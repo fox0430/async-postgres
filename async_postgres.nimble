@@ -2,7 +2,7 @@
 
 version = "0.1.0"
 author = "fox0430"
-description = "Async PostgreSQL client library"
+description = "Async PostgreSQL client"
 license = "MIT"
 
 # Dependencies
