@@ -3695,3 +3695,237 @@ suite "E2E: Column Name Access":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: Convenience Query Methods":
+  test "queryOne returns first row":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let row = await conn.queryOne("SELECT 1 AS a, 'hello' AS b")
+      doAssert row.isSome
+      doAssert row.get.getStr(0) == "1"
+      doAssert row.get.getStr(1) == "hello"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryOne returns none for empty result":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let row = await conn.queryOne("SELECT 1 WHERE false")
+      doAssert row.isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValue returns scalar":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValue("SELECT 42")
+      doAssert val == "42"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValue raises on no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.queryValue("SELECT 1 WHERE false")
+      except PgError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValue raises on NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.queryValue("SELECT NULL::text")
+      except PgError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOrDefault returns value":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOrDefault("SELECT 'yes'")
+      doAssert val == "yes"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOrDefault returns default on no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOrDefault("SELECT 1 WHERE false", default = "nope")
+      doAssert val == "nope"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOrDefault returns default on NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val =
+        await conn.queryValueOrDefault("SELECT NULL::text", default = "fallback")
+      doAssert val == "fallback"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryExists returns true when rows exist":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let exists = await conn.queryExists("SELECT 1")
+      doAssert exists
+      await conn.close()
+
+    waitFor t()
+
+  test "queryExists returns false when no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let exists = await conn.queryExists("SELECT 1 WHERE false")
+      doAssert not exists
+      await conn.close()
+
+    waitFor t()
+
+  test "execAffected returns affected row count":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("CREATE TEMP TABLE ea_test (id int)")
+      discard await conn.exec("INSERT INTO ea_test VALUES (1), (2), (3)")
+      let n = await conn.execAffected("DELETE FROM ea_test WHERE id > 1")
+      doAssert n == 2
+      await conn.close()
+
+    waitFor t()
+
+  test "queryColumn returns column values":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let vals = await conn.queryColumn("SELECT generate_series(1,3)::text")
+      doAssert vals == @["1", "2", "3"]
+      await conn.close()
+
+    waitFor t()
+
+  test "queryColumn raises on NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.queryColumn("SELECT NULL::text")
+      except PgTypeError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "queryOne returns only first row from multiple":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let row = await conn.queryOne("SELECT generate_series(10,12)::text AS v")
+      doAssert row.isSome
+      doAssert row.get.getStr(0) == "10"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryColumn returns empty seq for no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let vals = await conn.queryColumn("SELECT 1::text WHERE false")
+      doAssert vals.len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "execAffected returns 0 when no rows affected":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("CREATE TEMP TABLE ea_zero (id int)")
+      let n = await conn.execAffected("DELETE FROM ea_zero WHERE id = 999")
+      doAssert n == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "queryOne with params":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let row =
+        await conn.queryOne("SELECT $1::int + $2::int", @[3.toPgParam, 4.toPgParam])
+      doAssert row.isSome
+      doAssert row.get.getStr(0) == "7"
+      await conn.close()
+
+    waitFor t()
+
+  test "pool queryOne":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let row = await pool.queryOne("SELECT 'pooled'")
+      doAssert row.isSome
+      doAssert row.get.getStr(0) == "pooled"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val = await pool.queryValue("SELECT 99")
+      doAssert val == "99"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryExists":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      doAssert (await pool.queryExists("SELECT 1"))
+      doAssert not (await pool.queryExists("SELECT 1 WHERE false"))
+      await pool.close()
+
+    waitFor t()
+
+  test "pool execAffected":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("CREATE TEMP TABLE pool_ea2 (id int)")
+      discard await conn.exec("INSERT INTO pool_ea2 VALUES (1), (2)")
+      let n = await conn.execAffected("DELETE FROM pool_ea2")
+      doAssert n == 2
+      await conn.close()
+
+    waitFor t()
+
+  test "pool queryColumn":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let vals = await pool.queryColumn("SELECT generate_series(10,12)::text")
+      doAssert vals == @["10", "11", "12"]
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValueOrDefault":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val = await pool.queryValueOrDefault("SELECT 1 WHERE false", default = "x")
+      doAssert val == "x"
+      let val2 = await pool.queryValueOrDefault("SELECT 'ok'")
+      doAssert val2 == "ok"
+      await pool.close()
+
+    waitFor t()
