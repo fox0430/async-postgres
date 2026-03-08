@@ -4,12 +4,14 @@ on:
   pull_request:
     paths:
       - '.github/workflows/test.yml'
+      - 'docker-compose.yml'
       - 'async_postgres.nim*'
       - 'async_postgres/**'
       - 'tests/**'
   push:
     paths:
       - '.github/workflows/test.yml'
+      - 'docker-compose.yml'
       - 'async_postgres.nim*'
       - 'async_postgres/**'
       - 'tests/**'
@@ -58,29 +60,8 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
         if: matrix.nim-version == 'devel'
 
-      - name: Setup PostgreSQL
-        run: |
-          # Configure SSL certificates
-          sudo cp tests/certs/server.crt /etc/postgresql/*/main/server.crt
-          sudo cp tests/certs/server.key /etc/postgresql/*/main/server.key
-          sudo chown postgres:postgres /etc/postgresql/*/main/server.crt /etc/postgresql/*/main/server.key
-          sudo chmod 600 /etc/postgresql/*/main/server.key
-
-          # Enable SSL and set port
-          sudo sed -i "s/#ssl = off/ssl = on/" /etc/postgresql/*/main/postgresql.conf
-          sudo sed -i "s|ssl_cert_file = .*|ssl_cert_file = 'server.crt'|" /etc/postgresql/*/main/postgresql.conf
-          sudo sed -i "s|ssl_key_file = .*|ssl_key_file = 'server.key'|" /etc/postgresql/*/main/postgresql.conf
-          sudo sed -i "s/^port = .*/port = 15432/" /etc/postgresql/*/main/postgresql.conf
-
-          # Allow password auth from localhost
-          echo "host all all 127.0.0.1/32 md5" | sudo tee -a /etc/postgresql/*/main/pg_hba.conf
-
-          # Restart PostgreSQL
-          sudo systemctl restart postgresql
-
-          # Create test user and database
-          sudo -u postgres psql -p 15432 -c "CREATE USER test WITH PASSWORD 'test';"
-          sudo -u postgres psql -p 15432 -c "CREATE DATABASE test OWNER test;"
+      - name: Start PostgreSQL
+        run: docker compose up -d --wait
 
       - name: Install chronos
         run: nimble install chronos -y
