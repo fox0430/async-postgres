@@ -63,6 +63,27 @@ template makeCopyOutCallback(body: untyped): CopyOutCallback =
         body
       r
 
+template makeCopyInCallback(body: untyped): CopyInCallback =
+  block:
+    when hasChronos:
+      let r: CopyInCallback = proc(): Future[seq[byte]] {.
+          async: (raises: [CatchableError])
+      .} =
+        body
+      r
+    else:
+      # Manual Future construction: asyncdispatch's {.async.} doesn't support
+      # non-void return types on anonymous procs. Body must be synchronous (no await).
+      let r: CopyInCallback = proc(): Future[seq[byte]] {.gcsafe.} =
+        let fut = newFuture[seq[byte]]("copyInCallback")
+        try:
+          let res: seq[byte] = body
+          fut.complete(res)
+        except CatchableError as e:
+          fut.fail(e)
+        return fut
+      r
+
 suite "E2E: Basic Connection":
   test "plain connection and close":
     proc t() {.async.} =
@@ -3461,6 +3482,160 @@ suite "E2E: Array Types":
       doAssert res.rows.len == 1
       doAssert res.rows[0].isNull(0)
       doAssert res.rows[0].getIntArrayOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: COPY IN Stream":
+  test "copyInStream basic streaming":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyin_stream")
+      discard await conn.exec("CREATE TABLE test_copyin_stream (id int, name text)")
+
+      var idx = 0
+      let rows =
+        @["1\tAlice\n".toBytes(), "2\tBob\n".toBytes(), "3\tCharlie\n".toBytes()]
+      let cb = makeCopyInCallback:
+        if idx < rows.len:
+          let chunk = rows[idx]
+          inc idx
+          chunk
+        else:
+          newSeq[byte]()
+
+      let info = await conn.copyInStream("COPY test_copyin_stream FROM STDIN", cb)
+      doAssert "COPY 3" in info.commandTag
+      doAssert info.format == cfText
+      doAssert conn.state == csReady
+
+      let res = await conn.query("SELECT id, name FROM test_copyin_stream ORDER BY id")
+      doAssert res.rows.len == 3
+      doAssert res.rows[0].getStr(1) == "Alice"
+      doAssert res.rows[2].getStr(1) == "Charlie"
+
+      discard await conn.exec("DROP TABLE test_copyin_stream")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream empty data (immediate EOF)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyin_empty")
+      discard await conn.exec("CREATE TABLE test_copyin_empty (id int)")
+
+      let cb = makeCopyInCallback:
+        newSeq[byte]()
+
+      let info = await conn.copyInStream("COPY test_copyin_empty FROM STDIN", cb)
+      doAssert "COPY 0" in info.commandTag
+      doAssert conn.state == csReady
+
+      discard await conn.exec("DROP TABLE test_copyin_empty")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream callback error sends CopyFail":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyin_fail")
+      discard await conn.exec("CREATE TABLE test_copyin_fail (id int)")
+
+      var callCount = 0
+      let cb = makeCopyInCallback:
+        inc callCount
+        if callCount == 1:
+          "1\n".toBytes()
+        else:
+          raise newException(CatchableError, "callback failed")
+          newSeq[byte]()
+
+      var raised = false
+      try:
+        discard await conn.copyInStream("COPY test_copyin_fail FROM STDIN", cb)
+      except CatchableError as e:
+        raised = true
+        doAssert "callback failed" in e.msg
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Connection should still be usable
+      let res = await conn.query("SELECT count(*) FROM test_copyin_fail")
+      doAssert res.rows[0].getStr(0) == "0" # CopyFail aborted the COPY
+
+      discard await conn.exec("DROP TABLE test_copyin_fail")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream invalid SQL raises PgError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let cb = makeCopyInCallback:
+        newSeq[byte]()
+
+      var raised = false
+      try:
+        discard await conn.copyInStream("COPY nonexistent_table FROM STDIN", cb)
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Connection should still be usable
+      let res = await conn.simpleQuery("SELECT 1")
+      doAssert res[0].rows[0][0].get().toString() == "1"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream large data (10000 rows)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyin_large")
+      discard await conn.exec("CREATE TABLE test_copyin_large (id int, val text)")
+
+      var idx = 0
+      let cb = makeCopyInCallback:
+        if idx < 10000:
+          let row = ($idx & "\trow_" & $idx & "\n").toBytes()
+          inc idx
+          row
+        else:
+          newSeq[byte]()
+
+      let info = await conn.copyInStream("COPY test_copyin_large FROM STDIN", cb)
+      doAssert "COPY 10000" in info.commandTag
+      doAssert conn.state == csReady
+
+      let res = await conn.query("SELECT count(*) FROM test_copyin_large")
+      doAssert res.rows[0].getStr(0) == "10000"
+
+      discard await conn.exec("DROP TABLE test_copyin_large")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream format info in CopyInInfo":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyin_info")
+      discard await conn.exec("CREATE TABLE test_copyin_info (id int, name text)")
+
+      let cb = makeCopyInCallback:
+        newSeq[byte]()
+
+      let info = await conn.copyInStream("COPY test_copyin_info FROM STDIN", cb)
+      doAssert info.format == cfText
+      doAssert info.columnFormats.len == 2
+      doAssert info.columnFormats[0] == 0'i16 # text format
+      doAssert info.columnFormats[1] == 0'i16
+
+      discard await conn.exec("DROP TABLE test_copyin_info")
       await conn.close()
 
     waitFor t()

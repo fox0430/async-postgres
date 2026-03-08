@@ -102,9 +102,17 @@ type
     columnFormats*: seq[int16]
     commandTag*: string
 
+  CopyInInfo* = object
+    format*: CopyFormat
+    columnFormats*: seq[int16]
+    commandTag*: string
+
 when hasChronos:
   type CopyOutCallback* =
     proc(data: seq[byte]): Future[void] {.async: (raises: [CatchableError]), gcsafe.}
+
+  type CopyInCallback* =
+    proc(): Future[seq[byte]] {.async: (raises: [CatchableError]), gcsafe.}
 
   type TrustAnchorResult = object
     store: TrustAnchorStore
@@ -112,6 +120,8 @@ when hasChronos:
 
 else:
   type CopyOutCallback* = proc(data: seq[byte]): Future[void] {.gcsafe.}
+
+  type CopyInCallback* = proc(): Future[seq[byte]] {.gcsafe.}
 
 const RecvBufSize = 32768 ## Size of the temporary read buffer for recv operations
 
