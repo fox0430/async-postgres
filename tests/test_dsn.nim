@@ -175,6 +175,80 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host:-1/db")
 
+  test "keepalive default enabled via parseDsn":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.keepAlive == true
+
+  test "keepalives=0 disables keepalive":
+    let cfg = parseDsn("postgresql://host/db?keepalives=0")
+    check cfg.keepAlive == false
+
+  test "keepalives=1 enables keepalive":
+    let cfg = parseDsn("postgresql://host/db?keepalives=1")
+    check cfg.keepAlive == true
+
+  test "keepalive timing parameters":
+    let cfg = parseDsn(
+      "postgresql://host/db?keepalives_idle=60&keepalives_interval=10&keepalives_count=5"
+    )
+    check cfg.keepAliveIdle == 60
+    check cfg.keepAliveInterval == 10
+    check cfg.keepAliveCount == 5
+
+  test "keepalives not in DSN leaves keepAlive false":
+    var cfg = ConnConfig()
+    check cfg.keepAlive == false
+
+  test "keepalives with other params":
+    let cfg = parseDsn(
+      "postgresql://host/db?keepalives=1&keepalives_idle=30&application_name=test"
+    )
+    check cfg.keepAlive == true
+    check cfg.keepAliveIdle == 30
+    check cfg.applicationName == "test"
+
+  test "keepalive defaults are zero":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.keepAliveIdle == 0
+    check cfg.keepAliveInterval == 0
+    check cfg.keepAliveCount == 0
+
+  test "keepalives nonzero values are truthy (libpq compat)":
+    check parseDsn("postgresql://host/db?keepalives=2").keepAlive == true
+    check parseDsn("postgresql://host/db?keepalives=-1").keepAlive == true
+    check parseDsn("postgresql://host/db?keepalives=999").keepAlive == true
+
+  test "keepalives=0 with timing params still disables":
+    let cfg = parseDsn(
+      "postgresql://host/db?keepalives_idle=60&keepalives=0&keepalives_interval=10"
+    )
+    check cfg.keepAlive == false
+    check cfg.keepAliveIdle == 60
+    check cfg.keepAliveInterval == 10
+
+  test "partial keepalive timing (idle only)":
+    let cfg = parseDsn("postgresql://host/db?keepalives_idle=120")
+    check cfg.keepAlive == true
+    check cfg.keepAliveIdle == 120
+    check cfg.keepAliveInterval == 0
+    check cfg.keepAliveCount == 0
+
+  test "error: invalid keepalives value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives=abc")
+
+  test "error: invalid keepalives_idle value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_idle=abc")
+
+  test "error: invalid keepalives_interval value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_interval=abc")
+
+  test "error: invalid keepalives_count value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_count=abc")
+
   test "error: sslrootcert file not found":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")
