@@ -17,7 +17,7 @@ Async PostgreSQL client in Nim.
 - Typed parameters (`toPgParam`) and row accessors (`getStr`, `getInt`, ...)
 - Text and binary format support
 - Transactions (`withTransaction`)
-- Async backend: [chronos](https://github.com/status-im/nim-chronos) (default) or [asyncdispatch](https://nim-lang.org/docs/asyncdispatch.html)
+- Async backend: [asyncdispatch](https://nim-lang.org/docs/asyncdispatch.html) (default) or [chronos](https://github.com/status-im/nim-chronos)
 
 ## Requirements
 
