@@ -5,9 +5,9 @@ from std/times import
 
 import
   ../async_postgres/
-    [async_backend, pg_protocol, pg_connection, pg_client, pg_pool, pg_types]
+    [async_backend, pg_protocol, pg_client, pg_pool, pg_types]
 
-from ../async_postgres/pg_connection {.all.} import reconnectInPlace, listenPump
+import ../async_postgres/pg_connection {.all.}
 
 const
   PgHost = "127.0.0.1"
