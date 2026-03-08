@@ -133,15 +133,20 @@ proc dispatchNotice(conn: PgConnection, msg: BackendMessage) =
     conn.noticeCallback(Notice(fields: msg.noticeFields))
 
 when hasAsyncDispatch:
+  template bytesToString(data: seq[byte]): string =
+    let d = data
+    var s = newString(d.len)
+    if d.len > 0:
+      copyMem(addr s[0], unsafeAddr d[0], d.len)
+    s
+
   proc sendRawBytes(socket: AsyncSocket, data: seq[byte]): Future[void] =
     ## Send seq[byte] via asyncdispatch socket.
-    ## Uses a direct pointer cast to avoid copying into an intermediate string.
-    ## This is safe because asyncdispatch's send copies the buffer internally.
     if data.len == 0:
       var fut = newFuture[void]("sendRawBytes")
       fut.complete()
       return fut
-    socket.send(cast[string](data))
+    socket.send(bytesToString(data))
 
 proc compactRecvBuf(conn: PgConnection, consumed: int) {.inline.} =
   ## Remove consumed bytes from the front of recvBuf efficiently.

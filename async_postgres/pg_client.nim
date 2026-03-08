@@ -1,4 +1,4 @@
-import std/[options, strutils]
+import std/options
 
 import async_backend, pg_protocol, pg_connection, pg_types
 
