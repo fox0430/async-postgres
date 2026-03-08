@@ -496,11 +496,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       if addresses.len == 0:
         raise newException(PgError, "Could not resolve host: " & config.host)
       let transport = await connect(addresses[0])
-      try:
-        configureKeepalive(SocketHandle(transport.fd), config)
-      except CatchableError:
-        await transport.closeWait()
-        raise
+      configureKeepalive(SocketHandle(transport.fd), config)
       conn = PgConnection(
         transport: transport,
         recvBuf: @[],
