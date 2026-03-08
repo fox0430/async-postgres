@@ -71,3 +71,7 @@ jobs:
 
       - name: Run tests
         run: nimble test -y
+
+      - name: Gen docs
+        run: |
+          nim doc --project --index:on --outdir:./htmldocs ./async_postgres.nim
