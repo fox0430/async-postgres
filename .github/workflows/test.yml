@@ -60,6 +60,9 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
         if: matrix.nim-version == 'devel'
 
+      - name: Generate test certificates
+        run: bash tests/gen_certs.sh
+
       - name: Start PostgreSQL
         run: docker compose up -d --wait
 
