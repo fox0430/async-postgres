@@ -1,0 +1,757 @@
+import std/[json, options, strutils, times]
+
+import pg_protocol
+
+const
+  OidBool* = 16'i32
+  OidInt2* = 21'i32
+  OidInt4* = 23'i32
+  OidInt8* = 20'i32
+  OidFloat4* = 700'i32
+  OidFloat8* = 701'i32
+  OidText* = 25'i32
+  OidVarchar* = 1043'i32
+  OidBytea* = 17'i32
+  OidTimestamp* = 1114'i32
+  OidDate* = 1082'i32
+  OidTime* = 1083'i32
+  OidTimestampTz* = 1184'i32
+  OidNumeric* = 1700'i32
+  OidJson* = 114'i32
+  OidInterval* = 1186'i32
+  OidUuid* = 2950'i32
+  OidJsonb* = 3802'i32
+  OidBoolArray* = 1000'i32
+  OidInt2Array* = 1005'i32
+  OidInt4Array* = 1007'i32
+  OidInt8Array* = 1016'i32
+  OidFloat4Array* = 1021'i32
+  OidFloat8Array* = 1022'i32
+  OidTextArray* = 1009'i32
+  OidVarcharArray* = 1015'i32
+
+  pgEpochUnix* = 946684800'i64 ## 2000-01-01 00:00:00 UTC in Unix seconds
+  pgEpochDaysOffset* = 10957'i32 ## Days from 1970-01-01 to 2000-01-01
+
+type
+  PgUuid* = distinct string
+
+  PgNumeric* = distinct string
+    ## Arbitrary-precision numeric value stored as its string representation.
+    ## Use this instead of float64 to avoid precision loss with PostgreSQL numeric/decimal.
+
+  PgParam* = object
+    oid*: int32
+    format*: int16 # 0=text, 1=binary
+    value*: Option[seq[byte]]
+
+proc `$`*(v: PgNumeric): string {.borrow.}
+proc `==`*(a, b: PgNumeric): bool {.borrow.}
+
+proc toBytes(s: string): seq[byte] =
+  result = newSeq[byte](s.len)
+  for i in 0 ..< s.len:
+    result[i] = byte(s[i])
+
+proc toBE16(v: int16): seq[byte] =
+  @[byte((v shr 8) and 0xFF), byte(v and 0xFF)]
+
+proc toBE32(v: int32): seq[byte] =
+  @[
+    byte((v shr 24) and 0xFF),
+    byte((v shr 16) and 0xFF),
+    byte((v shr 8) and 0xFF),
+    byte(v and 0xFF),
+  ]
+
+proc toBE64(v: int64): seq[byte] =
+  @[
+    byte((v shr 56) and 0xFF),
+    byte((v shr 48) and 0xFF),
+    byte((v shr 40) and 0xFF),
+    byte((v shr 32) and 0xFF),
+    byte((v shr 24) and 0xFF),
+    byte((v shr 16) and 0xFF),
+    byte((v shr 8) and 0xFF),
+    byte(v and 0xFF),
+  ]
+
+proc fromBE16*(data: openArray[byte]): int16 =
+  int16(data[0]) shl 8 or int16(data[1])
+
+proc fromBE32*(data: openArray[byte]): int32 =
+  int32(data[0]) shl 24 or int32(data[1]) shl 16 or int32(data[2]) shl 8 or
+    int32(data[3])
+
+proc fromBE64*(data: openArray[byte]): int64 =
+  int64(data[0]) shl 56 or int64(data[1]) shl 48 or int64(data[2]) shl 40 or
+    int64(data[3]) shl 32 or int64(data[4]) shl 24 or int64(data[5]) shl 16 or
+    int64(data[6]) shl 8 or int64(data[7])
+
+proc toPgParam*(v: string): PgParam =
+  PgParam(oid: OidText, format: 0, value: some(toBytes(v)))
+
+proc toPgParam*(v: int16): PgParam =
+  PgParam(oid: OidInt2, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: int32): PgParam =
+  PgParam(oid: OidInt4, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: int64): PgParam =
+  PgParam(oid: OidInt8, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: int): PgParam =
+  PgParam(oid: OidInt8, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: float32): PgParam =
+  PgParam(oid: OidFloat4, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: float64): PgParam =
+  PgParam(oid: OidFloat8, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: bool): PgParam =
+  if v:
+    PgParam(oid: OidBool, format: 0, value: some(toBytes("t")))
+  else:
+    PgParam(oid: OidBool, format: 0, value: some(toBytes("f")))
+
+proc toPgParam*(v: seq[byte]): PgParam =
+  PgParam(oid: OidBytea, format: 0, value: some(v))
+
+proc toPgParam*(v: DateTime): PgParam =
+  let s = v.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
+  PgParam(oid: OidTimestamp, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: PgUuid): PgParam =
+  PgParam(oid: OidUuid, format: 0, value: some(toBytes(string(v))))
+
+proc toPgParam*(v: PgNumeric): PgParam =
+  PgParam(oid: OidNumeric, format: 0, value: some(toBytes(string(v))))
+
+proc toPgParam*(v: JsonNode): PgParam =
+  PgParam(oid: OidJsonb, format: 0, value: some(toBytes($v)))
+
+proc escapeArrayElement(s: string): string =
+  result = "\""
+  for c in s:
+    if c == '"' or c == '\\':
+      result.add('\\')
+    result.add(c)
+  result.add('"')
+
+proc toPgParam*(v: seq[int16]): PgParam =
+  var s = "{"
+  for i, x in v:
+    if i > 0:
+      s.add(',')
+    s.add($x)
+  s.add('}')
+  PgParam(oid: OidInt2Array, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: seq[int32]): PgParam =
+  var s = "{"
+  for i, x in v:
+    if i > 0:
+      s.add(',')
+    s.add($x)
+  s.add('}')
+  PgParam(oid: OidInt4Array, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: seq[int64]): PgParam =
+  var s = "{"
+  for i, x in v:
+    if i > 0:
+      s.add(',')
+    s.add($x)
+  s.add('}')
+  PgParam(oid: OidInt8Array, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: seq[float32]): PgParam =
+  var s = "{"
+  for i, x in v:
+    if i > 0:
+      s.add(',')
+    s.add($x)
+  s.add('}')
+  PgParam(oid: OidFloat4Array, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: seq[float64]): PgParam =
+  var s = "{"
+  for i, x in v:
+    if i > 0:
+      s.add(',')
+    s.add($x)
+  s.add('}')
+  PgParam(oid: OidFloat8Array, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: seq[bool]): PgParam =
+  var s = "{"
+  for i, x in v:
+    if i > 0:
+      s.add(',')
+    s.add(if x: "t" else: "f")
+  s.add('}')
+  PgParam(oid: OidBoolArray, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: seq[string]): PgParam =
+  var s = "{"
+  for i, x in v:
+    if i > 0:
+      s.add(',')
+    s.add(escapeArrayElement(x))
+  s.add('}')
+  PgParam(oid: OidTextArray, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: Option[JsonNode]): PgParam =
+  if v.isSome:
+    toPgParam(v.get)
+  else:
+    PgParam(oid: OidJsonb, format: 0, value: none(seq[byte]))
+
+proc toPgParam*[T](v: Option[T]): PgParam =
+  if v.isSome:
+    result = toPgParam(v.get)
+  else:
+    let proto = toPgParam(default(T))
+    result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: string): PgParam =
+  PgParam(oid: OidText, format: 1, value: some(toBytes(v)))
+
+proc toPgBinaryParam*(v: int16): PgParam =
+  PgParam(oid: OidInt2, format: 1, value: some(toBE16(v)))
+
+proc toPgBinaryParam*(v: int32): PgParam =
+  PgParam(oid: OidInt4, format: 1, value: some(toBE32(v)))
+
+proc toPgBinaryParam*(v: int64): PgParam =
+  PgParam(oid: OidInt8, format: 1, value: some(toBE64(v)))
+
+proc toPgBinaryParam*(v: int): PgParam =
+  PgParam(oid: OidInt8, format: 1, value: some(toBE64(int64(v))))
+
+proc toPgBinaryParam*(v: float32): PgParam =
+  PgParam(oid: OidFloat4, format: 1, value: some(toBE32(cast[int32](v))))
+
+proc toPgBinaryParam*(v: float64): PgParam =
+  PgParam(oid: OidFloat8, format: 1, value: some(toBE64(cast[int64](v))))
+
+proc toPgBinaryParam*(v: bool): PgParam =
+  PgParam(oid: OidBool, format: 1, value: some(@[if v: 1'u8 else: 0'u8]))
+
+proc toPgBinaryParam*(v: seq[byte]): PgParam =
+  PgParam(oid: OidBytea, format: 1, value: some(v))
+
+proc toPgBinaryParam*(v: DateTime): PgParam =
+  let t = v.toTime()
+  let unixUs = t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000)
+  let pgUs = unixUs - pgEpochUnix * 1_000_000
+  PgParam(oid: OidTimestamp, format: 1, value: some(toBE64(pgUs)))
+
+proc toPgBinaryParam*(v: PgNumeric): PgParam =
+  ## Sends numeric as text format (binary numeric encoding is complex).
+  PgParam(oid: OidNumeric, format: 0, value: some(toBytes(string(v))))
+
+proc toPgBinaryParam*(v: PgUuid): PgParam =
+  let hex = string(v).replace("-", "")
+  var bytes = newSeq[byte](16)
+  for i in 0 ..< 16:
+    bytes[i] = byte(parseHexInt(hex[i * 2 .. i * 2 + 1]))
+  PgParam(oid: OidUuid, format: 1, value: some(bytes))
+
+proc toPgBinaryParam*(v: JsonNode): PgParam =
+  let jsonBytes = toBytes($v)
+  var data = newSeq[byte](1 + jsonBytes.len)
+  data[0] = 1 # jsonb version byte
+  for i in 0 ..< jsonBytes.len:
+    data[i + 1] = jsonBytes[i]
+  PgParam(oid: OidJsonb, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: Option[JsonNode]): PgParam =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidJsonb, format: 1, value: none(seq[byte]))
+
+proc toPgBinaryParam*[T](v: Option[T]): PgParam =
+  if v.isSome:
+    result = toPgBinaryParam(v.get)
+  else:
+    let proto = toPgBinaryParam(default(T))
+    result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
+
+proc fromPgText*(data: seq[byte], oid: int32): string =
+  ## Convert text-format bytes from PostgreSQL to a Nim string.
+  result = newString(data.len)
+  for i in 0 ..< data.len:
+    result[i] = char(data[i])
+
+type
+  Row* = seq[Option[seq[byte]]]
+  PgTypeError* = object of CatchableError
+
+proc affectedRows*(tag: string): int64 =
+  ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).
+  let parts = tag.split(' ')
+  if parts.len > 0:
+    try:
+      return parseBiggestInt(parts[^1])
+    except ValueError:
+      return 0
+  return 0
+
+proc isNull*(row: Row, col: int): bool =
+  row[col].isNone
+
+proc getStr*(row: Row, col: int): string =
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  fromPgText(cell.get, 0)
+
+proc getInt*(row: Row, col: int): int32 =
+  let s = row.getStr(col)
+  result = int32(parseInt(s))
+
+proc getInt64*(row: Row, col: int): int64 =
+  let s = row.getStr(col)
+  result = parseBiggestInt(s)
+
+proc getFloat*(row: Row, col: int): float64 =
+  let s = row.getStr(col)
+  result = parseFloat(s)
+
+proc getNumeric*(row: Row, col: int): PgNumeric =
+  PgNumeric(row.getStr(col))
+
+proc getBool*(row: Row, col: int): bool =
+  let s = row.getStr(col)
+  case s
+  of "t", "true", "1":
+    true
+  of "f", "false", "0":
+    false
+  else:
+    raise newException(PgTypeError, "Invalid boolean value: " & s)
+
+proc getBytes*(row: Row, col: int): seq[byte] =
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let raw = cell.get
+  # PostgreSQL text-format bytea uses hex encoding: \xDEADBEEF
+  if raw.len >= 2 and raw[0] == byte('\\') and raw[1] == byte('x'):
+    let hex = fromPgText(raw, 0)[2 ..^ 1]
+    result = newSeq[byte](hex.len div 2)
+    for i in 0 ..< result.len:
+      result[i] = byte(parseHexInt(hex[i * 2 .. i * 2 + 1]))
+  else:
+    result = raw
+
+proc getTimestamp*(row: Row, col: int): DateTime =
+  let s = row.getStr(col)
+  const formats = [
+    "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
+    "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
+    "yyyy-MM-dd HH:mm:ss",
+  ]
+  for fmt in formats:
+    try:
+      return parse(s, fmt)
+    except TimeParseError:
+      discard
+  raise newException(PgTypeError, "Invalid timestamp: " & s)
+
+proc getDate*(row: Row, col: int): DateTime =
+  let s = row.getStr(col)
+  try:
+    return parse(s, "yyyy-MM-dd")
+  except TimeParseError:
+    raise newException(PgTypeError, "Invalid date: " & s)
+
+proc getJson*(row: Row, col: int): JsonNode =
+  let s = row.getStr(col)
+  try:
+    return parseJson(s)
+  except JsonParsingError:
+    raise newException(PgTypeError, "Invalid JSON: " & s)
+
+# NULL-safe Option accessors (text format)
+
+proc getStrOpt*(row: Row, col: int): Option[string] =
+  let cell = row[col]
+  if cell.isNone:
+    none(string)
+  else:
+    some(fromPgText(cell.get, 0))
+
+proc getIntOpt*(row: Row, col: int): Option[int32] =
+  if row[col].isNone:
+    none(int32)
+  else:
+    some(row.getInt(col))
+
+proc getInt64Opt*(row: Row, col: int): Option[int64] =
+  if row[col].isNone:
+    none(int64)
+  else:
+    some(row.getInt64(col))
+
+proc getFloatOpt*(row: Row, col: int): Option[float64] =
+  if row[col].isNone:
+    none(float64)
+  else:
+    some(row.getFloat(col))
+
+proc getNumericOpt*(row: Row, col: int): Option[PgNumeric] =
+  if row[col].isNone:
+    none(PgNumeric)
+  else:
+    some(row.getNumeric(col))
+
+proc getBoolOpt*(row: Row, col: int): Option[bool] =
+  if row[col].isNone:
+    none(bool)
+  else:
+    some(row.getBool(col))
+
+proc getJsonOpt*(row: Row, col: int): Option[JsonNode] =
+  if row[col].isNone:
+    none(JsonNode)
+  else:
+    some(row.getJson(col))
+
+# Array text format parser
+
+proc parseTextArray*(s: string): seq[Option[string]] =
+  ## Parse PostgreSQL text-format array literal: {elem1,elem2,...}
+  ## Returns elements as Option[string] (none for NULL).
+  if s.len < 2 or s[0] != '{' or s[^1] != '}':
+    raise newException(PgTypeError, "Invalid array literal: " & s)
+  let inner = s[1 ..^ 2]
+  if inner.len == 0:
+    return @[]
+  var i = 0
+  while i < inner.len:
+    if inner[i] == '"':
+      # Quoted element
+      i += 1
+      var elem = ""
+      while i < inner.len:
+        if inner[i] == '\\' and i + 1 < inner.len:
+          i += 1
+          elem.add(inner[i])
+        elif inner[i] == '"':
+          break
+        else:
+          elem.add(inner[i])
+        i += 1
+      i += 1 # skip closing quote
+      result.add(some(elem))
+    else:
+      # Unquoted element
+      var elem = ""
+      while i < inner.len and inner[i] != ',':
+        elem.add(inner[i])
+        i += 1
+      if elem == "NULL":
+        result.add(none(string))
+      else:
+        result.add(some(elem))
+    if i < inner.len and inner[i] == ',':
+      i += 1
+
+proc getIntArray*(row: Row, col: int): seq[int32] =
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in int array")
+    result.add(int32(parseInt(e.get)))
+
+proc getInt16Array*(row: Row, col: int): seq[int16] =
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in int16 array")
+    result.add(int16(parseInt(e.get)))
+
+proc getInt64Array*(row: Row, col: int): seq[int64] =
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in int64 array")
+    result.add(parseBiggestInt(e.get))
+
+proc getFloatArray*(row: Row, col: int): seq[float64] =
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in float array")
+    result.add(parseFloat(e.get))
+
+proc getFloat32Array*(row: Row, col: int): seq[float32] =
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in float32 array")
+    result.add(float32(parseFloat(e.get)))
+
+proc getBoolArray*(row: Row, col: int): seq[bool] =
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in bool array")
+    case e.get
+    of "t", "true", "1":
+      result.add(true)
+    of "f", "false", "0":
+      result.add(false)
+    else:
+      raise newException(PgTypeError, "Invalid boolean: " & e.get)
+
+proc getStrArray*(row: Row, col: int): seq[string] =
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in string array")
+    result.add(e.get)
+
+# Array Opt accessors
+
+proc getIntArrayOpt*(row: Row, col: int): Option[seq[int32]] =
+  if row[col].isNone:
+    none(seq[int32])
+  else:
+    some(row.getIntArray(col))
+
+proc getInt16ArrayOpt*(row: Row, col: int): Option[seq[int16]] =
+  if row[col].isNone:
+    none(seq[int16])
+  else:
+    some(row.getInt16Array(col))
+
+proc getInt64ArrayOpt*(row: Row, col: int): Option[seq[int64]] =
+  if row[col].isNone:
+    none(seq[int64])
+  else:
+    some(row.getInt64Array(col))
+
+proc getFloatArrayOpt*(row: Row, col: int): Option[seq[float64]] =
+  if row[col].isNone:
+    none(seq[float64])
+  else:
+    some(row.getFloatArray(col))
+
+proc getFloat32ArrayOpt*(row: Row, col: int): Option[seq[float32]] =
+  if row[col].isNone:
+    none(seq[float32])
+  else:
+    some(row.getFloat32Array(col))
+
+proc getBoolArrayOpt*(row: Row, col: int): Option[seq[bool]] =
+  if row[col].isNone:
+    none(seq[bool])
+  else:
+    some(row.getBoolArray(col))
+
+proc getStrArrayOpt*(row: Row, col: int): Option[seq[string]] =
+  if row[col].isNone:
+    none(seq[string])
+  else:
+    some(row.getStrArray(col))
+
+# Format-aware row accessors (binary support)
+
+proc decodeNumericBinary(data: openArray[byte]): string =
+  ## Decode PostgreSQL binary numeric format:
+  ##   2 bytes: ndigits (number of base-10000 digit groups)
+  ##   2 bytes: weight (weight of first digit)
+  ##   2 bytes: sign (0x0000=positive, 0x4000=negative, 0xC000=NaN)
+  ##   2 bytes: dscale (digits after decimal point)
+  ##   ndigits * 2 bytes: digit groups (each 0-9999)
+  let ndigits = int(fromBE16(data.toOpenArray(0, 1)))
+  let weight = int(int16(fromBE16(data.toOpenArray(2, 3))))
+  let sign = uint16(fromBE16(data.toOpenArray(4, 5)))
+  let dscale = int(fromBE16(data.toOpenArray(6, 7)))
+  if sign == 0xC000'u16:
+    return "NaN"
+  var digits = newSeq[int16](ndigits)
+  for i in 0 ..< ndigits:
+    digits[i] = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
+  if ndigits == 0:
+    if dscale > 0:
+      return "0." & repeat('0', dscale)
+    return "0"
+  var intPart = ""
+  var fracPart = ""
+  let intGroups = weight + 1
+  for i in 0 ..< ndigits:
+    let d = int(digits[i])
+    if i < intGroups:
+      if intPart.len == 0:
+        intPart.add($d)
+      else:
+        let s = $d
+        intPart.add(repeat('0', 4 - s.len))
+        intPart.add(s)
+    else:
+      let s = $d
+      fracPart.add(repeat('0', 4 - s.len))
+      fracPart.add(s)
+  if intGroups > ndigits:
+    intPart.add(repeat('0', (intGroups - ndigits) * 4))
+  if intPart.len == 0:
+    intPart = "0"
+    let leadingZeroGroups = -intGroups
+    fracPart = repeat('0', leadingZeroGroups * 4) & fracPart
+  if dscale > 0:
+    if fracPart.len > dscale:
+      fracPart = fracPart[0 ..< dscale]
+    elif fracPart.len < dscale:
+      fracPart.add(repeat('0', dscale - fracPart.len))
+    result = (if sign == 0x4000'u16: "-" else: "") & intPart & "." & fracPart
+  else:
+    result = (if sign == 0x4000'u16: "-" else: "") & intPart
+
+proc getStr*(row: Row, col: int, fields: seq[FieldDescription]): string =
+  if fields[col].formatCode == 0:
+    return row.getStr(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let data = cell.get
+  case fields[col].typeOid
+  of OidInt2:
+    return $fromBE16(data)
+  of OidInt4:
+    return $fromBE32(data)
+  of OidInt8:
+    return $fromBE64(data)
+  of OidFloat4:
+    return $cast[float32](cast[uint32](fromBE32(data)))
+  of OidFloat8:
+    return $cast[float64](cast[uint64](fromBE64(data)))
+  of OidNumeric:
+    return decodeNumericBinary(data)
+  of OidBool:
+    return if data[0] == 1: "t" else: "f"
+  else:
+    result = newString(data.len)
+    for i in 0 ..< data.len:
+      result[i] = char(data[i])
+
+proc getInt*(row: Row, col: int, fields: seq[FieldDescription]): int32 =
+  if fields[col].formatCode == 0:
+    return row.getInt(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let data = cell.get
+  if data.len == 2:
+    int32(fromBE16(data))
+  else:
+    fromBE32(data)
+
+proc getInt64*(row: Row, col: int, fields: seq[FieldDescription]): int64 =
+  if fields[col].formatCode == 0:
+    return row.getInt64(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let data = cell.get
+  if data.len == 2:
+    int64(fromBE16(data))
+  elif data.len == 4:
+    int64(fromBE32(data))
+  else:
+    fromBE64(data)
+
+proc getNumeric*(row: Row, col: int, fields: seq[FieldDescription]): PgNumeric =
+  if fields[col].formatCode == 0:
+    return row.getNumeric(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  PgNumeric(decodeNumericBinary(cell.get))
+
+proc getFloat*(row: Row, col: int, fields: seq[FieldDescription]): float64 =
+  if fields[col].formatCode == 0:
+    return row.getFloat(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let data = cell.get
+  if data.len == 4:
+    cast[float32](cast[uint32](fromBE32(data))).float64
+  else:
+    cast[float64](cast[uint64](fromBE64(data)))
+
+proc getBool*(row: Row, col: int, fields: seq[FieldDescription]): bool =
+  if fields[col].formatCode == 0:
+    return row.getBool(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  cell.get[0] == 1'u8
+
+proc getBytes*(row: Row, col: int, fields: seq[FieldDescription]): seq[byte] =
+  if fields[col].formatCode == 0:
+    return row.getBytes(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  cell.get
+
+proc getTimestamp*(row: Row, col: int, fields: seq[FieldDescription]): DateTime =
+  if fields[col].formatCode == 0:
+    return row.getTimestamp(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let pgUs = fromBE64(cell.get)
+  let unixUs = pgUs + pgEpochUnix * 1_000_000
+  var unixSec = unixUs div 1_000_000
+  var fracUs = unixUs mod 1_000_000
+  if fracUs < 0:
+    unixSec -= 1
+    fracUs += 1_000_000
+  initTime(unixSec, int(fracUs * 1000)).utc()
+
+proc getDate*(row: Row, col: int, fields: seq[FieldDescription]): DateTime =
+  if fields[col].formatCode == 0:
+    return row.getDate(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let pgDays = fromBE32(cell.get)
+  let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
+  initTime(unixSec, 0).utc()
+
+proc getJson*(row: Row, col: int, fields: seq[FieldDescription]): JsonNode =
+  if fields[col].formatCode == 0:
+    return row.getJson(col)
+  let cell = row[col]
+  if cell.isNone:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let data = cell.get
+  var jsonStr: string
+  if fields[col].typeOid == OidJsonb and data.len > 0 and data[0] == 1:
+    # jsonb binary: skip version byte
+    jsonStr = newString(data.len - 1)
+    for i in 1 ..< data.len:
+      jsonStr[i - 1] = char(data[i])
+  else:
+    jsonStr = newString(data.len)
+    for i in 0 ..< data.len:
+      jsonStr[i] = char(data[i])
+  try:
+    return parseJson(jsonStr)
+  except JsonParsingError:
+    raise newException(PgTypeError, "Invalid JSON: " & jsonStr)

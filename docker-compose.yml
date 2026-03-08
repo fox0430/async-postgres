@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: test
+    ports:
+      - "15432:5432"
+    volumes:
+      - ./tests/certs/server.crt:/tmp/certs/server.crt:ro
+      - ./tests/certs/server.key:/tmp/certs/server.key:ro
+      - ./tests/certs/ca.crt:/tmp/certs/ca.crt:ro
+    command:
+      - bash
+      - -c
+      - |
+        cp /tmp/certs/server.crt /var/lib/postgresql/server.crt
+        cp /tmp/certs/server.key /var/lib/postgresql/server.key
+        chmod 600 /var/lib/postgresql/server.key
+        chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/var/lib/postgresql/server.crt \
+          -c ssl_key_file=/var/lib/postgresql/server.key

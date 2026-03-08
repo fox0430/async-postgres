@@ -1,0 +1,850 @@
+import std/[options, strutils]
+
+import async_backend, pg_protocol, pg_connection, pg_types
+
+const binaryFormat*: seq[int16] = @[1'i16]
+
+type
+  PreparedStatement* = object
+    conn*: PgConnection
+    name*: string
+    fields*: seq[FieldDescription]
+    paramOids*: seq[int32]
+
+  Cursor* = ref object
+    conn*: PgConnection
+    portalName: string
+    chunkSize: int32
+    timeout: Duration
+    fields*: seq[FieldDescription]
+    exhausted*: bool
+    buffered: seq[Row]
+
+proc extractParams(
+    params: openArray[PgParam]
+): tuple[oids: seq[int32], formats: seq[int16], values: seq[Option[seq[byte]]]] =
+  result.oids = newSeq[int32](params.len)
+  result.formats = newSeq[int16](params.len)
+  result.values = newSeq[Option[seq[byte]]](params.len)
+  for i, p in params:
+    result.oids[i] = p.oid
+    result.formats[i] = p.format
+    result.values[i] = p.value
+
+proc execImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  var batch: seq[byte]
+  batch.add(encodeParse("", sql, paramOids))
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+  batch.add(encodeBind("", "", formats, params))
+  batch.add(encodeExecute("", 0))
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  var commandTag = ""
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkDataRow:
+      discard # exec ignores rows
+    of bmkCommandComplete:
+      commandTag = msg.commandTag
+    of bmkEmptyQueryResponse:
+      discard
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return commandTag
+
+proc exec*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a single SQL statement via extended query protocol, returning the command tag.
+  ## Only one statement is allowed; use `simpleQuery` for multiple statements.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await execImpl(conn, sql, params, paramOids, paramFormats, timeout).wait(
+        timeout
+      )
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "Exec timed out")
+  else:
+    return await execImpl(conn, sql, params, paramOids, paramFormats)
+
+proc exec*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a statement with typed parameters.
+  let (oids, formats, values) = extractParams(params)
+  return await conn.exec(sql, values, oids, formats, timeout)
+
+proc queryImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  var batch: seq[byte]
+  batch.add(encodeParse("", sql, paramOids))
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+  batch.add(encodeBind("", "", formats, params, resultFormats))
+  batch.add(encodeDescribe(dkPortal, ""))
+  batch.add(encodeExecute("", 0))
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  var qr = QueryResult()
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkRowDescription:
+      qr.fields = msg.fields
+    of bmkNoData:
+      discard
+    of bmkDataRow:
+      qr.rows.add(msg.columns)
+    of bmkCommandComplete:
+      qr.commandTag = msg.commandTag
+    of bmkEmptyQueryResponse:
+      discard
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return qr
+
+proc query*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a single SQL query via extended query protocol, returning rows.
+  ## Only one statement is allowed; use `simpleQuery` for multiple statements.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await queryImpl(
+        conn, sql, params, paramOids, paramFormats, resultFormats, timeout
+      )
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "Query timed out")
+  else:
+    return await queryImpl(conn, sql, params, paramOids, paramFormats, resultFormats)
+
+proc query*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query with typed parameters.
+  let (oids, formats, values) = extractParams(params)
+  return await conn.query(sql, values, oids, formats, resultFormats, timeout)
+
+proc prepareImpl(
+    conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
+): Future[PreparedStatement] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  var batch: seq[byte]
+  batch.add(encodeParse(name, sql))
+  batch.add(encodeDescribe(dkStatement, name))
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  var stmt = PreparedStatement(conn: conn, name: name)
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkParseComplete:
+      discard
+    of bmkParameterDescription:
+      stmt.paramOids = msg.paramTypeOids
+    of bmkRowDescription:
+      stmt.fields = msg.fields
+    of bmkNoData:
+      discard
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return stmt
+
+proc prepare*(
+    conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
+): Future[PreparedStatement] {.async.} =
+  ## Prepare a named statement, returning metadata.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await prepareImpl(conn, name, sql, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "Prepare timed out")
+  else:
+    return await prepareImpl(conn, name, sql)
+
+proc executeImpl(
+    stmt: PreparedStatement,
+    params: seq[Option[seq[byte]]],
+    paramFormats: seq[int16],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  let conn = stmt.conn
+
+  conn.checkReady()
+  conn.state = csBusy
+
+  var batch: seq[byte]
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+  batch.add(encodeBind("", stmt.name, formats, params, resultFormats))
+  batch.add(encodeExecute("", 0))
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  var qr = QueryResult(fields: stmt.fields)
+  if resultFormats.len > 0:
+    for i in 0 ..< qr.fields.len:
+      if resultFormats.len == 1:
+        qr.fields[i].formatCode = resultFormats[0]
+      elif i < resultFormats.len:
+        qr.fields[i].formatCode = resultFormats[i]
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkBindComplete:
+      discard
+    of bmkDataRow:
+      qr.rows.add(msg.columns)
+    of bmkCommandComplete:
+      qr.commandTag = msg.commandTag
+    of bmkEmptyQueryResponse:
+      discard
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return qr
+
+proc execute*(
+    stmt: PreparedStatement,
+    params: seq[Option[seq[byte]]] = @[],
+    paramFormats: seq[int16] = @[],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a prepared statement with parameters.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await executeImpl(stmt, params, paramFormats, resultFormats, timeout).wait(
+        timeout
+      )
+    except AsyncTimeoutError:
+      stmt.conn.state = csClosed
+      raise newException(PgError, "Execute timed out")
+  else:
+    return await executeImpl(stmt, params, paramFormats, resultFormats)
+
+proc execute*(
+    stmt: PreparedStatement,
+    params: seq[PgParam],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a prepared statement with typed parameters.
+  let (_, formats, values) = extractParams(params)
+  return await stmt.execute(values, formats, resultFormats, timeout)
+
+proc closeImpl(
+    stmt: PreparedStatement, timeout: Duration = ZeroDuration
+): Future[void] {.async.} =
+  let conn = stmt.conn
+
+  conn.checkReady()
+  conn.state = csBusy
+
+  var batch: seq[byte]
+  batch.add(encodeClose(dkStatement, stmt.name))
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCloseComplete:
+      discard
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+proc close*(
+    stmt: PreparedStatement, timeout: Duration = ZeroDuration
+): Future[void] {.async.} =
+  ## Close a prepared statement.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      await closeImpl(stmt, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      stmt.conn.state = csClosed
+      raise newException(PgError, "Statement close timed out")
+  else:
+    await closeImpl(stmt)
+
+proc notify*(
+    conn: PgConnection,
+    channel: string,
+    payload: string = "",
+    timeout: Duration = ZeroDuration,
+): Future[void] {.async.} =
+  let quoted = quoteIdentifier(channel)
+  if payload.len == 0:
+    discard await conn.exec("NOTIFY " & quoted, timeout = timeout)
+  else:
+    discard await conn.exec(
+      "SELECT pg_notify($1, $2)",
+      @[channel.toPgParam, payload.toPgParam],
+      timeout = timeout,
+    )
+
+proc copyInImpl(
+    conn: PgConnection,
+    sql: string,
+    data: seq[seq[byte]],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+  await conn.sendMsg(encodeQuery(sql))
+
+  var commandTag = ""
+  var errorMsg = ""
+
+  # Wait for CopyInResponse (or error)
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCopyInResponse:
+      break
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      return commandTag
+    else:
+      discard
+
+  # Send CopyData for each chunk
+  for chunk in data:
+    await conn.sendMsg(encodeCopyData(chunk))
+
+  # Send CopyDone
+  await conn.sendMsg(encodeCopyDone())
+
+  # Wait for CommandComplete + ReadyForQuery
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCommandComplete:
+      commandTag = msg.commandTag
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return commandTag
+
+proc copyIn*(
+    conn: PgConnection,
+    sql: string,
+    data: seq[seq[byte]],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute COPY ... FROM STDIN via simple query protocol.
+  ## Sends each element of `data` as a CopyData message, then CopyDone.
+  ## Returns the command tag (e.g. "COPY 5").
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await copyInImpl(conn, sql, data, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "COPY IN timed out")
+  else:
+    return await copyInImpl(conn, sql, data)
+
+proc copyOutImpl(
+    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
+): Future[CopyResult] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+  await conn.sendMsg(encodeQuery(sql))
+
+  var cr = CopyResult()
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCopyOutResponse:
+      cr.format = msg.copyFormat
+      cr.columnFormats = msg.copyColumnFormats
+    of bmkCopyData:
+      cr.data.add(msg.copyData)
+    of bmkCopyDone:
+      discard
+    of bmkCommandComplete:
+      cr.commandTag = msg.commandTag
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return cr
+
+proc copyOut*(
+    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
+): Future[CopyResult] {.async.} =
+  ## Execute COPY ... TO STDOUT via simple query protocol.
+  ## Collects all CopyData messages and returns them in a CopyResult.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await copyOutImpl(conn, sql, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "COPY OUT timed out")
+  else:
+    return await copyOutImpl(conn, sql)
+
+proc copyOutStreamImpl(
+    conn: PgConnection,
+    sql: string,
+    callback: CopyOutCallback,
+    timeout: Duration = ZeroDuration,
+): Future[CopyOutInfo] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+  await conn.sendMsg(encodeQuery(sql))
+
+  var info = CopyOutInfo()
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCopyOutResponse:
+      info.format = msg.copyFormat
+      info.columnFormats = msg.copyColumnFormats
+    of bmkCopyData:
+      try:
+        await callback(msg.copyData)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
+    of bmkCopyDone:
+      discard
+    of bmkCommandComplete:
+      info.commandTag = msg.commandTag
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return info
+
+proc copyOutStream*(
+    conn: PgConnection,
+    sql: string,
+    callback: CopyOutCallback,
+    timeout: Duration = ZeroDuration,
+): Future[CopyOutInfo] {.async.} =
+  ## Execute COPY ... TO STDOUT via simple query protocol, streaming each
+  ## CopyData chunk through `callback`. The callback is awaited, providing
+  ## natural TCP backpressure. If the callback raises, the connection is
+  ## marked csClosed (protocol cannot be resynchronized).
+  if timeout > ZeroDuration:
+    try:
+      return await copyOutStreamImpl(conn, sql, callback, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "COPY OUT stream timed out")
+  else:
+    return await copyOutStreamImpl(conn, sql, callback)
+
+template withTransaction*(
+    conn: PgConnection, body: untyped, txTimeout: Duration = ZeroDuration
+) =
+  ## Execute `body` inside a BEGIN/COMMIT transaction.
+  ## On exception, ROLLBACK is issued automatically.
+  ## **Note:** Do not use `return` inside the body.
+  discard await conn.exec("BEGIN", timeout = txTimeout)
+  try:
+    body
+    discard await conn.exec("COMMIT", timeout = txTimeout)
+  except CatchableError as e:
+    try:
+      discard await conn.exec("ROLLBACK", timeout = txTimeout)
+    except CatchableError:
+      discard
+    raise e
+
+proc openCursorImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    resultFormats: seq[int16],
+    chunkSize: int32,
+    timeout: Duration = ZeroDuration,
+): Future[Cursor] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  inc conn.portalCounter
+  let portalName = "_cursor_" & $conn.portalCounter
+
+  var batch: seq[byte]
+  batch.add(encodeParse("", sql, paramOids))
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+  batch.add(encodeBind(portalName, "", formats, params, resultFormats))
+  batch.add(encodeDescribe(dkPortal, portalName))
+  batch.add(encodeExecute(portalName, chunkSize))
+  batch.add(encodeFlush())
+  await conn.sendMsg(batch)
+
+  var cursor =
+    Cursor(conn: conn, portalName: portalName, chunkSize: chunkSize, exhausted: false)
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkRowDescription:
+      cursor.fields = msg.fields
+    of bmkNoData:
+      discard
+    of bmkDataRow:
+      cursor.buffered.add(msg.columns)
+    of bmkPortalSuspended:
+      break
+    of bmkCommandComplete:
+      cursor.exhausted = true
+      # Need to Sync to get ReadyForQuery
+      await conn.sendMsg(encodeSync())
+      while true:
+        let rmsg = await conn.recvMessage(timeout)
+        case rmsg.kind
+        of bmkReadyForQuery:
+          conn.txStatus = rmsg.txStatus
+          conn.state = csReady
+          break
+        else:
+          discard
+      break
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+      # Drain until ReadyForQuery
+      await conn.sendMsg(encodeSync())
+      while true:
+        let rmsg = await conn.recvMessage(timeout)
+        if rmsg.kind == bmkReadyForQuery:
+          conn.txStatus = rmsg.txStatus
+          conn.state = csReady
+          break
+      raise newException(PgError, errorMsg)
+    else:
+      discard
+
+  return cursor
+
+proc openCursor*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    resultFormats: seq[int16] = @[],
+    chunkSize: int32 = 100,
+    timeout: Duration = ZeroDuration,
+): Future[Cursor] {.async.} =
+  ## Open a server-side cursor for streaming rows in chunks.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      result = await openCursorImpl(
+        conn, sql, params, paramOids, paramFormats, resultFormats, chunkSize, timeout
+      )
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "Cursor open timed out")
+  else:
+    result = await openCursorImpl(
+      conn, sql, params, paramOids, paramFormats, resultFormats, chunkSize
+    )
+  result.timeout = timeout
+
+proc fetchNextImpl(
+    cursor: Cursor, timeout: Duration = ZeroDuration
+): Future[seq[Row]] {.async.} =
+  let conn = cursor.conn
+
+  var batch: seq[byte]
+  batch.add(encodeExecute(cursor.portalName, cursor.chunkSize))
+  batch.add(encodeFlush())
+  await conn.sendMsg(batch)
+
+  var rows: seq[Row]
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkDataRow:
+      rows.add(msg.columns)
+    of bmkPortalSuspended:
+      break
+    of bmkCommandComplete:
+      cursor.exhausted = true
+      # Close portal and sync
+      var closeBatch: seq[byte]
+      closeBatch.add(encodeClose(dkPortal, cursor.portalName))
+      closeBatch.add(encodeSync())
+      await conn.sendMsg(closeBatch)
+      while true:
+        let rmsg = await conn.recvMessage(timeout)
+        case rmsg.kind
+        of bmkCloseComplete:
+          discard
+        of bmkReadyForQuery:
+          conn.txStatus = rmsg.txStatus
+          conn.state = csReady
+          break
+        else:
+          discard
+      break
+    of bmkErrorResponse:
+      let errorMsg = formatError(msg.errorFields)
+      await conn.sendMsg(encodeSync())
+      while true:
+        let rmsg = await conn.recvMessage(timeout)
+        if rmsg.kind == bmkReadyForQuery:
+          conn.txStatus = rmsg.txStatus
+          conn.state = csReady
+          break
+      raise newException(PgError, errorMsg)
+    else:
+      discard
+
+  return rows
+
+proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
+  ## Fetch the next chunk of rows from the cursor.
+  ## Returns an empty seq when the cursor is exhausted.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if cursor.buffered.len > 0:
+    result = cursor.buffered
+    cursor.buffered = @[]
+    return result
+
+  if cursor.exhausted:
+    return @[]
+
+  if cursor.timeout > ZeroDuration:
+    try:
+      return await fetchNextImpl(cursor, cursor.timeout).wait(cursor.timeout)
+    except AsyncTimeoutError:
+      cursor.conn.state = csClosed
+      raise newException(PgError, "Cursor fetch timed out")
+  else:
+    return await fetchNextImpl(cursor)
+
+proc closeCursorImpl(
+    cursor: Cursor, timeout: Duration = ZeroDuration
+): Future[void] {.async.} =
+  if cursor.exhausted:
+    return
+
+  let conn = cursor.conn
+  var batch: seq[byte]
+  batch.add(encodeClose(dkPortal, cursor.portalName))
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCloseComplete:
+      discard
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      break
+    else:
+      discard
+
+  cursor.exhausted = true
+
+proc closeCursor*(cursor: Cursor): Future[void] {.async.} =
+  ## Close the cursor and return the connection to ready state.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if cursor.timeout > ZeroDuration:
+    try:
+      await closeCursorImpl(cursor, cursor.timeout).wait(cursor.timeout)
+    except AsyncTimeoutError:
+      cursor.conn.state = csClosed
+      raise newException(PgError, "Cursor close timed out")
+  else:
+    await closeCursorImpl(cursor)
+
+template withCursor*(
+    conn: PgConnection,
+    sql: string,
+    chunks: int32,
+    cursorName, body: untyped,
+    cursorTimeout: Duration = ZeroDuration,
+) =
+  let cursorName =
+    await conn.openCursor(sql, chunkSize = chunks, timeout = cursorTimeout)
+  try:
+    body
+  finally:
+    await cursorName.closeCursor()
+
+proc openCursor*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    resultFormats: seq[int16] = @[],
+    chunkSize: int32 = 100,
+    timeout: Duration = ZeroDuration,
+): Future[Cursor] {.async.} =
+  ## Open a cursor with typed parameters.
+  let (oids, formats, values) = extractParams(params)
+  return
+    await conn.openCursor(sql, values, oids, formats, resultFormats, chunkSize, timeout)

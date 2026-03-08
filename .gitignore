@@ -1,0 +1,12 @@
+nimble.develop
+nimble.paths
+nimbledeps
+config.nims
+
+tests/certs/
+
+async_postgres/*
+!async_postgres/*.*
+
+tests/*
+!tests/*.*
