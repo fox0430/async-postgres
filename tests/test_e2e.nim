@@ -3639,3 +3639,59 @@ suite "E2E: COPY IN Stream":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: Column Name Access":
+  test "columnIndex on QueryResult":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT 42::int4 AS id, 'alice'::text AS name")
+      doAssert res.columnIndex("id") == 0
+      doAssert res.columnIndex("name") == 1
+      doAssert res.rows[0].getInt(res.columnIndex("id")) == 42'i32
+      doAssert res.rows[0].getStr(res.columnIndex("name")) == "alice"
+      await conn.close()
+
+    waitFor t()
+
+  test "columnMap for repeated access":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT 1::int4 AS a, 'x'::text AS b UNION ALL SELECT 2, 'y'")
+      let cols = res.fields.columnMap()
+      doAssert res.rows[0].getInt(cols["a"]) == 1'i32
+      doAssert res.rows[0].getStr(cols["b"]) == "x"
+      doAssert res.rows[1].getInt(cols["a"]) == 2'i32
+      doAssert res.rows[1].getStr(cols["b"]) == "y"
+      await conn.close()
+
+    waitFor t()
+
+  test "columnIndex on PreparedStatement":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let stmt =
+        await conn.prepare("col_idx_stmt", "SELECT $1::int4 AS val, $2::text AS label")
+      doAssert stmt.columnIndex("val") == 0
+      doAssert stmt.columnIndex("label") == 1
+      let res = await stmt.execute(@[toPgParam(99'i32), toPgParam("test")])
+      doAssert res.rows[0].getInt(stmt.columnIndex("val")) == 99'i32
+      doAssert res.rows[0].getStr(stmt.columnIndex("label")) == "test"
+      await stmt.close()
+      await conn.close()
+
+    waitFor t()
+
+  test "columnIndex raises for missing column":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT 1 AS x")
+      var raised = false
+      try:
+        discard res.columnIndex("nonexistent")
+      except PgTypeError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
