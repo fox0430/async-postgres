@@ -1,4 +1,4 @@
-import std/[tables, sets, strutils, uri, deques]
+import std/[tables, sets, strutils, uri, deques, posix]
 
 import async_backend
 
@@ -11,6 +11,18 @@ elif hasAsyncDispatch:
     import std/[net, tempfiles, os]
 
 import pg_protocol, pg_auth, pg_types
+
+# TCP keepalive socket options (not exported by posix module)
+when defined(linux):
+  var
+    TCP_KEEPIDLE {.importc, header: "<netinet/tcp.h>".}: cint
+    TCP_KEEPINTVL {.importc, header: "<netinet/tcp.h>".}: cint
+    TCP_KEEPCNT {.importc, header: "<netinet/tcp.h>".}: cint
+elif defined(macosx):
+  var TCP_KEEPALIVE {.importc, header: "<netinet/tcp.h>".}: cint
+  const
+    TCP_KEEPINTVL = cint(0x101)
+    TCP_KEEPCNT = cint(0x102)
 
 type
   PgError* = object of CatchableError
@@ -40,6 +52,10 @@ type
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
     applicationName*: string
     connectTimeout*: Duration ## TCP connect timeout (default: no timeout)
+    keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
+    keepAliveIdle*: int ## Seconds before first probe (0 = OS default)
+    keepAliveInterval*: int ## Seconds between probes (0 = OS default)
+    keepAliveCount*: int ## Number of probes before giving up (0 = OS default)
     extraParams*: seq[(string, string)] ## Additional startup parameters
 
   Notification* = object
@@ -425,6 +441,52 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
   else:
     raise newException(PgError, "Unexpected SSL response: " & $respChar)
 
+proc configureKeepalive(fd: SocketHandle, config: ConnConfig) =
+  ## Set TCP keepalive options on the socket.
+  if not config.keepAlive:
+    return
+  var optval: cint = 1
+  if setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, addr optval, sizeof(optval).SockLen) < 0:
+    raise newException(PgError, "Failed to set SO_KEEPALIVE: " & $strerror(errno))
+  when defined(linux):
+    if config.keepAliveIdle > 0:
+      optval = cint(config.keepAliveIdle)
+      if setsockopt(
+        fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE, addr optval, sizeof(optval).SockLen
+      ) < 0:
+        raise newException(PgError, "Failed to set TCP_KEEPIDLE: " & $strerror(errno))
+    if config.keepAliveInterval > 0:
+      optval = cint(config.keepAliveInterval)
+      if setsockopt(
+        fd, cint(posix.IPPROTO_TCP), TCP_KEEPINTVL, addr optval, sizeof(optval).SockLen
+      ) < 0:
+        raise newException(PgError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno))
+    if config.keepAliveCount > 0:
+      optval = cint(config.keepAliveCount)
+      if setsockopt(
+        fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
+      ) < 0:
+        raise newException(PgError, "Failed to set TCP_KEEPCNT: " & $strerror(errno))
+  elif defined(macosx):
+    if config.keepAliveIdle > 0:
+      optval = cint(config.keepAliveIdle)
+      if setsockopt(
+        fd, cint(posix.IPPROTO_TCP), TCP_KEEPALIVE, addr optval, sizeof(optval).SockLen
+      ) < 0:
+        raise newException(PgError, "Failed to set TCP_KEEPALIVE: " & $strerror(errno))
+    if config.keepAliveInterval > 0:
+      optval = cint(config.keepAliveInterval)
+      if setsockopt(
+        fd, cint(posix.IPPROTO_TCP), TCP_KEEPINTVL, addr optval, sizeof(optval).SockLen
+      ) < 0:
+        raise newException(PgError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno))
+    if config.keepAliveCount > 0:
+      optval = cint(config.keepAliveCount)
+      if setsockopt(
+        fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
+      ) < 0:
+        raise newException(PgError, "Failed to set TCP_KEEPCNT: " & $strerror(errno))
+
 proc connect*(config: ConnConfig): Future[PgConnection] =
   proc perform(): Future[PgConnection] {.async.} =
     var conn: PgConnection
@@ -434,6 +496,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       if addresses.len == 0:
         raise newException(PgError, "Could not resolve host: " & config.host)
       let transport = await connect(addresses[0])
+      configureKeepalive(SocketHandle(transport.fd), config)
       conn = PgConnection(
         transport: transport,
         recvBuf: @[],
@@ -448,6 +511,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       let sock = newAsyncSocket(buffered = false)
       try:
         await sock.connect(config.host, Port(config.port))
+        configureKeepalive(sock.getFd(), config)
       except CatchableError:
         sock.close()
         raise
@@ -905,6 +969,7 @@ proc parseDsn*(dsn: string): ConnConfig =
   ## Format: ``postgresql://[user[:password]@][host[:port]][/database][?param=value&...]``
   ##
   ## Both ``postgresql://`` and ``postgres://`` schemes are accepted.
+  result.keepAlive = true
   let scheme =
     if dsn.startsWith("postgresql://"):
       "postgresql"
@@ -1009,5 +1074,25 @@ proc parseDsn*(dsn: string): ConnConfig =
           result.sslRootCert = readFile(val)
         except IOError:
           raise newException(PgError, "Cannot read sslrootcert file: " & val)
+      of "keepalives":
+        try:
+          result.keepAlive = parseInt(val) != 0
+        except ValueError:
+          raise newException(PgError, "Invalid keepalives: " & val)
+      of "keepalives_idle":
+        try:
+          result.keepAliveIdle = parseInt(val)
+        except ValueError:
+          raise newException(PgError, "Invalid keepalives_idle: " & val)
+      of "keepalives_interval":
+        try:
+          result.keepAliveInterval = parseInt(val)
+        except ValueError:
+          raise newException(PgError, "Invalid keepalives_interval: " & val)
+      of "keepalives_count":
+        try:
+          result.keepAliveCount = parseInt(val)
+        except ValueError:
+          raise newException(PgError, "Invalid keepalives_count: " & val)
       else:
         result.extraParams.add((key, val))
