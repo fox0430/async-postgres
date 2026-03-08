@@ -1,4 +1,4 @@
-import std/[json, options, strutils, times]
+import std/[json, options, strutils, tables, times]
 
 import pg_protocol
 
@@ -755,3 +755,15 @@ proc getJson*(row: Row, col: int, fields: seq[FieldDescription]): JsonNode =
     return parseJson(jsonStr)
   except JsonParsingError:
     raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
+
+proc columnIndex*(fields: seq[FieldDescription], name: string): int =
+  ## Find the index of a column by name. Raises PgTypeError if not found.
+  for i, f in fields:
+    if f.name == name:
+      return i
+  raise newException(PgTypeError, "Column not found: " & name)
+
+proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
+  ## Build a name-to-index mapping for all columns.
+  for i, f in fields:
+    result[f.name] = i

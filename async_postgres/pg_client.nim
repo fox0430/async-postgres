@@ -20,6 +20,14 @@ type
     exhausted*: bool
     buffered: seq[Row]
 
+proc columnIndex*(stmt: PreparedStatement, name: string): int =
+  ## Find the index of a column by name in a prepared statement.
+  stmt.fields.columnIndex(name)
+
+proc columnIndex*(cursor: Cursor, name: string): int =
+  ## Find the index of a column by name in a cursor.
+  cursor.fields.columnIndex(name)
+
 proc extractParams(
     params: openArray[PgParam]
 ): tuple[oids: seq[int32], formats: seq[int16], values: seq[Option[seq[byte]]]] =

@@ -1,4 +1,4 @@
-import std/[json, unittest, options, strutils, times, math]
+import std/[json, unittest, options, strutils, tables, times, math]
 
 import ../async_postgres/[pg_protocol, pg_types]
 
@@ -1484,3 +1484,54 @@ suite "PgNumeric":
     let p = toPgBinaryParam(none(PgNumeric))
     check p.oid == OidNumeric
     check p.value.isNone
+
+suite "columnIndex and columnMap":
+  proc mkFieldDesc(name: string): FieldDescription =
+    FieldDescription(
+      name: name,
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: OidText,
+      typeSize: -1,
+      typeMod: -1,
+      formatCode: 0,
+    )
+
+  let fields = @[mkFieldDesc("id"), mkFieldDesc("name"), mkFieldDesc("email")]
+
+  test "columnIndex finds existing column":
+    check fields.columnIndex("id") == 0
+    check fields.columnIndex("name") == 1
+    check fields.columnIndex("email") == 2
+
+  test "columnIndex raises on missing column":
+    var raised = false
+    try:
+      discard fields.columnIndex("missing")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "columnIndex is case-sensitive":
+    var raised = false
+    try:
+      discard fields.columnIndex("Name")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "columnMap builds complete mapping":
+    let m = fields.columnMap()
+    check m.len == 3
+    check m["id"] == 0
+    check m["name"] == 1
+    check m["email"] == 2
+
+  test "columnMap with empty fields":
+    let empty: seq[FieldDescription] = @[]
+    let m = empty.columnMap()
+    check m.len == 0
+
+  test "columnIndex with single field":
+    let single = @[mkFieldDesc("only")]
+    check single.columnIndex("only") == 0

@@ -125,6 +125,10 @@ type
     columnFormats*: seq[int16]
     commandTag*: string
 
+proc columnIndex*(qr: QueryResult, name: string): int =
+  ## Find the index of a column by name in a query result.
+  qr.fields.columnIndex(name)
+
 when hasChronos:
   type CopyOutCallback* =
     proc(data: seq[byte]): Future[void] {.async: (raises: [CatchableError]), gcsafe.}
