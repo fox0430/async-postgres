@@ -479,6 +479,105 @@ proc copyIn*(
   else:
     return await copyInImpl(conn, sql, data)
 
+proc copyInStreamImpl(
+    conn: PgConnection,
+    sql: string,
+    callback: CopyInCallback,
+    timeout: Duration = ZeroDuration,
+): Future[CopyInInfo] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+  await conn.sendMsg(encodeQuery(sql))
+
+  var info = CopyInInfo()
+  var errorMsg = ""
+
+  # Wait for CopyInResponse (or error)
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCopyInResponse:
+      info.format = msg.copyFormat
+      info.columnFormats = msg.copyColumnFormats
+      break
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      return info
+    else:
+      discard
+
+  # Pull data from callback and send as CopyData
+  var callbackError: ref CatchableError = nil
+  try:
+    while true:
+      let chunk = await callback()
+      if chunk.len == 0:
+        break
+      await conn.sendMsg(encodeCopyData(chunk))
+  except CatchableError as e:
+    callbackError = e
+
+  if callbackError != nil:
+    # Callback raised: send CopyFail, drain until ReadyForQuery, re-raise
+    await conn.sendMsg(encodeCopyFail(callbackError.msg))
+    while true:
+      let msg = await conn.recvMessage(timeout)
+      case msg.kind
+      of bmkReadyForQuery:
+        conn.txStatus = msg.txStatus
+        conn.state = csReady
+        break
+      else:
+        discard
+    raise callbackError
+  else:
+    # Normal completion: send CopyDone
+    await conn.sendMsg(encodeCopyDone())
+
+  # Wait for CommandComplete + ReadyForQuery
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCommandComplete:
+      info.commandTag = msg.commandTag
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return info
+
+proc copyInStream*(
+    conn: PgConnection,
+    sql: string,
+    callback: CopyInCallback,
+    timeout: Duration = ZeroDuration,
+): Future[CopyInInfo] {.async.} =
+  ## Execute COPY ... FROM STDIN via simple query protocol, streaming data
+  ## from `callback`. The callback is called repeatedly; returning an empty
+  ## seq[byte] signals EOF. If the callback raises, CopyFail is sent and
+  ## the connection returns to csReady.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await copyInStreamImpl(conn, sql, callback, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "COPY IN stream timed out")
+  else:
+    return await copyInStreamImpl(conn, sql, callback)
+
 proc copyOutImpl(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CopyResult] {.async.} =
