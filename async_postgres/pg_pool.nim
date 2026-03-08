@@ -1,4 +1,4 @@
-import std/[deques, options]
+import std/[deques, macros, options]
 
 import async_backend, pg_protocol, pg_connection, pg_client, pg_types
 
@@ -384,30 +384,66 @@ proc notify*(
   finally:
     pool.release(conn)
 
-template withTransaction*(
-    pool: PgPool, conn, body: untyped, txTimeout: Duration = ZeroDuration
-) =
+macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction using a pooled connection.
   ## On exception, ROLLBACK is issued automatically.
   ## **Note:** Do not use `return` inside the body.
   ##
+  ## Usage:
+  ##   pool.withTransaction(conn):
+  ##     conn.exec(...)
+  ##   pool.withTransaction(conn, TransactionOptions(isolation: ilSerializable)):
+  ##     conn.exec(...)
+  ##   pool.withTransaction(conn, opts, seconds(5)):
+  ##     conn.exec(...)
+  ##
   ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
   ## directly — not `pool.exec(...)` / `pool.query(...)`. Pool methods acquire
   ## a separate connection, so those statements would run outside this transaction.
-  let conn = await pool.acquire()
-  try:
-    discard await conn.exec("BEGIN", timeout = txTimeout)
+  var connIdent, body: NimNode
+  var beginSql: NimNode
+  var txTimeout: NimNode
+  case args.len
+  of 2:
+    connIdent = args[0]
+    body = args[1]
+    beginSql = newStrLitNode("BEGIN")
+    txTimeout = bindSym"ZeroDuration"
+  of 3:
+    connIdent = args[0]
+    let opts = args[1]
+    body = args[2]
+    beginSql = newCall(bindSym"buildBeginSql", opts)
+    txTimeout = bindSym"ZeroDuration"
+  of 4:
+    connIdent = args[0]
+    let opts = args[1]
+    txTimeout = args[2]
+    body = args[3]
+    beginSql = newCall(bindSym"buildBeginSql", opts)
+  else:
+    error(
+      "withTransaction expects (conn, body), (conn, opts, body), or (conn, opts, timeout, body)",
+      args[0],
+    )
+
+  let poolSym = pool
+  let eSym = genSym(nskLet, "e")
+  result = quote:
+    let `connIdent` = await `poolSym`.acquire()
     try:
-      body
-      discard await conn.exec("COMMIT", timeout = txTimeout)
-    except CatchableError as e:
+      discard await `connIdent`.exec(`beginSql`, timeout = `txTimeout`)
       try:
-        discard await conn.exec("ROLLBACK", timeout = txTimeout)
-      except CatchableError:
-        discard
-      raise e
-  finally:
-    pool.release(conn)
+        `body`
+        discard await `connIdent`.exec("COMMIT", timeout = `txTimeout`)
+      except CatchableError as `eSym`:
+        try:
+          discard await `connIdent`.exec("ROLLBACK", timeout = `txTimeout`)
+        except CatchableError:
+          discard
+        raise `eSym`
+    finally:
+      `poolSym`.release(`connIdent`)
 
 proc close*(pool: PgPool): Future[void] {.async.} =
   pool.closed = true

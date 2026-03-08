@@ -20,6 +20,56 @@ type
     exhausted*: bool
     buffered: seq[Row]
 
+  IsolationLevel* = enum
+    ilDefault
+    ilReadCommitted
+    ilRepeatableRead
+    ilSerializable
+    ilReadUncommitted
+
+  AccessMode* = enum
+    amDefault
+    amReadWrite
+    amReadOnly
+
+  DeferrableMode* = enum
+    dmDefault
+    dmDeferrable
+    dmNotDeferrable
+
+  TransactionOptions* = object
+    isolation*: IsolationLevel
+    access*: AccessMode
+    deferrable*: DeferrableMode
+
+proc buildBeginSql*(opts: TransactionOptions): string =
+  result = "BEGIN"
+  case opts.isolation
+  of ilDefault:
+    discard
+  of ilReadCommitted:
+    result.add " ISOLATION LEVEL READ COMMITTED"
+  of ilRepeatableRead:
+    result.add " ISOLATION LEVEL REPEATABLE READ"
+  of ilSerializable:
+    result.add " ISOLATION LEVEL SERIALIZABLE"
+  of ilReadUncommitted:
+    result.add " ISOLATION LEVEL READ UNCOMMITTED"
+  case opts.access
+  of amDefault:
+    discard
+  of amReadWrite:
+    result.add " READ WRITE"
+  of amReadOnly:
+    result.add " READ ONLY"
+  case opts.deferrable
+  of dmDefault:
+    discard
+  of dmDeferrable:
+    result.add " DEFERRABLE"
+  of dmNotDeferrable:
+    result.add " NOT DEFERRABLE"
+
 proc columnIndex*(stmt: PreparedStatement, name: string): int =
   ## Find the index of a column by name in a prepared statement.
   stmt.fields.columnIndex(name)
@@ -793,6 +843,54 @@ template withTransaction*(
   except CatchableError as e:
     try:
       discard await conn.exec("ROLLBACK", timeout = txTimeout)
+    except CatchableError:
+      discard
+    raise e
+
+template withTransaction*(
+    conn: PgConnection,
+    opts: TransactionOptions,
+    body: untyped,
+    txTimeout: Duration = ZeroDuration,
+) =
+  let beginSql = buildBeginSql(opts)
+  discard await conn.exec(beginSql, timeout = txTimeout)
+  try:
+    body
+    discard await conn.exec("COMMIT", timeout = txTimeout)
+  except CatchableError as e:
+    try:
+      discard await conn.exec("ROLLBACK", timeout = txTimeout)
+    except CatchableError:
+      discard
+    raise e
+
+template withSavepoint*(
+    conn: PgConnection, body: untyped, spTimeout: Duration = ZeroDuration
+) =
+  inc conn.portalCounter
+  let spName = "_sp_" & $conn.portalCounter
+  discard await conn.exec("SAVEPOINT " & spName, timeout = spTimeout)
+  try:
+    body
+    discard await conn.exec("RELEASE SAVEPOINT " & spName, timeout = spTimeout)
+  except CatchableError as e:
+    try:
+      discard await conn.exec("ROLLBACK TO SAVEPOINT " & spName, timeout = spTimeout)
+    except CatchableError:
+      discard
+    raise e
+
+template withSavepoint*(
+    conn: PgConnection, name: string, body: untyped, spTimeout: Duration = ZeroDuration
+) =
+  discard await conn.exec("SAVEPOINT " & name, timeout = spTimeout)
+  try:
+    body
+    discard await conn.exec("RELEASE SAVEPOINT " & name, timeout = spTimeout)
+  except CatchableError as e:
+    try:
+      discard await conn.exec("ROLLBACK TO SAVEPOINT " & name, timeout = spTimeout)
     except CatchableError:
       discard
     raise e

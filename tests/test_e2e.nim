@@ -915,6 +915,190 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  test "withTransaction with isolation level commits":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_iso")
+      discard
+        await conn.exec("CREATE TABLE test_tx_iso (id serial PRIMARY KEY, val text)")
+
+      conn.withTransaction(TransactionOptions(isolation: ilSerializable)):
+        discard await conn.exec(
+          "INSERT INTO test_tx_iso (val) VALUES ($1)", @[some("serializable".toBytes())]
+        )
+
+      let res = await conn.query("SELECT val FROM test_tx_iso")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "serializable"
+
+      discard await conn.exec("DROP TABLE test_tx_iso")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction with READ ONLY rejects writes":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_ro")
+      discard
+        await conn.exec("CREATE TABLE test_tx_ro (id serial PRIMARY KEY, val text)")
+
+      var raised = false
+      try:
+        conn.withTransaction(TransactionOptions(access: amReadOnly)):
+          discard await conn.exec(
+            "INSERT INTO test_tx_ro (val) VALUES ($1)", @[some("nope".toBytes())]
+          )
+      except PgError:
+        raised = true
+
+      doAssert raised
+
+      discard await conn.exec("DROP TABLE test_tx_ro")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction with all options":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      conn.withTransaction(
+        TransactionOptions(
+          isolation: ilSerializable, access: amReadOnly, deferrable: dmDeferrable
+        )
+      ):
+        let res = await conn.query("SELECT 1")
+        doAssert res.rows.len == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pool.withTransaction with options":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptx_opts")
+      discard
+        await pool.exec("CREATE TABLE test_ptx_opts (id serial PRIMARY KEY, val text)")
+
+      pool.withTransaction(conn, TransactionOptions(isolation: ilRepeatableRead)):
+        discard await conn.exec(
+          "INSERT INTO test_ptx_opts (val) VALUES ($1)", @[some("pool_opts".toBytes())]
+        )
+
+      let res = await pool.query("SELECT val FROM test_ptx_opts")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "pool_opts"
+
+      discard await pool.exec("DROP TABLE test_ptx_opts")
+      await pool.close()
+
+    waitFor t()
+
+  test "withSavepoint releases on success":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp")
+      discard await conn.exec("CREATE TABLE test_sp (id serial PRIMARY KEY, val text)")
+
+      conn.withTransaction:
+        conn.withSavepoint:
+          discard await conn.exec(
+            "INSERT INTO test_sp (val) VALUES ($1)", @[some("saved".toBytes())]
+          )
+
+      let res = await conn.query("SELECT val FROM test_sp")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "saved"
+
+      discard await conn.exec("DROP TABLE test_sp")
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepoint rolls back on exception":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp_rb")
+      discard
+        await conn.exec("CREATE TABLE test_sp_rb (id serial PRIMARY KEY, val text)")
+
+      conn.withTransaction:
+        discard await conn.exec(
+          "INSERT INTO test_sp_rb (val) VALUES ($1)", @[some("before".toBytes())]
+        )
+        try:
+          conn.withSavepoint:
+            discard await conn.exec(
+              "INSERT INTO test_sp_rb (val) VALUES ($1)", @[some("inner".toBytes())]
+            )
+            raise newException(ValueError, "savepoint error")
+        except ValueError:
+          discard
+
+      let res = await conn.query("SELECT val FROM test_sp_rb ORDER BY id")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "before"
+
+      discard await conn.exec("DROP TABLE test_sp_rb")
+      await conn.close()
+
+    waitFor t()
+
+  test "nested withSavepoint":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp_nest")
+      discard
+        await conn.exec("CREATE TABLE test_sp_nest (id serial PRIMARY KEY, val text)")
+
+      conn.withTransaction:
+        conn.withSavepoint:
+          discard await conn.exec(
+            "INSERT INTO test_sp_nest (val) VALUES ($1)", @[some("outer".toBytes())]
+          )
+          try:
+            conn.withSavepoint:
+              discard await conn.exec(
+                "INSERT INTO test_sp_nest (val) VALUES ($1)", @[some("inner".toBytes())]
+              )
+              raise newException(ValueError, "inner error")
+          except ValueError:
+            discard
+
+      let res = await conn.query("SELECT val FROM test_sp_nest ORDER BY id")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "outer"
+
+      discard await conn.exec("DROP TABLE test_sp_nest")
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepoint with named savepoint":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp_named")
+      discard
+        await conn.exec("CREATE TABLE test_sp_named (id serial PRIMARY KEY, val text)")
+
+      conn.withTransaction:
+        conn.withSavepoint("my_sp"):
+          discard await conn.exec(
+            "INSERT INTO test_sp_named (val) VALUES ($1)", @[some("named".toBytes())]
+          )
+
+      let res = await conn.query("SELECT val FROM test_sp_named")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "named"
+
+      discard await conn.exec("DROP TABLE test_sp_named")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":
     proc t() {.async.} =
