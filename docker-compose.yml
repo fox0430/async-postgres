@@ -11,6 +11,11 @@ services:
       - ./tests/certs/server.crt:/tmp/certs/server.crt:ro
       - ./tests/certs/server.key:/tmp/certs/server.key:ro
       - ./tests/certs/ca.crt:/tmp/certs/ca.crt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
     command:
       - bash
       - -c

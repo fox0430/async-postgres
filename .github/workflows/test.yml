@@ -1,0 +1,73 @@
+name: Unit tests
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/test.yml'
+      - 'docker-compose.yml'
+      - 'async_postgres.nim*'
+      - 'async_postgres/**'
+      - 'tests/**'
+  push:
+    paths:
+      - '.github/workflows/test.yml'
+      - 'docker-compose.yml'
+      - 'async_postgres.nim*'
+      - 'async_postgres/**'
+      - 'tests/**'
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        nim-version:
+          - '2.2.0'
+          - 'stable'
+          - 'devel'
+
+    name: Tests on ${{ matrix.nim-version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache nimble
+        id: cache-nimble
+        uses: actions/cache@v5
+        with:
+          path: ~/.nimble
+          key: ${{ runner.os }}-nimble-v2-${{ hashFiles('*.nimble') }}
+          restore-keys: |
+            ${{ runner.os }}-nimble-v2-
+
+      - name: Setup Nim (stable/release)
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.nim-version }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        if: matrix.nim-version != 'devel'
+
+      - name: Setup Nim (devel)
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.nim-version }}
+          use-nightlies: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        if: matrix.nim-version == 'devel'
+
+      - name: Generate test certificates
+        run: bash tests/gen_certs.sh
+
+      - name: Start PostgreSQL
+        run: docker compose up -d --wait
+
+      - name: Install chronos
+        run: nimble install chronos -y
+
+      - name: Run tests
+        run: nimble test -y
