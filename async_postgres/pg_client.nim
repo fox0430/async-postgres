@@ -212,6 +212,89 @@ proc query*(
   let (oids, formats, values) = extractParams(params)
   return await conn.query(sql, values, oids, formats, resultFormats, timeout)
 
+proc queryOne*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[Row]] {.async.} =
+  ## Execute a query and return the first row, or `none` if no rows.
+  let qr =
+    await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
+  if qr.rows.len > 0:
+    return some(qr.rows[0])
+  else:
+    return none(Row)
+
+proc queryValue*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a query and return the first column of the first row as a string.
+  ## Raises PgError if no rows are returned or the value is NULL.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  if qr.rows.len == 0:
+    raise newException(PgError, "Query returned no rows")
+  let cell = qr.rows[0][0]
+  if cell.isNone:
+    raise newException(PgError, "Query returned NULL")
+  return fromPgText(cell.get, 0)
+
+proc queryValueOrDefault*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: string = "",
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a query and return the first column of the first row as a string.
+  ## Returns `default` if no rows or the value is NULL.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  if qr.rows.len == 0:
+    return default
+  let cell = qr.rows[0][0]
+  if cell.isNone:
+    return default
+  return fromPgText(cell.get, 0)
+
+proc queryExists*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[bool] {.async.} =
+  ## Execute a query and return whether any rows exist.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  return qr.rows.len > 0
+
+proc execAffected*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  ## Execute a statement and return the number of affected rows.
+  let tag = await conn.exec(sql, params, timeout)
+  return affectedRows(tag)
+
+proc queryColumn*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[seq[string]] {.async.} =
+  ## Execute a query and return the first column of all rows as strings.
+  ## Raises PgTypeError if any value is NULL.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  for row in qr.rows:
+    let cell = row[0]
+    if cell.isNone:
+      raise newException(PgTypeError, "NULL value in column")
+    result.add(fromPgText(cell.get, 0))
+
 proc prepareImpl(
     conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
 ): Future[PreparedStatement] {.async.} =

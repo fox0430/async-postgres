@@ -291,6 +291,80 @@ proc query*(
   finally:
     pool.release(conn)
 
+proc queryOne*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[Row]] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryOne(sql, params, resultFormats, timeout)
+  finally:
+    pool.release(conn)
+
+proc queryValue*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValue(sql, params, timeout = timeout)
+  finally:
+    pool.release(conn)
+
+proc queryValueOrDefault*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: string = "",
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOrDefault(sql, params, default, timeout)
+  finally:
+    pool.release(conn)
+
+proc queryExists*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[bool] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryExists(sql, params, timeout)
+  finally:
+    pool.release(conn)
+
+proc execAffected*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.execAffected(sql, params, timeout)
+  finally:
+    pool.release(conn)
+
+proc queryColumn*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[seq[string]] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryColumn(sql, params, timeout)
+  finally:
+    pool.release(conn)
+
 proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.} =
   let conn = await pool.acquire()
   try:
