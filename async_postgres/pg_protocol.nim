@@ -350,10 +350,11 @@ proc encodeCancelRequest*(pid: int32, secretKey: int32): seq[byte] =
   for i, kb in keyBytes:
     result[i + 12] = kb
 
-proc encodeCopyData*(data: seq[byte]): seq[byte] =
-  result.add(byte('d'))
-  result.addInt32(int32(4 + data.len))
-  result.add(data)
+proc encodeCopyData*(buf: var seq[byte], data: seq[byte]) =
+  ## Encode a CopyData message, appending to `buf`.
+  buf.add(byte('d'))
+  buf.addInt32(int32(4 + data.len))
+  buf.add(data)
 
 proc encodeCopyDone*(): seq[byte] =
   result = @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]

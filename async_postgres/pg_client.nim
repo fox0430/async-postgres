@@ -3,6 +3,7 @@ import std/options
 import async_backend, pg_protocol, pg_connection, pg_types
 
 const binaryFormat*: seq[int16] = @[1'i16]
+const copyBatchSize = 65536 ## 64KB batch threshold for COPY IN buffering
 
 type
   PreparedStatement* = object
@@ -575,12 +576,17 @@ proc copyInImpl(
     else:
       discard
 
-  # Send CopyData for each chunk
+  # Send CopyData in batches to minimize syscalls and await overhead
+  const batchThreshold = copyBatchSize
+  var buf = newSeqOfCap[byte](batchThreshold)
   for chunk in data:
-    await conn.sendMsg(encodeCopyData(chunk))
-
-  # Send CopyDone
-  await conn.sendMsg(encodeCopyDone())
+    encodeCopyData(buf, chunk)
+    if buf.len >= batchThreshold:
+      await conn.sendMsg(buf)
+      buf.setLen(0)
+  # Flush remaining data + CopyDone in one send
+  buf.add(encodeCopyDone())
+  await conn.sendMsg(buf)
 
   # Wait for CommandComplete + ReadyForQuery
   while true:
@@ -652,19 +658,24 @@ proc copyInStreamImpl(
     else:
       discard
 
-  # Pull data from callback and send as CopyData
+  # Pull data from callback and send as CopyData in batches
+  const batchThreshold = copyBatchSize
   var callbackError: ref CatchableError = nil
+  var buf = newSeqOfCap[byte](batchThreshold)
   try:
     while true:
       let chunk = await callback()
       if chunk.len == 0:
         break
-      await conn.sendMsg(encodeCopyData(chunk))
+      encodeCopyData(buf, chunk)
+      if buf.len >= batchThreshold:
+        await conn.sendMsg(buf)
+        buf.setLen(0)
   except CatchableError as e:
     callbackError = e
 
   if callbackError != nil:
-    # Callback raised: send CopyFail, drain until ReadyForQuery, re-raise
+    # Callback raised: flush pending data is pointless, send CopyFail
     await conn.sendMsg(encodeCopyFail(callbackError.msg))
     while true:
       let msg = await conn.recvMessage(timeout)
@@ -677,8 +688,9 @@ proc copyInStreamImpl(
         discard
     raise callbackError
   else:
-    # Normal completion: send CopyDone
-    await conn.sendMsg(encodeCopyDone())
+    # Normal completion: flush remaining data + CopyDone in one send
+    buf.add(encodeCopyDone())
+    await conn.sendMsg(buf)
 
   # Wait for CommandComplete + ReadyForQuery
   while true:

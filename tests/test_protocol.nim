@@ -153,7 +153,8 @@ suite "Frontend encoding":
     check decodeInt32(msg, 12) == 5678'i32
 
   test "encodeCopyData":
-    let msg = encodeCopyData(@[1'u8, 2, 3])
+    var msg: seq[byte]
+    encodeCopyData(msg, @[1'u8, 2, 3])
     check msg[0] == byte('d')
     check decodeInt32(msg, 1) == 7'i32 # 4 + 3
 
