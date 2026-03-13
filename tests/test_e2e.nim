@@ -3334,7 +3334,7 @@ suite "E2E: Notification Buffering":
 
     waitFor t()
 
-  test "buffer respects max queue size":
+  test "buffer respects max queue size and tracks drops":
     proc t() {.async.} =
       let listener = await connect(plainConfig())
       let sender = await connect(plainConfig())
@@ -3348,11 +3348,51 @@ suite "E2E: Notification Buffering":
 
       # Only last 3 should remain (oldest dropped)
       doAssert listener.notifyQueue.len == 3
-      doAssert listener.notifyQueue.popFirst().payload == "3"
+      doAssert listener.notifyDropped == 2
+
+      # waitNotification should raise PgNotifyOverflowError
+      var caught = false
+      try:
+        discard await listener.waitNotification()
+      except PgNotifyOverflowError as e:
+        caught = true
+        doAssert e.dropped == 2
+      doAssert caught
+
+      # After overflow is cleared, normal access works
+      doAssert listener.notifyDropped == 0
+      let n = await listener.waitNotification()
+      doAssert n.payload == "3"
       doAssert listener.notifyQueue.popFirst().payload == "4"
       doAssert listener.notifyQueue.popFirst().payload == "5"
 
       await listener.unlisten("buf_max")
+      await listener.close()
+      await sender.close()
+
+    waitFor t()
+
+  test "notifyOverflowCallback fires on drop":
+    proc t() {.async.} =
+      let listener = await connect(plainConfig())
+      let sender = await connect(plainConfig())
+
+      listener.notifyMaxQueue = 2
+      var cbDropped = 0
+      listener.notifyOverflowCallback = proc(dropped: int) {.gcsafe, raises: [].} =
+        cbDropped += dropped
+
+      await listener.listen("buf_cb")
+
+      for i in 1 .. 4:
+        await sender.notify("buf_cb", $i)
+      await sleepAsync(milliseconds(300))
+
+      # 4 notifications into queue of 2: 2 dropped
+      doAssert cbDropped == 2
+      doAssert listener.notifyDropped == 2
+
+      await listener.unlisten("buf_cb")
       await listener.close()
       await sender.close()
 
