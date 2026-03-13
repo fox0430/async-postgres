@@ -1981,7 +1981,7 @@ suite "E2E: Cursor/Streaming":
         await conn.openCursor("SELECT id FROM test_cursor ORDER BY id", chunkSize = 10)
       doAssert cursor.fields.len == 1
 
-      var allRows: seq[seq[Option[seq[byte]]]]
+      var allRows: seq[Row]
       while true:
         let chunk = await cursor.fetchNext()
         if chunk.len == 0:
@@ -2195,7 +2195,7 @@ suite "E2E: Cursor/Streaming":
       )
       doAssert cursor.fields.len == 1
 
-      var allRows: seq[seq[Option[seq[byte]]]]
+      var allRows: seq[Row]
       while true:
         let chunk = await cursor.fetchNext()
         if chunk.len == 0:

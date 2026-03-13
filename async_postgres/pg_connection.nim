@@ -112,7 +112,8 @@ type
 
   QueryResult* = object
     fields*: seq[FieldDescription]
-    rows*: seq[Row]
+    data*: RowData
+    rowCount*: int32
     commandTag*: string
 
   CopyResult* = object
@@ -131,9 +132,27 @@ type
     columnFormats*: seq[int16]
     commandTag*: string
 
+proc len*(qr: QueryResult): int {.inline.} =
+  ## Return the number of rows in the query result.
+  int(qr.rowCount)
+
 proc columnIndex*(qr: QueryResult, name: string): int =
   ## Find the index of a column by name in a query result.
   qr.fields.columnIndex(name)
+
+proc rows*(qr: QueryResult): seq[Row] =
+  ## Return all rows as lightweight Row views into the flat buffer.
+  if qr.data == nil:
+    return @[]
+  result = newSeq[Row](qr.rowCount)
+  for i in 0 ..< qr.rowCount:
+    result[i] = Row(data: qr.data, rowIdx: i)
+
+iterator items*(qr: QueryResult): Row =
+  ## Iterate over all rows in the query result.
+  if qr.data != nil:
+    for i in 0 ..< qr.rowCount:
+      yield Row(data: qr.data, rowIdx: i)
 
 when hasChronos:
   type CopyOutCallback* =
@@ -204,16 +223,17 @@ proc compactRecvBuf(conn: PgConnection, consumed: int) {.inline.} =
     conn.recvBuf.setLen(remaining)
 
 proc recvMessage*(
-    conn: PgConnection, timeout = ZeroDuration
+    conn: PgConnection, timeout = ZeroDuration, rowData: RowData = nil
 ): Future[BackendMessage] {.async.} =
   ## Receive a single backend message from the connection.
   ## If `timeout` is non-zero, each read operation is bounded by the timeout,
   ## raising AsyncTimeoutError if no data arrives within the specified duration.
+  ## If `rowData` is non-nil, DataRow messages are parsed directly into the flat buffer.
   var totalConsumed = 0
   while true:
     var consumed: int
     let res = parseBackendMessage(
-      conn.recvBuf.toOpenArray(totalConsumed, conn.recvBuf.len - 1), consumed
+      conn.recvBuf.toOpenArray(totalConsumed, conn.recvBuf.len - 1), consumed, rowData
     )
     if res.state == psComplete:
       totalConsumed += consumed
@@ -682,12 +702,12 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage()
+    let msg = await conn.recvMessage(rowData = current.data)
     case msg.kind
     of bmkRowDescription:
-      current = QueryResult(fields: msg.fields)
+      current = QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
     of bmkDataRow:
-      current.rows.add(msg.columns)
+      inc current.rowCount
     of bmkCommandComplete:
       current.commandTag = msg.commandTag
       results.add(current)

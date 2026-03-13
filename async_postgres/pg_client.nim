@@ -19,7 +19,8 @@ type
     timeout: Duration
     fields*: seq[FieldDescription]
     exhausted*: bool
-    buffered: seq[Row]
+    bufferedData: RowData
+    bufferedCount: int32
 
   IsolationLevel* = enum
     ilDefault
@@ -201,16 +202,17 @@ proc queryImpl(
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage(timeout)
+    let msg = await conn.recvMessage(timeout, rowData = qr.data)
     case msg.kind
     of bmkParseComplete, bmkBindComplete:
       discard
     of bmkRowDescription:
       qr.fields = msg.fields
+      qr.data = newRowData(int16(msg.fields.len))
     of bmkNoData:
       discard
     of bmkDataRow:
-      qr.rows.add(msg.columns)
+      inc qr.rowCount
     of bmkCommandComplete:
       qr.commandTag = msg.commandTag
     of bmkEmptyQueryResponse:
@@ -273,8 +275,8 @@ proc queryOne*(
   ## Execute a query and return the first row, or `none` if no rows.
   let qr =
     await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
-  if qr.rows.len > 0:
-    return some(qr.rows[0])
+  if qr.rowCount > 0:
+    return some(Row(data: qr.data, rowIdx: 0))
   else:
     return none(Row)
 
@@ -287,12 +289,12 @@ proc queryValue*(
   ## Execute a query and return the first column of the first row as a string.
   ## Raises PgError if no rows are returned or the value is NULL.
   let qr = await conn.query(sql, params, timeout = timeout)
-  if qr.rows.len == 0:
+  if qr.rowCount == 0:
     raise newException(PgError, "Query returned no rows")
-  let cell = qr.rows[0][0]
-  if cell.isNone:
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
     raise newException(PgError, "Query returned NULL")
-  return fromPgText(cell.get, 0)
+  return row.getStr(0)
 
 proc queryValueOrDefault*(
     conn: PgConnection,
@@ -304,12 +306,12 @@ proc queryValueOrDefault*(
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `default` if no rows or the value is NULL.
   let qr = await conn.query(sql, params, timeout = timeout)
-  if qr.rows.len == 0:
+  if qr.rowCount == 0:
     return default
-  let cell = qr.rows[0][0]
-  if cell.isNone:
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
     return default
-  return fromPgText(cell.get, 0)
+  return row.getStr(0)
 
 proc queryExists*(
     conn: PgConnection,
@@ -319,7 +321,7 @@ proc queryExists*(
 ): Future[bool] {.async.} =
   ## Execute a query and return whether any rows exist.
   let qr = await conn.query(sql, params, timeout = timeout)
-  return qr.rows.len > 0
+  return qr.rowCount > 0
 
 proc execAffected*(
     conn: PgConnection,
@@ -340,11 +342,11 @@ proc queryColumn*(
   ## Execute a query and return the first column of all rows as strings.
   ## Raises PgTypeError if any value is NULL.
   let qr = await conn.query(sql, params, timeout = timeout)
-  for row in qr.rows:
-    let cell = row[0]
-    if cell.isNone:
+  for i in 0 ..< qr.rowCount:
+    let row = Row(data: qr.data, rowIdx: i)
+    if row.isNull(0):
       raise newException(PgTypeError, "NULL value in column")
-    result.add(fromPgText(cell.get, 0))
+    result.add(row.getStr(0))
 
 proc prepareImpl(
     conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
@@ -429,15 +431,17 @@ proc executeImpl(
         qr.fields[i].formatCode = resultFormats[0]
       elif i < resultFormats.len:
         qr.fields[i].formatCode = resultFormats[i]
+  if qr.fields.len > 0:
+    qr.data = newRowData(int16(qr.fields.len))
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage(timeout)
+    let msg = await conn.recvMessage(timeout, rowData = qr.data)
     case msg.kind
     of bmkBindComplete:
       discard
     of bmkDataRow:
-      qr.rows.add(msg.columns)
+      inc qr.rowCount
     of bmkCommandComplete:
       qr.commandTag = msg.commandTag
     of bmkEmptyQueryResponse:
@@ -941,16 +945,17 @@ proc openCursorImpl(
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage(timeout)
+    let msg = await conn.recvMessage(timeout, rowData = cursor.bufferedData)
     case msg.kind
     of bmkParseComplete, bmkBindComplete:
       discard
     of bmkRowDescription:
       cursor.fields = msg.fields
+      cursor.bufferedData = newRowData(int16(msg.fields.len))
     of bmkNoData:
       discard
     of bmkDataRow:
-      cursor.buffered.add(msg.columns)
+      inc cursor.bufferedCount
     of bmkPortalSuspended:
       break
     of bmkCommandComplete:
@@ -1014,19 +1019,19 @@ proc fetchNextImpl(
     cursor: Cursor, timeout: Duration = ZeroDuration
 ): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
+  let rd = newRowData(int16(cursor.fields.len))
+  var rowCount: int32 = 0
 
   var batch: seq[byte]
   batch.add(encodeExecute(cursor.portalName, cursor.chunkSize))
   batch.add(encodeFlush())
   await conn.sendMsg(batch)
 
-  var rows: seq[Row]
-
   while true:
-    let msg = await conn.recvMessage(timeout)
+    let msg = await conn.recvMessage(timeout, rowData = rd)
     case msg.kind
     of bmkDataRow:
-      rows.add(msg.columns)
+      inc rowCount
     of bmkPortalSuspended:
       break
     of bmkCommandComplete:
@@ -1061,15 +1066,20 @@ proc fetchNextImpl(
     else:
       discard
 
-  return rows
+  result = newSeq[Row](rowCount)
+  for i in 0 ..< rowCount:
+    result[i] = Row(data: rd, rowIdx: i)
 
 proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Fetch the next chunk of rows from the cursor.
   ## Returns an empty seq when the cursor is exhausted.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if cursor.buffered.len > 0:
-    result = cursor.buffered
-    cursor.buffered = @[]
+  if cursor.bufferedCount > 0:
+    result = newSeq[Row](cursor.bufferedCount)
+    for i in 0 ..< cursor.bufferedCount:
+      result[i] = Row(data: cursor.bufferedData, rowIdx: i)
+    cursor.bufferedData = nil
+    cursor.bufferedCount = 0
     return result
 
   if cursor.exhausted:
