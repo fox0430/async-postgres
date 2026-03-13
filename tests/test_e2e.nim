@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, tables, os, math, deques, sets]
+import std/[unittest, options, strutils, tables, os, math, deques, sets, importutils]
 from std/times import
   DateTime, dateTime, mMar, mJun, mJan, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
@@ -6,6 +6,8 @@ from std/times import
 import ../async_postgres/[async_backend, pg_protocol, pg_client, pg_pool, pg_types]
 
 import ../async_postgres/pg_connection {.all.}
+
+privateAccess(PgConnection)
 
 const
   PgHost = "127.0.0.1"
@@ -3233,14 +3235,16 @@ suite "E2E: recvMessage Timeout":
   test "recvMessage buffer restored after timeout":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let bufLenBefore = conn.recvBuf.len
+      # Logical unconsumed size (compactRecvBuf may shrink the raw buffer)
+      let unconsumedBefore = conn.recvBuf.len - conn.recvBufStart
       # Trigger a timeout with no pending server data
       try:
         discard await conn.recvMessage(timeout = milliseconds(100))
       except AsyncTimeoutError:
         discard
       # recvBuf must not grow from the failed read
-      doAssert conn.recvBuf.len == bufLenBefore
+      let unconsumedAfter = conn.recvBuf.len - conn.recvBufStart
+      doAssert unconsumedAfter == unconsumedBefore
       await conn.close()
 
     waitFor t()
