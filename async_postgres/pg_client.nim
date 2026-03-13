@@ -102,7 +102,7 @@ proc execImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](sql.len + 128)
   batch.add(encodeParse("", sql, paramOids))
   let formats =
     if paramFormats.len > 0:
@@ -185,7 +185,7 @@ proc queryImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](sql.len + 128)
   batch.add(encodeParse("", sql, paramOids))
   let formats =
     if paramFormats.len > 0:
@@ -353,7 +353,7 @@ proc prepareImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](sql.len + name.len + 32)
   batch.add(encodeParse(name, sql))
   batch.add(encodeDescribe(dkStatement, name))
   batch.add(encodeSync())
@@ -412,7 +412,7 @@ proc executeImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](64)
   let formats =
     if paramFormats.len > 0:
       paramFormats
@@ -495,7 +495,7 @@ proc closeImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](stmt.name.len + 16)
   batch.add(encodeClose(dkStatement, stmt.name))
   batch.add(encodeSync())
   await conn.sendMsg(batch)
@@ -925,7 +925,7 @@ proc openCursorImpl(
   inc conn.portalCounter
   let portalName = "_cursor_" & $conn.portalCounter
 
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](sql.len + 128)
   batch.add(encodeParse("", sql, paramOids))
   let formats =
     if paramFormats.len > 0:
@@ -1020,7 +1020,7 @@ proc fetchNextImpl(
   let rd = newRowData(int16(cursor.fields.len))
   var rowCount: int32 = 0
 
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](cursor.portalName.len + 24)
   batch.add(encodeExecute(cursor.portalName, cursor.chunkSize))
   batch.add(encodeFlush())
   await conn.sendMsg(batch)
@@ -1097,7 +1097,7 @@ proc closeCursorImpl(
     return
 
   let conn = cursor.conn
-  var batch: seq[byte]
+  var batch = newSeqOfCap[byte](cursor.portalName.len + 16)
   batch.add(encodeClose(dkPortal, cursor.portalName))
   batch.add(encodeSync())
   await conn.sendMsg(batch)
