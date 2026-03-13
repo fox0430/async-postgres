@@ -29,6 +29,9 @@ elif defined(macosx):
 type
   PgError* = object of CatchableError
 
+  PgNotifyOverflowError* = object of PgError
+    dropped*: int ## Number of notifications dropped due to queue overflow
+
   PgConnState* = enum
     csConnecting
     csAuthentication
@@ -102,7 +105,10 @@ type
     notifyQueue*: Deque[Notification]
     notifyMaxQueue*: int
     notifyWaiter: Future[void]
+    notifyDropped*: int ## Count of notifications dropped due to queue overflow
+    listenErrorMsg: string ## Set when listen pump fails permanently
     reconnectCallback*: proc() {.gcsafe, raises: [].}
+    notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
 
   QueryResult* = object
     fields*: seq[FieldDescription]
@@ -152,9 +158,14 @@ proc dispatchNotification(conn: PgConnection, msg: BackendMessage) =
     pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
   )
   if conn.notifyMaxQueue > 0:
+    var droppedNow = 0
     while conn.notifyQueue.len >= conn.notifyMaxQueue:
       discard conn.notifyQueue.popFirst()
+      conn.notifyDropped.inc
+      droppedNow.inc
     conn.notifyQueue.addLast(notif)
+    if droppedNow > 0 and conn.notifyOverflowCallback != nil:
+      conn.notifyOverflowCallback(droppedNow)
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
     conn.notifyWaiter.complete()
   if conn.notifyCallback != nil:
@@ -890,9 +901,11 @@ proc listenPump(conn: PgConnection) {.async.} =
         except CatchableError:
           backoff = min(backoff * 2, 30)
       if not reconnected:
+        conn.listenErrorMsg =
+          "Listen connection lost: reconnection failed after 10 attempts"
         conn.state = csClosed
         if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-          conn.notifyWaiter.fail(newException(PgError, "Reconnection failed"))
+          conn.notifyWaiter.fail(newException(PgError, conn.listenErrorMsg))
         return
 
 proc startListening(conn: PgConnection) =
@@ -942,11 +955,33 @@ proc unlisten*(conn: PgConnection, channel: string): Future[void] {.async.} =
   if conn.listenChannels.len > 0:
     conn.startListening()
 
+proc checkNotifyOverflow(conn: PgConnection) =
+  ## Raise PgNotifyOverflowError if notifications were dropped since last check.
+  if conn.notifyDropped > 0:
+    let dropped = conn.notifyDropped
+    conn.notifyDropped = 0
+    let err = (ref PgNotifyOverflowError)(
+      msg: "Dropped " & $dropped & " notifications due to queue overflow",
+      dropped: dropped,
+    )
+    raise err
+
+proc checkListenAlive(conn: PgConnection) =
+  ## Raise if the listen pump has died permanently.
+  if conn.listenErrorMsg.len > 0:
+    raise newException(PgError, conn.listenErrorMsg)
+  if conn.state == csClosed:
+    raise newException(PgError, "Connection is closed")
+
 proc waitNotification*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[Notification] {.async.} =
   ## Wait for the next notification from the buffer.
   ## If the buffer is empty, blocks until a notification arrives or timeout expires.
+  ## Raises PgNotifyOverflowError if notifications were dropped due to queue overflow.
+  ## Raises PgError if the listen pump has died (e.g. reconnection failed).
+  conn.checkNotifyOverflow()
+  conn.checkListenAlive()
   if conn.notifyQueue.len > 0:
     return conn.notifyQueue.popFirst()
   conn.notifyWaiter = newFuture[void]("waitNotification")
@@ -960,6 +995,7 @@ proc waitNotification*(
       await conn.notifyWaiter
   finally:
     conn.notifyWaiter = nil
+  conn.checkNotifyOverflow()
   if conn.notifyQueue.len > 0:
     return conn.notifyQueue.popFirst()
   raise newException(PgError, "No notification available")
