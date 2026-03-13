@@ -565,25 +565,31 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   if body.len < 2:
     raise newException(ProtocolError, "DataRow message too short")
   let numCols = decodeInt16(body, 0)
+  # Pre-extend cellIndex for this row to avoid per-column dynamic growth
+  let cellBase = rd.cellIndex.len
+  rd.cellIndex.setLen(cellBase + int(numCols) * 2)
   var offset = 2
   for i in 0 ..< numCols:
     if offset + 4 > body.len:
+      rd.cellIndex.setLen(cellBase) # rollback on error
       raise newException(ProtocolError, "DataRow: unexpected end of data")
     let colLen = decodeInt32(body, offset)
     offset += 4
+    let ci = cellBase + int(i) * 2
     if colLen == -1:
-      rd.cellIndex.add(0'i32)
-      rd.cellIndex.add(-1'i32)
+      rd.cellIndex[ci] = 0'i32
+      rd.cellIndex[ci + 1] = -1'i32
     else:
       if offset + colLen > body.len:
+        rd.cellIndex.setLen(cellBase) # rollback on error
         raise newException(ProtocolError, "DataRow: column data truncated")
       let bufOff = int32(rd.buf.len)
       let oldLen = rd.buf.len
       rd.buf.setLen(oldLen + int(colLen))
       if colLen > 0:
         copyMem(addr rd.buf[oldLen], unsafeAddr body[offset], int(colLen))
-      rd.cellIndex.add(bufOff)
-      rd.cellIndex.add(colLen)
+      rd.cellIndex[ci] = bufOff
+      rd.cellIndex[ci + 1] = colLen
       offset += colLen
 
 # Streaming backend message parser
