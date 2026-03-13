@@ -570,46 +570,40 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   # Pre-extend cellIndex for this row to avoid per-column dynamic growth
   let cellBase = rd.cellIndex.len
   rd.cellIndex.setLen(cellBase + int(numCols) * 2)
-  # First pass: validate and compute total buf size needed
-  var totalBufNeeded = 0
-  block:
-    var off = 2
-    for i in 0 ..< numCols:
-      if off + 4 > body.len:
-        rd.cellIndex.setLen(cellBase)
-        raise newException(ProtocolError, "DataRow: unexpected end of data")
-      let colLen = decodeInt32(body, off)
-      off += 4
-      if colLen < -1:
-        rd.cellIndex.setLen(cellBase)
-        raise newException(ProtocolError, "DataRow: invalid column length " & $colLen)
-      elif colLen == -1:
-        discard
-      else:
-        if off + colLen > body.len:
-          rd.cellIndex.setLen(cellBase)
-          raise newException(ProtocolError, "DataRow: column data truncated")
-        totalBufNeeded += int(colLen)
-        off += colLen
-  # Pre-extend buf once for all columns
+  # Pre-extend buf with upper bound (remaining body bytes); trim after loop
   let bufBase = rd.buf.len
-  rd.buf.setLen(bufBase + totalBufNeeded)
+  let maxDataBytes = body.len - 2 # upper bound on column data
+  rd.buf.setLen(bufBase + maxDataBytes)
   var offset = 2
   var bufOff = bufBase
   for i in 0 ..< numCols:
+    if offset + 4 > body.len:
+      rd.cellIndex.setLen(cellBase)
+      rd.buf.setLen(bufBase)
+      raise newException(ProtocolError, "DataRow: unexpected end of data")
     let colLen = decodeInt32(body, offset)
     offset += 4
     let ci = cellBase + int(i) * 2
-    if colLen == -1:
+    if colLen < -1:
+      rd.cellIndex.setLen(cellBase)
+      rd.buf.setLen(bufBase)
+      raise newException(ProtocolError, "DataRow: invalid column length " & $colLen)
+    elif colLen == -1:
       rd.cellIndex[ci] = 0'i32
       rd.cellIndex[ci + 1] = -1'i32
     else:
+      if offset + colLen > body.len:
+        rd.cellIndex.setLen(cellBase)
+        rd.buf.setLen(bufBase)
+        raise newException(ProtocolError, "DataRow: column data truncated")
       rd.cellIndex[ci] = int32(bufOff)
       rd.cellIndex[ci + 1] = colLen
       if colLen > 0:
         copyMem(addr rd.buf[bufOff], unsafeAddr body[offset], int(colLen))
       bufOff += int(colLen)
       offset += colLen
+  # Trim buf to actual size used
+  rd.buf.setLen(bufOff)
 
 # Streaming backend message parser
 
