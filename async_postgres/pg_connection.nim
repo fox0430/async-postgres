@@ -223,7 +223,10 @@ proc compactRecvBuf(conn: PgConnection, consumed: int) {.inline.} =
     conn.recvBuf.setLen(remaining)
 
 proc recvMessage*(
-    conn: PgConnection, timeout = ZeroDuration, rowData: RowData = nil
+    conn: PgConnection,
+    timeout = ZeroDuration,
+    rowData: RowData = nil,
+    rowCount: ptr int32 = nil,
 ): Future[BackendMessage] {.async.} =
   ## Receive a single backend message from the connection.
   ## If `timeout` is non-zero, each read operation is bounded by the timeout,
@@ -242,6 +245,9 @@ proc recvMessage*(
         continue
       if res.message.kind == bmkNoticeResponse:
         conn.dispatchNotice(res.message)
+        continue
+      if res.message.kind == bmkDataRow and rowCount != nil:
+        rowCount[] += 1
         continue
       conn.compactRecvBuf(totalConsumed)
       return res.message
@@ -702,12 +708,11 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage(rowData = current.data)
+    let msg =
+      await conn.recvMessage(rowData = current.data, rowCount = addr current.rowCount)
     case msg.kind
     of bmkRowDescription:
       current = QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
-    of bmkDataRow:
-      inc current.rowCount
     of bmkCommandComplete:
       current.commandTag = msg.commandTag
       results.add(current)

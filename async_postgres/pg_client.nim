@@ -202,7 +202,8 @@ proc queryImpl(
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage(timeout, rowData = qr.data)
+    let msg =
+      await conn.recvMessage(timeout, rowData = qr.data, rowCount = addr qr.rowCount)
     case msg.kind
     of bmkParseComplete, bmkBindComplete:
       discard
@@ -211,8 +212,6 @@ proc queryImpl(
       qr.data = newRowData(int16(msg.fields.len))
     of bmkNoData:
       discard
-    of bmkDataRow:
-      inc qr.rowCount
     of bmkCommandComplete:
       qr.commandTag = msg.commandTag
     of bmkEmptyQueryResponse:
@@ -436,12 +435,11 @@ proc executeImpl(
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage(timeout, rowData = qr.data)
+    let msg =
+      await conn.recvMessage(timeout, rowData = qr.data, rowCount = addr qr.rowCount)
     case msg.kind
     of bmkBindComplete:
       discard
-    of bmkDataRow:
-      inc qr.rowCount
     of bmkCommandComplete:
       qr.commandTag = msg.commandTag
     of bmkEmptyQueryResponse:
@@ -945,7 +943,9 @@ proc openCursorImpl(
   var errorMsg = ""
 
   while true:
-    let msg = await conn.recvMessage(timeout, rowData = cursor.bufferedData)
+    let msg = await conn.recvMessage(
+      timeout, rowData = cursor.bufferedData, rowCount = addr cursor.bufferedCount
+    )
     case msg.kind
     of bmkParseComplete, bmkBindComplete:
       discard
@@ -954,8 +954,6 @@ proc openCursorImpl(
       cursor.bufferedData = newRowData(int16(msg.fields.len))
     of bmkNoData:
       discard
-    of bmkDataRow:
-      inc cursor.bufferedCount
     of bmkPortalSuspended:
       break
     of bmkCommandComplete:
@@ -1028,10 +1026,8 @@ proc fetchNextImpl(
   await conn.sendMsg(batch)
 
   while true:
-    let msg = await conn.recvMessage(timeout, rowData = rd)
+    let msg = await conn.recvMessage(timeout, rowData = rd, rowCount = addr rowCount)
     case msg.kind
-    of bmkDataRow:
-      inc rowCount
     of bmkPortalSuspended:
       break
     of bmkCommandComplete:
