@@ -286,9 +286,43 @@ proc fromPgText*(data: seq[byte], oid: int32): string =
   for i in 0 ..< data.len:
     result[i] = char(data[i])
 
-type
-  Row* = seq[Option[seq[byte]]]
-  PgTypeError* = object of CatchableError
+type PgTypeError* = object of CatchableError
+
+# Row/RowData types are defined in pg_protocol and re-exported here.
+
+proc cellInfo(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
+  result.off = int(row.data.cellIndex[idx])
+  result.len = int(row.data.cellIndex[idx + 1])
+
+proc len*(row: Row): int {.inline.} =
+  int(row.data.numCols)
+
+proc `[]`*(row: Row, col: int): Option[seq[byte]] =
+  ## Backward-compatible cell access. Returns a copy of the cell data.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    none(seq[byte])
+  elif clen == 0:
+    some(newSeq[byte](0))
+  else:
+    some(@(row.data.buf.toOpenArray(off, off + clen - 1)))
+
+converter toRow*(cells: seq[Option[seq[byte]]]): Row =
+  ## Backward-compatible converter: build a Row from seq[Option[seq[byte]]].
+  let rd = RowData(
+    numCols: int16(cells.len), buf: @[], cellIndex: newSeq[int32](cells.len * 2)
+  )
+  for i, cell in cells:
+    if cell.isNone:
+      rd.cellIndex[i * 2] = 0'i32
+      rd.cellIndex[i * 2 + 1] = -1'i32
+    else:
+      let data = cell.get
+      rd.cellIndex[i * 2] = int32(rd.buf.len)
+      rd.cellIndex[i * 2 + 1] = int32(data.len)
+      rd.buf.add(data)
+  Row(data: rd, rowIdx: 0)
 
 proc affectedRows*(tag: string): int64 =
   ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).
@@ -301,13 +335,16 @@ proc affectedRows*(tag: string): int64 =
   return 0
 
 proc isNull*(row: Row, col: int): bool =
-  row[col].isNone
+  let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
+  row.data.cellIndex[idx + 1] == -1'i32
 
 proc getStr*(row: Row, col: int): string =
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  fromPgText(cell.get, 0)
+  result = newString(clen)
+  for i in 0 ..< clen:
+    result[i] = char(row.data.buf[off + i])
 
 proc getInt*(row: Row, col: int): int32 =
   let s = row.getStr(col)
@@ -335,18 +372,24 @@ proc getBool*(row: Row, col: int): bool =
     raise newException(PgTypeError, "Invalid boolean value: " & s)
 
 proc getBytes*(row: Row, col: int): seq[byte] =
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let raw = cell.get
   # PostgreSQL text-format bytea uses hex encoding: \xDEADBEEF
-  if raw.len >= 2 and raw[0] == byte('\\') and raw[1] == byte('x'):
-    let hex = fromPgText(raw, 0)[2 ..^ 1]
-    result = newSeq[byte](hex.len div 2)
+  if clen >= 2 and row.data.buf[off] == byte('\\') and row.data.buf[off + 1] == byte(
+    'x'
+  ):
+    let hexLen = clen - 2
+    var hex = newString(hexLen)
+    for i in 0 ..< hexLen:
+      hex[i] = char(row.data.buf[off + 2 + i])
+    result = newSeq[byte](hexLen div 2)
     for i in 0 ..< result.len:
       result[i] = byte(parseHexInt(hex[i * 2 .. i * 2 + 1]))
   else:
-    result = raw
+    result = newSeq[byte](clen)
+    if clen > 0:
+      copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
 
 proc getTimestamp*(row: Row, col: int): DateTime =
   let s = row.getStr(col)
@@ -379,44 +422,43 @@ proc getJson*(row: Row, col: int): JsonNode =
 # NULL-safe Option accessors (text format)
 
 proc getStrOpt*(row: Row, col: int): Option[string] =
-  let cell = row[col]
-  if cell.isNone:
+  if row.isNull(col):
     none(string)
   else:
-    some(fromPgText(cell.get, 0))
+    some(row.getStr(col))
 
 proc getIntOpt*(row: Row, col: int): Option[int32] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(int32)
   else:
     some(row.getInt(col))
 
 proc getInt64Opt*(row: Row, col: int): Option[int64] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(int64)
   else:
     some(row.getInt64(col))
 
 proc getFloatOpt*(row: Row, col: int): Option[float64] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(float64)
   else:
     some(row.getFloat(col))
 
 proc getNumericOpt*(row: Row, col: int): Option[PgNumeric] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(PgNumeric)
   else:
     some(row.getNumeric(col))
 
 proc getBoolOpt*(row: Row, col: int): Option[bool] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(bool)
   else:
     some(row.getBool(col))
 
 proc getJsonOpt*(row: Row, col: int): Option[JsonNode] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(JsonNode)
   else:
     some(row.getJson(col))
@@ -526,43 +568,43 @@ proc getStrArray*(row: Row, col: int): seq[string] =
 # Array Opt accessors
 
 proc getIntArrayOpt*(row: Row, col: int): Option[seq[int32]] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(seq[int32])
   else:
     some(row.getIntArray(col))
 
 proc getInt16ArrayOpt*(row: Row, col: int): Option[seq[int16]] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(seq[int16])
   else:
     some(row.getInt16Array(col))
 
 proc getInt64ArrayOpt*(row: Row, col: int): Option[seq[int64]] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(seq[int64])
   else:
     some(row.getInt64Array(col))
 
 proc getFloatArrayOpt*(row: Row, col: int): Option[seq[float64]] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(seq[float64])
   else:
     some(row.getFloatArray(col))
 
 proc getFloat32ArrayOpt*(row: Row, col: int): Option[seq[float32]] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(seq[float32])
   else:
     some(row.getFloat32Array(col))
 
 proc getBoolArrayOpt*(row: Row, col: int): Option[seq[bool]] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(seq[bool])
   else:
     some(row.getBoolArray(col))
 
 proc getStrArrayOpt*(row: Row, col: int): Option[seq[string]] =
-  if row[col].isNone:
+  if row.isNull(col):
     none(seq[string])
   else:
     some(row.getStrArray(col))
@@ -623,99 +665,101 @@ proc decodeNumericBinary(data: openArray[byte]): string =
 proc getStr*(row: Row, col: int, fields: seq[FieldDescription]): string =
   if fields[col].formatCode == 0:
     return row.getStr(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let data = cell.get
   case fields[col].typeOid
   of OidInt2:
-    return $fromBE16(data)
+    return $fromBE16(row.data.buf.toOpenArray(off, off + clen - 1))
   of OidInt4:
-    return $fromBE32(data)
+    return $fromBE32(row.data.buf.toOpenArray(off, off + clen - 1))
   of OidInt8:
-    return $fromBE64(data)
+    return $fromBE64(row.data.buf.toOpenArray(off, off + clen - 1))
   of OidFloat4:
-    return $cast[float32](cast[uint32](fromBE32(data)))
+    return $cast[float32](cast[uint32](fromBE32(
+      row.data.buf.toOpenArray(off, off + clen - 1)
+    )))
   of OidFloat8:
-    return $cast[float64](cast[uint64](fromBE64(data)))
+    return $cast[float64](cast[uint64](fromBE64(
+      row.data.buf.toOpenArray(off, off + clen - 1)
+    )))
   of OidNumeric:
-    return decodeNumericBinary(data)
+    return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   of OidBool:
-    return if data[0] == 1: "t" else: "f"
+    return if row.data.buf[off] == 1: "t" else: "f"
   else:
-    result = newString(data.len)
-    for i in 0 ..< data.len:
-      result[i] = char(data[i])
+    result = newString(clen)
+    for i in 0 ..< clen:
+      result[i] = char(row.data.buf[off + i])
 
 proc getInt*(row: Row, col: int, fields: seq[FieldDescription]): int32 =
   if fields[col].formatCode == 0:
     return row.getInt(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let data = cell.get
-  if data.len == 2:
-    int32(fromBE16(data))
+  if clen == 2:
+    int32(fromBE16(row.data.buf.toOpenArray(off, off + 1)))
   else:
-    fromBE32(data)
+    fromBE32(row.data.buf.toOpenArray(off, off + 3))
 
 proc getInt64*(row: Row, col: int, fields: seq[FieldDescription]): int64 =
   if fields[col].formatCode == 0:
     return row.getInt64(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let data = cell.get
-  if data.len == 2:
-    int64(fromBE16(data))
-  elif data.len == 4:
-    int64(fromBE32(data))
+  if clen == 2:
+    int64(fromBE16(row.data.buf.toOpenArray(off, off + 1)))
+  elif clen == 4:
+    int64(fromBE32(row.data.buf.toOpenArray(off, off + 3)))
   else:
-    fromBE64(data)
+    fromBE64(row.data.buf.toOpenArray(off, off + 7))
 
 proc getNumeric*(row: Row, col: int, fields: seq[FieldDescription]): PgNumeric =
   if fields[col].formatCode == 0:
     return row.getNumeric(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  PgNumeric(decodeNumericBinary(cell.get))
+  PgNumeric(decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1)))
 
 proc getFloat*(row: Row, col: int, fields: seq[FieldDescription]): float64 =
   if fields[col].formatCode == 0:
     return row.getFloat(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let data = cell.get
-  if data.len == 4:
-    cast[float32](cast[uint32](fromBE32(data))).float64
+  if clen == 4:
+    cast[float32](cast[uint32](fromBE32(row.data.buf.toOpenArray(off, off + 3)))).float64
   else:
-    cast[float64](cast[uint64](fromBE64(data)))
+    cast[float64](cast[uint64](fromBE64(row.data.buf.toOpenArray(off, off + 7))))
 
 proc getBool*(row: Row, col: int, fields: seq[FieldDescription]): bool =
   if fields[col].formatCode == 0:
     return row.getBool(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  cell.get[0] == 1'u8
+  row.data.buf[off] == 1'u8
 
 proc getBytes*(row: Row, col: int, fields: seq[FieldDescription]): seq[byte] =
   if fields[col].formatCode == 0:
     return row.getBytes(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  cell.get
+  result = newSeq[byte](clen)
+  if clen > 0:
+    copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
 
 proc getTimestamp*(row: Row, col: int, fields: seq[FieldDescription]): DateTime =
   if fields[col].formatCode == 0:
     return row.getTimestamp(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let pgUs = fromBE64(cell.get)
+  let pgUs = fromBE64(row.data.buf.toOpenArray(off, off + 7))
   let unixUs = pgUs + pgEpochUnix * 1_000_000
   var unixSec = unixUs div 1_000_000
   var fracUs = unixUs mod 1_000_000
@@ -727,30 +771,29 @@ proc getTimestamp*(row: Row, col: int, fields: seq[FieldDescription]): DateTime 
 proc getDate*(row: Row, col: int, fields: seq[FieldDescription]): DateTime =
   if fields[col].formatCode == 0:
     return row.getDate(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let pgDays = fromBE32(cell.get)
+  let pgDays = fromBE32(row.data.buf.toOpenArray(off, off + 3))
   let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
   initTime(unixSec, 0).utc()
 
 proc getJson*(row: Row, col: int, fields: seq[FieldDescription]): JsonNode =
   if fields[col].formatCode == 0:
     return row.getJson(col)
-  let cell = row[col]
-  if cell.isNone:
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let data = cell.get
   var jsonStr: string
-  if fields[col].typeOid == OidJsonb and data.len > 0 and data[0] == 1:
+  if fields[col].typeOid == OidJsonb and clen > 0 and row.data.buf[off] == 1:
     # jsonb binary: skip version byte
-    jsonStr = newString(data.len - 1)
-    for i in 1 ..< data.len:
-      jsonStr[i - 1] = char(data[i])
+    jsonStr = newString(clen - 1)
+    for i in 1 ..< clen:
+      jsonStr[i - 1] = char(row.data.buf[off + i])
   else:
-    jsonStr = newString(data.len)
-    for i in 0 ..< data.len:
-      jsonStr[i] = char(data[i])
+    jsonStr = newString(clen)
+    for i in 0 ..< clen:
+      jsonStr[i] = char(row.data.buf[off + i])
   try:
     return parseJson(jsonStr)
   except JsonParsingError:
