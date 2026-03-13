@@ -601,6 +601,14 @@ suite "Backend decoding - edge cases":
     let res = parseBackendMessage(buf)
     check res.message.columns[0].get.len == 1000
 
+  test "DataRow with negative column length raises ProtocolError":
+    var body: seq[byte] = @[]
+    body.addInt16(1)
+    body.addInt32(-2) # invalid: only -1 (NULL) is valid
+    var buf = buildMsg('D', body)
+    expect ProtocolError:
+      discard parseBackendMessage(buf)
+
   test "unknown message type raises ProtocolError":
     var buf = buildMsg('?', @[0'u8])
     expect ProtocolError:
