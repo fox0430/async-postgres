@@ -88,6 +88,7 @@ type
       socket*: AsyncSocket
     sslEnabled*: bool
     recvBuf*: seq[byte]
+    recvBufStart: int ## Read pointer into recvBuf; bytes before this are consumed
     state*: PgConnState
     pid*: int32
     secretKey*: int32
@@ -210,17 +211,19 @@ when hasAsyncDispatch:
       return fut
     socket.send(bytesToString(data))
 
-proc compactRecvBuf(conn: PgConnection, consumed: int) {.inline.} =
-  ## Remove consumed bytes from the front of recvBuf efficiently.
-  ## Shifts remaining data to the front instead of allocating a new seq.
-  if consumed == 0:
+proc compactRecvBuf(conn: PgConnection) {.inline.} =
+  ## Shift unconsumed data to the front of recvBuf, reclaiming space consumed
+  ## by the read pointer.  Called only before reading new data from the socket.
+  let start = conn.recvBufStart
+  if start == 0:
     return
-  let remaining = conn.recvBuf.len - consumed
+  let remaining = conn.recvBuf.len - start
   if remaining == 0:
     conn.recvBuf.setLen(0)
   else:
-    moveMem(addr conn.recvBuf[0], addr conn.recvBuf[consumed], remaining)
+    moveMem(addr conn.recvBuf[0], addr conn.recvBuf[start], remaining)
     conn.recvBuf.setLen(remaining)
+  conn.recvBufStart = 0
 
 proc recvMessage*(
     conn: PgConnection,
@@ -232,14 +235,14 @@ proc recvMessage*(
   ## If `timeout` is non-zero, each read operation is bounded by the timeout,
   ## raising AsyncTimeoutError if no data arrives within the specified duration.
   ## If `rowData` is non-nil, DataRow messages are parsed directly into the flat buffer.
-  var totalConsumed = 0
+  var pos = conn.recvBufStart
   while true:
     var consumed: int
     let res = parseBackendMessage(
-      conn.recvBuf.toOpenArray(totalConsumed, conn.recvBuf.len - 1), consumed, rowData
+      conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
     )
     if res.state == psComplete:
-      totalConsumed += consumed
+      pos += consumed
       if res.message.kind == bmkNotificationResponse:
         conn.dispatchNotification(res.message)
         continue
@@ -249,11 +252,12 @@ proc recvMessage*(
       if res.message.kind == bmkDataRow and rowCount != nil:
         rowCount[] += 1
         continue
-      conn.compactRecvBuf(totalConsumed)
+      conn.recvBufStart = pos
       return res.message
     # Compact before reading more data to maximize contiguous space
-    conn.compactRecvBuf(totalConsumed)
-    totalConsumed = 0
+    conn.recvBufStart = pos
+    conn.compactRecvBuf()
+    pos = 0
     when hasChronos:
       let oldLen = conn.recvBuf.len
       conn.recvBuf.setLen(oldLen + RecvBufSize)
@@ -860,6 +864,7 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   ## Reconnect using stored config, re-LISTENing on all channels.
   await conn.closeTransport()
   conn.recvBuf.setLen(0)
+  conn.recvBufStart = 0
   conn.state = csConnecting
   let newConn = await connect(conn.config)
   when hasChronos:
