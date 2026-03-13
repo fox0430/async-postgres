@@ -129,6 +129,15 @@ type
     state*: ParseState
     message*: BackendMessage
 
+  RowData* = ref object
+    buf*: seq[byte] ## All column data concatenated
+    cellIndex*: seq[int32] ## [off, len, off, len, ...] per cell; len=-1 = NULL
+    numCols*: int16
+
+  Row* = object
+    data*: RowData
+    rowIdx*: int32
+
 # Byte-level helpers
 
 proc encodeInt16*(val: int16): array[2, byte] =
@@ -547,9 +556,41 @@ proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
     result.copyColumnFormats[i] = decodeInt16(body, offset)
     offset += 2
 
+proc newRowData*(numCols: int16): RowData =
+  RowData(buf: @[], cellIndex: @[], numCols: numCols)
+
+proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
+  ## Parse a DataRow message body directly into a RowData flat buffer.
+  ## Column data is appended to rd.buf and (offset, length) pairs to rd.cellIndex.
+  if body.len < 2:
+    raise newException(ProtocolError, "DataRow message too short")
+  let numCols = decodeInt16(body, 0)
+  var offset = 2
+  for i in 0 ..< numCols:
+    if offset + 4 > body.len:
+      raise newException(ProtocolError, "DataRow: unexpected end of data")
+    let colLen = decodeInt32(body, offset)
+    offset += 4
+    if colLen == -1:
+      rd.cellIndex.add(0'i32)
+      rd.cellIndex.add(-1'i32)
+    else:
+      if offset + colLen > body.len:
+        raise newException(ProtocolError, "DataRow: column data truncated")
+      let bufOff = int32(rd.buf.len)
+      let oldLen = rd.buf.len
+      rd.buf.setLen(oldLen + int(colLen))
+      if colLen > 0:
+        copyMem(addr rd.buf[oldLen], unsafeAddr body[offset], int(colLen))
+      rd.cellIndex.add(bufOff)
+      rd.cellIndex.add(colLen)
+      offset += colLen
+
 # Streaming backend message parser
 
-proc parseBackendMessage*(buf: openArray[byte], consumed: var int): ParseResult =
+proc parseBackendMessage*(
+    buf: openArray[byte], consumed: var int, rowData: RowData = nil
+): ParseResult =
   ## Parse a single backend message from `buf`.
   ## On success, sets `consumed` to the number of bytes used.
   ## The caller is responsible for discarding those bytes from the buffer.
@@ -585,7 +626,11 @@ proc parseBackendMessage*(buf: openArray[byte], consumed: var int): ParseResult 
   of 'C':
     msg = parseCommandComplete(body)
   of 'D':
-    msg = parseDataRow(body)
+    if rowData != nil:
+      parseDataRowInto(body, rowData)
+      msg = BackendMessage(kind: bmkDataRow)
+    else:
+      msg = parseDataRow(body)
   of 'E':
     msg = parseErrorOrNotice(body, isError = true)
   of 'N':
