@@ -162,10 +162,21 @@ proc addInt32*(buf: var seq[byte], val: int32) =
   buf.add(encoded[2])
   buf.add(encoded[3])
 
+proc patchLen*(buf: var seq[byte], offset: int = 1) =
+  ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
+  let length = int32(buf.high)
+  let encoded = encodeInt32(length)
+  buf[offset] = encoded[0]
+  buf[offset + 1] = encoded[1]
+  buf[offset + 2] = encoded[2]
+  buf[offset + 3] = encoded[3]
+
 proc addCString*(buf: var seq[byte], s: string) =
-  for c in s:
-    buf.add(byte(c))
-  buf.add(0'u8)
+  let oldLen = buf.len
+  buf.setLen(oldLen + s.len + 1)
+  if s.len > 0:
+    copyMem(addr buf[oldLen], unsafeAddr s[0], s.len)
+  buf[oldLen + s.len] = 0'u8
 
 proc decodeInt16*(buf: openArray[byte], offset: int): int16 =
   result = int16(buf[offset]) shl 8 or int16(buf[offset + 1])
@@ -176,11 +187,13 @@ proc decodeInt32*(buf: openArray[byte], offset: int): int32 =
     int32(buf[offset + 2]) shl 8 or int32(buf[offset + 3])
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
-  var s = ""
   var i = offset
   while i < buf.len and buf[i] != 0:
-    s.add(char(buf[i]))
     inc i
+  let slen = i - offset
+  var s = newString(slen)
+  if slen > 0:
+    copyMem(addr s[0], unsafeAddr buf[offset], slen)
   if i < buf.len:
     inc i # skip null terminator
   result = (s, i - offset)
@@ -203,8 +216,10 @@ proc encodeStartup*(
   result.add(0'u8) # terminator
   let length = int32(result.len)
   let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i] = e
+  result[0] = encoded[0]
+  result[1] = encoded[1]
+  result[2] = encoded[2]
+  result[3] = encoded[3]
 
 proc encodeSSLRequest*(): seq[byte] =
   result = newSeq[byte](8)
@@ -219,10 +234,7 @@ proc encodePassword*(password: string): seq[byte] =
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.addCString(password)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeSASLInitialResponse*(mechanism: string, data: seq[byte]): seq[byte] =
   result.add(byte('p'))
@@ -230,28 +242,19 @@ proc encodeSASLInitialResponse*(mechanism: string, data: seq[byte]): seq[byte] =
   result.addCString(mechanism)
   result.addInt32(int32(data.len))
   result.add(data)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeSASLResponse*(data: seq[byte]): seq[byte] =
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.add(data)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeQuery*(sql: string): seq[byte] =
   result.add(byte('Q'))
   result.addInt32(0) # length placeholder
   result.addCString(sql)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeParse*(
     stmtName: string, sql: string, paramTypeOids: openArray[int32] = []
@@ -263,10 +266,7 @@ proc encodeParse*(
   result.addInt16(int16(paramTypeOids.len))
   for oid in paramTypeOids:
     result.addInt32(oid)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeBind*(
     portalName: string,
@@ -296,40 +296,28 @@ proc encodeBind*(
   result.addInt16(int16(resultFormats.len))
   for f in resultFormats:
     result.addInt16(f)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeDescribe*(kind: DescribeKind, name: string): seq[byte] =
   result.add(byte('D'))
   result.addInt32(0) # length placeholder
   result.add(byte(kind))
   result.addCString(name)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeExecute*(portalName: string, maxRows: int32 = 0): seq[byte] =
   result.add(byte('E'))
   result.addInt32(0) # length placeholder
   result.addCString(portalName)
   result.addInt32(maxRows)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeClose*(kind: DescribeKind, name: string): seq[byte] =
   result.add(byte('C'))
   result.addInt32(0) # length placeholder
   result.add(byte(kind))
   result.addCString(name)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 proc encodeSync*(): seq[byte] =
   result = @[byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
@@ -372,10 +360,7 @@ proc encodeCopyFail*(errorMsg: string): seq[byte] =
   result.add(byte('f'))
   result.addInt32(0) # length placeholder
   result.addCString(errorMsg)
-  let length = int32(result.high)
-  let encoded = encodeInt32(length)
-  for i, e in encoded:
-    result[i + 1] = e
+  result.patchLen()
 
 # Backend message parsing (internal helpers)
 

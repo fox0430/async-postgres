@@ -117,7 +117,7 @@ proc execImpl(
     # Cache hit: Bind(cached.name) + Execute + Sync
     let c = cachedOpt.get
     stmtName = c.name
-    var batch = newSeqOfCap[byte](64)
+    var batch = newSeqOfCap[byte](params.len * 16 + 128)
     batch.add(encodeBind("", stmtName, formats, params))
     batch.add(encodeExecute("", 0))
     batch.add(encodeSync())
@@ -250,7 +250,7 @@ proc queryImpl(
     let c = cachedOpt.get
     stmtName = c.name
     cachedFields = c.fields
-    var batch = newSeqOfCap[byte](64)
+    var batch = newSeqOfCap[byte](params.len * 16 + 128)
     batch.add(encodeBind("", stmtName, formats, params, resultFormats))
     batch.add(encodeExecute("", 0))
     batch.add(encodeSync())
@@ -531,7 +531,7 @@ proc executeImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch = newSeqOfCap[byte](64)
+  var batch = newSeqOfCap[byte](params.len * 16 + 128)
   let formats =
     if paramFormats.len > 0:
       paramFormats

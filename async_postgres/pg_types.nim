@@ -53,19 +53,19 @@ proc toBytes(s: string): seq[byte] =
   if s.len > 0:
     copyMem(addr result[0], unsafeAddr s[0], s.len)
 
-proc toBE16(v: int16): seq[byte] =
-  @[byte((v shr 8) and 0xFF), byte(v and 0xFF)]
+proc toBE16(v: int16): array[2, byte] =
+  [byte((v shr 8) and 0xFF), byte(v and 0xFF)]
 
-proc toBE32(v: int32): seq[byte] =
-  @[
+proc toBE32(v: int32): array[4, byte] =
+  [
     byte((v shr 24) and 0xFF),
     byte((v shr 16) and 0xFF),
     byte((v shr 8) and 0xFF),
     byte(v and 0xFF),
   ]
 
-proc toBE64(v: int64): seq[byte] =
-  @[
+proc toBE64(v: int64): array[8, byte] =
+  [
     byte((v shr 56) and 0xFF),
     byte((v shr 48) and 0xFF),
     byte((v shr 40) and 0xFF),
@@ -219,22 +219,22 @@ proc toPgBinaryParam*(v: string): PgParam =
   PgParam(oid: OidText, format: 1, value: some(toBytes(v)))
 
 proc toPgBinaryParam*(v: int16): PgParam =
-  PgParam(oid: OidInt2, format: 1, value: some(toBE16(v)))
+  PgParam(oid: OidInt2, format: 1, value: some(@(toBE16(v))))
 
 proc toPgBinaryParam*(v: int32): PgParam =
-  PgParam(oid: OidInt4, format: 1, value: some(toBE32(v)))
+  PgParam(oid: OidInt4, format: 1, value: some(@(toBE32(v))))
 
 proc toPgBinaryParam*(v: int64): PgParam =
-  PgParam(oid: OidInt8, format: 1, value: some(toBE64(v)))
+  PgParam(oid: OidInt8, format: 1, value: some(@(toBE64(v))))
 
 proc toPgBinaryParam*(v: int): PgParam =
-  PgParam(oid: OidInt8, format: 1, value: some(toBE64(int64(v))))
+  PgParam(oid: OidInt8, format: 1, value: some(@(toBE64(int64(v)))))
 
 proc toPgBinaryParam*(v: float32): PgParam =
-  PgParam(oid: OidFloat4, format: 1, value: some(toBE32(cast[int32](v))))
+  PgParam(oid: OidFloat4, format: 1, value: some(@(toBE32(cast[int32](v)))))
 
 proc toPgBinaryParam*(v: float64): PgParam =
-  PgParam(oid: OidFloat8, format: 1, value: some(toBE64(cast[int64](v))))
+  PgParam(oid: OidFloat8, format: 1, value: some(@(toBE64(cast[int64](v)))))
 
 proc toPgBinaryParam*(v: bool): PgParam =
   PgParam(oid: OidBool, format: 1, value: some(@[if v: 1'u8 else: 0'u8]))
@@ -246,7 +246,7 @@ proc toPgBinaryParam*(v: DateTime): PgParam =
   let t = v.toTime()
   let unixUs = t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000)
   let pgUs = unixUs - pgEpochUnix * 1_000_000
-  PgParam(oid: OidTimestamp, format: 1, value: some(toBE64(pgUs)))
+  PgParam(oid: OidTimestamp, format: 1, value: some(@(toBE64(pgUs))))
 
 proc toPgBinaryParam*(v: PgNumeric): PgParam =
   ## Sends numeric as text format (binary numeric encoding is complex).
@@ -343,8 +343,8 @@ proc getStr*(row: Row, col: int): string =
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   result = newString(clen)
-  for i in 0 ..< clen:
-    result[i] = char(row.data.buf[off + i])
+  if clen > 0:
+    copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
 
 proc getInt*(row: Row, col: int): int32 =
   let s = row.getStr(col)
