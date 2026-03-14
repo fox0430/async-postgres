@@ -961,13 +961,13 @@ template withTransaction*(
   ## Execute `body` inside a BEGIN/COMMIT transaction.
   ## On exception, ROLLBACK is issued automatically.
   ## **Note:** Do not use `return` inside the body.
-  discard await conn.exec("BEGIN", timeout = txTimeout)
+  discard await conn.simpleExec("BEGIN", timeout = txTimeout)
   try:
     body
-    discard await conn.exec("COMMIT", timeout = txTimeout)
+    discard await conn.simpleExec("COMMIT", timeout = txTimeout)
   except CatchableError as e:
     try:
-      discard await conn.exec("ROLLBACK", timeout = txTimeout)
+      discard await conn.simpleExec("ROLLBACK", timeout = txTimeout)
     except CatchableError:
       discard
     raise e
@@ -979,13 +979,13 @@ template withTransaction*(
     txTimeout: Duration = ZeroDuration,
 ) =
   let beginSql = buildBeginSql(opts)
-  discard await conn.exec(beginSql, timeout = txTimeout)
+  discard await conn.simpleExec(beginSql, timeout = txTimeout)
   try:
     body
-    discard await conn.exec("COMMIT", timeout = txTimeout)
+    discard await conn.simpleExec("COMMIT", timeout = txTimeout)
   except CatchableError as e:
     try:
-      discard await conn.exec("ROLLBACK", timeout = txTimeout)
+      discard await conn.simpleExec("ROLLBACK", timeout = txTimeout)
     except CatchableError:
       discard
     raise e
@@ -995,13 +995,14 @@ template withSavepoint*(
 ) =
   inc conn.portalCounter
   let spName = "_sp_" & $conn.portalCounter
-  discard await conn.exec("SAVEPOINT " & spName, timeout = spTimeout)
+  discard await conn.simpleExec("SAVEPOINT " & spName, timeout = spTimeout)
   try:
     body
-    discard await conn.exec("RELEASE SAVEPOINT " & spName, timeout = spTimeout)
+    discard await conn.simpleExec("RELEASE SAVEPOINT " & spName, timeout = spTimeout)
   except CatchableError as e:
     try:
-      discard await conn.exec("ROLLBACK TO SAVEPOINT " & spName, timeout = spTimeout)
+      discard
+        await conn.simpleExec("ROLLBACK TO SAVEPOINT " & spName, timeout = spTimeout)
     except CatchableError:
       discard
     raise e
@@ -1009,16 +1010,282 @@ template withSavepoint*(
 template withSavepoint*(
     conn: PgConnection, name: string, body: untyped, spTimeout: Duration = ZeroDuration
 ) =
-  discard await conn.exec("SAVEPOINT " & name, timeout = spTimeout)
+  discard await conn.simpleExec("SAVEPOINT " & name, timeout = spTimeout)
   try:
     body
-    discard await conn.exec("RELEASE SAVEPOINT " & name, timeout = spTimeout)
+    discard await conn.simpleExec("RELEASE SAVEPOINT " & name, timeout = spTimeout)
   except CatchableError as e:
     try:
-      discard await conn.exec("ROLLBACK TO SAVEPOINT " & name, timeout = spTimeout)
+      discard
+        await conn.simpleExec("ROLLBACK TO SAVEPOINT " & name, timeout = spTimeout)
     except CatchableError:
       discard
     raise e
+
+proc execInTransactionImpl(
+    conn: PgConnection,
+    beginSql: string,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    timeout: Duration,
+): Future[string] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+
+  # Pipeline: Parse+Bind+Execute for BEGIN, user SQL, COMMIT + single Sync
+  var batch = newSeqOfCap[byte](beginSql.len + sql.len + 256)
+  # BEGIN
+  batch.add(encodeParse("", beginSql))
+  batch.add(encodeBind("", "", @[], @[]))
+  batch.add(encodeExecute("", 0))
+  # User SQL
+  batch.add(encodeParse("", sql, paramOids))
+  batch.add(encodeBind("", "", formats, params))
+  batch.add(encodeExecute("", 0))
+  # COMMIT
+  batch.add(encodeParse("", "COMMIT"))
+  batch.add(encodeBind("", "", @[], @[]))
+  batch.add(encodeExecute("", 0))
+  # Single Sync
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  # Parse response: 3 phases (BEGIN=0, user=1, COMMIT=2)
+  var phase = 0
+  var userCommandTag = ""
+  var errorMsg = ""
+
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
+      discard
+    of bmkCommandComplete:
+      if phase == 1:
+        userCommandTag = msg.commandTag
+      inc phase
+    of bmkErrorResponse:
+      if errorMsg.len == 0:
+        errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        # Error occurred: if we're in a failed transaction, send ROLLBACK
+        if msg.txStatus == tsInFailedTransaction:
+          discard await conn.simpleExec("ROLLBACK")
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return userCommandTag
+
+proc execInTransaction*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a statement inside a pipelined BEGIN/COMMIT transaction (1 round trip).
+  ## On error, ROLLBACK is issued automatically.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await execInTransactionImpl(
+        conn, "BEGIN", sql, params, paramOids, paramFormats, timeout
+      )
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "execInTransaction timed out")
+  else:
+    return await execInTransactionImpl(
+      conn, "BEGIN", sql, params, paramOids, paramFormats, timeout
+    )
+
+proc execInTransaction*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a statement inside a pipelined transaction with typed parameters.
+  let (oids, formats, values) = extractParams(params)
+  return await conn.execInTransaction(sql, values, oids, formats, timeout)
+
+proc execInTransaction*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    opts: TransactionOptions,
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a statement inside a pipelined transaction with options.
+  let (oids, formats, values) = extractParams(params)
+  let beginSql = buildBeginSql(opts)
+  if timeout > ZeroDuration:
+    try:
+      return await execInTransactionImpl(
+        conn, beginSql, sql, values, oids, formats, timeout
+      )
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "execInTransaction timed out")
+  else:
+    return
+      await execInTransactionImpl(conn, beginSql, sql, values, oids, formats, timeout)
+
+proc queryInTransactionImpl(
+    conn: PgConnection,
+    beginSql: string,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    resultFormats: seq[int16],
+    timeout: Duration,
+): Future[QueryResult] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+
+  # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
+  var batch = newSeqOfCap[byte](beginSql.len + sql.len + 256)
+  # BEGIN
+  batch.add(encodeParse("", beginSql))
+  batch.add(encodeBind("", "", @[], @[]))
+  batch.add(encodeExecute("", 0))
+  # User SQL
+  batch.add(encodeParse("", sql, paramOids))
+  batch.add(encodeBind("", "", formats, params, resultFormats))
+  batch.add(encodeDescribe(dkPortal, ""))
+  batch.add(encodeExecute("", 0))
+  # COMMIT
+  batch.add(encodeParse("", "COMMIT"))
+  batch.add(encodeBind("", "", @[], @[]))
+  batch.add(encodeExecute("", 0))
+  # Single Sync
+  batch.add(encodeSync())
+  await conn.sendMsg(batch)
+
+  var qr = QueryResult()
+  var phase = 0
+  var errorMsg = ""
+
+  while true:
+    let msg =
+      await conn.recvMessage(timeout, rowData = qr.data, rowCount = addr qr.rowCount)
+    case msg.kind
+    of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkRowDescription:
+      qr.fields = msg.fields
+      qr.data = newRowData(int16(msg.fields.len))
+    of bmkNoData:
+      discard
+    of bmkEmptyQueryResponse:
+      discard
+    of bmkCommandComplete:
+      if phase == 1:
+        qr.commandTag = msg.commandTag
+      inc phase
+    of bmkErrorResponse:
+      if errorMsg.len == 0:
+        errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        if msg.txStatus == tsInFailedTransaction:
+          discard await conn.simpleExec("ROLLBACK")
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+
+  return qr
+
+proc queryInTransaction*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query inside a pipelined BEGIN/COMMIT transaction (1 round trip).
+  ## Returns rows. On error, ROLLBACK is issued automatically.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await queryInTransactionImpl(
+        conn, "BEGIN", sql, params, paramOids, paramFormats, resultFormats, timeout
+      )
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "queryInTransaction timed out")
+  else:
+    return await queryInTransactionImpl(
+      conn, "BEGIN", sql, params, paramOids, paramFormats, resultFormats, timeout
+    )
+
+proc queryInTransaction*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query inside a pipelined transaction with typed parameters.
+  let (oids, formats, values) = extractParams(params)
+  return
+    await conn.queryInTransaction(sql, values, oids, formats, resultFormats, timeout)
+
+proc queryInTransaction*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    opts: TransactionOptions,
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query inside a pipelined transaction with options.
+  let (oids, formats, values) = extractParams(params)
+  let beginSql = buildBeginSql(opts)
+  if timeout > ZeroDuration:
+    try:
+      return await queryInTransactionImpl(
+        conn, beginSql, sql, values, oids, formats, resultFormats, timeout
+      )
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "queryInTransaction timed out")
+  else:
+    return await queryInTransactionImpl(
+      conn, beginSql, sql, values, oids, formats, resultFormats, timeout
+    )
 
 proc openCursorImpl(
     conn: PgConnection,

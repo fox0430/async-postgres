@@ -766,6 +766,48 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
 
   return results
 
+proc simpleExecImpl(
+    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
+): Future[string] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+  await conn.sendMsg(encodeQuery(sql))
+  var commandTag = ""
+  var errorMsg = ""
+  while true:
+    let msg = await conn.recvMessage(timeout)
+    case msg.kind
+    of bmkCommandComplete:
+      commandTag = msg.commandTag
+    of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
+      discard
+    of bmkErrorResponse:
+      errorMsg = formatError(msg.errorFields)
+    of bmkReadyForQuery:
+      conn.txStatus = msg.txStatus
+      conn.state = csReady
+      if errorMsg.len > 0:
+        raise newException(PgError, errorMsg)
+      break
+    else:
+      discard
+  return commandTag
+
+proc simpleExec*(
+    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
+): Future[string] {.async.} =
+  ## Execute a SQL statement via simple query protocol, returning only the command tag.
+  ## Lighter than `exec` for parameter-less commands (no Parse/Bind/Describe overhead).
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await simpleExecImpl(conn, sql, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "simpleExec timed out")
+  else:
+    return await simpleExecImpl(conn, sql)
+
 proc isConnected(conn: PgConnection): bool =
   when hasChronos:
     not conn.writer.isNil

@@ -4301,3 +4301,227 @@ suite "E2E: Convenience Query Methods":
       await pool.close()
 
     waitFor t()
+
+suite "E2E: simpleExec":
+  test "simpleExec returns command tag":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_simpleexec")
+      discard await conn.exec(
+        "CREATE TABLE test_simpleexec (id serial PRIMARY KEY, val text)"
+      )
+
+      let tag = await conn.simpleExec("INSERT INTO test_simpleexec (val) VALUES ('a')")
+      doAssert tag == "INSERT 0 1"
+
+      let tag2 =
+        await conn.simpleExec("INSERT INTO test_simpleexec (val) VALUES ('b'), ('c')")
+      doAssert tag2 == "INSERT 0 2"
+
+      discard await conn.exec("DROP TABLE test_simpleexec")
+      await conn.close()
+
+    waitFor t()
+
+  test "simpleExec raises on error":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.simpleExec("SELECT * FROM nonexistent_table_xyz")
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "pool.simpleExec":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      let tag = await pool.simpleExec("SELECT 1")
+      doAssert tag == "SELECT 1"
+      await pool.close()
+
+    waitFor t()
+
+suite "E2E: execInTransaction / queryInTransaction":
+  test "execInTransaction commits successfully":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_eit")
+      discard await conn.exec("CREATE TABLE test_eit (id serial PRIMARY KEY, val text)")
+
+      let tag = await conn.execInTransaction(
+        "INSERT INTO test_eit (val) VALUES ($1)", @[some("pipelined".toBytes())]
+      )
+      doAssert tag == "INSERT 0 1"
+
+      # Verify committed
+      let res = await conn.query("SELECT val FROM test_eit")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "pipelined"
+
+      discard await conn.exec("DROP TABLE test_eit")
+      await conn.close()
+
+    waitFor t()
+
+  test "execInTransaction rolls back on error":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_eit_err")
+      discard await conn.exec(
+        "CREATE TABLE test_eit_err (id serial PRIMARY KEY, val text UNIQUE)"
+      )
+      discard await conn.exec("INSERT INTO test_eit_err (val) VALUES ('existing')")
+
+      var raised = false
+      try:
+        discard await conn.execInTransaction(
+          "INSERT INTO test_eit_err (val) VALUES ($1)", @[some("existing".toBytes())]
+        )
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Verify no extra row was committed
+      let res = await conn.query("SELECT count(*) FROM test_eit_err")
+      doAssert res.rows[0].getStr(0) == "1"
+
+      discard await conn.exec("DROP TABLE test_eit_err")
+      await conn.close()
+
+    waitFor t()
+
+  test "execInTransaction with PgParam":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_eit_pg")
+      discard await conn.exec("CREATE TABLE test_eit_pg (id int, name text)")
+
+      let tag = await conn.execInTransaction(
+        "INSERT INTO test_eit_pg (id, name) VALUES ($1, $2)",
+        @[toPgParam(42'i32), toPgParam("typed")],
+      )
+      doAssert tag == "INSERT 0 1"
+
+      let res = await conn.query("SELECT name FROM test_eit_pg WHERE id = 42")
+      doAssert res.rows[0].getStr(0) == "typed"
+
+      discard await conn.exec("DROP TABLE test_eit_pg")
+      await conn.close()
+
+    waitFor t()
+
+  test "execInTransaction with TransactionOptions":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_eit_opts")
+      discard
+        await conn.exec("CREATE TABLE test_eit_opts (id serial PRIMARY KEY, val text)")
+
+      let tag = await conn.execInTransaction(
+        "INSERT INTO test_eit_opts (val) VALUES ($1)",
+        @[toPgParam("serializable")],
+        TransactionOptions(isolation: ilSerializable),
+      )
+      doAssert tag == "INSERT 0 1"
+
+      let res = await conn.query("SELECT val FROM test_eit_opts")
+      doAssert res.rows[0].getStr(0) == "serializable"
+
+      discard await conn.exec("DROP TABLE test_eit_opts")
+      await conn.close()
+
+    waitFor t()
+
+  test "queryInTransaction returns rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_qit")
+      discard await conn.exec("CREATE TABLE test_qit (id serial PRIMARY KEY, val text)")
+      discard await conn.exec("INSERT INTO test_qit (val) VALUES ('a'), ('b'), ('c')")
+
+      let qr = await conn.queryInTransaction("SELECT val FROM test_qit ORDER BY id")
+      doAssert qr.rows.len == 3
+      doAssert qr.rows[0].getStr(0) == "a"
+      doAssert qr.rows[1].getStr(0) == "b"
+      doAssert qr.rows[2].getStr(0) == "c"
+
+      discard await conn.exec("DROP TABLE test_qit")
+      await conn.close()
+
+    waitFor t()
+
+  test "queryInTransaction with PgParam":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_qit_pg")
+      discard await conn.exec("CREATE TABLE test_qit_pg (id int, val text)")
+      discard
+        await conn.exec("INSERT INTO test_qit_pg (id, val) VALUES (1, 'x'), (2, 'y')")
+
+      let qr = await conn.queryInTransaction(
+        "SELECT val FROM test_qit_pg WHERE id = $1", @[toPgParam(1'i32)]
+      )
+      doAssert qr.rows.len == 1
+      doAssert qr.rows[0].getStr(0) == "x"
+
+      discard await conn.exec("DROP TABLE test_qit_pg")
+      await conn.close()
+
+    waitFor t()
+
+  test "queryInTransaction with TransactionOptions":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let qr = await conn.queryInTransaction(
+        "SELECT 1",
+        @[],
+        TransactionOptions(isolation: ilSerializable, access: amReadOnly),
+      )
+      doAssert qr.rows.len == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pool.execInTransaction":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_peit")
+      discard
+        await pool.exec("CREATE TABLE test_peit (id serial PRIMARY KEY, val text)")
+
+      let tag = await pool.execInTransaction(
+        "INSERT INTO test_peit (val) VALUES ($1)", @[toPgParam("pool_tx")]
+      )
+      doAssert tag == "INSERT 0 1"
+
+      let res = await pool.query("SELECT val FROM test_peit")
+      doAssert res.rows[0].getStr(0) == "pool_tx"
+
+      discard await pool.exec("DROP TABLE test_peit")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.queryInTransaction":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+
+      let qr = await pool.queryInTransaction("SELECT 42::int4")
+      doAssert qr.rows.len == 1
+      doAssert qr.rows[0].getStr(0) == "42"
+
+      await pool.close()
+
+    waitFor t()
