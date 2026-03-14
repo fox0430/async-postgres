@@ -118,28 +118,28 @@ proc execImpl(
     let c = cachedOpt.get
     stmtName = c.name
     var batch = newSeqOfCap[byte](params.len * 16 + 128)
-    batch.add(encodeBind("", stmtName, formats, params))
-    batch.add(encodeExecute("", 0))
-    batch.add(encodeSync())
+    batch.addBind("", stmtName, formats, params)
+    batch.addExecute("", 0)
+    batch.addSync()
     await conn.sendMsg(batch)
   elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
     # Cache miss with room: Parse(name) + Describe(Stmt) + Bind(name) + Execute + Sync
     cacheMiss = true
     stmtName = conn.nextStmtName()
     var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.add(encodeParse(stmtName, sql, paramOids))
-    batch.add(encodeDescribe(dkStatement, stmtName))
-    batch.add(encodeBind("", stmtName, formats, params))
-    batch.add(encodeExecute("", 0))
-    batch.add(encodeSync())
+    batch.addParse(stmtName, sql, paramOids)
+    batch.addDescribe(dkStatement, stmtName)
+    batch.addBind("", stmtName, formats, params)
+    batch.addExecute("", 0)
+    batch.addSync()
     await conn.sendMsg(batch)
   else:
     # Cache disabled/full: unnamed statement (original behavior)
     var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.add(encodeParse("", sql, paramOids))
-    batch.add(encodeBind("", "", formats, params))
-    batch.add(encodeExecute("", 0))
-    batch.add(encodeSync())
+    batch.addParse("", sql, paramOids)
+    batch.addBind("", "", formats, params)
+    batch.addExecute("", 0)
+    batch.addSync()
     await conn.sendMsg(batch)
 
   var commandTag = ""
@@ -251,29 +251,29 @@ proc queryImpl(
     stmtName = c.name
     cachedFields = c.fields
     var batch = newSeqOfCap[byte](params.len * 16 + 128)
-    batch.add(encodeBind("", stmtName, formats, params, resultFormats))
-    batch.add(encodeExecute("", 0))
-    batch.add(encodeSync())
+    batch.addBind("", stmtName, formats, params, resultFormats)
+    batch.addExecute("", 0)
+    batch.addSync()
     await conn.sendMsg(batch)
   elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
     # Cache miss with room: Parse(name) + Describe(Stmt) + Bind(name) + Execute + Sync
     cacheMiss = true
     stmtName = conn.nextStmtName()
     var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.add(encodeParse(stmtName, sql, paramOids))
-    batch.add(encodeDescribe(dkStatement, stmtName))
-    batch.add(encodeBind("", stmtName, formats, params, resultFormats))
-    batch.add(encodeExecute("", 0))
-    batch.add(encodeSync())
+    batch.addParse(stmtName, sql, paramOids)
+    batch.addDescribe(dkStatement, stmtName)
+    batch.addBind("", stmtName, formats, params, resultFormats)
+    batch.addExecute("", 0)
+    batch.addSync()
     await conn.sendMsg(batch)
   else:
     # Cache disabled/full: unnamed statement (original behavior)
     var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.add(encodeParse("", sql, paramOids))
-    batch.add(encodeBind("", "", formats, params, resultFormats))
-    batch.add(encodeDescribe(dkPortal, ""))
-    batch.add(encodeExecute("", 0))
-    batch.add(encodeSync())
+    batch.addParse("", sql, paramOids)
+    batch.addBind("", "", formats, params, resultFormats)
+    batch.addDescribe(dkPortal, "")
+    batch.addExecute("", 0)
+    batch.addSync()
     await conn.sendMsg(batch)
 
   var qr = QueryResult()
@@ -470,9 +470,9 @@ proc prepareImpl(
   conn.state = csBusy
 
   var batch = newSeqOfCap[byte](sql.len + name.len + 32)
-  batch.add(encodeParse(name, sql))
-  batch.add(encodeDescribe(dkStatement, name))
-  batch.add(encodeSync())
+  batch.addParse(name, sql)
+  batch.addDescribe(dkStatement, name)
+  batch.addSync()
   await conn.sendMsg(batch)
 
   var stmt = PreparedStatement(conn: conn, name: name)
@@ -537,9 +537,9 @@ proc executeImpl(
       paramFormats
     else:
       newSeq[int16](params.len)
-  batch.add(encodeBind("", stmt.name, formats, params, resultFormats))
-  batch.add(encodeExecute("", 0))
-  batch.add(encodeSync())
+  batch.addBind("", stmt.name, formats, params, resultFormats)
+  batch.addExecute("", 0)
+  batch.addSync()
   await conn.sendMsg(batch)
 
   var qr = QueryResult(fields: stmt.fields)
@@ -617,8 +617,8 @@ proc closeImpl(
   conn.state = csBusy
 
   var batch = newSeqOfCap[byte](stmt.name.len + 16)
-  batch.add(encodeClose(dkStatement, stmt.name))
-  batch.add(encodeSync())
+  batch.addClose(dkStatement, stmt.name)
+  batch.addSync()
   await conn.sendMsg(batch)
 
   var errorMsg = ""
@@ -714,7 +714,7 @@ proc copyInImpl(
       await conn.sendMsg(buf)
       buf.setLen(0)
   # Flush remaining data + CopyDone in one send
-  buf.add(encodeCopyDone())
+  buf.addCopyDone()
   await conn.sendMsg(buf)
 
   # Wait for CommandComplete + ReadyForQuery
@@ -827,7 +827,7 @@ proc copyInStreamImpl(
     raise callbackError
   else:
     # Normal completion: flush remaining data + CopyDone in one send
-    buf.add(encodeCopyDone())
+    buf.addCopyDone()
     await conn.sendMsg(buf)
 
   # Wait for CommandComplete + ReadyForQuery
@@ -1077,19 +1077,19 @@ proc execInTransactionImpl(
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL, COMMIT + single Sync
   var batch = newSeqOfCap[byte](beginSql.len + sql.len + 256)
   # BEGIN
-  batch.add(encodeParse("", beginSql))
-  batch.add(encodeBind("", "", @[], @[]))
-  batch.add(encodeExecute("", 0))
+  batch.addParse("", beginSql)
+  batch.addBind("", "", @[], @[])
+  batch.addExecute("", 0)
   # User SQL
-  batch.add(encodeParse("", sql, paramOids))
-  batch.add(encodeBind("", "", formats, params))
-  batch.add(encodeExecute("", 0))
+  batch.addParse("", sql, paramOids)
+  batch.addBind("", "", formats, params)
+  batch.addExecute("", 0)
   # COMMIT
-  batch.add(encodeParse("", "COMMIT"))
-  batch.add(encodeBind("", "", @[], @[]))
-  batch.add(encodeExecute("", 0))
+  batch.addParse("", "COMMIT")
+  batch.addBind("", "", @[], @[])
+  batch.addExecute("", 0)
   # Single Sync
-  batch.add(encodeSync())
+  batch.addSync()
   await conn.sendMsg(batch)
 
   # Parse response: 3 phases (BEGIN=0, user=1, COMMIT=2)
@@ -1208,20 +1208,20 @@ proc queryInTransactionImpl(
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
   var batch = newSeqOfCap[byte](beginSql.len + sql.len + 256)
   # BEGIN
-  batch.add(encodeParse("", beginSql))
-  batch.add(encodeBind("", "", @[], @[]))
-  batch.add(encodeExecute("", 0))
+  batch.addParse("", beginSql)
+  batch.addBind("", "", @[], @[])
+  batch.addExecute("", 0)
   # User SQL
-  batch.add(encodeParse("", sql, paramOids))
-  batch.add(encodeBind("", "", formats, params, resultFormats))
-  batch.add(encodeDescribe(dkPortal, ""))
-  batch.add(encodeExecute("", 0))
+  batch.addParse("", sql, paramOids)
+  batch.addBind("", "", formats, params, resultFormats)
+  batch.addDescribe(dkPortal, "")
+  batch.addExecute("", 0)
   # COMMIT
-  batch.add(encodeParse("", "COMMIT"))
-  batch.add(encodeBind("", "", @[], @[]))
-  batch.add(encodeExecute("", 0))
+  batch.addParse("", "COMMIT")
+  batch.addBind("", "", @[], @[])
+  batch.addExecute("", 0)
   # Single Sync
-  batch.add(encodeSync())
+  batch.addSync()
   await conn.sendMsg(batch)
 
   var qr = QueryResult()
@@ -1343,16 +1343,16 @@ proc openCursorImpl(
   let portalName = "_cursor_" & $conn.portalCounter
 
   var batch = newSeqOfCap[byte](sql.len + 128)
-  batch.add(encodeParse("", sql, paramOids))
+  batch.addParse("", sql, paramOids)
   let formats =
     if paramFormats.len > 0:
       paramFormats
     else:
       newSeq[int16](params.len)
-  batch.add(encodeBind(portalName, "", formats, params, resultFormats))
-  batch.add(encodeDescribe(dkPortal, portalName))
-  batch.add(encodeExecute(portalName, chunkSize))
-  batch.add(encodeFlush())
+  batch.addBind(portalName, "", formats, params, resultFormats)
+  batch.addDescribe(dkPortal, portalName)
+  batch.addExecute(portalName, chunkSize)
+  batch.addFlush()
   await conn.sendMsg(batch)
 
   var cursor =
@@ -1448,8 +1448,8 @@ proc fetchNextImpl(
   var rowCount: int32 = 0
 
   var batch = newSeqOfCap[byte](cursor.portalName.len + 24)
-  batch.add(encodeExecute(cursor.portalName, cursor.chunkSize))
-  batch.add(encodeFlush())
+  batch.addExecute(cursor.portalName, cursor.chunkSize)
+  batch.addFlush()
   await conn.sendMsg(batch)
 
   block recvLoop:
@@ -1463,8 +1463,8 @@ proc fetchNextImpl(
           cursor.exhausted = true
           # Close portal and sync
           var closeBatch: seq[byte]
-          closeBatch.add(encodeClose(dkPortal, cursor.portalName))
-          closeBatch.add(encodeSync())
+          closeBatch.addClose(dkPortal, cursor.portalName)
+          closeBatch.addSync()
           await conn.sendMsg(closeBatch)
           block drainLoop:
             while true:
@@ -1533,8 +1533,8 @@ proc closeCursorImpl(
 
   let conn = cursor.conn
   var batch = newSeqOfCap[byte](cursor.portalName.len + 16)
-  batch.add(encodeClose(dkPortal, cursor.portalName))
-  batch.add(encodeSync())
+  batch.addClose(dkPortal, cursor.portalName)
+  batch.addSync()
   await conn.sendMsg(batch)
 
   block recvLoop:
