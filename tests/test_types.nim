@@ -1,11 +1,7 @@
 import std/[json, unittest, options, strutils, tables, times, math]
 
-import ../async_postgres/[pg_protocol, pg_types]
-
-proc toBytes(s: string): seq[byte] =
-  result = newSeq[byte](s.len)
-  for i in 0 ..< s.len:
-    result[i] = byte(s[i])
+import ../async_postgres/pg_protocol
+import ../async_postgres/pg_types {.all.}
 
 proc toString(data: seq[byte]): string =
   result = newString(data.len)
@@ -50,55 +46,57 @@ suite "toPgParam":
   test "int32":
     let p = toPgParam(42'i32)
     check p.oid == OidInt4
-    check p.format == 0
-    check toString(p.value.get) == "42"
+    check p.format == 1
+    check p.value.get == @(toBE32(42'i32))
 
   test "int32 negative":
     let p = toPgParam(-1'i32)
-    check toString(p.value.get) == "-1"
+    check p.value.get == @(toBE32(-1'i32))
 
   test "int32 zero":
     let p = toPgParam(0'i32)
-    check toString(p.value.get) == "0"
+    check p.value.get == @(toBE32(0'i32))
 
   test "int64":
     let p = toPgParam(9999999999'i64)
     check p.oid == OidInt8
-    check p.format == 0
-    check toString(p.value.get) == "9999999999"
+    check p.format == 1
+    check p.value.get == @(toBE64(9999999999'i64))
 
   test "int64 negative":
     let p = toPgParam(-9999999999'i64)
-    check toString(p.value.get) == "-9999999999"
+    check p.value.get == @(toBE64(-9999999999'i64))
 
   test "float64":
     let p = toPgParam(3.14)
     check p.oid == OidFloat8
-    check p.format == 0
+    check p.format == 1
     check p.value.isSome
-    let s = toString(p.value.get)
-    check s.len > 0
-    # Verify it parses back to approximately the same value
-    check abs(parseFloat(s) - 3.14) < 1e-10
+    check p.value.get.len == 8
+    # Verify roundtrip via fromBE64 + cast
+    let bits = fromBE64(p.value.get)
+    check abs(cast[float64](bits) - 3.14) < 1e-10
 
   test "float64 zero":
     let p = toPgParam(0.0)
-    check toString(p.value.get) == "0.0"
+    let bits = fromBE64(p.value.get)
+    check cast[float64](bits) == 0.0
 
   test "float64 negative":
     let p = toPgParam(-1.5)
-    check abs(parseFloat(toString(p.value.get)) - (-1.5)) < 1e-10
+    let bits = fromBE64(p.value.get)
+    check abs(cast[float64](bits) - (-1.5)) < 1e-10
 
   test "bool true":
     let p = toPgParam(true)
     check p.oid == OidBool
-    check p.format == 0
-    check toString(p.value.get) == "t"
+    check p.format == 1
+    check p.value.get == @[1'u8]
 
   test "bool false":
     let p = toPgParam(false)
     check p.oid == OidBool
-    check toString(p.value.get) == "f"
+    check p.value.get == @[0'u8]
 
   test "seq[byte]":
     let data = @[0x01'u8, 0x02, 0xFF]
@@ -118,20 +116,21 @@ suite "toPgParam":
   test "int16":
     let p = toPgParam(100'i16)
     check p.oid == OidInt2
-    check p.format == 0
-    check toString(p.value.get) == "100"
+    check p.format == 1
+    check p.value.get == @(toBE16(100'i16))
 
   test "int16 negative":
     let p = toPgParam(-32000'i16)
-    check toString(p.value.get) == "-32000"
+    check p.value.get == @(toBE16(-32000'i16))
 
   test "float32":
     let p = toPgParam(1.5'f32)
     check p.oid == OidFloat4
-    check p.format == 0
+    check p.format == 1
     check p.value.isSome
-    let s = toString(p.value.get)
-    check abs(parseFloat(s) - 1.5) < 1e-5
+    check p.value.get.len == 4
+    let bits = fromBE32(p.value.get)
+    check abs(cast[float32](bits) - 1.5'f32) < 1e-5'f32
 
   test "float32 zero":
     let p = toPgParam(0.0'f32)
@@ -186,7 +185,7 @@ suite "toPgParam Option[T]":
   test "some int32":
     let p = toPgParam(some(42'i32))
     check p.oid == OidInt4
-    check toString(p.value.get) == "42"
+    check p.value.get == @(toBE32(42'i32))
 
   test "none int32":
     let p = toPgParam(none(int32))
@@ -195,7 +194,7 @@ suite "toPgParam Option[T]":
   test "some bool":
     let p = toPgParam(some(true))
     check p.oid == OidBool
-    check toString(p.value.get) == "t"
+    check p.value.get == @[1'u8]
 
   test "none bool":
     let p = toPgParam(none(bool))
@@ -255,14 +254,14 @@ suite "Row accessors":
     check raised
 
 suite "PgParam format field":
-  test "all toPgParam use text format":
+  test "toPgParam uses binary for numeric and bool, text for others":
     check toPgParam("x").format == 0
-    check toPgParam(1'i16).format == 0
-    check toPgParam(1'i32).format == 0
-    check toPgParam(1'i64).format == 0
-    check toPgParam(1.0'f32).format == 0
-    check toPgParam(1.0).format == 0
-    check toPgParam(true).format == 0
+    check toPgParam(1'i16).format == 1
+    check toPgParam(1'i32).format == 1
+    check toPgParam(1'i64).format == 1
+    check toPgParam(1.0'f32).format == 1
+    check toPgParam(1.0).format == 1
+    check toPgParam(true).format == 1
     check toPgParam(@[1'u8]).format == 0
     check toPgParam(dateTime(2024, mJan, 1, 0, 0, 0, 0, utc())).format == 0
     check toPgParam(PgUuid("test")).format == 0
