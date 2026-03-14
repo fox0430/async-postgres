@@ -1,4 +1,4 @@
-import std/options
+import std/[options, tables]
 
 import async_backend, pg_protocol, pg_connection, pg_types
 
@@ -102,25 +102,62 @@ proc execImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch = newSeqOfCap[byte](sql.len + 128)
-  batch.add(encodeParse("", sql, paramOids))
   let formats =
     if paramFormats.len > 0:
       paramFormats
     else:
       newSeq[int16](params.len)
-  batch.add(encodeBind("", "", formats, params))
-  batch.add(encodeExecute("", 0))
-  batch.add(encodeSync())
-  await conn.sendMsg(batch)
+
+  let cachedOpt = conn.lookupStmtCache(sql)
+  var cacheHit = cachedOpt.isSome
+  var cacheMiss = false
+  var stmtName = ""
+
+  if cacheHit:
+    # Cache hit: Bind(cached.name) + Execute + Sync
+    let c = cachedOpt.get
+    stmtName = c.name
+    var batch = newSeqOfCap[byte](64)
+    batch.add(encodeBind("", stmtName, formats, params))
+    batch.add(encodeExecute("", 0))
+    batch.add(encodeSync())
+    await conn.sendMsg(batch)
+  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+    # Cache miss with room: Parse(name) + Describe(Stmt) + Bind(name) + Execute + Sync
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.add(encodeParse(stmtName, sql, paramOids))
+    batch.add(encodeDescribe(dkStatement, stmtName))
+    batch.add(encodeBind("", stmtName, formats, params))
+    batch.add(encodeExecute("", 0))
+    batch.add(encodeSync())
+    await conn.sendMsg(batch)
+  else:
+    # Cache disabled/full: unnamed statement (original behavior)
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.add(encodeParse("", sql, paramOids))
+    batch.add(encodeBind("", "", formats, params))
+    batch.add(encodeExecute("", 0))
+    batch.add(encodeSync())
+    await conn.sendMsg(batch)
 
   var commandTag = ""
   var errorMsg = ""
+  var errorCode = ""
+  var cachedFields: seq[FieldDescription]
 
   while true:
     let msg = await conn.recvMessage(timeout)
     case msg.kind
     of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkParameterDescription:
+      discard
+    of bmkRowDescription:
+      if cacheMiss:
+        cachedFields = msg.fields
+    of bmkNoData:
       discard
     of bmkDataRow:
       discard # exec ignores rows
@@ -130,11 +167,19 @@ proc execImpl(
       discard
     of bmkErrorResponse:
       errorMsg = formatError(msg.errorFields)
+      for f in msg.errorFields:
+        if f.code == 'C':
+          errorCode = f.value
+          break
     of bmkReadyForQuery:
       conn.txStatus = msg.txStatus
       conn.state = csReady
       if errorMsg.len > 0:
+        if cacheHit and errorCode == "26000":
+          conn.removeStmtCache(sql)
         raise newException(PgError, errorMsg)
+      if cacheMiss:
+        conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
       break
     else:
       discard
@@ -185,21 +230,64 @@ proc queryImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch = newSeqOfCap[byte](sql.len + 128)
-  batch.add(encodeParse("", sql, paramOids))
   let formats =
     if paramFormats.len > 0:
       paramFormats
     else:
       newSeq[int16](params.len)
-  batch.add(encodeBind("", "", formats, params, resultFormats))
-  batch.add(encodeDescribe(dkPortal, ""))
-  batch.add(encodeExecute("", 0))
-  batch.add(encodeSync())
-  await conn.sendMsg(batch)
+
+  let cachedOpt = conn.lookupStmtCache(sql)
+  var cacheHit = cachedOpt.isSome
+  var cacheMiss = false
+  var stmtName = ""
+  var cachedFields: seq[FieldDescription] # raw fields (formatCode=0) for cache storage
+
+  if cacheHit:
+    # Cache hit: Bind(cached.name) + Execute + Sync
+    let c = cachedOpt.get
+    stmtName = c.name
+    cachedFields = c.fields
+    var batch = newSeqOfCap[byte](64)
+    batch.add(encodeBind("", stmtName, formats, params, resultFormats))
+    batch.add(encodeExecute("", 0))
+    batch.add(encodeSync())
+    await conn.sendMsg(batch)
+  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+    # Cache miss with room: Parse(name) + Describe(Stmt) + Bind(name) + Execute + Sync
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.add(encodeParse(stmtName, sql, paramOids))
+    batch.add(encodeDescribe(dkStatement, stmtName))
+    batch.add(encodeBind("", stmtName, formats, params, resultFormats))
+    batch.add(encodeExecute("", 0))
+    batch.add(encodeSync())
+    await conn.sendMsg(batch)
+  else:
+    # Cache disabled/full: unnamed statement (original behavior)
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.add(encodeParse("", sql, paramOids))
+    batch.add(encodeBind("", "", formats, params, resultFormats))
+    batch.add(encodeDescribe(dkPortal, ""))
+    batch.add(encodeExecute("", 0))
+    batch.add(encodeSync())
+    await conn.sendMsg(batch)
 
   var qr = QueryResult()
   var errorMsg = ""
+  var errorCode = ""
+
+  # For cache hit, set up fields from cache (with formatCode adjusted for resultFormats)
+  if cacheHit:
+    qr.fields = cachedFields
+    if resultFormats.len > 0:
+      for i in 0 ..< qr.fields.len:
+        if resultFormats.len == 1:
+          qr.fields[i].formatCode = resultFormats[0]
+        elif i < resultFormats.len:
+          qr.fields[i].formatCode = resultFormats[i]
+    if qr.fields.len > 0:
+      qr.data = newRowData(int16(qr.fields.len))
 
   while true:
     let msg =
@@ -207,9 +295,24 @@ proc queryImpl(
     case msg.kind
     of bmkParseComplete, bmkBindComplete:
       discard
+    of bmkParameterDescription:
+      discard
     of bmkRowDescription:
-      qr.fields = msg.fields
-      qr.data = newRowData(int16(msg.fields.len))
+      if cacheMiss:
+        # From Describe(Statement): save raw fields (formatCode=0) for cache
+        cachedFields = msg.fields
+        # Apply resultFormats for this execution
+        qr.fields = cachedFields
+        if resultFormats.len > 0:
+          for i in 0 ..< qr.fields.len:
+            if resultFormats.len == 1:
+              qr.fields[i].formatCode = resultFormats[0]
+            elif i < resultFormats.len:
+              qr.fields[i].formatCode = resultFormats[i]
+      else:
+        # Uncached path: RowDescription from Describe(Portal) already has correct formatCode
+        qr.fields = msg.fields
+      qr.data = newRowData(int16(qr.fields.len))
     of bmkNoData:
       discard
     of bmkCommandComplete:
@@ -218,11 +321,19 @@ proc queryImpl(
       discard
     of bmkErrorResponse:
       errorMsg = formatError(msg.errorFields)
+      for f in msg.errorFields:
+        if f.code == 'C':
+          errorCode = f.value
+          break
     of bmkReadyForQuery:
       conn.txStatus = msg.txStatus
       conn.state = csReady
       if errorMsg.len > 0:
+        if cacheHit and errorCode == "26000":
+          conn.removeStmtCache(sql)
         raise newException(PgError, errorMsg)
+      if cacheMiss:
+        conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
       break
     else:
       discard

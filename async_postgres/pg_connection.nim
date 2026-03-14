@@ -1,4 +1,4 @@
-import std/[tables, sets, strutils, uri, deques]
+import std/[tables, sets, strutils, uri, deques, options]
 when defined(linux) or defined(macosx):
   import std/posix
 
@@ -75,6 +75,10 @@ type
 
   NoticeCallback* = proc(notice: Notice) {.gcsafe, raises: [].}
 
+  CachedStmt* = object
+    name*: string ## Server-side statement name ("_sc_1", "_sc_2", ...)
+    fields*: seq[FieldDescription] ## From Describe(Statement), formatCode=0
+
   PgConnection* = ref object
     when hasChronos:
       transport*: StreamTransport
@@ -110,6 +114,9 @@ type
     listenErrorMsg: string ## Set when listen pump fails permanently
     reconnectCallback*: proc() {.gcsafe, raises: [].}
     notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
+    stmtCache*: Table[string, CachedStmt]
+    stmtCounter*: int
+    stmtCacheCapacity*: int ## 0=disabled, default 256
 
   QueryResult* = object
     fields*: seq[FieldDescription]
@@ -194,6 +201,27 @@ proc dispatchNotification(conn: PgConnection, msg: BackendMessage) =
 proc dispatchNotice(conn: PgConnection, msg: BackendMessage) =
   if conn.noticeCallback != nil:
     conn.noticeCallback(Notice(fields: msg.noticeFields))
+
+proc nextStmtName*(conn: PgConnection): string =
+  inc conn.stmtCounter
+  "_sc_" & $conn.stmtCounter
+
+proc clearStmtCache*(conn: PgConnection) =
+  conn.stmtCache.clear()
+
+proc lookupStmtCache*(conn: PgConnection, sql: string): Option[CachedStmt] =
+  if conn.stmtCacheCapacity <= 0:
+    return none(CachedStmt)
+  if conn.stmtCache.hasKey(sql):
+    return some(conn.stmtCache[sql])
+  return none(CachedStmt)
+
+proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
+  if conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+    conn.stmtCache[sql] = cached
+
+proc removeStmtCache*(conn: PgConnection, sql: string) =
+  conn.stmtCache.del(sql)
 
 when hasAsyncDispatch:
   template bytesToString(data: seq[byte]): string =
@@ -570,6 +598,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         port: config.port,
         config: config,
         notifyMaxQueue: 1024,
+        stmtCacheCapacity: 256,
       )
     elif hasAsyncDispatch:
       let sock = newAsyncSocket(buffered = false)
@@ -589,6 +618,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         port: config.port,
         config: config,
         notifyMaxQueue: 1024,
+        stmtCacheCapacity: 256,
       )
 
     try:
@@ -865,6 +895,7 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   await conn.closeTransport()
   conn.recvBuf.setLen(0)
   conn.recvBufStart = 0
+  conn.clearStmtCache()
   conn.state = csConnecting
   let newConn = await connect(conn.config)
   when hasChronos:

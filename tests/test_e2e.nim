@@ -4157,3 +4157,147 @@ suite "E2E: Convenience Query Methods":
       await pool.close()
 
     waitFor t()
+
+  test "stmt cache: repeated query uses cache":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      doAssert conn.stmtCacheCapacity == 256
+      doAssert conn.stmtCache.len == 0
+
+      # First call: cache miss -> populates cache
+      let r1 = await conn.query("SELECT 1 AS v")
+      doAssert r1.rows[0].getStr(0) == "1"
+      doAssert conn.stmtCache.len == 1
+
+      # Second call: cache hit
+      let r2 = await conn.query("SELECT 1 AS v")
+      doAssert r2.rows[0].getStr(0) == "1"
+      doAssert conn.stmtCache.len == 1 # no new entry
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: repeated exec uses cache":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      discard await conn.exec("SELECT 1")
+      doAssert conn.stmtCache.len == 1
+
+      discard await conn.exec("SELECT 1")
+      doAssert conn.stmtCache.len == 1
+
+      # Different SQL gets its own entry
+      discard await conn.exec("SELECT 2")
+      doAssert conn.stmtCache.len == 2
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: query with params":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.query(
+        "SELECT $1::int + $2::int AS sum", @[some(@[byte('1')]), some(@[byte('2')])]
+      )
+      doAssert r1.rows[0].getStr(0) == "3"
+      doAssert conn.stmtCache.len == 1
+
+      # Same SQL, different params: cache hit
+      let r2 = await conn.query(
+        "SELECT $1::int + $2::int AS sum", @[some(@[byte('3')]), some(@[byte('4')])]
+      )
+      doAssert r2.rows[0].getStr(0) == "7"
+      doAssert conn.stmtCache.len == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: binary result format works with cache":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.query("SELECT 42::int4", resultFormats = binaryFormat)
+      doAssert r1.rows[0].getInt(0, r1.fields) == 42
+      doAssert conn.stmtCache.len == 1
+
+      # Cache hit with binary format
+      let r2 = await conn.query("SELECT 42::int4", resultFormats = binaryFormat)
+      doAssert r2.rows[0].getInt(0, r2.fields) == 42
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: clearStmtCache works":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      discard await conn.query("SELECT 1")
+      discard await conn.query("SELECT 2")
+      doAssert conn.stmtCache.len == 2
+
+      conn.clearStmtCache()
+      doAssert conn.stmtCache.len == 0
+
+      # After clear, queries still work (cache miss path)
+      let r = await conn.query("SELECT 3")
+      doAssert r.rows[0].getStr(0) == "3"
+      doAssert conn.stmtCache.len == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: disabled when capacity=0":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 0
+
+      discard await conn.query("SELECT 1")
+      doAssert conn.stmtCache.len == 0
+
+      discard await conn.exec("SELECT 1")
+      doAssert conn.stmtCache.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: full cache falls back to unnamed":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      discard await conn.query("SELECT 1")
+      discard await conn.query("SELECT 2")
+      doAssert conn.stmtCache.len == 2
+
+      # Cache full, new SQL uses unnamed statement
+      let r = await conn.query("SELECT 3")
+      doAssert r.rows[0].getStr(0) == "3"
+      doAssert conn.stmtCache.len == 2 # not added
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: works with pool":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+
+      # First query populates cache on the pooled connection
+      let r1 = await pool.query("SELECT 'cached'")
+      doAssert r1.rows[0].getStr(0) == "cached"
+
+      # Second query should hit cache
+      let r2 = await pool.query("SELECT 'cached'")
+      doAssert r2.rows[0].getStr(0) == "cached"
+
+      await pool.close()
+
+    waitFor t()
