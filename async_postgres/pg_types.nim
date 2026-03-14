@@ -92,28 +92,25 @@ proc toPgParam*(v: string): PgParam =
   PgParam(oid: OidText, format: 0, value: some(toBytes(v)))
 
 proc toPgParam*(v: int16): PgParam =
-  PgParam(oid: OidInt2, format: 0, value: some(toBytes($v)))
+  PgParam(oid: OidInt2, format: 1, value: some(@(toBE16(v))))
 
 proc toPgParam*(v: int32): PgParam =
-  PgParam(oid: OidInt4, format: 0, value: some(toBytes($v)))
+  PgParam(oid: OidInt4, format: 1, value: some(@(toBE32(v))))
 
 proc toPgParam*(v: int64): PgParam =
-  PgParam(oid: OidInt8, format: 0, value: some(toBytes($v)))
+  PgParam(oid: OidInt8, format: 1, value: some(@(toBE64(v))))
 
 proc toPgParam*(v: int): PgParam =
-  PgParam(oid: OidInt8, format: 0, value: some(toBytes($v)))
+  PgParam(oid: OidInt8, format: 1, value: some(@(toBE64(int64(v)))))
 
 proc toPgParam*(v: float32): PgParam =
-  PgParam(oid: OidFloat4, format: 0, value: some(toBytes($v)))
+  PgParam(oid: OidFloat4, format: 1, value: some(@(toBE32(cast[int32](v)))))
 
 proc toPgParam*(v: float64): PgParam =
-  PgParam(oid: OidFloat8, format: 0, value: some(toBytes($v)))
+  PgParam(oid: OidFloat8, format: 1, value: some(@(toBE64(cast[int64](v)))))
 
 proc toPgParam*(v: bool): PgParam =
-  if v:
-    PgParam(oid: OidBool, format: 0, value: some(toBytes("t")))
-  else:
-    PgParam(oid: OidBool, format: 0, value: some(toBytes("f")))
+  PgParam(oid: OidBool, format: 1, value: some(@[if v: 1'u8 else: 0'u8]))
 
 proc toPgParam*(v: seq[byte]): PgParam =
   PgParam(oid: OidBytea, format: 0, value: some(v))
