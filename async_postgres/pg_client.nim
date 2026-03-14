@@ -761,8 +761,20 @@ proc executeImpl(
   conn.checkReady()
   conn.state = csBusy
 
+  # Coerce binary parameters to match server-inferred types from prepare().
+  var coerced: seq[PgParam]
+  var needsCoercion = false
+  if stmt.paramOids.len == params.len:
+    for i in 0 ..< params.len:
+      if params[i].format == 1 and params[i].oid != stmt.paramOids[i] and
+          stmt.paramOids[i] != 0:
+        if not needsCoercion:
+          coerced = params
+          needsCoercion = true
+        coerced[i] = coerceBinaryParam(params[i], stmt.paramOids[i])
+
   var batch = newSeqOfCap[byte](params.len * 16 + 128)
-  batch.addBind("", stmt.name, params, resultFormats)
+  batch.addBind("", stmt.name, if needsCoercion: coerced else: params, resultFormats)
   batch.addExecute("", 0)
   batch.addSync()
   await conn.sendMsg(batch)

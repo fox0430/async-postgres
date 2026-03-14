@@ -808,6 +808,52 @@ proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
   for i, f in fields:
     result[f.name] = i
 
+# Coerce a binary PgParam to match the server-inferred type from a prepared
+# statement.  This handles the common case where e.g. int32.toPgParam is
+# passed but the server inferred int8 (LIMIT/OFFSET).  Only safe widening
+# conversions are performed; incompatible types raise PgTypeError.
+
+proc coerceBinaryParam*(param: PgParam, serverOid: int32): PgParam =
+  ## Return a copy of `param` whose binary payload matches `serverOid`.
+  ## Text-format parameters (format == 0) and matching OIDs are returned
+  ## unchanged.  For binary-format parameters with a type mismatch, safe
+  ## widening conversions are applied.
+  if param.format == 0 or param.oid == serverOid or serverOid == 0:
+    return param
+  if param.value.isNone:
+    # NULL – OID doesn't matter for the wire payload
+    return PgParam(oid: serverOid, format: param.format, value: param.value)
+
+  let data = param.value.get
+
+  # int2 -> int4
+  if param.oid == OidInt2 and serverOid == OidInt4 and data.len == 2:
+    let v = int32(fromBE16(data))
+    return PgParam(oid: OidInt4, format: 1, value: some(@(toBE32(v))))
+
+  # int2 -> int8
+  if param.oid == OidInt2 and serverOid == OidInt8 and data.len == 2:
+    let v = int64(fromBE16(data))
+    return PgParam(oid: OidInt8, format: 1, value: some(@(toBE64(v))))
+
+  # int4 -> int8
+  if param.oid == OidInt4 and serverOid == OidInt8 and data.len == 4:
+    let v = int64(fromBE32(data))
+    return PgParam(oid: OidInt8, format: 1, value: some(@(toBE64(v))))
+
+  # float4 -> float8
+  if param.oid == OidFloat4 and serverOid == OidFloat8 and data.len == 4:
+    let f = cast[float32](fromBE32(data))
+    let d = float64(f)
+    return PgParam(oid: OidFloat8, format: 1, value: some(@(toBE64(cast[int64](d)))))
+
+  raise newException(
+    PgTypeError,
+    "Prepared statement parameter type mismatch: client sent OID " & $param.oid &
+      " (binary, " & $data.len & " bytes) but server expects OID " & $serverOid &
+      ". Use an explicit SQL cast (e.g. $N::int4) or pass the correct type.",
+  )
+
 # PgParam-aware in-place encoding (avoids extractParams allocations)
 
 proc addParse*(
