@@ -29,28 +29,29 @@ Async PostgreSQL client in Nim.
 import async_postgres
 
 proc main() {.async.} =
-  let conn = await connect(ConnConfig(
-    host: "127.0.0.1",
-    port: 5432,
-    user: "myuser",
-    password: "mypass",
-    database: "mydb",
-  ))
+  let conn = await connect(parseDsn("postgresql://myuser:mypass@127.0.0.1:5432/mydb"))
   defer: await conn.close()
 
-  # Execute (returns command tag)
-  discard await conn.exec(
+  # Insert and get affected row count
+  let affected = await conn.execAffected(
     "INSERT INTO users (name, age) VALUES ($1, $2)",
     @[toPgParam("Alice"), toPgParam(30'i32)],
   )
+  echo "Inserted: ", affected
 
-  # Query (returns rows)
+  # Query multiple rows
   let result = await conn.query(
     "SELECT id, name, age FROM users WHERE age > $1",
     @[toPgParam(25'i32)],
   )
   for row in result.rows:
     echo row.getStr(1), " age=", row.getInt(2)
+
+  # Query a single value
+  let count = await conn.queryValue(
+    "SELECT count(*) FROM users", default = "0",
+  )
+  echo "Total users: ", count
 
 waitFor main()
 ```
