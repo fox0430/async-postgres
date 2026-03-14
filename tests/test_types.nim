@@ -1534,3 +1534,121 @@ suite "columnIndex and columnMap":
   test "columnIndex with single field":
     let single = @[mkFieldDesc("only")]
     check single.columnIndex("only") == 0
+
+suite "coerceBinaryParam":
+  test "matching OID unchanged":
+    let p = toPgParam(42'i32)
+    let c = coerceBinaryParam(p, OidInt4)
+    check c.oid == OidInt4
+    check c.format == 1
+    check c.value.get == p.value.get
+
+  test "text format unchanged regardless of OID mismatch":
+    let p = toPgParam("hello")
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidText
+    check c.format == 0
+    check c.value.get == p.value.get
+
+  test "server OID 0 unchanged":
+    let p = toPgParam(42'i32)
+    let c = coerceBinaryParam(p, 0'i32)
+    check c.oid == OidInt4
+    check c.value.get == p.value.get
+
+  test "NULL value gets server OID":
+    let p = PgParam(oid: OidInt4, format: 1, value: none(seq[byte]))
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidInt8
+    check c.value.isNone
+
+  test "int2 -> int4":
+    let p = toPgParam(42'i16)
+    let c = coerceBinaryParam(p, OidInt4)
+    check c.oid == OidInt4
+    check c.format == 1
+    check c.value.get == @(toBE32(42'i32))
+
+  test "int2 -> int4 negative":
+    let p = toPgParam(-100'i16)
+    let c = coerceBinaryParam(p, OidInt4)
+    check c.oid == OidInt4
+    check c.value.get == @(toBE32(-100'i32))
+
+  test "int2 -> int8":
+    let p = toPgParam(1000'i16)
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidInt8
+    check c.format == 1
+    check c.value.get == @(toBE64(1000'i64))
+
+  test "int2 -> int8 negative":
+    let p = toPgParam(-1'i16)
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidInt8
+    check c.value.get == @(toBE64(-1'i64))
+
+  test "int4 -> int8":
+    let p = toPgParam(10'i32)
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidInt8
+    check c.format == 1
+    check c.value.get == @(toBE64(10'i64))
+
+  test "int4 -> int8 negative":
+    let p = toPgParam(-999999'i32)
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidInt8
+    check c.value.get == @(toBE64(-999999'i64))
+
+  test "int4 -> int8 max int32":
+    let p = toPgParam(high(int32))
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidInt8
+    check c.value.get == @(toBE64(int64(high(int32))))
+
+  test "int4 -> int8 min int32":
+    let p = toPgParam(low(int32))
+    let c = coerceBinaryParam(p, OidInt8)
+    check c.oid == OidInt8
+    check c.value.get == @(toBE64(int64(low(int32))))
+
+  test "float4 -> float8":
+    let p = toPgParam(1.5'f32)
+    let c = coerceBinaryParam(p, OidFloat8)
+    check c.oid == OidFloat8
+    check c.format == 1
+    check c.value.get == @(toBE64(cast[int64](float64(1.5'f32))))
+
+  test "float4 -> float8 negative":
+    let p = toPgParam(-3.14'f32)
+    let c = coerceBinaryParam(p, OidFloat8)
+    check c.oid == OidFloat8
+    check c.value.get == @(toBE64(cast[int64](float64(-3.14'f32))))
+
+  test "incompatible types raise PgTypeError":
+    let p = toPgParam(42'i32)
+    var raised = false
+    try:
+      discard coerceBinaryParam(p, OidText)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "int8 -> int4 not supported raises":
+    let p = toPgParam(42'i64)
+    var raised = false
+    try:
+      discard coerceBinaryParam(p, OidInt4)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "float8 -> float4 not supported raises":
+    let p = toPgParam(1.5'f64)
+    var raised = false
+    try:
+      discard coerceBinaryParam(p, OidFloat4)
+    except PgTypeError:
+      raised = true
+    check raised
