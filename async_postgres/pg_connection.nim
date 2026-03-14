@@ -306,6 +306,11 @@ proc nextMessage*(
       conn.recvBufStart = pos
       return none(BackendMessage)
     pos += consumed
+    if res.state == psDataRow:
+      # DataRow already parsed in-place into rowData; just count it
+      if rowCount != nil:
+        rowCount[] += 1
+      continue
     if res.message.kind == bmkNotificationResponse:
       conn.dispatchNotification(res.message)
       continue
