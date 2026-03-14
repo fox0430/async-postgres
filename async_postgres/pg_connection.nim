@@ -253,6 +253,71 @@ proc compactRecvBuf(conn: PgConnection) {.inline.} =
     conn.recvBuf.setLen(remaining)
   conn.recvBufStart = 0
 
+proc fillRecvBuf*(
+    conn: PgConnection, timeout: Duration = ZeroDuration
+): Future[void] {.async.} =
+  ## Read data from socket into buffer. The only await point for message reception.
+  conn.compactRecvBuf()
+  when hasChronos:
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + RecvBufSize)
+    try:
+      let n =
+        if timeout == ZeroDuration:
+          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
+        else:
+          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
+            timeout
+          )
+      if n == 0:
+        conn.state = csClosed
+        raise newException(PgError, "Connection closed by server")
+      conn.recvBuf.setLen(oldLen + n)
+    except AsyncTimeoutError as e:
+      conn.recvBuf.setLen(oldLen)
+      raise e
+  elif hasAsyncDispatch:
+    let data =
+      if timeout == ZeroDuration:
+        await conn.socket.recv(RecvBufSize)
+      else:
+        await conn.socket.recv(RecvBufSize).wait(timeout)
+    if data.len == 0:
+      conn.state = csClosed
+      raise newException(PgError, "Connection closed by server")
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + data.len)
+    copyMem(addr conn.recvBuf[oldLen], unsafeAddr data[0], data.len)
+
+proc nextMessage*(
+    conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
+): Option[BackendMessage] =
+  ## Synchronously parse the next message from the receive buffer.
+  ## Returns none if the buffer doesn't contain a complete message.
+  ## Notification/Notice messages are dispatched internally.
+  ## DataRow messages are counted (if rowCount != nil) and consumed.
+  var pos = conn.recvBufStart
+  while true:
+    var consumed: int
+    let res = parseBackendMessage(
+      conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
+    )
+    if res.state == psIncomplete:
+      conn.recvBufStart = pos
+      return none(BackendMessage)
+    pos += consumed
+    if res.message.kind == bmkNotificationResponse:
+      conn.dispatchNotification(res.message)
+      continue
+    if res.message.kind == bmkNoticeResponse:
+      conn.dispatchNotice(res.message)
+      continue
+    if res.message.kind == bmkDataRow and rowCount != nil:
+      rowCount[] += 1
+      continue
+    conn.recvBufStart = pos
+    return some(res.message)
+
 proc recvMessage*(
     conn: PgConnection,
     timeout = ZeroDuration,
@@ -260,62 +325,12 @@ proc recvMessage*(
     rowCount: ptr int32 = nil,
 ): Future[BackendMessage] {.async.} =
   ## Receive a single backend message from the connection.
-  ## If `timeout` is non-zero, each read operation is bounded by the timeout,
-  ## raising AsyncTimeoutError if no data arrives within the specified duration.
-  ## If `rowData` is non-nil, DataRow messages are parsed directly into the flat buffer.
-  var pos = conn.recvBufStart
+  ## Thin wrapper around nextMessage + fillRecvBuf for backward compatibility.
   while true:
-    var consumed: int
-    let res = parseBackendMessage(
-      conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
-    )
-    if res.state == psComplete:
-      pos += consumed
-      if res.message.kind == bmkNotificationResponse:
-        conn.dispatchNotification(res.message)
-        continue
-      if res.message.kind == bmkNoticeResponse:
-        conn.dispatchNotice(res.message)
-        continue
-      if res.message.kind == bmkDataRow and rowCount != nil:
-        rowCount[] += 1
-        continue
-      conn.recvBufStart = pos
-      return res.message
-    # Compact before reading more data to maximize contiguous space
-    conn.recvBufStart = pos
-    conn.compactRecvBuf()
-    pos = 0
-    when hasChronos:
-      let oldLen = conn.recvBuf.len
-      conn.recvBuf.setLen(oldLen + RecvBufSize)
-      try:
-        let n =
-          if timeout == ZeroDuration:
-            await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
-          else:
-            await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
-              timeout
-            )
-        if n == 0:
-          conn.state = csClosed
-          raise newException(PgError, "Connection closed by server")
-        conn.recvBuf.setLen(oldLen + n)
-      except AsyncTimeoutError as e:
-        conn.recvBuf.setLen(oldLen)
-        raise e
-    elif hasAsyncDispatch:
-      let data =
-        if timeout == ZeroDuration:
-          await conn.socket.recv(RecvBufSize)
-        else:
-          await conn.socket.recv(RecvBufSize).wait(timeout)
-      if data.len == 0:
-        conn.state = csClosed
-        raise newException(PgError, "Connection closed by server")
-      let oldLen = conn.recvBuf.len
-      conn.recvBuf.setLen(oldLen + data.len)
-      copyMem(addr conn.recvBuf[oldLen], unsafeAddr data[0], data.len)
+    let opt = conn.nextMessage(rowData, rowCount)
+    if opt.isSome:
+      return opt.get
+    await conn.fillRecvBuf(timeout)
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
   when hasChronos:
@@ -643,50 +658,59 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
 
       # Authentication loop
       var scramState: ScramState
-      while true:
-        let msg = await conn.recvMessage()
-        case msg.kind
-        of bmkAuthenticationOk:
-          break
-        of bmkAuthenticationCleartextPassword:
-          await conn.sendMsg(encodePassword(config.password))
-        of bmkAuthenticationMD5Password:
-          let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
-          await conn.sendMsg(encodePassword(hash))
-        of bmkAuthenticationSASL:
-          if "SCRAM-SHA-256" notin msg.saslMechanisms:
-            raise newException(PgError, "Server doesn't support SCRAM-SHA-256")
-          let clientFirst = scramClientFirstMessage(config.user, scramState)
-          await conn.sendMsg(encodeSASLInitialResponse("SCRAM-SHA-256", clientFirst))
-        of bmkAuthenticationSASLContinue:
-          let clientFinal =
-            scramClientFinalMessage(config.password, msg.saslData, scramState)
-          await conn.sendMsg(encodeSASLResponse(clientFinal))
-        of bmkAuthenticationSASLFinal:
-          if not scramVerifyServerFinal(msg.saslFinalData, scramState):
-            raise newException(PgError, "SCRAM server signature verification failed")
-        of bmkErrorResponse:
-          raise newException(PgError, formatError(msg.errorFields))
-        else:
-          discard
+      block authLoop:
+        while true:
+          while (let opt = conn.nextMessage(); opt.isSome):
+            let msg = opt.get
+            case msg.kind
+            of bmkAuthenticationOk:
+              break authLoop
+            of bmkAuthenticationCleartextPassword:
+              await conn.sendMsg(encodePassword(config.password))
+            of bmkAuthenticationMD5Password:
+              let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
+              await conn.sendMsg(encodePassword(hash))
+            of bmkAuthenticationSASL:
+              if "SCRAM-SHA-256" notin msg.saslMechanisms:
+                raise newException(PgError, "Server doesn't support SCRAM-SHA-256")
+              let clientFirst = scramClientFirstMessage(config.user, scramState)
+              await conn.sendMsg(
+                encodeSASLInitialResponse("SCRAM-SHA-256", clientFirst)
+              )
+            of bmkAuthenticationSASLContinue:
+              let clientFinal =
+                scramClientFinalMessage(config.password, msg.saslData, scramState)
+              await conn.sendMsg(encodeSASLResponse(clientFinal))
+            of bmkAuthenticationSASLFinal:
+              if not scramVerifyServerFinal(msg.saslFinalData, scramState):
+                raise
+                  newException(PgError, "SCRAM server signature verification failed")
+            of bmkErrorResponse:
+              raise newException(PgError, formatError(msg.errorFields))
+            else:
+              discard
+          await conn.fillRecvBuf()
 
       # Collect ParameterStatus, BackendKeyData until ReadyForQuery
-      while true:
-        let msg = await conn.recvMessage()
-        case msg.kind
-        of bmkParameterStatus:
-          conn.serverParams[msg.paramName] = msg.paramValue
-        of bmkBackendKeyData:
-          conn.pid = msg.backendPid
-          conn.secretKey = msg.backendSecretKey
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          break
-        of bmkErrorResponse:
-          raise newException(PgError, formatError(msg.errorFields))
-        else:
-          discard
+      block readyLoop:
+        while true:
+          while (let opt = conn.nextMessage(); opt.isSome):
+            let msg = opt.get
+            case msg.kind
+            of bmkParameterStatus:
+              conn.serverParams[msg.paramName] = msg.paramValue
+            of bmkBackendKeyData:
+              conn.pid = msg.backendPid
+              conn.secretKey = msg.backendSecretKey
+            of bmkReadyForQuery:
+              conn.txStatus = msg.txStatus
+              conn.state = csReady
+              break readyLoop
+            of bmkErrorResponse:
+              raise newException(PgError, formatError(msg.errorFields))
+            else:
+              discard
+          await conn.fillRecvBuf()
 
       conn.createdAt = Moment.now()
       return conn
@@ -741,28 +765,35 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
   var current = QueryResult()
   var errorMsg = ""
 
-  while true:
-    let msg =
-      await conn.recvMessage(rowData = current.data, rowCount = addr current.rowCount)
-    case msg.kind
-    of bmkRowDescription:
-      current = QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
-    of bmkCommandComplete:
-      current.commandTag = msg.commandTag
-      results.add(current)
-      current = QueryResult()
-    of bmkEmptyQueryResponse:
-      results.add(QueryResult())
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (
+        let opt = conn.nextMessage(current.data, addr current.rowCount)
+        opt.isSome
+      )
+      :
+        let msg = opt.get
+        case msg.kind
+        of bmkRowDescription:
+          current =
+            QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
+        of bmkCommandComplete:
+          current.commandTag = msg.commandTag
+          results.add(current)
+          current = QueryResult()
+        of bmkEmptyQueryResponse:
+          results.add(QueryResult())
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf()
 
   return results
 
@@ -774,23 +805,26 @@ proc simpleExecImpl(
   await conn.sendMsg(encodeQuery(sql))
   var commandTag = ""
   var errorMsg = ""
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCommandComplete:
-      commandTag = msg.commandTag
-    of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
-      discard
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCommandComplete:
+          commandTag = msg.commandTag
+        of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
   return commandTag
 
 proc simpleExec*(
@@ -827,21 +861,24 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
     await conn.sendMsg(encodeQuery(""))
 
     var errorMsg = ""
-    while true:
-      let msg = await conn.recvMessage()
-      case msg.kind
-      of bmkEmptyQueryResponse:
-        discard
-      of bmkErrorResponse:
-        errorMsg = formatError(msg.errorFields)
-      of bmkReadyForQuery:
-        conn.txStatus = msg.txStatus
-        conn.state = csReady
-        if errorMsg.len > 0:
-          raise newException(PgError, errorMsg)
-        break
-      else:
-        discard
+    block recvLoop:
+      while true:
+        while (let opt = conn.nextMessage(); opt.isSome):
+          let msg = opt.get
+          case msg.kind
+          of bmkEmptyQueryResponse:
+            discard
+          of bmkErrorResponse:
+            errorMsg = formatError(msg.errorFields)
+          of bmkReadyForQuery:
+            conn.txStatus = msg.txStatus
+            conn.state = csReady
+            if errorMsg.len > 0:
+              raise newException(PgError, errorMsg)
+            break recvLoop
+          else:
+            discard
+        await conn.fillRecvBuf()
 
   if timeout > ZeroDuration:
     proc withTimeout(): Future[void] {.async.} =
@@ -973,11 +1010,14 @@ proc listenPump(conn: PgConnection) {.async.} =
       while conn.state == csListening:
         discard await conn.recvMessage()
       # State changed -- drain the stop-signal query response until ReadyForQuery
-      while true:
-        let msg = await conn.recvMessage()
-        if msg.kind == bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          break
+      block drainLoop:
+        while true:
+          while (let opt = conn.nextMessage(); opt.isSome):
+            let msg = opt.get
+            if msg.kind == bmkReadyForQuery:
+              conn.txStatus = msg.txStatus
+              break drainLoop
+          await conn.fillRecvBuf()
       return # Clean exit via stopListening
     except CancelledError:
       return # Cancelled from close()
