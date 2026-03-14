@@ -50,8 +50,8 @@ proc `==`*(a, b: PgNumeric): bool {.borrow.}
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
-  for i in 0 ..< s.len:
-    result[i] = byte(s[i])
+  if s.len > 0:
+    copyMem(addr result[0], unsafeAddr s[0], s.len)
 
 proc toBE16(v: int16): seq[byte] =
   @[byte((v shr 8) and 0xFF), byte(v and 0xFF)]
