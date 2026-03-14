@@ -372,6 +372,68 @@ proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.}
   finally:
     pool.release(conn)
 
+proc simpleExec*(
+    pool: PgPool, sql: string, timeout: Duration = ZeroDuration
+): Future[string] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.simpleExec(sql, timeout)
+  finally:
+    pool.release(conn)
+
+proc execInTransaction*(
+    pool: PgPool,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.execInTransaction(sql, params, paramOids, paramFormats, timeout)
+  finally:
+    pool.release(conn)
+
+proc execInTransaction*(
+    pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
+): Future[string] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.execInTransaction(sql, params, timeout)
+  finally:
+    pool.release(conn)
+
+proc queryInTransaction*(
+    pool: PgPool,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryInTransaction(
+      sql, params, paramOids, paramFormats, resultFormats, timeout
+    )
+  finally:
+    pool.release(conn)
+
+proc queryInTransaction*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryInTransaction(sql, params, resultFormats, timeout)
+  finally:
+    pool.release(conn)
+
 proc notify*(
     pool: PgPool,
     channel: string,
@@ -432,13 +494,13 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   result = quote:
     let `connIdent` = await `poolSym`.acquire()
     try:
-      discard await `connIdent`.exec(`beginSql`, timeout = `txTimeout`)
+      discard await `connIdent`.simpleExec(`beginSql`, timeout = `txTimeout`)
       try:
         `body`
-        discard await `connIdent`.exec("COMMIT", timeout = `txTimeout`)
+        discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
       except CatchableError as `eSym`:
         try:
-          discard await `connIdent`.exec("ROLLBACK", timeout = `txTimeout`)
+          discard await `connIdent`.simpleExec("ROLLBACK", timeout = `txTimeout`)
         except CatchableError:
           discard
         raise `eSym`
