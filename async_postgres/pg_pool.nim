@@ -32,6 +32,8 @@ type
     waiters*: Deque[Future[PgConnection]]
     closed*: bool
     maintenanceTask*: Future[void]
+    cachedNow*: Moment
+      ## Updated on acquire(); reused by release() to avoid extra syscalls
 
 proc initPoolConfig*(
     connConfig: ConnConfig,
@@ -65,10 +67,6 @@ proc closeNoWait(conn: PgConnection) =
       discard
 
   asyncSpawn doClose()
-
-proc isExpired(pool: PgPool, conn: PgConnection): bool =
-  pool.config.maxLifetime > ZeroDuration and
-    Moment.now() - conn.createdAt > pool.config.maxLifetime
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
@@ -122,7 +120,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         break
       try:
         let conn = await connect(pool.config.connConfig)
-        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
       except CatchableError:
         break # best-effort, retry next interval
 
@@ -140,10 +138,10 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   )
 
   try:
-    let now = Moment.now()
+    pool.cachedNow = Moment.now()
     for i in 0 ..< cfg.minSize:
       let conn = await connect(cfg.connConfig)
-      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
   except CatchableError as e:
     while pool.idle.len > 0:
       let pc = pool.idle.popFirst()
@@ -167,11 +165,13 @@ proc release*(pool: PgPool, conn: PgConnection) =
     waiter.complete(conn)
   else:
     pool.active.dec
-    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
 
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   if pool.closed:
     raise newException(PgError, "Pool is closed")
+
+  pool.cachedNow = Moment.now()
 
   # Try to get an idle connection
   while pool.idle.len > 0:
@@ -182,7 +182,8 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
       except CatchableError:
         discard
       continue
-    if pool.isExpired(pc.conn):
+    if pool.config.maxLifetime > ZeroDuration and
+        pool.cachedNow - pc.conn.createdAt > pool.config.maxLifetime:
       try:
         await pc.conn.close()
       except CatchableError:
@@ -190,7 +191,7 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
       continue
     # Health check: ping connections that have been idle too long
     if pool.config.healthCheckTimeout > ZeroDuration and
-        Moment.now() - pc.lastUsedAt > pool.config.healthCheckTimeout:
+        pool.cachedNow - pc.lastUsedAt > pool.config.healthCheckTimeout:
       try:
         await pc.conn.ping(pool.config.pingTimeout)
       except CatchableError:
