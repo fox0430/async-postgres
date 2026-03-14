@@ -150,26 +150,36 @@ proc encodeInt32*(val: int32): array[4, byte] =
   result[2] = byte((val shr 8) and 0xFF)
   result[3] = byte(val and 0xFF)
 
-proc addInt16*(buf: var seq[byte], val: int16) =
-  let encoded = encodeInt16(val)
-  buf.add(encoded[0])
-  buf.add(encoded[1])
+proc addInt16*(buf: var seq[byte], val: int16) {.inline.} =
+  let oldLen = buf.len
+  buf.setLen(oldLen + 2)
+  buf[oldLen] = byte((val shr 8) and 0xFF)
+  buf[oldLen + 1] = byte(val and 0xFF)
 
-proc addInt32*(buf: var seq[byte], val: int32) =
-  let encoded = encodeInt32(val)
-  buf.add(encoded[0])
-  buf.add(encoded[1])
-  buf.add(encoded[2])
-  buf.add(encoded[3])
+proc addInt32*(buf: var seq[byte], val: int32) {.inline.} =
+  let oldLen = buf.len
+  buf.setLen(oldLen + 4)
+  buf[oldLen] = byte((val shr 24) and 0xFF)
+  buf[oldLen + 1] = byte((val shr 16) and 0xFF)
+  buf[oldLen + 2] = byte((val shr 8) and 0xFF)
+  buf[oldLen + 3] = byte(val and 0xFF)
 
 proc patchLen*(buf: var seq[byte], offset: int = 1) =
   ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
   let length = int32(buf.high)
-  let encoded = encodeInt32(length)
-  buf[offset] = encoded[0]
-  buf[offset + 1] = encoded[1]
-  buf[offset + 2] = encoded[2]
-  buf[offset + 3] = encoded[3]
+  buf[offset] = byte((length shr 24) and 0xFF)
+  buf[offset + 1] = byte((length shr 16) and 0xFF)
+  buf[offset + 2] = byte((length shr 8) and 0xFF)
+  buf[offset + 3] = byte(length and 0xFF)
+
+proc patchMsgLen*(buf: var seq[byte], msgStart: int) {.inline.} =
+  ## Patch the length field of a message starting at `msgStart`.
+  ## Length = total message size minus the type byte.
+  let length = int32(buf.len - msgStart - 1)
+  buf[msgStart + 1] = byte((length shr 24) and 0xFF)
+  buf[msgStart + 2] = byte((length shr 16) and 0xFF)
+  buf[msgStart + 3] = byte((length shr 8) and 0xFF)
+  buf[msgStart + 4] = byte(length and 0xFF)
 
 proc addCString*(buf: var seq[byte], s: string) =
   let oldLen = buf.len
@@ -256,17 +266,109 @@ proc encodeQuery*(sql: string): seq[byte] =
   result.addCString(sql)
   result.patchLen()
 
+# In-place frontend message encoding (append directly to batch buffer)
+
+const
+  syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
+  flushMsg* = [byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]
+  terminateMsg = [byte('X'), 0'u8, 0'u8, 0'u8, 4'u8]
+  copyDoneMsg* = [byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
+
+proc addFixedMsg(buf: var seq[byte], msg: array[5, byte]) {.inline.} =
+  let oldLen = buf.len
+  buf.setLen(oldLen + 5)
+  copyMem(addr buf[oldLen], unsafeAddr msg[0], 5)
+
+proc addParse*(
+    buf: var seq[byte],
+    stmtName: string,
+    sql: string,
+    paramTypeOids: openArray[int32] = [],
+) =
+  let msgStart = buf.len
+  buf.add(byte('P'))
+  buf.addInt32(0) # length placeholder
+  buf.addCString(stmtName)
+  buf.addCString(sql)
+  buf.addInt16(int16(paramTypeOids.len))
+  for oid in paramTypeOids:
+    buf.addInt32(oid)
+  buf.patchMsgLen(msgStart)
+
+proc addBind*(
+    buf: var seq[byte],
+    portalName: string,
+    stmtName: string,
+    paramFormats: openArray[int16],
+    paramValues: openArray[Option[seq[byte]]],
+    resultFormats: openArray[int16] = [],
+) =
+  let msgStart = buf.len
+  buf.add(byte('B'))
+  buf.addInt32(0) # length placeholder
+  buf.addCString(portalName)
+  buf.addCString(stmtName)
+  # Parameter format codes
+  buf.addInt16(int16(paramFormats.len))
+  for f in paramFormats:
+    buf.addInt16(f)
+  # Parameter values
+  buf.addInt16(int16(paramValues.len))
+  for v in paramValues:
+    if v.isNone:
+      buf.addInt32(-1) # NULL
+    else:
+      let data = v.get
+      buf.addInt32(int32(data.len))
+      if data.len > 0:
+        let oldLen = buf.len
+        buf.setLen(oldLen + data.len)
+        copyMem(addr buf[oldLen], unsafeAddr data[0], data.len)
+  # Result format codes
+  buf.addInt16(int16(resultFormats.len))
+  for f in resultFormats:
+    buf.addInt16(f)
+  buf.patchMsgLen(msgStart)
+
+proc addDescribe*(buf: var seq[byte], kind: DescribeKind, name: string) =
+  let msgStart = buf.len
+  buf.add(byte('D'))
+  buf.addInt32(0) # length placeholder
+  buf.add(byte(kind))
+  buf.addCString(name)
+  buf.patchMsgLen(msgStart)
+
+proc addExecute*(buf: var seq[byte], portalName: string, maxRows: int32 = 0) =
+  let msgStart = buf.len
+  buf.add(byte('E'))
+  buf.addInt32(0) # length placeholder
+  buf.addCString(portalName)
+  buf.addInt32(maxRows)
+  buf.patchMsgLen(msgStart)
+
+proc addClose*(buf: var seq[byte], kind: DescribeKind, name: string) =
+  let msgStart = buf.len
+  buf.add(byte('C'))
+  buf.addInt32(0) # length placeholder
+  buf.add(byte(kind))
+  buf.addCString(name)
+  buf.patchMsgLen(msgStart)
+
+proc addSync*(buf: var seq[byte]) {.inline.} =
+  buf.addFixedMsg(syncMsg)
+
+proc addFlush*(buf: var seq[byte]) {.inline.} =
+  buf.addFixedMsg(flushMsg)
+
+proc addCopyDone*(buf: var seq[byte]) {.inline.} =
+  buf.addFixedMsg(copyDoneMsg)
+
+# Wrapper functions that return seq[byte] (for non-batched sends)
+
 proc encodeParse*(
     stmtName: string, sql: string, paramTypeOids: openArray[int32] = []
 ): seq[byte] =
-  result.add(byte('P'))
-  result.addInt32(0) # length placeholder
-  result.addCString(stmtName)
-  result.addCString(sql)
-  result.addInt16(int16(paramTypeOids.len))
-  for oid in paramTypeOids:
-    result.addInt32(oid)
-  result.patchLen()
+  result.addParse(stmtName, sql, paramTypeOids)
 
 proc encodeBind*(
     portalName: string,
@@ -275,49 +377,16 @@ proc encodeBind*(
     paramValues: openArray[Option[seq[byte]]],
     resultFormats: openArray[int16] = [],
 ): seq[byte] =
-  result.add(byte('B'))
-  result.addInt32(0) # length placeholder
-  result.addCString(portalName)
-  result.addCString(stmtName)
-  # Parameter format codes
-  result.addInt16(int16(paramFormats.len))
-  for f in paramFormats:
-    result.addInt16(f)
-  # Parameter values
-  result.addInt16(int16(paramValues.len))
-  for v in paramValues:
-    if v.isNone:
-      result.addInt32(-1) # NULL
-    else:
-      let data = v.get
-      result.addInt32(int32(data.len))
-      result.add(data)
-  # Result format codes
-  result.addInt16(int16(resultFormats.len))
-  for f in resultFormats:
-    result.addInt16(f)
-  result.patchLen()
+  result.addBind(portalName, stmtName, paramFormats, paramValues, resultFormats)
 
 proc encodeDescribe*(kind: DescribeKind, name: string): seq[byte] =
-  result.add(byte('D'))
-  result.addInt32(0) # length placeholder
-  result.add(byte(kind))
-  result.addCString(name)
-  result.patchLen()
+  result.addDescribe(kind, name)
 
 proc encodeExecute*(portalName: string, maxRows: int32 = 0): seq[byte] =
-  result.add(byte('E'))
-  result.addInt32(0) # length placeholder
-  result.addCString(portalName)
-  result.addInt32(maxRows)
-  result.patchLen()
+  result.addExecute(portalName, maxRows)
 
 proc encodeClose*(kind: DescribeKind, name: string): seq[byte] =
-  result.add(byte('C'))
-  result.addInt32(0) # length placeholder
-  result.add(byte(kind))
-  result.addCString(name)
-  result.patchLen()
+  result.addClose(kind, name)
 
 proc encodeSync*(): seq[byte] =
   result = @[byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
@@ -329,29 +398,20 @@ proc encodeTerminate*(): seq[byte] =
   result = @[byte('X'), 0'u8, 0'u8, 0'u8, 4'u8]
 
 proc encodeCancelRequest*(pid: int32, secretKey: int32): seq[byte] =
-  result = newSeq[byte](16)
-
-  let lenBytes = encodeInt32(16)
-  for i, lb in lenBytes:
-    result[i] = lb
-
-  let magicBytes = encodeInt32(80877102)
-  for i, mb in magicBytes:
-    result[i + 4] = mb
-
-  let pidBytes = encodeInt32(pid)
-  for i, pb in pidBytes:
-    result[i + 8] = pb
-
-  let keyBytes = encodeInt32(secretKey)
-  for i, kb in keyBytes:
-    result[i + 12] = kb
+  result = newSeqOfCap[byte](16)
+  result.addInt32(16)
+  result.addInt32(80877102)
+  result.addInt32(pid)
+  result.addInt32(secretKey)
 
 proc encodeCopyData*(buf: var seq[byte], data: seq[byte]) =
   ## Encode a CopyData message, appending to `buf`.
   buf.add(byte('d'))
   buf.addInt32(int32(4 + data.len))
-  buf.add(data)
+  if data.len > 0:
+    let oldLen = buf.len
+    buf.setLen(oldLen + data.len)
+    copyMem(addr buf[oldLen], unsafeAddr data[0], data.len)
 
 proc encodeCopyDone*(): seq[byte] =
   result = @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
