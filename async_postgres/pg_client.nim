@@ -147,42 +147,45 @@ proc execImpl(
   var errorCode = ""
   var cachedFields: seq[FieldDescription]
 
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkParseComplete, bmkBindComplete:
-      discard
-    of bmkParameterDescription:
-      discard
-    of bmkRowDescription:
-      if cacheMiss:
-        cachedFields = msg.fields
-    of bmkNoData:
-      discard
-    of bmkDataRow:
-      discard # exec ignores rows
-    of bmkCommandComplete:
-      commandTag = msg.commandTag
-    of bmkEmptyQueryResponse:
-      discard
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-      for f in msg.errorFields:
-        if f.code == 'C':
-          errorCode = f.value
-          break
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        if cacheHit and errorCode == "26000":
-          conn.removeStmtCache(sql)
-        raise newException(PgError, errorMsg)
-      if cacheMiss:
-        conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete:
+          discard
+        of bmkParameterDescription:
+          discard
+        of bmkRowDescription:
+          if cacheMiss:
+            cachedFields = msg.fields
+        of bmkNoData:
+          discard
+        of bmkDataRow:
+          discard # exec ignores rows
+        of bmkCommandComplete:
+          commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+          for f in msg.errorFields:
+            if f.code == 'C':
+              errorCode = f.value
+              break
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            if cacheHit and errorCode == "26000":
+              conn.removeStmtCache(sql)
+            raise newException(PgError, errorMsg)
+          if cacheMiss:
+            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return commandTag
 
@@ -289,54 +292,56 @@ proc queryImpl(
     if qr.fields.len > 0:
       qr.data = newRowData(int16(qr.fields.len))
 
-  while true:
-    let msg =
-      await conn.recvMessage(timeout, rowData = qr.data, rowCount = addr qr.rowCount)
-    case msg.kind
-    of bmkParseComplete, bmkBindComplete:
-      discard
-    of bmkParameterDescription:
-      discard
-    of bmkRowDescription:
-      if cacheMiss:
-        # From Describe(Statement): save raw fields (formatCode=0) for cache
-        cachedFields = msg.fields
-        # Apply resultFormats for this execution
-        qr.fields = cachedFields
-        if resultFormats.len > 0:
-          for i in 0 ..< qr.fields.len:
-            if resultFormats.len == 1:
-              qr.fields[i].formatCode = resultFormats[0]
-            elif i < resultFormats.len:
-              qr.fields[i].formatCode = resultFormats[i]
-      else:
-        # Uncached path: RowDescription from Describe(Portal) already has correct formatCode
-        qr.fields = msg.fields
-      qr.data = newRowData(int16(qr.fields.len))
-    of bmkNoData:
-      discard
-    of bmkCommandComplete:
-      qr.commandTag = msg.commandTag
-    of bmkEmptyQueryResponse:
-      discard
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-      for f in msg.errorFields:
-        if f.code == 'C':
-          errorCode = f.value
-          break
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        if cacheHit and errorCode == "26000":
-          conn.removeStmtCache(sql)
-        raise newException(PgError, errorMsg)
-      if cacheMiss:
-        conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete:
+          discard
+        of bmkParameterDescription:
+          discard
+        of bmkRowDescription:
+          if cacheMiss:
+            # From Describe(Statement): save raw fields (formatCode=0) for cache
+            cachedFields = msg.fields
+            # Apply resultFormats for this execution
+            qr.fields = cachedFields
+            if resultFormats.len > 0:
+              for i in 0 ..< qr.fields.len:
+                if resultFormats.len == 1:
+                  qr.fields[i].formatCode = resultFormats[0]
+                elif i < resultFormats.len:
+                  qr.fields[i].formatCode = resultFormats[i]
+          else:
+            # Uncached path: RowDescription from Describe(Portal) already has correct formatCode
+            qr.fields = msg.fields
+          qr.data = newRowData(int16(qr.fields.len))
+        of bmkNoData:
+          discard
+        of bmkCommandComplete:
+          qr.commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+          for f in msg.errorFields:
+            if f.code == 'C':
+              errorCode = f.value
+              break
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            if cacheHit and errorCode == "26000":
+              conn.removeStmtCache(sql)
+            raise newException(PgError, errorMsg)
+          if cacheMiss:
+            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return qr
 
@@ -473,27 +478,30 @@ proc prepareImpl(
   var stmt = PreparedStatement(conn: conn, name: name)
   var errorMsg = ""
 
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkParseComplete:
-      discard
-    of bmkParameterDescription:
-      stmt.paramOids = msg.paramTypeOids
-    of bmkRowDescription:
-      stmt.fields = msg.fields
-    of bmkNoData:
-      discard
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete:
+          discard
+        of bmkParameterDescription:
+          stmt.paramOids = msg.paramTypeOids
+        of bmkRowDescription:
+          stmt.fields = msg.fields
+        of bmkNoData:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return stmt
 
@@ -545,26 +553,28 @@ proc executeImpl(
     qr.data = newRowData(int16(qr.fields.len))
   var errorMsg = ""
 
-  while true:
-    let msg =
-      await conn.recvMessage(timeout, rowData = qr.data, rowCount = addr qr.rowCount)
-    case msg.kind
-    of bmkBindComplete:
-      discard
-    of bmkCommandComplete:
-      qr.commandTag = msg.commandTag
-    of bmkEmptyQueryResponse:
-      discard
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkBindComplete:
+          discard
+        of bmkCommandComplete:
+          qr.commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return qr
 
@@ -613,21 +623,24 @@ proc closeImpl(
 
   var errorMsg = ""
 
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCloseComplete:
-      discard
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCloseComplete:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
 proc close*(
     stmt: PreparedStatement, timeout: Duration = ZeroDuration
@@ -673,21 +686,24 @@ proc copyInImpl(
   var errorMsg = ""
 
   # Wait for CopyInResponse (or error)
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCopyInResponse:
-      break
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      return commandTag
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCopyInResponse:
+          break recvLoop
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          return commandTag
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   # Send CopyData in batches to minimize syscalls and await overhead
   const batchThreshold = copyBatchSize
@@ -702,21 +718,24 @@ proc copyInImpl(
   await conn.sendMsg(buf)
 
   # Wait for CommandComplete + ReadyForQuery
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCommandComplete:
-      commandTag = msg.commandTag
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop2:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCommandComplete:
+          commandTag = msg.commandTag
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop2
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return commandTag
 
@@ -753,23 +772,26 @@ proc copyInStreamImpl(
   var errorMsg = ""
 
   # Wait for CopyInResponse (or error)
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCopyInResponse:
-      info.format = msg.copyFormat
-      info.columnFormats = msg.copyColumnFormats
-      break
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      return info
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCopyInResponse:
+          info.format = msg.copyFormat
+          info.columnFormats = msg.copyColumnFormats
+          break recvLoop
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          return info
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   # Pull data from callback and send as CopyData in batches
   const batchThreshold = copyBatchSize
@@ -790,15 +812,18 @@ proc copyInStreamImpl(
   if callbackError != nil:
     # Callback raised: flush pending data is pointless, send CopyFail
     await conn.sendMsg(encodeCopyFail(callbackError.msg))
-    while true:
-      let msg = await conn.recvMessage(timeout)
-      case msg.kind
-      of bmkReadyForQuery:
-        conn.txStatus = msg.txStatus
-        conn.state = csReady
-        break
-      else:
-        discard
+    block drainLoop:
+      while true:
+        while (let opt = conn.nextMessage(); opt.isSome):
+          let msg = opt.get
+          case msg.kind
+          of bmkReadyForQuery:
+            conn.txStatus = msg.txStatus
+            conn.state = csReady
+            break drainLoop
+          else:
+            discard
+        await conn.fillRecvBuf(timeout)
     raise callbackError
   else:
     # Normal completion: flush remaining data + CopyDone in one send
@@ -806,21 +831,24 @@ proc copyInStreamImpl(
     await conn.sendMsg(buf)
 
   # Wait for CommandComplete + ReadyForQuery
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCommandComplete:
-      info.commandTag = msg.commandTag
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop2:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCommandComplete:
+          info.commandTag = msg.commandTag
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop2
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return info
 
@@ -854,28 +882,31 @@ proc copyOutImpl(
   var cr = CopyResult()
   var errorMsg = ""
 
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCopyOutResponse:
-      cr.format = msg.copyFormat
-      cr.columnFormats = msg.copyColumnFormats
-    of bmkCopyData:
-      cr.data.add(msg.copyData)
-    of bmkCopyDone:
-      discard
-    of bmkCommandComplete:
-      cr.commandTag = msg.commandTag
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCopyOutResponse:
+          cr.format = msg.copyFormat
+          cr.columnFormats = msg.copyColumnFormats
+        of bmkCopyData:
+          cr.data.add(msg.copyData)
+        of bmkCopyDone:
+          discard
+        of bmkCommandComplete:
+          cr.commandTag = msg.commandTag
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return cr
 
@@ -907,32 +938,35 @@ proc copyOutStreamImpl(
   var info = CopyOutInfo()
   var errorMsg = ""
 
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCopyOutResponse:
-      info.format = msg.copyFormat
-      info.columnFormats = msg.copyColumnFormats
-    of bmkCopyData:
-      try:
-        await callback(msg.copyData)
-      except CatchableError as e:
-        conn.state = csClosed
-        raise e
-    of bmkCopyDone:
-      discard
-    of bmkCommandComplete:
-      info.commandTag = msg.commandTag
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCopyOutResponse:
+          info.format = msg.copyFormat
+          info.columnFormats = msg.copyColumnFormats
+        of bmkCopyData:
+          try:
+            await callback(msg.copyData)
+          except CatchableError as e:
+            conn.state = csClosed
+            raise e
+        of bmkCopyDone:
+          discard
+        of bmkCommandComplete:
+          info.commandTag = msg.commandTag
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return info
 
@@ -1063,31 +1097,34 @@ proc execInTransactionImpl(
   var userCommandTag = ""
   var errorMsg = ""
 
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkParseComplete, bmkBindComplete:
-      discard
-    of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
-      discard
-    of bmkCommandComplete:
-      if phase == 1:
-        userCommandTag = msg.commandTag
-      inc phase
-    of bmkErrorResponse:
-      if errorMsg.len == 0:
-        errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        # Error occurred: if we're in a failed transaction, send ROLLBACK
-        if msg.txStatus == tsInFailedTransaction:
-          discard await conn.simpleExec("ROLLBACK")
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete:
+          discard
+        of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
+          discard
+        of bmkCommandComplete:
+          if phase == 1:
+            userCommandTag = msg.commandTag
+          inc phase
+        of bmkErrorResponse:
+          if errorMsg.len == 0:
+            errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            # Error occurred: if we're in a failed transaction, send ROLLBACK
+            if msg.txStatus == tsInFailedTransaction:
+              discard await conn.simpleExec("ROLLBACK")
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return userCommandTag
 
@@ -1191,36 +1228,38 @@ proc queryInTransactionImpl(
   var phase = 0
   var errorMsg = ""
 
-  while true:
-    let msg =
-      await conn.recvMessage(timeout, rowData = qr.data, rowCount = addr qr.rowCount)
-    case msg.kind
-    of bmkParseComplete, bmkBindComplete:
-      discard
-    of bmkRowDescription:
-      qr.fields = msg.fields
-      qr.data = newRowData(int16(msg.fields.len))
-    of bmkNoData:
-      discard
-    of bmkEmptyQueryResponse:
-      discard
-    of bmkCommandComplete:
-      if phase == 1:
-        qr.commandTag = msg.commandTag
-      inc phase
-    of bmkErrorResponse:
-      if errorMsg.len == 0:
-        errorMsg = formatError(msg.errorFields)
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      if errorMsg.len > 0:
-        if msg.txStatus == tsInFailedTransaction:
-          discard await conn.simpleExec("ROLLBACK")
-        raise newException(PgError, errorMsg)
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete:
+          discard
+        of bmkRowDescription:
+          qr.fields = msg.fields
+          qr.data = newRowData(int16(msg.fields.len))
+        of bmkNoData:
+          discard
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkCommandComplete:
+          if phase == 1:
+            qr.commandTag = msg.commandTag
+          inc phase
+        of bmkErrorResponse:
+          if errorMsg.len == 0:
+            errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            if msg.txStatus == tsInFailedTransaction:
+              discard await conn.simpleExec("ROLLBACK")
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return qr
 
@@ -1320,47 +1359,57 @@ proc openCursorImpl(
     Cursor(conn: conn, portalName: portalName, chunkSize: chunkSize, exhausted: false)
   var errorMsg = ""
 
-  while true:
-    let msg = await conn.recvMessage(
-      timeout, rowData = cursor.bufferedData, rowCount = addr cursor.bufferedCount
-    )
-    case msg.kind
-    of bmkParseComplete, bmkBindComplete:
-      discard
-    of bmkRowDescription:
-      cursor.fields = msg.fields
-      cursor.bufferedData = newRowData(int16(msg.fields.len))
-    of bmkNoData:
-      discard
-    of bmkPortalSuspended:
-      break
-    of bmkCommandComplete:
-      cursor.exhausted = true
-      # Need to Sync to get ReadyForQuery
-      await conn.sendMsg(encodeSync())
-      while true:
-        let rmsg = await conn.recvMessage(timeout)
-        case rmsg.kind
-        of bmkReadyForQuery:
-          conn.txStatus = rmsg.txStatus
-          conn.state = csReady
-          break
+  block recvLoop:
+    while true:
+      while (
+        let opt = conn.nextMessage(cursor.bufferedData, addr cursor.bufferedCount)
+        opt.isSome
+      )
+      :
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete:
+          discard
+        of bmkRowDescription:
+          cursor.fields = msg.fields
+          cursor.bufferedData = newRowData(int16(msg.fields.len))
+        of bmkNoData:
+          discard
+        of bmkPortalSuspended:
+          break recvLoop
+        of bmkCommandComplete:
+          cursor.exhausted = true
+          # Need to Sync to get ReadyForQuery
+          await conn.sendMsg(encodeSync())
+          block drainLoop:
+            while true:
+              while (let ropt = conn.nextMessage(); ropt.isSome):
+                let rmsg = ropt.get
+                case rmsg.kind
+                of bmkReadyForQuery:
+                  conn.txStatus = rmsg.txStatus
+                  conn.state = csReady
+                  break drainLoop
+                else:
+                  discard
+              await conn.fillRecvBuf(timeout)
+          break recvLoop
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+          # Drain until ReadyForQuery
+          await conn.sendMsg(encodeSync())
+          block errDrain:
+            while true:
+              while (let ropt = conn.nextMessage(); ropt.isSome):
+                if ropt.get.kind == bmkReadyForQuery:
+                  conn.txStatus = ropt.get.txStatus
+                  conn.state = csReady
+                  break errDrain
+              await conn.fillRecvBuf(timeout)
+          raise newException(PgError, errorMsg)
         else:
           discard
-      break
-    of bmkErrorResponse:
-      errorMsg = formatError(msg.errorFields)
-      # Drain until ReadyForQuery
-      await conn.sendMsg(encodeSync())
-      while true:
-        let rmsg = await conn.recvMessage(timeout)
-        if rmsg.kind == bmkReadyForQuery:
-          conn.txStatus = rmsg.txStatus
-          conn.state = csReady
-          break
-      raise newException(PgError, errorMsg)
-    else:
-      discard
+      await conn.fillRecvBuf(timeout)
 
   return cursor
 
@@ -1403,42 +1452,50 @@ proc fetchNextImpl(
   batch.add(encodeFlush())
   await conn.sendMsg(batch)
 
-  while true:
-    let msg = await conn.recvMessage(timeout, rowData = rd, rowCount = addr rowCount)
-    case msg.kind
-    of bmkPortalSuspended:
-      break
-    of bmkCommandComplete:
-      cursor.exhausted = true
-      # Close portal and sync
-      var closeBatch: seq[byte]
-      closeBatch.add(encodeClose(dkPortal, cursor.portalName))
-      closeBatch.add(encodeSync())
-      await conn.sendMsg(closeBatch)
-      while true:
-        let rmsg = await conn.recvMessage(timeout)
-        case rmsg.kind
-        of bmkCloseComplete:
-          discard
-        of bmkReadyForQuery:
-          conn.txStatus = rmsg.txStatus
-          conn.state = csReady
-          break
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(rd, addr rowCount); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkPortalSuspended:
+          break recvLoop
+        of bmkCommandComplete:
+          cursor.exhausted = true
+          # Close portal and sync
+          var closeBatch: seq[byte]
+          closeBatch.add(encodeClose(dkPortal, cursor.portalName))
+          closeBatch.add(encodeSync())
+          await conn.sendMsg(closeBatch)
+          block drainLoop:
+            while true:
+              while (let ropt = conn.nextMessage(); ropt.isSome):
+                let rmsg = ropt.get
+                case rmsg.kind
+                of bmkCloseComplete:
+                  discard
+                of bmkReadyForQuery:
+                  conn.txStatus = rmsg.txStatus
+                  conn.state = csReady
+                  break drainLoop
+                else:
+                  discard
+              await conn.fillRecvBuf(timeout)
+          break recvLoop
+        of bmkErrorResponse:
+          let errorMsg = formatError(msg.errorFields)
+          await conn.sendMsg(encodeSync())
+          block errDrain:
+            while true:
+              while (let ropt = conn.nextMessage(); ropt.isSome):
+                if ropt.get.kind == bmkReadyForQuery:
+                  conn.txStatus = ropt.get.txStatus
+                  conn.state = csReady
+                  break errDrain
+              await conn.fillRecvBuf(timeout)
+          raise newException(PgError, errorMsg)
         else:
           discard
-      break
-    of bmkErrorResponse:
-      let errorMsg = formatError(msg.errorFields)
-      await conn.sendMsg(encodeSync())
-      while true:
-        let rmsg = await conn.recvMessage(timeout)
-        if rmsg.kind == bmkReadyForQuery:
-          conn.txStatus = rmsg.txStatus
-          conn.state = csReady
-          break
-      raise newException(PgError, errorMsg)
-    else:
-      discard
+      await conn.fillRecvBuf(timeout)
 
   result = newSeq[Row](rowCount)
   for i in 0 ..< rowCount:
@@ -1480,17 +1537,20 @@ proc closeCursorImpl(
   batch.add(encodeSync())
   await conn.sendMsg(batch)
 
-  while true:
-    let msg = await conn.recvMessage(timeout)
-    case msg.kind
-    of bmkCloseComplete:
-      discard
-    of bmkReadyForQuery:
-      conn.txStatus = msg.txStatus
-      conn.state = csReady
-      break
-    else:
-      discard
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCloseComplete:
+          discard
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   cursor.exhausted = true
 
