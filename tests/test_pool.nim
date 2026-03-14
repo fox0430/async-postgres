@@ -106,15 +106,15 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
-  test "release stores PooledConn with lastUsedAt":
+  test "release stores PooledConn with cachedNow as lastUsedAt":
     let pool = makePool()
     pool.active = 1
+    pool.cachedNow = Moment.now()
     let conn = mockConn()
-    let before = Moment.now()
     pool.release(conn)
     check pool.idle.len == 1
     check pool.idle[0].conn == conn
-    check pool.idle[0].lastUsedAt >= before
+    check pool.idle[0].lastUsedAt == pool.cachedNow
 
   test "release discards connection in transaction":
     let pool = makePool()
