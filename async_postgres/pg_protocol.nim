@@ -124,6 +124,7 @@ type
   ParseState* = enum
     psComplete
     psIncomplete
+    psDataRow ## DataRow parsed in-place into RowData; no BackendMessage constructed
 
   ParseResult* = object
     state*: ParseState
@@ -692,7 +693,8 @@ proc parseBackendMessage*(
   of 'D':
     if rowData != nil:
       parseDataRowInto(body, rowData)
-      msg = BackendMessage(kind: bmkDataRow)
+      consumed = totalLen
+      return ParseResult(state: psDataRow)
     else:
       msg = parseDataRow(body)
   of 'E':
