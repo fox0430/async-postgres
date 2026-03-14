@@ -114,7 +114,6 @@ proc execImpl(
   var stmtName = ""
 
   if cacheHit:
-    # Cache hit: Bind(cached.name) + Execute + Sync
     let c = cachedOpt.get
     stmtName = c.name
     var batch = newSeqOfCap[byte](params.len * 16 + 128)
@@ -123,7 +122,6 @@ proc execImpl(
     batch.addSync()
     await conn.sendMsg(batch)
   elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
-    # Cache miss with room: Parse(name) + Describe(Stmt) + Bind(name) + Execute + Sync
     cacheMiss = true
     stmtName = conn.nextStmtName()
     var batch = newSeqOfCap[byte](sql.len + 128)
@@ -134,10 +132,96 @@ proc execImpl(
     batch.addSync()
     await conn.sendMsg(batch)
   else:
-    # Cache disabled/full: unnamed statement (original behavior)
     var batch = newSeqOfCap[byte](sql.len + 128)
     batch.addParse("", sql, paramOids)
     batch.addBind("", "", formats, params)
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+
+  var commandTag = ""
+  var errorMsg = ""
+  var errorCode = ""
+  var cachedFields: seq[FieldDescription]
+
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete:
+          discard
+        of bmkParameterDescription:
+          discard
+        of bmkRowDescription:
+          if cacheMiss:
+            cachedFields = msg.fields
+        of bmkNoData:
+          discard
+        of bmkDataRow:
+          discard # exec ignores rows
+        of bmkCommandComplete:
+          commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+          for f in msg.errorFields:
+            if f.code == 'C':
+              errorCode = f.value
+              break
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            if cacheHit and errorCode == "26000":
+              conn.removeStmtCache(sql)
+            raise newException(PgError, errorMsg)
+          if cacheMiss:
+            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
+
+  return commandTag
+
+proc execImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let cachedOpt = conn.lookupStmtCache(sql)
+  var cacheHit = cachedOpt.isSome
+  var cacheMiss = false
+  var stmtName = ""
+
+  if cacheHit:
+    let c = cachedOpt.get
+    stmtName = c.name
+    var batch = newSeqOfCap[byte](params.len * 16 + 128)
+    batch.addBind("", stmtName, params)
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.addParse(stmtName, sql, params)
+    batch.addDescribe(dkStatement, stmtName)
+    batch.addBind("", stmtName, params)
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+  else:
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.addParse("", sql, params)
+    batch.addBind("", "", params)
     batch.addExecute("", 0)
     batch.addSync()
     await conn.sendMsg(batch)
@@ -218,69 +302,28 @@ proc exec*(
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   ## Execute a statement with typed parameters.
-  let (oids, formats, values) = extractParams(params)
-  return await conn.exec(sql, values, oids, formats, timeout)
+  if timeout > ZeroDuration:
+    try:
+      return await execImpl(conn, sql, params, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "Exec timed out")
+  else:
+    return await execImpl(conn, sql, params)
 
-proc queryImpl(
+template queryRecvLoop(
     conn: PgConnection,
     sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32],
-    paramFormats: seq[int16],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  conn.checkReady()
-  conn.state = csBusy
-
-  let formats =
-    if paramFormats.len > 0:
-      paramFormats
-    else:
-      newSeq[int16](params.len)
-
-  let cachedOpt = conn.lookupStmtCache(sql)
-  var cacheHit = cachedOpt.isSome
-  var cacheMiss = false
-  var stmtName = ""
-  var cachedFields: seq[FieldDescription] # raw fields (formatCode=0) for cache storage
-
-  if cacheHit:
-    # Cache hit: Bind(cached.name) + Execute + Sync
-    let c = cachedOpt.get
-    stmtName = c.name
-    cachedFields = c.fields
-    var batch = newSeqOfCap[byte](params.len * 16 + 128)
-    batch.addBind("", stmtName, formats, params, resultFormats)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
-  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
-    # Cache miss with room: Parse(name) + Describe(Stmt) + Bind(name) + Execute + Sync
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.addParse(stmtName, sql, paramOids)
-    batch.addDescribe(dkStatement, stmtName)
-    batch.addBind("", stmtName, formats, params, resultFormats)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
-  else:
-    # Cache disabled/full: unnamed statement (original behavior)
-    var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.addParse("", sql, paramOids)
-    batch.addBind("", "", formats, params, resultFormats)
-    batch.addDescribe(dkPortal, "")
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
-
-  var qr = QueryResult()
+    resultFormats: openArray[int16],
+    cacheHit, cacheMiss: bool,
+    stmtName: string,
+    cachedFields: var seq[FieldDescription],
+    qr: var QueryResult,
+    timeout: Duration,
+) =
   var errorMsg = ""
   var errorCode = ""
 
-  # For cache hit, set up fields from cache (with formatCode adjusted for resultFormats)
   if cacheHit:
     qr.fields = cachedFields
     if resultFormats.len > 0:
@@ -303,9 +346,7 @@ proc queryImpl(
           discard
         of bmkRowDescription:
           if cacheMiss:
-            # From Describe(Statement): save raw fields (formatCode=0) for cache
             cachedFields = msg.fields
-            # Apply resultFormats for this execution
             qr.fields = cachedFields
             if resultFormats.len > 0:
               for i in 0 ..< qr.fields.len:
@@ -314,7 +355,6 @@ proc queryImpl(
                 elif i < resultFormats.len:
                   qr.fields[i].formatCode = resultFormats[i]
           else:
-            # Uncached path: RowDescription from Describe(Portal) already has correct formatCode
             qr.fields = msg.fields
           qr.data = newRowData(int16(qr.fields.len))
         of bmkNoData:
@@ -343,6 +383,112 @@ proc queryImpl(
           discard
       await conn.fillRecvBuf(timeout)
 
+proc queryImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+
+  let cachedOpt = conn.lookupStmtCache(sql)
+  var cacheHit = cachedOpt.isSome
+  var cacheMiss = false
+  var stmtName = ""
+  var cachedFields: seq[FieldDescription]
+
+  if cacheHit:
+    let c = cachedOpt.get
+    stmtName = c.name
+    cachedFields = c.fields
+    var batch = newSeqOfCap[byte](params.len * 16 + 128)
+    batch.addBind("", stmtName, formats, params, resultFormats)
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.addParse(stmtName, sql, paramOids)
+    batch.addDescribe(dkStatement, stmtName)
+    batch.addBind("", stmtName, formats, params, resultFormats)
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+  else:
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.addParse("", sql, paramOids)
+    batch.addBind("", "", formats, params, resultFormats)
+    batch.addDescribe(dkPortal, "")
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+
+  var qr = QueryResult()
+  queryRecvLoop(
+    conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cachedFields, qr, timeout
+  )
+  return qr
+
+proc queryImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let cachedOpt = conn.lookupStmtCache(sql)
+  var cacheHit = cachedOpt.isSome
+  var cacheMiss = false
+  var stmtName = ""
+  var cachedFields: seq[FieldDescription]
+
+  if cacheHit:
+    let c = cachedOpt.get
+    stmtName = c.name
+    cachedFields = c.fields
+    var batch = newSeqOfCap[byte](params.len * 16 + 128)
+    batch.addBind("", stmtName, params, resultFormats)
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.addParse(stmtName, sql, params)
+    batch.addDescribe(dkStatement, stmtName)
+    batch.addBind("", stmtName, params, resultFormats)
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+  else:
+    var batch = newSeqOfCap[byte](sql.len + 128)
+    batch.addParse("", sql, params)
+    batch.addBind("", "", params, resultFormats)
+    batch.addDescribe(dkPortal, "")
+    batch.addExecute("", 0)
+    batch.addSync()
+    await conn.sendMsg(batch)
+
+  var qr = QueryResult()
+  queryRecvLoop(
+    conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cachedFields, qr, timeout
+  )
   return qr
 
 proc query*(
@@ -377,8 +523,14 @@ proc query*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query with typed parameters.
-  let (oids, formats, values) = extractParams(params)
-  return await conn.query(sql, values, oids, formats, resultFormats, timeout)
+  if timeout > ZeroDuration:
+    try:
+      return await queryImpl(conn, sql, params, resultFormats, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "Query timed out")
+  else:
+    return await queryImpl(conn, sql, params, resultFormats)
 
 proc queryOne*(
     conn: PgConnection,
@@ -598,6 +750,59 @@ proc execute*(
   else:
     return await executeImpl(stmt, params, paramFormats, resultFormats)
 
+proc executeImpl(
+    stmt: PreparedStatement,
+    params: seq[PgParam],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  let conn = stmt.conn
+
+  conn.checkReady()
+  conn.state = csBusy
+
+  var batch = newSeqOfCap[byte](params.len * 16 + 128)
+  batch.addBind("", stmt.name, params, resultFormats)
+  batch.addExecute("", 0)
+  batch.addSync()
+  await conn.sendMsg(batch)
+
+  var qr = QueryResult(fields: stmt.fields)
+  if resultFormats.len > 0:
+    for i in 0 ..< qr.fields.len:
+      if resultFormats.len == 1:
+        qr.fields[i].formatCode = resultFormats[0]
+      elif i < resultFormats.len:
+        qr.fields[i].formatCode = resultFormats[i]
+  if qr.fields.len > 0:
+    qr.data = newRowData(int16(qr.fields.len))
+  var errorMsg = ""
+
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkBindComplete:
+          discard
+        of bmkCommandComplete:
+          qr.commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            raise newException(PgError, errorMsg)
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
+
+  return qr
+
 proc execute*(
     stmt: PreparedStatement,
     params: seq[PgParam],
@@ -605,8 +810,14 @@ proc execute*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a prepared statement with typed parameters.
-  let (_, formats, values) = extractParams(params)
-  return await stmt.execute(values, formats, resultFormats, timeout)
+  if timeout > ZeroDuration:
+    try:
+      return await executeImpl(stmt, params, resultFormats, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      stmt.conn.state = csClosed
+      raise newException(PgError, "Execute timed out")
+  else:
+    return await executeImpl(stmt, params, resultFormats)
 
 proc closeImpl(
     stmt: PreparedStatement, timeout: Duration = ZeroDuration

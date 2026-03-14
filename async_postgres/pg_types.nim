@@ -810,3 +810,52 @@ proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
   ## Build a name-to-index mapping for all columns.
   for i, f in fields:
     result[f.name] = i
+
+# PgParam-aware in-place encoding (avoids extractParams allocations)
+
+proc addParse*(
+    buf: var seq[byte], stmtName: string, sql: string, params: openArray[PgParam]
+) =
+  let msgStart = buf.len
+  buf.add(byte('P'))
+  buf.addInt32(0) # length placeholder
+  buf.addCString(stmtName)
+  buf.addCString(sql)
+  buf.addInt16(int16(params.len))
+  for p in params:
+    buf.addInt32(p.oid)
+  buf.patchMsgLen(msgStart)
+
+proc addBind*(
+    buf: var seq[byte],
+    portalName: string,
+    stmtName: string,
+    params: openArray[PgParam],
+    resultFormats: openArray[int16] = [],
+) =
+  let msgStart = buf.len
+  buf.add(byte('B'))
+  buf.addInt32(0) # length placeholder
+  buf.addCString(portalName)
+  buf.addCString(stmtName)
+  # Parameter format codes
+  buf.addInt16(int16(params.len))
+  for p in params:
+    buf.addInt16(p.format)
+  # Parameter values
+  buf.addInt16(int16(params.len))
+  for p in params:
+    if p.value.isNone:
+      buf.addInt32(-1) # NULL
+    else:
+      let data = p.value.get
+      buf.addInt32(int32(data.len))
+      if data.len > 0:
+        let oldLen = buf.len
+        buf.setLen(oldLen + data.len)
+        copyMem(addr buf[oldLen], unsafeAddr data[0], data.len)
+  # Result format codes
+  buf.addInt16(int16(resultFormats.len))
+  for f in resultFormats:
+    buf.addInt16(f)
+  buf.patchMsgLen(msgStart)
