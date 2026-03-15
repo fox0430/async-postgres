@@ -135,10 +135,53 @@ type
     cellIndex*: seq[int32] ## [off, len, off, len, ...] per cell; len=-1 = NULL
     numCols*: int16
     colFormats*: seq[int16] ## Per-column format codes (0=text, 1=binary)
+    colTypeOids*: seq[int32] ## Per-column type OIDs for binary→text conversion
 
   Row* = object
     data*: RowData
     rowIdx*: int32
+
+const
+  syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
+  flushMsg* = [byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]
+  copyDoneMsg* = [byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
+
+  BinarySafeOids* = [
+    16'i32, # bool
+    17, # bytea
+    20, # int8 / bigint
+    21, # int2 / smallint
+    23, # int4 / integer
+    25, # text
+    700, # float4
+    701, # float8
+    1043, # varchar
+  ]
+
+  pgCopyBinaryHeader*: array[19, byte] = [
+    byte('P'),
+    byte('G'),
+    byte('C'),
+    byte('O'),
+    byte('P'),
+    byte('Y'),
+    byte('\n'),
+    0xFF'u8,
+    byte('\r'),
+    byte('\n'),
+    0x00'u8,
+    # flags (int32 = 0)
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+    # header extension area length (int32 = 0)
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+  ]
+  pgCopyBinaryTrailer*: array[2, byte] = [0xFF'u8, 0xFF'u8] # int16(-1)
 
 # Byte-level helpers
 
@@ -267,13 +310,6 @@ proc encodeQuery*(sql: string): seq[byte] =
   result.addInt32(0) # length placeholder
   result.addCString(sql)
   result.patchLen()
-
-# In-place frontend message encoding (append directly to batch buffer)
-
-const
-  syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
-  flushMsg* = [byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]
-  copyDoneMsg* = [byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
 
 proc addFixedMsg(buf: var seq[byte], msg: array[5, byte]) {.inline.} =
   let oldLen = buf.len
@@ -609,8 +645,27 @@ proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
     result.copyColumnFormats[i] = decodeInt16(body, offset)
     offset += 2
 
-proc newRowData*(numCols: int16): RowData =
-  RowData(buf: @[], cellIndex: @[], numCols: numCols)
+proc newRowData*(
+    numCols: int16, colFormats: seq[int16] = @[], colTypeOids: seq[int32] = @[]
+): RowData =
+  RowData(
+    buf: @[],
+    cellIndex: @[],
+    numCols: numCols,
+    colFormats: colFormats,
+    colTypeOids: colTypeOids,
+  )
+
+proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
+  ## Build per-column binary format codes: 1 for known safe types, 0 for others.
+  result = newSeq[int16](fields.len)
+  for i, f in fields:
+    var safe = false
+    for oid in BinarySafeOids:
+      if f.typeOid == oid:
+        safe = true
+        break
+    result[i] = if safe: 1'i16 else: 0'i16
 
 proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   ## Parse a DataRow message body directly into a RowData flat buffer.
@@ -766,32 +821,6 @@ proc formatError*(fields: seq[ErrorField]): string =
     result.add("\nHINT: " & hint)
 
 # Binary COPY format helpers
-
-const
-  pgCopyBinaryHeader*: array[19, byte] = [
-    byte('P'),
-    byte('G'),
-    byte('C'),
-    byte('O'),
-    byte('P'),
-    byte('Y'),
-    byte('\n'),
-    0xFF'u8,
-    byte('\r'),
-    byte('\n'),
-    0x00'u8,
-    # flags (int32 = 0)
-    0x00'u8,
-    0x00'u8,
-    0x00'u8,
-    0x00'u8,
-    # header extension area length (int32 = 0)
-    0x00'u8,
-    0x00'u8,
-    0x00'u8,
-    0x00'u8,
-  ]
-  pgCopyBinaryTrailer*: array[2, byte] = [0xFF'u8, 0xFF'u8] # int16(-1)
 
 proc addCopyBinaryHeader*(buf: var seq[byte]) =
   let oldLen = buf.len
