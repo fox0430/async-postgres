@@ -3868,6 +3868,196 @@ suite "E2E: COPY IN Stream":
 
     waitFor t()
 
+suite "E2E: COPY IN openArray[byte]":
+  test "copyIn with openArray[byte] inserts rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_raw")
+      discard await conn.exec("CREATE TABLE test_copy_raw (id int, name text)")
+
+      let data = "1\tAlice\n2\tBob\n3\tCharlie\n"
+      let tag = await conn.copyIn(
+        "COPY test_copy_raw FROM STDIN", data.toOpenArrayByte(0, data.high)
+      )
+      doAssert "COPY 3" in tag
+
+      let res = await conn.query("SELECT id, name FROM test_copy_raw ORDER BY id")
+      doAssert res.rows.len == 3
+      doAssert res.rows[0].getStr(1) == "Alice"
+      doAssert res.rows[2].getStr(1) == "Charlie"
+
+      discard await conn.exec("DROP TABLE test_copy_raw")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyIn with openArray[byte] empty data":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_raw_empty")
+      discard await conn.exec("CREATE TABLE test_copy_raw_empty (id int, name text)")
+
+      let empty: seq[byte] = @[]
+      let tag = await conn.copyIn("COPY test_copy_raw_empty FROM STDIN", empty)
+      doAssert "COPY 0" in tag
+
+      discard await conn.exec("DROP TABLE test_copy_raw_empty")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyIn with openArray[byte] large data":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_raw_large")
+      discard await conn.exec("CREATE TABLE test_copy_raw_large (id int, val text)")
+
+      var data = ""
+      for i in 0 ..< 10000:
+        data.add($i & "\trow" & $i & "\n")
+      let tag = await conn.copyIn(
+        "COPY test_copy_raw_large FROM STDIN", data.toOpenArrayByte(0, data.high)
+      )
+      doAssert "COPY 10000" in tag
+
+      let res = await conn.query("SELECT count(*) FROM test_copy_raw_large")
+      doAssert res.rows[0].getStr(0) == "10000"
+
+      discard await conn.exec("DROP TABLE test_copy_raw_large")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Binary COPY IN":
+  test "binary copyIn with int, float, text, bool, NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_bin")
+      discard await conn.exec(
+        """
+        CREATE TABLE test_copy_bin (
+          id int,
+          val double precision,
+          name text,
+          flag boolean
+        )
+      """
+      )
+
+      var buf: seq[byte]
+      buf.addCopyBinaryHeader()
+      # Row 1: all values
+      buf.addCopyTupleStart(4)
+      buf.addCopyFieldInt32(1'i32)
+      buf.addCopyFieldFloat64(3.14)
+      buf.addCopyFieldString("hello")
+      buf.addCopyFieldBool(true)
+      # Row 2: with NULL
+      buf.addCopyTupleStart(4)
+      buf.addCopyFieldInt32(2'i32)
+      buf.addCopyFieldNull()
+      buf.addCopyFieldString("world")
+      buf.addCopyFieldBool(false)
+      # Row 3
+      buf.addCopyTupleStart(4)
+      buf.addCopyFieldInt32(3'i32)
+      buf.addCopyFieldFloat64(-1.5)
+      buf.addCopyFieldText("bytes".toBytes())
+      buf.addCopyFieldBool(true)
+      buf.addCopyBinaryTrailer()
+
+      let tag =
+        await conn.copyIn("COPY test_copy_bin FROM STDIN WITH (FORMAT binary)", buf)
+      doAssert "COPY 3" in tag
+
+      let res =
+        await conn.query("SELECT id, val, name, flag FROM test_copy_bin ORDER BY id")
+      doAssert res.rows.len == 3
+      doAssert res.rows[0].getStr(0) == "1"
+      doAssert res.rows[0].getStr(2) == "hello"
+      doAssert res.rows[0].getStr(3) == "t"
+      # Row 2: NULL val
+      doAssert res.rows[1].getStr(0) == "2"
+      doAssert res.rows[1].isNull(1) == true
+      doAssert res.rows[1].getStr(2) == "world"
+      doAssert res.rows[1].getStr(3) == "f"
+      # Row 3
+      doAssert res.rows[2].getStr(0) == "3"
+      doAssert res.rows[2].getStr(2) == "bytes"
+
+      discard await conn.exec("DROP TABLE test_copy_bin")
+      await conn.close()
+
+    waitFor t()
+
+  test "binary copyIn with int16 and int64 fields":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_bin_ints")
+      discard await conn.exec(
+        """
+        CREATE TABLE test_copy_bin_ints (
+          a smallint,
+          b bigint
+        )
+      """
+      )
+
+      var buf: seq[byte]
+      buf.addCopyBinaryHeader()
+      buf.addCopyTupleStart(2)
+      buf.addCopyFieldInt16(42'i16)
+      buf.addCopyFieldInt64(9_000_000_000'i64)
+      buf.addCopyTupleStart(2)
+      buf.addCopyFieldInt16(-1'i16)
+      buf.addCopyFieldInt64(0'i64)
+      buf.addCopyBinaryTrailer()
+
+      let tag = await conn.copyIn(
+        "COPY test_copy_bin_ints FROM STDIN WITH (FORMAT binary)", buf
+      )
+      doAssert "COPY 2" in tag
+
+      let res = await conn.query("SELECT a, b FROM test_copy_bin_ints ORDER BY a")
+      doAssert res.rows.len == 2
+      doAssert res.rows[0].getStr(0) == "-1"
+      doAssert res.rows[0].getStr(1) == "0"
+      doAssert res.rows[1].getStr(0) == "42"
+      doAssert res.rows[1].getStr(1) == "9000000000"
+
+      discard await conn.exec("DROP TABLE test_copy_bin_ints")
+      await conn.close()
+
+    waitFor t()
+
+  test "binary copyIn with float32":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_bin_f32")
+      discard await conn.exec("CREATE TABLE test_copy_bin_f32 (val real)")
+
+      var buf: seq[byte]
+      buf.addCopyBinaryHeader()
+      buf.addCopyTupleStart(1)
+      buf.addCopyFieldFloat32(1.5'f32)
+      buf.addCopyTupleStart(1)
+      buf.addCopyFieldFloat32(-0.25'f32)
+      buf.addCopyBinaryTrailer()
+
+      let tag =
+        await conn.copyIn("COPY test_copy_bin_f32 FROM STDIN WITH (FORMAT binary)", buf)
+      doAssert "COPY 2" in tag
+
+      let res = await conn.query("SELECT val FROM test_copy_bin_f32 ORDER BY val")
+      doAssert res.rows.len == 2
+      doAssert res.rows[0].getStr(0) == "-0.25"
+      doAssert res.rows[1].getStr(0) == "1.5"
+
+      discard await conn.exec("DROP TABLE test_copy_bin_f32")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Column Name Access":
   test "columnIndex on QueryResult":
     proc t() {.async.} =

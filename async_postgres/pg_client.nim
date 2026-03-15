@@ -3,7 +3,7 @@ import std/[options, tables]
 import async_backend, pg_protocol, pg_connection, pg_types
 
 const binaryFormat*: seq[int16] = @[1'i16]
-const copyBatchSize = 65536 ## 64KB batch threshold for COPY IN buffering
+const copyBatchSize = 262144 ## 256KB batch threshold for COPY IN buffering
 
 type
   PreparedStatement* = object
@@ -895,11 +895,8 @@ proc notify*(
       timeout = timeout,
     )
 
-proc copyInImpl(
-    conn: PgConnection,
-    sql: string,
-    data: seq[seq[byte]],
-    timeout: Duration = ZeroDuration,
+proc copyInRawImpl(
+    conn: PgConnection, sql: string, data: seq[byte], timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -928,17 +925,21 @@ proc copyInImpl(
           discard
       await conn.fillRecvBuf(timeout)
 
-  # Send CopyData in batches to minimize syscalls and await overhead
-  const batchThreshold = copyBatchSize
-  var buf = newSeqOfCap[byte](batchThreshold)
-  for chunk in data:
-    encodeCopyData(buf, chunk)
-    if buf.len >= batchThreshold:
-      await conn.sendMsg(buf)
-      buf.setLen(0)
+  # Send CopyData in batches, slicing from the input buffer
+  const maxPayload = copyBatchSize - 5 # leave room for CopyData header
+  conn.sendBuf.setLen(0)
+  var offset = 0
+  while offset < data.len:
+    let endIdx = min(offset + maxPayload - 1, data.len - 1)
+    encodeCopyData(conn.sendBuf, data.toOpenArray(offset, endIdx))
+    offset = endIdx + 1
+    if conn.sendBuf.len >= copyBatchSize:
+      await conn.sendMsg(conn.sendBuf)
+      conn.sendBuf.setLen(0)
   # Flush remaining data + CopyDone in one send
-  buf.addCopyDone()
-  await conn.sendMsg(buf)
+  conn.sendBuf.addCopyDone()
+  await conn.sendMsg(conn.sendBuf)
+  conn.sendBuf.setLen(0)
 
   # Wait for CommandComplete + ReadyForQuery
   block recvLoop2:
@@ -963,23 +964,70 @@ proc copyInImpl(
   return commandTag
 
 proc copyIn*(
-    conn: PgConnection,
-    sql: string,
-    data: seq[seq[byte]],
-    timeout: Duration = ZeroDuration,
+    conn: PgConnection, sql: string, data: seq[byte], timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
-  ## Execute COPY ... FROM STDIN via simple query protocol.
-  ## Sends each element of `data` as a CopyData message, then CopyDone.
-  ## Returns the command tag (e.g. "COPY 5").
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## Execute COPY ... FROM STDIN with a single contiguous seq[byte].
+  ## Avoids the copy that the openArray[byte] overload performs.
   if timeout > ZeroDuration:
     try:
-      return await copyInImpl(conn, sql, data, timeout).wait(timeout)
+      return await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
       raise newException(PgError, "COPY IN timed out")
   else:
-    return await copyInImpl(conn, sql, data)
+    return await copyInRawImpl(conn, sql, data)
+
+proc copyIn*(
+    conn: PgConnection,
+    sql: string,
+    data: openArray[byte],
+    timeout: Duration = ZeroDuration,
+): Future[string] =
+  ## Execute COPY ... FROM STDIN with a single contiguous buffer.
+  ## Slices `data` into CopyData messages internally.
+  ## Returns the command tag (e.g. "COPY 5").
+  let dataCopy = @data # copy openArray to seq before async boundary
+  if timeout > ZeroDuration:
+    proc inner(): Future[string] {.async.} =
+      try:
+        return await copyInRawImpl(conn, sql, dataCopy, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.state = csClosed
+        raise newException(PgError, "COPY IN timed out")
+
+    return inner()
+  else:
+    return copyInRawImpl(conn, sql, dataCopy)
+
+proc copyIn*(
+    conn: PgConnection, sql: string, data: string, timeout: Duration = ZeroDuration
+): Future[string] =
+  ## Execute COPY ... FROM STDIN with text data as a string.
+  ## Converts to bytes internally; avoids manual toOpenArrayByte.
+  var bytes = newSeq[byte](data.len)
+  if data.len > 0:
+    copyMem(addr bytes[0], unsafeAddr data[0], data.len)
+  copyIn(conn, sql, bytes, timeout)
+
+proc copyIn*(
+    conn: PgConnection,
+    sql: string,
+    data: seq[seq[byte]],
+    timeout: Duration = ZeroDuration,
+): Future[string] =
+  ## Execute COPY ... FROM STDIN via simple query protocol.
+  ## Concatenates chunks and delegates to the seq[byte] overload.
+  ## Returns the command tag (e.g. "COPY 5").
+  var totalLen = 0
+  for chunk in data:
+    totalLen += chunk.len
+  var combined = newSeq[byte](totalLen)
+  var offset = 0
+  for chunk in data:
+    if chunk.len > 0:
+      copyMem(addr combined[offset], unsafeAddr chunk[0], chunk.len)
+      offset += chunk.len
+  copyIn(conn, sql, combined, timeout)
 
 proc copyInStreamImpl(
     conn: PgConnection,
@@ -1019,21 +1067,22 @@ proc copyInStreamImpl(
   # Pull data from callback and send as CopyData in batches
   const batchThreshold = copyBatchSize
   var callbackError: ref CatchableError = nil
-  var buf = newSeqOfCap[byte](batchThreshold)
+  conn.sendBuf.setLen(0)
   try:
     while true:
       let chunk = await callback()
       if chunk.len == 0:
         break
-      encodeCopyData(buf, chunk)
-      if buf.len >= batchThreshold:
-        await conn.sendMsg(buf)
-        buf.setLen(0)
+      encodeCopyData(conn.sendBuf, chunk)
+      if conn.sendBuf.len >= batchThreshold:
+        await conn.sendMsg(conn.sendBuf)
+        conn.sendBuf.setLen(0)
   except CatchableError as e:
     callbackError = e
 
   if callbackError != nil:
     # Callback raised: flush pending data is pointless, send CopyFail
+    conn.sendBuf.setLen(0)
     await conn.sendMsg(encodeCopyFail(callbackError.msg))
     block drainLoop:
       while true:
@@ -1050,8 +1099,9 @@ proc copyInStreamImpl(
     raise callbackError
   else:
     # Normal completion: flush remaining data + CopyDone in one send
-    buf.addCopyDone()
-    await conn.sendMsg(buf)
+    conn.sendBuf.addCopyDone()
+    await conn.sendMsg(conn.sendBuf)
+    conn.sendBuf.setLen(0)
 
   # Wait for CommandComplete + ReadyForQuery
   block recvLoop2:

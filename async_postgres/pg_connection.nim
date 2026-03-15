@@ -110,6 +110,7 @@ type
     notifyQueue*: Deque[Notification]
     notifyMaxQueue*: int
     notifyWaiter: Future[void]
+    sendBuf*: seq[byte] ## Reusable send buffer for COPY IN batching
     notifyDropped*: int ## Count of notifications dropped due to queue overflow
     listenErrorMsg: string ## Set when listen pump fails permanently
     reconnectCallback*: proc() {.gcsafe, raises: [].}
@@ -224,20 +225,19 @@ proc removeStmtCache*(conn: PgConnection, sql: string) =
   conn.stmtCache.del(sql)
 
 when hasAsyncDispatch:
-  template bytesToString(data: seq[byte]): string =
-    let d = data
-    var s = newString(d.len)
-    if d.len > 0:
-      copyMem(addr s[0], unsafeAddr d[0], d.len)
-    s
+  proc sendRawData(socket: AsyncSocket, p: pointer, len: int): Future[void] =
+    ## Send raw bytes via asyncdispatch socket. Copies data into a string once.
+    if len == 0:
+      var fut = newFuture[void]("sendRawData")
+      fut.complete()
+      return fut
+    var s = newString(len)
+    copyMem(addr s[0], p, len)
+    socket.send(move s)
 
   proc sendRawBytes(socket: AsyncSocket, data: seq[byte]): Future[void] =
     ## Send seq[byte] via asyncdispatch socket.
-    if data.len == 0:
-      var fut = newFuture[void]("sendRawBytes")
-      fut.complete()
-      return fut
-    socket.send(bytesToString(data))
+    sendRawData(socket, unsafeAddr data[0], data.len)
 
 proc compactRecvBuf(conn: PgConnection) {.inline.} =
   ## Shift unconsumed data to the front of recvBuf, reclaiming space consumed
@@ -537,6 +537,15 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
     raise newException(PgError, "Unexpected SSL response: " & $respChar)
 
 when defined(linux) or defined(macosx):
+  var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
+
+  proc configureTcpNoDelay(fd: SocketHandle) =
+    ## Disable Nagle's algorithm for low-latency sends.
+    var optval: cint = 1
+    discard setsockopt(
+      fd, cint(posix.IPPROTO_TCP), TCP_NODELAY, addr optval, sizeof(optval).SockLen
+    )
+
   proc configureKeepalive(fd: SocketHandle, config: ConnConfig) =
     ## Set TCP keepalive options on the socket.
     if not config.keepAlive:
@@ -608,6 +617,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         raise newException(PgError, "Could not resolve host: " & config.host)
       let transport = await connect(addresses[0])
       when defined(linux) or defined(macosx):
+        configureTcpNoDelay(SocketHandle(transport.fd))
         configureKeepalive(SocketHandle(transport.fd), config)
       conn = PgConnection(
         transport: transport,
@@ -625,6 +635,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       try:
         await sock.connect(config.host, Port(config.port))
         when defined(linux) or defined(macosx):
+          configureTcpNoDelay(SocketHandle(sock.getFd()))
           configureKeepalive(SocketHandle(sock.getFd()), config)
       except CatchableError:
         sock.close()
