@@ -1,4 +1,4 @@
-import std/[json, options, strutils, tables, times]
+import std/[json, options, strutils, tables, times, net]
 
 import pg_protocol
 
@@ -21,6 +21,10 @@ const
   OidInterval* = 1186'i32
   OidUuid* = 2950'i32
   OidJsonb* = 3802'i32
+  OidInet* = 869'i32
+  OidCidr* = 650'i32
+  OidMacAddr* = 829'i32
+  OidMacAddr8* = 774'i32
   OidBoolArray* = 1000'i32
   OidInt2Array* = 1005'i32
   OidInt4Array* = 1007'i32
@@ -45,6 +49,18 @@ type
     days*: int32
     microseconds*: int64
 
+  PgInet* = object
+    address*: IpAddress
+    mask*: uint8
+
+  PgCidr* = object
+    address*: IpAddress
+    mask*: uint8
+
+  PgMacAddr* = distinct string ## MAC address as "08:00:2b:01:02:03"
+
+  PgMacAddr8* = distinct string ## EUI-64 MAC address as "08:00:2b:01:02:03:04:05"
+
   PgParam* = object
     oid*: int32
     format*: int16 # 0=text, 1=binary
@@ -52,6 +68,24 @@ type
 
 proc `$`*(v: PgNumeric): string {.borrow.}
 proc `==`*(a, b: PgNumeric): bool {.borrow.}
+
+proc `$`*(v: PgMacAddr): string {.borrow.}
+proc `==`*(a, b: PgMacAddr): bool {.borrow.}
+
+proc `$`*(v: PgMacAddr8): string {.borrow.}
+proc `==`*(a, b: PgMacAddr8): bool {.borrow.}
+
+proc `$`*(v: PgInet): string =
+  $v.address & "/" & $v.mask
+
+proc `==`*(a, b: PgInet): bool =
+  a.address == b.address and a.mask == b.mask
+
+proc `$`*(v: PgCidr): string =
+  $v.address & "/" & $v.mask
+
+proc `==`*(a, b: PgCidr): bool =
+  a.address == b.address and a.mask == b.mask
 
 proc `$`*(v: PgInterval): string =
   var parts: seq[string]
@@ -167,6 +201,18 @@ proc toPgParam*(v: PgNumeric): PgParam =
 
 proc toPgParam*(v: PgInterval): PgParam =
   PgParam(oid: OidInterval, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgInet): PgParam =
+  PgParam(oid: OidInet, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgCidr): PgParam =
+  PgParam(oid: OidCidr, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgMacAddr): PgParam =
+  PgParam(oid: OidMacAddr, format: 0, value: some(toBytes(string(v))))
+
+proc toPgParam*(v: PgMacAddr8): PgParam =
+  PgParam(oid: OidMacAddr8, format: 0, value: some(toBytes(string(v))))
 
 proc toPgParam*(v: JsonNode): PgParam =
   PgParam(oid: OidJsonb, format: 0, value: some(toBytes($v)))
@@ -368,6 +414,66 @@ proc toPgBinaryParam*(v: PgInterval): PgParam =
   let monBytes = toBE32(v.months)
   copyMem(addr data[12], unsafeAddr monBytes[0], 4)
   PgParam(oid: OidInterval, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgInet): PgParam =
+  ## Binary format: family(1) + bits(1) + is_cidr(1) + addrlen(1) + addr(4|16)
+  if v.address.family == IpAddressFamily.IPv4:
+    var data = newSeq[byte](8)
+    data[0] = 2 # AF_INET
+    data[1] = v.mask
+    data[2] = 0 # is_cidr = false
+    data[3] = 4 # addrlen
+    for i in 0 ..< 4:
+      data[4 + i] = v.address.address_v4[i]
+    PgParam(oid: OidInet, format: 1, value: some(data))
+  else:
+    var data = newSeq[byte](20)
+    data[0] = 3 # AF_INET6
+    data[1] = v.mask
+    data[2] = 0 # is_cidr = false
+    data[3] = 16 # addrlen
+    for i in 0 ..< 16:
+      data[4 + i] = v.address.address_v6[i]
+    PgParam(oid: OidInet, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgCidr): PgParam =
+  ## Binary format: family(1) + bits(1) + is_cidr(1) + addrlen(1) + addr(4|16)
+  if v.address.family == IpAddressFamily.IPv4:
+    var data = newSeq[byte](8)
+    data[0] = 2 # AF_INET
+    data[1] = v.mask
+    data[2] = 1 # is_cidr = true
+    data[3] = 4 # addrlen
+    for i in 0 ..< 4:
+      data[4 + i] = v.address.address_v4[i]
+    PgParam(oid: OidCidr, format: 1, value: some(data))
+  else:
+    var data = newSeq[byte](20)
+    data[0] = 3 # AF_INET6
+    data[1] = v.mask
+    data[2] = 1 # is_cidr = true
+    data[3] = 16 # addrlen
+    for i in 0 ..< 16:
+      data[4 + i] = v.address.address_v6[i]
+    PgParam(oid: OidCidr, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgMacAddr): PgParam =
+  ## Binary format: 6 raw bytes
+  let s = string(v)
+  let parts = s.split(':')
+  var data = newSeq[byte](6)
+  for i in 0 ..< 6:
+    data[i] = byte(parseHexInt(parts[i]))
+  PgParam(oid: OidMacAddr, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgMacAddr8): PgParam =
+  ## Binary format: 8 raw bytes
+  let s = string(v)
+  let parts = s.split(':')
+  var data = newSeq[byte](8)
+  for i in 0 ..< 8:
+    data[i] = byte(parseHexInt(parts[i]))
+  PgParam(oid: OidMacAddr8, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: JsonNode): PgParam =
   let jsonBytes = toBytes($v)
@@ -630,6 +736,32 @@ proc getInterval*(row: Row, col: int): PgInterval =
   let s = row.getStr(col)
   parseIntervalText(s)
 
+proc parseInetText(s: string): tuple[address: IpAddress, mask: uint8] =
+  let slashIdx = s.find('/')
+  if slashIdx == -1:
+    let ip = parseIpAddress(s)
+    let defaultMask = if ip.family == IpAddressFamily.IPv4: 32'u8 else: 128'u8
+    return (ip, defaultMask)
+  let addrStr = s.substr(0, slashIdx - 1)
+  let maskStr = s.substr(slashIdx + 1)
+  result = (parseIpAddress(addrStr), uint8(parseInt(maskStr)))
+
+proc getInet*(row: Row, col: int): PgInet =
+  let s = row.getStr(col)
+  let (ip, mask) = parseInetText(s)
+  PgInet(address: ip, mask: mask)
+
+proc getCidr*(row: Row, col: int): PgCidr =
+  let s = row.getStr(col)
+  let (ip, mask) = parseInetText(s)
+  PgCidr(address: ip, mask: mask)
+
+proc getMacAddr*(row: Row, col: int): PgMacAddr =
+  PgMacAddr(row.getStr(col))
+
+proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
+  PgMacAddr8(row.getStr(col))
+
 # NULL-safe Option accessors (text format)
 
 proc getStrOpt*(row: Row, col: int): Option[string] =
@@ -679,6 +811,30 @@ proc getIntervalOpt*(row: Row, col: int): Option[PgInterval] =
     none(PgInterval)
   else:
     some(row.getInterval(col))
+
+proc getInetOpt*(row: Row, col: int): Option[PgInet] =
+  if row.isNull(col):
+    none(PgInet)
+  else:
+    some(row.getInet(col))
+
+proc getCidrOpt*(row: Row, col: int): Option[PgCidr] =
+  if row.isNull(col):
+    none(PgCidr)
+  else:
+    some(row.getCidr(col))
+
+proc getMacAddrOpt*(row: Row, col: int): Option[PgMacAddr] =
+  if row.isNull(col):
+    none(PgMacAddr)
+  else:
+    some(row.getMacAddr(col))
+
+proc getMacAddr8Opt*(row: Row, col: int): Option[PgMacAddr8] =
+  if row.isNull(col):
+    none(PgMacAddr8)
+  else:
+    some(row.getMacAddr8(col))
 
 # Array text format parser
 
@@ -1230,6 +1386,100 @@ proc getIntervalOpt*(
     none(PgInterval)
   else:
     some(row.getInterval(col, fields))
+
+proc decodeInetBinary(data: openArray[byte]): tuple[address: IpAddress, mask: uint8] =
+  ## Decode PostgreSQL binary inet/cidr format:
+  ##   1 byte: family (2=IPv4, 3=IPv6)
+  ##   1 byte: bits (netmask length)
+  ##   1 byte: is_cidr (0 or 1)
+  ##   1 byte: addrlen (4 or 16)
+  ##   N bytes: address
+  let family = data[0]
+  let bits = data[1]
+  # data[2] = is_cidr, ignored for decoding
+  # data[3] = addrlen
+  if family == 2:
+    var ip = IpAddress(family: IpAddressFamily.IPv4)
+    for i in 0 ..< 4:
+      ip.address_v4[i] = data[4 + i]
+    (ip, bits)
+  else:
+    var ip = IpAddress(family: IpAddressFamily.IPv6)
+    for i in 0 ..< 16:
+      ip.address_v6[i] = data[4 + i]
+    (ip, bits)
+
+proc getInet*(row: Row, col: int, fields: seq[FieldDescription]): PgInet =
+  if fields[col].formatCode == 0:
+    return row.getInet(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+  PgInet(address: ip, mask: mask)
+
+proc getCidr*(row: Row, col: int, fields: seq[FieldDescription]): PgCidr =
+  if fields[col].formatCode == 0:
+    return row.getCidr(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+  PgCidr(address: ip, mask: mask)
+
+proc getMacAddr*(row: Row, col: int, fields: seq[FieldDescription]): PgMacAddr =
+  if fields[col].formatCode == 0:
+    return row.getMacAddr(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 6:
+    raise newException(PgTypeError, "Invalid binary macaddr length: " & $clen)
+  var parts = newSeq[string](6)
+  for i in 0 ..< 6:
+    parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
+  PgMacAddr(parts.join(":"))
+
+proc getMacAddr8*(row: Row, col: int, fields: seq[FieldDescription]): PgMacAddr8 =
+  if fields[col].formatCode == 0:
+    return row.getMacAddr8(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 8:
+    raise newException(PgTypeError, "Invalid binary macaddr8 length: " & $clen)
+  var parts = newSeq[string](8)
+  for i in 0 ..< 8:
+    parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
+  PgMacAddr8(parts.join(":"))
+
+proc getInetOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgInet] =
+  if row.isNull(col):
+    none(PgInet)
+  else:
+    some(row.getInet(col, fields))
+
+proc getCidrOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgCidr] =
+  if row.isNull(col):
+    none(PgCidr)
+  else:
+    some(row.getCidr(col, fields))
+
+proc getMacAddrOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMacAddr] =
+  if row.isNull(col):
+    none(PgMacAddr)
+  else:
+    some(row.getMacAddr(col, fields))
+
+proc getMacAddr8Opt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMacAddr8] =
+  if row.isNull(col):
+    none(PgMacAddr8)
+  else:
+    some(row.getMacAddr8(col, fields))
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.
