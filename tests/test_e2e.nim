@@ -4715,3 +4715,304 @@ suite "E2E: execInTransaction / queryInTransaction":
       await pool.close()
 
     waitFor t()
+
+  test "pipeline: multiple exec":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_pipe_exec")
+      discard
+        await conn.exec("CREATE TABLE test_pipe_exec (id serial PRIMARY KEY, val text)")
+
+      var p = newPipeline(conn)
+      p.addExec("INSERT INTO test_pipe_exec (val) VALUES ($1)", @[toPgParam("a")])
+      p.addExec("INSERT INTO test_pipe_exec (val) VALUES ($1)", @[toPgParam("b")])
+      p.addExec("INSERT INTO test_pipe_exec (val) VALUES ($1)", @[toPgParam("c")])
+      let results = await p.execute()
+      doAssert results.len == 3
+      for r in results:
+        doAssert r.kind == prkExec
+        doAssert r.commandTag == "INSERT 0 1"
+
+      let qr = await conn.query("SELECT val FROM test_pipe_exec ORDER BY id")
+      doAssert qr.rowCount == 3
+      doAssert qr.rows[0].getStr(0) == "a"
+      doAssert qr.rows[1].getStr(0) == "b"
+      doAssert qr.rows[2].getStr(0) == "c"
+
+      discard await conn.exec("DROP TABLE test_pipe_exec")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: multiple query":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p = newPipeline(conn)
+      p.addQuery("SELECT 1::int4 AS a")
+      p.addQuery("SELECT 2::int4 AS b, 3::int4 AS c")
+      p.addQuery("SELECT 'hello'::text AS greeting")
+      let results = await p.execute()
+      doAssert results.len == 3
+
+      doAssert results[0].kind == prkQuery
+      doAssert results[0].queryResult.rowCount == 1
+      doAssert results[0].queryResult.rows[0].getStr(0) == "1"
+
+      doAssert results[1].kind == prkQuery
+      doAssert results[1].queryResult.rowCount == 1
+      doAssert results[1].queryResult.rows[0].getStr(0) == "2"
+      doAssert results[1].queryResult.rows[0].getStr(1) == "3"
+
+      doAssert results[2].kind == prkQuery
+      doAssert results[2].queryResult.rowCount == 1
+      doAssert results[2].queryResult.rows[0].getStr(0) == "hello"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: mixed exec and query":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_pipe_mixed")
+      discard await conn.exec(
+        "CREATE TABLE test_pipe_mixed (id serial PRIMARY KEY, val text)"
+      )
+
+      var p = newPipeline(conn)
+      p.addExec("INSERT INTO test_pipe_mixed (val) VALUES ($1)", @[toPgParam("x")])
+      p.addQuery("SELECT val FROM test_pipe_mixed ORDER BY id")
+      p.addExec("INSERT INTO test_pipe_mixed (val) VALUES ($1)", @[toPgParam("y")])
+      p.addQuery("SELECT count(*)::int4 FROM test_pipe_mixed")
+      let results = await p.execute()
+      doAssert results.len == 4
+
+      doAssert results[0].kind == prkExec
+      doAssert results[0].commandTag == "INSERT 0 1"
+
+      doAssert results[1].kind == prkQuery
+      doAssert results[1].queryResult.rowCount == 1
+      doAssert results[1].queryResult.rows[0].getStr(0) == "x"
+
+      doAssert results[2].kind == prkExec
+      doAssert results[2].commandTag == "INSERT 0 1"
+
+      doAssert results[3].kind == prkQuery
+      doAssert results[3].queryResult.rowCount == 1
+      doAssert results[3].queryResult.rows[0].getStr(0) == "2"
+
+      discard await conn.exec("DROP TABLE test_pipe_mixed")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: statement cache hit/miss":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # First execution: cache miss
+      var p1 = newPipeline(conn)
+      p1.addQuery("SELECT $1::text", @[toPgParam("first")])
+      p1.addQuery("SELECT $1::int4", @[toPgParam(42'i32)])
+      let r1 = await p1.execute()
+      doAssert r1[0].queryResult.rows[0].getStr(0) == "first"
+      doAssert r1[1].queryResult.rows[0].getStr(0) == "42"
+
+      # Second execution: cache hit (same SQL)
+      var p2 = newPipeline(conn)
+      p2.addQuery("SELECT $1::text", @[toPgParam("second")])
+      p2.addQuery("SELECT $1::int4", @[toPgParam(99'i32)])
+      let r2 = await p2.execute()
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "second"
+      doAssert r2[1].queryResult.rows[0].getStr(0) == "99"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: error aborts remaining ops":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p = newPipeline(conn)
+      p.addExec("SELECT 1")
+      p.addExec("INVALID SQL THAT WILL FAIL")
+      p.addExec("SELECT 2") # Should be skipped by server
+      var gotError = false
+      try:
+        discard await p.execute()
+      except PgError:
+        gotError = true
+      doAssert gotError
+
+      # Connection should still be usable
+      doAssert conn.state == csReady
+      let qr = await conn.query("SELECT 1::int4")
+      doAssert qr.rows[0].getStr(0) == "1"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParam raw overload":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p = newPipeline(conn)
+      p.addExec("SELECT $1::text", @[some(@(toOpenArrayByte("hello", 0, 4)))])
+      p.addQuery("SELECT $1::text", @[some(@(toOpenArrayByte("world", 0, 4)))])
+      let results = await p.execute()
+      doAssert results[0].kind == prkExec
+      doAssert results[1].kind == prkQuery
+      doAssert results[1].queryResult.rows[0].getStr(0) == "world"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: empty pipeline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p = newPipeline(conn)
+      let results = await p.execute()
+      doAssert results.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: pool withPipeline":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_pipe_pool")
+      discard
+        await pool.exec("CREATE TABLE test_pipe_pool (id serial PRIMARY KEY, val text)")
+
+      pool.withPipeline(p):
+        p.addExec(
+          "INSERT INTO test_pipe_pool (val) VALUES ($1)", @[toPgParam("pooled")]
+        )
+        p.addQuery("SELECT val FROM test_pipe_pool")
+        let results = await p.execute()
+        doAssert results.len == 2
+        doAssert results[0].commandTag == "INSERT 0 1"
+        doAssert results[1].queryResult.rows[0].getStr(0) == "pooled"
+
+      discard await pool.exec("DROP TABLE test_pipe_pool")
+      await pool.close()
+
+    waitFor t()
+
+  test "pipeline: query with multiple rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p = newPipeline(conn)
+      p.addQuery("SELECT generate_series(1, 5)::int4 AS n")
+      p.addQuery("SELECT generate_series(10, 12)::int4 AS m")
+      let results = await p.execute()
+      doAssert results.len == 2
+
+      doAssert results[0].queryResult.rowCount == 5
+      for i in 0 ..< 5:
+        doAssert results[0].queryResult.rows[i].getStr(0) == $(i + 1)
+
+      doAssert results[1].queryResult.rowCount == 3
+      doAssert results[1].queryResult.rows[0].getStr(0) == "10"
+      doAssert results[1].queryResult.rows[2].getStr(0) == "12"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: query returning zero rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p = newPipeline(conn)
+      p.addQuery("SELECT 1::int4 WHERE false")
+      p.addQuery("SELECT 42::int4")
+      let results = await p.execute()
+      doAssert results.len == 2
+
+      doAssert results[0].queryResult.rowCount == 0
+      doAssert results[1].queryResult.rowCount == 1
+      doAssert results[1].queryResult.rows[0].getStr(0) == "42"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: single op":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p1 = newPipeline(conn)
+      p1.addQuery("SELECT 'only'::text")
+      let r1 = await p1.execute()
+      doAssert r1.len == 1
+      doAssert r1[0].queryResult.rows[0].getStr(0) == "only"
+
+      var p2 = newPipeline(conn)
+      p2.addExec("SELECT 1")
+      let r2 = await p2.execute()
+      doAssert r2.len == 1
+      doAssert r2[0].kind == prkExec
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: cache full falls back to unnamed":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      # Fill the cache
+      discard await conn.query("SELECT 1")
+      discard await conn.query("SELECT 2")
+      doAssert conn.stmtCache.len == 2
+
+      # Pipeline with new SQL: must use unnamed statements
+      var p = newPipeline(conn)
+      p.addQuery("SELECT 100::int4")
+      p.addExec("SELECT 200")
+      p.addQuery("SELECT 300::int4")
+      let results = await p.execute()
+      doAssert results.len == 3
+      doAssert conn.stmtCache.len == 2 # unchanged
+
+      doAssert results[0].queryResult.rows[0].getStr(0) == "100"
+      doAssert results[1].kind == prkExec
+      doAssert results[2].queryResult.rows[0].getStr(0) == "300"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: same SQL query repeated in single pipeline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var p = newPipeline(conn)
+      p.addQuery("SELECT $1::text", @[toPgParam("aaa")])
+      p.addQuery("SELECT $1::text", @[toPgParam("bbb")])
+      p.addQuery("SELECT $1::text", @[toPgParam("ccc")])
+      let results = await p.execute()
+      doAssert results.len == 3
+      doAssert results[0].queryResult.rows[0].getStr(0) == "aaa"
+      doAssert results[1].queryResult.rows[0].getStr(0) == "bbb"
+      doAssert results[2].queryResult.rows[0].getStr(0) == "ccc"
+
+      # Second pipeline: same SQL should hit cache
+      var p2 = newPipeline(conn)
+      p2.addQuery("SELECT $1::text", @[toPgParam("cached")])
+      let r2 = await p2.execute()
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "cached"
+
+      await conn.close()
+
+    waitFor t()

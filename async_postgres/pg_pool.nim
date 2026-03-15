@@ -508,6 +508,16 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
     finally:
       `poolSym`.release(`connIdent`)
 
+template withPipeline*(pool: PgPool, pipeline, body: untyped) =
+  ## Acquire a connection, create a Pipeline, execute body, then release.
+  ## The `pipeline` identifier is a `var Pipeline` available in body.
+  let conn = await pool.acquire()
+  try:
+    var pipeline = newPipeline(conn)
+    body
+  finally:
+    pool.release(conn)
+
 proc close*(pool: PgPool): Future[void] {.async.} =
   pool.closed = true
 
