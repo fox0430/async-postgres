@@ -40,6 +40,11 @@ type
     ## Arbitrary-precision numeric value stored as its string representation.
     ## Use this instead of float64 to avoid precision loss with PostgreSQL numeric/decimal.
 
+  PgInterval* = object
+    months*: int32
+    days*: int32
+    microseconds*: int64
+
   PgParam* = object
     oid*: int32
     format*: int16 # 0=text, 1=binary
@@ -47,6 +52,41 @@ type
 
 proc `$`*(v: PgNumeric): string {.borrow.}
 proc `==`*(a, b: PgNumeric): bool {.borrow.}
+
+proc `$`*(v: PgInterval): string =
+  var parts: seq[string]
+  if v.months != 0:
+    let years = v.months div 12
+    let mons = v.months mod 12
+    if years != 0:
+      parts.add($years & " year" & (if years != 1 and years != -1: "s" else: ""))
+    if mons != 0:
+      parts.add($mons & " mon" & (if mons != 1 and mons != -1: "s" else: ""))
+  if v.days != 0:
+    parts.add($v.days & " day" & (if v.days != 1 and v.days != -1: "s" else: ""))
+  var us = v.microseconds
+  let neg = us < 0
+  if neg:
+    us = -us
+  let hours = us div 3_600_000_000
+  us = us mod 3_600_000_000
+  let mins = us div 60_000_000
+  us = us mod 60_000_000
+  let secs = us div 1_000_000
+  let frac = us mod 1_000_000
+  var timePart =
+    (if neg: "-" else: "") & align($hours, 2, '0') & ":" & align($mins, 2, '0') & ":" &
+    align($secs, 2, '0')
+  if frac != 0:
+    timePart.add("." & align($frac, 6, '0'))
+  if parts.len == 0 and v.microseconds == 0:
+    return "00:00:00"
+  if v.microseconds != 0:
+    parts.add(timePart)
+  result = parts.join(" ")
+
+proc `==`*(a, b: PgInterval): bool =
+  a.months == b.months and a.days == b.days and a.microseconds == b.microseconds
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -124,6 +164,9 @@ proc toPgParam*(v: PgUuid): PgParam =
 
 proc toPgParam*(v: PgNumeric): PgParam =
   PgParam(oid: OidNumeric, format: 0, value: some(toBytes(string(v))))
+
+proc toPgParam*(v: PgInterval): PgParam =
+  PgParam(oid: OidInterval, format: 0, value: some(toBytes($v)))
 
 proc toPgParam*(v: JsonNode): PgParam =
   PgParam(oid: OidJsonb, format: 0, value: some(toBytes($v)))
@@ -316,6 +359,16 @@ proc toPgBinaryParam*(v: PgUuid): PgParam =
     bytes[i] = byte(parseHexInt(hex[i * 2 .. i * 2 + 1]))
   PgParam(oid: OidUuid, format: 1, value: some(bytes))
 
+proc toPgBinaryParam*(v: PgInterval): PgParam =
+  var data = newSeq[byte](16)
+  let usBytes = toBE64(v.microseconds)
+  copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+  let dayBytes = toBE32(v.days)
+  copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+  let monBytes = toBE32(v.months)
+  copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+  PgParam(oid: OidInterval, format: 1, value: some(data))
+
 proc toPgBinaryParam*(v: JsonNode): PgParam =
   let jsonBytes = toBytes($v)
   var data = newSeq[byte](1 + jsonBytes.len)
@@ -479,6 +532,104 @@ proc getJson*(row: Row, col: int): JsonNode =
   except JsonParsingError:
     raise newException(PgTypeError, "Invalid JSON: " & s)
 
+proc parseIntervalText(s: string): PgInterval =
+  ## Parse PostgreSQL default interval text format:
+  ##   "1 year 2 mons 3 days 04:05:06.123456"
+  ##   "-1 year -2 mons +3 days -04:05:06"
+  ##   "00:00:00"
+  var months: int32 = 0
+  var days: int32 = 0
+  var microseconds: int64 = 0
+  var i = 0
+  let n = s.len
+  while i < n:
+    if s[i] == ' ':
+      i += 1
+      continue
+    # Check for time part (starts with optional sign then digit followed eventually by ':')
+    var j = i
+    if j < n and (s[j] == '-' or s[j] == '+'):
+      j += 1
+    if j < n and s[j] in '0' .. '9':
+      # Look ahead for ':' to distinguish time from number+unit
+      var k = j
+      while k < n and s[k] in '0' .. '9':
+        k += 1
+      if k < n and s[k] == ':':
+        # Time part: [+-]HH:MM:SS[.ffffff]
+        let neg = i < n and s[i] == '-'
+        if s[i] == '-' or s[i] == '+':
+          i += 1
+        var hours: int64 = 0
+        while i < n and s[i] in '0' .. '9':
+          hours = hours * 10 + int64(ord(s[i]) - ord('0'))
+          i += 1
+        i += 1 # skip ':'
+        var mins: int64 = 0
+        while i < n and s[i] in '0' .. '9':
+          mins = mins * 10 + int64(ord(s[i]) - ord('0'))
+          i += 1
+        var secs: int64 = 0
+        var frac: int64 = 0
+        if i < n and s[i] == ':':
+          i += 1
+          while i < n and s[i] in '0' .. '9':
+            secs = secs * 10 + int64(ord(s[i]) - ord('0'))
+            i += 1
+          if i < n and s[i] == '.':
+            i += 1
+            var fracDigits = 0
+            while i < n and s[i] in '0' .. '9' and fracDigits < 6:
+              frac = frac * 10 + int64(ord(s[i]) - ord('0'))
+              fracDigits += 1
+              i += 1
+            # Pad to 6 digits
+            while fracDigits < 6:
+              frac *= 10
+              fracDigits += 1
+            # Skip remaining fractional digits
+            while i < n and s[i] in '0' .. '9':
+              i += 1
+        let us = hours * 3_600_000_000 + mins * 60_000_000 + secs * 1_000_000 + frac
+        microseconds =
+          if neg:
+            -us
+          else:
+            us
+        continue
+    # Number + unit
+    let neg = i < n and s[i] == '-'
+    if s[i] == '-' or s[i] == '+':
+      i += 1
+    var val: int64 = 0
+    while i < n and s[i] in '0' .. '9':
+      val = val * 10 + int64(ord(s[i]) - ord('0'))
+      i += 1
+    if neg:
+      val = -val
+    # Skip space
+    while i < n and s[i] == ' ':
+      i += 1
+    # Read unit
+    var unit = ""
+    while i < n and s[i] in 'a' .. 'z':
+      unit.add(s[i])
+      i += 1
+    case unit
+    of "year", "years":
+      months += int32(val * 12)
+    of "mon", "mons":
+      months += int32(val)
+    of "day", "days":
+      days += int32(val)
+    else:
+      discard
+  PgInterval(months: months, days: days, microseconds: microseconds)
+
+proc getInterval*(row: Row, col: int): PgInterval =
+  let s = row.getStr(col)
+  parseIntervalText(s)
+
 # NULL-safe Option accessors (text format)
 
 proc getStrOpt*(row: Row, col: int): Option[string] =
@@ -522,6 +673,12 @@ proc getJsonOpt*(row: Row, col: int): Option[JsonNode] =
     none(JsonNode)
   else:
     some(row.getJson(col))
+
+proc getIntervalOpt*(row: Row, col: int): Option[PgInterval] =
+  if row.isNull(col):
+    none(PgInterval)
+  else:
+    some(row.getInterval(col))
 
 # Array text format parser
 
@@ -1053,6 +1210,26 @@ proc getJson*(row: Row, col: int, fields: seq[FieldDescription]): JsonNode =
     return parseJson(jsonStr)
   except JsonParsingError:
     raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
+
+proc getInterval*(row: Row, col: int, fields: seq[FieldDescription]): PgInterval =
+  if fields[col].formatCode == 0:
+    return row.getInterval(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 16:
+    raise newException(PgTypeError, "Invalid binary interval length: " & $clen)
+  result.microseconds = fromBE64(row.data.buf.toOpenArray(off, off + 7))
+  result.days = fromBE32(row.data.buf.toOpenArray(off + 8, off + 11))
+  result.months = fromBE32(row.data.buf.toOpenArray(off + 12, off + 15))
+
+proc getIntervalOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgInterval] =
+  if row.isNull(col):
+    none(PgInterval)
+  else:
+    some(row.getInterval(col, fields))
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.

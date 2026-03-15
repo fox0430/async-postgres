@@ -1671,6 +1671,211 @@ suite "PgNumeric":
     check p.oid == OidNumeric
     check p.value.isNone
 
+suite "PgInterval":
+  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+    FieldDescription(
+      name: "test",
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: typeOid,
+      typeSize: 0,
+      typeMod: 0,
+      formatCode: formatCode,
+    )
+
+  test "$ zero interval":
+    let v = PgInterval(months: 0, days: 0, microseconds: 0)
+    check $v == "00:00:00"
+
+  test "$ full interval":
+    let v = PgInterval(months: 14, days: 3, microseconds: 14706123456)
+    check $v == "1 year 2 mons 3 days 04:05:06.123456"
+
+  test "$ months only":
+    let v = PgInterval(months: 5, days: 0, microseconds: 0)
+    check $v == "5 mons"
+
+  test "$ days only":
+    let v = PgInterval(months: 0, days: 1, microseconds: 0)
+    check $v == "1 day"
+
+  test "$ time only":
+    let v = PgInterval(months: 0, days: 0, microseconds: 3_600_000_000)
+    check $v == "01:00:00"
+
+  test "$ negative time":
+    let v = PgInterval(months: 0, days: 0, microseconds: -3_600_000_000)
+    check $v == "-01:00:00"
+
+  test "$ negative months and days":
+    let v = PgInterval(months: -14, days: -3, microseconds: -14706123456)
+    check $v == "-1 year -2 mons -3 days -04:05:06.123456"
+
+  test "$ plural vs singular":
+    check $PgInterval(months: 12, days: 0, microseconds: 0) == "1 year"
+    check $PgInterval(months: 24, days: 0, microseconds: 0) == "2 years"
+    check $PgInterval(months: 1, days: 0, microseconds: 0) == "1 mon"
+    check $PgInterval(months: 2, days: 0, microseconds: 0) == "2 mons"
+    check $PgInterval(months: 0, days: 1, microseconds: 0) == "1 day"
+    check $PgInterval(months: 0, days: 2, microseconds: 0) == "2 days"
+
+  test "== operator":
+    let a = PgInterval(months: 1, days: 2, microseconds: 3)
+    let b = PgInterval(months: 1, days: 2, microseconds: 3)
+    let c = PgInterval(months: 1, days: 2, microseconds: 4)
+    check a == b
+    check not (a == c)
+
+  test "parseIntervalText basic":
+    let v = parseIntervalText("1 year 2 mons 3 days 04:05:06.123456")
+    check v.months == 14
+    check v.days == 3
+    check v.microseconds == 14706123456'i64
+
+  test "parseIntervalText zero":
+    let v = parseIntervalText("00:00:00")
+    check v == PgInterval(months: 0, days: 0, microseconds: 0)
+
+  test "parseIntervalText negative":
+    let v = parseIntervalText("-1 year -2 mons -3 days -04:05:06")
+    check v.months == -14
+    check v.days == -3
+    check v.microseconds == -14706000000'i64
+
+  test "parseIntervalText time only":
+    let v = parseIntervalText("01:30:00")
+    check v.months == 0
+    check v.days == 0
+    check v.microseconds == 5_400_000_000'i64
+
+  test "parseIntervalText days and time":
+    let v = parseIntervalText("7 days 12:00:00")
+    check v.days == 7
+    check v.microseconds == 43_200_000_000'i64
+
+  test "toPgParam PgInterval":
+    let v = PgInterval(months: 14, days: 3, microseconds: 14706123456)
+    let p = toPgParam(v)
+    check p.oid == OidInterval
+    check p.format == 0
+    check toString(p.value.get) == "1 year 2 mons 3 days 04:05:06.123456"
+
+  test "toPgBinaryParam PgInterval":
+    let v = PgInterval(months: 14, days: 3, microseconds: 14706123456)
+    let p = toPgBinaryParam(v)
+    check p.oid == OidInterval
+    check p.format == 1
+    let data = p.value.get
+    check data.len == 16
+    check fromBE64(data.toOpenArray(0, 7)) == 14706123456'i64
+    check fromBE32(data.toOpenArray(8, 11)) == 3'i32
+    check fromBE32(data.toOpenArray(12, 15)) == 14'i32
+
+  test "toPgBinaryParam PgInterval zero":
+    let v = PgInterval(months: 0, days: 0, microseconds: 0)
+    let p = toPgBinaryParam(v)
+    let data = p.value.get
+    check data.len == 16
+    check fromBE64(data.toOpenArray(0, 7)) == 0'i64
+    check fromBE32(data.toOpenArray(8, 11)) == 0'i32
+    check fromBE32(data.toOpenArray(12, 15)) == 0'i32
+
+  test "toPgBinaryParam PgInterval negative":
+    let v = PgInterval(months: -1, days: -2, microseconds: -3_600_000_000)
+    let p = toPgBinaryParam(v)
+    let data = p.value.get
+    check fromBE64(data.toOpenArray(0, 7)) == -3_600_000_000'i64
+    check fromBE32(data.toOpenArray(8, 11)) == -2'i32
+    check fromBE32(data.toOpenArray(12, 15)) == -1'i32
+
+  test "getInterval text format":
+    let row: Row = @[some(toBytes("1 year 2 mons 3 days 04:05:06.123456"))]
+    let v = row.getInterval(0)
+    check v == PgInterval(months: 14, days: 3, microseconds: 14706123456)
+
+  test "getInterval binary format":
+    var data = newSeq[byte](16)
+    let usBytes = toBE64(14706123456'i64)
+    copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+    let dayBytes = toBE32(3'i32)
+    copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+    let monBytes = toBE32(14'i32)
+    copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidInterval, 1)]
+    let v = row.getInterval(0, fields)
+    check v == PgInterval(months: 14, days: 3, microseconds: 14706123456)
+
+  test "getInterval binary fallback to text":
+    let row: Row = @[some(toBytes("5 days"))]
+    let fields = @[mkField(OidInterval, 0)]
+    let v = row.getInterval(0, fields)
+    check v == PgInterval(months: 0, days: 5, microseconds: 0)
+
+  test "getInterval binary NULL raises":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidInterval, 1)]
+    var raised = false
+    try:
+      discard row.getInterval(0, fields)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getIntervalOpt text some":
+    let row: Row = @[some(toBytes("00:00:00"))]
+    let v = row.getIntervalOpt(0)
+    check v.isSome
+    check v.get == PgInterval(months: 0, days: 0, microseconds: 0)
+
+  test "getIntervalOpt text none":
+    let row: Row = @[none(seq[byte])]
+    check row.getIntervalOpt(0) == none(PgInterval)
+
+  test "getIntervalOpt binary some":
+    var data = newSeq[byte](16)
+    let usBytes = toBE64(1_000_000'i64)
+    copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+    let dayBytes = toBE32(0'i32)
+    copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+    let monBytes = toBE32(0'i32)
+    copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidInterval, 1)]
+    let v = row.getIntervalOpt(0, fields)
+    check v.isSome
+    check v.get == PgInterval(months: 0, days: 0, microseconds: 1_000_000)
+
+  test "getIntervalOpt binary none":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidInterval, 1)]
+    check row.getIntervalOpt(0, fields) == none(PgInterval)
+
+  test "toPgParam Option[PgInterval] some":
+    let p = toPgParam(some(PgInterval(months: 1, days: 0, microseconds: 0)))
+    check p.oid == OidInterval
+    check p.value.isSome
+
+  test "toPgParam Option[PgInterval] none":
+    let p = toPgParam(none(PgInterval))
+    check p.oid == OidInterval
+    check p.value.isNone
+
+  test "roundtrip text format":
+    let orig = PgInterval(months: 14, days: 3, microseconds: 14706123456)
+    let parsed = parseIntervalText($orig)
+    check parsed == orig
+
+  test "roundtrip binary format":
+    let orig = PgInterval(months: -5, days: 10, microseconds: -7_200_000_000)
+    let p = toPgBinaryParam(orig)
+    let data = p.value.get
+    var decoded: PgInterval
+    decoded.microseconds = fromBE64(data.toOpenArray(0, 7))
+    decoded.days = fromBE32(data.toOpenArray(8, 11))
+    decoded.months = fromBE32(data.toOpenArray(12, 15))
+    check decoded == orig
+
 suite "columnIndex and columnMap":
   proc mkFieldDesc(name: string): FieldDescription =
     FieldDescription(
