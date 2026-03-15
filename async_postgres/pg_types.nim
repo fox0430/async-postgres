@@ -128,76 +128,136 @@ proc toPgParam*(v: PgNumeric): PgParam =
 proc toPgParam*(v: JsonNode): PgParam =
   PgParam(oid: OidJsonb, format: 0, value: some(toBytes($v)))
 
-proc escapeArrayElement(s: string): string =
-  result = "\""
-  for c in s:
-    if c == '"' or c == '\\':
-      result.add('\\')
-    result.add(c)
-  result.add('"')
+proc encodeBinaryArray*(elemOid: int32, elements: seq[seq[byte]]): seq[byte] =
+  ## Encode a 1-dimensional PostgreSQL binary array.
+  ## Header: ndim(4) + has_null(4) + elem_oid(4) + dim_len(4) + lower_bound(4) = 20 bytes
+  ## Each element: len(4) + data
+  let headerSize = 20
+  var dataSize = 0
+  for e in elements:
+    dataSize += 4 + e.len
+  result = newSeq[byte](headerSize + dataSize)
+  # ndim = 1
+  let ndim = toBE32(1'i32)
+  copyMem(addr result[0], unsafeAddr ndim[0], 4)
+  # has_null = 0
+  let hasNull = toBE32(0'i32)
+  copyMem(addr result[4], unsafeAddr hasNull[0], 4)
+  # elem_oid
+  let oid = toBE32(elemOid)
+  copyMem(addr result[8], unsafeAddr oid[0], 4)
+  # dim_len
+  let dimLen = toBE32(int32(elements.len))
+  copyMem(addr result[12], unsafeAddr dimLen[0], 4)
+  # lower_bound = 1
+  let lb = toBE32(1'i32)
+  copyMem(addr result[16], unsafeAddr lb[0], 4)
+  var pos = headerSize
+  for e in elements:
+    let eLen = toBE32(int32(e.len))
+    copyMem(addr result[pos], unsafeAddr eLen[0], 4)
+    pos += 4
+    if e.len > 0:
+      copyMem(addr result[pos], unsafeAddr e[0], e.len)
+      pos += e.len
+
+proc encodeBinaryArrayEmpty*(elemOid: int32): seq[byte] =
+  ## Encode an empty 1-dimensional PostgreSQL binary array.
+  ## ndim=0, has_null=0, elem_oid
+  result = newSeq[byte](12)
+  # ndim = 0
+  let ndim = toBE32(0'i32)
+  copyMem(addr result[0], unsafeAddr ndim[0], 4)
+  # has_null = 0
+  let hasNull = toBE32(0'i32)
+  copyMem(addr result[4], unsafeAddr hasNull[0], 4)
+  # elem_oid
+  let oid = toBE32(elemOid)
+  copyMem(addr result[8], unsafeAddr oid[0], 4)
 
 proc toPgParam*(v: seq[int16]): PgParam =
-  var s = "{"
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt2Array, format: 1, value: some(encodeBinaryArrayEmpty(OidInt2))
+    )
+  var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add($x)
-  s.add('}')
-  PgParam(oid: OidInt2Array, format: 0, value: some(toBytes(s)))
+    elements[i] = @(toBE16(x))
+  PgParam(
+    oid: OidInt2Array, format: 1, value: some(encodeBinaryArray(OidInt2, elements))
+  )
 
 proc toPgParam*(v: seq[int32]): PgParam =
-  var s = "{"
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt4Array, format: 1, value: some(encodeBinaryArrayEmpty(OidInt4))
+    )
+  var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add($x)
-  s.add('}')
-  PgParam(oid: OidInt4Array, format: 0, value: some(toBytes(s)))
+    elements[i] = @(toBE32(x))
+  PgParam(
+    oid: OidInt4Array, format: 1, value: some(encodeBinaryArray(OidInt4, elements))
+  )
 
 proc toPgParam*(v: seq[int64]): PgParam =
-  var s = "{"
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt8Array, format: 1, value: some(encodeBinaryArrayEmpty(OidInt8))
+    )
+  var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add($x)
-  s.add('}')
-  PgParam(oid: OidInt8Array, format: 0, value: some(toBytes(s)))
+    elements[i] = @(toBE64(x))
+  PgParam(
+    oid: OidInt8Array, format: 1, value: some(encodeBinaryArray(OidInt8, elements))
+  )
 
 proc toPgParam*(v: seq[float32]): PgParam =
-  var s = "{"
+  if v.len == 0:
+    return PgParam(
+      oid: OidFloat4Array, format: 1, value: some(encodeBinaryArrayEmpty(OidFloat4))
+    )
+  var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add($x)
-  s.add('}')
-  PgParam(oid: OidFloat4Array, format: 0, value: some(toBytes(s)))
+    elements[i] = @(toBE32(cast[int32](x)))
+  PgParam(
+    oid: OidFloat4Array, format: 1, value: some(encodeBinaryArray(OidFloat4, elements))
+  )
 
 proc toPgParam*(v: seq[float64]): PgParam =
-  var s = "{"
+  if v.len == 0:
+    return PgParam(
+      oid: OidFloat8Array, format: 1, value: some(encodeBinaryArrayEmpty(OidFloat8))
+    )
+  var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add($x)
-  s.add('}')
-  PgParam(oid: OidFloat8Array, format: 0, value: some(toBytes(s)))
+    elements[i] = @(toBE64(cast[int64](x)))
+  PgParam(
+    oid: OidFloat8Array, format: 1, value: some(encodeBinaryArray(OidFloat8, elements))
+  )
 
 proc toPgParam*(v: seq[bool]): PgParam =
-  var s = "{"
+  if v.len == 0:
+    return PgParam(
+      oid: OidBoolArray, format: 1, value: some(encodeBinaryArrayEmpty(OidBool))
+    )
+  var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add(if x: "t" else: "f")
-  s.add('}')
-  PgParam(oid: OidBoolArray, format: 0, value: some(toBytes(s)))
+    elements[i] = @[if x: 1'u8 else: 0'u8]
+  PgParam(
+    oid: OidBoolArray, format: 1, value: some(encodeBinaryArray(OidBool, elements))
+  )
 
 proc toPgParam*(v: seq[string]): PgParam =
-  var s = "{"
+  if v.len == 0:
+    return PgParam(
+      oid: OidTextArray, format: 1, value: some(encodeBinaryArrayEmpty(OidText))
+    )
+  var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add(escapeArrayElement(x))
-  s.add('}')
-  PgParam(oid: OidTextArray, format: 0, value: some(toBytes(s)))
+    elements[i] = toBytes(x)
+  PgParam(
+    oid: OidTextArray, format: 1, value: some(encodeBinaryArray(OidText, elements))
+  )
 
 proc toPgParam*(v: Option[JsonNode]): PgParam =
   if v.isSome:
@@ -263,6 +323,9 @@ proc toPgBinaryParam*(v: JsonNode): PgParam =
   for i in 0 ..< jsonBytes.len:
     data[i + 1] = jsonBytes[i]
   PgParam(oid: OidJsonb, format: 1, value: some(data))
+
+proc toPgBinaryParam*[T](v: seq[T]): PgParam =
+  toPgParam(v)
 
 proc toPgBinaryParam*(v: Option[JsonNode]): PgParam =
   if v.isSome:
@@ -562,7 +625,202 @@ proc getStrArray*(row: Row, col: int): seq[string] =
       raise newException(PgTypeError, "NULL element in string array")
     result.add(e.get)
 
-# Array Opt accessors
+proc decodeBinaryArray*(
+    data: openArray[byte]
+): tuple[elemOid: int32, elements: seq[tuple[off: int, len: int]]] =
+  ## Decode a PostgreSQL binary array, returning element OID and (offset, length) pairs.
+  ## Offsets are relative to the start of `data`.
+  if data.len < 12:
+    raise newException(PgTypeError, "Binary array too short")
+  let ndim = fromBE32(data.toOpenArray(0, 3))
+  # has_null at offset 4
+  result.elemOid = fromBE32(data.toOpenArray(8, 11))
+  if ndim == 0:
+    result.elements = @[]
+    return
+  if ndim != 1:
+    raise
+      newException(PgTypeError, "Multi-dimensional arrays not supported, ndim=" & $ndim)
+  if data.len < 20:
+    raise newException(PgTypeError, "Binary array header too short")
+  let dimLen = int(fromBE32(data.toOpenArray(12, 15)))
+  # lower_bound at offset 16, ignored
+  result.elements = newSeq[tuple[off: int, len: int]](dimLen)
+  var pos = 20
+  for i in 0 ..< dimLen:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary array truncated at element " & $i)
+    let eLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    if eLen == -1:
+      result.elements[i] = (off: 0, len: -1)
+    else:
+      result.elements[i] = (off: pos, len: eLen)
+      pos += eLen
+
+proc getIntArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[int32] =
+  if fields[col].formatCode == 0:
+    return row.getIntArray(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  result = newSeq[int32](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in int array")
+    result[i] = fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
+
+proc getInt16Array*(row: Row, col: int, fields: seq[FieldDescription]): seq[int16] =
+  if fields[col].formatCode == 0:
+    return row.getInt16Array(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  result = newSeq[int16](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in int16 array")
+    result[i] = fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
+
+proc getInt64Array*(row: Row, col: int, fields: seq[FieldDescription]): seq[int64] =
+  if fields[col].formatCode == 0:
+    return row.getInt64Array(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  result = newSeq[int64](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in int64 array")
+    result[i] = fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
+
+proc getFloatArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[float64] =
+  if fields[col].formatCode == 0:
+    return row.getFloatArray(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  result = newSeq[float64](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in float array")
+    if e.len == 4:
+      result[i] = float64(
+        cast[float32](cast[uint32](fromBE32(
+          row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+        )))
+      )
+    else:
+      result[i] = cast[float64](cast[uint64](fromBE64(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )))
+
+proc getFloat32Array*(row: Row, col: int, fields: seq[FieldDescription]): seq[float32] =
+  if fields[col].formatCode == 0:
+    return row.getFloat32Array(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  result = newSeq[float32](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in float32 array")
+    result[i] = cast[float32](cast[uint32](fromBE32(
+      row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+    )))
+
+proc getBoolArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[bool] =
+  if fields[col].formatCode == 0:
+    return row.getBoolArray(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  result = newSeq[bool](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in bool array")
+    result[i] = row.data.buf[off + e.off] == 1'u8
+
+proc getStrArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[string] =
+  if fields[col].formatCode == 0:
+    return row.getStrArray(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  result = newSeq[string](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in string array")
+    result[i] = newString(e.len)
+    if e.len > 0:
+      copyMem(addr result[i][0], unsafeAddr row.data.buf[off + e.off], e.len)
+
+# Format-aware array Opt accessors
+
+proc getIntArrayOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[seq[int32]] =
+  if row.isNull(col):
+    none(seq[int32])
+  else:
+    some(row.getIntArray(col, fields))
+
+proc getInt16ArrayOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[seq[int16]] =
+  if row.isNull(col):
+    none(seq[int16])
+  else:
+    some(row.getInt16Array(col, fields))
+
+proc getInt64ArrayOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[seq[int64]] =
+  if row.isNull(col):
+    none(seq[int64])
+  else:
+    some(row.getInt64Array(col, fields))
+
+proc getFloatArrayOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[seq[float64]] =
+  if row.isNull(col):
+    none(seq[float64])
+  else:
+    some(row.getFloatArray(col, fields))
+
+proc getFloat32ArrayOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[seq[float32]] =
+  if row.isNull(col):
+    none(seq[float32])
+  else:
+    some(row.getFloat32Array(col, fields))
+
+proc getBoolArrayOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[seq[bool]] =
+  if row.isNull(col):
+    none(seq[bool])
+  else:
+    some(row.getBoolArray(col, fields))
+
+proc getStrArrayOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[seq[string]] =
+  if row.isNull(col):
+    none(seq[string])
+  else:
+    some(row.getStrArray(col, fields))
+
+# Array Opt accessors (text format)
 
 proc getIntArrayOpt*(row: Row, col: int): Option[seq[int32]] =
   if row.isNull(col):
