@@ -2,6 +2,35 @@ import std/[json, macros, options, strutils, tables, times, net]
 
 import pg_protocol
 
+type
+  PgUuid* = distinct string
+
+  PgNumeric* = distinct string
+    ## Arbitrary-precision numeric value stored as its string representation.
+    ## Use this instead of float64 to avoid precision loss with PostgreSQL numeric/decimal.
+
+  PgInterval* = object
+    months*: int32
+    days*: int32
+    microseconds*: int64
+
+  PgInet* = object
+    address*: IpAddress
+    mask*: uint8
+
+  PgCidr* = object
+    address*: IpAddress
+    mask*: uint8
+
+  PgMacAddr* = distinct string ## MAC address as "08:00:2b:01:02:03"
+
+  PgMacAddr8* = distinct string ## EUI-64 MAC address as "08:00:2b:01:02:03:04:05"
+
+  PgParam* = object
+    oid*: int32
+    format*: int16 # 0=text, 1=binary
+    value*: Option[seq[byte]]
+
 const
   OidBool* = 16'i32
   OidInt2* = 21'i32
@@ -37,34 +66,7 @@ const
   pgEpochUnix* = 946684800'i64 ## 2000-01-01 00:00:00 UTC in Unix seconds
   pgEpochDaysOffset* = 10957'i32 ## Days from 1970-01-01 to 2000-01-01
 
-type
-  PgUuid* = distinct string
-
-  PgNumeric* = distinct string
-    ## Arbitrary-precision numeric value stored as its string representation.
-    ## Use this instead of float64 to avoid precision loss with PostgreSQL numeric/decimal.
-
-  PgInterval* = object
-    months*: int32
-    days*: int32
-    microseconds*: int64
-
-  PgInet* = object
-    address*: IpAddress
-    mask*: uint8
-
-  PgCidr* = object
-    address*: IpAddress
-    mask*: uint8
-
-  PgMacAddr* = distinct string ## MAC address as "08:00:2b:01:02:03"
-
-  PgMacAddr8* = distinct string ## EUI-64 MAC address as "08:00:2b:01:02:03:04:05"
-
-  PgParam* = object
-    oid*: int32
-    format*: int16 # 0=text, 1=binary
-    value*: Option[seq[byte]]
+  OidRecord* = 2249'i32
 
 proc `$`*(v: PgNumeric): string {.borrow.}
 proc `==`*(a, b: PgNumeric): bool {.borrow.}
@@ -1774,3 +1776,300 @@ proc getEnumOpt*[T: enum](
     none(T)
   else:
     some(getEnum[T](row, col, fields))
+
+# User-defined composite type support
+#
+# PostgreSQL composite types (row types / record types) have dynamic OIDs.
+# Text format:  (val1,val2,...)  with quoting for special chars
+# Binary format: numFields(4) + [oid(4) + len(4) + data]...
+#
+# Usage:
+#   type Point = object
+#     x: float64
+#     y: float64
+#
+#   pgComposite(Point)                # OID = 0; PostgreSQL infers
+#   pgComposite(Point, 12345'i32)     # explicit OID
+#
+# Reading rows:
+#   let p = row.getComposite[Point](0)
+#   let p = row.getCompositeOpt[Point](0)
+#   let p = row.getComposite[Point](0, fields)
+
+proc parseCompositeText*(s: string): seq[Option[string]] =
+  ## Parse PostgreSQL composite text format: (val1,val2,...)
+  ## Returns fields as Option[string] (none for NULL).
+  if s.len < 2 or s[0] != '(' or s[^1] != ')':
+    raise newException(PgTypeError, "Invalid composite literal: " & s)
+  let inner = s[1 ..^ 2]
+  if inner.len == 0:
+    return @[]
+  var i = 0
+  while i < inner.len:
+    if inner[i] == ',':
+      # Empty unquoted field at start or after comma = NULL
+      result.add(none(string))
+      i += 1
+      if i == inner.len:
+        result.add(none(string))
+    elif inner[i] == '"':
+      # Quoted field
+      i += 1
+      var elem = ""
+      while i < inner.len:
+        if inner[i] == '\\' and i + 1 < inner.len:
+          i += 1
+          elem.add(inner[i])
+        elif inner[i] == '"':
+          if i + 1 < inner.len and inner[i + 1] == '"':
+            # Doubled quote
+            elem.add('"')
+            i += 1
+          else:
+            break
+        else:
+          elem.add(inner[i])
+        i += 1
+      i += 1 # skip closing quote
+      result.add(some(elem))
+      if i < inner.len and inner[i] == ',':
+        i += 1
+        if i == inner.len:
+          result.add(none(string))
+    else:
+      # Unquoted field
+      var elem = ""
+      while i < inner.len and inner[i] != ',':
+        elem.add(inner[i])
+        i += 1
+      result.add(some(elem))
+      if i < inner.len and inner[i] == ',':
+        i += 1
+        if i == inner.len:
+          result.add(none(string))
+
+proc encodeBinaryComposite*(
+    fields: seq[tuple[oid: int32, data: Option[seq[byte]]]]
+): seq[byte] =
+  ## Encode a PostgreSQL binary composite value.
+  ## Format: numFields(4) + [oid(4) + len(4) + data]...
+  var size = 4
+  for f in fields:
+    size += 8 # oid + len
+    if f.data.isSome:
+      size += f.data.get.len
+  result = newSeq[byte](size)
+  let nf = toBE32(int32(fields.len))
+  copyMem(addr result[0], unsafeAddr nf[0], 4)
+  var pos = 4
+  for f in fields:
+    let oid = toBE32(f.oid)
+    copyMem(addr result[pos], unsafeAddr oid[0], 4)
+    pos += 4
+    if f.data.isNone:
+      let nl = toBE32(-1'i32)
+      copyMem(addr result[pos], unsafeAddr nl[0], 4)
+      pos += 4
+    else:
+      let data = f.data.get
+      let dl = toBE32(int32(data.len))
+      copyMem(addr result[pos], unsafeAddr dl[0], 4)
+      pos += 4
+      if data.len > 0:
+        copyMem(addr result[pos], unsafeAddr data[0], data.len)
+        pos += data.len
+
+proc decodeBinaryComposite*(
+    data: openArray[byte]
+): seq[tuple[oid: int32, off: int, len: int]] =
+  ## Decode a PostgreSQL binary composite value.
+  ## Returns (typeOid, offset, length) tuples. offset is relative to `data`.
+  ## length of -1 indicates NULL.
+  if data.len < 4:
+    raise newException(PgTypeError, "Binary composite too short")
+  let numFields = int(fromBE32(data.toOpenArray(0, 3)))
+  result = newSeq[tuple[oid: int32, off: int, len: int]](numFields)
+  var pos = 4
+  for i in 0 ..< numFields:
+    if pos + 8 > data.len:
+      raise newException(PgTypeError, "Binary composite truncated at field " & $i)
+    result[i].oid = fromBE32(data.toOpenArray(pos, pos + 3))
+    pos += 4
+    let flen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    if flen == -1:
+      result[i].off = 0
+      result[i].len = -1
+    else:
+      result[i].off = pos
+      result[i].len = flen
+      pos += flen
+
+proc compositeFieldToText(val: string): string =
+  ## Escape a composite field value for text format output.
+  var needsQuote = val.len == 0
+  for c in val:
+    if c in {',', '(', ')', '"', '\\', ' '}:
+      needsQuote = true
+      break
+  if not needsQuote:
+    return val
+  result = "\""
+  for c in val:
+    if c == '"':
+      result.add("\"\"")
+    elif c == '\\':
+      result.add("\\\\")
+    else:
+      result.add(c)
+  result.add('"')
+
+proc encodeCompositeText*(fields: seq[Option[string]]): string =
+  ## Encode fields as PostgreSQL composite text format: (val1,val2,...)
+  result = "("
+  for i, f in fields:
+    if i > 0:
+      result.add(',')
+    if f.isSome:
+      result.add(compositeFieldToText(f.get))
+  result.add(')')
+
+macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
+  ## Generate ``toPgParam`` for a Nim object as a PostgreSQL composite type.
+  ## Each field is sent as text inside the composite text format.
+  ## When OID is 0 (default), PostgreSQL infers the type from context.
+  let tImpl = T.getType[1]
+  let tSym = tImpl
+  result = newStmtList()
+  result.add quote do:
+    proc toPgParam*(v: `tSym`): PgParam =
+      var fields: seq[Option[string]]
+      for _, val in v.fieldPairs:
+        when typeof(val) is Option:
+          if val.isSome:
+            fields.add(some($val.get))
+          else:
+            fields.add(none(string))
+        else:
+          fields.add(some($val))
+      PgParam(
+        oid: `oid`, format: 0'i16, value: some(toBytes(encodeCompositeText(fields)))
+      )
+
+proc compositeFieldFromText[T](s: string): T =
+  ## Parse a single composite text field to the target type.
+  when T is string:
+    s
+  elif T is int32:
+    int32(parseInt(s))
+  elif T is int16:
+    int16(parseInt(s))
+  elif T is int64:
+    parseBiggestInt(s)
+  elif T is int:
+    parseInt(s)
+  elif T is float64:
+    parseFloat(s)
+  elif T is float32:
+    float32(parseFloat(s))
+  elif T is bool:
+    case s
+    of "t", "true", "1":
+      true
+    of "f", "false", "0":
+      false
+    else:
+      raise newException(PgTypeError, "Invalid boolean in composite: " & s)
+  elif T is PgNumeric:
+    PgNumeric(s)
+  else:
+    raise newException(PgTypeError, "Unsupported composite field type")
+
+proc getComposite*[T: object](row: Row, col: int): T =
+  ## Read a PostgreSQL composite column (text format) as a Nim object.
+  if row.isNull(col):
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let s = row.getStr(col)
+  let parts = parseCompositeText(s)
+  var idx = 0
+  for _, val in result.fieldPairs:
+    if idx >= parts.len:
+      raise newException(PgTypeError, "Composite has fewer fields than object")
+    when typeof(val) is Option:
+      if parts[idx].isNone:
+        val = none(typeof(val.get))
+      else:
+        val = some(compositeFieldFromText[typeof(val.get)](parts[idx].get))
+    else:
+      if parts[idx].isNone:
+        raise newException(PgTypeError, "NULL field in composite at index " & $idx)
+      val = compositeFieldFromText[typeof(val)](parts[idx].get)
+    idx += 1
+
+proc getCompositeOpt*[T: object](row: Row, col: int): Option[T] =
+  ## NULL-safe version of ``getComposite``.
+  if row.isNull(col):
+    none(T)
+  else:
+    some(getComposite[T](row, col))
+
+template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
+  when typeof(val) is string:
+    val = newString(fLen)
+    if fLen > 0:
+      copyMem(addr val[0], unsafeAddr buf[fOff], fLen)
+  elif typeof(val) is int16:
+    val = fromBE16(buf.toOpenArray(fOff, fEnd))
+  elif typeof(val) is int32:
+    val = fromBE32(buf.toOpenArray(fOff, fEnd))
+  elif typeof(val) is (int64 or int):
+    val = typeof(val)(fromBE64(buf.toOpenArray(fOff, fEnd)))
+  elif typeof(val) is float64:
+    val = cast[float64](cast[uint64](fromBE64(buf.toOpenArray(fOff, fEnd))))
+  elif typeof(val) is float32:
+    val = cast[float32](cast[uint32](fromBE32(buf.toOpenArray(fOff, fEnd))))
+  elif typeof(val) is bool:
+    val = buf[fOff] != 0
+  else:
+    var s = newString(fLen)
+    if fLen > 0:
+      copyMem(addr s[0], unsafeAddr buf[fOff], fLen)
+    val = compositeFieldFromText[typeof(val)](s)
+
+proc getComposite*[T: object](row: Row, col: int, fields: seq[FieldDescription]): T =
+  ## Read a PostgreSQL composite column with format-awareness.
+  if fields[col].formatCode == 0:
+    return getComposite[T](row, col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryComposite(row.data.buf.toOpenArray(off, off + clen - 1))
+  var idx = 0
+  for _, val in result.fieldPairs:
+    if idx >= decoded.len:
+      raise newException(PgTypeError, "Binary composite has fewer fields than object")
+    let f = decoded[idx]
+    let fOff = off + f.off
+    let fEnd = fOff + f.len - 1
+    when typeof(val) is Option:
+      if f.len == -1:
+        val = none(typeof(val.get))
+      else:
+        var inner: typeof(val.get)
+        decodeBinaryField(inner, row.data.buf, fOff, fEnd, f.len)
+        val = some(inner)
+    else:
+      if f.len == -1:
+        raise
+          newException(PgTypeError, "NULL field in binary composite at index " & $idx)
+      decodeBinaryField(val, row.data.buf, fOff, fEnd, f.len)
+    idx += 1
+
+proc getCompositeOpt*[T: object](
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[T] =
+  ## NULL-safe version of ``getComposite`` with format-awareness.
+  if row.isNull(col):
+    none(T)
+  else:
+    some(getComposite[T](row, col, fields))

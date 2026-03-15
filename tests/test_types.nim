@@ -8,6 +8,17 @@ proc toString(data: seq[byte]): string =
   for i in 0 ..< data.len:
     result[i] = char(data[i])
 
+proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+  FieldDescription(
+    name: "test",
+    tableOid: 0,
+    columnAttrNum: 0,
+    typeOid: typeOid,
+    typeSize: 0,
+    typeMod: 0,
+    formatCode: formatCode,
+  )
+
 suite "OID constants":
   test "standard OID values":
     check OidBool == 16'i32
@@ -470,17 +481,6 @@ suite "Binary encode/decode helpers":
     check p.value.isNone
 
 suite "Format-aware binary accessors":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "getInt binary":
     let data = @[0'u8, 0, 0, 42]
     let row = @[some(data)]
@@ -730,17 +730,6 @@ suite "JSON support":
     check row.getJsonOpt(0) == none(JsonNode)
 
   test "getJson binary jsonb":
-    proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-      FieldDescription(
-        name: "test",
-        tableOid: 0,
-        columnAttrNum: 0,
-        typeOid: typeOid,
-        typeSize: 0,
-        typeMod: 0,
-        formatCode: formatCode,
-      )
-
     let jsonStr = """{"key":"val"}"""
     var data = newSeq[byte](1 + jsonStr.len)
     data[0] = 1
@@ -752,34 +741,12 @@ suite "JSON support":
     check j["key"].getStr == "val"
 
   test "getJson binary json (no version byte)":
-    proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-      FieldDescription(
-        name: "test",
-        tableOid: 0,
-        columnAttrNum: 0,
-        typeOid: typeOid,
-        typeSize: 0,
-        typeMod: 0,
-        formatCode: formatCode,
-      )
-
     let row: Row = @[some(toBytes("""{"a":1}"""))]
     let fields = @[mkField(OidJson, 1)]
     let j = row.getJson(0, fields)
     check j["a"].getInt == 1
 
   test "getJson binary text fallback":
-    proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-      FieldDescription(
-        name: "test",
-        tableOid: 0,
-        columnAttrNum: 0,
-        typeOid: typeOid,
-        typeSize: 0,
-        typeMod: 0,
-        formatCode: formatCode,
-      )
-
     let row: Row = @[some(toBytes("""[1,2]"""))]
     let fields = @[mkField(OidJsonb, 0)]
     let j = row.getJson(0, fields)
@@ -832,17 +799,6 @@ suite "JSON support":
     check decoded["nested"]["a"].getBool == true
 
   test "roundtrip binary":
-    proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-      FieldDescription(
-        name: "test",
-        tableOid: 0,
-        columnAttrNum: 0,
-        typeOid: typeOid,
-        typeSize: 0,
-        typeMod: 0,
-        formatCode: formatCode,
-      )
-
     let orig = %*{"x": 42, "arr": [1, "two", nil], "flag": false}
     let p = toPgBinaryParam(orig)
     let row: Row = @[p.value]
@@ -854,17 +810,6 @@ suite "JSON support":
     check decoded["flag"].getBool == false
 
   test "getJson binary NULL raises":
-    proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-      FieldDescription(
-        name: "test",
-        tableOid: 0,
-        columnAttrNum: 0,
-        typeOid: typeOid,
-        typeSize: 0,
-        typeMod: 0,
-        formatCode: formatCode,
-      )
-
     let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidJsonb, 1)]
     var raised = false
@@ -899,17 +844,6 @@ suite "JSON support":
     check j["jp"].getStr == "日本語"
 
   test "roundtrip unicode binary":
-    proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-      FieldDescription(
-        name: "test",
-        tableOid: 0,
-        columnAttrNum: 0,
-        typeOid: typeOid,
-        typeSize: 0,
-        typeMod: 0,
-        formatCode: formatCode,
-      )
-
     let orig = %*{"text": "日本語テスト"}
     let p = toPgBinaryParam(orig)
     let row: Row = @[p.value]
@@ -1200,17 +1134,6 @@ suite "Array Opt accessors":
     check row.getInt16ArrayOpt(0) == none(seq[int16])
 
 suite "Binary array encode/decode roundtrip":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "encodeBinaryArray + decodeBinaryArray roundtrip int32":
     let encoded = encodeBinaryArray(
       OidInt4, @[@(toBE32(1'i32)), @(toBE32(2'i32)), @(toBE32(3'i32))]
@@ -1339,17 +1262,6 @@ suite "Binary array encode/decode roundtrip":
       300'i32
 
 suite "PgNumeric":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "toPgParam PgNumeric":
     let p = toPgParam(PgNumeric("123.456"))
     check p.oid == OidNumeric
@@ -1676,17 +1588,6 @@ suite "PgNumeric":
     check p.value.isNone
 
 suite "PgInterval":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "$ zero interval":
     let v = PgInterval(months: 0, days: 0, microseconds: 0)
     check $v == "00:00:00"
@@ -2050,17 +1951,6 @@ suite "coerceBinaryParam":
     check raised
 
 suite "PgInet":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "$ IPv4":
     let v = PgInet(address: parseIpAddress("192.168.1.1"), mask: 24)
     check $v == "192.168.1.1/24"
@@ -2210,17 +2100,6 @@ suite "PgInet":
     check decoded == orig
 
 suite "PgCidr":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "$ PgCidr":
     let v = PgCidr(address: parseIpAddress("192.168.1.0"), mask: 24)
     check $v == "192.168.1.0/24"
@@ -2273,17 +2152,6 @@ suite "PgCidr":
     check decoded == orig
 
 suite "PgMacAddr":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "$ PgMacAddr":
     let v = PgMacAddr("08:00:2b:01:02:03")
     check $v == "08:00:2b:01:02:03"
@@ -2357,17 +2225,6 @@ suite "PgMacAddr":
     check decoded == orig
 
 suite "PgMacAddr8":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "$ PgMacAddr8":
     let v = PgMacAddr8("08:00:2b:01:02:03:04:05")
     check $v == "08:00:2b:01:02:03:04:05"
@@ -2444,17 +2301,6 @@ pgEnum(Mood)
 pgEnum(Color, 99999)
 
 suite "User-defined enum":
-  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
-    FieldDescription(
-      name: "test",
-      tableOid: 0,
-      columnAttrNum: 0,
-      typeOid: typeOid,
-      typeSize: 0,
-      typeMod: 0,
-      formatCode: formatCode,
-    )
-
   test "pgEnum generates toPgParam with OID 0":
     let p = toPgParam(happy)
     check p.oid == 0'i32
@@ -2559,3 +2405,325 @@ suite "User-defined enum":
     let row: Row = @[p.value]
     let fields = @[mkField(99999'i32, 1'i16)]
     check getEnum[Mood](row, 0, fields) == orig
+
+# Composite type tests
+
+type
+  PgPoint = object
+    x: float64
+    y: float64
+
+  PersonRecord = object
+    name: string
+    age: int32
+    score: float64
+
+  NullableRecord = object
+    name: string
+    age: Option[int32]
+    note: Option[string]
+
+pgComposite(PgPoint)
+pgComposite(PersonRecord, 50000'i32)
+pgComposite(NullableRecord)
+
+suite "Composite text parser":
+  test "parseCompositeText simple":
+    let parts = parseCompositeText("(1,2,3)")
+    check parts.len == 3
+    check parts[0] == some("1")
+    check parts[1] == some("2")
+    check parts[2] == some("3")
+
+  test "parseCompositeText with NULL":
+    let parts = parseCompositeText("(hello,,world)")
+    check parts.len == 3
+    check parts[0] == some("hello")
+    check parts[1] == none(string)
+    check parts[2] == some("world")
+
+  test "parseCompositeText quoted":
+    let parts = parseCompositeText("(\"hello, world\",42)")
+    check parts.len == 2
+    check parts[0] == some("hello, world")
+    check parts[1] == some("42")
+
+  test "parseCompositeText quoted with escaped quote":
+    let parts = parseCompositeText("(\"say \"\"hi\"\"\",done)")
+    check parts.len == 2
+    check parts[0] == some("say \"hi\"")
+    check parts[1] == some("done")
+
+  test "parseCompositeText empty string quoted":
+    let parts = parseCompositeText("(\"\",42)")
+    check parts.len == 2
+    check parts[0] == some("")
+    check parts[1] == some("42")
+
+  test "parseCompositeText empty":
+    let parts = parseCompositeText("()")
+    check parts.len == 0
+
+  test "parseCompositeText single NULL":
+    let parts = parseCompositeText("(,)")
+    check parts.len == 2
+    check parts[0] == none(string)
+    check parts[1] == none(string)
+
+  test "parseCompositeText invalid raises":
+    var raised = false
+    try:
+      discard parseCompositeText("not a composite")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "encodeCompositeText simple":
+    let s = encodeCompositeText(@[some("1"), some("2")])
+    check s == "(1,2)"
+
+  test "encodeCompositeText with NULL":
+    let s = encodeCompositeText(@[some("hello"), none(string), some("world")])
+    check s == "(hello,,world)"
+
+  test "encodeCompositeText quoting":
+    let s = encodeCompositeText(@[some("hello, world"), some("42")])
+    check s == "(\"hello, world\",42)"
+
+  test "encodeCompositeText empty string quoted":
+    let s = encodeCompositeText(@[some(""), some("42")])
+    check s == "(\"\",42)"
+
+  test "roundtrip text encode/parse":
+    let fields = @[some("hello world"), some("42"), none(string), some("with,comma")]
+    let encoded = encodeCompositeText(fields)
+    let decoded = parseCompositeText(encoded)
+    check decoded.len == 4
+    check decoded[0] == some("hello world")
+    check decoded[1] == some("42")
+    check decoded[2] == none(string)
+    check decoded[3] == some("with,comma")
+
+suite "Composite binary encoder/decoder":
+  test "encodeBinaryComposite":
+    let fields = @[
+      (oid: OidInt4, data: some(@(toBE32(42'i32)))),
+      (oid: OidText, data: some(toBytes("hello"))),
+    ]
+    let data = encodeBinaryComposite(fields)
+    # numFields = 2
+    check fromBE32(data[0 .. 3]) == 2'i32
+    # field 0: oid=OidInt4, len=4, value=42
+    check fromBE32(data[4 .. 7]) == OidInt4
+    check fromBE32(data[8 .. 11]) == 4'i32
+    check fromBE32(data[12 .. 15]) == 42'i32
+    # field 1: oid=OidText, len=5, value="hello"
+    check fromBE32(data[16 .. 19]) == OidText
+    check fromBE32(data[20 .. 23]) == 5'i32
+    check toString(data[24 .. 28]) == "hello"
+
+  test "encodeBinaryComposite with NULL":
+    let fields = @[
+      (oid: OidInt4, data: some(@(toBE32(1'i32)))),
+      (oid: OidText, data: none(seq[byte])),
+    ]
+    let data = encodeBinaryComposite(fields)
+    check fromBE32(data[0 .. 3]) == 2'i32
+    # field 1: NULL (len = -1)
+    check fromBE32(data[16 .. 19]) == OidText
+    check fromBE32(data[20 .. 23]) == -1'i32
+
+  test "decodeBinaryComposite":
+    let fields = @[
+      (oid: OidInt4, data: some(@(toBE32(99'i32)))),
+      (oid: OidText, data: some(toBytes("abc"))),
+    ]
+    let data = encodeBinaryComposite(fields)
+    let decoded = decodeBinaryComposite(data)
+    check decoded.len == 2
+    check decoded[0].oid == OidInt4
+    check decoded[0].len == 4
+    check fromBE32(data[decoded[0].off .. decoded[0].off + 3]) == 99'i32
+    check decoded[1].oid == OidText
+    check decoded[1].len == 3
+
+  test "decodeBinaryComposite with NULL":
+    let fields = @[(oid: OidInt4, data: none(seq[byte]))]
+    let data = encodeBinaryComposite(fields)
+    let decoded = decodeBinaryComposite(data)
+    check decoded.len == 1
+    check decoded[0].oid == OidInt4
+    check decoded[0].len == -1
+
+  test "decodeBinaryComposite empty":
+    let data = encodeBinaryComposite(@[])
+    let decoded = decodeBinaryComposite(data)
+    check decoded.len == 0
+
+suite "User-defined composite":
+  test "pgComposite generates toPgParam with OID 0":
+    let p = toPgParam(PgPoint(x: 1.5, y: 2.5))
+    check p.oid == 0'i32
+    check p.format == 0'i16
+    check p.value.isSome
+    check toString(p.value.get) == "(1.5,2.5)"
+
+  test "pgComposite with explicit OID":
+    let p = toPgParam(PersonRecord(name: "Alice", age: 30, score: 95.5))
+    check p.oid == 50000'i32
+    check p.format == 0'i16
+    check p.value.isSome
+    check toString(p.value.get) == "(Alice,30,95.5)"
+
+  test "getComposite text format":
+    let row: Row = @[some(toBytes("(3.14,2.72)"))]
+    let pt = getComposite[PgPoint](row, 0)
+    check abs(pt.x - 3.14) < 1e-10
+    check abs(pt.y - 2.72) < 1e-10
+
+  test "getComposite text format with string":
+    let row: Row = @[some(toBytes("(Bob,25,88.5)"))]
+    let p = getComposite[PersonRecord](row, 0)
+    check p.name == "Bob"
+    check p.age == 25
+    check abs(p.score - 88.5) < 1e-10
+
+  test "getComposite text format quoted string":
+    let row: Row = @[some(toBytes("(\"Alice, Jr.\",30,95.5)"))]
+    let p = getComposite[PersonRecord](row, 0)
+    check p.name == "Alice, Jr."
+    check p.age == 30
+
+  test "getComposite raises on NULL column":
+    let row: Row = @[none(seq[byte])]
+    var raised = false
+    try:
+      discard getComposite[PgPoint](row, 0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getCompositeOpt some":
+    let row: Row = @[some(toBytes("(1.0,2.0)"))]
+    let opt = getCompositeOpt[PgPoint](row, 0)
+    check opt.isSome
+    check abs(opt.get.x - 1.0) < 1e-10
+    check abs(opt.get.y - 2.0) < 1e-10
+
+  test "getCompositeOpt none":
+    let row: Row = @[none(seq[byte])]
+    check getCompositeOpt[PgPoint](row, 0) == none(PgPoint)
+
+  test "getComposite binary format":
+    # Build binary composite: 2 fields, both float8
+    let fields_data = @[
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](3.14'f64))))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](2.72'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let row: Row = @[some(data)]
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let pt = getComposite[PgPoint](row, 0, fields)
+    check abs(pt.x - 3.14) < 1e-10
+    check abs(pt.y - 2.72) < 1e-10
+
+  test "getComposite binary text fallback":
+    let row: Row = @[some(toBytes("(5.0,6.0)"))]
+    let fields = @[mkField(50000'i32, 0'i16)]
+    let pt = getComposite[PgPoint](row, 0, fields)
+    check abs(pt.x - 5.0) < 1e-10
+    check abs(pt.y - 6.0) < 1e-10
+
+  test "getCompositeOpt binary NULL":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(50000'i32, 1'i16)]
+    check getCompositeOpt[PgPoint](row, 0, fields) == none(PgPoint)
+
+  test "roundtrip text":
+    let orig = PgPoint(x: 1.5, y: -3.7)
+    let p = toPgParam(orig)
+    let row: Row = @[p.value]
+    let decoded = getComposite[PgPoint](row, 0)
+    check abs(decoded.x - orig.x) < 1e-10
+    check abs(decoded.y - orig.y) < 1e-10
+
+  test "roundtrip text PersonRecord":
+    let orig = PersonRecord(name: "Charlie", age: 42, score: 99.9)
+    let p = toPgParam(orig)
+    let row: Row = @[p.value]
+    let decoded = getComposite[PersonRecord](row, 0)
+    check decoded.name == orig.name
+    check decoded.age == orig.age
+    check abs(decoded.score - orig.score) < 1e-10
+
+  test "Option field toPgParam with values":
+    let r = NullableRecord(name: "Alice", age: some(30'i32), note: some("hi"))
+    let p = toPgParam(r)
+    check toString(p.value.get) == "(Alice,30,hi)"
+
+  test "Option field toPgParam with none":
+    let r = NullableRecord(name: "Bob", age: none(int32), note: none(string))
+    let p = toPgParam(r)
+    check toString(p.value.get) == "(Bob,,)"
+
+  test "getComposite text with Option fields some":
+    let row: Row = @[some(toBytes("(Carol,25,hello)"))]
+    let r = getComposite[NullableRecord](row, 0)
+    check r.name == "Carol"
+    check r.age == some(25'i32)
+    check r.note == some("hello")
+
+  test "getComposite text with Option fields none":
+    let row: Row = @[some(toBytes("(Dave,,)"))]
+    let r = getComposite[NullableRecord](row, 0)
+    check r.name == "Dave"
+    check r.age == none(int32)
+    check r.note == none(string)
+
+  test "getComposite binary with Option fields none":
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Eve"))),
+      (oid: OidInt4, data: none(seq[byte])),
+      (oid: OidText, data: none(seq[byte])),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let row: Row = @[some(data)]
+    let fields = @[mkField(0'i32, 1'i16)]
+    let r = getComposite[NullableRecord](row, 0, fields)
+    check r.name == "Eve"
+    check r.age == none(int32)
+    check r.note == none(string)
+
+  test "getComposite binary with Option fields some":
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Fay"))),
+      (oid: OidInt4, data: some(@(toBE32(99'i32)))),
+      (oid: OidText, data: some(toBytes("note"))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let row: Row = @[some(data)]
+    let fields = @[mkField(0'i32, 1'i16)]
+    let r = getComposite[NullableRecord](row, 0, fields)
+    check r.name == "Fay"
+    check r.age == some(99'i32)
+    check r.note == some("note")
+
+  test "Option field roundtrip":
+    let orig = NullableRecord(name: "Test", age: some(42'i32), note: none(string))
+    let p = toPgParam(orig)
+    let row: Row = @[p.value]
+    let decoded = getComposite[NullableRecord](row, 0)
+    check decoded.name == orig.name
+    check decoded.age == orig.age
+    check decoded.note == orig.note
+
+  test "Option[Composite] toPgParam some":
+    let p = toPgParam(some(PgPoint(x: 1.0, y: 2.0)))
+    check p.oid == 0'i32
+    check p.format == 0'i16
+    check p.value.isSome
+
+  test "Option[Composite] toPgParam none":
+    let p = toPgParam(none(PgPoint))
+    check p.oid == 0'i32
+    check p.value.isNone
