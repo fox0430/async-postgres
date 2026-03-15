@@ -156,6 +156,18 @@ const
     700, # float4
     701, # float8
     1043, # varchar
+    3904, # int4range
+    3906, # numrange
+    3908, # tsrange
+    3910, # tstzrange
+    3912, # daterange
+    3926, # int8range
+    4451, # int4multirange
+    4532, # nummultirange
+    4533, # tsmultirange
+    4534, # tstzmultirange
+    4535, # datemultirange
+    4536, # int8multirange
   ]
 
   pgCopyBinaryHeader*: array[19, byte] = [

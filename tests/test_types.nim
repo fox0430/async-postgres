@@ -2727,3 +2727,579 @@ suite "User-defined composite":
     let p = toPgParam(none(PgPoint))
     check p.oid == 0'i32
     check p.value.isNone
+
+suite "Range OID constants":
+  test "range OID values":
+    check OidInt4Range == 3904'i32
+    check OidNumRange == 3906'i32
+    check OidTsRange == 3908'i32
+    check OidTsTzRange == 3910'i32
+    check OidDateRange == 3912'i32
+    check OidInt8Range == 3926'i32
+
+  test "multirange OID values":
+    check OidInt4Multirange == 4451'i32
+    check OidNumMultirange == 4532'i32
+    check OidTsMultirange == 4533'i32
+    check OidTsTzMultirange == 4534'i32
+    check OidDateMultirange == 4535'i32
+    check OidInt8Multirange == 4536'i32
+
+suite "PgRange constructors and display":
+  test "emptyRange":
+    let r = emptyRange[int32]()
+    check r.isEmpty == true
+    check $r == "empty"
+
+  test "rangeOf default [lower,upper)":
+    let r = rangeOf(1'i32, 10'i32)
+    check r.isEmpty == false
+    check r.hasLower == true
+    check r.hasUpper == true
+    check r.lower.value == 1'i32
+    check r.lower.inclusive == true
+    check r.upper.value == 10'i32
+    check r.upper.inclusive == false
+    check $r == "[1,10)"
+
+  test "rangeOf (lower,upper]":
+    let r = rangeOf(1'i32, 10'i32, lowerInc = false, upperInc = true)
+    check $r == "(1,10]"
+
+  test "rangeOf [lower,upper]":
+    let r = rangeOf(1'i64, 10'i64, upperInc = true)
+    check $r == "[1,10]"
+
+  test "rangeFrom [lower,)":
+    let r = rangeFrom(5'i32)
+    check r.hasLower == true
+    check r.hasUpper == false
+    check $r == "[5,)"
+
+  test "rangeTo (,upper)":
+    let r = rangeTo(10'i32)
+    check r.hasLower == false
+    check r.hasUpper == true
+    check $r == "(,10)"
+
+  test "rangeTo (,upper]":
+    let r = rangeTo(10'i32, inclusive = true)
+    check $r == "(,10]"
+
+  test "unboundedRange (,)":
+    let r = unboundedRange[int32]()
+    check r.hasLower == false
+    check r.hasUpper == false
+    check $r == "(,)"
+
+  test "equality":
+    check rangeOf(1'i32, 5'i32) == rangeOf(1'i32, 5'i32)
+    check rangeOf(1'i32, 5'i32) != rangeOf(1'i32, 6'i32)
+    check emptyRange[int32]() == emptyRange[int32]()
+    check emptyRange[int32]() != rangeOf(1'i32, 5'i32)
+
+  test "quoting special characters":
+    let r = rangeOf(PgNumeric("1.5"), PgNumeric("2.5"))
+    check $r == "[1.5,2.5)"
+
+suite "Range text parsing":
+  test "parse empty":
+    let r = parseRangeText[int32](
+      "empty",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check r.isEmpty == true
+
+  test "parse [1,10)":
+    let r = parseRangeText[int32](
+      "[1,10)",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check r.hasLower == true
+    check r.hasUpper == true
+    check r.lower.value == 1'i32
+    check r.lower.inclusive == true
+    check r.upper.value == 10'i32
+    check r.upper.inclusive == false
+
+  test "parse (1,10]":
+    let r = parseRangeText[int32](
+      "(1,10]",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check r.lower.inclusive == false
+    check r.upper.inclusive == true
+
+  test "parse [5,)":
+    let r = parseRangeText[int32](
+      "[5,)",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check r.hasLower == true
+    check r.hasUpper == false
+    check r.lower.value == 5'i32
+
+  test "parse (,10]":
+    let r = parseRangeText[int32](
+      "(,10]",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check r.hasLower == false
+    check r.hasUpper == true
+    check r.upper.value == 10'i32
+    check r.upper.inclusive == true
+
+  test "parse (,)":
+    let r = parseRangeText[int32](
+      "(,)",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check r.hasLower == false
+    check r.hasUpper == false
+    check r.isEmpty == false
+
+  test "parse with quoted values":
+    let r = parseRangeText[string](
+      "[\"hello, world\",\"foo\")",
+      proc(s: string): string =
+        s,
+    )
+    check r.hasLower == true
+    check r.hasUpper == true
+    check r.lower.value == "hello, world"
+    check r.upper.value == "foo"
+
+  test "roundtrip encode/parse int32":
+    let orig = rangeOf(1'i32, 100'i32)
+    let parsed = parseRangeText[int32](
+      $orig,
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check parsed == orig
+
+  test "roundtrip encode/parse int64":
+    let orig = rangeOf(1'i64, 100'i64, upperInc = true)
+    let parsed = parseRangeText[int64](
+      $orig,
+      proc(s: string): int64 =
+        parseBiggestInt(s),
+    )
+    check parsed == orig
+
+suite "Range toPgParam":
+  test "int4range":
+    let p = toPgParam(rangeOf(1'i32, 10'i32))
+    check p.oid == OidInt4Range
+    check p.format == 0'i16
+    check p.value.get.toString == "[1,10)"
+
+  test "int8range":
+    let p = toPgParam(rangeOf(1'i64, 10'i64))
+    check p.oid == OidInt8Range
+    check p.value.get.toString == "[1,10)"
+
+  test "numrange":
+    let p = toPgParam(rangeOf(PgNumeric("1.5"), PgNumeric("9.5")))
+    check p.oid == OidNumRange
+    check p.value.get.toString == "[1.5,9.5)"
+
+  test "tsrange":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgParam(rangeOf(dt1, dt2))
+    check p.oid == OidTsRange
+
+  test "tstzrange":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgTsTzRangeParam(rangeOf(dt1, dt2))
+    check p.oid == OidTsTzRange
+
+  test "daterange":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgDateRangeParam(rangeOf(dt1, dt2))
+    check p.oid == OidDateRange
+    check p.value.get.toString == "[2023-01-01,2023-12-31)"
+
+  test "empty range":
+    let p = toPgParam(emptyRange[int32]())
+    check p.oid == OidInt4Range
+    check p.value.get.toString == "empty"
+
+  test "custom OID via toPgRangeParam":
+    let p = toPgRangeParam(rangeOf(1'i32, 10'i32), 99999'i32)
+    check p.oid == 99999'i32
+
+  test "Option[PgRange[int32]] some":
+    let p = toPgParam(some(rangeOf(1'i32, 10'i32)))
+    check p.oid == OidInt4Range
+    check p.value.isSome
+
+  test "Option[PgRange[int32]] none":
+    let p = toPgParam(none(PgRange[int32]))
+    check p.oid == OidInt4Range
+    check p.value.isNone
+
+suite "Range toPgBinaryParam":
+  test "empty int4range binary":
+    let p = toPgBinaryParam(emptyRange[int32]())
+    check p.oid == OidInt4Range
+    check p.format == 1'i16
+    let data = p.value.get
+    check data.len == 1
+    check data[0] == rangeEmpty
+
+  test "int4range binary [1,10)":
+    let p = toPgBinaryParam(rangeOf(1'i32, 10'i32))
+    check p.oid == OidInt4Range
+    check p.format == 1'i16
+    let data = p.value.get
+    # flags byte
+    check (data[0] and rangeHasLower) != 0
+    check (data[0] and rangeHasUpper) != 0
+    check (data[0] and rangeLowerInc) != 0
+    check (data[0] and rangeUpperInc) == 0
+    # lower: len(4) + int32(4)
+    check fromBE32(data.toOpenArray(1, 4)) == 4'i32 # length
+    check fromBE32(data.toOpenArray(5, 8)) == 1'i32 # value
+    # upper: len(4) + int32(4)
+    check fromBE32(data.toOpenArray(9, 12)) == 4'i32
+    check fromBE32(data.toOpenArray(13, 16)) == 10'i32
+
+  test "int8range binary":
+    let p = toPgBinaryParam(rangeOf(100'i64, 200'i64))
+    check p.oid == OidInt8Range
+    check p.format == 1'i16
+
+  test "unbounded lower int4range binary":
+    let p = toPgBinaryParam(rangeTo[int32](10'i32))
+    let data = p.value.get
+    check (data[0] and rangeHasLower) == 0
+    check (data[0] and rangeHasUpper) != 0
+
+  test "unbounded upper int4range binary":
+    let p = toPgBinaryParam(rangeFrom[int32](5'i32))
+    let data = p.value.get
+    check (data[0] and rangeHasLower) != 0
+    check (data[0] and rangeHasUpper) == 0
+
+suite "Range binary decoding (roundtrip)":
+  test "int4range roundtrip":
+    let orig = rangeOf(1'i32, 10'i32)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Range, 1'i16)]
+    let decoded = row.getInt4Range(0, fields)
+    check decoded == orig
+
+  test "int4range empty roundtrip":
+    let orig = emptyRange[int32]()
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Range, 1'i16)]
+    let decoded = row.getInt4Range(0, fields)
+    check decoded.isEmpty == true
+
+  test "int8range roundtrip":
+    let orig = rangeOf(100'i64, 999'i64, upperInc = true)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt8Range, 1'i16)]
+    let decoded = row.getInt8Range(0, fields)
+    check decoded == orig
+
+  test "int4range unbounded lower roundtrip":
+    let orig = rangeTo[int32](10'i32)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Range, 1'i16)]
+    let decoded = row.getInt4Range(0, fields)
+    check decoded == orig
+
+  test "int4range unbounded upper roundtrip":
+    let orig = rangeFrom[int32](5'i32)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Range, 1'i16)]
+    let decoded = row.getInt4Range(0, fields)
+    check decoded == orig
+
+  test "tsrange roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let orig = rangeOf(dt1, dt2)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidTsRange, 1'i16)]
+    let decoded = row.getTsRange(0, fields)
+    check decoded.hasLower == true
+    check decoded.hasUpper == true
+    check decoded.lower.inclusive == true
+    check decoded.upper.inclusive == false
+    check decoded.lower.value.year == 2023
+    check decoded.lower.value.month == mJan
+    check decoded.upper.value.year == 2023
+    check decoded.upper.value.month == mDec
+
+  test "daterange roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let orig = rangeOf(dt1, dt2)
+    let p = toPgBinaryDateRangeParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidDateRange, 1'i16)]
+    let decoded = row.getDateRange(0, fields)
+    check decoded.hasLower == true
+    check decoded.hasUpper == true
+    check decoded.lower.value.year == 2023
+    check decoded.lower.value.month == mJan
+    check decoded.lower.value.monthday == 1
+
+suite "Range row getters":
+  test "getInt4Range text":
+    let row: Row = @[some(toBytes("[1,10)"))]
+    check row.getInt4Range(0) == rangeOf(1'i32, 10'i32)
+
+  test "getInt4Range text empty":
+    let row: Row = @[some(toBytes("empty"))]
+    check row.getInt4Range(0).isEmpty == true
+
+  test "getInt8Range text":
+    let row: Row = @[some(toBytes("[100,200)"))]
+    check row.getInt8Range(0) == rangeOf(100'i64, 200'i64)
+
+  test "getNumRange text":
+    let row: Row = @[some(toBytes("[1.5,9.5)"))]
+    let r = row.getNumRange(0)
+    check r.lower.value == PgNumeric("1.5")
+    check r.upper.value == PgNumeric("9.5")
+
+  test "getDateRange text":
+    let row: Row = @[some(toBytes("[2023-01-01,2023-12-31)"))]
+    let r = row.getDateRange(0)
+    check r.hasLower == true
+    check r.hasUpper == true
+    check r.lower.value.year == 2023
+    check r.lower.value.month == mJan
+    check r.upper.value.year == 2023
+    check r.upper.value.month == mDec
+
+  test "getTsRange text":
+    let row: Row = @[some(toBytes("[2023-01-01 00:00:00,2023-12-31 23:59:59)"))]
+    let r = row.getTsRange(0)
+    check r.hasLower == true
+    check r.lower.value.year == 2023
+
+  test "getInt4Range format-aware text fallback":
+    let row: Row = @[some(toBytes("[1,10)"))]
+    let fields = @[mkField(OidInt4Range, 0'i16)]
+    check row.getInt4Range(0, fields) == rangeOf(1'i32, 10'i32)
+
+  test "getInt4RangeOpt text some":
+    let row: Row = @[some(toBytes("[1,10)"))]
+    let r = row.getInt4RangeOpt(0)
+    check r.isSome
+    check r.get == rangeOf(1'i32, 10'i32)
+
+  test "getInt4RangeOpt text none":
+    let row: Row = @[none(seq[byte])]
+    check row.getInt4RangeOpt(0).isNone
+
+  test "getInt4RangeOpt format-aware some":
+    let p = toPgBinaryParam(rangeOf(1'i32, 10'i32))
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Range, 1'i16)]
+    let r = row.getInt4RangeOpt(0, fields)
+    check r.isSome
+    check r.get == rangeOf(1'i32, 10'i32)
+
+  test "getInt4RangeOpt format-aware none":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidInt4Range, 1'i16)]
+    check row.getInt4RangeOpt(0, fields).isNone
+
+suite "PgMultirange":
+  test "constructor and display":
+    let mr = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+    check mr.len == 2
+    check mr[0] == rangeOf(1'i32, 3'i32)
+    check mr[1] == rangeOf(5'i32, 8'i32)
+    check $mr == "{[1,3),[5,8)}"
+
+  test "empty multirange":
+    let mr = toMultirange[int32]()
+    check mr.len == 0
+    check $mr == "{}"
+
+  test "equality":
+    let a = toMultirange(rangeOf(1'i32, 3'i32))
+    let b = toMultirange(rangeOf(1'i32, 3'i32))
+    let c = toMultirange(rangeOf(1'i32, 5'i32))
+    check a == b
+    check a != c
+
+  test "items iterator":
+    let mr = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+    var count = 0
+    for r in mr:
+      count += 1
+    check count == 2
+
+  test "toPgParam int4multirange":
+    let mr = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+    let p = toPgParam(mr)
+    check p.oid == OidInt4Multirange
+    check p.format == 0'i16
+    check p.value.get.toString == "{[1,3),[5,8)}"
+
+  test "toPgParam int8multirange":
+    let mr = toMultirange(rangeOf(1'i64, 3'i64))
+    let p = toPgParam(mr)
+    check p.oid == OidInt8Multirange
+
+  test "toPgParam nummultirange":
+    let mr = toMultirange(rangeOf(PgNumeric("1.0"), PgNumeric("5.0")))
+    let p = toPgParam(mr)
+    check p.oid == OidNumMultirange
+
+  test "toPgParam empty multirange":
+    let mr = toMultirange[int32]()
+    let p = toPgParam(mr)
+    check p.oid == OidInt4Multirange
+    check p.value.get.toString == "{}"
+
+suite "Multirange text parsing":
+  test "parse int4multirange":
+    let mr = parseMultirangeText[int32](
+      "{[1,3),[5,8)}",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check mr.len == 2
+    check mr[0] == rangeOf(1'i32, 3'i32)
+    check mr[1] == rangeOf(5'i32, 8'i32)
+
+  test "parse empty multirange":
+    let mr = parseMultirangeText[int32](
+      "{}",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check mr.len == 0
+
+  test "parse single range multirange":
+    let mr = parseMultirangeText[int32](
+      "{[1,10)}",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check mr.len == 1
+    check mr[0] == rangeOf(1'i32, 10'i32)
+
+  test "roundtrip int4multirange":
+    let orig = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+    let parsed = parseMultirangeText[int32](
+      $orig,
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check parsed == orig
+
+suite "Multirange row getters":
+  test "getInt4Multirange text":
+    let row: Row = @[some(toBytes("{[1,3),[5,8)}"))]
+    let mr = row.getInt4Multirange(0)
+    check mr.len == 2
+    check mr[0] == rangeOf(1'i32, 3'i32)
+    check mr[1] == rangeOf(5'i32, 8'i32)
+
+  test "getInt4Multirange text empty":
+    let row: Row = @[some(toBytes("{}"))]
+    let mr = row.getInt4Multirange(0)
+    check mr.len == 0
+
+  test "getInt8Multirange text":
+    let row: Row = @[some(toBytes("{[100,200)}"))]
+    let mr = row.getInt8Multirange(0)
+    check mr.len == 1
+    check mr[0] == rangeOf(100'i64, 200'i64)
+
+  test "getInt4MultirangeOpt text some":
+    let row: Row = @[some(toBytes("{[1,3)}"))]
+    let r = row.getInt4MultirangeOpt(0)
+    check r.isSome
+    check r.get.len == 1
+
+  test "getInt4MultirangeOpt text none":
+    let row: Row = @[none(seq[byte])]
+    check row.getInt4MultirangeOpt(0).isNone
+
+suite "Multirange binary roundtrip":
+  test "int4multirange roundtrip":
+    let orig = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+    let p = toPgBinaryParam(orig)
+    check p.oid == OidInt4Multirange
+    check p.format == 1'i16
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Multirange, 1'i16)]
+    let decoded = row.getInt4Multirange(0, fields)
+    check decoded == orig
+
+  test "int8multirange roundtrip":
+    let orig = toMultirange(rangeOf(100'i64, 200'i64), rangeOf(300'i64, 400'i64))
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt8Multirange, 1'i16)]
+    let decoded = row.getInt8Multirange(0, fields)
+    check decoded == orig
+
+  test "empty int4multirange roundtrip":
+    let orig = toMultirange[int32]()
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Multirange, 1'i16)]
+    let decoded = row.getInt4Multirange(0, fields)
+    check decoded.len == 0
+
+  test "int4multirange format-aware text fallback":
+    let row: Row = @[some(toBytes("{[1,3),[5,8)}"))]
+    let fields = @[mkField(OidInt4Multirange, 0'i16)]
+    let mr = row.getInt4Multirange(0, fields)
+    check mr.len == 2
+    check mr[0] == rangeOf(1'i32, 3'i32)
+
+  test "tsrange multirange roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let dt3 = dateTime(2023, mJul, 1, zone = utc())
+    let dt4 = dateTime(2023, mDec, 31, zone = utc())
+    let orig = toMultirange(rangeOf(dt1, dt2), rangeOf(dt3, dt4))
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidTsMultirange, 1'i16)]
+    let decoded = row.getTsMultirange(0, fields)
+    check decoded.len == 2
+    check decoded[0].lower.value.year == 2023
+    check decoded[0].lower.value.month == mJan
+
+  test "getInt4MultirangeOpt format-aware some":
+    let orig = toMultirange(rangeOf(1'i32, 3'i32))
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidInt4Multirange, 1'i16)]
+    let r = row.getInt4MultirangeOpt(0, fields)
+    check r.isSome
+    check r.get == orig
+
+  test "getInt4MultirangeOpt format-aware none":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidInt4Multirange, 1'i16)]
+    check row.getInt4MultirangeOpt(0, fields).isNone
