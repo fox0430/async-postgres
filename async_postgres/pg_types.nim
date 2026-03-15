@@ -3,6 +3,8 @@ import std/[json, macros, options, strutils, tables, times, net]
 import pg_protocol
 
 type
+  PgTypeError* = object of CatchableError
+
   PgUuid* = distinct string
 
   PgNumeric* = distinct string
@@ -26,10 +28,47 @@ type
 
   PgMacAddr8* = distinct string ## EUI-64 MAC address as "08:00:2b:01:02:03:04:05"
 
+  PgRangeBound*[T] = object
+    value*: T
+    inclusive*: bool
+
+  PgRange*[T] = object
+    isEmpty*: bool
+    hasLower*: bool
+    hasUpper*: bool
+    lower*: PgRangeBound[T]
+    upper*: PgRangeBound[T]
+
+  PgMultirange*[T] = distinct seq[PgRange[T]]
+
   PgParam* = object
     oid*: int32
     format*: int16 # 0=text, 1=binary
     value*: Option[seq[byte]]
+
+  RangeBinaryInput =
+    tuple[
+      isEmpty: bool,
+      hasLower: bool,
+      hasUpper: bool,
+      lowerInc: bool,
+      upperInc: bool,
+      lowerData: seq[byte],
+      upperData: seq[byte],
+    ]
+
+  RangeBinaryRaw =
+    tuple[
+      isEmpty: bool,
+      hasLower: bool,
+      hasUpper: bool,
+      lowerInc: bool,
+      upperInc: bool,
+      lowerOff: int,
+      lowerLen: int,
+      upperOff: int,
+      upperLen: int,
+    ]
 
 const
   OidBool* = 16'i32
@@ -67,6 +106,28 @@ const
   pgEpochDaysOffset* = 10957'i32 ## Days from 1970-01-01 to 2000-01-01
 
   OidRecord* = 2249'i32
+
+  # Range types
+  OidInt4Range* = 3904'i32
+  OidNumRange* = 3906'i32
+  OidTsRange* = 3908'i32
+  OidTsTzRange* = 3910'i32
+  OidDateRange* = 3912'i32
+  OidInt8Range* = 3926'i32
+
+  # Multirange types (PostgreSQL 14+)
+  OidInt4Multirange* = 4451'i32
+  OidNumMultirange* = 4532'i32
+  OidTsMultirange* = 4533'i32
+  OidTsTzMultirange* = 4534'i32
+  OidDateMultirange* = 4535'i32
+  OidInt8Multirange* = 4536'i32
+
+  rangeEmpty* = 0x01'u8
+  rangeHasLower* = 0x02'u8
+  rangeHasUpper* = 0x04'u8
+  rangeLowerInc* = 0x08'u8
+  rangeUpperInc* = 0x10'u8
 
 proc `$`*(v: PgNumeric): string {.borrow.}
 proc `==`*(a, b: PgNumeric): bool {.borrow.}
@@ -506,8 +567,6 @@ proc fromPgText*(data: seq[byte], oid: int32): string =
   result = newString(data.len)
   for i in 0 ..< data.len:
     result[i] = char(data[i])
-
-type PgTypeError* = object of CatchableError
 
 # Row/RowData types are defined in pg_protocol and re-exported here.
 
@@ -2073,3 +2132,1073 @@ proc getCompositeOpt*[T: object](
     none(T)
   else:
     some(getComposite[T](row, col, fields))
+
+# Range type support
+#
+# PostgreSQL range types represent a range of values of some element type.
+# Text format:  [lower,upper)  (lower,upper]  empty  [lower,)  (,upper]
+# Binary format: flags(1) + [len(4) + lower] + [len(4) + upper]
+#   flags: 0x01=empty, 0x02=has_lower, 0x04=has_upper, 0x08=lower_inc, 0x10=upper_inc
+#
+# Built-in range types: int4range, int8range, numrange, tsrange, tstzrange, daterange
+#
+# Usage:
+#   let r = rangeOf(1'i32, 10'i32)           # [1,10)
+#   let r = rangeOf(1'i32, 10'i32, upperInc=true)  # [1,10]
+#   let r = emptyRange[int32]()               # empty
+#   let r = rangeFrom(5'i64)                  # [5,)
+#
+# Reading rows:
+#   let r = row.getInt4Range(0)
+#   let r = row.getInt4Range(0, fields)       # binary-format aware
+#   let r = row.getInt4RangeOpt(0)
+
+proc emptyRange*[T](): PgRange[T] =
+  PgRange[T](isEmpty: true)
+
+proc rangeOf*[T](lower, upper: T, lowerInc = true, upperInc = false): PgRange[T] =
+  PgRange[T](
+    hasLower: true,
+    hasUpper: true,
+    lower: PgRangeBound[T](value: lower, inclusive: lowerInc),
+    upper: PgRangeBound[T](value: upper, inclusive: upperInc),
+  )
+
+proc rangeFrom*[T](lower: T, inclusive = true): PgRange[T] =
+  PgRange[T](hasLower: true, lower: PgRangeBound[T](value: lower, inclusive: inclusive))
+
+proc rangeTo*[T](upper: T, inclusive = false): PgRange[T] =
+  PgRange[T](hasUpper: true, upper: PgRangeBound[T](value: upper, inclusive: inclusive))
+
+proc unboundedRange*[T](): PgRange[T] =
+  PgRange[T]()
+
+proc `==`*[T](a, b: PgRange[T]): bool =
+  if a.isEmpty != b.isEmpty:
+    return false
+  if a.isEmpty:
+    return true
+  if a.hasLower != b.hasLower or a.hasUpper != b.hasUpper:
+    return false
+  if a.hasLower:
+    if a.lower.value != b.lower.value or a.lower.inclusive != b.lower.inclusive:
+      return false
+  if a.hasUpper:
+    if a.upper.value != b.upper.value or a.upper.inclusive != b.upper.inclusive:
+      return false
+  true
+
+proc rangeElemNeedsQuoting(s: string): bool =
+  if s.len == 0:
+    return true
+  for c in s:
+    if c in {',', '(', ')', '[', ']', '"', '\\', ' '}:
+      return true
+  false
+
+proc quoteRangeElem(s: string): string =
+  if not rangeElemNeedsQuoting(s):
+    return s
+  result = "\""
+  for c in s:
+    if c == '"':
+      result.add("\\\"")
+    elif c == '\\':
+      result.add("\\\\")
+    else:
+      result.add(c)
+  result.add('"')
+
+proc `$`*[T](r: PgRange[T]): string =
+  if r.isEmpty:
+    return "empty"
+  result = if r.hasLower and r.lower.inclusive: "[" else: "("
+  if r.hasLower:
+    result.add(quoteRangeElem($r.lower.value))
+  result.add(',')
+  if r.hasUpper:
+    result.add(quoteRangeElem($r.upper.value))
+  result.add(if r.hasUpper and r.upper.inclusive: "]" else: ")")
+
+proc parseRangeElem(
+    s: string, start: int, stopChars: set[char]
+): tuple[val: string, pos: int] =
+  ## Parse a single range element (possibly quoted) starting at `start`.
+  var i = start
+  if i < s.len and s[i] == '"':
+    # Quoted element
+    i += 1
+    var elem = ""
+    while i < s.len:
+      if s[i] == '\\' and i + 1 < s.len:
+        i += 1
+        elem.add(s[i])
+      elif s[i] == '"':
+        i += 1
+        break
+      else:
+        elem.add(s[i])
+      i += 1
+    (elem, i)
+  else:
+    var elem = ""
+    while i < s.len and s[i] notin stopChars:
+      elem.add(s[i])
+      i += 1
+    (elem, i)
+
+proc parseRangeText*[T](s: string, parseElem: proc(s: string): T): PgRange[T] =
+  if s == "empty":
+    return PgRange[T](isEmpty: true)
+  if s.len < 3:
+    raise newException(PgTypeError, "Invalid range literal: " & s)
+  let lowerInc = s[0] == '['
+  let upperInc = s[^1] == ']'
+  let inner = s[1 ..^ 2]
+  # Find comma separator (respecting quoting)
+  var commaPos = -1
+  var i = 0
+  var inQuote = false
+  while i < inner.len:
+    if inQuote:
+      if inner[i] == '\\' and i + 1 < inner.len:
+        i += 2
+        continue
+      elif inner[i] == '"':
+        inQuote = false
+    else:
+      if inner[i] == '"':
+        inQuote = true
+      elif inner[i] == ',':
+        commaPos = i
+        break
+    i += 1
+  if commaPos == -1:
+    raise newException(PgTypeError, "Invalid range literal (no comma): " & s)
+  let lowerStr = inner[0 ..< commaPos]
+  let upperStr = inner[commaPos + 1 ..^ 1]
+  # Parse lower bound
+  if lowerStr.len > 0:
+    let (val, _) = parseRangeElem(lowerStr, 0, {','})
+    result.hasLower = true
+    result.lower = PgRangeBound[T](value: parseElem(val), inclusive: lowerInc)
+  # Parse upper bound
+  if upperStr.len > 0:
+    let (val, _) = parseRangeElem(upperStr, 0, {','})
+    result.hasUpper = true
+    result.upper = PgRangeBound[T](value: parseElem(val), inclusive: upperInc)
+
+proc encodeRangeBinaryImpl(r: RangeBinaryInput): seq[byte] =
+  if r.isEmpty:
+    return @[rangeEmpty]
+  var flags: uint8 = 0
+  if r.hasLower:
+    flags = flags or rangeHasLower
+  if r.hasUpper:
+    flags = flags or rangeHasUpper
+  if r.lowerInc:
+    flags = flags or rangeLowerInc
+  if r.upperInc:
+    flags = flags or rangeUpperInc
+  var size = 1
+  if r.hasLower:
+    size += 4 + r.lowerData.len
+  if r.hasUpper:
+    size += 4 + r.upperData.len
+  result = newSeq[byte](size)
+  result[0] = flags
+  var pos = 1
+  if r.hasLower:
+    let lb = toBE32(int32(r.lowerData.len))
+    copyMem(addr result[pos], unsafeAddr lb[0], 4)
+    pos += 4
+    if r.lowerData.len > 0:
+      copyMem(addr result[pos], unsafeAddr r.lowerData[0], r.lowerData.len)
+      pos += r.lowerData.len
+  if r.hasUpper:
+    let ub = toBE32(int32(r.upperData.len))
+    copyMem(addr result[pos], unsafeAddr ub[0], 4)
+    pos += 4
+    if r.upperData.len > 0:
+      copyMem(addr result[pos], unsafeAddr r.upperData[0], r.upperData.len)
+
+proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
+  if data.len < 1:
+    raise newException(PgTypeError, "Binary range too short")
+  let flags = data[0]
+  if (flags and rangeEmpty) != 0:
+    result.isEmpty = true
+    return
+  result.hasLower = (flags and rangeHasLower) != 0
+  result.hasUpper = (flags and rangeHasUpper) != 0
+  result.lowerInc = (flags and rangeLowerInc) != 0
+  result.upperInc = (flags and rangeUpperInc) != 0
+  var pos = 1
+  if result.hasLower:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary range truncated at lower bound length")
+    let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    result.lowerOff = pos
+    result.lowerLen = bLen
+    pos += bLen
+  if result.hasUpper:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary range truncated at upper bound length")
+    let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    result.upperOff = pos
+    result.upperLen = bLen
+
+# toPgParam for range types (text format)
+
+proc toPgParam*(v: PgRange[int32]): PgParam =
+  PgParam(oid: OidInt4Range, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgRange[int64]): PgParam =
+  PgParam(oid: OidInt8Range, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgRange[PgNumeric]): PgParam =
+  PgParam(oid: OidNumRange, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgRange[DateTime]): PgParam =
+  PgParam(oid: OidTsRange, format: 0, value: some(toBytes($v)))
+
+proc toPgTsTzRangeParam*(v: PgRange[DateTime]): PgParam =
+  PgParam(oid: OidTsTzRange, format: 0, value: some(toBytes($v)))
+
+proc toPgDateRangeParam*(v: PgRange[DateTime]): PgParam =
+  ## Encode a date range. DateTime values are formatted as date-only.
+  if v.isEmpty:
+    return PgParam(oid: OidDateRange, format: 0, value: some(toBytes("empty")))
+  var s = if v.hasLower and v.lower.inclusive: "[" else: "("
+  if v.hasLower:
+    s.add(v.lower.value.format("yyyy-MM-dd"))
+  s.add(',')
+  if v.hasUpper:
+    s.add(v.upper.value.format("yyyy-MM-dd"))
+  s.add(if v.hasUpper and v.upper.inclusive: "]" else: ")")
+  PgParam(oid: OidDateRange, format: 0, value: some(toBytes(s)))
+
+proc toPgRangeParam*[T](v: PgRange[T], oid: int32): PgParam =
+  PgParam(oid: oid, format: 0, value: some(toBytes($v)))
+
+# Binary encoding helpers
+
+proc encodeBinaryTimestamp(dt: DateTime): seq[byte] =
+  let t = dt.toTime()
+  let pgUs =
+    t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000) - pgEpochUnix * 1_000_000
+  @(toBE64(pgUs))
+
+proc encodeBinaryDate(dt: DateTime): seq[byte] =
+  let t = dt.toTime()
+  let pgDays = int32(t.toUnix() div 86400 - int64(pgEpochDaysOffset))
+  @(toBE32(pgDays))
+
+proc encodeRangeBinary[T](
+    v: PgRange[T], oid: int32, encodeBound: proc(v: T): seq[byte]
+): PgParam =
+  var ld, ud: seq[byte]
+  if v.hasLower:
+    ld = encodeBound(v.lower.value)
+  if v.hasUpper:
+    ud = encodeBound(v.upper.value)
+  let data = encodeRangeBinaryImpl(
+    (
+      isEmpty: v.isEmpty,
+      hasLower: v.hasLower,
+      hasUpper: v.hasUpper,
+      lowerInc: v.hasLower and v.lower.inclusive,
+      upperInc: v.hasUpper and v.upper.inclusive,
+      lowerData: ld,
+      upperData: ud,
+    )
+  )
+  PgParam(oid: oid, format: 1, value: some(data))
+
+# toPgBinaryParam for range types
+
+proc toPgBinaryParam*(v: PgRange[int32]): PgParam =
+  encodeRangeBinary(
+    v,
+    OidInt4Range,
+    proc(x: int32): seq[byte] =
+      @(toBE32(x)),
+  )
+
+proc toPgBinaryParam*(v: PgRange[int64]): PgParam =
+  encodeRangeBinary(
+    v,
+    OidInt8Range,
+    proc(x: int64): seq[byte] =
+      @(toBE64(x)),
+  )
+
+proc toPgBinaryParam*(v: PgRange[PgNumeric]): PgParam =
+  ## Sends numrange as text format (binary numeric encoding is complex).
+  PgParam(oid: OidNumRange, format: 0, value: some(toBytes($v)))
+
+proc toPgBinaryParam*(v: PgRange[DateTime]): PgParam =
+  encodeRangeBinary(v, OidTsRange, encodeBinaryTimestamp)
+
+proc toPgBinaryTsTzRangeParam*(v: PgRange[DateTime]): PgParam =
+  encodeRangeBinary(v, OidTsTzRange, encodeBinaryTimestamp)
+
+proc toPgBinaryDateRangeParam*(v: PgRange[DateTime]): PgParam =
+  encodeRangeBinary(v, OidDateRange, encodeBinaryDate)
+
+# Range text format getters
+
+proc getInt4Range*(row: Row, col: int): PgRange[int32] =
+  let s = row.getStr(col)
+  parseRangeText[int32](
+    s,
+    proc(e: string): int32 =
+      int32(parseInt(e)),
+  )
+
+proc getInt8Range*(row: Row, col: int): PgRange[int64] =
+  let s = row.getStr(col)
+  parseRangeText[int64](
+    s,
+    proc(e: string): int64 =
+      parseBiggestInt(e),
+  )
+
+proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
+  let s = row.getStr(col)
+  parseRangeText[PgNumeric](
+    s,
+    proc(e: string): PgNumeric =
+      PgNumeric(e),
+  )
+
+proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
+  let s = row.getStr(col)
+  parseRangeText[DateTime](
+    s,
+    proc(e: string): DateTime =
+      const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
+      for fmt in formats:
+        try:
+          return parse(e, fmt)
+        except TimeParseError:
+          discard
+      raise newException(PgTypeError, "Invalid timestamp in range: " & e),
+  )
+
+proc getTsTzRange*(row: Row, col: int): PgRange[DateTime] =
+  let s = row.getStr(col)
+  parseRangeText[DateTime](
+    s,
+    proc(e: string): DateTime =
+      const formats = [
+        "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
+        "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
+        "yyyy-MM-dd HH:mm:sszz", "yyyy-MM-dd HH:mm:ss",
+      ]
+      for fmt in formats:
+        try:
+          return parse(e, fmt)
+        except TimeParseError:
+          discard
+      raise newException(PgTypeError, "Invalid timestamptz in range: " & e),
+  )
+
+proc getDateRange*(row: Row, col: int): PgRange[DateTime] =
+  let s = row.getStr(col)
+  parseRangeText[DateTime](
+    s,
+    proc(e: string): DateTime =
+      try:
+        return parse(e, "yyyy-MM-dd")
+      except TimeParseError:
+        raise newException(PgTypeError, "Invalid date in range: " & e),
+  )
+
+# Binary helpers for timestamp/date decoding
+
+proc decodeBinaryTimestamp(data: openArray[byte]): DateTime =
+  let pgUs = fromBE64(data)
+  let unixUs = pgUs + pgEpochUnix * 1_000_000
+  var unixSec = unixUs div 1_000_000
+  var fracUs = unixUs mod 1_000_000
+  if fracUs < 0:
+    unixSec -= 1
+    fracUs += 1_000_000
+  initTime(unixSec, int(fracUs * 1000)).utc()
+
+proc decodeBinaryDate(data: openArray[byte]): DateTime =
+  let pgDays = fromBE32(data)
+  let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
+  initTime(unixSec, 0).utc()
+
+# Standalone binary range decoders (used by both format-aware getters and multirange getters)
+
+proc decodeInt4RangeBinary(data: openArray[byte]): PgRange[int32] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[int32](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[int32](
+      value: fromBE32(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[int32](
+      value: fromBE32(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
+      inclusive: raw.upperInc,
+    )
+
+proc decodeInt8RangeBinary(data: openArray[byte]): PgRange[int64] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[int64](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[int64](
+      value: fromBE64(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[int64](
+      value: fromBE64(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
+      inclusive: raw.upperInc,
+    )
+
+proc decodeNumRangeBinary(data: openArray[byte]): PgRange[PgNumeric] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[PgNumeric](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    let s = decodeNumericBinary(
+      data.toOpenArray(raw.lowerOff, raw.lowerOff + raw.lowerLen - 1)
+    )
+    result.lower = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.lowerInc)
+  if raw.hasUpper:
+    result.hasUpper = true
+    let s = decodeNumericBinary(
+      data.toOpenArray(raw.upperOff, raw.upperOff + raw.upperLen - 1)
+    )
+    result.upper = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.upperInc)
+
+proc decodeTsRangeBinary(data: openArray[byte]): PgRange[DateTime] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[DateTime](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[DateTime](
+      value: decodeBinaryTimestamp(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[DateTime](
+      value: decodeBinaryTimestamp(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
+      inclusive: raw.upperInc,
+    )
+
+proc decodeDateRangeBinary(data: openArray[byte]): PgRange[DateTime] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[DateTime](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[DateTime](
+      value: decodeBinaryDate(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[DateTime](
+      value: decodeBinaryDate(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
+      inclusive: raw.upperInc,
+    )
+
+# Range format-aware getters (binary support)
+
+proc getInt4Range*(row: Row, col: int, fields: seq[FieldDescription]): PgRange[int32] =
+  if fields[col].formatCode == 0:
+    return row.getInt4Range(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  decodeInt4RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+
+proc getInt8Range*(row: Row, col: int, fields: seq[FieldDescription]): PgRange[int64] =
+  if fields[col].formatCode == 0:
+    return row.getInt8Range(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  decodeInt8RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+
+proc getNumRange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgRange[PgNumeric] =
+  if fields[col].formatCode == 0:
+    return row.getNumRange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  decodeNumRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+
+proc getTsRange*(row: Row, col: int, fields: seq[FieldDescription]): PgRange[DateTime] =
+  if fields[col].formatCode == 0:
+    return row.getTsRange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+
+proc getTsTzRange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgRange[DateTime] =
+  if fields[col].formatCode == 0:
+    return row.getTsTzRange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+
+proc getDateRange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgRange[DateTime] =
+  if fields[col].formatCode == 0:
+    return row.getDateRange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  decodeDateRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+
+# Range Opt accessors (text format)
+
+proc getInt4RangeOpt*(row: Row, col: int): Option[PgRange[int32]] =
+  if row.isNull(col):
+    none(PgRange[int32])
+  else:
+    some(row.getInt4Range(col))
+
+proc getInt8RangeOpt*(row: Row, col: int): Option[PgRange[int64]] =
+  if row.isNull(col):
+    none(PgRange[int64])
+  else:
+    some(row.getInt8Range(col))
+
+proc getNumRangeOpt*(row: Row, col: int): Option[PgRange[PgNumeric]] =
+  if row.isNull(col):
+    none(PgRange[PgNumeric])
+  else:
+    some(row.getNumRange(col))
+
+proc getTsRangeOpt*(row: Row, col: int): Option[PgRange[DateTime]] =
+  if row.isNull(col):
+    none(PgRange[DateTime])
+  else:
+    some(row.getTsRange(col))
+
+proc getTsTzRangeOpt*(row: Row, col: int): Option[PgRange[DateTime]] =
+  if row.isNull(col):
+    none(PgRange[DateTime])
+  else:
+    some(row.getTsTzRange(col))
+
+proc getDateRangeOpt*(row: Row, col: int): Option[PgRange[DateTime]] =
+  if row.isNull(col):
+    none(PgRange[DateTime])
+  else:
+    some(row.getDateRange(col))
+
+# Range Opt accessors (format-aware)
+
+proc getInt4RangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgRange[int32]] =
+  if row.isNull(col):
+    none(PgRange[int32])
+  else:
+    some(row.getInt4Range(col, fields))
+
+proc getInt8RangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgRange[int64]] =
+  if row.isNull(col):
+    none(PgRange[int64])
+  else:
+    some(row.getInt8Range(col, fields))
+
+proc getNumRangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgRange[PgNumeric]] =
+  if row.isNull(col):
+    none(PgRange[PgNumeric])
+  else:
+    some(row.getNumRange(col, fields))
+
+proc getTsRangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgRange[DateTime]] =
+  if row.isNull(col):
+    none(PgRange[DateTime])
+  else:
+    some(row.getTsRange(col, fields))
+
+proc getTsTzRangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgRange[DateTime]] =
+  if row.isNull(col):
+    none(PgRange[DateTime])
+  else:
+    some(row.getTsTzRange(col, fields))
+
+proc getDateRangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgRange[DateTime]] =
+  if row.isNull(col):
+    none(PgRange[DateTime])
+  else:
+    some(row.getDateRange(col, fields))
+
+# Multirange type support
+#
+# PostgreSQL multirange types (PostgreSQL 14+) represent a set of non-overlapping ranges.
+# Text format:  {[1,3),[5,8)}
+# Binary format: count(4) + [len(4) + range_binary_data]...
+#
+# Usage:
+#   let mr = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+#   let mr = row.getInt4Multirange(0)
+
+proc len*[T](mr: PgMultirange[T]): int =
+  seq[PgRange[T]](mr).len
+
+proc `[]`*[T](mr: PgMultirange[T], i: int): PgRange[T] =
+  seq[PgRange[T]](mr)[i]
+
+iterator items*[T](mr: PgMultirange[T]): PgRange[T] =
+  for r in seq[PgRange[T]](mr):
+    yield r
+
+proc `==`*[T](a, b: PgMultirange[T]): bool =
+  let sa = seq[PgRange[T]](a)
+  let sb = seq[PgRange[T]](b)
+  if sa.len != sb.len:
+    return false
+  for i in 0 ..< sa.len:
+    if sa[i] != sb[i]:
+      return false
+  true
+
+proc toMultirange*[T](ranges: varargs[PgRange[T]]): PgMultirange[T] =
+  PgMultirange[T](@ranges)
+
+proc `$`*[T](mr: PgMultirange[T]): string =
+  result = "{"
+  let s = seq[PgRange[T]](mr)
+  for i, r in s:
+    if i > 0:
+      result.add(',')
+    result.add($r)
+  result.add('}')
+
+proc parseMultirangeText*[T](
+    s: string, parseElem: proc(s: string): T
+): PgMultirange[T] =
+  if s.len < 2 or s[0] != '{' or s[^1] != '}':
+    raise newException(PgTypeError, "Invalid multirange literal: " & s)
+  let inner = s[1 ..^ 2]
+  if inner.len == 0:
+    return PgMultirange[T](@[])
+  # Split on commas that are between ranges (at bracket depth 0)
+  var ranges: seq[PgRange[T]]
+  var depth = 0
+  var start = 0
+  for i in 0 ..< inner.len:
+    case inner[i]
+    of '[', '(':
+      if depth == 0 and i > start:
+        discard
+      depth += 1
+    of ']', ')':
+      depth -= 1
+      if depth == 0:
+        let rangeStr = inner[start .. i]
+        ranges.add(parseRangeText[T](rangeStr, parseElem))
+        start = i + 1
+        # Skip comma
+        if start < inner.len and inner[start] == ',':
+          start += 1
+    else:
+      # Handle "empty" ranges inside multirange
+      if depth == 0 and i == start and inner.len >= start + 5 and
+          inner[start ..< start + 5] == "empty":
+        ranges.add(PgRange[T](isEmpty: true))
+        start = start + 5
+        if start < inner.len and inner[start] == ',':
+          start += 1
+  PgMultirange[T](ranges)
+
+proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =
+  var size = 4
+  for rd in rangeData:
+    size += 4 + rd.len
+  result = newSeq[byte](size)
+  let cnt = toBE32(int32(rangeData.len))
+  copyMem(addr result[0], unsafeAddr cnt[0], 4)
+  var pos = 4
+  for rd in rangeData:
+    let rl = toBE32(int32(rd.len))
+    copyMem(addr result[pos], unsafeAddr rl[0], 4)
+    pos += 4
+    if rd.len > 0:
+      copyMem(addr result[pos], unsafeAddr rd[0], rd.len)
+      pos += rd.len
+
+proc decodeMultirangeBinaryRaw(data: openArray[byte]): seq[tuple[off: int, len: int]] =
+  if data.len < 4:
+    raise newException(PgTypeError, "Binary multirange too short")
+  let count = int(fromBE32(data.toOpenArray(0, 3)))
+  result = newSeq[tuple[off: int, len: int]](count)
+  var pos = 4
+  for i in 0 ..< count:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary multirange truncated at range " & $i)
+    let rLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    result[i] = (off: pos, len: rLen)
+    pos += rLen
+
+# Multirange toPgParam (text format)
+
+proc toPgParam*(v: PgMultirange[int32]): PgParam =
+  PgParam(oid: OidInt4Multirange, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgMultirange[int64]): PgParam =
+  PgParam(oid: OidInt8Multirange, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgMultirange[PgNumeric]): PgParam =
+  PgParam(oid: OidNumMultirange, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgMultirange[DateTime]): PgParam =
+  PgParam(oid: OidTsMultirange, format: 0, value: some(toBytes($v)))
+
+proc toPgTsTzMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
+  PgParam(oid: OidTsTzMultirange, format: 0, value: some(toBytes($v)))
+
+proc toPgDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
+  ## Encode a date multirange. DateTime values are formatted as date-only.
+  var s = "{"
+  let ranges = seq[PgRange[DateTime]](v)
+  for i, r in ranges:
+    if i > 0:
+      s.add(',')
+    if r.isEmpty:
+      s.add("empty")
+    else:
+      s.add(if r.hasLower and r.lower.inclusive: "[" else: "(")
+      if r.hasLower:
+        s.add(r.lower.value.format("yyyy-MM-dd"))
+      s.add(',')
+      if r.hasUpper:
+        s.add(r.upper.value.format("yyyy-MM-dd"))
+      s.add(if r.hasUpper and r.upper.inclusive: "]" else: ")")
+  s.add('}')
+  PgParam(oid: OidDateMultirange, format: 0, value: some(toBytes(s)))
+
+proc toPgMultirangeParam*[T](v: PgMultirange[T], oid: int32): PgParam =
+  PgParam(oid: oid, format: 0, value: some(toBytes($v)))
+
+# Multirange toPgBinaryParam
+
+proc toPgBinaryParam*(v: PgMultirange[int32]): PgParam =
+  var rangeData: seq[seq[byte]]
+  for r in seq[PgRange[int32]](v):
+    rangeData.add(toPgBinaryParam(r).value.get)
+  PgParam(
+    oid: OidInt4Multirange,
+    format: 1,
+    value: some(encodeMultirangeBinaryImpl(rangeData)),
+  )
+
+proc toPgBinaryParam*(v: PgMultirange[int64]): PgParam =
+  var rangeData: seq[seq[byte]]
+  for r in seq[PgRange[int64]](v):
+    rangeData.add(toPgBinaryParam(r).value.get)
+  PgParam(
+    oid: OidInt8Multirange,
+    format: 1,
+    value: some(encodeMultirangeBinaryImpl(rangeData)),
+  )
+
+proc toPgBinaryParam*(v: PgMultirange[PgNumeric]): PgParam =
+  ## Sends nummultirange as text format.
+  PgParam(oid: OidNumMultirange, format: 0, value: some(toBytes($v)))
+
+proc toPgBinaryParam*(v: PgMultirange[DateTime]): PgParam =
+  var rangeData: seq[seq[byte]]
+  for r in seq[PgRange[DateTime]](v):
+    rangeData.add(toPgBinaryParam(r).value.get)
+  PgParam(
+    oid: OidTsMultirange, format: 1, value: some(encodeMultirangeBinaryImpl(rangeData))
+  )
+
+# Multirange text format getters
+
+proc getInt4Multirange*(row: Row, col: int): PgMultirange[int32] =
+  let s = row.getStr(col)
+  parseMultirangeText[int32](
+    s,
+    proc(e: string): int32 =
+      int32(parseInt(e)),
+  )
+
+proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
+  let s = row.getStr(col)
+  parseMultirangeText[int64](
+    s,
+    proc(e: string): int64 =
+      parseBiggestInt(e),
+  )
+
+proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
+  let s = row.getStr(col)
+  parseMultirangeText[PgNumeric](
+    s,
+    proc(e: string): PgNumeric =
+      PgNumeric(e),
+  )
+
+proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
+  let s = row.getStr(col)
+  parseMultirangeText[DateTime](
+    s,
+    proc(e: string): DateTime =
+      const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
+      for fmt in formats:
+        try:
+          return parse(e, fmt)
+        except TimeParseError:
+          discard
+      raise newException(PgTypeError, "Invalid timestamp in multirange: " & e),
+  )
+
+proc getTsTzMultirange*(row: Row, col: int): PgMultirange[DateTime] =
+  let s = row.getStr(col)
+  parseMultirangeText[DateTime](
+    s,
+    proc(e: string): DateTime =
+      const formats = [
+        "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
+        "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
+        "yyyy-MM-dd HH:mm:sszz", "yyyy-MM-dd HH:mm:ss",
+      ]
+      for fmt in formats:
+        try:
+          return parse(e, fmt)
+        except TimeParseError:
+          discard
+      raise newException(PgTypeError, "Invalid timestamptz in multirange: " & e),
+  )
+
+proc getDateMultirange*(row: Row, col: int): PgMultirange[DateTime] =
+  let s = row.getStr(col)
+  parseMultirangeText[DateTime](
+    s,
+    proc(e: string): DateTime =
+      try:
+        return parse(e, "yyyy-MM-dd")
+      except TimeParseError:
+        raise newException(PgTypeError, "Invalid date in multirange: " & e),
+  )
+
+# Multirange format-aware getters
+
+proc getInt4Multirange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgMultirange[int32] =
+  if fields[col].formatCode == 0:
+    return row.getInt4Multirange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+  var ranges = newSeq[PgRange[int32]](parts.len)
+  for i, p in parts:
+    ranges[i] = decodeInt4RangeBinary(
+      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+    )
+  PgMultirange[int32](ranges)
+
+proc getInt8Multirange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgMultirange[int64] =
+  if fields[col].formatCode == 0:
+    return row.getInt8Multirange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+  var ranges = newSeq[PgRange[int64]](parts.len)
+  for i, p in parts:
+    ranges[i] = decodeInt8RangeBinary(
+      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+    )
+  PgMultirange[int64](ranges)
+
+proc getNumMultirange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgMultirange[PgNumeric] =
+  if fields[col].formatCode == 0:
+    return row.getNumMultirange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+  var ranges = newSeq[PgRange[PgNumeric]](parts.len)
+  for i, p in parts:
+    ranges[i] = decodeNumRangeBinary(
+      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+    )
+  PgMultirange[PgNumeric](ranges)
+
+proc getTsMultirange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgMultirange[DateTime] =
+  if fields[col].formatCode == 0:
+    return row.getTsMultirange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+  var ranges = newSeq[PgRange[DateTime]](parts.len)
+  for i, p in parts:
+    ranges[i] = decodeTsRangeBinary(
+      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+    )
+  PgMultirange[DateTime](ranges)
+
+proc getTsTzMultirange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgMultirange[DateTime] =
+  if fields[col].formatCode == 0:
+    return row.getTsTzMultirange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+  var ranges = newSeq[PgRange[DateTime]](parts.len)
+  for i, p in parts:
+    ranges[i] = decodeTsRangeBinary(
+      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+    )
+  PgMultirange[DateTime](ranges)
+
+proc getDateMultirange*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): PgMultirange[DateTime] =
+  if fields[col].formatCode == 0:
+    return row.getDateMultirange(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+  var ranges = newSeq[PgRange[DateTime]](parts.len)
+  for i, p in parts:
+    ranges[i] = decodeDateRangeBinary(
+      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+    )
+  PgMultirange[DateTime](ranges)
+
+# Multirange Opt accessors (text format)
+
+proc getInt4MultirangeOpt*(row: Row, col: int): Option[PgMultirange[int32]] =
+  if row.isNull(col):
+    none(PgMultirange[int32])
+  else:
+    some(row.getInt4Multirange(col))
+
+proc getInt8MultirangeOpt*(row: Row, col: int): Option[PgMultirange[int64]] =
+  if row.isNull(col):
+    none(PgMultirange[int64])
+  else:
+    some(row.getInt8Multirange(col))
+
+proc getNumMultirangeOpt*(row: Row, col: int): Option[PgMultirange[PgNumeric]] =
+  if row.isNull(col):
+    none(PgMultirange[PgNumeric])
+  else:
+    some(row.getNumMultirange(col))
+
+proc getTsMultirangeOpt*(row: Row, col: int): Option[PgMultirange[DateTime]] =
+  if row.isNull(col):
+    none(PgMultirange[DateTime])
+  else:
+    some(row.getTsMultirange(col))
+
+proc getTsTzMultirangeOpt*(row: Row, col: int): Option[PgMultirange[DateTime]] =
+  if row.isNull(col):
+    none(PgMultirange[DateTime])
+  else:
+    some(row.getTsTzMultirange(col))
+
+proc getDateMultirangeOpt*(row: Row, col: int): Option[PgMultirange[DateTime]] =
+  if row.isNull(col):
+    none(PgMultirange[DateTime])
+  else:
+    some(row.getDateMultirange(col))
+
+# Multirange Opt accessors (format-aware)
+
+proc getInt4MultirangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMultirange[int32]] =
+  if row.isNull(col):
+    none(PgMultirange[int32])
+  else:
+    some(row.getInt4Multirange(col, fields))
+
+proc getInt8MultirangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMultirange[int64]] =
+  if row.isNull(col):
+    none(PgMultirange[int64])
+  else:
+    some(row.getInt8Multirange(col, fields))
+
+proc getNumMultirangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMultirange[PgNumeric]] =
+  if row.isNull(col):
+    none(PgMultirange[PgNumeric])
+  else:
+    some(row.getNumMultirange(col, fields))
+
+proc getTsMultirangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMultirange[DateTime]] =
+  if row.isNull(col):
+    none(PgMultirange[DateTime])
+  else:
+    some(row.getTsMultirange(col, fields))
+
+proc getTsTzMultirangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMultirange[DateTime]] =
+  if row.isNull(col):
+    none(PgMultirange[DateTime])
+  else:
+    some(row.getTsTzMultirange(col, fields))
+
+proc getDateMultirangeOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgMultirange[DateTime]] =
+  if row.isNull(col):
+    none(PgMultirange[DateTime])
+  else:
+    some(row.getDateMultirange(col, fields))
