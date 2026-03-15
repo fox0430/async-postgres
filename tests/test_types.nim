@@ -924,56 +924,104 @@ suite "Array OID constants":
     check OidTextArray == 1009'i32
     check OidVarcharArray == 1015'i32
 
-suite "Array toPgParam":
+suite "Array toPgParam (binary)":
   test "seq[int32]":
     let p = toPgParam(@[1'i32, 2, 3])
     check p.oid == OidInt4Array
-    check p.format == 0
-    check toString(p.value.get) == "{1,2,3}"
+    check p.format == 1
+    let data = p.value.get
+    # Header: ndim=1, has_null=0, elem_oid=OidInt4, dim_len=3, lower_bound=1
+    check fromBE32(data[0 .. 3]) == 1'i32 # ndim
+    check fromBE32(data[4 .. 7]) == 0'i32 # has_null
+    check fromBE32(data[8 .. 11]) == OidInt4 # elem_oid
+    check fromBE32(data[12 .. 15]) == 3'i32 # dim_len
+    check fromBE32(data[16 .. 19]) == 1'i32 # lower_bound
+    # Element 0: len=4, value=1
+    check fromBE32(data[20 .. 23]) == 4'i32
+    check fromBE32(data[24 .. 27]) == 1'i32
+    # Element 1: len=4, value=2
+    check fromBE32(data[28 .. 31]) == 4'i32
+    check fromBE32(data[32 .. 35]) == 2'i32
+    # Element 2: len=4, value=3
+    check fromBE32(data[36 .. 39]) == 4'i32
+    check fromBE32(data[40 .. 43]) == 3'i32
 
   test "seq[int32] empty":
     let p = toPgParam(newSeq[int32]())
     check p.oid == OidInt4Array
-    check toString(p.value.get) == "{}"
+    check p.format == 1
+    let data = p.value.get
+    check fromBE32(data[0 .. 3]) == 0'i32 # ndim=0
+    check fromBE32(data[8 .. 11]) == OidInt4
 
   test "seq[int16]":
     let p = toPgParam(@[10'i16, -20'i16])
     check p.oid == OidInt2Array
-    check toString(p.value.get) == "{10,-20}"
+    check p.format == 1
+    let data = p.value.get
+    check fromBE32(data[8 .. 11]) == OidInt2
+    check fromBE32(data[12 .. 15]) == 2'i32
+    # Element 0: len=2, value=10
+    check fromBE32(data[20 .. 23]) == 2'i32
+    check fromBE16(data[24 .. 25]) == 10'i16
+    # Element 1: len=2, value=-20
+    check fromBE32(data[26 .. 29]) == 2'i32
+    check fromBE16(data[30 .. 31]) == -20'i16
 
   test "seq[int64]":
     let p = toPgParam(@[9999999999'i64, -1'i64])
     check p.oid == OidInt8Array
-    check toString(p.value.get) == "{9999999999,-1}"
+    check p.format == 1
+    let data = p.value.get
+    check fromBE32(data[8 .. 11]) == OidInt8
+    # Element 0: len=8
+    check fromBE32(data[20 .. 23]) == 8'i32
+    check fromBE64(data[24 .. 31]) == 9999999999'i64
 
   test "seq[float32]":
     let p = toPgParam(@[1.5'f32, 2.5'f32])
     check p.oid == OidFloat4Array
-    check toString(p.value.get).startsWith("{")
+    check p.format == 1
 
   test "seq[float64]":
     let p = toPgParam(@[3.14, 2.72])
     check p.oid == OidFloat8Array
-    check toString(p.value.get).startsWith("{")
+    check p.format == 1
 
   test "seq[bool]":
     let p = toPgParam(@[true, false, true])
     check p.oid == OidBoolArray
-    check toString(p.value.get) == "{t,f,t}"
+    check p.format == 1
+    let data = p.value.get
+    check fromBE32(data[8 .. 11]) == OidBool
+    check fromBE32(data[12 .. 15]) == 3'i32
+    # Element 0: len=1, value=1
+    check fromBE32(data[20 .. 23]) == 1'i32
+    check data[24] == 1'u8
+    # Element 1: len=1, value=0
+    check fromBE32(data[25 .. 28]) == 1'i32
+    check data[29] == 0'u8
 
   test "seq[string]":
     let p = toPgParam(@["hello", "world"])
     check p.oid == OidTextArray
-    check toString(p.value.get) == "{\"hello\",\"world\"}"
+    check p.format == 1
+    let data = p.value.get
+    check fromBE32(data[8 .. 11]) == OidText
+    check fromBE32(data[12 .. 15]) == 2'i32
+    # Element 0: len=5, "hello"
+    check fromBE32(data[20 .. 23]) == 5'i32
 
-  test "seq[string] with escaping":
-    let p = toPgParam(@["a\"b", "c\\d"])
+  test "seq[string] with special characters":
+    let p = toPgParam(@["a\"b", "c\\d", "e,f", ""])
     check p.oid == OidTextArray
-    check toString(p.value.get) == "{\"a\\\"b\",\"c\\\\d\"}"
+    check p.format == 1
 
   test "seq[string] empty":
     let p = toPgParam(newSeq[string]())
-    check toString(p.value.get) == "{}"
+    check p.format == 1
+    let data = p.value.get
+    check fromBE32(data[0 .. 3]) == 0'i32 # ndim=0
 
   test "Option[seq[int32]] some":
     let p = toPgParam(some(@[1'i32, 2]))
@@ -1146,6 +1194,145 @@ suite "Array Opt accessors":
   test "getInt16ArrayOpt none":
     let row: Row = @[none(seq[byte])]
     check row.getInt16ArrayOpt(0) == none(seq[int16])
+
+suite "Binary array encode/decode roundtrip":
+  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+    FieldDescription(
+      name: "test",
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: typeOid,
+      typeSize: 0,
+      typeMod: 0,
+      formatCode: formatCode,
+    )
+
+  test "encodeBinaryArray + decodeBinaryArray roundtrip int32":
+    let encoded = encodeBinaryArray(
+      OidInt4, @[@(toBE32(1'i32)), @(toBE32(2'i32)), @(toBE32(3'i32))]
+    )
+    let decoded = decodeBinaryArray(encoded)
+    check decoded.elemOid == OidInt4
+    check decoded.elements.len == 3
+    check fromBE32(
+      encoded[
+        decoded.elements[0].off ..< decoded.elements[0].off + decoded.elements[0].len
+      ]
+    ) == 1'i32
+    check fromBE32(
+      encoded[
+        decoded.elements[1].off ..< decoded.elements[1].off + decoded.elements[1].len
+      ]
+    ) == 2'i32
+    check fromBE32(
+      encoded[
+        decoded.elements[2].off ..< decoded.elements[2].off + decoded.elements[2].len
+      ]
+    ) == 3'i32
+
+  test "encodeBinaryArrayEmpty roundtrip":
+    let encoded = encodeBinaryArrayEmpty(OidInt4)
+    let decoded = decodeBinaryArray(encoded)
+    check decoded.elemOid == OidInt4
+    check decoded.elements.len == 0
+
+  test "getIntArray binary format":
+    let encoded = encodeBinaryArray(OidInt4, @[@(toBE32(10'i32)), @(toBE32(-5'i32))])
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidInt4Array, 1)]
+    check row.getIntArray(0, fields) == @[10'i32, -5'i32]
+
+  test "getIntArray text format fallback":
+    let row: Row = @[some(toBytes("{1,2,3}"))]
+    let fields = @[mkField(OidInt4Array, 0)]
+    check row.getIntArray(0, fields) == @[1'i32, 2, 3]
+
+  test "getInt16Array binary format":
+    let encoded = encodeBinaryArray(OidInt2, @[@(toBE16(10'i16)), @(toBE16(-20'i16))])
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidInt2Array, 1)]
+    check row.getInt16Array(0, fields) == @[10'i16, -20'i16]
+
+  test "getInt64Array binary format":
+    let encoded =
+      encodeBinaryArray(OidInt8, @[@(toBE64(9999999999'i64)), @(toBE64(-1'i64))])
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidInt8Array, 1)]
+    check row.getInt64Array(0, fields) == @[9999999999'i64, -1'i64]
+
+  test "getFloatArray binary format float8":
+    let encoded = encodeBinaryArray(
+      OidFloat8, @[@(toBE64(cast[int64](3.14'f64))), @(toBE64(cast[int64](2.72'f64)))]
+    )
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidFloat8Array, 1)]
+    let arr = row.getFloatArray(0, fields)
+    check arr.len == 2
+    check abs(arr[0] - 3.14) < 1e-10
+    check abs(arr[1] - 2.72) < 1e-10
+
+  test "getFloat32Array binary format":
+    let encoded = encodeBinaryArray(
+      OidFloat4, @[@(toBE32(cast[int32](1.5'f32))), @(toBE32(cast[int32](2.5'f32)))]
+    )
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidFloat4Array, 1)]
+    let arr = row.getFloat32Array(0, fields)
+    check arr.len == 2
+    check abs(arr[0] - 1.5'f32) < 1e-5
+    check abs(arr[1] - 2.5'f32) < 1e-5
+
+  test "getBoolArray binary format":
+    let encoded = encodeBinaryArray(OidBool, @[@[1'u8], @[0'u8], @[1'u8]])
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidBoolArray, 1)]
+    check row.getBoolArray(0, fields) == @[true, false, true]
+
+  test "getStrArray binary format":
+    let encoded = encodeBinaryArray(OidText, @[toBytes("hello"), toBytes("world")])
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidTextArray, 1)]
+    check row.getStrArray(0, fields) == @["hello", "world"]
+
+  test "getStrArray binary format with special chars":
+    let encoded = encodeBinaryArray(
+      OidText, @[toBytes("a\"b"), toBytes("c\\d"), toBytes("e,f"), toBytes("")]
+    )
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidTextArray, 1)]
+    check row.getStrArray(0, fields) == @["a\"b", "c\\d", "e,f", ""]
+
+  test "getIntArray binary empty":
+    let encoded = encodeBinaryArrayEmpty(OidInt4)
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidInt4Array, 1)]
+    check row.getIntArray(0, fields).len == 0
+
+  test "getIntArrayOpt binary some":
+    let encoded = encodeBinaryArray(OidInt4, @[@(toBE32(42'i32))])
+    let row: Row = @[some(encoded)]
+    let fields = @[mkField(OidInt4Array, 1)]
+    let v = row.getIntArrayOpt(0, fields)
+    check v.isSome
+    check v.get == @[42'i32]
+
+  test "getIntArrayOpt binary none":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidInt4Array, 1)]
+    check row.getIntArrayOpt(0, fields) == none(seq[int32])
+
+  test "toPgParam seq[int32] roundtrip via decode":
+    let p = toPgParam(@[100'i32, 200, 300])
+    let decoded = decodeBinaryArray(p.value.get)
+    check decoded.elemOid == OidInt4
+    check decoded.elements.len == 3
+    let data = p.value.get
+    check fromBE32(data[decoded.elements[0].off ..< decoded.elements[0].off + 4]) ==
+      100'i32
+    check fromBE32(data[decoded.elements[1].off ..< decoded.elements[1].off + 4]) ==
+      200'i32
+    check fromBE32(data[decoded.elements[2].off ..< decoded.elements[2].off + 4]) ==
+      300'i32
 
 suite "PgNumeric":
   proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
