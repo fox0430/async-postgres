@@ -557,30 +557,150 @@ proc isNull*(row: Row, col: int): bool =
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   row.data.cellIndex[idx + 1] == -1'i32
 
+proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
+  ## Check if column was received in binary format.
+  row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
+
+proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
+  if row.data.colTypeOids.len > col:
+    row.data.colTypeOids[col]
+  else:
+    0'i32
+
 proc getStr*(row: Row, col: int): string =
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if row.isBinaryCol(col):
+    let oid = row.colTypeOid(col)
+    let b = row.data.buf
+    case oid
+    of 16: # bool
+      return if b[off] != 0: "t" else: "f"
+    of 21: # int2
+      if clen == 2:
+        return $int16((uint16(b[off]) shl 8) or uint16(b[off + 1]))
+    of 23: # int4
+      if clen == 4:
+        return $int32(
+          (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+            (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+        )
+    of 20: # int8
+      if clen == 8:
+        return $int64(
+          (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
+            (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
+            (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
+            (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+        )
+    of 700: # float4
+      if clen == 4:
+        var bits = uint32(
+          (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+            (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+        )
+        var f: float32
+        copyMem(addr f, addr bits, 4)
+        return $f
+    of 701: # float8
+      if clen == 8:
+        var bits = uint64(
+          (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
+            (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
+            (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
+            (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+        )
+        var f: float64
+        copyMem(addr f, addr bits, 8)
+        return $f
+    else:
+      discard # text, varchar, bytea: fall through to raw copy
   result = newString(clen)
   if clen > 0:
     copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
 
 proc getInt*(row: Row, col: int): int32 =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen == 4:
+      let b = row.data.buf
+      return int32(
+        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+          (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+      )
+    elif clen == 2:
+      let b = row.data.buf
+      return int32(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
   let s = row.getStr(col)
   result = int32(parseInt(s))
 
 proc getInt64*(row: Row, col: int): int64 =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen == 8:
+      let b = row.data.buf
+      return int64(
+        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
+          (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
+          (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
+          (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+      )
+    elif clen == 4:
+      let b = row.data.buf
+      return int64(
+        int32(
+          (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+            (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+        )
+      )
+    elif clen == 2:
+      let b = row.data.buf
+      return int64(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
   let s = row.getStr(col)
   result = parseBiggestInt(s)
 
 proc getFloat*(row: Row, col: int): float64 =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen == 8:
+      var bits: uint64
+      let b = row.data.buf
+      bits =
+        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
+        (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
+        (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
+        (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+      copyMem(addr result, addr bits, 8)
+      return
+    elif clen == 4:
+      var bits: uint32
+      let b = row.data.buf
+      bits =
+        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+        (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+      var f32: float32
+      copyMem(addr f32, addr bits, 4)
+      return float64(f32)
   let s = row.getStr(col)
   result = parseFloat(s)
 
 proc getNumeric*(row: Row, col: int): PgNumeric =
+  ## Numeric is always requested as text format (not in binarySafeOids).
   PgNumeric(row.getStr(col))
 
 proc getBool*(row: Row, col: int): bool =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return row.data.buf[off] != 0
   let s = row.getStr(col)
   case s
   of "t", "true", "1":
@@ -594,7 +714,13 @@ proc getBytes*(row: Row, col: int): seq[byte] =
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
-  # PostgreSQL text-format bytea uses hex encoding: \xDEADBEEF
+  if row.isBinaryCol(col):
+    # Binary format: raw bytes, no hex encoding
+    result = newSeq[byte](clen)
+    if clen > 0:
+      copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
+    return
+  # Text format: bytea uses hex encoding \xDEADBEEF
   if clen >= 2 and row.data.buf[off] == byte('\\') and row.data.buf[off + 1] == byte(
     'x'
   ):
@@ -1638,15 +1764,7 @@ proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
 proc getEnum*[T: enum](row: Row, col: int, fields: seq[FieldDescription]): T =
   ## Read a PostgreSQL enum column with format-awareness.
   ## Both text and binary wire formats encode enum values as their label string.
-  if fields[col].formatCode == 0:
-    return getEnum[T](row, col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  var s = newString(clen)
-  if clen > 0:
-    copyMem(addr s[0], unsafeAddr row.data.buf[off], clen)
-  parseEnum[T](s)
+  parseEnum[T](row.getStr(col))
 
 proc getEnumOpt*[T: enum](
     row: Row, col: int, fields: seq[FieldDescription]
