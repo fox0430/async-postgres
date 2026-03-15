@@ -170,6 +170,8 @@ const
     4536, # int8multirange
   ]
 
+  BinarySafeMaxOid = 4536
+
   pgCopyBinaryHeader*: array[19, byte] = [
     byte('P'),
     byte('G'),
@@ -194,6 +196,15 @@ const
     0x00'u8,
   ]
   pgCopyBinaryTrailer*: array[2, byte] = [0xFF'u8, 0xFF'u8] # int16(-1)
+
+func makeBinarySafeLookup(): array[BinarySafeMaxOid + 1, bool] {.compileTime.} =
+  for oid in BinarySafeOids:
+    result[oid] = true
+
+const binarySafeLookup* = makeBinarySafeLookup()
+
+func isBinarySafeOid*(oid: int32): bool =
+  oid >= 0 and oid <= BinarySafeMaxOid and binarySafeLookup[oid]
 
 # Byte-level helpers
 
@@ -672,12 +683,7 @@ proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
   ## Build per-column binary format codes: 1 for known safe types, 0 for others.
   result = newSeq[int16](fields.len)
   for i, f in fields:
-    var safe = false
-    for oid in BinarySafeOids:
-      if f.typeOid == oid:
-        safe = true
-        break
-    result[i] = if safe: 1'i16 else: 0'i16
+    result[i] = if isBinarySafeOid(f.typeOid): 1'i16 else: 0'i16
 
 proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   ## Parse a DataRow message body directly into a RowData flat buffer.

@@ -771,6 +771,24 @@ proc getBool*(row: Row, col: int): bool =
   else:
     raise newException(PgTypeError, "Invalid boolean value: " & s)
 
+# Compile-time generic accessor — static dispatch by type, no OID branching.
+# Usage: let id = row.get(0, int32)
+
+proc get*(row: Row, col: int, T: typedesc[int32]): int32 =
+  row.getInt(col)
+
+proc get*(row: Row, col: int, T: typedesc[int64]): int64 =
+  row.getInt64(col)
+
+proc get*(row: Row, col: int, T: typedesc[float64]): float64 =
+  row.getFloat(col)
+
+proc get*(row: Row, col: int, T: typedesc[bool]): bool =
+  row.getBool(col)
+
+proc get*(row: Row, col: int, T: typedesc[string]): string =
+  row.getStr(col)
+
 proc getBytes*(row: Row, col: int): seq[byte] =
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
@@ -1774,6 +1792,187 @@ proc addBind*(
   for f in resultFormats:
     buf.addInt16(f)
   buf.patchMsgLen(msgStart)
+
+# Zero-alloc parameter encoding — write directly to send buffer
+
+proc writeParamFormat*(buf: var seq[byte], v: int16) =
+  buf.addInt16(1'i16) # binary
+
+proc writeParamFormat*(buf: var seq[byte], v: int32) =
+  buf.addInt16(1'i16)
+
+proc writeParamFormat*(buf: var seq[byte], v: int64) =
+  buf.addInt16(1'i16)
+
+proc writeParamFormat*(buf: var seq[byte], v: int) =
+  buf.addInt16(1'i16)
+
+proc writeParamFormat*(buf: var seq[byte], v: float32) =
+  buf.addInt16(1'i16)
+
+proc writeParamFormat*(buf: var seq[byte], v: float64) =
+  buf.addInt16(1'i16)
+
+proc writeParamFormat*(buf: var seq[byte], v: bool) =
+  buf.addInt16(1'i16)
+
+proc writeParamFormat*(buf: var seq[byte], v: string) =
+  buf.addInt16(0'i16) # text
+
+proc writeParamFormat*(buf: var seq[byte], v: seq[byte]) =
+  buf.addInt16(0'i16)
+
+proc writeParamFormat*(buf: var seq[byte], v: PgNumeric) =
+  buf.addInt16(0'i16)
+
+proc writeParamValue*(buf: var seq[byte], v: int16) =
+  buf.addInt32(2'i32)
+  buf.addInt16(v)
+
+proc writeParamValue*(buf: var seq[byte], v: int32) =
+  buf.addInt32(4'i32)
+  let o = buf.len
+  buf.setLen(o + 4)
+  buf[o] = byte((v shr 24) and 0xFF)
+  buf[o + 1] = byte((v shr 16) and 0xFF)
+  buf[o + 2] = byte((v shr 8) and 0xFF)
+  buf[o + 3] = byte(v and 0xFF)
+
+proc writeParamValue*(buf: var seq[byte], v: int64) =
+  buf.addInt32(8'i32)
+  let o = buf.len
+  buf.setLen(o + 8)
+  buf[o] = byte((v shr 56) and 0xFF)
+  buf[o + 1] = byte((v shr 48) and 0xFF)
+  buf[o + 2] = byte((v shr 40) and 0xFF)
+  buf[o + 3] = byte((v shr 32) and 0xFF)
+  buf[o + 4] = byte((v shr 24) and 0xFF)
+  buf[o + 5] = byte((v shr 16) and 0xFF)
+  buf[o + 6] = byte((v shr 8) and 0xFF)
+  buf[o + 7] = byte(v and 0xFF)
+
+proc writeParamValue*(buf: var seq[byte], v: int) =
+  writeParamValue(buf, int64(v))
+
+proc writeParamValue*(buf: var seq[byte], v: float32) =
+  let bits = cast[int32](v)
+  buf.addInt32(4'i32)
+  let o = buf.len
+  buf.setLen(o + 4)
+  buf[o] = byte((bits shr 24) and 0xFF)
+  buf[o + 1] = byte((bits shr 16) and 0xFF)
+  buf[o + 2] = byte((bits shr 8) and 0xFF)
+  buf[o + 3] = byte(bits and 0xFF)
+
+proc writeParamValue*(buf: var seq[byte], v: float64) =
+  let bits = cast[int64](v)
+  writeParamValue(buf, bits)
+
+proc writeParamValue*(buf: var seq[byte], v: bool) =
+  buf.addInt32(1'i32)
+  buf.add(if v: 1'u8 else: 0'u8)
+
+proc writeParamValue*(buf: var seq[byte], v: string) =
+  buf.addInt32(int32(v.len))
+  if v.len > 0:
+    let o = buf.len
+    buf.setLen(o + v.len)
+    copyMem(addr buf[o], unsafeAddr v[0], v.len)
+
+proc writeParamValue*(buf: var seq[byte], v: seq[byte]) =
+  buf.addInt32(int32(v.len))
+  if v.len > 0:
+    let o = buf.len
+    buf.setLen(o + v.len)
+    copyMem(addr buf[o], unsafeAddr v[0], v.len)
+
+proc writeParamValue*(buf: var seq[byte], v: PgNumeric) =
+  writeParamValue(buf, string(v))
+
+proc writeParamOid*(buf: var seq[byte], v: int16) =
+  buf.addInt32(OidInt2)
+
+proc writeParamOid*(buf: var seq[byte], v: int32) =
+  buf.addInt32(OidInt4)
+
+proc writeParamOid*(buf: var seq[byte], v: int64) =
+  buf.addInt32(OidInt8)
+
+proc writeParamOid*(buf: var seq[byte], v: int) =
+  buf.addInt32(OidInt8)
+
+proc writeParamOid*(buf: var seq[byte], v: float32) =
+  buf.addInt32(OidFloat4)
+
+proc writeParamOid*(buf: var seq[byte], v: float64) =
+  buf.addInt32(OidFloat8)
+
+proc writeParamOid*(buf: var seq[byte], v: bool) =
+  buf.addInt32(OidBool)
+
+proc writeParamOid*(buf: var seq[byte], v: string) =
+  buf.addInt32(OidText)
+
+proc writeParamOid*(buf: var seq[byte], v: seq[byte]) =
+  buf.addInt32(OidBytea)
+
+proc writeParamOid*(buf: var seq[byte], v: PgNumeric) =
+  buf.addInt32(OidNumeric)
+
+macro addParseDirect*(
+    buf: untyped, stmtName: string, sql: string, args: varargs[untyped]
+): untyped =
+  ## Compile-time macro: generates Parse message with OIDs from arg types.
+  result = newStmtList()
+  let msgStart = genSym(nskLet, "msgStart")
+  result.add quote do:
+    let `msgStart` = `buf`.len
+    `buf`.add(byte('P'))
+    `buf`.addInt32(0)
+    `buf`.addCString(`stmtName`)
+    `buf`.addCString(`sql`)
+    `buf`.addInt16(int16(`args`.len))
+  for arg in args:
+    result.add quote do:
+      `buf`.writeParamOid(`arg`)
+  result.add quote do:
+    `buf`.patchMsgLen(`msgStart`)
+
+macro addBindDirect*(
+    buf: untyped,
+    portalName: string,
+    stmtName: string,
+    resultFormats: untyped,
+    args: varargs[untyped],
+): untyped =
+  ## Compile-time macro: generates Bind message writing params directly to buffer.
+  ## Zero intermediate PgParam/seq[byte] allocations.
+  result = newStmtList()
+  let msgStart = genSym(nskLet, "msgStart")
+  let nParams = args.len
+  result.add quote do:
+    let `msgStart` = `buf`.len
+    `buf`.add(byte('B'))
+    `buf`.addInt32(0)
+    `buf`.addCString(`portalName`)
+    `buf`.addCString(`stmtName`)
+    # Parameter format codes
+    `buf`.addInt16(int16(`nParams`))
+  for arg in args:
+    result.add quote do:
+      `buf`.writeParamFormat(`arg`)
+  result.add quote do:
+    # Parameter values
+    `buf`.addInt16(int16(`nParams`))
+  for arg in args:
+    result.add quote do:
+      `buf`.writeParamValue(`arg`)
+  result.add quote do:
+    # Result format codes
+    `buf`.addInt16(int16(`resultFormats`.len))
+    for f in `resultFormats`:
+      `buf`.addInt16(f)
+    `buf`.patchMsgLen(`msgStart`)
 
 # User-defined enum type support
 #

@@ -1,4 +1,4 @@
-import std/[options, tables]
+import std/[options, tables, macros]
 
 import async_backend, pg_protocol, pg_connection, pg_types
 
@@ -349,6 +349,8 @@ template queryRecvLoop(
     cacheHit, cacheMiss: bool,
     stmtName: string,
     cachedFields: var seq[FieldDescription],
+    cachedColFmts: seq[int16],
+    cachedColOids: seq[int32],
     qr: var QueryResult,
     timeout: Duration,
 ) =
@@ -357,12 +359,11 @@ template queryRecvLoop(
 
   if cacheHit:
     qr.fields = cachedFields
-    let c = cachedOpt.get
-    if resultFormats.len > 0 and c.colFmts.len > 0:
+    if resultFormats.len > 0 and cachedColFmts.len > 0:
       for i in 0 ..< qr.fields.len:
-        qr.fields[i].formatCode = c.colFmts[i]
+        qr.fields[i].formatCode = cachedColFmts[i]
     if qr.fields.len > 0:
-      qr.data = newRowData(int16(qr.fields.len), c.colFmts, c.colOids)
+      qr.data = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
 
   block recvLoop:
     while true:
@@ -442,6 +443,8 @@ proc queryImpl(
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
+  var cachedColFmts: seq[int16]
+  var cachedColOids: seq[int32]
 
   var effectiveResultFormats: seq[int16]
 
@@ -449,6 +452,8 @@ proc queryImpl(
     let c = cachedOpt.get
     stmtName = c.name
     cachedFields = c.fields
+    cachedColFmts = c.colFmts
+    cachedColOids = c.colOids
     effectiveResultFormats =
       if resultFormats.len == 0: c.resultFormats else: resultFormats
     var batch = newSeqOfCap[byte](params.len * 16 + 128)
@@ -479,8 +484,8 @@ proc queryImpl(
 
   var qr = QueryResult()
   queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields, qr,
-    timeout,
+    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+    cachedColFmts, cachedColOids, qr, timeout,
   )
   return qr
 
@@ -499,6 +504,8 @@ proc queryImpl(
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
+  var cachedColFmts: seq[int16]
+  var cachedColOids: seq[int32]
 
   var effectiveResultFormats: seq[int16]
 
@@ -506,6 +513,8 @@ proc queryImpl(
     let c = cachedOpt.get
     stmtName = c.name
     cachedFields = c.fields
+    cachedColFmts = c.colFmts
+    cachedColOids = c.colOids
     effectiveResultFormats =
       if resultFormats.len == 0: c.resultFormats else: resultFormats
     var batch = newSeqOfCap[byte](params.len * 16 + 128)
@@ -536,8 +545,8 @@ proc queryImpl(
 
   var qr = QueryResult()
   queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields, qr,
-    timeout,
+    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+    cachedColFmts, cachedColOids, qr, timeout,
   )
   return qr
 
@@ -2171,3 +2180,151 @@ proc openCursor*(
   let (oids, formats, values) = extractParams(params)
   return
     await conn.openCursor(sql, values, oids, formats, resultFormats, chunkSize, timeout)
+
+# Zero-alloc query/exec via compile-time macros
+
+proc queryDirectImpl(
+    conn: PgConnection,
+    sql: string,
+    batch: seq[byte],
+    resultFormats: seq[int16],
+    colFmts: seq[int16],
+    colOids: seq[int32],
+    cacheHit: bool,
+    cacheMiss: bool,
+    stmtName: string,
+    cachedFields: seq[FieldDescription],
+    timeout: Duration,
+): Future[QueryResult] {.async.} =
+  ## Shared receive path for queryDirect macros.
+  await conn.sendMsg(batch)
+  var qr = QueryResult()
+  var cf = cachedFields
+  queryRecvLoop(
+    conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cf, colFmts, colOids, qr,
+    timeout,
+  )
+  return qr
+
+macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =
+  ## Zero-allocation query: encodes parameters directly into the send buffer
+  ## at compile time, avoiding seq[PgParam] and intermediate seq[byte] allocs.
+  ##
+  ## Usage: let qr = await conn.queryDirect("SELECT ... WHERE id = $1", myId)
+  result = newStmtList()
+
+  let connSym = genSym(nskLet, "conn")
+  let sqlSym = genSym(nskLet, "sql")
+  let cachedOptSym = genSym(nskLet, "cachedOpt")
+  let cacheHitSym = genSym(nskVar, "cacheHit")
+  let cacheMissSym = genSym(nskVar, "cacheMiss")
+  let stmtNameSym = genSym(nskVar, "stmtName")
+  let cachedFieldsSym = genSym(nskVar, "cachedFields")
+  let effectiveRfSym = genSym(nskVar, "effectiveRf")
+  let batchSym = genSym(nskVar, "batch")
+  let colFmtsSym = genSym(nskVar, "colFmts")
+  let colOidsSym = genSym(nskVar, "colOids")
+
+  result.add quote do:
+    let `connSym` = `conn`
+    let `sqlSym` = `sql`
+    `connSym`.checkReady()
+    `connSym`.state = csBusy
+
+    let `cachedOptSym` = `connSym`.lookupStmtCache(`sqlSym`)
+    var `cacheHitSym` = `cachedOptSym`.isSome
+    var `cacheMissSym` = false
+    var `stmtNameSym` = ""
+    var `cachedFieldsSym`: seq[FieldDescription]
+    var `effectiveRfSym`: seq[int16]
+    var `batchSym`: seq[byte]
+    var `colFmtsSym`: seq[int16]
+    var `colOidsSym`: seq[int32]
+
+  # Helper to build addBindDirect call with args
+  proc makeBindDirect(buf, portal, stmt, rf: NimNode, argList: NimNode): NimNode =
+    result = newCall(bindSym"addBindDirect", buf, portal, stmt, rf)
+    for i in 0 ..< argList.len:
+      result.add(argList[i])
+
+  proc makeParseDirect(buf, stmt, sql: NimNode, argList: NimNode): NimNode =
+    result = newCall(bindSym"addParseDirect", buf, stmt, sql)
+    for i in 0 ..< argList.len:
+      result.add(argList[i])
+
+  let argList = newNimNode(nnkBracket)
+  for arg in args:
+    argList.add(arg)
+
+  # Cache hit path
+  let hitBlock = newStmtList()
+  hitBlock.add quote do:
+    let c = `cachedOptSym`.get
+    `stmtNameSym` = c.name
+    `cachedFieldsSym` = c.fields
+    `colFmtsSym` = c.colFmts
+    `colOidsSym` = c.colOids
+    `effectiveRfSym` = c.resultFormats
+    `batchSym` = newSeqOfCap[byte](128)
+  hitBlock.add(
+    makeBindDirect(batchSym, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
+  )
+  hitBlock.add quote do:
+    `batchSym`.addExecute("", 0)
+    `batchSym`.addSync()
+
+  # Cache miss path
+  let missBlock = newStmtList()
+  missBlock.add quote do:
+    `cacheMissSym` = true
+    `stmtNameSym` = `connSym`.nextStmtName()
+    `effectiveRfSym` = @[]
+    `batchSym` = newSeqOfCap[byte](`sqlSym`.len + 128)
+  missBlock.add(makeParseDirect(batchSym, stmtNameSym, sqlSym, argList))
+  missBlock.add quote do:
+    `batchSym`.addDescribe(dkStatement, `stmtNameSym`)
+  missBlock.add(
+    makeBindDirect(batchSym, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
+  )
+  missBlock.add quote do:
+    `batchSym`.addExecute("", 0)
+    `batchSym`.addSync()
+
+  # No-cache path
+  let elseBlock = newStmtList()
+  elseBlock.add quote do:
+    `effectiveRfSym` = @[]
+    `batchSym` = newSeqOfCap[byte](`sqlSym`.len + 128)
+  elseBlock.add(makeParseDirect(batchSym, newStrLitNode(""), sqlSym, argList))
+  elseBlock.add(
+    makeBindDirect(
+      batchSym, newStrLitNode(""), newStrLitNode(""), effectiveRfSym, argList
+    )
+  )
+  elseBlock.add quote do:
+    `batchSym`.addDescribe(dkPortal, "")
+    `batchSym`.addExecute("", 0)
+    `batchSym`.addSync()
+
+  # Build if/elif/else
+  let ifNode = newNimNode(nnkIfStmt)
+  ifNode.add(
+    newNimNode(nnkElifBranch).add(
+      quote do:
+        `cacheHitSym`,
+      hitBlock,
+    )
+  )
+
+  let missCondition = quote:
+    `connSym`.stmtCacheCapacity > 0 and
+      `connSym`.stmtCache.len < `connSym`.stmtCacheCapacity
+  ifNode.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
+  ifNode.add(newNimNode(nnkElse).add(elseBlock))
+  result.add(ifNode)
+
+  result.add quote do:
+    queryDirectImpl(
+      `connSym`, `sqlSym`, `batchSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`,
+      `cacheHitSym`, `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, ZeroDuration,
+    )
