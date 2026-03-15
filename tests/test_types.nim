@@ -1,4 +1,4 @@
-import std/[json, unittest, options, strutils, tables, times, math]
+import std/[json, unittest, options, strutils, tables, times, math, net]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
@@ -28,6 +28,10 @@ suite "OID constants":
     check OidInterval == 1186'i32
     check OidUuid == 2950'i32
     check OidJsonb == 3802'i32
+    check OidInet == 869'i32
+    check OidCidr == 650'i32
+    check OidMacAddr == 829'i32
+    check OidMacAddr8 == 774'i32
 
 suite "toPgParam":
   test "string":
@@ -2044,3 +2048,381 @@ suite "coerceBinaryParam":
     except PgTypeError:
       raised = true
     check raised
+
+suite "PgInet":
+  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+    FieldDescription(
+      name: "test",
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: typeOid,
+      typeSize: 0,
+      typeMod: 0,
+      formatCode: formatCode,
+    )
+
+  test "$ IPv4":
+    let v = PgInet(address: parseIpAddress("192.168.1.1"), mask: 24)
+    check $v == "192.168.1.1/24"
+
+  test "$ IPv6":
+    let v = PgInet(address: parseIpAddress("::1"), mask: 128)
+    check $v == "::1/128"
+
+  test "== equality":
+    let a = PgInet(address: parseIpAddress("10.0.0.1"), mask: 32)
+    let b = PgInet(address: parseIpAddress("10.0.0.1"), mask: 32)
+    let c = PgInet(address: parseIpAddress("10.0.0.1"), mask: 24)
+    check a == b
+    check a != c
+
+  test "toPgParam PgInet":
+    let v = PgInet(address: parseIpAddress("192.168.1.1"), mask: 24)
+    let p = toPgParam(v)
+    check p.oid == OidInet
+    check p.format == 0
+    check toString(p.value.get) == "192.168.1.1/24"
+
+  test "toPgBinaryParam PgInet IPv4":
+    let v = PgInet(address: parseIpAddress("192.168.1.1"), mask: 24)
+    let p = toPgBinaryParam(v)
+    check p.oid == OidInet
+    check p.format == 1
+    let data = p.value.get
+    check data.len == 8
+    check data[0] == 2 # AF_INET
+    check data[1] == 24 # mask
+    check data[2] == 0 # is_cidr
+    check data[3] == 4 # addrlen
+    check data[4] == 192
+    check data[5] == 168
+    check data[6] == 1
+    check data[7] == 1
+
+  test "toPgBinaryParam PgInet IPv6":
+    let v = PgInet(address: parseIpAddress("::1"), mask: 128)
+    let p = toPgBinaryParam(v)
+    check p.oid == OidInet
+    check p.format == 1
+    let data = p.value.get
+    check data.len == 20
+    check data[0] == 3 # AF_INET6
+    check data[1] == 128 # mask
+    check data[2] == 0 # is_cidr
+    check data[3] == 16 # addrlen
+    check data[19] == 1 # last byte of ::1
+
+  test "getInet text format":
+    let row: Row = @[some(toBytes("192.168.1.1/24"))]
+    let v = row.getInet(0)
+    check v.address == parseIpAddress("192.168.1.1")
+    check v.mask == 24
+
+  test "getInet text format no mask":
+    let row: Row = @[some(toBytes("10.0.0.1"))]
+    let v = row.getInet(0)
+    check v.address == parseIpAddress("10.0.0.1")
+    check v.mask == 32
+
+  test "getInet binary format IPv4":
+    let data = @[2'u8, 24, 0, 4, 192, 168, 1, 1]
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidInet, 1)]
+    let v = row.getInet(0, fields)
+    check v.address == parseIpAddress("192.168.1.1")
+    check v.mask == 24
+
+  test "getInet binary format IPv6":
+    var data = newSeq[byte](20)
+    data[0] = 3 # AF_INET6
+    data[1] = 64 # mask
+    data[2] = 0 # is_cidr
+    data[3] = 16 # addrlen
+    # fe80::1
+    data[4] = 0xfe
+    data[5] = 0x80
+    data[19] = 1
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidInet, 1)]
+    let v = row.getInet(0, fields)
+    check v.address == parseIpAddress("fe80::1")
+    check v.mask == 64
+
+  test "getInet binary NULL raises":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidInet, 1)]
+    var raised = false
+    try:
+      discard row.getInet(0, fields)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getInetOpt text some":
+    let row: Row = @[some(toBytes("10.0.0.1/32"))]
+    let v = row.getInetOpt(0)
+    check v.isSome
+    check v.get.mask == 32
+
+  test "getInetOpt text none":
+    let row: Row = @[none(seq[byte])]
+    check row.getInetOpt(0) == none(PgInet)
+
+  test "getInetOpt binary some":
+    let data = @[2'u8, 32, 0, 4, 10, 0, 0, 1]
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidInet, 1)]
+    let v = row.getInetOpt(0, fields)
+    check v.isSome
+    check v.get.address == parseIpAddress("10.0.0.1")
+
+  test "getInetOpt binary none":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidInet, 1)]
+    check row.getInetOpt(0, fields) == none(PgInet)
+
+  test "toPgParam Option[PgInet] some":
+    let p = toPgParam(some(PgInet(address: parseIpAddress("10.0.0.1"), mask: 32)))
+    check p.oid == OidInet
+    check p.value.isSome
+
+  test "toPgParam Option[PgInet] none":
+    let p = toPgParam(none(PgInet))
+    check p.oid == OidInet
+    check p.value.isNone
+
+  test "roundtrip binary IPv4":
+    let orig = PgInet(address: parseIpAddress("172.16.0.1"), mask: 16)
+    let p = toPgBinaryParam(orig)
+    let data = p.value.get
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidInet, 1)]
+    let decoded = row.getInet(0, fields)
+    check decoded == orig
+
+  test "roundtrip binary IPv6":
+    let orig = PgInet(address: parseIpAddress("2001:db8::1"), mask: 48)
+    let p = toPgBinaryParam(orig)
+    let data = p.value.get
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidInet, 1)]
+    let decoded = row.getInet(0, fields)
+    check decoded == orig
+
+suite "PgCidr":
+  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+    FieldDescription(
+      name: "test",
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: typeOid,
+      typeSize: 0,
+      typeMod: 0,
+      formatCode: formatCode,
+    )
+
+  test "$ PgCidr":
+    let v = PgCidr(address: parseIpAddress("192.168.1.0"), mask: 24)
+    check $v == "192.168.1.0/24"
+
+  test "== equality":
+    let a = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+    let b = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+    check a == b
+
+  test "toPgParam PgCidr":
+    let v = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+    let p = toPgParam(v)
+    check p.oid == OidCidr
+    check p.format == 0
+
+  test "toPgBinaryParam PgCidr IPv4":
+    let v = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+    let p = toPgBinaryParam(v)
+    check p.oid == OidCidr
+    let data = p.value.get
+    check data[0] == 2 # AF_INET
+    check data[1] == 8 # mask
+    check data[2] == 1 # is_cidr
+    check data[3] == 4
+
+  test "getCidr text format":
+    let row: Row = @[some(toBytes("10.0.0.0/8"))]
+    let v = row.getCidr(0)
+    check v.address == parseIpAddress("10.0.0.0")
+    check v.mask == 8
+
+  test "getCidr binary format":
+    let data = @[2'u8, 8, 1, 4, 10, 0, 0, 0]
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidCidr, 1)]
+    let v = row.getCidr(0, fields)
+    check v.address == parseIpAddress("10.0.0.0")
+    check v.mask == 8
+
+  test "getCidrOpt text none":
+    let row: Row = @[none(seq[byte])]
+    check row.getCidrOpt(0) == none(PgCidr)
+
+  test "roundtrip binary":
+    let orig = PgCidr(address: parseIpAddress("192.168.0.0"), mask: 16)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[some(p.value.get)]
+    let fields = @[mkField(OidCidr, 1)]
+    let decoded = row.getCidr(0, fields)
+    check decoded == orig
+
+suite "PgMacAddr":
+  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+    FieldDescription(
+      name: "test",
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: typeOid,
+      typeSize: 0,
+      typeMod: 0,
+      formatCode: formatCode,
+    )
+
+  test "$ PgMacAddr":
+    let v = PgMacAddr("08:00:2b:01:02:03")
+    check $v == "08:00:2b:01:02:03"
+
+  test "== equality":
+    let a = PgMacAddr("08:00:2b:01:02:03")
+    let b = PgMacAddr("08:00:2b:01:02:03")
+    let c = PgMacAddr("08:00:2b:01:02:04")
+    check a == b
+    check a != c
+
+  test "toPgParam PgMacAddr":
+    let v = PgMacAddr("08:00:2b:01:02:03")
+    let p = toPgParam(v)
+    check p.oid == OidMacAddr
+    check p.format == 0
+    check toString(p.value.get) == "08:00:2b:01:02:03"
+
+  test "toPgBinaryParam PgMacAddr":
+    let v = PgMacAddr("08:00:2b:01:02:03")
+    let p = toPgBinaryParam(v)
+    check p.oid == OidMacAddr
+    check p.format == 1
+    let data = p.value.get
+    check data.len == 6
+    check data[0] == 0x08
+    check data[1] == 0x00
+    check data[2] == 0x2b
+    check data[3] == 0x01
+    check data[4] == 0x02
+    check data[5] == 0x03
+
+  test "getMacAddr text format":
+    let row: Row = @[some(toBytes("08:00:2b:01:02:03"))]
+    let v = row.getMacAddr(0)
+    check v == PgMacAddr("08:00:2b:01:02:03")
+
+  test "getMacAddr binary format":
+    let data = @[0x08'u8, 0x00, 0x2b, 0x01, 0x02, 0x03]
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidMacAddr, 1)]
+    let v = row.getMacAddr(0, fields)
+    check v == PgMacAddr("08:00:2b:01:02:03")
+
+  test "getMacAddr binary NULL raises":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidMacAddr, 1)]
+    var raised = false
+    try:
+      discard row.getMacAddr(0, fields)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getMacAddrOpt text some":
+    let row: Row = @[some(toBytes("08:00:2b:01:02:03"))]
+    let v = row.getMacAddrOpt(0)
+    check v.isSome
+    check v.get == PgMacAddr("08:00:2b:01:02:03")
+
+  test "getMacAddrOpt text none":
+    let row: Row = @[none(seq[byte])]
+    check row.getMacAddrOpt(0) == none(PgMacAddr)
+
+  test "roundtrip binary":
+    let orig = PgMacAddr("aa:bb:cc:dd:ee:ff")
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[some(p.value.get)]
+    let fields = @[mkField(OidMacAddr, 1)]
+    let decoded = row.getMacAddr(0, fields)
+    check decoded == orig
+
+suite "PgMacAddr8":
+  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+    FieldDescription(
+      name: "test",
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: typeOid,
+      typeSize: 0,
+      typeMod: 0,
+      formatCode: formatCode,
+    )
+
+  test "$ PgMacAddr8":
+    let v = PgMacAddr8("08:00:2b:01:02:03:04:05")
+    check $v == "08:00:2b:01:02:03:04:05"
+
+  test "== equality":
+    let a = PgMacAddr8("08:00:2b:01:02:03:04:05")
+    let b = PgMacAddr8("08:00:2b:01:02:03:04:05")
+    check a == b
+
+  test "toPgParam PgMacAddr8":
+    let v = PgMacAddr8("08:00:2b:01:02:03:04:05")
+    let p = toPgParam(v)
+    check p.oid == OidMacAddr8
+    check p.format == 0
+
+  test "toPgBinaryParam PgMacAddr8":
+    let v = PgMacAddr8("08:00:2b:01:02:03:04:05")
+    let p = toPgBinaryParam(v)
+    check p.oid == OidMacAddr8
+    check p.format == 1
+    let data = p.value.get
+    check data.len == 8
+    check data[0] == 0x08
+    check data[7] == 0x05
+
+  test "getMacAddr8 text format":
+    let row: Row = @[some(toBytes("08:00:2b:01:02:03:04:05"))]
+    let v = row.getMacAddr8(0)
+    check v == PgMacAddr8("08:00:2b:01:02:03:04:05")
+
+  test "getMacAddr8 binary format":
+    let data = @[0x08'u8, 0x00, 0x2b, 0x01, 0x02, 0x03, 0x04, 0x05]
+    let row: Row = @[some(data)]
+    let fields = @[mkField(OidMacAddr8, 1)]
+    let v = row.getMacAddr8(0, fields)
+    check v == PgMacAddr8("08:00:2b:01:02:03:04:05")
+
+  test "getMacAddr8 binary NULL raises":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidMacAddr8, 1)]
+    var raised = false
+    try:
+      discard row.getMacAddr8(0, fields)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getMacAddr8Opt text none":
+    let row: Row = @[none(seq[byte])]
+    check row.getMacAddr8Opt(0) == none(PgMacAddr8)
+
+  test "roundtrip binary":
+    let orig = PgMacAddr8("aa:bb:cc:dd:ee:ff:00:11")
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[some(p.value.get)]
+    let fields = @[mkField(OidMacAddr8, 1)]
+    let decoded = row.getMacAddr8(0, fields)
+    check decoded == orig
