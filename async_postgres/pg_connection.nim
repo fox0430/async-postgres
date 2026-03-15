@@ -119,6 +119,7 @@ type
     reconnectCallback*: proc() {.gcsafe, raises: [].}
     notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
     stmtCache*: Table[string, CachedStmt]
+    stmtCacheLru*: seq[string] ## LRU order: oldest at front, newest at back
     stmtCounter*: int
     stmtCacheCapacity*: int ## 0=disabled, default 256
 
@@ -212,28 +213,50 @@ proc nextStmtName*(conn: PgConnection): string =
 
 proc clearStmtCache*(conn: PgConnection) =
   conn.stmtCache.clear()
+  conn.stmtCacheLru.setLen(0)
 
 proc lookupStmtCache*(conn: PgConnection, sql: string): Option[CachedStmt] =
   if conn.stmtCacheCapacity <= 0:
     return none(CachedStmt)
   if conn.stmtCache.hasKey(sql):
+    # Move to back of LRU list (most recently used)
+    for i in 0 ..< conn.stmtCacheLru.len:
+      if conn.stmtCacheLru[i] == sql:
+        conn.stmtCacheLru.delete(i)
+        conn.stmtCacheLru.add(sql)
+        break
     return some(conn.stmtCache[sql])
   return none(CachedStmt)
 
+proc evictStmtCache*(conn: PgConnection): CachedStmt =
+  ## Evict the least recently used entry from the cache. Returns the evicted entry.
+  let oldSql = conn.stmtCacheLru[0]
+  conn.stmtCacheLru.delete(0)
+  result = conn.stmtCache[oldSql]
+  conn.stmtCache.del(oldSql)
+
 proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
-  if conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
-    var entry = cached
-    if entry.resultFormats.len == 0 and entry.fields.len > 0:
-      entry.resultFormats = buildResultFormats(entry.fields)
-      entry.colFmts = newSeq[int16](entry.fields.len)
-      entry.colOids = newSeq[int32](entry.fields.len)
-      for i in 0 ..< entry.fields.len:
-        entry.colOids[i] = entry.fields[i].typeOid
-        entry.colFmts[i] = entry.resultFormats[i]
-    conn.stmtCache[sql] = entry
+  if conn.stmtCacheCapacity <= 0:
+    return
+  if conn.stmtCache.len >= conn.stmtCacheCapacity:
+    return # caller should have evicted; skip if still full
+  var entry = cached
+  if entry.resultFormats.len == 0 and entry.fields.len > 0:
+    entry.resultFormats = buildResultFormats(entry.fields)
+    entry.colFmts = newSeq[int16](entry.fields.len)
+    entry.colOids = newSeq[int32](entry.fields.len)
+    for i in 0 ..< entry.fields.len:
+      entry.colOids[i] = entry.fields[i].typeOid
+      entry.colFmts[i] = entry.resultFormats[i]
+  conn.stmtCache[sql] = entry
+  conn.stmtCacheLru.add(sql)
 
 proc removeStmtCache*(conn: PgConnection, sql: string) =
   conn.stmtCache.del(sql)
+  for i in 0 ..< conn.stmtCacheLru.len:
+    if conn.stmtCacheLru[i] == sql:
+      conn.stmtCacheLru.delete(i)
+      break
 
 when hasAsyncDispatch:
   proc sendRawData(socket: AsyncSocket, p: pointer, len: int): Future[void] =
