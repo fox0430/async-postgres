@@ -201,7 +201,7 @@ func makeBinarySafeLookup(): array[BinarySafeMaxOid + 1, bool] {.compileTime.} =
   for oid in BinarySafeOids:
     result[oid] = true
 
-const binarySafeLookup* = makeBinarySafeLookup()
+const binarySafeLookup = makeBinarySafeLookup()
 
 func isBinarySafeOid*(oid: int32): bool =
   oid >= 0 and oid <= BinarySafeMaxOid and binarySafeLookup[oid]
