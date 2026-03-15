@@ -2060,7 +2060,8 @@ proc getComposite*[T: object](row: Row, col: int, fields: seq[FieldDescription])
         val = some(inner)
     else:
       if f.len == -1:
-        raise newException(PgTypeError, "NULL field in binary composite at index " & $idx)
+        raise
+          newException(PgTypeError, "NULL field in binary composite at index " & $idx)
       decodeBinaryField(val, row.data.buf, fOff, fEnd, f.len)
     idx += 1
 
