@@ -326,21 +326,12 @@ template queryRecvLoop(
 
   if cacheHit:
     qr.fields = cachedFields
-    var colFmts: seq[int16]
-    var colOids: seq[int32]
-    if resultFormats.len > 0:
-      colFmts = newSeq[int16](qr.fields.len)
-      colOids = newSeq[int32](qr.fields.len)
+    let c = cachedOpt.get
+    if resultFormats.len > 0 and c.colFmts.len > 0:
       for i in 0 ..< qr.fields.len:
-        colOids[i] = qr.fields[i].typeOid
-        if resultFormats.len == 1:
-          qr.fields[i].formatCode = resultFormats[0]
-          colFmts[i] = resultFormats[0]
-        elif i < resultFormats.len:
-          qr.fields[i].formatCode = resultFormats[i]
-          colFmts[i] = resultFormats[i]
+        qr.fields[i].formatCode = c.colFmts[i]
     if qr.fields.len > 0:
-      qr.data = newRowData(int16(qr.fields.len), colFmts, colOids)
+      qr.data = newRowData(int16(qr.fields.len), c.colFmts, c.colOids)
 
   block recvLoop:
     while true:
@@ -421,17 +412,14 @@ proc queryImpl(
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
 
-  # Auto-select binary result format for known-safe types on cache hit
-  let effectiveResultFormats =
-    if resultFormats.len == 0 and cacheHit:
-      buildResultFormats(cachedOpt.get.fields)
-    else:
-      resultFormats
+  var effectiveResultFormats: seq[int16]
 
   if cacheHit:
     let c = cachedOpt.get
     stmtName = c.name
     cachedFields = c.fields
+    effectiveResultFormats =
+      if resultFormats.len == 0: c.resultFormats else: resultFormats
     var batch = newSeqOfCap[byte](params.len * 16 + 128)
     batch.addBind("", stmtName, formats, params, effectiveResultFormats)
     batch.addExecute("", 0)
@@ -440,6 +428,7 @@ proc queryImpl(
   elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
     cacheMiss = true
     stmtName = conn.nextStmtName()
+    effectiveResultFormats = resultFormats
     var batch = newSeqOfCap[byte](sql.len + 128)
     batch.addParse(stmtName, sql, paramOids)
     batch.addDescribe(dkStatement, stmtName)
@@ -448,6 +437,7 @@ proc queryImpl(
     batch.addSync()
     await conn.sendMsg(batch)
   else:
+    effectiveResultFormats = resultFormats
     var batch = newSeqOfCap[byte](sql.len + 128)
     batch.addParse("", sql, paramOids)
     batch.addBind("", "", formats, params, effectiveResultFormats)
@@ -479,17 +469,14 @@ proc queryImpl(
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
 
-  # Auto-select binary result format for known-safe types on cache hit
-  let effectiveResultFormats =
-    if resultFormats.len == 0 and cacheHit:
-      buildResultFormats(cachedOpt.get.fields)
-    else:
-      resultFormats
+  var effectiveResultFormats: seq[int16]
 
   if cacheHit:
     let c = cachedOpt.get
     stmtName = c.name
     cachedFields = c.fields
+    effectiveResultFormats =
+      if resultFormats.len == 0: c.resultFormats else: resultFormats
     var batch = newSeqOfCap[byte](params.len * 16 + 128)
     batch.addBind("", stmtName, params, effectiveResultFormats)
     batch.addExecute("", 0)
@@ -498,6 +485,7 @@ proc queryImpl(
   elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
     cacheMiss = true
     stmtName = conn.nextStmtName()
+    effectiveResultFormats = resultFormats
     var batch = newSeqOfCap[byte](sql.len + 128)
     batch.addParse(stmtName, sql, params)
     batch.addDescribe(dkStatement, stmtName)
@@ -506,6 +494,7 @@ proc queryImpl(
     batch.addSync()
     await conn.sendMsg(batch)
   else:
+    effectiveResultFormats = resultFormats
     var batch = newSeqOfCap[byte](sql.len + 128)
     batch.addParse("", sql, params)
     batch.addBind("", "", params, effectiveResultFormats)

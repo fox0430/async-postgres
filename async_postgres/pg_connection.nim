@@ -78,6 +78,9 @@ type
   CachedStmt* = object
     name*: string ## Server-side statement name ("_sc_1", "_sc_2", ...)
     fields*: seq[FieldDescription] ## From Describe(Statement), formatCode=0
+    resultFormats*: seq[int16] ## Cached buildResultFormats() output
+    colFmts*: seq[int16] ## Per-column format codes for RowData
+    colOids*: seq[int32] ## Per-column type OIDs for RowData
 
   PgConnection* = ref object
     when hasChronos:
@@ -219,7 +222,15 @@ proc lookupStmtCache*(conn: PgConnection, sql: string): Option[CachedStmt] =
 
 proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   if conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
-    conn.stmtCache[sql] = cached
+    var entry = cached
+    if entry.resultFormats.len == 0 and entry.fields.len > 0:
+      entry.resultFormats = buildResultFormats(entry.fields)
+      entry.colFmts = newSeq[int16](entry.fields.len)
+      entry.colOids = newSeq[int32](entry.fields.len)
+      for i in 0 ..< entry.fields.len:
+        entry.colOids[i] = entry.fields[i].typeOid
+        entry.colFmts[i] = entry.resultFormats[i]
+    conn.stmtCache[sql] = entry
 
 proc removeStmtCache*(conn: PgConnection, sql: string) =
   conn.stmtCache.del(sql)
