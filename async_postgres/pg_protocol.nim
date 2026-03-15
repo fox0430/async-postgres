@@ -134,6 +134,7 @@ type
     buf*: seq[byte] ## All column data concatenated
     cellIndex*: seq[int32] ## [off, len, off, len, ...] per cell; len=-1 = NULL
     numCols*: int16
+    colFormats*: seq[int16] ## Per-column format codes (0=text, 1=binary)
 
   Row* = object
     data*: RowData

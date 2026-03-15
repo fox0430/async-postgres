@@ -1,4 +1,4 @@
-import std/[json, options, strutils, tables, times, net]
+import std/[json, macros, options, strutils, tables, times, net]
 
 import pg_protocol
 
@@ -1587,3 +1587,72 @@ proc addBind*(
   for f in resultFormats:
     buf.addInt16(f)
   buf.patchMsgLen(msgStart)
+
+# User-defined enum type support
+#
+# PostgreSQL user-defined enums have dynamic OIDs assigned at creation time.
+# Both text and binary wire formats transmit the enum label as a UTF-8 string.
+#
+# Usage:
+#   type Mood = enum
+#     happy = "happy"
+#     sad = "sad"
+#     ok = "ok"
+#
+#   pgEnum(Mood)                  # OID = 0; PostgreSQL infers the type
+#   pgEnum(Mood, 12345'i32)      # explicit OID (e.g. from pg_type lookup)
+#
+# Reading rows:
+#   let m = row.getEnum[Mood](0)
+#   let m = row.getEnumOpt[Mood](0)
+#   let m = row.getEnum[Mood](0, fields)   # binary-format aware
+
+macro pgEnum*(T: untyped): untyped =
+  ## Generate ``toPgParam`` for a Nim enum type.
+  ## The parameter is sent as text with OID 0 (unspecified) so that
+  ## PostgreSQL infers the enum type from context.
+  result = newStmtList()
+  result.add quote do:
+    proc toPgParam*(v: `T`): PgParam =
+      PgParam(oid: 0'i32, format: 0'i16, value: some(toBytes($v)))
+
+macro pgEnum*(T: untyped, oid: untyped): untyped =
+  ## Generate ``toPgParam`` for a Nim enum type with an explicit OID.
+  result = newStmtList()
+  result.add quote do:
+    proc toPgParam*(v: `T`): PgParam =
+      PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
+
+proc getEnum*[T: enum](row: Row, col: int): T =
+  ## Read a PostgreSQL enum column (text format) as a Nim enum.
+  ## The column value must exactly match one of ``T``'s string representations.
+  parseEnum[T](row.getStr(col))
+
+proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
+  ## NULL-safe version of ``getEnum``.
+  if row.isNull(col):
+    none(T)
+  else:
+    some(getEnum[T](row, col))
+
+proc getEnum*[T: enum](row: Row, col: int, fields: seq[FieldDescription]): T =
+  ## Read a PostgreSQL enum column with format-awareness.
+  ## Both text and binary wire formats encode enum values as their label string.
+  if fields[col].formatCode == 0:
+    return getEnum[T](row, col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  var s = newString(clen)
+  if clen > 0:
+    copyMem(addr s[0], unsafeAddr row.data.buf[off], clen)
+  parseEnum[T](s)
+
+proc getEnumOpt*[T: enum](
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[T] =
+  ## NULL-safe version of ``getEnum`` with format-awareness.
+  if row.isNull(col):
+    none(T)
+  else:
+    some(getEnum[T](row, col, fields))

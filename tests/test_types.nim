@@ -2426,3 +2426,136 @@ suite "PgMacAddr8":
     let fields = @[mkField(OidMacAddr8, 1)]
     let decoded = row.getMacAddr8(0, fields)
     check decoded == orig
+
+# User-defined enum tests
+
+type
+  Mood = enum
+    happy = "happy"
+    sad = "sad"
+    ok = "ok"
+
+  Color = enum
+    red
+    green
+    blue
+
+pgEnum(Mood)
+pgEnum(Color, 99999)
+
+suite "User-defined enum":
+  proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
+    FieldDescription(
+      name: "test",
+      tableOid: 0,
+      columnAttrNum: 0,
+      typeOid: typeOid,
+      typeSize: 0,
+      typeMod: 0,
+      formatCode: formatCode,
+    )
+
+  test "pgEnum generates toPgParam with OID 0":
+    let p = toPgParam(happy)
+    check p.oid == 0'i32
+    check p.format == 0'i16
+    check p.value.isSome
+    check toString(p.value.get) == "happy"
+
+  test "pgEnum with custom string values":
+    let p = toPgParam(sad)
+    check toString(p.value.get) == "sad"
+
+  test "pgEnum with explicit OID":
+    let p = toPgParam(red)
+    check p.oid == 99999'i32
+    check p.format == 0'i16
+    check toString(p.value.get) == "red"
+
+  test "pgEnum explicit OID all values":
+    check toString(toPgParam(green).value.get) == "green"
+    check toString(toPgParam(blue).value.get) == "blue"
+
+  test "getEnum text format":
+    let row: Row = @[some(toBytes("happy"))]
+    check getEnum[Mood](row, 0) == happy
+
+  test "getEnum all values":
+    check getEnum[Mood](Row @[some(toBytes("sad"))], 0) == sad
+    check getEnum[Mood](Row @[some(toBytes("ok"))], 0) == ok
+
+  test "getEnum raises on invalid value":
+    let row: Row = @[some(toBytes("unknown"))]
+    var raised = false
+    try:
+      discard getEnum[Mood](row, 0)
+    except ValueError:
+      raised = true
+    check raised
+
+  test "getEnum raises on NULL":
+    let row: Row = @[none(seq[byte])]
+    var raised = false
+    try:
+      discard getEnum[Mood](row, 0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getEnumOpt some":
+    let row: Row = @[some(toBytes("happy"))]
+    check getEnumOpt[Mood](row, 0) == some(happy)
+
+  test "getEnumOpt none":
+    let row: Row = @[none(seq[byte])]
+    check getEnumOpt[Mood](row, 0) == none(Mood)
+
+  test "getEnum binary format":
+    let row: Row = @[some(toBytes("sad"))]
+    # Use a non-standard OID to simulate a user-defined enum type
+    let fields = @[mkField(99999'i32, 1'i16)]
+    check getEnum[Mood](row, 0, fields) == sad
+
+  test "getEnum binary format falls back to text":
+    let row: Row = @[some(toBytes("ok"))]
+    let fields = @[mkField(99999'i32, 0'i16)]
+    check getEnum[Mood](row, 0, fields) == ok
+
+  test "getEnumOpt binary NULL":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(99999'i32, 1'i16)]
+    check getEnumOpt[Mood](row, 0, fields) == none(Mood)
+
+  test "getEnum binary NULL raises":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(99999'i32, 1'i16)]
+    var raised = false
+    try:
+      discard getEnum[Mood](row, 0, fields)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "Option[Enum] toPgParam some":
+    let p = toPgParam(some(happy))
+    check p.oid == 0'i32
+    check p.format == 0'i16
+    check toString(p.value.get) == "happy"
+
+  test "Option[Enum] toPgParam none":
+    let p = toPgParam(none(Mood))
+    check p.oid == 0'i32
+    check p.value.isNone
+
+  test "roundtrip text":
+    let orig = ok
+    let p = toPgParam(orig)
+    let row: Row = @[p.value]
+    check getEnum[Mood](row, 0) == orig
+
+  test "roundtrip binary":
+    let orig = happy
+    let p = toPgParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(99999'i32, 1'i16)]
+    check getEnum[Mood](row, 0, fields) == orig
