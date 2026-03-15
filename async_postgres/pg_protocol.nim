@@ -272,7 +272,6 @@ proc encodeQuery*(sql: string): seq[byte] =
 const
   syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
   flushMsg* = [byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]
-  terminateMsg = [byte('X'), 0'u8, 0'u8, 0'u8, 4'u8]
   copyDoneMsg* = [byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
 
 proc addFixedMsg(buf: var seq[byte], msg: array[5, byte]) {.inline.} =
@@ -405,14 +404,19 @@ proc encodeCancelRequest*(pid: int32, secretKey: int32): seq[byte] =
   result.addInt32(pid)
   result.addInt32(secretKey)
 
-proc encodeCopyData*(buf: var seq[byte], data: seq[byte]) =
+proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
   ## Encode a CopyData message, appending to `buf`.
-  buf.add(byte('d'))
-  buf.addInt32(int32(4 + data.len))
+  ## Single setLen for header + payload to minimize bounds checks.
+  let msgLen = int32(4 + data.len)
+  let oldLen = buf.len
+  buf.setLen(oldLen + 5 + data.len)
+  buf[oldLen] = byte('d')
+  buf[oldLen + 1] = byte((msgLen shr 24) and 0xFF)
+  buf[oldLen + 2] = byte((msgLen shr 16) and 0xFF)
+  buf[oldLen + 3] = byte((msgLen shr 8) and 0xFF)
+  buf[oldLen + 4] = byte(msgLen and 0xFF)
   if data.len > 0:
-    let oldLen = buf.len
-    buf.setLen(oldLen + data.len)
-    copyMem(addr buf[oldLen], unsafeAddr data[0], data.len)
+    copyMem(addr buf[oldLen + 5], unsafeAddr data[0], data.len)
 
 proc encodeCopyDone*(): seq[byte] =
   result = @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
@@ -759,3 +763,93 @@ proc formatError*(fields: seq[ErrorField]): string =
     result.add("\nDETAIL: " & detail)
   if hint.len > 0:
     result.add("\nHINT: " & hint)
+
+# Binary COPY format helpers
+
+const
+  pgCopyBinaryHeader*: array[19, byte] = [
+    byte('P'),
+    byte('G'),
+    byte('C'),
+    byte('O'),
+    byte('P'),
+    byte('Y'),
+    byte('\n'),
+    0xFF'u8,
+    byte('\r'),
+    byte('\n'),
+    0x00'u8,
+    # flags (int32 = 0)
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+    # header extension area length (int32 = 0)
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+    0x00'u8,
+  ]
+  pgCopyBinaryTrailer*: array[2, byte] = [0xFF'u8, 0xFF'u8] # int16(-1)
+
+proc addCopyBinaryHeader*(buf: var seq[byte]) =
+  let oldLen = buf.len
+  buf.setLen(oldLen + pgCopyBinaryHeader.len)
+  copyMem(addr buf[oldLen], unsafeAddr pgCopyBinaryHeader[0], pgCopyBinaryHeader.len)
+
+proc addCopyBinaryTrailer*(buf: var seq[byte]) =
+  let oldLen = buf.len
+  buf.setLen(oldLen + 2)
+  buf[oldLen] = 0xFF'u8
+  buf[oldLen + 1] = 0xFF'u8
+
+proc addCopyTupleStart*(buf: var seq[byte], numCols: int16) =
+  buf.addInt16(numCols)
+
+proc addCopyFieldNull*(buf: var seq[byte]) =
+  buf.addInt32(-1'i32)
+
+proc addCopyFieldInt16*(buf: var seq[byte], val: int16) =
+  buf.addInt32(2'i32)
+  buf.addInt16(val)
+
+proc addCopyFieldInt32*(buf: var seq[byte], val: int32) =
+  buf.addInt32(4'i32)
+  buf.addInt32(val)
+
+proc addCopyFieldInt64*(buf: var seq[byte], val: int64) =
+  buf.addInt32(8'i32)
+  let oldLen = buf.len
+  buf.setLen(oldLen + 8)
+  buf[oldLen] = byte((val shr 56) and 0xFF)
+  buf[oldLen + 1] = byte((val shr 48) and 0xFF)
+  buf[oldLen + 2] = byte((val shr 40) and 0xFF)
+  buf[oldLen + 3] = byte((val shr 32) and 0xFF)
+  buf[oldLen + 4] = byte((val shr 24) and 0xFF)
+  buf[oldLen + 5] = byte((val shr 16) and 0xFF)
+  buf[oldLen + 6] = byte((val shr 8) and 0xFF)
+  buf[oldLen + 7] = byte(val and 0xFF)
+
+proc addCopyFieldFloat64*(buf: var seq[byte], val: float64) =
+  buf.addCopyFieldInt64(cast[int64](val))
+
+proc addCopyFieldFloat32*(buf: var seq[byte], val: float32) =
+  buf.addCopyFieldInt32(cast[int32](val))
+
+proc addCopyFieldBool*(buf: var seq[byte], val: bool) =
+  buf.addInt32(1'i32)
+  buf.add(if val: 1'u8 else: 0'u8)
+
+proc addCopyFieldText*(buf: var seq[byte], val: openArray[byte]) =
+  buf.addInt32(int32(val.len))
+  if val.len > 0:
+    let oldLen = buf.len
+    buf.setLen(oldLen + val.len)
+    copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
+
+proc addCopyFieldString*(buf: var seq[byte], val: string) =
+  buf.addInt32(int32(val.len))
+  if val.len > 0:
+    let oldLen = buf.len
+    buf.setLen(oldLen + val.len)
+    copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
