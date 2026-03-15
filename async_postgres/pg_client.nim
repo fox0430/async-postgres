@@ -44,6 +44,37 @@ type
     access*: AccessMode
     deferrable*: DeferrableMode
 
+  PipelineOpKind = enum
+    pokExec
+    pokQuery
+
+  PipelineOp = object
+    kind: PipelineOpKind
+    sql: string
+    params: seq[Option[seq[byte]]]
+    paramOids: seq[int32]
+    paramFormats: seq[int16]
+    resultFormats: seq[int16]
+    # Set during send phase
+    cacheHit: bool
+    cacheMiss: bool
+    stmtName: string
+
+  PipelineResultKind* = enum
+    prkExec
+    prkQuery
+
+  PipelineResult* = object
+    case kind*: PipelineResultKind
+    of prkExec:
+      commandTag*: string
+    of prkQuery:
+      queryResult*: QueryResult
+
+  Pipeline* = object
+    conn: PgConnection
+    ops: seq[PipelineOp]
+
 proc buildBeginSql*(opts: TransactionOptions): string =
   result = "BEGIN"
   case opts.isolation
@@ -1617,6 +1648,262 @@ proc queryInTransaction*(
     return await queryInTransactionImpl(
       conn, beginSql, sql, values, oids, formats, resultFormats, timeout
     )
+
+proc newPipeline*(conn: PgConnection): Pipeline =
+  Pipeline(conn: conn, ops: @[])
+
+proc addExec*(p: var Pipeline, sql: string, params: seq[PgParam] = @[]) =
+  let (oids, formats, values) = extractParams(params)
+  p.ops.add PipelineOp(
+    kind: pokExec, sql: sql, params: values, paramOids: oids, paramFormats: formats
+  )
+
+proc addExec*(
+    p: var Pipeline,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+) =
+  p.ops.add PipelineOp(
+    kind: pokExec,
+    sql: sql,
+    params: params,
+    paramOids: paramOids,
+    paramFormats: paramFormats,
+  )
+
+proc addQuery*(
+    p: var Pipeline,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormats: seq[int16] = @[],
+) =
+  let (oids, formats, values) = extractParams(params)
+  p.ops.add PipelineOp(
+    kind: pokQuery,
+    sql: sql,
+    params: values,
+    paramOids: oids,
+    paramFormats: formats,
+    resultFormats: resultFormats,
+  )
+
+proc addQuery*(
+    p: var Pipeline,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    resultFormats: seq[int16] = @[],
+) =
+  p.ops.add PipelineOp(
+    kind: pokQuery,
+    sql: sql,
+    params: params,
+    paramOids: paramOids,
+    paramFormats: paramFormats,
+    resultFormats: resultFormats,
+  )
+
+proc executeImpl(
+    pIn: Pipeline, timeout: Duration
+): Future[seq[PipelineResult]] {.async.} =
+  var p = pIn
+  let conn = p.conn
+  conn.checkReady()
+  conn.state = csBusy
+
+  # Send Phase — also collect CachedStmt data needed by receive phase
+  var batch = newSeqOfCap[byte](p.ops.len * 256)
+  var cachedStmts = newSeq[CachedStmt](p.ops.len) # populated for cache-hit ops
+
+  for i in 0 ..< p.ops.len:
+    let formats =
+      if p.ops[i].paramFormats.len > 0:
+        p.ops[i].paramFormats
+      else:
+        newSeq[int16](p.ops[i].params.len)
+
+    let cachedOpt = conn.lookupStmtCache(p.ops[i].sql)
+    p.ops[i].cacheHit = cachedOpt.isSome
+    p.ops[i].cacheMiss = false
+
+    if cachedOpt.isSome:
+      let c = cachedOpt.get
+      p.ops[i].stmtName = c.name
+      cachedStmts[i] = c
+      var effectiveResultFormats: seq[int16]
+      if p.ops[i].kind == pokQuery:
+        effectiveResultFormats =
+          if p.ops[i].resultFormats.len == 0:
+            c.resultFormats
+          else:
+            p.ops[i].resultFormats
+        p.ops[i].resultFormats = effectiveResultFormats
+      batch.addBind("", c.name, formats, p.ops[i].params, effectiveResultFormats)
+      batch.addExecute("", 0)
+    elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+      p.ops[i].cacheMiss = true
+      p.ops[i].stmtName = conn.nextStmtName()
+      batch.addParse(p.ops[i].stmtName, p.ops[i].sql, p.ops[i].paramOids)
+      batch.addDescribe(dkStatement, p.ops[i].stmtName)
+      batch.addBind(
+        "", p.ops[i].stmtName, formats, p.ops[i].params, p.ops[i].resultFormats
+      )
+      batch.addExecute("", 0)
+    else:
+      batch.addParse("", p.ops[i].sql, p.ops[i].paramOids)
+      batch.addBind("", "", formats, p.ops[i].params, p.ops[i].resultFormats)
+      if p.ops[i].kind == pokQuery:
+        batch.addDescribe(dkPortal, "")
+      batch.addExecute("", 0)
+
+  batch.addSync()
+  await conn.sendMsg(batch)
+
+  # Receive Phase
+  var results = newSeq[PipelineResult](p.ops.len)
+  var activeOpIdx = 0
+  var errorMsg = ""
+  var errorCode = ""
+  var cachedFieldsPerOp: seq[seq[FieldDescription]] # lazy-init for cache misses
+
+  # Initialize query results
+  for i in 0 ..< p.ops.len:
+    if p.ops[i].kind == pokQuery:
+      results[i] = PipelineResult(kind: prkQuery)
+      if p.ops[i].cacheHit:
+        let c = cachedStmts[i]
+        results[i].queryResult.fields = c.fields
+        if p.ops[i].resultFormats.len > 0 and c.colFmts.len > 0:
+          for j in 0 ..< results[i].queryResult.fields.len:
+            results[i].queryResult.fields[j].formatCode = c.colFmts[j]
+        if results[i].queryResult.fields.len > 0:
+          results[i].queryResult.data =
+            newRowData(int16(results[i].queryResult.fields.len), c.colFmts, c.colOids)
+    else:
+      results[i] = PipelineResult(kind: prkExec)
+
+  block recvLoop:
+    while true:
+      var rowData: RowData = nil
+      var rowCount: ptr int32 = nil
+      if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+        rowData = results[activeOpIdx].queryResult.data
+        rowCount = addr results[activeOpIdx].queryResult.rowCount
+
+      while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete:
+          discard
+        of bmkParameterDescription:
+          discard
+        of bmkRowDescription:
+          if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+            var cf: seq[int16]
+            var co: seq[int32]
+            if p.ops[activeOpIdx].cacheMiss:
+              if cachedFieldsPerOp.len == 0:
+                cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
+              cachedFieldsPerOp[activeOpIdx] = msg.fields
+              results[activeOpIdx].queryResult.fields = msg.fields
+              if p.ops[activeOpIdx].resultFormats.len > 0:
+                cf = newSeq[int16](msg.fields.len)
+                co = newSeq[int32](msg.fields.len)
+                for j in 0 ..< msg.fields.len:
+                  co[j] = msg.fields[j].typeOid
+                  if p.ops[activeOpIdx].resultFormats.len == 1:
+                    results[activeOpIdx].queryResult.fields[j].formatCode =
+                      p.ops[activeOpIdx].resultFormats[0]
+                    cf[j] = p.ops[activeOpIdx].resultFormats[0]
+                  elif j < p.ops[activeOpIdx].resultFormats.len:
+                    results[activeOpIdx].queryResult.fields[j].formatCode =
+                      p.ops[activeOpIdx].resultFormats[j]
+                    cf[j] = p.ops[activeOpIdx].resultFormats[j]
+            else:
+              results[activeOpIdx].queryResult.fields = msg.fields
+            results[activeOpIdx].queryResult.data =
+              newRowData(int16(msg.fields.len), cf, co)
+            # Update pointers for nextMessage
+            rowData = results[activeOpIdx].queryResult.data
+            rowCount = addr results[activeOpIdx].queryResult.rowCount
+        of bmkNoData:
+          discard
+        of bmkCommandComplete:
+          if activeOpIdx < p.ops.len:
+            if p.ops[activeOpIdx].kind == pokExec:
+              results[activeOpIdx].commandTag = msg.commandTag
+            else:
+              results[activeOpIdx].queryResult.commandTag = msg.commandTag
+            inc activeOpIdx
+            # Update rowData/rowCount for next op
+            if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+              rowData = results[activeOpIdx].queryResult.data
+              rowCount = addr results[activeOpIdx].queryResult.rowCount
+            else:
+              rowData = nil
+              rowCount = nil
+        of bmkEmptyQueryResponse:
+          if activeOpIdx < p.ops.len:
+            inc activeOpIdx
+            if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+              rowData = results[activeOpIdx].queryResult.data
+              rowCount = addr results[activeOpIdx].queryResult.rowCount
+            else:
+              rowData = nil
+              rowCount = nil
+        of bmkErrorResponse:
+          if errorMsg.len == 0:
+            errorMsg = formatError(msg.errorFields)
+            for f in msg.errorFields:
+              if f.code == 'C':
+                errorCode = f.value
+                break
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            # Invalidate cache for 26000 (prepared statement does not exist)
+            if errorCode == "26000":
+              for i in 0 ..< p.ops.len:
+                if p.ops[i].cacheHit:
+                  conn.removeStmtCache(p.ops[i].sql)
+            raise newException(PgError, errorMsg)
+          # Cache misses: add to cache
+          for i in 0 ..< p.ops.len:
+            if p.ops[i].cacheMiss:
+              let fields =
+                if cachedFieldsPerOp.len > 0:
+                  cachedFieldsPerOp[i]
+                else:
+                  @[]
+              conn.addStmtCache(
+                p.ops[i].sql, CachedStmt(name: p.ops[i].stmtName, fields: fields)
+              )
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
+
+  return results
+
+proc execute*(
+    p: Pipeline, timeout: Duration = ZeroDuration
+): Future[seq[PipelineResult]] {.async.} =
+  ## Execute all queued pipeline operations in a single round trip.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if p.ops.len == 0:
+    return @[]
+  if timeout > ZeroDuration:
+    try:
+      return await executeImpl(p, timeout).wait(timeout)
+    except AsyncTimeoutError:
+      p.conn.state = csClosed
+      raise newException(PgError, "Pipeline execute timed out")
+  else:
+    return await executeImpl(p, timeout)
 
 proc openCursorImpl(
     conn: PgConnection,
