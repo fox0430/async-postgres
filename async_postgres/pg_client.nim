@@ -152,10 +152,13 @@ proc execImpl(
     batch.addExecute("", 0)
     batch.addSync()
     await conn.sendMsg(batch)
-  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+  elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     var batch = newSeqOfCap[byte](sql.len + 128)
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      batch.addClose(dkStatement, evicted.name)
     batch.addParse(stmtName, sql, paramOids)
     batch.addDescribe(dkStatement, stmtName)
     batch.addBind("", stmtName, formats, params)
@@ -180,7 +183,7 @@ proc execImpl(
       while (let opt = conn.nextMessage(); opt.isSome):
         let msg = opt.get
         case msg.kind
-        of bmkParseComplete, bmkBindComplete:
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
           discard
@@ -239,10 +242,13 @@ proc execImpl(
     batch.addExecute("", 0)
     batch.addSync()
     await conn.sendMsg(batch)
-  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+  elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     var batch = newSeqOfCap[byte](sql.len + 128)
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      batch.addClose(dkStatement, evicted.name)
     batch.addParse(stmtName, sql, params)
     batch.addDescribe(dkStatement, stmtName)
     batch.addBind("", stmtName, params)
@@ -267,7 +273,7 @@ proc execImpl(
       while (let opt = conn.nextMessage(); opt.isSome):
         let msg = opt.get
         case msg.kind
-        of bmkParseComplete, bmkBindComplete:
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
           discard
@@ -370,7 +376,7 @@ template queryRecvLoop(
       while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
         let msg = opt.get
         case msg.kind
-        of bmkParseComplete, bmkBindComplete:
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
           discard
@@ -461,11 +467,14 @@ proc queryImpl(
     batch.addExecute("", 0)
     batch.addSync()
     await conn.sendMsg(batch)
-  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+  elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     effectiveResultFormats = resultFormats
     var batch = newSeqOfCap[byte](sql.len + 128)
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      batch.addClose(dkStatement, evicted.name)
     batch.addParse(stmtName, sql, paramOids)
     batch.addDescribe(dkStatement, stmtName)
     batch.addBind("", stmtName, formats, params, effectiveResultFormats)
@@ -522,11 +531,14 @@ proc queryImpl(
     batch.addExecute("", 0)
     batch.addSync()
     await conn.sendMsg(batch)
-  elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+  elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     effectiveResultFormats = resultFormats
     var batch = newSeqOfCap[byte](sql.len + 128)
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      batch.addClose(dkStatement, evicted.name)
     batch.addParse(stmtName, sql, params)
     batch.addDescribe(dkStatement, stmtName)
     batch.addBind("", stmtName, params, effectiveResultFormats)
@@ -1726,6 +1738,7 @@ proc executeImpl(
   # Send Phase — also collect CachedStmt data needed by receive phase
   var batch = newSeqOfCap[byte](p.ops.len * 256)
   var cachedStmts = newSeq[CachedStmt](p.ops.len) # populated for cache-hit ops
+  var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
 
   for i in 0 ..< p.ops.len:
     let formats =
@@ -1752,9 +1765,14 @@ proc executeImpl(
         p.ops[i].resultFormats = effectiveResultFormats
       batch.addBind("", c.name, formats, p.ops[i].params, effectiveResultFormats)
       batch.addExecute("", 0)
-    elif conn.stmtCacheCapacity > 0 and conn.stmtCache.len < conn.stmtCacheCapacity:
+    elif conn.stmtCacheCapacity > 0:
       p.ops[i].cacheMiss = true
       p.ops[i].stmtName = conn.nextStmtName()
+      if conn.stmtCache.len + pendingCacheAdds >= conn.stmtCacheCapacity and
+          conn.stmtCache.len > 0:
+        let evicted = conn.evictStmtCache()
+        batch.addClose(dkStatement, evicted.name)
+      inc pendingCacheAdds
       batch.addParse(p.ops[i].stmtName, p.ops[i].sql, p.ops[i].paramOids)
       batch.addDescribe(dkStatement, p.ops[i].stmtName)
       batch.addBind(
@@ -1805,7 +1823,7 @@ proc executeImpl(
       while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
         let msg = opt.get
         case msg.kind
-        of bmkParseComplete, bmkBindComplete:
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
           discard
@@ -2280,6 +2298,9 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     `stmtNameSym` = `connSym`.nextStmtName()
     `effectiveRfSym` = @[]
     `batchSym` = newSeqOfCap[byte](`sqlSym`.len + 128)
+    if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
+      let evicted = `connSym`.evictStmtCache()
+      `batchSym`.addClose(dkStatement, evicted.name)
   missBlock.add(makeParseDirect(batchSym, stmtNameSym, sqlSym, argList))
   missBlock.add quote do:
     `batchSym`.addDescribe(dkStatement, `stmtNameSym`)
@@ -2317,8 +2338,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   )
 
   let missCondition = quote:
-    `connSym`.stmtCacheCapacity > 0 and
-      `connSym`.stmtCache.len < `connSym`.stmtCacheCapacity
+    `connSym`.stmtCacheCapacity > 0
   ifNode.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
   ifNode.add(newNimNode(nnkElse).add(elseBlock))
   result.add(ifNode)

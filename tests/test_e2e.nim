@@ -4458,7 +4458,7 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "stmt cache: full cache falls back to unnamed":
+  test "stmt cache: full cache evicts LRU entry":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       conn.stmtCacheCapacity = 2
@@ -4467,10 +4467,21 @@ suite "E2E: Convenience Query Methods":
       discard await conn.query("SELECT 2")
       doAssert conn.stmtCache.len == 2
 
-      # Cache full, new SQL uses unnamed statement
+      # Cache full, LRU entry ("SELECT 1") is evicted
       let r = await conn.query("SELECT 3")
       doAssert r.rows[0].getStr(0) == "3"
-      doAssert conn.stmtCache.len == 2 # not added
+      doAssert conn.stmtCache.len == 2
+      doAssert not conn.stmtCache.hasKey("SELECT 1") # evicted
+      doAssert conn.stmtCache.hasKey("SELECT 2")
+      doAssert conn.stmtCache.hasKey("SELECT 3") # newly cached
+
+      # Access "SELECT 2" to make it most recent, then add new
+      discard await conn.query("SELECT 2")
+      discard await conn.query("SELECT 4")
+      doAssert conn.stmtCache.len == 2
+      doAssert not conn.stmtCache.hasKey("SELECT 3") # evicted (was LRU)
+      doAssert conn.stmtCache.hasKey("SELECT 2") # kept (was accessed)
+      doAssert conn.stmtCache.hasKey("SELECT 4") # newly cached
 
       await conn.close()
 
@@ -4966,7 +4977,7 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
-  test "pipeline: cache full falls back to unnamed":
+  test "pipeline: cache full evicts LRU entries":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       conn.stmtCacheCapacity = 2
@@ -4976,18 +4987,40 @@ suite "E2E: execInTransaction / queryInTransaction":
       discard await conn.query("SELECT 2")
       doAssert conn.stmtCache.len == 2
 
-      # Pipeline with new SQL: must use unnamed statements
+      # Pipeline with new SQL: evicts LRU entries
       var p = newPipeline(conn)
       p.addQuery("SELECT 100::int4")
-      p.addExec("SELECT 200")
       p.addQuery("SELECT 300::int4")
       let results = await p.execute()
-      doAssert results.len == 3
-      doAssert conn.stmtCache.len == 2 # unchanged
+      doAssert results.len == 2
+      doAssert conn.stmtCache.len == 2
+      doAssert conn.stmtCache.hasKey("SELECT 100::int4")
+      doAssert conn.stmtCache.hasKey("SELECT 300::int4")
 
       doAssert results[0].queryResult.rows[0].getStr(0) == "100"
-      doAssert results[1].kind == prkExec
-      doAssert results[2].queryResult.rows[0].getStr(0) == "300"
+      doAssert results[1].queryResult.rows[0].getStr(0) == "300"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: cache misses exceed capacity":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      # 3 cache misses with capacity 2: should not crash
+      var p = newPipeline(conn)
+      p.addQuery("SELECT 10::int4")
+      p.addQuery("SELECT 20::int4")
+      p.addQuery("SELECT 30::int4")
+      let results = await p.execute()
+      doAssert results.len == 3
+      doAssert results[0].queryResult.rows[0].getStr(0) == "10"
+      doAssert results[1].queryResult.rows[0].getStr(0) == "20"
+      doAssert results[2].queryResult.rows[0].getStr(0) == "30"
+      # Only first 2 are cached (3rd exceeds capacity)
+      doAssert conn.stmtCache.len == 2
 
       await conn.close()
 
