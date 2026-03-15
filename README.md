@@ -4,19 +4,38 @@ Async PostgreSQL client in Nim.
 
 ## Features
 
+### Protocol & Connection
 - PostgreSQL wire protocol v3
 - Simple Query and Extended Query Protocol
-- Prepared statements
-- Server-side cursors (streaming row chunks)
+- Pipeline mode — batch multiple operations in a single network round trip
 - Connection pooling with health checks and maintenance
-- LISTEN/NOTIFY with auto-reconnect
-- COPY IN / COPY OUT (buffered and streaming)
 - SSL/TLS support (disable, prefer, require, verify-ca, verify-full)
 - MD5 and SCRAM-SHA-256 authentication
 - DSN connection string parsing
-- Typed parameters (`toPgParam`) and row accessors (`getStr`, `getInt`, ...)
-- Text and binary format support
+
+### Queries & Statements
+- Prepared statements with server-side statement cache (LRU eviction)
+- Server-side cursors (streaming row chunks)
 - Transactions (`withTransaction`)
+- COPY IN / COPY OUT (buffered and streaming)
+- LISTEN/NOTIFY with auto-reconnect
+
+### Types
+- Typed parameters (`toPgParam`) and row accessors (`getStr`, `getInt`, ...)
+- Array types with binary format support
+- Range and multirange types (`int4range`, `tsrange`, `daterange`, ...)
+- Composite types (user-defined row types via `pgComposite` macro)
+- Enum types (user-defined enums via `pgEnum` macro)
+- Network types (`inet`, `cidr`, `macaddr`, `macaddr8`)
+- Interval type (`PgInterval`)
+
+### Performance
+- Automatic binary format selection for known-safe types
+- Compile-time binary format lookup tables
+- Zero-copy binary array decoding
+- Optimized protocol encoding with minimized allocations
+
+### Platform
 - Async backend: [asyncdispatch](https://nim-lang.org/docs/asyncdispatch.html) (default) or [chronos](https://github.com/status-im/nim-chronos)
 
 ## Requirements
