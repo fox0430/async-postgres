@@ -1233,12 +1233,132 @@ proc parsePort(s: string): int =
   if result < 1 or result > 65535:
     raise newException(PgError, "Port out of range (1-65535): " & s)
 
-proc parseDsn*(dsn: string): ConnConfig =
-  ## Parse a PostgreSQL DSN/URL connection string into a ConnConfig.
+proc applyParam(result: var ConnConfig, key, val: string) =
+  ## Apply a single connection parameter to a ConnConfig.
+  case key
+  of "host", "hostaddr":
+    result.host = val
+  of "port":
+    result.port = parsePort(val)
+  of "dbname":
+    result.database = val
+  of "user":
+    result.user = val
+  of "password":
+    result.password = val
+  of "sslmode":
+    result.sslMode = parseSslMode(val)
+  of "application_name":
+    result.applicationName = val
+  of "connect_timeout":
+    try:
+      result.connectTimeout = seconds(parseInt(val))
+    except ValueError:
+      raise newException(PgError, "Invalid connect_timeout: " & val)
+  of "sslrootcert":
+    try:
+      result.sslRootCert = readFile(val)
+    except IOError:
+      raise newException(PgError, "Cannot read sslrootcert file: " & val)
+  of "keepalives":
+    try:
+      result.keepAlive = parseInt(val) != 0
+    except ValueError:
+      raise newException(PgError, "Invalid keepalives: " & val)
+  of "keepalives_idle":
+    try:
+      result.keepAliveIdle = parseInt(val)
+    except ValueError:
+      raise newException(PgError, "Invalid keepalives_idle: " & val)
+  of "keepalives_interval":
+    try:
+      result.keepAliveInterval = parseInt(val)
+    except ValueError:
+      raise newException(PgError, "Invalid keepalives_interval: " & val)
+  of "keepalives_count":
+    try:
+      result.keepAliveCount = parseInt(val)
+    except ValueError:
+      raise newException(PgError, "Invalid keepalives_count: " & val)
+  else:
+    result.extraParams.add((key, val))
+
+proc parseKeyValueDsn(dsn: string): ConnConfig =
+  ## Parse a libpq keyword=value connection string into a ConnConfig.
   ##
-  ## Format: ``postgresql://[user[:password]@][host[:port]][/database][?param=value&...]``
+  ## Format: ``host=localhost port=5432 dbname=test user=myuser``
   ##
-  ## Both ``postgresql://`` and ``postgres://`` schemes are accepted.
+  ## Values may be single-quoted: ``password='has spaces'``
+  ## Within quoted values, ``\'`` and ``\\`` are escape sequences.
+  result.keepAlive = true
+  result.host = "127.0.0.1"
+  result.port = 5432
+
+  # Tokenize into (key, value) pairs
+  var pairs: seq[(string, string)]
+  var i = 0
+  while i < dsn.len:
+    # Skip whitespace
+    while i < dsn.len and dsn[i] in {' ', '\t', '\n', '\r'}:
+      inc i
+    if i >= dsn.len:
+      break
+
+    # Read key
+    var key = ""
+    while i < dsn.len and dsn[i] notin {'=', ' ', '\t', '\n', '\r'}:
+      key.add dsn[i]
+      inc i
+    if key.len == 0:
+      raise newException(PgError, "Empty key in connection string")
+
+    # Skip whitespace around '='
+    while i < dsn.len and dsn[i] in {' ', '\t'}:
+      inc i
+    if i >= dsn.len or dsn[i] != '=':
+      raise newException(
+        PgError, "Expected '=' after key '" & key & "' in connection string"
+      )
+    inc i # skip '='
+    while i < dsn.len and dsn[i] in {' ', '\t'}:
+      inc i
+
+    # Read value
+    var val = ""
+    if i < dsn.len and dsn[i] == '\'':
+      # Quoted value
+      inc i # skip opening quote
+      var closed = false
+      while i < dsn.len:
+        if dsn[i] == '\\' and i + 1 < dsn.len:
+          # Escape sequence
+          val.add dsn[i + 1]
+          i += 2
+        elif dsn[i] == '\'':
+          inc i # skip closing quote
+          closed = true
+          break
+        else:
+          val.add dsn[i]
+          inc i
+      if not closed:
+        raise newException(PgError, "Unterminated quoted value for key '" & key & "'")
+    else:
+      # Unquoted value
+      while i < dsn.len and dsn[i] notin {' ', '\t', '\n', '\r'}:
+        val.add dsn[i]
+        inc i
+
+    pairs.add((key, val))
+
+  for (key, val) in pairs:
+    result.applyParam(key, val)
+
+  if result.host.len == 0:
+    result.host = "127.0.0.1"
+
+proc parseUriDsn(dsn: string): ConnConfig =
+  ## Parse a PostgreSQL URI connection string into a ConnConfig.
   result.keepAlive = true
   let scheme =
     if dsn.startsWith("postgresql://"):
@@ -1329,40 +1449,17 @@ proc parseDsn*(dsn: string): ConnConfig =
         continue
       let key = decodeUrl(pair[0 ..< epos])
       let val = decodeUrl(pair[epos + 1 .. ^1])
-      case key
-      of "sslmode":
-        result.sslMode = parseSslMode(val)
-      of "application_name":
-        result.applicationName = val
-      of "connect_timeout":
-        try:
-          result.connectTimeout = seconds(parseInt(val))
-        except ValueError:
-          raise newException(PgError, "Invalid connect_timeout: " & val)
-      of "sslrootcert":
-        try:
-          result.sslRootCert = readFile(val)
-        except IOError:
-          raise newException(PgError, "Cannot read sslrootcert file: " & val)
-      of "keepalives":
-        try:
-          result.keepAlive = parseInt(val) != 0
-        except ValueError:
-          raise newException(PgError, "Invalid keepalives: " & val)
-      of "keepalives_idle":
-        try:
-          result.keepAliveIdle = parseInt(val)
-        except ValueError:
-          raise newException(PgError, "Invalid keepalives_idle: " & val)
-      of "keepalives_interval":
-        try:
-          result.keepAliveInterval = parseInt(val)
-        except ValueError:
-          raise newException(PgError, "Invalid keepalives_interval: " & val)
-      of "keepalives_count":
-        try:
-          result.keepAliveCount = parseInt(val)
-        except ValueError:
-          raise newException(PgError, "Invalid keepalives_count: " & val)
-      else:
-        result.extraParams.add((key, val))
+      result.applyParam(key, val)
+
+proc parseDsn*(dsn: string): ConnConfig =
+  ## Parse a PostgreSQL connection string into a ConnConfig.
+  ##
+  ## Supports two formats:
+  ## - URI: ``postgresql://[user[:password]@][host[:port]][/database][?param=value&...]``
+  ## - keyword=value: ``host=localhost port=5432 dbname=test`` (libpq compatible)
+  ##
+  ## Both ``postgresql://`` and ``postgres://`` schemes are accepted for URI format.
+  if dsn.startsWith("postgresql://") or dsn.startsWith("postgres://"):
+    parseUriDsn(dsn)
+  else:
+    parseKeyValueDsn(dsn)

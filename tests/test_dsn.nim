@@ -252,3 +252,116 @@ suite "parseDsn":
   test "error: sslrootcert file not found":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")
+
+suite "parseDsn keyword=value":
+  test "full connection string":
+    let cfg = parseDsn("host=dbhost port=5433 dbname=mydb user=myuser password=mypass")
+    check cfg.host == "dbhost"
+    check cfg.port == 5433
+    check cfg.database == "mydb"
+    check cfg.user == "myuser"
+    check cfg.password == "mypass"
+
+  test "minimal - host only":
+    let cfg = parseDsn("host=localhost")
+    check cfg.host == "localhost"
+    check cfg.port == 5432
+    check cfg.user == ""
+    check cfg.database == ""
+
+  test "empty string defaults":
+    let cfg = parseDsn("")
+    check cfg.host == "127.0.0.1"
+    check cfg.port == 5432
+
+  test "single-quoted value with spaces":
+    let cfg = parseDsn("application_name='my app'")
+    check cfg.applicationName == "my app"
+
+  test "single-quoted value with escaped quote":
+    let cfg = parseDsn(r"password='it\'s secret'")
+    check cfg.password == "it's secret"
+
+  test "single-quoted value with escaped backslash":
+    let cfg = parseDsn(r"password='back\\slash'")
+    check cfg.password == "back\\slash"
+
+  test "hostaddr keyword":
+    let cfg = parseDsn("hostaddr=192.168.1.1 dbname=test")
+    check cfg.host == "192.168.1.1"
+    check cfg.database == "test"
+
+  test "sslmode parameter":
+    let cfg = parseDsn("host=h dbname=d sslmode=require")
+    check cfg.sslMode == sslRequire
+
+  test "connect_timeout parameter":
+    let cfg = parseDsn("host=h connect_timeout=30")
+    check cfg.connectTimeout == seconds(30)
+
+  test "keepalive parameters":
+    let cfg = parseDsn(
+      "host=h keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
+    )
+    check cfg.keepAlive == true
+    check cfg.keepAliveIdle == 60
+    check cfg.keepAliveInterval == 10
+    check cfg.keepAliveCount == 5
+
+  test "keepalives=0 disables keepalive":
+    let cfg = parseDsn("host=h keepalives=0")
+    check cfg.keepAlive == false
+
+  test "unknown params go to extraParams":
+    let cfg = parseDsn("host=h search_path=public options='-c log'")
+    check cfg.extraParams.len == 2
+    check cfg.extraParams[0] == ("search_path", "public")
+    check cfg.extraParams[1] == ("options", "-c log")
+
+  test "spaces around equals sign":
+    let cfg = parseDsn("host = localhost port = 5433 dbname = test")
+    check cfg.host == "localhost"
+    check cfg.port == 5433
+    check cfg.database == "test"
+
+  test "extra whitespace between pairs":
+    let cfg = parseDsn("  host=localhost   port=5432   dbname=test  ")
+    check cfg.host == "localhost"
+    check cfg.port == 5432
+    check cfg.database == "test"
+
+  test "error: invalid port":
+    expect PgError:
+      discard parseDsn("host=h port=notaport")
+
+  test "error: port out of range":
+    expect PgError:
+      discard parseDsn("host=h port=0")
+    expect PgError:
+      discard parseDsn("host=h port=65536")
+
+  test "error: invalid sslmode":
+    expect PgError:
+      discard parseDsn("host=h sslmode=bogus")
+
+  test "error: invalid connect_timeout":
+    expect PgError:
+      discard parseDsn("host=h connect_timeout=abc")
+
+  test "error: invalid keepalives value":
+    expect PgError:
+      discard parseDsn("host=h keepalives=abc")
+
+  test "error: unterminated quoted value":
+    expect PgError:
+      discard parseDsn("host=h password='unterminated")
+
+  test "error: empty key":
+    expect PgError:
+      discard parseDsn("=value")
+
+  test "URI strings still work":
+    let cfg = parseDsn("postgresql://myuser:mypass@dbhost:5433/mydb")
+    check cfg.user == "myuser"
+    check cfg.host == "dbhost"
+    check cfg.port == 5433
