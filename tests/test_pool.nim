@@ -138,8 +138,8 @@ suite "Pool resetSession":
   test "resetSession is no-op when resetQuery is empty":
     let pool = makePool()
     let conn = mockConn()
-    conn.stmtCache["SELECT 1"] = CachedStmt(name: "_sc_1")
-    conn.stmtCacheLru.add("SELECT 1")
+    conn.stmtCacheCapacity = 256
+    conn.addStmtCache("SELECT 1", CachedStmt(name: "_sc_1"))
     waitFor pool.resetSession(conn)
     check conn.state == csReady
     check conn.stmtCache.len == 1 # not cleared
