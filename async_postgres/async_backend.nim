@@ -93,7 +93,7 @@ elif hasAsyncDispatch:
     ## Create a Duration from hours.
     Duration(int64(h) * 3_600_000_000_000)
 
-  const ZeroDuration* = Duration(0)
+  const ZeroDuration* = Duration(0) ## A zero-length duration.
 
   proc `==`*(a, b: Duration): bool {.borrow.}
   proc `<`*(a, b: Duration): bool {.borrow.}

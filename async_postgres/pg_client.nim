@@ -2,17 +2,19 @@ import std/[options, tables, macros]
 
 import async_backend, pg_protocol, pg_connection, pg_types
 
-const binaryFormat*: seq[int16] = @[1'i16]
+const binaryFormat*: seq[int16] =
+  @[1'i16] ## Result format list requesting binary encoding for all columns.
 const copyBatchSize = 262144 ## 256KB batch threshold for COPY IN buffering
 
 type
-  PreparedStatement* = object
+  PreparedStatement* = object ## A server-side prepared statement returned by `prepare`.
     conn*: PgConnection
     name*: string
     fields*: seq[FieldDescription]
     paramOids*: seq[int32]
 
   Cursor* = ref object
+    ## A server-side portal for incremental row fetching via `declareCursor`/`fetch`.
     conn*: PgConnection
     portalName: string
     chunkSize: int32
@@ -23,6 +25,7 @@ type
     bufferedCount: int32
 
   IsolationLevel* = enum
+    ## PostgreSQL transaction isolation level.
     ilDefault
     ilReadCommitted
     ilRepeatableRead
@@ -30,16 +33,19 @@ type
     ilReadUncommitted
 
   AccessMode* = enum
+    ## PostgreSQL transaction access mode (read-write or read-only).
     amDefault
     amReadWrite
     amReadOnly
 
   DeferrableMode* = enum
+    ## PostgreSQL transaction deferrable mode (for serializable read-only transactions).
     dmDefault
     dmDeferrable
     dmNotDeferrable
 
   TransactionOptions* = object
+    ## Options for BEGIN: isolation level, access mode, and deferrable mode.
     isolation*: IsolationLevel
     access*: AccessMode
     deferrable*: DeferrableMode
@@ -61,10 +67,11 @@ type
     stmtName: string
 
   PipelineResultKind* = enum
+    ## Discriminator for pipeline result variants.
     prkExec
     prkQuery
 
-  PipelineResult* = object
+  PipelineResult* = object ## Result of a single operation within a pipeline.
     case kind*: PipelineResultKind
     of prkExec:
       commandTag*: string
@@ -72,6 +79,7 @@ type
       queryResult*: QueryResult
 
   Pipeline* = object
+    ## Batch of queries/execs sent through the PostgreSQL pipeline protocol.
     conn: PgConnection
     ops: seq[PipelineOp]
 

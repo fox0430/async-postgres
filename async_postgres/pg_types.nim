@@ -4,23 +4,26 @@ import pg_protocol
 
 type
   PgTypeError* = object of CatchableError
+    ## Raised when a PostgreSQL value cannot be converted to the requested Nim type.
 
   PgUuid* = distinct string
+    ## UUID value stored as its string representation (e.g. "550e8400-e29b-41d4-a716-446655440000").
 
   PgNumeric* = distinct string
     ## Arbitrary-precision numeric value stored as its string representation.
     ## Use this instead of float64 to avoid precision loss with PostgreSQL numeric/decimal.
 
   PgInterval* = object
+    ## PostgreSQL interval value decomposed into months, days, and microseconds.
     months*: int32
     days*: int32
     microseconds*: int64
 
-  PgInet* = object
+  PgInet* = object ## PostgreSQL inet type: an IP address with a subnet mask.
     address*: IpAddress
     mask*: uint8
 
-  PgCidr* = object
+  PgCidr* = object ## PostgreSQL cidr type: a network address with a subnet mask.
     address*: IpAddress
     mask*: uint8
 
@@ -28,11 +31,11 @@ type
 
   PgMacAddr8* = distinct string ## EUI-64 MAC address as "08:00:2b:01:02:03:04:05"
 
-  PgRangeBound*[T] = object
+  PgRangeBound*[T] = object ## One endpoint of a PostgreSQL range value.
     value*: T
     inclusive*: bool
 
-  PgRange*[T] = object
+  PgRange*[T] = object ## PostgreSQL range value (e.g. int4range, tsrange).
     isEmpty*: bool
     hasLower*: bool
     hasUpper*: bool
@@ -40,8 +43,10 @@ type
     upper*: PgRangeBound[T]
 
   PgMultirange*[T] = distinct seq[PgRange[T]]
+    ## PostgreSQL multirange value (PostgreSQL 14+). A sorted set of non-overlapping ranges.
 
   PgParam* = object
+    ## A single query parameter in binary wire format, ready to send to PostgreSQL.
     oid*: int32
     format*: int16 # 0=text, 1=binary
     value*: Option[seq[byte]]
@@ -71,6 +76,7 @@ type
     ]
 
 const
+  ## PostgreSQL type OIDs for scalar and array types.
   OidBool* = 16'i32
   OidInt2* = 21'i32
   OidInt4* = 23'i32
@@ -105,7 +111,7 @@ const
   pgEpochUnix* = 946684800'i64 ## 2000-01-01 00:00:00 UTC in Unix seconds
   pgEpochDaysOffset* = 10957'i32 ## Days from 1970-01-01 to 2000-01-01
 
-  OidRecord* = 2249'i32
+  OidRecord* = 2249'i32 ## Composite / anonymous record type OID.
 
   # Range types
   OidInt4Range* = 3904'i32
@@ -123,11 +129,11 @@ const
   OidDateMultirange* = 4535'i32
   OidInt8Multirange* = 4536'i32
 
-  rangeEmpty* = 0x01'u8
-  rangeHasLower* = 0x02'u8
-  rangeHasUpper* = 0x04'u8
-  rangeLowerInc* = 0x08'u8
-  rangeUpperInc* = 0x10'u8
+  rangeEmpty* = 0x01'u8 ## Range flag: range is empty.
+  rangeHasLower* = 0x02'u8 ## Range flag: lower bound present.
+  rangeHasUpper* = 0x04'u8 ## Range flag: upper bound present.
+  rangeLowerInc* = 0x08'u8 ## Range flag: lower bound is inclusive.
+  rangeUpperInc* = 0x10'u8 ## Range flag: upper bound is inclusive.
 
 proc `$`*(v: PgNumeric): string {.borrow.}
 proc `==`*(a, b: PgNumeric): bool {.borrow.}
