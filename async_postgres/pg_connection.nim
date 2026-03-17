@@ -1076,11 +1076,11 @@ proc checkSessionAttrs(
       readOnly = bytesToString(val.get) == "on"
   case attrs
   of tsaAny:
-    return true
+    true # unreachable, handled above
   of tsaReadWrite, tsaPrimary:
-    return not readOnly
+    not readOnly
   of tsaReadOnly, tsaStandby, tsaPreferStandby:
-    return readOnly
+    readOnly
 
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Establish a new connection to a PostgreSQL server.
