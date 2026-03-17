@@ -46,6 +46,8 @@ proc initPoolConfig*(
     pingTimeout = seconds(5),
     acquireTimeout = seconds(30),
 ): PoolConfig =
+  ## Create a pool configuration with sensible defaults.
+  ## `minSize` idle connections are maintained; up to `maxSize` total.
   PoolConfig(
     connConfig: connConfig,
     minSize: minSize,
@@ -125,6 +127,8 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         break # best-effort, retry next interval
 
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
+  ## Create a new connection pool and establish `minSize` initial connections.
+  ## Raises if any initial connection fails (all opened connections are closed on error).
   var cfg = config
   if cfg.maintenanceInterval == ZeroDuration:
     cfg.maintenanceInterval = seconds(30)
@@ -155,6 +159,9 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   return pool
 
 proc release*(pool: PgPool, conn: PgConnection) =
+  ## Return a connection to the pool. If the connection is broken or in a
+  ## transaction, it is closed instead. If waiters are queued, the connection
+  ## is handed directly to the next waiter.
   if pool.closed or conn.state != csReady or conn.txStatus != tsIdle:
     pool.active.dec
     conn.closeNoWait()
@@ -168,6 +175,9 @@ proc release*(pool: PgPool, conn: PgConnection) =
     pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
 
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
+  ## Acquire a connection from the pool. Tries idle connections first (with
+  ## health checks), creates a new one if under `maxSize`, or waits for a
+  ## release. Raises `PgError` on timeout or if the pool is closed.
   if pool.closed:
     raise newException(PgError, "Pool is closed")
 
@@ -237,6 +247,8 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
     return await fut
 
 template withConnection*(pool: PgPool, conn, body: untyped) =
+  ## Acquire a connection, execute `body`, then release it back to the pool.
+  ## The connection is available as `conn` inside the body.
   let conn = await pool.acquire()
   try:
     body
@@ -249,6 +261,7 @@ proc exec*(
     params: seq[Option[seq[byte]]] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
+  ## Execute a SQL statement using a pooled connection, returning the command tag.
   let conn = await pool.acquire()
   try:
     return await conn.exec(sql, params, timeout = timeout)
@@ -262,6 +275,7 @@ proc query*(
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
+  ## Execute a SQL query using a pooled connection, returning rows.
   let conn = await pool.acquire()
   try:
     return
@@ -272,6 +286,7 @@ proc query*(
 proc exec*(
     pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
+  ## Execute a statement with typed parameters using a pooled connection.
   let conn = await pool.acquire()
   try:
     return await conn.exec(sql, params, timeout = timeout)
@@ -285,6 +300,7 @@ proc query*(
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
+  ## Execute a query with typed parameters using a pooled connection.
   let conn = await pool.acquire()
   try:
     return
@@ -299,6 +315,7 @@ proc queryOne*(
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
+  ## Execute a query and return the first row, or `none` if no rows.
   let conn = await pool.acquire()
   try:
     return await conn.queryOne(sql, params, resultFormats, timeout)
@@ -311,6 +328,8 @@ proc queryValue*(
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
+  ## Execute a query and return the first column of the first row as a string.
+  ## Raises `PgError` if no rows or the value is NULL.
   let conn = await pool.acquire()
   try:
     return await conn.queryValue(sql, params, timeout = timeout)
@@ -324,6 +343,8 @@ proc queryValueOrDefault*(
     default: string = "",
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
+  ## Execute a query and return the first column of the first row as a string.
+  ## Returns `default` if no rows or the value is NULL.
   let conn = await pool.acquire()
   try:
     return await conn.queryValueOrDefault(sql, params, default, timeout)
@@ -336,6 +357,7 @@ proc queryExists*(
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[bool] {.async.} =
+  ## Execute a query and return whether any rows exist.
   let conn = await pool.acquire()
   try:
     return await conn.queryExists(sql, params, timeout)
@@ -348,6 +370,7 @@ proc execAffected*(
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
+  ## Execute a statement and return the number of affected rows.
   let conn = await pool.acquire()
   try:
     return await conn.execAffected(sql, params, timeout)
@@ -360,6 +383,7 @@ proc queryColumn*(
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[seq[string]] {.async.} =
+  ## Execute a query and return the first column of all rows as strings.
   let conn = await pool.acquire()
   try:
     return await conn.queryColumn(sql, params, timeout)
@@ -367,6 +391,7 @@ proc queryColumn*(
     pool.release(conn)
 
 proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.} =
+  ## Execute one or more SQL statements via simple query protocol using a pooled connection.
   let conn = await pool.acquire()
   try:
     return await conn.simpleQuery(sql)
@@ -376,6 +401,8 @@ proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.}
 proc simpleExec*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
+  ## Execute a SQL statement via simple query protocol using a pooled connection.
+  ## Returns the command tag.
   let conn = await pool.acquire()
   try:
     return await conn.simpleExec(sql, timeout)
@@ -390,6 +417,7 @@ proc execInTransaction*(
     paramFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
+  ## Execute a statement inside a pipelined BEGIN/COMMIT transaction using a pooled connection.
   let conn = await pool.acquire()
   try:
     return await conn.execInTransaction(sql, params, paramOids, paramFormats, timeout)
@@ -399,6 +427,7 @@ proc execInTransaction*(
 proc execInTransaction*(
     pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
+  ## Execute a statement inside a pipelined transaction with typed parameters.
   let conn = await pool.acquire()
   try:
     return await conn.execInTransaction(sql, params, timeout)
@@ -414,6 +443,7 @@ proc queryInTransaction*(
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
+  ## Execute a query inside a pipelined BEGIN/COMMIT transaction using a pooled connection.
   let conn = await pool.acquire()
   try:
     return await conn.queryInTransaction(
@@ -429,6 +459,7 @@ proc queryInTransaction*(
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
+  ## Execute a query inside a pipelined transaction with typed parameters.
   let conn = await pool.acquire()
   try:
     return await conn.queryInTransaction(sql, params, resultFormats, timeout)
@@ -441,6 +472,7 @@ proc notify*(
     payload: string = "",
     timeout: Duration = ZeroDuration,
 ): Future[void] {.async.} =
+  ## Send a NOTIFY on `channel` with optional `payload` using a pooled connection.
   let conn = await pool.acquire()
   try:
     await conn.notify(channel, payload, timeout)
@@ -519,6 +551,8 @@ template withPipeline*(pool: PgPool, pipeline, body: untyped) =
     pool.release(conn)
 
 proc close*(pool: PgPool): Future[void] {.async.} =
+  ## Close the pool: stop the maintenance loop, cancel all waiters, and close
+  ## all idle connections. Active connections are closed when released.
   pool.closed = true
 
   # Stop maintenance loop

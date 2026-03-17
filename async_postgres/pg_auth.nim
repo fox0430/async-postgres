@@ -29,6 +29,7 @@ proc md5AuthHash*(user, password: string, salt: array[4, byte]): string =
   result = "md5" & getMD5(saltedInput)
 
 proc scramClientFirstMessage*(user: string, state: var ScramState): seq[byte] =
+  ## Generate the SCRAM-SHA-256 client-first message with a random nonce.
   var nonceBuf: array[24, byte]
   let n = randomBytes(nonceBuf)
   doAssert n == 24
@@ -47,6 +48,8 @@ proc scramClientFirstMessage*(
 proc scramClientFinalMessage*(
     password: string, serverFirstData: openArray[byte], state: var ScramState
 ): seq[byte] =
+  ## Generate the SCRAM-SHA-256 client-final message from the server's first response.
+  ## Computes the client proof and stores the expected server signature in `state`.
   let serverFirstMsg = toString(serverFirstData)
   var combinedNonce, saltB64: string
   var iterations: int
@@ -84,6 +87,7 @@ proc scramClientFinalMessage*(
 proc scramVerifyServerFinal*(
     serverFinalData: openArray[byte], state: ScramState
 ): bool =
+  ## Verify the server's final SCRAM-SHA-256 signature matches the expected value.
   let serverFinalMsg = toString(serverFinalData)
   if not serverFinalMsg.startsWith("v="):
     return false

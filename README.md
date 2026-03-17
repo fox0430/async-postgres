@@ -45,7 +45,7 @@ Async PostgreSQL client in Nim.
 ## Basic Usage
 
 ```nim
-import async_postgres
+import pkg/async_postgres
 
 proc main() {.async.} =
   let conn = await connect(parseDsn("postgresql://myuser:mypass@127.0.0.1:5432/mydb"))
@@ -86,6 +86,8 @@ nim c -r your_app.nim
 # chronos
 nim c -r -d:asyncBackend=chronos your_app.nim
 ```
+
+**chronos is recommended.** chronos supports proper future cancellation, which enables reliable timeout handling and clean connection teardown. asyncdispatch lacks real cancellation — timed-out futures continue running in the background, and `cancelAndWait` is a no-op.
 
 SSL backend differs by async backend:
 - **chronos**: BearSSL (via nim-bearssl)
