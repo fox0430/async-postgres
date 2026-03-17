@@ -28,11 +28,13 @@ elif defined(macosx):
 
 type
   PgError* = object of CatchableError
+    ## General PostgreSQL error (connection failures, protocol errors, etc.).
 
   PgNotifyOverflowError* = object of PgError
     dropped*: int ## Number of notifications dropped due to queue overflow
 
   PgConnState* = enum
+    ## Connection lifecycle state.
     csConnecting
     csAuthentication
     csReady
@@ -41,6 +43,7 @@ type
     csClosed
 
   SslMode* = enum
+    ## SSL/TLS negotiation mode for the connection.
     sslDisable ## Disable SSL (default)
     sslPrefer ## Try SSL; fall back to plaintext if refused
     sslRequire ## Require SSL (no certificate verification)
@@ -48,6 +51,7 @@ type
     sslVerifyFull ## Require SSL + verify CA chain and hostname
 
   ConnConfig* = object
+    ## Connection configuration. Construct via `parseDsn` or set fields directly.
     host*: string
     port*: int # default 5432
     user*: string
@@ -63,19 +67,21 @@ type
     keepAliveCount*: int ## Number of probes before giving up (0 = OS default)
     extraParams*: seq[(string, string)] ## Additional startup parameters
 
-  Notification* = object
+  Notification* = object ## A NOTIFY message received from PostgreSQL.
     pid*: int32
     channel*: string
     payload*: string
 
   NotifyCallback* = proc(notification: Notification) {.gcsafe, raises: [].}
+    ## Callback invoked when a NOTIFY message arrives.
 
-  Notice* = object
+  Notice* = object ## A notice or warning message from the server (not an error).
     fields*: seq[ErrorField]
 
   NoticeCallback* = proc(notice: Notice) {.gcsafe, raises: [].}
+    ## Callback invoked when a notice/warning message arrives.
 
-  CachedStmt* = object
+  CachedStmt* = object ## A cached prepared statement in the LRU statement cache.
     name*: string ## Server-side statement name ("_sc_1", "_sc_2", ...)
     fields*: seq[FieldDescription] ## From Describe(Statement), formatCode=0
     resultFormats*: seq[int16] ## Cached buildResultFormats() output
@@ -83,6 +89,7 @@ type
     colOids*: seq[int32] ## Per-column type OIDs for RowData
 
   PgConnection* = ref object
+    ## A single PostgreSQL connection with buffered I/O and statement caching.
     when hasChronos:
       transport*: StreamTransport
       baseReader: AsyncStreamReader
@@ -124,23 +131,25 @@ type
     stmtCacheCapacity*: int ## 0=disabled, default 256
 
   QueryResult* = object
+    ## Result of a query: field descriptions, row data, and command tag.
     fields*: seq[FieldDescription]
     data*: RowData
     rowCount*: int32
     commandTag*: string
 
   CopyResult* = object
+    ## Result of a buffered COPY OUT operation: all rows collected in memory.
     format*: CopyFormat
     columnFormats*: seq[int16]
     data*: seq[seq[byte]]
     commandTag*: string
 
-  CopyOutInfo* = object
+  CopyOutInfo* = object ## Metadata returned when a streaming COPY OUT begins.
     format*: CopyFormat
     columnFormats*: seq[int16]
     commandTag*: string
 
-  CopyInInfo* = object
+  CopyInInfo* = object ## Metadata returned when a streaming COPY IN begins.
     format*: CopyFormat
     columnFormats*: seq[int16]
     commandTag*: string
@@ -170,9 +179,11 @@ iterator items*(qr: QueryResult): Row =
 when hasChronos:
   type CopyOutCallback* =
     proc(data: seq[byte]): Future[void] {.async: (raises: [CatchableError]), gcsafe.}
+    ## Callback receiving each chunk during streaming COPY OUT.
 
   type CopyInCallback* =
     proc(): Future[seq[byte]] {.async: (raises: [CatchableError]), gcsafe.}
+    ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
 
   type TrustAnchorResult = object
     store: TrustAnchorStore
@@ -180,8 +191,10 @@ when hasChronos:
 
 else:
   type CopyOutCallback* = proc(data: seq[byte]): Future[void] {.gcsafe.}
+    ## Callback receiving each chunk during streaming COPY OUT.
 
   type CopyInCallback* = proc(): Future[seq[byte]] {.gcsafe.}
+    ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
 
 const RecvBufSize = 32768 ## Size of the temporary read buffer for recv operations
 
