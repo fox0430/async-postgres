@@ -134,6 +134,41 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
+suite "Pool resetSession":
+  test "resetSession is no-op when resetQuery is empty":
+    let pool = makePool()
+    let conn = mockConn()
+    conn.stmtCache["SELECT 1"] = CachedStmt(name: "_sc_1")
+    conn.stmtCacheLru.add("SELECT 1")
+    waitFor pool.resetSession(conn)
+    check conn.state == csReady
+    check conn.stmtCache.len == 1 # not cleared
+
+  test "resetSession skips broken connection":
+    let pool = makePool()
+    pool.config.resetQuery = "DISCARD ALL"
+    let conn = mockConn(csClosed)
+    waitFor pool.resetSession(conn)
+    check conn.state == csClosed # unchanged
+
+  test "resetSession skips connection in transaction":
+    let pool = makePool()
+    pool.config.resetQuery = "DISCARD ALL"
+    let conn = mockConn()
+    conn.txStatus = tsInTransaction
+    waitFor pool.resetSession(conn)
+    check conn.state == csReady # unchanged, not closed
+
+  test "resetQuery field in initPoolConfig":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432), resetQuery = "DISCARD ALL"
+    )
+    check cfg.resetQuery == "DISCARD ALL"
+
+  test "resetQuery defaults to empty":
+    let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
+    check cfg.resetQuery == ""
+
 suite "Pool acquire":
   test "acquire from idle":
     let pool = makePool()
