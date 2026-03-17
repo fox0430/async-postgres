@@ -81,7 +81,7 @@ proc closeNoWait(conn: PgConnection) =
 
   asyncSpawn doClose()
 
-proc resetSession(pool: PgPool, conn: PgConnection) {.async.} =
+proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   ## Execute the configured reset query on a connection before returning it
   ## to the pool. On failure, closes the connection so that release() will
   ## discard it.
