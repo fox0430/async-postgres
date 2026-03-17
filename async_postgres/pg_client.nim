@@ -76,6 +76,8 @@ type
     ops: seq[PipelineOp]
 
 proc buildBeginSql*(opts: TransactionOptions): string =
+  ## Build a BEGIN SQL statement with the specified transaction options
+  ## (isolation level, access mode, deferrable mode).
   result = "BEGIN"
   case opts.isolation
   of ilDefault:
@@ -956,6 +958,8 @@ proc notify*(
     payload: string = "",
     timeout: Duration = ZeroDuration,
 ): Future[void] {.async.} =
+  ## Send a NOTIFY on `channel` with optional `payload`.
+  ## Uses NOTIFY for empty payloads, pg_notify() otherwise.
   let quoted = quoteIdentifier(channel)
   if payload.len == 0:
     discard await conn.exec("NOTIFY " & quoted, timeout = timeout)
@@ -1037,8 +1041,8 @@ proc copyInRawImpl(
 proc copyIn*(
     conn: PgConnection, sql: string, data: seq[byte], timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
-  ## Execute COPY ... FROM STDIN with a single contiguous seq[byte].
-  ## Avoids the copy that the openArray[byte] overload performs.
+  ## Execute COPY ... FROM STDIN with a single contiguous ``seq[byte]``.
+  ## Avoids the copy that the ``openArray[byte]`` overload performs.
   if timeout > ZeroDuration:
     try:
       return await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
@@ -1087,7 +1091,7 @@ proc copyIn*(
     timeout: Duration = ZeroDuration,
 ): Future[string] =
   ## Execute COPY ... FROM STDIN via simple query protocol.
-  ## Concatenates chunks and delegates to the seq[byte] overload.
+  ## Concatenates chunks and delegates to the ``seq[byte]`` overload.
   ## Returns the command tag (e.g. "COPY 5").
   var totalLen = 0
   for chunk in data:
@@ -1203,8 +1207,8 @@ proc copyInStream*(
     timeout: Duration = ZeroDuration,
 ): Future[CopyInInfo] {.async.} =
   ## Execute COPY ... FROM STDIN via simple query protocol, streaming data
-  ## from `callback`. The callback is called repeatedly; returning an empty
-  ## seq[byte] signals EOF. If the callback raises, CopyFail is sent and
+  ## from ``callback``. The callback is called repeatedly; returning an empty
+  ## ``seq[byte]`` signals EOF. If the callback raises, CopyFail is sent and
   ## the connection returns to csReady.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if timeout > ZeroDuration:
@@ -1356,6 +1360,8 @@ template withTransaction*(
     body: untyped,
     txTimeout: Duration = ZeroDuration,
 ) =
+  ## Execute `body` inside a transaction with custom options.
+  ## On exception, ROLLBACK is issued automatically.
   let beginSql = buildBeginSql(opts)
   discard await conn.simpleExec(beginSql, timeout = txTimeout)
   try:
@@ -1371,6 +1377,8 @@ template withTransaction*(
 template withSavepoint*(
     conn: PgConnection, body: untyped, spTimeout: Duration = ZeroDuration
 ) =
+  ## Execute `body` inside a SAVEPOINT with an auto-generated name.
+  ## On exception, ROLLBACK TO SAVEPOINT is issued automatically.
   inc conn.portalCounter
   let spName = "_sp_" & $conn.portalCounter
   discard await conn.simpleExec("SAVEPOINT " & spName, timeout = spTimeout)
@@ -1388,6 +1396,8 @@ template withSavepoint*(
 template withSavepoint*(
     conn: PgConnection, name: string, body: untyped, spTimeout: Duration = ZeroDuration
 ) =
+  ## Execute `body` inside a SAVEPOINT with the given `name`.
+  ## On exception, ROLLBACK TO SAVEPOINT is issued automatically.
   discard await conn.simpleExec("SAVEPOINT " & name, timeout = spTimeout)
   try:
     body
@@ -1671,9 +1681,11 @@ proc queryInTransaction*(
     )
 
 proc newPipeline*(conn: PgConnection): Pipeline =
+  ## Create a new pipeline for batching multiple operations into a single round trip.
   Pipeline(conn: conn, ops: @[])
 
 proc addExec*(p: var Pipeline, sql: string, params: seq[PgParam] = @[]) =
+  ## Add an exec operation to the pipeline with typed parameters.
   let (oids, formats, values) = extractParams(params)
   p.ops.add PipelineOp(
     kind: pokExec, sql: sql, params: values, paramOids: oids, paramFormats: formats
@@ -1686,6 +1698,7 @@ proc addExec*(
     paramOids: seq[int32] = @[],
     paramFormats: seq[int16] = @[],
 ) =
+  ## Add an exec operation to the pipeline with raw binary parameters.
   p.ops.add PipelineOp(
     kind: pokExec,
     sql: sql,
@@ -1700,6 +1713,7 @@ proc addQuery*(
     params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
 ) =
+  ## Add a query operation to the pipeline with typed parameters.
   let (oids, formats, values) = extractParams(params)
   p.ops.add PipelineOp(
     kind: pokQuery,
@@ -1718,6 +1732,7 @@ proc addQuery*(
     paramFormats: seq[int16] = @[],
     resultFormats: seq[int16] = @[],
 ) =
+  ## Add a query operation to the pipeline with raw binary parameters.
   p.ops.add PipelineOp(
     kind: pokQuery,
     sql: sql,
@@ -2179,6 +2194,8 @@ template withCursor*(
     cursorName, body: untyped,
     cursorTimeout: Duration = ZeroDuration,
 ) =
+  ## Open a cursor, execute `body`, then close the cursor automatically.
+  ## The cursor is available as `cursorName` inside the body.
   let cursorName =
     await conn.openCursor(sql, chunkSize = chunks, timeout = cursorTimeout)
   try:
@@ -2226,7 +2243,7 @@ proc queryDirectImpl(
 
 macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =
   ## Zero-allocation query: encodes parameters directly into the send buffer
-  ## at compile time, avoiding seq[PgParam] and intermediate seq[byte] allocs.
+  ## at compile time, avoiding ``seq[PgParam]`` and intermediate ``seq[byte]`` allocs.
   ##
   ## Usage: let qr = await conn.queryDirect("SELECT ... WHERE id = $1", myId)
   result = newStmtList()

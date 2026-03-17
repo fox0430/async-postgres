@@ -70,21 +70,27 @@ elif hasAsyncDispatch:
     ## Time interval in nanoseconds. API-compatible with chronos.Duration.
 
   proc nanoseconds*(ns: int64): Duration =
+    ## Create a Duration from nanoseconds.
     Duration(ns)
 
   proc nanoseconds*(ns: int): Duration =
+    ## Create a Duration from nanoseconds.
     Duration(int64(ns))
 
   proc milliseconds*(ms: int): Duration =
+    ## Create a Duration from milliseconds.
     Duration(int64(ms) * 1_000_000)
 
   proc seconds*(s: int): Duration =
+    ## Create a Duration from seconds.
     Duration(int64(s) * 1_000_000_000)
 
   proc minutes*(m: int): Duration =
+    ## Create a Duration from minutes.
     Duration(int64(m) * 60_000_000_000)
 
   proc hours*(h: int): Duration =
+    ## Create a Duration from hours.
     Duration(int64(h) * 3_600_000_000_000)
 
   const ZeroDuration* = Duration(0)
@@ -120,6 +126,7 @@ elif hasAsyncDispatch:
     ticks: int64 ## nanoseconds
 
   proc now*(T: typedesc[Moment]): Moment =
+    ## Get the current monotonic timestamp.
     Moment(ticks: getMonoTime().ticks)
 
   proc `-`*(a, b: Moment): Duration =

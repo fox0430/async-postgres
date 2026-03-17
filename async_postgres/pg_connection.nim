@@ -208,14 +208,17 @@ proc dispatchNotice(conn: PgConnection, msg: BackendMessage) =
     conn.noticeCallback(Notice(fields: msg.noticeFields))
 
 proc nextStmtName*(conn: PgConnection): string =
+  ## Generate the next unique prepared statement name for the statement cache.
   inc conn.stmtCounter
   "_sc_" & $conn.stmtCounter
 
 proc clearStmtCache*(conn: PgConnection) =
+  ## Clear the client-side statement cache. Does not close server-side statements.
   conn.stmtCache.clear()
   conn.stmtCacheLru.setLen(0)
 
 proc lookupStmtCache*(conn: PgConnection, sql: string): Option[CachedStmt] =
+  ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
   if conn.stmtCacheCapacity <= 0:
     return none(CachedStmt)
   if conn.stmtCache.hasKey(sql):
@@ -236,6 +239,7 @@ proc evictStmtCache*(conn: PgConnection): CachedStmt =
   conn.stmtCache.del(oldSql)
 
 proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
+  ## Add a prepared statement to the cache with auto-computed result formats.
   if conn.stmtCacheCapacity <= 0:
     return
   if conn.stmtCache.len >= conn.stmtCacheCapacity:
@@ -252,6 +256,7 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   conn.stmtCacheLru.add(sql)
 
 proc removeStmtCache*(conn: PgConnection, sql: string) =
+  ## Remove a statement from the cache by its SQL text.
   conn.stmtCache.del(sql)
   for i in 0 ..< conn.stmtCacheLru.len:
     if conn.stmtCacheLru[i] == sql:
@@ -270,7 +275,7 @@ when hasAsyncDispatch:
     socket.send(move s)
 
   proc sendRawBytes(socket: AsyncSocket, data: seq[byte]): Future[void] =
-    ## Send seq[byte] via asyncdispatch socket.
+    ## Send ``seq[byte]`` via asyncdispatch socket.
     sendRawData(socket, unsafeAddr data[0], data.len)
 
 proc compactRecvBuf(conn: PgConnection) {.inline.} =
@@ -372,6 +377,7 @@ proc recvMessage*(
     await conn.fillRecvBuf(timeout)
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
+  ## Send raw bytes to the PostgreSQL server over the connection.
   when hasChronos:
     await conn.writer.write(data)
   elif hasAsyncDispatch:
@@ -642,6 +648,9 @@ when defined(linux) or defined(macosx):
           raise newException(PgError, "Failed to set TCP_KEEPCNT: " & $strerror(errno))
 
 proc connect*(config: ConnConfig): Future[PgConnection] =
+  ## Establish a new connection to a PostgreSQL server.
+  ## Handles SSL negotiation, authentication (cleartext, MD5, SCRAM-SHA-256),
+  ## and startup parameter exchange. Respects `connectTimeout` if set.
   proc perform(): Future[PgConnection] {.async.} =
     var conn: PgConnection
 
@@ -800,13 +809,17 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     perform()
 
 proc checkReady*(conn: PgConnection) =
+  ## Assert that the connection is in `csReady` state. Raises `PgError` otherwise.
   if conn.state != csReady:
     raise newException(PgError, "Connection is not ready (state: " & $conn.state & ")")
 
 proc quoteIdentifier*(s: string): string =
+  ## Quote a SQL identifier (e.g. table/channel name) with double quotes, escaping embedded quotes.
   "\"" & s.replace("\"", "\"\"") & "\""
 
 proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.async.} =
+  ## Execute one or more SQL statements via simple query protocol.
+  ## Returns one `QueryResult` per statement. Supports multiple statements separated by semicolons.
   conn.checkReady()
   conn.state = csBusy
   await conn.sendMsg(encodeQuery(sql))
@@ -1017,6 +1030,7 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
   await conn.closeTransport()
 
 proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
+  ## Set a callback invoked for each incoming NOTIFY message.
   conn.notifyCallback = callback
 
 proc reconnectInPlace(conn: PgConnection) {.async.} =
@@ -1106,6 +1120,7 @@ proc startListening(conn: PgConnection) =
   conn.listenTask = conn.listenPump()
 
 proc stopListening*(conn: PgConnection) {.async.} =
+  ## Stop the background listen pump and return the connection to `csReady`.
   if conn.listenTask == nil or conn.listenTask.finished:
     conn.listenTask = nil
     if conn.state == csListening:
@@ -1132,6 +1147,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
     conn.state = csReady
 
 proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
+  ## Subscribe to a LISTEN channel and start the background notification pump.
   if conn.state == csListening:
     await conn.stopListening()
   conn.checkReady()
@@ -1140,6 +1156,7 @@ proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
   conn.startListening()
 
 proc unlisten*(conn: PgConnection, channel: string): Future[void] {.async.} =
+  ## Unsubscribe from a LISTEN channel. Stops the pump if no channels remain.
   if conn.state == csListening:
     await conn.stopListening()
   conn.checkReady()

@@ -204,27 +204,32 @@ func makeBinarySafeLookup(): array[BinarySafeMaxOid + 1, bool] {.compileTime.} =
 const binarySafeLookup = makeBinarySafeLookup()
 
 func isBinarySafeOid*(oid: int32): bool =
+  ## Check if a type OID can be safely requested in binary format.
   oid >= 0 and oid <= BinarySafeMaxOid and binarySafeLookup[oid]
 
 # Byte-level helpers
 
 proc encodeInt16*(val: int16): array[2, byte] =
+  ## Encode a 16-bit integer as big-endian bytes.
   result[0] = byte((val shr 8) and 0xFF)
   result[1] = byte(val and 0xFF)
 
 proc encodeInt32*(val: int32): array[4, byte] =
+  ## Encode a 32-bit integer as big-endian bytes.
   result[0] = byte((val shr 24) and 0xFF)
   result[1] = byte((val shr 16) and 0xFF)
   result[2] = byte((val shr 8) and 0xFF)
   result[3] = byte(val and 0xFF)
 
 proc addInt16*(buf: var seq[byte], val: int16) {.inline.} =
+  ## Append a 16-bit integer in big-endian format to the buffer.
   let oldLen = buf.len
   buf.setLen(oldLen + 2)
   buf[oldLen] = byte((val shr 8) and 0xFF)
   buf[oldLen + 1] = byte(val and 0xFF)
 
 proc addInt32*(buf: var seq[byte], val: int32) {.inline.} =
+  ## Append a 32-bit integer in big-endian format to the buffer.
   let oldLen = buf.len
   buf.setLen(oldLen + 4)
   buf[oldLen] = byte((val shr 24) and 0xFF)
@@ -250,6 +255,7 @@ proc patchMsgLen*(buf: var seq[byte], msgStart: int) {.inline.} =
   buf[msgStart + 4] = byte(length and 0xFF)
 
 proc addCString*(buf: var seq[byte], s: string) =
+  ## Append a null-terminated C string to the buffer.
   let oldLen = buf.len
   buf.setLen(oldLen + s.len + 1)
   if s.len > 0:
@@ -257,14 +263,17 @@ proc addCString*(buf: var seq[byte], s: string) =
   buf[oldLen + s.len] = 0'u8
 
 proc decodeInt16*(buf: openArray[byte], offset: int): int16 =
+  ## Decode a 16-bit integer from big-endian bytes at the given offset.
   result = int16(buf[offset]) shl 8 or int16(buf[offset + 1])
 
 proc decodeInt32*(buf: openArray[byte], offset: int): int32 =
+  ## Decode a 32-bit integer from big-endian bytes at the given offset.
   result =
     int32(buf[offset]) shl 24 or int32(buf[offset + 1]) shl 16 or
     int32(buf[offset + 2]) shl 8 or int32(buf[offset + 3])
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
+  ## Decode a null-terminated string at the given offset. Returns (string, bytes consumed).
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
@@ -281,6 +290,7 @@ proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
 proc encodeStartup*(
     user: string, database: string, extraParams: openArray[(string, string)] = []
 ): seq[byte] =
+  ## Encode a StartupMessage (protocol v3.0) with user, database, and extra parameters.
   result.addInt32(0) # length placeholder
   result.addInt32(196608) # protocol version 3.0
   result.addCString("user")
@@ -300,6 +310,7 @@ proc encodeStartup*(
   result[3] = encoded[3]
 
 proc encodeSSLRequest*(): seq[byte] =
+  ## Encode an SSLRequest message (magic number 80877103).
   result = newSeq[byte](8)
   let lenBytes = encodeInt32(8)
   let magicBytes = encodeInt32(80877103)
@@ -309,12 +320,14 @@ proc encodeSSLRequest*(): seq[byte] =
     result[i + 4] = mb
 
 proc encodePassword*(password: string): seq[byte] =
+  ## Encode a PasswordMessage for cleartext or MD5 authentication.
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.addCString(password)
   result.patchLen()
 
 proc encodeSASLInitialResponse*(mechanism: string, data: seq[byte]): seq[byte] =
+  ## Encode a SASLInitialResponse message with the chosen mechanism and client-first data.
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.addCString(mechanism)
@@ -323,12 +336,14 @@ proc encodeSASLInitialResponse*(mechanism: string, data: seq[byte]): seq[byte] =
   result.patchLen()
 
 proc encodeSASLResponse*(data: seq[byte]): seq[byte] =
+  ## Encode a SASLResponse message with client-final data.
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.add(data)
   result.patchLen()
 
 proc encodeQuery*(sql: string): seq[byte] =
+  ## Encode a simple Query message.
   result.add(byte('Q'))
   result.addInt32(0) # length placeholder
   result.addCString(sql)
@@ -345,6 +360,7 @@ proc addParse*(
     sql: string,
     paramTypeOids: openArray[int32] = [],
 ) =
+  ## Append a Parse message to the buffer (extended query protocol).
   let msgStart = buf.len
   buf.add(byte('P'))
   buf.addInt32(0) # length placeholder
@@ -363,6 +379,7 @@ proc addBind*(
     paramValues: openArray[Option[seq[byte]]],
     resultFormats: openArray[int16] = [],
 ) =
+  ## Append a Bind message to the buffer (extended query protocol).
   let msgStart = buf.len
   buf.add(byte('B'))
   buf.addInt32(0) # length placeholder
@@ -391,6 +408,7 @@ proc addBind*(
   buf.patchMsgLen(msgStart)
 
 proc addDescribe*(buf: var seq[byte], kind: DescribeKind, name: string) =
+  ## Append a Describe message to the buffer (portal or statement).
   let msgStart = buf.len
   buf.add(byte('D'))
   buf.addInt32(0) # length placeholder
@@ -399,6 +417,7 @@ proc addDescribe*(buf: var seq[byte], kind: DescribeKind, name: string) =
   buf.patchMsgLen(msgStart)
 
 proc addExecute*(buf: var seq[byte], portalName: string, maxRows: int32 = 0) =
+  ## Append an Execute message to the buffer. `maxRows` of 0 means unlimited.
   let msgStart = buf.len
   buf.add(byte('E'))
   buf.addInt32(0) # length placeholder
@@ -407,6 +426,7 @@ proc addExecute*(buf: var seq[byte], portalName: string, maxRows: int32 = 0) =
   buf.patchMsgLen(msgStart)
 
 proc addClose*(buf: var seq[byte], kind: DescribeKind, name: string) =
+  ## Append a Close message to the buffer (portal or statement).
   let msgStart = buf.len
   buf.add(byte('C'))
   buf.addInt32(0) # length placeholder
@@ -415,12 +435,15 @@ proc addClose*(buf: var seq[byte], kind: DescribeKind, name: string) =
   buf.patchMsgLen(msgStart)
 
 proc addSync*(buf: var seq[byte]) {.inline.} =
+  ## Append a Sync message to the buffer.
   buf.addFixedMsg(syncMsg)
 
 proc addFlush*(buf: var seq[byte]) {.inline.} =
+  ## Append a Flush message to the buffer.
   buf.addFixedMsg(flushMsg)
 
 proc addCopyDone*(buf: var seq[byte]) {.inline.} =
+  ## Append a CopyDone message to the buffer.
   buf.addFixedMsg(copyDoneMsg)
 
 # Wrapper functions that return seq[byte] (for non-batched sends)
@@ -428,6 +451,7 @@ proc addCopyDone*(buf: var seq[byte]) {.inline.} =
 proc encodeParse*(
     stmtName: string, sql: string, paramTypeOids: openArray[int32] = []
 ): seq[byte] =
+  ## Encode a standalone Parse message.
   result.addParse(stmtName, sql, paramTypeOids)
 
 proc encodeBind*(
@@ -437,27 +461,35 @@ proc encodeBind*(
     paramValues: openArray[Option[seq[byte]]],
     resultFormats: openArray[int16] = [],
 ): seq[byte] =
+  ## Encode a standalone Bind message.
   result.addBind(portalName, stmtName, paramFormats, paramValues, resultFormats)
 
 proc encodeDescribe*(kind: DescribeKind, name: string): seq[byte] =
+  ## Encode a standalone Describe message.
   result.addDescribe(kind, name)
 
 proc encodeExecute*(portalName: string, maxRows: int32 = 0): seq[byte] =
+  ## Encode a standalone Execute message.
   result.addExecute(portalName, maxRows)
 
 proc encodeClose*(kind: DescribeKind, name: string): seq[byte] =
+  ## Encode a standalone Close message.
   result.addClose(kind, name)
 
 proc encodeSync*(): seq[byte] =
+  ## Encode a standalone Sync message.
   result = @[byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
 
 proc encodeFlush*(): seq[byte] =
+  ## Encode a standalone Flush message.
   result = @[byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]
 
 proc encodeTerminate*(): seq[byte] =
+  ## Encode a Terminate message to close the connection.
   result = @[byte('X'), 0'u8, 0'u8, 0'u8, 4'u8]
 
 proc encodeCancelRequest*(pid: int32, secretKey: int32): seq[byte] =
+  ## Encode a CancelRequest message to abort a running query.
   result = newSeqOfCap[byte](16)
   result.addInt32(16)
   result.addInt32(80877102)
@@ -479,9 +511,11 @@ proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
     copyMem(addr buf[oldLen + 5], unsafeAddr data[0], data.len)
 
 proc encodeCopyDone*(): seq[byte] =
+  ## Encode a standalone CopyDone message.
   result = @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
 
 proc encodeCopyFail*(errorMsg: string): seq[byte] =
+  ## Encode a CopyFail message to abort a COPY operation with an error.
   result.add(byte('f'))
   result.addInt32(0) # length placeholder
   result.addCString(errorMsg)
@@ -671,6 +705,7 @@ proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
 proc newRowData*(
     numCols: int16, colFormats: seq[int16] = @[], colTypeOids: seq[int32] = @[]
 ): RowData =
+  ## Create a new RowData flat buffer for accumulating DataRow messages.
   RowData(
     buf: @[],
     cellIndex: @[],
@@ -819,12 +854,14 @@ proc parseBackendMessage*(
 # Utility
 
 proc getErrorField*(fields: seq[ErrorField], code: char): string =
+  ## Get the value of an error field by its single-char code (e.g. 'M' for message).
   for f in fields:
     if f.code == code:
       return f.value
   return ""
 
 proc formatError*(fields: seq[ErrorField]): string =
+  ## Format error fields into a human-readable error message with severity, SQLSTATE, detail, and hint.
   let severity = getErrorField(fields, 'S')
   let code = getErrorField(fields, 'C')
   let message = getErrorField(fields, 'M')
@@ -841,31 +878,38 @@ proc formatError*(fields: seq[ErrorField]): string =
 # Binary COPY format helpers
 
 proc addCopyBinaryHeader*(buf: var seq[byte]) =
+  ## Append the PostgreSQL binary COPY header (signature + flags + extension area).
   let oldLen = buf.len
   buf.setLen(oldLen + pgCopyBinaryHeader.len)
   copyMem(addr buf[oldLen], unsafeAddr pgCopyBinaryHeader[0], pgCopyBinaryHeader.len)
 
 proc addCopyBinaryTrailer*(buf: var seq[byte]) =
+  ## Append the binary COPY trailer (int16 = -1).
   let oldLen = buf.len
   buf.setLen(oldLen + 2)
   buf[oldLen] = 0xFF'u8
   buf[oldLen + 1] = 0xFF'u8
 
 proc addCopyTupleStart*(buf: var seq[byte], numCols: int16) =
+  ## Start a new tuple in binary COPY format with the given column count.
   buf.addInt16(numCols)
 
 proc addCopyFieldNull*(buf: var seq[byte]) =
+  ## Append a NULL field in binary COPY format.
   buf.addInt32(-1'i32)
 
 proc addCopyFieldInt16*(buf: var seq[byte], val: int16) =
+  ## Append an int16 field in binary COPY format.
   buf.addInt32(2'i32)
   buf.addInt16(val)
 
 proc addCopyFieldInt32*(buf: var seq[byte], val: int32) =
+  ## Append an int32 field in binary COPY format.
   buf.addInt32(4'i32)
   buf.addInt32(val)
 
 proc addCopyFieldInt64*(buf: var seq[byte], val: int64) =
+  ## Append an int64 field in binary COPY format.
   buf.addInt32(8'i32)
   let oldLen = buf.len
   buf.setLen(oldLen + 8)
@@ -879,16 +923,20 @@ proc addCopyFieldInt64*(buf: var seq[byte], val: int64) =
   buf[oldLen + 7] = byte(val and 0xFF)
 
 proc addCopyFieldFloat64*(buf: var seq[byte], val: float64) =
+  ## Append a float64 field in binary COPY format.
   buf.addCopyFieldInt64(cast[int64](val))
 
 proc addCopyFieldFloat32*(buf: var seq[byte], val: float32) =
+  ## Append a float32 field in binary COPY format.
   buf.addCopyFieldInt32(cast[int32](val))
 
 proc addCopyFieldBool*(buf: var seq[byte], val: bool) =
+  ## Append a boolean field in binary COPY format.
   buf.addInt32(1'i32)
   buf.add(if val: 1'u8 else: 0'u8)
 
 proc addCopyFieldText*(buf: var seq[byte], val: openArray[byte]) =
+  ## Append a raw byte field in binary COPY format.
   buf.addInt32(int32(val.len))
   if val.len > 0:
     let oldLen = buf.len
@@ -896,6 +944,7 @@ proc addCopyFieldText*(buf: var seq[byte], val: openArray[byte]) =
     copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
 
 proc addCopyFieldString*(buf: var seq[byte], val: string) =
+  ## Append a string field in binary COPY format.
   buf.addInt32(int32(val.len))
   if val.len > 0:
     let oldLen = buf.len
