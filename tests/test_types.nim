@@ -2409,7 +2409,7 @@ suite "User-defined enum":
 # Composite type tests
 
 type
-  PgPoint = object
+  PointRecord = object
     x: float64
     y: float64
 
@@ -2423,7 +2423,7 @@ type
     age: Option[int32]
     note: Option[string]
 
-pgComposite(PgPoint)
+pgComposite(PointRecord)
 pgComposite(PersonRecord, 50000'i32)
 pgComposite(NullableRecord)
 
@@ -2562,7 +2562,7 @@ suite "Composite binary encoder/decoder":
 
 suite "User-defined composite":
   test "pgComposite generates toPgParam with OID 0":
-    let p = toPgParam(PgPoint(x: 1.5, y: 2.5))
+    let p = toPgParam(PointRecord(x: 1.5, y: 2.5))
     check p.oid == 0'i32
     check p.format == 0'i16
     check p.value.isSome
@@ -2577,7 +2577,7 @@ suite "User-defined composite":
 
   test "getComposite text format":
     let row: Row = @[some(toBytes("(3.14,2.72)"))]
-    let pt = getComposite[PgPoint](row, 0)
+    let pt = getComposite[PointRecord](row, 0)
     check abs(pt.x - 3.14) < 1e-10
     check abs(pt.y - 2.72) < 1e-10
 
@@ -2598,21 +2598,21 @@ suite "User-defined composite":
     let row: Row = @[none(seq[byte])]
     var raised = false
     try:
-      discard getComposite[PgPoint](row, 0)
+      discard getComposite[PointRecord](row, 0)
     except PgTypeError:
       raised = true
     check raised
 
   test "getCompositeOpt some":
     let row: Row = @[some(toBytes("(1.0,2.0)"))]
-    let opt = getCompositeOpt[PgPoint](row, 0)
+    let opt = getCompositeOpt[PointRecord](row, 0)
     check opt.isSome
     check abs(opt.get.x - 1.0) < 1e-10
     check abs(opt.get.y - 2.0) < 1e-10
 
   test "getCompositeOpt none":
     let row: Row = @[none(seq[byte])]
-    check getCompositeOpt[PgPoint](row, 0) == none(PgPoint)
+    check getCompositeOpt[PointRecord](row, 0) == none(PointRecord)
 
   test "getComposite binary format":
     # Build binary composite: 2 fields, both float8
@@ -2623,27 +2623,27 @@ suite "User-defined composite":
     let data = encodeBinaryComposite(fields_data)
     let row: Row = @[some(data)]
     let fields = @[mkField(50000'i32, 1'i16)]
-    let pt = getComposite[PgPoint](row, 0, fields)
+    let pt = getComposite[PointRecord](row, 0, fields)
     check abs(pt.x - 3.14) < 1e-10
     check abs(pt.y - 2.72) < 1e-10
 
   test "getComposite binary text fallback":
     let row: Row = @[some(toBytes("(5.0,6.0)"))]
     let fields = @[mkField(50000'i32, 0'i16)]
-    let pt = getComposite[PgPoint](row, 0, fields)
+    let pt = getComposite[PointRecord](row, 0, fields)
     check abs(pt.x - 5.0) < 1e-10
     check abs(pt.y - 6.0) < 1e-10
 
   test "getCompositeOpt binary NULL":
     let row: Row = @[none(seq[byte])]
     let fields = @[mkField(50000'i32, 1'i16)]
-    check getCompositeOpt[PgPoint](row, 0, fields) == none(PgPoint)
+    check getCompositeOpt[PointRecord](row, 0, fields) == none(PointRecord)
 
   test "roundtrip text":
-    let orig = PgPoint(x: 1.5, y: -3.7)
+    let orig = PointRecord(x: 1.5, y: -3.7)
     let p = toPgParam(orig)
     let row: Row = @[p.value]
-    let decoded = getComposite[PgPoint](row, 0)
+    let decoded = getComposite[PointRecord](row, 0)
     check abs(decoded.x - orig.x) < 1e-10
     check abs(decoded.y - orig.y) < 1e-10
 
@@ -2718,13 +2718,13 @@ suite "User-defined composite":
     check decoded.note == orig.note
 
   test "Option[Composite] toPgParam some":
-    let p = toPgParam(some(PgPoint(x: 1.0, y: 2.0)))
+    let p = toPgParam(some(PointRecord(x: 1.0, y: 2.0)))
     check p.oid == 0'i32
     check p.format == 0'i16
     check p.value.isSome
 
   test "Option[Composite] toPgParam none":
-    let p = toPgParam(none(PgPoint))
+    let p = toPgParam(none(PointRecord))
     check p.oid == 0'i32
     check p.value.isNone
 
@@ -3303,3 +3303,287 @@ suite "Multirange binary roundtrip":
     let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInt4Multirange, 1'i16)]
     check row.getInt4MultirangeOpt(0, fields).isNone
+
+suite "Geometry types":
+  test "OID constants":
+    check OidPoint == 600'i32
+    check OidLseg == 601'i32
+    check OidPath == 602'i32
+    check OidBox == 603'i32
+    check OidPolygon == 604'i32
+    check OidLine == 628'i32
+    check OidCircle == 718'i32
+
+  test "PgPoint $ and ==":
+    let p = PgPoint(x: 1.5, y: 2.5)
+    check $p == "(1.5,2.5)"
+    check p == PgPoint(x: 1.5, y: 2.5)
+    check p != PgPoint(x: 1.5, y: 3.0)
+
+  test "PgLine $ and ==":
+    let l = PgLine(a: 1.0, b: 2.0, c: 3.0)
+    check $l == "{1.0,2.0,3.0}"
+    check l == PgLine(a: 1.0, b: 2.0, c: 3.0)
+
+  test "PgLseg $ and ==":
+    let s = PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 1.0, y: 1.0))
+    check $s == "[(0.0,0.0),(1.0,1.0)]"
+
+  test "PgBox $ and ==":
+    let b = PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+    check $b == "(3.0,4.0),(1.0,2.0)"
+
+  test "PgPath closed $ and ==":
+    let p = PgPath(
+      closed: true,
+      points:
+        @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 0.0, y: 1.0)],
+    )
+    check $p == "((0.0,0.0),(1.0,0.0),(0.0,1.0))"
+
+  test "PgPath open":
+    let p =
+      PgPath(closed: false, points: @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 1.0)])
+    check $p == "[(0.0,0.0),(1.0,1.0)]"
+
+  test "PgPolygon $":
+    let p = PgPolygon(
+      points:
+        @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 0.0, y: 1.0)]
+    )
+    check $p == "((0.0,0.0),(1.0,0.0),(0.0,1.0))"
+
+  test "PgCircle $ and ==":
+    let c = PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0)
+    check $c == "<(1.0,2.0),5.0>"
+
+  # toPgParam tests
+  test "toPgParam PgPoint":
+    let p = toPgParam(PgPoint(x: 1.5, y: 2.5))
+    check p.oid == OidPoint
+    check p.format == 0
+
+  test "toPgParam PgLine":
+    let p = toPgParam(PgLine(a: 1.0, b: 2.0, c: 3.0))
+    check p.oid == OidLine
+    check p.format == 0
+
+  test "toPgParam PgLseg":
+    let p = toPgParam(PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 1.0, y: 1.0)))
+    check p.oid == OidLseg
+    check p.format == 0
+
+  test "toPgParam PgBox":
+    let p =
+      toPgParam(PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0)))
+    check p.oid == OidBox
+    check p.format == 0
+
+  test "toPgParam PgPath":
+    let p = toPgParam(PgPath(closed: true, points: @[PgPoint(x: 0.0, y: 0.0)]))
+    check p.oid == OidPath
+    check p.format == 0
+
+  test "toPgParam PgPolygon":
+    let p = toPgParam(PgPolygon(points: @[PgPoint(x: 0.0, y: 0.0)]))
+    check p.oid == OidPolygon
+    check p.format == 0
+
+  test "toPgParam PgCircle":
+    let p = toPgParam(PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0))
+    check p.oid == OidCircle
+    check p.format == 0
+
+  # toPgBinaryParam tests
+  test "toPgBinaryParam PgPoint":
+    let p = toPgBinaryParam(PgPoint(x: 1.5, y: 2.5))
+    check p.oid == OidPoint
+    check p.format == 1
+    check p.value.get.len == 16
+
+  test "toPgBinaryParam PgLine":
+    let p = toPgBinaryParam(PgLine(a: 1.0, b: 2.0, c: 3.0))
+    check p.oid == OidLine
+    check p.format == 1
+    check p.value.get.len == 24
+
+  test "toPgBinaryParam PgLseg":
+    let p =
+      toPgBinaryParam(PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 1.0, y: 1.0)))
+    check p.oid == OidLseg
+    check p.format == 1
+    check p.value.get.len == 32
+
+  test "toPgBinaryParam PgBox":
+    let p = toPgBinaryParam(
+      PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+    )
+    check p.oid == OidBox
+    check p.format == 1
+    check p.value.get.len == 32
+
+  test "toPgBinaryParam PgPath":
+    let pts = @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 1.0)]
+    let p = toPgBinaryParam(PgPath(closed: true, points: pts))
+    check p.oid == OidPath
+    check p.format == 1
+    check p.value.get.len == 1 + 4 + 2 * 16
+
+  test "toPgBinaryParam PgPolygon":
+    let pts =
+      @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 0.0, y: 1.0)]
+    let p = toPgBinaryParam(PgPolygon(points: pts))
+    check p.oid == OidPolygon
+    check p.format == 1
+    check p.value.get.len == 4 + 3 * 16
+
+  test "toPgBinaryParam PgCircle":
+    let p = toPgBinaryParam(PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0))
+    check p.oid == OidCircle
+    check p.format == 1
+    check p.value.get.len == 24
+
+  # Text format decoding tests
+  test "getPoint text format":
+    let row: Row = @[some(toBytes("(1.5,2.5)"))]
+    let v = row.getPoint(0)
+    check v.x == 1.5
+    check v.y == 2.5
+
+  test "getLine text format":
+    let row: Row = @[some(toBytes("{1.0,2.0,3.0}"))]
+    let v = row.getLine(0)
+    check v.a == 1.0
+    check v.b == 2.0
+    check v.c == 3.0
+
+  test "getLseg text format":
+    let row: Row = @[some(toBytes("[(0,0),(1,1)]"))]
+    let v = row.getLseg(0)
+    check v.p1 == PgPoint(x: 0.0, y: 0.0)
+    check v.p2 == PgPoint(x: 1.0, y: 1.0)
+
+  test "getBox text format":
+    let row: Row = @[some(toBytes("(3,4),(1,2)"))]
+    let v = row.getBox(0)
+    check v.high == PgPoint(x: 3.0, y: 4.0)
+    check v.low == PgPoint(x: 1.0, y: 2.0)
+
+  test "getPath text format closed":
+    let row: Row = @[some(toBytes("((0,0),(1,0),(0,1))"))]
+    let v = row.getPath(0)
+    check v.closed == true
+    check v.points.len == 3
+
+  test "getPath text format open":
+    let row: Row = @[some(toBytes("[(0,0),(1,1)]"))]
+    let v = row.getPath(0)
+    check v.closed == false
+    check v.points.len == 2
+
+  test "getPolygon text format":
+    let row: Row = @[some(toBytes("((0,0),(1,0),(0,1))"))]
+    let v = row.getPolygon(0)
+    check v.points.len == 3
+
+  test "getCircle text format":
+    let row: Row = @[some(toBytes("<(1,2),5>"))]
+    let v = row.getCircle(0)
+    check v.center == PgPoint(x: 1.0, y: 2.0)
+    check v.radius == 5.0
+
+  # Binary format roundtrip tests
+  test "PgPoint binary roundtrip":
+    let orig = PgPoint(x: -3.14, y: 2.718)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidPoint, 1'i16)]
+    let decoded = row.getPoint(0, fields)
+    check decoded == orig
+
+  test "PgLine binary roundtrip":
+    let orig = PgLine(a: 1.0, b: -2.0, c: 3.5)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidLine, 1'i16)]
+    let decoded = row.getLine(0, fields)
+    check decoded == orig
+
+  test "PgLseg binary roundtrip":
+    let orig = PgLseg(p1: PgPoint(x: -1.0, y: 2.0), p2: PgPoint(x: 3.0, y: -4.0))
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidLseg, 1'i16)]
+    let decoded = row.getLseg(0, fields)
+    check decoded == orig
+
+  test "PgBox binary roundtrip":
+    let orig = PgBox(high: PgPoint(x: 5.0, y: 6.0), low: PgPoint(x: 1.0, y: 2.0))
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidBox, 1'i16)]
+    let decoded = row.getBox(0, fields)
+    check decoded == orig
+
+  test "PgPath binary roundtrip closed":
+    let orig = PgPath(
+      closed: true,
+      points:
+        @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 0.0, y: 1.0)],
+    )
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidPath, 1'i16)]
+    let decoded = row.getPath(0, fields)
+    check decoded == orig
+
+  test "PgPath binary roundtrip open":
+    let orig =
+      PgPath(closed: false, points: @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 5.0, y: 5.0)])
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidPath, 1'i16)]
+    let decoded = row.getPath(0, fields)
+    check decoded == orig
+
+  test "PgPolygon binary roundtrip":
+    let orig = PgPolygon(
+      points:
+        @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 4.0, y: 0.0), PgPoint(x: 2.0, y: 3.0)]
+    )
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidPolygon, 1'i16)]
+    let decoded = row.getPolygon(0, fields)
+    check decoded == orig
+
+  test "PgCircle binary roundtrip":
+    let orig = PgCircle(center: PgPoint(x: -1.5, y: 2.5), radius: 10.0)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidCircle, 1'i16)]
+    let decoded = row.getCircle(0, fields)
+    check decoded == orig
+
+  # Opt accessor tests
+  test "getPointOpt some":
+    let row: Row = @[some(toBytes("(1,2)"))]
+    check row.getPointOpt(0).isSome
+
+  test "getPointOpt none":
+    let row: Row = @[none(seq[byte])]
+    check row.getPointOpt(0).isNone
+
+  test "getCircleOpt binary some":
+    let orig = PgCircle(center: PgPoint(x: 0.0, y: 0.0), radius: 1.0)
+    let p = toPgBinaryParam(orig)
+    let row: Row = @[p.value]
+    let fields = @[mkField(OidCircle, 1'i16)]
+    let r = row.getCircleOpt(0, fields)
+    check r.isSome
+    check r.get == orig
+
+  test "getCircleOpt binary none":
+    let row: Row = @[none(seq[byte])]
+    let fields = @[mkField(OidCircle, 1'i16)]
+    check row.getCircleOpt(0, fields).isNone

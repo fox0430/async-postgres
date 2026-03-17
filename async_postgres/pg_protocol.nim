@@ -161,8 +161,15 @@ const
     21, # int2 / smallint
     23, # int4 / integer
     25, # text
+    600, # point
+    601, # lseg
+    602, # path
+    603, # box
+    604, # polygon
+    628, # line
     700, # float4
     701, # float8
+    718, # circle
     1043, # varchar
     3904, # int4range
     3906, # numrange

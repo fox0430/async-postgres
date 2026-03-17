@@ -1,4 +1,4 @@
-import std/[json, macros, options, strutils, tables, times, net]
+import std/[json, macros, math, options, sequtils, strutils, tables, times, net]
 
 import pg_protocol
 
@@ -30,6 +30,34 @@ type
   PgMacAddr* = distinct string ## MAC address as "08:00:2b:01:02:03"
 
   PgMacAddr8* = distinct string ## EUI-64 MAC address as "08:00:2b:01:02:03:04:05"
+
+  PgPoint* = object ## PostgreSQL point type: (x, y).
+    x*: float64
+    y*: float64
+
+  PgLine* = object ## PostgreSQL line type: {A, B, C} representing Ax + By + C = 0.
+    a*: float64
+    b*: float64
+    c*: float64
+
+  PgLseg* = object ## PostgreSQL lseg (line segment) type: [(x1,y1),(x2,y2)].
+    p1*: PgPoint
+    p2*: PgPoint
+
+  PgBox* = object ## PostgreSQL box type: (upper-right),(lower-left).
+    high*: PgPoint
+    low*: PgPoint
+
+  PgPath* = object ## PostgreSQL path type: open or closed sequence of points.
+    closed*: bool
+    points*: seq[PgPoint]
+
+  PgPolygon* = object ## PostgreSQL polygon type: closed sequence of points.
+    points*: seq[PgPoint]
+
+  PgCircle* = object ## PostgreSQL circle type: <(x,y),r>.
+    center*: PgPoint
+    radius*: float64
 
   PgRangeBound*[T] = object ## One endpoint of a PostgreSQL range value.
     value*: T
@@ -99,6 +127,13 @@ const
   OidCidr* = 650'i32
   OidMacAddr* = 829'i32
   OidMacAddr8* = 774'i32
+  OidPoint* = 600'i32
+  OidLseg* = 601'i32
+  OidPath* = 602'i32
+  OidBox* = 603'i32
+  OidPolygon* = 604'i32
+  OidLine* = 628'i32
+  OidCircle* = 718'i32
   OidBoolArray* = 1000'i32
   OidInt2Array* = 1005'i32
   OidInt4Array* = 1007'i32
@@ -143,6 +178,63 @@ proc `==`*(a, b: PgMacAddr): bool {.borrow.}
 
 proc `$`*(v: PgMacAddr8): string {.borrow.}
 proc `==`*(a, b: PgMacAddr8): bool {.borrow.}
+
+proc `$`*(v: PgPoint): string =
+  "(" & $v.x & "," & $v.y & ")"
+
+proc `==`*(a, b: PgPoint): bool =
+  a.x == b.x and a.y == b.y
+
+proc `$`*(v: PgLine): string =
+  "{" & $v.a & "," & $v.b & "," & $v.c & "}"
+
+proc `==`*(a, b: PgLine): bool =
+  a.a == b.a and a.b == b.b and a.c == b.c
+
+proc `$`*(v: PgLseg): string =
+  "[" & $v.p1 & "," & $v.p2 & "]"
+
+proc `==`*(a, b: PgLseg): bool =
+  a.p1 == b.p1 and a.p2 == b.p2
+
+proc `$`*(v: PgBox): string =
+  $v.high & "," & $v.low
+
+proc `==`*(a, b: PgBox): bool =
+  a.high == b.high and a.low == b.low
+
+proc `$`*(v: PgPath): string =
+  let inner = v.points
+    .map(
+      proc(p: PgPoint): string =
+        $p
+    )
+    .join(",")
+  if v.closed:
+    "(" & inner & ")"
+  else:
+    "[" & inner & "]"
+
+proc `==`*(a, b: PgPath): bool =
+  a.closed == b.closed and a.points == b.points
+
+proc `$`*(v: PgPolygon): string =
+  "(" &
+    v.points
+    .map(
+      proc(p: PgPoint): string =
+        $p
+    )
+    .join(",") & ")"
+
+proc `==`*(a, b: PgPolygon): bool =
+  a.points == b.points
+
+proc `$`*(v: PgCircle): string =
+  "<" & $v.center & "," & $v.radius & ">"
+
+proc `==`*(a, b: PgCircle): bool =
+  a.center == b.center and a.radius == b.radius
 
 proc `$`*(v: PgInet): string =
   $v.address & "/" & $v.mask
@@ -287,6 +379,27 @@ proc toPgParam*(v: PgMacAddr): PgParam =
 
 proc toPgParam*(v: PgMacAddr8): PgParam =
   PgParam(oid: OidMacAddr8, format: 0, value: some(toBytes(string(v))))
+
+proc toPgParam*(v: PgPoint): PgParam =
+  PgParam(oid: OidPoint, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgLine): PgParam =
+  PgParam(oid: OidLine, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgLseg): PgParam =
+  PgParam(oid: OidLseg, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgBox): PgParam =
+  PgParam(oid: OidBox, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgPath): PgParam =
+  PgParam(oid: OidPath, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgPolygon): PgParam =
+  PgParam(oid: OidPolygon, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgCircle): PgParam =
+  PgParam(oid: OidCircle, format: 0, value: some(toBytes($v)))
 
 proc toPgParam*(v: JsonNode): PgParam =
   PgParam(oid: OidJsonb, format: 0, value: some(toBytes($v)))
@@ -550,6 +663,94 @@ proc toPgBinaryParam*(v: PgMacAddr8): PgParam =
   for i in 0 ..< 8:
     data[i] = byte(parseHexInt(parts[i]))
   PgParam(oid: OidMacAddr8, format: 1, value: some(data))
+
+proc encodePointBinary(p: PgPoint): seq[byte] =
+  ## Encode a point as 16 bytes (two float64 big-endian).
+  result = newSeq[byte](16)
+  let xBytes = toBE64(cast[int64](p.x))
+  copyMem(addr result[0], unsafeAddr xBytes[0], 8)
+  let yBytes = toBE64(cast[int64](p.y))
+  copyMem(addr result[8], unsafeAddr yBytes[0], 8)
+
+proc decodePointBinary(data: openArray[byte], off: int): PgPoint =
+  ## Decode a point from 16 bytes at offset.
+  var xBits = uint64(
+    (uint64(data[off]) shl 56) or (uint64(data[off + 1]) shl 48) or
+      (uint64(data[off + 2]) shl 40) or (uint64(data[off + 3]) shl 32) or
+      (uint64(data[off + 4]) shl 24) or (uint64(data[off + 5]) shl 16) or
+      (uint64(data[off + 6]) shl 8) or uint64(data[off + 7])
+  )
+  var yBits = uint64(
+    (uint64(data[off + 8]) shl 56) or (uint64(data[off + 9]) shl 48) or
+      (uint64(data[off + 10]) shl 40) or (uint64(data[off + 11]) shl 32) or
+      (uint64(data[off + 12]) shl 24) or (uint64(data[off + 13]) shl 16) or
+      (uint64(data[off + 14]) shl 8) or uint64(data[off + 15])
+  )
+  copyMem(addr result.x, addr xBits, 8)
+  copyMem(addr result.y, addr yBits, 8)
+
+proc toPgBinaryParam*(v: PgPoint): PgParam =
+  ## Binary format: 16 bytes (two float64 big-endian).
+  PgParam(oid: OidPoint, format: 1, value: some(encodePointBinary(v)))
+
+proc toPgBinaryParam*(v: PgLine): PgParam =
+  ## Binary format: 24 bytes (three float64 big-endian: A, B, C).
+  var data = newSeq[byte](24)
+  let aBytes = toBE64(cast[int64](v.a))
+  copyMem(addr data[0], unsafeAddr aBytes[0], 8)
+  let bBytes = toBE64(cast[int64](v.b))
+  copyMem(addr data[8], unsafeAddr bBytes[0], 8)
+  let cBytes = toBE64(cast[int64](v.c))
+  copyMem(addr data[16], unsafeAddr cBytes[0], 8)
+  PgParam(oid: OidLine, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgLseg): PgParam =
+  ## Binary format: 32 bytes (two points).
+  var data = newSeq[byte](32)
+  let p1 = encodePointBinary(v.p1)
+  copyMem(addr data[0], unsafeAddr p1[0], 16)
+  let p2 = encodePointBinary(v.p2)
+  copyMem(addr data[16], unsafeAddr p2[0], 16)
+  PgParam(oid: OidLseg, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgBox): PgParam =
+  ## Binary format: 32 bytes (high point, low point).
+  var data = newSeq[byte](32)
+  let hi = encodePointBinary(v.high)
+  copyMem(addr data[0], unsafeAddr hi[0], 16)
+  let lo = encodePointBinary(v.low)
+  copyMem(addr data[16], unsafeAddr lo[0], 16)
+  PgParam(oid: OidBox, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgPath): PgParam =
+  ## Binary format: closed(1) + npts(4) + points(npts*16).
+  var data = newSeq[byte](1 + 4 + v.points.len * 16)
+  data[0] = if v.closed: 1'u8 else: 0'u8
+  let npts = toBE32(int32(v.points.len))
+  copyMem(addr data[1], unsafeAddr npts[0], 4)
+  for i, p in v.points:
+    let pb = encodePointBinary(p)
+    copyMem(addr data[5 + i * 16], unsafeAddr pb[0], 16)
+  PgParam(oid: OidPath, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgPolygon): PgParam =
+  ## Binary format: npts(4) + points(npts*16).
+  var data = newSeq[byte](4 + v.points.len * 16)
+  let npts = toBE32(int32(v.points.len))
+  copyMem(addr data[0], unsafeAddr npts[0], 4)
+  for i, p in v.points:
+    let pb = encodePointBinary(p)
+    copyMem(addr data[4 + i * 16], unsafeAddr pb[0], 16)
+  PgParam(oid: OidPolygon, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgCircle): PgParam =
+  ## Binary format: 24 bytes (center point + radius float64).
+  var data = newSeq[byte](24)
+  let cp = encodePointBinary(v.center)
+  copyMem(addr data[0], unsafeAddr cp[0], 16)
+  let rBytes = toBE64(cast[int64](v.radius))
+  copyMem(addr data[16], unsafeAddr rBytes[0], 8)
+  PgParam(oid: OidCircle, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: JsonNode): PgParam =
   let jsonBytes = toBytes($v)
@@ -1000,6 +1201,115 @@ proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
   ## Get a column value as PgMacAddr8 (EUI-64).
   PgMacAddr8(row.getStr(col))
 
+# Geometry text format parsers
+
+proc parsePointText(s: string): PgPoint =
+  ## Parse "(x,y)" text format.
+  var inner = s.strip()
+  if inner.len >= 2 and inner[0] == '(' and inner[^1] == ')':
+    inner = inner[1 ..^ 2]
+  let comma = inner.find(',')
+  if comma < 0:
+    raise newException(PgTypeError, "Invalid point: " & s)
+  PgPoint(x: parseFloat(inner[0 ..< comma]), y: parseFloat(inner[comma + 1 ..^ 1]))
+
+proc parsePointsText(s: string): seq[PgPoint] =
+  ## Parse a comma-separated list of points like "(x1,y1),(x2,y2),...".
+  var i = 0
+  let n = s.len
+  while i < n:
+    while i < n and s[i] in {' ', ','}:
+      i += 1
+    if i >= n:
+      break
+    if s[i] != '(':
+      raise newException(PgTypeError, "Expected '(' in point list at pos " & $i)
+    let start = i
+    i += 1
+    # Find matching ')'
+    while i < n and s[i] != ')':
+      i += 1
+    if i >= n:
+      raise newException(PgTypeError, "Unmatched '(' in point list")
+    i += 1 # skip ')'
+    result.add(parsePointText(s[start ..< i]))
+
+proc getPoint*(row: Row, col: int): PgPoint =
+  ## Get a column value as PgPoint. Text format: "(x,y)".
+  parsePointText(row.getStr(col))
+
+proc getLine*(row: Row, col: int): PgLine =
+  ## Get a column value as PgLine. Text format: "{A,B,C}".
+  let s = row.getStr(col)
+  var inner = s.strip()
+  if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
+    inner = inner[1 ..^ 2]
+  else:
+    raise newException(PgTypeError, "Invalid line: " & s)
+  let parts = inner.split(',')
+  if parts.len != 3:
+    raise newException(PgTypeError, "Invalid line: " & s)
+  PgLine(a: parseFloat(parts[0]), b: parseFloat(parts[1]), c: parseFloat(parts[2]))
+
+proc getLseg*(row: Row, col: int): PgLseg =
+  ## Get a column value as PgLseg. Text format: "[(x1,y1),(x2,y2)]".
+  let s = row.getStr(col).strip()
+  var inner = s
+  if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
+    inner = inner[1 ..^ 2]
+  let points = parsePointsText(inner)
+  if points.len != 2:
+    raise newException(PgTypeError, "Invalid lseg: " & s)
+  PgLseg(p1: points[0], p2: points[1])
+
+proc getBox*(row: Row, col: int): PgBox =
+  ## Get a column value as PgBox. Text format: "(x1,y1),(x2,y2)".
+  let s = row.getStr(col).strip()
+  let points = parsePointsText(s)
+  if points.len != 2:
+    raise newException(PgTypeError, "Invalid box: " & s)
+  PgBox(high: points[0], low: points[1])
+
+proc getPath*(row: Row, col: int): PgPath =
+  ## Get a column value as PgPath. Text: "((x,y),...)" closed or "[(x,y),...]" open.
+  let s = row.getStr(col).strip()
+  if s.len < 2:
+    raise newException(PgTypeError, "Invalid path: " & s)
+  let closed = s[0] == '('
+  let inner = s[1 ..^ 2]
+  let points = parsePointsText(inner)
+  PgPath(closed: closed, points: points)
+
+proc getPolygon*(row: Row, col: int): PgPolygon =
+  ## Get a column value as PgPolygon. Text format: "((x1,y1),(x2,y2),...)".
+  let s = row.getStr(col).strip()
+  if s.len < 2 or s[0] != '(' or s[^1] != ')':
+    raise newException(PgTypeError, "Invalid polygon: " & s)
+  let inner = s[1 ..^ 2]
+  PgPolygon(points: parsePointsText(inner))
+
+proc getCircle*(row: Row, col: int): PgCircle =
+  ## Get a column value as PgCircle. Text format: "<(x,y),r>".
+  let s = row.getStr(col).strip()
+  if s.len < 2 or s[0] != '<' or s[^1] != '>':
+    raise newException(PgTypeError, "Invalid circle: " & s)
+  let inner = s[1 ..^ 2]
+  # Find the last comma that's outside parens
+  var depth = 0
+  var lastComma = -1
+  for i in 0 ..< inner.len:
+    if inner[i] == '(':
+      depth += 1
+    elif inner[i] == ')':
+      depth -= 1
+    elif inner[i] == ',' and depth == 0:
+      lastComma = i
+  if lastComma < 0:
+    raise newException(PgTypeError, "Invalid circle: " & s)
+  let center = parsePointText(inner[0 ..< lastComma])
+  let radius = parseFloat(inner[lastComma + 1 ..^ 1])
+  PgCircle(center: center, radius: radius)
+
 # NULL-safe Option accessors — return `none` for NULL instead of raising.
 
 proc getStrOpt*(row: Row, col: int): Option[string] =
@@ -1074,6 +1384,48 @@ proc getMacAddr8Opt*(row: Row, col: int): Option[PgMacAddr8] =
     none(PgMacAddr8)
   else:
     some(row.getMacAddr8(col))
+
+proc getPointOpt*(row: Row, col: int): Option[PgPoint] =
+  if row.isNull(col):
+    none(PgPoint)
+  else:
+    some(row.getPoint(col))
+
+proc getLineOpt*(row: Row, col: int): Option[PgLine] =
+  if row.isNull(col):
+    none(PgLine)
+  else:
+    some(row.getLine(col))
+
+proc getLsegOpt*(row: Row, col: int): Option[PgLseg] =
+  if row.isNull(col):
+    none(PgLseg)
+  else:
+    some(row.getLseg(col))
+
+proc getBoxOpt*(row: Row, col: int): Option[PgBox] =
+  if row.isNull(col):
+    none(PgBox)
+  else:
+    some(row.getBox(col))
+
+proc getPathOpt*(row: Row, col: int): Option[PgPath] =
+  if row.isNull(col):
+    none(PgPath)
+  else:
+    some(row.getPath(col))
+
+proc getPolygonOpt*(row: Row, col: int): Option[PgPolygon] =
+  if row.isNull(col):
+    none(PgPolygon)
+  else:
+    some(row.getPolygon(col))
+
+proc getCircleOpt*(row: Row, col: int): Option[PgCircle] =
+  if row.isNull(col):
+    none(PgCircle)
+  else:
+    some(row.getCircle(col))
 
 # Array text format parser
 
@@ -1721,6 +2073,164 @@ proc getMacAddr8Opt*(
     none(PgMacAddr8)
   else:
     some(row.getMacAddr8(col, fields))
+
+# Geometry binary-aware decoders
+
+proc getPoint*(row: Row, col: int, fields: seq[FieldDescription]): PgPoint =
+  if fields[col].formatCode == 0:
+    return row.getPoint(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 16:
+    raise newException(PgTypeError, "Invalid binary point length: " & $clen)
+  decodePointBinary(row.data.buf, off)
+
+proc getLine*(row: Row, col: int, fields: seq[FieldDescription]): PgLine =
+  if fields[col].formatCode == 0:
+    return row.getLine(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 24:
+    raise newException(PgTypeError, "Invalid binary line length: " & $clen)
+  let b = row.data.buf
+  var aBits, bBits, cBits: uint64
+  aBits =
+    (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or (
+      uint64(b[off + 2]) shl 40
+    ) or (uint64(b[off + 3]) shl 32) or (uint64(b[off + 4]) shl 24) or
+    (uint64(b[off + 5]) shl 16) or (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+  bBits =
+    (uint64(b[off + 8]) shl 56) or (uint64(b[off + 9]) shl 48) or
+    (uint64(b[off + 10]) shl 40) or (uint64(b[off + 11]) shl 32) or
+    (uint64(b[off + 12]) shl 24) or (uint64(b[off + 13]) shl 16) or
+    (uint64(b[off + 14]) shl 8) or uint64(b[off + 15])
+  cBits =
+    (uint64(b[off + 16]) shl 56) or (uint64(b[off + 17]) shl 48) or
+    (uint64(b[off + 18]) shl 40) or (uint64(b[off + 19]) shl 32) or
+    (uint64(b[off + 20]) shl 24) or (uint64(b[off + 21]) shl 16) or
+    (uint64(b[off + 22]) shl 8) or uint64(b[off + 23])
+  copyMem(addr result.a, addr aBits, 8)
+  copyMem(addr result.b, addr bBits, 8)
+  copyMem(addr result.c, addr cBits, 8)
+
+proc getLseg*(row: Row, col: int, fields: seq[FieldDescription]): PgLseg =
+  if fields[col].formatCode == 0:
+    return row.getLseg(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 32:
+    raise newException(PgTypeError, "Invalid binary lseg length: " & $clen)
+  PgLseg(
+    p1: decodePointBinary(row.data.buf, off),
+    p2: decodePointBinary(row.data.buf, off + 16),
+  )
+
+proc getBox*(row: Row, col: int, fields: seq[FieldDescription]): PgBox =
+  if fields[col].formatCode == 0:
+    return row.getBox(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 32:
+    raise newException(PgTypeError, "Invalid binary box length: " & $clen)
+  PgBox(
+    high: decodePointBinary(row.data.buf, off),
+    low: decodePointBinary(row.data.buf, off + 16),
+  )
+
+proc getPath*(row: Row, col: int, fields: seq[FieldDescription]): PgPath =
+  if fields[col].formatCode == 0:
+    return row.getPath(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let b = row.data.buf
+  result.closed = b[off] != 0
+  let npts = fromBE32(b.toOpenArray(off + 1, off + 4))
+  result.points = newSeq[PgPoint](npts)
+  for i in 0 ..< npts:
+    result.points[i] = decodePointBinary(b, off + 5 + i * 16)
+
+proc getPolygon*(row: Row, col: int, fields: seq[FieldDescription]): PgPolygon =
+  if fields[col].formatCode == 0:
+    return row.getPolygon(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let b = row.data.buf
+  let npts = fromBE32(b.toOpenArray(off, off + 3))
+  result.points = newSeq[PgPoint](npts)
+  for i in 0 ..< npts:
+    result.points[i] = decodePointBinary(b, off + 4 + i * 16)
+
+proc getCircle*(row: Row, col: int, fields: seq[FieldDescription]): PgCircle =
+  if fields[col].formatCode == 0:
+    return row.getCircle(col)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if clen != 24:
+    raise newException(PgTypeError, "Invalid binary circle length: " & $clen)
+  result.center = decodePointBinary(row.data.buf, off)
+  var rBits: uint64
+  let b = row.data.buf
+  rBits =
+    (uint64(b[off + 16]) shl 56) or (uint64(b[off + 17]) shl 48) or
+    (uint64(b[off + 18]) shl 40) or (uint64(b[off + 19]) shl 32) or
+    (uint64(b[off + 20]) shl 24) or (uint64(b[off + 21]) shl 16) or
+    (uint64(b[off + 22]) shl 8) or uint64(b[off + 23])
+  copyMem(addr result.radius, addr rBits, 8)
+
+# Geometry binary-aware Opt accessors
+
+proc getPointOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgPoint] =
+  if row.isNull(col):
+    none(PgPoint)
+  else:
+    some(row.getPoint(col, fields))
+
+proc getLineOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgLine] =
+  if row.isNull(col):
+    none(PgLine)
+  else:
+    some(row.getLine(col, fields))
+
+proc getLsegOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgLseg] =
+  if row.isNull(col):
+    none(PgLseg)
+  else:
+    some(row.getLseg(col, fields))
+
+proc getBoxOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgBox] =
+  if row.isNull(col):
+    none(PgBox)
+  else:
+    some(row.getBox(col, fields))
+
+proc getPathOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgPath] =
+  if row.isNull(col):
+    none(PgPath)
+  else:
+    some(row.getPath(col, fields))
+
+proc getPolygonOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgPolygon] =
+  if row.isNull(col):
+    none(PgPolygon)
+  else:
+    some(row.getPolygon(col, fields))
+
+proc getCircleOpt*(
+    row: Row, col: int, fields: seq[FieldDescription]
+): Option[PgCircle] =
+  if row.isNull(col):
+    none(PgCircle)
+  else:
+    some(row.getCircle(col, fields))
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.
