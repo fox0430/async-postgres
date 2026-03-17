@@ -253,6 +253,101 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")
 
+  test "multi-host DSN":
+    let cfg = parseDsn("postgresql://h1:5432,h2:5433/db")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].host == "h1"
+    check cfg.hosts[0].port == 5432
+    check cfg.hosts[1].host == "h2"
+    check cfg.hosts[1].port == 5433
+    check cfg.host == "h1"
+    check cfg.port == 5432
+    check cfg.database == "db"
+
+  test "multi-host with IPv6":
+    let cfg = parseDsn("postgresql://[::1]:5432,h2/db")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].host == "::1"
+    check cfg.hosts[0].port == 5432
+    check cfg.hosts[1].host == "h2"
+    check cfg.hosts[1].port == 5432
+    check cfg.database == "db"
+
+  test "multi-host with userinfo":
+    let cfg = parseDsn("postgresql://user:pass@h1,h2/db")
+    check cfg.user == "user"
+    check cfg.password == "pass"
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].host == "h1"
+    check cfg.hosts[1].host == "h2"
+    check cfg.database == "db"
+
+  test "multi-host mixed ports":
+    let cfg = parseDsn("postgresql://h1,h2:5433/db")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].host == "h1"
+    check cfg.hosts[0].port == 5432
+    check cfg.hosts[1].host == "h2"
+    check cfg.hosts[1].port == 5433
+
+  test "target_session_attrs all values":
+    check parseDsn("postgresql://h/db?target_session_attrs=any").targetSessionAttrs ==
+      tsaAny
+    check parseDsn("postgresql://h/db?target_session_attrs=read-write").targetSessionAttrs ==
+      tsaReadWrite
+    check parseDsn("postgresql://h/db?target_session_attrs=read-only").targetSessionAttrs ==
+      tsaReadOnly
+    check parseDsn("postgresql://h/db?target_session_attrs=primary").targetSessionAttrs ==
+      tsaPrimary
+    check parseDsn("postgresql://h/db?target_session_attrs=standby").targetSessionAttrs ==
+      tsaStandby
+    check parseDsn("postgresql://h/db?target_session_attrs=prefer-standby").targetSessionAttrs ==
+      tsaPreferStandby
+
+  test "error: invalid target_session_attrs":
+    expect PgError:
+      discard parseDsn("postgresql://h/db?target_session_attrs=bogus")
+
+  test "single host backward compat - hosts has one entry":
+    let cfg = parseDsn("postgresql://myhost:5433/db")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "myhost"
+    check cfg.hosts[0].port == 5433
+    check cfg.host == "myhost"
+    check cfg.port == 5433
+
+  test "getHosts with populated hosts":
+    let cfg = parseDsn("postgresql://h1,h2:5433/db")
+    let hosts = cfg.getHosts()
+    check hosts.len == 2
+    check hosts[0].host == "h1"
+    check hosts[1].host == "h2"
+    check hosts[1].port == 5433
+
+  test "getHosts with empty hosts falls back to host/port":
+    var cfg = ConnConfig(host: "myhost", port: 9999)
+    let hosts = cfg.getHosts()
+    check hosts.len == 1
+    check hosts[0].host == "myhost"
+    check hosts[0].port == 9999
+
+  test "getHosts with zero port defaults to 5432":
+    var cfg = ConnConfig(host: "myhost", port: 0)
+    let hosts = cfg.getHosts()
+    check hosts[0].port == 5432
+
+  test "multi-host with target_session_attrs":
+    let cfg = parseDsn("postgresql://h1,h2,h3/db?target_session_attrs=read-write")
+    check cfg.hosts.len == 3
+    check cfg.targetSessionAttrs == tsaReadWrite
+
+  test "three hosts":
+    let cfg = parseDsn("postgresql://h1:5432,h2:5433,h3/db")
+    check cfg.hosts.len == 3
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5432)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5433)
+    check cfg.hosts[2] == HostEntry(host: "h3", port: 5432)
+
 suite "parseDsn keyword=value":
   test "full connection string":
     let cfg = parseDsn("host=dbhost port=5433 dbname=mydb user=myuser password=mypass")

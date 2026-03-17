@@ -50,6 +50,19 @@ type
     sslVerifyCa ## Require SSL + verify CA chain (no hostname verification)
     sslVerifyFull ## Require SSL + verify CA chain and hostname
 
+  TargetSessionAttrs* = enum
+    ## Target server type for multi-host failover (libpq compatible).
+    tsaAny ## Connect to any server (default)
+    tsaReadWrite ## Read-write server (primary)
+    tsaReadOnly ## Read-only server (standby)
+    tsaPrimary ## Primary server
+    tsaStandby ## Standby server
+    tsaPreferStandby ## Prefer standby, fall back to any
+
+  HostEntry* = object ## A single host:port entry for multi-host connection.
+    host*: string
+    port*: int
+
   ConnConfig* = object
     ## Connection configuration. Construct via `parseDsn` or set fields directly.
     host*: string
@@ -65,6 +78,8 @@ type
     keepAliveIdle*: int ## Seconds before first probe (0 = OS default)
     keepAliveInterval*: int ## Seconds between probes (0 = OS default)
     keepAliveCount*: int ## Number of probes before giving up (0 = OS default)
+    hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
+    targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     extraParams*: seq[(string, string)] ## Additional startup parameters
 
   Notification* = object ## A NOTIFY message received from PostgreSQL.
@@ -153,6 +168,14 @@ type
     format*: CopyFormat
     columnFormats*: seq[int16]
     commandTag*: string
+
+proc getHosts*(config: ConnConfig): seq[HostEntry] =
+  ## Return the list of hosts to try. If `hosts` is populated, return it;
+  ## otherwise synthesize a single entry from `host`/`port`.
+  if config.hosts.len > 0:
+    config.hosts
+  else:
+    @[HostEntry(host: config.host, port: if config.port == 0: 5432 else: config.port)]
 
 proc len*(qr: QueryResult): int {.inline.} =
   ## Return the number of rows in the query result.
@@ -660,166 +683,157 @@ when defined(linux) or defined(macosx):
         ) < 0:
           raise newException(PgError, "Failed to set TCP_KEEPCNT: " & $strerror(errno))
 
-proc connect*(config: ConnConfig): Future[PgConnection] =
-  ## Establish a new connection to a PostgreSQL server.
-  ## Handles SSL negotiation, authentication (cleartext, MD5, SCRAM-SHA-256),
-  ## and startup parameter exchange. Respects `connectTimeout` if set.
-  proc perform(): Future[PgConnection] {.async.} =
-    var conn: PgConnection
+proc connectToHost(
+    config: ConnConfig, hostAddr: string, hostPort: int
+): Future[PgConnection] {.async.} =
+  ## Connect to a single PostgreSQL host. Internal helper for multi-host connect.
+  var conn: PgConnection
+
+  when hasChronos:
+    let addresses = resolveTAddress(hostAddr, Port(hostPort))
+    if addresses.len == 0:
+      raise newException(PgError, "Could not resolve host: " & hostAddr)
+    let transport = await connect(addresses[0])
+    when defined(linux) or defined(macosx):
+      configureTcpNoDelay(SocketHandle(transport.fd))
+      configureKeepalive(SocketHandle(transport.fd), config)
+    conn = PgConnection(
+      transport: transport,
+      recvBuf: @[],
+      state: csConnecting,
+      serverParams: initTable[string, string](),
+      host: hostAddr,
+      port: hostPort,
+      config: config,
+      notifyMaxQueue: 1024,
+      stmtCacheCapacity: 256,
+    )
+  elif hasAsyncDispatch:
+    let sock = newAsyncSocket(buffered = false)
+    try:
+      await sock.connect(hostAddr, Port(hostPort))
+      when defined(linux) or defined(macosx):
+        configureTcpNoDelay(SocketHandle(sock.getFd()))
+        configureKeepalive(SocketHandle(sock.getFd()), config)
+    except CatchableError:
+      sock.close()
+      raise
+    conn = PgConnection(
+      socket: sock,
+      recvBuf: @[],
+      state: csConnecting,
+      serverParams: initTable[string, string](),
+      host: hostAddr,
+      port: hostPort,
+      config: config,
+      notifyMaxQueue: 1024,
+      stmtCacheCapacity: 256,
+    )
+
+  try:
+    # SSL negotiation (before StartupMessage)
+    if config.sslMode != sslDisable:
+      await negotiateSSL(conn, config)
 
     when hasChronos:
-      let addresses = resolveTAddress(config.host, Port(config.port))
-      if addresses.len == 0:
-        raise newException(PgError, "Could not resolve host: " & config.host)
-      let transport = await connect(addresses[0])
-      when defined(linux) or defined(macosx):
-        configureTcpNoDelay(SocketHandle(transport.fd))
-        configureKeepalive(SocketHandle(transport.fd), config)
-      conn = PgConnection(
-        transport: transport,
-        recvBuf: @[],
-        state: csConnecting,
-        serverParams: initTable[string, string](),
-        host: config.host,
-        port: config.port,
-        config: config,
-        notifyMaxQueue: 1024,
-        stmtCacheCapacity: 256,
-      )
+      # If SSL was not established, create plain streams
+      if conn.reader.isNil:
+        conn.baseReader = newAsyncStreamReader(conn.transport)
+        conn.baseWriter = newAsyncStreamWriter(conn.transport)
+        conn.reader = conn.baseReader
+        conn.writer = conn.baseWriter
+
+    # Send StartupMessage
+    var startupParams = config.extraParams
+    if config.applicationName.len > 0:
+      startupParams.add(("application_name", config.applicationName))
+    await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))
+    conn.state = csAuthentication
+
+    # Authentication loop
+    var scramState: ScramState
+    block authLoop:
+      while true:
+        while (let opt = conn.nextMessage(); opt.isSome):
+          let msg = opt.get
+          case msg.kind
+          of bmkAuthenticationOk:
+            break authLoop
+          of bmkAuthenticationCleartextPassword:
+            await conn.sendMsg(encodePassword(config.password))
+          of bmkAuthenticationMD5Password:
+            let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
+            await conn.sendMsg(encodePassword(hash))
+          of bmkAuthenticationSASL:
+            if "SCRAM-SHA-256" notin msg.saslMechanisms:
+              raise newException(PgError, "Server doesn't support SCRAM-SHA-256")
+            let clientFirst = scramClientFirstMessage(config.user, scramState)
+            await conn.sendMsg(encodeSASLInitialResponse("SCRAM-SHA-256", clientFirst))
+          of bmkAuthenticationSASLContinue:
+            let clientFinal =
+              scramClientFinalMessage(config.password, msg.saslData, scramState)
+            await conn.sendMsg(encodeSASLResponse(clientFinal))
+          of bmkAuthenticationSASLFinal:
+            if not scramVerifyServerFinal(msg.saslFinalData, scramState):
+              raise newException(PgError, "SCRAM server signature verification failed")
+          of bmkErrorResponse:
+            raise newException(PgError, formatError(msg.errorFields))
+          else:
+            discard
+        await conn.fillRecvBuf()
+
+    # Collect ParameterStatus, BackendKeyData until ReadyForQuery
+    block readyLoop:
+      while true:
+        while (let opt = conn.nextMessage(); opt.isSome):
+          let msg = opt.get
+          case msg.kind
+          of bmkParameterStatus:
+            conn.serverParams[msg.paramName] = msg.paramValue
+          of bmkBackendKeyData:
+            conn.pid = msg.backendPid
+            conn.secretKey = msg.backendSecretKey
+          of bmkReadyForQuery:
+            conn.txStatus = msg.txStatus
+            conn.state = csReady
+            break readyLoop
+          of bmkErrorResponse:
+            raise newException(PgError, formatError(msg.errorFields))
+          else:
+            discard
+        await conn.fillRecvBuf()
+
+    conn.createdAt = Moment.now()
+    return conn
+  except CatchableError as e:
+    when hasChronos:
+      if conn.tlsStream != nil:
+        try:
+          await conn.tlsStream.reader.closeWait()
+        except CatchableError:
+          discard
+        try:
+          await conn.tlsStream.writer.closeWait()
+        except CatchableError:
+          discard
+      if conn.baseReader != nil:
+        try:
+          await conn.baseReader.closeWait()
+        except CatchableError:
+          discard
+        try:
+          await conn.baseWriter.closeWait()
+        except CatchableError:
+          discard
+      if conn.transport != nil:
+        try:
+          await conn.transport.closeWait()
+        except CatchableError:
+          discard
     elif hasAsyncDispatch:
-      let sock = newAsyncSocket(buffered = false)
-      try:
-        await sock.connect(config.host, Port(config.port))
-        when defined(linux) or defined(macosx):
-          configureTcpNoDelay(SocketHandle(sock.getFd()))
-          configureKeepalive(SocketHandle(sock.getFd()), config)
-      except CatchableError:
-        sock.close()
-        raise
-      conn = PgConnection(
-        socket: sock,
-        recvBuf: @[],
-        state: csConnecting,
-        serverParams: initTable[string, string](),
-        host: config.host,
-        port: config.port,
-        config: config,
-        notifyMaxQueue: 1024,
-        stmtCacheCapacity: 256,
-      )
-
-    try:
-      # SSL negotiation (before StartupMessage)
-      if config.sslMode != sslDisable:
-        await negotiateSSL(conn, config)
-
-      when hasChronos:
-        # If SSL was not established, create plain streams
-        if conn.reader.isNil:
-          conn.baseReader = newAsyncStreamReader(conn.transport)
-          conn.baseWriter = newAsyncStreamWriter(conn.transport)
-          conn.reader = conn.baseReader
-          conn.writer = conn.baseWriter
-
-      # Send StartupMessage
-      var startupParams = config.extraParams
-      if config.applicationName.len > 0:
-        startupParams.add(("application_name", config.applicationName))
-      await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))
-      conn.state = csAuthentication
-
-      # Authentication loop
-      var scramState: ScramState
-      block authLoop:
-        while true:
-          while (let opt = conn.nextMessage(); opt.isSome):
-            let msg = opt.get
-            case msg.kind
-            of bmkAuthenticationOk:
-              break authLoop
-            of bmkAuthenticationCleartextPassword:
-              await conn.sendMsg(encodePassword(config.password))
-            of bmkAuthenticationMD5Password:
-              let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
-              await conn.sendMsg(encodePassword(hash))
-            of bmkAuthenticationSASL:
-              if "SCRAM-SHA-256" notin msg.saslMechanisms:
-                raise newException(PgError, "Server doesn't support SCRAM-SHA-256")
-              let clientFirst = scramClientFirstMessage(config.user, scramState)
-              await conn.sendMsg(
-                encodeSASLInitialResponse("SCRAM-SHA-256", clientFirst)
-              )
-            of bmkAuthenticationSASLContinue:
-              let clientFinal =
-                scramClientFinalMessage(config.password, msg.saslData, scramState)
-              await conn.sendMsg(encodeSASLResponse(clientFinal))
-            of bmkAuthenticationSASLFinal:
-              if not scramVerifyServerFinal(msg.saslFinalData, scramState):
-                raise
-                  newException(PgError, "SCRAM server signature verification failed")
-            of bmkErrorResponse:
-              raise newException(PgError, formatError(msg.errorFields))
-            else:
-              discard
-          await conn.fillRecvBuf()
-
-      # Collect ParameterStatus, BackendKeyData until ReadyForQuery
-      block readyLoop:
-        while true:
-          while (let opt = conn.nextMessage(); opt.isSome):
-            let msg = opt.get
-            case msg.kind
-            of bmkParameterStatus:
-              conn.serverParams[msg.paramName] = msg.paramValue
-            of bmkBackendKeyData:
-              conn.pid = msg.backendPid
-              conn.secretKey = msg.backendSecretKey
-            of bmkReadyForQuery:
-              conn.txStatus = msg.txStatus
-              conn.state = csReady
-              break readyLoop
-            of bmkErrorResponse:
-              raise newException(PgError, formatError(msg.errorFields))
-            else:
-              discard
-          await conn.fillRecvBuf()
-
-      conn.createdAt = Moment.now()
-      return conn
-    except CatchableError as e:
-      when hasChronos:
-        if conn.tlsStream != nil:
-          try:
-            await conn.tlsStream.reader.closeWait()
-          except CatchableError:
-            discard
-          try:
-            await conn.tlsStream.writer.closeWait()
-          except CatchableError:
-            discard
-        if conn.baseReader != nil:
-          try:
-            await conn.baseReader.closeWait()
-          except CatchableError:
-            discard
-          try:
-            await conn.baseWriter.closeWait()
-          except CatchableError:
-            discard
-        if conn.transport != nil:
-          try:
-            await conn.transport.closeWait()
-          except CatchableError:
-            discard
-      elif hasAsyncDispatch:
-        if not conn.socket.isNil:
-          conn.socket.close()
-      raise e
-
-  if config.connectTimeout != default(Duration):
-    perform().wait(config.connectTimeout)
-  else:
-    perform()
+      if not conn.socket.isNil:
+        conn.socket.close()
+    raise e
 
 proc checkReady*(conn: PgConnection) =
   ## Assert that the connection is in `csReady` state. Raises `PgError` otherwise.
@@ -1042,6 +1056,87 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
     conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
   await conn.closeTransport()
 
+proc bytesToString(data: seq[byte]): string =
+  result = newString(data.len)
+  for i in 0 ..< data.len:
+    result[i] = char(data[i])
+
+proc checkSessionAttrs(
+    conn: PgConnection, attrs: TargetSessionAttrs
+): Future[bool] {.async.} =
+  ## Check whether a connection matches the desired target_session_attrs.
+  ## Uses `SHOW transaction_read_only` to determine server role.
+  if attrs == tsaAny:
+    return true
+  let results = await conn.simpleQuery("SHOW transaction_read_only")
+  var readOnly = false
+  if results.len > 0 and results[0].rowCount > 0:
+    let val = results[0].rows[0][0]
+    if val.isSome:
+      readOnly = bytesToString(val.get) == "on"
+  case attrs
+  of tsaAny:
+    true # unreachable, handled above
+  of tsaReadWrite, tsaPrimary:
+    not readOnly
+  of tsaReadOnly, tsaStandby, tsaPreferStandby:
+    readOnly
+
+proc connect*(config: ConnConfig): Future[PgConnection] =
+  ## Establish a new connection to a PostgreSQL server.
+  ## Supports multi-host failover: tries each host in order.
+  ## Respects `targetSessionAttrs` to select the appropriate server type.
+  ## The `connectTimeout` wraps the entire multi-host connection attempt.
+  proc perform(): Future[PgConnection] {.async.} =
+    let hosts = config.getHosts()
+    var errors: seq[string]
+
+    if config.targetSessionAttrs == tsaPreferStandby:
+      # First pass: look for a standby
+      for entry in hosts:
+        try:
+          let conn = await connectToHost(config, entry.host, entry.port)
+          if await conn.checkSessionAttrs(tsaStandby):
+            return conn
+          await conn.close()
+        except CancelledError as e:
+          raise e
+        except CatchableError as e:
+          errors.add(entry.host & ":" & $entry.port & ": " & e.msg)
+      # Second pass: accept any server
+      for entry in hosts:
+        try:
+          let conn = await connectToHost(config, entry.host, entry.port)
+          return conn
+        except CancelledError as e:
+          raise e
+        except CatchableError as e:
+          errors.add(entry.host & ":" & $entry.port & ": " & e.msg)
+    else:
+      for entry in hosts:
+        try:
+          let conn = await connectToHost(config, entry.host, entry.port)
+          if config.targetSessionAttrs == tsaAny or
+              await conn.checkSessionAttrs(config.targetSessionAttrs):
+            return conn
+          await conn.close()
+          errors.add(
+            entry.host & ":" & $entry.port &
+              ": server does not match target_session_attrs " &
+              $config.targetSessionAttrs
+          )
+        except CancelledError as e:
+          raise e
+        except CatchableError as e:
+          errors.add(entry.host & ":" & $entry.port & ": " & e.msg)
+
+    raise newException(PgError, "Could not connect to any host: " & errors.join("; "))
+
+  if config.connectTimeout != default(Duration):
+    perform().wait(config.connectTimeout)
+  else:
+    perform()
+
 proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
   ## Set a callback invoked for each incoming NOTIFY message.
   conn.notifyCallback = callback
@@ -1238,6 +1333,23 @@ proc parseSslMode(s: string): SslMode =
   else:
     raise newException(PgError, "Invalid sslmode: " & s)
 
+proc parseTargetSessionAttrs(s: string): TargetSessionAttrs =
+  case s
+  of "any":
+    tsaAny
+  of "read-write":
+    tsaReadWrite
+  of "read-only":
+    tsaReadOnly
+  of "primary":
+    tsaPrimary
+  of "standby":
+    tsaStandby
+  of "prefer-standby":
+    tsaPreferStandby
+  else:
+    raise newException(PgError, "Invalid target_session_attrs: " & s)
+
 proc parsePort(s: string): int =
   try:
     result = parseInt(s)
@@ -1293,6 +1405,8 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       result.keepAliveCount = parseInt(val)
     except ValueError:
       raise newException(PgError, "Invalid keepalives_count: " & val)
+  of "target_session_attrs":
+    result.targetSessionAttrs = parseTargetSessionAttrs(val)
   else:
     result.extraParams.add((key, val))
 
@@ -1426,30 +1540,39 @@ proc parseUriDsn(dsn: string): ConnConfig =
   if dbpath.len > 0:
     result.database = decodeUrl(dbpath)
 
-  # Parse host and port
-  if hostport.len > 0:
-    # Handle IPv6: [::1]:5432
-    if hostport.startsWith("["):
-      let bracket = hostport.find(']')
+  # Parse host(s) and port(s) — supports comma-separated multi-host syntax
+  proc parseHostEntry(entry: string): HostEntry =
+    if entry.startsWith("["):
+      # IPv6: [::1]:5432
+      let bracket = entry.find(']')
       if bracket < 0:
         raise newException(PgError, "Invalid IPv6 address in DSN")
-      result.host = hostport[1 ..< bracket]
-      let afterBracket = hostport[bracket + 1 .. ^1]
+      result.host = entry[1 ..< bracket]
+      let afterBracket = entry[bracket + 1 .. ^1]
       if afterBracket.startsWith(":"):
         result.port = parsePort(afterBracket[1 .. ^1])
       else:
         result.port = 5432
     else:
-      let cpos = hostport.rfind(':')
+      let cpos = entry.rfind(':')
       if cpos >= 0:
-        result.host = hostport[0 ..< cpos]
-        result.port = parsePort(hostport[cpos + 1 .. ^1])
+        result.host = entry[0 ..< cpos]
+        result.port = parsePort(entry[cpos + 1 .. ^1])
       else:
-        result.host = hostport
+        result.host = entry
         result.port = 5432
+
+  if hostport.len > 0:
+    let parts = hostport.split(',')
+    for part in parts:
+      result.hosts.add(parseHostEntry(part))
+    # Back-compat: set host/port from first entry
+    result.host = result.hosts[0].host
+    result.port = result.hosts[0].port
   else:
     result.host = "127.0.0.1"
     result.port = 5432
+    result.hosts = @[HostEntry(host: "127.0.0.1", port: 5432)]
 
   if result.host.len == 0:
     result.host = "127.0.0.1"
