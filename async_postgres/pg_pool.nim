@@ -4,6 +4,7 @@ import async_backend, pg_protocol, pg_connection, pg_client, pg_types
 
 type
   PoolConfig* = object
+    ## Configuration for the connection pool. Create via `initPoolConfig`.
     connConfig*: ConnConfig
     minSize*: int ## Minimum idle connections (default 1)
     maxSize*: int ## Maximum total connections (default 10)
@@ -22,10 +23,11 @@ type
       ## Max queued acquire waiters (default 0=unlimited). Rejects with PgError when full.
 
   PooledConn* = object
+    ## An idle connection held by the pool with its last-used timestamp.
     conn*: PgConnection
     lastUsedAt*: Moment
 
-  PgPool* = ref object
+  PgPool* = ref object ## Connection pool that manages a set of PostgreSQL connections.
     config*: PoolConfig
     idle*: Deque[PooledConn]
     active*: int

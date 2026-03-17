@@ -2,8 +2,10 @@ import std/options
 
 type
   ProtocolError* = object of CatchableError
+    ## Raised on PostgreSQL wire protocol violations.
 
   FrontendMessageKind* = enum
+    ## Message types sent from client to server.
     fmkStartup
     fmkSSLRequest
     fmkPassword
@@ -23,6 +25,7 @@ type
     fmkCopyFail
 
   BackendMessageKind* = enum
+    ## Message types received from server to client.
     bmkAuthenticationOk
     bmkAuthenticationCleartextPassword
     bmkAuthenticationMD5Password
@@ -51,19 +54,22 @@ type
     bmkRowDescription
 
   DescribeKind* = enum
+    ## Target of a Describe or Close message.
     dkPortal = 'P'
     dkStatement = 'S'
 
   TransactionStatus* = enum
+    ## Server transaction state reported in ReadyForQuery.
     tsInFailedTransaction = 'E'
     tsIdle = 'I'
     tsInTransaction = 'T'
 
   ErrorField* = object
+    ## A single field from an ErrorResponse or NoticeResponse message.
     code*: char
     value*: string
 
-  FieldDescription* = object
+  FieldDescription* = object ## Column metadata from a RowDescription message.
     name*: string
     tableOid*: int32
     columnAttrNum*: int16
@@ -73,10 +79,12 @@ type
     formatCode*: int16
 
   CopyFormat* = enum
+    ## Wire format for COPY operations.
     cfText = 0
     cfBinary = 1
 
   BackendMessage* = object
+    ## Parsed message from the PostgreSQL backend. Variant type keyed by `kind`.
     case kind*: BackendMessageKind
     of bmkAuthenticationOk, bmkAuthenticationCleartextPassword:
       discard
@@ -126,27 +134,27 @@ type
     psIncomplete
     psDataRow ## DataRow parsed in-place into RowData; no BackendMessage constructed
 
-  ParseResult* = object
+  ParseResult* = object ## Result of parsing bytes from the receive buffer.
     state*: ParseState
     message*: BackendMessage
 
-  RowData* = ref object
+  RowData* = ref object ## Flat buffer holding all row data for a query result.
     buf*: seq[byte] ## All column data concatenated
     cellIndex*: seq[int32] ## [off, len, off, len, ...] per cell; len=-1 = NULL
     numCols*: int16
     colFormats*: seq[int16] ## Per-column format codes (0=text, 1=binary)
     colTypeOids*: seq[int32] ## Per-column type OIDs for binary→text conversion
 
-  Row* = object
+  Row* = object ## Lightweight view into a single row within a `RowData` buffer.
     data*: RowData
     rowIdx*: int32
 
 const
-  syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
-  flushMsg* = [byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]
-  copyDoneMsg* = [byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
+  syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8] ## Pre-built Sync message bytes.
+  flushMsg* = [byte('H'), 0'u8, 0'u8, 0'u8, 4'u8] ## Pre-built Flush message bytes.
+  copyDoneMsg* = [byte('c'), 0'u8, 0'u8, 0'u8, 4'u8] ## Pre-built CopyDone message bytes.
 
-  BinarySafeOids* = [
+  BinarySafeOids* = [ ## Type OIDs that the statement cache requests in binary format.
     16'i32, # bool
     17, # bytea
     20, # int8 / bigint
@@ -173,6 +181,7 @@ const
   BinarySafeMaxOid = 4536
 
   pgCopyBinaryHeader*: array[19, byte] = [
+    ## PGCOPY binary format header (signature + flags + extension length).
     byte('P'),
     byte('G'),
     byte('C'),
@@ -195,7 +204,8 @@ const
     0x00'u8,
     0x00'u8,
   ]
-  pgCopyBinaryTrailer*: array[2, byte] = [0xFF'u8, 0xFF'u8] # int16(-1)
+  pgCopyBinaryTrailer*: array[2, byte] = [0xFF'u8, 0xFF'u8]
+    ## PGCOPY binary format trailer (int16(-1) sentinel).
 
 func makeBinarySafeLookup(): array[BinarySafeMaxOid + 1, bool] {.compileTime.} =
   for oid in BinarySafeOids:

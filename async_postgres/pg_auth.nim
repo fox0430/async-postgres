@@ -5,6 +5,7 @@ import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 
 type ScramState* = object
+  ## Intermediate state for SCRAM-SHA-256 authentication handshake.
   clientNonce*: string
   clientFirstBare*: string
   serverSignature*: array[32, byte]
