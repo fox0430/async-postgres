@@ -44,14 +44,15 @@
 ## - `pg_types <async_postgres/pg_types.html>`_ — Type conversions (``toPgParam``, row accessors, arrays, ranges, composites, enums)
 ## - `pg_protocol <async_postgres/pg_protocol.html>`_ — Wire protocol encoding/decoding
 ## - `pg_auth <async_postgres/pg_auth.html>`_ — MD5 and SCRAM-SHA-256 authentication
+## - `pg_largeobject <async_postgres/pg_largeobject.html>`_ — Large Object API for streaming binary data
 ## - `async_backend <async_postgres/async_backend.html>`_ — Async framework abstraction (asyncdispatch / chronos)
 
 import
   async_postgres/[
     async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
-    pg_pool_cluster,
+    pg_pool_cluster, pg_largeobject,
   ]
 
 export
   async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
-  pg_pool_cluster
+  pg_pool_cluster, pg_largeobject
