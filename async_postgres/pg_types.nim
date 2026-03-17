@@ -214,18 +214,23 @@ proc toBE64(v: int64): array[8, byte] =
   ]
 
 proc fromBE16*(data: openArray[byte]): int16 =
+  ## Decode a 16-bit integer from big-endian bytes.
   int16(data[0]) shl 8 or int16(data[1])
 
 proc fromBE32*(data: openArray[byte]): int32 =
+  ## Decode a 32-bit integer from big-endian bytes.
   int32(data[0]) shl 24 or int32(data[1]) shl 16 or int32(data[2]) shl 8 or
     int32(data[3])
 
 proc fromBE64*(data: openArray[byte]): int64 =
+  ## Decode a 64-bit integer from big-endian bytes.
   int64(data[0]) shl 56 or int64(data[1]) shl 48 or int64(data[2]) shl 40 or
     int64(data[3]) shl 32 or int64(data[4]) shl 24 or int64(data[5]) shl 16 or
     int64(data[6]) shl 8 or int64(data[7])
 
 proc toPgParam*(v: string): PgParam =
+  ## Convert a Nim value to a PgParam for use as a query parameter.
+  ## Uses text format for strings, binary for numeric types.
   PgParam(oid: OidText, format: 0, value: some(toBytes(v)))
 
 proc toPgParam*(v: int16): PgParam =
@@ -425,6 +430,8 @@ proc toPgParam*[T](v: Option[T]): PgParam =
     result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
 
 proc toPgBinaryParam*(v: string): PgParam =
+  ## Convert a Nim value to a PgParam using binary format.
+  ## Prefer this over `toPgParam` when binary format is needed for all types.
   PgParam(oid: OidText, format: 1, value: some(toBytes(v)))
 
 proc toPgBinaryParam*(v: int16): PgParam =
@@ -576,6 +583,7 @@ proc cellInfo(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
   result.len = int(row.data.cellIndex[idx + 1])
 
 proc len*(row: Row): int {.inline.} =
+  ## Return the number of columns in this row.
   int(row.data.numCols)
 
 proc `[]`*(row: Row, col: int): Option[seq[byte]] =
@@ -589,7 +597,7 @@ proc `[]`*(row: Row, col: int): Option[seq[byte]] =
     some(@(row.data.buf.toOpenArray(off, off + clen - 1)))
 
 converter toRow*(cells: seq[Option[seq[byte]]]): Row =
-  ## Backward-compatible converter: build a Row from seq[Option[seq[byte]]].
+  ## Backward-compatible converter: build a Row from ``seq[Option[seq[byte]]]``.
   let rd = RowData(
     numCols: int16(cells.len), buf: @[], cellIndex: newSeq[int32](cells.len * 2)
   )
@@ -615,6 +623,7 @@ proc affectedRows*(tag: string): int64 =
   return 0
 
 proc isNull*(row: Row, col: int): bool =
+  ## Check if the column value is NULL.
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   row.data.cellIndex[idx + 1] == -1'i32
 
@@ -623,12 +632,15 @@ proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
   row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
 
 proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
+  ## Get the type OID for a column, or 0 if not available.
   if row.data.colTypeOids.len > col:
     row.data.colTypeOids[col]
   else:
     0'i32
 
 proc getStr*(row: Row, col: int): string =
+  ## Get a column value as a string. Handles binary-to-text conversion for
+  ## common types (bool, int2/4/8, float4/8). Raises `PgTypeError` on NULL.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -682,6 +694,7 @@ proc getStr*(row: Row, col: int): string =
     copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
 
 proc getInt*(row: Row, col: int): int32 =
+  ## Get a column value as int32. Handles binary int2/int4 directly. Raises `PgTypeError` on NULL.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -699,6 +712,7 @@ proc getInt*(row: Row, col: int): int32 =
   result = int32(parseInt(s))
 
 proc getInt64*(row: Row, col: int): int64 =
+  ## Get a column value as int64. Handles binary int2/4/8 directly. Raises `PgTypeError` on NULL.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -726,6 +740,7 @@ proc getInt64*(row: Row, col: int): int64 =
   result = parseBiggestInt(s)
 
 proc getFloat*(row: Row, col: int): float64 =
+  ## Get a column value as float64. Handles binary float4/8 directly. Raises `PgTypeError` on NULL.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -757,6 +772,7 @@ proc getNumeric*(row: Row, col: int): PgNumeric =
   PgNumeric(row.getStr(col))
 
 proc getBool*(row: Row, col: int): bool =
+  ## Get a column value as bool. Handles binary format directly. Raises `PgTypeError` on NULL.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -775,6 +791,7 @@ proc getBool*(row: Row, col: int): bool =
 # Usage: let id = row.get(0, int32)
 
 proc get*(row: Row, col: int, T: typedesc[int32]): int32 =
+  ## Generic typed accessor. Usage: ``row.get(0, int32)``
   row.getInt(col)
 
 proc get*(row: Row, col: int, T: typedesc[int64]): int64 =
@@ -790,6 +807,8 @@ proc get*(row: Row, col: int, T: typedesc[string]): string =
   row.getStr(col)
 
 proc getBytes*(row: Row, col: int): seq[byte] =
+  ## Get a column value as raw bytes. Decodes hex-encoded bytea in text format.
+  ## Raises `PgTypeError` on NULL.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -816,6 +835,7 @@ proc getBytes*(row: Row, col: int): seq[byte] =
       copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
 
 proc getTimestamp*(row: Row, col: int): DateTime =
+  ## Get a column value as DateTime, parsing common PostgreSQL timestamp formats.
   let s = row.getStr(col)
   const formats = [
     "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
@@ -830,6 +850,7 @@ proc getTimestamp*(row: Row, col: int): DateTime =
   raise newException(PgTypeError, "Invalid timestamp: " & s)
 
 proc getDate*(row: Row, col: int): DateTime =
+  ## Get a column value as DateTime, parsing "yyyy-MM-dd" format.
   let s = row.getStr(col)
   try:
     return parse(s, "yyyy-MM-dd")
@@ -837,6 +858,7 @@ proc getDate*(row: Row, col: int): DateTime =
     raise newException(PgTypeError, "Invalid date: " & s)
 
 proc getJson*(row: Row, col: int): JsonNode =
+  ## Get a column value as a parsed JsonNode.
   let s = row.getStr(col)
   try:
     return parseJson(s)
@@ -938,6 +960,7 @@ proc parseIntervalText(s: string): PgInterval =
   PgInterval(months: months, days: days, microseconds: microseconds)
 
 proc getInterval*(row: Row, col: int): PgInterval =
+  ## Get a column value as PgInterval, parsing PostgreSQL interval text format.
   let s = row.getStr(col)
   parseIntervalText(s)
 
@@ -952,24 +975,29 @@ proc parseInetText(s: string): tuple[address: IpAddress, mask: uint8] =
   result = (parseIpAddress(addrStr), uint8(parseInt(maskStr)))
 
 proc getInet*(row: Row, col: int): PgInet =
+  ## Get a column value as PgInet (IP address with mask).
   let s = row.getStr(col)
   let (ip, mask) = parseInetText(s)
   PgInet(address: ip, mask: mask)
 
 proc getCidr*(row: Row, col: int): PgCidr =
+  ## Get a column value as PgCidr (CIDR network address).
   let s = row.getStr(col)
   let (ip, mask) = parseInetText(s)
   PgCidr(address: ip, mask: mask)
 
 proc getMacAddr*(row: Row, col: int): PgMacAddr =
+  ## Get a column value as PgMacAddr.
   PgMacAddr(row.getStr(col))
 
 proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
+  ## Get a column value as PgMacAddr8 (EUI-64).
   PgMacAddr8(row.getStr(col))
 
-# NULL-safe Option accessors (text format)
+# NULL-safe Option accessors — return `none` for NULL instead of raising.
 
 proc getStrOpt*(row: Row, col: int): Option[string] =
+  ## Get a column value as ``Option[string]``. Returns none if NULL.
   if row.isNull(col):
     none(string)
   else:
@@ -1045,7 +1073,7 @@ proc getMacAddr8Opt*(row: Row, col: int): Option[PgMacAddr8] =
 
 proc parseTextArray*(s: string): seq[Option[string]] =
   ## Parse PostgreSQL text-format array literal: {elem1,elem2,...}
-  ## Returns elements as Option[string] (none for NULL).
+  ## Returns elements as ``Option[string]`` (none for NULL).
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
     raise newException(PgTypeError, "Invalid array literal: " & s)
   let inner = s[1 ..^ 2]
@@ -1082,6 +1110,7 @@ proc parseTextArray*(s: string): seq[Option[string]] =
       i += 1
 
 proc getIntArray*(row: Row, col: int): seq[int32] =
+  ## Get a column value as a seq of int32, parsing PostgreSQL array text format.
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1136,6 +1165,7 @@ proc getBoolArray*(row: Row, col: int): seq[bool] =
       raise newException(PgTypeError, "Invalid boolean: " & e.get)
 
 proc getStrArray*(row: Row, col: int): seq[string] =
+  ## Get a column value as a seq of strings, parsing PostgreSQL array text format.
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1946,7 +1976,7 @@ macro addBindDirect*(
     args: varargs[untyped],
 ): untyped =
   ## Compile-time macro: generates Bind message writing params directly to buffer.
-  ## Zero intermediate PgParam/seq[byte] allocations.
+  ## Zero intermediate PgParam/``seq[byte]`` allocations.
   result = newStmtList()
   let msgStart = genSym(nskLet, "msgStart")
   let nParams = args.len
@@ -2015,6 +2045,7 @@ proc getEnum*[T: enum](row: Row, col: int): T =
   parseEnum[T](row.getStr(col))
 
 proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
+  ## Read a PostgreSQL enum column as ``Option[T]``. Returns none if NULL.
   ## NULL-safe version of ``getEnum``.
   if row.isNull(col):
     none(T)
@@ -2056,7 +2087,7 @@ proc getEnumOpt*[T: enum](
 
 proc parseCompositeText*(s: string): seq[Option[string]] =
   ## Parse PostgreSQL composite text format: (val1,val2,...)
-  ## Returns fields as Option[string] (none for NULL).
+  ## Returns fields as ``Option[string]`` (none for NULL).
   if s.len < 2 or s[0] != '(' or s[^1] != ')':
     raise newException(PgTypeError, "Invalid composite literal: " & s)
   let inner = s[1 ..^ 2]
@@ -2110,7 +2141,7 @@ proc encodeBinaryComposite*(
     fields: seq[tuple[oid: int32, data: Option[seq[byte]]]]
 ): seq[byte] =
   ## Encode a PostgreSQL binary composite value.
-  ## Format: numFields(4) + [oid(4) + len(4) + data]...
+  ## Format: ``numFields(4) + [oid(4) + len(4) + data]...``
   var size = 4
   for f in fields:
     size += 8 # oid + len
@@ -2353,9 +2384,11 @@ proc getCompositeOpt*[T: object](
 #   let r = row.getInt4RangeOpt(0)
 
 proc emptyRange*[T](): PgRange[T] =
+  ## Create an empty range.
   PgRange[T](isEmpty: true)
 
 proc rangeOf*[T](lower, upper: T, lowerInc = true, upperInc = false): PgRange[T] =
+  ## Create a range with both bounds. Default: ``[lower, upper)``.
   PgRange[T](
     hasLower: true,
     hasUpper: true,
@@ -2364,12 +2397,15 @@ proc rangeOf*[T](lower, upper: T, lowerInc = true, upperInc = false): PgRange[T]
   )
 
 proc rangeFrom*[T](lower: T, inclusive = true): PgRange[T] =
+  ## Create a range with only a lower bound (upper unbounded).
   PgRange[T](hasLower: true, lower: PgRangeBound[T](value: lower, inclusive: inclusive))
 
 proc rangeTo*[T](upper: T, inclusive = false): PgRange[T] =
+  ## Create a range with only an upper bound (lower unbounded).
   PgRange[T](hasUpper: true, upper: PgRangeBound[T](value: upper, inclusive: inclusive))
 
 proc unboundedRange*[T](): PgRange[T] =
+  ## Create a fully unbounded range ``(,)``.
   PgRange[T]()
 
 proc `==`*[T](a, b: PgRange[T]): bool =
@@ -2650,6 +2686,7 @@ proc toPgBinaryDateRangeParam*(v: PgRange[DateTime]): PgParam =
 # Range text format getters
 
 proc getInt4Range*(row: Row, col: int): PgRange[int32] =
+  ## Get a column value as an int4range.
   let s = row.getStr(col)
   parseRangeText[int32](
     s,
@@ -2975,6 +3012,7 @@ proc getDateRangeOpt*(
 #   let mr = row.getInt4Multirange(0)
 
 proc len*[T](mr: PgMultirange[T]): int =
+  ## Return the number of ranges in the multirange.
   seq[PgRange[T]](mr).len
 
 proc `[]`*[T](mr: PgMultirange[T], i: int): PgRange[T] =
@@ -2995,6 +3033,7 @@ proc `==`*[T](a, b: PgMultirange[T]): bool =
   true
 
 proc toMultirange*[T](ranges: varargs[PgRange[T]]): PgMultirange[T] =
+  ## Create a multirange from individual ranges.
   PgMultirange[T](@ranges)
 
 proc `$`*[T](mr: PgMultirange[T]): string =
