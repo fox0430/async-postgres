@@ -731,6 +731,27 @@ proc newRowData*(
     colTypeOids: colTypeOids,
   )
 
+proc resetRowData*(
+    rd: RowData,
+    numCols: int16,
+    colFormats: sink seq[int16],
+    colTypeOids: sink seq[int32],
+) =
+  ## Reset an existing RowData for reuse, avoiding a new allocation.
+  rd.buf.setLen(0)
+  rd.cellIndex.setLen(0)
+  rd.numCols = numCols
+  rd.colFormats = colFormats
+  rd.colTypeOids = colTypeOids
+
+proc resetRowData*(rd: RowData, numCols: int16) =
+  ## Reset an existing RowData for reuse without changing format metadata.
+  rd.buf.setLen(0)
+  rd.cellIndex.setLen(0)
+  rd.numCols = numCols
+  rd.colFormats.setLen(0)
+  rd.colTypeOids.setLen(0)
+
 proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
   ## Build per-column binary format codes: 1 for known safe types, 0 for others.
   result = newSeq[int16](fields.len)

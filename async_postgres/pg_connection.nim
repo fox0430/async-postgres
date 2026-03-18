@@ -145,6 +145,7 @@ type
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
     stmtCounter*: int
     stmtCacheCapacity*: int ## 0=disabled, default 256
+    rowDataBuf*: RowData ## Reusable RowData buffer to avoid per-query allocation
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
