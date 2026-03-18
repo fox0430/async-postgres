@@ -31,7 +31,8 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
     ),
     idle: initDeque[PooledConn](),
     active: 0,
-    waiters: initDeque[Future[PgConnection]](),
+    waiters: initDeque[Waiter](),
+    waiterCount: 0,
     closed: false,
   )
 
@@ -80,14 +81,48 @@ suite "Pool release":
   test "release transfers to waiter":
     let pool = makePool()
     pool.active = 2
-    let waiter = newFuture[PgConnection]("test.waiter")
-    pool.waiters.addLast(waiter)
+    let fut = newFuture[PgConnection]("test.waiter")
+    pool.waiters.addLast(Waiter(fut: fut, cancelled: false))
+    pool.waiterCount = 1
     let conn = mockConn()
     pool.release(conn)
     check pool.active == 2
     check pool.waiters.len == 0
-    check waiter.finished
-    check waiter.read() == conn
+    check pool.waiterCount == 0
+    check fut.finished
+    check fut.read() == conn
+
+  test "release skips cancelled waiters and returns to idle":
+    let pool = makePool()
+    pool.active = 1
+    # Add cancelled waiters
+    let cancelled1 = Waiter(fut: newFuture[PgConnection]("c1"), cancelled: true)
+    let cancelled2 = Waiter(fut: newFuture[PgConnection]("c2"), cancelled: true)
+    pool.waiters.addLast(cancelled1)
+    pool.waiters.addLast(cancelled2)
+    let conn = mockConn()
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 1
+    check pool.idle[0].conn == conn
+    check pool.waiters.len == 0
+
+  test "release skips cancelled waiters and delivers to next valid":
+    let pool = makePool()
+    pool.active = 2
+    let cancelled = Waiter(fut: newFuture[PgConnection]("c"), cancelled: true)
+    let validFut = newFuture[PgConnection]("valid")
+    let valid = Waiter(fut: validFut, cancelled: false)
+    pool.waiters.addLast(cancelled)
+    pool.waiters.addLast(valid)
+    pool.waiterCount = 1
+    let conn = mockConn()
+    pool.release(conn)
+    check pool.active == 2
+    check pool.waiterCount == 0
+    check pool.idle.len == 0
+    check validFut.finished
+    check validFut.read() == conn
 
   test "release broken connection decrements active":
     let pool = makePool()
@@ -225,13 +260,15 @@ suite "Pool close":
   test "close cancels waiters":
     let pool = makePool()
     pool.active = 1
-    let waiter = newFuture[PgConnection]("test.waiter")
-    pool.waiters.addLast(waiter)
+    let fut = newFuture[PgConnection]("test.waiter")
+    pool.waiters.addLast(Waiter(fut: fut, cancelled: false))
+    pool.waiterCount = 1
 
     waitFor pool.close()
     check pool.closed
     check pool.waiters.len == 0
-    check waiter.finished
+    check pool.waiterCount == 0
+    check fut.finished
 
   test "close drains idle connections":
     let pool = makePool()
@@ -556,7 +593,7 @@ suite "Acquire timeout":
         msg = e.msg
 
       doAssert "timeout" in msg.toLowerAscii()
-      doAssert pool.waiters.len == 0
+      doAssert pool.waiterCount == 0
 
     waitFor t()
 
@@ -590,8 +627,8 @@ suite "Acquire timeout":
       except PgError:
         discard
 
-      # Waiter should be removed from queue
-      doAssert pool.waiters.len == 0
+      # Waiter should be cancelled
+      doAssert pool.waiterCount == 0
 
     waitFor t()
 
@@ -629,26 +666,29 @@ suite "Acquire timeout":
 
     waitFor t()
 
-  test "timeout only removes own waiter from queue":
+  test "timeout only cancels own waiter, not others":
     proc t() {.async.} =
       let pool = makePool(maxSize = 1)
       pool.config.acquireTimeout = milliseconds(50)
       pool.active = 1
 
       # Pre-existing waiter (e.g. from another coroutine with no timeout)
-      let otherWaiter = newFuture[PgConnection]("test.other")
+      let otherFut = newFuture[PgConnection]("test.other")
+      let otherWaiter = Waiter(fut: otherFut, cancelled: false)
       pool.waiters.addLast(otherWaiter)
+      pool.waiterCount = 1
 
       try:
         discard await pool.acquire()
       except PgError:
         discard
 
-      doAssert pool.waiters.len == 1
-      doAssert pool.waiters[0] == otherWaiter
+      # Other waiter should still be active
+      doAssert pool.waiterCount == 1
+      doAssert not otherWaiter.cancelled
 
       # Clean up
-      otherWaiter.complete(mockConn())
+      otherFut.complete(mockConn())
 
     waitFor t()
 
@@ -686,8 +726,39 @@ suite "Acquire timeout":
         except PgError:
           discard
 
-      doAssert pool.waiters.len == 0
+      doAssert pool.waiterCount == 0
       doAssert pool.active == 1
+
+    waitFor t()
+
+  test "cancelled waiters are lazily drained on release":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.acquireTimeout = milliseconds(50)
+      pool.active = 1
+
+      # Cause 3 timeouts — cancelled waiters accumulate in deque
+      for i in 0 ..< 3:
+        try:
+          discard await pool.acquire()
+        except PgError:
+          discard
+
+      doAssert pool.waiters.len == 3 # cancelled entries remain
+      doAssert pool.waiterCount == 0
+
+      # Add a real waiter behind the cancelled ones
+      let realFut = pool.acquire()
+      doAssert pool.waiters.len == 4
+      doAssert pool.waiterCount == 1
+
+      # Release should skip all 3 cancelled and deliver to the real waiter
+      let conn = mockConn()
+      pool.release(conn)
+      let acquired = await realFut
+      doAssert acquired == conn
+      doAssert pool.waiters.len == 0
+      doAssert pool.waiterCount == 0
 
     waitFor t()
 
