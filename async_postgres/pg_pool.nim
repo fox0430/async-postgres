@@ -33,11 +33,16 @@ type
     conn*: PgConnection
     lastUsedAt*: Moment
 
+  Waiter* = ref object
+    fut*: Future[PgConnection]
+    cancelled*: bool
+
   PgPool* = ref object ## Connection pool that manages a set of PostgreSQL connections.
     config*: PoolConfig
     idle*: Deque[PooledConn]
     active*: int
-    waiters*: Deque[Future[PgConnection]]
+    waiters*: Deque[Waiter]
+    waiterCount*: int ## Number of non-cancelled waiters
     closed*: bool
     maintenanceTask*: Future[void]
     cachedNow*: Moment
@@ -163,7 +168,8 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     config: cfg,
     idle: initDeque[PooledConn](),
     active: 0,
-    waiters: initDeque[Future[PgConnection]](),
+    waiters: initDeque[Waiter](),
+    waiterCount: 0,
     closed: false,
   )
 
@@ -193,12 +199,15 @@ proc release*(pool: PgPool, conn: PgConnection) =
     conn.closeNoWait()
     return
 
-  if pool.waiters.len > 0:
+  while pool.waiters.len > 0:
     let waiter = pool.waiters.popFirst()
-    waiter.complete(conn)
-  else:
-    pool.active.dec
-    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+    if waiter.cancelled:
+      continue
+    pool.waiterCount.dec
+    waiter.fut.complete(conn)
+    return
+  pool.active.dec
+  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
 
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## Acquire a connection from the pool. Tries idle connections first (with
@@ -249,22 +258,20 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
       raise e
 
   # Max connections reached; wait for one to be released
-  if pool.config.maxWaiters > 0 and pool.waiters.len >= pool.config.maxWaiters:
+  if pool.config.maxWaiters > 0 and pool.waiterCount >= pool.config.maxWaiters:
     raise newException(
       PgError, "Pool acquire queue full (maxWaiters=" & $pool.config.maxWaiters & ")"
     )
   let fut = newFuture[PgConnection]("PgPool.acquire")
-  pool.waiters.addLast(fut)
+  let waiter = Waiter(fut: fut, cancelled: false)
+  pool.waiters.addLast(waiter)
+  pool.waiterCount.inc
   if pool.config.acquireTimeout > ZeroDuration:
     try:
       return await fut.wait(pool.config.acquireTimeout)
     except AsyncTimeoutError:
-      # Remove from waiters if still queued
-      var cleaned = initDeque[Future[PgConnection]]()
-      for w in pool.waiters:
-        if w != fut:
-          cleaned.addLast(w)
-      pool.waiters = cleaned
+      waiter.cancelled = true
+      pool.waiterCount.dec
       # If release() completed the future in a race, put the connection back
       if fut.completed():
         pool.release(fut.read())
@@ -610,7 +617,9 @@ proc close*(pool: PgPool): Future[void] {.async.} =
   # Cancel all waiters
   while pool.waiters.len > 0:
     let waiter = pool.waiters.popFirst()
-    waiter.fail(newException(PgError, "Pool closed"))
+    if not waiter.cancelled:
+      waiter.fut.fail(newException(PgError, "Pool closed"))
+  pool.waiterCount = 0
 
   # Close all idle connections
   while pool.idle.len > 0:
