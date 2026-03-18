@@ -1,4 +1,5 @@
-import std/[json, macros, math, options, sequtils, strutils, tables, times, net]
+import
+  std/[json, macros, math, options, parseutils, sequtils, strutils, tables, times, net]
 
 import pg_protocol
 
@@ -789,6 +790,10 @@ proc cellInfo(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
   result.off = int(row.data.cellIndex[idx])
   result.len = int(row.data.cellIndex[idx + 1])
 
+template bufView(row: Row, off, clen: int): openArray[char] =
+  ## Zero-copy char view into row.data.buf for parseutils.
+  cast[ptr UncheckedArray[char]](unsafeAddr row.data.buf[off]).toOpenArray(0, clen - 1)
+
 proc len*(row: Row): int {.inline.} =
   ## Return the number of columns in this row.
   int(row.data.numCols)
@@ -902,10 +907,10 @@ proc getStr*(row: Row, col: int): string =
 
 proc getInt*(row: Row, col: int): int32 =
   ## Get a column value as int32. Handles binary int2/int4 directly. Raises `PgTypeError` on NULL.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
     if clen == 4:
       let b = row.data.buf
       return int32(
@@ -915,15 +920,16 @@ proc getInt*(row: Row, col: int): int32 =
     elif clen == 2:
       let b = row.data.buf
       return int32(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
-  let s = row.getStr(col)
-  result = int32(parseInt(s))
+  var v: int
+  discard parseInt(row.bufView(off, clen), v)
+  result = int32(v)
 
 proc getInt64*(row: Row, col: int): int64 =
   ## Get a column value as int64. Handles binary int2/4/8 directly. Raises `PgTypeError` on NULL.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
     if clen == 8:
       let b = row.data.buf
       return int64(
@@ -943,15 +949,16 @@ proc getInt64*(row: Row, col: int): int64 =
     elif clen == 2:
       let b = row.data.buf
       return int64(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
-  let s = row.getStr(col)
-  result = parseBiggestInt(s)
+  var v: BiggestInt
+  discard parseBiggestInt(row.bufView(off, clen), v)
+  result = v
 
 proc getFloat*(row: Row, col: int): float64 =
   ## Get a column value as float64. Handles binary float4/8 directly. Raises `PgTypeError` on NULL.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
     if clen == 8:
       var bits: uint64
       let b = row.data.buf
@@ -971,8 +978,7 @@ proc getFloat*(row: Row, col: int): float64 =
       var f32: float32
       copyMem(addr f32, addr bits, 4)
       return float64(f32)
-  let s = row.getStr(col)
-  result = parseFloat(s)
+  discard parseFloat(row.bufView(off, clen), result)
 
 proc getNumeric*(row: Row, col: int): PgNumeric =
   ## Numeric is always requested as text format (not in binarySafeOids).
@@ -980,19 +986,19 @@ proc getNumeric*(row: Row, col: int): PgNumeric =
 
 proc getBool*(row: Row, col: int): bool =
   ## Get a column value as bool. Handles binary format directly. Raises `PgTypeError` on NULL.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
     return row.data.buf[off] != 0
-  let s = row.getStr(col)
-  case s
-  of "t", "true", "1":
+  let c = char(row.data.buf[off])
+  case c
+  of 't', '1':
     true
-  of "f", "false", "0":
+  of 'f', '0':
     false
   else:
-    raise newException(PgTypeError, "Invalid boolean value: " & s)
+    raise newException(PgTypeError, "Invalid boolean value: " & c)
 
 # Compile-time generic accessor — static dispatch by type, no OID branching.
 # Usage: let id = row.get(0, int32)
