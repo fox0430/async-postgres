@@ -149,39 +149,36 @@ proc execImpl(
     else:
       newSeq[int16](params.len)
 
-  let cachedOpt = conn.lookupStmtCache(sql)
-  var cacheHit = cachedOpt.isSome
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
   var cacheMiss = false
   var stmtName = ""
 
+  conn.sendBuf.setLen(0)
   if cacheHit:
-    let c = cachedOpt.get
-    stmtName = c.name
-    var batch = newSeqOfCap[byte](params.len * 16 + 128)
-    batch.addBind("", stmtName, formats, params)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+    stmtName = cached.name
+    conn.sendBuf.addBind("", stmtName, formats, params)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
-    var batch = newSeqOfCap[byte](sql.len + 128)
     if conn.stmtCache.len >= conn.stmtCacheCapacity:
       let evicted = conn.evictStmtCache()
-      batch.addClose(dkStatement, evicted.name)
-    batch.addParse(stmtName, sql, paramOids)
-    batch.addDescribe(dkStatement, stmtName)
-    batch.addBind("", stmtName, formats, params)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, paramOids)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBind("", stmtName, formats, params)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   else:
-    var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.addParse("", sql, paramOids)
-    batch.addBind("", "", formats, params)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+    conn.sendBuf.addParse("", sql, paramOids)
+    conn.sendBuf.addBind("", "", formats, params)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
 
   var commandTag = ""
   var errorMsg = ""
@@ -239,39 +236,36 @@ proc execImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  let cachedOpt = conn.lookupStmtCache(sql)
-  var cacheHit = cachedOpt.isSome
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
   var cacheMiss = false
   var stmtName = ""
 
+  conn.sendBuf.setLen(0)
   if cacheHit:
-    let c = cachedOpt.get
-    stmtName = c.name
-    var batch = newSeqOfCap[byte](params.len * 16 + 128)
-    batch.addBind("", stmtName, params)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+    stmtName = cached.name
+    conn.sendBuf.addBind("", stmtName, params)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
-    var batch = newSeqOfCap[byte](sql.len + 128)
     if conn.stmtCache.len >= conn.stmtCacheCapacity:
       let evicted = conn.evictStmtCache()
-      batch.addClose(dkStatement, evicted.name)
-    batch.addParse(stmtName, sql, params)
-    batch.addDescribe(dkStatement, stmtName)
-    batch.addBind("", stmtName, params)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, params)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBind("", stmtName, params)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   else:
-    var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.addParse("", sql, params)
-    batch.addBind("", "", params)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+    conn.sendBuf.addParse("", sql, params)
+    conn.sendBuf.addBind("", "", params)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
 
   var commandTag = ""
   var errorMsg = ""
@@ -374,7 +368,7 @@ template queryRecvLoop(
   var errorCode = ""
 
   if cacheHit:
-    qr.fields = cachedFields
+    swap(qr.fields, cachedFields)
     if resultFormats.len > 0 and cachedColFmts.len > 0:
       for i in 0 ..< qr.fields.len:
         qr.fields[i].formatCode = cachedColFmts[i]
@@ -454,8 +448,8 @@ proc queryImpl(
     else:
       newSeq[int16](params.len)
 
-  let cachedOpt = conn.lookupStmtCache(sql)
-  var cacheHit = cachedOpt.isSome
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -464,42 +458,39 @@ proc queryImpl(
 
   var effectiveResultFormats: seq[int16]
 
+  conn.sendBuf.setLen(0)
   if cacheHit:
-    let c = cachedOpt.get
-    stmtName = c.name
-    cachedFields = c.fields
-    cachedColFmts = c.colFmts
-    cachedColOids = c.colOids
+    stmtName = cached.name
+    cachedFields = cached.fields
+    cachedColFmts = cached.colFmts
+    cachedColOids = cached.colOids
     effectiveResultFormats =
-      if resultFormats.len == 0: c.resultFormats else: resultFormats
-    var batch = newSeqOfCap[byte](params.len * 16 + 128)
-    batch.addBind("", stmtName, formats, params, effectiveResultFormats)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     effectiveResultFormats = resultFormats
-    var batch = newSeqOfCap[byte](sql.len + 128)
     if conn.stmtCache.len >= conn.stmtCacheCapacity:
       let evicted = conn.evictStmtCache()
-      batch.addClose(dkStatement, evicted.name)
-    batch.addParse(stmtName, sql, paramOids)
-    batch.addDescribe(dkStatement, stmtName)
-    batch.addBind("", stmtName, formats, params, effectiveResultFormats)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, paramOids)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   else:
     effectiveResultFormats = resultFormats
-    var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.addParse("", sql, paramOids)
-    batch.addBind("", "", formats, params, effectiveResultFormats)
-    batch.addDescribe(dkPortal, "")
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+    conn.sendBuf.addParse("", sql, paramOids)
+    conn.sendBuf.addBind("", "", formats, params, effectiveResultFormats)
+    conn.sendBuf.addDescribe(dkPortal, "")
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -518,8 +509,8 @@ proc queryImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  let cachedOpt = conn.lookupStmtCache(sql)
-  var cacheHit = cachedOpt.isSome
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -528,42 +519,39 @@ proc queryImpl(
 
   var effectiveResultFormats: seq[int16]
 
+  conn.sendBuf.setLen(0)
   if cacheHit:
-    let c = cachedOpt.get
-    stmtName = c.name
-    cachedFields = c.fields
-    cachedColFmts = c.colFmts
-    cachedColOids = c.colOids
+    stmtName = cached.name
+    cachedFields = cached.fields
+    cachedColFmts = cached.colFmts
+    cachedColOids = cached.colOids
     effectiveResultFormats =
-      if resultFormats.len == 0: c.resultFormats else: resultFormats
-    var batch = newSeqOfCap[byte](params.len * 16 + 128)
-    batch.addBind("", stmtName, params, effectiveResultFormats)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   elif conn.stmtCacheCapacity > 0:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     effectiveResultFormats = resultFormats
-    var batch = newSeqOfCap[byte](sql.len + 128)
     if conn.stmtCache.len >= conn.stmtCacheCapacity:
       let evicted = conn.evictStmtCache()
-      batch.addClose(dkStatement, evicted.name)
-    batch.addParse(stmtName, sql, params)
-    batch.addDescribe(dkStatement, stmtName)
-    batch.addBind("", stmtName, params, effectiveResultFormats)
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, params)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
   else:
     effectiveResultFormats = resultFormats
-    var batch = newSeqOfCap[byte](sql.len + 128)
-    batch.addParse("", sql, params)
-    batch.addBind("", "", params, effectiveResultFormats)
-    batch.addDescribe(dkPortal, "")
-    batch.addExecute("", 0)
-    batch.addSync()
-    await conn.sendMsg(batch)
+    conn.sendBuf.addParse("", sql, params)
+    conn.sendBuf.addBind("", "", params, effectiveResultFormats)
+    conn.sendBuf.addDescribe(dkPortal, "")
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -1017,11 +1005,11 @@ proc copyInRawImpl(
     encodeCopyData(conn.sendBuf, data.toOpenArray(offset, endIdx))
     offset = endIdx + 1
     if conn.sendBuf.len >= copyBatchSize:
-      await conn.sendMsg(conn.sendBuf)
+      await conn.sendBufMsg()
       conn.sendBuf.setLen(0)
   # Flush remaining data + CopyDone in one send
   conn.sendBuf.addCopyDone()
-  await conn.sendMsg(conn.sendBuf)
+  await conn.sendBufMsg()
   conn.sendBuf.setLen(0)
 
   # Wait for CommandComplete + ReadyForQuery
@@ -1158,7 +1146,7 @@ proc copyInStreamImpl(
         break
       encodeCopyData(conn.sendBuf, chunk)
       if conn.sendBuf.len >= batchThreshold:
-        await conn.sendMsg(conn.sendBuf)
+        await conn.sendBufMsg()
         conn.sendBuf.setLen(0)
   except CatchableError as e:
     callbackError = e
@@ -1183,7 +1171,7 @@ proc copyInStreamImpl(
   else:
     # Normal completion: flush remaining data + CopyDone in one send
     conn.sendBuf.addCopyDone()
-    await conn.sendMsg(conn.sendBuf)
+    await conn.sendBufMsg()
     conn.sendBuf.setLen(0)
 
   # Wait for CommandComplete + ReadyForQuery
@@ -1437,22 +1425,22 @@ proc execInTransactionImpl(
       newSeq[int16](params.len)
 
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL, COMMIT + single Sync
-  var batch = newSeqOfCap[byte](beginSql.len + sql.len + 256)
+  conn.sendBuf.setLen(0)
   # BEGIN
-  batch.addParse("", beginSql)
-  batch.addBind("", "", @[], @[])
-  batch.addExecute("", 0)
+  conn.sendBuf.addParse("", beginSql)
+  conn.sendBuf.addBind("", "", @[], @[])
+  conn.sendBuf.addExecute("", 0)
   # User SQL
-  batch.addParse("", sql, paramOids)
-  batch.addBind("", "", formats, params)
-  batch.addExecute("", 0)
+  conn.sendBuf.addParse("", sql, paramOids)
+  conn.sendBuf.addBind("", "", formats, params)
+  conn.sendBuf.addExecute("", 0)
   # COMMIT
-  batch.addParse("", "COMMIT")
-  batch.addBind("", "", @[], @[])
-  batch.addExecute("", 0)
+  conn.sendBuf.addParse("", "COMMIT")
+  conn.sendBuf.addBind("", "", @[], @[])
+  conn.sendBuf.addExecute("", 0)
   # Single Sync
-  batch.addSync()
-  await conn.sendMsg(batch)
+  conn.sendBuf.addSync()
+  await conn.sendBufMsg()
 
   # Parse response: 3 phases (BEGIN=0, user=1, COMMIT=2)
   var phase = 0
@@ -1568,23 +1556,23 @@ proc queryInTransactionImpl(
       newSeq[int16](params.len)
 
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
-  var batch = newSeqOfCap[byte](beginSql.len + sql.len + 256)
+  conn.sendBuf.setLen(0)
   # BEGIN
-  batch.addParse("", beginSql)
-  batch.addBind("", "", @[], @[])
-  batch.addExecute("", 0)
+  conn.sendBuf.addParse("", beginSql)
+  conn.sendBuf.addBind("", "", @[], @[])
+  conn.sendBuf.addExecute("", 0)
   # User SQL
-  batch.addParse("", sql, paramOids)
-  batch.addBind("", "", formats, params, resultFormats)
-  batch.addDescribe(dkPortal, "")
-  batch.addExecute("", 0)
+  conn.sendBuf.addParse("", sql, paramOids)
+  conn.sendBuf.addBind("", "", formats, params, resultFormats)
+  conn.sendBuf.addDescribe(dkPortal, "")
+  conn.sendBuf.addExecute("", 0)
   # COMMIT
-  batch.addParse("", "COMMIT")
-  batch.addBind("", "", @[], @[])
-  batch.addExecute("", 0)
+  conn.sendBuf.addParse("", "COMMIT")
+  conn.sendBuf.addBind("", "", @[], @[])
+  conn.sendBuf.addExecute("", 0)
   # Single Sync
-  batch.addSync()
-  await conn.sendMsg(batch)
+  conn.sendBuf.addSync()
+  await conn.sendBufMsg()
 
   var qr = QueryResult()
   var phase = 0
@@ -1759,7 +1747,7 @@ proc executeImpl(
   conn.state = csBusy
 
   # Send Phase — also collect CachedStmt data needed by receive phase
-  var batch = newSeqOfCap[byte](p.ops.len * 256)
+  conn.sendBuf.setLen(0)
   var cachedStmts = newSeq[CachedStmt](p.ops.len) # populated for cache-hit ops
   var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
 
@@ -1770,47 +1758,48 @@ proc executeImpl(
       else:
         newSeq[int16](p.ops[i].params.len)
 
-    let cachedOpt = conn.lookupStmtCache(p.ops[i].sql)
-    p.ops[i].cacheHit = cachedOpt.isSome
+    let cached = conn.lookupStmtCache(p.ops[i].sql)
+    p.ops[i].cacheHit = cached != nil
     p.ops[i].cacheMiss = false
 
-    if cachedOpt.isSome:
-      let c = cachedOpt.get
-      p.ops[i].stmtName = c.name
-      cachedStmts[i] = c
+    if cached != nil:
+      p.ops[i].stmtName = cached.name
+      cachedStmts[i] = cached[]
       var effectiveResultFormats: seq[int16]
       if p.ops[i].kind == pokQuery:
         effectiveResultFormats =
           if p.ops[i].resultFormats.len == 0:
-            c.resultFormats
+            cached.resultFormats
           else:
             p.ops[i].resultFormats
         p.ops[i].resultFormats = effectiveResultFormats
-      batch.addBind("", c.name, formats, p.ops[i].params, effectiveResultFormats)
-      batch.addExecute("", 0)
+      conn.sendBuf.addBind(
+        "", cached.name, formats, p.ops[i].params, effectiveResultFormats
+      )
+      conn.sendBuf.addExecute("", 0)
     elif conn.stmtCacheCapacity > 0:
       p.ops[i].cacheMiss = true
       p.ops[i].stmtName = conn.nextStmtName()
       if conn.stmtCache.len + pendingCacheAdds >= conn.stmtCacheCapacity and
           conn.stmtCache.len > 0:
         let evicted = conn.evictStmtCache()
-        batch.addClose(dkStatement, evicted.name)
+        conn.sendBuf.addClose(dkStatement, evicted.name)
       inc pendingCacheAdds
-      batch.addParse(p.ops[i].stmtName, p.ops[i].sql, p.ops[i].paramOids)
-      batch.addDescribe(dkStatement, p.ops[i].stmtName)
-      batch.addBind(
+      conn.sendBuf.addParse(p.ops[i].stmtName, p.ops[i].sql, p.ops[i].paramOids)
+      conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
+      conn.sendBuf.addBind(
         "", p.ops[i].stmtName, formats, p.ops[i].params, p.ops[i].resultFormats
       )
-      batch.addExecute("", 0)
+      conn.sendBuf.addExecute("", 0)
     else:
-      batch.addParse("", p.ops[i].sql, p.ops[i].paramOids)
-      batch.addBind("", "", formats, p.ops[i].params, p.ops[i].resultFormats)
+      conn.sendBuf.addParse("", p.ops[i].sql, p.ops[i].paramOids)
+      conn.sendBuf.addBind("", "", formats, p.ops[i].params, p.ops[i].resultFormats)
       if p.ops[i].kind == pokQuery:
-        batch.addDescribe(dkPortal, "")
-      batch.addExecute("", 0)
+        conn.sendBuf.addDescribe(dkPortal, "")
+      conn.sendBuf.addExecute("", 0)
 
-  batch.addSync()
-  await conn.sendMsg(batch)
+  conn.sendBuf.addSync()
+  await conn.sendBufMsg()
 
   # Receive Phase
   var results = newSeq[PipelineResult](p.ops.len)
@@ -2229,7 +2218,6 @@ proc openCursor*(
 proc queryDirectImpl(
     conn: PgConnection,
     sql: string,
-    batch: seq[byte],
     resultFormats: seq[int16],
     colFmts: seq[int16],
     colOids: seq[int32],
@@ -2240,7 +2228,7 @@ proc queryDirectImpl(
     timeout: Duration,
 ): Future[QueryResult] {.async.} =
   ## Shared receive path for queryDirect macros.
-  await conn.sendMsg(batch)
+  await conn.sendBufMsg()
   var qr = QueryResult()
   var cf = cachedFields
   queryRecvLoop(
@@ -2258,13 +2246,12 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
 
   let connSym = genSym(nskLet, "conn")
   let sqlSym = genSym(nskLet, "sql")
-  let cachedOptSym = genSym(nskLet, "cachedOpt")
+  let cachedPtrSym = genSym(nskLet, "cachedPtr")
   let cacheHitSym = genSym(nskVar, "cacheHit")
   let cacheMissSym = genSym(nskVar, "cacheMiss")
   let stmtNameSym = genSym(nskVar, "stmtName")
   let cachedFieldsSym = genSym(nskVar, "cachedFields")
   let effectiveRfSym = genSym(nskVar, "effectiveRf")
-  let batchSym = genSym(nskVar, "batch")
   let colFmtsSym = genSym(nskVar, "colFmts")
   let colOidsSym = genSym(nskVar, "colOids")
 
@@ -2274,13 +2261,12 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     `connSym`.checkReady()
     `connSym`.state = csBusy
 
-    let `cachedOptSym` = `connSym`.lookupStmtCache(`sqlSym`)
-    var `cacheHitSym` = `cachedOptSym`.isSome
+    let `cachedPtrSym` = `connSym`.lookupStmtCache(`sqlSym`)
+    var `cacheHitSym` = `cachedPtrSym` != nil
     var `cacheMissSym` = false
     var `stmtNameSym` = ""
     var `cachedFieldsSym`: seq[FieldDescription]
     var `effectiveRfSym`: seq[int16]
-    var `batchSym`: seq[byte]
     var `colFmtsSym`: seq[int16]
     var `colOidsSym`: seq[int32]
 
@@ -2302,19 +2288,19 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   # Cache hit path
   let hitBlock = newStmtList()
   hitBlock.add quote do:
-    let c = `cachedOptSym`.get
-    `stmtNameSym` = c.name
-    `cachedFieldsSym` = c.fields
-    `colFmtsSym` = c.colFmts
-    `colOidsSym` = c.colOids
-    `effectiveRfSym` = c.resultFormats
-    `batchSym` = newSeqOfCap[byte](128)
+    `stmtNameSym` = `cachedPtrSym`.name
+    `cachedFieldsSym` = `cachedPtrSym`.fields
+    `colFmtsSym` = `cachedPtrSym`.colFmts
+    `colOidsSym` = `cachedPtrSym`.colOids
+    `effectiveRfSym` = `cachedPtrSym`.resultFormats
+    `connSym`.sendBuf.setLen(0)
+  let sendBufNode = newDotExpr(connSym, ident"sendBuf")
   hitBlock.add(
-    makeBindDirect(batchSym, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
+    makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
   )
   hitBlock.add quote do:
-    `batchSym`.addExecute("", 0)
-    `batchSym`.addSync()
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
 
   # Cache miss path
   let missBlock = newStmtList()
@@ -2322,35 +2308,35 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     `cacheMissSym` = true
     `stmtNameSym` = `connSym`.nextStmtName()
     `effectiveRfSym` = @[]
-    `batchSym` = newSeqOfCap[byte](`sqlSym`.len + 128)
+    `connSym`.sendBuf.setLen(0)
     if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
       let evicted = `connSym`.evictStmtCache()
-      `batchSym`.addClose(dkStatement, evicted.name)
-  missBlock.add(makeParseDirect(batchSym, stmtNameSym, sqlSym, argList))
+      `connSym`.sendBuf.addClose(dkStatement, evicted.name)
+  missBlock.add(makeParseDirect(sendBufNode, stmtNameSym, sqlSym, argList))
   missBlock.add quote do:
-    `batchSym`.addDescribe(dkStatement, `stmtNameSym`)
+    `connSym`.sendBuf.addDescribe(dkStatement, `stmtNameSym`)
   missBlock.add(
-    makeBindDirect(batchSym, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
+    makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
   )
   missBlock.add quote do:
-    `batchSym`.addExecute("", 0)
-    `batchSym`.addSync()
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
 
   # No-cache path
   let elseBlock = newStmtList()
   elseBlock.add quote do:
     `effectiveRfSym` = @[]
-    `batchSym` = newSeqOfCap[byte](`sqlSym`.len + 128)
-  elseBlock.add(makeParseDirect(batchSym, newStrLitNode(""), sqlSym, argList))
+    `connSym`.sendBuf.setLen(0)
+  elseBlock.add(makeParseDirect(sendBufNode, newStrLitNode(""), sqlSym, argList))
   elseBlock.add(
     makeBindDirect(
-      batchSym, newStrLitNode(""), newStrLitNode(""), effectiveRfSym, argList
+      sendBufNode, newStrLitNode(""), newStrLitNode(""), effectiveRfSym, argList
     )
   )
   elseBlock.add quote do:
-    `batchSym`.addDescribe(dkPortal, "")
-    `batchSym`.addExecute("", 0)
-    `batchSym`.addSync()
+    `connSym`.sendBuf.addDescribe(dkPortal, "")
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
 
   # Build if/elif/else
   let ifNode = newNimNode(nnkIfStmt)
@@ -2370,6 +2356,165 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
 
   result.add quote do:
     queryDirectImpl(
-      `connSym`, `sqlSym`, `batchSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`,
-      `cacheHitSym`, `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, ZeroDuration,
+      `connSym`, `sqlSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`, `cacheHitSym`,
+      `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, ZeroDuration,
+    )
+
+proc execDirectImpl(
+    conn: PgConnection,
+    sql: string,
+    cacheHit: bool,
+    cacheMiss: bool,
+    stmtName: string,
+    timeout: Duration,
+): Future[string] {.async.} =
+  ## Shared receive path for execDirect macro.
+  await conn.sendBufMsg()
+  var commandTag = ""
+  var errorMsg = ""
+  var errorCode = ""
+  var cachedFields: seq[FieldDescription]
+
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+          discard
+        of bmkParameterDescription:
+          discard
+        of bmkRowDescription:
+          if cacheMiss:
+            cachedFields = msg.fields
+        of bmkNoData:
+          discard
+        of bmkDataRow:
+          discard
+        of bmkCommandComplete:
+          commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+          for f in msg.errorFields:
+            if f.code == 'C':
+              errorCode = f.value
+              break
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if errorMsg.len > 0:
+            if cacheHit and errorCode == "26000":
+              conn.removeStmtCache(sql)
+            raise newException(PgError, errorMsg)
+          if cacheMiss:
+            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
+
+  return commandTag
+
+macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =
+  ## Zero-allocation exec: encodes parameters directly into the send buffer
+  ## at compile time, avoiding ``seq[PgParam]`` and intermediate ``seq[byte]`` allocs.
+  ##
+  ## Usage: discard await conn.execDirect("UPDATE ... WHERE id = $1", myId)
+  result = newStmtList()
+
+  let connSym = genSym(nskLet, "conn")
+  let sqlSym = genSym(nskLet, "sql")
+  let cachedPtrSym = genSym(nskLet, "cachedPtr")
+  let cacheHitSym = genSym(nskVar, "cacheHit")
+  let cacheMissSym = genSym(nskVar, "cacheMiss")
+  let stmtNameSym = genSym(nskVar, "stmtName")
+
+  result.add quote do:
+    let `connSym` = `conn`
+    let `sqlSym` = `sql`
+    `connSym`.checkReady()
+    `connSym`.state = csBusy
+
+    let `cachedPtrSym` = `connSym`.lookupStmtCache(`sqlSym`)
+    var `cacheHitSym` = `cachedPtrSym` != nil
+    var `cacheMissSym` = false
+    var `stmtNameSym` = ""
+
+  proc makeBindDirect(buf, portal, stmt: NimNode, argList: NimNode): NimNode =
+    let emptyRf = newNimNode(nnkBracket) # no result formats for exec
+    result = newCall(bindSym"addBindDirect", buf, portal, stmt, emptyRf)
+    for i in 0 ..< argList.len:
+      result.add(argList[i])
+
+  proc makeParseDirect(buf, stmt, sql: NimNode, argList: NimNode): NimNode =
+    result = newCall(bindSym"addParseDirect", buf, stmt, sql)
+    for i in 0 ..< argList.len:
+      result.add(argList[i])
+
+  let argList = newNimNode(nnkBracket)
+  for arg in args:
+    argList.add(arg)
+
+  let sendBufNode = newDotExpr(connSym, ident"sendBuf")
+
+  # Cache hit path
+  let hitBlock = newStmtList()
+  hitBlock.add quote do:
+    `stmtNameSym` = `cachedPtrSym`.name
+    `connSym`.sendBuf.setLen(0)
+  hitBlock.add(makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, argList))
+  hitBlock.add quote do:
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
+
+  # Cache miss path
+  let missBlock = newStmtList()
+  missBlock.add quote do:
+    `cacheMissSym` = true
+    `stmtNameSym` = `connSym`.nextStmtName()
+    `connSym`.sendBuf.setLen(0)
+    if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
+      let evicted = `connSym`.evictStmtCache()
+      `connSym`.sendBuf.addClose(dkStatement, evicted.name)
+  missBlock.add(makeParseDirect(sendBufNode, stmtNameSym, sqlSym, argList))
+  missBlock.add quote do:
+    `connSym`.sendBuf.addDescribe(dkStatement, `stmtNameSym`)
+  missBlock.add(makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, argList))
+  missBlock.add quote do:
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
+
+  # No-cache path
+  let elseBlock = newStmtList()
+  elseBlock.add quote do:
+    `connSym`.sendBuf.setLen(0)
+  elseBlock.add(makeParseDirect(sendBufNode, newStrLitNode(""), sqlSym, argList))
+  elseBlock.add(
+    makeBindDirect(sendBufNode, newStrLitNode(""), newStrLitNode(""), argList)
+  )
+  elseBlock.add quote do:
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
+
+  # Build if/elif/else
+  let ifNode = newNimNode(nnkIfStmt)
+  ifNode.add(
+    newNimNode(nnkElifBranch).add(
+      quote do:
+        `cacheHitSym`,
+      hitBlock,
+    )
+  )
+
+  let missCondition = quote:
+    `connSym`.stmtCacheCapacity > 0
+  ifNode.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
+  ifNode.add(newNimNode(nnkElse).add(elseBlock))
+  result.add(ifNode)
+
+  result.add quote do:
+    execDirectImpl(
+      `connSym`, `sqlSym`, `cacheHitSym`, `cacheMissSym`, `stmtNameSym`, ZeroDuration
     )

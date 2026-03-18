@@ -5049,3 +5049,136 @@ suite "E2E: execInTransaction / queryInTransaction":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: queryDirect / execDirect":
+  test "queryDirect with int32 param":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect("SELECT $1::int4 + 10", 5'i32)
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getInt(0) == 15
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect with string param":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect("SELECT $1::text || ' world'", "hello")
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getStr(0) == "hello world"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect with multiple params":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect(
+        "SELECT $1::int4 + $2::int4, $3::text", 10'i32, 20'i32, "abc"
+      )
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getInt(0) == 30
+      doAssert qr.rows[0].getStr(1) == "abc"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect cache hit on repeated call":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      for i in 0 ..< 5:
+        let qr = await conn.queryDirect("SELECT $1::int4 * 2", int32(i))
+        doAssert qr.rows[0].getInt(0) == int32(i * 2)
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect no params":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect("SELECT 42 AS answer")
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getInt(0) == 42
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect INSERT and UPDATE":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_exec_direct")
+      discard await conn.exec(
+        "CREATE TABLE test_exec_direct (id serial PRIMARY KEY, val int NOT NULL)"
+      )
+
+      let tag1 =
+        await conn.execDirect("INSERT INTO test_exec_direct (val) VALUES ($1)", 100'i32)
+      doAssert "INSERT" in tag1
+
+      let tag2 = await conn.execDirect(
+        "UPDATE test_exec_direct SET val = $1 WHERE val = $2", 200'i32, 100'i32
+      )
+      doAssert "UPDATE 1" in tag2
+
+      let qr = await conn.queryDirect(
+        "SELECT val FROM test_exec_direct WHERE val = $1", 200'i32
+      )
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getInt(0) == 200
+
+      discard await conn.exec("DROP TABLE test_exec_direct")
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect cache hit on repeated call":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_exec_direct2")
+      discard await conn.exec(
+        "CREATE TABLE test_exec_direct2 (id serial PRIMARY KEY, val int NOT NULL)"
+      )
+
+      for i in 0 ..< 5:
+        discard await conn.execDirect(
+          "INSERT INTO test_exec_direct2 (val) VALUES ($1)", int32(i)
+        )
+
+      let qr = await conn.query("SELECT count(*) FROM test_exec_direct2")
+      doAssert qr.rows[0].getInt64(0) == 5
+
+      discard await conn.exec("DROP TABLE test_exec_direct2")
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect with bool param":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect("SELECT $1::bool", true)
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getBool(0) == true
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect with int64 param":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect("SELECT $1::int8 + 1", 9223372036854775806'i64)
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getInt64(0) == 9223372036854775807'i64
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect with float64 param":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect("SELECT $1::float8 + 0.5", 1.25'f64)
+      doAssert qr.rowCount == 1
+      doAssert abs(qr.rows[0].getFloat(0) - 1.75) < 1e-10
+      await conn.close()
+
+    waitFor t()
