@@ -373,7 +373,13 @@ template queryRecvLoop(
       for i in 0 ..< qr.fields.len:
         qr.fields[i].formatCode = cachedColFmts[i]
     if qr.fields.len > 0:
-      qr.data = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+      if conn.rowDataBuf != nil:
+        conn.rowDataBuf = conn.rowDataBuf.reuseRowData(
+          int16(qr.fields.len), cachedColFmts, cachedColOids
+        )
+      else:
+        conn.rowDataBuf = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+      qr.data = conn.rowDataBuf
 
   block recvLoop:
     while true:
@@ -403,7 +409,11 @@ template queryRecvLoop(
                   cf[i] = resultFormats[i]
           else:
             qr.fields = msg.fields
-          qr.data = newRowData(int16(qr.fields.len), cf, co)
+          if conn.rowDataBuf != nil:
+            conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len), cf, co)
+          else:
+            conn.rowDataBuf = newRowData(int16(qr.fields.len), cf, co)
+          qr.data = conn.rowDataBuf
         of bmkNoData:
           discard
         of bmkCommandComplete:
@@ -771,7 +781,11 @@ proc executeImpl(
       elif i < resultFormats.len:
         qr.fields[i].formatCode = resultFormats[i]
   if qr.fields.len > 0:
-    qr.data = newRowData(int16(qr.fields.len))
+    if conn.rowDataBuf != nil:
+      conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len))
+    else:
+      conn.rowDataBuf = newRowData(int16(qr.fields.len))
+    qr.data = conn.rowDataBuf
   var errorMsg = ""
 
   block recvLoop:
@@ -858,7 +872,11 @@ proc executeImpl(
       elif i < resultFormats.len:
         qr.fields[i].formatCode = resultFormats[i]
   if qr.fields.len > 0:
-    qr.data = newRowData(int16(qr.fields.len))
+    if conn.rowDataBuf != nil:
+      conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len))
+    else:
+      conn.rowDataBuf = newRowData(int16(qr.fields.len))
+    qr.data = conn.rowDataBuf
   var errorMsg = ""
 
   block recvLoop:

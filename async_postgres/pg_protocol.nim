@@ -731,6 +731,39 @@ proc newRowData*(
     colTypeOids: colTypeOids,
   )
 
+proc reuseRowData*(
+    rd: RowData,
+    numCols: int16,
+    colFormats: sink seq[int16],
+    colTypeOids: sink seq[int32],
+): RowData =
+  ## Create a new RowData that takes over the old buffer's capacity via move.
+  ## The old RowData (and any QueryResult still referencing it) is left intact.
+  result = RowData(
+    buf: move rd.buf,
+    cellIndex: move rd.cellIndex,
+    numCols: numCols,
+    colFormats: colFormats,
+    colTypeOids: colTypeOids,
+  )
+  result.buf.setLen(0)
+  result.cellIndex.setLen(0)
+
+proc reuseRowData*(rd: RowData, numCols: int16): RowData =
+  ## Create a new RowData that takes over the old buffer's capacity via move,
+  ## without format metadata.
+  result = RowData(
+    buf: move rd.buf,
+    cellIndex: move rd.cellIndex,
+    numCols: numCols,
+    colFormats: move rd.colFormats,
+    colTypeOids: move rd.colTypeOids,
+  )
+  result.buf.setLen(0)
+  result.cellIndex.setLen(0)
+  result.colFormats.setLen(0)
+  result.colTypeOids.setLen(0)
+
 proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
   ## Build per-column binary format codes: 1 for known safe types, 0 for others.
   result = newSeq[int16](fields.len)
