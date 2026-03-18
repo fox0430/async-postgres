@@ -374,11 +374,12 @@ template queryRecvLoop(
         qr.fields[i].formatCode = cachedColFmts[i]
     if qr.fields.len > 0:
       if conn.rowDataBuf != nil:
-        conn.rowDataBuf.resetRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
-        qr.data = conn.rowDataBuf
+        conn.rowDataBuf = conn.rowDataBuf.reuseRowData(
+          int16(qr.fields.len), cachedColFmts, cachedColOids
+        )
       else:
-        qr.data = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
-        conn.rowDataBuf = qr.data
+        conn.rowDataBuf = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+      qr.data = conn.rowDataBuf
 
   block recvLoop:
     while true:
@@ -409,11 +410,10 @@ template queryRecvLoop(
           else:
             qr.fields = msg.fields
           if conn.rowDataBuf != nil:
-            conn.rowDataBuf.resetRowData(int16(qr.fields.len), cf, co)
-            qr.data = conn.rowDataBuf
+            conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len), cf, co)
           else:
-            qr.data = newRowData(int16(qr.fields.len), cf, co)
-            conn.rowDataBuf = qr.data
+            conn.rowDataBuf = newRowData(int16(qr.fields.len), cf, co)
+          qr.data = conn.rowDataBuf
         of bmkNoData:
           discard
         of bmkCommandComplete:
@@ -782,11 +782,10 @@ proc executeImpl(
         qr.fields[i].formatCode = resultFormats[i]
   if qr.fields.len > 0:
     if conn.rowDataBuf != nil:
-      conn.rowDataBuf.resetRowData(int16(qr.fields.len))
-      qr.data = conn.rowDataBuf
+      conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len))
     else:
-      qr.data = newRowData(int16(qr.fields.len))
-      conn.rowDataBuf = qr.data
+      conn.rowDataBuf = newRowData(int16(qr.fields.len))
+    qr.data = conn.rowDataBuf
   var errorMsg = ""
 
   block recvLoop:
@@ -874,11 +873,10 @@ proc executeImpl(
         qr.fields[i].formatCode = resultFormats[i]
   if qr.fields.len > 0:
     if conn.rowDataBuf != nil:
-      conn.rowDataBuf.resetRowData(int16(qr.fields.len))
-      qr.data = conn.rowDataBuf
+      conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len))
     else:
-      qr.data = newRowData(int16(qr.fields.len))
-      conn.rowDataBuf = qr.data
+      conn.rowDataBuf = newRowData(int16(qr.fields.len))
+    qr.data = conn.rowDataBuf
   var errorMsg = ""
 
   block recvLoop:
