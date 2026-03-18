@@ -30,7 +30,8 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
     ),
     idle: initDeque[PooledConn](),
     active: 0,
-    waiters: initDeque[Future[PgConnection]](),
+    waiters: initDeque[Waiter](),
+    waiterCount: 0,
     closed: false,
   )
 
@@ -179,8 +180,9 @@ suite "Fallback":
     # But we need the waiter to fail immediately — set maxWaiters to reject
     cluster.replica.config.maxWaiters = 1
     # Fill the waiter queue so next acquire is rejected
-    let dummyWaiter = newFuture[PgConnection]("dummy")
-    cluster.replica.waiters.addLast(dummyWaiter)
+    let dummyFut = newFuture[PgConnection]("dummy")
+    cluster.replica.waiters.addLast(Waiter(fut: dummyFut, cancelled: false))
+    cluster.replica.waiterCount = 1
 
     let primaryConn = mockConn()
     cluster.primary.idle.addLast(
@@ -193,14 +195,15 @@ suite "Fallback":
     check cluster.primary.active == 1
 
     # Clean up
-    dummyWaiter.complete(mockConn())
+    dummyFut.complete(mockConn())
 
   test "rfNone raises when replica unavailable":
     let cluster = makeCluster(fallback = rfNone)
     cluster.replica.active = cluster.replica.config.maxSize
     cluster.replica.config.maxWaiters = 1
-    let dummyWaiter = newFuture[PgConnection]("dummy")
-    cluster.replica.waiters.addLast(dummyWaiter)
+    let dummyFut = newFuture[PgConnection]("dummy")
+    cluster.replica.waiters.addLast(Waiter(fut: dummyFut, cancelled: false))
+    cluster.replica.waiterCount = 1
 
     expect(PgError):
       discard waitFor acquireRead(cluster)
@@ -208,27 +211,29 @@ suite "Fallback":
     check cluster.primary.active == 0
 
     # Clean up
-    dummyWaiter.complete(mockConn())
+    dummyFut.complete(mockConn())
 
   test "rfPrimary raises when both pools unavailable":
     let cluster = makeCluster(fallback = rfPrimary)
     # Both pools at max with full waiter queues
     cluster.replica.active = cluster.replica.config.maxSize
     cluster.replica.config.maxWaiters = 1
-    let replicaWaiter = newFuture[PgConnection]("replica-dummy")
-    cluster.replica.waiters.addLast(replicaWaiter)
+    let replicaFut = newFuture[PgConnection]("replica-dummy")
+    cluster.replica.waiters.addLast(Waiter(fut: replicaFut, cancelled: false))
+    cluster.replica.waiterCount = 1
 
     cluster.primary.active = cluster.primary.config.maxSize
     cluster.primary.config.maxWaiters = 1
-    let primaryWaiter = newFuture[PgConnection]("primary-dummy")
-    cluster.primary.waiters.addLast(primaryWaiter)
+    let primaryFut = newFuture[PgConnection]("primary-dummy")
+    cluster.primary.waiters.addLast(Waiter(fut: primaryFut, cancelled: false))
+    cluster.primary.waiterCount = 1
 
     expect(PgError):
       discard waitFor acquireRead(cluster)
 
     # Clean up
-    replicaWaiter.complete(mockConn())
-    primaryWaiter.complete(mockConn())
+    replicaFut.complete(mockConn())
+    primaryFut.complete(mockConn())
 
   test "rfPrimary fallback when replica pool is closed":
     let cluster = makeCluster(fallback = rfPrimary)
