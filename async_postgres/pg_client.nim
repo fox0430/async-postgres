@@ -752,16 +752,16 @@ proc executeImpl(
   conn.checkReady()
   conn.state = csBusy
 
-  var batch = newSeqOfCap[byte](params.len * 16 + 128)
+  conn.sendBuf.setLen(0)
   let formats =
     if paramFormats.len > 0:
       paramFormats
     else:
       newSeq[int16](params.len)
-  batch.addBind("", stmt.name, formats, params, resultFormats)
-  batch.addExecute("", 0)
-  batch.addSync()
-  await conn.sendMsg(batch)
+  conn.sendBuf.addBind("", stmt.name, formats, params, resultFormats)
+  conn.sendBuf.addExecute("", 0)
+  conn.sendBuf.addSync()
+  await conn.sendBufMsg()
 
   var qr = QueryResult(fields: stmt.fields)
   if resultFormats.len > 0:
@@ -842,11 +842,13 @@ proc executeImpl(
           needsCoercion = true
         coerced[i] = coerceBinaryParam(params[i], stmt.paramOids[i])
 
-  var batch = newSeqOfCap[byte](params.len * 16 + 128)
-  batch.addBind("", stmt.name, if needsCoercion: coerced else: params, resultFormats)
-  batch.addExecute("", 0)
-  batch.addSync()
-  await conn.sendMsg(batch)
+  conn.sendBuf.setLen(0)
+  conn.sendBuf.addBind(
+    "", stmt.name, if needsCoercion: coerced else: params, resultFormats
+  )
+  conn.sendBuf.addExecute("", 0)
+  conn.sendBuf.addSync()
+  await conn.sendBufMsg()
 
   var qr = QueryResult(fields: stmt.fields)
   if resultFormats.len > 0:
@@ -2065,10 +2067,10 @@ proc fetchNextImpl(
   let rd = newRowData(int16(cursor.fields.len))
   var rowCount: int32 = 0
 
-  var batch = newSeqOfCap[byte](cursor.portalName.len + 24)
-  batch.addExecute(cursor.portalName, cursor.chunkSize)
-  batch.addFlush()
-  await conn.sendMsg(batch)
+  conn.sendBuf.setLen(0)
+  conn.sendBuf.addExecute(cursor.portalName, cursor.chunkSize)
+  conn.sendBuf.addFlush()
+  await conn.sendBufMsg()
 
   block recvLoop:
     while true:
