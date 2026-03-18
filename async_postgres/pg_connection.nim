@@ -102,6 +102,7 @@ type
     resultFormats*: seq[int16] ## Cached buildResultFormats() output
     colFmts*: seq[int16] ## Per-column format codes for RowData
     colOids*: seq[int32] ## Per-column type OIDs for RowData
+    lruNode*: DoublyLinkedNode[string] ## Embedded LRU list node
 
   PgConnection* = ref object
     ## A single PostgreSQL connection with buffered I/O and statement caching.
@@ -142,7 +143,6 @@ type
     notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
     stmtCache*: Table[string, CachedStmt]
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
-    stmtCacheNodes: Table[string, DoublyLinkedNode[string]] ## O(1) node lookup
     stmtCounter*: int
     stmtCacheCapacity*: int ## 0=disabled, default 256
 
@@ -253,26 +253,23 @@ proc clearStmtCache*(conn: PgConnection) =
   ## Clear the client-side statement cache. Does not close server-side statements.
   conn.stmtCache.clear()
   conn.stmtCacheLru = initDoublyLinkedList[string]()
-  conn.stmtCacheNodes.clear()
 
-proc lookupStmtCache*(conn: PgConnection, sql: string): Option[CachedStmt] =
+proc lookupStmtCache*(conn: PgConnection, sql: string): ptr CachedStmt =
   ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
+  ## Returns nil on miss. The returned pointer is valid until the next cache mutation.
   if conn.stmtCacheCapacity <= 0:
-    return none(CachedStmt)
-  if conn.stmtCache.hasKey(sql):
-    # Move to tail of LRU list (most recently used) — O(1)
-    let node = conn.stmtCacheNodes[sql]
-    conn.stmtCacheLru.remove(node)
-    conn.stmtCacheLru.append(node)
-    return some(conn.stmtCache[sql])
-  return none(CachedStmt)
+    return nil
+  conn.stmtCache.withValue(sql, entry):
+    conn.stmtCacheLru.remove(entry.lruNode)
+    conn.stmtCacheLru.append(entry.lruNode)
+    return addr entry[]
+  return nil
 
 proc evictStmtCache*(conn: PgConnection): CachedStmt =
   ## Evict the least recently used entry from the cache. Returns the evicted entry.
   let node = conn.stmtCacheLru.head
   let oldSql = node.value
   conn.stmtCacheLru.remove(node)
-  conn.stmtCacheNodes.del(oldSql)
   result = conn.stmtCache[oldSql]
   conn.stmtCache.del(oldSql)
 
@@ -290,18 +287,16 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
     for i in 0 ..< entry.fields.len:
       entry.colOids[i] = entry.fields[i].typeOid
       entry.colFmts[i] = entry.resultFormats[i]
-  conn.stmtCache[sql] = entry
   let node = newDoublyLinkedNode(sql)
+  entry.lruNode = node
+  conn.stmtCache[sql] = entry
   conn.stmtCacheLru.append(node)
-  conn.stmtCacheNodes[sql] = node
 
 proc removeStmtCache*(conn: PgConnection, sql: string) =
   ## Remove a statement from the cache by its SQL text.
+  conn.stmtCache.withValue(sql, entry):
+    conn.stmtCacheLru.remove(entry.lruNode)
   conn.stmtCache.del(sql)
-  if conn.stmtCacheNodes.hasKey(sql):
-    let node = conn.stmtCacheNodes[sql]
-    conn.stmtCacheLru.remove(node)
-    conn.stmtCacheNodes.del(sql)
 
 when hasAsyncDispatch:
   proc sendRawData(socket: AsyncSocket, p: pointer, len: int): Future[void] =
@@ -423,6 +418,16 @@ proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
   elif hasAsyncDispatch:
     if data.len > 0:
       await conn.socket.sendRawBytes(data)
+
+proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
+  ## Send conn.sendBuf to the server without copying the seq.
+  ## Safe because conn.state == csBusy prevents concurrent access to sendBuf.
+  when hasChronos:
+    if conn.sendBuf.len > 0:
+      await conn.writer.write(unsafeAddr conn.sendBuf[0], conn.sendBuf.len)
+  elif hasAsyncDispatch:
+    if conn.sendBuf.len > 0:
+      await conn.socket.sendRawData(unsafeAddr conn.sendBuf[0], conn.sendBuf.len)
 
 when hasChronos:
   proc appendDnCallback(
