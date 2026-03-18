@@ -2471,13 +2471,14 @@ macro addParseDirect*(
   ## Compile-time macro: generates Parse message with OIDs from arg types.
   result = newStmtList()
   let msgStart = genSym(nskLet, "msgStart")
+  let nParams = newLit(int16(args.len))
   result.add quote do:
     let `msgStart` = `buf`.len
     `buf`.add(byte('P'))
     `buf`.addInt32(0)
     `buf`.addCString(`stmtName`)
     `buf`.addCString(`sql`)
-    `buf`.addInt16(int16(`args`.len))
+    `buf`.addInt16(`nParams`)
   for arg in args:
     result.add quote do:
       `buf`.writeParamOid(`arg`)
@@ -2495,7 +2496,7 @@ macro addBindDirect*(
   ## Zero intermediate PgParam/``seq[byte]`` allocations.
   result = newStmtList()
   let msgStart = genSym(nskLet, "msgStart")
-  let nParams = args.len
+  let nParamsLit = newLit(int16(args.len))
   result.add quote do:
     let `msgStart` = `buf`.len
     `buf`.add(byte('B'))
@@ -2503,22 +2504,27 @@ macro addBindDirect*(
     `buf`.addCString(`portalName`)
     `buf`.addCString(`stmtName`)
     # Parameter format codes
-    `buf`.addInt16(int16(`nParams`))
+    `buf`.addInt16(`nParamsLit`)
   for arg in args:
     result.add quote do:
       `buf`.writeParamFormat(`arg`)
   result.add quote do:
     # Parameter values
-    `buf`.addInt16(int16(`nParams`))
+    `buf`.addInt16(`nParamsLit`)
   for arg in args:
     result.add quote do:
       `buf`.writeParamValue(`arg`)
-  result.add quote do:
-    # Result format codes
-    `buf`.addInt16(int16(`resultFormats`.len))
-    for f in `resultFormats`:
-      `buf`.addInt16(f)
-    `buf`.patchMsgLen(`msgStart`)
+  # Result format codes — handle at compile time to avoid empty-bracket inference issues
+  if resultFormats.kind == nnkBracket and resultFormats.len == 0:
+    result.add quote do:
+      `buf`.addInt16(0'i16)
+      `buf`.patchMsgLen(`msgStart`)
+  else:
+    result.add quote do:
+      `buf`.addInt16(int16(`resultFormats`.len))
+      for f in `resultFormats`:
+        `buf`.addInt16(f)
+      `buf`.patchMsgLen(`msgStart`)
 
 # User-defined enum type support
 #
