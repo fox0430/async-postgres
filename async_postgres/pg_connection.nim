@@ -28,11 +28,40 @@ elif defined(macosx):
 
 type
   PgError* = object of CatchableError
-    ## General PostgreSQL error (connection failures, protocol errors, etc.).
+    ## General PostgreSQL error. Base type for all pg-specific errors.
+
+  PgConnectionError* = object of PgError
+    ## Connection failures, disconnections, SSL/auth errors.
+
+  PgQueryError* = object of PgError
+    ## SQL execution errors from the server (ErrorResponse).
+    sqlState*: string ## 5-char SQLSTATE code (e.g. "42P01"), empty if unavailable.
+    severity*: string ## e.g. "ERROR", "FATAL"
+    detail*: string ## DETAIL field, empty if not present.
+    hint*: string ## HINT field, empty if not present.
+
+  PgTimeoutError* = object of PgError ## Operation timed out.
+
+  PgPoolError* = object of PgError ## Pool exhaustion, pool closed, or acquire timeout.
 
   PgNotifyOverflowError* = object of PgError
     dropped*: int ## Number of notifications dropped due to queue overflow
 
+proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
+  ## Create a PgQueryError from server ErrorResponse fields.
+  let sqlState = getErrorField(fields, 'C')
+  let severity = getErrorField(fields, 'S')
+  let detail = getErrorField(fields, 'D')
+  let hint = getErrorField(fields, 'H')
+  result = (ref PgQueryError)(
+    msg: formatError(fields),
+    sqlState: sqlState,
+    severity: severity,
+    detail: detail,
+    hint: hint,
+  )
+
+type
   PgConnState* = enum
     ## Connection lifecycle state.
     csConnecting
@@ -356,7 +385,7 @@ proc fillRecvBuf*(
           )
       if n == 0:
         conn.state = csClosed
-        raise newException(PgError, "Connection closed by server")
+        raise newException(PgConnectionError, "Connection closed by server")
       conn.recvBuf.setLen(oldLen + n)
     except AsyncTimeoutError as e:
       conn.recvBuf.setLen(oldLen)
@@ -369,7 +398,7 @@ proc fillRecvBuf*(
         await conn.socket.recv(RecvBufSize).wait(timeout)
     if data.len == 0:
       conn.state = csClosed
-      raise newException(PgError, "Connection closed by server")
+      raise newException(PgConnectionError, "Connection closed by server")
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + data.len)
     copyMem(addr conn.recvBuf[oldLen], unsafeAddr data[0], data.len)
@@ -531,7 +560,8 @@ when hasChronos:
       anchors.add(anchor)
 
     if anchors.len == 0:
-      raise newException(PgError, "No valid CA certificates found in PEM data")
+      raise
+        newException(PgConnectionError, "No valid CA certificates found in PEM data")
 
     result = TrustAnchorResult(store: TrustAnchorStore.new(anchors), backing: backing)
 
@@ -545,13 +575,13 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
     var response: array[1, byte]
     let n = await conn.transport.readOnce(addr response[0], 1)
     if n == 0:
-      raise newException(PgError, "Connection closed during SSL negotiation")
+      raise newException(PgConnectionError, "Connection closed during SSL negotiation")
     respChar = char(response[0])
   elif hasAsyncDispatch:
     await conn.socket.sendRawBytes(sslReq)
     let respStr = await conn.socket.recv(1)
     if respStr.len == 0:
-      raise newException(PgError, "Connection closed during SSL negotiation")
+      raise newException(PgConnectionError, "Connection closed during SSL negotiation")
     respChar = respStr[0]
 
   case respChar
@@ -620,17 +650,18 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
         wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
         conn.sslEnabled = true
       else:
-        raise newException(PgError, "SSL support requires compiling with -d:ssl")
+        raise
+          newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
   of 'N':
     if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
-      raise newException(PgError, "Server does not support SSL")
+      raise newException(PgConnectionError, "Server does not support SSL")
     # sslPrefer: server refused SSL – connection will proceed unencrypted.
     # WARNING: This is vulnerable to MITM downgrade attacks. A network
     # attacker can intercept the SSLRequest and reply 'N' to force
     # plaintext. Use sslRequire or stronger if security is needed.
     stderr.writeLine "pg_connection: SSL refused by server, falling back to plaintext (sslmode=prefer)"
   else:
-    raise newException(PgError, "Unexpected SSL response: " & $respChar)
+    raise newException(PgConnectionError, "Unexpected SSL response: " & $respChar)
 
 when defined(linux) or defined(macosx):
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
@@ -648,14 +679,18 @@ when defined(linux) or defined(macosx):
       return
     var optval: cint = 1
     if setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, addr optval, sizeof(optval).SockLen) < 0:
-      raise newException(PgError, "Failed to set SO_KEEPALIVE: " & $strerror(errno))
+      raise newException(
+        PgConnectionError, "Failed to set SO_KEEPALIVE: " & $strerror(errno)
+      )
     when defined(linux):
       if config.keepAliveIdle > 0:
         optval = cint(config.keepAliveIdle)
         if setsockopt(
           fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE, addr optval, sizeof(optval).SockLen
         ) < 0:
-          raise newException(PgError, "Failed to set TCP_KEEPIDLE: " & $strerror(errno))
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPIDLE: " & $strerror(errno)
+          )
       if config.keepAliveInterval > 0:
         optval = cint(config.keepAliveInterval)
         if setsockopt(
@@ -665,14 +700,17 @@ when defined(linux) or defined(macosx):
           addr optval,
           sizeof(optval).SockLen,
         ) < 0:
-          raise
-            newException(PgError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno))
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
+          )
       if config.keepAliveCount > 0:
         optval = cint(config.keepAliveCount)
         if setsockopt(
           fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
         ) < 0:
-          raise newException(PgError, "Failed to set TCP_KEEPCNT: " & $strerror(errno))
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
+          )
     elif defined(macosx):
       if config.keepAliveIdle > 0:
         optval = cint(config.keepAliveIdle)
@@ -694,14 +732,17 @@ when defined(linux) or defined(macosx):
           addr optval,
           sizeof(optval).SockLen,
         ) < 0:
-          raise
-            newException(PgError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno))
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
+          )
       if config.keepAliveCount > 0:
         optval = cint(config.keepAliveCount)
         if setsockopt(
           fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
         ) < 0:
-          raise newException(PgError, "Failed to set TCP_KEEPCNT: " & $strerror(errno))
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
+          )
 
 proc connectToHost(
     config: ConnConfig, hostAddr: string, hostPort: int
@@ -712,7 +753,7 @@ proc connectToHost(
   when hasChronos:
     let addresses = resolveTAddress(hostAddr, Port(hostPort))
     if addresses.len == 0:
-      raise newException(PgError, "Could not resolve host: " & hostAddr)
+      raise newException(PgConnectionError, "Could not resolve host: " & hostAddr)
     let transport = await connect(addresses[0])
     when defined(linux) or defined(macosx):
       configureTcpNoDelay(SocketHandle(transport.fd))
@@ -786,7 +827,8 @@ proc connectToHost(
             await conn.sendMsg(encodePassword(hash))
           of bmkAuthenticationSASL:
             if "SCRAM-SHA-256" notin msg.saslMechanisms:
-              raise newException(PgError, "Server doesn't support SCRAM-SHA-256")
+              raise
+                newException(PgConnectionError, "Server doesn't support SCRAM-SHA-256")
             let clientFirst = scramClientFirstMessage(config.user, scramState)
             await conn.sendMsg(encodeSASLInitialResponse("SCRAM-SHA-256", clientFirst))
           of bmkAuthenticationSASLContinue:
@@ -795,9 +837,11 @@ proc connectToHost(
             await conn.sendMsg(encodeSASLResponse(clientFinal))
           of bmkAuthenticationSASLFinal:
             if not scramVerifyServerFinal(msg.saslFinalData, scramState):
-              raise newException(PgError, "SCRAM server signature verification failed")
+              raise newException(
+                PgConnectionError, "SCRAM server signature verification failed"
+              )
           of bmkErrorResponse:
-            raise newException(PgError, formatError(msg.errorFields))
+            raise newException(PgConnectionError, formatError(msg.errorFields))
           else:
             discard
         await conn.fillRecvBuf()
@@ -818,7 +862,7 @@ proc connectToHost(
             conn.state = csReady
             break readyLoop
           of bmkErrorResponse:
-            raise newException(PgError, formatError(msg.errorFields))
+            raise newException(PgConnectionError, formatError(msg.errorFields))
           else:
             discard
         await conn.fillRecvBuf()
@@ -856,9 +900,11 @@ proc connectToHost(
     raise e
 
 proc checkReady*(conn: PgConnection) =
-  ## Assert that the connection is in `csReady` state. Raises `PgError` otherwise.
+  ## Assert that the connection is in `csReady` state. Raises `PgConnectionError` otherwise.
   if conn.state != csReady:
-    raise newException(PgError, "Connection is not ready (state: " & $conn.state & ")")
+    raise newException(
+      PgConnectionError, "Connection is not ready (state: " & $conn.state & ")"
+    )
 
 proc quoteIdentifier*(s: string): string =
   ## Quote a SQL identifier (e.g. table/channel name) with double quotes, escaping embedded quotes.
@@ -873,7 +919,7 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
 
   var results: seq[QueryResult]
   var current = QueryResult()
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -894,12 +940,12 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
         of bmkEmptyQueryResponse:
           results.add(QueryResult())
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -914,7 +960,7 @@ proc simpleExecImpl(
   conn.state = csBusy
   await conn.sendMsg(encodeQuery(sql))
   var commandTag = ""
-  var errorMsg = ""
+  var queryError: ref PgQueryError
   block recvLoop:
     while true:
       while (let opt = conn.nextMessage(); opt.isSome):
@@ -925,12 +971,12 @@ proc simpleExecImpl(
         of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -948,7 +994,7 @@ proc simpleExec*(
       return await simpleExecImpl(conn, sql, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "simpleExec timed out")
+      raise newException(PgTimeoutError, "simpleExec timed out")
   else:
     return await simpleExecImpl(conn, sql)
 
@@ -966,11 +1012,11 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
     conn.checkReady()
     if not conn.isConnected():
       conn.state = csClosed
-      raise newException(PgError, "Connection is not established")
+      raise newException(PgConnectionError, "Connection is not established")
     conn.state = csBusy
     await conn.sendMsg(encodeQuery(""))
 
-    var errorMsg = ""
+    var queryError: ref PgQueryError
     block recvLoop:
       while true:
         while (let opt = conn.nextMessage(); opt.isSome):
@@ -979,12 +1025,12 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
           of bmkEmptyQueryResponse:
             discard
           of bmkErrorResponse:
-            errorMsg = formatError(msg.errorFields)
+            queryError = newPgQueryError(msg.errorFields)
           of bmkReadyForQuery:
             conn.txStatus = msg.txStatus
             conn.state = csReady
-            if errorMsg.len > 0:
-              raise newException(PgError, errorMsg)
+            if queryError != nil:
+              raise queryError
             break recvLoop
           else:
             discard
@@ -996,7 +1042,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
         await perform().wait(timeout)
       except AsyncTimeoutError:
         conn.state = csClosed
-        raise newException(PgError, "Ping timed out")
+        raise newException(PgTimeoutError, "Ping timed out")
 
     withTimeout()
   else:
@@ -1007,7 +1053,7 @@ proc cancel*(conn: PgConnection): Future[void] {.async.} =
   when hasChronos:
     let addresses = resolveTAddress(conn.host, Port(conn.port))
     if addresses.len == 0:
-      raise newException(PgError, "Could not resolve host: " & conn.host)
+      raise newException(PgConnectionError, "Could not resolve host: " & conn.host)
     let transport = await connect(addresses[0])
     try:
       let msg = encodeCancelRequest(conn.pid, conn.secretKey)
@@ -1150,7 +1196,9 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CatchableError as e:
           errors.add(entry.host & ":" & $entry.port & ": " & e.msg)
 
-    raise newException(PgError, "Could not connect to any host: " & errors.join("; "))
+    raise newException(
+      PgConnectionError, "Could not connect to any host: " & errors.join("; ")
+    )
 
   if config.connectTimeout != default(Duration):
     perform().wait(config.connectTimeout)
@@ -1307,9 +1355,9 @@ proc checkNotifyOverflow(conn: PgConnection) =
 proc checkListenAlive(conn: PgConnection) =
   ## Raise if the listen pump has died permanently.
   if conn.listenErrorMsg.len > 0:
-    raise newException(PgError, conn.listenErrorMsg)
+    raise newException(PgConnectionError, conn.listenErrorMsg)
   if conn.state == csClosed:
-    raise newException(PgError, "Connection is closed")
+    raise newException(PgConnectionError, "Connection is closed")
 
 proc waitNotification*(
     conn: PgConnection, timeout: Duration = ZeroDuration
@@ -1328,7 +1376,7 @@ proc waitNotification*(
       try:
         await conn.notifyWaiter.wait(timeout)
       except AsyncTimeoutError:
-        raise newException(PgError, "Wait for notification timed out")
+        raise newException(PgTimeoutError, "Wait for notification timed out")
     else:
       await conn.notifyWaiter
   finally:

@@ -1,6 +1,6 @@
 import std/[unittest, options, strutils]
 
-import ../async_postgres/pg_protocol
+import ../async_postgres/[pg_protocol, pg_connection]
 
 proc parseBackendMessage(buf: var seq[byte]): ParseResult =
   ## Test-only wrapper that preserves the old var-buf interface.
@@ -490,6 +490,50 @@ suite "Consecutive messages":
     # Next parse should return incomplete
     let r4 = parseBackendMessage(buf)
     check r4.state == psIncomplete
+
+suite "newPgQueryError":
+  test "all fields populated":
+    let fields = @[
+      ErrorField(code: 'S', value: "ERROR"),
+      ErrorField(code: 'C', value: "42P01"),
+      ErrorField(code: 'M', value: "relation \"foo\" does not exist"),
+      ErrorField(code: 'D', value: "some detail"),
+      ErrorField(code: 'H', value: "create the table first"),
+    ]
+    let err = newPgQueryError(fields)
+    check err.sqlState == "42P01"
+    check err.severity == "ERROR"
+    check err.detail == "some detail"
+    check err.hint == "create the table first"
+    check "42P01" in err.msg
+    check "relation \"foo\" does not exist" in err.msg
+
+  test "missing optional fields default to empty":
+    let fields = @[
+      ErrorField(code: 'S', value: "ERROR"),
+      ErrorField(code: 'M', value: "something failed"),
+    ]
+    let err = newPgQueryError(fields)
+    check err.sqlState == ""
+    check err.severity == "ERROR"
+    check err.detail == ""
+    check err.hint == ""
+    check "something failed" in err.msg
+
+  test "inherits from PgError":
+    let fields = @[
+      ErrorField(code: 'S', value: "ERROR"),
+      ErrorField(code: 'C', value: "23505"),
+      ErrorField(code: 'M', value: "duplicate key"),
+    ]
+    let err = newPgQueryError(fields)
+    # Can be caught as PgError
+    var caughtAsPgError = false
+    try:
+      raise err
+    except PgError:
+      caughtAsPgError = true
+    check caughtAsPgError
 
 suite "Utility":
   test "formatError":
