@@ -181,8 +181,7 @@ proc execImpl(
     await conn.sendBufMsg()
 
   var commandTag = ""
-  var errorMsg = ""
-  var errorCode = ""
+  var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
 
   block recvLoop:
@@ -206,18 +205,14 @@ proc execImpl(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
-          for f in msg.errorFields:
-            if f.code == 'C':
-              errorCode = f.value
-              break
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            if cacheHit and errorCode == "26000":
+          if queryError != nil:
+            if cacheHit and queryError.sqlState == "26000":
               conn.removeStmtCache(sql)
-            raise newException(PgError, errorMsg)
+            raise queryError
           if cacheMiss:
             conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
           break recvLoop
@@ -268,8 +263,7 @@ proc execImpl(
     await conn.sendBufMsg()
 
   var commandTag = ""
-  var errorMsg = ""
-  var errorCode = ""
+  var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
 
   block recvLoop:
@@ -293,18 +287,14 @@ proc execImpl(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
-          for f in msg.errorFields:
-            if f.code == 'C':
-              errorCode = f.value
-              break
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            if cacheHit and errorCode == "26000":
+          if queryError != nil:
+            if cacheHit and queryError.sqlState == "26000":
               conn.removeStmtCache(sql)
-            raise newException(PgError, errorMsg)
+            raise queryError
           if cacheMiss:
             conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
           break recvLoop
@@ -332,7 +322,7 @@ proc exec*(
       )
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "Exec timed out")
+      raise newException(PgTimeoutError, "Exec timed out")
   else:
     return await execImpl(conn, sql, params, paramOids, paramFormats)
 
@@ -348,7 +338,7 @@ proc exec*(
       return await execImpl(conn, sql, params, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "Exec timed out")
+      raise newException(PgTimeoutError, "Exec timed out")
   else:
     return await execImpl(conn, sql, params)
 
@@ -364,8 +354,7 @@ template queryRecvLoop(
     qr: var QueryResult,
     timeout: Duration,
 ) =
-  var errorMsg = ""
-  var errorCode = ""
+  var queryError: ref PgQueryError
 
   if cacheHit:
     swap(qr.fields, cachedFields)
@@ -421,18 +410,14 @@ template queryRecvLoop(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
-          for f in msg.errorFields:
-            if f.code == 'C':
-              errorCode = f.value
-              break
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            if cacheHit and errorCode == "26000":
+          if queryError != nil:
+            if cacheHit and queryError.sqlState == "26000":
               conn.removeStmtCache(sql)
-            raise newException(PgError, errorMsg)
+            raise queryError
           if cacheMiss:
             conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
           break recvLoop
@@ -583,8 +568,7 @@ template queryEachRecvLoop(
     rowCount: var int64,
     timeout: Duration,
 ) =
-  var errorMsg = ""
-  var errorCode = ""
+  var queryError: ref PgQueryError
   var rd: RowData
   var callbackError: ref CatchableError = nil
 
@@ -660,21 +644,17 @@ template queryEachRecvLoop(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
-          for f in msg.errorFields:
-            if f.code == 'C':
-              errorCode = f.value
-              break
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.recvBufStart = pos
           conn.txStatus = msg.txStatus
           conn.state = csReady
           if callbackError != nil:
             raise callbackError
-          if errorMsg.len > 0:
-            if cacheHit and errorCode == "26000":
+          if queryError != nil:
+            if cacheHit and queryError.sqlState == "26000":
               conn.removeStmtCache(sql)
-            raise newException(PgError, errorMsg)
+            raise queryError
           if cacheMiss:
             conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
           break recvLoop
@@ -837,7 +817,7 @@ proc queryEach*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "queryEach timed out")
+      raise newException(PgTimeoutError, "queryEach timed out")
   else:
     return await queryEachImpl(
       conn, sql, params, paramOids, paramFormats, callback, resultFormats
@@ -859,7 +839,7 @@ proc queryEach*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "queryEach timed out")
+      raise newException(PgTimeoutError, "queryEach timed out")
   else:
     return await queryEachImpl(conn, sql, params, callback, resultFormats)
 
@@ -883,7 +863,7 @@ proc query*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "Query timed out")
+      raise newException(PgTimeoutError, "Query timed out")
   else:
     return await queryImpl(conn, sql, params, paramOids, paramFormats, resultFormats)
 
@@ -900,7 +880,7 @@ proc query*(
       return await queryImpl(conn, sql, params, resultFormats, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "Query timed out")
+      raise newException(PgTimeoutError, "Query timed out")
   else:
     return await queryImpl(conn, sql, params, resultFormats)
 
@@ -1000,7 +980,7 @@ proc prepareImpl(
   await conn.sendMsg(batch)
 
   var stmt = PreparedStatement(conn: conn, name: name)
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1016,12 +996,12 @@ proc prepareImpl(
         of bmkNoData:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1039,7 +1019,7 @@ proc prepare*(
       return await prepareImpl(conn, name, sql, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "Prepare timed out")
+      raise newException(PgTimeoutError, "Prepare timed out")
   else:
     return await prepareImpl(conn, name, sql)
 
@@ -1079,7 +1059,7 @@ proc executeImpl(
     else:
       conn.rowDataBuf = newRowData(int16(qr.fields.len))
     qr.data = conn.rowDataBuf
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1093,12 +1073,12 @@ proc executeImpl(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1122,7 +1102,7 @@ proc execute*(
       )
     except AsyncTimeoutError:
       stmt.conn.state = csClosed
-      raise newException(PgError, "Execute timed out")
+      raise newException(PgTimeoutError, "Execute timed out")
   else:
     return await executeImpl(stmt, params, paramFormats, resultFormats)
 
@@ -1170,7 +1150,7 @@ proc executeImpl(
     else:
       conn.rowDataBuf = newRowData(int16(qr.fields.len))
     qr.data = conn.rowDataBuf
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1184,12 +1164,12 @@ proc executeImpl(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1209,7 +1189,7 @@ proc execute*(
       return await executeImpl(stmt, params, resultFormats, timeout).wait(timeout)
     except AsyncTimeoutError:
       stmt.conn.state = csClosed
-      raise newException(PgError, "Execute timed out")
+      raise newException(PgTimeoutError, "Execute timed out")
   else:
     return await executeImpl(stmt, params, resultFormats)
 
@@ -1226,7 +1206,7 @@ proc closeImpl(
   batch.addSync()
   await conn.sendMsg(batch)
 
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1236,12 +1216,12 @@ proc closeImpl(
         of bmkCloseComplete:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1257,7 +1237,7 @@ proc close*(
       await closeImpl(stmt, timeout).wait(timeout)
     except AsyncTimeoutError:
       stmt.conn.state = csClosed
-      raise newException(PgError, "Statement close timed out")
+      raise newException(PgTimeoutError, "Statement close timed out")
   else:
     await closeImpl(stmt)
 
@@ -1287,7 +1267,7 @@ proc copyInRawImpl(
   await conn.sendMsg(encodeQuery(sql))
 
   var commandTag = ""
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   # Wait for CopyInResponse (or error)
   block recvLoop:
@@ -1298,12 +1278,12 @@ proc copyInRawImpl(
         of bmkCopyInResponse:
           break recvLoop
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           return commandTag
         else:
           discard
@@ -1334,12 +1314,12 @@ proc copyInRawImpl(
         of bmkCommandComplete:
           commandTag = msg.commandTag
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop2
         else:
           discard
@@ -1357,7 +1337,7 @@ proc copyIn*(
       return await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "COPY IN timed out")
+      raise newException(PgTimeoutError, "COPY IN timed out")
   else:
     return await copyInRawImpl(conn, sql, data)
 
@@ -1377,7 +1357,7 @@ proc copyIn*(
         return await copyInRawImpl(conn, sql, dataCopy, timeout).wait(timeout)
       except AsyncTimeoutError:
         conn.state = csClosed
-        raise newException(PgError, "COPY IN timed out")
+        raise newException(PgTimeoutError, "COPY IN timed out")
 
     return inner()
   else:
@@ -1424,7 +1404,7 @@ proc copyInStreamImpl(
   await conn.sendMsg(encodeQuery(sql))
 
   var info = CopyInInfo()
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   # Wait for CopyInResponse (or error)
   block recvLoop:
@@ -1437,12 +1417,12 @@ proc copyInStreamImpl(
           info.columnFormats = msg.copyColumnFormats
           break recvLoop
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           return info
         else:
           discard
@@ -1496,12 +1476,12 @@ proc copyInStreamImpl(
         of bmkCommandComplete:
           info.commandTag = msg.commandTag
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop2
         else:
           discard
@@ -1525,7 +1505,7 @@ proc copyInStream*(
       return await copyInStreamImpl(conn, sql, callback, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "COPY IN stream timed out")
+      raise newException(PgTimeoutError, "COPY IN stream timed out")
   else:
     return await copyInStreamImpl(conn, sql, callback)
 
@@ -1537,7 +1517,7 @@ proc copyOutImpl(
   await conn.sendMsg(encodeQuery(sql))
 
   var cr = CopyResult()
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1554,12 +1534,12 @@ proc copyOutImpl(
         of bmkCommandComplete:
           cr.commandTag = msg.commandTag
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1578,7 +1558,7 @@ proc copyOut*(
       return await copyOutImpl(conn, sql, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "COPY OUT timed out")
+      raise newException(PgTimeoutError, "COPY OUT timed out")
   else:
     return await copyOutImpl(conn, sql)
 
@@ -1593,7 +1573,7 @@ proc copyOutStreamImpl(
   await conn.sendMsg(encodeQuery(sql))
 
   var info = CopyOutInfo()
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1614,12 +1594,12 @@ proc copyOutStreamImpl(
         of bmkCommandComplete:
           info.commandTag = msg.commandTag
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            raise newException(PgError, errorMsg)
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1642,7 +1622,7 @@ proc copyOutStream*(
       return await copyOutStreamImpl(conn, sql, callback, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "COPY OUT stream timed out")
+      raise newException(PgTimeoutError, "COPY OUT stream timed out")
   else:
     return await copyOutStreamImpl(conn, sql, callback)
 
@@ -1758,7 +1738,7 @@ proc execInTransactionImpl(
   # Parse response: 3 phases (BEGIN=0, user=1, COMMIT=2)
   var phase = 0
   var userCommandTag = ""
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1774,16 +1754,16 @@ proc execInTransactionImpl(
             userCommandTag = msg.commandTag
           inc phase
         of bmkErrorResponse:
-          if errorMsg.len == 0:
-            errorMsg = formatError(msg.errorFields)
+          if queryError == nil:
+            queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
+          if queryError != nil:
             # Error occurred: if we're in a failed transaction, send ROLLBACK
             if msg.txStatus == tsInFailedTransaction:
               discard await conn.simpleExec("ROLLBACK")
-            raise newException(PgError, errorMsg)
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1810,7 +1790,7 @@ proc execInTransaction*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "execInTransaction timed out")
+      raise newException(PgTimeoutError, "execInTransaction timed out")
   else:
     return await execInTransactionImpl(
       conn, "BEGIN", sql, params, paramOids, paramFormats, timeout
@@ -1844,7 +1824,7 @@ proc execInTransaction*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "execInTransaction timed out")
+      raise newException(PgTimeoutError, "execInTransaction timed out")
   else:
     return
       await execInTransactionImpl(conn, beginSql, sql, values, oids, formats, timeout)
@@ -1889,7 +1869,7 @@ proc queryInTransactionImpl(
 
   var qr = QueryResult()
   var phase = 0
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -1910,15 +1890,15 @@ proc queryInTransactionImpl(
             qr.commandTag = msg.commandTag
           inc phase
         of bmkErrorResponse:
-          if errorMsg.len == 0:
-            errorMsg = formatError(msg.errorFields)
+          if queryError == nil:
+            queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
+          if queryError != nil:
             if msg.txStatus == tsInFailedTransaction:
               discard await conn.simpleExec("ROLLBACK")
-            raise newException(PgError, errorMsg)
+            raise queryError
           break recvLoop
         else:
           discard
@@ -1946,7 +1926,7 @@ proc queryInTransaction*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "queryInTransaction timed out")
+      raise newException(PgTimeoutError, "queryInTransaction timed out")
   else:
     return await queryInTransactionImpl(
       conn, "BEGIN", sql, params, paramOids, paramFormats, resultFormats, timeout
@@ -1983,7 +1963,7 @@ proc queryInTransaction*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "queryInTransaction timed out")
+      raise newException(PgTimeoutError, "queryInTransaction timed out")
   else:
     return await queryInTransactionImpl(
       conn, beginSql, sql, values, oids, formats, resultFormats, timeout
@@ -2132,8 +2112,7 @@ proc executeImpl(
   # Receive Phase
   var results = newSeq[PipelineResult](p.ops.len)
   var activeOpIdx = 0
-  var errorMsg = ""
-  var errorCode = ""
+  var queryError: ref PgQueryError
   var cachedFieldsPerOp: seq[seq[FieldDescription]] # lazy-init for cache misses
 
   # Initialize query results
@@ -2222,22 +2201,18 @@ proc executeImpl(
               rowData = nil
               rowCount = nil
         of bmkErrorResponse:
-          if errorMsg.len == 0:
-            errorMsg = formatError(msg.errorFields)
-            for f in msg.errorFields:
-              if f.code == 'C':
-                errorCode = f.value
-                break
+          if queryError == nil:
+            queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
+          if queryError != nil:
             # Invalidate cache for 26000 (prepared statement does not exist)
-            if errorCode == "26000":
+            if queryError.sqlState == "26000":
               for i in 0 ..< p.ops.len:
                 if p.ops[i].cacheHit:
                   conn.removeStmtCache(p.ops[i].sql)
-            raise newException(PgError, errorMsg)
+            raise queryError
           # Cache misses: add to cache
           for i in 0 ..< p.ops.len:
             if p.ops[i].cacheMiss:
@@ -2268,7 +2243,7 @@ proc execute*(
       return await executeImpl(p, timeout).wait(timeout)
     except AsyncTimeoutError:
       p.conn.state = csClosed
-      raise newException(PgError, "Pipeline execute timed out")
+      raise newException(PgTimeoutError, "Pipeline execute timed out")
   else:
     return await executeImpl(p, timeout)
 
@@ -2303,7 +2278,7 @@ proc openCursorImpl(
 
   var cursor =
     Cursor(conn: conn, portalName: portalName, chunkSize: chunkSize, exhausted: false)
-  var errorMsg = ""
+  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -2341,7 +2316,7 @@ proc openCursorImpl(
               await conn.fillRecvBuf(timeout)
           break recvLoop
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
+          queryError = newPgQueryError(msg.errorFields)
           # Drain until ReadyForQuery
           await conn.sendMsg(encodeSync())
           block errDrain:
@@ -2352,7 +2327,7 @@ proc openCursorImpl(
                   conn.state = csReady
                   break errDrain
               await conn.fillRecvBuf(timeout)
-          raise newException(PgError, errorMsg)
+          raise queryError
         else:
           discard
       await conn.fillRecvBuf(timeout)
@@ -2379,7 +2354,7 @@ proc openCursor*(
         .wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
-      raise newException(PgError, "Cursor open timed out")
+      raise newException(PgTimeoutError, "Cursor open timed out")
   else:
     result = await openCursorImpl(
       conn, sql, params, paramOids, paramFormats, resultFormats, chunkSize
@@ -2428,7 +2403,7 @@ proc fetchNextImpl(
               await conn.fillRecvBuf(timeout)
           break recvLoop
         of bmkErrorResponse:
-          let errorMsg = formatError(msg.errorFields)
+          let queryError = newPgQueryError(msg.errorFields)
           await conn.sendMsg(encodeSync())
           block errDrain:
             while true:
@@ -2438,7 +2413,7 @@ proc fetchNextImpl(
                   conn.state = csReady
                   break errDrain
               await conn.fillRecvBuf(timeout)
-          raise newException(PgError, errorMsg)
+          raise queryError
         else:
           discard
       await conn.fillRecvBuf(timeout)
@@ -2467,7 +2442,7 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
       return await fetchNextImpl(cursor, cursor.timeout).wait(cursor.timeout)
     except AsyncTimeoutError:
       cursor.conn.state = csClosed
-      raise newException(PgError, "Cursor fetch timed out")
+      raise newException(PgTimeoutError, "Cursor fetch timed out")
   else:
     return await fetchNextImpl(cursor)
 
@@ -2508,7 +2483,7 @@ proc closeCursor*(cursor: Cursor): Future[void] {.async.} =
       await closeCursorImpl(cursor, cursor.timeout).wait(cursor.timeout)
     except AsyncTimeoutError:
       cursor.conn.state = csClosed
-      raise newException(PgError, "Cursor close timed out")
+      raise newException(PgTimeoutError, "Cursor close timed out")
   else:
     await closeCursorImpl(cursor)
 
@@ -2699,8 +2674,7 @@ proc execDirectImpl(
   ## Shared receive path for execDirect macro.
   await conn.sendBufMsg()
   var commandTag = ""
-  var errorMsg = ""
-  var errorCode = ""
+  var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
 
   block recvLoop:
@@ -2724,18 +2698,14 @@ proc execDirectImpl(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          errorMsg = formatError(msg.errorFields)
-          for f in msg.errorFields:
-            if f.code == 'C':
-              errorCode = f.value
-              break
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
-          if errorMsg.len > 0:
-            if cacheHit and errorCode == "26000":
+          if queryError != nil:
+            if cacheHit and queryError.sqlState == "26000":
               conn.removeStmtCache(sql)
-            raise newException(PgError, errorMsg)
+            raise queryError
           if cacheMiss:
             conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
           break recvLoop

@@ -212,9 +212,9 @@ proc release*(pool: PgPool, conn: PgConnection) =
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## Acquire a connection from the pool. Tries idle connections first (with
   ## health checks), creates a new one if under `maxSize`, or waits for a
-  ## release. Raises `PgError` on timeout or if the pool is closed.
+  ## release. Raises `PgPoolError` on timeout or if the pool is closed.
   if pool.closed:
-    raise newException(PgError, "Pool is closed")
+    raise newException(PgPoolError, "Pool is closed")
 
   pool.cachedNow = Moment.now()
 
@@ -260,7 +260,8 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   # Max connections reached; wait for one to be released
   if pool.config.maxWaiters > 0 and pool.waiterCount >= pool.config.maxWaiters:
     raise newException(
-      PgError, "Pool acquire queue full (maxWaiters=" & $pool.config.maxWaiters & ")"
+      PgPoolError,
+      "Pool acquire queue full (maxWaiters=" & $pool.config.maxWaiters & ")",
     )
   let fut = newFuture[PgConnection]("PgPool.acquire")
   let waiter = Waiter(fut: fut, cancelled: false)
@@ -275,7 +276,7 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
       # If release() completed the future in a race, put the connection back
       if fut.completed():
         pool.release(fut.read())
-      raise newException(PgError, "Pool acquire timeout")
+      raise newException(PgPoolError, "Pool acquire timeout")
   else:
     return await fut
 
