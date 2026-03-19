@@ -158,7 +158,7 @@ suite "reuseRowData":
     rd = rd.reuseRowData(1)
     parseDataRowInto(buildDataRowBody(["only"]), rd)
     check rd.cellIndex.len == 2 # 1 row * 1 col * 2
-    check rd.buf.len == 4 # "only"
+    check rd.buf.len == 8 # 4-byte length header + "only"
     check getCell(rd, 0, 0) == "only"
 
   test "empty string vs NULL distinction preserved after reuse":

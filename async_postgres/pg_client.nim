@@ -1702,10 +1702,16 @@ proc newPipeline*(conn: PgConnection): Pipeline =
 
 proc addExec*(p: var Pipeline, sql: string, params: seq[PgParam] = @[]) =
   ## Add an exec operation to the pipeline with typed parameters.
-  let (oids, formats, values) = extractParams(params)
-  p.ops.add PipelineOp(
-    kind: pokExec, sql: sql, params: values, paramOids: oids, paramFormats: formats
-  )
+  var op = PipelineOp(kind: pokExec, sql: sql)
+  if params.len > 0:
+    op.paramOids = newSeqOfCap[int32](params.len)
+    op.paramFormats = newSeqOfCap[int16](params.len)
+    op.params = newSeqOfCap[Option[seq[byte]]](params.len)
+    for param in params:
+      op.paramOids.add param.oid
+      op.paramFormats.add param.format
+      op.params.add param.value
+  p.ops.add move(op)
 
 proc addExec*(
     p: var Pipeline,
@@ -1768,15 +1774,20 @@ proc executeImpl(
 
   # Send Phase — also collect CachedStmt data needed by receive phase
   conn.sendBuf.setLen(0)
-  var cachedStmts = newSeq[CachedStmt](p.ops.len) # populated for cache-hit ops
+  var cachedStmts: seq[CachedStmt] # lazy-init, only populated for pokQuery cache-hit ops
+  var hasCachedStmts = false
   var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
+  var defaultFormats: seq[int16] # reused across ops when paramFormats is empty
 
   for i in 0 ..< p.ops.len:
     let formats =
       if p.ops[i].paramFormats.len > 0:
         p.ops[i].paramFormats
       else:
-        newSeq[int16](p.ops[i].params.len)
+        let needed = p.ops[i].params.len
+        if defaultFormats.len != needed:
+          defaultFormats = newSeq[int16](needed)
+        defaultFormats
 
     let cached = conn.lookupStmtCache(p.ops[i].sql)
     p.ops[i].cacheHit = cached != nil
@@ -1784,7 +1795,11 @@ proc executeImpl(
 
     if cached != nil:
       p.ops[i].stmtName = cached.name
-      cachedStmts[i] = cached[]
+      if p.ops[i].kind == pokQuery:
+        if not hasCachedStmts:
+          cachedStmts = newSeq[CachedStmt](p.ops.len)
+          hasCachedStmts = true
+        cachedStmts[i] = cached[]
       var effectiveResultFormats: seq[int16]
       if p.ops[i].kind == pokQuery:
         effectiveResultFormats =
