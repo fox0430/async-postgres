@@ -5182,3 +5182,280 @@ suite "E2E: queryDirect / execDirect":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: queryEach":
+  test "basic - all rows passed to callback":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var count = 0
+      let rowCount = await conn.queryEach(
+        "SELECT generate_series(1, 5)",
+        callback = proc(row: Row) =
+          count += 1,
+      )
+      doAssert count == 5
+      doAssert rowCount == 5
+      await conn.close()
+
+    waitFor t()
+
+  test "value access in callback":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var values: seq[string]
+      discard await conn.queryEach(
+        "SELECT 'hello'::text, 42::int4, true::bool",
+        callback = proc(row: Row) =
+          values.add(row.getStr(0))
+          values.add($row.getInt(1))
+          values.add($row.getBool(2)),
+      )
+      doAssert values == @["hello", "42", "true"]
+      await conn.close()
+
+    waitFor t()
+
+  test "with PgParam parameters":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sum = 0
+      let rowCount = await conn.queryEach(
+        "SELECT generate_series(1, $1::int4)",
+        @[10'i32.toPgParam],
+        callback = proc(row: Row) =
+          sum += row.getInt(0),
+      )
+      doAssert rowCount == 10
+      doAssert sum == 55
+      await conn.close()
+
+    waitFor t()
+
+  test "zero rows - callback not called":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var called = false
+      let rowCount = await conn.queryEach(
+        "SELECT 1 WHERE false",
+        callback = proc(row: Row) =
+          called = true,
+      )
+      doAssert not called
+      doAssert rowCount == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "10000 rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var count = 0
+      let rowCount = await conn.queryEach(
+        "SELECT generate_series(1, 10000)",
+        callback = proc(row: Row) =
+          count += 1,
+      )
+      doAssert count == 10000
+      doAssert rowCount == 10000
+      await conn.close()
+
+    waitFor t()
+
+  test "binary format with cache hit":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # First call: cache miss, populates stmt cache
+      var firstVal = 0
+      discard await conn.queryEach(
+        "SELECT 42::int4",
+        callback = proc(row: Row) =
+          firstVal = row.getInt(0),
+      )
+      doAssert firstVal == 42
+      # Second call: cache hit, should use binary format automatically
+      var secondVal = 0
+      discard await conn.queryEach(
+        "SELECT 42::int4",
+        callback = proc(row: Row) =
+          secondVal = row.getInt(0),
+      )
+      doAssert secondVal == 42
+      await conn.close()
+
+    waitFor t()
+
+  test "callback exception is propagated":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var count = 0
+      var gotError = false
+      try:
+        discard await conn.queryEach(
+          "SELECT generate_series(1, 5)",
+          callback = proc(row: Row) =
+            count += 1
+            if count == 3:
+              raise newException(ValueError, "test error")
+          ,
+        )
+      except CatchableError:
+        gotError = true
+      doAssert gotError
+      # Connection should be in ready state after exception
+      doAssert conn.state == csReady
+      # Connection should still be usable
+      let qr = await conn.query("SELECT 1")
+      doAssert qr.rowCount == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL value handling":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var gotNull = false
+      var gotValue = false
+      discard await conn.queryEach(
+        "SELECT NULL::text, 'hello'::text",
+        callback = proc(row: Row) =
+          gotNull = row.isNull(0)
+          gotValue = row.getStr(1) == "hello",
+      )
+      doAssert gotNull
+      doAssert gotValue
+      await conn.close()
+
+    waitFor t()
+
+  test "multiple rows have correct values":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var values: seq[int]
+      discard await conn.queryEach(
+        "SELECT x FROM generate_series(1, 5) AS x ORDER BY x",
+        callback = proc(row: Row) =
+          values.add(row.getInt(0)),
+      )
+      doAssert values == @[1, 2, 3, 4, 5]
+      await conn.close()
+
+    waitFor t()
+
+  test "consecutive queryEach on same connection":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sum1 = 0
+      discard await conn.queryEach(
+        "SELECT generate_series(1, 3)",
+        callback = proc(row: Row) =
+          sum1 += row.getInt(0),
+      )
+      var sum2 = 0
+      discard await conn.queryEach(
+        "SELECT generate_series(10, 12)",
+        callback = proc(row: Row) =
+          sum2 += row.getInt(0),
+      )
+      doAssert sum1 == 6
+      doAssert sum2 == 33
+      await conn.close()
+
+    waitFor t()
+
+  test "queryEach then query on same connection":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var eachCount = 0
+      discard await conn.queryEach(
+        "SELECT generate_series(1, 5)",
+        callback = proc(row: Row) =
+          eachCount += 1,
+      )
+      doAssert eachCount == 5
+      let qr = await conn.query("SELECT 42::int4")
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getInt(0) == 42
+      await conn.close()
+
+    waitFor t()
+
+  test "invalid SQL raises PgError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var gotError = false
+      try:
+        discard await conn.queryEach(
+          "SELECT FROM nonexistent_table_xyz",
+          callback = proc(row: Row) =
+            discard,
+        )
+      except PgError:
+        gotError = true
+      doAssert gotError
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "without stmt cache":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 0
+      var values: seq[int]
+      let rowCount = await conn.queryEach(
+        "SELECT generate_series(1, 3)",
+        callback = proc(row: Row) =
+          values.add(row.getInt(0)),
+      )
+      doAssert rowCount == 3
+      doAssert values == @[1, 2, 3]
+      await conn.close()
+
+    waitFor t()
+
+  test "Option[seq[byte]] params overload":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sum = 0
+      let rowCount = await conn.queryEach(
+        "SELECT generate_series(1, $1::int4)",
+        @[some(@[byte('5')])],
+        callback = proc(row: Row) =
+          sum += row.getInt(0),
+      )
+      doAssert rowCount == 5
+      doAssert sum == 15
+      await conn.close()
+
+    waitFor t()
+
+  test "pool queryEach":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var count = 0
+      let rowCount = await pool.queryEach(
+        "SELECT generate_series(1, 5)",
+        callback = proc(row: Row) =
+          count += 1,
+      )
+      doAssert count == 5
+      doAssert rowCount == 5
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryEach with PgParam":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var sum = 0
+      let rowCount = await pool.queryEach(
+        "SELECT generate_series(1, $1::int4)",
+        @[5'i32.toPgParam],
+        callback = proc(row: Row) =
+          sum += row.getInt(0),
+      )
+      doAssert rowCount == 5
+      doAssert sum == 15
+      await pool.close()
+
+    waitFor t()

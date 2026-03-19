@@ -570,6 +570,299 @@ proc queryImpl(
   )
   return qr
 
+template queryEachRecvLoop(
+    conn: PgConnection,
+    sql: string,
+    resultFormats: openArray[int16],
+    cacheHit, cacheMiss: bool,
+    stmtName: string,
+    cachedFields: var seq[FieldDescription],
+    cachedColFmts: seq[int16],
+    cachedColOids: seq[int32],
+    callback: RowCallback,
+    rowCount: var int64,
+    timeout: Duration,
+) =
+  var errorMsg = ""
+  var errorCode = ""
+  var rd: RowData
+  var callbackError: ref CatchableError = nil
+
+  if cacheHit:
+    if cachedColFmts.len > 0 or cachedColOids.len > 0:
+      rd = newRowData(int16(cachedFields.len), cachedColFmts, cachedColOids)
+    else:
+      rd = newRowData(int16(cachedFields.len))
+    if resultFormats.len > 0 and cachedColFmts.len > 0:
+      for i in 0 ..< cachedFields.len:
+        rd.colFormats[i] = cachedColFmts[i]
+
+  block recvLoop:
+    while true:
+      # Parse messages directly from recvBuf using parseBackendMessage
+      var pos = conn.recvBufStart
+      while true:
+        var consumed: int
+        let res = parseBackendMessage(
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rd
+        )
+        if res.state == psIncomplete:
+          conn.recvBufStart = pos
+          break # need more data
+        pos += consumed
+        if res.state == psDataRow:
+          # DataRow was parsed into rd — invoke callback, then reset for next row
+          if callbackError == nil:
+            try:
+              callback(Row(data: rd, rowIdx: 0))
+            except CatchableError as e:
+              callbackError = e
+          rowCount += 1
+          # Reset buffers but keep capacity
+          rd.buf.setLen(0)
+          rd.cellIndex.setLen(0)
+          continue
+        let msg = res.message
+        case msg.kind
+        of bmkNotificationResponse:
+          conn.dispatchNotification(msg)
+          continue
+        of bmkNoticeResponse:
+          conn.dispatchNotice(msg)
+          continue
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+          discard
+        of bmkParameterDescription:
+          discard
+        of bmkRowDescription:
+          var cf: seq[int16]
+          var co: seq[int32]
+          if cacheMiss:
+            cachedFields = msg.fields
+            if resultFormats.len > 0:
+              cf = newSeq[int16](cachedFields.len)
+              co = newSeq[int32](cachedFields.len)
+              for i in 0 ..< cachedFields.len:
+                co[i] = cachedFields[i].typeOid
+                if resultFormats.len == 1:
+                  cachedFields[i].formatCode = resultFormats[0]
+                  cf[i] = resultFormats[0]
+                elif i < resultFormats.len:
+                  cachedFields[i].formatCode = resultFormats[i]
+                  cf[i] = resultFormats[i]
+          else:
+            cachedFields = msg.fields
+          rd = newRowData(int16(cachedFields.len), cf, co)
+        of bmkNoData:
+          discard
+        of bmkCommandComplete:
+          discard
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          errorMsg = formatError(msg.errorFields)
+          for f in msg.errorFields:
+            if f.code == 'C':
+              errorCode = f.value
+              break
+        of bmkReadyForQuery:
+          conn.recvBufStart = pos
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if callbackError != nil:
+            raise callbackError
+          if errorMsg.len > 0:
+            if cacheHit and errorCode == "26000":
+              conn.removeStmtCache(sql)
+            raise newException(PgError, errorMsg)
+          if cacheMiss:
+            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+          break recvLoop
+        else:
+          discard
+        conn.recvBufStart = pos
+      await conn.fillRecvBuf(timeout)
+
+proc queryEachImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    callback: RowCallback,
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
+  var cacheMiss = false
+  var stmtName = ""
+  var cachedFields: seq[FieldDescription]
+  var cachedColFmts: seq[int16]
+  var cachedColOids: seq[int32]
+
+  var effectiveResultFormats: seq[int16]
+
+  conn.sendBuf.setLen(0)
+  if cacheHit:
+    stmtName = cached.name
+    cachedFields = cached.fields
+    cachedColFmts = cached.colFmts
+    cachedColOids = cached.colOids
+    effectiveResultFormats =
+      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  elif conn.stmtCacheCapacity > 0:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    effectiveResultFormats = resultFormats
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, paramOids)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  else:
+    effectiveResultFormats = resultFormats
+    conn.sendBuf.addParse("", sql, paramOids)
+    conn.sendBuf.addBind("", "", formats, params, effectiveResultFormats)
+    conn.sendBuf.addDescribe(dkPortal, "")
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+
+  var rowCount: int64 = 0
+  queryEachRecvLoop(
+    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+    cachedColFmts, cachedColOids, callback, rowCount, timeout,
+  )
+  return rowCount
+
+proc queryEachImpl(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam],
+    callback: RowCallback,
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
+  var cacheMiss = false
+  var stmtName = ""
+  var cachedFields: seq[FieldDescription]
+  var cachedColFmts: seq[int16]
+  var cachedColOids: seq[int32]
+
+  var effectiveResultFormats: seq[int16]
+
+  conn.sendBuf.setLen(0)
+  if cacheHit:
+    stmtName = cached.name
+    cachedFields = cached.fields
+    cachedColFmts = cached.colFmts
+    cachedColOids = cached.colOids
+    effectiveResultFormats =
+      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  elif conn.stmtCacheCapacity > 0:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    effectiveResultFormats = resultFormats
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, params)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  else:
+    effectiveResultFormats = resultFormats
+    conn.sendBuf.addParse("", sql, params)
+    conn.sendBuf.addBind("", "", params, effectiveResultFormats)
+    conn.sendBuf.addDescribe(dkPortal, "")
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+
+  var rowCount: int64 = 0
+  queryEachRecvLoop(
+    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+    cachedColFmts, cachedColOids, callback, rowCount, timeout,
+  )
+  return rowCount
+
+proc queryEach*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    callback: RowCallback,
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  ## Execute a query and invoke `callback` once per row, reusing a single RowData buffer.
+  ## The `Row` passed to the callback is only valid inside the callback.
+  ## Returns the number of rows processed.
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  if timeout > ZeroDuration:
+    try:
+      return await queryEachImpl(
+        conn, sql, params, paramOids, paramFormats, callback, resultFormats, timeout
+      )
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "queryEach timed out")
+  else:
+    return await queryEachImpl(
+      conn, sql, params, paramOids, paramFormats, callback, resultFormats
+    )
+
+proc queryEach*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    callback: RowCallback,
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  ## Execute a query with typed parameters, invoking `callback` once per row.
+  ## Returns the number of rows processed.
+  if timeout > ZeroDuration:
+    try:
+      return await queryEachImpl(conn, sql, params, callback, resultFormats, timeout)
+        .wait(timeout)
+    except AsyncTimeoutError:
+      conn.state = csClosed
+      raise newException(PgError, "queryEach timed out")
+  else:
+    return await queryEachImpl(conn, sql, params, callback, resultFormats)
+
 proc query*(
     conn: PgConnection,
     sql: string,
