@@ -118,7 +118,7 @@ type
       socket*: AsyncSocket
     sslEnabled*: bool
     recvBuf*: seq[byte]
-    recvBufStart: int ## Read pointer into recvBuf; bytes before this are consumed
+    recvBufStart*: int ## Read pointer into recvBuf; bytes before this are consumed
     state*: PgConnState
     pid*: int32
     secretKey*: int32
@@ -221,9 +221,19 @@ else:
   type CopyInCallback* = proc(): Future[seq[byte]] {.gcsafe.}
     ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
 
-const RecvBufSize = 32768 ## Size of the temporary read buffer for recv operations
+when hasChronos:
+  type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
+    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
+    ## inside the callback — its backing buffer is reused for the next row.
 
-proc dispatchNotification(conn: PgConnection, msg: BackendMessage) =
+else:
+  type RowCallback* = proc(row: Row) {.gcsafe.}
+    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
+    ## inside the callback — its backing buffer is reused for the next row.
+
+const RecvBufSize = 131072 ## Size of the temporary read buffer for recv operations
+
+proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) =
   let notif = Notification(
     pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
   )
@@ -241,7 +251,7 @@ proc dispatchNotification(conn: PgConnection, msg: BackendMessage) =
   if conn.notifyCallback != nil:
     conn.notifyCallback(notif)
 
-proc dispatchNotice(conn: PgConnection, msg: BackendMessage) =
+proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) =
   if conn.noticeCallback != nil:
     conn.noticeCallback(Notice(fields: msg.noticeFields))
 
