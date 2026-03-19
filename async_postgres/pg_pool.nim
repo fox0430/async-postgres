@@ -347,6 +347,42 @@ proc query*(
     await pool.resetSession(conn)
     pool.release(conn)
 
+proc queryEach*(
+    pool: PgPool,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32] = @[],
+    paramFormats: seq[int16] = @[],
+    callback: RowCallback,
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  ## Execute a query using a pooled connection, invoking `callback` once per row.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryEach(
+      sql, params, paramOids, paramFormats, callback, resultFormats, timeout
+    )
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
+proc queryEach*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    callback: RowCallback,
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[int64] {.async.} =
+  ## Execute a query with typed parameters using a pooled connection, invoking `callback` once per row.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryEach(sql, params, callback, resultFormats, timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
 proc queryOne*(
     pool: PgPool,
     sql: string,
