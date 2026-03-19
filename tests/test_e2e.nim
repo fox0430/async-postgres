@@ -207,6 +207,23 @@ suite "E2E: Simple Query Protocol":
 
     waitFor t()
 
+  test "invalid SQL raises PgQueryError with SQLSTATE":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sqlState = ""
+      var severity = ""
+      try:
+        discard await conn.simpleQuery("SELECT FROM nonexistent_table_xyz")
+      except PgQueryError as e:
+        sqlState = e.sqlState
+        severity = e.severity
+      doAssert sqlState.len == 5, "expected 5-char SQLSTATE, got: " & sqlState
+      doAssert severity == "ERROR"
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Extended Query Protocol":
   test "exec CREATE TABLE and INSERT":
     proc t() {.async.} =
@@ -5457,5 +5474,171 @@ suite "E2E: queryEach":
       doAssert rowCount == 5
       doAssert sum == 15
       await pool.close()
+
+    waitFor t()
+
+suite "E2E: Error type granularity":
+  test "invalid SQL via exec raises PgQueryError with SQLSTATE":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sqlState = ""
+      var detail = ""
+      try:
+        discard await conn.exec("INSERT INTO nonexistent_tbl VALUES (1)")
+      except PgQueryError as e:
+        sqlState = e.sqlState
+        detail = e.detail
+      doAssert sqlState == "42P01" # undefined_table
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "syntax error via query raises PgQueryError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sqlState = ""
+      try:
+        discard await conn.query("SELECTT 1")
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == "42601" # syntax_error
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "PgQueryError is catchable as PgError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var caught = false
+      try:
+        discard await conn.exec("INSERT INTO nonexistent_tbl VALUES (1)")
+      except PgError:
+        caught = true
+      doAssert caught
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "wrong password raises PgConnectionError":
+    proc t() {.async.} =
+      let badConfig = ConnConfig(
+        host: PgHost,
+        port: PgPort,
+        user: PgUser,
+        password: "wrong_password",
+        database: PgDatabase,
+        sslMode: sslDisable,
+      )
+      var caught = false
+      try:
+        let conn = await connect(badConfig)
+        await conn.close()
+      except PgConnectionError:
+        caught = true
+      except PgError:
+        discard
+      doAssert caught
+
+    waitFor t()
+
+  test "connection to bad host raises PgConnectionError":
+    proc t() {.async.} =
+      let badConfig = ConnConfig(
+        host: "127.0.0.1",
+        port: 1, # unlikely to have a PG server
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslDisable,
+      )
+      var caught = false
+      try:
+        let conn = await connect(badConfig)
+        await conn.close()
+      except PgConnectionError:
+        caught = true
+      except CatchableError:
+        discard
+      doAssert caught
+
+    waitFor t()
+
+  test "PgConnectionError is catchable as PgError":
+    proc t() {.async.} =
+      let badConfig = ConnConfig(
+        host: PgHost,
+        port: PgPort,
+        user: PgUser,
+        password: "wrong_password",
+        database: PgDatabase,
+        sslMode: sslDisable,
+      )
+      var caught = false
+      try:
+        let conn = await connect(badConfig)
+        await conn.close()
+      except PgError:
+        caught = true
+      doAssert caught
+
+    waitFor t()
+
+  test "exec timeout raises PgTimeoutError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var caught = false
+      try:
+        discard await conn.exec("SELECT pg_sleep(10)", timeout = milliseconds(50))
+      except PgTimeoutError:
+        caught = true
+      except PgError:
+        discard
+      doAssert caught
+      # Connection should be closed after timeout
+      doAssert conn.state == csClosed
+
+    waitFor t()
+
+  test "PgTimeoutError is catchable as PgError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var caught = false
+      try:
+        discard await conn.exec("SELECT pg_sleep(10)", timeout = milliseconds(50))
+      except PgError:
+        caught = true
+      doAssert caught
+
+    waitFor t()
+
+  test "PgQueryError fields populated for constraint violation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_err_types")
+      discard await conn.exec(
+        "CREATE TABLE test_err_types (id int PRIMARY KEY, val text NOT NULL)"
+      )
+      discard await conn.exec(
+        "INSERT INTO test_err_types VALUES ($1, $2)", pgParams(1'i32, "hello")
+      )
+
+      var sqlState = ""
+      var detail = ""
+      try:
+        discard await conn.exec(
+          "INSERT INTO test_err_types VALUES ($1, $2)", pgParams(1'i32, "duplicate")
+        )
+      except PgQueryError as e:
+        sqlState = e.sqlState
+        detail = e.detail
+
+      doAssert sqlState == "23505" # unique_violation
+      doAssert detail.len > 0
+
+      discard await conn.exec("DROP TABLE test_err_types")
+      await conn.close()
 
     waitFor t()

@@ -852,3 +852,62 @@ when hasChronos:
         await cancelAndWait(pool.maintenanceTask)
 
       waitFor t()
+
+suite "Error type granularity":
+  test "closed pool raises PgPoolError":
+    let pool = makePool()
+    pool.closed = true
+    var caught = false
+    try:
+      discard waitFor pool.acquire()
+    except PgPoolError:
+      caught = true
+    except PgError:
+      discard
+    check caught
+
+  test "maxWaiters full raises PgPoolError":
+    let pool = makePool(maxSize = 1)
+    pool.config.maxWaiters = 1
+    pool.active = 1
+
+    discard pool.acquire() # fills the waiter queue
+
+    var caught = false
+    try:
+      discard waitFor pool.acquire()
+    except PgPoolError:
+      caught = true
+    except PgError:
+      discard
+    check caught
+
+    # Clean up
+    pool.release(mockConn())
+
+  test "acquire timeout raises PgPoolError":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.acquireTimeout = milliseconds(50)
+      pool.active = 1
+
+      var caught = false
+      try:
+        discard await pool.acquire()
+      except PgPoolError:
+        caught = true
+      except PgError:
+        discard
+      doAssert caught
+
+    waitFor t()
+
+  test "PgPoolError is catchable as PgError":
+    let pool = makePool()
+    pool.closed = true
+    var caught = false
+    try:
+      discard waitFor pool.acquire()
+    except PgError:
+      caught = true
+    check caught
