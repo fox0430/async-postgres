@@ -21,7 +21,7 @@ Async PostgreSQL client in Nim.
 - LISTEN/NOTIFY with auto-reconnect
 
 ### Types
-- Typed parameters (`toPgParam`) and row accessors (`getStr`, `getInt`, ...)
+- Typed parameters (`pgParams` / `toPgParam`) and row accessors (`getStr`, `getInt`, ...)
 - Array types with binary format support
 - Range and multirange types (`int4range`, `tsrange`, `daterange`, ...)
 - Composite types (user-defined row types via `pgComposite` macro)
@@ -54,14 +54,14 @@ proc main() {.async.} =
   # Insert and get affected row count
   let affected = await conn.execAffected(
     "INSERT INTO users (name, age) VALUES ($1, $2)",
-    @[toPgParam("Alice"), toPgParam(30'i32)],
+    pgParams("Alice", 30'i32),
   )
   echo "Inserted: ", affected
 
   # Query multiple rows
   let result = await conn.query(
     "SELECT id, name, age FROM users WHERE age > $1",
-    @[toPgParam(25'i32)],
+    pgParams(25'i32),
   )
   for row in result.rows:
     echo row.getStr(1), " age=", row.getInt(2)

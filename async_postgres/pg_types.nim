@@ -549,6 +549,21 @@ proc toPgParam*[T](v: Option[T]): PgParam =
     let proto = toPgParam(default(T))
     result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
 
+macro pgParams*(args: varargs[typed]): untyped =
+  ## Convert multiple values to a ``seq[PgParam]`` in one call.
+  ## At least one argument is required; for parameterless queries omit the
+  ## parameter argument entirely instead of calling ``pgParams()``.
+  ##
+  ## .. code-block:: nim
+  ##   await conn.query("SELECT * FROM users WHERE age > $1 AND name = $2",
+  ##     pgParams(25'i32, "Alice"))
+  result = newNimNode(nnkPrefix)
+  result.add(ident"@")
+  let bracket = newNimNode(nnkBracket)
+  for arg in args:
+    bracket.add(newCall(bindSym"toPgParam", arg))
+  result.add(bracket)
+
 proc toPgBinaryParam*(v: string): PgParam =
   ## Convert a Nim value to a PgParam using binary format.
   ## Prefer this over `toPgParam` when binary format is needed for all types.
