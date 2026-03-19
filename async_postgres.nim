@@ -22,13 +22,13 @@
 ##     # Execute with typed parameters
 ##     discard await conn.exec(
 ##       "INSERT INTO users (name, age) VALUES ($1, $2)",
-##       @[toPgParam("Alice"), toPgParam(30'i32)],
+##       pgParams("Alice", 30'i32),
 ##     )
 ##
 ##     # Query rows
 ##     let result = await conn.query(
 ##       "SELECT id, name, age FROM users WHERE age > $1",
-##       @[toPgParam(25'i32)],
+##       pgParams(25'i32),
 ##     )
 ##     for row in result:
 ##       echo row.getStr(1), " age=", row.getInt(2)
