@@ -368,6 +368,7 @@ template queryRecvLoop(
         )
       else:
         conn.rowDataBuf = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+      conn.rowDataBuf.fields = qr.fields
       qr.data = conn.rowDataBuf
 
   block recvLoop:
@@ -402,6 +403,7 @@ template queryRecvLoop(
             conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len), cf, co)
           else:
             conn.rowDataBuf = newRowData(int16(qr.fields.len), cf, co)
+          conn.rowDataBuf.fields = qr.fields
           qr.data = conn.rowDataBuf
         of bmkNoData:
           discard
@@ -577,6 +579,7 @@ template queryEachRecvLoop(
       rd = newRowData(int16(cachedFields.len), cachedColFmts, cachedColOids)
     else:
       rd = newRowData(int16(cachedFields.len))
+    rd.fields = cachedFields
     if resultFormats.len > 0 and cachedColFmts.len > 0:
       for i in 0 ..< cachedFields.len:
         rd.colFormats[i] = cachedColFmts[i]
@@ -637,6 +640,7 @@ template queryEachRecvLoop(
           else:
             cachedFields = msg.fields
           rd = newRowData(int16(cachedFields.len), cf, co)
+          rd.fields = cachedFields
         of bmkNoData:
           discard
         of bmkCommandComplete:
@@ -895,6 +899,8 @@ proc queryOne*(
   let qr =
     await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
   if qr.rowCount > 0:
+    if qr.fields.len > 0 and qr.data.fields.len == 0:
+      qr.data.fields = qr.fields
     return some(Row(data: qr.data, rowIdx: 0))
   else:
     return none(Row)
@@ -2418,6 +2424,8 @@ proc fetchNextImpl(
           discard
       await conn.fillRecvBuf(timeout)
 
+  if rd != nil and cursor.fields.len > 0 and rd.fields.len == 0:
+    rd.fields = cursor.fields
   result = newSeq[Row](rowCount)
   for i in 0 ..< rowCount:
     result[i] = Row(data: rd, rowIdx: i)
@@ -2427,6 +2435,8 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Returns an empty seq when the cursor is exhausted.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if cursor.bufferedCount > 0:
+    if cursor.fields.len > 0 and cursor.bufferedData.fields.len == 0:
+      cursor.bufferedData.fields = cursor.fields
     result = newSeq[Row](cursor.bufferedCount)
     for i in 0 ..< cursor.bufferedCount:
       result[i] = Row(data: cursor.bufferedData, rowIdx: i)

@@ -144,6 +144,7 @@ type
     numCols*: int16
     colFormats*: seq[int16] ## Per-column format codes (0=text, 1=binary)
     colTypeOids*: seq[int32] ## Per-column type OIDs for binary→text conversion
+    fields*: seq[FieldDescription] ## Column metadata for name-based access
 
   Row* = object ## Lightweight view into a single row within a `RowData` buffer.
     data*: RowData
