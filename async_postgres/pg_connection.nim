@@ -220,6 +220,8 @@ proc rows*(qr: QueryResult): seq[Row] =
   ## Return all rows as lightweight Row views into the flat buffer.
   if qr.data == nil:
     return @[]
+  if qr.fields.len > 0 and qr.data.fields.len == 0:
+    qr.data.fields = qr.fields
   result = newSeq[Row](qr.rowCount)
   for i in 0 ..< qr.rowCount:
     result[i] = Row(data: qr.data, rowIdx: i)
@@ -227,6 +229,8 @@ proc rows*(qr: QueryResult): seq[Row] =
 iterator items*(qr: QueryResult): Row =
   ## Iterate over all rows in the query result.
   if qr.data != nil:
+    if qr.fields.len > 0 and qr.data.fields.len == 0:
+      qr.data.fields = qr.fields
     for i in 0 ..< qr.rowCount:
       yield Row(data: qr.data, rowIdx: i)
 

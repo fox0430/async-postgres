@@ -3983,3 +3983,318 @@ proc getDateMultirangeOpt*(
     none(PgMultirange[DateTime])
   else:
     some(row.getDateMultirange(col, fields))
+
+# Name-based column access
+
+proc columnIndex*(row: Row, name: string): int =
+  ## Find the index of a column by name using the field metadata attached to
+  ## the row's underlying ``RowData``.  Raises ``PgTypeError`` if the metadata
+  ## is not available (e.g. the Row was constructed manually) or the column
+  ## name is not found.
+  if row.data == nil or row.data.fields.len == 0:
+    raise newException(PgTypeError, "Column name lookup requires field metadata")
+  columnIndex(row.data.fields, name)
+
+proc isNull*(row: Row, name: string): bool =
+  ## Check if the named column value is NULL.
+  row.isNull(row.columnIndex(name))
+
+proc getStr*(row: Row, name: string): string =
+  ## Get a named column value as a string.
+  row.getStr(row.columnIndex(name))
+
+proc getInt*(row: Row, name: string): int32 =
+  ## Get a named column value as int32.
+  row.getInt(row.columnIndex(name))
+
+proc getInt64*(row: Row, name: string): int64 =
+  ## Get a named column value as int64.
+  row.getInt64(row.columnIndex(name))
+
+proc getFloat*(row: Row, name: string): float64 =
+  ## Get a named column value as float64.
+  row.getFloat(row.columnIndex(name))
+
+proc getBool*(row: Row, name: string): bool =
+  ## Get a named column value as bool.
+  row.getBool(row.columnIndex(name))
+
+proc getBytes*(row: Row, name: string): seq[byte] =
+  ## Get a named column value as raw bytes.
+  row.getBytes(row.columnIndex(name))
+
+proc getNumeric*(row: Row, name: string): PgNumeric =
+  ## Get a named column value as PgNumeric.
+  row.getNumeric(row.columnIndex(name))
+
+proc getTimestamp*(row: Row, name: string): DateTime =
+  ## Get a named column value as DateTime (timestamp).
+  row.getTimestamp(row.columnIndex(name))
+
+proc getDate*(row: Row, name: string): DateTime =
+  ## Get a named column value as DateTime (date).
+  row.getDate(row.columnIndex(name))
+
+proc getJson*(row: Row, name: string): JsonNode =
+  ## Get a named column value as JsonNode.
+  row.getJson(row.columnIndex(name))
+
+proc getInterval*(row: Row, name: string): PgInterval =
+  ## Get a named column value as PgInterval.
+  row.getInterval(row.columnIndex(name))
+
+proc getInet*(row: Row, name: string): PgInet =
+  ## Get a named column value as PgInet.
+  row.getInet(row.columnIndex(name))
+
+proc getCidr*(row: Row, name: string): PgCidr =
+  ## Get a named column value as PgCidr.
+  row.getCidr(row.columnIndex(name))
+
+proc getMacAddr*(row: Row, name: string): PgMacAddr =
+  ## Get a named column value as PgMacAddr.
+  row.getMacAddr(row.columnIndex(name))
+
+proc getMacAddr8*(row: Row, name: string): PgMacAddr8 =
+  ## Get a named column value as PgMacAddr8.
+  row.getMacAddr8(row.columnIndex(name))
+
+proc getPoint*(row: Row, name: string): PgPoint =
+  ## Get a named column value as PgPoint.
+  row.getPoint(row.columnIndex(name))
+
+proc getLine*(row: Row, name: string): PgLine =
+  ## Get a named column value as PgLine.
+  row.getLine(row.columnIndex(name))
+
+proc getLseg*(row: Row, name: string): PgLseg =
+  ## Get a named column value as PgLseg.
+  row.getLseg(row.columnIndex(name))
+
+proc getBox*(row: Row, name: string): PgBox =
+  ## Get a named column value as PgBox.
+  row.getBox(row.columnIndex(name))
+
+proc getPath*(row: Row, name: string): PgPath =
+  ## Get a named column value as PgPath.
+  row.getPath(row.columnIndex(name))
+
+proc getPolygon*(row: Row, name: string): PgPolygon =
+  ## Get a named column value as PgPolygon.
+  row.getPolygon(row.columnIndex(name))
+
+proc getCircle*(row: Row, name: string): PgCircle =
+  ## Get a named column value as PgCircle.
+  row.getCircle(row.columnIndex(name))
+
+# Optional variants
+
+proc getStrOpt*(row: Row, name: string): Option[string] =
+  ## Get a named column value as Option[string].
+  row.getStrOpt(row.columnIndex(name))
+
+proc getIntOpt*(row: Row, name: string): Option[int32] =
+  ## Get a named column value as Option[int32].
+  row.getIntOpt(row.columnIndex(name))
+
+proc getInt64Opt*(row: Row, name: string): Option[int64] =
+  ## Get a named column value as Option[int64].
+  row.getInt64Opt(row.columnIndex(name))
+
+proc getFloatOpt*(row: Row, name: string): Option[float64] =
+  ## Get a named column value as Option[float64].
+  row.getFloatOpt(row.columnIndex(name))
+
+proc getNumericOpt*(row: Row, name: string): Option[PgNumeric] =
+  ## Get a named column value as Option[PgNumeric].
+  row.getNumericOpt(row.columnIndex(name))
+
+proc getBoolOpt*(row: Row, name: string): Option[bool] =
+  ## Get a named column value as Option[bool].
+  row.getBoolOpt(row.columnIndex(name))
+
+proc getJsonOpt*(row: Row, name: string): Option[JsonNode] =
+  ## Get a named column value as Option[JsonNode].
+  row.getJsonOpt(row.columnIndex(name))
+
+proc getIntervalOpt*(row: Row, name: string): Option[PgInterval] =
+  ## Get a named column value as Option[PgInterval].
+  row.getIntervalOpt(row.columnIndex(name))
+
+proc getInetOpt*(row: Row, name: string): Option[PgInet] =
+  ## Get a named column value as Option[PgInet].
+  row.getInetOpt(row.columnIndex(name))
+
+proc getCidrOpt*(row: Row, name: string): Option[PgCidr] =
+  ## Get a named column value as Option[PgCidr].
+  row.getCidrOpt(row.columnIndex(name))
+
+proc getMacAddrOpt*(row: Row, name: string): Option[PgMacAddr] =
+  ## Get a named column value as Option[PgMacAddr].
+  row.getMacAddrOpt(row.columnIndex(name))
+
+proc getMacAddr8Opt*(row: Row, name: string): Option[PgMacAddr8] =
+  ## Get a named column value as Option[PgMacAddr8].
+  row.getMacAddr8Opt(row.columnIndex(name))
+
+proc getPointOpt*(row: Row, name: string): Option[PgPoint] =
+  ## Get a named column value as Option[PgPoint].
+  row.getPointOpt(row.columnIndex(name))
+
+proc getLineOpt*(row: Row, name: string): Option[PgLine] =
+  ## Get a named column value as Option[PgLine].
+  row.getLineOpt(row.columnIndex(name))
+
+proc getLsegOpt*(row: Row, name: string): Option[PgLseg] =
+  ## Get a named column value as Option[PgLseg].
+  row.getLsegOpt(row.columnIndex(name))
+
+proc getBoxOpt*(row: Row, name: string): Option[PgBox] =
+  ## Get a named column value as Option[PgBox].
+  row.getBoxOpt(row.columnIndex(name))
+
+proc getPathOpt*(row: Row, name: string): Option[PgPath] =
+  ## Get a named column value as Option[PgPath].
+  row.getPathOpt(row.columnIndex(name))
+
+proc getPolygonOpt*(row: Row, name: string): Option[PgPolygon] =
+  ## Get a named column value as Option[PgPolygon].
+  row.getPolygonOpt(row.columnIndex(name))
+
+proc getCircleOpt*(row: Row, name: string): Option[PgCircle] =
+  ## Get a named column value as Option[PgCircle].
+  row.getCircleOpt(row.columnIndex(name))
+
+# Array variants
+
+proc getIntArray*(row: Row, name: string): seq[int32] =
+  ## Get a named column value as seq[int32].
+  row.getIntArray(row.columnIndex(name))
+
+proc getInt16Array*(row: Row, name: string): seq[int16] =
+  ## Get a named column value as seq[int16].
+  row.getInt16Array(row.columnIndex(name))
+
+proc getInt64Array*(row: Row, name: string): seq[int64] =
+  ## Get a named column value as seq[int64].
+  row.getInt64Array(row.columnIndex(name))
+
+proc getFloatArray*(row: Row, name: string): seq[float64] =
+  ## Get a named column value as seq[float64].
+  row.getFloatArray(row.columnIndex(name))
+
+proc getFloat32Array*(row: Row, name: string): seq[float32] =
+  ## Get a named column value as seq[float32].
+  row.getFloat32Array(row.columnIndex(name))
+
+proc getBoolArray*(row: Row, name: string): seq[bool] =
+  ## Get a named column value as seq[bool].
+  row.getBoolArray(row.columnIndex(name))
+
+proc getStrArray*(row: Row, name: string): seq[string] =
+  ## Get a named column value as seq[string].
+  row.getStrArray(row.columnIndex(name))
+
+proc getIntArrayOpt*(row: Row, name: string): Option[seq[int32]] =
+  ## Get a named column value as Option[seq[int32]].
+  row.getIntArrayOpt(row.columnIndex(name))
+
+proc getInt16ArrayOpt*(row: Row, name: string): Option[seq[int16]] =
+  ## Get a named column value as Option[seq[int16]].
+  row.getInt16ArrayOpt(row.columnIndex(name))
+
+proc getInt64ArrayOpt*(row: Row, name: string): Option[seq[int64]] =
+  ## Get a named column value as Option[seq[int64]].
+  row.getInt64ArrayOpt(row.columnIndex(name))
+
+proc getFloatArrayOpt*(row: Row, name: string): Option[seq[float64]] =
+  ## Get a named column value as Option[seq[float64]].
+  row.getFloatArrayOpt(row.columnIndex(name))
+
+proc getFloat32ArrayOpt*(row: Row, name: string): Option[seq[float32]] =
+  ## Get a named column value as Option[seq[float32]].
+  row.getFloat32ArrayOpt(row.columnIndex(name))
+
+proc getBoolArrayOpt*(row: Row, name: string): Option[seq[bool]] =
+  ## Get a named column value as Option[seq[bool]].
+  row.getBoolArrayOpt(row.columnIndex(name))
+
+proc getStrArrayOpt*(row: Row, name: string): Option[seq[string]] =
+  ## Get a named column value as Option[seq[string]].
+  row.getStrArrayOpt(row.columnIndex(name))
+
+# Range variants
+
+proc getInt4Range*(row: Row, name: string): PgRange[int32] =
+  row.getInt4Range(row.columnIndex(name))
+
+proc getInt8Range*(row: Row, name: string): PgRange[int64] =
+  row.getInt8Range(row.columnIndex(name))
+
+proc getNumRange*(row: Row, name: string): PgRange[PgNumeric] =
+  row.getNumRange(row.columnIndex(name))
+
+proc getTsRange*(row: Row, name: string): PgRange[DateTime] =
+  row.getTsRange(row.columnIndex(name))
+
+proc getTsTzRange*(row: Row, name: string): PgRange[DateTime] =
+  row.getTsTzRange(row.columnIndex(name))
+
+proc getDateRange*(row: Row, name: string): PgRange[DateTime] =
+  row.getDateRange(row.columnIndex(name))
+
+proc getInt4RangeOpt*(row: Row, name: string): Option[PgRange[int32]] =
+  row.getInt4RangeOpt(row.columnIndex(name))
+
+proc getInt8RangeOpt*(row: Row, name: string): Option[PgRange[int64]] =
+  row.getInt8RangeOpt(row.columnIndex(name))
+
+proc getNumRangeOpt*(row: Row, name: string): Option[PgRange[PgNumeric]] =
+  row.getNumRangeOpt(row.columnIndex(name))
+
+proc getTsRangeOpt*(row: Row, name: string): Option[PgRange[DateTime]] =
+  row.getTsRangeOpt(row.columnIndex(name))
+
+proc getTsTzRangeOpt*(row: Row, name: string): Option[PgRange[DateTime]] =
+  row.getTsTzRangeOpt(row.columnIndex(name))
+
+proc getDateRangeOpt*(row: Row, name: string): Option[PgRange[DateTime]] =
+  row.getDateRangeOpt(row.columnIndex(name))
+
+# Multirange variants
+
+proc getInt4Multirange*(row: Row, name: string): PgMultirange[int32] =
+  row.getInt4Multirange(row.columnIndex(name))
+
+proc getInt8Multirange*(row: Row, name: string): PgMultirange[int64] =
+  row.getInt8Multirange(row.columnIndex(name))
+
+proc getNumMultirange*(row: Row, name: string): PgMultirange[PgNumeric] =
+  row.getNumMultirange(row.columnIndex(name))
+
+proc getTsMultirange*(row: Row, name: string): PgMultirange[DateTime] =
+  row.getTsMultirange(row.columnIndex(name))
+
+proc getTsTzMultirange*(row: Row, name: string): PgMultirange[DateTime] =
+  row.getTsTzMultirange(row.columnIndex(name))
+
+proc getDateMultirange*(row: Row, name: string): PgMultirange[DateTime] =
+  row.getDateMultirange(row.columnIndex(name))
+
+proc getInt4MultirangeOpt*(row: Row, name: string): Option[PgMultirange[int32]] =
+  row.getInt4MultirangeOpt(row.columnIndex(name))
+
+proc getInt8MultirangeOpt*(row: Row, name: string): Option[PgMultirange[int64]] =
+  row.getInt8MultirangeOpt(row.columnIndex(name))
+
+proc getNumMultirangeOpt*(row: Row, name: string): Option[PgMultirange[PgNumeric]] =
+  row.getNumMultirangeOpt(row.columnIndex(name))
+
+proc getTsMultirangeOpt*(row: Row, name: string): Option[PgMultirange[DateTime]] =
+  row.getTsMultirangeOpt(row.columnIndex(name))
+
+proc getTsTzMultirangeOpt*(row: Row, name: string): Option[PgMultirange[DateTime]] =
+  row.getTsTzMultirangeOpt(row.columnIndex(name))
+
+proc getDateMultirangeOpt*(row: Row, name: string): Option[PgMultirange[DateTime]] =
+  row.getDateMultirangeOpt(row.columnIndex(name))
