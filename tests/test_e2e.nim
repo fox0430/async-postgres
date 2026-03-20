@@ -576,7 +576,7 @@ suite "E2E: Connection Pool":
       await sleepAsync(milliseconds(500))
 
       # Pool should have cleaned up idle connections
-      doAssert pool.idle.len == 0
+      doAssert pool.idleCount == 0
 
       await pool.close()
 
@@ -601,13 +601,13 @@ suite "E2E: Connection Pool":
       pool.release(c1)
       pool.release(c2)
       pool.release(c3)
-      doAssert pool.idle.len == 3
+      doAssert pool.idleCount == 3
 
       # Wait for idleTimeout + maintenance cycles
       await sleepAsync(milliseconds(500))
 
       # Should shrink to minSize, not below
-      doAssert pool.idle.len == 2
+      doAssert pool.idleCount == 2
 
       await pool.close()
 
@@ -2523,12 +2523,12 @@ suite "E2E: Pool minSize Replenishment":
         )
       )
 
-      doAssert pool.idle.len == 2
+      doAssert pool.idleCount == 2
 
       # Wait for maxLifetime to expire + maintenance to clean + replenish
       await sleepAsync(milliseconds(600))
 
-      doAssert pool.idle.len == 2
+      doAssert pool.idleCount == 2
 
       # Verify replenished connections are functional
       let conn = await pool.acquire()

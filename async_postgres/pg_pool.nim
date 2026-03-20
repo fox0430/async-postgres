@@ -28,24 +28,24 @@ type
       ## "RESET ALL" (reset session parameters only).
       ## On failure, the connection is discarded.
 
-  PooledConn* = object
+  PooledConn = object
     ## An idle connection held by the pool with its last-used timestamp.
-    conn*: PgConnection
-    lastUsedAt*: Moment
+    conn: PgConnection
+    lastUsedAt: Moment
 
-  Waiter* = ref object
-    fut*: Future[PgConnection]
-    cancelled*: bool
+  Waiter = ref object
+    fut: Future[PgConnection]
+    cancelled: bool
 
   PgPool* = ref object ## Connection pool that manages a set of PostgreSQL connections.
-    config*: PoolConfig
-    idle*: Deque[PooledConn]
-    active*: int
-    waiters*: Deque[Waiter]
-    waiterCount*: int ## Number of non-cancelled waiters
-    closed*: bool
-    maintenanceTask*: Future[void]
-    cachedNow*: Moment
+    config: PoolConfig
+    idle: Deque[PooledConn]
+    active: int
+    waiters: Deque[Waiter]
+    waiterCount: int ## Number of non-cancelled waiters
+    closed: bool
+    maintenanceTask: Future[void]
+    cachedNow: Moment
       ## Updated on acquire(); reused by release() to avoid extra syscalls
 
 proc initPoolConfig*(
@@ -75,6 +75,30 @@ proc initPoolConfig*(
     acquireTimeout: acquireTimeout,
     resetQuery: resetQuery,
   )
+
+proc poolConfig*(pool: PgPool): PoolConfig =
+  ## The pool configuration.
+  pool.config
+
+proc idleCount*(pool: PgPool): int =
+  ## Number of idle connections currently in the pool.
+  pool.idle.len
+
+proc activeCount*(pool: PgPool): int =
+  ## Number of connections currently checked out from the pool.
+  pool.active
+
+proc size*(pool: PgPool): int =
+  ## Total number of connections (idle + active).
+  pool.idle.len + pool.active
+
+proc pendingAcquires*(pool: PgPool): int =
+  ## Number of non-cancelled waiters queued for a connection.
+  pool.waiterCount
+
+proc isClosed*(pool: PgPool): bool =
+  ## Whether the pool has been closed.
+  pool.closed
 
 proc closeNoWait(conn: PgConnection) =
   ## Schedule connection close without waiting. For use in non-async contexts.

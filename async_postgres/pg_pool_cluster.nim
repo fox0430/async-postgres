@@ -12,11 +12,27 @@ type
     ## Read queries (`query*`) are routed to the replica pool, while write
     ## operations (`exec*`, `*InTransaction`, `notify`) go to the primary pool.
     ##
-    ## For transactions, use `cluster.primary.withTransaction` directly.
-    primary*: PgPool
-    replica*: PgPool
-    fallback*: ReplicaFallback
-    closed*: bool
+    ## For transactions, use `cluster.primaryPool.withTransaction` directly.
+    primary: PgPool
+    replica: PgPool
+    fallback: ReplicaFallback
+    closed: bool
+
+proc primaryPool*(cluster: PgPoolCluster): PgPool =
+  ## The primary (read-write) pool.
+  cluster.primary
+
+proc replicaPool*(cluster: PgPoolCluster): PgPool =
+  ## The replica (read-only) pool.
+  cluster.replica
+
+proc replicaFallback*(cluster: PgPoolCluster): ReplicaFallback =
+  ## The configured replica fallback behavior.
+  cluster.fallback
+
+proc isClosed*(cluster: PgPoolCluster): bool =
+  ## Whether the cluster has been closed.
+  cluster.closed
 
 proc newPoolCluster*(
     primaryConfig: PoolConfig, replicaConfig: PoolConfig, fallback = rfNone
