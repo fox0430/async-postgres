@@ -1659,6 +1659,45 @@ proc parseUriDsn(dsn: string): ConnConfig =
       let val = decodeUrl(pair[epos + 1 .. ^1])
       result.applyParam(key, val)
 
+proc initConnConfig*(
+    host = "127.0.0.1",
+    port = 5432,
+    user = "",
+    password = "",
+    database = "",
+    sslMode = sslDisable,
+    sslRootCert = "",
+    applicationName = "",
+    connectTimeout = ZeroDuration,
+    keepAlive = true,
+    keepAliveIdle = 0,
+    keepAliveInterval = 0,
+    keepAliveCount = 0,
+    hosts: seq[HostEntry] = @[],
+    targetSessionAttrs = tsaAny,
+    extraParams: seq[(string, string)] = @[],
+): ConnConfig =
+  ## Create a connection configuration with sensible defaults.
+  ## For DSN-based configuration, use `parseDsn` instead.
+  ConnConfig(
+    host: host,
+    port: port,
+    user: user,
+    password: password,
+    database: database,
+    sslMode: sslMode,
+    sslRootCert: sslRootCert,
+    applicationName: applicationName,
+    connectTimeout: connectTimeout,
+    keepAlive: keepAlive,
+    keepAliveIdle: keepAliveIdle,
+    keepAliveInterval: keepAliveInterval,
+    keepAliveCount: keepAliveCount,
+    hosts: hosts,
+    targetSessionAttrs: targetSessionAttrs,
+    extraParams: extraParams,
+  )
+
 proc parseDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL connection string into a ConnConfig.
   ##

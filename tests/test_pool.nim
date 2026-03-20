@@ -40,6 +40,83 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
 proc toPooled(conn: PgConnection): PooledConn =
   PooledConn(conn: conn, lastUsedAt: Moment.now())
 
+suite "initConnConfig":
+  test "defaults":
+    let cfg = initConnConfig()
+    check cfg.host == "127.0.0.1"
+    check cfg.port == 5432
+    check cfg.user == ""
+    check cfg.password == ""
+    check cfg.database == ""
+    check cfg.sslMode == sslDisable
+    check cfg.sslRootCert == ""
+    check cfg.applicationName == ""
+    check cfg.connectTimeout == ZeroDuration
+    check cfg.keepAlive == true
+    check cfg.keepAliveIdle == 0
+    check cfg.keepAliveInterval == 0
+    check cfg.keepAliveCount == 0
+    check cfg.hosts.len == 0
+    check cfg.targetSessionAttrs == tsaAny
+    check cfg.extraParams.len == 0
+
+  test "custom overrides":
+    let cfg = initConnConfig(
+      host = "db.example.com",
+      port = 15432,
+      user = "admin",
+      password = "secret",
+      database = "mydb",
+      sslMode = sslRequire,
+      applicationName = "myapp",
+      keepAlive = false,
+      targetSessionAttrs = tsaPrimary,
+    )
+    check cfg.host == "db.example.com"
+    check cfg.port == 15432
+    check cfg.user == "admin"
+    check cfg.password == "secret"
+    check cfg.database == "mydb"
+    check cfg.sslMode == sslRequire
+    check cfg.applicationName == "myapp"
+    check cfg.keepAlive == false
+    check cfg.targetSessionAttrs == tsaPrimary
+    # Non-overridden fields keep defaults
+    check cfg.sslRootCert == ""
+    check cfg.connectTimeout == ZeroDuration
+    check cfg.keepAliveIdle == 0
+
+  test "with multi-host":
+    let cfg = initConnConfig(
+      hosts = @[
+        HostEntry(host: "primary.db", port: 5432),
+        HostEntry(host: "replica.db", port: 5433),
+      ],
+      targetSessionAttrs = tsaPreferStandby,
+    )
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].host == "primary.db"
+    check cfg.hosts[0].port == 5432
+    check cfg.hosts[1].host == "replica.db"
+    check cfg.hosts[1].port == 5433
+    check cfg.targetSessionAttrs == tsaPreferStandby
+
+  test "with extra params":
+    let cfg = initConnConfig(
+      extraParams = @[("statement_timeout", "5000"), ("lock_timeout", "3000")]
+    )
+    check cfg.extraParams.len == 2
+    check cfg.extraParams[0] == ("statement_timeout", "5000")
+    check cfg.extraParams[1] == ("lock_timeout", "3000")
+
+  test "composable with initPoolConfig":
+    let connCfg = initConnConfig(host = "localhost", user = "test", database = "test")
+    let poolCfg = initPoolConfig(connCfg, minSize = 2, maxSize = 5)
+    check poolCfg.connConfig.host == "localhost"
+    check poolCfg.connConfig.user == "test"
+    check poolCfg.minSize == 2
+    check poolCfg.maxSize == 5
+
 suite "initPoolConfig":
   test "defaults":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
