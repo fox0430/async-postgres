@@ -1,6 +1,8 @@
 import std/[deques, macros, options]
 
-import async_backend, pg_protocol, pg_connection, pg_client, pg_types
+import async_backend, pg_protocol, pg_connection, pg_types
+
+import pg_client {.all.}
 
 type
   PoolConfig* = object
@@ -315,7 +317,7 @@ template withConnection*(pool: PgPool, conn, body: untyped) =
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc exec*(
+proc exec(
     pool: PgPool,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -329,7 +331,7 @@ proc exec*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc query*(
+proc query(
     pool: PgPool,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -346,7 +348,10 @@ proc query*(
     pool.release(conn)
 
 proc exec*(
-    pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   ## Execute a statement with typed parameters using a pooled connection.
   let conn = await pool.acquire()
@@ -359,7 +364,7 @@ proc exec*(
 proc query*(
     pool: PgPool,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
@@ -550,7 +555,7 @@ proc simpleExec*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc execInTransaction*(
+proc execInTransaction(
     pool: PgPool,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -577,7 +582,7 @@ proc execInTransaction*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryInTransaction*(
+proc queryInTransaction(
     pool: PgPool,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
