@@ -11,6 +11,7 @@ import ../async_postgres/pg_pool {.all.}
 privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
+privateAccess(Waiter)
 
 proc mockConn(state: PgConnState = csReady): PgConnection =
   result = PgConnection(

@@ -9,6 +9,7 @@ import ../async_postgres/pg_pool_cluster {.all.}
 privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
+privateAccess(Waiter)
 privateAccess(PgPoolCluster)
 
 proc mockConn(state: PgConnState = csReady): PgConnection =
