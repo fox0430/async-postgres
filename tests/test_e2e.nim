@@ -54,40 +54,6 @@ proc toString(b: seq[byte]): string =
   if b.len > 0:
     copyMem(addr result[0], unsafeAddr b[0], b.len)
 
-template makeCopyOutCallback(body: untyped): CopyOutCallback =
-  block:
-    when hasChronos:
-      let r: CopyOutCallback = proc(
-          data {.inject.}: seq[byte]
-      ) {.async: (raises: [CatchableError]).} =
-        body
-      r
-    else:
-      let r: CopyOutCallback = proc(data {.inject.}: seq[byte]) {.async.} =
-        body
-      r
-
-template makeCopyInCallback(body: untyped): CopyInCallback =
-  block:
-    when hasChronos:
-      let r: CopyInCallback = proc(): Future[seq[byte]] {.
-          async: (raises: [CatchableError])
-      .} =
-        body
-      r
-    else:
-      # Manual Future construction: asyncdispatch's {.async.} doesn't support
-      # non-void return types on anonymous procs. Body must be synchronous (no await).
-      let r: CopyInCallback = proc(): Future[seq[byte]] {.gcsafe.} =
-        let fut = newFuture[seq[byte]]("copyInCallback")
-        try:
-          let res: seq[byte] = body
-          fut.complete(res)
-        except CatchableError as e:
-          fut.fail(e)
-        return fut
-      r
-
 suite "E2E: Basic Connection":
   test "plain connection and close":
     proc t() {.async.} =

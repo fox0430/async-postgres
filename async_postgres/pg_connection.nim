@@ -254,6 +254,64 @@ else:
   type CopyInCallback* = proc(): Future[seq[byte]] {.gcsafe.}
     ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
 
+template makeCopyOutCallback*(body: untyped): CopyOutCallback =
+  ## Create a ``CopyOutCallback`` that works with both asyncdispatch and chronos.
+  ## Inside ``body``, the current chunk is available as ``data: seq[byte]``.
+  ##
+  ## .. code-block:: nim
+  ##   var chunks: seq[seq[byte]]
+  ##   let cb = makeCopyOutCallback:
+  ##     chunks.add(data)
+  block:
+    when hasChronos:
+      let r: CopyOutCallback = proc(
+          data {.inject.}: seq[byte]
+      ) {.async: (raises: [CatchableError]).} =
+        body
+      r
+    else:
+      let r: CopyOutCallback = proc(data {.inject.}: seq[byte]) {.async.} =
+        body
+      r
+
+template makeCopyInCallback*(body: untyped): CopyInCallback =
+  ## Create a ``CopyInCallback`` that works with both asyncdispatch and chronos.
+  ## ``body`` must evaluate to ``seq[byte]``. Return an empty seq to signal completion.
+  ##
+  ## With asyncdispatch, anonymous async procs cannot return non-void types,
+  ## so this template wraps the body in manual ``Future`` construction.
+  ##
+  ## .. code-block:: nim
+  ##   var idx = 0
+  ##   let rows = @["1\tAlice\n".toBytes(), "2\tBob\n".toBytes()]
+  ##   let cb = makeCopyInCallback:
+  ##     if idx < rows.len:
+  ##       let chunk = rows[idx]
+  ##       inc idx
+  ##       chunk
+  ##     else:
+  ##       newSeq[byte]()
+  block:
+    when hasChronos:
+      let r: CopyInCallback = proc(): Future[seq[byte]] {.
+          async: (raises: [CatchableError])
+      .} =
+        body
+      r
+    else:
+      # asyncdispatch's {.async.} doesn't support non-void return types on
+      # anonymous procs. Wrap in manual Future construction instead.
+      # Note: body must be synchronous (no await).
+      let r: CopyInCallback = proc(): Future[seq[byte]] {.gcsafe.} =
+        let fut = newFuture[seq[byte]]("makeCopyInCallback")
+        try:
+          let res: seq[byte] = body
+          fut.complete(res)
+        except CatchableError as e:
+          fut.fail(e)
+        return fut
+      r
+
 when hasChronos:
   type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
     ## Callback invoked once per row during `queryEach`. The `Row` is only valid
