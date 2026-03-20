@@ -4131,6 +4131,87 @@ suite "E2E: Column Name Access":
 
     waitFor t()
 
+  test "name-based row accessors via rows()":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query(
+        "SELECT 42::int4 AS id, 'alice'::text AS name, true::bool AS active, 3.14::float8 AS score"
+      )
+      doAssert res.rows.len == 1
+      let row = res.rows[0]
+      doAssert row.getInt("id") == 42'i32
+      doAssert row.getStr("name") == "alice"
+      doAssert row.getBool("active") == true
+      doAssert abs(row.getFloat("score") - 3.14) < 0.001
+      doAssert row.isNull("name") == false
+      await conn.close()
+
+    waitFor t()
+
+  test "name-based row accessors via items iterator":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT 1::int4 AS v UNION ALL SELECT 2 UNION ALL SELECT 3")
+      var vals: seq[int32]
+      for row in res:
+        vals.add(row.getInt("v"))
+      doAssert vals == @[1'i32, 2'i32, 3'i32]
+      await conn.close()
+
+    waitFor t()
+
+  test "name-based Opt accessors":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT 10::int4 AS a, NULL::text AS b")
+      let row = res.rows[0]
+      doAssert row.getIntOpt("a") == some(10'i32)
+      doAssert row.getStrOpt("b").isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "name-based queryOne accessors":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let rowOpt = await conn.queryOne("SELECT 99::int8 AS big, 'hello'::text AS msg")
+      doAssert rowOpt.isSome
+      let row = rowOpt.get
+      doAssert row.getInt64("big") == 99'i64
+      doAssert row.getStr("msg") == "hello"
+      await conn.close()
+
+    waitFor t()
+
+  test "name-based accessor raises on missing column":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT 1::int4 AS x")
+      let row = res.rows[0]
+      var raised = false
+      try:
+        discard row.getStr("nonexistent")
+      except PgTypeError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "name-based accessor raises without field metadata":
+    proc t() {.async.} =
+      # Row constructed manually without fields
+      let row: Row = @[some(@[byte(49)])]
+      var raised = false
+      try:
+        discard row.getStr("x")
+      except PgTypeError:
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
 suite "E2E: Convenience Query Methods":
   test "queryOne returns first row":
     proc t() {.async.} =
