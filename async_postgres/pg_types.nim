@@ -1332,121 +1332,52 @@ proc getCircle*(row: Row, col: int): PgCircle =
   PgCircle(center: center, radius: radius)
 
 # NULL-safe Option accessors — return `none` for NULL instead of raising.
+#
+# Template helpers used throughout this module to eliminate boilerplate for
+# delegation-only accessor overloads.  Each template generates a public proc
+# whose body simply delegates to an existing overload with different parameter
+# types.
 
-proc getStrOpt*(row: Row, col: int): Option[string] =
-  ## Get a column value as ``Option[string]``. Returns none if NULL.
-  if row.isNull(col):
-    none(string)
-  else:
-    some(row.getStr(col))
+template optAccessor(getProc, optProc: untyped, T: typedesc) =
+  ## Generate ``optProc*(row, col): Option[T]`` that delegates to ``getProc``.
+  proc optProc*(row: Row, col: int): Option[T] =
+    if row.isNull(col):
+      none(T)
+    else:
+      some(row.getProc(col))
 
-proc getIntOpt*(row: Row, col: int): Option[int32] =
-  if row.isNull(col):
-    none(int32)
-  else:
-    some(row.getInt(col))
+template optFieldsAccessor(getProc, optProc: untyped, T: typedesc) =
+  ## Generate ``optProc*(row, col, fields): Option[T]`` that delegates to ``getProc``.
+  proc optProc*(row: Row, col: int, fields: seq[FieldDescription]): Option[T] =
+    if row.isNull(col):
+      none(T)
+    else:
+      some(row.getProc(col, fields))
 
-proc getInt64Opt*(row: Row, col: int): Option[int64] =
-  if row.isNull(col):
-    none(int64)
-  else:
-    some(row.getInt64(col))
+template nameAccessor(getProc: untyped, T: typedesc) =
+  ## Generate ``getProc*(row, name): T`` that delegates to the index-based overload.
+  proc getProc*(row: Row, name: string): T =
+    row.getProc(row.columnIndex(name))
 
-proc getFloatOpt*(row: Row, col: int): Option[float64] =
-  if row.isNull(col):
-    none(float64)
-  else:
-    some(row.getFloat(col))
-
-proc getNumericOpt*(row: Row, col: int): Option[PgNumeric] =
-  if row.isNull(col):
-    none(PgNumeric)
-  else:
-    some(row.getNumeric(col))
-
-proc getBoolOpt*(row: Row, col: int): Option[bool] =
-  if row.isNull(col):
-    none(bool)
-  else:
-    some(row.getBool(col))
-
-proc getJsonOpt*(row: Row, col: int): Option[JsonNode] =
-  if row.isNull(col):
-    none(JsonNode)
-  else:
-    some(row.getJson(col))
-
-proc getIntervalOpt*(row: Row, col: int): Option[PgInterval] =
-  if row.isNull(col):
-    none(PgInterval)
-  else:
-    some(row.getInterval(col))
-
-proc getInetOpt*(row: Row, col: int): Option[PgInet] =
-  if row.isNull(col):
-    none(PgInet)
-  else:
-    some(row.getInet(col))
-
-proc getCidrOpt*(row: Row, col: int): Option[PgCidr] =
-  if row.isNull(col):
-    none(PgCidr)
-  else:
-    some(row.getCidr(col))
-
-proc getMacAddrOpt*(row: Row, col: int): Option[PgMacAddr] =
-  if row.isNull(col):
-    none(PgMacAddr)
-  else:
-    some(row.getMacAddr(col))
-
-proc getMacAddr8Opt*(row: Row, col: int): Option[PgMacAddr8] =
-  if row.isNull(col):
-    none(PgMacAddr8)
-  else:
-    some(row.getMacAddr8(col))
-
-proc getPointOpt*(row: Row, col: int): Option[PgPoint] =
-  if row.isNull(col):
-    none(PgPoint)
-  else:
-    some(row.getPoint(col))
-
-proc getLineOpt*(row: Row, col: int): Option[PgLine] =
-  if row.isNull(col):
-    none(PgLine)
-  else:
-    some(row.getLine(col))
-
-proc getLsegOpt*(row: Row, col: int): Option[PgLseg] =
-  if row.isNull(col):
-    none(PgLseg)
-  else:
-    some(row.getLseg(col))
-
-proc getBoxOpt*(row: Row, col: int): Option[PgBox] =
-  if row.isNull(col):
-    none(PgBox)
-  else:
-    some(row.getBox(col))
-
-proc getPathOpt*(row: Row, col: int): Option[PgPath] =
-  if row.isNull(col):
-    none(PgPath)
-  else:
-    some(row.getPath(col))
-
-proc getPolygonOpt*(row: Row, col: int): Option[PgPolygon] =
-  if row.isNull(col):
-    none(PgPolygon)
-  else:
-    some(row.getPolygon(col))
-
-proc getCircleOpt*(row: Row, col: int): Option[PgCircle] =
-  if row.isNull(col):
-    none(PgCircle)
-  else:
-    some(row.getCircle(col))
+optAccessor(getStr, getStrOpt, string)
+optAccessor(getInt, getIntOpt, int32)
+optAccessor(getInt64, getInt64Opt, int64)
+optAccessor(getFloat, getFloatOpt, float64)
+optAccessor(getNumeric, getNumericOpt, PgNumeric)
+optAccessor(getBool, getBoolOpt, bool)
+optAccessor(getJson, getJsonOpt, JsonNode)
+optAccessor(getInterval, getIntervalOpt, PgInterval)
+optAccessor(getInet, getInetOpt, PgInet)
+optAccessor(getCidr, getCidrOpt, PgCidr)
+optAccessor(getMacAddr, getMacAddrOpt, PgMacAddr)
+optAccessor(getMacAddr8, getMacAddr8Opt, PgMacAddr8)
+optAccessor(getPoint, getPointOpt, PgPoint)
+optAccessor(getLine, getLineOpt, PgLine)
+optAccessor(getLseg, getLsegOpt, PgLseg)
+optAccessor(getBox, getBoxOpt, PgBox)
+optAccessor(getPath, getPathOpt, PgPath)
+optAccessor(getPolygon, getPolygonOpt, PgPolygon)
+optAccessor(getCircle, getCircleOpt, PgCircle)
 
 # Array text format parser
 
@@ -1691,105 +1622,23 @@ proc getStrArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[string
 
 # Format-aware array Opt accessors
 
-proc getIntArrayOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[seq[int32]] =
-  if row.isNull(col):
-    none(seq[int32])
-  else:
-    some(row.getIntArray(col, fields))
-
-proc getInt16ArrayOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[seq[int16]] =
-  if row.isNull(col):
-    none(seq[int16])
-  else:
-    some(row.getInt16Array(col, fields))
-
-proc getInt64ArrayOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[seq[int64]] =
-  if row.isNull(col):
-    none(seq[int64])
-  else:
-    some(row.getInt64Array(col, fields))
-
-proc getFloatArrayOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[seq[float64]] =
-  if row.isNull(col):
-    none(seq[float64])
-  else:
-    some(row.getFloatArray(col, fields))
-
-proc getFloat32ArrayOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[seq[float32]] =
-  if row.isNull(col):
-    none(seq[float32])
-  else:
-    some(row.getFloat32Array(col, fields))
-
-proc getBoolArrayOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[seq[bool]] =
-  if row.isNull(col):
-    none(seq[bool])
-  else:
-    some(row.getBoolArray(col, fields))
-
-proc getStrArrayOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[seq[string]] =
-  if row.isNull(col):
-    none(seq[string])
-  else:
-    some(row.getStrArray(col, fields))
+optFieldsAccessor(getIntArray, getIntArrayOpt, seq[int32])
+optFieldsAccessor(getInt16Array, getInt16ArrayOpt, seq[int16])
+optFieldsAccessor(getInt64Array, getInt64ArrayOpt, seq[int64])
+optFieldsAccessor(getFloatArray, getFloatArrayOpt, seq[float64])
+optFieldsAccessor(getFloat32Array, getFloat32ArrayOpt, seq[float32])
+optFieldsAccessor(getBoolArray, getBoolArrayOpt, seq[bool])
+optFieldsAccessor(getStrArray, getStrArrayOpt, seq[string])
 
 # Array Opt accessors (text format)
 
-proc getIntArrayOpt*(row: Row, col: int): Option[seq[int32]] =
-  if row.isNull(col):
-    none(seq[int32])
-  else:
-    some(row.getIntArray(col))
-
-proc getInt16ArrayOpt*(row: Row, col: int): Option[seq[int16]] =
-  if row.isNull(col):
-    none(seq[int16])
-  else:
-    some(row.getInt16Array(col))
-
-proc getInt64ArrayOpt*(row: Row, col: int): Option[seq[int64]] =
-  if row.isNull(col):
-    none(seq[int64])
-  else:
-    some(row.getInt64Array(col))
-
-proc getFloatArrayOpt*(row: Row, col: int): Option[seq[float64]] =
-  if row.isNull(col):
-    none(seq[float64])
-  else:
-    some(row.getFloatArray(col))
-
-proc getFloat32ArrayOpt*(row: Row, col: int): Option[seq[float32]] =
-  if row.isNull(col):
-    none(seq[float32])
-  else:
-    some(row.getFloat32Array(col))
-
-proc getBoolArrayOpt*(row: Row, col: int): Option[seq[bool]] =
-  if row.isNull(col):
-    none(seq[bool])
-  else:
-    some(row.getBoolArray(col))
-
-proc getStrArrayOpt*(row: Row, col: int): Option[seq[string]] =
-  if row.isNull(col):
-    none(seq[string])
-  else:
-    some(row.getStrArray(col))
+optAccessor(getIntArray, getIntArrayOpt, seq[int32])
+optAccessor(getInt16Array, getInt16ArrayOpt, seq[int16])
+optAccessor(getInt64Array, getInt64ArrayOpt, seq[int64])
+optAccessor(getFloatArray, getFloatArrayOpt, seq[float64])
+optAccessor(getFloat32Array, getFloat32ArrayOpt, seq[float32])
+optAccessor(getBoolArray, getBoolArrayOpt, seq[bool])
+optAccessor(getStrArray, getStrArrayOpt, seq[string])
 
 # Format-aware row accessors (binary support)
 
@@ -1993,13 +1842,7 @@ proc getInterval*(row: Row, col: int, fields: seq[FieldDescription]): PgInterval
   result.days = fromBE32(row.data.buf.toOpenArray(off + 8, off + 11))
   result.months = fromBE32(row.data.buf.toOpenArray(off + 12, off + 15))
 
-proc getIntervalOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgInterval] =
-  if row.isNull(col):
-    none(PgInterval)
-  else:
-    some(row.getInterval(col, fields))
+optFieldsAccessor(getInterval, getIntervalOpt, PgInterval)
 
 proc decodeInetBinary(data: openArray[byte]): tuple[address: IpAddress, mask: uint8] =
   ## Decode PostgreSQL binary inet/cidr format:
@@ -2067,33 +1910,10 @@ proc getMacAddr8*(row: Row, col: int, fields: seq[FieldDescription]): PgMacAddr8
     parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
   PgMacAddr8(parts.join(":"))
 
-proc getInetOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgInet] =
-  if row.isNull(col):
-    none(PgInet)
-  else:
-    some(row.getInet(col, fields))
-
-proc getCidrOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgCidr] =
-  if row.isNull(col):
-    none(PgCidr)
-  else:
-    some(row.getCidr(col, fields))
-
-proc getMacAddrOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMacAddr] =
-  if row.isNull(col):
-    none(PgMacAddr)
-  else:
-    some(row.getMacAddr(col, fields))
-
-proc getMacAddr8Opt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMacAddr8] =
-  if row.isNull(col):
-    none(PgMacAddr8)
-  else:
-    some(row.getMacAddr8(col, fields))
+optFieldsAccessor(getInet, getInetOpt, PgInet)
+optFieldsAccessor(getCidr, getCidrOpt, PgCidr)
+optFieldsAccessor(getMacAddr, getMacAddrOpt, PgMacAddr)
+optFieldsAccessor(getMacAddr8, getMacAddr8Opt, PgMacAddr8)
 
 # Geometry binary-aware decoders
 
@@ -2207,51 +2027,13 @@ proc getCircle*(row: Row, col: int, fields: seq[FieldDescription]): PgCircle =
 
 # Geometry binary-aware Opt accessors
 
-proc getPointOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgPoint] =
-  if row.isNull(col):
-    none(PgPoint)
-  else:
-    some(row.getPoint(col, fields))
-
-proc getLineOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgLine] =
-  if row.isNull(col):
-    none(PgLine)
-  else:
-    some(row.getLine(col, fields))
-
-proc getLsegOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgLseg] =
-  if row.isNull(col):
-    none(PgLseg)
-  else:
-    some(row.getLseg(col, fields))
-
-proc getBoxOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgBox] =
-  if row.isNull(col):
-    none(PgBox)
-  else:
-    some(row.getBox(col, fields))
-
-proc getPathOpt*(row: Row, col: int, fields: seq[FieldDescription]): Option[PgPath] =
-  if row.isNull(col):
-    none(PgPath)
-  else:
-    some(row.getPath(col, fields))
-
-proc getPolygonOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgPolygon] =
-  if row.isNull(col):
-    none(PgPolygon)
-  else:
-    some(row.getPolygon(col, fields))
-
-proc getCircleOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgCircle] =
-  if row.isNull(col):
-    none(PgCircle)
-  else:
-    some(row.getCircle(col, fields))
+optFieldsAccessor(getPoint, getPointOpt, PgPoint)
+optFieldsAccessor(getLine, getLineOpt, PgLine)
+optFieldsAccessor(getLseg, getLsegOpt, PgLseg)
+optFieldsAccessor(getBox, getBoxOpt, PgBox)
+optFieldsAccessor(getPath, getPathOpt, PgPath)
+optFieldsAccessor(getPolygon, getPolygonOpt, PgPolygon)
+optFieldsAccessor(getCircle, getCircleOpt, PgCircle)
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.
@@ -3458,91 +3240,21 @@ proc getDateRange*(
 
 # Range Opt accessors (text format)
 
-proc getInt4RangeOpt*(row: Row, col: int): Option[PgRange[int32]] =
-  if row.isNull(col):
-    none(PgRange[int32])
-  else:
-    some(row.getInt4Range(col))
-
-proc getInt8RangeOpt*(row: Row, col: int): Option[PgRange[int64]] =
-  if row.isNull(col):
-    none(PgRange[int64])
-  else:
-    some(row.getInt8Range(col))
-
-proc getNumRangeOpt*(row: Row, col: int): Option[PgRange[PgNumeric]] =
-  if row.isNull(col):
-    none(PgRange[PgNumeric])
-  else:
-    some(row.getNumRange(col))
-
-proc getTsRangeOpt*(row: Row, col: int): Option[PgRange[DateTime]] =
-  if row.isNull(col):
-    none(PgRange[DateTime])
-  else:
-    some(row.getTsRange(col))
-
-proc getTsTzRangeOpt*(row: Row, col: int): Option[PgRange[DateTime]] =
-  if row.isNull(col):
-    none(PgRange[DateTime])
-  else:
-    some(row.getTsTzRange(col))
-
-proc getDateRangeOpt*(row: Row, col: int): Option[PgRange[DateTime]] =
-  if row.isNull(col):
-    none(PgRange[DateTime])
-  else:
-    some(row.getDateRange(col))
+optAccessor(getInt4Range, getInt4RangeOpt, PgRange[int32])
+optAccessor(getInt8Range, getInt8RangeOpt, PgRange[int64])
+optAccessor(getNumRange, getNumRangeOpt, PgRange[PgNumeric])
+optAccessor(getTsRange, getTsRangeOpt, PgRange[DateTime])
+optAccessor(getTsTzRange, getTsTzRangeOpt, PgRange[DateTime])
+optAccessor(getDateRange, getDateRangeOpt, PgRange[DateTime])
 
 # Range Opt accessors (format-aware)
 
-proc getInt4RangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgRange[int32]] =
-  if row.isNull(col):
-    none(PgRange[int32])
-  else:
-    some(row.getInt4Range(col, fields))
-
-proc getInt8RangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgRange[int64]] =
-  if row.isNull(col):
-    none(PgRange[int64])
-  else:
-    some(row.getInt8Range(col, fields))
-
-proc getNumRangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgRange[PgNumeric]] =
-  if row.isNull(col):
-    none(PgRange[PgNumeric])
-  else:
-    some(row.getNumRange(col, fields))
-
-proc getTsRangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgRange[DateTime]] =
-  if row.isNull(col):
-    none(PgRange[DateTime])
-  else:
-    some(row.getTsRange(col, fields))
-
-proc getTsTzRangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgRange[DateTime]] =
-  if row.isNull(col):
-    none(PgRange[DateTime])
-  else:
-    some(row.getTsTzRange(col, fields))
-
-proc getDateRangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgRange[DateTime]] =
-  if row.isNull(col):
-    none(PgRange[DateTime])
-  else:
-    some(row.getDateRange(col, fields))
+optFieldsAccessor(getInt4Range, getInt4RangeOpt, PgRange[int32])
+optFieldsAccessor(getInt8Range, getInt8RangeOpt, PgRange[int64])
+optFieldsAccessor(getNumRange, getNumRangeOpt, PgRange[PgNumeric])
+optFieldsAccessor(getTsRange, getTsRangeOpt, PgRange[DateTime])
+optFieldsAccessor(getTsTzRange, getTsTzRangeOpt, PgRange[DateTime])
+optFieldsAccessor(getDateRange, getDateRangeOpt, PgRange[DateTime])
 
 # Multirange type support
 #
@@ -3898,91 +3610,21 @@ proc getDateMultirange*(
 
 # Multirange Opt accessors (text format)
 
-proc getInt4MultirangeOpt*(row: Row, col: int): Option[PgMultirange[int32]] =
-  if row.isNull(col):
-    none(PgMultirange[int32])
-  else:
-    some(row.getInt4Multirange(col))
-
-proc getInt8MultirangeOpt*(row: Row, col: int): Option[PgMultirange[int64]] =
-  if row.isNull(col):
-    none(PgMultirange[int64])
-  else:
-    some(row.getInt8Multirange(col))
-
-proc getNumMultirangeOpt*(row: Row, col: int): Option[PgMultirange[PgNumeric]] =
-  if row.isNull(col):
-    none(PgMultirange[PgNumeric])
-  else:
-    some(row.getNumMultirange(col))
-
-proc getTsMultirangeOpt*(row: Row, col: int): Option[PgMultirange[DateTime]] =
-  if row.isNull(col):
-    none(PgMultirange[DateTime])
-  else:
-    some(row.getTsMultirange(col))
-
-proc getTsTzMultirangeOpt*(row: Row, col: int): Option[PgMultirange[DateTime]] =
-  if row.isNull(col):
-    none(PgMultirange[DateTime])
-  else:
-    some(row.getTsTzMultirange(col))
-
-proc getDateMultirangeOpt*(row: Row, col: int): Option[PgMultirange[DateTime]] =
-  if row.isNull(col):
-    none(PgMultirange[DateTime])
-  else:
-    some(row.getDateMultirange(col))
+optAccessor(getInt4Multirange, getInt4MultirangeOpt, PgMultirange[int32])
+optAccessor(getInt8Multirange, getInt8MultirangeOpt, PgMultirange[int64])
+optAccessor(getNumMultirange, getNumMultirangeOpt, PgMultirange[PgNumeric])
+optAccessor(getTsMultirange, getTsMultirangeOpt, PgMultirange[DateTime])
+optAccessor(getTsTzMultirange, getTsTzMultirangeOpt, PgMultirange[DateTime])
+optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 
 # Multirange Opt accessors (format-aware)
 
-proc getInt4MultirangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMultirange[int32]] =
-  if row.isNull(col):
-    none(PgMultirange[int32])
-  else:
-    some(row.getInt4Multirange(col, fields))
-
-proc getInt8MultirangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMultirange[int64]] =
-  if row.isNull(col):
-    none(PgMultirange[int64])
-  else:
-    some(row.getInt8Multirange(col, fields))
-
-proc getNumMultirangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMultirange[PgNumeric]] =
-  if row.isNull(col):
-    none(PgMultirange[PgNumeric])
-  else:
-    some(row.getNumMultirange(col, fields))
-
-proc getTsMultirangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMultirange[DateTime]] =
-  if row.isNull(col):
-    none(PgMultirange[DateTime])
-  else:
-    some(row.getTsMultirange(col, fields))
-
-proc getTsTzMultirangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMultirange[DateTime]] =
-  if row.isNull(col):
-    none(PgMultirange[DateTime])
-  else:
-    some(row.getTsTzMultirange(col, fields))
-
-proc getDateMultirangeOpt*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[PgMultirange[DateTime]] =
-  if row.isNull(col):
-    none(PgMultirange[DateTime])
-  else:
-    some(row.getDateMultirange(col, fields))
+optFieldsAccessor(getInt4Multirange, getInt4MultirangeOpt, PgMultirange[int32])
+optFieldsAccessor(getInt8Multirange, getInt8MultirangeOpt, PgMultirange[int64])
+optFieldsAccessor(getNumMultirange, getNumMultirangeOpt, PgMultirange[PgNumeric])
+optFieldsAccessor(getTsMultirange, getTsMultirangeOpt, PgMultirange[DateTime])
+optFieldsAccessor(getTsTzMultirange, getTsTzMultirangeOpt, PgMultirange[DateTime])
+optFieldsAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 
 # Name-based column access
 
@@ -3995,306 +3637,83 @@ proc columnIndex*(row: Row, name: string): int =
     raise newException(PgTypeError, "Column name lookup requires field metadata")
   columnIndex(row.data.fields, name)
 
-proc isNull*(row: Row, name: string): bool =
-  ## Check if the named column value is NULL.
-  row.isNull(row.columnIndex(name))
-
-proc getStr*(row: Row, name: string): string =
-  ## Get a named column value as a string.
-  row.getStr(row.columnIndex(name))
-
-proc getInt*(row: Row, name: string): int32 =
-  ## Get a named column value as int32.
-  row.getInt(row.columnIndex(name))
-
-proc getInt64*(row: Row, name: string): int64 =
-  ## Get a named column value as int64.
-  row.getInt64(row.columnIndex(name))
-
-proc getFloat*(row: Row, name: string): float64 =
-  ## Get a named column value as float64.
-  row.getFloat(row.columnIndex(name))
-
-proc getBool*(row: Row, name: string): bool =
-  ## Get a named column value as bool.
-  row.getBool(row.columnIndex(name))
-
-proc getBytes*(row: Row, name: string): seq[byte] =
-  ## Get a named column value as raw bytes.
-  row.getBytes(row.columnIndex(name))
-
-proc getNumeric*(row: Row, name: string): PgNumeric =
-  ## Get a named column value as PgNumeric.
-  row.getNumeric(row.columnIndex(name))
-
-proc getTimestamp*(row: Row, name: string): DateTime =
-  ## Get a named column value as DateTime (timestamp).
-  row.getTimestamp(row.columnIndex(name))
-
-proc getDate*(row: Row, name: string): DateTime =
-  ## Get a named column value as DateTime (date).
-  row.getDate(row.columnIndex(name))
-
-proc getJson*(row: Row, name: string): JsonNode =
-  ## Get a named column value as JsonNode.
-  row.getJson(row.columnIndex(name))
-
-proc getInterval*(row: Row, name: string): PgInterval =
-  ## Get a named column value as PgInterval.
-  row.getInterval(row.columnIndex(name))
-
-proc getInet*(row: Row, name: string): PgInet =
-  ## Get a named column value as PgInet.
-  row.getInet(row.columnIndex(name))
-
-proc getCidr*(row: Row, name: string): PgCidr =
-  ## Get a named column value as PgCidr.
-  row.getCidr(row.columnIndex(name))
-
-proc getMacAddr*(row: Row, name: string): PgMacAddr =
-  ## Get a named column value as PgMacAddr.
-  row.getMacAddr(row.columnIndex(name))
-
-proc getMacAddr8*(row: Row, name: string): PgMacAddr8 =
-  ## Get a named column value as PgMacAddr8.
-  row.getMacAddr8(row.columnIndex(name))
-
-proc getPoint*(row: Row, name: string): PgPoint =
-  ## Get a named column value as PgPoint.
-  row.getPoint(row.columnIndex(name))
-
-proc getLine*(row: Row, name: string): PgLine =
-  ## Get a named column value as PgLine.
-  row.getLine(row.columnIndex(name))
-
-proc getLseg*(row: Row, name: string): PgLseg =
-  ## Get a named column value as PgLseg.
-  row.getLseg(row.columnIndex(name))
-
-proc getBox*(row: Row, name: string): PgBox =
-  ## Get a named column value as PgBox.
-  row.getBox(row.columnIndex(name))
-
-proc getPath*(row: Row, name: string): PgPath =
-  ## Get a named column value as PgPath.
-  row.getPath(row.columnIndex(name))
-
-proc getPolygon*(row: Row, name: string): PgPolygon =
-  ## Get a named column value as PgPolygon.
-  row.getPolygon(row.columnIndex(name))
-
-proc getCircle*(row: Row, name: string): PgCircle =
-  ## Get a named column value as PgCircle.
-  row.getCircle(row.columnIndex(name))
-
-# Optional variants
-
-proc getStrOpt*(row: Row, name: string): Option[string] =
-  ## Get a named column value as Option[string].
-  row.getStrOpt(row.columnIndex(name))
-
-proc getIntOpt*(row: Row, name: string): Option[int32] =
-  ## Get a named column value as Option[int32].
-  row.getIntOpt(row.columnIndex(name))
-
-proc getInt64Opt*(row: Row, name: string): Option[int64] =
-  ## Get a named column value as Option[int64].
-  row.getInt64Opt(row.columnIndex(name))
-
-proc getFloatOpt*(row: Row, name: string): Option[float64] =
-  ## Get a named column value as Option[float64].
-  row.getFloatOpt(row.columnIndex(name))
-
-proc getNumericOpt*(row: Row, name: string): Option[PgNumeric] =
-  ## Get a named column value as Option[PgNumeric].
-  row.getNumericOpt(row.columnIndex(name))
-
-proc getBoolOpt*(row: Row, name: string): Option[bool] =
-  ## Get a named column value as Option[bool].
-  row.getBoolOpt(row.columnIndex(name))
-
-proc getJsonOpt*(row: Row, name: string): Option[JsonNode] =
-  ## Get a named column value as Option[JsonNode].
-  row.getJsonOpt(row.columnIndex(name))
-
-proc getIntervalOpt*(row: Row, name: string): Option[PgInterval] =
-  ## Get a named column value as Option[PgInterval].
-  row.getIntervalOpt(row.columnIndex(name))
-
-proc getInetOpt*(row: Row, name: string): Option[PgInet] =
-  ## Get a named column value as Option[PgInet].
-  row.getInetOpt(row.columnIndex(name))
-
-proc getCidrOpt*(row: Row, name: string): Option[PgCidr] =
-  ## Get a named column value as Option[PgCidr].
-  row.getCidrOpt(row.columnIndex(name))
-
-proc getMacAddrOpt*(row: Row, name: string): Option[PgMacAddr] =
-  ## Get a named column value as Option[PgMacAddr].
-  row.getMacAddrOpt(row.columnIndex(name))
-
-proc getMacAddr8Opt*(row: Row, name: string): Option[PgMacAddr8] =
-  ## Get a named column value as Option[PgMacAddr8].
-  row.getMacAddr8Opt(row.columnIndex(name))
-
-proc getPointOpt*(row: Row, name: string): Option[PgPoint] =
-  ## Get a named column value as Option[PgPoint].
-  row.getPointOpt(row.columnIndex(name))
-
-proc getLineOpt*(row: Row, name: string): Option[PgLine] =
-  ## Get a named column value as Option[PgLine].
-  row.getLineOpt(row.columnIndex(name))
-
-proc getLsegOpt*(row: Row, name: string): Option[PgLseg] =
-  ## Get a named column value as Option[PgLseg].
-  row.getLsegOpt(row.columnIndex(name))
-
-proc getBoxOpt*(row: Row, name: string): Option[PgBox] =
-  ## Get a named column value as Option[PgBox].
-  row.getBoxOpt(row.columnIndex(name))
-
-proc getPathOpt*(row: Row, name: string): Option[PgPath] =
-  ## Get a named column value as Option[PgPath].
-  row.getPathOpt(row.columnIndex(name))
-
-proc getPolygonOpt*(row: Row, name: string): Option[PgPolygon] =
-  ## Get a named column value as Option[PgPolygon].
-  row.getPolygonOpt(row.columnIndex(name))
-
-proc getCircleOpt*(row: Row, name: string): Option[PgCircle] =
-  ## Get a named column value as Option[PgCircle].
-  row.getCircleOpt(row.columnIndex(name))
-
-# Array variants
-
-proc getIntArray*(row: Row, name: string): seq[int32] =
-  ## Get a named column value as seq[int32].
-  row.getIntArray(row.columnIndex(name))
-
-proc getInt16Array*(row: Row, name: string): seq[int16] =
-  ## Get a named column value as seq[int16].
-  row.getInt16Array(row.columnIndex(name))
-
-proc getInt64Array*(row: Row, name: string): seq[int64] =
-  ## Get a named column value as seq[int64].
-  row.getInt64Array(row.columnIndex(name))
-
-proc getFloatArray*(row: Row, name: string): seq[float64] =
-  ## Get a named column value as seq[float64].
-  row.getFloatArray(row.columnIndex(name))
-
-proc getFloat32Array*(row: Row, name: string): seq[float32] =
-  ## Get a named column value as seq[float32].
-  row.getFloat32Array(row.columnIndex(name))
-
-proc getBoolArray*(row: Row, name: string): seq[bool] =
-  ## Get a named column value as seq[bool].
-  row.getBoolArray(row.columnIndex(name))
-
-proc getStrArray*(row: Row, name: string): seq[string] =
-  ## Get a named column value as seq[string].
-  row.getStrArray(row.columnIndex(name))
-
-proc getIntArrayOpt*(row: Row, name: string): Option[seq[int32]] =
-  ## Get a named column value as Option[seq[int32]].
-  row.getIntArrayOpt(row.columnIndex(name))
-
-proc getInt16ArrayOpt*(row: Row, name: string): Option[seq[int16]] =
-  ## Get a named column value as Option[seq[int16]].
-  row.getInt16ArrayOpt(row.columnIndex(name))
-
-proc getInt64ArrayOpt*(row: Row, name: string): Option[seq[int64]] =
-  ## Get a named column value as Option[seq[int64]].
-  row.getInt64ArrayOpt(row.columnIndex(name))
-
-proc getFloatArrayOpt*(row: Row, name: string): Option[seq[float64]] =
-  ## Get a named column value as Option[seq[float64]].
-  row.getFloatArrayOpt(row.columnIndex(name))
-
-proc getFloat32ArrayOpt*(row: Row, name: string): Option[seq[float32]] =
-  ## Get a named column value as Option[seq[float32]].
-  row.getFloat32ArrayOpt(row.columnIndex(name))
-
-proc getBoolArrayOpt*(row: Row, name: string): Option[seq[bool]] =
-  ## Get a named column value as Option[seq[bool]].
-  row.getBoolArrayOpt(row.columnIndex(name))
-
-proc getStrArrayOpt*(row: Row, name: string): Option[seq[string]] =
-  ## Get a named column value as Option[seq[string]].
-  row.getStrArrayOpt(row.columnIndex(name))
-
-# Range variants
-
-proc getInt4Range*(row: Row, name: string): PgRange[int32] =
-  row.getInt4Range(row.columnIndex(name))
-
-proc getInt8Range*(row: Row, name: string): PgRange[int64] =
-  row.getInt8Range(row.columnIndex(name))
-
-proc getNumRange*(row: Row, name: string): PgRange[PgNumeric] =
-  row.getNumRange(row.columnIndex(name))
-
-proc getTsRange*(row: Row, name: string): PgRange[DateTime] =
-  row.getTsRange(row.columnIndex(name))
-
-proc getTsTzRange*(row: Row, name: string): PgRange[DateTime] =
-  row.getTsTzRange(row.columnIndex(name))
-
-proc getDateRange*(row: Row, name: string): PgRange[DateTime] =
-  row.getDateRange(row.columnIndex(name))
-
-proc getInt4RangeOpt*(row: Row, name: string): Option[PgRange[int32]] =
-  row.getInt4RangeOpt(row.columnIndex(name))
-
-proc getInt8RangeOpt*(row: Row, name: string): Option[PgRange[int64]] =
-  row.getInt8RangeOpt(row.columnIndex(name))
-
-proc getNumRangeOpt*(row: Row, name: string): Option[PgRange[PgNumeric]] =
-  row.getNumRangeOpt(row.columnIndex(name))
-
-proc getTsRangeOpt*(row: Row, name: string): Option[PgRange[DateTime]] =
-  row.getTsRangeOpt(row.columnIndex(name))
-
-proc getTsTzRangeOpt*(row: Row, name: string): Option[PgRange[DateTime]] =
-  row.getTsTzRangeOpt(row.columnIndex(name))
-
-proc getDateRangeOpt*(row: Row, name: string): Option[PgRange[DateTime]] =
-  row.getDateRangeOpt(row.columnIndex(name))
-
-# Multirange variants
-
-proc getInt4Multirange*(row: Row, name: string): PgMultirange[int32] =
-  row.getInt4Multirange(row.columnIndex(name))
-
-proc getInt8Multirange*(row: Row, name: string): PgMultirange[int64] =
-  row.getInt8Multirange(row.columnIndex(name))
-
-proc getNumMultirange*(row: Row, name: string): PgMultirange[PgNumeric] =
-  row.getNumMultirange(row.columnIndex(name))
-
-proc getTsMultirange*(row: Row, name: string): PgMultirange[DateTime] =
-  row.getTsMultirange(row.columnIndex(name))
-
-proc getTsTzMultirange*(row: Row, name: string): PgMultirange[DateTime] =
-  row.getTsTzMultirange(row.columnIndex(name))
-
-proc getDateMultirange*(row: Row, name: string): PgMultirange[DateTime] =
-  row.getDateMultirange(row.columnIndex(name))
-
-proc getInt4MultirangeOpt*(row: Row, name: string): Option[PgMultirange[int32]] =
-  row.getInt4MultirangeOpt(row.columnIndex(name))
-
-proc getInt8MultirangeOpt*(row: Row, name: string): Option[PgMultirange[int64]] =
-  row.getInt8MultirangeOpt(row.columnIndex(name))
-
-proc getNumMultirangeOpt*(row: Row, name: string): Option[PgMultirange[PgNumeric]] =
-  row.getNumMultirangeOpt(row.columnIndex(name))
-
-proc getTsMultirangeOpt*(row: Row, name: string): Option[PgMultirange[DateTime]] =
-  row.getTsMultirangeOpt(row.columnIndex(name))
-
-proc getTsTzMultirangeOpt*(row: Row, name: string): Option[PgMultirange[DateTime]] =
-  row.getTsTzMultirangeOpt(row.columnIndex(name))
-
-proc getDateMultirangeOpt*(row: Row, name: string): Option[PgMultirange[DateTime]] =
-  row.getDateMultirangeOpt(row.columnIndex(name))
+nameAccessor(isNull, bool)
+nameAccessor(getStr, string)
+nameAccessor(getInt, int32)
+nameAccessor(getInt64, int64)
+nameAccessor(getFloat, float64)
+nameAccessor(getBool, bool)
+nameAccessor(getBytes, seq[byte])
+nameAccessor(getNumeric, PgNumeric)
+nameAccessor(getTimestamp, DateTime)
+nameAccessor(getDate, DateTime)
+nameAccessor(getJson, JsonNode)
+nameAccessor(getInterval, PgInterval)
+nameAccessor(getInet, PgInet)
+nameAccessor(getCidr, PgCidr)
+nameAccessor(getMacAddr, PgMacAddr)
+nameAccessor(getMacAddr8, PgMacAddr8)
+nameAccessor(getPoint, PgPoint)
+nameAccessor(getLine, PgLine)
+nameAccessor(getLseg, PgLseg)
+nameAccessor(getBox, PgBox)
+nameAccessor(getPath, PgPath)
+nameAccessor(getPolygon, PgPolygon)
+nameAccessor(getCircle, PgCircle)
+nameAccessor(getStrOpt, Option[string])
+nameAccessor(getIntOpt, Option[int32])
+nameAccessor(getInt64Opt, Option[int64])
+nameAccessor(getFloatOpt, Option[float64])
+nameAccessor(getNumericOpt, Option[PgNumeric])
+nameAccessor(getBoolOpt, Option[bool])
+nameAccessor(getJsonOpt, Option[JsonNode])
+nameAccessor(getIntervalOpt, Option[PgInterval])
+nameAccessor(getInetOpt, Option[PgInet])
+nameAccessor(getCidrOpt, Option[PgCidr])
+nameAccessor(getMacAddrOpt, Option[PgMacAddr])
+nameAccessor(getMacAddr8Opt, Option[PgMacAddr8])
+nameAccessor(getPointOpt, Option[PgPoint])
+nameAccessor(getLineOpt, Option[PgLine])
+nameAccessor(getLsegOpt, Option[PgLseg])
+nameAccessor(getBoxOpt, Option[PgBox])
+nameAccessor(getPathOpt, Option[PgPath])
+nameAccessor(getPolygonOpt, Option[PgPolygon])
+nameAccessor(getCircleOpt, Option[PgCircle])
+nameAccessor(getIntArray, seq[int32])
+nameAccessor(getInt16Array, seq[int16])
+nameAccessor(getInt64Array, seq[int64])
+nameAccessor(getFloatArray, seq[float64])
+nameAccessor(getFloat32Array, seq[float32])
+nameAccessor(getBoolArray, seq[bool])
+nameAccessor(getStrArray, seq[string])
+nameAccessor(getIntArrayOpt, Option[seq[int32]])
+nameAccessor(getInt16ArrayOpt, Option[seq[int16]])
+nameAccessor(getInt64ArrayOpt, Option[seq[int64]])
+nameAccessor(getFloatArrayOpt, Option[seq[float64]])
+nameAccessor(getFloat32ArrayOpt, Option[seq[float32]])
+nameAccessor(getBoolArrayOpt, Option[seq[bool]])
+nameAccessor(getStrArrayOpt, Option[seq[string]])
+nameAccessor(getInt4Range, PgRange[int32])
+nameAccessor(getInt8Range, PgRange[int64])
+nameAccessor(getNumRange, PgRange[PgNumeric])
+nameAccessor(getTsRange, PgRange[DateTime])
+nameAccessor(getTsTzRange, PgRange[DateTime])
+nameAccessor(getDateRange, PgRange[DateTime])
+nameAccessor(getInt4RangeOpt, Option[PgRange[int32]])
+nameAccessor(getInt8RangeOpt, Option[PgRange[int64]])
+nameAccessor(getNumRangeOpt, Option[PgRange[PgNumeric]])
+nameAccessor(getTsRangeOpt, Option[PgRange[DateTime]])
+nameAccessor(getTsTzRangeOpt, Option[PgRange[DateTime]])
+nameAccessor(getDateRangeOpt, Option[PgRange[DateTime]])
+nameAccessor(getInt4Multirange, PgMultirange[int32])
+nameAccessor(getInt8Multirange, PgMultirange[int64])
+nameAccessor(getNumMultirange, PgMultirange[PgNumeric])
+nameAccessor(getTsMultirange, PgMultirange[DateTime])
+nameAccessor(getTsTzMultirange, PgMultirange[DateTime])
+nameAccessor(getDateMultirange, PgMultirange[DateTime])
+nameAccessor(getInt4MultirangeOpt, Option[PgMultirange[int32]])
+nameAccessor(getInt8MultirangeOpt, Option[PgMultirange[int64]])
+nameAccessor(getNumMultirangeOpt, Option[PgMultirange[PgNumeric]])
+nameAccessor(getTsMultirangeOpt, Option[PgMultirange[DateTime]])
+nameAccessor(getTsTzMultirangeOpt, Option[PgMultirange[DateTime]])
+nameAccessor(getDateMultirangeOpt, Option[PgMultirange[DateTime]])
