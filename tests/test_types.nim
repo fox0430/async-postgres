@@ -19,6 +19,30 @@ proc mkField(typeOid: int32, formatCode: int16): FieldDescription =
     formatCode: formatCode,
   )
 
+proc mkRow(cells: seq[Option[seq[byte]]], fields: seq[FieldDescription]): Row =
+  ## Build a Row from cell data with format metadata from fields.
+  let rd = RowData(
+    numCols: int16(cells.len),
+    buf: @[],
+    cellIndex: newSeq[int32](cells.len * 2),
+    colFormats: newSeq[int16](fields.len),
+    colTypeOids: newSeq[int32](fields.len),
+    fields: fields,
+  )
+  for i in 0 ..< fields.len:
+    rd.colFormats[i] = fields[i].formatCode
+    rd.colTypeOids[i] = fields[i].typeOid
+  for i, cell in cells:
+    if cell.isNone:
+      rd.cellIndex[i * 2] = 0'i32
+      rd.cellIndex[i * 2 + 1] = -1'i32
+    else:
+      let data = cell.get
+      rd.cellIndex[i * 2] = int32(rd.buf.len)
+      rd.cellIndex[i * 2 + 1] = int32(data.len)
+      rd.buf.add(data)
+  Row(data: rd, rowIdx: 0)
+
 suite "OID constants":
   test "standard OID values":
     check OidBool == 16'i32
@@ -483,78 +507,77 @@ suite "Binary encode/decode helpers":
 suite "Format-aware binary accessors":
   test "getInt binary":
     let data = @[0'u8, 0, 0, 42]
-    let row = @[some(data)]
     let fields = @[mkField(OidInt4, 1)]
-    check row.getInt(0, fields) == 42'i32
+    let row = mkRow(@[some(data)], fields)
+    check row.getInt(0) == 42'i32
 
   test "getInt text fallback":
     let row = @[some(toBytes("42"))]
-    let fields = @[mkField(OidInt4, 0)]
-    check row.getInt(0, fields) == 42'i32
+    check row.getInt(0) == 42'i32
 
   test "getInt64 binary int8":
     let data = @[0'u8, 0, 0, 0, 0, 0, 0, 42]
-    let row = @[some(data)]
     let fields = @[mkField(OidInt8, 1)]
-    check row.getInt64(0, fields) == 42'i64
+    let row = mkRow(@[some(data)], fields)
+    check row.getInt64(0) == 42'i64
 
   test "getInt64 binary int4 promotion":
     let data = @[0'u8, 0, 0, 42]
-    let row = @[some(data)]
     let fields = @[mkField(OidInt4, 1)]
-    check row.getInt64(0, fields) == 42'i64
+    let row = mkRow(@[some(data)], fields)
+    check row.getInt64(0) == 42'i64
 
   test "getInt64 binary int2 promotion":
     let data = @[0'u8, 42]
-    let row = @[some(data)]
     let fields = @[mkField(OidInt2, 1)]
-    check row.getInt64(0, fields) == 42'i64
+    let row = mkRow(@[some(data)], fields)
+    check row.getInt64(0) == 42'i64
 
   test "getFloat binary float8":
     let p = toPgBinaryParam(3.14)
-    let row = @[p.value]
     let fields = @[mkField(OidFloat8, 1)]
-    check abs(row.getFloat(0, fields) - 3.14) < 1e-10
+    let row = mkRow(@[p.value], fields)
+    check abs(row.getFloat(0) - 3.14) < 1e-10
 
   test "getFloat binary float4":
     let p = toPgBinaryParam(1.5'f32)
-    let row = @[p.value]
     let fields = @[mkField(OidFloat4, 1)]
-    check abs(row.getFloat(0, fields) - 1.5) < 1e-5
+    let row = mkRow(@[p.value], fields)
+    check abs(row.getFloat(0) - 1.5) < 1e-5
 
   test "getBool binary":
-    let row = @[some(@[1'u8])]
     let fields = @[mkField(OidBool, 1)]
-    check row.getBool(0, fields) == true
+    let row = mkRow(@[some(@[1'u8])], fields)
+    check row.getBool(0) == true
 
   test "getBool binary false":
-    let row = @[some(@[0'u8])]
     let fields = @[mkField(OidBool, 1)]
-    check row.getBool(0, fields) == false
+    let row = mkRow(@[some(@[0'u8])], fields)
+    check row.getBool(0) == false
 
   test "getBytes binary":
     let data = @[0xDE'u8, 0xAD, 0xBE, 0xEF]
-    let row = @[some(data)]
     let fields = @[mkField(OidBytea, 1)]
-    check row.getBytes(0, fields) == data
+    let row = mkRow(@[some(data)], fields)
+    check row.getBytes(0) == data
 
   test "getStr binary text":
-    let row = @[some(toBytes("hello"))]
     let fields = @[mkField(OidText, 1)]
-    check row.getStr(0, fields) == "hello"
+    let row = mkRow(@[some(toBytes("hello"))], fields)
+    check row.getStr(0) == "hello"
 
   test "getStr binary int4":
     let data = @[0'u8, 0, 0, 42]
-    let row = @[some(data)]
     let fields = @[mkField(OidInt4, 1)]
-    check row.getStr(0, fields) == "42"
+    let row = mkRow(@[some(data)], fields)
+    check row.getStr(0) == "42"
 
   test "getTimestamp binary":
     let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
     let p = toPgBinaryParam(dt)
-    let row = @[p.value]
     let fields = @[mkField(OidTimestamp, 1)]
-    let result = row.getTimestamp(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTimestamp(0)
     check result.year == 2024
     check result.month == mJan
     check result.monthday == 15
@@ -577,9 +600,9 @@ suite "Format-aware binary accessors":
         ]
       ),
     )
-    let row = @[p.value]
     let fields = @[mkField(OidDate, 1)]
-    let result = row.getDate(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let result = row.getDate(0)
     check result.year == 2024
     check result.month == mJan
     check result.monthday == 15
@@ -735,21 +758,20 @@ suite "JSON support":
     data[0] = 1
     for i in 0 ..< jsonStr.len:
       data[i + 1] = byte(jsonStr[i])
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidJsonb, 1)]
-    let j = row.getJson(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let j = row.getJson(0)
     check j["key"].getStr == "val"
 
   test "getJson binary json (no version byte)":
-    let row: Row = @[some(toBytes("""{"a":1}"""))]
     let fields = @[mkField(OidJson, 1)]
-    let j = row.getJson(0, fields)
+    let row = mkRow(@[some(toBytes("""{"a":1}"""))], fields)
+    let j = row.getJson(0)
     check j["a"].getInt == 1
 
   test "getJson binary text fallback":
     let row: Row = @[some(toBytes("""[1,2]"""))]
-    let fields = @[mkField(OidJsonb, 0)]
-    let j = row.getJson(0, fields)
+    let j = row.getJson(0)
     check j.kind == JArray
     check j.len == 2
 
@@ -801,20 +823,20 @@ suite "JSON support":
   test "roundtrip binary":
     let orig = %*{"x": 42, "arr": [1, "two", nil], "flag": false}
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidJsonb, 1)]
-    let decoded = row.getJson(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getJson(0)
     check decoded["x"].getInt == 42
     check decoded["arr"][1].getStr == "two"
     check decoded["arr"][2].kind == JNull
     check decoded["flag"].getBool == false
 
   test "getJson binary NULL raises":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidJsonb, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
     var raised = false
     try:
-      discard row.getJson(0, fields)
+      discard row.getJson(0)
     except PgTypeError:
       raised = true
     check raised
@@ -846,9 +868,9 @@ suite "JSON support":
   test "roundtrip unicode binary":
     let orig = %*{"text": "日本語テスト"}
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidJsonb, 1)]
-    let decoded = row.getJson(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getJson(0)
     check decoded["text"].getStr == "日本語テスト"
 
 suite "Array OID constants":
@@ -1165,35 +1187,34 @@ suite "Binary array encode/decode roundtrip":
 
   test "getIntArray binary format":
     let encoded = encodeBinaryArray(OidInt4, @[@(toBE32(10'i32)), @(toBE32(-5'i32))])
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidInt4Array, 1)]
-    check row.getIntArray(0, fields) == @[10'i32, -5'i32]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getIntArray(0) == @[10'i32, -5'i32]
 
   test "getIntArray text format fallback":
     let row: Row = @[some(toBytes("{1,2,3}"))]
-    let fields = @[mkField(OidInt4Array, 0)]
-    check row.getIntArray(0, fields) == @[1'i32, 2, 3]
+    check row.getIntArray(0) == @[1'i32, 2, 3]
 
   test "getInt16Array binary format":
     let encoded = encodeBinaryArray(OidInt2, @[@(toBE16(10'i16)), @(toBE16(-20'i16))])
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidInt2Array, 1)]
-    check row.getInt16Array(0, fields) == @[10'i16, -20'i16]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getInt16Array(0) == @[10'i16, -20'i16]
 
   test "getInt64Array binary format":
     let encoded =
       encodeBinaryArray(OidInt8, @[@(toBE64(9999999999'i64)), @(toBE64(-1'i64))])
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidInt8Array, 1)]
-    check row.getInt64Array(0, fields) == @[9999999999'i64, -1'i64]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getInt64Array(0) == @[9999999999'i64, -1'i64]
 
   test "getFloatArray binary format float8":
     let encoded = encodeBinaryArray(
       OidFloat8, @[@(toBE64(cast[int64](3.14'f64))), @(toBE64(cast[int64](2.72'f64)))]
     )
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidFloat8Array, 1)]
-    let arr = row.getFloatArray(0, fields)
+    let row = mkRow(@[some(encoded)], fields)
+    let arr = row.getFloatArray(0)
     check arr.len == 2
     check abs(arr[0] - 3.14) < 1e-10
     check abs(arr[1] - 2.72) < 1e-10
@@ -1202,51 +1223,51 @@ suite "Binary array encode/decode roundtrip":
     let encoded = encodeBinaryArray(
       OidFloat4, @[@(toBE32(cast[int32](1.5'f32))), @(toBE32(cast[int32](2.5'f32)))]
     )
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidFloat4Array, 1)]
-    let arr = row.getFloat32Array(0, fields)
+    let row = mkRow(@[some(encoded)], fields)
+    let arr = row.getFloat32Array(0)
     check arr.len == 2
     check abs(arr[0] - 1.5'f32) < 1e-5
     check abs(arr[1] - 2.5'f32) < 1e-5
 
   test "getBoolArray binary format":
     let encoded = encodeBinaryArray(OidBool, @[@[1'u8], @[0'u8], @[1'u8]])
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidBoolArray, 1)]
-    check row.getBoolArray(0, fields) == @[true, false, true]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getBoolArray(0) == @[true, false, true]
 
   test "getStrArray binary format":
     let encoded = encodeBinaryArray(OidText, @[toBytes("hello"), toBytes("world")])
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidTextArray, 1)]
-    check row.getStrArray(0, fields) == @["hello", "world"]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getStrArray(0) == @["hello", "world"]
 
   test "getStrArray binary format with special chars":
     let encoded = encodeBinaryArray(
       OidText, @[toBytes("a\"b"), toBytes("c\\d"), toBytes("e,f"), toBytes("")]
     )
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidTextArray, 1)]
-    check row.getStrArray(0, fields) == @["a\"b", "c\\d", "e,f", ""]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getStrArray(0) == @["a\"b", "c\\d", "e,f", ""]
 
   test "getIntArray binary empty":
     let encoded = encodeBinaryArrayEmpty(OidInt4)
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidInt4Array, 1)]
-    check row.getIntArray(0, fields).len == 0
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getIntArray(0).len == 0
 
   test "getIntArrayOpt binary some":
     let encoded = encodeBinaryArray(OidInt4, @[@(toBE32(42'i32))])
-    let row: Row = @[some(encoded)]
     let fields = @[mkField(OidInt4Array, 1)]
-    let v = row.getIntArrayOpt(0, fields)
+    let row = mkRow(@[some(encoded)], fields)
+    let v = row.getIntArrayOpt(0)
     check v.isSome
     check v.get == @[42'i32]
 
   test "getIntArrayOpt binary none":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInt4Array, 1)]
-    check row.getIntArrayOpt(0, fields) == none(seq[int32])
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getIntArrayOpt(0) == none(seq[int32])
 
   test "toPgParam seq[int32] roundtrip via decode":
     let p = toPgParam(@[100'i32, 200, 300])
@@ -1306,9 +1327,9 @@ suite "PgNumeric":
       0x04,
       0xD2, # digit = 1234
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "1234"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "1234"
 
   test "decodeNumericBinary - positive with decimal":
     # 12345.6789: ndigits=2, weight=1, sign=0, dscale=4, digits=[1, 2345.6789]
@@ -1335,9 +1356,9 @@ suite "PgNumeric":
       0x1A,
       0x85, # digit = 6789
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "12345.6789"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "12345.6789"
 
   test "decodeNumericBinary - negative":
     # -42.50: ndigits=2, weight=0, sign=0x4000, dscale=2, digits=[42, 5000]
@@ -1355,9 +1376,9 @@ suite "PgNumeric":
       0x13,
       0x88, # digit = 5000
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "-42.50"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "-42.50"
 
   test "decodeNumericBinary - zero":
     # 0: ndigits=0, weight=0, sign=0, dscale=0
@@ -1371,9 +1392,9 @@ suite "PgNumeric":
       0x00,
       0x00, # dscale = 0
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "0"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "0"
 
   test "decodeNumericBinary - NaN":
     let data: seq[byte] = @[
@@ -1386,9 +1407,9 @@ suite "PgNumeric":
       0x00,
       0x00,
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "NaN"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "NaN"
 
   test "decodeNumericBinary - small decimal 0.00001":
     # 0.00001: weight=-2 (first digit at 10^(-2*4)=10^-8 place)
@@ -1416,17 +1437,17 @@ suite "PgNumeric":
       0x03,
       0xE8, # digit = 1000
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "0.00001"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "0.00001"
 
   test "decodeNumericBinary - zero with scale":
     let data: seq[byte] = @[
       0x00'u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 # dscale = 2
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "0.00"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "0.00"
 
   test "decodeNumericBinary - large integer with trailing zero groups":
     # 10000000: weight=1, ndigits=1, digit=1000
@@ -1443,9 +1464,9 @@ suite "PgNumeric":
       0x03,
       0xE8, # digit = 1000
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "10000000"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "10000000"
 
   test "decodeNumericBinary - weight=-1 (0.5)":
     # 0.5: weight=-1, ndigits=1, digit=5000, dscale=1
@@ -1461,9 +1482,9 @@ suite "PgNumeric":
       0x13,
       0x88, # digit = 5000
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "0.5"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "0.5"
 
   test "decodeNumericBinary - multiple fractional groups":
     # 0.123456789012: weight=-1, dscale=12
@@ -1484,9 +1505,9 @@ suite "PgNumeric":
       0x23,
       0x34, # digit = 9012
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "0.123456789012"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "0.123456789012"
 
   test "decodeNumericBinary - negative with fractional":
     # -0.0025: weight=-1, sign=0x4000, dscale=4, digit=25
@@ -1502,9 +1523,9 @@ suite "PgNumeric":
       0x00,
       0x19, # digit = 25
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check $row.getNumeric(0, fields) == "-0.0025"
+    let row = mkRow(@[some(data)], fields)
+    check $row.getNumeric(0) == "-0.0025"
 
   test "getNumeric text NULL raises":
     let row: Row = @[none(seq[byte])]
@@ -1516,28 +1537,27 @@ suite "PgNumeric":
     check raised
 
   test "getNumeric binary NULL raises":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidNumeric, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
     var raised = false
     try:
-      discard row.getNumeric(0, fields)
+      discard row.getNumeric(0)
     except PgTypeError:
       raised = true
     check raised
 
   test "getNumeric binary text fallback":
     let row: Row = @[some(toBytes("999.123"))]
-    let fields = @[mkField(OidNumeric, 0)] # formatCode=0 → text
-    check $row.getNumeric(0, fields) == "999.123"
+    check $row.getNumeric(0) == "999.123"
 
   test "getStr binary with OidNumeric":
     # 42: ndigits=1, weight=0, dscale=0, digit=42
     let data: seq[byte] = @[
       0x00'u8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A # digit = 42
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check row.getStr(0, fields) == "42"
+    let row = mkRow(@[some(data)], fields)
+    check row.getStr(0) == "42"
 
   test "getStr binary OidNumeric with decimal":
     # 3.14: weight=0, dscale=2, digits=[3, 1400]
@@ -1555,9 +1575,9 @@ suite "PgNumeric":
       0x05,
       0x78, # digit = 1400
     ]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidNumeric, 1)]
-    check row.getStr(0, fields) == "3.14"
+    let row = mkRow(@[some(data)], fields)
+    check row.getStr(0) == "3.14"
 
   test "$ PgNumeric":
     check $PgNumeric("12345.67890") == "12345.67890"
@@ -1706,23 +1726,22 @@ suite "PgInterval":
     copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
     let monBytes = toBE32(14'i32)
     copyMem(addr data[12], unsafeAddr monBytes[0], 4)
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidInterval, 1)]
-    let v = row.getInterval(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getInterval(0)
     check v == PgInterval(months: 14, days: 3, microseconds: 14706123456)
 
   test "getInterval binary fallback to text":
     let row: Row = @[some(toBytes("5 days"))]
-    let fields = @[mkField(OidInterval, 0)]
-    let v = row.getInterval(0, fields)
+    let v = row.getInterval(0)
     check v == PgInterval(months: 0, days: 5, microseconds: 0)
 
   test "getInterval binary NULL raises":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInterval, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
     var raised = false
     try:
-      discard row.getInterval(0, fields)
+      discard row.getInterval(0)
     except PgTypeError:
       raised = true
     check raised
@@ -1745,16 +1764,16 @@ suite "PgInterval":
     copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
     let monBytes = toBE32(0'i32)
     copyMem(addr data[12], unsafeAddr monBytes[0], 4)
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidInterval, 1)]
-    let v = row.getIntervalOpt(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getIntervalOpt(0)
     check v.isSome
     check v.get == PgInterval(months: 0, days: 0, microseconds: 1_000_000)
 
   test "getIntervalOpt binary none":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInterval, 1)]
-    check row.getIntervalOpt(0, fields) == none(PgInterval)
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getIntervalOpt(0) == none(PgInterval)
 
   test "toPgParam Option[PgInterval] some":
     let p = toPgParam(some(PgInterval(months: 1, days: 0, microseconds: 0)))
@@ -2016,9 +2035,9 @@ suite "PgInet":
 
   test "getInet binary format IPv4":
     let data = @[2'u8, 24, 0, 4, 192, 168, 1, 1]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidInet, 1)]
-    let v = row.getInet(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getInet(0)
     check v.address == parseIpAddress("192.168.1.1")
     check v.mask == 24
 
@@ -2032,18 +2051,18 @@ suite "PgInet":
     data[4] = 0xfe
     data[5] = 0x80
     data[19] = 1
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidInet, 1)]
-    let v = row.getInet(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getInet(0)
     check v.address == parseIpAddress("fe80::1")
     check v.mask == 64
 
   test "getInet binary NULL raises":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInet, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
     var raised = false
     try:
-      discard row.getInet(0, fields)
+      discard row.getInet(0)
     except PgTypeError:
       raised = true
     check raised
@@ -2060,16 +2079,16 @@ suite "PgInet":
 
   test "getInetOpt binary some":
     let data = @[2'u8, 32, 0, 4, 10, 0, 0, 1]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidInet, 1)]
-    let v = row.getInetOpt(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getInetOpt(0)
     check v.isSome
     check v.get.address == parseIpAddress("10.0.0.1")
 
   test "getInetOpt binary none":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInet, 1)]
-    check row.getInetOpt(0, fields) == none(PgInet)
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getInetOpt(0) == none(PgInet)
 
   test "toPgParam Option[PgInet] some":
     let p = toPgParam(some(PgInet(address: parseIpAddress("10.0.0.1"), mask: 32)))
@@ -2085,18 +2104,18 @@ suite "PgInet":
     let orig = PgInet(address: parseIpAddress("172.16.0.1"), mask: 16)
     let p = toPgBinaryParam(orig)
     let data = p.value.get
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidInet, 1)]
-    let decoded = row.getInet(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let decoded = row.getInet(0)
     check decoded == orig
 
   test "roundtrip binary IPv6":
     let orig = PgInet(address: parseIpAddress("2001:db8::1"), mask: 48)
     let p = toPgBinaryParam(orig)
     let data = p.value.get
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidInet, 1)]
-    let decoded = row.getInet(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let decoded = row.getInet(0)
     check decoded == orig
 
 suite "PgCidr":
@@ -2133,9 +2152,9 @@ suite "PgCidr":
 
   test "getCidr binary format":
     let data = @[2'u8, 8, 1, 4, 10, 0, 0, 0]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidCidr, 1)]
-    let v = row.getCidr(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getCidr(0)
     check v.address == parseIpAddress("10.0.0.0")
     check v.mask == 8
 
@@ -2146,9 +2165,9 @@ suite "PgCidr":
   test "roundtrip binary":
     let orig = PgCidr(address: parseIpAddress("192.168.0.0"), mask: 16)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[some(p.value.get)]
     let fields = @[mkField(OidCidr, 1)]
-    let decoded = row.getCidr(0, fields)
+    let row = mkRow(@[some(p.value.get)], fields)
+    let decoded = row.getCidr(0)
     check decoded == orig
 
 suite "PgMacAddr":
@@ -2191,17 +2210,17 @@ suite "PgMacAddr":
 
   test "getMacAddr binary format":
     let data = @[0x08'u8, 0x00, 0x2b, 0x01, 0x02, 0x03]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidMacAddr, 1)]
-    let v = row.getMacAddr(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getMacAddr(0)
     check v == PgMacAddr("08:00:2b:01:02:03")
 
   test "getMacAddr binary NULL raises":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidMacAddr, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
     var raised = false
     try:
-      discard row.getMacAddr(0, fields)
+      discard row.getMacAddr(0)
     except PgTypeError:
       raised = true
     check raised
@@ -2219,9 +2238,9 @@ suite "PgMacAddr":
   test "roundtrip binary":
     let orig = PgMacAddr("aa:bb:cc:dd:ee:ff")
     let p = toPgBinaryParam(orig)
-    let row: Row = @[some(p.value.get)]
     let fields = @[mkField(OidMacAddr, 1)]
-    let decoded = row.getMacAddr(0, fields)
+    let row = mkRow(@[some(p.value.get)], fields)
+    let decoded = row.getMacAddr(0)
     check decoded == orig
 
 suite "PgMacAddr8":
@@ -2257,17 +2276,17 @@ suite "PgMacAddr8":
 
   test "getMacAddr8 binary format":
     let data = @[0x08'u8, 0x00, 0x2b, 0x01, 0x02, 0x03, 0x04, 0x05]
-    let row: Row = @[some(data)]
     let fields = @[mkField(OidMacAddr8, 1)]
-    let v = row.getMacAddr8(0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getMacAddr8(0)
     check v == PgMacAddr8("08:00:2b:01:02:03:04:05")
 
   test "getMacAddr8 binary NULL raises":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidMacAddr8, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
     var raised = false
     try:
-      discard row.getMacAddr8(0, fields)
+      discard row.getMacAddr8(0)
     except PgTypeError:
       raised = true
     check raised
@@ -2279,9 +2298,9 @@ suite "PgMacAddr8":
   test "roundtrip binary":
     let orig = PgMacAddr8("aa:bb:cc:dd:ee:ff:00:11")
     let p = toPgBinaryParam(orig)
-    let row: Row = @[some(p.value.get)]
     let fields = @[mkField(OidMacAddr8, 1)]
-    let decoded = row.getMacAddr8(0, fields)
+    let row = mkRow(@[some(p.value.get)], fields)
+    let decoded = row.getMacAddr8(0)
     check decoded == orig
 
 # User-defined enum tests
@@ -2359,25 +2378,23 @@ suite "User-defined enum":
   test "getEnum binary format":
     let row: Row = @[some(toBytes("sad"))]
     # Use a non-standard OID to simulate a user-defined enum type
-    let fields = @[mkField(99999'i32, 1'i16)]
-    check getEnum[Mood](row, 0, fields) == sad
+    check getEnum[Mood](row, 0) == sad
 
   test "getEnum binary format falls back to text":
     let row: Row = @[some(toBytes("ok"))]
-    let fields = @[mkField(99999'i32, 0'i16)]
-    check getEnum[Mood](row, 0, fields) == ok
+    check getEnum[Mood](row, 0) == ok
 
   test "getEnumOpt binary NULL":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(99999'i32, 1'i16)]
-    check getEnumOpt[Mood](row, 0, fields) == none(Mood)
+    let row = mkRow(@[none(seq[byte])], fields)
+    check getEnumOpt[Mood](row, 0) == none(Mood)
 
   test "getEnum binary NULL raises":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(99999'i32, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
     var raised = false
     try:
-      discard getEnum[Mood](row, 0, fields)
+      discard getEnum[Mood](row, 0)
     except PgTypeError:
       raised = true
     check raised
@@ -2402,9 +2419,9 @@ suite "User-defined enum":
   test "roundtrip binary":
     let orig = happy
     let p = toPgParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(99999'i32, 1'i16)]
-    check getEnum[Mood](row, 0, fields) == orig
+    let row = mkRow(@[p.value], fields)
+    check getEnum[Mood](row, 0) == orig
 
 # Composite type tests
 
@@ -2621,23 +2638,22 @@ suite "User-defined composite":
       (oid: OidFloat8, data: some(@(toBE64(cast[int64](2.72'f64))))),
     ]
     let data = encodeBinaryComposite(fields_data)
-    let row: Row = @[some(data)]
     let fields = @[mkField(50000'i32, 1'i16)]
-    let pt = getComposite[PointRecord](row, 0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let pt = getComposite[PointRecord](row, 0)
     check abs(pt.x - 3.14) < 1e-10
     check abs(pt.y - 2.72) < 1e-10
 
   test "getComposite binary text fallback":
     let row: Row = @[some(toBytes("(5.0,6.0)"))]
-    let fields = @[mkField(50000'i32, 0'i16)]
-    let pt = getComposite[PointRecord](row, 0, fields)
+    let pt = getComposite[PointRecord](row, 0)
     check abs(pt.x - 5.0) < 1e-10
     check abs(pt.y - 6.0) < 1e-10
 
   test "getCompositeOpt binary NULL":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(50000'i32, 1'i16)]
-    check getCompositeOpt[PointRecord](row, 0, fields) == none(PointRecord)
+    let row = mkRow(@[none(seq[byte])], fields)
+    check getCompositeOpt[PointRecord](row, 0) == none(PointRecord)
 
   test "roundtrip text":
     let orig = PointRecord(x: 1.5, y: -3.7)
@@ -2687,9 +2703,9 @@ suite "User-defined composite":
       (oid: OidText, data: none(seq[byte])),
     ]
     let data = encodeBinaryComposite(fields_data)
-    let row: Row = @[some(data)]
     let fields = @[mkField(0'i32, 1'i16)]
-    let r = getComposite[NullableRecord](row, 0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let r = getComposite[NullableRecord](row, 0)
     check r.name == "Eve"
     check r.age == none(int32)
     check r.note == none(string)
@@ -2701,9 +2717,9 @@ suite "User-defined composite":
       (oid: OidText, data: some(toBytes("note"))),
     ]
     let data = encodeBinaryComposite(fields_data)
-    let row: Row = @[some(data)]
     let fields = @[mkField(0'i32, 1'i16)]
-    let r = getComposite[NullableRecord](row, 0, fields)
+    let row = mkRow(@[some(data)], fields)
+    let r = getComposite[NullableRecord](row, 0)
     check r.name == "Fay"
     check r.age == some(99'i32)
     check r.note == some("note")
@@ -2995,41 +3011,41 @@ suite "Range binary decoding (roundtrip)":
   test "int4range roundtrip":
     let orig = rangeOf(1'i32, 10'i32)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Range, 1'i16)]
-    let decoded = row.getInt4Range(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4Range(0)
     check decoded == orig
 
   test "int4range empty roundtrip":
     let orig = emptyRange[int32]()
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Range, 1'i16)]
-    let decoded = row.getInt4Range(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4Range(0)
     check decoded.isEmpty == true
 
   test "int8range roundtrip":
     let orig = rangeOf(100'i64, 999'i64, upperInc = true)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt8Range, 1'i16)]
-    let decoded = row.getInt8Range(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt8Range(0)
     check decoded == orig
 
   test "int4range unbounded lower roundtrip":
     let orig = rangeTo[int32](10'i32)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Range, 1'i16)]
-    let decoded = row.getInt4Range(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4Range(0)
     check decoded == orig
 
   test "int4range unbounded upper roundtrip":
     let orig = rangeFrom[int32](5'i32)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Range, 1'i16)]
-    let decoded = row.getInt4Range(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4Range(0)
     check decoded == orig
 
   test "tsrange roundtrip":
@@ -3037,9 +3053,9 @@ suite "Range binary decoding (roundtrip)":
     let dt2 = dateTime(2023, mDec, 31, zone = utc())
     let orig = rangeOf(dt1, dt2)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidTsRange, 1'i16)]
-    let decoded = row.getTsRange(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getTsRange(0)
     check decoded.hasLower == true
     check decoded.hasUpper == true
     check decoded.lower.inclusive == true
@@ -3054,9 +3070,9 @@ suite "Range binary decoding (roundtrip)":
     let dt2 = dateTime(2023, mDec, 31, zone = utc())
     let orig = rangeOf(dt1, dt2)
     let p = toPgBinaryDateRangeParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidDateRange, 1'i16)]
-    let decoded = row.getDateRange(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getDateRange(0)
     check decoded.hasLower == true
     check decoded.hasUpper == true
     check decoded.lower.value.year == 2023
@@ -3100,8 +3116,7 @@ suite "Range row getters":
 
   test "getInt4Range format-aware text fallback":
     let row: Row = @[some(toBytes("[1,10)"))]
-    let fields = @[mkField(OidInt4Range, 0'i16)]
-    check row.getInt4Range(0, fields) == rangeOf(1'i32, 10'i32)
+    check row.getInt4Range(0) == rangeOf(1'i32, 10'i32)
 
   test "getInt4RangeOpt text some":
     let row: Row = @[some(toBytes("[1,10)"))]
@@ -3115,16 +3130,16 @@ suite "Range row getters":
 
   test "getInt4RangeOpt format-aware some":
     let p = toPgBinaryParam(rangeOf(1'i32, 10'i32))
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Range, 1'i16)]
-    let r = row.getInt4RangeOpt(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let r = row.getInt4RangeOpt(0)
     check r.isSome
     check r.get == rangeOf(1'i32, 10'i32)
 
   test "getInt4RangeOpt format-aware none":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInt4Range, 1'i16)]
-    check row.getInt4RangeOpt(0, fields).isNone
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getInt4RangeOpt(0).isNone
 
 suite "PgMultirange":
   test "constructor and display":
@@ -3248,31 +3263,30 @@ suite "Multirange binary roundtrip":
     let p = toPgBinaryParam(orig)
     check p.oid == OidInt4Multirange
     check p.format == 1'i16
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Multirange, 1'i16)]
-    let decoded = row.getInt4Multirange(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4Multirange(0)
     check decoded == orig
 
   test "int8multirange roundtrip":
     let orig = toMultirange(rangeOf(100'i64, 200'i64), rangeOf(300'i64, 400'i64))
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt8Multirange, 1'i16)]
-    let decoded = row.getInt8Multirange(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt8Multirange(0)
     check decoded == orig
 
   test "empty int4multirange roundtrip":
     let orig = toMultirange[int32]()
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Multirange, 1'i16)]
-    let decoded = row.getInt4Multirange(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4Multirange(0)
     check decoded.len == 0
 
   test "int4multirange format-aware text fallback":
     let row: Row = @[some(toBytes("{[1,3),[5,8)}"))]
-    let fields = @[mkField(OidInt4Multirange, 0'i16)]
-    let mr = row.getInt4Multirange(0, fields)
+    let mr = row.getInt4Multirange(0)
     check mr.len == 2
     check mr[0] == rangeOf(1'i32, 3'i32)
 
@@ -3283,9 +3297,9 @@ suite "Multirange binary roundtrip":
     let dt4 = dateTime(2023, mDec, 31, zone = utc())
     let orig = toMultirange(rangeOf(dt1, dt2), rangeOf(dt3, dt4))
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidTsMultirange, 1'i16)]
-    let decoded = row.getTsMultirange(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getTsMultirange(0)
     check decoded.len == 2
     check decoded[0].lower.value.year == 2023
     check decoded[0].lower.value.month == mJan
@@ -3293,16 +3307,16 @@ suite "Multirange binary roundtrip":
   test "getInt4MultirangeOpt format-aware some":
     let orig = toMultirange(rangeOf(1'i32, 3'i32))
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidInt4Multirange, 1'i16)]
-    let r = row.getInt4MultirangeOpt(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let r = row.getInt4MultirangeOpt(0)
     check r.isSome
     check r.get == orig
 
   test "getInt4MultirangeOpt format-aware none":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidInt4Multirange, 1'i16)]
-    check row.getInt4MultirangeOpt(0, fields).isNone
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getInt4MultirangeOpt(0).isNone
 
 suite "Geometry types":
   test "OID constants":
@@ -3496,33 +3510,33 @@ suite "Geometry types":
   test "PgPoint binary roundtrip":
     let orig = PgPoint(x: -3.14, y: 2.718)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidPoint, 1'i16)]
-    let decoded = row.getPoint(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getPoint(0)
     check decoded == orig
 
   test "PgLine binary roundtrip":
     let orig = PgLine(a: 1.0, b: -2.0, c: 3.5)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidLine, 1'i16)]
-    let decoded = row.getLine(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getLine(0)
     check decoded == orig
 
   test "PgLseg binary roundtrip":
     let orig = PgLseg(p1: PgPoint(x: -1.0, y: 2.0), p2: PgPoint(x: 3.0, y: -4.0))
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidLseg, 1'i16)]
-    let decoded = row.getLseg(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getLseg(0)
     check decoded == orig
 
   test "PgBox binary roundtrip":
     let orig = PgBox(high: PgPoint(x: 5.0, y: 6.0), low: PgPoint(x: 1.0, y: 2.0))
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidBox, 1'i16)]
-    let decoded = row.getBox(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getBox(0)
     check decoded == orig
 
   test "PgPath binary roundtrip closed":
@@ -3532,18 +3546,18 @@ suite "Geometry types":
         @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 0.0, y: 1.0)],
     )
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidPath, 1'i16)]
-    let decoded = row.getPath(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getPath(0)
     check decoded == orig
 
   test "PgPath binary roundtrip open":
     let orig =
       PgPath(closed: false, points: @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 5.0, y: 5.0)])
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidPath, 1'i16)]
-    let decoded = row.getPath(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getPath(0)
     check decoded == orig
 
   test "PgPolygon binary roundtrip":
@@ -3552,17 +3566,17 @@ suite "Geometry types":
         @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 4.0, y: 0.0), PgPoint(x: 2.0, y: 3.0)]
     )
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidPolygon, 1'i16)]
-    let decoded = row.getPolygon(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getPolygon(0)
     check decoded == orig
 
   test "PgCircle binary roundtrip":
     let orig = PgCircle(center: PgPoint(x: -1.5, y: 2.5), radius: 10.0)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidCircle, 1'i16)]
-    let decoded = row.getCircle(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getCircle(0)
     check decoded == orig
 
   # Opt accessor tests
@@ -3577,13 +3591,13 @@ suite "Geometry types":
   test "getCircleOpt binary some":
     let orig = PgCircle(center: PgPoint(x: 0.0, y: 0.0), radius: 1.0)
     let p = toPgBinaryParam(orig)
-    let row: Row = @[p.value]
     let fields = @[mkField(OidCircle, 1'i16)]
-    let r = row.getCircleOpt(0, fields)
+    let row = mkRow(@[p.value], fields)
+    let r = row.getCircleOpt(0)
     check r.isSome
     check r.get == orig
 
   test "getCircleOpt binary none":
-    let row: Row = @[none(seq[byte])]
     let fields = @[mkField(OidCircle, 1'i16)]
-    check row.getCircleOpt(0, fields).isNone
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getCircleOpt(0).isNone

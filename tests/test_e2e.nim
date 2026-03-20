@@ -2964,12 +2964,12 @@ suite "E2E: Binary Format":
       )
       doAssert qr.rows.len == 1
       let row = qr.rows[0]
-      doAssert row.getInt(0, qr.fields) == 42'i32 # int2 promoted via getInt
-      doAssert row.getInt(1, qr.fields) == 123456'i32
-      doAssert row.getInt64(2, qr.fields) == 9999999999'i64
+      doAssert row.getInt(0) == 42'i32 # int2 promoted via getInt
+      doAssert row.getInt(1) == 123456'i32
+      doAssert row.getInt64(2) == 9999999999'i64
       # getInt64 should also work on int2/int4 columns (promotion)
-      doAssert row.getInt64(0, qr.fields) == 42'i64
-      doAssert row.getInt64(1, qr.fields) == 123456'i64
+      doAssert row.getInt64(0) == 42'i64
+      doAssert row.getInt64(1) == 123456'i64
       await conn.close()
 
     waitFor t()
@@ -2982,8 +2982,8 @@ suite "E2E: Binary Format":
       )
       doAssert qr.rows.len == 1
       let row = qr.rows[0]
-      doAssert abs(row.getFloat(0, qr.fields) - 3.14) < 1e-10
-      doAssert abs(row.getFloat(1, qr.fields) - 1.5) < 1e-5
+      doAssert abs(row.getFloat(0) - 3.14) < 1e-10
+      doAssert abs(row.getFloat(1) - 1.5) < 1e-5
       await conn.close()
 
     waitFor t()
@@ -2993,8 +2993,8 @@ suite "E2E: Binary Format":
       let conn = await connect(plainConfig())
       let qr = await conn.query("SELECT true, false", resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      doAssert qr.rows[0].getBool(0, qr.fields) == true
-      doAssert qr.rows[0].getBool(1, qr.fields) == false
+      doAssert qr.rows[0].getBool(0) == true
+      doAssert qr.rows[0].getBool(1) == false
       await conn.close()
 
     waitFor t()
@@ -3006,8 +3006,8 @@ suite "E2E: Binary Format":
         "SELECT 'hello'::text, 'world'::varchar", resultFormats = binaryFormat
       )
       doAssert qr.rows.len == 1
-      doAssert qr.rows[0].getStr(0, qr.fields) == "hello"
-      doAssert qr.rows[0].getStr(1, qr.fields) == "world"
+      doAssert qr.rows[0].getStr(0) == "hello"
+      doAssert qr.rows[0].getStr(1) == "world"
       await conn.close()
 
     waitFor t()
@@ -3018,7 +3018,7 @@ suite "E2E: Binary Format":
       let qr =
         await conn.query("SELECT '\\xDEADBEEF'::bytea", resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      doAssert qr.rows[0].getBytes(0, qr.fields) == @[0xDE'u8, 0xAD, 0xBE, 0xEF]
+      doAssert qr.rows[0].getBytes(0) == @[0xDE'u8, 0xAD, 0xBE, 0xEF]
       await conn.close()
 
     waitFor t()
@@ -3030,7 +3030,7 @@ suite "E2E: Binary Format":
         "SELECT '2024-01-15 10:30:00'::timestamp", resultFormats = binaryFormat
       )
       doAssert qr.rows.len == 1
-      let dt = qr.rows[0].getTimestamp(0, qr.fields)
+      let dt = qr.rows[0].getTimestamp(0)
       doAssert dt.year == 2024
       doAssert dt.month == mJan
       doAssert dt.monthday == 15
@@ -3046,7 +3046,7 @@ suite "E2E: Binary Format":
       let qr =
         await conn.query("SELECT '2024-01-15'::date", resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      let dt = qr.rows[0].getDate(0, qr.fields)
+      let dt = qr.rows[0].getDate(0)
       doAssert dt.year == 2024
       doAssert dt.month == mJan
       doAssert dt.monthday == 15
@@ -3062,7 +3062,7 @@ suite "E2E: Binary Format":
         resultFormats = binaryFormat,
       )
       doAssert qr.rows.len == 1
-      let data = qr.rows[0].getBytes(0, qr.fields)
+      let data = qr.rows[0].getBytes(0)
       doAssert data.len == 16
       doAssert data[0] == 0x55'u8
       doAssert data[1] == 0x0e'u8
@@ -3080,9 +3080,9 @@ suite "E2E: Binary Format":
         "SELECT $1::int4, $2::int8, $3::bool", params, resultFormats = binaryFormat
       )
       doAssert qr.rows.len == 1
-      doAssert qr.rows[0].getInt(0, qr.fields) == 42'i32
-      doAssert qr.rows[0].getInt64(1, qr.fields) == 9999999999'i64
-      doAssert qr.rows[0].getBool(2, qr.fields) == true
+      doAssert qr.rows[0].getInt(0) == 42'i32
+      doAssert qr.rows[0].getInt64(1) == 9999999999'i64
+      doAssert qr.rows[0].getBool(2) == true
       await conn.close()
 
     waitFor t()
@@ -3104,7 +3104,7 @@ suite "E2E: Binary Format":
       let params = @[toPgParam(42'i32)]
       let qr = await conn.query("SELECT $1::int4", params, resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      doAssert qr.rows[0].getInt(0, qr.fields) == 42'i32
+      doAssert qr.rows[0].getInt(0) == 42'i32
       await conn.close()
 
     waitFor t()
@@ -3128,7 +3128,7 @@ suite "E2E: Binary Format":
       let qr =
         await stmt.execute(@[toPgBinaryParam(32'i32)], resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      doAssert qr.rows[0].getInt(0, qr.fields) == 42'i32
+      doAssert qr.rows[0].getInt(0) == 42'i32
       await stmt.close()
       await conn.close()
 
@@ -3142,7 +3142,7 @@ suite "E2E: Binary Format":
       let qr =
         await conn.query("SELECT $1::timestamp", params, resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      let result = qr.rows[0].getTimestamp(0, qr.fields)
+      let result = qr.rows[0].getTimestamp(0)
       doAssert result.year == 2024
       doAssert result.month == mJan
       doAssert result.monthday == 15
@@ -3159,7 +3159,7 @@ suite "E2E: Binary Format":
       let qr =
         await conn.query("SELECT $1::float8", params, resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      doAssert abs(qr.rows[0].getFloat(0, qr.fields) - 3.14159265358979) < 1e-14
+      doAssert abs(qr.rows[0].getFloat(0) - 3.14159265358979) < 1e-14
       await conn.close()
 
     waitFor t()
@@ -3172,7 +3172,7 @@ suite "E2E: Binary Format":
       let qr =
         await conn.query("SELECT $1::bytea", params, resultFormats = binaryFormat)
       doAssert qr.rows.len == 1
-      doAssert qr.rows[0].getBytes(0, qr.fields) == data
+      doAssert qr.rows[0].getBytes(0) == data
       await conn.close()
 
     waitFor t()
@@ -4552,12 +4552,12 @@ suite "E2E: Convenience Query Methods":
       let conn = await connect(plainConfig())
 
       let r1 = await conn.query("SELECT 42::int4", resultFormats = binaryFormat)
-      doAssert r1.rows[0].getInt(0, r1.fields) == 42
+      doAssert r1.rows[0].getInt(0) == 42
       doAssert conn.stmtCache.len == 1
 
       # Cache hit with binary format
       let r2 = await conn.query("SELECT 42::int4", resultFormats = binaryFormat)
-      doAssert r2.rows[0].getInt(0, r2.fields) == 42
+      doAssert r2.rows[0].getInt(0) == 42
 
       await conn.close()
 

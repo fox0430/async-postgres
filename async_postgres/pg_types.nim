@@ -688,23 +688,6 @@ proc encodePointBinary(p: PgPoint): seq[byte] =
   let yBytes = toBE64(cast[int64](p.y))
   copyMem(addr result[8], unsafeAddr yBytes[0], 8)
 
-proc decodePointBinary(data: openArray[byte], off: int): PgPoint =
-  ## Decode a point from 16 bytes at offset.
-  var xBits = uint64(
-    (uint64(data[off]) shl 56) or (uint64(data[off + 1]) shl 48) or
-      (uint64(data[off + 2]) shl 40) or (uint64(data[off + 3]) shl 32) or
-      (uint64(data[off + 4]) shl 24) or (uint64(data[off + 5]) shl 16) or
-      (uint64(data[off + 6]) shl 8) or uint64(data[off + 7])
-  )
-  var yBits = uint64(
-    (uint64(data[off + 8]) shl 56) or (uint64(data[off + 9]) shl 48) or
-      (uint64(data[off + 10]) shl 40) or (uint64(data[off + 11]) shl 32) or
-      (uint64(data[off + 12]) shl 24) or (uint64(data[off + 13]) shl 16) or
-      (uint64(data[off + 14]) shl 8) or uint64(data[off + 15])
-  )
-  copyMem(addr result.x, addr xBits, 8)
-  copyMem(addr result.y, addr yBits, 8)
-
 proc toPgBinaryParam*(v: PgPoint): PgParam =
   ## Binary format: 16 bytes (two float64 big-endian).
   PgParam(oid: OidPoint, format: 1, value: some(encodePointBinary(v)))
@@ -797,6 +780,300 @@ proc fromPgText*(data: seq[byte], oid: int32): string =
   result = newString(data.len)
   for i in 0 ..< data.len:
     result[i] = char(data[i])
+
+# Binary decoders needed by both basic and format-aware row accessors.
+# Placed before the Row getters to avoid forward-declaration issues.
+
+proc decodeNumericBinary(data: openArray[byte]): string =
+  ## Decode PostgreSQL binary numeric format:
+  ##   2 bytes: ndigits (number of base-10000 digit groups)
+  ##   2 bytes: weight (weight of first digit)
+  ##   2 bytes: sign (0x0000=positive, 0x4000=negative, 0xC000=NaN)
+  ##   2 bytes: dscale (digits after decimal point)
+  ##   ndigits * 2 bytes: digit groups (each 0-9999)
+  let ndigits = int(fromBE16(data.toOpenArray(0, 1)))
+  let weight = int(int16(fromBE16(data.toOpenArray(2, 3))))
+  let sign = uint16(fromBE16(data.toOpenArray(4, 5)))
+  let dscale = int(fromBE16(data.toOpenArray(6, 7)))
+  if sign == 0xC000'u16:
+    return "NaN"
+  var digits = newSeq[int16](ndigits)
+  for i in 0 ..< ndigits:
+    digits[i] = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
+  if ndigits == 0:
+    if dscale > 0:
+      return "0." & repeat('0', dscale)
+    return "0"
+  var intPart = ""
+  var fracPart = ""
+  let intGroups = weight + 1
+  for i in 0 ..< ndigits:
+    let d = int(digits[i])
+    if i < intGroups:
+      if intPart.len == 0:
+        intPart.add($d)
+      else:
+        let s = $d
+        intPart.add(repeat('0', 4 - s.len))
+        intPart.add(s)
+    else:
+      let s = $d
+      fracPart.add(repeat('0', 4 - s.len))
+      fracPart.add(s)
+  if intGroups > ndigits:
+    intPart.add(repeat('0', (intGroups - ndigits) * 4))
+  if intPart.len == 0:
+    intPart = "0"
+    let leadingZeroGroups = -intGroups
+    fracPart = repeat('0', leadingZeroGroups * 4) & fracPart
+  if dscale > 0:
+    if fracPart.len > dscale:
+      fracPart = fracPart[0 ..< dscale]
+    elif fracPart.len < dscale:
+      fracPart.add(repeat('0', dscale - fracPart.len))
+    result = (if sign == 0x4000'u16: "-" else: "") & intPart & "." & fracPart
+  else:
+    result = (if sign == 0x4000'u16: "-" else: "") & intPart
+
+proc decodeBinaryTimestamp(data: openArray[byte]): DateTime =
+  let pgUs = fromBE64(data)
+  let unixUs = pgUs + pgEpochUnix * 1_000_000
+  var unixSec = unixUs div 1_000_000
+  var fracUs = unixUs mod 1_000_000
+  if fracUs < 0:
+    unixSec -= 1
+    fracUs += 1_000_000
+  initTime(unixSec, int(fracUs * 1000)).utc()
+
+proc decodeBinaryDate(data: openArray[byte]): DateTime =
+  let pgDays = fromBE32(data)
+  let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
+  initTime(unixSec, 0).utc()
+
+proc decodeInetBinary(data: openArray[byte]): tuple[address: IpAddress, mask: uint8] =
+  ## Decode PostgreSQL binary inet/cidr format:
+  ##   1 byte: family (2=IPv4, 3=IPv6)
+  ##   1 byte: bits (netmask length)
+  ##   1 byte: is_cidr (0 or 1)
+  ##   1 byte: addrlen (4 or 16)
+  ##   N bytes: address
+  let family = data[0]
+  let bits = data[1]
+  # data[2] = is_cidr, ignored for decoding
+  # data[3] = addrlen
+  if family == 2:
+    var ip = IpAddress(family: IpAddressFamily.IPv4)
+    for i in 0 ..< 4:
+      ip.address_v4[i] = data[4 + i]
+    (ip, bits)
+  else:
+    var ip = IpAddress(family: IpAddressFamily.IPv6)
+    for i in 0 ..< 16:
+      ip.address_v6[i] = data[4 + i]
+    (ip, bits)
+
+proc decodePointBinary(data: openArray[byte], off: int): PgPoint =
+  ## Decode a point from 16 bytes at offset.
+  var xBits = uint64(
+    (uint64(data[off]) shl 56) or (uint64(data[off + 1]) shl 48) or
+      (uint64(data[off + 2]) shl 40) or (uint64(data[off + 3]) shl 32) or
+      (uint64(data[off + 4]) shl 24) or (uint64(data[off + 5]) shl 16) or
+      (uint64(data[off + 6]) shl 8) or uint64(data[off + 7])
+  )
+  var yBits = uint64(
+    (uint64(data[off + 8]) shl 56) or (uint64(data[off + 9]) shl 48) or
+      (uint64(data[off + 10]) shl 40) or (uint64(data[off + 11]) shl 32) or
+      (uint64(data[off + 12]) shl 24) or (uint64(data[off + 13]) shl 16) or
+      (uint64(data[off + 14]) shl 8) or uint64(data[off + 15])
+  )
+  copyMem(addr result.x, addr xBits, 8)
+  copyMem(addr result.y, addr yBits, 8)
+
+proc decodeBinaryArray*(
+    data: openArray[byte]
+): tuple[elemOid: int32, elements: seq[tuple[off: int, len: int]]] =
+  ## Decode a PostgreSQL binary array, returning element OID and (offset, length) pairs.
+  ## Offsets are relative to the start of `data`.
+  if data.len < 12:
+    raise newException(PgTypeError, "Binary array too short")
+  let ndim = fromBE32(data.toOpenArray(0, 3))
+  # has_null at offset 4
+  result.elemOid = fromBE32(data.toOpenArray(8, 11))
+  if ndim == 0:
+    result.elements = @[]
+    return
+  if ndim != 1:
+    raise
+      newException(PgTypeError, "Multi-dimensional arrays not supported, ndim=" & $ndim)
+  if data.len < 20:
+    raise newException(PgTypeError, "Binary array header too short")
+  let dimLen = int(fromBE32(data.toOpenArray(12, 15)))
+  # lower_bound at offset 16, ignored
+  result.elements = newSeq[tuple[off: int, len: int]](dimLen)
+  var pos = 20
+  for i in 0 ..< dimLen:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary array truncated at element " & $i)
+    let eLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    if eLen == -1:
+      result.elements[i] = (off: 0, len: -1)
+    else:
+      result.elements[i] = (off: pos, len: eLen)
+      pos += eLen
+
+proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
+  if data.len < 1:
+    raise newException(PgTypeError, "Binary range too short")
+  let flags = data[0]
+  if (flags and rangeEmpty) != 0:
+    result.isEmpty = true
+    return
+  result.hasLower = (flags and rangeHasLower) != 0
+  result.hasUpper = (flags and rangeHasUpper) != 0
+  result.lowerInc = (flags and rangeLowerInc) != 0
+  result.upperInc = (flags and rangeUpperInc) != 0
+  var pos = 1
+  if result.hasLower:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary range truncated at lower bound length")
+    let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    result.lowerOff = pos
+    result.lowerLen = bLen
+    pos += bLen
+  if result.hasUpper:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary range truncated at upper bound length")
+    let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    result.upperOff = pos
+    result.upperLen = bLen
+
+proc decodeInt4RangeBinary(data: openArray[byte]): PgRange[int32] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[int32](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[int32](
+      value: fromBE32(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[int32](
+      value: fromBE32(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
+      inclusive: raw.upperInc,
+    )
+
+proc decodeInt8RangeBinary(data: openArray[byte]): PgRange[int64] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[int64](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[int64](
+      value: fromBE64(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[int64](
+      value: fromBE64(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
+      inclusive: raw.upperInc,
+    )
+
+proc decodeNumRangeBinary(data: openArray[byte]): PgRange[PgNumeric] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[PgNumeric](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    let s = decodeNumericBinary(
+      data.toOpenArray(raw.lowerOff, raw.lowerOff + raw.lowerLen - 1)
+    )
+    result.lower = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.lowerInc)
+  if raw.hasUpper:
+    result.hasUpper = true
+    let s = decodeNumericBinary(
+      data.toOpenArray(raw.upperOff, raw.upperOff + raw.upperLen - 1)
+    )
+    result.upper = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.upperInc)
+
+proc decodeTsRangeBinary(data: openArray[byte]): PgRange[DateTime] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[DateTime](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[DateTime](
+      value: decodeBinaryTimestamp(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[DateTime](
+      value: decodeBinaryTimestamp(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
+      inclusive: raw.upperInc,
+    )
+
+proc decodeDateRangeBinary(data: openArray[byte]): PgRange[DateTime] =
+  let raw = decodeRangeBinaryRaw(data)
+  if raw.isEmpty:
+    return PgRange[DateTime](isEmpty: true)
+  if raw.hasLower:
+    result.hasLower = true
+    result.lower = PgRangeBound[DateTime](
+      value: decodeBinaryDate(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
+      inclusive: raw.lowerInc,
+    )
+  if raw.hasUpper:
+    result.hasUpper = true
+    result.upper = PgRangeBound[DateTime](
+      value: decodeBinaryDate(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
+      inclusive: raw.upperInc,
+    )
+
+proc decodeMultirangeBinaryRaw(data: openArray[byte]): seq[tuple[off: int, len: int]] =
+  if data.len < 4:
+    raise newException(PgTypeError, "Binary multirange too short")
+  let count = int(fromBE32(data.toOpenArray(0, 3)))
+  result = newSeq[tuple[off: int, len: int]](count)
+  var pos = 4
+  for i in 0 ..< count:
+    if pos + 4 > data.len:
+      raise newException(PgTypeError, "Binary multirange truncated at range " & $i)
+    let rLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    result[i] = (off: pos, len: rLen)
+    pos += rLen
+
+proc decodeBinaryComposite*(
+    data: openArray[byte]
+): seq[tuple[oid: int32, off: int, len: int]] =
+  ## Decode a PostgreSQL binary composite value.
+  ## Returns (typeOid, offset, length) tuples. offset is relative to `data`.
+  ## length of -1 indicates NULL.
+  if data.len < 4:
+    raise newException(PgTypeError, "Binary composite too short")
+  let numFields = int(fromBE32(data.toOpenArray(0, 3)))
+  result = newSeq[tuple[oid: int32, off: int, len: int]](numFields)
+  var pos = 4
+  for i in 0 ..< numFields:
+    if pos + 8 > data.len:
+      raise newException(PgTypeError, "Binary composite truncated at field " & $i)
+    result[i].oid = fromBE32(data.toOpenArray(pos, pos + 3))
+    pos += 4
+    let flen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
+    pos += 4
+    if flen == -1:
+      result[i].off = 0
+      result[i].len = -1
+    else:
+      result[i].off = pos
+      result[i].len = flen
+      pos += flen
 
 # Row/RowData types are defined in pg_protocol and re-exported here.
 
@@ -914,6 +1191,8 @@ proc getStr*(row: Row, col: int): string =
         var f: float64
         copyMem(addr f, addr bits, 8)
         return $f
+    of OidNumeric:
+      return decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
     else:
       discard # text, varchar, bytea: fall through to raw copy
   result = newString(clen)
@@ -996,7 +1275,12 @@ proc getFloat*(row: Row, col: int): float64 =
   discard parseFloat(row.bufView(off, clen), result)
 
 proc getNumeric*(row: Row, col: int): PgNumeric =
-  ## Numeric is always requested as text format (not in binarySafeOids).
+  ## Get a column value as PgNumeric. Handles binary numeric format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return PgNumeric(decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1)))
   PgNumeric(row.getStr(col))
 
 proc getBool*(row: Row, col: int): bool =
@@ -1063,7 +1347,12 @@ proc getBytes*(row: Row, col: int): seq[byte] =
       copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
 
 proc getTimestamp*(row: Row, col: int): DateTime =
-  ## Get a column value as DateTime, parsing common PostgreSQL timestamp formats.
+  ## Get a column value as DateTime. Handles binary timestamp format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
   const formats = [
     "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
@@ -1078,7 +1367,12 @@ proc getTimestamp*(row: Row, col: int): DateTime =
   raise newException(PgTypeError, "Invalid timestamp: " & s)
 
 proc getDate*(row: Row, col: int): DateTime =
-  ## Get a column value as DateTime, parsing "yyyy-MM-dd" format.
+  ## Get a column value as DateTime. Handles binary date format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeBinaryDate(row.data.buf.toOpenArray(off, off + 3))
   let s = row.getStr(col)
   try:
     return parse(s, "yyyy-MM-dd")
@@ -1086,7 +1380,25 @@ proc getDate*(row: Row, col: int): DateTime =
     raise newException(PgTypeError, "Invalid date: " & s)
 
 proc getJson*(row: Row, col: int): JsonNode =
-  ## Get a column value as a parsed JsonNode.
+  ## Get a column value as a parsed JsonNode. Handles binary json/jsonb format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    var jsonStr: string
+    if row.colTypeOid(col) == OidJsonb and clen > 0 and row.data.buf[off] == 1:
+      # jsonb binary: skip version byte
+      jsonStr = newString(clen - 1)
+      for i in 1 ..< clen:
+        jsonStr[i - 1] = char(row.data.buf[off + i])
+    else:
+      jsonStr = newString(clen)
+      for i in 0 ..< clen:
+        jsonStr[i] = char(row.data.buf[off + i])
+    try:
+      return parseJson(jsonStr)
+    except JsonParsingError:
+      raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
   let s = row.getStr(col)
   try:
     return parseJson(s)
@@ -1188,7 +1500,17 @@ proc parseIntervalText(s: string): PgInterval =
   PgInterval(months: months, days: days, microseconds: microseconds)
 
 proc getInterval*(row: Row, col: int): PgInterval =
-  ## Get a column value as PgInterval, parsing PostgreSQL interval text format.
+  ## Get a column value as PgInterval. Handles binary interval format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 16:
+      raise newException(PgTypeError, "Invalid binary interval length: " & $clen)
+    result.microseconds = fromBE64(row.data.buf.toOpenArray(off, off + 7))
+    result.days = fromBE32(row.data.buf.toOpenArray(off + 8, off + 11))
+    result.months = fromBE32(row.data.buf.toOpenArray(off + 12, off + 15))
+    return
   let s = row.getStr(col)
   parseIntervalText(s)
 
@@ -1203,23 +1525,55 @@ proc parseInetText(s: string): tuple[address: IpAddress, mask: uint8] =
   result = (parseIpAddress(addrStr), uint8(parseInt(maskStr)))
 
 proc getInet*(row: Row, col: int): PgInet =
-  ## Get a column value as PgInet (IP address with mask).
+  ## Get a column value as PgInet (IP address with mask). Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+    return PgInet(address: ip, mask: mask)
   let s = row.getStr(col)
   let (ip, mask) = parseInetText(s)
   PgInet(address: ip, mask: mask)
 
 proc getCidr*(row: Row, col: int): PgCidr =
-  ## Get a column value as PgCidr (CIDR network address).
+  ## Get a column value as PgCidr (CIDR network address). Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+    return PgCidr(address: ip, mask: mask)
   let s = row.getStr(col)
   let (ip, mask) = parseInetText(s)
   PgCidr(address: ip, mask: mask)
 
 proc getMacAddr*(row: Row, col: int): PgMacAddr =
-  ## Get a column value as PgMacAddr.
+  ## Get a column value as PgMacAddr. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 6:
+      raise newException(PgTypeError, "Invalid binary macaddr length: " & $clen)
+    var parts = newSeq[string](6)
+    for i in 0 ..< 6:
+      parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
+    return PgMacAddr(parts.join(":"))
   PgMacAddr(row.getStr(col))
 
 proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
-  ## Get a column value as PgMacAddr8 (EUI-64).
+  ## Get a column value as PgMacAddr8 (EUI-64). Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 8:
+      raise newException(PgTypeError, "Invalid binary macaddr8 length: " & $clen)
+    var parts = newSeq[string](8)
+    for i in 0 ..< 8:
+      parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
+    return PgMacAddr8(parts.join(":"))
   PgMacAddr8(row.getStr(col))
 
 # Geometry text format parsers
@@ -1256,11 +1610,45 @@ proc parsePointsText(s: string): seq[PgPoint] =
     result.add(parsePointText(s[start ..< i]))
 
 proc getPoint*(row: Row, col: int): PgPoint =
-  ## Get a column value as PgPoint. Text format: "(x,y)".
+  ## Get a column value as PgPoint. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 16:
+      raise newException(PgTypeError, "Invalid binary point length: " & $clen)
+    return decodePointBinary(row.data.buf, off)
   parsePointText(row.getStr(col))
 
 proc getLine*(row: Row, col: int): PgLine =
-  ## Get a column value as PgLine. Text format: "{A,B,C}".
+  ## Get a column value as PgLine. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 24:
+      raise newException(PgTypeError, "Invalid binary line length: " & $clen)
+    let b = row.data.buf
+    var aBits, bBits, cBits: uint64
+    aBits =
+      (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
+      (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
+      (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
+      (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+    bBits =
+      (uint64(b[off + 8]) shl 56) or (uint64(b[off + 9]) shl 48) or
+      (uint64(b[off + 10]) shl 40) or (uint64(b[off + 11]) shl 32) or
+      (uint64(b[off + 12]) shl 24) or (uint64(b[off + 13]) shl 16) or
+      (uint64(b[off + 14]) shl 8) or uint64(b[off + 15])
+    cBits =
+      (uint64(b[off + 16]) shl 56) or (uint64(b[off + 17]) shl 48) or
+      (uint64(b[off + 18]) shl 40) or (uint64(b[off + 19]) shl 32) or
+      (uint64(b[off + 20]) shl 24) or (uint64(b[off + 21]) shl 16) or
+      (uint64(b[off + 22]) shl 8) or uint64(b[off + 23])
+    copyMem(addr result.a, addr aBits, 8)
+    copyMem(addr result.b, addr bBits, 8)
+    copyMem(addr result.c, addr cBits, 8)
+    return
   let s = row.getStr(col)
   var inner = s.strip()
   if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
@@ -1273,7 +1661,17 @@ proc getLine*(row: Row, col: int): PgLine =
   PgLine(a: parseFloat(parts[0]), b: parseFloat(parts[1]), c: parseFloat(parts[2]))
 
 proc getLseg*(row: Row, col: int): PgLseg =
-  ## Get a column value as PgLseg. Text format: "[(x1,y1),(x2,y2)]".
+  ## Get a column value as PgLseg. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 32:
+      raise newException(PgTypeError, "Invalid binary lseg length: " & $clen)
+    return PgLseg(
+      p1: decodePointBinary(row.data.buf, off),
+      p2: decodePointBinary(row.data.buf, off + 16),
+    )
   let s = row.getStr(col).strip()
   var inner = s
   if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
@@ -1284,7 +1682,17 @@ proc getLseg*(row: Row, col: int): PgLseg =
   PgLseg(p1: points[0], p2: points[1])
 
 proc getBox*(row: Row, col: int): PgBox =
-  ## Get a column value as PgBox. Text format: "(x1,y1),(x2,y2)".
+  ## Get a column value as PgBox. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 32:
+      raise newException(PgTypeError, "Invalid binary box length: " & $clen)
+    return PgBox(
+      high: decodePointBinary(row.data.buf, off),
+      low: decodePointBinary(row.data.buf, off + 16),
+    )
   let s = row.getStr(col).strip()
   let points = parsePointsText(s)
   if points.len != 2:
@@ -1292,7 +1700,18 @@ proc getBox*(row: Row, col: int): PgBox =
   PgBox(high: points[0], low: points[1])
 
 proc getPath*(row: Row, col: int): PgPath =
-  ## Get a column value as PgPath. Text: "((x,y),...)" closed or "[(x,y),...]" open.
+  ## Get a column value as PgPath. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let b = row.data.buf
+    result.closed = b[off] != 0
+    let npts = fromBE32(b.toOpenArray(off + 1, off + 4))
+    result.points = newSeq[PgPoint](npts)
+    for i in 0 ..< npts:
+      result.points[i] = decodePointBinary(b, off + 5 + i * 16)
+    return
   let s = row.getStr(col).strip()
   if s.len < 2:
     raise newException(PgTypeError, "Invalid path: " & s)
@@ -1302,7 +1721,17 @@ proc getPath*(row: Row, col: int): PgPath =
   PgPath(closed: closed, points: points)
 
 proc getPolygon*(row: Row, col: int): PgPolygon =
-  ## Get a column value as PgPolygon. Text format: "((x1,y1),(x2,y2),...)".
+  ## Get a column value as PgPolygon. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let b = row.data.buf
+    let npts = fromBE32(b.toOpenArray(off, off + 3))
+    result.points = newSeq[PgPoint](npts)
+    for i in 0 ..< npts:
+      result.points[i] = decodePointBinary(b, off + 4 + i * 16)
+    return
   let s = row.getStr(col).strip()
   if s.len < 2 or s[0] != '(' or s[^1] != ')':
     raise newException(PgTypeError, "Invalid polygon: " & s)
@@ -1310,7 +1739,23 @@ proc getPolygon*(row: Row, col: int): PgPolygon =
   PgPolygon(points: parsePointsText(inner))
 
 proc getCircle*(row: Row, col: int): PgCircle =
-  ## Get a column value as PgCircle. Text format: "<(x,y),r>".
+  ## Get a column value as PgCircle. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 24:
+      raise newException(PgTypeError, "Invalid binary circle length: " & $clen)
+    result.center = decodePointBinary(row.data.buf, off)
+    var rBits: uint64
+    let b = row.data.buf
+    rBits =
+      (uint64(b[off + 16]) shl 56) or (uint64(b[off + 17]) shl 48) or
+      (uint64(b[off + 18]) shl 40) or (uint64(b[off + 19]) shl 32) or
+      (uint64(b[off + 20]) shl 24) or (uint64(b[off + 21]) shl 16) or
+      (uint64(b[off + 22]) shl 8) or uint64(b[off + 23])
+    copyMem(addr result.radius, addr rBits, 8)
+    return
   let s = row.getStr(col).strip()
   if s.len < 2 or s[0] != '<' or s[^1] != '>':
     raise newException(PgTypeError, "Invalid circle: " & s)
@@ -1345,14 +1790,6 @@ template optAccessor(getProc, optProc: untyped, T: typedesc) =
       none(T)
     else:
       some(row.getProc(col))
-
-template optFieldsAccessor(getProc, optProc: untyped, T: typedesc) =
-  ## Generate ``optProc*(row, col, fields): Option[T]`` that delegates to ``getProc``.
-  proc optProc*(row: Row, col: int, fields: seq[FieldDescription]): Option[T] =
-    if row.isNull(col):
-      none(T)
-    else:
-      some(row.getProc(col, fields))
 
 template nameAccessor(getProc: untyped, T: typedesc) =
   ## Generate ``getProc*(row, name): T`` that delegates to the index-based overload.
@@ -1420,7 +1857,19 @@ proc parseTextArray*(s: string): seq[Option[string]] =
       i += 1
 
 proc getIntArray*(row: Row, col: int): seq[int32] =
-  ## Get a column value as a seq of int32, parsing PostgreSQL array text format.
+  ## Get a column value as a seq of int32. Handles binary array format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[int32](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in int array")
+      result[i] =
+        fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
+    return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1429,6 +1878,19 @@ proc getIntArray*(row: Row, col: int): seq[int32] =
     result.add(int32(parseInt(e.get)))
 
 proc getInt16Array*(row: Row, col: int): seq[int16] =
+  ## Get a column value as a seq of int16. Handles binary array format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[int16](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in int16 array")
+      result[i] =
+        fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
+    return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1437,6 +1899,19 @@ proc getInt16Array*(row: Row, col: int): seq[int16] =
     result.add(int16(parseInt(e.get)))
 
 proc getInt64Array*(row: Row, col: int): seq[int64] =
+  ## Get a column value as a seq of int64. Handles binary array format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[int64](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in int64 array")
+      result[i] =
+        fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
+    return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1445,6 +1920,27 @@ proc getInt64Array*(row: Row, col: int): seq[int64] =
     result.add(parseBiggestInt(e.get))
 
 proc getFloatArray*(row: Row, col: int): seq[float64] =
+  ## Get a column value as a seq of float64. Handles binary array format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[float64](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in float array")
+      if e.len == 4:
+        result[i] = float64(
+          cast[float32](cast[uint32](fromBE32(
+            row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+          )))
+        )
+      else:
+        result[i] = cast[float64](cast[uint64](fromBE64(
+          row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+        )))
+    return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1453,6 +1949,20 @@ proc getFloatArray*(row: Row, col: int): seq[float64] =
     result.add(parseFloat(e.get))
 
 proc getFloat32Array*(row: Row, col: int): seq[float32] =
+  ## Get a column value as a seq of float32. Handles binary array format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[float32](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in float32 array")
+      result[i] = cast[float32](cast[uint32](fromBE32(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )))
+    return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1461,6 +1971,18 @@ proc getFloat32Array*(row: Row, col: int): seq[float32] =
     result.add(float32(parseFloat(e.get)))
 
 proc getBoolArray*(row: Row, col: int): seq[bool] =
+  ## Get a column value as a seq of bool. Handles binary array format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[bool](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in bool array")
+      result[i] = row.data.buf[off + e.off] == 1'u8
+    return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
@@ -1475,160 +1997,26 @@ proc getBoolArray*(row: Row, col: int): seq[bool] =
       raise newException(PgTypeError, "Invalid boolean: " & e.get)
 
 proc getStrArray*(row: Row, col: int): seq[string] =
-  ## Get a column value as a seq of strings, parsing PostgreSQL array text format.
+  ## Get a column value as a seq of strings. Handles binary array format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[string](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in string array")
+      result[i] = newString(e.len)
+      if e.len > 0:
+        copyMem(addr result[i][0], unsafeAddr row.data.buf[off + e.off], e.len)
+    return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in string array")
     result.add(e.get)
-
-proc decodeBinaryArray*(
-    data: openArray[byte]
-): tuple[elemOid: int32, elements: seq[tuple[off: int, len: int]]] =
-  ## Decode a PostgreSQL binary array, returning element OID and (offset, length) pairs.
-  ## Offsets are relative to the start of `data`.
-  if data.len < 12:
-    raise newException(PgTypeError, "Binary array too short")
-  let ndim = fromBE32(data.toOpenArray(0, 3))
-  # has_null at offset 4
-  result.elemOid = fromBE32(data.toOpenArray(8, 11))
-  if ndim == 0:
-    result.elements = @[]
-    return
-  if ndim != 1:
-    raise
-      newException(PgTypeError, "Multi-dimensional arrays not supported, ndim=" & $ndim)
-  if data.len < 20:
-    raise newException(PgTypeError, "Binary array header too short")
-  let dimLen = int(fromBE32(data.toOpenArray(12, 15)))
-  # lower_bound at offset 16, ignored
-  result.elements = newSeq[tuple[off: int, len: int]](dimLen)
-  var pos = 20
-  for i in 0 ..< dimLen:
-    if pos + 4 > data.len:
-      raise newException(PgTypeError, "Binary array truncated at element " & $i)
-    let eLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
-    pos += 4
-    if eLen == -1:
-      result.elements[i] = (off: 0, len: -1)
-    else:
-      result.elements[i] = (off: pos, len: eLen)
-      pos += eLen
-
-proc getIntArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[int32] =
-  if fields[col].formatCode == 0:
-    return row.getIntArray(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-  result = newSeq[int32](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in int array")
-    result[i] = fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-
-proc getInt16Array*(row: Row, col: int, fields: seq[FieldDescription]): seq[int16] =
-  if fields[col].formatCode == 0:
-    return row.getInt16Array(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-  result = newSeq[int16](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in int16 array")
-    result[i] = fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-
-proc getInt64Array*(row: Row, col: int, fields: seq[FieldDescription]): seq[int64] =
-  if fields[col].formatCode == 0:
-    return row.getInt64Array(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-  result = newSeq[int64](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in int64 array")
-    result[i] = fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-
-proc getFloatArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[float64] =
-  if fields[col].formatCode == 0:
-    return row.getFloatArray(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-  result = newSeq[float64](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in float array")
-    if e.len == 4:
-      result[i] = float64(
-        cast[float32](cast[uint32](fromBE32(
-          row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-        )))
-      )
-    else:
-      result[i] = cast[float64](cast[uint64](fromBE64(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )))
-
-proc getFloat32Array*(row: Row, col: int, fields: seq[FieldDescription]): seq[float32] =
-  if fields[col].formatCode == 0:
-    return row.getFloat32Array(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-  result = newSeq[float32](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in float32 array")
-    result[i] = cast[float32](cast[uint32](fromBE32(
-      row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-    )))
-
-proc getBoolArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[bool] =
-  if fields[col].formatCode == 0:
-    return row.getBoolArray(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-  result = newSeq[bool](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in bool array")
-    result[i] = row.data.buf[off + e.off] == 1'u8
-
-proc getStrArray*(row: Row, col: int, fields: seq[FieldDescription]): seq[string] =
-  if fields[col].formatCode == 0:
-    return row.getStrArray(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-  result = newSeq[string](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in string array")
-    result[i] = newString(e.len)
-    if e.len > 0:
-      copyMem(addr result[i][0], unsafeAddr row.data.buf[off + e.off], e.len)
-
-# Format-aware array Opt accessors
-
-optFieldsAccessor(getIntArray, getIntArrayOpt, seq[int32])
-optFieldsAccessor(getInt16Array, getInt16ArrayOpt, seq[int16])
-optFieldsAccessor(getInt64Array, getInt64ArrayOpt, seq[int64])
-optFieldsAccessor(getFloatArray, getFloatArrayOpt, seq[float64])
-optFieldsAccessor(getFloat32Array, getFloat32ArrayOpt, seq[float32])
-optFieldsAccessor(getBoolArray, getBoolArrayOpt, seq[bool])
-optFieldsAccessor(getStrArray, getStrArrayOpt, seq[string])
 
 # Array Opt accessors (text format)
 
@@ -1639,413 +2027,6 @@ optAccessor(getFloatArray, getFloatArrayOpt, seq[float64])
 optAccessor(getFloat32Array, getFloat32ArrayOpt, seq[float32])
 optAccessor(getBoolArray, getBoolArrayOpt, seq[bool])
 optAccessor(getStrArray, getStrArrayOpt, seq[string])
-
-# Format-aware row accessors (binary support)
-
-proc decodeNumericBinary(data: openArray[byte]): string =
-  ## Decode PostgreSQL binary numeric format:
-  ##   2 bytes: ndigits (number of base-10000 digit groups)
-  ##   2 bytes: weight (weight of first digit)
-  ##   2 bytes: sign (0x0000=positive, 0x4000=negative, 0xC000=NaN)
-  ##   2 bytes: dscale (digits after decimal point)
-  ##   ndigits * 2 bytes: digit groups (each 0-9999)
-  let ndigits = int(fromBE16(data.toOpenArray(0, 1)))
-  let weight = int(int16(fromBE16(data.toOpenArray(2, 3))))
-  let sign = uint16(fromBE16(data.toOpenArray(4, 5)))
-  let dscale = int(fromBE16(data.toOpenArray(6, 7)))
-  if sign == 0xC000'u16:
-    return "NaN"
-  var digits = newSeq[int16](ndigits)
-  for i in 0 ..< ndigits:
-    digits[i] = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
-  if ndigits == 0:
-    if dscale > 0:
-      return "0." & repeat('0', dscale)
-    return "0"
-  var intPart = ""
-  var fracPart = ""
-  let intGroups = weight + 1
-  for i in 0 ..< ndigits:
-    let d = int(digits[i])
-    if i < intGroups:
-      if intPart.len == 0:
-        intPart.add($d)
-      else:
-        let s = $d
-        intPart.add(repeat('0', 4 - s.len))
-        intPart.add(s)
-    else:
-      let s = $d
-      fracPart.add(repeat('0', 4 - s.len))
-      fracPart.add(s)
-  if intGroups > ndigits:
-    intPart.add(repeat('0', (intGroups - ndigits) * 4))
-  if intPart.len == 0:
-    intPart = "0"
-    let leadingZeroGroups = -intGroups
-    fracPart = repeat('0', leadingZeroGroups * 4) & fracPart
-  if dscale > 0:
-    if fracPart.len > dscale:
-      fracPart = fracPart[0 ..< dscale]
-    elif fracPart.len < dscale:
-      fracPart.add(repeat('0', dscale - fracPart.len))
-    result = (if sign == 0x4000'u16: "-" else: "") & intPart & "." & fracPart
-  else:
-    result = (if sign == 0x4000'u16: "-" else: "") & intPart
-
-proc getStr*(row: Row, col: int, fields: seq[FieldDescription]): string =
-  if fields[col].formatCode == 0:
-    return row.getStr(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  case fields[col].typeOid
-  of OidInt2:
-    return $fromBE16(row.data.buf.toOpenArray(off, off + clen - 1))
-  of OidInt4:
-    return $fromBE32(row.data.buf.toOpenArray(off, off + clen - 1))
-  of OidInt8:
-    return $fromBE64(row.data.buf.toOpenArray(off, off + clen - 1))
-  of OidFloat4:
-    return $cast[float32](cast[uint32](fromBE32(
-      row.data.buf.toOpenArray(off, off + clen - 1)
-    )))
-  of OidFloat8:
-    return $cast[float64](cast[uint64](fromBE64(
-      row.data.buf.toOpenArray(off, off + clen - 1)
-    )))
-  of OidNumeric:
-    return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  of OidBool:
-    return if row.data.buf[off] == 1: "t" else: "f"
-  else:
-    result = newString(clen)
-    for i in 0 ..< clen:
-      result[i] = char(row.data.buf[off + i])
-
-proc getInt*(row: Row, col: int, fields: seq[FieldDescription]): int32 =
-  if fields[col].formatCode == 0:
-    return row.getInt(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen == 2:
-    int32(fromBE16(row.data.buf.toOpenArray(off, off + 1)))
-  else:
-    fromBE32(row.data.buf.toOpenArray(off, off + 3))
-
-proc getInt64*(row: Row, col: int, fields: seq[FieldDescription]): int64 =
-  if fields[col].formatCode == 0:
-    return row.getInt64(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen == 2:
-    int64(fromBE16(row.data.buf.toOpenArray(off, off + 1)))
-  elif clen == 4:
-    int64(fromBE32(row.data.buf.toOpenArray(off, off + 3)))
-  else:
-    fromBE64(row.data.buf.toOpenArray(off, off + 7))
-
-proc getNumeric*(row: Row, col: int, fields: seq[FieldDescription]): PgNumeric =
-  if fields[col].formatCode == 0:
-    return row.getNumeric(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  PgNumeric(decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1)))
-
-proc getFloat*(row: Row, col: int, fields: seq[FieldDescription]): float64 =
-  if fields[col].formatCode == 0:
-    return row.getFloat(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen == 4:
-    cast[float32](cast[uint32](fromBE32(row.data.buf.toOpenArray(off, off + 3)))).float64
-  else:
-    cast[float64](cast[uint64](fromBE64(row.data.buf.toOpenArray(off, off + 7))))
-
-proc getBool*(row: Row, col: int, fields: seq[FieldDescription]): bool =
-  if fields[col].formatCode == 0:
-    return row.getBool(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  row.data.buf[off] == 1'u8
-
-proc getBytes*(row: Row, col: int, fields: seq[FieldDescription]): seq[byte] =
-  if fields[col].formatCode == 0:
-    return row.getBytes(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  result = newSeq[byte](clen)
-  if clen > 0:
-    copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
-
-proc getTimestamp*(row: Row, col: int, fields: seq[FieldDescription]): DateTime =
-  if fields[col].formatCode == 0:
-    return row.getTimestamp(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let pgUs = fromBE64(row.data.buf.toOpenArray(off, off + 7))
-  let unixUs = pgUs + pgEpochUnix * 1_000_000
-  var unixSec = unixUs div 1_000_000
-  var fracUs = unixUs mod 1_000_000
-  if fracUs < 0:
-    unixSec -= 1
-    fracUs += 1_000_000
-  initTime(unixSec, int(fracUs * 1000)).utc()
-
-proc getDate*(row: Row, col: int, fields: seq[FieldDescription]): DateTime =
-  if fields[col].formatCode == 0:
-    return row.getDate(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let pgDays = fromBE32(row.data.buf.toOpenArray(off, off + 3))
-  let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
-  initTime(unixSec, 0).utc()
-
-proc getJson*(row: Row, col: int, fields: seq[FieldDescription]): JsonNode =
-  if fields[col].formatCode == 0:
-    return row.getJson(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  var jsonStr: string
-  if fields[col].typeOid == OidJsonb and clen > 0 and row.data.buf[off] == 1:
-    # jsonb binary: skip version byte
-    jsonStr = newString(clen - 1)
-    for i in 1 ..< clen:
-      jsonStr[i - 1] = char(row.data.buf[off + i])
-  else:
-    jsonStr = newString(clen)
-    for i in 0 ..< clen:
-      jsonStr[i] = char(row.data.buf[off + i])
-  try:
-    return parseJson(jsonStr)
-  except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
-
-proc getInterval*(row: Row, col: int, fields: seq[FieldDescription]): PgInterval =
-  if fields[col].formatCode == 0:
-    return row.getInterval(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 16:
-    raise newException(PgTypeError, "Invalid binary interval length: " & $clen)
-  result.microseconds = fromBE64(row.data.buf.toOpenArray(off, off + 7))
-  result.days = fromBE32(row.data.buf.toOpenArray(off + 8, off + 11))
-  result.months = fromBE32(row.data.buf.toOpenArray(off + 12, off + 15))
-
-optFieldsAccessor(getInterval, getIntervalOpt, PgInterval)
-
-proc decodeInetBinary(data: openArray[byte]): tuple[address: IpAddress, mask: uint8] =
-  ## Decode PostgreSQL binary inet/cidr format:
-  ##   1 byte: family (2=IPv4, 3=IPv6)
-  ##   1 byte: bits (netmask length)
-  ##   1 byte: is_cidr (0 or 1)
-  ##   1 byte: addrlen (4 or 16)
-  ##   N bytes: address
-  let family = data[0]
-  let bits = data[1]
-  # data[2] = is_cidr, ignored for decoding
-  # data[3] = addrlen
-  if family == 2:
-    var ip = IpAddress(family: IpAddressFamily.IPv4)
-    for i in 0 ..< 4:
-      ip.address_v4[i] = data[4 + i]
-    (ip, bits)
-  else:
-    var ip = IpAddress(family: IpAddressFamily.IPv6)
-    for i in 0 ..< 16:
-      ip.address_v6[i] = data[4 + i]
-    (ip, bits)
-
-proc getInet*(row: Row, col: int, fields: seq[FieldDescription]): PgInet =
-  if fields[col].formatCode == 0:
-    return row.getInet(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  PgInet(address: ip, mask: mask)
-
-proc getCidr*(row: Row, col: int, fields: seq[FieldDescription]): PgCidr =
-  if fields[col].formatCode == 0:
-    return row.getCidr(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  PgCidr(address: ip, mask: mask)
-
-proc getMacAddr*(row: Row, col: int, fields: seq[FieldDescription]): PgMacAddr =
-  if fields[col].formatCode == 0:
-    return row.getMacAddr(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 6:
-    raise newException(PgTypeError, "Invalid binary macaddr length: " & $clen)
-  var parts = newSeq[string](6)
-  for i in 0 ..< 6:
-    parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
-  PgMacAddr(parts.join(":"))
-
-proc getMacAddr8*(row: Row, col: int, fields: seq[FieldDescription]): PgMacAddr8 =
-  if fields[col].formatCode == 0:
-    return row.getMacAddr8(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 8:
-    raise newException(PgTypeError, "Invalid binary macaddr8 length: " & $clen)
-  var parts = newSeq[string](8)
-  for i in 0 ..< 8:
-    parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
-  PgMacAddr8(parts.join(":"))
-
-optFieldsAccessor(getInet, getInetOpt, PgInet)
-optFieldsAccessor(getCidr, getCidrOpt, PgCidr)
-optFieldsAccessor(getMacAddr, getMacAddrOpt, PgMacAddr)
-optFieldsAccessor(getMacAddr8, getMacAddr8Opt, PgMacAddr8)
-
-# Geometry binary-aware decoders
-
-proc getPoint*(row: Row, col: int, fields: seq[FieldDescription]): PgPoint =
-  if fields[col].formatCode == 0:
-    return row.getPoint(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 16:
-    raise newException(PgTypeError, "Invalid binary point length: " & $clen)
-  decodePointBinary(row.data.buf, off)
-
-proc getLine*(row: Row, col: int, fields: seq[FieldDescription]): PgLine =
-  if fields[col].formatCode == 0:
-    return row.getLine(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 24:
-    raise newException(PgTypeError, "Invalid binary line length: " & $clen)
-  let b = row.data.buf
-  var aBits, bBits, cBits: uint64
-  aBits =
-    (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or (
-      uint64(b[off + 2]) shl 40
-    ) or (uint64(b[off + 3]) shl 32) or (uint64(b[off + 4]) shl 24) or
-    (uint64(b[off + 5]) shl 16) or (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
-  bBits =
-    (uint64(b[off + 8]) shl 56) or (uint64(b[off + 9]) shl 48) or
-    (uint64(b[off + 10]) shl 40) or (uint64(b[off + 11]) shl 32) or
-    (uint64(b[off + 12]) shl 24) or (uint64(b[off + 13]) shl 16) or
-    (uint64(b[off + 14]) shl 8) or uint64(b[off + 15])
-  cBits =
-    (uint64(b[off + 16]) shl 56) or (uint64(b[off + 17]) shl 48) or
-    (uint64(b[off + 18]) shl 40) or (uint64(b[off + 19]) shl 32) or
-    (uint64(b[off + 20]) shl 24) or (uint64(b[off + 21]) shl 16) or
-    (uint64(b[off + 22]) shl 8) or uint64(b[off + 23])
-  copyMem(addr result.a, addr aBits, 8)
-  copyMem(addr result.b, addr bBits, 8)
-  copyMem(addr result.c, addr cBits, 8)
-
-proc getLseg*(row: Row, col: int, fields: seq[FieldDescription]): PgLseg =
-  if fields[col].formatCode == 0:
-    return row.getLseg(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 32:
-    raise newException(PgTypeError, "Invalid binary lseg length: " & $clen)
-  PgLseg(
-    p1: decodePointBinary(row.data.buf, off),
-    p2: decodePointBinary(row.data.buf, off + 16),
-  )
-
-proc getBox*(row: Row, col: int, fields: seq[FieldDescription]): PgBox =
-  if fields[col].formatCode == 0:
-    return row.getBox(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 32:
-    raise newException(PgTypeError, "Invalid binary box length: " & $clen)
-  PgBox(
-    high: decodePointBinary(row.data.buf, off),
-    low: decodePointBinary(row.data.buf, off + 16),
-  )
-
-proc getPath*(row: Row, col: int, fields: seq[FieldDescription]): PgPath =
-  if fields[col].formatCode == 0:
-    return row.getPath(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let b = row.data.buf
-  result.closed = b[off] != 0
-  let npts = fromBE32(b.toOpenArray(off + 1, off + 4))
-  result.points = newSeq[PgPoint](npts)
-  for i in 0 ..< npts:
-    result.points[i] = decodePointBinary(b, off + 5 + i * 16)
-
-proc getPolygon*(row: Row, col: int, fields: seq[FieldDescription]): PgPolygon =
-  if fields[col].formatCode == 0:
-    return row.getPolygon(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let b = row.data.buf
-  let npts = fromBE32(b.toOpenArray(off, off + 3))
-  result.points = newSeq[PgPoint](npts)
-  for i in 0 ..< npts:
-    result.points[i] = decodePointBinary(b, off + 4 + i * 16)
-
-proc getCircle*(row: Row, col: int, fields: seq[FieldDescription]): PgCircle =
-  if fields[col].formatCode == 0:
-    return row.getCircle(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  if clen != 24:
-    raise newException(PgTypeError, "Invalid binary circle length: " & $clen)
-  result.center = decodePointBinary(row.data.buf, off)
-  var rBits: uint64
-  let b = row.data.buf
-  rBits =
-    (uint64(b[off + 16]) shl 56) or (uint64(b[off + 17]) shl 48) or
-    (uint64(b[off + 18]) shl 40) or (uint64(b[off + 19]) shl 32) or
-    (uint64(b[off + 20]) shl 24) or (uint64(b[off + 21]) shl 16) or
-    (uint64(b[off + 22]) shl 8) or uint64(b[off + 23])
-  copyMem(addr result.radius, addr rBits, 8)
-
-# Geometry binary-aware Opt accessors
-
-optFieldsAccessor(getPoint, getPointOpt, PgPoint)
-optFieldsAccessor(getLine, getLineOpt, PgLine)
-optFieldsAccessor(getLseg, getLsegOpt, PgLseg)
-optFieldsAccessor(getBox, getBoxOpt, PgBox)
-optFieldsAccessor(getPath, getPathOpt, PgPath)
-optFieldsAccessor(getPolygon, getPolygonOpt, PgPolygon)
-optFieldsAccessor(getCircle, getCircleOpt, PgCircle)
-
-proc columnIndex*(fields: seq[FieldDescription], name: string): int =
-  ## Find the index of a column by name. Raises PgTypeError if not found.
-  for i, f in fields:
-    if f.name == name:
-      return i
-  raise newException(PgTypeError, "Column not found: " & name)
-
-proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
-  ## Build a name-to-index mapping for all columns.
-  for i, f in fields:
-    result[f.name] = i
 
 # Coerce a binary PgParam to match the server-inferred type from a prepared
 # statement.  This handles the common case where e.g. int32.toPgParam is
@@ -2346,7 +2327,6 @@ macro addBindDirect*(
 # Reading rows:
 #   let m = row.getEnum[Mood](0)
 #   let m = row.getEnumOpt[Mood](0)
-#   let m = row.getEnum[Mood](0, fields)   # binary-format aware
 
 macro pgEnum*(T: untyped): untyped =
   ## Generate ``toPgParam`` for a Nim enum type.
@@ -2377,20 +2357,6 @@ proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
   else:
     some(getEnum[T](row, col))
 
-proc getEnum*[T: enum](row: Row, col: int, fields: seq[FieldDescription]): T =
-  ## Read a PostgreSQL enum column with format-awareness.
-  ## Both text and binary wire formats encode enum values as their label string.
-  parseEnum[T](row.getStr(col))
-
-proc getEnumOpt*[T: enum](
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[T] =
-  ## NULL-safe version of ``getEnum`` with format-awareness.
-  if row.isNull(col):
-    none(T)
-  else:
-    some(getEnum[T](row, col, fields))
-
 # User-defined composite type support
 #
 # PostgreSQL composite types (row types / record types) have dynamic OIDs.
@@ -2408,7 +2374,6 @@ proc getEnumOpt*[T: enum](
 # Reading rows:
 #   let p = row.getComposite[Point](0)
 #   let p = row.getCompositeOpt[Point](0)
-#   let p = row.getComposite[Point](0, fields)
 
 proc parseCompositeText*(s: string): seq[Option[string]] =
   ## Parse PostgreSQL composite text format: (val1,val2,...)
@@ -2493,32 +2458,6 @@ proc encodeBinaryComposite*(
         copyMem(addr result[pos], unsafeAddr data[0], data.len)
         pos += data.len
 
-proc decodeBinaryComposite*(
-    data: openArray[byte]
-): seq[tuple[oid: int32, off: int, len: int]] =
-  ## Decode a PostgreSQL binary composite value.
-  ## Returns (typeOid, offset, length) tuples. offset is relative to `data`.
-  ## length of -1 indicates NULL.
-  if data.len < 4:
-    raise newException(PgTypeError, "Binary composite too short")
-  let numFields = int(fromBE32(data.toOpenArray(0, 3)))
-  result = newSeq[tuple[oid: int32, off: int, len: int]](numFields)
-  var pos = 4
-  for i in 0 ..< numFields:
-    if pos + 8 > data.len:
-      raise newException(PgTypeError, "Binary composite truncated at field " & $i)
-    result[i].oid = fromBE32(data.toOpenArray(pos, pos + 3))
-    pos += 4
-    let flen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
-    pos += 4
-    if flen == -1:
-      result[i].off = 0
-      result[i].len = -1
-    else:
-      result[i].off = pos
-      result[i].len = flen
-      pos += flen
-
 proc compositeFieldToText(val: string): string =
   ## Escape a composite field value for text format output.
   var needsQuote = val.len == 0
@@ -2599,10 +2538,57 @@ proc compositeFieldFromText[T](s: string): T =
   else:
     raise newException(PgTypeError, "Unsupported composite field type")
 
+template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
+  when typeof(val) is string:
+    val = newString(fLen)
+    if fLen > 0:
+      copyMem(addr val[0], unsafeAddr buf[fOff], fLen)
+  elif typeof(val) is int16:
+    val = fromBE16(buf.toOpenArray(fOff, fEnd))
+  elif typeof(val) is int32:
+    val = fromBE32(buf.toOpenArray(fOff, fEnd))
+  elif typeof(val) is (int64 or int):
+    val = typeof(val)(fromBE64(buf.toOpenArray(fOff, fEnd)))
+  elif typeof(val) is float64:
+    val = cast[float64](cast[uint64](fromBE64(buf.toOpenArray(fOff, fEnd))))
+  elif typeof(val) is float32:
+    val = cast[float32](cast[uint32](fromBE32(buf.toOpenArray(fOff, fEnd))))
+  elif typeof(val) is bool:
+    val = buf[fOff] != 0
+  else:
+    var s = newString(fLen)
+    if fLen > 0:
+      copyMem(addr s[0], unsafeAddr buf[fOff], fLen)
+    val = compositeFieldFromText[typeof(val)](s)
+
 proc getComposite*[T: object](row: Row, col: int): T =
-  ## Read a PostgreSQL composite column (text format) as a Nim object.
+  ## Read a PostgreSQL composite column as a Nim object. Handles binary format.
   if row.isNull(col):
     raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    let decoded = decodeBinaryComposite(row.data.buf.toOpenArray(off, off + clen - 1))
+    var idx = 0
+    for _, val in result.fieldPairs:
+      if idx >= decoded.len:
+        raise newException(PgTypeError, "Binary composite has fewer fields than object")
+      let f = decoded[idx]
+      let fOff = off + f.off
+      let fEnd = fOff + f.len - 1
+      when typeof(val) is Option:
+        if f.len == -1:
+          val = none(typeof(val.get))
+        else:
+          var inner: typeof(val.get)
+          decodeBinaryField(inner, row.data.buf, fOff, fEnd, f.len)
+          val = some(inner)
+      else:
+        if f.len == -1:
+          raise
+            newException(PgTypeError, "NULL field in binary composite at index " & $idx)
+        decodeBinaryField(val, row.data.buf, fOff, fEnd, f.len)
+      idx += 1
+    return
   let s = row.getStr(col)
   let parts = parseCompositeText(s)
   var idx = 0
@@ -2627,67 +2613,6 @@ proc getCompositeOpt*[T: object](row: Row, col: int): Option[T] =
   else:
     some(getComposite[T](row, col))
 
-template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
-  when typeof(val) is string:
-    val = newString(fLen)
-    if fLen > 0:
-      copyMem(addr val[0], unsafeAddr buf[fOff], fLen)
-  elif typeof(val) is int16:
-    val = fromBE16(buf.toOpenArray(fOff, fEnd))
-  elif typeof(val) is int32:
-    val = fromBE32(buf.toOpenArray(fOff, fEnd))
-  elif typeof(val) is (int64 or int):
-    val = typeof(val)(fromBE64(buf.toOpenArray(fOff, fEnd)))
-  elif typeof(val) is float64:
-    val = cast[float64](cast[uint64](fromBE64(buf.toOpenArray(fOff, fEnd))))
-  elif typeof(val) is float32:
-    val = cast[float32](cast[uint32](fromBE32(buf.toOpenArray(fOff, fEnd))))
-  elif typeof(val) is bool:
-    val = buf[fOff] != 0
-  else:
-    var s = newString(fLen)
-    if fLen > 0:
-      copyMem(addr s[0], unsafeAddr buf[fOff], fLen)
-    val = compositeFieldFromText[typeof(val)](s)
-
-proc getComposite*[T: object](row: Row, col: int, fields: seq[FieldDescription]): T =
-  ## Read a PostgreSQL composite column with format-awareness.
-  if fields[col].formatCode == 0:
-    return getComposite[T](row, col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let decoded = decodeBinaryComposite(row.data.buf.toOpenArray(off, off + clen - 1))
-  var idx = 0
-  for _, val in result.fieldPairs:
-    if idx >= decoded.len:
-      raise newException(PgTypeError, "Binary composite has fewer fields than object")
-    let f = decoded[idx]
-    let fOff = off + f.off
-    let fEnd = fOff + f.len - 1
-    when typeof(val) is Option:
-      if f.len == -1:
-        val = none(typeof(val.get))
-      else:
-        var inner: typeof(val.get)
-        decodeBinaryField(inner, row.data.buf, fOff, fEnd, f.len)
-        val = some(inner)
-    else:
-      if f.len == -1:
-        raise
-          newException(PgTypeError, "NULL field in binary composite at index " & $idx)
-      decodeBinaryField(val, row.data.buf, fOff, fEnd, f.len)
-    idx += 1
-
-proc getCompositeOpt*[T: object](
-    row: Row, col: int, fields: seq[FieldDescription]
-): Option[T] =
-  ## NULL-safe version of ``getComposite`` with format-awareness.
-  if row.isNull(col):
-    none(T)
-  else:
-    some(getComposite[T](row, col, fields))
-
 # Range type support
 #
 # PostgreSQL range types represent a range of values of some element type.
@@ -2705,7 +2630,6 @@ proc getCompositeOpt*[T: object](
 #
 # Reading rows:
 #   let r = row.getInt4Range(0)
-#   let r = row.getInt4Range(0, fields)       # binary-format aware
 #   let r = row.getInt4RangeOpt(0)
 
 proc emptyRange*[T](): PgRange[T] =
@@ -2882,34 +2806,6 @@ proc encodeRangeBinaryImpl(r: RangeBinaryInput): seq[byte] =
     if r.upperData.len > 0:
       copyMem(addr result[pos], unsafeAddr r.upperData[0], r.upperData.len)
 
-proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
-  if data.len < 1:
-    raise newException(PgTypeError, "Binary range too short")
-  let flags = data[0]
-  if (flags and rangeEmpty) != 0:
-    result.isEmpty = true
-    return
-  result.hasLower = (flags and rangeHasLower) != 0
-  result.hasUpper = (flags and rangeHasUpper) != 0
-  result.lowerInc = (flags and rangeLowerInc) != 0
-  result.upperInc = (flags and rangeUpperInc) != 0
-  var pos = 1
-  if result.hasLower:
-    if pos + 4 > data.len:
-      raise newException(PgTypeError, "Binary range truncated at lower bound length")
-    let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
-    pos += 4
-    result.lowerOff = pos
-    result.lowerLen = bLen
-    pos += bLen
-  if result.hasUpper:
-    if pos + 4 > data.len:
-      raise newException(PgTypeError, "Binary range truncated at upper bound length")
-    let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
-    pos += 4
-    result.upperOff = pos
-    result.upperLen = bLen
-
 # toPgParam for range types (text format)
 
 proc toPgParam*(v: PgRange[int32]): PgParam =
@@ -3011,7 +2907,12 @@ proc toPgBinaryDateRangeParam*(v: PgRange[DateTime]): PgParam =
 # Range text format getters
 
 proc getInt4Range*(row: Row, col: int): PgRange[int32] =
-  ## Get a column value as an int4range.
+  ## Get a column value as an int4range. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeInt4RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
   parseRangeText[int32](
     s,
@@ -3020,6 +2921,12 @@ proc getInt4Range*(row: Row, col: int): PgRange[int32] =
   )
 
 proc getInt8Range*(row: Row, col: int): PgRange[int64] =
+  ## Get a column value as an int8range. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeInt8RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
   parseRangeText[int64](
     s,
@@ -3028,6 +2935,12 @@ proc getInt8Range*(row: Row, col: int): PgRange[int64] =
   )
 
 proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
+  ## Get a column value as a numrange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeNumRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
   parseRangeText[PgNumeric](
     s,
@@ -3036,6 +2949,12 @@ proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
   )
 
 proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
+  ## Get a column value as a tsrange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
   parseRangeText[DateTime](
     s,
@@ -3050,6 +2969,12 @@ proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
   )
 
 proc getTsTzRange*(row: Row, col: int): PgRange[DateTime] =
+  ## Get a column value as a tstzrange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
   parseRangeText[DateTime](
     s,
@@ -3068,6 +2993,12 @@ proc getTsTzRange*(row: Row, col: int): PgRange[DateTime] =
   )
 
 proc getDateRange*(row: Row, col: int): PgRange[DateTime] =
+  ## Get a column value as a daterange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeDateRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
   parseRangeText[DateTime](
     s,
@@ -3078,166 +3009,6 @@ proc getDateRange*(row: Row, col: int): PgRange[DateTime] =
         raise newException(PgTypeError, "Invalid date in range: " & e),
   )
 
-# Binary helpers for timestamp/date decoding
-
-proc decodeBinaryTimestamp(data: openArray[byte]): DateTime =
-  let pgUs = fromBE64(data)
-  let unixUs = pgUs + pgEpochUnix * 1_000_000
-  var unixSec = unixUs div 1_000_000
-  var fracUs = unixUs mod 1_000_000
-  if fracUs < 0:
-    unixSec -= 1
-    fracUs += 1_000_000
-  initTime(unixSec, int(fracUs * 1000)).utc()
-
-proc decodeBinaryDate(data: openArray[byte]): DateTime =
-  let pgDays = fromBE32(data)
-  let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
-  initTime(unixSec, 0).utc()
-
-# Standalone binary range decoders (used by both format-aware getters and multirange getters)
-
-proc decodeInt4RangeBinary(data: openArray[byte]): PgRange[int32] =
-  let raw = decodeRangeBinaryRaw(data)
-  if raw.isEmpty:
-    return PgRange[int32](isEmpty: true)
-  if raw.hasLower:
-    result.hasLower = true
-    result.lower = PgRangeBound[int32](
-      value: fromBE32(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
-      inclusive: raw.lowerInc,
-    )
-  if raw.hasUpper:
-    result.hasUpper = true
-    result.upper = PgRangeBound[int32](
-      value: fromBE32(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
-      inclusive: raw.upperInc,
-    )
-
-proc decodeInt8RangeBinary(data: openArray[byte]): PgRange[int64] =
-  let raw = decodeRangeBinaryRaw(data)
-  if raw.isEmpty:
-    return PgRange[int64](isEmpty: true)
-  if raw.hasLower:
-    result.hasLower = true
-    result.lower = PgRangeBound[int64](
-      value: fromBE64(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
-      inclusive: raw.lowerInc,
-    )
-  if raw.hasUpper:
-    result.hasUpper = true
-    result.upper = PgRangeBound[int64](
-      value: fromBE64(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
-      inclusive: raw.upperInc,
-    )
-
-proc decodeNumRangeBinary(data: openArray[byte]): PgRange[PgNumeric] =
-  let raw = decodeRangeBinaryRaw(data)
-  if raw.isEmpty:
-    return PgRange[PgNumeric](isEmpty: true)
-  if raw.hasLower:
-    result.hasLower = true
-    let s = decodeNumericBinary(
-      data.toOpenArray(raw.lowerOff, raw.lowerOff + raw.lowerLen - 1)
-    )
-    result.lower = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.lowerInc)
-  if raw.hasUpper:
-    result.hasUpper = true
-    let s = decodeNumericBinary(
-      data.toOpenArray(raw.upperOff, raw.upperOff + raw.upperLen - 1)
-    )
-    result.upper = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.upperInc)
-
-proc decodeTsRangeBinary(data: openArray[byte]): PgRange[DateTime] =
-  let raw = decodeRangeBinaryRaw(data)
-  if raw.isEmpty:
-    return PgRange[DateTime](isEmpty: true)
-  if raw.hasLower:
-    result.hasLower = true
-    result.lower = PgRangeBound[DateTime](
-      value: decodeBinaryTimestamp(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
-      inclusive: raw.lowerInc,
-    )
-  if raw.hasUpper:
-    result.hasUpper = true
-    result.upper = PgRangeBound[DateTime](
-      value: decodeBinaryTimestamp(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
-      inclusive: raw.upperInc,
-    )
-
-proc decodeDateRangeBinary(data: openArray[byte]): PgRange[DateTime] =
-  let raw = decodeRangeBinaryRaw(data)
-  if raw.isEmpty:
-    return PgRange[DateTime](isEmpty: true)
-  if raw.hasLower:
-    result.hasLower = true
-    result.lower = PgRangeBound[DateTime](
-      value: decodeBinaryDate(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
-      inclusive: raw.lowerInc,
-    )
-  if raw.hasUpper:
-    result.hasUpper = true
-    result.upper = PgRangeBound[DateTime](
-      value: decodeBinaryDate(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
-      inclusive: raw.upperInc,
-    )
-
-# Range format-aware getters (binary support)
-
-proc getInt4Range*(row: Row, col: int, fields: seq[FieldDescription]): PgRange[int32] =
-  if fields[col].formatCode == 0:
-    return row.getInt4Range(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  decodeInt4RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-
-proc getInt8Range*(row: Row, col: int, fields: seq[FieldDescription]): PgRange[int64] =
-  if fields[col].formatCode == 0:
-    return row.getInt8Range(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  decodeInt8RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-
-proc getNumRange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgRange[PgNumeric] =
-  if fields[col].formatCode == 0:
-    return row.getNumRange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  decodeNumRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-
-proc getTsRange*(row: Row, col: int, fields: seq[FieldDescription]): PgRange[DateTime] =
-  if fields[col].formatCode == 0:
-    return row.getTsRange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-
-proc getTsTzRange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgRange[DateTime] =
-  if fields[col].formatCode == 0:
-    return row.getTsTzRange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-
-proc getDateRange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgRange[DateTime] =
-  if fields[col].formatCode == 0:
-    return row.getDateRange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  decodeDateRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-
 # Range Opt accessors (text format)
 
 optAccessor(getInt4Range, getInt4RangeOpt, PgRange[int32])
@@ -3246,15 +3017,6 @@ optAccessor(getNumRange, getNumRangeOpt, PgRange[PgNumeric])
 optAccessor(getTsRange, getTsRangeOpt, PgRange[DateTime])
 optAccessor(getTsTzRange, getTsTzRangeOpt, PgRange[DateTime])
 optAccessor(getDateRange, getDateRangeOpt, PgRange[DateTime])
-
-# Range Opt accessors (format-aware)
-
-optFieldsAccessor(getInt4Range, getInt4RangeOpt, PgRange[int32])
-optFieldsAccessor(getInt8Range, getInt8RangeOpt, PgRange[int64])
-optFieldsAccessor(getNumRange, getNumRangeOpt, PgRange[PgNumeric])
-optFieldsAccessor(getTsRange, getTsRangeOpt, PgRange[DateTime])
-optFieldsAccessor(getTsTzRange, getTsTzRangeOpt, PgRange[DateTime])
-optFieldsAccessor(getDateRange, getDateRangeOpt, PgRange[DateTime])
 
 # Multirange type support
 #
@@ -3353,20 +3115,6 @@ proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =
       copyMem(addr result[pos], unsafeAddr rd[0], rd.len)
       pos += rd.len
 
-proc decodeMultirangeBinaryRaw(data: openArray[byte]): seq[tuple[off: int, len: int]] =
-  if data.len < 4:
-    raise newException(PgTypeError, "Binary multirange too short")
-  let count = int(fromBE32(data.toOpenArray(0, 3)))
-  result = newSeq[tuple[off: int, len: int]](count)
-  var pos = 4
-  for i in 0 ..< count:
-    if pos + 4 > data.len:
-      raise newException(PgTypeError, "Binary multirange truncated at range " & $i)
-    let rLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
-    pos += 4
-    result[i] = (off: pos, len: rLen)
-    pos += rLen
-
 # Multirange toPgParam (text format)
 
 proc toPgParam*(v: PgMultirange[int32]): PgParam =
@@ -3444,6 +3192,18 @@ proc toPgBinaryParam*(v: PgMultirange[DateTime]): PgParam =
 # Multirange text format getters
 
 proc getInt4Multirange*(row: Row, col: int): PgMultirange[int32] =
+  ## Get a column value as an int4multirange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+    var ranges = newSeq[PgRange[int32]](parts.len)
+    for i, p in parts:
+      ranges[i] = decodeInt4RangeBinary(
+        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+      )
+    return PgMultirange[int32](ranges)
   let s = row.getStr(col)
   parseMultirangeText[int32](
     s,
@@ -3452,6 +3212,18 @@ proc getInt4Multirange*(row: Row, col: int): PgMultirange[int32] =
   )
 
 proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
+  ## Get a column value as an int8multirange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+    var ranges = newSeq[PgRange[int64]](parts.len)
+    for i, p in parts:
+      ranges[i] = decodeInt8RangeBinary(
+        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+      )
+    return PgMultirange[int64](ranges)
   let s = row.getStr(col)
   parseMultirangeText[int64](
     s,
@@ -3460,6 +3232,18 @@ proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
   )
 
 proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
+  ## Get a column value as a nummultirange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+    var ranges = newSeq[PgRange[PgNumeric]](parts.len)
+    for i, p in parts:
+      ranges[i] = decodeNumRangeBinary(
+        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+      )
+    return PgMultirange[PgNumeric](ranges)
   let s = row.getStr(col)
   parseMultirangeText[PgNumeric](
     s,
@@ -3468,6 +3252,18 @@ proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
   )
 
 proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
+  ## Get a column value as a tsmultirange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+    var ranges = newSeq[PgRange[DateTime]](parts.len)
+    for i, p in parts:
+      ranges[i] = decodeTsRangeBinary(
+        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+      )
+    return PgMultirange[DateTime](ranges)
   let s = row.getStr(col)
   parseMultirangeText[DateTime](
     s,
@@ -3482,6 +3278,18 @@ proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   )
 
 proc getTsTzMultirange*(row: Row, col: int): PgMultirange[DateTime] =
+  ## Get a column value as a tstzmultirange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+    var ranges = newSeq[PgRange[DateTime]](parts.len)
+    for i, p in parts:
+      ranges[i] = decodeTsRangeBinary(
+        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+      )
+    return PgMultirange[DateTime](ranges)
   let s = row.getStr(col)
   parseMultirangeText[DateTime](
     s,
@@ -3500,6 +3308,18 @@ proc getTsTzMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   )
 
 proc getDateMultirange*(row: Row, col: int): PgMultirange[DateTime] =
+  ## Get a column value as a datemultirange. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+    var ranges = newSeq[PgRange[DateTime]](parts.len)
+    for i, p in parts:
+      ranges[i] = decodeDateRangeBinary(
+        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
+      )
+    return PgMultirange[DateTime](ranges)
   let s = row.getStr(col)
   parseMultirangeText[DateTime](
     s,
@@ -3510,104 +3330,6 @@ proc getDateMultirange*(row: Row, col: int): PgMultirange[DateTime] =
         raise newException(PgTypeError, "Invalid date in multirange: " & e),
   )
 
-# Multirange format-aware getters
-
-proc getInt4Multirange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgMultirange[int32] =
-  if fields[col].formatCode == 0:
-    return row.getInt4Multirange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-  var ranges = newSeq[PgRange[int32]](parts.len)
-  for i, p in parts:
-    ranges[i] = decodeInt4RangeBinary(
-      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-    )
-  PgMultirange[int32](ranges)
-
-proc getInt8Multirange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgMultirange[int64] =
-  if fields[col].formatCode == 0:
-    return row.getInt8Multirange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-  var ranges = newSeq[PgRange[int64]](parts.len)
-  for i, p in parts:
-    ranges[i] = decodeInt8RangeBinary(
-      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-    )
-  PgMultirange[int64](ranges)
-
-proc getNumMultirange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgMultirange[PgNumeric] =
-  if fields[col].formatCode == 0:
-    return row.getNumMultirange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-  var ranges = newSeq[PgRange[PgNumeric]](parts.len)
-  for i, p in parts:
-    ranges[i] = decodeNumRangeBinary(
-      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-    )
-  PgMultirange[PgNumeric](ranges)
-
-proc getTsMultirange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgMultirange[DateTime] =
-  if fields[col].formatCode == 0:
-    return row.getTsMultirange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-  var ranges = newSeq[PgRange[DateTime]](parts.len)
-  for i, p in parts:
-    ranges[i] = decodeTsRangeBinary(
-      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-    )
-  PgMultirange[DateTime](ranges)
-
-proc getTsTzMultirange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgMultirange[DateTime] =
-  if fields[col].formatCode == 0:
-    return row.getTsTzMultirange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-  var ranges = newSeq[PgRange[DateTime]](parts.len)
-  for i, p in parts:
-    ranges[i] = decodeTsRangeBinary(
-      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-    )
-  PgMultirange[DateTime](ranges)
-
-proc getDateMultirange*(
-    row: Row, col: int, fields: seq[FieldDescription]
-): PgMultirange[DateTime] =
-  if fields[col].formatCode == 0:
-    return row.getDateMultirange(col)
-  let (off, clen) = cellInfo(row, col)
-  if clen == -1:
-    raise newException(PgTypeError, "Column " & $col & " is NULL")
-  let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-  var ranges = newSeq[PgRange[DateTime]](parts.len)
-  for i, p in parts:
-    ranges[i] = decodeDateRangeBinary(
-      row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-    )
-  PgMultirange[DateTime](ranges)
-
 # Multirange Opt accessors (text format)
 
 optAccessor(getInt4Multirange, getInt4MultirangeOpt, PgMultirange[int32])
@@ -3617,14 +3339,17 @@ optAccessor(getTsMultirange, getTsMultirangeOpt, PgMultirange[DateTime])
 optAccessor(getTsTzMultirange, getTsTzMultirangeOpt, PgMultirange[DateTime])
 optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 
-# Multirange Opt accessors (format-aware)
+proc columnIndex*(fields: seq[FieldDescription], name: string): int =
+  ## Find the index of a column by name. Raises PgTypeError if not found.
+  for i, f in fields:
+    if f.name == name:
+      return i
+  raise newException(PgTypeError, "Column not found: " & name)
 
-optFieldsAccessor(getInt4Multirange, getInt4MultirangeOpt, PgMultirange[int32])
-optFieldsAccessor(getInt8Multirange, getInt8MultirangeOpt, PgMultirange[int64])
-optFieldsAccessor(getNumMultirange, getNumMultirangeOpt, PgMultirange[PgNumeric])
-optFieldsAccessor(getTsMultirange, getTsMultirangeOpt, PgMultirange[DateTime])
-optFieldsAccessor(getTsTzMultirange, getTsTzMultirangeOpt, PgMultirange[DateTime])
-optFieldsAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
+proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
+  ## Build a name-to-index mapping for all columns.
+  for i, f in fields:
+    result[f.name] = i
 
 # Name-based column access
 
