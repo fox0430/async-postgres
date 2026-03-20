@@ -1097,10 +1097,17 @@ proc executeImpl(
       elif i < resultFormats.len:
         qr.fields[i].formatCode = resultFormats[i]
   if qr.fields.len > 0:
+    var colFmts = newSeq[int16](qr.fields.len)
+    var colOids = newSeq[int32](qr.fields.len)
+    for i in 0 ..< qr.fields.len:
+      colFmts[i] = qr.fields[i].formatCode
+      colOids[i] = qr.fields[i].typeOid
     if conn.rowDataBuf != nil:
-      conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len))
+      conn.rowDataBuf =
+        conn.rowDataBuf.reuseRowData(int16(qr.fields.len), colFmts, colOids)
     else:
-      conn.rowDataBuf = newRowData(int16(qr.fields.len))
+      conn.rowDataBuf = newRowData(int16(qr.fields.len), colFmts, colOids)
+    conn.rowDataBuf.fields = qr.fields
     qr.data = conn.rowDataBuf
   var queryError: ref PgQueryError
 
@@ -1188,10 +1195,17 @@ proc executeImpl(
       elif i < resultFormats.len:
         qr.fields[i].formatCode = resultFormats[i]
   if qr.fields.len > 0:
+    var colFmts = newSeq[int16](qr.fields.len)
+    var colOids = newSeq[int32](qr.fields.len)
+    for i in 0 ..< qr.fields.len:
+      colFmts[i] = qr.fields[i].formatCode
+      colOids[i] = qr.fields[i].typeOid
     if conn.rowDataBuf != nil:
-      conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len))
+      conn.rowDataBuf =
+        conn.rowDataBuf.reuseRowData(int16(qr.fields.len), colFmts, colOids)
     else:
-      conn.rowDataBuf = newRowData(int16(qr.fields.len))
+      conn.rowDataBuf = newRowData(int16(qr.fields.len), colFmts, colOids)
+    conn.rowDataBuf.fields = qr.fields
     qr.data = conn.rowDataBuf
   var queryError: ref PgQueryError
 
