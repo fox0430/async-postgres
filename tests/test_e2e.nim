@@ -4296,6 +4296,59 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "queryValue with typedesc returns typed value":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValue(int64, "SELECT 42")
+      doAssert val == 42'i64
+      let fval = await conn.queryValue(float64, "SELECT 3.14::float8")
+      doAssert abs(fval - 3.14) < 0.001
+      let bval = await conn.queryValue(bool, "SELECT true")
+      doAssert bval == true
+      let sval = await conn.queryValue(string, "SELECT 'hello'")
+      doAssert sval == "hello"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValue with typedesc raises on no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.queryValue(int32, "SELECT 1 WHERE false")
+      except PgError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValue with typedesc raises on NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.queryValue(int64, "SELECT NULL::int8")
+      except PgError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOrDefault with typedesc":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val =
+        await conn.queryValueOrDefault(int64, "SELECT 1 WHERE false", default = -1'i64)
+      doAssert val == -1'i64
+      let val2 = await conn.queryValueOrDefault(int64, "SELECT 99", default = 0'i64)
+      doAssert val2 == 99'i64
+      await conn.close()
+
+    waitFor t()
+
   test "queryExists returns true when rows exist":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -4442,6 +4495,27 @@ suite "E2E: Convenience Query Methods":
       doAssert val == "x"
       let val2 = await pool.queryValueOrDefault("SELECT 'ok'")
       doAssert val2 == "ok"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue with typedesc":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val = await pool.queryValue(int64, "SELECT 123")
+      doAssert val == 123'i64
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValueOrDefault with typedesc":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val =
+        await pool.queryValueOrDefault(int32, "SELECT 1 WHERE false", default = -1'i32)
+      doAssert val == -1'i32
+      let val2 = await pool.queryValueOrDefault(int32, "SELECT 7", default = 0'i32)
+      doAssert val2 == 7'i32
       await pool.close()
 
     waitFor t()

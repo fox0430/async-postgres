@@ -438,6 +438,22 @@ proc queryValue*(
     await pool.resetSession(conn)
     pool.release(conn)
 
+proc queryValue*[T](
+    pool: PgPool,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`.
+  ## Raises `PgError` if no rows or the value is NULL.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValue(T, sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
 proc queryValueOrDefault*(
     pool: PgPool,
     sql: string,
@@ -450,6 +466,23 @@ proc queryValueOrDefault*(
   let conn = await pool.acquire()
   try:
     return await conn.queryValueOrDefault(sql, params, default, timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
+proc queryValueOrDefault*[T](
+    pool: PgPool,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`.
+  ## Returns `default` if no rows or the value is NULL.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOrDefault(T, sql, params, default, timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)
