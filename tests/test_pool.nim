@@ -146,6 +146,28 @@ suite "initPoolConfig":
     check cfg.maxLifetime == hours(1)
     check cfg.healthCheckTimeout == seconds(5)
 
+  test "validation: minSize < 0":
+    expect(ValueError):
+      discard initPoolConfig(ConnConfig(host: "localhost", port: 5432), minSize = -1)
+
+  test "validation: maxSize < 1":
+    expect(ValueError):
+      discard initPoolConfig(ConnConfig(host: "localhost", port: 5432), maxSize = 0)
+
+  test "validation: minSize > maxSize":
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), minSize = 10, maxSize = 5
+      )
+
+  test "validation: maxWaiters < 0":
+    expect(ValueError):
+      discard initPoolConfig(ConnConfig(host: "localhost", port: 5432), maxWaiters = -1)
+
+  test "validation: minSize = 0 is valid":
+    let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432), minSize = 0)
+    check cfg.minSize == 0
+
 suite "Pool release":
   test "release to idle queue":
     let pool = makePool()
