@@ -3,8 +3,10 @@ from std/times import
   DateTime, dateTime, mMar, mJun, mJan, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
 
-import ../async_postgres/[async_backend, pg_protocol, pg_client, pg_pool, pg_types]
+import ../async_postgres/[async_backend, pg_protocol, pg_types]
 
+import ../async_postgres/pg_client {.all.}
+import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_connection {.all.}
 
 privateAccess(PgConnection)

@@ -1,6 +1,8 @@
 import std/options
 
-import async_backend, pg_protocol, pg_connection, pg_client, pg_types, pg_pool
+import async_backend, pg_protocol, pg_connection, pg_types, pg_pool
+
+import pg_client {.all.}
 
 type
   ReplicaFallback* = enum
@@ -95,7 +97,7 @@ template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
 
 # Read operations → replica
 
-proc query*(
+proc query(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -114,7 +116,7 @@ proc query*(
 proc query*(
     cluster: PgPoolCluster,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
@@ -232,7 +234,7 @@ proc queryColumn*(
 
 # Write operations → primary
 
-proc exec*(
+proc exec(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -249,7 +251,7 @@ proc exec*(
 proc exec*(
     cluster: PgPoolCluster,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   ## Execute a statement with typed parameters routed to the primary pool.
@@ -274,7 +276,7 @@ proc execAffected*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc execInTransaction*(
+proc execInTransaction(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -304,7 +306,7 @@ proc execInTransaction*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc queryInTransaction*(
+proc queryInTransaction(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],

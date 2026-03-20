@@ -304,7 +304,7 @@ proc execImpl(
 
   return commandTag
 
-proc exec*(
+proc exec(
     conn: PgConnection,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -329,7 +329,7 @@ proc exec*(
 proc exec*(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   ## Execute a statement with typed parameters.
@@ -847,7 +847,7 @@ proc queryEach*(
   else:
     return await queryEachImpl(conn, sql, params, callback, resultFormats)
 
-proc query*(
+proc query(
     conn: PgConnection,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -874,7 +874,7 @@ proc query*(
 proc query*(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
@@ -1129,14 +1129,14 @@ proc executeImpl(
 
   return qr
 
-proc execute*(
+proc execute(
     stmt: PreparedStatement,
     params: seq[Option[seq[byte]]] = @[],
     paramFormats: seq[int16] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
-  ## Execute a prepared statement with parameters.
+  ## Execute a prepared statement with raw binary parameters.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if timeout > ZeroDuration:
     try:
@@ -1222,7 +1222,7 @@ proc executeImpl(
 
 proc execute*(
     stmt: PreparedStatement,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
@@ -1814,7 +1814,7 @@ proc execInTransactionImpl(
 
   return userCommandTag
 
-proc execInTransaction*(
+proc execInTransaction(
     conn: PgConnection,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -1949,7 +1949,7 @@ proc queryInTransactionImpl(
 
   return qr
 
-proc queryInTransaction*(
+proc queryInTransaction(
     conn: PgConnection,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -2029,7 +2029,7 @@ proc addExec*(p: var Pipeline, sql: string, params: seq[PgParam] = @[]) =
       op.params.add param.value
   p.ops.add move(op)
 
-proc addExec*(
+proc addExec(
     p: var Pipeline,
     sql: string,
     params: seq[Option[seq[byte]]],
@@ -2062,7 +2062,7 @@ proc addQuery*(
     resultFormats: resultFormats,
   )
 
-proc addQuery*(
+proc addQuery(
     p: var Pipeline,
     sql: string,
     params: seq[Option[seq[byte]]],
@@ -2377,7 +2377,7 @@ proc openCursorImpl(
 
   return cursor
 
-proc openCursor*(
+proc openCursor(
     conn: PgConnection,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
