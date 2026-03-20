@@ -156,6 +156,21 @@ proc queryValue*(
     await pool.resetSession(conn)
     pool.release(conn)
 
+proc queryValue*[T](
+    cluster: PgPoolCluster,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query routed to the replica pool and return the first column as `T`.
+  let (conn, pool) = await acquireRead(cluster)
+  try:
+    return await conn.queryValue(T, sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
 proc queryValueOrDefault*(
     cluster: PgPoolCluster,
     sql: string,
@@ -167,6 +182,22 @@ proc queryValueOrDefault*(
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryValueOrDefault(sql, params, default, timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
+proc queryValueOrDefault*[T](
+    cluster: PgPoolCluster,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query routed to the replica pool; return default if no rows or NULL.
+  let (conn, pool) = await acquireRead(cluster)
+  try:
+    return await conn.queryValueOrDefault(T, sql, params, default, timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)

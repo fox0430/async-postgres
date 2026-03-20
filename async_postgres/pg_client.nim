@@ -921,6 +921,24 @@ proc queryValue*(
     raise newException(PgError, "Query returned NULL")
   return row.getStr(0)
 
+proc queryValue*[T](
+    conn: PgConnection,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`.
+  ## Raises PgError if no rows are returned or the value is NULL.
+  ## Supported types: int32, int64, float64, bool, string.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    raise newException(PgError, "Query returned no rows")
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    raise newException(PgError, "Query returned NULL")
+  return row.get(0, T)
+
 proc queryValueOrDefault*(
     conn: PgConnection,
     sql: string,
@@ -937,6 +955,25 @@ proc queryValueOrDefault*(
   if row.isNull(0):
     return default
   return row.getStr(0)
+
+proc queryValueOrDefault*[T](
+    conn: PgConnection,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`.
+  ## Returns `default` if no rows or the value is NULL.
+  ## Supported types: int32, int64, float64, bool, string.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return default
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    return default
+  return row.get(0, T)
 
 proc queryExists*(
     conn: PgConnection,
