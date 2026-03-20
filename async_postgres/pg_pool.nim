@@ -60,11 +60,25 @@ proc initPoolConfig*(
     healthCheckTimeout = seconds(5),
     pingTimeout = seconds(5),
     acquireTimeout = seconds(30),
+    maxWaiters = 0,
     resetQuery = "",
 ): PoolConfig =
   ## Create a pool configuration with sensible defaults.
   ## `minSize` idle connections are maintained; up to `maxSize` total.
   ## Set `resetQuery` to clean session state on release (e.g. "DISCARD ALL" for PgBouncer).
+  ##
+  ## Raises `ValueError` if parameters are invalid.
+  if minSize < 0:
+    raise newException(ValueError, "minSize must be >= 0, got " & $minSize)
+  if maxSize < 1:
+    raise newException(ValueError, "maxSize must be >= 1, got " & $maxSize)
+  if minSize > maxSize:
+    raise newException(
+      ValueError, "minSize (" & $minSize & ") must be <= maxSize (" & $maxSize & ")"
+    )
+  if maxWaiters < 0:
+    raise newException(ValueError, "maxWaiters must be >= 0, got " & $maxWaiters)
+
   PoolConfig(
     connConfig: connConfig,
     minSize: minSize,
@@ -75,6 +89,7 @@ proc initPoolConfig*(
     healthCheckTimeout: healthCheckTimeout,
     pingTimeout: pingTimeout,
     acquireTimeout: acquireTimeout,
+    maxWaiters: maxWaiters,
     resetQuery: resetQuery,
   )
 
