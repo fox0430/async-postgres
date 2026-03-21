@@ -28,6 +28,7 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
       connConfig: ConnConfig(host: "localhost", port: 5432),
       minSize: minSize,
       maxSize: maxSize,
+      maxWaiters: -1,
       maintenanceInterval: seconds(30),
     ),
     idle: initDeque[PooledConn](),
@@ -128,7 +129,7 @@ suite "initPoolConfig":
     check cfg.healthCheckTimeout == seconds(5)
     check cfg.pingTimeout == seconds(5)
     check cfg.acquireTimeout == seconds(30)
-    check cfg.maxWaiters == 0
+    check cfg.maxWaiters == -1
 
   test "custom overrides":
     let cfg = initPoolConfig(
@@ -160,9 +161,9 @@ suite "initPoolConfig":
         ConnConfig(host: "localhost", port: 5432), minSize = 10, maxSize = 5
       )
 
-  test "validation: maxWaiters < 0":
+  test "validation: maxWaiters < -1":
     expect(ValueError):
-      discard initPoolConfig(ConnConfig(host: "localhost", port: 5432), maxWaiters = -1)
+      discard initPoolConfig(ConnConfig(host: "localhost", port: 5432), maxWaiters = -2)
 
   test "validation: minSize = 0 is valid":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432), minSize = 0)
@@ -582,7 +583,7 @@ when hasChronos:
       check pool.idle.len == 0
 
 suite "Max waiters":
-  test "maxWaiters 0 allows unlimited waiters":
+  test "maxWaiters -1 allows unlimited waiters":
     let pool = makePool(maxSize = 1)
     pool.active = 1
 
@@ -597,6 +598,15 @@ suite "Max waiters":
       pool.release(conn)
     for f in futs:
       discard waitFor f
+
+  test "maxWaiters 0 rejects all waiters":
+    let pool = makePool(maxSize = 1)
+    pool.config.maxWaiters = 0
+    pool.active = 1
+
+    expect(PgError):
+      discard waitFor pool.acquire()
+    check pool.waiters.len == 0
 
   test "maxWaiters rejects when queue is full":
     let pool = makePool(maxSize = 1)
