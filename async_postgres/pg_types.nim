@@ -1,5 +1,8 @@
 import
-  std/[json, macros, math, options, parseutils, sequtils, strutils, tables, times, net]
+  std/[
+    hashes, json, macros, math, options, parseutils, sequtils, strutils, tables, times,
+    net,
+  ]
 
 import pg_protocol
 
@@ -13,9 +16,19 @@ type
   PgUuid* = distinct string
     ## UUID value stored as its string representation (e.g. "550e8400-e29b-41d4-a716-446655440000").
 
-  PgNumeric* = distinct string
-    ## Arbitrary-precision numeric value stored as its string representation.
+  PgNumericSign* = enum
+    pgPositive = 0x0000
+    pgNegative = 0x4000
+    pgNaN = 0xC000
+
+  PgNumeric* = object
+    ## Arbitrary-precision numeric value using PostgreSQL's internal base-10000 representation.
+    ## Supports comparison operators but not arithmetic.
     ## Use this instead of float64 to avoid precision loss with PostgreSQL numeric/decimal.
+    weight*: int16 ## exponent of first digit group (value = digit * 10000^weight)
+    sign*: PgNumericSign ## positive, negative, or NaN
+    dscale*: int16 ## number of digits after decimal point (display scale)
+    digits*: seq[int16] ## base-10000 digit groups, each 0..9999
 
   PgInterval* = object
     ## PostgreSQL interval value decomposed into months, days, and microseconds.
@@ -180,14 +193,234 @@ const
   rangeLowerInc* = 0x08'u8 ## Range flag: lower bound is inclusive.
   rangeUpperInc* = 0x10'u8 ## Range flag: upper bound is inclusive.
 
-proc `$`*(v: PgNumeric): string {.borrow.}
-proc `==`*(a, b: PgNumeric): bool {.borrow.}
+proc `$`*(v: PgUuid): string {.borrow.}
+proc `==`*(a, b: PgUuid): bool {.borrow.}
+proc hash*(v: PgUuid): Hash {.borrow.}
 
 proc `$`*(v: PgMacAddr): string {.borrow.}
 proc `==`*(a, b: PgMacAddr): bool {.borrow.}
 
 proc `$`*(v: PgMacAddr8): string {.borrow.}
 proc `==`*(a, b: PgMacAddr8): bool {.borrow.}
+
+proc parsePgNumeric*(s: string): PgNumeric =
+  ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN") into PgNumeric.
+  if s.len == 0:
+    raise newException(PgTypeError, "Invalid numeric: empty string")
+  if s == "NaN":
+    return PgNumeric(sign: pgNaN)
+  var src = s
+  var sign = pgPositive
+  if src[0] == '-':
+    sign = pgNegative
+    src = src[1 .. ^1]
+  if src.len == 0:
+    raise newException(PgTypeError, "Invalid numeric: " & s)
+  for c in src:
+    if c notin {'0' .. '9', '.'}:
+      raise newException(PgTypeError, "Invalid numeric: " & s)
+  if src.count('.') > 1:
+    raise newException(PgTypeError, "Invalid numeric: " & s)
+  if src == ".":
+    raise newException(PgTypeError, "Invalid numeric: " & s)
+  # Split integer and fractional parts
+  let dotPos = src.find('.')
+  var intPart, fracPart: string
+  if dotPos >= 0:
+    intPart = src[0 ..< dotPos]
+    fracPart = src[dotPos + 1 .. ^1]
+  else:
+    intPart = src
+    fracPart = ""
+  let dscale = int16(fracPart.len)
+  # Strip leading zeros from integer part (keep at least "")
+  var intStripped = intPart.strip(leading = true, trailing = false, chars = {'0'})
+  # Pad to multiples of 4 for base-10000 grouping
+  var fracPadded = fracPart
+  if fracPadded.len mod 4 != 0:
+    fracPadded.add(repeat('0', 4 - fracPadded.len mod 4))
+  var intPadded = intStripped
+  if intPadded.len > 0 and intPadded.len mod 4 != 0:
+    intPadded = repeat('0', 4 - intPadded.len mod 4) & intPadded
+  # Parse base-10000 digit groups: integer part then fractional part
+  var digits: seq[int16]
+  for i in countup(0, intPadded.len - 1, 4):
+    digits.add(int16(parseInt(intPadded[i ..< i + 4])))
+  for i in countup(0, fracPadded.len - 1, 4):
+    digits.add(int16(parseInt(fracPadded[i ..< i + 4])))
+  let intGroups = intPadded.len div 4
+  # Strip trailing zero groups, keeping enough for dscale
+  let minDigits = intGroups + (if dscale > 0: (dscale.int + 3) div 4 else: 0)
+  while digits.len > minDigits and digits.len > 0 and digits[^1] == 0:
+    digits.setLen(digits.len - 1)
+  # Strip leading zero groups from fractional part (pure fractions like 0.001)
+  var leadingZeroGroups = 0
+  if intGroups == 0:
+    while leadingZeroGroups < digits.len and digits[leadingZeroGroups] == 0:
+      inc leadingZeroGroups
+    if leadingZeroGroups > 0:
+      digits = digits[leadingZeroGroups .. ^1]
+  # Compute weight (exponent of first digit group)
+  let weight =
+    if intGroups > 0:
+      int16(intGroups - 1)
+    elif digits.len > 0:
+      int16(-leadingZeroGroups - 1)
+    else:
+      0'i16
+  if digits.len == 0:
+    return PgNumeric(weight: 0, sign: pgPositive, dscale: dscale, digits: @[])
+  PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
+
+proc `$`*(v: PgNumeric): string =
+  ## Convert PgNumeric to its decimal string representation.
+  if v.sign == pgNaN:
+    return "NaN"
+  if v.digits.len == 0:
+    if v.dscale > 0:
+      result = "0."
+      for _ in 0 ..< v.dscale.int:
+        result.add('0')
+      return
+    return "0"
+  result = ""
+  if v.sign == pgNegative:
+    result.add('-')
+  let intGroups = v.weight + 1
+  # Integer part
+  var wroteInt = false
+  for i in 0 ..< min(v.digits.len, intGroups.int):
+    let d = int(v.digits[i])
+    if not wroteInt:
+      result.add($d)
+      wroteInt = true
+    else:
+      let s = $d
+      for _ in 0 ..< 4 - s.len:
+        result.add('0')
+      result.add(s)
+  if intGroups > v.digits.len:
+    for _ in 0 ..< (intGroups.int - v.digits.len) * 4:
+      result.add('0')
+    wroteInt = true
+  if not wroteInt:
+    result.add('0')
+  if v.dscale > 0:
+    result.add('.')
+    let fracStart = result.len
+    # Leading zero groups for pure fractions (intGroups < 0)
+    if intGroups < 0:
+      for _ in 0 ..< -intGroups.int * 4:
+        result.add('0')
+    # Fractional digit groups
+    for i in max(intGroups.int, 0) ..< v.digits.len:
+      let s = $int(v.digits[i])
+      for _ in 0 ..< 4 - s.len:
+        result.add('0')
+      result.add(s)
+    # Trim or pad to dscale
+    let fracLen = result.len - fracStart
+    if fracLen > v.dscale.int:
+      result.setLen(fracStart + v.dscale.int)
+    elif fracLen < v.dscale.int:
+      for _ in 0 ..< v.dscale.int - fracLen:
+        result.add('0')
+
+proc cmpMagnitude(a, b: PgNumeric): int =
+  ## Compare absolute values. Returns -1, 0, or 1.
+  # Compare weights first
+  let aWeight =
+    if a.digits.len > 0:
+      a.weight.int
+    else:
+      -int.high
+  let bWeight =
+    if b.digits.len > 0:
+      b.weight.int
+    else:
+      -int.high
+  if aWeight != bWeight:
+    return if aWeight < bWeight: -1 else: 1
+  # Same weight: compare digit-by-digit
+  let maxLen = max(a.digits.len, b.digits.len)
+  for i in 0 ..< maxLen:
+    let ad =
+      if i < a.digits.len:
+        a.digits[i].int
+      else:
+        0
+    let bd =
+      if i < b.digits.len:
+        b.digits[i].int
+      else:
+        0
+    if ad != bd:
+      return if ad < bd: -1 else: 1
+  return 0
+
+proc isZero*(v: PgNumeric): bool =
+  ## Check if the numeric value is zero.
+  v.sign != pgNaN and v.digits.len == 0
+
+proc cmp*(a, b: PgNumeric): int =
+  ## Compare two PgNumeric values. NaN sorts highest (PostgreSQL convention).
+  # NaN handling
+  if a.sign == pgNaN and b.sign == pgNaN:
+    return 0
+  if a.sign == pgNaN:
+    return 1
+  if b.sign == pgNaN:
+    return -1
+  # Zero handling
+  let aZero = a.isZero
+  let bZero = b.isZero
+  if aZero and bZero:
+    return 0
+  if aZero:
+    return (if b.sign == pgNegative: 1 else: -1)
+  if bZero:
+    return (if a.sign == pgNegative: -1 else: 1)
+  # Sign comparison
+  if a.sign != b.sign:
+    return if a.sign == pgNegative: -1 else: 1
+  # Same sign: compare magnitude
+  let mc = cmpMagnitude(a, b)
+  if a.sign == pgNegative:
+    -mc
+  else:
+    mc
+
+proc `==`*(a, b: PgNumeric): bool =
+  ## Value-based equality. 1.0 == 1.00 is true.
+  cmp(a, b) == 0
+
+proc `<`*(a, b: PgNumeric): bool =
+  cmp(a, b) < 0
+
+proc `<=`*(a, b: PgNumeric): bool =
+  cmp(a, b) <= 0
+
+proc `>`*(a, b: PgNumeric): bool =
+  cmp(a, b) > 0
+
+proc `>=`*(a, b: PgNumeric): bool =
+  cmp(a, b) >= 0
+
+proc hash*(v: PgNumeric): Hash =
+  ## Hash consistent with value-based ==.
+  if v.sign == pgNaN:
+    return !$(0 !& hash(pgNaN.ord))
+  var lastNonZero = v.digits.len - 1
+  while lastNonZero >= 0 and v.digits[lastNonZero] == 0:
+    dec lastNonZero
+  if lastNonZero < 0:
+    return !$(0 !& hash(0) !& hash(0))
+  var h: Hash = 0
+  h = h !& hash(v.sign.ord)
+  h = h !& hash(v.weight)
+  for i in 0 .. lastNonZero:
+    h = h !& hash(v.digits[i])
+  !$h
 
 proc `$`*(v: PgPoint): string =
   "(" & $v.x & "," & $v.y & ")"
@@ -373,7 +606,7 @@ proc toPgParam*(v: PgUuid): PgParam =
   PgParam(oid: OidUuid, format: 0, value: some(toBytes(string(v))))
 
 proc toPgParam*(v: PgNumeric): PgParam =
-  PgParam(oid: OidNumeric, format: 0, value: some(toBytes(string(v))))
+  PgParam(oid: OidNumeric, format: 0, value: some(toBytes($v)))
 
 proc toPgParam*(v: PgInterval): PgParam =
   PgParam(oid: OidInterval, format: 0, value: some(toBytes($v)))
@@ -608,9 +841,25 @@ proc toPgBinaryParam*(v: DateTime): PgParam =
   let pgUs = unixUs - pgEpochUnix * 1_000_000
   PgParam(oid: OidTimestamp, format: 1, value: some(@(toBE64(pgUs))))
 
+proc putBE16(buf: var seq[byte], off: int, v: int16) =
+  let b = toBE16(v)
+  buf[off] = b[0]
+  buf[off + 1] = b[1]
+
+proc encodeNumericBinary*(v: PgNumeric): seq[byte] =
+  ## Encode PgNumeric as PostgreSQL binary numeric format.
+  let ndigits = int16(v.digits.len)
+  let signVal = cast[int16](v.sign.uint16)
+  result = newSeq[byte](8 + ndigits.int * 2)
+  result.putBE16(0, ndigits)
+  result.putBE16(2, v.weight)
+  result.putBE16(4, signVal)
+  result.putBE16(6, v.dscale)
+  for i in 0 ..< ndigits.int:
+    result.putBE16(8 + i * 2, v.digits[i])
+
 proc toPgBinaryParam*(v: PgNumeric): PgParam =
-  ## Sends numeric as text format (binary numeric encoding is complex).
-  PgParam(oid: OidNumeric, format: 0, value: some(toBytes(string(v))))
+  PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
 
 proc toPgBinaryParam*(v: PgUuid): PgParam =
   let hex = string(v).replace("-", "")
@@ -793,56 +1042,30 @@ proc fromPgText*(data: seq[byte], oid: int32): string =
 # Binary decoders needed by both basic and format-aware row accessors.
 # Placed before the Row getters to avoid forward-declaration issues.
 
-proc decodeNumericBinary(data: openArray[byte]): string =
-  ## Decode PostgreSQL binary numeric format:
-  ##   2 bytes: ndigits (number of base-10000 digit groups)
-  ##   2 bytes: weight (weight of first digit)
-  ##   2 bytes: sign (0x0000=positive, 0x4000=negative, 0xC000=NaN)
-  ##   2 bytes: dscale (digits after decimal point)
-  ##   ndigits * 2 bytes: digit groups (each 0-9999)
+proc decodeNumericBinary(data: openArray[byte]): PgNumeric =
+  ## Decode PostgreSQL binary numeric format into PgNumeric.
+  if data.len < 8:
+    raise newException(PgTypeError, "Numeric binary data too short: " & $data.len)
   let ndigits = int(fromBE16(data.toOpenArray(0, 1)))
-  let weight = int(int16(fromBE16(data.toOpenArray(2, 3))))
-  let sign = uint16(fromBE16(data.toOpenArray(4, 5)))
-  let dscale = int(fromBE16(data.toOpenArray(6, 7)))
-  if sign == 0xC000'u16:
-    return "NaN"
+  let weight = int16(fromBE16(data.toOpenArray(2, 3)))
+  let signRaw = uint16(fromBE16(data.toOpenArray(4, 5)))
+  let dscale = int16(fromBE16(data.toOpenArray(6, 7)))
+  let sign =
+    case signRaw
+    of 0x0000'u16:
+      pgPositive
+    of 0x4000'u16:
+      pgNegative
+    of 0xC000'u16:
+      pgNaN
+    else:
+      raise newException(PgTypeError, "Invalid numeric sign: " & $signRaw)
+  if sign == pgNaN:
+    return PgNumeric(sign: pgNaN)
   var digits = newSeq[int16](ndigits)
   for i in 0 ..< ndigits:
     digits[i] = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
-  if ndigits == 0:
-    if dscale > 0:
-      return "0." & repeat('0', dscale)
-    return "0"
-  var intPart = ""
-  var fracPart = ""
-  let intGroups = weight + 1
-  for i in 0 ..< ndigits:
-    let d = int(digits[i])
-    if i < intGroups:
-      if intPart.len == 0:
-        intPart.add($d)
-      else:
-        let s = $d
-        intPart.add(repeat('0', 4 - s.len))
-        intPart.add(s)
-    else:
-      let s = $d
-      fracPart.add(repeat('0', 4 - s.len))
-      fracPart.add(s)
-  if intGroups > ndigits:
-    intPart.add(repeat('0', (intGroups - ndigits) * 4))
-  if intPart.len == 0:
-    intPart = "0"
-    let leadingZeroGroups = -intGroups
-    fracPart = repeat('0', leadingZeroGroups * 4) & fracPart
-  if dscale > 0:
-    if fracPart.len > dscale:
-      fracPart = fracPart[0 ..< dscale]
-    elif fracPart.len < dscale:
-      fracPart.add(repeat('0', dscale - fracPart.len))
-    result = (if sign == 0x4000'u16: "-" else: "") & intPart & "." & fracPart
-  else:
-    result = (if sign == 0x4000'u16: "-" else: "") & intPart
+  PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
 
 proc decodeBinaryTimestamp(data: openArray[byte]): DateTime =
   let pgUs = fromBE64(data)
@@ -999,16 +1222,20 @@ proc decodeNumRangeBinary(data: openArray[byte]): PgRange[PgNumeric] =
     return PgRange[PgNumeric](isEmpty: true)
   if raw.hasLower:
     result.hasLower = true
-    let s = decodeNumericBinary(
-      data.toOpenArray(raw.lowerOff, raw.lowerOff + raw.lowerLen - 1)
+    result.lower = PgRangeBound[PgNumeric](
+      value: decodeNumericBinary(
+        data.toOpenArray(raw.lowerOff, raw.lowerOff + raw.lowerLen - 1)
+      ),
+      inclusive: raw.lowerInc,
     )
-    result.lower = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.lowerInc)
   if raw.hasUpper:
     result.hasUpper = true
-    let s = decodeNumericBinary(
-      data.toOpenArray(raw.upperOff, raw.upperOff + raw.upperLen - 1)
+    result.upper = PgRangeBound[PgNumeric](
+      value: decodeNumericBinary(
+        data.toOpenArray(raw.upperOff, raw.upperOff + raw.upperLen - 1)
+      ),
+      inclusive: raw.upperInc,
     )
-    result.upper = PgRangeBound[PgNumeric](value: PgNumeric(s), inclusive: raw.upperInc)
 
 proc decodeTsRangeBinary(data: openArray[byte]): PgRange[DateTime] =
   let raw = decodeRangeBinaryRaw(data)
@@ -1201,7 +1428,7 @@ proc getStr*(row: Row, col: int): string =
         copyMem(addr f, addr bits, 8)
         return $f
     of OidNumeric:
-      return decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
+      return $decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
     else:
       discard # text, varchar, bytea: fall through to raw copy
   result = newString(clen)
@@ -1289,8 +1516,30 @@ proc getNumeric*(row: Row, col: int): PgNumeric =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    return PgNumeric(decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1)))
-  PgNumeric(row.getStr(col))
+    if clen >= 8:
+      return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+  parsePgNumeric(row.getStr(col))
+
+proc getUuid*(row: Row, col: int): PgUuid =
+  ## Get a column value as PgUuid. Handles binary format (16 bytes).
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen == 16:
+      const hexChars = "0123456789abcdef"
+      var s = newString(36)
+      var pos = 0
+      for i in 0 ..< 16:
+        if i == 4 or i == 6 or i == 8 or i == 10:
+          s[pos] = '-'
+          inc pos
+        let b = row.data.buf[off + i]
+        s[pos] = hexChars[int(b shr 4)]
+        s[pos + 1] = hexChars[int(b and 0x0F)]
+        pos += 2
+      return PgUuid(s)
+  PgUuid(row.getStr(col))
 
 proc getBool*(row: Row, col: int): bool =
   ## Get a column value as bool. Handles binary format directly. Raises `PgTypeError` on NULL.
@@ -1810,6 +2059,7 @@ optAccessor(getInt, getIntOpt, int32)
 optAccessor(getInt64, getInt64Opt, int64)
 optAccessor(getFloat, getFloatOpt, float64)
 optAccessor(getNumeric, getNumericOpt, PgNumeric)
+optAccessor(getUuid, getUuidOpt, PgUuid)
 optAccessor(getBool, getBoolOpt, bool)
 optAccessor(getJson, getJsonOpt, JsonNode)
 optAccessor(getInterval, getIntervalOpt, PgInterval)
@@ -2226,7 +2476,7 @@ proc writeParamValue*(buf: var seq[byte], v: seq[byte]) =
     copyMem(addr buf[o], unsafeAddr v[0], v.len)
 
 proc writeParamValue*(buf: var seq[byte], v: PgNumeric) =
-  writeParamValue(buf, string(v))
+  writeParamValue(buf, $v)
 
 proc writeParamOid*(buf: var seq[byte], v: int16) =
   buf.addInt32(OidInt2)
@@ -2543,7 +2793,7 @@ proc compositeFieldFromText[T](s: string): T =
     else:
       raise newException(PgTypeError, "Invalid boolean in composite: " & s)
   elif T is PgNumeric:
-    PgNumeric(s)
+    parsePgNumeric(s)
   else:
     raise newException(PgTypeError, "Unsupported composite field type")
 
@@ -2901,8 +3151,7 @@ proc toPgBinaryParam*(v: PgRange[int64]): PgParam =
   )
 
 proc toPgBinaryParam*(v: PgRange[PgNumeric]): PgParam =
-  ## Sends numrange as text format (binary numeric encoding is complex).
-  PgParam(oid: OidNumRange, format: 0, value: some(toBytes($v)))
+  encodeRangeBinary(v, OidNumRange, encodeNumericBinary)
 
 proc toPgBinaryParam*(v: PgRange[DateTime]): PgParam =
   encodeRangeBinary(v, OidTsRange, encodeBinaryTimestamp)
@@ -2954,7 +3203,7 @@ proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
   parseRangeText[PgNumeric](
     s,
     proc(e: string): PgNumeric =
-      PgNumeric(e),
+      parsePgNumeric(e),
   )
 
 proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
@@ -3187,8 +3436,12 @@ proc toPgBinaryParam*(v: PgMultirange[int64]): PgParam =
   )
 
 proc toPgBinaryParam*(v: PgMultirange[PgNumeric]): PgParam =
-  ## Sends nummultirange as text format.
-  PgParam(oid: OidNumMultirange, format: 0, value: some(toBytes($v)))
+  var rangeData: seq[seq[byte]]
+  for r in seq[PgRange[PgNumeric]](v):
+    rangeData.add(toPgBinaryParam(r).value.get)
+  PgParam(
+    oid: OidNumMultirange, format: 1, value: some(encodeMultirangeBinaryImpl(rangeData))
+  )
 
 proc toPgBinaryParam*(v: PgMultirange[DateTime]): PgParam =
   var rangeData: seq[seq[byte]]
@@ -3257,7 +3510,7 @@ proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
   parseMultirangeText[PgNumeric](
     s,
     proc(e: string): PgNumeric =
-      PgNumeric(e),
+      parsePgNumeric(e),
   )
 
 proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
@@ -3379,6 +3632,7 @@ nameAccessor(getFloat, float64)
 nameAccessor(getBool, bool)
 nameAccessor(getBytes, seq[byte])
 nameAccessor(getNumeric, PgNumeric)
+nameAccessor(getUuid, PgUuid)
 nameAccessor(getTimestamp, DateTime)
 nameAccessor(getDate, DateTime)
 nameAccessor(getJson, JsonNode)
@@ -3399,6 +3653,7 @@ nameAccessor(getIntOpt, Option[int32])
 nameAccessor(getInt64Opt, Option[int64])
 nameAccessor(getFloatOpt, Option[float64])
 nameAccessor(getNumericOpt, Option[PgNumeric])
+nameAccessor(getUuidOpt, Option[PgUuid])
 nameAccessor(getBoolOpt, Option[bool])
 nameAccessor(getJsonOpt, Option[JsonNode])
 nameAccessor(getIntervalOpt, Option[PgInterval])

@@ -2571,7 +2571,7 @@ suite "E2E: Extended Type Roundtrip":
       let uuid = PgUuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
       let res = await conn.query("SELECT $1::uuid", @[toPgParam(uuid)])
       doAssert res.rows.len == 1
-      doAssert res.rows[0].getStr(0) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+      doAssert $res.rows[0].getUuid(0) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
       await conn.close()
 
     waitFor t()
@@ -2895,7 +2895,7 @@ suite "E2E: JSON and Numeric":
       discard await conn.exec("CREATE TABLE test_numeric_param (val numeric(20,8))")
       discard await conn.exec(
         "INSERT INTO test_numeric_param VALUES ($1)",
-        @[toPgParam(PgNumeric("123456789012.56789012"))],
+        @[toPgParam(parsePgNumeric("123456789012.56789012"))],
       )
       let res = await conn.query("SELECT val FROM test_numeric_param")
       doAssert res.rows.len == 1
