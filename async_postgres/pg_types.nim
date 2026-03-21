@@ -3711,13 +3711,19 @@ proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
 # Name-based column access
 
 proc columnIndex*(row: Row, name: string): int =
-  ## Find the index of a column by name using the field metadata attached to
-  ## the row's underlying ``RowData``.  Raises ``PgTypeError`` if the metadata
-  ## is not available (e.g. the Row was constructed manually) or the column
-  ## name is not found.
+  ## Find the index of a column by name using a cached name→index table on the
+  ## row's underlying ``RowData``.  The table is built lazily on first access.
+  ## Raises ``PgTypeError`` if the metadata is not available (e.g. the Row was
+  ## constructed manually) or the column name is not found.
   if row.data == nil or row.data.fields.len == 0:
     raise newException(PgTypeError, "Column name lookup requires field metadata")
-  columnIndex(row.data.fields, name)
+  if row.data.colMap.len == 0 and row.data.fields.len > 0:
+    for i, f in row.data.fields:
+      row.data.colMap[f.name] = i
+  let idx = row.data.colMap.getOrDefault(name, -1)
+  if idx < 0:
+    raise newException(PgTypeError, "Column not found: " & name)
+  idx
 
 # Generic typed accessor by column name
 
