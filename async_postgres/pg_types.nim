@@ -1308,25 +1308,6 @@ proc getBool*(row: Row, col: int): bool =
   else:
     raise newException(PgTypeError, "Invalid boolean value: " & c)
 
-# Compile-time generic accessor — static dispatch by type, no OID branching.
-# Usage: let id = row.get(0, int32)
-
-proc get*(row: Row, col: int, T: typedesc[int32]): int32 =
-  ## Generic typed accessor. Usage: ``row.get(0, int32)``
-  row.getInt(col)
-
-proc get*(row: Row, col: int, T: typedesc[int64]): int64 =
-  row.getInt64(col)
-
-proc get*(row: Row, col: int, T: typedesc[float64]): float64 =
-  row.getFloat(col)
-
-proc get*(row: Row, col: int, T: typedesc[bool]): bool =
-  row.getBool(col)
-
-proc get*(row: Row, col: int, T: typedesc[string]): string =
-  row.getStr(col)
-
 proc getBytes*(row: Row, col: int): seq[byte] =
   ## Get a column value as raw bytes. Decodes hex-encoded bytea in text format.
   ## Raises `PgTypeError` on NULL.
@@ -3347,6 +3328,120 @@ optAccessor(getNumMultirange, getNumMultirangeOpt, PgMultirange[PgNumeric])
 optAccessor(getTsMultirange, getTsMultirangeOpt, PgMultirange[DateTime])
 optAccessor(getTsTzMultirange, getTsTzMultirangeOpt, PgMultirange[DateTime])
 optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
+
+# Generic accessors — static dispatch by type, no OID branching.
+# DateTime-based types (DateTime, PgRange[DateTime], PgMultirange[DateTime])
+# are excluded because DateTime maps to multiple PG types (timestamp,
+# timestamptz, date) making a single `get` overload ambiguous. Use the
+# explicit getters (getTimestamp, getTimestampTz, getDate, etc.) instead.
+
+proc get*(row: Row, col: int, T: typedesc[int32]): int32 =
+  ## Generic typed accessor. Usage: ``row.get(0, int32)``
+  row.getInt(col)
+
+proc get*(row: Row, col: int, T: typedesc[int64]): int64 =
+  row.getInt64(col)
+
+proc get*(row: Row, col: int, T: typedesc[float64]): float64 =
+  row.getFloat(col)
+
+proc get*(row: Row, col: int, T: typedesc[bool]): bool =
+  row.getBool(col)
+
+proc get*(row: Row, col: int, T: typedesc[string]): string =
+  row.getStr(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[byte]]): seq[byte] =
+  row.getBytes(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgNumeric]): PgNumeric =
+  row.getNumeric(col)
+
+proc get*(row: Row, col: int, T: typedesc[JsonNode]): JsonNode =
+  row.getJson(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgInterval]): PgInterval =
+  row.getInterval(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgInet]): PgInet =
+  row.getInet(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgCidr]): PgCidr =
+  row.getCidr(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgMacAddr]): PgMacAddr =
+  row.getMacAddr(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgMacAddr8]): PgMacAddr8 =
+  row.getMacAddr8(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgPoint]): PgPoint =
+  row.getPoint(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgLine]): PgLine =
+  row.getLine(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgLseg]): PgLseg =
+  row.getLseg(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgBox]): PgBox =
+  row.getBox(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgPath]): PgPath =
+  row.getPath(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgPolygon]): PgPolygon =
+  row.getPolygon(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgCircle]): PgCircle =
+  row.getCircle(col)
+
+# Array types
+
+proc get*(row: Row, col: int, T: typedesc[seq[int16]]): seq[int16] =
+  row.getInt16Array(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[int32]]): seq[int32] =
+  row.getIntArray(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[int64]]): seq[int64] =
+  row.getInt64Array(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[float32]]): seq[float32] =
+  row.getFloat32Array(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[float64]]): seq[float64] =
+  row.getFloatArray(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[bool]]): seq[bool] =
+  row.getBoolArray(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[string]]): seq[string] =
+  row.getStrArray(col)
+
+# Range types (DateTime-based ranges excluded — see note above)
+
+proc get*(row: Row, col: int, T: typedesc[PgRange[int32]]): PgRange[int32] =
+  row.getInt4Range(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgRange[int64]]): PgRange[int64] =
+  row.getInt8Range(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgRange[PgNumeric]]): PgRange[PgNumeric] =
+  row.getNumRange(col)
+
+# Multirange types (DateTime-based multiranges excluded — see note above)
+
+proc get*(row: Row, col: int, T: typedesc[PgMultirange[int32]]): PgMultirange[int32] =
+  row.getInt4Multirange(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgMultirange[int64]]): PgMultirange[int64] =
+  row.getInt8Multirange(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[PgMultirange[PgNumeric]]
+): PgMultirange[PgNumeric] =
+  row.getNumMultirange(col)
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.
