@@ -638,24 +638,24 @@ suite "Row type alias":
     check row.getStr(0) == "hello"
     check row.isNull(1)
 
-suite "affectedRows":
+suite "parseAffectedRows":
   test "UPDATE tag":
-    check affectedRows("UPDATE 3") == 3
+    check parseAffectedRows("UPDATE 3") == 3
 
   test "INSERT tag":
-    check affectedRows("INSERT 0 1") == 1
+    check parseAffectedRows("INSERT 0 1") == 1
 
   test "DELETE tag":
-    check affectedRows("DELETE 0") == 0
+    check parseAffectedRows("DELETE 0") == 0
 
   test "SELECT tag":
-    check affectedRows("SELECT 5") == 5
+    check parseAffectedRows("SELECT 5") == 5
 
   test "empty tag":
-    check affectedRows("") == 0
+    check parseAffectedRows("") == 0
 
   test "non-numeric tag":
-    check affectedRows("CREATE TABLE") == 0
+    check parseAffectedRows("CREATE TABLE") == 0
 
 suite "Option accessors":
   test "getStrOpt some":

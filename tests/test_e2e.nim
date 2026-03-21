@@ -4406,13 +4406,13 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "execAffected returns affected row count":
+  test "exec().affectedRows returns affected row count":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       discard await conn.exec("CREATE TEMP TABLE ea_test (id int)")
       discard await conn.exec("INSERT INTO ea_test VALUES (1), (2), (3)")
-      let n = await conn.execAffected("DELETE FROM ea_test WHERE id > 1")
-      doAssert n == 2
+      let cr = await conn.exec("DELETE FROM ea_test WHERE id > 1", newSeq[PgParam]())
+      doAssert cr.affectedRows == 2
       await conn.close()
 
     waitFor t()
@@ -4458,12 +4458,12 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "execAffected returns 0 when no rows affected":
+  test "exec().affectedRows returns 0 when no rows affected":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       discard await conn.exec("CREATE TEMP TABLE ea_zero (id int)")
-      let n = await conn.execAffected("DELETE FROM ea_zero WHERE id = 999")
-      doAssert n == 0
+      let cr = await conn.exec("DELETE FROM ea_zero WHERE id = 999", newSeq[PgParam]())
+      doAssert cr.affectedRows == 0
       await conn.close()
 
     waitFor t()
@@ -4507,13 +4507,13 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "pool execAffected":
+  test "pool exec().affectedRows":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       discard await conn.exec("CREATE TEMP TABLE pool_ea2 (id int)")
       discard await conn.exec("INSERT INTO pool_ea2 VALUES (1), (2)")
-      let n = await conn.execAffected("DELETE FROM pool_ea2")
-      doAssert n == 2
+      let cr = await conn.exec("DELETE FROM pool_ea2", newSeq[PgParam]())
+      doAssert cr.affectedRows == 2
       await conn.close()
 
     waitFor t()
@@ -4975,7 +4975,7 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert results.len == 3
       for r in results:
         doAssert r.kind == prkExec
-        doAssert r.commandTag == "INSERT 0 1"
+        doAssert r.commandResult == "INSERT 0 1"
 
       let qr = await conn.query("SELECT val FROM test_pipe_exec ORDER BY id")
       doAssert qr.rowCount == 3
@@ -5033,14 +5033,14 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert results.len == 4
 
       doAssert results[0].kind == prkExec
-      doAssert results[0].commandTag == "INSERT 0 1"
+      doAssert results[0].commandResult == "INSERT 0 1"
 
       doAssert results[1].kind == prkQuery
       doAssert results[1].queryResult.rowCount == 1
       doAssert results[1].queryResult.rows[0].getStr(0) == "x"
 
       doAssert results[2].kind == prkExec
-      doAssert results[2].commandTag == "INSERT 0 1"
+      doAssert results[2].commandResult == "INSERT 0 1"
 
       doAssert results[3].kind == prkQuery
       doAssert results[3].queryResult.rowCount == 1
@@ -5142,7 +5142,7 @@ suite "E2E: execInTransaction / queryInTransaction":
         p.addQuery("SELECT val FROM test_pipe_pool")
         let results = await p.execute()
         doAssert results.len == 2
-        doAssert results[0].commandTag == "INSERT 0 1"
+        doAssert results[0].commandResult == "INSERT 0 1"
         doAssert results[1].queryResult.rows[0].getStr(0) == "pooled"
 
       discard await pool.exec("DROP TABLE test_pipe_pool")

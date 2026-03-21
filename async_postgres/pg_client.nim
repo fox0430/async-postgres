@@ -82,7 +82,7 @@ type
   PipelineResult* = object ## Result of a single operation within a pipeline.
     case kind*: PipelineResultKind
     of prkExec:
-      commandTag*: string
+      commandResult*: CommandResult
     of prkQuery:
       queryResult*: QueryResult
 
@@ -339,16 +339,18 @@ proc exec*(
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a statement with typed parameters.
+  var tag: string
   if timeout > ZeroDuration:
     try:
-      return await execImpl(conn, sql, params, timeout).wait(timeout)
+      tag = await execImpl(conn, sql, params, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
       raise newException(PgTimeoutError, "Exec timed out")
   else:
-    return await execImpl(conn, sql, params)
+    tag = await execImpl(conn, sql, params)
+  return initCommandResult(tag)
 
 template queryRecvLoop(
     conn: PgConnection,
@@ -1028,16 +1030,6 @@ proc queryExists*(
   let qr = await conn.query(sql, params, timeout = timeout)
   return qr.rowCount > 0
 
-proc execAffected*(
-    conn: PgConnection,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  ## Execute a statement and return the number of affected rows.
-  let tag = await conn.exec(sql, params, timeout)
-  return affectedRows(tag)
-
 proc queryColumn*(
     conn: PgConnection,
     sql: string,
@@ -1430,43 +1422,35 @@ proc copyInRawImpl(
 
 proc copyIn*(
     conn: PgConnection, sql: string, data: seq[byte], timeout: Duration = ZeroDuration
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute COPY ... FROM STDIN with a single contiguous ``seq[byte]``.
   ## Avoids the copy that the ``openArray[byte]`` overload performs.
+  var tag: string
   if timeout > ZeroDuration:
     try:
-      return await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
+      tag = await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
       raise newException(PgTimeoutError, "COPY IN timed out")
   else:
-    return await copyInRawImpl(conn, sql, data)
+    tag = await copyInRawImpl(conn, sql, data)
+  return initCommandResult(tag)
 
 proc copyIn*(
     conn: PgConnection,
     sql: string,
     data: openArray[byte],
     timeout: Duration = ZeroDuration,
-): Future[string] =
+): Future[CommandResult] =
   ## Execute COPY ... FROM STDIN with a single contiguous buffer.
   ## Slices `data` into CopyData messages internally.
-  ## Returns the command tag (e.g. "COPY 5").
+  ## Returns the command result (e.g. "COPY 5").
   let dataCopy = @data # copy openArray to seq before async boundary
-  if timeout > ZeroDuration:
-    proc inner(): Future[string] {.async.} =
-      try:
-        return await copyInRawImpl(conn, sql, dataCopy, timeout).wait(timeout)
-      except AsyncTimeoutError:
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "COPY IN timed out")
-
-    return inner()
-  else:
-    return copyInRawImpl(conn, sql, dataCopy)
+  copyIn(conn, sql, dataCopy, timeout)
 
 proc copyIn*(
     conn: PgConnection, sql: string, data: string, timeout: Duration = ZeroDuration
-): Future[string] =
+): Future[CommandResult] =
   ## Execute COPY ... FROM STDIN with text data as a string.
   ## Converts to bytes internally; avoids manual toOpenArrayByte.
   var bytes = newSeq[byte](data.len)
@@ -1479,10 +1463,10 @@ proc copyIn*(
     sql: string,
     data: seq[seq[byte]],
     timeout: Duration = ZeroDuration,
-): Future[string] =
+): Future[CommandResult] =
   ## Execute COPY ... FROM STDIN via simple query protocol.
   ## Concatenates chunks and delegates to the ``seq[byte]`` overload.
-  ## Returns the command tag (e.g. "COPY 5").
+  ## Returns the command result (e.g. "COPY 5").
   var totalLen = 0
   for chunk in data:
     totalLen += chunk.len
@@ -1902,10 +1886,11 @@ proc execInTransaction*(
     sql: string,
     params: seq[PgParam],
     timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with typed parameters.
   let (oids, formats, values) = extractParams(params)
-  return await conn.execInTransaction(sql, values, oids, formats, timeout)
+  let tag = await conn.execInTransaction(sql, values, oids, formats, timeout)
+  return initCommandResult(tag)
 
 proc execInTransaction*(
     conn: PgConnection,
@@ -1913,13 +1898,14 @@ proc execInTransaction*(
     params: seq[PgParam],
     opts: TransactionOptions,
     timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with options.
   let (oids, formats, values) = extractParams(params)
   let beginSql = buildBeginSql(opts)
+  var tag: string
   if timeout > ZeroDuration:
     try:
-      return await execInTransactionImpl(
+      tag = await execInTransactionImpl(
         conn, beginSql, sql, values, oids, formats, timeout
       )
         .wait(timeout)
@@ -1927,8 +1913,9 @@ proc execInTransaction*(
       conn.state = csClosed
       raise newException(PgTimeoutError, "execInTransaction timed out")
   else:
-    return
+    tag =
       await execInTransactionImpl(conn, beginSql, sql, values, oids, formats, timeout)
+  return initCommandResult(tag)
 
 proc queryInTransactionImpl(
     conn: PgConnection,
@@ -2282,7 +2269,7 @@ proc executeImpl(
         of bmkCommandComplete:
           if activeOpIdx < p.ops.len:
             if p.ops[activeOpIdx].kind == pokExec:
-              results[activeOpIdx].commandTag = msg.commandTag
+              results[activeOpIdx].commandResult = initCommandResult(msg.commandTag)
             else:
               results[activeOpIdx].queryResult.commandTag = msg.commandTag
             inc activeOpIdx
@@ -2777,7 +2764,7 @@ proc execDirectImpl(
     cacheMiss: bool,
     stmtName: string,
     timeout: Duration,
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Shared receive path for execDirect macro.
   await conn.sendBufMsg()
   var commandTag = ""
@@ -2820,7 +2807,7 @@ proc execDirectImpl(
           discard
       await conn.fillRecvBuf(timeout)
 
-  return commandTag
+  return initCommandResult(commandTag)
 
 macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =
   ## Zero-allocation exec: encodes parameters directly into the send buffer
