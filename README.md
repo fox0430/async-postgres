@@ -48,7 +48,7 @@ Async PostgreSQL client in Nim.
 import pkg/async_postgres
 
 proc main() {.async.} =
-  let conn = await connect(parseDsn("postgresql://myuser:mypass@127.0.0.1:5432/mydb"))
+  let conn = await connect("postgresql://myuser:mypass@127.0.0.1:5432/mydb")
   defer: await conn.close()
 
   # Insert and get affected row count

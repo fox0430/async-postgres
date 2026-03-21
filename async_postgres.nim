@@ -16,7 +16,7 @@
 ##   import pkg/async_postgres
 ##
 ##   proc main() {.async.} =
-##     let conn = await connect(parseDsn("postgresql://user:pass@localhost:5432/mydb"))
+##     let conn = await connect("postgresql://user:pass@localhost:5432/mydb")
 ##     defer: await conn.close()
 ##
 ##     # Execute with typed parameters
