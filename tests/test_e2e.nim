@@ -4309,6 +4309,60 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "queryValueOpt returns some on value":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOpt("SELECT 'hello'")
+      doAssert val == some("hello")
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOpt returns none on no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOpt("SELECT 1 WHERE false")
+      doAssert val.isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOpt returns none on NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOpt("SELECT NULL::text")
+      doAssert val.isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOpt with typedesc returns some":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOpt(int64, "SELECT 42")
+      doAssert val == some(42'i64)
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOpt with typedesc returns none on no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOpt(int32, "SELECT 1 WHERE false")
+      doAssert val.isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOpt with typedesc returns none on NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOpt(int64, "SELECT NULL::int8")
+      doAssert val.isNone
+      await conn.close()
+
+    waitFor t()
+
   test "queryExists returns true when rows exist":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -4476,6 +4530,28 @@ suite "E2E: Convenience Query Methods":
       doAssert val == -1'i32
       let val2 = await pool.queryValueOrDefault(int32, "SELECT 7", default = 0'i32)
       doAssert val2 == 7'i32
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValueOpt":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val = await pool.queryValueOpt("SELECT 'ok'")
+      doAssert val == some("ok")
+      let none_val = await pool.queryValueOpt("SELECT 1 WHERE false")
+      doAssert none_val.isNone
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValueOpt with typedesc":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val = await pool.queryValueOpt(int64, "SELECT 123")
+      doAssert val == some(123'i64)
+      let none_val = await pool.queryValueOpt(int32, "SELECT 1 WHERE false")
+      doAssert none_val.isNone
       await pool.close()
 
     waitFor t()

@@ -473,6 +473,37 @@ proc queryValue*[T](
     await pool.resetSession(conn)
     pool.release(conn)
 
+proc queryValueOpt*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[string]] {.async.} =
+  ## Execute a query and return the first column of the first row as a string.
+  ## Returns `none` if no rows or the value is NULL.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOpt(sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
+proc queryValueOpt*[T](
+    pool: PgPool,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[T]] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`.
+  ## Returns `none` if no rows or the value is NULL.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOpt(T, sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
 proc queryValueOrDefault*(
     pool: PgPool,
     sql: string,

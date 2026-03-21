@@ -1,4 +1,4 @@
-import std/[unittest, strutils, importutils]
+import std/[unittest, importutils]
 
 import ../async_postgres/[async_backend, pg_client, pg_types, pg_largeobject]
 import ../async_postgres/pg_connection {.all.}
