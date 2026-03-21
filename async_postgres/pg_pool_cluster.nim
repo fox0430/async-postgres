@@ -10,9 +10,10 @@ type
     rfPrimary ## Fall back to primary when replica is unavailable
 
   PgPoolCluster* = ref object
-    ## Connection pool cluster that routes queries to primary or replica pools.
-    ## Read queries (`query*`) are routed to the replica pool, while write
-    ## operations (`exec*`, `*InTransaction`, `notify`) go to the primary pool.
+    ## Connection pool cluster with explicit read/write routing.
+    ##
+    ## - `read*` methods route to the replica pool (read-only queries).
+    ## - `write*` methods route to the primary pool (writes, `SELECT FOR UPDATE`, etc.).
     ##
     ## For transactions, use `cluster.primaryPool.withTransaction` directly.
     primary: PgPool
@@ -97,14 +98,14 @@ template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
 
 # Read operations → replica
 
-proc query(
+proc readQuery(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
-  ## Execute a SQL query routed to the replica pool.
+  ## Execute a read-only query routed to the replica pool.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return
@@ -113,14 +114,14 @@ proc query(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc query*(
+proc readQuery*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
-  ## Execute a query with typed parameters routed to the replica pool.
+  ## Execute a read-only query with typed parameters routed to the replica pool.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
@@ -128,14 +129,14 @@ proc query*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryOne*(
+proc readQueryOne*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
-  ## Execute a query routed to the replica pool and return the first row.
+  ## Execute a read-only query routed to the replica pool and return the first row.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryOne(sql, params, resultFormat, timeout)
@@ -143,13 +144,13 @@ proc queryOne*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryValue*(
+proc readQueryValue*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
-  ## Execute a query routed to the replica pool and return the first column of the first row.
+  ## Execute a read-only query routed to the replica pool and return the first column of the first row.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryValue(sql, params, timeout = timeout)
@@ -157,14 +158,14 @@ proc queryValue*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryValue*[T](
+proc readQueryValue*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[T] {.async.} =
-  ## Execute a query routed to the replica pool and return the first column as `T`.
+  ## Execute a read-only query routed to the replica pool and return the first column as `T`.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryValue(T, sql, params, timeout = timeout)
@@ -172,13 +173,13 @@ proc queryValue*[T](
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryValueOpt*(
+proc readQueryValueOpt*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[Option[string]] {.async.} =
-  ## Execute a query routed to the replica pool; return `none` if no rows or NULL.
+  ## Execute a read-only query routed to the replica pool; return `none` if no rows or NULL.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryValueOpt(sql, params, timeout = timeout)
@@ -186,14 +187,14 @@ proc queryValueOpt*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryValueOpt*[T](
+proc readQueryValueOpt*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[Option[T]] {.async.} =
-  ## Execute a query routed to the replica pool; return `none` if no rows or NULL.
+  ## Execute a read-only query routed to the replica pool; return `none` if no rows or NULL.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryValueOpt(T, sql, params, timeout = timeout)
@@ -201,14 +202,14 @@ proc queryValueOpt*[T](
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryValueOrDefault*(
+proc readQueryValueOrDefault*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     default: string = "",
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
-  ## Execute a query routed to the replica pool; return default if no rows or NULL.
+  ## Execute a read-only query routed to the replica pool; return default if no rows or NULL.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryValueOrDefault(sql, params, default, timeout)
@@ -216,7 +217,7 @@ proc queryValueOrDefault*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryValueOrDefault*[T](
+proc readQueryValueOrDefault*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sql: string,
@@ -224,7 +225,7 @@ proc queryValueOrDefault*[T](
     default: T,
     timeout: Duration = ZeroDuration,
 ): Future[T] {.async.} =
-  ## Execute a query routed to the replica pool; return default if no rows or NULL.
+  ## Execute a read-only query routed to the replica pool; return default if no rows or NULL.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryValueOrDefault(T, sql, params, default, timeout)
@@ -232,13 +233,13 @@ proc queryValueOrDefault*[T](
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryExists*(
+proc readQueryExists*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[bool] {.async.} =
-  ## Execute a query routed to the replica pool and return whether any rows exist.
+  ## Execute a read-only query routed to the replica pool and return whether any rows exist.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryExists(sql, params, timeout)
@@ -246,13 +247,13 @@ proc queryExists*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryColumn*(
+proc readQueryColumn*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[seq[string]] {.async.} =
-  ## Execute a query routed to the replica pool and return the first column of all rows.
+  ## Execute a read-only query routed to the replica pool and return the first column of all rows.
   let (conn, pool) = await acquireRead(cluster)
   try:
     return await conn.queryColumn(sql, params, timeout)
@@ -262,7 +263,7 @@ proc queryColumn*(
 
 # Write operations → primary
 
-proc exec(
+proc writeExec(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -276,7 +277,7 @@ proc exec(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc exec*(
+proc writeExec*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
@@ -290,7 +291,7 @@ proc exec*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc execAffected*(
+proc writeExecAffected*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
@@ -304,7 +305,171 @@ proc execAffected*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc execInTransaction(
+proc writeQuery(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[Option[seq[byte]]] = @[],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query routed to the primary pool (e.g. SELECT FOR UPDATE, INSERT RETURNING).
+  let conn = await cluster.primary.acquire()
+  try:
+    return
+      await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQuery*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query with typed parameters routed to the primary pool
+  ## (e.g. SELECT FOR UPDATE, INSERT RETURNING).
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryOne*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[Option[Row]] {.async.} =
+  ## Execute a query routed to the primary pool and return the first row.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryOne(sql, params, resultFormat, timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryValue*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a query routed to the primary pool and return the first column of the first row.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryValue(sql, params, timeout = timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryValue*[T](
+    cluster: PgPoolCluster,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query routed to the primary pool and return the first column as `T`.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryValue(T, sql, params, timeout = timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryValueOpt*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[string]] {.async.} =
+  ## Execute a query routed to the primary pool; return `none` if no rows or NULL.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryValueOpt(sql, params, timeout = timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryValueOpt*[T](
+    cluster: PgPoolCluster,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[T]] {.async.} =
+  ## Execute a query routed to the primary pool; return `none` if no rows or NULL.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryValueOpt(T, sql, params, timeout = timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryValueOrDefault*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: string = "",
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  ## Execute a query routed to the primary pool; return default if no rows or NULL.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryValueOrDefault(sql, params, default, timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryValueOrDefault*[T](
+    cluster: PgPoolCluster,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query routed to the primary pool; return default if no rows or NULL.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryValueOrDefault(T, sql, params, default, timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryExists*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[bool] {.async.} =
+  ## Execute a query routed to the primary pool and return whether any rows exist.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryExists(sql, params, timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeQueryColumn*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[seq[string]] {.async.} =
+  ## Execute a query routed to the primary pool and return the first column of all rows.
+  let conn = await cluster.primary.acquire()
+  try:
+    return await conn.queryColumn(sql, params, timeout)
+  finally:
+    await cluster.primary.resetSession(conn)
+    cluster.primary.release(conn)
+
+proc writeExecInTransaction(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -320,7 +485,7 @@ proc execInTransaction(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc execInTransaction*(
+proc writeExecInTransaction*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam],
@@ -334,7 +499,7 @@ proc execInTransaction*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc queryInTransaction(
+proc writeQueryInTransaction(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[Option[seq[byte]]] = @[],
@@ -353,7 +518,7 @@ proc queryInTransaction(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc queryInTransaction*(
+proc writeQueryInTransaction*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam],
@@ -368,7 +533,7 @@ proc queryInTransaction*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc simpleQuery*(
+proc writeSimpleQuery*(
     cluster: PgPoolCluster, sql: string
 ): Future[seq[QueryResult]] {.async.} =
   ## Execute via simple query protocol routed to the primary pool.
@@ -379,7 +544,7 @@ proc simpleQuery*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc simpleExec*(
+proc writeSimpleExec*(
     cluster: PgPoolCluster, sql: string, timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
   ## Execute via simple query protocol routed to the primary pool.
@@ -390,7 +555,7 @@ proc simpleExec*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc notify*(
+proc writeNotify*(
     cluster: PgPoolCluster,
     channel: string,
     payload: string = "",
