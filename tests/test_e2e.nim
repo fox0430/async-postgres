@@ -2960,7 +2960,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let qr = await conn.query(
-        "SELECT 42::int2, 123456::int4, 9999999999::int8", resultFormats = binaryFormat
+        "SELECT 42::int2, 123456::int4, 9999999999::int8", resultFormat = rfBinary
       )
       doAssert qr.rows.len == 1
       let row = qr.rows[0]
@@ -2977,9 +2977,8 @@ suite "E2E: Binary Format":
   test "binary results for float types":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let qr = await conn.query(
-        "SELECT 3.14::float8, 1.5::float4", resultFormats = binaryFormat
-      )
+      let qr =
+        await conn.query("SELECT 3.14::float8, 1.5::float4", resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       let row = qr.rows[0]
       doAssert abs(row.getFloat(0) - 3.14) < 1e-10
@@ -2991,7 +2990,7 @@ suite "E2E: Binary Format":
   test "binary results for bool":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let qr = await conn.query("SELECT true, false", resultFormats = binaryFormat)
+      let qr = await conn.query("SELECT true, false", resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getBool(0) == true
       doAssert qr.rows[0].getBool(1) == false
@@ -3003,7 +3002,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let qr = await conn.query(
-        "SELECT 'hello'::text, 'world'::varchar", resultFormats = binaryFormat
+        "SELECT 'hello'::text, 'world'::varchar", resultFormat = rfBinary
       )
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getStr(0) == "hello"
@@ -3015,8 +3014,7 @@ suite "E2E: Binary Format":
   test "binary results for bytea":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let qr =
-        await conn.query("SELECT '\\xDEADBEEF'::bytea", resultFormats = binaryFormat)
+      let qr = await conn.query("SELECT '\\xDEADBEEF'::bytea", resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getBytes(0) == @[0xDE'u8, 0xAD, 0xBE, 0xEF]
       await conn.close()
@@ -3027,7 +3025,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let qr = await conn.query(
-        "SELECT '2024-01-15 10:30:00'::timestamp", resultFormats = binaryFormat
+        "SELECT '2024-01-15 10:30:00'::timestamp", resultFormat = rfBinary
       )
       doAssert qr.rows.len == 1
       let dt = qr.rows[0].getTimestamp(0)
@@ -3043,8 +3041,7 @@ suite "E2E: Binary Format":
   test "binary results for date":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let qr =
-        await conn.query("SELECT '2024-01-15'::date", resultFormats = binaryFormat)
+      let qr = await conn.query("SELECT '2024-01-15'::date", resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       let dt = qr.rows[0].getDate(0)
       doAssert dt.year == 2024
@@ -3058,8 +3055,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let qr = await conn.query(
-        "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid",
-        resultFormats = binaryFormat,
+        "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid", resultFormat = rfBinary
       )
       doAssert qr.rows.len == 1
       let data = qr.rows[0].getBytes(0)
@@ -3077,7 +3073,7 @@ suite "E2E: Binary Format":
         toPgBinaryParam(42'i32), toPgBinaryParam(9999999999'i64), toPgBinaryParam(true)
       ]
       let qr = await conn.query(
-        "SELECT $1::int4, $2::int8, $3::bool", params, resultFormats = binaryFormat
+        "SELECT $1::int4, $2::int8, $3::bool", params, resultFormat = rfBinary
       )
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getInt(0) == 42'i32
@@ -3102,7 +3098,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let params = @[toPgParam(42'i32)]
-      let qr = await conn.query("SELECT $1::int4", params, resultFormats = binaryFormat)
+      let qr = await conn.query("SELECT $1::int4", params, resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getInt(0) == 42'i32
       await conn.close()
@@ -3113,7 +3109,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let qr =
-        await conn.query("SELECT NULL::int4, NULL::text", resultFormats = binaryFormat)
+        await conn.query("SELECT NULL::int4, NULL::text", resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].isNull(0)
       doAssert qr.rows[0].isNull(1)
@@ -3125,8 +3121,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let stmt = await conn.prepare("bin_stmt", "SELECT $1::int4 + 10")
-      let qr =
-        await stmt.execute(@[toPgBinaryParam(32'i32)], resultFormats = binaryFormat)
+      let qr = await stmt.execute(@[toPgBinaryParam(32'i32)], resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getInt(0) == 42'i32
       await stmt.close()
@@ -3139,8 +3134,7 @@ suite "E2E: Binary Format":
       let conn = await connect(plainConfig())
       let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
       let params = @[toPgBinaryParam(dt)]
-      let qr =
-        await conn.query("SELECT $1::timestamp", params, resultFormats = binaryFormat)
+      let qr = await conn.query("SELECT $1::timestamp", params, resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       let result = qr.rows[0].getTimestamp(0)
       doAssert result.year == 2024
@@ -3156,8 +3150,7 @@ suite "E2E: Binary Format":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let params = @[toPgBinaryParam(3.14159265358979)]
-      let qr =
-        await conn.query("SELECT $1::float8", params, resultFormats = binaryFormat)
+      let qr = await conn.query("SELECT $1::float8", params, resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert abs(qr.rows[0].getFloat(0) - 3.14159265358979) < 1e-14
       await conn.close()
@@ -3169,8 +3162,7 @@ suite "E2E: Binary Format":
       let conn = await connect(plainConfig())
       let data = @[0xDE'u8, 0xAD, 0xBE, 0xEF, 0x00, 0xFF]
       let params = @[toPgBinaryParam(data)]
-      let qr =
-        await conn.query("SELECT $1::bytea", params, resultFormats = binaryFormat)
+      let qr = await conn.query("SELECT $1::bytea", params, resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getBytes(0) == data
       await conn.close()
@@ -4551,12 +4543,12 @@ suite "E2E: Convenience Query Methods":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      let r1 = await conn.query("SELECT 42::int4", resultFormats = binaryFormat)
+      let r1 = await conn.query("SELECT 42::int4", resultFormat = rfBinary)
       doAssert r1.rows[0].getInt(0) == 42
       doAssert conn.stmtCache.len == 1
 
       # Cache hit with binary format
-      let r2 = await conn.query("SELECT 42::int4", resultFormats = binaryFormat)
+      let r2 = await conn.query("SELECT 42::int4", resultFormat = rfBinary)
       doAssert r2.rows[0].getInt(0) == 42
 
       await conn.close()

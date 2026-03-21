@@ -80,6 +80,12 @@ type
     format*: int16 # 0=text, 1=binary
     value*: Option[seq[byte]]
 
+  ResultFormat* = enum
+    ## How result columns should be encoded by the server.
+    rfAuto ## Per-column binary-safe detection via statement cache (default).
+    rfText ## All columns in text format.
+    rfBinary ## All columns in binary format.
+
   RangeBinaryInput =
     tuple[
       isEmpty: bool,
