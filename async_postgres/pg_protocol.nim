@@ -1,4 +1,4 @@
-import std/options
+import std/[options, tables]
 
 type
   ProtocolError* = object of CatchableError
@@ -145,6 +145,7 @@ type
     colFormats*: seq[int16] ## Per-column format codes (0=text, 1=binary)
     colTypeOids*: seq[int32] ## Per-column type OIDs for binary→text conversion
     fields*: seq[FieldDescription] ## Column metadata for name-based access
+    colMap*: Table[string, int] ## Cached name→index mapping (lazily built)
 
   Row* = object ## Lightweight view into a single row within a `RowData` buffer.
     data*: RowData
