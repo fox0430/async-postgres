@@ -4,7 +4,10 @@ import
 import pg_protocol
 
 type
-  PgTypeError* = object of CatchableError
+  PgError* = object of CatchableError
+    ## General PostgreSQL error. Base type for all pg-specific errors.
+
+  PgTypeError* = object of PgError
     ## Raised when a PostgreSQL value cannot be converted to the requested Nim type.
 
   PgUuid* = distinct string
