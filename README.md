@@ -52,11 +52,11 @@ proc main() {.async.} =
   defer: await conn.close()
 
   # Insert and get affected row count
-  let affected = await conn.execAffected(
+  let cr = await conn.exec(
     "INSERT INTO users (name, age) VALUES ($1, $2)",
     pgParams("Alice", 30'i32),
   )
-  echo "Inserted: ", affected
+  echo "Inserted: ", cr.affectedRows
 
   # Query multiple rows
   let result = await conn.query(

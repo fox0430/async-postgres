@@ -367,7 +367,7 @@ proc exec*(
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a statement with typed parameters using a pooled connection.
   let conn = await pool.acquire()
   try:
@@ -551,20 +551,6 @@ proc queryExists*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc execAffected*(
-    pool: PgPool,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  ## Execute a statement and return the number of affected rows.
-  let conn = await pool.acquire()
-  try:
-    return await conn.execAffected(sql, params, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
 proc queryColumn*(
     pool: PgPool,
     sql: string,
@@ -590,9 +576,9 @@ proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.}
 
 proc simpleExec*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a SQL statement via simple query protocol using a pooled connection.
-  ## Returns the command tag.
+  ## Returns the command result.
   let conn = await pool.acquire()
   try:
     return await conn.simpleExec(sql, timeout)
@@ -618,7 +604,7 @@ proc execInTransaction(
 
 proc execInTransaction*(
     pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with typed parameters.
   let conn = await pool.acquire()
   try:

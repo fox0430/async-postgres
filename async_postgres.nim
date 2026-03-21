@@ -20,10 +20,11 @@
 ##     defer: await conn.close()
 ##
 ##     # Execute with typed parameters
-##     discard await conn.exec(
+##     let cr = await conn.exec(
 ##       "INSERT INTO users (name, age) VALUES ($1, $2)",
 ##       pgParams("Alice", 30'i32),
 ##     )
+##     echo "Inserted: ", cr.affectedRows
 ##
 ##     # Query rows
 ##     let result = await conn.query(
