@@ -492,6 +492,31 @@ suite "Binary encode/decode helpers":
     check p.value.get[0] == 0x55'u8
     check p.value.get[1] == 0x0e'u8
 
+  test "PgUuid $ and ==":
+    let a = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+    let b = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+    let c = PgUuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+    check $a == "550e8400-e29b-41d4-a716-446655440000"
+    check a == b
+    check a != c
+
+  test "getUuid binary":
+    let data: seq[byte] = @[
+      0x55'u8, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
+      0x44, 0x00, 0x00,
+    ]
+    let fields = @[mkField(OidUuid, 1)]
+    let row = mkRow(@[some(data)], fields)
+    check $row.getUuid(0) == "550e8400-e29b-41d4-a716-446655440000"
+
+  test "getUuid text":
+    let row: Row = @[some(toBytes("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"))]
+    check $row.getUuid(0) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+
+  test "getUuidOpt none":
+    let row: Row = @[none(seq[byte])]
+    check row.getUuidOpt(0) == none(PgUuid)
+
   test "Option some":
     let p = toPgBinaryParam(some(42'i32))
     check p.oid == OidInt4
@@ -1284,15 +1309,27 @@ suite "Binary array encode/decode roundtrip":
 
 suite "PgNumeric":
   test "toPgParam PgNumeric":
-    let p = toPgParam(PgNumeric("123.456"))
+    let p = toPgParam(parsePgNumeric("123.456"))
     check p.oid == OidNumeric
     check p.format == 0
     check toString(p.value.get) == "123.456"
 
-  test "toPgBinaryParam PgNumeric uses text format":
-    let p = toPgBinaryParam(PgNumeric("99.99"))
+  test "toPgBinaryParam PgNumeric binary format":
+    let p = toPgBinaryParam(parsePgNumeric("99.99"))
     check p.oid == OidNumeric
-    check p.format == 0
+    check p.format == 1
+    # Verify roundtrip: decode the encoded binary
+    let decoded = $decodeNumericBinary(p.value.get)
+    check decoded == "99.99"
+
+  test "toPgBinaryParam PgNumeric roundtrip variants":
+    for s in [
+      "0", "-1", "NaN", "0.00", "12345.6789", "-0.001", "100000000", "0.00001",
+      "999.999",
+    ]:
+      let p = toPgBinaryParam(parsePgNumeric(s))
+      let decoded = $decodeNumericBinary(p.value.get)
+      check decoded == s
 
   test "getNumeric text format":
     let row: Row = @[some(toBytes("12345.6789012345678901234567890"))]
@@ -1310,8 +1347,58 @@ suite "PgNumeric":
     check row.getNumericOpt(0) == none(PgNumeric)
 
   test "PgNumeric equality":
-    check PgNumeric("100.00") == PgNumeric("100.00")
-    check PgNumeric("1.0") != PgNumeric("1.00")
+    check parsePgNumeric("100.00") == parsePgNumeric("100.00")
+    check parsePgNumeric("1.0") == parsePgNumeric("1.00") # value-based equality
+    check parsePgNumeric("0") == parsePgNumeric("0.00")
+    check parsePgNumeric("NaN") == parsePgNumeric("NaN")
+    check parsePgNumeric("1") != parsePgNumeric("2")
+    check parsePgNumeric("1") != parsePgNumeric("-1")
+
+  test "PgNumeric comparison":
+    check parsePgNumeric("1") < parsePgNumeric("2")
+    check parsePgNumeric("2") > parsePgNumeric("1")
+    check parsePgNumeric("-5") < parsePgNumeric("1")
+    check parsePgNumeric("-1") > parsePgNumeric("-2")
+    check parsePgNumeric("0") < parsePgNumeric("0.001")
+    check parsePgNumeric("0.001") > parsePgNumeric("0")
+    check parsePgNumeric("0") > parsePgNumeric("-0.001")
+    check parsePgNumeric("1.5") <= parsePgNumeric("1.5")
+    check parsePgNumeric("1.5") >= parsePgNumeric("1.5")
+    check parsePgNumeric("99999") < parsePgNumeric("100000")
+    # NaN sorts highest (PostgreSQL convention)
+    check parsePgNumeric("NaN") > parsePgNumeric("999999999")
+    check parsePgNumeric("NaN") > parsePgNumeric("-999999999")
+    check parsePgNumeric("NaN") >= parsePgNumeric("NaN")
+    check parsePgNumeric("NaN") <= parsePgNumeric("NaN")
+
+  test "PgNumeric hash consistency":
+    # Equal values must have equal hashes
+    check hash(parsePgNumeric("1.0")) == hash(parsePgNumeric("1.00"))
+    check hash(parsePgNumeric("0")) == hash(parsePgNumeric("0.00"))
+    check hash(parsePgNumeric("NaN")) == hash(parsePgNumeric("NaN"))
+
+  test "parsePgNumeric roundtrip":
+    for s in [
+      "0", "1", "-1", "0.00", "12345.6789", "-0.001", "NaN", "100000000", "0.00001",
+      "999.999",
+    ]:
+      check $parsePgNumeric(s) == s
+
+  test "parsePgNumeric rejects invalid input":
+    expect(PgTypeError):
+      discard parsePgNumeric("")
+    expect(PgTypeError):
+      discard parsePgNumeric("abc")
+    expect(PgTypeError):
+      discard parsePgNumeric("+1.5")
+    expect(PgTypeError):
+      discard parsePgNumeric(" 1.5")
+    expect(PgTypeError):
+      discard parsePgNumeric("1.2.3")
+    expect(PgTypeError):
+      discard parsePgNumeric("-")
+    expect(PgTypeError):
+      discard parsePgNumeric(".")
 
   test "decodeNumericBinary - positive integer":
     # 1234: ndigits=1, weight=0, sign=0, dscale=0, digit=1234
@@ -1580,12 +1667,12 @@ suite "PgNumeric":
     check row.getStr(0) == "3.14"
 
   test "$ PgNumeric":
-    check $PgNumeric("12345.67890") == "12345.67890"
-    check $PgNumeric("0") == "0"
-    check $PgNumeric("-999") == "-999"
+    check $parsePgNumeric("12345.67890") == "12345.67890"
+    check $parsePgNumeric("0") == "0"
+    check $parsePgNumeric("-999") == "-999"
 
   test "toPgParam Option[PgNumeric] some":
-    let p = toPgParam(some(PgNumeric("42.00")))
+    let p = toPgParam(some(parsePgNumeric("42.00")))
     check p.oid == OidNumeric
     check p.format == 0
     check p.value.isSome
@@ -1597,9 +1684,9 @@ suite "PgNumeric":
     check p.value.isNone
 
   test "toPgBinaryParam Option[PgNumeric] some":
-    let p = toPgBinaryParam(some(PgNumeric("1.5")))
+    let p = toPgBinaryParam(some(parsePgNumeric("1.5")))
     check p.oid == OidNumeric
-    check p.format == 0 # PgNumeric always uses text format
+    check p.format == 1
     check p.value.isSome
 
   test "toPgBinaryParam Option[PgNumeric] none":
@@ -2815,7 +2902,7 @@ suite "PgRange constructors and display":
     check emptyRange[int32]() != rangeOf(1'i32, 5'i32)
 
   test "quoting special characters":
-    let r = rangeOf(PgNumeric("1.5"), PgNumeric("2.5"))
+    let r = rangeOf(parsePgNumeric("1.5"), parsePgNumeric("2.5"))
     check $r == "[1.5,2.5)"
 
 suite "Range text parsing":
@@ -2922,7 +3009,7 @@ suite "Range toPgParam":
     check p.value.get.toString == "[1,10)"
 
   test "numrange":
-    let p = toPgParam(rangeOf(PgNumeric("1.5"), PgNumeric("9.5")))
+    let p = toPgParam(rangeOf(parsePgNumeric("1.5"), parsePgNumeric("9.5")))
     check p.oid == OidNumRange
     check p.value.get.toString == "[1.5,9.5)"
 
@@ -3095,8 +3182,8 @@ suite "Range row getters":
   test "getNumRange text":
     let row: Row = @[some(toBytes("[1.5,9.5)"))]
     let r = row.getNumRange(0)
-    check r.lower.value == PgNumeric("1.5")
-    check r.upper.value == PgNumeric("9.5")
+    check r.lower.value == parsePgNumeric("1.5")
+    check r.upper.value == parsePgNumeric("9.5")
 
   test "getDateRange text":
     let row: Row = @[some(toBytes("[2023-01-01,2023-12-31)"))]
@@ -3181,7 +3268,7 @@ suite "PgMultirange":
     check p.oid == OidInt8Multirange
 
   test "toPgParam nummultirange":
-    let mr = toMultirange(rangeOf(PgNumeric("1.0"), PgNumeric("5.0")))
+    let mr = toMultirange(rangeOf(parsePgNumeric("1.0"), parsePgNumeric("5.0")))
     let p = toPgParam(mr)
     check p.oid == OidNumMultirange
 
