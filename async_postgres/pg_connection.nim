@@ -13,6 +13,7 @@ elif hasAsyncDispatch:
     import std/[net, tempfiles, os]
 
 import pg_protocol, pg_auth, pg_types
+export pg_types.PgError
 
 # TCP keepalive socket options (not exported by posix module)
 when defined(linux):
