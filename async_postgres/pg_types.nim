@@ -3719,6 +3719,12 @@ proc columnIndex*(row: Row, name: string): int =
     raise newException(PgTypeError, "Column name lookup requires field metadata")
   columnIndex(row.data.fields, name)
 
+# Generic typed accessor by column name
+
+proc get*[T](row: Row, name: string, _: typedesc[T]): T =
+  ## Generic typed accessor by column name. Usage: ``row.get("id", int32)``
+  row.get(row.columnIndex(name), T)
+
 nameAccessor(isNull, bool)
 nameAccessor(getStr, string)
 nameAccessor(getInt, int32)
