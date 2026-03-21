@@ -2,9 +2,17 @@ import std/[options, tables, macros]
 
 import async_backend, pg_protocol, pg_connection, pg_types
 
-const binaryFormat*: seq[int16] =
-  @[1'i16] ## Result format list requesting binary encoding for all columns.
 const copyBatchSize = 262144 ## 256KB batch threshold for COPY IN buffering
+
+func toFormatCodes(rf: ResultFormat): seq[int16] {.inline.} =
+  ## Convert a high-level ResultFormat to wire-protocol format codes.
+  case rf
+  of rfAuto:
+    @[]
+  of rfText:
+    @[0'i16]
+  of rfBinary:
+    @[1'i16]
 
 type
   PreparedStatement* = object ## A server-side prepared statement returned by `prepare`.
@@ -832,11 +840,12 @@ proc queryEach*(
     sql: string,
     params: seq[PgParam] = @[],
     callback: RowCallback,
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
   ## Execute a query with typed parameters, invoking `callback` once per row.
   ## Returns the number of rows processed.
+  let resultFormats = resultFormat.toFormatCodes()
   if timeout > ZeroDuration:
     try:
       return await queryEachImpl(conn, sql, params, callback, resultFormats, timeout)
@@ -875,10 +884,11 @@ proc query*(
     conn: PgConnection,
     sql: string,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query with typed parameters.
+  let resultFormats = resultFormat.toFormatCodes()
   if timeout > ZeroDuration:
     try:
       return await queryImpl(conn, sql, params, resultFormats, timeout).wait(timeout)
@@ -892,12 +902,11 @@ proc queryOne*(
     conn: PgConnection,
     sql: string,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
   ## Execute a query and return the first row, or `none` if no rows.
-  let qr =
-    await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
+  let qr = await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   if qr.rowCount > 0:
     if qr.fields.len > 0 and qr.data.fields.len == 0:
       qr.data.fields = qr.fields
@@ -1237,10 +1246,11 @@ proc executeImpl(
 proc execute*(
     stmt: PreparedStatement,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a prepared statement with typed parameters.
+  let resultFormats = resultFormat.toFormatCodes()
   if timeout > ZeroDuration:
     try:
       return await executeImpl(stmt, params, resultFormats, timeout).wait(timeout)
@@ -1993,11 +2003,12 @@ proc queryInTransaction*(
     conn: PgConnection,
     sql: string,
     params: seq[PgParam],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined transaction with typed parameters.
   let (oids, formats, values) = extractParams(params)
+  let resultFormats = resultFormat.toFormatCodes()
   return
     await conn.queryInTransaction(sql, values, oids, formats, resultFormats, timeout)
 
@@ -2006,11 +2017,12 @@ proc queryInTransaction*(
     sql: string,
     params: seq[PgParam],
     opts: TransactionOptions,
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined transaction with options.
   let (oids, formats, values) = extractParams(params)
+  let resultFormats = resultFormat.toFormatCodes()
   let beginSql = buildBeginSql(opts)
   if timeout > ZeroDuration:
     try:
@@ -2063,7 +2075,7 @@ proc addQuery*(
     p: var Pipeline,
     sql: string,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
 ) =
   ## Add a query operation to the pipeline with typed parameters.
   let (oids, formats, values) = extractParams(params)
@@ -2073,7 +2085,7 @@ proc addQuery*(
     params: values,
     paramOids: oids,
     paramFormats: formats,
-    resultFormats: resultFormats,
+    resultFormats: resultFormat.toFormatCodes(),
   )
 
 proc addQuery(
@@ -2568,12 +2580,13 @@ proc openCursor*(
     conn: PgConnection,
     sql: string,
     params: seq[PgParam],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     chunkSize: int32 = 100,
     timeout: Duration = ZeroDuration,
 ): Future[Cursor] {.async.} =
   ## Open a cursor with typed parameters.
   let (oids, formats, values) = extractParams(params)
+  let resultFormats = resultFormat.toFormatCodes()
   return
     await conn.openCursor(sql, values, oids, formats, resultFormats, chunkSize, timeout)
 
