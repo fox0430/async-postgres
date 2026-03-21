@@ -2,7 +2,7 @@ import std/[tables, sets, strutils, uri, deques, options, lists]
 when defined(linux) or defined(macosx):
   import std/posix
 
-import async_backend
+import async_backend, pg_protocol, pg_auth, pg_types
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -12,7 +12,7 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[net, tempfiles, os]
 
-import pg_protocol, pg_auth, pg_types
+export PgError
 
 # TCP keepalive socket options (not exported by posix module)
 when defined(linux):
@@ -27,9 +27,6 @@ elif defined(macosx):
     TCP_KEEPCNT = cint(0x102)
 
 type
-  PgError* = object of CatchableError
-    ## General PostgreSQL error. Base type for all pg-specific errors.
-
   PgConnectionError* = object of PgError
     ## Connection failures, disconnections, SSL/auth errors.
 
