@@ -380,14 +380,13 @@ proc query*(
     pool: PgPool,
     sql: string,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query with typed parameters using a pooled connection.
   let conn = await pool.acquire()
   try:
-    return
-      await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
+    return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)
@@ -417,13 +416,13 @@ proc queryEach*(
     sql: string,
     params: seq[PgParam] = @[],
     callback: RowCallback,
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
   ## Execute a query with typed parameters using a pooled connection, invoking `callback` once per row.
   let conn = await pool.acquire()
   try:
-    return await conn.queryEach(sql, params, callback, resultFormats, timeout)
+    return await conn.queryEach(sql, params, callback, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)
@@ -432,13 +431,13 @@ proc queryOne*(
     pool: PgPool,
     sql: string,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
   ## Execute a query and return the first row, or `none` if no rows.
   let conn = await pool.acquire()
   try:
-    return await conn.queryOne(sql, params, resultFormats, timeout)
+    return await conn.queryOne(sql, params, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)
@@ -620,13 +619,13 @@ proc queryInTransaction*(
     pool: PgPool,
     sql: string,
     params: seq[PgParam],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined transaction with typed parameters.
   let conn = await pool.acquire()
   try:
-    return await conn.queryInTransaction(sql, params, resultFormats, timeout)
+    return await conn.queryInTransaction(sql, params, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)

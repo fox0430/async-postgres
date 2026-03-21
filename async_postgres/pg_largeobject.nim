@@ -101,7 +101,7 @@ proc loRead*(
   let qr = await lo.conn.query(
     "SELECT loread($1, $2)",
     @[toPgParam(lo.fd), toPgParam(length)],
-    resultFormats = binaryFormat,
+    resultFormat = rfBinary,
     timeout = timeout,
   )
   if qr.rowCount == 0:

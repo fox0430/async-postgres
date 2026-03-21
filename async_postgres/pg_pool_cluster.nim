@@ -117,14 +117,13 @@ proc query*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query with typed parameters routed to the replica pool.
   let (conn, pool) = await acquireRead(cluster)
   try:
-    return
-      await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
+    return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)
@@ -133,13 +132,13 @@ proc queryOne*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
   ## Execute a query routed to the replica pool and return the first row.
   let (conn, pool) = await acquireRead(cluster)
   try:
-    return await conn.queryOne(sql, params, resultFormats, timeout)
+    return await conn.queryOne(sql, params, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
     pool.release(conn)
@@ -329,13 +328,13 @@ proc queryInTransaction*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam],
-    resultFormats: seq[int16] = @[],
+    resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query in a pipelined transaction with typed parameters, routed to primary.
   let conn = await cluster.primary.acquire()
   try:
-    return await conn.queryInTransaction(sql, params, resultFormats, timeout)
+    return await conn.queryInTransaction(sql, params, resultFormat, timeout)
   finally:
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
