@@ -27,6 +27,7 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
       connConfig: ConnConfig(host: "localhost", port: 5432),
       minSize: minSize,
       maxSize: maxSize,
+      maxWaiters: -1,
       maintenanceInterval: seconds(30),
     ),
     idle: initDeque[PooledConn](),
