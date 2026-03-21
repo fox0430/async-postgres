@@ -27,9 +27,6 @@ elif defined(macosx):
     TCP_KEEPCNT = cint(0x102)
 
 type
-  PgError* = object of CatchableError
-    ## General PostgreSQL error. Base type for all pg-specific errors.
-
   PgConnectionError* = object of PgError
     ## Connection failures, disconnections, SSL/auth errors.
 
