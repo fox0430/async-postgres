@@ -65,6 +65,31 @@ suite "E2E: Basic Connection":
 
     waitFor t()
 
+  test "connect with DSN string":
+    proc t() {.async.} =
+      let dsn =
+        "postgresql://" & PgUser & ":" & PgPassword & "@" & PgHost & ":" & $PgPort & "/" &
+        PgDatabase & "?sslmode=disable"
+      let conn = await connect(dsn)
+      doAssert conn.state == csReady
+      let res = await conn.simpleQuery("SELECT 1")
+      doAssert res[0].rows[0][0].get().toString() == "1"
+      await conn.close()
+      doAssert conn.state == csClosed
+
+    waitFor t()
+
+  test "connect with keyword=value DSN string":
+    proc t() {.async.} =
+      let dsn =
+        "host=" & PgHost & " port=" & $PgPort & " user=" & PgUser & " password=" &
+        PgPassword & " dbname=" & PgDatabase & " sslmode=disable"
+      let conn = await connect(dsn)
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
   test "server parameters available":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

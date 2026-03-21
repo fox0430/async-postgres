@@ -1765,3 +1765,7 @@ proc parseDsn*(dsn: string): ConnConfig =
     parseUriDsn(dsn)
   else:
     parseKeyValueDsn(dsn)
+
+proc connect*(dsn: string): Future[PgConnection] =
+  ## Shorthand for ``connect(parseDsn(dsn))``.
+  connect(parseDsn(dsn))
