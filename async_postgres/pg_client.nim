@@ -948,6 +948,40 @@ proc queryValue*[T](
     raise newException(PgError, "Query returned NULL")
   return row.get(0, T)
 
+proc queryValueOpt*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[string]] {.async.} =
+  ## Execute a query and return the first column of the first row as a string.
+  ## Returns `none` if no rows are returned or the value is NULL.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return none(string)
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    return none(string)
+  return some(row.getStr(0))
+
+proc queryValueOpt*[T](
+    conn: PgConnection,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[T]] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`.
+  ## Returns `none` if no rows are returned or the value is NULL.
+  ## Supported types: int32, int64, float64, bool, string.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return none(T)
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    return none(T)
+  return some(row.get(0, T))
+
 proc queryValueOrDefault*(
     conn: PgConnection,
     sql: string,

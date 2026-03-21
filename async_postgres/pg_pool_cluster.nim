@@ -172,6 +172,35 @@ proc queryValue*[T](
     await pool.resetSession(conn)
     pool.release(conn)
 
+proc queryValueOpt*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[string]] {.async.} =
+  ## Execute a query routed to the replica pool; return `none` if no rows or NULL.
+  let (conn, pool) = await acquireRead(cluster)
+  try:
+    return await conn.queryValueOpt(sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
+proc queryValueOpt*[T](
+    cluster: PgPoolCluster,
+    _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[Option[T]] {.async.} =
+  ## Execute a query routed to the replica pool; return `none` if no rows or NULL.
+  let (conn, pool) = await acquireRead(cluster)
+  try:
+    return await conn.queryValueOpt(T, sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
 proc queryValueOrDefault*(
     cluster: PgPoolCluster,
     sql: string,
