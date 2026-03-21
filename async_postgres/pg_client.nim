@@ -4,7 +4,7 @@ import async_backend, pg_protocol, pg_connection, pg_types
 
 const copyBatchSize = 262144 ## 256KB batch threshold for COPY IN buffering
 
-func toFormatCodes(rf: ResultFormat): seq[int16] {.inline.} =
+func toFormatCodes(rf: ResultFormat): seq[int16] =
   ## Convert a high-level ResultFormat to wire-protocol format codes.
   case rf
   of rfAuto:
