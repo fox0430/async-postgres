@@ -740,10 +740,10 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
 
 template withPipeline*(pool: PgPool, pipeline, body: untyped) =
   ## Acquire a connection, create a Pipeline, execute body, then release.
-  ## The `pipeline` identifier is a `var Pipeline` available in body.
+  ## The `pipeline` identifier is a `Pipeline` available in body.
   let conn = await pool.acquire()
   try:
-    var pipeline = newPipeline(conn)
+    let pipeline = newPipeline(conn)
     body
   finally:
     await pool.resetSession(conn)

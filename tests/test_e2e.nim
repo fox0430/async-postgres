@@ -4942,7 +4942,7 @@ suite "E2E: execInTransaction / queryInTransaction":
       discard
         await conn.exec("CREATE TABLE test_pipe_exec (id serial PRIMARY KEY, val text)")
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addExec("INSERT INTO test_pipe_exec (val) VALUES ($1)", @[toPgParam("a")])
       p.addExec("INSERT INTO test_pipe_exec (val) VALUES ($1)", @[toPgParam("b")])
       p.addExec("INSERT INTO test_pipe_exec (val) VALUES ($1)", @[toPgParam("c")])
@@ -4967,7 +4967,7 @@ suite "E2E: execInTransaction / queryInTransaction":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addQuery("SELECT 1::int4 AS a")
       p.addQuery("SELECT 2::int4 AS b, 3::int4 AS c")
       p.addQuery("SELECT 'hello'::text AS greeting")
@@ -4999,7 +4999,7 @@ suite "E2E: execInTransaction / queryInTransaction":
         "CREATE TABLE test_pipe_mixed (id serial PRIMARY KEY, val text)"
       )
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addExec("INSERT INTO test_pipe_mixed (val) VALUES ($1)", @[toPgParam("x")])
       p.addQuery("SELECT val FROM test_pipe_mixed ORDER BY id")
       p.addExec("INSERT INTO test_pipe_mixed (val) VALUES ($1)", @[toPgParam("y")])
@@ -5054,7 +5054,7 @@ suite "E2E: execInTransaction / queryInTransaction":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addExec("SELECT 1")
       p.addExec("INVALID SQL THAT WILL FAIL")
       p.addExec("SELECT 2") # Should be skipped by server
@@ -5078,7 +5078,7 @@ suite "E2E: execInTransaction / queryInTransaction":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addExec("SELECT $1::text", @[some(@(toOpenArrayByte("hello", 0, 4)))])
       p.addQuery("SELECT $1::text", @[some(@(toOpenArrayByte("world", 0, 4)))])
       let results = await p.execute()
@@ -5094,7 +5094,7 @@ suite "E2E: execInTransaction / queryInTransaction":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       let results = await p.execute()
       doAssert results.len == 0
 
@@ -5129,7 +5129,7 @@ suite "E2E: execInTransaction / queryInTransaction":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addQuery("SELECT generate_series(1, 5)::int4 AS n")
       p.addQuery("SELECT generate_series(10, 12)::int4 AS m")
       let results = await p.execute()
@@ -5151,7 +5151,7 @@ suite "E2E: execInTransaction / queryInTransaction":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addQuery("SELECT 1::int4 WHERE false")
       p.addQuery("SELECT 42::int4")
       let results = await p.execute()
@@ -5196,7 +5196,7 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert conn.stmtCache.len == 2
 
       # Pipeline with new SQL: evicts LRU entries
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addQuery("SELECT 100::int4")
       p.addQuery("SELECT 300::int4")
       let results = await p.execute()
@@ -5218,7 +5218,7 @@ suite "E2E: execInTransaction / queryInTransaction":
       conn.stmtCacheCapacity = 2
 
       # 3 cache misses with capacity 2: should not crash
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addQuery("SELECT 10::int4")
       p.addQuery("SELECT 20::int4")
       p.addQuery("SELECT 30::int4")
@@ -5238,7 +5238,7 @@ suite "E2E: execInTransaction / queryInTransaction":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      var p = newPipeline(conn)
+      let p = newPipeline(conn)
       p.addQuery("SELECT $1::text", @[toPgParam("aaa")])
       p.addQuery("SELECT $1::text", @[toPgParam("bbb")])
       p.addQuery("SELECT $1::text", @[toPgParam("ccc")])

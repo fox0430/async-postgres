@@ -86,7 +86,7 @@ type
     of prkQuery:
       queryResult*: QueryResult
 
-  Pipeline* = object
+  Pipeline* = ref object
     ## Batch of queries/execs sent through the PostgreSQL pipeline protocol.
     conn: PgConnection
     ops: seq[PipelineOp]
@@ -2076,7 +2076,7 @@ proc newPipeline*(conn: PgConnection): Pipeline =
   ## Create a new pipeline for batching multiple operations into a single round trip.
   Pipeline(conn: conn, ops: @[])
 
-proc addExec*(p: var Pipeline, sql: string, params: seq[PgParam] = @[]) =
+proc addExec*(p: Pipeline, sql: string, params: seq[PgParam] = @[]) =
   ## Add an exec operation to the pipeline with typed parameters.
   var op = PipelineOp(kind: pokExec, sql: sql)
   if params.len > 0:
@@ -2090,7 +2090,7 @@ proc addExec*(p: var Pipeline, sql: string, params: seq[PgParam] = @[]) =
   p.ops.add move(op)
 
 proc addExec(
-    p: var Pipeline,
+    p: Pipeline,
     sql: string,
     params: seq[Option[seq[byte]]],
     paramOids: seq[int32] = @[],
@@ -2106,7 +2106,7 @@ proc addExec(
   )
 
 proc addQuery*(
-    p: var Pipeline,
+    p: Pipeline,
     sql: string,
     params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
@@ -2123,7 +2123,7 @@ proc addQuery*(
   )
 
 proc addQuery(
-    p: var Pipeline,
+    p: Pipeline,
     sql: string,
     params: seq[Option[seq[byte]]],
     paramOids: seq[int32] = @[],
@@ -2141,9 +2141,8 @@ proc addQuery(
   )
 
 proc executeImpl(
-    pIn: Pipeline, timeout: Duration
+    p: Pipeline, timeout: Duration
 ): Future[seq[PipelineResult]] {.async.} =
-  var p = pIn
   let conn = p.conn
   conn.checkReady()
   conn.state = csBusy
