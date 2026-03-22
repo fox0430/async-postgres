@@ -27,9 +27,9 @@
 ##
 ##     # Query rows
 ##     let minAge = 25'i32
-##     let result = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
-##     for row in result:
-##       echo row.getStr(1), " age=", row.getInt(2)
+##     let r = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
+##     for row in r:
+##       echo row.getStr("name"), " age=", row.getInt("age")
 ##
 ##   waitFor main()
 ##
