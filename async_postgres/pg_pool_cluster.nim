@@ -313,19 +313,6 @@ proc writeExecAffected*(
   let conn = await cluster.primary.acquire()
   try:
     return await conn.execAffected(sql, params, timeout)
-
-proc writeQuery(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a query routed to the primary pool (e.g. SELECT FOR UPDATE, INSERT RETURNING).
-  let conn = await cluster.primary.acquire()
-  try:
-    return
-      await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
   finally:
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
