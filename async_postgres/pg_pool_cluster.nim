@@ -275,20 +275,6 @@ proc readSimpleQuery*(
 
 # Write operations → primary
 
-proc writeExec(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
-  ## Execute a SQL statement routed to the primary pool.
-  let conn = await cluster.primary.acquire()
-  try:
-    return await conn.exec(sql, params, timeout = timeout)
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
-
 proc writeExec*(
     cluster: PgPoolCluster,
     sql: string,
@@ -299,20 +285,6 @@ proc writeExec*(
   let conn = await cluster.primary.acquire()
   try:
     return await conn.exec(sql, params, timeout = timeout)
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
-
-proc writeExecAffected*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  ## Execute a statement routed to the primary pool and return affected row count.
-  let conn = await cluster.primary.acquire()
-  try:
-    return await conn.execAffected(sql, params, timeout)
   finally:
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
