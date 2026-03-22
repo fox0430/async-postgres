@@ -9,15 +9,19 @@ Async PostgreSQL client in Nim.
 - Simple Query and Extended Query Protocol
 - Pipeline mode — batch multiple operations in a single network round trip
 - Connection pooling with health checks and maintenance
+- Pool cluster with read replica routing
 - SSL/TLS support (disable, prefer, require, verify-ca, verify-full)
 - MD5 and SCRAM-SHA-256 authentication
 - DSN connection string parsing
 
 ### Queries & Statements
+- `sql` macro — compile-time `{expr}` placeholder extraction with automatic parameterization
+- `?`-style placeholders (`sqlParams`) for db_connector compatibility
 - Prepared statements with server-side statement cache (LRU eviction)
 - Server-side cursors (streaming row chunks)
 - Transactions (`withTransaction`)
 - COPY IN / COPY OUT (buffered and streaming)
+- Large Object API (streaming binary data)
 - LISTEN/NOTIFY with auto-reconnect
 
 ### Types
@@ -42,6 +46,12 @@ Async PostgreSQL client in Nim.
 
 - Nim >= 2.2.0
 
+## Installation
+
+```sh
+nimble install async_postgres
+```
+
 ## Basic Usage
 
 ```nim
@@ -59,9 +69,9 @@ proc main() {.async.} =
 
   # Query multiple rows
   let minAge = 25'i32
-  let result = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
-  for row in result.rows:
-    echo row.getStr(1), " age=", row.getInt(2)
+  let r = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
+  for row in r.rows:
+    echo row.getStr("name"), " age=", row.getInt("age")
 
   # Query a single value
   let count = await conn.queryValue("SELECT count(*) FROM users", default = "0")
