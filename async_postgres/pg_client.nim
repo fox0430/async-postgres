@@ -1111,96 +1111,6 @@ proc prepare*(
 
 proc executeImpl(
     stmt: PreparedStatement,
-    params: seq[Option[seq[byte]]],
-    paramFormats: seq[int16],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  let conn = stmt.conn
-
-  conn.checkReady()
-  conn.state = csBusy
-
-  conn.sendBuf.setLen(0)
-  let formats =
-    if paramFormats.len > 0:
-      paramFormats
-    else:
-      newSeq[int16](params.len)
-  conn.sendBuf.addBind("", stmt.name, formats, params, resultFormats)
-  conn.sendBuf.addExecute("", 0)
-  conn.sendBuf.addSync()
-  await conn.sendBufMsg()
-
-  var qr = QueryResult(fields: stmt.fields)
-  if resultFormats.len > 0:
-    for i in 0 ..< qr.fields.len:
-      if resultFormats.len == 1:
-        qr.fields[i].formatCode = resultFormats[0]
-      elif i < resultFormats.len:
-        qr.fields[i].formatCode = resultFormats[i]
-  if qr.fields.len > 0:
-    var colFmts = newSeq[int16](qr.fields.len)
-    var colOids = newSeq[int32](qr.fields.len)
-    for i in 0 ..< qr.fields.len:
-      colFmts[i] = qr.fields[i].formatCode
-      colOids[i] = qr.fields[i].typeOid
-    if conn.rowDataBuf != nil:
-      conn.rowDataBuf =
-        conn.rowDataBuf.reuseRowData(int16(qr.fields.len), colFmts, colOids)
-    else:
-      conn.rowDataBuf = newRowData(int16(qr.fields.len), colFmts, colOids)
-    conn.rowDataBuf.fields = qr.fields
-    qr.data = conn.rowDataBuf
-  var queryError: ref PgQueryError
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkBindComplete:
-          discard
-        of bmkCommandComplete:
-          qr.commandTag = msg.commandTag
-        of bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf(timeout)
-
-  return qr
-
-proc execute(
-    stmt: PreparedStatement,
-    params: seq[Option[seq[byte]]] = @[],
-    paramFormats: seq[int16] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a prepared statement with raw binary parameters.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await executeImpl(stmt, params, paramFormats, resultFormats, timeout).wait(
-        timeout
-      )
-    except AsyncTimeoutError:
-      stmt.conn.state = csClosed
-      raise newException(PgTimeoutError, "Execute timed out")
-  else:
-    return await executeImpl(stmt, params, paramFormats, resultFormats)
-
-proc executeImpl(
-    stmt: PreparedStatement,
     params: seq[PgParam],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
@@ -2089,22 +1999,6 @@ proc addExec*(p: Pipeline, sql: string, params: seq[PgParam] = @[]) =
       op.params.add param.value
   p.ops.add move(op)
 
-proc addExec(
-    p: Pipeline,
-    sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-) =
-  ## Add an exec operation to the pipeline with raw binary parameters.
-  p.ops.add PipelineOp(
-    kind: pokExec,
-    sql: sql,
-    params: params,
-    paramOids: paramOids,
-    paramFormats: paramFormats,
-  )
-
 proc addQuery*(
     p: Pipeline,
     sql: string,
@@ -2120,24 +2014,6 @@ proc addQuery*(
     paramOids: oids,
     paramFormats: formats,
     resultFormats: resultFormat.toFormatCodes(),
-  )
-
-proc addQuery(
-    p: Pipeline,
-    sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    resultFormats: seq[int16] = @[],
-) =
-  ## Add a query operation to the pipeline with raw binary parameters.
-  p.ops.add PipelineOp(
-    kind: pokQuery,
-    sql: sql,
-    params: params,
-    paramOids: paramOids,
-    paramFormats: paramFormats,
-    resultFormats: resultFormats,
   )
 
 proc executeImpl(

@@ -2,7 +2,7 @@ import std/[deques, macros, options]
 
 import async_backend, pg_protocol, pg_connection, pg_types
 
-import pg_client {.all.}
+import pg_client
 
 type
   PoolConfig* = object
@@ -332,36 +332,6 @@ template withConnection*(pool: PgPool, conn, body: untyped) =
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc exec(
-    pool: PgPool,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
-  ## Execute a SQL statement using a pooled connection, returning the command tag.
-  let conn = await pool.acquire()
-  try:
-    return await conn.exec(sql, params, timeout = timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
-proc query(
-    pool: PgPool,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a SQL query using a pooled connection, returning rows.
-  let conn = await pool.acquire()
-  try:
-    return
-      await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
 proc exec*(
     pool: PgPool,
     sql: string,
@@ -600,22 +570,6 @@ proc simpleExec*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc execInTransaction(
-    pool: PgPool,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
-  ## Execute a statement inside a pipelined BEGIN/COMMIT transaction using a pooled connection.
-  let conn = await pool.acquire()
-  try:
-    return await conn.execInTransaction(sql, params, paramOids, paramFormats, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
 proc execInTransaction*(
     pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
@@ -623,25 +577,6 @@ proc execInTransaction*(
   let conn = await pool.acquire()
   try:
     return await conn.execInTransaction(sql, params, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
-proc queryInTransaction(
-    pool: PgPool,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a query inside a pipelined BEGIN/COMMIT transaction using a pooled connection.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryInTransaction(
-      sql, params, paramOids, paramFormats, resultFormats, timeout
-    )
   finally:
     await pool.resetSession(conn)
     pool.release(conn)
