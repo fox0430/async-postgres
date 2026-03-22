@@ -126,6 +126,11 @@ type
       upperLen: int,
     ]
 
+  CommandResult* = object
+    ## Result of a command execution, wrapping the PostgreSQL command tag.
+    commandTag*: string
+      ## Raw command tag string (e.g. "INSERT 0 1", "UPDATE 3", "DELETE 5").
+
 const
   ## PostgreSQL type OIDs for scalar and array types.
   OidBool* = 16'i32
@@ -1352,7 +1357,7 @@ converter toRow*(cells: seq[Option[seq[byte]]]): Row =
       rd.buf.add(data)
   Row(data: rd, rowIdx: 0)
 
-proc affectedRows*(tag: string): int64 =
+proc parseAffectedRows*(tag: string): int64 =
   ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).
   let parts = tag.split(' ')
   if parts.len > 0:
@@ -1361,6 +1366,23 @@ proc affectedRows*(tag: string): int64 =
     except ValueError:
       return 0
   return 0
+
+proc initCommandResult*(tag: string): CommandResult {.inline.} =
+  CommandResult(commandTag: tag)
+
+proc affectedRows*(cr: CommandResult): int64 {.inline.} =
+  ## Extract the number of affected rows from the command result.
+  parseAffectedRows(cr.commandTag)
+
+proc `$`*(cr: CommandResult): string {.inline.} =
+  cr.commandTag
+
+proc `==`*(cr: CommandResult, s: string): bool {.inline.} =
+  cr.commandTag == s
+
+proc contains*(cr: CommandResult, s: string): bool {.inline.} =
+  ## Check if the command tag contains the given string.
+  s in cr.commandTag
 
 proc isNull*(row: Row, col: int): bool =
   ## Check if the column value is NULL.
@@ -3711,13 +3733,19 @@ proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
 # Name-based column access
 
 proc columnIndex*(row: Row, name: string): int =
-  ## Find the index of a column by name using the field metadata attached to
-  ## the row's underlying ``RowData``.  Raises ``PgTypeError`` if the metadata
-  ## is not available (e.g. the Row was constructed manually) or the column
-  ## name is not found.
+  ## Find the index of a column by name using a cached name→index table on the
+  ## row's underlying ``RowData``.  The table is built lazily on first access.
+  ## Raises ``PgTypeError`` if the metadata is not available (e.g. the Row was
+  ## constructed manually) or the column name is not found.
   if row.data == nil or row.data.fields.len == 0:
     raise newException(PgTypeError, "Column name lookup requires field metadata")
-  columnIndex(row.data.fields, name)
+  if row.data.colMap.len == 0 and row.data.fields.len > 0:
+    for i, f in row.data.fields:
+      row.data.colMap[f.name] = i
+  let idx = row.data.colMap.getOrDefault(name, -1)
+  if idx < 0:
+    raise newException(PgTypeError, "Column not found: " & name)
+  idx
 
 # Generic typed accessor by column name
 

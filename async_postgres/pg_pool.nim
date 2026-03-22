@@ -21,8 +21,8 @@ type
       ## Max time to wait for a health check ping response (default 5s, ZeroDuration=no timeout)
     acquireTimeout*: Duration
       ## Max time to wait for an available connection (default 30s, ZeroDuration=no timeout)
-    maxWaiters*: int
-      ## Max queued acquire waiters (default 0=unlimited). Rejects with PgError when full.
+    maxWaiters*: int = -1
+      ## Max queued acquire waiters (default -1=unlimited, 0=no waiting). Rejects with PgPoolError when full.
     resetQuery*: string
       ## SQL to execute when returning a connection to the pool (default ""=disabled).
       ## Common values: "DISCARD ALL" (full reset, recommended for PgBouncer),
@@ -60,7 +60,7 @@ proc initPoolConfig*(
     healthCheckTimeout = seconds(5),
     pingTimeout = seconds(5),
     acquireTimeout = seconds(30),
-    maxWaiters = 0,
+    maxWaiters = -1,
     resetQuery = "",
 ): PoolConfig =
   ## Create a pool configuration with sensible defaults.
@@ -76,8 +76,8 @@ proc initPoolConfig*(
     raise newException(
       ValueError, "minSize (" & $minSize & ") must be <= maxSize (" & $maxSize & ")"
     )
-  if maxWaiters < 0:
-    raise newException(ValueError, "maxWaiters must be >= 0, got " & $maxWaiters)
+  if maxWaiters < -1:
+    raise newException(ValueError, "maxWaiters must be >= -1, got " & $maxWaiters)
 
   PoolConfig(
     connConfig: connConfig,
@@ -299,7 +299,7 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
       raise e
 
   # Max connections reached; wait for one to be released
-  if pool.config.maxWaiters > 0 and pool.waiterCount >= pool.config.maxWaiters:
+  if pool.config.maxWaiters >= 0 and pool.waiterCount >= pool.config.maxWaiters:
     raise newException(
       PgPoolError,
       "Pool acquire queue full (maxWaiters=" & $pool.config.maxWaiters & ")",
@@ -337,7 +337,7 @@ proc exec*(
     sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a statement with typed parameters using a pooled connection.
   let conn = await pool.acquire()
   try:
@@ -521,20 +521,6 @@ proc queryExists*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc execAffected*(
-    pool: PgPool,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  ## Execute a statement and return the number of affected rows.
-  let conn = await pool.acquire()
-  try:
-    return await conn.execAffected(sql, params, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
 proc queryColumn*(
     pool: PgPool,
     sql: string,
@@ -560,9 +546,9 @@ proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.}
 
 proc simpleExec*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a SQL statement via simple query protocol using a pooled connection.
-  ## Returns the command tag.
+  ## Returns the command result.
   let conn = await pool.acquire()
   try:
     return await conn.simpleExec(sql, timeout)
@@ -572,7 +558,7 @@ proc simpleExec*(
 
 proc execInTransaction*(
     pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
-): Future[string] {.async.} =
+): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with typed parameters.
   let conn = await pool.acquire()
   try:

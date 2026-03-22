@@ -1044,18 +1044,20 @@ proc simpleExecImpl(
 
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
-): Future[string] {.async.} =
-  ## Execute a SQL statement via simple query protocol, returning only the command tag.
+): Future[CommandResult] {.async.} =
+  ## Execute a SQL statement via simple query protocol, returning the command result.
   ## Lighter than `exec` for parameter-less commands (no Parse/Bind/Describe overhead).
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  var tag: string
   if timeout > ZeroDuration:
     try:
-      return await simpleExecImpl(conn, sql, timeout).wait(timeout)
+      tag = await simpleExecImpl(conn, sql, timeout).wait(timeout)
     except AsyncTimeoutError:
       conn.state = csClosed
       raise newException(PgTimeoutError, "simpleExec timed out")
   else:
-    return await simpleExecImpl(conn, sql)
+    tag = await simpleExecImpl(conn, sql)
+  return initCommandResult(tag)
 
 proc isConnected(conn: PgConnection): bool =
   when hasChronos:
