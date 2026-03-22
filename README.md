@@ -51,25 +51,20 @@ proc main() {.async.} =
   let conn = await connect("postgresql://myuser:mypass@127.0.0.1:5432/mydb")
   defer: await conn.close()
 
-  # Insert and get affected row count
-  let cr = await conn.exec(
-    "INSERT INTO users (name, age) VALUES ($1, $2)",
-    pgParams("Alice", 30'i32),
-  )
+  # Insert with typed parameters
+  let name = "Alice"
+  let age = 30'i32
+  let cr = await conn.exec(sql"INSERT INTO users (name, age) VALUES ({name}, {age})")
   echo "Inserted: ", cr.affectedRows
 
   # Query multiple rows
-  let result = await conn.query(
-    "SELECT id, name, age FROM users WHERE age > $1",
-    pgParams(25'i32),
-  )
+  let minAge = 25'i32
+  let result = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
   for row in result.rows:
     echo row.getStr(1), " age=", row.getInt(2)
 
   # Query a single value
-  let count = await conn.queryValue(
-    "SELECT count(*) FROM users", default = "0",
-  )
+  let count = await conn.queryValue("SELECT count(*) FROM users", default = "0")
   echo "Total users: ", count
 
 waitFor main()

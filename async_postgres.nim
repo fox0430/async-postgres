@@ -19,18 +19,15 @@
 ##     let conn = await connect("postgresql://user:pass@localhost:5432/mydb")
 ##     defer: await conn.close()
 ##
-##     # Execute with typed parameters
-##     let cr = await conn.exec(
-##       "INSERT INTO users (name, age) VALUES ($1, $2)",
-##       pgParams("Alice", 30'i32),
-##     )
+##     # Insert with typed parameters
+##     let name = "Alice"
+##     let age = 30'i32
+##     let cr = await conn.exec(sql"INSERT INTO users (name, age) VALUES ({name}, {age})")
 ##     echo "Inserted: ", cr.affectedRows
 ##
 ##     # Query rows
-##     let result = await conn.query(
-##       "SELECT id, name, age FROM users WHERE age > $1",
-##       pgParams(25'i32),
-##     )
+##     let minAge = 25'i32
+##     let result = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
 ##     for row in result:
 ##       echo row.getStr(1), " age=", row.getInt(2)
 ##
@@ -51,9 +48,9 @@
 import
   async_postgres/[
     async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
-    pg_pool_cluster, pg_largeobject,
+    pg_pool_cluster, pg_largeobject, pg_sql,
   ]
 
 export
   async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
-  pg_pool_cluster, pg_largeobject
+  pg_pool_cluster, pg_largeobject, pg_sql
