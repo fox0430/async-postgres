@@ -98,22 +98,6 @@ template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
 
 # Read operations → replica
 
-proc readQuery(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a read-only query routed to the replica pool.
-  let (conn, pool) = await acquireRead(cluster)
-  try:
-    return
-      await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
 proc readQuery*(
     cluster: PgPoolCluster,
     sql: string,
@@ -261,26 +245,6 @@ proc readQueryColumn*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc readQueryEach(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    callback: RowCallback,
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  ## Execute a read-only query routed to the replica pool, invoking `callback` once per row.
-  let (conn, pool) = await acquireRead(cluster)
-  try:
-    return await conn.queryEach(
-      sql, params, paramOids, paramFormats, callback, resultFormats, timeout
-    )
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
-
 proc readQueryEach*(
     cluster: PgPoolCluster,
     sql: string,
@@ -311,20 +275,6 @@ proc readSimpleQuery*(
 
 # Write operations → primary
 
-proc writeExec(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
-  ## Execute a SQL statement routed to the primary pool.
-  let conn = await cluster.primary.acquire()
-  try:
-    return await conn.exec(sql, params, timeout = timeout)
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
-
 proc writeExec*(
     cluster: PgPoolCluster,
     sql: string,
@@ -335,22 +285,6 @@ proc writeExec*(
   let conn = await cluster.primary.acquire()
   try:
     return await conn.exec(sql, params, timeout = timeout)
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
-
-proc writeQuery(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a query routed to the primary pool (e.g. SELECT FOR UPDATE, INSERT RETURNING).
-  let conn = await cluster.primary.acquire()
-  try:
-    return
-      await conn.query(sql, params, resultFormats = resultFormats, timeout = timeout)
   finally:
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
@@ -503,26 +437,6 @@ proc writeQueryColumn*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc writeQueryEach(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    callback: RowCallback,
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  ## Execute a query routed to the primary pool, invoking `callback` once per row.
-  let conn = await cluster.primary.acquire()
-  try:
-    return await conn.queryEach(
-      sql, params, paramOids, paramFormats, callback, resultFormats, timeout
-    )
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
-
 proc writeQueryEach*(
     cluster: PgPoolCluster,
     sql: string,
@@ -540,22 +454,6 @@ proc writeQueryEach*(
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
 
-proc writeExecInTransaction(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
-  ## Execute a statement in a pipelined transaction routed to the primary pool.
-  let conn = await cluster.primary.acquire()
-  try:
-    return await conn.execInTransaction(sql, params, paramOids, paramFormats, timeout)
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
-
 proc writeExecInTransaction*(
     cluster: PgPoolCluster,
     sql: string,
@@ -566,25 +464,6 @@ proc writeExecInTransaction*(
   let conn = await cluster.primary.acquire()
   try:
     return await conn.execInTransaction(sql, params, timeout)
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
-
-proc writeQueryInTransaction(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a query in a pipelined transaction routed to the primary pool.
-  let conn = await cluster.primary.acquire()
-  try:
-    return await conn.queryInTransaction(
-      sql, params, paramOids, paramFormats, resultFormats, timeout
-    )
   finally:
     await cluster.primary.resetSession(conn)
     cluster.primary.release(conn)
