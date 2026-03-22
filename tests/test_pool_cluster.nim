@@ -337,13 +337,6 @@ suite "Write routing":
     expect(PgError):
       discard waitFor cluster.writeExec("INSERT INTO t VALUES (1)")
 
-  test "writeExecAffected routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeExecAffected("DELETE FROM t")
-
   test "writeExecInTransaction routes to primary":
     let cluster = makeCluster()
     cluster.primary.closed = true

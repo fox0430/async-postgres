@@ -227,7 +227,7 @@ suite "E2E: Extended Query Protocol":
       )
       doAssert "CREATE TABLE" in createTag
       let insertTag = await conn.exec(
-        "INSERT INTO test_e2e (name) VALUES ($1)", @[some("alice".toBytes())]
+        "INSERT INTO test_e2e (name) VALUES ($1)", @[toPgParam("alice")]
       )
       doAssert "INSERT" in insertTag
       discard await conn.exec("DROP TABLE test_e2e")
@@ -243,10 +243,10 @@ suite "E2E: Extended Query Protocol":
         await conn.exec("CREATE TABLE test_e2e_q (id serial PRIMARY KEY, name text)")
       discard await conn.exec(
         "INSERT INTO test_e2e_q (name) VALUES ($1), ($2)",
-        @[some("alice".toBytes()), some("bob".toBytes())],
+        @[toPgParam("alice"), toPgParam("bob")],
       )
       let res = await conn.query(
-        "SELECT name FROM test_e2e_q WHERE name = $1", @[some("bob".toBytes())]
+        "SELECT name FROM test_e2e_q WHERE name = $1", @[toPgParam("bob")]
       )
       doAssert res.rows.len == 1
       doAssert res.rows[0][0].get().toString() == "bob"
@@ -263,7 +263,7 @@ suite "E2E: Extended Query Protocol":
         await conn.exec("CREATE TABLE test_e2e_ps (id serial PRIMARY KEY, val text)")
       discard await conn.exec(
         "INSERT INTO test_e2e_ps (val) VALUES ($1), ($2)",
-        @[some("x".toBytes()), some("y".toBytes())],
+        @[toPgParam("x"), toPgParam("y")],
       )
 
       let stmt =
@@ -272,7 +272,7 @@ suite "E2E: Extended Query Protocol":
       doAssert stmt.fields.len == 1
       doAssert stmt.paramOids.len == 1
 
-      let res = await stmt.execute(@[some("x".toBytes())])
+      let res = await stmt.execute(@[toPgParam("x")])
       doAssert res.rows.len == 1
       doAssert res.rows[0][0].get().toString() == "x"
 
@@ -727,10 +727,10 @@ suite "E2E: Pool Extended Query":
         await pool.exec("CREATE TABLE test_pool_qp (id serial PRIMARY KEY, name text)")
       discard await pool.exec(
         "INSERT INTO test_pool_qp (name) VALUES ($1), ($2)",
-        @[some("alice".toBytes()), some("bob".toBytes())],
+        @[toPgParam("alice"), toPgParam("bob")],
       )
       let res = await pool.query(
-        "SELECT name FROM test_pool_qp WHERE name = $1", @[some("bob".toBytes())]
+        "SELECT name FROM test_pool_qp WHERE name = $1", @[toPgParam("bob")]
       )
       doAssert res.rows.len == 1
       doAssert res.rows[0][0].get().toString() == "bob"
@@ -788,7 +788,7 @@ suite "E2E: Transaction":
 
       conn.withTransaction:
         discard await conn.exec(
-          "INSERT INTO test_tx (val) VALUES ($1)", @[some("committed".toBytes())]
+          "INSERT INTO test_tx (val) VALUES ($1)", @[toPgParam("committed")]
         )
 
       let res = await conn.query("SELECT val FROM test_tx")
@@ -811,7 +811,7 @@ suite "E2E: Transaction":
       try:
         conn.withTransaction:
           discard await conn.exec(
-            "INSERT INTO test_tx_rb (val) VALUES ($1)", @[some("rollback_me".toBytes())]
+            "INSERT INTO test_tx_rb (val) VALUES ($1)", @[toPgParam("rollback_me")]
           )
           raise newException(ValueError, "intentional error")
       except ValueError:
@@ -835,7 +835,7 @@ suite "E2E: Transaction":
 
       pool.withTransaction(conn):
         discard await conn.exec(
-          "INSERT INTO test_ptx (val) VALUES ($1)", @[some("pool_commit".toBytes())]
+          "INSERT INTO test_ptx (val) VALUES ($1)", @[toPgParam("pool_commit")]
         )
 
       let res = await pool.query("SELECT val FROM test_ptx")
@@ -859,8 +859,7 @@ suite "E2E: Transaction":
       try:
         pool.withTransaction(conn):
           discard await conn.exec(
-            "INSERT INTO test_ptx_rb (val) VALUES ($1)",
-            @[some("pool_rollback".toBytes())],
+            "INSERT INTO test_ptx_rb (val) VALUES ($1)", @[toPgParam("pool_rollback")]
           )
           raise newException(ValueError, "intentional error")
       except ValueError:
@@ -887,7 +886,7 @@ suite "E2E: Transaction":
           let pid = pidRes.rows[0].getStr(0)
           # Kill the connection from another session
           discard await killer.query(
-            "SELECT pg_terminate_backend($1)", @[some(pid.toBytes())]
+            "SELECT pg_terminate_backend($1)", @[toPgParam(parseInt(pid).int32)]
           )
           # Give the server a moment to terminate the backend
           await sleepAsync(milliseconds(100))
@@ -913,7 +912,7 @@ suite "E2E: Transaction":
           let pidRes = await conn.query("SELECT pg_backend_pid()")
           let pid = pidRes.rows[0].getStr(0)
           discard await killer.query(
-            "SELECT pg_terminate_backend($1)", @[some(pid.toBytes())]
+            "SELECT pg_terminate_backend($1)", @[toPgParam(parseInt(pid).int32)]
           )
           await sleepAsync(milliseconds(100))
           raise newException(ValueError, "original error")
@@ -936,7 +935,7 @@ suite "E2E: Transaction":
 
       conn.withTransaction(TransactionOptions(isolation: ilSerializable)):
         discard await conn.exec(
-          "INSERT INTO test_tx_iso (val) VALUES ($1)", @[some("serializable".toBytes())]
+          "INSERT INTO test_tx_iso (val) VALUES ($1)", @[toPgParam("serializable")]
         )
 
       let res = await conn.query("SELECT val FROM test_tx_iso")
@@ -959,7 +958,7 @@ suite "E2E: Transaction":
       try:
         conn.withTransaction(TransactionOptions(access: amReadOnly)):
           discard await conn.exec(
-            "INSERT INTO test_tx_ro (val) VALUES ($1)", @[some("nope".toBytes())]
+            "INSERT INTO test_tx_ro (val) VALUES ($1)", @[toPgParam("nope")]
           )
       except PgError:
         raised = true
@@ -997,7 +996,7 @@ suite "E2E: Transaction":
 
       pool.withTransaction(conn, TransactionOptions(isolation: ilRepeatableRead)):
         discard await conn.exec(
-          "INSERT INTO test_ptx_opts (val) VALUES ($1)", @[some("pool_opts".toBytes())]
+          "INSERT INTO test_ptx_opts (val) VALUES ($1)", @[toPgParam("pool_opts")]
         )
 
       let res = await pool.query("SELECT val FROM test_ptx_opts")
@@ -1018,7 +1017,7 @@ suite "E2E: Transaction":
       conn.withTransaction:
         conn.withSavepoint:
           discard await conn.exec(
-            "INSERT INTO test_sp (val) VALUES ($1)", @[some("saved".toBytes())]
+            "INSERT INTO test_sp (val) VALUES ($1)", @[toPgParam("saved")]
           )
 
       let res = await conn.query("SELECT val FROM test_sp")
@@ -1039,12 +1038,12 @@ suite "E2E: Transaction":
 
       conn.withTransaction:
         discard await conn.exec(
-          "INSERT INTO test_sp_rb (val) VALUES ($1)", @[some("before".toBytes())]
+          "INSERT INTO test_sp_rb (val) VALUES ($1)", @[toPgParam("before")]
         )
         try:
           conn.withSavepoint:
             discard await conn.exec(
-              "INSERT INTO test_sp_rb (val) VALUES ($1)", @[some("inner".toBytes())]
+              "INSERT INTO test_sp_rb (val) VALUES ($1)", @[toPgParam("inner")]
             )
             raise newException(ValueError, "savepoint error")
         except ValueError:
@@ -1069,12 +1068,12 @@ suite "E2E: Transaction":
       conn.withTransaction:
         conn.withSavepoint:
           discard await conn.exec(
-            "INSERT INTO test_sp_nest (val) VALUES ($1)", @[some("outer".toBytes())]
+            "INSERT INTO test_sp_nest (val) VALUES ($1)", @[toPgParam("outer")]
           )
           try:
             conn.withSavepoint:
               discard await conn.exec(
-                "INSERT INTO test_sp_nest (val) VALUES ($1)", @[some("inner".toBytes())]
+                "INSERT INTO test_sp_nest (val) VALUES ($1)", @[toPgParam("inner")]
               )
               raise newException(ValueError, "inner error")
           except ValueError:
@@ -1099,7 +1098,7 @@ suite "E2E: Transaction":
       conn.withTransaction:
         conn.withSavepoint("my_sp"):
           discard await conn.exec(
-            "INSERT INTO test_sp_named (val) VALUES ($1)", @[some("named".toBytes())]
+            "INSERT INTO test_sp_named (val) VALUES ($1)", @[toPgParam("named")]
           )
 
       let res = await conn.query("SELECT val FROM test_sp_named")
@@ -1116,8 +1115,7 @@ suite "E2E: Type Roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let res = await conn.query(
-        "SELECT $1::int4, $2::int8",
-        @[some("42".toBytes()), some("9999999999".toBytes())],
+        "SELECT $1::int4, $2::int8", @[toPgParam("42"), toPgParam("9999999999")]
       )
       doAssert res.rows.len == 1
       doAssert res.rows[0].getInt(0) == 42'i32
@@ -1129,7 +1127,7 @@ suite "E2E: Type Roundtrip":
   test "float roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let res = await conn.query("SELECT $1::float8", @[some("3.14".toBytes())])
+      let res = await conn.query("SELECT $1::float8", @[toPgParam("3.14")])
       doAssert res.rows.len == 1
       doAssert abs(res.rows[0].getFloat(0) - 3.14) < 1e-10
       await conn.close()
@@ -1139,9 +1137,8 @@ suite "E2E: Type Roundtrip":
   test "bool roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let res = await conn.query(
-        "SELECT $1::bool, $2::bool", @[some("t".toBytes()), some("f".toBytes())]
-      )
+      let res =
+        await conn.query("SELECT $1::bool, $2::bool", @[toPgParam("t"), toPgParam("f")])
       doAssert res.rows.len == 1
       doAssert res.rows[0].getBool(0) == true
       doAssert res.rows[0].getBool(1) == false
@@ -1152,7 +1149,7 @@ suite "E2E: Type Roundtrip":
   test "text roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let res = await conn.query("SELECT $1::text", @[some("hello world".toBytes())])
+      let res = await conn.query("SELECT $1::text", @[toPgParam("hello world")])
       doAssert res.rows[0].getStr(0) == "hello world"
       await conn.close()
 
@@ -1161,7 +1158,7 @@ suite "E2E: Type Roundtrip":
   test "NULL handling":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let res = await conn.query("SELECT NULL::text, $1::text", @[some("ok".toBytes())])
+      let res = await conn.query("SELECT NULL::text, $1::text", @[toPgParam("ok")])
       doAssert res.rows[0].isNull(0)
       doAssert not res.rows[0].isNull(1)
       doAssert res.rows[0].getStr(1) == "ok"
@@ -1173,8 +1170,7 @@ suite "E2E: Type Roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let res = await conn.query(
-        "SELECT $1::text IS NULL, $2::int4",
-        @[toPgParam(none(string)).value, some("7".toBytes())],
+        "SELECT $1::text IS NULL, $2::int4", @[toPgParam(none(string)), toPgParam("7")]
       )
       doAssert res.rows[0].getStr(0) == "t"
       doAssert res.rows[0].getInt(1) == 7'i32
@@ -1986,7 +1982,7 @@ suite "E2E: Cursor/Streaming":
       discard await conn.exec("CREATE TABLE test_cursor (id int)")
       for i in 1 .. 100:
         discard await conn.exec(
-          "INSERT INTO test_cursor (id) VALUES ($1)", @[some(($i).toBytes())]
+          "INSERT INTO test_cursor (id) VALUES ($1)", @[toPgParam(i.int32)]
         )
 
       let cursor =
@@ -2018,7 +2014,7 @@ suite "E2E: Cursor/Streaming":
       discard await conn.exec("CREATE TABLE test_cursor_close (id int)")
       for i in 1 .. 50:
         discard await conn.exec(
-          "INSERT INTO test_cursor_close (id) VALUES ($1)", @[some(($i).toBytes())]
+          "INSERT INTO test_cursor_close (id) VALUES ($1)", @[toPgParam(i.int32)]
         )
 
       let cursor = await conn.openCursor(
@@ -2046,7 +2042,7 @@ suite "E2E: Cursor/Streaming":
       discard await conn.exec("CREATE TABLE test_cursor_with (id int)")
       for i in 1 .. 25:
         discard await conn.exec(
-          "INSERT INTO test_cursor_with (id) VALUES ($1)", @[some(($i).toBytes())]
+          "INSERT INTO test_cursor_with (id) VALUES ($1)", @[toPgParam(i.int32)]
         )
 
       var total = 0
@@ -2116,7 +2112,7 @@ suite "E2E: Cursor/Streaming":
       discard await conn.exec("CREATE TABLE test_cursor_exc (id int)")
       for i in 1 .. 20:
         discard await conn.exec(
-          "INSERT INTO test_cursor_exc (id) VALUES ($1)", @[some(($i).toBytes())]
+          "INSERT INTO test_cursor_exc (id) VALUES ($1)", @[toPgParam(i.int32)]
         )
 
       var raised = false
@@ -2197,7 +2193,7 @@ suite "E2E: Cursor/Streaming":
       discard await conn.exec("CREATE TABLE test_cursor_timeout (id int)")
       for i in 1 .. 10:
         discard await conn.exec(
-          "INSERT INTO test_cursor_timeout (id) VALUES ($1)", @[some(($i).toBytes())]
+          "INSERT INTO test_cursor_timeout (id) VALUES ($1)", @[toPgParam(i.int32)]
         )
 
       let cursor = await conn.openCursor(
@@ -2453,7 +2449,7 @@ suite "E2E: Operation Timeouts":
       let conn = await connect(plainConfig())
       let stmt =
         await conn.prepare("test_timeout_stmt", "SELECT $1::int", timeout = seconds(5))
-      let qr = await stmt.execute(@[some(("7").toBytes())], timeout = seconds(5))
+      let qr = await stmt.execute(@[toPgParam("7")], timeout = seconds(5))
       doAssert qr.rows.len == 1
       doAssert qr.rows[0][0].get().toString() == "7"
       await stmt.close(timeout = seconds(5))
@@ -2468,8 +2464,7 @@ suite "E2E: Operation Timeouts":
       let stmt = await conn.prepare("test_timeout_exec", "SELECT pg_sleep($1::float)")
       var raised = false
       try:
-        discard
-          await stmt.execute(@[some(("10").toBytes())], timeout = milliseconds(100))
+        discard await stmt.execute(@[toPgParam("10")], timeout = milliseconds(100))
       except PgError as e:
         raised = true
         doAssert "timed out" in e.msg
@@ -3548,10 +3543,9 @@ when hasChronos:
 
         # Kill the connection from the server side
         let killer = await connect(plainConfig())
-        let pidStr = $listener.pid
         try:
           discard await killer.exec(
-            "SELECT pg_terminate_backend($1)", @[some(pidStr.toBytes())]
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
           )
         except PgError:
           discard
@@ -3588,10 +3582,9 @@ when hasChronos:
 
         # Kill the connection
         let killer = await connect(plainConfig())
-        let pidStr = $listener.pid
         try:
           discard await killer.exec(
-            "SELECT pg_terminate_backend($1)", @[some(pidStr.toBytes())]
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
           )
         except PgError:
           discard
@@ -4624,14 +4617,14 @@ suite "E2E: Convenience Query Methods":
       let conn = await connect(plainConfig())
 
       let r1 = await conn.query(
-        "SELECT $1::int + $2::int AS sum", @[some(@[byte('1')]), some(@[byte('2')])]
+        "SELECT $1::int + $2::int AS sum", @[toPgParam("1"), toPgParam("2")]
       )
       doAssert r1.rows[0].getStr(0) == "3"
       doAssert conn.stmtCache.len == 1
 
       # Same SQL, different params: cache hit
       let r2 = await conn.query(
-        "SELECT $1::int + $2::int AS sum", @[some(@[byte('3')]), some(@[byte('4')])]
+        "SELECT $1::int + $2::int AS sum", @[toPgParam("3"), toPgParam("4")]
       )
       doAssert r2.rows[0].getStr(0) == "7"
       doAssert conn.stmtCache.len == 1
@@ -4789,7 +4782,7 @@ suite "E2E: execInTransaction / queryInTransaction":
       discard await conn.exec("CREATE TABLE test_eit (id serial PRIMARY KEY, val text)")
 
       let tag = await conn.execInTransaction(
-        "INSERT INTO test_eit (val) VALUES ($1)", @[some("pipelined".toBytes())]
+        "INSERT INTO test_eit (val) VALUES ($1)", @[toPgParam("pipelined")]
       )
       doAssert tag == "INSERT 0 1"
 
@@ -4815,7 +4808,7 @@ suite "E2E: execInTransaction / queryInTransaction":
       var raised = false
       try:
         discard await conn.execInTransaction(
-          "INSERT INTO test_eit_err (val) VALUES ($1)", @[some("existing".toBytes())]
+          "INSERT INTO test_eit_err (val) VALUES ($1)", @[toPgParam("existing")]
         )
       except PgError:
         raised = true
@@ -4952,7 +4945,7 @@ suite "E2E: execInTransaction / queryInTransaction":
       let pool =
         await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
 
-      let qr = await pool.queryInTransaction("SELECT 42::int4")
+      let qr = await pool.queryInTransaction("SELECT 42::int4", @[])
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getStr(0) == "42"
 
@@ -5104,8 +5097,8 @@ suite "E2E: execInTransaction / queryInTransaction":
       let conn = await connect(plainConfig())
 
       let p = newPipeline(conn)
-      p.addExec("SELECT $1::text", @[some(@(toOpenArrayByte("hello", 0, 4)))])
-      p.addQuery("SELECT $1::text", @[some(@(toOpenArrayByte("world", 0, 4)))])
+      p.addExec("SELECT $1::text", @[toPgParam("hello")])
+      p.addQuery("SELECT $1::text", @[toPgParam("world")])
       let results = await p.execute()
       doAssert results[0].kind == prkExec
       doAssert results[1].kind == prkQuery
@@ -5646,13 +5639,13 @@ suite "E2E: queryEach":
 
     waitFor t()
 
-  test "Option[seq[byte]] params overload":
+  test "queryEach with params":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       var sum = 0
       let rowCount = await conn.queryEach(
         "SELECT generate_series(1, $1::int4)",
-        @[some(@[byte('5')])],
+        @[toPgParam("5")],
         callback = proc(row: Row) =
           sum += row.getInt(0),
       )
