@@ -680,76 +680,6 @@ template queryEachRecvLoop(
 proc queryEachImpl(
     conn: PgConnection,
     sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32],
-    paramFormats: seq[int16],
-    callback: RowCallback,
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  conn.checkReady()
-  conn.state = csBusy
-
-  let formats =
-    if paramFormats.len > 0:
-      paramFormats
-    else:
-      newSeq[int16](params.len)
-
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  var cacheMiss = false
-  var stmtName = ""
-  var cachedFields: seq[FieldDescription]
-  var cachedColFmts: seq[int16]
-  var cachedColOids: seq[int32]
-
-  var effectiveResultFormats: seq[int16]
-
-  conn.sendBuf.setLen(0)
-  if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
-    effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
-    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    effectiveResultFormats = resultFormats
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, paramOids)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    effectiveResultFormats = resultFormats
-    conn.sendBuf.addParse("", sql, paramOids)
-    conn.sendBuf.addBind("", "", formats, params, effectiveResultFormats)
-    conn.sendBuf.addDescribe(dkPortal, "")
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-
-  var rowCount: int64 = 0
-  queryEachRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, callback, rowCount, timeout,
-  )
-  return rowCount
-
-proc queryEachImpl(
-    conn: PgConnection,
-    sql: string,
     params: seq[PgParam],
     callback: RowCallback,
     resultFormats: seq[int16] = @[],
@@ -808,34 +738,6 @@ proc queryEachImpl(
     cachedColFmts, cachedColOids, callback, rowCount, timeout,
   )
   return rowCount
-
-proc queryEach*(
-    conn: PgConnection,
-    sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    callback: RowCallback,
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[int64] {.async.} =
-  ## Execute a query and invoke `callback` once per row, reusing a single RowData buffer.
-  ## The `Row` passed to the callback is only valid inside the callback.
-  ## Returns the number of rows processed.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await queryEachImpl(
-        conn, sql, params, paramOids, paramFormats, callback, resultFormats, timeout
-      )
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "queryEach timed out")
-  else:
-    return await queryEachImpl(
-      conn, sql, params, paramOids, paramFormats, callback, resultFormats
-    )
 
 proc queryEach*(
     conn: PgConnection,

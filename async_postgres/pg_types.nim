@@ -57,7 +57,7 @@ type
     b*: float64
     c*: float64
 
-  PgLseg* = object ## PostgreSQL lseg (line segment) type: [(x1,y1),(x2,y2)].
+  PgLseg* = object ## PostgreSQL lseg (line segment) type: ``[(x1,y1),(x2,y2)]``.
     p1*: PgPoint
     p2*: PgPoint
 
@@ -985,7 +985,7 @@ proc toPgBinaryParam*(v: PgBox): PgParam =
   PgParam(oid: OidBox, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgPath): PgParam =
-  ## Binary format: closed(1) + npts(4) + points(npts*16).
+  ## Binary format: closed(1) + npts(4) + points(npts \* 16).
   var data = newSeq[byte](1 + 4 + v.points.len * 16)
   data[0] = if v.closed: 1'u8 else: 0'u8
   let npts = toBE32(int32(v.points.len))
@@ -996,7 +996,7 @@ proc toPgBinaryParam*(v: PgPath): PgParam =
   PgParam(oid: OidPath, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgPolygon): PgParam =
-  ## Binary format: npts(4) + points(npts*16).
+  ## Binary format: npts(4) + points(npts \* 16).
   var data = newSeq[byte](4 + v.points.len * 16)
   let npts = toBE32(int32(v.points.len))
   copyMem(addr data[0], unsafeAddr npts[0], 4)
