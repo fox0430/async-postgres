@@ -70,7 +70,7 @@ proc main() {.async.} =
   # Query multiple rows
   let minAge = 25'i32
   let r = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
-  for row in r.rows:
+  for row in r:
     echo row.getStr("name"), " age=", row.getInt("age")
 
   # Query a single value
