@@ -926,6 +926,28 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  test "withTransaction with timeout only":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_timeout")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_timeout (id serial PRIMARY KEY, val text)"
+      )
+
+      conn.withTransaction(seconds(5)):
+        discard await conn.exec(
+          "INSERT INTO test_tx_timeout (val) VALUES ($1)", @[toPgParam("timeout_only")]
+        )
+
+      let res = await conn.query("SELECT val FROM test_tx_timeout")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "timeout_only"
+
+      discard await conn.exec("DROP TABLE test_tx_timeout")
+      await conn.close()
+
+    waitFor t()
+
   test "withTransaction with isolation level commits":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -1004,6 +1026,29 @@ suite "E2E: Transaction":
       doAssert res.rows[0].getStr(0) == "pool_opts"
 
       discard await pool.exec("DROP TABLE test_ptx_opts")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransaction with timeout only":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptx_timeout")
+      discard await pool.exec(
+        "CREATE TABLE test_ptx_timeout (id serial PRIMARY KEY, val text)"
+      )
+
+      pool.withTransaction(conn, seconds(5)):
+        discard await conn.exec(
+          "INSERT INTO test_ptx_timeout (val) VALUES ($1)", @[toPgParam("pool_timeout")]
+        )
+
+      let res = await pool.query("SELECT val FROM test_ptx_timeout")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "pool_timeout"
+
+      discard await pool.exec("DROP TABLE test_ptx_timeout")
       await pool.close()
 
     waitFor t()
@@ -1109,6 +1154,83 @@ suite "E2E: Transaction":
       await conn.close()
 
     waitFor t()
+
+  test "withSavepoint with timeout and name":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp_timeout_name")
+      discard await conn.exec(
+        "CREATE TABLE test_sp_timeout_name (id serial PRIMARY KEY, val text)"
+      )
+
+      conn.withTransaction:
+        conn.withSavepoint("my_sp_tn", seconds(5)):
+          discard await conn.exec(
+            "INSERT INTO test_sp_timeout_name (val) VALUES ($1)",
+            @[toPgParam("timeout_name")],
+          )
+
+      let res = await conn.query("SELECT val FROM test_sp_timeout_name")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "timeout_name"
+
+      discard await conn.exec("DROP TABLE test_sp_timeout_name")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            return
+
+    )
+
+  test "withSavepoint rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withSavepoint:
+            return
+
+    )
+
+  test "withSavepoint (named) rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withSavepoint("sp"):
+            return
+
+    )
+
+  test "pool.withTransaction rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransaction(conn):
+            return
+
+    )
+
+  test "return inside nested proc is allowed in withTransaction":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            let inner = proc() =
+              return
+            inner()
+
+    )
 
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":

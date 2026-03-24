@@ -1527,78 +1527,176 @@ proc copyOutStream*(
   else:
     return await copyOutStreamImpl(conn, sql, callback)
 
-template withTransaction*(
-    conn: PgConnection, body: untyped, txTimeout: Duration = ZeroDuration
-) =
+proc hasReturnStmt*(n: NimNode): bool =
+  ## Check whether an AST contains a `return` statement (excluding nested
+  ## proc/func/method/iterator definitions where `return` is valid).
+  if n.kind == nnkReturnStmt:
+    return true
+  if n.kind in {
+    nnkProcDef, nnkFuncDef, nnkMethodDef, nnkIteratorDef, nnkLambda, nnkDo,
+    nnkConverterDef, nnkTemplateDef, nnkMacroDef,
+  }:
+    return false
+  for child in n:
+    if hasReturnStmt(child):
+      return true
+  return false
+
+macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction.
   ## On exception, ROLLBACK is issued automatically.
-  ## **Note:** Do not use `return` inside the body.
-  discard await conn.simpleExec("BEGIN", timeout = txTimeout)
-  try:
-    body
-    discard await conn.simpleExec("COMMIT", timeout = txTimeout)
-  except CatchableError as e:
-    try:
-      discard await conn.simpleExec("ROLLBACK", timeout = txTimeout)
-    except CatchableError:
-      discard
-    raise e
+  ## Using `return` inside the body is a compile-time error.
+  ##
+  ## Usage:
+  ##   conn.withTransaction:
+  ##     await conn.exec(...)
+  ##   conn.withTransaction(seconds(5)):
+  ##     await conn.exec(...)
+  ##   conn.withTransaction(TransactionOptions(isolation: ilSerializable)):
+  ##     await conn.exec(...)
+  ##   conn.withTransaction(TransactionOptions(...), seconds(5)):
+  ##     await conn.exec(...)
+  ##
+  ## **Note:** `TransactionOptions` must be passed as a constructor literal, not
+  ## through a variable (the macro uses AST node kind to distinguish options
+  ## from timeout).
+  var body: NimNode
+  var beginSql: NimNode
+  var txTimeout: NimNode
+  case args.len
+  of 1:
+    body = args[0]
+    beginSql = newStrLitNode("BEGIN")
+    txTimeout = bindSym"ZeroDuration"
+  of 2:
+    if args[0].kind == nnkObjConstr:
+      # conn.withTransaction(TransactionOptions(...)): body
+      beginSql = newCall(bindSym"buildBeginSql", args[0])
+      txTimeout = bindSym"ZeroDuration"
+    else:
+      # conn.withTransaction(timeout): body
+      beginSql = newStrLitNode("BEGIN")
+      txTimeout = args[0]
+    body = args[1]
+  of 3:
+    let opts = args[0]
+    txTimeout = args[1]
+    body = args[2]
+    beginSql = newCall(bindSym"buildBeginSql", opts)
+  else:
+    error(
+      "withTransaction expects (body), (timeout, body), (opts, body), or (opts, timeout, body)",
+      args[0],
+    )
 
-template withTransaction*(
-    conn: PgConnection,
-    opts: TransactionOptions,
-    body: untyped,
-    txTimeout: Duration = ZeroDuration,
-) =
-  ## Execute `body` inside a transaction with custom options.
-  ## On exception, ROLLBACK is issued automatically.
-  let beginSql = buildBeginSql(opts)
-  discard await conn.simpleExec(beginSql, timeout = txTimeout)
-  try:
-    body
-    discard await conn.simpleExec("COMMIT", timeout = txTimeout)
-  except CatchableError as e:
-    try:
-      discard await conn.simpleExec("ROLLBACK", timeout = txTimeout)
-    except CatchableError:
-      discard
-    raise e
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withTransaction is not allowed: COMMIT/ROLLBACK would be skipped",
+      body,
+    )
 
-template withSavepoint*(
-    conn: PgConnection, body: untyped, spTimeout: Duration = ZeroDuration
-) =
-  ## Execute `body` inside a SAVEPOINT with an auto-generated name.
+  let connExpr = conn
+  let connSym = genSym(nskLet, "conn")
+  let eSym = genSym(nskLet, "e")
+  result = quote:
+    let `connSym` = `connExpr`
+    discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
+    try:
+      `body`
+      discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
+    except CatchableError as `eSym`:
+      try:
+        discard await `connSym`.simpleExec("ROLLBACK", timeout = `txTimeout`)
+      except CatchableError:
+        discard
+      raise `eSym`
+
+macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
+  ## Execute `body` inside a SAVEPOINT.
   ## On exception, ROLLBACK TO SAVEPOINT is issued automatically.
-  inc conn.portalCounter
-  let spName = "_sp_" & $conn.portalCounter
-  discard await conn.simpleExec("SAVEPOINT " & spName, timeout = spTimeout)
-  try:
-    body
-    discard await conn.simpleExec("RELEASE SAVEPOINT " & spName, timeout = spTimeout)
-  except CatchableError as e:
-    try:
-      discard
-        await conn.simpleExec("ROLLBACK TO SAVEPOINT " & spName, timeout = spTimeout)
-    except CatchableError:
-      discard
-    raise e
+  ## Using `return` inside the body is a compile-time error.
+  ##
+  ## Usage:
+  ##   conn.withSavepoint:
+  ##     await conn.exec(...)
+  ##   conn.withSavepoint("my_sp"):
+  ##     await conn.exec(...)
+  ##   conn.withSavepoint(seconds(5)):
+  ##     await conn.exec(...)
+  ##   conn.withSavepoint("my_sp", seconds(5)):
+  ##     await conn.exec(...)
+  ##
+  ## **Note:** The savepoint name must be a string literal, not a variable
+  ## (the macro uses AST node kind to distinguish name from timeout).
+  var body: NimNode
+  var spName: NimNode = nil
+  var spTimeout: NimNode
 
-template withSavepoint*(
-    conn: PgConnection, name: string, body: untyped, spTimeout: Duration = ZeroDuration
-) =
-  ## Execute `body` inside a SAVEPOINT with the given `name`.
-  ## On exception, ROLLBACK TO SAVEPOINT is issued automatically.
-  discard await conn.simpleExec("SAVEPOINT " & name, timeout = spTimeout)
-  try:
-    body
-    discard await conn.simpleExec("RELEASE SAVEPOINT " & name, timeout = spTimeout)
-  except CatchableError as e:
+  case args.len
+  of 1:
+    # conn.withSavepoint: body
+    body = args[0]
+    spTimeout = bindSym"ZeroDuration"
+  of 2:
+    if args[0].kind == nnkStrLit:
+      # conn.withSavepoint("name"): body
+      spName = args[0]
+      body = args[1]
+      spTimeout = bindSym"ZeroDuration"
+    else:
+      # conn.withSavepoint(timeout): body
+      spTimeout = args[0]
+      body = args[1]
+  of 3:
+    # conn.withSavepoint("name", timeout): body
+    spName = args[0]
+    spTimeout = args[1]
+    body = args[2]
+  else:
+    error(
+      "withSavepoint expects (body), (name, body), (timeout, body), or (name, timeout, body)",
+      args[0],
+    )
+
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withSavepoint is not allowed: RELEASE/ROLLBACK would be skipped",
+      body,
+    )
+
+  let connExpr = conn
+  let connSym = genSym(nskLet, "conn")
+  let eSym = genSym(nskLet, "e")
+  let spNameSym = genSym(nskLet, "spName")
+
+  let nameExpr =
+    if spName != nil:
+      spName
+    else:
+      let portalCounterSym = ident"portalCounter"
+      quote:
+        block:
+          inc `connSym`.`portalCounterSym`
+          "_sp_" & $`connSym`.`portalCounterSym`
+
+  result = quote:
+    let `connSym` = `connExpr`
+    let `spNameSym` = `nameExpr`
+    discard
+      await `connSym`.simpleExec("SAVEPOINT " & `spNameSym`, timeout = `spTimeout`)
     try:
-      discard
-        await conn.simpleExec("ROLLBACK TO SAVEPOINT " & name, timeout = spTimeout)
-    except CatchableError:
-      discard
-    raise e
+      `body`
+      discard await `connSym`.simpleExec(
+        "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
+      )
+    except CatchableError as `eSym`:
+      try:
+        discard await `connSym`.simpleExec(
+          "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
+        )
+      except CatchableError:
+        discard
+      raise `eSym`
 
 proc execInTransactionImpl(
     conn: PgConnection,
