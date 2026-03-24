@@ -27,9 +27,9 @@
 ##
 ##     # Query multiple rows
 ##     let minAge = 25'i32
-##     let r = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
-##     for row in r:
-##       echo row.getStr("name"), " age=", row.getInt("age")
+##     let row = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
+##     for r in row:
+##       echo r.getStr("name"), " age=", r.getInt("age")
 ##
 ##     # Query a single value
 ##     let count = await conn.queryValueOrDefault("SELECT count(*) FROM users", default = "0")
