@@ -51,6 +51,61 @@ else:
   type LoReadCallback* = proc(data: seq[byte]): Future[void] {.gcsafe.}
   type LoWriteCallback* = proc(): Future[seq[byte]] {.gcsafe.}
 
+template makeLoReadCallback*(body: untyped): LoReadCallback =
+  ## Create a ``LoReadCallback`` that works with both asyncdispatch and chronos.
+  ## Inside ``body``, the current chunk is available as ``data: seq[byte]``.
+  ##
+  ## .. code-block:: nim
+  ##   var chunks: seq[seq[byte]]
+  ##   let cb = makeLoReadCallback:
+  ##     chunks.add(data)
+  block:
+    when hasChronos:
+      let r: LoReadCallback = proc(
+          data {.inject.}: seq[byte]
+      ) {.async: (raises: [CatchableError]).} =
+        body
+      r
+    else:
+      let r: LoReadCallback = proc(data {.inject.}: seq[byte]) {.async.} =
+        body
+      r
+
+template makeLoWriteCallback*(body: untyped): LoWriteCallback =
+  ## Create a ``LoWriteCallback`` that works with both asyncdispatch and chronos.
+  ## ``body`` must evaluate to ``seq[byte]``. Return an empty seq to signal completion.
+  ##
+  ## With asyncdispatch, anonymous async procs cannot return non-void types,
+  ## so this template wraps the body in manual ``Future`` construction.
+  ##
+  ## .. code-block:: nim
+  ##   var idx = 0
+  ##   let chunks = @[data1, data2]
+  ##   let cb = makeLoWriteCallback:
+  ##     if idx < chunks.len:
+  ##       let chunk = chunks[idx]
+  ##       inc idx
+  ##       chunk
+  ##     else:
+  ##       newSeq[byte]()
+  block:
+    when hasChronos:
+      let r: LoWriteCallback = proc(): Future[seq[byte]] {.
+          async: (raises: [CatchableError])
+      .} =
+        body
+      r
+    else:
+      let r: LoWriteCallback = proc(): Future[seq[byte]] {.gcsafe.} =
+        let fut = newFuture[seq[byte]]("makeLoWriteCallback")
+        try:
+          let res: seq[byte] = body
+          fut.complete(res)
+        except CatchableError as e:
+          fut.fail(e)
+        return fut
+      r
+
 # Core API
 
 proc loCreate*(

@@ -30,38 +30,6 @@ proc toString(b: seq[byte]): string =
   if b.len > 0:
     copyMem(addr result[0], unsafeAddr b[0], b.len)
 
-template makeLoReadCallback(body: untyped): LoReadCallback =
-  block:
-    when hasChronos:
-      let r: LoReadCallback = proc(
-          data {.inject.}: seq[byte]
-      ) {.async: (raises: [CatchableError]).} =
-        body
-      r
-    else:
-      let r: LoReadCallback = proc(data {.inject.}: seq[byte]) {.async.} =
-        body
-      r
-
-template makeLoWriteCallback(body: untyped): LoWriteCallback =
-  block:
-    when hasChronos:
-      let r: LoWriteCallback = proc(): Future[seq[byte]] {.
-          async: (raises: [CatchableError])
-      .} =
-        body
-      r
-    else:
-      let r: LoWriteCallback = proc(): Future[seq[byte]] {.gcsafe.} =
-        let fut = newFuture[seq[byte]]("loWriteCallback")
-        try:
-          let res: seq[byte] = body
-          fut.complete(res)
-        except CatchableError as e:
-          fut.fail(e)
-        return fut
-      r
-
 suite "Large Object: create and unlink":
   test "loCreate and loUnlink":
     proc t() {.async.} =
