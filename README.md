@@ -74,7 +74,7 @@ proc main() {.async.} =
     echo row.getStr("name"), " age=", row.getInt("age")
 
   # Query a single value
-  let count = await conn.queryValue("SELECT count(*) FROM users", default = "0")
+  let count = await conn.queryValueOrDefault("SELECT count(*) FROM users", default = "0")
   echo "Total users: ", count
 
 waitFor main()
