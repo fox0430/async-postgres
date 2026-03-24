@@ -579,15 +579,21 @@ proc notify*(
 macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction using a pooled connection.
   ## On exception, ROLLBACK is issued automatically.
-  ## **Note:** Do not use `return` inside the body.
+  ## Using `return` inside the body is a compile-time error.
   ##
   ## Usage:
   ##   pool.withTransaction(conn):
+  ##     conn.exec(...)
+  ##   pool.withTransaction(conn, seconds(5)):
   ##     conn.exec(...)
   ##   pool.withTransaction(conn, TransactionOptions(isolation: ilSerializable)):
   ##     conn.exec(...)
   ##   pool.withTransaction(conn, opts, seconds(5)):
   ##     conn.exec(...)
+  ##
+  ## **Note:** `TransactionOptions` must be passed as a constructor literal, not
+  ## through a variable (the macro uses AST node kind to distinguish options
+  ## from timeout).
   ##
   ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
   ## directly — not `pool.exec(...)` / `pool.query(...)`. Pool methods acquire
@@ -603,10 +609,15 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
     txTimeout = bindSym"ZeroDuration"
   of 3:
     connIdent = args[0]
-    let opts = args[1]
+    if args[1].kind == nnkObjConstr:
+      # pool.withTransaction(conn, TransactionOptions(...)): body
+      beginSql = newCall(bindSym"buildBeginSql", args[1])
+      txTimeout = bindSym"ZeroDuration"
+    else:
+      # pool.withTransaction(conn, timeout): body
+      beginSql = newStrLitNode("BEGIN")
+      txTimeout = args[1]
     body = args[2]
-    beginSql = newCall(bindSym"buildBeginSql", opts)
-    txTimeout = bindSym"ZeroDuration"
   of 4:
     connIdent = args[0]
     let opts = args[1]
@@ -615,14 +626,22 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
     beginSql = newCall(bindSym"buildBeginSql", opts)
   else:
     error(
-      "withTransaction expects (conn, body), (conn, opts, body), or (conn, opts, timeout, body)",
+      "withTransaction expects (conn, body), (conn, timeout, body), (conn, opts, body), or (conn, opts, timeout, body)",
       args[0],
     )
 
-  let poolSym = pool
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withTransaction is not allowed: COMMIT/ROLLBACK would be skipped",
+      body,
+    )
+
+  let poolExpr = pool
+  let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
   let resetSessionSym = bindSym"resetSession"
   result = quote:
+    let `poolSym` = `poolExpr`
     let `connIdent` = await `poolSym`.acquire()
     try:
       discard await `connIdent`.simpleExec(`beginSql`, timeout = `txTimeout`)
