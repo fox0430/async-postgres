@@ -341,6 +341,8 @@ proc exec*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement with typed parameters.
+  ## On timeout the connection is marked closed (protocol desync) and cannot be
+  ## reused; pooled connections are discarded automatically.
   var tag: string
   if timeout > ZeroDuration:
     try:
@@ -792,6 +794,8 @@ proc query*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query with typed parameters.
+  ## On timeout the connection is marked closed (protocol desync) and cannot be
+  ## reused; pooled connections are discarded automatically.
   let resultFormats = resultFormat.toFormatCodes()
   if timeout > ZeroDuration:
     try:

@@ -16,7 +16,7 @@
 ##   import pkg/async_postgres
 ##
 ##   proc main() {.async.} =
-##     let conn = await connect("postgresql://user:pass@localhost:5432/mydb")
+##     let conn = await connect("postgresql://myuser:mypass@127.0.0.1:5432/mydb")
 ##     defer: await conn.close()
 ##
 ##     # Insert with typed parameters
@@ -25,18 +25,22 @@
 ##     let cr = await conn.exec(sql"INSERT INTO users (name, age) VALUES ({name}, {age})")
 ##     echo "Inserted: ", cr.affectedRows
 ##
-##     # Query rows
+##     # Query multiple rows
 ##     let minAge = 25'i32
-##     let r = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
-##     for row in r:
-##       echo row.getStr("name"), " age=", row.getInt("age")
+##     let row = await conn.query(sql"SELECT id, name, age FROM users WHERE age > {minAge}")
+##     for r in row:
+##       echo r.getStr("name"), " age=", r.getInt("age")
+##
+##     # Query a single value
+##     let count = await conn.queryValueOrDefault("SELECT count(*) FROM users", default = "0")
+##     echo "Total users: ", count
 ##
 ##   waitFor main()
 ##
 ## Modules
 ## =======
 ## - `pg_connection <async_postgres/pg_connection.html>`_ — Connection management, DSN parsing, SSL, LISTEN/NOTIFY
-## - `pg_client <async_postgres/pg_client.html>`_ — Query execution, prepared statements, cursors, pipelines, transactions, COPY
+## - `pg_client <async_postgres/pg_client.html>`_ — Query execution, prepared statements, cursors, pipelines, transactions, COPY, zero-alloc macros (``queryDirect``/``execDirect``)
 ## - `pg_pool <async_postgres/pg_pool.html>`_ — Connection pooling with health checks and maintenance
 ## - `pg_pool_cluster <async_postgres/pg_pool_cluster.html>`_ — Read replica pool cluster with automatic query routing
 ## - `pg_types <async_postgres/pg_types.html>`_ — Type conversions (``toPgParam``, row accessors, arrays, ranges, composites, enums)
