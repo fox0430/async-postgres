@@ -38,7 +38,7 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
   )
 
 proc makeCluster(
-    fallback = rfNone, primaryMaxSize = 5, replicaMaxSize = 5
+    fallback = fallbackNone, primaryMaxSize = 5, replicaMaxSize = 5
 ): PgPoolCluster =
   PgPoolCluster(
     primary: makePool(maxSize = primaryMaxSize),
@@ -174,8 +174,8 @@ suite "Exception safety":
     waitFor t()
 
 suite "Fallback":
-  test "rfPrimary falls back to primary when replica unavailable":
-    let cluster = makeCluster(fallback = rfPrimary)
+  test "fallbackPrimary falls back to primary when replica unavailable":
+    let cluster = makeCluster(fallback = fallbackPrimary)
     # replica has no idle connections and is at max
     cluster.replica.active = cluster.replica.config.maxSize
     cluster.replica.config.acquireTimeout = ZeroDuration
@@ -199,8 +199,8 @@ suite "Fallback":
     # Clean up
     dummyFut.complete(mockConn())
 
-  test "rfNone raises when replica unavailable":
-    let cluster = makeCluster(fallback = rfNone)
+  test "fallbackNone raises when replica unavailable":
+    let cluster = makeCluster(fallback = fallbackNone)
     cluster.replica.active = cluster.replica.config.maxSize
     cluster.replica.config.maxWaiters = 1
     let dummyFut = newFuture[PgConnection]("dummy")
@@ -215,8 +215,8 @@ suite "Fallback":
     # Clean up
     dummyFut.complete(mockConn())
 
-  test "rfPrimary raises when both pools unavailable":
-    let cluster = makeCluster(fallback = rfPrimary)
+  test "fallbackPrimary raises when both pools unavailable":
+    let cluster = makeCluster(fallback = fallbackPrimary)
     # Both pools at max with full waiter queues
     cluster.replica.active = cluster.replica.config.maxSize
     cluster.replica.config.maxWaiters = 1
@@ -237,8 +237,8 @@ suite "Fallback":
     replicaFut.complete(mockConn())
     primaryFut.complete(mockConn())
 
-  test "rfPrimary fallback when replica pool is closed":
-    let cluster = makeCluster(fallback = rfPrimary)
+  test "fallbackPrimary fallback when replica pool is closed":
+    let cluster = makeCluster(fallback = fallbackPrimary)
     cluster.replica.closed = true
 
     let primaryConn = mockConn()
@@ -378,7 +378,7 @@ suite "Read routing targets replica":
   test "readQuery routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor cluster.readQuery("SELECT 1")
@@ -386,7 +386,7 @@ suite "Read routing targets replica":
   test "readQueryOne routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor cluster.readQueryOne("SELECT 1")
@@ -394,7 +394,7 @@ suite "Read routing targets replica":
   test "readQueryValue routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor cluster.readQueryValue("SELECT 1")
@@ -402,7 +402,7 @@ suite "Read routing targets replica":
   test "readQueryValueOpt routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor cluster.readQueryValueOpt("SELECT 1")
@@ -410,7 +410,7 @@ suite "Read routing targets replica":
   test "readQueryValueOrDefault routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor cluster.readQueryValueOrDefault("SELECT 1")
@@ -418,7 +418,7 @@ suite "Read routing targets replica":
   test "readQueryExists routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor cluster.readQueryExists("SELECT 1")
@@ -426,7 +426,7 @@ suite "Read routing targets replica":
   test "readQueryColumn routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor cluster.readQueryColumn("SELECT 1")
@@ -435,7 +435,7 @@ suite "Closed pool cluster":
   test "acquire on closed replica raises error":
     let cluster = makeCluster()
     cluster.replica.closed = true
-    cluster.fallback = rfNone
+    cluster.fallback = fallbackNone
 
     expect(PgError):
       discard waitFor acquireRead(cluster)

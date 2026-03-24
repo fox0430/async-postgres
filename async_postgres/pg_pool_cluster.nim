@@ -6,8 +6,8 @@ import pg_client {.all.}
 
 type
   ReplicaFallback* = enum
-    rfNone ## Error when replica is unavailable
-    rfPrimary ## Fall back to primary when replica is unavailable
+    fallbackNone ## Error when replica is unavailable
+    fallbackPrimary ## Fall back to primary when replica is unavailable
 
   PgPoolCluster* = ref object
     ## Connection pool cluster with explicit read/write routing.
@@ -38,7 +38,7 @@ proc isClosed*(cluster: PgPoolCluster): bool =
   cluster.closed
 
 proc newPoolCluster*(
-    primaryConfig: PoolConfig, replicaConfig: PoolConfig, fallback = rfNone
+    primaryConfig: PoolConfig, replicaConfig: PoolConfig, fallback = fallbackNone
 ): Future[PgPoolCluster] {.async.} =
   ## Create a new pool cluster with separate primary and replica pools.
   ## If `connConfig.targetSessionAttrs` is `tsaAny` (the default), it is
@@ -72,7 +72,7 @@ proc acquireRead(
     let conn = await cluster.replica.acquire()
     return (conn, cluster.replica)
   except CatchableError as e:
-    if cluster.fallback == rfPrimary:
+    if cluster.fallback == fallbackPrimary:
       let conn = await cluster.primary.acquire()
       return (conn, cluster.primary)
     raise e
