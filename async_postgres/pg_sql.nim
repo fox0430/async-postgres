@@ -281,384 +281,375 @@ macro sql*(queryStr: static[string]): untyped =
   result = quote:
     SqlQuery(query: `sqlLit`, params: `paramsSeq`)
 
+macro sqlQueryForwards(body: untyped): untyped =
+  ## Generate ``SqlQuery`` forwarding templates from compact proc declarations.
+  ##
+  ## Each entry is a bodiless ``proc`` whose ``sq: SqlQuery`` parameter is
+  ## expanded to ``sq.query, sq.params`` in the generated template body.
+  ## ``_: typedesc[T]`` parameters are forwarded as ``T``.
+  result = newStmtList()
+  for child in body:
+    child.expectKind(nnkProcDef)
+    let name = child[0]
+    let genericParams = child[2]
+    let formalParams = child[3]
+    var procIdent =
+      if name.kind == nnkPostfix:
+        name[1]
+      else:
+        name
+
+    var sqIdx = -1
+    for i in 1 ..< formalParams.len:
+      if formalParams[i][0].eqIdent("sq"):
+        sqIdx = i
+        break
+    doAssert sqIdx >= 0, "missing sq: SqlQuery in " & repr(procIdent)
+
+    var call = newCall(procIdent)
+    for i in 1 ..< formalParams.len:
+      let param = formalParams[i]
+      if i == sqIdx:
+        call.add(newDotExpr(ident"sq", ident"query"))
+        call.add(newDotExpr(ident"sq", ident"params"))
+      elif param[1].kind == nnkBracketExpr and param[1][0].eqIdent("typedesc"):
+        call.add(param[1][1])
+      else:
+        call.add(param[0])
+
+    var tmpl = newNimNode(nnkTemplateDef)
+    tmpl.add(name.copyNimTree())
+    tmpl.add(newEmptyNode())
+    tmpl.add(genericParams.copyNimTree())
+    tmpl.add(formalParams.copyNimTree())
+    tmpl.add(newEmptyNode())
+    tmpl.add(newEmptyNode())
+    tmpl.add(call)
+    result.add(tmpl)
+
 # SqlQuery forwarding templates – PgConnection
 
-template exec*(
+sqlQueryForwards:
+  proc exec*(
     conn: PgConnection, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  exec(conn, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template query*(
+  proc query*(
     conn: PgConnection,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  query(conn, sq.query, sq.params, resultFormat = resultFormat, timeout = timeout)
+  ): untyped
 
-template queryOne*(
+  proc queryOne*(
     conn: PgConnection,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryOne(conn, sq.query, sq.params, resultFormat, timeout)
+  ): untyped
 
-template queryEach*(
+  proc queryEach*(
     conn: PgConnection,
     sq: SqlQuery,
     callback: RowCallback,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryEach(conn, sq.query, sq.params, callback, resultFormat, timeout)
+  ): untyped
 
-template queryValue*(
+  proc queryValue*(
     conn: PgConnection, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValue(conn, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValue*[T](
+  proc queryValue*[T](
     conn: PgConnection, _: typedesc[T], sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValue(conn, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValueOpt*(
+  proc queryValueOpt*(
     conn: PgConnection, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValueOpt(conn, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValueOpt*[T](
+  proc queryValueOpt*[T](
     conn: PgConnection, _: typedesc[T], sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValueOpt(conn, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValueOrDefault*(
+  proc queryValueOrDefault*(
     conn: PgConnection,
     sq: SqlQuery,
     default: string = "",
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryValueOrDefault(conn, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template queryValueOrDefault*[T](
+  proc queryValueOrDefault*[T](
     conn: PgConnection,
     _: typedesc[T],
     sq: SqlQuery,
     default: T,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryValueOrDefault(conn, T, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template queryExists*(
+  proc queryExists*(
     conn: PgConnection, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryExists(conn, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryColumn*(
+  proc queryColumn*(
     conn: PgConnection, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryColumn(conn, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template execInTransaction*(
+  proc execInTransaction*(
     conn: PgConnection, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  execInTransaction(conn, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template execInTransaction*(
+  proc execInTransaction*(
     conn: PgConnection,
     sq: SqlQuery,
     opts: TransactionOptions,
     timeout: Duration = ZeroDuration,
-): untyped =
-  execInTransaction(conn, sq.query, sq.params, opts, timeout = timeout)
+  ): untyped
 
-template queryInTransaction*(
+  proc queryInTransaction*(
     conn: PgConnection,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryInTransaction(conn, sq.query, sq.params, resultFormat, timeout = timeout)
+  ): untyped
 
-template queryInTransaction*(
+  proc queryInTransaction*(
     conn: PgConnection,
     sq: SqlQuery,
     opts: TransactionOptions,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryInTransaction(conn, sq.query, sq.params, opts, resultFormat, timeout = timeout)
+  ): untyped
 
-template addExec*(p: Pipeline, sq: SqlQuery): untyped =
-  addExec(p, sq.query, sq.params)
-
-template addQuery*(
+  proc addExec*(p: Pipeline, sq: SqlQuery): untyped
+  proc addQuery*(
     p: Pipeline, sq: SqlQuery, resultFormat: ResultFormat = rfAuto
-): untyped =
-  addQuery(p, sq.query, sq.params, resultFormat = resultFormat)
+  ): untyped
 
 # SqlQuery forwarding templates – PgPool
 
-template exec*(pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration): untyped =
-  exec(pool, sq.query, sq.params, timeout = timeout)
-
-template query*(
+sqlQueryForwards:
+  proc exec*(pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration): untyped
+  proc query*(
     pool: PgPool,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  query(pool, sq.query, sq.params, resultFormat = resultFormat, timeout = timeout)
+  ): untyped
 
-template queryOne*(
+  proc queryOne*(
     pool: PgPool,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryOne(pool, sq.query, sq.params, resultFormat, timeout)
+  ): untyped
 
-template queryEach*(
+  proc queryEach*(
     pool: PgPool,
     sq: SqlQuery,
     callback: RowCallback,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryEach(pool, sq.query, sq.params, callback, resultFormat, timeout)
+  ): untyped
 
-template queryValue*(
+  proc queryValue*(
     pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValue(pool, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValue*[T](
+  proc queryValue*[T](
     pool: PgPool, _: typedesc[T], sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValue(pool, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValueOpt*(
+  proc queryValueOpt*(
     pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValueOpt(pool, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValueOpt*[T](
+  proc queryValueOpt*[T](
     pool: PgPool, _: typedesc[T], sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryValueOpt(pool, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryValueOrDefault*(
+  proc queryValueOrDefault*(
     pool: PgPool, sq: SqlQuery, default: string = "", timeout: Duration = ZeroDuration
-): untyped =
-  queryValueOrDefault(pool, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template queryValueOrDefault*[T](
+  proc queryValueOrDefault*[T](
     pool: PgPool,
     _: typedesc[T],
     sq: SqlQuery,
     default: T,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryValueOrDefault(pool, T, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template queryExists*(
+  proc queryExists*(
     pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryExists(pool, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryColumn*(
+  proc queryColumn*(
     pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  queryColumn(pool, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template execInTransaction*(
+  proc execInTransaction*(
     pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  execInTransaction(pool, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template queryInTransaction*(
+  proc queryInTransaction*(
     pool: PgPool,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  queryInTransaction(pool, sq.query, sq.params, resultFormat, timeout = timeout)
+  ): untyped
 
 # SqlQuery forwarding templates – PgPoolCluster (read)
 
-template readQuery*(
+sqlQueryForwards:
+  proc readQuery*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  readQuery(cluster, sq.query, sq.params, resultFormat, timeout)
+  ): untyped
 
-template readQueryOne*(
+  proc readQueryOne*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  readQueryOne(cluster, sq.query, sq.params, resultFormat, timeout)
+  ): untyped
 
-template readQueryValue*(
+  proc readQueryValue*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  readQueryValue(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template readQueryValue*[T](
+  proc readQueryValue*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sq: SqlQuery,
     timeout: Duration = ZeroDuration,
-): untyped =
-  readQueryValue(cluster, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template readQueryValueOpt*(
+  proc readQueryValueOpt*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  readQueryValueOpt(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template readQueryValueOpt*[T](
+  proc readQueryValueOpt*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sq: SqlQuery,
     timeout: Duration = ZeroDuration,
-): untyped =
-  readQueryValueOpt(cluster, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template readQueryValueOrDefault*(
+  proc readQueryValueOrDefault*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     default: string = "",
     timeout: Duration = ZeroDuration,
-): untyped =
-  readQueryValueOrDefault(cluster, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template readQueryValueOrDefault*[T](
+  proc readQueryValueOrDefault*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sq: SqlQuery,
     default: T,
     timeout: Duration = ZeroDuration,
-): untyped =
-  readQueryValueOrDefault(cluster, T, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template readQueryExists*(
+  proc readQueryExists*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  readQueryExists(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template readQueryColumn*(
+  proc readQueryColumn*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  readQueryColumn(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template readQueryEach*(
+  proc readQueryEach*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     callback: RowCallback,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  readQueryEach(cluster, sq.query, sq.params, callback, resultFormat, timeout)
+  ): untyped
 
 # SqlQuery forwarding templates – PgPoolCluster (write)
 
-template writeExec*(
+sqlQueryForwards:
+  proc writeExec*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  writeExec(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQuery*(
+  proc writeQuery*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQuery(cluster, sq.query, sq.params, resultFormat, timeout)
+  ): untyped
 
-template writeQueryOne*(
+  proc writeQueryOne*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQueryOne(cluster, sq.query, sq.params, resultFormat, timeout)
+  ): untyped
 
-template writeQueryValue*(
+  proc writeQueryValue*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  writeQueryValue(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQueryValue*[T](
+  proc writeQueryValue*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sq: SqlQuery,
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQueryValue(cluster, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQueryValueOpt*(
+  proc writeQueryValueOpt*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  writeQueryValueOpt(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQueryValueOpt*[T](
+  proc writeQueryValueOpt*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sq: SqlQuery,
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQueryValueOpt(cluster, T, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQueryValueOrDefault*(
+  proc writeQueryValueOrDefault*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     default: string = "",
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQueryValueOrDefault(cluster, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template writeQueryValueOrDefault*[T](
+  proc writeQueryValueOrDefault*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
     sq: SqlQuery,
     default: T,
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQueryValueOrDefault(cluster, T, sq.query, sq.params, default, timeout)
+  ): untyped
 
-template writeQueryExists*(
+  proc writeQueryExists*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  writeQueryExists(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQueryColumn*(
+  proc writeQueryColumn*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  writeQueryColumn(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQueryEach*(
+  proc writeQueryEach*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     callback: RowCallback,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQueryEach(cluster, sq.query, sq.params, callback, resultFormat, timeout)
+  ): untyped
 
-template writeExecInTransaction*(
+  proc writeExecInTransaction*(
     cluster: PgPoolCluster, sq: SqlQuery, timeout: Duration = ZeroDuration
-): untyped =
-  writeExecInTransaction(cluster, sq.query, sq.params, timeout = timeout)
+  ): untyped
 
-template writeQueryInTransaction*(
+  proc writeQueryInTransaction*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
-): untyped =
-  writeQueryInTransaction(cluster, sq.query, sq.params, resultFormat, timeout = timeout)
+  ): untyped
