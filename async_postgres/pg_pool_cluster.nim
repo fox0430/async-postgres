@@ -441,7 +441,15 @@ template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
 proc close*(cluster: PgPoolCluster): Future[void] {.async.} =
   ## Close both primary and replica pools.
   cluster.closed = true
+  var firstErr: ref CatchableError
   try:
     await cluster.primary.close()
-  finally:
+  except CatchableError as e:
+    firstErr = e
+  try:
     await cluster.replica.close()
+  except CatchableError as e:
+    if firstErr == nil:
+      firstErr = e
+  if firstErr != nil:
+    raise firstErr

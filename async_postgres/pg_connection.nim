@@ -629,6 +629,41 @@ when hasChronos:
 
     result = TrustAnchorResult(store: TrustAnchorStore.new(anchors), backing: backing)
 
+proc closeTransport(conn: PgConnection) {.async.} =
+  ## Close transport resources without sending Terminate.
+  when hasChronos:
+    if conn.tlsStream != nil:
+      try:
+        await conn.tlsStream.reader.closeWait()
+      except CatchableError:
+        discard
+      try:
+        await conn.tlsStream.writer.closeWait()
+      except CatchableError:
+        discard
+      conn.tlsStream = nil
+    if conn.baseReader != nil:
+      try:
+        await conn.baseReader.closeWait()
+      except CatchableError:
+        discard
+      try:
+        await conn.baseWriter.closeWait()
+      except CatchableError:
+        discard
+      conn.baseReader = nil
+      conn.baseWriter = nil
+    if conn.transport != nil:
+      try:
+        await conn.transport.closeWait()
+      except CatchableError:
+        discard
+      conn.transport = nil
+  elif hasAsyncDispatch:
+    if not conn.socket.isNil:
+      conn.socket.close()
+      conn.socket = nil
+
 proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
   ## Send SSLRequest and negotiate TLS if server accepts.
   let sslReq = encodeSSLRequest()
@@ -949,33 +984,7 @@ proc connectToHost(
     conn.createdAt = Moment.now()
     return conn
   except CatchableError as e:
-    when hasChronos:
-      if conn.tlsStream != nil:
-        try:
-          await conn.tlsStream.reader.closeWait()
-        except CatchableError:
-          discard
-        try:
-          await conn.tlsStream.writer.closeWait()
-        except CatchableError:
-          discard
-      if conn.baseReader != nil:
-        try:
-          await conn.baseReader.closeWait()
-        except CatchableError:
-          discard
-        try:
-          await conn.baseWriter.closeWait()
-        except CatchableError:
-          discard
-      if conn.transport != nil:
-        try:
-          await conn.transport.closeWait()
-        except CatchableError:
-          discard
-    elif hasAsyncDispatch:
-      if not conn.socket.isNil:
-        conn.socket.close()
+    await conn.closeTransport()
     raise e
 
 proc checkReady*(conn: PgConnection) =
@@ -1149,41 +1158,6 @@ proc cancel*(conn: PgConnection): Future[void] {.async.} =
       await sock.sendRawBytes(msg)
     finally:
       sock.close()
-
-proc closeTransport(conn: PgConnection) {.async.} =
-  ## Close transport resources without sending Terminate.
-  when hasChronos:
-    if conn.tlsStream != nil:
-      try:
-        await conn.tlsStream.reader.closeWait()
-      except CatchableError:
-        discard
-      try:
-        await conn.tlsStream.writer.closeWait()
-      except CatchableError:
-        discard
-      conn.tlsStream = nil
-    if conn.baseReader != nil:
-      try:
-        await conn.baseReader.closeWait()
-      except CatchableError:
-        discard
-      try:
-        await conn.baseWriter.closeWait()
-      except CatchableError:
-        discard
-      conn.baseReader = nil
-      conn.baseWriter = nil
-    if conn.transport != nil:
-      try:
-        await conn.transport.closeWait()
-      except CatchableError:
-        discard
-      conn.transport = nil
-  elif hasAsyncDispatch:
-    if not conn.socket.isNil:
-      conn.socket.close()
-      conn.socket = nil
 
 proc close*(conn: PgConnection): Future[void] {.async.} =
   ## Close the connection. Idempotent: safe to call multiple times.
