@@ -118,6 +118,13 @@ suite "SCRAM-SHA-256":
     expect CatchableError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
+  test "scramClientFinalMessage rejects excessive iteration count":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=10000001"
+    expect CatchableError:
+      discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
   test "scramClientFinalMessage rejects invalid base64 salt":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
