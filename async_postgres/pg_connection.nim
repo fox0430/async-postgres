@@ -410,6 +410,10 @@ when hasAsyncDispatch:
 
   proc sendRawBytes(socket: AsyncSocket, data: seq[byte]): Future[void] =
     ## Send ``seq[byte]`` via asyncdispatch socket.
+    if data.len == 0:
+      var fut = newFuture[void]("sendRawBytes")
+      fut.complete()
+      return fut
     sendRawData(socket, unsafeAddr data[0], data.len)
 
 proc compactRecvBuf(conn: PgConnection) {.inline.} =
