@@ -1,5 +1,5 @@
 import std/[tables, sets, strutils, uri, deques, options, lists]
-when defined(linux) or defined(macosx):
+when defined(posix):
   import std/posix
 
 import async_backend, pg_protocol, pg_auth, pg_types
@@ -25,6 +25,11 @@ elif defined(macosx):
   const
     TCP_KEEPINTVL = cint(0x101)
     TCP_KEEPCNT = cint(0x102)
+else:
+  {.
+    warning:
+      "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
+  .}
 
 type
   PgConnectionError* = object of PgError
@@ -769,7 +774,7 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
   else:
     raise newException(PgConnectionError, "Unexpected SSL response: " & $respChar)
 
-when defined(linux) or defined(macosx):
+when defined(posix):
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
 
   proc configureTcpNoDelay(fd: SocketHandle) =
@@ -850,6 +855,13 @@ when defined(linux) or defined(macosx):
           raise newException(
             PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
           )
+    else:
+      if config.keepAliveIdle > 0 or config.keepAliveInterval > 0 or
+          config.keepAliveCount > 0:
+        {.
+          warning:
+            "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
+        .}
 
 proc connectToHost(
     config: ConnConfig, hostAddr: string, hostPort: int
@@ -862,7 +874,7 @@ proc connectToHost(
     if addresses.len == 0:
       raise newException(PgConnectionError, "Could not resolve host: " & hostAddr)
     let transport = await connect(addresses[0])
-    when defined(linux) or defined(macosx):
+    when defined(posix):
       try:
         configureTcpNoDelay(SocketHandle(transport.fd))
         configureKeepalive(SocketHandle(transport.fd), config)
@@ -887,7 +899,7 @@ proc connectToHost(
     let sock = newAsyncSocket(buffered = false)
     try:
       await sock.connect(hostAddr, Port(hostPort))
-      when defined(linux) or defined(macosx):
+      when defined(posix):
         configureTcpNoDelay(SocketHandle(sock.getFd()))
         configureKeepalive(SocketHandle(sock.getFd()), config)
     except CatchableError:
