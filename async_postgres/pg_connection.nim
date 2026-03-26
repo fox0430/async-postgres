@@ -1282,7 +1282,12 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   conn.recvBufStart = 0
   conn.clearStmtCache()
   conn.state = csConnecting
-  let newConn = await connect(conn.config)
+  var newConn: PgConnection
+  try:
+    newConn = await connect(conn.config)
+  except CatchableError as e:
+    conn.state = csClosed
+    raise e
   when hasChronos:
     conn.transport = newConn.transport
     conn.baseReader = newConn.baseReader
