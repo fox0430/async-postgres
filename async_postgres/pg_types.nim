@@ -1482,7 +1482,8 @@ proc getInt*(row: Row, col: int): int32 =
       let b = row.data.buf
       return int32(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
   var v: int
-  discard parseInt(row.bufView(off, clen), v)
+  if parseInt(row.bufView(off, clen), v) == 0:
+    raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
   result = int32(v)
 
 proc getInt64*(row: Row, col: int): int64 =
