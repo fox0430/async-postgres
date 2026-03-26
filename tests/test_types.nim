@@ -273,6 +273,11 @@ suite "Row accessors":
     let row = @[some(toBytes("-7"))]
     check row.getInt(0) == -7'i32
 
+  test "getInt invalid value raises":
+    let row = @[some(toBytes("abc"))]
+    expect PgTypeError:
+      discard row.getInt(0)
+
   test "getInt64":
     let row = @[some(toBytes("9999999999"))]
     check row.getInt64(0) == 9999999999'i64
