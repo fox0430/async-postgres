@@ -1488,7 +1488,19 @@ proc copyOutStreamImpl(
           try:
             await callback(msg.copyData)
           except CatchableError as e:
-            conn.state = csClosed
+            # Drain remaining messages until ReadyForQuery to keep protocol in sync
+            block drainLoop:
+              while true:
+                while (let opt2 = conn.nextMessage(); opt2.isSome):
+                  let msg2 = opt2.get
+                  case msg2.kind
+                  of bmkReadyForQuery:
+                    conn.txStatus = msg2.txStatus
+                    conn.state = csReady
+                    break drainLoop
+                  else:
+                    discard
+                await conn.fillRecvBuf(timeout)
             raise e
         of bmkCopyDone:
           discard
