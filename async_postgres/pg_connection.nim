@@ -1704,7 +1704,8 @@ proc parseUriDsn(dsn: string): ConnConfig =
   if hostport.len > 0:
     let parts = hostport.split(',')
     for part in parts:
-      result.hosts.add(parseHostEntry(part))
+      if part.len > 0:
+        result.hosts.add(parseHostEntry(part))
     # Back-compat: set host/port from first entry
     result.host = result.hosts[0].host
     result.port = result.hosts[0].port

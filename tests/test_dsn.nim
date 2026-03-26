@@ -290,6 +290,12 @@ suite "parseDsn":
     check cfg.hosts[1].host == "h2"
     check cfg.hosts[1].port == 5433
 
+  test "multi-host skips empty entries":
+    let cfg = parseDsn("postgresql://h1,,h3/db")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].host == "h1"
+    check cfg.hosts[1].host == "h3"
+
   test "target_session_attrs all values":
     check parseDsn("postgresql://h/db?target_session_attrs=any").targetSessionAttrs ==
       tsaAny
