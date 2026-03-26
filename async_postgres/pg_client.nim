@@ -1612,8 +1612,8 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let eSym = genSym(nskLet, "e")
   result = quote:
     let `connSym` = `connExpr`
-    discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
     try:
+      discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
     except CatchableError as `eSym`:
@@ -1694,9 +1694,9 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   result = quote:
     let `connSym` = `connExpr`
     let `spNameSym` = `nameExpr`
-    discard
-      await `connSym`.simpleExec("SAVEPOINT " & `spNameSym`, timeout = `spTimeout`)
     try:
+      discard
+        await `connSym`.simpleExec("SAVEPOINT " & `spNameSym`, timeout = `spTimeout`)
       `body`
       discard await `connSym`.simpleExec(
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
