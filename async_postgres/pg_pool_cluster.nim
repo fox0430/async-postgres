@@ -413,5 +413,7 @@ template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
 proc close*(cluster: PgPoolCluster): Future[void] {.async.} =
   ## Close both primary and replica pools.
   cluster.closed = true
-  await cluster.primary.close()
-  await cluster.replica.close()
+  try:
+    await cluster.primary.close()
+  finally:
+    await cluster.replica.close()

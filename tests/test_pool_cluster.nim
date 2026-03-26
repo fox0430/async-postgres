@@ -276,6 +276,25 @@ suite "Close":
     check cluster.primary.idle.len == 0
     check cluster.replica.idle.len == 0
 
+  test "close closes replica even if primary.close raises":
+    ## Ensures try/finally guarantees replica cleanup when primary fails.
+    let cluster = makeCluster()
+    # Add an idle connection with csReady state to primary — closing it will
+    # attempt to send Terminate on a nil socket, which raises.
+    cluster.primary.idle.addLast(
+      PooledConn(conn: mockConn(csReady), lastUsedAt: Moment.now())
+    )
+    cluster.replica.idle.addLast(
+      PooledConn(conn: mockConn(csClosed), lastUsedAt: Moment.now())
+    )
+
+    # close() should not propagate the primary error (pool.close catches it)
+    waitFor cluster.close()
+    check cluster.closed
+    check cluster.primary.closed
+    check cluster.replica.closed
+    check cluster.replica.idle.len == 0
+
 suite "Write routing":
   ## writeQuery* methods must route to the primary pool, not replica.
   ## We verify this by closing the primary pool — if the method raises
