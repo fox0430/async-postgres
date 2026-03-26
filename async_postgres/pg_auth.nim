@@ -54,13 +54,31 @@ proc scramClientFinalMessage*(
   let serverFirstMsg = toString(serverFirstData)
   var combinedNonce, saltB64: string
   var iterations: int
+  var hasNonce, hasSalt, hasIterations: bool
   for part in serverFirstMsg.split(','):
     if part.startsWith("r="):
       combinedNonce = part[2 .. ^1]
+      hasNonce = true
     elif part.startsWith("s="):
       saltB64 = part[2 .. ^1]
+      hasSalt = true
     elif part.startsWith("i="):
-      iterations = parseInt(part[2 .. ^1])
+      try:
+        iterations = parseInt(part[2 .. ^1])
+      except ValueError:
+        raise newException(CatchableError, "SCRAM: invalid iteration count")
+      hasIterations = true
+
+  if not hasNonce:
+    raise newException(CatchableError, "SCRAM: server response missing nonce (r=)")
+  if not hasSalt:
+    raise newException(CatchableError, "SCRAM: server response missing salt (s=)")
+  if not hasIterations:
+    raise newException(
+      CatchableError, "SCRAM: server response missing iteration count (i=)"
+    )
+  if iterations <= 0:
+    raise newException(CatchableError, "SCRAM: iteration count must be positive")
 
   if not combinedNonce.startsWith(state.clientNonce):
     raise newException(
