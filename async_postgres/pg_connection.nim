@@ -1534,16 +1534,22 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       result.keepAliveIdle = parseInt(val)
     except ValueError:
       raise newException(PgError, "Invalid keepalives_idle: " & val)
+    if result.keepAliveIdle < 0:
+      raise newException(PgError, "keepalives_idle must be non-negative: " & val)
   of "keepalives_interval":
     try:
       result.keepAliveInterval = parseInt(val)
     except ValueError:
       raise newException(PgError, "Invalid keepalives_interval: " & val)
+    if result.keepAliveInterval < 0:
+      raise newException(PgError, "keepalives_interval must be non-negative: " & val)
   of "keepalives_count":
     try:
       result.keepAliveCount = parseInt(val)
     except ValueError:
       raise newException(PgError, "Invalid keepalives_count: " & val)
+    if result.keepAliveCount < 0:
+      raise newException(PgError, "keepalives_count must be non-negative: " & val)
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
   else:

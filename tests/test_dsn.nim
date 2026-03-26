@@ -249,6 +249,18 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?keepalives_count=abc")
 
+  test "error: negative keepalives_idle":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_idle=-1")
+
+  test "error: negative keepalives_interval":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_interval=-1")
+
+  test "error: negative keepalives_count":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_count=-1")
+
   test "error: sslrootcert file not found":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")
