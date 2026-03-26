@@ -784,8 +784,9 @@ when defined(linux) or defined(macosx):
           addr optval,
           sizeof(optval).SockLen,
         ) < 0:
-          raise
-            newException(PgConnectionError, "Failed to set TCP_KEEPALIVE: " & $strerror(errno))
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPALIVE: " & $strerror(errno)
+          )
       if config.keepAliveInterval > 0:
         optval = cint(config.keepAliveInterval)
         if setsockopt(
