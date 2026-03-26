@@ -80,7 +80,7 @@ proc scramClientFinalMessage*(
     )
   if iterations <= 0:
     raise newException(CatchableError, "SCRAM: iteration count must be positive")
-  if iterations > 10_000_000:
+  if iterations > 600_000:
     raise
       newException(CatchableError, "SCRAM: iteration count too large: " & $iterations)
 
