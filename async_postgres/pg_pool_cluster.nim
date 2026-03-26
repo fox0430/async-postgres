@@ -19,6 +19,8 @@ type
     primary: PgPool
     replica: PgPool
     fallback: ReplicaFallback
+    fallbackTimeout: Duration
+      ## Max time to wait for a fallback acquire (ZeroDuration = use pool's own acquireTimeout)
     closed: bool
 
 proc primaryPool*(cluster: PgPoolCluster): PgPool =
@@ -37,8 +39,18 @@ proc isClosed*(cluster: PgPoolCluster): bool =
   ## Whether the cluster has been closed.
   cluster.closed
 
+proc fallbackTimeout*(cluster: PgPoolCluster): Duration =
+  ## The configured fallback timeout for read operations.
+  ## When `fallbackPrimary` is set and the replica acquire fails, this limits
+  ## how long the fallback primary acquire may wait. `ZeroDuration` means the
+  ## primary pool's own `acquireTimeout` is used as-is.
+  cluster.fallbackTimeout
+
 proc newPoolCluster*(
-    primaryConfig: PoolConfig, replicaConfig: PoolConfig, fallback = fallbackNone
+    primaryConfig: PoolConfig,
+    replicaConfig: PoolConfig,
+    fallback = fallbackNone,
+    fallbackTimeout = ZeroDuration,
 ): Future[PgPoolCluster] {.async.} =
   ## Create a new pool cluster with separate primary and replica pools.
   ## If `connConfig.targetSessionAttrs` is `tsaAny` (the default), it is
@@ -60,8 +72,13 @@ proc newPoolCluster*(
     await pPool.close()
     raise e
 
-  return
-    PgPoolCluster(primary: pPool, replica: rPool, fallback: fallback, closed: false)
+  return PgPoolCluster(
+    primary: pPool,
+    replica: rPool,
+    fallback: fallback,
+    fallbackTimeout: fallbackTimeout,
+    closed: false,
+  )
 
 proc acquireRead(
     cluster: PgPoolCluster
@@ -73,8 +90,19 @@ proc acquireRead(
     return (conn, cluster.replica)
   except CatchableError as e:
     if cluster.fallback == fallbackPrimary:
-      let conn = await cluster.primary.acquire()
-      return (conn, cluster.primary)
+      if cluster.fallbackTimeout > ZeroDuration:
+        try:
+          let conn = await cluster.primary.acquire().wait(cluster.fallbackTimeout)
+          return (conn, cluster.primary)
+        except AsyncTimeoutError:
+          raise newException(
+            PgPoolError,
+            "Pool cluster fallback acquire timeout (replica error: " & e.msg & ")",
+            e,
+          )
+      else:
+        let conn = await cluster.primary.acquire()
+        return (conn, cluster.primary)
     raise e
 
 template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
