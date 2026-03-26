@@ -329,7 +329,8 @@ proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) =
     var droppedNow = 0
     while conn.notifyQueue.len >= conn.notifyMaxQueue:
       discard conn.notifyQueue.popFirst()
-      conn.notifyDropped.inc
+      if conn.notifyDropped < high(int):
+        conn.notifyDropped.inc
       droppedNow.inc
     conn.notifyQueue.addLast(notif)
     if droppedNow > 0 and conn.notifyOverflowCallback != nil:
