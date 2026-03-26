@@ -270,6 +270,11 @@ suite "Row accessors":
     let row = @[some(toBytes("9999999999"))]
     check row.getInt64(0) == 9999999999'i64
 
+  test "getInt64 invalid value raises":
+    let row = @[some(toBytes("xyz"))]
+    expect PgTypeError:
+      discard row.getInt64(0)
+
   test "getFloat":
     let row = @[some(toBytes("3.14"))]
     check abs(row.getFloat(0) - 3.14) < 1e-10
