@@ -1284,9 +1284,9 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   var newConn: PgConnection
   try:
     newConn = await connect(conn.config)
-  except CatchableError:
+  except CatchableError as e:
     conn.state = csClosed
-    raise
+    raise e
   when hasChronos:
     conn.transport = newConn.transport
     conn.baseReader = newConn.baseReader
