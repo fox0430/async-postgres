@@ -828,8 +828,15 @@ proc connectToHost(
       raise newException(PgConnectionError, "Could not resolve host: " & hostAddr)
     let transport = await connect(addresses[0])
     when defined(linux) or defined(macosx):
-      configureTcpNoDelay(SocketHandle(transport.fd))
-      configureKeepalive(SocketHandle(transport.fd), config)
+      try:
+        configureTcpNoDelay(SocketHandle(transport.fd))
+        configureKeepalive(SocketHandle(transport.fd), config)
+      except CatchableError as e:
+        try:
+          await noCancel transport.closeWait()
+        except CatchableError:
+          discard
+        raise newException(PgConnectionError, e.msg, e)
     conn = PgConnection(
       transport: transport,
       recvBuf: @[],
