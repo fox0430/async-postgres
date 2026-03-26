@@ -33,7 +33,8 @@ proc scramClientFirstMessage*(user: string, state: var ScramState): seq[byte] =
   ## Generate the SCRAM-SHA-256 client-first message with a random nonce.
   var nonceBuf: array[24, byte]
   let n = randomBytes(nonceBuf)
-  doAssert n == 24
+  if n != 24:
+    raise newException(CatchableError, "SCRAM: failed to generate random nonce")
   state.clientNonce = base64.encode(nonceBuf)
   state.clientFirstBare = "n=" & user & ",r=" & state.clientNonce
   result = toBytes("n,," & state.clientFirstBare)
