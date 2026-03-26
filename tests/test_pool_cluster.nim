@@ -1,8 +1,6 @@
 import std/[unittest, deques, tables, importutils]
 
-import ../async_postgres/async_backend
-import ../async_postgres/pg_protocol
-import ../async_postgres/pg_connection
+import ../async_postgres/[async_backend, pg_protocol, pg_connection]
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_pool_cluster {.all.}
 
@@ -38,12 +36,16 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
   )
 
 proc makeCluster(
-    fallback = fallbackNone, primaryMaxSize = 5, replicaMaxSize = 5
+    fallback = fallbackNone,
+    primaryMaxSize = 5,
+    replicaMaxSize = 5,
+    fallbackTimeout = ZeroDuration,
 ): PgPoolCluster =
   PgPoolCluster(
     primary: makePool(maxSize = primaryMaxSize),
     replica: makePool(maxSize = replicaMaxSize),
     fallback: fallback,
+    fallbackTimeout: fallbackTimeout,
     closed: false,
   )
 
@@ -236,6 +238,29 @@ suite "Fallback":
     # Clean up
     replicaFut.complete(mockConn())
     primaryFut.complete(mockConn())
+
+  test "fallbackTimeout raises PgPoolError when primary acquire exceeds timeout":
+    let cluster =
+      makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(50))
+    cluster.replica.closed = true
+    # Primary at max with no idle connections — acquire will wait
+    cluster.primary.active = cluster.primary.config.maxSize
+
+    expect(PgError):
+      discard waitFor acquireRead(cluster)
+
+  test "fallbackTimeout succeeds when primary available within timeout":
+    let cluster = makeCluster(fallback = fallbackPrimary, fallbackTimeout = seconds(5))
+    cluster.replica.closed = true
+
+    let primaryConn = mockConn()
+    cluster.primary.idle.addLast(
+      PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+    )
+
+    let (acquired, pool) = waitFor acquireRead(cluster)
+    check acquired == primaryConn
+    check pool == cluster.primary
 
   test "fallbackPrimary fallback when replica pool is closed":
     let cluster = makeCluster(fallback = fallbackPrimary)
