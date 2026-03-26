@@ -1723,6 +1723,12 @@ suite "PgInterval":
     let v = PgInterval(months: -14, days: -3, microseconds: -14706123456)
     check $v == "-1 year -2 mons -3 days -04:05:06.123456"
 
+  test "$ int64.min microseconds does not overflow":
+    let v = PgInterval(months: 0, days: 0, microseconds: int64.low)
+    let s = $v
+    check s.len > 0
+    check s.startsWith("-")
+
   test "$ plural vs singular":
     check $PgInterval(months: 12, days: 0, microseconds: 0) == "1 year"
     check $PgInterval(months: 24, days: 0, microseconds: 0) == "2 years"

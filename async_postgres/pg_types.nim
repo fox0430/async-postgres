@@ -510,7 +510,10 @@ proc `$`*(v: PgInterval): string =
   var us = v.microseconds
   let neg = us < 0
   if neg:
-    us = -us
+    if us == int64.low:
+      us = int64.high # -int64.min overflows; clamp to int64.max
+    else:
+      us = -us
   let hours = us div 3_600_000_000
   us = us mod 3_600_000_000
   let mins = us div 60_000_000
