@@ -398,6 +398,26 @@ suite "Pool active count tracking":
     discard waitFor pool.acquire()
     check pool.active == 1
 
+  test "double release of broken connection does not underflow active":
+    let pool = makePool()
+    let conn = mockConn(csClosed)
+    pool.active = 1
+    pool.release(conn)
+    check pool.active == 0
+    pool.release(conn)
+    check pool.active == 0
+
+  test "double release of normal connection does not underflow active":
+    let pool = makePool()
+    let conn = mockConn()
+    pool.active = 1
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 1
+    # Second release — conn is now in idle, but active is already 0
+    pool.release(conn)
+    check pool.active == 0
+
   test "waiter transfer preserves active count":
     let pool = makePool(maxSize = 1)
     pool.active = 1

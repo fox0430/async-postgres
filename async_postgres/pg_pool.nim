@@ -236,7 +236,8 @@ proc release*(pool: PgPool, conn: PgConnection) =
   ## transaction, it is closed instead. If waiters are queued, the connection
   ## is handed directly to the next waiter.
   if pool.closed or conn.state != csReady or conn.txStatus != tsIdle:
-    pool.active.dec
+    if pool.active > 0:
+      pool.active.dec
     conn.closeNoWait()
     return
 
@@ -247,7 +248,8 @@ proc release*(pool: PgPool, conn: PgConnection) =
     pool.waiterCount.dec
     waiter.fut.complete(conn)
     return
-  pool.active.dec
+  if pool.active > 0:
+    pool.active.dec
   pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
 
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
