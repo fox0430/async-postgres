@@ -293,6 +293,8 @@ proc decodeInt32*(buf: openArray[byte], offset: int): int32 =
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at the given offset. Returns (string, bytes consumed).
+  if offset > buf.len:
+    raise newException(ProtocolError, "decodeCString: offset past end of buffer")
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
