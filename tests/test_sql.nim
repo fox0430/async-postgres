@@ -156,3 +156,18 @@ suite "sql macro":
     let sq = sql"SELECT $fn${hello}$fn$ WHERE id = {x}"
     check sq.query == "SELECT $fn${hello}$fn$ WHERE id = $1"
     check sq.params.len == 1
+
+  test "expression containing char literal with closing brace":
+    let sq = sql"SELECT {(if '}' == '}': 1'i32 else: 0'i32)}"
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
+
+  test "expression containing string literal with closing brace":
+    let sq = sql"""SELECT {"}".len.int32}"""
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
+
+  test "expression containing string literal with escaped quote and brace":
+    let sq = sql"""SELECT {"\"}".len.int32}"""
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
