@@ -124,3 +124,13 @@ suite "SCRAM-SHA-256":
     let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=10000001"
     expect CatchableError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+  test "scramClientFinalMessage rejects invalid base64 salt":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=!!!invalid!!!,i=4096"
+    expect CatchableError:
+      discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramVerifyServerFinal rejects invalid base64 signature":
+    var state: ScramState
+    check scramVerifyServerFinal(toBytes("v=!!!invalid!!!"), state) == false

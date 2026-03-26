@@ -89,7 +89,11 @@ proc scramClientFinalMessage*(
       CatchableError, "SCRAM: server nonce doesn't start with client nonce"
     )
 
-  let salt = base64.decode(saltB64)
+  let salt =
+    try:
+      base64.decode(saltB64)
+    except ValueError:
+      raise newException(CatchableError, "SCRAM: invalid base64 in salt")
   let saltedPassword = sha256.pbkdf2(password, salt, iterations, 32)
   let clientKey = sha256.hmac(saltedPassword, "Client Key").data
   let storedKey = sha256.digest(clientKey).data
@@ -114,7 +118,11 @@ proc scramVerifyServerFinal*(
   let serverFinalMsg = toString(serverFinalData)
   if not serverFinalMsg.startsWith("v="):
     return false
-  let sig = base64.decode(serverFinalMsg[2 .. ^1])
+  let sig =
+    try:
+      base64.decode(serverFinalMsg[2 .. ^1])
+    except ValueError:
+      return false
   if sig.len != 32:
     return false
   var diff: byte = 0
