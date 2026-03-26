@@ -659,9 +659,15 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[seq[byte]]): seq[byte] =
   ## Encode a 1-dimensional PostgreSQL binary array.
   ## Header: ndim(4) + has_null(4) + elem_oid(4) + dim_len(4) + lower_bound(4) = 20 bytes
   ## Each element: len(4) + data
+  if elements.len > int32.high.int:
+    raise
+      newException(PgError, "Array has too many elements for PostgreSQL binary format")
   let headerSize = 20
   var dataSize = 0
   for e in elements:
+    if e.len > int32.high.int:
+      raise
+        newException(PgError, "Array element too large for PostgreSQL binary format")
     dataSize += 4 + e.len
   result = newSeq[byte](headerSize + dataSize)
   # ndim = 1
