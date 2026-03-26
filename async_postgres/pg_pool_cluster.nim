@@ -39,8 +39,11 @@ proc isClosed*(cluster: PgPoolCluster): bool =
   ## Whether the cluster has been closed.
   cluster.closed
 
-proc fallbackTimeoutDuration*(cluster: PgPoolCluster): Duration =
-  ## The configured fallback timeout.
+proc fallbackTimeout*(cluster: PgPoolCluster): Duration =
+  ## The configured fallback timeout for read operations.
+  ## When `fallbackPrimary` is set and the replica acquire fails, this limits
+  ## how long the fallback primary acquire may wait. `ZeroDuration` means the
+  ## primary pool's own `acquireTimeout` is used as-is.
   cluster.fallbackTimeout
 
 proc newPoolCluster*(
@@ -92,7 +95,11 @@ proc acquireRead(
           let conn = await cluster.primary.acquire().wait(cluster.fallbackTimeout)
           return (conn, cluster.primary)
         except AsyncTimeoutError:
-          raise newException(PgPoolError, "Pool cluster fallback acquire timeout")
+          raise newException(
+            PgPoolError,
+            "Pool cluster fallback acquire timeout (replica error: " & e.msg & ")",
+            e,
+          )
       else:
         let conn = await cluster.primary.acquire()
         return (conn, cluster.primary)
