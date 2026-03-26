@@ -699,20 +699,27 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
           else: SslCVerifyMode.CVerifyNone
 
         var ctx: SslContext
+        var tmpPath: string
         if config.sslRootCert.len > 0:
-          let (tmpFile, tmpPath) = createTempFile("pg_ca_", ".pem")
+          let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
+          tmpPath = tp
           try:
             tmpFile.write(config.sslRootCert)
             tmpFile.close()
             ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
-          finally:
+          except:
             removeFile(tmpPath)
+            raise
         else:
           ctx = newContext(verifyMode = verifyMode)
 
-        let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
-        wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
-        conn.sslEnabled = true
+        try:
+          let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
+          wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
+          conn.sslEnabled = true
+        finally:
+          if tmpPath.len > 0:
+            removeFile(tmpPath)
       else:
         raise
           newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
