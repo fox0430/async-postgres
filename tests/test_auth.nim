@@ -89,3 +89,31 @@ suite "SCRAM-SHA-256":
     let serverFirst = "r=differentNonce,s=c2FsdA==,i=4096"
     expect CatchableError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage rejects missing salt":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,i=4096"
+    expect CatchableError:
+      discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage rejects missing iteration count":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=c2FsdA=="
+    expect CatchableError:
+      discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage rejects invalid iteration count":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=abc"
+    expect CatchableError:
+      discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage rejects zero iteration count":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=0"
+    expect CatchableError:
+      discard scramClientFinalMessage("password", toBytes(serverFirst), state)
