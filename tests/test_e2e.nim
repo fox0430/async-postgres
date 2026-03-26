@@ -3741,6 +3741,34 @@ when hasChronos:
 
       waitFor t()
 
+    test "concurrent waitNotification raises error":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        await listener.listen("wait_concurrent")
+
+        let waitFut1 = listener.waitNotification()
+        await sleepAsync(milliseconds(10))
+        doAssert not waitFut1.finished
+
+        var raised = false
+        try:
+          discard await listener.waitNotification()
+        except PgError:
+          raised = true
+        doAssert raised
+
+        # Clean up: complete the first waiter by sending a notification
+        let sender = await connect(plainConfig())
+        discard await sender.query("NOTIFY wait_concurrent, 'done'")
+        let notif = await waitFut1
+        doAssert notif.channel == "wait_concurrent"
+        doAssert notif.payload == "done"
+
+        await sender.close()
+        await listener.close()
+
+      waitFor t()
+
 suite "E2E: Array Types":
   test "int4 array roundtrip":
     proc t() {.async.} =
