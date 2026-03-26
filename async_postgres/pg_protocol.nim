@@ -258,6 +258,8 @@ proc addInt32*(buf: var seq[byte], val: int32) {.inline.} =
 
 proc patchLen*(buf: var seq[byte], offset: int = 1) =
   ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
+  doAssert offset >= 0 and offset + 3 < buf.len,
+    "patchLen: offset " & $offset & " out of range for buf.len " & $buf.len
   let length = int32(buf.high)
   buf[offset] = byte((length shr 24) and 0xFF)
   buf[offset + 1] = byte((length shr 16) and 0xFF)
@@ -267,6 +269,8 @@ proc patchLen*(buf: var seq[byte], offset: int = 1) =
 proc patchMsgLen*(buf: var seq[byte], msgStart: int) {.inline.} =
   ## Patch the length field of a message starting at `msgStart`.
   ## Length = total message size minus the type byte.
+  doAssert msgStart >= 0 and msgStart + 4 < buf.len,
+    "patchMsgLen: msgStart " & $msgStart & " out of range for buf.len " & $buf.len
   let length = int32(buf.len - msgStart - 1)
   buf[msgStart + 1] = byte((length shr 24) and 0xFF)
   buf[msgStart + 2] = byte((length shr 16) and 0xFF)
