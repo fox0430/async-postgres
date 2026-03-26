@@ -1328,6 +1328,10 @@ proc decodeBinaryComposite*(
 # Row/RowData types are defined in pg_protocol and re-exported here.
 
 proc cellInfo(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  if col < 0 or col >= int(row.data.numCols):
+    raise newException(
+      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+    )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   result.off = int(row.data.cellIndex[idx])
   result.len = int(row.data.cellIndex[idx + 1])
