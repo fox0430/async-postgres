@@ -210,11 +210,35 @@ macro sql*(queryStr: static[string]): untyped =
           var depth = 1
           var j = start
           while j < queryStr.len and depth > 0:
-            if queryStr[j] == '{':
+            let ch = queryStr[j]
+            if ch == '\'':
+              # Nim char literal: skip 'x' or '\x'
+              inc j
+              if j < queryStr.len and queryStr[j] == '\\':
+                j += min(2, queryStr.len - j)
+              elif j < queryStr.len:
+                inc j
+              if j < queryStr.len and queryStr[j] == '\'':
+                inc j
+            elif ch == '"':
+              # Nim string literal: skip until closing " (handle \" escape)
+              inc j
+              while j < queryStr.len:
+                if queryStr[j] == '\\':
+                  j += min(2, queryStr.len - j)
+                elif queryStr[j] == '"':
+                  inc j
+                  break
+                else:
+                  inc j
+            elif ch == '{':
               inc depth
-            elif queryStr[j] == '}':
+              inc j
+            elif ch == '}':
               dec depth
-            if depth > 0:
+              if depth > 0:
+                inc j
+            else:
               inc j
           if depth != 0:
             error("Unmatched '{' in sql string at position " & $i)
