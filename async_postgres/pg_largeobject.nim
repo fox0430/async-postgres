@@ -255,7 +255,12 @@ proc loWriteAll*(
   while offset < data.len:
     let endIdx = min(offset + chunkSize, data.len)
     let chunk = data[offset ..< endIdx]
-    discard await lo.loWrite(chunk, timeout)
+    let written = await lo.loWrite(chunk, timeout)
+    if written != int32(chunk.len):
+      raise newException(
+        CatchableError,
+        "loWriteAll: partial write (" & $written & "/" & $chunk.len & " bytes)",
+      )
     offset = endIdx
 
 proc loSize*(
