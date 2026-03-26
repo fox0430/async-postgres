@@ -1511,7 +1511,8 @@ proc getInt64*(row: Row, col: int): int64 =
       let b = row.data.buf
       return int64(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
   var v: BiggestInt
-  discard parseBiggestInt(row.bufView(off, clen), v)
+  if parseBiggestInt(row.bufView(off, clen), v) == 0:
+    raise newException(PgTypeError, "Column " & $col & ": invalid int64 value")
   result = v
 
 proc getFloat*(row: Row, col: int): float64 =
