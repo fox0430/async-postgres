@@ -113,7 +113,7 @@ proc scramVerifyServerFinal*(
   let sig = base64.decode(serverFinalMsg[2 .. ^1])
   if sig.len != 32:
     return false
+  var diff: byte = 0
   for i in 0 ..< 32:
-    if byte(sig[i]) != state.serverSignature[i]:
-      return false
-  return true
+    diff = diff or (byte(sig[i]) xor state.serverSignature[i])
+  return diff == 0
