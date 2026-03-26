@@ -1449,6 +1449,8 @@ proc waitNotification*(
   conn.checkListenAlive()
   if conn.notifyQueue.len > 0:
     return conn.notifyQueue.popFirst()
+  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+    raise newException(PgError, "Another waitNotification is already active")
   conn.notifyWaiter = newFuture[void]("waitNotification")
   try:
     if timeout > ZeroDuration:
