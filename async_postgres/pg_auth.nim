@@ -80,6 +80,9 @@ proc scramClientFinalMessage*(
     )
   if iterations <= 0:
     raise newException(CatchableError, "SCRAM: iteration count must be positive")
+  if iterations > 10_000_000:
+    raise
+      newException(CatchableError, "SCRAM: iteration count too large: " & $iterations)
 
   if not combinedNonce.startsWith(state.clientNonce):
     raise newException(
