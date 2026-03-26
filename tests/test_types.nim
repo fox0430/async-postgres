@@ -258,6 +258,13 @@ suite "Row accessors":
     check not row.isNull(0)
     check row.isNull(1)
 
+  test "column index out of range raises IndexDefect":
+    let row = @[some(toBytes("hello"))]
+    expect IndexDefect:
+      discard row.getStr(1)
+    expect IndexDefect:
+      discard row.getStr(-1)
+
   test "getInt":
     let row = @[some(toBytes("42"))]
     check row.getInt(0) == 42'i32
