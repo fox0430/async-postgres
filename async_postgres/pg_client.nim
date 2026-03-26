@@ -2431,6 +2431,8 @@ proc closeCursorImpl(
   batch.addSync()
   await conn.sendMsg(batch)
 
+  var queryError: ref PgQueryError
+
   block recvLoop:
     while true:
       while (let opt = conn.nextMessage(); opt.isSome):
@@ -2438,9 +2440,13 @@ proc closeCursorImpl(
         case msg.kind
         of bmkCloseComplete:
           discard
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
           conn.state = csReady
+          if queryError != nil:
+            raise queryError
           break recvLoop
         else:
           discard
