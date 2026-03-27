@@ -44,22 +44,22 @@ proc toPooled(conn: PgConnection): PooledConn =
 suite "initConnConfig":
   test "defaults":
     let cfg = initConnConfig()
-    check cfg.host == "127.0.0.1"
-    check cfg.port == 5432
-    check cfg.user == ""
-    check cfg.password == ""
-    check cfg.database == ""
-    check cfg.sslMode == sslDisable
-    check cfg.sslRootCert == ""
-    check cfg.applicationName == ""
-    check cfg.connectTimeout == ZeroDuration
-    check cfg.keepAlive == true
-    check cfg.keepAliveIdle == 0
-    check cfg.keepAliveInterval == 0
-    check cfg.keepAliveCount == 0
-    check cfg.hosts.len == 0
-    check cfg.targetSessionAttrs == tsaAny
-    check cfg.extraParams.len == 0
+    doAssert cfg.host == "127.0.0.1"
+    doAssert cfg.port == 5432
+    doAssert cfg.user == ""
+    doAssert cfg.password == ""
+    doAssert cfg.database == ""
+    doAssert cfg.sslMode == sslDisable
+    doAssert cfg.sslRootCert == ""
+    doAssert cfg.applicationName == ""
+    doAssert cfg.connectTimeout == ZeroDuration
+    doAssert cfg.keepAlive == true
+    doAssert cfg.keepAliveIdle == 0
+    doAssert cfg.keepAliveInterval == 0
+    doAssert cfg.keepAliveCount == 0
+    doAssert cfg.hosts.len == 0
+    doAssert cfg.targetSessionAttrs == tsaAny
+    doAssert cfg.extraParams.len == 0
 
   test "custom overrides":
     let cfg = initConnConfig(
@@ -73,19 +73,19 @@ suite "initConnConfig":
       keepAlive = false,
       targetSessionAttrs = tsaPrimary,
     )
-    check cfg.host == "db.example.com"
-    check cfg.port == 15432
-    check cfg.user == "admin"
-    check cfg.password == "secret"
-    check cfg.database == "mydb"
-    check cfg.sslMode == sslRequire
-    check cfg.applicationName == "myapp"
-    check cfg.keepAlive == false
-    check cfg.targetSessionAttrs == tsaPrimary
+    doAssert cfg.host == "db.example.com"
+    doAssert cfg.port == 15432
+    doAssert cfg.user == "admin"
+    doAssert cfg.password == "secret"
+    doAssert cfg.database == "mydb"
+    doAssert cfg.sslMode == sslRequire
+    doAssert cfg.applicationName == "myapp"
+    doAssert cfg.keepAlive == false
+    doAssert cfg.targetSessionAttrs == tsaPrimary
     # Non-overridden fields keep defaults
-    check cfg.sslRootCert == ""
-    check cfg.connectTimeout == ZeroDuration
-    check cfg.keepAliveIdle == 0
+    doAssert cfg.sslRootCert == ""
+    doAssert cfg.connectTimeout == ZeroDuration
+    doAssert cfg.keepAliveIdle == 0
 
   test "with multi-host":
     let cfg = initConnConfig(
@@ -95,41 +95,41 @@ suite "initConnConfig":
       ],
       targetSessionAttrs = tsaPreferStandby,
     )
-    check cfg.hosts.len == 2
-    check cfg.hosts[0].host == "primary.db"
-    check cfg.hosts[0].port == 5432
-    check cfg.hosts[1].host == "replica.db"
-    check cfg.hosts[1].port == 5433
-    check cfg.targetSessionAttrs == tsaPreferStandby
+    doAssert cfg.hosts.len == 2
+    doAssert cfg.hosts[0].host == "primary.db"
+    doAssert cfg.hosts[0].port == 5432
+    doAssert cfg.hosts[1].host == "replica.db"
+    doAssert cfg.hosts[1].port == 5433
+    doAssert cfg.targetSessionAttrs == tsaPreferStandby
 
   test "with extra params":
     let cfg = initConnConfig(
       extraParams = @[("statement_timeout", "5000"), ("lock_timeout", "3000")]
     )
-    check cfg.extraParams.len == 2
-    check cfg.extraParams[0] == ("statement_timeout", "5000")
-    check cfg.extraParams[1] == ("lock_timeout", "3000")
+    doAssert cfg.extraParams.len == 2
+    doAssert cfg.extraParams[0] == ("statement_timeout", "5000")
+    doAssert cfg.extraParams[1] == ("lock_timeout", "3000")
 
   test "composable with initPoolConfig":
     let connCfg = initConnConfig(host = "localhost", user = "test", database = "test")
     let poolCfg = initPoolConfig(connCfg, minSize = 2, maxSize = 5)
-    check poolCfg.connConfig.host == "localhost"
-    check poolCfg.connConfig.user == "test"
-    check poolCfg.minSize == 2
-    check poolCfg.maxSize == 5
+    doAssert poolCfg.connConfig.host == "localhost"
+    doAssert poolCfg.connConfig.user == "test"
+    doAssert poolCfg.minSize == 2
+    doAssert poolCfg.maxSize == 5
 
 suite "initPoolConfig":
   test "defaults":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
-    check cfg.minSize == 1
-    check cfg.maxSize == 10
-    check cfg.idleTimeout == minutes(10)
-    check cfg.maxLifetime == hours(1)
-    check cfg.maintenanceInterval == seconds(30)
-    check cfg.healthCheckTimeout == seconds(5)
-    check cfg.pingTimeout == seconds(5)
-    check cfg.acquireTimeout == seconds(30)
-    check cfg.maxWaiters == -1
+    doAssert cfg.minSize == 1
+    doAssert cfg.maxSize == 10
+    doAssert cfg.idleTimeout == minutes(10)
+    doAssert cfg.maxLifetime == hours(1)
+    doAssert cfg.maintenanceInterval == seconds(30)
+    doAssert cfg.healthCheckTimeout == seconds(5)
+    doAssert cfg.pingTimeout == seconds(5)
+    doAssert cfg.acquireTimeout == seconds(30)
+    doAssert cfg.maxWaiters == -1
 
   test "custom overrides":
     let cfg = initPoolConfig(
@@ -139,13 +139,13 @@ suite "initPoolConfig":
       idleTimeout = minutes(5),
       acquireTimeout = seconds(10),
     )
-    check cfg.minSize == 5
-    check cfg.maxSize == 20
-    check cfg.idleTimeout == minutes(5)
-    check cfg.acquireTimeout == seconds(10)
+    doAssert cfg.minSize == 5
+    doAssert cfg.maxSize == 20
+    doAssert cfg.idleTimeout == minutes(5)
+    doAssert cfg.acquireTimeout == seconds(10)
     # Non-overridden fields keep defaults
-    check cfg.maxLifetime == hours(1)
-    check cfg.healthCheckTimeout == seconds(5)
+    doAssert cfg.maxLifetime == hours(1)
+    doAssert cfg.healthCheckTimeout == seconds(5)
 
   test "validation: minSize < 0":
     expect(ValueError):
@@ -167,7 +167,7 @@ suite "initPoolConfig":
 
   test "validation: minSize = 0 is valid":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432), minSize = 0)
-    check cfg.minSize == 0
+    doAssert cfg.minSize == 0
 
 suite "Pool release":
   test "release to idle queue":
@@ -175,9 +175,9 @@ suite "Pool release":
     let conn = mockConn()
     pool.active = 1
     pool.release(conn)
-    check pool.active == 0
-    check pool.idle.len == 1
-    check pool.idle[0].conn == conn
+    doAssert pool.active == 0
+    doAssert pool.idle.len == 1
+    doAssert pool.idle[0].conn == conn
 
   test "release transfers to waiter":
     let pool = makePool()
@@ -187,11 +187,11 @@ suite "Pool release":
     pool.waiterCount = 1
     let conn = mockConn()
     pool.release(conn)
-    check pool.active == 2
-    check pool.waiters.len == 0
-    check pool.waiterCount == 0
-    check fut.finished
-    check fut.read() == conn
+    doAssert pool.active == 2
+    doAssert pool.waiters.len == 0
+    doAssert pool.waiterCount == 0
+    doAssert fut.finished
+    doAssert fut.read() == conn
 
   test "release skips cancelled waiters and returns to idle":
     let pool = makePool()
@@ -203,10 +203,10 @@ suite "Pool release":
     pool.waiters.addLast(cancelled2)
     let conn = mockConn()
     pool.release(conn)
-    check pool.active == 0
-    check pool.idle.len == 1
-    check pool.idle[0].conn == conn
-    check pool.waiters.len == 0
+    doAssert pool.active == 0
+    doAssert pool.idle.len == 1
+    doAssert pool.idle[0].conn == conn
+    doAssert pool.waiters.len == 0
 
   test "release skips cancelled waiters and delivers to next valid":
     let pool = makePool()
@@ -219,19 +219,19 @@ suite "Pool release":
     pool.waiterCount = 1
     let conn = mockConn()
     pool.release(conn)
-    check pool.active == 2
-    check pool.waiterCount == 0
-    check pool.idle.len == 0
-    check validFut.finished
-    check validFut.read() == conn
+    doAssert pool.active == 2
+    doAssert pool.waiterCount == 0
+    doAssert pool.idle.len == 0
+    doAssert validFut.finished
+    doAssert validFut.read() == conn
 
   test "release broken connection decrements active":
     let pool = makePool()
     pool.active = 1
     let conn = mockConn(csClosed)
     pool.release(conn)
-    check pool.active == 0
-    check pool.idle.len == 0
+    doAssert pool.active == 0
+    doAssert pool.idle.len == 0
 
   test "release to closed pool decrements active":
     let pool = makePool()
@@ -239,8 +239,8 @@ suite "Pool release":
     pool.closed = true
     let conn = mockConn()
     pool.release(conn)
-    check pool.active == 0
-    check pool.idle.len == 0
+    doAssert pool.active == 0
+    doAssert pool.idle.len == 0
 
   test "release stores PooledConn with cachedNow as lastUsedAt":
     let pool = makePool()
@@ -248,9 +248,9 @@ suite "Pool release":
     pool.cachedNow = Moment.now()
     let conn = mockConn()
     pool.release(conn)
-    check pool.idle.len == 1
-    check pool.idle[0].conn == conn
-    check pool.idle[0].lastUsedAt == pool.cachedNow
+    doAssert pool.idle.len == 1
+    doAssert pool.idle[0].conn == conn
+    doAssert pool.idle[0].lastUsedAt == pool.cachedNow
 
   test "release discards connection in transaction":
     let pool = makePool()
@@ -258,8 +258,8 @@ suite "Pool release":
     let conn = mockConn()
     conn.txStatus = tsInTransaction
     pool.release(conn)
-    check pool.active == 0
-    check pool.idle.len == 0
+    doAssert pool.active == 0
+    doAssert pool.idle.len == 0
 
   test "release discards connection in failed transaction":
     let pool = makePool()
@@ -267,8 +267,8 @@ suite "Pool release":
     let conn = mockConn()
     conn.txStatus = tsInFailedTransaction
     pool.release(conn)
-    check pool.active == 0
-    check pool.idle.len == 0
+    doAssert pool.active == 0
+    doAssert pool.idle.len == 0
 
 suite "Pool resetSession":
   test "resetSession is no-op when resetQuery is empty":
@@ -277,15 +277,15 @@ suite "Pool resetSession":
     conn.stmtCacheCapacity = 256
     conn.addStmtCache("SELECT 1", CachedStmt(name: "_sc_1"))
     waitFor pool.resetSession(conn)
-    check conn.state == csReady
-    check conn.stmtCache.len == 1 # not cleared
+    doAssert conn.state == csReady
+    doAssert conn.stmtCache.len == 1 # not cleared
 
   test "resetSession skips broken connection":
     let pool = makePool()
     pool.config.resetQuery = "DISCARD ALL"
     let conn = mockConn(csClosed)
     waitFor pool.resetSession(conn)
-    check conn.state == csClosed # unchanged
+    doAssert conn.state == csClosed # unchanged
 
   test "resetSession skips connection in transaction":
     let pool = makePool()
@@ -293,17 +293,17 @@ suite "Pool resetSession":
     let conn = mockConn()
     conn.txStatus = tsInTransaction
     waitFor pool.resetSession(conn)
-    check conn.state == csReady # unchanged, not closed
+    doAssert conn.state == csReady # unchanged, not closed
 
   test "resetQuery field in initPoolConfig":
     let cfg = initPoolConfig(
       ConnConfig(host: "localhost", port: 5432), resetQuery = "DISCARD ALL"
     )
-    check cfg.resetQuery == "DISCARD ALL"
+    doAssert cfg.resetQuery == "DISCARD ALL"
 
   test "resetQuery defaults to empty":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
-    check cfg.resetQuery == ""
+    doAssert cfg.resetQuery == ""
 
 suite "Pool acquire":
   test "acquire from idle":
@@ -312,9 +312,9 @@ suite "Pool acquire":
     pool.idle.addLast(conn.toPooled())
 
     let acquired = waitFor pool.acquire()
-    check acquired == conn
-    check pool.active == 1
-    check pool.idle.len == 0
+    doAssert acquired == conn
+    doAssert pool.active == 1
+    doAssert pool.idle.len == 0
 
   test "acquire skips broken connections":
     let pool = makePool()
@@ -324,9 +324,9 @@ suite "Pool acquire":
     pool.idle.addLast(good.toPooled())
 
     let acquired = waitFor pool.acquire()
-    check acquired == good
-    check pool.active == 1
-    check pool.idle.len == 0
+    doAssert acquired == good
+    doAssert pool.active == 1
+    doAssert pool.idle.len == 0
 
   test "acquire skips maxLifetime-expired connections":
     let pool = makePool()
@@ -340,22 +340,22 @@ suite "Pool acquire":
     pool.idle.addLast(good.toPooled())
 
     let acquired = waitFor pool.acquire()
-    check acquired == good
-    check pool.active == 1
-    check pool.idle.len == 0
+    doAssert acquired == good
+    doAssert pool.active == 1
+    doAssert pool.idle.len == 0
 
   test "acquire registers waiter when at max":
     let pool = makePool(maxSize = 1)
     pool.active = 1
 
     let acquireFut = pool.acquire()
-    check not acquireFut.finished
-    check pool.waiters.len == 1
+    doAssert not acquireFut.finished
+    doAssert pool.waiters.len == 1
 
     let conn = mockConn()
     pool.release(conn)
     let acquired = waitFor acquireFut
-    check acquired == conn
+    doAssert acquired == conn
 
 suite "Pool close":
   test "close cancels waiters":
@@ -366,10 +366,10 @@ suite "Pool close":
     pool.waiterCount = 1
 
     waitFor pool.close()
-    check pool.closed
-    check pool.waiters.len == 0
-    check pool.waiterCount == 0
-    check fut.finished
+    doAssert pool.closed
+    doAssert pool.waiters.len == 0
+    doAssert pool.waiterCount == 0
+    doAssert fut.finished
 
   test "close drains idle connections":
     let pool = makePool()
@@ -379,13 +379,13 @@ suite "Pool close":
     pool.idle.addLast(conn2.toPooled())
 
     waitFor pool.close()
-    check pool.closed
-    check pool.idle.len == 0
+    doAssert pool.closed
+    doAssert pool.idle.len == 0
 
   test "close empty pool":
     let pool = makePool()
     waitFor pool.close()
-    check pool.closed
+    doAssert pool.closed
 
 suite "Pool active count tracking":
   test "release then acquire roundtrip":
@@ -393,43 +393,43 @@ suite "Pool active count tracking":
     let conn = mockConn()
     pool.active = 1
     pool.release(conn)
-    check pool.active == 0
+    doAssert pool.active == 0
 
     discard waitFor pool.acquire()
-    check pool.active == 1
+    doAssert pool.active == 1
 
   test "double release of broken connection does not underflow active":
     let pool = makePool()
     let conn = mockConn(csClosed)
     pool.active = 1
     pool.release(conn)
-    check pool.active == 0
+    doAssert pool.active == 0
     pool.release(conn)
-    check pool.active == 0
+    doAssert pool.active == 0
 
   test "double release of normal connection does not underflow active":
     let pool = makePool()
     let conn = mockConn()
     pool.active = 1
     pool.release(conn)
-    check pool.active == 0
-    check pool.idle.len == 1
+    doAssert pool.active == 0
+    doAssert pool.idle.len == 1
     # Second release — conn is now in idle, but active is already 0
     pool.release(conn)
-    check pool.active == 0
+    doAssert pool.active == 0
 
   test "waiter transfer preserves active count":
     let pool = makePool(maxSize = 1)
     pool.active = 1
     let acquireFut = pool.acquire()
-    check pool.active == 1
+    doAssert pool.active == 1
 
     let conn = mockConn()
     pool.release(conn)
-    check pool.active == 1
+    doAssert pool.active == 1
 
     discard waitFor acquireFut
-    check pool.active == 1
+    doAssert pool.active == 1
 
 when hasChronos:
   proc makeHangingConn(): Future[(PgConnection, StreamServer, StreamTransport)] {.
@@ -511,8 +511,8 @@ when hasChronos:
       waitFor conn.ping()
     except PgError as e:
       msg = e.msg
-    check "not established" in msg
-    check conn.state == csClosed
+    doAssert "not established" in msg
+    doAssert conn.state == csClosed
 
   test "ping with timeout on nil writer raises PgError (not timeout error)":
     let conn = mockConn()
@@ -521,11 +521,11 @@ when hasChronos:
       waitFor conn.ping(timeout = seconds(5))
     except PgError as e:
       msg = e.msg
-    check "not established" in msg
-    check conn.state == csClosed
+    doAssert "not established" in msg
+    doAssert conn.state == csClosed
 
 when hasChronos:
-  suite "Health check on acquire":
+  suite "Health doAssert on acquire":
     test "fresh connection skips health check":
       let pool = makePool()
       pool.config.healthCheckTimeout = seconds(60)
@@ -533,10 +533,10 @@ when hasChronos:
       pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
 
       let acquired = waitFor pool.acquire()
-      check acquired == conn
-      check pool.active == 1
+      doAssert acquired == conn
+      doAssert pool.active == 1
 
-    test "stale connection fails health check and is discarded":
+    test "stale connection fails health doAssert and is discarded":
       let pool = makePool()
       pool.config.healthCheckTimeout = milliseconds(10)
       # Stale connection (no transport -> ping will raise)
@@ -548,19 +548,19 @@ when hasChronos:
       pool.idle.addLast(PooledConn(conn: good, lastUsedAt: Moment.now()))
 
       let acquired = waitFor pool.acquire()
-      check acquired == good
-      check pool.active == 1
-      check pool.idle.len == 0
+      doAssert acquired == good
+      doAssert pool.active == 1
+      doAssert pool.idle.len == 0
 
-    test "disabled health check skips ping":
+    test "disabled health doAssert skips ping":
       let pool = makePool()
       # healthCheckTimeout = ZeroDuration (default in makePool) -> disabled
       let conn = mockConn()
       pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now() - hours(1)))
 
       let acquired = waitFor pool.acquire()
-      check acquired == conn
-      check pool.active == 1
+      doAssert acquired == conn
+      doAssert pool.active == 1
 
     test "acquire discards connection that fails ping timeout":
       proc t() {.async.} =
@@ -568,7 +568,7 @@ when hasChronos:
         pool.config.healthCheckTimeout = seconds(60)
         pool.config.pingTimeout = milliseconds(50)
 
-        # Hanging connection: idle > 60s -> triggers health check -> times out
+        # Hanging connection: idle > 60s -> triggers health doAssert -> times out
         let (hanging, server, serverTransport) = await makeHangingConn()
         pool.idle.addLast(
           PooledConn(conn: hanging, lastUsedAt: Moment.now() - minutes(2))
@@ -588,7 +588,7 @@ when hasChronos:
 
       waitFor t()
 
-    test "all stale connections fail health check then creates new":
+    test "all stale connections fail health doAssert then creates new":
       let pool = makePool()
       pool.config.healthCheckTimeout = milliseconds(1)
       let stale1 = mockConn()
@@ -597,10 +597,10 @@ when hasChronos:
       pool.idle.addLast(PooledConn(conn: stale2, lastUsedAt: Moment.now() - seconds(1)))
 
       # No good idle connections and no real server -> acquire will try connect() and fail
-      check pool.idle.len == 2
+      doAssert pool.idle.len == 2
       expect(CatchableError):
         discard waitFor pool.acquire()
-      check pool.idle.len == 0
+      doAssert pool.idle.len == 0
 
 suite "Max waiters":
   test "maxWaiters -1 allows unlimited waiters":
@@ -610,7 +610,7 @@ suite "Max waiters":
     var futs: seq[Future[PgConnection]]
     for i in 0 ..< 100:
       futs.add(pool.acquire())
-    check pool.waiters.len == 100
+    doAssert pool.waiters.len == 100
 
     # Clean up: release connections to satisfy all waiters
     for f in futs:
@@ -626,7 +626,7 @@ suite "Max waiters":
 
     expect(PgError):
       discard waitFor pool.acquire()
-    check pool.waiters.len == 0
+    doAssert pool.waiters.len == 0
 
   test "maxWaiters rejects when queue is full":
     let pool = makePool(maxSize = 1)
@@ -636,7 +636,7 @@ suite "Max waiters":
     # First two waiters should succeed
     let fut1 = pool.acquire()
     let fut2 = pool.acquire()
-    check pool.waiters.len == 2
+    doAssert pool.waiters.len == 2
 
     # Third should be rejected immediately
     var msg = ""
@@ -645,8 +645,8 @@ suite "Max waiters":
     except PgError as e:
       msg = e.msg
 
-    check "queue full" in msg.toLowerAscii()
-    check pool.waiters.len == 2
+    doAssert "queue full" in msg.toLowerAscii()
+    doAssert pool.waiters.len == 2
 
     # Clean up
     pool.release(mockConn())
@@ -660,12 +660,12 @@ suite "Max waiters":
     pool.active = 1
 
     let fut1 = pool.acquire()
-    check pool.waiters.len == 1
+    doAssert pool.waiters.len == 1
 
     expect(PgError):
       discard waitFor pool.acquire()
 
-    check pool.waiters.len == 1
+    doAssert pool.waiters.len == 1
 
     # Clean up
     pool.release(mockConn())
@@ -678,17 +678,17 @@ suite "Max waiters":
 
     # First waiter
     let fut1 = pool.acquire()
-    check pool.waiters.len == 1
+    doAssert pool.waiters.len == 1
 
     # Resolve it
     pool.release(mockConn())
     discard waitFor fut1
-    check pool.waiters.len == 0
+    doAssert pool.waiters.len == 0
 
     # Now another waiter should be allowed
     pool.active = 1
     let fut2 = pool.acquire()
-    check pool.waiters.len == 1
+    doAssert pool.waiters.len == 1
 
     # Clean up
     pool.release(mockConn())
@@ -700,14 +700,14 @@ suite "Max waiters":
     pool.active = 1
 
     discard pool.acquire() # fills the waiter queue
-    check pool.active == 1
+    doAssert pool.active == 1
 
     try:
       discard waitFor pool.acquire()
     except PgError:
       discard
 
-    check pool.active == 1
+    doAssert pool.active == 1
 
 suite "Acquire timeout":
   test "acquire timeout raises PgError when pool is exhausted":
@@ -994,7 +994,7 @@ suite "Error type granularity":
       caught = true
     except PgError:
       discard
-    check caught
+    doAssert caught
 
   test "maxWaiters full raises PgPoolError":
     let pool = makePool(maxSize = 1)
@@ -1010,7 +1010,7 @@ suite "Error type granularity":
       caught = true
     except PgError:
       discard
-    check caught
+    doAssert caught
 
     # Clean up
     pool.release(mockConn())
@@ -1040,4 +1040,4 @@ suite "Error type granularity":
       discard waitFor pool.acquire()
     except PgError:
       caught = true
-    check caught
+    doAssert caught

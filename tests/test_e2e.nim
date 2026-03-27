@@ -2837,7 +2837,7 @@ suite "E2E: Pool Stress":
           maxSize: 3,
           acquireTimeout: seconds(10),
           maintenanceInterval: seconds(30),
-          # Health check with very short idle threshold so acquire pings the connection
+          # Health doAssert with very short idle threshold so acquire pings the connection
           healthCheckTimeout: milliseconds(1),
           pingTimeout: seconds(5),
         )

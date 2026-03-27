@@ -71,8 +71,8 @@ suite "newPoolCluster targetSessionAttrs":
     if rCfg.connConfig.targetSessionAttrs == tsaAny:
       rCfg.connConfig.targetSessionAttrs = tsaPreferStandby
 
-    check pCfg.connConfig.targetSessionAttrs == tsaReadWrite
-    check rCfg.connConfig.targetSessionAttrs == tsaPreferStandby
+    doAssert pCfg.connConfig.targetSessionAttrs == tsaReadWrite
+    doAssert rCfg.connConfig.targetSessionAttrs == tsaPreferStandby
 
   test "preserves explicit targetSessionAttrs":
     var pCfg = PoolConfig(
@@ -89,8 +89,8 @@ suite "newPoolCluster targetSessionAttrs":
     if rCfg.connConfig.targetSessionAttrs == tsaAny:
       rCfg.connConfig.targetSessionAttrs = tsaPreferStandby
 
-    check pCfg.connConfig.targetSessionAttrs == tsaPrimary
-    check rCfg.connConfig.targetSessionAttrs == tsaStandby
+    doAssert pCfg.connConfig.targetSessionAttrs == tsaPrimary
+    doAssert rCfg.connConfig.targetSessionAttrs == tsaStandby
 
 suite "Read routing":
   test "acquireRead returns connection from replica pool":
@@ -99,10 +99,10 @@ suite "Read routing":
     cluster.replica.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
 
     let (acquired, pool) = waitFor acquireRead(cluster)
-    check acquired == conn
-    check pool == cluster.replica
-    check cluster.replica.active == 1
-    check cluster.primary.active == 0
+    doAssert acquired == conn
+    doAssert pool == cluster.replica
+    doAssert cluster.replica.active == 1
+    doAssert cluster.primary.active == 0
 
   test "withReadConnection acquires from replica and releases":
     proc t() {.async.} =
@@ -194,9 +194,9 @@ suite "Fallback":
     )
 
     let (acquired, pool) = waitFor acquireRead(cluster)
-    check acquired == primaryConn
-    check pool == cluster.primary
-    check cluster.primary.active == 1
+    doAssert acquired == primaryConn
+    doAssert pool == cluster.primary
+    doAssert cluster.primary.active == 1
 
     # Clean up
     dummyFut.complete(mockConn())
@@ -212,7 +212,7 @@ suite "Fallback":
     expect(PgError):
       discard waitFor acquireRead(cluster)
 
-    check cluster.primary.active == 0
+    doAssert cluster.primary.active == 0
 
     # Clean up
     dummyFut.complete(mockConn())
@@ -259,8 +259,8 @@ suite "Fallback":
     )
 
     let (acquired, pool) = waitFor acquireRead(cluster)
-    check acquired == primaryConn
-    check pool == cluster.primary
+    doAssert acquired == primaryConn
+    doAssert pool == cluster.primary
 
   test "fallbackPrimary fallback when replica pool is closed":
     let cluster = makeCluster(fallback = fallbackPrimary)
@@ -272,21 +272,21 @@ suite "Fallback":
     )
 
     let (acquired, pool) = waitFor acquireRead(cluster)
-    check acquired == primaryConn
-    check pool == cluster.primary
+    doAssert acquired == primaryConn
+    doAssert pool == cluster.primary
 
 suite "Close":
   test "close sets closed and closes both pools":
     let cluster = makeCluster()
-    check not cluster.closed
-    check not cluster.primary.closed
-    check not cluster.replica.closed
+    doAssert not cluster.closed
+    doAssert not cluster.primary.closed
+    doAssert not cluster.replica.closed
 
     waitFor cluster.close()
 
-    check cluster.closed
-    check cluster.primary.closed
-    check cluster.replica.closed
+    doAssert cluster.closed
+    doAssert cluster.primary.closed
+    doAssert cluster.replica.closed
 
   test "close drains idle from both pools":
     let cluster = makeCluster()
@@ -298,8 +298,8 @@ suite "Close":
     )
 
     waitFor cluster.close()
-    check cluster.primary.idle.len == 0
-    check cluster.replica.idle.len == 0
+    doAssert cluster.primary.idle.len == 0
+    doAssert cluster.replica.idle.len == 0
 
   test "close closes replica even if primary.close raises":
     ## Ensures try/finally guarantees replica cleanup when primary fails.
@@ -315,10 +315,10 @@ suite "Close":
 
     # close() should not propagate the primary error (pool.close catches it)
     waitFor cluster.close()
-    check cluster.closed
-    check cluster.primary.closed
-    check cluster.replica.closed
-    check cluster.replica.idle.len == 0
+    doAssert cluster.closed
+    doAssert cluster.primary.closed
+    doAssert cluster.replica.closed
+    doAssert cluster.replica.idle.len == 0
 
 suite "Write routing":
   ## writeQuery* methods must route to the primary pool, not replica.
