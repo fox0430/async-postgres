@@ -1294,6 +1294,7 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   conn.recvBuf.setLen(0)
   conn.recvBufStart = 0
   conn.clearStmtCache()
+  conn.rowDataBuf = nil
   conn.state = csConnecting
   var newConn: PgConnection
   try:
