@@ -6001,3 +6001,48 @@ suite "E2E: Error type granularity":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: quoteIdentifier":
+  test "simple identifier":
+    doAssert quoteIdentifier("foo") == "\"foo\""
+
+  test "identifier with double quotes":
+    doAssert quoteIdentifier("foo\"bar") == "\"foo\"\"bar\""
+
+  test "empty string":
+    doAssert quoteIdentifier("") == "\"\""
+
+  test "identifier with spaces":
+    doAssert quoteIdentifier("my table") == "\"my table\""
+
+suite "E2E: cancelNoWait":
+  test "cancelNoWait aborts pg_sleep":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Start a long-running query
+      let sleepFut = conn.simpleQuery("SELECT pg_sleep(30)")
+
+      # Give the server time to start executing
+      await sleepAsync(milliseconds(100))
+
+      # Cancel the query without waiting
+      conn.cancelNoWait()
+
+      # The original query should fail with query_canceled (57014)
+      var raised = false
+      try:
+        discard await sleepFut
+      except PgError as e:
+        raised = true
+        doAssert "57014" in e.msg
+      doAssert raised
+
+      # Connection should still be usable after cancel
+      doAssert conn.state == csReady
+      let res = await conn.simpleQuery("SELECT 1 AS check_col")
+      doAssert res[0].rows[0][0].get().toString() == "1"
+
+      await conn.close()
+
+    waitFor t()
