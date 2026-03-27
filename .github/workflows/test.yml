@@ -8,6 +8,7 @@ on:
       - 'async_postgres.nim*'
       - 'async_postgres/**'
       - 'tests/**'
+      - 'examples/**'
   push:
     paths:
       - '.github/workflows/test.yml'
@@ -15,6 +16,7 @@ on:
       - 'async_postgres.nim*'
       - 'async_postgres/**'
       - 'tests/**'
+      - 'examples/**'
     branches:
       - main
 
@@ -71,6 +73,21 @@ jobs:
 
       - name: Run tests
         run: nimble test -y
+
+      - name: Install async_postgres
+        run: nimble install -y
+
+      - name: Compile examples (asyncdispatch)
+        run: |
+          nim c examples/basic_query.nim
+          nim c examples/pool.nim
+          nim c examples/listen_notify.nim
+
+      - name: Compile examples (chronos)
+        run: |
+          nim c -d:asyncBackend=chronos examples/basic_query.nim
+          nim c -d:asyncBackend=chronos examples/pool.nim
+          nim c -d:asyncBackend=chronos examples/listen_notify.nim
 
       - name: Gen docs
         run: |
