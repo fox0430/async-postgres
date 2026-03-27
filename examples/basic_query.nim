@@ -4,7 +4,7 @@
 ## and querying data using the extended query protocol.
 ##
 ## Usage:
-##   nim c -d:ssl -r examples/basic_query.nim
+##   nim c -r examples/basic_query.nim
 
 import pkg/async_postgres
 

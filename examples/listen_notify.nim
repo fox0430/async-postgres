@@ -4,7 +4,7 @@
 ## using two connections: one listens and one sends notifications.
 ##
 ## Usage:
-##   nim c -d:ssl -r examples/listen_notify.nim
+##   nim c -r examples/listen_notify.nim
 
 import pkg/async_postgres
 

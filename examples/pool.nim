@@ -4,7 +4,7 @@
 ## and transactions.
 ##
 ## Usage:
-##   nim c -d:ssl -r examples/pool.nim
+##   nim c -r examples/pool.nim
 
 import std/options
 import pkg/async_postgres
