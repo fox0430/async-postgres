@@ -340,8 +340,8 @@ proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) =
     conn.notifyQueue.addLast(notif)
     if droppedNow > 0 and conn.notifyOverflowCallback != nil:
       conn.notifyOverflowCallback(droppedNow)
-  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    conn.notifyWaiter.complete()
+    if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+      conn.notifyWaiter.complete()
   if conn.notifyCallback != nil:
     conn.notifyCallback(notif)
 
