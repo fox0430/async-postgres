@@ -86,19 +86,29 @@ By default, asyncdispatch is used. To use chronos:
 
 ```sh
 # asyncdispatch (default)
-nim c -r your_app.nim
+nim c your_app.nim
+# asyncdispatch with ssl
+nim c -d:ssl your_app.nim
 
 # chronos
-nim c -r -d:asyncBackend=chronos your_app.nim
+nim c -d:asyncBackend=chronos your_app.nim
 ```
 
 **chronos is recommended.** chronos supports proper future cancellation, which enables reliable timeout handling and clean connection teardown. asyncdispatch lacks real cancellation — timed-out futures continue running in the background, and `cancelAndWait` is a no-op.
 
 SSL backend differs by async backend:
-- **chronos**: BearSSL (via nim-bearssl)
-- **asyncdispatch**: OpenSSL (requires `-d:ssl`)
+- asyncdispatch: OpenSSL (requires `-d:ssl`)
+- chronos: BearSSL (via [nim-bearssl](https://github.com/status-im/nim-bearssl))
 
-## Documents
+## Examples
+
+The [examples](examples/) directory contains runnable samples:
+
+- [basic_query](examples/basic_query.nim) — Connect, insert, and query rows
+- [pool](examples/pool.nim) — Connection pooling
+- [listen_notify](examples/listen_notify.nim) — LISTEN/NOTIFY with auto-reconnect
+
+## Documentation
 
 https://fox0430.github.io/async-postgres/async_postgres.html
 
