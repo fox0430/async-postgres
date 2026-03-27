@@ -1083,6 +1083,37 @@ proc simpleExecImpl(
       await conn.fillRecvBuf(timeout)
   return commandTag
 
+proc cancel*(conn: PgConnection): Future[void] {.async.} =
+  ## Send a CancelRequest over a separate TCP connection to abort the running query.
+  when hasChronos:
+    let addresses = resolveTAddress(conn.host, Port(conn.port))
+    if addresses.len == 0:
+      raise newException(PgConnectionError, "Could not resolve host: " & conn.host)
+    let transport = await connect(addresses[0])
+    try:
+      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
+      discard await transport.write(msg)
+    finally:
+      await transport.closeWait()
+  elif hasAsyncDispatch:
+    let sock = newAsyncSocket(buffered = false)
+    try:
+      await sock.connect(conn.host, Port(conn.port))
+      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
+      await sock.sendRawBytes(msg)
+    finally:
+      sock.close()
+
+proc cancelNoWait*(conn: PgConnection) =
+  ## Schedule a best-effort CancelRequest without waiting. For use in timeout handlers.
+  proc doCancel() {.async.} =
+    try:
+      await conn.cancel()
+    except CatchableError:
+      discard
+
+  asyncSpawn doCancel()
+
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
@@ -1094,6 +1125,7 @@ proc simpleExec*(
     try:
       tag = await simpleExecImpl(conn, sql, timeout).wait(timeout)
     except AsyncTimeoutError:
+      conn.cancelNoWait()
       conn.state = csClosed
       raise newException(PgTimeoutError, "simpleExec timed out")
   else:
@@ -1143,33 +1175,13 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
       try:
         await perform().wait(timeout)
       except AsyncTimeoutError:
+        conn.cancelNoWait()
         conn.state = csClosed
         raise newException(PgTimeoutError, "Ping timed out")
 
     withTimeout()
   else:
     perform()
-
-proc cancel*(conn: PgConnection): Future[void] {.async.} =
-  ## Send a CancelRequest over a separate TCP connection to abort the running query.
-  when hasChronos:
-    let addresses = resolveTAddress(conn.host, Port(conn.port))
-    if addresses.len == 0:
-      raise newException(PgConnectionError, "Could not resolve host: " & conn.host)
-    let transport = await connect(addresses[0])
-    try:
-      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
-      discard await transport.write(msg)
-    finally:
-      await transport.closeWait()
-  elif hasAsyncDispatch:
-    let sock = newAsyncSocket(buffered = false)
-    try:
-      await sock.connect(conn.host, Port(conn.port))
-      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
-      await sock.sendRawBytes(msg)
-    finally:
-      sock.close()
 
 proc close*(conn: PgConnection): Future[void] {.async.} =
   ## Close the connection. Idempotent: safe to call multiple times.
