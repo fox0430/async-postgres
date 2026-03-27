@@ -74,6 +74,9 @@ jobs:
       - name: Run tests
         run: nimble test -y
 
+      - name: Install async_postgres
+        run: nimble install -y
+
       - name: Compile examples (asyncdispatch)
         run: |
           nim c examples/basic_query.nim
