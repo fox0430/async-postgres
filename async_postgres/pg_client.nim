@@ -233,7 +233,7 @@ proc execImpl(
 proc execImpl(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   conn.checkReady()
@@ -366,7 +366,7 @@ template queryRecvLoop(
     cachedColFmts: seq[int16],
     cachedColOids: seq[int32],
     qr: var QueryResult,
-    timeout: Duration,
+    timeout: Duration = ZeroDuration,
 ) =
   var queryError: ref PgQueryError
 
@@ -513,7 +513,7 @@ proc queryImpl(
 proc queryImpl(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
@@ -582,7 +582,7 @@ template queryEachRecvLoop(
     cachedColOids: seq[int32],
     callback: RowCallback,
     rowCount: var int64,
-    timeout: Duration,
+    timeout: Duration = ZeroDuration,
 ) =
   var queryError: ref PgQueryError
   var rd: RowData
@@ -684,7 +684,7 @@ template queryEachRecvLoop(
 proc queryEachImpl(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     callback: RowCallback,
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
@@ -1015,7 +1015,7 @@ proc prepare*(
 
 proc executeImpl(
     stmt: PreparedStatement,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
@@ -1729,7 +1729,7 @@ proc execInTransactionImpl(
     params: seq[Option[seq[byte]]],
     paramOids: seq[int32],
     paramFormats: seq[int16],
-    timeout: Duration,
+    timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -1823,7 +1823,7 @@ proc execInTransaction(
 proc execInTransaction*(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with typed parameters.
@@ -1834,7 +1834,7 @@ proc execInTransaction*(
 proc execInTransaction*(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     opts: TransactionOptions,
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
@@ -1865,7 +1865,7 @@ proc queryInTransactionImpl(
     paramOids: seq[int32],
     paramFormats: seq[int16],
     resultFormats: seq[int16],
-    timeout: Duration,
+    timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -1964,7 +1964,7 @@ proc queryInTransaction(
 proc queryInTransaction*(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
@@ -1977,7 +1977,7 @@ proc queryInTransaction*(
 proc queryInTransaction*(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     opts: TransactionOptions,
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
@@ -2036,7 +2036,7 @@ proc addQuery*(
   )
 
 proc executeImpl(
-    p: Pipeline, timeout: Duration
+    p: Pipeline, timeout: Duration = ZeroDuration
 ): Future[seq[PipelineResult]] {.async.} =
   let conn = p.conn
   conn.checkReady()
@@ -2517,7 +2517,7 @@ template withCursor*(
 proc openCursor*(
     conn: PgConnection,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     chunkSize: int32 = 100,
     timeout: Duration = ZeroDuration,
@@ -2540,7 +2540,7 @@ proc queryDirectImpl(
     cacheMiss: bool,
     stmtName: string,
     cachedFields: seq[FieldDescription],
-    timeout: Duration,
+    timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Shared receive path for queryDirect macros.
   await conn.sendBufMsg()
@@ -2681,7 +2681,7 @@ proc execDirectImpl(
     cacheHit: bool,
     cacheMiss: bool,
     stmtName: string,
-    timeout: Duration,
+    timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Shared receive path for execDirect macro.
   await conn.sendBufMsg()
