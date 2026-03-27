@@ -1168,7 +1168,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
             break recvLoop
           else:
             discard
-        await conn.fillRecvBuf()
+        await conn.fillRecvBuf(timeout)
 
   if timeout > ZeroDuration:
     proc withTimeout(): Future[void] {.async.} =
