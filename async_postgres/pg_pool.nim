@@ -189,11 +189,17 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     # Replenish to minSize (best-effort)
     let currentTotal = pool.idle.len + pool.active
     let needed = max(0, pool.config.minSize - currentTotal)
+    # Use connectTimeout if set, otherwise cap at maintenanceInterval to avoid blocking
+    let replenishTimeout =
+      if pool.config.connConfig.connectTimeout > ZeroDuration:
+        pool.config.connConfig.connectTimeout
+      else:
+        pool.config.maintenanceInterval
     for i in 0 ..< needed:
       if pool.closed:
         break
       try:
-        let conn = await connect(pool.config.connConfig)
+        let conn = await connect(pool.config.connConfig).wait(replenishTimeout)
         pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
       except CatchableError:
         break # best-effort, retry next interval
