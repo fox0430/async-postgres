@@ -70,6 +70,37 @@ suite "sqlParams":
   test "dollar sign not starting a dollar-quote":
     check sqlParams("SELECT $1 WHERE id = ?") == "SELECT $1 WHERE id = $1"
 
+  test "?| at end of string":
+    check sqlParams("SELECT col ?|") == "SELECT col ?|"
+
+  test "?& at end of string":
+    check sqlParams("SELECT col ?&") == "SELECT col ?&"
+
+  test "??? parsed as escape then placeholder":
+    check sqlParams("SELECT ???") == "SELECT ?$1"
+
+  test "lowercase e-string":
+    check sqlParams("SELECT e'hello ?' WHERE id = ?") ==
+      "SELECT e'hello ?' WHERE id = $1"
+
+  test "unterminated single-quoted string":
+    check sqlParams("SELECT 'unterminated ? ") == "SELECT 'unterminated ? "
+
+  test "unterminated double-quoted identifier":
+    check sqlParams("""SELECT "unterminated ? """) == """SELECT "unterminated ? """
+
+  test "unterminated dollar-quoted string":
+    check sqlParams("SELECT $$unterminated ? ") == "SELECT $$unterminated ? "
+
+  test "E-string backslash at end of string":
+    check sqlParams("SELECT E'abc\\") == "SELECT E'abc\\"
+
+  test "? immediately after dollar-quote ends":
+    check sqlParams("SELECT $$body$$ WHERE id = ?") == "SELECT $$body$$ WHERE id = $1"
+
+  test "? immediately after single-quote ends":
+    check sqlParams("SELECT 'val'WHERE id = ?") == "SELECT 'val'WHERE id = $1"
+
 suite "sql macro":
   test "basic parameter extraction":
     let x = 42'i32
@@ -171,3 +202,57 @@ suite "sql macro":
     let sq = sql"""SELECT {"\"}".len.int32}"""
     check sq.query == "SELECT $1"
     check sq.params.len == 1
+
+  test "adjacent parameters without space":
+    let a = 1'i32
+    let b = 2'i32
+    let sq = sql"SELECT {a}{b}"
+    check sq.query == "SELECT $1$2"
+    check sq.params.len == 2
+
+  test "{{ immediately followed by parameter":
+    let x = 1'i32
+    let sq = sql"SELECT {{{x}}}"
+    check sq.query == "SELECT {$1}"
+    check sq.params.len == 1
+
+  test "param value roundtrip bool":
+    let v = true
+    let sq = sql"SELECT {v}"
+    check sq.query == "SELECT $1"
+    check sq.params[0].oid == OidBool
+    check sq.params[0].value.isSome
+
+  test "param value roundtrip float64":
+    let v = 3.14
+    let sq = sql"SELECT {v}"
+    check sq.query == "SELECT $1"
+    check sq.params[0].oid == OidFloat8
+    check sq.params[0].value.isSome
+
+  test "param value roundtrip seq[byte]":
+    let v = @[0x01'u8, 0x02'u8]
+    let sq = sql"SELECT {v}"
+    check sq.query == "SELECT $1"
+    check sq.params[0].oid == OidBytea
+    check sq.params[0].value.isSome
+
+  test "param value roundtrip Option none":
+    let v = none(int32)
+    let sq = sql"SELECT {v}"
+    check sq.query == "SELECT $1"
+    check sq.params[0].oid == OidInt4
+    check sq.params[0].value.isNone
+
+  test "param value roundtrip Option some":
+    let v = some(42'i32)
+    let sq = sql"SELECT {v}"
+    check sq.query == "SELECT $1"
+    check sq.params[0].oid == OidInt4
+    check sq.params[0].value.isSome
+
+  test "Nim array literal expression":
+    let sq = sql"SELECT {(@[1'i32, 2'i32, 3'i32])}"
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
+    check sq.params[0].oid == OidInt4Array
