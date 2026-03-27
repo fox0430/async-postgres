@@ -408,14 +408,14 @@ clusterForwards("write"):
   proc writeExecInTransaction*(
     cluster: PgPoolCluster,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
   ): Future[CommandResult]
 
   proc writeQueryInTransaction*(
     cluster: PgPoolCluster,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
   ): Future[QueryResult]

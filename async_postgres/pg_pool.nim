@@ -548,7 +548,10 @@ proc simpleExec*(
     pool.release(conn)
 
 proc execInTransaction*(
-    pool: PgPool, sql: string, params: seq[PgParam], timeout: Duration = ZeroDuration
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with typed parameters.
   let conn = await pool.acquire()
@@ -561,7 +564,7 @@ proc execInTransaction*(
 proc queryInTransaction*(
     pool: PgPool,
     sql: string,
-    params: seq[PgParam],
+    params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
