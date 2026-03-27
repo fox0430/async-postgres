@@ -322,7 +322,10 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
     except AsyncTimeoutError:
       waiter.cancelled = true
       pool.waiterCount.dec
-      # If release() completed the future in a race, put the connection back
+      # In single-threaded async, no preemption occurs between completed()
+      # and read(), so this sequence is race-free. If release() completed
+      # the future just before the timeout fired, return the connection
+      # to the pool instead of leaking it.
       if fut.completed():
         pool.release(fut.read())
       raise newException(PgPoolError, "Pool acquire timeout")
