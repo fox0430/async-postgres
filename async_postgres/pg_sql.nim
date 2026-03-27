@@ -20,9 +20,109 @@ import std/macros
 
 import async_backend, pg_types, pg_connection, pg_client, pg_pool, pg_pool_cluster
 
-type SqlQuery* = object ## A parameterised SQL query with its bound parameters.
-  query*: string
-  params*: seq[PgParam]
+type
+  SqlQuery* = object ## A parameterised SQL query with its bound parameters.
+    query*: string
+    params*: seq[PgParam]
+
+  SqlParseState = enum
+    sNormal
+    sSingleQuote
+    sEString
+    sDoubleQuote
+    sDollarQuote
+
+template sqlParseLoop(
+    sql: string,
+    output: var string,
+    idx: var int,
+    state: var SqlParseState,
+    dollarTag: var string,
+    normalBody: untyped,
+) =
+  ## Shared SQL parsing loop that handles quote-state transitions.
+  ## ``normalBody`` is executed for characters in ``sNormal`` that are not
+  ## quote transitions (``'``, ``"``, ``$``-quote). Inside ``normalBody``,
+  ## ``c`` is the current character at ``sql[idx]``.
+  while idx < sql.len:
+    let c {.inject.} = sql[idx]
+    case state
+    of sNormal:
+      case c
+      of '\'':
+        let isE =
+          idx > 0 and sql[idx - 1] in {'E', 'e'} and
+          (idx < 2 or sql[idx - 2] notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'})
+        state = if isE: sEString else: sSingleQuote
+        output.add(c)
+        inc idx
+      of '"':
+        state = sDoubleQuote
+        output.add(c)
+        inc idx
+      of '$':
+        var j = idx + 1
+        var matched = false
+        if j < sql.len and sql[j] == '$':
+          dollarTag = "$$"
+          state = sDollarQuote
+          output.add("$$")
+          idx = j + 1
+          matched = true
+        elif j < sql.len and sql[j] in {'a' .. 'z', 'A' .. 'Z', '_'}:
+          while j < sql.len and sql[j] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}:
+            inc j
+          if j < sql.len and sql[j] == '$':
+            dollarTag = sql[idx .. j]
+            state = sDollarQuote
+            output.add(dollarTag)
+            idx = j + 1
+            matched = true
+        if not matched:
+          output.add(c)
+          inc idx
+      else:
+        normalBody
+    of sSingleQuote:
+      output.add(c)
+      if c == '\'':
+        if idx + 1 < sql.len and sql[idx + 1] == '\'':
+          output.add('\'')
+          inc idx
+        else:
+          state = sNormal
+      inc idx
+    of sEString:
+      output.add(c)
+      if c == '\\':
+        if idx + 1 < sql.len:
+          inc idx
+          output.add(sql[idx])
+      elif c == '\'':
+        if idx + 1 < sql.len and sql[idx + 1] == '\'':
+          output.add('\'')
+          inc idx
+        else:
+          state = sNormal
+      inc idx
+    of sDoubleQuote:
+      output.add(c)
+      if c == '"':
+        if idx + 1 < sql.len and sql[idx + 1] == '"':
+          output.add('"')
+          inc idx
+        else:
+          state = sNormal
+      inc idx
+    of sDollarQuote:
+      if c == '$' and idx + dollarTag.len <= sql.len and
+          sql[idx ..< idx + dollarTag.len] == dollarTag:
+        output.add(dollarTag)
+        idx += dollarTag.len
+        state = sNormal
+      else:
+        output.add(c)
+        inc idx
 
 func sqlParams*(sql: string): string =
   ## Convert ``?``-style placeholders to PostgreSQL ``$1, $2, …`` positional
@@ -34,112 +134,30 @@ func sqlParams*(sql: string): string =
   ## - ``?`` inside ``E'…'`` C-style escape strings is preserved
   ## - ``?`` inside double-quoted identifiers is preserved
   ## - ``?`` inside dollar-quoted strings (``$$…$$``, ``$tag$…$tag$``) is preserved
-  type State = enum
-    sNormal
-    sSingleQuote
-    sEString
-    sDoubleQuote
-    sDollarQuote
-
   result = newStringOfCap(sql.len + 16)
   var i = 0
   var paramIdx = 0
   var state = sNormal
   var dollarTag = ""
 
-  while i < sql.len:
-    let c = sql[i]
-    case state
-    of sNormal:
-      case c
-      of '\'':
-        let isE =
-          i > 0 and sql[i - 1] in {'E', 'e'} and
-          (i < 2 or sql[i - 2] notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'})
-        state = if isE: sEString else: sSingleQuote
+  sqlParseLoop(sql, result, i, state, dollarTag):
+    case c
+    of '?':
+      if i + 1 < sql.len and sql[i + 1] == '?':
+        result.add('?')
+        i += 2
+      elif i + 1 < sql.len and sql[i + 1] in {'|', '&'}:
         result.add(c)
-        inc i
-      of '"':
-        state = sDoubleQuote
-        result.add(c)
-        inc i
-      of '$':
-        var j = i + 1
-        var matched = false
-        if j < sql.len and sql[j] == '$':
-          dollarTag = "$$"
-          state = sDollarQuote
-          result.add("$$")
-          i = j + 1
-          matched = true
-        elif j < sql.len and sql[j] in {'a' .. 'z', 'A' .. 'Z', '_'}:
-          while j < sql.len and sql[j] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}:
-            inc j
-          if j < sql.len and sql[j] == '$':
-            dollarTag = sql[i .. j]
-            state = sDollarQuote
-            result.add(dollarTag)
-            i = j + 1
-            matched = true
-        if not matched:
-          result.add(c)
-          inc i
-      of '?':
-        if i + 1 < sql.len and sql[i + 1] == '?':
-          result.add('?')
-          i += 2
-        elif i + 1 < sql.len and sql[i + 1] in {'|', '&'}:
-          result.add(c)
-          result.add(sql[i + 1])
-          i += 2
-        else:
-          inc paramIdx
-          result.add('$')
-          result.addInt(paramIdx)
-          inc i
+        result.add(sql[i + 1])
+        i += 2
       else:
-        result.add(c)
+        inc paramIdx
+        result.add('$')
+        result.addInt(paramIdx)
         inc i
-    of sSingleQuote:
+    else:
       result.add(c)
-      if c == '\'':
-        if i + 1 < sql.len and sql[i + 1] == '\'':
-          result.add('\'')
-          inc i
-        else:
-          state = sNormal
       inc i
-    of sEString:
-      result.add(c)
-      if c == '\\':
-        if i + 1 < sql.len:
-          inc i
-          result.add(sql[i])
-      elif c == '\'':
-        if i + 1 < sql.len and sql[i + 1] == '\'':
-          result.add('\'')
-          inc i
-        else:
-          state = sNormal
-      inc i
-    of sDoubleQuote:
-      result.add(c)
-      if c == '"':
-        if i + 1 < sql.len and sql[i + 1] == '"':
-          result.add('"')
-          inc i
-        else:
-          state = sNormal
-      inc i
-    of sDollarQuote:
-      if c == '$' and i + dollarTag.len <= sql.len and
-          sql[i ..< i + dollarTag.len] == dollarTag:
-        result.add(dollarTag)
-        i += dollarTag.len
-        state = sNormal
-      else:
-        result.add(c)
-        inc i
 
 macro sql*(queryStr: static[string]): untyped =
   ## Compile-time macro that parses ``{expr}`` placeholders in a SQL string
@@ -149,13 +167,6 @@ macro sql*(queryStr: static[string]): untyped =
   ## Use ``{{`` and ``}}`` to produce literal braces.  Placeholders inside
   ## single-quoted SQL strings, ``E'…'`` strings, double-quoted identifiers,
   ## and dollar-quoted strings are left as-is.
-  type State = enum
-    sNormal
-    sSingleQuote
-    sEString
-    sDoubleQuote
-    sDollarQuote
-
   var resultSql = newStringOfCap(queryStr.len)
   var paramNodes = newNimNode(nnkBracket)
   var paramIdx = 0
@@ -163,141 +174,65 @@ macro sql*(queryStr: static[string]): untyped =
   var state = sNormal
   var dollarTag = ""
 
-  while i < queryStr.len:
-    let c = queryStr[i]
-    case state
-    of sNormal:
-      case c
-      of '\'':
-        let isE =
-          i > 0 and queryStr[i - 1] in {'E', 'e'} and
-          (i < 2 or queryStr[i - 2] notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'})
-        state = if isE: sEString else: sSingleQuote
-        resultSql.add(c)
-        inc i
-      of '"':
-        state = sDoubleQuote
-        resultSql.add(c)
-        inc i
-      of '$':
-        var j = i + 1
-        var matched = false
-        if j < queryStr.len and queryStr[j] == '$':
-          dollarTag = "$$"
-          state = sDollarQuote
-          resultSql.add("$$")
-          i = j + 1
-          matched = true
-        elif j < queryStr.len and queryStr[j] in {'a' .. 'z', 'A' .. 'Z', '_'}:
-          while j < queryStr.len and
-              queryStr[j] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}:
+  sqlParseLoop(queryStr, resultSql, i, state, dollarTag):
+    case c
+    of '{':
+      if i + 1 < queryStr.len and queryStr[i + 1] == '{':
+        resultSql.add('{')
+        i += 2
+      else:
+        let start = i + 1
+        var depth = 1
+        var j = start
+        while j < queryStr.len and depth > 0:
+          let ch = queryStr[j]
+          if ch == '\'':
+            # Nim char literal: skip 'x' or '\x'
             inc j
-          if j < queryStr.len and queryStr[j] == '$':
-            dollarTag = queryStr[i .. j]
-            state = sDollarQuote
-            resultSql.add(dollarTag)
-            i = j + 1
-            matched = true
-        if not matched:
-          resultSql.add(c)
-          inc i
-      of '{':
-        if i + 1 < queryStr.len and queryStr[i + 1] == '{':
-          resultSql.add('{')
-          i += 2
-        else:
-          let start = i + 1
-          var depth = 1
-          var j = start
-          while j < queryStr.len and depth > 0:
-            let ch = queryStr[j]
-            if ch == '\'':
-              # Nim char literal: skip 'x' or '\x'
+            if j < queryStr.len and queryStr[j] == '\\':
+              j += min(2, queryStr.len - j)
+            elif j < queryStr.len:
               inc j
-              if j < queryStr.len and queryStr[j] == '\\':
+            if j < queryStr.len and queryStr[j] == '\'':
+              inc j
+          elif ch == '"':
+            # Nim string literal: skip until closing " (handle \" escape)
+            inc j
+            while j < queryStr.len:
+              if queryStr[j] == '\\':
                 j += min(2, queryStr.len - j)
-              elif j < queryStr.len:
+              elif queryStr[j] == '"':
                 inc j
-              if j < queryStr.len and queryStr[j] == '\'':
+                break
+              else:
                 inc j
-            elif ch == '"':
-              # Nim string literal: skip until closing " (handle \" escape)
+          elif ch == '{':
+            inc depth
+            inc j
+          elif ch == '}':
+            dec depth
+            if depth > 0:
               inc j
-              while j < queryStr.len:
-                if queryStr[j] == '\\':
-                  j += min(2, queryStr.len - j)
-                elif queryStr[j] == '"':
-                  inc j
-                  break
-                else:
-                  inc j
-            elif ch == '{':
-              inc depth
-              inc j
-            elif ch == '}':
-              dec depth
-              if depth > 0:
-                inc j
-            else:
-              inc j
-          if depth != 0:
-            error("Unmatched '{' in sql string at position " & $i)
-          let exprStr = queryStr[start ..< j]
-          let exprNode = parseExpr(exprStr)
-          inc paramIdx
-          resultSql.add('$')
-          resultSql.addInt(paramIdx)
-          paramNodes.add(newCall(bindSym"toPgParam", exprNode))
-          i = j + 1
-      of '}':
-        if i + 1 < queryStr.len and queryStr[i + 1] == '}':
-          resultSql.add('}')
-          i += 2
-        else:
-          error("Unmatched '}' in sql string at position " & $i)
+          else:
+            inc j
+        if depth != 0:
+          error("Unmatched '{' in sql string at position " & $i)
+        let exprStr = queryStr[start ..< j]
+        let exprNode = parseExpr(exprStr)
+        inc paramIdx
+        resultSql.add('$')
+        resultSql.addInt(paramIdx)
+        paramNodes.add(newCall(bindSym"toPgParam", exprNode))
+        i = j + 1
+    of '}':
+      if i + 1 < queryStr.len and queryStr[i + 1] == '}':
+        resultSql.add('}')
+        i += 2
       else:
-        resultSql.add(c)
-        inc i
-    of sSingleQuote:
+        error("Unmatched '}' in sql string at position " & $i)
+    else:
       resultSql.add(c)
-      if c == '\'':
-        if i + 1 < queryStr.len and queryStr[i + 1] == '\'':
-          resultSql.add('\'')
-          inc i
-        else:
-          state = sNormal
       inc i
-    of sEString:
-      resultSql.add(c)
-      if c == '\\':
-        if i + 1 < queryStr.len:
-          inc i
-          resultSql.add(queryStr[i])
-      elif c == '\'':
-        if i + 1 < queryStr.len and queryStr[i + 1] == '\'':
-          resultSql.add('\'')
-          inc i
-        else:
-          state = sNormal
-      inc i
-    of sDoubleQuote:
-      resultSql.add(c)
-      if c == '"':
-        if i + 1 < queryStr.len and queryStr[i + 1] == '"':
-          resultSql.add('"')
-          inc i
-        else:
-          state = sNormal
-      inc i
-    of sDollarQuote:
-      if c == '$' and i + dollarTag.len <= queryStr.len and
-          queryStr[i ..< i + dollarTag.len] == dollarTag:
-        resultSql.add(dollarTag)
-        i += dollarTag.len
-        state = sNormal
-      else:
-        resultSql.add(c)
-        inc i
 
   let sqlLit = newStrLitNode(resultSql)
   let paramsSeq = newTree(nnkPrefix, ident"@", paramNodes)
