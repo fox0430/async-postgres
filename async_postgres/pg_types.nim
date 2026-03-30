@@ -189,6 +189,14 @@ const
   OidDateRange* = 3912'i32
   OidInt8Range* = 3926'i32
 
+  # Range array types
+  OidInt4RangeArray* = 3905'i32
+  OidNumRangeArray* = 3907'i32
+  OidTsRangeArray* = 3909'i32
+  OidTsTzRangeArray* = 3911'i32
+  OidDateRangeArray* = 3913'i32
+  OidInt8RangeArray* = 3927'i32
+
   # Multirange types (PostgreSQL 14+)
   OidInt4Multirange* = 4451'i32
   OidNumMultirange* = 4532'i32
@@ -3378,6 +3386,100 @@ proc toPgBinaryTsTzRangeParam*(v: PgRange[DateTime]): PgParam =
 proc toPgBinaryDateRangeParam*(v: PgRange[DateTime]): PgParam =
   encodeRangeBinary(v, OidDateRange, encodeBinaryDate)
 
+# toPgBinaryParam for range array types
+
+proc toPgBinaryParam*(v: seq[PgRange[int32]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt4RangeArray,
+      format: 1,
+      value: some(encodeBinaryArrayEmpty(OidInt4Range)),
+    )
+  var elements = newSeq[seq[byte]](v.len)
+  for i, r in v:
+    elements[i] = toPgBinaryParam(r).value.get
+  PgParam(
+    oid: OidInt4RangeArray,
+    format: 1,
+    value: some(encodeBinaryArray(OidInt4Range, elements)),
+  )
+
+proc toPgBinaryParam*(v: seq[PgRange[int64]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt8RangeArray,
+      format: 1,
+      value: some(encodeBinaryArrayEmpty(OidInt8Range)),
+    )
+  var elements = newSeq[seq[byte]](v.len)
+  for i, r in v:
+    elements[i] = toPgBinaryParam(r).value.get
+  PgParam(
+    oid: OidInt8RangeArray,
+    format: 1,
+    value: some(encodeBinaryArray(OidInt8Range, elements)),
+  )
+
+proc toPgBinaryParam*(v: seq[PgRange[PgNumeric]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidNumRangeArray, format: 1, value: some(encodeBinaryArrayEmpty(OidNumRange))
+    )
+  var elements = newSeq[seq[byte]](v.len)
+  for i, r in v:
+    elements[i] = toPgBinaryParam(r).value.get
+  PgParam(
+    oid: OidNumRangeArray,
+    format: 1,
+    value: some(encodeBinaryArray(OidNumRange, elements)),
+  )
+
+proc toPgBinaryParam*(v: seq[PgRange[DateTime]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidTsRangeArray, format: 1, value: some(encodeBinaryArrayEmpty(OidTsRange))
+    )
+  var elements = newSeq[seq[byte]](v.len)
+  for i, r in v:
+    elements[i] = toPgBinaryParam(r).value.get
+  PgParam(
+    oid: OidTsRangeArray,
+    format: 1,
+    value: some(encodeBinaryArray(OidTsRange, elements)),
+  )
+
+proc toPgBinaryTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidTsTzRangeArray,
+      format: 1,
+      value: some(encodeBinaryArrayEmpty(OidTsTzRange)),
+    )
+  var elements = newSeq[seq[byte]](v.len)
+  for i, r in v:
+    elements[i] = toPgBinaryTsTzRangeParam(r).value.get
+  PgParam(
+    oid: OidTsTzRangeArray,
+    format: 1,
+    value: some(encodeBinaryArray(OidTsTzRange, elements)),
+  )
+
+proc toPgBinaryDateRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidDateRangeArray,
+      format: 1,
+      value: some(encodeBinaryArrayEmpty(OidDateRange)),
+    )
+  var elements = newSeq[seq[byte]](v.len)
+  for i, r in v:
+    elements[i] = toPgBinaryDateRangeParam(r).value.get
+  PgParam(
+    oid: OidDateRangeArray,
+    format: 1,
+    value: some(encodeBinaryArray(OidDateRange, elements)),
+  )
+
 # Range text format getters
 
 proc getInt4Range*(row: Row, col: int): PgRange[int32] =
@@ -3816,6 +3918,208 @@ optAccessor(getNumMultirange, getNumMultirangeOpt, PgMultirange[PgNumeric])
 optAccessor(getTsMultirange, getTsMultirangeOpt, PgMultirange[DateTime])
 optAccessor(getTsTzMultirange, getTsTzMultirangeOpt, PgMultirange[DateTime])
 optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
+
+# Range array type support
+#
+# PostgreSQL range array types store arrays of range values.
+# Text format:  {"[1,10)","[20,30)"}
+# Binary format: standard array container with range elements.
+
+proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
+  ## Get a column value as an int4range[]. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgRange[int32]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in range array")
+      result[i] = decodeInt4RangeBinary(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in range array")
+    result.add(
+      parseRangeText[int32](
+        e.get,
+        proc(x: string): int32 =
+          int32(parseInt(x)),
+      )
+    )
+
+proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
+  ## Get a column value as an int8range[]. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgRange[int64]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in range array")
+      result[i] = decodeInt8RangeBinary(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in range array")
+    result.add(
+      parseRangeText[int64](
+        e.get,
+        proc(x: string): int64 =
+          parseBiggestInt(x),
+      )
+    )
+
+proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
+  ## Get a column value as a numrange[]. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgRange[PgNumeric]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in range array")
+      result[i] = decodeNumRangeBinary(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in range array")
+    result.add(
+      parseRangeText[PgNumeric](
+        e.get,
+        proc(x: string): PgNumeric =
+          parsePgNumeric(x),
+      )
+    )
+
+proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
+  ## Get a column value as a tsrange[]. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgRange[DateTime]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in range array")
+      result[i] = decodeTsRangeBinary(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in range array")
+    result.add(
+      parseRangeText[DateTime](
+        e.get,
+        proc(x: string): DateTime =
+          const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
+          for fmt in formats:
+            try:
+              return parse(x, fmt)
+            except TimeParseError:
+              discard
+          raise newException(PgTypeError, "Invalid timestamp in range array: " & x),
+      )
+    )
+
+proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
+  ## Get a column value as a tstzrange[]. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgRange[DateTime]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in range array")
+      result[i] = decodeTsRangeBinary(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in range array")
+    result.add(
+      parseRangeText[DateTime](
+        e.get,
+        proc(x: string): DateTime =
+          const formats = [
+            "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
+            "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
+            "yyyy-MM-dd HH:mm:sszz", "yyyy-MM-dd HH:mm:ss",
+          ]
+          for fmt in formats:
+            try:
+              return parse(x, fmt)
+            except TimeParseError:
+              discard
+          raise newException(PgTypeError, "Invalid timestamptz in range array: " & x),
+      )
+    )
+
+proc getDateRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
+  ## Get a column value as a daterange[]. Handles binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgRange[DateTime]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in range array")
+      result[i] = decodeDateRangeBinary(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in range array")
+    result.add(
+      parseRangeText[DateTime](
+        e.get,
+        proc(x: string): DateTime =
+          try:
+            return parse(x, "yyyy-MM-dd")
+          except TimeParseError:
+            raise newException(PgTypeError, "Invalid date in range array: " & x),
+      )
+    )
+
+# Range array Opt accessors
+
+optAccessor(getInt4RangeArray, getInt4RangeArrayOpt, seq[PgRange[int32]])
+optAccessor(getInt8RangeArray, getInt8RangeArrayOpt, seq[PgRange[int64]])
+optAccessor(getNumRangeArray, getNumRangeArrayOpt, seq[PgRange[PgNumeric]])
+optAccessor(getTsRangeArray, getTsRangeArrayOpt, seq[PgRange[DateTime]])
+optAccessor(getTsTzRangeArray, getTsTzRangeArrayOpt, seq[PgRange[DateTime]])
+optAccessor(getDateRangeArray, getDateRangeArrayOpt, seq[PgRange[DateTime]])
 
 # Generic accessors — static dispatch by type, no OID branching.
 # DateTime-based types (DateTime, PgRange[DateTime], PgMultirange[DateTime])

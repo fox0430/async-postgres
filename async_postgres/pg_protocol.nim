@@ -174,11 +174,17 @@ const
     718, # circle
     1043, # varchar
     3904, # int4range
+    3905, # int4range[]
     3906, # numrange
+    3907, # numrange[]
     3908, # tsrange
+    3909, # tsrange[]
     3910, # tstzrange
+    3911, # tstzrange[]
     3912, # daterange
+    3913, # daterange[]
     3926, # int8range
+    3927, # int8range[]
     4451, # int4multirange
     4532, # nummultirange
     4533, # tsmultirange
