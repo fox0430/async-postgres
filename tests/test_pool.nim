@@ -387,6 +387,30 @@ suite "Pool close":
     waitFor pool.close()
     check pool.closed
 
+  test "close with timeout waits for active connections":
+    let pool = makePool()
+    pool.active = 1
+
+    # Simulate a connection being released after a short delay
+    proc releaseAfter(pool: PgPool) {.async.} =
+      await sleepAsync(milliseconds(20))
+      let conn = mockConn(csClosed)
+      pool.active.dec
+
+    let releaseFut = releaseAfter(pool)
+    waitFor pool.close(timeout = seconds(1))
+    waitFor releaseFut
+    check pool.closed
+    check pool.active == 0
+
+  test "close with timeout expires when active not released":
+    let pool = makePool()
+    pool.active = 1
+
+    waitFor pool.close(timeout = milliseconds(100))
+    check pool.closed
+    check pool.active == 1
+
 suite "Pool active count tracking":
   test "release then acquire roundtrip":
     let pool = makePool()
