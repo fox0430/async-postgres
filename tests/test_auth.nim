@@ -35,6 +35,24 @@ suite "MD5 authentication":
     let h2 = md5AuthHash("user", "pass", [0x05'u8, 0x06, 0x07, 0x08])
     check h1 != h2
 
+suite "SCRAM username escaping":
+  test "scramEscapeUsername with no special chars":
+    check scramEscapeUsername("user") == "user"
+
+  test "scramEscapeUsername escapes '='":
+    check scramEscapeUsername("user=1") == "user=3D1"
+
+  test "scramEscapeUsername escapes ','":
+    check scramEscapeUsername("user,name") == "user=2Cname"
+
+  test "scramEscapeUsername escapes both '=' and ','":
+    check scramEscapeUsername("a=b,c") == "a=3Db=2Cc"
+
+  test "scramEscapeUsername escapes '=' before ','":
+    # '=' must be escaped first so that '=2C' introduced by comma escaping
+    # is not double-escaped.
+    check scramEscapeUsername("=,") == "=3D=2C"
+
 suite "SCRAM-SHA-256":
   test "clientFirstMessage with fixed nonce":
     var state: ScramState
@@ -42,6 +60,12 @@ suite "SCRAM-SHA-256":
     check toString(msg) == "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
     check state.clientNonce == "rOprNGfwEbeRWgbNEkqO"
     check state.clientFirstBare == "n=user,r=rOprNGfwEbeRWgbNEkqO"
+
+  test "clientFirstMessage escapes username":
+    var state: ScramState
+    let msg = scramClientFirstMessage("u=ser,1", "testNonce", state)
+    check toString(msg) == "n,,n=u=3Dser=2C1,r=testNonce"
+    check state.clientFirstBare == "n=u=3Dser=2C1,r=testNonce"
 
   test "clientFirstMessage with random nonce":
     var state: ScramState
