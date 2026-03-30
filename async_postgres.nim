@@ -47,14 +47,15 @@
 ## - `pg_protocol <async_postgres/pg_protocol.html>`_ — Wire protocol encoding/decoding
 ## - `pg_auth <async_postgres/pg_auth.html>`_ — MD5 and SCRAM-SHA-256 authentication
 ## - `pg_largeobject <async_postgres/pg_largeobject.html>`_ — Large Object API for streaming binary data
+## - `pg_advisory_lock <async_postgres/pg_advisory_lock.html>`_ — Advisory lock API (session/transaction, exclusive/shared)
 ## - `async_backend <async_postgres/async_backend.html>`_ — Async framework abstraction (asyncdispatch / chronos)
 
 import
   async_postgres/[
     async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
-    pg_pool_cluster, pg_largeobject, pg_sql,
+    pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql,
   ]
 
 export
   async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
-  pg_pool_cluster, pg_largeobject, pg_sql
+  pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql
