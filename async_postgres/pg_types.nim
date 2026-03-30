@@ -1921,103 +1921,86 @@ proc decodeBinaryTsVector(data: openArray[byte]): string =
     parts[i] = part
   parts.join(" ")
 
+proc parseTsQueryNode(data: openArray[byte], pos: var int): string =
+  if pos >= data.len:
+    raise newException(PgTypeError, "tsquery binary truncated")
+  let tokenType = data[pos]
+  inc pos
+  case tokenType
+  of 1: # operand
+    if pos + 2 >= data.len:
+      raise newException(PgTypeError, "tsquery operand truncated")
+    let weightByte = data[pos]
+    inc pos
+    let prefix = data[pos] != 0
+    inc pos
+    var strEnd = pos
+    while strEnd < data.len and data[strEnd] != 0:
+      inc strEnd
+    if strEnd >= data.len:
+      raise newException(PgTypeError, "tsquery binary: operand missing null terminator")
+    var operand = newString(strEnd - pos)
+    for j in 0 ..< strEnd - pos:
+      operand[j] = char(data[pos + j])
+    pos = strEnd + 1
+    var s = "'" & operand & "'"
+    var suffix = ""
+    if (weightByte and 0x08) != 0:
+      suffix.add('A')
+    if (weightByte and 0x04) != 0:
+      suffix.add('B')
+    if (weightByte and 0x02) != 0:
+      suffix.add('C')
+    if (weightByte and 0x01) != 0:
+      suffix.add('D')
+    if suffix.len > 0 or prefix:
+      s.add(':')
+      s.add(suffix)
+      if prefix:
+        s.add('*')
+    s
+  of 2: # operator
+    if pos >= data.len:
+      raise newException(PgTypeError, "tsquery operator truncated")
+    let op = data[pos]
+    inc pos
+    case op
+    of 1: # NOT
+      let arg = parseTsQueryNode(data, pos)
+      "!" & arg
+    of 2: # AND
+      let left = parseTsQueryNode(data, pos)
+      let right = parseTsQueryNode(data, pos)
+      left & " & " & right
+    of 3: # OR
+      let left = parseTsQueryNode(data, pos)
+      let right = parseTsQueryNode(data, pos)
+      "( " & left & " | " & right & " )"
+    of 4: # PHRASE
+      if pos + 1 >= data.len:
+        raise newException(PgTypeError, "tsquery PHRASE distance truncated")
+      let distance = int(fromBE16(data.toOpenArray(pos, pos + 1)))
+      pos += 2
+      let left = parseTsQueryNode(data, pos)
+      let right = parseTsQueryNode(data, pos)
+      if distance == 1:
+        left & " <-> " & right
+      else:
+        left & " <" & $distance & "> " & right
+    else:
+      raise newException(PgTypeError, "Unknown tsquery operator: " & $op)
+  else:
+    raise newException(PgTypeError, "Unknown tsquery token type: " & $tokenType)
+
 proc decodeBinaryTsQuery(data: openArray[byte]): string =
-  ## Decode PostgreSQL binary tsquery (postfix) to text representation (infix).
+  ## Decode PostgreSQL binary tsquery (prefix/preorder) to text representation (infix).
   if data.len < 4:
     raise newException(PgTypeError, "tsquery binary data too short")
   let ntokens = int(fromBE32(data.toOpenArray(0, 3)))
   if ntokens == 0:
     return ""
   var pos = 4
-  var stack: seq[string]
-  for i in 0 ..< ntokens:
-    if pos >= data.len:
-      raise newException(PgTypeError, "tsquery binary truncated")
-    let tokenType = data[pos]
-    inc pos
-    case tokenType
-    of 1: # operand
-      if pos + 2 >= data.len:
-        raise newException(PgTypeError, "tsquery operand truncated")
-      let weightByte = data[pos]
-      inc pos
-      let prefix = data[pos] != 0
-      inc pos
-      var strEnd = pos
-      while strEnd < data.len and data[strEnd] != 0:
-        inc strEnd
-      if strEnd >= data.len:
-        raise
-          newException(PgTypeError, "tsquery binary: operand missing null terminator")
-      var operand = newString(strEnd - pos)
-      for j in 0 ..< strEnd - pos:
-        operand[j] = char(data[pos + j])
-      pos = strEnd + 1
-      var s = "'" & operand & "'"
-      var suffix = ""
-      if (weightByte and 0x08) != 0:
-        suffix.add('A')
-      if (weightByte and 0x04) != 0:
-        suffix.add('B')
-      if (weightByte and 0x02) != 0:
-        suffix.add('C')
-      if (weightByte and 0x01) != 0:
-        suffix.add('D')
-      if suffix.len > 0 or prefix:
-        s.add(':')
-        s.add(suffix)
-        if prefix:
-          s.add('*')
-      stack.add(s)
-    of 2: # operator
-      if pos >= data.len:
-        raise newException(PgTypeError, "tsquery operator truncated")
-      let op = data[pos]
-      inc pos
-      case op
-      of 1: # NOT
-        if stack.len < 1:
-          raise newException(PgTypeError, "tsquery binary: NOT with empty stack")
-        let arg = stack.pop()
-        stack.add("!" & arg)
-      of 2: # AND
-        if stack.len < 2:
-          raise
-            newException(PgTypeError, "tsquery binary: AND with insufficient operands")
-        let right = stack.pop()
-        let left = stack.pop()
-        stack.add(left & " & " & right)
-      of 3: # OR
-        if stack.len < 2:
-          raise
-            newException(PgTypeError, "tsquery binary: OR with insufficient operands")
-        let right = stack.pop()
-        let left = stack.pop()
-        stack.add("( " & left & " | " & right & " )")
-      of 4: # PHRASE
-        if pos + 1 >= data.len:
-          raise newException(PgTypeError, "tsquery PHRASE distance truncated")
-        if stack.len < 2:
-          raise newException(
-            PgTypeError, "tsquery binary: PHRASE with insufficient operands"
-          )
-        let distance = int(fromBE16(data.toOpenArray(pos, pos + 1)))
-        pos += 2
-        let right = stack.pop()
-        let left = stack.pop()
-        if distance == 1:
-          stack.add(left & " <-> " & right)
-        else:
-          stack.add(left & " <" & $distance & "> " & right)
-      else:
-        raise newException(PgTypeError, "Unknown tsquery operator: " & $op)
-    else:
-      raise newException(PgTypeError, "Unknown tsquery token type: " & $tokenType)
-  if stack.len != 1:
-    raise newException(
-      PgTypeError, "Invalid tsquery binary: stack has " & $stack.len & " items"
-    )
-  stack[0]
+  parseTsQueryNode(data, pos)
 
 proc getTsVector*(row: Row, col: int): PgTsVector =
   ## Get a column value as PgTsVector. Handles both text and binary format.

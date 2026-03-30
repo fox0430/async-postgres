@@ -3811,10 +3811,13 @@ suite "tsvector / tsquery":
     check "'bar' 'foo':2B" == $v
 
   test "getTsQuery binary format simple AND":
-    # Binary tsquery for 'cat' & 'dog' (postfix: cat, dog, AND)
+    # Binary tsquery for 'cat' & 'dog' (prefix: AND, cat, dog)
     var data: seq[byte] = @[]
     # ntokens = 3
     data.add(@(toBE32(3'i32)))
+    # AND operator: type=2, op=2
+    data.add(2'u8)
+    data.add(2'u8)
     # operand "cat": type=1, weight=0, prefix=0, "cat\0"
     data.add(1'u8) # type
     data.add(0'u8) # weight
@@ -3829,18 +3832,18 @@ suite "tsvector / tsquery":
     for c in "dog":
       data.add(byte(c))
     data.add(0'u8)
-    # AND operator: type=2, op=2
-    data.add(2'u8)
-    data.add(2'u8)
     let fields = @[mkField(OidTsQuery, 1'i16)]
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
     check "'cat' & 'dog'" == $q
 
   test "getTsQuery binary format NOT":
-    # Binary tsquery for !'cat' (postfix: cat, NOT)
+    # Binary tsquery for !'cat' (prefix: NOT, cat)
     var data: seq[byte] = @[]
     data.add(@(toBE32(2'i32)))
+    # NOT operator: type=2, op=1
+    data.add(2'u8)
+    data.add(1'u8)
     # operand "cat"
     data.add(1'u8)
     data.add(0'u8)
@@ -3848,18 +3851,19 @@ suite "tsvector / tsquery":
     for c in "cat":
       data.add(byte(c))
     data.add(0'u8)
-    # NOT operator: type=2, op=1
-    data.add(2'u8)
-    data.add(1'u8)
     let fields = @[mkField(OidTsQuery, 1'i16)]
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
     check "!'cat'" == $q
 
   test "getTsQuery binary format PHRASE":
-    # Binary tsquery for 'cat' <-> 'dog' (postfix: cat, dog, PHRASE dist=1)
+    # Binary tsquery for 'cat' <-> 'dog' (prefix: PHRASE dist=1, cat, dog)
     var data: seq[byte] = @[]
     data.add(@(toBE32(3'i32)))
+    # PHRASE operator: type=2, op=4, distance=1
+    data.add(2'u8)
+    data.add(4'u8)
+    data.add(@(toBE16(1'i16)))
     # operand "cat"
     data.add(1'u8)
     data.add(0'u8)
@@ -3874,10 +3878,6 @@ suite "tsvector / tsquery":
     for c in "dog":
       data.add(byte(c))
     data.add(0'u8)
-    # PHRASE operator: type=2, op=4, distance=1
-    data.add(2'u8)
-    data.add(4'u8)
-    data.add(@(toBE16(1'i16)))
     let fields = @[mkField(OidTsQuery, 1'i16)]
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
