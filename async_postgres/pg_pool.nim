@@ -683,9 +683,14 @@ template withPipeline*(pool: PgPool, pipeline, body: untyped) =
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc close*(pool: PgPool): Future[void] {.async.} =
+proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close the pool: stop the maintenance loop, cancel all waiters, and close
-  ## all idle connections. Active connections are closed when released.
+  ## all idle and active connections.
+  ##
+  ## When `timeout > ZeroDuration`, waits up to `timeout` for active
+  ## connections to be released. Unreleased connections are closed when they
+  ## are eventually returned to the pool. Without a timeout (or
+  ## `ZeroDuration`), active connections are closed on release.
   pool.closed = true
 
   # Stop maintenance loop
@@ -698,6 +703,12 @@ proc close*(pool: PgPool): Future[void] {.async.} =
     if not waiter.cancelled:
       waiter.fut.fail(newException(PgError, "Pool closed"))
   pool.waiterCount = 0
+
+  # Wait for active connections to drain
+  if timeout > ZeroDuration and pool.active > 0:
+    let deadline = Moment.now() + timeout
+    while pool.active > 0 and Moment.now() < deadline:
+      await sleepAsync(milliseconds(50))
 
   # Close all idle connections
   while pool.idle.len > 0:
