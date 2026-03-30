@@ -6046,3 +6046,97 @@ suite "E2E: cancelNoWait":
       await conn.close()
 
     waitFor t()
+
+  test "tsvector roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgTsVector("'cat':1A 'dog':3")
+      let res = await conn.query("SELECT $1::tsvector", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTsVector(0)
+      doAssert $got == "'cat':1A 'dog':3"
+      await conn.close()
+
+    waitFor t()
+
+  test "to_tsvector function":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT to_tsvector('english', 'The fat cat sat on the mat')")
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getTsVector(0)
+      let s = $v
+      doAssert "'cat'" in s
+      doAssert "'fat'" in s
+      doAssert "'mat'" in s
+      doAssert "'sat'" in s
+      await conn.close()
+
+    waitFor t()
+
+  test "tsquery roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let q = PgTsQuery("'fat' & 'rat'")
+      let res = await conn.query("SELECT $1::tsquery", @[toPgParam(q)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTsQuery(0)
+      doAssert "'fat' & 'rat'" == $got
+      await conn.close()
+
+    waitFor t()
+
+  test "full-text search with @@ operator":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query(
+        "SELECT to_tsvector('english', 'the fat cat') @@ to_tsquery('english', 'fat & cat')"
+      )
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getBool(0) == true
+      let res2 = await conn.query(
+        "SELECT to_tsvector('english', 'the fat cat') @@ to_tsquery('english', 'fat & dog')"
+      )
+      doAssert res2.rows[0].getBool(0) == false
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL tsvector and tsquery":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::tsvector, NULL::tsquery")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getTsVectorOpt(0).isNone
+      doAssert res.rows[0].getTsQueryOpt(1).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "tsvector binary results":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT 'cat:1A dog:3'::tsvector", resultFormat = rfBinary)
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getTsVector(0)
+      let s = $v
+      doAssert "'cat'" in s
+      doAssert "'dog'" in s
+      await conn.close()
+
+    waitFor t()
+
+  test "tsquery binary results":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT 'fat & rat'::tsquery", resultFormat = rfBinary)
+      doAssert res.rows.len == 1
+      let q = res.rows[0].getTsQuery(0)
+      let s = $q
+      doAssert "'fat'" in s
+      doAssert "'rat'" in s
+      await conn.close()
+
+    waitFor t()

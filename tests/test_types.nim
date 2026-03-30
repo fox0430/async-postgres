@@ -67,6 +67,8 @@ suite "OID constants":
     check OidCidr == 650'i32
     check OidMacAddr == 829'i32
     check OidMacAddr8 == 774'i32
+    check OidTsVector == 3614'i32
+    check OidTsQuery == 3615'i32
 
 suite "toPgParam":
   test "string":
@@ -3711,3 +3713,214 @@ suite "Geometry types":
     let fields = @[mkField(OidCircle, 1'i16)]
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getCircleOpt(0).isNone
+
+suite "tsvector / tsquery":
+  test "toPgParam PgTsVector":
+    let v = PgTsVector("'cat':1A 'dog':3")
+    let p = toPgParam(v)
+    check p.oid == OidTsVector
+    check p.format == 0
+    check toString(p.value.get) == "'cat':1A 'dog':3"
+
+  test "toPgParam PgTsQuery":
+    let q = PgTsQuery("'fat' & 'rat'")
+    let p = toPgParam(q)
+    check p.oid == OidTsQuery
+    check p.format == 0
+    check toString(p.value.get) == "'fat' & 'rat'"
+
+  test "toPgBinaryParam PgTsVector sends text format":
+    let v = PgTsVector("'cat':1A 'dog':3")
+    let p = toPgBinaryParam(v)
+    check p.oid == OidTsVector
+    check p.format == 0
+
+  test "toPgBinaryParam PgTsQuery sends text format":
+    let q = PgTsQuery("'fat' & 'rat'")
+    let p = toPgBinaryParam(q)
+    check p.oid == OidTsQuery
+    check p.format == 0
+
+  test "$ PgTsVector":
+    let v = PgTsVector("'cat':1A 'dog':3")
+    check $v == "'cat':1A 'dog':3"
+
+  test "$ PgTsQuery":
+    let q = PgTsQuery("'fat' & 'rat'")
+    check $q == "'fat' & 'rat'"
+
+  test "== PgTsVector":
+    check PgTsVector("'a':1") == PgTsVector("'a':1")
+    check PgTsVector("'a':1") != PgTsVector("'b':1")
+
+  test "== PgTsQuery":
+    check PgTsQuery("'a' & 'b'") == PgTsQuery("'a' & 'b'")
+    check PgTsQuery("'a'") != PgTsQuery("'b'")
+
+  test "getTsVector text format":
+    let data = toBytes("'cat':1A,2B 'dog':3")
+    let fields = @[mkField(OidTsVector, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    check $row.getTsVector(0) == "'cat':1A,2B 'dog':3"
+
+  test "getTsQuery text format":
+    let data = toBytes("'fat' & 'rat'")
+    let fields = @[mkField(OidTsQuery, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    check $row.getTsQuery(0) == "'fat' & 'rat'"
+
+  test "getTsVector binary format":
+    # Binary tsvector for 'cat':1A (1 lexeme, 1 position with weight A)
+    # Header: nlexemes = 1
+    # Lexeme: "cat\0" + npos=1 + position=1 with weight A (3 << 14 | 1 = 0xC001)
+    var data: seq[byte] = @[]
+    # nlexemes = 1
+    data.add(@(toBE32(1'i32)))
+    # lexeme "cat" + null terminator
+    for c in "cat":
+      data.add(byte(c))
+    data.add(0'u8)
+    # npos = 1
+    data.add(@(toBE16(1'i16)))
+    # position 1 with weight A (weight=3, so 3 << 14 | 1 = 0xC001)
+    data.add(@(toBE16(cast[int16](0xC001'u16))))
+    let fields = @[mkField(OidTsVector, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getTsVector(0)
+    check "'cat':1A" == $v
+
+  test "getTsVector binary format multiple lexemes":
+    # Binary tsvector for 'bar' 'foo':2B
+    var data: seq[byte] = @[]
+    # nlexemes = 2
+    data.add(@(toBE32(2'i32)))
+    # lexeme "bar" + null + npos=0
+    for c in "bar":
+      data.add(byte(c))
+    data.add(0'u8)
+    data.add(@(toBE16(0'i16)))
+    # lexeme "foo" + null + npos=1 + position 2 with weight B (weight=2, 2 << 14 | 2 = 0x8002)
+    for c in "foo":
+      data.add(byte(c))
+    data.add(0'u8)
+    data.add(@(toBE16(1'i16)))
+    data.add(@(toBE16(cast[int16](0x8002'u16))))
+    let fields = @[mkField(OidTsVector, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let v = row.getTsVector(0)
+    check "'bar' 'foo':2B" == $v
+
+  test "getTsQuery binary format simple AND":
+    # Binary tsquery for 'cat' & 'dog' (postfix: cat, dog, AND)
+    var data: seq[byte] = @[]
+    # ntokens = 3
+    data.add(@(toBE32(3'i32)))
+    # operand "cat": type=1, weight=0, prefix=0, "cat\0"
+    data.add(1'u8) # type
+    data.add(0'u8) # weight
+    data.add(0'u8) # prefix
+    for c in "cat":
+      data.add(byte(c))
+    data.add(0'u8)
+    # operand "dog": type=1, weight=0, prefix=0, "dog\0"
+    data.add(1'u8)
+    data.add(0'u8)
+    data.add(0'u8)
+    for c in "dog":
+      data.add(byte(c))
+    data.add(0'u8)
+    # AND operator: type=2, op=2
+    data.add(2'u8)
+    data.add(2'u8)
+    let fields = @[mkField(OidTsQuery, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let q = row.getTsQuery(0)
+    check "'cat' & 'dog'" == $q
+
+  test "getTsQuery binary format NOT":
+    # Binary tsquery for !'cat' (postfix: cat, NOT)
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(2'i32)))
+    # operand "cat"
+    data.add(1'u8)
+    data.add(0'u8)
+    data.add(0'u8)
+    for c in "cat":
+      data.add(byte(c))
+    data.add(0'u8)
+    # NOT operator: type=2, op=1
+    data.add(2'u8)
+    data.add(1'u8)
+    let fields = @[mkField(OidTsQuery, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let q = row.getTsQuery(0)
+    check "!'cat'" == $q
+
+  test "getTsQuery binary format PHRASE":
+    # Binary tsquery for 'cat' <-> 'dog' (postfix: cat, dog, PHRASE dist=1)
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(3'i32)))
+    # operand "cat"
+    data.add(1'u8)
+    data.add(0'u8)
+    data.add(0'u8)
+    for c in "cat":
+      data.add(byte(c))
+    data.add(0'u8)
+    # operand "dog"
+    data.add(1'u8)
+    data.add(0'u8)
+    data.add(0'u8)
+    for c in "dog":
+      data.add(byte(c))
+    data.add(0'u8)
+    # PHRASE operator: type=2, op=4, distance=1
+    data.add(2'u8)
+    data.add(4'u8)
+    data.add(@(toBE16(1'i16)))
+    let fields = @[mkField(OidTsQuery, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let q = row.getTsQuery(0)
+    check "'cat' <-> 'dog'" == $q
+
+  test "getTsQuery binary format with weight and prefix":
+    # Binary tsquery for 'cat':AB* (single operand with weights A+B and prefix)
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(1'i32)))
+    # operand "cat": type=1, weight=0x0C (A=0x08 + B=0x04), prefix=1
+    data.add(1'u8)
+    data.add(0x0C'u8) # A + B
+    data.add(1'u8) # prefix
+    for c in "cat":
+      data.add(byte(c))
+    data.add(0'u8)
+    let fields = @[mkField(OidTsQuery, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let q = row.getTsQuery(0)
+    check "'cat':AB*" == $q
+
+  test "getTsVectorOpt text some":
+    let data = toBytes("'cat':1A")
+    let fields = @[mkField(OidTsVector, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let r = row.getTsVectorOpt(0)
+    check r.isSome
+    check $r.get == "'cat':1A"
+
+  test "getTsVectorOpt none":
+    let fields = @[mkField(OidTsVector, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getTsVectorOpt(0).isNone
+
+  test "getTsQueryOpt text some":
+    let data = toBytes("'cat' & 'dog'")
+    let fields = @[mkField(OidTsQuery, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let r = row.getTsQueryOpt(0)
+    check r.isSome
+    check $r.get == "'cat' & 'dog'"
+
+  test "getTsQueryOpt none":
+    let fields = @[mkField(OidTsQuery, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getTsQueryOpt(0).isNone

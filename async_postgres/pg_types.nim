@@ -48,6 +48,9 @@ type
 
   PgMacAddr8* = distinct string ## EUI-64 MAC address as "08:00:2b:01:02:03:04:05"
 
+  PgTsVector* = distinct string ## PostgreSQL tsvector (full-text search document).
+  PgTsQuery* = distinct string ## PostgreSQL tsquery (full-text search query).
+
   PgPoint* = object ## PostgreSQL point type: (x, y).
     x*: float64
     y*: float64
@@ -192,6 +195,10 @@ const
   OidDateMultirange* = 4535'i32
   OidInt8Multirange* = 4536'i32
 
+  # Full-text search types
+  OidTsVector* = 3614'i32
+  OidTsQuery* = 3615'i32
+
   rangeEmpty* = 0x01'u8 ## Range flag: range is empty.
   rangeHasLower* = 0x02'u8 ## Range flag: lower bound present.
   rangeHasUpper* = 0x04'u8 ## Range flag: upper bound present.
@@ -207,6 +214,12 @@ proc `==`*(a, b: PgMacAddr): bool {.borrow.}
 
 proc `$`*(v: PgMacAddr8): string {.borrow.}
 proc `==`*(a, b: PgMacAddr8): bool {.borrow.}
+
+proc `$`*(v: PgTsVector): string {.borrow.}
+proc `==`*(a, b: PgTsVector): bool {.borrow.}
+
+proc `$`*(v: PgTsQuery): string {.borrow.}
+proc `==`*(a, b: PgTsQuery): bool {.borrow.}
 
 proc parsePgNumeric*(s: string): PgNumeric =
   ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN") into PgNumeric.
@@ -631,6 +644,12 @@ proc toPgParam*(v: PgMacAddr): PgParam =
 proc toPgParam*(v: PgMacAddr8): PgParam =
   PgParam(oid: OidMacAddr8, format: 0, value: some(toBytes(string(v))))
 
+proc toPgParam*(v: PgTsVector): PgParam =
+  PgParam(oid: OidTsVector, format: 0, value: some(toBytes(string(v))))
+
+proc toPgParam*(v: PgTsQuery): PgParam =
+  PgParam(oid: OidTsQuery, format: 0, value: some(toBytes(string(v))))
+
 proc toPgParam*(v: PgPoint): PgParam =
   PgParam(oid: OidPoint, format: 0, value: some(toBytes($v)))
 
@@ -951,6 +970,14 @@ proc toPgBinaryParam*(v: PgMacAddr8): PgParam =
   for i in 0 ..< 8:
     data[i] = byte(parseHexInt(parts[i]))
   PgParam(oid: OidMacAddr8, format: 1, value: some(data))
+
+proc toPgBinaryParam*(v: PgTsVector): PgParam =
+  ## Send as text format — PostgreSQL handles the parsing.
+  PgParam(oid: OidTsVector, format: 0, value: some(toBytes(string(v))))
+
+proc toPgBinaryParam*(v: PgTsQuery): PgParam =
+  ## Send as text format — PostgreSQL handles the parsing.
+  PgParam(oid: OidTsQuery, format: 0, value: some(toBytes(string(v))))
 
 proc encodePointBinary(p: PgPoint): seq[byte] =
   ## Encode a point as 16 bytes (two float64 big-endian).
@@ -1852,6 +1879,165 @@ proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
     return PgMacAddr8(parts.join(":"))
   PgMacAddr8(row.getStr(col))
 
+proc decodeBinaryTsVector(data: openArray[byte]): string =
+  ## Decode PostgreSQL binary tsvector to text representation.
+  if data.len < 4:
+    raise newException(PgTypeError, "tsvector binary data too short")
+  let nlexemes = int(fromBE32(data.toOpenArray(0, 3)))
+  var pos = 4
+  var parts = newSeq[string](nlexemes)
+  const weightChars = ['D', 'C', 'B', 'A']
+  for i in 0 ..< nlexemes:
+    # Read null-terminated lexeme
+    var lexEnd = pos
+    while lexEnd < data.len and data[lexEnd] != 0:
+      inc lexEnd
+    if lexEnd >= data.len:
+      raise newException(PgTypeError, "tsvector binary: lexeme missing null terminator")
+    var lexeme = newString(lexEnd - pos)
+    for j in 0 ..< lexEnd - pos:
+      lexeme[j] = char(data[pos + j])
+    pos = lexEnd + 1 # skip null terminator
+    # Read positions
+    if pos + 1 >= data.len:
+      raise newException(PgTypeError, "tsvector binary truncated at position count")
+    let npos = int(fromBE16(data.toOpenArray(pos, pos + 1)))
+    pos += 2
+    var part = "'" & lexeme & "'"
+    if npos > 0:
+      part.add(':')
+      for j in 0 ..< npos:
+        if pos + 1 >= data.len:
+          raise newException(PgTypeError, "tsvector binary truncated at position")
+        let posVal = uint16(fromBE16(data.toOpenArray(pos, pos + 1)))
+        pos += 2
+        let position = posVal and 0x3FFF
+        let weight = int((posVal shr 14) and 0x3)
+        if j > 0:
+          part.add(',')
+        part.add($position)
+        if weight > 0:
+          part.add(weightChars[weight])
+    parts[i] = part
+  parts.join(" ")
+
+proc decodeBinaryTsQuery(data: openArray[byte]): string =
+  ## Decode PostgreSQL binary tsquery (postfix) to text representation (infix).
+  if data.len < 4:
+    raise newException(PgTypeError, "tsquery binary data too short")
+  let ntokens = int(fromBE32(data.toOpenArray(0, 3)))
+  if ntokens == 0:
+    return ""
+  var pos = 4
+  var stack: seq[string]
+  for i in 0 ..< ntokens:
+    if pos >= data.len:
+      raise newException(PgTypeError, "tsquery binary truncated")
+    let tokenType = data[pos]
+    inc pos
+    case tokenType
+    of 1: # operand
+      if pos + 2 >= data.len:
+        raise newException(PgTypeError, "tsquery operand truncated")
+      let weightByte = data[pos]
+      inc pos
+      let prefix = data[pos] != 0
+      inc pos
+      var strEnd = pos
+      while strEnd < data.len and data[strEnd] != 0:
+        inc strEnd
+      if strEnd >= data.len:
+        raise
+          newException(PgTypeError, "tsquery binary: operand missing null terminator")
+      var operand = newString(strEnd - pos)
+      for j in 0 ..< strEnd - pos:
+        operand[j] = char(data[pos + j])
+      pos = strEnd + 1
+      var s = "'" & operand & "'"
+      var suffix = ""
+      if (weightByte and 0x08) != 0:
+        suffix.add('A')
+      if (weightByte and 0x04) != 0:
+        suffix.add('B')
+      if (weightByte and 0x02) != 0:
+        suffix.add('C')
+      if (weightByte and 0x01) != 0:
+        suffix.add('D')
+      if suffix.len > 0 or prefix:
+        s.add(':')
+        s.add(suffix)
+        if prefix:
+          s.add('*')
+      stack.add(s)
+    of 2: # operator
+      if pos >= data.len:
+        raise newException(PgTypeError, "tsquery operator truncated")
+      let op = data[pos]
+      inc pos
+      case op
+      of 1: # NOT
+        if stack.len < 1:
+          raise newException(PgTypeError, "tsquery binary: NOT with empty stack")
+        let arg = stack.pop()
+        stack.add("!" & arg)
+      of 2: # AND
+        if stack.len < 2:
+          raise
+            newException(PgTypeError, "tsquery binary: AND with insufficient operands")
+        let right = stack.pop()
+        let left = stack.pop()
+        stack.add(left & " & " & right)
+      of 3: # OR
+        if stack.len < 2:
+          raise
+            newException(PgTypeError, "tsquery binary: OR with insufficient operands")
+        let right = stack.pop()
+        let left = stack.pop()
+        stack.add("( " & left & " | " & right & " )")
+      of 4: # PHRASE
+        if pos + 1 >= data.len:
+          raise newException(PgTypeError, "tsquery PHRASE distance truncated")
+        if stack.len < 2:
+          raise newException(
+            PgTypeError, "tsquery binary: PHRASE with insufficient operands"
+          )
+        let distance = int(fromBE16(data.toOpenArray(pos, pos + 1)))
+        pos += 2
+        let right = stack.pop()
+        let left = stack.pop()
+        if distance == 1:
+          stack.add(left & " <-> " & right)
+        else:
+          stack.add(left & " <" & $distance & "> " & right)
+      else:
+        raise newException(PgTypeError, "Unknown tsquery operator: " & $op)
+    else:
+      raise newException(PgTypeError, "Unknown tsquery token type: " & $tokenType)
+  if stack.len != 1:
+    raise newException(
+      PgTypeError, "Invalid tsquery binary: stack has " & $stack.len & " items"
+    )
+  stack[0]
+
+proc getTsVector*(row: Row, col: int): PgTsVector =
+  ## Get a column value as PgTsVector. Handles both text and binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return
+      PgTsVector(decodeBinaryTsVector(row.data.buf.toOpenArray(off, off + clen - 1)))
+  PgTsVector(row.getStr(col))
+
+proc getTsQuery*(row: Row, col: int): PgTsQuery =
+  ## Get a column value as PgTsQuery. Handles both text and binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return PgTsQuery(decodeBinaryTsQuery(row.data.buf.toOpenArray(off, off + clen - 1)))
+  PgTsQuery(row.getStr(col))
+
 # Geometry text format parsers
 
 proc parsePointText(s: string): PgPoint =
@@ -2085,6 +2271,8 @@ optAccessor(getInet, getInetOpt, PgInet)
 optAccessor(getCidr, getCidrOpt, PgCidr)
 optAccessor(getMacAddr, getMacAddrOpt, PgMacAddr)
 optAccessor(getMacAddr8, getMacAddr8Opt, PgMacAddr8)
+optAccessor(getTsVector, getTsVectorOpt, PgTsVector)
+optAccessor(getTsQuery, getTsQueryOpt, PgTsQuery)
 optAccessor(getPoint, getPointOpt, PgPoint)
 optAccessor(getLine, getLineOpt, PgLine)
 optAccessor(getLseg, getLsegOpt, PgLseg)
@@ -3665,6 +3853,12 @@ proc get*(row: Row, col: int, T: typedesc[PgMacAddr]): PgMacAddr =
 proc get*(row: Row, col: int, T: typedesc[PgMacAddr8]): PgMacAddr8 =
   row.getMacAddr8(col)
 
+proc get*(row: Row, col: int, T: typedesc[PgTsVector]): PgTsVector =
+  row.getTsVector(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgTsQuery]): PgTsQuery =
+  row.getTsQuery(col)
+
 proc get*(row: Row, col: int, T: typedesc[PgPoint]): PgPoint =
   row.getPoint(col)
 
@@ -3785,6 +3979,8 @@ nameAccessor(getInet, PgInet)
 nameAccessor(getCidr, PgCidr)
 nameAccessor(getMacAddr, PgMacAddr)
 nameAccessor(getMacAddr8, PgMacAddr8)
+nameAccessor(getTsVector, PgTsVector)
+nameAccessor(getTsQuery, PgTsQuery)
 nameAccessor(getPoint, PgPoint)
 nameAccessor(getLine, PgLine)
 nameAccessor(getLseg, PgLseg)
@@ -3805,6 +4001,8 @@ nameAccessor(getInetOpt, Option[PgInet])
 nameAccessor(getCidrOpt, Option[PgCidr])
 nameAccessor(getMacAddrOpt, Option[PgMacAddr])
 nameAccessor(getMacAddr8Opt, Option[PgMacAddr8])
+nameAccessor(getTsVectorOpt, Option[PgTsVector])
+nameAccessor(getTsQueryOpt, Option[PgTsQuery])
 nameAccessor(getPointOpt, Option[PgPoint])
 nameAccessor(getLineOpt, Option[PgLine])
 nameAccessor(getLsegOpt, Option[PgLseg])
