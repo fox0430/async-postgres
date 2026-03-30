@@ -3430,6 +3430,136 @@ suite "Multirange binary roundtrip":
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getInt4MultirangeOpt(0).isNone
 
+suite "Range array binary roundtrip":
+  test "int4range[] roundtrip":
+    let orig = @[rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32)]
+    let p = toPgBinaryParam(orig)
+    check p.oid == OidInt4RangeArray
+    check p.format == 1'i16
+    let fields = @[mkField(OidInt4RangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4RangeArray(0)
+    check decoded == orig
+
+  test "int8range[] roundtrip":
+    let orig = @[rangeOf(100'i64, 200'i64), rangeOf(300'i64, 400'i64)]
+    let p = toPgBinaryParam(orig)
+    check p.oid == OidInt8RangeArray
+    let fields = @[mkField(OidInt8RangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt8RangeArray(0)
+    check decoded == orig
+
+  test "numrange[] roundtrip":
+    let orig = @[
+      rangeOf(parsePgNumeric("1.5"), parsePgNumeric("9.5")),
+      rangeOf(parsePgNumeric("10.0"), parsePgNumeric("20.0")),
+    ]
+    let p = toPgBinaryParam(orig)
+    check p.oid == OidNumRangeArray
+    let fields = @[mkField(OidNumRangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getNumRangeArray(0)
+    check decoded == orig
+
+  test "tsrange[] roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let dt3 = dateTime(2023, mJul, 1, zone = utc())
+    let dt4 = dateTime(2023, mDec, 31, zone = utc())
+    let orig = @[rangeOf(dt1, dt2), rangeOf(dt3, dt4)]
+    let p = toPgBinaryParam(orig)
+    check p.oid == OidTsRangeArray
+    let fields = @[mkField(OidTsRangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getTsRangeArray(0)
+    check decoded.len == 2
+    check decoded[0].lower.value.year == 2023
+    check decoded[0].lower.value.month == mJan
+
+  test "tstzrange[] roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let orig = @[rangeOf(dt1, dt2)]
+    let p = toPgBinaryTsTzRangeArrayParam(orig)
+    check p.oid == OidTsTzRangeArray
+    let fields = @[mkField(OidTsTzRangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getTsTzRangeArray(0)
+    check decoded.len == 1
+    check decoded[0].lower.value.year == 2023
+
+  test "daterange[] roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let orig = @[rangeOf(dt1, dt2)]
+    let p = toPgBinaryDateRangeArrayParam(orig)
+    check p.oid == OidDateRangeArray
+    let fields = @[mkField(OidDateRangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getDateRangeArray(0)
+    check decoded.len == 1
+    check decoded[0].lower.value.year == 2023
+    check decoded[0].lower.value.month == mJan
+
+  test "empty int4range[] roundtrip":
+    let orig: seq[PgRange[int32]] = @[]
+    let p = toPgBinaryParam(orig)
+    check p.oid == OidInt4RangeArray
+    let fields = @[mkField(OidInt4RangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4RangeArray(0)
+    check decoded.len == 0
+
+  test "int4range[] with empty range element":
+    let orig = @[rangeOf(1'i32, 10'i32), emptyRange[int32]()]
+    let p = toPgBinaryParam(orig)
+    let fields = @[mkField(OidInt4RangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getInt4RangeArray(0)
+    check decoded.len == 2
+    check decoded[0] == rangeOf(1'i32, 10'i32)
+    check decoded[1].isEmpty == true
+
+suite "Range array row getters":
+  test "getInt4RangeArray text":
+    let row: Row = @[some(toBytes("{\"[1,10)\",\"[20,30)\"}"))]
+    let arr = row.getInt4RangeArray(0)
+    check arr.len == 2
+    check arr[0] == rangeOf(1'i32, 10'i32)
+    check arr[1] == rangeOf(20'i32, 30'i32)
+
+  test "getInt8RangeArray text":
+    let row: Row = @[some(toBytes("{\"[100,200)\"}"))]
+    let arr = row.getInt8RangeArray(0)
+    check arr.len == 1
+    check arr[0] == rangeOf(100'i64, 200'i64)
+
+  test "getNumRangeArray text":
+    let row: Row = @[some(toBytes("{\"[1.5,9.5)\"}"))]
+    let arr = row.getNumRangeArray(0)
+    check arr.len == 1
+    check arr[0].lower.value == parsePgNumeric("1.5")
+
+  test "getDateRangeArray text":
+    let row: Row = @[some(toBytes("{\"[2023-01-01,2023-12-31)\"}"))]
+    let arr = row.getDateRangeArray(0)
+    check arr.len == 1
+    check arr[0].lower.value.year == 2023
+
+  test "getInt4RangeArrayOpt some":
+    let p = toPgBinaryParam(@[rangeOf(1'i32, 10'i32)])
+    let fields = @[mkField(OidInt4RangeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let r = row.getInt4RangeArrayOpt(0)
+    check r.isSome
+    check r.get.len == 1
+
+  test "getInt4RangeArrayOpt none":
+    let fields = @[mkField(OidInt4RangeArray, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getInt4RangeArrayOpt(0).isNone
+
 suite "Geometry types":
   test "OID constants":
     check OidPoint == 600'i32
