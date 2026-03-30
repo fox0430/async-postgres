@@ -3924,3 +3924,53 @@ suite "tsvector / tsquery":
     let fields = @[mkField(OidTsQuery, 0'i16)]
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getTsQueryOpt(0).isNone
+
+suite "xml":
+  test "OID constant":
+    check OidXml == 142'i32
+
+  test "toPgParam PgXml":
+    let v = PgXml("<root><item>hello</item></root>")
+    let p = toPgParam(v)
+    check p.oid == OidXml
+    check p.format == 0
+    check toString(p.value.get) == "<root><item>hello</item></root>"
+
+  test "toPgBinaryParam PgXml sends binary format":
+    let v = PgXml("<root/>")
+    let p = toPgBinaryParam(v)
+    check p.oid == OidXml
+    check p.format == 1
+
+  test "$ PgXml":
+    let v = PgXml("<root/>")
+    check $v == "<root/>"
+
+  test "== PgXml":
+    check PgXml("<a/>") == PgXml("<a/>")
+    check PgXml("<a/>") != PgXml("<b/>")
+
+  test "getXml text format":
+    let data = toBytes("<root><item>test</item></root>")
+    let fields = @[mkField(OidXml, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    check $row.getXml(0) == "<root><item>test</item></root>"
+
+  test "getXml binary format":
+    let data = toBytes("<root><item>test</item></root>")
+    let fields = @[mkField(OidXml, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    check $row.getXml(0) == "<root><item>test</item></root>"
+
+  test "getXmlOpt some":
+    let data = toBytes("<root/>")
+    let fields = @[mkField(OidXml, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let r = row.getXmlOpt(0)
+    check r.isSome
+    check $r.get == "<root/>"
+
+  test "getXmlOpt none":
+    let fields = @[mkField(OidXml, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getXmlOpt(0).isNone
