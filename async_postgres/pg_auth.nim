@@ -29,6 +29,11 @@ proc md5AuthHash*(user, password: string, salt: array[4, byte]): string =
     saltedInput.add(char(b))
   result = "md5" & getMD5(saltedInput)
 
+proc scramEscapeUsername*(user: string): string =
+  ## Escape username for SCRAM per RFC 5802 Section 5.1.
+  ## '=' is encoded as '=3D' and ',' is encoded as '=2C'.
+  result = user.replace("=", "=3D").replace(",", "=2C")
+
 proc scramClientFirstMessage*(user: string, state: var ScramState): seq[byte] =
   ## Generate the SCRAM-SHA-256 client-first message with a random nonce.
   var nonceBuf: array[24, byte]
@@ -36,7 +41,7 @@ proc scramClientFirstMessage*(user: string, state: var ScramState): seq[byte] =
   if n != 24:
     raise newException(CatchableError, "SCRAM: failed to generate random nonce")
   state.clientNonce = base64.encode(nonceBuf)
-  state.clientFirstBare = "n=" & user & ",r=" & state.clientNonce
+  state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & state.clientNonce
   result = toBytes("n,," & state.clientFirstBare)
 
 proc scramClientFirstMessage*(
@@ -44,7 +49,7 @@ proc scramClientFirstMessage*(
 ): seq[byte] =
   ## Overload with explicit nonce for testing.
   state.clientNonce = nonce
-  state.clientFirstBare = "n=" & user & ",r=" & nonce
+  state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & nonce
   result = toBytes("n,," & state.clientFirstBare)
 
 proc scramClientFinalMessage*(
