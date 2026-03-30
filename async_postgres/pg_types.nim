@@ -51,6 +51,8 @@ type
   PgTsVector* = distinct string ## PostgreSQL tsvector (full-text search document).
   PgTsQuery* = distinct string ## PostgreSQL tsquery (full-text search query).
 
+  PgXml* = distinct string ## PostgreSQL xml type.
+
   PgPoint* = object ## PostgreSQL point type: (x, y).
     x*: float64
     y*: float64
@@ -199,6 +201,8 @@ const
   OidTsVector* = 3614'i32
   OidTsQuery* = 3615'i32
 
+  OidXml* = 142'i32
+
   rangeEmpty* = 0x01'u8 ## Range flag: range is empty.
   rangeHasLower* = 0x02'u8 ## Range flag: lower bound present.
   rangeHasUpper* = 0x04'u8 ## Range flag: upper bound present.
@@ -220,6 +224,9 @@ proc `==`*(a, b: PgTsVector): bool {.borrow.}
 
 proc `$`*(v: PgTsQuery): string {.borrow.}
 proc `==`*(a, b: PgTsQuery): bool {.borrow.}
+
+proc `$`*(v: PgXml): string {.borrow.}
+proc `==`*(a, b: PgXml): bool {.borrow.}
 
 proc parsePgNumeric*(s: string): PgNumeric =
   ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN") into PgNumeric.
@@ -650,6 +657,9 @@ proc toPgParam*(v: PgTsVector): PgParam =
 proc toPgParam*(v: PgTsQuery): PgParam =
   PgParam(oid: OidTsQuery, format: 0, value: some(toBytes(string(v))))
 
+proc toPgParam*(v: PgXml): PgParam =
+  PgParam(oid: OidXml, format: 0, value: some(toBytes(string(v))))
+
 proc toPgParam*(v: PgPoint): PgParam =
   PgParam(oid: OidPoint, format: 0, value: some(toBytes($v)))
 
@@ -978,6 +988,10 @@ proc toPgBinaryParam*(v: PgTsVector): PgParam =
 proc toPgBinaryParam*(v: PgTsQuery): PgParam =
   ## Send as text format — PostgreSQL handles the parsing.
   PgParam(oid: OidTsQuery, format: 0, value: some(toBytes(string(v))))
+
+proc toPgBinaryParam*(v: PgXml): PgParam =
+  ## Binary wire format for xml is the text representation itself.
+  PgParam(oid: OidXml, format: 1, value: some(toBytes(string(v))))
 
 proc encodePointBinary(p: PgPoint): seq[byte] =
   ## Encode a point as 16 bytes (two float64 big-endian).
@@ -2021,6 +2035,18 @@ proc getTsQuery*(row: Row, col: int): PgTsQuery =
     return PgTsQuery(decodeBinaryTsQuery(row.data.buf.toOpenArray(off, off + clen - 1)))
   PgTsQuery(row.getStr(col))
 
+proc getXml*(row: Row, col: int): PgXml =
+  ## Get a column value as PgXml. Handles both text and binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    var s = newString(clen)
+    for i in 0 ..< clen:
+      s[i] = char(row.data.buf[off + i])
+    return PgXml(s)
+  PgXml(row.getStr(col))
+
 # Geometry text format parsers
 
 proc parsePointText(s: string): PgPoint =
@@ -2256,6 +2282,7 @@ optAccessor(getMacAddr, getMacAddrOpt, PgMacAddr)
 optAccessor(getMacAddr8, getMacAddr8Opt, PgMacAddr8)
 optAccessor(getTsVector, getTsVectorOpt, PgTsVector)
 optAccessor(getTsQuery, getTsQueryOpt, PgTsQuery)
+optAccessor(getXml, getXmlOpt, PgXml)
 optAccessor(getPoint, getPointOpt, PgPoint)
 optAccessor(getLine, getLineOpt, PgLine)
 optAccessor(getLseg, getLsegOpt, PgLseg)
@@ -3842,6 +3869,9 @@ proc get*(row: Row, col: int, T: typedesc[PgTsVector]): PgTsVector =
 proc get*(row: Row, col: int, T: typedesc[PgTsQuery]): PgTsQuery =
   row.getTsQuery(col)
 
+proc get*(row: Row, col: int, T: typedesc[PgXml]): PgXml =
+  row.getXml(col)
+
 proc get*(row: Row, col: int, T: typedesc[PgPoint]): PgPoint =
   row.getPoint(col)
 
@@ -3964,6 +3994,7 @@ nameAccessor(getMacAddr, PgMacAddr)
 nameAccessor(getMacAddr8, PgMacAddr8)
 nameAccessor(getTsVector, PgTsVector)
 nameAccessor(getTsQuery, PgTsQuery)
+nameAccessor(getXml, PgXml)
 nameAccessor(getPoint, PgPoint)
 nameAccessor(getLine, PgLine)
 nameAccessor(getLseg, PgLseg)
@@ -3986,6 +4017,7 @@ nameAccessor(getMacAddrOpt, Option[PgMacAddr])
 nameAccessor(getMacAddr8Opt, Option[PgMacAddr8])
 nameAccessor(getTsVectorOpt, Option[PgTsVector])
 nameAccessor(getTsQueryOpt, Option[PgTsQuery])
+nameAccessor(getXmlOpt, Option[PgXml])
 nameAccessor(getPointOpt, Option[PgPoint])
 nameAccessor(getLineOpt, Option[PgLine])
 nameAccessor(getLsegOpt, Option[PgLseg])

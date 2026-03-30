@@ -6140,3 +6140,48 @@ suite "E2E: cancelNoWait":
       await conn.close()
 
     waitFor t()
+
+  test "xml roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgXml("<root><item>hello</item></root>")
+      let res = await conn.query("SELECT $1::xml", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getXml(0)
+      doAssert $got == "<root><item>hello</item></root>"
+      await conn.close()
+
+    waitFor t()
+
+  test "xmlparse function":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT xmlparse(CONTENT '<item>test</item>')")
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getXml(0)
+      doAssert "<item>test</item>" == $v
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL xml":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::xml")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getXmlOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "xml binary results":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT '<root>data</root>'::xml", resultFormat = rfBinary)
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getXml(0)
+      doAssert "<root>data</root>" == $v
+      await conn.close()
+
+    waitFor t()
