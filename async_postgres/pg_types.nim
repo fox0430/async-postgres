@@ -1,7 +1,7 @@
 import
   std/[
     hashes, json, macros, math, options, parseutils, sequtils, strutils, tables, times,
-    net,
+    typetraits, net,
   ]
 
 import pg_protocol
@@ -3095,6 +3095,63 @@ proc getCompositeOpt*[T: object](row: Row, col: int): Option[T] =
     none(T)
   else:
     some(getComposite[T](row, col))
+
+# User-defined domain type support
+#
+# PostgreSQL domain types are named constraints over a base type.
+# They have their own OID but share the wire format of the base type.
+# In Nim, they map naturally to ``distinct`` types.
+#
+# Usage:
+#   type UsPostalCode = distinct string
+#
+#   pgDomain(UsPostalCode, string)              # OID = 0; base type OID used
+#   pgDomain(UsPostalCode, string, 12345'i32)   # explicit domain OID
+#
+# Reading rows:
+#   let z = row.getDomain[UsPostalCode](0)
+#   let z = row.getDomainOpt[UsPostalCode](0)
+
+macro pgDomain*(T: typedesc, Base: typedesc, oid: int32 = 0'i32): untyped =
+  ## Generate ``toPgParam`` for a Nim distinct type as a PostgreSQL domain type.
+  ## Encoding delegates to the base type's ``toPgParam``.
+  ## When OID is 0 (default), the base type's OID is used.
+  let tSym = T.getType[1]
+  let bSym = Base.getType[1]
+  result = newStmtList()
+  result.add quote do:
+    proc toPgParam*(v: `tSym`): PgParam =
+      result = toPgParam(`bSym`(v))
+      if `oid` != 0'i32:
+        result.oid = `oid`
+
+proc getDomain*[T: distinct](row: Row, col: int): T =
+  ## Read a PostgreSQL domain column as a Nim distinct type.
+  ## The base type determines which row accessor is used.
+  when distinctBase(T) is string:
+    T(row.getStr(col))
+  elif distinctBase(T) is int16:
+    T(int16(row.getInt(col)))
+  elif distinctBase(T) is int32:
+    T(row.getInt(col))
+  elif distinctBase(T) is int64:
+    T(row.getInt64(col))
+  elif distinctBase(T) is float64:
+    T(row.getFloat(col))
+  elif distinctBase(T) is bool:
+    T(row.getBool(col))
+  else:
+    {.
+      error:
+        "Unsupported domain base type: use string, int16, int32, int64, float64, or bool"
+    .}
+
+proc getDomainOpt*[T: distinct](row: Row, col: int): Option[T] =
+  ## NULL-safe version of ``getDomain``.
+  if row.isNull(col):
+    none(T)
+  else:
+    some(getDomain[T](row, col))
 
 # Range type support
 #
