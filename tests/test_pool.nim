@@ -1065,3 +1065,151 @@ suite "Error type granularity":
     except PgError:
       caught = true
     check caught
+
+suite "Pool metrics":
+  test "initial metrics are zero":
+    let pool = makePool()
+    let m = pool.metrics
+    check m.acquireCount == 0
+    check m.acquireDuration == ZeroDuration
+    check m.timeoutCount == 0
+    check m.createCount == 0
+    check m.closeCount == 0
+
+  test "acquire from idle increments acquireCount":
+    let pool = makePool()
+    let conn = mockConn()
+    pool.idle.addLast(conn.toPooled())
+    discard waitFor pool.acquire()
+    check pool.metrics.acquireCount == 1
+
+  test "acquire tracks acquireDuration":
+    let pool = makePool()
+    let conn = mockConn()
+    pool.idle.addLast(conn.toPooled())
+    discard waitFor pool.acquire()
+    check pool.metrics.acquireDuration >= ZeroDuration
+
+  test "acquire skipping broken connections increments closeCount":
+    let pool = makePool()
+    let broken = mockConn(csClosed)
+    let good = mockConn()
+    pool.idle.addLast(broken.toPooled())
+    pool.idle.addLast(good.toPooled())
+    discard waitFor pool.acquire()
+    check pool.metrics.closeCount == 1
+    check pool.metrics.acquireCount == 1
+
+  test "release broken connection increments closeCount":
+    let pool = makePool()
+    pool.active = 1
+    let conn = mockConn(csClosed)
+    pool.release(conn)
+    check pool.metrics.closeCount == 1
+
+  test "release to closed pool increments closeCount":
+    let pool = makePool()
+    pool.active = 1
+    pool.closed = true
+    let conn = mockConn()
+    pool.release(conn)
+    check pool.metrics.closeCount == 1
+
+  test "close draining idle connections increments closeCount":
+    let pool = makePool()
+    let conn1 = mockConn(csClosed)
+    let conn2 = mockConn(csClosed)
+    pool.idle.addLast(conn1.toPooled())
+    pool.idle.addLast(conn2.toPooled())
+    waitFor pool.close()
+    check pool.metrics.closeCount == 2
+
+  test "acquire timeout increments timeoutCount":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.acquireTimeout = milliseconds(50)
+      pool.active = 1
+
+      try:
+        discard await pool.acquire()
+      except PgError:
+        discard
+
+      doAssert pool.metrics.timeoutCount == 1
+      doAssert pool.metrics.acquireCount == 0
+
+    waitFor t()
+
+  test "multiple acquires accumulate metrics":
+    let pool = makePool()
+    for i in 0 ..< 3:
+      let conn = mockConn()
+      pool.idle.addLast(conn.toPooled())
+      discard waitFor pool.acquire()
+      pool.active.dec
+      pool.idle.addLast(conn.toPooled())
+    check pool.metrics.acquireCount == 3
+
+  test "waiter transfer increments acquireCount":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+
+    let acquireFut = pool.acquire()
+    check not acquireFut.finished
+
+    let conn = mockConn()
+    pool.release(conn)
+    discard waitFor acquireFut
+    check pool.metrics.acquireCount == 1
+
+  test "acquire skipping maxLifetime-expired connections increments closeCount":
+    let pool = makePool()
+    pool.config.maxLifetime = seconds(1)
+    let expired = mockConn()
+    expired.createdAt = Moment.now() - seconds(5)
+    expired.state = csClosed
+    let good = mockConn()
+    pool.idle.addLast(expired.toPooled())
+    pool.idle.addLast(good.toPooled())
+    discard waitFor pool.acquire()
+    check pool.metrics.closeCount == 1
+    check pool.metrics.acquireCount == 1
+
+  test "acquireDuration accumulates across multiple acquires":
+    let pool = makePool()
+    for i in 0 ..< 3:
+      let conn = mockConn()
+      pool.idle.addLast(conn.toPooled())
+      discard waitFor pool.acquire()
+      pool.active.dec
+    check pool.metrics.acquireCount == 3
+    check pool.metrics.acquireDuration >= ZeroDuration
+
+  test "waiter transfer tracks acquireDuration":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+
+    let acquireFut = pool.acquire()
+    check not acquireFut.finished
+
+    let conn = mockConn()
+    pool.release(conn)
+    discard waitFor acquireFut
+    check pool.metrics.acquireCount == 1
+    check pool.metrics.acquireDuration >= ZeroDuration
+
+  test "acquire timeout does not increment createCount":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.acquireTimeout = milliseconds(50)
+      pool.active = 1
+
+      try:
+        discard await pool.acquire()
+      except PgError:
+        discard
+
+      doAssert pool.metrics.createCount == 0
+      doAssert pool.metrics.timeoutCount == 1
+
+    waitFor t()
