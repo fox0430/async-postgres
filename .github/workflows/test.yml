@@ -78,16 +78,10 @@ jobs:
         run: nimble install -y
 
       - name: Compile examples (asyncdispatch)
-        run: |
-          nim c examples/basic_query.nim
-          nim c examples/pool.nim
-          nim c examples/listen_notify.nim
+        run: for f in examples/*.nim; do nim c "$f"; done
 
       - name: Compile examples (chronos)
-        run: |
-          nim c -d:asyncBackend=chronos examples/basic_query.nim
-          nim c -d:asyncBackend=chronos examples/pool.nim
-          nim c -d:asyncBackend=chronos examples/listen_notify.nim
+        run: for f in examples/*.nim; do nim c -d:asyncBackend=chronos "$f"; done
 
       - name: Gen docs
         run: |
