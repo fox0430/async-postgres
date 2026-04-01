@@ -96,9 +96,35 @@ proc sendAuthOkAndReady(client: MockClient): Future[void] {.async.} =
   resp.add(buildBackendMsg('Z', @[byte('I')]))
   await sendBytes(client, resp)
 
+proc sendEmptyQueryResult(client: MockClient): Future[void] {.async.} =
+  ## Respond to the hstore OID discovery query with an empty result set.
+  var resp: seq[byte]
+  # CommandComplete: "SELECT 0"
+  var ccBody: seq[byte] = @[]
+  for c in "SELECT 0":
+    ccBody.add(byte(c))
+  ccBody.add(0'u8)
+  resp.add(buildBackendMsg('C', ccBody))
+  # ReadyForQuery
+  resp.add(buildBackendMsg('Z', @[byte('I')]))
+  await sendBytes(client, resp)
+
+proc drainFrontendMessage(client: MockClient): Future[void] {.async.} =
+  ## Read a frontend message (type byte + int32 length + body).
+  discard await readN(client, 1) # message type
+  let lenBuf = await readN(client, 4)
+  let msgLen = decodeInt32(lenBuf, 0)
+  if msgLen > 4:
+    discard await readN(client, msgLen - 4)
+
 proc drainUntilClose(client: MockClient): Future[void] {.async.} =
   try:
-    discard await readN(client, 64)
+    # Drain the hstore discovery query ('Q' message)
+    await drainFrontendMessage(client)
+    # Send back an empty result + ReadyForQuery
+    await sendEmptyQueryResult(client)
+    # Drain the Terminate message
+    await drainFrontendMessage(client)
   except CatchableError:
     discard
 
