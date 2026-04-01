@@ -134,6 +134,27 @@ suite "Read routing":
 
     waitFor t()
 
+  test "withWriteConnection and withReadConnection in same scope with same name":
+    proc t() {.async.} =
+      let cluster = makeCluster()
+      let wConn = mockConn()
+      let rConn = mockConn()
+      cluster.primary.idle.addLast(PooledConn(conn: wConn, lastUsedAt: Moment.now()))
+      cluster.replica.idle.addLast(PooledConn(conn: rConn, lastUsedAt: Moment.now()))
+
+      cluster.withWriteConnection(conn):
+        doAssert conn == wConn
+        doAssert cluster.primary.active == 1
+
+      cluster.withReadConnection(conn):
+        doAssert conn == rConn
+        doAssert cluster.replica.active == 1
+
+      doAssert cluster.primary.active == 0
+      doAssert cluster.replica.active == 0
+
+    waitFor t()
+
 suite "Exception safety":
   test "withReadConnection releases on exception":
     proc t() {.async.} =

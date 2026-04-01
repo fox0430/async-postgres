@@ -108,21 +108,23 @@ proc acquireRead(
 template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
   ## Acquire a read connection (from replica, with optional primary fallback),
   ## execute `body`, then release.
-  let (conn, pool) = await acquireRead(cluster)
-  try:
-    body
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  block:
+    let (conn, connPool) = await acquireRead(cluster)
+    try:
+      body
+    finally:
+      await connPool.resetSession(conn)
+      connPool.release(conn)
 
 template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
-  let conn = await cluster.primary.acquire()
-  try:
-    body
-  finally:
-    await cluster.primary.resetSession(conn)
-    cluster.primary.release(conn)
+  block:
+    let conn = await cluster.primary.acquire()
+    try:
+      body
+    finally:
+      await cluster.primary.resetSession(conn)
+      cluster.primary.release(conn)
 
 # Macro to generate cluster forwarding procs from compact declarations.
 # Each entry is a bodiless `proc` whose name starts with "read" or "write".
