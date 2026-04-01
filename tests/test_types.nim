@@ -4287,3 +4287,145 @@ suite "xml":
     let fields = @[mkField(OidXml, 0'i16)]
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getXmlOpt(0).isNone
+
+suite "hstore":
+  test "encodeHstoreText empty":
+    let h: PgHstore = initTable[string, Option[string]]()
+    check encodeHstoreText(h) == ""
+
+  test "encodeHstoreText single pair":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["key"] = some("val")
+    check encodeHstoreText(h) == "\"key\"=>\"val\""
+
+  test "encodeHstoreText NULL value":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["key"] = none(string)
+    check encodeHstoreText(h) == "\"key\"=>NULL"
+
+  test "encodeHstoreText escape":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["k\"ey"] = some("v\\al")
+    check encodeHstoreText(h) == "\"k\\\"ey\"=>\"v\\\\al\""
+
+  test "parseHstoreText empty":
+    let h = parseHstoreText("")
+    check h.len == 0
+
+  test "parseHstoreText single pair":
+    let h = parseHstoreText("\"key\"=>\"val\"")
+    check h.len == 1
+    check h["key"] == some("val")
+
+  test "parseHstoreText NULL value":
+    let h = parseHstoreText("\"key\"=>NULL")
+    check h.len == 1
+    check h["key"] == none(string)
+
+  test "parseHstoreText multiple pairs":
+    let h = parseHstoreText("\"a\"=>\"1\", \"b\"=>NULL, \"c\"=>\"3\"")
+    check h.len == 3
+    check h["a"] == some("1")
+    check h["b"] == none(string)
+    check h["c"] == some("3")
+
+  test "parseHstoreText escaped":
+    let h = parseHstoreText("\"k\\\"ey\"=>\"v\\\\al\"")
+    check h.len == 1
+    check h["k\"ey"] == some("v\\al")
+
+  test "parseHstoreText roundtrip":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["hello"] = some("world")
+    h["null_val"] = none(string)
+    let encoded = encodeHstoreText(h)
+    let decoded = parseHstoreText(encoded)
+    check decoded == h
+
+  test "encodeHstoreBinary empty":
+    let h: PgHstore = initTable[string, Option[string]]()
+    let data = encodeHstoreBinary(h)
+    check data == @[byte 0, 0, 0, 0] # numPairs = 0
+
+  test "decodeHstoreBinary empty":
+    let data = @[byte 0, 0, 0, 0]
+    let h = decodeHstoreBinary(data)
+    check h.len == 0
+
+  test "encodeHstoreBinary and decodeHstoreBinary roundtrip":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["key"] = some("val")
+    h["nul"] = none(string)
+    let data = encodeHstoreBinary(h)
+    let decoded = decodeHstoreBinary(data)
+    check decoded == h
+
+  test "decodeHstoreBinary single pair with NULL":
+    # numPairs=1, key="a" (len=1), val=NULL (len=-1)
+    let data = @[
+      byte 0,
+      0,
+      0,
+      1, # numPairs = 1
+      0,
+      0,
+      0,
+      1, # keyLen = 1
+      byte('a'), # key data
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFF, # valLen = -1 (NULL)
+    ]
+    let h = decodeHstoreBinary(data)
+    check h.len == 1
+    check h["a"] == none(string)
+
+  test "toPgParam hstore":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["k"] = some("v")
+    let p = toPgParam(h)
+    check p.oid == OidText
+    check p.format == 0
+    check p.value.isSome
+    check toString(p.value.get) == "\"k\"=>\"v\""
+
+  test "toPgBinaryParam hstore":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["k"] = some("v")
+    let p = toPgBinaryParam(h, 16385'i32)
+    check p.oid == 16385'i32
+    check p.format == 1
+    check p.value.isSome
+    let decoded = decodeHstoreBinary(p.value.get)
+    check decoded == h
+
+  test "getHstore text format":
+    let data = toBytes("\"a\"=>\"1\", \"b\"=>NULL")
+    let fields = @[mkField(OidText, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let h = row.getHstore(0)
+    check h.len == 2
+    check h["a"] == some("1")
+    check h["b"] == none(string)
+
+  test "getHstore binary format":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["key"] = some("val")
+    let data = encodeHstoreBinary(h)
+    let fields = @[mkField(16385'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    check row.getHstore(0) == h
+
+  test "getHstoreOpt some":
+    let data = toBytes("\"a\"=>\"1\"")
+    let fields = @[mkField(OidText, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let r = row.getHstoreOpt(0)
+    check r.isSome
+    check r.get["a"] == some("1")
+
+  test "getHstoreOpt none":
+    let fields = @[mkField(OidText, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getHstoreOpt(0).isNone

@@ -784,6 +784,21 @@ proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
   for i, f in fields:
     result[i] = if isBinarySafeOid(f.typeOid): 1'i16 else: 0'i16
 
+proc buildResultFormats*(
+    fields: openArray[FieldDescription], extraBinaryOids: openArray[int32]
+): seq[int16] =
+  ## Build per-column binary format codes with additional runtime-safe OIDs.
+  result = newSeq[int16](fields.len)
+  for i, f in fields:
+    if isBinarySafeOid(f.typeOid):
+      result[i] = 1'i16
+    else:
+      result[i] = 0'i16
+      for oid in extraBinaryOids:
+        if f.typeOid == oid:
+          result[i] = 1'i16
+          break
+
 proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   ## Parse a DataRow message body directly into a RowData flat buffer.
   ## Column data is appended to rd.buf and (offset, length) pairs to rd.cellIndex.
