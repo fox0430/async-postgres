@@ -2224,7 +2224,7 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
-  test "mid-stream closeCursor returns conn to ready":
+  test "mid-stream close returns conn to ready":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       discard await conn.exec("DROP TABLE IF EXISTS test_cursor_close")
@@ -2240,7 +2240,7 @@ suite "E2E: Cursor/Streaming":
       let chunk1 = await cursor.fetchNext()
       doAssert chunk1.len == 10
 
-      await cursor.closeCursor()
+      await cursor.close()
       doAssert conn.state == csReady
 
       # Connection is usable after closing cursor mid-stream
@@ -2593,7 +2593,7 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
-  test "closeCursor on already exhausted cursor":
+  test "close on already exhausted cursor":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let cursor = await conn.openCursor("SELECT 1 AS x", chunkSize = 10)
@@ -2601,8 +2601,8 @@ suite "E2E: Cursor/Streaming":
       doAssert chunk.len == 1
       doAssert cursor.exhausted
 
-      # closeCursor on exhausted cursor should be safe no-op
-      await cursor.closeCursor()
+      # close on exhausted cursor should be safe no-op
+      await cursor.close()
       doAssert conn.state == csReady
 
       let res = await conn.query("SELECT 2 AS y")

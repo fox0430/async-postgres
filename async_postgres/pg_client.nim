@@ -2497,7 +2497,7 @@ proc closeCursorImpl(
 
   cursor.exhausted = true
 
-proc closeCursor*(cursor: Cursor): Future[void] {.async.} =
+proc close*(cursor: Cursor): Future[void] {.async.} =
   ## Close the cursor and return the connection to ready state.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if cursor.timeout > ZeroDuration:
@@ -2524,7 +2524,7 @@ template withCursor*(
   try:
     body
   finally:
-    await cursorName.closeCursor()
+    await cursorName.close()
 
 proc openCursor*(
     conn: PgConnection,
