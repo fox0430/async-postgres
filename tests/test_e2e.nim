@@ -1053,6 +1053,101 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  test "withTransaction with TransactionOptions variable":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_opts_var")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_opts_var (id serial PRIMARY KEY, val text)"
+      )
+
+      let opts = TransactionOptions(isolation: ilSerializable)
+      conn.withTransaction(opts):
+        discard await conn.exec(
+          "INSERT INTO test_tx_opts_var (val) VALUES ($1)", @[toPgParam("opts_var")]
+        )
+
+      let res = await conn.query("SELECT val FROM test_tx_opts_var")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "opts_var"
+
+      discard await conn.exec("DROP TABLE test_tx_opts_var")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction with Duration variable":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_dur_var")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_dur_var (id serial PRIMARY KEY, val text)"
+      )
+
+      let timeout = seconds(5)
+      conn.withTransaction(timeout):
+        discard await conn.exec(
+          "INSERT INTO test_tx_dur_var (val) VALUES ($1)", @[toPgParam("dur_var")]
+        )
+
+      let res = await conn.query("SELECT val FROM test_tx_dur_var")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "dur_var"
+
+      discard await conn.exec("DROP TABLE test_tx_dur_var")
+      await conn.close()
+
+    waitFor t()
+
+  test "pool.withTransaction with TransactionOptions variable":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptx_opts_var")
+      discard await pool.exec(
+        "CREATE TABLE test_ptx_opts_var (id serial PRIMARY KEY, val text)"
+      )
+
+      let opts = TransactionOptions(isolation: ilRepeatableRead)
+      pool.withTransaction(conn, opts):
+        discard await conn.exec(
+          "INSERT INTO test_ptx_opts_var (val) VALUES ($1)",
+          @[toPgParam("pool_opts_var")],
+        )
+
+      let res = await pool.query("SELECT val FROM test_ptx_opts_var")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "pool_opts_var"
+
+      discard await pool.exec("DROP TABLE test_ptx_opts_var")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransaction with Duration variable":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptx_dur_var")
+      discard await pool.exec(
+        "CREATE TABLE test_ptx_dur_var (id serial PRIMARY KEY, val text)"
+      )
+
+      let timeout = seconds(5)
+      pool.withTransaction(conn, timeout):
+        discard await conn.exec(
+          "INSERT INTO test_ptx_dur_var (val) VALUES ($1)", @[toPgParam("pool_dur_var")]
+        )
+
+      let res = await pool.query("SELECT val FROM test_ptx_dur_var")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "pool_dur_var"
+
+      discard await pool.exec("DROP TABLE test_ptx_dur_var")
+      await pool.close()
+
+    waitFor t()
+
   test "withSavepoint releases on success":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
