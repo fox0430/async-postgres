@@ -565,8 +565,15 @@ proc `$`*(v: PgInterval): string =
 proc `==`*(a, b: PgInterval): bool =
   a.months == b.months and a.days == b.days and a.microseconds == b.microseconds
 
-proc toBytes(s: string): seq[byte] =
+proc toBytes*(s: string): seq[byte] =
+  ## Converts a string to a sequence of bytes.
   result = newSeq[byte](s.len)
+  if s.len > 0:
+    copyMem(addr result[0], unsafeAddr s[0], s.len)
+
+proc toString*(s: seq[byte]): string =
+  ## Converts a sequence of bytes to a string.
+  result = newString(s.len)
   if s.len > 0:
     copyMem(addr result[0], unsafeAddr s[0], s.len)
 
