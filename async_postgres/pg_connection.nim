@@ -177,6 +177,7 @@ type
     stmtCounter*: int
     stmtCacheCapacity*: int ## 0=disabled, default 256
     rowDataBuf*: RowData ## Reusable RowData buffer to avoid per-query allocation
+    hstoreOid*: int32 ## Dynamic OID for hstore extension type; 0 if not available
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -386,7 +387,10 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
     return # caller should have evicted; skip if still full
   var entry = cached
   if entry.resultFormats.len == 0 and entry.fields.len > 0:
-    entry.resultFormats = buildResultFormats(entry.fields)
+    if conn.hstoreOid != 0:
+      entry.resultFormats = buildResultFormats(entry.fields, [conn.hstoreOid])
+    else:
+      entry.resultFormats = buildResultFormats(entry.fields)
     entry.colFmts = newSeq[int16](entry.fields.len)
     entry.colOids = newSeq[int32](entry.fields.len)
     for i in 0 ..< entry.fields.len:
@@ -863,6 +867,11 @@ when defined(posix):
             "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
         .}
 
+proc bytesToString(data: seq[byte]): string =
+  result = newString(data.len)
+  for i in 0 ..< data.len:
+    result[i] = char(data[i])
+
 proc connectToHost(
     config: ConnConfig, hostAddr: string, hostPort: int
 ): Future[PgConnection] {.async.} =
@@ -989,6 +998,36 @@ proc connectToHost(
             break readyLoop
           of bmkErrorResponse:
             raise newException(PgConnectionError, formatError(msg.errorFields))
+          else:
+            discard
+        await conn.fillRecvBuf()
+
+    # Discover extension type OIDs (hstore, etc.)
+    conn.state = csBusy
+    await conn.sendMsg(
+      encodeQuery("SELECT oid FROM pg_type WHERE typname = 'hstore' LIMIT 1")
+    )
+    block discoverLoop:
+      while true:
+        while (let opt = conn.nextMessage(); opt.isSome):
+          let msg = opt.get
+          case msg.kind
+          of bmkRowDescription:
+            discard
+          of bmkDataRow:
+            if msg.columns.len > 0 and msg.columns[0].isSome:
+              try:
+                conn.hstoreOid = int32(parseInt(bytesToString(msg.columns[0].get)))
+              except ValueError:
+                discard
+          of bmkCommandComplete, bmkEmptyQueryResponse:
+            discard
+          of bmkReadyForQuery:
+            conn.txStatus = msg.txStatus
+            conn.state = csReady
+            break discoverLoop
+          of bmkErrorResponse:
+            discard
           else:
             discard
         await conn.fillRecvBuf()
@@ -1201,11 +1240,6 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
     conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
   await conn.closeTransport()
 
-proc bytesToString(data: seq[byte]): string =
-  result = newString(data.len)
-  for i in 0 ..< data.len:
-    result[i] = char(data[i])
-
 proc checkSessionAttrs(
     conn: PgConnection, attrs: TargetSessionAttrs
 ): Future[bool] {.async.} =
@@ -1320,6 +1354,7 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   conn.txStatus = newConn.txStatus
   conn.state = csReady
   conn.createdAt = newConn.createdAt
+  conn.hstoreOid = newConn.hstoreOid
   for ch in conn.listenChannels:
     discard await conn.simpleQuery("LISTEN " & quoteIdentifier(ch))
 
