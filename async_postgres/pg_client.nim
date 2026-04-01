@@ -1566,6 +1566,29 @@ proc hasReturnStmt*(n: NimNode): bool =
       return true
   return false
 
+proc buildTxBeginAndTimeout*(arg: NimNode): tuple[beginSql, txTimeout: NimNode] =
+  ## Shared helper for `withTransaction` macros.
+  ## Uses `when ... is` to dispatch on the argument type at compile time.
+  let buildBeginSqlSym = bindSym"buildBeginSql"
+  let zeroDurSym = bindSym"ZeroDuration"
+  let txOptsSym = bindSym"TransactionOptions"
+  let durSym = bindSym"Duration"
+  let beginSql = quote:
+    when `arg` is `txOptsSym`:
+      `buildBeginSqlSym`(`arg`)
+    elif `arg` is `durSym`:
+      "BEGIN"
+    else:
+      {.error: "withTransaction expects TransactionOptions or Duration".}
+  let txTimeout = quote:
+    when `arg` is `txOptsSym`:
+      `zeroDurSym`
+    elif `arg` is `durSym`:
+      `arg`
+    else:
+      {.error: "withTransaction expects TransactionOptions or Duration".}
+  (beginSql, txTimeout)
+
 macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction.
   ## On exception, ROLLBACK is issued automatically.
@@ -1580,10 +1603,6 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ##     await conn.exec(...)
   ##   conn.withTransaction(TransactionOptions(...), seconds(5)):
   ##     await conn.exec(...)
-  ##
-  ## **Note:** `TransactionOptions` must be passed as a constructor literal, not
-  ## through a variable (the macro uses AST node kind to distinguish options
-  ## from timeout).
   var body: NimNode
   var beginSql: NimNode
   var txTimeout: NimNode
@@ -1593,15 +1612,8 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
     beginSql = newStrLitNode("BEGIN")
     txTimeout = bindSym"ZeroDuration"
   of 2:
-    if args[0].kind == nnkObjConstr:
-      # conn.withTransaction(TransactionOptions(...)): body
-      beginSql = newCall(bindSym"buildBeginSql", args[0])
-      txTimeout = bindSym"ZeroDuration"
-    else:
-      # conn.withTransaction(timeout): body
-      beginSql = newStrLitNode("BEGIN")
-      txTimeout = args[0]
     body = args[1]
+    (beginSql, txTimeout) = buildTxBeginAndTimeout(args[0])
   of 3:
     let opts = args[0]
     txTimeout = args[1]

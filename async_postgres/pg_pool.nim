@@ -641,10 +641,6 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ##   pool.withTransaction(conn, opts, seconds(5)):
   ##     conn.exec(...)
   ##
-  ## **Note:** `TransactionOptions` must be passed as a constructor literal, not
-  ## through a variable (the macro uses AST node kind to distinguish options
-  ## from timeout).
-  ##
   ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
   ## directly — not `pool.exec(...)` / `pool.query(...)`. Pool methods acquire
   ## a separate connection, so those statements would run outside this transaction.
@@ -659,15 +655,8 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
     txTimeout = bindSym"ZeroDuration"
   of 3:
     connIdent = args[0]
-    if args[1].kind == nnkObjConstr:
-      # pool.withTransaction(conn, TransactionOptions(...)): body
-      beginSql = newCall(bindSym"buildBeginSql", args[1])
-      txTimeout = bindSym"ZeroDuration"
-    else:
-      # pool.withTransaction(conn, timeout): body
-      beginSql = newStrLitNode("BEGIN")
-      txTimeout = args[1]
     body = args[2]
+    (beginSql, txTimeout) = buildTxBeginAndTimeout(args[1])
   of 4:
     connIdent = args[0]
     let opts = args[1]
