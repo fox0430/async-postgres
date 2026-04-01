@@ -105,8 +105,16 @@ SSL backend differs by async backend:
 The [examples](examples/) directory contains runnable samples:
 
 - [basic_query](examples/basic_query.nim) — Connect, insert, and query rows
+- [prepared_statement](examples/prepared_statement.nim) — Server-side prepared statements
+- [transaction](examples/transaction.nim) — Transaction control with rollback and isolation levels
+- [cursor](examples/cursor.nim) — Server-side cursors for streaming large result sets
+- [pipeline](examples/pipeline.nim) — Batch multiple operations in a single round trip
+- [copy](examples/copy.nim) — Bulk import/export with COPY protocol
+- [large_object](examples/large_object.nim) — Large Object API for binary data
+- [listen_notify](examples/listen_notify.nim) — LISTEN/NOTIFY
 - [pool](examples/pool.nim) — Connection pooling
-- [listen_notify](examples/listen_notify.nim) — LISTEN/NOTIFY with auto-reconnect
+- [pool_cluster](examples/pool_cluster.nim) — Read/write splitting with pool cluster
+- [advisory_lock](examples/advisory_lock.nim) — Application-level distributed locking
 
 ## Documentation
 
