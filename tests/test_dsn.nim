@@ -478,3 +478,34 @@ suite "parseDsn keyword=value":
     check cfg.user == "myuser"
     check cfg.host == "dbhost"
     check cfg.port == 5433
+
+suite "Unix socket":
+  test "isUnixSocket":
+    check isUnixSocket("/var/run/postgresql") == true
+    check isUnixSocket("/tmp") == true
+    check isUnixSocket("localhost") == false
+    check isUnixSocket("127.0.0.1") == false
+    check isUnixSocket("") == false
+
+  test "unixSocketPath":
+    check unixSocketPath("/var/run/postgresql", 5432) ==
+      "/var/run/postgresql/.s.PGSQL.5432"
+    check unixSocketPath("/tmp", 5433) == "/tmp/.s.PGSQL.5433"
+
+  test "key-value DSN with unix socket host":
+    let cfg = parseDsn("host=/var/run/postgresql port=5432 dbname=test user=myuser")
+    check cfg.host == "/var/run/postgresql"
+    check cfg.port == 5432
+    check cfg.database == "test"
+    check cfg.user == "myuser"
+
+  test "key-value DSN with unix socket host default port":
+    let cfg = parseDsn("host=/tmp dbname=test")
+    check cfg.host == "/tmp"
+    check cfg.port == 5432
+
+  test "URI DSN with unix socket via query param":
+    let cfg = parseDsn("postgresql:///mydb?host=/var/run/postgresql")
+    check cfg.host == "/var/run/postgresql"
+    check cfg.database == "mydb"
+    check cfg.port == 5432
