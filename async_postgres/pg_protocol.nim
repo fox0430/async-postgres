@@ -38,6 +38,7 @@ type
     bmkCommandComplete
     bmkCopyInResponse
     bmkCopyOutResponse
+    bmkCopyBothResponse
     bmkCopyData
     bmkCopyDone
     bmkDataRow
@@ -104,7 +105,7 @@ type
       discard
     of bmkCommandComplete:
       commandTag*: string
-    of bmkCopyInResponse, bmkCopyOutResponse:
+    of bmkCopyInResponse, bmkCopyOutResponse, bmkCopyBothResponse:
       copyFormat*: CopyFormat
       copyColumnFormats*: seq[int16]
     of bmkCopyData:
@@ -262,6 +263,19 @@ proc addInt32*(buf: var seq[byte], val: int32) {.inline.} =
   buf[oldLen + 2] = byte((val shr 8) and 0xFF)
   buf[oldLen + 3] = byte(val and 0xFF)
 
+proc addInt64*(buf: var seq[byte], val: int64) {.inline.} =
+  ## Append a 64-bit integer in big-endian format to the buffer.
+  let oldLen = buf.len
+  buf.setLen(oldLen + 8)
+  buf[oldLen] = byte((val shr 56) and 0xFF)
+  buf[oldLen + 1] = byte((val shr 48) and 0xFF)
+  buf[oldLen + 2] = byte((val shr 40) and 0xFF)
+  buf[oldLen + 3] = byte((val shr 32) and 0xFF)
+  buf[oldLen + 4] = byte((val shr 24) and 0xFF)
+  buf[oldLen + 5] = byte((val shr 16) and 0xFF)
+  buf[oldLen + 6] = byte((val shr 8) and 0xFF)
+  buf[oldLen + 7] = byte(val and 0xFF)
+
 proc patchLen*(buf: var seq[byte], offset: int = 1) =
   ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
   doAssert offset >= 0 and offset + 3 < buf.len,
@@ -300,6 +314,14 @@ proc decodeInt32*(buf: openArray[byte], offset: int): int32 =
   result =
     int32(buf[offset]) shl 24 or int32(buf[offset + 1]) shl 16 or
     int32(buf[offset + 2]) shl 8 or int32(buf[offset + 3])
+
+proc decodeInt64*(buf: openArray[byte], offset: int): int64 =
+  ## Decode a 64-bit integer from big-endian bytes at the given offset.
+  result =
+    int64(buf[offset]) shl 56 or int64(buf[offset + 1]) shl 48 or
+    int64(buf[offset + 2]) shl 40 or int64(buf[offset + 3]) shl 32 or
+    int64(buf[offset + 4]) shl 24 or int64(buf[offset + 5]) shl 16 or
+    int64(buf[offset + 6]) shl 8 or int64(buf[offset + 7])
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at the given offset. Returns (string, bytes consumed).
@@ -733,6 +755,20 @@ proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
     result.copyColumnFormats[i] = decodeInt16(body, offset)
     offset += 2
 
+proc parseCopyBothResponse(body: openArray[byte]): BackendMessage =
+  if body.len < 3:
+    raise newException(ProtocolError, "CopyBothResponse message too short")
+  result = BackendMessage(kind: bmkCopyBothResponse)
+  result.copyFormat = if body[0] == 0: cfText else: cfBinary
+  let numCols = decodeInt16(body, 1)
+  result.copyColumnFormats = newSeq[int16](numCols)
+  var offset = 3
+  for i in 0 ..< numCols:
+    if offset + 2 > body.len:
+      raise newException(ProtocolError, "CopyBothResponse truncated")
+    result.copyColumnFormats[i] = decodeInt16(body, offset)
+    offset += 2
+
 proc newRowData*(
     numCols: int16, colFormats: seq[int16] = @[], colTypeOids: seq[int32] = @[]
 ): RowData =
@@ -922,6 +958,8 @@ proc parseBackendMessage*(
     msg = parseCopyResponse(body, isIn = true)
   of 'H':
     msg = parseCopyResponse(body, isIn = false)
+  of 'W':
+    msg = parseCopyBothResponse(body)
   of 'd':
     msg = BackendMessage(kind: bmkCopyData)
     msg.copyData = @(body)
@@ -993,16 +1031,7 @@ proc addCopyFieldInt32*(buf: var seq[byte], val: int32) =
 proc addCopyFieldInt64*(buf: var seq[byte], val: int64) =
   ## Append an int64 field in binary COPY format.
   buf.addInt32(8'i32)
-  let oldLen = buf.len
-  buf.setLen(oldLen + 8)
-  buf[oldLen] = byte((val shr 56) and 0xFF)
-  buf[oldLen + 1] = byte((val shr 48) and 0xFF)
-  buf[oldLen + 2] = byte((val shr 40) and 0xFF)
-  buf[oldLen + 3] = byte((val shr 32) and 0xFF)
-  buf[oldLen + 4] = byte((val shr 24) and 0xFF)
-  buf[oldLen + 5] = byte((val shr 16) and 0xFF)
-  buf[oldLen + 6] = byte((val shr 8) and 0xFF)
-  buf[oldLen + 7] = byte(val and 0xFF)
+  buf.addInt64(val)
 
 proc addCopyFieldFloat64*(buf: var seq[byte], val: float64) =
   ## Append a float64 field in binary COPY format.
@@ -1032,3 +1061,19 @@ proc addCopyFieldString*(buf: var seq[byte], val: string) =
     let oldLen = buf.len
     buf.setLen(oldLen + val.len)
     copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
+
+# Replication protocol helpers
+
+proc encodeStandbyStatusUpdate*(
+    receiveLsn, flushLsn, applyLsn, sendTime: int64, reply: byte
+): seq[byte] =
+  ## Encode a Standby Status Update as a CopyData message.
+  ## The inner format is: byte 'r' + receiveLsn(8) + flushLsn(8) + applyLsn(8) + sendTime(8) + reply(1) = 34 bytes payload.
+  result.add(byte('d')) # CopyData message type
+  result.addInt32(int32(4 + 1 + 8 + 8 + 8 + 8 + 1)) # length: self(4) + payload(34)
+  result.add(byte('r'))
+  result.addInt64(receiveLsn)
+  result.addInt64(flushLsn)
+  result.addInt64(applyLsn)
+  result.addInt64(sendTime)
+  result.add(reply)
