@@ -3,7 +3,7 @@ from std/times import
   DateTime, dateTime, mMar, mJun, mJan, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
 
-import ../async_postgres/[async_backend, pg_protocol, pg_types]
+import ../async_postgres/[async_backend, pg_protocol, pg_types, pg_replication]
 
 import ../async_postgres/pg_client {.all.}
 import ../async_postgres/pg_pool {.all.}
@@ -6278,5 +6278,153 @@ suite "E2E: cancelNoWait":
       let v = res.rows[0].getXml(0)
       doAssert "<root>data</root>" == $v
       await conn.close()
+
+    waitFor t()
+
+suite "E2E: Logical Replication":
+  test "identifySystem returns valid info":
+    proc t() {.async.} =
+      let conn = await connectReplication(plainConfig())
+      let info = await conn.identifySystem()
+      doAssert info.systemId.len > 0
+      doAssert info.timeline >= 1
+      doAssert info.xLogPos != InvalidLsn
+      doAssert info.dbName == PgDatabase
+      await conn.close()
+
+    waitFor t()
+
+  test "create and drop temporary replication slot":
+    proc t() {.async.} =
+      let conn = await connectReplication(plainConfig())
+      let slot =
+        await conn.createReplicationSlot("test_temp_slot", "pgoutput", temporary = true)
+      doAssert slot.slotName == "test_temp_slot"
+      doAssert slot.consistentPoint != InvalidLsn
+      doAssert slot.outputPlugin == "pgoutput"
+
+      await conn.dropReplicationSlot("test_temp_slot")
+      await conn.close()
+
+    waitFor t()
+
+  test "stream replication and receive insert":
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+
+      # Set up test table and publication
+      discard await writer.simpleQuery("DROP PUBLICATION IF EXISTS test_repl_pub")
+      discard await writer.simpleQuery("DROP TABLE IF EXISTS test_repl_tbl")
+      discard await writer.simpleQuery(
+        "CREATE TABLE test_repl_tbl (id serial PRIMARY KEY, val text)"
+      )
+      discard await writer.simpleQuery(
+        "CREATE PUBLICATION test_repl_pub FOR TABLE test_repl_tbl"
+      )
+
+      # Replication connection
+      let replConn = await connectReplication(plainConfig())
+      let slot = await replConn.createReplicationSlot(
+        "test_stream_slot", "pgoutput", temporary = true
+      )
+
+      var relations: RelationCache
+      var gotInsert = false
+      var insertRelName = ""
+      var insertVal = ""
+
+      let cb = makeReplicationCallback:
+        case msg.kind
+        of rmkXLogData:
+          let pgMsg = decodePgOutput(msg.xlogData)
+          case pgMsg.kind
+          of pomkRelation:
+            relations[pgMsg.relation.relationId] = pgMsg.relation
+          of pomkInsert:
+            gotInsert = true
+            if pgMsg.insert.relationId in relations:
+              insertRelName = relations[pgMsg.insert.relationId].name
+            if pgMsg.insert.newTuple.len >= 2 and
+                pgMsg.insert.newTuple[1].kind == tdkText:
+              insertVal = pgMsg.insert.newTuple[1].toString()
+            await replConn.sendStandbyStatus(msg.xlogData.endLsn)
+            await replConn.stopReplication()
+          of pomkCommit:
+            discard
+          else:
+            discard
+        of rmkPrimaryKeepalive:
+          if msg.keepalive.replyRequested:
+            await replConn.sendStandbyStatus(msg.keepalive.walEnd)
+
+      # Insert a row from the writer connection after a short delay
+      proc insertRow() {.async.} =
+        await sleepAsync(milliseconds(200))
+        discard await writer.simpleQuery(
+          "INSERT INTO test_repl_tbl (val) VALUES ('hello_repl')"
+        )
+
+      let insertFut = insertRow()
+
+      await replConn.startReplication(
+        "test_stream_slot",
+        slot.consistentPoint,
+        options = @{"proto_version": "'1'", "publication_names": "'test_repl_pub'"},
+        callback = cb,
+      )
+
+      await insertFut
+
+      doAssert gotInsert, "Should have received an INSERT message"
+      doAssert insertRelName == "test_repl_tbl"
+      doAssert insertVal == "hello_repl"
+      doAssert replConn.state == csReady
+
+      await replConn.close()
+
+      # Clean up
+      discard await writer.simpleQuery("DROP PUBLICATION test_repl_pub")
+      discard await writer.simpleQuery("DROP TABLE test_repl_tbl")
+      await writer.close()
+
+    waitFor t()
+
+  test "connection state is csReady after replication ends":
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery("DROP PUBLICATION IF EXISTS test_state_pub")
+      discard await writer.simpleQuery("CREATE PUBLICATION test_state_pub")
+
+      let replConn = await connectReplication(plainConfig())
+      let slot = await replConn.createReplicationSlot(
+        "test_state_slot", "pgoutput", temporary = true
+      )
+
+      let cb = makeReplicationCallback:
+        case msg.kind
+        of rmkXLogData:
+          await replConn.sendStandbyStatus(msg.xlogData.endLsn)
+        of rmkPrimaryKeepalive:
+          # Stop immediately on first keepalive
+          await replConn.sendStandbyStatus(msg.keepalive.walEnd)
+          await replConn.stopReplication()
+
+      await replConn.startReplication(
+        "test_state_slot",
+        slot.consistentPoint,
+        options = @{"proto_version": "'1'", "publication_names": "'test_state_pub'"},
+        callback = cb,
+      )
+
+      doAssert replConn.state == csReady
+
+      # Connection should be reusable
+      let info = await replConn.identifySystem()
+      doAssert info.systemId.len > 0
+
+      await replConn.close()
+
+      discard await writer.simpleQuery("DROP PUBLICATION test_state_pub")
+      await writer.close()
 
     waitFor t()
