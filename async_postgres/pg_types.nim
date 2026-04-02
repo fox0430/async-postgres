@@ -1129,7 +1129,7 @@ proc toPgBinaryParam*(v: Option[JsonNode]): PgParam =
 
 proc encodeHstoreBinary*(v: PgHstore): seq[byte] =
   ## Encode hstore as PostgreSQL binary format.
-  ## Format: numPairs(int32) + [keyLen(int32) + keyData + valLen(int32) + valData]...
+  ## Format: ``numPairs(int32) + [keyLen(int32) + keyData + valLen(int32) + valData]...``
   var size = 4
   for k, val in v.pairs:
     size += 4 + k.len + 4
@@ -4165,7 +4165,7 @@ optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 # Binary format: standard array container with range elements.
 
 proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
-  ## Get a column value as an int4range[]. Handles binary format.
+  ## Get a column value as an ``int4range[]``. Handles binary format.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -4193,7 +4193,7 @@ proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
     )
 
 proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
-  ## Get a column value as an int8range[]. Handles binary format.
+  ## Get a column value as an ``int8range[]``. Handles binary format.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -4221,7 +4221,7 @@ proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
     )
 
 proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
-  ## Get a column value as a numrange[]. Handles binary format.
+  ## Get a column value as a ``numrange[]``. Handles binary format.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -4249,7 +4249,7 @@ proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
     )
 
 proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
-  ## Get a column value as a tsrange[]. Handles binary format.
+  ## Get a column value as a ``tsrange[]``. Handles binary format.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -4283,7 +4283,7 @@ proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     )
 
 proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
-  ## Get a column value as a tstzrange[]. Handles binary format.
+  ## Get a column value as a ``tstzrange[]``. Handles binary format.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -4321,7 +4321,7 @@ proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     )
 
 proc getDateRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
-  ## Get a column value as a daterange[]. Handles binary format.
+  ## Get a column value as a ``daterange[]``. Handles binary format.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
