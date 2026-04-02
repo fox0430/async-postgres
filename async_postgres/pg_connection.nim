@@ -8,7 +8,8 @@ when hasChronos:
   import chronos/streams/tlsstream
   import bearssl/[x509, rsa, ec]
 elif hasAsyncDispatch:
-  import std/[asyncnet, nativesockets]
+  import std/asyncnet
+  from std/nativesockets import Domain, SockType, Protocol
   when defined(ssl):
     import std/[net, tempfiles, os]
 
@@ -790,14 +791,14 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
 when defined(posix):
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
 
-  proc configureTcpNoDelay(fd: SocketHandle) =
+  proc configureTcpNoDelay(fd: posix.SocketHandle) =
     ## Disable Nagle's algorithm for low-latency sends.
     var optval: cint = 1
     discard setsockopt(
       fd, cint(posix.IPPROTO_TCP), TCP_NODELAY, addr optval, sizeof(optval).SockLen
     )
 
-  proc configureKeepalive(fd: SocketHandle, config: ConnConfig) =
+  proc configureKeepalive(fd: posix.SocketHandle, config: ConnConfig) =
     ## Set TCP keepalive options on the socket.
     if not config.keepAlive:
       return
@@ -906,8 +907,8 @@ proc connectToHost(
     when defined(posix):
       if not isUnix:
         try:
-          configureTcpNoDelay(SocketHandle(transport.fd))
-          configureKeepalive(SocketHandle(transport.fd), config)
+          configureTcpNoDelay(posix.SocketHandle(transport.fd))
+          configureKeepalive(posix.SocketHandle(transport.fd), config)
         except CatchableError as e:
           try:
             await noCancel transport.closeWait()
@@ -949,8 +950,8 @@ proc connectToHost(
       else:
         await sock.connect(hostAddr, Port(hostPort))
         when defined(posix):
-          configureTcpNoDelay(SocketHandle(sock.getFd()))
-          configureKeepalive(SocketHandle(sock.getFd()), config)
+          configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
+          configureKeepalive(posix.SocketHandle(sock.getFd()), config)
     except CatchableError:
       sock.close()
       raise
