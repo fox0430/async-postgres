@@ -72,6 +72,7 @@ type
     csReady
     csBusy
     csListening
+    csReplicating
     csClosed
 
   SslMode* = enum
