@@ -345,15 +345,22 @@ proc exec*(
   ## On timeout the connection is marked closed (protocol desync) and cannot be
   ## reused; pooled connections are discarded automatically.
   var tag: string
-  if timeout > ZeroDuration:
-    try:
-      tag = await execImpl(conn, sql, params, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "Exec timed out")
-  else:
-    tag = await execImpl(conn, sql, params)
+  withConnTracing(
+    conn,
+    onQueryStart, onQueryEnd,
+    TraceQueryStartData(sql: sql, params: params, isExec: true),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: tag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        tag = await execImpl(conn, sql, params, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "Exec timed out")
+    else:
+      tag = await execImpl(conn, sql, params)
   return initCommandResult(tag)
 
 template queryRecvLoop(
@@ -800,16 +807,25 @@ proc query*(
   ## Execute a query with typed parameters.
   ## On timeout the connection is marked closed (protocol desync) and cannot be
   ## reused; pooled connections are discarded automatically.
-  let resultFormats = resultFormat.toFormatCodes()
-  if timeout > ZeroDuration:
-    try:
-      return await queryImpl(conn, sql, params, resultFormats, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "Query timed out")
-  else:
-    return await queryImpl(conn, sql, params, resultFormats)
+  var qr: QueryResult
+  withConnTracing(
+    conn,
+    onQueryStart, onQueryEnd,
+    TraceQueryStartData(sql: sql, params: params, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
+  ):
+    let resultFormats = resultFormat.toFormatCodes()
+    if timeout > ZeroDuration:
+      try:
+        qr = await queryImpl(conn, sql, params, resultFormats, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "Query timed out")
+    else:
+      qr = await queryImpl(conn, sql, params, resultFormats)
+  return qr
 
 proc queryOne*(
     conn: PgConnection,
@@ -1003,15 +1019,24 @@ proc prepare*(
 ): Future[PreparedStatement] {.async.} =
   ## Prepare a named statement, returning metadata.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await prepareImpl(conn, name, sql, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "Prepare timed out")
-  else:
-    return await prepareImpl(conn, name, sql)
+  var stmt: PreparedStatement
+  withConnTracing(
+    conn,
+    onPrepareStart, onPrepareEnd,
+    TracePrepareStartData(name: name, sql: sql),
+    TracePrepareEndData,
+    TracePrepareEndData(),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        stmt = await prepareImpl(conn, name, sql, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "Prepare timed out")
+    else:
+      stmt = await prepareImpl(conn, name, sql)
+  return stmt
 
 proc executeImpl(
     stmt: PreparedStatement,
@@ -1098,16 +1123,25 @@ proc execute*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a prepared statement with typed parameters.
-  let resultFormats = resultFormat.toFormatCodes()
-  if timeout > ZeroDuration:
-    try:
-      return await executeImpl(stmt, params, resultFormats, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      stmt.conn.cancelNoWait()
-      stmt.conn.state = csClosed
-      raise newException(PgTimeoutError, "Execute timed out")
-  else:
-    return await executeImpl(stmt, params, resultFormats)
+  var qr: QueryResult
+  withConnTracing(
+    stmt.conn,
+    onQueryStart, onQueryEnd,
+    TraceQueryStartData(sql: stmt.name, params: params, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
+  ):
+    let resultFormats = resultFormat.toFormatCodes()
+    if timeout > ZeroDuration:
+      try:
+        qr = await executeImpl(stmt, params, resultFormats, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        stmt.conn.cancelNoWait()
+        stmt.conn.state = csClosed
+        raise newException(PgTimeoutError, "Execute timed out")
+    else:
+      qr = await executeImpl(stmt, params, resultFormats)
+  return qr
 
 proc closeImpl(
     stmt: PreparedStatement, timeout: Duration = ZeroDuration
@@ -1250,15 +1284,22 @@ proc copyIn*(
   ## Execute COPY ... FROM STDIN with a single contiguous ``seq[byte]``.
   ## Avoids the copy that the ``openArray[byte]`` overload performs.
   var tag: string
-  if timeout > ZeroDuration:
-    try:
-      tag = await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "COPY IN timed out")
-  else:
-    tag = await copyInRawImpl(conn, sql, data)
+  withConnTracing(
+    conn,
+    onCopyStart, onCopyEnd,
+    TraceCopyStartData(sql: sql, direction: tcdIn),
+    TraceCopyEndData,
+    TraceCopyEndData(commandTag: tag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        tag = await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "COPY IN timed out")
+    else:
+      tag = await copyInRawImpl(conn, sql, data)
   return initCommandResult(tag)
 
 proc copyIn*(
@@ -1410,15 +1451,24 @@ proc copyInStream*(
   ## ``seq[byte]`` signals EOF. If the callback raises, CopyFail is sent and
   ## the connection returns to csReady.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await copyInStreamImpl(conn, sql, callback, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "COPY IN stream timed out")
-  else:
-    return await copyInStreamImpl(conn, sql, callback)
+  var info: CopyInInfo
+  withConnTracing(
+    conn,
+    onCopyStart, onCopyEnd,
+    TraceCopyStartData(sql: sql, direction: tcdIn),
+    TraceCopyEndData,
+    TraceCopyEndData(commandTag: info.commandTag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        info = await copyInStreamImpl(conn, sql, callback, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "COPY IN stream timed out")
+    else:
+      info = await copyInStreamImpl(conn, sql, callback)
+  return info
 
 proc copyOutImpl(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
@@ -1464,15 +1514,24 @@ proc copyOut*(
   ## Execute COPY ... TO STDOUT via simple query protocol.
   ## Collects all CopyData messages and returns them in a CopyResult.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await copyOutImpl(conn, sql, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "COPY OUT timed out")
-  else:
-    return await copyOutImpl(conn, sql)
+  var cr: CopyResult
+  withConnTracing(
+    conn,
+    onCopyStart, onCopyEnd,
+    TraceCopyStartData(sql: sql, direction: tcdOut),
+    TraceCopyEndData,
+    TraceCopyEndData(commandTag: cr.commandTag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        cr = await copyOutImpl(conn, sql, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "COPY OUT timed out")
+    else:
+      cr = await copyOutImpl(conn, sql)
+  return cr
 
 proc copyOutStreamImpl(
     conn: PgConnection,
@@ -1541,15 +1600,24 @@ proc copyOutStream*(
   ## CopyData chunk through `callback`. The callback is awaited, providing
   ## natural TCP backpressure. If the callback raises, the connection is
   ## marked csClosed (protocol cannot be resynchronized).
-  if timeout > ZeroDuration:
-    try:
-      return await copyOutStreamImpl(conn, sql, callback, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "COPY OUT stream timed out")
-  else:
-    return await copyOutStreamImpl(conn, sql, callback)
+  var info: CopyOutInfo
+  withConnTracing(
+    conn,
+    onCopyStart, onCopyEnd,
+    TraceCopyStartData(sql: sql, direction: tcdOut),
+    TraceCopyEndData,
+    TraceCopyEndData(commandTag: info.commandTag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        info = await copyOutStreamImpl(conn, sql, callback, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "COPY OUT stream timed out")
+    else:
+      info = await copyOutStreamImpl(conn, sql, callback)
+  return info
 
 proc hasReturnStmt*(n: NimNode): bool =
   ## Check whether an AST contains a `return` statement (excluding nested
@@ -2247,15 +2315,24 @@ proc execute*(
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if p.ops.len == 0:
     return @[]
-  if timeout > ZeroDuration:
-    try:
-      return await executeImpl(p, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      p.conn.cancelNoWait()
-      p.conn.state = csClosed
-      raise newException(PgTimeoutError, "Pipeline execute timed out")
-  else:
-    return await executeImpl(p, timeout)
+  var results: seq[PipelineResult]
+  withConnTracing(
+    p.conn,
+    onPipelineStart, onPipelineEnd,
+    TracePipelineStartData(opCount: p.ops.len),
+    TracePipelineEndData,
+    TracePipelineEndData(),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        results = await executeImpl(p, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        p.conn.cancelNoWait()
+        p.conn.state = csClosed
+        raise newException(PgTimeoutError, "Pipeline execute timed out")
+    else:
+      results = await executeImpl(p, timeout)
+  return results
 
 proc openCursorImpl(
     conn: PgConnection,
