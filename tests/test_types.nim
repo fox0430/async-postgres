@@ -4429,3 +4429,157 @@ suite "hstore":
     let fields = @[mkField(OidText, 0'i16)]
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getHstoreOpt(0).isNone
+
+suite "PgBit":
+  test "OID constants":
+    check OidBit == 1560'i32
+    check OidVarbit == 1562'i32
+    check OidBitArray == 1561'i32
+    check OidVarbitArray == 1563'i32
+
+  test "parseBitString and $ roundtrip":
+    let b = parseBitString("10110011")
+    check b.nbits == 8
+    check b.data == @[0b10110011'u8]
+    check $b == "10110011"
+
+  test "parseBitString non-byte-aligned":
+    let b = parseBitString("101")
+    check b.nbits == 3
+    check $b == "101"
+    # data should be 0b10100000
+    check b.data == @[0b10100000'u8]
+
+  test "parseBitString empty":
+    let b = parseBitString("")
+    check b.nbits == 0
+    check b.data.len == 0
+    check $b == ""
+
+  test "== operator":
+    check parseBitString("1010") == parseBitString("1010")
+    check parseBitString("1010") != parseBitString("1011")
+    check parseBitString("10") != parseBitString("1000")
+
+  test "toPgParam PgBit":
+    let b = parseBitString("10110011")
+    let p = toPgParam(b)
+    check p.oid == OidVarbit
+    check p.format == 0
+    check toString(p.value.get) == "10110011"
+
+  test "toPgBinaryParam PgBit":
+    let b = parseBitString("10110011")
+    let p = toPgBinaryParam(b)
+    check p.oid == OidVarbit
+    check p.format == 1
+    let data = p.value.get
+    check data.len == 5 # 4 bytes for nbits + 1 byte for data
+    # nbits = 8 in big-endian
+    check data[0 .. 3] == @[0'u8, 0, 0, 8]
+    check data[4] == 0b10110011'u8
+
+  test "toPgBinaryParam PgBit non-byte-aligned":
+    let b = parseBitString("101")
+    let p = toPgBinaryParam(b)
+    let data = p.value.get
+    check data.len == 5
+    # nbits = 3 in big-endian
+    check data[0 .. 3] == @[0'u8, 0, 0, 3]
+    check data[4] == 0b10100000'u8
+
+  test "getBit text format":
+    let data = toBytes("10110011")
+    let fields = @[mkField(OidVarbit, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let b = row.getBit(0)
+    check b.nbits == 8
+    check $b == "10110011"
+
+  test "getBit binary format":
+    # Binary: 4 bytes nbits (8) + 1 byte data
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(8'i32)))
+    data.add(0b10110011'u8)
+    let fields = @[mkField(OidVarbit, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let b = row.getBit(0)
+    check b.nbits == 8
+    check $b == "10110011"
+
+  test "getBit binary format non-byte-aligned":
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(3'i32)))
+    data.add(0b10100000'u8)
+    let fields = @[mkField(OidBit, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let b = row.getBit(0)
+    check b.nbits == 3
+    check $b == "101"
+
+  test "getBitOpt with value":
+    let data = toBytes("10110011")
+    let fields = @[mkField(OidVarbit, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let b = row.getBitOpt(0)
+    check b.isSome
+    check $b.get == "10110011"
+
+  test "getBitOpt with NULL":
+    let fields = @[mkField(OidVarbit, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getBitOpt(0).isNone
+
+  test "toPgParam seq[PgBit]":
+    let v = @[parseBitString("1010"), parseBitString("110")]
+    let p = toPgParam(v)
+    check p.oid == OidVarbitArray
+    check p.format == 1
+
+  test "toPgParam seq[PgBit] empty":
+    let v: seq[PgBit] = @[]
+    let p = toPgParam(v)
+    check p.oid == OidVarbitArray
+    check p.format == 1
+
+  test "toPgBinaryParam seq[PgBit]":
+    let v = @[parseBitString("1010"), parseBitString("110")]
+    let p = toPgBinaryParam(v)
+    check p.oid == OidVarbitArray
+    check p.format == 1
+
+  test "getBitArray text format":
+    let data = toBytes("{1010,110,00001111}")
+    let fields = @[mkField(OidVarbitArray, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let arr = row.getBitArray(0)
+    check arr.len == 3
+    check $arr[0] == "1010"
+    check $arr[1] == "110"
+    check $arr[2] == "00001111"
+
+  test "getBitArray binary format":
+    # Encode two elements using toPgBinaryParam
+    let v = @[parseBitString("1010"), parseBitString("11001100")]
+    let p = toPgBinaryParam(v)
+    let data = p.value.get
+    let fields = @[mkField(OidVarbitArray, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let arr = row.getBitArray(0)
+    check arr.len == 2
+    check $arr[0] == "1010"
+    check $arr[1] == "11001100"
+
+  test "getBitArrayOpt with value":
+    let data = toBytes("{101}")
+    let fields = @[mkField(OidVarbitArray, 0'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let arr = row.getBitArrayOpt(0)
+    check arr.isSome
+    check arr.get.len == 1
+    check $arr.get[0] == "101"
+
+  test "getBitArrayOpt with NULL":
+    let fields = @[mkField(OidVarbitArray, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getBitArrayOpt(0).isNone
