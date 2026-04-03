@@ -347,7 +347,8 @@ proc exec*(
   var tag: string
   withConnTracing(
     conn,
-    onQueryStart, onQueryEnd,
+    onQueryStart,
+    onQueryEnd,
     TraceQueryStartData(sql: sql, params: params, isExec: true),
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
@@ -810,7 +811,8 @@ proc query*(
   var qr: QueryResult
   withConnTracing(
     conn,
-    onQueryStart, onQueryEnd,
+    onQueryStart,
+    onQueryEnd,
     TraceQueryStartData(sql: sql, params: params, isExec: false),
     TraceQueryEndData,
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
@@ -1022,7 +1024,8 @@ proc prepare*(
   var stmt: PreparedStatement
   withConnTracing(
     conn,
-    onPrepareStart, onPrepareEnd,
+    onPrepareStart,
+    onPrepareEnd,
     TracePrepareStartData(name: name, sql: sql),
     TracePrepareEndData,
     TracePrepareEndData(),
@@ -1126,7 +1129,8 @@ proc execute*(
   var qr: QueryResult
   withConnTracing(
     stmt.conn,
-    onQueryStart, onQueryEnd,
+    onQueryStart,
+    onQueryEnd,
     TraceQueryStartData(sql: stmt.name, params: params, isExec: false),
     TraceQueryEndData,
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
@@ -1286,7 +1290,8 @@ proc copyIn*(
   var tag: string
   withConnTracing(
     conn,
-    onCopyStart, onCopyEnd,
+    onCopyStart,
+    onCopyEnd,
     TraceCopyStartData(sql: sql, direction: tcdIn),
     TraceCopyEndData,
     TraceCopyEndData(commandTag: tag),
@@ -1454,7 +1459,8 @@ proc copyInStream*(
   var info: CopyInInfo
   withConnTracing(
     conn,
-    onCopyStart, onCopyEnd,
+    onCopyStart,
+    onCopyEnd,
     TraceCopyStartData(sql: sql, direction: tcdIn),
     TraceCopyEndData,
     TraceCopyEndData(commandTag: info.commandTag),
@@ -1517,7 +1523,8 @@ proc copyOut*(
   var cr: CopyResult
   withConnTracing(
     conn,
-    onCopyStart, onCopyEnd,
+    onCopyStart,
+    onCopyEnd,
     TraceCopyStartData(sql: sql, direction: tcdOut),
     TraceCopyEndData,
     TraceCopyEndData(commandTag: cr.commandTag),
@@ -1603,7 +1610,8 @@ proc copyOutStream*(
   var info: CopyOutInfo
   withConnTracing(
     conn,
-    onCopyStart, onCopyEnd,
+    onCopyStart,
+    onCopyEnd,
     TraceCopyStartData(sql: sql, direction: tcdOut),
     TraceCopyEndData,
     TraceCopyEndData(commandTag: info.commandTag),
@@ -2318,7 +2326,8 @@ proc execute*(
   var results: seq[PipelineResult]
   withConnTracing(
     p.conn,
-    onPipelineStart, onPipelineEnd,
+    onPipelineStart,
+    onPipelineEnd,
     TracePipelineStartData(opCount: p.ops.len),
     TracePipelineEndData,
     TracePipelineEndData(),

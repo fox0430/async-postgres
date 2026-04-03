@@ -387,7 +387,8 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   var ar: AcquireResult
   withTracing(
     pool.config.tracer,
-    onPoolAcquireStart, onPoolAcquireEnd,
+    onPoolAcquireStart,
+    onPoolAcquireEnd,
     TracePoolAcquireStartData(
       idleCount: pool.idle.len, activeCount: pool.active, maxSize: pool.config.maxSize
     ),

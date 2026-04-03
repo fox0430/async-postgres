@@ -1274,7 +1274,8 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
   var lastTag: string
   withConnTracing(
     conn,
-    onQueryStart, onQueryEnd,
+    onQueryStart,
+    onQueryEnd,
     TraceQueryStartData(sql: sql, isExec: false),
     TraceQueryEndData,
     TraceQueryEndData(commandTag: lastTag, rowCount: totalRows),
@@ -1421,7 +1422,8 @@ proc simpleExec*(
   var tag: string
   withConnTracing(
     conn,
-    onQueryStart, onQueryEnd,
+    onQueryStart,
+    onQueryEnd,
     TraceQueryStartData(sql: sql, isExec: true),
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
