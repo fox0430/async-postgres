@@ -373,6 +373,10 @@ suite "SSL negotiation - sslVerifyCa":
     waitFor testBody()
     check raised
 
+  test "sslAllow ordinal is between sslDisable and sslPrefer":
+    check ord(sslAllow) > ord(sslDisable)
+    check ord(sslAllow) < ord(sslPrefer)
+
   test "sslVerifyCa ordinal is between sslRequire and sslVerifyFull":
     check ord(sslVerifyCa) > ord(sslRequire)
     check ord(sslVerifyCa) < ord(sslVerifyFull)
@@ -380,6 +384,119 @@ suite "SSL negotiation - sslVerifyCa":
   test "ConnConfig sslRootCert defaults to empty":
     let config = ConnConfig()
     check config.sslRootCert == ""
+
+suite "SSL negotiation - sslAllow":
+  test "sslAllow connects without SSL when server accepts plaintext":
+    var connState: PgConnState
+    var connSslEnabled: bool
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendAuthOkAndReady(st)
+          await drainUntilClose(st)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslAllow,
+      )
+
+      let conn = await connect(config)
+      connState = conn.state
+      connSslEnabled = conn.sslEnabled
+      await conn.close()
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check connState == csReady
+    check connSslEnabled == false
+
+  test "sslAllow retries with SSL when plaintext is rejected":
+    var connState: PgConnState
+    var connSslEnabled: bool
+    var attemptCount: int = 0
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        # First connection: reject plaintext with FATAL error
+        block:
+          let st = await ms.accept()
+          attemptCount.inc
+          try:
+            discard await readN(st, 8) # read StartupMessage header
+            # Send FATAL error response (server requires SSL)
+            var body: seq[byte] = @[]
+            body.add(byte('S'))
+            for c in "FATAL":
+              body.add(byte(c))
+            body.add(0)
+            body.add(byte('M'))
+            for c in "no pg_hba.conf entry":
+              body.add(byte(c))
+            body.add(0)
+            body.add(0) # terminator
+            var msg: seq[byte] = @[byte('E')]
+            msg.addInt32(int32(4 + body.len))
+            msg.add(body)
+            await sendBytes(st, msg)
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+        # Second connection: accept SSL and complete handshake
+        block:
+          let st = await ms.accept()
+          attemptCount.inc
+          try:
+            # Read SSLRequest
+            discard await readN(st, 8)
+            # Refuse SSL (sslPrefer will fall back to plaintext)
+            await sendBytes(st, @[byte('N')])
+            await drainStartupMessage(st)
+            await sendAuthOkAndReady(st)
+            await drainUntilClose(st)
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslAllow,
+      )
+
+      let conn = await connect(config)
+      connState = conn.state
+      connSslEnabled = conn.sslEnabled
+      await conn.close()
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check attemptCount == 2
+    check connState == csReady
+    check connSslEnabled == false
 
 suite "SSL negotiation - sslDisable":
   test "sslDisable sends StartupMessage directly without SSLRequest":

@@ -76,11 +76,13 @@ suite "parseDsn":
     check cfg.database == "my/db"
 
   test "query param sslmode":
-    for mode in ["disable", "prefer", "require", "verify-ca", "verify-full"]:
+    for mode in ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]:
       let cfg = parseDsn("postgresql://host/db?sslmode=" & mode)
       case mode
       of "disable":
         check cfg.sslMode == sslDisable
+      of "allow":
+        check cfg.sslMode == sslAllow
       of "prefer":
         check cfg.sslMode == sslPrefer
       of "require":
