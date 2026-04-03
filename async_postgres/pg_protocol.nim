@@ -174,6 +174,10 @@ const
     701, # float8
     718, # circle
     1043, # varchar
+    1560, # bit
+    1561, # bit[]
+    1562, # varbit
+    1563, # varbit[]
     3904, # int4range
     3905, # int4range[]
     3906, # numrange
