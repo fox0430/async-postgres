@@ -315,6 +315,15 @@ suite "E2E: SSL Connection":
 
     waitFor t()
 
+  test "sslAllow connects without SSL when server accepts plaintext":
+    proc t() {.async.} =
+      let conn = await connect(sslConfig(sslAllow))
+      doAssert conn.state == csReady
+      doAssert conn.sslEnabled == false
+      await conn.close()
+
+    waitFor t()
+
   test "query over SSL connection":
     proc t() {.async.} =
       let conn = await connect(sslConfig(sslRequire))
