@@ -78,6 +78,7 @@ type
   SslMode* = enum
     ## SSL/TLS negotiation mode for the connection.
     sslDisable ## Disable SSL (default)
+    sslAllow ## Try plaintext; fall back to SSL if refused
     sslPrefer ## Try SSL; fall back to plaintext if refused
     sslRequire ## Require SSL (no certificate verification)
     sslVerifyCa ## Require SSL + verify CA chain (no hostname verification)
@@ -887,6 +888,25 @@ proc connectToHost(
     config: ConnConfig, hostAddr: string, hostPort: int
 ): Future[PgConnection] {.async.} =
   ## Connect to a single PostgreSQL host. Internal helper for multi-host connect.
+
+  if config.sslMode == sslAllow:
+    # sslAllow: try plaintext first, then fall back to SSL.
+    var plainConfig = config
+    plainConfig.sslMode = sslDisable
+    try:
+      return await connectToHost(plainConfig, hostAddr, hostPort)
+    except CancelledError as e:
+      raise e
+    except CatchableError:
+      # Plaintext failed — retry with SSL.
+      # WARNING: This is vulnerable to MITM downgrade attacks. A network
+      # attacker can force the first attempt to fail and then intercept
+      # the SSL connection. Use sslRequire or stronger if security is needed.
+      stderr.writeLine "pg_connection: plaintext connection failed, retrying with SSL (sslmode=allow)"
+      var sslConfig = config
+      sslConfig.sslMode = sslPrefer
+      return await connectToHost(sslConfig, hostAddr, hostPort)
+
   var conn: PgConnection
 
   let isUnix = isUnixSocket(hostAddr)
@@ -1583,6 +1603,8 @@ proc parseSslMode(s: string): SslMode =
   case s
   of "disable":
     sslDisable
+  of "allow":
+    sslAllow
   of "prefer":
     sslPrefer
   of "require":
