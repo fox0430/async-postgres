@@ -29,6 +29,7 @@ type
       ## "DEALLOCATE ALL" (clear prepared statements only),
       ## "RESET ALL" (reset session parameters only).
       ## On failure, the connection is discarded.
+    tracer*: PgTracer ## Optional tracer for pool-level hooks (acquire/release)
 
   PooledConn = object
     ## An idle connection held by the pool with its last-used timestamp.
@@ -259,27 +260,41 @@ proc release*(pool: PgPool, conn: PgConnection) =
   ## Return a connection to the pool. If the connection is broken or in a
   ## transaction, it is closed instead. If waiters are queued, the connection
   ## is handed directly to the next waiter.
+  var traceCtx: TraceContext
+  if pool.config.tracer != nil and pool.config.tracer.onPoolReleaseStart != nil:
+    traceCtx =
+      pool.config.tracer.onPoolReleaseStart(TracePoolReleaseStartData(conn: conn))
+
+  var wasClosed = false
+  var handedToWaiter = false
   if pool.closed or conn.state != csReady or conn.txStatus != tsIdle:
     if pool.active > 0:
       pool.active.dec
     pool.closeNoWait(conn)
-    return
+    wasClosed = true
+  else:
+    block dispatch:
+      while pool.waiters.len > 0:
+        let waiter = pool.waiters.popFirst()
+        if waiter.cancelled:
+          continue
+        pool.waiterCount.dec
+        waiter.fut.complete(conn)
+        handedToWaiter = true
+        break dispatch
+      if pool.active > 0:
+        pool.active.dec
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
 
-  while pool.waiters.len > 0:
-    let waiter = pool.waiters.popFirst()
-    if waiter.cancelled:
-      continue
-    pool.waiterCount.dec
-    waiter.fut.complete(conn)
-    return
-  if pool.active > 0:
-    pool.active.dec
-  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+  if pool.config.tracer != nil and pool.config.tracer.onPoolReleaseEnd != nil:
+    pool.config.tracer.onPoolReleaseEnd(
+      traceCtx,
+      TracePoolReleaseEndData(wasClosed: wasClosed, handedToWaiter: handedToWaiter),
+    )
 
-proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
-  ## Acquire a connection from the pool. Tries idle connections first (with
-  ## health checks), creates a new one if under `maxSize`, or waits for a
-  ## release. Raises `PgPoolError` on timeout or if the pool is closed.
+type AcquireResult = tuple[conn: PgConnection, wasCreated: bool]
+
+proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   if pool.closed:
     raise newException(PgPoolError, "Pool is closed")
 
@@ -323,7 +338,7 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
         continue
     pool.active.inc
     recordAcquire()
-    return pc.conn
+    return (pc.conn, false)
 
   # No idle connections; create new if under limit
   if pool.active < pool.config.maxSize:
@@ -332,7 +347,7 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
       let conn = await connect(pool.config.connConfig)
       pool.metrics.createCount.inc
       recordAcquire()
-      return conn
+      return (conn, true)
     except CatchableError as e:
       pool.active.dec
       raise e
@@ -351,7 +366,7 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
     try:
       let conn = await fut.wait(pool.config.acquireTimeout)
       recordAcquire()
-      return conn
+      return (conn, false)
     except AsyncTimeoutError:
       waiter.cancelled = true
       pool.waiterCount.dec
@@ -366,7 +381,25 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   else:
     let conn = await fut
     recordAcquire()
-    return conn
+    return (conn, false)
+
+proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
+  ## Acquire a connection from the pool. Tries idle connections first (with
+  ## health checks), creates a new one if under `maxSize`, or waits for a
+  ## release. Raises `PgPoolError` on timeout or if the pool is closed.
+  var ar: AcquireResult
+  withTracing(
+    pool.config.tracer,
+    onPoolAcquireStart,
+    onPoolAcquireEnd,
+    TracePoolAcquireStartData(
+      idleCount: pool.idle.len, activeCount: pool.active, maxSize: pool.config.maxSize
+    ),
+    TracePoolAcquireEndData,
+    TracePoolAcquireEndData(conn: ar.conn, wasCreated: ar.wasCreated),
+  ):
+    ar = await pool.acquireImpl()
+  return ar.conn
 
 template withConnection*(pool: PgPool, conn, body: untyped) =
   ## Acquire a connection, execute `body`, then release it back to the pool.

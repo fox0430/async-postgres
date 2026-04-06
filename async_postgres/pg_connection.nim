@@ -115,6 +115,7 @@ type
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     extraParams*: seq[(string, string)] ## Additional startup parameters
+    tracer*: PgTracer ## Optional tracer for connection-level hooks
 
   Notification* = object ## A NOTIFY message received from PostgreSQL.
     pid*: int32
@@ -181,6 +182,7 @@ type
     stmtCacheCapacity*: int ## 0=disabled, default 256
     rowDataBuf*: RowData ## Reusable RowData buffer to avoid per-query allocation
     hstoreOid*: int32 ## Dynamic OID for hstore extension type; 0 if not available
+    tracer*: PgTracer ## Inherited from ConnConfig on connect
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -205,6 +207,157 @@ type
     format*: CopyFormat
     columnFormats*: seq[int16]
     commandTag*: string
+
+  # Tracing types
+  TraceContext* = RootRef
+    ## Opaque correlation token returned by trace Start hooks and passed to End hooks.
+    ## Users subtype RootObj (e.g. ``type Span = ref object of RootObj``) and return
+    ## it from Start hooks; End hooks downcast via ``Span(ctx)``.
+
+  TraceCopyDirection* = enum
+    tcdIn
+    tcdOut
+
+  TraceConnectStartData* = object ## Data passed to the connect start hook.
+    hosts*: seq[HostEntry]
+
+  TraceConnectEndData* = object ## Data passed to the connect end hook.
+    conn*: PgConnection
+    err*: ref CatchableError
+
+  TraceQueryStartData* = object ## Data passed to the query/exec start hook.
+    sql*: string
+    params*: seq[PgParam]
+    isExec*: bool ## true for exec, false for query
+
+  TraceQueryEndData* = object ## Data passed to the query/exec end hook.
+    commandTag*: string
+    rowCount*: int64
+    err*: ref CatchableError
+
+  TracePrepareStartData* = object ## Data passed to the prepare start hook.
+    name*: string
+    sql*: string
+
+  TracePrepareEndData* = object ## Data passed to the prepare end hook.
+    err*: ref CatchableError
+
+  TracePipelineStartData* = object ## Data passed to the pipeline start hook.
+    opCount*: int
+
+  TracePipelineEndData* = object ## Data passed to the pipeline end hook.
+    err*: ref CatchableError
+
+  TraceCopyStartData* = object ## Data passed to the copy start hook.
+    sql*: string
+    direction*: TraceCopyDirection
+
+  TraceCopyEndData* = object ## Data passed to the copy end hook.
+    commandTag*: string
+    err*: ref CatchableError
+
+  TracePoolAcquireStartData* = object ## Data passed to the pool acquire start hook.
+    idleCount*: int
+    activeCount*: int
+    maxSize*: int
+
+  TracePoolAcquireEndData* = object ## Data passed to the pool acquire end hook.
+    conn*: PgConnection
+    err*: ref CatchableError
+    wasCreated*: bool ## true if a new connection was created
+
+  TracePoolReleaseStartData* = object ## Data passed to the pool release start hook.
+    conn*: PgConnection
+
+  TracePoolReleaseEndData* = object ## Data passed to the pool release end hook.
+    wasClosed*: bool ## true if connection was closed instead of returned to pool
+    handedToWaiter*: bool ## true if connection was given directly to a waiting acquirer
+
+  PgTracer* = ref object
+    ## Tracing hooks for async-postgres operations.
+    ## Set only the callbacks you need; nil callbacks are skipped with zero overhead.
+    ##
+    ## Start hooks return a ``TraceContext`` (opaque pointer) that is passed to the
+    ## corresponding End hook for correlation (e.g. timing, span linking).
+    ## Return nil from Start if you don't need correlation.
+    onConnectStart*:
+      proc(data: TraceConnectStartData): TraceContext {.gcsafe, raises: [].}
+    onConnectEnd*:
+      proc(ctx: TraceContext, data: TraceConnectEndData) {.gcsafe, raises: [].}
+    onQueryStart*: proc(conn: PgConnection, data: TraceQueryStartData): TraceContext {.
+      gcsafe, raises: []
+    .}
+    onQueryEnd*: proc(ctx: TraceContext, conn: PgConnection, data: TraceQueryEndData) {.
+      gcsafe, raises: []
+    .}
+    onPrepareStart*: proc(conn: PgConnection, data: TracePrepareStartData): TraceContext {.
+      gcsafe, raises: []
+    .}
+    onPrepareEnd*: proc(
+      ctx: TraceContext, conn: PgConnection, data: TracePrepareEndData
+    ) {.gcsafe, raises: [].}
+    onPipelineStart*: proc(
+      conn: PgConnection, data: TracePipelineStartData
+    ): TraceContext {.gcsafe, raises: [].}
+    onPipelineEnd*: proc(
+      ctx: TraceContext, conn: PgConnection, data: TracePipelineEndData
+    ) {.gcsafe, raises: [].}
+    onCopyStart*: proc(conn: PgConnection, data: TraceCopyStartData): TraceContext {.
+      gcsafe, raises: []
+    .}
+    onCopyEnd*: proc(ctx: TraceContext, conn: PgConnection, data: TraceCopyEndData) {.
+      gcsafe, raises: []
+    .}
+    onPoolAcquireStart*:
+      proc(data: TracePoolAcquireStartData): TraceContext {.gcsafe, raises: [].}
+    onPoolAcquireEnd*:
+      proc(ctx: TraceContext, data: TracePoolAcquireEndData) {.gcsafe, raises: [].}
+    onPoolReleaseStart*:
+      proc(data: TracePoolReleaseStartData): TraceContext {.gcsafe, raises: [].}
+    onPoolReleaseEnd*:
+      proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
+
+template withConnTracing*(
+    conn: PgConnection,
+    startHook, endHook: untyped,
+    startData: typed,
+    EndDataType: typedesc,
+    endDataExpr: typed,
+    body: untyped,
+) =
+  ## Wrap an operation with connection-scoped tracing hooks.
+  var traceCtx {.inject.}: TraceContext
+  if conn.tracer != nil and conn.tracer.startHook != nil:
+    traceCtx = conn.tracer.startHook(conn, startData)
+  try:
+    body
+  except CatchableError as e:
+    if conn.tracer != nil and conn.tracer.endHook != nil:
+      conn.tracer.endHook(traceCtx, conn, EndDataType(err: e))
+    raise e
+  if conn.tracer != nil and conn.tracer.endHook != nil:
+    conn.tracer.endHook(traceCtx, conn, endDataExpr)
+
+template withTracing*(
+    tracer: PgTracer,
+    startHook, endHook: untyped,
+    startData: typed,
+    EndDataType: typedesc,
+    endDataExpr: typed,
+    body: untyped,
+) =
+  ## Wrap an operation with non-connection tracing hooks (connect, pool).
+  var traceCtx {.inject.}: TraceContext
+  if tracer != nil and tracer.startHook != nil:
+    traceCtx = tracer.startHook(startData)
+  try:
+    body
+  except CatchableError as e:
+    if tracer != nil and tracer.endHook != nil:
+      tracer.endHook(traceCtx, EndDataType(err: e))
+    raise e
+  if tracer != nil and tracer.endHook != nil:
+    tracer.endHook(traceCtx, endDataExpr)
 
 proc isUnixSocket*(host: string): bool {.inline.} =
   ## True if `host` represents a Unix socket directory (starts with '/').
@@ -1115,42 +1268,60 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
   ## Execute one or more SQL statements via simple query protocol.
   ## Returns one `QueryResult` per statement. Supports multiple statements separated by semicolons.
   conn.checkReady()
-  conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
 
   var results: seq[QueryResult]
-  var current = QueryResult()
-  var queryError: ref PgQueryError
+  var totalRows: int32
+  var lastTag: string
+  # For multi-statement queries (e.g. "SELECT 1; SELECT 2"), the trace end hook
+  # receives the aggregated row count and only the last command tag.
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: lastTag, rowCount: totalRows),
+  ):
+    conn.state = csBusy
+    await conn.sendMsg(encodeQuery(sql))
 
-  block recvLoop:
-    while true:
-      while (
-        let opt = conn.nextMessage(current.data, addr current.rowCount)
-        opt.isSome
-      )
-      :
-        let msg = opt.get
-        case msg.kind
-        of bmkRowDescription:
-          current =
-            QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
-        of bmkCommandComplete:
-          current.commandTag = msg.commandTag
-          results.add(current)
-          current = QueryResult()
-        of bmkEmptyQueryResponse:
-          results.add(QueryResult())
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+    var current = QueryResult()
+    var queryError: ref PgQueryError
+
+    block recvLoop:
+      while true:
+        while (
+          let opt = conn.nextMessage(current.data, addr current.rowCount)
+          opt.isSome
+        )
+        :
+          let msg = opt.get
+          case msg.kind
+          of bmkRowDescription:
+            current =
+              QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
+          of bmkCommandComplete:
+            current.commandTag = msg.commandTag
+            results.add(current)
+            current = QueryResult()
+          of bmkEmptyQueryResponse:
+            results.add(QueryResult())
+          of bmkErrorResponse:
+            queryError = newPgQueryError(msg.errorFields)
+          of bmkReadyForQuery:
+            conn.txStatus = msg.txStatus
+            conn.state = csReady
+            if queryError != nil:
+              raise queryError
+            break recvLoop
+          else:
+            discard
+        await conn.fillRecvBuf()
+
+    for r in results:
+      totalRows += r.rowCount
+      if r.commandTag.len > 0:
+        lastTag = r.commandTag
 
   return results
 
@@ -1251,15 +1422,23 @@ proc simpleExec*(
   ## Lighter than `exec` for parameter-less commands (no Parse/Bind/Describe overhead).
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   var tag: string
-  if timeout > ZeroDuration:
-    try:
-      tag = await simpleExecImpl(conn, sql, timeout).wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "simpleExec timed out")
-  else:
-    tag = await simpleExecImpl(conn, sql)
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, isExec: true),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: tag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        tag = await simpleExecImpl(conn, sql, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "simpleExec timed out")
+    else:
+      tag = await simpleExecImpl(conn, sql)
   return initCommandResult(tag)
 
 proc isConnected(conn: PgConnection): bool =
@@ -1404,10 +1583,26 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       PgConnectionError, "Could not connect to any host: " & errors.join("; ")
     )
 
-  if config.connectTimeout != default(Duration):
-    perform().wait(config.connectTimeout)
-  else:
-    perform()
+  proc wrapped(): Future[PgConnection] {.async.} =
+    let hosts = config.getHosts()
+    var conn: PgConnection
+    withTracing(
+      config.tracer,
+      onConnectStart,
+      onConnectEnd,
+      TraceConnectStartData(hosts: hosts),
+      TraceConnectEndData,
+      TraceConnectEndData(conn: conn),
+    ):
+      conn =
+        if config.connectTimeout != default(Duration):
+          await perform().wait(config.connectTimeout)
+        else:
+          await perform()
+      conn.tracer = config.tracer
+    return conn
+
+  wrapped()
 
 proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
   ## Set a callback invoked for each incoming NOTIFY message.
