@@ -2,7 +2,7 @@ import std/[unittest, strutils]
 
 import ../async_postgres/async_backend
 
-import ../async_postgres/[pg_client, pg_types]
+import ../async_postgres/[pg_client, pg_types, pg_protocol]
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_connection {.all.}
 
@@ -64,7 +64,7 @@ type
   QueryEndRec = object
     spanId: int
     commandTag: string
-    rowCount: int32
+    rowCount: int64
     hasErr: bool
 
   PrepareStartRec = object
@@ -419,7 +419,7 @@ suite "Tracing: PreparedStatement.execute":
       discard await stmt.execute(@[toPgParam(42'i32)])
 
       doAssert log.queryStarts.len == 1
-      doAssert log.queryStarts[0].sql == "test_exec_stmt"
+      doAssert log.queryStarts[0].sql == "SELECT $1::int4"
       doAssert log.queryStarts[0].isExec == false
       doAssert log.queryEnds.len == 1
       doAssert log.queryEnds[0].rowCount == 1
@@ -472,6 +472,76 @@ suite "Tracing: copyOut":
 
       discard await conn.copyOut("COPY test_trace_copy_out TO STDOUT")
 
+      doAssert log.copyStarts.len == 1
+      doAssert log.copyStarts[0].direction == tcdOut
+      doAssert log.copyEnds.len == 1
+      doAssert log.copyEnds[0].commandTag.startsWith("COPY")
+      doAssert not log.copyEnds[0].hasErr
+
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: copyInStream":
+  test "onCopyStart(tcdIn) and onCopyEnd with commandTag":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+
+      discard await conn.exec(
+        "CREATE TEMP TABLE test_trace_copy_in_stream (id int, name text)"
+      )
+
+      var chunks = @["1\tAlice\n".toBytes(), "2\tBob\n".toBytes()]
+      var idx = 0
+      let cb = makeCopyInCallback:
+        if idx < chunks.len:
+          let data = chunks[idx]
+          idx.inc
+          data
+        else:
+          @[]
+
+      log.copyStarts.setLen(0)
+      log.copyEnds.setLen(0)
+
+      discard await conn.copyInStream("COPY test_trace_copy_in_stream FROM STDIN", cb)
+
+      doAssert log.copyStarts.len == 1
+      doAssert log.copyStarts[0].direction == tcdIn
+      doAssert "test_trace_copy_in_stream" in log.copyStarts[0].sql
+      doAssert log.copyEnds.len == 1
+      doAssert log.copyEnds[0].commandTag.startsWith("COPY")
+      doAssert not log.copyEnds[0].hasErr
+
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: copyOutStream":
+  test "onCopyStart(tcdOut) and onCopyEnd with commandTag":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+
+      discard await conn.exec(
+        "CREATE TEMP TABLE test_trace_copy_out_stream (id int, name text)"
+      )
+      discard
+        await conn.exec("INSERT INTO test_trace_copy_out_stream VALUES (1, 'Alice')")
+
+      log.copyStarts.setLen(0)
+      log.copyEnds.setLen(0)
+
+      var received: seq[seq[byte]]
+      let cb = makeCopyOutCallback:
+        received.add(data)
+
+      discard await conn.copyOutStream("COPY test_trace_copy_out_stream TO STDOUT", cb)
+
+      doAssert received.len > 0
       doAssert log.copyStarts.len == 1
       doAssert log.copyStarts[0].direction == tcdOut
       doAssert log.copyEnds.len == 1
@@ -564,6 +634,79 @@ suite "Tracing: pool acquire/release":
 
       pool.release(conn2)
       await pool.close()
+
+    waitFor t()
+
+suite "Tracing: queryEach":
+  test "onQueryStart and onQueryEnd are called with rowCount":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      log.queryStarts.setLen(0)
+      log.queryEnds.setLen(0)
+
+      var rows: seq[string]
+      discard await conn.queryEach(
+        "SELECT generate_series(1, 3)",
+        callback = proc(row: Row) =
+          rows.add(row.getStr(0)),
+      )
+
+      doAssert rows.len == 3
+      doAssert log.queryStarts.len == 1
+      doAssert log.queryStarts[0].sql == "SELECT generate_series(1, 3)"
+      doAssert log.queryStarts[0].isExec == false
+      doAssert log.queryEnds.len == 1
+      doAssert log.queryEnds[0].rowCount == 3
+      doAssert not log.queryEnds[0].hasErr
+
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: execInTransaction":
+  test "onQueryStart(isExec=true) and onQueryEnd with commandTag":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      log.queryStarts.setLen(0)
+      log.queryEnds.setLen(0)
+
+      discard
+        await conn.execInTransaction("CREATE TEMP TABLE test_trace_exec_tx (id int)")
+
+      doAssert log.queryStarts.len == 1
+      doAssert log.queryStarts[0].isExec == true
+      doAssert log.queryEnds.len == 1
+      doAssert log.queryEnds[0].commandTag.len > 0
+      doAssert not log.queryEnds[0].hasErr
+
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: queryInTransaction":
+  test "onQueryStart(isExec=false) and onQueryEnd with rowCount":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      log.queryStarts.setLen(0)
+      log.queryEnds.setLen(0)
+
+      let qr = await conn.queryInTransaction("SELECT generate_series(1, 3)")
+
+      doAssert qr.rowCount == 3
+      doAssert log.queryStarts.len == 1
+      doAssert log.queryStarts[0].sql == "SELECT generate_series(1, 3)"
+      doAssert log.queryStarts[0].isExec == false
+      doAssert log.queryEnds.len == 1
+      doAssert log.queryEnds[0].rowCount == 3
+      doAssert not log.queryEnds[0].hasErr
+
+      await conn.close()
 
     waitFor t()
 

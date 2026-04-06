@@ -232,7 +232,7 @@ type
 
   TraceQueryEndData* = object ## Data passed to the query/exec end hook.
     commandTag*: string
-    rowCount*: int32
+    rowCount*: int64
     err*: ref CatchableError
 
   TracePrepareStartData* = object ## Data passed to the prepare start hook.
@@ -1272,6 +1272,8 @@ proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.a
   var results: seq[QueryResult]
   var totalRows: int32
   var lastTag: string
+  # For multi-statement queries (e.g. "SELECT 1; SELECT 2"), the trace end hook
+  # receives the aggregated row count and only the last command tag.
   withConnTracing(
     conn,
     onQueryStart,

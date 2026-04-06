@@ -18,6 +18,7 @@ type
   PreparedStatement* = object ## A server-side prepared statement returned by `prepare`.
     conn*: PgConnection
     name*: string
+    sql*: string
     fields*: seq[FieldDescription]
     paramOids*: seq[int32]
 
@@ -761,17 +762,27 @@ proc queryEach*(
 ): Future[int64] {.async.} =
   ## Execute a query with typed parameters, invoking `callback` once per row.
   ## Returns the number of rows processed.
-  let resultFormats = resultFormat.toFormatCodes()
-  if timeout > ZeroDuration:
-    try:
-      return await queryEachImpl(conn, sql, params, callback, resultFormats, timeout)
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "queryEach timed out")
-  else:
-    return await queryEachImpl(conn, sql, params, callback, resultFormats)
+  var count: int64
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, params: params, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(rowCount: count),
+  ):
+    let resultFormats = resultFormat.toFormatCodes()
+    if timeout > ZeroDuration:
+      try:
+        count = await queryEachImpl(conn, sql, params, callback, resultFormats, timeout)
+          .wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "queryEach timed out")
+    else:
+      count = await queryEachImpl(conn, sql, params, callback, resultFormats)
+  return count
 
 proc query(
     conn: PgConnection,
@@ -986,7 +997,7 @@ proc prepareImpl(
   batch.addSync()
   await conn.sendMsg(batch)
 
-  var stmt = PreparedStatement(conn: conn, name: name)
+  var stmt = PreparedStatement(conn: conn, name: name, sql: sql)
   var queryError: ref PgQueryError
 
   block recvLoop:
@@ -1131,7 +1142,7 @@ proc execute*(
     stmt.conn,
     onQueryStart,
     onQueryEnd,
-    TraceQueryStartData(sql: stmt.name, params: params, isExec: false),
+    TraceQueryStartData(sql: stmt.sql, params: params, isExec: false),
     TraceQueryEndData,
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
   ):
@@ -1893,20 +1904,30 @@ proc execInTransaction(
   ## Execute a statement inside a pipelined BEGIN/COMMIT transaction (1 round trip).
   ## On error, ROLLBACK is issued automatically.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await execInTransactionImpl(
+  var tag: string
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, isExec: true),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: tag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        tag = await execInTransactionImpl(
+          conn, "BEGIN", sql, params, paramOids, paramFormats, timeout
+        )
+          .wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "execInTransaction timed out")
+    else:
+      tag = await execInTransactionImpl(
         conn, "BEGIN", sql, params, paramOids, paramFormats, timeout
       )
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "execInTransaction timed out")
-  else:
-    return await execInTransactionImpl(
-      conn, "BEGIN", sql, params, paramOids, paramFormats, timeout
-    )
+  return tag
 
 proc execInTransaction*(
     conn: PgConnection,
@@ -1927,22 +1948,30 @@ proc execInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with options.
-  let (oids, formats, values) = extractParams(params)
-  let beginSql = buildBeginSql(opts)
   var tag: string
-  if timeout > ZeroDuration:
-    try:
-      tag = await execInTransactionImpl(
-        conn, beginSql, sql, values, oids, formats, timeout
-      )
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "execInTransaction timed out")
-  else:
-    tag =
-      await execInTransactionImpl(conn, beginSql, sql, values, oids, formats, timeout)
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, params: params, isExec: true),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: tag),
+  ):
+    let (oids, formats, values) = extractParams(params)
+    let beginSql = buildBeginSql(opts)
+    if timeout > ZeroDuration:
+      try:
+        tag = await execInTransactionImpl(
+          conn, beginSql, sql, values, oids, formats, timeout
+        )
+          .wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "execInTransaction timed out")
+    else:
+      tag =
+        await execInTransactionImpl(conn, beginSql, sql, values, oids, formats, timeout)
   return initCommandResult(tag)
 
 proc queryInTransactionImpl(
@@ -2034,20 +2063,30 @@ proc queryInTransaction(
   ## Execute a query inside a pipelined BEGIN/COMMIT transaction (1 round trip).
   ## Returns rows. On error, ROLLBACK is issued automatically.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await queryInTransactionImpl(
+  var qr: QueryResult
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        qr = await queryInTransactionImpl(
+          conn, "BEGIN", sql, params, paramOids, paramFormats, resultFormats, timeout
+        )
+          .wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "queryInTransaction timed out")
+    else:
+      qr = await queryInTransactionImpl(
         conn, "BEGIN", sql, params, paramOids, paramFormats, resultFormats, timeout
       )
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "queryInTransaction timed out")
-  else:
-    return await queryInTransactionImpl(
-      conn, "BEGIN", sql, params, paramOids, paramFormats, resultFormats, timeout
-    )
+  return qr
 
 proc queryInTransaction*(
     conn: PgConnection,
@@ -2071,23 +2110,33 @@ proc queryInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined transaction with options.
-  let (oids, formats, values) = extractParams(params)
-  let resultFormats = resultFormat.toFormatCodes()
-  let beginSql = buildBeginSql(opts)
-  if timeout > ZeroDuration:
-    try:
-      return await queryInTransactionImpl(
+  var qr: QueryResult
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, params: params, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
+  ):
+    let (oids, formats, values) = extractParams(params)
+    let resultFormats = resultFormat.toFormatCodes()
+    let beginSql = buildBeginSql(opts)
+    if timeout > ZeroDuration:
+      try:
+        qr = await queryInTransactionImpl(
+          conn, beginSql, sql, values, oids, formats, resultFormats, timeout
+        )
+          .wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "queryInTransaction timed out")
+    else:
+      qr = await queryInTransactionImpl(
         conn, beginSql, sql, values, oids, formats, resultFormats, timeout
       )
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "queryInTransaction timed out")
-  else:
-    return await queryInTransactionImpl(
-      conn, beginSql, sql, values, oids, formats, resultFormats, timeout
-    )
+  return qr
 
 proc newPipeline*(conn: PgConnection): Pipeline =
   ## Create a new pipeline for batching multiple operations into a single round trip.
