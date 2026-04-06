@@ -10,9 +10,12 @@ Async PostgreSQL client in Nim.
 - Pipeline mode — batch multiple operations in a single network round trip
 - Connection pooling with health checks and maintenance
 - Pool cluster with read replica routing
-- SSL/TLS support (disable, prefer, require, verify-ca, verify-full)
+- SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full)
 - MD5 and SCRAM-SHA-256 authentication
 - DSN connection string parsing
+- Unix socket connection
+- Multi-host failover
+- Target session attributes (any, read-write, read-only, primary, standby, prefer-standby)
 
 ### Queries & Statements
 - `sql` macro — compile-time `{expr}` placeholder extraction with automatic parameterization
@@ -23,21 +26,35 @@ Async PostgreSQL client in Nim.
 - COPY IN / COPY OUT (buffered and streaming)
 - Large Object API (streaming binary data)
 - LISTEN/NOTIFY with auto-reconnect
+- Advisory locks (session/transaction, exclusive/shared)
+- Logical replication with pgoutput decoder
 
 ### Types
 - Typed parameters (`pgParams` / `toPgParam`) and row accessors (`getStr`, `getInt`, ...)
+- UUID type (`PgUuid`)
+- Numeric type (`PgNumeric` — arbitrary-precision decimal)
+- JSON/JSONB (`JsonNode`)
 - Array types with binary format support
 - Range and multirange types (`int4range`, `tsrange`, `daterange`, ...)
 - Composite types (user-defined row types via `pgComposite` macro)
 - Enum types (user-defined enums via `pgEnum` macro)
+- Domain types (user-defined domains via `pgDomain` macro)
 - Network types (`inet`, `cidr`, `macaddr`, `macaddr8`)
+- Geometric types (`point`, `line`, `lseg`, `box`, `path`, `polygon`, `circle`)
+- Text search types (`tsvector`, `tsquery`)
+- Bit string types (`bit`, `varbit`)
 - Interval type (`PgInterval`)
+- hstore type (`PgHstore`)
+- XML type (`PgXml`)
 
 ### Performance
 - Automatic binary format selection for known-safe types
 - Compile-time binary format lookup tables
 - Zero-copy binary array decoding
 - Optimized protocol encoding with minimized allocations
+
+### Observability
+- Tracing hooks for connection, query, prepared statement, pipeline, COPY, and pool operations
 
 ### Platform
 - Async backend: [asyncdispatch](https://nim-lang.org/docs/asyncdispatch.html) (default) or [chronos](https://github.com/status-im/nim-chronos)
@@ -115,6 +132,7 @@ The [examples](examples/) directory contains runnable samples:
 - [pool](examples/pool.nim) — Connection pooling
 - [pool_cluster](examples/pool_cluster.nim) — Read/write splitting with pool cluster
 - [advisory_lock](examples/advisory_lock.nim) — Application-level distributed locking
+- [replication](examples/replication.nim) — Logical replication with pgoutput
 
 ## Documentation
 
