@@ -266,6 +266,7 @@ proc release*(pool: PgPool, conn: PgConnection) =
       pool.config.tracer.onPoolReleaseStart(TracePoolReleaseStartData(conn: conn))
 
   var wasClosed = false
+  var handedToWaiter = false
   if pool.closed or conn.state != csReady or conn.txStatus != tsIdle:
     if pool.active > 0:
       pool.active.dec
@@ -279,6 +280,7 @@ proc release*(pool: PgPool, conn: PgConnection) =
           continue
         pool.waiterCount.dec
         waiter.fut.complete(conn)
+        handedToWaiter = true
         break dispatch
       if pool.active > 0:
         pool.active.dec
@@ -286,7 +288,8 @@ proc release*(pool: PgPool, conn: PgConnection) =
 
   if pool.config.tracer != nil and pool.config.tracer.onPoolReleaseEnd != nil:
     pool.config.tracer.onPoolReleaseEnd(
-      traceCtx, TracePoolReleaseEndData(wasClosed: wasClosed)
+      traceCtx,
+      TracePoolReleaseEndData(wasClosed: wasClosed, handedToWaiter: handedToWaiter),
     )
 
 type AcquireResult = tuple[conn: PgConnection, wasCreated: bool]

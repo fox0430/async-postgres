@@ -219,8 +219,7 @@ type
     tcdOut
 
   TraceConnectStartData* = object ## Data passed to the connect start hook.
-    host*: string
-    port*: int
+    hosts*: seq[HostEntry]
 
   TraceConnectEndData* = object ## Data passed to the connect end hook.
     conn*: PgConnection
@@ -272,6 +271,7 @@ type
 
   TracePoolReleaseEndData* = object ## Data passed to the pool release end hook.
     wasClosed*: bool ## true if connection was closed instead of returned to pool
+    handedToWaiter*: bool ## true if connection was given directly to a waiting acquirer
 
   PgTracer* = ref object
     ## Tracing hooks for async-postgres operations.
@@ -1582,37 +1582,22 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     )
 
   proc wrapped(): Future[PgConnection] {.async.} =
-    var traceCtx: TraceContext
-    if config.tracer != nil and config.tracer.onConnectStart != nil:
-      let hosts = config.getHosts()
-      traceCtx = config.tracer.onConnectStart(
-        TraceConnectStartData(
-          host:
-            if hosts.len > 0:
-              hosts[0].host
-            else:
-              "",
-          port:
-            if hosts.len > 0:
-              hosts[0].port
-            else:
-              5432,
-        )
-      )
+    let hosts = config.getHosts()
     var conn: PgConnection
-    try:
+    withTracing(
+      config.tracer,
+      onConnectStart,
+      onConnectEnd,
+      TraceConnectStartData(hosts: hosts),
+      TraceConnectEndData,
+      TraceConnectEndData(conn: conn),
+    ):
       conn =
         if config.connectTimeout != default(Duration):
           await perform().wait(config.connectTimeout)
         else:
           await perform()
-    except CatchableError as e:
-      if config.tracer != nil and config.tracer.onConnectEnd != nil:
-        config.tracer.onConnectEnd(traceCtx, TraceConnectEndData(err: e))
-      raise e
-    conn.tracer = config.tracer
-    if config.tracer != nil and config.tracer.onConnectEnd != nil:
-      config.tracer.onConnectEnd(traceCtx, TraceConnectEndData(conn: conn))
+      conn.tracer = config.tracer
     return conn
 
   wrapped()

@@ -50,8 +50,7 @@ proc newSpan(kind: SpanKind): Span =
 # Record types
 type
   ConnectStartRec = object
-    host: string
-    port: int
+    hosts: seq[HostEntry]
 
   ConnectEndRec = object
     spanId: int
@@ -109,6 +108,7 @@ type
   PoolReleaseEndRec = object
     spanId: int
     wasClosed: bool
+    handedToWaiter: bool
 
   TraceLog = ref object
     connectStarts: seq[ConnectStartRec]
@@ -135,7 +135,7 @@ proc buildTracer(log: TraceLog): PgTracer =
   tracer.onConnectStart = proc(
       data: TraceConnectStartData
   ): TraceContext {.gcsafe, raises: [].} =
-    log.connectStarts.add(ConnectStartRec(host: data.host, port: data.port))
+    log.connectStarts.add(ConnectStartRec(hosts: data.hosts))
     let span = newSpan(skConnect)
     return span
 
@@ -244,7 +244,9 @@ proc buildTracer(log: TraceLog): PgTracer =
   ) {.gcsafe, raises: [].} =
     let span = Span(ctx)
     log.poolReleaseEnds.add(
-      PoolReleaseEndRec(spanId: span.id, wasClosed: data.wasClosed)
+      PoolReleaseEndRec(
+        spanId: span.id, wasClosed: data.wasClosed, handedToWaiter: data.handedToWaiter
+      )
     )
 
   return tracer
@@ -262,8 +264,9 @@ suite "Tracing: connect":
       let conn = await connect(tracedConfig(tracer))
 
       doAssert log.connectStarts.len == 1
-      doAssert log.connectStarts[0].host == PgHost
-      doAssert log.connectStarts[0].port == PgPort
+      doAssert log.connectStarts[0].hosts.len == 1
+      doAssert log.connectStarts[0].hosts[0].host == PgHost
+      doAssert log.connectStarts[0].hosts[0].port == PgPort
       doAssert log.connectEnds.len == 1
       doAssert log.connectEnds[0].hasConn
       doAssert not log.connectEnds[0].hasErr
@@ -526,6 +529,7 @@ suite "Tracing: pool acquire/release":
       doAssert log.poolReleaseStarts[0].hasConn
       doAssert log.poolReleaseEnds.len == 1
       doAssert not log.poolReleaseEnds[0].wasClosed
+      doAssert not log.poolReleaseEnds[0].handedToWaiter
 
       # Re-acquire should reuse the idle connection
       let conn2 = await pool.acquire()
@@ -533,6 +537,30 @@ suite "Tracing: pool acquire/release":
       doAssert log.poolAcquireStarts.len == 2
       doAssert log.poolAcquireEnds.len == 2
       doAssert log.poolAcquireEnds[1].wasCreated == false
+
+      pool.release(conn2)
+      await pool.close()
+
+    waitFor t()
+
+  test "release hands connection to waiter":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      let conn1 = await pool.acquire()
+      # maxSize=1, so next acquire will wait
+      let fut = pool.acquire()
+      # Release conn1 -- should hand to the waiter
+      pool.release(conn1)
+      let conn2 = await fut
+
+      doAssert log.poolReleaseEnds.len == 1
+      doAssert not log.poolReleaseEnds[0].wasClosed
+      doAssert log.poolReleaseEnds[0].handedToWaiter
 
       pool.release(conn2)
       await pool.close()
