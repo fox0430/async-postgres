@@ -5530,6 +5530,401 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: executeIsolated basic":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_pipe_iso")
+      discard
+        await conn.exec("CREATE TABLE test_pipe_iso (id serial PRIMARY KEY, val text)")
+
+      let p = newPipeline(conn)
+      p.addExec("INSERT INTO test_pipe_iso (val) VALUES ($1)", @[toPgParam("a")])
+      p.addQuery("SELECT 42::int4")
+      p.addExec("INSERT INTO test_pipe_iso (val) VALUES ($1)", @[toPgParam("b")])
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      doAssert ir.errors.len == 3
+      for i in 0 ..< 3:
+        doAssert ir.errors[i] == nil
+      doAssert ir.results[0].kind == prkExec
+      doAssert ir.results[0].commandResult == "INSERT 0 1"
+      doAssert ir.results[1].kind == prkQuery
+      doAssert ir.results[1].queryResult.rows[0].getStr(0) == "42"
+      doAssert ir.results[2].kind == prkExec
+
+      let qr = await conn.query("SELECT val FROM test_pipe_iso ORDER BY id")
+      doAssert qr.rowCount == 2
+      doAssert qr.rows[0].getStr(0) == "a"
+      doAssert qr.rows[1].getStr(0) == "b"
+
+      discard await conn.exec("DROP TABLE test_pipe_iso")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated error does not abort subsequent ops":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_pipe_iso2")
+      discard await conn.exec(
+        "CREATE TABLE test_pipe_iso2 (id serial PRIMARY KEY, val text NOT NULL)"
+      )
+
+      let p = newPipeline(conn)
+      p.addExec("INSERT INTO test_pipe_iso2 (val) VALUES ($1)", @[toPgParam("ok")])
+      # This will fail: NULL violates NOT NULL constraint
+      p.addExec("INSERT INTO test_pipe_iso2 (val) VALUES (NULL)")
+      p.addExec("INSERT INTO test_pipe_iso2 (val) VALUES ($1)", @[toPgParam("also_ok")])
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert ir.errors[2] == nil # NOT aborted, unlike execute()
+
+      # Connection should still be usable
+      doAssert conn.state == csReady
+      let qr = await conn.query("SELECT val FROM test_pipe_iso2 ORDER BY id")
+      doAssert qr.rowCount == 2
+      doAssert qr.rows[0].getStr(0) == "ok"
+      doAssert qr.rows[1].getStr(0) == "also_ok"
+
+      discard await conn.exec("DROP TABLE test_pipe_iso2")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated empty":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p = newPipeline(conn)
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 0
+      doAssert ir.errors.len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated with cache hit":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Warm the cache
+      discard await conn.query("SELECT $1::text", @[toPgParam("warm")])
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT $1::text", @[toPgParam("cached")])
+      p.addQuery("SELECT $1::int4", @[toPgParam(99'i32)])
+      let ir = await p.executeIsolated()
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] == nil
+      doAssert ir.results[0].queryResult.rows[0].getStr(0) == "cached"
+      doAssert ir.results[1].queryResult.rows[0].getStr(0) == "99"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated timeout":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p = newPipeline(conn)
+      p.addQuery("SELECT pg_sleep(10)")
+      var caught = false
+      try:
+        discard await p.executeIsolated(timeout = milliseconds(100))
+      except PgTimeoutError:
+        caught = true
+      doAssert caught
+      doAssert conn.state == csClosed
+
+    waitFor t()
+
+  test "pipeline: executeIsolated cache eviction":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      # Warm cache with 2 entries
+      discard await conn.query("SELECT 1")
+      discard await conn.query("SELECT 2")
+      doAssert conn.stmtCache.len == 2
+
+      # Pipeline 2 new queries via executeIsolated => evicts both old entries
+      let p = newPipeline(conn)
+      p.addQuery("SELECT 100::int4")
+      p.addQuery("SELECT 200::int4")
+      let ir = await p.executeIsolated()
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] == nil
+      doAssert ir.results[0].queryResult.rows[0].getStr(0) == "100"
+      doAssert ir.results[1].queryResult.rows[0].getStr(0) == "200"
+
+      doAssert conn.stmtCache.len == 2
+      doAssert conn.stmtCache.hasKey("SELECT 100::int4")
+      doAssert conn.stmtCache.hasKey("SELECT 200::int4")
+
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Pipelined Pool":
+  test "pipelined pool: basic exec and query":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      discard await pool.exec("DROP TABLE IF EXISTS test_pp")
+      discard await pool.exec("CREATE TABLE test_pp (id serial PRIMARY KEY, val text)")
+
+      discard
+        await pool.exec("INSERT INTO test_pp (val) VALUES ($1)", @[toPgParam("hi")])
+      let qr = await pool.query("SELECT val FROM test_pp")
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getStr(0) == "hi"
+
+      discard await pool.exec("DROP TABLE test_pp")
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: concurrent ops are batched":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+
+      # Fire multiple queries concurrently within the same tick
+      let f1 = pool.query("SELECT 1::int4")
+      let f2 = pool.query("SELECT 2::int4")
+      let f3 = pool.query("SELECT 3::int4")
+      let r1 = await f1
+      let r2 = await f2
+      let r3 = await f3
+      doAssert r1.rows[0].getStr(0) == "1"
+      doAssert r2.rows[0].getStr(0) == "2"
+      doAssert r3.rows[0].getStr(0) == "3"
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: error isolation between ops":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+
+      let f1 = pool.query("SELECT 1::int4")
+      let f2 = pool.query("INVALID SQL HERE")
+      let f3 = pool.query("SELECT 3::int4")
+
+      let r1 = await f1
+      doAssert r1.rows[0].getStr(0) == "1"
+
+      var gotError = false
+      try:
+        discard await f2
+      except PgError:
+        gotError = true
+      doAssert gotError
+
+      let r3 = await f3
+      doAssert r3.rows[0].getStr(0) == "3"
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: exec error isolation":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      discard await pool.exec("DROP TABLE IF EXISTS test_pp_exec_err")
+      discard await pool.exec("CREATE TABLE test_pp_exec_err (id int PRIMARY KEY)")
+      discard await pool.exec("INSERT INTO test_pp_exec_err VALUES (1)")
+
+      # Fire concurrent ops: one exec will violate PK, others should succeed
+      let f1 = pool.query("SELECT 1::int4")
+      let f2 = pool.exec("INSERT INTO test_pp_exec_err VALUES (1)") # duplicate PK
+      let f3 = pool.query("SELECT 3::int4")
+
+      let r1 = await f1
+      doAssert r1.rows[0].getStr(0) == "1"
+
+      var gotError = false
+      try:
+        discard await f2
+      except PgError:
+        gotError = true
+      doAssert gotError
+
+      let r3 = await f3
+      doAssert r3.rows[0].getStr(0) == "3"
+
+      discard await pool.exec("DROP TABLE test_pp_exec_err")
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: queryOne works":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      let row = await pool.queryOne("SELECT 42::int4 AS answer")
+      doAssert row.isSome
+      doAssert row.get.getStr(0) == "42"
+
+      let empty = await pool.queryOne("SELECT 1 WHERE false")
+      doAssert empty.isNone
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: queryValue works":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      let v = await pool.queryValue("SELECT 'hello'::text")
+      doAssert v == "hello"
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: queryValueOpt works":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      let opt = await pool.queryValueOpt("SELECT 'found'::text")
+      doAssert opt.isSome
+      doAssert opt.get == "found"
+
+      let optNone = await pool.queryValueOpt("SELECT 1 WHERE false")
+      doAssert optNone.isNone
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: queryValueOrDefault works":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      let v = await pool.queryValueOrDefault("SELECT 'val'::text", default = "fb")
+      doAssert v == "val"
+
+      let def =
+        await pool.queryValueOrDefault("SELECT 1 WHERE false", default = "fallback")
+      doAssert def == "fallback"
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: queryExists works":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      let exists = await pool.queryExists("SELECT 1")
+      doAssert exists
+
+      let notExists = await pool.queryExists("SELECT 1 WHERE false")
+      doAssert not notExists
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: queryColumn works":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      let col = await pool.queryColumn(
+        "SELECT v::text FROM (VALUES ('a'), ('b'), ('c')) AS t(v)"
+      )
+      doAssert col.len == 3
+      doAssert col == @["a", "b", "c"]
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: close fails pending ops":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      # Queue an op but close immediately
+      let fut = pool.query("SELECT 1::int4")
+      await pool.close()
+
+      var gotError = false
+      try:
+        discard await fut
+      except PgError:
+        gotError = true
+      doAssert gotError
+
+    waitFor t()
+
+  test "pipelined pool: maxPipelineSize limits batch":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(
+          connConfig: plainConfig(),
+          minSize: 1,
+          maxSize: 3,
+          pipelined: true,
+          maxPipelineSize: 2,
+        )
+      )
+
+      # Fire 4 queries concurrently; maxPipelineSize=2 means batches of 2
+      let f1 = pool.query("SELECT 10::int4")
+      let f2 = pool.query("SELECT 20::int4")
+      let f3 = pool.query("SELECT 30::int4")
+      let f4 = pool.query("SELECT 40::int4")
+      doAssert (await f1).rows[0].getStr(0) == "10"
+      doAssert (await f2).rows[0].getStr(0) == "20"
+      doAssert (await f3).rows[0].getStr(0) == "30"
+      doAssert (await f4).rows[0].getStr(0) == "40"
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: high concurrency distributes across connections":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 2, maxSize: 4, pipelined: true)
+      )
+
+      # Fire 6 concurrent queries -- more than maxSize
+      let f1 = pool.query("SELECT 1::int4")
+      let f2 = pool.query("SELECT 2::int4")
+      let f3 = pool.query("SELECT 3::int4")
+      let f4 = pool.query("SELECT 4::int4")
+      let f5 = pool.query("SELECT 5::int4")
+      let f6 = pool.query("SELECT 6::int4")
+      doAssert (await f1).rows[0].getStr(0) == "1"
+      doAssert (await f2).rows[0].getStr(0) == "2"
+      doAssert (await f3).rows[0].getStr(0) == "3"
+      doAssert (await f4).rows[0].getStr(0) == "4"
+      doAssert (await f5).rows[0].getStr(0) == "5"
+      doAssert (await f6).rows[0].getStr(0) == "6"
+
+      await pool.close()
+
+    waitFor t()
+
 suite "E2E: queryDirect / execDirect":
   test "queryDirect with int32 param":
     proc t() {.async.} =

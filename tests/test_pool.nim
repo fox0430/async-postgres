@@ -394,7 +394,6 @@ suite "Pool close":
     # Simulate a connection being released after a short delay
     proc releaseAfter(pool: PgPool) {.async.} =
       await sleepAsync(milliseconds(20))
-      let conn = mockConn(csClosed)
       pool.active.dec
 
     let releaseFut = releaseAfter(pool)
