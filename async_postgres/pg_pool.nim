@@ -30,6 +30,14 @@ type
       ## "RESET ALL" (reset session parameters only).
       ## On failure, the connection is discarded.
     tracer*: PgTracer ## Optional tracer for pool-level hooks (acquire/release)
+    pipelined*: bool
+      ## Enable implicit query batching for pool.exec/query (default false).
+      ## When enabled, concurrent calls within the same event loop tick are
+      ## batched into a single TCP write per connection using per-query SYNC
+      ## for error isolation.
+    maxPipelineSize*: int
+      ## Max operations per pipeline batch per connection (default 0=unlimited).
+      ## Only used when `pipelined` is true.
 
   PooledConn = object
     ## An idle connection held by the pool with its last-used timestamp.
@@ -47,6 +55,19 @@ type
     createCount*: int64 ## Number of new connections created
     closeCount*: int64 ## Number of connections closed/discarded
 
+  PendingOpKind = enum
+    popExec
+    popQuery
+
+  PendingPoolOp = ref object
+    kind: PendingOpKind
+    sql: string
+    params: seq[PgParam]
+    resultFormat: ResultFormat ## Only used for popQuery
+    timeout: Duration
+    execFut: Future[CommandResult] ## Non-nil for popExec
+    queryFut: Future[QueryResult] ## Non-nil for popQuery
+
   PgPool* = ref object ## Connection pool that manages a set of PostgreSQL connections.
     config: PoolConfig
     idle: Deque[PooledConn]
@@ -58,6 +79,8 @@ type
     cachedNow: Moment
       ## Updated on acquire(); reused by release() to avoid extra syscalls
     metrics: PoolMetrics
+    pendingOps: Deque[PendingPoolOp] ## Queue for implicit pipeline batching
+    dispatchScheduled: bool ## Whether a dispatch callback is pending
 
 proc initPoolConfig*(
     connConfig: ConnConfig,
@@ -71,10 +94,13 @@ proc initPoolConfig*(
     acquireTimeout = seconds(30),
     maxWaiters = -1,
     resetQuery = "",
+    pipelined = false,
+    maxPipelineSize = 0,
 ): PoolConfig =
   ## Create a pool configuration with sensible defaults.
   ## `minSize` idle connections are maintained; up to `maxSize` total.
   ## Set `resetQuery` to clean session state on release (e.g. "DISCARD ALL" for PgBouncer).
+  ## Set `pipelined` to true to enable implicit query batching for `pool.exec`/`pool.query`.
   ##
   ## Raises `ValueError` if parameters are invalid.
   if minSize < 0:
@@ -100,6 +126,8 @@ proc initPoolConfig*(
     acquireTimeout: acquireTimeout,
     maxWaiters: maxWaiters,
     resetQuery: resetQuery,
+    pipelined: pipelined,
+    maxPipelineSize: maxPipelineSize,
   )
 
 proc poolConfig*(pool: PgPool): PoolConfig =
@@ -236,6 +264,8 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     waiters: initDeque[Waiter](),
     waiterCount: 0,
     closed: false,
+    pendingOps: initDeque[PendingPoolOp](),
+    dispatchScheduled: false,
   )
 
   try:
@@ -412,6 +442,164 @@ template withConnection*(pool: PgPool, conn, body: untyped) =
     await pool.resetSession(conn)
     pool.release(conn)
 
+proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
+  ## Fail a pending op's future if not already finished.
+  case op.kind
+  of popExec:
+    if not op.execFut.finished:
+      op.execFut.fail(e)
+  of popQuery:
+    if not op.queryFut.finished:
+      op.queryFut.fail(e)
+
+proc executeBatch(
+    pool: PgPool, conn: PgConnection, batch: seq[PendingPoolOp]
+): Future[void] {.async.} =
+  ## Execute a batch of pending operations on a single connection via pipeline.
+  let batchTimeout = block:
+    var t = ZeroDuration
+    for op in batch:
+      if op.timeout > t:
+        t = op.timeout
+    t
+  try:
+    let pipeline = newPipeline(conn)
+    for op in batch:
+      case op.kind
+      of popExec:
+        pipeline.addExec(op.sql, op.params)
+      of popQuery:
+        pipeline.addQuery(op.sql, op.params, op.resultFormat)
+    let ir = await pipeline.executeIsolated(batchTimeout)
+    for i in 0 ..< batch.len:
+      let op = batch[i]
+      if ir.errors[i] != nil:
+        case op.kind
+        of popExec:
+          op.execFut.fail(ir.errors[i])
+        of popQuery:
+          op.queryFut.fail(ir.errors[i])
+      else:
+        case op.kind
+        of popExec:
+          op.execFut.complete(ir.results[i].commandResult)
+        of popQuery:
+          op.queryFut.complete(ir.results[i].queryResult)
+  except CatchableError as e:
+    for op in batch:
+      failPendingOp(op, e)
+  finally:
+    await pool.resetSession(conn)
+    pool.release(conn)
+
+proc dispatchBatchImpl(pool: PgPool) {.async.} =
+  ## Drain the pending ops queue and execute them via pipelined connections.
+  pool.dispatchScheduled = false
+  if pool.pendingOps.len == 0 or pool.closed:
+    return
+
+  # Drain queue (respect maxPipelineSize)
+  var ops: seq[PendingPoolOp]
+  let maxOps = pool.config.maxPipelineSize
+  while pool.pendingOps.len > 0:
+    if maxOps > 0 and ops.len >= maxOps:
+      break
+    ops.add(pool.pendingOps.popFirst())
+
+  # Fast path: single op, skip pipeline overhead
+  if ops.len == 1:
+    let op = ops[0]
+    try:
+      let conn = await pool.acquire()
+      try:
+        case op.kind
+        of popExec:
+          let r = await conn.exec(op.sql, op.params, timeout = op.timeout)
+          op.execFut.complete(r)
+        of popQuery:
+          let r = await conn.query(
+            op.sql, op.params, resultFormat = op.resultFormat, timeout = op.timeout
+          )
+          op.queryFut.complete(r)
+      finally:
+        await pool.resetSession(conn)
+        pool.release(conn)
+    except CatchableError as e:
+      failPendingOp(op, e)
+    return
+
+  # Multi-op path: acquire connections and distribute.
+  # Limit to at most half the pool to avoid starving other users.
+  var conns: seq[PgConnection]
+  let maxConns = min(ops.len, max(1, pool.config.maxSize div 2))
+  for i in 0 ..< maxConns:
+    try:
+      let conn = await pool.acquire()
+      conns.add(conn)
+    except CatchableError:
+      break
+
+  if conns.len == 0:
+    let err = newException(PgPoolError, "Failed to acquire connection for batch")
+    for op in ops:
+      failPendingOp(op, err)
+    return
+
+  # Distribute ops round-robin across connections
+  var connOps = newSeq[seq[PendingPoolOp]](conns.len)
+  for i in 0 ..< ops.len:
+    connOps[i mod conns.len].add(ops[i])
+
+  # Execute each connection's batch in parallel
+  var batchFuts: seq[Future[void]]
+  for ci in 0 ..< conns.len:
+    if connOps[ci].len == 0:
+      await pool.resetSession(conns[ci])
+      pool.release(conns[ci])
+      continue
+    batchFuts.add(executeBatch(pool, conns[ci], connOps[ci]))
+
+  await allFutures(batchFuts)
+
+proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
+  ## Schedule a batch dispatch on the next event loop tick.
+  if pool.dispatchScheduled:
+    return
+  pool.dispatchScheduled = true
+  let p = pool
+  proc cb() {.gcsafe, raises: [].} =
+    proc run(pool: PgPool) {.async.} =
+      try:
+        await pool.dispatchBatchImpl()
+      except CatchableError as e:
+        # Fail any ops still in the queue so their futures don't hang forever.
+        while pool.pendingOps.len > 0:
+          let op = pool.pendingOps.popFirst()
+          failPendingOp(op, e)
+      # Re-schedule if there are remaining ops
+      if pool.pendingOps.len > 0:
+        pool.scheduleDispatch()
+
+    {.gcsafe.}:
+      try:
+        asyncSpawn p.run()
+      except Exception as e:
+        # asyncSpawn should not raise in practice, but the compiler cannot
+        # prove it.  Fail any pending ops so their futures do not hang.
+        let err = newException(PgError, "Pipeline dispatch failed: " & e.msg)
+        try:
+          while p.pendingOps.len > 0:
+            let op = p.pendingOps.popFirst()
+            failPendingOp(op, err)
+        except Exception:
+          discard
+        p.dispatchScheduled = false
+
+  try:
+    scheduleSoon(cb)
+  except CatchableError:
+    pool.dispatchScheduled = false
+
 proc exec*(
     pool: PgPool,
     sql: string,
@@ -419,6 +607,17 @@ proc exec*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement with typed parameters using a pooled connection.
+  ## When `pipelined` is enabled, the operation is batched with other concurrent
+  ## calls and sent in a single TCP write.
+  if pool.config.pipelined:
+    let fut = newFuture[CommandResult]("PgPool.exec.pipelined")
+    pool.pendingOps.addLast(
+      PendingPoolOp(
+        kind: popExec, sql: sql, params: params, timeout: timeout, execFut: fut
+      )
+    )
+    pool.scheduleDispatch()
+    return await fut
   let conn = await pool.acquire()
   try:
     return await conn.exec(sql, params, timeout = timeout)
@@ -434,6 +633,22 @@ proc query*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query with typed parameters using a pooled connection.
+  ## When `pipelined` is enabled, the operation is batched with other concurrent
+  ## calls and sent in a single TCP write.
+  if pool.config.pipelined:
+    let fut = newFuture[QueryResult]("PgPool.query.pipelined")
+    pool.pendingOps.addLast(
+      PendingPoolOp(
+        kind: popQuery,
+        sql: sql,
+        params: params,
+        resultFormat: resultFormat,
+        timeout: timeout,
+        queryFut: fut,
+      )
+    )
+    pool.scheduleDispatch()
+    return await fut
   let conn = await pool.acquire()
   try:
     return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
@@ -465,12 +680,12 @@ proc queryOne*(
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
   ## Execute a query and return the first row, or `none` if no rows.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryOne(sql, params, resultFormat, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, resultFormat, timeout)
+  if qr.rowCount > 0:
+    if qr.fields.len > 0 and qr.data.fields.len == 0:
+      qr.data.fields = qr.fields
+    return some(Row(data: qr.data, rowIdx: 0))
+  return none(Row)
 
 proc queryValue*(
     pool: PgPool,
@@ -480,12 +695,13 @@ proc queryValue*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Raises `PgError` if no rows or the value is NULL.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryValue(sql, params, timeout = timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    raise newException(PgError, "Query returned no rows")
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    raise newException(PgError, "Query returned NULL")
+  return row.getStr(0)
 
 proc queryValue*[T](
     pool: PgPool,
@@ -496,12 +712,13 @@ proc queryValue*[T](
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Raises `PgError` if no rows or the value is NULL.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryValue(T, sql, params, timeout = timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    raise newException(PgError, "Query returned no rows")
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    raise newException(PgError, "Query returned NULL")
+  return row.get(0, T)
 
 proc queryValueOpt*(
     pool: PgPool,
@@ -511,12 +728,13 @@ proc queryValueOpt*(
 ): Future[Option[string]] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `none` if no rows or the value is NULL.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryValueOpt(sql, params, timeout = timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return none(string)
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    return none(string)
+  return some(row.getStr(0))
 
 proc queryValueOpt*[T](
     pool: PgPool,
@@ -527,12 +745,13 @@ proc queryValueOpt*[T](
 ): Future[Option[T]] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `none` if no rows or the value is NULL.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryValueOpt(T, sql, params, timeout = timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return none(T)
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    return none(T)
+  return some(row.get(0, T))
 
 proc queryValueOrDefault*(
     pool: PgPool,
@@ -543,12 +762,13 @@ proc queryValueOrDefault*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `default` if no rows or the value is NULL.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryValueOrDefault(sql, params, default, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return default
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    return default
+  return row.getStr(0)
 
 proc queryValueOrDefault*[T](
     pool: PgPool,
@@ -560,12 +780,13 @@ proc queryValueOrDefault*[T](
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `default` if no rows or the value is NULL.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryValueOrDefault(T, sql, params, default, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return default
+  let row = Row(data: qr.data, rowIdx: 0)
+  if row.isNull(0):
+    return default
+  return row.get(0, T)
 
 proc queryExists*(
     pool: PgPool,
@@ -574,12 +795,8 @@ proc queryExists*(
     timeout: Duration = ZeroDuration,
 ): Future[bool] {.async.} =
   ## Execute a query and return whether any rows exist.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryExists(sql, params, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  let qr = await pool.query(sql, params, timeout = timeout)
+  return qr.rowCount > 0
 
 proc queryColumn*(
     pool: PgPool,
@@ -588,12 +805,13 @@ proc queryColumn*(
     timeout: Duration = ZeroDuration,
 ): Future[seq[string]] {.async.} =
   ## Execute a query and return the first column of all rows as strings.
-  let conn = await pool.acquire()
-  try:
-    return await conn.queryColumn(sql, params, timeout)
-  finally:
-    await pool.resetSession(conn)
-    pool.release(conn)
+  ## Raises PgTypeError if any value is NULL.
+  let qr = await pool.query(sql, params, timeout = timeout)
+  for i in 0 ..< qr.rowCount:
+    let row = Row(data: qr.data, rowIdx: i)
+    if row.isNull(0):
+      raise newException(PgTypeError, "NULL value in column")
+    result.add(row.getStr(0))
 
 proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.} =
   ## Execute one or more SQL statements via simple query protocol using a pooled connection.
@@ -761,6 +979,13 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     if not waiter.cancelled:
       waiter.fut.fail(newException(PgError, "Pool closed"))
   pool.waiterCount = 0
+
+  # Fail all pending pipeline ops
+  pool.dispatchScheduled = false
+  let closeErr = newException(PgError, "Pool closed")
+  while pool.pendingOps.len > 0:
+    let op = pool.pendingOps.popFirst()
+    failPendingOp(op, closeErr)
 
   # Wait for active connections to drain
   if timeout > ZeroDuration and pool.active > 0:
