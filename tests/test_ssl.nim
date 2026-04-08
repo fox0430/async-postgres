@@ -545,3 +545,268 @@ suite "SSL negotiation - sslDisable":
     check firstMsgVersion == 196608'i32
     check connState == csReady
     check connSslEnabled == false
+
+suite "Direct SSL negotiation (sslnDirect)":
+  test "sslnDirect sends TLS ClientHello as first bytes (no SSLRequest)":
+    when defined(ssl) or hasChronos:
+      var firstByte: byte = 0
+      var gotData = false
+      var raised = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await ms.accept()
+          try:
+            # Read first 5 bytes (TLS record header: type + version + length)
+            let data = await readN(st, 5)
+            firstByte = data[0]
+            gotData = true
+            # Read remaining TLS ClientHello body to avoid broken pipe
+            let bodyLen = int(data[3]) shl 8 or int(data[4])
+            if bodyLen > 0 and bodyLen < 65536:
+              try:
+                discard await readN(st, bodyLen)
+              except CatchableError:
+                discard
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslRequire,
+          sslNegotiation: sslnDirect,
+        )
+
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except CatchableError:
+          raised = true
+
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody()
+      # TLS record content type 0x16 = Handshake (ClientHello)
+      check gotData
+      check firstByte == 0x16'u8
+      # Connection will fail because mock server doesn't do TLS
+      check raised
+    else:
+      skip()
+
+  test "sslnDirect + sslVerifyCa sends TLS ClientHello as first bytes":
+    when defined(ssl) or hasChronos:
+      var firstByte: byte = 0
+      var gotData = false
+      var raised = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await ms.accept()
+          try:
+            let data = await readN(st, 5)
+            firstByte = data[0]
+            gotData = true
+            let bodyLen = int(data[3]) shl 8 or int(data[4])
+            if bodyLen > 0 and bodyLen < 65536:
+              try:
+                discard await readN(st, bodyLen)
+              except CatchableError:
+                discard
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslVerifyCa,
+          sslNegotiation: sslnDirect,
+        )
+
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except CatchableError:
+          raised = true
+
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody()
+      check gotData
+      check firstByte == 0x16'u8
+      check raised
+    else:
+      skip()
+
+  test "sslnDirect + sslVerifyFull sends TLS ClientHello as first bytes":
+    when defined(ssl) or hasChronos:
+      var firstByte: byte = 0
+      var gotData = false
+      var raised = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await ms.accept()
+          try:
+            let data = await readN(st, 5)
+            firstByte = data[0]
+            gotData = true
+            let bodyLen = int(data[3]) shl 8 or int(data[4])
+            if bodyLen > 0 and bodyLen < 65536:
+              try:
+                discard await readN(st, bodyLen)
+              except CatchableError:
+                discard
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslVerifyFull,
+          sslNegotiation: sslnDirect,
+        )
+
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except CatchableError:
+          raised = true
+
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody()
+      check gotData
+      check firstByte == 0x16'u8
+      check raised
+    else:
+      skip()
+
+  test "sslnDirect + sslDisable raises error":
+    var raised = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 5432,
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+        sslNegotiation: sslnDirect,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        raised = true
+
+    waitFor testBody()
+    check raised
+
+  test "sslnDirect + sslAllow raises error":
+    var raised = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 5432,
+        user: "test",
+        database: "test",
+        sslMode: sslAllow,
+        sslNegotiation: sslnDirect,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        raised = true
+
+    waitFor testBody()
+    check raised
+
+  test "sslnDirect + sslPrefer raises error":
+    var raised = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 5432,
+        user: "test",
+        database: "test",
+        sslMode: sslPrefer,
+        sslNegotiation: sslnDirect,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        raised = true
+
+    waitFor testBody()
+    check raised
+
+  test "sslnPostgres is default and sends SSLRequest as before":
+    var sslReqMagic: int32 = 0
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          let sslReq = await readN(st, 8)
+          sslReqMagic = decodeInt32(sslReq, 4)
+          await sendBytes(st, @[byte('N')])
+          await drainStartupMessage(st)
+          await sendAuthOkAndReady(st)
+          await drainUntilClose(st)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslPrefer, # sslNegotiation defaults to sslnPostgres
+      )
+
+      let conn = await connect(config)
+      await conn.close()
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check sslReqMagic == 80877103'i32

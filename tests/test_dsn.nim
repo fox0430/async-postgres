@@ -94,6 +94,21 @@ suite "parseDsn":
       else:
         discard
 
+  test "query param sslnegotiation":
+    for mode in ["postgres", "direct"]:
+      let cfg = parseDsn("postgresql://host/db?sslnegotiation=" & mode)
+      case mode
+      of "postgres":
+        check cfg.sslNegotiation == sslnPostgres
+      of "direct":
+        check cfg.sslNegotiation == sslnDirect
+      else:
+        discard
+
+  test "error: invalid sslnegotiation":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslnegotiation=bogus")
+
   test "query param application_name":
     let cfg = parseDsn("postgresql://host/db?application_name=myapp")
     check cfg.applicationName == "myapp"
@@ -409,6 +424,14 @@ suite "parseDsn keyword=value":
   test "sslmode parameter":
     let cfg = parseDsn("host=h dbname=d sslmode=require")
     check cfg.sslMode == sslRequire
+
+  test "sslnegotiation parameter":
+    let cfg = parseDsn("host=h dbname=d sslnegotiation=direct")
+    check cfg.sslNegotiation == sslnDirect
+
+  test "error: invalid sslnegotiation (key-value)":
+    expect PgError:
+      discard parseDsn("host=h sslnegotiation=bogus")
 
   test "connect_timeout parameter":
     let cfg = parseDsn("host=h connect_timeout=30")

@@ -333,6 +333,45 @@ suite "E2E: SSL Connection":
 
     waitFor t()
 
+suite "E2E: Direct SSL Negotiation":
+  test "sslnDirect + sslRequire connects with SSL":
+    proc t() {.async.} =
+      let conn = await connect(
+        ConnConfig(
+          host: PgHost,
+          port: PgPort,
+          user: PgUser,
+          password: PgPassword,
+          database: PgDatabase,
+          sslMode: sslRequire,
+          sslNegotiation: sslnDirect,
+        )
+      )
+      doAssert conn.state == csReady
+      doAssert conn.sslEnabled == true
+      await conn.close()
+
+    waitFor t()
+
+  test "sslnDirect query over SSL connection":
+    proc t() {.async.} =
+      let conn = await connect(
+        ConnConfig(
+          host: PgHost,
+          port: PgPort,
+          user: PgUser,
+          password: PgPassword,
+          database: PgDatabase,
+          sslMode: sslRequire,
+          sslNegotiation: sslnDirect,
+        )
+      )
+      let results = await conn.simpleQuery("SELECT 42 AS answer")
+      doAssert results[0].rows[0][0].get().toString() == "42"
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: SSL Verification":
   test "sslVerifyCa connects with CA verification":
     proc t() {.async.} =
