@@ -192,6 +192,6 @@ when hasChronos:
 
     if anchors.len == 0:
       raise
-        newException(PgConnectionError, "No valid CA certificates found in PEM data")
+        newException(PgError, "No valid CA certificates found in PEM data")
 
     result = TrustAnchorResult(store: TrustAnchorStore.new(anchors), backing: backing)
