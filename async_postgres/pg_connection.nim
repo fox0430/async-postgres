@@ -6,12 +6,12 @@ import async_backend, pg_protocol, pg_auth, pg_types
 
 when hasChronos:
   import chronos/streams/tlsstream
-  import bearssl/[x509, rsa, ec]
+  import pg_bearssl
 elif hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, SockType, Protocol
   when defined(ssl):
-    import std/[net, tempfiles, os]
+    import std/[net, openssl, tempfiles, os]
 
 export PgError
 
@@ -50,21 +50,6 @@ type
   PgNotifyOverflowError* = object of PgError
     dropped*: int ## Number of notifications dropped due to queue overflow
 
-proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
-  ## Create a PgQueryError from server ErrorResponse fields.
-  let sqlState = getErrorField(fields, 'C')
-  let severity = getErrorField(fields, 'S')
-  let detail = getErrorField(fields, 'D')
-  let hint = getErrorField(fields, 'H')
-  result = (ref PgQueryError)(
-    msg: formatError(fields),
-    sqlState: sqlState,
-    severity: severity,
-    detail: detail,
-    hint: hint,
-  )
-
-type
   PgConnState* = enum
     ## Connection lifecycle state.
     csConnecting
@@ -149,8 +134,10 @@ type
       writer: AsyncStreamWriter
       tlsStream: TLSAsyncStream
       trustAnchorBufs: seq[seq[byte]] ## Backing memory for custom trust anchor pointers
+      x509Capture: X509CertCaptureContext ## X509 wrapper for cert capture
     elif hasAsyncDispatch:
       socket*: AsyncSocket
+    serverCertDer: seq[byte] ## DER-encoded server certificate for SCRAM channel binding
     sslEnabled*: bool
     recvBuf*: seq[byte]
     recvBufStart*: int ## Read pointer into recvBuf; bytes before this are consumed
@@ -317,6 +304,20 @@ type
     onPoolReleaseEnd*:
       proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
 
+proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
+  ## Create a PgQueryError from server ErrorResponse fields.
+  let sqlState = getErrorField(fields, 'C')
+  let severity = getErrorField(fields, 'S')
+  let detail = getErrorField(fields, 'D')
+  let hint = getErrorField(fields, 'H')
+  result = (ref PgQueryError)(
+    msg: formatError(fields),
+    sqlState: sqlState,
+    severity: severity,
+    detail: detail,
+    hint: hint,
+  )
+
 template withConnTracing*(
     conn: PgConnection,
     startHook, endHook: untyped,
@@ -410,10 +411,6 @@ when hasChronos:
   type CopyInCallback* =
     proc(): Future[seq[byte]] {.async: (raises: [CatchableError]), gcsafe.}
     ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
-
-  type TrustAnchorResult = object
-    store: TrustAnchorStore
-    backing: seq[seq[byte]] ## Owns memory pointed to by trust anchor fields
 
 else:
   type CopyOutCallback* = proc(data: seq[byte]): Future[void] {.gcsafe.}
@@ -707,102 +704,6 @@ proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
     if conn.sendBuf.len > 0:
       await conn.socket.sendRawData(unsafeAddr conn.sendBuf[0], conn.sendBuf.len)
 
-when hasChronos:
-  proc appendDnCallback(
-      ctx: pointer, buf: pointer, len: uint
-  ) {.exportc: "pg_append_dn_nim", cdecl, gcsafe, noSideEffect, raises: [].} =
-    let s = cast[ptr seq[byte]](ctx)
-    let p = cast[ptr UncheckedArray[byte]](buf)
-    for i in 0 ..< int(len):
-      s[].add(p[i])
-
-  # C shim with const void* to satisfy BearSSL's br_x509_decoder_init signature
-  {.
-    emit: """
-  static void pg_append_dn_shim(void *ctx, const void *buf, size_t len) {
-    pg_append_dn_nim(ctx, (void*)buf, len);
-  }
-  """
-  .}
-
-  proc initX509Decoder(ctx: var X509DecoderContext, appendDnCtx: pointer) =
-    {.
-      emit: ["br_x509_decoder_init(&", ctx, ", pg_append_dn_shim, ", appendDnCtx, ");"]
-    .}
-
-  proc parseTrustAnchors(pemData: string): TrustAnchorResult =
-    ## Parse PEM-encoded CA certificates into a TrustAnchorStore.
-    ## Returns both the store and the backing memory that anchor pointers reference.
-    ##
-    ## IMPORTANT: X509TrustAnchor contains raw `ptr byte` fields (dn.data,
-    ## pkey.key.rsa.n/e, pkey.key.ec.q). TrustAnchorStore.new() only shallow-copies
-    ## these structs, and BearSSL only stores a pointer to the anchor array.
-    ## The caller MUST keep `result.backing` alive for the lifetime of the TLS session.
-    let items = pemDecode(pemData)
-    var anchors: seq[X509TrustAnchor]
-    var backing: seq[seq[byte]]
-
-    for item in items:
-      if item.name != "CERTIFICATE":
-        continue
-
-      var dnBuf: seq[byte]
-      var decoder: X509DecoderContext
-      initX509Decoder(decoder, addr dnBuf)
-      x509DecoderPush(decoder, unsafeAddr item.data[0], uint(item.data.len))
-
-      if x509DecoderLastError(decoder) != 0:
-        continue
-
-      let pkey = x509DecoderGetPkey(decoder)
-      if pkey.isNil:
-        continue
-
-      # Deep-copy DN
-      backing.add(dnBuf)
-      let dnData = addr backing[^1][0]
-
-      # Deep-copy public key and build anchor
-      var anchor: X509TrustAnchor
-      anchor.dn = X500Name(data: dnData, len: uint(dnBuf.len))
-      anchor.flags =
-        if x509DecoderIsCA(decoder) != 0:
-          cuint(X509_TA_CA)
-        else:
-          0
-      anchor.pkey.keyType = pkey.keyType
-
-      if pkey.keyType == byte(KEYTYPE_RSA):
-        var nBuf = newSeq[byte](pkey.key.rsa.nlen)
-        copyMem(addr nBuf[0], pkey.key.rsa.n, nBuf.len)
-        backing.add(nBuf)
-        var eBuf = newSeq[byte](pkey.key.rsa.elen)
-        copyMem(addr eBuf[0], pkey.key.rsa.e, eBuf.len)
-        backing.add(eBuf)
-        anchor.pkey.key.rsa = RsaPublicKey(
-          n: addr backing[^2][0],
-          nlen: uint(nBuf.len),
-          e: addr backing[^1][0],
-          elen: uint(eBuf.len),
-        )
-      elif pkey.keyType == byte(KEYTYPE_EC):
-        var qBuf = newSeq[byte](pkey.key.ec.qlen)
-        copyMem(addr qBuf[0], pkey.key.ec.q, qBuf.len)
-        backing.add(qBuf)
-        anchor.pkey.key.ec = EcPublicKey(
-          curve: pkey.key.ec.curve, q: addr backing[^1][0], qlen: uint(qBuf.len)
-        )
-      else:
-        continue
-
-      anchors.add(anchor)
-
-    if anchors.len == 0:
-      raise
-        newException(PgConnectionError, "No valid CA certificates found in PEM data")
-
-    result = TrustAnchorResult(store: TrustAnchorStore.new(anchors), backing: backing)
-
 proc closeTransport(conn: PgConnection) {.async.} =
   ## Close transport resources without sending Terminate.
   when hasChronos:
@@ -896,6 +797,9 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
           minVersion = TLSVersion.TLS12,
           maxVersion = TLSVersion.TLS12,
         )
+      installX509Capture(
+        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+      )
       await conn.tlsStream.handshake()
       conn.reader = conn.tlsStream.reader
       conn.writer = conn.tlsStream.writer
@@ -926,6 +830,17 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
           let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
           wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
           conn.sslEnabled = true
+          # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding
+          let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
+          if peerCert != nil:
+            try:
+              let derStr = i2d_X509(peerCert)
+              if derStr.len > 0:
+                conn.serverCertDer = newSeq[byte](derStr.len)
+                for i in 0 ..< derStr.len:
+                  conn.serverCertDer[i] = byte(derStr[i])
+            finally:
+              X509_free(peerCert)
         finally:
           if tmpPath.len > 0:
             removeFile(tmpPath)
@@ -1176,11 +1091,24 @@ proc connectToHost(
             let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
             await conn.sendMsg(encodePassword(hash))
           of bmkAuthenticationSASL:
-            if "SCRAM-SHA-256" notin msg.saslMechanisms:
-              raise
-                newException(PgConnectionError, "Server doesn't support SCRAM-SHA-256")
-            let clientFirst = scramClientFirstMessage(config.user, scramState)
-            await conn.sendMsg(encodeSASLInitialResponse("SCRAM-SHA-256", clientFirst))
+            var mechanism: string
+            var cbType = ""
+            var cbData: seq[byte]
+            if conn.sslEnabled and conn.serverCertDer.len > 0 and
+                "SCRAM-SHA-256-PLUS" in msg.saslMechanisms:
+              mechanism = "SCRAM-SHA-256-PLUS"
+              cbType = "tls-server-end-point"
+              cbData = computeTlsServerEndpoint(conn.serverCertDer)
+            elif "SCRAM-SHA-256" in msg.saslMechanisms:
+              mechanism = "SCRAM-SHA-256"
+            else:
+              raise newException(
+                PgConnectionError,
+                "Server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS",
+              )
+            let clientFirst =
+              scramClientFirstMessage(config.user, scramState, cbType, cbData)
+            await conn.sendMsg(encodeSASLInitialResponse(mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
             let clientFinal =
               scramClientFinalMessage(config.password, msg.saslData, scramState)
