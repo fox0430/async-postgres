@@ -9,6 +9,8 @@ type ScramState* = object
   clientNonce*: string
   clientFirstBare*: string
   serverSignature*: array[32, byte]
+  gs2Header*: string ## GS2 header: "n,," (no binding) or "p=tls-server-end-point,,"
+  channelBindingData*: seq[byte] ## Channel binding data (empty for non-PLUS)
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -34,23 +36,42 @@ proc scramEscapeUsername*(user: string): string =
   ## '=' is encoded as '=3D' and ',' is encoded as '=2C'.
   result = user.replace("=", "=3D").replace(",", "=2C")
 
-proc scramClientFirstMessage*(user: string, state: var ScramState): seq[byte] =
+proc scramClientFirstMessage*(
+    user: string, state: var ScramState, cbType: string = "", cbData: seq[byte] = @[]
+): seq[byte] =
   ## Generate the SCRAM-SHA-256 client-first message with a random nonce.
+  ## When `cbType` is non-empty, use channel binding (SCRAM-SHA-256-PLUS).
   var nonceBuf: array[24, byte]
   let n = randomBytes(nonceBuf)
   if n != 24:
     raise newException(CatchableError, "SCRAM: failed to generate random nonce")
   state.clientNonce = base64.encode(nonceBuf)
   state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & state.clientNonce
-  result = toBytes("n,," & state.clientFirstBare)
+  state.gs2Header =
+    if cbType.len > 0:
+      "p=" & cbType & ",,"
+    else:
+      "n,,"
+  state.channelBindingData = cbData
+  result = toBytes(state.gs2Header & state.clientFirstBare)
 
 proc scramClientFirstMessage*(
-    user: string, nonce: string, state: var ScramState
+    user: string,
+    nonce: string,
+    state: var ScramState,
+    cbType: string = "",
+    cbData: seq[byte] = @[],
 ): seq[byte] =
   ## Overload with explicit nonce for testing.
   state.clientNonce = nonce
   state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & nonce
-  result = toBytes("n,," & state.clientFirstBare)
+  state.gs2Header =
+    if cbType.len > 0:
+      "p=" & cbType & ",,"
+    else:
+      "n,,"
+  state.channelBindingData = cbData
+  result = toBytes(state.gs2Header & state.clientFirstBare)
 
 proc scramClientFinalMessage*(
     password: string, serverFirstData: openArray[byte], state: var ScramState
@@ -102,7 +123,9 @@ proc scramClientFinalMessage*(
   let saltedPassword = sha256.pbkdf2(password, salt, iterations, 32)
   let clientKey = sha256.hmac(saltedPassword, "Client Key").data
   let storedKey = sha256.digest(clientKey).data
-  let clientFinalWithoutProof = "c=biws,r=" & combinedNonce
+  var cbindInput = toBytes(state.gs2Header)
+  cbindInput.add(state.channelBindingData)
+  let clientFinalWithoutProof = "c=" & base64.encode(cbindInput) & ",r=" & combinedNonce
   let authMessage =
     state.clientFirstBare & "," & serverFirstMsg & "," & clientFinalWithoutProof
   let clientSignature = sha256.hmac(storedKey, authMessage).data
@@ -115,6 +138,12 @@ proc scramClientFinalMessage*(
   state.serverSignature = sha256.hmac(serverKey, authMessage).data
 
   result = toBytes(clientFinalWithoutProof & ",p=" & base64.encode(clientProof))
+
+proc computeTlsServerEndpoint*(certDer: openArray[byte]): seq[byte] =
+  ## Compute tls-server-end-point channel binding data per RFC 5929.
+  ## Always uses SHA-256, matching PostgreSQL (libpq) behavior.
+  let hash = sha256.digest(certDer)
+  result = @(hash.data)
 
 proc scramVerifyServerFinal*(
     serverFinalData: openArray[byte], state: ScramState

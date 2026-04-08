@@ -11,7 +11,7 @@ Async PostgreSQL client in Nim.
 - Connection pooling with health checks and maintenance
 - Pool cluster with read replica routing
 - SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full)
-- MD5 and SCRAM-SHA-256 authentication
+- MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
 - DSN connection string parsing
 - Unix socket connection
 - Multi-host failover
