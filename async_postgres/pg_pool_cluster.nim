@@ -2,7 +2,7 @@ import std/[options, macros, strutils]
 
 import async_backend, pg_protocol, pg_connection, pg_types, pg_pool
 
-import pg_client {.all.}
+import pg_client
 
 type
   ReplicaFallback* = enum
