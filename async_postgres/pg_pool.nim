@@ -1,8 +1,6 @@
 import std/[deques, macros, options]
 
-import async_backend, pg_protocol, pg_connection, pg_types
-
-import pg_client
+import async_backend, pg_protocol, pg_connection, pg_types, pg_client
 
 type
   PoolConfig* = object
