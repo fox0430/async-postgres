@@ -237,6 +237,14 @@ clusterForwards("read"):
     timeout: Duration = ZeroDuration,
   ): Future[Option[Row]]
 
+  proc readQueryRow*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): Future[Row]
+
   proc readQueryValue*(
     cluster: PgPoolCluster,
     sql: string,
@@ -334,6 +342,14 @@ clusterForwards("write"):
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
   ): Future[Option[Row]]
+
+  proc writeQueryRow*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): Future[Row]
 
   proc writeQueryValue*(
     cluster: PgPoolCluster,

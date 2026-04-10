@@ -861,6 +861,21 @@ proc queryOne*(
   else:
     return none(Row)
 
+proc queryRow*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[Row] {.async.} =
+  ## Execute a query and return the first row.
+  ## Raises `PgError` if no rows are returned.
+  let row =
+    await conn.queryOne(sql, params, resultFormat = resultFormat, timeout = timeout)
+  if row.isNone:
+    raise newException(PgError, "Query returned no rows")
+  return row.get
+
 proc queryValue*(
     conn: PgConnection,
     sql: string,
