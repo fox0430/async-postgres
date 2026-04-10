@@ -6,7 +6,6 @@
 ## Usage:
 ##   nim c -r examples/pool.nim
 
-import std/options
 import pkg/async_postgres
 
 proc main() {.async.} =
@@ -49,8 +48,8 @@ proc main() {.async.} =
 
   proc cheapest(): Future[string] {.async.} =
     pool.withConnection(conn):
-      let row = await conn.queryOne("SELECT name FROM products ORDER BY price LIMIT 1")
-      return options.get(row).getStr("name")
+      let row = await conn.queryRow("SELECT name FROM products ORDER BY price LIMIT 1")
+      return row.getStr("name")
 
   # Launch concurrently, then await each result
   let expCountFut = countExpensive()

@@ -4465,6 +4465,29 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "queryRow returns first row":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let row = await conn.queryRow("SELECT 1 AS a, 'hello' AS b")
+      doAssert row.getStr(0) == "1"
+      doAssert row.getStr(1) == "hello"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryRow raises on no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.queryRow("SELECT 1 WHERE false")
+      except PgError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
   test "queryValue returns scalar":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -4732,6 +4755,28 @@ suite "E2E: Convenience Query Methods":
       let row = await pool.queryOne("SELECT 'pooled'")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "pooled"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryRow":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let row = await pool.queryRow("SELECT 'pooled' AS v")
+      doAssert row.getStr("v") == "pooled"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryRow raises on no rows":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryRow("SELECT 1 WHERE false")
+      except PgError:
+        raised = true
+      doAssert raised
       await pool.close()
 
     waitFor t()

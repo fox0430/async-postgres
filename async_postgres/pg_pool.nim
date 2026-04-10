@@ -685,6 +685,21 @@ proc queryOne*(
     return some(Row(data: qr.data, rowIdx: 0))
   return none(Row)
 
+proc queryRow*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[Row] {.async.} =
+  ## Execute a query and return the first row.
+  ## Raises `PgError` if no rows are returned.
+  let row =
+    await pool.queryOne(sql, params, resultFormat = resultFormat, timeout = timeout)
+  if row.isNone:
+    raise newException(PgError, "Query returned no rows")
+  return row.get
+
 proc queryValue*(
     pool: PgPool,
     sql: string,
