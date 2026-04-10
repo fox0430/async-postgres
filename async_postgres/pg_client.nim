@@ -397,7 +397,8 @@ template queryRecvLoop(
             int16(qr.fields.len), cachedColFmts, cachedColOids
           )
         else:
-          conn.rowDataBuf = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+          conn.rowDataBuf =
+            newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
         conn.rowDataBuf.fields = qr.fields
         qr.data = conn.rowDataBuf
       else:
@@ -434,7 +435,8 @@ template queryRecvLoop(
             qr.fields = msg.fields
           if reuseBuffer:
             if conn.rowDataBuf != nil:
-              conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len), cf, co)
+              conn.rowDataBuf =
+                conn.rowDataBuf.reuseRowData(int16(qr.fields.len), cf, co)
             else:
               conn.rowDataBuf = newRowData(int16(qr.fields.len), cf, co)
             conn.rowDataBuf.fields = qr.fields
@@ -528,8 +530,18 @@ proc queryImpl(
 
   var qr = QueryResult()
   queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr, timeout, reuseBuffer = false,
+    conn,
+    sql,
+    effectiveResultFormats,
+    cacheHit,
+    cacheMiss,
+    stmtName,
+    cachedFields,
+    cachedColFmts,
+    cachedColOids,
+    qr,
+    timeout,
+    reuseBuffer = false,
   )
   return qr
 
@@ -589,8 +601,18 @@ proc queryImpl(
 
   var qr = QueryResult()
   queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr, timeout, reuseBuffer = false,
+    conn,
+    sql,
+    effectiveResultFormats,
+    cacheHit,
+    cacheMiss,
+    stmtName,
+    cachedFields,
+    cachedColFmts,
+    cachedColOids,
+    qr,
+    timeout,
+    reuseBuffer = false,
   )
   return qr
 
