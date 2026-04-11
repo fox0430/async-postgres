@@ -6039,6 +6039,21 @@ suite "E2E: queryDirect / execDirect":
 
     waitFor t()
 
+  test "queryDirect Row survives subsequent queries (lifetime bug)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr1 = await conn.queryDirect("SELECT $1::text", "x")
+      let qr2 = await conn.queryDirect("SELECT $1::text", "y")
+      doAssert qr1.rowCount == 1
+      doAssert qr2.rowCount == 1
+      let row1 = Row(data: qr1.data, rowIdx: 0)
+      let row2 = Row(data: qr2.data, rowIdx: 0)
+      doAssert row1.getStr(0) == "x", "qr1 data was invalidated by qr2"
+      doAssert row2.getStr(0) == "y"
+      await conn.close()
+
+    waitFor t()
+
   test "execDirect INSERT and UPDATE":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

@@ -175,7 +175,6 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
     try:
       discard await conn.simpleExec(pool.config.resetQuery)
       conn.clearStmtCache()
-      conn.rowDataBuf = nil
     except CatchableError:
       try:
         await conn.close()
