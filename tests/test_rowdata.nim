@@ -209,3 +209,80 @@ suite "reuseRowData":
     # The key safety property: rd1 is a different ref object than rd2
     let rd2 = rd1.reuseRowData(1)
     check rd1 != rd2 # Different ref objects
+
+suite "Row.clone":
+  test "returns independent RowData backing":
+    let rd = newRowData(2)
+    parseDataRowInto(buildDataRowBody(["hello", "world"]), rd)
+    let row = Row(data: rd, rowIdx: 0)
+    let cloned = row.clone()
+    check cloned.data != rd
+    check cloned.rowIdx == 0
+    check cloned.data.numCols == 2
+
+  test "clone survives original buffer reuse":
+    let rd = newRowData(2)
+    parseDataRowInto(buildDataRowBody(["hello", "world"]), rd)
+    let cloned = Row(data: rd, rowIdx: 0).clone()
+
+    # Simulate queryEach behavior: reset and parse next row into same rd
+    rd.buf.setLen(0)
+    rd.cellIndex.setLen(0)
+    parseDataRowInto(buildDataRowBody(["xxx", "yyy"]), rd)
+
+    check getCell(cloned.data, 0, 0) == "hello"
+    check getCell(cloned.data, 0, 1) == "world"
+
+  test "clones a specific row out of a multi-row buffer":
+    let rd = newRowData(2)
+    parseDataRowInto(buildDataRowBody(["a0", "b0"]), rd)
+    parseDataRowInto(buildDataRowBody(["a1", "b1"]), rd)
+    parseDataRowInto(buildDataRowBody(["a2", "b2"]), rd)
+
+    let cloned = Row(data: rd, rowIdx: 1).clone()
+    check cloned.data.numCols == 2
+    check cloned.data.cellIndex.len == 4 # just one row worth
+    check getCell(cloned.data, 0, 0) == "a1"
+    check getCell(cloned.data, 0, 1) == "b1"
+
+  test "preserves NULL cells":
+    let rd = newRowData(3)
+    parseDataRowInto(buildDataRowBody(["val", "\xFF", "end"]), rd)
+    let cloned = Row(data: rd, rowIdx: 0).clone()
+    check getCell(cloned.data, 0, 0) == "val"
+    check isCellNull(cloned.data, 0, 1)
+    check getCell(cloned.data, 0, 2) == "end"
+
+  test "preserves empty string vs NULL distinction":
+    let rd = newRowData(2)
+    var body: seq[byte]
+    body.addInt16(2)
+    body.addInt32(0) # empty string
+    body.addInt32(-1) # NULL
+    parseDataRowInto(body, rd)
+
+    let cloned = Row(data: rd, rowIdx: 0).clone()
+    check not isCellNull(cloned.data, 0, 0)
+    check getCell(cloned.data, 0, 0) == ""
+    check isCellNull(cloned.data, 0, 1)
+
+  test "copies colFormats, colTypeOids, and fields":
+    let rd =
+      newRowData(2, colFormats = @[1'i16, 0'i16], colTypeOids = @[23'i32, 25'i32])
+    rd.fields = @[
+      FieldDescription(name: "id", typeOid: 23, formatCode: 1),
+      FieldDescription(name: "name", typeOid: 25, formatCode: 0),
+    ]
+    parseDataRowInto(buildDataRowBody(["x", "y"]), rd)
+
+    let cloned = Row(data: rd, rowIdx: 0).clone()
+    check cloned.data.colFormats == @[1'i16, 0'i16]
+    check cloned.data.colTypeOids == @[23'i32, 25'i32]
+    check cloned.data.fields.len == 2
+    check cloned.data.fields[0].name == "id"
+    check cloned.data.fields[1].name == "name"
+
+  test "clone of nil data is safe":
+    let row = Row(data: nil, rowIdx: 0)
+    let cloned = row.clone()
+    check cloned.data == nil

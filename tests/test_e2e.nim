@@ -6196,6 +6196,26 @@ suite "E2E: queryEach":
 
     waitFor t()
 
+  test "row.clone() retains row beyond callback lifetime":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var saved: seq[Row] = @[]
+      discard await conn.queryEach(
+        "SELECT * FROM (VALUES ('a', 1), ('b', 2), ('c', 3)) AS t(s, n)",
+        callback = proc(row: Row) =
+          saved.add(row.clone()),
+      )
+      doAssert saved.len == 3
+      doAssert saved[0].getStr(0) == "a"
+      doAssert saved[0].getInt(1) == 1
+      doAssert saved[1].getStr(0) == "b"
+      doAssert saved[1].getInt(1) == 2
+      doAssert saved[2].getStr(0) == "c"
+      doAssert saved[2].getInt(1) == 3
+      await conn.close()
+
+    waitFor t()
+
   test "10000 rows":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
