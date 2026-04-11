@@ -167,7 +167,6 @@ type
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
     stmtCounter*: int
     stmtCacheCapacity*: int ## 0=disabled, default 256
-    rowDataBuf*: RowData ## Reusable RowData buffer to avoid per-query allocation
     hstoreOid*: int32 ## Dynamic OID for hstore extension type; 0 if not available
     tracer*: PgTracer ## Inherited from ConnConfig on connect
 
@@ -1542,7 +1541,6 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   conn.recvBuf.setLen(0)
   conn.recvBufStart = 0
   conn.clearStmtCache()
-  conn.rowDataBuf = nil
   conn.state = csConnecting
   var newConn: PgConnection
   try:
