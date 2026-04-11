@@ -4749,6 +4749,21 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "query Row survives subsequent queries (lifetime bug)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr1 = await conn.query("SELECT 'x'")
+      let qr2 = await conn.query("SELECT 'y'")
+      doAssert qr1.rowCount == 1
+      doAssert qr2.rowCount == 1
+      let row1 = Row(data: qr1.data, rowIdx: 0)
+      let row2 = Row(data: qr2.data, rowIdx: 0)
+      doAssert row1.getStr(0) == "x", "qr1 data was invalidated by qr2"
+      doAssert row2.getStr(0) == "y"
+      await conn.close()
+
+    waitFor t()
+
   test "pool queryOne":
     proc t() {.async.} =
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))

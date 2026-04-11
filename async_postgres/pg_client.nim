@@ -381,6 +381,7 @@ template queryRecvLoop(
     cachedColOids: seq[int32],
     qr: var QueryResult,
     timeout: Duration = ZeroDuration,
+    reuseBuffer: bool = true,
 ) =
   var queryError: ref PgQueryError
 
@@ -390,14 +391,19 @@ template queryRecvLoop(
       for i in 0 ..< qr.fields.len:
         qr.fields[i].formatCode = cachedColFmts[i]
     if qr.fields.len > 0:
-      if conn.rowDataBuf != nil:
-        conn.rowDataBuf = conn.rowDataBuf.reuseRowData(
-          int16(qr.fields.len), cachedColFmts, cachedColOids
-        )
+      if reuseBuffer:
+        if conn.rowDataBuf != nil:
+          conn.rowDataBuf = conn.rowDataBuf.reuseRowData(
+            int16(qr.fields.len), cachedColFmts, cachedColOids
+          )
+        else:
+          conn.rowDataBuf =
+            newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+        conn.rowDataBuf.fields = qr.fields
+        qr.data = conn.rowDataBuf
       else:
-        conn.rowDataBuf = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
-      conn.rowDataBuf.fields = qr.fields
-      qr.data = conn.rowDataBuf
+        qr.data = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+        qr.data.fields = qr.fields
 
   block recvLoop:
     while true:
@@ -427,12 +433,17 @@ template queryRecvLoop(
                   cf[i] = resultFormats[i]
           else:
             qr.fields = msg.fields
-          if conn.rowDataBuf != nil:
-            conn.rowDataBuf = conn.rowDataBuf.reuseRowData(int16(qr.fields.len), cf, co)
+          if reuseBuffer:
+            if conn.rowDataBuf != nil:
+              conn.rowDataBuf =
+                conn.rowDataBuf.reuseRowData(int16(qr.fields.len), cf, co)
+            else:
+              conn.rowDataBuf = newRowData(int16(qr.fields.len), cf, co)
+            conn.rowDataBuf.fields = qr.fields
+            qr.data = conn.rowDataBuf
           else:
-            conn.rowDataBuf = newRowData(int16(qr.fields.len), cf, co)
-          conn.rowDataBuf.fields = qr.fields
-          qr.data = conn.rowDataBuf
+            qr.data = newRowData(int16(qr.fields.len), cf, co)
+            qr.data.fields = qr.fields
         of bmkNoData:
           discard
         of bmkCommandComplete:
@@ -519,8 +530,18 @@ proc queryImpl(
 
   var qr = QueryResult()
   queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr, timeout,
+    conn,
+    sql,
+    effectiveResultFormats,
+    cacheHit,
+    cacheMiss,
+    stmtName,
+    cachedFields,
+    cachedColFmts,
+    cachedColOids,
+    qr,
+    timeout,
+    reuseBuffer = false,
   )
   return qr
 
@@ -580,8 +601,18 @@ proc queryImpl(
 
   var qr = QueryResult()
   queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr, timeout,
+    conn,
+    sql,
+    effectiveResultFormats,
+    cacheHit,
+    cacheMiss,
+    stmtName,
+    cachedFields,
+    cachedColFmts,
+    cachedColOids,
+    qr,
+    timeout,
+    reuseBuffer = false,
   )
   return qr
 
@@ -1116,13 +1147,8 @@ proc executeImpl(
     for i in 0 ..< qr.fields.len:
       colFmts[i] = qr.fields[i].formatCode
       colOids[i] = qr.fields[i].typeOid
-    if conn.rowDataBuf != nil:
-      conn.rowDataBuf =
-        conn.rowDataBuf.reuseRowData(int16(qr.fields.len), colFmts, colOids)
-    else:
-      conn.rowDataBuf = newRowData(int16(qr.fields.len), colFmts, colOids)
-    conn.rowDataBuf.fields = qr.fields
-    qr.data = conn.rowDataBuf
+    qr.data = newRowData(int16(qr.fields.len), colFmts, colOids)
+    qr.data.fields = qr.fields
   var queryError: ref PgQueryError
 
   block recvLoop:
