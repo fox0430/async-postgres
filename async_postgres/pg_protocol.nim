@@ -818,6 +818,47 @@ proc reuseRowData*(rd: RowData, numCols: int16): RowData =
   result.colFormats.setLen(0)
   result.colTypeOids.setLen(0)
 
+proc clone*(row: Row): Row =
+  ## Return a deep copy of `row` with an independent `RowData` backing buffer
+  ## containing only this single row. Use this to retain rows from a
+  ## `queryEach` callback beyond the callback's lifetime — the original
+  ## buffer is reused for subsequent rows and would otherwise be overwritten.
+  if row.data == nil:
+    return Row(data: nil, rowIdx: 0)
+  let src = row.data
+  let numCols = src.numCols
+  let cellBase = int(row.rowIdx) * int(numCols) * 2
+  var total = 0
+  for i in 0 ..< int(numCols):
+    let clen = src.cellIndex[cellBase + i * 2 + 1]
+    if clen > 0:
+      total += int(clen)
+  let rd = RowData(
+    numCols: numCols,
+    colFormats: src.colFormats,
+    colTypeOids: src.colTypeOids,
+    fields: src.fields,
+    colMap: src.colMap,
+    cellIndex: newSeq[int32](int(numCols) * 2),
+    buf: newSeq[byte](total),
+  )
+  var pos = 0
+  for i in 0 ..< int(numCols):
+    let srcOff = int(src.cellIndex[cellBase + i * 2])
+    let clen = src.cellIndex[cellBase + i * 2 + 1]
+    if clen == -1:
+      rd.cellIndex[i * 2] = 0'i32
+      rd.cellIndex[i * 2 + 1] = -1'i32
+    elif clen == 0:
+      rd.cellIndex[i * 2] = 0'i32
+      rd.cellIndex[i * 2 + 1] = 0'i32
+    else:
+      copyMem(addr rd.buf[pos], unsafeAddr src.buf[srcOff], int(clen))
+      rd.cellIndex[i * 2] = int32(pos)
+      rd.cellIndex[i * 2 + 1] = clen
+      pos += int(clen)
+  Row(data: rd, rowIdx: 0)
+
 proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
   ## Build per-column binary format codes: 1 for known safe types, 0 for others.
   result = newSeq[int16](fields.len)

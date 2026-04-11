@@ -757,6 +757,12 @@ proc queryEach*(
 ): Future[int64] {.async.} =
   ## Execute a query with typed parameters, invoking `callback` once per row.
   ## Returns the number of rows processed.
+  ##
+  ## The `Row` passed to `callback` is only valid for the duration of that
+  ## single invocation: its backing buffer is reused for the next row as soon
+  ## as the callback returns. To retain a row beyond the callback, call
+  ## `row.clone()` to get a detached copy, or extract the column values you
+  ## need into your own types before returning.
   var count: int64
   withConnTracing(
     conn,

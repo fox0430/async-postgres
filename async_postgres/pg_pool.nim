@@ -662,6 +662,10 @@ proc queryEach*(
     timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
   ## Execute a query with typed parameters using a pooled connection, invoking `callback` once per row.
+  ##
+  ## Row lifetime: the `Row` passed to `callback` is only valid for the
+  ## duration of that single invocation. To retain a row beyond the callback,
+  ## call `row.clone()` to get a detached copy.
   let conn = await pool.acquire()
   try:
     return await conn.queryEach(sql, params, callback, resultFormat, timeout)
