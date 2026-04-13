@@ -3606,7 +3606,9 @@ proc parseRangeElem(
       i += 1
     (elem, i)
 
-proc parseRangeText*[T](s: string, parseElem: proc(s: string): T): PgRange[T] =
+proc parseRangeText*[T](
+    s: string, parseElem: proc(s: string): T {.gcsafe, raises: [CatchableError].}
+): PgRange[T] =
   if s == "empty":
     return PgRange[T](isEmpty: true)
   if s.len < 3:
@@ -3884,7 +3886,7 @@ proc getInt4Range*(row: Row, col: int): PgRange[int32] =
   let s = row.getStr(col)
   parseRangeText[int32](
     s,
-    proc(e: string): int32 =
+    proc(e: string): int32 {.gcsafe, raises: [CatchableError].} =
       int32(parseInt(e)),
   )
 
@@ -3898,7 +3900,7 @@ proc getInt8Range*(row: Row, col: int): PgRange[int64] =
   let s = row.getStr(col)
   parseRangeText[int64](
     s,
-    proc(e: string): int64 =
+    proc(e: string): int64 {.gcsafe, raises: [CatchableError].} =
       parseBiggestInt(e),
   )
 
@@ -3912,7 +3914,7 @@ proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
   let s = row.getStr(col)
   parseRangeText[PgNumeric](
     s,
-    proc(e: string): PgNumeric =
+    proc(e: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
       parsePgNumeric(e),
   )
 
@@ -3926,7 +3928,7 @@ proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
   let s = row.getStr(col)
   parseRangeText[DateTime](
     s,
-    proc(e: string): DateTime =
+    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
       const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
       for fmt in formats:
         try:
@@ -3946,7 +3948,7 @@ proc getTsTzRange*(row: Row, col: int): PgRange[DateTime] =
   let s = row.getStr(col)
   parseRangeText[DateTime](
     s,
-    proc(e: string): DateTime =
+    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
       const formats = [
         "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
         "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
@@ -3970,7 +3972,7 @@ proc getDateRange*(row: Row, col: int): PgRange[DateTime] =
   let s = row.getStr(col)
   parseRangeText[DateTime](
     s,
-    proc(e: string): DateTime =
+    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
       try:
         return parse(e, "yyyy-MM-dd")
       except TimeParseError:
@@ -4031,7 +4033,7 @@ proc `$`*[T](mr: PgMultirange[T]): string =
   result.add('}')
 
 proc parseMultirangeText*[T](
-    s: string, parseElem: proc(s: string): T
+    s: string, parseElem: proc(s: string): T {.gcsafe, raises: [CatchableError].}
 ): PgMultirange[T] =
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
     raise newException(PgTypeError, "Invalid multirange literal: " & s)
@@ -4179,7 +4181,7 @@ proc getInt4Multirange*(row: Row, col: int): PgMultirange[int32] =
   let s = row.getStr(col)
   parseMultirangeText[int32](
     s,
-    proc(e: string): int32 =
+    proc(e: string): int32 {.gcsafe, raises: [CatchableError].} =
       int32(parseInt(e)),
   )
 
@@ -4199,7 +4201,7 @@ proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
   let s = row.getStr(col)
   parseMultirangeText[int64](
     s,
-    proc(e: string): int64 =
+    proc(e: string): int64 {.gcsafe, raises: [CatchableError].} =
       parseBiggestInt(e),
   )
 
@@ -4219,7 +4221,7 @@ proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
   let s = row.getStr(col)
   parseMultirangeText[PgNumeric](
     s,
-    proc(e: string): PgNumeric =
+    proc(e: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
       parsePgNumeric(e),
   )
 
@@ -4239,7 +4241,7 @@ proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   let s = row.getStr(col)
   parseMultirangeText[DateTime](
     s,
-    proc(e: string): DateTime =
+    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
       const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
       for fmt in formats:
         try:
@@ -4265,7 +4267,7 @@ proc getTsTzMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   let s = row.getStr(col)
   parseMultirangeText[DateTime](
     s,
-    proc(e: string): DateTime =
+    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
       const formats = [
         "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
         "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
@@ -4295,7 +4297,7 @@ proc getDateMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   let s = row.getStr(col)
   parseMultirangeText[DateTime](
     s,
-    proc(e: string): DateTime =
+    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
       try:
         return parse(e, "yyyy-MM-dd")
       except TimeParseError:
@@ -4340,7 +4342,7 @@ proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
     result.add(
       parseRangeText[int32](
         e.get,
-        proc(x: string): int32 =
+        proc(x: string): int32 {.gcsafe, raises: [CatchableError].} =
           int32(parseInt(x)),
       )
     )
@@ -4368,7 +4370,7 @@ proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
     result.add(
       parseRangeText[int64](
         e.get,
-        proc(x: string): int64 =
+        proc(x: string): int64 {.gcsafe, raises: [CatchableError].} =
           parseBiggestInt(x),
       )
     )
@@ -4396,7 +4398,7 @@ proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
     result.add(
       parseRangeText[PgNumeric](
         e.get,
-        proc(x: string): PgNumeric =
+        proc(x: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
           parsePgNumeric(x),
       )
     )
@@ -4424,7 +4426,7 @@ proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     result.add(
       parseRangeText[DateTime](
         e.get,
-        proc(x: string): DateTime =
+        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
           const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
           for fmt in formats:
             try:
@@ -4458,7 +4460,7 @@ proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     result.add(
       parseRangeText[DateTime](
         e.get,
-        proc(x: string): DateTime =
+        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
           const formats = [
             "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
             "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
@@ -4496,7 +4498,7 @@ proc getDateRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     result.add(
       parseRangeText[DateTime](
         e.get,
-        proc(x: string): DateTime =
+        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
           try:
             return parse(x, "yyyy-MM-dd")
           except TimeParseError:
