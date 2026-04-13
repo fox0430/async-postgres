@@ -651,9 +651,9 @@ proc nextMessage*(
       conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
     )
     if res.state == psIncomplete:
-      conn.recvBufStart = pos
       return none(BackendMessage)
     pos += consumed
+    conn.recvBufStart = pos
     if res.state == psDataRow:
       # DataRow already parsed in-place into rowData; just count it
       if rowCount != nil:
@@ -668,7 +668,6 @@ proc nextMessage*(
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
-    conn.recvBufStart = pos
     return some(res.message)
 
 proc recvMessage*(
