@@ -1282,6 +1282,8 @@ proc decodeNumericBinary(data: openArray[byte]): PgNumeric =
   if data.len < 8:
     raise newException(PgTypeError, "Numeric binary data too short: " & $data.len)
   let ndigits = int(fromBE16(data.toOpenArray(0, 1)))
+  if ndigits < 0:
+    raise newException(PgTypeError, "Numeric binary: invalid ndigits " & $ndigits)
   let weight = int16(fromBE16(data.toOpenArray(2, 3)))
   let signRaw = uint16(fromBE16(data.toOpenArray(4, 5)))
   let dscale = int16(fromBE16(data.toOpenArray(6, 7)))
@@ -1297,6 +1299,10 @@ proc decodeNumericBinary(data: openArray[byte]): PgNumeric =
       raise newException(PgTypeError, "Invalid numeric sign: " & $signRaw)
   if sign == pgNaN:
     return PgNumeric(sign: pgNaN)
+  if 8 + ndigits * 2 > data.len:
+    raise newException(
+      PgTypeError, "Numeric binary: data truncated for " & $ndigits & " digits"
+    )
   var digits = newSeq[int16](ndigits)
   for i in 0 ..< ndigits:
     digits[i] = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
@@ -1375,6 +1381,8 @@ proc decodeBinaryArray*(
   if data.len < 20:
     raise newException(PgTypeError, "Binary array header too short")
   let dimLen = int(fromBE32(data.toOpenArray(12, 15)))
+  if dimLen < 0:
+    raise newException(PgTypeError, "Binary array: invalid dimension length " & $dimLen)
   # lower_bound at offset 16, ignored
   result.elements = newSeq[tuple[off: int, len: int]](dimLen)
   var pos = 20
@@ -1383,9 +1391,13 @@ proc decodeBinaryArray*(
       raise newException(PgTypeError, "Binary array truncated at element " & $i)
     let eLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
     pos += 4
-    if eLen == -1:
+    if eLen < -1:
+      raise newException(PgTypeError, "Binary array: invalid element length " & $eLen)
+    elif eLen == -1:
       result.elements[i] = (off: 0, len: -1)
     else:
+      if pos + eLen > data.len:
+        raise newException(PgTypeError, "Binary array: element data truncated at " & $i)
       result.elements[i] = (off: pos, len: eLen)
       pos += eLen
 
@@ -1406,6 +1418,9 @@ proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
       raise newException(PgTypeError, "Binary range truncated at lower bound length")
     let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
     pos += 4
+    if bLen < 0 or pos + bLen > data.len:
+      raise
+        newException(PgTypeError, "Binary range: invalid lower bound length " & $bLen)
     result.lowerOff = pos
     result.lowerLen = bLen
     pos += bLen
@@ -1414,6 +1429,9 @@ proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
       raise newException(PgTypeError, "Binary range truncated at upper bound length")
     let bLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
     pos += 4
+    if bLen < 0 or pos + bLen > data.len:
+      raise
+        newException(PgTypeError, "Binary range: invalid upper bound length " & $bLen)
     result.upperOff = pos
     result.upperLen = bLen
 
@@ -1510,6 +1528,8 @@ proc decodeMultirangeBinaryRaw(data: openArray[byte]): seq[tuple[off: int, len: 
   if data.len < 4:
     raise newException(PgTypeError, "Binary multirange too short")
   let count = int(fromBE32(data.toOpenArray(0, 3)))
+  if count < 0:
+    raise newException(PgTypeError, "Binary multirange: invalid count " & $count)
   result = newSeq[tuple[off: int, len: int]](count)
   var pos = 4
   for i in 0 ..< count:
@@ -1517,6 +1537,9 @@ proc decodeMultirangeBinaryRaw(data: openArray[byte]): seq[tuple[off: int, len: 
       raise newException(PgTypeError, "Binary multirange truncated at range " & $i)
     let rLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
     pos += 4
+    if rLen < 0 or pos + rLen > data.len:
+      raise
+        newException(PgTypeError, "Binary multirange: invalid range length " & $rLen)
     result[i] = (off: pos, len: rLen)
     pos += rLen
 
@@ -1529,6 +1552,9 @@ proc decodeBinaryComposite*(
   if data.len < 4:
     raise newException(PgTypeError, "Binary composite too short")
   let numFields = int(fromBE32(data.toOpenArray(0, 3)))
+  if numFields < 0:
+    raise
+      newException(PgTypeError, "Binary composite: invalid field count " & $numFields)
   result = newSeq[tuple[oid: int32, off: int, len: int]](numFields)
   var pos = 4
   for i in 0 ..< numFields:
@@ -1538,10 +1564,15 @@ proc decodeBinaryComposite*(
     pos += 4
     let flen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
     pos += 4
-    if flen == -1:
+    if flen < -1:
+      raise newException(PgTypeError, "Binary composite: invalid field length " & $flen)
+    elif flen == -1:
       result[i].off = 0
       result[i].len = -1
     else:
+      if pos + flen > data.len:
+        raise
+          newException(PgTypeError, "Binary composite: field data truncated at " & $i)
       result[i].off = pos
       result[i].len = flen
       pos += flen
@@ -2163,6 +2194,9 @@ proc decodeBinaryTsVector(data: openArray[byte]): string =
   if data.len < 4:
     raise newException(PgTypeError, "tsvector binary data too short")
   let nlexemes = int(fromBE32(data.toOpenArray(0, 3)))
+  if nlexemes < 0:
+    raise
+      newException(PgTypeError, "tsvector binary: invalid lexeme count " & $nlexemes)
   var pos = 4
   var parts = newSeq[string](nlexemes)
   const weightChars = ['D', 'C', 'B', 'A']
@@ -2181,6 +2215,9 @@ proc decodeBinaryTsVector(data: openArray[byte]): string =
     if pos + 1 >= data.len:
       raise newException(PgTypeError, "tsvector binary truncated at position count")
     let npos = int(fromBE16(data.toOpenArray(pos, pos + 1)))
+    if npos < 0:
+      raise
+        newException(PgTypeError, "tsvector binary: invalid position count " & $npos)
     pos += 2
     var part = "'" & lexeme & "'"
     if npos > 0:
@@ -2276,6 +2313,8 @@ proc decodeBinaryTsQuery(data: openArray[byte]): string =
   if data.len < 4:
     raise newException(PgTypeError, "tsquery binary data too short")
   let ntokens = int(fromBE32(data.toOpenArray(0, 3)))
+  if ntokens < 0:
+    raise newException(PgTypeError, "tsquery binary: invalid token count " & $ntokens)
   if ntokens == 0:
     return ""
   var pos = 4
