@@ -329,17 +329,18 @@ proc decodeInt64*(buf: openArray[byte], offset: int): int64 =
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at the given offset. Returns (string, bytes consumed).
-  if offset > buf.len:
+  if offset >= buf.len:
     raise newException(ProtocolError, "decodeCString: offset past end of buffer")
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
+  if i >= buf.len:
+    raise newException(ProtocolError, "decodeCString: missing null terminator")
   let slen = i - offset
   var s = newString(slen)
   if slen > 0:
     copyMem(addr s[0], unsafeAddr buf[offset], slen)
-  if i < buf.len:
-    inc i # skip null terminator
+  inc i # skip null terminator
   result = (s, i - offset)
 
 # Frontend message encoding

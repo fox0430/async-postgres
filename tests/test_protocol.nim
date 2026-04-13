@@ -48,9 +48,8 @@ suite "Byte helpers":
 
   test "decodeCString at end of buffer":
     let buf = @[byte('a'), 0'u8]
-    let (s, consumed) = decodeCString(buf, 2)
-    check s == ""
-    check consumed == 0
+    expect(ProtocolError):
+      discard decodeCString(buf, 2)
 
   test "decodeCString offset past end of buffer":
     let buf = @[byte('a'), 0'u8]
@@ -61,6 +60,11 @@ suite "Byte helpers":
     let buf: seq[byte] = @[]
     expect(ProtocolError):
       discard decodeCString(buf, 1)
+
+  test "decodeCString missing null terminator":
+    let buf = @[byte('h'), byte('i')]
+    expect(ProtocolError):
+      discard decodeCString(buf, 0)
 
 suite "Frontend encoding":
   test "encodeStartup - no type byte, version 3.0":
