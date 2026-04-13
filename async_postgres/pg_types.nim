@@ -1620,6 +1620,10 @@ proc contains*(cr: CommandResult, s: string): bool {.inline.} =
 
 proc isNull*(row: Row, col: int): bool =
   ## Check if the column value is NULL.
+  if col < 0 or col >= int(row.data.numCols):
+    raise newException(
+      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+    )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   row.data.cellIndex[idx + 1] == -1'i32
 
