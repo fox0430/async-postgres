@@ -4583,3 +4583,222 @@ suite "PgBit":
     let fields = @[mkField(OidVarbitArray, 0'i16)]
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getBitArrayOpt(0).isNone
+
+suite "Binary decoder validation":
+  test "decodeNumericBinary rejects negative ndigits":
+    # ndigits = -1 (0xFFFF as int16)
+    var data: seq[byte] = @[
+      0xFF'u8,
+      0xFF, # ndigits = -1
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeNumericBinary rejects truncated digit data":
+    # ndigits = 2 but only 1 digit of data provided
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x02, # ndigits = 2
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+      0x00,
+      0x01, # only 1 digit (need 2)
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeBinaryArray rejects negative dimension length":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # ndim = 1
+      0x00,
+      0x00,
+      0x00,
+      0x00, # has_null
+      0x00,
+      0x00,
+      0x00,
+      0x17, # elemOid
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFF, # dimLen = -1
+      0x00,
+      0x00,
+      0x00,
+      0x01, # lower_bound
+    ]
+    expect PgTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray rejects invalid element length":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # ndim = 1
+      0x00,
+      0x00,
+      0x00,
+      0x00, # has_null
+      0x00,
+      0x00,
+      0x00,
+      0x17, # elemOid
+      0x00,
+      0x00,
+      0x00,
+      0x01, # dimLen = 1
+      0x00,
+      0x00,
+      0x00,
+      0x01, # lower_bound
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFE, # eLen = -2 (invalid)
+    ]
+    expect PgTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray rejects truncated element data":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # ndim = 1
+      0x00,
+      0x00,
+      0x00,
+      0x00, # has_null
+      0x00,
+      0x00,
+      0x00,
+      0x17, # elemOid
+      0x00,
+      0x00,
+      0x00,
+      0x01, # dimLen = 1
+      0x00,
+      0x00,
+      0x00,
+      0x01, # lower_bound
+      0x00,
+      0x00,
+      0x00,
+      0x08, # eLen = 8 but no data follows
+    ]
+    expect PgTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeRangeBinaryRaw rejects negative bound length":
+    var data: seq[byte] = @[
+      0x02'u8, # flags: hasLower
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFF, # bLen = -1
+    ]
+    expect PgTypeError:
+      discard decodeRangeBinaryRaw(data)
+
+  test "decodeRangeBinaryRaw rejects truncated bound data":
+    var data: seq[byte] = @[
+      0x02'u8, # flags: hasLower
+      0x00,
+      0x00,
+      0x00,
+      0x10, # bLen = 16 but no data
+    ]
+    expect PgTypeError:
+      discard decodeRangeBinaryRaw(data)
+
+  test "decodeMultirangeBinaryRaw rejects negative count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # count = -1
+    ]
+    expect PgTypeError:
+      discard decodeMultirangeBinaryRaw(data)
+
+  test "decodeMultirangeBinaryRaw rejects truncated range data":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # count = 1
+      0x00,
+      0x00,
+      0x00,
+      0x20, # rLen = 32 but no data
+    ]
+    expect PgTypeError:
+      discard decodeMultirangeBinaryRaw(data)
+
+  test "decodeBinaryComposite rejects negative field count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # numFields = -1
+    ]
+    expect PgTypeError:
+      discard decodeBinaryComposite(data)
+
+  test "decodeBinaryComposite rejects invalid field length":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # numFields = 1
+      0x00,
+      0x00,
+      0x00,
+      0x17, # oid
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFE, # flen = -2 (invalid)
+    ]
+    expect PgTypeError:
+      discard decodeBinaryComposite(data)
+
+  test "decodeBinaryComposite rejects truncated field data":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # numFields = 1
+      0x00,
+      0x00,
+      0x00,
+      0x17, # oid
+      0x00,
+      0x00,
+      0x00,
+      0x10, # flen = 16 but no data
+    ]
+    expect PgTypeError:
+      discard decodeBinaryComposite(data)
+
+  test "decodeBinaryTsVector rejects negative lexeme count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # nlexemes = -1
+    ]
+    expect PgTypeError:
+      discard decodeBinaryTsVector(data)
+
+  test "decodeBinaryTsQuery rejects negative token count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # ntokens = -1
+    ]
+    expect PgTypeError:
+      discard decodeBinaryTsQuery(data)
