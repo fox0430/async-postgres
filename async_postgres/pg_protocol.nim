@@ -954,9 +954,9 @@ proc parseBackendMessage*(
 
   # Body is the region after type byte and 4-byte length
   let bodyStart = 5
-  let bodyEnd = bodyStart + int(msgLen) - 4 - 1
+  let bodyLen = int(msgLen) - 4 # msgLen includes the 4-byte length field itself
   template body(): untyped =
-    buf.toOpenArray(bodyStart, bodyEnd)
+    buf.toOpenArray(bodyStart, bodyStart + bodyLen - 1)
 
   var msg: BackendMessage
 
