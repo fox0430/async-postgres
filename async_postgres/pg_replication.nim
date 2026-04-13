@@ -230,15 +230,18 @@ proc currentPgTimestamp*(): int64 =
 
 proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at offset. Returns (string, next offset).
+  if offset >= buf.len:
+    raise newException(ProtocolError, "decodeCStringAt: offset past end of buffer")
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
+  if i >= buf.len:
+    raise newException(ProtocolError, "decodeCStringAt: missing null terminator")
   let slen = i - offset
   var s = newString(slen)
   if slen > 0:
     copyMem(addr s[0], unsafeAddr buf[offset], slen)
-  if i < buf.len:
-    inc i # skip null
+  inc i # skip null
   (s, i)
 
 proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
