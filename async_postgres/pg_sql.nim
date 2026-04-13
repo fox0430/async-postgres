@@ -307,6 +307,13 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
+  proc queryRow*(
+    conn: PgConnection,
+    sq: SqlQuery,
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): untyped
+
   proc queryEach*(
     conn: PgConnection,
     sq: SqlQuery,
@@ -403,6 +410,13 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
+  proc queryRow*(
+    pool: PgPool,
+    sq: SqlQuery,
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): untyped
+
   proc queryEach*(
     pool: PgPool,
     sq: SqlQuery,
@@ -469,6 +483,13 @@ sqlQueryForwards:
   ): untyped
 
   proc readQueryOne*(
+    cluster: PgPoolCluster,
+    sq: SqlQuery,
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): untyped
+
+  proc readQueryRow*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
@@ -543,6 +564,13 @@ sqlQueryForwards:
   ): untyped
 
   proc writeQueryOne*(
+    cluster: PgPoolCluster,
+    sq: SqlQuery,
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): untyped
+
+  proc writeQueryRow*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
