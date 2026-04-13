@@ -1,4 +1,5 @@
-import std/[unittest, options, strutils, tables, os, math, deques, sets, importutils]
+import
+  std/[unittest, options, strutils, tables, os, math, deques, sets, importutils, net]
 from std/times import
   DateTime, dateTime, mMar, mJun, mJan, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
@@ -6925,5 +6926,742 @@ suite "E2E: Logical Replication":
 
       discard await writer.simpleQuery("DROP PUBLICATION test_state_pub")
       await writer.close()
+
+    waitFor t()
+
+# User-defined type definitions for e2e tests (macros must be at top level)
+type
+  TestPoint = object
+    x: float64
+    y: float64
+
+  TestPerson = object
+    name: string
+    age: int32
+    score: float64
+
+  TestNullable = object
+    name: string
+    age: Option[int32]
+    note: Option[string]
+
+pgComposite(TestPoint)
+pgComposite(TestPerson)
+pgComposite(TestNullable)
+
+type TestMood = enum
+  tmHappy = "happy"
+  tmSad = "sad"
+  tmOk = "ok"
+
+pgEnum(TestMood)
+
+type TestPosInt = distinct int32
+
+pgDomain(TestPosInt, int32)
+
+suite "E2E: User-Defined Types":
+  test "composite roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_point CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TYPE test_e2e_point AS (x float8, y float8)")
+
+      let res = await conn.query("SELECT ROW(1.5, 2.5)::test_e2e_point")
+      doAssert res.rows.len == 1
+      let got = getComposite[TestPoint](res.rows[0], 0)
+      doAssert got.x == 1.5
+      doAssert got.y == 2.5
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_point")
+      await conn.close()
+
+    waitFor t()
+
+  test "composite with strings":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_person CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_person AS (name text, age int4, score float8)"
+      )
+
+      let res = await conn.query("SELECT ROW('Alice', 30, 95.5)::test_e2e_person")
+      doAssert res.rows.len == 1
+      let got = getComposite[TestPerson](res.rows[0], 0)
+      doAssert got.name == "Alice"
+      doAssert got.age == 30'i32
+      doAssert got.score == 95.5
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_person")
+      await conn.close()
+
+    waitFor t()
+
+  test "composite NULL fields":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_nullable CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_nullable AS (name text, age int4, note text)"
+      )
+
+      let res = await conn.query("SELECT ROW('Bob', NULL, NULL)::test_e2e_nullable")
+      doAssert res.rows.len == 1
+      let got = getComposite[TestNullable](res.rows[0], 0)
+      doAssert got.name == "Bob"
+      doAssert got.age.isNone
+      doAssert got.note.isNone
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_nullable")
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL composite":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_point2 CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TYPE test_e2e_point2 AS (x float8, y float8)")
+
+      let res = await conn.query("SELECT NULL::test_e2e_point2")
+      doAssert res.rows.len == 1
+      let got = getCompositeOpt[TestPoint](res.rows[0], 0)
+      doAssert got.isNone
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_point2")
+      await conn.close()
+
+    waitFor t()
+
+  test "composite param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_point3 CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TYPE test_e2e_point3 AS (x float8, y float8)")
+
+      let v = TestPoint(x: 3.14, y: 2.72)
+      let res = await conn.query("SELECT $1::test_e2e_point3", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = getComposite[TestPoint](res.rows[0], 0)
+      doAssert got.x == 3.14
+      doAssert got.y == 2.72
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_point3")
+      await conn.close()
+
+    waitFor t()
+
+  test "enum roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood AS ENUM ('happy', 'sad', 'ok')"
+      )
+
+      let res = await conn.query("SELECT 'happy'::test_e2e_mood")
+      doAssert res.rows.len == 1
+      let got = getEnum[TestMood](res.rows[0], 0)
+      doAssert got == tmHappy
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood")
+      await conn.close()
+
+    waitFor t()
+
+  test "enum param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood2 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood2 AS ENUM ('happy', 'sad', 'ok')"
+      )
+
+      let res = await conn.query("SELECT $1::test_e2e_mood2", @[toPgParam(tmSad)])
+      doAssert res.rows.len == 1
+      let got = getEnum[TestMood](res.rows[0], 0)
+      doAssert got == tmSad
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood2")
+      await conn.close()
+
+    waitFor t()
+
+  test "enum in table":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TABLE IF EXISTS test_e2e_mood_tbl CASCADE")
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood3 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood3 AS ENUM ('happy', 'sad', 'ok')"
+      )
+      discard await conn.simpleQuery(
+        "CREATE TABLE test_e2e_mood_tbl (id serial, mood test_e2e_mood3)"
+      )
+      discard
+        await conn.simpleQuery("INSERT INTO test_e2e_mood_tbl (mood) VALUES ('ok')")
+
+      let res = await conn.query("SELECT mood FROM test_e2e_mood_tbl WHERE id = 1")
+      doAssert res.rows.len == 1
+      let got = getEnum[TestMood](res.rows[0], 0)
+      doAssert got == tmOk
+
+      discard await conn.simpleQuery("DROP TABLE test_e2e_mood_tbl")
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood3")
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL enum":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood4 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood4 AS ENUM ('happy', 'sad', 'ok')"
+      )
+
+      let res = await conn.query("SELECT NULL::test_e2e_mood4")
+      doAssert res.rows.len == 1
+      let got = getEnumOpt[TestMood](res.rows[0], 0)
+      doAssert got.isNone
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood4")
+      await conn.close()
+
+    waitFor t()
+
+  test "domain roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP DOMAIN IF EXISTS test_e2e_posint CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE DOMAIN test_e2e_posint AS int4 CHECK (VALUE > 0)"
+      )
+
+      let res =
+        await conn.query("SELECT $1::test_e2e_posint", @[toPgParam(TestPosInt(42))])
+      doAssert res.rows.len == 1
+      let got = getDomain[TestPosInt](res.rows[0], 0)
+      doAssert int32(got) == 42'i32
+
+      discard await conn.simpleQuery("DROP DOMAIN test_e2e_posint")
+      await conn.close()
+
+    waitFor t()
+
+  test "domain constraint violation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP DOMAIN IF EXISTS test_e2e_posint2 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE DOMAIN test_e2e_posint2 AS int4 CHECK (VALUE > 0)"
+      )
+
+      var raised = false
+      try:
+        discard
+          await conn.query("SELECT $1::test_e2e_posint2", @[toPgParam(TestPosInt(-1))])
+      except PgError:
+        raised = true
+      doAssert raised
+
+      discard await conn.simpleQuery("DROP DOMAIN test_e2e_posint2")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Network Types":
+  test "inet roundtrip IPv4":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgInet(address: parseIpAddress("192.168.1.5"), mask: 24)
+      let res = await conn.query("SELECT $1::inet", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("192.168.1.5")
+      doAssert got.mask == 24
+      await conn.close()
+
+    waitFor t()
+
+  test "inet roundtrip IPv6":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgInet(address: parseIpAddress("::1"), mask: 128)
+      let res = await conn.query("SELECT $1::inet", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("::1")
+      doAssert got.mask == 128
+      await conn.close()
+
+    waitFor t()
+
+  test "inet host address without mask":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgInet(address: parseIpAddress("10.0.0.1"), mask: 32)
+      let res = await conn.query("SELECT $1::inet", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("10.0.0.1")
+      doAssert got.mask == 32
+      await conn.close()
+
+    waitFor t()
+
+  test "cidr roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+      let res = await conn.query("SELECT $1::cidr", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getCidr(0)
+      doAssert got.address == parseIpAddress("10.0.0.0")
+      doAssert got.mask == 8
+      await conn.close()
+
+    waitFor t()
+
+  test "macaddr roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgMacAddr("08:00:2b:01:02:03")
+      let res = await conn.query("SELECT $1::macaddr", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getMacAddr(0)
+      doAssert $got == "08:00:2b:01:02:03"
+      await conn.close()
+
+    waitFor t()
+
+  test "macaddr8 roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgMacAddr8("08:00:2b:01:02:03:04:05")
+      let res = await conn.query("SELECT $1::macaddr8", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getMacAddr8(0)
+      doAssert $got == "08:00:2b:01:02:03:04:05"
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL network types":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT NULL::inet, NULL::cidr, NULL::macaddr, NULL::macaddr8")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInetOpt(0).isNone
+      doAssert res.rows[0].getCidrOpt(1).isNone
+      doAssert res.rows[0].getMacAddrOpt(2).isNone
+      doAssert res.rows[0].getMacAddr8Opt(3).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "inet in table":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TABLE IF EXISTS test_e2e_inet_tbl CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TABLE test_e2e_inet_tbl (id serial, addr inet)")
+
+      let v = PgInet(address: parseIpAddress("192.168.0.1"), mask: 24)
+      discard await conn.exec(
+        "INSERT INTO test_e2e_inet_tbl (addr) VALUES ($1)", @[toPgParam(v)]
+      )
+      let res = await conn.query("SELECT addr FROM test_e2e_inet_tbl WHERE id = 1")
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("192.168.0.1")
+      doAssert got.mask == 24
+
+      discard await conn.simpleQuery("DROP TABLE test_e2e_inet_tbl")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Geometric Types":
+  test "point roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPoint(x: 1.5, y: 2.5)
+      let res = await conn.query("SELECT $1::point", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPoint(0)
+      doAssert got.x == 1.5
+      doAssert got.y == 2.5
+      await conn.close()
+
+    waitFor t()
+
+  test "line roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgLine(a: 1.0, b: -1.0, c: 0.0)
+      let res = await conn.query("SELECT $1::line", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getLine(0)
+      doAssert got.a == 1.0
+      doAssert got.b == -1.0
+      doAssert got.c == 0.0
+      await conn.close()
+
+    waitFor t()
+
+  test "lseg roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 3.0, y: 4.0))
+      let res = await conn.query("SELECT $1::lseg", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getLseg(0)
+      doAssert got.p1.x == 0.0
+      doAssert got.p1.y == 0.0
+      doAssert got.p2.x == 3.0
+      doAssert got.p2.y == 4.0
+      await conn.close()
+
+    waitFor t()
+
+  test "box roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+      let res = await conn.query("SELECT $1::box", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getBox(0)
+      doAssert got.high.x == 3.0
+      doAssert got.high.y == 4.0
+      doAssert got.low.x == 1.0
+      doAssert got.low.y == 2.0
+      await conn.close()
+
+    waitFor t()
+
+  test "path roundtrip closed":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPath(
+        closed: true,
+        points:
+          @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 0.0, y: 1.0)],
+      )
+      let res = await conn.query("SELECT $1::path", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPath(0)
+      doAssert got.closed == true
+      doAssert got.points.len == 3
+      doAssert got.points[0].x == 0.0
+      doAssert got.points[1].x == 1.0
+      doAssert got.points[2].y == 1.0
+      await conn.close()
+
+    waitFor t()
+
+  test "path roundtrip open":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPath(
+        closed: false, points: @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 5.0, y: 5.0)]
+      )
+      let res = await conn.query("SELECT $1::path", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPath(0)
+      doAssert got.closed == false
+      doAssert got.points.len == 2
+      doAssert got.points[0].x == 0.0
+      doAssert got.points[1].x == 5.0
+      await conn.close()
+
+    waitFor t()
+
+  test "polygon roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPolygon(
+        points: @[
+          PgPoint(x: 0.0, y: 0.0),
+          PgPoint(x: 4.0, y: 0.0),
+          PgPoint(x: 4.0, y: 3.0),
+          PgPoint(x: 0.0, y: 3.0),
+        ]
+      )
+      let res = await conn.query("SELECT $1::polygon", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPolygon(0)
+      doAssert got.points.len == 4
+      doAssert got.points[0].x == 0.0
+      doAssert got.points[2].x == 4.0
+      doAssert got.points[2].y == 3.0
+      await conn.close()
+
+    waitFor t()
+
+  test "circle roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0)
+      let res = await conn.query("SELECT $1::circle", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getCircle(0)
+      doAssert got.center.x == 1.0
+      doAssert got.center.y == 2.0
+      doAssert got.radius == 5.0
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL geometric types":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::point, NULL::line, NULL::circle")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getPointOpt(0).isNone
+      doAssert res.rows[0].getLineOpt(1).isNone
+      doAssert res.rows[0].getCircleOpt(2).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "geometric distance computation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT point '(1,2)' <-> point '(4,6)'")
+      doAssert res.rows.len == 1
+      let dist = parseFloat(res.rows[0].getStr(0))
+      doAssert abs(dist - 5.0) < 1e-10
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Range Types":
+  test "int4range roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(1'i32, 10'i32)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.hasLower
+      doAssert got.hasUpper
+      doAssert got.lower.value == 1'i32
+      doAssert got.lower.inclusive == true
+      doAssert got.upper.value == 10'i32
+      doAssert got.upper.inclusive == false
+      await conn.close()
+
+    waitFor t()
+
+  test "int8range roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(100'i64, 999'i64)
+      let res = await conn.query("SELECT $1::int8range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt8Range(0)
+      doAssert got.lower.value == 100'i64
+      doAssert got.upper.value == 999'i64
+      await conn.close()
+
+    waitFor t()
+
+  test "numrange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(parsePgNumeric("1.5"), parsePgNumeric("9.5"))
+      let res = await conn.query("SELECT $1::numrange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getNumRange(0)
+      doAssert $got.lower.value == "1.5"
+      doAssert $got.upper.value == "9.5"
+      await conn.close()
+
+    waitFor t()
+
+  test "daterange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let lower = dateTime(2024, mJan, 1, zone = utc())
+      let upper = dateTime(2024, mMar, 1, zone = utc())
+      let v = rangeOf(lower, upper)
+      let res = await conn.query("SELECT $1::daterange", @[toPgDateRangeParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getDateRange(0)
+      doAssert got.hasLower
+      doAssert got.hasUpper
+      doAssert got.lower.value.year == 2024
+      doAssert got.lower.value.month == mJan
+      doAssert got.lower.value.monthday == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "empty range":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = emptyRange[int32]()
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.isEmpty
+      await conn.close()
+
+    waitFor t()
+
+  test "unbounded range":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = unboundedRange[int32]()
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert not got.isEmpty
+      doAssert not got.hasLower
+      doAssert not got.hasUpper
+      await conn.close()
+
+    waitFor t()
+
+  test "half-bounded range rangeFrom":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeFrom(5'i32)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.hasLower
+      doAssert not got.hasUpper
+      doAssert got.lower.value == 5'i32
+      doAssert got.lower.inclusive == true
+      await conn.close()
+
+    waitFor t()
+
+  test "half-bounded range rangeTo":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeTo(10'i32)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert not got.hasLower
+      doAssert got.hasUpper
+      doAssert got.upper.value == 10'i32
+      doAssert got.upper.inclusive == false
+      await conn.close()
+
+    waitFor t()
+
+  test "inclusive upper bound normalizes for integers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # For integer ranges, PostgreSQL normalizes [1,10] to [1,11)
+      let v = rangeOf(1'i32, 10'i32, upperInc = true)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.lower.value == 1'i32
+      doAssert got.lower.inclusive == true
+      doAssert got.upper.value == 11'i32
+      doAssert got.upper.inclusive == false
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL range":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4range")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt4RangeOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "range contains operator":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(1'i32, 10'i32)
+      let res = await conn.query("SELECT $1::int4range @> 5::int4", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getBool(0) == true
+
+      let res2 = await conn.query("SELECT $1::int4range @> 15::int4", @[toPgParam(v)])
+      doAssert res2.rows[0].getBool(0) == false
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Multirange Types":
+  test "int4multirange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+      let res = await conn.query("SELECT $1::int4multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Multirange(0)
+      doAssert got.len == 2
+      doAssert got[0].lower.value == 1'i32
+      doAssert got[0].upper.value == 3'i32
+      doAssert got[1].lower.value == 5'i32
+      doAssert got[1].upper.value == 8'i32
+      await conn.close()
+
+    waitFor t()
+
+  test "int8multirange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange(rangeOf(100'i64, 200'i64), rangeOf(300'i64, 400'i64))
+      let res = await conn.query("SELECT $1::int8multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt8Multirange(0)
+      doAssert got.len == 2
+      doAssert got[0].lower.value == 100'i64
+      doAssert got[1].upper.value == 400'i64
+      await conn.close()
+
+    waitFor t()
+
+  test "empty multirange":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange[int32]()
+      let res = await conn.query("SELECT $1::int4multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Multirange(0)
+      doAssert got.len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "single range multirange":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange(rangeOf(10'i32, 20'i32))
+      let res = await conn.query("SELECT $1::int4multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Multirange(0)
+      doAssert got.len == 1
+      doAssert got[0].lower.value == 10'i32
+      doAssert got[0].upper.value == 20'i32
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL multirange":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4multirange")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt4MultirangeOpt(0).isNone
+      await conn.close()
 
     waitFor t()
