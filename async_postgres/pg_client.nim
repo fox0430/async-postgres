@@ -612,9 +612,9 @@ template queryEachRecvLoop(
           conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rd
         )
         if res.state == psIncomplete:
-          conn.recvBufStart = pos
           break # need more data
         pos += consumed
+        conn.recvBufStart = pos
         if res.state == psDataRow:
           # DataRow was parsed into rd — invoke callback, then reset for next row
           if callbackError == nil:
