@@ -184,6 +184,11 @@ const
     701, # float8
     718, # circle
     1043, # varchar
+    1082, # date
+    1083, # time
+    1114, # timestamp
+    1184, # timestamptz
+    1266, # timetz
     1560, # bit
     1561, # bit[]
     1562, # varbit

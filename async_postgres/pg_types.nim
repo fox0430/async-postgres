@@ -36,6 +36,19 @@ type
     days*: int32
     microseconds*: int64
 
+  PgTime* = object ## PostgreSQL time without time zone.
+    hour*: int32 ## 0..23
+    minute*: int32 ## 0..59
+    second*: int32 ## 0..59
+    microsecond*: int32 ## 0..999999
+
+  PgTimeTz* = object ## PostgreSQL time with time zone.
+    hour*: int32 ## 0..23
+    minute*: int32 ## 0..59
+    second*: int32 ## 0..59
+    microsecond*: int32 ## 0..999999
+    utcOffset*: int32 ## UTC offset in seconds (positive = east of UTC)
+
   PgInet* = object ## PostgreSQL inet type: an IP address with a subnet mask.
     address*: IpAddress
     mask*: uint8
@@ -158,6 +171,7 @@ const
   OidDate* = 1082'i32
   OidTime* = 1083'i32
   OidTimestampTz* = 1184'i32
+  OidTimeTz* = 1266'i32
   OidNumeric* = 1700'i32
   OidJson* = 114'i32
   OidInterval* = 1186'i32
@@ -602,6 +616,32 @@ proc `$`*(v: PgInterval): string =
 proc `==`*(a, b: PgInterval): bool =
   a.months == b.months and a.days == b.days and a.microseconds == b.microseconds
 
+proc `$`*(v: PgTime): string =
+  result =
+    align($v.hour, 2, '0') & ":" & align($v.minute, 2, '0') & ":" &
+    align($v.second, 2, '0')
+  if v.microsecond != 0:
+    result.add("." & align($v.microsecond, 6, '0'))
+
+proc `$`*(v: PgTimeTz): string =
+  result =
+    align($v.hour, 2, '0') & ":" & align($v.minute, 2, '0') & ":" &
+    align($v.second, 2, '0')
+  if v.microsecond != 0:
+    result.add("." & align($v.microsecond, 6, '0'))
+  let off = v.utcOffset
+  if off >= 0:
+    result.add("+")
+  else:
+    result.add("-")
+  let absOff = abs(off)
+  let offH = absOff div 3600
+  let offM = (absOff mod 3600) div 60
+  let offS = absOff mod 60
+  result.add(align($offH, 2, '0') & ":" & align($offM, 2, '0'))
+  if offS != 0:
+    result.add(":" & align($offS, 2, '0'))
+
 proc toBytes*(s: string): seq[byte] =
   ## Converts a string to a sequence of bytes.
   result = newSeq[byte](s.len)
@@ -684,6 +724,22 @@ proc toPgParam*(v: seq[byte]): PgParam =
 proc toPgParam*(v: DateTime): PgParam =
   let s = v.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
   PgParam(oid: OidTimestamp, format: 0, value: some(toBytes(s)))
+
+proc toPgDateParam*(v: DateTime): PgParam =
+  ## Encode a DateTime as a date parameter (OID 1082).
+  let s = v.format("yyyy-MM-dd")
+  PgParam(oid: OidDate, format: 0, value: some(toBytes(s)))
+
+proc toPgTimestampTzParam*(v: DateTime): PgParam =
+  ## Encode a DateTime as a timestamptz parameter (OID 1184).
+  let s = v.format("yyyy-MM-dd HH:mm:ss'.'ffffffzzz")
+  PgParam(oid: OidTimestampTz, format: 0, value: some(toBytes(s)))
+
+proc toPgParam*(v: PgTime): PgParam =
+  PgParam(oid: OidTime, format: 0, value: some(toBytes($v)))
+
+proc toPgParam*(v: PgTimeTz): PgParam =
+  PgParam(oid: OidTimeTz, format: 0, value: some(toBytes($v)))
 
 proc toPgParam*(v: PgUuid): PgParam =
   PgParam(oid: OidUuid, format: 0, value: some(toBytes(string(v))))
@@ -969,6 +1025,34 @@ proc toPgBinaryParam*(v: DateTime): PgParam =
   let unixUs = t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000)
   let pgUs = unixUs - pgEpochUnix * 1_000_000
   PgParam(oid: OidTimestamp, format: 1, value: some(@(toBE64(pgUs))))
+
+proc toPgBinaryDateParam*(v: DateTime): PgParam =
+  ## Encode a DateTime as a binary date parameter (OID 1082).
+  let t = v.toTime()
+  let pgDays = int32(t.toUnix() div 86400 - int64(pgEpochDaysOffset))
+  PgParam(oid: OidDate, format: 1, value: some(@(toBE32(pgDays))))
+
+proc toPgBinaryTimestampTzParam*(v: DateTime): PgParam =
+  ## Encode a DateTime as a binary timestamptz parameter (OID 1184).
+  let t = v.toTime()
+  let unixUs = t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000)
+  let pgUs = unixUs - pgEpochUnix * 1_000_000
+  PgParam(oid: OidTimestampTz, format: 1, value: some(@(toBE64(pgUs))))
+
+proc toPgBinaryParam*(v: PgTime): PgParam =
+  let us =
+    int64(v.hour) * 3_600_000_000'i64 + int64(v.minute) * 60_000_000'i64 +
+    int64(v.second) * 1_000_000'i64 + int64(v.microsecond)
+  PgParam(oid: OidTime, format: 1, value: some(@(toBE64(us))))
+
+proc toPgBinaryParam*(v: PgTimeTz): PgParam =
+  let us =
+    int64(v.hour) * 3_600_000_000'i64 + int64(v.minute) * 60_000_000'i64 +
+    int64(v.second) * 1_000_000'i64 + int64(v.microsecond)
+  let pgOffset = int32(-v.utcOffset) # PostgreSQL stores offset negated
+  var data: seq[byte] = @(toBE64(us))
+  data.add(@(toBE32(pgOffset)))
+  PgParam(oid: OidTimeTz, format: 1, value: some(data))
 
 proc putBE16(buf: var seq[byte], off: int, v: int16) =
   let b = toBE16(v)
@@ -1322,6 +1406,33 @@ proc decodeBinaryDate(data: openArray[byte]): DateTime =
   let pgDays = fromBE32(data)
   let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
   initTime(unixSec, 0).utc()
+
+proc decodeBinaryTime(data: openArray[byte]): PgTime =
+  let us = fromBE64(data)
+  let hours = int32(us div 3_600_000_000)
+  let rem1 = us mod 3_600_000_000
+  let minutes = int32(rem1 div 60_000_000)
+  let rem2 = rem1 mod 60_000_000
+  let seconds = int32(rem2 div 1_000_000)
+  let microseconds = int32(rem2 mod 1_000_000)
+  PgTime(hour: hours, minute: minutes, second: seconds, microsecond: microseconds)
+
+proc decodeBinaryTimeTz(data: openArray[byte]): PgTimeTz =
+  let us = fromBE64(data)
+  let pgOffset = fromBE32(data.toOpenArray(8, 11))
+  let hours = int32(us div 3_600_000_000)
+  let rem1 = us mod 3_600_000_000
+  let minutes = int32(rem1 div 60_000_000)
+  let rem2 = rem1 mod 60_000_000
+  let seconds = int32(rem2 div 1_000_000)
+  let microseconds = int32(rem2 mod 1_000_000)
+  PgTimeTz(
+    hour: hours,
+    minute: minutes,
+    second: seconds,
+    microsecond: microseconds,
+    utcOffset: -pgOffset, # un-negate PostgreSQL wire format
+  )
 
 proc decodeInetBinary(data: openArray[byte]): tuple[address: IpAddress, mask: uint8] =
   ## Decode PostgreSQL binary inet/cidr format:
@@ -1931,7 +2042,7 @@ proc getTimestamp*(row: Row, col: int): DateTime =
   for fmt in formats:
     try:
       return parse(s, fmt)
-    except TimeParseError:
+    except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp: " & s)
 
@@ -1947,6 +2058,107 @@ proc getDate*(row: Row, col: int): DateTime =
     return parse(s, "yyyy-MM-dd")
   except TimeParseError:
     raise newException(PgTypeError, "Invalid date: " & s)
+
+proc getTimestampTz*(row: Row, col: int): DateTime =
+  ## Get a column value as DateTime from a timestamptz column.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
+  let s = row.getStr(col)
+  const formats = [
+    "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
+    "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
+    "yyyy-MM-dd HH:mm:ss",
+  ]
+  for fmt in formats:
+    try:
+      return parse(s, fmt)
+    except TimeParseError, IndexDefect:
+      discard
+  raise newException(PgTypeError, "Invalid timestamptz: " & s)
+
+proc parseTimeText(s: string): PgTime =
+  ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".
+  if s.len < 8 or s[2] != ':' or s[5] != ':':
+    raise newException(PgTypeError, "Invalid time: " & s)
+  var h, m, sec, us: int
+  try:
+    h = parseInt(s[0 .. 1])
+    m = parseInt(s[3 .. 4])
+    sec = parseInt(s[6 .. 7])
+  except ValueError:
+    raise newException(PgTypeError, "Invalid time: " & s)
+  if h notin 0 .. 23 or m notin 0 .. 59 or sec notin 0 .. 59:
+    raise newException(PgTypeError, "Invalid time: " & s)
+  if s.len > 8 and s[8] == '.':
+    let frac = s[9 .. ^1]
+    if frac.len == 0 or frac.len > 6:
+      raise newException(PgTypeError, "Invalid time: " & s)
+    try:
+      us = parseInt(frac)
+    except ValueError:
+      raise newException(PgTypeError, "Invalid time: " & s)
+    # Pad to 6 digits
+    for _ in 0 ..< (6 - frac.len):
+      us *= 10
+  PgTime(hour: int32(h), minute: int32(m), second: int32(sec), microsecond: int32(us))
+
+proc getTime*(row: Row, col: int): PgTime =
+  ## Get a column value as PgTime. Handles binary time format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeBinaryTime(row.data.buf.toOpenArray(off, off + 7))
+  let s = row.getStr(col)
+  return parseTimeText(s)
+
+proc getTimeTz*(row: Row, col: int): PgTimeTz =
+  ## Get a column value as PgTimeTz. Handles binary timetz format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    return decodeBinaryTimeTz(row.data.buf.toOpenArray(off, off + 11))
+  let s = row.getStr(col)
+  # Find the timezone offset separator (+ or - after the time part)
+  var tzPos = -1
+  for i in 8 ..< s.len:
+    if s[i] == '+' or s[i] == '-':
+      tzPos = i
+      break
+  if tzPos < 0:
+    raise newException(PgTypeError, "Invalid timetz (no offset): " & s)
+  let timePart = s[0 ..< tzPos]
+  let t = parseTimeText(timePart)
+  # Parse offset: "+HH", "+HH:MM", "+HH:MM:SS"
+  let sign = if s[tzPos] == '+': 1 else: -1
+  let offStr = s[tzPos + 1 .. ^1]
+  var offH, offM, offS: int
+  try:
+    if offStr.len == 2:
+      offH = parseInt(offStr)
+    elif offStr.len == 5 and offStr[2] == ':':
+      offH = parseInt(offStr[0 .. 1])
+      offM = parseInt(offStr[3 .. 4])
+    elif offStr.len == 8 and offStr[2] == ':' and offStr[5] == ':':
+      offH = parseInt(offStr[0 .. 1])
+      offM = parseInt(offStr[3 .. 4])
+      offS = parseInt(offStr[6 .. 7])
+    else:
+      raise newException(PgTypeError, "Invalid timetz offset: " & s)
+  except ValueError:
+    raise newException(PgTypeError, "Invalid timetz offset: " & s)
+  let utcOff = sign * (offH * 3600 + offM * 60 + offS)
+  PgTimeTz(
+    hour: t.hour,
+    minute: t.minute,
+    second: t.second,
+    microsecond: t.microsecond,
+    utcOffset: int32(utcOff),
+  )
 
 proc parseHstoreText*(s: string): PgHstore =
   ## Parse PostgreSQL hstore text format: ``"key1"=>"val1", "key2"=>NULL``.
@@ -2630,6 +2842,9 @@ optAccessor(getBytes, getBytesOpt, seq[byte])
 optAccessor(getJson, getJsonOpt, JsonNode)
 optAccessor(getTimestamp, getTimestampOpt, DateTime)
 optAccessor(getDate, getDateOpt, DateTime)
+optAccessor(getTime, getTimeOpt, PgTime)
+optAccessor(getTimeTz, getTimeTzOpt, PgTimeTz)
+optAccessor(getTimestampTz, getTimestampTzOpt, DateTime)
 optAccessor(getInterval, getIntervalOpt, PgInterval)
 optAccessor(getInet, getInetOpt, PgInet)
 optAccessor(getCidr, getCidrOpt, PgCidr)

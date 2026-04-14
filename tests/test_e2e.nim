@@ -2812,6 +2812,68 @@ suite "E2E: Extended Type Roundtrip":
 
     waitFor t()
 
+  test "time roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm = PgTime(hour: 14, minute: 30, second: 45, microsecond: 123456)
+      let res = await conn.query("SELECT $1::time", @[toPgParam(tm)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTime(0)
+      doAssert got.hour == 14
+      doAssert got.minute == 30
+      doAssert got.second == 45
+      doAssert got.microsecond == 123456
+      await conn.close()
+
+    waitFor t()
+
+  test "timetz roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm =
+        PgTimeTz(hour: 14, minute: 30, second: 45, microsecond: 0, utcOffset: 18000)
+      let res = await conn.query("SELECT $1::timetz", @[toPgParam(tm)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTimeTz(0)
+      doAssert got.hour == 14
+      doAssert got.minute == 30
+      doAssert got.second == 45
+      doAssert got.utcOffset == 18000
+      await conn.close()
+
+    waitFor t()
+
+  test "date param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2025, mJun, 15, 0, 0, 0, zone = utc())
+      let res = await conn.query("SELECT $1::date", @[toPgDateParam(dt)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getDate(0)
+      doAssert got.year == 2025
+      doAssert got.month == mJun
+      doAssert got.monthday == 15
+      await conn.close()
+
+    waitFor t()
+
+  test "timestamptz roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2025, mMar, 15, 10, 30, 45, zone = utc())
+      let res = await conn.query("SELECT $1::timestamptz", @[toPgTimestampTzParam(dt)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTimestampTz(0)
+      doAssert got.utc().year == 2025
+      doAssert got.utc().month == mMar
+      doAssert got.utc().monthday == 15
+      doAssert got.utc().hour == 10
+      doAssert got.utc().minute == 30
+      doAssert got.utc().second == 45
+      await conn.close()
+
+    waitFor t()
+
   test "UUID roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -3389,6 +3451,66 @@ suite "E2E: Binary Format":
       doAssert result.monthday == 15
       doAssert result.hour == 10
       doAssert result.minute == 30
+      await conn.close()
+
+    waitFor t()
+
+  test "binary time param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm = PgTime(hour: 14, minute: 30, second: 45, microsecond: 123456)
+      let params = @[toPgBinaryParam(tm)]
+      let qr = await conn.query("SELECT $1::time", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getTime(0)
+      doAssert got == tm
+      await conn.close()
+
+    waitFor t()
+
+  test "binary timetz param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm =
+        PgTimeTz(hour: 14, minute: 30, second: 45, microsecond: 0, utcOffset: 18000)
+      let params = @[toPgBinaryParam(tm)]
+      let qr = await conn.query("SELECT $1::timetz", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getTimeTz(0)
+      doAssert got == tm
+      await conn.close()
+
+    waitFor t()
+
+  test "binary date param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
+      let params = @[toPgBinaryDateParam(dt)]
+      let qr = await conn.query("SELECT $1::date", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getDate(0)
+      doAssert got.year == 2024
+      doAssert got.month == mJan
+      doAssert got.monthday == 15
+      await conn.close()
+
+    waitFor t()
+
+  test "binary timestamptz param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+      let params = @[toPgBinaryTimestampTzParam(dt)]
+      let qr =
+        await conn.query("SELECT $1::timestamptz", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getTimestampTz(0)
+      doAssert got.year == 2024
+      doAssert got.month == mJan
+      doAssert got.monthday == 15
+      doAssert got.hour == 10
+      doAssert got.minute == 30
       await conn.close()
 
     waitFor t()
