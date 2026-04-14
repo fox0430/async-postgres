@@ -2042,7 +2042,7 @@ proc getTimestamp*(row: Row, col: int): DateTime =
   for fmt in formats:
     try:
       return parse(s, fmt)
-    except TimeParseError:
+    except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp: " & s)
 
@@ -2075,7 +2075,7 @@ proc getTimestampTz*(row: Row, col: int): DateTime =
   for fmt in formats:
     try:
       return parse(s, fmt)
-    except TimeParseError:
+    except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamptz: " & s)
 
