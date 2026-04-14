@@ -351,21 +351,36 @@ func state*(conn: PgConnection): var PgConnState {.inline.} =
   ## The current connection state.
   conn.state
 
+proc `state=`*(conn: PgConnection, val: PgConnState) {.inline.} =
+  conn.state = val
+
 func txStatus*(conn: PgConnection): var TransactionStatus {.inline.} =
   ## The current transaction status.
   conn.txStatus
+
+proc `txStatus=`*(conn: PgConnection, val: TransactionStatus) {.inline.} =
+  conn.txStatus = val
 
 func stmtCacheCapacity*(conn: PgConnection): var int {.inline.} =
   ## Statement cache capacity (0 = disabled, default 256).
   conn.stmtCacheCapacity
 
+proc `stmtCacheCapacity=`*(conn: PgConnection, val: int) {.inline.} =
+  conn.stmtCacheCapacity = val
+
 func createdAt*(conn: PgConnection): var Moment {.inline.} =
   ## When this connection was established.
   conn.createdAt
 
+proc `createdAt=`*(conn: PgConnection, val: Moment) {.inline.} =
+  conn.createdAt = val
+
 func tracer*(conn: PgConnection): var PgTracer {.inline.} =
   ## The tracing context for this connection.
   conn.tracer
+
+proc `tracer=`*(conn: PgConnection, val: PgTracer) {.inline.} =
+  conn.tracer = val
 
 func notifyQueue*(conn: PgConnection): var Deque[Notification] {.inline.} =
   ## The notification queue for buffered notifications.
@@ -374,6 +389,9 @@ func notifyQueue*(conn: PgConnection): var Deque[Notification] {.inline.} =
 func listenTask*(conn: PgConnection): var Future[void] {.inline.} =
   ## The background listen pump task.
   conn.listenTask
+
+proc `listenTask=`*(conn: PgConnection, val: Future[void]) {.inline.} =
+  conn.listenTask = val
 
 # Public API: setters for callback/config fields
 
@@ -401,8 +419,14 @@ proc `reconnectCallback=`*(
 
 func recvBuf*(conn: PgConnection): var seq[byte] {.inline.} =
   conn.recvBuf
+proc `recvBuf=`*(conn: PgConnection, val: seq[byte]) {.inline.} =
+  conn.recvBuf = val
+
 func recvBufStart*(conn: PgConnection): var int {.inline.} =
   conn.recvBufStart
+proc `recvBufStart=`*(conn: PgConnection, val: int) {.inline.} =
+  conn.recvBufStart = val
+
 func sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
   conn.sendBuf
 func stmtCache*(conn: PgConnection): var Table[string, CachedStmt] {.inline.} =
