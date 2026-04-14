@@ -447,7 +447,7 @@ proc identifySystem*(conn: PgConnection): Future[SystemInfo] {.async.} =
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "IDENTIFY_SYSTEM returned no results")
   let qr = results[0]
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   var info = SystemInfo()
   info.systemId = row.getStr(0)
   info.timeline = parseInt(row.getStr(1)).int32
@@ -472,7 +472,7 @@ proc createReplicationSlot*(
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "CREATE_REPLICATION_SLOT returned no results")
   let qr = results[0]
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   var info = ReplicationSlotInfo()
   info.slotName = row.getStr(0)
   info.consistentPoint = parseLsn(row.getStr(1))
@@ -500,7 +500,7 @@ proc readReplicationSlot*(
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "READ_REPLICATION_SLOT returned no results")
   let qr = results[0]
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   var info = ReplicationSlotInfo()
   # READ_REPLICATION_SLOT returns: slot_type, restart_lsn, restart_tli
   # But the column layout depends on PG version. We handle common case.
