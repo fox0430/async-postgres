@@ -291,6 +291,19 @@ suite "Row accessors":
     expect IndexDefect:
       discard row.getStr(-1)
 
+  test "getInt16":
+    let row = @[some(toBytes("123"))]
+    check row.getInt16(0) == 123'i16
+
+  test "getInt16 negative":
+    let row = @[some(toBytes("-456"))]
+    check row.getInt16(0) == -456'i16
+
+  test "getInt16 invalid value raises":
+    let row = @[some(toBytes("abc"))]
+    expect PgTypeError:
+      discard row.getInt16(0)
+
   test "getInt":
     let row = @[some(toBytes("42"))]
     check row.getInt(0) == 42'i32
@@ -312,6 +325,15 @@ suite "Row accessors":
     let row = @[some(toBytes("xyz"))]
     expect PgTypeError:
       discard row.getInt64(0)
+
+  test "getFloat32":
+    let row = @[some(toBytes("2.5"))]
+    check abs(row.getFloat32(0) - 2.5'f32) < 1e-6
+
+  test "getFloat32 invalid value raises":
+    let row = @[some(toBytes("notanumber"))]
+    expect PgTypeError:
+      discard row.getFloat32(0)
 
   test "getFloat":
     let row = @[some(toBytes("3.14"))]
@@ -709,6 +731,14 @@ suite "Option accessors":
     let row: Row = @[none(seq[byte])]
     check row.getStrOpt(0) == none(string)
 
+  test "getInt16Opt some":
+    let row: Row = @[some(toBytes("123"))]
+    check row.getInt16Opt(0) == some(123'i16)
+
+  test "getInt16Opt none":
+    let row: Row = @[none(seq[byte])]
+    check row.getInt16Opt(0) == none(int16)
+
   test "getIntOpt some":
     let row: Row = @[some(toBytes("42"))]
     check row.getIntOpt(0) == some(42'i32)
@@ -724,6 +754,16 @@ suite "Option accessors":
   test "getInt64Opt none":
     let row: Row = @[none(seq[byte])]
     check row.getInt64Opt(0) == none(int64)
+
+  test "getFloat32Opt some":
+    let row: Row = @[some(toBytes("2.5"))]
+    let v = row.getFloat32Opt(0)
+    check v.isSome
+    check abs(v.get - 2.5'f32) < 1e-6
+
+  test "getFloat32Opt none":
+    let row: Row = @[none(seq[byte])]
+    check row.getFloat32Opt(0) == none(float32)
 
   test "getFloatOpt some":
     let row: Row = @[some(toBytes("3.14"))]
