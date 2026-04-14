@@ -1620,7 +1620,7 @@ converter toRow*(cells: seq[Option[seq[byte]]]): Row =
       rd.cellIndex[i * 2] = int32(rd.buf.len)
       rd.cellIndex[i * 2 + 1] = int32(data.len)
       rd.buf.add(data)
-  Row(data: rd, rowIdx: 0)
+  initRow(rd, 0)
 
 proc parseAffectedRows*(tag: string): int64 =
   ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).

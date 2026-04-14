@@ -214,7 +214,7 @@ suite "Row.clone":
   test "returns independent RowData backing":
     let rd = newRowData(2)
     parseDataRowInto(buildDataRowBody(["hello", "world"]), rd)
-    let row = Row(data: rd, rowIdx: 0)
+    let row = initRow(rd, 0)
     let cloned = row.clone()
     check cloned.data != rd
     check cloned.rowIdx == 0
@@ -223,7 +223,7 @@ suite "Row.clone":
   test "clone survives original buffer reuse":
     let rd = newRowData(2)
     parseDataRowInto(buildDataRowBody(["hello", "world"]), rd)
-    let cloned = Row(data: rd, rowIdx: 0).clone()
+    let cloned = initRow(rd, 0).clone()
 
     # Simulate queryEach behavior: reset and parse next row into same rd
     rd.buf.setLen(0)
@@ -239,7 +239,7 @@ suite "Row.clone":
     parseDataRowInto(buildDataRowBody(["a1", "b1"]), rd)
     parseDataRowInto(buildDataRowBody(["a2", "b2"]), rd)
 
-    let cloned = Row(data: rd, rowIdx: 1).clone()
+    let cloned = initRow(rd, 1).clone()
     check cloned.data.numCols == 2
     check cloned.data.cellIndex.len == 4 # just one row worth
     check getCell(cloned.data, 0, 0) == "a1"
@@ -248,7 +248,7 @@ suite "Row.clone":
   test "preserves NULL cells":
     let rd = newRowData(3)
     parseDataRowInto(buildDataRowBody(["val", "\xFF", "end"]), rd)
-    let cloned = Row(data: rd, rowIdx: 0).clone()
+    let cloned = initRow(rd, 0).clone()
     check getCell(cloned.data, 0, 0) == "val"
     check isCellNull(cloned.data, 0, 1)
     check getCell(cloned.data, 0, 2) == "end"
@@ -261,7 +261,7 @@ suite "Row.clone":
     body.addInt32(-1) # NULL
     parseDataRowInto(body, rd)
 
-    let cloned = Row(data: rd, rowIdx: 0).clone()
+    let cloned = initRow(rd, 0).clone()
     check not isCellNull(cloned.data, 0, 0)
     check getCell(cloned.data, 0, 0) == ""
     check isCellNull(cloned.data, 0, 1)
@@ -275,7 +275,7 @@ suite "Row.clone":
     ]
     parseDataRowInto(buildDataRowBody(["x", "y"]), rd)
 
-    let cloned = Row(data: rd, rowIdx: 0).clone()
+    let cloned = initRow(rd, 0).clone()
     check cloned.data.colFormats == @[1'i16, 0'i16]
     check cloned.data.colTypeOids == @[23'i32, 25'i32]
     check cloned.data.fields.len == 2
@@ -283,6 +283,6 @@ suite "Row.clone":
     check cloned.data.fields[1].name == "name"
 
   test "clone of nil data is safe":
-    let row = Row(data: nil, rowIdx: 0)
+    let row = initRow(nil, 0)
     let cloned = row.clone()
     check cloned.data == nil

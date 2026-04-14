@@ -619,7 +619,7 @@ template queryEachRecvLoop(
           # DataRow was parsed into rd — invoke callback, then reset for next row
           if callbackError == nil:
             try:
-              callback(Row(data: rd, rowIdx: 0))
+              callback(initRow(rd, 0))
             except CatchableError as e:
               callbackError = e
           rowCount += 1
@@ -853,7 +853,7 @@ proc queryOne*(
   if qr.rowCount > 0:
     if qr.fields.len > 0 and qr.data.fields.len == 0:
       qr.data.fields = qr.fields
-    return some(Row(data: qr.data, rowIdx: 0))
+    return some(initRow(qr.data, 0))
   else:
     return none(Row)
 
@@ -883,7 +883,7 @@ proc queryValue*(
   let qr = await conn.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     raise newException(PgError, "Query returned no rows")
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     raise newException(PgError, "Query returned NULL")
   return row.getStr(0)
@@ -901,7 +901,7 @@ proc queryValue*[T](
   let qr = await conn.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     raise newException(PgError, "Query returned no rows")
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     raise newException(PgError, "Query returned NULL")
   return row.get(0, T)
@@ -917,7 +917,7 @@ proc queryValueOpt*(
   let qr = await conn.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return none(string)
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(string)
   return some(row.getStr(0))
@@ -935,7 +935,7 @@ proc queryValueOpt*[T](
   let qr = await conn.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return none(T)
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(T)
   return some(row.get(0, T))
@@ -952,7 +952,7 @@ proc queryValueOrDefault*(
   let qr = await conn.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return default
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
   return row.getStr(0)
@@ -971,7 +971,7 @@ proc queryValueOrDefault*[T](
   let qr = await conn.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return default
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
   return row.get(0, T)
@@ -996,7 +996,7 @@ proc queryColumn*(
   ## Raises PgTypeError if any value is NULL.
   let qr = await conn.query(sql, params, timeout = timeout)
   for i in 0 ..< qr.rowCount:
-    let row = Row(data: qr.data, rowIdx: i)
+    let row = initRow(qr.data, i)
     if row.isNull(0):
       raise newException(PgTypeError, "NULL value in column")
     result.add(row.getStr(0))
@@ -2781,7 +2781,7 @@ proc fetchNextImpl(
     rd.fields = cursor.fields
   result = newSeq[Row](rowCount)
   for i in 0 ..< rowCount:
-    result[i] = Row(data: rd, rowIdx: i)
+    result[i] = initRow(rd, i)
 
 proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Fetch the next chunk of rows from the cursor.
@@ -2792,7 +2792,7 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
       cursor.bufferedData.fields = cursor.fields
     result = newSeq[Row](cursor.bufferedCount)
     for i in 0 ..< cursor.bufferedCount:
-      result[i] = Row(data: cursor.bufferedData, rowIdx: i)
+      result[i] = initRow(cursor.bufferedData, i)
     cursor.bufferedData = nil
     cursor.bufferedCount = 0
     return result
