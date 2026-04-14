@@ -4757,8 +4757,8 @@ suite "E2E: Convenience Query Methods":
       let qr2 = await conn.query("SELECT 'y'")
       doAssert qr1.rowCount == 1
       doAssert qr2.rowCount == 1
-      let row1 = Row(data: qr1.data, rowIdx: 0)
-      let row2 = Row(data: qr2.data, rowIdx: 0)
+      let row1 = initRow(qr1.data, 0)
+      let row2 = initRow(qr2.data, 0)
       doAssert row1.getStr(0) == "x", "qr1 data was invalidated by qr2"
       doAssert row2.getStr(0) == "y"
       await conn.close()
@@ -6047,8 +6047,8 @@ suite "E2E: queryDirect / execDirect":
       let qr2 = await conn.queryDirect("SELECT $1::text", "y")
       doAssert qr1.rowCount == 1
       doAssert qr2.rowCount == 1
-      let row1 = Row(data: qr1.data, rowIdx: 0)
-      let row2 = Row(data: qr2.data, rowIdx: 0)
+      let row1 = initRow(qr1.data, 0)
+      let row2 = initRow(qr2.data, 0)
       doAssert row1.getStr(0) == "x", "qr1 data was invalidated by qr2"
       doAssert row2.getStr(0) == "y"
       await conn.close()

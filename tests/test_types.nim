@@ -65,7 +65,7 @@ proc mkRow(cells: seq[Option[seq[byte]]], fields: seq[FieldDescription]): Row =
       rd.cellIndex[i * 2] = int32(rd.buf.len)
       rd.cellIndex[i * 2 + 1] = int32(data.len)
       rd.buf.add(data)
-  Row(data: rd, rowIdx: 0)
+  initRow(rd, 0)
 
 suite "OID constants":
   test "standard OID values":

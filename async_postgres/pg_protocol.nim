@@ -149,8 +149,18 @@ type
     colMap*: Table[string, int] ## Cached name→index mapping (lazily built)
 
   Row* = object ## Lightweight view into a single row within a `RowData` buffer.
-    data*: RowData
-    rowIdx*: int32
+    data: RowData
+    rowIdx: int32
+
+func initRow*(data: RowData, rowIdx: int32): Row {.inline.} =
+  ## Create a Row view into the given RowData at the specified row index.
+  Row(data: data, rowIdx: rowIdx)
+
+func data*(row: Row): RowData {.inline.} = ## The underlying RowData buffer.
+  row.data
+
+func rowIdx*(row: Row): int32 {.inline.} = ## The row index within the RowData buffer.
+  row.rowIdx
 
 const
   syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8] ## Pre-built Sync message bytes.

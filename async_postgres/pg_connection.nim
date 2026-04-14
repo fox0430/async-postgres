@@ -127,7 +127,7 @@ type
   PgConnection* = ref object
     ## A single PostgreSQL connection with buffered I/O and statement caching.
     when hasChronos:
-      transport*: StreamTransport
+      transport: StreamTransport
       baseReader: AsyncStreamReader
       baseWriter: AsyncStreamWriter
       reader: AsyncStreamReader
@@ -136,39 +136,39 @@ type
       trustAnchorBufs: seq[seq[byte]] ## Backing memory for custom trust anchor pointers
       x509Capture: X509CertCaptureContext ## X509 wrapper for cert capture
     elif hasAsyncDispatch:
-      socket*: AsyncSocket
+      socket: AsyncSocket
     serverCertDer: seq[byte] ## DER-encoded server certificate for SCRAM channel binding
-    sslEnabled*: bool
-    recvBuf*: seq[byte]
-    recvBufStart*: int ## Read pointer into recvBuf; bytes before this are consumed
-    state*: PgConnState
-    pid*: int32
-    secretKey*: int32
-    serverParams*: Table[string, string]
-    txStatus*: TransactionStatus
-    notifyCallback*: NotifyCallback
-    noticeCallback*: NoticeCallback
-    listenChannels*: HashSet[string]
-    listenTask*: Future[void]
+    sslEnabled: bool
+    recvBuf: seq[byte]
+    recvBufStart: int ## Read pointer into recvBuf; bytes before this are consumed
+    state: PgConnState
+    pid: int32
+    secretKey: int32
+    serverParams: Table[string, string]
+    txStatus: TransactionStatus
+    notifyCallback: NotifyCallback
+    noticeCallback: NoticeCallback
+    listenChannels: HashSet[string]
+    listenTask: Future[void]
     host: string
     port: int
-    createdAt*: Moment
-    portalCounter*: int
-    config*: ConnConfig
-    notifyQueue*: Deque[Notification]
-    notifyMaxQueue*: int
+    createdAt: Moment
+    portalCounter: int
+    config: ConnConfig
+    notifyQueue: Deque[Notification]
+    notifyMaxQueue: int
     notifyWaiter: Future[void]
-    sendBuf*: seq[byte] ## Reusable send buffer for COPY IN batching
-    notifyDropped*: int ## Count of notifications dropped due to queue overflow
+    sendBuf: seq[byte] ## Reusable send buffer for COPY IN batching
+    notifyDropped: int ## Count of notifications dropped due to queue overflow
     listenErrorMsg: string ## Set when listen pump fails permanently
-    reconnectCallback*: proc() {.gcsafe, raises: [].}
-    notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
-    stmtCache*: Table[string, CachedStmt]
+    reconnectCallback: proc() {.gcsafe, raises: [].}
+    notifyOverflowCallback: proc(dropped: int) {.gcsafe, raises: [].}
+    stmtCache: Table[string, CachedStmt]
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
-    stmtCounter*: int
-    stmtCacheCapacity*: int ## 0=disabled, default 256
-    hstoreOid*: int32 ## Dynamic OID for hstore extension type; 0 if not available
-    tracer*: PgTracer ## Inherited from ConnConfig on connect
+    stmtCounter: int
+    stmtCacheCapacity: int ## 0=disabled, default 256
+    hstoreOid: int32 ## Dynamic OID for hstore extension type; 0 if not available
+    tracer: PgTracer ## Inherited from ConnConfig on connect
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -303,6 +303,137 @@ type
     onPoolReleaseEnd*:
       proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
 
+# Public API: read-only getters
+
+func pid*(conn: PgConnection): int32 {.inline.} =
+  ## The backend process ID for this connection.
+  conn.pid
+
+func sslEnabled*(conn: PgConnection): bool {.inline.} =
+  ## Whether SSL/TLS is active on this connection.
+  conn.sslEnabled
+
+func serverParams*(conn: PgConnection): lent Table[string, string] {.inline.} =
+  ## Server parameters reported during startup (e.g. server_version).
+  conn.serverParams
+
+func listenChannels*(conn: PgConnection): lent HashSet[string] {.inline.} =
+  ## The set of channels this connection is currently LISTENing on.
+  conn.listenChannels
+
+func notifyDropped*(conn: PgConnection): int {.inline.} =
+  ## Count of notifications dropped due to queue overflow.
+  conn.notifyDropped
+
+func config*(conn: PgConnection): lent ConnConfig {.inline.} =
+  ## The connection configuration used to establish this connection.
+  conn.config
+
+func secretKey*(conn: PgConnection): int32 {.inline.} =
+  ## The backend secret key (used for cancel requests).
+  conn.secretKey
+
+func hstoreOid*(conn: PgConnection): int32 {.inline.} =
+  ## Dynamic OID for hstore extension type; 0 if not available.
+  conn.hstoreOid
+
+func notifyCallback*(conn: PgConnection): NotifyCallback {.inline.} =
+  ## The callback invoked when a NOTIFY message arrives.
+  conn.notifyCallback
+
+func notifyMaxQueue*(conn: PgConnection): int {.inline.} =
+  ## The maximum notification queue size (0 = unlimited).
+  conn.notifyMaxQueue
+
+# Public API: read-write accessors
+
+func state*(conn: PgConnection): var PgConnState {.inline.} =
+  ## The current connection state.
+  conn.state
+
+proc `state=`*(conn: PgConnection, val: PgConnState) {.inline.} =
+  conn.state = val
+
+func txStatus*(conn: PgConnection): var TransactionStatus {.inline.} =
+  ## The current transaction status.
+  conn.txStatus
+
+proc `txStatus=`*(conn: PgConnection, val: TransactionStatus) {.inline.} =
+  conn.txStatus = val
+
+func stmtCacheCapacity*(conn: PgConnection): var int {.inline.} =
+  ## Statement cache capacity (0 = disabled, default 256).
+  conn.stmtCacheCapacity
+
+proc `stmtCacheCapacity=`*(conn: PgConnection, val: int) {.inline.} =
+  conn.stmtCacheCapacity = val
+
+func createdAt*(conn: PgConnection): var Moment {.inline.} =
+  ## When this connection was established.
+  conn.createdAt
+
+proc `createdAt=`*(conn: PgConnection, val: Moment) {.inline.} =
+  conn.createdAt = val
+
+func tracer*(conn: PgConnection): var PgTracer {.inline.} =
+  ## The tracing context for this connection.
+  conn.tracer
+
+proc `tracer=`*(conn: PgConnection, val: PgTracer) {.inline.} =
+  conn.tracer = val
+
+func notifyQueue*(conn: PgConnection): var Deque[Notification] {.inline.} =
+  ## The notification queue for buffered notifications.
+  conn.notifyQueue
+
+func listenTask*(conn: PgConnection): var Future[void] {.inline.} =
+  ## The background listen pump task.
+  conn.listenTask
+
+proc `listenTask=`*(conn: PgConnection, val: Future[void]) {.inline.} =
+  conn.listenTask = val
+
+# Public API: setters for callback/config fields
+
+proc `noticeCallback=`*(conn: PgConnection, cb: NoticeCallback) {.inline.} =
+  ## Set the callback invoked when a notice/warning message arrives.
+  conn.noticeCallback = cb
+
+proc `notifyMaxQueue=`*(conn: PgConnection, val: int) {.inline.} =
+  ## Set the maximum notification queue size (0 = unlimited).
+  conn.notifyMaxQueue = val
+
+proc `notifyOverflowCallback=`*(
+    conn: PgConnection, cb: proc(dropped: int) {.gcsafe, raises: [].}
+) {.inline.} =
+  ## Set the callback invoked when notifications are dropped due to queue overflow.
+  conn.notifyOverflowCallback = cb
+
+proc `reconnectCallback=`*(
+    conn: PgConnection, cb: proc() {.gcsafe, raises: [].}
+) {.inline.} =
+  ## Set the callback invoked after a successful automatic reconnect.
+  conn.reconnectCallback = cb
+
+# Internal accessors for cross-module use within the library
+
+func recvBuf*(conn: PgConnection): var seq[byte] {.inline.} =
+  conn.recvBuf
+proc `recvBuf=`*(conn: PgConnection, val: seq[byte]) {.inline.} =
+  conn.recvBuf = val
+
+func recvBufStart*(conn: PgConnection): var int {.inline.} =
+  conn.recvBufStart
+proc `recvBufStart=`*(conn: PgConnection, val: int) {.inline.} =
+  conn.recvBufStart = val
+
+func sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
+  conn.sendBuf
+func stmtCache*(conn: PgConnection): var Table[string, CachedStmt] {.inline.} =
+  conn.stmtCache
+func portalCounter*(conn: PgConnection): var int {.inline.} =
+  conn.portalCounter
+
 proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
   ## Create a PgQueryError from server ErrorResponse fields.
   let sqlState = getErrorField(fields, 'C')
@@ -392,7 +523,7 @@ proc rows*(qr: QueryResult): seq[Row] =
     qr.data.fields = qr.fields
   result = newSeq[Row](qr.rowCount)
   for i in 0 ..< qr.rowCount:
-    result[i] = Row(data: qr.data, rowIdx: i)
+    result[i] = initRow(qr.data, i)
 
 iterator items*(qr: QueryResult): Row =
   ## Iterate over all rows in the query result.
@@ -400,7 +531,7 @@ iterator items*(qr: QueryResult): Row =
     if qr.fields.len > 0 and qr.data.fields.len == 0:
       qr.data.fields = qr.fields
     for i in 0 ..< qr.rowCount:
-      yield Row(data: qr.data, rowIdx: i)
+      yield initRow(qr.data, i)
 
 when hasChronos:
   type CopyOutCallback* =
@@ -1580,7 +1711,7 @@ proc listenPump(conn: PgConnection) {.async.} =
     try:
       while conn.state == csListening:
         discard await conn.recvMessage()
-      # State changed -- drain the stop-signal query response until ReadyForQuery
+      # State changed: drain the stop-signal query response until ReadyForQuery
       block drainLoop:
         while true:
           while (let opt = conn.nextMessage(); opt.isSome):
@@ -1642,7 +1773,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
   except CancelledError as e:
     raise e
   except CatchableError:
-    # Send or pump failed -- connection is dead
+    # Send or pump failed: connection is dead
     if conn.listenTask != nil and not conn.listenTask.finished:
       await cancelAndWait(conn.listenTask)
     conn.listenTask = nil
