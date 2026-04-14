@@ -467,6 +467,273 @@ suite "getDate accessor":
       raised = true
     check raised
 
+suite "PgTime":
+  test "$PgTime without microseconds":
+    let t = PgTime(hour: 14, minute: 30, second: 0, microsecond: 0)
+    check $t == "14:30:00"
+
+  test "$PgTime with microseconds":
+    let t = PgTime(hour: 9, minute: 5, second: 3, microsecond: 123456)
+    check $t == "09:05:03.123456"
+
+  test "$PgTime with leading zero microseconds":
+    let t = PgTime(hour: 0, minute: 0, second: 0, microsecond: 100)
+    check $t == "00:00:00.000100"
+
+  test "toPgParam OID and format":
+    let p = toPgParam(PgTime(hour: 10, minute: 20, second: 30))
+    check p.oid == OidTime
+    check p.format == 0
+
+  test "getTime text without microseconds":
+    let row = @[some(toBytes("14:30:00"))]
+    let t = row.getTime(0)
+    check t.hour == 14
+    check t.minute == 30
+    check t.second == 0
+    check t.microsecond == 0
+
+  test "getTime text with microseconds":
+    let row = @[some(toBytes("09:05:03.123456"))]
+    let t = row.getTime(0)
+    check t.hour == 9
+    check t.minute == 5
+    check t.second == 3
+    check t.microsecond == 123456
+
+  test "getTime text with partial microseconds":
+    let row = @[some(toBytes("10:00:00.5"))]
+    let t = row.getTime(0)
+    check t.microsecond == 500000
+
+  test "getTime invalid raises":
+    let row = @[some(toBytes("not-a-time"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime out-of-range hour raises":
+    let row = @[some(toBytes("25:00:00"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime out-of-range minute raises":
+    let row = @[some(toBytes("12:60:00"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime out-of-range second raises":
+    let row = @[some(toBytes("12:00:60"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime NULL raises":
+    let row = @[none(seq[byte])]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime binary roundtrip":
+    let t = PgTime(hour: 14, minute: 30, second: 45, microsecond: 123456)
+    let p = toPgBinaryParam(t)
+    check p.oid == OidTime
+    check p.format == 1
+    let fields = @[mkField(OidTime, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTime(0)
+    check result == t
+
+  test "getTime binary midnight":
+    let t = PgTime(hour: 0, minute: 0, second: 0, microsecond: 0)
+    let p = toPgBinaryParam(t)
+    let fields = @[mkField(OidTime, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTime(0)
+    check result == t
+
+  test "getTimeOpt NULL returns none":
+    let row = @[none(seq[byte])]
+    check row.getTimeOpt(0).isNone
+
+  test "getTimeOpt returns some":
+    let row = @[some(toBytes("10:30:00"))]
+    let opt = row.getTimeOpt(0)
+    check opt.isSome
+    check opt.get().hour == 10
+
+suite "PgTimeTz":
+  test "$PgTimeTz positive offset":
+    let t = PgTimeTz(hour: 14, minute: 30, second: 0, microsecond: 0, utcOffset: 18000)
+    check $t == "14:30:00+05:00"
+
+  test "$PgTimeTz negative offset":
+    let t = PgTimeTz(hour: 14, minute: 30, second: 0, microsecond: 0, utcOffset: -12600)
+    check $t == "14:30:00-03:30"
+
+  test "$PgTimeTz UTC":
+    let t = PgTimeTz(hour: 10, minute: 0, second: 0, microsecond: 0, utcOffset: 0)
+    check $t == "10:00:00+00:00"
+
+  test "$PgTimeTz with microseconds":
+    let t =
+      PgTimeTz(hour: 9, minute: 5, second: 3, microsecond: 123456, utcOffset: 3600)
+    check $t == "09:05:03.123456+01:00"
+
+  test "toPgParam OID":
+    let p = toPgParam(PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: 0))
+    check p.oid == OidTimeTz
+    check p.format == 0
+
+  test "getTimeTz text +HH":
+    let row = @[some(toBytes("14:30:00+05"))]
+    let t = row.getTimeTz(0)
+    check t.hour == 14
+    check t.minute == 30
+    check t.utcOffset == 18000
+
+  test "getTimeTz text -HH:MM":
+    let row = @[some(toBytes("10:00:00.123456-03:30"))]
+    let t = row.getTimeTz(0)
+    check t.hour == 10
+    check t.minute == 0
+    check t.microsecond == 123456
+    check t.utcOffset == -12600
+
+  test "getTimeTz text +HH:MM:SS":
+    let row = @[some(toBytes("12:00:00+05:30:15"))]
+    let t = row.getTimeTz(0)
+    check t.utcOffset == 19815
+
+  test "getTimeTz invalid raises":
+    let row = @[some(toBytes("not-a-time"))]
+    var raised = false
+    try:
+      discard row.getTimeTz(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTimeTz missing offset raises":
+    let row = @[some(toBytes("14:30:00"))]
+    var raised = false
+    try:
+      discard row.getTimeTz(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTimeTz binary roundtrip":
+    let t =
+      PgTimeTz(hour: 14, minute: 30, second: 45, microsecond: 123456, utcOffset: 18000)
+    let p = toPgBinaryParam(t)
+    check p.oid == OidTimeTz
+    check p.format == 1
+    let fields = @[mkField(OidTimeTz, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTimeTz(0)
+    check result == t
+
+  test "getTimeTz binary negative offset":
+    let t = PgTimeTz(hour: 10, minute: 0, second: 0, microsecond: 0, utcOffset: -12600)
+    let p = toPgBinaryParam(t)
+    let fields = @[mkField(OidTimeTz, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTimeTz(0)
+    check result == t
+
+  test "getTimeTzOpt NULL returns none":
+    let row = @[none(seq[byte])]
+    check row.getTimeTzOpt(0).isNone
+
+suite "date parameter encoding":
+  test "toPgDateParam OID and format":
+    let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
+    let p = toPgDateParam(dt)
+    check p.oid == OidDate
+    check p.format == 0
+    check p.value.isSome
+    let s = cast[string](p.value.get())
+    check s == "2024-01-15"
+
+  test "toPgBinaryDateParam roundtrip":
+    let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
+    let p = toPgBinaryDateParam(dt)
+    check p.oid == OidDate
+    check p.format == 1
+    let fields = @[mkField(OidDate, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getDate(0)
+    check result.year == 2024
+    check result.month == mJan
+    check result.monthday == 15
+
+suite "getTimestampTz accessor":
+  test "timestamptz with tz":
+    let row = @[some(toBytes("2024-01-15 10:30:00.000000+05:00"))]
+    let dt = row.getTimestampTz(0)
+    check dt.year == 2024
+    check dt.month == mJan
+    check dt.monthday == 15
+
+  test "timestamptz without fractional seconds":
+    let row = @[some(toBytes("2024-06-20 14:05:30+00:00"))]
+    let dt = row.getTimestampTz(0)
+    check dt.year == 2024
+    # The parsed DateTime is converted to local timezone by Nim's parse(),
+    # so we compare using UTC.
+    check dt.utc().hour == 14
+
+  test "invalid timestamptz raises":
+    let row = @[some(toBytes("not-a-timestamp"))]
+    var raised = false
+    try:
+      discard row.getTimestampTz(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "timestamptz binary roundtrip":
+    let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+    let p = toPgBinaryTimestampTzParam(dt)
+    check p.oid == OidTimestampTz
+    check p.format == 1
+    let fields = @[mkField(OidTimestampTz, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTimestampTz(0)
+    check result.year == 2024
+    check result.month == mJan
+    check result.monthday == 15
+    check result.hour == 10
+    check result.minute == 30
+
+  test "toPgTimestampTzParam OID":
+    let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+    let p = toPgTimestampTzParam(dt)
+    check p.oid == OidTimestampTz
+    check p.format == 0
+
+  test "getTimestampTzOpt NULL returns none":
+    let row = @[none(seq[byte])]
+    check row.getTimestampTzOpt(0).isNone
+
 suite "Binary encode/decode helpers":
   test "int16 roundtrip":
     let p = toPgBinaryParam(42'i16)
