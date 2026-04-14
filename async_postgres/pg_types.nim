@@ -1746,6 +1746,24 @@ proc getInt*(row: Row, col: int): int32 =
     raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
   result = int32(v)
 
+proc getInt16*(row: Row, col: int): int16 =
+  ## Get a column value as int16. Handles binary int2 directly. Raises `PgTypeError` on NULL.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if row.isBinaryCol(col):
+    if clen == 2:
+      let b = row.data.buf
+      return int16((uint16(b[off]) shl 8) or uint16(b[off + 1]))
+    raise newException(
+      PgTypeError,
+      "Column " & $col & ": unexpected binary length " & $clen & " for int16",
+    )
+  var v: int
+  if parseInt(row.bufView(off, clen), v) == 0:
+    raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
+  result = int16(v)
+
 proc getInt64*(row: Row, col: int): int64 =
   ## Get a column value as int64. Handles binary int2/4/8 directly. Raises `PgTypeError` on NULL.
   let (off, clen) = cellInfo(row, col)
@@ -1802,6 +1820,25 @@ proc getFloat*(row: Row, col: int): float64 =
       copyMem(addr f32, addr bits, 4)
       return float64(f32)
   discard parseFloat(row.bufView(off, clen), result)
+
+proc getFloat32*(row: Row, col: int): float32 =
+  ## Get a column value as float32. Handles binary float4 directly. Raises `PgTypeError` on NULL.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if row.isBinaryCol(col):
+    if clen == 4:
+      var bits: uint32
+      let b = row.data.buf
+      bits =
+        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+        (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+      copyMem(addr result, addr bits, 4)
+      return
+  var f: float64
+  if parseFloat(row.bufView(off, clen), f) == 0:
+    raise newException(PgTypeError, "Column " & $col & ": invalid float32 value")
+  result = float32(f)
 
 proc getNumeric*(row: Row, col: int): PgNumeric =
   ## Get a column value as PgNumeric. Handles binary numeric format.
@@ -2582,12 +2619,17 @@ template nameAccessor(getProc: untyped, T: typedesc) =
 
 optAccessor(getStr, getStrOpt, string)
 optAccessor(getInt, getIntOpt, int32)
+optAccessor(getInt16, getInt16Opt, int16)
 optAccessor(getInt64, getInt64Opt, int64)
 optAccessor(getFloat, getFloatOpt, float64)
+optAccessor(getFloat32, getFloat32Opt, float32)
 optAccessor(getNumeric, getNumericOpt, PgNumeric)
 optAccessor(getUuid, getUuidOpt, PgUuid)
 optAccessor(getBool, getBoolOpt, bool)
+optAccessor(getBytes, getBytesOpt, seq[byte])
 optAccessor(getJson, getJsonOpt, JsonNode)
+optAccessor(getTimestamp, getTimestampOpt, DateTime)
+optAccessor(getDate, getDateOpt, DateTime)
 optAccessor(getInterval, getIntervalOpt, PgInterval)
 optAccessor(getInet, getInetOpt, PgInet)
 optAccessor(getCidr, getCidrOpt, PgCidr)
@@ -4521,12 +4563,19 @@ optAccessor(getDateRangeArray, getDateRangeArrayOpt, seq[PgRange[DateTime]])
 # timestamptz, date) making a single `get` overload ambiguous. Use the
 # explicit getters (getTimestamp, getTimestampTz, getDate, etc.) instead.
 
+proc get*(row: Row, col: int, T: typedesc[int16]): int16 =
+  ## Generic typed accessor. Usage: ``row.get(0, int16)``
+  row.getInt16(col)
+
 proc get*(row: Row, col: int, T: typedesc[int32]): int32 =
   ## Generic typed accessor. Usage: ``row.get(0, int32)``
   row.getInt(col)
 
 proc get*(row: Row, col: int, T: typedesc[int64]): int64 =
   row.getInt64(col)
+
+proc get*(row: Row, col: int, T: typedesc[float32]): float32 =
+  row.getFloat32(col)
 
 proc get*(row: Row, col: int, T: typedesc[float64]): float64 =
   row.getFloat(col)
@@ -4569,6 +4618,15 @@ proc get*(row: Row, col: int, T: typedesc[PgTsQuery]): PgTsQuery =
 
 proc get*(row: Row, col: int, T: typedesc[PgXml]): PgXml =
   row.getXml(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgBit]): PgBit =
+  row.getBit(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgHstore]): PgHstore =
+  row.getHstore(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgUuid]): PgUuid =
+  row.getUuid(col)
 
 proc get*(row: Row, col: int, T: typedesc[PgPoint]): PgPoint =
   row.getPoint(col)
@@ -4613,6 +4671,9 @@ proc get*(row: Row, col: int, T: typedesc[seq[bool]]): seq[bool] =
 
 proc get*(row: Row, col: int, T: typedesc[seq[string]]): seq[string] =
   row.getStrArray(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[PgBit]]): seq[PgBit] =
+  row.getBitArray(col)
 
 # Range types (DateTime-based ranges excluded — see note above)
 
