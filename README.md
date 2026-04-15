@@ -61,7 +61,7 @@ Async PostgreSQL client in Nim.
 
 ## Requirements
 
-- Nim >= 2.2.0
+- Nim >= 2.2.4
 
 ## Installation
 
