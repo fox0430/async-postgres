@@ -5109,3 +5109,382 @@ suite "Binary decoder validation":
     ]
     expect PgTypeError:
       discard decodeBinaryTsQuery(data)
+
+suite "Temporal array types":
+  test "toPgTimestampArrayParam roundtrip":
+    let dt1 = dateTime(2023, mJan, 15, 10, 30, 0, zone = utc())
+    let dt2 = dateTime(2024, mJun, 20, 14, 45, 30, zone = utc())
+    let p = toPgTimestampArrayParam(@[dt1, dt2])
+    check p.oid == OidTimestampArray
+    check p.format == 1'i16
+    let fields = @[mkField(OidTimestampArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimestampArray(0)
+    check arr.len == 2
+    check arr[0].year == 2023
+    check arr[1].year == 2024
+
+  test "toPgTimestampArrayParam empty":
+    let p = toPgTimestampArrayParam(newSeq[DateTime]())
+    check p.oid == OidTimestampArray
+    let fields = @[mkField(OidTimestampArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    check row.getTimestampArray(0).len == 0
+
+  test "getTimestampArray text format":
+    let row: Row = @[some(toBytes("{\"2023-01-15 10:30:00\",\"2024-06-20 14:45:30\"}"))]
+    let arr = row.getTimestampArray(0)
+    check arr.len == 2
+    check arr[0].year == 2023
+    check arr[1].month == mJun
+
+  test "getTimestampArrayOpt none":
+    let fields = @[mkField(OidTimestampArray, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getTimestampArrayOpt(0).isNone
+
+  test "toPgTimestampTzArrayParam roundtrip":
+    let dt1 = dateTime(2023, mJan, 15, 10, 30, 0, zone = utc())
+    let p = toPgTimestampTzArrayParam(@[dt1])
+    check p.oid == OidTimestampTzArray
+    let fields = @[mkField(OidTimestampTzArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimestampTzArray(0)
+    check arr.len == 1
+    check arr[0].year == 2023
+
+  test "toPgDateArrayParam roundtrip":
+    let dt1 = dateTime(2023, mMar, 10, zone = utc())
+    let dt2 = dateTime(2024, mDec, 25, zone = utc())
+    let p = toPgDateArrayParam(@[dt1, dt2])
+    check p.oid == OidDateArray
+    let fields = @[mkField(OidDateArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getDateArray(0)
+    check arr.len == 2
+    check arr[0].monthday == 10
+    check arr[1].month == mDec
+
+  test "getDateArray text format":
+    let row: Row = @[some(toBytes("{2023-03-10,2024-12-25}"))]
+    let arr = row.getDateArray(0)
+    check arr.len == 2
+    check arr[0].year == 2023
+
+  test "toPgParam seq[PgTime] roundtrip":
+    let t1 = PgTime(hour: 10, minute: 30, second: 0, microsecond: 0)
+    let t2 = PgTime(hour: 23, minute: 59, second: 59, microsecond: 123456)
+    let p = toPgParam(@[t1, t2])
+    check p.oid == OidTimeArray
+    let fields = @[mkField(OidTimeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimeArray(0)
+    check arr.len == 2
+    check arr[0] == t1
+    check arr[1] == t2
+
+  test "getTimeArray text format":
+    let row: Row = @[some(toBytes("{10:30:00,23:59:59.123456}"))]
+    let arr = row.getTimeArray(0)
+    check arr.len == 2
+    check arr[0].hour == 10
+    check arr[1].microsecond == 123456
+
+  test "toPgParam seq[PgTimeTz] roundtrip":
+    let t1 = PgTimeTz(hour: 10, minute: 30, second: 0, microsecond: 0, utcOffset: 3600)
+    let t2 =
+      PgTimeTz(hour: 23, minute: 59, second: 59, microsecond: 0, utcOffset: -18000)
+    let p = toPgParam(@[t1, t2])
+    check p.oid == OidTimeTzArray
+    let fields = @[mkField(OidTimeTzArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimeTzArray(0)
+    check arr.len == 2
+    check arr[0] == t1
+    check arr[1] == t2
+
+  test "getTimeTzArray text format":
+    let row: Row = @[some(toBytes("{10:30:00+01,23:59:59-05}"))]
+    let arr = row.getTimeTzArray(0)
+    check arr.len == 2
+    check arr[0].utcOffset == 3600
+    check arr[1].utcOffset == -18000
+
+  test "toPgParam seq[PgInterval] roundtrip":
+    let iv1 = PgInterval(months: 2, days: 3, microseconds: 3600000000)
+    let iv2 = PgInterval(months: 0, days: 0, microseconds: 1000000)
+    let p = toPgParam(@[iv1, iv2])
+    check p.oid == OidIntervalArray
+    let fields = @[mkField(OidIntervalArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getIntervalArray(0)
+    check arr.len == 2
+    check arr[0] == iv1
+    check arr[1] == iv2
+
+suite "Identifier / network array types":
+  test "toPgParam seq[PgUuid] roundtrip":
+    let u1 = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+    let u2 = PgUuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+    let p = toPgParam(@[u1, u2])
+    check p.oid == OidUuidArray
+    let fields = @[mkField(OidUuidArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getUuidArray(0)
+    check arr.len == 2
+    check arr[0] == u1
+    check arr[1] == u2
+
+  test "getUuidArray text format":
+    let row: Row = @[
+      some(
+        toBytes(
+          "{550e8400-e29b-41d4-a716-446655440000,6ba7b810-9dad-11d1-80b4-00c04fd430c8}"
+        )
+      )
+    ]
+    let arr = row.getUuidArray(0)
+    check arr.len == 2
+    check arr[0] == PgUuid("550e8400-e29b-41d4-a716-446655440000")
+
+  test "getUuidArrayOpt none":
+    let fields = @[mkField(OidUuidArray, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getUuidArrayOpt(0).isNone
+
+  test "toPgParam seq[PgInet] roundtrip":
+    let i1 = PgInet(address: parseIpAddress("192.168.1.1"), mask: 32)
+    let i2 = PgInet(address: parseIpAddress("10.0.0.0"), mask: 8)
+    let p = toPgParam(@[i1, i2])
+    check p.oid == OidInetArray
+    let fields = @[mkField(OidInetArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getInetArray(0)
+    check arr.len == 2
+    check $arr[0].address == "192.168.1.1"
+    check arr[1].mask == 8
+
+  test "toPgParam seq[PgMacAddr] roundtrip":
+    let m1 = PgMacAddr("08:00:2b:01:02:03")
+    let m2 = PgMacAddr("aa:bb:cc:dd:ee:ff")
+    let p = toPgParam(@[m1, m2])
+    check p.oid == OidMacAddrArray
+    let fields = @[mkField(OidMacAddrArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getMacAddrArray(0)
+    check arr.len == 2
+    check arr[0] == m1
+    check arr[1] == m2
+
+  test "getMacAddrArray text format":
+    let row: Row = @[some(toBytes("{08:00:2b:01:02:03,aa:bb:cc:dd:ee:ff}"))]
+    let arr = row.getMacAddrArray(0)
+    check arr.len == 2
+    check arr[0] == PgMacAddr("08:00:2b:01:02:03")
+
+  test "toPgParam seq[PgMacAddr8] roundtrip":
+    let m1 = PgMacAddr8("08:00:2b:01:02:03:04:05")
+    let p = toPgParam(@[m1])
+    check p.oid == OidMacAddr8Array
+    let fields = @[mkField(OidMacAddr8Array, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getMacAddr8Array(0)
+    check arr.len == 1
+    check arr[0] == m1
+
+suite "Numeric / binary / JSON array types":
+  test "toPgParam seq[PgNumeric] roundtrip":
+    let n1 = parsePgNumeric("123.45")
+    let n2 = parsePgNumeric("0.001")
+    let p = toPgParam(@[n1, n2])
+    check p.oid == OidNumericArray
+    let fields = @[mkField(OidNumericArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getNumericArray(0)
+    check arr.len == 2
+    check $arr[0] == "123.45"
+    check $arr[1] == "0.001"
+
+  test "getNumericArray text format":
+    let row: Row = @[some(toBytes("{123.45,0.001}"))]
+    let arr = row.getNumericArray(0)
+    check arr.len == 2
+    check $arr[0] == "123.45"
+
+  test "toPgByteaArrayParam roundtrip":
+    let b1 = @[1'u8, 2, 3]
+    let b2 = @[0xFF'u8, 0x00]
+    let p = toPgByteaArrayParam(@[b1, b2])
+    check p.oid == OidByteaArray
+    let fields = @[mkField(OidByteaArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getBytesArray(0)
+    check arr.len == 2
+    check arr[0] == b1
+    check arr[1] == b2
+
+  test "toPgByteaArrayParam empty":
+    let p = toPgByteaArrayParam(newSeq[seq[byte]]())
+    check p.oid == OidByteaArray
+    let fields = @[mkField(OidByteaArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    check row.getBytesArray(0).len == 0
+
+  test "toPgParam seq[JsonNode] roundtrip":
+    let j1 = %*{"key": "value"}
+    let j2 = %*[1, 2, 3]
+    let p = toPgParam(@[j1, j2])
+    check p.oid == OidJsonbArray
+    let fields = @[mkField(OidJsonbArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getJsonArray(0)
+    check arr.len == 2
+    check arr[0]["key"].getStr == "value"
+    check arr[1].len == 3
+
+  test "getJsonArray text format":
+    let row: Row = @[some(toBytes("""{"{\"a\":1}","{\"b\":2}"}"""))]
+    let arr = row.getJsonArray(0)
+    check arr.len == 2
+    check arr[0]["a"].getInt == 1
+
+suite "Geometric array types":
+  test "toPgParam seq[PgPoint] roundtrip":
+    let p1 = PgPoint(x: 1.0, y: 2.0)
+    let p2 = PgPoint(x: 3.0, y: 4.0)
+    let p = toPgParam(@[p1, p2])
+    check p.oid == OidPointArray
+    let fields = @[mkField(OidPointArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getPointArray(0)
+    check arr.len == 2
+    check arr[0] == p1
+    check arr[1] == p2
+
+  test "getPointArray text format":
+    let row: Row = @[some(toBytes("{\"(1,2)\",\"(3,4)\"}"))]
+    let arr = row.getPointArray(0)
+    check arr.len == 2
+    check arr[0].x == 1.0
+
+  test "toPgParam seq[PgCircle] roundtrip":
+    let c1 = PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0)
+    let p = toPgParam(@[c1])
+    check p.oid == OidCircleArray
+    let fields = @[mkField(OidCircleArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getCircleArray(0)
+    check arr.len == 1
+    check arr[0].center.x == 1.0
+    check arr[0].radius == 5.0
+
+  test "toPgParam seq[PgLseg] roundtrip":
+    let l1 = PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 1.0, y: 1.0))
+    let p = toPgParam(@[l1])
+    check p.oid == OidLsegArray
+    let fields = @[mkField(OidLsegArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getLsegArray(0)
+    check arr.len == 1
+    check arr[0].p1.x == 0.0
+    check arr[0].p2.y == 1.0
+
+  test "toPgParam seq[PgBox] roundtrip":
+    let b1 = PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+    let p = toPgParam(@[b1])
+    check p.oid == OidBoxArray
+    let fields = @[mkField(OidBoxArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getBoxArray(0)
+    check arr.len == 1
+    check arr[0].high.x == 3.0
+    check arr[0].low.y == 2.0
+
+  test "toPgParam seq[PgLine] roundtrip":
+    let l1 = PgLine(a: 1.0, b: 2.0, c: 3.0)
+    let p = toPgParam(@[l1])
+    check p.oid == OidLineArray
+    let fields = @[mkField(OidLineArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getLineArray(0)
+    check arr.len == 1
+    check arr[0].a == 1.0
+    check arr[0].b == 2.0
+
+suite "Other array types":
+  test "toPgParam seq[PgXml] roundtrip":
+    let x1 = PgXml("<root/>")
+    let x2 = PgXml("<data>hello</data>")
+    let p = toPgParam(@[x1, x2])
+    check p.oid == OidXmlArray
+    let fields = @[mkField(OidXmlArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getXmlArray(0)
+    check arr.len == 2
+    check string(arr[0]) == "<root/>"
+    check string(arr[1]) == "<data>hello</data>"
+
+  test "getXmlArray text format":
+    let row: Row = @[some(toBytes("{\"<root/>\",\"<data>hello</data>\"}"))]
+    let arr = row.getXmlArray(0)
+    check arr.len == 2
+    check string(arr[0]) == "<root/>"
+
+  test "toPgParam seq[PgTsVector] roundtrip":
+    let tv1 = PgTsVector("'hello':1 'world':2")
+    let p = toPgParam(@[tv1])
+    check p.oid == OidTsVectorArray
+    let fields = @[mkField(OidTsVectorArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTsVectorArray(0)
+    check arr.len == 1
+
+  test "toPgParam seq[PgTsQuery] roundtrip":
+    let tq1 = PgTsQuery("hello & world")
+    let p = toPgParam(@[tq1])
+    check p.oid == OidTsQueryArray
+    let fields = @[mkField(OidTsQueryArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTsQueryArray(0)
+    check arr.len == 1
+
+suite "Multirange array types":
+  test "toPgParam seq[PgMultirange[int32]] text roundtrip":
+    let mr1 = toMultirange(rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32))
+    let mr2 = toMultirange(rangeOf(100'i32, 200'i32))
+    let p = toPgParam(@[mr1, mr2])
+    check p.oid == OidInt4MultirangeArray
+    check p.format == 0'i16
+    # Text format roundtrip
+    let row: Row = @[p.value]
+    let arr = row.getInt4MultirangeArray(0)
+    check arr.len == 2
+    check seq[PgRange[int32]](arr[0]).len == 2
+    check seq[PgRange[int32]](arr[1]).len == 1
+
+  test "toPgParam seq[PgMultirange[int32]] empty":
+    let p = toPgParam(newSeq[PgMultirange[int32]]())
+    check p.oid == OidInt4MultirangeArray
+    let row: Row = @[p.value]
+    check row.getInt4MultirangeArray(0).len == 0
+
+  test "getInt4MultirangeArrayOpt none":
+    let fields = @[mkField(OidInt4MultirangeArray, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getInt4MultirangeArrayOpt(0).isNone
+
+  test "toPgParam seq[PgMultirange[int64]] text roundtrip":
+    let mr1 = toMultirange(rangeOf(100'i64, 200'i64))
+    let p = toPgParam(@[mr1])
+    check p.oid == OidInt8MultirangeArray
+    let row: Row = @[p.value]
+    let arr = row.getInt8MultirangeArray(0)
+    check arr.len == 1
+
+  test "toPgParam seq[PgMultirange[PgNumeric]] text roundtrip":
+    let mr1 = toMultirange(rangeOf(parsePgNumeric("1.5"), parsePgNumeric("3.5")))
+    let p = toPgParam(@[mr1])
+    check p.oid == OidNumMultirangeArray
+    let row: Row = @[p.value]
+    let arr = row.getNumMultirangeArray(0)
+    check arr.len == 1

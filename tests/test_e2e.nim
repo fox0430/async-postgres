@@ -1,7 +1,9 @@
 import
-  std/[unittest, options, strutils, tables, os, math, deques, sets, importutils, net]
+  std/[
+    unittest, options, strutils, tables, os, math, deques, sets, importutils, net, json
+  ]
 from std/times import
-  DateTime, dateTime, mMar, mJun, mJan, utc, year, month, monthday, hour, minute,
+  DateTime, dateTime, mMar, mJun, mJan, mDec, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
 
 import ../async_postgres/[async_backend, pg_protocol, pg_types, pg_replication]
@@ -7784,6 +7786,328 @@ suite "E2E: Multirange Types":
       let res = await conn.query("SELECT NULL::int4multirange")
       doAssert res.rows.len == 1
       doAssert res.rows[0].getInt4MultirangeOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Temporal array types":
+  test "timestamp array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt1 = dateTime(2023, mJan, 15, 10, 30, 0, zone = utc())
+      let dt2 = dateTime(2024, mJun, 20, 14, 45, 30, zone = utc())
+      let res = await conn.query(
+        "SELECT $1::timestamp[]", @[toPgTimestampArrayParam(@[dt1, dt2])]
+      )
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getTimestampArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0].year == 2023
+      doAssert arr[1].year == 2024
+      await conn.close()
+
+    waitFor t()
+
+  test "empty timestamp array":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query(
+        "SELECT $1::timestamp[]", @[toPgTimestampArrayParam(newSeq[DateTime]())]
+      )
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getTimestampArray(0).len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL timestamp array":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::timestamp[]")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getTimestampArrayOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "date array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt1 = dateTime(2023, mMar, 10, zone = utc())
+      let dt2 = dateTime(2024, mDec, 25, zone = utc())
+      let res =
+        await conn.query("SELECT $1::date[]", @[toPgDateArrayParam(@[dt1, dt2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getDateArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0].monthday == 10
+      doAssert arr[1].month == mDec
+      await conn.close()
+
+    waitFor t()
+
+  test "time array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let t1 = PgTime(hour: 10, minute: 30, second: 0, microsecond: 0)
+      let t2 = PgTime(hour: 23, minute: 59, second: 59, microsecond: 123456)
+      let res = await conn.query("SELECT $1::time[]", @[toPgParam(@[t1, t2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getTimeArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == t1
+      doAssert arr[1] == t2
+      await conn.close()
+
+    waitFor t()
+
+  test "timetz array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let t1 =
+        PgTimeTz(hour: 10, minute: 30, second: 0, microsecond: 0, utcOffset: 3600)
+      let t2 =
+        PgTimeTz(hour: 23, minute: 59, second: 59, microsecond: 0, utcOffset: -18000)
+      let res = await conn.query("SELECT $1::timetz[]", @[toPgParam(@[t1, t2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getTimeTzArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == t1
+      doAssert arr[1] == t2
+      await conn.close()
+
+    waitFor t()
+
+  test "interval array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let iv1 = PgInterval(months: 2, days: 3, microseconds: 3600000000)
+      let iv2 = PgInterval(months: 0, days: 0, microseconds: 1000000)
+      let res = await conn.query("SELECT $1::interval[]", @[toPgParam(@[iv1, iv2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getIntervalArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == iv1
+      doAssert arr[1] == iv2
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Identifier / network array types":
+  test "uuid array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let u1 = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+      let u2 = PgUuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+      let res = await conn.query("SELECT $1::uuid[]", @[toPgParam(@[u1, u2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getUuidArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == u1
+      doAssert arr[1] == u2
+      await conn.close()
+
+    waitFor t()
+
+  test "inet array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let i1 = PgInet(address: parseIpAddress("192.168.1.1"), mask: 32)
+      let i2 = PgInet(address: parseIpAddress("10.0.0.0"), mask: 8)
+      let res = await conn.query("SELECT $1::inet[]", @[toPgParam(@[i1, i2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getInetArray(0)
+      doAssert arr.len == 2
+      doAssert $arr[0].address == "192.168.1.1"
+      doAssert arr[1].mask == 8
+      await conn.close()
+
+    waitFor t()
+
+  test "cidr array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let c1 = PgCidr(address: parseIpAddress("192.168.1.0"), mask: 24)
+      let c2 = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+      let res = await conn.query("SELECT $1::cidr[]", @[toPgParam(@[c1, c2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getCidrArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0].mask == 24
+      doAssert arr[1].mask == 8
+      await conn.close()
+
+    waitFor t()
+
+  test "macaddr array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let m1 = PgMacAddr("08:00:2b:01:02:03")
+      let m2 = PgMacAddr("aa:bb:cc:dd:ee:ff")
+      let res = await conn.query("SELECT $1::macaddr[]", @[toPgParam(@[m1, m2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getMacAddrArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == m1
+      doAssert arr[1] == m2
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Numeric / binary / JSON array types":
+  test "numeric array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let n1 = parsePgNumeric("123.45")
+      let n2 = parsePgNumeric("0.001")
+      let res = await conn.query("SELECT $1::numeric[]", @[toPgParam(@[n1, n2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getNumericArray(0)
+      doAssert arr.len == 2
+      doAssert $arr[0] == "123.45"
+      doAssert $arr[1] == "0.001"
+      await conn.close()
+
+    waitFor t()
+
+  test "bytea array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let b1 = @[1'u8, 2, 3]
+      let b2 = @[0xFF'u8, 0x00]
+      let res =
+        await conn.query("SELECT $1::bytea[]", @[toPgByteaArrayParam(@[b1, b2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getBytesArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == b1
+      doAssert arr[1] == b2
+      await conn.close()
+
+    waitFor t()
+
+  test "jsonb array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let j1 = %*{"key": "value"}
+      let j2 = %*[1, 2, 3]
+      let res = await conn.query("SELECT $1::jsonb[]", @[toPgParam(@[j1, j2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getJsonArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0]["key"].getStr == "value"
+      doAssert arr[1].len == 3
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Geometric array types":
+  test "point array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p1 = PgPoint(x: 1.0, y: 2.0)
+      let p2 = PgPoint(x: 3.5, y: 4.5)
+      let res = await conn.query("SELECT $1::point[]", @[toPgParam(@[p1, p2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getPointArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == p1
+      doAssert arr[1] == p2
+      await conn.close()
+
+    waitFor t()
+
+  test "circle array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let c1 = PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0)
+      let res = await conn.query("SELECT $1::circle[]", @[toPgParam(@[c1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getCircleArray(0)
+      doAssert arr.len == 1
+      doAssert arr[0].center.x == 1.0
+      doAssert arr[0].radius == 5.0
+      await conn.close()
+
+    waitFor t()
+
+  test "box array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let b1 = PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+      let res = await conn.query("SELECT $1::box[]", @[toPgParam(@[b1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getBoxArray(0)
+      doAssert arr.len == 1
+      doAssert arr[0].high.x == 3.0
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Other array types":
+  test "xml array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let x1 = PgXml("<root/>")
+      let x2 = PgXml("<data>hello</data>")
+      let res = await conn.query("SELECT $1::xml[]", @[toPgParam(@[x1, x2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getXmlArray(0)
+      doAssert arr.len == 2
+      doAssert string(arr[0]) == "<root/>"
+      doAssert string(arr[1]) == "<data>hello</data>"
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Multirange array types":
+  test "int4multirange array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let mr1 = toMultirange(rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32))
+      let mr2 = toMultirange(rangeOf(100'i32, 200'i32))
+      let res =
+        await conn.query("SELECT $1::int4multirange[]", @[toPgParam(@[mr1, mr2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getInt4MultirangeArray(0)
+      doAssert arr.len == 2
+      doAssert seq[PgRange[int32]](arr[0]).len == 2
+      doAssert seq[PgRange[int32]](arr[1]).len == 1
+      doAssert seq[PgRange[int32]](arr[0])[0].lower.value == 1'i32
+      await conn.close()
+
+    waitFor t()
+
+  test "int8multirange array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let mr1 = toMultirange(rangeOf(100'i64, 200'i64))
+      let res = await conn.query("SELECT $1::int8multirange[]", @[toPgParam(@[mr1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getInt8MultirangeArray(0)
+      doAssert arr.len == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "nummultirange array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let mr1 = toMultirange(rangeOf(parsePgNumeric("1.5"), parsePgNumeric("3.5")))
+      let res = await conn.query("SELECT $1::nummultirange[]", @[toPgParam(@[mr1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getNumMultirangeArray(0)
+      doAssert arr.len == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL multirange array":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4multirange[]")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt4MultirangeArrayOpt(0).isNone
       await conn.close()
 
     waitFor t()
