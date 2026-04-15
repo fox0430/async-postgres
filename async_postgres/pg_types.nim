@@ -2426,21 +2426,7 @@ proc getTimestampTz*(row: Row, col: int): DateTime =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
-<<<<<<< Updated upstream
-  const formats = [
-    "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
-    "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
-    "yyyy-MM-dd HH:mm:ss",
-  ]
-  for fmt in formats:
-    try:
-      return parse(s, fmt)
-    except TimeParseError, IndexDefect:
-      discard
-  raise newException(PgTypeError, "Invalid timestamptz: " & s)
-=======
   return parseTimestampText(s)
->>>>>>> Stashed changes
 
 proc parseTimeText(s: string): PgTime =
   ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".
