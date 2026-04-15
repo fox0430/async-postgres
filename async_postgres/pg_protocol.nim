@@ -174,25 +174,69 @@ const
     21, # int2 / smallint
     23, # int4 / integer
     25, # text
+    114, # json
+    142, # xml
+    143, # xml[]
     600, # point
     601, # lseg
     602, # path
     603, # box
     604, # polygon
     628, # line
+    629, # line[]
+    650, # cidr
+    651, # cidr[]
     700, # float4
     701, # float8
     718, # circle
+    719, # circle[]
+    774, # macaddr8
+    775, # macaddr8[]
+    829, # macaddr
+    869, # inet
+    1000, # bool[]
+    1001, # bytea[]
+    1005, # int2[]
+    1007, # int4[]
+    1009, # text[]
+    1015, # varchar[]
+    1016, # int8[]
+    1017, # point[]
+    1018, # lseg[]
+    1019, # path[]
+    1020, # box[]
+    1021, # float4[]
+    1022, # float8[]
+    1027, # polygon[]
+    1040, # macaddr[]
+    1041, # inet[]
     1043, # varchar
     1082, # date
     1083, # time
     1114, # timestamp
+    1115, # timestamp[]
+    1182, # date[]
+    1183, # time[]
     1184, # timestamptz
+    1185, # timestamptz[]
+    1186, # interval
+    1187, # interval[]
+    1231, # numeric[]
     1266, # timetz
+    1270, # timetz[]
     1560, # bit
     1561, # bit[]
     1562, # varbit
     1563, # varbit[]
+    1700, # numeric
+    2950, # uuid
+    2951, # uuid[]
+    3614, # tsvector
+    3615, # tsquery
+    3643, # tsvector[]
+    3645, # tsquery[]
+    3802, # jsonb
+    3807, # jsonb[]
     3904, # int4range
     3905, # int4range[]
     3906, # numrange
@@ -211,9 +255,15 @@ const
     4534, # tstzmultirange
     4535, # datemultirange
     4536, # int8multirange
+    6150, # int4multirange[]
+    6151, # nummultirange[]
+    6152, # tsmultirange[]
+    6153, # tstzmultirange[]
+    6155, # datemultirange[]
+    6157, # int8multirange[]
   ]
 
-  BinarySafeMaxOid = 4536
+  BinarySafeMaxOid = 6157
 
   pgCopyBinaryHeader*: array[19, byte] = [
     ## PGCOPY binary format header (signature + flags + extension length).
