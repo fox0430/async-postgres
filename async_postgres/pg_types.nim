@@ -1276,109 +1276,27 @@ proc toPgDateArrayParam*(v: seq[DateTime]): PgParam =
     oid: OidDateArray, format: 1, value: some(encodeBinaryArray(OidDate, elements))
   )
 
-proc toPgParam*(v: seq[PgTime]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidTimeArray, format: 1, value: some(encodeBinaryArrayEmpty(OidTime))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidTimeArray, format: 1, value: some(encodeBinaryArray(OidTime, elements))
-  )
+template genArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
+  proc toPgParam*(v: seq[T]): PgParam =
+    if v.len == 0:
+      return
+        PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArrayEmpty(elemOid)))
+    var elements = newSeq[seq[byte]](v.len)
+    for i, x in v:
+      elements[i] = toPgBinaryParam(x).value.get
+    PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArray(elemOid, elements)))
 
-proc toPgParam*(v: seq[PgTimeTz]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidTimeTzArray, format: 1, value: some(encodeBinaryArrayEmpty(OidTimeTz))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidTimeTzArray, format: 1, value: some(encodeBinaryArray(OidTimeTz, elements))
-  )
-
-proc toPgParam*(v: seq[PgInterval]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidIntervalArray, format: 1, value: some(encodeBinaryArrayEmpty(OidInterval))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidIntervalArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidInterval, elements)),
-  )
+genArrayEncoder(PgTime, OidTimeArray, OidTime)
+genArrayEncoder(PgTimeTz, OidTimeTzArray, OidTimeTz)
+genArrayEncoder(PgInterval, OidIntervalArray, OidInterval)
 
 # --- Identifier / network array encoders ---
 
-proc toPgParam*(v: seq[PgUuid]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidUuidArray, format: 1, value: some(encodeBinaryArrayEmpty(OidUuid))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidUuidArray, format: 1, value: some(encodeBinaryArray(OidUuid, elements))
-  )
-
-proc toPgParam*(v: seq[PgInet]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidInetArray, format: 1, value: some(encodeBinaryArrayEmpty(OidInet))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidInetArray, format: 1, value: some(encodeBinaryArray(OidInet, elements))
-  )
-
-proc toPgParam*(v: seq[PgCidr]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidCidrArray, format: 1, value: some(encodeBinaryArrayEmpty(OidCidr))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidCidrArray, format: 1, value: some(encodeBinaryArray(OidCidr, elements))
-  )
-
-proc toPgParam*(v: seq[PgMacAddr]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidMacAddrArray, format: 1, value: some(encodeBinaryArrayEmpty(OidMacAddr))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidMacAddrArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidMacAddr, elements)),
-  )
-
-proc toPgParam*(v: seq[PgMacAddr8]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidMacAddr8Array, format: 1, value: some(encodeBinaryArrayEmpty(OidMacAddr8))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidMacAddr8Array,
-    format: 1,
-    value: some(encodeBinaryArray(OidMacAddr8, elements)),
-  )
+genArrayEncoder(PgUuid, OidUuidArray, OidUuid)
+genArrayEncoder(PgInet, OidInetArray, OidInet)
+genArrayEncoder(PgCidr, OidCidrArray, OidCidr)
+genArrayEncoder(PgMacAddr, OidMacAddrArray, OidMacAddr)
+genArrayEncoder(PgMacAddr8, OidMacAddr8Array, OidMacAddr8)
 
 # --- Numeric / binary / JSON array encoders ---
 
@@ -1501,127 +1419,29 @@ proc toPgBinaryParam*(v: JsonNode): PgParam =
 
 # --- Geometric array encoders ---
 
-proc toPgParam*(v: seq[PgPoint]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidPointArray, format: 1, value: some(encodeBinaryArrayEmpty(OidPoint))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidPointArray, format: 1, value: some(encodeBinaryArray(OidPoint, elements))
-  )
-
-proc toPgParam*(v: seq[PgLine]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidLineArray, format: 1, value: some(encodeBinaryArrayEmpty(OidLine))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidLineArray, format: 1, value: some(encodeBinaryArray(OidLine, elements))
-  )
-
-proc toPgParam*(v: seq[PgLseg]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidLsegArray, format: 1, value: some(encodeBinaryArrayEmpty(OidLseg))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidLsegArray, format: 1, value: some(encodeBinaryArray(OidLseg, elements))
-  )
-
-proc toPgParam*(v: seq[PgBox]): PgParam =
-  if v.len == 0:
-    return
-      PgParam(oid: OidBoxArray, format: 1, value: some(encodeBinaryArrayEmpty(OidBox)))
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(oid: OidBoxArray, format: 1, value: some(encodeBinaryArray(OidBox, elements)))
-
-proc toPgParam*(v: seq[PgPath]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidPathArray, format: 1, value: some(encodeBinaryArrayEmpty(OidPath))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidPathArray, format: 1, value: some(encodeBinaryArray(OidPath, elements))
-  )
-
-proc toPgParam*(v: seq[PgPolygon]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidPolygonArray, format: 1, value: some(encodeBinaryArrayEmpty(OidPolygon))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidPolygonArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidPolygon, elements)),
-  )
-
-proc toPgParam*(v: seq[PgCircle]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidCircleArray, format: 1, value: some(encodeBinaryArrayEmpty(OidCircle))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toPgBinaryParam(x).value.get
-  PgParam(
-    oid: OidCircleArray, format: 1, value: some(encodeBinaryArray(OidCircle, elements))
-  )
+genArrayEncoder(PgPoint, OidPointArray, OidPoint)
+genArrayEncoder(PgLine, OidLineArray, OidLine)
+genArrayEncoder(PgLseg, OidLsegArray, OidLseg)
+genArrayEncoder(PgBox, OidBoxArray, OidBox)
+genArrayEncoder(PgPath, OidPathArray, OidPath)
+genArrayEncoder(PgPolygon, OidPolygonArray, OidPolygon)
+genArrayEncoder(PgCircle, OidCircleArray, OidCircle)
 
 # --- Other array encoders ---
 
-proc toPgParam*(v: seq[PgXml]): PgParam =
-  if v.len == 0:
-    return
-      PgParam(oid: OidXmlArray, format: 1, value: some(encodeBinaryArrayEmpty(OidXml)))
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toBytes(string(x))
-  PgParam(oid: OidXmlArray, format: 1, value: some(encodeBinaryArray(OidXml, elements)))
+template genStringArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
+  proc toPgParam*(v: seq[T]): PgParam =
+    if v.len == 0:
+      return
+        PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArrayEmpty(elemOid)))
+    var elements = newSeq[seq[byte]](v.len)
+    for i, x in v:
+      elements[i] = toBytes(string(x))
+    PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArray(elemOid, elements)))
 
-proc toPgParam*(v: seq[PgTsVector]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidTsVectorArray, format: 1, value: some(encodeBinaryArrayEmpty(OidTsVector))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toBytes(string(x))
-  PgParam(
-    oid: OidTsVectorArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidTsVector, elements)),
-  )
-
-proc toPgParam*(v: seq[PgTsQuery]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidTsQueryArray, format: 1, value: some(encodeBinaryArrayEmpty(OidTsQuery))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = toBytes(string(x))
-  PgParam(
-    oid: OidTsQueryArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidTsQuery, elements)),
-  )
+genStringArrayEncoder(PgXml, OidXmlArray, OidXml)
+genStringArrayEncoder(PgTsVector, OidTsVectorArray, OidTsVector)
+genStringArrayEncoder(PgTsQuery, OidTsQueryArray, OidTsQuery)
 
 proc toPgBinaryParam*[T](v: seq[T]): PgParam =
   toPgParam(v)
@@ -3420,45 +3240,29 @@ proc getBitArray*(row: Row, col: int): seq[PgBit] =
 
 # --- Temporal array decoders ---
 
-proc getTimestampArray*(row: Row, col: int): seq[DateTime] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[DateTime](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in timestamp array")
-      result[i] =
-        decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in timestamp array")
-    result.add(parseTimestampText(e.get))
+template genTimestampArrayDecoder(getProc: untyped, typeName: static string) =
+  proc getProc*(row: Row, col: int): seq[DateTime] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      result = newSeq[DateTime](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in " & typeName & " array")
+        result[i] =
+          decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7))
+      return
+    let s = row.getStr(col)
+    let elems = parseTextArray(s)
+    for e in elems:
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in " & typeName & " array")
+      result.add(parseTimestampText(e.get))
 
-proc getTimestampTzArray*(row: Row, col: int): seq[DateTime] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[DateTime](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in timestamptz array")
-      result[i] =
-        decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in timestamptz array")
-    result.add(parseTimestampText(e.get))
+genTimestampArrayDecoder(getTimestampArray, "timestamp")
+genTimestampArrayDecoder(getTimestampTzArray, "timestamptz")
 
 proc getDateArray*(row: Row, col: int): seq[DateTime] =
   if row.isBinaryCol(col):
@@ -3584,99 +3388,64 @@ proc getUuidArray*(row: Row, col: int): seq[PgUuid] =
       raise newException(PgTypeError, "NULL element in uuid array")
     result.add(PgUuid(e.get))
 
-proc getInetArray*(row: Row, col: int): seq[PgInet] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgInet](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in inet array")
-      let (ip, mask) =
-        decodeInetBinary(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-      result[i] = PgInet(address: ip, mask: mask)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in inet array")
-    let (ip, mask) = parseInetText(e.get)
-    result.add(PgInet(address: ip, mask: mask))
+template genInetArrayDecoder(getProc: untyped, T: typedesc, typeName: static string) =
+  proc getProc*(row: Row, col: int): seq[T] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      result = newSeq[T](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in " & typeName & " array")
+        let (ip, mask) = decodeInetBinary(
+          row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+        )
+        result[i] = T(address: ip, mask: mask)
+      return
+    let s = row.getStr(col)
+    let elems = parseTextArray(s)
+    for e in elems:
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in " & typeName & " array")
+      let (ip, mask) = parseInetText(e.get)
+      result.add(T(address: ip, mask: mask))
 
-proc getCidrArray*(row: Row, col: int): seq[PgCidr] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgCidr](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in cidr array")
-      let (ip, mask) =
-        decodeInetBinary(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-      result[i] = PgCidr(address: ip, mask: mask)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in cidr array")
-    let (ip, mask) = parseInetText(e.get)
-    result.add(PgCidr(address: ip, mask: mask))
+genInetArrayDecoder(getInetArray, PgInet, "inet")
+genInetArrayDecoder(getCidrArray, PgCidr, "cidr")
 
-proc getMacAddrArray*(row: Row, col: int): seq[PgMacAddr] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgMacAddr](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in macaddr array")
-      if e.len != 6:
-        raise
-          newException(PgTypeError, "Invalid binary macaddr element length: " & $e.len)
-      var parts = newSeq[string](6)
-      for j in 0 ..< 6:
-        parts[j] = toHex(row.data.buf[off + e.off + j], 2).toLowerAscii()
-      result[i] = PgMacAddr(parts.join(":"))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in macaddr array")
-    result.add(PgMacAddr(e.get))
+template genMacAddrArrayDecoder(
+    getProc: untyped, T: typedesc, nBytes: static int, typeName: static string
+) =
+  proc getProc*(row: Row, col: int): seq[T] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      result = newSeq[T](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in " & typeName & " array")
+        if e.len != nBytes:
+          raise newException(
+            PgTypeError, "Invalid binary " & typeName & " element length: " & $e.len
+          )
+        var parts = newSeq[string](nBytes)
+        for j in 0 ..< nBytes:
+          parts[j] = toHex(row.data.buf[off + e.off + j], 2).toLowerAscii()
+        result[i] = T(parts.join(":"))
+      return
+    let s = row.getStr(col)
+    let elems = parseTextArray(s)
+    for e in elems:
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in " & typeName & " array")
+      result.add(T(e.get))
 
-proc getMacAddr8Array*(row: Row, col: int): seq[PgMacAddr8] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgMacAddr8](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in macaddr8 array")
-      if e.len != 8:
-        raise
-          newException(PgTypeError, "Invalid binary macaddr8 element length: " & $e.len)
-      var parts = newSeq[string](8)
-      for j in 0 ..< 8:
-        parts[j] = toHex(row.data.buf[off + e.off + j], 2).toLowerAscii()
-      result[i] = PgMacAddr8(parts.join(":"))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in macaddr8 array")
-    result.add(PgMacAddr8(e.get))
+genMacAddrArrayDecoder(getMacAddrArray, PgMacAddr, 6, "macaddr")
+genMacAddrArrayDecoder(getMacAddr8Array, PgMacAddr8, 8, "macaddr8")
 
 # --- Numeric / binary / JSON array decoders ---
 
@@ -3983,71 +3752,32 @@ proc getCircleArray*(row: Row, col: int): seq[PgCircle] =
 
 # --- Other array decoders ---
 
-proc getXmlArray*(row: Row, col: int): seq[PgXml] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgXml](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in xml array")
-      var s = newString(e.len)
-      if e.len > 0:
-        copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
-      result[i] = PgXml(s)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in xml array")
-    result.add(PgXml(e.get))
+template genStringArrayDecoder(getProc: untyped, T: typedesc, typeName: static string) =
+  proc getProc*(row: Row, col: int): seq[T] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      result = newSeq[T](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in " & typeName & " array")
+        var s = newString(e.len)
+        if e.len > 0:
+          copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+        result[i] = T(s)
+      return
+    let s = row.getStr(col)
+    let elems = parseTextArray(s)
+    for e in elems:
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in " & typeName & " array")
+      result.add(T(e.get))
 
-proc getTsVectorArray*(row: Row, col: int): seq[PgTsVector] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgTsVector](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in tsvector array")
-      var s = newString(e.len)
-      if e.len > 0:
-        copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
-      result[i] = PgTsVector(s)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in tsvector array")
-    result.add(PgTsVector(e.get))
-
-proc getTsQueryArray*(row: Row, col: int): seq[PgTsQuery] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgTsQuery](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in tsquery array")
-      var s = newString(e.len)
-      if e.len > 0:
-        copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
-      result[i] = PgTsQuery(s)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in tsquery array")
-    result.add(PgTsQuery(e.get))
+genStringArrayDecoder(getXmlArray, PgXml, "xml")
+genStringArrayDecoder(getTsVectorArray, PgTsVector, "tsvector")
+genStringArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery")
 
 # Array Opt accessors (text format)
 
@@ -5417,26 +5147,15 @@ proc encodeMultirangeArrayText[T](v: seq[PgMultirange[T]]): string =
     result.add('"')
   result.add('}')
 
-proc toPgParam*(v: seq[PgMultirange[int32]]): PgParam =
-  PgParam(
-    oid: OidInt4MultirangeArray,
-    format: 0,
-    value: some(toBytes(encodeMultirangeArrayText(v))),
-  )
+template genMultirangeArrayEncoder(T: typedesc, arrayOid: int32) =
+  proc toPgParam*(v: seq[PgMultirange[T]]): PgParam =
+    PgParam(
+      oid: arrayOid, format: 0, value: some(toBytes(encodeMultirangeArrayText(v)))
+    )
 
-proc toPgParam*(v: seq[PgMultirange[int64]]): PgParam =
-  PgParam(
-    oid: OidInt8MultirangeArray,
-    format: 0,
-    value: some(toBytes(encodeMultirangeArrayText(v))),
-  )
-
-proc toPgParam*(v: seq[PgMultirange[PgNumeric]]): PgParam =
-  PgParam(
-    oid: OidNumMultirangeArray,
-    format: 0,
-    value: some(toBytes(encodeMultirangeArrayText(v))),
-  )
+genMultirangeArrayEncoder(int32, OidInt4MultirangeArray)
+genMultirangeArrayEncoder(int64, OidInt8MultirangeArray)
+genMultirangeArrayEncoder(PgNumeric, OidNumMultirangeArray)
 
 proc toPgTsMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
   PgParam(
