@@ -1230,7 +1230,7 @@ proc toPgBinaryParam*(v: seq[PgBit]): PgParam =
 proc toPgParam*(v: seq[PgBit]): PgParam =
   toPgBinaryParam(v)
 
-# --- Temporal array encoders ---
+# Temporal array encoders
 
 proc toPgTimestampArrayParam*(v: seq[DateTime]): PgParam =
   if v.len == 0:
@@ -1290,7 +1290,7 @@ genArrayEncoder(PgTime, OidTimeArray, OidTime)
 genArrayEncoder(PgTimeTz, OidTimeTzArray, OidTimeTz)
 genArrayEncoder(PgInterval, OidIntervalArray, OidInterval)
 
-# --- Identifier / network array encoders ---
+# Identifier / network array encoders
 
 genArrayEncoder(PgUuid, OidUuidArray, OidUuid)
 genArrayEncoder(PgInet, OidInetArray, OidInet)
@@ -1298,7 +1298,7 @@ genArrayEncoder(PgCidr, OidCidrArray, OidCidr)
 genArrayEncoder(PgMacAddr, OidMacAddrArray, OidMacAddr)
 genArrayEncoder(PgMacAddr8, OidMacAddr8Array, OidMacAddr8)
 
-# --- Numeric / binary / JSON array encoders ---
+# Numeric / binary / JSON array encoders
 
 proc toPgParam*(v: seq[PgNumeric]): PgParam =
   if v.len == 0:
@@ -1417,7 +1417,7 @@ proc toPgBinaryParam*(v: JsonNode): PgParam =
     data[i + 1] = jsonBytes[i]
   PgParam(oid: OidJsonb, format: 1, value: some(data))
 
-# --- Geometric array encoders ---
+# Geometric array encoders
 
 genArrayEncoder(PgPoint, OidPointArray, OidPoint)
 genArrayEncoder(PgLine, OidLineArray, OidLine)
@@ -1427,7 +1427,7 @@ genArrayEncoder(PgPath, OidPathArray, OidPath)
 genArrayEncoder(PgPolygon, OidPolygonArray, OidPolygon)
 genArrayEncoder(PgCircle, OidCircleArray, OidCircle)
 
-# --- Other array encoders ---
+# Other array encoders
 
 template genStringArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
   proc toPgParam*(v: seq[T]): PgParam =
@@ -3238,7 +3238,7 @@ proc getBitArray*(row: Row, col: int): seq[PgBit] =
       raise newException(PgTypeError, "NULL element in bit array")
     result.add(parseBitString(e.get))
 
-# --- Temporal array decoders ---
+# Temporal array decoders
 
 template genTimestampArrayDecoder(getProc: untyped, typeName: static string) =
   proc getProc*(row: Row, col: int): seq[DateTime] =
@@ -3354,7 +3354,7 @@ proc getIntervalArray*(row: Row, col: int): seq[PgInterval] =
       raise newException(PgTypeError, "NULL element in interval array")
     result.add(parseIntervalText(e.get))
 
-# --- Identifier / network array decoders ---
+# Identifier / network array decoders
 
 proc getUuidArray*(row: Row, col: int): seq[PgUuid] =
   if row.isBinaryCol(col):
@@ -3447,7 +3447,7 @@ template genMacAddrArrayDecoder(
 genMacAddrArrayDecoder(getMacAddrArray, PgMacAddr, 6, "macaddr")
 genMacAddrArrayDecoder(getMacAddr8Array, PgMacAddr8, 8, "macaddr8")
 
-# --- Numeric / binary / JSON array decoders ---
+# Numeric / binary / JSON array decoders
 
 proc getNumericArray*(row: Row, col: int): seq[PgNumeric] =
   if row.isBinaryCol(col):
@@ -3533,7 +3533,7 @@ proc getJsonArray*(row: Row, col: int): seq[JsonNode] =
     except JsonParsingError:
       raise newException(PgTypeError, "Invalid JSON element: " & e.get)
 
-# --- Geometric array decoders ---
+# Geometric array decoders
 
 proc getPointArray*(row: Row, col: int): seq[PgPoint] =
   if row.isBinaryCol(col):
@@ -3750,7 +3750,7 @@ proc getCircleArray*(row: Row, col: int): seq[PgCircle] =
       )
     )
 
-# --- Other array decoders ---
+# Other array decoders
 
 template genStringArrayDecoder(getProc: untyped, T: typedesc, typeName: static string) =
   proc getProc*(row: Row, col: int): seq[T] =
