@@ -317,6 +317,10 @@ clusterForwards("read"):
 
   proc readSimpleQuery*(cluster: PgPoolCluster, sql: string): Future[seq[QueryResult]]
 
+  proc readSimpleExec*(
+    cluster: PgPoolCluster, sql: string, timeout: Duration = ZeroDuration
+  ): Future[CommandResult]
+
 # Write operations → primary
 
 clusterForwards("write"):

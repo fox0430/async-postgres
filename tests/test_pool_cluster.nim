@@ -511,6 +511,22 @@ suite "Read routing targets replica":
     expect(PgError):
       discard waitFor cluster.readQueryColumn("SELECT 1")
 
+  test "readSimpleQuery routes to replica":
+    let cluster = makeCluster()
+    cluster.replica.closed = true
+    cluster.fallback = fallbackNone
+
+    expect(PgError):
+      discard waitFor cluster.readSimpleQuery("SELECT 1")
+
+  test "readSimpleExec routes to replica":
+    let cluster = makeCluster()
+    cluster.replica.closed = true
+    cluster.fallback = fallbackNone
+
+    expect(PgError):
+      discard waitFor cluster.readSimpleExec("SELECT 1")
+
 suite "Closed pool cluster":
   test "acquire on closed replica raises error":
     let cluster = makeCluster()
