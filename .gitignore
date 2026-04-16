@@ -13,3 +13,5 @@ tests/*
 
 examples/*
 !examples/*.*
+
+async_postgres.out
