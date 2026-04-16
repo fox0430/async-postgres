@@ -1568,19 +1568,7 @@ genArrayEncoder(PgMoney, OidMoneyArray, OidMoney)
 
 # Numeric / binary / JSON array encoders
 
-proc toPgParam*(v: seq[PgNumeric]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidNumericArray, format: 1, value: some(encodeBinaryArrayEmpty(OidNumeric))
-    )
-  var elements = newSeq[seq[byte]](v.len)
-  for i, x in v:
-    elements[i] = encodeNumericBinary(x)
-  PgParam(
-    oid: OidNumericArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidNumeric, elements)),
-  )
+genArrayEncoder(PgNumeric, OidNumericArray, OidNumeric)
 
 proc toPgByteaArrayParam*(v: seq[seq[byte]]): PgParam =
   if v.len == 0:
@@ -1788,6 +1776,40 @@ proc toPgBinaryParam*(v: PgHstore, oid: int32): PgParam =
   ## Encode hstore in binary format. Requires the dynamic hstore OID
   ## (available as ``conn.hstoreOid`` after connection).
   PgParam(oid: oid, format: 1, value: some(encodeHstoreBinary(v)))
+
+proc toPgParam*(v: seq[PgHstore]): PgParam =
+  ## Send hstore[] in text format using ``OidTextArray``. Requires an explicit
+  ## ``::hstore[]`` cast in the SQL statement (e.g. ``SELECT $1::hstore[]``),
+  ## since the parameter is typed as text[]. No connection-specific OID is
+  ## needed; prefer ``toPgBinaryParam`` when a ``PgConnection`` with the
+  ## discovered hstore OIDs is available (faster, no cast required).
+  if v.len == 0:
+    return PgParam(oid: OidTextArray, format: 0, value: some(toBytes("{}")))
+  var s = "{"
+  for i, h in v:
+    if i > 0:
+      s.add(',')
+    s.add('"')
+    for c in encodeHstoreText(h):
+      if c == '"' or c == '\\':
+        s.add('\\')
+      s.add(c)
+    s.add('"')
+  s.add('}')
+  PgParam(oid: OidTextArray, format: 0, value: some(toBytes(s)))
+
+proc toPgBinaryParam*(v: seq[PgHstore], elemOid: int32, arrayOid: int32): PgParam =
+  ## Encode hstore[] in binary format. Requires both the dynamic hstore OID
+  ## and hstore[] OID (available as ``conn.hstoreOid`` and
+  ## ``conn.hstoreArrayOid`` after connection). See also the ``PgConnection``
+  ## overload in ``pg_connection`` which reads these OIDs automatically.
+  if v.len == 0:
+    return
+      PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArrayEmpty(elemOid)))
+  var elements = newSeq[seq[byte]](v.len)
+  for i, x in v:
+    elements[i] = encodeHstoreBinary(x)
+  PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArray(elemOid, elements)))
 
 proc toPgBinaryParam*[T](v: Option[T]): PgParam =
   if v.isSome:
@@ -4099,6 +4121,28 @@ genStringArrayDecoder(getXmlArray, PgXml, "xml")
 genStringArrayDecoder(getTsVectorArray, PgTsVector, "tsvector")
 genStringArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery")
 
+proc getHstoreArray*(row: Row, col: int): seq[PgHstore] =
+  ## Get a column value as ``seq[PgHstore]``. Handles both text and binary format.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgHstore](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in hstore array")
+      result[i] = decodeHstoreBinary(
+        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in hstore array")
+    result.add(parseHstoreText(e.get))
+
 # Array Opt accessors (text format)
 
 optAccessor(getIntArray, getIntArrayOpt, seq[int32])
@@ -4134,6 +4178,7 @@ optAccessor(getCircleArray, getCircleArrayOpt, seq[PgCircle])
 optAccessor(getXmlArray, getXmlArrayOpt, seq[PgXml])
 optAccessor(getTsVectorArray, getTsVectorArrayOpt, seq[PgTsVector])
 optAccessor(getTsQueryArray, getTsQueryArrayOpt, seq[PgTsQuery])
+optAccessor(getHstoreArray, getHstoreArrayOpt, seq[PgHstore])
 
 # Coerce a binary PgParam to match the server-inferred type from a prepared
 # statement.  This handles the common case where e.g. int32.toPgParam is
@@ -6293,6 +6338,9 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgTsVector]]): seq[PgTsVector] =
 proc get*(row: Row, col: int, T: typedesc[seq[PgTsQuery]]): seq[PgTsQuery] =
   row.getTsQueryArray(col)
 
+proc get*(row: Row, col: int, T: typedesc[seq[PgHstore]]): seq[PgHstore] =
+  row.getHstoreArray(col)
+
 # Range types (DateTime-based ranges excluded — see note above)
 
 proc get*(row: Row, col: int, T: typedesc[PgRange[int32]]): PgRange[int32] =
@@ -6464,6 +6512,7 @@ nameAccessor(getCircleArray, seq[PgCircle])
 nameAccessor(getXmlArray, seq[PgXml])
 nameAccessor(getTsVectorArray, seq[PgTsVector])
 nameAccessor(getTsQueryArray, seq[PgTsQuery])
+nameAccessor(getHstoreArray, seq[PgHstore])
 nameAccessor(getTimestampArrayOpt, Option[seq[DateTime]])
 nameAccessor(getTimestampTzArrayOpt, Option[seq[DateTime]])
 nameAccessor(getDateArrayOpt, Option[seq[DateTime]])
@@ -6489,6 +6538,7 @@ nameAccessor(getCircleArrayOpt, Option[seq[PgCircle]])
 nameAccessor(getXmlArrayOpt, Option[seq[PgXml]])
 nameAccessor(getTsVectorArrayOpt, Option[seq[PgTsVector]])
 nameAccessor(getTsQueryArrayOpt, Option[seq[PgTsQuery]])
+nameAccessor(getHstoreArrayOpt, Option[seq[PgHstore]])
 nameAccessor(getInt4Range, PgRange[int32])
 nameAccessor(getInt8Range, PgRange[int64])
 nameAccessor(getNumRange, PgRange[PgNumeric])

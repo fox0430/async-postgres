@@ -5011,6 +5011,73 @@ suite "hstore":
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getHstoreOpt(0).isNone
 
+  test "toPgParam seq[PgHstore] text roundtrip":
+    var h1: PgHstore = initTable[string, Option[string]]()
+    h1["a"] = some("1")
+    var h2: PgHstore = initTable[string, Option[string]]()
+    h2["b"] = none(string)
+    let p = toPgParam(@[h1, h2])
+    check p.oid == OidTextArray
+    check p.format == 0
+    let fields = @[mkField(OidTextArray, 0'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getHstoreArray(0)
+    check arr.len == 2
+    check arr[0] == h1
+    check arr[1] == h2
+
+  test "toPgParam seq[PgHstore] empty":
+    let p = toPgParam(newSeq[PgHstore]())
+    check p.oid == OidTextArray
+    check p.format == 0
+    check toString(p.value.get) == "{}"
+
+  test "toPgBinaryParam seq[PgHstore] roundtrip":
+    var h1: PgHstore = initTable[string, Option[string]]()
+    h1["x"] = some("y")
+    var h2: PgHstore = initTable[string, Option[string]]()
+    h2["nul"] = none(string)
+    let p = toPgBinaryParam(@[h1, h2], 16385'i32, 16386'i32)
+    check p.oid == 16386'i32
+    check p.format == 1
+    let fields = @[mkField(16386'i32, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getHstoreArray(0)
+    check arr.len == 2
+    check arr[0] == h1
+    check arr[1] == h2
+
+  test "toPgBinaryParam seq[PgHstore] empty":
+    let p = toPgBinaryParam(newSeq[PgHstore](), 16385'i32, 16386'i32)
+    check p.oid == 16386'i32
+    check p.format == 1
+    let fields = @[mkField(16386'i32, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    check row.getHstoreArray(0).len == 0
+
+  test "getHstoreArray text format":
+    let row: Row = @[some(toBytes("{\"\\\"a\\\"=>\\\"1\\\"\",\"\\\"b\\\"=>NULL\"}"))]
+    let arr = row.getHstoreArray(0)
+    check arr.len == 2
+    check arr[0]["a"] == some("1")
+    check arr[1]["b"] == none(string)
+
+  test "getHstoreArrayOpt some":
+    var h1: PgHstore = initTable[string, Option[string]]()
+    h1["k"] = some("v")
+    let p = toPgParam(@[h1])
+    let fields = @[mkField(OidTextArray, 0'i16)]
+    let row = mkRow(@[p.value], fields)
+    let r = row.getHstoreArrayOpt(0)
+    check r.isSome
+    check r.get.len == 1
+    check r.get[0] == h1
+
+  test "getHstoreArrayOpt none":
+    let fields = @[mkField(OidTextArray, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getHstoreArrayOpt(0).isNone
+
 suite "PgBit":
   test "OID constants":
     check OidBit == 1560'i32
