@@ -8050,6 +8050,60 @@ suite "E2E: Numeric / binary / JSON array types":
 
     waitFor t()
 
+  test "hstore array roundtrip (text cast)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      var h1: PgHstore = initTable[string, Option[string]]()
+      h1["a"] = some("1")
+      var h2: PgHstore = initTable[string, Option[string]]()
+      h2["b"] = none(string)
+      let res = await conn.query("SELECT $1::hstore[]", @[toPgParam(@[h1, h2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getHstoreArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == h1
+      doAssert arr[1] == h2
+      await conn.close()
+
+    waitFor t()
+
+  test "hstore array roundtrip (binary)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      doAssert conn.hstoreOid != 0
+      doAssert conn.hstoreArrayOid != 0
+      var h1: PgHstore = initTable[string, Option[string]]()
+      h1["x"] = some("y")
+      var h2: PgHstore = initTable[string, Option[string]]()
+      h2["nul"] = none(string)
+      let bin = toPgBinaryParam(@[h1, h2], conn.hstoreOid, conn.hstoreArrayOid)
+      let res = await conn.query("SELECT $1", @[bin])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getHstoreArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == h1
+      doAssert arr[1] == h2
+      await conn.close()
+
+    waitFor t()
+
+  test "hstore array roundtrip (binary, conn overload)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      var h1: PgHstore = initTable[string, Option[string]]()
+      h1["k"] = some("v")
+      let res = await conn.query("SELECT $1", @[conn.toPgBinaryParam(@[h1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getHstoreArray(0)
+      doAssert arr.len == 1
+      doAssert arr[0] == h1
+      await conn.close()
+
+    waitFor t()
+
   test "bytea array roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

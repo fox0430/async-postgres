@@ -168,6 +168,7 @@ type
     stmtCounter: int
     stmtCacheCapacity: int ## 0=disabled, default 256
     hstoreOid: int32 ## Dynamic OID for hstore extension type; 0 if not available
+    hstoreArrayOid: int32 ## Dynamic OID for hstore[] array; 0 if not available
     tracer: PgTracer ## Inherited from ConnConfig on connect
 
   QueryResult* = object
@@ -336,6 +337,27 @@ func secretKey*(conn: PgConnection): int32 {.inline.} =
 func hstoreOid*(conn: PgConnection): int32 {.inline.} =
   ## Dynamic OID for hstore extension type; 0 if not available.
   conn.hstoreOid
+
+func hstoreArrayOid*(conn: PgConnection): int32 {.inline.} =
+  ## Dynamic OID for hstore[] array type; 0 if not available.
+  conn.hstoreArrayOid
+
+proc toPgBinaryParam*(conn: PgConnection, v: PgHstore): PgParam {.inline.} =
+  ## Convenience overload: encode hstore in binary using ``conn.hstoreOid``.
+  ## Raises ``PgTypeError`` if the hstore extension OID has not been discovered
+  ## (e.g. extension not installed on the server).
+  if conn.hstoreOid == 0:
+    raise newException(PgTypeError, "hstore OID not available on this connection")
+  toPgBinaryParam(v, conn.hstoreOid)
+
+proc toPgBinaryParam*(conn: PgConnection, v: seq[PgHstore]): PgParam {.inline.} =
+  ## Convenience overload: encode hstore[] in binary using ``conn.hstoreOid``
+  ## and ``conn.hstoreArrayOid``. Raises ``PgTypeError`` if either OID has not
+  ## been discovered.
+  if conn.hstoreOid == 0 or conn.hstoreArrayOid == 0:
+    raise
+      newException(PgTypeError, "hstore/hstore[] OIDs not available on this connection")
+  toPgBinaryParam(v, conn.hstoreOid, conn.hstoreArrayOid)
 
 func notifyCallback*(conn: PgConnection): NotifyCallback {.inline.} =
   ## The callback invoked when a NOTIFY message arrives.
@@ -679,10 +701,12 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
     return # caller should have evicted; skip if still full
   var entry = cached
   if entry.resultFormats.len == 0 and entry.fields.len > 0:
+    var extraOids: seq[int32]
     if conn.hstoreOid != 0:
-      entry.resultFormats = buildResultFormats(entry.fields, [conn.hstoreOid])
-    else:
-      entry.resultFormats = buildResultFormats(entry.fields)
+      extraOids.add(conn.hstoreOid)
+    if conn.hstoreArrayOid != 0:
+      extraOids.add(conn.hstoreArrayOid)
+    entry.resultFormats = buildResultFormats(entry.fields, extraOids)
     entry.colFmts = newSeq[int16](entry.fields.len)
     entry.colOids = newSeq[int32](entry.fields.len)
     for i in 0 ..< entry.fields.len:
@@ -1277,7 +1301,7 @@ proc connectToHost(
     # Discover extension type OIDs (hstore, etc.)
     conn.state = csBusy
     await conn.sendMsg(
-      encodeQuery("SELECT oid FROM pg_type WHERE typname = 'hstore' LIMIT 1")
+      encodeQuery("SELECT oid, typarray FROM pg_type WHERE typname = 'hstore' LIMIT 1")
     )
     block discoverLoop:
       while true:
@@ -1290,6 +1314,11 @@ proc connectToHost(
             if msg.columns.len > 0 and msg.columns[0].isSome:
               try:
                 conn.hstoreOid = int32(parseInt(bytesToString(msg.columns[0].get)))
+              except ValueError:
+                discard
+            if msg.columns.len > 1 and msg.columns[1].isSome:
+              try:
+                conn.hstoreArrayOid = int32(parseInt(bytesToString(msg.columns[1].get)))
               except ValueError:
                 discard
           of bmkCommandComplete, bmkEmptyQueryResponse:
@@ -1697,6 +1726,7 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   conn.state = csReady
   conn.createdAt = newConn.createdAt
   conn.hstoreOid = newConn.hstoreOid
+  conn.hstoreArrayOid = newConn.hstoreArrayOid
   for ch in conn.listenChannels:
     discard await conn.simpleQuery("LISTEN " & quoteIdentifier(ch))
 
