@@ -192,6 +192,8 @@ const
     719, # circle[]
     774, # macaddr8
     775, # macaddr8[]
+    790, # money
+    791, # money[]
     829, # macaddr
     869, # inet
     1000, # bool[]

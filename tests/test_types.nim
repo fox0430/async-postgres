@@ -2044,6 +2044,280 @@ suite "PgNumeric":
     check p.oid == OidNumeric
     check p.value.isNone
 
+suite "PgMoney":
+  test "OID constants":
+    check OidMoney == 790'i32
+    check OidMoneyArray == 791'i32
+
+  test "initPgMoney defaults and fields":
+    let m = initPgMoney(123456'i64)
+    check m.amount == 123456'i64
+    check m.scale == 2
+    let m0 = initPgMoney(1234'i64, scale = 0)
+    check m0.amount == 1234'i64
+    check m0.scale == 0
+
+  test "initPgMoney rejects invalid scale":
+    expect(PgTypeError):
+      discard initPgMoney(1'i64, scale = -1)
+    expect(PgTypeError):
+      discard initPgMoney(1'i64, scale = 19)
+
+  test "$ without currency symbol (scale=2)":
+    check $initPgMoney(0) == "0.00"
+    check $initPgMoney(7) == "0.07"
+    check $initPgMoney(100) == "1.00"
+    check $initPgMoney(123456) == "1234.56"
+    check $initPgMoney(-1) == "-0.01"
+    check $initPgMoney(-123456) == "-1234.56"
+
+  test "$ with alternate scales":
+    check $initPgMoney(1234, scale = 0) == "1234"
+    check $initPgMoney(-1234, scale = 0) == "-1234"
+    check $initPgMoney(1234567, scale = 3) == "1234.567"
+    check $initPgMoney(5, scale = 3) == "0.005"
+    check $initPgMoney(12345, scale = 4) == "1.2345"
+
+  test "$ handles int64.low":
+    # Must not overflow when negating the magnitude.
+    let s2 = $initPgMoney(int64.low, scale = 2)
+    check s2 == "-92233720368547758.08"
+    let s0 = $initPgMoney(int64.low, scale = 0)
+    check s0 == "-9223372036854775808"
+
+  test "parsePgMoney roundtrip (C locale style)":
+    for s in ["0.00", "0.07", "1.00", "1234.56", "-0.01", "-1234.56"]:
+      check $parsePgMoney(s) == s
+
+  test "parsePgMoney accepts optional $ and +":
+    check parsePgMoney("1234.56") == initPgMoney(123456)
+    check parsePgMoney("$1234.56") == initPgMoney(123456)
+    check parsePgMoney("+$1.00") == initPgMoney(100)
+
+  test "parsePgMoney accepts sign after currency symbol":
+    check parsePgMoney("$-1.00") == initPgMoney(-100)
+    check parsePgMoney("$-1,234.56") == initPgMoney(-123456)
+    check parsePgMoney("$+1.00") == initPgMoney(100)
+    check parsePgMoney("¥-1,234", scale = 0) == initPgMoney(-1234, scale = 0)
+
+  test "parsePgMoney with en_US thousand separator":
+    check parsePgMoney("$1,234.56") == initPgMoney(123456)
+    check parsePgMoney("$1,234,567.89") == initPgMoney(123456789)
+    check parsePgMoney("-$1,234.56") == initPgMoney(-123456)
+
+  test "parsePgMoney with EU format (comma decimal)":
+    check parsePgMoney("1.234,56") == initPgMoney(123456)
+    check parsePgMoney("1.234,56 €") == initPgMoney(123456)
+    check parsePgMoney("-1.234,56 €") == initPgMoney(-123456)
+
+  test "parsePgMoney strips non-ASCII currency symbols":
+    check parsePgMoney("¥12.34") == initPgMoney(1234)
+    check parsePgMoney("£1,234.56") == initPgMoney(123456)
+
+  test "parsePgMoney strips surrounding whitespace":
+    check parsePgMoney("  $100.00  ") == initPgMoney(10000)
+
+  test "parsePgMoney handles parenthesized negatives":
+    check parsePgMoney("($1.00)") == initPgMoney(-100)
+    check parsePgMoney("($1,234.56)") == initPgMoney(-123456)
+    check parsePgMoney("(1.234,56 €)") == initPgMoney(-123456)
+
+  test "parsePgMoney scale=0 (e.g. JPY)":
+    check parsePgMoney("1234", scale = 0) == initPgMoney(1234, scale = 0)
+    check parsePgMoney("¥1,234", scale = 0) == initPgMoney(1234, scale = 0)
+    check parsePgMoney("-¥1,234,567", scale = 0) == initPgMoney(-1234567, scale = 0)
+
+  test "parsePgMoney scale=3":
+    check parsePgMoney("1.234,567", scale = 3) == initPgMoney(1234567, scale = 3)
+    check parsePgMoney("0.005", scale = 3) == initPgMoney(5, scale = 3)
+
+  test "parsePgMoney int64.low roundtrip":
+    let lo = initPgMoney(int64.low, scale = 2)
+    check parsePgMoney($lo, scale = 2) == lo
+    let lo0 = initPgMoney(int64.low, scale = 0)
+    check parsePgMoney($lo0, scale = 0) == lo0
+
+  test "parsePgMoney rejects invalid input":
+    expect(PgTypeError):
+      discard parsePgMoney("")
+    expect(PgTypeError):
+      discard parsePgMoney("abc")
+    # scale=2 requires exactly 2 fractional digits after last . or ,
+    expect(PgTypeError):
+      discard parsePgMoney("$1.5")
+    expect(PgTypeError):
+      discard parsePgMoney("$1.234")
+    expect(PgTypeError):
+      discard parsePgMoney("$.56")
+    # No decimal separator for scale=2
+    expect(PgTypeError):
+      discard parsePgMoney("$1234")
+    # Parenthesized with extra minus
+    expect(PgTypeError):
+      discard parsePgMoney("(-$1.00)")
+
+  test "parsePgMoney rejects overflow":
+    expect(PgTypeError):
+      discard parsePgMoney("99999999999999999999.99")
+
+  test "equality, ordering, and hash":
+    check initPgMoney(100) == initPgMoney(100)
+    check initPgMoney(100) != initPgMoney(100, scale = 0)
+    check initPgMoney(1) < initPgMoney(2)
+    check initPgMoney(2) > initPgMoney(1)
+    check initPgMoney(1) <= initPgMoney(1)
+    check hash(initPgMoney(42)) == hash(initPgMoney(42))
+    check hash(initPgMoney(42, scale = 0)) != hash(initPgMoney(42, scale = 2))
+
+  test "ordering rejects mismatched scale":
+    expect(PgTypeError):
+      discard initPgMoney(100, scale = 0) < initPgMoney(100, scale = 2)
+    expect(PgTypeError):
+      discard initPgMoney(100, scale = 0) <= initPgMoney(100, scale = 2)
+
+  test "formatPgMoney default = $":
+    check formatPgMoney(initPgMoney(123456)) == "1234.56"
+    check formatPgMoney(initPgMoney(-123456)) == "-1234.56"
+
+  test "formatPgMoney en_US style":
+    check formatPgMoney(initPgMoney(123456), symbol = "$", thousandsSep = ',') ==
+      "$1,234.56"
+    check formatPgMoney(initPgMoney(123456789), symbol = "$", thousandsSep = ',') ==
+      "$1,234,567.89"
+    check formatPgMoney(initPgMoney(-123456), symbol = "$", thousandsSep = ',') ==
+      "-$1,234.56"
+    check formatPgMoney(initPgMoney(1), symbol = "$", thousandsSep = ',') == "$0.01"
+
+  test "formatPgMoney EU style":
+    check formatPgMoney(
+      initPgMoney(123456),
+      symbol = " €",
+      decimalSep = ',',
+      thousandsSep = '.',
+      symbolBefore = false,
+    ) == "1.234,56 €"
+
+  test "formatPgMoney scale=0":
+    check formatPgMoney(
+      initPgMoney(1234567, scale = 0), symbol = "¥", thousandsSep = ','
+    ) == "¥1,234,567"
+
+  test "formatPgMoney accounting parens for negatives":
+    check formatPgMoney(
+      initPgMoney(-123456), symbol = "$", thousandsSep = ',', accountingParens = true
+    ) == "($1,234.56)"
+    # Positive values unaffected
+    check formatPgMoney(
+      initPgMoney(123456), symbol = "$", thousandsSep = ',', accountingParens = true
+    ) == "$1,234.56"
+    # EU style, symbol after
+    check formatPgMoney(
+      initPgMoney(-123456),
+      symbol = " €",
+      decimalSep = ',',
+      thousandsSep = '.',
+      symbolBefore = false,
+      accountingParens = true,
+    ) == "(1.234,56 €)"
+    # Roundtrip through parsePgMoney
+    let v = initPgMoney(-123456)
+    let s = formatPgMoney(v, symbol = "$", thousandsSep = ',', accountingParens = true)
+    check parsePgMoney(s) == v
+
+  test "toPgParam PgMoney":
+    let p = toPgParam(initPgMoney(123456))
+    check p.oid == OidMoney
+    check p.format == 1
+    check p.value.get == @(toBE64(123456'i64))
+
+  test "toPgBinaryParam PgMoney":
+    let p = toPgBinaryParam(initPgMoney(-500))
+    check p.oid == OidMoney
+    check p.format == 1
+    check p.value.get == @(toBE64(-500'i64))
+
+  test "getMoney binary default scale":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(987654'i64)))], fields)
+    check row.getMoney(0) == initPgMoney(987654)
+
+  test "getMoney binary with scale=0":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(987654'i64)))], fields)
+    check row.getMoney(0, scale = 0) == initPgMoney(987654, scale = 0)
+
+  test "getMoney text":
+    let row: Row = @[some(toBytes("$1,234.56"))]
+    check row.getMoney(0) == initPgMoney(123456)
+
+  test "getMoney text with scale=0":
+    let row: Row = @[some(toBytes("¥1,234"))]
+    check row.getMoney(0, scale = 0) == initPgMoney(1234, scale = 0)
+
+  test "getMoney NULL raises":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    expect(PgTypeError):
+      discard row.getMoney(0)
+
+  test "getMoneyOpt some/none":
+    let fields = @[mkField(OidMoney, 1)]
+    let rowSome = mkRow(@[some(@(toBE64(42'i64)))], fields)
+    check rowSome.getMoneyOpt(0) == some(initPgMoney(42))
+    let rowNone = mkRow(@[none(seq[byte])], fields)
+    check rowNone.getMoneyOpt(0) == none(PgMoney)
+
+  test "toPgParam seq[PgMoney] empty":
+    let p = toPgParam(newSeq[PgMoney]())
+    check p.oid == OidMoneyArray
+    check p.format == 1
+    check p.value.isSome
+
+  test "toPgParam seq[PgMoney] roundtrip (binary)":
+    let values = @[initPgMoney(100), initPgMoney(-50), initPgMoney(999999)]
+    let p = toPgParam(values)
+    check p.oid == OidMoneyArray
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getMoneyArray(0) == values
+
+  test "getMoneyArray binary with scale=0":
+    let values = @[initPgMoney(100, scale = 0), initPgMoney(-50, scale = 0)]
+    let p = toPgParam(@[initPgMoney(100), initPgMoney(-50)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getMoneyArray(0, scale = 0) == values
+
+  test "getMoneyArray text format with locale-formatted elements":
+    let row: Row = @[some(toBytes("{\"$1,234.56\",\"$2.00\"}"))]
+    check row.getMoneyArray(0) == @[initPgMoney(123456), initPgMoney(200)]
+
+  test "getMoneyArrayOpt some/none":
+    let values = @[initPgMoney(1), initPgMoney(2)]
+    let p = toPgParam(values)
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let rowSome = mkRow(@[p.value], fields)
+    check rowSome.getMoneyArrayOpt(0) == some(values)
+    let rowNone = mkRow(@[none(seq[byte])], fields)
+    check rowNone.getMoneyArrayOpt(0) == none(seq[PgMoney])
+
+  test "getMoney rejects invalid scale":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(1'i64)))], fields)
+    expect(PgTypeError):
+      discard row.getMoney(0, scale = -1)
+    expect(PgTypeError):
+      discard row.getMoney(0, scale = 19)
+
+  test "getMoneyArray rejects invalid scale":
+    let p = toPgParam(@[initPgMoney(1)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    expect(PgTypeError):
+      discard row.getMoneyArray(0, scale = -1)
+    expect(PgTypeError):
+      discard row.getMoneyArray(0, scale = 19)
+
 suite "PgInterval":
   test "$ zero interval":
     let v = PgInterval(months: 0, days: 0, microseconds: 0)

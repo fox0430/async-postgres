@@ -16,6 +16,19 @@ type
   PgUuid* = distinct string
     ## UUID value stored as its string representation (e.g. "550e8400-e29b-41d4-a716-446655440000").
 
+  PgMoney* = object
+    ## PostgreSQL money value. Stores the raw signed 64-bit amount in the
+    ## locale's minor currency unit together with ``scale`` — the number of
+    ## fractional digits (``frac_digits`` from ``lc_monetary``). The binary
+    ## wire format carries only the integer amount, so ``scale`` is a
+    ## client-side tag that defaults to 2 when decoding. Callers whose server
+    ## runs with a non-default ``lc_monetary`` (e.g. ``ja_JP`` → ``scale=0``)
+    ## must pass ``scale`` explicitly to ``parsePgMoney`` / ``getMoney`` /
+    ## ``getMoneyArray``. Use ``formatPgMoney`` to render with a currency
+    ## symbol and thousand separators; ``$`` emits a plain decimal number.
+    amount*: int64 ## raw value in the minor currency unit
+    scale*: int8 ## number of fractional digits (``frac_digits``)
+
   PgNumericSign* = enum
     pgPositive = 0x0000
     pgNegative = 0x4000
@@ -173,6 +186,7 @@ const
   OidTimestampTz* = 1184'i32
   OidTimeTz* = 1266'i32
   OidNumeric* = 1700'i32
+  OidMoney* = 790'i32
   OidJson* = 114'i32
   OidInterval* = 1186'i32
   OidUuid* = 2950'i32
@@ -249,6 +263,7 @@ const
   OidTimestampTzArray* = 1185'i32
   OidIntervalArray* = 1187'i32
   OidNumericArray* = 1231'i32
+  OidMoneyArray* = 791'i32
   OidTimeTzArray* = 1270'i32
   OidUuidArray* = 2951'i32
   OidJsonbArray* = 3807'i32
@@ -278,6 +293,250 @@ const
 proc `$`*(v: PgUuid): string {.borrow.}
 proc `==`*(a, b: PgUuid): bool {.borrow.}
 proc hash*(v: PgUuid): Hash {.borrow.}
+
+proc initPgMoney*(amount: int64, scale: int = 2): PgMoney =
+  ## Construct a PgMoney. ``amount`` is the raw integer in the minor currency
+  ## unit; ``scale`` is the number of fractional digits (default 2).
+  if scale < 0 or scale > 18:
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  PgMoney(amount: amount, scale: int8(scale))
+
+proc `<`*(a, b: PgMoney): bool =
+  ## Order by ``amount``. Raises ``PgTypeError`` when ``a.scale != b.scale``
+  ## because the raw amounts represent different minor units and comparing
+  ## them would yield a nonsensical ordering.
+  if a.scale != b.scale:
+    raise newException(
+      PgTypeError,
+      "Cannot compare PgMoney with different scale: " & $a.scale & " vs " & $b.scale,
+    )
+  a.amount < b.amount
+
+proc `<=`*(a, b: PgMoney): bool =
+  ## Order by ``amount``. See ``<`` for the scale-mismatch behavior.
+  if a.scale != b.scale:
+    raise newException(
+      PgTypeError,
+      "Cannot compare PgMoney with different scale: " & $a.scale & " vs " & $b.scale,
+    )
+  a.amount <= b.amount
+
+proc hash*(v: PgMoney): Hash =
+  var h: Hash = 0
+  h = h !& hash(v.amount)
+  h = h !& hash(int(v.scale))
+  !$h
+
+proc pow10u64(n: int): uint64 =
+  result = 1'u64
+  for _ in 0 ..< n:
+    result *= 10'u64
+
+proc `$`*(v: PgMoney): string =
+  ## Format PgMoney as a plain decimal number with ``scale`` fractional
+  ## digits. No currency symbol or thousand separator is emitted:
+  ##   * ``PgMoney(amount: 123456, scale: 2)`` -> ``"1234.56"``
+  ##   * ``PgMoney(amount: -1, scale: 2)`` -> ``"-0.01"``
+  ##   * ``PgMoney(amount: 1234, scale: 0)`` -> ``"1234"``
+  ##   * ``PgMoney(amount: 1234567, scale: 3)`` -> ``"1234.567"``
+  ## Use ``formatPgMoney`` for currency symbols and thousand separators.
+  let c = v.amount
+  let scale = int(v.scale)
+  let neg = c < 0
+  # Avoid overflow on int64.low by working in uint64 for the magnitude.
+  let mag =
+    if neg:
+      uint64(not c) + 1'u64
+    else:
+      uint64(c)
+  result = newStringOfCap(24)
+  if neg:
+    result.add('-')
+  if scale == 0:
+    result.add($mag)
+    return
+  let divisor = pow10u64(scale)
+  let whole = mag div divisor
+  let frac = mag mod divisor
+  result.add($whole)
+  result.add('.')
+  let fracStr = $frac
+  for _ in 0 ..< (scale - fracStr.len):
+    result.add('0')
+  result.add(fracStr)
+
+proc formatPgMoney*(
+    v: PgMoney,
+    symbol: string = "",
+    decimalSep: char = '.',
+    thousandsSep: char = '\0',
+    symbolBefore: bool = true,
+    accountingParens: bool = false,
+): string =
+  ## Locale-aware money formatter. ``thousandsSep`` of ``'\0'`` disables
+  ## grouping. When ``accountingParens`` is true, negative values are wrapped
+  ## in parentheses instead of being prefixed with ``-``. Examples:
+  ##   ``formatPgMoney(initPgMoney(123456), symbol = "$")`` -> ``"$1234.56"``
+  ##   ``formatPgMoney(initPgMoney(123456), symbol = "$", thousandsSep = ',')``
+  ##     -> ``"$1,234.56"``
+  ##   ``formatPgMoney(initPgMoney(123456), symbol = " €",
+  ##                   decimalSep = ',', thousandsSep = '.',
+  ##                   symbolBefore = false)`` -> ``"1.234,56 €"``
+  ##   ``formatPgMoney(initPgMoney(-123456), symbol = "$",
+  ##                   thousandsSep = ',', accountingParens = true)``
+  ##     -> ``"($1,234.56)"``
+  let c = v.amount
+  let scale = int(v.scale)
+  let neg = c < 0
+  let mag =
+    if neg:
+      uint64(not c) + 1'u64
+    else:
+      uint64(c)
+  let divisor = pow10u64(scale)
+  let whole = mag div divisor
+  let frac = mag mod divisor
+  var wholeStr = $whole
+  if thousandsSep != '\0' and wholeStr.len > 3:
+    var grouped = newStringOfCap(wholeStr.len + wholeStr.len div 3)
+    let firstLen = wholeStr.len mod 3
+    var idx = 0
+    if firstLen > 0:
+      grouped.add(wholeStr[0 ..< firstLen])
+      idx = firstLen
+    while idx < wholeStr.len:
+      if grouped.len > 0:
+        grouped.add(thousandsSep)
+      grouped.add(wholeStr[idx ..< idx + 3])
+      idx += 3
+    wholeStr = grouped
+  result = newStringOfCap(symbol.len + wholeStr.len + scale + 4)
+  if neg and accountingParens:
+    result.add('(')
+  elif neg:
+    result.add('-')
+  if symbolBefore:
+    result.add(symbol)
+  result.add(wholeStr)
+  if scale > 0:
+    result.add(decimalSep)
+    let fracStr = $frac
+    for _ in 0 ..< (scale - fracStr.len):
+      result.add('0')
+    result.add(fracStr)
+  if not symbolBefore:
+    result.add(symbol)
+  if neg and accountingParens:
+    result.add(')')
+
+proc parsePgMoney*(s: string, scale: int = 2): PgMoney =
+  ## Parse a money string with tolerant locale handling. Accepts:
+  ##   * Optional currency symbol anywhere (``$``, ``€``, ``¥``, ``£`` etc. —
+  ##     any non-digit, non-sign, non-separator characters are ignored)
+  ##   * ``.`` or ``,`` as decimal separator; the other is treated as thousand
+  ##     separator. For ``scale > 0`` the last ``.``/``,`` is the decimal
+  ##     point and must be followed by exactly ``scale`` digits.
+  ##   * ``-``/``+`` sign either before or after the currency symbol
+  ##     (``-$1.00`` and ``$-1.00`` both work)
+  ##   * Accounting-style parenthesized negatives, e.g. ``($1.00)``
+  ## Raises ``PgTypeError`` on malformed input. The server's actual
+  ## ``frac_digits`` cannot be inferred from the text — pass ``scale``
+  ## explicitly when the server uses a non-default ``lc_monetary``.
+  if scale < 0 or scale > 18:
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  var trimmed = s.strip()
+  if trimmed.len == 0:
+    raise newException(PgTypeError, "Empty money string")
+  var neg = false
+  # Accounting-style parentheses: treat (...) as negative.
+  if trimmed.len >= 2 and trimmed[0] == '(' and trimmed[^1] == ')':
+    neg = true
+    trimmed = trimmed[1 ..^ 2].strip()
+    if trimmed.len == 0:
+      raise newException(PgTypeError, "Invalid money format: " & s)
+  # Extract a single leading sign, skipping whitespace and currency prefix
+  # characters (anything that is not a digit, separator, or sign). This
+  # accepts both ``-$1.00`` and ``$-1.00`` forms. Scanning stops at the
+  # first digit/separator. The sign character itself is left in ``trimmed``
+  # since the cleaning pass below filters non-digit/separator bytes.
+  for ch in trimmed:
+    if (ch >= '0' and ch <= '9') or ch == '.' or ch == ',':
+      break
+    if ch == '-':
+      if neg:
+        raise newException(PgTypeError, "Invalid money format: " & s)
+      neg = true
+      break
+    if ch == '+':
+      break
+  # Keep only digits and separators (.,). Everything else (currency symbols,
+  # whitespace, letters, UTF-8 bytes, sign characters) is discarded.
+  var cleaned = newStringOfCap(trimmed.len)
+  for ch in trimmed:
+    if (ch >= '0' and ch <= '9') or ch == '.' or ch == ',':
+      cleaned.add(ch)
+  if cleaned.len == 0:
+    raise newException(PgTypeError, "Invalid money format: " & s)
+  # Separate integer and fractional parts based on expected scale.
+  var wholePart: string
+  var fracPart: string
+  if scale == 0:
+    fracPart = ""
+    wholePart = newStringOfCap(cleaned.len)
+    for ch in cleaned:
+      if ch == '.' or ch == ',':
+        continue
+      wholePart.add(ch)
+  else:
+    var decIdx = -1
+    for i in countdown(cleaned.len - 1, 0):
+      if cleaned[i] == '.' or cleaned[i] == ',':
+        decIdx = i
+        break
+    if decIdx == -1:
+      raise newException(PgTypeError, "Invalid money format: " & s)
+    fracPart = cleaned[decIdx + 1 ..^ 1]
+    if fracPart.len != scale:
+      raise newException(PgTypeError, "Invalid money format: " & s)
+    for ch in fracPart:
+      if ch < '0' or ch > '9':
+        raise newException(PgTypeError, "Invalid money format: " & s)
+    wholePart = newStringOfCap(decIdx)
+    for i in 0 ..< decIdx:
+      let ch = cleaned[i]
+      if ch == '.' or ch == ',':
+        continue
+      wholePart.add(ch)
+  if wholePart.len == 0:
+    raise newException(PgTypeError, "Invalid money format: " & s)
+  for ch in wholePart:
+    if ch < '0' or ch > '9':
+      raise newException(PgTypeError, "Invalid money format: " & s)
+  # Accumulate magnitude in uint64 with overflow detection. abs(int64.low)
+  # equals uint64(int64.high) + 1, so the max allowed magnitude is magMax+1
+  # only when negative.
+  const magMax = uint64(high(int64))
+  var mag: uint64 = 0
+  for ch in wholePart:
+    let d = uint64(ord(ch) - ord('0'))
+    if mag > (high(uint64) - d) div 10'u64:
+      raise newException(PgTypeError, "Money value out of range: " & s)
+    mag = mag * 10 + d
+  for ch in fracPart:
+    let d = uint64(ord(ch) - ord('0'))
+    if mag > (high(uint64) - d) div 10'u64:
+      raise newException(PgTypeError, "Money value out of range: " & s)
+    mag = mag * 10 + d
+  if neg:
+    if mag == magMax + 1'u64:
+      return PgMoney(amount: low(int64), scale: int8(scale))
+    if mag > magMax:
+      raise newException(PgTypeError, "Money value out of range: " & s)
+    return PgMoney(amount: -int64(mag), scale: int8(scale))
+  else:
+    if mag > magMax:
+      raise newException(PgTypeError, "Money value out of range: " & s)
+    return PgMoney(amount: int64(mag), scale: int8(scale))
 
 proc `$`*(v: PgMacAddr): string {.borrow.}
 proc `==`*(a, b: PgMacAddr): bool {.borrow.}
@@ -789,6 +1048,11 @@ proc toPgParam*(v: PgUuid): PgParam =
 proc toPgParam*(v: PgNumeric): PgParam =
   PgParam(oid: OidNumeric, format: 0, value: some(toBytes($v)))
 
+proc toPgParam*(v: PgMoney): PgParam =
+  ## Uses binary format: money's text representation is ``lc_monetary``-dependent,
+  ## so a text round-trip is not reliable. Binary sends the raw int64 amount.
+  PgParam(oid: OidMoney, format: 1, value: some(@(toBE64(v.amount))))
+
 proc toPgParam*(v: PgInterval): PgParam =
   PgParam(oid: OidInterval, format: 0, value: some(toBytes($v)))
 
@@ -1116,6 +1380,9 @@ proc encodeNumericBinary*(v: PgNumeric): seq[byte] =
 proc toPgBinaryParam*(v: PgNumeric): PgParam =
   PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
 
+proc toPgBinaryParam*(v: PgMoney): PgParam =
+  PgParam(oid: OidMoney, format: 1, value: some(@(toBE64(v.amount))))
+
 proc toPgBinaryParam*(v: PgUuid): PgParam =
   let hex = string(v).replace("-", "")
   var bytes = newSeq[byte](16)
@@ -1297,6 +1564,7 @@ genArrayEncoder(PgInet, OidInetArray, OidInet)
 genArrayEncoder(PgCidr, OidCidrArray, OidCidr)
 genArrayEncoder(PgMacAddr, OidMacAddrArray, OidMacAddr)
 genArrayEncoder(PgMacAddr8, OidMacAddr8Array, OidMacAddr8)
+genArrayEncoder(PgMoney, OidMoneyArray, OidMoney)
 
 # Numeric / binary / JSON array encoders
 
@@ -2136,6 +2404,29 @@ proc getNumeric*(row: Row, col: int): PgNumeric =
     if clen >= 8:
       return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   parsePgNumeric(row.getStr(col))
+
+proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
+  ## Get a column value as PgMoney. Handles binary money (8-byte int64) and
+  ## locale-formatted text (see ``parsePgMoney`` for accepted forms).
+  ## ``scale`` is the server's ``frac_digits`` (default 2 for ``C`` /
+  ## ``en_US``; pass 0 for ``ja_JP`` etc.). The wire protocol does not expose
+  ## this, so callers must specify it when it differs from the default.
+  ## Raises ``PgTypeError`` on NULL or when ``scale`` is outside ``0..18``.
+  if scale < 0 or scale > 18:
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if row.isBinaryCol(col):
+    if clen == 8:
+      return PgMoney(
+        amount: fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale: int8(scale)
+      )
+    raise newException(
+      PgTypeError,
+      "Column " & $col & ": unexpected binary length " & $clen & " for money",
+    )
+  parsePgMoney(row.getStr(col), scale)
 
 proc getUuid*(row: Row, col: int): PgUuid =
   ## Get a column value as PgUuid. Handles binary format (16 bytes).
@@ -2982,6 +3273,7 @@ optAccessor(getInt64, getInt64Opt, int64)
 optAccessor(getFloat, getFloatOpt, float64)
 optAccessor(getFloat32, getFloat32Opt, float32)
 optAccessor(getNumeric, getNumericOpt, PgNumeric)
+optAccessor(getMoney, getMoneyOpt, PgMoney)
 optAccessor(getUuid, getUuidOpt, PgUuid)
 optAccessor(getBool, getBoolOpt, bool)
 optAccessor(getBytes, getBytesOpt, seq[byte])
@@ -3111,6 +3403,34 @@ proc getInt64Array*(row: Row, col: int): seq[int64] =
     if e.isNone:
       raise newException(PgTypeError, "NULL element in int64 array")
     result.add(parseBiggestInt(e.get))
+
+proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
+  ## Get a column value as a seq of PgMoney. Handles binary array format and
+  ## locale-formatted text arrays (see ``parsePgMoney``). ``scale`` tags each
+  ## element's ``frac_digits`` and is also used for text parsing.
+  ## Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
+  if scale < 0 or scale > 18:
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[PgMoney](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in money array")
+      result[i] = PgMoney(
+        amount: fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
+        scale: int8(scale),
+      )
+    return
+  let s = row.getStr(col)
+  let elems = parseTextArray(s)
+  for e in elems:
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in money array")
+    result.add(parsePgMoney(e.get, scale))
 
 proc getFloatArray*(row: Row, col: int): seq[float64] =
   ## Get a column value as a seq of float64. Handles binary array format.
@@ -3801,6 +4121,7 @@ optAccessor(getCidrArray, getCidrArrayOpt, seq[PgCidr])
 optAccessor(getMacAddrArray, getMacAddrArrayOpt, seq[PgMacAddr])
 optAccessor(getMacAddr8Array, getMacAddr8ArrayOpt, seq[PgMacAddr8])
 optAccessor(getNumericArray, getNumericArrayOpt, seq[PgNumeric])
+optAccessor(getMoneyArray, getMoneyArrayOpt, seq[PgMoney])
 optAccessor(getBytesArray, getBytesArrayOpt, seq[seq[byte]])
 optAccessor(getJsonArray, getJsonArrayOpt, seq[JsonNode])
 optAccessor(getPointArray, getPointArrayOpt, seq[PgPoint])
@@ -5823,6 +6144,9 @@ proc get*(row: Row, col: int, T: typedesc[seq[byte]]): seq[byte] =
 proc get*(row: Row, col: int, T: typedesc[PgNumeric]): PgNumeric =
   row.getNumeric(col)
 
+proc get*(row: Row, col: int, T: typedesc[PgMoney]): PgMoney =
+  row.getMoney(col)
+
 proc get*(row: Row, col: int, T: typedesc[JsonNode]): JsonNode =
   row.getJson(col)
 
@@ -5932,6 +6256,9 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgMacAddr8]]): seq[PgMacAddr8] =
 
 proc get*(row: Row, col: int, T: typedesc[seq[PgNumeric]]): seq[PgNumeric] =
   row.getNumericArray(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[PgMoney]]): seq[PgMoney] =
+  row.getMoneyArray(col)
 
 proc get*(row: Row, col: int, T: typedesc[seq[JsonNode]]): seq[JsonNode] =
   row.getJsonArray(col)
@@ -6048,6 +6375,7 @@ nameAccessor(getFloat, float64)
 nameAccessor(getBool, bool)
 nameAccessor(getBytes, seq[byte])
 nameAccessor(getNumeric, PgNumeric)
+nameAccessor(getMoney, PgMoney)
 nameAccessor(getUuid, PgUuid)
 nameAccessor(getTimestamp, DateTime)
 nameAccessor(getDate, DateTime)
@@ -6074,6 +6402,7 @@ nameAccessor(getIntOpt, Option[int32])
 nameAccessor(getInt64Opt, Option[int64])
 nameAccessor(getFloatOpt, Option[float64])
 nameAccessor(getNumericOpt, Option[PgNumeric])
+nameAccessor(getMoneyOpt, Option[PgMoney])
 nameAccessor(getUuidOpt, Option[PgUuid])
 nameAccessor(getBoolOpt, Option[bool])
 nameAccessor(getJsonOpt, Option[JsonNode])
@@ -6122,6 +6451,7 @@ nameAccessor(getCidrArray, seq[PgCidr])
 nameAccessor(getMacAddrArray, seq[PgMacAddr])
 nameAccessor(getMacAddr8Array, seq[PgMacAddr8])
 nameAccessor(getNumericArray, seq[PgNumeric])
+nameAccessor(getMoneyArray, seq[PgMoney])
 nameAccessor(getBytesArray, seq[seq[byte]])
 nameAccessor(getJsonArray, seq[JsonNode])
 nameAccessor(getPointArray, seq[PgPoint])
@@ -6146,6 +6476,7 @@ nameAccessor(getCidrArrayOpt, Option[seq[PgCidr]])
 nameAccessor(getMacAddrArrayOpt, Option[seq[PgMacAddr]])
 nameAccessor(getMacAddr8ArrayOpt, Option[seq[PgMacAddr8]])
 nameAccessor(getNumericArrayOpt, Option[seq[PgNumeric]])
+nameAccessor(getMoneyArrayOpt, Option[seq[PgMoney]])
 nameAccessor(getBytesArrayOpt, Option[seq[seq[byte]]])
 nameAccessor(getJsonArrayOpt, Option[seq[JsonNode]])
 nameAccessor(getPointArrayOpt, Option[seq[PgPoint]])

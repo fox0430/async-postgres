@@ -3226,6 +3226,86 @@ suite "E2E: JSON and Numeric":
 
     waitFor t()
 
+suite "E2E: Money":
+  test "money binary param and binary result roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      for v in [
+        initPgMoney(0),
+        initPgMoney(123456),
+        initPgMoney(-123456),
+        initPgMoney(low(int64)),
+        initPgMoney(high(int64)),
+      ]:
+        let res =
+          await conn.query("SELECT $1::money", @[toPgParam(v)], resultFormat = rfBinary)
+        doAssert res.rows.len == 1
+        doAssert res.rows[0].getMoney(0) == v
+      await conn.close()
+
+    waitFor t()
+
+  test "money text result from server":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # Force C-locale formatting so the test is deterministic regardless of
+      # the server's lc_monetary setting.
+      discard await conn.exec("SET lc_monetary = 'C'")
+      let res = await conn.query("SELECT 1234.56::money")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getMoney(0) == initPgMoney(123456)
+      await conn.close()
+
+    waitFor t()
+
+  test "money stored in table":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_money")
+      discard await conn.exec("CREATE TABLE test_money (id int, val money)")
+      discard await conn.exec(
+        "INSERT INTO test_money VALUES (1, $1), (2, $2), (3, $3)",
+        @[
+          toPgParam(initPgMoney(0)),
+          toPgParam(initPgMoney(-123456)),
+          toPgParam(initPgMoney(99999999)),
+        ],
+      )
+      let res = await conn.query(
+        "SELECT val FROM test_money ORDER BY id", resultFormat = rfBinary
+      )
+      doAssert res.rows.len == 3
+      doAssert res.rows[0].getMoney(0) == initPgMoney(0)
+      doAssert res.rows[1].getMoney(0) == initPgMoney(-123456)
+      doAssert res.rows[2].getMoney(0) == initPgMoney(99999999)
+      discard await conn.exec("DROP TABLE test_money")
+      await conn.close()
+
+    waitFor t()
+
+  test "money NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::money", resultFormat = rfBinary)
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getMoneyOpt(0) == none(PgMoney)
+      await conn.close()
+
+    waitFor t()
+
+  test "money array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let values = @[initPgMoney(100), initPgMoney(-50), initPgMoney(999999)]
+      let res = await conn.query(
+        "SELECT $1::money[]", @[toPgParam(values)], resultFormat = rfBinary
+      )
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getMoneyArray(0) == values
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Connection Edge Cases":
   test "double close is safe":
     proc t() {.async.} =
