@@ -215,6 +215,9 @@ type
   TraceQueryStartData* = object ## Data passed to the query/exec start hook.
     sql*: string
     params*: seq[PgParam]
+    paramsInline*: seq[PgParamInline]
+      ## Populated when the caller used a `PgParamInline` overload; empty
+      ## otherwise. Tracers that want a single view can check both fields.
     isExec*: bool ## true for exec, false for query
 
   TraceQueryEndData* = object ## Data passed to the query/exec end hook.

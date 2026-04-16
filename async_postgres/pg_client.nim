@@ -66,10 +66,21 @@ type
   PipelineOp = object
     kind: PipelineOpKind
     sql: string
+    # Legacy path — populated by the `seq[PgParam]` overloads. These seqs own
+    # the per-parameter byte payloads directly, avoiding an extra copy into
+    # Pipeline-level storage for bulk-string workloads.
     params: seq[Option[seq[byte]]]
     paramOids: seq[int32]
     paramFormats: seq[int16]
     resultFormats: seq[int16]
+    # Inline path — populated by the `openArray[PgParamInline]` overloads.
+    # Points at slices of the Pipeline-level SoA buffers
+    # (`inlineRanges`/`inlineOids`/`inlineFormats`/`inlineData`). `hasInline`
+    # true means the send phase should use these slices instead of the legacy
+    # fields above.
+    hasInline: bool
+    inlineStart: int32
+    inlineCount: int32
     # Set during send phase
     cacheHit: bool
     cacheMiss: bool
@@ -91,6 +102,13 @@ type
     ## Batch of queries/execs sent through the PostgreSQL pipeline protocol.
     conn: PgConnection
     ops: seq[PipelineOp]
+    # SoA storage shared by all ops added via the `PgParamInline` path.
+    # Index ranges in each op point into these sequences, eliminating per-op
+    # parameter allocations.
+    inlineData: seq[byte]
+    inlineRanges: seq[tuple[off: int32, len: int32]]
+    inlineOids: seq[int32]
+    inlineFormats: seq[int16]
 
   IsolatedPipelineResults* = object
     ## Results from `executeIsolated`: per-op error isolation via per-query SYNC.
@@ -368,6 +386,161 @@ proc exec*(
         raise newException(PgTimeoutError, "Exec timed out")
     else:
       tag = await execImpl(conn, sql, params)
+  return initCommandResult(tag)
+
+proc flattenInline(
+    params: openArray[PgParamInline]
+): tuple[
+  data: seq[byte],
+  ranges: seq[tuple[off: int32, len: int32]],
+  oids: seq[int32],
+  formats: seq[int16],
+] =
+  if params.len == 0:
+    return
+  result.oids = newSeqOfCap[int32](params.len)
+  result.formats = newSeqOfCap[int16](params.len)
+  result.ranges = newSeqOfCap[tuple[off: int32, len: int32]](params.len)
+  var estBytes = 0
+  for p in params:
+    if p.len > 0:
+      estBytes += int(p.len)
+  result.data = newSeqOfCap[byte](estBytes)
+  for p in params:
+    result.oids.add p.oid
+    result.formats.add p.format
+    if p.len == -1:
+      result.ranges.add (off: int32(0), len: int32(-1))
+    elif p.len == 0:
+      result.ranges.add (off: int32(result.data.len), len: int32(0))
+    elif p.len <= PgInlineBufSize:
+      let off = int32(result.data.len)
+      let oldLen = result.data.len
+      result.data.setLen(oldLen + int(p.len))
+      copyMem(addr result.data[oldLen], unsafeAddr p.inlineBuf[0], int(p.len))
+      result.ranges.add (off: off, len: p.len)
+    else:
+      let off = int32(result.data.len)
+      let oldLen = result.data.len
+      result.data.setLen(oldLen + int(p.len))
+      copyMem(addr result.data[oldLen], unsafeAddr p.overflow[0], int(p.len))
+      result.ranges.add (off: off, len: p.len)
+
+proc execInlineImpl(
+    conn: PgConnection,
+    sql: string,
+    data: seq[byte],
+    ranges: seq[tuple[off: int32, len: int32]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    timeout: Duration = ZeroDuration,
+): Future[string] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
+  var cacheMiss = false
+  var stmtName = ""
+
+  conn.sendBuf.setLen(0)
+  if cacheHit:
+    stmtName = cached.name
+    conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  elif conn.stmtCacheCapacity > 0:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, paramOids)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  else:
+    conn.sendBuf.addParse("", sql, paramOids)
+    conn.sendBuf.addBindRaw("", "", paramFormats, data, ranges)
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+
+  var commandTag = ""
+  var queryError: ref PgQueryError
+  var cachedFields: seq[FieldDescription]
+
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+          discard
+        of bmkParameterDescription:
+          discard
+        of bmkRowDescription:
+          if cacheMiss:
+            cachedFields = msg.fields
+        of bmkNoData:
+          discard
+        of bmkDataRow:
+          discard
+        of bmkCommandComplete:
+          commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            if cacheHit and queryError.sqlState == "26000":
+              conn.removeStmtCache(sql)
+            raise queryError
+          if cacheMiss:
+            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
+
+  return commandTag
+
+proc exec*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParamInline],
+    timeout: Duration = ZeroDuration,
+): Future[CommandResult] {.async.} =
+  ## Execute a statement with heap-alloc-free inline parameters.
+  ## Prefer this overload for scalar-heavy workloads (e.g. bulk INSERT of
+  ## numeric columns) where `seq[PgParam]` would heap-allocate per parameter.
+  let (data, ranges, oids, formats) = flattenInline(params)
+  var tag: string
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, paramsInline: params, isExec: true),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: tag),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        tag = await execInlineImpl(conn, sql, data, ranges, oids, formats, timeout).wait(
+          timeout
+        )
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "Exec timed out")
+    else:
+      tag = await execInlineImpl(conn, sql, data, ranges, oids, formats)
   return initCommandResult(tag)
 
 template queryRecvLoop(
@@ -839,6 +1012,108 @@ proc query*(
         raise newException(PgTimeoutError, "Query timed out")
     else:
       qr = await queryImpl(conn, sql, params, resultFormats)
+  return qr
+
+proc queryInlineImpl(
+    conn: PgConnection,
+    sql: string,
+    data: seq[byte],
+    ranges: seq[tuple[off: int32, len: int32]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    resultFormats: seq[int16] = @[],
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  conn.checkReady()
+  conn.state = csBusy
+
+  let cached = conn.lookupStmtCache(sql)
+  var cacheHit = cached != nil
+  var cacheMiss = false
+  var stmtName = ""
+  var cachedFields: seq[FieldDescription]
+  var cachedColFmts: seq[int16]
+  var cachedColOids: seq[int32]
+  var effectiveResultFormats: seq[int16]
+
+  conn.sendBuf.setLen(0)
+  if cacheHit:
+    stmtName = cached.name
+    cachedFields = cached.fields
+    cachedColFmts = cached.colFmts
+    cachedColOids = cached.colOids
+    effectiveResultFormats =
+      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+    conn.sendBuf.addBindRaw(
+      "", stmtName, paramFormats, data, ranges, effectiveResultFormats
+    )
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  elif conn.stmtCacheCapacity > 0:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    effectiveResultFormats = resultFormats
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.sendBuf.addParse(stmtName, sql, paramOids)
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.sendBuf.addBindRaw(
+      "", stmtName, paramFormats, data, ranges, effectiveResultFormats
+    )
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+  else:
+    effectiveResultFormats = resultFormats
+    conn.sendBuf.addParse("", sql, paramOids)
+    conn.sendBuf.addBindRaw("", "", paramFormats, data, ranges, effectiveResultFormats)
+    conn.sendBuf.addDescribe(dkPortal, "")
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+    await conn.sendBufMsg()
+
+  var qr = QueryResult()
+  queryRecvLoop(
+    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+    cachedColFmts, cachedColOids, qr, timeout,
+  )
+  return qr
+
+proc query*(
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParamInline],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query with heap-alloc-free inline parameters.
+  ## Prefer this overload for scalar-heavy workloads where `seq[PgParam]`
+  ## would heap-allocate per parameter.
+  let (data, ranges, oids, formats) = flattenInline(params)
+  var qr: QueryResult
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, paramsInline: params, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
+  ):
+    let resultFormats = resultFormat.toFormatCodes()
+    if timeout > ZeroDuration:
+      try:
+        qr = await queryInlineImpl(
+          conn, sql, data, ranges, oids, formats, resultFormats, timeout
+        )
+          .wait(timeout)
+      except AsyncTimeoutError:
+        conn.cancelNoWait()
+        conn.state = csClosed
+        raise newException(PgTimeoutError, "Query timed out")
+    else:
+      qr = await queryInlineImpl(conn, sql, data, ranges, oids, formats, resultFormats)
   return qr
 
 proc queryOne*(
@@ -2153,6 +2428,33 @@ proc newPipeline*(conn: PgConnection): Pipeline =
   ## Create a new pipeline for batching multiple operations into a single round trip.
   Pipeline(conn: conn, ops: @[])
 
+proc appendInline(
+    p: Pipeline, params: openArray[PgParamInline]
+): tuple[start, count: int32] =
+  ## Append inline params to the Pipeline-level SoA buffers. Returns
+  ## `(start, count)` identifying the appended slice.
+  result.start = int32(p.inlineRanges.len)
+  result.count = int32(params.len)
+  for pi in params:
+    p.inlineOids.add pi.oid
+    p.inlineFormats.add pi.format
+    if pi.len == -1:
+      p.inlineRanges.add (off: int32(0), len: int32(-1))
+    elif pi.len == 0:
+      p.inlineRanges.add (off: int32(p.inlineData.len), len: int32(0))
+    elif pi.len <= PgInlineBufSize:
+      let off = int32(p.inlineData.len)
+      let oldLen = p.inlineData.len
+      p.inlineData.setLen(oldLen + int(pi.len))
+      copyMem(addr p.inlineData[oldLen], unsafeAddr pi.inlineBuf[0], int(pi.len))
+      p.inlineRanges.add (off: off, len: pi.len)
+    else:
+      let off = int32(p.inlineData.len)
+      let oldLen = p.inlineData.len
+      p.inlineData.setLen(oldLen + int(pi.len))
+      copyMem(addr p.inlineData[oldLen], unsafeAddr pi.overflow[0], int(pi.len))
+      p.inlineRanges.add (off: off, len: pi.len)
+
 proc addExec*(p: Pipeline, sql: string, params: seq[PgParam] = @[]) =
   ## Add an exec operation to the pipeline with typed parameters.
   var op = PipelineOp(kind: pokExec, sql: sql)
@@ -2183,6 +2485,30 @@ proc addQuery*(
     resultFormats: resultFormat.toFormatCodes(),
   )
 
+proc addExec*(p: Pipeline, sql: string, params: openArray[PgParamInline]) =
+  ## Add an exec operation using the heap-alloc-free `PgParamInline` path.
+  let (start, count) = p.appendInline(params)
+  p.ops.add PipelineOp(
+    kind: pokExec, sql: sql, hasInline: true, inlineStart: start, inlineCount: count
+  )
+
+proc addQuery*(
+    p: Pipeline,
+    sql: string,
+    params: openArray[PgParamInline],
+    resultFormat: ResultFormat = rfAuto,
+) =
+  ## Add a query operation using the heap-alloc-free `PgParamInline` path.
+  let (start, count) = p.appendInline(params)
+  p.ops.add PipelineOp(
+    kind: pokQuery,
+    sql: sql,
+    hasInline: true,
+    inlineStart: start,
+    inlineCount: count,
+    resultFormats: resultFormat.toFormatCodes(),
+  )
+
 proc executeImpl(
     p: Pipeline, timeout: Duration = ZeroDuration
 ): Future[seq[PipelineResult]] {.async.} =
@@ -2198,14 +2524,42 @@ proc executeImpl(
   var defaultFormats: seq[int16] # reused across ops when paramFormats is empty
 
   for i in 0 ..< p.ops.len:
-    let formats =
-      if p.ops[i].paramFormats.len > 0:
-        p.ops[i].paramFormats
+    let hasInline = p.ops[i].hasInline
+    let startIdx = int(p.ops[i].inlineStart)
+    let endIdx = startIdx + int(p.ops[i].inlineCount) - 1
+    if not hasInline and p.ops[i].paramFormats.len == 0:
+      let needed = p.ops[i].params.len
+      if defaultFormats.len != needed:
+        defaultFormats = newSeq[int16](needed)
+
+    template currentFormats(): openArray[int16] =
+      if hasInline:
+        p.inlineFormats.toOpenArray(startIdx, endIdx)
+      elif p.ops[i].paramFormats.len > 0:
+        p.ops[i].paramFormats.toOpenArray(0, p.ops[i].paramFormats.high)
       else:
-        let needed = p.ops[i].params.len
-        if defaultFormats.len != needed:
-          defaultFormats = newSeq[int16](needed)
-        defaultFormats
+        defaultFormats.toOpenArray(0, defaultFormats.high)
+
+    template emitBind(stmt: string, resultFmts: openArray[int16]) =
+      if hasInline:
+        conn.sendBuf.addBindRaw(
+          "",
+          stmt,
+          currentFormats(),
+          p.inlineData,
+          p.inlineRanges.toOpenArray(startIdx, endIdx),
+          resultFmts,
+        )
+      else:
+        conn.sendBuf.addBind("", stmt, currentFormats(), p.ops[i].params, resultFmts)
+
+    template emitParse(stmt: string) =
+      if hasInline:
+        conn.sendBuf.addParse(
+          stmt, p.ops[i].sql, p.inlineOids.toOpenArray(startIdx, endIdx)
+        )
+      else:
+        conn.sendBuf.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
 
     let cached = conn.lookupStmtCache(p.ops[i].sql)
     p.ops[i].cacheHit = cached != nil
@@ -2226,9 +2580,7 @@ proc executeImpl(
           else:
             p.ops[i].resultFormats
         p.ops[i].resultFormats = effectiveResultFormats
-      conn.sendBuf.addBind(
-        "", cached.name, formats, p.ops[i].params, effectiveResultFormats
-      )
+      emitBind(cached.name, effectiveResultFormats)
       conn.sendBuf.addExecute("", 0)
     elif conn.stmtCacheCapacity > 0:
       p.ops[i].cacheMiss = true
@@ -2238,21 +2590,24 @@ proc executeImpl(
         let evicted = conn.evictStmtCache()
         conn.sendBuf.addClose(dkStatement, evicted.name)
       inc pendingCacheAdds
-      conn.sendBuf.addParse(p.ops[i].stmtName, p.ops[i].sql, p.ops[i].paramOids)
+      emitParse(p.ops[i].stmtName)
       conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
-      conn.sendBuf.addBind(
-        "", p.ops[i].stmtName, formats, p.ops[i].params, p.ops[i].resultFormats
-      )
+      emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
       conn.sendBuf.addExecute("", 0)
     else:
-      conn.sendBuf.addParse("", p.ops[i].sql, p.ops[i].paramOids)
-      conn.sendBuf.addBind("", "", formats, p.ops[i].params, p.ops[i].resultFormats)
+      emitParse("")
+      emitBind("", p.ops[i].resultFormats)
       if p.ops[i].kind == pokQuery:
         conn.sendBuf.addDescribe(dkPortal, "")
       conn.sendBuf.addExecute("", 0)
 
   conn.sendBuf.addSync()
-  await conn.sendBufMsg()
+  when hasChronos:
+    # chronos drains the send Future in the background while we descend into
+    # the receive loop; for asyncdispatch we keep the original serial behavior.
+    var sendFut = conn.sendBufMsg()
+  else:
+    await conn.sendBufMsg()
 
   # Receive Phase
   var results = newSeq[PipelineResult](p.ops.len)
@@ -2372,7 +2727,27 @@ proc executeImpl(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      when hasChronos:
+        try:
+          await conn.fillRecvBuf(timeout)
+        except CatchableError:
+          # recv failed with an in-flight send: don't leak sendFut as an
+          # unhandled Future. Cancel it and let the recv error propagate.
+          if not sendFut.finished:
+            try:
+              await cancelAndWait(sendFut)
+            except CatchableError:
+              discard
+          raise
+      else:
+        await conn.fillRecvBuf(timeout)
+
+  when hasChronos:
+    # Propagate any write error whether the send completed before or after
+    # the recv loop finished. `await` on an already-finished Future re-raises
+    # a stored exception, so this covers both "still running" and
+    # "finished-with-error" cases.
+    await sendFut
 
   return results
 
@@ -2417,17 +2792,45 @@ proc executeIsolatedImpl(
   var cachedStmts: seq[CachedStmt]
   var hasCachedStmts = false
   var pendingCacheAdds = 0
-  var defaultFormats: seq[int16]
 
+  var defaultFormats: seq[int16]
   for i in 0 ..< p.ops.len:
-    let formats =
-      if p.ops[i].paramFormats.len > 0:
-        p.ops[i].paramFormats
+    let hasInline = p.ops[i].hasInline
+    let startIdx = int(p.ops[i].inlineStart)
+    let endIdx = startIdx + int(p.ops[i].inlineCount) - 1
+    if not hasInline and p.ops[i].paramFormats.len == 0:
+      let needed = p.ops[i].params.len
+      if defaultFormats.len != needed:
+        defaultFormats = newSeq[int16](needed)
+
+    template currentFormats(): openArray[int16] =
+      if hasInline:
+        p.inlineFormats.toOpenArray(startIdx, endIdx)
+      elif p.ops[i].paramFormats.len > 0:
+        p.ops[i].paramFormats.toOpenArray(0, p.ops[i].paramFormats.high)
       else:
-        let needed = p.ops[i].params.len
-        if defaultFormats.len != needed:
-          defaultFormats = newSeq[int16](needed)
-        defaultFormats
+        defaultFormats.toOpenArray(0, defaultFormats.high)
+
+    template emitBind(stmt: string, resultFmts: openArray[int16]) =
+      if hasInline:
+        conn.sendBuf.addBindRaw(
+          "",
+          stmt,
+          currentFormats(),
+          p.inlineData,
+          p.inlineRanges.toOpenArray(startIdx, endIdx),
+          resultFmts,
+        )
+      else:
+        conn.sendBuf.addBind("", stmt, currentFormats(), p.ops[i].params, resultFmts)
+
+    template emitParse(stmt: string) =
+      if hasInline:
+        conn.sendBuf.addParse(
+          stmt, p.ops[i].sql, p.inlineOids.toOpenArray(startIdx, endIdx)
+        )
+      else:
+        conn.sendBuf.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
 
     let cached = conn.lookupStmtCache(p.ops[i].sql)
     p.ops[i].cacheHit = cached != nil
@@ -2448,9 +2851,7 @@ proc executeIsolatedImpl(
           else:
             p.ops[i].resultFormats
         p.ops[i].resultFormats = effectiveResultFormats
-      conn.sendBuf.addBind(
-        "", cached.name, formats, p.ops[i].params, effectiveResultFormats
-      )
+      emitBind(cached.name, effectiveResultFormats)
       conn.sendBuf.addExecute("", 0)
     elif conn.stmtCacheCapacity > 0:
       p.ops[i].cacheMiss = true
@@ -2460,15 +2861,13 @@ proc executeIsolatedImpl(
         let evicted = conn.evictStmtCache()
         conn.sendBuf.addClose(dkStatement, evicted.name)
       inc pendingCacheAdds
-      conn.sendBuf.addParse(p.ops[i].stmtName, p.ops[i].sql, p.ops[i].paramOids)
+      emitParse(p.ops[i].stmtName)
       conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
-      conn.sendBuf.addBind(
-        "", p.ops[i].stmtName, formats, p.ops[i].params, p.ops[i].resultFormats
-      )
+      emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
       conn.sendBuf.addExecute("", 0)
     else:
-      conn.sendBuf.addParse("", p.ops[i].sql, p.ops[i].paramOids)
-      conn.sendBuf.addBind("", "", formats, p.ops[i].params, p.ops[i].resultFormats)
+      emitParse("")
+      emitBind("", p.ops[i].resultFormats)
       if p.ops[i].kind == pokQuery:
         conn.sendBuf.addDescribe(dkPortal, "")
       conn.sendBuf.addExecute("", 0)

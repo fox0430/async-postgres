@@ -134,6 +134,19 @@ type
     format*: int16 # 0=text, 1=binary
     value*: Option[seq[byte]]
 
+  PgParamInline* = object
+    ## Heap-alloc-free parameter for scalar types. Binary payloads up to
+    ## `PgInlineBufSize` bytes live in `inlineBuf`; longer values spill into
+    ## `overflow`. Use `toPgParamInline` to construct; pass to the `openArray
+    ## [PgParamInline]` overloads of `exec`, `query`, `addExec`, `addQuery`.
+    oid*: int32
+    format*: int16 # 0=text, 1=binary
+    len*: int32
+      ## -1 = NULL; 0..PgInlineBufSize uses `inlineBuf`;
+      ## > PgInlineBufSize uses `overflow`.
+    inlineBuf*: array[16, byte]
+    overflow*: seq[byte]
+
   ResultFormat* = enum
     ## How result columns should be encoded by the server.
     rfAuto ## Per-column binary-safe detection via statement cache (default).
@@ -289,6 +302,10 @@ const
   rangeHasUpper* = 0x04'u8 ## Range flag: upper bound present.
   rangeLowerInc* = 0x08'u8 ## Range flag: lower bound is inclusive.
   rangeUpperInc* = 0x10'u8 ## Range flag: upper bound is inclusive.
+
+  PgInlineBufSize* = 16
+    ## Maximum payload size that fits in `PgParamInline.inlineBuf` without a
+    ## heap allocation. Values longer than this are stored in `overflow`.
 
 proc `$`*(v: PgUuid): string {.borrow.}
 proc `==`*(a, b: PgUuid): bool {.borrow.}
@@ -992,6 +1009,100 @@ proc decodeFloat64BE*(data: openArray[byte], offset: int = 0): float64 =
     (uint64(data[offset + 4]) shl 24) or (uint64(data[offset + 5]) shl 16) or
     (uint64(data[offset + 6]) shl 8) or uint64(data[offset + 7])
   copyMem(addr result, addr bits, 8)
+
+proc toPgParamInline*(v: int16): PgParamInline =
+  result.oid = OidInt2
+  result.format = 1
+  result.len = 2
+  let be = toBE16(v)
+  result.inlineBuf[0] = be[0]
+  result.inlineBuf[1] = be[1]
+
+proc toPgParamInline*(v: int32): PgParamInline =
+  result.oid = OidInt4
+  result.format = 1
+  result.len = 4
+  let be = toBE32(v)
+  result.inlineBuf[0] = be[0]
+  result.inlineBuf[1] = be[1]
+  result.inlineBuf[2] = be[2]
+  result.inlineBuf[3] = be[3]
+
+proc toPgParamInline*(v: int64): PgParamInline =
+  result.oid = OidInt8
+  result.format = 1
+  result.len = 8
+  let be = toBE64(v)
+  for i in 0 ..< 8:
+    result.inlineBuf[i] = be[i]
+
+proc toPgParamInline*(v: int): PgParamInline =
+  toPgParamInline(int64(v))
+
+proc toPgParamInline*(v: float32): PgParamInline =
+  result.oid = OidFloat4
+  result.format = 1
+  result.len = 4
+  let be = toBE32(cast[int32](v))
+  result.inlineBuf[0] = be[0]
+  result.inlineBuf[1] = be[1]
+  result.inlineBuf[2] = be[2]
+  result.inlineBuf[3] = be[3]
+
+proc toPgParamInline*(v: float64): PgParamInline =
+  result.oid = OidFloat8
+  result.format = 1
+  result.len = 8
+  let be = toBE64(cast[int64](v))
+  for i in 0 ..< 8:
+    result.inlineBuf[i] = be[i]
+
+proc toPgParamInline*(v: bool): PgParamInline =
+  result.oid = OidBool
+  result.format = 1
+  result.len = 1
+  result.inlineBuf[0] = if v: 1'u8 else: 0'u8
+
+proc toPgParamInline*(v: string): PgParamInline =
+  result.oid = OidText
+  result.format = 0
+  result.len = int32(v.len)
+  if v.len == 0:
+    discard
+  elif v.len <= PgInlineBufSize:
+    copyMem(addr result.inlineBuf[0], unsafeAddr v[0], v.len)
+  else:
+    result.overflow = newSeq[byte](v.len)
+    copyMem(addr result.overflow[0], unsafeAddr v[0], v.len)
+
+proc toPgParamInline*(v: seq[byte]): PgParamInline =
+  result.oid = OidBytea
+  result.format = 0
+  result.len = int32(v.len)
+  if v.len == 0:
+    discard
+  elif v.len <= PgInlineBufSize:
+    copyMem(addr result.inlineBuf[0], unsafeAddr v[0], v.len)
+  else:
+    result.overflow = v
+
+proc toPgParamInline*(v: PgUuid): PgParamInline =
+  toPgParamInline(string(v))
+
+proc toPgParamInline*(v: PgMoney): PgParamInline =
+  result.oid = OidMoney
+  result.format = 1
+  result.len = 8
+  let be = toBE64(v.amount)
+  for i in 0 ..< 8:
+    result.inlineBuf[i] = be[i]
+
+proc toPgParamInline*[T](v: Option[T]): PgParamInline =
+  if v.isSome:
+    toPgParamInline(v.get)
+  else:
+    let tmpl = toPgParamInline(default(T))
+    PgParamInline(oid: tmpl.oid, format: tmpl.format, len: -1)
 
 proc toPgParam*(v: string): PgParam =
   ## Convert a Nim value to a PgParam for use as a query parameter.
@@ -2199,13 +2310,35 @@ converter toRow*(cells: seq[Option[seq[byte]]]): Row =
       rd.buf.add(data)
   initRow(rd, 0)
 
+proc parseAffectedRowsRaw*(tag: openArray[char]): int64 =
+  ## Extract row count from the raw bytes of a command tag (e.g.
+  ## "UPDATE 3" -> 3, "INSERT 0 1" -> 1). Unlike `parseAffectedRows(string)`
+  ## this performs zero heap allocation — useful for pipelines that process
+  ## many `CommandComplete` messages.
+  ##
+  ## Mirrors the legacy `split(' ')` semantics exactly: the last token (bytes
+  ## after the final space) must parse as an integer; a trailing space or any
+  ## non-numeric tail yields 0.
+  if tag.len == 0:
+    return 0
+  var lo = tag.high
+  while lo >= 0 and tag[lo] != ' ':
+    dec lo
+  inc lo
+  if lo > tag.high:
+    return 0
+  var parsed: BiggestInt = 0
+  try:
+    let consumed = parseutils.parseBiggestInt(tag.toOpenArray(lo, tag.high), parsed)
+    if consumed == 0 or consumed != tag.high - lo + 1:
+      return 0
+  except ValueError, OverflowDefect:
+    return 0
+  parsed
+
 proc parseAffectedRows*(tag: string): int64 =
   ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).
-  let parts = tag.split(' ')
-  try:
-    parseBiggestInt(parts[^1])
-  except ValueError, OverflowDefect:
-    0
+  parseAffectedRowsRaw(tag.toOpenArray(0, tag.high))
 
 proc initCommandResult*(tag: string): CommandResult {.inline.} =
   CommandResult(commandTag: tag)
