@@ -1912,12 +1912,10 @@ converter toRow*(cells: seq[Option[seq[byte]]]): Row =
 proc parseAffectedRows*(tag: string): int64 =
   ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).
   let parts = tag.split(' ')
-  if parts.len > 0:
-    try:
-      return parseBiggestInt(parts[^1])
-    except ValueError:
-      return 0
-  return 0
+  try:
+    parseBiggestInt(parts[^1])
+  except ValueError, OverflowDefect:
+    0
 
 proc initCommandResult*(tag: string): CommandResult {.inline.} =
   CommandResult(commandTag: tag)

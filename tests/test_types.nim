@@ -989,6 +989,27 @@ suite "parseAffectedRows":
   test "non-numeric tag":
     check parseAffectedRows("CREATE TABLE") == 0
 
+  test "COPY tag":
+    check parseAffectedRows("COPY 100") == 100
+
+  test "MERGE tag":
+    check parseAffectedRows("MERGE 7") == 7
+
+  test "MOVE tag":
+    check parseAffectedRows("MOVE 12") == 12
+
+  test "FETCH tag":
+    check parseAffectedRows("FETCH 4") == 4
+
+  test "trailing whitespace falls back to 0":
+    check parseAffectedRows("UPDATE 3 ") == 0
+
+  test "overflow falls back to 0":
+    check parseAffectedRows("UPDATE 99999999999999999999999999") == 0
+
+  test "single-token DDL tag":
+    check parseAffectedRows("BEGIN") == 0
+
 suite "Option accessors":
   test "getStrOpt some":
     let row: Row = @[some(toBytes("hello"))]
