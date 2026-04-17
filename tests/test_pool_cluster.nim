@@ -353,12 +353,12 @@ suite "Write routing":
     expect(PgError):
       discard waitFor cluster.writeQuery("SELECT 1")
 
-  test "writeQueryOne routes to primary":
+  test "writeQueryRowOpt routes to primary":
     let cluster = makeCluster()
     cluster.primary.closed = true
 
     expect(PgError):
-      discard waitFor cluster.writeQueryOne("SELECT 1")
+      discard waitFor cluster.writeQueryRowOpt("SELECT 1")
 
   test "writeQueryRow routes to primary":
     let cluster = makeCluster()
@@ -455,13 +455,13 @@ suite "Read routing targets replica":
     expect(PgError):
       discard waitFor cluster.readQuery("SELECT 1")
 
-  test "readQueryOne routes to replica":
+  test "readQueryRowOpt routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
     cluster.fallback = fallbackNone
 
     expect(PgError):
-      discard waitFor cluster.readQueryOne("SELECT 1")
+      discard waitFor cluster.readQueryRowOpt("SELECT 1")
 
   test "readQueryRow routes to replica":
     let cluster = makeCluster()
