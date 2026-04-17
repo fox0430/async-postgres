@@ -1,7 +1,11 @@
-import std/[json, unittest, options, strutils, tables, times, math, net, typetraits]
+import
+  std/[
+    json, unittest, options, strutils, tables, times, math, net, typetraits, importutils
+  ]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
+import ../async_postgres/pg_client {.all.}
 
 type
   UsPostalCode = distinct string
@@ -5850,3 +5854,490 @@ suite "Multirange array types":
     let row: Row = @[p.value]
     let arr = row.getNumMultirangeArray(0)
     check arr.len == 1
+
+proc inlinePayload(p: PgParamInline): seq[byte] =
+  ## Reconstruct the binary payload a PgParamInline would emit on the wire,
+  ## picking between `inlineBuf` and `overflow` based on `len`.
+  if p.len == -1:
+    return @[]
+  if p.len == 0:
+    return @[]
+  if p.len <= PgInlineBufSize:
+    result = newSeq[byte](p.len)
+    copyMem(addr result[0], unsafeAddr p.inlineBuf[0], p.len)
+  else:
+    result = p.overflow
+
+suite "toPgParamInline":
+  test "int16 encodes as binary BE and fits inline":
+    let p = toPgParamInline(42'i16)
+    check p.oid == OidInt2
+    check p.format == 1
+    check p.len == 2
+    check inlinePayload(p) == @(toBE16(42'i16))
+
+  test "int16 negative":
+    let p = toPgParamInline(-1'i16)
+    check inlinePayload(p) == @(toBE16(-1'i16))
+
+  test "int32 wire-format matches toPgParam":
+    let old = toPgParam(123456'i32)
+    let new = toPgParamInline(123456'i32)
+    check new.oid == old.oid
+    check new.format == old.format
+    check inlinePayload(new) == old.value.get
+
+  test "int32 boundaries":
+    for v in [0'i32, 1, -1, int32.high, int32.low]:
+      let p = toPgParamInline(v)
+      check p.len == 4
+      check inlinePayload(p) == @(toBE32(v))
+
+  test "int64 fits inline at 8 bytes":
+    let p = toPgParamInline(9_999_999_999'i64)
+    check p.oid == OidInt8
+    check p.len == 8
+    check inlinePayload(p) == @(toBE64(9_999_999_999'i64))
+
+  test "int widens to int64":
+    let p = toPgParamInline(42.int)
+    check p.oid == OidInt8
+    check p.len == 8
+    check inlinePayload(p) == @(toBE64(42'i64))
+
+  test "float32 wire-format":
+    let p = toPgParamInline(3.14'f32)
+    check p.oid == OidFloat4
+    check p.len == 4
+    # Match toPgParam exactly (same cast-to-int32 + BE encoding).
+    let old = toPgParam(3.14'f32)
+    check inlinePayload(p) == old.value.get
+
+  test "float64 wire-format":
+    let p = toPgParamInline(3.14)
+    check p.oid == OidFloat8
+    check p.len == 8
+    let bits = fromBE64(inlinePayload(p))
+    check abs(cast[float64](bits) - 3.14) < 1e-10
+
+  test "bool true / false":
+    let pt = toPgParamInline(true)
+    check pt.oid == OidBool
+    check pt.len == 1
+    check pt.inlineBuf[0] == 1'u8
+    let pf = toPgParamInline(false)
+    check pf.inlineBuf[0] == 0'u8
+
+  test "string short fits inline":
+    let p = toPgParamInline("hello")
+    check p.oid == OidText
+    check p.format == 0
+    check p.len == 5
+    check p.overflow.len == 0
+    check inlinePayload(p) == @(toBytes("hello"))
+
+  test "string empty":
+    let p = toPgParamInline("")
+    check p.len == 0
+    check inlinePayload(p).len == 0
+
+  test "string at inline boundary (16 bytes)":
+    let s = "0123456789ABCDEF" # exactly 16 chars
+    let p = toPgParamInline(s)
+    check p.len == 16
+    check p.overflow.len == 0
+    check inlinePayload(p) == @(toBytes(s))
+
+  test "string above boundary uses overflow":
+    let s = "0123456789ABCDEFG" # 17 chars
+    let p = toPgParamInline(s)
+    check p.len == 17
+    check p.overflow.len == 17
+    check inlinePayload(p) == @(toBytes(s))
+
+  test "seq[byte] short fits inline":
+    let b = @[byte 1, 2, 3, 4]
+    let p = toPgParamInline(b)
+    check p.oid == OidBytea
+    check p.len == 4
+    check p.overflow.len == 0
+    check inlinePayload(p) == b
+
+  test "seq[byte] above boundary uses overflow":
+    var b = newSeq[byte](32)
+    for i in 0 ..< 32:
+      b[i] = byte(i)
+    let p = toPgParamInline(b)
+    check p.len == 32
+    check p.overflow.len == 32
+    check inlinePayload(p) == b
+
+  test "PgUuid matches toPgParam (OidUuid, text, overflow)":
+    # UUID string is 36 chars, exceeds PgInlineBufSize.
+    let u = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+    let p = toPgParamInline(u)
+    let old = toPgParam(u)
+    check p.oid == OidUuid
+    check p.oid == old.oid
+    check p.format == old.format
+    check p.len == 36
+    check p.overflow.len == 36
+    check inlinePayload(p) == old.value.get
+    check inlinePayload(p) == @(toBytes(string(u)))
+
+  test "PgMoney encodes int64 amount only":
+    let m = PgMoney(amount: 12345'i64, scale: 2'i8)
+    let p = toPgParamInline(m)
+    check p.oid == OidMoney
+    check p.len == 8
+    check inlinePayload(p) == @(toBE64(12345'i64))
+
+  test "Option[int32] some delegates to int32":
+    let p = toPgParamInline(some(42'i32))
+    check p.oid == OidInt4
+    check p.len == 4
+    check inlinePayload(p) == @(toBE32(42'i32))
+
+  test "Option[int32] none marks NULL":
+    let p = toPgParamInline(none(int32))
+    check p.oid == OidInt4
+    check p.format == 1
+    check p.len == -1
+
+  test "Option[string] none marks NULL with text oid":
+    let p = toPgParamInline(none(string))
+    check p.oid == OidText
+    check p.format == 0
+    check p.len == -1
+
+suite "addBindRaw wire-format parity":
+  test "single int32 param matches addBind":
+    let old = toPgParam(42'i32)
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("p", "s", [int16(1)], [old.value], [])
+    var rawBuf: seq[byte] = @[]
+    let data = old.value.get
+    let ranges = @[(off: int32(0), len: int32(data.len))]
+    rawBuf.addBindRaw("p", "s", [int16(1)], data, ranges, [])
+    check legacyBuf == rawBuf
+
+  test "three params matches addBind":
+    let a = toPgParam(1'i32)
+    let b = toPgParam(2'i32)
+    let c = toPgParam(3'i32)
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("", "stmt", [int16(1), 1, 1], [a.value, b.value, c.value], [])
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    for v in [a.value.get, b.value.get, c.value.get]:
+      ranges.add (off: int32(data.len), len: int32(v.len))
+      data.add v
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw("", "stmt", [int16(1), 1, 1], data, ranges, [])
+    check legacyBuf == rawBuf
+
+  test "NULL param matches addBind":
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("", "s", [int16(1)], [none(seq[byte])], [])
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw("", "s", [int16(1)], @[], @[(off: int32(0), len: int32(-1))], [])
+    check legacyBuf == rawBuf
+
+  test "mixed NULL and non-NULL matches addBind":
+    let a = toPgParam(7'i32)
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("", "s", [int16(1), 1], [a.value, none(seq[byte])], [])
+    var data: seq[byte] = a.value.get
+    var ranges =
+      @[(off: int32(0), len: int32(data.len)), (off: int32(0), len: int32(-1))]
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw("", "s", [int16(1), 1], data, ranges, [])
+    check legacyBuf == rawBuf
+
+  test "result formats are preserved":
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("p", "", [int16(0)], [none(seq[byte])], [int16(1), 0, 1])
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw(
+      "p", "", [int16(0)], @[], @[(off: int32(0), len: int32(-1))], [int16(1), 0, 1]
+    )
+    check legacyBuf == rawBuf
+
+suite "addBindRaw range validation":
+  test "range len below -1 raises ValueError":
+    var buf: seq[byte] = @[]
+    expect ValueError:
+      buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(0), len: int32(-2))], [])
+
+  test "negative off with non-zero len raises ValueError":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    expect ValueError:
+      buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(-1), len: int32(4))], [])
+
+  test "off + len past paramData.len raises ValueError":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    expect ValueError:
+      # off + len == 5, data.len == 4 — reads past end
+      buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(1), len: int32(4))], [])
+
+  test "range exactly at end of paramData is valid":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    # off + len == 4, data.len == 4 — boundary is inclusive on the data side
+    buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(0), len: int32(4))], [])
+    check buf.len > 0
+
+  test "len == 0 with off at end of data is valid (empty string case)":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    # Mirrors flattenInline's encoding for empty strings: off = data.len, len = 0
+    buf.addBindRaw("", "", [int16(0)], data, @[(off: int32(4), len: int32(0))], [])
+    check buf.len > 0
+
+  test "NULL range with arbitrary off is valid (off ignored when len == -1)":
+    var buf: seq[byte] = @[]
+    buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(999), len: int32(-1))], [])
+    check buf.len > 0
+
+suite "parseAffectedRowsRaw":
+  test "UPDATE / DELETE returns trailing count":
+    check parseAffectedRows("UPDATE 3") == 3
+    check parseAffectedRows("DELETE 5") == 5
+    check parseAffectedRows("SELECT 100") == 100
+
+  test "INSERT 0 N returns N":
+    check parseAffectedRows("INSERT 0 1") == 1
+    check parseAffectedRows("INSERT 0 42") == 42
+
+  test "trailing whitespace yields 0 (matches legacy split semantics)":
+    check parseAffectedRows("UPDATE 3 ") == 0
+    check parseAffectedRows("UPDATE 7   ") == 0
+
+  test "empty / non-numeric returns 0":
+    check parseAffectedRows("") == 0
+    check parseAffectedRows("CREATE TABLE") == 0
+    check parseAffectedRows("COMMIT") == 0
+    check parseAffectedRows("   ") == 0
+
+  test "single-token numeric tag":
+    # Tag that is just a number — not a real PostgreSQL tag but robust for safety.
+    check parseAffectedRows("123") == 123
+
+  test "large values":
+    check parseAffectedRows("INSERT 0 9999999999") == 9_999_999_999'i64
+
+  test "raw overload on char openArray":
+    let s = "UPDATE 42"
+    check parseAffectedRowsRaw(s.toOpenArray(0, s.high)) == 42
+
+suite "flattenInline SoA layout":
+  test "empty input produces empty SoA":
+    let params: seq[PgParamInline] = @[]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 0
+    check ranges.len == 0
+    check oids.len == 0
+    check formats.len == 0
+
+  test "single short int32 param":
+    let params = @[toPgParamInline(42'i32)]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data == @(toBE32(42'i32))
+    check ranges.len == 1
+    check ranges[0].off == 0
+    check ranges[0].len == 4
+    check oids == @[OidInt4]
+    check formats == @[1'i16]
+
+  test "single NULL param (off=0, len=-1, no bytes written)":
+    let params = @[none(int32).toPgParamInline]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 0
+    check ranges.len == 1
+    check ranges[0].len == -1
+    check oids == @[OidInt4]
+    check formats == @[1'i16]
+
+  test "single empty string (len=0, off points to current data.len)":
+    let params = @[toPgParamInline("")]
+    let (data, ranges, _, _) = flattenInline(params)
+    check data.len == 0
+    check ranges.len == 1
+    check ranges[0].len == 0
+    check ranges[0].off == 0
+
+  test "boundary string (16 bytes fits in inlineBuf path)":
+    let params = @[toPgParamInline("0123456789ABCDEF")]
+    let (data, ranges, _, _) = flattenInline(params)
+    check data.len == 16
+    check data == @(toBytes("0123456789ABCDEF"))
+    check ranges.len == 1
+    check ranges[0].off == 0
+    check ranges[0].len == 16
+
+  test "overflow string (17 bytes uses overflow path)":
+    let long = "0123456789ABCDEFG" # 17 chars
+    let params = @[toPgParamInline(long)]
+    let (data, ranges, _, _) = flattenInline(params)
+    check data.len == 17
+    check data == @(toBytes(long))
+    check ranges.len == 1
+    check ranges[0].off == 0
+    check ranges[0].len == 17
+
+  test "mixed [short, NULL, overflow, empty, short] — offsets are consecutive":
+    let long = "abcdefghijklmnopqrst" # 20 chars → overflow
+    let params = @[
+      toPgParamInline(1'i32), # 4 bytes
+      none(int32).toPgParamInline, # NULL
+      toPgParamInline(long), # 20 bytes
+      toPgParamInline(""), # 0 bytes
+      toPgParamInline(7'i32), # 4 bytes
+    ]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 4 + 20 + 4 # NULL and empty contribute nothing
+    check ranges.len == 5
+    # int32(1)
+    check ranges[0].off == 0
+    check ranges[0].len == 4
+    check data[0 ..< 4] == @(toBE32(1'i32))
+    # NULL
+    check ranges[1].len == -1
+    # long overflow string
+    check ranges[2].off == 4
+    check ranges[2].len == 20
+    check data[4 ..< 24] == @(toBytes(long))
+    # empty string — off points just past the overflow bytes, len 0
+    check ranges[3].off == 24
+    check ranges[3].len == 0
+    # int32(7)
+    check ranges[4].off == 24
+    check ranges[4].len == 4
+    check data[24 ..< 28] == @(toBE32(7'i32))
+    check oids == @[OidInt4, OidInt4, OidText, OidText, OidInt4]
+    # int32 uses binary(1), text uses text(0)
+    check formats == @[1'i16, 1'i16, 0'i16, 0'i16, 1'i16]
+
+  test "100 int32 params — data size, offsets, oids all consistent":
+    var params = newSeqOfCap[PgParamInline](100)
+    for i in 0 ..< 100:
+      params.add toPgParamInline(int32(i * 3))
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 100 * 4
+    check ranges.len == 100
+    for i in 0 ..< 100:
+      check ranges[i].off == int32(i * 4)
+      check ranges[i].len == 4
+      check data[i * 4 ..< (i + 1) * 4] == @(toBE32(int32(i * 3)))
+    for o in oids:
+      check o == OidInt4
+    for f in formats:
+      check f == 1'i16
+
+suite "Pipeline appendInline SoA layout":
+  test "single op: inlineStart/Count correct, ranges point into p.inlineData":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("INSERT", [toPgParamInline(42'i32), toPgParamInline("abc")])
+    check p.ops.len == 1
+    check p.ops[0].hasInline
+    check p.ops[0].inlineStart == 0
+    check p.ops[0].inlineCount == 2
+    check p.inlineRanges.len == 2
+    check p.inlineOids == @[OidInt4, OidText]
+    check p.inlineFormats == @[1'i16, 0'i16]
+    # Byte layout: 4 bytes for int32 + 3 bytes for "abc"
+    check p.inlineData.len == 7
+    check p.inlineRanges[0].off == 0
+    check p.inlineRanges[0].len == 4
+    check p.inlineRanges[1].off == 4
+    check p.inlineRanges[1].len == 3
+
+  test "two ops: second op's inlineStart resumes after first":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("INSERT 1", [toPgParamInline(1'i32)])
+    p.addExec("INSERT 2", [toPgParamInline(2'i32), toPgParamInline(3'i32)])
+    check p.ops.len == 2
+    check p.ops[0].inlineStart == 0
+    check p.ops[0].inlineCount == 1
+    check p.ops[1].inlineStart == 1
+    check p.ops[1].inlineCount == 2
+    check p.inlineRanges.len == 3
+    check p.inlineData.len == 12
+    check p.inlineRanges[0].off == 0 # op0 param0
+    check p.inlineRanges[1].off == 4 # op1 param0
+    check p.inlineRanges[2].off == 8 # op1 param1
+
+  test "mixed NULL + overflow in one op, offsets correct":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    let long = "abcdefghijklmnopqrst" # 20 chars → overflow
+    p.addExec(
+      "X", [toPgParamInline(9'i32), none(int32).toPgParamInline, toPgParamInline(long)]
+    )
+    check p.ops[0].inlineCount == 3
+    check p.inlineRanges.len == 3
+    check p.inlineData.len == 4 + 20 # NULL contributes nothing
+    check p.inlineRanges[0].off == 0
+    check p.inlineRanges[0].len == 4
+    check p.inlineRanges[1].len == -1 # NULL
+    check p.inlineRanges[2].off == 4
+    check p.inlineRanges[2].len == 20
+    check p.inlineData[4 ..< 24] == @(toBytes(long))
+
+  test "addQuery + addExec populate same SoA buffer":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addQuery("SELECT", [toPgParamInline(1'i32)])
+    p.addExec("INSERT", [toPgParamInline(2'i32)])
+    check p.ops.len == 2
+    check p.ops[0].kind == pokQuery
+    check p.ops[1].kind == pokExec
+    check p.ops[0].hasInline
+    check p.ops[1].hasInline
+    check p.ops[0].inlineStart == 0
+    check p.ops[1].inlineStart == 1
+    check p.inlineData.len == 8
+    check p.inlineData[0 ..< 4] == @(toBE32(1'i32))
+    check p.inlineData[4 ..< 8] == @(toBE32(2'i32))
+
+  test "addExec with empty inline params: hasInline=true, count=0":
+    # Edge case: the inline overload is chosen but no params are provided.
+    # executeImpl computes `endIdx = inlineStart + inlineCount - 1`, so for
+    # count==0 we get an empty `toOpenArray(start, start-1)` view — make sure
+    # that view is empty and the SoA buffers are untouched.
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    let empty: seq[PgParamInline] = @[]
+    p.addExec("SELECT 1", empty)
+    check p.ops.len == 1
+    check p.ops[0].hasInline
+    check p.ops[0].inlineStart == 0
+    check p.ops[0].inlineCount == 0
+    check p.inlineRanges.len == 0
+    check p.inlineOids.len == 0
+    check p.inlineFormats.len == 0
+    check p.inlineData.len == 0
+
+  test "addExec empty inline after a populated op: start resumes correctly":
+    # A second op with zero inline params must record `inlineStart` at the
+    # current tail of the SoA buffers, not 0.
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("A", [toPgParamInline(1'i32), toPgParamInline(2'i32)])
+    let empty: seq[PgParamInline] = @[]
+    p.addExec("B", empty)
+    check p.ops.len == 2
+    check p.ops[1].hasInline
+    check p.ops[1].inlineStart == 2 # resumes after the two params of op A
+    check p.ops[1].inlineCount == 0
+    check p.inlineRanges.len == 2 # unchanged by op B

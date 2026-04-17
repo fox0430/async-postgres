@@ -532,6 +532,58 @@ proc addBind*(
     buf.addInt16(f)
   buf.patchMsgLen(msgStart)
 
+proc addBindRaw*(
+    buf: var seq[byte],
+    portalName: string,
+    stmtName: string,
+    paramFormats: openArray[int16],
+    paramData: openArray[byte],
+    paramRanges: openArray[tuple[off: int32, len: int32]],
+    resultFormats: openArray[int16] = [],
+) =
+  ## Append a Bind message built from a raw byte buffer and offset/length
+  ## ranges. Each parameter is described by `(off, len)`: `len == -1` encodes
+  ## NULL; any other `len` reads `paramData[off ..< off + len]`. Lets callers
+  ## write payloads straight into a single owned buffer without constructing
+  ## `Option[seq[byte]]` per parameter.
+  ##
+  ## Each range must satisfy one of: `len == -1` (NULL), or
+  ## `len >= 0` with `0 <= off` and `off + len <= paramData.len`.
+  ## Invalid ranges raise `ValueError` — the check is always active so callers
+  ## cannot silently trigger an out-of-bounds `copyMem` in release builds.
+  let msgStart = buf.len
+  buf.add(byte('B'))
+  buf.addInt32(0) # length placeholder
+  buf.addCString(portalName)
+  buf.addCString(stmtName)
+  buf.addInt16(int16(paramFormats.len))
+  for f in paramFormats:
+    buf.addInt16(f)
+  buf.addInt16(int16(paramRanges.len))
+  for r in paramRanges:
+    if r.len < -1:
+      raise newException(ValueError, "addBindRaw: invalid range len " & $r.len)
+    if r.len == -1:
+      buf.addInt32(-1)
+    else:
+      buf.addInt32(r.len)
+      if r.len > 0:
+        if r.off < 0:
+          raise newException(ValueError, "addBindRaw: negative range off " & $r.off)
+        if r.off.int64 + r.len.int64 > paramData.len.int64:
+          raise newException(
+            ValueError,
+            "addBindRaw: range out of bounds (off=" & $r.off & ", len=" & $r.len &
+              ", data.len=" & $paramData.len & ")",
+          )
+        let oldLen = buf.len
+        buf.setLen(oldLen + r.len)
+        copyMem(addr buf[oldLen], unsafeAddr paramData[r.off], r.len)
+  buf.addInt16(int16(resultFormats.len))
+  for f in resultFormats:
+    buf.addInt16(f)
+  buf.patchMsgLen(msgStart)
+
 proc addDescribe*(buf: var seq[byte], kind: DescribeKind, name: string) =
   ## Append a Describe message to the buffer (portal or statement).
   let msgStart = buf.len

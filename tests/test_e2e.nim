@@ -5627,6 +5627,300 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: PgParamInline overload roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_pipe")
+      discard
+        await conn.exec("CREATE TABLE test_inline_pipe (id serial PRIMARY KEY, v int)")
+
+      let p = newPipeline(conn)
+      for i in 0 ..< 5:
+        p.addExec(
+          "INSERT INTO test_inline_pipe (v) VALUES ($1)", [i.int32.toPgParamInline]
+        )
+      p.addQuery("SELECT v FROM test_inline_pipe ORDER BY id")
+      let results = await p.execute()
+      doAssert results.len == 6
+      for i in 0 ..< 5:
+        doAssert results[i].commandResult == "INSERT 0 1"
+      let qr = results[5].queryResult
+      doAssert qr.rows.len == 5
+      for i in 0 ..< 5:
+        doAssert qr.rows[i].getStr(0) == $i
+
+      discard await conn.exec("DROP TABLE test_inline_pipe")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline and PgParam overloads can be mixed in one pipeline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_mixed_pipe")
+      discard await conn.exec(
+        "CREATE TABLE test_mixed_pipe (id serial PRIMARY KEY, v int, s text)"
+      )
+
+      let p = newPipeline(conn)
+      # inline path
+      p.addExec(
+        "INSERT INTO test_mixed_pipe (v, s) VALUES ($1, $2)",
+        [1.int32.toPgParamInline, "from-inline".toPgParamInline],
+      )
+      # legacy path
+      p.addExec(
+        "INSERT INTO test_mixed_pipe (v, s) VALUES ($1, $2)",
+        @[toPgParam(2'i32), toPgParam("from-legacy")],
+      )
+      p.addQuery("SELECT v, s FROM test_mixed_pipe ORDER BY id")
+      let results = await p.execute()
+      doAssert results.len == 3
+      let rows = results[2].queryResult.rows
+      doAssert rows.len == 2
+      doAssert rows[0].getStr(0) == "1"
+      doAssert rows[0].getStr(1) == "from-inline"
+      doAssert rows[1].getStr(0) == "2"
+      doAssert rows[1].getStr(1) == "from-legacy"
+
+      discard await conn.exec("DROP TABLE test_mixed_pipe")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline NULL via Option":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_null")
+      discard
+        await conn.exec("CREATE TABLE test_inline_null (id serial PRIMARY KEY, v int)")
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_inline_null (v) VALUES ($1)", [none(int32).toPgParamInline]
+      )
+      p.addQuery("SELECT v FROM test_inline_null ORDER BY id")
+      let results = await p.execute()
+      doAssert results[1].queryResult.rows[0].isNull(0)
+
+      discard await conn.exec("DROP TABLE test_inline_null")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline overflow path (long string)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_overflow")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_overflow (id serial PRIMARY KEY, s text)"
+      )
+
+      let long = "abcdefghijklmnopqrstuvwxyz0123456789" # 36 chars → overflow
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_inline_overflow (s) VALUES ($1)", [long.toPgParamInline]
+      )
+      p.addQuery("SELECT s FROM test_inline_overflow")
+      let results = await p.execute()
+      doAssert results[1].queryResult.rows[0].getStr(0) == long
+
+      discard await conn.exec("DROP TABLE test_inline_overflow")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline large overflow (16KB single value)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_large")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_large (id serial PRIMARY KEY, s text)"
+      )
+
+      # 16 KB payload — well beyond PgInlineBufSize, exercises a single large
+      # copy into the SoA inlineData buffer.
+      var big = newStringOfCap(16 * 1024)
+      for i in 0 ..< 16 * 1024:
+        big.add char(ord('a') + (i mod 26))
+      let p = newPipeline(conn)
+      p.addExec("INSERT INTO test_inline_large (s) VALUES ($1)", [big.toPgParamInline])
+      p.addQuery("SELECT s FROM test_inline_large")
+      let results = await p.execute()
+      doAssert results[0].commandResult == "INSERT 0 1"
+      doAssert results[1].queryResult.rows[0].getStr(0) == big
+
+      discard await conn.exec("DROP TABLE test_inline_large")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline many large overflows stress SoA reallocation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_stress")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_stress (id serial PRIMARY KEY, s text)"
+      )
+
+      # 50 × ~2 KB values across 50 ops in one pipeline. Each value is unique
+      # so a bug in SoA offset accounting (e.g. slice aliasing, reuse of stale
+      # offsets after inlineData grows) surfaces as a mismatched readback.
+      let numOps = 50
+      let valueSize = 2 * 1024
+      var expected = newSeq[string](numOps)
+      let p = newPipeline(conn)
+      for i in 0 ..< numOps:
+        var s = newStringOfCap(valueSize)
+        # Prefix with the index so every value is distinct and order-sensitive.
+        s.add "op" & $i & ":"
+        while s.len < valueSize:
+          s.add char(ord('a') + ((i + s.len) mod 26))
+        expected[i] = s
+        p.addExec("INSERT INTO test_inline_stress (s) VALUES ($1)", [s.toPgParamInline])
+      p.addQuery("SELECT s FROM test_inline_stress ORDER BY id")
+      let results = await p.execute()
+      doAssert results.len == numOps + 1
+      for i in 0 ..< numOps:
+        doAssert results[i].commandResult == "INSERT 0 1"
+      let rows = results[numOps].queryResult.rows
+      doAssert rows.len == numOps
+      for i in 0 ..< numOps:
+        doAssert rows[i].getStr(0) == expected[i]
+
+      discard await conn.exec("DROP TABLE test_inline_stress")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline empty params on param-less SQL":
+    # Edge case: caller reaches the inline overload with zero params (e.g. a
+    # SQL that takes no bound parameters). executeImpl builds an empty
+    # openArray via `toOpenArray(start, start-1)`; regression test that the
+    # Bind message still goes out cleanly and the query round-trips.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p = newPipeline(conn)
+      let empty: seq[PgParamInline] = @[]
+      p.addQuery("SELECT 42", empty)
+      p.addExec("SELECT 1", empty)
+      let results = await p.execute()
+      doAssert results.len == 2
+      doAssert results[0].queryResult.rows[0].getStr(0) == "42"
+      doAssert results[1].commandResult == "SELECT 1"
+      await conn.close()
+
+    waitFor t()
+
+  test "exec: PgParamInline overload roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_exec_inline")
+      discard
+        await conn.exec("CREATE TABLE test_exec_inline (id serial PRIMARY KEY, v int)")
+
+      # Multi-value INSERT (the benchmark workload): 100 params in one exec.
+      var sql = "INSERT INTO test_exec_inline (v) VALUES "
+      var params = newSeqOfCap[PgParamInline](100)
+      for j in 0 ..< 100:
+        if j > 0:
+          sql.add ","
+        sql.add "($" & $(j + 1) & ")"
+        params.add j.int32.toPgParamInline
+      let cr = await conn.exec(sql, params)
+      doAssert cr.affectedRows == 100
+
+      let qr =
+        await conn.query("SELECT count(*)::int4, max(v)::int4 FROM test_exec_inline")
+      doAssert qr.rows[0].getStr(0) == "100"
+      doAssert qr.rows[0].getStr(1) == "99"
+
+      discard await conn.exec("DROP TABLE test_exec_inline")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated with PgParamInline roundtrip":
+    # Covers the inline path through executeIsolatedImpl (per-op SYNC) and
+    # its concurrent send/recv scheduling under chronos. Mixes inline and
+    # legacy params across ops so both code paths in the op loop execute.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_iso_inline")
+      discard await conn.exec(
+        "CREATE TABLE test_iso_inline (id serial PRIMARY KEY, v int, s text)"
+      )
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_iso_inline (v, s) VALUES ($1, $2)",
+        [10.int32.toPgParamInline, "inline".toPgParamInline],
+      )
+      p.addExec(
+        "INSERT INTO test_iso_inline (v, s) VALUES ($1, $2)",
+        @[toPgParam(20'i32), toPgParam("legacy")],
+      )
+      p.addQuery(
+        "SELECT v, s FROM test_iso_inline WHERE v > $1 ORDER BY id",
+        [5.int32.toPgParamInline],
+      )
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      for e in ir.errors:
+        doAssert e == nil
+      doAssert ir.results[0].commandResult == "INSERT 0 1"
+      doAssert ir.results[1].commandResult == "INSERT 0 1"
+      let rows = ir.results[2].queryResult.rows
+      doAssert rows.len == 2
+      doAssert rows[0].getStr(0) == "10"
+      doAssert rows[0].getStr(1) == "inline"
+      doAssert rows[1].getStr(0) == "20"
+      doAssert rows[1].getStr(1) == "legacy"
+
+      discard await conn.exec("DROP TABLE test_iso_inline")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated with PgParamInline isolates per-op errors":
+    # Confirms that per-op SYNC still provides error isolation when ops use
+    # the inline overload: a failing inline op must not abort subsequent
+    # inline ops, and the connection must remain usable afterwards.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_iso_inline_err")
+      discard await conn.exec(
+        "CREATE TABLE test_iso_inline_err (id serial PRIMARY KEY, v int NOT NULL)"
+      )
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [1.int32.toPgParamInline]
+      )
+      # NULL inline param violates NOT NULL — isolated error.
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [none(int32).toPgParamInline]
+      )
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [3.int32.toPgParamInline]
+      )
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert ir.errors[2] == nil # not aborted
+
+      doAssert conn.state == csReady
+      let qr = await conn.query("SELECT v FROM test_iso_inline_err ORDER BY id")
+      doAssert qr.rowCount == 2
+      doAssert qr.rows[0].getStr(0) == "1"
+      doAssert qr.rows[1].getStr(0) == "3"
+
+      discard await conn.exec("DROP TABLE test_iso_inline_err")
+      await conn.close()
+
+    waitFor t()
+
   test "pipeline: empty pipeline":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

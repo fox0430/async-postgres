@@ -215,6 +215,13 @@ type
   TraceQueryStartData* = object ## Data passed to the query/exec start hook.
     sql*: string
     params*: seq[PgParam]
+      ## Populated when the caller used a `seq[PgParam]` overload. Mutually
+      ## exclusive with `paramsInline`: exactly one of the two is non-empty
+      ## per call (or both are empty if the query has no bound parameters).
+    paramsInline*: seq[PgParamInline]
+      ## Populated when the caller used a `PgParamInline` overload. Mutually
+      ## exclusive with `params` (see above). Tracers that want a single view
+      ## should branch on whichever field is non-empty.
     isExec*: bool ## true for exec, false for query
 
   TraceQueryEndData* = object ## Data passed to the query/exec end hook.
