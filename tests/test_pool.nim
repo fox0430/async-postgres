@@ -410,6 +410,37 @@ suite "Pool close":
     check pool.closed
     check pool.active == 1
 
+  test "release of broken conn tracks pending close":
+    let pool = makePool()
+    pool.active = 1
+    let conn = mockConn(csClosed)
+    pool.release(conn)
+    check pool.pendingCloses.len == 1
+
+  test "close awaits pending closeNoWait tasks":
+    let pool = makePool()
+    pool.active = 2
+    pool.release(mockConn(csClosed))
+    pool.release(mockConn(csClosed))
+
+    waitFor pool.close()
+    check pool.closed
+    check pool.pendingCloses.len == 0
+
+  test "closeNoWait prunes finished futures once threshold is reached":
+    let pool = makePool()
+    # Inject pre-finished dummies up to the prune threshold so the next
+    # closeNoWait deterministically triggers the sweep regardless of timing.
+    for _ in 0 ..< closePruneThreshold:
+      let f = newFuture[void]("dummy")
+      f.complete()
+      pool.pendingCloses.add(f)
+    pool.active = 1
+    pool.release(mockConn(csClosed))
+    # All finished dummies were swept, leaving only the newly spawned close.
+    check pool.pendingCloses.len == 1
+    waitFor pool.close()
+
 suite "Pool active count tracking":
   test "release then acquire roundtrip":
     let pool = makePool()
