@@ -353,9 +353,7 @@ proc exec(
         timeout
       )
     except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "Exec timed out")
+      conn.invalidateOnTimeout("Exec timed out")
   else:
     return await execImpl(conn, sql, params, paramOids, paramFormats)
 
@@ -381,9 +379,7 @@ proc exec*(
       try:
         tag = await execImpl(conn, sql, params, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "Exec timed out")
+        conn.invalidateOnTimeout("Exec timed out")
     else:
       tag = await execImpl(conn, sql, params)
   return initCommandResult(tag)
@@ -547,9 +543,7 @@ proc exec*(
           timeout
         )
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "Exec timed out")
+        conn.invalidateOnTimeout("Exec timed out")
     else:
       tag = await execInlineImpl(conn, sql, data, ranges, oids, formats)
   return initCommandResult(tag)
@@ -962,9 +956,7 @@ proc queryEach*(
         count = await queryEachImpl(conn, sql, params, callback, resultFormats, timeout)
           .wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "queryEach timed out")
+        conn.invalidateOnTimeout("queryEach timed out")
     else:
       count = await queryEachImpl(conn, sql, params, callback, resultFormats)
   return count
@@ -988,9 +980,7 @@ proc query(
       )
         .wait(timeout)
     except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "Query timed out")
+      conn.invalidateOnTimeout("Query timed out")
   else:
     return await queryImpl(conn, sql, params, paramOids, paramFormats, resultFormats)
 
@@ -1018,9 +1008,7 @@ proc query*(
       try:
         qr = await queryImpl(conn, sql, params, resultFormats, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "Query timed out")
+        conn.invalidateOnTimeout("Query timed out")
     else:
       qr = await queryImpl(conn, sql, params, resultFormats)
   return qr
@@ -1120,9 +1108,7 @@ proc query*(
         )
           .wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "Query timed out")
+        conn.invalidateOnTimeout("Query timed out")
     else:
       qr = await queryInlineImpl(conn, sql, data, ranges, oids, formats, resultFormats)
   return qr
@@ -1347,9 +1333,7 @@ proc prepare*(
       try:
         stmt = await prepareImpl(conn, name, sql, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "Prepare timed out")
+        conn.invalidateOnTimeout("Prepare timed out")
     else:
       stmt = await prepareImpl(conn, name, sql)
   return stmt
@@ -1448,9 +1432,7 @@ proc execute*(
       try:
         qr = await executeImpl(stmt, params, resultFormats, timeout).wait(timeout)
       except AsyncTimeoutError:
-        stmt.conn.cancelNoWait()
-        stmt.conn.state = csClosed
-        raise newException(PgTimeoutError, "Execute timed out")
+        stmt.conn.invalidateOnTimeout("Execute timed out")
     else:
       qr = await executeImpl(stmt, params, resultFormats)
   return qr
@@ -1498,9 +1480,7 @@ proc close*(
     try:
       await closeImpl(stmt, timeout).wait(timeout)
     except AsyncTimeoutError:
-      stmt.conn.cancelNoWait()
-      stmt.conn.state = csClosed
-      raise newException(PgTimeoutError, "Statement close timed out")
+      stmt.conn.invalidateOnTimeout("Statement close timed out")
   else:
     await closeImpl(stmt)
 
@@ -1608,9 +1588,7 @@ proc copyIn*(
       try:
         tag = await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "COPY IN timed out")
+        conn.invalidateOnTimeout("COPY IN timed out")
     else:
       tag = await copyInRawImpl(conn, sql, data)
   return initCommandResult(tag)
@@ -1777,9 +1755,7 @@ proc copyInStream*(
       try:
         info = await copyInStreamImpl(conn, sql, callback, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "COPY IN stream timed out")
+        conn.invalidateOnTimeout("COPY IN stream timed out")
     else:
       info = await copyInStreamImpl(conn, sql, callback)
   return info
@@ -1841,9 +1817,7 @@ proc copyOut*(
       try:
         cr = await copyOutImpl(conn, sql, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "COPY OUT timed out")
+        conn.invalidateOnTimeout("COPY OUT timed out")
     else:
       cr = await copyOutImpl(conn, sql)
   return cr
@@ -1928,9 +1902,7 @@ proc copyOutStream*(
       try:
         info = await copyOutStreamImpl(conn, sql, callback, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "COPY OUT stream timed out")
+        conn.invalidateOnTimeout("COPY OUT stream timed out")
     else:
       info = await copyOutStreamImpl(conn, sql, callback)
   return info
@@ -2217,9 +2189,7 @@ proc execInTransaction(
         )
           .wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "execInTransaction timed out")
+        conn.invalidateOnTimeout("execInTransaction timed out")
     else:
       tag = await execInTransactionImpl(
         conn, "BEGIN", sql, params, paramOids, paramFormats, timeout
@@ -2263,9 +2233,7 @@ proc execInTransaction*(
         )
           .wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "execInTransaction timed out")
+        conn.invalidateOnTimeout("execInTransaction timed out")
     else:
       tag =
         await execInTransactionImpl(conn, beginSql, sql, values, oids, formats, timeout)
@@ -2376,9 +2344,7 @@ proc queryInTransaction(
         )
           .wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "queryInTransaction timed out")
+        conn.invalidateOnTimeout("queryInTransaction timed out")
     else:
       qr = await queryInTransactionImpl(
         conn, "BEGIN", sql, params, paramOids, paramFormats, resultFormats, timeout
@@ -2426,9 +2392,7 @@ proc queryInTransaction*(
         )
           .wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "queryInTransaction timed out")
+        conn.invalidateOnTimeout("queryInTransaction timed out")
     else:
       qr = await queryInTransactionImpl(
         conn, beginSql, sql, values, oids, formats, resultFormats, timeout
@@ -2770,9 +2734,7 @@ proc execute*(
       try:
         results = await executeImpl(p, timeout).wait(timeout)
       except AsyncTimeoutError:
-        p.conn.cancelNoWait()
-        p.conn.state = csClosed
-        raise newException(PgTimeoutError, "Pipeline execute timed out")
+        p.conn.invalidateOnTimeout("Pipeline execute timed out")
     else:
       results = await executeImpl(p, timeout)
   return results
@@ -3022,9 +2984,7 @@ proc executeIsolated*(
       try:
         ir = await executeIsolatedImpl(p, timeout).wait(timeout)
       except AsyncTimeoutError:
-        p.conn.cancelNoWait()
-        p.conn.state = csClosed
-        raise newException(PgTimeoutError, "Pipeline executeIsolated timed out")
+        p.conn.invalidateOnTimeout("Pipeline executeIsolated timed out")
     else:
       ir = await executeIsolatedImpl(p, timeout)
   return ir
@@ -3135,9 +3095,7 @@ proc openCursor(
       )
         .wait(timeout)
     except AsyncTimeoutError:
-      conn.cancelNoWait()
-      conn.state = csClosed
-      raise newException(PgTimeoutError, "Cursor open timed out")
+      conn.invalidateOnTimeout("Cursor open timed out")
   else:
     result = await openCursorImpl(
       conn, sql, params, paramOids, paramFormats, resultFormats, chunkSize
@@ -3228,9 +3186,7 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
     try:
       return await fetchNextImpl(cursor, cursor.timeout).wait(cursor.timeout)
     except AsyncTimeoutError:
-      cursor.conn.cancelNoWait()
-      cursor.conn.state = csClosed
-      raise newException(PgTimeoutError, "Cursor fetch timed out")
+      cursor.conn.invalidateOnTimeout("Cursor fetch timed out")
   else:
     return await fetchNextImpl(cursor)
 
@@ -3276,9 +3232,7 @@ proc close*(cursor: Cursor): Future[void] {.async.} =
     try:
       await closeCursorImpl(cursor, cursor.timeout).wait(cursor.timeout)
     except AsyncTimeoutError:
-      cursor.conn.cancelNoWait()
-      cursor.conn.state = csClosed
-      raise newException(PgTimeoutError, "Cursor close timed out")
+      cursor.conn.invalidateOnTimeout("Cursor close timed out")
   else:
     await closeCursorImpl(cursor)
 

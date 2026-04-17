@@ -163,9 +163,16 @@ proc metrics*(pool: PgPool): PoolMetrics =
   pool.metrics
 
 proc closeNoWait(pool: PgPool, conn: PgConnection) =
-  ## Schedule connection close without waiting. For use in non-async contexts.
-  ## The spawned task is tracked in `pool.pendingCloses` so `pool.close()` can
-  ## await its completion for graceful shutdown.
+  ## Schedule connection close without waiting. For use in non-async contexts
+  ## (e.g. `release()` is synchronous). The spawned task is tracked in
+  ## `pool.pendingCloses` so `pool.close()` can await its completion for
+  ## graceful shutdown.
+  ##
+  ## Note on asyncdispatch: a close scheduled here may race with an inflight
+  ## request future that the previous timeout could not cancel (see
+  ## `invalidateOnTimeout`). That future will observe a closed fd and fail
+  ## quietly — we rely on `asyncSpawn` swallowing the resulting CatchableError
+  ## so it never surfaces. The connection is not reused either way.
   pool.metrics.closeCount.inc
   proc doClose() {.async.} =
     try:
@@ -311,6 +318,16 @@ proc release*(pool: PgPool, conn: PgConnection) =
   ## Return a connection to the pool. If the connection is broken or in a
   ## transaction, it is closed instead. If waiters are queued, the connection
   ## is handed directly to the next waiter.
+  ##
+  ## Discard criteria (`conn.state != csReady`):
+  ## - A timed-out request reaches us via `invalidateOnTimeout` with
+  ##   `state = csClosed`. Under asyncdispatch this is load-bearing: the
+  ##   inner future is still alive and may write to the socket, so the
+  ##   connection MUST be retired from the pool.
+  ## - Any listening/replication/COPY state is also not reusable.
+  ## Transaction-in-progress (`txStatus != tsIdle`) is treated as failure
+  ## to reset the session, so the connection is closed rather than leaking
+  ## transaction state to the next borrower.
   var traceCtx: TraceContext
   if pool.config.tracer != nil and pool.config.tracer.onPoolReleaseStart != nil:
     traceCtx =
