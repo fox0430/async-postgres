@@ -5972,13 +5972,17 @@ suite "toPgParamInline":
     check p.overflow.len == 32
     check inlinePayload(p) == b
 
-  test "PgUuid routed through string overflow":
+  test "PgUuid matches toPgParam (OidUuid, text, overflow)":
     # UUID string is 36 chars, exceeds PgInlineBufSize.
     let u = PgUuid("550e8400-e29b-41d4-a716-446655440000")
     let p = toPgParamInline(u)
-    check p.oid == OidText
+    let old = toPgParam(u)
+    check p.oid == OidUuid
+    check p.oid == old.oid
+    check p.format == old.format
     check p.len == 36
     check p.overflow.len == 36
+    check inlinePayload(p) == old.value.get
     check inlinePayload(p) == @(toBytes(string(u)))
 
   test "PgMoney encodes int64 amount only":
@@ -6058,6 +6062,44 @@ suite "addBindRaw wire-format parity":
       "p", "", [int16(0)], @[], @[(off: int32(0), len: int32(-1))], [int16(1), 0, 1]
     )
     check legacyBuf == rawBuf
+
+suite "addBindRaw range validation":
+  test "range len below -1 raises ValueError":
+    var buf: seq[byte] = @[]
+    expect ValueError:
+      buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(0), len: int32(-2))], [])
+
+  test "negative off with non-zero len raises ValueError":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    expect ValueError:
+      buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(-1), len: int32(4))], [])
+
+  test "off + len past paramData.len raises ValueError":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    expect ValueError:
+      # off + len == 5, data.len == 4 — reads past end
+      buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(1), len: int32(4))], [])
+
+  test "range exactly at end of paramData is valid":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    # off + len == 4, data.len == 4 — boundary is inclusive on the data side
+    buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(0), len: int32(4))], [])
+    check buf.len > 0
+
+  test "len == 0 with off at end of data is valid (empty string case)":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    # Mirrors flattenInline's encoding for empty strings: off = data.len, len = 0
+    buf.addBindRaw("", "", [int16(0)], data, @[(off: int32(4), len: int32(0))], [])
+    check buf.len > 0
+
+  test "NULL range with arbitrary off is valid (off ignored when len == -1)":
+    var buf: seq[byte] = @[]
+    buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(999), len: int32(-1))], [])
+    check buf.len > 0
 
 suite "parseAffectedRowsRaw":
   test "UPDATE / DELETE returns trailing count":

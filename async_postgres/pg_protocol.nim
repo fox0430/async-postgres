@@ -546,6 +546,11 @@ proc addBindRaw*(
   ## NULL; any other `len` reads `paramData[off ..< off + len]`. Lets callers
   ## write payloads straight into a single owned buffer without constructing
   ## `Option[seq[byte]]` per parameter.
+  ##
+  ## Each range must satisfy one of: `len == -1` (NULL), or
+  ## `len >= 0` with `0 <= off` and `off + len <= paramData.len`.
+  ## Invalid ranges raise `ValueError` — the check is always active so callers
+  ## cannot silently trigger an out-of-bounds `copyMem` in release builds.
   let msgStart = buf.len
   buf.add(byte('B'))
   buf.addInt32(0) # length placeholder
@@ -556,11 +561,21 @@ proc addBindRaw*(
     buf.addInt16(f)
   buf.addInt16(int16(paramRanges.len))
   for r in paramRanges:
+    if r.len < -1:
+      raise newException(ValueError, "addBindRaw: invalid range len " & $r.len)
     if r.len == -1:
       buf.addInt32(-1)
     else:
       buf.addInt32(r.len)
       if r.len > 0:
+        if r.off < 0:
+          raise newException(ValueError, "addBindRaw: negative range off " & $r.off)
+        if r.off.int64 + r.len.int64 > paramData.len.int64:
+          raise newException(
+            ValueError,
+            "addBindRaw: range out of bounds (off=" & $r.off & ", len=" & $r.len &
+              ", data.len=" & $paramData.len & ")",
+          )
         let oldLen = buf.len
         buf.setLen(oldLen + r.len)
         copyMem(addr buf[oldLen], unsafeAddr paramData[r.off], r.len)

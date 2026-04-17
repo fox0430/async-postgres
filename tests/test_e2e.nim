@@ -5730,6 +5730,69 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: PgParamInline large overflow (16KB single value)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_large")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_large (id serial PRIMARY KEY, s text)"
+      )
+
+      # 16 KB payload — well beyond PgInlineBufSize, exercises a single large
+      # copy into the SoA inlineData buffer.
+      var big = newStringOfCap(16 * 1024)
+      for i in 0 ..< 16 * 1024:
+        big.add char(ord('a') + (i mod 26))
+      let p = newPipeline(conn)
+      p.addExec("INSERT INTO test_inline_large (s) VALUES ($1)", [big.toPgParamInline])
+      p.addQuery("SELECT s FROM test_inline_large")
+      let results = await p.execute()
+      doAssert results[0].commandResult == "INSERT 0 1"
+      doAssert results[1].queryResult.rows[0].getStr(0) == big
+
+      discard await conn.exec("DROP TABLE test_inline_large")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline many large overflows stress SoA reallocation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_stress")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_stress (id serial PRIMARY KEY, s text)"
+      )
+
+      # 50 × ~2 KB values across 50 ops in one pipeline. Each value is unique
+      # so a bug in SoA offset accounting (e.g. slice aliasing, reuse of stale
+      # offsets after inlineData grows) surfaces as a mismatched readback.
+      let numOps = 50
+      let valueSize = 2 * 1024
+      var expected = newSeq[string](numOps)
+      let p = newPipeline(conn)
+      for i in 0 ..< numOps:
+        var s = newStringOfCap(valueSize)
+        # Prefix with the index so every value is distinct and order-sensitive.
+        s.add "op" & $i & ":"
+        while s.len < valueSize:
+          s.add char(ord('a') + ((i + s.len) mod 26))
+        expected[i] = s
+        p.addExec("INSERT INTO test_inline_stress (s) VALUES ($1)", [s.toPgParamInline])
+      p.addQuery("SELECT s FROM test_inline_stress ORDER BY id")
+      let results = await p.execute()
+      doAssert results.len == numOps + 1
+      for i in 0 ..< numOps:
+        doAssert results[i].commandResult == "INSERT 0 1"
+      let rows = results[numOps].queryResult.rows
+      doAssert rows.len == numOps
+      for i in 0 ..< numOps:
+        doAssert rows[i].getStr(0) == expected[i]
+
+      discard await conn.exec("DROP TABLE test_inline_stress")
+      await conn.close()
+
+    waitFor t()
+
   test "exec: PgParamInline overload roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
