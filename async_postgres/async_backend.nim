@@ -153,8 +153,19 @@ elif hasAsyncDispatch:
   proc wait*[T](fut: Future[T], timeout: Duration): Future[T] {.async.} =
     ## Wait for a future with a timeout. Raises AsyncTimeoutError on timeout.
     ## API-compatible with chronos Future.wait().
-    ## Note: asyncdispatch has no cancellation, so the inner future keeps running
-    ## after timeout. We add a callback to suppress unhandled exception warnings.
+    ##
+    ## .. warning::
+    ##   asyncdispatch has no cancellation. When a timeout fires, the inner
+    ##   future keeps running in the background until its I/O completes. For
+    ##   this reason **the underlying connection MUST NOT be reused after an
+    ##   AsyncTimeoutError** — a late write from the suspended future would
+    ##   corrupt the protocol stream of whoever reuses it next. The pg_client
+    ##   layer forces `csClosed` on timeout under asyncdispatch; see
+    ##   `invalidateOnTimeout` in pg_client.nim. chronos is not affected because
+    ##   its futures are actually cancelled.
+    ##
+    ## Note: we add a no-op callback to suppress unhandled exception warnings
+    ## when the suspended inner future eventually fails.
     let ms = toMilliseconds(timeout)
     let completed = await withTimeout(fut, ms)
     if not completed:
@@ -173,7 +184,15 @@ elif hasAsyncDispatch:
 
   proc cancelAndWait*(fut: Future[void]): Future[void] {.async.} =
     ## Cancel a future and wait for completion.
-    ## asyncdispatch has no real cancellation; this is a best-effort no-op.
+    ##
+    ## .. warning::
+    ##   On asyncdispatch this is a **no-op** — the future is neither cancelled
+    ##   nor awaited. asyncdispatch has no cancellation primitive. Callers must
+    ##   not assume the future has stopped: any buffer it holds via
+    ##   `unsafeAddr` remains live, and any socket write it scheduled will
+    ##   still complete. Do not reuse the affected resource (socket, buffer)
+    ##   after calling this under asyncdispatch. chronos cancels the future
+    ##   properly.
     discard
 
   proc asyncSpawn*(fut: Future[void]) =
@@ -217,7 +236,9 @@ elif hasAsyncDispatch:
     asyncdispatch.sleepAsync(ms)
 
   proc cancelTimer*(fut: Future[void]) =
-    ## No-op: asyncdispatch timers complete harmlessly and are GC'd.
+    ## No-op under asyncdispatch: timers cannot be cancelled, but they complete
+    ## harmlessly and are garbage-collected. Provided for API parity with
+    ## chronos, which does cancel the timer via `cancelSoon`.
     discard
 
   proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =

@@ -1508,6 +1508,24 @@ proc cancelNoWait*(conn: PgConnection) =
 
   asyncSpawn doCancel()
 
+proc invalidateOnTimeout*(conn: PgConnection, reason: string) =
+  ## Timeout recovery for a connection whose last request may have left the
+  ## protocol out of sync. Schedules a best-effort CancelRequest via
+  ## `cancelNoWait`, marks the connection `csClosed` so it cannot be reused,
+  ## and raises `PgTimeoutError` with `reason`.
+  ##
+  ## Under asyncdispatch this is the **only** safe recovery path: the inner
+  ## future keeps running in the background after `wait()` fires, and may
+  ## still write to the socket. Reusing the connection would interleave its
+  ## stale write with a new request and corrupt the protocol stream. chronos
+  ## cancels the inner future properly, but we still invalidate unconditionally
+  ## — the server may have processed the request partially and the cached
+  ## session state (prepared statements, portals, transaction status) is no
+  ## longer reliable.
+  conn.cancelNoWait()
+  conn.state = csClosed
+  raise newException(PgTimeoutError, reason)
+
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
@@ -1527,9 +1545,7 @@ proc simpleExec*(
       try:
         tag = await simpleExecImpl(conn, sql, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "simpleExec timed out")
+        conn.invalidateOnTimeout("simpleExec timed out")
     else:
       tag = await simpleExecImpl(conn, sql)
   return initCommandResult(tag)
@@ -1577,9 +1593,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
       try:
         await perform().wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "Ping timed out")
+        conn.invalidateOnTimeout("Ping timed out")
 
     withTimeout()
   else:
