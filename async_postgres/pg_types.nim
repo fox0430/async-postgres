@@ -1087,7 +1087,19 @@ proc toPgParamInline*(v: seq[byte]): PgParamInline =
     result.overflow = v
 
 proc toPgParamInline*(v: PgUuid): PgParamInline =
-  toPgParamInline(string(v))
+  # Text format with OidUuid (matches toPgParam). UUID canonical string is
+  # 36 bytes, so the payload always takes the overflow path.
+  let s = string(v)
+  result.oid = OidUuid
+  result.format = 0
+  result.len = int32(s.len)
+  if s.len == 0:
+    discard
+  elif s.len <= PgInlineBufSize:
+    copyMem(addr result.inlineBuf[0], unsafeAddr s[0], s.len)
+  else:
+    result.overflow = newSeq[byte](s.len)
+    copyMem(addr result.overflow[0], unsafeAddr s[0], s.len)
 
 proc toPgParamInline*(v: PgMoney): PgParamInline =
   result.oid = OidMoney

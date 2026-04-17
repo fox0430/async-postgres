@@ -2604,7 +2604,10 @@ proc executeImpl(
   conn.sendBuf.addSync()
   when hasChronos:
     # chronos drains the send Future in the background while we descend into
-    # the receive loop; for asyncdispatch we keep the original serial behavior.
+    # the receive loop. The outer try/except below owns sendFut's lifetime:
+    # it drains sendFut on the normal path (propagating any stored write
+    # error) and cancels it on any abnormal exit so the Future never leaks
+    # and `conn.sendBuf` is never mutated while a write still borrows it.
     var sendFut = conn.sendBufMsg()
   else:
     await conn.sendBufMsg()
@@ -2631,123 +2634,125 @@ proc executeImpl(
     else:
       results[i] = PipelineResult(kind: prkExec)
 
-  block recvLoop:
-    while true:
-      var rowData: RowData = nil
-      var rowCount: ptr int32 = nil
-      if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
-        rowData = results[activeOpIdx].queryResult.data
-        rowCount = addr results[activeOpIdx].queryResult.rowCount
+  try:
+    block recvLoop:
+      while true:
+        var rowData: RowData = nil
+        var rowCount: ptr int32 = nil
+        if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+          rowData = results[activeOpIdx].queryResult.data
+          rowCount = addr results[activeOpIdx].queryResult.rowCount
 
-      while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-          discard
-        of bmkParameterDescription:
-          discard
-        of bmkRowDescription:
-          if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
-            var cf: seq[int16]
-            var co: seq[int32]
-            if p.ops[activeOpIdx].cacheMiss:
-              if cachedFieldsPerOp.len == 0:
-                cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
-              cachedFieldsPerOp[activeOpIdx] = msg.fields
-              results[activeOpIdx].queryResult.fields = msg.fields
-              if p.ops[activeOpIdx].resultFormats.len > 0:
-                cf = newSeq[int16](msg.fields.len)
-                co = newSeq[int32](msg.fields.len)
-                for j in 0 ..< msg.fields.len:
-                  co[j] = msg.fields[j].typeOid
-                  if p.ops[activeOpIdx].resultFormats.len == 1:
-                    results[activeOpIdx].queryResult.fields[j].formatCode =
-                      p.ops[activeOpIdx].resultFormats[0]
-                    cf[j] = p.ops[activeOpIdx].resultFormats[0]
-                  elif j < p.ops[activeOpIdx].resultFormats.len:
-                    results[activeOpIdx].queryResult.fields[j].formatCode =
-                      p.ops[activeOpIdx].resultFormats[j]
-                    cf[j] = p.ops[activeOpIdx].resultFormats[j]
-            else:
-              results[activeOpIdx].queryResult.fields = msg.fields
-            results[activeOpIdx].queryResult.data =
-              newRowData(int16(msg.fields.len), cf, co)
-            # Update pointers for nextMessage
-            rowData = results[activeOpIdx].queryResult.data
-            rowCount = addr results[activeOpIdx].queryResult.rowCount
-        of bmkNoData:
-          discard
-        of bmkCommandComplete:
-          if activeOpIdx < p.ops.len:
-            if p.ops[activeOpIdx].kind == pokExec:
-              results[activeOpIdx].commandResult = initCommandResult(msg.commandTag)
-            else:
-              results[activeOpIdx].queryResult.commandTag = msg.commandTag
-            inc activeOpIdx
-            # Update rowData/rowCount for next op
+        while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
+          let msg = opt.get
+          case msg.kind
+          of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+            discard
+          of bmkParameterDescription:
+            discard
+          of bmkRowDescription:
             if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+              var cf: seq[int16]
+              var co: seq[int32]
+              if p.ops[activeOpIdx].cacheMiss:
+                if cachedFieldsPerOp.len == 0:
+                  cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
+                cachedFieldsPerOp[activeOpIdx] = msg.fields
+                results[activeOpIdx].queryResult.fields = msg.fields
+                if p.ops[activeOpIdx].resultFormats.len > 0:
+                  cf = newSeq[int16](msg.fields.len)
+                  co = newSeq[int32](msg.fields.len)
+                  for j in 0 ..< msg.fields.len:
+                    co[j] = msg.fields[j].typeOid
+                    if p.ops[activeOpIdx].resultFormats.len == 1:
+                      results[activeOpIdx].queryResult.fields[j].formatCode =
+                        p.ops[activeOpIdx].resultFormats[0]
+                      cf[j] = p.ops[activeOpIdx].resultFormats[0]
+                    elif j < p.ops[activeOpIdx].resultFormats.len:
+                      results[activeOpIdx].queryResult.fields[j].formatCode =
+                        p.ops[activeOpIdx].resultFormats[j]
+                      cf[j] = p.ops[activeOpIdx].resultFormats[j]
+              else:
+                results[activeOpIdx].queryResult.fields = msg.fields
+              results[activeOpIdx].queryResult.data =
+                newRowData(int16(msg.fields.len), cf, co)
+              # Update pointers for nextMessage
               rowData = results[activeOpIdx].queryResult.data
               rowCount = addr results[activeOpIdx].queryResult.rowCount
-            else:
-              rowData = nil
-              rowCount = nil
-        of bmkEmptyQueryResponse:
-          if activeOpIdx < p.ops.len:
-            inc activeOpIdx
-            if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
-              rowData = results[activeOpIdx].queryResult.data
-              rowCount = addr results[activeOpIdx].queryResult.rowCount
-            else:
-              rowData = nil
-              rowCount = nil
-        of bmkErrorResponse:
-          if queryError == nil:
-            queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            # Invalidate cache for 26000 (prepared statement does not exist)
-            if queryError.sqlState == "26000":
-              for i in 0 ..< p.ops.len:
-                if p.ops[i].cacheHit:
-                  conn.removeStmtCache(p.ops[i].sql)
-            raise queryError
-          # Cache misses: add to cache
-          for i in 0 ..< p.ops.len:
-            if p.ops[i].cacheMiss:
-              let fields =
-                if cachedFieldsPerOp.len > 0:
-                  cachedFieldsPerOp[i]
-                else:
-                  @[]
-              conn.addStmtCache(
-                p.ops[i].sql, CachedStmt(name: p.ops[i].stmtName, fields: fields)
-              )
-          break recvLoop
-        else:
-          discard
-      when hasChronos:
-        try:
-          await conn.fillRecvBuf(timeout)
-        except CatchableError as e:
-          # recv failed with an in-flight send: don't leak sendFut as an
-          # unhandled Future. Cancel it and let the recv error propagate.
-          if not sendFut.finished:
-            try:
-              await cancelAndWait(sendFut)
-            except CatchableError:
-              discard
-          raise e
-      else:
+          of bmkNoData:
+            discard
+          of bmkCommandComplete:
+            if activeOpIdx < p.ops.len:
+              if p.ops[activeOpIdx].kind == pokExec:
+                results[activeOpIdx].commandResult = initCommandResult(msg.commandTag)
+              else:
+                results[activeOpIdx].queryResult.commandTag = msg.commandTag
+              inc activeOpIdx
+              # Update rowData/rowCount for next op
+              if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+                rowData = results[activeOpIdx].queryResult.data
+                rowCount = addr results[activeOpIdx].queryResult.rowCount
+              else:
+                rowData = nil
+                rowCount = nil
+          of bmkEmptyQueryResponse:
+            if activeOpIdx < p.ops.len:
+              inc activeOpIdx
+              if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
+                rowData = results[activeOpIdx].queryResult.data
+                rowCount = addr results[activeOpIdx].queryResult.rowCount
+              else:
+                rowData = nil
+                rowCount = nil
+          of bmkErrorResponse:
+            if queryError == nil:
+              queryError = newPgQueryError(msg.errorFields)
+          of bmkReadyForQuery:
+            conn.txStatus = msg.txStatus
+            conn.state = csReady
+            if queryError != nil:
+              # Invalidate cache for 26000 (prepared statement does not exist)
+              if queryError.sqlState == "26000":
+                for i in 0 ..< p.ops.len:
+                  if p.ops[i].cacheHit:
+                    conn.removeStmtCache(p.ops[i].sql)
+              raise queryError
+            # Cache misses: add to cache
+            for i in 0 ..< p.ops.len:
+              if p.ops[i].cacheMiss:
+                let fields =
+                  if cachedFieldsPerOp.len > 0:
+                    cachedFieldsPerOp[i]
+                  else:
+                    @[]
+                conn.addStmtCache(
+                  p.ops[i].sql, CachedStmt(name: p.ops[i].stmtName, fields: fields)
+                )
+            break recvLoop
+          else:
+            discard
         await conn.fillRecvBuf(timeout)
 
-  when hasChronos:
-    # Propagate any write error whether the send completed before or after
-    # the recv loop finished. `await` on an already-finished Future re-raises
-    # a stored exception, so this covers both "still running" and
-    # "finished-with-error" cases.
-    await sendFut
+    when hasChronos:
+      # Normal path: drain sendFut to propagate any stored write error and
+      # release the borrow on conn.sendBuf.
+      await sendFut
+  except CatchableError as e:
+    when hasChronos:
+      # Abnormal path (recv error, cancellation, failed stored write):
+      # ensure sendFut never escapes as an unhandled Future and that no
+      # in-flight write still holds unsafeAddr conn.sendBuf[0].
+      if not sendFut.finished:
+        try:
+          await cancelAndWait(sendFut)
+        except CatchableError:
+          discard
+      else:
+        try:
+          await sendFut
+        except CatchableError:
+          discard
+    raise e
 
   return results
 
@@ -2874,7 +2879,13 @@ proc executeIsolatedImpl(
 
     conn.sendBuf.addSync() # Per-op SYNC for error isolation
 
-  await conn.sendBufMsg()
+  when hasChronos:
+    # Same concurrent-send pattern as executeImpl: the write drains while the
+    # recv loop consumes per-op ReadyForQuery messages. Per-op SYNC still
+    # provides error isolation; only the IO scheduling differs.
+    var sendFut = conn.sendBufMsg()
+  else:
+    await conn.sendBufMsg()
 
   # Receive Phase (per-op ReadyForQuery)
   var results = newSeq[PipelineResult](p.ops.len)
@@ -2896,81 +2907,101 @@ proc executeIsolatedImpl(
     else:
       results[i] = PipelineResult(kind: prkExec)
 
-  for opIdx in 0 ..< p.ops.len:
-    var opError: ref PgQueryError
-    var cachedFields: seq[FieldDescription]
+  try:
+    for opIdx in 0 ..< p.ops.len:
+      var opError: ref PgQueryError
+      var cachedFields: seq[FieldDescription]
 
-    block opRecv:
-      while true:
-        var rowData: RowData = nil
-        var rowCount: ptr int32 = nil
-        if p.ops[opIdx].kind == pokQuery:
-          rowData = results[opIdx].queryResult.data
-          rowCount = addr results[opIdx].queryResult.rowCount
+      block opRecv:
+        while true:
+          var rowData: RowData = nil
+          var rowCount: ptr int32 = nil
+          if p.ops[opIdx].kind == pokQuery:
+            rowData = results[opIdx].queryResult.data
+            rowCount = addr results[opIdx].queryResult.rowCount
 
-        while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
-          let msg = opt.get
-          case msg.kind
-          of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-            discard
-          of bmkParameterDescription:
-            discard
-          of bmkRowDescription:
-            if p.ops[opIdx].kind == pokQuery:
-              if p.ops[opIdx].cacheMiss:
-                cachedFields = msg.fields
-                results[opIdx].queryResult.fields = msg.fields
-                var cf: seq[int16]
-                var co: seq[int32]
-                if p.ops[opIdx].resultFormats.len > 0:
-                  cf = newSeq[int16](msg.fields.len)
-                  co = newSeq[int32](msg.fields.len)
-                  for j in 0 ..< msg.fields.len:
-                    co[j] = msg.fields[j].typeOid
-                    if p.ops[opIdx].resultFormats.len == 1:
-                      results[opIdx].queryResult.fields[j].formatCode =
-                        p.ops[opIdx].resultFormats[0]
-                      cf[j] = p.ops[opIdx].resultFormats[0]
-                    elif j < p.ops[opIdx].resultFormats.len:
-                      results[opIdx].queryResult.fields[j].formatCode =
-                        p.ops[opIdx].resultFormats[j]
-                      cf[j] = p.ops[opIdx].resultFormats[j]
-                results[opIdx].queryResult.data =
-                  newRowData(int16(msg.fields.len), cf, co)
-                rowData = results[opIdx].queryResult.data
-                rowCount = addr results[opIdx].queryResult.rowCount
+          while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
+            let msg = opt.get
+            case msg.kind
+            of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+              discard
+            of bmkParameterDescription:
+              discard
+            of bmkRowDescription:
+              if p.ops[opIdx].kind == pokQuery:
+                if p.ops[opIdx].cacheMiss:
+                  cachedFields = msg.fields
+                  results[opIdx].queryResult.fields = msg.fields
+                  var cf: seq[int16]
+                  var co: seq[int32]
+                  if p.ops[opIdx].resultFormats.len > 0:
+                    cf = newSeq[int16](msg.fields.len)
+                    co = newSeq[int32](msg.fields.len)
+                    for j in 0 ..< msg.fields.len:
+                      co[j] = msg.fields[j].typeOid
+                      if p.ops[opIdx].resultFormats.len == 1:
+                        results[opIdx].queryResult.fields[j].formatCode =
+                          p.ops[opIdx].resultFormats[0]
+                        cf[j] = p.ops[opIdx].resultFormats[0]
+                      elif j < p.ops[opIdx].resultFormats.len:
+                        results[opIdx].queryResult.fields[j].formatCode =
+                          p.ops[opIdx].resultFormats[j]
+                        cf[j] = p.ops[opIdx].resultFormats[j]
+                  results[opIdx].queryResult.data =
+                    newRowData(int16(msg.fields.len), cf, co)
+                  rowData = results[opIdx].queryResult.data
+                  rowCount = addr results[opIdx].queryResult.rowCount
+                else:
+                  results[opIdx].queryResult.fields = msg.fields
+                  results[opIdx].queryResult.data = newRowData(int16(msg.fields.len))
+                  rowData = results[opIdx].queryResult.data
+                  rowCount = addr results[opIdx].queryResult.rowCount
+            of bmkNoData:
+              discard
+            of bmkCommandComplete:
+              if p.ops[opIdx].kind == pokExec:
+                results[opIdx].commandResult = initCommandResult(msg.commandTag)
               else:
-                results[opIdx].queryResult.fields = msg.fields
-                results[opIdx].queryResult.data = newRowData(int16(msg.fields.len))
-                rowData = results[opIdx].queryResult.data
-                rowCount = addr results[opIdx].queryResult.rowCount
-          of bmkNoData:
-            discard
-          of bmkCommandComplete:
-            if p.ops[opIdx].kind == pokExec:
-              results[opIdx].commandResult = initCommandResult(msg.commandTag)
+                results[opIdx].queryResult.commandTag = msg.commandTag
+            of bmkEmptyQueryResponse:
+              discard
+            of bmkErrorResponse:
+              if opError == nil:
+                opError = newPgQueryError(msg.errorFields)
+            of bmkReadyForQuery:
+              conn.txStatus = msg.txStatus
+              if opError != nil:
+                if opError.sqlState == "26000" and p.ops[opIdx].cacheHit:
+                  conn.removeStmtCache(p.ops[opIdx].sql)
+                errors[opIdx] = opError
+              elif p.ops[opIdx].cacheMiss:
+                conn.addStmtCache(
+                  p.ops[opIdx].sql,
+                  CachedStmt(name: p.ops[opIdx].stmtName, fields: cachedFields),
+                )
+              break opRecv
             else:
-              results[opIdx].queryResult.commandTag = msg.commandTag
-          of bmkEmptyQueryResponse:
-            discard
-          of bmkErrorResponse:
-            if opError == nil:
-              opError = newPgQueryError(msg.errorFields)
-          of bmkReadyForQuery:
-            conn.txStatus = msg.txStatus
-            if opError != nil:
-              if opError.sqlState == "26000" and p.ops[opIdx].cacheHit:
-                conn.removeStmtCache(p.ops[opIdx].sql)
-              errors[opIdx] = opError
-            elif p.ops[opIdx].cacheMiss:
-              conn.addStmtCache(
-                p.ops[opIdx].sql,
-                CachedStmt(name: p.ops[opIdx].stmtName, fields: cachedFields),
-              )
-            break opRecv
-          else:
-            discard
-        await conn.fillRecvBuf(timeout)
+              discard
+          await conn.fillRecvBuf(timeout)
+
+    when hasChronos:
+      # Normal path: drain sendFut to propagate any stored write error.
+      await sendFut
+  except CatchableError as e:
+    when hasChronos:
+      # Abnormal path: cancel or drain sendFut so the Future never leaks
+      # and no in-flight write still borrows conn.sendBuf.
+      if not sendFut.finished:
+        try:
+          await cancelAndWait(sendFut)
+        except CatchableError:
+          discard
+      else:
+        try:
+          await sendFut
+        except CatchableError:
+          discard
+    raise e
 
   conn.state = csReady
   return IsolatedPipelineResults(results: results, errors: errors)
