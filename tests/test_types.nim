@@ -6341,3 +6341,200 @@ suite "Pipeline appendInline SoA layout":
     check p.ops[1].inlineStart == 2 # resumes after the two params of op A
     check p.ops[1].inlineCount == 0
     check p.inlineRanges.len == 2 # unchanged by op B
+
+suite "encodeBinaryArray with Option elements":
+  test "mixed null and non-null int32":
+    let elements = @[some(@(toBE32(1'i32))), none(seq[byte]), some(@(toBE32(3'i32)))]
+    let encoded = encodeBinaryArray(OidInt4, elements)
+    # header(20) + 3 × len(4) + 2 non-null × payload(4) = 40
+    check encoded.len == 40
+    check fromBE32(encoded.toOpenArray(0, 3)) == 1'i32 # ndim
+    check fromBE32(encoded.toOpenArray(4, 7)) == 1'i32 # has_null = 1
+    check fromBE32(encoded.toOpenArray(8, 11)) == OidInt4
+    check fromBE32(encoded.toOpenArray(12, 15)) == 3'i32 # dim_len
+    # element 0 len
+    check fromBE32(encoded.toOpenArray(20, 23)) == 4'i32
+    # element 1 len = -1 (NULL)
+    check fromBE32(encoded.toOpenArray(28, 31)) == -1'i32
+    # element 2 len
+    check fromBE32(encoded.toOpenArray(32, 35)) == 4'i32
+
+  test "all-some matches non-optional encoder byte-for-byte":
+    let same = encodeBinaryArray(OidInt4, @[@(toBE32(1'i32)), @(toBE32(2'i32))])
+    let withOpt =
+      encodeBinaryArray(OidInt4, @[some(@(toBE32(1'i32))), some(@(toBE32(2'i32)))])
+    check same == withOpt
+
+  test "all-none sets has_null":
+    let encoded = encodeBinaryArray(OidInt4, @[none(seq[byte]), none(seq[byte])])
+    check fromBE32(encoded.toOpenArray(4, 7)) == 1'i32
+
+suite "toPgParam seq[Option[T]]":
+  test "int32 with null":
+    let p = toPgParam(@[some(1'i32), none(int32), some(3'i32)])
+    check p.oid == OidInt4Array
+    check p.format == 1'i16
+    check p.value.isSome
+    # has_null should be 1
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "int16 with null":
+    let p = toPgParam(@[some(10'i16), none(int16)])
+    check p.oid == OidInt2Array
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "int64 with null":
+    let p = toPgParam(@[none(int64), some(99'i64)])
+    check p.oid == OidInt8Array
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "int with null":
+    let p = toPgParam(@[some(1), none(int)])
+    check p.oid == OidInt8Array
+
+  test "float32 with null":
+    let p = toPgParam(@[some(1.5'f32), none(float32)])
+    check p.oid == OidFloat4Array
+
+  test "float64 with null":
+    let p = toPgParam(@[some(1.5), none(float64)])
+    check p.oid == OidFloat8Array
+
+  test "bool with null":
+    let p = toPgParam(@[some(true), none(bool), some(false)])
+    check p.oid == OidBoolArray
+
+  test "string with null":
+    let p = toPgParam(@[some("a"), none(string), some("c")])
+    check p.oid == OidTextArray
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "empty seq[Option[int32]]":
+    let v: seq[Option[int32]] = @[]
+    let p = toPgParam(v)
+    check p.oid == OidInt4Array
+    check p.value.isSome
+    # empty array: ndim=0, has_null=0, elem_oid
+    check fromBE32(p.value.get.toOpenArray(0, 3)) == 0'i32
+
+  test "all-some int32 matches non-optional":
+    let a = toPgParam(@[1'i32, 2, 3])
+    let b = toPgParam(@[some(1'i32), some(2'i32), some(3'i32)])
+    check a.value.get == b.value.get
+
+suite "getXxxArrayElemOpt":
+  test "getIntArrayElemOpt text with NULL":
+    let row: Row = @[some(toBytes("{1,NULL,3}"))]
+    check row.getIntArrayElemOpt(0) == @[some(1'i32), none(int32), some(3'i32)]
+
+  test "getIntArrayElemOpt text all-some":
+    let row: Row = @[some(toBytes("{1,2,3}"))]
+    check row.getIntArrayElemOpt(0) == @[some(1'i32), some(2'i32), some(3'i32)]
+
+  test "getIntArrayElemOpt NULL column raises":
+    let row: Row = @[none(seq[byte])]
+    var raised = false
+    try:
+      discard row.getIntArrayElemOpt(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getIntArrayElemOptOpt NULL column is none":
+    let row: Row = @[none(seq[byte])]
+    check row.getIntArrayElemOptOpt(0) == none(seq[Option[int32]])
+
+  test "getIntArrayElemOptOpt some with NULL element":
+    let row: Row = @[some(toBytes("{1,NULL}"))]
+    let v = row.getIntArrayElemOptOpt(0)
+    check v.isSome
+    check v.get == @[some(1'i32), none(int32)]
+
+  test "getStrArrayElemOpt text with NULL":
+    let row: Row = @[some(toBytes("{\"a\",NULL,\"c\"}"))]
+    check row.getStrArrayElemOpt(0) == @[some("a"), none(string), some("c")]
+
+  test "getBoolArrayElemOpt text with NULL":
+    let row: Row = @[some(toBytes("{t,NULL,f}"))]
+    check row.getBoolArrayElemOpt(0) == @[some(true), none(bool), some(false)]
+
+  test "getInt16ArrayElemOpt text":
+    let row: Row = @[some(toBytes("{10,NULL}"))]
+    check row.getInt16ArrayElemOpt(0) == @[some(10'i16), none(int16)]
+
+  test "getInt64ArrayElemOpt text":
+    let row: Row = @[some(toBytes("{99,NULL}"))]
+    check row.getInt64ArrayElemOpt(0) == @[some(99'i64), none(int64)]
+
+  test "getFloatArrayElemOpt text":
+    let row: Row = @[some(toBytes("{1.5,NULL}"))]
+    let v = row.getFloatArrayElemOpt(0)
+    check v.len == 2
+    check v[0].isSome
+    check abs(v[0].get - 1.5) < 1e-10
+    check v[1].isNone
+
+  test "getFloat32ArrayElemOpt text":
+    let row: Row = @[some(toBytes("{2.5,NULL}"))]
+    let v = row.getFloat32ArrayElemOpt(0)
+    check v.len == 2
+    check v[0].isSome
+    check v[1].isNone
+
+suite "enum arrays":
+  test "toPgParam seq[Mood] emits text array literal":
+    let p = toPgParam(@[happy, sad, ok])
+    check p.format == 0'i16
+    check toString(p.value.get) == "{\"happy\",\"sad\",\"ok\"}"
+
+  test "toPgParam seq[Option[Mood]] emits NULL tokens":
+    let p = toPgParam(@[some(happy), none(Mood), some(ok)])
+    check toString(p.value.get) == "{\"happy\",NULL,\"ok\"}"
+
+  test "toPgParam empty seq[Mood]":
+    let v: seq[Mood] = @[]
+    let p = toPgParam(v)
+    check toString(p.value.get) == "{}"
+
+  test "pgEnum OID=0: array uses OID 0":
+    let p = toPgParam(@[happy])
+    check p.oid == 0'i32
+
+  test "pgEnum with explicit OID: scalar OID propagates to array with OID 0":
+    let p = toPgParam(@[red, green])
+    # 2-arg pgEnum keeps arrayOid = 0
+    check p.oid == 0'i32
+
+  test "getEnumArray text":
+    let row: Row = @[some(toBytes("{happy,sad,ok}"))]
+    check getEnumArray[Mood](row, 0) == @[happy, sad, ok]
+
+  test "getEnumArray raises on NULL element":
+    let row: Row = @[some(toBytes("{happy,NULL,ok}"))]
+    var raised = false
+    try:
+      discard getEnumArray[Mood](row, 0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getEnumArrayElemOpt":
+    let row: Row = @[some(toBytes("{happy,NULL,ok}"))]
+    check getEnumArrayElemOpt[Mood](row, 0) == @[some(happy), none(Mood), some(ok)]
+
+  test "getEnumArrayOpt NULL column":
+    let row: Row = @[none(seq[byte])]
+    check getEnumArrayOpt[Mood](row, 0) == none(seq[Mood])
+
+  test "getEnumArrayOpt some":
+    let row: Row = @[some(toBytes("{happy}"))]
+    check getEnumArrayOpt[Mood](row, 0) == some(@[happy])
+
+  test "getEnumArray invalid label raises":
+    let row: Row = @[some(toBytes("{unknown}"))]
+    var raised = false
+    try:
+      discard getEnumArray[Mood](row, 0)
+    except ValueError:
+      raised = true
+    check raised

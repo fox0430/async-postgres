@@ -229,7 +229,7 @@ clusterForwards("read"):
     timeout: Duration = ZeroDuration,
   ): Future[QueryResult]
 
-  proc readQueryOne*(
+  proc readQueryRowOpt*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
@@ -339,7 +339,7 @@ clusterForwards("write"):
     timeout: Duration = ZeroDuration,
   ): Future[QueryResult]
 
-  proc writeQueryOne*(
+  proc writeQueryRowOpt*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],

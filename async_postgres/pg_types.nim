@@ -1294,6 +1294,52 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[seq[byte]]): seq[byte] =
       copyMem(addr result[pos], unsafeAddr e[0], e.len)
       pos += e.len
 
+proc encodeBinaryArray*(elemOid: int32, elements: seq[Option[seq[byte]]]): seq[byte] =
+  ## Encode a 1-dimensional binary array that may contain NULL elements.
+  ## NULL elements are written with length ``-1`` and no payload.
+  ## ``has_null`` is set to 1 iff any element is ``none``.
+  if elements.len > int32.high.int:
+    raise
+      newException(PgError, "Array has too many elements for PostgreSQL binary format")
+  let headerSize = 20
+  var dataSize = 0
+  var anyNull = false
+  for e in elements:
+    if e.isNone:
+      anyNull = true
+      dataSize += 4
+    else:
+      let ev = e.get
+      if ev.len > int32.high.int:
+        raise
+          newException(PgError, "Array element too large for PostgreSQL binary format")
+      dataSize += 4 + ev.len
+  result = newSeq[byte](headerSize + dataSize)
+  let ndim = toBE32(1'i32)
+  copyMem(addr result[0], unsafeAddr ndim[0], 4)
+  let hasNull = toBE32(if anyNull: 1'i32 else: 0'i32)
+  copyMem(addr result[4], unsafeAddr hasNull[0], 4)
+  let oid = toBE32(elemOid)
+  copyMem(addr result[8], unsafeAddr oid[0], 4)
+  let dimLen = toBE32(int32(elements.len))
+  copyMem(addr result[12], unsafeAddr dimLen[0], 4)
+  let lb = toBE32(1'i32)
+  copyMem(addr result[16], unsafeAddr lb[0], 4)
+  var pos = headerSize
+  for e in elements:
+    if e.isNone:
+      let eLen = toBE32(-1'i32)
+      copyMem(addr result[pos], unsafeAddr eLen[0], 4)
+      pos += 4
+    else:
+      let ev = e.get
+      let eLen = toBE32(int32(ev.len))
+      copyMem(addr result[pos], unsafeAddr eLen[0], 4)
+      pos += 4
+      if ev.len > 0:
+        copyMem(addr result[pos], unsafeAddr ev[0], ev.len)
+        pos += ev.len
+
 proc encodeBinaryArrayEmpty*(elemOid: int32): seq[byte] =
   ## Encode an empty 1-dimensional PostgreSQL binary array.
   ## ndim=0, has_null=0, elem_oid
@@ -1388,6 +1434,134 @@ proc toPgParam*(v: seq[string]): PgParam =
   var elements = newSeq[seq[byte]](v.len)
   for i, x in v:
     elements[i] = toBytes(x)
+  PgParam(
+    oid: OidTextArray, format: 1, value: some(encodeBinaryArray(OidText, elements))
+  )
+
+proc toPgParam*(v: seq[Option[int16]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt2Array, format: 1, value: some(encodeBinaryArrayEmpty(OidInt2))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(@(toBE16(x.get)))
+      else:
+        none(seq[byte])
+  PgParam(
+    oid: OidInt2Array, format: 1, value: some(encodeBinaryArray(OidInt2, elements))
+  )
+
+proc toPgParam*(v: seq[Option[int32]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt4Array, format: 1, value: some(encodeBinaryArrayEmpty(OidInt4))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(@(toBE32(x.get)))
+      else:
+        none(seq[byte])
+  PgParam(
+    oid: OidInt4Array, format: 1, value: some(encodeBinaryArray(OidInt4, elements))
+  )
+
+proc toPgParam*(v: seq[Option[int64]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt8Array, format: 1, value: some(encodeBinaryArrayEmpty(OidInt8))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(@(toBE64(x.get)))
+      else:
+        none(seq[byte])
+  PgParam(
+    oid: OidInt8Array, format: 1, value: some(encodeBinaryArray(OidInt8, elements))
+  )
+
+proc toPgParam*(v: seq[Option[int]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidInt8Array, format: 1, value: some(encodeBinaryArrayEmpty(OidInt8))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(@(toBE64(int64(x.get))))
+      else:
+        none(seq[byte])
+  PgParam(
+    oid: OidInt8Array, format: 1, value: some(encodeBinaryArray(OidInt8, elements))
+  )
+
+proc toPgParam*(v: seq[Option[float32]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidFloat4Array, format: 1, value: some(encodeBinaryArrayEmpty(OidFloat4))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(@(toBE32(cast[int32](x.get))))
+      else:
+        none(seq[byte])
+  PgParam(
+    oid: OidFloat4Array, format: 1, value: some(encodeBinaryArray(OidFloat4, elements))
+  )
+
+proc toPgParam*(v: seq[Option[float64]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidFloat8Array, format: 1, value: some(encodeBinaryArrayEmpty(OidFloat8))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(@(toBE64(cast[int64](x.get))))
+      else:
+        none(seq[byte])
+  PgParam(
+    oid: OidFloat8Array, format: 1, value: some(encodeBinaryArray(OidFloat8, elements))
+  )
+
+proc toPgParam*(v: seq[Option[bool]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidBoolArray, format: 1, value: some(encodeBinaryArrayEmpty(OidBool))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(@[if x.get: 1'u8 else: 0'u8])
+      else:
+        none(seq[byte])
+  PgParam(
+    oid: OidBoolArray, format: 1, value: some(encodeBinaryArray(OidBool, elements))
+  )
+
+proc toPgParam*(v: seq[Option[string]]): PgParam =
+  if v.len == 0:
+    return PgParam(
+      oid: OidTextArray, format: 1, value: some(encodeBinaryArrayEmpty(OidText))
+    )
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, x in v:
+    elements[i] =
+      if x.isSome:
+        some(toBytes(x.get))
+      else:
+        none(seq[byte])
   PgParam(
     oid: OidTextArray, format: 1, value: some(encodeBinaryArray(OidText, elements))
   )
@@ -4286,6 +4460,175 @@ proc getHstoreArray*(row: Row, col: int): seq[PgHstore] =
       raise newException(PgTypeError, "NULL element in hstore array")
     result.add(parseHstoreText(e.get))
 
+# Element-level NULL-safe array getters: each element becomes ``Option[T]``,
+# with ``none`` for NULL elements.  Column-level NULL still raises (like the
+# base getters); the column-and-element NULL-safe variants are generated just
+# below via ``optAccessor``.
+
+proc getIntArrayElemOpt*(row: Row, col: int): seq[Option[int32]] =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[int32]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(int32)
+      else:
+        result[i] =
+          some(fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      result.add(none(int32))
+    else:
+      result.add(some(int32(parseInt(e.get))))
+
+proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[int16]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(int16)
+      else:
+        result[i] =
+          some(fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      result.add(none(int16))
+    else:
+      result.add(some(int16(parseInt(e.get))))
+
+proc getInt64ArrayElemOpt*(row: Row, col: int): seq[Option[int64]] =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[int64]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(int64)
+      else:
+        result[i] =
+          some(fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      result.add(none(int64))
+    else:
+      result.add(some(parseBiggestInt(e.get)))
+
+proc getFloatArrayElemOpt*(row: Row, col: int): seq[Option[float64]] =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[float64]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(float64)
+      elif e.len == 4:
+        result[i] = some(
+          float64(
+            cast[float32](cast[uint32](fromBE32(
+              row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+            )))
+          )
+        )
+      else:
+        result[i] = some(
+          cast[float64](cast[uint64](fromBE64(
+            row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+          )))
+        )
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      result.add(none(float64))
+    else:
+      result.add(some(parseFloat(e.get)))
+
+proc getFloat32ArrayElemOpt*(row: Row, col: int): seq[Option[float32]] =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[float32]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(float32)
+      else:
+        result[i] = some(
+          cast[float32](cast[uint32](fromBE32(
+            row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+          )))
+        )
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      result.add(none(float32))
+    else:
+      result.add(some(float32(parseFloat(e.get))))
+
+proc getBoolArrayElemOpt*(row: Row, col: int): seq[Option[bool]] =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[bool]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(bool)
+      else:
+        result[i] = some(row.data.buf[off + e.off] == 1'u8)
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      result.add(none(bool))
+    else:
+      case e.get
+      of "t", "true", "1":
+        result.add(some(true))
+      of "f", "false", "0":
+        result.add(some(false))
+      else:
+        raise newException(PgTypeError, "Invalid boolean: " & e.get)
+
+proc getStrArrayElemOpt*(row: Row, col: int): seq[Option[string]] =
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[string]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(string)
+      else:
+        var s = newString(e.len)
+        if e.len > 0:
+          copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+        result[i] = some(s)
+    return
+  let s = row.getStr(col)
+  result = parseTextArray(s)
+
 # Array Opt accessors (text format)
 
 optAccessor(getIntArray, getIntArrayOpt, seq[int32])
@@ -4322,6 +4665,17 @@ optAccessor(getXmlArray, getXmlArrayOpt, seq[PgXml])
 optAccessor(getTsVectorArray, getTsVectorArrayOpt, seq[PgTsVector])
 optAccessor(getTsQueryArray, getTsQueryArrayOpt, seq[PgTsQuery])
 optAccessor(getHstoreArray, getHstoreArrayOpt, seq[PgHstore])
+
+# Column-level + element-level NULL-safe: returns ``none`` when the whole
+# column is NULL; otherwise each element is ``Option[T]`` with ``none`` for
+# NULL elements.
+optAccessor(getIntArrayElemOpt, getIntArrayElemOptOpt, seq[Option[int32]])
+optAccessor(getInt16ArrayElemOpt, getInt16ArrayElemOptOpt, seq[Option[int16]])
+optAccessor(getInt64ArrayElemOpt, getInt64ArrayElemOptOpt, seq[Option[int64]])
+optAccessor(getFloatArrayElemOpt, getFloatArrayElemOptOpt, seq[Option[float64]])
+optAccessor(getFloat32ArrayElemOpt, getFloat32ArrayElemOptOpt, seq[Option[float32]])
+optAccessor(getBoolArrayElemOpt, getBoolArrayElemOptOpt, seq[Option[bool]])
+optAccessor(getStrArrayElemOpt, getStrArrayElemOptOpt, seq[Option[string]])
 
 # Coerce a binary PgParam to match the server-inferred type from a prepared
 # statement.  This handles the common case where e.g. int32.toPgParam is
@@ -4623,21 +4977,112 @@ macro addBindDirect*(
 #   let m = row.getEnum[Mood](0)
 #   let m = row.getEnumOpt[Mood](0)
 
+proc encodeEnumTextArray*(labels: seq[Option[string]]): string =
+  ## Encode enum labels as a PostgreSQL text-format array literal.
+  ## ``none`` labels become unquoted ``NULL``.
+  result = "{"
+  for i, lbl in labels:
+    if i > 0:
+      result.add(',')
+    if lbl.isSome:
+      result.add('"')
+      for c in lbl.get:
+        if c == '"' or c == '\\':
+          result.add('\\')
+        result.add(c)
+      result.add('"')
+    else:
+      result.add("NULL")
+  result.add('}')
+
 macro pgEnum*(T: untyped): untyped =
-  ## Generate ``toPgParam`` for a Nim enum type.
-  ## The parameter is sent as text with OID 0 (unspecified) so that
-  ## PostgreSQL infers the enum type from context.
+  ## Generate ``toPgParam`` overloads for a Nim enum type and its array forms.
+  ## OIDs are 0 (unspecified) so PostgreSQL infers the type from context
+  ## (use ``$1::mytype`` / ``$1::mytype[]`` in the SQL).
   result = newStmtList()
   result.add quote do:
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: 0'i32, format: 0'i16, value: some(toBytes($v)))
 
+    proc toPgParam*(v: seq[`T`]): PgParam =
+      var labels = newSeq[Option[string]](v.len)
+      for i, x in v:
+        labels[i] = some($x)
+      PgParam(
+        oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
+      )
+
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+      var labels = newSeq[Option[string]](v.len)
+      for i, x in v:
+        labels[i] =
+          if x.isSome:
+            some($x.get)
+          else:
+            none(string)
+      PgParam(
+        oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
+      )
+
 macro pgEnum*(T: untyped, oid: untyped): untyped =
-  ## Generate ``toPgParam`` for a Nim enum type with an explicit OID.
+  ## Generate ``toPgParam`` overloads for a Nim enum type with an explicit
+  ## scalar OID. The array OID is unspecified (0); add a ``$1::mytype[]``
+  ## cast in the SQL, or use the 3-argument form to set the array OID too.
   result = newStmtList()
   result.add quote do:
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
+
+    proc toPgParam*(v: seq[`T`]): PgParam =
+      var labels = newSeq[Option[string]](v.len)
+      for i, x in v:
+        labels[i] = some($x)
+      PgParam(
+        oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
+      )
+
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+      var labels = newSeq[Option[string]](v.len)
+      for i, x in v:
+        labels[i] =
+          if x.isSome:
+            some($x.get)
+          else:
+            none(string)
+      PgParam(
+        oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
+      )
+
+macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
+  ## Generate ``toPgParam`` overloads with explicit scalar and array OIDs.
+  result = newStmtList()
+  result.add quote do:
+    proc toPgParam*(v: `T`): PgParam =
+      PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
+
+    proc toPgParam*(v: seq[`T`]): PgParam =
+      var labels = newSeq[Option[string]](v.len)
+      for i, x in v:
+        labels[i] = some($x)
+      PgParam(
+        oid: int32(`arrayOid`),
+        format: 0'i16,
+        value: some(toBytes(encodeEnumTextArray(labels))),
+      )
+
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+      var labels = newSeq[Option[string]](v.len)
+      for i, x in v:
+        labels[i] =
+          if x.isSome:
+            some($x.get)
+          else:
+            none(string)
+      PgParam(
+        oid: int32(`arrayOid`),
+        format: 0'i16,
+        value: some(toBytes(encodeEnumTextArray(labels))),
+      )
 
 proc getEnum*[T: enum](row: Row, col: int): T =
   ## Read a PostgreSQL enum column (text format) as a Nim enum.
@@ -4651,6 +5096,60 @@ proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
     none(T)
   else:
     some(getEnum[T](row, col))
+
+proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
+  ## Read a PostgreSQL enum[] column as ``seq[T]``.
+  ## Raises ``PgTypeError`` on NULL column or NULL element.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[T](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in enum array")
+      var s = newString(e.len)
+      if e.len > 0:
+        copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+      result[i] = parseEnum[T](s)
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in enum array")
+    result.add(parseEnum[T](e.get))
+
+proc getEnumArrayOpt*[T: enum](row: Row, col: int): Option[seq[T]] =
+  ## NULL-safe column-level variant. Element NULL still raises.
+  if row.isNull(col):
+    none(seq[T])
+  else:
+    some(getEnumArray[T](row, col))
+
+proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
+  ## Element-level NULL-safe: each element is ``Option[T]``.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    result = newSeq[Option[T]](decoded.elements.len)
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result[i] = none(T)
+      else:
+        var s = newString(e.len)
+        if e.len > 0:
+          copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+        result[i] = some(parseEnum[T](s))
+    return
+  let s = row.getStr(col)
+  for e in parseTextArray(s):
+    if e.isNone:
+      result.add(none(T))
+    else:
+      result.add(some(parseEnum[T](e.get)))
 
 # User-defined composite type support
 #
@@ -6682,6 +7181,20 @@ nameAccessor(getXmlArrayOpt, Option[seq[PgXml]])
 nameAccessor(getTsVectorArrayOpt, Option[seq[PgTsVector]])
 nameAccessor(getTsQueryArrayOpt, Option[seq[PgTsQuery]])
 nameAccessor(getHstoreArrayOpt, Option[seq[PgHstore]])
+nameAccessor(getIntArrayElemOpt, seq[Option[int32]])
+nameAccessor(getInt16ArrayElemOpt, seq[Option[int16]])
+nameAccessor(getInt64ArrayElemOpt, seq[Option[int64]])
+nameAccessor(getFloatArrayElemOpt, seq[Option[float64]])
+nameAccessor(getFloat32ArrayElemOpt, seq[Option[float32]])
+nameAccessor(getBoolArrayElemOpt, seq[Option[bool]])
+nameAccessor(getStrArrayElemOpt, seq[Option[string]])
+nameAccessor(getIntArrayElemOptOpt, Option[seq[Option[int32]]])
+nameAccessor(getInt16ArrayElemOptOpt, Option[seq[Option[int16]]])
+nameAccessor(getInt64ArrayElemOptOpt, Option[seq[Option[int64]]])
+nameAccessor(getFloatArrayElemOptOpt, Option[seq[Option[float64]]])
+nameAccessor(getFloat32ArrayElemOptOpt, Option[seq[Option[float32]]])
+nameAccessor(getBoolArrayElemOptOpt, Option[seq[Option[bool]]])
+nameAccessor(getStrArrayElemOptOpt, Option[seq[Option[string]]])
 nameAccessor(getInt4Range, PgRange[int32])
 nameAccessor(getInt8Range, PgRange[int64])
 nameAccessor(getNumRange, PgRange[PgNumeric])
