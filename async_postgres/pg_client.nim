@@ -388,6 +388,34 @@ proc exec*(
       tag = await execImpl(conn, sql, params)
   return initCommandResult(tag)
 
+template appendInlineParam(
+    data: var seq[byte],
+    ranges: var seq[tuple[off: int32, len: int32]],
+    oids: var seq[int32],
+    formats: var seq[int16],
+    p: PgParamInline,
+) =
+  ## Shared encoder for a single `PgParamInline` into SoA buffers. Used by
+  ## both `flattenInline` (per-call temporaries) and `Pipeline.appendInline`
+  ## (pipeline-wide SoA). Keeping the NULL / empty / inline / overflow
+  ## branching in one place means wire-format semantics cannot drift between
+  ## the two code paths.
+  oids.add p.oid
+  formats.add p.format
+  if p.len == -1:
+    ranges.add((int32(0), int32(-1)))
+  elif p.len == 0:
+    ranges.add((int32(data.len), int32(0)))
+  else:
+    let dataOff = int32(data.len)
+    let oldLen = data.len
+    data.setLen(oldLen + int(p.len))
+    if p.len <= PgInlineBufSize:
+      copyMem(addr data[oldLen], unsafeAddr p.inlineBuf[0], int(p.len))
+    else:
+      copyMem(addr data[oldLen], unsafeAddr p.overflow[0], int(p.len))
+    ranges.add((dataOff, p.len))
+
 proc flattenInline(
     params: openArray[PgParamInline]
 ): tuple[
@@ -407,24 +435,7 @@ proc flattenInline(
       estBytes += int(p.len)
   result.data = newSeqOfCap[byte](estBytes)
   for p in params:
-    result.oids.add p.oid
-    result.formats.add p.format
-    if p.len == -1:
-      result.ranges.add (off: int32(0), len: int32(-1))
-    elif p.len == 0:
-      result.ranges.add (off: int32(result.data.len), len: int32(0))
-    elif p.len <= PgInlineBufSize:
-      let off = int32(result.data.len)
-      let oldLen = result.data.len
-      result.data.setLen(oldLen + int(p.len))
-      copyMem(addr result.data[oldLen], unsafeAddr p.inlineBuf[0], int(p.len))
-      result.ranges.add (off: off, len: p.len)
-    else:
-      let off = int32(result.data.len)
-      let oldLen = result.data.len
-      result.data.setLen(oldLen + int(p.len))
-      copyMem(addr result.data[oldLen], unsafeAddr p.overflow[0], int(p.len))
-      result.ranges.add (off: off, len: p.len)
+    appendInlineParam(result.data, result.ranges, result.oids, result.formats, p)
 
 proc execInlineImpl(
     conn: PgConnection,
@@ -2436,24 +2447,7 @@ proc appendInline(
   result.start = int32(p.inlineRanges.len)
   result.count = int32(params.len)
   for pi in params:
-    p.inlineOids.add pi.oid
-    p.inlineFormats.add pi.format
-    if pi.len == -1:
-      p.inlineRanges.add (off: int32(0), len: int32(-1))
-    elif pi.len == 0:
-      p.inlineRanges.add (off: int32(p.inlineData.len), len: int32(0))
-    elif pi.len <= PgInlineBufSize:
-      let off = int32(p.inlineData.len)
-      let oldLen = p.inlineData.len
-      p.inlineData.setLen(oldLen + int(pi.len))
-      copyMem(addr p.inlineData[oldLen], unsafeAddr pi.inlineBuf[0], int(pi.len))
-      p.inlineRanges.add (off: off, len: pi.len)
-    else:
-      let off = int32(p.inlineData.len)
-      let oldLen = p.inlineData.len
-      p.inlineData.setLen(oldLen + int(pi.len))
-      copyMem(addr p.inlineData[oldLen], unsafeAddr pi.overflow[0], int(pi.len))
-      p.inlineRanges.add (off: off, len: pi.len)
+    appendInlineParam(p.inlineData, p.inlineRanges, p.inlineOids, p.inlineFormats, pi)
 
 proc addExec*(p: Pipeline, sql: string, params: seq[PgParam] = @[]) =
   ## Add an exec operation to the pipeline with typed parameters.

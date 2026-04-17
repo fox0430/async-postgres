@@ -5793,6 +5793,25 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: PgParamInline empty params on param-less SQL":
+    # Edge case: caller reaches the inline overload with zero params (e.g. a
+    # SQL that takes no bound parameters). executeImpl builds an empty
+    # openArray via `toOpenArray(start, start-1)`; regression test that the
+    # Bind message still goes out cleanly and the query round-trips.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p = newPipeline(conn)
+      let empty: seq[PgParamInline] = @[]
+      p.addQuery("SELECT 42", empty)
+      p.addExec("SELECT 1", empty)
+      let results = await p.execute()
+      doAssert results.len == 2
+      doAssert results[0].queryResult.rows[0].getStr(0) == "42"
+      doAssert results[1].commandResult == "SELECT 1"
+      await conn.close()
+
+    waitFor t()
+
   test "exec: PgParamInline overload roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -5817,6 +5836,87 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert qr.rows[0].getStr(1) == "99"
 
       discard await conn.exec("DROP TABLE test_exec_inline")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated with PgParamInline roundtrip":
+    # Covers the inline path through executeIsolatedImpl (per-op SYNC) and
+    # its concurrent send/recv scheduling under chronos. Mixes inline and
+    # legacy params across ops so both code paths in the op loop execute.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_iso_inline")
+      discard await conn.exec(
+        "CREATE TABLE test_iso_inline (id serial PRIMARY KEY, v int, s text)"
+      )
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_iso_inline (v, s) VALUES ($1, $2)",
+        [10.int32.toPgParamInline, "inline".toPgParamInline],
+      )
+      p.addExec(
+        "INSERT INTO test_iso_inline (v, s) VALUES ($1, $2)",
+        @[toPgParam(20'i32), toPgParam("legacy")],
+      )
+      p.addQuery(
+        "SELECT v, s FROM test_iso_inline WHERE v > $1 ORDER BY id",
+        [5.int32.toPgParamInline],
+      )
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      for e in ir.errors:
+        doAssert e == nil
+      doAssert ir.results[0].commandResult == "INSERT 0 1"
+      doAssert ir.results[1].commandResult == "INSERT 0 1"
+      let rows = ir.results[2].queryResult.rows
+      doAssert rows.len == 2
+      doAssert rows[0].getStr(0) == "10"
+      doAssert rows[0].getStr(1) == "inline"
+      doAssert rows[1].getStr(0) == "20"
+      doAssert rows[1].getStr(1) == "legacy"
+
+      discard await conn.exec("DROP TABLE test_iso_inline")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated with PgParamInline isolates per-op errors":
+    # Confirms that per-op SYNC still provides error isolation when ops use
+    # the inline overload: a failing inline op must not abort subsequent
+    # inline ops, and the connection must remain usable afterwards.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_iso_inline_err")
+      discard await conn.exec(
+        "CREATE TABLE test_iso_inline_err (id serial PRIMARY KEY, v int NOT NULL)"
+      )
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [1.int32.toPgParamInline]
+      )
+      # NULL inline param violates NOT NULL — isolated error.
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [none(int32).toPgParamInline]
+      )
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [3.int32.toPgParamInline]
+      )
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert ir.errors[2] == nil # not aborted
+
+      doAssert conn.state == csReady
+      let qr = await conn.query("SELECT v FROM test_iso_inline_err ORDER BY id")
+      doAssert qr.rowCount == 2
+      doAssert qr.rows[0].getStr(0) == "1"
+      doAssert qr.rows[1].getStr(0) == "3"
+
+      discard await conn.exec("DROP TABLE test_iso_inline_err")
       await conn.close()
 
     waitFor t()

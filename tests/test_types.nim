@@ -6307,3 +6307,37 @@ suite "Pipeline appendInline SoA layout":
     check p.inlineData.len == 8
     check p.inlineData[0 ..< 4] == @(toBE32(1'i32))
     check p.inlineData[4 ..< 8] == @(toBE32(2'i32))
+
+  test "addExec with empty inline params: hasInline=true, count=0":
+    # Edge case: the inline overload is chosen but no params are provided.
+    # executeImpl computes `endIdx = inlineStart + inlineCount - 1`, so for
+    # count==0 we get an empty `toOpenArray(start, start-1)` view — make sure
+    # that view is empty and the SoA buffers are untouched.
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    let empty: seq[PgParamInline] = @[]
+    p.addExec("SELECT 1", empty)
+    check p.ops.len == 1
+    check p.ops[0].hasInline
+    check p.ops[0].inlineStart == 0
+    check p.ops[0].inlineCount == 0
+    check p.inlineRanges.len == 0
+    check p.inlineOids.len == 0
+    check p.inlineFormats.len == 0
+    check p.inlineData.len == 0
+
+  test "addExec empty inline after a populated op: start resumes correctly":
+    # A second op with zero inline params must record `inlineStart` at the
+    # current tail of the SoA buffers, not 0.
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("A", [toPgParamInline(1'i32), toPgParamInline(2'i32)])
+    let empty: seq[PgParamInline] = @[]
+    p.addExec("B", empty)
+    check p.ops.len == 2
+    check p.ops[1].hasInline
+    check p.ops[1].inlineStart == 2 # resumes after the two params of op A
+    check p.ops[1].inlineCount == 0
+    check p.inlineRanges.len == 2 # unchanged by op B
