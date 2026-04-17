@@ -2730,7 +2730,7 @@ proc executeImpl(
       when hasChronos:
         try:
           await conn.fillRecvBuf(timeout)
-        except CatchableError:
+        except CatchableError as e:
           # recv failed with an in-flight send: don't leak sendFut as an
           # unhandled Future. Cancel it and let the recv error propagate.
           if not sendFut.finished:
@@ -2738,7 +2738,7 @@ proc executeImpl(
               await cancelAndWait(sendFut)
             except CatchableError:
               discard
-          raise
+          raise e
       else:
         await conn.fillRecvBuf(timeout)
 
