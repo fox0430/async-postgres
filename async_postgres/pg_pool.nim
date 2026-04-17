@@ -673,7 +673,7 @@ proc queryEach*(
     await pool.resetSession(conn)
     pool.release(conn)
 
-proc queryOne*(
+proc queryRowOpt*(
     pool: PgPool,
     sql: string,
     params: seq[PgParam] = @[],
@@ -698,7 +698,7 @@ proc queryRow*(
   ## Execute a query and return the first row.
   ## Raises `PgError` if no rows are returned.
   let row =
-    await pool.queryOne(sql, params, resultFormat = resultFormat, timeout = timeout)
+    await pool.queryRowOpt(sql, params, resultFormat = resultFormat, timeout = timeout)
   if row.isNone:
     raise newException(PgError, "Query returned no rows")
   return row.get

@@ -4609,10 +4609,11 @@ suite "E2E: Column Name Access":
 
     waitFor t()
 
-  test "name-based queryOne accessors":
+  test "name-based queryRowOpt accessors":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let rowOpt = await conn.queryOne("SELECT 99::int8 AS big, 'hello'::text AS msg")
+      let rowOpt =
+        await conn.queryRowOpt("SELECT 99::int8 AS big, 'hello'::text AS msg")
       doAssert rowOpt.isSome
       let row = rowOpt.get
       doAssert row.getInt64("big") == 99'i64
@@ -4650,10 +4651,10 @@ suite "E2E: Column Name Access":
     waitFor t()
 
 suite "E2E: Convenience Query Methods":
-  test "queryOne returns first row":
+  test "queryRowOpt returns first row":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let row = await conn.queryOne("SELECT 1 AS a, 'hello' AS b")
+      let row = await conn.queryRowOpt("SELECT 1 AS a, 'hello' AS b")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "1"
       doAssert row.get.getStr(1) == "hello"
@@ -4661,10 +4662,10 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "queryOne returns none for empty result":
+  test "queryRowOpt returns none for empty result":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let row = await conn.queryOne("SELECT 1 WHERE false")
+      let row = await conn.queryRowOpt("SELECT 1 WHERE false")
       doAssert row.isNone
       await conn.close()
 
@@ -4914,10 +4915,10 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "queryOne returns only first row from multiple":
+  test "queryRowOpt returns only first row from multiple":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let row = await conn.queryOne("SELECT generate_series(10,12)::text AS v")
+      let row = await conn.queryRowOpt("SELECT generate_series(10,12)::text AS v")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "10"
       await conn.close()
@@ -4943,11 +4944,11 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "queryOne with params":
+  test "queryRowOpt with params":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let row =
-        await conn.queryOne("SELECT $1::int + $2::int", @[3.toPgParam, 4.toPgParam])
+        await conn.queryRowOpt("SELECT $1::int + $2::int", @[3.toPgParam, 4.toPgParam])
       doAssert row.isSome
       doAssert row.get.getStr(0) == "7"
       await conn.close()
@@ -4969,10 +4970,10 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "pool queryOne":
+  test "pool queryRowOpt":
     proc t() {.async.} =
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
-      let row = await pool.queryOne("SELECT 'pooled'")
+      let row = await pool.queryRowOpt("SELECT 'pooled'")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "pooled"
       await pool.close()
@@ -6326,16 +6327,16 @@ suite "E2E: Pipelined Pool":
 
     waitFor t()
 
-  test "pipelined pool: queryOne works":
+  test "pipelined pool: queryRowOpt works":
     proc t() {.async.} =
       let pool = await newPool(
         PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
       )
-      let row = await pool.queryOne("SELECT 42::int4 AS answer")
+      let row = await pool.queryRowOpt("SELECT 42::int4 AS answer")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "42"
 
-      let empty = await pool.queryOne("SELECT 1 WHERE false")
+      let empty = await pool.queryRowOpt("SELECT 1 WHERE false")
       doAssert empty.isNone
 
       await pool.close()
@@ -8537,5 +8538,139 @@ suite "E2E: Multirange array types":
       doAssert res.rows.len == 1
       doAssert res.rows[0].getInt4MultirangeArrayOpt(0).isNone
       await conn.close()
+
+    waitFor t()
+
+suite "E2E: Option/NULL array input and element-level output":
+  test "seq[Option[int32]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some(1'i32), none(int32), some(3'i32)]
+      let res = await conn.query("SELECT $1::int4[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "seq[Option[string]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some("a"), none(string), some("c")]
+      let res = await conn.query("SELECT $1::text[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStrArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "seq[Option[bool]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some(true), none(bool), some(false)]
+      let res = await conn.query("SELECT $1::bool[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getBoolArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "seq[Option[float64]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some(1.5), none(float64), some(3.25)]
+      let res = await conn.query("SELECT $1::float8[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getFloatArrayElemOpt(0)
+      doAssert got.len == 3
+      doAssert got[0].isSome and abs(got[0].get - 1.5) < 1e-10
+      doAssert got[1].isNone
+      doAssert got[2].isSome and abs(got[2].get - 3.25) < 1e-10
+      await conn.close()
+
+    waitFor t()
+
+  test "all-NULL array roundtrips":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[none(int32), none(int32)]
+      let res = await conn.query("SELECT $1::int4[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "empty seq[Option[int32]] works":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr: seq[Option[int32]] = @[]
+      let res = await conn.query("SELECT $1::int4[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0).len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "literal ARRAY[1, NULL, 3] via getIntArrayElemOpt":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT ARRAY[1, NULL, 3]::int4[] AS a")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0) ==
+        @[some(1'i32), none(int32), some(3'i32)]
+      await conn.close()
+
+    waitFor t()
+
+  test "column NULL via getIntArrayElemOptOpt returns none":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4[] AS a")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOptOpt(0) == none(seq[Option[int32]])
+      await conn.close()
+
+    waitFor t()
+
+type PgE2eMood = enum
+  happy2 = "happy2"
+  sad2 = "sad2"
+  ok2 = "ok2"
+
+pgEnum(PgE2eMood)
+
+suite "E2E: enum arrays":
+  test "enum array roundtrip with and without NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TYPE IF EXISTS e2e_mood CASCADE")
+      discard await conn.exec("CREATE TYPE e2e_mood AS ENUM ('happy2', 'sad2', 'ok2')")
+      block:
+        let arr = @[happy2, sad2, ok2]
+        let res = await conn.query("SELECT $1::e2e_mood[] AS a", @[toPgParam(arr)])
+        doAssert res.rows.len == 1
+        doAssert getEnumArray[PgE2eMood](res.rows[0], 0) == arr
+      block:
+        let arr = @[some(happy2), none(PgE2eMood), some(ok2)]
+        let res = await conn.query("SELECT $1::e2e_mood[] AS a", @[toPgParam(arr)])
+        doAssert res.rows.len == 1
+        doAssert getEnumArrayElemOpt[PgE2eMood](res.rows[0], 0) == arr
+      discard await conn.exec("DROP TYPE IF EXISTS e2e_mood CASCADE")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: queryRowOpt via pool":
+  test "pool queryRowOpt returns first row and none on empty":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 2))
+      let row = await pool.queryRowOpt("SELECT 7 AS v")
+      doAssert row.isSome
+      doAssert row.get.getStr(0) == "7"
+      let empty = await pool.queryRowOpt("SELECT 1 WHERE false")
+      doAssert empty.isNone
+      await pool.close()
 
     waitFor t()

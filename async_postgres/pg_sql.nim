@@ -300,7 +300,7 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
-  proc queryOne*(
+  proc queryRowOpt*(
     conn: PgConnection,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
@@ -403,7 +403,7 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
-  proc queryOne*(
+  proc queryRowOpt*(
     pool: PgPool,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
@@ -482,7 +482,7 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
-  proc readQueryOne*(
+  proc readQueryRowOpt*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,
@@ -563,7 +563,7 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
-  proc writeQueryOne*(
+  proc writeQueryRowOpt*(
     cluster: PgPoolCluster,
     sq: SqlQuery,
     resultFormat: ResultFormat = rfAuto,

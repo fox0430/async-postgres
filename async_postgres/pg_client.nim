@@ -1127,7 +1127,7 @@ proc query*(
       qr = await queryInlineImpl(conn, sql, data, ranges, oids, formats, resultFormats)
   return qr
 
-proc queryOne*(
+proc queryRowOpt*(
     conn: PgConnection,
     sql: string,
     params: seq[PgParam] = @[],
@@ -1153,7 +1153,7 @@ proc queryRow*(
   ## Execute a query and return the first row.
   ## Raises `PgError` if no rows are returned.
   let row =
-    await conn.queryOne(sql, params, resultFormat = resultFormat, timeout = timeout)
+    await conn.queryRowOpt(sql, params, resultFormat = resultFormat, timeout = timeout)
   if row.isNone:
     raise newException(PgError, "Query returned no rows")
   return row.get
