@@ -2463,11 +2463,11 @@ suite "PgInterval":
   test "getInterval binary format":
     var data = newSeq[byte](16)
     let usBytes = toBE64(14706123456'i64)
-    copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+    copyMem(addr data[0], addr usBytes[0], 8)
     let dayBytes = toBE32(3'i32)
-    copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+    copyMem(addr data[8], addr dayBytes[0], 4)
     let monBytes = toBE32(14'i32)
-    copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+    copyMem(addr data[12], addr monBytes[0], 4)
     let fields = @[mkField(OidInterval, 1)]
     let row = mkRow(@[some(data)], fields)
     let v = row.getInterval(0)
@@ -2501,11 +2501,11 @@ suite "PgInterval":
   test "getIntervalOpt binary some":
     var data = newSeq[byte](16)
     let usBytes = toBE64(1_000_000'i64)
-    copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+    copyMem(addr data[0], addr usBytes[0], 8)
     let dayBytes = toBE32(0'i32)
-    copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+    copyMem(addr data[8], addr dayBytes[0], 4)
     let monBytes = toBE32(0'i32)
-    copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+    copyMem(addr data[12], addr monBytes[0], 4)
     let fields = @[mkField(OidInterval, 1)]
     let row = mkRow(@[some(data)], fields)
     let v = row.getIntervalOpt(0)
@@ -5864,7 +5864,7 @@ proc inlinePayload(p: PgParamInline): seq[byte] =
     return @[]
   if p.len <= PgInlineBufSize:
     result = newSeq[byte](p.len)
-    copyMem(addr result[0], unsafeAddr p.inlineBuf[0], p.len)
+    copyMem(addr result[0], addr p.inlineBuf[0], p.len)
   else:
     result = p.overflow
 

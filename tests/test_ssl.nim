@@ -77,13 +77,13 @@ elif hasAsyncDispatch:
       let data = await client.recv(n - offset)
       if data.len == 0:
         raise newException(CatchableError, "Connection closed prematurely")
-      copyMem(addr result[offset], unsafeAddr data[0], data.len)
+      copyMem(addr result[offset], addr data[0], data.len)
       offset += data.len
 
   proc sendBytes(client: MockClient, data: seq[byte]) {.async.} =
     if data.len > 0:
       var str = newString(data.len)
-      copyMem(addr str[0], unsafeAddr data[0], data.len)
+      copyMem(addr str[0], addr data[0], data.len)
       await client.send(str)
 
 proc drainStartupMessage(client: MockClient): Future[void] {.async.} =

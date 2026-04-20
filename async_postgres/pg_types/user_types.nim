@@ -157,7 +157,7 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
         raise newException(PgTypeError, "NULL element in enum array")
       var s = newString(e.len)
       if e.len > 0:
-        copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+        copyMem(addr s[0], addr row.data.buf[off + e.off], e.len)
       result[i] = parseEnum[T](s)
     return
   let s = row.getStr(col)
@@ -187,7 +187,7 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
       else:
         var s = newString(e.len)
         if e.len > 0:
-          copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+          copyMem(addr s[0], addr row.data.buf[off + e.off], e.len)
         result[i] = some(parseEnum[T](s))
     return
   let s = row.getStr(col)
@@ -263,23 +263,23 @@ proc encodeBinaryComposite*(
       size += f.data.get.len
   result = newSeq[byte](size)
   let nf = toBE32(int32(fields.len))
-  copyMem(addr result[0], unsafeAddr nf[0], 4)
+  copyMem(addr result[0], addr nf[0], 4)
   var pos = 4
   for f in fields:
     let oid = toBE32(f.oid)
-    copyMem(addr result[pos], unsafeAddr oid[0], 4)
+    copyMem(addr result[pos], addr oid[0], 4)
     pos += 4
     if f.data.isNone:
       let nl = toBE32(-1'i32)
-      copyMem(addr result[pos], unsafeAddr nl[0], 4)
+      copyMem(addr result[pos], addr nl[0], 4)
       pos += 4
     else:
       let data = f.data.get
       let dl = toBE32(int32(data.len))
-      copyMem(addr result[pos], unsafeAddr dl[0], 4)
+      copyMem(addr result[pos], addr dl[0], 4)
       pos += 4
       if data.len > 0:
-        copyMem(addr result[pos], unsafeAddr data[0], data.len)
+        copyMem(addr result[pos], addr data[0], data.len)
         pos += data.len
 
 proc compositeFieldToText(val: string): string =
@@ -366,7 +366,7 @@ template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
   when typeof(val) is string:
     val = newString(fLen)
     if fLen > 0:
-      copyMem(addr val[0], unsafeAddr buf[fOff], fLen)
+      copyMem(addr val[0], addr buf[fOff], fLen)
   elif typeof(val) is int16:
     val = fromBE16(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is int32:
@@ -382,7 +382,7 @@ template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
   else:
     var s = newString(fLen)
     if fLen > 0:
-      copyMem(addr s[0], unsafeAddr buf[fOff], fLen)
+      copyMem(addr s[0], addr buf[fOff], fLen)
     val = compositeFieldFromText[typeof(val)](s)
 
 proc getComposite*[T: object](row: Row, col: int): T =

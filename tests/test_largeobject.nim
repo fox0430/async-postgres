@@ -28,7 +28,7 @@ proc toBytes(s: string): seq[byte] =
 proc toString(b: seq[byte]): string =
   result = newString(b.len)
   if b.len > 0:
-    copyMem(addr result[0], unsafeAddr b[0], b.len)
+    copyMem(addr result[0], addr b[0], b.len)
 
 suite "Large Object: create and unlink":
   test "loCreate and loUnlink":

@@ -339,17 +339,17 @@ proc encodeRangeBinaryImpl(r: RangeBinaryInput): seq[byte] =
   var pos = 1
   if r.hasLower:
     let lb = toBE32(int32(r.lowerData.len))
-    copyMem(addr result[pos], unsafeAddr lb[0], 4)
+    copyMem(addr result[pos], addr lb[0], 4)
     pos += 4
     if r.lowerData.len > 0:
-      copyMem(addr result[pos], unsafeAddr r.lowerData[0], r.lowerData.len)
+      copyMem(addr result[pos], addr r.lowerData[0], r.lowerData.len)
       pos += r.lowerData.len
   if r.hasUpper:
     let ub = toBE32(int32(r.upperData.len))
-    copyMem(addr result[pos], unsafeAddr ub[0], 4)
+    copyMem(addr result[pos], addr ub[0], 4)
     pos += 4
     if r.upperData.len > 0:
-      copyMem(addr result[pos], unsafeAddr r.upperData[0], r.upperData.len)
+      copyMem(addr result[pos], addr r.upperData[0], r.upperData.len)
 
 # toPgParam for range types (text format)
 
@@ -735,14 +735,14 @@ proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =
     size += 4 + rd.len
   result = newSeq[byte](size)
   let cnt = toBE32(int32(rangeData.len))
-  copyMem(addr result[0], unsafeAddr cnt[0], 4)
+  copyMem(addr result[0], addr cnt[0], 4)
   var pos = 4
   for rd in rangeData:
     let rl = toBE32(int32(rd.len))
-    copyMem(addr result[pos], unsafeAddr rl[0], 4)
+    copyMem(addr result[pos], addr rl[0], 4)
     pos += 4
     if rd.len > 0:
-      copyMem(addr result[pos], unsafeAddr rd[0], rd.len)
+      copyMem(addr result[pos], addr rd[0], rd.len)
       pos += rd.len
 
 # Multirange toPgParam (text format)

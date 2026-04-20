@@ -407,9 +407,9 @@ template appendInlineParam(
     let oldLen = data.len
     data.setLen(oldLen + int(p.len))
     if p.len <= PgInlineBufSize:
-      copyMem(addr data[oldLen], unsafeAddr p.inlineBuf[0], int(p.len))
+      copyMem(addr data[oldLen], addr p.inlineBuf[0], int(p.len))
     else:
-      copyMem(addr data[oldLen], unsafeAddr p.overflow[0], int(p.len))
+      copyMem(addr data[oldLen], addr p.overflow[0], int(p.len))
     ranges.add((dataOff, p.len))
 
 proc flattenInline(
@@ -1612,7 +1612,7 @@ proc copyIn*(
   ## Converts to bytes internally; avoids manual toOpenArrayByte.
   var bytes = newSeq[byte](data.len)
   if data.len > 0:
-    copyMem(addr bytes[0], unsafeAddr data[0], data.len)
+    copyMem(addr bytes[0], addr data[0], data.len)
   copyIn(conn, sql, bytes, timeout)
 
 proc copyIn*(
@@ -1631,7 +1631,7 @@ proc copyIn*(
   var offset = 0
   for chunk in data:
     if chunk.len > 0:
-      copyMem(addr combined[offset], unsafeAddr chunk[0], chunk.len)
+      copyMem(addr combined[offset], addr chunk[0], chunk.len)
       offset += chunk.len
   copyIn(conn, sql, combined, timeout)
 
@@ -2699,7 +2699,7 @@ proc executeImpl(
     when hasChronos:
       # Abnormal path (recv error, cancellation, failed stored write):
       # ensure sendFut never escapes as an unhandled Future and that no
-      # in-flight write still holds unsafeAddr conn.sendBuf[0].
+      # in-flight write still holds addr conn.sendBuf[0].
       if not sendFut.finished:
         try:
           await cancelAndWait(sendFut)

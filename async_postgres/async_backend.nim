@@ -189,7 +189,7 @@ elif hasAsyncDispatch:
     ##   On asyncdispatch this is a **no-op** — the future is neither cancelled
     ##   nor awaited. asyncdispatch has no cancellation primitive. Callers must
     ##   not assume the future has stopped: any buffer it holds via
-    ##   `unsafeAddr` remains live, and any socket write it scheduled will
+    ##   `addr` remains live, and any socket write it scheduled will
     ##   still complete. Do not reuse the affected resource (socket, buffer)
     ##   after calling this under asyncdispatch. chronos cancels the future
     ##   properly.
