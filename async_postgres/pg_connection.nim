@@ -1336,8 +1336,8 @@ proc connectToHost(
       else:
         await sock.connect(hostAddr, Port(hostPort))
         when defined(posix):
-          configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
-          configureKeepalive(posix.SocketHandle(sock.getFd()), config)
+          configureTcpNoDelay(sock.getFd())
+          configureKeepalive(sock.getFd(), config)
     except CatchableError:
       sock.close()
       raise
