@@ -947,6 +947,167 @@ suite "Acquire timeout":
     waitFor t()
 
 when hasChronos:
+  suite "Cancel/timeout interactions":
+    test "shorter-timeout waiter fails while longer-timeout waiter keeps waiting":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.active = 1
+
+        pool.config.acquireTimeout = milliseconds(40)
+        let fut1 = pool.acquire()
+
+        pool.config.acquireTimeout = seconds(5)
+        let fut2 = pool.acquire()
+
+        doAssert pool.waiters.len == 2
+        doAssert pool.waiterCount == 2
+
+        await sleepAsync(milliseconds(90))
+        doAssert fut1.failed
+        doAssert not fut2.finished
+        doAssert pool.waiterCount == 1
+        doAssert pool.metrics.timeoutCount == 1
+
+        let conn = mockConn()
+        pool.release(conn)
+        doAssert (await fut2) == conn
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 0
+
+      waitFor t()
+
+    test "middle waiter timing out does not stall FIFO delivery":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.active = 1
+
+        pool.config.acquireTimeout = seconds(5)
+        let futA = pool.acquire()
+
+        pool.config.acquireTimeout = milliseconds(40)
+        let futB = pool.acquire()
+
+        pool.config.acquireTimeout = seconds(5)
+        let futC = pool.acquire()
+
+        doAssert pool.waiterCount == 3
+
+        await sleepAsync(milliseconds(90))
+        doAssert not futA.finished
+        doAssert futB.failed
+        doAssert not futC.finished
+        doAssert pool.waiterCount == 2
+
+        let c1 = mockConn()
+        pool.release(c1)
+        doAssert (await futA) == c1
+
+        let c2 = mockConn()
+        pool.release(c2)
+        doAssert (await futC) == c2
+
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 0
+
+      waitFor t()
+
+    test "concurrent timeouts increment timeoutCount per waiter":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(40)
+        pool.active = 1
+
+        var futs: seq[Future[PgConnection]]
+        for i in 0 ..< 8:
+          futs.add(pool.acquire())
+        doAssert pool.waiterCount == 8
+
+        await sleepAsync(milliseconds(90))
+        for f in futs:
+          doAssert f.failed
+
+        doAssert pool.metrics.timeoutCount == 8
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 8 # cancelled entries still in deque
+
+      waitFor t()
+
+    test "pool close after mass timeout drains cancelled waiters":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(40)
+        pool.active = 1
+
+        var futs: seq[Future[PgConnection]]
+        for i in 0 ..< 4:
+          futs.add(pool.acquire())
+
+        await sleepAsync(milliseconds(90))
+        for f in futs:
+          doAssert f.failed
+
+        doAssert pool.waiters.len == 4
+        doAssert pool.waiterCount == 0
+
+        await pool.close()
+        doAssert pool.closed
+        doAssert pool.waiters.len == 0
+        doAssert pool.waiterCount == 0
+
+      waitFor t()
+
+    test "timeout then release reuses pool and delivers conn to idle":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(40)
+        pool.active = 1
+
+        try:
+          discard await pool.acquire()
+          doAssert false, "expected timeout"
+        except PgError:
+          discard
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 1 # cancelled waiter still present
+
+        # Releasing drains the cancelled waiter and parks the conn in idle.
+        pool.release(mockConn())
+        doAssert pool.waiters.len == 0
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 1
+
+        # Next acquire reuses the idle conn.
+        pool.config.acquireTimeout = ZeroDuration
+        let got = await pool.acquire()
+        doAssert got != nil
+        doAssert pool.active == 1
+        doAssert pool.idle.len == 0
+
+      waitFor t()
+
+    test "cancelling maintenance task does not disturb pending waiters":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1, minSize = 0)
+        pool.config.maintenanceInterval = milliseconds(10)
+        pool.config.idleTimeout = hours(1)
+        pool.active = 1
+        pool.maintenanceTask = maintenanceLoop(pool)
+
+        pool.config.acquireTimeout = seconds(5)
+        let fut = pool.acquire()
+        doAssert pool.waiterCount == 1
+
+        await cancelAndWait(pool.maintenanceTask)
+        doAssert pool.waiterCount == 1
+        doAssert not fut.finished
+
+        let c = mockConn()
+        pool.release(c)
+        doAssert (await fut) == c
+        doAssert pool.waiterCount == 0
+
+      waitFor t()
+
   suite "Maintenance loop":
     test "idle timeout removes old connections":
       proc t() {.async.} =
