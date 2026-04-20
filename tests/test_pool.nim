@@ -1037,6 +1037,106 @@ when hasChronos:
 
       waitFor t()
 
+suite "Pool high concurrency":
+  test "parallel acquire saturates maxSize and queues remainder":
+    let pool = makePool(maxSize = 5)
+    for i in 0 ..< 5:
+      pool.idle.addLast(mockConn().toPooled())
+
+    var futs: seq[Future[PgConnection]]
+    for i in 0 ..< 20:
+      futs.add(pool.acquire())
+
+    check pool.active == 5
+    check pool.idle.len == 0
+    check pool.waiters.len == 15
+    check pool.waiterCount == 15
+
+    # Clean up: release 15 mocks to satisfy the pending waiters
+    for i in 0 ..< 15:
+      pool.release(mockConn())
+    for f in futs:
+      discard waitFor f
+
+  test "mass release delivers to all waiters preserving active":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+
+    var futs: seq[Future[PgConnection]]
+    for i in 0 ..< 50:
+      futs.add(pool.acquire())
+    check pool.waiters.len == 50
+    check pool.waiterCount == 50
+
+    for i in 0 ..< 50:
+      pool.release(mockConn())
+
+    check pool.waiters.len == 0
+    check pool.waiterCount == 0
+    check pool.active == 1
+    check pool.idle.len == 0
+
+    for f in futs:
+      discard waitFor f
+
+  test "interleaved acquire/release leaves pool healthy":
+    let pool = makePool(maxSize = 3)
+    for i in 0 ..< 3:
+      pool.idle.addLast(mockConn().toPooled())
+
+    for i in 0 ..< 100:
+      let c = waitFor pool.acquire()
+      pool.release(c)
+
+    check pool.active == 0
+    check pool.waiters.len == 0
+    check pool.waiterCount == 0
+    check pool.idle.len == 3
+    check pool.metrics.acquireCount == 100
+
+  test "mixed timeout and success preserves counts":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.acquireTimeout = milliseconds(50)
+      pool.active = 1
+
+      var futs: seq[Future[PgConnection]]
+      for i in 0 ..< 5:
+        futs.add(pool.acquire())
+
+      await sleepAsync(milliseconds(100))
+
+      for f in futs:
+        doAssert f.failed
+      doAssert pool.waiterCount == 0
+      doAssert pool.active == 1
+
+      # release must drain all cancelled entries and park the conn in idle
+      pool.release(mockConn())
+      doAssert pool.waiters.len == 0
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+    waitFor t()
+
+  test "waiter resolution order matches release order (FIFO)":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+
+    var futs: seq[Future[PgConnection]]
+    for i in 0 ..< 10:
+      futs.add(pool.acquire())
+
+    var conns: seq[PgConnection]
+    for i in 0 ..< 10:
+      conns.add(mockConn())
+
+    for i in 0 ..< 10:
+      pool.release(conns[i])
+
+    for i in 0 ..< 10:
+      check waitFor(futs[i]) == conns[i]
+
 suite "Error type granularity":
   test "closed pool raises PgPoolError":
     let pool = makePool()
