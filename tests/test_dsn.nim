@@ -173,6 +173,47 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?channel_binding=bogus")
 
+  test "require_auth default is empty set":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.requireAuth == {}
+
+  test "ConnConfig zero init has empty requireAuth":
+    let cfg = ConnConfig()
+    check cfg.requireAuth == {}
+
+  test "query param require_auth single value":
+    let cases = {
+      "none": amNone,
+      "password": amPassword,
+      "md5": amMd5,
+      "scram-sha-256": amScramSha256,
+      "scram-sha-256-plus": amScramSha256Plus,
+    }
+    for (name, expected) in cases:
+      let cfg = parseDsn("postgresql://host/db?require_auth=" & name)
+      check cfg.requireAuth == {expected}
+
+  test "query param require_auth comma list":
+    let cfg =
+      parseDsn("postgresql://host/db?require_auth=scram-sha-256,scram-sha-256-plus")
+    check cfg.requireAuth == {amScramSha256, amScramSha256Plus}
+
+  test "query param require_auth tolerates whitespace":
+    let cfg = parseDsn("postgresql://host/db?require_auth=scram-sha-256,%20md5")
+    check cfg.requireAuth == {amScramSha256, amMd5}
+
+  test "keyword=value form require_auth":
+    let cfg = parseDsn("host=127.0.0.1 require_auth=md5,password")
+    check cfg.requireAuth == {amMd5, amPassword}
+
+  test "error: unknown require_auth method":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?require_auth=sha1")
+
+  test "error: empty entry in require_auth list":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?require_auth=md5,,password")
+
   test "error: invalid connect_timeout":
     expect PgError:
       discard parseDsn("postgresql://host/db?connect_timeout=abc")
