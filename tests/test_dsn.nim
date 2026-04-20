@@ -148,6 +148,31 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslmode=bogus")
 
+  test "query param channel_binding":
+    for mode in ["disable", "prefer", "require"]:
+      let cfg = parseDsn("postgresql://host/db?channel_binding=" & mode)
+      case mode
+      of "disable":
+        check cfg.channelBinding == cbDisable
+      of "prefer":
+        check cfg.channelBinding == cbPrefer
+      of "require":
+        check cfg.channelBinding == cbRequire
+      else:
+        discard
+
+  test "channel_binding default is prefer":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.channelBinding == cbPrefer
+
+  test "ConnConfig zero init has cbPrefer":
+    let cfg = ConnConfig()
+    check cfg.channelBinding == cbPrefer
+
+  test "error: invalid channel_binding":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?channel_binding=bogus")
+
   test "error: invalid connect_timeout":
     expect PgError:
       discard parseDsn("postgresql://host/db?connect_timeout=abc")
@@ -458,6 +483,14 @@ suite "parseDsn keyword=value":
   test "error: invalid sslmode":
     expect PgError:
       discard parseDsn("host=h sslmode=bogus")
+
+  test "channel_binding parameter":
+    let cfg = parseDsn("host=h channel_binding=require")
+    check cfg.channelBinding == cbRequire
+
+  test "error: invalid channel_binding":
+    expect PgError:
+      discard parseDsn("host=h channel_binding=bogus")
 
   test "error: invalid connect_timeout":
     expect PgError:
