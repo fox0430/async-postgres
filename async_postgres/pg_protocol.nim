@@ -373,7 +373,7 @@ proc addCString*(buf: var seq[byte], s: string) =
   let oldLen = buf.len
   buf.setLen(oldLen + s.len + 1)
   if s.len > 0:
-    copyMem(addr buf[oldLen], unsafeAddr s[0], s.len)
+    copyMem(addr buf[oldLen], addr s[0], s.len)
   buf[oldLen + s.len] = 0'u8
 
 proc decodeInt16*(buf: openArray[byte], offset: int): int16 =
@@ -406,7 +406,7 @@ proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   let slen = i - offset
   var s = newString(slen)
   if slen > 0:
-    copyMem(addr s[0], unsafeAddr buf[offset], slen)
+    copyMem(addr s[0], addr buf[offset], slen)
   inc i # skip null terminator
   result = (s, i - offset)
 
@@ -477,7 +477,7 @@ proc encodeQuery*(sql: string): seq[byte] =
 proc addFixedMsg(buf: var seq[byte], msg: array[5, byte]) {.inline.} =
   let oldLen = buf.len
   buf.setLen(oldLen + 5)
-  copyMem(addr buf[oldLen], unsafeAddr msg[0], 5)
+  copyMem(addr buf[oldLen], addr msg[0], 5)
 
 proc addParse*(
     buf: var seq[byte],
@@ -525,7 +525,7 @@ proc addBind*(
       if data.len > 0:
         let oldLen = buf.len
         buf.setLen(oldLen + data.len)
-        copyMem(addr buf[oldLen], unsafeAddr data[0], data.len)
+        copyMem(addr buf[oldLen], addr data[0], data.len)
   # Result format codes
   buf.addInt16(int16(resultFormats.len))
   for f in resultFormats:
@@ -578,7 +578,7 @@ proc addBindRaw*(
           )
         let oldLen = buf.len
         buf.setLen(oldLen + r.len)
-        copyMem(addr buf[oldLen], unsafeAddr paramData[r.off], r.len)
+        copyMem(addr buf[oldLen], addr paramData[r.off], r.len)
   buf.addInt16(int16(resultFormats.len))
   for f in resultFormats:
     buf.addInt16(f)
@@ -685,7 +685,7 @@ proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
   buf[oldLen + 3] = byte((msgLen shr 8) and 0xFF)
   buf[oldLen + 4] = byte(msgLen and 0xFF)
   if data.len > 0:
-    copyMem(addr buf[oldLen + 5], unsafeAddr data[0], data.len)
+    copyMem(addr buf[oldLen + 5], addr data[0], data.len)
 
 proc encodeCopyDone*(): seq[byte] =
   ## Encode a standalone CopyDone message.
@@ -973,7 +973,7 @@ proc clone*(row: Row): Row =
       rd.cellIndex[i * 2] = 0'i32
       rd.cellIndex[i * 2 + 1] = 0'i32
     else:
-      copyMem(addr rd.buf[pos], unsafeAddr src.buf[srcOff], int(clen))
+      copyMem(addr rd.buf[pos], addr src.buf[srcOff], int(clen))
       rd.cellIndex[i * 2] = int32(pos)
       rd.cellIndex[i * 2 + 1] = clen
       pos += int(clen)
@@ -1016,7 +1016,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   let dataLen = body.len - 2
   rd.buf.setLen(bufBase + dataLen)
   if dataLen > 0:
-    copyMem(addr rd.buf[bufBase], unsafeAddr body[2], dataLen)
+    copyMem(addr rd.buf[bufBase], addr body[2], dataLen)
   # Walk the copied buffer to build cellIndex
   var pos = bufBase # current position in rd.buf
   let bufEnd = bufBase + dataLen
@@ -1166,7 +1166,7 @@ proc addCopyBinaryHeader*(buf: var seq[byte]) =
   ## Append the PostgreSQL binary COPY header (signature + flags + extension area).
   let oldLen = buf.len
   buf.setLen(oldLen + pgCopyBinaryHeader.len)
-  copyMem(addr buf[oldLen], unsafeAddr pgCopyBinaryHeader[0], pgCopyBinaryHeader.len)
+  copyMem(addr buf[oldLen], addr pgCopyBinaryHeader[0], pgCopyBinaryHeader.len)
 
 proc addCopyBinaryTrailer*(buf: var seq[byte]) =
   ## Append the binary COPY trailer (int16 = -1).
@@ -1217,7 +1217,7 @@ proc addCopyFieldText*(buf: var seq[byte], val: openArray[byte]) =
   if val.len > 0:
     let oldLen = buf.len
     buf.setLen(oldLen + val.len)
-    copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
+    copyMem(addr buf[oldLen], addr val[0], val.len)
 
 proc addCopyFieldString*(buf: var seq[byte], val: string) =
   ## Append a string field in binary COPY format.
@@ -1225,7 +1225,7 @@ proc addCopyFieldString*(buf: var seq[byte], val: string) =
   if val.len > 0:
     let oldLen = buf.len
     buf.setLen(oldLen + val.len)
-    copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
+    copyMem(addr buf[oldLen], addr val[0], val.len)
 
 # Replication protocol helpers
 

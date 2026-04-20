@@ -22,7 +22,7 @@ proc getCell(rd: RowData, rowIdx, col: int): string =
   if clen <= 0:
     return ""
   result = newString(clen)
-  copyMem(addr result[0], unsafeAddr rd.buf[off], clen)
+  copyMem(addr result[0], addr rd.buf[off], clen)
 
 proc isCellNull(rd: RowData, rowIdx, col: int): bool =
   let idx = (rowIdx * int(rd.numCols) + col) * 2

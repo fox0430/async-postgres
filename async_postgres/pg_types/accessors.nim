@@ -15,7 +15,7 @@ proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
 
 template bufView*(row: Row, off, clen: int): openArray[char] =
   ## Zero-copy char view into row.data.buf for parseutils.
-  cast[ptr UncheckedArray[char]](unsafeAddr row.data.buf[off]).toOpenArray(0, clen - 1)
+  cast[ptr UncheckedArray[char]](addr row.data.buf[off]).toOpenArray(0, clen - 1)
 
 proc len*(row: Row): int {.inline.} =
   ## Return the number of columns in this row.
@@ -169,7 +169,7 @@ proc getStr*(row: Row, col: int): string =
       discard # text, varchar, bytea: fall through to raw copy
   result = newString(clen)
   if clen > 0:
-    copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
+    copyMem(addr result[0], addr row.data.buf[off], clen)
 
 proc getInt*(row: Row, col: int): int32 =
   ## Get a column value as int32. Handles binary int2/int4 directly. Raises `PgTypeError` on NULL.
@@ -365,7 +365,7 @@ proc getBytes*(row: Row, col: int): seq[byte] =
     # Binary format: raw bytes, no hex encoding
     result = newSeq[byte](clen)
     if clen > 0:
-      copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
+      copyMem(addr result[0], addr row.data.buf[off], clen)
     return
   # Text format: bytea uses hex encoding \xDEADBEEF
   if clen >= 2 and row.data.buf[off] == byte('\\') and row.data.buf[off + 1] == byte(
@@ -381,7 +381,7 @@ proc getBytes*(row: Row, col: int): seq[byte] =
   else:
     result = newSeq[byte](clen)
     if clen > 0:
-      copyMem(addr result[0], unsafeAddr row.data.buf[off], clen)
+      copyMem(addr result[0], addr row.data.buf[off], clen)
 
 proc getTimestamp*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime. Handles binary timestamp format.
@@ -959,7 +959,7 @@ proc getStrArray*(row: Row, col: int): seq[string] =
         raise newException(PgTypeError, "NULL element in string array")
       result[i] = newString(e.len)
       if e.len > 0:
-        copyMem(addr result[i][0], unsafeAddr row.data.buf[off + e.off], e.len)
+        copyMem(addr result[i][0], addr row.data.buf[off + e.off], e.len)
     return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
@@ -1239,7 +1239,7 @@ proc getBytesArray*(row: Row, col: int): seq[seq[byte]] =
         raise newException(PgTypeError, "NULL element in bytea array")
       result[i] = newSeq[byte](e.len)
       if e.len > 0:
-        copyMem(addr result[i][0], unsafeAddr row.data.buf[off + e.off], e.len)
+        copyMem(addr result[i][0], addr row.data.buf[off + e.off], e.len)
     return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
@@ -1522,7 +1522,7 @@ template genStringArrayDecoder(getProc: untyped, T: typedesc, typeName: static s
           raise newException(PgTypeError, "NULL element in " & typeName & " array")
         var s = newString(e.len)
         if e.len > 0:
-          copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+          copyMem(addr s[0], addr row.data.buf[off + e.off], e.len)
         result[i] = T(s)
       return
     let s = row.getStr(col)
@@ -1718,7 +1718,7 @@ proc getStrArrayElemOpt*(row: Row, col: int): seq[Option[string]] =
       else:
         var s = newString(e.len)
         if e.len > 0:
-          copyMem(addr s[0], unsafeAddr row.data.buf[off + e.off], e.len)
+          copyMem(addr s[0], addr row.data.buf[off + e.off], e.len)
         result[i] = some(s)
     return
   let s = row.getStr(col)

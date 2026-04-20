@@ -142,7 +142,7 @@ when hasChronos:
       var dnBuf: seq[byte]
       var decoder: X509DecoderContext
       initX509Decoder(decoder, addr dnBuf)
-      x509DecoderPush(decoder, unsafeAddr item.data[0], uint(item.data.len))
+      x509DecoderPush(decoder, addr item.data[0], uint(item.data.len))
 
       if x509DecoderLastError(decoder) != 0:
         continue

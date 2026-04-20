@@ -797,7 +797,7 @@ when hasAsyncDispatch:
       var fut = newFuture[void]("sendRawBytes")
       fut.complete()
       return fut
-    sendRawData(socket, unsafeAddr data[0], data.len)
+    sendRawData(socket, addr data[0], data.len)
 
 proc compactRecvBuf(conn: PgConnection) {.inline.} =
   ## Shift unconsumed data to the front of recvBuf, reclaiming space consumed
@@ -847,7 +847,7 @@ proc fillRecvBuf*(
       raise newException(PgConnectionError, "Connection closed by server")
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + data.len)
-    copyMem(addr conn.recvBuf[oldLen], unsafeAddr data[0], data.len)
+    copyMem(addr conn.recvBuf[oldLen], addr data[0], data.len)
 
 proc nextMessage*(
     conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
@@ -909,10 +909,10 @@ proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
   ## Safe because conn.state == csBusy prevents concurrent access to sendBuf.
   when hasChronos:
     if conn.sendBuf.len > 0:
-      await conn.writer.write(unsafeAddr conn.sendBuf[0], conn.sendBuf.len)
+      await conn.writer.write(addr conn.sendBuf[0], conn.sendBuf.len)
   elif hasAsyncDispatch:
     if conn.sendBuf.len > 0:
-      await conn.socket.sendRawData(unsafeAddr conn.sendBuf[0], conn.sendBuf.len)
+      await conn.socket.sendRawData(addr conn.sendBuf[0], conn.sendBuf.len)
 
 proc closeTransport(conn: PgConnection) {.async.} =
   ## Close transport resources without sending Terminate.

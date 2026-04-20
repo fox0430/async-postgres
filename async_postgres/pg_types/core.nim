@@ -924,13 +924,13 @@ proc toBytes*(s: string): seq[byte] =
   ## Converts a string to a sequence of bytes.
   result = newSeq[byte](s.len)
   if s.len > 0:
-    copyMem(addr result[0], unsafeAddr s[0], s.len)
+    copyMem(addr result[0], addr s[0], s.len)
 
 proc toString*(s: seq[byte]): string =
   ## Converts a sequence of bytes to a string.
   result = newString(s.len)
   if s.len > 0:
-    copyMem(addr result[0], unsafeAddr s[0], s.len)
+    copyMem(addr result[0], addr s[0], s.len)
 
 proc toBE16*(v: int16): array[2, byte] =
   [byte((v shr 8) and 0xFF), byte(v and 0xFF)]

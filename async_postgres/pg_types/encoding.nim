@@ -63,10 +63,10 @@ proc toPgParamInline*(v: string): PgParamInline =
   if v.len == 0:
     discard
   elif v.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], unsafeAddr v[0], v.len)
+    copyMem(addr result.inlineBuf[0], addr v[0], v.len)
   else:
     result.overflow = newSeq[byte](v.len)
-    copyMem(addr result.overflow[0], unsafeAddr v[0], v.len)
+    copyMem(addr result.overflow[0], addr v[0], v.len)
 
 proc toPgParamInline*(v: seq[byte]): PgParamInline =
   result.oid = OidBytea
@@ -75,7 +75,7 @@ proc toPgParamInline*(v: seq[byte]): PgParamInline =
   if v.len == 0:
     discard
   elif v.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], unsafeAddr v[0], v.len)
+    copyMem(addr result.inlineBuf[0], addr v[0], v.len)
   else:
     result.overflow = v
 
@@ -89,10 +89,10 @@ proc toPgParamInline*(v: PgUuid): PgParamInline =
   if s.len == 0:
     discard
   elif s.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], unsafeAddr s[0], s.len)
+    copyMem(addr result.inlineBuf[0], addr s[0], s.len)
   else:
     result.overflow = newSeq[byte](s.len)
-    copyMem(addr result.overflow[0], unsafeAddr s[0], s.len)
+    copyMem(addr result.overflow[0], addr s[0], s.len)
 
 proc toPgParamInline*(v: PgMoney): PgParamInline =
   result.oid = OidMoney
@@ -265,26 +265,26 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[seq[byte]]): seq[byte] =
   result = newSeq[byte](headerSize + dataSize)
   # ndim = 1
   let ndim = toBE32(1'i32)
-  copyMem(addr result[0], unsafeAddr ndim[0], 4)
+  copyMem(addr result[0], addr ndim[0], 4)
   # has_null = 0
   let hasNull = toBE32(0'i32)
-  copyMem(addr result[4], unsafeAddr hasNull[0], 4)
+  copyMem(addr result[4], addr hasNull[0], 4)
   # elem_oid
   let oid = toBE32(elemOid)
-  copyMem(addr result[8], unsafeAddr oid[0], 4)
+  copyMem(addr result[8], addr oid[0], 4)
   # dim_len
   let dimLen = toBE32(int32(elements.len))
-  copyMem(addr result[12], unsafeAddr dimLen[0], 4)
+  copyMem(addr result[12], addr dimLen[0], 4)
   # lower_bound = 1
   let lb = toBE32(1'i32)
-  copyMem(addr result[16], unsafeAddr lb[0], 4)
+  copyMem(addr result[16], addr lb[0], 4)
   var pos = headerSize
   for e in elements:
     let eLen = toBE32(int32(e.len))
-    copyMem(addr result[pos], unsafeAddr eLen[0], 4)
+    copyMem(addr result[pos], addr eLen[0], 4)
     pos += 4
     if e.len > 0:
-      copyMem(addr result[pos], unsafeAddr e[0], e.len)
+      copyMem(addr result[pos], addr e[0], e.len)
       pos += e.len
 
 proc encodeBinaryArray*(elemOid: int32, elements: seq[Option[seq[byte]]]): seq[byte] =
@@ -309,28 +309,28 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[Option[seq[byte]]]): seq[b
       dataSize += 4 + ev.len
   result = newSeq[byte](headerSize + dataSize)
   let ndim = toBE32(1'i32)
-  copyMem(addr result[0], unsafeAddr ndim[0], 4)
+  copyMem(addr result[0], addr ndim[0], 4)
   let hasNull = toBE32(if anyNull: 1'i32 else: 0'i32)
-  copyMem(addr result[4], unsafeAddr hasNull[0], 4)
+  copyMem(addr result[4], addr hasNull[0], 4)
   let oid = toBE32(elemOid)
-  copyMem(addr result[8], unsafeAddr oid[0], 4)
+  copyMem(addr result[8], addr oid[0], 4)
   let dimLen = toBE32(int32(elements.len))
-  copyMem(addr result[12], unsafeAddr dimLen[0], 4)
+  copyMem(addr result[12], addr dimLen[0], 4)
   let lb = toBE32(1'i32)
-  copyMem(addr result[16], unsafeAddr lb[0], 4)
+  copyMem(addr result[16], addr lb[0], 4)
   var pos = headerSize
   for e in elements:
     if e.isNone:
       let eLen = toBE32(-1'i32)
-      copyMem(addr result[pos], unsafeAddr eLen[0], 4)
+      copyMem(addr result[pos], addr eLen[0], 4)
       pos += 4
     else:
       let ev = e.get
       let eLen = toBE32(int32(ev.len))
-      copyMem(addr result[pos], unsafeAddr eLen[0], 4)
+      copyMem(addr result[pos], addr eLen[0], 4)
       pos += 4
       if ev.len > 0:
-        copyMem(addr result[pos], unsafeAddr ev[0], ev.len)
+        copyMem(addr result[pos], addr ev[0], ev.len)
         pos += ev.len
 
 proc encodeBinaryArrayEmpty*(elemOid: int32): seq[byte] =
@@ -339,13 +339,13 @@ proc encodeBinaryArrayEmpty*(elemOid: int32): seq[byte] =
   result = newSeq[byte](12)
   # ndim = 0
   let ndim = toBE32(0'i32)
-  copyMem(addr result[0], unsafeAddr ndim[0], 4)
+  copyMem(addr result[0], addr ndim[0], 4)
   # has_null = 0
   let hasNull = toBE32(0'i32)
-  copyMem(addr result[4], unsafeAddr hasNull[0], 4)
+  copyMem(addr result[4], addr hasNull[0], 4)
   # elem_oid
   let oid = toBE32(elemOid)
-  copyMem(addr result[8], unsafeAddr oid[0], 4)
+  copyMem(addr result[8], addr oid[0], 4)
 
 proc toPgParam*(v: seq[int16]): PgParam =
   if v.len == 0:
@@ -683,11 +683,11 @@ proc toPgBinaryParam*(v: PgUuid): PgParam =
 proc toPgBinaryParam*(v: PgInterval): PgParam =
   var data = newSeq[byte](16)
   let usBytes = toBE64(v.microseconds)
-  copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+  copyMem(addr data[0], addr usBytes[0], 8)
   let dayBytes = toBE32(v.days)
-  copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+  copyMem(addr data[8], addr dayBytes[0], 4)
   let monBytes = toBE32(v.months)
-  copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+  copyMem(addr data[12], addr monBytes[0], 4)
   PgParam(oid: OidInterval, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgInet): PgParam =
@@ -888,9 +888,9 @@ proc encodePointBinary*(p: PgPoint): seq[byte] =
   ## Encode a point as 16 bytes (two float64 big-endian).
   result = newSeq[byte](16)
   let xBytes = toBE64(cast[int64](p.x))
-  copyMem(addr result[0], unsafeAddr xBytes[0], 8)
+  copyMem(addr result[0], addr xBytes[0], 8)
   let yBytes = toBE64(cast[int64](p.y))
-  copyMem(addr result[8], unsafeAddr yBytes[0], 8)
+  copyMem(addr result[8], addr yBytes[0], 8)
 
 proc toPgBinaryParam*(v: PgPoint): PgParam =
   ## Binary format: 16 bytes (two float64 big-endian).
@@ -900,29 +900,29 @@ proc toPgBinaryParam*(v: PgLine): PgParam =
   ## Binary format: 24 bytes (three float64 big-endian: A, B, C).
   var data = newSeq[byte](24)
   let aBytes = toBE64(cast[int64](v.a))
-  copyMem(addr data[0], unsafeAddr aBytes[0], 8)
+  copyMem(addr data[0], addr aBytes[0], 8)
   let bBytes = toBE64(cast[int64](v.b))
-  copyMem(addr data[8], unsafeAddr bBytes[0], 8)
+  copyMem(addr data[8], addr bBytes[0], 8)
   let cBytes = toBE64(cast[int64](v.c))
-  copyMem(addr data[16], unsafeAddr cBytes[0], 8)
+  copyMem(addr data[16], addr cBytes[0], 8)
   PgParam(oid: OidLine, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgLseg): PgParam =
   ## Binary format: 32 bytes (two points).
   var data = newSeq[byte](32)
   let p1 = encodePointBinary(v.p1)
-  copyMem(addr data[0], unsafeAddr p1[0], 16)
+  copyMem(addr data[0], addr p1[0], 16)
   let p2 = encodePointBinary(v.p2)
-  copyMem(addr data[16], unsafeAddr p2[0], 16)
+  copyMem(addr data[16], addr p2[0], 16)
   PgParam(oid: OidLseg, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgBox): PgParam =
   ## Binary format: 32 bytes (high point, low point).
   var data = newSeq[byte](32)
   let hi = encodePointBinary(v.high)
-  copyMem(addr data[0], unsafeAddr hi[0], 16)
+  copyMem(addr data[0], addr hi[0], 16)
   let lo = encodePointBinary(v.low)
-  copyMem(addr data[16], unsafeAddr lo[0], 16)
+  copyMem(addr data[16], addr lo[0], 16)
   PgParam(oid: OidBox, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgPath): PgParam =
@@ -930,29 +930,29 @@ proc toPgBinaryParam*(v: PgPath): PgParam =
   var data = newSeq[byte](1 + 4 + v.points.len * 16)
   data[0] = if v.closed: 1'u8 else: 0'u8
   let npts = toBE32(int32(v.points.len))
-  copyMem(addr data[1], unsafeAddr npts[0], 4)
+  copyMem(addr data[1], addr npts[0], 4)
   for i, p in v.points:
     let pb = encodePointBinary(p)
-    copyMem(addr data[5 + i * 16], unsafeAddr pb[0], 16)
+    copyMem(addr data[5 + i * 16], addr pb[0], 16)
   PgParam(oid: OidPath, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgPolygon): PgParam =
   ## Binary format: npts(4) + points(npts \* 16).
   var data = newSeq[byte](4 + v.points.len * 16)
   let npts = toBE32(int32(v.points.len))
-  copyMem(addr data[0], unsafeAddr npts[0], 4)
+  copyMem(addr data[0], addr npts[0], 4)
   for i, p in v.points:
     let pb = encodePointBinary(p)
-    copyMem(addr data[4 + i * 16], unsafeAddr pb[0], 16)
+    copyMem(addr data[4 + i * 16], addr pb[0], 16)
   PgParam(oid: OidPolygon, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgCircle): PgParam =
   ## Binary format: 24 bytes (center point + radius float64).
   var data = newSeq[byte](24)
   let cp = encodePointBinary(v.center)
-  copyMem(addr data[0], unsafeAddr cp[0], 16)
+  copyMem(addr data[0], addr cp[0], 16)
   let rBytes = toBE64(cast[int64](v.radius))
-  copyMem(addr data[16], unsafeAddr rBytes[0], 8)
+  copyMem(addr data[16], addr rBytes[0], 8)
   PgParam(oid: OidCircle, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: JsonNode): PgParam =
@@ -1008,25 +1008,25 @@ proc encodeHstoreBinary*(v: PgHstore): seq[byte] =
       size += val.get.len
   result = newSeq[byte](size)
   let np = toBE32(int32(v.len))
-  copyMem(addr result[0], unsafeAddr np[0], 4)
+  copyMem(addr result[0], addr np[0], 4)
   var pos = 4
   for k, val in v.pairs:
     let kLen = toBE32(int32(k.len))
-    copyMem(addr result[pos], unsafeAddr kLen[0], 4)
+    copyMem(addr result[pos], addr kLen[0], 4)
     pos += 4
     if k.len > 0:
-      copyMem(addr result[pos], unsafeAddr k[0], k.len)
+      copyMem(addr result[pos], addr k[0], k.len)
       pos += k.len
     if val.isSome:
       let vLen = toBE32(int32(val.get.len))
-      copyMem(addr result[pos], unsafeAddr vLen[0], 4)
+      copyMem(addr result[pos], addr vLen[0], 4)
       pos += 4
       if val.get.len > 0:
-        copyMem(addr result[pos], unsafeAddr val.get[0], val.get.len)
+        copyMem(addr result[pos], addr val.get[0], val.get.len)
         pos += val.get.len
     else:
       let nullLen = toBE32(-1'i32)
-      copyMem(addr result[pos], unsafeAddr nullLen[0], 4)
+      copyMem(addr result[pos], addr nullLen[0], 4)
       pos += 4
 
 proc toPgBinaryParam*(v: PgHstore, oid: int32): PgParam =
@@ -1159,7 +1159,7 @@ proc addBind*(
       if data.len > 0:
         let oldLen = buf.len
         buf.setLen(oldLen + data.len)
-        copyMem(addr buf[oldLen], unsafeAddr data[0], data.len)
+        copyMem(addr buf[oldLen], addr data[0], data.len)
   # Result format codes
   buf.addInt16(int16(resultFormats.len))
   for f in resultFormats:
@@ -1250,14 +1250,14 @@ proc writeParamValue*(buf: var seq[byte], v: string) =
   if v.len > 0:
     let o = buf.len
     buf.setLen(o + v.len)
-    copyMem(addr buf[o], unsafeAddr v[0], v.len)
+    copyMem(addr buf[o], addr v[0], v.len)
 
 proc writeParamValue*(buf: var seq[byte], v: seq[byte]) =
   buf.addInt32(int32(v.len))
   if v.len > 0:
     let o = buf.len
     buf.setLen(o + v.len)
-    copyMem(addr buf[o], unsafeAddr v[0], v.len)
+    copyMem(addr buf[o], addr v[0], v.len)
 
 proc writeParamValue*(buf: var seq[byte], v: PgNumeric) =
   writeParamValue(buf, $v)
