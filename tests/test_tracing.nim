@@ -110,6 +110,10 @@ type
     wasClosed: bool
     handedToWaiter: bool
 
+  PoolCloseErrorRec = object
+    hasConn: bool
+    errMsg: string
+
   TraceLog = ref object
     connectStarts: seq[ConnectStartRec]
     connectEnds: seq[ConnectEndRec]
@@ -125,6 +129,7 @@ type
     poolAcquireEnds: seq[PoolAcquireEndRec]
     poolReleaseStarts: seq[PoolReleaseStartRec]
     poolReleaseEnds: seq[PoolReleaseEndRec]
+    poolCloseErrors: seq[PoolCloseErrorRec]
 
 proc newTraceLog(): TraceLog =
   TraceLog()
@@ -246,6 +251,13 @@ proc buildTracer(log: TraceLog): PgTracer =
     log.poolReleaseEnds.add(
       PoolReleaseEndRec(
         spanId: span.id, wasClosed: data.wasClosed, handedToWaiter: data.handedToWaiter
+      )
+    )
+
+  tracer.onPoolCloseError = proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].} =
+    log.poolCloseErrors.add(
+      PoolCloseErrorRec(
+        hasConn: data.conn != nil, errMsg: (if data.err != nil: data.err.msg else: "")
       )
     )
 
@@ -633,6 +645,90 @@ suite "Tracing: pool acquire/release":
       doAssert log.poolReleaseEnds[0].handedToWaiter
 
       pool.release(conn2)
+      await pool.close()
+
+    waitFor t()
+
+suite "Tracing: pool close errors":
+  test "onPoolCloseError reports swallowed close failures":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      let conn = await pool.acquire()
+
+      # Drive the hook through reportCloseError — the single chokepoint that
+      # tracedClose funnels errors through. Inducing a real conn.close() failure
+      # is impractical in tests: close() is idempotent and its only raising path
+      # is inside sendMsg, which it already swallows internally.
+      let err = newException(PgError, "simulated close failure")
+      pool.reportCloseError(conn, err)
+
+      doAssert log.poolCloseErrors.len == 1
+      doAssert log.poolCloseErrors[0].hasConn
+      doAssert log.poolCloseErrors[0].errMsg == "simulated close failure"
+
+      pool.release(conn)
+      await pool.close()
+
+    waitFor t()
+
+  test "nil onPoolCloseError hook is a no-op":
+    proc t() {.async.} =
+      # Build a tracer that sets OTHER hooks but leaves onPoolCloseError nil.
+      let tracer = PgTracer()
+      var poolCfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      let conn = await pool.acquire()
+      # Must not raise even though the hook is nil.
+      pool.reportCloseError(conn, newException(PgError, "ignored"))
+
+      pool.release(conn)
+      await pool.close()
+
+    waitFor t()
+
+  test "tracedClose on healthy connection does not fire hook":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      # Use a stand-alone connection so pool.active/idle counters stay
+      # consistent — tracedClose only touches the tracer, not pool state.
+      let conn = await connect(tracedConfig(tracer))
+      await pool.tracedClose(conn)
+
+      doAssert log.poolCloseErrors.len == 0
+
+      await pool.close()
+
+    waitFor t()
+
+  test "tracedClose on already-closed connection is a no-op":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      # conn.close() is documented as idempotent. tracedClose against an
+      # already-closed conn exercises the real close path end-to-end and must
+      # neither raise nor fire the error hook.
+      let conn = await connect(tracedConfig(tracer))
+      await conn.close()
+      await pool.tracedClose(conn)
+
+      doAssert log.poolCloseErrors.len == 0
+
       await pool.close()
 
     waitFor t()
