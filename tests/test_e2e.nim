@@ -1,12 +1,13 @@
 import
-  std/[
-    unittest, options, strutils, tables, os, math, deques, sets, importutils, net, json
-  ]
+  std/[unittest, options, strutils, tables, os, math, deques, importutils, net, json]
 from std/times import
   DateTime, dateTime, mMar, mJun, mJan, mDec, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
 
 import ../async_postgres/[async_backend, pg_protocol, pg_types, pg_replication]
+
+when hasChronos:
+  import std/sets
 
 import ../async_postgres/pg_client {.all.}
 import ../async_postgres/pg_pool {.all.}
@@ -820,12 +821,14 @@ suite "E2E: Transaction":
         await conn.exec("CREATE TABLE test_tx_rb (id serial PRIMARY KEY, val text)")
 
       var raised = false
+      var shouldRaise = true
       try:
         conn.withTransaction:
           discard await conn.exec(
             "INSERT INTO test_tx_rb (val) VALUES ($1)", @[toPgParam("rollback_me")]
           )
-          raise newException(ValueError, "intentional error")
+          if shouldRaise:
+            raise newException(ValueError, "intentional error")
       except ValueError:
         raised = true
 
@@ -868,12 +871,14 @@ suite "E2E: Transaction":
         await pool.exec("CREATE TABLE test_ptx_rb (id serial PRIMARY KEY, val text)")
 
       var raised = false
+      var shouldRaise = true
       try:
         pool.withTransaction(conn):
           discard await conn.exec(
             "INSERT INTO test_ptx_rb (val) VALUES ($1)", @[toPgParam("pool_rollback")]
           )
-          raise newException(ValueError, "intentional error")
+          if shouldRaise:
+            raise newException(ValueError, "intentional error")
       except ValueError:
         raised = true
 
@@ -892,6 +897,7 @@ suite "E2E: Transaction":
       let killer = await connect(plainConfig())
 
       var raised = false
+      var shouldRaise = true
       try:
         conn.withTransaction:
           let pidRes = await conn.query("SELECT pg_backend_pid()")
@@ -902,7 +908,8 @@ suite "E2E: Transaction":
           )
           # Give the server a moment to terminate the backend
           await sleepAsync(milliseconds(100))
-          raise newException(ValueError, "original error")
+          if shouldRaise:
+            raise newException(ValueError, "original error")
       except ValueError as e:
         raised = true
         doAssert e.msg == "original error"
@@ -919,6 +926,7 @@ suite "E2E: Transaction":
       let killer = await connect(plainConfig())
 
       var raised = false
+      var shouldRaise = true
       try:
         pool.withTransaction(conn):
           let pidRes = await conn.query("SELECT pg_backend_pid()")
@@ -927,7 +935,8 @@ suite "E2E: Transaction":
             "SELECT pg_terminate_backend($1)", @[toPgParam(parseInt(pid).int32)]
           )
           await sleepAsync(milliseconds(100))
-          raise newException(ValueError, "original error")
+          if shouldRaise:
+            raise newException(ValueError, "original error")
       except ValueError as e:
         raised = true
         doAssert e.msg == "original error"
@@ -1188,6 +1197,7 @@ suite "E2E: Transaction":
       discard
         await conn.exec("CREATE TABLE test_sp_rb (id serial PRIMARY KEY, val text)")
 
+      var shouldRaise = true
       conn.withTransaction:
         discard await conn.exec(
           "INSERT INTO test_sp_rb (val) VALUES ($1)", @[toPgParam("before")]
@@ -1197,7 +1207,8 @@ suite "E2E: Transaction":
             discard await conn.exec(
               "INSERT INTO test_sp_rb (val) VALUES ($1)", @[toPgParam("inner")]
             )
-            raise newException(ValueError, "savepoint error")
+            if shouldRaise:
+              raise newException(ValueError, "savepoint error")
         except ValueError:
           discard
 
@@ -1217,6 +1228,7 @@ suite "E2E: Transaction":
       discard
         await conn.exec("CREATE TABLE test_sp_nest (id serial PRIMARY KEY, val text)")
 
+      var shouldRaise = true
       conn.withTransaction:
         conn.withSavepoint:
           discard await conn.exec(
@@ -1227,7 +1239,8 @@ suite "E2E: Transaction":
               discard await conn.exec(
                 "INSERT INTO test_sp_nest (val) VALUES ($1)", @[toPgParam("inner")]
               )
-              raise newException(ValueError, "inner error")
+              if shouldRaise:
+                raise newException(ValueError, "inner error")
           except ValueError:
             discard
 
@@ -1532,14 +1545,14 @@ suite "E2E: COPY Protocol":
       discard
         await conn.exec("INSERT INTO test_copy_out VALUES (1, 'Alice'), (2, 'Bob')")
 
-      let result = await conn.copyOut("COPY test_copy_out TO STDOUT")
-      doAssert result.format == cfText
-      doAssert "COPY 2" in result.commandTag
-      doAssert result.data.len == 2
+      let r = await conn.copyOut("COPY test_copy_out TO STDOUT")
+      doAssert r.format == cfText
+      doAssert "COPY 2" in r.commandTag
+      doAssert r.data.len == 2
 
       # Each row is a tab-delimited line with trailing newline
-      doAssert result.data[0].toString() == "1\tAlice\n"
-      doAssert result.data[1].toString() == "2\tBob\n"
+      doAssert r.data[0].toString() == "1\tAlice\n"
+      doAssert r.data[1].toString() == "2\tBob\n"
 
       discard await conn.exec("DROP TABLE test_copy_out")
       await conn.close()
@@ -1599,9 +1612,9 @@ suite "E2E: COPY Protocol":
       discard await conn.exec("DROP TABLE IF EXISTS test_copy_out_empty")
       discard await conn.exec("CREATE TABLE test_copy_out_empty (id int, name text)")
 
-      let result = await conn.copyOut("COPY test_copy_out_empty TO STDOUT")
-      doAssert result.data.len == 0
-      doAssert "COPY 0" in result.commandTag
+      let r = await conn.copyOut("COPY test_copy_out_empty TO STDOUT")
+      doAssert r.data.len == 0
+      doAssert "COPY 0" in r.commandTag
       doAssert conn.state == csReady
 
       discard await conn.exec("DROP TABLE test_copy_out_empty")
@@ -1638,9 +1651,9 @@ suite "E2E: COPY Protocol":
         "INSERT INTO test_copy_out_large SELECT g FROM generate_series(1, 10000) AS g"
       )
 
-      let result = await conn.copyOut("COPY test_copy_out_large TO STDOUT")
-      doAssert result.data.len == 10000
-      doAssert "COPY 10000" in result.commandTag
+      let r = await conn.copyOut("COPY test_copy_out_large TO STDOUT")
+      doAssert r.data.len == 10000
+      doAssert "COPY 10000" in r.commandTag
 
       discard await conn.exec("DROP TABLE test_copy_out_large")
       await conn.close()
@@ -1682,11 +1695,11 @@ suite "E2E: COPY Protocol":
         "INSERT INTO test_copy_out_null VALUES (1, NULL), (NULL, 'Bob')"
       )
 
-      let result = await conn.copyOut("COPY test_copy_out_null TO STDOUT")
-      doAssert result.data.len == 2
+      let r = await conn.copyOut("COPY test_copy_out_null TO STDOUT")
+      doAssert r.data.len == 2
       # NULL is represented as \N in text format
-      doAssert result.data[0].toString() == "1\t\\N\n"
-      doAssert result.data[1].toString() == "\\N\tBob\n"
+      doAssert r.data[0].toString() == "1\t\\N\n"
+      doAssert r.data[1].toString() == "\\N\tBob\n"
 
       discard await conn.exec("DROP TABLE test_copy_out_null")
       await conn.close()
@@ -1754,11 +1767,10 @@ suite "E2E: COPY Protocol":
         "INSERT INTO test_copy_csv_out VALUES (1, 'Alice'), (2, 'Bob, Jr.')"
       )
 
-      let result =
-        await conn.copyOut("COPY test_copy_csv_out TO STDOUT WITH (FORMAT csv)")
-      doAssert result.data.len == 2
-      doAssert result.data[0].toString() == "1,Alice\n"
-      doAssert result.data[1].toString() == "2,\"Bob, Jr.\"\n"
+      let r = await conn.copyOut("COPY test_copy_csv_out TO STDOUT WITH (FORMAT csv)")
+      doAssert r.data.len == 2
+      doAssert r.data[0].toString() == "1,Alice\n"
+      doAssert r.data[1].toString() == "2,\"Bob, Jr.\"\n"
 
       discard await conn.exec("DROP TABLE test_copy_csv_out")
       await conn.close()
@@ -3527,12 +3539,12 @@ suite "E2E: Binary Format":
       let params = @[toPgBinaryParam(dt)]
       let qr = await conn.query("SELECT $1::timestamp", params, resultFormat = rfBinary)
       doAssert qr.rows.len == 1
-      let result = qr.rows[0].getTimestamp(0)
-      doAssert result.year == 2024
-      doAssert result.month == mJan
-      doAssert result.monthday == 15
-      doAssert result.hour == 10
-      doAssert result.minute == 30
+      let r = qr.rows[0].getTimestamp(0)
+      doAssert r.year == 2024
+      doAssert r.month == mJan
+      doAssert r.monthday == 15
+      doAssert r.hour == 10
+      doAssert r.minute == 30
       await conn.close()
 
     waitFor t()
@@ -4232,7 +4244,6 @@ suite "E2E: COPY IN Stream":
           "1\n".toBytes()
         else:
           raise newException(CatchableError, "callback failed")
-          newSeq[byte]()
 
       var raised = false
       try:
