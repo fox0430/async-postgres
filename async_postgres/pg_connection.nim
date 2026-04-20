@@ -276,6 +276,14 @@ type
     wasClosed*: bool ## true if connection was closed instead of returned to pool
     handedToWaiter*: bool ## true if connection was given directly to a waiting acquirer
 
+  TracePoolCloseErrorData* = object
+    ## Data passed to the pool close-error hook. Fired when a pool-initiated
+    ## `conn.close()` raises — these errors are otherwise swallowed because
+    ## close runs from non-async cleanup paths and fire-and-forget tasks,
+    ## making leaks hard to observe without tracing.
+    conn*: PgConnection
+    err*: ref CatchableError
+
   PgTracer* = ref object
     ## Tracing hooks for async-postgres operations.
     ## Set only the callbacks you need; nil callbacks are skipped with zero overhead.
@@ -319,6 +327,7 @@ type
       proc(data: TracePoolReleaseStartData): TraceContext {.gcsafe, raises: [].}
     onPoolReleaseEnd*:
       proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
+    onPoolCloseError*: proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].}
 
 # Public API: read-only getters
 

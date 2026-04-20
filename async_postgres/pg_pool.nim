@@ -162,6 +162,21 @@ proc metrics*(pool: PgPool): PoolMetrics =
   ## Cumulative pool metrics.
   pool.metrics
 
+proc reportCloseError(pool: PgPool, conn: PgConnection, err: ref CatchableError) =
+  ## Route a swallowed pool-initiated close error to the tracer. The pool
+  ## cannot propagate these errors to a caller (close runs from synchronous
+  ## cleanup paths and fire-and-forget tasks), so tracing is the only signal
+  ## operators have for leak detection.
+  if pool.config.tracer != nil and pool.config.tracer.onPoolCloseError != nil:
+    pool.config.tracer.onPoolCloseError(TracePoolCloseErrorData(conn: conn, err: err))
+
+proc tracedClose(pool: PgPool, conn: PgConnection) {.async.} =
+  ## Close `conn`, reporting any close error via `reportCloseError`.
+  try:
+    await conn.close()
+  except CatchableError as e:
+    pool.reportCloseError(conn, e)
+
 proc closeNoWait(pool: PgPool, conn: PgConnection) =
   ## Schedule connection close without waiting. For use in non-async contexts
   ## (e.g. `release()` is synchronous). The spawned task is tracked in
@@ -171,14 +186,12 @@ proc closeNoWait(pool: PgPool, conn: PgConnection) =
   ## Note on asyncdispatch: a close scheduled here may race with an inflight
   ## request future that the previous timeout could not cancel (see
   ## `invalidateOnTimeout`). That future will observe a closed fd and fail
-  ## quietly — we rely on `asyncSpawn` swallowing the resulting CatchableError
-  ## so it never surfaces. The connection is not reused either way.
+  ## quietly — `tracedClose` catches the error and routes it to the
+  ## `onPoolCloseError` tracer hook (nil when unconfigured). The connection
+  ## is not reused either way.
   pool.metrics.closeCount.inc
   proc doClose() {.async.} =
-    try:
-      await conn.close()
-    except CatchableError:
-      discard
+    await pool.tracedClose(conn)
 
   # Prune only once the seq grows past the threshold so the sweep is amortized
   # instead of O(n) on every call. Uses swap-remove (constant-time delete that
@@ -207,10 +220,7 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
       discard await conn.simpleExec(pool.config.resetQuery)
       conn.clearStmtCache()
     except CatchableError:
-      try:
-        await conn.close()
-      except CatchableError:
-        discard
+      await pool.tracedClose(conn)
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
@@ -227,20 +237,14 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       # Always close broken or in-transaction connections (unusable)
       if pc.conn.state != csReady or pc.conn.txStatus != tsIdle:
         pool.metrics.closeCount.inc
-        try:
-          await pc.conn.close()
-        except CatchableError:
-          discard
+        await pool.tracedClose(pc.conn)
         continue
 
       # Always close max-lifetime-exceeded connections (acquire rejects them anyway)
       if pool.config.maxLifetime > ZeroDuration and
           now - pc.conn.createdAt > pool.config.maxLifetime:
         pool.metrics.closeCount.inc
-        try:
-          await pc.conn.close()
-        except CatchableError:
-          discard
+        await pool.tracedClose(pc.conn)
         continue
 
       # Idle timeout respects minSize
@@ -249,10 +253,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         let totalCount = remaining.len + pool.idle.len + pool.active
         if totalCount >= pool.config.minSize:
           pool.metrics.closeCount.inc
-          try:
-            await pc.conn.close()
-          except CatchableError:
-            discard
+          await pool.tracedClose(pc.conn)
           continue
 
       remaining.addLast(pc)
@@ -305,10 +306,7 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   except CatchableError as e:
     while pool.idle.len > 0:
       let pc = pool.idle.popFirst()
-      try:
-        await pc.conn.close()
-      except CatchableError:
-        discard
+      await pool.tracedClose(pc.conn)
     raise e
 
   pool.maintenanceTask = maintenanceLoop(pool)
@@ -379,18 +377,12 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     let pc = pool.idle.popFirst()
     if pc.conn.state != csReady:
       pool.metrics.closeCount.inc
-      try:
-        await pc.conn.close()
-      except CatchableError:
-        discard
+      await pool.tracedClose(pc.conn)
       continue
     if pool.config.maxLifetime > ZeroDuration and
         pool.cachedNow - pc.conn.createdAt > pool.config.maxLifetime:
       pool.metrics.closeCount.inc
-      try:
-        await pc.conn.close()
-      except CatchableError:
-        discard
+      await pool.tracedClose(pc.conn)
       continue
     # Health check: ping connections that have been idle too long
     if pool.config.healthCheckTimeout > ZeroDuration and
@@ -399,10 +391,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         await pc.conn.ping(pool.config.pingTimeout)
       except CatchableError:
         pool.metrics.closeCount.inc
-        try:
-          await pc.conn.close()
-        except CatchableError:
-          discard
+        await pool.tracedClose(pc.conn)
         continue
     pool.active.inc
     recordAcquire()
@@ -1061,10 +1050,7 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   while pool.idle.len > 0:
     let pc = pool.idle.popFirst()
     pool.metrics.closeCount.inc
-    try:
-      await pc.conn.close()
-    except CatchableError:
-      discard
+    await pool.tracedClose(pc.conn)
 
   # Wait for any fire-and-forget closes spawned via closeNoWait so the server
   # observes Terminate and fds are released before this proc returns. A late
