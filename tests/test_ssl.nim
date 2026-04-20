@@ -1,6 +1,8 @@
 import std/[unittest, strutils]
 
-import ../async_postgres/[async_backend, pg_protocol, pg_connection]
+import ../async_postgres/[async_backend, pg_protocol]
+
+import ../async_postgres/pg_connection {.all.}
 
 when hasAsyncDispatch:
   import std/asyncnet
@@ -545,3 +547,296 @@ suite "SSL negotiation - sslDisable":
     check firstMsgVersion == 196608'i32
     check connState == csReady
     check connSslEnabled == false
+
+proc sendAuthSasl(client: MockClient, mechanisms: seq[string]): Future[void] {.async.} =
+  var body: seq[byte] = @[]
+  body.addInt32(10) # AuthenticationSASL
+  for m in mechanisms:
+    body.addCString(m)
+  body.add(0'u8) # terminator
+  await sendBytes(client, buildBackendMsg('R', body))
+
+proc readSaslInitialResponseMechanism(client: MockClient): Future[string] {.async.} =
+  ## Read a frontend 'p' message (SASLInitialResponse) and return the mechanism name.
+  discard await readN(client, 1) # 'p' message type
+  let lenBuf = await readN(client, 4)
+  let msgLen = decodeInt32(lenBuf, 0)
+  let body = await readN(client, msgLen - 4)
+  result = ""
+  var i = 0
+  while i < body.len and body[i] != 0:
+    result.add(char(body[i]))
+    inc i
+
+suite "SCRAM channel binding enforcement":
+  test "cbRequire without SSL raises PgError":
+    var raised = false
+    var msgMatches = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendAuthSasl(st, @["SCRAM-SHA-256"])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslDisable,
+        channelBinding: cbRequire,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "SSL is not in use" in e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+
+  test "cbRequire errors when server offers only SCRAM-SHA-256":
+    var raised = false
+    var msgMatches = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendAuthSasl(st, @["SCRAM-SHA-256"])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslDisable,
+        channelBinding: cbRequire,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "channel binding" in e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+
+  test "cbDisable picks SCRAM-SHA-256 even when PLUS is offered":
+    var pickedNonPlus = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendAuthSasl(st, @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"])
+          let mech = await readSaslInitialResponseMechanism(st)
+          pickedNonPlus = mech == "SCRAM-SHA-256"
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslDisable,
+        channelBinding: cbDisable,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        discard
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check pickedNonPlus
+
+  test "cbDisable errors when server offers only PLUS":
+    var raised = false
+    var msgMatches = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendAuthSasl(st, @["SCRAM-SHA-256-PLUS"])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslDisable,
+        channelBinding: cbDisable,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "channel binding" in e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+
+  test "cbPrefer without SSL accepts SCRAM-SHA-256":
+    var pickedScram = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendAuthSasl(st, @["SCRAM-SHA-256"])
+          let mech = await readSaslInitialResponseMechanism(st)
+          pickedScram = mech == "SCRAM-SHA-256"
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslDisable,
+        channelBinding: cbPrefer,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        discard
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check pickedScram
+
+suite "selectScramMechanism":
+  const fakeCert = @[byte 0x30, 0x82, 0x01, 0x22] # dummy DER prefix
+  const bothMechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+
+  test "cbDisable rejects PLUS when SSL is available":
+    let choice = selectScramMechanism(
+      sslEnabled = true,
+      serverCertDer = fakeCert,
+      saslMechanisms = bothMechs,
+      mode = cbDisable,
+    )
+    check choice.mechanism == "SCRAM-SHA-256"
+    check choice.cbType == ""
+    check choice.cbData.len == 0
+
+  test "cbPrefer picks PLUS when SSL + cert + server support all present":
+    let choice = selectScramMechanism(
+      sslEnabled = true,
+      serverCertDer = fakeCert,
+      saslMechanisms = bothMechs,
+      mode = cbPrefer,
+    )
+    check choice.mechanism == "SCRAM-SHA-256-PLUS"
+    check choice.cbType == "tls-server-end-point"
+    check choice.cbData.len > 0
+
+  test "cbPrefer falls back to SCRAM-SHA-256 when cert is missing":
+    let choice = selectScramMechanism(
+      sslEnabled = true,
+      serverCertDer = @[],
+      saslMechanisms = bothMechs,
+      mode = cbPrefer,
+    )
+    check choice.mechanism == "SCRAM-SHA-256"
+
+  test "cbRequire succeeds when SSL + cert + PLUS all available":
+    let choice = selectScramMechanism(
+      sslEnabled = true,
+      serverCertDer = fakeCert,
+      saslMechanisms = bothMechs,
+      mode = cbRequire,
+    )
+    check choice.mechanism == "SCRAM-SHA-256-PLUS"
+    check choice.cbType == "tls-server-end-point"
+    check choice.cbData.len > 0
+
+  test "cbRequire raises when cert is missing even with SSL":
+    expect PgConnectionError:
+      discard selectScramMechanism(
+        sslEnabled = true,
+        serverCertDer = @[],
+        saslMechanisms = bothMechs,
+        mode = cbRequire,
+      )
+
+  test "cbPrefer raises when no SCRAM mechanism is offered":
+    expect PgConnectionError:
+      discard selectScramMechanism(
+        sslEnabled = false,
+        serverCertDer = @[],
+        saslMechanisms = @["SOMETHING-ELSE"],
+        mode = cbPrefer,
+      )

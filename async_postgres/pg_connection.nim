@@ -69,6 +69,12 @@ type
     sslVerifyCa ## Require SSL + verify CA chain (no hostname verification)
     sslVerifyFull ## Require SSL + verify CA chain and hostname
 
+  ChannelBindingMode* = enum
+    ## SCRAM channel binding policy (libpq-compatible).
+    cbPrefer ## Use SCRAM-SHA-256-PLUS when SSL and server support it (default).
+    cbDisable ## Never use SCRAM-SHA-256-PLUS; only SCRAM-SHA-256.
+    cbRequire ## Require SCRAM-SHA-256-PLUS; fail if unavailable.
+
   TargetSessionAttrs* = enum
     ## Target server type for multi-host failover (libpq compatible).
     tsaAny ## Connect to any server (default)
@@ -91,6 +97,9 @@ type
     database*: string
     sslMode*: SslMode
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    channelBinding*: ChannelBindingMode
+      ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
+      ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
     applicationName*: string
     connectTimeout*: Duration ## TCP connect timeout (default: no timeout)
     keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
@@ -1112,6 +1121,57 @@ proc bytesToString(data: seq[byte]): string =
   for i in 0 ..< data.len:
     result[i] = char(data[i])
 
+proc selectScramMechanism(
+    sslEnabled: bool,
+    serverCertDer: openArray[byte],
+    saslMechanisms: seq[string],
+    mode: ChannelBindingMode,
+): tuple[mechanism: string, cbType: string, cbData: seq[byte]] =
+  ## Pick the SCRAM mechanism and channel-binding material for a SASL
+  ## authentication attempt. Raises `PgConnectionError` when the server-offered
+  ## mechanisms cannot satisfy `mode`.
+  let serverHasPlus = "SCRAM-SHA-256-PLUS" in saslMechanisms
+  let serverHasScram = "SCRAM-SHA-256" in saslMechanisms
+  let canUsePlus = sslEnabled and serverCertDer.len > 0 and serverHasPlus
+  case mode
+  of cbRequire:
+    if not sslEnabled:
+      raise newException(
+        PgConnectionError, "channel binding is required, but SSL is not in use"
+      )
+    if not serverHasPlus:
+      raise newException(
+        PgConnectionError,
+        "channel binding is required, but server did not offer SCRAM-SHA-256-PLUS",
+      )
+    if serverCertDer.len == 0:
+      raise newException(
+        PgConnectionError,
+        "channel binding is required, but server certificate is unavailable",
+      )
+    result.mechanism = "SCRAM-SHA-256-PLUS"
+    result.cbType = "tls-server-end-point"
+    result.cbData = computeTlsServerEndpoint(serverCertDer)
+  of cbPrefer:
+    if canUsePlus:
+      result.mechanism = "SCRAM-SHA-256-PLUS"
+      result.cbType = "tls-server-end-point"
+      result.cbData = computeTlsServerEndpoint(serverCertDer)
+    elif serverHasScram:
+      result.mechanism = "SCRAM-SHA-256"
+    else:
+      raise newException(
+        PgConnectionError, "server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS"
+      )
+  of cbDisable:
+    if serverHasScram:
+      result.mechanism = "SCRAM-SHA-256"
+    else:
+      raise newException(
+        PgConnectionError,
+        "channel binding is disabled, but server only offered SCRAM-SHA-256-PLUS",
+      )
+
 proc connectToHost(
     config: ConnConfig, hostAddr: string, hostPort: int
 ): Future[PgConnection] {.async.} =
@@ -1251,24 +1311,14 @@ proc connectToHost(
             let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
             await conn.sendMsg(encodePassword(hash))
           of bmkAuthenticationSASL:
-            var mechanism: string
-            var cbType = ""
-            var cbData: seq[byte]
-            if conn.sslEnabled and conn.serverCertDer.len > 0 and
-                "SCRAM-SHA-256-PLUS" in msg.saslMechanisms:
-              mechanism = "SCRAM-SHA-256-PLUS"
-              cbType = "tls-server-end-point"
-              cbData = computeTlsServerEndpoint(conn.serverCertDer)
-            elif "SCRAM-SHA-256" in msg.saslMechanisms:
-              mechanism = "SCRAM-SHA-256"
-            else:
-              raise newException(
-                PgConnectionError,
-                "Server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS",
-              )
-            let clientFirst =
-              scramClientFirstMessage(config.user, scramState, cbType, cbData)
-            await conn.sendMsg(encodeSASLInitialResponse(mechanism, clientFirst))
+            let choice = selectScramMechanism(
+              conn.sslEnabled, conn.serverCertDer, msg.saslMechanisms,
+              config.channelBinding,
+            )
+            let clientFirst = scramClientFirstMessage(
+              config.user, scramState, choice.cbType, choice.cbData
+            )
+            await conn.sendMsg(encodeSASLInitialResponse(choice.mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
             let clientFinal =
               scramClientFinalMessage(config.password, msg.saslData, scramState)
@@ -1918,6 +1968,17 @@ proc parseSslMode(s: string): SslMode =
   else:
     raise newException(PgError, "Invalid sslmode: " & s)
 
+proc parseChannelBindingMode(s: string): ChannelBindingMode =
+  case s
+  of "disable":
+    cbDisable
+  of "prefer":
+    cbPrefer
+  of "require":
+    cbRequire
+  else:
+    raise newException(PgError, "Invalid channel_binding: " & s)
+
 proc parseTargetSessionAttrs(s: string): TargetSessionAttrs =
   case s
   of "any":
@@ -1958,6 +2019,8 @@ proc applyParam(result: var ConnConfig, key, val: string) =
     result.password = val
   of "sslmode":
     result.sslMode = parseSslMode(val)
+  of "channel_binding":
+    result.channelBinding = parseChannelBindingMode(val)
   of "application_name":
     result.applicationName = val
   of "connect_timeout":
@@ -2187,6 +2250,7 @@ proc initConnConfig*(
     database = "",
     sslMode = sslDisable,
     sslRootCert = "",
+    channelBinding = cbPrefer,
     applicationName = "",
     connectTimeout = ZeroDuration,
     keepAlive = true,
@@ -2207,6 +2271,7 @@ proc initConnConfig*(
     database: database,
     sslMode: sslMode,
     sslRootCert: sslRootCert,
+    channelBinding: channelBinding,
     applicationName: applicationName,
     connectTimeout: connectTimeout,
     keepAlive: keepAlive,
