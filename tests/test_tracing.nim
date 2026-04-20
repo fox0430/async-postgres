@@ -114,6 +114,11 @@ type
     hasConn: bool
     errMsg: string
 
+  InsecureAuthRec = object
+    hasConn: bool
+    authMethod: AuthMethod
+    sslEnabled: bool
+
   TraceLog = ref object
     connectStarts: seq[ConnectStartRec]
     connectEnds: seq[ConnectEndRec]
@@ -130,6 +135,7 @@ type
     poolReleaseStarts: seq[PoolReleaseStartRec]
     poolReleaseEnds: seq[PoolReleaseEndRec]
     poolCloseErrors: seq[PoolCloseErrorRec]
+    insecureAuths: seq[InsecureAuthRec]
 
 proc newTraceLog(): TraceLog =
   TraceLog()
@@ -258,6 +264,15 @@ proc buildTracer(log: TraceLog): PgTracer =
     log.poolCloseErrors.add(
       PoolCloseErrorRec(
         hasConn: data.conn != nil, errMsg: (if data.err != nil: data.err.msg else: "")
+      )
+    )
+
+  tracer.onInsecureAuth = proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].} =
+    log.insecureAuths.add(
+      InsecureAuthRec(
+        hasConn: data.conn != nil,
+        authMethod: data.authMethod,
+        sslEnabled: data.sslEnabled,
       )
     )
 
@@ -821,3 +836,99 @@ suite "Tracing: nil tracer":
       await conn.close()
 
     waitFor t()
+
+suite "Tracing: onInsecureAuth":
+  # These unit tests exercise the tracer closure directly via the public
+  # hook. End-to-end firing from the auth loop (cleartext over plaintext)
+  # requires a PG server configured to request `password` auth, which is
+  # out of scope for the current docker-compose setup.
+  test "closure receives method and transport state (plaintext)":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection()
+
+    tracer.onInsecureAuth(
+      TraceInsecureAuthData(conn: fake, authMethod: amPassword, sslEnabled: false)
+    )
+
+    check log.insecureAuths.len == 1
+    check log.insecureAuths[0].hasConn
+    check log.insecureAuths[0].authMethod == amPassword
+    check log.insecureAuths[0].sslEnabled == false
+
+  test "closure receives sslEnabled=true":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection()
+
+    tracer.onInsecureAuth(
+      TraceInsecureAuthData(conn: fake, authMethod: amPassword, sslEnabled: true)
+    )
+
+    check log.insecureAuths.len == 1
+    check log.insecureAuths[0].sslEnabled == true
+
+  test "PgTracer with nil onInsecureAuth hook is safe to leave unset":
+    let tracer = PgTracer()
+    check tracer.onInsecureAuth == nil
+
+suite "filterSaslByRequireAuth":
+  test "empty allowed set performs no filtering":
+    let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+    check filterSaslByRequireAuth(mechs, {}) == mechs
+
+  test "drops PLUS when only SCRAM allowed":
+    let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+    check filterSaslByRequireAuth(mechs, {amScramSha256}) == @["SCRAM-SHA-256"]
+
+  test "drops SCRAM when only PLUS allowed":
+    let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+    check filterSaslByRequireAuth(mechs, {amScramSha256Plus}) == @["SCRAM-SHA-256-PLUS"]
+
+  test "empty result when nothing matches":
+    let mechs = @["SCRAM-SHA-256"]
+    check filterSaslByRequireAuth(mechs, {amMd5}).len == 0
+
+  test "unrelated non-SCRAM methods in allowlist do not add mechanisms":
+    let mechs = @["SCRAM-SHA-256"]
+    check filterSaslByRequireAuth(mechs, {amScramSha256, amMd5, amPassword}) ==
+      @["SCRAM-SHA-256"]
+
+suite "Tracing: requireAuth happy path":
+  test "accepts SCRAM when explicitly allowed":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.requireAuth = {amScramSha256, amScramSha256Plus}
+      let conn = await connect(cfg)
+      doAssert conn != nil
+      discard await conn.exec("SELECT 1")
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: requireAuth negative path":
+  # These tests require the docker-compose PG to use SCRAM auth (the default
+  # for modern postgres images). If the server ever switches to trust/md5,
+  # the expected error message will differ but the connect must still fail.
+  proc connectRaises(requireAuth: set[AuthMethod]): bool =
+    var raised = false
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.requireAuth = requireAuth
+      try:
+        let conn = await connect(cfg)
+        await conn.close()
+      except PgConnectionError:
+        raised = true
+
+    waitFor t()
+    raised
+
+  test "rejects when only md5 is allowed against SCRAM server":
+    check connectRaises({amMd5})
+
+  test "rejects when only password is allowed against SCRAM server":
+    check connectRaises({amPassword})
+
+  test "rejects when only amNone is allowed against SCRAM server":
+    check connectRaises({amNone})
