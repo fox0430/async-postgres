@@ -396,7 +396,7 @@ func hstoreOid*(conn: PgConnection): int32 {.inline.} =
   conn.hstoreOid
 
 func hstoreArrayOid*(conn: PgConnection): int32 {.inline.} =
-  ## Dynamic OID for hstore[] array type; 0 if not available.
+  ## Dynamic OID for ``hstore[]`` array type; 0 if not available.
   conn.hstoreArrayOid
 
 proc toPgBinaryParam*(conn: PgConnection, v: PgHstore): PgParam {.inline.} =
@@ -408,9 +408,9 @@ proc toPgBinaryParam*(conn: PgConnection, v: PgHstore): PgParam {.inline.} =
   toPgBinaryParam(v, conn.hstoreOid)
 
 proc toPgBinaryParam*(conn: PgConnection, v: seq[PgHstore]): PgParam {.inline.} =
-  ## Convenience overload: encode hstore[] in binary using ``conn.hstoreOid``
-  ## and ``conn.hstoreArrayOid``. Raises ``PgTypeError`` if either OID has not
-  ## been discovered.
+  ## Convenience overload: encode ``hstore[]`` in binary using
+  ## ``conn.hstoreOid`` and ``conn.hstoreArrayOid``. Raises ``PgTypeError`` if
+  ## either OID has not been discovered.
   if conn.hstoreOid == 0 or conn.hstoreArrayOid == 0:
     raise
       newException(PgTypeError, "hstore/hstore[] OIDs not available on this connection")
@@ -1336,8 +1336,14 @@ proc connectToHost(
       else:
         await sock.connect(hostAddr, Port(hostPort))
         when defined(posix):
-          configureTcpNoDelay(sock.getFd())
-          configureKeepalive(sock.getFd(), config)
+          when defined(nimdoc):
+            # nim doc resolves nativesockets.SocketHandle to winlean on some
+            # setups, so cast explicitly to satisfy the doc-time type check.
+            configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
+            configureKeepalive(posix.SocketHandle(sock.getFd()), config)
+          else:
+            configureTcpNoDelay(sock.getFd())
+            configureKeepalive(sock.getFd(), config)
     except CatchableError:
       sock.close()
       raise

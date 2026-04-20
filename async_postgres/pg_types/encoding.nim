@@ -1035,11 +1035,12 @@ proc toPgBinaryParam*(v: PgHstore, oid: int32): PgParam =
   PgParam(oid: oid, format: 1, value: some(encodeHstoreBinary(v)))
 
 proc toPgParam*(v: seq[PgHstore]): PgParam =
-  ## Send hstore[] in text format using ``OidTextArray``. Requires an explicit
-  ## ``::hstore[]`` cast in the SQL statement (e.g. ``SELECT $1::hstore[]``),
-  ## since the parameter is typed as text[]. No connection-specific OID is
-  ## needed; prefer ``toPgBinaryParam`` when a ``PgConnection`` with the
-  ## discovered hstore OIDs is available (faster, no cast required).
+  ## Send ``hstore[]`` in text format using ``OidTextArray``. Requires an
+  ## explicit ``::hstore[]`` cast in the SQL statement (e.g.
+  ## ``SELECT $1::hstore[]``), since the parameter is typed as ``text[]``. No
+  ## connection-specific OID is needed; prefer ``toPgBinaryParam`` when a
+  ## ``PgConnection`` with the discovered hstore OIDs is available (faster, no
+  ## cast required).
   if v.len == 0:
     return PgParam(oid: OidTextArray, format: 0, value: some(toBytes("{}")))
   var s = "{"
@@ -1056,8 +1057,8 @@ proc toPgParam*(v: seq[PgHstore]): PgParam =
   PgParam(oid: OidTextArray, format: 0, value: some(toBytes(s)))
 
 proc toPgBinaryParam*(v: seq[PgHstore], elemOid: int32, arrayOid: int32): PgParam =
-  ## Encode hstore[] in binary format. Requires both the dynamic hstore OID
-  ## and hstore[] OID (available as ``conn.hstoreOid`` and
+  ## Encode ``hstore[]`` in binary format. Requires both the dynamic hstore OID
+  ## and ``hstore[]`` OID (available as ``conn.hstoreOid`` and
   ## ``conn.hstoreArrayOid`` after connection). See also the ``PgConnection``
   ## overload in ``pg_connection`` which reads these OIDs automatically.
   if v.len == 0:
