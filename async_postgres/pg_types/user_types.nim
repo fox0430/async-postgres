@@ -144,7 +144,7 @@ proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
     some(getEnum[T](row, col))
 
 proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
-  ## Read a PostgreSQL enum[] column as ``seq[T]``.
+  ## Read a PostgreSQL ``enum[]`` column as ``seq[T]``.
   ## Raises ``PgTypeError`` on NULL column or NULL element.
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
