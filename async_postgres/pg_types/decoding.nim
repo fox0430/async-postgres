@@ -18,7 +18,7 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
       raise newException(PgTypeError, "hstore binary: truncated key data")
     var key = newString(keyLen)
     if keyLen > 0:
-      copyMem(addr key[0], unsafeAddr data[pos], keyLen)
+      copyMem(addr key[0], addr data[pos], keyLen)
     pos += keyLen
     if pos + 4 > data.len:
       raise newException(PgTypeError, "hstore binary: truncated value length")
@@ -31,7 +31,7 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
         raise newException(PgTypeError, "hstore binary: truncated value data")
       var val = newString(valLen)
       if valLen > 0:
-        copyMem(addr val[0], unsafeAddr data[pos], valLen)
+        copyMem(addr val[0], addr data[pos], valLen)
       pos += valLen
       result[key] = some(val)
 
