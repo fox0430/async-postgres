@@ -2,6 +2,18 @@ import std/[options, strutils, tables, times, net]
 
 import ./core
 
+proc readString*(src: openArray[byte], off, len: int): string =
+  ## Copy `len` bytes from src starting at off into a new string.
+  result = newString(len)
+  if len > 0:
+    copyMem(addr result[0], addr src[off], len)
+
+proc readBytes*(src: openArray[byte], off, len: int): seq[byte] =
+  ## Copy `len` bytes from src starting at off into a new seq[byte].
+  result = newSeq[byte](len)
+  if len > 0:
+    copyMem(addr result[0], addr src[off], len)
+
 proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
   ## Decode PostgreSQL binary hstore format.
   result = initTable[string, Option[string]]()
@@ -16,9 +28,7 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
     pos += 4
     if keyLen < 0 or pos + keyLen > data.len:
       raise newException(PgTypeError, "hstore binary: truncated key data")
-    var key = newString(keyLen)
-    if keyLen > 0:
-      copyMem(addr key[0], addr data[pos], keyLen)
+    let key = readString(data, pos, keyLen)
     pos += keyLen
     if pos + 4 > data.len:
       raise newException(PgTypeError, "hstore binary: truncated value length")
@@ -29,9 +39,7 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
     else:
       if valLen < 0 or pos + valLen > data.len:
         raise newException(PgTypeError, "hstore binary: truncated value data")
-      var val = newString(valLen)
-      if valLen > 0:
-        copyMem(addr val[0], addr data[pos], valLen)
+      let val = readString(data, pos, valLen)
       pos += valLen
       result[key] = some(val)
 

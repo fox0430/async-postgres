@@ -407,9 +407,9 @@ template appendInlineParam(
     let oldLen = data.len
     data.setLen(oldLen + int(p.len))
     if p.len <= PgInlineBufSize:
-      copyMem(addr data[oldLen], addr p.inlineBuf[0], int(p.len))
+      data.writeBytesAt(oldLen, p.inlineBuf.toOpenArray(0, int(p.len) - 1))
     else:
-      copyMem(addr data[oldLen], addr p.overflow[0], int(p.len))
+      data.writeBytesAt(oldLen, p.overflow.toOpenArray(0, int(p.len) - 1))
     ranges.add((dataOff, p.len))
 
 proc flattenInline(
@@ -1612,7 +1612,7 @@ proc copyIn*(
   ## Converts to bytes internally; avoids manual toOpenArrayByte.
   var bytes = newSeq[byte](data.len)
   if data.len > 0:
-    copyMem(addr bytes[0], addr data[0], data.len)
+    bytes.writeBytesAt(0, data.toOpenArrayByte(0, data.high))
   copyIn(conn, sql, bytes, timeout)
 
 proc copyIn*(
@@ -1630,9 +1630,8 @@ proc copyIn*(
   var combined = newSeq[byte](totalLen)
   var offset = 0
   for chunk in data:
-    if chunk.len > 0:
-      copyMem(addr combined[offset], addr chunk[0], chunk.len)
-      offset += chunk.len
+    combined.writeBytesAt(offset, chunk)
+    offset += chunk.len
   copyIn(conn, sql, combined, timeout)
 
 proc copyInStreamImpl(

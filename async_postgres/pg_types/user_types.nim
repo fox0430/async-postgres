@@ -153,10 +153,7 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in enum array")
-      var s = newString(e.len)
-      if e.len > 0:
-        copyMem(addr s[0], addr row.data.buf[off + e.off], e.len)
-      result[i] = parseEnum[T](s)
+      result[i] = parseEnum[T](readString(row.data.buf, off + e.off, e.len))
     return
   let s = row.getStr(col)
   for e in parseTextArray(s):
@@ -183,10 +180,7 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
       if e.len == -1:
         result[i] = none(T)
       else:
-        var s = newString(e.len)
-        if e.len > 0:
-          copyMem(addr s[0], addr row.data.buf[off + e.off], e.len)
-        result[i] = some(parseEnum[T](s))
+        result[i] = some(parseEnum[T](readString(row.data.buf, off + e.off, e.len)))
     return
   let s = row.getStr(col)
   for e in parseTextArray(s):
@@ -357,9 +351,7 @@ proc compositeFieldFromText[T](s: string): T =
 
 template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
   when typeof(val) is string:
-    val = newString(fLen)
-    if fLen > 0:
-      copyMem(addr val[0], addr buf[fOff], fLen)
+    val = readString(buf, fOff, fLen)
   elif typeof(val) is int16:
     val = fromBE16(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is int32:
@@ -373,10 +365,7 @@ template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
   elif typeof(val) is bool:
     val = buf[fOff] != 0
   else:
-    var s = newString(fLen)
-    if fLen > 0:
-      copyMem(addr s[0], addr buf[fOff], fLen)
-    val = compositeFieldFromText[typeof(val)](s)
+    val = compositeFieldFromText[typeof(val)](readString(buf, fOff, fLen))
 
 proc getComposite*[T: object](row: Row, col: int): T =
   ## Read a PostgreSQL composite column as a Nim object. Handles binary format.

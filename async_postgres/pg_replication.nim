@@ -185,9 +185,7 @@ proc `<=`*(a, b: Lsn): bool {.borrow.}
 
 proc toString*(field: TupleField): string =
   ## Convert a TupleField's data to a string by copying the bytes.
-  result = newString(field.data.len)
-  if field.data.len > 0:
-    copyMem(addr result[0], addr field.data[0], field.data.len)
+  result = readString(field.data, 0, field.data.len)
 
 template toUInt64*(lsn: Lsn): uint64 =
   ## Get the raw uint64 value of an LSN.
@@ -238,9 +236,7 @@ proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
   if i >= buf.len:
     raise newException(ProtocolError, "decodeCStringAt: missing null terminator")
   let slen = i - offset
-  var s = newString(slen)
-  if slen > 0:
-    copyMem(addr s[0], addr buf[offset], slen)
+  let s = readString(buf, offset, slen)
   inc i # skip null
   (s, i)
 
@@ -261,9 +257,7 @@ proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
     of 't', 'b':
       let dataLen = decodeInt32(buf, pos)
       pos += 4
-      var data = newSeq[byte](dataLen)
-      if dataLen > 0:
-        copyMem(addr data[0], addr buf[pos], dataLen)
+      let data = readBytes(buf, pos, int(dataLen))
       pos += int(dataLen)
       fields[i] = TupleField(kind: if kind == 't': tdkText else: tdkBinary, data: data)
     else:
@@ -387,9 +381,7 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     pos = nextPos
     let contentLen = decodeInt32(data, pos)
     pos += 4
-    if contentLen > 0:
-      msg.content = newSeq[byte](contentLen)
-      copyMem(addr msg.content[0], addr data[pos], contentLen)
+    msg.content = readBytes(data, pos, int(contentLen))
     PgOutputMessage(kind: pomkMessage, message: msg)
   else:
     raise newException(ProtocolError, "Unknown pgoutput message type: " & msgType)
