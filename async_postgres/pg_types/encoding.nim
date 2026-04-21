@@ -3,31 +3,43 @@ import std/[options, json, macros, strutils, tables, times, net]
 import ../pg_protocol
 import ./core
 
+template writeBE16*(buf: var openArray[byte], pos: int, v: int16) =
+  buf[pos] = byte((v shr 8) and 0xFF)
+  buf[pos + 1] = byte(v and 0xFF)
+
+template writeBE32*(buf: var openArray[byte], pos: int, v: int32) =
+  buf[pos] = byte((v shr 24) and 0xFF)
+  buf[pos + 1] = byte((v shr 16) and 0xFF)
+  buf[pos + 2] = byte((v shr 8) and 0xFF)
+  buf[pos + 3] = byte(v and 0xFF)
+
+template writeBE64*(buf: var openArray[byte], pos: int, v: int64) =
+  buf[pos] = byte((v shr 56) and 0xFF)
+  buf[pos + 1] = byte((v shr 48) and 0xFF)
+  buf[pos + 2] = byte((v shr 40) and 0xFF)
+  buf[pos + 3] = byte((v shr 32) and 0xFF)
+  buf[pos + 4] = byte((v shr 24) and 0xFF)
+  buf[pos + 5] = byte((v shr 16) and 0xFF)
+  buf[pos + 6] = byte((v shr 8) and 0xFF)
+  buf[pos + 7] = byte(v and 0xFF)
+
 proc toPgParamInline*(v: int16): PgParamInline =
   result.oid = OidInt2
   result.format = 1
   result.len = 2
-  let be = toBE16(v)
-  result.inlineBuf[0] = be[0]
-  result.inlineBuf[1] = be[1]
+  result.inlineBuf.writeBE16(0, v)
 
 proc toPgParamInline*(v: int32): PgParamInline =
   result.oid = OidInt4
   result.format = 1
   result.len = 4
-  let be = toBE32(v)
-  result.inlineBuf[0] = be[0]
-  result.inlineBuf[1] = be[1]
-  result.inlineBuf[2] = be[2]
-  result.inlineBuf[3] = be[3]
+  result.inlineBuf.writeBE32(0, v)
 
 proc toPgParamInline*(v: int64): PgParamInline =
   result.oid = OidInt8
   result.format = 1
   result.len = 8
-  let be = toBE64(v)
-  for i in 0 ..< 8:
-    result.inlineBuf[i] = be[i]
+  result.inlineBuf.writeBE64(0, v)
 
 proc toPgParamInline*(v: int): PgParamInline =
   toPgParamInline(int64(v))
@@ -36,19 +48,13 @@ proc toPgParamInline*(v: float32): PgParamInline =
   result.oid = OidFloat4
   result.format = 1
   result.len = 4
-  let be = toBE32(cast[int32](v))
-  result.inlineBuf[0] = be[0]
-  result.inlineBuf[1] = be[1]
-  result.inlineBuf[2] = be[2]
-  result.inlineBuf[3] = be[3]
+  result.inlineBuf.writeBE32(0, cast[int32](v))
 
 proc toPgParamInline*(v: float64): PgParamInline =
   result.oid = OidFloat8
   result.format = 1
   result.len = 8
-  let be = toBE64(cast[int64](v))
-  for i in 0 ..< 8:
-    result.inlineBuf[i] = be[i]
+  result.inlineBuf.writeBE64(0, cast[int64](v))
 
 proc toPgParamInline*(v: bool): PgParamInline =
   result.oid = OidBool
@@ -98,9 +104,7 @@ proc toPgParamInline*(v: PgMoney): PgParamInline =
   result.oid = OidMoney
   result.format = 1
   result.len = 8
-  let be = toBE64(v.amount)
-  for i in 0 ..< 8:
-    result.inlineBuf[i] = be[i]
+  result.inlineBuf.writeBE64(0, v.amount)
 
 proc toPgParamInline*[T](v: Option[T]): PgParamInline =
   if v.isSome:
@@ -263,25 +267,14 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[seq[byte]]): seq[byte] =
         newException(PgError, "Array element too large for PostgreSQL binary format")
     dataSize += 4 + e.len
   result = newSeq[byte](headerSize + dataSize)
-  # ndim = 1
-  let ndim = toBE32(1'i32)
-  copyMem(addr result[0], addr ndim[0], 4)
-  # has_null = 0
-  let hasNull = toBE32(0'i32)
-  copyMem(addr result[4], addr hasNull[0], 4)
-  # elem_oid
-  let oid = toBE32(elemOid)
-  copyMem(addr result[8], addr oid[0], 4)
-  # dim_len
-  let dimLen = toBE32(int32(elements.len))
-  copyMem(addr result[12], addr dimLen[0], 4)
-  # lower_bound = 1
-  let lb = toBE32(1'i32)
-  copyMem(addr result[16], addr lb[0], 4)
+  result.writeBE32(0, 1'i32) # ndim
+  result.writeBE32(4, 0'i32) # has_null
+  result.writeBE32(8, elemOid) # elem_oid
+  result.writeBE32(12, int32(elements.len)) # dim_len
+  result.writeBE32(16, 1'i32) # lower_bound
   var pos = headerSize
   for e in elements:
-    let eLen = toBE32(int32(e.len))
-    copyMem(addr result[pos], addr eLen[0], 4)
+    result.writeBE32(pos, int32(e.len))
     pos += 4
     if e.len > 0:
       copyMem(addr result[pos], addr e[0], e.len)
@@ -308,26 +301,19 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[Option[seq[byte]]]): seq[b
           newException(PgError, "Array element too large for PostgreSQL binary format")
       dataSize += 4 + ev.len
   result = newSeq[byte](headerSize + dataSize)
-  let ndim = toBE32(1'i32)
-  copyMem(addr result[0], addr ndim[0], 4)
-  let hasNull = toBE32(if anyNull: 1'i32 else: 0'i32)
-  copyMem(addr result[4], addr hasNull[0], 4)
-  let oid = toBE32(elemOid)
-  copyMem(addr result[8], addr oid[0], 4)
-  let dimLen = toBE32(int32(elements.len))
-  copyMem(addr result[12], addr dimLen[0], 4)
-  let lb = toBE32(1'i32)
-  copyMem(addr result[16], addr lb[0], 4)
+  result.writeBE32(0, 1'i32) # ndim
+  result.writeBE32(4, if anyNull: 1'i32 else: 0'i32) # has_null
+  result.writeBE32(8, elemOid) # elem_oid
+  result.writeBE32(12, int32(elements.len)) # dim_len
+  result.writeBE32(16, 1'i32) # lower_bound
   var pos = headerSize
   for e in elements:
     if e.isNone:
-      let eLen = toBE32(-1'i32)
-      copyMem(addr result[pos], addr eLen[0], 4)
+      result.writeBE32(pos, -1'i32)
       pos += 4
     else:
       let ev = e.get
-      let eLen = toBE32(int32(ev.len))
-      copyMem(addr result[pos], addr eLen[0], 4)
+      result.writeBE32(pos, int32(ev.len))
       pos += 4
       if ev.len > 0:
         copyMem(addr result[pos], addr ev[0], ev.len)
@@ -337,15 +323,9 @@ proc encodeBinaryArrayEmpty*(elemOid: int32): seq[byte] =
   ## Encode an empty 1-dimensional PostgreSQL binary array.
   ## ndim=0, has_null=0, elem_oid
   result = newSeq[byte](12)
-  # ndim = 0
-  let ndim = toBE32(0'i32)
-  copyMem(addr result[0], addr ndim[0], 4)
-  # has_null = 0
-  let hasNull = toBE32(0'i32)
-  copyMem(addr result[4], addr hasNull[0], 4)
-  # elem_oid
-  let oid = toBE32(elemOid)
-  copyMem(addr result[8], addr oid[0], 4)
+  result.writeBE32(0, 0'i32) # ndim
+  result.writeBE32(4, 0'i32) # has_null
+  result.writeBE32(8, elemOid) # elem_oid
 
 proc toPgParam*(v: seq[int16]): PgParam =
   if v.len == 0:
@@ -650,22 +630,17 @@ proc toPgBinaryParam*(v: PgTimeTz): PgParam =
   data.add(@(toBE32(pgOffset)))
   PgParam(oid: OidTimeTz, format: 1, value: some(data))
 
-proc putBE16(buf: var seq[byte], off: int, v: int16) =
-  let b = toBE16(v)
-  buf[off] = b[0]
-  buf[off + 1] = b[1]
-
 proc encodeNumericBinary*(v: PgNumeric): seq[byte] =
   ## Encode PgNumeric as PostgreSQL binary numeric format.
   let ndigits = int16(v.digits.len)
   let signVal = cast[int16](v.sign.uint16)
   result = newSeq[byte](8 + ndigits.int * 2)
-  result.putBE16(0, ndigits)
-  result.putBE16(2, v.weight)
-  result.putBE16(4, signVal)
-  result.putBE16(6, v.dscale)
+  result.writeBE16(0, ndigits)
+  result.writeBE16(2, v.weight)
+  result.writeBE16(4, signVal)
+  result.writeBE16(6, v.dscale)
   for i in 0 ..< ndigits.int:
-    result.putBE16(8 + i * 2, v.digits[i])
+    result.writeBE16(8 + i * 2, v.digits[i])
 
 proc toPgBinaryParam*(v: PgNumeric): PgParam =
   PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
@@ -682,12 +657,9 @@ proc toPgBinaryParam*(v: PgUuid): PgParam =
 
 proc toPgBinaryParam*(v: PgInterval): PgParam =
   var data = newSeq[byte](16)
-  let usBytes = toBE64(v.microseconds)
-  copyMem(addr data[0], addr usBytes[0], 8)
-  let dayBytes = toBE32(v.days)
-  copyMem(addr data[8], addr dayBytes[0], 4)
-  let monBytes = toBE32(v.months)
-  copyMem(addr data[12], addr monBytes[0], 4)
+  data.writeBE64(0, v.microseconds)
+  data.writeBE32(8, v.days)
+  data.writeBE32(12, v.months)
   PgParam(oid: OidInterval, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgInet): PgParam =
@@ -765,9 +737,7 @@ proc toPgBinaryParam*(v: PgXml): PgParam =
 proc toPgBinaryParam*(v: PgBit): PgParam =
   ## Binary format: 4-byte bit count (big-endian) + packed bit data.
   var data = newSeq[byte](4 + v.data.len)
-  let beNbits = toBE32(v.nbits)
-  for i in 0 ..< 4:
-    data[i] = beNbits[i]
+  data.writeBE32(0, v.nbits)
   for i in 0 ..< v.data.len:
     data[4 + i] = v.data[i]
   PgParam(oid: OidVarbit, format: 1, value: some(data))
@@ -887,10 +857,8 @@ proc toPgParam*(v: seq[JsonNode]): PgParam =
 proc encodePointBinary*(p: PgPoint): seq[byte] =
   ## Encode a point as 16 bytes (two float64 big-endian).
   result = newSeq[byte](16)
-  let xBytes = toBE64(cast[int64](p.x))
-  copyMem(addr result[0], addr xBytes[0], 8)
-  let yBytes = toBE64(cast[int64](p.y))
-  copyMem(addr result[8], addr yBytes[0], 8)
+  result.writeBE64(0, cast[int64](p.x))
+  result.writeBE64(8, cast[int64](p.y))
 
 proc toPgBinaryParam*(v: PgPoint): PgParam =
   ## Binary format: 16 bytes (two float64 big-endian).
@@ -899,12 +867,9 @@ proc toPgBinaryParam*(v: PgPoint): PgParam =
 proc toPgBinaryParam*(v: PgLine): PgParam =
   ## Binary format: 24 bytes (three float64 big-endian: A, B, C).
   var data = newSeq[byte](24)
-  let aBytes = toBE64(cast[int64](v.a))
-  copyMem(addr data[0], addr aBytes[0], 8)
-  let bBytes = toBE64(cast[int64](v.b))
-  copyMem(addr data[8], addr bBytes[0], 8)
-  let cBytes = toBE64(cast[int64](v.c))
-  copyMem(addr data[16], addr cBytes[0], 8)
+  data.writeBE64(0, cast[int64](v.a))
+  data.writeBE64(8, cast[int64](v.b))
+  data.writeBE64(16, cast[int64](v.c))
   PgParam(oid: OidLine, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgLseg): PgParam =
@@ -929,8 +894,7 @@ proc toPgBinaryParam*(v: PgPath): PgParam =
   ## Binary format: closed(1) + npts(4) + points(npts \* 16).
   var data = newSeq[byte](1 + 4 + v.points.len * 16)
   data[0] = if v.closed: 1'u8 else: 0'u8
-  let npts = toBE32(int32(v.points.len))
-  copyMem(addr data[1], addr npts[0], 4)
+  data.writeBE32(1, int32(v.points.len))
   for i, p in v.points:
     let pb = encodePointBinary(p)
     copyMem(addr data[5 + i * 16], addr pb[0], 16)
@@ -939,8 +903,7 @@ proc toPgBinaryParam*(v: PgPath): PgParam =
 proc toPgBinaryParam*(v: PgPolygon): PgParam =
   ## Binary format: npts(4) + points(npts \* 16).
   var data = newSeq[byte](4 + v.points.len * 16)
-  let npts = toBE32(int32(v.points.len))
-  copyMem(addr data[0], addr npts[0], 4)
+  data.writeBE32(0, int32(v.points.len))
   for i, p in v.points:
     let pb = encodePointBinary(p)
     copyMem(addr data[4 + i * 16], addr pb[0], 16)
@@ -951,8 +914,7 @@ proc toPgBinaryParam*(v: PgCircle): PgParam =
   var data = newSeq[byte](24)
   let cp = encodePointBinary(v.center)
   copyMem(addr data[0], addr cp[0], 16)
-  let rBytes = toBE64(cast[int64](v.radius))
-  copyMem(addr data[16], addr rBytes[0], 8)
+  data.writeBE64(16, cast[int64](v.radius))
   PgParam(oid: OidCircle, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: JsonNode): PgParam =
@@ -1007,26 +969,22 @@ proc encodeHstoreBinary*(v: PgHstore): seq[byte] =
     if val.isSome:
       size += val.get.len
   result = newSeq[byte](size)
-  let np = toBE32(int32(v.len))
-  copyMem(addr result[0], addr np[0], 4)
+  result.writeBE32(0, int32(v.len))
   var pos = 4
   for k, val in v.pairs:
-    let kLen = toBE32(int32(k.len))
-    copyMem(addr result[pos], addr kLen[0], 4)
+    result.writeBE32(pos, int32(k.len))
     pos += 4
     if k.len > 0:
       copyMem(addr result[pos], addr k[0], k.len)
       pos += k.len
     if val.isSome:
-      let vLen = toBE32(int32(val.get.len))
-      copyMem(addr result[pos], addr vLen[0], 4)
+      result.writeBE32(pos, int32(val.get.len))
       pos += 4
       if val.get.len > 0:
         copyMem(addr result[pos], addr val.get[0], val.get.len)
         pos += val.get.len
     else:
-      let nullLen = toBE32(-1'i32)
-      copyMem(addr result[pos], addr nullLen[0], 4)
+      result.writeBE32(pos, -1'i32)
       pos += 4
 
 proc toPgBinaryParam*(v: PgHstore, oid: int32): PgParam =
@@ -1206,36 +1164,22 @@ proc writeParamValue*(buf: var seq[byte], v: int32) =
   buf.addInt32(4'i32)
   let o = buf.len
   buf.setLen(o + 4)
-  buf[o] = byte((v shr 24) and 0xFF)
-  buf[o + 1] = byte((v shr 16) and 0xFF)
-  buf[o + 2] = byte((v shr 8) and 0xFF)
-  buf[o + 3] = byte(v and 0xFF)
+  buf.writeBE32(o, v)
 
 proc writeParamValue*(buf: var seq[byte], v: int64) =
   buf.addInt32(8'i32)
   let o = buf.len
   buf.setLen(o + 8)
-  buf[o] = byte((v shr 56) and 0xFF)
-  buf[o + 1] = byte((v shr 48) and 0xFF)
-  buf[o + 2] = byte((v shr 40) and 0xFF)
-  buf[o + 3] = byte((v shr 32) and 0xFF)
-  buf[o + 4] = byte((v shr 24) and 0xFF)
-  buf[o + 5] = byte((v shr 16) and 0xFF)
-  buf[o + 6] = byte((v shr 8) and 0xFF)
-  buf[o + 7] = byte(v and 0xFF)
+  buf.writeBE64(o, v)
 
 proc writeParamValue*(buf: var seq[byte], v: int) =
   writeParamValue(buf, int64(v))
 
 proc writeParamValue*(buf: var seq[byte], v: float32) =
-  let bits = cast[int32](v)
   buf.addInt32(4'i32)
   let o = buf.len
   buf.setLen(o + 4)
-  buf[o] = byte((bits shr 24) and 0xFF)
-  buf[o + 1] = byte((bits shr 16) and 0xFF)
-  buf[o + 2] = byte((bits shr 8) and 0xFF)
-  buf[o + 3] = byte(bits and 0xFF)
+  buf.writeBE32(o, cast[int32](v))
 
 proc writeParamValue*(buf: var seq[byte], v: float64) =
   let bits = cast[int64](v)
