@@ -51,10 +51,10 @@ proc toPgParamInline*(v: string): PgParamInline =
   if v.len == 0:
     discard
   elif v.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], addr v[0], v.len)
+    result.inlineBuf.writeBytesAt(0, v.toOpenArrayByte(0, v.high))
   else:
     result.overflow = newSeq[byte](v.len)
-    copyMem(addr result.overflow[0], addr v[0], v.len)
+    result.overflow.writeBytesAt(0, v.toOpenArrayByte(0, v.high))
 
 proc toPgParamInline*(v: seq[byte]): PgParamInline =
   result.oid = OidBytea
@@ -63,7 +63,7 @@ proc toPgParamInline*(v: seq[byte]): PgParamInline =
   if v.len == 0:
     discard
   elif v.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], addr v[0], v.len)
+    result.inlineBuf.writeBytesAt(0, v)
   else:
     result.overflow = v
 
@@ -77,10 +77,10 @@ proc toPgParamInline*(v: PgUuid): PgParamInline =
   if s.len == 0:
     discard
   elif s.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], addr s[0], s.len)
+    result.inlineBuf.writeBytesAt(0, s.toOpenArrayByte(0, s.high))
   else:
     result.overflow = newSeq[byte](s.len)
-    copyMem(addr result.overflow[0], addr s[0], s.len)
+    result.overflow.writeBytesAt(0, s.toOpenArrayByte(0, s.high))
 
 proc toPgParamInline*(v: PgMoney): PgParamInline =
   result.oid = OidMoney
