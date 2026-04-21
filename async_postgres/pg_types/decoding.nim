@@ -74,6 +74,8 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric =
   PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
 
 proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
+  if data.len < 8:
+    raise newException(PgTypeError, "Binary timestamp data too short: " & $data.len)
   let pgUs = fromBE64(data)
   let unixUs = pgUs + pgEpochUnix * 1_000_000
   var unixSec = unixUs div 1_000_000
@@ -84,12 +86,21 @@ proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
   initTime(unixSec, int(fracUs * 1000)).utc()
 
 proc decodeBinaryDate*(data: openArray[byte]): DateTime =
+  if data.len < 4:
+    raise newException(PgTypeError, "Binary date data too short: " & $data.len)
   let pgDays = fromBE32(data)
   let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
   initTime(unixSec, 0).utc()
 
+const pgTimeMaxUs = 86_400_000_000'i64
+  ## PostgreSQL time-of-day is microseconds since midnight in [0, 86_400_000_000).
+
 proc decodeBinaryTime*(data: openArray[byte]): PgTime =
+  if data.len < 8:
+    raise newException(PgTypeError, "Binary time data too short: " & $data.len)
   let us = fromBE64(data)
+  if us < 0 or us >= pgTimeMaxUs:
+    raise newException(PgTypeError, "Binary time: microseconds out of range " & $us)
   let hours = int32(us div 3_600_000_000)
   let rem1 = us mod 3_600_000_000
   let minutes = int32(rem1 div 60_000_000)
@@ -99,7 +110,11 @@ proc decodeBinaryTime*(data: openArray[byte]): PgTime =
   PgTime(hour: hours, minute: minutes, second: seconds, microsecond: microseconds)
 
 proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz =
+  if data.len < 12:
+    raise newException(PgTypeError, "Binary timetz data too short: " & $data.len)
   let us = fromBE64(data)
+  if us < 0 or us >= pgTimeMaxUs:
+    raise newException(PgTypeError, "Binary timetz: microseconds out of range " & $us)
   let pgOffset = fromBE32(data.toOpenArray(8, 11))
   let hours = int32(us div 3_600_000_000)
   let rem1 = us mod 3_600_000_000
@@ -122,16 +137,22 @@ proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: u
   ##   1 byte: is_cidr (0 or 1)
   ##   1 byte: addrlen (4 or 16)
   ##   N bytes: address
+  if data.len < 4:
+    raise newException(PgTypeError, "Binary inet data too short: " & $data.len)
   let family = data[0]
   let bits = data[1]
   # data[2] = is_cidr, ignored for decoding
   # data[3] = addrlen
   if family == 2:
+    if data.len < 8:
+      raise newException(PgTypeError, "Binary inet IPv4 data too short: " & $data.len)
     var ip = IpAddress(family: IpAddressFamily.IPv4)
     for i in 0 ..< 4:
       ip.address_v4[i] = data[4 + i]
     (ip, bits)
   else:
+    if data.len < 20:
+      raise newException(PgTypeError, "Binary inet IPv6 data too short: " & $data.len)
     var ip = IpAddress(family: IpAddressFamily.IPv6)
     for i in 0 ..< 16:
       ip.address_v6[i] = data[4 + i]
@@ -139,6 +160,8 @@ proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: u
 
 proc decodePointBinary*(data: openArray[byte], off: int): PgPoint =
   ## Decode a point from 16 bytes at offset.
+  if off < 0 or off + 16 > data.len:
+    raise newException(PgTypeError, "Binary point data truncated at offset " & $off)
   let xBits = uint64(
     (uint64(data[off]) shl 56) or (uint64(data[off + 1]) shl 48) or
       (uint64(data[off + 2]) shl 40) or (uint64(data[off + 3]) shl 32) or
@@ -175,6 +198,11 @@ proc decodeBinaryArray*(
   let dimLen = int(fromBE32(data.toOpenArray(12, 15)))
   if dimLen < 0:
     raise newException(PgTypeError, "Binary array: invalid dimension length " & $dimLen)
+  # Each element carries at least a 4-byte length prefix after the 20-byte
+  # header, so dimLen cannot exceed (data.len - 20) div 4. This guard stops a
+  # crafted header from triggering a multi-GB allocation on malformed input.
+  if dimLen > (data.len - 20) div 4:
+    raise newException(PgTypeError, "Binary array: dimension length exceeds data")
   # lower_bound at offset 16, ignored
   result.elements = newSeq[tuple[off: int, len: int]](dimLen)
   var pos = 20
@@ -205,6 +233,10 @@ proc decodeBinaryComposite*(
   if numFields < 0:
     raise
       newException(PgTypeError, "Binary composite: invalid field count " & $numFields)
+  # Each field carries at least an 8-byte header (oid + len) after the 4-byte
+  # count, so numFields cannot exceed (data.len - 4) div 8.
+  if numFields > (data.len - 4) div 8:
+    raise newException(PgTypeError, "Binary composite: field count exceeds data")
   result = newSeq[tuple[oid: int32, off: int, len: int]](numFields)
   var pos = 4
   for i in 0 ..< numFields:
@@ -479,6 +511,10 @@ proc decodeBinaryTsVector*(data: openArray[byte]): string =
   if nlexemes < 0:
     raise
       newException(PgTypeError, "tsvector binary: invalid lexeme count " & $nlexemes)
+  # Each lexeme needs at least a null terminator (1 byte) + 2-byte position
+  # count after the 4-byte count, so nlexemes cannot exceed (data.len - 4) div 3.
+  if nlexemes > (data.len - 4) div 3:
+    raise newException(PgTypeError, "tsvector binary: lexeme count exceeds data")
   var pos = 4
   var parts = newSeq[string](nlexemes)
   const weightChars = ['D', 'C', 'B', 'A']

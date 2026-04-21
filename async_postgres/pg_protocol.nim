@@ -757,6 +757,8 @@ proc parseDataRow(body: openArray[byte]): BackendMessage =
     raise newException(ProtocolError, "DataRow message too short")
   result = BackendMessage(kind: bmkDataRow)
   let numCols = decodeInt16(body, 0)
+  if numCols < 0:
+    raise newException(ProtocolError, "DataRow: invalid column count " & $numCols)
   result.columns = newSeq[Option[seq[byte]]](numCols)
   var offset = 2
   for i in 0 ..< numCols:
@@ -819,6 +821,9 @@ proc parseRowDescription(body: openArray[byte]): BackendMessage =
     raise newException(ProtocolError, "RowDescription message too short")
   result = BackendMessage(kind: bmkRowDescription)
   let numFields = decodeInt16(body, 0)
+  if numFields < 0:
+    raise
+      newException(ProtocolError, "RowDescription: invalid field count " & $numFields)
   result.fields = newSeq[FieldDescription](numFields)
   var offset = 2
   for i in 0 ..< numFields:
@@ -856,6 +861,10 @@ proc parseParameterDescription(body: openArray[byte]): BackendMessage =
     raise newException(ProtocolError, "ParameterDescription too short")
   result = BackendMessage(kind: bmkParameterDescription)
   let numParams = decodeInt16(body, 0)
+  if numParams < 0:
+    raise newException(
+      ProtocolError, "ParameterDescription: invalid param count " & $numParams
+    )
   result.paramTypeOids = newSeq[int32](numParams)
   var offset = 2
   for i in 0 ..< numParams:
@@ -873,6 +882,8 @@ proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
     result = BackendMessage(kind: bmkCopyOutResponse)
   result.copyFormat = if body[0] == 0: cfText else: cfBinary
   let numCols = decodeInt16(body, 1)
+  if numCols < 0:
+    raise newException(ProtocolError, "CopyResponse: invalid column count " & $numCols)
   result.copyColumnFormats = newSeq[int16](numCols)
   var offset = 3
   for i in 0 ..< numCols:
@@ -887,6 +898,9 @@ proc parseCopyBothResponse(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkCopyBothResponse)
   result.copyFormat = if body[0] == 0: cfText else: cfBinary
   let numCols = decodeInt16(body, 1)
+  if numCols < 0:
+    raise
+      newException(ProtocolError, "CopyBothResponse: invalid column count " & $numCols)
   result.copyColumnFormats = newSeq[int16](numCols)
   var offset = 3
   for i in 0 ..< numCols:
@@ -1010,6 +1024,8 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   if body.len < 2:
     raise newException(ProtocolError, "DataRow message too short")
   let numCols = decodeInt16(body, 0)
+  if numCols < 0:
+    raise newException(ProtocolError, "DataRow: invalid column count " & $numCols)
   # Pre-extend cellIndex for this row
   let cellBase = rd.cellIndex.len
   rd.cellIndex.setLen(cellBase + int(numCols) * 2)
