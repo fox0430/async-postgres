@@ -8,9 +8,9 @@
 ## transitioned to `csClosed` as appropriate, so pools never recycle a
 ## broken connection.
 
-import std/[unittest, importutils, strutils]
+import std/[unittest, importutils]
 
-import ../async_postgres/[async_backend, pg_client, pg_protocol, pg_types]
+import ../async_postgres/[async_backend, pg_client, pg_types]
 import ../async_postgres/pg_connection {.all.}
 
 privateAccess(PgConnection)

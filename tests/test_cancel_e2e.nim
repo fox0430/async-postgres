@@ -7,7 +7,7 @@
 
 import std/[unittest, importutils, strutils]
 
-import ../async_postgres/[async_backend, pg_client, pg_protocol, pg_types]
+import ../async_postgres/[async_backend, pg_client, pg_types]
 import ../async_postgres/pg_connection {.all.}
 
 privateAccess(PgConnection)
