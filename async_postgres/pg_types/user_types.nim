@@ -1,9 +1,7 @@
 import std/[options, macros, strutils, typetraits]
 
 import ../pg_protocol
-import ./core
-import ./decoding
-import ./accessors
+import core, decoding, encoding, accessors
 
 # User-defined enum type support
 #
@@ -262,25 +260,20 @@ proc encodeBinaryComposite*(
     if f.data.isSome:
       size += f.data.get.len
   result = newSeq[byte](size)
-  let nf = toBE32(int32(fields.len))
-  copyMem(addr result[0], addr nf[0], 4)
+  result.writeBE32(0, int32(fields.len))
   var pos = 4
   for f in fields:
-    let oid = toBE32(f.oid)
-    copyMem(addr result[pos], addr oid[0], 4)
+    result.writeBE32(pos, f.oid)
     pos += 4
     if f.data.isNone:
-      let nl = toBE32(-1'i32)
-      copyMem(addr result[pos], addr nl[0], 4)
+      result.writeBE32(pos, -1'i32)
       pos += 4
     else:
       let data = f.data.get
-      let dl = toBE32(int32(data.len))
-      copyMem(addr result[pos], addr dl[0], 4)
+      result.writeBE32(pos, int32(data.len))
       pos += 4
-      if data.len > 0:
-        copyMem(addr result[pos], addr data[0], data.len)
-        pos += data.len
+      result.writeBytesAt(pos, data)
+      pos += data.len
 
 proc compositeFieldToText(val: string): string =
   ## Escape a composite field value for text format output.
