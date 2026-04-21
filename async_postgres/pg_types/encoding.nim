@@ -28,6 +28,11 @@ template writeBytesAt*(dst: var openArray[byte], pos: int, src: openArray[byte])
   if src.len > 0:
     copyMem(addr dst[pos], addr src[0], src.len)
 
+template appendBytes*(buf: var seq[byte], src: openArray[byte]) =
+  ## Append src bytes to the end of buf. No-op when src is empty.
+  if src.len > 0:
+    buf.add(src)
+
 proc toPgParamInline*(v: int16): PgParamInline =
   result.oid = OidInt2
   result.format = 1
@@ -1118,10 +1123,7 @@ proc addBind*(
     else:
       let data = p.value.get
       buf.addInt32(int32(data.len))
-      if data.len > 0:
-        let oldLen = buf.len
-        buf.setLen(oldLen + data.len)
-        copyMem(addr buf[oldLen], addr data[0], data.len)
+      buf.appendBytes(data)
   # Result format codes
   buf.addInt16(int16(resultFormats.len))
   for f in resultFormats:
@@ -1196,16 +1198,11 @@ proc writeParamValue*(buf: var seq[byte], v: bool) =
 proc writeParamValue*(buf: var seq[byte], v: string) =
   buf.addInt32(int32(v.len))
   if v.len > 0:
-    let o = buf.len
-    buf.setLen(o + v.len)
-    copyMem(addr buf[o], addr v[0], v.len)
+    buf.appendBytes(v.toOpenArrayByte(0, v.high))
 
 proc writeParamValue*(buf: var seq[byte], v: seq[byte]) =
   buf.addInt32(int32(v.len))
-  if v.len > 0:
-    let o = buf.len
-    buf.setLen(o + v.len)
-    copyMem(addr buf[o], addr v[0], v.len)
+  buf.appendBytes(v)
 
 proc writeParamValue*(buf: var seq[byte], v: PgNumeric) =
   writeParamValue(buf, $v)
