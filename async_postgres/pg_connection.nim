@@ -856,12 +856,21 @@ proc nextMessage*(
   ## Returns none if the buffer doesn't contain a complete message.
   ## Notification/Notice messages are dispatched internally.
   ## DataRow messages are counted (if rowCount != nil) and consumed.
+  ##
+  ## On `ProtocolError` the protocol stream is desynchronised — the connection
+  ## is transitioned to `csClosed` before re-raising so that it is never
+  ## reused (in particular, by the connection pool).
   var pos = conn.recvBufStart
   while true:
     var consumed: int
-    let res = parseBackendMessage(
-      conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
-    )
+    let res =
+      try:
+        parseBackendMessage(
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
+        )
+      except ProtocolError:
+        conn.state = csClosed
+        raise
     if res.state == psIncomplete:
       return none(BackendMessage)
     pos += consumed
