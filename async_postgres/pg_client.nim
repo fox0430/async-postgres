@@ -2564,8 +2564,7 @@ proc executeImpl(
     # chronos drains the send Future in the background while we descend into
     # the receive loop. The outer try/except below owns sendFut's lifetime:
     # it drains sendFut on the normal path (propagating any stored write
-    # error) and cancels it on any abnormal exit so the Future never leaks
-    # and `conn.sendBuf` is never mutated while a write still borrows it.
+    # error) and cancels it on any abnormal exit so the Future never leaks.
     var sendFut = conn.sendBufMsg()
   else:
     await conn.sendBufMsg()
@@ -2692,14 +2691,12 @@ proc executeImpl(
         await conn.fillRecvBuf(timeout)
 
     when hasChronos:
-      # Normal path: drain sendFut to propagate any stored write error and
-      # release the borrow on conn.sendBuf.
+      # Normal path: drain sendFut to propagate any stored write error.
       await sendFut
   except CatchableError as e:
     when hasChronos:
       # Abnormal path (recv error, cancellation, failed stored write):
-      # ensure sendFut never escapes as an unhandled Future and that no
-      # in-flight write still holds addr conn.sendBuf[0].
+      # ensure sendFut never escapes as an unhandled Future.
       if not sendFut.finished:
         try:
           await cancelAndWait(sendFut)
@@ -2945,8 +2942,7 @@ proc executeIsolatedImpl(
       await sendFut
   except CatchableError as e:
     when hasChronos:
-      # Abnormal path: cancel or drain sendFut so the Future never leaks
-      # and no in-flight write still borrows conn.sendBuf.
+      # Abnormal path: cancel or drain sendFut so the Future never leaks.
       if not sendFut.finished:
         try:
           await cancelAndWait(sendFut)

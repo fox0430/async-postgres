@@ -905,14 +905,15 @@ proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
       await conn.socket.sendRawBytes(data)
 
 proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
-  ## Send conn.sendBuf to the server without copying the seq.
-  ## Safe because conn.state == csBusy prevents concurrent access to sendBuf.
+  ## Send conn.sendBuf to the server.
+  ## The transport receives its own copy of the buffer, so conn.sendBuf is safe
+  ## to mutate while the returned Future is still pending.
   when hasChronos:
     if conn.sendBuf.len > 0:
-      await conn.writer.write(addr conn.sendBuf[0], conn.sendBuf.len)
+      await conn.writer.write(conn.sendBuf)
   elif hasAsyncDispatch:
     if conn.sendBuf.len > 0:
-      await conn.socket.sendRawData(addr conn.sendBuf[0], conn.sendBuf.len)
+      await conn.socket.sendRawBytes(conn.sendBuf)
 
 proc closeTransport(conn: PgConnection) {.async.} =
   ## Close transport resources without sending Terminate.
