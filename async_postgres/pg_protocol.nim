@@ -1,5 +1,7 @@
 import std/[options, tables]
 
+import pg_bytes
+
 type
   ProtocolError* = object of CatchableError
     ## Raised on PostgreSQL wire protocol violations.
@@ -373,7 +375,7 @@ proc addCString*(buf: var seq[byte], s: string) =
   let oldLen = buf.len
   buf.setLen(oldLen + s.len + 1)
   if s.len > 0:
-    copyMem(addr buf[oldLen], addr s[0], s.len)
+    buf.writeBytesAt(oldLen, s.toOpenArrayByte(0, s.high))
   buf[oldLen + s.len] = 0'u8
 
 proc decodeInt16*(buf: openArray[byte], offset: int): int16 =
@@ -404,9 +406,7 @@ proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   if i >= buf.len:
     raise newException(ProtocolError, "decodeCString: missing null terminator")
   let slen = i - offset
-  var s = newString(slen)
-  if slen > 0:
-    copyMem(addr s[0], addr buf[offset], slen)
+  let s = readString(buf, offset, slen)
   inc i # skip null terminator
   result = (s, i - offset)
 
@@ -477,7 +477,7 @@ proc encodeQuery*(sql: string): seq[byte] =
 proc addFixedMsg(buf: var seq[byte], msg: array[5, byte]) {.inline.} =
   let oldLen = buf.len
   buf.setLen(oldLen + 5)
-  copyMem(addr buf[oldLen], addr msg[0], 5)
+  buf.writeBytesAt(oldLen, msg)
 
 proc addParse*(
     buf: var seq[byte],
@@ -522,10 +522,7 @@ proc addBind*(
     else:
       let data = v.get
       buf.addInt32(int32(data.len))
-      if data.len > 0:
-        let oldLen = buf.len
-        buf.setLen(oldLen + data.len)
-        copyMem(addr buf[oldLen], addr data[0], data.len)
+      buf.appendBytes(data)
   # Result format codes
   buf.addInt16(int16(resultFormats.len))
   for f in resultFormats:
@@ -578,7 +575,7 @@ proc addBindRaw*(
           )
         let oldLen = buf.len
         buf.setLen(oldLen + r.len)
-        copyMem(addr buf[oldLen], addr paramData[r.off], r.len)
+        buf.writeBytesAt(oldLen, paramData.toOpenArray(r.off, r.off + r.len - 1))
   buf.addInt16(int16(resultFormats.len))
   for f in resultFormats:
     buf.addInt16(f)
@@ -684,8 +681,7 @@ proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
   buf[oldLen + 2] = byte((msgLen shr 16) and 0xFF)
   buf[oldLen + 3] = byte((msgLen shr 8) and 0xFF)
   buf[oldLen + 4] = byte(msgLen and 0xFF)
-  if data.len > 0:
-    copyMem(addr buf[oldLen + 5], addr data[0], data.len)
+  buf.writeBytesAt(oldLen + 5, data)
 
 proc encodeCopyDone*(): seq[byte] =
   ## Encode a standalone CopyDone message.
@@ -973,7 +969,7 @@ proc clone*(row: Row): Row =
       rd.cellIndex[i * 2] = 0'i32
       rd.cellIndex[i * 2 + 1] = 0'i32
     else:
-      copyMem(addr rd.buf[pos], addr src.buf[srcOff], int(clen))
+      rd.buf.writeBytesAt(pos, src.buf.toOpenArray(srcOff, srcOff + int(clen) - 1))
       rd.cellIndex[i * 2] = int32(pos)
       rd.cellIndex[i * 2 + 1] = clen
       pos += int(clen)
@@ -1016,7 +1012,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   let dataLen = body.len - 2
   rd.buf.setLen(bufBase + dataLen)
   if dataLen > 0:
-    copyMem(addr rd.buf[bufBase], addr body[2], dataLen)
+    rd.buf.writeBytesAt(bufBase, body.toOpenArray(2, 2 + dataLen - 1))
   # Walk the copied buffer to build cellIndex
   var pos = bufBase # current position in rd.buf
   let bufEnd = bufBase + dataLen
@@ -1164,9 +1160,7 @@ proc formatError*(fields: seq[ErrorField]): string =
 
 proc addCopyBinaryHeader*(buf: var seq[byte]) =
   ## Append the PostgreSQL binary COPY header (signature + flags + extension area).
-  let oldLen = buf.len
-  buf.setLen(oldLen + pgCopyBinaryHeader.len)
-  copyMem(addr buf[oldLen], addr pgCopyBinaryHeader[0], pgCopyBinaryHeader.len)
+  buf.appendBytes(pgCopyBinaryHeader)
 
 proc addCopyBinaryTrailer*(buf: var seq[byte]) =
   ## Append the binary COPY trailer (int16 = -1).
@@ -1214,18 +1208,13 @@ proc addCopyFieldBool*(buf: var seq[byte], val: bool) =
 proc addCopyFieldText*(buf: var seq[byte], val: openArray[byte]) =
   ## Append a raw byte field in binary COPY format.
   buf.addInt32(int32(val.len))
-  if val.len > 0:
-    let oldLen = buf.len
-    buf.setLen(oldLen + val.len)
-    copyMem(addr buf[oldLen], addr val[0], val.len)
+  buf.appendBytes(val)
 
 proc addCopyFieldString*(buf: var seq[byte], val: string) =
   ## Append a string field in binary COPY format.
   buf.addInt32(int32(val.len))
   if val.len > 0:
-    let oldLen = buf.len
-    buf.setLen(oldLen + val.len)
-    copyMem(addr buf[oldLen], addr val[0], val.len)
+    buf.appendBytes(val.toOpenArrayByte(0, val.high))
 
 # Replication protocol helpers
 
