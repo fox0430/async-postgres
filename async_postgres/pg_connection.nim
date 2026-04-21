@@ -698,7 +698,7 @@ else:
 
 const RecvBufSize = 131072 ## Size of the temporary read buffer for recv operations
 
-proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) =
+proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
   let notif = Notification(
     pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
   )
@@ -713,11 +713,16 @@ proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) =
     if droppedNow > 0 and conn.notifyOverflowCallback != nil:
       conn.notifyOverflowCallback(droppedNow)
     if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-      conn.notifyWaiter.complete()
+      # asyncdispatch's `Future.complete` has inferred effect `Exception`
+      # via the callback chain; swallow it to keep this proc `raises: []`.
+      try:
+        conn.notifyWaiter.complete()
+      except Exception:
+        discard
   if conn.notifyCallback != nil:
     conn.notifyCallback(notif)
 
-proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) =
+proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
   if conn.noticeCallback != nil:
     conn.noticeCallback(Notice(fields: msg.noticeFields))
 
@@ -851,17 +856,26 @@ proc fillRecvBuf*(
 
 proc nextMessage*(
     conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
-): Option[BackendMessage] =
+): Option[BackendMessage] {.raises: [ProtocolError].} =
   ## Synchronously parse the next message from the receive buffer.
   ## Returns none if the buffer doesn't contain a complete message.
   ## Notification/Notice messages are dispatched internally.
   ## DataRow messages are counted (if rowCount != nil) and consumed.
+  ##
+  ## On `ProtocolError` the protocol stream is desynchronised — the connection
+  ## is transitioned to `csClosed` before re-raising so that it is never
+  ## reused (in particular, by the connection pool).
   var pos = conn.recvBufStart
   while true:
     var consumed: int
-    let res = parseBackendMessage(
-      conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
-    )
+    let res =
+      try:
+        parseBackendMessage(
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
+        )
+      except ProtocolError as e:
+        conn.state = csClosed
+        raise e
     if res.state == psIncomplete:
       return none(BackendMessage)
     pos += consumed

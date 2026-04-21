@@ -1069,7 +1069,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
 
 proc parseBackendMessage*(
     buf: openArray[byte], consumed: var int, rowData: RowData = nil
-): ParseResult =
+): ParseResult {.raises: [ProtocolError].} =
   ## Parse a single backend message from `buf`.
   ## On success, sets `consumed` to the number of bytes used.
   ## The caller is responsible for discarding those bytes from the buffer.
