@@ -1,5 +1,6 @@
 import std/[json, options, times]
 
+import pg_protocol
 import pg_types/[core, encoding, decoding, accessors, user_types, ranges]
 
 export core, encoding, decoding, accessors, user_types, ranges
@@ -207,3 +208,11 @@ nameAccessor(getNumMultirangeArrayOpt, Option[seq[PgMultirange[PgNumeric]]])
 nameAccessor(getTsMultirangeArrayOpt, Option[seq[PgMultirange[DateTime]]])
 nameAccessor(getTsTzMultirangeArrayOpt, Option[seq[PgMultirange[DateTime]]])
 nameAccessor(getDateMultirangeArrayOpt, Option[seq[PgMultirange[DateTime]]])
+
+# Generic Option[T] dispatch: delegates to the bare `get(col, T)` plus a NULL
+# check, so every bare type overload automatically gains an Option counterpart.
+proc get*[T](row: Row, col: int, _: typedesc[Option[T]]): Option[T] =
+  if row.isNull(col):
+    none(T)
+  else:
+    some(row.get(col, T))
