@@ -1807,6 +1807,12 @@ proc get*(row: Row, col: int, T: typedesc[PgXml]): PgXml =
 proc get*(row: Row, col: int, T: typedesc[PgBit]): PgBit =
   row.getBit(col)
 
+proc get*(row: Row, col: int, T: typedesc[PgTime]): PgTime =
+  row.getTime(col)
+
+proc get*(row: Row, col: int, T: typedesc[PgTimeTz]): PgTimeTz =
+  row.getTimeTz(col)
+
 proc get*(row: Row, col: int, T: typedesc[PgHstore]): PgHstore =
   row.getHstore(col)
 
@@ -1856,6 +1862,9 @@ proc get*(row: Row, col: int, T: typedesc[seq[bool]]): seq[bool] =
 
 proc get*(row: Row, col: int, T: typedesc[seq[string]]): seq[string] =
   row.getStrArray(col)
+
+proc get*(row: Row, col: int, T: typedesc[seq[seq[byte]]]): seq[seq[byte]] =
+  row.getBytesArray(col)
 
 proc get*(row: Row, col: int, T: typedesc[seq[PgBit]]): seq[PgBit] =
   row.getBitArray(col)
@@ -1925,6 +1934,43 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgTsQuery]]): seq[PgTsQuery] =
 
 proc get*(row: Row, col: int, T: typedesc[seq[PgHstore]]): seq[PgHstore] =
   row.getHstoreArray(col)
+
+# Per-element Option array types
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[Option[int16]]]
+): seq[Option[int16]] =
+  row.getInt16ArrayElemOpt(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[Option[int32]]]
+): seq[Option[int32]] =
+  row.getIntArrayElemOpt(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[Option[int64]]]
+): seq[Option[int64]] =
+  row.getInt64ArrayElemOpt(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[Option[float32]]]
+): seq[Option[float32]] =
+  row.getFloat32ArrayElemOpt(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[Option[float64]]]
+): seq[Option[float64]] =
+  row.getFloatArrayElemOpt(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[Option[bool]]]
+): seq[Option[bool]] =
+  row.getBoolArrayElemOpt(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[Option[string]]]
+): seq[Option[string]] =
+  row.getStrArrayElemOpt(col)
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.

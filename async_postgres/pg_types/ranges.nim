@@ -1490,6 +1490,21 @@ proc get*(
   row.getNumMultirange(col)
 
 proc get*(
+    row: Row, col: int, T: typedesc[seq[PgRange[int32]]]
+): seq[PgRange[int32]] =
+  row.getInt4RangeArray(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[PgRange[int64]]]
+): seq[PgRange[int64]] =
+  row.getInt8RangeArray(col)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[PgRange[PgNumeric]]]
+): seq[PgRange[PgNumeric]] =
+  row.getNumRangeArray(col)
+
+proc get*(
     row: Row, col: int, T: typedesc[seq[PgMultirange[int32]]]
 ): seq[PgMultirange[int32]] =
   row.getInt4MultirangeArray(col)
