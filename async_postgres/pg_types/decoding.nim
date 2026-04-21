@@ -1,18 +1,9 @@
 import std/[options, strutils, tables, times, net]
 
+import ../pg_bytes
 import ./core
 
-proc readString*(src: openArray[byte], off, len: int): string =
-  ## Copy `len` bytes from src starting at off into a new string.
-  result = newString(len)
-  if len > 0:
-    copyMem(addr result[0], addr src[off], len)
-
-proc readBytes*(src: openArray[byte], off, len: int): seq[byte] =
-  ## Copy `len` bytes from src starting at off into a new seq[byte].
-  result = newSeq[byte](len)
-  if len > 0:
-    copyMem(addr result[0], addr src[off], len)
+export pg_bytes
 
 proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
   ## Decode PostgreSQL binary hstore format.
