@@ -1937,39 +1937,25 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgHstore]]): seq[PgHstore] =
 
 # Per-element Option array types
 
-proc get*(
-    row: Row, col: int, T: typedesc[seq[Option[int16]]]
-): seq[Option[int16]] =
+proc get*(row: Row, col: int, T: typedesc[seq[Option[int16]]]): seq[Option[int16]] =
   row.getInt16ArrayElemOpt(col)
 
-proc get*(
-    row: Row, col: int, T: typedesc[seq[Option[int32]]]
-): seq[Option[int32]] =
+proc get*(row: Row, col: int, T: typedesc[seq[Option[int32]]]): seq[Option[int32]] =
   row.getIntArrayElemOpt(col)
 
-proc get*(
-    row: Row, col: int, T: typedesc[seq[Option[int64]]]
-): seq[Option[int64]] =
+proc get*(row: Row, col: int, T: typedesc[seq[Option[int64]]]): seq[Option[int64]] =
   row.getInt64ArrayElemOpt(col)
 
-proc get*(
-    row: Row, col: int, T: typedesc[seq[Option[float32]]]
-): seq[Option[float32]] =
+proc get*(row: Row, col: int, T: typedesc[seq[Option[float32]]]): seq[Option[float32]] =
   row.getFloat32ArrayElemOpt(col)
 
-proc get*(
-    row: Row, col: int, T: typedesc[seq[Option[float64]]]
-): seq[Option[float64]] =
+proc get*(row: Row, col: int, T: typedesc[seq[Option[float64]]]): seq[Option[float64]] =
   row.getFloatArrayElemOpt(col)
 
-proc get*(
-    row: Row, col: int, T: typedesc[seq[Option[bool]]]
-): seq[Option[bool]] =
+proc get*(row: Row, col: int, T: typedesc[seq[Option[bool]]]): seq[Option[bool]] =
   row.getBoolArrayElemOpt(col)
 
-proc get*(
-    row: Row, col: int, T: typedesc[seq[Option[string]]]
-): seq[Option[string]] =
+proc get*(row: Row, col: int, T: typedesc[seq[Option[string]]]): seq[Option[string]] =
   row.getStrArrayElemOpt(col)
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
