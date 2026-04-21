@@ -1,37 +1,9 @@
 import std/[options, json, macros, strutils, tables, times, net]
 
-import ../pg_protocol
+import ../[pg_bytes, pg_protocol]
 import ./core
 
-template writeBE16*(buf: var openArray[byte], pos: int, v: int16) =
-  buf[pos] = byte((v shr 8) and 0xFF)
-  buf[pos + 1] = byte(v and 0xFF)
-
-template writeBE32*(buf: var openArray[byte], pos: int, v: int32) =
-  buf[pos] = byte((v shr 24) and 0xFF)
-  buf[pos + 1] = byte((v shr 16) and 0xFF)
-  buf[pos + 2] = byte((v shr 8) and 0xFF)
-  buf[pos + 3] = byte(v and 0xFF)
-
-template writeBE64*(buf: var openArray[byte], pos: int, v: int64) =
-  buf[pos] = byte((v shr 56) and 0xFF)
-  buf[pos + 1] = byte((v shr 48) and 0xFF)
-  buf[pos + 2] = byte((v shr 40) and 0xFF)
-  buf[pos + 3] = byte((v shr 32) and 0xFF)
-  buf[pos + 4] = byte((v shr 24) and 0xFF)
-  buf[pos + 5] = byte((v shr 16) and 0xFF)
-  buf[pos + 6] = byte((v shr 8) and 0xFF)
-  buf[pos + 7] = byte(v and 0xFF)
-
-template writeBytesAt*(dst: var openArray[byte], pos: int, src: openArray[byte]) =
-  ## Copy src bytes into dst starting at pos. No-op when src is empty.
-  if src.len > 0:
-    copyMem(addr dst[pos], addr src[0], src.len)
-
-template appendBytes*(buf: var seq[byte], src: openArray[byte]) =
-  ## Append src bytes to the end of buf. No-op when src is empty.
-  if src.len > 0:
-    buf.add(src)
+export pg_bytes
 
 proc toPgParamInline*(v: int16): PgParamInline =
   result.oid = OidInt2
@@ -79,10 +51,10 @@ proc toPgParamInline*(v: string): PgParamInline =
   if v.len == 0:
     discard
   elif v.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], addr v[0], v.len)
+    result.inlineBuf.writeBytesAt(0, v.toOpenArrayByte(0, v.high))
   else:
     result.overflow = newSeq[byte](v.len)
-    copyMem(addr result.overflow[0], addr v[0], v.len)
+    result.overflow.writeBytesAt(0, v.toOpenArrayByte(0, v.high))
 
 proc toPgParamInline*(v: seq[byte]): PgParamInline =
   result.oid = OidBytea
@@ -91,7 +63,7 @@ proc toPgParamInline*(v: seq[byte]): PgParamInline =
   if v.len == 0:
     discard
   elif v.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], addr v[0], v.len)
+    result.inlineBuf.writeBytesAt(0, v)
   else:
     result.overflow = v
 
@@ -105,10 +77,10 @@ proc toPgParamInline*(v: PgUuid): PgParamInline =
   if s.len == 0:
     discard
   elif s.len <= PgInlineBufSize:
-    copyMem(addr result.inlineBuf[0], addr s[0], s.len)
+    result.inlineBuf.writeBytesAt(0, s.toOpenArrayByte(0, s.high))
   else:
     result.overflow = newSeq[byte](s.len)
-    copyMem(addr result.overflow[0], addr s[0], s.len)
+    result.overflow.writeBytesAt(0, s.toOpenArrayByte(0, s.high))
 
 proc toPgParamInline*(v: PgMoney): PgParamInline =
   result.oid = OidMoney
