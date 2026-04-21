@@ -1,7 +1,7 @@
 ## Shared constants and helpers for E2E tests that require a live
 ## PostgreSQL at 127.0.0.1:15432 (docker-compose.yml).
 
-import ../async_postgres/[pg_client, pg_connection, pg_types]
+import ../async_postgres/pg_connection
 
 const
   PgHost* = "127.0.0.1"
