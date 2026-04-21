@@ -972,10 +972,9 @@ proc fromBE64*(data: openArray[byte]): int64 =
 
 proc decodeFloat64BE*(data: openArray[byte], offset: int = 0): float64 =
   ## Decode a big-endian 64-bit float from bytes at the given offset.
-  var bits: uint64
-  bits =
+  let bits =
     (uint64(data[offset]) shl 56) or (uint64(data[offset + 1]) shl 48) or
     (uint64(data[offset + 2]) shl 40) or (uint64(data[offset + 3]) shl 32) or
     (uint64(data[offset + 4]) shl 24) or (uint64(data[offset + 5]) shl 16) or
     (uint64(data[offset + 6]) shl 8) or uint64(data[offset + 7])
-  copyMem(addr result, addr bits, 8)
+  cast[float64](bits)

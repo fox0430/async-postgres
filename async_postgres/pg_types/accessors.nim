@@ -145,24 +145,20 @@ proc getStr*(row: Row, col: int): string =
         )
     of 700: # float4
       if clen == 4:
-        var bits = uint32(
+        let bits = uint32(
           (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
             (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
         )
-        var f: float32
-        copyMem(addr f, addr bits, 4)
-        return $f
+        return $cast[float32](bits)
     of 701: # float8
       if clen == 8:
-        var bits = uint64(
+        let bits = uint64(
           (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
             (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
             (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
             (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
         )
-        var f: float64
-        copyMem(addr f, addr bits, 8)
-        return $f
+        return $cast[float64](bits)
     of OidNumeric:
       return $decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
     else:
@@ -246,24 +242,19 @@ proc getFloat*(row: Row, col: int): float64 =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 8:
-      var bits: uint64
       let b = row.data.buf
-      bits =
+      let bits =
         (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
         (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
         (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
         (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
-      copyMem(addr result, addr bits, 8)
-      return
+      return cast[float64](bits)
     elif clen == 4:
-      var bits: uint32
       let b = row.data.buf
-      bits =
+      let bits =
         (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
         (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-      var f32: float32
-      copyMem(addr f32, addr bits, 4)
-      return float64(f32)
+      return float64(cast[float32](bits))
   discard parseFloat(row.bufView(off, clen), result)
 
 proc getFloat32*(row: Row, col: int): float32 =
@@ -273,13 +264,11 @@ proc getFloat32*(row: Row, col: int): float32 =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 4:
-      var bits: uint32
       let b = row.data.buf
-      bits =
+      let bits =
         (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
         (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-      copyMem(addr result, addr bits, 4)
-      return
+      return cast[float32](bits)
   var f: float64
   if parseFloat(row.bufView(off, clen), f) == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid float32 value")
