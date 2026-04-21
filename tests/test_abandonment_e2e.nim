@@ -12,25 +12,9 @@ import std/[unittest, importutils]
 
 import ../async_postgres/[async_backend, pg_client, pg_types]
 import ../async_postgres/pg_connection {.all.}
+import ./e2e_common
 
 privateAccess(PgConnection)
-
-const
-  PgHost = "127.0.0.1"
-  PgPort = 15432
-  PgUser = "test"
-  PgPassword = "test"
-  PgDatabase = "test"
-
-proc plainConfig(): ConnConfig =
-  ConnConfig(
-    host: PgHost,
-    port: PgPort,
-    user: PgUser,
-    password: PgPassword,
-    database: PgDatabase,
-    sslMode: sslDisable,
-  )
 
 # Cursor abandonment
 
@@ -147,7 +131,8 @@ suite "E2E: COPY OUT timeout / stall":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       # Generate rows one at a time with pg_sleep(5) each; a 200ms timeout will
-      # fire long before the first row is produced.
+      # fire long before the first row is produced (200ms ≪ 5s per row), so this
+      # is robust even on slow CI runners.
       let sql =
         "COPY (SELECT i, pg_sleep(5)::text FROM generate_series(1, 10) i) TO STDOUT"
       var timedOut = false

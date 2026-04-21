@@ -5,32 +5,16 @@
 ## COPY OUT paths, plus invalid-secret-key and post-completion race cases.
 ## All tests require a live PostgreSQL at 127.0.0.1:15432 (docker-compose.yml).
 
-import std/[unittest, importutils, strutils]
+import std/[unittest, importutils]
 
 import ../async_postgres/[async_backend, pg_client, pg_types]
 import ../async_postgres/pg_connection {.all.}
+import ./e2e_common
 
 privateAccess(PgConnection)
 
-const
-  PgHost = "127.0.0.1"
-  PgPort = 15432
-  PgUser = "test"
-  PgPassword = "test"
-  PgDatabase = "test"
-
-proc plainConfig(): ConnConfig =
-  ConnConfig(
-    host: PgHost,
-    port: PgPort,
-    user: PgUser,
-    password: PgPassword,
-    database: PgDatabase,
-    sslMode: sslDisable,
-  )
-
-template isCanceled(e: ref PgError): bool =
-  "57014" in e.msg
+template isCanceled(e: ref PgQueryError): bool =
+  e.sqlState == "57014"
 
 # extended query
 
@@ -44,9 +28,9 @@ suite "E2E: Cancel extended query":
       var raised = false
       try:
         discard await fut
-      except PgError as e:
+      except PgQueryError as e:
         raised = true
-        doAssert e.isCanceled, "expected 57014, got: " & e.msg
+        doAssert e.isCanceled, "expected 57014, got: " & e.sqlState
       doAssert raised, "query should have raised"
       doAssert conn.state == csReady, $conn.state
       # Connection is still usable afterwards.
@@ -72,9 +56,9 @@ suite "E2E: Cancel pipeline execute":
       var raised = false
       try:
         discard await fut
-      except PgError as e:
+      except PgQueryError as e:
         raised = true
-        doAssert e.isCanceled, "expected 57014, got: " & e.msg
+        doAssert e.isCanceled, "expected 57014, got: " & e.sqlState
       doAssert raised, "pipeline should have raised"
       doAssert conn.state == csReady, $conn.state
       let res = await conn.query("SELECT 42")
@@ -83,7 +67,7 @@ suite "E2E: Cancel pipeline execute":
 
     waitFor t()
 
-  test "cancel aborts an executeIsolated op; subsequent ops are not cancelled":
+  test "cancel propagates to at least one op in executeIsolated":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let p = conn.newPipeline()
@@ -93,14 +77,16 @@ suite "E2E: Cancel pipeline execute":
       await sleepAsync(milliseconds(100))
       await conn.cancel()
       let ir = await fut
-      # First op must have errored with 57014. Second op should typically
-      # have completed — but if it didn't (race), at minimum the errors
-      # length equals ops length and at least one is 57014.
+      # First op is expected to error with 57014. The second op usually
+      # completes (per-op SYNC), but under timing race it may also be caught
+      # by the cancel — both outcomes are acceptable as long as at least one
+      # op reports 57014 and the errors length matches ops length.
       doAssert ir.errors.len == 2
       var cancelSeen = false
-      for e in ir.errors:
-        if e != nil and "57014" in e.msg:
-          cancelSeen = true
+      for err in ir.errors:
+        if err != nil and err of PgQueryError:
+          if (ref PgQueryError)(err).sqlState == "57014":
+            cancelSeen = true
       doAssert cancelSeen, "expected at least one 57014 in errors"
       doAssert conn.state == csReady, $conn.state
       let res = await conn.query("SELECT 'post-pipeline'::text AS s")
@@ -127,9 +113,9 @@ suite "E2E: Cancel cursor openCursor":
       var raised = false
       try:
         discard await fut
-      except PgError as e:
+      except PgQueryError as e:
         raised = true
-        doAssert e.isCanceled, "expected 57014, got: " & e.msg
+        doAssert e.isCanceled, "expected 57014, got: " & e.sqlState
       doAssert raised, "openCursor should have raised"
       doAssert conn.state == csReady, $conn.state
       # A new query on the same connection must succeed.
@@ -154,9 +140,9 @@ suite "E2E: Cancel COPY OUT":
       var raised = false
       try:
         discard await fut
-      except PgError as e:
+      except PgQueryError as e:
         raised = true
-        doAssert e.isCanceled, "expected 57014, got: " & e.msg
+        doAssert e.isCanceled, "expected 57014, got: " & e.sqlState
       doAssert raised, "copyOut should have raised"
       doAssert conn.state == csReady, $conn.state
       let res = await conn.query("SELECT 1")
@@ -195,21 +181,22 @@ suite "E2E: Cancel races":
       # Run a quick query and wait for it to fully complete.
       let qr1 = await conn.query("SELECT 100")
       doAssert qr1.rowCount == 1
-      # Now issue a cancel — it will race against nothing; the backend may
-      # queue it for the NEXT statement per PostgreSQL documentation, but
-      # since there is no active statement the CancelRequest is a no-op.
+      # Now issue a cancel — CancelRequest is best-effort: the server sends
+      # SIGINT to the backend, which has no effect if nothing is executing.
+      # Depending on timing, the cancel may also arrive while the NEXT query
+      # is in flight and abort it.
       await conn.cancel()
-      # Next query may or may not be cancelled depending on timing. The
-      # documented safe behaviour: either the next query succeeds, or it
-      # raises 57014; the connection must recover to csReady either way.
+      # Next query may or may not be cancelled depending on timing: either it
+      # succeeds, or it raises 57014. The connection must recover to csReady
+      # either way.
       var secondOk = false
       var secondCancelled = false
       try:
         let qr2 = await conn.query("SELECT 200")
         doAssert qr2.rowCount == 1
         secondOk = true
-      except PgError as e:
-        doAssert e.isCanceled, "unexpected error on second query: " & e.msg
+      except PgQueryError as e:
+        doAssert e.isCanceled, "unexpected error on second query: " & e.sqlState
         secondCancelled = true
       doAssert secondOk or secondCancelled
       doAssert conn.state == csReady
