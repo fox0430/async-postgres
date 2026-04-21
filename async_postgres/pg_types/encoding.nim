@@ -862,11 +862,15 @@ proc toPgParam*(v: seq[JsonNode]): PgParam =
     oid: OidJsonbArray, format: 1, value: some(encodeBinaryArray(OidJsonb, elements))
   )
 
+template writePointAt*(dst: var openArray[byte], pos: int, p: PgPoint) =
+  ## Write a point as 16 bytes (two float64 big-endian) into dst at pos.
+  dst.writeBE64(pos, cast[int64](p.x))
+  dst.writeBE64(pos + 8, cast[int64](p.y))
+
 proc encodePointBinary*(p: PgPoint): seq[byte] =
   ## Encode a point as 16 bytes (two float64 big-endian).
   result = newSeq[byte](16)
-  result.writeBE64(0, cast[int64](p.x))
-  result.writeBE64(8, cast[int64](p.y))
+  result.writePointAt(0, p)
 
 proc toPgBinaryParam*(v: PgPoint): PgParam =
   ## Binary format: 16 bytes (two float64 big-endian).
@@ -883,19 +887,15 @@ proc toPgBinaryParam*(v: PgLine): PgParam =
 proc toPgBinaryParam*(v: PgLseg): PgParam =
   ## Binary format: 32 bytes (two points).
   var data = newSeq[byte](32)
-  let p1 = encodePointBinary(v.p1)
-  copyMem(addr data[0], addr p1[0], 16)
-  let p2 = encodePointBinary(v.p2)
-  copyMem(addr data[16], addr p2[0], 16)
+  data.writePointAt(0, v.p1)
+  data.writePointAt(16, v.p2)
   PgParam(oid: OidLseg, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgBox): PgParam =
   ## Binary format: 32 bytes (high point, low point).
   var data = newSeq[byte](32)
-  let hi = encodePointBinary(v.high)
-  copyMem(addr data[0], addr hi[0], 16)
-  let lo = encodePointBinary(v.low)
-  copyMem(addr data[16], addr lo[0], 16)
+  data.writePointAt(0, v.high)
+  data.writePointAt(16, v.low)
   PgParam(oid: OidBox, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgPath): PgParam =
@@ -904,8 +904,7 @@ proc toPgBinaryParam*(v: PgPath): PgParam =
   data[0] = if v.closed: 1'u8 else: 0'u8
   data.writeBE32(1, int32(v.points.len))
   for i, p in v.points:
-    let pb = encodePointBinary(p)
-    copyMem(addr data[5 + i * 16], addr pb[0], 16)
+    data.writePointAt(5 + i * 16, p)
   PgParam(oid: OidPath, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgPolygon): PgParam =
@@ -913,15 +912,13 @@ proc toPgBinaryParam*(v: PgPolygon): PgParam =
   var data = newSeq[byte](4 + v.points.len * 16)
   data.writeBE32(0, int32(v.points.len))
   for i, p in v.points:
-    let pb = encodePointBinary(p)
-    copyMem(addr data[4 + i * 16], addr pb[0], 16)
+    data.writePointAt(4 + i * 16, p)
   PgParam(oid: OidPolygon, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: PgCircle): PgParam =
   ## Binary format: 24 bytes (center point + radius float64).
   var data = newSeq[byte](24)
-  let cp = encodePointBinary(v.center)
-  copyMem(addr data[0], addr cp[0], 16)
+  data.writePointAt(0, v.center)
   data.writeBE64(16, cast[int64](v.radius))
   PgParam(oid: OidCircle, format: 1, value: some(data))
 
