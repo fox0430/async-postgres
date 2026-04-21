@@ -23,6 +23,11 @@ template writeBE64*(buf: var openArray[byte], pos: int, v: int64) =
   buf[pos + 6] = byte((v shr 8) and 0xFF)
   buf[pos + 7] = byte(v and 0xFF)
 
+template writeBytesAt*(dst: var openArray[byte], pos: int, src: openArray[byte]) =
+  ## Copy src bytes into dst starting at pos. No-op when src is empty.
+  if src.len > 0:
+    copyMem(addr dst[pos], addr src[0], src.len)
+
 proc toPgParamInline*(v: int16): PgParamInline =
   result.oid = OidInt2
   result.format = 1
@@ -276,9 +281,8 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[seq[byte]]): seq[byte] =
   for e in elements:
     result.writeBE32(pos, int32(e.len))
     pos += 4
-    if e.len > 0:
-      copyMem(addr result[pos], addr e[0], e.len)
-      pos += e.len
+    result.writeBytesAt(pos, e)
+    pos += e.len
 
 proc encodeBinaryArray*(elemOid: int32, elements: seq[Option[seq[byte]]]): seq[byte] =
   ## Encode a 1-dimensional binary array that may contain NULL elements.
@@ -315,9 +319,8 @@ proc encodeBinaryArray*(elemOid: int32, elements: seq[Option[seq[byte]]]): seq[b
       let ev = e.get
       result.writeBE32(pos, int32(ev.len))
       pos += 4
-      if ev.len > 0:
-        copyMem(addr result[pos], addr ev[0], ev.len)
-        pos += ev.len
+      result.writeBytesAt(pos, ev)
+      pos += ev.len
 
 proc encodeBinaryArrayEmpty*(elemOid: int32): seq[byte] =
   ## Encode an empty 1-dimensional PostgreSQL binary array.
@@ -975,14 +978,15 @@ proc encodeHstoreBinary*(v: PgHstore): seq[byte] =
     result.writeBE32(pos, int32(k.len))
     pos += 4
     if k.len > 0:
-      copyMem(addr result[pos], addr k[0], k.len)
+      result.writeBytesAt(pos, k.toOpenArrayByte(0, k.high))
       pos += k.len
     if val.isSome:
-      result.writeBE32(pos, int32(val.get.len))
+      let vs = val.get
+      result.writeBE32(pos, int32(vs.len))
       pos += 4
-      if val.get.len > 0:
-        copyMem(addr result[pos], addr val.get[0], val.get.len)
-        pos += val.get.len
+      if vs.len > 0:
+        result.writeBytesAt(pos, vs.toOpenArrayByte(0, vs.high))
+        pos += vs.len
     else:
       result.writeBE32(pos, -1'i32)
       pos += 4
