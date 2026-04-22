@@ -353,6 +353,10 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
+  proc queryValueOrDefault*[T](
+    conn: PgConnection, sq: SqlQuery, default: T, timeout: Duration = ZeroDuration
+  ): untyped
+
   proc queryExists*(
     conn: PgConnection, sq: SqlQuery, timeout: Duration = ZeroDuration
   ): untyped
@@ -453,6 +457,10 @@ sqlQueryForwards:
     timeout: Duration = ZeroDuration,
   ): untyped
 
+  proc queryValueOrDefault*[T](
+    pool: PgPool, sq: SqlQuery, default: T, timeout: Duration = ZeroDuration
+  ): untyped
+
   proc queryExists*(
     pool: PgPool, sq: SqlQuery, timeout: Duration = ZeroDuration
   ): untyped
@@ -531,6 +539,10 @@ sqlQueryForwards:
     sq: SqlQuery,
     default: T,
     timeout: Duration = ZeroDuration,
+  ): untyped
+
+  proc readQueryValueOrDefault*[T](
+    cluster: PgPoolCluster, sq: SqlQuery, default: T, timeout: Duration = ZeroDuration
   ): untyped
 
   proc readQueryExists*(
@@ -612,6 +624,10 @@ sqlQueryForwards:
     sq: SqlQuery,
     default: T,
     timeout: Duration = ZeroDuration,
+  ): untyped
+
+  proc writeQueryValueOrDefault*[T](
+    cluster: PgPoolCluster, sq: SqlQuery, default: T, timeout: Duration = ZeroDuration
   ): untyped
 
   proc writeQueryExists*(

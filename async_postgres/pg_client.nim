@@ -1313,6 +1313,25 @@ proc queryValueOrDefault*[T](
     return default
   return row.get(0, T)
 
+proc queryValueOrDefault*[T](
+    conn: PgConnection,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`,
+  ## inferring `T` from `default`.
+  ## Returns `default` if no rows or the value is NULL.
+  ## Supported types: int32, int64, float64, bool, string.
+  let qr = await conn.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return default
+  let row = initRow(qr.data, 0)
+  if row.isNull(0):
+    return default
+  return row.get(0, T)
+
 proc queryExists*(
     conn: PgConnection,
     sql: string,

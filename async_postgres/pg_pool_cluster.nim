@@ -292,6 +292,14 @@ clusterForwards("read"):
     timeout: Duration = ZeroDuration,
   ): Future[T]
 
+  proc readQueryValueOrDefault*[T](
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+  ): Future[T]
+
   proc readQueryExists*(
     cluster: PgPoolCluster,
     sql: string,
@@ -396,6 +404,14 @@ clusterForwards("write"):
   proc writeQueryValueOrDefault*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+  ): Future[T]
+
+  proc writeQueryValueOrDefault*[T](
+    cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     default: T,

@@ -5075,6 +5075,17 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "queryValueOrDefault infers type from default":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOrDefault("SELECT 1 WHERE false", default = -1'i64)
+      doAssert val == -1'i64
+      let val2 = await conn.queryValueOrDefault("SELECT 42", default = 0'i32)
+      doAssert val2 == 42'i32
+      await conn.close()
+
+    waitFor t()
+
   test "queryValueOpt returns some on value":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -5332,6 +5343,17 @@ suite "E2E: Convenience Query Methods":
         await pool.queryValueOrDefault(int32, "SELECT 1 WHERE false", default = -1'i32)
       doAssert val == -1'i32
       let val2 = await pool.queryValueOrDefault(int32, "SELECT 7", default = 0'i32)
+      doAssert val2 == 7'i32
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValueOrDefault infers type from default":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val = await pool.queryValueOrDefault("SELECT 1 WHERE false", default = -1'i32)
+      doAssert val == -1'i32
+      let val2 = await pool.queryValueOrDefault("SELECT 7", default = 0'i32)
       doAssert val2 == 7'i32
       await pool.close()
 
