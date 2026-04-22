@@ -1,12 +1,9 @@
 import std/[hashes, options, sequtils, strutils, tables, net]
 
+import ../pg_errors
+export pg_errors
+
 type
-  PgError* = object of CatchableError
-    ## General PostgreSQL error. Base type for all pg-specific errors.
-
-  PgTypeError* = object of PgError
-    ## Raised when a PostgreSQL value cannot be converted to the requested Nim type.
-
   PgUuid* = distinct string
     ## UUID value stored as its string representation (e.g. "550e8400-e29b-41d4-a716-446655440000").
 
