@@ -42,7 +42,7 @@ proc readString*(src: openArray[byte], off, len: int): string =
     copyMem(addr result[0], addr src[off], len)
 
 proc readBytes*(src: openArray[byte], off, len: int): seq[byte] =
-  ## Copy `len` bytes from src starting at off into a new seq[byte].
+  ## Copy `len` bytes from src starting at off into a new `seq[byte]`.
   result = newSeq[byte](len)
   if len > 0:
     copyMem(addr result[0], addr src[off], len)
