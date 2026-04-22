@@ -10,13 +10,14 @@ privateAccess(PooledConn)
 privateAccess(Waiter)
 privateAccess(PgPoolCluster)
 
-proc mockConn(state: PgConnState = csReady): PgConnection =
+proc mockConn(state: PgConnState = csReady, pool: PgPool = nil): PgConnection =
   PgConnection(
     recvBuf: @[],
     state: state,
     txStatus: tsIdle,
     serverParams: initTable[string, string](),
     createdAt: Moment.now(),
+    ownerPool: pool,
   )
 
 proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
@@ -48,6 +49,14 @@ proc makeCluster(
     fallbackTimeout: fallbackTimeout,
     closed: false,
   )
+
+proc mockIdle(pool: PgPool, conn: PgConnection) =
+  ## Place a mock connection in the pool's idle queue, wiring `ownerPool`
+  ## the same way production `newPool` does. Without this, a subsequent
+  ## `conn.release()` (e.g. via `withReadConnection`) would raise because
+  ## the back-reference is nil.
+  conn.ownerPool = pool
+  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
 
 suite "newPoolCluster targetSessionAttrs":
   test "auto-sets tsaReadWrite for primary and tsaPreferStandby for replica when tsaAny":
@@ -96,7 +105,7 @@ suite "Read routing":
   test "acquireRead returns connection from replica pool":
     let cluster = makeCluster()
     let conn = mockConn()
-    cluster.replica.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+    cluster.replica.mockIdle(conn)
 
     let (acquired, pool) = waitFor acquireRead(cluster)
     check acquired == conn
@@ -108,7 +117,7 @@ suite "Read routing":
     proc t() {.async.} =
       let cluster = makeCluster()
       let conn = mockConn()
-      cluster.replica.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+      cluster.replica.mockIdle(conn)
 
       cluster.withReadConnection(c):
         doAssert c == conn
@@ -123,7 +132,7 @@ suite "Read routing":
     proc t() {.async.} =
       let cluster = makeCluster()
       let conn = mockConn()
-      cluster.primary.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+      cluster.primary.mockIdle(conn)
 
       cluster.withWriteConnection(c):
         doAssert c == conn
@@ -139,8 +148,8 @@ suite "Read routing":
       let cluster = makeCluster()
       let wConn = mockConn()
       let rConn = mockConn()
-      cluster.primary.idle.addLast(PooledConn(conn: wConn, lastUsedAt: Moment.now()))
-      cluster.replica.idle.addLast(PooledConn(conn: rConn, lastUsedAt: Moment.now()))
+      cluster.primary.mockIdle(wConn)
+      cluster.replica.mockIdle(rConn)
 
       cluster.withWriteConnection(conn):
         doAssert conn == wConn
@@ -160,7 +169,7 @@ suite "Exception safety":
     proc t() {.async.} =
       let cluster = makeCluster()
       let conn = mockConn()
-      cluster.replica.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+      cluster.replica.mockIdle(conn)
 
       var caught = false
       try:
@@ -180,7 +189,7 @@ suite "Exception safety":
     proc t() {.async.} =
       let cluster = makeCluster()
       let conn = mockConn()
-      cluster.primary.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+      cluster.primary.mockIdle(conn)
 
       var caught = false
       try:

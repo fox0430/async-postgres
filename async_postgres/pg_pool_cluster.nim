@@ -112,7 +112,7 @@ template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
       body
     finally:
       await connPool.resetSession(conn)
-      connPool.release(conn)
+      conn.release()
 
 template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
@@ -122,7 +122,7 @@ template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
       body
     finally:
       await cluster.primary.resetSession(conn)
-      cluster.primary.release(conn)
+      conn.release()
 
 # Macro to generate cluster forwarding procs from compact declarations.
 # Each entry is a bodiless `proc` whose name starts with "read" or "write".
@@ -185,7 +185,7 @@ macro clusterForwards(mode: static[string], body: untyped): untyped =
           ident"await",
           newCall(newDotExpr(ident"pool", ident"resetSession"), ident"conn"),
         ),
-        newCall(newDotExpr(ident"pool", ident"release"), ident"conn"),
+        newCall(newDotExpr(ident"conn", ident"release")),
       )
     else:
       let primary = newDotExpr(ident"cluster", ident"primary")
@@ -200,7 +200,7 @@ macro clusterForwards(mode: static[string], body: untyped): untyped =
           ident"await",
           newCall(newDotExpr(primary.copyNimTree(), ident"resetSession"), ident"conn"),
         ),
-        newCall(newDotExpr(primary.copyNimTree(), ident"release"), ident"conn"),
+        newCall(newDotExpr(ident"conn", ident"release")),
       )
 
     let tryFinally =
@@ -523,7 +523,7 @@ macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped 
         raise `eSym`
     finally:
       await `resetSessionSym`(`clusterSym`.primary, `connIdent`)
-      `clusterSym`.primary.release(`connIdent`)
+      `connIdent`.release()
 
 template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
   ## Create a pipeline on the primary pool.

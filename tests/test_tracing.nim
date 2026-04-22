@@ -620,7 +620,7 @@ suite "Tracing: pool acquire/release":
       doAssert log.poolAcquireEnds[0].wasCreated == true
       doAssert not log.poolAcquireEnds[0].hasErr
 
-      pool.release(conn)
+      conn.release()
 
       doAssert log.poolReleaseStarts.len == 1
       doAssert log.poolReleaseStarts[0].hasConn
@@ -635,7 +635,7 @@ suite "Tracing: pool acquire/release":
       doAssert log.poolAcquireEnds.len == 2
       doAssert log.poolAcquireEnds[1].wasCreated == false
 
-      pool.release(conn2)
+      conn2.release()
       await pool.close()
 
     waitFor t()
@@ -652,14 +652,14 @@ suite "Tracing: pool acquire/release":
       # maxSize=1, so next acquire will wait
       let fut = pool.acquire()
       # Release conn1 -- should hand to the waiter
-      pool.release(conn1)
+      conn1.release()
       let conn2 = await fut
 
       doAssert log.poolReleaseEnds.len == 1
       doAssert not log.poolReleaseEnds[0].wasClosed
       doAssert log.poolReleaseEnds[0].handedToWaiter
 
-      pool.release(conn2)
+      conn2.release()
       await pool.close()
 
     waitFor t()
@@ -686,7 +686,7 @@ suite "Tracing: pool close errors":
       doAssert log.poolCloseErrors[0].hasConn
       doAssert log.poolCloseErrors[0].errMsg == "simulated close failure"
 
-      pool.release(conn)
+      conn.release()
       await pool.close()
 
     waitFor t()
@@ -703,7 +703,7 @@ suite "Tracing: pool close errors":
       # Must not raise even though the hook is nil.
       pool.reportCloseError(conn, newException(PgError, "ignored"))
 
-      pool.release(conn)
+      conn.release()
       await pool.close()
 
     waitFor t()
