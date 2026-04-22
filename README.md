@@ -8,7 +8,7 @@ Async PostgreSQL client in Nim.
 - PostgreSQL wire protocol v3
 - Simple Query and Extended Query Protocol
 - Pipeline mode — batch multiple operations in a single network round trip
-- Connection pooling with health checks and maintenance
+- Connection pooling with health checks and maintenance (broken connections discarded on acquire/release)
 - Pool cluster with read replica routing
 - SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full)
 - MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
@@ -97,6 +97,12 @@ proc main() {.async.} =
 
 waitFor main()
 ```
+
+## Reconnection Policy
+
+- **Connection pool (`PgPool` / `PgPoolCluster`)** — broken connections are detected and discarded automatically. On `acquire`, entries whose state is not `csReady` (or that fail the optional `ping` health check) are retired and replaced. On `release`, connections left in a non-ready or in-transaction state are also closed rather than returned to the idle queue. Configure `healthCheckTimeout` / `pingTimeout` to tune idle-connection probing.
+- **Direct `PgConnection`** — no automatic reconnection for regular queries. Per-query retry would be unsafe for non-idempotent statements and in-flight transactions, so a closed connection must be replaced by calling `connect(...)` again (or by using the pool). Inspect `conn.isConnected()` or `conn.state` to decide whether a handle is still usable.
+- **LISTEN/NOTIFY** — this is the one exception. The listen pump reconnects with exponential backoff (up to 10 attempts, 30 s cap) and re-subscribes to all channels. Register a `reconnectCallback` if you need to resynchronise application state after a reconnect.
 
 ## Async Backend
 

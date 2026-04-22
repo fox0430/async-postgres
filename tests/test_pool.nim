@@ -8,6 +8,8 @@ import ../async_postgres/pg_protocol
 import ../async_postgres/pg_connection
 import ../async_postgres/pg_pool {.all.}
 
+import ./mock_pg_server
+
 privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
@@ -1504,3 +1506,126 @@ suite "Pool metrics":
       doAssert pool.metrics.timeoutCount == 1
 
     waitFor t()
+
+suite "isConnected":
+  test "returns false for mock connection without transport":
+    let conn = mockConn()
+    check not conn.isConnected()
+
+  test "returns false for csClosed mock":
+    let conn = mockConn(csClosed)
+    check not conn.isConnected()
+
+  when hasChronos:
+    test "returns true while transport is live, false after close":
+      proc t() {.async.} =
+        let (conn, server, serverTransport) = await makeHangingConn()
+        doAssert conn.isConnected()
+        await conn.close()
+        doAssert not conn.isConnected()
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
+proc mockConfig(port: int): ConnConfig =
+  ConnConfig(
+    host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
+  )
+
+suite "Pool broken connection handling (integration)":
+  test "query failure from server close transitions conn to csClosed and release discards it":
+    # End-to-end: a live pool connection that dies mid-query should surface as
+    # csClosed, so release() retires it instead of returning it to idle.
+    var finalState: PgConnState
+    var idleAfter = -1
+    var closeCountDelta: int64 = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        try:
+          discard await drainFrontendMessage(st) # client query
+          # Server disappears mid-query without sending a response
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let pool = await newPool(cfg)
+
+      let conn = await pool.acquire()
+      try:
+        discard await conn.simpleQuery("SELECT 1")
+      except CatchableError:
+        discard
+
+      finalState = conn.state
+      let before = pool.metrics.closeCount
+      pool.release(conn)
+      closeCountDelta = pool.metrics.closeCount - before
+      idleAfter = pool.idle.len
+
+      await pool.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check finalState == csClosed
+    check closeCountDelta == 1
+    check idleAfter == 0
+
+  test "acquire skips an idle conn whose transport was torn down":
+    # An idle pool entry whose backend vanished (state surfaced as csClosed
+    # via a prior read, or an out-of-band close) must be retired on the next
+    # acquire attempt. We force-close from the client side to flip state,
+    # then check acquire() drops the entry and returns an alternative.
+    var idleAfter = -1
+    var closeCountDelta: int64 = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        try:
+          let st = await acceptAndReady(ms)
+          # Stay up long enough for the client to finish; close at the end.
+          await sleepAsync(milliseconds(200))
+          await closeClient(st)
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+
+      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let pool = await newPool(cfg)
+
+      let broken = await pool.acquire()
+      pool.release(broken)
+      doAssert pool.idle.len == 1
+
+      # Simulate the backend vanishing: csClosed on the idle entry.
+      await broken.close()
+      doAssert broken.state == csClosed
+
+      # Inject a healthy mock alongside the broken one so acquire has a
+      # non-real candidate to hand back without re-entering connect().
+      let good = mockConn()
+      pool.idle.addLast(toPooled(good))
+
+      let before = pool.metrics.closeCount
+      let acquired = await pool.acquire()
+      closeCountDelta = pool.metrics.closeCount - before
+      idleAfter = pool.idle.len
+
+      doAssert acquired == good
+
+      pool.release(acquired)
+      await pool.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check closeCountDelta == 1
+    check idleAfter == 0
