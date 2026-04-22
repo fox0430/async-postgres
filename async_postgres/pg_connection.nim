@@ -959,6 +959,9 @@ proc closeTransport(conn: PgConnection) {.async.} =
       except CatchableError:
         discard
       conn.transport = nil
+    # Drop the cached reader/writer aliases so isConnected() reports false.
+    conn.reader = nil
+    conn.writer = nil
   elif hasAsyncDispatch:
     if not conn.socket.isNil:
       conn.socket.close()
@@ -1726,7 +1729,16 @@ proc simpleExec*(
       tag = await simpleExecImpl(conn, sql)
   return initCommandResult(tag)
 
-proc isConnected(conn: PgConnection): bool =
+proc isConnected*(conn: PgConnection): bool =
+  ## Whether the underlying transport is present.
+  ##
+  ## This is a cheap, non-blocking check (no round trip): it only reports
+  ## whether the connection object currently holds a transport handle. It
+  ## does **not** detect server-side closes that have not yet been observed
+  ## by a read — use `ping` for that.
+  ##
+  ## Pair with `state == csReady` to decide whether a connection is usable
+  ## before issuing a query.
   when hasChronos:
     not conn.writer.isNil
   elif hasAsyncDispatch:
