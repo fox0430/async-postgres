@@ -1547,8 +1547,18 @@ proc quoteIdentifier*(s: string): string =
   "\"" & s.replace("\"", "\"\"") & "\""
 
 proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.async.} =
-  ## Execute one or more SQL statements via simple query protocol.
-  ## Returns one `QueryResult` per statement. Supports multiple statements separated by semicolons.
+  ## Execute one or more SQL statements via the **simple query protocol**.
+  ##
+  ## Returns one ``QueryResult`` per statement; supports multiple statements
+  ## separated by ``;`` in a single round trip — this is the main reason to
+  ## choose ``simpleQuery`` over ``query``.
+  ##
+  ## No parameters are supported (the SQL string is sent verbatim — only use
+  ## trusted input) and rows are always in the text wire format. No
+  ## server-side plan cache entry is created.
+  ##
+  ## For single-statement parameterised reads, prefer ``query``; for
+  ## parameter-less commands without rows, prefer ``simpleExec``.
   conn.checkReady()
 
   var results: seq[QueryResult]
@@ -1718,8 +1728,21 @@ proc invalidateOnTimeout*(conn: PgConnection, reason: string) =
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
-  ## Execute a SQL statement via simple query protocol, returning the command result.
-  ## Lighter than `exec` for parameter-less commands (no Parse/Bind/Describe overhead).
+  ## Execute a side-effect SQL command via the **simple query protocol**,
+  ## returning the final command tag.
+  ##
+  ## Lighter than ``exec`` for parameter-less commands — one ``Query`` message,
+  ## no Parse/Bind/Describe round trip and no plan cache entry. Intended for
+  ## session-level commands such as ``BEGIN``, ``SET``, ``VACUUM``,
+  ## ``LISTEN``, ``NOTIFY``.
+  ##
+  ## The SQL string is sent verbatim (no parameters) — only use trusted input,
+  ## or quote interpolated identifiers yourself via ``quoteIdentifier``.
+  ##
+  ## Multiple ``;``-separated statements are accepted, but only the **last**
+  ## command tag is returned; use ``simpleQuery`` if you need per-statement
+  ## results. For parameterised writes, prefer ``exec``.
+  ##
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   var tag: string
   withConnTracing(

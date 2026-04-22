@@ -892,7 +892,9 @@ proc queryColumn*(
     result.add(row.getStr(0))
 
 proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.} =
-  ## Execute one or more SQL statements via simple query protocol using a pooled connection.
+  ## Execute one or more SQL statements via the simple query protocol using a
+  ## pooled connection. See ``PgConnection.simpleQuery`` for semantics —
+  ## multi-statement, no parameters, no plan cache.
   let conn = await pool.acquire()
   try:
     return await conn.simpleQuery(sql)
@@ -903,8 +905,9 @@ proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.}
 proc simpleExec*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
-  ## Execute a SQL statement via simple query protocol using a pooled connection.
-  ## Returns the command result.
+  ## Execute a side-effect SQL command via the simple query protocol using a
+  ## pooled connection. See ``PgConnection.simpleExec`` for semantics — no
+  ## parameters, no plan cache, last command tag returned.
   let conn = await pool.acquire()
   try:
     return await conn.simpleExec(sql, timeout)
