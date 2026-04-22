@@ -1,3 +1,57 @@
+## Query execution API.
+##
+## Choosing between extended- and simple-protocol entry points
+## ===========================================================
+##
+## ``exec`` / ``query`` use the **extended query protocol** (Parse / Bind /
+## Describe / Execute). They are the default choice for application queries:
+##
+## - Exactly one statement per call.
+## - Typed parameters via ``seq[PgParam]`` or ``openArray[PgParamInline]`` —
+##   values are bound out-of-band, so no string escaping is required.
+## - Reuses server-side prepared statements across calls with identical SQL
+##   text (bounded by ``stmtCacheCapacity``); the statement is parsed once
+##   and rebound on subsequent calls.
+## - Result rows may use the binary wire format when ``resultFormat =
+##   rfBinary`` is passed, or on paths that build per-column format codes
+##   via ``buildResultFormats``. The default ``rfAuto`` returns text rows.
+##
+## ``simpleExec`` / ``simpleQuery`` use the **simple query protocol** (a single
+## ``Query`` message, text-only rows). Prefer them only when the extended
+## protocol cannot express what you need:
+##
+## - **No parameters.** The SQL string is sent verbatim — only use with
+##   trusted input, or quote identifiers/literals yourself (e.g. via
+##   ``quoteIdentifier``).
+## - **No prepared statement reuse.** Each call re-parses on the server;
+##   appropriate for one-off session commands (``BEGIN``, ``SET``,
+##   ``VACUUM`` …) where a cached statement would be wasted. For
+##   ``LISTEN`` / ``UNLISTEN`` / ``NOTIFY`` prefer the dedicated ``listen``,
+##   ``unlisten``, and ``notify`` helpers — they quote the channel name for
+##   you.
+## - ``simpleQuery`` accepts multiple ``;``-separated statements and returns
+##   one ``QueryResult`` per statement — the one case the extended protocol
+##   cannot cover in a single round trip.
+## - ``simpleExec`` expects a side-effect command; the returned tag is the
+##   **last** ``CommandComplete`` seen, so multi-statement input is accepted
+##   but per-statement results are not surfaced — use ``simpleQuery`` when
+##   you need them.
+##
+## Quick reference
+## ---------------
+##
+## ===========================  =========  ============  ===========  ==============
+## API                           Protocol   Multi-stmt   Parameters   Plan cache
+## ===========================  =========  ============  ===========  ==============
+## ``query`` / ``exec``          extended   no           yes          yes
+## ``simpleQuery``               simple     yes          no           no
+## ``simpleExec``                simple     last-wins    no           no
+## ===========================  =========  ============  ===========  ==============
+##
+## Timeout behaviour is shared by all four: when a ``timeout`` is exceeded the
+## connection is marked ``csClosed`` (the protocol may be mid-exchange) and a
+## pooled connection is discarded on release.
+
 import std/[options, tables, macros]
 
 import async_backend, pg_protocol, pg_connection, pg_types
@@ -363,7 +417,13 @@ proc exec*(
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
-  ## Execute a statement with typed parameters.
+  ## Execute a statement with typed parameters via the extended query protocol.
+  ##
+  ## Single statement only; the plan is cached per-connection. Use
+  ## ``simpleExec`` for parameter-less session commands (``BEGIN``, ``SET``,
+  ## ``VACUUM``, ``LISTEN`` …) or ``simpleQuery`` when you need multi-statement
+  ## execution in one round trip.
+  ##
   ## On timeout the connection is marked closed (protocol desync) and cannot be
   ## reused; pooled connections are discarded automatically.
   var tag: string
@@ -991,7 +1051,12 @@ proc query*(
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
-  ## Execute a query with typed parameters.
+  ## Execute a query with typed parameters via the extended query protocol.
+  ##
+  ## Single statement only; the plan is cached per-connection. Use
+  ## ``simpleQuery`` when you need multiple ``;``-separated statements to run
+  ## in one round trip (no parameters, text-only rows).
+  ##
   ## On timeout the connection is marked closed (protocol desync) and cannot be
   ## reused; pooled connections are discarded automatically.
   var qr: QueryResult
