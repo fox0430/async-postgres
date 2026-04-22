@@ -2,7 +2,7 @@ import std/[tables, sets, strutils, uri, deques, options, lists]
 when defined(posix):
   import std/posix
 
-import async_backend, pg_protocol, pg_auth, pg_types
+import async_backend, pg_errors, pg_protocol, pg_auth, pg_types
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -13,7 +13,7 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[net, openssl, tempfiles, os]
 
-export PgError
+export pg_errors
 
 # TCP keepalive socket options (not exported by posix module)
 when defined(linux):
@@ -33,23 +33,6 @@ else:
   .}
 
 type
-  PgConnectionError* = object of PgError
-    ## Connection failures, disconnections, SSL/auth errors.
-
-  PgQueryError* = object of PgError
-    ## SQL execution errors from the server (ErrorResponse).
-    sqlState*: string ## 5-char SQLSTATE code (e.g. "42P01"), empty if unavailable.
-    severity*: string ## e.g. "ERROR", "FATAL"
-    detail*: string ## DETAIL field, empty if not present.
-    hint*: string ## HINT field, empty if not present.
-
-  PgTimeoutError* = object of PgError ## Operation timed out.
-
-  PgPoolError* = object of PgError ## Pool exhaustion, pool closed, or acquire timeout.
-
-  PgNotifyOverflowError* = object of PgError
-    dropped*: int ## Number of notifications dropped due to queue overflow
-
   PgConnState* = enum
     ## Connection lifecycle state.
     csConnecting

@@ -1,11 +1,9 @@
 import std/[options, tables]
 
-import pg_bytes
+import pg_bytes, pg_errors
+export pg_errors
 
 type
-  ProtocolError* = object of CatchableError
-    ## Raised on PostgreSQL wire protocol violations.
-
   FrontendMessageKind* = enum
     ## Message types sent from client to server.
     fmkStartup
