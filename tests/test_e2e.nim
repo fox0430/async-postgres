@@ -495,7 +495,7 @@ suite "E2E: Connection Pool":
         await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
       let conn = await pool.acquire()
       doAssert conn.state == csReady
-      pool.release(conn)
+      conn.release()
       await pool.close()
 
     waitFor t()
@@ -521,9 +521,9 @@ suite "E2E: Connection Pool":
       doAssert c1.state == csReady
       doAssert c2.state == csReady
       doAssert c3.state == csReady
-      pool.release(c1)
-      pool.release(c2)
-      pool.release(c3)
+      c1.release()
+      c2.release()
+      c3.release()
       await pool.close()
 
     waitFor t()
@@ -544,7 +544,7 @@ suite "E2E: Connection Pool":
       let conn1 = await pool.acquire()
       let pid1 = conn1.pid
       doAssert conn1.state == csReady
-      pool.release(conn1)
+      conn1.release()
 
       # Wait for maxLifetime to expire
       await sleepAsync(milliseconds(600))
@@ -555,7 +555,7 @@ suite "E2E: Connection Pool":
       doAssert conn2.state == csReady
       # The new connection should be different (different pid from server)
       doAssert conn2.pid != pid1
-      pool.release(conn2)
+      conn2.release()
 
       await pool.close()
 
@@ -576,7 +576,7 @@ suite "E2E: Connection Pool":
       # Create and release a connection so it sits idle
       let conn = await pool.acquire()
       doAssert conn.state == csReady
-      pool.release(conn)
+      conn.release()
 
       # Wait for idleTimeout + maintenance cycle
       await sleepAsync(milliseconds(500))
@@ -604,9 +604,9 @@ suite "E2E: Connection Pool":
       let c1 = await pool.acquire()
       let c2 = await pool.acquire()
       let c3 = await pool.acquire()
-      pool.release(c1)
-      pool.release(c2)
-      pool.release(c3)
+      c1.release()
+      c2.release()
+      c3.release()
       doAssert pool.idleCount == 3
 
       # Wait for idleTimeout + maintenance cycles
@@ -633,7 +633,7 @@ suite "E2E: Connection Pool":
 
       let conn1 = await pool.acquire()
       let pid1 = conn1.pid
-      pool.release(conn1)
+      conn1.release()
 
       # Wait for maxLifetime to expire
       await sleepAsync(milliseconds(400))
@@ -642,7 +642,7 @@ suite "E2E: Connection Pool":
       let conn2 = await pool.acquire()
       doAssert conn2.state == csReady
       doAssert conn2.pid != pid1
-      pool.release(conn2)
+      conn2.release()
 
       await pool.close()
 
@@ -661,7 +661,7 @@ suite "E2E: Connection Pool":
       )
 
       let conn1 = await pool.acquire()
-      pool.release(conn1)
+      conn1.release()
 
       # Wait for maxLifetime to expire and maintenance to clean up
       await sleepAsync(milliseconds(500))
@@ -690,12 +690,12 @@ suite "E2E: Connection Pool":
 
       let conn1 = await pool.acquire()
       let pid1 = conn1.pid
-      pool.release(conn1)
+      conn1.release()
 
       # Immediate re-acquire should return the same connection
       let conn2 = await pool.acquire()
       doAssert conn2.pid == pid1
-      pool.release(conn2)
+      conn2.release()
 
       await pool.close()
 
@@ -2764,7 +2764,7 @@ suite "E2E: Pool minSize Replenishment":
       doAssert conn.state == csReady
       let res = await conn.simpleQuery("SELECT 1")
       doAssert res[0].rows[0][0].get().toString() == "1"
-      pool.release(conn)
+      conn.release()
 
       await pool.close()
 
@@ -2992,7 +2992,7 @@ suite "E2E: Pool Stress":
       var raised = false
       try:
         let conn2 = await pool.acquire()
-        pool.release(conn2)
+        conn2.release()
       except PgError as e:
         raised = true
         doAssert "timeout" in e.msg.toLowerAscii()
@@ -3000,7 +3000,7 @@ suite "E2E: Pool Stress":
       doAssert raised
 
       # Release and verify pool still works
-      pool.release(conn)
+      conn.release()
       let res = await pool.query("SELECT 1")
       doAssert res.rows.len == 1
       doAssert res.rows[0].getStr(0) == "1"
@@ -3028,7 +3028,7 @@ suite "E2E: Pool Stress":
       let conn = await pool.acquire()
       let pidRes = await conn.query("SELECT pg_backend_pid()")
       let pid = pidRes.rows[0].getInt(0)
-      pool.release(conn)
+      conn.release()
 
       # Kill the backend via a separate connection
       let killer = await connect(plainConfig())

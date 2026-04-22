@@ -152,6 +152,11 @@ type
     colOids*: seq[int32] ## Per-column type OIDs for RowData
     lruNode*: DoublyLinkedNode[string] ## Embedded LRU list node
 
+  PgPoolOwner* = ref object of RootObj
+    ## Opaque base for pool-ownership back-references on `PgConnection`.
+    ## The concrete type is `PgPool` (defined in `pg_pool`); this base lives
+    ## here to avoid a circular import. Consumers should not subclass this.
+
   PgConnection* = ref object
     ## A single PostgreSQL connection with buffered I/O and statement caching.
     when hasChronos:
@@ -198,6 +203,11 @@ type
     hstoreOid: int32 ## Dynamic OID for hstore extension type; 0 if not available
     hstoreArrayOid: int32 ## Dynamic OID for hstore[] array; 0 if not available
     tracer: PgTracer ## Inherited from ConnConfig on connect
+    ownerPool*: PgPoolOwner
+      ## Owning pool back-reference. Set when this connection is managed by
+      ## a `PgPool` (or a pool inside `PgPoolCluster`); `nil` for standalone
+      ## connections created via `connect`. Used by `release(conn)` to route
+      ## the connection back to the correct pool.
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
