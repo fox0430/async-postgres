@@ -866,6 +866,24 @@ proc queryValueOrDefault*[T](
     return default
   return row.get(0, T)
 
+proc queryValueOrDefault*[T](
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`,
+  ## inferring `T` from `default`.
+  ## Returns `default` if no rows or the value is NULL.
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return default
+  let row = initRow(qr.data, 0)
+  if row.isNull(0):
+    return default
+  return row.get(0, T)
+
 proc queryExists*(
     pool: PgPool,
     sql: string,
