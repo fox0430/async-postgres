@@ -15,13 +15,14 @@ privateAccess(PgConnection)
 privateAccess(PooledConn)
 privateAccess(Waiter)
 
-proc mockConn(state: PgConnState = csReady): PgConnection =
+proc mockConn(state: PgConnState = csReady, pool: PgPool = nil): PgConnection =
   result = PgConnection(
     recvBuf: @[],
     state: state,
     txStatus: tsIdle,
     serverParams: initTable[string, string](),
     createdAt: Moment.now(),
+    ownerPool: pool,
   )
 
 proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
@@ -42,6 +43,14 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
 
 proc toPooled(conn: PgConnection): PooledConn =
   PooledConn(conn: conn, lastUsedAt: Moment.now())
+
+proc release(pool: PgPool, conn: PgConnection) =
+  ## Test-only shim that wires `ownerPool` on throw-away mock connections
+  ## and delegates to the public `conn.release()` API. Production callers
+  ## should use `conn.release()` directly; pool-acquired connections already
+  ## have `ownerPool` set.
+  conn.ownerPool = pool
+  conn.release()
 
 suite "initConnConfig":
   test "defaults":
@@ -271,6 +280,12 @@ suite "Pool release":
     pool.release(conn)
     check pool.active == 0
     check pool.idle.len == 0
+
+  test "release on standalone connection raises PgError":
+    let conn = mockConn()
+    check conn.ownerPool == nil
+    expect PgError:
+      conn.release()
 
 suite "Pool resetSession":
   test "resetSession is no-op when resetQuery is empty":

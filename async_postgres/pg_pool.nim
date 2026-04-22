@@ -70,7 +70,8 @@ type
     execFut: Future[CommandResult] ## Non-nil for popExec
     queryFut: Future[QueryResult] ## Non-nil for popQuery
 
-  PgPool* = ref object ## Connection pool that manages a set of PostgreSQL connections.
+  PgPool* = ref object of PgPoolOwner
+    ## Connection pool that manages a set of PostgreSQL connections.
     config: PoolConfig
     idle: Deque[PooledConn]
     active: int
@@ -274,6 +275,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         break
       try:
         let conn = await connect(pool.config.connConfig).wait(replenishTimeout)
+        conn.ownerPool = pool
         pool.metrics.createCount.inc
         pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
       except CatchableError:
@@ -301,6 +303,7 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     pool.cachedNow = Moment.now()
     for i in 0 ..< cfg.minSize:
       let conn = await connect(cfg.connConfig)
+      conn.ownerPool = pool
       pool.metrics.createCount.inc
       pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
   except CatchableError as e:
@@ -312,10 +315,11 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   pool.maintenanceTask = maintenanceLoop(pool)
   return pool
 
-proc release*(pool: PgPool, conn: PgConnection) =
-  ## Return a connection to the pool. If the connection is broken or in a
-  ## transaction, it is closed instead. If waiters are queued, the connection
-  ## is handed directly to the next waiter.
+proc releaseImpl(pool: PgPool, conn: PgConnection) =
+  ## Implementation of `release(conn)`; called once the owning pool is known.
+  ## Returns the connection to the pool. If the connection is broken or in
+  ## a transaction, it is closed instead. If waiters are queued, the
+  ## connection is handed directly to the next waiter.
   ##
   ## Discard criteria (`conn.state != csReady`):
   ## - A timed-out request reaches us via `invalidateOnTimeout` with
@@ -357,6 +361,26 @@ proc release*(pool: PgPool, conn: PgConnection) =
       traceCtx,
       TracePoolReleaseEndData(wasClosed: wasClosed, handedToWaiter: handedToWaiter),
     )
+
+proc release*(conn: PgConnection) =
+  ## Return a connection to its owning pool. If the connection is broken or
+  ## in a transaction, it is closed instead; if waiters are queued, it is
+  ## handed directly to the next waiter.
+  ##
+  ## The owning pool is tracked on `conn.ownerPool`, set automatically when
+  ## the connection is acquired from a `PgPool` (including pools inside a
+  ## `PgPoolCluster`). For standalone connections created with `connect`
+  ## this field is `nil` and calling `release` raises `PgError` — use
+  ## `conn.close()` instead.
+  ##
+  ## `withConnection`, `withReadConnection`, `withWriteConnection`,
+  ## `withPipeline`, and `withTransaction` call this automatically; direct
+  ## callers only need it when they manage `acquire`/`release` manually.
+  if conn.ownerPool == nil:
+    raise newException(
+      PgError, "release() called on a standalone connection; use conn.close() instead"
+    )
+  PgPool(conn.ownerPool).releaseImpl(conn)
 
 type AcquireResult = tuple[conn: PgConnection, wasCreated: bool]
 
@@ -402,6 +426,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     pool.active.inc
     try:
       let conn = await connect(pool.config.connConfig)
+      conn.ownerPool = pool
       pool.metrics.createCount.inc
       recordAcquire()
       return (conn, true)
@@ -433,7 +458,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       # the future just before the timeout fired, return the connection
       # to the pool instead of leaking it.
       if fut.completed():
-        pool.release(fut.read())
+        fut.read().release()
       raise newException(PgPoolError, "Pool acquire timeout")
   else:
     let conn = await fut
@@ -467,7 +492,7 @@ template withConnection*(pool: PgPool, conn, body: untyped) =
     body
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
   ## Fail a pending op's future if not already finished.
@@ -531,7 +556,7 @@ proc executeBatch(
       failPendingOp(op, e)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc dispatchBatchImpl(pool: PgPool) {.async.} =
   ## Drain the pending ops queue and execute them via pipelined connections.
@@ -564,7 +589,7 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
           op.queryFut.complete(r)
       finally:
         await pool.resetSession(conn)
-        pool.release(conn)
+        conn.release()
     except CatchableError as e:
       failPendingOp(op, e)
     return
@@ -596,7 +621,7 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
   for ci in 0 ..< conns.len:
     if connOps[ci].len == 0:
       await pool.resetSession(conns[ci])
-      pool.release(conns[ci])
+      conns[ci].release()
       continue
     batchFuts.add(executeBatch(pool, conns[ci], connOps[ci]))
 
@@ -657,7 +682,7 @@ proc exec*(
     return await conn.exec(sql, params, timeout = timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc query*(
     pool: PgPool,
@@ -688,7 +713,7 @@ proc query*(
     return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc queryEach*(
     pool: PgPool,
@@ -708,7 +733,7 @@ proc queryEach*(
     return await conn.queryEach(sql, params, callback, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc queryRowOpt*(
     pool: PgPool,
@@ -873,7 +898,7 @@ proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.}
     return await conn.simpleQuery(sql)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc simpleExec*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
@@ -885,7 +910,7 @@ proc simpleExec*(
     return await conn.simpleExec(sql, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc execInTransaction*(
     pool: PgPool,
@@ -899,7 +924,7 @@ proc execInTransaction*(
     return await conn.execInTransaction(sql, params, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc queryInTransaction*(
     pool: PgPool,
@@ -914,7 +939,7 @@ proc queryInTransaction*(
     return await conn.queryInTransaction(sql, params, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc notify*(
     pool: PgPool,
@@ -928,7 +953,7 @@ proc notify*(
     await conn.notify(channel, payload, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction using a pooled connection.
@@ -999,7 +1024,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         raise `eSym`
     finally:
       await `resetSessionSym`(`poolSym`, `connIdent`)
-      `poolSym`.release(`connIdent`)
+      `connIdent`.release()
 
 template withPipeline*(pool: PgPool, pipeline, body: untyped) =
   ## Acquire a connection, create a Pipeline, execute body, then release.
@@ -1010,7 +1035,7 @@ template withPipeline*(pool: PgPool, pipeline, body: untyped) =
     body
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close the pool: stop the maintenance loop, cancel all waiters, and close
