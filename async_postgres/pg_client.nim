@@ -2372,6 +2372,7 @@ proc queryInTransactionImpl(
         of bmkRowDescription:
           qr.fields = msg.fields
           qr.data = newRowData(int16(msg.fields.len))
+          qr.data.fields = qr.fields
         of bmkNoData:
           discard
         of bmkEmptyQueryResponse:
@@ -2669,6 +2670,7 @@ proc executeImpl(
         if results[i].queryResult.fields.len > 0:
           results[i].queryResult.data =
             newRowData(int16(results[i].queryResult.fields.len), c.colFmts, c.colOids)
+          results[i].queryResult.data.fields = results[i].queryResult.fields
     else:
       results[i] = PipelineResult(kind: prkExec)
 
@@ -2714,6 +2716,8 @@ proc executeImpl(
                 results[activeOpIdx].queryResult.fields = msg.fields
               results[activeOpIdx].queryResult.data =
                 newRowData(int16(msg.fields.len), cf, co)
+              results[activeOpIdx].queryResult.data.fields =
+                results[activeOpIdx].queryResult.fields
               # Update pointers for nextMessage
               rowData = results[activeOpIdx].queryResult.data
               rowCount = addr results[activeOpIdx].queryResult.rowCount
@@ -2938,6 +2942,7 @@ proc executeIsolatedImpl(
         if results[i].queryResult.fields.len > 0:
           results[i].queryResult.data =
             newRowData(int16(results[i].queryResult.fields.len), c.colFmts, c.colOids)
+          results[i].queryResult.data.fields = results[i].queryResult.fields
     else:
       results[i] = PipelineResult(kind: prkExec)
 
@@ -2983,11 +2988,15 @@ proc executeIsolatedImpl(
                         cf[j] = p.ops[opIdx].resultFormats[j]
                   results[opIdx].queryResult.data =
                     newRowData(int16(msg.fields.len), cf, co)
+                  results[opIdx].queryResult.data.fields =
+                    results[opIdx].queryResult.fields
                   rowData = results[opIdx].queryResult.data
                   rowCount = addr results[opIdx].queryResult.rowCount
                 else:
                   results[opIdx].queryResult.fields = msg.fields
                   results[opIdx].queryResult.data = newRowData(int16(msg.fields.len))
+                  results[opIdx].queryResult.data.fields =
+                    results[opIdx].queryResult.fields
                   rowData = results[opIdx].queryResult.data
                   rowCount = addr results[opIdx].queryResult.rowCount
             of bmkNoData:
