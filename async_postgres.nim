@@ -37,6 +37,79 @@
 ##
 ##   waitFor main()
 ##
+## Choosing a query API
+## ====================
+## Four parameterised entry points are provided. They differ in how parameters
+## are supplied and in the amount of per-call allocation:
+##
+## 1. `sql"..."` macro — compile-time ``{expr}`` interpolation
+## ----------------------------------------------------------------------
+## Most readable. ``{expr}`` placeholders are rewritten to ``$1, $2, …`` at
+## compile time and the expressions are collected into a ``seq[PgParam]``.
+## Works with `query`, `exec`, `pool.query`, `cluster.withReadConnection`, etc.
+##
+## .. code-block:: nim
+##   let name = "Alice"
+##   await conn.query(sql"SELECT id FROM users WHERE name = {name}")
+##
+## - Pros: concise; compile-time placeholder rewriting; SQL injection-safe.
+## - Cons: still allocates a ``seq[PgParam]`` per call; ``{expr}`` must be a
+##   compile-time-visible expression (not an ``openArray`` spread).
+## - Use when: SQL is a literal and ergonomics matter more than zero-alloc.
+##
+## 2. `query`/`exec` with an explicit ``seq[PgParam]``
+## ----------------------------------------------------------------------
+## The baseline runtime API. Use when the SQL or the parameter list is
+## constructed dynamically (e.g. conditional ``WHERE`` clauses).
+##
+## .. code-block:: nim
+##   var params: seq[PgParam]
+##   params.add name.toPgParam
+##   params.add age.toPgParam
+##   await conn.query("SELECT id FROM users WHERE name = $1 AND age > $2", params)
+##
+## A second overload takes ``seq[PgParamInline]`` (``pgParams(a, b, c)``) which
+## avoids per-parameter heap allocations for scalar types.
+##
+## 3. `queryDirect`/`execDirect` — zero-allocation macros
+## ----------------------------------------------------------------------
+## Encodes parameters directly into the connection's send buffer at compile
+## time; no intermediate ``seq[PgParam]`` or ``seq[byte]`` is built.
+##
+## .. code-block:: nim
+##   let qr = await conn.queryDirect("SELECT name FROM users WHERE id = $1", myId)
+##
+## - Pros: no per-call allocations for the parameter path; same statement
+##   cache semantics as `query`.
+## - Cons: SQL must be a string literal/compile-time constant; arguments are
+##   positional (``$1, $2, …``), no ``{expr}`` sugar.
+## - Use when: the call site is on a hot path and params are scalars.
+##
+## 4. `simpleQuery`/`simpleExec` — simple query protocol
+## ----------------------------------------------------------------------
+## Parameter-less, text-only, single round trip. Allows multiple
+## ``;``-separated statements and session-only commands that the extended
+## protocol rejects (``SET``, ``LISTEN``, ``VACUUM``, …).
+##
+## .. code-block:: nim
+##   discard await conn.simpleExec("SET search_path TO myschema, public")
+##
+## Quick decision table
+## --------------------
+## =========================  ===================================================
+## Situation                   Prefer
+## =========================  ===================================================
+## Literal SQL, readability    ``sql"..."`` macro
+## Dynamic SQL or params       ``query(sql, params)`` / ``exec``
+## Hot path, scalar params     ``queryDirect`` / ``execDirect``
+## ``SET`` / multi-statement   ``simpleQuery`` / ``simpleExec``
+## =========================  ===================================================
+##
+## All four paths share the per-connection prepared-statement cache (except
+## ``simpleQuery``/``simpleExec`` which use the simple protocol and are not
+## cached) and honour the same ``timeout`` semantics — on timeout the
+## connection is marked closed because the wire protocol desynchronises.
+##
 ## Modules
 ## =======
 ## - `pg_connection <async_postgres/pg_connection.html>`_ — Connection management, DSN parsing, SSL, LISTEN/NOTIFY
