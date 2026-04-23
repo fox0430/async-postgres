@@ -13,6 +13,13 @@ type
   PgTypeError* = object of PgError
     ## Raised when a PostgreSQL value cannot be converted to the requested Nim type.
 
+  PgNoRowsError* = object of PgError
+    ## Raised by single-row/single-value queries when the result set is empty.
+
+  PgNullError* = object of PgError
+    ## Raised by single-value queries when the value is SQL NULL and the
+    ## caller requested a non-nullable result.
+
   PgConnectionError* = object of PgError
     ## Connection failures, disconnections, SSL/auth errors.
 
