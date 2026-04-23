@@ -175,34 +175,37 @@ suite "E2E: Cancel with invalid secret key":
 # cancel race
 
 suite "E2E: Cancel races":
-  test "cancel after query completion does not affect the next query":
+  test "cancel after query completion recovers on a subsequent query":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       # Run a quick query and wait for it to fully complete.
       let qr1 = await conn.query("SELECT 100")
       doAssert qr1.rowCount == 1
-      # Now issue a cancel — CancelRequest is best-effort: the server sends
-      # SIGINT to the backend, which has no effect if nothing is executing.
-      # Depending on timing, the cancel may also arrive while the NEXT query
-      # is in flight and abort it.
+      # Now issue a cancel — CancelRequest is best-effort: the postmaster
+      # sends SIGINT to the backend asynchronously. The signal may arrive:
+      #   (a) while the backend is idle → ignored
+      #   (b) while a subsequent query is executing → that query raises 57014
+      # A single CancelRequest delivers at most one SIGINT, so at most one
+      # subsequent query is cancelled. Under CI load the signal can be
+      # delayed long enough to hit a query later than the immediate next
+      # one — test only for recovery, not a specific target.
       await conn.cancel()
-      # Next query may or may not be cancelled depending on timing: either it
-      # succeeds, or it raises 57014. The connection must recover to csReady
-      # either way.
-      var secondOk = false
-      var secondCancelled = false
-      try:
-        let qr2 = await conn.query("SELECT 200")
-        doAssert qr2.rowCount == 1
-        secondOk = true
-      except PgQueryError as e:
-        doAssert e.isCanceled, "unexpected error on second query: " & e.sqlState
-        secondCancelled = true
-      doAssert secondOk or secondCancelled
-      doAssert conn.state == csReady
-      # A third query MUST succeed regardless — the connection is healthy.
-      let qr3 = await conn.query("SELECT 300")
-      doAssert qr3.rowCount == 1
+      # Loop until a query succeeds. At most one 57014 is expected; the
+      # connection must recover to csReady after any cancellation.
+      var recovered = false
+      var cancelCount = 0
+      for i in 1 .. 5:
+        try:
+          let qr = await conn.query("SELECT " & $(100 + i))
+          doAssert qr.rowCount == 1
+          recovered = true
+          break
+        except PgQueryError as e:
+          doAssert e.isCanceled, "unexpected error on probe " & $i & ": " & e.sqlState
+          doAssert conn.state == csReady
+          cancelCount.inc
+          doAssert cancelCount == 1, "SIGINT should be delivered at most once"
+      doAssert recovered, "connection did not recover after cancel"
       await conn.close()
 
     waitFor t()
