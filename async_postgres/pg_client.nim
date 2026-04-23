@@ -3122,6 +3122,7 @@ proc openCursorImpl(
         of bmkRowDescription:
           cursor.fields = msg.fields
           cursor.bufferedData = newRowData(int16(msg.fields.len))
+          cursor.bufferedData.fields = cursor.fields
         of bmkNoData:
           discard
         of bmkPortalSuspended:
@@ -3193,6 +3194,7 @@ proc fetchNextImpl(
 ): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
   let rd = newRowData(int16(cursor.fields.len))
+  rd.fields = cursor.fields
   var rowCount: int32 = 0
 
   conn.sendBuf.setLen(0)
@@ -3245,8 +3247,6 @@ proc fetchNextImpl(
           discard
       await conn.fillRecvBuf(timeout)
 
-  if rd != nil and cursor.fields.len > 0 and rd.fields.len == 0:
-    rd.fields = cursor.fields
   result = newSeq[Row](rowCount)
   for i in 0 ..< rowCount:
     result[i] = initRow(rd, i)
@@ -3256,8 +3256,6 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Returns an empty seq when the cursor is exhausted.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if cursor.bufferedCount > 0:
-    if cursor.fields.len > 0 and cursor.bufferedData.fields.len == 0:
-      cursor.bufferedData.fields = cursor.fields
     result = newSeq[Row](cursor.bufferedCount)
     for i in 0 ..< cursor.bufferedCount:
       result[i] = initRow(cursor.bufferedData, i)
