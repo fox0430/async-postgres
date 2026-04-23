@@ -68,8 +68,10 @@
 ##   params.add age.toPgParam
 ##   await conn.query("SELECT id FROM users WHERE name = $1 AND age > $2", params)
 ##
-## A second overload takes ``seq[PgParamInline]`` (``pgParams(a, b, c)``) which
-## avoids per-parameter heap allocations for scalar types.
+## The ``pgParams(a, b, c)`` macro builds a ``seq[PgParam]`` in one call. A
+## second overload takes ``seq[PgParamInline]`` — constructed manually as
+## ``@[toPgParamInline(a), toPgParamInline(b)]`` — which avoids per-parameter
+## heap allocations for scalar types.
 ##
 ## 3. `queryDirect`/`execDirect` — zero-allocation macros
 ## ----------------------------------------------------------------------
@@ -105,10 +107,13 @@
 ## ``SET`` / multi-statement   ``simpleQuery`` / ``simpleExec``
 ## =========================  ===================================================
 ##
-## All four paths share the per-connection prepared-statement cache (except
-## ``simpleQuery``/``simpleExec`` which use the simple protocol and are not
-## cached) and honour the same ``timeout`` semantics — on timeout the
+## ``sql"..."``, ``query``/``exec``, and ``queryDirect``/``execDirect`` share
+## the per-connection prepared-statement cache; ``simpleQuery``/``simpleExec``
+## use the simple protocol and are not cached. A ``timeout`` parameter is
+## accepted by ``query``/``exec`` and ``simpleExec``; on timeout the
 ## connection is marked closed because the wire protocol desynchronises.
+## ``queryDirect``/``execDirect`` and ``simpleQuery`` currently do not accept
+## a timeout.
 ##
 ## Modules
 ## =======
