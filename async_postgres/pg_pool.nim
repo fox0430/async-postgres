@@ -745,8 +745,6 @@ proc queryRowOpt*(
   ## Execute a query and return the first row, or `none` if no rows.
   let qr = await pool.query(sql, params, resultFormat, timeout)
   if qr.rowCount > 0:
-    if qr.fields.len > 0 and qr.data.fields.len == 0:
-      qr.data.fields = qr.fields
     return some(initRow(qr.data, 0))
   return none(Row)
 
@@ -758,11 +756,11 @@ proc queryRow*(
     timeout: Duration = ZeroDuration,
 ): Future[Row] {.async.} =
   ## Execute a query and return the first row.
-  ## Raises `PgError` if no rows are returned.
+  ## Raises `PgNoRowsError` if no rows are returned.
   let row =
     await pool.queryRowOpt(sql, params, resultFormat = resultFormat, timeout = timeout)
   if row.isNone:
-    raise newException(PgError, "Query returned no rows")
+    raise newException(PgNoRowsError, "Query returned no rows")
   return row.get
 
 proc queryValue*(
@@ -772,13 +770,13 @@ proc queryValue*(
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
-  ## Raises `PgError` if no rows or the value is NULL.
+  ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
-    raise newException(PgError, "Query returned no rows")
+    raise newException(PgNoRowsError, "Query returned no rows")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
-    raise newException(PgError, "Query returned NULL")
+    raise newException(PgNullError, "Query returned NULL")
   return row.getStr(0)
 
 proc queryValue*[T](
@@ -789,13 +787,13 @@ proc queryValue*[T](
     timeout: Duration = ZeroDuration,
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
-  ## Raises `PgError` if no rows or the value is NULL.
+  ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
-    raise newException(PgError, "Query returned no rows")
+    raise newException(PgNoRowsError, "Query returned no rows")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
-    raise newException(PgError, "Query returned NULL")
+    raise newException(PgNullError, "Query returned NULL")
   return row.get(0, T)
 
 proc queryValueOpt*(
@@ -901,12 +899,12 @@ proc queryColumn*(
     timeout: Duration = ZeroDuration,
 ): Future[seq[string]] {.async.} =
   ## Execute a query and return the first column of all rows as strings.
-  ## Raises PgTypeError if any value is NULL.
+  ## Raises `PgNullError` if any value is NULL.
   let qr = await pool.query(sql, params, timeout = timeout)
   for i in 0 ..< qr.rowCount:
     let row = initRow(qr.data, i)
     if row.isNull(0):
-      raise newException(PgTypeError, "NULL value in column")
+      raise newException(PgNullError, "NULL value in column")
     result.add(row.getStr(0))
 
 proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.} =

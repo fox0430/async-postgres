@@ -4952,7 +4952,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryRow("SELECT 1 WHERE false")
-      except PgError:
+      except PgNoRowsError:
         raised = true
       doAssert raised
       await conn.close()
@@ -4974,7 +4974,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue("SELECT 1 WHERE false")
-      except PgError:
+      except PgNoRowsError:
         raised = true
       doAssert raised
       await conn.close()
@@ -4987,7 +4987,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue("SELECT NULL::text")
-      except PgError:
+      except PgNullError:
         raised = true
       doAssert raised
       await conn.close()
@@ -5043,7 +5043,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue(int32, "SELECT 1 WHERE false")
-      except PgError:
+      except PgNoRowsError:
         raised = true
       doAssert raised
       await conn.close()
@@ -5056,7 +5056,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue(int64, "SELECT NULL::int8")
-      except PgError:
+      except PgNullError:
         raised = true
       doAssert raised
       await conn.close()
@@ -5184,7 +5184,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryColumn("SELECT NULL::text")
-      except PgTypeError:
+      except PgNullError:
         raised = true
       doAssert raised
       await conn.close()
@@ -5271,7 +5271,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await pool.queryRow("SELECT 1 WHERE false")
-      except PgError:
+      except PgNoRowsError:
         raised = true
       doAssert raised
       await pool.close()
@@ -5283,6 +5283,32 @@ suite "E2E: Convenience Query Methods":
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
       let val = await pool.queryValue("SELECT 99")
       doAssert val == "99"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue raises on no rows":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue("SELECT 1 WHERE false")
+      except PgNoRowsError:
+        raised = true
+      doAssert raised
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue raises on NULL":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue("SELECT NULL::text")
+      except PgNullError:
+        raised = true
+      doAssert raised
       await pool.close()
 
     waitFor t()
@@ -5332,6 +5358,32 @@ suite "E2E: Convenience Query Methods":
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
       let val = await pool.queryValue(int64, "SELECT 123")
       doAssert val == 123'i64
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue with typedesc raises on no rows":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue(int32, "SELECT 1 WHERE false")
+      except PgNoRowsError:
+        raised = true
+      doAssert raised
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue with typedesc raises on NULL":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue(int64, "SELECT NULL::int8")
+      except PgNullError:
+        raised = true
+      doAssert raised
       await pool.close()
 
     waitFor t()
