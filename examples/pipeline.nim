@@ -49,8 +49,8 @@ proc main() {.async.} =
       echo "Operation ", i, " (", r.queryResult.rowCount, " rows):"
       for row in r.queryResult.rows:
         var cols: seq[string]
-        for j in 0 ..< r.queryResult.fields.len:
-          cols.add(r.queryResult.fields[j].name & "=" & row.getStr(j))
+        for field in r.queryResult.fields:
+          cols.add(field.name & "=" & row.getStr(field.name))
         echo "  ", cols.join(", ")
 
 waitFor main()
