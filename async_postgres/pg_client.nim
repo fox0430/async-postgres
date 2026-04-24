@@ -163,6 +163,10 @@ type
     inlineRanges: seq[tuple[off: int32, len: int32]]
     inlineOids: seq[int32]
     inlineFormats: seq[int16]
+    autoReset*: bool
+      ## When true, `execute`/`executeIsolated` call `reset()` in a `finally`
+      ## block so the Pipeline can be safely reused without leaking state from
+      ## the previous run. Default: false (backward-compatible).
 
   IsolatedPipelineResults* = object
     ## Results from `executeIsolated`: per-op error isolation via per-query SYNC.
@@ -2481,9 +2485,24 @@ proc queryInTransaction*(
       )
   return qr
 
-proc newPipeline*(conn: PgConnection): Pipeline =
+proc newPipeline*(conn: PgConnection, autoReset: bool = false): Pipeline =
   ## Create a new pipeline for batching multiple operations into a single round trip.
-  Pipeline(conn: conn, ops: @[])
+  ## When `autoReset` is true, the pipeline's queued ops and inline buffers are
+  ## cleared automatically after each `execute`/`executeIsolated` call, making
+  ## it safe to reuse the same Pipeline instance.
+  Pipeline(conn: conn, ops: @[], autoReset: autoReset)
+
+proc reset*(p: Pipeline) =
+  ## Clear all queued ops and inline SoA buffers. Safe to call at any time,
+  ## including while the pipeline is empty. Does not affect the underlying
+  ## connection or its statement cache. When `p.autoReset` is true,
+  ## `execute`/`executeIsolated` call this automatically (including on raise),
+  ## so manual calls are only needed when `autoReset` is false.
+  p.ops.setLen(0)
+  p.inlineData.setLen(0)
+  p.inlineRanges.setLen(0)
+  p.inlineOids.setLen(0)
+  p.inlineFormats.setLen(0)
 
 proc appendInline(
     p: Pipeline, params: openArray[PgParamInline]
@@ -2801,24 +2820,30 @@ proc execute*(
 ): Future[seq[PipelineResult]] {.async.} =
   ## Execute all queued pipeline operations in a single round trip.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if p.ops.len == 0:
-    return @[]
+  ## When `p.autoReset` is true, the pipeline is reset on exit (including on
+  ## raise) so it can be safely reused.
   var results: seq[PipelineResult]
-  withConnTracing(
-    p.conn,
-    onPipelineStart,
-    onPipelineEnd,
-    TracePipelineStartData(opCount: p.ops.len),
-    TracePipelineEndData,
-    TracePipelineEndData(),
-  ):
-    if timeout > ZeroDuration:
-      try:
-        results = await executeImpl(p, timeout).wait(timeout)
-      except AsyncTimeoutError:
-        p.conn.invalidateOnTimeout("Pipeline execute timed out")
-    else:
-      results = await executeImpl(p, timeout)
+  try:
+    if p.ops.len == 0:
+      return @[]
+    withConnTracing(
+      p.conn,
+      onPipelineStart,
+      onPipelineEnd,
+      TracePipelineStartData(opCount: p.ops.len),
+      TracePipelineEndData,
+      TracePipelineEndData(),
+    ):
+      if timeout > ZeroDuration:
+        try:
+          results = await executeImpl(p, timeout).wait(timeout)
+        except AsyncTimeoutError:
+          p.conn.invalidateOnTimeout("Pipeline execute timed out")
+      else:
+        results = await executeImpl(p, timeout)
+  finally:
+    if p.autoReset:
+      p.reset()
   return results
 
 proc executeIsolatedImpl(
@@ -3055,24 +3080,30 @@ proc executeIsolated*(
   ## Each operation gets its own SYNC message, so a failed operation does not
   ## abort subsequent ones. Returns results and per-op errors.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if p.ops.len == 0:
-    return IsolatedPipelineResults(results: @[], errors: @[])
+  ## When `p.autoReset` is true, the pipeline is reset on exit (including on
+  ## raise) so it can be safely reused.
   var ir: IsolatedPipelineResults
-  withConnTracing(
-    p.conn,
-    onPipelineStart,
-    onPipelineEnd,
-    TracePipelineStartData(opCount: p.ops.len),
-    TracePipelineEndData,
-    TracePipelineEndData(),
-  ):
-    if timeout > ZeroDuration:
-      try:
-        ir = await executeIsolatedImpl(p, timeout).wait(timeout)
-      except AsyncTimeoutError:
-        p.conn.invalidateOnTimeout("Pipeline executeIsolated timed out")
-    else:
-      ir = await executeIsolatedImpl(p, timeout)
+  try:
+    if p.ops.len == 0:
+      return IsolatedPipelineResults(results: @[], errors: @[])
+    withConnTracing(
+      p.conn,
+      onPipelineStart,
+      onPipelineEnd,
+      TracePipelineStartData(opCount: p.ops.len),
+      TracePipelineEndData,
+      TracePipelineEndData(),
+    ):
+      if timeout > ZeroDuration:
+        try:
+          ir = await executeIsolatedImpl(p, timeout).wait(timeout)
+        except AsyncTimeoutError:
+          p.conn.invalidateOnTimeout("Pipeline executeIsolated timed out")
+      else:
+        ir = await executeIsolatedImpl(p, timeout)
+  finally:
+    if p.autoReset:
+      p.reset()
   return ir
 
 proc openCursorImpl(
