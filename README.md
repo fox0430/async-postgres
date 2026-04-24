@@ -129,6 +129,8 @@ SSL backend differs by async backend:
 The [examples](examples/) directory contains runnable samples:
 
 - [basic_query](examples/basic_query.nim) — Connect, insert, and query rows
+- [query_variants](examples/query_variants.nim) — `queryExists` / `queryValueOrDefault` / `queryValueOpt` / `queryRowOpt` / `queryColumn` / `queryEach` / `simpleExec` / `simpleQuery`
+- [query_direct](examples/query_direct.nim) — Zero-allocation `queryDirect` / `execDirect` macros for hot paths
 - [prepared_statement](examples/prepared_statement.nim) — Server-side prepared statements
 - [transaction](examples/transaction.nim) — Transaction control with rollback and isolation levels
 - [cursor](examples/cursor.nim) — Server-side cursors for streaming large result sets
