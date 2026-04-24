@@ -75,7 +75,9 @@ jobs:
         run: nimble test -y
 
       - name: Install async_postgres
-        run: nimble install -y
+        run: |
+          rm -rf ~/.nimble/pkgs2/async_postgres-*
+          nimble install -y
 
       - name: Compile examples (asyncdispatch)
         run: for f in examples/*.nim; do nim c "$f"; done

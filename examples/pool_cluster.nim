@@ -10,17 +10,17 @@
 import pkg/async_postgres
 
 proc main() {.async.} =
-  let connConfig = ConnConfig(
-    host: "127.0.0.1",
-    port: 15432,
-    user: "test",
-    password: "test",
-    database: "test",
-    sslMode: sslDisable,
+  let connConfig = initConnConfig(
+    host = "127.0.0.1",
+    port = 15432,
+    user = "test",
+    password = "test",
+    database = "test",
+    sslMode = sslDisable,
   )
 
-  let primaryConfig = PoolConfig(connConfig: connConfig, minSize: 1, maxSize: 3)
-  let replicaConfig = PoolConfig(connConfig: connConfig, minSize: 1, maxSize: 3)
+  let primaryConfig = initPoolConfig(connConfig, minSize = 1, maxSize = 3)
+  let replicaConfig = initPoolConfig(connConfig, minSize = 1, maxSize = 3)
 
   # fallbackPrimary: if replica is unavailable, fall back to primary for reads
   let cluster =

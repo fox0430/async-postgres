@@ -37,7 +37,7 @@ proc main() {.async.} =
       let size = await lo.loSize()
       echo "Size: ", size, " bytes"
 
-  # Streaming read
+  # Streaming read, then clean up in the same transaction
   conn.withTransaction:
     conn.withLargeObject(lo, oid, INV_READ):
       echo "\nStreaming read:"
@@ -45,8 +45,6 @@ proc main() {.async.} =
         echo "  chunk (", data.len, " bytes): ", data.toString()
       await lo.loReadStream(cb, chunkSize = 10)
 
-  # Clean up
-  conn.withTransaction:
     await conn.loUnlink(oid)
     echo "\nDeleted Large Object: oid=", oid
 
