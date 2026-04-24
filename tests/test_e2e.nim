@@ -6273,6 +6273,128 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: reset clears queued ops and allows reuse":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT $1::int4", @[toPgParam(1'i32)])
+      p.addQuery("SELECT $1::int4", @[toPgParam(2'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 2
+
+      # Without reset, queued ops would be executed again.
+      p.reset()
+      let r0 = await p.execute()
+      doAssert r0.len == 0
+
+      # Reused instance is healthy for a brand-new batch.
+      p.addQuery("SELECT $1::text", @[toPgParam("reused")])
+      let r2 = await p.execute()
+      doAssert r2.len == 1
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "reused"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: reset on empty pipeline is a no-op":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn)
+      p.reset()
+      p.reset()
+      let results = await p.execute()
+      doAssert results.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: autoReset clears state after execute":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn, autoReset = true)
+      p.addQuery("SELECT $1::int4", @[toPgParam(10'i32)])
+      p.addQuery("SELECT $1::int4", @[toPgParam(20'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 2
+
+      # After the first execute(), autoReset has cleared queued ops, so
+      # calling execute() again produces an empty result without replaying.
+      let r0 = await p.execute()
+      doAssert r0.len == 0
+
+      # Same instance is safe to reuse for a new batch.
+      p.addQuery("SELECT $1::text", @[toPgParam("auto")])
+      let r2 = await p.execute()
+      doAssert r2.len == 1
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "auto"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: autoReset clears state after executeIsolated (incl. on error)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn, autoReset = true)
+      p.addQuery("SELECT 1::int4")
+      p.addQuery("SELECT * FROM __definitely_missing_table__")
+      p.addQuery("SELECT 2::int4")
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      doAssert ir.errors.len == 3
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert ir.errors[2] == nil
+
+      # After executeIsolated, autoReset should have cleared queued ops.
+      let ir0 = await p.executeIsolated()
+      doAssert ir0.results.len == 0
+      doAssert ir0.errors.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: autoReset clears state when execute raises":
+    # execute() uses a single SYNC, so a failing op aborts the batch and the
+    # await re-raises. Confirms the finally-path reset runs on raise.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn, autoReset = true)
+      p.addExec("SELECT 1")
+      p.addExec("INVALID SQL THAT WILL FAIL")
+      p.addExec("SELECT 2")
+      var gotError = false
+      try:
+        discard await p.execute()
+      except PgError:
+        gotError = true
+      doAssert gotError
+
+      # Connection should still be usable after the error.
+      doAssert conn.state == csReady
+
+      # autoReset must have cleared queued ops even though execute() raised.
+      let r0 = await p.execute()
+      doAssert r0.len == 0
+
+      # Reused instance is healthy for a brand-new batch.
+      p.addQuery("SELECT $1::int4", @[toPgParam(42'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 1
+      doAssert r1[0].queryResult.rows[0].getStr(0) == "42"
+
+      await conn.close()
+
+    waitFor t()
+
   test "pipeline: pool withPipeline":
     proc t() {.async.} =
       let pool =
