@@ -177,6 +177,11 @@ type
     sendBuf: seq[byte] ## Reusable send buffer for COPY IN batching
     notifyDropped: int ## Count of notifications dropped due to queue overflow
     listenErrorMsg: string ## Set when listen pump fails permanently
+    listenReconnectMaxAttempts: int
+      ## Max reconnect attempts on listen pump failure. Default 10.
+      ## 0 or negative = unlimited retries (retry until close()).
+    listenReconnectMaxBackoff: int
+      ## Max seconds between reconnect attempts (backoff cap). Default 30.
     reconnectCallback: proc() {.gcsafe, raises: [].}
     notifyOverflowCallback: proc(dropped: int) {.gcsafe, raises: [].}
     stmtCache: Table[string, CachedStmt]
@@ -417,6 +422,14 @@ func notifyMaxQueue*(conn: PgConnection): int {.inline.} =
   ## The maximum notification queue size (0 = unlimited).
   conn.notifyMaxQueue
 
+func listenReconnectMaxAttempts*(conn: PgConnection): int {.inline.} =
+  ## Max reconnect attempts on listen pump failure (0 or negative = unlimited).
+  conn.listenReconnectMaxAttempts
+
+func listenReconnectMaxBackoff*(conn: PgConnection): int {.inline.} =
+  ## Maximum seconds between reconnect attempts (backoff cap).
+  conn.listenReconnectMaxBackoff
+
 # Public API: read-write accessors
 
 func state*(conn: PgConnection): var PgConnState {.inline.} =
@@ -474,6 +487,15 @@ proc `noticeCallback=`*(conn: PgConnection, cb: NoticeCallback) {.inline.} =
 proc `notifyMaxQueue=`*(conn: PgConnection, val: int) {.inline.} =
   ## Set the maximum notification queue size (0 = unlimited).
   conn.notifyMaxQueue = val
+
+proc `listenReconnectMaxAttempts=`*(conn: PgConnection, val: int) {.inline.} =
+  ## Set the maximum reconnect attempts for the listen pump.
+  ## 0 or negative = unlimited retries (retry until close()).
+  conn.listenReconnectMaxAttempts = val
+
+proc `listenReconnectMaxBackoff=`*(conn: PgConnection, val: int) {.inline.} =
+  ## Set the maximum seconds between reconnect attempts (backoff cap).
+  conn.listenReconnectMaxBackoff = val
 
 proc `notifyOverflowCallback=`*(
     conn: PgConnection, cb: proc(dropped: int) {.gcsafe, raises: [].}
@@ -1322,6 +1344,8 @@ proc connectToHost(
       config: config,
       notifyMaxQueue: 1024,
       stmtCacheCapacity: 256,
+      listenReconnectMaxAttempts: 10,
+      listenReconnectMaxBackoff: 30,
     )
   elif hasAsyncDispatch:
     let sock =
@@ -1368,6 +1392,8 @@ proc connectToHost(
       config: config,
       notifyMaxQueue: 1024,
       stmtCacheCapacity: 256,
+      listenReconnectMaxAttempts: 10,
+      listenReconnectMaxBackoff: 30,
     )
 
   try:
@@ -1959,7 +1985,8 @@ proc listenPump(conn: PgConnection) {.async.} =
   ## Background loop: repeatedly receives messages, dispatching notifications.
   ## Non-notification messages are discarded (recvMessage handles dispatch).
   ## On connection failure, attempts automatic reconnection with exponential
-  ## backoff (up to 10 attempts) and re-subscribes to all channels.
+  ## backoff (up to `listenReconnectMaxAttempts` attempts; 0 or negative =
+  ## unlimited) and re-subscribes to all channels.
   ## Exits cleanly when state changes from csListening (via stopListening
   ## sending an empty query), then drains until ReadyForQuery.
   while true:
@@ -1985,9 +2012,13 @@ proc listenPump(conn: PgConnection) {.async.} =
           conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
         return
       # Auto-reconnect with exponential backoff
+      let maxAttempts = conn.listenReconnectMaxAttempts
+      let maxBackoff = max(1, conn.listenReconnectMaxBackoff)
+      let unlimited = maxAttempts <= 0
       var reconnected = false
       var backoff = 1
-      for attempt in 0 ..< 10:
+      var attempt = 0
+      while unlimited or attempt < maxAttempts:
         try:
           await sleepAsync(seconds(backoff))
           await conn.reconnectInPlace()
@@ -1999,10 +2030,12 @@ proc listenPump(conn: PgConnection) {.async.} =
         except CancelledError:
           return
         except CatchableError:
-          backoff = min(backoff * 2, 30)
+          backoff = min(backoff * 2, maxBackoff)
+        inc attempt
       if not reconnected:
         conn.listenErrorMsg =
-          "Listen connection lost: reconnection failed after 10 attempts"
+          "Listen connection lost: reconnection failed after " & $maxAttempts &
+          " attempts"
         conn.state = csClosed
         if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
           conn.notifyWaiter.fail(newException(PgError, conn.listenErrorMsg))
