@@ -4042,6 +4042,88 @@ when hasChronos:
 
       waitFor t()
 
+    test "listenReconnect config defaults":
+      proc t() {.async.} =
+        let conn = await connect(plainConfig())
+        doAssert conn.listenReconnectMaxAttempts == 10
+        doAssert conn.listenReconnectMaxBackoff == 30
+        await conn.close()
+
+      waitFor t()
+
+    test "listenReconnect config setters":
+      proc t() {.async.} =
+        let conn = await connect(plainConfig())
+        conn.listenReconnectMaxAttempts = 3
+        conn.listenReconnectMaxBackoff = 5
+        doAssert conn.listenReconnectMaxAttempts == 3
+        doAssert conn.listenReconnectMaxBackoff == 5
+        # 0 = unlimited (sentinel)
+        conn.listenReconnectMaxAttempts = 0
+        doAssert conn.listenReconnectMaxAttempts == 0
+        await conn.close()
+
+      waitFor t()
+
+    test "auto-reconnect honors custom maxAttempts setting":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        listener.listenReconnectMaxAttempts = 2
+        listener.listenReconnectMaxBackoff = 1
+
+        var reconnected = false
+        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+          reconnected = true
+
+        await listener.listen("reconn_custom")
+
+        let killer = await connect(plainConfig())
+        try:
+          discard await killer.exec(
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
+          )
+        except PgError:
+          discard
+        await killer.close()
+
+        # First retry runs after backoff=1s; reconnect should succeed.
+        await sleepAsync(milliseconds(3000))
+        doAssert reconnected
+        doAssert listener.state == csListening
+
+        await listener.close()
+
+      waitFor t()
+
+    test "auto-reconnect with unlimited attempts (maxAttempts=0)":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        listener.listenReconnectMaxAttempts = 0 # unlimited
+        listener.listenReconnectMaxBackoff = 1
+
+        var reconnected = false
+        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+          reconnected = true
+
+        await listener.listen("reconn_unlimited")
+
+        let killer = await connect(plainConfig())
+        try:
+          discard await killer.exec(
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
+          )
+        except PgError:
+          discard
+        await killer.close()
+
+        await sleepAsync(milliseconds(3000))
+        doAssert reconnected
+        doAssert listener.state == csListening
+
+        await listener.close()
+
+      waitFor t()
+
     test "waitNotification fails on close":
       proc t() {.async.} =
         let listener = await connect(plainConfig())
