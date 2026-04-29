@@ -450,6 +450,9 @@ proc encodeSSLRequest*(): seq[byte] =
 
 proc encodePassword*(password: string): seq[byte] =
   ## Encode a PasswordMessage for cleartext or MD5 authentication.
+  ## Pre-allocates the buffer so internal `add` calls do not realloc and
+  ## leave residual copies of the password in freed heap memory.
+  result = newSeqOfCap[byte](1 + 4 + password.len + 1)
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.addCString(password)

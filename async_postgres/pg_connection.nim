@@ -3,6 +3,7 @@ when defined(posix):
   import std/posix
 
 import async_backend, pg_errors, pg_protocol, pg_auth, pg_types
+import pkg/nimcrypto/utils as ncutils
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -1433,12 +1434,21 @@ proc connectToHost(
             if not conn.sslEnabled:
               fireInsecureAuth(conn, amPassword)
             enforceAuthAllowed(amPassword, config.requireAuth)
-            await conn.sendMsg(encodePassword(config.password))
+            var pwMsg = encodePassword(config.password)
+            try:
+              await conn.sendMsg(pwMsg)
+            finally:
+              ncutils.burnMem(pwMsg)
           of bmkAuthenticationMD5Password:
             sawAuthRequest = true
             enforceAuthAllowed(amMd5, config.requireAuth)
-            let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
-            await conn.sendMsg(encodePassword(hash))
+            var hash = md5AuthHash(config.user, config.password, msg.md5Salt)
+            var hashMsg = encodePassword(hash)
+            burnStr(hash)
+            try:
+              await conn.sendMsg(hashMsg)
+            finally:
+              ncutils.burnMem(hashMsg)
           of bmkAuthenticationSASL:
             sawAuthRequest = true
             let filtered =
@@ -1468,11 +1478,18 @@ proc connectToHost(
             )
             await conn.sendMsg(encodeSASLInitialResponse(choice.mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
-            let clientFinal =
+            var clientFinal =
               scramClientFinalMessage(config.password, msg.saslData, scramState)
-            await conn.sendMsg(encodeSASLResponse(clientFinal))
+            var saslMsg = encodeSASLResponse(clientFinal)
+            ncutils.burnMem(clientFinal)
+            try:
+              await conn.sendMsg(saslMsg)
+            finally:
+              ncutils.burnMem(saslMsg)
           of bmkAuthenticationSASLFinal:
-            if not scramVerifyServerFinal(msg.saslFinalData, scramState):
+            let ok = scramVerifyServerFinal(msg.saslFinalData, scramState)
+            ncutils.burnMem(scramState.serverSignature)
+            if not ok:
               raise newException(
                 PgConnectionError, "SCRAM server signature verification failed"
               )
