@@ -114,6 +114,16 @@ proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
   else:
     0'i32
 
+const NumericBinaryHeaderLen = 8
+  ## Minimum byte length of a binary numeric value (4 x int16: ndigits, weight, sign, dscale).
+
+template raiseIfBadNumericBinary(col, clen: int) =
+  if clen < NumericBinaryHeaderLen:
+    raise newException(
+      PgTypeError,
+      "Column " & $col & ": unexpected binary length " & $clen & " for numeric",
+    )
+
 proc getStr*(row: Row, col: int): string =
   ## Get a column value as a string. Handles binary-to-text conversion for
   ## common types (bool, int2/4/8, float4/8). Raises `PgTypeError` on NULL.
@@ -125,41 +135,67 @@ proc getStr*(row: Row, col: int): string =
     let b = row.data.buf
     case oid
     of 16: # bool
+      if clen != 1:
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": unexpected binary length " & $clen & " for bool",
+        )
       return if b[off] != 0: "t" else: "f"
     of 21: # int2
-      if clen == 2:
-        return $int16((uint16(b[off]) shl 8) or uint16(b[off + 1]))
+      if clen != 2:
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": unexpected binary length " & $clen & " for int2",
+        )
+      return $int16((uint16(b[off]) shl 8) or uint16(b[off + 1]))
     of 23: # int4
-      if clen == 4:
-        return $int32(
-          (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-            (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+      if clen != 4:
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": unexpected binary length " & $clen & " for int4",
         )
+      return $int32(
+        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+          (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+      )
     of 20: # int8
-      if clen == 8:
-        return $int64(
-          (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
-            (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
-            (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
-            (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+      if clen != 8:
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": unexpected binary length " & $clen & " for int8",
         )
+      return $int64(
+        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
+          (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
+          (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
+          (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+      )
     of 700: # float4
-      if clen == 4:
-        let bits = uint32(
-          (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-            (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+      if clen != 4:
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": unexpected binary length " & $clen & " for float4",
         )
-        return $cast[float32](bits)
+      let bits = uint32(
+        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
+          (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
+      )
+      return $cast[float32](bits)
     of 701: # float8
-      if clen == 8:
-        let bits = uint64(
-          (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
-            (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
-            (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
-            (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+      if clen != 8:
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": unexpected binary length " & $clen & " for float8",
         )
-        return $cast[float64](bits)
+      let bits = uint64(
+        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
+          (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
+          (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
+          (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
+      )
+      return $cast[float64](bits)
     of OidNumeric:
+      raiseIfBadNumericBinary(col, clen)
       return $decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
     else:
       discard # text, varchar, bytea: fall through to raw copy
@@ -180,6 +216,11 @@ proc getInt*(row: Row, col: int): int32 =
     elif clen == 2:
       let b = row.data.buf
       return int32(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
+    else:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for int32",
+      )
   var v: int
   if parseInt(row.bufView(off, clen), v) == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
@@ -194,10 +235,11 @@ proc getInt16*(row: Row, col: int): int16 =
     if clen == 2:
       let b = row.data.buf
       return int16((uint16(b[off]) shl 8) or uint16(b[off + 1]))
-    raise newException(
-      PgTypeError,
-      "Column " & $col & ": unexpected binary length " & $clen & " for int16",
-    )
+    else:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for int16",
+      )
   var v: int
   if parseInt(row.bufView(off, clen), v) == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
@@ -228,6 +270,11 @@ proc getInt64*(row: Row, col: int): int64 =
     elif clen == 2:
       let b = row.data.buf
       return int64(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
+    else:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for int64",
+      )
   var v: BiggestInt
   if parseBiggestInt(row.bufView(off, clen), v) == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid int64 value")
@@ -253,7 +300,13 @@ proc getFloat*(row: Row, col: int): float64 =
         (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
         (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
       return float64(cast[float32](bits))
-  discard parseFloat(row.bufView(off, clen), result)
+    else:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for float64",
+      )
+  if parseFloat(row.bufView(off, clen), result) == 0:
+    raise newException(PgTypeError, "Column " & $col & ": invalid float value")
 
 proc getFloat32*(row: Row, col: int): float32 =
   ## Get a column value as float32. Handles binary float4 directly. Raises `PgTypeError` on NULL.
@@ -267,6 +320,11 @@ proc getFloat32*(row: Row, col: int): float32 =
         (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
         (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
       return cast[float32](bits)
+    else:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for float32",
+      )
   var f: float64
   if parseFloat(row.bufView(off, clen), f) == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid float32 value")
@@ -278,8 +336,8 @@ proc getNumeric*(row: Row, col: int): PgNumeric =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    if clen >= 8:
-      return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
+    raiseIfBadNumericBinary(col, clen)
+    return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   parsePgNumeric(row.getStr(col))
 
 proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
@@ -311,19 +369,23 @@ proc getUuid*(row: Row, col: int): PgUuid =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    if clen == 16:
-      const hexChars = "0123456789abcdef"
-      var s = newString(36)
-      var pos = 0
-      for i in 0 ..< 16:
-        if i == 4 or i == 6 or i == 8 or i == 10:
-          s[pos] = '-'
-          inc pos
-        let b = row.data.buf[off + i]
-        s[pos] = hexChars[int(b shr 4)]
-        s[pos + 1] = hexChars[int(b and 0x0F)]
-        pos += 2
-      return PgUuid(s)
+    if clen != 16:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for uuid",
+      )
+    const hexChars = "0123456789abcdef"
+    var s = newString(36)
+    var pos = 0
+    for i in 0 ..< 16:
+      if i == 4 or i == 6 or i == 8 or i == 10:
+        s[pos] = '-'
+        inc pos
+      let b = row.data.buf[off + i]
+      s[pos] = hexChars[int(b shr 4)]
+      s[pos + 1] = hexChars[int(b and 0x0F)]
+      pos += 2
+    return PgUuid(s)
   PgUuid(row.getStr(col))
 
 proc getBool*(row: Row, col: int): bool =
@@ -332,6 +394,11 @@ proc getBool*(row: Row, col: int): bool =
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    if clen != 1:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for bool",
+      )
     return row.data.buf[off] != 0
   let c = char(row.data.buf[off])
   case c
@@ -372,6 +439,11 @@ proc getTimestamp*(row: Row, col: int): DateTime =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 8:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for timestamp",
+      )
     return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
   return parseTimestampText(s)
@@ -382,6 +454,11 @@ proc getDate*(row: Row, col: int): DateTime =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 4:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for date",
+      )
     return decodeBinaryDate(row.data.buf.toOpenArray(off, off + 3))
   let s = row.getStr(col)
   try:
@@ -395,6 +472,11 @@ proc getTimestampTz*(row: Row, col: int): DateTime =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 8:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for timestamptz",
+      )
     return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
   return parseTimestampText(s)
@@ -405,6 +487,11 @@ proc getTime*(row: Row, col: int): PgTime =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 8:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for time",
+      )
     return decodeBinaryTime(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
   return parseTimeText(s)
@@ -415,6 +502,11 @@ proc getTimeTz*(row: Row, col: int): PgTimeTz =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen != 12:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": unexpected binary length " & $clen & " for timetz",
+      )
     return decodeBinaryTimeTz(row.data.buf.toOpenArray(off, off + 11))
   let s = row.getStr(col)
   return parseTimeTzText(s)
@@ -647,9 +739,25 @@ proc getPath*(row: Row, col: int): PgPath =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen < 5:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": binary path header too short (" & $clen & " bytes)",
+      )
     let b = row.data.buf
     result.closed = b[off] != 0
     let npts = fromBE32(b.toOpenArray(off + 1, off + 4))
+    if npts < 0:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": binary path has negative point count " & $npts,
+      )
+    if npts > (clen - 5) div 16:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": binary path " & $npts & " points exceed " & $clen &
+          "-byte cell",
+      )
     result.points = newSeq[PgPoint](npts)
     for i in 0 ..< npts:
       result.points[i] = decodePointBinary(b, off + 5 + i * 16)
@@ -668,8 +776,24 @@ proc getPolygon*(row: Row, col: int): PgPolygon =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
+    if clen < 4:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": binary polygon header too short (" & $clen & " bytes)",
+      )
     let b = row.data.buf
     let npts = fromBE32(b.toOpenArray(off, off + 3))
+    if npts < 0:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": binary polygon has negative point count " & $npts,
+      )
+    if npts > (clen - 4) div 16:
+      raise newException(
+        PgTypeError,
+        "Column " & $col & ": binary polygon " & $npts & " points exceed " & $clen &
+          "-byte cell",
+      )
     result.points = newSeq[PgPoint](npts)
     for i in 0 ..< npts:
       result.points[i] = decodePointBinary(b, off + 4 + i * 16)
@@ -772,6 +896,10 @@ proc getIntArray*(row: Row, col: int): seq[int32] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in int array")
+      if e.len != 4:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for int4 array"
+        )
       result[i] =
         fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
     return
@@ -793,6 +921,10 @@ proc getInt16Array*(row: Row, col: int): seq[int16] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in int16 array")
+      if e.len != 2:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for int2 array"
+        )
       result[i] =
         fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
     return
@@ -814,6 +946,10 @@ proc getInt64Array*(row: Row, col: int): seq[int64] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in int64 array")
+      if e.len != 8:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for int8 array"
+        )
       result[i] =
         fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
     return
@@ -840,6 +976,10 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in money array")
+      if e.len != 8:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
+        )
       result[i] = PgMoney(
         amount: fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
         scale: int8(scale),
@@ -869,10 +1009,14 @@ proc getFloatArray*(row: Row, col: int): seq[float64] =
             row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
           )))
         )
-      else:
+      elif e.len == 8:
         result[i] = cast[float64](cast[uint64](fromBE64(
           row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
         )))
+      else:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for float array"
+        )
     return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
@@ -892,6 +1036,11 @@ proc getFloat32Array*(row: Row, col: int): seq[float32] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in float32 array")
+      if e.len != 4:
+        raise newException(
+          PgTypeError,
+          "Unexpected binary element length " & $e.len & " for float32 array",
+        )
       result[i] = cast[float32](cast[uint32](fromBE32(
         row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
       )))
@@ -914,6 +1063,10 @@ proc getBoolArray*(row: Row, col: int): seq[bool] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in bool array")
+      if e.len != 1:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for bool array"
+        )
       result[i] = row.data.buf[off + e.off] == 1'u8
     return
   let s = row.getStr(col)
