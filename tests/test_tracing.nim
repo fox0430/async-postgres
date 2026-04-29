@@ -119,6 +119,10 @@ type
     authMethod: AuthMethod
     sslEnabled: bool
 
+  DeprecatedAuthRec = object
+    hasConn: bool
+    authMethod: AuthMethod
+
   TraceLog = ref object
     connectStarts: seq[ConnectStartRec]
     connectEnds: seq[ConnectEndRec]
@@ -136,6 +140,7 @@ type
     poolReleaseEnds: seq[PoolReleaseEndRec]
     poolCloseErrors: seq[PoolCloseErrorRec]
     insecureAuths: seq[InsecureAuthRec]
+    deprecatedAuths: seq[DeprecatedAuthRec]
 
 proc newTraceLog(): TraceLog =
   TraceLog()
@@ -274,6 +279,11 @@ proc buildTracer(log: TraceLog): PgTracer =
         authMethod: data.authMethod,
         sslEnabled: data.sslEnabled,
       )
+    )
+
+  tracer.onDeprecatedAuth = proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].} =
+    log.deprecatedAuths.add(
+      DeprecatedAuthRec(hasConn: data.conn != nil, authMethod: data.authMethod)
     )
 
   return tracer
@@ -871,6 +881,26 @@ suite "Tracing: onInsecureAuth":
   test "PgTracer with nil onInsecureAuth hook is safe to leave unset":
     let tracer = PgTracer()
     check tracer.onInsecureAuth == nil
+
+suite "Tracing: onDeprecatedAuth":
+  # End-to-end firing from the auth loop (MD5 challenge) requires a PG
+  # server configured with `password_encryption = md5` and an md5-stored
+  # role, which is out of scope for the current docker-compose setup.
+  # These unit tests exercise the closure directly.
+  test "closure receives MD5 auth method":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection()
+
+    tracer.onDeprecatedAuth(TraceDeprecatedAuthData(conn: fake, authMethod: amMd5))
+
+    check log.deprecatedAuths.len == 1
+    check log.deprecatedAuths[0].hasConn
+    check log.deprecatedAuths[0].authMethod == amMd5
+
+  test "PgTracer with nil onDeprecatedAuth hook is safe to leave unset":
+    let tracer = PgTracer()
+    check tracer.onDeprecatedAuth == nil
 
 suite "filterSaslByRequireAuth":
   test "empty allowed set performs no filtering":
