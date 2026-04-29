@@ -154,13 +154,19 @@ proc decodeDateRangeBinary*(data: openArray[byte]): PgRange[DateTime] =
       inclusive: raw.upperInc,
     )
 
-proc decodeMultirangeBinaryRaw*(data: openArray[byte]): seq[tuple[off: int, len: int]] =
+proc decodeMultirangeBinaryRaw*(
+    data: openArray[byte]
+): seq[tuple[off: RelOff, len: int]] =
+  ## Decode the framing of a binary multirange into ``(off, len)`` pairs for
+  ## each contained range. ``off`` is relative to ``data`` (typed as
+  ## ``RelOff``); recover the absolute parent-buffer offset with
+  ## ``parentOff + p.off``.
   if data.len < 4:
     raise newException(PgTypeError, "Binary multirange too short")
   let count = int(fromBE32(data.toOpenArray(0, 3)))
   if count < 0:
     raise newException(PgTypeError, "Binary multirange: invalid count " & $count)
-  result = newSeq[tuple[off: int, len: int]](count)
+  result = newSeq[tuple[off: RelOff, len: int]](count)
   var pos = 4
   for i in 0 ..< count:
     if pos + 4 > data.len:
@@ -170,7 +176,7 @@ proc decodeMultirangeBinaryRaw*(data: openArray[byte]): seq[tuple[off: int, len:
     if rLen < 0 or pos + rLen > data.len:
       raise
         newException(PgTypeError, "Binary multirange: invalid range length " & $rLen)
-    result[i] = (off: pos, len: rLen)
+    result[i] = (off: RelOff(pos), len: rLen)
     pos += rLen
 
 # Range type support
