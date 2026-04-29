@@ -310,6 +310,15 @@ type
     authMethod*: AuthMethod ## The method the server requested
     sslEnabled*: bool ## Transport state at the time of the auth step
 
+  TraceDeprecatedAuthData* = object
+    ## Advisory notification that a server-requested auth method is
+    ## considered cryptographically weak / deprecated regardless of
+    ## transport. Currently fires for MD5 (PostgreSQL recommends
+    ## SCRAM-SHA-256 since v10). The connection is NOT aborted — use
+    ## `ConnConfig.requireAuth` for actual enforcement.
+    conn*: PgConnection
+    authMethod*: AuthMethod ## The method the server requested
+
   PgTracer* = ref object
     ## Tracing hooks for async-postgres operations.
     ## Set only the callbacks you need; nil callbacks are skipped with zero overhead.
@@ -358,6 +367,11 @@ type
       ## Fires when an auth method is used over an insecure transport
       ## (currently: cleartext password without SSL). Advisory only; does
       ## not abort the connection. Use `ConnConfig.requireAuth` to enforce.
+    onDeprecatedAuth*: proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].}
+      ## Fires when a server-requested auth method is cryptographically
+      ## weak / deprecated regardless of transport (currently: MD5).
+      ## Advisory only; does not abort the connection. Use
+      ## `ConnConfig.requireAuth` to enforce.
 
 # Public API: read-only getters
 
@@ -1199,6 +1213,11 @@ proc fireInsecureAuth(conn: PgConnection, authMethod: AuthMethod) =
       )
     )
 
+proc fireDeprecatedAuth(conn: PgConnection, authMethod: AuthMethod) =
+  let t = conn.config.tracer
+  if t != nil and t.onDeprecatedAuth != nil:
+    t.onDeprecatedAuth(TraceDeprecatedAuthData(conn: conn, authMethod: authMethod))
+
 proc enforceAuthAllowed(
     authMethod: AuthMethod, allowed: set[AuthMethod], offered: string = ""
 ) {.raises: [PgConnectionError].} =
@@ -1436,6 +1455,7 @@ proc connectToHost(
             await conn.sendMsg(encodePassword(config.password))
           of bmkAuthenticationMD5Password:
             sawAuthRequest = true
+            fireDeprecatedAuth(conn, amMd5)
             enforceAuthAllowed(amMd5, config.requireAuth)
             let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
             await conn.sendMsg(encodePassword(hash))
