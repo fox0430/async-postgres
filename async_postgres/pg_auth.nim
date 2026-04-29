@@ -3,6 +3,14 @@ import std/[strutils, base64]
 import pkg/checksums/md5
 import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
+import pkg/nimcrypto/utils as ncutils
+
+template burnStr*(s: var string) =
+  ## Wipe a string's heap buffer. Compiler is prevented from eliding the
+  ## write because nimcrypto's `burnMem` uses a volatile memset.
+  if s.len > 0:
+    ncutils.burnMem(addr s[0], s.len)
+    s.setLen(0)
 
 type ScramState* = object
   ## Intermediate state for SCRAM-SHA-256 authentication handshake.
@@ -25,11 +33,18 @@ proc toString(data: openArray[byte]): string =
 proc md5AuthHash*(user, password: string, salt: array[4, byte]): string =
   ## Compute MD5 authentication hash for PostgreSQL.
   ## Returns "md5" followed by hex of MD5(MD5(password+user) + salt).
-  let inner = getMD5(password & user)
-  var saltedInput = inner
+  var combined = newStringOfCap(password.len + user.len)
+  combined.add(password)
+  combined.add(user)
+  var inner = getMD5(combined)
+  burnStr(combined)
+  var saltedInput = newStringOfCap(inner.len + salt.len)
+  saltedInput.add(inner)
+  burnStr(inner)
   for b in salt:
     saltedInput.add(char(b))
   result = "md5" & getMD5(saltedInput)
+  burnStr(saltedInput)
 
 proc scramEscapeUsername*(user: string): string =
   ## Escape username for SCRAM per RFC 5802 Section 5.1.
@@ -120,24 +135,40 @@ proc scramClientFinalMessage*(
       base64.decode(saltB64)
     except ValueError:
       raise newException(CatchableError, "SCRAM: invalid base64 in salt")
-  let saltedPassword = sha256.pbkdf2(password, salt, iterations, 32)
-  let clientKey = sha256.hmac(saltedPassword, "Client Key").data
-  let storedKey = sha256.digest(clientKey).data
-  var cbindInput = toBytes(state.gs2Header)
-  cbindInput.add(state.channelBindingData)
-  let clientFinalWithoutProof = "c=" & base64.encode(cbindInput) & ",r=" & combinedNonce
-  let authMessage =
-    state.clientFirstBare & "," & serverFirstMsg & "," & clientFinalWithoutProof
-  let clientSignature = sha256.hmac(storedKey, authMessage).data
 
+  var saltedPassword: seq[byte]
+  var clientKey, storedKey, clientSignature, serverKey: array[32, byte]
+  var cbindInput: seq[byte]
+  var authMessage: string
   var clientProof: array[32, byte]
-  for i in 0 ..< 32:
-    clientProof[i] = clientKey[i] xor clientSignature[i]
+  try:
+    saltedPassword = sha256.pbkdf2(password, salt, iterations, 32)
+    clientKey = sha256.hmac(saltedPassword, "Client Key").data
+    storedKey = sha256.digest(clientKey).data
+    cbindInput = toBytes(state.gs2Header)
+    cbindInput.add(state.channelBindingData)
+    let clientFinalWithoutProof =
+      "c=" & base64.encode(cbindInput) & ",r=" & combinedNonce
+    authMessage =
+      state.clientFirstBare & "," & serverFirstMsg & "," & clientFinalWithoutProof
+    clientSignature = sha256.hmac(storedKey, authMessage).data
 
-  let serverKey = sha256.hmac(saltedPassword, "Server Key").data
-  state.serverSignature = sha256.hmac(serverKey, authMessage).data
+    for i in 0 ..< 32:
+      clientProof[i] = clientKey[i] xor clientSignature[i]
 
-  result = toBytes(clientFinalWithoutProof & ",p=" & base64.encode(clientProof))
+    serverKey = sha256.hmac(saltedPassword, "Server Key").data
+    state.serverSignature = sha256.hmac(serverKey, authMessage).data
+
+    result = toBytes(clientFinalWithoutProof & ",p=" & base64.encode(clientProof))
+  finally:
+    ncutils.burnMem(saltedPassword)
+    ncutils.burnMem(clientKey)
+    ncutils.burnMem(storedKey)
+    ncutils.burnMem(cbindInput)
+    ncutils.burnMem(clientSignature)
+    ncutils.burnMem(serverKey)
+    ncutils.burnMem(clientProof)
+    burnStr(authMessage)
 
 proc computeTlsServerEndpoint*(certDer: openArray[byte]): seq[byte] =
   ## Compute tls-server-end-point channel binding data per RFC 5929.
@@ -149,6 +180,8 @@ proc scramVerifyServerFinal*(
     serverFinalData: openArray[byte], state: ScramState
 ): bool =
   ## Verify the server's final SCRAM-SHA-256 signature matches the expected value.
+  ## The caller is expected to wipe `state.serverSignature` after verification
+  ## since it is no longer needed and would aid an attacker impersonating the server.
   let serverFinalMsg = toString(serverFinalData)
   if not serverFinalMsg.startsWith("v="):
     return false
