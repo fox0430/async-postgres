@@ -1745,21 +1745,12 @@ suite "Binary array encode/decode roundtrip":
     let decoded = decodeBinaryArray(encoded)
     check decoded.elemOid == OidInt4
     check decoded.elements.len == 3
-    check fromBE32(
-      encoded[
-        decoded.elements[0].off ..< decoded.elements[0].off + decoded.elements[0].len
-      ]
-    ) == 1'i32
-    check fromBE32(
-      encoded[
-        decoded.elements[1].off ..< decoded.elements[1].off + decoded.elements[1].len
-      ]
-    ) == 2'i32
-    check fromBE32(
-      encoded[
-        decoded.elements[2].off ..< decoded.elements[2].off + decoded.elements[2].len
-      ]
-    ) == 3'i32
+    let off0 = 0 + decoded.elements[0].off
+    let off1 = 0 + decoded.elements[1].off
+    let off2 = 0 + decoded.elements[2].off
+    check fromBE32(encoded[off0 ..< off0 + decoded.elements[0].len]) == 1'i32
+    check fromBE32(encoded[off1 ..< off1 + decoded.elements[1].len]) == 2'i32
+    check fromBE32(encoded[off2 ..< off2 + decoded.elements[2].len]) == 3'i32
 
   test "encodeBinaryArrayEmpty roundtrip":
     let encoded = encodeBinaryArrayEmpty(OidInt4)
@@ -1857,12 +1848,12 @@ suite "Binary array encode/decode roundtrip":
     check decoded.elemOid == OidInt4
     check decoded.elements.len == 3
     let data = p.value.get
-    check fromBE32(data[decoded.elements[0].off ..< decoded.elements[0].off + 4]) ==
-      100'i32
-    check fromBE32(data[decoded.elements[1].off ..< decoded.elements[1].off + 4]) ==
-      200'i32
-    check fromBE32(data[decoded.elements[2].off ..< decoded.elements[2].off + 4]) ==
-      300'i32
+    let o0 = 0 + decoded.elements[0].off
+    let o1 = 0 + decoded.elements[1].off
+    let o2 = 0 + decoded.elements[2].off
+    check fromBE32(data[o0 ..< o0 + 4]) == 100'i32
+    check fromBE32(data[o1 ..< o1 + 4]) == 200'i32
+    check fromBE32(data[o2 ..< o2 + 4]) == 300'i32
 
 suite "PgNumeric":
   test "toPgParam PgNumeric":
@@ -3484,7 +3475,8 @@ suite "Composite binary encoder/decoder":
     check decoded.len == 2
     check decoded[0].oid == OidInt4
     check decoded[0].len == 4
-    check fromBE32(data[decoded[0].off .. decoded[0].off + 3]) == 99'i32
+    let f0 = 0 + decoded[0].off
+    check fromBE32(data[f0 .. f0 + 3]) == 99'i32
     check decoded[1].oid == OidText
     check decoded[1].len == 3
 
