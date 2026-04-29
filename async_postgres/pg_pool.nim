@@ -216,12 +216,21 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   ## Execute the configured reset query on a connection before returning it
   ## to the pool. On failure, closes the connection so that release() will
   ## discard it.
+  ##
+  ## Never propagates `CatchableError`: this is invoked from `finally` blocks
+  ## in the `with*` helpers (and the per-call cleanup path of `exec` / `query`
+  ## etc.), where a raised reset error would mask the body's original
+  ## exception. Cleanup errors — including any raised from the close path's
+  ## tracer hook — are swallowed.
   if pool.config.resetQuery.len > 0 and conn.state == csReady and conn.txStatus == tsIdle:
     try:
       discard await conn.simpleExec(pool.config.resetQuery)
       conn.clearStmtCache()
     except CatchableError:
-      await pool.tracedClose(conn)
+      try:
+        await pool.tracedClose(conn)
+      except CatchableError:
+        discard
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
