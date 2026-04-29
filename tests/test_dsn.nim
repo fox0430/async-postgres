@@ -329,6 +329,26 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?keepalives_count=-1")
 
+  test "max_message_size from URI DSN":
+    let cfg = parseDsn("postgresql://host/db?max_message_size=1048576")
+    check cfg.maxMessageSize == 1048576
+
+  test "max_message_size from keyword DSN":
+    let cfg = parseDsn("host=h dbname=d max_message_size=2097152")
+    check cfg.maxMessageSize == 2097152
+
+  test "max_message_size default is zero (use library default)":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.maxMessageSize == 0
+
+  test "error: invalid max_message_size value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_message_size=abc")
+
+  test "error: negative max_message_size":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_message_size=-1")
+
   test "error: sslrootcert file not found":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")

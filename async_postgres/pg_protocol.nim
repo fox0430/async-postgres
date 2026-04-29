@@ -1065,12 +1065,27 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
 
 # Streaming backend message parser
 
+const DefaultMaxBackendMessageLen* = 1024 * 1024 * 1024
+  ## Default upper bound on a single backend message (header + body), 1 GiB.
+  ## Prevents a malicious or broken server from causing unbounded recv-buffer
+  ## growth (and OOM) by advertising an int32-max length. PostgreSQL itself
+  ## bounds individual values by `MaxAllocSize` (~1 GiB - 1), so legitimate
+  ## traffic stays well below this cap.
+
 proc parseBackendMessage*(
-    buf: openArray[byte], consumed: var int, rowData: RowData = nil
+    buf: openArray[byte],
+    consumed: var int,
+    rowData: RowData = nil,
+    maxLen: int = DefaultMaxBackendMessageLen,
 ): ParseResult {.raises: [ProtocolError].} =
   ## Parse a single backend message from `buf`.
   ## On success, sets `consumed` to the number of bytes used.
   ## The caller is responsible for discarding those bytes from the buffer.
+  ## A message whose declared length exceeds `maxLen` is rejected with
+  ## `ProtocolError` before any allocation, capping recv-buffer growth.
+  ## ``maxLen <= 0`` disables the cap (intended for tests); production
+  ## callers should resolve the default via ``ConnConfig.maxMessageSize``
+  ## and ``effectiveMaxMessageSize``.
   consumed = 0
 
   # Need at least 5 bytes: 1 type + 4 length
@@ -1082,6 +1097,15 @@ proc parseBackendMessage*(
 
   if msgLen < 4:
     raise newException(ProtocolError, "Invalid message length: " & $msgLen)
+  # Compare in int64 to avoid overflow on 32-bit platforms where `int` is
+  # 32-bit and `msgLen + 1` would wrap when msgLen approaches int32.high.
+  # Total message size is `msgLen + 1` (type byte), so reject when that
+  # would exceed maxLen, i.e. when `msgLen >= maxLen`.
+  if maxLen > 0 and int64(msgLen) >= int64(maxLen):
+    raise newException(
+      ProtocolError,
+      "Backend message too large: " & $msgLen & " bytes (max " & $maxLen & ")",
+    )
 
   let totalLen = int(msgLen) + 1 # type byte + length field + body
   if buf.len < totalLen:

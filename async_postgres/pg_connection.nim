@@ -111,6 +111,13 @@ type
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     extraParams*: seq[(string, string)] ## Additional startup parameters
+    maxMessageSize*: int
+      ## Upper bound (in bytes) on a single backend message including
+      ## its 1-byte type and 4-byte length header. A server claiming a
+      ## larger message is rejected with `ProtocolError` before any
+      ## further recv-buffer growth, capping memory exposure to a
+      ## misbehaving or malicious peer. ``0`` (default) selects
+      ## `DefaultMaxBackendMessageLen` (1 GiB).
     tracer*: PgTracer ## Optional tracer for connection-level hooks
 
   Notification* = object ## A NOTIFY message received from PostgreSQL.
@@ -525,6 +532,14 @@ proc `reconnectCallback=`*(
 
 # Internal accessors for cross-module use within the library
 
+func effectiveMaxMessageSize*(conn: PgConnection): int {.inline.} =
+  ## Effective per-message recv cap for this connection. Resolves the
+  ## ``ConnConfig.maxMessageSize`` default (0) to ``DefaultMaxBackendMessageLen``.
+  if conn.config.maxMessageSize > 0:
+    conn.config.maxMessageSize
+  else:
+    DefaultMaxBackendMessageLen
+
 func recvBuf*(conn: PgConnection): var seq[byte] {.inline.} =
   conn.recvBuf
 proc `recvBuf=`*(conn: PgConnection, val: seq[byte]) {.inline.} =
@@ -895,12 +910,13 @@ proc nextMessage*(
   ## is transitioned to `csClosed` before re-raising so that it is never
   ## reused (in particular, by the connection pool).
   var pos = conn.recvBufStart
+  let maxLen = conn.effectiveMaxMessageSize()
   while true:
     var consumed: int
     let res =
       try:
         parseBackendMessage(
-          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData, maxLen
         )
       except ProtocolError as e:
         conn.state = csClosed
@@ -2297,6 +2313,13 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "keepalives_count must be non-negative: " & val)
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
+  of "max_message_size":
+    try:
+      result.maxMessageSize = parseInt(val)
+    except ValueError:
+      raise newException(PgError, "Invalid max_message_size: " & val)
+    if result.maxMessageSize < 0:
+      raise newException(PgError, "max_message_size must be non-negative: " & val)
   else:
     result.extraParams.add((key, val))
 
@@ -2497,6 +2520,7 @@ proc initConnConfig*(
     targetSessionAttrs = tsaAny,
     requireAuth: set[AuthMethod] = {},
     extraParams: seq[(string, string)] = @[],
+    maxMessageSize = 0,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
@@ -2519,6 +2543,7 @@ proc initConnConfig*(
     targetSessionAttrs: targetSessionAttrs,
     requireAuth: requireAuth,
     extraParams: extraParams,
+    maxMessageSize: maxMessageSize,
   )
 
 proc parseDsn*(dsn: string): ConnConfig =

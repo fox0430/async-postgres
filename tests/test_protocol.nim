@@ -694,6 +694,31 @@ suite "Backend decoding - edge cases":
     expect ProtocolError:
       discard parseBackendMessage(buf)
 
+  test "oversized message length raises ProtocolError before allocation":
+    # Header advertises a near-int32-max body; without a cap this would
+    # cause the recv loop to grow recvBuf until OOM. The parser must
+    # reject such headers before any further read.
+    var buf = @[byte('D'), 0x7F'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8] # msgLen = int32.high
+    expect ProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "configurable maxLen rejects header above caller's threshold":
+    # 100-byte body declared, but caller permits only 32 bytes total.
+    var buf = @[byte('C'), 0'u8, 0, 0, 100'u8]
+    var consumed: int
+    expect ProtocolError:
+      discard parseBackendMessage(buf, consumed, nil, 32)
+
+  test "maxLen permits message exactly at the limit":
+    # Build a CommandComplete ("C") of total size = 1 + 4 + 4 = 9 bytes.
+    var body: seq[byte] = @[]
+    body.addCString("OK")
+    var buf = buildMsg('C', body)
+    var consumed: int
+    let res = parseBackendMessage(buf, consumed, nil, buf.len)
+    check res.state == psComplete
+    check consumed == buf.len
+
   test "SASL with multiple mechanisms":
     var body: seq[byte] = @[]
     body.addInt32(10)

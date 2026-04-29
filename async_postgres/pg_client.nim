@@ -844,15 +844,21 @@ template queryEachRecvLoop(
       for i in 0 ..< cachedFields.len:
         rd.colFormats[i] = cachedColFmts[i]
 
+  let maxLen = conn.effectiveMaxMessageSize()
   block recvLoop:
     while true:
       # Parse messages directly from recvBuf using parseBackendMessage
       var pos = conn.recvBufStart
       while true:
         var consumed: int
-        let res = parseBackendMessage(
-          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rd
-        )
+        let res =
+          try:
+            parseBackendMessage(
+              conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rd, maxLen
+            )
+          except ProtocolError as e:
+            conn.state = csClosed
+            raise e
         if res.state == psIncomplete:
           break # need more data
         pos += consumed
