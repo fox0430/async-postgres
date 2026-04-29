@@ -862,9 +862,9 @@ template queryEachRecvLoop(
           if callbackError == nil:
             try:
               callback(initRow(rd, 0))
+              rowCount += 1
             except CatchableError as e:
               callbackError = e
-          rowCount += 1
           # Reset buffers but keep capacity
           rd.buf.setLen(0)
           rd.cellIndex.setLen(0)
