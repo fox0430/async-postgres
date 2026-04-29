@@ -91,9 +91,17 @@ suite "parseBackendMessage: framing":
     expectParseError:
       discard tryParse(header('C', int32.low))
 
-  test "huge msgLen with short buffer is incomplete":
-    # 2 GiB - 1 but we only supplied 5 bytes.
-    let (state, consumed) = tryParse(header('C', int32.high))
+  test "msgLen above default cap raises ProtocolError":
+    # int32.high (~2 GiB) exceeds DefaultMaxBackendMessageLen (1 GiB) and
+    # must be rejected before the recv loop can grow the buffer further.
+    expectParseError:
+      discard tryParse(header('C', int32.high))
+
+  test "msgLen below cap with short buffer is incomplete":
+    # Just under the default cap; only the header is supplied, so the
+    # parser should ask for more bytes rather than fail.
+    let (state, consumed) =
+      tryParse(header('C', int32(DefaultMaxBackendMessageLen - 1)))
     check state == psIncomplete
     check consumed == 0
 
