@@ -179,9 +179,10 @@ proc decodePointBinary*(data: openArray[byte], off: int): PgPoint =
 
 proc decodeBinaryArray*(
     data: openArray[byte]
-): tuple[elemOid: int32, elements: seq[tuple[off: int, len: int]]] =
+): tuple[elemOid: int32, elements: seq[tuple[off: RelOff, len: int]]] =
   ## Decode a PostgreSQL binary array, returning element OID and (offset, length) pairs.
-  ## Offsets are relative to the start of `data`.
+  ## Offsets are relative to the start of `data` (typed as ``RelOff``); recover
+  ## the absolute parent-buffer offset with ``parentOff + e.off``.
   if data.len < 12:
     raise newException(PgTypeError, "Binary array too short")
   let ndim = fromBE32(data.toOpenArray(0, 3))
@@ -204,7 +205,7 @@ proc decodeBinaryArray*(
   if dimLen > (data.len - 20) div 4:
     raise newException(PgTypeError, "Binary array: dimension length exceeds data")
   # lower_bound at offset 16, ignored
-  result.elements = newSeq[tuple[off: int, len: int]](dimLen)
+  result.elements = newSeq[tuple[off: RelOff, len: int]](dimLen)
   var pos = 20
   for i in 0 ..< dimLen:
     if pos + 4 > data.len:
@@ -214,19 +215,20 @@ proc decodeBinaryArray*(
     if eLen < -1:
       raise newException(PgTypeError, "Binary array: invalid element length " & $eLen)
     elif eLen == -1:
-      result.elements[i] = (off: 0, len: -1)
+      result.elements[i] = (off: RelOff(0), len: -1)
     else:
       if pos + eLen > data.len:
         raise newException(PgTypeError, "Binary array: element data truncated at " & $i)
-      result.elements[i] = (off: pos, len: eLen)
+      result.elements[i] = (off: RelOff(pos), len: eLen)
       pos += eLen
 
 proc decodeBinaryComposite*(
     data: openArray[byte]
-): seq[tuple[oid: int32, off: int, len: int]] =
+): seq[tuple[oid: int32, off: RelOff, len: int]] =
   ## Decode a PostgreSQL binary composite value.
-  ## Returns (typeOid, offset, length) tuples. offset is relative to `data`.
-  ## length of -1 indicates NULL.
+  ## Returns (typeOid, offset, length) tuples. ``off`` is relative to ``data``
+  ## (typed as ``RelOff``); recover the absolute parent-buffer offset with
+  ## ``parentOff + f.off``. ``len`` of -1 indicates NULL.
   if data.len < 4:
     raise newException(PgTypeError, "Binary composite too short")
   let numFields = int(fromBE32(data.toOpenArray(0, 3)))
@@ -237,7 +239,7 @@ proc decodeBinaryComposite*(
   # count, so numFields cannot exceed (data.len - 4) div 8.
   if numFields > (data.len - 4) div 8:
     raise newException(PgTypeError, "Binary composite: field count exceeds data")
-  result = newSeq[tuple[oid: int32, off: int, len: int]](numFields)
+  result = newSeq[tuple[oid: int32, off: RelOff, len: int]](numFields)
   var pos = 4
   for i in 0 ..< numFields:
     if pos + 8 > data.len:
@@ -249,13 +251,13 @@ proc decodeBinaryComposite*(
     if flen < -1:
       raise newException(PgTypeError, "Binary composite: invalid field length " & $flen)
     elif flen == -1:
-      result[i].off = 0
+      result[i].off = RelOff(0)
       result[i].len = -1
     else:
       if pos + flen > data.len:
         raise
           newException(PgTypeError, "Binary composite: field data truncated at " & $i)
-      result[i].off = pos
+      result[i].off = RelOff(pos)
       result[i].len = flen
       pos += flen
 

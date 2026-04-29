@@ -4,6 +4,13 @@ import ../pg_errors
 export pg_errors
 
 type
+  RelOff* = distinct int
+    ## Offset relative to the start of a slice that was passed into a binary
+    ## decoder (e.g. ``decodeBinaryArray``, ``decodeBinaryComposite``,
+    ## ``decodeMultirangeBinaryRaw``). Cannot be used directly as an index into
+    ## the parent buffer — must be combined with the absolute origin via ``+``
+    ## (``int + RelOff -> int``) to recover the absolute offset.
+
   PgUuid* = distinct string
     ## UUID value stored as its string representation (e.g. "550e8400-e29b-41d4-a716-446655440000").
 
@@ -273,6 +280,15 @@ const
   PgInlineBufSize* = 16
     ## Maximum payload size that fits in `PgParamInline.inlineBuf` without a
     ## heap allocation. Values longer than this are stored in `overflow`.
+
+proc `+`*(a: int, b: RelOff): int {.inline.} =
+  ## Combine an absolute parent-buffer origin with a relative decoder offset.
+  ## ``RelOff`` cannot be added to itself or used as a buffer index directly,
+  ## so any access path that omits the absolute origin fails to compile.
+  a + int(b)
+
+proc `==`*(a, b: RelOff): bool {.borrow.}
+proc `$`*(v: RelOff): string {.borrow.}
 
 proc `$`*(v: PgUuid): string {.borrow.}
 proc `==`*(a, b: PgUuid): bool {.borrow.}
