@@ -1352,6 +1352,88 @@ suite "E2E: Transaction":
 
     )
 
+  test "withTransaction skips ROLLBACK when COMMIT fails":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_commit_fail")
+      discard await conn.exec(
+        """
+        CREATE TABLE test_tx_commit_fail (
+          id int PRIMARY KEY,
+          ref_id int REFERENCES test_tx_commit_fail(id)
+            DEFERRABLE INITIALLY DEFERRED
+        )
+        """
+      )
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          discard await conn.exec("INSERT INTO test_tx_commit_fail VALUES (1, 999)")
+      except PgQueryError:
+        raised = true
+
+      doAssert raised
+      doAssert "COMMIT" in queries
+      doAssert "ROLLBACK" notin queries
+      doAssert conn.txStatus == tsIdle
+
+      conn.tracer = nil
+      discard await conn.exec("DROP TABLE test_tx_commit_fail")
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepoint skips ROLLBACK TO SAVEPOINT when outer transaction has ended":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      discard await conn.exec("BEGIN")
+      var raised = false
+      try:
+        conn.withSavepoint("sp_outer_done"):
+          # End the outer transaction from inside the savepoint, so the
+          # savepoint no longer exists by the time we raise.
+          discard await conn.exec("ROLLBACK")
+          raise newException(ValueError, "boom")
+      except ValueError:
+        raised = true
+
+      doAssert raised
+      doAssert "SAVEPOINT sp_outer_done" in queries
+      var hasRollbackToSp = false
+      for q in queries:
+        if q.startsWith("ROLLBACK TO SAVEPOINT"):
+          hasRollbackToSp = true
+          break
+      doAssert not hasRollbackToSp
+      doAssert conn.txStatus == tsIdle
+
+      conn.tracer = nil
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":
     proc t() {.async.} =
