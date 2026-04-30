@@ -180,6 +180,64 @@ suite "initPoolConfig":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432), minSize = 0)
     check cfg.minSize == 0
 
+  test "backoff defaults":
+    let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
+    check cfg.connectBackoffInitial == seconds(1)
+    check cfg.connectBackoffMax == seconds(60)
+
+  test "backoff custom overrides":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432),
+      connectBackoffInitial = milliseconds(100),
+      connectBackoffMax = seconds(10),
+    )
+    check cfg.connectBackoffInitial == milliseconds(100)
+    check cfg.connectBackoffMax == seconds(10)
+
+  test "backoff disabled with ZeroDuration initial":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432),
+      connectBackoffInitial = ZeroDuration,
+      connectBackoffMax = ZeroDuration,
+    )
+    check cfg.connectBackoffInitial == ZeroDuration
+
+  test "validation: connectBackoffMax < connectBackoffInitial":
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432),
+        connectBackoffInitial = seconds(10),
+        connectBackoffMax = seconds(1),
+      )
+
+suite "computeConnectBackoff":
+  test "zero failures returns ZeroDuration":
+    check computeConnectBackoff(seconds(1), seconds(60), 0) == ZeroDuration
+
+  test "negative failures returns ZeroDuration":
+    check computeConnectBackoff(seconds(1), seconds(60), -1) == ZeroDuration
+
+  test "disabled when initial is ZeroDuration":
+    check computeConnectBackoff(ZeroDuration, seconds(60), 5) == ZeroDuration
+
+  test "first failure returns initial":
+    check computeConnectBackoff(seconds(1), seconds(60), 1) == seconds(1)
+
+  test "doubles on each failure up to max":
+    check computeConnectBackoff(seconds(1), seconds(60), 2) == seconds(2)
+    check computeConnectBackoff(seconds(1), seconds(60), 3) == seconds(4)
+    check computeConnectBackoff(seconds(1), seconds(60), 4) == seconds(8)
+    check computeConnectBackoff(seconds(1), seconds(60), 5) == seconds(16)
+    check computeConnectBackoff(seconds(1), seconds(60), 6) == seconds(32)
+
+  test "caps at maxDelay":
+    # 2^6 = 64 > 60, so 7th failure caps
+    check computeConnectBackoff(seconds(1), seconds(60), 7) == seconds(60)
+    check computeConnectBackoff(seconds(1), seconds(60), 50) == seconds(60)
+
+  test "initial already exceeds max returns max":
+    check computeConnectBackoff(seconds(120), seconds(60), 1) == seconds(60)
+
 suite "Pool release":
   test "release to idle queue":
     let pool = makePool()
