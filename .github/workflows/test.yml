@@ -37,7 +37,7 @@ jobs:
           - 'stable'
           - 'devel'
 
-    name: Tests on ${{ matrix.nim-version }}
+    name: Tests on ${{ matrix.nim-version }} (${{ matrix.os }})
     steps:
       - uses: actions/checkout@v6
 
