@@ -2075,6 +2075,8 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
+  let tsInTxSym = bindSym"tsInTransaction"
+  let tsInFailedSym = bindSym"tsInFailedTransaction"
   result = quote:
     let `connSym` = `connExpr`
     try:
@@ -2082,10 +2084,14 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
     except CatchableError as `eSym`:
-      try:
-        discard await `connSym`.simpleExec("ROLLBACK", timeout = `txTimeout`)
-      except CatchableError:
-        discard
+      # Only ROLLBACK if the server is still in a transaction. After a failed
+      # COMMIT, PostgreSQL has already ended the transaction (txStatus = tsIdle),
+      # so an extra ROLLBACK would just emit "no transaction in progress".
+      if `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+        try:
+          discard await `connSym`.simpleExec("ROLLBACK", timeout = `txTimeout`)
+        except CatchableError:
+          discard
       raise `eSym`
 
 macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
@@ -2145,6 +2151,8 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
   let spNameSym = genSym(nskLet, "spName")
+  let tsInTxSym = bindSym"tsInTransaction"
+  let tsInFailedSym = bindSym"tsInFailedTransaction"
 
   let nameExpr =
     if spName != nil:
@@ -2167,12 +2175,16 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
       )
     except CatchableError as `eSym`:
-      try:
-        discard await `connSym`.simpleExec(
-          "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
-        )
-      except CatchableError:
-        discard
+      # Only ROLLBACK TO SAVEPOINT if the outer transaction is still alive.
+      # If txStatus is tsIdle the surrounding transaction has already ended,
+      # so the savepoint no longer exists.
+      if `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+        try:
+          discard await `connSym`.simpleExec(
+            "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
+          )
+        except CatchableError:
+          discard
       raise `eSym`
 
 proc execInTransactionImpl(
