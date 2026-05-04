@@ -114,6 +114,11 @@ type
     hasConn: bool
     errMsg: string
 
+  TransportCloseErrorRec = object
+    hasConn: bool
+    stage: TransportCloseStage
+    errMsg: string
+
   InsecureAuthRec = object
     hasConn: bool
     authMethod: AuthMethod
@@ -139,6 +144,7 @@ type
     poolReleaseStarts: seq[PoolReleaseStartRec]
     poolReleaseEnds: seq[PoolReleaseEndRec]
     poolCloseErrors: seq[PoolCloseErrorRec]
+    transportCloseErrors: seq[TransportCloseErrorRec]
     insecureAuths: seq[InsecureAuthRec]
     deprecatedAuths: seq[DeprecatedAuthRec]
 
@@ -269,6 +275,17 @@ proc buildTracer(log: TraceLog): PgTracer =
     log.poolCloseErrors.add(
       PoolCloseErrorRec(
         hasConn: data.conn != nil, errMsg: (if data.err != nil: data.err.msg else: "")
+      )
+    )
+
+  tracer.onTransportCloseError = proc(
+      data: TraceTransportCloseErrorData
+  ) {.gcsafe, raises: [].} =
+    log.transportCloseErrors.add(
+      TransportCloseErrorRec(
+        hasConn: data.conn != nil,
+        stage: data.stage,
+        errMsg: (if data.err != nil: data.err.msg else: ""),
       )
     )
 
@@ -757,6 +774,101 @@ suite "Tracing: pool close errors":
       await pool.close()
 
     waitFor t()
+
+suite "Tracing: transport close errors":
+  when hasChronos:
+    test "onTransportCloseError reports swallowed close failures":
+      proc t() {.async.} =
+        let log = newTraceLog()
+        let tracer = buildTracer(log)
+        let conn = await connect(tracedConfig(tracer))
+
+        # Drive the hook directly — inducing a real closeWait() failure is
+        # impractical (the chronos streams swallow most peer-side faults
+        # internally), so we exercise the chokepoint that closeTransport
+        # funnels every swallowed close error through.
+        let err = newException(PgError, "simulated tls close failure")
+        conn.fireTransportCloseError(tcsTlsReader, err)
+
+        doAssert log.transportCloseErrors.len == 1
+        doAssert log.transportCloseErrors[0].hasConn
+        doAssert log.transportCloseErrors[0].stage == tcsTlsReader
+        doAssert log.transportCloseErrors[0].errMsg == "simulated tls close failure"
+
+        await conn.close()
+
+      waitFor t()
+
+    test "every stage value round-trips through the hook":
+      proc t() {.async.} =
+        let log = newTraceLog()
+        let tracer = buildTracer(log)
+        let conn = await connect(tracedConfig(tracer))
+
+        const stages =
+          [tcsTlsReader, tcsTlsWriter, tcsBaseReader, tcsBaseWriter, tcsTransport]
+        for stage in stages:
+          conn.fireTransportCloseError(stage, newException(PgError, "x"))
+
+        doAssert log.transportCloseErrors.len == stages.len
+        for i in 0 ..< stages.len:
+          doAssert log.transportCloseErrors[i].stage == stages[i]
+          doAssert log.transportCloseErrors[i].errMsg == "x"
+
+        await conn.close()
+
+      waitFor t()
+
+    test "nil onTransportCloseError hook is a no-op":
+      proc t() {.async.} =
+        # Build a config with no tracer at all — fire must be a no-op.
+        let conn = await connect(plainConfig())
+        conn.fireTransportCloseError(tcsTransport, newException(PgError, "ignored"))
+
+        # Tracer present but the hook itself is nil — also a no-op.
+        let tracer = PgTracer()
+        var cfg = plainConfig()
+        cfg.tracer = tracer
+        let conn2 = await connect(cfg)
+        conn2.fireTransportCloseError(tcsBaseReader, newException(PgError, "ignored2"))
+
+        await conn.close()
+        await conn2.close()
+
+      waitFor t()
+
+  test "healthy close() does not fire onTransportCloseError":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      await conn.close()
+
+      doAssert log.transportCloseErrors.len == 0
+
+    waitFor t()
+
+  test "closeTransport wires every TransportCloseStage to a fire call":
+    # Structural guard. Inducing real closeWait() failures is impractical, so
+    # the behavioural tests above drive fireTransportCloseError directly and
+    # cannot catch regressions inside closeTransport itself (forgotten except
+    # clause, new stage without a fire call, new closeWait without wiring).
+    # This test reads the source and asserts the invariants mechanically.
+    const src = staticRead("../async_postgres/pg_connection.nim")
+    let body = src.split("proc closeTransport(")[1].split("\nproc ")[0]
+
+    for stage in [
+      "tcsTlsReader", "tcsTlsWriter", "tcsBaseReader", "tcsBaseWriter", "tcsTransport"
+    ]:
+      doAssert stage in body,
+        "closeTransport missing reference to " & stage &
+          " — fire call wiring is incomplete"
+
+    let closeWaits = body.count("closeWait()")
+    let fires = body.count("fireTransportCloseError(")
+    doAssert closeWaits == fires,
+      "closeTransport has " & $closeWaits & " closeWait() calls but " & $fires &
+        " fireTransportCloseError() calls — each closeWait must be paired with a fire"
 
 suite "Tracing: queryEach":
   test "onQueryStart and onQueryEnd are called with rowCount":
