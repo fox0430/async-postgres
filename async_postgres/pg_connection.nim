@@ -309,6 +309,25 @@ type
     conn*: PgConnection
     err*: ref CatchableError
 
+  TransportCloseStage* = enum
+    ## Which transport resource raised during connection teardown.
+    tcsTlsReader
+    tcsTlsWriter
+    tcsBaseReader
+    tcsBaseWriter
+    tcsTransport
+
+  TraceTransportCloseErrorData* = object
+    ## Data passed to the transport close-error hook. Fired when a chronos
+    ## ``closeWait()`` call raises while ``closeTransport`` is releasing
+    ## connection resources. These errors are otherwise swallowed because
+    ## teardown must release every transport resource regardless of
+    ## individual failures, leaving operators with no signal for half-closed
+    ## TLS sessions, BearSSL ``close_notify`` mismatches, or peer RSTs.
+    conn*: PgConnection
+    stage*: TransportCloseStage
+    err*: ref CatchableError
+
   TraceInsecureAuthData* = object
     ## Advisory notification that a server-requested auth method is
     ## considered insecure in the current transport context. Currently fires
@@ -371,6 +390,12 @@ type
     onPoolReleaseEnd*:
       proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
     onPoolCloseError*: proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].}
+    onTransportCloseError*:
+      proc(data: TraceTransportCloseErrorData) {.gcsafe, raises: [].}
+      ## Fires when a transport ``closeWait()`` raises during teardown.
+      ## Advisory only — ``closeTransport`` continues releasing the remaining
+      ## resources regardless. Use this to surface half-closed TLS sessions
+      ## or peer RSTs that would otherwise be invisible.
     onInsecureAuth*: proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].}
       ## Fires when an auth method is used over an insecure transport
       ## (currently: cleartext password without SSL). Advisory only; does
@@ -380,6 +405,18 @@ type
       ## weak / deprecated regardless of transport (currently: MD5).
       ## Advisory only; does not abort the connection. Use
       ## `ConnConfig.requireAuth` to enforce.
+
+when hasChronos:
+  type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
+    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
+    ## inside the callback — its backing buffer is reused for the next row.
+
+else:
+  type RowCallback* = proc(row: Row) {.gcsafe.}
+    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
+    ## inside the callback — its backing buffer is reused for the next row.
+
+const RecvBufSize = 131072 ## Size of the temporary read buffer for recv operations
 
 # Public API: read-only getters
 
@@ -731,18 +768,6 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
         return fut
       r
 
-when hasChronos:
-  type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
-    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
-    ## inside the callback — its backing buffer is reused for the next row.
-
-else:
-  type RowCallback* = proc(row: Row) {.gcsafe.}
-    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
-    ## inside the callback — its backing buffer is reused for the next row.
-
-const RecvBufSize = 131072 ## Size of the temporary read buffer for recv operations
-
 proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
   let notif = Notification(
     pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
@@ -975,35 +1000,50 @@ proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
     if conn.sendBuf.len > 0:
       await conn.socket.sendRawBytes(conn.sendBuf)
 
+when hasChronos:
+  proc fireTransportCloseError(
+      conn: PgConnection, stage: TransportCloseStage, err: ref CatchableError
+  ) =
+    ## Route a swallowed transport close error to the tracer. ``closeTransport``
+    ## must continue releasing the remaining resources, so the error cannot be
+    ## propagated to a caller — tracing is the only signal operators have.
+    ## Reads from ``conn.config.tracer`` so events fire even when teardown
+    ## happens before the runtime tracer alias has been assigned.
+    let t = conn.config.tracer
+    if t != nil and t.onTransportCloseError != nil:
+      t.onTransportCloseError(
+        TraceTransportCloseErrorData(conn: conn, stage: stage, err: err)
+      )
+
 proc closeTransport(conn: PgConnection) {.async.} =
   ## Close transport resources without sending Terminate.
   when hasChronos:
     if conn.tlsStream != nil:
       try:
         await conn.tlsStream.reader.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTlsReader, e)
       try:
         await conn.tlsStream.writer.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTlsWriter, e)
       conn.tlsStream = nil
     if conn.baseReader != nil:
       try:
         await conn.baseReader.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsBaseReader, e)
       try:
         await conn.baseWriter.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsBaseWriter, e)
       conn.baseReader = nil
       conn.baseWriter = nil
     if conn.transport != nil:
       try:
         await conn.transport.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTransport, e)
       conn.transport = nil
     # Drop the cached reader/writer aliases so isConnected() reports false.
     conn.reader = nil
