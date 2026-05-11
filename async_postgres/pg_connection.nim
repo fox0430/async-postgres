@@ -935,13 +935,13 @@ proc fillRecvBuf*(
           await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
             timeout
           )
-    except AsyncTimeoutError:
+    except AsyncTimeoutError as e:
       conn.recvBuf.setLen(oldLen)
-      raise
-    except CatchableError:
+      raise e
+    except CatchableError as e:
       conn.recvBuf.setLen(oldLen)
       conn.state = csClosed
-      raise
+      raise e
     if n == 0:
       conn.recvBuf.setLen(oldLen)
       conn.state = csClosed
@@ -954,11 +954,11 @@ proc fillRecvBuf*(
           await conn.socket.recv(RecvBufSize)
         else:
           await conn.socket.recv(RecvBufSize).wait(timeout)
-      except AsyncTimeoutError:
-        raise
-      except CatchableError:
+      except AsyncTimeoutError as e:
+        raise e
+      except CatchableError as e:
         conn.state = csClosed
-        raise
+        raise e
     if data.len == 0:
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
