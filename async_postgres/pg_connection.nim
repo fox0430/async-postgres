@@ -915,31 +915,50 @@ proc fillRecvBuf*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Read data from socket into buffer. The only await point for message reception.
+  ##
+  ## On `AsyncTimeoutError` the caller (typically `invalidateOnTimeout`) is
+  ## responsible for the state transition. On any other `CatchableError`
+  ## (transport failure, cancellation, etc.) the connection is marked
+  ## `csClosed` before re-raising, since the read may have consumed an
+  ## indeterminate number of bytes from the socket and the stream is no
+  ## longer parseable.
   conn.compactRecvBuf()
   when hasChronos:
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + RecvBufSize)
+    var n: int
     try:
-      let n =
+      n =
         if timeout == ZeroDuration:
           await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
         else:
           await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
             timeout
           )
-      if n == 0:
-        conn.state = csClosed
-        raise newException(PgConnectionError, "Connection closed by server")
-      conn.recvBuf.setLen(oldLen + n)
     except AsyncTimeoutError as e:
       conn.recvBuf.setLen(oldLen)
       raise e
+    except CatchableError as e:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise e
+    if n == 0:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise newException(PgConnectionError, "Connection closed by server")
+    conn.recvBuf.setLen(oldLen + n)
   elif hasAsyncDispatch:
     let data =
-      if timeout == ZeroDuration:
-        await conn.socket.recv(RecvBufSize)
-      else:
-        await conn.socket.recv(RecvBufSize).wait(timeout)
+      try:
+        if timeout == ZeroDuration:
+          await conn.socket.recv(RecvBufSize)
+        else:
+          await conn.socket.recv(RecvBufSize).wait(timeout)
+      except AsyncTimeoutError as e:
+        raise e
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
     if data.len == 0:
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
