@@ -182,6 +182,11 @@ const
 proc `==`*(a, b: Lsn): bool {.borrow.}
 proc `<`*(a, b: Lsn): bool {.borrow.}
 proc `<=`*(a, b: Lsn): bool {.borrow.}
+proc `>`*(a, b: Lsn): bool {.inline.} =
+  b < a
+
+proc `>=`*(a, b: Lsn): bool {.inline.} =
+  b <= a
 
 proc toString*(field: TupleField): string =
   ## Convert a TupleField's data to a string by copying the bytes.
@@ -562,6 +567,7 @@ proc startReplication*(
     slotName: string,
     startLsn: Lsn = InvalidLsn,
     options: seq[(string, string)] = @[],
+    autoKeepaliveReply: bool = true,
     callback: ReplicationCallback,
 ): Future[void] {.async.} =
   ## Begin logical replication streaming from the given slot.
@@ -569,6 +575,28 @@ proc startReplication*(
   ## The ``callback`` is invoked for each ``XLogData`` or ``PrimaryKeepalive``
   ## message received. The callback is awaited, providing natural TCP backpressure.
   ## Within the callback, use ``sendStandbyStatus`` to acknowledge received data.
+  ##
+  ## When ``autoKeepaliveReply`` is true (the default), the library responds
+  ## automatically to ``PrimaryKeepalive`` messages with ``replyRequested = true``
+  ## *before* invoking the callback, sending the most recently received
+  ## ``XLogData.endLsn`` (or ``startLsn`` if no XLogData has arrived yet) as
+  ## receive/flush/apply LSN. This prevents silent disconnects from
+  ## ``wal_sender_timeout`` when the callback is slow. The keepalive is still
+  ## delivered to the callback. Set ``autoKeepaliveReply = false`` to manage
+  ## replies manually — for example, when the flush/apply LSN must reflect
+  ## callback-side progress (durable writes) rather than what has merely been
+  ## received from the wire.
+  ##
+  ## If no ``XLogData`` has arrived and ``startLsn`` was left at its default
+  ## ``InvalidLsn`` (``0/0``), the auto-reply will carry ``0/0`` for
+  ## receive/flush/apply. PostgreSQL treats this as "position unknown" and will
+  ## not move ``confirmed_flush_lsn`` backwards, so the reply is still useful
+  ## for resetting ``wal_sender_timeout`` without risking data loss.
+  ##
+  ## If the auto-reply itself fails (for example, the connection is lost
+  ## between receiving the keepalive and writing the Standby Status Update),
+  ## the exception is propagated out of ``startReplication`` and the callback
+  ## is *not* invoked for that keepalive.
   ##
   ## The proc returns when the server sends ``CopyDone`` or the connection closes.
   ## To stop replication from the client side, call ``stopReplication`` from within
@@ -628,6 +656,13 @@ proc startReplication*(
   if not gotCopyBoth:
     return
 
+  # Tracks the highest XLogData.endLsn received from the wire (updated just
+  # before the callback is invoked) so that auto-replies acknowledge only what
+  # we have actually received, never the server's walEnd (which would falsely
+  # advance confirmed_flush_lsn past unprocessed data and cause data loss on
+  # slot restart).
+  var lastReceivedLsn: Lsn = startLsn
+
   # Streaming loop
   block recvLoop:
     while true:
@@ -636,6 +671,13 @@ proc startReplication*(
         case msg.kind
         of bmkCopyData:
           let replMsg = parseReplicationMessage(msg.copyData)
+          case replMsg.kind
+          of rmkXLogData:
+            if replMsg.xlogData.endLsn > lastReceivedLsn:
+              lastReceivedLsn = replMsg.xlogData.endLsn
+          of rmkPrimaryKeepalive:
+            if autoKeepaliveReply and replMsg.keepalive.replyRequested:
+              await sendStandbyStatus(conn, lastReceivedLsn)
           await callback(replMsg)
         of bmkCopyDone:
           # Server ended the stream; reply with CopyDone before draining
