@@ -339,6 +339,24 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
+  test "release discards connection holding session advisory locks":
+    let pool = makePool()
+    pool.active = 1
+    let conn = mockConn()
+    conn.heldSessionLocks = 1
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 0
+
+  test "release returns connection to idle when no locks held":
+    let pool = makePool()
+    pool.active = 1
+    let conn = mockConn()
+    check conn.heldSessionLocks == 0
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 1
+
   test "release on standalone connection raises PgError":
     let conn = mockConn()
     check conn.ownerPool == nil
@@ -346,7 +364,7 @@ suite "Pool release":
       conn.release()
 
 suite "Pool resetSession":
-  test "resetSession is no-op when resetQuery is empty":
+  test "resetSession is no-op when resetQuery is empty and no locks held":
     let pool = makePool()
     let conn = mockConn()
     conn.stmtCacheCapacity = 256
@@ -354,6 +372,7 @@ suite "Pool resetSession":
     waitFor pool.resetSession(conn)
     check conn.state == csReady
     check conn.stmtCache.len == 1 # not cleared
+    check conn.heldSessionLocks == 0
 
   test "resetSession skips broken connection":
     let pool = makePool()
