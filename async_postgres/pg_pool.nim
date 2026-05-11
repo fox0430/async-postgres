@@ -1,6 +1,8 @@
-import std/[deques, macros, options]
+import std/[deques, macros, options, importutils]
 
 import async_backend, pg_protocol, pg_connection, pg_types, pg_client
+
+privateAccess(PgConnection)
 
 const closePruneThreshold = 16
   ## Sweep `pool.pendingCloses` for finished futures only once its length
@@ -237,24 +239,42 @@ proc closeNoWait(pool: PgPool, conn: PgConnection) =
   asyncSpawn fut
 
 proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
-  ## Execute the configured reset query on a connection before returning it
-  ## to the pool. On failure, closes the connection so that release() will
-  ## discard it.
+  ## Reset session-affecting state on a connection before returning it to the
+  ## pool. Releases any session-level advisory locks acquired through the
+  ## typed API, then runs the configured `resetQuery` (if any). On failure,
+  ## closes the connection so that release() will discard it.
+  ##
+  ## Always safe to call: returns immediately when the connection is unusable
+  ## (broken / mid-transaction) or has nothing to clean up (no `resetQuery`
+  ## and no advisory locks held). Callers don't need to gate on the pool
+  ## config.
   ##
   ## Never propagates `CatchableError`: this is invoked from `finally` blocks
   ## in the `with*` helpers (and the per-call cleanup path of `exec` / `query`
   ## etc.), where a raised reset error would mask the body's original
   ## exception. Cleanup errors — including any raised from the close path's
   ## tracer hook — are swallowed.
-  if pool.config.resetQuery.len > 0 and conn.state == csReady and conn.txStatus == tsIdle:
-    try:
+  if conn.state != csReady or conn.txStatus != tsIdle:
+    return
+  if pool.config.resetQuery.len == 0 and conn.heldSessionLocks == 0:
+    return
+  try:
+    if conn.heldSessionLocks > 0:
+      let t = pool.config.tracer
+      if t != nil and t.onLeakedSessionLocks != nil:
+        t.onLeakedSessionLocks(
+          TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
+        )
+      discard await conn.simpleExec("SELECT pg_advisory_unlock_all()")
+      conn.heldSessionLocks = 0
+    if pool.config.resetQuery.len > 0:
       discard await conn.simpleExec(pool.config.resetQuery)
       conn.clearStmtCache()
+  except CatchableError:
+    try:
+      await pool.tracedClose(conn)
     except CatchableError:
-      try:
-        await pool.tracedClose(conn)
-      except CatchableError:
-        discard
+      discard
 
 proc computeConnectBackoff*(initial, maxDelay: Duration, failures: int): Duration =
   ## Exponential backoff for repeated connect failures: returns
@@ -383,7 +403,8 @@ proc releaseCore(
   ## Core release logic shared by the traced and non-traced paths of
   ## `releaseImpl`. Returns flags describing the disposition of `conn` so
   ## the caller can report them to the tracer.
-  if pool.closed or conn.state != csReady or conn.txStatus != tsIdle:
+  if pool.closed or conn.state != csReady or conn.txStatus != tsIdle or
+      conn.heldSessionLocks > 0:
     if pool.active > 0:
       pool.active.dec
     pool.closeNoWait(conn)
@@ -415,7 +436,15 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## Transaction-in-progress (`txStatus != tsIdle`) is treated as failure
   ## to reset the session, so the connection is closed rather than leaking
   ## transaction state to the next borrower.
+  ## Session-level advisory locks (`heldSessionLocks > 0`) likewise force the
+  ## connection to be discarded: callers who route through `resetSession`
+  ## clear them ahead of time, so anything reaching here with locks still
+  ## held has bypassed that path and must not return to the idle queue.
   let tracer = pool.config.tracer
+  if conn.heldSessionLocks > 0 and tracer != nil and tracer.onLeakedSessionLocks != nil:
+    tracer.onLeakedSessionLocks(
+      TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
+    )
   if tracer == nil:
     discard pool.releaseCore(conn)
     return
@@ -563,13 +592,14 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
 template withConnection*(pool: PgPool, conn, body: untyped) =
   ## Acquire a connection, execute `body`, then release it back to the pool.
   ## The connection is available as `conn` inside the body.
-  ## If `resetQuery` is configured, session state is reset before release.
+  ## `resetSession` runs before release, so a configured `resetQuery` is
+  ## applied and any session-level advisory locks acquired through the typed
+  ## API are released via `pg_advisory_unlock_all`.
   let conn = await pool.acquire()
   try:
     body
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
@@ -633,8 +663,7 @@ proc executeBatch(
     for op in batch:
       failPendingOp(op, e)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc dispatchBatchImpl(pool: PgPool) {.async.} =
@@ -667,8 +696,7 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
           )
           op.queryFut.complete(r)
       finally:
-        if pool.config.resetQuery.len > 0:
-          await pool.resetSession(conn)
+        await pool.resetSession(conn)
         conn.release()
     except CatchableError as e:
       failPendingOp(op, e)
@@ -700,8 +728,7 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
   var batchFuts: seq[Future[void]]
   for ci in 0 ..< conns.len:
     if connOps[ci].len == 0:
-      if pool.config.resetQuery.len > 0:
-        await pool.resetSession(conns[ci])
+      await pool.resetSession(conns[ci])
       conns[ci].release()
       continue
     batchFuts.add(executeBatch(pool, conns[ci], connOps[ci]))
@@ -762,8 +789,7 @@ proc exec*(
   try:
     return await conn.exec(sql, params, timeout = timeout)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc query*(
@@ -794,8 +820,7 @@ proc query*(
   try:
     return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc queryEach*(
@@ -815,8 +840,7 @@ proc queryEach*(
   try:
     return await conn.queryEach(sql, params, callback, resultFormat, timeout)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc queryRowOpt*(
@@ -999,8 +1023,7 @@ proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.}
   try:
     return await conn.simpleQuery(sql)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc simpleExec*(
@@ -1013,8 +1036,7 @@ proc simpleExec*(
   try:
     return await conn.simpleExec(sql, timeout)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc execInTransaction*(
@@ -1028,8 +1050,7 @@ proc execInTransaction*(
   try:
     return await conn.execInTransaction(sql, params, timeout)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc queryInTransaction*(
@@ -1044,8 +1065,7 @@ proc queryInTransaction*(
   try:
     return await conn.queryInTransaction(sql, params, resultFormat, timeout)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc notify*(
@@ -1059,8 +1079,7 @@ proc notify*(
   try:
     await conn.notify(channel, payload, timeout)
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
@@ -1131,8 +1150,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
           discard
         raise `eSym`
     finally:
-      if `poolSym`.config.resetQuery.len > 0:
-        await `resetSessionSym`(`poolSym`, `connIdent`)
+      await `resetSessionSym`(`poolSym`, `connIdent`)
       `connIdent`.release()
 
 template withPipeline*(pool: PgPool, pipeline, body: untyped) =
@@ -1143,8 +1161,7 @@ template withPipeline*(pool: PgPool, pipeline, body: untyped) =
     let pipeline = newPipeline(conn)
     body
   finally:
-    if pool.config.resetQuery.len > 0:
-      await pool.resetSession(conn)
+    await pool.resetSession(conn)
     conn.release()
 
 proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =

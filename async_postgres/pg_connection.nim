@@ -198,6 +198,11 @@ type
     stmtCacheCapacity: int ## 0=disabled, default 256
     hstoreOid: int32 ## Dynamic OID for hstore extension type; 0 if not available
     hstoreArrayOid: int32 ## Dynamic OID for hstore[] array; 0 if not available
+    heldSessionLocks: int
+      ## Count of session-level `pg_advisory_lock` acquires through the typed
+      ## API. The pool releases or discards connections with a non-zero count
+      ## so that locks never leak to subsequent borrowers. Raw-SQL acquires
+      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass this counter.
     tracer: PgTracer ## Inherited from ConnConfig on connect
     ownerPool*: PgPoolOwner
       ## Owning pool back-reference. Set when this connection is managed by
@@ -328,6 +333,18 @@ type
     stage*: TransportCloseStage
     err*: ref CatchableError
 
+  TraceLeakedSessionLocksData* = object
+    ## Advisory notification that a pool connection returned while still
+    ## holding session-level advisory locks acquired through the typed API.
+    ## The pool handles cleanup itself — either running
+    ## ``pg_advisory_unlock_all`` from ``resetSession`` and reusing the
+    ## connection, or discarding it on ``release`` when ``resetSession`` was
+    ## bypassed. Use this hook to detect missing ``advisoryUnlock`` /
+    ## ``advisoryUnlockAll`` calls at the borrow site, since silent cleanup
+    ## would otherwise mask the leak.
+    conn*: PgConnection
+    count*: int ## Value of ``heldSessionLocks`` at detection time
+
   TraceInsecureAuthData* = object
     ## Advisory notification that a server-requested auth method is
     ## considered insecure in the current transport context. Currently fires
@@ -396,6 +413,12 @@ type
       ## Advisory only — ``closeTransport`` continues releasing the remaining
       ## resources regardless. Use this to surface half-closed TLS sessions
       ## or peer RSTs that would otherwise be invisible.
+    onLeakedSessionLocks*:
+      proc(data: TraceLeakedSessionLocksData) {.gcsafe, raises: [].}
+      ## Fires when a pool connection returns holding session-level advisory
+      ## locks acquired through the typed API. Advisory only — the pool
+      ## handles cleanup as described in `TraceLeakedSessionLocksData`. Use
+      ## this to surface missing ``advisoryUnlock`` calls at the borrow site.
     onInsecureAuth*: proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].}
       ## Fires when an auth method is used over an insecure transport
       ## (currently: cleartext password without SSL). Advisory only; does
@@ -1935,6 +1958,7 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
     except CatchableError:
       discard
   conn.state = csClosed
+  conn.heldSessionLocks = 0
   # Fail any pending notification waiter
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
     conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
