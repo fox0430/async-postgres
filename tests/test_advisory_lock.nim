@@ -1,6 +1,11 @@
-import std/unittest
+import std/[unittest, importutils, deques]
 
+import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/[async_backend, pg_connection, pg_client, pg_advisory_lock]
+
+privateAccess(PgPool)
+privateAccess(PgConnection)
+privateAccess(PooledConn)
 
 const
   PgHost = "127.0.0.1"
@@ -371,5 +376,276 @@ suite "Advisory Lock: withAdvisoryLockXact template":
         conn1.withAdvisoryLockXactShared(17'i32, 18'i32):
           let acquired = await conn2.advisoryTryLockXactShared(17'i32, 18'i32)
           doAssert acquired
+
+    waitFor t()
+
+suite "Advisory Lock: counter accounting":
+  test "advisoryLock increments counter":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      doAssert conn.heldSessionLocks == 0
+      await conn.advisoryLock(70001'i64)
+      doAssert conn.heldSessionLocks == 1
+      discard await conn.advisoryUnlock(70001'i64)
+      doAssert conn.heldSessionLocks == 0
+
+    waitFor t()
+
+  test "advisoryTryLock increments only on success":
+    proc t() {.async.} =
+      let conn1 = await connect(plainConfig())
+      let conn2 = await connect(plainConfig())
+      defer:
+        await conn1.close()
+        await conn2.close()
+      await conn1.advisoryLock(70002'i64)
+      doAssert conn1.heldSessionLocks == 1
+      # conn2 cannot acquire; counter stays at 0.
+      let got = await conn2.advisoryTryLock(70002'i64)
+      doAssert not got
+      doAssert conn2.heldSessionLocks == 0
+      discard await conn1.advisoryUnlock(70002'i64)
+
+    waitFor t()
+
+  test "recursive acquire stacks the counter":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      await conn.advisoryLock(70003'i64)
+      await conn.advisoryLock(70003'i64)
+      doAssert conn.heldSessionLocks == 2
+      discard await conn.advisoryUnlock(70003'i64)
+      doAssert conn.heldSessionLocks == 1
+      discard await conn.advisoryUnlock(70003'i64)
+      doAssert conn.heldSessionLocks == 0
+
+    waitFor t()
+
+  test "advisoryUnlock returning false does not decrement":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      await conn.advisoryLock(70004'i64)
+      doAssert conn.heldSessionLocks == 1
+      # Unlock a key that is not held — server returns false.
+      let released = await conn.advisoryUnlock(70099'i64)
+      doAssert not released
+      doAssert conn.heldSessionLocks == 1
+      discard await conn.advisoryUnlock(70004'i64)
+      doAssert conn.heldSessionLocks == 0
+
+    waitFor t()
+
+  test "advisoryUnlockAll zeroes the counter":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      await conn.advisoryLock(70005'i64)
+      await conn.advisoryLockShared(70006'i64)
+      doAssert conn.heldSessionLocks == 2
+      await conn.advisoryUnlockAll()
+      doAssert conn.heldSessionLocks == 0
+
+    waitFor t()
+
+  test "two-key int32 variants track the counter":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      await conn.advisoryLock(701'i32, 702'i32)
+      doAssert conn.heldSessionLocks == 1
+      discard await conn.advisoryUnlock(701'i32, 702'i32)
+      doAssert conn.heldSessionLocks == 0
+
+    waitFor t()
+
+  test "xact-level lock does not affect counter":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      conn.withTransaction:
+        await conn.advisoryLockXact(70007'i64)
+        doAssert conn.heldSessionLocks == 0
+      doAssert conn.heldSessionLocks == 0
+
+    waitFor t()
+
+suite "Advisory Lock: pool integration":
+  test "pool discards connection that still holds a session lock":
+    proc t() {.async.} =
+      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      let conn = await pool.acquire()
+      await conn.advisoryLock(71001'i64)
+      let closeBefore = pool.metrics.closeCount
+      conn.release()
+      doAssert pool.idle.len == 0
+      doAssert pool.metrics.closeCount - closeBefore == 1
+
+      # A different session can immediately take the same key.
+      let probe = await connect(plainConfig())
+      defer:
+        await probe.close()
+      let acquired = await probe.advisoryTryLock(71001'i64)
+      doAssert acquired
+      discard await probe.advisoryUnlock(71001'i64)
+
+    waitFor t()
+
+  test "explicit unlock keeps connection in the pool":
+    proc t() {.async.} =
+      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      let conn = await pool.acquire()
+      await conn.advisoryLock(71002'i64)
+      discard await conn.advisoryUnlock(71002'i64)
+      doAssert conn.heldSessionLocks == 0
+      let closeBefore = pool.metrics.closeCount
+      conn.release()
+      doAssert pool.idle.len == 1
+      doAssert pool.metrics.closeCount == closeBefore
+
+    waitFor t()
+
+  test "advisoryUnlockAll lets the pool reuse the connection":
+    proc t() {.async.} =
+      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      let conn = await pool.acquire()
+      await conn.advisoryLock(71003'i64)
+      await conn.advisoryLockShared(71004'i64)
+      await conn.advisoryUnlockAll()
+      doAssert conn.heldSessionLocks == 0
+      let closeBefore = pool.metrics.closeCount
+      conn.release()
+      doAssert pool.idle.len == 1
+      doAssert pool.metrics.closeCount == closeBefore
+
+    waitFor t()
+
+  test "withAdvisoryLock through pool acquires releases on exit":
+    proc t() {.async.} =
+      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        conn.withAdvisoryLock(71005'i64):
+          doAssert conn.heldSessionLocks == 1
+        doAssert conn.heldSessionLocks == 0
+
+      doAssert pool.idle.len == 1
+
+    waitFor t()
+
+  test "resetQuery path unlocks via pg_advisory_unlock_all then runs reset":
+    proc t() {.async.} =
+      let cfg = initPoolConfig(
+        plainConfig(), minSize = 0, maxSize = 1, resetQuery = "DISCARD ALL"
+      )
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        await conn.advisoryLock(71006'i64)
+      # resetSession ran (via withConnection finally) and cleared the counter.
+      doAssert pool.idle.len == 1
+      let pooled = pool.idle[0]
+      doAssert pooled.conn.heldSessionLocks == 0
+
+      # Different session can now grab the key.
+      let probe = await connect(plainConfig())
+      defer:
+        await probe.close()
+      let acquired = await probe.advisoryTryLock(71006'i64)
+      doAssert acquired
+      discard await probe.advisoryUnlock(71006'i64)
+
+    waitFor t()
+
+suite "Advisory Lock: onLeakedSessionLocks tracer hook":
+  type LeakLog = ref object
+    counts: seq[int]
+
+  proc buildLeakTracer(log: LeakLog): PgTracer =
+    let tracer = PgTracer()
+    tracer.onLeakedSessionLocks = proc(
+        data: TraceLeakedSessionLocksData
+    ) {.gcsafe, raises: [].} =
+      log.counts.add(data.count)
+    tracer
+
+  test "resetSession path fires hook with leaked lock count":
+    proc t() {.async.} =
+      let log = LeakLog()
+      var cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      cfg.tracer = buildLeakTracer(log)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        await conn.advisoryLock(72001'i64)
+        await conn.advisoryLockShared(72002'i64)
+      # withConnection finally → resetSession → onLeakedSessionLocks fires once,
+      # pg_advisory_unlock_all clears the counter, and the connection returns
+      # to the idle queue (no resetQuery configured).
+      doAssert log.counts == @[2]
+      doAssert pool.idle.len == 1
+      doAssert pool.idle[0].conn.heldSessionLocks == 0
+
+    waitFor t()
+
+  test "manual release path fires hook and discards connection":
+    proc t() {.async.} =
+      let log = LeakLog()
+      var cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      cfg.tracer = buildLeakTracer(log)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      let conn = await pool.acquire()
+      await conn.advisoryLock(72003'i64)
+      conn.release()
+      doAssert log.counts == @[1]
+      doAssert pool.idle.len == 0
+
+    waitFor t()
+
+  test "no leak leaves hook silent":
+    proc t() {.async.} =
+      let log = LeakLog()
+      var cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      cfg.tracer = buildLeakTracer(log)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        await conn.advisoryLock(72004'i64)
+        discard await conn.advisoryUnlock(72004'i64)
+
+      doAssert log.counts.len == 0
+      doAssert pool.idle.len == 1
 
     waitFor t()

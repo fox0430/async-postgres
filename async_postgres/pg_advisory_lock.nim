@@ -21,6 +21,13 @@
 ## them with the same key unintentionally. Transaction-level locks are not
 ## stackable and are always released at transaction end.
 ##
+## **Pool integration:** Session-level lock acquires through this typed API
+## bump a per-connection counter, and the pool releases or discards the
+## connection on return so that locks never leak to subsequent borrowers.
+## Raw-SQL acquires (e.g. ``conn.exec("SELECT pg_advisory_lock(1)")``) bypass
+## this tracking — callers must release them explicitly or invoke
+## ``advisoryUnlockAll`` before returning the connection to the pool.
+##
 ## Example
 ## =======
 ##
@@ -47,9 +54,11 @@
 ##   conn.withAdvisoryLock(42'i64):
 ##     echo "lock held here"
 
-import std/macros
+import std/[macros, importutils]
 
 import async_backend, pg_types, pg_connection, pg_client
+
+privateAccess(PgConnection)
 
 # Session-level exclusive locks
 
@@ -60,24 +69,31 @@ proc advisoryLock*(
   discard await conn.queryValue(
     "SELECT pg_advisory_lock($1)", @[toPgParam(key)], timeout = timeout
   )
+  inc conn.heldSessionLocks
 
 proc advisoryTryLock*(
     conn: PgConnection, key: int64, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Try to acquire a session-level exclusive advisory lock without blocking.
   ## Returns ``true`` if the lock was acquired.
-  return await conn.queryValue(
+  let acquired = await conn.queryValue(
     bool, "SELECT pg_try_advisory_lock($1)", @[toPgParam(key)], timeout = timeout
   )
+  if acquired:
+    inc conn.heldSessionLocks
+  return acquired
 
 proc advisoryUnlock*(
     conn: PgConnection, key: int64, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Release a session-level exclusive advisory lock.
   ## Returns ``true`` if the lock was held and successfully released.
-  return await conn.queryValue(
+  let released = await conn.queryValue(
     bool, "SELECT pg_advisory_unlock($1)", @[toPgParam(key)], timeout = timeout
   )
+  if released and conn.heldSessionLocks > 0:
+    dec conn.heldSessionLocks
+  return released
 
 # Session-level shared locks
 
@@ -88,30 +104,38 @@ proc advisoryLockShared*(
   discard await conn.queryValue(
     "SELECT pg_advisory_lock_shared($1)", @[toPgParam(key)], timeout = timeout
   )
+  inc conn.heldSessionLocks
 
 proc advisoryTryLockShared*(
     conn: PgConnection, key: int64, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Try to acquire a session-level shared advisory lock without blocking.
   ## Returns ``true`` if the lock was acquired.
-  return await conn.queryValue(
+  let acquired = await conn.queryValue(
     bool, "SELECT pg_try_advisory_lock_shared($1)", @[toPgParam(key)], timeout = timeout
   )
+  if acquired:
+    inc conn.heldSessionLocks
+  return acquired
 
 proc advisoryUnlockShared*(
     conn: PgConnection, key: int64, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Release a session-level shared advisory lock.
   ## Returns ``true`` if the lock was held and successfully released.
-  return await conn.queryValue(
+  let released = await conn.queryValue(
     bool, "SELECT pg_advisory_unlock_shared($1)", @[toPgParam(key)], timeout = timeout
   )
+  if released and conn.heldSessionLocks > 0:
+    dec conn.heldSessionLocks
+  return released
 
 proc advisoryUnlockAll*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Release all session-level advisory locks held by the current session.
   discard await conn.exec("SELECT pg_advisory_unlock_all()", timeout = timeout)
+  conn.heldSessionLocks = 0
 
 # Transaction-level exclusive locks
 
@@ -167,28 +191,35 @@ proc advisoryLock*(
     @[toPgParam(key1), toPgParam(key2)],
     timeout = timeout,
   )
+  inc conn.heldSessionLocks
 
 proc advisoryTryLock*(
     conn: PgConnection, key1, key2: int32, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Try to acquire a session-level exclusive advisory lock (two int32 keys).
-  return await conn.queryValue(
+  let acquired = await conn.queryValue(
     bool,
     "SELECT pg_try_advisory_lock($1, $2)",
     @[toPgParam(key1), toPgParam(key2)],
     timeout = timeout,
   )
+  if acquired:
+    inc conn.heldSessionLocks
+  return acquired
 
 proc advisoryUnlock*(
     conn: PgConnection, key1, key2: int32, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Release a session-level exclusive advisory lock (two int32 keys).
-  return await conn.queryValue(
+  let released = await conn.queryValue(
     bool,
     "SELECT pg_advisory_unlock($1, $2)",
     @[toPgParam(key1), toPgParam(key2)],
     timeout = timeout,
   )
+  if released and conn.heldSessionLocks > 0:
+    dec conn.heldSessionLocks
+  return released
 
 # Two-key (int32, int32) variants — Session-level shared
 
@@ -201,28 +232,35 @@ proc advisoryLockShared*(
     @[toPgParam(key1), toPgParam(key2)],
     timeout = timeout,
   )
+  inc conn.heldSessionLocks
 
 proc advisoryTryLockShared*(
     conn: PgConnection, key1, key2: int32, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Try to acquire a session-level shared advisory lock (two int32 keys).
-  return await conn.queryValue(
+  let acquired = await conn.queryValue(
     bool,
     "SELECT pg_try_advisory_lock_shared($1, $2)",
     @[toPgParam(key1), toPgParam(key2)],
     timeout = timeout,
   )
+  if acquired:
+    inc conn.heldSessionLocks
+  return acquired
 
 proc advisoryUnlockShared*(
     conn: PgConnection, key1, key2: int32, timeout: Duration = ZeroDuration
 ): Future[bool] {.async.} =
   ## Release a session-level shared advisory lock (two int32 keys).
-  return await conn.queryValue(
+  let released = await conn.queryValue(
     bool,
     "SELECT pg_advisory_unlock_shared($1, $2)",
     @[toPgParam(key1), toPgParam(key2)],
     timeout = timeout,
   )
+  if released and conn.heldSessionLocks > 0:
+    dec conn.heldSessionLocks
+  return released
 
 # Two-key (int32, int32) variants — Transaction-level exclusive
 
