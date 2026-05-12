@@ -7,6 +7,7 @@ import pkg/nimcrypto/utils as ncutils
 
 when hasChronos:
   import chronos/streams/tlsstream
+  import bearssl/ssl as bearssl_ssl
   import pg_bearssl
 elif hasAsyncDispatch:
   import std/asyncnet
@@ -53,6 +54,11 @@ type
     sslVerifyCa ## Require SSL + verify CA chain (no hostname verification)
     sslVerifyFull ## Require SSL + verify CA chain and hostname
 
+  SslNegotiation* = enum
+    ## SSL negotiation method for the connection.
+    sslnPostgres ## Traditional SSLRequest negotiation (default)
+    sslnDirect ## Direct SSL: start TLS immediately without SSLRequest (PostgreSQL 17+)
+
   ChannelBindingMode* = enum
     ## SCRAM channel binding policy (libpq-compatible).
     cbPrefer ## Use SCRAM-SHA-256-PLUS when SSL and server support it (default).
@@ -89,6 +95,7 @@ type
     password*: string
     database*: string
     sslMode*: SslMode
+    sslNegotiation*: SslNegotiation ## SSL negotiation method (default: sslnPostgres)
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
@@ -1095,6 +1102,112 @@ proc closeTransport(conn: PgConnection) {.async.} =
       conn.socket.close()
       conn.socket = nil
 
+proc setupTls(conn: PgConnection, config: ConnConfig) {.async.} =
+  ## Perform TLS handshake on an already-connected transport.
+  ## Shared by both traditional (SSLRequest) and direct SSL negotiation.
+  when hasChronos:
+    conn.baseReader = newAsyncStreamReader(conn.transport)
+    conn.baseWriter = newAsyncStreamWriter(conn.transport)
+
+    let flags =
+      case config.sslMode
+      of sslVerifyFull:
+        {}
+      of sslVerifyCa:
+        {TLSFlags.NoVerifyServerName}
+      else:
+        {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
+
+    let serverName = if config.sslMode == sslVerifyFull: config.host else: ""
+
+    # Direct SSL requires ALPN "postgresql" (PostgreSQL 17+, IANA-registered).
+    let alpnProtocols =
+      if config.sslNegotiation == sslnDirect:
+        @["postgresql"]
+      else:
+        @[]
+
+    if config.sslRootCert.len > 0:
+      let parsed = parseTrustAnchors(config.sslRootCert)
+      conn.trustAnchorBufs = parsed.backing
+        # Must outlive TLS session (see parseTrustAnchors doc)
+      conn.tlsStream = newTLSClientAsyncStream(
+        conn.baseReader,
+        conn.baseWriter,
+        serverName,
+        flags = flags,
+        minVersion = TLSVersion.TLS12,
+        maxVersion = TLSVersion.TLS12,
+        trustAnchors = parsed.store,
+        alpnProtocols = alpnProtocols,
+      )
+    else:
+      conn.tlsStream = newTLSClientAsyncStream(
+        conn.baseReader,
+        conn.baseWriter,
+        serverName,
+        flags = flags,
+        minVersion = TLSVersion.TLS12,
+        maxVersion = TLSVersion.TLS12,
+        alpnProtocols = alpnProtocols,
+      )
+    installX509Capture(
+      conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+    )
+    await conn.tlsStream.handshake()
+    conn.reader = conn.tlsStream.reader
+    conn.writer = conn.tlsStream.writer
+    conn.sslEnabled = true
+  elif hasAsyncDispatch:
+    when defined(ssl):
+      let verifyMode =
+        case config.sslMode
+        of sslVerifyCa, sslVerifyFull: SslCVerifyMode.CVerifyPeer
+        else: SslCVerifyMode.CVerifyNone
+
+      var ctx: SslContext
+      var tmpPath: string
+      if config.sslRootCert.len > 0:
+        let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
+        tmpPath = tp
+        try:
+          tmpFile.write(config.sslRootCert)
+          tmpFile.close()
+          ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
+        except CatchableError:
+          removeFile(tmpPath)
+          raise
+      else:
+        ctx = newContext(verifyMode = verifyMode)
+
+      if config.sslNegotiation == sslnDirect:
+        # Direct SSL requires ALPN "postgresql" (PostgreSQL 17+)
+        const alpnProto = "\x0apostgresql"
+        discard
+          SSL_CTX_set_alpn_protos(ctx.context, alpnProto.cstring, cuint(alpnProto.len))
+
+      try:
+        let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
+        wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
+        conn.sslEnabled = true
+        # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding
+        let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
+        if peerCert != nil:
+          try:
+            let derStr = i2d_X509(peerCert)
+            if derStr.len > 0:
+              conn.serverCertDer = newSeq[byte](derStr.len)
+              for i in 0 ..< derStr.len:
+                conn.serverCertDer[i] = byte(derStr[i])
+          finally:
+            X509_free(peerCert)
+      finally:
+        if tmpPath.len > 0:
+          removeFile(tmpPath)
+    else:
+      raise
+        newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
+
 proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
   ## Send SSLRequest and negotiate TLS if server accepts.
   let sslReq = encodeSSLRequest()
@@ -1116,93 +1229,7 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
 
   case respChar
   of 'S':
-    when hasChronos:
-      conn.baseReader = newAsyncStreamReader(conn.transport)
-      conn.baseWriter = newAsyncStreamWriter(conn.transport)
-
-      let flags =
-        case config.sslMode
-        of sslVerifyFull:
-          {}
-        of sslVerifyCa:
-          {TLSFlags.NoVerifyServerName}
-        else:
-          {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
-
-      let serverName = if config.sslMode == sslVerifyFull: config.host else: ""
-
-      if config.sslRootCert.len > 0:
-        let parsed = parseTrustAnchors(config.sslRootCert)
-        conn.trustAnchorBufs = parsed.backing
-          # Must outlive TLS session (see parseTrustAnchors doc)
-        conn.tlsStream = newTLSClientAsyncStream(
-          conn.baseReader,
-          conn.baseWriter,
-          serverName,
-          flags = flags,
-          minVersion = TLSVersion.TLS12,
-          maxVersion = TLSVersion.TLS12,
-          trustAnchors = parsed.store,
-        )
-      else:
-        conn.tlsStream = newTLSClientAsyncStream(
-          conn.baseReader,
-          conn.baseWriter,
-          serverName,
-          flags = flags,
-          minVersion = TLSVersion.TLS12,
-          maxVersion = TLSVersion.TLS12,
-        )
-      installX509Capture(
-        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
-      )
-      await conn.tlsStream.handshake()
-      conn.reader = conn.tlsStream.reader
-      conn.writer = conn.tlsStream.writer
-      conn.sslEnabled = true
-    elif hasAsyncDispatch:
-      when defined(ssl):
-        let verifyMode =
-          case config.sslMode
-          of sslVerifyCa, sslVerifyFull: SslCVerifyMode.CVerifyPeer
-          else: SslCVerifyMode.CVerifyNone
-
-        var ctx: SslContext
-        var tmpPath: string
-        if config.sslRootCert.len > 0:
-          let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
-          tmpPath = tp
-          try:
-            tmpFile.write(config.sslRootCert)
-            tmpFile.close()
-            ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
-          except:
-            removeFile(tmpPath)
-            raise
-        else:
-          ctx = newContext(verifyMode = verifyMode)
-
-        try:
-          let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
-          wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
-          conn.sslEnabled = true
-          # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding
-          let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
-          if peerCert != nil:
-            try:
-              let derStr = i2d_X509(peerCert)
-              if derStr.len > 0:
-                conn.serverCertDer = newSeq[byte](derStr.len)
-                for i in 0 ..< derStr.len:
-                  conn.serverCertDer[i] = byte(derStr[i])
-            finally:
-              X509_free(peerCert)
-        finally:
-          if tmpPath.len > 0:
-            removeFile(tmpPath)
-      else:
-        raise
-          newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
+    await conn.setupTls(config)
   of 'N':
     if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
       raise newException(PgConnectionError, "Server does not support SSL")
@@ -1405,6 +1432,19 @@ proc connectToHost(
 ): Future[PgConnection] {.async.} =
   ## Connect to a single PostgreSQL host. Internal helper for multi-host connect.
 
+  if config.sslNegotiation == sslnDirect:
+    if config.sslMode == sslDisable:
+      raise newException(
+        PgConnectionError, "sslnegotiation=direct is incompatible with sslmode=disable"
+      )
+    if config.sslMode in {sslAllow, sslPrefer}:
+      raise newException(
+        PgConnectionError,
+        "sslnegotiation=direct is incompatible with sslmode=" &
+          (if config.sslMode == sslAllow: "allow" else: "prefer") &
+          " (direct SSL does not support fallback)",
+      )
+
   if config.sslMode == sslAllow:
     # sslAllow: try plaintext first, then fall back to SSL.
     var plainConfig = config
@@ -1517,7 +1557,10 @@ proc connectToHost(
   try:
     # SSL negotiation (before StartupMessage) — skip for Unix sockets
     if config.sslMode != sslDisable and not isUnix:
-      await negotiateSSL(conn, config)
+      if config.sslNegotiation == sslnDirect:
+        await conn.setupTls(config)
+      else:
+        await negotiateSSL(conn, config)
 
     when hasChronos:
       # If SSL was not established, create plain streams
@@ -2291,6 +2334,15 @@ proc parseSslMode(s: string): SslMode =
   else:
     raise newException(PgError, "Invalid sslmode: " & s)
 
+proc parseSslNegotiation(s: string): SslNegotiation =
+  case s
+  of "postgres":
+    sslnPostgres
+  of "direct":
+    sslnDirect
+  else:
+    raise newException(PgError, "Invalid sslnegotiation: " & s)
+
 proc parseChannelBindingMode(s: string): ChannelBindingMode =
   case s
   of "disable":
@@ -2369,6 +2421,8 @@ proc applyParam(result: var ConnConfig, key, val: string) =
     result.password = val
   of "sslmode":
     result.sslMode = parseSslMode(val)
+  of "sslnegotiation":
+    result.sslNegotiation = parseSslNegotiation(val)
   of "channel_binding":
     result.channelBinding = parseChannelBindingMode(val)
   of "require_auth":
