@@ -46,9 +46,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.nimble
-          key: ${{ runner.os }}-nimble-v2-${{ hashFiles('*.nimble') }}
+          key: ${{ runner.os }}-nimble-v3-${{ hashFiles('*.nimble') }}
           restore-keys: |
-            ${{ runner.os }}-nimble-v2-
+            ${{ runner.os }}-nimble-v3-
 
       - name: Setup Nim (stable/release)
         uses: jiro4989/setup-nim-action@v2
@@ -72,7 +72,8 @@ jobs:
         run: docker compose up -d --wait
 
       - name: Install chronos
-        run: nimble install chronos -y
+        # ALPN API (nim-chronos#640) not in a released chronos yet; pin master.
+        run: nimble install chronos@#master -y
 
       - name: Run tests
         run: nimble test -y
