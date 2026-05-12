@@ -568,6 +568,60 @@ proc readSaslInitialResponseMechanism(client: MockClient): Future[string] {.asyn
     result.add(char(body[i]))
     inc i
 
+proc parseAlpnFromClientHello(record: seq[byte]): seq[string] =
+  ## Parse ALPN extension protocol names from a TLS ClientHello record.
+  ## Returns an empty seq when the record is malformed or has no ALPN extension.
+  result = @[]
+  if record.len < 5 or record[0] != 0x16'u8:
+    return
+  var p = 5 # skip TLS record header (type + version + length)
+  if p + 4 > record.len or record[p] != 0x01'u8:
+    return
+  p += 4 # skip handshake type (1) + handshake length (3)
+  p += 2 # legacy_version
+  p += 32 # random
+  if p >= record.len:
+    return
+  let sidLen = int(record[p]) # legacy_session_id
+  p += 1 + sidLen
+  if p + 2 > record.len:
+    return
+  let csLen = int(record[p]) shl 8 or int(record[p + 1]) # cipher_suites
+  p += 2 + csLen
+  if p + 1 > record.len:
+    return
+  let cmLen = int(record[p]) # legacy_compression_methods
+  p += 1 + cmLen
+  if p + 2 > record.len:
+    return
+  let extLen = int(record[p]) shl 8 or int(record[p + 1])
+  p += 2
+  let extEnd = min(p + extLen, record.len)
+  while p + 4 <= extEnd:
+    let extType = int(record[p]) shl 8 or int(record[p + 1])
+    let extDataLen = int(record[p + 2]) shl 8 or int(record[p + 3])
+    p += 4
+    if p + extDataLen > extEnd:
+      return
+    if extType == 0x0010: # ALPN
+      if extDataLen < 2:
+        return
+      let listLen = int(record[p]) shl 8 or int(record[p + 1])
+      var q = p + 2
+      let listEnd = min(p + 2 + listLen, p + extDataLen)
+      while q < listEnd:
+        let nameLen = int(record[q])
+        inc q
+        if q + nameLen > listEnd:
+          return
+        var name = newString(nameLen)
+        for i in 0 ..< nameLen:
+          name[i] = char(record[q + i])
+        result.add(name)
+        q += nameLen
+      return
+    p += extDataLen
+
 suite "Direct SSL negotiation (sslnDirect)":
   test "sslnDirect sends TLS ClientHello as first bytes (no SSLRequest)":
     when defined(ssl) or hasChronos:
@@ -726,6 +780,110 @@ suite "Direct SSL negotiation (sslnDirect)":
       check gotData
       check firstByte == 0x16'u8
       check raised
+    else:
+      skip()
+
+  test "sslnDirect ClientHello advertises ALPN 'postgresql'":
+    when defined(ssl) or hasChronos:
+      type Result = ref object
+        alpnProtos: seq[string]
+        gotData: bool
+        raised: bool
+
+      proc testBody(r: Result) {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await ms.accept()
+          try:
+            let header = await readN(st, 5)
+            let bodyLen = int(header[3]) shl 8 or int(header[4])
+            if bodyLen > 0 and bodyLen < 65536:
+              let body = await readN(st, bodyLen)
+              r.alpnProtos = parseAlpnFromClientHello(header & body)
+              r.gotData = true
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslRequire,
+          sslNegotiation: sslnDirect,
+        )
+
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except CatchableError:
+          r.raised = true
+
+        await serverFut
+        await closeServer(ms)
+
+      let r = Result()
+      waitFor testBody(r)
+      check r.gotData
+      check "postgresql" in r.alpnProtos
+      check r.raised
+    else:
+      skip()
+
+  test "sslnPostgres ClientHello has no ALPN extension":
+    when defined(ssl) or hasChronos:
+      type Result = ref object
+        alpnProtos: seq[string]
+        sawClientHello: bool
+
+      proc testBody(r: Result) {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await ms.accept()
+          try:
+            # Read SSLRequest (8 bytes) and reply 'S' to accept SSL
+            discard await readN(st, 8)
+            await sendBytes(st, @[byte('S')])
+            # Now the client sends a TLS ClientHello
+            let header = await readN(st, 5)
+            if header[0] == 0x16'u8:
+              r.sawClientHello = true
+              let bodyLen = int(header[3]) shl 8 or int(header[4])
+              if bodyLen > 0 and bodyLen < 65536:
+                let body = await readN(st, bodyLen)
+                r.alpnProtos = parseAlpnFromClientHello(header & body)
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslRequire, # sslNegotiation defaults to sslnPostgres
+        )
+
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except CatchableError:
+          discard
+
+        await serverFut
+        await closeServer(ms)
+
+      let r = Result()
+      waitFor testBody(r)
+      check r.sawClientHello
+      check r.alpnProtos.len == 0
     else:
       skip()
 
