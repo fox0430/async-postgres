@@ -8,10 +8,11 @@ Async PostgreSQL client in Nim.
 - PostgreSQL wire protocol v3
 - Simple Query and Extended Query Protocol
 - Pipeline mode — batch multiple operations in a single network round trip
-- Connection pooling with health checks and maintenance
+- Connection pooling with health checks and maintenance (broken connections discarded on acquire/release)
 - Pool cluster with read replica routing
 - SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full)
 - MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
+- `channel_binding` policy (disable, prefer, require) to harden SCRAM against downgrade
 - DSN connection string parsing
 - Unix socket connection
 - Multi-host failover
@@ -61,7 +62,7 @@ Async PostgreSQL client in Nim.
 
 ## Requirements
 
-- Nim >= 2.2.0
+- Nim >= 2.2.4
 
 ## Installation
 
@@ -97,6 +98,12 @@ proc main() {.async.} =
 waitFor main()
 ```
 
+## Reconnection Policy
+
+- **Connection pool (`PgPool` / `PgPoolCluster`)** — broken connections are detected and discarded automatically. On `acquire`, entries whose state is not `csReady` (or that fail the optional `ping` health check) are retired and replaced. On `release`, connections left in a non-ready or in-transaction state are also closed rather than returned to the idle queue. Configure `healthCheckTimeout` / `pingTimeout` to tune idle-connection probing.
+- **Direct `PgConnection`** — no automatic reconnection for regular queries. Per-query retry would be unsafe for non-idempotent statements and in-flight transactions, so a closed connection must be replaced by calling `connect(...)` again (or by using the pool). Inspect `conn.isConnected()` or `conn.state` to decide whether a handle is still usable.
+- **LISTEN/NOTIFY** — this is the one exception. The listen pump reconnects with exponential backoff (up to 10 attempts, 30 s cap) and re-subscribes to all channels. Register a `reconnectCallback` if you need to resynchronise application state after a reconnect.
+
 ## Async Backend
 
 By default, asyncdispatch is used. To use chronos:
@@ -122,6 +129,8 @@ SSL backend differs by async backend:
 The [examples](examples/) directory contains runnable samples:
 
 - [basic_query](examples/basic_query.nim) — Connect, insert, and query rows
+- [query_variants](examples/query_variants.nim) — `queryExists` / `queryValueOrDefault` / `queryValueOpt` / `queryRowOpt` / `queryColumn` / `queryEach` / `simpleExec` / `simpleQuery`
+- [query_direct](examples/query_direct.nim) — Zero-allocation `queryDirect` / `execDirect` macros for hot paths
 - [prepared_statement](examples/prepared_statement.nim) — Server-side prepared statements
 - [transaction](examples/transaction.nim) — Transaction control with rollback and isolation levels
 - [cursor](examples/cursor.nim) — Server-side cursors for streaming large result sets

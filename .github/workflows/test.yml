@@ -29,12 +29,15 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
+        os:
+          - 'ubuntu-latest'
+          - 'macOS-latest'
         nim-version:
-          - '2.2.0'
+          - '2.2.4'
           - 'stable'
           - 'devel'
 
-    name: Tests on ${{ matrix.nim-version }}
+    name: Tests on ${{ matrix.nim-version }} (${{ matrix.os }})
     steps:
       - uses: actions/checkout@v6
 
@@ -75,7 +78,9 @@ jobs:
         run: nimble test -y
 
       - name: Install async_postgres
-        run: nimble install -y
+        run: |
+          rm -rf ~/.nimble/pkgs2/async_postgres-*
+          nimble install -y
 
       - name: Compile examples (asyncdispatch)
         run: for f in examples/*.nim; do nim c "$f"; done

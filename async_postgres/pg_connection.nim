@@ -2,7 +2,8 @@ import std/[tables, sets, strutils, uri, deques, options, lists]
 when defined(posix):
   import std/posix
 
-import async_backend, pg_protocol, pg_auth, pg_types
+import async_backend, pg_errors, pg_protocol, pg_auth, pg_types
+import pkg/nimcrypto/utils as ncutils
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -14,7 +15,7 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[net, openssl, tempfiles, os]
 
-export PgError
+export pg_errors
 
 # TCP keepalive socket options (not exported by posix module)
 when defined(linux):
@@ -34,23 +35,6 @@ else:
   .}
 
 type
-  PgConnectionError* = object of PgError
-    ## Connection failures, disconnections, SSL/auth errors.
-
-  PgQueryError* = object of PgError
-    ## SQL execution errors from the server (ErrorResponse).
-    sqlState*: string ## 5-char SQLSTATE code (e.g. "42P01"), empty if unavailable.
-    severity*: string ## e.g. "ERROR", "FATAL"
-    detail*: string ## DETAIL field, empty if not present.
-    hint*: string ## HINT field, empty if not present.
-
-  PgTimeoutError* = object of PgError ## Operation timed out.
-
-  PgPoolError* = object of PgError ## Pool exhaustion, pool closed, or acquire timeout.
-
-  PgNotifyOverflowError* = object of PgError
-    dropped*: int ## Number of notifications dropped due to queue overflow
-
   PgConnState* = enum
     ## Connection lifecycle state.
     csConnecting
@@ -75,6 +59,21 @@ type
     sslnPostgres ## Traditional SSLRequest negotiation (default)
     sslnDirect ## Direct SSL: start TLS immediately without SSLRequest (PostgreSQL 17+)
 
+  ChannelBindingMode* = enum
+    ## SCRAM channel binding policy (libpq-compatible).
+    cbPrefer ## Use SCRAM-SHA-256-PLUS when SSL and server support it (default).
+    cbDisable ## Never use SCRAM-SHA-256-PLUS; only SCRAM-SHA-256.
+    cbRequire ## Require SCRAM-SHA-256-PLUS; fail if unavailable.
+
+  AuthMethod* = enum
+    ## Individual authentication methods for `ConnConfig.requireAuth`
+    ## allowlisting (libpq `require_auth` parity).
+    amNone ## AuthenticationOk with no challenge (trust/peer/ident)
+    amPassword ## cleartext password (libpq: "password")
+    amMd5 ## MD5 challenge (libpq: "md5")
+    amScramSha256 ## SASL SCRAM-SHA-256 (libpq: "scram-sha-256")
+    amScramSha256Plus ## SASL SCRAM-SHA-256-PLUS (libpq: "scram-sha-256-plus")
+
   TargetSessionAttrs* = enum
     ## Target server type for multi-host failover (libpq compatible).
     tsaAny ## Connect to any server (default)
@@ -98,6 +97,19 @@ type
     sslMode*: SslMode
     sslNegotiation*: SslNegotiation ## SSL negotiation method (default: sslnPostgres)
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    channelBinding*: ChannelBindingMode
+      ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
+      ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
+    requireAuth*: set[AuthMethod]
+      ## Allowlist of auth methods the client will accept. An empty set
+      ## (default) means "allow any" — matching libpq when `require_auth` is
+      ## unset. If the server requests a method outside this set, connect
+      ## fails with `PgConnectionError`. For SASL, advertised mechanisms are
+      ## filtered and the selected mechanism is validated.
+      ##
+      ## Note: libpq's `!`-prefix negation syntax (e.g. `!password`) is not
+      ## yet supported by `parseRequireAuth` — specify the allowed methods
+      ## positively instead.
     applicationName*: string
     connectTimeout*: Duration ## TCP connect timeout (default: no timeout)
     keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
@@ -107,6 +119,13 @@ type
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     extraParams*: seq[(string, string)] ## Additional startup parameters
+    maxMessageSize*: int
+      ## Upper bound (in bytes) on a single backend message including
+      ## its 1-byte type and 4-byte length header. A server claiming a
+      ## larger message is rejected with `ProtocolError` before any
+      ## further recv-buffer growth, capping memory exposure to a
+      ## misbehaving or malicious peer. ``0`` (default) selects
+      ## `DefaultMaxBackendMessageLen` (1 GiB).
     tracer*: PgTracer ## Optional tracer for connection-level hooks
 
   Notification* = object ## A NOTIFY message received from PostgreSQL.
@@ -131,10 +150,15 @@ type
     colOids*: seq[int32] ## Per-column type OIDs for RowData
     lruNode*: DoublyLinkedNode[string] ## Embedded LRU list node
 
+  PgPoolOwner* = ref object of RootObj
+    ## Opaque base for pool-ownership back-references on `PgConnection`.
+    ## The concrete type is `PgPool` (defined in `pg_pool`); this base lives
+    ## here to avoid a circular import. Consumers should not subclass this.
+
   PgConnection* = ref object
     ## A single PostgreSQL connection with buffered I/O and statement caching.
     when hasChronos:
-      transport*: StreamTransport
+      transport: StreamTransport
       baseReader: AsyncStreamReader
       baseWriter: AsyncStreamWriter
       reader: AsyncStreamReader
@@ -145,40 +169,55 @@ type
       alpnNames: cstringArray
         ## Backing storage for ALPN protocol names (must outlive TLS session)
     elif hasAsyncDispatch:
-      socket*: AsyncSocket
+      socket: AsyncSocket
     serverCertDer: seq[byte] ## DER-encoded server certificate for SCRAM channel binding
-    sslEnabled*: bool
-    recvBuf*: seq[byte]
-    recvBufStart*: int ## Read pointer into recvBuf; bytes before this are consumed
-    state*: PgConnState
-    pid*: int32
-    secretKey*: int32
-    serverParams*: Table[string, string]
-    txStatus*: TransactionStatus
-    notifyCallback*: NotifyCallback
-    noticeCallback*: NoticeCallback
-    listenChannels*: HashSet[string]
-    listenTask*: Future[void]
+    sslEnabled: bool
+    recvBuf: seq[byte]
+    recvBufStart: int ## Read pointer into recvBuf; bytes before this are consumed
+    state: PgConnState
+    pid: int32
+    secretKey: int32
+    serverParams: Table[string, string]
+    txStatus: TransactionStatus
+    notifyCallback: NotifyCallback
+    noticeCallback: NoticeCallback
+    listenChannels: HashSet[string]
+    listenTask: Future[void]
     host: string
     port: int
-    createdAt*: Moment
-    portalCounter*: int
-    config*: ConnConfig
-    notifyQueue*: Deque[Notification]
-    notifyMaxQueue*: int
+    createdAt: Moment
+    portalCounter: int
+    config: ConnConfig
+    notifyQueue: Deque[Notification]
+    notifyMaxQueue: int
     notifyWaiter: Future[void]
-    sendBuf*: seq[byte] ## Reusable send buffer for COPY IN batching
-    notifyDropped*: int ## Count of notifications dropped due to queue overflow
+    sendBuf: seq[byte] ## Reusable send buffer for COPY IN batching
+    notifyDropped: int ## Count of notifications dropped due to queue overflow
     listenErrorMsg: string ## Set when listen pump fails permanently
-    reconnectCallback*: proc() {.gcsafe, raises: [].}
-    notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
-    stmtCache*: Table[string, CachedStmt]
+    listenReconnectMaxAttempts: int
+      ## Max reconnect attempts on listen pump failure. Default 10.
+      ## 0 or negative = unlimited retries (retry until close()).
+    listenReconnectMaxBackoff: int
+      ## Max seconds between reconnect attempts (backoff cap). Default 30.
+    reconnectCallback: proc() {.gcsafe, raises: [].}
+    notifyOverflowCallback: proc(dropped: int) {.gcsafe, raises: [].}
+    stmtCache: Table[string, CachedStmt]
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
-    stmtCounter*: int
-    stmtCacheCapacity*: int ## 0=disabled, default 256
-    rowDataBuf*: RowData ## Reusable RowData buffer to avoid per-query allocation
-    hstoreOid*: int32 ## Dynamic OID for hstore extension type; 0 if not available
-    tracer*: PgTracer ## Inherited from ConnConfig on connect
+    stmtCounter: int
+    stmtCacheCapacity: int ## 0=disabled, default 256
+    hstoreOid: int32 ## Dynamic OID for hstore extension type; 0 if not available
+    hstoreArrayOid: int32 ## Dynamic OID for hstore[] array; 0 if not available
+    heldSessionLocks: int
+      ## Count of session-level `pg_advisory_lock` acquires through the typed
+      ## API. The pool releases or discards connections with a non-zero count
+      ## so that locks never leak to subsequent borrowers. Raw-SQL acquires
+      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass this counter.
+    tracer: PgTracer ## Inherited from ConnConfig on connect
+    ownerPool*: PgPoolOwner
+      ## Owning pool back-reference. Set when this connection is managed by
+      ## a `PgPool` (or a pool inside `PgPoolCluster`); `nil` for standalone
+      ## connections created via `connect`. Used by `release(conn)` to route
+      ## the connection back to the correct pool.
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -224,6 +263,13 @@ type
   TraceQueryStartData* = object ## Data passed to the query/exec start hook.
     sql*: string
     params*: seq[PgParam]
+      ## Populated when the caller used a `seq[PgParam]` overload. Mutually
+      ## exclusive with `paramsInline`: exactly one of the two is non-empty
+      ## per call (or both are empty if the query has no bound parameters).
+    paramsInline*: seq[PgParamInline]
+      ## Populated when the caller used a `PgParamInline` overload. Mutually
+      ## exclusive with `params` (see above). Tracers that want a single view
+      ## should branch on whichever field is non-empty.
     isExec*: bool ## true for exec, false for query
 
   TraceQueryEndData* = object ## Data passed to the query/exec end hook.
@@ -269,6 +315,63 @@ type
     wasClosed*: bool ## true if connection was closed instead of returned to pool
     handedToWaiter*: bool ## true if connection was given directly to a waiting acquirer
 
+  TracePoolCloseErrorData* = object
+    ## Data passed to the pool close-error hook. Fired when a pool-initiated
+    ## `conn.close()` raises — these errors are otherwise swallowed because
+    ## close runs from non-async cleanup paths and fire-and-forget tasks,
+    ## making leaks hard to observe without tracing.
+    conn*: PgConnection
+    err*: ref CatchableError
+
+  TransportCloseStage* = enum
+    ## Which transport resource raised during connection teardown.
+    tcsTlsReader
+    tcsTlsWriter
+    tcsBaseReader
+    tcsBaseWriter
+    tcsTransport
+
+  TraceTransportCloseErrorData* = object
+    ## Data passed to the transport close-error hook. Fired when a chronos
+    ## ``closeWait()`` call raises while ``closeTransport`` is releasing
+    ## connection resources. These errors are otherwise swallowed because
+    ## teardown must release every transport resource regardless of
+    ## individual failures, leaving operators with no signal for half-closed
+    ## TLS sessions, BearSSL ``close_notify`` mismatches, or peer RSTs.
+    conn*: PgConnection
+    stage*: TransportCloseStage
+    err*: ref CatchableError
+
+  TraceLeakedSessionLocksData* = object
+    ## Advisory notification that a pool connection returned while still
+    ## holding session-level advisory locks acquired through the typed API.
+    ## The pool handles cleanup itself — either running
+    ## ``pg_advisory_unlock_all`` from ``resetSession`` and reusing the
+    ## connection, or discarding it on ``release`` when ``resetSession`` was
+    ## bypassed. Use this hook to detect missing ``advisoryUnlock`` /
+    ## ``advisoryUnlockAll`` calls at the borrow site, since silent cleanup
+    ## would otherwise mask the leak.
+    conn*: PgConnection
+    count*: int ## Value of ``heldSessionLocks`` at detection time
+
+  TraceInsecureAuthData* = object
+    ## Advisory notification that a server-requested auth method is
+    ## considered insecure in the current transport context. Currently fires
+    ## for cleartext password over a non-SSL connection. The connection is
+    ## NOT aborted — use `ConnConfig.requireAuth` for actual enforcement.
+    conn*: PgConnection
+    authMethod*: AuthMethod ## The method the server requested
+    sslEnabled*: bool ## Transport state at the time of the auth step
+
+  TraceDeprecatedAuthData* = object
+    ## Advisory notification that a server-requested auth method is
+    ## considered cryptographically weak / deprecated regardless of
+    ## transport. Currently fires for MD5 (PostgreSQL recommends
+    ## SCRAM-SHA-256 since v10). The connection is NOT aborted — use
+    ## `ConnConfig.requireAuth` for actual enforcement.
+    conn*: PgConnection
+    authMethod*: AuthMethod ## The method the server requested
+
   PgTracer* = ref object
     ## Tracing hooks for async-postgres operations.
     ## Set only the callbacks you need; nil callbacks are skipped with zero overhead.
@@ -312,6 +415,217 @@ type
       proc(data: TracePoolReleaseStartData): TraceContext {.gcsafe, raises: [].}
     onPoolReleaseEnd*:
       proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
+    onPoolCloseError*: proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].}
+    onTransportCloseError*:
+      proc(data: TraceTransportCloseErrorData) {.gcsafe, raises: [].}
+      ## Fires when a transport ``closeWait()`` raises during teardown.
+      ## Advisory only — ``closeTransport`` continues releasing the remaining
+      ## resources regardless. Use this to surface half-closed TLS sessions
+      ## or peer RSTs that would otherwise be invisible.
+    onLeakedSessionLocks*:
+      proc(data: TraceLeakedSessionLocksData) {.gcsafe, raises: [].}
+      ## Fires when a pool connection returns holding session-level advisory
+      ## locks acquired through the typed API. Advisory only — the pool
+      ## handles cleanup as described in `TraceLeakedSessionLocksData`. Use
+      ## this to surface missing ``advisoryUnlock`` calls at the borrow site.
+    onInsecureAuth*: proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].}
+      ## Fires when an auth method is used over an insecure transport
+      ## (currently: cleartext password without SSL). Advisory only; does
+      ## not abort the connection. Use `ConnConfig.requireAuth` to enforce.
+    onDeprecatedAuth*: proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].}
+      ## Fires when a server-requested auth method is cryptographically
+      ## weak / deprecated regardless of transport (currently: MD5).
+      ## Advisory only; does not abort the connection. Use
+      ## `ConnConfig.requireAuth` to enforce.
+
+when hasChronos:
+  type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
+    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
+    ## inside the callback — its backing buffer is reused for the next row.
+
+else:
+  type RowCallback* = proc(row: Row) {.gcsafe.}
+    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
+    ## inside the callback — its backing buffer is reused for the next row.
+
+const RecvBufSize = 131072 ## Size of the temporary read buffer for recv operations
+
+# Public API: read-only getters
+
+func pid*(conn: PgConnection): int32 {.inline.} =
+  ## The backend process ID for this connection.
+  conn.pid
+
+func sslEnabled*(conn: PgConnection): bool {.inline.} =
+  ## Whether SSL/TLS is active on this connection.
+  conn.sslEnabled
+
+func serverParams*(conn: PgConnection): lent Table[string, string] {.inline.} =
+  ## Server parameters reported during startup (e.g. server_version).
+  conn.serverParams
+
+func listenChannels*(conn: PgConnection): lent HashSet[string] {.inline.} =
+  ## The set of channels this connection is currently LISTENing on.
+  conn.listenChannels
+
+func notifyDropped*(conn: PgConnection): int {.inline.} =
+  ## Count of notifications dropped due to queue overflow.
+  conn.notifyDropped
+
+func config*(conn: PgConnection): lent ConnConfig {.inline.} =
+  ## The connection configuration used to establish this connection.
+  conn.config
+
+func secretKey*(conn: PgConnection): int32 {.inline.} =
+  ## The backend secret key (used for cancel requests).
+  conn.secretKey
+
+func hstoreOid*(conn: PgConnection): int32 {.inline.} =
+  ## Dynamic OID for hstore extension type; 0 if not available.
+  conn.hstoreOid
+
+func hstoreArrayOid*(conn: PgConnection): int32 {.inline.} =
+  ## Dynamic OID for ``hstore[]`` array type; 0 if not available.
+  conn.hstoreArrayOid
+
+proc toPgBinaryParam*(conn: PgConnection, v: PgHstore): PgParam {.inline.} =
+  ## Convenience overload: encode hstore in binary using ``conn.hstoreOid``.
+  ## Raises ``PgTypeError`` if the hstore extension OID has not been discovered
+  ## (e.g. extension not installed on the server).
+  if conn.hstoreOid == 0:
+    raise newException(PgTypeError, "hstore OID not available on this connection")
+  toPgBinaryParam(v, conn.hstoreOid)
+
+proc toPgBinaryParam*(conn: PgConnection, v: seq[PgHstore]): PgParam {.inline.} =
+  ## Convenience overload: encode ``hstore[]`` in binary using
+  ## ``conn.hstoreOid`` and ``conn.hstoreArrayOid``. Raises ``PgTypeError`` if
+  ## either OID has not been discovered.
+  if conn.hstoreOid == 0 or conn.hstoreArrayOid == 0:
+    raise
+      newException(PgTypeError, "hstore/hstore[] OIDs not available on this connection")
+  toPgBinaryParam(v, conn.hstoreOid, conn.hstoreArrayOid)
+
+func notifyCallback*(conn: PgConnection): NotifyCallback {.inline.} =
+  ## The callback invoked when a NOTIFY message arrives.
+  conn.notifyCallback
+
+func notifyMaxQueue*(conn: PgConnection): int {.inline.} =
+  ## The maximum notification queue size (0 = unlimited).
+  conn.notifyMaxQueue
+
+func listenReconnectMaxAttempts*(conn: PgConnection): int {.inline.} =
+  ## Max reconnect attempts on listen pump failure (0 or negative = unlimited).
+  conn.listenReconnectMaxAttempts
+
+func listenReconnectMaxBackoff*(conn: PgConnection): int {.inline.} =
+  ## Maximum seconds between reconnect attempts (backoff cap).
+  conn.listenReconnectMaxBackoff
+
+# Public API: read-write accessors
+
+func state*(conn: PgConnection): var PgConnState {.inline.} =
+  ## The current connection state.
+  conn.state
+
+proc `state=`*(conn: PgConnection, val: PgConnState) {.inline.} =
+  conn.state = val
+
+func txStatus*(conn: PgConnection): var TransactionStatus {.inline.} =
+  ## The current transaction status.
+  conn.txStatus
+
+proc `txStatus=`*(conn: PgConnection, val: TransactionStatus) {.inline.} =
+  conn.txStatus = val
+
+func stmtCacheCapacity*(conn: PgConnection): var int {.inline.} =
+  ## Statement cache capacity (0 = disabled, default 256).
+  conn.stmtCacheCapacity
+
+proc `stmtCacheCapacity=`*(conn: PgConnection, val: int) {.inline.} =
+  conn.stmtCacheCapacity = val
+
+func createdAt*(conn: PgConnection): var Moment {.inline.} =
+  ## When this connection was established.
+  conn.createdAt
+
+proc `createdAt=`*(conn: PgConnection, val: Moment) {.inline.} =
+  conn.createdAt = val
+
+func tracer*(conn: PgConnection): var PgTracer {.inline.} =
+  ## The tracing context for this connection.
+  conn.tracer
+
+proc `tracer=`*(conn: PgConnection, val: PgTracer) {.inline.} =
+  conn.tracer = val
+
+func notifyQueue*(conn: PgConnection): var Deque[Notification] {.inline.} =
+  ## The notification queue for buffered notifications.
+  conn.notifyQueue
+
+func listenTask*(conn: PgConnection): var Future[void] {.inline.} =
+  ## The background listen pump task.
+  conn.listenTask
+
+proc `listenTask=`*(conn: PgConnection, val: Future[void]) {.inline.} =
+  conn.listenTask = val
+
+# Public API: setters for callback/config fields
+
+proc `noticeCallback=`*(conn: PgConnection, cb: NoticeCallback) {.inline.} =
+  ## Set the callback invoked when a notice/warning message arrives.
+  conn.noticeCallback = cb
+
+proc `notifyMaxQueue=`*(conn: PgConnection, val: int) {.inline.} =
+  ## Set the maximum notification queue size (0 = unlimited).
+  conn.notifyMaxQueue = val
+
+proc `listenReconnectMaxAttempts=`*(conn: PgConnection, val: int) {.inline.} =
+  ## Set the maximum reconnect attempts for the listen pump.
+  ## 0 or negative = unlimited retries (retry until close()).
+  conn.listenReconnectMaxAttempts = val
+
+proc `listenReconnectMaxBackoff=`*(conn: PgConnection, val: int) {.inline.} =
+  ## Set the maximum seconds between reconnect attempts (backoff cap).
+  conn.listenReconnectMaxBackoff = val
+
+proc `notifyOverflowCallback=`*(
+    conn: PgConnection, cb: proc(dropped: int) {.gcsafe, raises: [].}
+) {.inline.} =
+  ## Set the callback invoked when notifications are dropped due to queue overflow.
+  conn.notifyOverflowCallback = cb
+
+proc `reconnectCallback=`*(
+    conn: PgConnection, cb: proc() {.gcsafe, raises: [].}
+) {.inline.} =
+  ## Set the callback invoked after a successful automatic reconnect.
+  conn.reconnectCallback = cb
+
+# Internal accessors for cross-module use within the library
+
+func effectiveMaxMessageSize*(conn: PgConnection): int {.inline.} =
+  ## Effective per-message recv cap for this connection. Resolves the
+  ## ``ConnConfig.maxMessageSize`` default (0) to ``DefaultMaxBackendMessageLen``.
+  if conn.config.maxMessageSize > 0:
+    conn.config.maxMessageSize
+  else:
+    DefaultMaxBackendMessageLen
+
+func recvBuf*(conn: PgConnection): var seq[byte] {.inline.} =
+  conn.recvBuf
+proc `recvBuf=`*(conn: PgConnection, val: seq[byte]) {.inline.} =
+  conn.recvBuf = val
+
+func recvBufStart*(conn: PgConnection): var int {.inline.} =
+  conn.recvBufStart
+proc `recvBufStart=`*(conn: PgConnection, val: int) {.inline.} =
+  conn.recvBufStart = val
+
+func sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
+  conn.sendBuf
+func stmtCache*(conn: PgConnection): var Table[string, CachedStmt] {.inline.} =
+  conn.stmtCache
+func portalCounter*(conn: PgConnection): var int {.inline.} =
+  conn.portalCounter
 
 proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
   ## Create a PgQueryError from server ErrorResponse fields.
@@ -402,7 +716,7 @@ proc rows*(qr: QueryResult): seq[Row] =
     qr.data.fields = qr.fields
   result = newSeq[Row](qr.rowCount)
   for i in 0 ..< qr.rowCount:
-    result[i] = Row(data: qr.data, rowIdx: i)
+    result[i] = initRow(qr.data, i)
 
 iterator items*(qr: QueryResult): Row =
   ## Iterate over all rows in the query result.
@@ -410,7 +724,7 @@ iterator items*(qr: QueryResult): Row =
     if qr.fields.len > 0 and qr.data.fields.len == 0:
       qr.data.fields = qr.fields
     for i in 0 ..< qr.rowCount:
-      yield Row(data: qr.data, rowIdx: i)
+      yield initRow(qr.data, i)
 
 when hasChronos:
   type CopyOutCallback* =
@@ -486,19 +800,7 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
         return fut
       r
 
-when hasChronos:
-  type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
-    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
-    ## inside the callback — its backing buffer is reused for the next row.
-
-else:
-  type RowCallback* = proc(row: Row) {.gcsafe.}
-    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
-    ## inside the callback — its backing buffer is reused for the next row.
-
-const RecvBufSize = 131072 ## Size of the temporary read buffer for recv operations
-
-proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) =
+proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
   let notif = Notification(
     pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
   )
@@ -513,11 +815,16 @@ proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) =
     if droppedNow > 0 and conn.notifyOverflowCallback != nil:
       conn.notifyOverflowCallback(droppedNow)
     if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-      conn.notifyWaiter.complete()
+      # asyncdispatch's `Future.complete` has inferred effect `Exception`
+      # via the callback chain; swallow it to keep this proc `raises: []`.
+      try:
+        conn.notifyWaiter.complete()
+      except Exception:
+        discard
   if conn.notifyCallback != nil:
     conn.notifyCallback(notif)
 
-proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) =
+proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
   if conn.noticeCallback != nil:
     conn.noticeCallback(Notice(fields: msg.noticeFields))
 
@@ -558,10 +865,12 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
     return # caller should have evicted; skip if still full
   var entry = cached
   if entry.resultFormats.len == 0 and entry.fields.len > 0:
+    var extraOids: seq[int32]
     if conn.hstoreOid != 0:
-      entry.resultFormats = buildResultFormats(entry.fields, [conn.hstoreOid])
-    else:
-      entry.resultFormats = buildResultFormats(entry.fields)
+      extraOids.add(conn.hstoreOid)
+    if conn.hstoreArrayOid != 0:
+      extraOids.add(conn.hstoreArrayOid)
+    entry.resultFormats = buildResultFormats(entry.fields, extraOids)
     entry.colFmts = newSeq[int16](entry.fields.len)
     entry.colOids = newSeq[int32](entry.fields.len)
     for i in 0 ..< entry.fields.len:
@@ -595,7 +904,7 @@ when hasAsyncDispatch:
       var fut = newFuture[void]("sendRawBytes")
       fut.complete()
       return fut
-    sendRawData(socket, unsafeAddr data[0], data.len)
+    sendRawData(socket, addr data[0], data.len)
 
 proc compactRecvBuf(conn: PgConnection) {.inline.} =
   ## Shift unconsumed data to the front of recvBuf, reclaiming space consumed
@@ -615,55 +924,84 @@ proc fillRecvBuf*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Read data from socket into buffer. The only await point for message reception.
+  ##
+  ## On `AsyncTimeoutError` the caller (typically `invalidateOnTimeout`) is
+  ## responsible for the state transition. On any other `CatchableError`
+  ## (transport failure, cancellation, etc.) the connection is marked
+  ## `csClosed` before re-raising, since the read may have consumed an
+  ## indeterminate number of bytes from the socket and the stream is no
+  ## longer parseable.
   conn.compactRecvBuf()
   when hasChronos:
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + RecvBufSize)
+    var n: int
     try:
-      let n =
+      n =
         if timeout == ZeroDuration:
           await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
         else:
           await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
             timeout
           )
-      if n == 0:
-        conn.state = csClosed
-        raise newException(PgConnectionError, "Connection closed by server")
-      conn.recvBuf.setLen(oldLen + n)
     except AsyncTimeoutError as e:
       conn.recvBuf.setLen(oldLen)
       raise e
+    except CatchableError as e:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise e
+    if n == 0:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise newException(PgConnectionError, "Connection closed by server")
+    conn.recvBuf.setLen(oldLen + n)
   elif hasAsyncDispatch:
     let data =
-      if timeout == ZeroDuration:
-        await conn.socket.recv(RecvBufSize)
-      else:
-        await conn.socket.recv(RecvBufSize).wait(timeout)
+      try:
+        if timeout == ZeroDuration:
+          await conn.socket.recv(RecvBufSize)
+        else:
+          await conn.socket.recv(RecvBufSize).wait(timeout)
+      except AsyncTimeoutError as e:
+        raise e
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
     if data.len == 0:
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + data.len)
-    copyMem(addr conn.recvBuf[oldLen], unsafeAddr data[0], data.len)
+    copyMem(addr conn.recvBuf[oldLen], addr data[0], data.len)
 
 proc nextMessage*(
     conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
-): Option[BackendMessage] =
+): Option[BackendMessage] {.raises: [ProtocolError].} =
   ## Synchronously parse the next message from the receive buffer.
   ## Returns none if the buffer doesn't contain a complete message.
   ## Notification/Notice messages are dispatched internally.
   ## DataRow messages are counted (if rowCount != nil) and consumed.
+  ##
+  ## On `ProtocolError` the protocol stream is desynchronised — the connection
+  ## is transitioned to `csClosed` before re-raising so that it is never
+  ## reused (in particular, by the connection pool).
   var pos = conn.recvBufStart
+  let maxLen = conn.effectiveMaxMessageSize()
   while true:
     var consumed: int
-    let res = parseBackendMessage(
-      conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData
-    )
+    let res =
+      try:
+        parseBackendMessage(
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData, maxLen
+        )
+      except ProtocolError as e:
+        conn.state = csClosed
+        raise e
     if res.state == psIncomplete:
-      conn.recvBufStart = pos
       return none(BackendMessage)
     pos += consumed
+    conn.recvBufStart = pos
     if res.state == psDataRow:
       # DataRow already parsed in-place into rowData; just count it
       if rowCount != nil:
@@ -678,7 +1016,6 @@ proc nextMessage*(
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
-    conn.recvBufStart = pos
     return some(res.message)
 
 proc recvMessage*(
@@ -704,14 +1041,30 @@ proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
       await conn.socket.sendRawBytes(data)
 
 proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
-  ## Send conn.sendBuf to the server without copying the seq.
-  ## Safe because conn.state == csBusy prevents concurrent access to sendBuf.
+  ## Send conn.sendBuf to the server.
+  ## The transport receives its own copy of the buffer, so conn.sendBuf is safe
+  ## to mutate while the returned Future is still pending.
   when hasChronos:
     if conn.sendBuf.len > 0:
-      await conn.writer.write(unsafeAddr conn.sendBuf[0], conn.sendBuf.len)
+      await conn.writer.write(conn.sendBuf)
   elif hasAsyncDispatch:
     if conn.sendBuf.len > 0:
-      await conn.socket.sendRawData(unsafeAddr conn.sendBuf[0], conn.sendBuf.len)
+      await conn.socket.sendRawBytes(conn.sendBuf)
+
+when hasChronos:
+  proc fireTransportCloseError(
+      conn: PgConnection, stage: TransportCloseStage, err: ref CatchableError
+  ) =
+    ## Route a swallowed transport close error to the tracer. ``closeTransport``
+    ## must continue releasing the remaining resources, so the error cannot be
+    ## propagated to a caller — tracing is the only signal operators have.
+    ## Reads from ``conn.config.tracer`` so events fire even when teardown
+    ## happens before the runtime tracer alias has been assigned.
+    let t = conn.config.tracer
+    if t != nil and t.onTransportCloseError != nil:
+      t.onTransportCloseError(
+        TraceTransportCloseErrorData(conn: conn, stage: stage, err: err)
+      )
 
 proc closeTransport(conn: PgConnection) {.async.} =
   ## Close transport resources without sending Terminate.
@@ -719,12 +1072,12 @@ proc closeTransport(conn: PgConnection) {.async.} =
     if conn.tlsStream != nil:
       try:
         await conn.tlsStream.reader.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTlsReader, e)
       try:
         await conn.tlsStream.writer.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTlsWriter, e)
       conn.tlsStream = nil
     if conn.alpnNames != nil:
       deallocCStringArray(conn.alpnNames)
@@ -732,20 +1085,23 @@ proc closeTransport(conn: PgConnection) {.async.} =
     if conn.baseReader != nil:
       try:
         await conn.baseReader.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsBaseReader, e)
       try:
         await conn.baseWriter.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsBaseWriter, e)
       conn.baseReader = nil
       conn.baseWriter = nil
     if conn.transport != nil:
       try:
         await conn.transport.closeWait()
-      except CatchableError:
-        discard
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTransport, e)
       conn.transport = nil
+    # Drop the cached reader/writer aliases so isConnected() reports false.
+    conn.reader = nil
+    conn.writer = nil
   elif hasAsyncDispatch:
     if not conn.socket.isNil:
       conn.socket.close()
@@ -983,10 +1339,102 @@ when defined(posix):
             "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
         .}
 
+proc fireInsecureAuth(conn: PgConnection, authMethod: AuthMethod) =
+  let t = conn.config.tracer
+  if t != nil and t.onInsecureAuth != nil:
+    t.onInsecureAuth(
+      TraceInsecureAuthData(
+        conn: conn, authMethod: authMethod, sslEnabled: conn.sslEnabled
+      )
+    )
+
+proc fireDeprecatedAuth(conn: PgConnection, authMethod: AuthMethod) =
+  let t = conn.config.tracer
+  if t != nil and t.onDeprecatedAuth != nil:
+    t.onDeprecatedAuth(TraceDeprecatedAuthData(conn: conn, authMethod: authMethod))
+
+proc enforceAuthAllowed(
+    authMethod: AuthMethod, allowed: set[AuthMethod], offered: string = ""
+) {.raises: [PgConnectionError].} =
+  if allowed.len > 0 and authMethod notin allowed:
+    var msg =
+      "server requested auth method '" & $authMethod &
+      "' which is not in require_auth allowlist " & $allowed
+    if offered.len > 0:
+      msg.add(" (server offered: ")
+      msg.add(offered)
+      msg.add(")")
+    raise newException(PgConnectionError, msg)
+
+proc filterSaslByRequireAuth*(
+    mechs: seq[string], allowed: set[AuthMethod]
+): seq[string] =
+  ## Filter a server-offered SASL mechanism list by the client's
+  ## `requireAuth` policy. An empty `allowed` set performs no filtering
+  ## (matching libpq semantics when `require_auth` is unset).
+  if allowed.len == 0:
+    return mechs
+  for m in mechs:
+    if m == "SCRAM-SHA-256-PLUS" and amScramSha256Plus in allowed:
+      result.add(m)
+    elif m == "SCRAM-SHA-256" and amScramSha256 in allowed:
+      result.add(m)
+
 proc bytesToString(data: seq[byte]): string =
   result = newString(data.len)
   for i in 0 ..< data.len:
     result[i] = char(data[i])
+
+proc selectScramMechanism(
+    sslEnabled: bool,
+    serverCertDer: openArray[byte],
+    saslMechanisms: seq[string],
+    mode: ChannelBindingMode,
+): tuple[mechanism: string, cbType: string, cbData: seq[byte]] =
+  ## Pick the SCRAM mechanism and channel-binding material for a SASL
+  ## authentication attempt. Raises `PgConnectionError` when the server-offered
+  ## mechanisms cannot satisfy `mode`.
+  let serverHasPlus = "SCRAM-SHA-256-PLUS" in saslMechanisms
+  let serverHasScram = "SCRAM-SHA-256" in saslMechanisms
+  let canUsePlus = sslEnabled and serverCertDer.len > 0 and serverHasPlus
+  case mode
+  of cbRequire:
+    if not sslEnabled:
+      raise newException(
+        PgConnectionError, "channel binding is required, but SSL is not in use"
+      )
+    if not serverHasPlus:
+      raise newException(
+        PgConnectionError,
+        "channel binding is required, but server did not offer SCRAM-SHA-256-PLUS",
+      )
+    if serverCertDer.len == 0:
+      raise newException(
+        PgConnectionError,
+        "channel binding is required, but server certificate is unavailable",
+      )
+    result.mechanism = "SCRAM-SHA-256-PLUS"
+    result.cbType = "tls-server-end-point"
+    result.cbData = computeTlsServerEndpoint(serverCertDer)
+  of cbPrefer:
+    if canUsePlus:
+      result.mechanism = "SCRAM-SHA-256-PLUS"
+      result.cbType = "tls-server-end-point"
+      result.cbData = computeTlsServerEndpoint(serverCertDer)
+    elif serverHasScram:
+      result.mechanism = "SCRAM-SHA-256"
+    else:
+      raise newException(
+        PgConnectionError, "server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS"
+      )
+  of cbDisable:
+    if serverHasScram:
+      result.mechanism = "SCRAM-SHA-256"
+    else:
+      raise newException(
+        PgConnectionError,
+        "channel binding is disabled, but server only offered SCRAM-SHA-256-PLUS",
+      )
 
 proc connectToHost(
     config: ConnConfig, hostAddr: string, hostPort: int
@@ -1063,6 +1511,8 @@ proc connectToHost(
       config: config,
       notifyMaxQueue: 1024,
       stmtCacheCapacity: 256,
+      listenReconnectMaxAttempts: 10,
+      listenReconnectMaxBackoff: 30,
     )
   elif hasAsyncDispatch:
     let sock =
@@ -1088,8 +1538,14 @@ proc connectToHost(
       else:
         await sock.connect(hostAddr, Port(hostPort))
         when defined(posix):
-          configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
-          configureKeepalive(posix.SocketHandle(sock.getFd()), config)
+          when defined(nimdoc):
+            # nim doc resolves nativesockets.SocketHandle to winlean on some
+            # setups, so cast explicitly to satisfy the doc-time type check.
+            configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
+            configureKeepalive(posix.SocketHandle(sock.getFd()), config)
+          else:
+            configureTcpNoDelay(sock.getFd())
+            configureKeepalive(sock.getFd(), config)
     except CatchableError:
       sock.close()
       raise
@@ -1103,6 +1559,8 @@ proc connectToHost(
       config: config,
       notifyMaxQueue: 1024,
       stmtCacheCapacity: 256,
+      listenReconnectMaxAttempts: 10,
+      listenReconnectMaxBackoff: 30,
     )
 
   try:
@@ -1130,43 +1588,78 @@ proc connectToHost(
 
     # Authentication loop
     var scramState: ScramState
+    var sawAuthRequest = false
     block authLoop:
       while true:
         while (let opt = conn.nextMessage(); opt.isSome):
           let msg = opt.get
           case msg.kind
           of bmkAuthenticationOk:
+            if not sawAuthRequest:
+              enforceAuthAllowed(amNone, config.requireAuth)
             break authLoop
           of bmkAuthenticationCleartextPassword:
-            await conn.sendMsg(encodePassword(config.password))
+            sawAuthRequest = true
+            if not conn.sslEnabled:
+              fireInsecureAuth(conn, amPassword)
+            enforceAuthAllowed(amPassword, config.requireAuth)
+            var pwMsg = encodePassword(config.password)
+            try:
+              await conn.sendMsg(pwMsg)
+            finally:
+              ncutils.burnMem(pwMsg)
           of bmkAuthenticationMD5Password:
-            let hash = md5AuthHash(config.user, config.password, msg.md5Salt)
-            await conn.sendMsg(encodePassword(hash))
+            sawAuthRequest = true
+            fireDeprecatedAuth(conn, amMd5)
+            enforceAuthAllowed(amMd5, config.requireAuth)
+            var hash = md5AuthHash(config.user, config.password, msg.md5Salt)
+            var hashMsg = encodePassword(hash)
+            burnStr(hash)
+            try:
+              await conn.sendMsg(hashMsg)
+            finally:
+              ncutils.burnMem(hashMsg)
           of bmkAuthenticationSASL:
-            var mechanism: string
-            var cbType = ""
-            var cbData: seq[byte]
-            if conn.sslEnabled and conn.serverCertDer.len > 0 and
-                "SCRAM-SHA-256-PLUS" in msg.saslMechanisms:
-              mechanism = "SCRAM-SHA-256-PLUS"
-              cbType = "tls-server-end-point"
-              cbData = computeTlsServerEndpoint(conn.serverCertDer)
-            elif "SCRAM-SHA-256" in msg.saslMechanisms:
-              mechanism = "SCRAM-SHA-256"
-            else:
+            sawAuthRequest = true
+            let filtered =
+              filterSaslByRequireAuth(msg.saslMechanisms, config.requireAuth)
+            if config.requireAuth.len > 0 and filtered.len == 0:
               raise newException(
                 PgConnectionError,
-                "Server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS",
+                "server offered SASL mechanisms " & $msg.saslMechanisms &
+                  " but none match require_auth allowlist " & $config.requireAuth,
               )
-            let clientFirst =
-              scramClientFirstMessage(config.user, scramState, cbType, cbData)
-            await conn.sendMsg(encodeSASLInitialResponse(mechanism, clientFirst))
+            let choice = selectScramMechanism(
+              conn.sslEnabled, conn.serverCertDer, filtered, config.channelBinding
+            )
+            let chosen =
+              if choice.mechanism == "SCRAM-SHA-256-PLUS":
+                amScramSha256Plus
+              else:
+                amScramSha256
+            # Defensive: filterSaslByRequireAuth above already dropped
+            # disallowed mechanisms, so `chosen` is guaranteed allowed. This
+            # re-check guards against future changes to selectScramMechanism
+            # introducing a bypass (e.g. a fallback that reaches past the
+            # filtered list).
+            enforceAuthAllowed(chosen, config.requireAuth, $msg.saslMechanisms)
+            let clientFirst = scramClientFirstMessage(
+              config.user, scramState, choice.cbType, choice.cbData
+            )
+            await conn.sendMsg(encodeSASLInitialResponse(choice.mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
-            let clientFinal =
+            var clientFinal =
               scramClientFinalMessage(config.password, msg.saslData, scramState)
-            await conn.sendMsg(encodeSASLResponse(clientFinal))
+            var saslMsg = encodeSASLResponse(clientFinal)
+            ncutils.burnMem(clientFinal)
+            try:
+              await conn.sendMsg(saslMsg)
+            finally:
+              ncutils.burnMem(saslMsg)
           of bmkAuthenticationSASLFinal:
-            if not scramVerifyServerFinal(msg.saslFinalData, scramState):
+            let ok = scramVerifyServerFinal(msg.saslFinalData, scramState)
+            ncutils.burnMem(scramState.serverSignature)
+            if not ok:
               raise newException(
                 PgConnectionError, "SCRAM server signature verification failed"
               )
@@ -1200,7 +1693,7 @@ proc connectToHost(
     # Discover extension type OIDs (hstore, etc.)
     conn.state = csBusy
     await conn.sendMsg(
-      encodeQuery("SELECT oid FROM pg_type WHERE typname = 'hstore' LIMIT 1")
+      encodeQuery("SELECT oid, typarray FROM pg_type WHERE typname = 'hstore' LIMIT 1")
     )
     block discoverLoop:
       while true:
@@ -1213,6 +1706,11 @@ proc connectToHost(
             if msg.columns.len > 0 and msg.columns[0].isSome:
               try:
                 conn.hstoreOid = int32(parseInt(bytesToString(msg.columns[0].get)))
+              except ValueError:
+                discard
+            if msg.columns.len > 1 and msg.columns[1].isSome:
+              try:
+                conn.hstoreArrayOid = int32(parseInt(bytesToString(msg.columns[1].get)))
               except ValueError:
                 discard
           of bmkCommandComplete, bmkEmptyQueryResponse:
@@ -1245,8 +1743,18 @@ proc quoteIdentifier*(s: string): string =
   "\"" & s.replace("\"", "\"\"") & "\""
 
 proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.async.} =
-  ## Execute one or more SQL statements via simple query protocol.
-  ## Returns one `QueryResult` per statement. Supports multiple statements separated by semicolons.
+  ## Execute one or more SQL statements via the **simple query protocol**.
+  ##
+  ## Returns one ``QueryResult`` per statement; supports multiple statements
+  ## separated by ``;`` in a single round trip — this is the main reason to
+  ## choose ``simpleQuery`` over ``query``.
+  ##
+  ## No parameters are supported (the SQL string is sent verbatim — only use
+  ## trusted input) and rows are always in the text wire format. No
+  ## server-side plan cache entry is created.
+  ##
+  ## For single-statement parameterised reads, prefer ``query``; for
+  ## parameter-less commands without rows, prefer ``simpleExec``.
   conn.checkReady()
 
   var results: seq[QueryResult]
@@ -1395,11 +1903,42 @@ proc cancelNoWait*(conn: PgConnection) =
 
   asyncSpawn doCancel()
 
+proc invalidateOnTimeout*(conn: PgConnection, reason: string) =
+  ## Timeout recovery for a connection whose last request may have left the
+  ## protocol out of sync. Schedules a best-effort CancelRequest via
+  ## `cancelNoWait`, marks the connection `csClosed` so it cannot be reused,
+  ## and raises `PgTimeoutError` with `reason`.
+  ##
+  ## Under asyncdispatch this is the **only** safe recovery path: the inner
+  ## future keeps running in the background after `wait()` fires, and may
+  ## still write to the socket. Reusing the connection would interleave its
+  ## stale write with a new request and corrupt the protocol stream. chronos
+  ## cancels the inner future properly, but we still invalidate unconditionally
+  ## — the server may have processed the request partially and the cached
+  ## session state (prepared statements, portals, transaction status) is no
+  ## longer reliable.
+  conn.cancelNoWait()
+  conn.state = csClosed
+  raise newException(PgTimeoutError, reason)
+
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
-  ## Execute a SQL statement via simple query protocol, returning the command result.
-  ## Lighter than `exec` for parameter-less commands (no Parse/Bind/Describe overhead).
+  ## Execute a side-effect SQL command via the **simple query protocol**,
+  ## returning the final command tag.
+  ##
+  ## Lighter than ``exec`` for parameter-less commands — one ``Query`` message,
+  ## no Parse/Bind/Describe round trip and no plan cache entry. Intended for
+  ## session-level commands such as ``BEGIN``, ``SET``, ``VACUUM``,
+  ## ``LISTEN``, ``NOTIFY``.
+  ##
+  ## The SQL string is sent verbatim (no parameters) — only use trusted input,
+  ## or quote interpolated identifiers yourself via ``quoteIdentifier``.
+  ##
+  ## Multiple ``;``-separated statements are accepted, but only the **last**
+  ## command tag is returned; use ``simpleQuery`` if you need per-statement
+  ## results. For parameterised writes, prefer ``exec``.
+  ##
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   var tag: string
   withConnTracing(
@@ -1414,14 +1953,21 @@ proc simpleExec*(
       try:
         tag = await simpleExecImpl(conn, sql, timeout).wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "simpleExec timed out")
+        conn.invalidateOnTimeout("simpleExec timed out")
     else:
       tag = await simpleExecImpl(conn, sql)
   return initCommandResult(tag)
 
-proc isConnected(conn: PgConnection): bool =
+proc isConnected*(conn: PgConnection): bool =
+  ## Whether the underlying transport is present.
+  ##
+  ## This is a cheap, non-blocking check (no round trip): it only reports
+  ## whether the connection object currently holds a transport handle. It
+  ## does **not** detect server-side closes that have not yet been observed
+  ## by a read — use `ping` for that.
+  ##
+  ## Pair with `state == csReady` to decide whether a connection is usable
+  ## before issuing a query.
   when hasChronos:
     not conn.writer.isNil
   elif hasAsyncDispatch:
@@ -1464,9 +2010,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
       try:
         await perform().wait(timeout)
       except AsyncTimeoutError:
-        conn.cancelNoWait()
-        conn.state = csClosed
-        raise newException(PgTimeoutError, "Ping timed out")
+        conn.invalidateOnTimeout("Ping timed out")
 
     withTimeout()
   else:
@@ -1485,6 +2029,7 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
     except CatchableError:
       discard
   conn.state = csClosed
+  conn.heldSessionLocks = 0
   # Fail any pending notification waiter
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
     conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
@@ -1594,7 +2139,6 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   conn.recvBuf.setLen(0)
   conn.recvBufStart = 0
   conn.clearStmtCache()
-  conn.rowDataBuf = nil
   conn.state = csConnecting
   var newConn: PgConnection
   try:
@@ -1621,6 +2165,7 @@ proc reconnectInPlace(conn: PgConnection) {.async.} =
   conn.state = csReady
   conn.createdAt = newConn.createdAt
   conn.hstoreOid = newConn.hstoreOid
+  conn.hstoreArrayOid = newConn.hstoreArrayOid
   for ch in conn.listenChannels:
     discard await conn.simpleQuery("LISTEN " & quoteIdentifier(ch))
 
@@ -1628,14 +2173,15 @@ proc listenPump(conn: PgConnection) {.async.} =
   ## Background loop: repeatedly receives messages, dispatching notifications.
   ## Non-notification messages are discarded (recvMessage handles dispatch).
   ## On connection failure, attempts automatic reconnection with exponential
-  ## backoff (up to 10 attempts) and re-subscribes to all channels.
+  ## backoff (up to `listenReconnectMaxAttempts` attempts; 0 or negative =
+  ## unlimited) and re-subscribes to all channels.
   ## Exits cleanly when state changes from csListening (via stopListening
   ## sending an empty query), then drains until ReadyForQuery.
   while true:
     try:
       while conn.state == csListening:
         discard await conn.recvMessage()
-      # State changed -- drain the stop-signal query response until ReadyForQuery
+      # State changed: drain the stop-signal query response until ReadyForQuery
       block drainLoop:
         while true:
           while (let opt = conn.nextMessage(); opt.isSome):
@@ -1654,9 +2200,13 @@ proc listenPump(conn: PgConnection) {.async.} =
           conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
         return
       # Auto-reconnect with exponential backoff
+      let maxAttempts = conn.listenReconnectMaxAttempts
+      let maxBackoff = max(1, conn.listenReconnectMaxBackoff)
+      let unlimited = maxAttempts <= 0
       var reconnected = false
       var backoff = 1
-      for attempt in 0 ..< 10:
+      var attempt = 0
+      while unlimited or attempt < maxAttempts:
         try:
           await sleepAsync(seconds(backoff))
           await conn.reconnectInPlace()
@@ -1668,10 +2218,12 @@ proc listenPump(conn: PgConnection) {.async.} =
         except CancelledError:
           return
         except CatchableError:
-          backoff = min(backoff * 2, 30)
+          backoff = min(backoff * 2, maxBackoff)
+        inc attempt
       if not reconnected:
         conn.listenErrorMsg =
-          "Listen connection lost: reconnection failed after 10 attempts"
+          "Listen connection lost: reconnection failed after " & $maxAttempts &
+          " attempts"
         conn.state = csClosed
         if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
           conn.notifyWaiter.fail(newException(PgError, conn.listenErrorMsg))
@@ -1697,7 +2249,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
   except CancelledError as e:
     raise e
   except CatchableError:
-    # Send or pump failed -- connection is dead
+    # Send or pump failed: connection is dead
     if conn.listenTask != nil and not conn.listenTask.finished:
       await cancelAndWait(conn.listenTask)
     conn.listenTask = nil
@@ -1800,6 +2352,44 @@ proc parseSslNegotiation(s: string): SslNegotiation =
   else:
     raise newException(PgError, "Invalid sslnegotiation: " & s)
 
+proc parseChannelBindingMode(s: string): ChannelBindingMode =
+  case s
+  of "disable":
+    cbDisable
+  of "prefer":
+    cbPrefer
+  of "require":
+    cbRequire
+  else:
+    raise newException(PgError, "Invalid channel_binding: " & s)
+
+proc parseAuthMethod(s: string): AuthMethod =
+  case s
+  of "none":
+    amNone
+  of "password":
+    amPassword
+  of "md5":
+    amMd5
+  of "scram-sha-256":
+    amScramSha256
+  of "scram-sha-256-plus":
+    amScramSha256Plus
+  else:
+    raise newException(PgError, "Invalid require_auth method: " & s)
+
+proc parseRequireAuth*(s: string): set[AuthMethod] =
+  ## Parse a comma-separated list of auth method names into a set
+  ## (libpq `require_auth` syntax; negation prefix `!` is not yet supported).
+  ## Empty input returns the empty set (allow any).
+  if s.len == 0:
+    return {}
+  for raw in s.split(','):
+    let tok = raw.strip()
+    if tok.len == 0:
+      raise newException(PgError, "Empty entry in require_auth list: " & s)
+    result.incl(parseAuthMethod(tok))
+
 proc parseTargetSessionAttrs(s: string): TargetSessionAttrs =
   case s
   of "any":
@@ -1842,6 +2432,10 @@ proc applyParam(result: var ConnConfig, key, val: string) =
     result.sslMode = parseSslMode(val)
   of "sslnegotiation":
     result.sslNegotiation = parseSslNegotiation(val)
+  of "channel_binding":
+    result.channelBinding = parseChannelBindingMode(val)
+  of "require_auth":
+    result.requireAuth = parseRequireAuth(val)
   of "application_name":
     result.applicationName = val
   of "connect_timeout":
@@ -1882,6 +2476,13 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "keepalives_count must be non-negative: " & val)
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
+  of "max_message_size":
+    try:
+      result.maxMessageSize = parseInt(val)
+    except ValueError:
+      raise newException(PgError, "Invalid max_message_size: " & val)
+    if result.maxMessageSize < 0:
+      raise newException(PgError, "max_message_size must be non-negative: " & val)
   else:
     result.extraParams.add((key, val))
 
@@ -2071,6 +2672,7 @@ proc initConnConfig*(
     database = "",
     sslMode = sslDisable,
     sslRootCert = "",
+    channelBinding = cbPrefer,
     applicationName = "",
     connectTimeout = ZeroDuration,
     keepAlive = true,
@@ -2079,7 +2681,9 @@ proc initConnConfig*(
     keepAliveCount = 0,
     hosts: seq[HostEntry] = @[],
     targetSessionAttrs = tsaAny,
+    requireAuth: set[AuthMethod] = {},
     extraParams: seq[(string, string)] = @[],
+    maxMessageSize = 0,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
@@ -2091,6 +2695,7 @@ proc initConnConfig*(
     database: database,
     sslMode: sslMode,
     sslRootCert: sslRootCert,
+    channelBinding: channelBinding,
     applicationName: applicationName,
     connectTimeout: connectTimeout,
     keepAlive: keepAlive,
@@ -2099,7 +2704,9 @@ proc initConnConfig*(
     keepAliveCount: keepAliveCount,
     hosts: hosts,
     targetSessionAttrs: targetSessionAttrs,
+    requireAuth: requireAuth,
     extraParams: extraParams,
+    maxMessageSize: maxMessageSize,
   )
 
 proc parseDsn*(dsn: string): ConnConfig =

@@ -1,8 +1,6 @@
 import std/[options, macros, strutils]
 
-import async_backend, pg_protocol, pg_connection, pg_types, pg_pool
-
-import pg_client {.all.}
+import async_backend, pg_protocol, pg_connection, pg_types, pg_pool, pg_client
 
 type
   ReplicaFallback* = enum
@@ -15,7 +13,7 @@ type
     ## - `read*` methods route to the replica pool (read-only queries).
     ## - `write*` methods route to the primary pool (writes, `SELECT FOR UPDATE`, etc.).
     ##
-    ## For transactions, use `cluster.primaryPool.withTransaction` directly.
+    ## For transactions, use `cluster.withTransaction`.
     primary: PgPool
     replica: PgPool
     fallback: ReplicaFallback
@@ -114,7 +112,7 @@ template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
       body
     finally:
       await connPool.resetSession(conn)
-      connPool.release(conn)
+      conn.release()
 
 template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
@@ -124,7 +122,7 @@ template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
       body
     finally:
       await cluster.primary.resetSession(conn)
-      cluster.primary.release(conn)
+      conn.release()
 
 # Macro to generate cluster forwarding procs from compact declarations.
 # Each entry is a bodiless `proc` whose name starts with "read" or "write".
@@ -187,7 +185,7 @@ macro clusterForwards(mode: static[string], body: untyped): untyped =
           ident"await",
           newCall(newDotExpr(ident"pool", ident"resetSession"), ident"conn"),
         ),
-        newCall(newDotExpr(ident"pool", ident"release"), ident"conn"),
+        newCall(newDotExpr(ident"conn", ident"release")),
       )
     else:
       let primary = newDotExpr(ident"cluster", ident"primary")
@@ -202,7 +200,7 @@ macro clusterForwards(mode: static[string], body: untyped): untyped =
           ident"await",
           newCall(newDotExpr(primary.copyNimTree(), ident"resetSession"), ident"conn"),
         ),
-        newCall(newDotExpr(primary.copyNimTree(), ident"release"), ident"conn"),
+        newCall(newDotExpr(ident"conn", ident"release")),
       )
 
     let tryFinally =
@@ -231,13 +229,21 @@ clusterForwards("read"):
     timeout: Duration = ZeroDuration,
   ): Future[QueryResult]
 
-  proc readQueryOne*(
+  proc readQueryRowOpt*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
   ): Future[Option[Row]]
+
+  proc readQueryRow*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): Future[Row]
 
   proc readQueryValue*(
     cluster: PgPoolCluster,
@@ -286,6 +292,14 @@ clusterForwards("read"):
     timeout: Duration = ZeroDuration,
   ): Future[T]
 
+  proc readQueryValueOrDefault*[T](
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+  ): Future[T]
+
   proc readQueryExists*(
     cluster: PgPoolCluster,
     sql: string,
@@ -311,6 +325,10 @@ clusterForwards("read"):
 
   proc readSimpleQuery*(cluster: PgPoolCluster, sql: string): Future[seq[QueryResult]]
 
+  proc readSimpleExec*(
+    cluster: PgPoolCluster, sql: string, timeout: Duration = ZeroDuration
+  ): Future[CommandResult]
+
 # Write operations → primary
 
 clusterForwards("write"):
@@ -329,13 +347,21 @@ clusterForwards("write"):
     timeout: Duration = ZeroDuration,
   ): Future[QueryResult]
 
-  proc writeQueryOne*(
+  proc writeQueryRowOpt*(
     cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
   ): Future[Option[Row]]
+
+  proc writeQueryRow*(
+    cluster: PgPoolCluster,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+  ): Future[Row]
 
   proc writeQueryValue*(
     cluster: PgPoolCluster,
@@ -378,6 +404,14 @@ clusterForwards("write"):
   proc writeQueryValueOrDefault*[T](
     cluster: PgPoolCluster,
     _: typedesc[T],
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+  ): Future[T]
+
+  proc writeQueryValueOrDefault*[T](
+    cluster: PgPoolCluster,
     sql: string,
     params: seq[PgParam] = @[],
     default: T,
@@ -434,6 +468,78 @@ clusterForwards("write"):
     payload: string = "",
     timeout: Duration = ZeroDuration,
   ): Future[void]
+
+macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
+  ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool.
+  ## On exception, ROLLBACK is issued automatically.
+  ## Using `return` inside the body is a compile-time error.
+  ##
+  ## Usage:
+  ##   cluster.withTransaction(conn):
+  ##     conn.exec(...)
+  ##   cluster.withTransaction(conn, seconds(5)):
+  ##     conn.exec(...)
+  ##   cluster.withTransaction(conn, TransactionOptions(isolation: ilSerializable)):
+  ##     conn.exec(...)
+  ##   cluster.withTransaction(conn, opts, seconds(5)):
+  ##     conn.exec(...)
+  ##
+  ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
+  ## directly — not `cluster.writeExec(...)` / `cluster.writeQuery(...)`.
+  ## Cluster methods acquire a separate connection, so those statements would
+  ## run outside this transaction.
+  var connIdent, body: NimNode
+  var beginSql: NimNode
+  var txTimeout: NimNode
+  case args.len
+  of 2:
+    connIdent = args[0]
+    body = args[1]
+    beginSql = newStrLitNode("BEGIN")
+    txTimeout = bindSym"ZeroDuration"
+  of 3:
+    connIdent = args[0]
+    body = args[2]
+    (beginSql, txTimeout) = buildTxBeginAndTimeout(args[1])
+  of 4:
+    connIdent = args[0]
+    let opts = args[1]
+    txTimeout = args[2]
+    body = args[3]
+    beginSql = newCall(bindSym"buildBeginSql", opts)
+  else:
+    error(
+      "withTransaction expects (conn, body), (conn, timeout, body), (conn, opts, body), or (conn, opts, timeout, body)",
+      args[0],
+    )
+
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withTransaction is not allowed: COMMIT/ROLLBACK would be skipped",
+      body,
+    )
+
+  let clusterExpr = cluster
+  let clusterSym = genSym(nskLet, "cluster")
+  let eSym = genSym(nskLet, "e")
+  let resetSessionSym = bindSym"resetSession"
+  result = quote:
+    let `clusterSym` = `clusterExpr`
+    let `connIdent` = await `clusterSym`.primary.acquire()
+    try:
+      discard await `connIdent`.simpleExec(`beginSql`, timeout = `txTimeout`)
+      try:
+        `body`
+        discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
+      except CatchableError as `eSym`:
+        try:
+          discard await `connIdent`.simpleExec("ROLLBACK", timeout = `txTimeout`)
+        except CatchableError:
+          discard
+        raise `eSym`
+    finally:
+      await `resetSessionSym`(`clusterSym`.primary, `connIdent`)
+      `connIdent`.release()
 
 template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
   ## Create a pipeline on the primary pool.

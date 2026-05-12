@@ -8,18 +8,21 @@ import ../async_postgres/pg_protocol
 import ../async_postgres/pg_connection
 import ../async_postgres/pg_pool {.all.}
 
+import ./mock_pg_server
+
 privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
 privateAccess(Waiter)
 
-proc mockConn(state: PgConnState = csReady): PgConnection =
+proc mockConn(state: PgConnState = csReady, pool: PgPool = nil): PgConnection =
   result = PgConnection(
     recvBuf: @[],
     state: state,
     txStatus: tsIdle,
     serverParams: initTable[string, string](),
     createdAt: Moment.now(),
+    ownerPool: pool,
   )
 
 proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
@@ -40,6 +43,14 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
 
 proc toPooled(conn: PgConnection): PooledConn =
   PooledConn(conn: conn, lastUsedAt: Moment.now())
+
+proc release(pool: PgPool, conn: PgConnection) =
+  ## Test-only shim that wires `ownerPool` on throw-away mock connections
+  ## and delegates to the public `conn.release()` API. Production callers
+  ## should use `conn.release()` directly; pool-acquired connections already
+  ## have `ownerPool` set.
+  conn.ownerPool = pool
+  conn.release()
 
 suite "initConnConfig":
   test "defaults":
@@ -169,6 +180,64 @@ suite "initPoolConfig":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432), minSize = 0)
     check cfg.minSize == 0
 
+  test "backoff defaults":
+    let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
+    check cfg.connectBackoffInitial == seconds(1)
+    check cfg.connectBackoffMax == seconds(60)
+
+  test "backoff custom overrides":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432),
+      connectBackoffInitial = milliseconds(100),
+      connectBackoffMax = seconds(10),
+    )
+    check cfg.connectBackoffInitial == milliseconds(100)
+    check cfg.connectBackoffMax == seconds(10)
+
+  test "backoff disabled with ZeroDuration initial":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432),
+      connectBackoffInitial = ZeroDuration,
+      connectBackoffMax = ZeroDuration,
+    )
+    check cfg.connectBackoffInitial == ZeroDuration
+
+  test "validation: connectBackoffMax < connectBackoffInitial":
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432),
+        connectBackoffInitial = seconds(10),
+        connectBackoffMax = seconds(1),
+      )
+
+suite "computeConnectBackoff":
+  test "zero failures returns ZeroDuration":
+    check computeConnectBackoff(seconds(1), seconds(60), 0) == ZeroDuration
+
+  test "negative failures returns ZeroDuration":
+    check computeConnectBackoff(seconds(1), seconds(60), -1) == ZeroDuration
+
+  test "disabled when initial is ZeroDuration":
+    check computeConnectBackoff(ZeroDuration, seconds(60), 5) == ZeroDuration
+
+  test "first failure returns initial":
+    check computeConnectBackoff(seconds(1), seconds(60), 1) == seconds(1)
+
+  test "doubles on each failure up to max":
+    check computeConnectBackoff(seconds(1), seconds(60), 2) == seconds(2)
+    check computeConnectBackoff(seconds(1), seconds(60), 3) == seconds(4)
+    check computeConnectBackoff(seconds(1), seconds(60), 4) == seconds(8)
+    check computeConnectBackoff(seconds(1), seconds(60), 5) == seconds(16)
+    check computeConnectBackoff(seconds(1), seconds(60), 6) == seconds(32)
+
+  test "caps at maxDelay":
+    # 2^6 = 64 > 60, so 7th failure caps
+    check computeConnectBackoff(seconds(1), seconds(60), 7) == seconds(60)
+    check computeConnectBackoff(seconds(1), seconds(60), 50) == seconds(60)
+
+  test "initial already exceeds max returns max":
+    check computeConnectBackoff(seconds(120), seconds(60), 1) == seconds(60)
+
 suite "Pool release":
   test "release to idle queue":
     let pool = makePool()
@@ -270,8 +339,32 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
+  test "release discards connection holding session advisory locks":
+    let pool = makePool()
+    pool.active = 1
+    let conn = mockConn()
+    conn.heldSessionLocks = 1
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 0
+
+  test "release returns connection to idle when no locks held":
+    let pool = makePool()
+    pool.active = 1
+    let conn = mockConn()
+    check conn.heldSessionLocks == 0
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 1
+
+  test "release on standalone connection raises PgError":
+    let conn = mockConn()
+    check conn.ownerPool == nil
+    expect PgError:
+      conn.release()
+
 suite "Pool resetSession":
-  test "resetSession is no-op when resetQuery is empty":
+  test "resetSession is no-op when resetQuery is empty and no locks held":
     let pool = makePool()
     let conn = mockConn()
     conn.stmtCacheCapacity = 256
@@ -279,6 +372,7 @@ suite "Pool resetSession":
     waitFor pool.resetSession(conn)
     check conn.state == csReady
     check conn.stmtCache.len == 1 # not cleared
+    check conn.heldSessionLocks == 0
 
   test "resetSession skips broken connection":
     let pool = makePool()
@@ -409,6 +503,37 @@ suite "Pool close":
     waitFor pool.close(timeout = milliseconds(100))
     check pool.closed
     check pool.active == 1
+
+  test "release of broken conn tracks pending close":
+    let pool = makePool()
+    pool.active = 1
+    let conn = mockConn(csClosed)
+    pool.release(conn)
+    check pool.pendingCloses.len == 1
+
+  test "close awaits pending closeNoWait tasks":
+    let pool = makePool()
+    pool.active = 2
+    pool.release(mockConn(csClosed))
+    pool.release(mockConn(csClosed))
+
+    waitFor pool.close()
+    check pool.closed
+    check pool.pendingCloses.len == 0
+
+  test "closeNoWait prunes finished futures once threshold is reached":
+    let pool = makePool()
+    # Inject pre-finished dummies up to the prune threshold so the next
+    # closeNoWait deterministically triggers the sweep regardless of timing.
+    for _ in 0 ..< closePruneThreshold:
+      let f = newFuture[void]("dummy")
+      f.complete()
+      pool.pendingCloses.add(f)
+    pool.active = 1
+    pool.release(mockConn(csClosed))
+    # All finished dummies were swept, leaving only the newly spawned close.
+    check pool.pendingCloses.len == 1
+    waitFor pool.close()
 
 suite "Pool active count tracking":
   test "release then acquire roundtrip":
@@ -916,6 +1041,167 @@ suite "Acquire timeout":
     waitFor t()
 
 when hasChronos:
+  suite "Cancel/timeout interactions":
+    test "shorter-timeout waiter fails while longer-timeout waiter keeps waiting":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.active = 1
+
+        pool.config.acquireTimeout = milliseconds(40)
+        let fut1 = pool.acquire()
+
+        pool.config.acquireTimeout = seconds(5)
+        let fut2 = pool.acquire()
+
+        doAssert pool.waiters.len == 2
+        doAssert pool.waiterCount == 2
+
+        await sleepAsync(milliseconds(90))
+        doAssert fut1.failed
+        doAssert not fut2.finished
+        doAssert pool.waiterCount == 1
+        doAssert pool.metrics.timeoutCount == 1
+
+        let conn = mockConn()
+        pool.release(conn)
+        doAssert (await fut2) == conn
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 0
+
+      waitFor t()
+
+    test "middle waiter timing out does not stall FIFO delivery":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.active = 1
+
+        pool.config.acquireTimeout = seconds(5)
+        let futA = pool.acquire()
+
+        pool.config.acquireTimeout = milliseconds(40)
+        let futB = pool.acquire()
+
+        pool.config.acquireTimeout = seconds(5)
+        let futC = pool.acquire()
+
+        doAssert pool.waiterCount == 3
+
+        await sleepAsync(milliseconds(90))
+        doAssert not futA.finished
+        doAssert futB.failed
+        doAssert not futC.finished
+        doAssert pool.waiterCount == 2
+
+        let c1 = mockConn()
+        pool.release(c1)
+        doAssert (await futA) == c1
+
+        let c2 = mockConn()
+        pool.release(c2)
+        doAssert (await futC) == c2
+
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 0
+
+      waitFor t()
+
+    test "concurrent timeouts increment timeoutCount per waiter":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(40)
+        pool.active = 1
+
+        var futs: seq[Future[PgConnection]]
+        for i in 0 ..< 8:
+          futs.add(pool.acquire())
+        doAssert pool.waiterCount == 8
+
+        await sleepAsync(milliseconds(90))
+        for f in futs:
+          doAssert f.failed
+
+        doAssert pool.metrics.timeoutCount == 8
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 8 # cancelled entries still in deque
+
+      waitFor t()
+
+    test "pool close after mass timeout drains cancelled waiters":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(40)
+        pool.active = 1
+
+        var futs: seq[Future[PgConnection]]
+        for i in 0 ..< 4:
+          futs.add(pool.acquire())
+
+        await sleepAsync(milliseconds(90))
+        for f in futs:
+          doAssert f.failed
+
+        doAssert pool.waiters.len == 4
+        doAssert pool.waiterCount == 0
+
+        await pool.close()
+        doAssert pool.closed
+        doAssert pool.waiters.len == 0
+        doAssert pool.waiterCount == 0
+
+      waitFor t()
+
+    test "timeout then release reuses pool and delivers conn to idle":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(40)
+        pool.active = 1
+
+        try:
+          discard await pool.acquire()
+          doAssert false, "expected timeout"
+        except PgError:
+          discard
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 1 # cancelled waiter still present
+
+        # Releasing drains the cancelled waiter and parks the conn in idle.
+        pool.release(mockConn())
+        doAssert pool.waiters.len == 0
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 1
+
+        # Next acquire reuses the idle conn.
+        pool.config.acquireTimeout = ZeroDuration
+        let got = await pool.acquire()
+        doAssert got != nil
+        doAssert pool.active == 1
+        doAssert pool.idle.len == 0
+
+      waitFor t()
+
+    test "cancelling maintenance task does not disturb pending waiters":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1, minSize = 0)
+        pool.config.maintenanceInterval = milliseconds(10)
+        pool.config.idleTimeout = hours(1)
+        pool.active = 1
+        pool.maintenanceTask = maintenanceLoop(pool)
+
+        pool.config.acquireTimeout = seconds(5)
+        let fut = pool.acquire()
+        doAssert pool.waiterCount == 1
+
+        await cancelAndWait(pool.maintenanceTask)
+        doAssert pool.waiterCount == 1
+        doAssert not fut.finished
+
+        let c = mockConn()
+        pool.release(c)
+        doAssert (await fut) == c
+        doAssert pool.waiterCount == 0
+
+      waitFor t()
+
   suite "Maintenance loop":
     test "idle timeout removes old connections":
       proc t() {.async.} =
@@ -1005,6 +1291,106 @@ when hasChronos:
         await cancelAndWait(pool.maintenanceTask)
 
       waitFor t()
+
+suite "Pool high concurrency":
+  test "parallel acquire saturates maxSize and queues remainder":
+    let pool = makePool(maxSize = 5)
+    for i in 0 ..< 5:
+      pool.idle.addLast(mockConn().toPooled())
+
+    var futs: seq[Future[PgConnection]]
+    for i in 0 ..< 20:
+      futs.add(pool.acquire())
+
+    check pool.active == 5
+    check pool.idle.len == 0
+    check pool.waiters.len == 15
+    check pool.waiterCount == 15
+
+    # Clean up: release 15 mocks to satisfy the pending waiters
+    for i in 0 ..< 15:
+      pool.release(mockConn())
+    for f in futs:
+      discard waitFor f
+
+  test "mass release delivers to all waiters preserving active":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+
+    var futs: seq[Future[PgConnection]]
+    for i in 0 ..< 50:
+      futs.add(pool.acquire())
+    check pool.waiters.len == 50
+    check pool.waiterCount == 50
+
+    for i in 0 ..< 50:
+      pool.release(mockConn())
+
+    check pool.waiters.len == 0
+    check pool.waiterCount == 0
+    check pool.active == 1
+    check pool.idle.len == 0
+
+    for f in futs:
+      discard waitFor f
+
+  test "interleaved acquire/release leaves pool healthy":
+    let pool = makePool(maxSize = 3)
+    for i in 0 ..< 3:
+      pool.idle.addLast(mockConn().toPooled())
+
+    for i in 0 ..< 100:
+      let c = waitFor pool.acquire()
+      pool.release(c)
+
+    check pool.active == 0
+    check pool.waiters.len == 0
+    check pool.waiterCount == 0
+    check pool.idle.len == 3
+    check pool.metrics.acquireCount == 100
+
+  test "mixed timeout and success preserves counts":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.acquireTimeout = milliseconds(50)
+      pool.active = 1
+
+      var futs: seq[Future[PgConnection]]
+      for i in 0 ..< 5:
+        futs.add(pool.acquire())
+
+      await sleepAsync(milliseconds(100))
+
+      for f in futs:
+        doAssert f.failed
+      doAssert pool.waiterCount == 0
+      doAssert pool.active == 1
+
+      # release must drain all cancelled entries and park the conn in idle
+      pool.release(mockConn())
+      doAssert pool.waiters.len == 0
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+    waitFor t()
+
+  test "waiter resolution order matches release order (FIFO)":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+
+    var futs: seq[Future[PgConnection]]
+    for i in 0 ..< 10:
+      futs.add(pool.acquire())
+
+    var conns: seq[PgConnection]
+    for i in 0 ..< 10:
+      conns.add(mockConn())
+
+    for i in 0 ..< 10:
+      pool.release(conns[i])
+
+    for i in 0 ..< 10:
+      check waitFor(futs[i]) == conns[i]
 
 suite "Error type granularity":
   test "closed pool raises PgPoolError":
@@ -1212,3 +1598,126 @@ suite "Pool metrics":
       doAssert pool.metrics.timeoutCount == 1
 
     waitFor t()
+
+suite "isConnected":
+  test "returns false for mock connection without transport":
+    let conn = mockConn()
+    check not conn.isConnected()
+
+  test "returns false for csClosed mock":
+    let conn = mockConn(csClosed)
+    check not conn.isConnected()
+
+  when hasChronos:
+    test "returns true while transport is live, false after close":
+      proc t() {.async.} =
+        let (conn, server, serverTransport) = await makeHangingConn()
+        doAssert conn.isConnected()
+        await conn.close()
+        doAssert not conn.isConnected()
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
+proc mockConfig(port: int): ConnConfig =
+  ConnConfig(
+    host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
+  )
+
+suite "Pool broken connection handling (integration)":
+  test "query failure from server close transitions conn to csClosed and release discards it":
+    # End-to-end: a live pool connection that dies mid-query should surface as
+    # csClosed, so release() retires it instead of returning it to idle.
+    var finalState: PgConnState
+    var idleAfter = -1
+    var closeCountDelta: int64 = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        try:
+          discard await drainFrontendMessage(st) # client query
+          # Server disappears mid-query without sending a response
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let pool = await newPool(cfg)
+
+      let conn = await pool.acquire()
+      try:
+        discard await conn.simpleQuery("SELECT 1")
+      except CatchableError:
+        discard
+
+      finalState = conn.state
+      let before = pool.metrics.closeCount
+      pool.release(conn)
+      closeCountDelta = pool.metrics.closeCount - before
+      idleAfter = pool.idle.len
+
+      await pool.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check finalState == csClosed
+    check closeCountDelta == 1
+    check idleAfter == 0
+
+  test "acquire skips an idle conn whose transport was torn down":
+    # An idle pool entry whose backend vanished (state surfaced as csClosed
+    # via a prior read, or an out-of-band close) must be retired on the next
+    # acquire attempt. We force-close from the client side to flip state,
+    # then check acquire() drops the entry and returns an alternative.
+    var idleAfter = -1
+    var closeCountDelta: int64 = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        try:
+          let st = await acceptAndReady(ms)
+          # Stay up long enough for the client to finish; close at the end.
+          await sleepAsync(milliseconds(200))
+          await closeClient(st)
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+
+      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let pool = await newPool(cfg)
+
+      let broken = await pool.acquire()
+      pool.release(broken)
+      doAssert pool.idle.len == 1
+
+      # Simulate the backend vanishing: csClosed on the idle entry.
+      await broken.close()
+      doAssert broken.state == csClosed
+
+      # Inject a healthy mock alongside the broken one so acquire has a
+      # non-real candidate to hand back without re-entering connect().
+      let good = mockConn()
+      pool.idle.addLast(toPooled(good))
+
+      let before = pool.metrics.closeCount
+      let acquired = await pool.acquire()
+      closeCountDelta = pool.metrics.closeCount - before
+      idleAfter = pool.idle.len
+
+      doAssert acquired == good
+
+      pool.release(acquired)
+      await pool.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check closeCountDelta == 1
+    check idleAfter == 0

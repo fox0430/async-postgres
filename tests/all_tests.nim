@@ -1,4 +1,7 @@
+{.push warning[UnusedImport]: off.}
 import
-  test_advisory_lock, test_auth, test_dsn, test_e2e, test_keepalive, test_largeobject,
-  test_pool, test_protocol, test_rowdata, test_sql, test_ssl, test_tracing, test_types,
-  test_pool_cluster
+  test_abandonment_e2e, test_advisory_lock, test_auth, test_cancel_e2e, test_dsn,
+  test_e2e, test_fill_recvbuf, test_keepalive, test_largeobject, test_network_failure,
+  test_pool, test_protocol, test_protocol_fuzz, test_replication_keepalive,
+  test_rowdata, test_sql, test_ssl, test_tracing, test_types, test_pool_cluster
+{.pop.}

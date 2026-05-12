@@ -1,13 +1,13 @@
 # Package
 
-version = "0.1.0"
+version = "0.2.0"
 author = "fox0430"
 description = "Async PostgreSQL client"
 license = "MIT"
 
 # Dependencies
 
-requires "nim >= 2.2.0"
+requires "nim >= 2.2.4"
 requires "nimcrypto >= 0.6.0"
 requires "checksums >= 0.2.0"
 

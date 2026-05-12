@@ -1,7 +1,11 @@
-import std/[json, unittest, options, strutils, tables, times, math, net, typetraits]
+import
+  std/[
+    json, unittest, options, strutils, tables, times, math, net, typetraits, importutils
+  ]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
+import ../async_postgres/pg_client {.all.}
 
 type
   UsPostalCode = distinct string
@@ -65,7 +69,7 @@ proc mkRow(cells: seq[Option[seq[byte]]], fields: seq[FieldDescription]): Row =
       rd.cellIndex[i * 2] = int32(rd.buf.len)
       rd.cellIndex[i * 2 + 1] = int32(data.len)
       rd.buf.add(data)
-  Row(data: rd, rowIdx: 0)
+  initRow(rd, 0)
 
 suite "OID constants":
   test "standard OID values":
@@ -291,6 +295,19 @@ suite "Row accessors":
     expect IndexDefect:
       discard row.getStr(-1)
 
+  test "getInt16":
+    let row = @[some(toBytes("123"))]
+    check row.getInt16(0) == 123'i16
+
+  test "getInt16 negative":
+    let row = @[some(toBytes("-456"))]
+    check row.getInt16(0) == -456'i16
+
+  test "getInt16 invalid value raises":
+    let row = @[some(toBytes("abc"))]
+    expect PgTypeError:
+      discard row.getInt16(0)
+
   test "getInt":
     let row = @[some(toBytes("42"))]
     check row.getInt(0) == 42'i32
@@ -312,6 +329,15 @@ suite "Row accessors":
     let row = @[some(toBytes("xyz"))]
     expect PgTypeError:
       discard row.getInt64(0)
+
+  test "getFloat32":
+    let row = @[some(toBytes("2.5"))]
+    check abs(row.getFloat32(0) - 2.5'f32) < 1e-6
+
+  test "getFloat32 invalid value raises":
+    let row = @[some(toBytes("notanumber"))]
+    expect PgTypeError:
+      discard row.getFloat32(0)
 
   test "getFloat":
     let row = @[some(toBytes("3.14"))]
@@ -444,6 +470,273 @@ suite "getDate accessor":
     except PgTypeError:
       raised = true
     check raised
+
+suite "PgTime":
+  test "$PgTime without microseconds":
+    let t = PgTime(hour: 14, minute: 30, second: 0, microsecond: 0)
+    check $t == "14:30:00"
+
+  test "$PgTime with microseconds":
+    let t = PgTime(hour: 9, minute: 5, second: 3, microsecond: 123456)
+    check $t == "09:05:03.123456"
+
+  test "$PgTime with leading zero microseconds":
+    let t = PgTime(hour: 0, minute: 0, second: 0, microsecond: 100)
+    check $t == "00:00:00.000100"
+
+  test "toPgParam OID and format":
+    let p = toPgParam(PgTime(hour: 10, minute: 20, second: 30))
+    check p.oid == OidTime
+    check p.format == 0
+
+  test "getTime text without microseconds":
+    let row = @[some(toBytes("14:30:00"))]
+    let t = row.getTime(0)
+    check t.hour == 14
+    check t.minute == 30
+    check t.second == 0
+    check t.microsecond == 0
+
+  test "getTime text with microseconds":
+    let row = @[some(toBytes("09:05:03.123456"))]
+    let t = row.getTime(0)
+    check t.hour == 9
+    check t.minute == 5
+    check t.second == 3
+    check t.microsecond == 123456
+
+  test "getTime text with partial microseconds":
+    let row = @[some(toBytes("10:00:00.5"))]
+    let t = row.getTime(0)
+    check t.microsecond == 500000
+
+  test "getTime invalid raises":
+    let row = @[some(toBytes("not-a-time"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime out-of-range hour raises":
+    let row = @[some(toBytes("25:00:00"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime out-of-range minute raises":
+    let row = @[some(toBytes("12:60:00"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime out-of-range second raises":
+    let row = @[some(toBytes("12:00:60"))]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime NULL raises":
+    let row = @[none(seq[byte])]
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTime binary roundtrip":
+    let t = PgTime(hour: 14, minute: 30, second: 45, microsecond: 123456)
+    let p = toPgBinaryParam(t)
+    check p.oid == OidTime
+    check p.format == 1
+    let fields = @[mkField(OidTime, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTime(0)
+    check result == t
+
+  test "getTime binary midnight":
+    let t = PgTime(hour: 0, minute: 0, second: 0, microsecond: 0)
+    let p = toPgBinaryParam(t)
+    let fields = @[mkField(OidTime, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTime(0)
+    check result == t
+
+  test "getTimeOpt NULL returns none":
+    let row = @[none(seq[byte])]
+    check row.getTimeOpt(0).isNone
+
+  test "getTimeOpt returns some":
+    let row = @[some(toBytes("10:30:00"))]
+    let opt = row.getTimeOpt(0)
+    check opt.isSome
+    check opt.get().hour == 10
+
+suite "PgTimeTz":
+  test "$PgTimeTz positive offset":
+    let t = PgTimeTz(hour: 14, minute: 30, second: 0, microsecond: 0, utcOffset: 18000)
+    check $t == "14:30:00+05:00"
+
+  test "$PgTimeTz negative offset":
+    let t = PgTimeTz(hour: 14, minute: 30, second: 0, microsecond: 0, utcOffset: -12600)
+    check $t == "14:30:00-03:30"
+
+  test "$PgTimeTz UTC":
+    let t = PgTimeTz(hour: 10, minute: 0, second: 0, microsecond: 0, utcOffset: 0)
+    check $t == "10:00:00+00:00"
+
+  test "$PgTimeTz with microseconds":
+    let t =
+      PgTimeTz(hour: 9, minute: 5, second: 3, microsecond: 123456, utcOffset: 3600)
+    check $t == "09:05:03.123456+01:00"
+
+  test "toPgParam OID":
+    let p = toPgParam(PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: 0))
+    check p.oid == OidTimeTz
+    check p.format == 0
+
+  test "getTimeTz text +HH":
+    let row = @[some(toBytes("14:30:00+05"))]
+    let t = row.getTimeTz(0)
+    check t.hour == 14
+    check t.minute == 30
+    check t.utcOffset == 18000
+
+  test "getTimeTz text -HH:MM":
+    let row = @[some(toBytes("10:00:00.123456-03:30"))]
+    let t = row.getTimeTz(0)
+    check t.hour == 10
+    check t.minute == 0
+    check t.microsecond == 123456
+    check t.utcOffset == -12600
+
+  test "getTimeTz text +HH:MM:SS":
+    let row = @[some(toBytes("12:00:00+05:30:15"))]
+    let t = row.getTimeTz(0)
+    check t.utcOffset == 19815
+
+  test "getTimeTz invalid raises":
+    let row = @[some(toBytes("not-a-time"))]
+    var raised = false
+    try:
+      discard row.getTimeTz(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTimeTz missing offset raises":
+    let row = @[some(toBytes("14:30:00"))]
+    var raised = false
+    try:
+      discard row.getTimeTz(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getTimeTz binary roundtrip":
+    let t =
+      PgTimeTz(hour: 14, minute: 30, second: 45, microsecond: 123456, utcOffset: 18000)
+    let p = toPgBinaryParam(t)
+    check p.oid == OidTimeTz
+    check p.format == 1
+    let fields = @[mkField(OidTimeTz, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTimeTz(0)
+    check result == t
+
+  test "getTimeTz binary negative offset":
+    let t = PgTimeTz(hour: 10, minute: 0, second: 0, microsecond: 0, utcOffset: -12600)
+    let p = toPgBinaryParam(t)
+    let fields = @[mkField(OidTimeTz, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTimeTz(0)
+    check result == t
+
+  test "getTimeTzOpt NULL returns none":
+    let row = @[none(seq[byte])]
+    check row.getTimeTzOpt(0).isNone
+
+suite "date parameter encoding":
+  test "toPgDateParam OID and format":
+    let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
+    let p = toPgDateParam(dt)
+    check p.oid == OidDate
+    check p.format == 0
+    check p.value.isSome
+    let s = cast[string](p.value.get())
+    check s == "2024-01-15"
+
+  test "toPgBinaryDateParam roundtrip":
+    let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
+    let p = toPgBinaryDateParam(dt)
+    check p.oid == OidDate
+    check p.format == 1
+    let fields = @[mkField(OidDate, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getDate(0)
+    check result.year == 2024
+    check result.month == mJan
+    check result.monthday == 15
+
+suite "getTimestampTz accessor":
+  test "timestamptz with tz":
+    let row = @[some(toBytes("2024-01-15 10:30:00.000000+05:00"))]
+    let dt = row.getTimestampTz(0)
+    check dt.year == 2024
+    check dt.month == mJan
+    check dt.monthday == 15
+
+  test "timestamptz without fractional seconds":
+    let row = @[some(toBytes("2024-06-20 14:05:30+00:00"))]
+    let dt = row.getTimestampTz(0)
+    check dt.year == 2024
+    # The parsed DateTime is converted to local timezone by Nim's parse(),
+    # so we compare using UTC.
+    check dt.utc().hour == 14
+
+  test "invalid timestamptz raises":
+    let row = @[some(toBytes("not-a-timestamp"))]
+    var raised = false
+    try:
+      discard row.getTimestampTz(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "timestamptz binary roundtrip":
+    let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+    let p = toPgBinaryTimestampTzParam(dt)
+    check p.oid == OidTimestampTz
+    check p.format == 1
+    let fields = @[mkField(OidTimestampTz, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getTimestampTz(0)
+    check result.year == 2024
+    check result.month == mJan
+    check result.monthday == 15
+    check result.hour == 10
+    check result.minute == 30
+
+  test "toPgTimestampTzParam OID":
+    let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+    let p = toPgTimestampTzParam(dt)
+    check p.oid == OidTimestampTz
+    check p.format == 0
+
+  test "getTimestampTzOpt NULL returns none":
+    let row = @[none(seq[byte])]
+    check row.getTimestampTzOpt(0).isNone
 
 suite "Binary encode/decode helpers":
   test "int16 roundtrip":
@@ -675,6 +968,188 @@ suite "Format-aware binary accessors":
     check result.month == mJan
     check result.monthday == 15
 
+suite "Binary clen mismatch raises PgTypeError":
+  test "getInt binary unexpected length":
+    let fields = @[mkField(OidInt4, 1)]
+    let row = mkRow(@[some(@[0'u8, 0, 0])], fields) # 3 bytes (expected 2 or 4)
+    expect PgTypeError:
+      discard row.getInt(0)
+
+  test "getInt64 binary unexpected length":
+    let fields = @[mkField(OidInt8, 1)]
+    let row = mkRow(@[some(@[0'u8, 0, 0, 0, 0, 0, 0])], fields) # 7 bytes
+    expect PgTypeError:
+      discard row.getInt64(0)
+
+  test "getFloat binary unexpected length":
+    let fields = @[mkField(OidFloat8, 1)]
+    let row = mkRow(@[some(@[0'u8, 0, 0])], fields) # 3 bytes (expected 4 or 8)
+    expect PgTypeError:
+      discard row.getFloat(0)
+
+  test "getFloat invalid text raises (no silent 0.0)":
+    let row: Row = @[some(toBytes("not-a-number"))]
+    expect PgTypeError:
+      discard row.getFloat(0)
+
+  test "getFloat32 binary unexpected length":
+    let fields = @[mkField(OidFloat4, 1)]
+    let row = mkRow(@[some(@[0'u8, 0, 0, 0, 0])], fields) # 5 bytes (expected 4)
+    expect PgTypeError:
+      discard row.getFloat32(0)
+
+  test "getBool binary unexpected length":
+    let fields = @[mkField(OidBool, 1)]
+    let row = mkRow(@[some(newSeq[byte](0))], fields) # 0 bytes
+    expect PgTypeError:
+      discard row.getBool(0)
+
+  test "getUuid binary unexpected length":
+    let fields = @[mkField(OidUuid, 1)]
+    let row = mkRow(@[some(newSeq[byte](8))], fields) # 8 bytes (expected 16)
+    expect PgTypeError:
+      discard row.getUuid(0)
+
+  test "getNumeric binary unexpected length":
+    let fields = @[mkField(OidNumeric, 1)]
+    let row = mkRow(@[some(newSeq[byte](4))], fields) # 4 bytes (expected >= 8)
+    expect PgTypeError:
+      discard row.getNumeric(0)
+
+  test "getTimestamp binary unexpected length":
+    let fields = @[mkField(OidTimestamp, 1)]
+    let row = mkRow(@[some(newSeq[byte](4))], fields) # 4 bytes (expected 8)
+    expect PgTypeError:
+      discard row.getTimestamp(0)
+
+  test "getTimestampTz binary unexpected length":
+    let fields = @[mkField(OidTimestampTz, 1)]
+    let row = mkRow(@[some(newSeq[byte](4))], fields)
+    expect PgTypeError:
+      discard row.getTimestampTz(0)
+
+  test "getDate binary unexpected length":
+    let fields = @[mkField(OidDate, 1)]
+    let row = mkRow(@[some(newSeq[byte](2))], fields) # 2 bytes (expected 4)
+    expect PgTypeError:
+      discard row.getDate(0)
+
+  test "getTime binary unexpected length":
+    let fields = @[mkField(OidTime, 1)]
+    let row = mkRow(@[some(newSeq[byte](4))], fields)
+    expect PgTypeError:
+      discard row.getTime(0)
+
+  test "getTimeTz binary unexpected length":
+    let fields = @[mkField(OidTimeTz, 1)]
+    let row = mkRow(@[some(newSeq[byte](8))], fields) # 8 bytes (expected 12)
+    expect PgTypeError:
+      discard row.getTimeTz(0)
+
+  test "getStr binary int4 size mismatch":
+    let fields = @[mkField(OidInt4, 1)]
+    let row = mkRow(@[some(@[0'u8, 0, 0])], fields) # 3 bytes
+    expect PgTypeError:
+      discard row.getStr(0)
+
+  test "getStr binary unknown OID size mismatch is tolerated":
+    # text/varchar/bytea: else branch keeps raw-bytes fallback
+    let fields = @[mkField(OidText, 1)]
+    let row = mkRow(@[some(toBytes("hello"))], fields)
+    check row.getStr(0) == "hello"
+
+  test "getIntArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 4)
+    let bin = encodeBinaryArray(OidInt4, elements)
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getIntArray(0)
+
+  test "getInt16Array binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 2)
+    let bin = encodeBinaryArray(OidInt2, elements)
+    let fields = @[mkField(OidInt2Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getInt16Array(0)
+
+  test "getInt64Array binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0]] # 4 bytes (expected 8)
+    let bin = encodeBinaryArray(OidInt8, elements)
+    let fields = @[mkField(OidInt8Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getInt64Array(0)
+
+  test "getFloatArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 4 or 8)
+    let bin = encodeBinaryArray(OidFloat8, elements)
+    let fields = @[mkField(OidFloat8Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getFloatArray(0)
+
+  test "getFloat32Array binary element length mismatch":
+    let elements = @[@[0'u8, 0]] # 2 bytes (expected 4)
+    let bin = encodeBinaryArray(OidFloat4, elements)
+    let fields = @[mkField(OidFloat4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getFloat32Array(0)
+
+  test "getBoolArray binary element length mismatch":
+    let elements = @[@[1'u8, 1]] # 2 bytes (expected 1)
+    let bin = encodeBinaryArray(OidBool, elements)
+    let fields = @[mkField(OidBoolArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getBoolArray(0)
+
+  test "getMoneyArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0]] # 4 bytes (expected 8)
+    let bin = encodeBinaryArray(OidMoney, elements)
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getMoneyArray(0)
+
+  test "getPath binary npts exceeds clen":
+    # closed(1) + npts(4) = 5-byte header; claim 100 points (1600 bytes) but pass 5 bytes
+    var bin = newSeq[byte](5)
+    bin[0] = 0
+    bin[1] = 0
+    bin[2] = 0
+    bin[3] = 0
+    bin[4] = 100 # npts = 100
+    let fields = @[mkField(OidPath, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getPath(0)
+
+  test "getPath binary header truncated":
+    let fields = @[mkField(OidPath, 1)]
+    let row = mkRow(@[some(@[0'u8, 0])], fields) # 2 bytes (need >= 5)
+    expect PgTypeError:
+      discard row.getPath(0)
+
+  test "getPolygon binary npts exceeds clen":
+    var bin = newSeq[byte](4)
+    bin[0] = 0
+    bin[1] = 0
+    bin[2] = 0
+    bin[3] = 50 # npts = 50, expects 800 bytes of data
+    let fields = @[mkField(OidPolygon, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getPolygon(0)
+
+  test "getPolygon binary header truncated":
+    let fields = @[mkField(OidPolygon, 1)]
+    let row = mkRow(@[some(@[0'u8, 0])], fields) # 2 bytes (need >= 4)
+    expect PgTypeError:
+      discard row.getPolygon(0)
+
 suite "Row type alias":
   test "Row is seq[Option[seq[byte]]]":
     let row: Row = @[some(toBytes("hello")), none(seq[byte])]
@@ -700,6 +1175,27 @@ suite "parseAffectedRows":
   test "non-numeric tag":
     check parseAffectedRows("CREATE TABLE") == 0
 
+  test "COPY tag":
+    check parseAffectedRows("COPY 100") == 100
+
+  test "MERGE tag":
+    check parseAffectedRows("MERGE 7") == 7
+
+  test "MOVE tag":
+    check parseAffectedRows("MOVE 12") == 12
+
+  test "FETCH tag":
+    check parseAffectedRows("FETCH 4") == 4
+
+  test "trailing whitespace falls back to 0":
+    check parseAffectedRows("UPDATE 3 ") == 0
+
+  test "overflow falls back to 0":
+    check parseAffectedRows("UPDATE 99999999999999999999999999") == 0
+
+  test "single-token DDL tag":
+    check parseAffectedRows("BEGIN") == 0
+
 suite "Option accessors":
   test "getStrOpt some":
     let row: Row = @[some(toBytes("hello"))]
@@ -708,6 +1204,14 @@ suite "Option accessors":
   test "getStrOpt none":
     let row: Row = @[none(seq[byte])]
     check row.getStrOpt(0) == none(string)
+
+  test "getInt16Opt some":
+    let row: Row = @[some(toBytes("123"))]
+    check row.getInt16Opt(0) == some(123'i16)
+
+  test "getInt16Opt none":
+    let row: Row = @[none(seq[byte])]
+    check row.getInt16Opt(0) == none(int16)
 
   test "getIntOpt some":
     let row: Row = @[some(toBytes("42"))]
@@ -724,6 +1228,16 @@ suite "Option accessors":
   test "getInt64Opt none":
     let row: Row = @[none(seq[byte])]
     check row.getInt64Opt(0) == none(int64)
+
+  test "getFloat32Opt some":
+    let row: Row = @[some(toBytes("2.5"))]
+    let v = row.getFloat32Opt(0)
+    check v.isSome
+    check abs(v.get - 2.5'f32) < 1e-6
+
+  test "getFloat32Opt none":
+    let row: Row = @[none(seq[byte])]
+    check row.getFloat32Opt(0) == none(float32)
 
   test "getFloatOpt some":
     let row: Row = @[some(toBytes("3.14"))]
@@ -1231,21 +1745,12 @@ suite "Binary array encode/decode roundtrip":
     let decoded = decodeBinaryArray(encoded)
     check decoded.elemOid == OidInt4
     check decoded.elements.len == 3
-    check fromBE32(
-      encoded[
-        decoded.elements[0].off ..< decoded.elements[0].off + decoded.elements[0].len
-      ]
-    ) == 1'i32
-    check fromBE32(
-      encoded[
-        decoded.elements[1].off ..< decoded.elements[1].off + decoded.elements[1].len
-      ]
-    ) == 2'i32
-    check fromBE32(
-      encoded[
-        decoded.elements[2].off ..< decoded.elements[2].off + decoded.elements[2].len
-      ]
-    ) == 3'i32
+    let off0 = 0 + decoded.elements[0].off
+    let off1 = 0 + decoded.elements[1].off
+    let off2 = 0 + decoded.elements[2].off
+    check fromBE32(encoded[off0 ..< off0 + decoded.elements[0].len]) == 1'i32
+    check fromBE32(encoded[off1 ..< off1 + decoded.elements[1].len]) == 2'i32
+    check fromBE32(encoded[off2 ..< off2 + decoded.elements[2].len]) == 3'i32
 
   test "encodeBinaryArrayEmpty roundtrip":
     let encoded = encodeBinaryArrayEmpty(OidInt4)
@@ -1343,12 +1848,12 @@ suite "Binary array encode/decode roundtrip":
     check decoded.elemOid == OidInt4
     check decoded.elements.len == 3
     let data = p.value.get
-    check fromBE32(data[decoded.elements[0].off ..< decoded.elements[0].off + 4]) ==
-      100'i32
-    check fromBE32(data[decoded.elements[1].off ..< decoded.elements[1].off + 4]) ==
-      200'i32
-    check fromBE32(data[decoded.elements[2].off ..< decoded.elements[2].off + 4]) ==
-      300'i32
+    let o0 = 0 + decoded.elements[0].off
+    let o1 = 0 + decoded.elements[1].off
+    let o2 = 0 + decoded.elements[2].off
+    check fromBE32(data[o0 ..< o0 + 4]) == 100'i32
+    check fromBE32(data[o1 ..< o1 + 4]) == 200'i32
+    check fromBE32(data[o2 ..< o2 + 4]) == 300'i32
 
 suite "PgNumeric":
   test "toPgParam PgNumeric":
@@ -1737,6 +2242,280 @@ suite "PgNumeric":
     check p.oid == OidNumeric
     check p.value.isNone
 
+suite "PgMoney":
+  test "OID constants":
+    check OidMoney == 790'i32
+    check OidMoneyArray == 791'i32
+
+  test "initPgMoney defaults and fields":
+    let m = initPgMoney(123456'i64)
+    check m.amount == 123456'i64
+    check m.scale == 2
+    let m0 = initPgMoney(1234'i64, scale = 0)
+    check m0.amount == 1234'i64
+    check m0.scale == 0
+
+  test "initPgMoney rejects invalid scale":
+    expect(PgTypeError):
+      discard initPgMoney(1'i64, scale = -1)
+    expect(PgTypeError):
+      discard initPgMoney(1'i64, scale = 19)
+
+  test "$ without currency symbol (scale=2)":
+    check $initPgMoney(0) == "0.00"
+    check $initPgMoney(7) == "0.07"
+    check $initPgMoney(100) == "1.00"
+    check $initPgMoney(123456) == "1234.56"
+    check $initPgMoney(-1) == "-0.01"
+    check $initPgMoney(-123456) == "-1234.56"
+
+  test "$ with alternate scales":
+    check $initPgMoney(1234, scale = 0) == "1234"
+    check $initPgMoney(-1234, scale = 0) == "-1234"
+    check $initPgMoney(1234567, scale = 3) == "1234.567"
+    check $initPgMoney(5, scale = 3) == "0.005"
+    check $initPgMoney(12345, scale = 4) == "1.2345"
+
+  test "$ handles int64.low":
+    # Must not overflow when negating the magnitude.
+    let s2 = $initPgMoney(int64.low, scale = 2)
+    check s2 == "-92233720368547758.08"
+    let s0 = $initPgMoney(int64.low, scale = 0)
+    check s0 == "-9223372036854775808"
+
+  test "parsePgMoney roundtrip (C locale style)":
+    for s in ["0.00", "0.07", "1.00", "1234.56", "-0.01", "-1234.56"]:
+      check $parsePgMoney(s) == s
+
+  test "parsePgMoney accepts optional $ and +":
+    check parsePgMoney("1234.56") == initPgMoney(123456)
+    check parsePgMoney("$1234.56") == initPgMoney(123456)
+    check parsePgMoney("+$1.00") == initPgMoney(100)
+
+  test "parsePgMoney accepts sign after currency symbol":
+    check parsePgMoney("$-1.00") == initPgMoney(-100)
+    check parsePgMoney("$-1,234.56") == initPgMoney(-123456)
+    check parsePgMoney("$+1.00") == initPgMoney(100)
+    check parsePgMoney("¥-1,234", scale = 0) == initPgMoney(-1234, scale = 0)
+
+  test "parsePgMoney with en_US thousand separator":
+    check parsePgMoney("$1,234.56") == initPgMoney(123456)
+    check parsePgMoney("$1,234,567.89") == initPgMoney(123456789)
+    check parsePgMoney("-$1,234.56") == initPgMoney(-123456)
+
+  test "parsePgMoney with EU format (comma decimal)":
+    check parsePgMoney("1.234,56") == initPgMoney(123456)
+    check parsePgMoney("1.234,56 €") == initPgMoney(123456)
+    check parsePgMoney("-1.234,56 €") == initPgMoney(-123456)
+
+  test "parsePgMoney strips non-ASCII currency symbols":
+    check parsePgMoney("¥12.34") == initPgMoney(1234)
+    check parsePgMoney("£1,234.56") == initPgMoney(123456)
+
+  test "parsePgMoney strips surrounding whitespace":
+    check parsePgMoney("  $100.00  ") == initPgMoney(10000)
+
+  test "parsePgMoney handles parenthesized negatives":
+    check parsePgMoney("($1.00)") == initPgMoney(-100)
+    check parsePgMoney("($1,234.56)") == initPgMoney(-123456)
+    check parsePgMoney("(1.234,56 €)") == initPgMoney(-123456)
+
+  test "parsePgMoney scale=0 (e.g. JPY)":
+    check parsePgMoney("1234", scale = 0) == initPgMoney(1234, scale = 0)
+    check parsePgMoney("¥1,234", scale = 0) == initPgMoney(1234, scale = 0)
+    check parsePgMoney("-¥1,234,567", scale = 0) == initPgMoney(-1234567, scale = 0)
+
+  test "parsePgMoney scale=3":
+    check parsePgMoney("1.234,567", scale = 3) == initPgMoney(1234567, scale = 3)
+    check parsePgMoney("0.005", scale = 3) == initPgMoney(5, scale = 3)
+
+  test "parsePgMoney int64.low roundtrip":
+    let lo = initPgMoney(int64.low, scale = 2)
+    check parsePgMoney($lo, scale = 2) == lo
+    let lo0 = initPgMoney(int64.low, scale = 0)
+    check parsePgMoney($lo0, scale = 0) == lo0
+
+  test "parsePgMoney rejects invalid input":
+    expect(PgTypeError):
+      discard parsePgMoney("")
+    expect(PgTypeError):
+      discard parsePgMoney("abc")
+    # scale=2 requires exactly 2 fractional digits after last . or ,
+    expect(PgTypeError):
+      discard parsePgMoney("$1.5")
+    expect(PgTypeError):
+      discard parsePgMoney("$1.234")
+    expect(PgTypeError):
+      discard parsePgMoney("$.56")
+    # No decimal separator for scale=2
+    expect(PgTypeError):
+      discard parsePgMoney("$1234")
+    # Parenthesized with extra minus
+    expect(PgTypeError):
+      discard parsePgMoney("(-$1.00)")
+
+  test "parsePgMoney rejects overflow":
+    expect(PgTypeError):
+      discard parsePgMoney("99999999999999999999.99")
+
+  test "equality, ordering, and hash":
+    check initPgMoney(100) == initPgMoney(100)
+    check initPgMoney(100) != initPgMoney(100, scale = 0)
+    check initPgMoney(1) < initPgMoney(2)
+    check initPgMoney(2) > initPgMoney(1)
+    check initPgMoney(1) <= initPgMoney(1)
+    check hash(initPgMoney(42)) == hash(initPgMoney(42))
+    check hash(initPgMoney(42, scale = 0)) != hash(initPgMoney(42, scale = 2))
+
+  test "ordering rejects mismatched scale":
+    expect(PgTypeError):
+      discard initPgMoney(100, scale = 0) < initPgMoney(100, scale = 2)
+    expect(PgTypeError):
+      discard initPgMoney(100, scale = 0) <= initPgMoney(100, scale = 2)
+
+  test "formatPgMoney default = $":
+    check formatPgMoney(initPgMoney(123456)) == "1234.56"
+    check formatPgMoney(initPgMoney(-123456)) == "-1234.56"
+
+  test "formatPgMoney en_US style":
+    check formatPgMoney(initPgMoney(123456), symbol = "$", thousandsSep = ',') ==
+      "$1,234.56"
+    check formatPgMoney(initPgMoney(123456789), symbol = "$", thousandsSep = ',') ==
+      "$1,234,567.89"
+    check formatPgMoney(initPgMoney(-123456), symbol = "$", thousandsSep = ',') ==
+      "-$1,234.56"
+    check formatPgMoney(initPgMoney(1), symbol = "$", thousandsSep = ',') == "$0.01"
+
+  test "formatPgMoney EU style":
+    check formatPgMoney(
+      initPgMoney(123456),
+      symbol = " €",
+      decimalSep = ',',
+      thousandsSep = '.',
+      symbolBefore = false,
+    ) == "1.234,56 €"
+
+  test "formatPgMoney scale=0":
+    check formatPgMoney(
+      initPgMoney(1234567, scale = 0), symbol = "¥", thousandsSep = ','
+    ) == "¥1,234,567"
+
+  test "formatPgMoney accounting parens for negatives":
+    check formatPgMoney(
+      initPgMoney(-123456), symbol = "$", thousandsSep = ',', accountingParens = true
+    ) == "($1,234.56)"
+    # Positive values unaffected
+    check formatPgMoney(
+      initPgMoney(123456), symbol = "$", thousandsSep = ',', accountingParens = true
+    ) == "$1,234.56"
+    # EU style, symbol after
+    check formatPgMoney(
+      initPgMoney(-123456),
+      symbol = " €",
+      decimalSep = ',',
+      thousandsSep = '.',
+      symbolBefore = false,
+      accountingParens = true,
+    ) == "(1.234,56 €)"
+    # Roundtrip through parsePgMoney
+    let v = initPgMoney(-123456)
+    let s = formatPgMoney(v, symbol = "$", thousandsSep = ',', accountingParens = true)
+    check parsePgMoney(s) == v
+
+  test "toPgParam PgMoney":
+    let p = toPgParam(initPgMoney(123456))
+    check p.oid == OidMoney
+    check p.format == 1
+    check p.value.get == @(toBE64(123456'i64))
+
+  test "toPgBinaryParam PgMoney":
+    let p = toPgBinaryParam(initPgMoney(-500))
+    check p.oid == OidMoney
+    check p.format == 1
+    check p.value.get == @(toBE64(-500'i64))
+
+  test "getMoney binary default scale":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(987654'i64)))], fields)
+    check row.getMoney(0) == initPgMoney(987654)
+
+  test "getMoney binary with scale=0":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(987654'i64)))], fields)
+    check row.getMoney(0, scale = 0) == initPgMoney(987654, scale = 0)
+
+  test "getMoney text":
+    let row: Row = @[some(toBytes("$1,234.56"))]
+    check row.getMoney(0) == initPgMoney(123456)
+
+  test "getMoney text with scale=0":
+    let row: Row = @[some(toBytes("¥1,234"))]
+    check row.getMoney(0, scale = 0) == initPgMoney(1234, scale = 0)
+
+  test "getMoney NULL raises":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    expect(PgTypeError):
+      discard row.getMoney(0)
+
+  test "getMoneyOpt some/none":
+    let fields = @[mkField(OidMoney, 1)]
+    let rowSome = mkRow(@[some(@(toBE64(42'i64)))], fields)
+    check rowSome.getMoneyOpt(0) == some(initPgMoney(42))
+    let rowNone = mkRow(@[none(seq[byte])], fields)
+    check rowNone.getMoneyOpt(0) == none(PgMoney)
+
+  test "toPgParam seq[PgMoney] empty":
+    let p = toPgParam(newSeq[PgMoney]())
+    check p.oid == OidMoneyArray
+    check p.format == 1
+    check p.value.isSome
+
+  test "toPgParam seq[PgMoney] roundtrip (binary)":
+    let values = @[initPgMoney(100), initPgMoney(-50), initPgMoney(999999)]
+    let p = toPgParam(values)
+    check p.oid == OidMoneyArray
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getMoneyArray(0) == values
+
+  test "getMoneyArray binary with scale=0":
+    let values = @[initPgMoney(100, scale = 0), initPgMoney(-50, scale = 0)]
+    let p = toPgParam(@[initPgMoney(100), initPgMoney(-50)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getMoneyArray(0, scale = 0) == values
+
+  test "getMoneyArray text format with locale-formatted elements":
+    let row: Row = @[some(toBytes("{\"$1,234.56\",\"$2.00\"}"))]
+    check row.getMoneyArray(0) == @[initPgMoney(123456), initPgMoney(200)]
+
+  test "getMoneyArrayOpt some/none":
+    let values = @[initPgMoney(1), initPgMoney(2)]
+    let p = toPgParam(values)
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let rowSome = mkRow(@[p.value], fields)
+    check rowSome.getMoneyArrayOpt(0) == some(values)
+    let rowNone = mkRow(@[none(seq[byte])], fields)
+    check rowNone.getMoneyArrayOpt(0) == none(seq[PgMoney])
+
+  test "getMoney rejects invalid scale":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(1'i64)))], fields)
+    expect(PgTypeError):
+      discard row.getMoney(0, scale = -1)
+    expect(PgTypeError):
+      discard row.getMoney(0, scale = 19)
+
+  test "getMoneyArray rejects invalid scale":
+    let p = toPgParam(@[initPgMoney(1)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    expect(PgTypeError):
+      discard row.getMoneyArray(0, scale = -1)
+    expect(PgTypeError):
+      discard row.getMoneyArray(0, scale = 19)
+
 suite "PgInterval":
   test "$ zero interval":
     let v = PgInterval(months: 0, days: 0, microseconds: 0)
@@ -1857,11 +2636,11 @@ suite "PgInterval":
   test "getInterval binary format":
     var data = newSeq[byte](16)
     let usBytes = toBE64(14706123456'i64)
-    copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+    copyMem(addr data[0], addr usBytes[0], 8)
     let dayBytes = toBE32(3'i32)
-    copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+    copyMem(addr data[8], addr dayBytes[0], 4)
     let monBytes = toBE32(14'i32)
-    copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+    copyMem(addr data[12], addr monBytes[0], 4)
     let fields = @[mkField(OidInterval, 1)]
     let row = mkRow(@[some(data)], fields)
     let v = row.getInterval(0)
@@ -1895,11 +2674,11 @@ suite "PgInterval":
   test "getIntervalOpt binary some":
     var data = newSeq[byte](16)
     let usBytes = toBE64(1_000_000'i64)
-    copyMem(addr data[0], unsafeAddr usBytes[0], 8)
+    copyMem(addr data[0], addr usBytes[0], 8)
     let dayBytes = toBE32(0'i32)
-    copyMem(addr data[8], unsafeAddr dayBytes[0], 4)
+    copyMem(addr data[8], addr dayBytes[0], 4)
     let monBytes = toBE32(0'i32)
-    copyMem(addr data[12], unsafeAddr monBytes[0], 4)
+    copyMem(addr data[12], addr monBytes[0], 4)
     let fields = @[mkField(OidInterval, 1)]
     let row = mkRow(@[some(data)], fields)
     let v = row.getIntervalOpt(0)
@@ -2696,7 +3475,8 @@ suite "Composite binary encoder/decoder":
     check decoded.len == 2
     check decoded[0].oid == OidInt4
     check decoded[0].len == 4
-    check fromBE32(data[decoded[0].off .. decoded[0].off + 3]) == 99'i32
+    let f0 = 0 + decoded[0].off
+    check fromBE32(data[f0 .. f0 + 3]) == 99'i32
     check decoded[1].oid == OidText
     check decoded[1].len == 3
 
@@ -4430,6 +5210,73 @@ suite "hstore":
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getHstoreOpt(0).isNone
 
+  test "toPgParam seq[PgHstore] text roundtrip":
+    var h1: PgHstore = initTable[string, Option[string]]()
+    h1["a"] = some("1")
+    var h2: PgHstore = initTable[string, Option[string]]()
+    h2["b"] = none(string)
+    let p = toPgParam(@[h1, h2])
+    check p.oid == OidTextArray
+    check p.format == 0
+    let fields = @[mkField(OidTextArray, 0'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getHstoreArray(0)
+    check arr.len == 2
+    check arr[0] == h1
+    check arr[1] == h2
+
+  test "toPgParam seq[PgHstore] empty":
+    let p = toPgParam(newSeq[PgHstore]())
+    check p.oid == OidTextArray
+    check p.format == 0
+    check toString(p.value.get) == "{}"
+
+  test "toPgBinaryParam seq[PgHstore] roundtrip":
+    var h1: PgHstore = initTable[string, Option[string]]()
+    h1["x"] = some("y")
+    var h2: PgHstore = initTable[string, Option[string]]()
+    h2["nul"] = none(string)
+    let p = toPgBinaryParam(@[h1, h2], 16385'i32, 16386'i32)
+    check p.oid == 16386'i32
+    check p.format == 1
+    let fields = @[mkField(16386'i32, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getHstoreArray(0)
+    check arr.len == 2
+    check arr[0] == h1
+    check arr[1] == h2
+
+  test "toPgBinaryParam seq[PgHstore] empty":
+    let p = toPgBinaryParam(newSeq[PgHstore](), 16385'i32, 16386'i32)
+    check p.oid == 16386'i32
+    check p.format == 1
+    let fields = @[mkField(16386'i32, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    check row.getHstoreArray(0).len == 0
+
+  test "getHstoreArray text format":
+    let row: Row = @[some(toBytes("{\"\\\"a\\\"=>\\\"1\\\"\",\"\\\"b\\\"=>NULL\"}"))]
+    let arr = row.getHstoreArray(0)
+    check arr.len == 2
+    check arr[0]["a"] == some("1")
+    check arr[1]["b"] == none(string)
+
+  test "getHstoreArrayOpt some":
+    var h1: PgHstore = initTable[string, Option[string]]()
+    h1["k"] = some("v")
+    let p = toPgParam(@[h1])
+    let fields = @[mkField(OidTextArray, 0'i16)]
+    let row = mkRow(@[p.value], fields)
+    let r = row.getHstoreArrayOpt(0)
+    check r.isSome
+    check r.get.len == 1
+    check r.get[0] == h1
+
+  test "getHstoreArrayOpt none":
+    let fields = @[mkField(OidTextArray, 0'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getHstoreArrayOpt(0).isNone
+
 suite "PgBit":
   test "OID constants":
     check OidBit == 1560'i32
@@ -4583,3 +5430,1285 @@ suite "PgBit":
     let fields = @[mkField(OidVarbitArray, 0'i16)]
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getBitArrayOpt(0).isNone
+
+suite "Binary decoder validation":
+  test "decodeNumericBinary rejects negative ndigits":
+    # ndigits = -1 (0xFFFF as int16)
+    var data: seq[byte] = @[
+      0xFF'u8,
+      0xFF, # ndigits = -1
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeNumericBinary rejects truncated digit data":
+    # ndigits = 2 but only 1 digit of data provided
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x02, # ndigits = 2
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+      0x00,
+      0x01, # only 1 digit (need 2)
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeBinaryArray rejects negative dimension length":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # ndim = 1
+      0x00,
+      0x00,
+      0x00,
+      0x00, # has_null
+      0x00,
+      0x00,
+      0x00,
+      0x17, # elemOid
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFF, # dimLen = -1
+      0x00,
+      0x00,
+      0x00,
+      0x01, # lower_bound
+    ]
+    expect PgTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray rejects invalid element length":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # ndim = 1
+      0x00,
+      0x00,
+      0x00,
+      0x00, # has_null
+      0x00,
+      0x00,
+      0x00,
+      0x17, # elemOid
+      0x00,
+      0x00,
+      0x00,
+      0x01, # dimLen = 1
+      0x00,
+      0x00,
+      0x00,
+      0x01, # lower_bound
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFE, # eLen = -2 (invalid)
+    ]
+    expect PgTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray rejects truncated element data":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # ndim = 1
+      0x00,
+      0x00,
+      0x00,
+      0x00, # has_null
+      0x00,
+      0x00,
+      0x00,
+      0x17, # elemOid
+      0x00,
+      0x00,
+      0x00,
+      0x01, # dimLen = 1
+      0x00,
+      0x00,
+      0x00,
+      0x01, # lower_bound
+      0x00,
+      0x00,
+      0x00,
+      0x08, # eLen = 8 but no data follows
+    ]
+    expect PgTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeRangeBinaryRaw rejects negative bound length":
+    var data: seq[byte] = @[
+      0x02'u8, # flags: hasLower
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFF, # bLen = -1
+    ]
+    expect PgTypeError:
+      discard decodeRangeBinaryRaw(data)
+
+  test "decodeRangeBinaryRaw rejects truncated bound data":
+    var data: seq[byte] = @[
+      0x02'u8, # flags: hasLower
+      0x00,
+      0x00,
+      0x00,
+      0x10, # bLen = 16 but no data
+    ]
+    expect PgTypeError:
+      discard decodeRangeBinaryRaw(data)
+
+  test "decodeMultirangeBinaryRaw rejects negative count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # count = -1
+    ]
+    expect PgTypeError:
+      discard decodeMultirangeBinaryRaw(data)
+
+  test "decodeMultirangeBinaryRaw rejects truncated range data":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # count = 1
+      0x00,
+      0x00,
+      0x00,
+      0x20, # rLen = 32 but no data
+    ]
+    expect PgTypeError:
+      discard decodeMultirangeBinaryRaw(data)
+
+  test "decodeBinaryComposite rejects negative field count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # numFields = -1
+    ]
+    expect PgTypeError:
+      discard decodeBinaryComposite(data)
+
+  test "decodeBinaryComposite rejects invalid field length":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # numFields = 1
+      0x00,
+      0x00,
+      0x00,
+      0x17, # oid
+      0xFF,
+      0xFF,
+      0xFF,
+      0xFE, # flen = -2 (invalid)
+    ]
+    expect PgTypeError:
+      discard decodeBinaryComposite(data)
+
+  test "decodeBinaryComposite rejects truncated field data":
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x00,
+      0x00,
+      0x01, # numFields = 1
+      0x00,
+      0x00,
+      0x00,
+      0x17, # oid
+      0x00,
+      0x00,
+      0x00,
+      0x10, # flen = 16 but no data
+    ]
+    expect PgTypeError:
+      discard decodeBinaryComposite(data)
+
+  test "decodeBinaryTsVector rejects negative lexeme count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # nlexemes = -1
+    ]
+    expect PgTypeError:
+      discard decodeBinaryTsVector(data)
+
+  test "decodeBinaryTsQuery rejects negative token count":
+    var data: seq[byte] = @[
+      0xFF'u8, 0xFF, 0xFF, 0xFF # ntokens = -1
+    ]
+    expect PgTypeError:
+      discard decodeBinaryTsQuery(data)
+
+suite "Temporal array types":
+  test "toPgTimestampArrayParam roundtrip":
+    let dt1 = dateTime(2023, mJan, 15, 10, 30, 0, zone = utc())
+    let dt2 = dateTime(2024, mJun, 20, 14, 45, 30, zone = utc())
+    let p = toPgTimestampArrayParam(@[dt1, dt2])
+    check p.oid == OidTimestampArray
+    check p.format == 1'i16
+    let fields = @[mkField(OidTimestampArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimestampArray(0)
+    check arr.len == 2
+    check arr[0].year == 2023
+    check arr[1].year == 2024
+
+  test "toPgTimestampArrayParam empty":
+    let p = toPgTimestampArrayParam(newSeq[DateTime]())
+    check p.oid == OidTimestampArray
+    let fields = @[mkField(OidTimestampArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    check row.getTimestampArray(0).len == 0
+
+  test "getTimestampArray text format":
+    let row: Row = @[some(toBytes("{\"2023-01-15 10:30:00\",\"2024-06-20 14:45:30\"}"))]
+    let arr = row.getTimestampArray(0)
+    check arr.len == 2
+    check arr[0].year == 2023
+    check arr[1].month == mJun
+
+  test "getTimestampArrayOpt none":
+    let fields = @[mkField(OidTimestampArray, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getTimestampArrayOpt(0).isNone
+
+  test "toPgTimestampTzArrayParam roundtrip":
+    let dt1 = dateTime(2023, mJan, 15, 10, 30, 0, zone = utc())
+    let p = toPgTimestampTzArrayParam(@[dt1])
+    check p.oid == OidTimestampTzArray
+    let fields = @[mkField(OidTimestampTzArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimestampTzArray(0)
+    check arr.len == 1
+    check arr[0].year == 2023
+
+  test "toPgDateArrayParam roundtrip":
+    let dt1 = dateTime(2023, mMar, 10, zone = utc())
+    let dt2 = dateTime(2024, mDec, 25, zone = utc())
+    let p = toPgDateArrayParam(@[dt1, dt2])
+    check p.oid == OidDateArray
+    let fields = @[mkField(OidDateArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getDateArray(0)
+    check arr.len == 2
+    check arr[0].monthday == 10
+    check arr[1].month == mDec
+
+  test "getDateArray text format":
+    let row: Row = @[some(toBytes("{2023-03-10,2024-12-25}"))]
+    let arr = row.getDateArray(0)
+    check arr.len == 2
+    check arr[0].year == 2023
+
+  test "toPgParam seq[PgTime] roundtrip":
+    let t1 = PgTime(hour: 10, minute: 30, second: 0, microsecond: 0)
+    let t2 = PgTime(hour: 23, minute: 59, second: 59, microsecond: 123456)
+    let p = toPgParam(@[t1, t2])
+    check p.oid == OidTimeArray
+    let fields = @[mkField(OidTimeArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimeArray(0)
+    check arr.len == 2
+    check arr[0] == t1
+    check arr[1] == t2
+
+  test "getTimeArray text format":
+    let row: Row = @[some(toBytes("{10:30:00,23:59:59.123456}"))]
+    let arr = row.getTimeArray(0)
+    check arr.len == 2
+    check arr[0].hour == 10
+    check arr[1].microsecond == 123456
+
+  test "toPgParam seq[PgTimeTz] roundtrip":
+    let t1 = PgTimeTz(hour: 10, minute: 30, second: 0, microsecond: 0, utcOffset: 3600)
+    let t2 =
+      PgTimeTz(hour: 23, minute: 59, second: 59, microsecond: 0, utcOffset: -18000)
+    let p = toPgParam(@[t1, t2])
+    check p.oid == OidTimeTzArray
+    let fields = @[mkField(OidTimeTzArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTimeTzArray(0)
+    check arr.len == 2
+    check arr[0] == t1
+    check arr[1] == t2
+
+  test "getTimeTzArray text format":
+    let row: Row = @[some(toBytes("{10:30:00+01,23:59:59-05}"))]
+    let arr = row.getTimeTzArray(0)
+    check arr.len == 2
+    check arr[0].utcOffset == 3600
+    check arr[1].utcOffset == -18000
+
+  test "toPgParam seq[PgInterval] roundtrip":
+    let iv1 = PgInterval(months: 2, days: 3, microseconds: 3600000000)
+    let iv2 = PgInterval(months: 0, days: 0, microseconds: 1000000)
+    let p = toPgParam(@[iv1, iv2])
+    check p.oid == OidIntervalArray
+    let fields = @[mkField(OidIntervalArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getIntervalArray(0)
+    check arr.len == 2
+    check arr[0] == iv1
+    check arr[1] == iv2
+
+suite "Identifier / network array types":
+  test "toPgParam seq[PgUuid] roundtrip":
+    let u1 = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+    let u2 = PgUuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+    let p = toPgParam(@[u1, u2])
+    check p.oid == OidUuidArray
+    let fields = @[mkField(OidUuidArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getUuidArray(0)
+    check arr.len == 2
+    check arr[0] == u1
+    check arr[1] == u2
+
+  test "getUuidArray text format":
+    let row: Row = @[
+      some(
+        toBytes(
+          "{550e8400-e29b-41d4-a716-446655440000,6ba7b810-9dad-11d1-80b4-00c04fd430c8}"
+        )
+      )
+    ]
+    let arr = row.getUuidArray(0)
+    check arr.len == 2
+    check arr[0] == PgUuid("550e8400-e29b-41d4-a716-446655440000")
+
+  test "getUuidArrayOpt none":
+    let fields = @[mkField(OidUuidArray, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getUuidArrayOpt(0).isNone
+
+  test "toPgParam seq[PgInet] roundtrip":
+    let i1 = PgInet(address: parseIpAddress("192.168.1.1"), mask: 32)
+    let i2 = PgInet(address: parseIpAddress("10.0.0.0"), mask: 8)
+    let p = toPgParam(@[i1, i2])
+    check p.oid == OidInetArray
+    let fields = @[mkField(OidInetArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getInetArray(0)
+    check arr.len == 2
+    check $arr[0].address == "192.168.1.1"
+    check arr[1].mask == 8
+
+  test "toPgParam seq[PgMacAddr] roundtrip":
+    let m1 = PgMacAddr("08:00:2b:01:02:03")
+    let m2 = PgMacAddr("aa:bb:cc:dd:ee:ff")
+    let p = toPgParam(@[m1, m2])
+    check p.oid == OidMacAddrArray
+    let fields = @[mkField(OidMacAddrArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getMacAddrArray(0)
+    check arr.len == 2
+    check arr[0] == m1
+    check arr[1] == m2
+
+  test "getMacAddrArray text format":
+    let row: Row = @[some(toBytes("{08:00:2b:01:02:03,aa:bb:cc:dd:ee:ff}"))]
+    let arr = row.getMacAddrArray(0)
+    check arr.len == 2
+    check arr[0] == PgMacAddr("08:00:2b:01:02:03")
+
+  test "toPgParam seq[PgMacAddr8] roundtrip":
+    let m1 = PgMacAddr8("08:00:2b:01:02:03:04:05")
+    let p = toPgParam(@[m1])
+    check p.oid == OidMacAddr8Array
+    let fields = @[mkField(OidMacAddr8Array, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getMacAddr8Array(0)
+    check arr.len == 1
+    check arr[0] == m1
+
+suite "Numeric / binary / JSON array types":
+  test "toPgParam seq[PgNumeric] roundtrip":
+    let n1 = parsePgNumeric("123.45")
+    let n2 = parsePgNumeric("0.001")
+    let p = toPgParam(@[n1, n2])
+    check p.oid == OidNumericArray
+    let fields = @[mkField(OidNumericArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getNumericArray(0)
+    check arr.len == 2
+    check $arr[0] == "123.45"
+    check $arr[1] == "0.001"
+
+  test "getNumericArray text format":
+    let row: Row = @[some(toBytes("{123.45,0.001}"))]
+    let arr = row.getNumericArray(0)
+    check arr.len == 2
+    check $arr[0] == "123.45"
+
+  test "toPgByteaArrayParam roundtrip":
+    let b1 = @[1'u8, 2, 3]
+    let b2 = @[0xFF'u8, 0x00]
+    let p = toPgByteaArrayParam(@[b1, b2])
+    check p.oid == OidByteaArray
+    let fields = @[mkField(OidByteaArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getBytesArray(0)
+    check arr.len == 2
+    check arr[0] == b1
+    check arr[1] == b2
+
+  test "toPgByteaArrayParam empty":
+    let p = toPgByteaArrayParam(newSeq[seq[byte]]())
+    check p.oid == OidByteaArray
+    let fields = @[mkField(OidByteaArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    check row.getBytesArray(0).len == 0
+
+  test "toPgParam seq[JsonNode] roundtrip":
+    let j1 = %*{"key": "value"}
+    let j2 = %*[1, 2, 3]
+    let p = toPgParam(@[j1, j2])
+    check p.oid == OidJsonbArray
+    let fields = @[mkField(OidJsonbArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getJsonArray(0)
+    check arr.len == 2
+    check arr[0]["key"].getStr == "value"
+    check arr[1].len == 3
+
+  test "getJsonArray text format":
+    let row: Row = @[some(toBytes("""{"{\"a\":1}","{\"b\":2}"}"""))]
+    let arr = row.getJsonArray(0)
+    check arr.len == 2
+    check arr[0]["a"].getInt == 1
+
+suite "Geometric array types":
+  test "toPgParam seq[PgPoint] roundtrip":
+    let p1 = PgPoint(x: 1.0, y: 2.0)
+    let p2 = PgPoint(x: 3.0, y: 4.0)
+    let p = toPgParam(@[p1, p2])
+    check p.oid == OidPointArray
+    let fields = @[mkField(OidPointArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getPointArray(0)
+    check arr.len == 2
+    check arr[0] == p1
+    check arr[1] == p2
+
+  test "getPointArray text format":
+    let row: Row = @[some(toBytes("{\"(1,2)\",\"(3,4)\"}"))]
+    let arr = row.getPointArray(0)
+    check arr.len == 2
+    check arr[0].x == 1.0
+
+  test "toPgParam seq[PgCircle] roundtrip":
+    let c1 = PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0)
+    let p = toPgParam(@[c1])
+    check p.oid == OidCircleArray
+    let fields = @[mkField(OidCircleArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getCircleArray(0)
+    check arr.len == 1
+    check arr[0].center.x == 1.0
+    check arr[0].radius == 5.0
+
+  test "toPgParam seq[PgLseg] roundtrip":
+    let l1 = PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 1.0, y: 1.0))
+    let p = toPgParam(@[l1])
+    check p.oid == OidLsegArray
+    let fields = @[mkField(OidLsegArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getLsegArray(0)
+    check arr.len == 1
+    check arr[0].p1.x == 0.0
+    check arr[0].p2.y == 1.0
+
+  test "toPgParam seq[PgBox] roundtrip":
+    let b1 = PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+    let p = toPgParam(@[b1])
+    check p.oid == OidBoxArray
+    let fields = @[mkField(OidBoxArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getBoxArray(0)
+    check arr.len == 1
+    check arr[0].high.x == 3.0
+    check arr[0].low.y == 2.0
+
+  test "toPgParam seq[PgLine] roundtrip":
+    let l1 = PgLine(a: 1.0, b: 2.0, c: 3.0)
+    let p = toPgParam(@[l1])
+    check p.oid == OidLineArray
+    let fields = @[mkField(OidLineArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getLineArray(0)
+    check arr.len == 1
+    check arr[0].a == 1.0
+    check arr[0].b == 2.0
+
+suite "Other array types":
+  test "toPgParam seq[PgXml] roundtrip":
+    let x1 = PgXml("<root/>")
+    let x2 = PgXml("<data>hello</data>")
+    let p = toPgParam(@[x1, x2])
+    check p.oid == OidXmlArray
+    let fields = @[mkField(OidXmlArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getXmlArray(0)
+    check arr.len == 2
+    check string(arr[0]) == "<root/>"
+    check string(arr[1]) == "<data>hello</data>"
+
+  test "getXmlArray text format":
+    let row: Row = @[some(toBytes("{\"<root/>\",\"<data>hello</data>\"}"))]
+    let arr = row.getXmlArray(0)
+    check arr.len == 2
+    check string(arr[0]) == "<root/>"
+
+  test "toPgParam seq[PgTsVector] roundtrip":
+    let tv1 = PgTsVector("'hello':1 'world':2")
+    let p = toPgParam(@[tv1])
+    check p.oid == OidTsVectorArray
+    let fields = @[mkField(OidTsVectorArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTsVectorArray(0)
+    check arr.len == 1
+
+  test "toPgParam seq[PgTsQuery] roundtrip":
+    let tq1 = PgTsQuery("hello & world")
+    let p = toPgParam(@[tq1])
+    check p.oid == OidTsQueryArray
+    let fields = @[mkField(OidTsQueryArray, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let arr = row.getTsQueryArray(0)
+    check arr.len == 1
+
+suite "Multirange array types":
+  test "toPgParam seq[PgMultirange[int32]] text roundtrip":
+    let mr1 = toMultirange(rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32))
+    let mr2 = toMultirange(rangeOf(100'i32, 200'i32))
+    let p = toPgParam(@[mr1, mr2])
+    check p.oid == OidInt4MultirangeArray
+    check p.format == 0'i16
+    # Text format roundtrip
+    let row: Row = @[p.value]
+    let arr = row.getInt4MultirangeArray(0)
+    check arr.len == 2
+    check seq[PgRange[int32]](arr[0]).len == 2
+    check seq[PgRange[int32]](arr[1]).len == 1
+
+  test "toPgParam seq[PgMultirange[int32]] empty":
+    let p = toPgParam(newSeq[PgMultirange[int32]]())
+    check p.oid == OidInt4MultirangeArray
+    let row: Row = @[p.value]
+    check row.getInt4MultirangeArray(0).len == 0
+
+  test "getInt4MultirangeArrayOpt none":
+    let fields = @[mkField(OidInt4MultirangeArray, 1'i16)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getInt4MultirangeArrayOpt(0).isNone
+
+  test "toPgParam seq[PgMultirange[int64]] text roundtrip":
+    let mr1 = toMultirange(rangeOf(100'i64, 200'i64))
+    let p = toPgParam(@[mr1])
+    check p.oid == OidInt8MultirangeArray
+    let row: Row = @[p.value]
+    let arr = row.getInt8MultirangeArray(0)
+    check arr.len == 1
+
+  test "toPgParam seq[PgMultirange[PgNumeric]] text roundtrip":
+    let mr1 = toMultirange(rangeOf(parsePgNumeric("1.5"), parsePgNumeric("3.5")))
+    let p = toPgParam(@[mr1])
+    check p.oid == OidNumMultirangeArray
+    let row: Row = @[p.value]
+    let arr = row.getNumMultirangeArray(0)
+    check arr.len == 1
+
+proc inlinePayload(p: PgParamInline): seq[byte] =
+  ## Reconstruct the binary payload a PgParamInline would emit on the wire,
+  ## picking between `inlineBuf` and `overflow` based on `len`.
+  if p.len == -1:
+    return @[]
+  if p.len == 0:
+    return @[]
+  if p.len <= PgInlineBufSize:
+    result = newSeq[byte](p.len)
+    copyMem(addr result[0], addr p.inlineBuf[0], p.len)
+  else:
+    result = p.overflow
+
+suite "toPgParamInline":
+  test "int16 encodes as binary BE and fits inline":
+    let p = toPgParamInline(42'i16)
+    check p.oid == OidInt2
+    check p.format == 1
+    check p.len == 2
+    check inlinePayload(p) == @(toBE16(42'i16))
+
+  test "int16 negative":
+    let p = toPgParamInline(-1'i16)
+    check inlinePayload(p) == @(toBE16(-1'i16))
+
+  test "int32 wire-format matches toPgParam":
+    let old = toPgParam(123456'i32)
+    let new = toPgParamInline(123456'i32)
+    check new.oid == old.oid
+    check new.format == old.format
+    check inlinePayload(new) == old.value.get
+
+  test "int32 boundaries":
+    for v in [0'i32, 1, -1, int32.high, int32.low]:
+      let p = toPgParamInline(v)
+      check p.len == 4
+      check inlinePayload(p) == @(toBE32(v))
+
+  test "int64 fits inline at 8 bytes":
+    let p = toPgParamInline(9_999_999_999'i64)
+    check p.oid == OidInt8
+    check p.len == 8
+    check inlinePayload(p) == @(toBE64(9_999_999_999'i64))
+
+  test "int widens to int64":
+    let p = toPgParamInline(42.int)
+    check p.oid == OidInt8
+    check p.len == 8
+    check inlinePayload(p) == @(toBE64(42'i64))
+
+  test "float32 wire-format":
+    let p = toPgParamInline(3.14'f32)
+    check p.oid == OidFloat4
+    check p.len == 4
+    # Match toPgParam exactly (same cast-to-int32 + BE encoding).
+    let old = toPgParam(3.14'f32)
+    check inlinePayload(p) == old.value.get
+
+  test "float64 wire-format":
+    let p = toPgParamInline(3.14)
+    check p.oid == OidFloat8
+    check p.len == 8
+    let bits = fromBE64(inlinePayload(p))
+    check abs(cast[float64](bits) - 3.14) < 1e-10
+
+  test "bool true / false":
+    let pt = toPgParamInline(true)
+    check pt.oid == OidBool
+    check pt.len == 1
+    check pt.inlineBuf[0] == 1'u8
+    let pf = toPgParamInline(false)
+    check pf.inlineBuf[0] == 0'u8
+
+  test "string short fits inline":
+    let p = toPgParamInline("hello")
+    check p.oid == OidText
+    check p.format == 0
+    check p.len == 5
+    check p.overflow.len == 0
+    check inlinePayload(p) == @(toBytes("hello"))
+
+  test "string empty":
+    let p = toPgParamInline("")
+    check p.len == 0
+    check inlinePayload(p).len == 0
+
+  test "string at inline boundary (16 bytes)":
+    let s = "0123456789ABCDEF" # exactly 16 chars
+    let p = toPgParamInline(s)
+    check p.len == 16
+    check p.overflow.len == 0
+    check inlinePayload(p) == @(toBytes(s))
+
+  test "string above boundary uses overflow":
+    let s = "0123456789ABCDEFG" # 17 chars
+    let p = toPgParamInline(s)
+    check p.len == 17
+    check p.overflow.len == 17
+    check inlinePayload(p) == @(toBytes(s))
+
+  test "seq[byte] short fits inline":
+    let b = @[byte 1, 2, 3, 4]
+    let p = toPgParamInline(b)
+    check p.oid == OidBytea
+    check p.len == 4
+    check p.overflow.len == 0
+    check inlinePayload(p) == b
+
+  test "seq[byte] above boundary uses overflow":
+    var b = newSeq[byte](32)
+    for i in 0 ..< 32:
+      b[i] = byte(i)
+    let p = toPgParamInline(b)
+    check p.len == 32
+    check p.overflow.len == 32
+    check inlinePayload(p) == b
+
+  test "PgUuid matches toPgParam (OidUuid, text, overflow)":
+    # UUID string is 36 chars, exceeds PgInlineBufSize.
+    let u = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+    let p = toPgParamInline(u)
+    let old = toPgParam(u)
+    check p.oid == OidUuid
+    check p.oid == old.oid
+    check p.format == old.format
+    check p.len == 36
+    check p.overflow.len == 36
+    check inlinePayload(p) == old.value.get
+    check inlinePayload(p) == @(toBytes(string(u)))
+
+  test "PgMoney encodes int64 amount only":
+    let m = PgMoney(amount: 12345'i64, scale: 2'i8)
+    let p = toPgParamInline(m)
+    check p.oid == OidMoney
+    check p.len == 8
+    check inlinePayload(p) == @(toBE64(12345'i64))
+
+  test "Option[int32] some delegates to int32":
+    let p = toPgParamInline(some(42'i32))
+    check p.oid == OidInt4
+    check p.len == 4
+    check inlinePayload(p) == @(toBE32(42'i32))
+
+  test "Option[int32] none marks NULL":
+    let p = toPgParamInline(none(int32))
+    check p.oid == OidInt4
+    check p.format == 1
+    check p.len == -1
+
+  test "Option[string] none marks NULL with text oid":
+    let p = toPgParamInline(none(string))
+    check p.oid == OidText
+    check p.format == 0
+    check p.len == -1
+
+suite "addBindRaw wire-format parity":
+  test "single int32 param matches addBind":
+    let old = toPgParam(42'i32)
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("p", "s", [int16(1)], [old.value], [])
+    var rawBuf: seq[byte] = @[]
+    let data = old.value.get
+    let ranges = @[(off: int32(0), len: int32(data.len))]
+    rawBuf.addBindRaw("p", "s", [int16(1)], data, ranges, [])
+    check legacyBuf == rawBuf
+
+  test "three params matches addBind":
+    let a = toPgParam(1'i32)
+    let b = toPgParam(2'i32)
+    let c = toPgParam(3'i32)
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("", "stmt", [int16(1), 1, 1], [a.value, b.value, c.value], [])
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    for v in [a.value.get, b.value.get, c.value.get]:
+      ranges.add (off: int32(data.len), len: int32(v.len))
+      data.add v
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw("", "stmt", [int16(1), 1, 1], data, ranges, [])
+    check legacyBuf == rawBuf
+
+  test "NULL param matches addBind":
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("", "s", [int16(1)], [none(seq[byte])], [])
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw("", "s", [int16(1)], @[], @[(off: int32(0), len: int32(-1))], [])
+    check legacyBuf == rawBuf
+
+  test "mixed NULL and non-NULL matches addBind":
+    let a = toPgParam(7'i32)
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("", "s", [int16(1), 1], [a.value, none(seq[byte])], [])
+    var data: seq[byte] = a.value.get
+    var ranges =
+      @[(off: int32(0), len: int32(data.len)), (off: int32(0), len: int32(-1))]
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw("", "s", [int16(1), 1], data, ranges, [])
+    check legacyBuf == rawBuf
+
+  test "result formats are preserved":
+    var legacyBuf: seq[byte] = @[]
+    legacyBuf.addBind("p", "", [int16(0)], [none(seq[byte])], [int16(1), 0, 1])
+    var rawBuf: seq[byte] = @[]
+    rawBuf.addBindRaw(
+      "p", "", [int16(0)], @[], @[(off: int32(0), len: int32(-1))], [int16(1), 0, 1]
+    )
+    check legacyBuf == rawBuf
+
+suite "addBindRaw range validation":
+  test "range len below -1 raises ValueError":
+    var buf: seq[byte] = @[]
+    expect ValueError:
+      buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(0), len: int32(-2))], [])
+
+  test "negative off with non-zero len raises ValueError":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    expect ValueError:
+      buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(-1), len: int32(4))], [])
+
+  test "off + len past paramData.len raises ValueError":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    expect ValueError:
+      # off + len == 5, data.len == 4 — reads past end
+      buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(1), len: int32(4))], [])
+
+  test "range exactly at end of paramData is valid":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    # off + len == 4, data.len == 4 — boundary is inclusive on the data side
+    buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(0), len: int32(4))], [])
+    check buf.len > 0
+
+  test "len == 0 with off at end of data is valid (empty string case)":
+    var buf: seq[byte] = @[]
+    let data = @[byte 1, 2, 3, 4]
+    # Mirrors flattenInline's encoding for empty strings: off = data.len, len = 0
+    buf.addBindRaw("", "", [int16(0)], data, @[(off: int32(4), len: int32(0))], [])
+    check buf.len > 0
+
+  test "NULL range with arbitrary off is valid (off ignored when len == -1)":
+    var buf: seq[byte] = @[]
+    buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(999), len: int32(-1))], [])
+    check buf.len > 0
+
+suite "parseAffectedRowsRaw":
+  test "UPDATE / DELETE returns trailing count":
+    check parseAffectedRows("UPDATE 3") == 3
+    check parseAffectedRows("DELETE 5") == 5
+    check parseAffectedRows("SELECT 100") == 100
+
+  test "INSERT 0 N returns N":
+    check parseAffectedRows("INSERT 0 1") == 1
+    check parseAffectedRows("INSERT 0 42") == 42
+
+  test "trailing whitespace yields 0 (matches legacy split semantics)":
+    check parseAffectedRows("UPDATE 3 ") == 0
+    check parseAffectedRows("UPDATE 7   ") == 0
+
+  test "empty / non-numeric returns 0":
+    check parseAffectedRows("") == 0
+    check parseAffectedRows("CREATE TABLE") == 0
+    check parseAffectedRows("COMMIT") == 0
+    check parseAffectedRows("   ") == 0
+
+  test "single-token numeric tag":
+    # Tag that is just a number — not a real PostgreSQL tag but robust for safety.
+    check parseAffectedRows("123") == 123
+
+  test "large values":
+    check parseAffectedRows("INSERT 0 9999999999") == 9_999_999_999'i64
+
+  test "raw overload on char openArray":
+    let s = "UPDATE 42"
+    check parseAffectedRowsRaw(s.toOpenArray(0, s.high)) == 42
+
+suite "flattenInline SoA layout":
+  test "empty input produces empty SoA":
+    let params: seq[PgParamInline] = @[]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 0
+    check ranges.len == 0
+    check oids.len == 0
+    check formats.len == 0
+
+  test "single short int32 param":
+    let params = @[toPgParamInline(42'i32)]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data == @(toBE32(42'i32))
+    check ranges.len == 1
+    check ranges[0].off == 0
+    check ranges[0].len == 4
+    check oids == @[OidInt4]
+    check formats == @[1'i16]
+
+  test "single NULL param (off=0, len=-1, no bytes written)":
+    let params = @[none(int32).toPgParamInline]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 0
+    check ranges.len == 1
+    check ranges[0].len == -1
+    check oids == @[OidInt4]
+    check formats == @[1'i16]
+
+  test "single empty string (len=0, off points to current data.len)":
+    let params = @[toPgParamInline("")]
+    let (data, ranges, _, _) = flattenInline(params)
+    check data.len == 0
+    check ranges.len == 1
+    check ranges[0].len == 0
+    check ranges[0].off == 0
+
+  test "boundary string (16 bytes fits in inlineBuf path)":
+    let params = @[toPgParamInline("0123456789ABCDEF")]
+    let (data, ranges, _, _) = flattenInline(params)
+    check data.len == 16
+    check data == @(toBytes("0123456789ABCDEF"))
+    check ranges.len == 1
+    check ranges[0].off == 0
+    check ranges[0].len == 16
+
+  test "overflow string (17 bytes uses overflow path)":
+    let long = "0123456789ABCDEFG" # 17 chars
+    let params = @[toPgParamInline(long)]
+    let (data, ranges, _, _) = flattenInline(params)
+    check data.len == 17
+    check data == @(toBytes(long))
+    check ranges.len == 1
+    check ranges[0].off == 0
+    check ranges[0].len == 17
+
+  test "mixed [short, NULL, overflow, empty, short] — offsets are consecutive":
+    let long = "abcdefghijklmnopqrst" # 20 chars → overflow
+    let params = @[
+      toPgParamInline(1'i32), # 4 bytes
+      none(int32).toPgParamInline, # NULL
+      toPgParamInline(long), # 20 bytes
+      toPgParamInline(""), # 0 bytes
+      toPgParamInline(7'i32), # 4 bytes
+    ]
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 4 + 20 + 4 # NULL and empty contribute nothing
+    check ranges.len == 5
+    # int32(1)
+    check ranges[0].off == 0
+    check ranges[0].len == 4
+    check data[0 ..< 4] == @(toBE32(1'i32))
+    # NULL
+    check ranges[1].len == -1
+    # long overflow string
+    check ranges[2].off == 4
+    check ranges[2].len == 20
+    check data[4 ..< 24] == @(toBytes(long))
+    # empty string — off points just past the overflow bytes, len 0
+    check ranges[3].off == 24
+    check ranges[3].len == 0
+    # int32(7)
+    check ranges[4].off == 24
+    check ranges[4].len == 4
+    check data[24 ..< 28] == @(toBE32(7'i32))
+    check oids == @[OidInt4, OidInt4, OidText, OidText, OidInt4]
+    # int32 uses binary(1), text uses text(0)
+    check formats == @[1'i16, 1'i16, 0'i16, 0'i16, 1'i16]
+
+  test "100 int32 params — data size, offsets, oids all consistent":
+    var params = newSeqOfCap[PgParamInline](100)
+    for i in 0 ..< 100:
+      params.add toPgParamInline(int32(i * 3))
+    let (data, ranges, oids, formats) = flattenInline(params)
+    check data.len == 100 * 4
+    check ranges.len == 100
+    for i in 0 ..< 100:
+      check ranges[i].off == int32(i * 4)
+      check ranges[i].len == 4
+      check data[i * 4 ..< (i + 1) * 4] == @(toBE32(int32(i * 3)))
+    for o in oids:
+      check o == OidInt4
+    for f in formats:
+      check f == 1'i16
+
+suite "Pipeline appendInline SoA layout":
+  test "single op: inlineStart/Count correct, ranges point into p.inlineData":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("INSERT", [toPgParamInline(42'i32), toPgParamInline("abc")])
+    check p.ops.len == 1
+    check p.ops[0].hasInline
+    check p.ops[0].inlineStart == 0
+    check p.ops[0].inlineCount == 2
+    check p.inlineRanges.len == 2
+    check p.inlineOids == @[OidInt4, OidText]
+    check p.inlineFormats == @[1'i16, 0'i16]
+    # Byte layout: 4 bytes for int32 + 3 bytes for "abc"
+    check p.inlineData.len == 7
+    check p.inlineRanges[0].off == 0
+    check p.inlineRanges[0].len == 4
+    check p.inlineRanges[1].off == 4
+    check p.inlineRanges[1].len == 3
+
+  test "two ops: second op's inlineStart resumes after first":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("INSERT 1", [toPgParamInline(1'i32)])
+    p.addExec("INSERT 2", [toPgParamInline(2'i32), toPgParamInline(3'i32)])
+    check p.ops.len == 2
+    check p.ops[0].inlineStart == 0
+    check p.ops[0].inlineCount == 1
+    check p.ops[1].inlineStart == 1
+    check p.ops[1].inlineCount == 2
+    check p.inlineRanges.len == 3
+    check p.inlineData.len == 12
+    check p.inlineRanges[0].off == 0 # op0 param0
+    check p.inlineRanges[1].off == 4 # op1 param0
+    check p.inlineRanges[2].off == 8 # op1 param1
+
+  test "mixed NULL + overflow in one op, offsets correct":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    let long = "abcdefghijklmnopqrst" # 20 chars → overflow
+    p.addExec(
+      "X", [toPgParamInline(9'i32), none(int32).toPgParamInline, toPgParamInline(long)]
+    )
+    check p.ops[0].inlineCount == 3
+    check p.inlineRanges.len == 3
+    check p.inlineData.len == 4 + 20 # NULL contributes nothing
+    check p.inlineRanges[0].off == 0
+    check p.inlineRanges[0].len == 4
+    check p.inlineRanges[1].len == -1 # NULL
+    check p.inlineRanges[2].off == 4
+    check p.inlineRanges[2].len == 20
+    check p.inlineData[4 ..< 24] == @(toBytes(long))
+
+  test "addQuery + addExec populate same SoA buffer":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addQuery("SELECT", [toPgParamInline(1'i32)])
+    p.addExec("INSERT", [toPgParamInline(2'i32)])
+    check p.ops.len == 2
+    check p.ops[0].kind == pokQuery
+    check p.ops[1].kind == pokExec
+    check p.ops[0].hasInline
+    check p.ops[1].hasInline
+    check p.ops[0].inlineStart == 0
+    check p.ops[1].inlineStart == 1
+    check p.inlineData.len == 8
+    check p.inlineData[0 ..< 4] == @(toBE32(1'i32))
+    check p.inlineData[4 ..< 8] == @(toBE32(2'i32))
+
+  test "addExec with empty inline params: hasInline=true, count=0":
+    # Edge case: the inline overload is chosen but no params are provided.
+    # executeImpl computes `endIdx = inlineStart + inlineCount - 1`, so for
+    # count==0 we get an empty `toOpenArray(start, start-1)` view — make sure
+    # that view is empty and the SoA buffers are untouched.
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    let empty: seq[PgParamInline] = @[]
+    p.addExec("SELECT 1", empty)
+    check p.ops.len == 1
+    check p.ops[0].hasInline
+    check p.ops[0].inlineStart == 0
+    check p.ops[0].inlineCount == 0
+    check p.inlineRanges.len == 0
+    check p.inlineOids.len == 0
+    check p.inlineFormats.len == 0
+    check p.inlineData.len == 0
+
+  test "addExec empty inline after a populated op: start resumes correctly":
+    # A second op with zero inline params must record `inlineStart` at the
+    # current tail of the SoA buffers, not 0.
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("A", [toPgParamInline(1'i32), toPgParamInline(2'i32)])
+    let empty: seq[PgParamInline] = @[]
+    p.addExec("B", empty)
+    check p.ops.len == 2
+    check p.ops[1].hasInline
+    check p.ops[1].inlineStart == 2 # resumes after the two params of op A
+    check p.ops[1].inlineCount == 0
+    check p.inlineRanges.len == 2 # unchanged by op B
+
+suite "encodeBinaryArray with Option elements":
+  test "mixed null and non-null int32":
+    let elements = @[some(@(toBE32(1'i32))), none(seq[byte]), some(@(toBE32(3'i32)))]
+    let encoded = encodeBinaryArray(OidInt4, elements)
+    # header(20) + 3 × len(4) + 2 non-null × payload(4) = 40
+    check encoded.len == 40
+    check fromBE32(encoded.toOpenArray(0, 3)) == 1'i32 # ndim
+    check fromBE32(encoded.toOpenArray(4, 7)) == 1'i32 # has_null = 1
+    check fromBE32(encoded.toOpenArray(8, 11)) == OidInt4
+    check fromBE32(encoded.toOpenArray(12, 15)) == 3'i32 # dim_len
+    # element 0 len
+    check fromBE32(encoded.toOpenArray(20, 23)) == 4'i32
+    # element 1 len = -1 (NULL)
+    check fromBE32(encoded.toOpenArray(28, 31)) == -1'i32
+    # element 2 len
+    check fromBE32(encoded.toOpenArray(32, 35)) == 4'i32
+
+  test "all-some matches non-optional encoder byte-for-byte":
+    let same = encodeBinaryArray(OidInt4, @[@(toBE32(1'i32)), @(toBE32(2'i32))])
+    let withOpt =
+      encodeBinaryArray(OidInt4, @[some(@(toBE32(1'i32))), some(@(toBE32(2'i32)))])
+    check same == withOpt
+
+  test "all-none sets has_null":
+    let encoded = encodeBinaryArray(OidInt4, @[none(seq[byte]), none(seq[byte])])
+    check fromBE32(encoded.toOpenArray(4, 7)) == 1'i32
+
+suite "toPgParam seq[Option[T]]":
+  test "int32 with null":
+    let p = toPgParam(@[some(1'i32), none(int32), some(3'i32)])
+    check p.oid == OidInt4Array
+    check p.format == 1'i16
+    check p.value.isSome
+    # has_null should be 1
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "int16 with null":
+    let p = toPgParam(@[some(10'i16), none(int16)])
+    check p.oid == OidInt2Array
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "int64 with null":
+    let p = toPgParam(@[none(int64), some(99'i64)])
+    check p.oid == OidInt8Array
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "int with null":
+    let p = toPgParam(@[some(1), none(int)])
+    check p.oid == OidInt8Array
+
+  test "float32 with null":
+    let p = toPgParam(@[some(1.5'f32), none(float32)])
+    check p.oid == OidFloat4Array
+
+  test "float64 with null":
+    let p = toPgParam(@[some(1.5), none(float64)])
+    check p.oid == OidFloat8Array
+
+  test "bool with null":
+    let p = toPgParam(@[some(true), none(bool), some(false)])
+    check p.oid == OidBoolArray
+
+  test "string with null":
+    let p = toPgParam(@[some("a"), none(string), some("c")])
+    check p.oid == OidTextArray
+    check fromBE32(p.value.get.toOpenArray(4, 7)) == 1'i32
+
+  test "empty seq[Option[int32]]":
+    let v: seq[Option[int32]] = @[]
+    let p = toPgParam(v)
+    check p.oid == OidInt4Array
+    check p.value.isSome
+    # empty array: ndim=0, has_null=0, elem_oid
+    check fromBE32(p.value.get.toOpenArray(0, 3)) == 0'i32
+
+  test "all-some int32 matches non-optional":
+    let a = toPgParam(@[1'i32, 2, 3])
+    let b = toPgParam(@[some(1'i32), some(2'i32), some(3'i32)])
+    check a.value.get == b.value.get
+
+suite "getXxxArrayElemOpt":
+  test "getIntArrayElemOpt text with NULL":
+    let row: Row = @[some(toBytes("{1,NULL,3}"))]
+    check row.getIntArrayElemOpt(0) == @[some(1'i32), none(int32), some(3'i32)]
+
+  test "getIntArrayElemOpt text all-some":
+    let row: Row = @[some(toBytes("{1,2,3}"))]
+    check row.getIntArrayElemOpt(0) == @[some(1'i32), some(2'i32), some(3'i32)]
+
+  test "getIntArrayElemOpt NULL column raises":
+    let row: Row = @[none(seq[byte])]
+    var raised = false
+    try:
+      discard row.getIntArrayElemOpt(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getIntArrayElemOptOpt NULL column is none":
+    let row: Row = @[none(seq[byte])]
+    check row.getIntArrayElemOptOpt(0) == none(seq[Option[int32]])
+
+  test "getIntArrayElemOptOpt some with NULL element":
+    let row: Row = @[some(toBytes("{1,NULL}"))]
+    let v = row.getIntArrayElemOptOpt(0)
+    check v.isSome
+    check v.get == @[some(1'i32), none(int32)]
+
+  test "getStrArrayElemOpt text with NULL":
+    let row: Row = @[some(toBytes("{\"a\",NULL,\"c\"}"))]
+    check row.getStrArrayElemOpt(0) == @[some("a"), none(string), some("c")]
+
+  test "getBoolArrayElemOpt text with NULL":
+    let row: Row = @[some(toBytes("{t,NULL,f}"))]
+    check row.getBoolArrayElemOpt(0) == @[some(true), none(bool), some(false)]
+
+  test "getInt16ArrayElemOpt text":
+    let row: Row = @[some(toBytes("{10,NULL}"))]
+    check row.getInt16ArrayElemOpt(0) == @[some(10'i16), none(int16)]
+
+  test "getInt64ArrayElemOpt text":
+    let row: Row = @[some(toBytes("{99,NULL}"))]
+    check row.getInt64ArrayElemOpt(0) == @[some(99'i64), none(int64)]
+
+  test "getFloatArrayElemOpt text":
+    let row: Row = @[some(toBytes("{1.5,NULL}"))]
+    let v = row.getFloatArrayElemOpt(0)
+    check v.len == 2
+    check v[0].isSome
+    check abs(v[0].get - 1.5) < 1e-10
+    check v[1].isNone
+
+  test "getFloat32ArrayElemOpt text":
+    let row: Row = @[some(toBytes("{2.5,NULL}"))]
+    let v = row.getFloat32ArrayElemOpt(0)
+    check v.len == 2
+    check v[0].isSome
+    check v[1].isNone
+
+suite "enum arrays":
+  test "toPgParam seq[Mood] emits text array literal":
+    let p = toPgParam(@[happy, sad, ok])
+    check p.format == 0'i16
+    check toString(p.value.get) == "{\"happy\",\"sad\",\"ok\"}"
+
+  test "toPgParam seq[Option[Mood]] emits NULL tokens":
+    let p = toPgParam(@[some(happy), none(Mood), some(ok)])
+    check toString(p.value.get) == "{\"happy\",NULL,\"ok\"}"
+
+  test "toPgParam empty seq[Mood]":
+    let v: seq[Mood] = @[]
+    let p = toPgParam(v)
+    check toString(p.value.get) == "{}"
+
+  test "pgEnum OID=0: array uses OID 0":
+    let p = toPgParam(@[happy])
+    check p.oid == 0'i32
+
+  test "pgEnum with explicit OID: scalar OID propagates to array with OID 0":
+    let p = toPgParam(@[red, green])
+    # 2-arg pgEnum keeps arrayOid = 0
+    check p.oid == 0'i32
+
+  test "getEnumArray text":
+    let row: Row = @[some(toBytes("{happy,sad,ok}"))]
+    check getEnumArray[Mood](row, 0) == @[happy, sad, ok]
+
+  test "getEnumArray raises on NULL element":
+    let row: Row = @[some(toBytes("{happy,NULL,ok}"))]
+    var raised = false
+    try:
+      discard getEnumArray[Mood](row, 0)
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "getEnumArrayElemOpt":
+    let row: Row = @[some(toBytes("{happy,NULL,ok}"))]
+    check getEnumArrayElemOpt[Mood](row, 0) == @[some(happy), none(Mood), some(ok)]
+
+  test "getEnumArrayOpt NULL column":
+    let row: Row = @[none(seq[byte])]
+    check getEnumArrayOpt[Mood](row, 0) == none(seq[Mood])
+
+  test "getEnumArrayOpt some":
+    let row: Row = @[some(toBytes("{happy}"))]
+    check getEnumArrayOpt[Mood](row, 0) == some(@[happy])
+
+  test "getEnumArray invalid label raises":
+    let row: Row = @[some(toBytes("{unknown}"))]
+    var raised = false
+    try:
+      discard getEnumArray[Mood](row, 0)
+    except ValueError:
+      raised = true
+    check raised

@@ -7,9 +7,13 @@ tests/certs/
 
 async_postgres/*
 !async_postgres/*.*
+async_postgres/pg_types/*
+!async_postgres/pg_types/*.*
 
 tests/*
 !tests/*.*
 
 examples/*
 !examples/*.*
+
+async_postgres.out

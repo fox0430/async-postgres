@@ -182,12 +182,15 @@ const
 proc `==`*(a, b: Lsn): bool {.borrow.}
 proc `<`*(a, b: Lsn): bool {.borrow.}
 proc `<=`*(a, b: Lsn): bool {.borrow.}
+proc `>`*(a, b: Lsn): bool {.inline.} =
+  b < a
+
+proc `>=`*(a, b: Lsn): bool {.inline.} =
+  b <= a
 
 proc toString*(field: TupleField): string =
   ## Convert a TupleField's data to a string by copying the bytes.
-  result = newString(field.data.len)
-  if field.data.len > 0:
-    copyMem(addr result[0], unsafeAddr field.data[0], field.data.len)
+  result = readString(field.data, 0, field.data.len)
 
 template toUInt64*(lsn: Lsn): uint64 =
   ## Get the raw uint64 value of an LSN.
@@ -230,15 +233,16 @@ proc currentPgTimestamp*(): int64 =
 
 proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at offset. Returns (string, next offset).
+  if offset >= buf.len:
+    raise newException(ProtocolError, "decodeCStringAt: offset past end of buffer")
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
+  if i >= buf.len:
+    raise newException(ProtocolError, "decodeCStringAt: missing null terminator")
   let slen = i - offset
-  var s = newString(slen)
-  if slen > 0:
-    copyMem(addr s[0], unsafeAddr buf[offset], slen)
-  if i < buf.len:
-    inc i # skip null
+  let s = readString(buf, offset, slen)
+  inc i # skip null
   (s, i)
 
 proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
@@ -258,9 +262,7 @@ proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
     of 't', 'b':
       let dataLen = decodeInt32(buf, pos)
       pos += 4
-      var data = newSeq[byte](dataLen)
-      if dataLen > 0:
-        copyMem(addr data[0], unsafeAddr buf[pos], dataLen)
+      let data = readBytes(buf, pos, int(dataLen))
       pos += int(dataLen)
       fields[i] = TupleField(kind: if kind == 't': tdkText else: tdkBinary, data: data)
     else:
@@ -384,9 +386,7 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     pos = nextPos
     let contentLen = decodeInt32(data, pos)
     pos += 4
-    if contentLen > 0:
-      msg.content = newSeq[byte](contentLen)
-      copyMem(addr msg.content[0], unsafeAddr data[pos], contentLen)
+    msg.content = readBytes(data, pos, int(contentLen))
     PgOutputMessage(kind: pomkMessage, message: msg)
   else:
     raise newException(ProtocolError, "Unknown pgoutput message type: " & msgType)
@@ -444,7 +444,7 @@ proc identifySystem*(conn: PgConnection): Future[SystemInfo] {.async.} =
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "IDENTIFY_SYSTEM returned no results")
   let qr = results[0]
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   var info = SystemInfo()
   info.systemId = row.getStr(0)
   info.timeline = parseInt(row.getStr(1)).int32
@@ -469,7 +469,7 @@ proc createReplicationSlot*(
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "CREATE_REPLICATION_SLOT returned no results")
   let qr = results[0]
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   var info = ReplicationSlotInfo()
   info.slotName = row.getStr(0)
   info.consistentPoint = parseLsn(row.getStr(1))
@@ -497,7 +497,7 @@ proc readReplicationSlot*(
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "READ_REPLICATION_SLOT returned no results")
   let qr = results[0]
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   var info = ReplicationSlotInfo()
   # READ_REPLICATION_SLOT returns: slot_type, restart_lsn, restart_tli
   # But the column layout depends on PG version. We handle common case.
@@ -567,6 +567,7 @@ proc startReplication*(
     slotName: string,
     startLsn: Lsn = InvalidLsn,
     options: seq[(string, string)] = @[],
+    autoKeepaliveReply: bool = true,
     callback: ReplicationCallback,
 ): Future[void] {.async.} =
   ## Begin logical replication streaming from the given slot.
@@ -574,6 +575,28 @@ proc startReplication*(
   ## The ``callback`` is invoked for each ``XLogData`` or ``PrimaryKeepalive``
   ## message received. The callback is awaited, providing natural TCP backpressure.
   ## Within the callback, use ``sendStandbyStatus`` to acknowledge received data.
+  ##
+  ## When ``autoKeepaliveReply`` is true (the default), the library responds
+  ## automatically to ``PrimaryKeepalive`` messages with ``replyRequested = true``
+  ## *before* invoking the callback, sending the most recently received
+  ## ``XLogData.endLsn`` (or ``startLsn`` if no XLogData has arrived yet) as
+  ## receive/flush/apply LSN. This prevents silent disconnects from
+  ## ``wal_sender_timeout`` when the callback is slow. The keepalive is still
+  ## delivered to the callback. Set ``autoKeepaliveReply = false`` to manage
+  ## replies manually — for example, when the flush/apply LSN must reflect
+  ## callback-side progress (durable writes) rather than what has merely been
+  ## received from the wire.
+  ##
+  ## If no ``XLogData`` has arrived and ``startLsn`` was left at its default
+  ## ``InvalidLsn`` (``0/0``), the auto-reply will carry ``0/0`` for
+  ## receive/flush/apply. PostgreSQL treats this as "position unknown" and will
+  ## not move ``confirmed_flush_lsn`` backwards, so the reply is still useful
+  ## for resetting ``wal_sender_timeout`` without risking data loss.
+  ##
+  ## If the auto-reply itself fails (for example, the connection is lost
+  ## between receiving the keepalive and writing the Standby Status Update),
+  ## the exception is propagated out of ``startReplication`` and the callback
+  ## is *not* invoked for that keepalive.
   ##
   ## The proc returns when the server sends ``CopyDone`` or the connection closes.
   ## To stop replication from the client side, call ``stopReplication`` from within
@@ -633,6 +656,13 @@ proc startReplication*(
   if not gotCopyBoth:
     return
 
+  # Tracks the highest XLogData.endLsn received from the wire (updated just
+  # before the callback is invoked) so that auto-replies acknowledge only what
+  # we have actually received, never the server's walEnd (which would falsely
+  # advance confirmed_flush_lsn past unprocessed data and cause data loss on
+  # slot restart).
+  var lastReceivedLsn: Lsn = startLsn
+
   # Streaming loop
   block recvLoop:
     while true:
@@ -641,6 +671,13 @@ proc startReplication*(
         case msg.kind
         of bmkCopyData:
           let replMsg = parseReplicationMessage(msg.copyData)
+          case replMsg.kind
+          of rmkXLogData:
+            if replMsg.xlogData.endLsn > lastReceivedLsn:
+              lastReceivedLsn = replMsg.xlogData.endLsn
+          of rmkPrimaryKeepalive:
+            if autoKeepaliveReply and replMsg.keepalive.replyRequested:
+              await sendStandbyStatus(conn, lastReceivedLsn)
           await callback(replMsg)
         of bmkCopyDone:
           # Server ended the stream; reply with CopyDone before draining

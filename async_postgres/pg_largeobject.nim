@@ -161,7 +161,7 @@ proc loRead*(
   )
   if qr.rowCount == 0:
     return @[]
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return @[]
   return row.getBytes(0)

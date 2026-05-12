@@ -1,8 +1,12 @@
-import std/[deques, macros, options]
+import std/[deques, macros, options, importutils]
 
-import async_backend, pg_protocol, pg_connection, pg_types
+import async_backend, pg_protocol, pg_connection, pg_types, pg_client
 
-import pg_client
+privateAccess(PgConnection)
+
+const closePruneThreshold = 16
+  ## Sweep `pool.pendingCloses` for finished futures only once its length
+  ## reaches this threshold, so the O(n) prune is amortized across calls.
 
 type
   PoolConfig* = object
@@ -38,6 +42,12 @@ type
     maxPipelineSize*: int
       ## Max operations per pipeline batch per connection (default 0=unlimited).
       ## Only used when `pipelined` is true.
+    connectBackoffInitial*: Duration
+      ## First backoff after a maintenance-loop connect failure (default 1s,
+      ## ZeroDuration=disabled, falls back to fixed `maintenanceInterval` retries).
+    connectBackoffMax*: Duration
+      ## Cap for exponential backoff growth (default 60s). Doubles each failure
+      ## until reaching this value.
 
   PooledConn = object
     ## An idle connection held by the pool with its last-used timestamp.
@@ -68,7 +78,8 @@ type
     execFut: Future[CommandResult] ## Non-nil for popExec
     queryFut: Future[QueryResult] ## Non-nil for popQuery
 
-  PgPool* = ref object ## Connection pool that manages a set of PostgreSQL connections.
+  PgPool* = ref object of PgPoolOwner
+    ## Connection pool that manages a set of PostgreSQL connections.
     config: PoolConfig
     idle: Deque[PooledConn]
     active: int
@@ -81,6 +92,14 @@ type
     metrics: PoolMetrics
     pendingOps: Deque[PendingPoolOp] ## Queue for implicit pipeline batching
     dispatchScheduled: bool ## Whether a dispatch callback is pending
+    pendingCloses: seq[Future[void]]
+      ## Fire-and-forget close tasks spawned by closeNoWait, awaited on pool.close()
+    consecutiveConnectFailures: int
+      ## Counter for exponential backoff in the maintenance loop. Reset to 0
+      ## whenever a connect succeeds (in maintenance or acquire).
+    nextConnectRetryAt: Moment
+      ## Monotonic deadline before the maintenance loop is allowed to retry
+      ## opening a new connection. Zero means "no pending backoff".
 
 proc initPoolConfig*(
     connConfig: ConnConfig,
@@ -96,11 +115,17 @@ proc initPoolConfig*(
     resetQuery = "",
     pipelined = false,
     maxPipelineSize = 0,
+    connectBackoffInitial = seconds(1),
+    connectBackoffMax = seconds(60),
 ): PoolConfig =
   ## Create a pool configuration with sensible defaults.
   ## `minSize` idle connections are maintained; up to `maxSize` total.
   ## Set `resetQuery` to clean session state on release (e.g. "DISCARD ALL" for PgBouncer).
   ## Set `pipelined` to true to enable implicit query batching for `pool.exec`/`pool.query`.
+  ## When the maintenance loop fails to open a connection, subsequent retries
+  ## use exponential backoff starting at `connectBackoffInitial`, doubling up to
+  ## `connectBackoffMax`. Set `connectBackoffInitial = ZeroDuration` to disable
+  ## backoff and fall back to fixed-interval retries.
   ##
   ## Raises `ValueError` if parameters are invalid.
   if minSize < 0:
@@ -113,6 +138,10 @@ proc initPoolConfig*(
     )
   if maxWaiters < -1:
     raise newException(ValueError, "maxWaiters must be >= -1, got " & $maxWaiters)
+  if connectBackoffInitial < ZeroDuration:
+    raise newException(ValueError, "connectBackoffInitial must be >= 0")
+  if connectBackoffMax < connectBackoffInitial:
+    raise newException(ValueError, "connectBackoffMax must be >= connectBackoffInitial")
 
   PoolConfig(
     connConfig: connConfig,
@@ -128,6 +157,8 @@ proc initPoolConfig*(
     resetQuery: resetQuery,
     pipelined: pipelined,
     maxPipelineSize: maxPipelineSize,
+    connectBackoffInitial: connectBackoffInitial,
+    connectBackoffMax: connectBackoffMax,
   )
 
 proc poolConfig*(pool: PgPool): PoolConfig =
@@ -158,31 +189,106 @@ proc metrics*(pool: PgPool): PoolMetrics =
   ## Cumulative pool metrics.
   pool.metrics
 
+proc reportCloseError(pool: PgPool, conn: PgConnection, err: ref CatchableError) =
+  ## Route a swallowed pool-initiated close error to the tracer. The pool
+  ## cannot propagate these errors to a caller (close runs from synchronous
+  ## cleanup paths and fire-and-forget tasks), so tracing is the only signal
+  ## operators have for leak detection.
+  if pool.config.tracer != nil and pool.config.tracer.onPoolCloseError != nil:
+    pool.config.tracer.onPoolCloseError(TracePoolCloseErrorData(conn: conn, err: err))
+
+proc tracedClose(pool: PgPool, conn: PgConnection) {.async.} =
+  ## Close `conn`, reporting any close error via `reportCloseError`.
+  try:
+    await conn.close()
+  except CatchableError as e:
+    pool.reportCloseError(conn, e)
+
 proc closeNoWait(pool: PgPool, conn: PgConnection) =
-  ## Schedule connection close without waiting. For use in non-async contexts.
+  ## Schedule connection close without waiting. For use in non-async contexts
+  ## (e.g. `release()` is synchronous). The spawned task is tracked in
+  ## `pool.pendingCloses` so `pool.close()` can await its completion for
+  ## graceful shutdown.
+  ##
+  ## Note on asyncdispatch: a close scheduled here may race with an inflight
+  ## request future that the previous timeout could not cancel (see
+  ## `invalidateOnTimeout`). That future will observe a closed fd and fail
+  ## quietly — `tracedClose` catches the error and routes it to the
+  ## `onPoolCloseError` tracer hook (nil when unconfigured). The connection
+  ## is not reused either way.
   pool.metrics.closeCount.inc
   proc doClose() {.async.} =
+    await pool.tracedClose(conn)
+
+  # Prune only once the seq grows past the threshold so the sweep is amortized
+  # instead of O(n) on every call. Uses swap-remove (constant-time delete that
+  # reorders) since order among pending closes is irrelevant.
+  if pool.pendingCloses.len >= closePruneThreshold:
+    var n = pool.pendingCloses.len
+    var i = 0
+    while i < n:
+      if pool.pendingCloses[i].finished:
+        pool.pendingCloses[i] = pool.pendingCloses[n - 1]
+        dec n
+      else:
+        inc i
+    pool.pendingCloses.setLen(n)
+
+  let fut = doClose()
+  pool.pendingCloses.add(fut)
+  asyncSpawn fut
+
+proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
+  ## Reset session-affecting state on a connection before returning it to the
+  ## pool. Releases any session-level advisory locks acquired through the
+  ## typed API, then runs the configured `resetQuery` (if any). On failure,
+  ## closes the connection so that release() will discard it.
+  ##
+  ## Always safe to call: returns immediately when the connection is unusable
+  ## (broken / mid-transaction) or has nothing to clean up (no `resetQuery`
+  ## and no advisory locks held). Callers don't need to gate on the pool
+  ## config.
+  ##
+  ## Never propagates `CatchableError`: this is invoked from `finally` blocks
+  ## in the `with*` helpers (and the per-call cleanup path of `exec` / `query`
+  ## etc.), where a raised reset error would mask the body's original
+  ## exception. Cleanup errors — including any raised from the close path's
+  ## tracer hook — are swallowed.
+  if conn.state != csReady or conn.txStatus != tsIdle:
+    return
+  if pool.config.resetQuery.len == 0 and conn.heldSessionLocks == 0:
+    return
+  try:
+    if conn.heldSessionLocks > 0:
+      let t = pool.config.tracer
+      if t != nil and t.onLeakedSessionLocks != nil:
+        t.onLeakedSessionLocks(
+          TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
+        )
+      discard await conn.simpleExec("SELECT pg_advisory_unlock_all()")
+      conn.heldSessionLocks = 0
+    if pool.config.resetQuery.len > 0:
+      discard await conn.simpleExec(pool.config.resetQuery)
+      conn.clearStmtCache()
+  except CatchableError:
     try:
-      await conn.close()
+      await pool.tracedClose(conn)
     except CatchableError:
       discard
 
-  asyncSpawn doClose()
-
-proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
-  ## Execute the configured reset query on a connection before returning it
-  ## to the pool. On failure, closes the connection so that release() will
-  ## discard it.
-  if pool.config.resetQuery.len > 0 and conn.state == csReady and conn.txStatus == tsIdle:
-    try:
-      discard await conn.simpleExec(pool.config.resetQuery)
-      conn.clearStmtCache()
-      conn.rowDataBuf = nil
-    except CatchableError:
-      try:
-        await conn.close()
-      except CatchableError:
-        discard
+proc computeConnectBackoff*(initial, maxDelay: Duration, failures: int): Duration =
+  ## Exponential backoff for repeated connect failures: returns
+  ## `initial * 2^(failures-1)` capped at `maxDelay`. Returns `ZeroDuration`
+  ## when backoff is disabled (`initial == ZeroDuration`) or `failures <= 0`.
+  if failures <= 0 or initial == ZeroDuration:
+    return ZeroDuration
+  result = initial
+  for _ in 1 ..< failures:
+    if result >= maxDelay:
+      return maxDelay
+    result = result + result
+  if result > maxDelay:
+    result = maxDelay
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
@@ -199,20 +305,14 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       # Always close broken or in-transaction connections (unusable)
       if pc.conn.state != csReady or pc.conn.txStatus != tsIdle:
         pool.metrics.closeCount.inc
-        try:
-          await pc.conn.close()
-        except CatchableError:
-          discard
+        await pool.tracedClose(pc.conn)
         continue
 
       # Always close max-lifetime-exceeded connections (acquire rejects them anyway)
       if pool.config.maxLifetime > ZeroDuration and
           now - pc.conn.createdAt > pool.config.maxLifetime:
         pool.metrics.closeCount.inc
-        try:
-          await pc.conn.close()
-        except CatchableError:
-          discard
+        await pool.tracedClose(pc.conn)
         continue
 
       # Idle timeout respects minSize
@@ -221,15 +321,19 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         let totalCount = remaining.len + pool.idle.len + pool.active
         if totalCount >= pool.config.minSize:
           pool.metrics.closeCount.inc
-          try:
-            await pc.conn.close()
-          except CatchableError:
-            discard
+          await pool.tracedClose(pc.conn)
           continue
 
       remaining.addLast(pc)
 
     pool.idle = remaining
+
+    # Skip the replenish phase while we are inside a backoff window from a
+    # recent failure. Idle pruning above still runs every interval — only the
+    # connect attempts are throttled, so a backed-off pool keeps closing dead
+    # idle/expired connections normally.
+    if pool.consecutiveConnectFailures > 0 and Moment.now() < pool.nextConnectRetryAt:
+      continue
 
     # Replenish to minSize (best-effort)
     let currentTotal = pool.idle.len + pool.active
@@ -245,10 +349,19 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         break
       try:
         let conn = await connect(pool.config.connConfig).wait(replenishTimeout)
+        conn.ownerPool = pool
         pool.metrics.createCount.inc
         pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
+        pool.consecutiveConnectFailures = 0
       except CatchableError:
-        break # best-effort, retry next interval
+        pool.consecutiveConnectFailures.inc
+        let delay = computeConnectBackoff(
+          pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
+          pool.consecutiveConnectFailures,
+        )
+        if delay > ZeroDuration:
+          pool.nextConnectRetryAt = Moment.now() + delay
+        break # best-effort, retry next interval (or after backoff)
 
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   ## Create a new connection pool and establish `minSize` initial connections.
@@ -272,55 +385,101 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     pool.cachedNow = Moment.now()
     for i in 0 ..< cfg.minSize:
       let conn = await connect(cfg.connConfig)
+      conn.ownerPool = pool
       pool.metrics.createCount.inc
       pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
   except CatchableError as e:
     while pool.idle.len > 0:
       let pc = pool.idle.popFirst()
-      try:
-        await pc.conn.close()
-      except CatchableError:
-        discard
+      await pool.tracedClose(pc.conn)
     raise e
 
   pool.maintenanceTask = maintenanceLoop(pool)
   return pool
 
-proc release*(pool: PgPool, conn: PgConnection) =
-  ## Return a connection to the pool. If the connection is broken or in a
-  ## transaction, it is closed instead. If waiters are queued, the connection
-  ## is handed directly to the next waiter.
-  var traceCtx: TraceContext
-  if pool.config.tracer != nil and pool.config.tracer.onPoolReleaseStart != nil:
-    traceCtx =
-      pool.config.tracer.onPoolReleaseStart(TracePoolReleaseStartData(conn: conn))
-
-  var wasClosed = false
-  var handedToWaiter = false
-  if pool.closed or conn.state != csReady or conn.txStatus != tsIdle:
+proc releaseCore(
+    pool: PgPool, conn: PgConnection
+): tuple[wasClosed, handedToWaiter: bool] =
+  ## Core release logic shared by the traced and non-traced paths of
+  ## `releaseImpl`. Returns flags describing the disposition of `conn` so
+  ## the caller can report them to the tracer.
+  if pool.closed or conn.state != csReady or conn.txStatus != tsIdle or
+      conn.heldSessionLocks > 0:
     if pool.active > 0:
       pool.active.dec
     pool.closeNoWait(conn)
-    wasClosed = true
-  else:
-    block dispatch:
-      while pool.waiters.len > 0:
-        let waiter = pool.waiters.popFirst()
-        if waiter.cancelled:
-          continue
-        pool.waiterCount.dec
-        waiter.fut.complete(conn)
-        handedToWaiter = true
-        break dispatch
-      if pool.active > 0:
-        pool.active.dec
-      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+    return (true, false)
+  while pool.waiters.len > 0:
+    let waiter = pool.waiters.popFirst()
+    if waiter.cancelled:
+      continue
+    pool.waiterCount.dec
+    waiter.fut.complete(conn)
+    return (false, true)
+  if pool.active > 0:
+    pool.active.dec
+  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+  return (false, false)
 
-  if pool.config.tracer != nil and pool.config.tracer.onPoolReleaseEnd != nil:
-    pool.config.tracer.onPoolReleaseEnd(
+proc releaseImpl(pool: PgPool, conn: PgConnection) =
+  ## Implementation of `release(conn)`; called once the owning pool is known.
+  ## Returns the connection to the pool. If the connection is broken or in
+  ## a transaction, it is closed instead. If waiters are queued, the
+  ## connection is handed directly to the next waiter.
+  ##
+  ## Discard criteria (`conn.state != csReady`):
+  ## - A timed-out request reaches us via `invalidateOnTimeout` with
+  ##   `state = csClosed`. Under asyncdispatch this is load-bearing: the
+  ##   inner future is still alive and may write to the socket, so the
+  ##   connection MUST be retired from the pool.
+  ## - Any listening/replication/COPY state is also not reusable.
+  ## Transaction-in-progress (`txStatus != tsIdle`) is treated as failure
+  ## to reset the session, so the connection is closed rather than leaking
+  ## transaction state to the next borrower.
+  ## Session-level advisory locks (`heldSessionLocks > 0`) likewise force the
+  ## connection to be discarded: callers who route through `resetSession`
+  ## clear them ahead of time, so anything reaching here with locks still
+  ## held has bypassed that path and must not return to the idle queue.
+  let tracer = pool.config.tracer
+  if conn.heldSessionLocks > 0 and tracer != nil and tracer.onLeakedSessionLocks != nil:
+    tracer.onLeakedSessionLocks(
+      TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
+    )
+  if tracer == nil:
+    discard pool.releaseCore(conn)
+    return
+
+  var traceCtx: TraceContext
+  if tracer.onPoolReleaseStart != nil:
+    traceCtx = tracer.onPoolReleaseStart(TracePoolReleaseStartData(conn: conn))
+
+  let (wasClosed, handedToWaiter) = pool.releaseCore(conn)
+
+  if tracer.onPoolReleaseEnd != nil:
+    tracer.onPoolReleaseEnd(
       traceCtx,
       TracePoolReleaseEndData(wasClosed: wasClosed, handedToWaiter: handedToWaiter),
     )
+
+proc release*(conn: PgConnection) =
+  ## Return a connection to its owning pool. If the connection is broken or
+  ## in a transaction, it is closed instead; if waiters are queued, it is
+  ## handed directly to the next waiter.
+  ##
+  ## The owning pool is tracked on `conn.ownerPool`, set automatically when
+  ## the connection is acquired from a `PgPool` (including pools inside a
+  ## `PgPoolCluster`). For standalone connections created with `connect`
+  ## this field is `nil` and calling `release` raises `PgError` — use
+  ## `conn.close()` instead.
+  ##
+  ## `withConnection`, `withReadConnection`, `withWriteConnection`,
+  ## `withPipeline`, and `withTransaction` call this automatically; direct
+  ## callers only need it when they manage `acquire`/`release` manually.
+  if conn.ownerPool == nil:
+    raise newException(
+      PgError, "release() called on a standalone connection; use conn.close() instead"
+    )
+  PgPool(conn.ownerPool).releaseImpl(conn)
 
 type AcquireResult = tuple[conn: PgConnection, wasCreated: bool]
 
@@ -341,18 +500,12 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     let pc = pool.idle.popFirst()
     if pc.conn.state != csReady:
       pool.metrics.closeCount.inc
-      try:
-        await pc.conn.close()
-      except CatchableError:
-        discard
+      await pool.tracedClose(pc.conn)
       continue
     if pool.config.maxLifetime > ZeroDuration and
         pool.cachedNow - pc.conn.createdAt > pool.config.maxLifetime:
       pool.metrics.closeCount.inc
-      try:
-        await pc.conn.close()
-      except CatchableError:
-        discard
+      await pool.tracedClose(pc.conn)
       continue
     # Health check: ping connections that have been idle too long
     if pool.config.healthCheckTimeout > ZeroDuration and
@@ -361,10 +514,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         await pc.conn.ping(pool.config.pingTimeout)
       except CatchableError:
         pool.metrics.closeCount.inc
-        try:
-          await pc.conn.close()
-        except CatchableError:
-          discard
+        await pool.tracedClose(pc.conn)
         continue
     pool.active.inc
     recordAcquire()
@@ -375,7 +525,11 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     pool.active.inc
     try:
       let conn = await connect(pool.config.connConfig)
+      conn.ownerPool = pool
       pool.metrics.createCount.inc
+      # A successful caller-driven connect signals the DB is reachable —
+      # let the maintenance loop resume immediate replenishment.
+      pool.consecutiveConnectFailures = 0
       recordAcquire()
       return (conn, true)
     except CatchableError as e:
@@ -406,7 +560,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       # the future just before the timeout fired, return the connection
       # to the pool instead of leaking it.
       if fut.completed():
-        pool.release(fut.read())
+        fut.read().release()
       raise newException(PgPoolError, "Pool acquire timeout")
   else:
     let conn = await fut
@@ -417,6 +571,10 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## Acquire a connection from the pool. Tries idle connections first (with
   ## health checks), creates a new one if under `maxSize`, or waits for a
   ## release. Raises `PgPoolError` on timeout or if the pool is closed.
+  if pool.config.tracer == nil:
+    let ar = await pool.acquireImpl()
+    return ar.conn
+
   var ar: AcquireResult
   withTracing(
     pool.config.tracer,
@@ -434,13 +592,15 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
 template withConnection*(pool: PgPool, conn, body: untyped) =
   ## Acquire a connection, execute `body`, then release it back to the pool.
   ## The connection is available as `conn` inside the body.
-  ## If `resetQuery` is configured, session state is reset before release.
+  ## `resetSession` runs before release, so a configured `resetQuery` is
+  ## applied and any session-level advisory locks acquired through the typed
+  ## API are released via `pg_advisory_unlock_all`.
   let conn = await pool.acquire()
   try:
     body
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
   ## Fail a pending op's future if not already finished.
@@ -451,6 +611,20 @@ proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
   of popQuery:
     if not op.queryFut.finished:
       op.queryFut.fail(e)
+
+proc failAllPending(pool: PgPool, e: ref CatchableError) {.raises: [].} =
+  ## Fail every queued op with `e`. Marked `raises: []` so the compiler
+  ## proves the loop cannot leak into an `asyncSpawn`ed caller — any future
+  ## change to `failPendingOp` or the underlying `Future.fail` that could
+  ## raise will be caught here at compile time. `Exception` is used (not
+  ## `CatchableError`) because asyncdispatch's `Future.fail` has inferred
+  ## effect `Exception` via its callback chain.
+  try:
+    while pool.pendingOps.len > 0:
+      let op = pool.pendingOps.popFirst()
+      failPendingOp(op, e)
+  except Exception:
+    discard
 
 proc executeBatch(
     pool: PgPool, conn: PgConnection, batch: seq[PendingPoolOp]
@@ -490,7 +664,7 @@ proc executeBatch(
       failPendingOp(op, e)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc dispatchBatchImpl(pool: PgPool) {.async.} =
   ## Drain the pending ops queue and execute them via pipelined connections.
@@ -523,7 +697,7 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
           op.queryFut.complete(r)
       finally:
         await pool.resetSession(conn)
-        pool.release(conn)
+        conn.release()
     except CatchableError as e:
       failPendingOp(op, e)
     return
@@ -555,7 +729,7 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
   for ci in 0 ..< conns.len:
     if connOps[ci].len == 0:
       await pool.resetSession(conns[ci])
-      pool.release(conns[ci])
+      conns[ci].release()
       continue
     batchFuts.add(executeBatch(pool, conns[ci], connOps[ci]))
 
@@ -573,9 +747,7 @@ proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
         await pool.dispatchBatchImpl()
       except CatchableError as e:
         # Fail any ops still in the queue so their futures don't hang forever.
-        while pool.pendingOps.len > 0:
-          let op = pool.pendingOps.popFirst()
-          failPendingOp(op, e)
+        pool.failAllPending(e)
       # Re-schedule if there are remaining ops
       if pool.pendingOps.len > 0:
         pool.scheduleDispatch()
@@ -587,12 +759,7 @@ proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
         # asyncSpawn should not raise in practice, but the compiler cannot
         # prove it.  Fail any pending ops so their futures do not hang.
         let err = newException(PgError, "Pipeline dispatch failed: " & e.msg)
-        try:
-          while p.pendingOps.len > 0:
-            let op = p.pendingOps.popFirst()
-            failPendingOp(op, err)
-        except Exception:
-          discard
+        p.failAllPending(err)
         p.dispatchScheduled = false
 
   try:
@@ -623,7 +790,7 @@ proc exec*(
     return await conn.exec(sql, params, timeout = timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc query*(
     pool: PgPool,
@@ -654,7 +821,7 @@ proc query*(
     return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc queryEach*(
     pool: PgPool,
@@ -665,14 +832,18 @@ proc queryEach*(
     timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
   ## Execute a query with typed parameters using a pooled connection, invoking `callback` once per row.
+  ##
+  ## Row lifetime: the `Row` passed to `callback` is only valid for the
+  ## duration of that single invocation. To retain a row beyond the callback,
+  ## call `row.clone()` to get a detached copy.
   let conn = await pool.acquire()
   try:
     return await conn.queryEach(sql, params, callback, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
-proc queryOne*(
+proc queryRowOpt*(
     pool: PgPool,
     sql: string,
     params: seq[PgParam] = @[],
@@ -682,10 +853,23 @@ proc queryOne*(
   ## Execute a query and return the first row, or `none` if no rows.
   let qr = await pool.query(sql, params, resultFormat, timeout)
   if qr.rowCount > 0:
-    if qr.fields.len > 0 and qr.data.fields.len == 0:
-      qr.data.fields = qr.fields
-    return some(Row(data: qr.data, rowIdx: 0))
+    return some(initRow(qr.data, 0))
   return none(Row)
+
+proc queryRow*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[Row] {.async.} =
+  ## Execute a query and return the first row.
+  ## Raises `PgNoRowsError` if no rows are returned.
+  let row =
+    await pool.queryRowOpt(sql, params, resultFormat = resultFormat, timeout = timeout)
+  if row.isNone:
+    raise newException(PgNoRowsError, "Query returned no rows")
+  return row.get
 
 proc queryValue*(
     pool: PgPool,
@@ -694,13 +878,13 @@ proc queryValue*(
     timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
-  ## Raises `PgError` if no rows or the value is NULL.
+  ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
-    raise newException(PgError, "Query returned no rows")
-  let row = Row(data: qr.data, rowIdx: 0)
+    raise newException(PgNoRowsError, "Query returned no rows")
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
-    raise newException(PgError, "Query returned NULL")
+    raise newException(PgNullError, "Query returned NULL")
   return row.getStr(0)
 
 proc queryValue*[T](
@@ -711,13 +895,13 @@ proc queryValue*[T](
     timeout: Duration = ZeroDuration,
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
-  ## Raises `PgError` if no rows or the value is NULL.
+  ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
-    raise newException(PgError, "Query returned no rows")
-  let row = Row(data: qr.data, rowIdx: 0)
+    raise newException(PgNoRowsError, "Query returned no rows")
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
-    raise newException(PgError, "Query returned NULL")
+    raise newException(PgNullError, "Query returned NULL")
   return row.get(0, T)
 
 proc queryValueOpt*(
@@ -731,7 +915,7 @@ proc queryValueOpt*(
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return none(string)
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(string)
   return some(row.getStr(0))
@@ -748,7 +932,7 @@ proc queryValueOpt*[T](
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return none(T)
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(T)
   return some(row.get(0, T))
@@ -765,7 +949,7 @@ proc queryValueOrDefault*(
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return default
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
   return row.getStr(0)
@@ -783,7 +967,25 @@ proc queryValueOrDefault*[T](
   let qr = await pool.query(sql, params, timeout = timeout)
   if qr.rowCount == 0:
     return default
-  let row = Row(data: qr.data, rowIdx: 0)
+  let row = initRow(qr.data, 0)
+  if row.isNull(0):
+    return default
+  return row.get(0, T)
+
+proc queryValueOrDefault*[T](
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    default: T,
+    timeout: Duration = ZeroDuration,
+): Future[T] {.async.} =
+  ## Execute a query and return the first column of the first row as `T`,
+  ## inferring `T` from `default`.
+  ## Returns `default` if no rows or the value is NULL.
+  let qr = await pool.query(sql, params, timeout = timeout)
+  if qr.rowCount == 0:
+    return default
+  let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
   return row.get(0, T)
@@ -805,34 +1007,37 @@ proc queryColumn*(
     timeout: Duration = ZeroDuration,
 ): Future[seq[string]] {.async.} =
   ## Execute a query and return the first column of all rows as strings.
-  ## Raises PgTypeError if any value is NULL.
+  ## Raises `PgNullError` if any value is NULL.
   let qr = await pool.query(sql, params, timeout = timeout)
   for i in 0 ..< qr.rowCount:
-    let row = Row(data: qr.data, rowIdx: i)
+    let row = initRow(qr.data, i)
     if row.isNull(0):
-      raise newException(PgTypeError, "NULL value in column")
+      raise newException(PgNullError, "NULL value in column")
     result.add(row.getStr(0))
 
 proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.} =
-  ## Execute one or more SQL statements via simple query protocol using a pooled connection.
+  ## Execute one or more SQL statements via the simple query protocol using a
+  ## pooled connection. See ``PgConnection.simpleQuery`` for semantics —
+  ## multi-statement, no parameters, no plan cache.
   let conn = await pool.acquire()
   try:
     return await conn.simpleQuery(sql)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc simpleExec*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
-  ## Execute a SQL statement via simple query protocol using a pooled connection.
-  ## Returns the command result.
+  ## Execute a side-effect SQL command via the simple query protocol using a
+  ## pooled connection. See ``PgConnection.simpleExec`` for semantics — no
+  ## parameters, no plan cache, last command tag returned.
   let conn = await pool.acquire()
   try:
     return await conn.simpleExec(sql, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc execInTransaction*(
     pool: PgPool,
@@ -846,7 +1051,7 @@ proc execInTransaction*(
     return await conn.execInTransaction(sql, params, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc queryInTransaction*(
     pool: PgPool,
@@ -861,7 +1066,7 @@ proc queryInTransaction*(
     return await conn.queryInTransaction(sql, params, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc notify*(
     pool: PgPool,
@@ -875,7 +1080,7 @@ proc notify*(
     await conn.notify(channel, payload, timeout)
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction using a pooled connection.
@@ -946,7 +1151,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         raise `eSym`
     finally:
       await `resetSessionSym`(`poolSym`, `connIdent`)
-      `poolSym`.release(`connIdent`)
+      `connIdent`.release()
 
 template withPipeline*(pool: PgPool, pipeline, body: untyped) =
   ## Acquire a connection, create a Pipeline, execute body, then release.
@@ -957,7 +1162,7 @@ template withPipeline*(pool: PgPool, pipeline, body: untyped) =
     body
   finally:
     await pool.resetSession(conn)
-    pool.release(conn)
+    conn.release()
 
 proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close the pool: stop the maintenance loop, cancel all waiters, and close
@@ -997,7 +1202,13 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   while pool.idle.len > 0:
     let pc = pool.idle.popFirst()
     pool.metrics.closeCount.inc
-    try:
-      await pc.conn.close()
-    except CatchableError:
-      discard
+    await pool.tracedClose(pc.conn)
+
+  # Wait for any fire-and-forget closes spawned via closeNoWait so the server
+  # observes Terminate and fds are released before this proc returns. A late
+  # release() from another task may push more entries while we await, so loop
+  # with snapshot-and-clear to avoid discarding unfinished futures.
+  while pool.pendingCloses.len > 0:
+    let pending = pool.pendingCloses
+    pool.pendingCloses.setLen(0)
+    await allFutures(pending)

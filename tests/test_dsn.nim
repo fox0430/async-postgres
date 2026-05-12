@@ -163,6 +163,72 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslmode=bogus")
 
+  test "query param channel_binding":
+    for mode in ["disable", "prefer", "require"]:
+      let cfg = parseDsn("postgresql://host/db?channel_binding=" & mode)
+      case mode
+      of "disable":
+        check cfg.channelBinding == cbDisable
+      of "prefer":
+        check cfg.channelBinding == cbPrefer
+      of "require":
+        check cfg.channelBinding == cbRequire
+      else:
+        discard
+
+  test "channel_binding default is prefer":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.channelBinding == cbPrefer
+
+  test "ConnConfig zero init has cbPrefer":
+    let cfg = ConnConfig()
+    check cfg.channelBinding == cbPrefer
+
+  test "error: invalid channel_binding":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?channel_binding=bogus")
+
+  test "require_auth default is empty set":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.requireAuth == {}
+
+  test "ConnConfig zero init has empty requireAuth":
+    let cfg = ConnConfig()
+    check cfg.requireAuth == {}
+
+  test "query param require_auth single value":
+    let cases = {
+      "none": amNone,
+      "password": amPassword,
+      "md5": amMd5,
+      "scram-sha-256": amScramSha256,
+      "scram-sha-256-plus": amScramSha256Plus,
+    }
+    for (name, expected) in cases:
+      let cfg = parseDsn("postgresql://host/db?require_auth=" & name)
+      check cfg.requireAuth == {expected}
+
+  test "query param require_auth comma list":
+    let cfg =
+      parseDsn("postgresql://host/db?require_auth=scram-sha-256,scram-sha-256-plus")
+    check cfg.requireAuth == {amScramSha256, amScramSha256Plus}
+
+  test "query param require_auth tolerates whitespace":
+    let cfg = parseDsn("postgresql://host/db?require_auth=scram-sha-256,%20md5")
+    check cfg.requireAuth == {amScramSha256, amMd5}
+
+  test "keyword=value form require_auth":
+    let cfg = parseDsn("host=127.0.0.1 require_auth=md5,password")
+    check cfg.requireAuth == {amMd5, amPassword}
+
+  test "error: unknown require_auth method":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?require_auth=sha1")
+
+  test "error: empty entry in require_auth list":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?require_auth=md5,,password")
+
   test "error: invalid connect_timeout":
     expect PgError:
       discard parseDsn("postgresql://host/db?connect_timeout=abc")
@@ -277,6 +343,26 @@ suite "parseDsn":
   test "error: negative keepalives_count":
     expect PgError:
       discard parseDsn("postgresql://host/db?keepalives_count=-1")
+
+  test "max_message_size from URI DSN":
+    let cfg = parseDsn("postgresql://host/db?max_message_size=1048576")
+    check cfg.maxMessageSize == 1048576
+
+  test "max_message_size from keyword DSN":
+    let cfg = parseDsn("host=h dbname=d max_message_size=2097152")
+    check cfg.maxMessageSize == 2097152
+
+  test "max_message_size default is zero (use library default)":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.maxMessageSize == 0
+
+  test "error: invalid max_message_size value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_message_size=abc")
+
+  test "error: negative max_message_size":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_message_size=-1")
 
   test "error: sslrootcert file not found":
     expect PgError:
@@ -481,6 +567,14 @@ suite "parseDsn keyword=value":
   test "error: invalid sslmode":
     expect PgError:
       discard parseDsn("host=h sslmode=bogus")
+
+  test "channel_binding parameter":
+    let cfg = parseDsn("host=h channel_binding=require")
+    check cfg.channelBinding == cbRequire
+
+  test "error: invalid channel_binding":
+    expect PgError:
+      discard parseDsn("host=h channel_binding=bogus")
 
   test "error: invalid connect_timeout":
     expect PgError:

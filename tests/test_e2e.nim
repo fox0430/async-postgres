@@ -1,9 +1,13 @@
-import std/[unittest, options, strutils, tables, os, math, deques, sets, importutils]
+import
+  std/[unittest, options, strutils, tables, os, math, deques, importutils, net, json]
 from std/times import
-  DateTime, dateTime, mMar, mJun, mJan, utc, year, month, monthday, hour, minute,
+  DateTime, dateTime, mMar, mJun, mJan, mDec, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
 
 import ../async_postgres/[async_backend, pg_protocol, pg_types, pg_replication]
+
+when hasChronos:
+  import std/sets
 
 import ../async_postgres/pg_client {.all.}
 import ../async_postgres/pg_pool {.all.}
@@ -52,7 +56,7 @@ proc toBytes(s: string): seq[byte] =
 proc toString(b: seq[byte]): string =
   result = newString(b.len)
   if b.len > 0:
-    copyMem(addr result[0], unsafeAddr b[0], b.len)
+    copyMem(addr result[0], addr b[0], b.len)
 
 suite "E2E: Basic Connection":
   test "plain connection and close":
@@ -530,7 +534,7 @@ suite "E2E: Connection Pool":
         await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
       let conn = await pool.acquire()
       doAssert conn.state == csReady
-      pool.release(conn)
+      conn.release()
       await pool.close()
 
     waitFor t()
@@ -556,9 +560,9 @@ suite "E2E: Connection Pool":
       doAssert c1.state == csReady
       doAssert c2.state == csReady
       doAssert c3.state == csReady
-      pool.release(c1)
-      pool.release(c2)
-      pool.release(c3)
+      c1.release()
+      c2.release()
+      c3.release()
       await pool.close()
 
     waitFor t()
@@ -579,7 +583,7 @@ suite "E2E: Connection Pool":
       let conn1 = await pool.acquire()
       let pid1 = conn1.pid
       doAssert conn1.state == csReady
-      pool.release(conn1)
+      conn1.release()
 
       # Wait for maxLifetime to expire
       await sleepAsync(milliseconds(600))
@@ -590,7 +594,7 @@ suite "E2E: Connection Pool":
       doAssert conn2.state == csReady
       # The new connection should be different (different pid from server)
       doAssert conn2.pid != pid1
-      pool.release(conn2)
+      conn2.release()
 
       await pool.close()
 
@@ -611,7 +615,7 @@ suite "E2E: Connection Pool":
       # Create and release a connection so it sits idle
       let conn = await pool.acquire()
       doAssert conn.state == csReady
-      pool.release(conn)
+      conn.release()
 
       # Wait for idleTimeout + maintenance cycle
       await sleepAsync(milliseconds(500))
@@ -639,9 +643,9 @@ suite "E2E: Connection Pool":
       let c1 = await pool.acquire()
       let c2 = await pool.acquire()
       let c3 = await pool.acquire()
-      pool.release(c1)
-      pool.release(c2)
-      pool.release(c3)
+      c1.release()
+      c2.release()
+      c3.release()
       doAssert pool.idleCount == 3
 
       # Wait for idleTimeout + maintenance cycles
@@ -668,7 +672,7 @@ suite "E2E: Connection Pool":
 
       let conn1 = await pool.acquire()
       let pid1 = conn1.pid
-      pool.release(conn1)
+      conn1.release()
 
       # Wait for maxLifetime to expire
       await sleepAsync(milliseconds(400))
@@ -677,7 +681,7 @@ suite "E2E: Connection Pool":
       let conn2 = await pool.acquire()
       doAssert conn2.state == csReady
       doAssert conn2.pid != pid1
-      pool.release(conn2)
+      conn2.release()
 
       await pool.close()
 
@@ -696,7 +700,7 @@ suite "E2E: Connection Pool":
       )
 
       let conn1 = await pool.acquire()
-      pool.release(conn1)
+      conn1.release()
 
       # Wait for maxLifetime to expire and maintenance to clean up
       await sleepAsync(milliseconds(500))
@@ -725,12 +729,12 @@ suite "E2E: Connection Pool":
 
       let conn1 = await pool.acquire()
       let pid1 = conn1.pid
-      pool.release(conn1)
+      conn1.release()
 
       # Immediate re-acquire should return the same connection
       let conn2 = await pool.acquire()
       doAssert conn2.pid == pid1
-      pool.release(conn2)
+      conn2.release()
 
       await pool.close()
 
@@ -856,12 +860,14 @@ suite "E2E: Transaction":
         await conn.exec("CREATE TABLE test_tx_rb (id serial PRIMARY KEY, val text)")
 
       var raised = false
+      var shouldRaise = true
       try:
         conn.withTransaction:
           discard await conn.exec(
             "INSERT INTO test_tx_rb (val) VALUES ($1)", @[toPgParam("rollback_me")]
           )
-          raise newException(ValueError, "intentional error")
+          if shouldRaise:
+            raise newException(ValueError, "intentional error")
       except ValueError:
         raised = true
 
@@ -904,12 +910,14 @@ suite "E2E: Transaction":
         await pool.exec("CREATE TABLE test_ptx_rb (id serial PRIMARY KEY, val text)")
 
       var raised = false
+      var shouldRaise = true
       try:
         pool.withTransaction(conn):
           discard await conn.exec(
             "INSERT INTO test_ptx_rb (val) VALUES ($1)", @[toPgParam("pool_rollback")]
           )
-          raise newException(ValueError, "intentional error")
+          if shouldRaise:
+            raise newException(ValueError, "intentional error")
       except ValueError:
         raised = true
 
@@ -928,6 +936,7 @@ suite "E2E: Transaction":
       let killer = await connect(plainConfig())
 
       var raised = false
+      var shouldRaise = true
       try:
         conn.withTransaction:
           let pidRes = await conn.query("SELECT pg_backend_pid()")
@@ -938,7 +947,8 @@ suite "E2E: Transaction":
           )
           # Give the server a moment to terminate the backend
           await sleepAsync(milliseconds(100))
-          raise newException(ValueError, "original error")
+          if shouldRaise:
+            raise newException(ValueError, "original error")
       except ValueError as e:
         raised = true
         doAssert e.msg == "original error"
@@ -955,6 +965,7 @@ suite "E2E: Transaction":
       let killer = await connect(plainConfig())
 
       var raised = false
+      var shouldRaise = true
       try:
         pool.withTransaction(conn):
           let pidRes = await conn.query("SELECT pg_backend_pid()")
@@ -963,7 +974,8 @@ suite "E2E: Transaction":
             "SELECT pg_terminate_backend($1)", @[toPgParam(parseInt(pid).int32)]
           )
           await sleepAsync(milliseconds(100))
-          raise newException(ValueError, "original error")
+          if shouldRaise:
+            raise newException(ValueError, "original error")
       except ValueError as e:
         raised = true
         doAssert e.msg == "original error"
@@ -1224,6 +1236,7 @@ suite "E2E: Transaction":
       discard
         await conn.exec("CREATE TABLE test_sp_rb (id serial PRIMARY KEY, val text)")
 
+      var shouldRaise = true
       conn.withTransaction:
         discard await conn.exec(
           "INSERT INTO test_sp_rb (val) VALUES ($1)", @[toPgParam("before")]
@@ -1233,7 +1246,8 @@ suite "E2E: Transaction":
             discard await conn.exec(
               "INSERT INTO test_sp_rb (val) VALUES ($1)", @[toPgParam("inner")]
             )
-            raise newException(ValueError, "savepoint error")
+            if shouldRaise:
+              raise newException(ValueError, "savepoint error")
         except ValueError:
           discard
 
@@ -1253,6 +1267,7 @@ suite "E2E: Transaction":
       discard
         await conn.exec("CREATE TABLE test_sp_nest (id serial PRIMARY KEY, val text)")
 
+      var shouldRaise = true
       conn.withTransaction:
         conn.withSavepoint:
           discard await conn.exec(
@@ -1263,7 +1278,8 @@ suite "E2E: Transaction":
               discard await conn.exec(
                 "INSERT INTO test_sp_nest (val) VALUES ($1)", @[toPgParam("inner")]
               )
-              raise newException(ValueError, "inner error")
+              if shouldRaise:
+                raise newException(ValueError, "inner error")
           except ValueError:
             discard
 
@@ -1374,6 +1390,88 @@ suite "E2E: Transaction":
             inner()
 
     )
+
+  test "withTransaction skips ROLLBACK when COMMIT fails":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_commit_fail")
+      discard await conn.exec(
+        """
+        CREATE TABLE test_tx_commit_fail (
+          id int PRIMARY KEY,
+          ref_id int REFERENCES test_tx_commit_fail(id)
+            DEFERRABLE INITIALLY DEFERRED
+        )
+        """
+      )
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          discard await conn.exec("INSERT INTO test_tx_commit_fail VALUES (1, 999)")
+      except PgQueryError:
+        raised = true
+
+      doAssert raised
+      doAssert "COMMIT" in queries
+      doAssert "ROLLBACK" notin queries
+      doAssert conn.txStatus == tsIdle
+
+      conn.tracer = nil
+      discard await conn.exec("DROP TABLE test_tx_commit_fail")
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepoint skips ROLLBACK TO SAVEPOINT when outer transaction has ended":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      discard await conn.exec("BEGIN")
+      var raised = false
+      try:
+        conn.withSavepoint("sp_outer_done"):
+          # End the outer transaction from inside the savepoint, so the
+          # savepoint no longer exists by the time we raise.
+          discard await conn.exec("ROLLBACK")
+          raise newException(ValueError, "boom")
+      except ValueError:
+        raised = true
+
+      doAssert raised
+      doAssert "SAVEPOINT sp_outer_done" in queries
+      var hasRollbackToSp = false
+      for q in queries:
+        if q.startsWith("ROLLBACK TO SAVEPOINT"):
+          hasRollbackToSp = true
+          break
+      doAssert not hasRollbackToSp
+      doAssert conn.txStatus == tsIdle
+
+      conn.tracer = nil
+      await conn.close()
+
+    waitFor t()
 
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":
@@ -1568,14 +1666,14 @@ suite "E2E: COPY Protocol":
       discard
         await conn.exec("INSERT INTO test_copy_out VALUES (1, 'Alice'), (2, 'Bob')")
 
-      let result = await conn.copyOut("COPY test_copy_out TO STDOUT")
-      doAssert result.format == cfText
-      doAssert "COPY 2" in result.commandTag
-      doAssert result.data.len == 2
+      let r = await conn.copyOut("COPY test_copy_out TO STDOUT")
+      doAssert r.format == cfText
+      doAssert "COPY 2" in r.commandTag
+      doAssert r.data.len == 2
 
       # Each row is a tab-delimited line with trailing newline
-      doAssert result.data[0].toString() == "1\tAlice\n"
-      doAssert result.data[1].toString() == "2\tBob\n"
+      doAssert r.data[0].toString() == "1\tAlice\n"
+      doAssert r.data[1].toString() == "2\tBob\n"
 
       discard await conn.exec("DROP TABLE test_copy_out")
       await conn.close()
@@ -1635,9 +1733,9 @@ suite "E2E: COPY Protocol":
       discard await conn.exec("DROP TABLE IF EXISTS test_copy_out_empty")
       discard await conn.exec("CREATE TABLE test_copy_out_empty (id int, name text)")
 
-      let result = await conn.copyOut("COPY test_copy_out_empty TO STDOUT")
-      doAssert result.data.len == 0
-      doAssert "COPY 0" in result.commandTag
+      let r = await conn.copyOut("COPY test_copy_out_empty TO STDOUT")
+      doAssert r.data.len == 0
+      doAssert "COPY 0" in r.commandTag
       doAssert conn.state == csReady
 
       discard await conn.exec("DROP TABLE test_copy_out_empty")
@@ -1674,9 +1772,9 @@ suite "E2E: COPY Protocol":
         "INSERT INTO test_copy_out_large SELECT g FROM generate_series(1, 10000) AS g"
       )
 
-      let result = await conn.copyOut("COPY test_copy_out_large TO STDOUT")
-      doAssert result.data.len == 10000
-      doAssert "COPY 10000" in result.commandTag
+      let r = await conn.copyOut("COPY test_copy_out_large TO STDOUT")
+      doAssert r.data.len == 10000
+      doAssert "COPY 10000" in r.commandTag
 
       discard await conn.exec("DROP TABLE test_copy_out_large")
       await conn.close()
@@ -1718,11 +1816,11 @@ suite "E2E: COPY Protocol":
         "INSERT INTO test_copy_out_null VALUES (1, NULL), (NULL, 'Bob')"
       )
 
-      let result = await conn.copyOut("COPY test_copy_out_null TO STDOUT")
-      doAssert result.data.len == 2
+      let r = await conn.copyOut("COPY test_copy_out_null TO STDOUT")
+      doAssert r.data.len == 2
       # NULL is represented as \N in text format
-      doAssert result.data[0].toString() == "1\t\\N\n"
-      doAssert result.data[1].toString() == "\\N\tBob\n"
+      doAssert r.data[0].toString() == "1\t\\N\n"
+      doAssert r.data[1].toString() == "\\N\tBob\n"
 
       discard await conn.exec("DROP TABLE test_copy_out_null")
       await conn.close()
@@ -1790,11 +1888,10 @@ suite "E2E: COPY Protocol":
         "INSERT INTO test_copy_csv_out VALUES (1, 'Alice'), (2, 'Bob, Jr.')"
       )
 
-      let result =
-        await conn.copyOut("COPY test_copy_csv_out TO STDOUT WITH (FORMAT csv)")
-      doAssert result.data.len == 2
-      doAssert result.data[0].toString() == "1,Alice\n"
-      doAssert result.data[1].toString() == "2,\"Bob, Jr.\"\n"
+      let r = await conn.copyOut("COPY test_copy_csv_out TO STDOUT WITH (FORMAT csv)")
+      doAssert r.data.len == 2
+      doAssert r.data[0].toString() == "1,Alice\n"
+      doAssert r.data[1].toString() == "2,\"Bob, Jr.\"\n"
 
       discard await conn.exec("DROP TABLE test_copy_csv_out")
       await conn.close()
@@ -2788,7 +2885,7 @@ suite "E2E: Pool minSize Replenishment":
       doAssert conn.state == csReady
       let res = await conn.simpleQuery("SELECT 1")
       doAssert res[0].rows[0][0].get().toString() == "1"
-      pool.release(conn)
+      conn.release()
 
       await pool.close()
 
@@ -2846,6 +2943,68 @@ suite "E2E: Extended Type Roundtrip":
       doAssert got.year == 2025
       doAssert got.month == mJun
       doAssert got.monthday == 15
+      await conn.close()
+
+    waitFor t()
+
+  test "time roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm = PgTime(hour: 14, minute: 30, second: 45, microsecond: 123456)
+      let res = await conn.query("SELECT $1::time", @[toPgParam(tm)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTime(0)
+      doAssert got.hour == 14
+      doAssert got.minute == 30
+      doAssert got.second == 45
+      doAssert got.microsecond == 123456
+      await conn.close()
+
+    waitFor t()
+
+  test "timetz roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm =
+        PgTimeTz(hour: 14, minute: 30, second: 45, microsecond: 0, utcOffset: 18000)
+      let res = await conn.query("SELECT $1::timetz", @[toPgParam(tm)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTimeTz(0)
+      doAssert got.hour == 14
+      doAssert got.minute == 30
+      doAssert got.second == 45
+      doAssert got.utcOffset == 18000
+      await conn.close()
+
+    waitFor t()
+
+  test "date param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2025, mJun, 15, 0, 0, 0, zone = utc())
+      let res = await conn.query("SELECT $1::date", @[toPgDateParam(dt)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getDate(0)
+      doAssert got.year == 2025
+      doAssert got.month == mJun
+      doAssert got.monthday == 15
+      await conn.close()
+
+    waitFor t()
+
+  test "timestamptz roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2025, mMar, 15, 10, 30, 45, zone = utc())
+      let res = await conn.query("SELECT $1::timestamptz", @[toPgTimestampTzParam(dt)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTimestampTz(0)
+      doAssert got.utc().year == 2025
+      doAssert got.utc().month == mMar
+      doAssert got.utc().monthday == 15
+      doAssert got.utc().hour == 10
+      doAssert got.utc().minute == 30
+      doAssert got.utc().second == 45
       await conn.close()
 
     waitFor t()
@@ -2954,7 +3113,7 @@ suite "E2E: Pool Stress":
       var raised = false
       try:
         let conn2 = await pool.acquire()
-        pool.release(conn2)
+        conn2.release()
       except PgError as e:
         raised = true
         doAssert "timeout" in e.msg.toLowerAscii()
@@ -2962,7 +3121,7 @@ suite "E2E: Pool Stress":
       doAssert raised
 
       # Release and verify pool still works
-      pool.release(conn)
+      conn.release()
       let res = await pool.query("SELECT 1")
       doAssert res.rows.len == 1
       doAssert res.rows[0].getStr(0) == "1"
@@ -2990,7 +3149,7 @@ suite "E2E: Pool Stress":
       let conn = await pool.acquire()
       let pidRes = await conn.query("SELECT pg_backend_pid()")
       let pid = pidRes.rows[0].getInt(0)
-      pool.release(conn)
+      conn.release()
 
       # Kill the backend via a separate connection
       let killer = await connect(plainConfig())
@@ -3196,6 +3355,86 @@ suite "E2E: JSON and Numeric":
       let res = await conn.query("SELECT 99999999999999999999999999999::numeric")
       doAssert res.rows.len == 1
       doAssert $res.rows[0].getNumeric(0) == "99999999999999999999999999999"
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Money":
+  test "money binary param and binary result roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      for v in [
+        initPgMoney(0),
+        initPgMoney(123456),
+        initPgMoney(-123456),
+        initPgMoney(low(int64)),
+        initPgMoney(high(int64)),
+      ]:
+        let res =
+          await conn.query("SELECT $1::money", @[toPgParam(v)], resultFormat = rfBinary)
+        doAssert res.rows.len == 1
+        doAssert res.rows[0].getMoney(0) == v
+      await conn.close()
+
+    waitFor t()
+
+  test "money text result from server":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # Force C-locale formatting so the test is deterministic regardless of
+      # the server's lc_monetary setting.
+      discard await conn.exec("SET lc_monetary = 'C'")
+      let res = await conn.query("SELECT 1234.56::money")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getMoney(0) == initPgMoney(123456)
+      await conn.close()
+
+    waitFor t()
+
+  test "money stored in table":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_money")
+      discard await conn.exec("CREATE TABLE test_money (id int, val money)")
+      discard await conn.exec(
+        "INSERT INTO test_money VALUES (1, $1), (2, $2), (3, $3)",
+        @[
+          toPgParam(initPgMoney(0)),
+          toPgParam(initPgMoney(-123456)),
+          toPgParam(initPgMoney(99999999)),
+        ],
+      )
+      let res = await conn.query(
+        "SELECT val FROM test_money ORDER BY id", resultFormat = rfBinary
+      )
+      doAssert res.rows.len == 3
+      doAssert res.rows[0].getMoney(0) == initPgMoney(0)
+      doAssert res.rows[1].getMoney(0) == initPgMoney(-123456)
+      doAssert res.rows[2].getMoney(0) == initPgMoney(99999999)
+      discard await conn.exec("DROP TABLE test_money")
+      await conn.close()
+
+    waitFor t()
+
+  test "money NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::money", resultFormat = rfBinary)
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getMoneyOpt(0) == none(PgMoney)
+      await conn.close()
+
+    waitFor t()
+
+  test "money array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let values = @[initPgMoney(100), initPgMoney(-50), initPgMoney(999999)]
+      let res = await conn.query(
+        "SELECT $1::money[]", @[toPgParam(values)], resultFormat = rfBinary
+      )
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getMoneyArray(0) == values
       await conn.close()
 
     waitFor t()
@@ -3421,12 +3660,72 @@ suite "E2E: Binary Format":
       let params = @[toPgBinaryParam(dt)]
       let qr = await conn.query("SELECT $1::timestamp", params, resultFormat = rfBinary)
       doAssert qr.rows.len == 1
-      let result = qr.rows[0].getTimestamp(0)
-      doAssert result.year == 2024
-      doAssert result.month == mJan
-      doAssert result.monthday == 15
-      doAssert result.hour == 10
-      doAssert result.minute == 30
+      let r = qr.rows[0].getTimestamp(0)
+      doAssert r.year == 2024
+      doAssert r.month == mJan
+      doAssert r.monthday == 15
+      doAssert r.hour == 10
+      doAssert r.minute == 30
+      await conn.close()
+
+    waitFor t()
+
+  test "binary time param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm = PgTime(hour: 14, minute: 30, second: 45, microsecond: 123456)
+      let params = @[toPgBinaryParam(tm)]
+      let qr = await conn.query("SELECT $1::time", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getTime(0)
+      doAssert got == tm
+      await conn.close()
+
+    waitFor t()
+
+  test "binary timetz param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let tm =
+        PgTimeTz(hour: 14, minute: 30, second: 45, microsecond: 0, utcOffset: 18000)
+      let params = @[toPgBinaryParam(tm)]
+      let qr = await conn.query("SELECT $1::timetz", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getTimeTz(0)
+      doAssert got == tm
+      await conn.close()
+
+    waitFor t()
+
+  test "binary date param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
+      let params = @[toPgBinaryDateParam(dt)]
+      let qr = await conn.query("SELECT $1::date", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getDate(0)
+      doAssert got.year == 2024
+      doAssert got.month == mJan
+      doAssert got.monthday == 15
+      await conn.close()
+
+    waitFor t()
+
+  test "binary timestamptz param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+      let params = @[toPgBinaryTimestampTzParam(dt)]
+      let qr =
+        await conn.query("SELECT $1::timestamptz", params, resultFormat = rfBinary)
+      doAssert qr.rows.len == 1
+      let got = qr.rows[0].getTimestampTz(0)
+      doAssert got.year == 2024
+      doAssert got.month == mJan
+      doAssert got.monthday == 15
+      doAssert got.hour == 10
+      doAssert got.minute == 30
       await conn.close()
 
     waitFor t()
@@ -3864,6 +4163,88 @@ when hasChronos:
 
       waitFor t()
 
+    test "listenReconnect config defaults":
+      proc t() {.async.} =
+        let conn = await connect(plainConfig())
+        doAssert conn.listenReconnectMaxAttempts == 10
+        doAssert conn.listenReconnectMaxBackoff == 30
+        await conn.close()
+
+      waitFor t()
+
+    test "listenReconnect config setters":
+      proc t() {.async.} =
+        let conn = await connect(plainConfig())
+        conn.listenReconnectMaxAttempts = 3
+        conn.listenReconnectMaxBackoff = 5
+        doAssert conn.listenReconnectMaxAttempts == 3
+        doAssert conn.listenReconnectMaxBackoff == 5
+        # 0 = unlimited (sentinel)
+        conn.listenReconnectMaxAttempts = 0
+        doAssert conn.listenReconnectMaxAttempts == 0
+        await conn.close()
+
+      waitFor t()
+
+    test "auto-reconnect honors custom maxAttempts setting":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        listener.listenReconnectMaxAttempts = 2
+        listener.listenReconnectMaxBackoff = 1
+
+        var reconnected = false
+        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+          reconnected = true
+
+        await listener.listen("reconn_custom")
+
+        let killer = await connect(plainConfig())
+        try:
+          discard await killer.exec(
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
+          )
+        except PgError:
+          discard
+        await killer.close()
+
+        # First retry runs after backoff=1s; reconnect should succeed.
+        await sleepAsync(milliseconds(3000))
+        doAssert reconnected
+        doAssert listener.state == csListening
+
+        await listener.close()
+
+      waitFor t()
+
+    test "auto-reconnect with unlimited attempts (maxAttempts=0)":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        listener.listenReconnectMaxAttempts = 0 # unlimited
+        listener.listenReconnectMaxBackoff = 1
+
+        var reconnected = false
+        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+          reconnected = true
+
+        await listener.listen("reconn_unlimited")
+
+        let killer = await connect(plainConfig())
+        try:
+          discard await killer.exec(
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
+          )
+        except PgError:
+          discard
+        await killer.close()
+
+        await sleepAsync(milliseconds(3000))
+        doAssert reconnected
+        doAssert listener.state == csListening
+
+        await listener.close()
+
+      waitFor t()
+
     test "waitNotification fails on close":
       proc t() {.async.} =
         let listener = await connect(plainConfig())
@@ -4066,7 +4447,6 @@ suite "E2E: COPY IN Stream":
           "1\n".toBytes()
         else:
           raise newException(CatchableError, "callback failed")
-          newSeq[byte]()
 
       var raised = false
       try:
@@ -4152,6 +4532,260 @@ suite "E2E: COPY IN Stream":
       doAssert info.columnFormats[1] == 0'i16
 
       discard await conn.exec("DROP TABLE test_copyin_info")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: COPY Failure Recovery":
+  test "copyIn bad data inside txn: rollback recovers and next query works":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_fail_txn")
+      discard await conn.exec("CREATE TABLE test_copy_fail_txn (id int, name text)")
+
+      discard await conn.exec("BEGIN")
+      doAssert conn.txStatus == tsInTransaction
+
+      var raised = false
+      try:
+        # "abc" is not a valid int4 -> server raises invalid_text_representation
+        discard await conn.copyIn(
+          "COPY test_copy_fail_txn FROM STDIN", @["abc\tAlice\n".toBytes()]
+        )
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsInFailedTransaction
+
+      # Any query in a failed txn errors until ROLLBACK
+      var stillFailed = false
+      try:
+        discard await conn.query("SELECT 1")
+      except PgError:
+        stillFailed = true
+      doAssert stillFailed
+      doAssert conn.txStatus == tsInFailedTransaction
+
+      discard await conn.exec("ROLLBACK")
+      doAssert conn.txStatus == tsIdle
+
+      let res = await conn.query("SELECT 1")
+      doAssert res.rows[0].getStr(0) == "1"
+
+      let cnt = await conn.query("SELECT count(*) FROM test_copy_fail_txn")
+      doAssert cnt.rows[0].getStr(0) == "0"
+
+      discard await conn.exec("DROP TABLE test_copy_fail_txn")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyIn invalid SQL inside txn: rollback recovers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("BEGIN")
+      doAssert conn.txStatus == tsInTransaction
+
+      var raised = false
+      try:
+        discard await conn.copyIn(
+          "COPY nonexistent_table_xyz FROM STDIN", @["1\ttest\n".toBytes()]
+        )
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsInFailedTransaction
+
+      discard await conn.exec("ROLLBACK")
+      doAssert conn.txStatus == tsIdle
+
+      let res = await conn.query("SELECT 42")
+      doAssert res.rows[0].getStr(0) == "42"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream callback error inside txn: rollback recovers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_fail_stream_txn")
+      discard
+        await conn.exec("CREATE TABLE test_copy_fail_stream_txn (id int, name text)")
+
+      discard await conn.exec("BEGIN")
+      doAssert conn.txStatus == tsInTransaction
+      discard
+        await conn.exec("INSERT INTO test_copy_fail_stream_txn VALUES (1, 'pre-copy')")
+
+      var callCount = 0
+      let cb = makeCopyInCallback:
+        inc callCount
+        if callCount == 1:
+          "1\tfirst\n".toBytes()
+        else:
+          raise newException(CatchableError, "stream aborted")
+
+      var raised = false
+      try:
+        discard await conn.copyInStream("COPY test_copy_fail_stream_txn FROM STDIN", cb)
+      except CatchableError as e:
+        raised = true
+        doAssert "stream aborted" in e.msg
+      doAssert raised
+      doAssert conn.state == csReady
+      # CopyFail inside txn aborts the transaction
+      doAssert conn.txStatus == tsInFailedTransaction
+
+      discard await conn.exec("ROLLBACK")
+      doAssert conn.txStatus == tsIdle
+
+      # Table was created + pre-copy row inserted, both rolled back
+      let cnt = await conn.query("SELECT count(*) FROM test_copy_fail_stream_txn")
+      doAssert cnt.rows[0].getStr(0) == "0"
+
+      discard await conn.exec("DROP TABLE test_copy_fail_stream_txn")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyOut invalid SQL inside txn: rollback recovers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("BEGIN")
+      doAssert conn.txStatus == tsInTransaction
+
+      var raised = false
+      try:
+        discard await conn.copyOut("COPY nonexistent_table_xyz TO STDOUT")
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsInFailedTransaction
+
+      discard await conn.exec("ROLLBACK")
+      doAssert conn.txStatus == tsIdle
+
+      let res = await conn.query("SELECT 7")
+      doAssert res.rows[0].getStr(0) == "7"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "copyOutStream callback error inside txn: rollback recovers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_out_fail_txn")
+      discard await conn.exec("CREATE TABLE test_copy_out_fail_txn (id int)")
+      discard await conn.exec(
+        "INSERT INTO test_copy_out_fail_txn SELECT g FROM generate_series(1, 200) AS g"
+      )
+
+      discard await conn.exec("BEGIN")
+      doAssert conn.txStatus == tsInTransaction
+
+      var chunkCount = 0
+      let failingCb = makeCopyOutCallback:
+        inc chunkCount
+        raise newException(CatchableError, "out callback failed")
+
+      var raised = false
+      try:
+        discard
+          await conn.copyOutStream("COPY test_copy_out_fail_txn TO STDOUT", failingCb)
+      except CatchableError as e:
+        raised = true
+        doAssert "out callback failed" in e.msg
+      doAssert raised
+      doAssert chunkCount >= 1
+      doAssert conn.state == csReady
+      # COPY OUT has no client->server abort; server completes normally so tx
+      # remains in-transaction even though the client callback failed.
+      doAssert conn.txStatus == tsInTransaction
+
+      discard await conn.exec("ROLLBACK")
+      doAssert conn.txStatus == tsIdle
+
+      let res = await conn.query("SELECT 1")
+      doAssert res.rows[0].getStr(0) == "1"
+
+      discard await conn.exec("DROP TABLE test_copy_out_fail_txn")
+      await conn.close()
+
+    waitFor t()
+
+  test "cursor works after copyIn failure (portal state clean)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_portal")
+      discard await conn.exec("CREATE TABLE test_copy_portal (id int)")
+      discard await conn.exec(
+        "INSERT INTO test_copy_portal SELECT g FROM generate_series(1, 30) AS g"
+      )
+
+      var raised = false
+      try:
+        discard await conn.copyIn(
+          "COPY test_copy_portal FROM STDIN", @["not_an_int\n".toBytes()]
+        )
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      # Subsequent portal-based cursor op must succeed
+      let cursor = await conn.openCursor(
+        "SELECT id FROM test_copy_portal ORDER BY id", chunkSize = 10
+      )
+      var total = 0
+      while true:
+        let chunk = await cursor.fetchNext()
+        if chunk.len == 0:
+          break
+        total += chunk.len
+      doAssert total == 30
+      doAssert conn.state == csReady
+
+      discard await conn.exec("DROP TABLE test_copy_portal")
+      await conn.close()
+
+    waitFor t()
+
+  test "cursor works after copyOut failure (portal state clean)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_out_portal")
+      discard await conn.exec("CREATE TABLE test_copy_out_portal (id int)")
+      discard await conn.exec(
+        "INSERT INTO test_copy_out_portal SELECT g FROM generate_series(1, 15) AS g"
+      )
+
+      var raised = false
+      try:
+        discard await conn.copyOut("COPY nonexistent_portal_tbl TO STDOUT")
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      let cursor = await conn.openCursor(
+        "SELECT id FROM test_copy_out_portal ORDER BY id", chunkSize = 5
+      )
+      var total = 0
+      while true:
+        let chunk = await cursor.fetchNext()
+        if chunk.len == 0:
+          break
+        total += chunk.len
+      doAssert total == 15
+
+      discard await conn.exec("DROP TABLE test_copy_out_portal")
       await conn.close()
 
     waitFor t()
@@ -4443,10 +5077,11 @@ suite "E2E: Column Name Access":
 
     waitFor t()
 
-  test "name-based queryOne accessors":
+  test "name-based queryRowOpt accessors":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let rowOpt = await conn.queryOne("SELECT 99::int8 AS big, 'hello'::text AS msg")
+      let rowOpt =
+        await conn.queryRowOpt("SELECT 99::int8 AS big, 'hello'::text AS msg")
       doAssert rowOpt.isSome
       let row = rowOpt.get
       doAssert row.getInt64("big") == 99'i64
@@ -4484,10 +5119,10 @@ suite "E2E: Column Name Access":
     waitFor t()
 
 suite "E2E: Convenience Query Methods":
-  test "queryOne returns first row":
+  test "queryRowOpt returns first row":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let row = await conn.queryOne("SELECT 1 AS a, 'hello' AS b")
+      let row = await conn.queryRowOpt("SELECT 1 AS a, 'hello' AS b")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "1"
       doAssert row.get.getStr(1) == "hello"
@@ -4495,11 +5130,34 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "queryOne returns none for empty result":
+  test "queryRowOpt returns none for empty result":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let row = await conn.queryOne("SELECT 1 WHERE false")
+      let row = await conn.queryRowOpt("SELECT 1 WHERE false")
       doAssert row.isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "queryRow returns first row":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let row = await conn.queryRow("SELECT 1 AS a, 'hello' AS b")
+      doAssert row.getStr(0) == "1"
+      doAssert row.getStr(1) == "hello"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryRow raises on no rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.queryRow("SELECT 1 WHERE false")
+      except PgNoRowsError:
+        raised = true
+      doAssert raised
       await conn.close()
 
     waitFor t()
@@ -4519,7 +5177,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue("SELECT 1 WHERE false")
-      except PgError:
+      except PgNoRowsError:
         raised = true
       doAssert raised
       await conn.close()
@@ -4532,7 +5190,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue("SELECT NULL::text")
-      except PgError:
+      except PgNullError:
         raised = true
       doAssert raised
       await conn.close()
@@ -4588,7 +5246,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue(int32, "SELECT 1 WHERE false")
-      except PgError:
+      except PgNoRowsError:
         raised = true
       doAssert raised
       await conn.close()
@@ -4601,7 +5259,7 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryValue(int64, "SELECT NULL::int8")
-      except PgError:
+      except PgNullError:
         raised = true
       doAssert raised
       await conn.close()
@@ -4616,6 +5274,17 @@ suite "E2E: Convenience Query Methods":
       doAssert val == -1'i64
       let val2 = await conn.queryValueOrDefault(int64, "SELECT 99", default = 0'i64)
       doAssert val2 == 99'i64
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOrDefault infers type from default":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let val = await conn.queryValueOrDefault("SELECT 1 WHERE false", default = -1'i64)
+      doAssert val == -1'i64
+      let val2 = await conn.queryValueOrDefault("SELECT 42", default = 0'i32)
+      doAssert val2 == 42'i32
       await conn.close()
 
     waitFor t()
@@ -4718,17 +5387,17 @@ suite "E2E: Convenience Query Methods":
       var raised = false
       try:
         discard await conn.queryColumn("SELECT NULL::text")
-      except PgTypeError:
+      except PgNullError:
         raised = true
       doAssert raised
       await conn.close()
 
     waitFor t()
 
-  test "queryOne returns only first row from multiple":
+  test "queryRowOpt returns only first row from multiple":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
-      let row = await conn.queryOne("SELECT generate_series(10,12)::text AS v")
+      let row = await conn.queryRowOpt("SELECT generate_series(10,12)::text AS v")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "10"
       await conn.close()
@@ -4754,23 +5423,60 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "queryOne with params":
+  test "queryRowOpt with params":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let row =
-        await conn.queryOne("SELECT $1::int + $2::int", @[3.toPgParam, 4.toPgParam])
+        await conn.queryRowOpt("SELECT $1::int + $2::int", @[3.toPgParam, 4.toPgParam])
       doAssert row.isSome
       doAssert row.get.getStr(0) == "7"
       await conn.close()
 
     waitFor t()
 
-  test "pool queryOne":
+  test "query Row survives subsequent queries (lifetime bug)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr1 = await conn.query("SELECT 'x'")
+      let qr2 = await conn.query("SELECT 'y'")
+      doAssert qr1.rowCount == 1
+      doAssert qr2.rowCount == 1
+      let row1 = initRow(qr1.data, 0)
+      let row2 = initRow(qr2.data, 0)
+      doAssert row1.getStr(0) == "x", "qr1 data was invalidated by qr2"
+      doAssert row2.getStr(0) == "y"
+      await conn.close()
+
+    waitFor t()
+
+  test "pool queryRowOpt":
     proc t() {.async.} =
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
-      let row = await pool.queryOne("SELECT 'pooled'")
+      let row = await pool.queryRowOpt("SELECT 'pooled'")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "pooled"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryRow":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let row = await pool.queryRow("SELECT 'pooled' AS v")
+      doAssert row.getStr("v") == "pooled"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryRow raises on no rows":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryRow("SELECT 1 WHERE false")
+      except PgNoRowsError:
+        raised = true
+      doAssert raised
       await pool.close()
 
     waitFor t()
@@ -4780,6 +5486,32 @@ suite "E2E: Convenience Query Methods":
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
       let val = await pool.queryValue("SELECT 99")
       doAssert val == "99"
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue raises on no rows":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue("SELECT 1 WHERE false")
+      except PgNoRowsError:
+        raised = true
+      doAssert raised
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue raises on NULL":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue("SELECT NULL::text")
+      except PgNullError:
+        raised = true
+      doAssert raised
       await pool.close()
 
     waitFor t()
@@ -4833,6 +5565,32 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "pool queryValue with typedesc raises on no rows":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue(int32, "SELECT 1 WHERE false")
+      except PgNoRowsError:
+        raised = true
+      doAssert raised
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValue with typedesc raises on NULL":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      var raised = false
+      try:
+        discard await pool.queryValue(int64, "SELECT NULL::int8")
+      except PgNullError:
+        raised = true
+      doAssert raised
+      await pool.close()
+
+    waitFor t()
+
   test "pool queryValueOrDefault with typedesc":
     proc t() {.async.} =
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
@@ -4840,6 +5598,17 @@ suite "E2E: Convenience Query Methods":
         await pool.queryValueOrDefault(int32, "SELECT 1 WHERE false", default = -1'i32)
       doAssert val == -1'i32
       let val2 = await pool.queryValueOrDefault(int32, "SELECT 7", default = 0'i32)
+      doAssert val2 == 7'i32
+      await pool.close()
+
+    waitFor t()
+
+  test "pool queryValueOrDefault infers type from default":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 2))
+      let val = await pool.queryValueOrDefault("SELECT 1 WHERE false", default = -1'i32)
+      doAssert val == -1'i32
+      let val2 = await pool.queryValueOrDefault("SELECT 7", default = 0'i32)
       doAssert val2 == 7'i32
       await pool.close()
 
@@ -5401,6 +6170,300 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: PgParamInline overload roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_pipe")
+      discard
+        await conn.exec("CREATE TABLE test_inline_pipe (id serial PRIMARY KEY, v int)")
+
+      let p = newPipeline(conn)
+      for i in 0 ..< 5:
+        p.addExec(
+          "INSERT INTO test_inline_pipe (v) VALUES ($1)", [i.int32.toPgParamInline]
+        )
+      p.addQuery("SELECT v FROM test_inline_pipe ORDER BY id")
+      let results = await p.execute()
+      doAssert results.len == 6
+      for i in 0 ..< 5:
+        doAssert results[i].commandResult == "INSERT 0 1"
+      let qr = results[5].queryResult
+      doAssert qr.rows.len == 5
+      for i in 0 ..< 5:
+        doAssert qr.rows[i].getStr(0) == $i
+
+      discard await conn.exec("DROP TABLE test_inline_pipe")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline and PgParam overloads can be mixed in one pipeline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_mixed_pipe")
+      discard await conn.exec(
+        "CREATE TABLE test_mixed_pipe (id serial PRIMARY KEY, v int, s text)"
+      )
+
+      let p = newPipeline(conn)
+      # inline path
+      p.addExec(
+        "INSERT INTO test_mixed_pipe (v, s) VALUES ($1, $2)",
+        [1.int32.toPgParamInline, "from-inline".toPgParamInline],
+      )
+      # legacy path
+      p.addExec(
+        "INSERT INTO test_mixed_pipe (v, s) VALUES ($1, $2)",
+        @[toPgParam(2'i32), toPgParam("from-legacy")],
+      )
+      p.addQuery("SELECT v, s FROM test_mixed_pipe ORDER BY id")
+      let results = await p.execute()
+      doAssert results.len == 3
+      let rows = results[2].queryResult.rows
+      doAssert rows.len == 2
+      doAssert rows[0].getStr(0) == "1"
+      doAssert rows[0].getStr(1) == "from-inline"
+      doAssert rows[1].getStr(0) == "2"
+      doAssert rows[1].getStr(1) == "from-legacy"
+
+      discard await conn.exec("DROP TABLE test_mixed_pipe")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline NULL via Option":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_null")
+      discard
+        await conn.exec("CREATE TABLE test_inline_null (id serial PRIMARY KEY, v int)")
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_inline_null (v) VALUES ($1)", [none(int32).toPgParamInline]
+      )
+      p.addQuery("SELECT v FROM test_inline_null ORDER BY id")
+      let results = await p.execute()
+      doAssert results[1].queryResult.rows[0].isNull(0)
+
+      discard await conn.exec("DROP TABLE test_inline_null")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline overflow path (long string)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_overflow")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_overflow (id serial PRIMARY KEY, s text)"
+      )
+
+      let long = "abcdefghijklmnopqrstuvwxyz0123456789" # 36 chars → overflow
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_inline_overflow (s) VALUES ($1)", [long.toPgParamInline]
+      )
+      p.addQuery("SELECT s FROM test_inline_overflow")
+      let results = await p.execute()
+      doAssert results[1].queryResult.rows[0].getStr(0) == long
+
+      discard await conn.exec("DROP TABLE test_inline_overflow")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline large overflow (16KB single value)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_large")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_large (id serial PRIMARY KEY, s text)"
+      )
+
+      # 16 KB payload — well beyond PgInlineBufSize, exercises a single large
+      # copy into the SoA inlineData buffer.
+      var big = newStringOfCap(16 * 1024)
+      for i in 0 ..< 16 * 1024:
+        big.add char(ord('a') + (i mod 26))
+      let p = newPipeline(conn)
+      p.addExec("INSERT INTO test_inline_large (s) VALUES ($1)", [big.toPgParamInline])
+      p.addQuery("SELECT s FROM test_inline_large")
+      let results = await p.execute()
+      doAssert results[0].commandResult == "INSERT 0 1"
+      doAssert results[1].queryResult.rows[0].getStr(0) == big
+
+      discard await conn.exec("DROP TABLE test_inline_large")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline many large overflows stress SoA reallocation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_inline_stress")
+      discard await conn.exec(
+        "CREATE TABLE test_inline_stress (id serial PRIMARY KEY, s text)"
+      )
+
+      # 50 × ~2 KB values across 50 ops in one pipeline. Each value is unique
+      # so a bug in SoA offset accounting (e.g. slice aliasing, reuse of stale
+      # offsets after inlineData grows) surfaces as a mismatched readback.
+      let numOps = 50
+      let valueSize = 2 * 1024
+      var expected = newSeq[string](numOps)
+      let p = newPipeline(conn)
+      for i in 0 ..< numOps:
+        var s = newStringOfCap(valueSize)
+        # Prefix with the index so every value is distinct and order-sensitive.
+        s.add "op" & $i & ":"
+        while s.len < valueSize:
+          s.add char(ord('a') + ((i + s.len) mod 26))
+        expected[i] = s
+        p.addExec("INSERT INTO test_inline_stress (s) VALUES ($1)", [s.toPgParamInline])
+      p.addQuery("SELECT s FROM test_inline_stress ORDER BY id")
+      let results = await p.execute()
+      doAssert results.len == numOps + 1
+      for i in 0 ..< numOps:
+        doAssert results[i].commandResult == "INSERT 0 1"
+      let rows = results[numOps].queryResult.rows
+      doAssert rows.len == numOps
+      for i in 0 ..< numOps:
+        doAssert rows[i].getStr(0) == expected[i]
+
+      discard await conn.exec("DROP TABLE test_inline_stress")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline empty params on param-less SQL":
+    # Edge case: caller reaches the inline overload with zero params (e.g. a
+    # SQL that takes no bound parameters). executeImpl builds an empty
+    # openArray via `toOpenArray(start, start-1)`; regression test that the
+    # Bind message still goes out cleanly and the query round-trips.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p = newPipeline(conn)
+      let empty: seq[PgParamInline] = @[]
+      p.addQuery("SELECT 42", empty)
+      p.addExec("SELECT 1", empty)
+      let results = await p.execute()
+      doAssert results.len == 2
+      doAssert results[0].queryResult.rows[0].getStr(0) == "42"
+      doAssert results[1].commandResult == "SELECT 1"
+      await conn.close()
+
+    waitFor t()
+
+  test "exec: PgParamInline overload roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_exec_inline")
+      discard
+        await conn.exec("CREATE TABLE test_exec_inline (id serial PRIMARY KEY, v int)")
+
+      # Multi-value INSERT (the benchmark workload): 100 params in one exec.
+      var sql = "INSERT INTO test_exec_inline (v) VALUES "
+      var params = newSeqOfCap[PgParamInline](100)
+      for j in 0 ..< 100:
+        if j > 0:
+          sql.add ","
+        sql.add "($" & $(j + 1) & ")"
+        params.add j.int32.toPgParamInline
+      let cr = await conn.exec(sql, params)
+      doAssert cr.affectedRows == 100
+
+      let qr =
+        await conn.query("SELECT count(*)::int4, max(v)::int4 FROM test_exec_inline")
+      doAssert qr.rows[0].getStr(0) == "100"
+      doAssert qr.rows[0].getStr(1) == "99"
+
+      discard await conn.exec("DROP TABLE test_exec_inline")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated with PgParamInline roundtrip":
+    # Covers the inline path through executeIsolatedImpl (per-op SYNC) and
+    # its concurrent send/recv scheduling under chronos. Mixes inline and
+    # legacy params across ops so both code paths in the op loop execute.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_iso_inline")
+      discard await conn.exec(
+        "CREATE TABLE test_iso_inline (id serial PRIMARY KEY, v int, s text)"
+      )
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_iso_inline (v, s) VALUES ($1, $2)",
+        [10.int32.toPgParamInline, "inline".toPgParamInline],
+      )
+      p.addExec(
+        "INSERT INTO test_iso_inline (v, s) VALUES ($1, $2)",
+        @[toPgParam(20'i32), toPgParam("legacy")],
+      )
+      p.addQuery(
+        "SELECT v, s FROM test_iso_inline WHERE v > $1 ORDER BY id",
+        [5.int32.toPgParamInline],
+      )
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      for e in ir.errors:
+        doAssert e == nil
+      doAssert ir.results[0].commandResult == "INSERT 0 1"
+      doAssert ir.results[1].commandResult == "INSERT 0 1"
+      let rows = ir.results[2].queryResult.rows
+      doAssert rows.len == 2
+      doAssert rows[0].getStr(0) == "10"
+      doAssert rows[0].getStr(1) == "inline"
+      doAssert rows[1].getStr(0) == "20"
+      doAssert rows[1].getStr(1) == "legacy"
+
+      discard await conn.exec("DROP TABLE test_iso_inline")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated with PgParamInline isolates per-op errors":
+    # Confirms that per-op SYNC still provides error isolation when ops use
+    # the inline overload: a failing inline op must not abort subsequent
+    # inline ops, and the connection must remain usable afterwards.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_iso_inline_err")
+      discard await conn.exec(
+        "CREATE TABLE test_iso_inline_err (id serial PRIMARY KEY, v int NOT NULL)"
+      )
+
+      let p = newPipeline(conn)
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [1.int32.toPgParamInline]
+      )
+      # NULL inline param violates NOT NULL — isolated error.
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [none(int32).toPgParamInline]
+      )
+      p.addExec(
+        "INSERT INTO test_iso_inline_err (v) VALUES ($1)", [3.int32.toPgParamInline]
+      )
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert ir.errors[2] == nil # not aborted
+
+      doAssert conn.state == csReady
+      let qr = await conn.query("SELECT v FROM test_iso_inline_err ORDER BY id")
+      doAssert qr.rowCount == 2
+      doAssert qr.rows[0].getStr(0) == "1"
+      doAssert qr.rows[1].getStr(0) == "3"
+
+      discard await conn.exec("DROP TABLE test_iso_inline_err")
+      await conn.close()
+
+    waitFor t()
+
   test "pipeline: empty pipeline":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -5408,6 +6471,128 @@ suite "E2E: execInTransaction / queryInTransaction":
       let p = newPipeline(conn)
       let results = await p.execute()
       doAssert results.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: reset clears queued ops and allows reuse":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT $1::int4", @[toPgParam(1'i32)])
+      p.addQuery("SELECT $1::int4", @[toPgParam(2'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 2
+
+      # Without reset, queued ops would be executed again.
+      p.reset()
+      let r0 = await p.execute()
+      doAssert r0.len == 0
+
+      # Reused instance is healthy for a brand-new batch.
+      p.addQuery("SELECT $1::text", @[toPgParam("reused")])
+      let r2 = await p.execute()
+      doAssert r2.len == 1
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "reused"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: reset on empty pipeline is a no-op":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn)
+      p.reset()
+      p.reset()
+      let results = await p.execute()
+      doAssert results.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: autoReset clears state after execute":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn, autoReset = true)
+      p.addQuery("SELECT $1::int4", @[toPgParam(10'i32)])
+      p.addQuery("SELECT $1::int4", @[toPgParam(20'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 2
+
+      # After the first execute(), autoReset has cleared queued ops, so
+      # calling execute() again produces an empty result without replaying.
+      let r0 = await p.execute()
+      doAssert r0.len == 0
+
+      # Same instance is safe to reuse for a new batch.
+      p.addQuery("SELECT $1::text", @[toPgParam("auto")])
+      let r2 = await p.execute()
+      doAssert r2.len == 1
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "auto"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: autoReset clears state after executeIsolated (incl. on error)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn, autoReset = true)
+      p.addQuery("SELECT 1::int4")
+      p.addQuery("SELECT * FROM __definitely_missing_table__")
+      p.addQuery("SELECT 2::int4")
+      let ir = await p.executeIsolated()
+      doAssert ir.results.len == 3
+      doAssert ir.errors.len == 3
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert ir.errors[2] == nil
+
+      # After executeIsolated, autoReset should have cleared queued ops.
+      let ir0 = await p.executeIsolated()
+      doAssert ir0.results.len == 0
+      doAssert ir0.errors.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: autoReset clears state when execute raises":
+    # execute() uses a single SYNC, so a failing op aborts the batch and the
+    # await re-raises. Confirms the finally-path reset runs on raise.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let p = newPipeline(conn, autoReset = true)
+      p.addExec("SELECT 1")
+      p.addExec("INVALID SQL THAT WILL FAIL")
+      p.addExec("SELECT 2")
+      var gotError = false
+      try:
+        discard await p.execute()
+      except PgError:
+        gotError = true
+      doAssert gotError
+
+      # Connection should still be usable after the error.
+      doAssert conn.state == csReady
+
+      # autoReset must have cleared queued ops even though execute() raised.
+      let r0 = await p.execute()
+      doAssert r0.len == 0
+
+      # Reused instance is healthy for a brand-new batch.
+      p.addQuery("SELECT $1::int4", @[toPgParam(42'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 1
+      doAssert r1[0].queryResult.rows[0].getStr(0) == "42"
 
       await conn.close()
 
@@ -5806,16 +6991,16 @@ suite "E2E: Pipelined Pool":
 
     waitFor t()
 
-  test "pipelined pool: queryOne works":
+  test "pipelined pool: queryRowOpt works":
     proc t() {.async.} =
       let pool = await newPool(
         PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
       )
-      let row = await pool.queryOne("SELECT 42::int4 AS answer")
+      let row = await pool.queryRowOpt("SELECT 42::int4 AS answer")
       doAssert row.isSome
       doAssert row.get.getStr(0) == "42"
 
-      let empty = await pool.queryOne("SELECT 1 WHERE false")
+      let empty = await pool.queryRowOpt("SELECT 1 WHERE false")
       doAssert empty.isNone
 
       await pool.close()
@@ -6018,6 +7203,21 @@ suite "E2E: queryDirect / execDirect":
 
     waitFor t()
 
+  test "queryDirect Row survives subsequent queries (lifetime bug)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr1 = await conn.queryDirect("SELECT $1::text", "x")
+      let qr2 = await conn.queryDirect("SELECT $1::text", "y")
+      doAssert qr1.rowCount == 1
+      doAssert qr2.rowCount == 1
+      let row1 = initRow(qr1.data, 0)
+      let row2 = initRow(qr2.data, 0)
+      doAssert row1.getStr(0) == "x", "qr1 data was invalidated by qr2"
+      doAssert row2.getStr(0) == "y"
+      await conn.close()
+
+    waitFor t()
+
   test "execDirect INSERT and UPDATE":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -6156,6 +7356,26 @@ suite "E2E: queryEach":
       )
       doAssert not called
       doAssert rowCount == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "row.clone() retains row beyond callback lifetime":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var saved: seq[Row] = @[]
+      discard await conn.queryEach(
+        "SELECT * FROM (VALUES ('a', 1), ('b', 2), ('c', 3)) AS t(s, n)",
+        callback = proc(row: Row) =
+          saved.add(row.clone()),
+      )
+      doAssert saved.len == 3
+      doAssert saved[0].getStr(0) == "a"
+      doAssert saved[0].getInt(1) == 1
+      doAssert saved[1].getStr(0) == "b"
+      doAssert saved[1].getInt(1) == 2
+      doAssert saved[2].getStr(0) == "c"
+      doAssert saved[2].getInt(1) == 3
       await conn.close()
 
     waitFor t()
@@ -6869,5 +8089,1252 @@ suite "E2E: Logical Replication":
 
       discard await writer.simpleQuery("DROP PUBLICATION test_state_pub")
       await writer.close()
+
+    waitFor t()
+
+# User-defined type definitions for e2e tests (macros must be at top level)
+type
+  TestPoint = object
+    x: float64
+    y: float64
+
+  TestPerson = object
+    name: string
+    age: int32
+    score: float64
+
+  TestNullable = object
+    name: string
+    age: Option[int32]
+    note: Option[string]
+
+pgComposite(TestPoint)
+pgComposite(TestPerson)
+pgComposite(TestNullable)
+
+type TestMood = enum
+  tmHappy = "happy"
+  tmSad = "sad"
+  tmOk = "ok"
+
+pgEnum(TestMood)
+
+type TestPosInt = distinct int32
+
+pgDomain(TestPosInt, int32)
+
+suite "E2E: User-Defined Types":
+  test "composite roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_point CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TYPE test_e2e_point AS (x float8, y float8)")
+
+      let res = await conn.query("SELECT ROW(1.5, 2.5)::test_e2e_point")
+      doAssert res.rows.len == 1
+      let got = getComposite[TestPoint](res.rows[0], 0)
+      doAssert got.x == 1.5
+      doAssert got.y == 2.5
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_point")
+      await conn.close()
+
+    waitFor t()
+
+  test "composite with strings":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_person CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_person AS (name text, age int4, score float8)"
+      )
+
+      let res = await conn.query("SELECT ROW('Alice', 30, 95.5)::test_e2e_person")
+      doAssert res.rows.len == 1
+      let got = getComposite[TestPerson](res.rows[0], 0)
+      doAssert got.name == "Alice"
+      doAssert got.age == 30'i32
+      doAssert got.score == 95.5
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_person")
+      await conn.close()
+
+    waitFor t()
+
+  test "composite NULL fields":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_nullable CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_nullable AS (name text, age int4, note text)"
+      )
+
+      let res = await conn.query("SELECT ROW('Bob', NULL, NULL)::test_e2e_nullable")
+      doAssert res.rows.len == 1
+      let got = getComposite[TestNullable](res.rows[0], 0)
+      doAssert got.name == "Bob"
+      doAssert got.age.isNone
+      doAssert got.note.isNone
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_nullable")
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL composite":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_point2 CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TYPE test_e2e_point2 AS (x float8, y float8)")
+
+      let res = await conn.query("SELECT NULL::test_e2e_point2")
+      doAssert res.rows.len == 1
+      let got = getCompositeOpt[TestPoint](res.rows[0], 0)
+      doAssert got.isNone
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_point2")
+      await conn.close()
+
+    waitFor t()
+
+  test "composite param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_point3 CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TYPE test_e2e_point3 AS (x float8, y float8)")
+
+      let v = TestPoint(x: 3.14, y: 2.72)
+      let res = await conn.query("SELECT $1::test_e2e_point3", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = getComposite[TestPoint](res.rows[0], 0)
+      doAssert got.x == 3.14
+      doAssert got.y == 2.72
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_point3")
+      await conn.close()
+
+    waitFor t()
+
+  test "enum roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood AS ENUM ('happy', 'sad', 'ok')"
+      )
+
+      let res = await conn.query("SELECT 'happy'::test_e2e_mood")
+      doAssert res.rows.len == 1
+      let got = getEnum[TestMood](res.rows[0], 0)
+      doAssert got == tmHappy
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood")
+      await conn.close()
+
+    waitFor t()
+
+  test "enum param roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood2 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood2 AS ENUM ('happy', 'sad', 'ok')"
+      )
+
+      let res = await conn.query("SELECT $1::test_e2e_mood2", @[toPgParam(tmSad)])
+      doAssert res.rows.len == 1
+      let got = getEnum[TestMood](res.rows[0], 0)
+      doAssert got == tmSad
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood2")
+      await conn.close()
+
+    waitFor t()
+
+  test "enum in table":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TABLE IF EXISTS test_e2e_mood_tbl CASCADE")
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood3 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood3 AS ENUM ('happy', 'sad', 'ok')"
+      )
+      discard await conn.simpleQuery(
+        "CREATE TABLE test_e2e_mood_tbl (id serial, mood test_e2e_mood3)"
+      )
+      discard
+        await conn.simpleQuery("INSERT INTO test_e2e_mood_tbl (mood) VALUES ('ok')")
+
+      let res = await conn.query("SELECT mood FROM test_e2e_mood_tbl WHERE id = 1")
+      doAssert res.rows.len == 1
+      let got = getEnum[TestMood](res.rows[0], 0)
+      doAssert got == tmOk
+
+      discard await conn.simpleQuery("DROP TABLE test_e2e_mood_tbl")
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood3")
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL enum":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_mood4 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_mood4 AS ENUM ('happy', 'sad', 'ok')"
+      )
+
+      let res = await conn.query("SELECT NULL::test_e2e_mood4")
+      doAssert res.rows.len == 1
+      let got = getEnumOpt[TestMood](res.rows[0], 0)
+      doAssert got.isNone
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_mood4")
+      await conn.close()
+
+    waitFor t()
+
+  test "domain roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP DOMAIN IF EXISTS test_e2e_posint CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE DOMAIN test_e2e_posint AS int4 CHECK (VALUE > 0)"
+      )
+
+      let res =
+        await conn.query("SELECT $1::test_e2e_posint", @[toPgParam(TestPosInt(42))])
+      doAssert res.rows.len == 1
+      let got = getDomain[TestPosInt](res.rows[0], 0)
+      doAssert int32(got) == 42'i32
+
+      discard await conn.simpleQuery("DROP DOMAIN test_e2e_posint")
+      await conn.close()
+
+    waitFor t()
+
+  test "domain constraint violation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP DOMAIN IF EXISTS test_e2e_posint2 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE DOMAIN test_e2e_posint2 AS int4 CHECK (VALUE > 0)"
+      )
+
+      var raised = false
+      try:
+        discard
+          await conn.query("SELECT $1::test_e2e_posint2", @[toPgParam(TestPosInt(-1))])
+      except PgError:
+        raised = true
+      doAssert raised
+
+      discard await conn.simpleQuery("DROP DOMAIN test_e2e_posint2")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Network Types":
+  test "inet roundtrip IPv4":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgInet(address: parseIpAddress("192.168.1.5"), mask: 24)
+      let res = await conn.query("SELECT $1::inet", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("192.168.1.5")
+      doAssert got.mask == 24
+      await conn.close()
+
+    waitFor t()
+
+  test "inet roundtrip IPv6":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgInet(address: parseIpAddress("::1"), mask: 128)
+      let res = await conn.query("SELECT $1::inet", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("::1")
+      doAssert got.mask == 128
+      await conn.close()
+
+    waitFor t()
+
+  test "inet host address without mask":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgInet(address: parseIpAddress("10.0.0.1"), mask: 32)
+      let res = await conn.query("SELECT $1::inet", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("10.0.0.1")
+      doAssert got.mask == 32
+      await conn.close()
+
+    waitFor t()
+
+  test "cidr roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+      let res = await conn.query("SELECT $1::cidr", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getCidr(0)
+      doAssert got.address == parseIpAddress("10.0.0.0")
+      doAssert got.mask == 8
+      await conn.close()
+
+    waitFor t()
+
+  test "macaddr roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgMacAddr("08:00:2b:01:02:03")
+      let res = await conn.query("SELECT $1::macaddr", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getMacAddr(0)
+      doAssert $got == "08:00:2b:01:02:03"
+      await conn.close()
+
+    waitFor t()
+
+  test "macaddr8 roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgMacAddr8("08:00:2b:01:02:03:04:05")
+      let res = await conn.query("SELECT $1::macaddr8", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getMacAddr8(0)
+      doAssert $got == "08:00:2b:01:02:03:04:05"
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL network types":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT NULL::inet, NULL::cidr, NULL::macaddr, NULL::macaddr8")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInetOpt(0).isNone
+      doAssert res.rows[0].getCidrOpt(1).isNone
+      doAssert res.rows[0].getMacAddrOpt(2).isNone
+      doAssert res.rows[0].getMacAddr8Opt(3).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "inet in table":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TABLE IF EXISTS test_e2e_inet_tbl CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TABLE test_e2e_inet_tbl (id serial, addr inet)")
+
+      let v = PgInet(address: parseIpAddress("192.168.0.1"), mask: 24)
+      discard await conn.exec(
+        "INSERT INTO test_e2e_inet_tbl (addr) VALUES ($1)", @[toPgParam(v)]
+      )
+      let res = await conn.query("SELECT addr FROM test_e2e_inet_tbl WHERE id = 1")
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInet(0)
+      doAssert got.address == parseIpAddress("192.168.0.1")
+      doAssert got.mask == 24
+
+      discard await conn.simpleQuery("DROP TABLE test_e2e_inet_tbl")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Geometric Types":
+  test "point roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPoint(x: 1.5, y: 2.5)
+      let res = await conn.query("SELECT $1::point", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPoint(0)
+      doAssert got.x == 1.5
+      doAssert got.y == 2.5
+      await conn.close()
+
+    waitFor t()
+
+  test "line roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgLine(a: 1.0, b: -1.0, c: 0.0)
+      let res = await conn.query("SELECT $1::line", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getLine(0)
+      doAssert got.a == 1.0
+      doAssert got.b == -1.0
+      doAssert got.c == 0.0
+      await conn.close()
+
+    waitFor t()
+
+  test "lseg roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 3.0, y: 4.0))
+      let res = await conn.query("SELECT $1::lseg", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getLseg(0)
+      doAssert got.p1.x == 0.0
+      doAssert got.p1.y == 0.0
+      doAssert got.p2.x == 3.0
+      doAssert got.p2.y == 4.0
+      await conn.close()
+
+    waitFor t()
+
+  test "box roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+      let res = await conn.query("SELECT $1::box", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getBox(0)
+      doAssert got.high.x == 3.0
+      doAssert got.high.y == 4.0
+      doAssert got.low.x == 1.0
+      doAssert got.low.y == 2.0
+      await conn.close()
+
+    waitFor t()
+
+  test "path roundtrip closed":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPath(
+        closed: true,
+        points:
+          @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 0.0, y: 1.0)],
+      )
+      let res = await conn.query("SELECT $1::path", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPath(0)
+      doAssert got.closed == true
+      doAssert got.points.len == 3
+      doAssert got.points[0].x == 0.0
+      doAssert got.points[1].x == 1.0
+      doAssert got.points[2].y == 1.0
+      await conn.close()
+
+    waitFor t()
+
+  test "path roundtrip open":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPath(
+        closed: false, points: @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 5.0, y: 5.0)]
+      )
+      let res = await conn.query("SELECT $1::path", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPath(0)
+      doAssert got.closed == false
+      doAssert got.points.len == 2
+      doAssert got.points[0].x == 0.0
+      doAssert got.points[1].x == 5.0
+      await conn.close()
+
+    waitFor t()
+
+  test "polygon roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgPolygon(
+        points: @[
+          PgPoint(x: 0.0, y: 0.0),
+          PgPoint(x: 4.0, y: 0.0),
+          PgPoint(x: 4.0, y: 3.0),
+          PgPoint(x: 0.0, y: 3.0),
+        ]
+      )
+      let res = await conn.query("SELECT $1::polygon", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getPolygon(0)
+      doAssert got.points.len == 4
+      doAssert got.points[0].x == 0.0
+      doAssert got.points[2].x == 4.0
+      doAssert got.points[2].y == 3.0
+      await conn.close()
+
+    waitFor t()
+
+  test "circle roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0)
+      let res = await conn.query("SELECT $1::circle", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getCircle(0)
+      doAssert got.center.x == 1.0
+      doAssert got.center.y == 2.0
+      doAssert got.radius == 5.0
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL geometric types":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::point, NULL::line, NULL::circle")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getPointOpt(0).isNone
+      doAssert res.rows[0].getLineOpt(1).isNone
+      doAssert res.rows[0].getCircleOpt(2).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "geometric distance computation":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT point '(1,2)' <-> point '(4,6)'")
+      doAssert res.rows.len == 1
+      let dist = parseFloat(res.rows[0].getStr(0))
+      doAssert abs(dist - 5.0) < 1e-10
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Range Types":
+  test "int4range roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(1'i32, 10'i32)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.hasLower
+      doAssert got.hasUpper
+      doAssert got.lower.value == 1'i32
+      doAssert got.lower.inclusive == true
+      doAssert got.upper.value == 10'i32
+      doAssert got.upper.inclusive == false
+      await conn.close()
+
+    waitFor t()
+
+  test "int8range roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(100'i64, 999'i64)
+      let res = await conn.query("SELECT $1::int8range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt8Range(0)
+      doAssert got.lower.value == 100'i64
+      doAssert got.upper.value == 999'i64
+      await conn.close()
+
+    waitFor t()
+
+  test "numrange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(parsePgNumeric("1.5"), parsePgNumeric("9.5"))
+      let res = await conn.query("SELECT $1::numrange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getNumRange(0)
+      doAssert $got.lower.value == "1.5"
+      doAssert $got.upper.value == "9.5"
+      await conn.close()
+
+    waitFor t()
+
+  test "daterange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let lower = dateTime(2024, mJan, 1, zone = utc())
+      let upper = dateTime(2024, mMar, 1, zone = utc())
+      let v = rangeOf(lower, upper)
+      let res = await conn.query("SELECT $1::daterange", @[toPgDateRangeParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getDateRange(0)
+      doAssert got.hasLower
+      doAssert got.hasUpper
+      doAssert got.lower.value.year == 2024
+      doAssert got.lower.value.month == mJan
+      doAssert got.lower.value.monthday == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "empty range":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = emptyRange[int32]()
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.isEmpty
+      await conn.close()
+
+    waitFor t()
+
+  test "unbounded range":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = unboundedRange[int32]()
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert not got.isEmpty
+      doAssert not got.hasLower
+      doAssert not got.hasUpper
+      await conn.close()
+
+    waitFor t()
+
+  test "half-bounded range rangeFrom":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeFrom(5'i32)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.hasLower
+      doAssert not got.hasUpper
+      doAssert got.lower.value == 5'i32
+      doAssert got.lower.inclusive == true
+      await conn.close()
+
+    waitFor t()
+
+  test "half-bounded range rangeTo":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeTo(10'i32)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert not got.hasLower
+      doAssert got.hasUpper
+      doAssert got.upper.value == 10'i32
+      doAssert got.upper.inclusive == false
+      await conn.close()
+
+    waitFor t()
+
+  test "inclusive upper bound normalizes for integers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # For integer ranges, PostgreSQL normalizes [1,10] to [1,11)
+      let v = rangeOf(1'i32, 10'i32, upperInc = true)
+      let res = await conn.query("SELECT $1::int4range", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Range(0)
+      doAssert got.lower.value == 1'i32
+      doAssert got.lower.inclusive == true
+      doAssert got.upper.value == 11'i32
+      doAssert got.upper.inclusive == false
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL range":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4range")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt4RangeOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "range contains operator":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = rangeOf(1'i32, 10'i32)
+      let res = await conn.query("SELECT $1::int4range @> 5::int4", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getBool(0) == true
+
+      let res2 = await conn.query("SELECT $1::int4range @> 15::int4", @[toPgParam(v)])
+      doAssert res2.rows[0].getBool(0) == false
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Multirange Types":
+  test "int4multirange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+      let res = await conn.query("SELECT $1::int4multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Multirange(0)
+      doAssert got.len == 2
+      doAssert got[0].lower.value == 1'i32
+      doAssert got[0].upper.value == 3'i32
+      doAssert got[1].lower.value == 5'i32
+      doAssert got[1].upper.value == 8'i32
+      await conn.close()
+
+    waitFor t()
+
+  test "int8multirange roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange(rangeOf(100'i64, 200'i64), rangeOf(300'i64, 400'i64))
+      let res = await conn.query("SELECT $1::int8multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt8Multirange(0)
+      doAssert got.len == 2
+      doAssert got[0].lower.value == 100'i64
+      doAssert got[1].upper.value == 400'i64
+      await conn.close()
+
+    waitFor t()
+
+  test "empty multirange":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange[int32]()
+      let res = await conn.query("SELECT $1::int4multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Multirange(0)
+      doAssert got.len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "single range multirange":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = toMultirange(rangeOf(10'i32, 20'i32))
+      let res = await conn.query("SELECT $1::int4multirange", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getInt4Multirange(0)
+      doAssert got.len == 1
+      doAssert got[0].lower.value == 10'i32
+      doAssert got[0].upper.value == 20'i32
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL multirange":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4multirange")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt4MultirangeOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Temporal array types":
+  test "timestamp array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt1 = dateTime(2023, mJan, 15, 10, 30, 0, zone = utc())
+      let dt2 = dateTime(2024, mJun, 20, 14, 45, 30, zone = utc())
+      let res = await conn.query(
+        "SELECT $1::timestamp[]", @[toPgTimestampArrayParam(@[dt1, dt2])]
+      )
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getTimestampArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0].year == 2023
+      doAssert arr[1].year == 2024
+      await conn.close()
+
+    waitFor t()
+
+  test "empty timestamp array":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query(
+        "SELECT $1::timestamp[]", @[toPgTimestampArrayParam(newSeq[DateTime]())]
+      )
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getTimestampArray(0).len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL timestamp array":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::timestamp[]")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getTimestampArrayOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "date array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let dt1 = dateTime(2023, mMar, 10, zone = utc())
+      let dt2 = dateTime(2024, mDec, 25, zone = utc())
+      let res =
+        await conn.query("SELECT $1::date[]", @[toPgDateArrayParam(@[dt1, dt2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getDateArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0].monthday == 10
+      doAssert arr[1].month == mDec
+      await conn.close()
+
+    waitFor t()
+
+  test "time array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let t1 = PgTime(hour: 10, minute: 30, second: 0, microsecond: 0)
+      let t2 = PgTime(hour: 23, minute: 59, second: 59, microsecond: 123456)
+      let res = await conn.query("SELECT $1::time[]", @[toPgParam(@[t1, t2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getTimeArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == t1
+      doAssert arr[1] == t2
+      await conn.close()
+
+    waitFor t()
+
+  test "timetz array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let t1 =
+        PgTimeTz(hour: 10, minute: 30, second: 0, microsecond: 0, utcOffset: 3600)
+      let t2 =
+        PgTimeTz(hour: 23, minute: 59, second: 59, microsecond: 0, utcOffset: -18000)
+      let res = await conn.query("SELECT $1::timetz[]", @[toPgParam(@[t1, t2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getTimeTzArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == t1
+      doAssert arr[1] == t2
+      await conn.close()
+
+    waitFor t()
+
+  test "interval array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let iv1 = PgInterval(months: 2, days: 3, microseconds: 3600000000)
+      let iv2 = PgInterval(months: 0, days: 0, microseconds: 1000000)
+      let res = await conn.query("SELECT $1::interval[]", @[toPgParam(@[iv1, iv2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getIntervalArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == iv1
+      doAssert arr[1] == iv2
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Identifier / network array types":
+  test "uuid array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let u1 = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+      let u2 = PgUuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+      let res = await conn.query("SELECT $1::uuid[]", @[toPgParam(@[u1, u2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getUuidArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == u1
+      doAssert arr[1] == u2
+      await conn.close()
+
+    waitFor t()
+
+  test "inet array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let i1 = PgInet(address: parseIpAddress("192.168.1.1"), mask: 32)
+      let i2 = PgInet(address: parseIpAddress("10.0.0.0"), mask: 8)
+      let res = await conn.query("SELECT $1::inet[]", @[toPgParam(@[i1, i2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getInetArray(0)
+      doAssert arr.len == 2
+      doAssert $arr[0].address == "192.168.1.1"
+      doAssert arr[1].mask == 8
+      await conn.close()
+
+    waitFor t()
+
+  test "cidr array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let c1 = PgCidr(address: parseIpAddress("192.168.1.0"), mask: 24)
+      let c2 = PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8)
+      let res = await conn.query("SELECT $1::cidr[]", @[toPgParam(@[c1, c2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getCidrArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0].mask == 24
+      doAssert arr[1].mask == 8
+      await conn.close()
+
+    waitFor t()
+
+  test "macaddr array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let m1 = PgMacAddr("08:00:2b:01:02:03")
+      let m2 = PgMacAddr("aa:bb:cc:dd:ee:ff")
+      let res = await conn.query("SELECT $1::macaddr[]", @[toPgParam(@[m1, m2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getMacAddrArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == m1
+      doAssert arr[1] == m2
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Numeric / binary / JSON array types":
+  test "numeric array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let n1 = parsePgNumeric("123.45")
+      let n2 = parsePgNumeric("0.001")
+      let res = await conn.query("SELECT $1::numeric[]", @[toPgParam(@[n1, n2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getNumericArray(0)
+      doAssert arr.len == 2
+      doAssert $arr[0] == "123.45"
+      doAssert $arr[1] == "0.001"
+      await conn.close()
+
+    waitFor t()
+
+  test "hstore array roundtrip (text cast)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      var h1: PgHstore = initTable[string, Option[string]]()
+      h1["a"] = some("1")
+      var h2: PgHstore = initTable[string, Option[string]]()
+      h2["b"] = none(string)
+      let res = await conn.query("SELECT $1::hstore[]", @[toPgParam(@[h1, h2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getHstoreArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == h1
+      doAssert arr[1] == h2
+      await conn.close()
+
+    waitFor t()
+
+  test "hstore array roundtrip (binary)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      doAssert conn.hstoreOid != 0
+      doAssert conn.hstoreArrayOid != 0
+      var h1: PgHstore = initTable[string, Option[string]]()
+      h1["x"] = some("y")
+      var h2: PgHstore = initTable[string, Option[string]]()
+      h2["nul"] = none(string)
+      let bin = toPgBinaryParam(@[h1, h2], conn.hstoreOid, conn.hstoreArrayOid)
+      let res = await conn.query("SELECT $1", @[bin])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getHstoreArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == h1
+      doAssert arr[1] == h2
+      await conn.close()
+
+    waitFor t()
+
+  test "hstore array roundtrip (binary, conn overload)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      var h1: PgHstore = initTable[string, Option[string]]()
+      h1["k"] = some("v")
+      let res = await conn.query("SELECT $1", @[conn.toPgBinaryParam(@[h1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getHstoreArray(0)
+      doAssert arr.len == 1
+      doAssert arr[0] == h1
+      await conn.close()
+
+    waitFor t()
+
+  test "bytea array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let b1 = @[1'u8, 2, 3]
+      let b2 = @[0xFF'u8, 0x00]
+      let res =
+        await conn.query("SELECT $1::bytea[]", @[toPgByteaArrayParam(@[b1, b2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getBytesArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == b1
+      doAssert arr[1] == b2
+      await conn.close()
+
+    waitFor t()
+
+  test "jsonb array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let j1 = %*{"key": "value"}
+      let j2 = %*[1, 2, 3]
+      let res = await conn.query("SELECT $1::jsonb[]", @[toPgParam(@[j1, j2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getJsonArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0]["key"].getStr == "value"
+      doAssert arr[1].len == 3
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Geometric array types":
+  test "point array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p1 = PgPoint(x: 1.0, y: 2.0)
+      let p2 = PgPoint(x: 3.5, y: 4.5)
+      let res = await conn.query("SELECT $1::point[]", @[toPgParam(@[p1, p2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getPointArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == p1
+      doAssert arr[1] == p2
+      await conn.close()
+
+    waitFor t()
+
+  test "circle array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let c1 = PgCircle(center: PgPoint(x: 1.0, y: 2.0), radius: 5.0)
+      let res = await conn.query("SELECT $1::circle[]", @[toPgParam(@[c1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getCircleArray(0)
+      doAssert arr.len == 1
+      doAssert arr[0].center.x == 1.0
+      doAssert arr[0].radius == 5.0
+      await conn.close()
+
+    waitFor t()
+
+  test "box array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let b1 = PgBox(high: PgPoint(x: 3.0, y: 4.0), low: PgPoint(x: 1.0, y: 2.0))
+      let res = await conn.query("SELECT $1::box[]", @[toPgParam(@[b1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getBoxArray(0)
+      doAssert arr.len == 1
+      doAssert arr[0].high.x == 3.0
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Other array types":
+  test "xml array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let x1 = PgXml("<root/>")
+      let x2 = PgXml("<data>hello</data>")
+      let res = await conn.query("SELECT $1::xml[]", @[toPgParam(@[x1, x2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getXmlArray(0)
+      doAssert arr.len == 2
+      doAssert string(arr[0]) == "<root/>"
+      doAssert string(arr[1]) == "<data>hello</data>"
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Multirange array types":
+  test "int4multirange array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let mr1 = toMultirange(rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32))
+      let mr2 = toMultirange(rangeOf(100'i32, 200'i32))
+      let res =
+        await conn.query("SELECT $1::int4multirange[]", @[toPgParam(@[mr1, mr2])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getInt4MultirangeArray(0)
+      doAssert arr.len == 2
+      doAssert seq[PgRange[int32]](arr[0]).len == 2
+      doAssert seq[PgRange[int32]](arr[1]).len == 1
+      doAssert seq[PgRange[int32]](arr[0])[0].lower.value == 1'i32
+      await conn.close()
+
+    waitFor t()
+
+  test "int8multirange array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let mr1 = toMultirange(rangeOf(100'i64, 200'i64))
+      let res = await conn.query("SELECT $1::int8multirange[]", @[toPgParam(@[mr1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getInt8MultirangeArray(0)
+      doAssert arr.len == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "nummultirange array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let mr1 = toMultirange(rangeOf(parsePgNumeric("1.5"), parsePgNumeric("3.5")))
+      let res = await conn.query("SELECT $1::nummultirange[]", @[toPgParam(@[mr1])])
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getNumMultirangeArray(0)
+      doAssert arr.len == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL multirange array":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4multirange[]")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt4MultirangeArrayOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Option/NULL array input and element-level output":
+  test "seq[Option[int32]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some(1'i32), none(int32), some(3'i32)]
+      let res = await conn.query("SELECT $1::int4[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "seq[Option[string]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some("a"), none(string), some("c")]
+      let res = await conn.query("SELECT $1::text[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStrArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "seq[Option[bool]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some(true), none(bool), some(false)]
+      let res = await conn.query("SELECT $1::bool[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getBoolArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "seq[Option[float64]] roundtrip with NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some(1.5), none(float64), some(3.25)]
+      let res = await conn.query("SELECT $1::float8[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getFloatArrayElemOpt(0)
+      doAssert got.len == 3
+      doAssert got[0].isSome and abs(got[0].get - 1.5) < 1e-10
+      doAssert got[1].isNone
+      doAssert got[2].isSome and abs(got[2].get - 3.25) < 1e-10
+      await conn.close()
+
+    waitFor t()
+
+  test "all-NULL array roundtrips":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[none(int32), none(int32)]
+      let res = await conn.query("SELECT $1::int4[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0) == arr
+      await conn.close()
+
+    waitFor t()
+
+  test "empty seq[Option[int32]] works":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr: seq[Option[int32]] = @[]
+      let res = await conn.query("SELECT $1::int4[] AS a", pgParams(arr))
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0).len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "literal ARRAY[1, NULL, 3] via getIntArrayElemOpt":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT ARRAY[1, NULL, 3]::int4[] AS a")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOpt(0) ==
+        @[some(1'i32), none(int32), some(3'i32)]
+      await conn.close()
+
+    waitFor t()
+
+  test "column NULL via getIntArrayElemOptOpt returns none":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::int4[] AS a")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getIntArrayElemOptOpt(0) == none(seq[Option[int32]])
+      await conn.close()
+
+    waitFor t()
+
+type PgE2eMood = enum
+  happy2 = "happy2"
+  sad2 = "sad2"
+  ok2 = "ok2"
+
+pgEnum(PgE2eMood)
+
+suite "E2E: enum arrays":
+  test "enum array roundtrip with and without NULL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TYPE IF EXISTS e2e_mood CASCADE")
+      discard await conn.exec("CREATE TYPE e2e_mood AS ENUM ('happy2', 'sad2', 'ok2')")
+      block:
+        let arr = @[happy2, sad2, ok2]
+        let res = await conn.query("SELECT $1::e2e_mood[] AS a", @[toPgParam(arr)])
+        doAssert res.rows.len == 1
+        doAssert getEnumArray[PgE2eMood](res.rows[0], 0) == arr
+      block:
+        let arr = @[some(happy2), none(PgE2eMood), some(ok2)]
+        let res = await conn.query("SELECT $1::e2e_mood[] AS a", @[toPgParam(arr)])
+        doAssert res.rows.len == 1
+        doAssert getEnumArrayElemOpt[PgE2eMood](res.rows[0], 0) == arr
+      discard await conn.exec("DROP TYPE IF EXISTS e2e_mood CASCADE")
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: queryRowOpt via pool":
+  test "pool queryRowOpt returns first row and none on empty":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 2))
+      let row = await pool.queryRowOpt("SELECT 7 AS v")
+      doAssert row.isSome
+      doAssert row.get.getStr(0) == "7"
+      let empty = await pool.queryRowOpt("SELECT 1 WHERE false")
+      doAssert empty.isNone
+      await pool.close()
 
     waitFor t()

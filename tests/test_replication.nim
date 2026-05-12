@@ -45,6 +45,15 @@ suite "LSN":
     check a <= a
     check not (b < a)
 
+  test "LSN comparison > and >=":
+    let a = parseLsn("0/100")
+    let b = parseLsn("0/200")
+    check b > a
+    check not (a > b)
+    check a >= a
+    check b >= a
+    check not (a >= b)
+
   test "LSN toInt64":
     let lsn = parseLsn("0/FF")
     check lsn.toInt64 == 0xFF'i64

@@ -1,9 +1,9 @@
 import std/[options, tables]
 
-type
-  ProtocolError* = object of CatchableError
-    ## Raised on PostgreSQL wire protocol violations.
+import pg_bytes, pg_errors
+export pg_errors
 
+type
   FrontendMessageKind* = enum
     ## Message types sent from client to server.
     fmkStartup
@@ -149,8 +149,18 @@ type
     colMap*: Table[string, int] ## Cached name→index mapping (lazily built)
 
   Row* = object ## Lightweight view into a single row within a `RowData` buffer.
-    data*: RowData
-    rowIdx*: int32
+    data: RowData
+    rowIdx: int32
+
+func initRow*(data: RowData, rowIdx: int32): Row {.inline.} =
+  ## Create a Row view into the given RowData at the specified row index.
+  Row(data: data, rowIdx: rowIdx)
+
+func data*(row: Row): RowData {.inline.} = ## The underlying RowData buffer.
+  row.data
+
+func rowIdx*(row: Row): int32 {.inline.} = ## The row index within the RowData buffer.
+  row.rowIdx
 
 const
   syncMsg* = [byte('S'), 0'u8, 0'u8, 0'u8, 4'u8] ## Pre-built Sync message bytes.
@@ -164,20 +174,71 @@ const
     21, # int2 / smallint
     23, # int4 / integer
     25, # text
+    114, # json
+    142, # xml
+    143, # xml[]
     600, # point
     601, # lseg
     602, # path
     603, # box
     604, # polygon
     628, # line
+    629, # line[]
+    650, # cidr
+    651, # cidr[]
     700, # float4
     701, # float8
     718, # circle
+    719, # circle[]
+    774, # macaddr8
+    775, # macaddr8[]
+    790, # money
+    791, # money[]
+    829, # macaddr
+    869, # inet
+    1000, # bool[]
+    1001, # bytea[]
+    1005, # int2[]
+    1007, # int4[]
+    1009, # text[]
+    1015, # varchar[]
+    1016, # int8[]
+    1017, # point[]
+    1018, # lseg[]
+    1019, # path[]
+    1020, # box[]
+    1021, # float4[]
+    1022, # float8[]
+    1027, # polygon[]
+    1040, # macaddr[]
+    1041, # inet[]
     1043, # varchar
+    1082, # date
+    1083, # time
+    1114, # timestamp
+    1115, # timestamp[]
+    1182, # date[]
+    1183, # time[]
+    1184, # timestamptz
+    1185, # timestamptz[]
+    1186, # interval
+    1187, # interval[]
+    1231, # numeric[]
+    1266, # timetz
+    1270, # timetz[]
     1560, # bit
     1561, # bit[]
     1562, # varbit
     1563, # varbit[]
+    1700, # numeric
+    2950, # uuid
+    2951, # uuid[]
+    3614, # tsvector
+    3615, # tsquery
+    3643, # tsvector[]
+    3645, # tsquery[]
+    3802, # jsonb
+    3807, # jsonb[]
     3904, # int4range
     3905, # int4range[]
     3906, # numrange
@@ -196,9 +257,15 @@ const
     4534, # tstzmultirange
     4535, # datemultirange
     4536, # int8multirange
+    6150, # int4multirange[]
+    6151, # nummultirange[]
+    6152, # tsmultirange[]
+    6153, # tstzmultirange[]
+    6155, # datemultirange[]
+    6157, # int8multirange[]
   ]
 
-  BinarySafeMaxOid = 4536
+  BinarySafeMaxOid = 6157
 
   pgCopyBinaryHeader*: array[19, byte] = [
     ## PGCOPY binary format header (signature + flags + extension length).
@@ -282,8 +349,11 @@ proc addInt64*(buf: var seq[byte], val: int64) {.inline.} =
 
 proc patchLen*(buf: var seq[byte], offset: int = 1) =
   ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
-  doAssert offset >= 0 and offset + 3 < buf.len,
-    "patchLen: offset " & $offset & " out of range for buf.len " & $buf.len
+  if offset < 0 or offset + 3 >= buf.len:
+    raise newException(
+      ProtocolError,
+      "patchLen: offset " & $offset & " out of range for buf.len " & $buf.len,
+    )
   let length = int32(buf.high)
   buf[offset] = byte((length shr 24) and 0xFF)
   buf[offset + 1] = byte((length shr 16) and 0xFF)
@@ -293,8 +363,11 @@ proc patchLen*(buf: var seq[byte], offset: int = 1) =
 proc patchMsgLen*(buf: var seq[byte], msgStart: int) {.inline.} =
   ## Patch the length field of a message starting at `msgStart`.
   ## Length = total message size minus the type byte.
-  doAssert msgStart >= 0 and msgStart + 4 < buf.len,
-    "patchMsgLen: msgStart " & $msgStart & " out of range for buf.len " & $buf.len
+  if msgStart < 0 or msgStart + 4 >= buf.len:
+    raise newException(
+      ProtocolError,
+      "patchMsgLen: msgStart " & $msgStart & " out of range for buf.len " & $buf.len,
+    )
   let length = int32(buf.len - msgStart - 1)
   buf[msgStart + 1] = byte((length shr 24) and 0xFF)
   buf[msgStart + 2] = byte((length shr 16) and 0xFF)
@@ -306,7 +379,7 @@ proc addCString*(buf: var seq[byte], s: string) =
   let oldLen = buf.len
   buf.setLen(oldLen + s.len + 1)
   if s.len > 0:
-    copyMem(addr buf[oldLen], unsafeAddr s[0], s.len)
+    buf.writeBytesAt(oldLen, s.toOpenArrayByte(0, s.high))
   buf[oldLen + s.len] = 0'u8
 
 proc decodeInt16*(buf: openArray[byte], offset: int): int16 =
@@ -329,17 +402,16 @@ proc decodeInt64*(buf: openArray[byte], offset: int): int64 =
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at the given offset. Returns (string, bytes consumed).
-  if offset > buf.len:
+  if offset >= buf.len:
     raise newException(ProtocolError, "decodeCString: offset past end of buffer")
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
+  if i >= buf.len:
+    raise newException(ProtocolError, "decodeCString: missing null terminator")
   let slen = i - offset
-  var s = newString(slen)
-  if slen > 0:
-    copyMem(addr s[0], unsafeAddr buf[offset], slen)
-  if i < buf.len:
-    inc i # skip null terminator
+  let s = readString(buf, offset, slen)
+  inc i # skip null terminator
   result = (s, i - offset)
 
 # Frontend message encoding
@@ -378,6 +450,9 @@ proc encodeSSLRequest*(): seq[byte] =
 
 proc encodePassword*(password: string): seq[byte] =
   ## Encode a PasswordMessage for cleartext or MD5 authentication.
+  ## Pre-allocates the buffer so internal `add` calls do not realloc and
+  ## leave residual copies of the password in freed heap memory.
+  result = newSeqOfCap[byte](1 + 4 + password.len + 1)
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.addCString(password)
@@ -409,7 +484,7 @@ proc encodeQuery*(sql: string): seq[byte] =
 proc addFixedMsg(buf: var seq[byte], msg: array[5, byte]) {.inline.} =
   let oldLen = buf.len
   buf.setLen(oldLen + 5)
-  copyMem(addr buf[oldLen], unsafeAddr msg[0], 5)
+  buf.writeBytesAt(oldLen, msg)
 
 proc addParse*(
     buf: var seq[byte],
@@ -454,11 +529,60 @@ proc addBind*(
     else:
       let data = v.get
       buf.addInt32(int32(data.len))
-      if data.len > 0:
-        let oldLen = buf.len
-        buf.setLen(oldLen + data.len)
-        copyMem(addr buf[oldLen], unsafeAddr data[0], data.len)
+      buf.appendBytes(data)
   # Result format codes
+  buf.addInt16(int16(resultFormats.len))
+  for f in resultFormats:
+    buf.addInt16(f)
+  buf.patchMsgLen(msgStart)
+
+proc addBindRaw*(
+    buf: var seq[byte],
+    portalName: string,
+    stmtName: string,
+    paramFormats: openArray[int16],
+    paramData: openArray[byte],
+    paramRanges: openArray[tuple[off: int32, len: int32]],
+    resultFormats: openArray[int16] = [],
+) =
+  ## Append a Bind message built from a raw byte buffer and offset/length
+  ## ranges. Each parameter is described by `(off, len)`: `len == -1` encodes
+  ## NULL; any other `len` reads `paramData[off ..< off + len]`. Lets callers
+  ## write payloads straight into a single owned buffer without constructing
+  ## `Option[seq[byte]]` per parameter.
+  ##
+  ## Each range must satisfy one of: `len == -1` (NULL), or
+  ## `len >= 0` with `0 <= off` and `off + len <= paramData.len`.
+  ## Invalid ranges raise `ValueError` — the check is always active so callers
+  ## cannot silently trigger an out-of-bounds `copyMem` in release builds.
+  let msgStart = buf.len
+  buf.add(byte('B'))
+  buf.addInt32(0) # length placeholder
+  buf.addCString(portalName)
+  buf.addCString(stmtName)
+  buf.addInt16(int16(paramFormats.len))
+  for f in paramFormats:
+    buf.addInt16(f)
+  buf.addInt16(int16(paramRanges.len))
+  for r in paramRanges:
+    if r.len < -1:
+      raise newException(ValueError, "addBindRaw: invalid range len " & $r.len)
+    if r.len == -1:
+      buf.addInt32(-1)
+    else:
+      buf.addInt32(r.len)
+      if r.len > 0:
+        if r.off < 0:
+          raise newException(ValueError, "addBindRaw: negative range off " & $r.off)
+        if r.off.int64 + r.len.int64 > paramData.len.int64:
+          raise newException(
+            ValueError,
+            "addBindRaw: range out of bounds (off=" & $r.off & ", len=" & $r.len &
+              ", data.len=" & $paramData.len & ")",
+          )
+        let oldLen = buf.len
+        buf.setLen(oldLen + r.len)
+        buf.writeBytesAt(oldLen, paramData.toOpenArray(r.off, r.off + r.len - 1))
   buf.addInt16(int16(resultFormats.len))
   for f in resultFormats:
     buf.addInt16(f)
@@ -564,8 +688,7 @@ proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
   buf[oldLen + 2] = byte((msgLen shr 16) and 0xFF)
   buf[oldLen + 3] = byte((msgLen shr 8) and 0xFF)
   buf[oldLen + 4] = byte(msgLen and 0xFF)
-  if data.len > 0:
-    copyMem(addr buf[oldLen + 5], unsafeAddr data[0], data.len)
+  buf.writeBytesAt(oldLen + 5, data)
 
 proc encodeCopyDone*(): seq[byte] =
   ## Encode a standalone CopyDone message.
@@ -635,6 +758,8 @@ proc parseDataRow(body: openArray[byte]): BackendMessage =
     raise newException(ProtocolError, "DataRow message too short")
   result = BackendMessage(kind: bmkDataRow)
   let numCols = decodeInt16(body, 0)
+  if numCols < 0:
+    raise newException(ProtocolError, "DataRow: invalid column count " & $numCols)
   result.columns = newSeq[Option[seq[byte]]](numCols)
   var offset = 2
   for i in 0 ..< numCols:
@@ -697,6 +822,9 @@ proc parseRowDescription(body: openArray[byte]): BackendMessage =
     raise newException(ProtocolError, "RowDescription message too short")
   result = BackendMessage(kind: bmkRowDescription)
   let numFields = decodeInt16(body, 0)
+  if numFields < 0:
+    raise
+      newException(ProtocolError, "RowDescription: invalid field count " & $numFields)
   result.fields = newSeq[FieldDescription](numFields)
   var offset = 2
   for i in 0 ..< numFields:
@@ -734,6 +862,10 @@ proc parseParameterDescription(body: openArray[byte]): BackendMessage =
     raise newException(ProtocolError, "ParameterDescription too short")
   result = BackendMessage(kind: bmkParameterDescription)
   let numParams = decodeInt16(body, 0)
+  if numParams < 0:
+    raise newException(
+      ProtocolError, "ParameterDescription: invalid param count " & $numParams
+    )
   result.paramTypeOids = newSeq[int32](numParams)
   var offset = 2
   for i in 0 ..< numParams:
@@ -751,6 +883,8 @@ proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
     result = BackendMessage(kind: bmkCopyOutResponse)
   result.copyFormat = if body[0] == 0: cfText else: cfBinary
   let numCols = decodeInt16(body, 1)
+  if numCols < 0:
+    raise newException(ProtocolError, "CopyResponse: invalid column count " & $numCols)
   result.copyColumnFormats = newSeq[int16](numCols)
   var offset = 3
   for i in 0 ..< numCols:
@@ -765,6 +899,9 @@ proc parseCopyBothResponse(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkCopyBothResponse)
   result.copyFormat = if body[0] == 0: cfText else: cfBinary
   let numCols = decodeInt16(body, 1)
+  if numCols < 0:
+    raise
+      newException(ProtocolError, "CopyBothResponse: invalid column count " & $numCols)
   result.copyColumnFormats = newSeq[int16](numCols)
   var offset = 3
   for i in 0 ..< numCols:
@@ -818,6 +955,47 @@ proc reuseRowData*(rd: RowData, numCols: int16): RowData =
   result.colFormats.setLen(0)
   result.colTypeOids.setLen(0)
 
+proc clone*(row: Row): Row =
+  ## Return a deep copy of `row` with an independent `RowData` backing buffer
+  ## containing only this single row. Use this to retain rows from a
+  ## `queryEach` callback beyond the callback's lifetime — the original
+  ## buffer is reused for subsequent rows and would otherwise be overwritten.
+  if row.data == nil:
+    return Row(data: nil, rowIdx: 0)
+  let src = row.data
+  let numCols = src.numCols
+  let cellBase = int(row.rowIdx) * int(numCols) * 2
+  var total = 0
+  for i in 0 ..< int(numCols):
+    let clen = src.cellIndex[cellBase + i * 2 + 1]
+    if clen > 0:
+      total += int(clen)
+  let rd = RowData(
+    numCols: numCols,
+    colFormats: src.colFormats,
+    colTypeOids: src.colTypeOids,
+    fields: src.fields,
+    colMap: src.colMap,
+    cellIndex: newSeq[int32](int(numCols) * 2),
+    buf: newSeq[byte](total),
+  )
+  var pos = 0
+  for i in 0 ..< int(numCols):
+    let srcOff = int(src.cellIndex[cellBase + i * 2])
+    let clen = src.cellIndex[cellBase + i * 2 + 1]
+    if clen == -1:
+      rd.cellIndex[i * 2] = 0'i32
+      rd.cellIndex[i * 2 + 1] = -1'i32
+    elif clen == 0:
+      rd.cellIndex[i * 2] = 0'i32
+      rd.cellIndex[i * 2 + 1] = 0'i32
+    else:
+      rd.buf.writeBytesAt(pos, src.buf.toOpenArray(srcOff, srcOff + int(clen) - 1))
+      rd.cellIndex[i * 2] = int32(pos)
+      rd.cellIndex[i * 2 + 1] = clen
+      pos += int(clen)
+  Row(data: rd, rowIdx: 0)
+
 proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
   ## Build per-column binary format codes: 1 for known safe types, 0 for others.
   result = newSeq[int16](fields.len)
@@ -847,6 +1025,8 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   if body.len < 2:
     raise newException(ProtocolError, "DataRow message too short")
   let numCols = decodeInt16(body, 0)
+  if numCols < 0:
+    raise newException(ProtocolError, "DataRow: invalid column count " & $numCols)
   # Pre-extend cellIndex for this row
   let cellBase = rd.cellIndex.len
   rd.cellIndex.setLen(cellBase + int(numCols) * 2)
@@ -855,7 +1035,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   let dataLen = body.len - 2
   rd.buf.setLen(bufBase + dataLen)
   if dataLen > 0:
-    copyMem(addr rd.buf[bufBase], unsafeAddr body[2], dataLen)
+    rd.buf.writeBytesAt(bufBase, body.toOpenArray(2, 2 + dataLen - 1))
   # Walk the copied buffer to build cellIndex
   var pos = bufBase # current position in rd.buf
   let bufEnd = bufBase + dataLen
@@ -888,12 +1068,27 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
 
 # Streaming backend message parser
 
+const DefaultMaxBackendMessageLen* = 1024 * 1024 * 1024
+  ## Default upper bound on a single backend message (header + body), 1 GiB.
+  ## Prevents a malicious or broken server from causing unbounded recv-buffer
+  ## growth (and OOM) by advertising an int32-max length. PostgreSQL itself
+  ## bounds individual values by `MaxAllocSize` (~1 GiB - 1), so legitimate
+  ## traffic stays well below this cap.
+
 proc parseBackendMessage*(
-    buf: openArray[byte], consumed: var int, rowData: RowData = nil
-): ParseResult =
+    buf: openArray[byte],
+    consumed: var int,
+    rowData: RowData = nil,
+    maxLen: int = DefaultMaxBackendMessageLen,
+): ParseResult {.raises: [ProtocolError].} =
   ## Parse a single backend message from `buf`.
   ## On success, sets `consumed` to the number of bytes used.
   ## The caller is responsible for discarding those bytes from the buffer.
+  ## A message whose declared length exceeds `maxLen` is rejected with
+  ## `ProtocolError` before any allocation, capping recv-buffer growth.
+  ## ``maxLen <= 0`` disables the cap (intended for tests); production
+  ## callers should resolve the default via ``ConnConfig.maxMessageSize``
+  ## and ``effectiveMaxMessageSize``.
   consumed = 0
 
   # Need at least 5 bytes: 1 type + 4 length
@@ -905,6 +1100,15 @@ proc parseBackendMessage*(
 
   if msgLen < 4:
     raise newException(ProtocolError, "Invalid message length: " & $msgLen)
+  # Compare in int64 to avoid overflow on 32-bit platforms where `int` is
+  # 32-bit and `msgLen + 1` would wrap when msgLen approaches int32.high.
+  # Total message size is `msgLen + 1` (type byte), so reject when that
+  # would exceed maxLen, i.e. when `msgLen >= maxLen`.
+  if maxLen > 0 and int64(msgLen) >= int64(maxLen):
+    raise newException(
+      ProtocolError,
+      "Backend message too large: " & $msgLen & " bytes (max " & $maxLen & ")",
+    )
 
   let totalLen = int(msgLen) + 1 # type byte + length field + body
   if buf.len < totalLen:
@@ -912,9 +1116,9 @@ proc parseBackendMessage*(
 
   # Body is the region after type byte and 4-byte length
   let bodyStart = 5
-  let bodyEnd = bodyStart + int(msgLen) - 4 - 1
+  let bodyLen = int(msgLen) - 4 # msgLen includes the 4-byte length field itself
   template body(): untyped =
-    buf.toOpenArray(bodyStart, bodyEnd)
+    buf.toOpenArray(bodyStart, bodyStart + bodyLen - 1)
 
   var msg: BackendMessage
 
@@ -1003,9 +1207,7 @@ proc formatError*(fields: seq[ErrorField]): string =
 
 proc addCopyBinaryHeader*(buf: var seq[byte]) =
   ## Append the PostgreSQL binary COPY header (signature + flags + extension area).
-  let oldLen = buf.len
-  buf.setLen(oldLen + pgCopyBinaryHeader.len)
-  copyMem(addr buf[oldLen], unsafeAddr pgCopyBinaryHeader[0], pgCopyBinaryHeader.len)
+  buf.appendBytes(pgCopyBinaryHeader)
 
 proc addCopyBinaryTrailer*(buf: var seq[byte]) =
   ## Append the binary COPY trailer (int16 = -1).
@@ -1053,18 +1255,13 @@ proc addCopyFieldBool*(buf: var seq[byte], val: bool) =
 proc addCopyFieldText*(buf: var seq[byte], val: openArray[byte]) =
   ## Append a raw byte field in binary COPY format.
   buf.addInt32(int32(val.len))
-  if val.len > 0:
-    let oldLen = buf.len
-    buf.setLen(oldLen + val.len)
-    copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
+  buf.appendBytes(val)
 
 proc addCopyFieldString*(buf: var seq[byte], val: string) =
   ## Append a string field in binary COPY format.
   buf.addInt32(int32(val.len))
   if val.len > 0:
-    let oldLen = buf.len
-    buf.setLen(oldLen + val.len)
-    copyMem(addr buf[oldLen], unsafeAddr val[0], val.len)
+    buf.appendBytes(val.toOpenArrayByte(0, val.high))
 
 # Replication protocol helpers
 

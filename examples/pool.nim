@@ -6,20 +6,19 @@
 ## Usage:
 ##   nim c -r examples/pool.nim
 
-import std/options
 import pkg/async_postgres
 
 proc main() {.async.} =
-  let connConfig = ConnConfig(
-    host: "127.0.0.1",
-    port: 15432,
-    user: "test",
-    password: "test",
-    database: "test",
-    sslMode: sslDisable,
+  let connConfig = initConnConfig(
+    host = "127.0.0.1",
+    port = 15432,
+    user = "test",
+    password = "test",
+    database = "test",
+    sslMode = sslDisable,
   )
 
-  let pool = await newPool(PoolConfig(connConfig: connConfig, minSize: 2, maxSize: 5))
+  let pool = await newPool(initPoolConfig(connConfig, minSize = 2, maxSize = 5))
   defer:
     await pool.close()
 
@@ -42,15 +41,16 @@ proc main() {.async.} =
 
   # Run concurrent queries using withConnection
   proc countExpensive(): Future[int64] {.async.} =
+    let minPrice = 150'i32
     pool.withConnection(conn):
       return await conn.queryValue(
-        int64, "SELECT count(*) FROM products WHERE price > $1", @[toPgParam(150'i32)]
+        int64, sql"SELECT count(*) FROM products WHERE price > {minPrice}"
       )
 
   proc cheapest(): Future[string] {.async.} =
     pool.withConnection(conn):
-      let row = await conn.queryOne("SELECT name FROM products ORDER BY price LIMIT 1")
-      return options.get(row).getStr("name")
+      let row = await conn.queryRow("SELECT name FROM products ORDER BY price LIMIT 1")
+      return row.getStr("name")
 
   # Launch concurrently, then await each result
   let expCountFut = countExpensive()

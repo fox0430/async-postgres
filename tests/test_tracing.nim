@@ -110,6 +110,24 @@ type
     wasClosed: bool
     handedToWaiter: bool
 
+  PoolCloseErrorRec = object
+    hasConn: bool
+    errMsg: string
+
+  TransportCloseErrorRec = object
+    hasConn: bool
+    stage: TransportCloseStage
+    errMsg: string
+
+  InsecureAuthRec = object
+    hasConn: bool
+    authMethod: AuthMethod
+    sslEnabled: bool
+
+  DeprecatedAuthRec = object
+    hasConn: bool
+    authMethod: AuthMethod
+
   TraceLog = ref object
     connectStarts: seq[ConnectStartRec]
     connectEnds: seq[ConnectEndRec]
@@ -125,6 +143,10 @@ type
     poolAcquireEnds: seq[PoolAcquireEndRec]
     poolReleaseStarts: seq[PoolReleaseStartRec]
     poolReleaseEnds: seq[PoolReleaseEndRec]
+    poolCloseErrors: seq[PoolCloseErrorRec]
+    transportCloseErrors: seq[TransportCloseErrorRec]
+    insecureAuths: seq[InsecureAuthRec]
+    deprecatedAuths: seq[DeprecatedAuthRec]
 
 proc newTraceLog(): TraceLog =
   TraceLog()
@@ -247,6 +269,38 @@ proc buildTracer(log: TraceLog): PgTracer =
       PoolReleaseEndRec(
         spanId: span.id, wasClosed: data.wasClosed, handedToWaiter: data.handedToWaiter
       )
+    )
+
+  tracer.onPoolCloseError = proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].} =
+    log.poolCloseErrors.add(
+      PoolCloseErrorRec(
+        hasConn: data.conn != nil, errMsg: (if data.err != nil: data.err.msg else: "")
+      )
+    )
+
+  tracer.onTransportCloseError = proc(
+      data: TraceTransportCloseErrorData
+  ) {.gcsafe, raises: [].} =
+    log.transportCloseErrors.add(
+      TransportCloseErrorRec(
+        hasConn: data.conn != nil,
+        stage: data.stage,
+        errMsg: (if data.err != nil: data.err.msg else: ""),
+      )
+    )
+
+  tracer.onInsecureAuth = proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].} =
+    log.insecureAuths.add(
+      InsecureAuthRec(
+        hasConn: data.conn != nil,
+        authMethod: data.authMethod,
+        sslEnabled: data.sslEnabled,
+      )
+    )
+
+  tracer.onDeprecatedAuth = proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].} =
+    log.deprecatedAuths.add(
+      DeprecatedAuthRec(hasConn: data.conn != nil, authMethod: data.authMethod)
     )
 
   return tracer
@@ -593,7 +647,7 @@ suite "Tracing: pool acquire/release":
       doAssert log.poolAcquireEnds[0].wasCreated == true
       doAssert not log.poolAcquireEnds[0].hasErr
 
-      pool.release(conn)
+      conn.release()
 
       doAssert log.poolReleaseStarts.len == 1
       doAssert log.poolReleaseStarts[0].hasConn
@@ -608,7 +662,7 @@ suite "Tracing: pool acquire/release":
       doAssert log.poolAcquireEnds.len == 2
       doAssert log.poolAcquireEnds[1].wasCreated == false
 
-      pool.release(conn2)
+      conn2.release()
       await pool.close()
 
     waitFor t()
@@ -625,17 +679,196 @@ suite "Tracing: pool acquire/release":
       # maxSize=1, so next acquire will wait
       let fut = pool.acquire()
       # Release conn1 -- should hand to the waiter
-      pool.release(conn1)
+      conn1.release()
       let conn2 = await fut
 
       doAssert log.poolReleaseEnds.len == 1
       doAssert not log.poolReleaseEnds[0].wasClosed
       doAssert log.poolReleaseEnds[0].handedToWaiter
 
-      pool.release(conn2)
+      conn2.release()
       await pool.close()
 
     waitFor t()
+
+suite "Tracing: pool close errors":
+  test "onPoolCloseError reports swallowed close failures":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      let conn = await pool.acquire()
+
+      # Drive the hook through reportCloseError — the single chokepoint that
+      # tracedClose funnels errors through. Inducing a real conn.close() failure
+      # is impractical in tests: close() is idempotent and its only raising path
+      # is inside sendMsg, which it already swallows internally.
+      let err = newException(PgError, "simulated close failure")
+      pool.reportCloseError(conn, err)
+
+      doAssert log.poolCloseErrors.len == 1
+      doAssert log.poolCloseErrors[0].hasConn
+      doAssert log.poolCloseErrors[0].errMsg == "simulated close failure"
+
+      conn.release()
+      await pool.close()
+
+    waitFor t()
+
+  test "nil onPoolCloseError hook is a no-op":
+    proc t() {.async.} =
+      # Build a tracer that sets OTHER hooks but leaves onPoolCloseError nil.
+      let tracer = PgTracer()
+      var poolCfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      let conn = await pool.acquire()
+      # Must not raise even though the hook is nil.
+      pool.reportCloseError(conn, newException(PgError, "ignored"))
+
+      conn.release()
+      await pool.close()
+
+    waitFor t()
+
+  test "tracedClose on healthy connection does not fire hook":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      # Use a stand-alone connection so pool.active/idle counters stay
+      # consistent — tracedClose only touches the tracer, not pool state.
+      let conn = await connect(tracedConfig(tracer))
+      await pool.tracedClose(conn)
+
+      doAssert log.poolCloseErrors.len == 0
+
+      await pool.close()
+
+    waitFor t()
+
+  test "tracedClose on already-closed connection is a no-op":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 1)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      # conn.close() is documented as idempotent. tracedClose against an
+      # already-closed conn exercises the real close path end-to-end and must
+      # neither raise nor fire the error hook.
+      let conn = await connect(tracedConfig(tracer))
+      await conn.close()
+      await pool.tracedClose(conn)
+
+      doAssert log.poolCloseErrors.len == 0
+
+      await pool.close()
+
+    waitFor t()
+
+suite "Tracing: transport close errors":
+  when hasChronos:
+    test "onTransportCloseError reports swallowed close failures":
+      proc t() {.async.} =
+        let log = newTraceLog()
+        let tracer = buildTracer(log)
+        let conn = await connect(tracedConfig(tracer))
+
+        # Drive the hook directly — inducing a real closeWait() failure is
+        # impractical (the chronos streams swallow most peer-side faults
+        # internally), so we exercise the chokepoint that closeTransport
+        # funnels every swallowed close error through.
+        let err = newException(PgError, "simulated tls close failure")
+        conn.fireTransportCloseError(tcsTlsReader, err)
+
+        doAssert log.transportCloseErrors.len == 1
+        doAssert log.transportCloseErrors[0].hasConn
+        doAssert log.transportCloseErrors[0].stage == tcsTlsReader
+        doAssert log.transportCloseErrors[0].errMsg == "simulated tls close failure"
+
+        await conn.close()
+
+      waitFor t()
+
+    test "every stage value round-trips through the hook":
+      proc t() {.async.} =
+        let log = newTraceLog()
+        let tracer = buildTracer(log)
+        let conn = await connect(tracedConfig(tracer))
+
+        const stages =
+          [tcsTlsReader, tcsTlsWriter, tcsBaseReader, tcsBaseWriter, tcsTransport]
+        for stage in stages:
+          conn.fireTransportCloseError(stage, newException(PgError, "x"))
+
+        doAssert log.transportCloseErrors.len == stages.len
+        for i in 0 ..< stages.len:
+          doAssert log.transportCloseErrors[i].stage == stages[i]
+          doAssert log.transportCloseErrors[i].errMsg == "x"
+
+        await conn.close()
+
+      waitFor t()
+
+    test "nil onTransportCloseError hook is a no-op":
+      proc t() {.async.} =
+        # Build a config with no tracer at all — fire must be a no-op.
+        let conn = await connect(plainConfig())
+        conn.fireTransportCloseError(tcsTransport, newException(PgError, "ignored"))
+
+        # Tracer present but the hook itself is nil — also a no-op.
+        let tracer = PgTracer()
+        var cfg = plainConfig()
+        cfg.tracer = tracer
+        let conn2 = await connect(cfg)
+        conn2.fireTransportCloseError(tcsBaseReader, newException(PgError, "ignored2"))
+
+        await conn.close()
+        await conn2.close()
+
+      waitFor t()
+
+  test "healthy close() does not fire onTransportCloseError":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      await conn.close()
+
+      doAssert log.transportCloseErrors.len == 0
+
+    waitFor t()
+
+  test "closeTransport wires every TransportCloseStage to a fire call":
+    # Structural guard. Inducing real closeWait() failures is impractical, so
+    # the behavioural tests above drive fireTransportCloseError directly and
+    # cannot catch regressions inside closeTransport itself (forgotten except
+    # clause, new stage without a fire call, new closeWait without wiring).
+    # This test reads the source and asserts the invariants mechanically.
+    const src = staticRead("../async_postgres/pg_connection.nim")
+    let body = src.split("proc closeTransport(")[1].split("\nproc ")[0]
+
+    for stage in [
+      "tcsTlsReader", "tcsTlsWriter", "tcsBaseReader", "tcsBaseWriter", "tcsTransport"
+    ]:
+      doAssert stage in body,
+        "closeTransport missing reference to " & stage &
+          " — fire call wiring is incomplete"
+
+    let closeWaits = body.count("closeWait()")
+    let fires = body.count("fireTransportCloseError(")
+    doAssert closeWaits == fires,
+      "closeTransport has " & $closeWaits & " closeWait() calls but " & $fires &
+        " fireTransportCloseError() calls — each closeWait must be paired with a fire"
 
 suite "Tracing: queryEach":
   test "onQueryStart and onQueryEnd are called with rowCount":
@@ -725,3 +958,119 @@ suite "Tracing: nil tracer":
       await conn.close()
 
     waitFor t()
+
+suite "Tracing: onInsecureAuth":
+  # These unit tests exercise the tracer closure directly via the public
+  # hook. End-to-end firing from the auth loop (cleartext over plaintext)
+  # requires a PG server configured to request `password` auth, which is
+  # out of scope for the current docker-compose setup.
+  test "closure receives method and transport state (plaintext)":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection()
+
+    tracer.onInsecureAuth(
+      TraceInsecureAuthData(conn: fake, authMethod: amPassword, sslEnabled: false)
+    )
+
+    check log.insecureAuths.len == 1
+    check log.insecureAuths[0].hasConn
+    check log.insecureAuths[0].authMethod == amPassword
+    check log.insecureAuths[0].sslEnabled == false
+
+  test "closure receives sslEnabled=true":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection()
+
+    tracer.onInsecureAuth(
+      TraceInsecureAuthData(conn: fake, authMethod: amPassword, sslEnabled: true)
+    )
+
+    check log.insecureAuths.len == 1
+    check log.insecureAuths[0].sslEnabled == true
+
+  test "PgTracer with nil onInsecureAuth hook is safe to leave unset":
+    let tracer = PgTracer()
+    check tracer.onInsecureAuth == nil
+
+suite "Tracing: onDeprecatedAuth":
+  # End-to-end firing from the auth loop (MD5 challenge) requires a PG
+  # server configured with `password_encryption = md5` and an md5-stored
+  # role, which is out of scope for the current docker-compose setup.
+  # These unit tests exercise the closure directly.
+  test "closure receives MD5 auth method":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection()
+
+    tracer.onDeprecatedAuth(TraceDeprecatedAuthData(conn: fake, authMethod: amMd5))
+
+    check log.deprecatedAuths.len == 1
+    check log.deprecatedAuths[0].hasConn
+    check log.deprecatedAuths[0].authMethod == amMd5
+
+  test "PgTracer with nil onDeprecatedAuth hook is safe to leave unset":
+    let tracer = PgTracer()
+    check tracer.onDeprecatedAuth == nil
+
+suite "filterSaslByRequireAuth":
+  test "empty allowed set performs no filtering":
+    let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+    check filterSaslByRequireAuth(mechs, {}) == mechs
+
+  test "drops PLUS when only SCRAM allowed":
+    let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+    check filterSaslByRequireAuth(mechs, {amScramSha256}) == @["SCRAM-SHA-256"]
+
+  test "drops SCRAM when only PLUS allowed":
+    let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
+    check filterSaslByRequireAuth(mechs, {amScramSha256Plus}) == @["SCRAM-SHA-256-PLUS"]
+
+  test "empty result when nothing matches":
+    let mechs = @["SCRAM-SHA-256"]
+    check filterSaslByRequireAuth(mechs, {amMd5}).len == 0
+
+  test "unrelated non-SCRAM methods in allowlist do not add mechanisms":
+    let mechs = @["SCRAM-SHA-256"]
+    check filterSaslByRequireAuth(mechs, {amScramSha256, amMd5, amPassword}) ==
+      @["SCRAM-SHA-256"]
+
+suite "Tracing: requireAuth happy path":
+  test "accepts SCRAM when explicitly allowed":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.requireAuth = {amScramSha256, amScramSha256Plus}
+      let conn = await connect(cfg)
+      doAssert conn != nil
+      discard await conn.exec("SELECT 1")
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: requireAuth negative path":
+  # These tests require the docker-compose PG to use SCRAM auth (the default
+  # for modern postgres images). If the server ever switches to trust/md5,
+  # the expected error message will differ but the connect must still fail.
+  proc connectRaises(requireAuth: set[AuthMethod]): bool =
+    var raised = false
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.requireAuth = requireAuth
+      try:
+        let conn = await connect(cfg)
+        await conn.close()
+      except PgConnectionError:
+        raised = true
+
+    waitFor t()
+    raised
+
+  test "rejects when only md5 is allowed against SCRAM server":
+    check connectRaises({amMd5})
+
+  test "rejects when only password is allowed against SCRAM server":
+    check connectRaises({amPassword})
+
+  test "rejects when only amNone is allowed against SCRAM server":
+    check connectRaises({amNone})

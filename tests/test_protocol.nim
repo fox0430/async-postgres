@@ -1,6 +1,9 @@
-import std/[unittest, options, strutils]
+import std/[unittest, options, strutils, tables, importutils]
 
+import ../async_postgres/async_backend
 import ../async_postgres/[pg_protocol, pg_connection]
+
+privateAccess(PgConnection)
 
 proc parseBackendMessage(buf: var seq[byte]): ParseResult =
   ## Test-only wrapper that preserves the old var-buf interface.
@@ -48,9 +51,8 @@ suite "Byte helpers":
 
   test "decodeCString at end of buffer":
     let buf = @[byte('a'), 0'u8]
-    let (s, consumed) = decodeCString(buf, 2)
-    check s == ""
-    check consumed == 0
+    expect(ProtocolError):
+      discard decodeCString(buf, 2)
 
   test "decodeCString offset past end of buffer":
     let buf = @[byte('a'), 0'u8]
@@ -61,6 +63,11 @@ suite "Byte helpers":
     let buf: seq[byte] = @[]
     expect(ProtocolError):
       discard decodeCString(buf, 1)
+
+  test "decodeCString missing null terminator":
+    let buf = @[byte('h'), byte('i')]
+    expect(ProtocolError):
+      discard decodeCString(buf, 0)
 
 suite "Frontend encoding":
   test "encodeStartup - no type byte, version 3.0":
@@ -687,6 +694,31 @@ suite "Backend decoding - edge cases":
     expect ProtocolError:
       discard parseBackendMessage(buf)
 
+  test "oversized message length raises ProtocolError before allocation":
+    # Header advertises a near-int32-max body; without a cap this would
+    # cause the recv loop to grow recvBuf until OOM. The parser must
+    # reject such headers before any further read.
+    var buf = @[byte('D'), 0x7F'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8] # msgLen = int32.high
+    expect ProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "configurable maxLen rejects header above caller's threshold":
+    # 100-byte body declared, but caller permits only 32 bytes total.
+    var buf = @[byte('C'), 0'u8, 0, 0, 100'u8]
+    var consumed: int
+    expect ProtocolError:
+      discard parseBackendMessage(buf, consumed, nil, 32)
+
+  test "maxLen permits message exactly at the limit":
+    # Build a CommandComplete ("C") of total size = 1 + 4 + 4 = 9 bytes.
+    var body: seq[byte] = @[]
+    body.addCString("OK")
+    var buf = buildMsg('C', body)
+    var consumed: int
+    let res = parseBackendMessage(buf, consumed, nil, buf.len)
+    check res.state == psComplete
+    check consumed == buf.len
+
   test "SASL with multiple mechanisms":
     var body: seq[byte] = @[]
     body.addInt32(10)
@@ -792,3 +824,71 @@ suite "Frontend encoding - edge cases":
     let msg = encodeCopyFail("")
     check msg[0] == byte('f')
     check decodeInt32(msg, 1) == int32(msg.len - 1)
+
+suite "nextMessage recvBufStart update":
+  proc buildMsg(msgType: char, body: seq[byte]): seq[byte] =
+    result = @[byte(msgType)]
+    result.addInt32(int32(4 + body.len))
+    result.add(body)
+
+  proc buildDataRowMsg(values: openArray[string]): seq[byte] =
+    var body: seq[byte] = @[]
+    body.addInt16(int16(values.len))
+    for v in values:
+      body.addInt32(int32(v.len))
+      for c in v:
+        body.add(byte(c))
+    buildMsg('D', body)
+
+  proc mockConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "recvBufStart advances past DataRows on exception":
+    var conn = mockConn()
+    let validRow = buildDataRowMsg(["hello"])
+    # Build a malformed DataRow: claims 1 column but body is truncated
+    var badBody: seq[byte] = @[]
+    badBody.addInt16(1)
+    badBody.addInt32(-2) # invalid column length
+    let badRow = buildMsg('D', badBody)
+
+    conn.recvBuf = validRow & badRow
+    conn.recvBufStart = 0
+
+    var rd = newRowData(1)
+    var count: int32 = 0
+    expect ProtocolError:
+      discard conn.nextMessage(rd, addr count)
+
+    # recvBufStart should have advanced past the valid DataRow
+    check conn.recvBufStart == validRow.len
+
+  test "recvBufStart advances past multiple DataRows before non-DataRow":
+    var conn = mockConn()
+    let row1 = buildDataRowMsg(["a"])
+    let row2 = buildDataRowMsg(["bb"])
+    # CommandComplete: 'C' with tag "SELECT 2\0"
+    var ccBody: seq[byte] = @[]
+    for c in "SELECT 2":
+      ccBody.add(byte(c))
+    ccBody.add(0'u8)
+    let cc = buildMsg('C', ccBody)
+
+    conn.recvBuf = row1 & row2 & cc
+    conn.recvBufStart = 0
+
+    var rd = newRowData(1)
+    var count: int32 = 0
+    let opt = conn.nextMessage(rd, addr count)
+
+    check opt.isSome
+    check opt.get.kind == bmkCommandComplete
+    check count == 2
+    check conn.recvBufStart == row1.len + row2.len + cc.len
