@@ -166,8 +166,6 @@ type
       tlsStream: TLSAsyncStream
       trustAnchorBufs: seq[seq[byte]] ## Backing memory for custom trust anchor pointers
       x509Capture: X509CertCaptureContext ## X509 wrapper for cert capture
-      alpnNames: cstringArray
-        ## Backing storage for ALPN protocol names (must outlive TLS session)
     elif hasAsyncDispatch:
       socket: AsyncSocket
     serverCertDer: seq[byte] ## DER-encoded server certificate for SCRAM channel binding
@@ -1079,9 +1077,6 @@ proc closeTransport(conn: PgConnection) {.async.} =
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTlsWriter, e)
       conn.tlsStream = nil
-    if conn.alpnNames != nil:
-      deallocCStringArray(conn.alpnNames)
-      conn.alpnNames = nil
     if conn.baseReader != nil:
       try:
         await conn.baseReader.closeWait()
@@ -1125,6 +1120,13 @@ proc setupTls(conn: PgConnection, config: ConnConfig) {.async.} =
 
     let serverName = if config.sslMode == sslVerifyFull: config.host else: ""
 
+    # Direct SSL requires ALPN "postgresql" (PostgreSQL 17+, IANA-registered).
+    let alpnProtocols =
+      if config.sslNegotiation == sslnDirect:
+        @["postgresql"]
+      else:
+        @[]
+
     if config.sslRootCert.len > 0:
       let parsed = parseTrustAnchors(config.sslRootCert)
       conn.trustAnchorBufs = parsed.backing
@@ -1137,6 +1139,7 @@ proc setupTls(conn: PgConnection, config: ConnConfig) {.async.} =
         minVersion = TLSVersion.TLS12,
         maxVersion = TLSVersion.TLS12,
         trustAnchors = parsed.store,
+        alpnProtocols = alpnProtocols,
       )
     else:
       conn.tlsStream = newTLSClientAsyncStream(
@@ -1146,20 +1149,8 @@ proc setupTls(conn: PgConnection, config: ConnConfig) {.async.} =
         flags = flags,
         minVersion = TLSVersion.TLS12,
         maxVersion = TLSVersion.TLS12,
+        alpnProtocols = alpnProtocols,
       )
-    if config.sslNegotiation == sslnDirect:
-      # Direct SSL requires ALPN "postgresql" (PostgreSQL 17+).
-      # Must set ALPN then re-reset the client context so the handshake
-      # state machine picks up the protocol names for the ClientHello.
-      conn.alpnNames = allocCStringArray(["postgresql"])
-      let names = conn.alpnNames
-      {.
-        emit: [
-          conn.tlsStream[].ccontext.eng, ".protocol_names = (const char **)", names, ";"
-        ]
-      .}
-      conn.tlsStream.ccontext.eng.protocolNamesNum = 1
-      discard sslClientReset(conn.tlsStream.ccontext, nil, 0)
     installX509Capture(
       conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
     )
