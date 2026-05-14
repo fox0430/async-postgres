@@ -1,4 +1,4 @@
-import std/[tables, sets, strutils, uri, deques, options, lists]
+import std/[tables, sets, strutils, uri, deques, options, lists, os]
 when defined(posix):
   import std/posix
 
@@ -12,7 +12,7 @@ elif hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, SockType, Protocol
   when defined(ssl):
-    import std/[net, openssl, tempfiles, os]
+    import std/[net, openssl, tempfiles]
 
 export pg_errors
 
@@ -90,6 +90,16 @@ type
     database*: string
     sslMode*: SslMode
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    sslCert*: string
+      ## PEM-encoded client certificate (and any intermediates) for mutual TLS.
+      ## Must be paired with ``sslKey``; ``sslMode`` must also be ``sslPrefer``
+      ## or stronger, otherwise TLS would not be negotiated and the credential
+      ## would be silently unused — config validation rejects that.
+    sslKey*: string
+      ## PEM-encoded client private key for mutual TLS. The key must be
+      ## **unencrypted** on both backends (no passphrase callback is wired up).
+      ## On chronos/BearSSL specifically it must be PKCS#8 (RSA or EC); PKCS#1
+      ## is not supported. Must be paired with ``sslCert``.
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
@@ -1097,6 +1107,12 @@ proc closeTransport(conn: PgConnection) {.async.} =
 
 proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
   ## Send SSLRequest and negotiate TLS if server accepts.
+  if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
+    raise newException(
+      PgConnectionError,
+      "sslcert and sslkey must be provided together for client certificate auth",
+    )
+
   let sslReq = encodeSSLRequest()
   var respChar: char
 
@@ -1131,6 +1147,21 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
 
       let serverName = if config.sslMode == sslVerifyFull: config.host else: ""
 
+      # ``newTLSClientAsyncStream`` stores these on ``TLSAsyncStream``
+      # (clientCertificate/clientPrivateKey) so BearSSL keeps a valid
+      # reference for the lifetime of conn.tlsStream — no extra retention
+      # on PgConnection is needed (unlike trustAnchorBufs above).
+      var clientCert: TLSCertificate
+      var clientKey: TLSPrivateKey
+      if config.sslCert.len > 0 and config.sslKey.len > 0:
+        try:
+          clientCert = TLSCertificate.init(config.sslCert)
+          clientKey = TLSPrivateKey.init(config.sslKey)
+        except TLSStreamProtocolError as e:
+          raise newException(
+            PgConnectionError, "Failed to load client certificate/key: " & e.msg
+          )
+
       if config.sslRootCert.len > 0:
         let parsed = parseTrustAnchors(config.sslRootCert)
         conn.trustAnchorBufs = parsed.backing
@@ -1143,6 +1174,8 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
           minVersion = TLSVersion.TLS12,
           maxVersion = TLSVersion.TLS12,
           trustAnchors = parsed.store,
+          certificate = clientCert,
+          privateKey = clientKey,
         )
       else:
         conn.tlsStream = newTLSClientAsyncStream(
@@ -1152,6 +1185,8 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
           flags = flags,
           minVersion = TLSVersion.TLS12,
           maxVersion = TLSVersion.TLS12,
+          certificate = clientCert,
+          privateKey = clientKey,
         )
       installX509Capture(
         conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
@@ -1168,21 +1203,36 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
           else: SslCVerifyMode.CVerifyNone
 
         var ctx: SslContext
-        var tmpPath: string
-        if config.sslRootCert.len > 0:
-          let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
-          tmpPath = tp
-          try:
-            tmpFile.write(config.sslRootCert)
-            tmpFile.close()
-            ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
-          except:
-            removeFile(tmpPath)
-            raise
-        else:
-          ctx = newContext(verifyMode = verifyMode)
+        var tmpPaths: seq[string]
 
         try:
+          var caPath, certPath, keyPath: string
+          if config.sslRootCert.len > 0:
+            let (f, p) = createTempFile("pg_ca_", ".pem")
+            tmpPaths.add(p)
+            f.write(config.sslRootCert)
+            f.close()
+            caPath = p
+          if config.sslCert.len > 0:
+            let (f, p) = createTempFile("pg_cert_", ".pem")
+            tmpPaths.add(p)
+            f.write(config.sslCert)
+            f.close()
+            certPath = p
+          if config.sslKey.len > 0:
+            let (f, p) = createTempFile("pg_key_", ".pem")
+            tmpPaths.add(p)
+            f.write(config.sslKey)
+            f.close()
+            keyPath = p
+
+          ctx = newContext(
+            verifyMode = verifyMode,
+            certFile = certPath,
+            keyFile = keyPath,
+            caFile = caPath,
+          )
+
           let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
           wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
           conn.sslEnabled = true
@@ -1198,8 +1248,15 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
             finally:
               X509_free(peerCert)
         finally:
-          if tmpPath.len > 0:
-            removeFile(tmpPath)
+          # Each removal is wrapped so one failure does not skip the rest, but
+          # we still surface failures because tmpPaths may contain the client
+          # private key PEM — silently leaving it in /tmp would be a footgun.
+          for p in tmpPaths:
+            try:
+              removeFile(p)
+            except OSError as e:
+              stderr.writeLine "pg_connection: failed to remove temp SSL file " & p &
+                ": " & e.msg
       else:
         raise
           newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
@@ -2354,6 +2411,42 @@ proc parsePort(s: string): int =
   if result < 1 or result > 65535:
     raise newException(PgError, "Port out of range (1-65535): " & s)
 
+proc validateClientCertConfig(config: ConnConfig) =
+  ## Reject inconsistent client certificate configurations early (at config
+  ## build time, before any connection is opened). Both halves of an mTLS
+  ## credential must be present together, and the SSL mode must actually
+  ## negotiate TLS — otherwise the cert/key would be silently ignored.
+  if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
+    raise newException(
+      PgError,
+      "sslcert and sslkey must be provided together for client certificate auth",
+    )
+  if (config.sslCert.len > 0 or config.sslKey.len > 0) and
+      config.sslMode in {sslDisable, sslAllow}:
+    raise newException(
+      PgError,
+      "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
+        "); they would otherwise be silently unused",
+    )
+
+proc checkPrivateKeyPermissions(path: string) =
+  ## Reject SSL key files that are group- or world-accessible (libpq parity:
+  ## libpq refuses keys with permissions outside ``0600`` on POSIX).
+  when defined(posix):
+    var perms: set[FilePermission]
+    try:
+      perms = getFilePermissions(path)
+    except OSError as e:
+      raise newException(PgError, "Cannot stat sslkey file: " & path & ": " & e.msg)
+    const forbidden = {
+      fpGroupRead, fpGroupWrite, fpGroupExec, fpOthersRead, fpOthersWrite, fpOthersExec
+    }
+    if (perms * forbidden).len > 0:
+      raise newException(
+        PgError,
+        "sslkey file has group or world accessible permissions, refusing to use: " & path,
+      )
+
 proc applyParam(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
   case key
@@ -2385,6 +2478,17 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       result.sslRootCert = readFile(val)
     except IOError:
       raise newException(PgError, "Cannot read sslrootcert file: " & val)
+  of "sslcert":
+    try:
+      result.sslCert = readFile(val)
+    except IOError:
+      raise newException(PgError, "Cannot read sslcert file: " & val)
+  of "sslkey":
+    checkPrivateKeyPermissions(val)
+    try:
+      result.sslKey = readFile(val)
+    except IOError:
+      raise newException(PgError, "Cannot read sslkey file: " & val)
   of "keepalives":
     try:
       result.keepAlive = parseInt(val) != 0
@@ -2609,6 +2713,8 @@ proc initConnConfig*(
     database = "",
     sslMode = sslDisable,
     sslRootCert = "",
+    sslCert = "",
+    sslKey = "",
     channelBinding = cbPrefer,
     applicationName = "",
     connectTimeout = ZeroDuration,
@@ -2624,7 +2730,7 @@ proc initConnConfig*(
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
-  ConnConfig(
+  result = ConnConfig(
     host: host,
     port: port,
     user: user,
@@ -2632,6 +2738,8 @@ proc initConnConfig*(
     database: database,
     sslMode: sslMode,
     sslRootCert: sslRootCert,
+    sslCert: sslCert,
+    sslKey: sslKey,
     channelBinding: channelBinding,
     applicationName: applicationName,
     connectTimeout: connectTimeout,
@@ -2645,6 +2753,7 @@ proc initConnConfig*(
     extraParams: extraParams,
     maxMessageSize: maxMessageSize,
   )
+  validateClientCertConfig(result)
 
 proc parseDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL connection string into a ConnConfig.
@@ -2655,9 +2764,10 @@ proc parseDsn*(dsn: string): ConnConfig =
   ##
   ## Both ``postgresql://`` and ``postgres://`` schemes are accepted for URI format.
   if dsn.startsWith("postgresql://") or dsn.startsWith("postgres://"):
-    parseUriDsn(dsn)
+    result = parseUriDsn(dsn)
   else:
-    parseKeyValueDsn(dsn)
+    result = parseKeyValueDsn(dsn)
+  validateClientCertConfig(result)
 
 proc connect*(dsn: string): Future[PgConnection] =
   ## Shorthand for ``connect(parseDsn(dsn))``.
