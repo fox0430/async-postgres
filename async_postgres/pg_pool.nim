@@ -563,9 +563,23 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         fut.read().release()
       raise newException(PgPoolError, "Pool acquire timeout")
   else:
-    let conn = await fut
-    recordAcquire()
-    return (conn, false)
+    try:
+      let conn = await fut
+      recordAcquire()
+      return (conn, false)
+    except CancelledError:
+      # The caller's `wait()`-style timeout (e.g. pool.withTransactionDeadline)
+      # cancelled this acquire. Mark the waiter so the next `release()` skips
+      # it instead of calling `complete()` on a finished+cancelled future
+      # (which would raise a Defect). Mirrors the AsyncTimeoutError path
+      # above. If `release()` slipped in and completed `fut` on the same tick
+      # the cancel arrived, hand the connection back to the pool instead of
+      # leaking it.
+      waiter.cancelled = true
+      pool.waiterCount.dec
+      if fut.completed():
+        fut.read().release()
+      raise
 
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## Acquire a connection from the pool. Tries idle connections first (with
@@ -1100,6 +1114,13 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
   ## directly — not `pool.exec(...)` / `pool.query(...)`. Pool methods acquire
   ## a separate connection, so those statements would run outside this transaction.
+  ##
+  ## **Timeout semantics:** The `timeout` argument applies *per-call* to
+  ## BEGIN, COMMIT, and ROLLBACK only — it does **not** bound `body` operations
+  ## or `pool.acquire()`. Worst-case wall-clock = acquire(unbounded) +
+  ## BEGIN(≤timeout) + body(unbounded) + COMMIT(≤timeout)
+  ## [+ ROLLBACK(≤timeout) on failure]. Use `withTransactionDeadline` for a
+  ## single wall-clock deadline covering acquire, BEGIN, body, and COMMIT.
   var connIdent, body: NimNode
   var beginSql: NimNode
   var txTimeout: NimNode
@@ -1152,6 +1173,142 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
     finally:
       await `resetSessionSym`(`poolSym`, `connIdent`)
       `connIdent`.release()
+
+macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
+  ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single
+  ## wall-clock deadline that covers `pool.acquire()`, BEGIN, the body, and
+  ## COMMIT together.
+  ##
+  ## Usage:
+  ##   pool.withTransactionDeadline(conn, seconds(5)):
+  ##     await conn.exec(...)
+  ##   pool.withTransactionDeadline(conn, TransactionOptions(...), seconds(5)):
+  ##     await conn.exec(...)
+  ##
+  ## **On deadline exceeded:** if a connection was already acquired, it is
+  ## invalidated via `invalidateOnTimeout` (marked `csClosed`) and the pool
+  ## drops it on release. ROLLBACK is *not* attempted. `PgTimeoutError` is
+  ## raised. If the timeout fires while still waiting for `acquire()`, the
+  ## waiter remains queued (cancelled best-effort) until the underlying
+  ## acquire future settles; this is unavoidable under asyncdispatch.
+  ##
+  ## **Edge case — acquire-completion race:** under asyncdispatch the only
+  ## preemption point is `await`, but the outer `wait` may still fire its
+  ## timeout on the same tick the body finishes. To avoid a false-positive
+  ## `PgTimeoutError` in that window, the timeout handler checks
+  ## `bodyFut.completed()` (success only) and, when true, returns normally
+  ## instead of reporting a timeout. A still-running or failed body falls
+  ## through to the standard invalidate-and-raise path. This narrows but
+  ## does not eliminate the race — a `PgTimeoutError` from this macro
+  ## still does **not** guarantee the transaction was rolled back if the
+  ## body was mid-flight when the timer won; it only guarantees the
+  ## *caller* gave up waiting.
+  ##
+  ## **On other body exceptions:** ROLLBACK is issued with
+  ## `rollbackGrace` per-call timeout.
+  ##
+  ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
+  ## directly — not `pool.exec(...)` / `pool.query(...)`. Pool methods acquire
+  ## a separate connection, so those statements would run outside this transaction.
+  var connIdent, body: NimNode
+  var beginSql: NimNode
+  var deadline: NimNode
+  case args.len
+  of 3:
+    # (conn, deadline, body)
+    connIdent = args[0]
+    deadline = args[1]
+    body = args[2]
+    beginSql = newStrLitNode("BEGIN")
+  of 4:
+    # (conn, opts, deadline, body)
+    connIdent = args[0]
+    beginSql = newCall(bindSym"buildBeginSql", args[1])
+    deadline = args[2]
+    body = args[3]
+  else:
+    error(
+      "withTransactionDeadline expects (conn, deadline, body) or (conn, opts, deadline, body)",
+      args[0],
+    )
+
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withTransactionDeadline is not allowed: COMMIT/ROLLBACK would be skipped",
+      body,
+    )
+
+  let poolExpr = pool
+  let poolSym = genSym(nskLet, "pool")
+  let eSym = genSym(nskLet, "e")
+  let totalDurSym = genSym(nskLet, "totalDur")
+  let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
+  let bodyFnSym = genSym(nskProc, "poolTxBodyDeadline")
+  let bodyFutSym = genSym(nskLet, "bodyFut")
+  let connOptSym = genSym(nskVar, "connOpt")
+  let resetSessionSym = bindSym"resetSession"
+  let tsInTxSym = bindSym"tsInTransaction"
+  let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let timeoutErrSym = bindSym"AsyncTimeoutError"
+  let waitSym = bindSym"wait"
+  let remainingSym = bindSym"remainingDeadlineDuration"
+  let graceSym = bindSym"rollbackGrace"
+  let invalidateSym = bindSym"invalidateOnTimeout"
+
+  result = quote:
+    let `poolSym` = `poolExpr`
+    let `totalDurSym` = `deadline`
+    let `deadlineMomentSym` = Moment.now() + `totalDurSym`
+    var `connOptSym` = none(PgConnection)
+    proc `bodyFnSym`(): Future[void] {.async.} =
+      let `connIdent` = await `poolSym`.acquire()
+      `connOptSym` = some(`connIdent`)
+      try:
+        discard await `connIdent`.simpleExec(
+          `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
+        )
+        try:
+          `body`
+          discard await `connIdent`.simpleExec(
+            "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
+          )
+        except CatchableError as `eSym`:
+          if `connIdent`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+            try:
+              discard await `connIdent`.simpleExec("ROLLBACK", timeout = `graceSym`)
+            except CatchableError:
+              discard
+          raise `eSym`
+      finally:
+        await `resetSessionSym`(`poolSym`, `connIdent`)
+        `connIdent`.release()
+
+    let `bodyFutSym` = `bodyFnSym`()
+    try:
+      await `waitSym`(`bodyFutSym`, `totalDurSym`)
+    except `timeoutErrSym`:
+      # Use `completed()` (= finished and *not* failed), not `finished()`:
+      # under chronos, `wait` cancels the inner future before raising
+      # `AsyncTimeoutError`, leaving it in finished+failed (CancelledError)
+      # state. Treating that as "done" would re-raise CancelledError
+      # instead of the intended PgTimeoutError. Only a genuine success-on-
+      # the-same-tick should suppress the timeout report.
+      if `bodyFutSym`.completed():
+        discard
+      elif `connOptSym`.isSome:
+        # invalidateOnTimeout marks the connection csClosed and raises
+        # PgTimeoutError — control does not return from this call.
+        # Ordering note: under chronos, `wait` cancels `bodyFut`, which runs
+        # `bodyFn`'s `finally` (resetSession + release) before this handler
+        # gets control. The connection has therefore already been returned
+        # to the pool when we invalidate it here. That is safe: the pool's
+        # next `acquire` health-check drops `csClosed` connections, so the
+        # bad conn cannot escape back to a caller.
+        `connOptSym`.get.`invalidateSym`("withTransactionDeadline (pool) exceeded")
+      else:
+        raise newException(
+          PgTimeoutError, "withTransactionDeadline (pool): acquire timed out"
+        )
 
 template withPipeline*(pool: PgPool, pipeline, body: untyped) =
   ## Acquire a connection, create a Pipeline, execute body, then release.
