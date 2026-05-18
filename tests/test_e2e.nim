@@ -1434,6 +1434,285 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+suite "E2E: Deadline-bounded Transaction":
+  test "withTransactionDeadline commits on success":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txd")
+      discard await conn.exec("CREATE TABLE test_txd (id serial PRIMARY KEY, val text)")
+
+      conn.withTransactionDeadline(seconds(5)):
+        discard await conn.exec(
+          "INSERT INTO test_txd (val) VALUES ($1)", @[toPgParam("deadline_commit")]
+        )
+
+      let res = await conn.query("SELECT val FROM test_txd")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "deadline_commit"
+      doAssert conn.txStatus == tsIdle
+
+      discard await conn.exec("DROP TABLE test_txd")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline rolls back on body exception":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txd_rb")
+      discard
+        await conn.exec("CREATE TABLE test_txd_rb (id serial PRIMARY KEY, val text)")
+
+      var raised = false
+      var shouldRaise = true
+      try:
+        conn.withTransactionDeadline(seconds(5)):
+          discard await conn.exec(
+            "INSERT INTO test_txd_rb (val) VALUES ($1)", @[toPgParam("nope")]
+          )
+          if shouldRaise:
+            raise newException(ValueError, "intentional")
+      except ValueError:
+        raised = true
+
+      doAssert raised
+      let res = await conn.query("SELECT val FROM test_txd_rb")
+      doAssert res.rows.len == 0
+      doAssert conn.txStatus == tsIdle
+
+      discard await conn.exec("DROP TABLE test_txd_rb")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline raises PgTimeoutError when body exceeds deadline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var raised = false
+      try:
+        conn.withTransactionDeadline(milliseconds(300)):
+          # pg_sleep blocks server-side for 2s — exceeds the 300ms deadline.
+          discard await conn.query("SELECT pg_sleep(2)")
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      # Connection is invalidated; not safe to reuse.
+      doAssert conn.state == csClosed
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline with TransactionOptions commits":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      conn.withTransactionDeadline(
+        TransactionOptions(isolation: ilSerializable), seconds(5)
+      ):
+        let res = await conn.query("SELECT 1")
+        doAssert res.rows.len == 1
+
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepointDeadline releases on success":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_spd")
+      discard await conn.exec("CREATE TABLE test_spd (id serial PRIMARY KEY, val text)")
+
+      conn.withTransaction:
+        conn.withSavepointDeadline(seconds(5)):
+          discard await conn.exec(
+            "INSERT INTO test_spd (val) VALUES ($1)", @[toPgParam("sp_deadline")]
+          )
+
+      let res = await conn.query("SELECT val FROM test_spd")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "sp_deadline"
+
+      discard await conn.exec("DROP TABLE test_spd")
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepointDeadline rolls back to savepoint on body exception":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_spd_rb")
+      discard
+        await conn.exec("CREATE TABLE test_spd_rb (id serial PRIMARY KEY, val text)")
+
+      var shouldRaise = true
+      conn.withTransaction:
+        discard await conn.exec(
+          "INSERT INTO test_spd_rb (val) VALUES ($1)", @[toPgParam("outer")]
+        )
+        try:
+          conn.withSavepointDeadline("sp1", seconds(5)):
+            discard await conn.exec(
+              "INSERT INTO test_spd_rb (val) VALUES ($1)", @[toPgParam("inner")]
+            )
+            if shouldRaise:
+              raise newException(ValueError, "sp error")
+        except ValueError:
+          discard
+
+      let res = await conn.query("SELECT val FROM test_spd_rb ORDER BY id")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "outer"
+
+      discard await conn.exec("DROP TABLE test_spd_rb")
+      await conn.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline commits on success":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptxd")
+      discard
+        await pool.exec("CREATE TABLE test_ptxd (id serial PRIMARY KEY, val text)")
+
+      pool.withTransactionDeadline(conn, seconds(5)):
+        discard await conn.exec(
+          "INSERT INTO test_ptxd (val) VALUES ($1)", @[toPgParam("pool_deadline")]
+        )
+
+      let res = await pool.query("SELECT val FROM test_ptxd")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "pool_deadline"
+
+      discard await pool.exec("DROP TABLE test_ptxd")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline drops invalidated connection on deadline":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+
+      var raised = false
+      try:
+        pool.withTransactionDeadline(conn, milliseconds(300)):
+          discard await conn.query("SELECT pg_sleep(2)")
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      # Subsequent pool ops still work — the bad connection is dropped, not stuck.
+      let res = await pool.query("SELECT 1::int")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt(0) == 1'i32
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline raises PgTimeoutError when acquire times out":
+    proc t() {.async.} =
+      # maxSize=1: a single held connection forces the next acquire to queue.
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+      let blocker = await pool.acquire()
+
+      var bodyRan = false
+      var raised = false
+      try:
+        pool.withTransactionDeadline(conn, milliseconds(300)):
+          # Should never run — acquire must time out before BEGIN.
+          bodyRan = true
+          discard await conn.exec("SELECT 1")
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      doAssert not bodyRan
+
+      # Release blocker so any background-queued acquire (asyncdispatch) can
+      # settle, then poll until its bodyFn finishes BEGIN/COMMIT and releases
+      # the connection (activeCount returns to 0) before pool.close() runs.
+      # Bounded by a generous wall-clock cap to avoid hangs on regressions.
+      blocker.release()
+      let drainDeadline = Moment.now() + seconds(5)
+      while pool.activeCount > 0 and Moment.now() < drainDeadline:
+        await sleepAsync(milliseconds(10))
+      doAssert pool.activeCount == 0,
+        "background acquire did not drain within 5s (activeCount=" & $pool.activeCount &
+          ")"
+
+      # Pool should still be usable after the timeout.
+      let res = await pool.query("SELECT 1::int")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt(0) == 1'i32
+
+      await pool.close()
+
+    waitFor t()
+
+  test "withSavepointDeadline raises PgTimeoutError when body exceeds deadline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var raised = false
+      try:
+        # Interaction note: the inner deadline fires and invalidates the
+        # connection (csClosed) before raising PgTimeoutError. The outer
+        # withTransaction's `except CatchableError` then tries ROLLBACK on
+        # the closed connection — that simpleExec fails immediately, but
+        # withTransaction's inner try/except swallows the cleanup error and
+        # re-raises the original PgTimeoutError, which is what we catch here.
+        conn.withTransaction:
+          conn.withSavepointDeadline(milliseconds(300)):
+            # pg_sleep blocks server-side for 2s — exceeds the 300ms deadline.
+            discard await conn.query("SELECT pg_sleep(2)")
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      # Connection is invalidated; not safe to reuse.
+      doAssert conn.state == csClosed
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepointDeadline with auto-generated name round-trips":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_spd_auto")
+      discard
+        await conn.exec("CREATE TABLE test_spd_auto (id serial PRIMARY KEY, val text)")
+
+      conn.withTransaction:
+        # No name argument — macro generates "_sp_<portalCounter>".
+        conn.withSavepointDeadline(seconds(5)):
+          discard await conn.exec(
+            "INSERT INTO test_spd_auto (val) VALUES ($1)", @[toPgParam("auto1")]
+          )
+        # Second auto-named savepoint in the same tx must get a distinct name.
+        conn.withSavepointDeadline(seconds(5)):
+          discard await conn.exec(
+            "INSERT INTO test_spd_auto (val) VALUES ($1)", @[toPgParam("auto2")]
+          )
+
+      let res = await conn.query("SELECT val FROM test_spd_auto ORDER BY id")
+      doAssert res.rows.len == 2
+      doAssert res.rows[0].getStr(0) == "auto1"
+      doAssert res.rows[1].getStr(0) == "auto2"
+
+      discard await conn.exec("DROP TABLE test_spd_auto")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":
     proc t() {.async.} =
