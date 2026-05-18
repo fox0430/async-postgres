@@ -181,27 +181,6 @@ proc execImpl*(
 proc exec*(
     conn: PgConnection,
     sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[string] {.async.} =
-  ## Execute a single SQL statement via extended query protocol, returning the command tag.
-  ## Only one statement is allowed; use `simpleQuery` for multiple statements.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await execImpl(conn, sql, params, paramOids, paramFormats, timeout).wait(
-        timeout
-      )
-    except AsyncTimeoutError:
-      conn.invalidateOnTimeout("Exec timed out")
-  else:
-    return await execImpl(conn, sql, params, paramOids, paramFormats)
-
-proc exec*(
-    conn: PgConnection,
-    sql: string,
     params: seq[PgParam] = @[],
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =

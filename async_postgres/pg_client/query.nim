@@ -238,29 +238,6 @@ proc queryEach*(
 proc query*(
     conn: PgConnection,
     sql: string,
-    params: seq[Option[seq[byte]]] = @[],
-    paramOids: seq[int32] = @[],
-    paramFormats: seq[int16] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
-): Future[QueryResult] {.async.} =
-  ## Execute a single SQL query via extended query protocol, returning rows.
-  ## Only one statement is allowed; use `simpleQuery` for multiple statements.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      return await queryImpl(
-        conn, sql, params, paramOids, paramFormats, resultFormats, timeout
-      )
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.invalidateOnTimeout("Query timed out")
-  else:
-    return await queryImpl(conn, sql, params, paramOids, paramFormats, resultFormats)
-
-proc query*(
-    conn: PgConnection,
-    sql: string,
     params: seq[PgParam] = @[],
     resultFormat: ResultFormat = rfAuto,
     timeout: Duration = ZeroDuration,
