@@ -376,6 +376,15 @@ proc patchMsgLen*(buf: var seq[byte], msgStart: int) {.inline.} =
 
 proc addCString*(buf: var seq[byte], s: string) =
   ## Append a null-terminated C string to the buffer.
+  ##
+  ## Raises ``ValueError`` if ``s`` contains an embedded NUL byte. PostgreSQL
+  ## protocol fields are NUL-terminated, so an embedded ``\0`` would split the
+  ## value into two fields on the server side — at best causing a desync
+  ## (`invalid message format`), at worst allowing startup-parameter injection
+  ## through the StartupMessage K/V stream.
+  for c in s:
+    if c == '\0':
+      raise newException(ValueError, "addCString: embedded NUL byte in protocol string")
   let oldLen = buf.len
   buf.setLen(oldLen + s.len + 1)
   if s.len > 0:
