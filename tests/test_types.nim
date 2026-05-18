@@ -5,7 +5,8 @@ import
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
-import ../async_postgres/pg_client {.all.}
+import ../async_postgres/pg_client
+import ../async_postgres/pg_client/core {.all.}
 
 type
   UsPostalCode = distinct string
