@@ -567,7 +567,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       let conn = await fut
       recordAcquire()
       return (conn, false)
-    except CancelledError:
+    except CancelledError as e:
       # The caller's `wait()`-style timeout (e.g. pool.withTransactionDeadline)
       # cancelled this acquire. Mark the waiter so the next `release()` skips
       # it instead of calling `complete()` on a finished+cancelled future
@@ -579,7 +579,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       pool.waiterCount.dec
       if fut.completed():
         fut.read().release()
-      raise
+      raise e
 
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## Acquire a connection from the pool. Tries idle connections first (with
