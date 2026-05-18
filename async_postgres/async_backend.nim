@@ -271,3 +271,24 @@ elif hasAsyncDispatch:
 
 else:
   {.fatal: "Unknown asyncBackend. Use -d:asyncBackend=asyncdispatch|chronos".}
+
+proc remainingDeadlineDuration*(deadline: Moment): Duration =
+  ## Compute the remaining Duration until `deadline`. When the deadline has
+  ## passed, returns 1 millisecond so the next `wait()` / `simpleExec(timeout)`
+  ## fires reliably. A `nanoseconds(1)` floor would be ignored by chronos's
+  ## `wait` when the awaited future completes synchronously (e.g. socket recv
+  ## with bytes already buffered), letting the loop run indefinitely; 1ms is
+  ## above chronos's timer resolution so the timer fires deterministically.
+  ## Returning `ZeroDuration` would mean "no timeout" in this codebase — the
+  ## opposite of what a missed deadline should do.
+  ##
+  ## **Practical minimum:** because of the 1ms floor and per-call event-loop
+  ## scheduling overhead, deadlines smaller than a few milliseconds are not
+  ## meaningfully enforced — the floor will kick in on the first call and
+  ## subsequent ms-level waits still need an event-loop tick to fire. Useful
+  ## deadlines for the `*Deadline` helpers start in the tens of milliseconds.
+  let now = Moment.now()
+  if deadline <= now:
+    milliseconds(1)
+  else:
+    deadline - now

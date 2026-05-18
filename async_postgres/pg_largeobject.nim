@@ -237,6 +237,10 @@ proc loReadAll*(
     timeout: Duration = ZeroDuration,
 ): Future[seq[byte]] {.async.} =
   ## Read the entire Large Object from the current position to EOF.
+  ##
+  ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
+  ## reach `N × timeout` for N chunks. Use `loReadAllDeadline` for a single
+  ## wall-clock deadline covering the whole read.
   result = @[]
   while true:
     let chunk = await lo.loRead(chunkSize, timeout)
@@ -251,6 +255,10 @@ proc loWriteAll*(
     timeout: Duration = ZeroDuration,
 ): Future[void] {.async.} =
   ## Write all of ``data``, splitting into chunks.
+  ##
+  ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
+  ## reach `N × timeout` for N chunks. Use `loWriteAllDeadline` for a single
+  ## wall-clock deadline covering the whole write.
   var offset = 0
   while offset < data.len:
     let endIdx = min(offset + chunkSize, data.len)
@@ -258,8 +266,7 @@ proc loWriteAll*(
     let written = await lo.loWrite(chunk, timeout)
     if written != int32(chunk.len):
       raise newException(
-        CatchableError,
-        "loWriteAll: partial write (" & $written & "/" & $chunk.len & " bytes)",
+        PgError, "loWriteAll: partial write (" & $written & "/" & $chunk.len & " bytes)"
       )
     offset = endIdx
 
@@ -267,9 +274,17 @@ proc loSize*(
     lo: LargeObject, timeout: Duration = ZeroDuration
 ): Future[int64] {.async.} =
   ## Return the total size of the Large Object in bytes.
+  ##
+  ## **Timeout semantics:** `timeout` applies *per call* to each of the 3
+  ## internal lo_tell/lo_seek operations. Total wall-clock can reach
+  ## `3 × timeout`. Use `loSizeDeadline` for a single wall-clock deadline
+  ## covering the operation as a whole.
+  ##
+  ## **Implementation:** uses `loSeek(0, SEEK_END)`'s return value (the new
+  ## absolute position) as the size directly, saving one round-trip over an
+  ## equivalent `loSeek + loTell` pair.
   let savedPos = await lo.loTell(timeout)
-  discard await lo.loSeek(0, SEEK_END, timeout)
-  result = await lo.loTell(timeout)
+  result = await lo.loSeek(0, SEEK_END, timeout)
   discard await lo.loSeek(savedPos, SEEK_SET, timeout)
 
 # Template
@@ -294,6 +309,10 @@ proc loReadStream*(
     timeout: Duration = ZeroDuration,
 ): Future[void] {.async.} =
   ## Read the Large Object in chunks, calling ``callback`` for each chunk.
+  ##
+  ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
+  ## reach `N × timeout` plus the cumulative callback runtime. Use
+  ## `loReadStreamDeadline` for a single wall-clock deadline.
   while true:
     let chunk = await lo.loRead(chunkSize, timeout)
     if chunk.len == 0:
@@ -308,8 +327,122 @@ proc loWriteStream*(
 ): Future[void] {.async.} =
   ## Write to the Large Object by repeatedly calling ``callback`` until it
   ## returns an empty ``seq[byte]``.
+  ##
+  ## **Timeout semantics:** `timeout` applies *per chunk* within each
+  ## `loWriteAll` invocation. Total wall-clock is unbounded. Use
+  ## `loWriteStreamDeadline` for a single wall-clock deadline.
   while true:
     let data = await callback()
     if data.len == 0:
       break
     await lo.loWriteAll(data, chunkSize, timeout)
+
+# Deadline-bounded API
+#
+# Each *Deadline variant accepts a Duration `deadline` that bounds the *total*
+# wall-clock spent across all internal lo_read/lo_write/lo_seek/lo_tell calls.
+# Each internal call receives the *remaining* time as its per-call timeout,
+# so the cumulative cost cannot exceed `deadline` plus a 1ms floor used by
+# `remainingDeadlineDuration` once the deadline is past. When the next
+# internal call fires with that 1ms timeout it raises `PgTimeoutError` from
+# `simpleExec`/`exec` and the underlying connection is invalidated (see
+# `invalidateOnTimeout`).
+#
+# **Best-effort, not a hard deadline.** Local Postgres responses can satisfy
+# `await reader.readOnce` synchronously when bytes are already in the recv
+# buffer, in which case chronos's `wait(fut, dur)` returns the value without
+# arming the timer (asyncfutures.nim wait/waitImpl). PostgreSQL's
+# `CancelRequest` over a side connection also does not arrive in time to
+# interrupt a stream of fast queries. Useful overall deadlines for these
+# helpers are therefore in the tens of milliseconds and up; sub-millisecond
+# deadlines are not guaranteed to fire mid-stream on either backend.
+#
+# **`chunkSize` types** mirror the non-deadline variants: `int32` for read
+# helpers (server `lo_read` takes int32), `int` for write helpers (host-side
+# slicing only). Keep this asymmetry; unifying would diverge from the
+# non-deadline API and force callers to cast.
+
+proc loReadAllDeadline*(
+    lo: LargeObject, deadline: Duration, chunkSize: int32 = loDefaultChunkSize
+): Future[seq[byte]] {.async.} =
+  ## Like `loReadAll` but `deadline` bounds total wall-clock across all chunks.
+  ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  let deadlineMoment = Moment.now() + deadline
+  result = @[]
+  while true:
+    let chunk = await lo.loRead(chunkSize, remainingDeadlineDuration(deadlineMoment))
+    if chunk.len == 0:
+      break
+    result.add(chunk)
+
+proc loWriteAllDeadline*(
+    lo: LargeObject,
+    data: seq[byte],
+    deadline: Duration,
+    chunkSize: int = loDefaultChunkSize,
+): Future[void] {.async.} =
+  ## Like `loWriteAll` but `deadline` bounds total wall-clock across all chunks.
+  ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  let deadlineMoment = Moment.now() + deadline
+  var offset = 0
+  while offset < data.len:
+    let endIdx = min(offset + chunkSize, data.len)
+    let chunk = data[offset ..< endIdx]
+    let written = await lo.loWrite(chunk, remainingDeadlineDuration(deadlineMoment))
+    if written != int32(chunk.len):
+      raise newException(
+        PgError,
+        "loWriteAllDeadline: partial write (" & $written & "/" & $chunk.len & " bytes)",
+      )
+    offset = endIdx
+
+proc loSizeDeadline*(lo: LargeObject, deadline: Duration): Future[int64] {.async.} =
+  ## Like `loSize` but `deadline` bounds total wall-clock across the 3 internal
+  ## lo_tell/lo_seek operations (instead of 3 × per-call timeout).
+  ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  ##
+  ## **Caveat:** if the deadline is exhausted before the final
+  ## `loSeek(savedPos, SEEK_SET)`, that restore call will raise
+  ## `PgTimeoutError` and the Large Object's file position will be left at
+  ## the end of the object (from the internal `SEEK_END`). Subsequent reads
+  ## via the same `LargeObject` handle will therefore return no data until
+  ## the caller reseeks. The connection is also invalidated on timeout, so
+  ## in practice the handle is unusable anyway.
+  let deadlineMoment = Moment.now() + deadline
+  let savedPos = await lo.loTell(remainingDeadlineDuration(deadlineMoment))
+  result = await lo.loSeek(0, SEEK_END, remainingDeadlineDuration(deadlineMoment))
+  discard await lo.loSeek(savedPos, SEEK_SET, remainingDeadlineDuration(deadlineMoment))
+
+proc loReadStreamDeadline*(
+    lo: LargeObject,
+    callback: LoReadCallback,
+    deadline: Duration,
+    chunkSize: int32 = loDefaultChunkSize,
+): Future[void] {.async.} =
+  ## Like `loReadStream` but `deadline` bounds total wall-clock across all
+  ## reads. Callback time is included in the deadline.
+  ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  let deadlineMoment = Moment.now() + deadline
+  while true:
+    let chunk = await lo.loRead(chunkSize, remainingDeadlineDuration(deadlineMoment))
+    if chunk.len == 0:
+      break
+    await callback(chunk)
+
+proc loWriteStreamDeadline*(
+    lo: LargeObject,
+    callback: LoWriteCallback,
+    deadline: Duration,
+    chunkSize: int = loDefaultChunkSize,
+): Future[void] {.async.} =
+  ## Like `loWriteStream` but `deadline` bounds total wall-clock across all
+  ## writes. Callback time is included in the deadline.
+  ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  let deadlineMoment = Moment.now() + deadline
+  while true:
+    let data = await callback()
+    if data.len == 0:
+      break
+    await lo.loWriteAllDeadline(
+      data, remainingDeadlineDuration(deadlineMoment), chunkSize
+    )
