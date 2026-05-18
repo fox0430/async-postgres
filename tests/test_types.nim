@@ -829,6 +829,44 @@ suite "Binary encode/decode helpers":
     check p.value.get[0] == 0x55'u8
     check p.value.get[1] == 0x0e'u8
 
+  test "PgUuid binary accepts dashless form":
+    let uuid = PgUuid("550e8400e29b41d4a716446655440000")
+    let p = toPgBinaryParam(uuid)
+    check p.value.get.len == 16
+    check p.value.get[0] == 0x55'u8
+    check p.value.get[15] == 0x00'u8
+
+  test "PgUuid binary uppercase hex":
+    let uuid = PgUuid("AABBCCDD-EEFF-0011-2233-445566778899")
+    let p = toPgBinaryParam(uuid)
+    check p.value.get[0] == 0xAA'u8
+    check p.value.get[7] == 0x11'u8
+    check p.value.get[15] == 0x99'u8
+
+  test "PgUuid binary too short raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgUuid("550e8400"))
+
+  test "PgUuid binary too long raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgUuid("550e8400-e29b-41d4-a716-44665544000000"))
+
+  test "PgUuid binary empty raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgUuid(""))
+
+  test "PgUuid binary non-hex char raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgUuid("550e8400-e29b-41d4-a716-44665544zzzz"))
+
+  test "PgUuid text passes through unvalidated (server-side check)":
+    # Text format hands the raw string to PostgreSQL, so client-side does NOT
+    # raise on invalid input — the server returns the error instead. This
+    # contrasts with toPgBinaryParam, which validates locally.
+    let p = toPgParam(PgUuid("not-a-uuid"))
+    check p.format == 0
+    check toString(p.value.get) == "not-a-uuid"
+
   test "PgUuid $ and ==":
     let a = PgUuid("550e8400-e29b-41d4-a716-446655440000")
     let b = PgUuid("550e8400-e29b-41d4-a716-446655440000")
@@ -3119,6 +3157,31 @@ suite "PgMacAddr":
     check data[4] == 0x02
     check data[5] == 0x03
 
+  test "toPgBinaryParam PgMacAddr wrong octet count raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr("08:00:2b:01:02"))
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr("08:00:2b:01:02:03:04"))
+
+  test "toPgBinaryParam PgMacAddr non-hex digit raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr("08:00:2b:01:02:zz"))
+
+  test "toPgBinaryParam PgMacAddr octet not 2 digits raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr("8:00:2b:01:02:03"))
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr("080:00:2b:01:02:03"))
+
+  test "toPgBinaryParam PgMacAddr empty raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr(""))
+
+  test "toPgParam PgMacAddr text passes through unvalidated":
+    let p = toPgParam(PgMacAddr("not-a-mac"))
+    check p.format == 0
+    check toString(p.value.get) == "not-a-mac"
+
   test "getMacAddr text format":
     let row: Row = @[some(toBytes("08:00:2b:01:02:03"))]
     let v = row.getMacAddr(0)
@@ -3184,6 +3247,18 @@ suite "PgMacAddr8":
     check data.len == 8
     check data[0] == 0x08
     check data[7] == 0x05
+
+  test "toPgBinaryParam PgMacAddr8 wrong octet count raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr8("08:00:2b:01:02:03"))
+
+  test "toPgBinaryParam PgMacAddr8 non-hex digit raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr8("08:00:2b:01:02:03:04:gg"))
+
+  test "toPgBinaryParam PgMacAddr8 octet not 2 digits raises":
+    expect PgTypeError:
+      discard toPgBinaryParam(PgMacAddr8("08:00:2b:01:02:03:04:5"))
 
   test "getMacAddr8 text format":
     let row: Row = @[some(toBytes("08:00:2b:01:02:03:04:05"))]

@@ -628,11 +628,40 @@ proc toPgBinaryParam*(v: PgNumeric): PgParam =
 proc toPgBinaryParam*(v: PgMoney): PgParam =
   PgParam(oid: OidMoney, format: 1, value: some(@(toBE64(v.amount))))
 
+proc hexNibble(c: char): int =
+  case c
+  of '0' .. '9':
+    ord(c) - ord('0')
+  of 'a' .. 'f':
+    ord(c) - ord('a') + 10
+  of 'A' .. 'F':
+    ord(c) - ord('A') + 10
+  else:
+    -1
+
+proc decodeHexPair(s: string, i: int, errCtx: string): byte =
+  let hi = hexNibble(s[i])
+  let lo = hexNibble(s[i + 1])
+  if hi < 0 or lo < 0:
+    raise newException(
+      PgTypeError, errCtx & ": non-hex character at position " & $i & " in " & s.escape
+    )
+  byte((hi shl 4) or lo)
+
 proc toPgBinaryParam*(v: PgUuid): PgParam =
+  # Dashes are stripped before validation, so dash positions are not enforced
+  # (e.g. dashless and non-canonical placements are accepted). PostgreSQL itself
+  # is stricter in text format, but binary form has no dash concept.
   let hex = string(v).replace("-", "")
+  if hex.len != 32:
+    raise newException(
+      PgTypeError,
+      "Invalid PgUuid: expected 32 hex digits (dashes optional), got " & $hex.len &
+        " in " & string(v).escape,
+    )
   var bytes = newSeq[byte](16)
   for i in 0 ..< 16:
-    bytes[i] = byte(parseHexInt(hex[i * 2 .. i * 2 + 1]))
+    bytes[i] = decodeHexPair(hex, i * 2, "Invalid PgUuid")
   PgParam(oid: OidUuid, format: 1, value: some(bytes))
 
 proc toPgBinaryParam*(v: PgInterval): PgParam =
@@ -684,23 +713,36 @@ proc toPgBinaryParam*(v: PgCidr): PgParam =
       data[4 + i] = v.address.address_v6[i]
     PgParam(oid: OidCidr, format: 1, value: some(data))
 
+proc encodeMacBinary(s: string, n: int, label: string): seq[byte] =
+  let parts = s.split(':')
+  let prefix = "Invalid " & label
+  if parts.len != n:
+    raise newException(
+      PgTypeError,
+      prefix & ": expected " & $n & " colon-separated octets, got " & $parts.len & " in " &
+        s.escape,
+    )
+  result = newSeq[byte](n)
+  for i in 0 ..< n:
+    if parts[i].len != 2:
+      raise newException(
+        PgTypeError, prefix & ": octet " & $i & " is not 2 hex digits in " & s.escape
+      )
+    result[i] = decodeHexPair(parts[i], 0, prefix)
+
 proc toPgBinaryParam*(v: PgMacAddr): PgParam =
   ## Binary format: 6 raw bytes
-  let s = string(v)
-  let parts = s.split(':')
-  var data = newSeq[byte](6)
-  for i in 0 ..< 6:
-    data[i] = byte(parseHexInt(parts[i]))
-  PgParam(oid: OidMacAddr, format: 1, value: some(data))
+  PgParam(
+    oid: OidMacAddr, format: 1, value: some(encodeMacBinary(string(v), 6, "PgMacAddr"))
+  )
 
 proc toPgBinaryParam*(v: PgMacAddr8): PgParam =
   ## Binary format: 8 raw bytes
-  let s = string(v)
-  let parts = s.split(':')
-  var data = newSeq[byte](8)
-  for i in 0 ..< 8:
-    data[i] = byte(parseHexInt(parts[i]))
-  PgParam(oid: OidMacAddr8, format: 1, value: some(data))
+  PgParam(
+    oid: OidMacAddr8,
+    format: 1,
+    value: some(encodeMacBinary(string(v), 8, "PgMacAddr8")),
+  )
 
 proc toPgBinaryParam*(v: PgTsVector): PgParam =
   ## Send as text format — PostgreSQL handles the parsing.
