@@ -37,6 +37,72 @@ suite "Byte helpers":
     buf.addCString("abc")
     check buf == @[byte('a'), byte('b'), byte('c'), 0'u8]
 
+  test "addCString empty":
+    var buf: seq[byte] = @[]
+    buf.addCString("")
+    check buf == @[0'u8]
+
+  test "addCString rejects embedded NUL":
+    var buf: seq[byte] = @[]
+    expect(ValueError):
+      buf.addCString("abc\0def")
+    expect(ValueError):
+      buf.addCString("\0")
+    expect(ValueError):
+      buf.addCString("trailing\0")
+    expect(ValueError):
+      buf.addCString("\0leading")
+
+  test "addCString leaves buffer unchanged on rejection":
+    var buf: seq[byte] = @[byte('x')]
+    try:
+      buf.addCString("a\0b")
+    except ValueError:
+      discard
+    check buf == @[byte('x')]
+
+  test "encodeStartup rejects NUL in user":
+    expect(ValueError):
+      discard encodeStartup("alice\0is_superuser", "db")
+
+  test "encodeStartup rejects NUL in database":
+    expect(ValueError):
+      discard encodeStartup("alice", "db\0options=-c")
+
+  test "encodeStartup rejects NUL in extra params":
+    expect(ValueError):
+      discard encodeStartup(
+        "alice", "db", [("application_name", "app\0options=-c log_statement=all")]
+      )
+    expect(ValueError):
+      discard encodeStartup("alice", "db", [("app\0name", "value")])
+
+  test "encodeQuery rejects NUL in sql":
+    expect(ValueError):
+      discard encodeQuery("SELECT 1\0; DROP TABLE users")
+
+  test "encodePassword rejects NUL":
+    expect(ValueError):
+      discard encodePassword("pass\0word")
+
+  test "encodeParse rejects NUL in stmtName or sql":
+    expect(ValueError):
+      discard encodeParse("stmt\0", "SELECT 1")
+    expect(ValueError):
+      discard encodeParse("stmt", "SELECT \x001")
+
+  test "encodeDescribe / encodeExecute / encodeClose reject NUL in name":
+    expect(ValueError):
+      discard encodeDescribe(dkPortal, "portal\0name")
+    expect(ValueError):
+      discard encodeExecute("portal\0name", 0)
+    expect(ValueError):
+      discard encodeClose(dkStatement, "stmt\0name")
+
+  test "encodeCopyFail rejects NUL in errorMsg":
+    expect(ValueError):
+      discard encodeCopyFail("bad\0msg")
+
   test "decodeCString":
     let buf = @[byte('h'), byte('i'), 0'u8, byte('x')]
     let (s, consumed) = decodeCString(buf, 0)
