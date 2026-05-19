@@ -1218,35 +1218,71 @@ proc writeParamValue*(buf: var seq[byte], v: seq[byte]) =
 proc writeParamValue*(buf: var seq[byte], v: PgNumeric) =
   writeParamValue(buf, $v)
 
+# Compile-time OID lookup for parameter scalar types. Source of truth for
+# the OID emitted by ``writeParamOid`` (Parse message) and consumed by
+# ``queryDirect`` / ``execDirect``'s cache-hit OID validation. Adding a new
+# scalar type means adding a ``paramOidOf`` overload here — ``writeParamOid``
+# below picks it up automatically, so the two cannot drift.
+
+func paramOidOf*(v: int16): int32 =
+  OidInt2
+
+func paramOidOf*(v: int32): int32 =
+  OidInt4
+
+func paramOidOf*(v: int64): int32 =
+  OidInt8
+
+func paramOidOf*(v: int): int32 =
+  OidInt8
+
+func paramOidOf*(v: float32): int32 =
+  OidFloat4
+
+func paramOidOf*(v: float64): int32 =
+  OidFloat8
+
+func paramOidOf*(v: bool): int32 =
+  OidBool
+
+func paramOidOf*(v: string): int32 =
+  OidText
+
+func paramOidOf*(v: seq[byte]): int32 =
+  OidBytea
+
+func paramOidOf*(v: PgNumeric): int32 =
+  OidNumeric
+
 proc writeParamOid*(buf: var seq[byte], v: int16) =
-  buf.addInt32(OidInt2)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: int32) =
-  buf.addInt32(OidInt4)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: int64) =
-  buf.addInt32(OidInt8)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: int) =
-  buf.addInt32(OidInt8)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: float32) =
-  buf.addInt32(OidFloat4)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: float64) =
-  buf.addInt32(OidFloat8)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: bool) =
-  buf.addInt32(OidBool)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: string) =
-  buf.addInt32(OidText)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: seq[byte]) =
-  buf.addInt32(OidBytea)
+  buf.addInt32(paramOidOf(v))
 
 proc writeParamOid*(buf: var seq[byte], v: PgNumeric) =
-  buf.addInt32(OidNumeric)
+  buf.addInt32(paramOidOf(v))
 
 macro addParseDirect*(
     buf: untyped, stmtName: string, sql: string, args: varargs[untyped]

@@ -25,6 +25,7 @@ proc execImpl*(
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
+  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
 
@@ -58,6 +59,7 @@ proc execImpl*(
   var commandTag = ""
   var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
+  var cachedParamOids: seq[int32]
 
   block recvLoop:
     while true:
@@ -67,7 +69,8 @@ proc execImpl*(
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
-          discard
+          if cacheMiss:
+            cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
           if cacheMiss:
             cachedFields = msg.fields
@@ -89,7 +92,12 @@ proc execImpl*(
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
-            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+            conn.addStmtCache(
+              sql,
+              CachedStmt(
+                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
+              ),
+            )
           break recvLoop
         else:
           discard
@@ -108,6 +116,7 @@ proc execImpl*(
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
+  conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
   var cacheMiss = false
   var stmtName = ""
 
@@ -141,6 +150,7 @@ proc execImpl*(
   var commandTag = ""
   var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
+  var cachedParamOids: seq[int32]
 
   block recvLoop:
     while true:
@@ -150,7 +160,8 @@ proc execImpl*(
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
-          discard
+          if cacheMiss:
+            cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
           if cacheMiss:
             cachedFields = msg.fields
@@ -172,7 +183,12 @@ proc execImpl*(
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
-            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+            conn.addStmtCache(
+              sql,
+              CachedStmt(
+                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
+              ),
+            )
           break recvLoop
         else:
           discard
@@ -227,6 +243,7 @@ proc execInlineImpl*(
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
+  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
 
@@ -260,6 +277,7 @@ proc execInlineImpl*(
   var commandTag = ""
   var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
+  var cachedParamOids: seq[int32]
 
   block recvLoop:
     while true:
@@ -269,7 +287,8 @@ proc execInlineImpl*(
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
-          discard
+          if cacheMiss:
+            cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
           if cacheMiss:
             cachedFields = msg.fields
@@ -291,7 +310,12 @@ proc execInlineImpl*(
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
-            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+            conn.addStmtCache(
+              sql,
+              CachedStmt(
+                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
+              ),
+            )
           break recvLoop
         else:
           discard

@@ -10,6 +10,7 @@ when hasChronos:
   import std/sets
 
 import ../async_postgres/pg_client {.all.}
+import ../async_postgres/pg_client/core as pg_client_core
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_connection {.all.}
 
@@ -6219,6 +6220,230 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: paramOids saved from ParameterDescription":
+    # The cache-miss path captures the server's ParameterDescription so the
+    # cache hit path can validate that a follow-up call binds compatible
+    # parameter types. Without this, the server would interpret bind bytes
+    # under the original parse-time OIDs even when the caller intended a
+    # different type, silently corrupting results.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r = await conn.query("SELECT $1::int8 AS v", @[toPgParam(123'i64)])
+      doAssert r.rows[0].getInt64(0) == 123
+      doAssert conn.stmtCache.len == 1
+      let cached = conn.stmtCache["SELECT $1::int8 AS v"]
+      doAssert cached.paramOids == @[OidInt8]
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: identical OIDs reuse cached statement":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.query("SELECT $1::int8", @[toPgParam(1'i64)])
+      doAssert r1.rows[0].getInt64(0) == 1
+      let firstName = conn.stmtCache["SELECT $1::int8"].name
+
+      # Same OID set → cache hit, same server-side statement reused.
+      let r2 = await conn.query("SELECT $1::int8", @[toPgParam(2'i64)])
+      doAssert r2.rows[0].getInt64(0) == 2
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache["SELECT $1::int8"].name == firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: mismatched OIDs invalidate and re-parse":
+    # Reproduces the silent-corruption pathway: same SQL text bound first
+    # with int8 and then with int4. Without invalidation, the server would
+    # treat the int4 4-byte payload as part of an int8 statement (or fail
+    # on length mismatch). With invalidation, the stale entry's server-side
+    # statement is queued for Close and a fresh Parse runs under the new
+    # types.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.query("SELECT $1 AS v", @[toPgParam(123'i64)])
+      doAssert r1.rows[0].getInt64(0) == 123
+      let firstName = conn.stmtCache["SELECT $1 AS v"].name
+      doAssert conn.stmtCache["SELECT $1 AS v"].paramOids == @[OidInt8]
+
+      # Same SQL, different OID (int4 instead of int8). The cache entry
+      # for int8 must be evicted and a new statement parsed for int4.
+      let r2 = await conn.query("SELECT $1 AS v", @[toPgParam(7'i32)])
+      doAssert r2.rows[0].getInt(0) == 7
+      doAssert conn.stmtCache.len == 1
+      let entry = conn.stmtCache["SELECT $1 AS v"]
+      doAssert entry.paramOids == @[OidInt4]
+      doAssert entry.name != firstName # fresh server-side statement
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: mismatched OIDs work across many type swaps":
+    # Stress the invalidation path: repeatedly swap parameter type for the
+    # same SQL text. Each swap evicts and re-parses; the cache must stay at
+    # size 1 (the SQL key is the same) and results must reflect the new
+    # type, not be silently reinterpreted under a stale plan.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.query("SELECT $1 AS v", @[toPgParam(1'i32)])
+      doAssert r1.rows[0].getInt(0) == 1
+      let r2 = await conn.query("SELECT $1 AS v", @[toPgParam(2'i64)])
+      doAssert r2.rows[0].getInt64(0) == 2
+      let r3 = await conn.query("SELECT $1 AS v", @[toPgParam("hello")])
+      doAssert r3.rows[0].getStr(0) == "hello"
+      let r4 = await conn.query("SELECT $1 AS v", @[toPgParam(3'i32)])
+      doAssert r4.rows[0].getInt(0) == 3
+      doAssert conn.stmtCache.len == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: exec invalidates on OID mismatch":
+    # exec discards rows, so we can swap parameter types without worrying
+    # about column compatibility. The point is that the cached server-side
+    # statement is replaced when OIDs change — same SQL key, new stmtName.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      discard await conn.exec("SELECT $1", @[toPgParam(1'i32)])
+      let sql = "SELECT $1"
+      let firstName = conn.stmtCache[sql].name
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
+
+      discard await conn.exec(sql, @[toPgParam("hello")])
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidText]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: caller OID 0 is wildcard against cached known OID":
+    # ``OidUnknown`` (0) means "let the server infer the type". When the
+    # caller leaves the OID unset, ``paramOidsMatch`` must treat it as a
+    # wildcard so a previously cached prepared statement (with a concrete
+    # parse-time OID) is reused instead of being needlessly evicted and
+    # re-parsed.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # First call: explicit OidInt4 → cache stores paramOids=[OidInt4].
+      discard await conn.query("SELECT $1::int + 1", @[toPgParam(1'i32)])
+      doAssert conn.stmtCache.len == 1
+      let firstName = conn.stmtCache["SELECT $1::int + 1"].name
+      doAssert conn.stmtCache["SELECT $1::int + 1"].paramOids == @[OidInt4]
+
+      # Second call: caller leaves OID unset (0). The wildcard branch of
+      # ``paramOidsMatch`` (``n == 0``) must keep the entry alive.
+      let untypedParam = PgParam(oid: 0'i32, format: 0, value: some(toBytes("2")))
+      discard await conn.query("SELECT $1::int + 1", @[untypedParam])
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache["SELECT $1::int + 1"].name == firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: execInline saves paramOids and invalidates on mismatch":
+    # ``execInlineImpl`` has its own recv loop (not the shared template), so
+    # it must independently capture ParameterDescription and feed it into
+    # ``CachedStmt.paramOids``. Without that, ``invalidateIfOidMismatch``
+    # sees an empty cached OID list, length-mismatches against any non-empty
+    # caller OIDs, and silently re-parses on every call — defeating the
+    # cache. This test pins both halves: the first call stores OIDs, the
+    # second call (different OID) replaces the entry.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      discard await conn.exec("SELECT $1", @[toPgParamInline(1'i32)])
+      let sql = "SELECT $1"
+      let firstName = conn.stmtCache[sql].name
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
+
+      # Same OIDs → cache hit, same server-side statement reused.
+      discard await conn.exec(sql, @[toPgParamInline(2'i32)])
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache[sql].name == firstName
+
+      # Different OID → cache evicted and re-parsed.
+      discard await conn.exec(sql, @[toPgParamInline("hello")])
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidText]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: queryInline saves paramOids and invalidates on mismatch":
+    # ``queryInlineImpl`` reuses ``queryRecvLoop``, so this is mostly a sanity
+    # check that the inline parameter path threads OIDs through Parse and
+    # the recv-loop captures them. Pairs with the execInline test above.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.query("SELECT $1 AS v", @[toPgParamInline(1'i32)])
+      doAssert r1.rows[0].getInt(0) == 1
+      let sql = "SELECT $1 AS v"
+      let firstName = conn.stmtCache[sql].name
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
+
+      let r2 = await conn.query(sql, @[toPgParamInline("hello")])
+      doAssert r2.rows[0].getStr(0) == "hello"
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidText]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "paramOidsMatch: length mismatch and wildcard branches":
+    # Unit-style coverage for the matcher itself, separate from the
+    # round-trip e2e cases above. Exercises every branch:
+    #   - equal length, all matching
+    #   - length mismatch → false
+    #   - wildcard on either side → true
+    #   - genuine mismatch → false
+    #   - empty vs empty (parameter-less SQL) → true
+    doAssert paramOidsMatch([OidInt4, OidText], [OidInt4, OidText])
+    doAssert not paramOidsMatch([OidInt4], [OidInt4, OidText])
+    doAssert not paramOidsMatch([OidInt4, OidText], [OidInt4])
+    doAssert paramOidsMatch([0'i32], [OidInt4])
+    doAssert paramOidsMatch([OidInt4], [0'i32])
+    doAssert paramOidsMatch([OidInt4, 0'i32], [0'i32, OidText])
+    doAssert not paramOidsMatch([OidInt4], [OidText])
+    doAssert not paramOidsMatch([OidInt4, OidText], [OidInt4, OidInt8])
+    let emptyOids: seq[int32] = @[]
+    doAssert paramOidsMatch(emptyOids, emptyOids)
+
+  test "paramOidsMatch (PgParam overload): reads .oid in place":
+    # Pin the ``openArray[PgParam]`` overload added so the ``query``/``exec``
+    # cache-hit path can avoid the ``seq[int32]`` projection. Same branches
+    # as the int32-vs-int32 case above, just driven through PgParam values.
+    proc p(oid: int32): PgParam =
+      PgParam(oid: oid, format: 0, value: none(seq[byte]))
+
+    doAssert paramOidsMatch([OidInt4, OidText], [p(OidInt4), p(OidText)])
+    doAssert not paramOidsMatch([OidInt4], [p(OidInt4), p(OidText)])
+    doAssert not paramOidsMatch([OidInt4, OidText], [p(OidInt4)])
+    doAssert paramOidsMatch([0'i32], [p(OidInt4)])
+    doAssert paramOidsMatch([OidInt4], [p(0'i32)])
+    doAssert not paramOidsMatch([OidInt4], [p(OidText)])
+    let emptyParams: seq[PgParam] = @[]
+    let emptyOids: seq[int32] = @[]
+    doAssert paramOidsMatch(emptyOids, emptyParams)
+
 suite "E2E: simpleExec":
   test "simpleExec returns command tag":
     proc t() {.async.} =
@@ -7783,6 +8008,95 @@ suite "E2E: queryDirect / execDirect":
         discard
       doAssert caught
       doAssert conn.state == csClosed
+
+    waitFor t()
+
+  test "queryDirect: mismatched OIDs invalidate and re-parse":
+    # ``queryDirect`` synthesizes the parameter OID array at macro-expansion
+    # time, so this is a regression guard for the AST builder: hitting the
+    # same SQL with two literal types must invalidate the cached prepared
+    # statement and produce a fresh server-side ``Parse`` for the new type,
+    # not silently bind the new bytes under the old plan.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.queryDirect("SELECT $1 AS v", 123'i64)
+      doAssert r1.rows[0].getInt64(0) == 123
+      let sql = "SELECT $1 AS v"
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt8]
+      let firstName = conn.stmtCache[sql].name
+
+      let r2 = await conn.queryDirect("SELECT $1 AS v", 7'i32)
+      doAssert r2.rows[0].getInt(0) == 7
+      doAssert conn.stmtCache.len == 1
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidInt4]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect: mismatched OIDs invalidate and re-parse":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      discard await conn.execDirect("SELECT $1", 1'i32)
+      let sql = "SELECT $1"
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
+      let firstName = conn.stmtCache[sql].name
+
+      discard await conn.execDirect("SELECT $1", "hello")
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidText]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect: identical OIDs reuse cached statement":
+    # Pair with the mismatch test above: same literal type across two calls
+    # must keep the cached entry and its server-side ``stmtName``. This pins
+    # that ``invalidateIfOidMismatch`` does not over-invalidate when OIDs
+    # agree.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.queryDirect("SELECT $1::int8", 1'i64)
+      doAssert r1.rows[0].getInt64(0) == 1
+      let sql = "SELECT $1::int8"
+      let firstName = conn.stmtCache[sql].name
+
+      let r2 = await conn.queryDirect("SELECT $1::int8", 2'i64)
+      doAssert r2.rows[0].getInt64(0) == 2
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache[sql].name == firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect: no-param SQL skips OID-mismatch check":
+    # Parameter-less ``queryDirect`` exercises the
+    # ``positional.len == 0`` short-circuit in ``buildInvalidateOnOidMismatchStmt``.
+    # The cached statement must be reused across repeated calls; both calls
+    # must succeed and hit the same server-side statement.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.queryDirect("SELECT 42 AS answer")
+      doAssert r1.rows[0].getInt(0) == 42
+      let sql = "SELECT 42 AS answer"
+      let firstName = conn.stmtCache[sql].name
+      doAssert conn.stmtCache[sql].paramOids.len == 0
+
+      let r2 = await conn.queryDirect("SELECT 42 AS answer")
+      doAssert r2.rows[0].getInt(0) == 42
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache[sql].name == firstName
+
+      await conn.close()
 
     waitFor t()
 
