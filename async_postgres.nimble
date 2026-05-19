@@ -12,5 +12,5 @@ requires "nimcrypto >= 0.6.0"
 requires "checksums >= 0.2.0"
 
 task test, "test":
-  exec "nim c -d:asyncBackend=asyncdispatch -d:ssl -r tests/all_tests.nim"
+  exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
   exec "nim c -d:asyncBackend=chronos -r tests/all_tests.nim"
