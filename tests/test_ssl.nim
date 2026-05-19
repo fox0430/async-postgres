@@ -430,7 +430,11 @@ suite "SSL negotiation - sslAllow":
   test "sslAllow attempts SSL after plaintext failure and reports both errors":
     var attemptCount: int = 0
     var raised = false
-    var errMsg = ""
+    var msgHasSslMode = false
+    var msgHasPlaintext = false
+    var msgHasPgHba = false
+    var msgHasSslFallback = false
+    var msgHasNoSslSupport = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -487,7 +491,11 @@ suite "SSL negotiation - sslAllow":
         await conn.close()
       except PgConnectionError as e:
         raised = true
-        errMsg = e.msg
+        msgHasSslMode = "sslmode=allow" in e.msg
+        msgHasPlaintext = "plaintext attempt failed" in e.msg
+        msgHasPgHba = "no pg_hba.conf entry" in e.msg
+        msgHasSslFallback = "SSL fallback failed" in e.msg
+        msgHasNoSslSupport = "Server does not support SSL" in e.msg
 
       await serverFut
       await closeServer(ms)
@@ -496,11 +504,11 @@ suite "SSL negotiation - sslAllow":
     check attemptCount == 2
     check raised
     # Both failure reasons must be preserved in the final error message.
-    check "sslmode=allow" in errMsg
-    check "plaintext attempt failed" in errMsg
-    check "no pg_hba.conf entry" in errMsg
-    check "SSL fallback failed" in errMsg
-    check "Server does not support SSL" in errMsg
+    check msgHasSslMode
+    check msgHasPlaintext
+    check msgHasPgHba
+    check msgHasSslFallback
+    check msgHasNoSslSupport
 
   test "sslAllow connects via SSL fallback when SSL handshake refused fails cleanly":
     # Verifies that sslAllow does NOT fall back to plaintext a second time
