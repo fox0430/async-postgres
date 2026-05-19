@@ -930,12 +930,9 @@ proc buildMultirangeArrayParam(
     arrayOid, elemOid: int32, elements: seq[seq[byte]]
 ): PgParam =
   if elements.len == 0:
-    return PgParam(
-      oid: arrayOid, format: 1, value: some(encodeBinaryArrayEmpty(elemOid))
-    )
-  PgParam(
-    oid: arrayOid, format: 1, value: some(encodeBinaryArray(elemOid, elements))
-  )
+    return
+      PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArrayEmpty(elemOid)))
+  PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArray(elemOid, elements)))
 
 proc toPgBinaryParam*(v: seq[PgMultirange[int32]]): PgParam =
   var elements = newSeq[seq[byte]](v.len)
