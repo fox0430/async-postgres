@@ -1751,6 +1751,39 @@ suite "isConnected":
 
       waitFor t()
 
+    test "detects peer-side FIN before any read (half-open)":
+      when not defined(posix):
+        skip()
+      else:
+        # Server closes its side while the client is idle and has not yet
+        # observed the FIN through a read. `isConnected` must still report
+        # false via the OS-level probe so half-open conns are recognised
+        # before being handed out.
+        var hasFin = false
+        var stillConnected = true
+        var stateAtProbe = csConnecting
+
+        proc t() {.async.} =
+          let (conn, server, serverTransport) = await makeHangingConn()
+          doAssert conn.isConnected()
+          await serverTransport.closeWait()
+          # Yield so the kernel posts the FIN to our socket buffer.
+          await sleepAsync(milliseconds(50))
+          hasFin = conn.socketHasFin()
+          stillConnected = conn.isConnected()
+          # State stays csReady — the protocol layer never saw the FIN —
+          # so isConnected is the only signal callers have here.
+          stateAtProbe = conn.state
+          await conn.close()
+          server.stop()
+          server.close()
+          await server.join()
+
+        waitFor t()
+        check hasFin
+        check not stillConnected
+        check stateAtProbe == csReady
+
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
     host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
@@ -1853,3 +1886,60 @@ suite "Pool broken connection handling (integration)":
     waitFor testBody()
     check closeCountDelta == 1
     check idleAfter == 0
+
+  when defined(posix):
+    test "acquire skips an idle conn whose peer half-closed (FIN, state still csReady)":
+      # Half-open scenario: the server has sent FIN but the client has not
+      # read it yet, so the conn's logical state remains csReady. Without
+      # an OS-level probe, the pool would happily hand this corpse out;
+      # acquire must call socketHasFin and discard it.
+      var idleAfter = -1
+      var closeCountDelta: int64 = -1
+      var stateAtAcquire = csConnecting
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        var serverSide: MockClient
+
+        proc serverHandler() {.async.} =
+          try:
+            serverSide = await acceptAndReady(ms)
+          except CatchableError:
+            discard
+
+        let serverFut = serverHandler()
+
+        let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+        let pool = await newPool(cfg)
+
+        let broken = await pool.acquire()
+        pool.release(broken)
+        await serverFut
+        doAssert pool.idle.len == 1
+        doAssert broken.state == csReady
+
+        # Peer closes — FIN lands in the client kernel but we never read it,
+        # so broken.state stays csReady.
+        await closeClient(serverSide)
+        await sleepAsync(milliseconds(50))
+        stateAtAcquire = broken.state
+
+        # Inject a healthy mock so acquire can return without re-entering
+        # connect() against the now-dead mock server.
+        let good = mockConn()
+        pool.idle.addLast(toPooled(good))
+
+        let before = pool.metrics.closeCount
+        let acquired = await pool.acquire()
+        closeCountDelta = pool.metrics.closeCount - before
+        idleAfter = pool.idle.len
+
+        doAssert acquired == good
+        pool.release(acquired)
+        await pool.close()
+        await closeServer(ms)
+
+      waitFor testBody()
+      check stateAtAcquire == csReady
+      check closeCountDelta == 1
+      check idleAfter == 0
