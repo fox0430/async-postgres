@@ -85,6 +85,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     `colOidsSym` = `cachedPtrSym`.colOids
     `effectiveRfSym` = `cachedPtrSym`.resultFormats
     `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
   let sendBufNode = newDotExpr(connSym, ident"sendBuf")
   hitBlock.add(
     makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
@@ -100,6 +101,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     `stmtNameSym` = `connSym`.nextStmtName()
     `effectiveRfSym` = @[]
     `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
     if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
       let evicted = `connSym`.evictStmtCache()
       `connSym`.sendBuf.addClose(dkStatement, evicted.name)
@@ -118,6 +120,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   elseBlock.add quote do:
     `effectiveRfSym` = @[]
     `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
   elseBlock.add(makeParseDirect(sendBufNode, newStrLitNode(""), sqlSym, argList))
   elseBlock.add(
     makeBindDirect(
@@ -250,6 +253,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   hitBlock.add quote do:
     `stmtNameSym` = `cachedPtrSym`.name
     `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
   hitBlock.add(makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, argList))
   hitBlock.add quote do:
     `connSym`.sendBuf.addExecute("", 0)
@@ -261,6 +265,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     `cacheMissSym` = true
     `stmtNameSym` = `connSym`.nextStmtName()
     `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
     if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
       let evicted = `connSym`.evictStmtCache()
       `connSym`.sendBuf.addClose(dkStatement, evicted.name)
@@ -276,6 +281,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   let elseBlock = newStmtList()
   elseBlock.add quote do:
     `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
   elseBlock.add(makeParseDirect(sendBufNode, newStrLitNode(""), sqlSym, argList))
   elseBlock.add(
     makeBindDirect(sendBufNode, newStrLitNode(""), newStrLitNode(""), argList)

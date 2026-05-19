@@ -29,6 +29,7 @@ proc execImpl*(
   var stmtName = ""
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   if cacheHit:
     stmtName = cached.name
     conn.sendBuf.addBind("", stmtName, formats, params)
@@ -111,6 +112,7 @@ proc execImpl*(
   var stmtName = ""
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   if cacheHit:
     stmtName = cached.name
     conn.sendBuf.addBind("", stmtName, params)
@@ -229,6 +231,7 @@ proc execInlineImpl*(
   var stmtName = ""
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   if cacheHit:
     stmtName = cached.name
     conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges)

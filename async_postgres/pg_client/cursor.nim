@@ -38,6 +38,7 @@ proc openCursorImpl(
   let portalName = "_cursor_" & $conn.portalCounter
 
   var batch = newSeqOfCap[byte](sql.len + 128)
+  conn.flushPendingStmtCloses(batch)
   batch.addParse("", sql, paramOids)
   let formats =
     if paramFormats.len > 0:
@@ -118,6 +119,7 @@ proc fetchNextImpl(
   var rowCount: int32 = 0
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   conn.sendBuf.addExecute(cursor.portalName, cursor.chunkSize)
   conn.sendBuf.addFlush()
   await conn.sendBufMsg()
@@ -202,6 +204,7 @@ proc closeCursorImpl(
 
   let conn = cursor.conn
   var batch = newSeqOfCap[byte](cursor.portalName.len + 16)
+  conn.flushPendingStmtCloses(batch)
   batch.addClose(dkPortal, cursor.portalName)
   batch.addSync()
   await conn.sendMsg(batch)

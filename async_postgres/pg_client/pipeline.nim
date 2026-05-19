@@ -159,6 +159,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   ## otherwise a single trailing Sync is appended (execute).
   let conn = p.conn
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   var hasCachedStmts = false
   var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
   var defaultFormats: seq[int16] # reused across ops when paramFormats is empty
