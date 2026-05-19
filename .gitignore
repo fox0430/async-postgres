@@ -7,16 +7,23 @@ tests/certs/
 
 async_postgres/*
 !async_postgres/*.*
+!async_postgres/pg_types/
 async_postgres/pg_types/*
 !async_postgres/pg_types/*.*
 !async_postgres/pg_client/
 async_postgres/pg_client/*
 !async_postgres/pg_client/*.*
+!async_postgres/pg_pool_cluster/
+async_postgres/pg_pool_cluster/*
+!async_postgres/pg_pool_cluster/*.*
 
 tests/*
 !tests/*.*
 
 examples/*
 !examples/*.*
+
+htmldocs/
+htmdocs/
 
 async_postgres.out
