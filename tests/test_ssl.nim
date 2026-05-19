@@ -427,22 +427,21 @@ suite "SSL negotiation - sslAllow":
     check connState == csReady
     check connSslEnabled == false
 
-  test "sslAllow retries with SSL when plaintext is rejected":
-    var connState: PgConnState
-    var connSslEnabled: bool
+  test "sslAllow attempts SSL after plaintext failure and reports both errors":
     var attemptCount: int = 0
+    var raised = false
+    var errMsg = ""
 
     proc testBody() {.async.} =
       let ms = startMockServer()
 
       proc serverHandler() {.async.} =
-        # First connection: reject plaintext with FATAL error
+        # First connection: reject plaintext with a FATAL error
         block:
           let st = await ms.accept()
           attemptCount.inc
           try:
             discard await readN(st, 8) # read StartupMessage header
-            # Send FATAL error response (server requires SSL)
             var body: seq[byte] = @[]
             body.add(byte('S'))
             for c in "FATAL":
@@ -461,18 +460,14 @@ suite "SSL negotiation - sslAllow":
             discard
           await closeClient(st)
 
-        # Second connection: accept SSL and complete handshake
+        # Second connection: SSL fallback. Refuse SSL so sslRequire fails —
+        # this verifies libpq-compatible semantics (no further plaintext retry).
         block:
           let st = await ms.accept()
           attemptCount.inc
           try:
-            # Read SSLRequest
-            discard await readN(st, 8)
-            # Refuse SSL (sslPrefer will fall back to plaintext)
-            await sendBytes(st, @[byte('N')])
-            await drainStartupMessage(st)
-            await sendAuthOkAndReady(st)
-            await drainUntilClose(st)
+            discard await readN(st, 8) # read SSLRequest
+            await sendBytes(st, @[byte('N')]) # refuse SSL
           except CatchableError:
             discard
           await closeClient(st)
@@ -487,18 +482,77 @@ suite "SSL negotiation - sslAllow":
         sslMode: sslAllow,
       )
 
-      let conn = await connect(config)
-      connState = conn.state
-      connSslEnabled = conn.sslEnabled
-      await conn.close()
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgConnectionError as e:
+        raised = true
+        errMsg = e.msg
 
       await serverFut
       await closeServer(ms)
 
     waitFor testBody()
     check attemptCount == 2
-    check connState == csReady
-    check connSslEnabled == false
+    check raised
+    # Both failure reasons must be preserved in the final error message.
+    check "sslmode=allow" in errMsg
+    check "plaintext attempt failed" in errMsg
+    check "no pg_hba.conf entry" in errMsg
+    check "SSL fallback failed" in errMsg
+    check "Server does not support SSL" in errMsg
+
+  test "sslAllow connects via SSL fallback when SSL handshake refused fails cleanly":
+    # Verifies that sslAllow does NOT fall back to plaintext a second time
+    # if the server refuses SSL — i.e. fallback uses sslRequire semantics,
+    # not sslPrefer.
+    var attemptCount: int = 0
+    var raised = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        # First connection: close immediately to fail plaintext startup.
+        block:
+          let st = await ms.accept()
+          attemptCount.inc
+          await closeClient(st)
+
+        # Second connection: refuse SSL. Must NOT result in plaintext retry.
+        block:
+          let st = await ms.accept()
+          attemptCount.inc
+          try:
+            discard await readN(st, 8)
+            await sendBytes(st, @[byte('N')])
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslAllow,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgConnectionError:
+        raised = true
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    # Exactly two attempts: one plaintext, one SSL — no third plaintext retry.
+    check attemptCount == 2
+    check raised
 
 suite "SSL negotiation - sslDisable":
   test "sslDisable sends StartupMessage directly without SSLRequest":

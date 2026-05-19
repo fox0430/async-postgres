@@ -1447,22 +1447,37 @@ proc connectToHost(
   ## Connect to a single PostgreSQL host. Internal helper for multi-host connect.
 
   if config.sslMode == sslAllow:
-    # sslAllow: try plaintext first, then fall back to SSL.
+    # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
+    # WARNING: This is vulnerable to MITM downgrade attacks. A network
+    # attacker can force the first attempt to fail and then intercept
+    # the SSL connection. Use sslRequire or stronger if security is needed.
     var plainConfig = config
     plainConfig.sslMode = sslDisable
+    var plainErrMsg = ""
     try:
       return await connectToHost(plainConfig, hostAddr, hostPort)
     except CancelledError as e:
       raise e
-    except CatchableError:
-      # Plaintext failed — retry with SSL.
-      # WARNING: This is vulnerable to MITM downgrade attacks. A network
-      # attacker can force the first attempt to fail and then intercept
-      # the SSL connection. Use sslRequire or stronger if security is needed.
-      stderr.writeLine "pg_connection: plaintext connection failed, retrying with SSL (sslmode=allow)"
-      var sslConfig = config
-      sslConfig.sslMode = sslPrefer
+    except CatchableError as e:
+      # Keep only the first line: asyncdispatch appends an async traceback and
+      # "Exception message:" prefix to e.msg, which would make the combined
+      # error below unreadable. Assumes PgConnectionError messages are single-line.
+      plainErrMsg = e.msg.split('\n')[0]
+
+    var sslConfig = config
+    sslConfig.sslMode = sslRequire
+    try:
       return await connectToHost(sslConfig, hostAddr, hostPort)
+    except CancelledError as e:
+      raise e
+    except CatchableError as e:
+      let sslErrMsg = e.msg.split('\n')[0]
+      raise newException(
+        PgConnectionError,
+        "sslmode=allow: plaintext attempt failed (" & plainErrMsg &
+          ") and SSL fallback failed (" & sslErrMsg & ")",
+        e,
+      )
 
   var conn: PgConnection
 
