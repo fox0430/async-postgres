@@ -196,6 +196,14 @@ type
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
     stmtCounter: int
     stmtCacheCapacity: int ## 0=disabled, default 256
+    pendingStmtCloses: seq[string]
+      ## Server-side prepared statement names whose ``Close`` was not bundled
+      ## with the operation that evicted them. Populated when the defensive
+      ## eviction loop in ``addStmtCache`` fires (caller skipped the
+      ## pre-eviction step, or ``stmtCacheCapacity`` was shrunk below the
+      ## current cache size). Flushed by ``flushPendingStmtCloses`` at the
+      ## start of the next Extended Query send phase so the leak is bounded
+      ## to the gap until the next operation.
     hstoreOid: int32 ## Dynamic OID for hstore extension type; 0 if not available
     hstoreArrayOid: int32 ## Dynamic OID for hstore[] array; 0 if not available
     heldSessionLocks: int
@@ -615,6 +623,8 @@ func sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
   conn.sendBuf
 func stmtCache*(conn: PgConnection): var Table[string, CachedStmt] {.inline.} =
   conn.stmtCache
+func pendingStmtCloses*(conn: PgConnection): var seq[string] {.inline.} =
+  conn.pendingStmtCloses
 func portalCounter*(conn: PgConnection): var int {.inline.} =
   conn.portalCounter
 
@@ -825,9 +835,14 @@ proc nextStmtName*(conn: PgConnection): string =
   "_sc_" & $conn.stmtCounter
 
 proc clearStmtCache*(conn: PgConnection) =
-  ## Clear the client-side statement cache. Does not close server-side statements.
+  ## Clear the client-side statement cache. Does not close server-side
+  ## statements, including any ``Close`` messages queued in
+  ## ``pendingStmtCloses`` from defensive eviction — the queue is dropped on
+  ## the assumption the caller will reset the session externally (e.g. via
+  ## ``DISCARD ALL`` or by closing the connection).
   conn.stmtCache.clear()
   conn.stmtCacheLru = initDoublyLinkedList[string]()
+  conn.pendingStmtCloses.setLen(0)
 
 proc lookupStmtCache*(conn: PgConnection, sql: string): ptr CachedStmt =
   ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
@@ -850,10 +865,18 @@ proc evictStmtCache*(conn: PgConnection): CachedStmt =
 
 proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   ## Add a prepared statement to the cache with auto-computed result formats.
+  ## Callers are expected to evict and send a server-side ``Close`` for the
+  ## evicted statement before sending ``Parse``, so the loop below normally
+  ## does not fire. It is a defensive guard: if a caller ever skips the
+  ## pre-eviction step (or if ``stmtCacheCapacity`` was shrunk below the
+  ## current size), we evict here instead of silently dropping the new entry
+  ## and queue the evicted names in ``pendingStmtCloses`` so the next
+  ## Extended Query operation can send their server-side ``Close``.
   if conn.stmtCacheCapacity <= 0:
     return
-  if conn.stmtCache.len >= conn.stmtCacheCapacity:
-    return # caller should have evicted; skip if still full
+  while conn.stmtCache.len >= conn.stmtCacheCapacity:
+    let evicted = conn.evictStmtCache()
+    conn.pendingStmtCloses.add(evicted.name)
   var entry = cached
   if entry.resultFormats.len == 0 and entry.fields.len > 0:
     var extraOids: seq[int32]
@@ -877,6 +900,24 @@ proc removeStmtCache*(conn: PgConnection, sql: string) =
   conn.stmtCache.withValue(sql, entry):
     conn.stmtCacheLru.remove(entry.lruNode)
   conn.stmtCache.del(sql)
+
+proc flushPendingStmtCloses*(conn: PgConnection, buf: var seq[byte]) =
+  ## Append ``Close`` messages for any prepared statement names queued by the
+  ## defensive eviction path in ``addStmtCache`` to ``buf`` and clear the
+  ## queue. Called by Extended Query send paths after the outgoing buffer is
+  ## emptied (or freshly allocated) so the closes ride along with the next
+  ## operation's ``Sync``. The corresponding ``CloseComplete`` replies are
+  ## absorbed by the receive loops (every Extended Query recv loop handles
+  ## ``bmkCloseComplete`` or falls through ``else: discard``).
+  if conn.pendingStmtCloses.len == 0:
+    return
+  for name in conn.pendingStmtCloses:
+    buf.addClose(dkStatement, name)
+  conn.pendingStmtCloses.setLen(0)
+
+proc flushPendingStmtCloses*(conn: PgConnection) =
+  ## Convenience overload that writes to ``conn.sendBuf``.
+  conn.flushPendingStmtCloses(conn.sendBuf)
 
 when hasAsyncDispatch:
   proc sendRawData(socket: AsyncSocket, p: pointer, len: int): Future[void] =
