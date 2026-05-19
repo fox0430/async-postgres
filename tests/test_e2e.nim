@@ -6015,6 +6015,194 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: addStmtCache evicts when full (defensive guard)":
+    # If a caller ever skips the pre-eviction step before calling
+    # addStmtCache, the new entry must still be inserted (the cache must
+    # not silently drop it, which would leak the corresponding server-side
+    # prepared statement). The evicted name is queued in pendingStmtCloses
+    # so the next Extended Query operation sends its server-side Close.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      conn.addStmtCache("A", CachedStmt(name: "s1"))
+      conn.addStmtCache("B", CachedStmt(name: "s2"))
+      doAssert conn.stmtCache.len == 2
+      doAssert conn.pendingStmtCloses.len == 0
+
+      # Bypass the caller-side eviction and add a third entry directly.
+      conn.addStmtCache("C", CachedStmt(name: "s3"))
+      doAssert conn.stmtCache.len == 2
+      doAssert not conn.stmtCache.hasKey("A") # LRU evicted
+      doAssert conn.stmtCache.hasKey("B")
+      doAssert conn.stmtCache.hasKey("C") # newly inserted, not dropped
+      doAssert conn.pendingStmtCloses == @["s1"] # queued for next op
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: addStmtCache evicts down to capacity after shrink":
+    # Shrinking stmtCacheCapacity below the current size leaves the cache
+    # over-full; the next addStmtCache must drain it down to the new
+    # capacity rather than dropping the new entry or stopping after one
+    # eviction. All evicted names are queued in pendingStmtCloses.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 4
+
+      conn.addStmtCache("A", CachedStmt(name: "s1"))
+      conn.addStmtCache("B", CachedStmt(name: "s2"))
+      conn.addStmtCache("C", CachedStmt(name: "s3"))
+      conn.addStmtCache("D", CachedStmt(name: "s4"))
+      doAssert conn.stmtCache.len == 4
+
+      conn.stmtCacheCapacity = 2
+      conn.addStmtCache("E", CachedStmt(name: "s5"))
+      doAssert conn.stmtCache.len == 2
+      doAssert conn.stmtCache.hasKey("D") # most-recent kept
+      doAssert conn.stmtCache.hasKey("E") # newly inserted
+      doAssert conn.pendingStmtCloses == @["s1", "s2", "s3"] # all queued
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: next operation drains pending closes":
+    # The pending Close queue from defensive eviction is flushed at the
+    # start of the next Extended Query send phase. Postgres treats Close
+    # on a non-existent prepared statement as a no-op (returns
+    # CloseComplete), so using synthetic names here is safe.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      conn.addStmtCache("A", CachedStmt(name: "s1"))
+      conn.addStmtCache("B", CachedStmt(name: "s2"))
+      conn.addStmtCache("C", CachedStmt(name: "s3")) # evicts A
+      doAssert conn.pendingStmtCloses.len == 1
+
+      # Any Extended Query operation drains the queue.
+      let r = await conn.query("SELECT 42")
+      doAssert r.rows[0].getInt(0) == 42
+      doAssert conn.pendingStmtCloses.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: shrink drains entire pending queue in one op":
+    # After a large shrink, multiple pending closes are batched into the
+    # next operation's Sync round-trip.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 4
+
+      conn.addStmtCache("A", CachedStmt(name: "s1"))
+      conn.addStmtCache("B", CachedStmt(name: "s2"))
+      conn.addStmtCache("C", CachedStmt(name: "s3"))
+      conn.addStmtCache("D", CachedStmt(name: "s4"))
+
+      conn.stmtCacheCapacity = 2
+      conn.addStmtCache("E", CachedStmt(name: "s5"))
+      doAssert conn.pendingStmtCloses.len == 3
+
+      discard await conn.query("SELECT 1")
+      doAssert conn.pendingStmtCloses.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: openCursor flushes pending closes":
+    # Cursor send paths used to use a local batch buffer that bypassed
+    # ``conn.sendBuf``, so any closes queued in ``pendingStmtCloses`` would
+    # sit there until the next non-cursor Extended Query op. The cursor
+    # batch now drains the queue first.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      conn.addStmtCache("A", CachedStmt(name: "s1"))
+      conn.addStmtCache("B", CachedStmt(name: "s2"))
+      conn.addStmtCache("C", CachedStmt(name: "s3")) # evicts A, queues s1
+      doAssert conn.pendingStmtCloses.len == 1
+
+      let cursor = await conn.openCursor("SELECT generate_series(1,3)", chunkSize = 10)
+      doAssert conn.pendingStmtCloses.len == 0
+      discard await cursor.fetchNext()
+      await cursor.close()
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: fetchNext flushes pending closes":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      let cursor = await conn.openCursor("SELECT generate_series(1,30)", chunkSize = 10)
+      # The first chunk was buffered inside openCursor; this fetchNext
+      # returns that buffer without touching fetchNextImpl.
+      let first = await cursor.fetchNext()
+      doAssert first.len == 10
+
+      # Inject a pending close mid-cursor and verify the *next* fetchNext
+      # (which actually goes through fetchNextImpl) drains the queue.
+      conn.pendingStmtCloses.add("nonexistent_stmt_1")
+      doAssert conn.pendingStmtCloses.len == 1
+
+      let second = await cursor.fetchNext()
+      doAssert second.len == 10
+      doAssert conn.pendingStmtCloses.len == 0
+
+      await cursor.close()
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: closeCursor flushes pending closes":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      let cursor = await conn.openCursor("SELECT generate_series(1,30)", chunkSize = 5)
+      discard await cursor.fetchNext() # not exhausted (30 rows, chunk 5)
+
+      conn.pendingStmtCloses.add("nonexistent_stmt_2")
+      doAssert conn.pendingStmtCloses.len == 1
+
+      await cursor.close()
+      doAssert conn.pendingStmtCloses.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: clearStmtCache also clears pendingStmtCloses":
+    # ``clearStmtCache`` documents that it does not close server-side
+    # statements; that intent extends to any closes queued in
+    # ``pendingStmtCloses`` from defensive eviction — they are dropped on
+    # the assumption the caller will reset the session externally.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 2
+
+      conn.addStmtCache("A", CachedStmt(name: "s1"))
+      conn.addStmtCache("B", CachedStmt(name: "s2"))
+      conn.addStmtCache("C", CachedStmt(name: "s3")) # evicts A, queues s1
+      doAssert conn.stmtCache.len == 2
+      doAssert conn.pendingStmtCloses.len == 1
+
+      conn.clearStmtCache()
+      doAssert conn.stmtCache.len == 0
+      doAssert conn.pendingStmtCloses.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: works with pool":
     proc t() {.async.} =
       let pool = await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))

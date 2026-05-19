@@ -36,6 +36,7 @@ proc queryImpl*(
   var effectiveResultFormats: seq[int16]
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   if cacheHit:
     stmtName = cached.name
     cachedFields = cached.fields
@@ -97,6 +98,7 @@ proc queryImpl*(
   var effectiveResultFormats: seq[int16]
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   if cacheHit:
     stmtName = cached.name
     cachedFields = cached.fields
@@ -159,6 +161,7 @@ proc queryEachImpl*(
   var effectiveResultFormats: seq[int16]
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   if cacheHit:
     stmtName = cached.name
     cachedFields = cached.fields
@@ -292,6 +295,7 @@ proc queryInlineImpl*(
   var effectiveResultFormats: seq[int16]
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   if cacheHit:
     stmtName = cached.name
     cachedFields = cached.fields

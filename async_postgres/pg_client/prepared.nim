@@ -106,6 +106,7 @@ proc executeImpl*(
         coerced[i] = coerceBinaryParam(params[i], stmt.paramOids[i])
 
   conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
   conn.sendBuf.addBind(
     "", stmt.name, if needsCoercion: coerced else: params, resultFormats
   )
