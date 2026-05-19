@@ -398,6 +398,75 @@ suite "Tracing: query":
 
     waitFor t()
 
+suite "Tracing: queryDirect":
+  test "onQueryStart(isExec=false) and onQueryEnd with rowCount":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      log.queryStarts.setLen(0)
+      log.queryEnds.setLen(0)
+
+      let qr = await conn.queryDirect("SELECT generate_series(1, $1)::int4", 3'i32)
+      doAssert qr.rowCount == 3
+
+      doAssert log.queryStarts.len == 1
+      doAssert log.queryStarts[0].sql == "SELECT generate_series(1, $1)::int4"
+      doAssert log.queryStarts[0].isExec == false
+      doAssert log.queryEnds.len == 1
+      doAssert log.queryEnds[0].rowCount == 3
+      doAssert not log.queryEnds[0].hasErr
+      doAssert log.queryEnds[0].spanId > 0
+
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: execDirect":
+  test "onQueryStart(isExec=true) and onQueryEnd with commandTag":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      log.queryStarts.setLen(0)
+      log.queryEnds.setLen(0)
+
+      let tag = await conn.execDirect("SELECT $1::int4", 1'i32)
+      doAssert tag.commandTag.len > 0
+
+      doAssert log.queryStarts.len == 1
+      doAssert log.queryStarts[0].sql == "SELECT $1::int4"
+      doAssert log.queryStarts[0].isExec == true
+      doAssert log.queryEnds.len == 1
+      doAssert log.queryEnds[0].commandTag.len > 0
+      doAssert not log.queryEnds[0].hasErr
+      doAssert log.queryEnds[0].spanId > 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "onQueryEnd receives err on timeout":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+      log.queryStarts.setLen(0)
+      log.queryEnds.setLen(0)
+
+      try:
+        discard await conn.execDirect(
+          "SELECT pg_sleep($1)", 10'f64, timeout = milliseconds(50)
+        )
+      except PgError:
+        discard
+
+      doAssert log.queryStarts.len == 1
+      doAssert log.queryEnds.len == 1
+      doAssert log.queryEnds[0].hasErr
+
+    waitFor t()
+
 suite "Tracing: simpleExec":
   test "onQueryStart and onQueryEnd are called":
     proc t() {.async.} =

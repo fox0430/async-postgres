@@ -7537,6 +7537,67 @@ suite "E2E: queryDirect / execDirect":
 
     waitFor t()
 
+  test "queryDirect timeout=Zero behaves as no-timeout (regression)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.queryDirect("SELECT $1::int4", 7'i32, timeout = ZeroDuration)
+      doAssert qr.rows[0].getInt(0) == 7
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect timeout=Zero behaves as no-timeout (regression)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_exec_direct_to_zero")
+      discard await conn.exec(
+        "CREATE TABLE test_exec_direct_to_zero (id serial PRIMARY KEY, val int NOT NULL)"
+      )
+      let tag = await conn.execDirect(
+        "INSERT INTO test_exec_direct_to_zero (val) VALUES ($1)",
+        42'i32,
+        timeout = ZeroDuration,
+      )
+      doAssert "INSERT" in tag
+      discard await conn.exec("DROP TABLE test_exec_direct_to_zero")
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect timeout raises PgTimeoutError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var caught = false
+      try:
+        discard await conn.queryDirect(
+          "SELECT pg_sleep($1)", 10'f64, timeout = milliseconds(50)
+        )
+      except PgTimeoutError:
+        caught = true
+      except PgError:
+        discard
+      doAssert caught
+      doAssert conn.state == csClosed
+
+    waitFor t()
+
+  test "execDirect timeout raises PgTimeoutError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var caught = false
+      try:
+        discard await conn.execDirect(
+          "SELECT pg_sleep($1)", 10'f64, timeout = milliseconds(50)
+        )
+      except PgTimeoutError:
+        caught = true
+      except PgError:
+        discard
+      doAssert caught
+      doAssert conn.state == csClosed
+
+    waitFor t()
+
 suite "E2E: queryEach":
   test "basic - all rows passed to callback":
     proc t() {.async.} =
