@@ -4,9 +4,9 @@ import async_backend, pg_protocol, pg_connection, pg_types, pg_client
 
 privateAccess(PgConnection)
 
-const closePruneThreshold = 16
-  ## Sweep `pool.pendingCloses` for finished futures only once its length
-  ## reaches this threshold, so the O(n) prune is amortized across calls.
+const bgTaskPruneThreshold = 16
+  ## Sweep `pool.pendingBackgroundTasks` for finished futures only once its
+  ## length reaches this threshold, so the O(n) prune is amortized across calls.
 
 type
   PoolConfig* = object
@@ -92,8 +92,10 @@ type
     metrics: PoolMetrics
     pendingOps: Deque[PendingPoolOp] ## Queue for implicit pipeline batching
     dispatchScheduled: bool ## Whether a dispatch callback is pending
-    pendingCloses: seq[Future[void]]
-      ## Fire-and-forget close tasks spawned by closeNoWait, awaited on pool.close()
+    pendingBackgroundTasks: seq[Future[void]]
+      ## Fire-and-forget tasks tracked so `pool.close()` can drain them
+      ## before returning. Populated by `closeNoWait` (connection closes)
+      ## and `spawnConnectForWaiter` (FIFO-driven background connects).
     consecutiveConnectFailures: int
       ## Counter for exponential backoff in the maintenance loop. Reset to 0
       ## whenever a connect succeeds (in maintenance or acquire).
@@ -204,11 +206,28 @@ proc tracedClose(pool: PgPool, conn: PgConnection) {.async.} =
   except CatchableError as e:
     pool.reportCloseError(conn, e)
 
+proc pruneBackgroundTasks(pool: PgPool) =
+  ## Sweep finished futures out of `pool.pendingBackgroundTasks`. Skipped until
+  ## the seq grows past `bgTaskPruneThreshold` so the O(n) walk is amortized
+  ## across calls. Uses swap-remove (constant-time delete that reorders)
+  ## since order among pending tasks is irrelevant.
+  if pool.pendingBackgroundTasks.len < bgTaskPruneThreshold:
+    return
+  var n = pool.pendingBackgroundTasks.len
+  var i = 0
+  while i < n:
+    if pool.pendingBackgroundTasks[i].finished:
+      pool.pendingBackgroundTasks[i] = pool.pendingBackgroundTasks[n - 1]
+      dec n
+    else:
+      inc i
+  pool.pendingBackgroundTasks.setLen(n)
+
 proc closeNoWait(pool: PgPool, conn: PgConnection) =
   ## Schedule connection close without waiting. For use in non-async contexts
   ## (e.g. `release()` is synchronous). The spawned task is tracked in
-  ## `pool.pendingCloses` so `pool.close()` can await its completion for
-  ## graceful shutdown.
+  ## `pool.pendingBackgroundTasks` so `pool.close()` can await its completion
+  ## for graceful shutdown.
   ##
   ## Note on asyncdispatch: a close scheduled here may race with an inflight
   ## request future that the previous timeout could not cancel (see
@@ -220,22 +239,9 @@ proc closeNoWait(pool: PgPool, conn: PgConnection) =
   proc doClose() {.async.} =
     await pool.tracedClose(conn)
 
-  # Prune only once the seq grows past the threshold so the sweep is amortized
-  # instead of O(n) on every call. Uses swap-remove (constant-time delete that
-  # reorders) since order among pending closes is irrelevant.
-  if pool.pendingCloses.len >= closePruneThreshold:
-    var n = pool.pendingCloses.len
-    var i = 0
-    while i < n:
-      if pool.pendingCloses[i].finished:
-        pool.pendingCloses[i] = pool.pendingCloses[n - 1]
-        dec n
-      else:
-        inc i
-    pool.pendingCloses.setLen(n)
-
+  pool.pruneBackgroundTasks()
   let fut = doClose()
-  pool.pendingCloses.add(fut)
+  pool.pendingBackgroundTasks.add(fut)
   asyncSpawn fut
 
 proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
@@ -289,6 +295,91 @@ proc computeConnectBackoff*(initial, maxDelay: Duration, failures: int): Duratio
     result = result + result
   if result > maxDelay:
     result = maxDelay
+
+proc tryHandoffToWaiter(pool: PgPool, conn: PgConnection): bool =
+  ## Hand `conn` to the next non-cancelled waiter, if any. Returns true on
+  ## delivery; the caller is responsible for accounting `pool.active` since
+  ## the connection is now owned by the waiter.
+  while pool.waiters.len > 0:
+    let waiter = pool.waiters.popFirst()
+    if waiter.cancelled:
+      continue
+    pool.waiterCount.dec
+    waiter.fut.complete(conn)
+    return true
+  return false
+
+proc failNextWaiter(pool: PgPool, err: ref CatchableError): bool =
+  ## Fail the next non-cancelled waiter with `err`. Returns true if a waiter
+  ## was failed.
+  while pool.waiters.len > 0:
+    let waiter = pool.waiters.popFirst()
+    if waiter.cancelled:
+      continue
+    pool.waiterCount.dec
+    waiter.fut.fail(err)
+    return true
+  return false
+
+proc canAttemptConnect(pool: PgPool): bool =
+  ## Whether a new connection may be opened right now. Respects the
+  ## exponential backoff window driven by `consecutiveConnectFailures` /
+  ## `nextConnectRetryAt`.
+  pool.consecutiveConnectFailures == 0 or Moment.now() >= pool.nextConnectRetryAt
+
+proc spawnConnectForWaiter(pool: PgPool) =
+  ## Open a connection asynchronously and hand it to the next queued waiter
+  ## (FIFO). The caller MUST have already incremented `pool.active` as a
+  ## capacity reservation before invoking this proc; the spawn rebalances
+  ## that reservation based on the outcome:
+  ## - delivered to a waiter: reservation stays consumed (the conn is the
+  ##   waiter's active connection)
+  ## - connect failed / no waiter remained / pool closed: reservation is
+  ##   released via `active.dec`
+  ##
+  ## On connect failure the front waiter is failed with the underlying
+  ## error so the caller's `acquire` returns promptly rather than waiting
+  ## for `acquireTimeout`. The spawned future is tracked in
+  ## `pendingBackgroundTasks` so `pool.close()` drains it before returning.
+  proc run() {.async.} =
+    var consumed = false
+    try:
+      let conn = await connect(pool.config.connConfig)
+      conn.ownerPool = pool
+      pool.metrics.createCount.inc
+      pool.consecutiveConnectFailures = 0
+      if pool.closed:
+        await pool.tracedClose(conn)
+        return
+      if pool.tryHandoffToWaiter(conn):
+        consumed = true
+        return
+      # No waiter remained (all cancelled); park the conn in idle so it
+      # is not lost.
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+    except CatchableError as e:
+      pool.consecutiveConnectFailures.inc
+      let delay = computeConnectBackoff(
+        pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
+        pool.consecutiveConnectFailures,
+      )
+      if delay > ZeroDuration:
+        pool.nextConnectRetryAt = Moment.now() + delay
+      # Only the front waiter is failed here: this spawn's reservation was
+      # for that one waiter, and other waiters may still be served by
+      # existing borrowers' releases. We don't blanket-fail the queue or
+      # re-spawn for siblings — `canAttemptConnect()` is now false during
+      # the backoff window, so further spawns are deferred until backoff
+      # expires (then triggered by the next acquire or release).
+      discard pool.failNextWaiter(e)
+    finally:
+      if not consumed and pool.active > 0:
+        pool.active.dec
+
+  pool.pruneBackgroundTasks()
+  let fut = run()
+  pool.pendingBackgroundTasks.add(fut)
+  asyncSpawn fut
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
@@ -351,8 +442,14 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         let conn = await connect(pool.config.connConfig).wait(replenishTimeout)
         conn.ownerPool = pool
         pool.metrics.createCount.inc
-        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
         pool.consecutiveConnectFailures = 0
+        # FIFO fairness: if a waiter is already queued, hand the freshly
+        # opened connection to them directly rather than parking it in
+        # idle (which would let a later acquire jump the queue).
+        if pool.tryHandoffToWaiter(conn):
+          pool.active.inc
+        else:
+          pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
       except CatchableError:
         pool.consecutiveConnectFailures.inc
         let delay = computeConnectBackoff(
@@ -408,7 +505,22 @@ proc releaseCore(
     if pool.active > 0:
       pool.active.dec
     pool.closeNoWait(conn)
+    # FIFO fairness: a discarded conn does not serve a waiter, but it frees
+    # an `active` slot. If a waiter is queued and the pool can still grow,
+    # open a replacement out-of-band so the front waiter is not stranded
+    # until the next release or maintenance tick.
+    if not pool.closed and pool.waiterCount > 0 and pool.active < pool.config.maxSize and
+        pool.canAttemptConnect():
+      pool.active.inc
+      pool.spawnConnectForWaiter()
     return (true, false)
+  # FIFO handoff: serve the head waiter directly with the released conn.
+  # `active` is intentionally not decremented — the conn is still in use, just
+  # by a different borrower. Any remaining waiters behind the head are not
+  # spawned for here: each one already had a `spawnConnectForWaiter`
+  # reservation kicked off at queue-time (acquireImpl) or at the broken-release
+  # that freed a slot, so the queue is already covered by in-flight spawns or
+  # by the next release.
   while pool.waiters.len > 0:
     let waiter = pool.waiters.popFirst()
     if waiter.cancelled:
@@ -495,48 +607,54 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     pool.metrics.acquireDuration =
       pool.metrics.acquireDuration + (Moment.now() - acquireStart)
 
-  # Try to get an idle connection
-  while pool.idle.len > 0:
-    let pc = pool.idle.popFirst()
-    if pc.conn.state != csReady:
-      pool.metrics.closeCount.inc
-      await pool.tracedClose(pc.conn)
-      continue
-    if pool.config.maxLifetime > ZeroDuration and
-        pool.cachedNow - pc.conn.createdAt > pool.config.maxLifetime:
-      pool.metrics.closeCount.inc
-      await pool.tracedClose(pc.conn)
-      continue
-    # Health check: ping connections that have been idle too long
-    if pool.config.healthCheckTimeout > ZeroDuration and
-        pool.cachedNow - pc.lastUsedAt > pool.config.healthCheckTimeout:
-      try:
-        await pc.conn.ping(pool.config.pingTimeout)
-      except CatchableError:
+  # FIFO fairness: skip the idle / new-conn fast paths when waiters are
+  # already queued, otherwise a fresh caller would jump the queue. Cancelled
+  # waiters don't count (they're swept lazily by release/handoff), so the
+  # `waiterCount` field — which tracks only live waiters — is the guard.
+  if pool.waiterCount == 0:
+    # Try to get an idle connection
+    while pool.idle.len > 0:
+      let pc = pool.idle.popFirst()
+      if pc.conn.state != csReady:
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
         continue
-    pool.active.inc
-    recordAcquire()
-    return (pc.conn, false)
-
-  # No idle connections; create new if under limit
-  if pool.active < pool.config.maxSize:
-    pool.active.inc
-    try:
-      let conn = await connect(pool.config.connConfig)
-      conn.ownerPool = pool
-      pool.metrics.createCount.inc
-      # A successful caller-driven connect signals the DB is reachable —
-      # let the maintenance loop resume immediate replenishment.
-      pool.consecutiveConnectFailures = 0
+      if pool.config.maxLifetime > ZeroDuration and
+          pool.cachedNow - pc.conn.createdAt > pool.config.maxLifetime:
+        pool.metrics.closeCount.inc
+        await pool.tracedClose(pc.conn)
+        continue
+      # Health check: ping connections that have been idle too long
+      if pool.config.healthCheckTimeout > ZeroDuration and
+          pool.cachedNow - pc.lastUsedAt > pool.config.healthCheckTimeout:
+        try:
+          await pc.conn.ping(pool.config.pingTimeout)
+        except CatchableError:
+          pool.metrics.closeCount.inc
+          await pool.tracedClose(pc.conn)
+          continue
+      pool.active.inc
       recordAcquire()
-      return (conn, true)
-    except CatchableError as e:
-      pool.active.dec
-      raise e
+      return (pc.conn, false)
 
-  # Max connections reached; wait for one to be released
+    # No idle connections; create new if under limit
+    if pool.active < pool.config.maxSize:
+      pool.active.inc
+      try:
+        let conn = await connect(pool.config.connConfig)
+        conn.ownerPool = pool
+        pool.metrics.createCount.inc
+        # A successful caller-driven connect signals the DB is reachable —
+        # let the maintenance loop resume immediate replenishment.
+        pool.consecutiveConnectFailures = 0
+        recordAcquire()
+        return (conn, true)
+      except CatchableError as e:
+        pool.active.dec
+        raise e
+
+  # Either max connections are reached or waiters are queued ahead of us;
+  # queue up and wait for delivery.
   if pool.config.maxWaiters >= 0 and pool.waiterCount >= pool.config.maxWaiters:
     raise newException(
       PgPoolError,
@@ -546,6 +664,17 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   let waiter = Waiter(fut: fut, cancelled: false)
   pool.waiters.addLast(waiter)
   pool.waiterCount.inc
+
+  # FIFO fairness: if the pool still has spare capacity but we're queued
+  # behind others, open an out-of-band connection so the front waiter is
+  # served promptly. Without this, the queue would only drain when an
+  # existing borrower releases — broken-conn releases (which discard
+  # instead of handing off) could otherwise leave waiters stalled even
+  # though `active < maxSize`.
+  if pool.active < pool.config.maxSize and pool.canAttemptConnect():
+    pool.active.inc
+    pool.spawnConnectForWaiter()
+
   if pool.config.acquireTimeout > ZeroDuration:
     try:
       let conn = await fut.wait(pool.config.acquireTimeout)
@@ -1361,11 +1490,11 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     pool.metrics.closeCount.inc
     await pool.tracedClose(pc.conn)
 
-  # Wait for any fire-and-forget closes spawned via closeNoWait so the server
-  # observes Terminate and fds are released before this proc returns. A late
-  # release() from another task may push more entries while we await, so loop
-  # with snapshot-and-clear to avoid discarding unfinished futures.
-  while pool.pendingCloses.len > 0:
-    let pending = pool.pendingCloses
-    pool.pendingCloses.setLen(0)
+  # Wait for any fire-and-forget tasks (closeNoWait, spawnConnectForWaiter) so
+  # the server observes Terminate / connects unwind before this proc returns. A
+  # late release() from another task may push more entries while we await, so
+  # loop with snapshot-and-clear to avoid discarding unfinished futures.
+  while pool.pendingBackgroundTasks.len > 0:
+    let pending = pool.pendingBackgroundTasks
+    pool.pendingBackgroundTasks.setLen(0)
     await allFutures(pending)

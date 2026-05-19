@@ -509,7 +509,7 @@ suite "Pool close":
     pool.active = 1
     let conn = mockConn(csClosed)
     pool.release(conn)
-    check pool.pendingCloses.len == 1
+    check pool.pendingBackgroundTasks.len == 1
 
   test "close awaits pending closeNoWait tasks":
     let pool = makePool()
@@ -519,20 +519,20 @@ suite "Pool close":
 
     waitFor pool.close()
     check pool.closed
-    check pool.pendingCloses.len == 0
+    check pool.pendingBackgroundTasks.len == 0
 
   test "closeNoWait prunes finished futures once threshold is reached":
     let pool = makePool()
     # Inject pre-finished dummies up to the prune threshold so the next
     # closeNoWait deterministically triggers the sweep regardless of timing.
-    for _ in 0 ..< closePruneThreshold:
+    for _ in 0 ..< bgTaskPruneThreshold:
       let f = newFuture[void]("dummy")
       f.complete()
-      pool.pendingCloses.add(f)
+      pool.pendingBackgroundTasks.add(f)
     pool.active = 1
     pool.release(mockConn(csClosed))
     # All finished dummies were swept, leaving only the newly spawned close.
-    check pool.pendingCloses.len == 1
+    check pool.pendingBackgroundTasks.len == 1
     waitFor pool.close()
 
 suite "Pool active count tracking":
@@ -1391,6 +1391,138 @@ suite "Pool high concurrency":
 
     for i in 0 ..< 10:
       check waitFor(futs[i]) == conns[i]
+
+suite "FIFO fairness":
+  test "tryHandoffToWaiter delivers to first non-cancelled waiter":
+    let pool = makePool()
+    let cancelled = Waiter(fut: newFuture[PgConnection]("c"), cancelled: true)
+    let validFut = newFuture[PgConnection]("v")
+    let valid = Waiter(fut: validFut, cancelled: false)
+    pool.waiters.addLast(cancelled)
+    pool.waiters.addLast(valid)
+    pool.waiterCount = 1
+
+    let conn = mockConn()
+    check pool.tryHandoffToWaiter(conn)
+    check pool.waiterCount == 0
+    check pool.waiters.len == 0
+    check validFut.finished
+    check validFut.read() == conn
+
+  test "tryHandoffToWaiter returns false with no live waiters":
+    let pool = makePool()
+    check not pool.tryHandoffToWaiter(mockConn())
+
+    # All-cancelled waiters are equivalent to no waiters and get drained.
+    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("c"), cancelled: true))
+    check not pool.tryHandoffToWaiter(mockConn())
+    check pool.waiters.len == 0
+
+  test "acquire does not jump idle when waiters are already queued":
+    # Pre-fix bug: a fresh acquire would pop the idle conn and bypass any
+    # already-queued waiter. After the fix, the new caller must join the
+    # back of the queue and leave idle untouched.
+    let pool = makePool(maxSize = 2)
+    pool.active = 2 # at maxSize
+    pool.idle.addLast(toPooled(mockConn()))
+    let existingFut = newFuture[PgConnection]("existing")
+    pool.waiters.addLast(Waiter(fut: existingFut, cancelled: false))
+    pool.waiterCount = 1
+
+    let newFut = pool.acquire()
+
+    check pool.waiters.len == 2
+    check pool.waiterCount == 2
+    check pool.idle.len == 1
+    check not newFut.finished
+    check not existingFut.finished
+
+    # Drain in FIFO order: existing waiter first, then the new one.
+    let c1 = mockConn()
+    pool.release(c1)
+    check existingFut.finished
+    check existingFut.read() == c1
+
+    let c2 = mockConn()
+    pool.release(c2)
+    check waitFor(newFut) == c2
+
+  test "acquire does not create new conn when waiters are already queued":
+    # Pre-fix bug: with active<maxSize and waiters queued (e.g. after a
+    # broken-conn release dropped active without serving the waiter), a
+    # fresh acquire would create a new connection that should have gone to
+    # the head-of-queue waiter. After the fix, the new caller queues.
+    let pool = makePool(maxSize = 5)
+    pool.active = 1
+    let existingFut = newFuture[PgConnection]("existing")
+    pool.waiters.addLast(Waiter(fut: existingFut, cancelled: false))
+    pool.waiterCount = 1
+    # Suppress the spawn-for-waiter so the test isolates the queue logic
+    # from the async connect path.
+    pool.consecutiveConnectFailures = 1
+    pool.nextConnectRetryAt = Moment.now() + seconds(60)
+
+    let newFut = pool.acquire()
+
+    check pool.waiters.len == 2
+    check pool.waiterCount == 2
+    check pool.active == 1
+    check not newFut.finished
+    check not existingFut.finished
+
+    # Drain front-of-queue waiter; newFut intentionally left pending.
+    pool.release(mockConn())
+    check existingFut.finished
+    discard newFut
+
+  test "broken-conn release in backoff does not reserve a slot":
+    # Verifies canAttemptConnect is honored: while in the backoff window,
+    # a broken-conn release just frees the active slot without kicking off
+    # a spawn-for-waiter (which would otherwise pile failures on a known
+    # unreachable DB).
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+    let waitFut = newFuture[PgConnection]("waiter")
+    pool.waiters.addLast(Waiter(fut: waitFut, cancelled: false))
+    pool.waiterCount = 1
+    pool.consecutiveConnectFailures = 1
+    pool.nextConnectRetryAt = Moment.now() + seconds(60)
+
+    pool.release(mockConn(csClosed))
+
+    check pool.active == 0
+    check pool.waiterCount == 1
+    check not waitFut.finished
+
+  test "broken-conn release reserves an active slot for queued waiter":
+    # The fix: discarding a broken connection while a waiter is queued
+    # must immediately reserve the freed slot for an out-of-band connect.
+    # Otherwise a concurrent fresh acquire would jump the queue.
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      # The spawn-for-waiter triggered by release() will try to connect to
+      # localhost:5432. Cap the attempt so the test doesn't hang on hosts
+      # where the SYN is silently dropped (the assertions below are
+      # synchronous; the connect outcome only affects close()'s drain).
+      pool.config.connConfig.connectTimeout = milliseconds(100)
+      pool.active = 1
+      let waitFut = newFuture[PgConnection]("waiter")
+      pool.waiters.addLast(Waiter(fut: waitFut, cancelled: false))
+      pool.waiterCount = 1
+
+      pool.release(mockConn(csClosed))
+
+      # Synchronously after release: active was decremented from 1 to 0,
+      # then re-incremented to 1 as a reservation for the spawn-for-waiter
+      # task. The waiter is still queued (the spawn body has not run yet).
+      doAssert pool.active == 1
+      doAssert pool.waiterCount == 1
+
+      # Drain the in-flight spawn via close so the test does not outlive it.
+      await pool.close()
+      doAssert pool.closed
+
+    waitFor t()
 
 suite "Error type granularity":
   test "closed pool raises PgPoolError":
