@@ -1257,6 +1257,7 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
 
 when defined(posix):
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
+  var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
 
   proc configureTcpNoDelay(fd: posix.SocketHandle) =
     ## Disable Nagle's algorithm for low-latency sends.
@@ -1962,20 +1963,67 @@ proc simpleExec*(
       tag = await simpleExecImpl(conn, sql)
   return initCommandResult(tag)
 
-proc isConnected*(conn: PgConnection): bool =
-  ## Whether the underlying transport is present.
+proc socketHasFin*(conn: PgConnection): bool =
+  ## Non-blocking OS-level half-open probe (POSIX only).
   ##
-  ## This is a cheap, non-blocking check (no round trip): it only reports
-  ## whether the connection object currently holds a transport handle. It
-  ## does **not** detect server-side closes that have not yet been observed
-  ## by a read — use `ping` for that.
+  ## Returns `true` when the kernel has already observed a peer-side FIN/RST
+  ## on this connection's underlying socket. Returns `false` when the socket
+  ## is alive and idle, when there is pending data (which the next operation
+  ## will handle), or when there is no transport handle to probe (e.g. mock
+  ## connections, or after `close`).
+  ##
+  ## A single `recv(MSG_PEEK | MSG_DONTWAIT)` syscall — no round trip. For
+  ## TLS connections this still detects TCP-level FIN/RST, but not TLS-layer
+  ## errors that haven't been read yet; use `ping` for that.
+  ##
+  ## On non-POSIX platforms this always returns `false` (no probe available).
+  when defined(posix):
+    when hasChronos:
+      if conn.transport.isNil:
+        return false
+      let fd = posix.SocketHandle(conn.transport.fd)
+    elif hasAsyncDispatch:
+      if conn.socket.isNil:
+        return false
+      let fd = posix.SocketHandle(conn.socket.getFd())
+    var buf: byte
+    let flags = posix.MSG_PEEK or MSG_DONTWAIT
+    while true:
+      let n = posix.recv(fd, addr buf, 1, flags)
+      if n > 0:
+        return false
+      if n == 0:
+        return true
+      let err = errno
+      if err == EAGAIN or err == EWOULDBLOCK:
+        return false
+      if err == EINTR:
+        continue
+      return true
+  else:
+    false
+
+proc isConnected*(conn: PgConnection): bool =
+  ## Whether the underlying transport is present and the OS has not yet
+  ## observed a peer-side close.
+  ##
+  ## Cheap, non-blocking (no round trip): checks that the connection object
+  ## holds a transport handle, and on POSIX also issues a single
+  ## `recv(MSG_PEEK | MSG_DONTWAIT)` via `socketHasFin` to catch FIN/RST
+  ## already sitting in the kernel buffer (half-open detection). On
+  ## non-POSIX platforms the check falls back to handle presence only.
   ##
   ## Pair with `state == csReady` to decide whether a connection is usable
-  ## before issuing a query.
+  ## before issuing a query. Use `ping` for a full server round trip when
+  ## the OS-level probe is insufficient (e.g. TLS-layer state, application
+  ## liveness rather than transport liveness).
   when hasChronos:
-    not conn.writer.isNil
+    if conn.writer.isNil:
+      return false
   elif hasAsyncDispatch:
-    not conn.socket.isNil
+    if conn.socket.isNil:
+      return false
+  not conn.socketHasFin()
 
 proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
   ## Lightweight health check using an empty simple query.

@@ -615,7 +615,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     # Try to get an idle connection
     while pool.idle.len > 0:
       let pc = pool.idle.popFirst()
-      if pc.conn.state != csReady:
+      if pc.conn.state != csReady or pc.conn.socketHasFin():
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
         continue
