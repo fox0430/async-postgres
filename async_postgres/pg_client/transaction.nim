@@ -65,6 +65,15 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## COMMIT(≤timeout) [+ ROLLBACK(≤timeout) on failure]. Use
   ## `withTransactionDeadline` for a single wall-clock deadline covering
   ## BEGIN, body, and COMMIT together.
+  ##
+  ## **On per-call timeout** (BEGIN/COMMIT/in-body): `simpleExec` invalidates
+  ## the connection via `invalidateOnTimeout` (marked `csClosed`, server-side
+  ## CancelRequest dispatched) and raises `PgTimeoutError`. ROLLBACK is *not*
+  ## attempted on an already-closed connection — `txStatus` may still read
+  ## `tsInTransaction` (stale, because no `ReadyForQuery` was received), but
+  ## the `csReady` guard prevents a futile cleanup call. Standalone callers
+  ## must `await conn.close()` after this error; pooled connections are
+  ## dropped on release.
   var body: NimNode
   var beginSql: NimNode
   var txTimeout: NimNode
@@ -98,6 +107,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let eSym = genSym(nskLet, "e")
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let csReadySym = bindSym"csReady"
   result = quote:
     let `connSym` = `connExpr`
     try:
@@ -105,10 +115,14 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
     except CatchableError as `eSym`:
-      # Only ROLLBACK if the server is still in a transaction. After a failed
-      # COMMIT, PostgreSQL has already ended the transaction (txStatus = tsIdle),
-      # so an extra ROLLBACK would just emit "no transaction in progress".
-      if `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+      # Only ROLLBACK if the server is still in a transaction AND the connection
+      # is usable. After a failed COMMIT, PostgreSQL has already ended the
+      # transaction (txStatus = tsIdle), so an extra ROLLBACK would just emit
+      # "no transaction in progress". On per-call timeout the connection is
+      # csClosed but txStatus is stale (no RFQ received) — the state guard
+      # avoids dispatching a ROLLBACK that would fail at checkReady().
+      if `connSym`.state == `csReadySym` and
+          `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
         try:
           discard await `connSym`.simpleExec("ROLLBACK", timeout = `txTimeout`)
         except CatchableError:
@@ -193,6 +207,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let spNameSym = genSym(nskLet, "spName")
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let csReadySym = bindSym"csReady"
 
   let nameExpr = savepointNameExpr(connSym, spName)
 
@@ -207,10 +222,14 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
       )
     except CatchableError as `eSym`:
-      # Only ROLLBACK TO SAVEPOINT if the outer transaction is still alive.
-      # If txStatus is tsIdle the surrounding transaction has already ended,
-      # so the savepoint no longer exists.
-      if `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+      # Only ROLLBACK TO SAVEPOINT if the outer transaction is still alive AND
+      # the connection is usable. If txStatus is tsIdle the surrounding
+      # transaction has already ended, so the savepoint no longer exists.
+      # On per-call timeout the connection is csClosed but txStatus is stale
+      # (no RFQ received) — the state guard avoids a cleanup call that would
+      # fail at checkReady().
+      if `connSym`.state == `csReadySym` and
+          `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
         try:
           discard await `connSym`.simpleExec(
             "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
@@ -298,6 +317,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let csReadySym = bindSym"csReady"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let remainingSym = bindSym"remainingDeadlineDuration"
@@ -333,7 +353,11 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
         # PgTimeoutError — control does not return from this call.
         `connSym`.invalidateOnTimeout("withTransactionDeadline exceeded")
     except CatchableError as `eSym`:
-      if `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+      # Skip ROLLBACK when the connection is already csClosed (e.g. a per-call
+      # timeout inside body invalidated it) — checkReady would just raise and
+      # the failure would be swallowed by the inner except.
+      if `connSym`.state == `csReadySym` and
+          `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
         try:
           discard await `connSym`.simpleExec("ROLLBACK", timeout = `graceSym`)
         except CatchableError:
@@ -401,6 +425,7 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let csReadySym = bindSym"csReady"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let remainingSym = bindSym"remainingDeadlineDuration"
@@ -435,7 +460,9 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
         # PgTimeoutError — control does not return from this call.
         `connSym`.invalidateOnTimeout("withSavepointDeadline exceeded")
     except CatchableError as `eSym`:
-      if `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+      # Skip ROLLBACK TO SAVEPOINT when the connection is already csClosed.
+      if `connSym`.state == `csReadySym` and
+          `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
         try:
           discard await `connSym`.simpleExec(
             "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `graceSym`
