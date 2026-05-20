@@ -57,52 +57,7 @@ proc execImpl*(
     await conn.sendBufMsg()
 
   var commandTag = ""
-  var queryError: ref PgQueryError
-  var cachedFields: seq[FieldDescription]
-  var cachedParamOids: seq[int32]
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-          discard
-        of bmkParameterDescription:
-          if cacheMiss:
-            cachedParamOids = msg.paramTypeOids
-        of bmkRowDescription:
-          if cacheMiss:
-            cachedFields = msg.fields
-        of bmkNoData:
-          discard
-        of bmkDataRow:
-          discard # exec ignores rows
-        of bmkCommandComplete:
-          commandTag = msg.commandTag
-        of bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            if cacheHit and queryError.sqlState == "26000":
-              conn.removeStmtCache(sql)
-            raise queryError
-          if cacheMiss:
-            conn.addStmtCache(
-              sql,
-              CachedStmt(
-                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
-              ),
-            )
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf(timeout)
-
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
   return commandTag
 
 proc execImpl*(
@@ -148,52 +103,7 @@ proc execImpl*(
     await conn.sendBufMsg()
 
   var commandTag = ""
-  var queryError: ref PgQueryError
-  var cachedFields: seq[FieldDescription]
-  var cachedParamOids: seq[int32]
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-          discard
-        of bmkParameterDescription:
-          if cacheMiss:
-            cachedParamOids = msg.paramTypeOids
-        of bmkRowDescription:
-          if cacheMiss:
-            cachedFields = msg.fields
-        of bmkNoData:
-          discard
-        of bmkDataRow:
-          discard # exec ignores rows
-        of bmkCommandComplete:
-          commandTag = msg.commandTag
-        of bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            if cacheHit and queryError.sqlState == "26000":
-              conn.removeStmtCache(sql)
-            raise queryError
-          if cacheMiss:
-            conn.addStmtCache(
-              sql,
-              CachedStmt(
-                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
-              ),
-            )
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf(timeout)
-
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
   return commandTag
 
 proc exec*(
@@ -275,52 +185,7 @@ proc execInlineImpl*(
     await conn.sendBufMsg()
 
   var commandTag = ""
-  var queryError: ref PgQueryError
-  var cachedFields: seq[FieldDescription]
-  var cachedParamOids: seq[int32]
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-          discard
-        of bmkParameterDescription:
-          if cacheMiss:
-            cachedParamOids = msg.paramTypeOids
-        of bmkRowDescription:
-          if cacheMiss:
-            cachedFields = msg.fields
-        of bmkNoData:
-          discard
-        of bmkDataRow:
-          discard
-        of bmkCommandComplete:
-          commandTag = msg.commandTag
-        of bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            if cacheHit and queryError.sqlState == "26000":
-              conn.removeStmtCache(sql)
-            raise queryError
-          if cacheMiss:
-            conn.addStmtCache(
-              sql,
-              CachedStmt(
-                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
-              ),
-            )
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf(timeout)
-
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
   return commandTag
 
 proc exec*(
