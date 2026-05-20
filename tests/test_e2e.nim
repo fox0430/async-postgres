@@ -8491,6 +8491,268 @@ suite "E2E: queryDirect / execDirect":
 
     waitFor t()
 
+suite "Compile-time: queryDirect / execDirect arity":
+  # ---- positive cases ----
+
+  test "queryDirect: matching arity (single param)":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $1::int4", 1'i32)
+
+    )
+
+  test "queryDirect: matching arity (multiple params)":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect(
+            "SELECT $1::int4 + $2::int4, $3::text", 1'i32, 2'i32, "x"
+          )
+
+    )
+
+  test "queryDirect: repeated placeholder reference":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard
+            await conn.queryDirect("SELECT $1::text, $1::text, $2::text", "x", "y")
+
+    )
+
+  test "queryDirect: zero args + no placeholders":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 42 AS answer")
+
+    )
+
+  test "queryDirect: $1 inside single-quoted string is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT '$1 here' AS s")
+
+    )
+
+  test "queryDirect: $1 inside dollar-quoted block is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $tag$$1$tag$ AS s")
+
+    )
+
+  test "queryDirect: $1 inside $$..$$ dollar-quoted block is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $$$1$$ AS s")
+
+    )
+
+  test "queryDirect: $1 inside double-quoted identifier is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 1 AS \"$1\"")
+
+    )
+
+  test "queryDirect: $5 inside -- line comment is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 1 -- $5 unused\n")
+
+    )
+
+  test "queryDirect: $5 inside /* */ block comment is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 1 /* $5 unused */")
+
+    )
+
+  test "queryDirect: nested block comment skips inner $N":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 1 /* /* $5 */ still in comment */")
+
+    )
+
+  test "queryDirect: non-literal SQL skips compile-time check":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          let s = "SELECT $1"
+          # Arity mismatch is intentional: validator must silently skip when
+          # sql is not a string literal (runtime will catch it).
+          discard await conn.queryDirect(s)
+
+    )
+
+  test "execDirect: matching arity":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.execDirect(
+            "UPDATE t SET a=$1, b=$2 WHERE c=$3", 1'i32, 2'i32, 3'i32
+          )
+
+    )
+
+  # ---- negative cases ----
+
+  test "queryDirect: rejects too few args":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $1::int4, $2::int4", 1'i32)
+
+    )
+
+  test "queryDirect: rejects too many args":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $1::int4", 1'i32, 2'i32)
+
+    )
+
+  test "queryDirect: rejects gap in numbering":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard
+            await conn.queryDirect("SELECT $1::int4, $3::int4", 1'i32, 2'i32, 3'i32)
+
+    )
+
+  test "queryDirect: rejects $0":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $0::int4", 1'i32)
+
+    )
+
+  test "queryDirect: rejects $N when no args were passed":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $1::int4")
+
+    )
+
+  test "execDirect: rejects too few args":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard
+            await conn.execDirect("UPDATE t SET a=$1, b=$2 WHERE c=$3", 1'i32, 2'i32)
+
+    )
+
+  test "queryDirect: timeout kwarg does not inflate arity":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard
+            await conn.queryDirect("SELECT $1::int4", 1'i32, timeout = ZeroDuration)
+
+    )
+
+  test "queryDirect: $1 inside E'...' string is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT E'\\n$1' AS s")
+
+    )
+
+  test "queryDirect: $1 inside E'...' with backslash-escaped $ is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT E'$1\\$2' AS s")
+
+    )
+
+  test "queryDirect: $1 inside '' (doubled-quote escape) is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 'it''s $1' AS s")
+
+    )
+
+  test "queryDirect: doubled-quote inside string then placeholder outside":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 'a''b' || $1::text", "x")
+
+    )
+
+  test "queryDirect: const SQL with matching arity":
+    doAssert compiles(
+      block:
+        const SQL_OK = "SELECT $1::int4, $2::int4"
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect(SQL_OK, 1'i32, 2'i32)
+
+    )
+
+  test "queryDirect: const SQL with mismatched arity is rejected":
+    doAssert not compiles(
+      block:
+        const SQL_BAD = "SELECT $1::int4, $2::int4"
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect(SQL_BAD, 1'i32)
+
+    )
+
+  test "execDirect: const SQL with mismatched arity is rejected":
+    doAssert not compiles(
+      block:
+        const SQL_BAD_EXEC = "UPDATE t SET a=$1, b=$2 WHERE c=$3"
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.execDirect(SQL_BAD_EXEC, 1'i32, 2'i32)
+
+    )
+
 suite "E2E: queryEach":
   test "basic - all rows passed to callback":
     proc t() {.async.} =
