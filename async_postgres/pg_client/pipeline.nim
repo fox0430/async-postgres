@@ -203,10 +203,27 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
         conn.sendBuf.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
 
     let cached = conn.lookupStmtCache(p.ops[i].sql)
-    p.ops[i].cacheHit = cached != nil
+    var cacheHit = cached != nil
+    if cacheHit:
+      # Reject the cache entry if its parse-time OIDs no longer match what
+      # this op wants to bind (commit a7b656bd: prevents the server from
+      # interpreting bind bytes under stale parse-time types). Pipeline
+      # can't reuse ``invalidateIfOidMismatch`` because that routes Close
+      # through ``pendingStmtCloses`` — already flushed at the top of
+      # ``buildSendPhase`` — so emit the Close directly into sendBuf.
+      let oidsMatch =
+        if hasInline:
+          paramOidsMatch(cached.paramOids, p.inlineOids.toOpenArray(startIdx, endIdx))
+        else:
+          paramOidsMatch(cached.paramOids, p.ops[i].paramOids)
+      if not oidsMatch:
+        conn.sendBuf.addClose(dkStatement, cached.name)
+        conn.removeStmtCache(p.ops[i].sql)
+        cacheHit = false
+    p.ops[i].cacheHit = cacheHit
     p.ops[i].cacheMiss = false
 
-    if cached != nil:
+    if cacheHit:
       p.ops[i].stmtName = cached.name
       if p.ops[i].kind == pokQuery:
         if not hasCachedStmts:
@@ -270,6 +287,7 @@ proc executeImpl(
   var activeOpIdx = 0
   var queryError: ref PgQueryError
   var cachedFieldsPerOp: seq[seq[FieldDescription]] # lazy-init for cache misses
+  var cachedParamOidsPerOp: seq[seq[int32]] # lazy-init, parallel to ops
 
   # Initialize query results
   for i in 0 ..< p.ops.len:
@@ -303,7 +321,10 @@ proc executeImpl(
           of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
             discard
           of bmkParameterDescription:
-            discard
+            if activeOpIdx < p.ops.len and p.ops[activeOpIdx].cacheMiss:
+              if cachedParamOidsPerOp.len == 0:
+                cachedParamOidsPerOp = newSeq[seq[int32]](p.ops.len)
+              cachedParamOidsPerOp[activeOpIdx] = msg.paramTypeOids
           of bmkRowDescription:
             if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
               var cf: seq[int16]
@@ -381,8 +402,16 @@ proc executeImpl(
                     cachedFieldsPerOp[i]
                   else:
                     @[]
+                let paramOids =
+                  if cachedParamOidsPerOp.len > 0:
+                    cachedParamOidsPerOp[i]
+                  else:
+                    @[]
                 conn.addStmtCache(
-                  p.ops[i].sql, CachedStmt(name: p.ops[i].stmtName, fields: fields)
+                  p.ops[i].sql,
+                  CachedStmt(
+                    name: p.ops[i].stmtName, fields: fields, paramOids: paramOids
+                  ),
                 )
             break recvLoop
           else:
@@ -484,6 +513,7 @@ proc executeIsolatedImpl(
     for opIdx in 0 ..< p.ops.len:
       var opError: ref PgQueryError
       var cachedFields: seq[FieldDescription]
+      var cachedParamOids: seq[int32]
 
       block opRecv:
         while true:
@@ -499,7 +529,8 @@ proc executeIsolatedImpl(
             of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
               discard
             of bmkParameterDescription:
-              discard
+              if p.ops[opIdx].cacheMiss:
+                cachedParamOids = msg.paramTypeOids
             of bmkRowDescription:
               if p.ops[opIdx].kind == pokQuery:
                 if p.ops[opIdx].cacheMiss:
@@ -554,7 +585,11 @@ proc executeIsolatedImpl(
               elif p.ops[opIdx].cacheMiss:
                 conn.addStmtCache(
                   p.ops[opIdx].sql,
-                  CachedStmt(name: p.ops[opIdx].stmtName, fields: cachedFields),
+                  CachedStmt(
+                    name: p.ops[opIdx].stmtName,
+                    fields: cachedFields,
+                    paramOids: cachedParamOids,
+                  ),
                 )
               break opRecv
             else:

@@ -7544,6 +7544,142 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: saves paramOids and invalidates on OID mismatch (execute)":
+    # Pipeline must capture ParameterDescription on cache-miss and validate
+    # cached paramOids on cache-hit — the same protection commit a7b656bd
+    # added for query/exec. Without it, re-binding the same SQL with a
+    # different parameter type would silently reinterpret bytes under the
+    # original parse-time OID.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1 AS v"
+      var p1 = newPipeline(conn)
+      p1.addQuery(sql, @[toPgParam(123'i64)])
+      let r1 = await p1.execute()
+      doAssert r1[0].queryResult.rows[0].getInt64(0) == 123
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt8]
+      let firstName = conn.stmtCache[sql].name
+
+      # Same SQL, different OID (int4 vs int8) → cache eviction + re-parse.
+      var p2 = newPipeline(conn)
+      p2.addQuery(sql, @[toPgParam(7'i32)])
+      let r2 = await p2.execute()
+      doAssert r2[0].queryResult.rows[0].getInt(0) == 7
+      doAssert conn.stmtCache.len == 1
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidInt4]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: invalidates on OID mismatch (executeIsolated)":
+    # Same fix, executeIsolated path (per-op SYNC). Each op has its own
+    # ReadyForQuery, but the cache-miss paramOids capture and cache-hit OID
+    # validation must both still trigger.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1 AS v"
+      var p1 = newPipeline(conn)
+      p1.addQuery(sql, @[toPgParam(123'i64)])
+      let ir1 = await p1.executeIsolated()
+      doAssert ir1.errors[0] == nil
+      doAssert ir1.results[0].queryResult.rows[0].getInt64(0) == 123
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt8]
+      let firstName = conn.stmtCache[sql].name
+
+      var p2 = newPipeline(conn)
+      p2.addQuery(sql, @[toPgParam(7'i32)])
+      let ir2 = await p2.executeIsolated()
+      doAssert ir2.errors[0] == nil
+      doAssert ir2.results[0].queryResult.rows[0].getInt(0) == 7
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidInt4]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: PgParamInline saves paramOids and invalidates on mismatch":
+    # Inline param path uses a separate SoA storage for OIDs; pin that the
+    # cache-hit check threads through ``p.inlineOids`` and the cache-miss
+    # path still stores OIDs even though Parse came from the inline buffer.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1 AS v"
+      var p1 = newPipeline(conn)
+      p1.addQuery(sql, [toPgParamInline(1'i32)])
+      let r1 = await p1.execute()
+      doAssert r1[0].queryResult.rows[0].getInt(0) == 1
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
+      let firstName = conn.stmtCache[sql].name
+
+      var p2 = newPipeline(conn)
+      p2.addQuery(sql, [toPgParamInline("hello")])
+      let r2 = await p2.execute()
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "hello"
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidText]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: matching OIDs reuse cached statement":
+    # The OID check must not regress the happy path: two pipeline calls with
+    # the same SQL and same OIDs should share one server-side statement.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1::int4 AS v"
+      var p1 = newPipeline(conn)
+      p1.addQuery(sql, @[toPgParam(1'i32)])
+      discard await p1.execute()
+      let firstName = conn.stmtCache[sql].name
+
+      var p2 = newPipeline(conn)
+      p2.addQuery(sql, @[toPgParam(2'i32)])
+      let r2 = await p2.execute()
+      doAssert r2[0].queryResult.rows[0].getInt(0) == 2
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache[sql].name == firstName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: cross-path OID mismatch with prior conn.query":
+    # ``query`` populates the cache with paramOids; a follow-up pipeline call
+    # that finds the entry as a cache-hit must run the OID check and
+    # invalidate when types differ. Pins interop between the two cache
+    # populators.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1 AS v"
+      let r0 = await conn.query(sql, @[toPgParam(123'i64)])
+      doAssert r0.rows[0].getInt64(0) == 123
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt8]
+      let firstName = conn.stmtCache[sql].name
+
+      var p = newPipeline(conn)
+      p.addQuery(sql, @[toPgParam(7'i32)])
+      let r1 = await p.execute()
+      doAssert r1[0].queryResult.rows[0].getInt(0) == 7
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidInt4]
+      doAssert entry.name != firstName
+
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Pipelined Pool":
   test "pipelined pool: basic exec and query":
     proc t() {.async.} =
