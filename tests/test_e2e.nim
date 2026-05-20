@@ -7718,6 +7718,223 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: same SQL repeated in one batch Parses once":
+    # Three ops with identical SQL and identical OIDs must collapse to one
+    # server-side prepared statement. Before in-flight dedup, each op got a
+    # fresh stmtName via nextStmtName(); only the last addStmtCache survived,
+    # leaving N-1 orphaned prepared statements on the session.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1::int8 AS v"
+      var p = newPipeline(conn)
+      p.addQuery(sql, @[toPgParam(1'i64)])
+      p.addQuery(sql, @[toPgParam(2'i64)])
+      p.addQuery(sql, @[toPgParam(3'i64)])
+      let rs = await p.execute()
+      doAssert rs[0].queryResult.rows[0].getInt64(0) == 1
+      doAssert rs[1].queryResult.rows[0].getInt64(0) == 2
+      doAssert rs[2].queryResult.rows[0].getInt64(0) == 3
+
+      doAssert conn.stmtCache.len == 1
+      let cachedName = conn.stmtCache[sql].name
+
+      # Verify the server only has the one statement we tracked — no orphans.
+      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert pq[0].rowCount == 1
+      doAssert pq[0].rows[0].getStr(0) == cachedName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: same SQL repeated (executeIsolated) Parses once":
+    # per-op SYNC path: each op gets its own ReadyForQuery, but the in-flight
+    # entry must persist across those Sync boundaries because prepared
+    # statements are not torn down on Sync.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1::int8 AS v"
+      var p = newPipeline(conn)
+      p.addQuery(sql, @[toPgParam(1'i64)])
+      p.addQuery(sql, @[toPgParam(2'i64)])
+      p.addQuery(sql, @[toPgParam(3'i64)])
+      let ir = await p.executeIsolated()
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] == nil
+      doAssert ir.errors[2] == nil
+      doAssert ir.results[0].queryResult.rows[0].getInt64(0) == 1
+      doAssert ir.results[1].queryResult.rows[0].getInt64(0) == 2
+      doAssert ir.results[2].queryResult.rows[0].getInt64(0) == 3
+
+      doAssert conn.stmtCache.len == 1
+      let cachedName = conn.stmtCache[sql].name
+      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert pq[0].rowCount == 1
+      doAssert pq[0].rows[0].getStr(0) == cachedName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: same SQL with inline params Parses once":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1::int4 AS v"
+      var p = newPipeline(conn)
+      p.addQuery(sql, [toPgParamInline(10'i32)])
+      p.addQuery(sql, [toPgParamInline(20'i32)])
+      let rs = await p.execute()
+      doAssert rs[0].queryResult.rows[0].getInt(0) == 10
+      doAssert rs[1].queryResult.rows[0].getInt(0) == 20
+
+      doAssert conn.stmtCache.len == 1
+      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert pq[0].rowCount == 1
+      doAssert pq[0].rows[0].getStr(0) == conn.stmtCache[sql].name
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: same SQL with mismatched OIDs in one batch":
+    # Mid-batch OID change: op 0 Parses with int8, op 1 wants int4. The
+    # in-flight entry's OIDs don't match, so the in-flight stmt must be
+    # explicitly Closed and a fresh Parse emitted. The cache must end with
+    # only the latest (type-correct) stmt; the server must not retain the
+    # int8 stmt either.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1 AS v"
+      var p = newPipeline(conn)
+      p.addQuery(sql, @[toPgParam(100'i64)])
+      p.addQuery(sql, @[toPgParam(7'i32)])
+      let rs = await p.execute()
+      doAssert rs[0].queryResult.rows[0].getInt64(0) == 100
+      doAssert rs[1].queryResult.rows[0].getInt(0) == 7
+
+      doAssert conn.stmtCache.len == 1
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidInt4]
+
+      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert pq[0].rowCount == 1
+      doAssert pq[0].rows[0].getStr(0) == entry.name
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: same SQL three ops, OID changes after a share":
+    # The hardest interleave: op 0 cacheMiss (int8) — op 1 cacheShare (int8)
+    # — op 2 OID mismatch (int4). The mid-batch Close must target op 0's
+    # stmt, op 0 must be marked superseded (so it isn't added to cache), and
+    # op 1's share is still valid (its Bind/Execute completes before the
+    # Close hits the wire).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1 AS v"
+      var p = newPipeline(conn)
+      p.addQuery(sql, @[toPgParam(1'i64)])
+      p.addQuery(sql, @[toPgParam(2'i64)])
+      p.addQuery(sql, @[toPgParam(3'i32)])
+      let rs = await p.execute()
+      doAssert rs[0].queryResult.rows[0].getInt64(0) == 1
+      doAssert rs[1].queryResult.rows[0].getInt64(0) == 2
+      doAssert rs[2].queryResult.rows[0].getInt(0) == 3
+
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
+      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert pq[0].rowCount == 1
+      doAssert pq[0].rows[0].getStr(0) == conn.stmtCache[sql].name
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: same SQL repeated under capacity=1 stays leak-free":
+    # If N same-SQL ops were each Parsed separately, eviction would close the
+    # previously-tracked stmt but the in-pipeline duplicates would still
+    # orphan server-side. With dedup, one stmt suffices regardless of cache
+    # capacity.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 1
+
+      let sql = "SELECT $1::int4 AS v"
+      var p = newPipeline(conn)
+      for i in 0 ..< 5:
+        p.addQuery(sql, @[toPgParam(int32(i))])
+      let rs = await p.execute()
+      for i in 0 ..< 5:
+        doAssert rs[i].queryResult.rows[0].getInt(0) == i
+
+      doAssert conn.stmtCache.len == 1
+      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert pq[0].rowCount == 1
+      doAssert pq[0].rows[0].getStr(0) == conn.stmtCache[sql].name
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: rfBinary same SQL — cacheShare op decodes binary correctly":
+    # Regression for cacheShare's RowData metadata: cacheShare ops skip
+    # Describe(Statement) but still emit Describe(Portal), so they get a
+    # RowDescription with server-confirmed binary formatCodes. Without
+    # mirroring those into RowData.colFormats / colTypeOids, isBinaryCol
+    # would report false and binary bytes would be decoded as text, giving
+    # garbage (or raising on non-printable bytes).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1::int8 AS v"
+      var p = newPipeline(conn)
+      p.addQuery(sql, @[toPgParam(11'i64)], rfBinary)
+      p.addQuery(sql, @[toPgParam(22'i64)], rfBinary)
+      p.addQuery(sql, @[toPgParam(33'i64)], rfBinary)
+      let rs = await p.execute()
+      doAssert rs[0].queryResult.rows[0].getInt64(0) == 11
+      doAssert rs[1].queryResult.rows[0].getInt64(0) == 22
+      doAssert rs[2].queryResult.rows[0].getInt64(0) == 33
+      # All three ops must see binary metadata on column 0. Op 0 is cacheMiss
+      # (Describe(Statement) path), ops 1/2 are cacheShare (Describe(Portal)
+      # path) — both must yield isBinaryCol == true.
+      doAssert rs[0].queryResult.rows[0].isBinaryCol(0)
+      doAssert rs[1].queryResult.rows[0].isBinaryCol(0)
+      doAssert rs[2].queryResult.rows[0].isBinaryCol(0)
+
+      doAssert conn.stmtCache.len == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: rfBinary same SQL via executeIsolated — cacheShare decodes":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let sql = "SELECT $1::int8 AS v"
+      var p = newPipeline(conn)
+      p.addQuery(sql, @[toPgParam(100'i64)], rfBinary)
+      p.addQuery(sql, @[toPgParam(200'i64)], rfBinary)
+      let ir = await p.executeIsolated()
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] == nil
+      doAssert ir.results[0].queryResult.rows[0].getInt64(0) == 100
+      doAssert ir.results[1].queryResult.rows[0].getInt64(0) == 200
+      doAssert ir.results[0].queryResult.rows[0].isBinaryCol(0)
+      doAssert ir.results[1].queryResult.rows[0].isBinaryCol(0)
+
+      doAssert conn.stmtCache.len == 1
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Pipelined Pool":
   test "pipelined pool: basic exec and query":
     proc t() {.async.} =
