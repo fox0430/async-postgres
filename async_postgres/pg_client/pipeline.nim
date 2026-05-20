@@ -33,6 +33,15 @@ type
     # Set during send phase
     cacheHit: bool
     cacheMiss: bool
+    cacheShare: bool
+      ## Reuses an in-flight prepared statement Parsed by an earlier op in
+      ## the same pipeline (same SQL, compatible OIDs). Skips Parse/Describe,
+      ## emits Bind + Describe(Portal) + Execute instead.
+    cacheSuperseded: bool
+      ## A cacheMiss op whose freshly-Parsed prepared statement was Closed
+      ## mid-pipeline by a later same-SQL op with mismatched OIDs. The op's
+      ## results are still returned, but it is not added to the persistent
+      ## stmt cache (only the latest, type-correct stmt is).
     stmtName: string
 
   PipelineResultKind* = enum
@@ -163,6 +172,13 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   var hasCachedStmts = false
   var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
   var defaultFormats: seq[int16] # reused across ops when paramFormats is empty
+  # Statements Parsed earlier in this same pipeline batch. Lets subsequent
+  # same-SQL ops reuse the just-allocated stmtName instead of re-Parsing —
+  # without this, N same-SQL ops on a cold cache would orphan N-1 server-side
+  # prepared statements (only the last addStmtCache would survive, the rest
+  # would leak until session end).
+  var inFlight:
+    Table[string, tuple[stmtName: string, paramOids: seq[int32], opIdx: int]]
 
   for i in 0 ..< p.ops.len:
     let hasInline = p.ops[i].hasInline
@@ -202,26 +218,29 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
       else:
         conn.sendBuf.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
 
+    template currentOidsMatch(cachedOids: seq[int32]): bool =
+      if hasInline:
+        paramOidsMatch(cachedOids, p.inlineOids.toOpenArray(startIdx, endIdx))
+      else:
+        paramOidsMatch(cachedOids, p.ops[i].paramOids)
+
     let cached = conn.lookupStmtCache(p.ops[i].sql)
     var cacheHit = cached != nil
     if cacheHit:
       # Reject the cache entry if its parse-time OIDs no longer match what
-      # this op wants to bind (commit a7b656bd: prevents the server from
-      # interpreting bind bytes under stale parse-time types). Pipeline
-      # can't reuse ``invalidateIfOidMismatch`` because that routes Close
-      # through ``pendingStmtCloses`` — already flushed at the top of
+      # this op wants to bind — otherwise the server would interpret bind
+      # bytes under stale parse-time types. Pipeline can't reuse
+      # ``invalidateIfOidMismatch`` because that routes Close through
+      # ``pendingStmtCloses``, which was already flushed at the top of
       # ``buildSendPhase`` — so emit the Close directly into sendBuf.
-      let oidsMatch =
-        if hasInline:
-          paramOidsMatch(cached.paramOids, p.inlineOids.toOpenArray(startIdx, endIdx))
-        else:
-          paramOidsMatch(cached.paramOids, p.ops[i].paramOids)
-      if not oidsMatch:
+      if not currentOidsMatch(cached.paramOids):
         conn.sendBuf.addClose(dkStatement, cached.name)
         conn.removeStmtCache(p.ops[i].sql)
         cacheHit = false
     p.ops[i].cacheHit = cacheHit
     p.ops[i].cacheMiss = false
+    p.ops[i].cacheShare = false
+    p.ops[i].cacheSuperseded = false
 
     if cacheHit:
       p.ops[i].stmtName = cached.name
@@ -241,17 +260,50 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
       emitBind(cached.name, effectiveResultFormats)
       conn.sendBuf.addExecute("", 0)
     elif conn.stmtCacheCapacity > 0:
-      p.ops[i].cacheMiss = true
-      p.ops[i].stmtName = conn.nextStmtName()
-      if conn.stmtCache.len + pendingCacheAdds >= conn.stmtCacheCapacity and
-          conn.stmtCache.len > 0:
-        let evicted = conn.evictStmtCache()
-        conn.sendBuf.addClose(dkStatement, evicted.name)
-      inc pendingCacheAdds
-      emitParse(p.ops[i].stmtName)
-      conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
-      emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
-      conn.sendBuf.addExecute("", 0)
+      var shared = false
+      if inFlight.hasKey(p.ops[i].sql):
+        let entry = inFlight[p.ops[i].sql]
+        if currentOidsMatch(entry.paramOids):
+          # Same SQL, compatible OIDs — reuse the earlier op's stmt. No new
+          # Parse/Describe(Statement); we still send Describe(Portal) for
+          # queries so the recv loop gets a RowDescription for this op.
+          shared = true
+          p.ops[i].cacheShare = true
+          p.ops[i].stmtName = entry.stmtName
+          emitBind(entry.stmtName, p.ops[i].resultFormats)
+          if p.ops[i].kind == pokQuery:
+            conn.sendBuf.addDescribe(dkPortal, "")
+          conn.sendBuf.addExecute("", 0)
+        else:
+          # Same SQL, different OIDs — close the in-flight stmt and demote
+          # its creator so it isn't added to the persistent cache. The
+          # fall-through emits a fresh Parse with the new OIDs.
+          conn.sendBuf.addClose(dkStatement, entry.stmtName)
+          p.ops[entry.opIdx].cacheSuperseded = true
+          dec pendingCacheAdds
+          inFlight.del(p.ops[i].sql)
+      if not shared:
+        p.ops[i].cacheMiss = true
+        p.ops[i].stmtName = conn.nextStmtName()
+        if conn.stmtCache.len + pendingCacheAdds >= conn.stmtCacheCapacity and
+            conn.stmtCache.len > 0:
+          let evicted = conn.evictStmtCache()
+          conn.sendBuf.addClose(dkStatement, evicted.name)
+        inc pendingCacheAdds
+        emitParse(p.ops[i].stmtName)
+        conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
+        emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
+        conn.sendBuf.addExecute("", 0)
+        # Deep-copy the OIDs so the inFlight entry is independent of the op's
+        # storage. Symmetric across inline (slice of pipeline-level SoA) and
+        # legacy (op-owned seq) paths — no shared aliasing surprises.
+        let recordedOids =
+          if hasInline:
+            @(p.inlineOids.toOpenArray(startIdx, endIdx))
+          else:
+            @(p.ops[i].paramOids)
+        inFlight[p.ops[i].sql] =
+          (stmtName: p.ops[i].stmtName, paramOids: recordedOids, opIdx: i)
     else:
       emitParse("")
       emitBind("", p.ops[i].resultFormats)
@@ -321,7 +373,10 @@ proc executeImpl(
           of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
             discard
           of bmkParameterDescription:
-            if activeOpIdx < p.ops.len and p.ops[activeOpIdx].cacheMiss:
+            # Skip cacheSuperseded ops: their stmt was Closed mid-pipeline and
+            # will not be added to stmtCache, so the paramOids would be unused.
+            if activeOpIdx < p.ops.len and p.ops[activeOpIdx].cacheMiss and
+                not p.ops[activeOpIdx].cacheSuperseded:
               if cachedParamOidsPerOp.len == 0:
                 cachedParamOidsPerOp = newSeq[seq[int32]](p.ops.len)
               cachedParamOidsPerOp[activeOpIdx] = msg.paramTypeOids
@@ -330,9 +385,10 @@ proc executeImpl(
               var cf: seq[int16]
               var co: seq[int32]
               if p.ops[activeOpIdx].cacheMiss:
-                if cachedFieldsPerOp.len == 0:
-                  cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
-                cachedFieldsPerOp[activeOpIdx] = msg.fields
+                if not p.ops[activeOpIdx].cacheSuperseded:
+                  if cachedFieldsPerOp.len == 0:
+                    cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
+                  cachedFieldsPerOp[activeOpIdx] = msg.fields
                 results[activeOpIdx].queryResult.fields = msg.fields
                 if p.ops[activeOpIdx].resultFormats.len > 0:
                   cf = newSeq[int16](msg.fields.len)
@@ -349,6 +405,17 @@ proc executeImpl(
                       cf[j] = p.ops[activeOpIdx].resultFormats[j]
               else:
                 results[activeOpIdx].queryResult.fields = msg.fields
+                # cacheShare: this op skipped Describe(Statement) but still
+                # emitted Describe(Portal), so msg.fields' formatCode/typeOid
+                # reflect this op's Bind. Mirror into RowData so binary
+                # decoders (isBinaryCol/colTypeOid) see the right metadata —
+                # otherwise binary results would be misread as text.
+                if p.ops[activeOpIdx].cacheShare:
+                  cf = newSeq[int16](msg.fields.len)
+                  co = newSeq[int32](msg.fields.len)
+                  for j in 0 ..< msg.fields.len:
+                    cf[j] = msg.fields[j].formatCode
+                    co[j] = msg.fields[j].typeOid
               results[activeOpIdx].queryResult.data =
                 newRowData(int16(msg.fields.len), cf, co)
               results[activeOpIdx].queryResult.data.fields =
@@ -394,9 +461,11 @@ proc executeImpl(
                   if p.ops[i].cacheHit:
                     conn.removeStmtCache(p.ops[i].sql)
               raise queryError
-            # Cache misses: add to cache
+            # Cache misses: add to cache (skip ops superseded by a later
+            # same-SQL op in this same pipeline — those stmts were already
+            # Closed in buildSendPhase).
             for i in 0 ..< p.ops.len:
-              if p.ops[i].cacheMiss:
+              if p.ops[i].cacheMiss and not p.ops[i].cacheSuperseded:
                 let fields =
                   if cachedFieldsPerOp.len > 0:
                     cachedFieldsPerOp[i]
@@ -529,12 +598,14 @@ proc executeIsolatedImpl(
             of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
               discard
             of bmkParameterDescription:
-              if p.ops[opIdx].cacheMiss:
+              # Skip cacheSuperseded ops — see executeImpl for rationale.
+              if p.ops[opIdx].cacheMiss and not p.ops[opIdx].cacheSuperseded:
                 cachedParamOids = msg.paramTypeOids
             of bmkRowDescription:
               if p.ops[opIdx].kind == pokQuery:
                 if p.ops[opIdx].cacheMiss:
-                  cachedFields = msg.fields
+                  if not p.ops[opIdx].cacheSuperseded:
+                    cachedFields = msg.fields
                   results[opIdx].queryResult.fields = msg.fields
                   var cf: seq[int16]
                   var co: seq[int32]
@@ -559,7 +630,18 @@ proc executeIsolatedImpl(
                   rowCount = addr results[opIdx].queryResult.rowCount
                 else:
                   results[opIdx].queryResult.fields = msg.fields
-                  results[opIdx].queryResult.data = newRowData(int16(msg.fields.len))
+                  # cacheShare: mirror Describe(Portal)'s formatCode/typeOid
+                  # into RowData so binary decoders see the right metadata.
+                  var cf: seq[int16]
+                  var co: seq[int32]
+                  if p.ops[opIdx].cacheShare:
+                    cf = newSeq[int16](msg.fields.len)
+                    co = newSeq[int32](msg.fields.len)
+                    for j in 0 ..< msg.fields.len:
+                      cf[j] = msg.fields[j].formatCode
+                      co[j] = msg.fields[j].typeOid
+                  results[opIdx].queryResult.data =
+                    newRowData(int16(msg.fields.len), cf, co)
                   results[opIdx].queryResult.data.fields =
                     results[opIdx].queryResult.fields
                   rowData = results[opIdx].queryResult.data
@@ -582,7 +664,7 @@ proc executeIsolatedImpl(
                 if opError.sqlState == "26000" and p.ops[opIdx].cacheHit:
                   conn.removeStmtCache(p.ops[opIdx].sql)
                 errors[opIdx] = opError
-              elif p.ops[opIdx].cacheMiss:
+              elif p.ops[opIdx].cacheMiss and not p.ops[opIdx].cacheSuperseded:
                 conn.addStmtCache(
                   p.ops[opIdx].sql,
                   CachedStmt(
