@@ -1236,7 +1236,10 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
           let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
           wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
           conn.sslEnabled = true
-          # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding
+          # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
+          # If unavailable, cbPrefer will silently fall back to SCRAM-SHA-256 —
+          # warn the operator so the loss of channel binding is observable.
+          # (cbRequire is enforced in selectScramMechanism.)
           let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
           if peerCert != nil:
             try:
@@ -1245,8 +1248,12 @@ proc negotiateSSL(conn: PgConnection, config: ConnConfig) {.async.} =
                 conn.serverCertDer = newSeq[byte](derStr.len)
                 for i in 0 ..< derStr.len:
                   conn.serverCertDer[i] = byte(derStr[i])
+              else:
+                stderr.writeLine "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
             finally:
               X509_free(peerCert)
+          else:
+            stderr.writeLine "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
         finally:
           if tmpPath.len > 0:
             removeFile(tmpPath)
