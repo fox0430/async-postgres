@@ -1,7 +1,7 @@
 ## Zero-allocation `queryDirect` / `execDirect` compile-time macros that
 ## encode parameters directly into the connection send buffer.
 
-import std/[macros, options, tables]
+import std/[algorithm, macros, options, sets, tables]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ./core
@@ -93,6 +93,231 @@ proc buildInvalidateOnOidMismatchStmt(
       `connSym`, `sqlSym`, `cachedPtrSym`, `bracket`, `cacheHitSym`
     )
 
+proc scanPlaceholders(sql: string): tuple[seen: HashSet[int], badZero: bool] =
+  ## Compile-time SQL scanner: walks ``sql`` and collects every ``$N``
+  ## placeholder index appearing in normal code positions, skipping single-
+  ## quoted strings, ``E'...'`` C-style strings, double-quoted identifiers,
+  ## dollar-quoted blocks (``$$...$$`` and ``$tag$...$tag$``), ``--`` line
+  ## comments and ``/* ... */`` block comments (nestable, per PostgreSQL).
+  ## Sets ``badZero`` when ``$0`` is encountered (PostgreSQL placeholders are
+  ## 1-based).
+  type ScanState = enum
+    sNormal
+    sSingleQuote
+    sEString
+    sDoubleQuote
+    sDollarQuote
+    sLineComment
+    sBlockComment
+
+  var state = sNormal
+  var dollarTag = ""
+  var blockDepth = 0
+  var i = 0
+  let n = sql.len
+
+  while i < n:
+    let c = sql[i]
+    case state
+    of sNormal:
+      case c
+      of '\'':
+        let isE =
+          i > 0 and sql[i - 1] in {'E', 'e'} and
+          (i < 2 or sql[i - 2] notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'})
+        state = if isE: sEString else: sSingleQuote
+        inc i
+      of '"':
+        state = sDoubleQuote
+        inc i
+      of '-':
+        if i + 1 < n and sql[i + 1] == '-':
+          state = sLineComment
+          i += 2
+        else:
+          inc i
+      of '/':
+        if i + 1 < n and sql[i + 1] == '*':
+          state = sBlockComment
+          blockDepth = 1
+          i += 2
+        else:
+          inc i
+      of '$':
+        var j = i + 1
+        if j < n and sql[j] == '$':
+          dollarTag = "$$"
+          state = sDollarQuote
+          i = j + 1
+        elif j < n and sql[j] in {'a' .. 'z', 'A' .. 'Z', '_'}:
+          while j < n and sql[j] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}:
+            inc j
+          if j < n and sql[j] == '$':
+            dollarTag = sql[i .. j]
+            state = sDollarQuote
+            i = j + 1
+          else:
+            i = j
+        elif j < n and sql[j] in {'0' .. '9'}:
+          var num = 0
+          while j < n and sql[j] in {'0' .. '9'}:
+            num = num * 10 + (sql[j].ord - '0'.ord)
+            inc j
+          if num == 0:
+            result.badZero = true
+          else:
+            result.seen.incl(num)
+          i = j
+        else:
+          inc i
+      else:
+        inc i
+    of sSingleQuote:
+      if c == '\'':
+        if i + 1 < n and sql[i + 1] == '\'':
+          i += 2
+        else:
+          state = sNormal
+          inc i
+      else:
+        inc i
+    of sEString:
+      if c == '\\':
+        i += (if i + 1 < n: 2 else: 1)
+      elif c == '\'':
+        if i + 1 < n and sql[i + 1] == '\'':
+          i += 2
+        else:
+          state = sNormal
+          inc i
+      else:
+        inc i
+    of sDoubleQuote:
+      if c == '"':
+        if i + 1 < n and sql[i + 1] == '"':
+          i += 2
+        else:
+          state = sNormal
+          inc i
+      else:
+        inc i
+    of sDollarQuote:
+      if c == '$' and i + dollarTag.len <= n and
+          sql[i ..< i + dollarTag.len] == dollarTag:
+        i += dollarTag.len
+        state = sNormal
+      else:
+        inc i
+    of sLineComment:
+      if c == '\n':
+        state = sNormal
+      inc i
+    of sBlockComment:
+      if c == '*' and i + 1 < n and sql[i + 1] == '/':
+        dec blockDepth
+        i += 2
+        if blockDepth == 0:
+          state = sNormal
+      elif c == '/' and i + 1 < n and sql[i + 1] == '*':
+        inc blockDepth
+        i += 2
+      else:
+        inc i
+
+proc formatPlaceholders(xs: HashSet[int]): string =
+  ## Render a HashSet of placeholder indices as a sorted ``$1, $2, ...`` string
+  ## for diagnostic messages.
+  var sorted: seq[int]
+  for k in xs:
+    sorted.add(k)
+  sorted.sort()
+  for idx, k in sorted:
+    if idx > 0:
+      result.add(", ")
+    result.add('$')
+    result.add($k)
+
+proc resolveSqlLiteral(sqlNode: NimNode): NimNode =
+  ## Return the underlying string-literal node for ``sqlNode`` when possible:
+  ## direct string literals pass through, and ``const`` symbols bound to a
+  ## string literal are resolved via ``getImpl``. Returns ``nil`` for anything
+  ## else (let/var bindings, concatenations, proc results, …) so callers can
+  ## skip compile-time checks for non-literal SQL.
+  if sqlNode.kind in {nnkStrLit, nnkTripleStrLit, nnkRStrLit}:
+    return sqlNode
+  if sqlNode.kind == nnkSym:
+    let impl = sqlNode.getImpl
+    if impl.kind == nnkConstDef and impl.len >= 3:
+      let val = impl[2]
+      if val.kind in {nnkStrLit, nnkTripleStrLit, nnkRStrLit}:
+        return val
+  return nil
+
+proc validatePlaceholderArity(
+    sqlNode: NimNode, positionalCount: int, macroName: string
+) =
+  ## Compile-time arity check: when ``sqlNode`` resolves to a string literal
+  ## (directly or via a ``const`` symbol), require that the set of ``$N``
+  ## placeholder indices in normal SQL positions equals
+  ## ``{1, 2, ..., positionalCount}`` exactly. Non-literal SQL (let/var
+  ## bindings, concatenation results, runtime-built strings, etc.) is skipped
+  ## silently — the runtime path still surfaces mismatches via the PostgreSQL
+  ## ``08P01`` error response.
+  let lit = resolveSqlLiteral(sqlNode)
+  if lit == nil:
+    return
+  let (seen, badZero) = scanPlaceholders(lit.strVal)
+  if badZero:
+    error(macroName & ": '$0' is not a valid placeholder ($N is 1-based)", sqlNode)
+  var expected: HashSet[int]
+  for k in 1 .. positionalCount:
+    expected.incl(k)
+  if seen == expected:
+    return
+  let extra = seen - expected
+  let missing = expected - seen
+  if extra.len > 0 and missing.len == 0:
+    error(
+      macroName & ": SQL references " & formatPlaceholders(extra) & " but only " &
+        $positionalCount & " arg(s) were passed",
+      sqlNode,
+    )
+  elif missing.len > 0 and extra.len == 0:
+    # missing-only happens in two shapes:
+    #   (a) gap in numbering, e.g. $1, $3 with 3 args → missing={2}
+    #   (b) too many args, e.g. SQL uses only $1 but caller passed 2 args
+    # Distinguish by whether seen covers a contiguous prefix below
+    # positionalCount: case (b) is friendlier framed as "too many args".
+    var maxSeen = 0
+    for k in seen:
+      if k > maxSeen:
+        maxSeen = k
+    if maxSeen < positionalCount:
+      let referenced =
+        if seen.len == 0:
+          "no placeholders"
+        elif maxSeen == 1:
+          "only $1"
+        else:
+          "only $1..$" & $maxSeen
+      error(
+        macroName & ": SQL references " & referenced & " but " & $positionalCount &
+          " arg(s) were passed",
+        sqlNode,
+      )
+    else:
+      error(
+        macroName & ": SQL is missing placeholder(s) " & formatPlaceholders(missing) &
+          " (expected $1..$" & $positionalCount & ")",
+        sqlNode,
+      )
+  else:
+    error(
+      macroName & ": SQL placeholders {" & formatPlaceholders(seen) &
+        "} do not match expected $1..$" & $positionalCount,
+      sqlNode,
+    )
+
 proc extractTimeoutArg(
     args: NimNode
 ): tuple[positional: seq[NimNode], timeout: NimNode] =
@@ -126,6 +351,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   result = newStmtList()
 
   let (positional, timeoutExpr) = extractTimeoutArg(args)
+  validatePlaceholderArity(sql, positional.len, "queryDirect")
 
   let connSym = genSym(nskLet, "conn")
   let sqlSym = genSym(nskLet, "sql")
@@ -359,6 +585,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   result = newStmtList()
 
   let (positional, timeoutExpr) = extractTimeoutArg(args)
+  validatePlaceholderArity(sql, positional.len, "execDirect")
 
   let connSym = genSym(nskLet, "conn")
   let sqlSym = genSym(nskLet, "sql")
