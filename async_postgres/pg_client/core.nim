@@ -423,3 +423,61 @@ template queryEachRecvLoop*(
           discard
         conn.recvBufStart = pos
       await conn.fillRecvBuf(timeout)
+
+template execRecvLoop*(
+    conn: PgConnection,
+    sql: string,
+    cacheHit, cacheMiss: bool,
+    stmtName: string,
+    commandTag: var string,
+    timeout: Duration = ZeroDuration,
+) =
+  ## Receive-loop counterpart of `queryRecvLoop` for the extended-query exec
+  ## path: discards `DataRow`s (exec callers don't need rows) and exposes only
+  ## the `CommandComplete` tag via the `commandTag` out-parameter. Shared by
+  ## `execImpl` (both overloads), `execInlineImpl`, and `execDirectRunImpl`.
+  var queryError: ref PgQueryError
+  var cachedFields: seq[FieldDescription]
+  var cachedParamOids: seq[int32]
+
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+          discard
+        of bmkParameterDescription:
+          if cacheMiss:
+            cachedParamOids = msg.paramTypeOids
+        of bmkRowDescription:
+          if cacheMiss:
+            cachedFields = msg.fields
+        of bmkNoData:
+          discard
+        of bmkDataRow:
+          discard
+        of bmkCommandComplete:
+          commandTag = msg.commandTag
+        of bmkEmptyQueryResponse:
+          discard
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            if cacheHit and queryError.sqlState == "26000":
+              conn.removeStmtCache(sql)
+            raise queryError
+          if cacheMiss:
+            conn.addStmtCache(
+              sql,
+              CachedStmt(
+                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
+              ),
+            )
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
