@@ -78,6 +78,87 @@ proc buildBeginSql*(opts: TransactionOptions): string =
   of dmNotDeferrable:
     result.add " NOT DEFERRABLE"
 
+proc paramOidsMatch*(cachedOids, currentOids: openArray[int32]): bool =
+  ## Whether a cached prepared statement's parse-time parameter OIDs are
+  ## compatible with the OIDs a caller wants to bind now.
+  ##
+  ## OID ``0`` (unknown) on either side is treated as a wildcard: the server
+  ## inferred or will infer the type, so we cannot pre-judge a mismatch.
+  ## A length mismatch is treated as incompatible.
+  ##
+  ## Empty-vs-empty (parameter-less SQL) matches trivially: the loop body does
+  ## not execute and the length check passes.
+  ##
+  ## Callers use a ``false`` result to invalidate the cache entry and re-parse
+  ## the statement with the new OIDs, preventing the server from interpreting
+  ## bind payloads under the statement's original (and now wrong) parse-time
+  ## type assumptions.
+  if cachedOids.len != currentOids.len:
+    return false
+  for i in 0 ..< cachedOids.len:
+    let c = cachedOids[i]
+    let n = currentOids[i]
+    if c == n or c == 0 or n == 0:
+      continue
+    return false
+  return true
+
+proc paramOidsMatch*(cachedOids: openArray[int32], params: openArray[PgParam]): bool =
+  ## ``PgParam`` overload that reads each parameter's ``oid`` field directly,
+  ## avoiding a temporary ``seq[int32]`` projection on the ``query``/``exec``
+  ## cache-hit path. Semantics match the ``openArray[int32]`` overload.
+  if cachedOids.len != params.len:
+    return false
+  for i in 0 ..< cachedOids.len:
+    let c = cachedOids[i]
+    let n = params[i].oid
+    if c == n or c == 0 or n == 0:
+      continue
+    return false
+  return true
+
+proc invalidateIfOidMismatch*(
+    conn: PgConnection,
+    sql: string,
+    cached: ptr CachedStmt,
+    currentOids: openArray[int32],
+    cacheHit: var bool,
+) =
+  ## If the caller is about to bind ``currentOids`` to a cached prepared
+  ## statement whose parse-time OIDs do not match, evict the cache entry
+  ## (queue the server-side ``Close`` via ``pendingStmtCloses``, remove the
+  ## local entry) and set ``cacheHit`` to ``false`` so the caller's
+  ## cache-miss path runs and re-parses under the new OIDs.
+  ##
+  ## No-op when ``cacheHit`` is already ``false`` — ``cached`` is only
+  ## dereferenced under the ``cacheHit`` guard, so passing ``nil`` is safe
+  ## as long as ``cacheHit`` is ``false``.
+  if not cacheHit:
+    return
+  if paramOidsMatch(cached.paramOids, currentOids):
+    return
+  conn.pendingStmtCloses.add(cached.name)
+  conn.removeStmtCache(sql)
+  cacheHit = false
+
+proc invalidateIfOidMismatch*(
+    conn: PgConnection,
+    sql: string,
+    cached: ptr CachedStmt,
+    params: openArray[PgParam],
+    cacheHit: var bool,
+) =
+  ## ``PgParam`` overload for the ``query``/``exec`` call paths. Avoids the
+  ## ``seq[int32]`` allocation a separate OID-projection step would require —
+  ## the per-parameter ``.oid`` reads happen inside ``paramOidsMatch``.
+  if not cacheHit:
+    return
+  if paramOidsMatch(cached.paramOids, params):
+    return
+  conn.pendingStmtCloses.add(cached.name)
+  conn.removeStmtCache(sql)
+  cacheHit = false
+
 proc extractParams*(
     params: openArray[PgParam]
 ): tuple[oids: seq[int32], formats: seq[int16], values: seq[Option[seq[byte]]]] =
@@ -151,6 +232,7 @@ template queryRecvLoop*(
     timeout: Duration = ZeroDuration,
 ) =
   var queryError: ref PgQueryError
+  var cachedParamOids: seq[int32]
 
   if cacheHit:
     swap(qr.fields, cachedFields)
@@ -169,7 +251,8 @@ template queryRecvLoop*(
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
-          discard
+          if cacheMiss:
+            cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
           var cf: seq[int16]
           var co: seq[int32]
@@ -207,7 +290,12 @@ template queryRecvLoop*(
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
-            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+            conn.addStmtCache(
+              sql,
+              CachedStmt(
+                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
+              ),
+            )
           break recvLoop
         else:
           discard
@@ -229,6 +317,7 @@ template queryEachRecvLoop*(
   var queryError: ref PgQueryError
   var rd: RowData
   var callbackError: ref CatchableError = nil
+  var cachedParamOids: seq[int32]
 
   if cacheHit:
     if cachedColFmts.len > 0 or cachedColOids.len > 0:
@@ -282,7 +371,8 @@ template queryEachRecvLoop*(
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
-          discard
+          if cacheMiss:
+            cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
           var cf: seq[int16]
           var co: seq[int32]
@@ -322,7 +412,12 @@ template queryEachRecvLoop*(
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
-            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+            conn.addStmtCache(
+              sql,
+              CachedStmt(
+                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
+              ),
+            )
           break recvLoop
         else:
           discard

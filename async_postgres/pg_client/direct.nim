@@ -69,6 +69,30 @@ proc queryDirectImpl*(
         cachedFields, ZeroDuration,
       )
 
+proc buildInvalidateOnOidMismatchStmt(
+    connSym, sqlSym, cachedPtrSym, cacheHitSym: NimNode, positional: seq[NimNode]
+): NimNode =
+  ## AST builder for the cache-hit OID-validation call shared by both direct
+  ## macros. Emits a single ``invalidateIfOidMismatch`` call with a
+  ## ``[paramOidOf(arg0), paramOidOf(arg1), …]`` array literal — kept as an
+  ## ``array`` (not ``seq``) so the OID list can live on the stack and
+  ## preserve the macro's zero-allocation contract.
+  ##
+  ## When the macro has no positional parameters there is nothing to compare
+  ## (the cache key — SQL text — already pins a fixed parameter count, so
+  ## same-SQL cache hits cannot differ in arity here), and an empty
+  ## ``[]`` literal has no inferable element type. Emit an empty statement
+  ## list instead.
+  if positional.len == 0:
+    return newStmtList()
+  let bracket = newNimNode(nnkBracket)
+  for arg in positional:
+    bracket.add(newCall(ident"paramOidOf", arg))
+  result = quote:
+    invalidateIfOidMismatch(
+      `connSym`, `sqlSym`, `cachedPtrSym`, `bracket`, `cacheHitSym`
+    )
+
 proc extractTimeoutArg(
     args: NimNode
 ): tuple[positional: seq[NimNode], timeout: NimNode] =
@@ -130,6 +154,10 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     var `effectiveRfSym`: seq[int16]
     var `colFmtsSym`: seq[int16]
     var `colOidsSym`: seq[int32]
+
+  result.add buildInvalidateOnOidMismatchStmt(
+    connSym, sqlSym, cachedPtrSym, cacheHitSym, positional
+  )
 
   # Helper to build addBindDirect call with args
   proc makeBindDirect(buf, portal, stmt, rf: NimNode, argList: NimNode): NimNode =
@@ -239,6 +267,7 @@ proc execDirectRunImpl*(
   var commandTag = ""
   var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
+  var cachedParamOids: seq[int32]
 
   block recvLoop:
     while true:
@@ -248,7 +277,8 @@ proc execDirectRunImpl*(
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
-          discard
+          if cacheMiss:
+            cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
           if cacheMiss:
             cachedFields = msg.fields
@@ -270,7 +300,12 @@ proc execDirectRunImpl*(
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
-            conn.addStmtCache(sql, CachedStmt(name: stmtName, fields: cachedFields))
+            conn.addStmtCache(
+              sql,
+              CachedStmt(
+                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
+              ),
+            )
           break recvLoop
         else:
           discard
@@ -344,6 +379,10 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     var `cacheHitSym` = `cachedPtrSym` != nil
     var `cacheMissSym` = false
     var `stmtNameSym` = ""
+
+  result.add buildInvalidateOnOidMismatchStmt(
+    connSym, sqlSym, cachedPtrSym, cacheHitSym, positional
+  )
 
   proc makeBindDirect(buf, portal, stmt: NimNode, argList: NimNode): NimNode =
     let emptyRf = newNimNode(nnkBracket) # no result formats for exec

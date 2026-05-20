@@ -27,6 +27,7 @@ proc queryImpl*(
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
+  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -89,6 +90,7 @@ proc queryImpl*(
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
+  conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -152,6 +154,7 @@ proc queryEachImpl*(
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
+  conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -287,6 +290,7 @@ proc queryInlineImpl*(
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
+  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
