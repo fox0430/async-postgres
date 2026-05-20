@@ -7680,6 +7680,44 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: addExec invalidates on OID mismatch":
+    # ``addExec`` shares ``buildSendPhase`` with ``addQuery`` but lacks
+    # RowDescription on cache-miss. Pin that the paramOids capture from
+    # ParameterDescription still happens, and that cache-hit OID validation
+    # kicks in for non-query ops.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_pipe_exec_oid")
+      discard await conn.exec(
+        "CREATE TABLE test_pipe_exec_oid (id serial PRIMARY KEY, v int)"
+      )
+
+      let sql = "INSERT INTO test_pipe_exec_oid (v) VALUES ($1)"
+      var p1 = newPipeline(conn)
+      p1.addExec(sql, @[toPgParam(1'i64)])
+      let r1 = await p1.execute()
+      doAssert r1[0].commandResult == "INSERT 0 1"
+      doAssert conn.stmtCache[sql].paramOids == @[OidInt8]
+      let firstName = conn.stmtCache[sql].name
+
+      var p2 = newPipeline(conn)
+      p2.addExec(sql, @[toPgParam(2'i32)])
+      let r2 = await p2.execute()
+      doAssert r2[0].commandResult == "INSERT 0 1"
+      let entry = conn.stmtCache[sql]
+      doAssert entry.paramOids == @[OidInt4]
+      doAssert entry.name != firstName
+
+      let qr = await conn.query("SELECT v FROM test_pipe_exec_oid ORDER BY id")
+      doAssert qr.rowCount == 2
+      doAssert qr.rows[0].getInt(0) == 1
+      doAssert qr.rows[1].getInt(0) == 2
+
+      discard await conn.exec("DROP TABLE test_pipe_exec_oid")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Pipelined Pool":
   test "pipelined pool: basic exec and query":
     proc t() {.async.} =
