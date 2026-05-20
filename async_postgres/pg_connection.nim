@@ -138,6 +138,15 @@ type
   CachedStmt* = object ## A cached prepared statement in the LRU statement cache.
     name*: string ## Server-side statement name ("_sc_1", "_sc_2", ...)
     fields*: seq[FieldDescription] ## From Describe(Statement), formatCode=0
+    paramOids*: seq[int32]
+      ## Input parameter type OIDs from ParameterDescription. Used to detect
+      ## type-mismatch on cache hit: if a later call binds the same SQL with
+      ## different parameter OIDs, the server would interpret the bytes using
+      ## the original parse-time types, silently corrupting results. The
+      ## cache-hit path checks these against the caller's OIDs and falls back
+      ## to a re-parse when they diverge. Empty for parameter-less SQL —
+      ## an empty-vs-empty comparison matches trivially and the cache entry
+      ## is reused.
     resultFormats*: seq[int16] ## Cached buildResultFormats() output
     colFmts*: seq[int16] ## Per-column format codes for RowData
     colOids*: seq[int32] ## Per-column type OIDs for RowData
