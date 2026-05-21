@@ -1129,383 +1129,284 @@ proc getBitArray*(row: Row, col: int): seq[PgBit] =
       raise newException(PgTypeError, "NULL element in bit array")
     result.add(parseBitString(e.get))
 
-# Temporal array decoders
-
-template genTimestampArrayDecoder(getProc: untyped, typeName: static string) =
-  proc getProc*(row: Row, col: int): seq[DateTime] =
+# Generic array decoder skeleton: handles binary array header parsing and the
+# binary/text NULL-element checks. ``binBody`` is the expression that decodes
+# one binary element (with ``row``/``off``/``e``/``decoded`` in scope), and
+# ``textBody`` decodes one text element (with ``e`` — an ``Option[string]`` —
+# in scope).
+template genArrayDecoder(
+    getProc: untyped, T: typedesc, typeName: static string, binBody, textBody: untyped
+) {.dirty.} =
+  proc getProc*(row: Row, col: int): seq[T] =
     if row.isBinaryCol(col):
       let (off, clen) = cellInfo(row, col)
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      result = newSeq[DateTime](decoded.elements.len)
+      result = newSeq[T](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
           raise newException(PgTypeError, "NULL element in " & typeName & " array")
-        result[i] =
-          decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7))
+        result[i] = binBody
       return
-    let s = row.getStr(col)
-    let elems = parseTextArray(s)
-    for e in elems:
+    for e in parseTextArray(row.getStr(col)):
       if e.isNone:
         raise newException(PgTypeError, "NULL element in " & typeName & " array")
-      result.add(parseTimestampText(e.get))
+      result.add(textBody)
 
-genTimestampArrayDecoder(getTimestampArray, "timestamp")
-genTimestampArrayDecoder(getTimestampTzArray, "timestamptz")
+# Temporal array decoders
 
-proc getDateArray*(row: Row, col: int): seq[DateTime] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[DateTime](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in date array")
-      result[i] =
-        decodeBinaryDate(row.data.buf.toOpenArray(off + e.off, off + e.off + 3))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in date array")
-    try:
-      result.add(parse(e.get, "yyyy-MM-dd"))
-    except TimeParseError:
-      raise newException(PgTypeError, "Invalid date: " & e.get)
+genArrayDecoder(
+  getTimestampArray,
+  DateTime,
+  "timestamp",
+  decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7)),
+  parseTimestampText(e.get),
+)
+genArrayDecoder(
+  getTimestampTzArray,
+  DateTime,
+  "timestamptz",
+  decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7)),
+  parseTimestampText(e.get),
+)
 
-proc getTimeArray*(row: Row, col: int): seq[PgTime] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgTime](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in time array")
-      result[i] =
-        decodeBinaryTime(row.data.buf.toOpenArray(off + e.off, off + e.off + 7))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in time array")
-    result.add(parseTimeText(e.get))
+proc dateElemFromText(s: string): DateTime =
+  try:
+    parse(s, "yyyy-MM-dd")
+  except TimeParseError:
+    raise newException(PgTypeError, "Invalid date: " & s)
 
-proc getTimeTzArray*(row: Row, col: int): seq[PgTimeTz] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgTimeTz](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in timetz array")
-      result[i] =
-        decodeBinaryTimeTz(row.data.buf.toOpenArray(off + e.off, off + e.off + 11))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in timetz array")
-    result.add(parseTimeTzText(e.get))
+genArrayDecoder(
+  getDateArray,
+  DateTime,
+  "date",
+  decodeBinaryDate(row.data.buf.toOpenArray(off + e.off, off + e.off + 3)),
+  dateElemFromText(e.get),
+)
+genArrayDecoder(
+  getTimeArray,
+  PgTime,
+  "time",
+  decodeBinaryTime(row.data.buf.toOpenArray(off + e.off, off + e.off + 7)),
+  parseTimeText(e.get),
+)
+genArrayDecoder(
+  getTimeTzArray,
+  PgTimeTz,
+  "timetz",
+  decodeBinaryTimeTz(row.data.buf.toOpenArray(off + e.off, off + e.off + 11)),
+  parseTimeTzText(e.get),
+)
 
-proc getIntervalArray*(row: Row, col: int): seq[PgInterval] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgInterval](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in interval array")
-      if e.len != 16:
-        raise
-          newException(PgTypeError, "Invalid binary interval element length: " & $e.len)
-      result[i].microseconds =
-        fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + 7))
-      result[i].days =
-        fromBE32(row.data.buf.toOpenArray(off + e.off + 8, off + e.off + 11))
-      result[i].months =
-        fromBE32(row.data.buf.toOpenArray(off + e.off + 12, off + e.off + 15))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in interval array")
-    result.add(parseIntervalText(e.get))
+proc intervalElemFromBinary(buf: openArray[byte], off, elen: int): PgInterval =
+  if elen != 16:
+    raise newException(PgTypeError, "Invalid binary interval element length: " & $elen)
+  result.microseconds = fromBE64(buf.toOpenArray(off, off + 7))
+  result.days = fromBE32(buf.toOpenArray(off + 8, off + 11))
+  result.months = fromBE32(buf.toOpenArray(off + 12, off + 15))
+
+genArrayDecoder(
+  getIntervalArray,
+  PgInterval,
+  "interval",
+  intervalElemFromBinary(row.data.buf, off + e.off, e.len),
+  parseIntervalText(e.get),
+)
 
 # Identifier / network array decoders
 
-proc getUuidArray*(row: Row, col: int): seq[PgUuid] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgUuid](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in uuid array")
-      if e.len != 16:
-        raise newException(PgTypeError, "Invalid binary uuid element length: " & $e.len)
-      const hexChars = "0123456789abcdef"
-      var s = newString(36)
-      var pos = 0
-      for j in 0 ..< 16:
-        if j == 4 or j == 6 or j == 8 or j == 10:
-          s[pos] = '-'
-          inc pos
-        let b = row.data.buf[off + e.off + j]
-        s[pos] = hexChars[int(b shr 4)]
-        s[pos + 1] = hexChars[int(b and 0x0F)]
-        pos += 2
-      result[i] = PgUuid(s)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in uuid array")
-    result.add(PgUuid(e.get))
+proc uuidElemFromBinary(buf: openArray[byte], off, elen: int): PgUuid =
+  if elen != 16:
+    raise newException(PgTypeError, "Invalid binary uuid element length: " & $elen)
+  const hexChars = "0123456789abcdef"
+  var s = newString(36)
+  var pos = 0
+  for j in 0 ..< 16:
+    if j == 4 or j == 6 or j == 8 or j == 10:
+      s[pos] = '-'
+      inc pos
+    let b = buf[off + j]
+    s[pos] = hexChars[int(b shr 4)]
+    s[pos + 1] = hexChars[int(b and 0x0F)]
+    pos += 2
+  PgUuid(s)
 
-template genInetArrayDecoder(getProc: untyped, T: typedesc, typeName: static string) =
-  proc getProc*(row: Row, col: int): seq[T] =
-    if row.isBinaryCol(col):
-      let (off, clen) = cellInfo(row, col)
-      if clen == -1:
-        raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      result = newSeq[T](decoded.elements.len)
-      for i, e in decoded.elements:
-        if e.len == -1:
-          raise newException(PgTypeError, "NULL element in " & typeName & " array")
-        let (ip, mask) = decodeInetBinary(
-          row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-        )
-        result[i] = T(address: ip, mask: mask)
-      return
-    let s = row.getStr(col)
-    let elems = parseTextArray(s)
-    for e in elems:
-      if e.isNone:
-        raise newException(PgTypeError, "NULL element in " & typeName & " array")
-      let (ip, mask) = parseInetText(e.get)
-      result.add(T(address: ip, mask: mask))
+genArrayDecoder(
+  getUuidArray,
+  PgUuid,
+  "uuid",
+  uuidElemFromBinary(row.data.buf, off + e.off, e.len),
+  PgUuid(e.get),
+)
 
-genInetArrayDecoder(getInetArray, PgInet, "inet")
-genInetArrayDecoder(getCidrArray, PgCidr, "cidr")
+proc inetElemFromBinary[T](buf: openArray[byte], lo, hi: int): T =
+  let (ip, mask) = decodeInetBinary(buf.toOpenArray(lo, hi))
+  result.address = ip
+  result.mask = mask
 
-template genMacAddrArrayDecoder(
-    getProc: untyped, T: typedesc, nBytes: static int, typeName: static string
-) =
-  proc getProc*(row: Row, col: int): seq[T] =
-    if row.isBinaryCol(col):
-      let (off, clen) = cellInfo(row, col)
-      if clen == -1:
-        raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      result = newSeq[T](decoded.elements.len)
-      for i, e in decoded.elements:
-        if e.len == -1:
-          raise newException(PgTypeError, "NULL element in " & typeName & " array")
-        if e.len != nBytes:
-          raise newException(
-            PgTypeError, "Invalid binary " & typeName & " element length: " & $e.len
-          )
-        var parts = newSeq[string](nBytes)
-        for j in 0 ..< nBytes:
-          parts[j] = toHex(row.data.buf[off + e.off + j], 2).toLowerAscii()
-        result[i] = T(parts.join(":"))
-      return
-    let s = row.getStr(col)
-    let elems = parseTextArray(s)
-    for e in elems:
-      if e.isNone:
-        raise newException(PgTypeError, "NULL element in " & typeName & " array")
-      result.add(T(e.get))
+proc inetElemFromText[T](s: string): T =
+  let (ip, mask) = parseInetText(s)
+  result.address = ip
+  result.mask = mask
 
-genMacAddrArrayDecoder(getMacAddrArray, PgMacAddr, 6, "macaddr")
-genMacAddrArrayDecoder(getMacAddr8Array, PgMacAddr8, 8, "macaddr8")
+genArrayDecoder(
+  getInetArray,
+  PgInet,
+  "inet",
+  inetElemFromBinary[PgInet](row.data.buf, off + e.off, off + e.off + e.len - 1),
+  inetElemFromText[PgInet](e.get),
+)
+genArrayDecoder(
+  getCidrArray,
+  PgCidr,
+  "cidr",
+  inetElemFromBinary[PgCidr](row.data.buf, off + e.off, off + e.off + e.len - 1),
+  inetElemFromText[PgCidr](e.get),
+)
+
+proc macAddrElemFromBinary[T](
+    buf: openArray[byte], off, elen: int, nBytes: static int, typeName: static string
+): T =
+  if elen != nBytes:
+    raise newException(
+      PgTypeError, "Invalid binary " & typeName & " element length: " & $elen
+    )
+  var parts = newSeq[string](nBytes)
+  for j in 0 ..< nBytes:
+    parts[j] = toHex(buf[off + j], 2).toLowerAscii()
+  T(parts.join(":"))
+
+genArrayDecoder(
+  getMacAddrArray,
+  PgMacAddr,
+  "macaddr",
+  macAddrElemFromBinary[PgMacAddr](row.data.buf, off + e.off, e.len, 6, "macaddr"),
+  PgMacAddr(e.get),
+)
+genArrayDecoder(
+  getMacAddr8Array,
+  PgMacAddr8,
+  "macaddr8",
+  macAddrElemFromBinary[PgMacAddr8](row.data.buf, off + e.off, e.len, 8, "macaddr8"),
+  PgMacAddr8(e.get),
+)
 
 # Numeric / binary / JSON array decoders
 
-proc getNumericArray*(row: Row, col: int): seq[PgNumeric] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgNumeric](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in numeric array")
-      result[i] = decodeNumericBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in numeric array")
-    result.add(parsePgNumeric(e.get))
+genArrayDecoder(
+  getNumericArray,
+  PgNumeric,
+  "numeric",
+  decodeNumericBinary(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
+  parsePgNumeric(e.get),
+)
 
-proc getBytesArray*(row: Row, col: int): seq[seq[byte]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[seq[byte]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in bytea array")
-      result[i] = readBytes(row.data.buf, off + e.off, e.len)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in bytea array")
-    let v = e.get
-    if v.len >= 2 and v[0] == '\\' and v[1] == 'x':
-      let hexStr = v[2 ..^ 1]
-      var bytes = newSeq[byte](hexStr.len div 2)
-      for j in 0 ..< bytes.len:
-        bytes[j] = byte(parseHexInt(hexStr[j * 2 .. j * 2 + 1]))
-      result.add(bytes)
-    else:
-      result.add(toBytes(v))
+proc bytesElemFromText(s: string): seq[byte] =
+  if s.len >= 2 and s[0] == '\\' and s[1] == 'x':
+    let hexStr = s[2 ..^ 1]
+    result = newSeq[byte](hexStr.len div 2)
+    for j in 0 ..< result.len:
+      result[j] = byte(parseHexInt(hexStr[j * 2 .. j * 2 + 1]))
+  else:
+    result = toBytes(s)
 
-proc getJsonArray*(row: Row, col: int): seq[JsonNode] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[JsonNode](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in json array")
-      var jsonStr: string
-      if decoded.elemOid == OidJsonb and e.len > 0 and row.data.buf[off + e.off] == 1:
-        jsonStr = newString(e.len - 1)
-        for j in 1 ..< e.len:
-          jsonStr[j - 1] = char(row.data.buf[off + e.off + j])
-      else:
-        jsonStr = newString(e.len)
-        for j in 0 ..< e.len:
-          jsonStr[j] = char(row.data.buf[off + e.off + j])
-      try:
-        result[i] = parseJson(jsonStr)
-      except JsonParsingError:
-        raise newException(PgTypeError, "Invalid JSON element: " & jsonStr)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in json array")
-    try:
-      result.add(parseJson(e.get))
-    except JsonParsingError:
-      raise newException(PgTypeError, "Invalid JSON element: " & e.get)
+genArrayDecoder(
+  getBytesArray,
+  seq[byte],
+  "bytea",
+  readBytes(row.data.buf, off + e.off, e.len),
+  bytesElemFromText(e.get),
+)
+
+proc jsonElemFromBinary(
+    buf: openArray[byte], off, elen: int, elemOid: int32
+): JsonNode =
+  var jsonStr: string
+  if elemOid == OidJsonb and elen > 0 and buf[off] == 1:
+    jsonStr = newString(elen - 1)
+    for j in 1 ..< elen:
+      jsonStr[j - 1] = char(buf[off + j])
+  else:
+    jsonStr = newString(elen)
+    for j in 0 ..< elen:
+      jsonStr[j] = char(buf[off + j])
+  try:
+    parseJson(jsonStr)
+  except JsonParsingError:
+    raise newException(PgTypeError, "Invalid JSON element: " & jsonStr)
+
+proc jsonElemFromText(s: string): JsonNode =
+  try:
+    parseJson(s)
+  except JsonParsingError:
+    raise newException(PgTypeError, "Invalid JSON element: " & s)
+
+genArrayDecoder(
+  getJsonArray,
+  JsonNode,
+  "json",
+  jsonElemFromBinary(row.data.buf, off + e.off, e.len, decoded.elemOid),
+  jsonElemFromText(e.get),
+)
 
 # Geometric array decoders
 
-proc getPointArray*(row: Row, col: int): seq[PgPoint] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgPoint](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in point array")
-      result[i] = decodePointBinary(row.data.buf, off + e.off)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in point array")
-    result.add(parsePointText(e.get))
+genArrayDecoder(
+  getPointArray,
+  PgPoint,
+  "point",
+  decodePointBinary(row.data.buf, off + e.off),
+  parsePointText(e.get),
+)
 
-proc getLineArray*(row: Row, col: int): seq[PgLine] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgLine](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in line array")
-      if e.len != 24:
-        raise newException(PgTypeError, "Invalid binary line element length: " & $e.len)
-      let o = off + e.off
-      result[i].a = decodeFloat64BE(row.data.buf, o)
-      result[i].b = decodeFloat64BE(row.data.buf, o + 8)
-      result[i].c = decodeFloat64BE(row.data.buf, o + 16)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in line array")
-    let v = e.get.strip()
-    var inner = v
-    if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
-      inner = inner[1 ..^ 2]
-    else:
-      raise newException(PgTypeError, "Invalid line: " & v)
-    let parts = inner.split(',')
-    if parts.len != 3:
-      raise newException(PgTypeError, "Invalid line: " & v)
-    result.add(
-      PgLine(a: parseFloat(parts[0]), b: parseFloat(parts[1]), c: parseFloat(parts[2]))
-    )
+proc lineElemFromBinary(buf: openArray[byte], off, elen: int): PgLine =
+  if elen != 24:
+    raise newException(PgTypeError, "Invalid binary line element length: " & $elen)
+  result.a = decodeFloat64BE(buf, off)
+  result.b = decodeFloat64BE(buf, off + 8)
+  result.c = decodeFloat64BE(buf, off + 16)
 
-proc getLsegArray*(row: Row, col: int): seq[PgLseg] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgLseg](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in lseg array")
-      result[i] = PgLseg(
-        p1: decodePointBinary(row.data.buf, off + e.off),
-        p2: decodePointBinary(row.data.buf, off + e.off + 16),
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in lseg array")
-    let v = e.get.strip()
-    var inner = v
-    if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
-      inner = inner[1 ..^ 2]
-    let points = parsePointsText(inner)
-    if points.len != 2:
-      raise newException(PgTypeError, "Invalid lseg: " & v)
-    result.add(PgLseg(p1: points[0], p2: points[1]))
+proc lineElemFromText(s: string): PgLine =
+  let v = s.strip()
+  var inner = v
+  if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
+    inner = inner[1 ..^ 2]
+  else:
+    raise newException(PgTypeError, "Invalid line: " & v)
+  let parts = inner.split(',')
+  if parts.len != 3:
+    raise newException(PgTypeError, "Invalid line: " & v)
+  PgLine(a: parseFloat(parts[0]), b: parseFloat(parts[1]), c: parseFloat(parts[2]))
+
+genArrayDecoder(
+  getLineArray,
+  PgLine,
+  "line",
+  lineElemFromBinary(row.data.buf, off + e.off, e.len),
+  lineElemFromText(e.get),
+)
+
+proc lsegElemFromBinary(buf: openArray[byte], off: int): PgLseg =
+  PgLseg(p1: decodePointBinary(buf, off), p2: decodePointBinary(buf, off + 16))
+
+proc lsegElemFromText(s: string): PgLseg =
+  let v = s.strip()
+  var inner = v
+  if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
+    inner = inner[1 ..^ 2]
+  let points = parsePointsText(inner)
+  if points.len != 2:
+    raise newException(PgTypeError, "Invalid lseg: " & v)
+  PgLseg(p1: points[0], p2: points[1])
+
+genArrayDecoder(
+  getLsegArray,
+  PgLseg,
+  "lseg",
+  lsegElemFromBinary(row.data.buf, off + e.off),
+  lsegElemFromText(e.get),
+)
 
 proc getBoxArray*(row: Row, col: int): seq[PgBox] =
   if row.isBinaryCol(col):
@@ -1539,153 +1440,118 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
       raise newException(PgTypeError, "Invalid box: " & v)
     result.add(PgBox(high: points[0], low: points[1]))
 
-proc getPathArray*(row: Row, col: int): seq[PgPath] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgPath](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in path array")
-      let b = row.data.buf
-      let o = off + e.off
-      result[i].closed = b[o] != 0
-      let npts = fromBE32(b.toOpenArray(o + 1, o + 4))
-      result[i].points = newSeq[PgPoint](npts)
-      for j in 0 ..< npts:
-        result[i].points[j] = decodePointBinary(b, o + 5 + j * 16)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in path array")
-    let v = e.get.strip()
-    if v.len < 2:
-      raise newException(PgTypeError, "Invalid path: " & v)
-    let closed = v[0] == '('
-    let inner = v[1 ..^ 2]
-    result.add(PgPath(closed: closed, points: parsePointsText(inner)))
+proc pathElemFromBinary(buf: openArray[byte], off: int): PgPath =
+  result.closed = buf[off] != 0
+  let npts = fromBE32(buf.toOpenArray(off + 1, off + 4))
+  result.points = newSeq[PgPoint](npts)
+  for j in 0 ..< npts:
+    result.points[j] = decodePointBinary(buf, off + 5 + j * 16)
 
-proc getPolygonArray*(row: Row, col: int): seq[PgPolygon] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgPolygon](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in polygon array")
-      let b = row.data.buf
-      let o = off + e.off
-      let npts = fromBE32(b.toOpenArray(o, o + 3))
-      result[i].points = newSeq[PgPoint](npts)
-      for j in 0 ..< npts:
-        result[i].points[j] = decodePointBinary(b, o + 4 + j * 16)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in polygon array")
-    let v = e.get.strip()
-    if v.len < 2 or v[0] != '(' or v[^1] != ')':
-      raise newException(PgTypeError, "Invalid polygon: " & v)
-    result.add(PgPolygon(points: parsePointsText(v[1 ..^ 2])))
+proc pathElemFromText(s: string): PgPath =
+  let v = s.strip()
+  if v.len < 2:
+    raise newException(PgTypeError, "Invalid path: " & v)
+  let closed = v[0] == '('
+  let inner = v[1 ..^ 2]
+  PgPath(closed: closed, points: parsePointsText(inner))
 
-proc getCircleArray*(row: Row, col: int): seq[PgCircle] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgCircle](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in circle array")
-      if e.len != 24:
-        raise
-          newException(PgTypeError, "Invalid binary circle element length: " & $e.len)
-      result[i].center = decodePointBinary(row.data.buf, off + e.off)
-      result[i].radius = decodeFloat64BE(row.data.buf, off + e.off + 16)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in circle array")
-    let v = e.get.strip()
-    if v.len < 2 or v[0] != '<' or v[^1] != '>':
-      raise newException(PgTypeError, "Invalid circle: " & v)
-    let inner = v[1 ..^ 2]
-    var depth = 0
-    var lastComma = -1
-    for j in 0 ..< inner.len:
-      if inner[j] == '(':
-        depth += 1
-      elif inner[j] == ')':
-        depth -= 1
-      elif inner[j] == ',' and depth == 0:
-        lastComma = j
-    if lastComma < 0:
-      raise newException(PgTypeError, "Invalid circle: " & v)
-    result.add(
-      PgCircle(
-        center: parsePointText(inner[0 ..< lastComma]),
-        radius: parseFloat(inner[lastComma + 1 ..^ 1]),
-      )
-    )
+genArrayDecoder(
+  getPathArray,
+  PgPath,
+  "path",
+  pathElemFromBinary(row.data.buf, off + e.off),
+  pathElemFromText(e.get),
+)
+
+proc polygonElemFromBinary(buf: openArray[byte], off: int): PgPolygon =
+  let npts = fromBE32(buf.toOpenArray(off, off + 3))
+  result.points = newSeq[PgPoint](npts)
+  for j in 0 ..< npts:
+    result.points[j] = decodePointBinary(buf, off + 4 + j * 16)
+
+proc polygonElemFromText(s: string): PgPolygon =
+  let v = s.strip()
+  if v.len < 2 or v[0] != '(' or v[^1] != ')':
+    raise newException(PgTypeError, "Invalid polygon: " & v)
+  PgPolygon(points: parsePointsText(v[1 ..^ 2]))
+
+genArrayDecoder(
+  getPolygonArray,
+  PgPolygon,
+  "polygon",
+  polygonElemFromBinary(row.data.buf, off + e.off),
+  polygonElemFromText(e.get),
+)
+
+proc circleElemFromBinary(buf: openArray[byte], off, elen: int): PgCircle =
+  if elen != 24:
+    raise newException(PgTypeError, "Invalid binary circle element length: " & $elen)
+  result.center = decodePointBinary(buf, off)
+  result.radius = decodeFloat64BE(buf, off + 16)
+
+proc circleElemFromText(s: string): PgCircle =
+  let v = s.strip()
+  if v.len < 2 or v[0] != '<' or v[^1] != '>':
+    raise newException(PgTypeError, "Invalid circle: " & v)
+  let inner = v[1 ..^ 2]
+  var depth = 0
+  var lastComma = -1
+  for j in 0 ..< inner.len:
+    if inner[j] == '(':
+      depth += 1
+    elif inner[j] == ')':
+      depth -= 1
+    elif inner[j] == ',' and depth == 0:
+      lastComma = j
+  if lastComma < 0:
+    raise newException(PgTypeError, "Invalid circle: " & v)
+  PgCircle(
+    center: parsePointText(inner[0 ..< lastComma]),
+    radius: parseFloat(inner[lastComma + 1 ..^ 1]),
+  )
+
+genArrayDecoder(
+  getCircleArray,
+  PgCircle,
+  "circle",
+  circleElemFromBinary(row.data.buf, off + e.off, e.len),
+  circleElemFromText(e.get),
+)
 
 # Other array decoders
 
-template genStringArrayDecoder(getProc: untyped, T: typedesc, typeName: static string) =
-  proc getProc*(row: Row, col: int): seq[T] =
-    if row.isBinaryCol(col):
-      let (off, clen) = cellInfo(row, col)
-      if clen == -1:
-        raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      result = newSeq[T](decoded.elements.len)
-      for i, e in decoded.elements:
-        if e.len == -1:
-          raise newException(PgTypeError, "NULL element in " & typeName & " array")
-        result[i] = T(readString(row.data.buf, off + e.off, e.len))
-      return
-    let s = row.getStr(col)
-    let elems = parseTextArray(s)
-    for e in elems:
-      if e.isNone:
-        raise newException(PgTypeError, "NULL element in " & typeName & " array")
-      result.add(T(e.get))
+proc stringElemFromBinary[T](buf: openArray[byte], off, elen: int): T =
+  T(readString(buf, off, elen))
 
-genStringArrayDecoder(getXmlArray, PgXml, "xml")
-genStringArrayDecoder(getTsVectorArray, PgTsVector, "tsvector")
-genStringArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery")
+genArrayDecoder(
+  getXmlArray,
+  PgXml,
+  "xml",
+  stringElemFromBinary[PgXml](row.data.buf, off + e.off, e.len),
+  PgXml(e.get),
+)
+genArrayDecoder(
+  getTsVectorArray,
+  PgTsVector,
+  "tsvector",
+  stringElemFromBinary[PgTsVector](row.data.buf, off + e.off, e.len),
+  PgTsVector(e.get),
+)
+genArrayDecoder(
+  getTsQueryArray,
+  PgTsQuery,
+  "tsquery",
+  stringElemFromBinary[PgTsQuery](row.data.buf, off + e.off, e.len),
+  PgTsQuery(e.get),
+)
 
-proc getHstoreArray*(row: Row, col: int): seq[PgHstore] =
-  ## Get a column value as ``seq[PgHstore]``. Handles both text and binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    result = newSeq[PgHstore](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in hstore array")
-      result[i] = decodeHstoreBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in hstore array")
-    result.add(parseHstoreText(e.get))
+genArrayDecoder(
+  getHstoreArray,
+  PgHstore,
+  "hstore",
+  decodeHstoreBinary(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
+  parseHstoreText(e.get),
+)
 
 # Element-level NULL-safe array getters
 
