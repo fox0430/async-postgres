@@ -121,7 +121,7 @@ suite "Replication message parsing":
     var payload: seq[byte]
     payload.add(byte('w'))
     payload.addInt64(0x100'i64) # startLsn
-    payload.addInt64(0x200'i64) # endLsn
+    payload.addInt64(0x200'i64) # walEnd
     payload.addInt64(12345'i64) # sendTime
     payload.add(@[1'u8, 2, 3]) # WAL data
 
@@ -129,9 +129,11 @@ suite "Replication message parsing":
     let replMsg = parseReplicationMessage(payload)
     check replMsg.kind == rmkXLogData
     check replMsg.xlogData.startLsn == Lsn(0x100'u64)
-    check replMsg.xlogData.endLsn == Lsn(0x200'u64)
+    check replMsg.xlogData.walEnd == Lsn(0x200'u64)
     check replMsg.xlogData.sendTime == 12345'i64
     check replMsg.xlogData.data == @[1'u8, 2, 3]
+    # receivedEndLsn = startLsn + data.len, independent of walEnd
+    check replMsg.xlogData.receivedEndLsn == Lsn(0x103'u64)
 
   test "parse PrimaryKeepalive":
     var payload: seq[byte]
