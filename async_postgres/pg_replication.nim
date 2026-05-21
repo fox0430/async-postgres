@@ -31,8 +31,14 @@ type
     rmkPrimaryKeepalive
 
   XLogData* = object ## WAL data payload from the server.
-    startLsn*: Lsn ## Start of the WAL data in this message
-    endLsn*: Lsn ## Current end of WAL on the server
+    startLsn*: Lsn ## Start LSN of the WAL data in this message
+    walEnd*: Lsn
+      ## Current end of WAL on the server at the time this message was sent.
+      ## This is *not* the end of the WAL data contained in this message; it
+      ## reflects how far WAL has advanced on the server and is informational.
+      ## To acknowledge what was actually received, use ``receivedEndLsn``
+      ## (``startLsn + data.len``), never ``walEnd`` — ``walEnd`` may be ahead
+      ## of what this message contains.
     sendTime*: int64 ## Server send time (microseconds since PG epoch)
     data*: seq[byte] ## Raw WAL data (plugin-dependent format)
 
@@ -391,6 +397,13 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
   else:
     raise newException(ProtocolError, "Unknown pgoutput message type: " & msgType)
 
+proc receivedEndLsn*(msg: XLogData): Lsn =
+  ## End LSN of the WAL data actually contained in this message
+  ## (``startLsn + len(data)``). Use this when acknowledging received data via
+  ## ``sendStandbyStatus``; do not use ``walEnd``, which is the server's
+  ## current WAL position and may point past data this message does not carry.
+  Lsn(uint64(msg.startLsn) + uint64(msg.data.len))
+
 proc decodePgOutput*(msg: XLogData): PgOutputMessage =
   ## Convenience: decode the pgoutput message from an XLogData's data field.
   parsePgOutputMessage(msg.data)
@@ -519,7 +532,7 @@ proc parseReplicationMessage*(copyData: seq[byte]): ReplicationMessage =
       raise newException(ProtocolError, "XLogData message too short")
     var xlog = XLogData()
     xlog.startLsn = Lsn(cast[uint64](decodeInt64(copyData, 1)))
-    xlog.endLsn = Lsn(cast[uint64](decodeInt64(copyData, 9)))
+    xlog.walEnd = Lsn(cast[uint64](decodeInt64(copyData, 9)))
     xlog.sendTime = decodeInt64(copyData, 17)
     let dataStart = 25
     if copyData.len > dataStart:
@@ -578,14 +591,15 @@ proc startReplication*(
   ##
   ## When ``autoKeepaliveReply`` is true (the default), the library responds
   ## automatically to ``PrimaryKeepalive`` messages with ``replyRequested = true``
-  ## *before* invoking the callback, sending the most recently received
-  ## ``XLogData.endLsn`` (or ``startLsn`` if no XLogData has arrived yet) as
-  ## receive/flush/apply LSN. This prevents silent disconnects from
-  ## ``wal_sender_timeout`` when the callback is slow. The keepalive is still
-  ## delivered to the callback. Set ``autoKeepaliveReply = false`` to manage
-  ## replies manually — for example, when the flush/apply LSN must reflect
-  ## callback-side progress (durable writes) rather than what has merely been
-  ## received from the wire.
+  ## *before* invoking the callback, sending the highest ``receivedEndLsn``
+  ## (``startLsn + data.len``) observed so far across received ``XLogData``
+  ## messages — or the caller-supplied ``startLsn`` if no ``XLogData`` has
+  ## arrived yet — as receive/flush/apply LSN. This prevents silent disconnects
+  ## from ``wal_sender_timeout`` when the callback is slow. The keepalive is
+  ## still delivered to the callback. Set ``autoKeepaliveReply = false`` to
+  ## manage replies manually — for example, when the flush/apply LSN must
+  ## reflect callback-side progress (durable writes) rather than what has merely
+  ## been received from the wire.
   ##
   ## If no ``XLogData`` has arrived and ``startLsn`` was left at its default
   ## ``InvalidLsn`` (``0/0``), the auto-reply will carry ``0/0`` for
@@ -656,11 +670,12 @@ proc startReplication*(
   if not gotCopyBoth:
     return
 
-  # Tracks the highest XLogData.endLsn received from the wire (updated just
-  # before the callback is invoked) so that auto-replies acknowledge only what
-  # we have actually received, never the server's walEnd (which would falsely
-  # advance confirmed_flush_lsn past unprocessed data and cause data loss on
-  # slot restart).
+  # Highest end LSN of WAL data actually received from the wire — computed as
+  # XLogData.startLsn + data.len, *not* XLogData.walEnd. ``walEnd`` is the
+  # server's current WAL position at the time the message was sent and can be
+  # ahead of the bytes this message carries; acknowledging ``walEnd`` would
+  # falsely advance ``confirmed_flush_lsn`` past unprocessed WAL and cause data
+  # loss on slot restart.
   var lastReceivedLsn: Lsn = startLsn
 
   # Streaming loop
@@ -673,8 +688,9 @@ proc startReplication*(
           let replMsg = parseReplicationMessage(msg.copyData)
           case replMsg.kind
           of rmkXLogData:
-            if replMsg.xlogData.endLsn > lastReceivedLsn:
-              lastReceivedLsn = replMsg.xlogData.endLsn
+            let received = replMsg.xlogData.receivedEndLsn
+            if received > lastReceivedLsn:
+              lastReceivedLsn = received
           of rmkPrimaryKeepalive:
             if autoKeepaliveReply and replMsg.keepalive.replyRequested:
               await sendStandbyStatus(conn, lastReceivedLsn)

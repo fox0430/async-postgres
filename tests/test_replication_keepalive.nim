@@ -2,8 +2,10 @@
 ##
 ## Verifies that when `startReplication` is invoked with `autoKeepaliveReply = true`
 ## (the default), the library responds to `PrimaryKeepalive(replyRequested=true)`
-## messages automatically, using the most recently received `XLogData.endLsn`
-## (never the keepalive's `walEnd`). Also verifies the opt-out path.
+## messages automatically, using the highest `receivedEndLsn`
+## (`XLogData.startLsn + data.len`) observed so far — never the server's
+## `walEnd` (neither the keepalive's nor the XLogData's). Also verifies the
+## opt-out path.
 
 import std/unittest
 
@@ -27,12 +29,12 @@ proc buildCopyBothResponse(): seq[byte] =
 proc buildCopyData(payload: openArray[byte]): seq[byte] =
   buildBackendMsg('d', payload)
 
-proc buildXLogData(startLsn, endLsn, sendTime: int64, walData: seq[byte]): seq[byte] =
-  ## CopyData('w' + startLsn + endLsn + sendTime + walData).
+proc buildXLogData(startLsn, walEnd, sendTime: int64, walData: seq[byte]): seq[byte] =
+  ## CopyData('w' + startLsn + walEnd + sendTime + walData).
   var payload: seq[byte]
   payload.add(byte('w'))
   payload.addInt64(startLsn)
-  payload.addInt64(endLsn)
+  payload.addInt64(walEnd)
   payload.addInt64(sendTime)
   payload.add(walData)
   buildCopyData(payload)
@@ -56,8 +58,17 @@ proc decodeStandbyStatusReceiveLsn(body: seq[byte]): int64 =
   decodeInt64(body, 1)
 
 const
-  testEndLsn = 0x0000_0000_0000_1000'i64
-  testWalEnd = 0x0000_0000_0000_9999'i64
+  # startLsn of the XLogData burst the mock server sends.
+  testStartLsn = 0x0000_0000_0000_1000'i64
+  # WAL bytes carried by the XLogData. The receivedEndLsn the client should
+  # acknowledge is testStartLsn + testWalData.len.
+  testWalData: seq[byte] = @[1'u8, 2, 3]
+  testReceivedEndLsn = testStartLsn + testWalData.len
+  # XLogData.walEnd and PrimaryKeepalive.walEnd are both the server's current
+  # WAL end; they may be far ahead of what the message actually contains.
+  # The client must NOT acknowledge these.
+  testXLogWalEnd = 0x0000_0000_0000_5000'i64
+  testKeepaliveWalEnd = 0x0000_0000_0000_9999'i64
 
 # Captured by the closure-typed `ReplicationCallback`. Kept at module scope so
 # the callback body can mutate state without forcing a non-gcsafe seq capture.
@@ -68,7 +79,7 @@ var keepaliveSeen: bool
 var unexpectedFrontendMsgType: char = '\0'
 
 suite "Replication: auto keepalive reply":
-  test "auto-reply uses last XLogData endLsn, not server walEnd":
+  test "auto-reply uses receivedEndLsn (startLsn+data.len), not any walEnd":
     observedReceiveLsn = -1
     observedReplyMsgType = '\0'
     callbackKinds.setLen(0)
@@ -81,10 +92,12 @@ suite "Replication: auto keepalive reply":
         # Drain START_REPLICATION query.
         discard await drainFrontendMessage(st)
         # Send CopyBothResponse + XLogData + Keepalive(replyRequested=1).
+        # XLogData.walEnd is deliberately set far ahead of startLsn+data.len
+        # so the test would fail if the client incorrectly acknowledged it.
         var burst: seq[byte]
         burst.add(buildCopyBothResponse())
-        burst.add(buildXLogData(0x100, testEndLsn, 0, @[1'u8, 2, 3]))
-        burst.add(buildKeepalive(testWalEnd, 0, replyRequested = true))
+        burst.add(buildXLogData(testStartLsn, testXLogWalEnd, 0, testWalData))
+        burst.add(buildKeepalive(testKeepaliveWalEnd, 0, replyRequested = true))
         await sendBytes(st, burst)
         # Expect the client to auto-reply with a Standby Status Update.
         let reply = await drainFrontendMessage(st)
@@ -113,7 +126,10 @@ suite "Replication: auto keepalive reply":
 
     waitFor testBody()
     check observedReplyMsgType == 'd'
-    check observedReceiveLsn == testEndLsn
+    check observedReceiveLsn == testReceivedEndLsn
+    # Regression guard: must not be either walEnd value.
+    check observedReceiveLsn != testXLogWalEnd
+    check observedReceiveLsn != testKeepaliveWalEnd
     check callbackKinds == @[rmkXLogData, rmkPrimaryKeepalive]
 
   test "auto-reply disabled: library does not send Standby Status":
@@ -128,8 +144,8 @@ suite "Replication: auto keepalive reply":
         discard await drainFrontendMessage(st) # START_REPLICATION
         var burst: seq[byte]
         burst.add(buildCopyBothResponse())
-        burst.add(buildXLogData(0x100, testEndLsn, 0, @[1'u8, 2, 3]))
-        burst.add(buildKeepalive(testWalEnd, 0, replyRequested = true))
+        burst.add(buildXLogData(testStartLsn, testXLogWalEnd, 0, testWalData))
+        burst.add(buildKeepalive(testKeepaliveWalEnd, 0, replyRequested = true))
         await sendBytes(st, burst)
         # The library must NOT auto-reply with a Standby Status Update when
         # autoKeepaliveReply = false. Observe this directly by attempting to

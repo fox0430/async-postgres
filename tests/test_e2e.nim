@@ -9466,7 +9466,7 @@ suite "E2E: Logical Replication":
             if pgMsg.insert.newTuple.len >= 2 and
                 pgMsg.insert.newTuple[1].kind == tdkText:
               insertVal = pgMsg.insert.newTuple[1].toString()
-            await replConn.sendStandbyStatus(msg.xlogData.endLsn)
+            await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
             await replConn.stopReplication()
           of pomkCommit:
             discard
@@ -9522,7 +9522,7 @@ suite "E2E: Logical Replication":
       let cb = makeReplicationCallback:
         case msg.kind
         of rmkXLogData:
-          await replConn.sendStandbyStatus(msg.xlogData.endLsn)
+          await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
         of rmkPrimaryKeepalive:
           # Stop immediately on first keepalive
           await replConn.sendStandbyStatus(msg.keepalive.walEnd)

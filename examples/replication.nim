@@ -81,8 +81,10 @@ proc main() {.async.} =
       else:
         echo "Other: ", pgMsg.kind
 
-      # Acknowledge progress
-      await replConn.sendStandbyStatus(msg.xlogData.endLsn)
+      # Acknowledge progress. Use receivedEndLsn (startLsn + data.len), not
+      # walEnd: walEnd is the server's current WAL position and may point past
+      # what this message actually carries.
+      await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
 
       inc msgCount
       if msgCount >= 10:
