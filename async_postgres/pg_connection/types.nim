@@ -356,6 +356,39 @@ type
     stage*: TransportCloseStage
     err*: ref CatchableError
 
+  CleanupKind* = enum
+    ## Which automatic cleanup operation was skipped or whose failure was
+    ## swallowed. Reported through `onCleanupSkipped` so operators can
+    ## distinguish outer-transaction cleanup from savepoint cleanup.
+    ckTxRollback ## Outer `ROLLBACK` (withTransaction / withTransactionDeadline)
+    ckSavepointRollback
+      ## `ROLLBACK TO SAVEPOINT` (withSavepoint / withSavepointDeadline)
+
+  CleanupSkipReason* = enum
+    ## Why an automatic cleanup operation did not run to completion.
+    csrConnInvalidated
+      ## The connection was already `csClosed` (typically because a per-call
+      ## timeout invalidated it via `invalidateOnTimeout`). The cleanup SQL
+      ## was *never dispatched* — `err` on the event is nil.
+    csrCleanupFailed
+      ## The cleanup SQL was dispatched but raised. The failure was
+      ## swallowed so it cannot mask the original body/COMMIT error;
+      ## `err` carries the cleanup failure.
+
+  TraceCleanupSkippedData* = object
+    ## Advisory notification fired from `withTransaction*` / `withSavepoint*`
+    ## error-cleanup paths when ROLLBACK is either skipped (connection
+    ## already invalidated) or attempted but failed (failure swallowed to
+    ## preserve the original error). Useful for surfacing the diagnostic
+    ## asymmetry between the timeout path (silent skip) and the body-error
+    ## path (visible ROLLBACK simpleExec event).
+    conn*: PgConnection
+    kind*: CleanupKind
+    reason*: CleanupSkipReason
+    err*: ref CatchableError
+      ## Cleanup-SQL failure when `reason == csrCleanupFailed`; nil when
+      ## `reason == csrConnInvalidated` (nothing was dispatched).
+
   TraceLeakedSessionLocksData* = object
     ## Advisory notification that a pool connection returned while still
     ## holding session-level advisory locks acquired through the typed API.
@@ -442,6 +475,23 @@ type
       ## locks acquired through the typed API. Advisory only — the pool
       ## handles cleanup as described in `TraceLeakedSessionLocksData`. Use
       ## this to surface missing ``advisoryUnlock`` calls at the borrow site.
+    onCleanupSkipped*: proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].}
+      ## Fires from `withTransaction*` / `withSavepoint*` error paths when
+      ## an automatic ROLLBACK is either skipped (connection already
+      ## `csClosed`, e.g. after a per-call timeout) or attempted but failed
+      ## (failure swallowed to keep the original error). Advisory only —
+      ## the macro's behaviour is unchanged. Use this to close the
+      ## diagnostic gap between the timeout path (silent) and the body-
+      ## error path (visible ROLLBACK simpleExec event).
+      ##
+      ## **Nested macros may fire this hook more than once per failure.**
+      ## When `withSavepoint*` is nested inside `withTransaction*` and the
+      ## connection becomes `csClosed`, the savepoint's error handler
+      ## fires `ckSavepointRollback` first, then the original exception
+      ## propagates to the outer transaction's handler which sees the same
+      ## `csClosed` state and fires `ckTxRollback`. Both events refer to
+      ## the same underlying cause; observers that aggregate by failure
+      ## (not by cleanup attempt) should dedupe.
     onInsecureAuth*: proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].}
       ## Fires when an auth method is used over an insecure transport
       ## (currently: cleartext password without SSL). Advisory only; does
@@ -541,6 +591,21 @@ proc fireDeprecatedAuth*(conn: PgConnection, authMethod: AuthMethod) =
   let t = conn.config.tracer
   if t != nil and t.onDeprecatedAuth != nil:
     t.onDeprecatedAuth(TraceDeprecatedAuthData(conn: conn, authMethod: authMethod))
+
+proc fireCleanupSkipped*(
+    conn: PgConnection,
+    kind: CleanupKind,
+    reason: CleanupSkipReason,
+    err: ref CatchableError = nil,
+) =
+  ## Route a `withTransaction*` / `withSavepoint*` ROLLBACK skip-or-swallow
+  ## event to the tracer. Reads from ``conn.config.tracer`` so events fire
+  ## regardless of the runtime ``conn.tracer`` alias. Nil hook is a no-op.
+  let t = conn.config.tracer
+  if t != nil and t.onCleanupSkipped != nil:
+    t.onCleanupSkipped(
+      TraceCleanupSkippedData(conn: conn, kind: kind, reason: reason, err: err)
+    )
 
 when hasChronos:
   proc fireTransportCloseError*(

@@ -1304,7 +1304,15 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
+  let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let resetSessionSym = bindSym"resetSession"
+  let csReadySym = bindSym"csReady"
+  let tsInTxSym = bindSym"tsInTransaction"
+  let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let fireCleanupSkippedSym = bindSym"fireCleanupSkipped"
+  let ckTxRollbackSym = bindSym"ckTxRollback"
+  let csrConnInvalidatedSym = bindSym"csrConnInvalidated"
+  let csrCleanupFailedSym = bindSym"csrCleanupFailed"
   result = quote:
     let `poolSym` = `poolExpr`
     let `connIdent` = await `poolSym`.acquire()
@@ -1314,10 +1322,24 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         `body`
         discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
       except CatchableError as `eSym`:
-        try:
-          discard await `connIdent`.simpleExec("ROLLBACK", timeout = `txTimeout`)
-        except CatchableError:
-          discard
+        # Mirror the per-call rationale from pg_client's `withTransaction`:
+        # skip ROLLBACK on an already-invalidated connection (per-call
+        # timeout marked it csClosed but txStatus may still be stale) and
+        # avoid a futile cleanup when the server has already ended the
+        # transaction. The csClosed skip and any swallowed inner-ROLLBACK
+        # failure are surfaced through `onCleanupSkipped` so the diagnostic
+        # asymmetry with the body-error path goes away.
+        if `connIdent`.state != `csReadySym`:
+          `fireCleanupSkippedSym`(
+            `connIdent`, `ckTxRollbackSym`, `csrConnInvalidatedSym`
+          )
+        elif `connIdent`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+          try:
+            discard await `connIdent`.simpleExec("ROLLBACK", timeout = `txTimeout`)
+          except CatchableError as `cleanupErrSym`:
+            `fireCleanupSkippedSym`(
+              `connIdent`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
+            )
         raise `eSym`
     finally:
       await `resetSessionSym`(`poolSym`, `connIdent`)
@@ -1390,12 +1412,14 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
+  let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "poolTxBodyDeadline")
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let connOptSym = genSym(nskVar, "connOpt")
   let resetSessionSym = bindSym"resetSession"
+  let csReadySym = bindSym"csReady"
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
@@ -1403,6 +1427,10 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let invalidateSym = bindSym"invalidateOnTimeout"
+  let fireCleanupSkippedSym = bindSym"fireCleanupSkipped"
+  let ckTxRollbackSym = bindSym"ckTxRollback"
+  let csrConnInvalidatedSym = bindSym"csrConnInvalidated"
+  let csrCleanupFailedSym = bindSym"csrCleanupFailed"
 
   result = quote:
     let `poolSym` = `poolExpr`
@@ -1422,11 +1450,21 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
             "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
           )
         except CatchableError as `eSym`:
-          if `connIdent`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+          # Mirror pg_client's `withTransactionDeadline`: skip ROLLBACK on a
+          # csClosed connection (per-call body timeout invalidated it) and
+          # report the skip / any swallowed inner-ROLLBACK failure through
+          # `onCleanupSkipped` so the timeout path is observable.
+          if `connIdent`.state != `csReadySym`:
+            `fireCleanupSkippedSym`(
+              `connIdent`, `ckTxRollbackSym`, `csrConnInvalidatedSym`
+            )
+          elif `connIdent`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
             try:
               discard await `connIdent`.simpleExec("ROLLBACK", timeout = `graceSym`)
-            except CatchableError:
-              discard
+            except CatchableError as `cleanupErrSym`:
+              `fireCleanupSkippedSym`(
+                `connIdent`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
+              )
           raise `eSym`
       finally:
         await `resetSessionSym`(`poolSym`, `connIdent`)
