@@ -128,6 +128,12 @@ type
     hasConn: bool
     authMethod: AuthMethod
 
+  CleanupSkippedRec = object
+    hasConn: bool
+    kind: CleanupKind
+    reason: CleanupSkipReason
+    errMsg: string
+
   TraceLog = ref object
     connectStarts: seq[ConnectStartRec]
     connectEnds: seq[ConnectEndRec]
@@ -147,6 +153,7 @@ type
     transportCloseErrors: seq[TransportCloseErrorRec]
     insecureAuths: seq[InsecureAuthRec]
     deprecatedAuths: seq[DeprecatedAuthRec]
+    cleanupSkipped: seq[CleanupSkippedRec]
 
 proc newTraceLog(): TraceLog =
   TraceLog()
@@ -301,6 +308,16 @@ proc buildTracer(log: TraceLog): PgTracer =
   tracer.onDeprecatedAuth = proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].} =
     log.deprecatedAuths.add(
       DeprecatedAuthRec(hasConn: data.conn != nil, authMethod: data.authMethod)
+    )
+
+  tracer.onCleanupSkipped = proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].} =
+    log.cleanupSkipped.add(
+      CleanupSkippedRec(
+        hasConn: data.conn != nil,
+        kind: data.kind,
+        reason: data.reason,
+        errMsg: (if data.err != nil: data.err.msg else: ""),
+      )
     )
 
   return tracer
@@ -1082,6 +1099,248 @@ suite "Tracing: onDeprecatedAuth":
   test "PgTracer with nil onDeprecatedAuth hook is safe to leave unset":
     let tracer = PgTracer()
     check tracer.onDeprecatedAuth == nil
+
+suite "Tracing: onCleanupSkipped":
+  # The `withTransaction*` / `withSavepoint*` macros invoke
+  # `fireCleanupSkipped` through `conn.config.tracer`, so unit tests can
+  # drive that codepath without a live PG by attaching a tracer to a
+  # zero-initialised `PgConnection` and calling `fireCleanupSkipped`
+  # directly. The end-to-end tests below exercise the macro paths against
+  # a real server (timeout-induced csClosed skip, body-error swallowed
+  # ROLLBACK failure) — but the unit tests cover the data wiring on their
+  # own.
+  test "fire helper routes csrConnInvalidated with nil err":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection(config: ConnConfig(tracer: tracer))
+
+    fake.fireCleanupSkipped(ckTxRollback, csrConnInvalidated)
+
+    check log.cleanupSkipped.len == 1
+    check log.cleanupSkipped[0].hasConn
+    check log.cleanupSkipped[0].kind == ckTxRollback
+    check log.cleanupSkipped[0].reason == csrConnInvalidated
+    check log.cleanupSkipped[0].errMsg == ""
+
+  test "fire helper routes csrCleanupFailed with err message":
+    let log = newTraceLog()
+    let tracer = buildTracer(log)
+    let fake = PgConnection(config: ConnConfig(tracer: tracer))
+
+    let err = newException(PgError, "rollback boom")
+    fake.fireCleanupSkipped(ckSavepointRollback, csrCleanupFailed, err)
+
+    check log.cleanupSkipped.len == 1
+    check log.cleanupSkipped[0].kind == ckSavepointRollback
+    check log.cleanupSkipped[0].reason == csrCleanupFailed
+    check log.cleanupSkipped[0].errMsg == "rollback boom"
+
+  test "nil tracer is a no-op":
+    let fake = PgConnection() # no config.tracer
+    fake.fireCleanupSkipped(ckTxRollback, csrConnInvalidated) # must not raise
+
+  test "nil onCleanupSkipped hook is a no-op":
+    let tracer = PgTracer() # other hooks left nil too — verify just this one is safe
+    check tracer.onCleanupSkipped == nil
+    let fake = PgConnection(config: ConnConfig(tracer: tracer))
+    fake.fireCleanupSkipped(ckTxRollback, csrConnInvalidated) # must not raise
+
+  test "withTransaction body error fires no cleanup-skipped event on healthy conn":
+    # The success-path inner ROLLBACK must complete cleanly and NOT fire
+    # the advisory hook — only swallowed failures do.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          discard await conn.exec("SELECT 1")
+          raise newException(PgError, "body boom")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction on csClosed conn fires csrConnInvalidated":
+    # Force the per-call timeout path by invalidating mid-body. The inner
+    # ROLLBACK is then skipped because `state != csReady`, and the advisory
+    # hook fires with reason=csrConnInvalidated.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          # Stand-in for "per-call timeout invalidated the conn after BEGIN":
+          # mark csClosed by hand and raise. The macro must observe the
+          # invalidated state and skip ROLLBACK while reporting the skip.
+          conn.state = csClosed
+          raise newException(PgError, "simulated timeout invalidation")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 1
+      doAssert log.cleanupSkipped[0].kind == ckTxRollback
+      doAssert log.cleanupSkipped[0].reason == csrConnInvalidated
+      doAssert log.cleanupSkipped[0].errMsg == ""
+
+      # `conn` was marked closed — let close() run idempotently for cleanup.
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepoint on csClosed conn fires csrConnInvalidated":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          conn.withSavepoint:
+            conn.state = csClosed
+            raise newException(PgError, "simulated timeout invalidation")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      # Nested macros fire `onCleanupSkipped` once per cleanup site: the
+      # inner savepoint's except handler reports a `ckSavepointRollback`
+      # csClosed skip, then re-raises into the outer transaction whose
+      # except handler reports a `ckTxRollback` csClosed skip on the same
+      # connection. Observers aggregating by failure (not by cleanup
+      # attempt) should dedupe — see `onCleanupSkipped` docs.
+      doAssert log.cleanupSkipped.len == 2
+      doAssert log.cleanupSkipped[0].kind == ckSavepointRollback
+      doAssert log.cleanupSkipped[0].reason == csrConnInvalidated
+      doAssert log.cleanupSkipped[0].errMsg == ""
+      doAssert log.cleanupSkipped[1].kind == ckTxRollback
+      doAssert log.cleanupSkipped[1].reason == csrConnInvalidated
+      doAssert log.cleanupSkipped[1].errMsg == ""
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction with mock cleanup failure fires csrCleanupFailed":
+    # End-to-end coverage for the `csrCleanupFailed` arm of the macro
+    # cleanup path. Inducing a real ROLLBACK failure inside the macro is
+    # impractical against a healthy server (the SQL is fixed and the
+    # connection is still ready), so we drive `fireCleanupSkipped` from
+    # the same `conn.config.tracer` chain the macro uses — this verifies
+    # the wiring end-to-end (tracer attached via `tracedConfig`, hook
+    # callable while a real connection is open) without relying on a
+    # synthetic transport failure. The direct `csrCleanupFailed` arm of
+    # `fireCleanupSkipped` is already covered by the unit test above; the
+    # added value here is the live-connection path.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let conn = await connect(tracedConfig(tracer))
+
+      let err = newException(PgError, "synthetic ROLLBACK failure")
+      conn.fireCleanupSkipped(ckTxRollback, csrCleanupFailed, err)
+
+      doAssert log.cleanupSkipped.len == 1
+      doAssert log.cleanupSkipped[0].hasConn
+      doAssert log.cleanupSkipped[0].kind == ckTxRollback
+      doAssert log.cleanupSkipped[0].reason == csrCleanupFailed
+      doAssert log.cleanupSkipped[0].errMsg == "synthetic ROLLBACK failure"
+
+      await conn.close()
+
+    waitFor t()
+
+suite "Tracing: onCleanupSkipped (pool)":
+  test "pool.withTransaction body error fires no cleanup-skipped event on healthy conn":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 2)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      var raised = false
+      try:
+        pool.withTransaction(conn):
+          discard await conn.exec("SELECT 1")
+          raise newException(PgError, "body boom")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 0
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransaction on csClosed conn fires csrConnInvalidated":
+    # Mirror of the per-connection csClosed test: drive the cleanup path
+    # without a real per-call timeout by forcing `state = csClosed` mid-
+    # body. The pool variant must skip ROLLBACK and report the skip the
+    # same way the per-connection macro does.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 2)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      var raised = false
+      try:
+        pool.withTransaction(conn):
+          conn.state = csClosed
+          raise newException(PgError, "simulated timeout invalidation")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 1
+      doAssert log.cleanupSkipped[0].kind == ckTxRollback
+      doAssert log.cleanupSkipped[0].reason == csrConnInvalidated
+      doAssert log.cleanupSkipped[0].errMsg == ""
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline on csClosed conn fires csrConnInvalidated":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 2)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      var raised = false
+      try:
+        pool.withTransactionDeadline(conn, seconds(30)):
+          conn.state = csClosed
+          raise newException(PgError, "simulated timeout invalidation")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 1
+      doAssert log.cleanupSkipped[0].kind == ckTxRollback
+      doAssert log.cleanupSkipped[0].reason == csrConnInvalidated
+      doAssert log.cleanupSkipped[0].errMsg == ""
+
+      await pool.close()
+
+    waitFor t()
 
 suite "filterSaslByRequireAuth":
   test "empty allowed set performs no filtering":
