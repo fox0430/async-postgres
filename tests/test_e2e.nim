@@ -6285,6 +6285,48 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: pending close drain removes statement server-side":
+    # End-to-end verification of the eviction → flushPendingStmtCloses path
+    # against ``pg_prepared_statements``. An OID-mismatch invalidation
+    # queues the cached statement's server name in ``pendingStmtCloses``;
+    # the immediate cache-miss send drains the queue, so the Close has to
+    # take effect server-side before the second query returns.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let r1 = await conn.query("SELECT $1 AS v", @[toPgParam(1'i64)])
+      doAssert r1.rows[0].getInt64(0) == 1
+      let firstName = conn.stmtCache["SELECT $1 AS v"].name
+
+      let pre = await conn.query(
+        "SELECT count(*)::int FROM pg_prepared_statements WHERE name = $1",
+        @[toPgParam(firstName)],
+      )
+      doAssert pre.rows[0].getInt(0) == 1
+
+      # Same SQL, different parameter OID → invalidateIfOidMismatch queues
+      # ``firstName`` into pendingStmtCloses, then the cache-miss path
+      # drains it via flushPendingStmtCloses before re-parsing under a
+      # new statement name.
+      let r2 = await conn.query("SELECT $1 AS v", @[toPgParam(2'i32)])
+      doAssert r2.rows[0].getInt(0) == 2
+      doAssert conn.pendingStmtCloses.len == 0 # drained in this op
+      let secondName = conn.stmtCache["SELECT $1 AS v"].name
+      doAssert secondName != firstName
+
+      # Server must have processed the Close: the old name is gone and
+      # only the freshly parsed statement remains.
+      let post = await conn.query(
+        "SELECT name FROM pg_prepared_statements WHERE name IN ($1, $2) ORDER BY name",
+        @[toPgParam(firstName), toPgParam(secondName)],
+      )
+      doAssert post.rows.len == 1
+      doAssert post.rows[0].getStr(0) == secondName
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: mismatched OIDs work across many type swaps":
     # Stress the invalidation path: repeatedly swap parameter type for the
     # same SQL text. Each swap evicts and re-parses; the cache must stay at
