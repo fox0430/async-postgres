@@ -215,7 +215,11 @@ type
       ## current cache size). Flushed by ``flushPendingStmtCloses`` at the
       ## start of the next Extended Query send phase so the leak is bounded
       ## to the gap until the next operation.
-    hstoreOid*: int32 ## Dynamic OID for hstore extension type; 0 if not available
+    hstoreOid*: int32
+      ## Dynamic OID for the hstore extension type; 0 if not available.
+      ## Resolved once at connect time via ``to_regtype('hstore')``, which
+      ## follows the connection's ``search_path`` at that moment. Later
+      ## ``SET search_path`` changes do not refresh this value.
     hstoreArrayOid*: int32 ## Dynamic OID for hstore[] array; 0 if not available
     heldSessionLocks*: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
