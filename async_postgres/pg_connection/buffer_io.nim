@@ -1,0 +1,502 @@
+## Transport-layer buffering and message I/O.
+##
+## - recvBuf/sendBuf management (compact, fill, send)
+## - Synchronous backend-message parsing (`nextMessage`) and the async wrapper
+##   `recvMessage`
+## - Notification/Notice dispatch (called from `nextMessage`)
+## - Transport teardown (`closeTransport`)
+## - TCP keepalive / TCP_NODELAY socket options
+## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`)
+## - `makeCopyOutCallback` / `makeCopyInCallback` cross-backend templates
+##
+## Re-exported through `pg_connection.nim`; depends only on `types.nim` and
+## the protocol/error/backend abstraction modules.
+
+import std/[deques, options]
+when defined(posix):
+  import std/posix
+
+import ../[async_backend, pg_errors, pg_protocol]
+import types
+
+when hasChronos:
+  import chronos/streams/tlsstream
+elif hasAsyncDispatch:
+  import std/asyncnet
+
+when defined(posix):
+  # POSIX socket option constants (used by liveness probes and TCP keepalive)
+  var TCP_NODELAY* {.importc, header: "<netinet/tcp.h>".}: cint
+  var MSG_DONTWAIT* {.importc, header: "<sys/socket.h>".}: cint
+
+# Host / address helpers
+
+proc isUnixSocket*(host: string): bool {.inline.} =
+  ## True if `host` represents a Unix socket directory (starts with '/').
+  ## Compatible with libpq behavior.
+  host.len > 0 and host[0] == '/'
+
+proc unixSocketPath*(host: string, port: int): string =
+  ## Build the libpq-compatible Unix socket file path: ``{dir}/.s.PGSQL.{port}``.
+  host & "/.s.PGSQL." & $port
+
+proc getHosts*(config: ConnConfig): seq[HostEntry] =
+  ## Return the list of hosts to try. If `hosts` is populated, return it;
+  ## otherwise synthesize a single entry from `host`/`port`.
+  if config.hosts.len > 0:
+    config.hosts
+  else:
+    @[HostEntry(host: config.host, port: if config.port == 0: 5432 else: config.port)]
+
+# COPY callback factories (cross-backend)
+
+template makeCopyOutCallback*(body: untyped): CopyOutCallback =
+  ## Create a ``CopyOutCallback`` that works with both asyncdispatch and chronos.
+  ## Inside ``body``, the current chunk is available as ``data: seq[byte]``.
+  ##
+  ## .. code-block:: nim
+  ##   var chunks: seq[seq[byte]]
+  ##   let cb = makeCopyOutCallback:
+  ##     chunks.add(data)
+  block:
+    when hasChronos:
+      let r: CopyOutCallback = proc(
+          data {.inject.}: seq[byte]
+      ) {.async: (raises: [CatchableError]).} =
+        body
+      r
+    else:
+      let r: CopyOutCallback = proc(data {.inject.}: seq[byte]) {.async.} =
+        body
+      r
+
+template makeCopyInCallback*(body: untyped): CopyInCallback =
+  ## Create a ``CopyInCallback`` that works with both asyncdispatch and chronos.
+  ## ``body`` must evaluate to ``seq[byte]``. Return an empty seq to signal completion.
+  ##
+  ## With asyncdispatch, anonymous async procs cannot return non-void types,
+  ## so this template wraps the body in manual ``Future`` construction.
+  ##
+  ## .. code-block:: nim
+  ##   var idx = 0
+  ##   let rows = @["1\tAlice\n".toBytes(), "2\tBob\n".toBytes()]
+  ##   let cb = makeCopyInCallback:
+  ##     if idx < rows.len:
+  ##       let chunk = rows[idx]
+  ##       inc idx
+  ##       chunk
+  ##     else:
+  ##       newSeq[byte]()
+  block:
+    when hasChronos:
+      let r: CopyInCallback = proc(): Future[seq[byte]] {.
+          async: (raises: [CatchableError])
+      .} =
+        body
+      r
+    else:
+      # asyncdispatch's {.async.} doesn't support non-void return types on
+      # anonymous procs. Wrap in manual Future construction instead.
+      # Note: body must be synchronous (no await).
+      let r: CopyInCallback = proc(): Future[seq[byte]] {.gcsafe.} =
+        let fut = newFuture[seq[byte]]("makeCopyInCallback")
+        try:
+          let res: seq[byte] = body
+          fut.complete(res)
+        except CatchableError as e:
+          fut.fail(e)
+        return fut
+      r
+
+# Notification / notice dispatch
+
+proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
+  let notif = Notification(
+    pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
+  )
+  if conn.notifyMaxQueue > 0:
+    var droppedNow = 0
+    while conn.notifyQueue.len >= conn.notifyMaxQueue:
+      discard conn.notifyQueue.popFirst()
+      if conn.notifyDropped < high(int):
+        conn.notifyDropped.inc
+      droppedNow.inc
+    conn.notifyQueue.addLast(notif)
+    if droppedNow > 0 and conn.notifyOverflowCallback != nil:
+      conn.notifyOverflowCallback(droppedNow)
+    if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+      # asyncdispatch's `Future.complete` has inferred effect `Exception`
+      # via the callback chain; swallow it to keep this proc `raises: []`.
+      try:
+        conn.notifyWaiter.complete()
+      except Exception:
+        discard
+  if conn.notifyCallback != nil:
+    conn.notifyCallback(notif)
+
+proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
+  if conn.noticeCallback != nil:
+    conn.noticeCallback(Notice(fields: msg.noticeFields))
+
+# Raw send helpers (asyncdispatch only)
+
+when hasAsyncDispatch:
+  proc sendRawData*(socket: AsyncSocket, p: pointer, len: int): Future[void] =
+    ## Send raw bytes via asyncdispatch socket. Copies data into a string once.
+    if len == 0:
+      var fut = newFuture[void]("sendRawData")
+      fut.complete()
+      return fut
+    var s = newString(len)
+    copyMem(addr s[0], p, len)
+    socket.send(move s)
+
+  proc sendRawBytes*(socket: AsyncSocket, data: seq[byte]): Future[void] =
+    ## Send ``seq[byte]`` via asyncdispatch socket.
+    if data.len == 0:
+      var fut = newFuture[void]("sendRawBytes")
+      fut.complete()
+      return fut
+    sendRawData(socket, addr data[0], data.len)
+
+# Receive buffer management
+
+proc compactRecvBuf*(conn: PgConnection) {.inline.} =
+  ## Shift unconsumed data to the front of recvBuf, reclaiming space consumed
+  ## by the read pointer.  Called only before reading new data from the socket.
+  let start = conn.recvBufStart
+  if start == 0:
+    return
+  let remaining = conn.recvBuf.len - start
+  if remaining == 0:
+    conn.recvBuf.setLen(0)
+  else:
+    moveMem(addr conn.recvBuf[0], addr conn.recvBuf[start], remaining)
+    conn.recvBuf.setLen(remaining)
+  conn.recvBufStart = 0
+
+proc fillRecvBuf*(
+    conn: PgConnection, timeout: Duration = ZeroDuration
+): Future[void] {.async.} =
+  ## Read data from socket into buffer. The only await point for message reception.
+  ##
+  ## On `AsyncTimeoutError` the caller (typically `invalidateOnTimeout`) is
+  ## responsible for the state transition. On any other `CatchableError`
+  ## (transport failure, cancellation, etc.) the connection is marked
+  ## `csClosed` before re-raising, since the read may have consumed an
+  ## indeterminate number of bytes from the socket and the stream is no
+  ## longer parseable.
+  conn.compactRecvBuf()
+  when hasChronos:
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + RecvBufSize)
+    var n: int
+    try:
+      n =
+        if timeout == ZeroDuration:
+          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
+        else:
+          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
+            timeout
+          )
+    except AsyncTimeoutError as e:
+      conn.recvBuf.setLen(oldLen)
+      raise e
+    except CatchableError as e:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise e
+    if n == 0:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise newException(PgConnectionError, "Connection closed by server")
+    conn.recvBuf.setLen(oldLen + n)
+  elif hasAsyncDispatch:
+    let data =
+      try:
+        if timeout == ZeroDuration:
+          await conn.socket.recv(RecvBufSize)
+        else:
+          await conn.socket.recv(RecvBufSize).wait(timeout)
+      except AsyncTimeoutError as e:
+        raise e
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
+    if data.len == 0:
+      conn.state = csClosed
+      raise newException(PgConnectionError, "Connection closed by server")
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + data.len)
+    copyMem(addr conn.recvBuf[oldLen], addr data[0], data.len)
+
+proc nextMessage*(
+    conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
+): Option[BackendMessage] {.raises: [ProtocolError].} =
+  ## Synchronously parse the next message from the receive buffer.
+  ## Returns none if the buffer doesn't contain a complete message.
+  ## Notification/Notice messages are dispatched internally.
+  ## DataRow messages are counted (if rowCount != nil) and consumed.
+  ##
+  ## On `ProtocolError` the protocol stream is desynchronised — the connection
+  ## is transitioned to `csClosed` before re-raising so that it is never
+  ## reused (in particular, by the connection pool).
+  var pos = conn.recvBufStart
+  let maxLen = conn.effectiveMaxMessageSize()
+  while true:
+    var consumed: int
+    let res =
+      try:
+        parseBackendMessage(
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData, maxLen
+        )
+      except ProtocolError as e:
+        conn.state = csClosed
+        raise e
+    if res.state == psIncomplete:
+      return none(BackendMessage)
+    pos += consumed
+    conn.recvBufStart = pos
+    if res.state == psDataRow:
+      # DataRow already parsed in-place into rowData; just count it
+      if rowCount != nil:
+        rowCount[] += 1
+      continue
+    if res.message.kind == bmkNotificationResponse:
+      conn.dispatchNotification(res.message)
+      continue
+    if res.message.kind == bmkNoticeResponse:
+      conn.dispatchNotice(res.message)
+      continue
+    if res.message.kind == bmkDataRow and rowCount != nil:
+      rowCount[] += 1
+      continue
+    return some(res.message)
+
+proc recvMessage*(
+    conn: PgConnection,
+    timeout = ZeroDuration,
+    rowData: RowData = nil,
+    rowCount: ptr int32 = nil,
+): Future[BackendMessage] {.async.} =
+  ## Receive a single backend message from the connection.
+  ## Thin wrapper around nextMessage + fillRecvBuf for backward compatibility.
+  while true:
+    let opt = conn.nextMessage(rowData, rowCount)
+    if opt.isSome:
+      return opt.get
+    await conn.fillRecvBuf(timeout)
+
+# Send helpers
+
+proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
+  ## Send raw bytes to the PostgreSQL server over the connection.
+  when hasChronos:
+    await conn.writer.write(data)
+  elif hasAsyncDispatch:
+    if data.len > 0:
+      await conn.socket.sendRawBytes(data)
+
+proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
+  ## Send conn.sendBuf to the server.
+  ## The transport receives its own copy of the buffer, so conn.sendBuf is safe
+  ## to mutate while the returned Future is still pending.
+  when hasChronos:
+    if conn.sendBuf.len > 0:
+      await conn.writer.write(conn.sendBuf)
+  elif hasAsyncDispatch:
+    if conn.sendBuf.len > 0:
+      await conn.socket.sendRawBytes(conn.sendBuf)
+
+# Transport teardown
+
+proc closeTransport*(conn: PgConnection) {.async.} =
+  ## Close transport resources without sending Terminate.
+  when hasChronos:
+    if conn.tlsStream != nil:
+      try:
+        await conn.tlsStream.reader.closeWait()
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTlsReader, e)
+      try:
+        await conn.tlsStream.writer.closeWait()
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTlsWriter, e)
+      conn.tlsStream = nil
+    if conn.baseReader != nil:
+      try:
+        await conn.baseReader.closeWait()
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsBaseReader, e)
+      try:
+        await conn.baseWriter.closeWait()
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsBaseWriter, e)
+      conn.baseReader = nil
+      conn.baseWriter = nil
+    if conn.transport != nil:
+      try:
+        await conn.transport.closeWait()
+      except CatchableError as e:
+        conn.fireTransportCloseError(tcsTransport, e)
+      conn.transport = nil
+    # Drop the cached reader/writer aliases so isConnected() reports false.
+    conn.reader = nil
+    conn.writer = nil
+  elif hasAsyncDispatch:
+    if not conn.socket.isNil:
+      conn.socket.close()
+      conn.socket = nil
+
+# Liveness probes
+
+proc socketHasFin*(conn: PgConnection): bool =
+  ## Non-blocking OS-level half-open probe (POSIX only).
+  ##
+  ## Returns `true` when the kernel has already observed a peer-side FIN/RST
+  ## on this connection's underlying socket. Returns `false` when the socket
+  ## is alive and idle, when there is pending data (which the next operation
+  ## will handle), or when there is no transport handle to probe (e.g. mock
+  ## connections, or after `close`).
+  ##
+  ## A single `recv(MSG_PEEK | MSG_DONTWAIT)` syscall — no round trip. For
+  ## TLS connections this still detects TCP-level FIN/RST, but not TLS-layer
+  ## errors that haven't been read yet; use `ping` for that.
+  ##
+  ## On non-POSIX platforms this always returns `false` (no probe available).
+  when defined(posix):
+    when hasChronos:
+      if conn.transport.isNil:
+        return false
+      let fd = posix.SocketHandle(conn.transport.fd)
+    elif hasAsyncDispatch:
+      if conn.socket.isNil:
+        return false
+      let fd = posix.SocketHandle(conn.socket.getFd())
+    var buf: byte
+    let flags = posix.MSG_PEEK or MSG_DONTWAIT
+    while true:
+      let n = posix.recv(fd, addr buf, 1, flags)
+      if n > 0:
+        return false
+      if n == 0:
+        return true
+      let err = errno
+      if err == EAGAIN or err == EWOULDBLOCK:
+        return false
+      if err == EINTR:
+        continue
+      return true
+  else:
+    false
+
+proc isConnected*(conn: PgConnection): bool =
+  ## Whether the underlying transport is present and the OS has not yet
+  ## observed a peer-side close.
+  ##
+  ## Cheap, non-blocking (no round trip): checks that the connection object
+  ## holds a transport handle, and on POSIX also issues a single
+  ## `recv(MSG_PEEK | MSG_DONTWAIT)` via `socketHasFin` to catch FIN/RST
+  ## already sitting in the kernel buffer (half-open detection). On
+  ## non-POSIX platforms the check falls back to handle presence only.
+  ##
+  ## Pair with `state == csReady` to decide whether a connection is usable
+  ## before issuing a query. Use `ping` for a full server round trip when
+  ## the OS-level probe is insufficient (e.g. TLS-layer state, application
+  ## liveness rather than transport liveness).
+  when hasChronos:
+    if conn.writer.isNil:
+      return false
+  elif hasAsyncDispatch:
+    if conn.socket.isNil:
+      return false
+  not conn.socketHasFin()
+
+# TCP socket options
+
+when defined(posix):
+  proc configureTcpNoDelay*(fd: posix.SocketHandle) =
+    ## Disable Nagle's algorithm for low-latency sends.
+    var optval: cint = 1
+    discard setsockopt(
+      fd, cint(posix.IPPROTO_TCP), TCP_NODELAY, addr optval, sizeof(optval).SockLen
+    )
+
+  proc configureKeepalive*(fd: posix.SocketHandle, config: ConnConfig) =
+    ## Set TCP keepalive options on the socket.
+    if not config.keepAlive:
+      return
+    var optval: cint = 1
+    if setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, addr optval, sizeof(optval).SockLen) < 0:
+      raise newException(
+        PgConnectionError, "Failed to set SO_KEEPALIVE: " & $strerror(errno)
+      )
+    when defined(linux):
+      if config.keepAliveIdle > 0:
+        optval = cint(config.keepAliveIdle)
+        if setsockopt(
+          fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE, addr optval, sizeof(optval).SockLen
+        ) < 0:
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPIDLE: " & $strerror(errno)
+          )
+      if config.keepAliveInterval > 0:
+        optval = cint(config.keepAliveInterval)
+        if setsockopt(
+          fd,
+          cint(posix.IPPROTO_TCP),
+          TCP_KEEPINTVL,
+          addr optval,
+          sizeof(optval).SockLen,
+        ) < 0:
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
+          )
+      if config.keepAliveCount > 0:
+        optval = cint(config.keepAliveCount)
+        if setsockopt(
+          fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
+        ) < 0:
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
+          )
+    elif defined(macosx):
+      if config.keepAliveIdle > 0:
+        optval = cint(config.keepAliveIdle)
+        if setsockopt(
+          fd,
+          cint(posix.IPPROTO_TCP),
+          TCP_KEEPALIVE,
+          addr optval,
+          sizeof(optval).SockLen,
+        ) < 0:
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPALIVE: " & $strerror(errno)
+          )
+      if config.keepAliveInterval > 0:
+        optval = cint(config.keepAliveInterval)
+        if setsockopt(
+          fd,
+          cint(posix.IPPROTO_TCP),
+          TCP_KEEPINTVL,
+          addr optval,
+          sizeof(optval).SockLen,
+        ) < 0:
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
+          )
+      if config.keepAliveCount > 0:
+        optval = cint(config.keepAliveCount)
+        if setsockopt(
+          fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
+        ) < 0:
+          raise newException(
+            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
+          )
+    else:
+      if config.keepAliveIdle > 0 or config.keepAliveInterval > 0 or
+          config.keepAliveCount > 0:
+        {.
+          warning:
+            "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
+        .}

@@ -13,6 +13,9 @@ async_postgres/pg_types/*
 !async_postgres/pg_client/
 async_postgres/pg_client/*
 !async_postgres/pg_client/*.*
+!async_postgres/pg_connection/
+async_postgres/pg_connection/*
+!async_postgres/pg_connection/*.*
 !async_postgres/pg_pool_cluster/
 async_postgres/pg_pool_cluster/*
 !async_postgres/pg_pool_cluster/*.*
