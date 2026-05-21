@@ -10519,6 +10519,25 @@ suite "E2E: Numeric / binary / JSON array types":
 
     waitFor t()
 
+  test "hstore OID discovery respects search_path":
+    # to_regtype('hstore') must return NULL — and hstoreOid must stay 0 —
+    # when the connection's startup search_path excludes the schema where
+    # hstore is installed. Guards against regressing to a typname-only
+    # lookup that would resolve hstore regardless of search_path.
+    proc t() {.async.} =
+      let setup = await connect(plainConfig())
+      discard await setup.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      await setup.close()
+
+      var cfg = plainConfig()
+      cfg.extraParams = @[("search_path", "pg_catalog")]
+      let conn = await connect(cfg)
+      doAssert conn.hstoreOid == 0
+      doAssert conn.hstoreArrayOid == 0
+      await conn.close()
+
+    waitFor t()
+
   test "bytea array roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

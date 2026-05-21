@@ -371,7 +371,7 @@ proc connectToHost*(
     # Discover extension type OIDs (hstore, etc.)
     conn.state = csBusy
     await conn.sendMsg(
-      encodeQuery("SELECT oid, typarray FROM pg_type WHERE typname = 'hstore' LIMIT 1")
+      encodeQuery("SELECT oid, typarray FROM pg_type WHERE oid = to_regtype('hstore')")
     )
     block discoverLoop:
       while true:
