@@ -1268,7 +1268,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## BEGIN, COMMIT, and ROLLBACK only — it does **not** bound `body` operations
   ## or `pool.acquire()`. Worst-case wall-clock = acquire(unbounded) +
   ## BEGIN(≤timeout) + body(unbounded) + COMMIT(≤timeout)
-  ## [+ ROLLBACK(≤timeout) on failure]. Use `withTransactionDeadline` for a
+  ## \[+ ROLLBACK(≤timeout) on failure\]. Use `withTransactionDeadline` for a
   ## single wall-clock deadline covering acquire, BEGIN, body, and COMMIT.
   var connIdent, body: NimNode
   var beginSql: NimNode
