@@ -25,7 +25,7 @@ import std/[options, strutils]
 import ../[async_backend, pg_errors, pg_protocol, pg_types]
 import types, buffer_io
 
-if hasAsyncDispatch:
+when hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, SockType, Protocol
 
