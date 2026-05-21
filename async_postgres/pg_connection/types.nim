@@ -452,6 +452,7 @@ when hasChronos:
   type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
     ## Callback invoked once per row during `queryEach`. The `Row` is only valid
     ## inside the callback — its backing buffer is reused for the next row.
+
 else:
   type RowCallback* = proc(row: Row) {.gcsafe.}
     ## Callback invoked once per row during `queryEach`. The `Row` is only valid
@@ -465,6 +466,7 @@ when hasChronos:
   type CopyInCallback* =
     proc(): Future[seq[byte]] {.async: (raises: [CatchableError]), gcsafe.}
     ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
+
 else:
   type CopyOutCallback* = proc(data: seq[byte]): Future[void] {.gcsafe.}
     ## Callback receiving each chunk during streaming COPY OUT.
