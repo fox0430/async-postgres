@@ -90,8 +90,9 @@ proc main() {.async.} =
       if msgCount >= 10:
         await replConn.stopReplication()
     of rmkPrimaryKeepalive:
-      if msg.keepalive.replyRequested:
-        await replConn.sendStandbyStatus(msg.keepalive.walEnd)
+      # startReplication's autoKeepaliveReply (default) already responds with
+      # the highest receivedEndLsn observed so far. No manual reply needed.
+      discard
 
   echo "Starting replication from ", slot.consistentPoint
   echo "Insert rows into test_repl from another session to see changes..."

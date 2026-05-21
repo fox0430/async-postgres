@@ -9473,8 +9473,8 @@ suite "E2E: Logical Replication":
           else:
             discard
         of rmkPrimaryKeepalive:
-          if msg.keepalive.replyRequested:
-            await replConn.sendStandbyStatus(msg.keepalive.walEnd)
+          # autoKeepaliveReply (default) responds with receivedEndLsn.
+          discard
 
       # Insert a row from the writer connection after a short delay
       proc insertRow() {.async.} =
@@ -9524,8 +9524,8 @@ suite "E2E: Logical Replication":
         of rmkXLogData:
           await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
         of rmkPrimaryKeepalive:
-          # Stop immediately on first keepalive
-          await replConn.sendStandbyStatus(msg.keepalive.walEnd)
+          # Stop immediately on first keepalive.
+          # autoKeepaliveReply (default) handles the ACK with receivedEndLsn.
           await replConn.stopReplication()
 
       await replConn.startReplication(
