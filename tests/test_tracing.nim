@@ -923,8 +923,8 @@ suite "Tracing: transport close errors":
     # cannot catch regressions inside closeTransport itself (forgotten except
     # clause, new stage without a fire call, new closeWait without wiring).
     # This test reads the source and asserts the invariants mechanically.
-    const src = staticRead("../async_postgres/pg_connection.nim")
-    let body = src.split("proc closeTransport(")[1].split("\nproc ")[0]
+    const src = staticRead("../async_postgres/pg_connection/buffer_io.nim")
+    let body = src.split("proc closeTransport*(")[1].split("\nproc ")[0]
 
     for stage in [
       "tcsTlsReader", "tcsTlsWriter", "tcsBaseReader", "tcsBaseWriter", "tcsTransport"
