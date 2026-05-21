@@ -20,7 +20,14 @@ type
       ## Max connection lifetime (default 1hr, ZeroDuration=disabled)
     maintenanceInterval*: Duration ## Maintenance loop interval (default 30s)
     healthCheckTimeout*: Duration
-      ## Ping idle connections older than this before returning (default 5s, ZeroDuration=disabled)
+      ## Ping idle connections older than this before returning (default 5s, ZeroDuration=disabled).
+      ## Applies to plaintext connections. For TLS connections, see `tlsHealthCheckTimeout`.
+    tlsHealthCheckTimeout*: Duration
+      ## Same as `healthCheckTimeout` but for TLS connections (default 500ms,
+      ## ZeroDuration=disabled).
+      ## MSG_PEEK-based liveness detection is blind to TLS alerts and to any
+      ## ErrorResponse already encrypted into the TCP buffer, so TLS pools
+      ## need a much shorter idle window than plaintext to stay correct.
     pingTimeout*: Duration
       ## Max time to wait for a health check ping response (default 5s, ZeroDuration=no timeout)
     acquireTimeout*: Duration
@@ -111,6 +118,7 @@ proc initPoolConfig*(
     maxLifetime = hours(1),
     maintenanceInterval = seconds(30),
     healthCheckTimeout = seconds(5),
+    tlsHealthCheckTimeout = milliseconds(500),
     pingTimeout = seconds(5),
     acquireTimeout = seconds(30),
     maxWaiters = -1,
@@ -144,6 +152,10 @@ proc initPoolConfig*(
     raise newException(ValueError, "connectBackoffInitial must be >= 0")
   if connectBackoffMax < connectBackoffInitial:
     raise newException(ValueError, "connectBackoffMax must be >= connectBackoffInitial")
+  if healthCheckTimeout < ZeroDuration:
+    raise newException(ValueError, "healthCheckTimeout must be >= 0")
+  if tlsHealthCheckTimeout < ZeroDuration:
+    raise newException(ValueError, "tlsHealthCheckTimeout must be >= 0")
 
   PoolConfig(
     connConfig: connConfig,
@@ -153,6 +165,7 @@ proc initPoolConfig*(
     maxLifetime: maxLifetime,
     maintenanceInterval: maintenanceInterval,
     healthCheckTimeout: healthCheckTimeout,
+    tlsHealthCheckTimeout: tlsHealthCheckTimeout,
     pingTimeout: pingTimeout,
     acquireTimeout: acquireTimeout,
     maxWaiters: maxWaiters,
@@ -624,9 +637,16 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
         continue
-      # Health check: ping connections that have been idle too long
-      if pool.config.healthCheckTimeout > ZeroDuration and
-          pool.cachedNow - pc.lastUsedAt > pool.config.healthCheckTimeout:
+      # Health check: ping connections that have been idle too long.
+      # TLS connections use the tighter `tlsHealthCheckTimeout` window because
+      # the MSG_PEEK probe above cannot see TLS alerts or any ErrorResponse
+      # already encrypted into the TCP buffer — only a real round-trip can.
+      let idleThreshold =
+        if pc.conn.sslEnabled:
+          pool.config.tlsHealthCheckTimeout
+        else:
+          pool.config.healthCheckTimeout
+      if idleThreshold > ZeroDuration and pool.cachedNow - pc.lastUsedAt > idleThreshold:
         try:
           await pc.conn.ping(pool.config.pingTimeout)
         except CatchableError:

@@ -138,6 +138,7 @@ suite "initPoolConfig":
     check cfg.maxLifetime == hours(1)
     check cfg.maintenanceInterval == seconds(30)
     check cfg.healthCheckTimeout == seconds(5)
+    check cfg.tlsHealthCheckTimeout == milliseconds(500)
     check cfg.pingTimeout == seconds(5)
     check cfg.acquireTimeout == seconds(30)
     check cfg.maxWaiters == -1
@@ -157,6 +158,7 @@ suite "initPoolConfig":
     # Non-overridden fields keep defaults
     check cfg.maxLifetime == hours(1)
     check cfg.healthCheckTimeout == seconds(5)
+    check cfg.tlsHealthCheckTimeout == milliseconds(500)
 
   test "validation: minSize < 0":
     expect(ValueError):
@@ -175,6 +177,20 @@ suite "initPoolConfig":
   test "validation: maxWaiters < -1":
     expect(ValueError):
       discard initPoolConfig(ConnConfig(host: "localhost", port: 5432), maxWaiters = -2)
+
+  test "validation: tlsHealthCheckTimeout < 0":
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432),
+        tlsHealthCheckTimeout = milliseconds(-1),
+      )
+
+  test "tlsHealthCheckTimeout custom override":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432),
+      tlsHealthCheckTimeout = milliseconds(100),
+    )
+    check cfg.tlsHealthCheckTimeout == milliseconds(100)
 
   test "validation: minSize = 0 is valid":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432), minSize = 0)
