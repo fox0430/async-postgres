@@ -68,7 +68,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## **Timeout semantics:** The `timeout` argument applies *per-call* to
   ## BEGIN, COMMIT, and ROLLBACK only — it does **not** bound `body` operations.
   ## Worst-case wall-clock = BEGIN(≤timeout) + body(unbounded) +
-  ## COMMIT(≤timeout) [+ ROLLBACK(≤timeout) on failure]. Use
+  ## COMMIT(≤timeout) \[+ ROLLBACK(≤timeout) on failure\]. Use
   ## `withTransactionDeadline` for a single wall-clock deadline covering
   ## BEGIN, body, and COMMIT together.
   ##
