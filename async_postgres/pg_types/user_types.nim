@@ -149,6 +149,7 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[T](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -175,6 +176,7 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[T]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
