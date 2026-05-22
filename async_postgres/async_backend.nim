@@ -57,6 +57,7 @@ when hasChronos:
     )
 
 elif hasAsyncDispatch:
+  {.warning: "asyncdispatch backend does not support cancellation".}
   import std/[asyncdispatch, monotimes]
   export asyncdispatch
 
