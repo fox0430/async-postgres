@@ -110,9 +110,9 @@
 ## ``sql"..."``, ``query``/``exec``, and ``queryDirect``/``execDirect`` share
 ## the per-connection prepared-statement cache; ``simpleQuery``/``simpleExec``
 ## use the simple protocol and are not cached. A ``timeout`` parameter is
-## accepted by ``query``/``exec`` and ``simpleExec``; on timeout the
-## connection is marked closed because the wire protocol desynchronises.
-## ``queryDirect``/``execDirect`` and ``simpleQuery`` currently do not accept
+## accepted by ``query``/``exec``, ``queryDirect``/``execDirect``, and
+## ``simpleExec``; on timeout the connection is marked closed because the
+## wire protocol desynchronises. ``simpleQuery`` currently does not accept
 ## a timeout.
 ##
 ## Modules
