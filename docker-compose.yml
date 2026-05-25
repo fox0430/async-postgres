@@ -11,6 +11,7 @@ services:
       - ./tests/certs/server.crt:/tmp/certs/server.crt:ro
       - ./tests/certs/server.key:/tmp/certs/server.key:ro
       - ./tests/certs/ca.crt:/tmp/certs/ca.crt:ro
+      - ./tests/pg_init/10-physical-replication-hba.sh:/docker-entrypoint-initdb.d/10-physical-replication-hba.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U test"]
       interval: 2s

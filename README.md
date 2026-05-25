@@ -28,7 +28,7 @@ Async PostgreSQL client in Nim.
 - Large Object API (streaming binary data)
 - LISTEN/NOTIFY with auto-reconnect
 - Advisory locks (session/transaction, exclusive/shared)
-- Logical replication with pgoutput decoder
+- Logical and physical replication (pgoutput decoder for logical streams; raw WAL streaming, slot-less or slot-based, with optional `TIMELINE` for physical)
 
 ### Types
 - Typed parameters (`pgParams` / `toPgParam`) and row accessors (`getStr`, `getInt`, ...)

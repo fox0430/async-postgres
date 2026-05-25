@@ -22,6 +22,8 @@ async_postgres/pg_pool_cluster/*
 
 tests/*
 !tests/*.*
+!tests/pg_init/
+!tests/pg_init/*
 
 examples/*
 !examples/*.*

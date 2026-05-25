@@ -9590,6 +9590,122 @@ suite "E2E: Logical Replication":
 
     waitFor t()
 
+suite "E2E: Physical Replication":
+  test "connectReplication(rmPhysical) + identifySystem":
+    proc t() {.async.} =
+      let conn = await connectReplication(plainConfig(), rmPhysical)
+      let info = await conn.identifySystem()
+      doAssert info.systemId.len > 0
+      doAssert info.timeline >= 1
+      doAssert info.xLogPos != InvalidLsn
+      # Physical connections are not bound to a database; dbName should be empty.
+      doAssert info.dbName == ""
+      await conn.close()
+
+    waitFor t()
+
+  test "physical streaming receives WAL and returns to csReady":
+    proc t() {.async.} =
+      # Writer connection (regular SQL) to generate WAL traffic.
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery("DROP TABLE IF EXISTS test_phys_repl")
+      discard await writer.simpleQuery(
+        "CREATE TABLE test_phys_repl (id serial PRIMARY KEY, val text)"
+      )
+
+      let replConn = await connectReplication(plainConfig(), rmPhysical)
+      let info = await replConn.identifySystem()
+      let startLsn = info.xLogPos
+
+      var gotWal = false
+      var byteCount = 0
+
+      let cb = makeReplicationCallback:
+        case msg.kind
+        of rmkXLogData:
+          if msg.xlogData.data.len > 0:
+            gotWal = true
+            byteCount += msg.xlogData.data.len
+            await replConn.stopReplication()
+        of rmkPrimaryKeepalive:
+          # autoKeepaliveReply (default) handles the ACK.
+          discard
+
+      proc insertRows() {.async.} =
+        await sleepAsync(milliseconds(200))
+        for i in 0 ..< 5:
+          discard await writer.simpleQuery(
+            "INSERT INTO test_phys_repl (val) VALUES ('phys" & $i & "')"
+          )
+
+      let insertFut = insertRows()
+
+      await replConn.startPhysicalReplication(startLsn = startLsn, callback = cb)
+
+      await insertFut
+
+      doAssert gotWal, "Expected at least one XLogData with WAL bytes"
+      doAssert byteCount > 0
+      doAssert replConn.state == csReady
+
+      await replConn.close()
+
+      discard await writer.simpleQuery("DROP TABLE test_phys_repl")
+      await writer.close()
+
+    waitFor t()
+
+  test "sendCopyData requires csReplicating state":
+    proc t() {.async.} =
+      let conn = await connectReplication(plainConfig(), rmPhysical)
+      var raised = false
+      try:
+        await conn.sendCopyData(@[byte('x')])
+      except PgConnectionError:
+        raised = true
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "physical replication slot create -> stream -> drop":
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      # Ensure the slot does not exist from a prior failed run.
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_e2e') " &
+          "FROM pg_replication_slots WHERE slot_name = 'test_phys_e2e'"
+      )
+      discard await writer.simpleQuery(
+        "SELECT pg_create_physical_replication_slot('test_phys_e2e')"
+      )
+
+      let replConn = await connectReplication(plainConfig(), rmPhysical)
+      let info = await replConn.identifySystem()
+      let startLsn = info.xLogPos
+
+      let cb = makeReplicationCallback:
+        # Stop on the very first message of any kind to keep the test snappy.
+        case msg.kind
+        of rmkXLogData, rmkPrimaryKeepalive:
+          await replConn.stopReplication()
+
+      # Generate a bit of WAL so the server has something to send.
+      discard await writer.simpleQuery("CHECKPOINT")
+      discard await writer.simpleQuery("SELECT pg_switch_wal()")
+
+      await replConn.startPhysicalReplication(
+        startLsn = startLsn, slotName = "test_phys_e2e", callback = cb
+      )
+      doAssert replConn.state == csReady
+      await replConn.close()
+
+      discard
+        await writer.simpleQuery("SELECT pg_drop_replication_slot('test_phys_e2e')")
+      await writer.close()
+
+    waitFor t()
+
 # User-defined type definitions for e2e tests (macros must be at top level)
 type
   TestPoint = object
