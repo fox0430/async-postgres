@@ -368,7 +368,19 @@ proc connectToHost*(
             discard
         await conn.fillRecvBuf()
 
-    # Discover extension type OIDs (hstore, etc.)
+    # Discover extension type OIDs (hstore, etc.).
+    # Physical replication connections (``replication=true``) reject any SQL
+    # other than replication commands, so we skip the discovery — hstore is
+    # never relevant on a physical streaming connection anyway. PostgreSQL
+    # treats ``replication`` parameter values case-insensitively, so do the
+    # same here.
+    var isPhysicalReplication = false
+    for (k, v) in config.extraParams:
+      if cmpIgnoreCase(k, "replication") == 0 and cmpIgnoreCase(v, "true") == 0:
+        isPhysicalReplication = true
+        break
+    if isPhysicalReplication:
+      return conn
     conn.state = csBusy
     await conn.sendMsg(
       encodeQuery("SELECT oid, typarray FROM pg_type WHERE oid = to_regtype('hstore')")

@@ -67,6 +67,18 @@ type
     xLogPos*: Lsn
     dbName*: string
 
+  ReplicationMode* = enum
+    ## Replication mode selected at connection time.
+    ## ``rmDatabase`` sends ``replication=database`` (logical replication +
+    ## ability to run SQL on the chosen database). ``rmPhysical`` sends
+    ## ``replication=true`` (physical replication; no SQL on user databases).
+    rmDatabase
+    rmPhysical
+
+  TimelineHistory* = object ## Result of TIMELINE_HISTORY command.
+    filename*: string ## Timeline history file name (e.g. "00000002.history").
+    content*: seq[byte] ## Raw history file content.
+
   # pgoutput decoder types
   PgOutputMessageKind* = enum
     ## Message types within the pgoutput logical decoding plugin.
@@ -436,17 +448,31 @@ template makeReplicationCallback*(body: untyped): ReplicationCallback =
 
 # Replication connection
 
-proc connectReplication*(config: ConnConfig): Future[PgConnection] =
-  ## Connect to PostgreSQL with ``replication=database`` in startup parameters.
-  ## This enables replication commands (IDENTIFY_SYSTEM, CREATE_REPLICATION_SLOT, etc.).
+proc replicationParamValue(mode: ReplicationMode): string {.inline.} =
+  case mode
+  of rmDatabase: "database"
+  of rmPhysical: "true"
+
+proc connectReplication*(
+    config: ConnConfig, mode: ReplicationMode = rmDatabase
+): Future[PgConnection] =
+  ## Connect to PostgreSQL with the ``replication`` startup parameter set.
+  ## ``rmDatabase`` enables logical replication commands (IDENTIFY_SYSTEM,
+  ## CREATE_REPLICATION_SLOT, START_REPLICATION ... LOGICAL, etc.) against
+  ## the chosen database. ``rmPhysical`` opens a physical replication
+  ## connection (``replication=true``); only replication commands work — no
+  ## SQL on user databases is permitted.
   var cfg = config
-  cfg.extraParams.add(("replication", "database"))
+  cfg.extraParams.add(("replication", replicationParamValue(mode)))
   connect(cfg)
 
-proc connectReplication*(dsn: string): Future[PgConnection] =
-  ## Connect to PostgreSQL with ``replication=database`` using a DSN string.
+proc connectReplication*(
+    dsn: string, mode: ReplicationMode = rmDatabase
+): Future[PgConnection] =
+  ## DSN-string variant of ``connectReplication``. See the ``ConnConfig``
+  ## overload for the meaning of ``mode``.
   var cfg = parseDsn(dsn)
-  cfg.extraParams.add(("replication", "database"))
+  cfg.extraParams.add(("replication", replicationParamValue(mode)))
   connect(cfg)
 
 # Replication commands (via simple query protocol)
@@ -462,7 +488,9 @@ proc identifySystem*(conn: PgConnection): Future[SystemInfo] {.async.} =
   info.systemId = row.getStr(0)
   info.timeline = parseInt(row.getStr(1)).int32
   info.xLogPos = parseLsn(row.getStr(2))
-  if qr.fields.len > 3:
+  # On physical replication connections (``replication=true``) the dbName
+  # column is NULL because the session is not bound to a database.
+  if qr.fields.len > 3 and not row.isNull(3):
     info.dbName = row.getStr(3)
   return info
 
@@ -519,6 +547,26 @@ proc readReplicationSlot*(
     info.consistentPoint = parseLsn(row.getStr(1))
   return info
 
+proc timelineHistory*(
+    conn: PgConnection, timeline: int32
+): Future[TimelineHistory] {.async.} =
+  ## Execute ``TIMELINE_HISTORY <tli>`` and return the history file metadata
+  ## plus its raw contents. Required when a physical standby needs to follow
+  ## a timeline switch on the primary.
+  if timeline <= 0:
+    raise newException(ValueError, "timeline must be > 0, got " & $timeline)
+  let results = await conn.simpleQuery("TIMELINE_HISTORY " & $timeline)
+  if results.len == 0 or results[0].rowCount == 0:
+    raise newException(PgConnectionError, "TIMELINE_HISTORY returned no results")
+  let qr = results[0]
+  let row = initRow(qr.data, 0)
+  var info = TimelineHistory()
+  if not row.isNull(0):
+    info.filename = row.getStr(0)
+  if not row.isNull(1):
+    info.content = row.getBytes(1)
+  return info
+
 # Replication streaming
 
 proc parseReplicationMessage*(copyData: seq[byte]): ReplicationMessage =
@@ -548,6 +596,26 @@ proc parseReplicationMessage*(copyData: seq[byte]): ReplicationMessage =
     ReplicationMessage(kind: rmkPrimaryKeepalive, keepalive: ka)
   else:
     raise newException(ProtocolError, "Unknown replication message type: " & kind)
+
+proc sendCopyData*(conn: PgConnection, data: openArray[byte]): Future[void] =
+  ## Send a raw CopyData frame to the server during a CopyBoth stream
+  ## (i.e. while the connection is in ``csReplicating``). Useful for protocols
+  ## layered on top of CopyBoth — for example, physical replication
+  ## acknowledgements or custom replication plugins that exchange messages
+  ## the library does not know about. For Standby Status Updates, prefer
+  ## ``sendStandbyStatus`` which builds the payload for you.
+  ##
+  ## ``data`` is encoded into a CopyData frame synchronously *before* the
+  ## first async suspension, so the caller's buffer does not need to outlive
+  ## the returned ``Future``.
+  if conn.state != csReplicating:
+    raise newException(
+      PgConnectionError,
+      "sendCopyData: connection is not in replicating state (state: " & $conn.state & ")",
+    )
+  var buf: seq[byte]
+  encodeCopyData(buf, data)
+  conn.sendMsg(buf)
 
 proc sendStandbyStatus*(
     conn: PgConnection,
@@ -640,8 +708,9 @@ proc startReplication*(
 
   await conn.sendMsg(encodeQuery(sql))
 
-  # Wait for CopyBothResponse
-  var gotCopyBoth = false
+  # Wait for CopyBothResponse. The block exits only via the CopyBothResponse
+  # break or by raising — fillRecvBuf re-raises connection errors, and a
+  # ReadyForQuery before CopyBothResponse always raises.
   var queryError: ref PgQueryError
 
   block waitCopyBoth:
@@ -650,7 +719,6 @@ proc startReplication*(
         let msg = opt.get
         case msg.kind
         of bmkCopyBothResponse:
-          gotCopyBoth = true
           conn.state = csReplicating
           break waitCopyBoth
         of bmkErrorResponse:
@@ -666,9 +734,6 @@ proc startReplication*(
         else:
           discard
       await conn.fillRecvBuf()
-
-  if not gotCopyBoth:
-    return
 
   # Highest end LSN of WAL data actually received from the wire — computed as
   # XLogData.startLsn + data.len, *not* XLogData.walEnd. ``walEnd`` is the
@@ -742,3 +807,130 @@ proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
         ")",
     )
   await conn.sendMsg(@copyDoneMsg)
+
+proc startPhysicalReplication*(
+    conn: PgConnection,
+    startLsn: Lsn,
+    slotName: string = "",
+    timeline: int32 = 0,
+    autoKeepaliveReply: bool = true,
+    callback: ReplicationCallback,
+): Future[void] {.async.} =
+  ## Begin **physical** replication streaming.
+  ##
+  ## ``slotName`` is optional; pass ``""`` for a slot-less stream. ``timeline``
+  ## is appended as ``TIMELINE n`` when non-zero — useful when the standby is
+  ## following a specific timeline and must abort if the primary advanced past
+  ## it.
+  ##
+  ## The callback contract matches ``startReplication``: each ``XLogData`` or
+  ## ``PrimaryKeepalive`` is delivered as a ``ReplicationMessage``. The raw
+  ## WAL bytes inside ``XLogData.data`` are the physical WAL stream; no
+  ## pgoutput decoding applies.
+  ##
+  ## ``autoKeepaliveReply`` behaves identically to ``startReplication``: when
+  ## true, ``PrimaryKeepalive(replyRequested=true)`` is acknowledged with the
+  ## highest observed ``receivedEndLsn`` before the callback is invoked.
+  ##
+  ## On a timeline switch the server may send a final result set describing
+  ## the next timeline (``RowDescription`` + ``DataRow`` + ``CommandComplete``)
+  ## between ``CopyDone`` and ``ReadyForQuery``. This proc drains and discards
+  ## those messages; callers that need the next-timeline information should
+  ## re-issue ``IDENTIFY_SYSTEM`` after this proc returns.
+  conn.checkReady()
+  conn.state = csBusy
+
+  var sql = "START_REPLICATION"
+  if slotName.len > 0:
+    sql.add(" SLOT " & quoteIdentifier(slotName))
+  sql.add(" PHYSICAL " & $startLsn)
+  if timeline > 0:
+    sql.add(" TIMELINE " & $timeline)
+
+  await conn.sendMsg(encodeQuery(sql))
+
+  # See startReplication for the invariants of this block — it can only exit
+  # via the CopyBothResponse break or by raising.
+  var queryError: ref PgQueryError
+
+  block waitCopyBoth:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCopyBothResponse:
+          conn.state = csReplicating
+          break waitCopyBoth
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            raise queryError
+          raise newException(
+            PgConnectionError,
+            "START_REPLICATION PHYSICAL ended without CopyBothResponse",
+          )
+        else:
+          discard
+      await conn.fillRecvBuf()
+
+  # Highest end LSN of WAL data actually received — see startReplication for
+  # why we track ``startLsn + data.len`` rather than ``walEnd``.
+  var lastReceivedLsn: Lsn = startLsn
+
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCopyData:
+          let replMsg = parseReplicationMessage(msg.copyData)
+          case replMsg.kind
+          of rmkXLogData:
+            let received = replMsg.xlogData.receivedEndLsn
+            if received > lastReceivedLsn:
+              lastReceivedLsn = received
+          of rmkPrimaryKeepalive:
+            if autoKeepaliveReply and replMsg.keepalive.replyRequested:
+              await sendStandbyStatus(conn, lastReceivedLsn)
+          await callback(replMsg)
+        of bmkCopyDone:
+          await conn.sendMsg(@copyDoneMsg)
+          break recvLoop
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            raise queryError
+          return
+        else:
+          discard
+      if conn.state == csClosed:
+        raise newException(
+          PgConnectionError, "Connection closed during physical replication"
+        )
+      await conn.fillRecvBuf()
+
+  # After CopyDone, drain to ReadyForQuery. Accept the optional timeline-switch
+  # result set (RowDescription + DataRow + CommandComplete) the server emits
+  # when the stream stopped because the standby reached the end of a timeline.
+  block drainLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            raise queryError
+          break drainLoop
+        else:
+          discard
+      await conn.fillRecvBuf()
