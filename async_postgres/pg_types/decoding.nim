@@ -1,9 +1,9 @@
 import std/[options, strutils, tables, times, net]
 
 import ../pg_bytes
-import ./core
+import core, array
 
-export pg_bytes
+export pg_bytes, array
 
 proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
   ## Decode PostgreSQL binary hstore format.
@@ -179,35 +179,58 @@ proc decodePointBinary*(data: openArray[byte], off: int): PgPoint =
 
 proc decodeBinaryArray*(
     data: openArray[byte]
-): tuple[elemOid: int32, elements: seq[tuple[off: RelOff, len: int]]] =
-  ## Decode a PostgreSQL binary array, returning element OID and (offset, length) pairs.
-  ## Offsets are relative to the start of `data` (typed as ``RelOff``); recover
-  ## the absolute parent-buffer offset with ``parentOff + e.off``.
+): tuple[
+  elemOid: int32,
+  dims: seq[int32],
+  lowerBounds: seq[int32],
+  elements: seq[tuple[off: RelOff, len: int]],
+] =
+  ## Decode a PostgreSQL binary array header into element OID, per-dimension
+  ## length and lower bound, and ``(offset, length)`` pairs for each element
+  ## in row-major order. Offsets are relative to the start of ``data`` (typed
+  ## as ``RelOff``); recover the absolute parent-buffer offset via
+  ## ``parentOff + e.off``. An element ``len`` of ``-1`` represents NULL.
+  ##
+  ## ``ndim`` may be ``0..PgArrayMaxDim``; arrays with more dimensions than
+  ## PostgreSQL's ``MAXDIM`` are rejected. For an empty array
+  ## (``ndim=0``) ``dims``, ``lowerBounds`` and ``elements`` are all empty.
   if data.len < 12:
     raise newException(PgTypeError, "Binary array too short")
   let ndim = fromBE32(data.toOpenArray(0, 3))
   # has_null at offset 4
   result.elemOid = fromBE32(data.toOpenArray(8, 11))
+  if ndim < 0:
+    raise newException(PgTypeError, "Binary array: invalid ndim " & $ndim)
+  if ndim > PgArrayMaxDim:
+    raise newException(
+      PgTypeError,
+      "Binary array: ndim=" & $ndim & " exceeds MAXDIM (" & $PgArrayMaxDim & ")",
+    )
   if ndim == 0:
+    result.dims = @[]
+    result.lowerBounds = @[]
     result.elements = @[]
     return
-  if ndim != 1:
-    raise
-      newException(PgTypeError, "Multi-dimensional arrays not supported, ndim=" & $ndim)
-  if data.len < 20:
+  let headerSize = 12 + 8 * int(ndim)
+  if data.len < headerSize:
     raise newException(PgTypeError, "Binary array header too short")
-  let dimLen = int(fromBE32(data.toOpenArray(12, 15)))
-  if dimLen < 0:
-    raise newException(PgTypeError, "Binary array: invalid dimension length " & $dimLen)
-  # Each element carries at least a 4-byte length prefix after the 20-byte
-  # header, so dimLen cannot exceed (data.len - 20) div 4. This guard stops a
-  # crafted header from triggering a multi-GB allocation on malformed input.
-  if dimLen > (data.len - 20) div 4:
+  result.dims = newSeq[int32](ndim)
+  result.lowerBounds = newSeq[int32](ndim)
+  for d in 0 ..< int(ndim):
+    result.dims[d] = fromBE32(data.toOpenArray(12 + d * 8, 15 + d * 8))
+    result.lowerBounds[d] = fromBE32(data.toOpenArray(16 + d * 8, 19 + d * 8))
+  # Delegate per-dim ``> 0`` and product-overflow checks to expectedElemCount
+  # so encoder and decoder share one source of truth (raises PgTypeError).
+  let totalInt = expectedElemCount(result.dims)
+  # Each element carries at least a 4-byte length prefix after the header,
+  # so totalInt cannot exceed (data.len - headerSize) div 4. This guard
+  # stops a crafted header from triggering a multi-GB allocation on
+  # malformed input.
+  if totalInt > (data.len - headerSize) div 4:
     raise newException(PgTypeError, "Binary array: dimension length exceeds data")
-  # lower_bound at offset 16, ignored
-  result.elements = newSeq[tuple[off: RelOff, len: int]](dimLen)
-  var pos = 20
-  for i in 0 ..< dimLen:
+  result.elements = newSeq[tuple[off: RelOff, len: int]](totalInt)
+  var pos = headerSize
+  for i in 0 ..< totalInt:
     if pos + 4 > data.len:
       raise newException(PgTypeError, "Binary array truncated at element " & $i)
     let eLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
@@ -221,6 +244,26 @@ proc decodeBinaryArray*(
         raise newException(PgTypeError, "Binary array: element data truncated at " & $i)
       result.elements[i] = (off: RelOff(pos), len: eLen)
       pos += eLen
+
+proc rejectMultiDim*(
+    decoded:
+      tuple[
+        elemOid: int32,
+        dims: seq[int32],
+        lowerBounds: seq[int32],
+        elements: seq[tuple[off: RelOff, len: int]],
+      ]
+) =
+  ## Raise ``PgTypeError`` when ``decoded`` represents a multi-dimensional
+  ## array, since the 1-D ``getXxxArray`` accessors cannot flatten the result
+  ## without losing the shape. ``ndim=0`` (empty array) is allowed. Callers
+  ## that want multi-dim support should use the ``PgArray[T]`` accessors.
+  if decoded.dims.len > 1:
+    raise newException(
+      PgTypeError,
+      "Multi-dimensional array (ndim=" & $decoded.dims.len &
+        ") cannot be read as seq; use the PgArray[T] accessor instead",
+    )
 
 proc decodeBinaryComposite*(
     data: openArray[byte]

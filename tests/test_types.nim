@@ -16,6 +16,22 @@ type
   BigCount = distinct int64
   IsActive = distinct bool
 
+# Test-local shims for the legacy 1-D ``encodeBinaryArray`` and
+# ``encodeBinaryArrayEmpty`` shapes that were removed when the encoder was
+# generalized to N dimensions. They delegate to the new N-D entry point so
+# the existing fixture-style tests below keep working unchanged.
+proc encodeBinaryArrayEmpty(elemOid: int32): seq[byte] =
+  encodeBinaryArray(elemOid, newSeq[int32](), newSeq[Option[seq[byte]]]())
+
+proc encodeBinaryArray(elemOid: int32, elements: seq[seq[byte]]): seq[byte] =
+  var opts = newSeq[Option[seq[byte]]](elements.len)
+  for i, e in elements:
+    opts[i] = some(e)
+  encodeBinaryArray(elemOid, dimsFor1D(elements.len), opts)
+
+proc encodeBinaryArray(elemOid: int32, elements: seq[Option[seq[byte]]]): seq[byte] =
+  encodeBinaryArray(elemOid, dimsFor1D(elements.len), elements)
+
 proc `==`(a, b: UsPostalCode): bool {.borrow.}
 proc `==`(a, b: SmallCount): bool {.borrow.}
 proc `==`(a, b: PositiveInt): bool {.borrow.}
@@ -7024,3 +7040,788 @@ suite "enum arrays":
     except ValueError:
       raised = true
     check raised
+
+suite "PgArray[T] construction and validation":
+  test "pgArray 1D from non-NULL elements":
+    let a = pgArray(@[1'i32, 2, 3, 4])
+    check a.dims == @[4'i32]
+    check a.lowerBounds == @[1'i32]
+    check a.elements.len == 4
+    check a.elements[0] == some(1'i32)
+    check a.elements[3] == some(4'i32)
+    check a.ndim == 1
+    check not a.isEmpty
+
+  test "pgArray 1D from Option elements":
+    let a = pgArray(@[some(1'i32), none(int32), some(3'i32)])
+    check a.dims == @[3'i32]
+    check a.elements[1] == none(int32)
+
+  test "pgArray 1D empty":
+    let a = pgArray(newSeq[int32]())
+    check a.dims.len == 0
+    check a.lowerBounds.len == 0
+    check a.elements.len == 0
+    check a.isEmpty
+    check a.ndim == 0
+
+  test "pgArray 2D rectangular":
+    let a = pgArray(@[2'i32, 3], @[1'i32, 2, 3, 4, 5, 6])
+    check a.dims == @[2'i32, 3]
+    check a.lowerBounds == @[1'i32, 1]
+    check a.elements.len == 6
+    check a.ndim == 2
+
+  test "pgArray 2D with NULL elements":
+    let a = pgArray(@[2'i32, 2], @[some(1'i32), none(int32), some(3'i32), some(4'i32)])
+    check a.dims == @[2'i32, 2]
+    check a.elements[1] == none(int32)
+
+  test "pgArray validates length mismatch":
+    expect PgError:
+      discard pgArray(@[2'i32, 3], @[1'i32, 2, 3]) # 6 expected, 3 given
+
+  test "pgArray length mismatch with empty elements hints at dims = @[]":
+    # Non-empty dims + empty elements is a common API misuse; the error
+    # message should point users at the ``dims = @[]`` empty-array form
+    # instead of just reporting the count mismatch.
+    var raised = false
+    try:
+      discard pgArray(@[3'i32], newSeq[Option[int32]]())
+    except PgError as e:
+      raised = true
+      check "dims = @[]" in e.msg
+    check raised
+
+  test "pgArray validates dims/lowerBounds length mismatch":
+    expect PgError:
+      discard pgArray(
+        @[2'i32, 3],
+        @[1'i32],
+        @[some(1'i32), some(2'i32), some(3'i32), some(4'i32), some(5'i32), some(6'i32)],
+      )
+
+  test "pgArray rejects too many dimensions":
+    expect PgError:
+      discard pgArray(@[1'i32, 1, 1, 1, 1, 1, 1], @[1'i32])
+
+  test "pgArray rejects zero-sized dimension":
+    # Empty arrays must use dims = @[] (ndim = 0), not a zero dim_len.
+    expect PgError:
+      discard pgArray(@[3'i32, 0], newSeq[Option[int32]]())
+    expect PgError:
+      discard pgArray(@[0'i32], newSeq[Option[int32]]())
+
+  test "pgArray with explicit lowerBounds":
+    let a = pgArray(@[3'i32], @[2'i32], @[some(10'i32), some(20'i32), some(30'i32)])
+    check a.lowerBounds == @[2'i32]
+
+  test "expectedElemCount product":
+    check expectedElemCount(@[]) == 0
+    check expectedElemCount(@[5'i32]) == 5
+    check expectedElemCount(@[2'i32, 3]) == 6
+    check expectedElemCount(@[2'i32, 3, 4]) == 24
+
+  test "expectedElemCount rejects negative":
+    expect PgError:
+      discard expectedElemCount(@[-1'i32])
+
+  test "expectedElemCount rejects overflow":
+    expect PgError:
+      discard expectedElemCount(@[int32.high, 2'i32])
+
+suite "PgArray[T] toPgParam":
+  test "toPgParam PgArray[int32] 1D":
+    let p = toPgParam(pgArray(@[10'i32, 20, 30]))
+    check p.oid == OidInt4Array
+    check p.format == 1
+    let data = p.value.get
+    check fromBE32(data.toOpenArray(0, 3)) == 1'i32 # ndim
+    check fromBE32(data.toOpenArray(12, 15)) == 3'i32 # dim_len
+    check fromBE32(data.toOpenArray(16, 19)) == 1'i32 # lower_bound
+    # decode first element
+    let dec = decodeBinaryArray(data)
+    check dec.dims == @[3'i32]
+    check dec.elements.len == 3
+
+  test "toPgParam PgArray[int32] 2D wire format":
+    let a = pgArray(@[2'i32, 2], @[1'i32, 2, 3, 4])
+    let p = toPgParam(a)
+    check p.oid == OidInt4Array
+    let data = p.value.get
+    # Header: 12 + 8*2 = 28 bytes
+    check fromBE32(data.toOpenArray(0, 3)) == 2'i32 # ndim
+    check fromBE32(data.toOpenArray(4, 7)) == 0'i32 # has_null
+    check fromBE32(data.toOpenArray(8, 11)) == OidInt4 # elem_oid
+    check fromBE32(data.toOpenArray(12, 15)) == 2'i32 # dim_len[0]
+    check fromBE32(data.toOpenArray(16, 19)) == 1'i32 # lower_bound[0]
+    check fromBE32(data.toOpenArray(20, 23)) == 2'i32 # dim_len[1]
+    check fromBE32(data.toOpenArray(24, 27)) == 1'i32 # lower_bound[1]
+    # 4 elements * 8 bytes (len + payload) = 32 bytes total payload
+    check data.len == 28 + 32
+
+  test "toPgParam empty PgArray[string]":
+    let a = pgArray(newSeq[string]())
+    let p = toPgParam(a)
+    check p.oid == OidTextArray
+    let data = p.value.get
+    check fromBE32(data.toOpenArray(0, 3)) == 0'i32 # ndim=0
+    check data.len == 12
+
+  test "toPgParam PgArray with NULL elements sets has_null":
+    let a = pgArray(@[some(1'i32), none(int32), some(3'i32)])
+    let p = toPgParam(a)
+    let data = p.value.get
+    check fromBE32(data.toOpenArray(4, 7)) == 1'i32
+
+  test "toPgParam PgArray[bool] 3D":
+    let a =
+      pgArray(@[2'i32, 2, 2], @[true, false, true, false, false, true, true, true])
+    let p = toPgParam(a)
+    check p.oid == OidBoolArray
+    let data = p.value.get
+    check fromBE32(data.toOpenArray(0, 3)) == 3'i32 # ndim
+    # header = 12 + 8*3 = 36, then 8 elements * 5 bytes (len+1) = 40
+    check data.len == 36 + 40
+
+suite "PgArray[T] decode and getArrayND":
+  test "getArrayND[int32] 1D roundtrip":
+    let src = pgArray(@[100'i32, 200, 300])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[int32](row, 0)
+    check got == src
+
+  test "getArrayND[int32] 2D roundtrip":
+    let src = pgArray(@[2'i32, 3], @[1'i32, 2, 3, 4, 5, 6])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[int32](row, 0)
+    check got == src
+    check got.dims == @[2'i32, 3]
+    check got.elements.len == 6
+    check got.elements[5] == some(6'i32)
+
+  test "getArrayND[string] 2D with NULLs":
+    let src = pgArray(@[2'i32, 2], @[some("a"), none(string), some("c"), some("d")])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidTextArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[string](row, 0)
+    check got.dims == @[2'i32, 2]
+    check got.elements[1] == none(string)
+    check got.elements[2] == some("c")
+
+  test "getArrayND[int32] empty":
+    let src = pgArray(newSeq[int32]())
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[int32](row, 0)
+    check got.isEmpty
+
+  test "1D getIntArray rejects multi-dim with clear error":
+    let src = pgArray(@[2'i32, 2], @[1'i32, 2, 3, 4])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getIntArray(0)
+
+  test "getArrayND[int32] non-default lowerBounds preserved":
+    let src = pgArray(@[3'i32], @[5'i32], @[some(10'i32), some(20'i32), some(30'i32)])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[int32](row, 0)
+    check got.lowerBounds == @[5'i32]
+    check got.dims == @[3'i32]
+
+  test "getArrayNDOpt none":
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check getArrayNDOpt[int32](row, 0) == none(PgArray[int32])
+
+  test "getArrayNDOpt some":
+    let src = pgArray(@[42'i32, 7])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    check getArrayNDOpt[int32](row, 0) == some(src)
+
+suite "PgArray[T] geometric type multi-dim round-trip":
+  # Exercise the registry wiring for variable-length geometric element types,
+  # which take separate ``encodePgArrayElement`` / ``decodePgArrayElement``
+  # paths and care about per-element ``elen``.
+  test "PgArray[PgPoint] 2D round-trip":
+    let pts = @[
+      PgPoint(x: 0.0, y: 0.0),
+      PgPoint(x: 1.0, y: 2.0),
+      PgPoint(x: -3.5, y: 4.25),
+      PgPoint(x: 1e10, y: -1e-10),
+    ]
+    let src = pgArray(@[2'i32, 2], pts)
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidPointArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[PgPoint](row, 0)
+    check got.dims == @[2'i32, 2]
+    check got == src
+
+  test "PgArray[PgBox] 2D round-trip":
+    let boxes = @[
+      PgBox(high: PgPoint(x: 1, y: 2), low: PgPoint(x: 0, y: 0)),
+      PgBox(high: PgPoint(x: 3, y: 4), low: PgPoint(x: -1, y: -2)),
+    ]
+    let src = pgArray(@[1'i32, 2], boxes)
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidBoxArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[PgBox](row, 0)
+    check got.dims == @[1'i32, 2]
+    check got == src
+
+  test "PgArray[PgLseg] 2D round-trip":
+    let segs = @[
+      PgLseg(p1: PgPoint(x: 0, y: 0), p2: PgPoint(x: 1, y: 1)),
+      PgLseg(p1: PgPoint(x: 2, y: 3), p2: PgPoint(x: 4, y: 5)),
+    ]
+    let src = pgArray(@[2'i32, 1], segs)
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidLsegArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[PgLseg](row, 0)
+    check got == src
+
+  test "PgArray[PgLine] 2D round-trip":
+    let lines = @[PgLine(a: 1, b: 2, c: 3), PgLine(a: -4, b: 5, c: -6)]
+    let src = pgArray(@[1'i32, 2], lines)
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidLineArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[PgLine](row, 0)
+    check got == src
+
+  test "PgArray[PgCircle] 2D round-trip":
+    let circles = @[
+      PgCircle(center: PgPoint(x: 0, y: 0), radius: 1.0),
+      PgCircle(center: PgPoint(x: 2, y: -3), radius: 4.5),
+    ]
+    let src = pgArray(@[2'i32, 1], circles)
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidCircleArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[PgCircle](row, 0)
+    check got == src
+
+  test "PgArray[PgPath] 2D round-trip varying point counts":
+    # PgPath has variable-size payload; exercise both an open and a closed
+    # path with different point counts inside a 2D array.
+    let paths = @[
+      PgPath(closed: false, points: @[PgPoint(x: 0, y: 0), PgPoint(x: 1, y: 1)]),
+      PgPath(
+        closed: true,
+        points: @[PgPoint(x: 0, y: 0), PgPoint(x: 1, y: 0), PgPoint(x: 1, y: 1)],
+      ),
+    ]
+    let src = pgArray(@[1'i32, 2], paths)
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidPathArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[PgPath](row, 0)
+    check got.dims == @[1'i32, 2]
+    check got == src
+
+  test "PgArray[PgPolygon] 2D round-trip with NULL element":
+    let polys = @[
+      some(
+        PgPolygon(
+          points: @[PgPoint(x: 0, y: 0), PgPoint(x: 1, y: 0), PgPoint(x: 0, y: 1)]
+        )
+      ),
+      none(PgPolygon),
+      some(
+        PgPolygon(
+          points: @[
+            PgPoint(x: 0, y: 0),
+            PgPoint(x: 2, y: 0),
+            PgPoint(x: 2, y: 2),
+            PgPoint(x: 0, y: 2),
+          ]
+        )
+      ),
+      some(PgPolygon(points: @[])), # zero-point polygon (npts=0)
+    ]
+    let src = pgArray(@[2'i32, 2], polys)
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidPolygonArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[PgPolygon](row, 0)
+    check got.dims == @[2'i32, 2]
+    check got.elements[1] == none(PgPolygon)
+    check got == src
+
+suite "PgArray[T] registry compile-time errors":
+  test "toPgParam(PgArray[DateTime]) does not compile":
+    check not compiles(toPgParam(default(PgArray[DateTime])))
+
+  test "toPgParam(PgArray[seq[byte]]) does not compile":
+    check not compiles(toPgParam(default(PgArray[seq[byte]])))
+
+  test "toPgParam(PgArray[PgHstore]) does not compile":
+    check not compiles(toPgParam(default(PgArray[PgHstore])))
+
+  test "getArrayND[DateTime] does not compile":
+    let r: Row = default(Row)
+    check not compiles(getArrayND[DateTime](r, 0))
+
+  test "getArrayND[seq[byte]] does not compile":
+    let r: Row = default(Row)
+    check not compiles(getArrayND[seq[byte]](r, 0))
+
+  test "toPgParam(PgArray[int32]) still compiles":
+    # Sanity: registered types remain usable.
+    check compiles(toPgParam(default(PgArray[int32])))
+
+  test "toPgParam(PgArray[int]) does not compile":
+    check not compiles(toPgParam(default(PgArray[int])))
+
+  test "toPgParam(PgArray[PgTsVector]) does not compile":
+    check not compiles(toPgParam(default(PgArray[PgTsVector])))
+
+  test "toPgParam(PgArray[PgTsQuery]) does not compile":
+    check not compiles(toPgParam(default(PgArray[PgTsQuery])))
+
+  test "getArrayND[int] does not compile":
+    let r: Row = default(Row)
+    check not compiles(getArrayND[int](r, 0))
+
+  test "getArrayND[PgMoney] does not compile (use getMoneyArrayND)":
+    let r: Row = default(Row)
+    check not compiles(getArrayND[PgMoney](r, 0))
+
+  test "toPgParam(PgArray[PgMoney]) does not compile (use toPgMoneyArrayNDParam)":
+    check not compiles(toPgParam(default(PgArray[PgMoney])))
+
+  test "getArrayND[PgTsVector] does not compile":
+    let r: Row = default(Row)
+    check not compiles(getArrayND[PgTsVector](r, 0))
+
+  test "getArrayND[PgTsQuery] does not compile":
+    let r: Row = default(Row)
+    check not compiles(getArrayND[PgTsQuery](r, 0))
+
+  test "encodePgArrayElement(PgTsVector) is not exposed":
+    # Registry entries for PgTsVector/PgTsQuery were removed since the
+    # PgArray entrypoint rejects them; direct calls must not compile so
+    # users cannot accidentally feed text bytes into encodeBinaryArray.
+    check not compiles(encodePgArrayElement(PgTsVector("foo")))
+    check not compiles(encodePgArrayElement(PgTsQuery("foo")))
+
+  test "encodePgArrayElement(PgMoney) is not exposed":
+    # Removed to force callers through toPgMoneyArrayNDParam, which
+    # validates the scale invariant against the server's frac_digits.
+    check not compiles(encodePgArrayElement(PgMoney(amount: 0, scale: 2)))
+
+suite "getMoneyArrayND scale":
+  test "getMoneyArrayND default scale=2":
+    # Build a money[] wire payload with two amounts: 12345 (= $123.45) and 100.
+    let src =
+      pgArray(@[PgMoney(amount: 12345, scale: 2), PgMoney(amount: 100, scale: 2)])
+    let bin = toPgMoneyArrayNDParam(src).value.get
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getMoneyArrayND(row, 0)
+    check got.elements.len == 2
+    check got.elements[0].get.amount == 12345
+    check got.elements[0].get.scale == 2
+
+  test "getMoneyArrayND honors explicit scale":
+    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let bin = toPgMoneyArrayNDParam(src, scale = 3).value.get
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getMoneyArrayND(row, 0, scale = 3)
+    check got.elements[0].get.scale == 3
+    check got.elements[0].get.amount == 12345
+
+  test "getMoneyArrayND rejects bad scale":
+    let src = pgArray(@[PgMoney(amount: 1, scale: 2)])
+    let bin = toPgMoneyArrayNDParam(src).value.get
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard getMoneyArrayND(row, 0, scale = -1)
+    expect PgTypeError:
+      discard getMoneyArrayND(row, 0, scale = 19)
+
+  test "getMoneyArrayNDOpt returns none for NULL column":
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check getMoneyArrayNDOpt(row, 0) == none(PgArray[PgMoney])
+
+suite "toPgMoneyArrayNDParam":
+  test "toPgMoneyArrayNDParam roundtrip with default scale":
+    let src =
+      pgArray(@[PgMoney(amount: 100, scale: 2), PgMoney(amount: -250, scale: 2)])
+    let p = toPgMoneyArrayNDParam(src)
+    check p.oid == OidMoneyArray
+    check p.format == 1
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(p.value.get)], fields)
+    let got = getMoneyArrayND(row, 0)
+    check got.elements.len == 2
+    check got.elements[0].get.amount == 100
+    check got.elements[1].get.amount == -250
+    check got.elements[1].get.scale == 2
+
+  test "toPgMoneyArrayNDParam roundtrip with explicit scale=3":
+    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let p = toPgMoneyArrayNDParam(src, scale = 3)
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(p.value.get)], fields)
+    let got = getMoneyArrayND(row, 0, scale = 3)
+    check got.elements[0].get.amount == 12345
+    check got.elements[0].get.scale == 3
+
+  test "toPgMoneyArrayNDParam honors NULLs and multi-dim":
+    let src = pgArray(
+      @[2'i32, 2],
+      @[
+        some(PgMoney(amount: 1, scale: 2)),
+        none(PgMoney),
+        some(PgMoney(amount: 2, scale: 2)),
+        some(PgMoney(amount: 3, scale: 2)),
+      ],
+    )
+    let p = toPgMoneyArrayNDParam(src)
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(p.value.get)], fields)
+    let got = getMoneyArrayND(row, 0)
+    check got.dims == @[2'i32, 2]
+    check got.elements[1].isNone
+    check got.elements[2].get.amount == 2
+
+  test "toPgMoneyArrayNDParam rejects element scale mismatch":
+    let src = pgArray(@[PgMoney(amount: 1, scale: 2), PgMoney(amount: 2, scale: 3)])
+    expect PgError:
+      discard toPgMoneyArrayNDParam(src, scale = 2)
+
+  test "toPgMoneyArrayNDParam rejects bad scale argument":
+    let src = pgArray(@[PgMoney(amount: 1, scale: 2)])
+    expect PgError:
+      discard toPgMoneyArrayNDParam(src, scale = -1)
+    expect PgError:
+      discard toPgMoneyArrayNDParam(src, scale = 19)
+
+  test "toPgMoneyArrayNDParam empty array":
+    let src = pgArray(newSeq[PgMoney]())
+    let p = toPgMoneyArrayNDParam(src)
+    check p.oid == OidMoneyArray
+    let data = p.value.get
+    check fromBE32(data.toOpenArray(0, 3)) == 0'i32 # ndim=0
+    check data.len == 12
+
+suite "PgArray[T] elemOid validation":
+  test "getArrayND[int32] rejects text[] column":
+    # Encode a text[] payload, try to read as int32[].
+    let src = pgArray(@["abcd", "efgh"])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidTextArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard getArrayND[int32](row, 0)
+
+  test "getArrayND[JsonNode] accepts json[] (no version byte)":
+    # Build a wire payload manually with OidJson and raw JSON bytes
+    # (no jsonb version-byte prefix).
+    let body = "\"hello\""
+    let elemPayload = toBytes(body)
+    var data = newSeq[byte](12 + 8 + 4 + elemPayload.len)
+    data.writeBE32(0, 1'i32) # ndim
+    data.writeBE32(4, 0'i32) # has_null
+    data.writeBE32(8, OidJson) # elem_oid = json
+    data.writeBE32(12, 1'i32) # dim_len
+    data.writeBE32(16, 1'i32) # lower_bound
+    data.writeBE32(20, int32(elemPayload.len)) # element length
+    for i, b in elemPayload:
+      data[24 + i] = b
+    # Field OID isn't consulted by getArrayND (only wire elemOid is); use jsonb[].
+    let fields = @[mkField(OidJsonbArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    let got = getArrayND[JsonNode](row, 0)
+    check got.elements.len == 1
+    check got.elements[0].get.getStr == "hello"
+
+  test "getArrayND[JsonNode] accepts jsonb[] (with version byte)":
+    let src = pgArray(@[%*"world"])
+    let bin = toPgParam(src).value.get
+    let fields = @[mkField(OidJsonbArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = getArrayND[JsonNode](row, 0)
+    check got.elements[0].get.getStr == "world"
+
+  test "getArrayND[JsonNode] json[] does not strip a leading 0x01 byte":
+    # Adversarial payload: an element whose body really starts with 0x01.
+    # Bytes 0x01 + "\"a\"" = invalid JSON. The legacy `buf[0] == 1` heuristic
+    # would silently strip the 0x01 and parse the remaining `"a"` (valid JSON
+    # — JString "a"). The elemOid-driven path keeps the 0x01 in place, so
+    # parseJson must raise.
+    let elemPayload = @[0x01'u8, byte('"'), byte('a'), byte('"')]
+    var data = newSeq[byte](12 + 8 + 4 + elemPayload.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidJson)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elemPayload.len))
+    for i, b in elemPayload:
+      data[24 + i] = b
+    let fields = @[mkField(OidJsonbArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getArrayND[JsonNode](row, 0)
+
+suite "PgArray[T] element decoder validation":
+  test "decodePgArrayElement[PgBit] rejects negative nbits":
+    # nbits = -1, 4 bytes of "data" (irrelevant)
+    var buf = newSeq[byte](8)
+    buf.writeBE32(0, -1'i32)
+    expect PgTypeError:
+      discard decodePgArrayElement(PgBit, buf)
+
+  test "decodePgArrayElement[PgBit] rejects nbits/dataLen mismatch":
+    # nbits = 8 → needs 1 data byte, but supply 2.
+    var buf = newSeq[byte](6)
+    buf.writeBE32(0, 8'i32)
+    expect PgTypeError:
+      discard decodePgArrayElement(PgBit, buf)
+
+  test "decodePgArrayElement[PgBit] accepts valid nbits=0":
+    # nbits = 0 → 0 data bytes. Header-only payload is valid.
+    var buf = newSeq[byte](4)
+    buf.writeBE32(0, 0'i32)
+    let bit = decodePgArrayElement(PgBit, buf)
+    check bit.nbits == 0
+    check bit.data.len == 0
+
+  test "decodePgArrayElement[bool] treats any non-zero as true":
+    # Matches the scalar getBool convention (buf[0] != 0).
+    check decodePgArrayElement(bool, @[0'u8]) == false
+    check decodePgArrayElement(bool, @[1'u8]) == true
+    check decodePgArrayElement(bool, @[2'u8]) == true
+    check decodePgArrayElement(bool, @[0xFF'u8]) == true
+
+  test "decodePgArrayElement[PgBit] accepts nbits=12 with 2 data bytes":
+    # nbits = 12 → (12 + 7) div 8 = 2 data bytes.
+    var buf = newSeq[byte](6)
+    buf.writeBE32(0, 12'i32)
+    buf[4] = 0xAB
+    buf[5] = 0xC0
+    let bit = decodePgArrayElement(PgBit, buf)
+    check bit.nbits == 12
+    check bit.data == @[0xAB'u8, 0xC0'u8]
+
+  test "decodePgArrayElement[PgPath] rejects trailing slack bytes":
+    # closed(1) + npts(4)=0 + 0 points = 5 bytes total. A 13-byte buffer with
+    # the same header has 8 unused bytes; the strict decoder must reject.
+    var buf = newSeq[byte](13)
+    buf[0] = 0
+    buf.writeBE32(1, 0'i32)
+    expect PgTypeError:
+      discard decodePgArrayElement(PgPath, buf)
+
+  test "decodePgArrayElement[PgPolygon] rejects trailing slack bytes":
+    var buf = newSeq[byte](12)
+    buf.writeBE32(0, 0'i32) # npts=0, but buf.len 4+8 trailing
+    expect PgTypeError:
+      discard decodePgArrayElement(PgPolygon, buf)
+
+suite "1-D path/polygon binary element validation":
+  test "pathElemFromBinary rejects negative npts via getPathArray":
+    # Build a path[] payload whose single element has npts = -1 (0xFFFFFFFF).
+    # Element wire: closed(1) + npts(4) = 5 bytes.
+    var elem = newSeq[byte](5)
+    elem[0] = 0
+    elem.writeBE32(1, -1'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32) # ndim=1
+    data.writeBE32(4, 0'i32) # has_null
+    data.writeBE32(8, OidPath)
+    data.writeBE32(12, 1'i32) # dim_len
+    data.writeBE32(16, 1'i32) # lower_bound
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPathArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPathArray(0)
+
+  test "pathElemFromBinary rejects oversized npts via getPathArray":
+    # npts claims 100 points (1605 bytes needed) but element is only 5 bytes.
+    var elem = newSeq[byte](5)
+    elem[0] = 0
+    elem.writeBE32(1, 100'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidPath)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPathArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPathArray(0)
+
+  test "polygonElemFromBinary rejects negative npts via getPolygonArray":
+    var elem = newSeq[byte](4)
+    elem.writeBE32(0, -1'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidPolygon)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPolygonArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPolygonArray(0)
+
+  test "polygonElemFromBinary rejects oversized npts via getPolygonArray":
+    var elem = newSeq[byte](4)
+    elem.writeBE32(0, 100'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidPolygon)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPolygonArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPolygonArray(0)
+
+  test "pathElemFromBinary rejects trailing slack via getPathArray":
+    # Element wire: closed(1) + npts(4)=0 + extra(8) = 13 bytes. With strict
+    # equality, 13 != 5 + 0*16 → must reject.
+    var elem = newSeq[byte](13)
+    elem[0] = 0
+    elem.writeBE32(1, 0'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidPath)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPathArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPathArray(0)
+
+  test "polygonElemFromBinary rejects trailing slack via getPolygonArray":
+    # Element wire: npts(4)=0 + extra(8) = 12 bytes. 12 != 4 + 0*16 → reject.
+    var elem = newSeq[byte](12)
+    elem.writeBE32(0, 0'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidPolygon)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPolygonArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPolygonArray(0)
+
+suite "1-D bit binary element validation":
+  test "getBit rejects negative nbits in binary":
+    var data = newSeq[byte](4)
+    data.writeBE32(0, -1'i32)
+    let fields = @[mkField(OidVarbit, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getBit(0)
+
+  test "getBit rejects nbits/dataLen mismatch":
+    # nbits=33 needs 5 data bytes; supply only 1.
+    var data = newSeq[byte](5)
+    data.writeBE32(0, 33'i32)
+    let fields = @[mkField(OidVarbit, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getBit(0)
+
+  test "getBitArray rejects negative nbits per element":
+    # 1-element bit[] whose payload is nbits=-1 + 0 data bytes (4 bytes total).
+    var elem = newSeq[byte](4)
+    elem.writeBE32(0, -1'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidVarbit)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidVarbitArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getBitArray(0)
+
+  test "getBitArray rejects nbits/dataLen mismatch per element":
+    var elem = newSeq[byte](5)
+    elem.writeBE32(0, 33'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidVarbit)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidVarbitArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getBitArray(0)
+
+  test "getBit rejects nbits exceeding PgBitMaxBits":
+    # nbits = PgBitMaxBits + 1 → reject before any allocation.
+    var data = newSeq[byte](4)
+    data.writeBE32(0, PgBitMaxBits + 1'i32)
+    let fields = @[mkField(OidVarbit, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getBit(0)
+
+  test "decodePgArrayElement[PgBit] rejects nbits exceeding PgBitMaxBits":
+    var buf = newSeq[byte](4)
+    buf.writeBE32(0, PgBitMaxBits + 1'i32)
+    expect PgTypeError:
+      discard decodePgArrayElement(PgBit, buf)
+
+suite "expectedElemCount strictness":
+  test "expectedElemCount rejects zero-sized dimension":
+    expect PgError:
+      discard expectedElemCount(@[2'i32, 0])
+    expect PgError:
+      discard expectedElemCount(@[0'i32])

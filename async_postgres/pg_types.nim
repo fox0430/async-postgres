@@ -1,9 +1,9 @@
 import std/[json, options, times]
 
 import pg_protocol
-import pg_types/[core, encoding, decoding, accessors, user_types, ranges]
+import pg_types/[core, array, encoding, decoding, accessors, user_types, ranges]
 
-export core, encoding, decoding, accessors, user_types, ranges
+export core, array, encoding, decoding, accessors, user_types, ranges
 
 # Name-based accessors bound here so both accessors.nim (non-range getters)
 # and ranges.nim (Range/Multirange getters) are visible when `nameAccessor`

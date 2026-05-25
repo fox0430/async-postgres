@@ -389,10 +389,80 @@ suite "Binary type decoders: malformed input":
     expectTypeError:
       discard decodeBinaryArray(newSeq[byte](11))
 
-  test "decodeBinaryArray ndim != 0, 1 is rejected":
-    # ndim=2 with 20 bytes of header.
+  test "decodeBinaryArray ndim=2 accepted with valid header":
+    # ndim=2, dims=[2,3], 6 elements, each int4 (4 bytes payload).
+    # Header: ndim(4)+has_null(4)+elemOid(4)+dim_len(4)+lower_bound(4)+
+    #         dim_len(4)+lower_bound(4) = 28 bytes
+    # Then 6 elements * (4 len prefix + 4 payload) = 48 bytes. Total 76.
+    var data = newSeq[byte](28 + 6 * 8)
+    data.writeBE32(0, 2'i32) # ndim
+    data.writeBE32(4, 0'i32) # has_null
+    data.writeBE32(8, OidInt4) # elem_oid
+    data.writeBE32(12, 2'i32) # dim_len[0]
+    data.writeBE32(16, 1'i32) # lower_bound[0]
+    data.writeBE32(20, 3'i32) # dim_len[1]
+    data.writeBE32(24, 1'i32) # lower_bound[1]
+    var pos = 28
+    for v in [1'i32, 2, 3, 4, 5, 6]:
+      data.writeBE32(pos, 4'i32) # element length
+      data.writeBE32(pos + 4, v)
+      pos += 8
+    let decoded = decodeBinaryArray(data)
+    check decoded.dims == @[2'i32, 3]
+    check decoded.lowerBounds == @[1'i32, 1]
+    check decoded.elements.len == 6
+
+  test "decodeBinaryArray ndim too large is rejected":
+    # ndim=7 exceeds PgArrayMaxDim (6); should reject before reading dims.
+    var data = newSeq[byte](12 + 8 * 7)
+    data.writeBE32(0, 7'i32) # ndim
+    data.writeBE32(8, OidInt4)
+    expectTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray ndim=2 truncated header":
+    # ndim=2 needs 28-byte header; supply only 20.
     var data = newSeq[byte](20)
-    data[3] = 2 # ndim low byte
+    data.writeBE32(0, 2'i32)
+    data.writeBE32(8, OidInt4)
+    expectTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray ndim=2 element count overflow":
+    # dims=[int32.high, 2]; product overflows int32. The decoder must reject
+    # before allocating elements.
+    var data = newSeq[byte](28)
+    data.writeBE32(0, 2'i32)
+    data.writeBE32(8, OidInt4)
+    data.writeBE32(12, int32.high)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, 2'i32)
+    data.writeBE32(24, 1'i32)
+    expectTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray ndim=2 rejects zero dim_len":
+    # PG sends ndim=0 for empty arrays; a non-zero ndim with dim_len=0 is
+    # malformed and should be rejected.
+    var data = newSeq[byte](28)
+    data.writeBE32(0, 2'i32)
+    data.writeBE32(8, OidInt4)
+    data.writeBE32(12, 0'i32) # dim_len[0] = 0
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, 3'i32)
+    data.writeBE32(24, 1'i32)
+    expectTypeError:
+      discard decodeBinaryArray(data)
+
+  test "decodeBinaryArray ndim=2 product exceeds payload":
+    # dims=[10, 10] → 100 elements but no payload — must reject early.
+    var data = newSeq[byte](28)
+    data.writeBE32(0, 2'i32)
+    data.writeBE32(8, OidInt4)
+    data.writeBE32(12, 10'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, 10'i32)
+    data.writeBE32(24, 1'i32)
     expectTypeError:
       discard decodeBinaryArray(data)
 
