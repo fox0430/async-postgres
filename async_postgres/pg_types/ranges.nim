@@ -472,95 +472,63 @@ proc toPgBinaryDateRangeParam*(v: PgRange[DateTime]): PgParam =
 # toPgBinaryParam for range array types
 
 proc toPgBinaryParam*(v: seq[PgRange[int32]]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidInt4RangeArray,
-      format: 1,
-      value: some(encodeBinaryArrayEmpty(OidInt4Range)),
-    )
-  var elements = newSeq[seq[byte]](v.len)
+  var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
-    elements[i] = toPgBinaryParam(r).value.get
+    elements[i] = some(toPgBinaryParam(r).value.get)
   PgParam(
     oid: OidInt4RangeArray,
     format: 1,
-    value: some(encodeBinaryArray(OidInt4Range, elements)),
+    value: some(encodeBinaryArray(OidInt4Range, dimsFor1D(v.len), elements)),
   )
 
 proc toPgBinaryParam*(v: seq[PgRange[int64]]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidInt8RangeArray,
-      format: 1,
-      value: some(encodeBinaryArrayEmpty(OidInt8Range)),
-    )
-  var elements = newSeq[seq[byte]](v.len)
+  var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
-    elements[i] = toPgBinaryParam(r).value.get
+    elements[i] = some(toPgBinaryParam(r).value.get)
   PgParam(
     oid: OidInt8RangeArray,
     format: 1,
-    value: some(encodeBinaryArray(OidInt8Range, elements)),
+    value: some(encodeBinaryArray(OidInt8Range, dimsFor1D(v.len), elements)),
   )
 
 proc toPgBinaryParam*(v: seq[PgRange[PgNumeric]]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidNumRangeArray, format: 1, value: some(encodeBinaryArrayEmpty(OidNumRange))
-    )
-  var elements = newSeq[seq[byte]](v.len)
+  var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
-    elements[i] = toPgBinaryParam(r).value.get
+    elements[i] = some(toPgBinaryParam(r).value.get)
   PgParam(
     oid: OidNumRangeArray,
     format: 1,
-    value: some(encodeBinaryArray(OidNumRange, elements)),
+    value: some(encodeBinaryArray(OidNumRange, dimsFor1D(v.len), elements)),
   )
 
 proc toPgBinaryParam*(v: seq[PgRange[DateTime]]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidTsRangeArray, format: 1, value: some(encodeBinaryArrayEmpty(OidTsRange))
-    )
-  var elements = newSeq[seq[byte]](v.len)
+  var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
-    elements[i] = toPgBinaryParam(r).value.get
+    elements[i] = some(toPgBinaryParam(r).value.get)
   PgParam(
     oid: OidTsRangeArray,
     format: 1,
-    value: some(encodeBinaryArray(OidTsRange, elements)),
+    value: some(encodeBinaryArray(OidTsRange, dimsFor1D(v.len), elements)),
   )
 
 proc toPgBinaryTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidTsTzRangeArray,
-      format: 1,
-      value: some(encodeBinaryArrayEmpty(OidTsTzRange)),
-    )
-  var elements = newSeq[seq[byte]](v.len)
+  var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
-    elements[i] = toPgBinaryTsTzRangeParam(r).value.get
+    elements[i] = some(toPgBinaryTsTzRangeParam(r).value.get)
   PgParam(
     oid: OidTsTzRangeArray,
     format: 1,
-    value: some(encodeBinaryArray(OidTsTzRange, elements)),
+    value: some(encodeBinaryArray(OidTsTzRange, dimsFor1D(v.len), elements)),
   )
 
 proc toPgBinaryDateRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
-  if v.len == 0:
-    return PgParam(
-      oid: OidDateRangeArray,
-      format: 1,
-      value: some(encodeBinaryArrayEmpty(OidDateRange)),
-    )
-  var elements = newSeq[seq[byte]](v.len)
+  var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
-    elements[i] = toPgBinaryDateRangeParam(r).value.get
+    elements[i] = some(toPgBinaryDateRangeParam(r).value.get)
   PgParam(
     oid: OidDateRangeArray,
     format: 1,
-    value: some(encodeBinaryArray(OidDateRange, elements)),
+    value: some(encodeBinaryArray(OidDateRange, dimsFor1D(v.len), elements)),
   )
 
 # toPgParam for range array types (text format)
@@ -929,10 +897,14 @@ proc toPgBinaryDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
 proc buildMultirangeArrayParam(
     arrayOid, elemOid: int32, elements: seq[seq[byte]]
 ): PgParam =
-  if elements.len == 0:
-    return
-      PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArrayEmpty(elemOid)))
-  PgParam(oid: arrayOid, format: 1, value: some(encodeBinaryArray(elemOid, elements)))
+  var optElements = newSeq[Option[seq[byte]]](elements.len)
+  for i, e in elements:
+    optElements[i] = some(e)
+  PgParam(
+    oid: arrayOid,
+    format: 1,
+    value: some(encodeBinaryArray(elemOid, dimsFor1D(elements.len), optElements)),
+  )
 
 proc toPgBinaryParam*(v: seq[PgMultirange[int32]]): PgParam =
   var elements = newSeq[seq[byte]](v.len)
@@ -1206,6 +1178,7 @@ proc getInt4MultirangeArray*(row: Row, col: int): seq[PgMultirange[int32]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgMultirange[int32]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1239,6 +1212,7 @@ proc getInt8MultirangeArray*(row: Row, col: int): seq[PgMultirange[int64]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgMultirange[int64]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1272,6 +1246,7 @@ proc getNumMultirangeArray*(row: Row, col: int): seq[PgMultirange[PgNumeric]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgMultirange[PgNumeric]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1305,6 +1280,7 @@ proc getTsMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgMultirange[DateTime]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1344,6 +1320,7 @@ proc getTsTzMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgMultirange[DateTime]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1387,6 +1364,7 @@ proc getDateMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgMultirange[DateTime]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1439,6 +1417,7 @@ proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgRange[int32]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1467,6 +1446,7 @@ proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgRange[int64]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1495,6 +1475,7 @@ proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgRange[PgNumeric]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1523,6 +1504,7 @@ proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgRange[DateTime]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1557,6 +1539,7 @@ proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgRange[DateTime]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1595,6 +1578,7 @@ proc getDateRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgRange[DateTime]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:

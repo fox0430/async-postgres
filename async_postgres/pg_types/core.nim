@@ -157,7 +157,15 @@ type
       ## Raw command tag string (e.g. "INSERT 0 1", "UPDATE 3", "DELETE 5").
 
 const
-  ## PostgreSQL type OIDs for scalar and array types.
+  PgBitMaxBits* = 1'i32 shl 30
+    ## Defensive upper bound on ``PgBit.nbits`` (1 G bits = 128 MiB of packed
+    ## data) used by the binary bit decoders to refuse pathologically large
+    ## lengths from the wire before allocating the data buffer. PostgreSQL's
+    ## own ``VARBITMAXLEN`` is effectively ``INT_MAX`` bits, but a 1G-bit
+    ## ceiling suffices for any realistic ``bit varying`` column and bounds
+    ## DoS risk from a malicious intermediary.
+
+  # PostgreSQL type OIDs for scalar and array types.
   OidBool* = 16'i32
   OidInt2* = 21'i32
   OidInt4* = 23'i32

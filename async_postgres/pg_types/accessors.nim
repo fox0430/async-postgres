@@ -1,8 +1,7 @@
 import std/[options, json, macros, parseutils, strutils, tables, times, net]
 
 import ../pg_protocol
-import ./core
-import ./decoding
+import core, decoding, encoding
 
 proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
   if col < 0 or col >= int(row.data.numCols):
@@ -612,8 +611,23 @@ proc getBit*(row: Row, col: int): PgBit =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     if clen < 4:
       raise newException(PgTypeError, "Invalid binary bit data: too short")
-    let nbits = fromBE32(row.data.buf[off .. off + 3])
+    let nbits = fromBE32(row.data.buf.toOpenArray(off, off + 3))
+    if nbits < 0:
+      raise
+        newException(PgTypeError, "Invalid binary bit data: negative nbits " & $nbits)
+    if nbits > PgBitMaxBits:
+      raise newException(
+        PgTypeError,
+        "Invalid binary bit data: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits &
+          ")",
+      )
     let dataLen = clen - 4
+    if (int64(nbits) + 7) div 8 != int64(dataLen):
+      raise newException(
+        PgTypeError,
+        "Invalid binary bit data: nbits=" & $nbits & " inconsistent with dataLen=" &
+          $dataLen,
+      )
     var data = newSeq[byte](dataLen)
     for i in 0 ..< dataLen:
       data[i] = row.data.buf[off + 4 + i]
@@ -892,6 +906,7 @@ proc getIntArray*(row: Row, col: int): seq[int32] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[int32](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -917,6 +932,7 @@ proc getInt16Array*(row: Row, col: int): seq[int16] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[int16](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -942,6 +958,7 @@ proc getInt64Array*(row: Row, col: int): seq[int64] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[int64](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -972,6 +989,7 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgMoney](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -999,6 +1017,7 @@ proc getFloatArray*(row: Row, col: int): seq[float64] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[float64](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1032,6 +1051,7 @@ proc getFloat32Array*(row: Row, col: int): seq[float32] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[float32](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1059,6 +1079,7 @@ proc getBoolArray*(row: Row, col: int): seq[bool] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[bool](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1089,6 +1110,7 @@ proc getStrArray*(row: Row, col: int): seq[string] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[string](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1109,6 +1131,7 @@ proc getBitArray*(row: Row, col: int): seq[PgBit] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgBit](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1116,7 +1139,23 @@ proc getBitArray*(row: Row, col: int): seq[PgBit] =
       if e.len < 4:
         raise newException(PgTypeError, "Invalid binary bit element: too short")
       let nbits = fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + 3))
+      if nbits < 0:
+        raise newException(
+          PgTypeError, "Invalid binary bit element: negative nbits " & $nbits
+        )
+      if nbits > PgBitMaxBits:
+        raise newException(
+          PgTypeError,
+          "Invalid binary bit element: nbits " & $nbits & " exceeds limit (" &
+            $PgBitMaxBits & ")",
+        )
       let dataLen = e.len - 4
+      if (int64(nbits) + 7) div 8 != int64(dataLen):
+        raise newException(
+          PgTypeError,
+          "Invalid binary bit element: nbits=" & $nbits & " inconsistent with dataLen=" &
+            $dataLen,
+        )
       var data = newSeq[byte](dataLen)
       for j in 0 ..< dataLen:
         data[j] = row.data.buf[off + e.off + 4 + j]
@@ -1143,6 +1182,7 @@ template genArrayDecoder(
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      rejectMultiDim(decoded)
       result = newSeq[T](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1414,6 +1454,7 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[PgBox](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1440,9 +1481,16 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
       raise newException(PgTypeError, "Invalid box: " & v)
     result.add(PgBox(high: points[0], low: points[1]))
 
-proc pathElemFromBinary(buf: openArray[byte], off: int): PgPath =
+proc pathElemFromBinary(buf: openArray[byte], off, elen: int): PgPath =
+  if elen < 5:
+    raise newException(PgTypeError, "Invalid binary path element: too short " & $elen)
   result.closed = buf[off] != 0
   let npts = fromBE32(buf.toOpenArray(off + 1, off + 4))
+  if npts < 0 or elen != 5 + npts * 16:
+    raise newException(
+      PgTypeError,
+      "Invalid binary path element: bad npts " & $npts & " (elen " & $elen & ")",
+    )
   result.points = newSeq[PgPoint](npts)
   for j in 0 ..< npts:
     result.points[j] = decodePointBinary(buf, off + 5 + j * 16)
@@ -1459,12 +1507,20 @@ genArrayDecoder(
   getPathArray,
   PgPath,
   "path",
-  pathElemFromBinary(row.data.buf, off + e.off),
+  pathElemFromBinary(row.data.buf, off + e.off, e.len),
   pathElemFromText(e.get),
 )
 
-proc polygonElemFromBinary(buf: openArray[byte], off: int): PgPolygon =
+proc polygonElemFromBinary(buf: openArray[byte], off, elen: int): PgPolygon =
+  if elen < 4:
+    raise
+      newException(PgTypeError, "Invalid binary polygon element: too short " & $elen)
   let npts = fromBE32(buf.toOpenArray(off, off + 3))
+  if npts < 0 or elen != 4 + npts * 16:
+    raise newException(
+      PgTypeError,
+      "Invalid binary polygon element: bad npts " & $npts & " (elen " & $elen & ")",
+    )
   result.points = newSeq[PgPoint](npts)
   for j in 0 ..< npts:
     result.points[j] = decodePointBinary(buf, off + 4 + j * 16)
@@ -1479,7 +1535,7 @@ genArrayDecoder(
   getPolygonArray,
   PgPolygon,
   "polygon",
-  polygonElemFromBinary(row.data.buf, off + e.off),
+  polygonElemFromBinary(row.data.buf, off + e.off, e.len),
   polygonElemFromText(e.get),
 )
 
@@ -1561,6 +1617,7 @@ proc getIntArrayElemOpt*(row: Row, col: int): seq[Option[int32]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[int32]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1582,6 +1639,7 @@ proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[int16]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1603,6 +1661,7 @@ proc getInt64ArrayElemOpt*(row: Row, col: int): seq[Option[int64]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[int64]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1624,6 +1683,7 @@ proc getFloatArrayElemOpt*(row: Row, col: int): seq[Option[float64]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[float64]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1656,6 +1716,7 @@ proc getFloat32ArrayElemOpt*(row: Row, col: int): seq[Option[float32]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[float32]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1680,6 +1741,7 @@ proc getBoolArrayElemOpt*(row: Row, col: int): seq[Option[bool]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[bool]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1706,6 +1768,7 @@ proc getStrArrayElemOpt*(row: Row, col: int): seq[Option[string]] =
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    rejectMultiDim(decoded)
     result = newSeq[Option[string]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1761,6 +1824,345 @@ optAccessor(getFloatArrayElemOpt, getFloatArrayElemOptOpt, seq[Option[float64]])
 optAccessor(getFloat32ArrayElemOpt, getFloat32ArrayElemOptOpt, seq[Option[float32]])
 optAccessor(getBoolArrayElemOpt, getBoolArrayElemOptOpt, seq[Option[bool]])
 optAccessor(getStrArrayElemOpt, getStrArrayElemOptOpt, seq[Option[string]])
+
+# PgArray[T] decoder registry and ``getArrayND`` — companion to the encoder
+# registry in ``encoding.nim``. Supports multi-dimensional arrays.
+
+proc decodePgArrayElement*(_: typedesc[int16], buf: openArray[byte]): int16 {.inline.} =
+  if buf.len != 2:
+    raise newException(PgTypeError, "int2 array element: bad length " & $buf.len)
+  fromBE16(buf)
+
+proc decodePgArrayElement*(_: typedesc[int32], buf: openArray[byte]): int32 {.inline.} =
+  if buf.len != 4:
+    raise newException(PgTypeError, "int4 array element: bad length " & $buf.len)
+  fromBE32(buf)
+
+proc decodePgArrayElement*(_: typedesc[int64], buf: openArray[byte]): int64 {.inline.} =
+  if buf.len != 8:
+    raise newException(PgTypeError, "int8 array element: bad length " & $buf.len)
+  fromBE64(buf)
+
+proc decodePgArrayElement*(
+    _: typedesc[float32], buf: openArray[byte]
+): float32 {.inline.} =
+  if buf.len != 4:
+    raise newException(PgTypeError, "float4 array element: bad length " & $buf.len)
+  cast[float32](cast[uint32](fromBE32(buf)))
+
+proc decodePgArrayElement*(
+    _: typedesc[float64], buf: openArray[byte]
+): float64 {.inline.} =
+  if buf.len != 8:
+    raise newException(PgTypeError, "float8 array element: bad length " & $buf.len)
+  cast[float64](cast[uint64](fromBE64(buf)))
+
+proc decodePgArrayElement*(_: typedesc[bool], buf: openArray[byte]): bool {.inline.} =
+  if buf.len != 1:
+    raise newException(PgTypeError, "bool array element: bad length " & $buf.len)
+  buf[0] != 0'u8
+
+proc decodePgArrayElement*(_: typedesc[string], buf: openArray[byte]): string =
+  result = newString(buf.len)
+  for i in 0 ..< buf.len:
+    result[i] = char(buf[i])
+
+proc decodePgArrayElement*(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
+  if buf.len != 16:
+    raise newException(PgTypeError, "uuid array element: bad length " & $buf.len)
+  const hexChars = "0123456789abcdef"
+  var s = newString(36)
+  var pos = 0
+  for j in 0 ..< 16:
+    if j == 4 or j == 6 or j == 8 or j == 10:
+      s[pos] = '-'
+      inc pos
+    let b = buf[j]
+    s[pos] = hexChars[int(b shr 4)]
+    s[pos + 1] = hexChars[int(b and 0x0F)]
+    pos += 2
+  PgUuid(s)
+
+proc decodePgArrayElement*(_: typedesc[PgNumeric], buf: openArray[byte]): PgNumeric =
+  decodeNumericBinary(buf)
+
+# Intentionally no ``decodePgArrayElement(PgMoney, ...)``: the binary money
+# wire format does not carry the fractional-digit count, so the scale must
+# come from the caller. ``getArrayND[PgMoney]`` is ``{.error.}``-gated, and
+# ``getMoneyArrayND`` decodes elements inline with the caller-supplied scale.
+
+proc decodePgArrayElement*(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
+  if buf.len < 4:
+    raise newException(PgTypeError, "bit array element too short")
+  let nbits = fromBE32(buf.toOpenArray(0, 3))
+  if nbits < 0:
+    raise newException(PgTypeError, "bit array element: negative nbits " & $nbits)
+  if nbits > PgBitMaxBits:
+    raise newException(
+      PgTypeError,
+      "bit array element: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits & ")",
+    )
+  let dataLen = buf.len - 4
+  if (int64(nbits) + 7) div 8 != int64(dataLen):
+    raise newException(
+      PgTypeError,
+      "bit array element: nbits=" & $nbits & " inconsistent with dataLen=" & $dataLen,
+    )
+  var data = newSeq[byte](dataLen)
+  for j in 0 ..< dataLen:
+    data[j] = buf[4 + j]
+  PgBit(nbits: nbits, data: data)
+
+proc decodePgArrayElement*(_: typedesc[PgInterval], buf: openArray[byte]): PgInterval =
+  if buf.len != 16:
+    raise newException(PgTypeError, "interval array element: bad length " & $buf.len)
+  result.microseconds = fromBE64(buf.toOpenArray(0, 7))
+  result.days = fromBE32(buf.toOpenArray(8, 11))
+  result.months = fromBE32(buf.toOpenArray(12, 15))
+
+proc decodePgArrayElement*(_: typedesc[PgTime], buf: openArray[byte]): PgTime =
+  decodeBinaryTime(buf)
+
+proc decodePgArrayElement*(_: typedesc[PgTimeTz], buf: openArray[byte]): PgTimeTz =
+  decodeBinaryTimeTz(buf)
+
+proc decodePgArrayElement*(_: typedesc[PgInet], buf: openArray[byte]): PgInet =
+  let (ip, mask) = decodeInetBinary(buf)
+  PgInet(address: ip, mask: mask)
+
+proc decodePgArrayElement*(_: typedesc[PgCidr], buf: openArray[byte]): PgCidr =
+  let (ip, mask) = decodeInetBinary(buf)
+  PgCidr(address: ip, mask: mask)
+
+proc decodePgArrayElement*(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacAddr =
+  if buf.len != 6:
+    raise newException(PgTypeError, "macaddr array element: bad length " & $buf.len)
+  var parts = newSeq[string](6)
+  for j in 0 ..< 6:
+    parts[j] = toHex(buf[j], 2).toLowerAscii()
+  PgMacAddr(parts.join(":"))
+
+proc decodePgArrayElement*(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacAddr8 =
+  if buf.len != 8:
+    raise newException(PgTypeError, "macaddr8 array element: bad length " & $buf.len)
+  var parts = newSeq[string](8)
+  for j in 0 ..< 8:
+    parts[j] = toHex(buf[j], 2).toLowerAscii()
+  PgMacAddr8(parts.join(":"))
+
+proc decodePgArrayElement*(_: typedesc[PgXml], buf: openArray[byte]): PgXml =
+  var s = newString(buf.len)
+  for i in 0 ..< buf.len:
+    s[i] = char(buf[i])
+  PgXml(s)
+
+proc decodePgArrayElement*(_: typedesc[PgPoint], buf: openArray[byte]): PgPoint =
+  if buf.len != 16:
+    raise newException(PgTypeError, "point array element: bad length " & $buf.len)
+  decodePointBinary(buf, 0)
+
+proc decodePgArrayElement*(_: typedesc[PgLine], buf: openArray[byte]): PgLine =
+  if buf.len != 24:
+    raise newException(PgTypeError, "line array element: bad length " & $buf.len)
+  result.a = decodeFloat64BE(buf, 0)
+  result.b = decodeFloat64BE(buf, 8)
+  result.c = decodeFloat64BE(buf, 16)
+
+proc decodePgArrayElement*(_: typedesc[PgLseg], buf: openArray[byte]): PgLseg =
+  if buf.len != 32:
+    raise newException(PgTypeError, "lseg array element: bad length " & $buf.len)
+  PgLseg(p1: decodePointBinary(buf, 0), p2: decodePointBinary(buf, 16))
+
+proc decodePgArrayElement*(_: typedesc[PgBox], buf: openArray[byte]): PgBox =
+  if buf.len != 32:
+    raise newException(PgTypeError, "box array element: bad length " & $buf.len)
+  PgBox(high: decodePointBinary(buf, 0), low: decodePointBinary(buf, 16))
+
+proc decodePgArrayElement*(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
+  if buf.len < 5:
+    raise newException(PgTypeError, "path array element too short")
+  result.closed = buf[0] != 0
+  let npts = fromBE32(buf.toOpenArray(1, 4))
+  if npts < 0 or buf.len != 5 + npts * 16:
+    raise newException(
+      PgTypeError,
+      "path array element: bad npts " & $npts & " (buf.len " & $buf.len & ")",
+    )
+  result.points = newSeq[PgPoint](npts)
+  for j in 0 ..< npts:
+    result.points[j] = decodePointBinary(buf, 5 + j * 16)
+
+proc decodePgArrayElement*(_: typedesc[PgPolygon], buf: openArray[byte]): PgPolygon =
+  if buf.len < 4:
+    raise newException(PgTypeError, "polygon array element too short")
+  let npts = fromBE32(buf.toOpenArray(0, 3))
+  if npts < 0 or buf.len != 4 + npts * 16:
+    raise newException(
+      PgTypeError,
+      "polygon array element: bad npts " & $npts & " (buf.len " & $buf.len & ")",
+    )
+  result.points = newSeq[PgPoint](npts)
+  for j in 0 ..< npts:
+    result.points[j] = decodePointBinary(buf, 4 + j * 16)
+
+proc decodePgArrayElement*(_: typedesc[PgCircle], buf: openArray[byte]): PgCircle =
+  if buf.len != 24:
+    raise newException(PgTypeError, "circle array element: bad length " & $buf.len)
+  result.center = decodePointBinary(buf, 0)
+  result.radius = decodeFloat64BE(buf, 16)
+
+proc getArrayND*[T](row: Row, col: int): PgArray[T] =
+  ## Read an N-dimensional PostgreSQL array column as a ``PgArray[T]``.
+  ## Requires binary column format; text-format multi-dimensional arrays are
+  ## not supported. Raises ``PgTypeError`` when the column is NULL, or when
+  ## the wire ``elemOid`` does not match the registered OID for ``T``
+  ## (``JsonNode`` accepts both ``json`` and ``jsonb``).
+  ##
+  ## Validation looks only at the wire ``elemOid`` carried in the array
+  ## payload, not at the column's field OID from ``RowDescription``. A bind
+  ## mismatch (e.g. reading a ``text[]`` column as ``getArrayND[int32]``) is
+  ## caught by the elemOid check; reading e.g. ``int4[]`` via
+  ## ``getArrayND[int32]`` against a column declared as ``int8[]`` succeeds
+  ## as long as the wire bytes match the requested ``T``. For ``JsonNode``,
+  ## the leading jsonb version byte is stripped only when ``elemOid == jsonb``;
+  ## ``json`` payloads pass through unchanged, and any other wire ``elemOid``
+  ## (e.g. ``int4``) is rejected by the OID check so calling
+  ## ``getArrayND[JsonNode]`` on a non-JSON column raises rather than
+  ## silently misinterpreting the bytes.
+  when T is DateTime:
+    {.
+      error:
+        "getArrayND[DateTime] is ambiguous (timestamp / timestamptz / date " &
+        "have distinct OIDs). Use the dedicated 1-D accessors " &
+        "(getTimestampArray / getTimestampTzArray / getDateArray) instead."
+    .}
+  elif T is seq[byte]:
+    {.
+      error:
+        "getArrayND[seq[byte]] is not supported by the PgArray registry. " &
+        "Use getByteaArray instead."
+    .}
+  elif T is int:
+    {.
+      error:
+        "getArrayND[int] is not supported (platform-dependent width). " &
+        "Use getArrayND[int32] or getArrayND[int64] explicitly."
+    .}
+  elif T is PgMoney:
+    {.
+      error:
+        "getArrayND[PgMoney] would silently hardcode scale=2 and produce " &
+        "wrong values on servers whose lc_monetary frac_digits differ from " &
+        "2. Use getMoneyArrayND(row, col, scale = ...) instead " &
+        "(getMoneyArrayNDOpt for the NULL-safe variant)."
+    .}
+  elif T is PgTsVector or T is PgTsQuery:
+    {.
+      error:
+        "getArrayND[PgTsVector] / getArrayND[PgTsQuery] is not supported by " &
+        "the PgArray registry: the binary wire format for tsvector / " &
+        "tsquery is structured (not the text representation), so element " &
+        "round-trip would not match what PostgreSQL sends. Use the 1-D " &
+        "accessor (getTsVectorArray / getTsQueryArray) instead; " &
+        "PgArray[T] currently has no multi-dim equivalent for these types."
+    .}
+  if not row.isBinaryCol(col):
+    raise newException(
+      PgTypeError, "getArrayND requires binary column format (col " & $col & ")"
+    )
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  when T is JsonNode:
+    if decoded.elemOid != OidJson and decoded.elemOid != OidJsonb:
+      raise newException(
+        PgTypeError,
+        "getArrayND[JsonNode]: wire elemOid=" & $decoded.elemOid &
+          " is neither json nor jsonb",
+      )
+  else:
+    if decoded.elemOid != pgArrayElemOid(T):
+      raise newException(
+        PgTypeError,
+        "getArrayND[" & $T & "]: wire elemOid=" & $decoded.elemOid & " expected " &
+          $pgArrayElemOid(T),
+      )
+  result.dims = decoded.dims
+  result.lowerBounds = decoded.lowerBounds
+  result.elements = newSeq[Option[T]](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      result.elements[i] = none(T)
+    else:
+      when T is JsonNode:
+        # Strip the leading jsonb version byte only when the wire elemOid
+        # actually says jsonb. Plain ``json`` payloads are forwarded as-is.
+        result.elements[i] =
+          some(jsonElemFromBinary(row.data.buf, off + e.off, e.len, decoded.elemOid))
+      else:
+        result.elements[i] = some(
+          decodePgArrayElement(
+            T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+          )
+        )
+
+proc getArrayNDOpt*[T](row: Row, col: int): Option[PgArray[T]] =
+  ## NULL-safe column-level variant of ``getArrayND[T]``.
+  if row.isNull(col):
+    none(PgArray[T])
+  else:
+    some(getArrayND[T](row, col))
+
+proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
+  ## ``getArrayND``-style accessor for ``money[]`` (any dimensionality).
+  ## ``getArrayND[PgMoney]`` is intentionally ``{.error.}``-gated because the
+  ## binary ``money`` wire format does not carry the fractional-digit count,
+  ## so the caller must supply ``scale`` (matching the server's
+  ## ``lc_monetary`` ``frac_digits``) — this accessor is the only way to
+  ## read a ``money[]`` column. Defaults to ``scale = 2`` for the common
+  ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
+  if scale < 0 or scale > 18:
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  if not row.isBinaryCol(col):
+    raise newException(
+      PgTypeError, "getMoneyArrayND requires binary column format (col " & $col & ")"
+    )
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  if decoded.elemOid != pgArrayElemOid(PgMoney):
+    raise newException(
+      PgTypeError,
+      "getMoneyArrayND: wire elemOid=" & $decoded.elemOid & " expected " &
+        $pgArrayElemOid(PgMoney),
+    )
+  result.dims = decoded.dims
+  result.lowerBounds = decoded.lowerBounds
+  result.elements = newSeq[Option[PgMoney]](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      result.elements[i] = none(PgMoney)
+    else:
+      if e.len != 8:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
+        )
+      result.elements[i] = some(
+        PgMoney(
+          amount:
+            fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
+          scale: int8(scale),
+        )
+      )
+
+proc getMoneyArrayNDOpt*(row: Row, col: int, scale: int = 2): Option[PgArray[PgMoney]] =
+  ## NULL-safe column-level variant of ``getMoneyArrayND``.
+  if row.isNull(col):
+    none(PgArray[PgMoney])
+  else:
+    some(getMoneyArrayND(row, col, scale))
 
 # Generic accessors — static dispatch by type, no OID branching.
 
