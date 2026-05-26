@@ -248,7 +248,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
         if not hasCachedStmts:
           result = newSeq[CachedStmt](p.ops.len)
           hasCachedStmts = true
-        result[i] = cached[]
+        result[i] = cached
       var effectiveResultFormats: seq[int16]
       if p.ops[i].kind == pokQuery:
         effectiveResultFormats =
