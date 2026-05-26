@@ -72,6 +72,30 @@ type
     createCount*: int64 ## Number of new connections created
     closeCount*: int64 ## Number of connections closed/discarded
 
+  PooledConnHandle* = ref object
+    ## A pool-borrowed connection paired with the pool it came from.
+    ##
+    ## Returned by `PgPool.acquireHandle` and `PgPoolCluster.readConnection` /
+    ## `writeConnection`. The handle must be released with `release(h)` to
+    ## return the connection to the pool — typically via `defer: h.release()`.
+    ## Forgetting to release leaks the connection until the pool is closed.
+    ##
+    ## **No session reset:** unlike `withConnection` / `withReadConnection` /
+    ## `withWriteConnection`, `release(h)` does **not** call `resetSession`,
+    ## so a configured `resetQuery` will not run and any session-level
+    ## advisory locks acquired through the typed API will not be released
+    ## via `pg_advisory_unlock_all`. Use the `with*Connection` templates when
+    ## you want automatic session cleanup, or call `pool.resetSession(h.conn)`
+    ## yourself before `release(h)`.
+    ##
+    ## `pool` is the pool the connection was actually borrowed from. For
+    ## `PgPoolCluster.readConnection` with `fallbackPrimary`, this can be
+    ## either the replica or the primary depending on which served the
+    ## acquire.
+    conn*: PgConnection
+    pool*: PgPool
+    released: bool
+
   PendingOpKind = enum
     popExec
     popQuery
@@ -606,6 +630,20 @@ proc release*(conn: PgConnection) =
     )
   PgPool(conn.ownerPool).releaseImpl(conn)
 
+proc release*(h: PooledConnHandle) =
+  ## Return the borrowed connection to its pool. Idempotent — safe to call
+  ## twice (e.g. once explicitly and once via `defer`).
+  ##
+  ## **Does not run `resetSession`.** Session state (`SET`/`SET LOCAL` outside
+  ## a transaction, prepared statements, advisory locks acquired via the typed
+  ## API, etc.) on the connection is **not** cleared before it returns to the
+  ## pool, so subsequent borrowers may observe it. If that matters, use
+  ## `withConnection` / `withReadConnection` / `withWriteConnection` instead,
+  ## or call `await h.pool.resetSession(h.conn)` yourself before `release(h)`.
+  if not h.released and h.conn != nil:
+    h.released = true
+    h.conn.release()
+
 type AcquireResult = tuple[conn: PgConnection, wasCreated: bool]
 
 proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
@@ -751,6 +789,18 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ):
     ar = await pool.acquireImpl()
   return ar.conn
+
+proc acquireHandle*(pool: PgPool): Future[PooledConnHandle] {.async.} =
+  ## Acquire a connection wrapped in a `PooledConnHandle`. Equivalent to
+  ## `acquire`, but the returned handle pairs the connection with its owning
+  ## pool and provides an idempotent `release(h)`.
+  ##
+  ## The caller is responsible for releasing — typically via
+  ## `defer: h.release()`. Forgetting to release leaks the connection.
+  ## `release(h)` does **not** run `resetSession`; prefer `withConnection`
+  ## when automatic session cleanup is desired.
+  let conn = await pool.acquire()
+  return PooledConnHandle(conn: conn, pool: pool)
 
 template withConnection*(pool: PgPool, conn, body: untyped) =
   ## Acquire a connection, execute `body`, then release it back to the pool.

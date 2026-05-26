@@ -351,190 +351,41 @@ suite "Close":
     check cluster.replica.idle.len == 0
 
 suite "Write routing":
-  ## writeQuery* methods must route to the primary pool, not replica.
-  ## We verify this by closing the primary pool — if the method raises
-  ## PgPoolError ("Pool is closed"), it proves routing targets primary.
-
-  test "writeQuery routes to primary":
+  test "writeConnection routes to primary":
     let cluster = makeCluster()
     cluster.primary.closed = true
 
     expect(PgError):
-      discard waitFor cluster.writeQuery("SELECT 1")
+      discard waitFor cluster.writeConnection()
 
-  test "writeQueryRowOpt routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryRowOpt("SELECT 1")
-
-  test "writeQueryRow routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryRow("SELECT 1")
-
-  test "writeQueryValue routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryValue("SELECT 1")
-
-  test "writeQueryValueOpt routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryValueOpt("SELECT 1")
-
-  test "writeQueryValueOrDefault routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryValueOrDefault("SELECT 1")
-
-  test "writeQueryExists routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryExists("SELECT 1")
-
-  test "writeQueryColumn routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryColumn("SELECT 1")
-
-  test "writeExec routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeExec("INSERT INTO t VALUES (1)")
-
-  test "writeExecInTransaction routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeExecInTransaction("INSERT INTO t VALUES (1)", @[])
-
-  test "writeQueryInTransaction routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeQueryInTransaction("SELECT 1", @[])
-
-  test "writeSimpleQuery routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeSimpleQuery("SELECT 1")
-
-  test "writeSimpleExec routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      discard waitFor cluster.writeSimpleExec("SELECT 1")
-
-  test "writeNotify routes to primary":
-    let cluster = makeCluster()
-    cluster.primary.closed = true
-
-    expect(PgError):
-      waitFor cluster.writeNotify("ch")
-
-suite "Read routing targets replica":
-  ## Symmetric tests: readQuery* must route to the replica pool.
-
-  test "readQuery routes to replica":
+  test "readConnection routes to replica":
     let cluster = makeCluster()
     cluster.replica.closed = true
     cluster.fallback = fallbackNone
 
     expect(PgError):
-      discard waitFor cluster.readQuery("SELECT 1")
+      discard waitFor cluster.readConnection()
 
-  test "readQueryRowOpt routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
+  test "readConnection falls back to primary when replica unavailable":
+    let cluster = makeCluster(fallback = fallbackPrimary)
+    cluster.replica.active = cluster.replica.config.maxSize
+    cluster.replica.config.acquireTimeout = ZeroDuration
+    cluster.replica.config.maxWaiters = 1
+    let dummyFut = newFuture[PgConnection]("dummy")
+    cluster.replica.waiters.addLast(Waiter(fut: dummyFut, cancelled: false))
+    cluster.replica.waiterCount = 1
 
-    expect(PgError):
-      discard waitFor cluster.readQueryRowOpt("SELECT 1")
+    let primaryConn = mockConn()
+    primaryConn.ownerPool = cluster.primary
+    cluster.primary.idle.addLast(
+      PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+    )
 
-  test "readQueryRow routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
+    let h = waitFor cluster.readConnection()
+    check h.conn == primaryConn
+    h.release()
 
-    expect(PgError):
-      discard waitFor cluster.readQueryRow("SELECT 1")
-
-  test "readQueryValue routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
-
-    expect(PgError):
-      discard waitFor cluster.readQueryValue("SELECT 1")
-
-  test "readQueryValueOpt routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
-
-    expect(PgError):
-      discard waitFor cluster.readQueryValueOpt("SELECT 1")
-
-  test "readQueryValueOrDefault routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
-
-    expect(PgError):
-      discard waitFor cluster.readQueryValueOrDefault("SELECT 1")
-
-  test "readQueryExists routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
-
-    expect(PgError):
-      discard waitFor cluster.readQueryExists("SELECT 1")
-
-  test "readQueryColumn routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
-
-    expect(PgError):
-      discard waitFor cluster.readQueryColumn("SELECT 1")
-
-  test "readSimpleQuery routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
-
-    expect(PgError):
-      discard waitFor cluster.readSimpleQuery("SELECT 1")
-
-  test "readSimpleExec routes to replica":
-    let cluster = makeCluster()
-    cluster.replica.closed = true
-    cluster.fallback = fallbackNone
-
-    expect(PgError):
-      discard waitFor cluster.readSimpleExec("SELECT 1")
+    dummyFut.complete(mockConn())
 
 suite "Closed pool cluster":
   test "acquire on closed replica raises error":

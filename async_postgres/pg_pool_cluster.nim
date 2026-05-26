@@ -1,4 +1,4 @@
-import std/[options, macros, strutils]
+import std/macros
 
 import async_backend, pg_protocol, pg_connection, pg_types, pg_pool, pg_client
 
@@ -10,8 +10,8 @@ type
   PgPoolCluster* = ref object
     ## Connection pool cluster with explicit read/write routing.
     ##
-    ## - `read*` methods route to the replica pool (read-only queries).
-    ## - `write*` methods route to the primary pool (writes, `SELECT FOR UPDATE`, etc.).
+    ## - `readConnection()` / `withReadConnection` route to the replica pool.
+    ## - `writeConnection()` / `withWriteConnection` route to the primary pool.
     ##
     ## For transactions, use `cluster.withTransaction`.
     primary: PgPool
@@ -103,6 +103,39 @@ proc acquireRead(
         return (conn, cluster.primary)
     raise e
 
+proc readConnection*(cluster: PgPoolCluster): Future[PooledConnHandle] {.async.} =
+  ## Acquire a read connection from the replica pool (with optional primary
+  ## fallback per `ReplicaFallback`) wrapped in a `PooledConnHandle`.
+  ##
+  ## The caller must release the handle — typically via `defer: h.release()`.
+  ## Forgetting to release leaks the connection until the pool is closed.
+  ## `h.pool` reflects which pool actually served the acquire (replica or
+  ## primary on fallback), so use it for any pool-level operations on the
+  ## borrowed connection.
+  ##
+  ## **No session reset on release.** Prefer `withReadConnection` when the
+  ## body is a single block and automatic `resetSession` is desired; use
+  ## `readConnection` when the handle must outlive a single lexical scope
+  ## (e.g. stored in a struct, passed across `await` boundaries through
+  ## multiple helpers, or selected dynamically).
+  let (conn, pool) = await cluster.acquireRead()
+  return PooledConnHandle(conn: conn, pool: pool)
+
+proc writeConnection*(cluster: PgPoolCluster): Future[PooledConnHandle] {.async.} =
+  ## Acquire a write connection from the primary pool, wrapped in a
+  ## `PooledConnHandle`.
+  ##
+  ## The caller must release the handle — typically via `defer: h.release()`.
+  ## Forgetting to release leaks the connection until the pool is closed.
+  ##
+  ## **No session reset on release.** Prefer `withWriteConnection` when the
+  ## body is a single block and automatic `resetSession` is desired; use
+  ## `writeConnection` when the handle must outlive a single lexical scope.
+  ## For transactional work, use `cluster.withTransaction` instead — handles
+  ## are not transaction-aware.
+  let conn = await cluster.primary.acquire()
+  return PooledConnHandle(conn: conn, pool: cluster.primary)
+
 template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
   ## Acquire a read connection (from replica, with optional primary fallback),
   ## execute `body`, then release.
@@ -124,351 +157,6 @@ template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
       await cluster.primary.resetSession(conn)
       conn.release()
 
-# Macro to generate cluster forwarding procs from compact declarations.
-# Each entry is a bodiless `proc` whose name starts with "read" or "write".
-# The prefix is stripped to derive the connection-level method name.
-# `_: typedesc[T]` parameters are forwarded as `T`.
-
-macro clusterForwards(mode: static[string], body: untyped): untyped =
-  result = newStmtList()
-  for child in body:
-    child.expectKind(nnkProcDef)
-    let name = child[0]
-    let genericParams = child[2]
-    let formalParams = child[3]
-
-    var procIdent =
-      if name.kind == nnkPostfix:
-        name[1]
-      else:
-        name
-    let nameStr = $procIdent
-    var innerStr = nameStr[mode.len .. ^1]
-    innerStr[0] = toLowerAscii(innerStr[0])
-
-    # Build inner call: conn.innerMethod(params...)
-    var call = newCall(newDotExpr(ident"conn", ident(innerStr)))
-    for i in 2 ..< formalParams.len:
-      let param = formalParams[i]
-      if param[1].kind == nnkBracketExpr and param[1][0].eqIdent("typedesc"):
-        call.add(param[1][1])
-      else:
-        call.add(param[0])
-
-    # Check if return type is Future[void]
-    let retType = formalParams[0]
-    let isVoid =
-      retType.kind == nnkBracketExpr and retType.len > 1 and retType[1].eqIdent("void")
-
-    # Build: await call OR return await call
-    let awaitCall = newNimNode(nnkCommand).add(ident"await", call)
-    var tryStmt =
-      if isVoid:
-        newStmtList(awaitCall)
-      else:
-        newStmtList(newNimNode(nnkReturnStmt).add(awaitCall))
-
-    # Build acquire and finally based on mode
-    var acquireStmt, finallyBody: NimNode
-
-    if mode == "read":
-      let acquireCall = newNimNode(nnkCommand).add(
-          ident"await", newCall(ident"acquireRead", ident"cluster")
-        )
-      acquireStmt = newNimNode(nnkLetSection).add(
-          newNimNode(nnkVarTuple).add(
-            ident"conn", ident"pool", newEmptyNode(), acquireCall
-          )
-        )
-      finallyBody = newStmtList(
-        newNimNode(nnkCommand).add(
-          ident"await",
-          newCall(newDotExpr(ident"pool", ident"resetSession"), ident"conn"),
-        ),
-        newCall(newDotExpr(ident"conn", ident"release")),
-      )
-    else:
-      let primary = newDotExpr(ident"cluster", ident"primary")
-      let acquireCall = newNimNode(nnkCommand).add(
-          ident"await", newCall(newDotExpr(primary, ident"acquire"))
-        )
-      acquireStmt = newNimNode(nnkLetSection).add(
-          newIdentDefs(ident"conn", newEmptyNode(), acquireCall)
-        )
-      finallyBody = newStmtList(
-        newNimNode(nnkCommand).add(
-          ident"await",
-          newCall(newDotExpr(primary.copyNimTree(), ident"resetSession"), ident"conn"),
-        ),
-        newCall(newDotExpr(ident"conn", ident"release")),
-      )
-
-    let tryFinally =
-      newNimNode(nnkTryStmt).add(tryStmt, newNimNode(nnkFinally).add(finallyBody))
-
-    var procBody = newStmtList(acquireStmt, tryFinally)
-
-    var newProc = newNimNode(nnkProcDef)
-    newProc.add(name.copyNimTree())
-    newProc.add(newEmptyNode())
-    newProc.add(genericParams.copyNimTree())
-    newProc.add(formalParams.copyNimTree())
-    newProc.add(newNimNode(nnkPragma).add(ident"async"))
-    newProc.add(newEmptyNode())
-    newProc.add(procBody)
-    result.add(newProc)
-
-# Read operations → replica
-
-clusterForwards("read"):
-  proc readQuery*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[QueryResult]
-
-  proc readQueryRowOpt*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[Option[Row]]
-
-  proc readQueryRow*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[Row]
-
-  proc readQueryValue*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[string]
-
-  proc readQueryValue*[T](
-    cluster: PgPoolCluster,
-    _: typedesc[T],
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[T]
-
-  proc readQueryValueOpt*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[Option[string]]
-
-  proc readQueryValueOpt*[T](
-    cluster: PgPoolCluster,
-    _: typedesc[T],
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[Option[T]]
-
-  proc readQueryValueOrDefault*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    default: string = "",
-    timeout: Duration = ZeroDuration,
-  ): Future[string]
-
-  proc readQueryValueOrDefault*[T](
-    cluster: PgPoolCluster,
-    _: typedesc[T],
-    sql: string,
-    params: seq[PgParam] = @[],
-    default: T,
-    timeout: Duration = ZeroDuration,
-  ): Future[T]
-
-  proc readQueryValueOrDefault*[T](
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    default: T,
-    timeout: Duration = ZeroDuration,
-  ): Future[T]
-
-  proc readQueryExists*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[bool]
-
-  proc readQueryColumn*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[seq[string]]
-
-  proc readQueryEach*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    callback: RowCallback,
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[int64]
-
-  proc readSimpleQuery*(cluster: PgPoolCluster, sql: string): Future[seq[QueryResult]]
-
-  proc readSimpleExec*(
-    cluster: PgPoolCluster, sql: string, timeout: Duration = ZeroDuration
-  ): Future[CommandResult]
-
-# Write operations → primary
-
-clusterForwards("write"):
-  proc writeExec*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[CommandResult]
-
-  proc writeQuery*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[QueryResult]
-
-  proc writeQueryRowOpt*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[Option[Row]]
-
-  proc writeQueryRow*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[Row]
-
-  proc writeQueryValue*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[string]
-
-  proc writeQueryValue*[T](
-    cluster: PgPoolCluster,
-    _: typedesc[T],
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[T]
-
-  proc writeQueryValueOpt*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[Option[string]]
-
-  proc writeQueryValueOpt*[T](
-    cluster: PgPoolCluster,
-    _: typedesc[T],
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[Option[T]]
-
-  proc writeQueryValueOrDefault*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    default: string = "",
-    timeout: Duration = ZeroDuration,
-  ): Future[string]
-
-  proc writeQueryValueOrDefault*[T](
-    cluster: PgPoolCluster,
-    _: typedesc[T],
-    sql: string,
-    params: seq[PgParam] = @[],
-    default: T,
-    timeout: Duration = ZeroDuration,
-  ): Future[T]
-
-  proc writeQueryValueOrDefault*[T](
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    default: T,
-    timeout: Duration = ZeroDuration,
-  ): Future[T]
-
-  proc writeQueryExists*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[bool]
-
-  proc writeQueryColumn*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[seq[string]]
-
-  proc writeQueryEach*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    callback: RowCallback,
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[int64]
-
-  proc writeExecInTransaction*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
-  ): Future[CommandResult]
-
-  proc writeQueryInTransaction*(
-    cluster: PgPoolCluster,
-    sql: string,
-    params: seq[PgParam] = @[],
-    resultFormat: ResultFormat = rfAuto,
-    timeout: Duration = ZeroDuration,
-  ): Future[QueryResult]
-
-  proc writeSimpleQuery*(cluster: PgPoolCluster, sql: string): Future[seq[QueryResult]]
-
-  proc writeSimpleExec*(
-    cluster: PgPoolCluster, sql: string, timeout: Duration = ZeroDuration
-  ): Future[CommandResult]
-
-  proc writeNotify*(
-    cluster: PgPoolCluster,
-    channel: string,
-    payload: string = "",
-    timeout: Duration = ZeroDuration,
-  ): Future[void]
-
 macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool.
   ## On exception, ROLLBACK is issued automatically.
@@ -484,10 +172,11 @@ macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped 
   ##   cluster.withTransaction(conn, opts, seconds(5)):
   ##     conn.exec(...)
   ##
-  ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
-  ## directly — not `cluster.writeExec(...)` / `cluster.writeQuery(...)`.
-  ## Cluster methods acquire a separate connection, so those statements would
-  ## run outside this transaction.
+  ## **Warning:** Inside the body, run statements on the bound `conn`
+  ## directly (`conn.exec(...)` / `conn.query(...)`). Calling
+  ## `cluster.writeConnection()` / `cluster.readConnection()` inside the body
+  ## acquires a *separate* connection from the pool, so any statements issued
+  ## through that handle run outside this transaction.
   var connIdent, body: NimNode
   var beginSql: NimNode
   var txTimeout: NimNode
