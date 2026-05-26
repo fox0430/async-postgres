@@ -63,12 +63,7 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
     conn.pendingStmtCloses.add(evicted.name)
   var entry = cached
   if entry.resultFormats.len == 0 and entry.fields.len > 0:
-    var extraOids: seq[int32]
-    if conn.hstoreOid != 0:
-      extraOids.add(conn.hstoreOid)
-    if conn.hstoreArrayOid != 0:
-      extraOids.add(conn.hstoreArrayOid)
-    entry.resultFormats = buildResultFormats(entry.fields, extraOids)
+    entry.resultFormats = buildResultFormats(entry.fields)
     entry.colFmts = newSeq[int16](entry.fields.len)
     entry.colOids = newSeq[int32](entry.fields.len)
     for i in 0 ..< entry.fields.len:

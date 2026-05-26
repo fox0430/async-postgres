@@ -339,7 +339,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
 
 # Multi-host failover probe
 
-proc bytesToString(data: seq[byte]): string =
+proc bytesToString*(data: seq[byte]): string =
   result = newString(data.len)
   for i in 0 ..< data.len:
     result[i] = char(data[i])
