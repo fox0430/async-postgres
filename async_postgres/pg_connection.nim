@@ -29,6 +29,10 @@
 ##                                  and the SCRAM/require_auth helpers.
 ## - `pg_connection/notify`       — LISTEN/NOTIFY pump, `waitNotification`,
 ##                                  `reconnectInPlace`.
+## - `pg_connection/type_lookup`  — `lookupTypeOids` generic helper to
+##                                  resolve type names to OIDs via
+##                                  `to_regtype` (extension types like
+##                                  `hstore`, `citext`, etc.).
 ##
 ## Every public symbol previously defined in this file is re-exported from
 ## here, so existing `import async_postgres/pg_connection` (or the
@@ -40,7 +44,8 @@
 
 import pg_errors
 import
-  pg_connection/[types, dsn, buffer_io, ssl, cache, simple_query, lifecycle, notify]
+  pg_connection/
+    [types, dsn, buffer_io, ssl, cache, simple_query, lifecycle, notify, type_lookup]
 
 export pg_errors
-export types, dsn, buffer_io, ssl, cache, simple_query, lifecycle, notify
+export types, dsn, buffer_io, ssl, cache, simple_query, lifecycle, notify, type_lookup

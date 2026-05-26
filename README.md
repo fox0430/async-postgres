@@ -45,7 +45,7 @@ Async PostgreSQL client in Nim.
 - Text search types (`tsvector`, `tsquery`)
 - Bit string types (`bit`, `varbit`)
 - Interval type (`PgInterval`)
-- hstore type (`PgHstore`)
+- hstore type (`PgHstore` — extension; requires `lookupTypeOids` for binary encoding)
 - XML type (`PgXml`)
 
 ### Performance

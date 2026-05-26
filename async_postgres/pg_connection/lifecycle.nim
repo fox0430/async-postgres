@@ -106,13 +106,6 @@ proc selectScramMechanism*(
         "channel binding is disabled, but server only offered SCRAM-SHA-256-PLUS",
       )
 
-# Internal helpers
-
-proc bytesToString(data: seq[byte]): string =
-  result = newString(data.len)
-  for i in 0 ..< data.len:
-    result[i] = char(data[i])
-
 # Single-host bootstrap
 
 proc connectToHost*(
@@ -364,53 +357,6 @@ proc connectToHost*(
             break readyLoop
           of bmkErrorResponse:
             raise newException(PgConnectionError, formatError(msg.errorFields))
-          else:
-            discard
-        await conn.fillRecvBuf()
-
-    # Discover extension type OIDs (hstore, etc.).
-    # Physical replication connections (``replication=true``) reject any SQL
-    # other than replication commands, so we skip the discovery — hstore is
-    # never relevant on a physical streaming connection anyway. PostgreSQL
-    # treats ``replication`` parameter values case-insensitively, so do the
-    # same here.
-    var isPhysicalReplication = false
-    for (k, v) in config.extraParams:
-      if cmpIgnoreCase(k, "replication") == 0 and cmpIgnoreCase(v, "true") == 0:
-        isPhysicalReplication = true
-        break
-    if isPhysicalReplication:
-      return conn
-    conn.state = csBusy
-    await conn.sendMsg(
-      encodeQuery("SELECT oid, typarray FROM pg_type WHERE oid = to_regtype('hstore')")
-    )
-    block discoverLoop:
-      while true:
-        while (let opt = conn.nextMessage(); opt.isSome):
-          let msg = opt.get
-          case msg.kind
-          of bmkRowDescription:
-            discard
-          of bmkDataRow:
-            if msg.columns.len > 0 and msg.columns[0].isSome:
-              try:
-                conn.hstoreOid = int32(parseInt(bytesToString(msg.columns[0].get)))
-              except ValueError:
-                discard
-            if msg.columns.len > 1 and msg.columns[1].isSome:
-              try:
-                conn.hstoreArrayOid = int32(parseInt(bytesToString(msg.columns[1].get)))
-              except ValueError:
-                discard
-          of bmkCommandComplete, bmkEmptyQueryResponse:
-            discard
-          of bmkReadyForQuery:
-            conn.txStatus = msg.txStatus
-            conn.state = csReady
-            break discoverLoop
-          of bmkErrorResponse:
-            discard
           else:
             discard
         await conn.fillRecvBuf()

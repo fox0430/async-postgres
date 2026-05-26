@@ -215,12 +215,6 @@ type
       ## current cache size). Flushed by ``flushPendingStmtCloses`` at the
       ## start of the next Extended Query send phase so the leak is bounded
       ## to the gap until the next operation.
-    hstoreOid*: int32
-      ## Dynamic OID for the hstore extension type; 0 if not available.
-      ## Resolved once at connect time via ``to_regtype('hstore')``, which
-      ## follows the connection's ``search_path`` at that moment. Later
-      ## ``SET search_path`` changes do not refresh this value.
-    hstoreArrayOid*: int32 ## Dynamic OID for hstore[] array; 0 if not available
     heldSessionLocks*: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
       ## API. The pool releases or discards connections with a non-zero count
@@ -529,26 +523,6 @@ else:
     ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
 
 const RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
-
-# Convenience overloads for hstore parameter encoding using a connection's
-# discovered OIDs (so callers don't have to plumb them through manually).
-
-proc toPgBinaryParam*(conn: PgConnection, v: PgHstore): PgParam {.inline.} =
-  ## Convenience overload: encode hstore in binary using ``conn.hstoreOid``.
-  ## Raises ``PgTypeError`` if the hstore extension OID has not been discovered
-  ## (e.g. extension not installed on the server).
-  if conn.hstoreOid == 0:
-    raise newException(PgTypeError, "hstore OID not available on this connection")
-  toPgBinaryParam(v, conn.hstoreOid)
-
-proc toPgBinaryParam*(conn: PgConnection, v: seq[PgHstore]): PgParam {.inline.} =
-  ## Convenience overload: encode ``hstore[]`` in binary using
-  ## ``conn.hstoreOid`` and ``conn.hstoreArrayOid``. Raises ``PgTypeError`` if
-  ## either OID has not been discovered.
-  if conn.hstoreOid == 0 or conn.hstoreArrayOid == 0:
-    raise
-      newException(PgTypeError, "hstore/hstore[] OIDs not available on this connection")
-  toPgBinaryParam(v, conn.hstoreOid, conn.hstoreArrayOid)
 
 # Internal accessor for cross-module use within the library
 
