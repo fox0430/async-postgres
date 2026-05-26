@@ -467,6 +467,44 @@ suite "Pool acquire":
     let acquired = waitFor acquireFut
     check acquired == conn
 
+suite "Pool acquireHandle":
+  test "acquireHandle returns handle pairing conn with its pool":
+    let pool = makePool()
+    let conn = mockConn(pool = pool)
+    pool.idle.addLast(conn.toPooled())
+
+    let h = waitFor pool.acquireHandle()
+    check h.conn == conn
+    check h.pool == pool
+    check pool.active == 1
+    check pool.idle.len == 0
+
+  test "release(handle) returns conn to idle":
+    let pool = makePool()
+    let conn = mockConn(pool = pool)
+    pool.idle.addLast(conn.toPooled())
+
+    let h = waitFor pool.acquireHandle()
+    h.release()
+    check pool.active == 0
+    check pool.idle.len == 1
+
+  test "release(handle) is idempotent — second call is a no-op":
+    let pool = makePool()
+    let conn = mockConn(pool = pool)
+    pool.idle.addLast(conn.toPooled())
+
+    let h = waitFor pool.acquireHandle()
+    h.release()
+    check pool.active == 0
+    check pool.idle.len == 1
+
+    # Second release must not double-return the connection, decrement active
+    # below zero, or otherwise corrupt pool state.
+    h.release()
+    check pool.active == 0
+    check pool.idle.len == 1
+
 suite "Pool close":
   test "close cancels waiters":
     let pool = makePool()
