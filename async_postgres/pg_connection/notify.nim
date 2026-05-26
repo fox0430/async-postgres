@@ -61,8 +61,6 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.txStatus = newConn.txStatus
   conn.state = csReady
   conn.createdAt = newConn.createdAt
-  conn.hstoreOid = newConn.hstoreOid
-  conn.hstoreArrayOid = newConn.hstoreArrayOid
   for ch in conn.listenChannels:
     discard await conn.simpleQuery("LISTEN " & quoteIdentifier(ch))
 

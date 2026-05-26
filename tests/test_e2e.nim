@@ -10645,13 +10645,16 @@ suite "E2E: Numeric / binary / JSON array types":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
-      doAssert conn.hstoreOid != 0
-      doAssert conn.hstoreArrayOid != 0
+      let oids = await conn.lookupTypeOids(@["hstore"])
+      doAssert oids.hasKey("hstore")
+      let info = oids["hstore"]
+      doAssert info.oid != 0
+      doAssert info.arrayOid != 0
       var h1: PgHstore = initTable[string, Option[string]]()
       h1["x"] = some("y")
       var h2: PgHstore = initTable[string, Option[string]]()
       h2["nul"] = none(string)
-      let bin = toPgBinaryParam(@[h1, h2], conn.hstoreOid, conn.hstoreArrayOid)
+      let bin = toPgBinaryParam(@[h1, h2], info.oid, info.arrayOid)
       let res = await conn.query("SELECT $1", @[bin])
       doAssert res.rows.len == 1
       let arr = res.rows[0].getHstoreArray(0)
@@ -10662,26 +10665,10 @@ suite "E2E: Numeric / binary / JSON array types":
 
     waitFor t()
 
-  test "hstore array roundtrip (binary, conn overload)":
-    proc t() {.async.} =
-      let conn = await connect(plainConfig())
-      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
-      var h1: PgHstore = initTable[string, Option[string]]()
-      h1["k"] = some("v")
-      let res = await conn.query("SELECT $1", @[conn.toPgBinaryParam(@[h1])])
-      doAssert res.rows.len == 1
-      let arr = res.rows[0].getHstoreArray(0)
-      doAssert arr.len == 1
-      doAssert arr[0] == h1
-      await conn.close()
-
-    waitFor t()
-
-  test "hstore OID discovery respects search_path":
-    # to_regtype('hstore') must return NULL — and hstoreOid must stay 0 —
-    # when the connection's startup search_path excludes the schema where
-    # hstore is installed. Guards against regressing to a typname-only
-    # lookup that would resolve hstore regardless of search_path.
+  test "lookupTypeOids respects search_path":
+    # to_regtype('hstore') returns NULL when the connection's search_path
+    # excludes the schema where hstore is installed; lookupTypeOids must
+    # omit it from the result table.
     proc t() {.async.} =
       let setup = await connect(plainConfig())
       discard await setup.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
@@ -10690,8 +10677,8 @@ suite "E2E: Numeric / binary / JSON array types":
       var cfg = plainConfig()
       cfg.extraParams = @[("search_path", "pg_catalog")]
       let conn = await connect(cfg)
-      doAssert conn.hstoreOid == 0
-      doAssert conn.hstoreArrayOid == 0
+      let oids = await conn.lookupTypeOids(@["hstore"])
+      doAssert not oids.hasKey("hstore")
       await conn.close()
 
     waitFor t()
@@ -10969,5 +10956,93 @@ suite "E2E: queryRowOpt via pool":
       let empty = await pool.queryRowOpt("SELECT 1 WHERE false")
       doAssert empty.isNone
       await pool.close()
+
+    waitFor t()
+
+suite "E2E: lookupTypeOids":
+  test "resolves multiple types in one round trip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      let oids = await conn.lookupTypeOids(@["int4", "text", "hstore"])
+      doAssert oids.hasKey("int4")
+      doAssert oids["int4"].oid == 23
+      doAssert oids.hasKey("text")
+      doAssert oids["text"].oid == 25
+      doAssert oids.hasKey("hstore")
+      doAssert oids["hstore"].oid != 0
+      doAssert oids["hstore"].arrayOid != 0
+      await conn.close()
+
+    waitFor t()
+
+  test "unknown types omitted from result":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let oids = await conn.lookupTypeOids(@["int4", "nonexistent_xyz_type"])
+      doAssert oids.hasKey("int4")
+      doAssert not oids.hasKey("nonexistent_xyz_type")
+      doAssert oids.len == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "empty names returns empty table without round trip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let oids = await conn.lookupTypeOids(newSeq[string]())
+      doAssert oids.len == 0
+      await conn.close()
+
+    waitFor t()
+
+  test "raises PgConnectionError when connection not ready":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      await conn.close()
+      var raised = false
+      try:
+        discard await conn.lookupTypeOids(@["int4"])
+      except PgConnectionError:
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "rejects type names with unsafe characters":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.lookupTypeOids(@["x'; DROP TABLE--"])
+      except PgTypeError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "array OID populated for scalar types":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let oids = await conn.lookupTypeOids(@["int4"])
+      doAssert oids["int4"].arrayOid == 1007 # _int4
+      await conn.close()
+
+    waitFor t()
+
+  test "hstore column returned as text decodes via getHstore":
+    # cache.nim no longer auto-flips hstore columns to binary; this confirms
+    # that hstore values still decode through the text path.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      let res = await conn.query("SELECT 'a=>1,b=>NULL'::hstore", newSeq[PgParam]())
+      doAssert res.rows.len == 1
+      let h = res.rows[0].getHstore(0)
+      doAssert h["a"] == some("1")
+      doAssert h["b"].isNone
+      await conn.close()
 
     waitFor t()
