@@ -67,35 +67,6 @@ suite "Network failure: handshake":
     waitFor testBody()
     check raised
 
-  test "handshake succeeds but hstore discovery is dropped mid-response":
-    # Server completes auth + ready, but closes the socket after the client's
-    # hstore discovery query, before sending any response.
-    var raised = false
-
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          await sendFullHandshake(st)
-          discard await drainFrontendMessage(st) # the hstore query
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        await conn.close()
-      except CatchableError:
-        raised = true
-      await serverFut
-      await closeServer(ms)
-
-    waitFor testBody()
-    check raised
-
 # Malformed / truncated backend messages
 
 suite "Network failure: malformed server messages":

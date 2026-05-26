@@ -185,25 +185,13 @@ proc sendFullHandshake*(
   resp.add(buildReadyForQuery('I'))
   await sendBytes(client, resp)
 
-proc sendEmptyHstoreDiscovery*(client: MockClient) {.async.} =
-  ## Respond to the post-handshake hstore OID discovery query with an empty
-  ## result set (CommandComplete "SELECT 0" + ReadyForQuery). Leaves the
-  ## client in `csReady` state.
-  var resp: seq[byte]
-  resp.add(buildCommandComplete("SELECT 0"))
-  resp.add(buildReadyForQuery('I'))
-  await sendBytes(client, resp)
-
 proc acceptAndReady*(
     ms: MockServer, pid: int32 = 1234, secretKey: int32 = 5678
 ): Future[MockClient] {.async.} =
-  ## End-to-end helper: accept a client, complete startup + handshake, and
-  ## answer the hstore OID discovery query with an empty result. On return
-  ## the client is positioned at `csReady` with no outstanding requests.
+  ## End-to-end helper: accept a client and complete startup + handshake.
+  ## On return the client is positioned at `csReady` with no outstanding
+  ## requests.
   let client = await ms.accept()
   await drainStartupMessage(client)
   await sendFullHandshake(client, pid, secretKey)
-  # The connect() path issues the hstore discovery query next.
-  discard await drainFrontendMessage(client)
-  await sendEmptyHstoreDiscovery(client)
   client

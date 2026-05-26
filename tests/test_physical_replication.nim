@@ -286,9 +286,6 @@ suite "connectReplication mode":
         {.cast(gcsafe).}:
           capturedStartupBody = body
         await sendFullHandshake(client)
-        # The post-handshake hstore discovery only runs for rmDatabase
-        # connections (replication=database). For rmPhysical the library
-        # skips it because SQL on user databases is not permitted.
         await closeClient(client)
 
       let serverFut = serverHandler()
