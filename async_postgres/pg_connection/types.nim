@@ -137,7 +137,7 @@ type
   NoticeCallback* = proc(notice: Notice) {.gcsafe, raises: [].}
     ## Callback invoked when a notice/warning message arrives.
 
-  CachedStmt* = object ## A cached prepared statement in the LRU statement cache.
+  CachedStmt* = ref object ## A cached prepared statement in the LRU statement cache.
     name*: string ## Server-side statement name ("_sc_1", "_sc_2", ...)
     fields*: seq[FieldDescription] ## From Describe(Statement), formatCode=0
     paramOids*: seq[int32]

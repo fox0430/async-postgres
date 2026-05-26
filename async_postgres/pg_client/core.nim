@@ -120,7 +120,7 @@ proc paramOidsMatch*(cachedOids: openArray[int32], params: openArray[PgParam]): 
 proc invalidateIfOidMismatch*(
     conn: PgConnection,
     sql: string,
-    cached: ptr CachedStmt,
+    cached: CachedStmt,
     currentOids: openArray[int32],
     cacheHit: var bool,
 ) =
@@ -144,7 +144,7 @@ proc invalidateIfOidMismatch*(
 proc invalidateIfOidMismatch*(
     conn: PgConnection,
     sql: string,
-    cached: ptr CachedStmt,
+    cached: CachedStmt,
     params: openArray[PgParam],
     cacheHit: var bool,
 ) =

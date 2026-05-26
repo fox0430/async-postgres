@@ -28,15 +28,17 @@ proc clearStmtCache*(conn: PgConnection) =
   conn.stmtCacheLru = initDoublyLinkedList[string]()
   conn.pendingStmtCloses.setLen(0)
 
-proc lookupStmtCache*(conn: PgConnection, sql: string): ptr CachedStmt =
+proc lookupStmtCache*(conn: PgConnection, sql: string): CachedStmt =
   ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
-  ## Returns nil on miss. The returned pointer is valid until the next cache mutation.
+  ## Returns ``nil`` on miss. Because ``CachedStmt`` is a ``ref``, the returned
+  ## value remains valid even if the cache is mutated afterwards — the entry's
+  ## lifetime is extended by the reference.
   if conn.stmtCacheCapacity <= 0:
     return nil
   conn.stmtCache.withValue(sql, entry):
     conn.stmtCacheLru.remove(entry.lruNode)
     conn.stmtCacheLru.append(entry.lruNode)
-    return addr entry[]
+    return entry[]
   return nil
 
 proc evictStmtCache*(conn: PgConnection): CachedStmt =
@@ -61,17 +63,16 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   while conn.stmtCache.len >= conn.stmtCacheCapacity:
     let evicted = conn.evictStmtCache()
     conn.pendingStmtCloses.add(evicted.name)
-  var entry = cached
-  if entry.resultFormats.len == 0 and entry.fields.len > 0:
-    entry.resultFormats = buildResultFormats(entry.fields)
-    entry.colFmts = newSeq[int16](entry.fields.len)
-    entry.colOids = newSeq[int32](entry.fields.len)
-    for i in 0 ..< entry.fields.len:
-      entry.colOids[i] = entry.fields[i].typeOid
-      entry.colFmts[i] = entry.resultFormats[i]
+  if cached.resultFormats.len == 0 and cached.fields.len > 0:
+    cached.resultFormats = buildResultFormats(cached.fields)
+    cached.colFmts = newSeq[int16](cached.fields.len)
+    cached.colOids = newSeq[int32](cached.fields.len)
+    for i in 0 ..< cached.fields.len:
+      cached.colOids[i] = cached.fields[i].typeOid
+      cached.colFmts[i] = cached.resultFormats[i]
   let node = newDoublyLinkedNode(sql)
-  entry.lruNode = node
-  conn.stmtCache[sql] = entry
+  cached.lruNode = node
+  conn.stmtCache[sql] = cached
   conn.stmtCacheLru.append(node)
 
 proc removeStmtCache*(conn: PgConnection, sql: string) =
