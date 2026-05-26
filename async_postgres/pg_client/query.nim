@@ -26,7 +26,7 @@ proc queryImpl*(
       newSeq[int16](params.len)
 
   let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
+  var cacheHit = cached.isSome
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
@@ -39,12 +39,12 @@ proc queryImpl*(
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
+    stmtName = cached.get.name
+    cachedFields = cached.get.fields
+    cachedColFmts = cached.get.colFmts
+    cachedColOids = cached.get.colOids
     effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+      if resultFormats.len == 0: cached.get.resultFormats else: resultFormats
     conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()
@@ -89,7 +89,7 @@ proc queryImpl*(
   conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
+  var cacheHit = cached.isSome
   conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
   var cacheMiss = false
   var stmtName = ""
@@ -102,12 +102,12 @@ proc queryImpl*(
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
+    stmtName = cached.get.name
+    cachedFields = cached.get.fields
+    cachedColFmts = cached.get.colFmts
+    cachedColOids = cached.get.colOids
     effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+      if resultFormats.len == 0: cached.get.resultFormats else: resultFormats
     conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()
@@ -153,7 +153,7 @@ proc queryEachImpl*(
   conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
+  var cacheHit = cached.isSome
   conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
   var cacheMiss = false
   var stmtName = ""
@@ -166,12 +166,12 @@ proc queryEachImpl*(
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
+    stmtName = cached.get.name
+    cachedFields = cached.get.fields
+    cachedColFmts = cached.get.colFmts
+    cachedColOids = cached.get.colOids
     effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+      if resultFormats.len == 0: cached.get.resultFormats else: resultFormats
     conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()
@@ -289,7 +289,7 @@ proc queryInlineImpl*(
   conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
+  var cacheHit = cached.isSome
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
@@ -301,12 +301,12 @@ proc queryInlineImpl*(
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
+    stmtName = cached.get.name
+    cachedFields = cached.get.fields
+    cachedColFmts = cached.get.colFmts
+    cachedColOids = cached.get.colOids
     effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+      if resultFormats.len == 0: cached.get.resultFormats else: resultFormats
     conn.sendBuf.addBindRaw(
       "", stmtName, paramFormats, data, ranges, effectiveResultFormats
     )

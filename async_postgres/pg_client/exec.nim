@@ -24,7 +24,7 @@ proc execImpl*(
       newSeq[int16](params.len)
 
   let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
+  var cacheHit = cached.isSome
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
@@ -32,7 +32,7 @@ proc execImpl*(
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
-    stmtName = cached.name
+    stmtName = cached.get.name
     conn.sendBuf.addBind("", stmtName, formats, params)
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()
@@ -70,7 +70,7 @@ proc execImpl*(
   conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
+  var cacheHit = cached.isSome
   conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
   var cacheMiss = false
   var stmtName = ""
@@ -78,7 +78,7 @@ proc execImpl*(
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
-    stmtName = cached.name
+    stmtName = cached.get.name
     conn.sendBuf.addBind("", stmtName, params)
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()
@@ -152,7 +152,7 @@ proc execInlineImpl*(
   conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
+  var cacheHit = cached.isSome
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
@@ -160,7 +160,7 @@ proc execInlineImpl*(
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
-    stmtName = cached.name
+    stmtName = cached.get.name
     conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges)
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()

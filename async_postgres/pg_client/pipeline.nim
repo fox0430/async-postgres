@@ -225,7 +225,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
         paramOidsMatch(cachedOids, p.ops[i].paramOids)
 
     let cached = conn.lookupStmtCache(p.ops[i].sql)
-    var cacheHit = cached != nil
+    var cacheHit = cached.isSome
     if cacheHit:
       # Reject the cache entry if its parse-time OIDs no longer match what
       # this op wants to bind — otherwise the server would interpret bind
@@ -233,8 +233,8 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
       # ``invalidateIfOidMismatch`` because that routes Close through
       # ``pendingStmtCloses``, which was already flushed at the top of
       # ``buildSendPhase`` — so emit the Close directly into sendBuf.
-      if not currentOidsMatch(cached.paramOids):
-        conn.sendBuf.addClose(dkStatement, cached.name)
+      if not currentOidsMatch(cached.get.paramOids):
+        conn.sendBuf.addClose(dkStatement, cached.get.name)
         conn.removeStmtCache(p.ops[i].sql)
         cacheHit = false
     p.ops[i].cacheHit = cacheHit
@@ -243,21 +243,21 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
     p.ops[i].cacheSuperseded = false
 
     if cacheHit:
-      p.ops[i].stmtName = cached.name
+      p.ops[i].stmtName = cached.get.name
       if p.ops[i].kind == pokQuery:
         if not hasCachedStmts:
           result = newSeq[CachedStmt](p.ops.len)
           hasCachedStmts = true
-        result[i] = cached[]
+        result[i] = cached.get
       var effectiveResultFormats: seq[int16]
       if p.ops[i].kind == pokQuery:
         effectiveResultFormats =
           if p.ops[i].resultFormats.len == 0:
-            cached.resultFormats
+            cached.get.resultFormats
           else:
             p.ops[i].resultFormats
         p.ops[i].resultFormats = effectiveResultFormats
-      emitBind(cached.name, effectiveResultFormats)
+      emitBind(cached.get.name, effectiveResultFormats)
       conn.sendBuf.addExecute("", 0)
     elif conn.stmtCacheCapacity > 0:
       var shared = false

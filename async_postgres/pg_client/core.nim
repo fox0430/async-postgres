@@ -120,7 +120,7 @@ proc paramOidsMatch*(cachedOids: openArray[int32], params: openArray[PgParam]): 
 proc invalidateIfOidMismatch*(
     conn: PgConnection,
     sql: string,
-    cached: ptr CachedStmt,
+    cached: Option[CachedStmt],
     currentOids: openArray[int32],
     cacheHit: var bool,
 ) =
@@ -131,20 +131,20 @@ proc invalidateIfOidMismatch*(
   ## cache-miss path runs and re-parses under the new OIDs.
   ##
   ## No-op when ``cacheHit`` is already ``false`` — ``cached`` is only
-  ## dereferenced under the ``cacheHit`` guard, so passing ``nil`` is safe
-  ## as long as ``cacheHit`` is ``false``.
+  ## unwrapped under the ``cacheHit`` guard, so passing ``none(CachedStmt)``
+  ## is safe as long as ``cacheHit`` is ``false``.
   if not cacheHit:
     return
-  if paramOidsMatch(cached.paramOids, currentOids):
+  if paramOidsMatch(cached.get.paramOids, currentOids):
     return
-  conn.pendingStmtCloses.add(cached.name)
+  conn.pendingStmtCloses.add(cached.get.name)
   conn.removeStmtCache(sql)
   cacheHit = false
 
 proc invalidateIfOidMismatch*(
     conn: PgConnection,
     sql: string,
-    cached: ptr CachedStmt,
+    cached: Option[CachedStmt],
     params: openArray[PgParam],
     cacheHit: var bool,
 ) =
@@ -153,9 +153,9 @@ proc invalidateIfOidMismatch*(
   ## the per-parameter ``.oid`` reads happen inside ``paramOidsMatch``.
   if not cacheHit:
     return
-  if paramOidsMatch(cached.paramOids, params):
+  if paramOidsMatch(cached.get.paramOids, params):
     return
-  conn.pendingStmtCloses.add(cached.name)
+  conn.pendingStmtCloses.add(cached.get.name)
   conn.removeStmtCache(sql)
   cacheHit = false
 

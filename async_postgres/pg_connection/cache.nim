@@ -8,10 +8,12 @@
 ##
 ## Re-exported through `pg_connection.nim`.
 
-import std/[tables, lists]
+import std/[options, tables, lists]
 
 import ../pg_protocol
 import types
+
+export options
 
 proc nextStmtName*(conn: PgConnection): string =
   ## Generate the next unique prepared statement name for the statement cache.
@@ -28,16 +30,17 @@ proc clearStmtCache*(conn: PgConnection) =
   conn.stmtCacheLru = initDoublyLinkedList[string]()
   conn.pendingStmtCloses.setLen(0)
 
-proc lookupStmtCache*(conn: PgConnection, sql: string): ptr CachedStmt =
+proc lookupStmtCache*(conn: PgConnection, sql: string): Option[CachedStmt] =
   ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
-  ## Returns nil on miss. The returned pointer is valid until the next cache mutation.
+  ## Returns ``none(CachedStmt)`` on miss. The returned value is an independent
+  ## copy — callers can safely mutate the cache afterwards.
   if conn.stmtCacheCapacity <= 0:
-    return nil
+    return none(CachedStmt)
   conn.stmtCache.withValue(sql, entry):
     conn.stmtCacheLru.remove(entry.lruNode)
     conn.stmtCacheLru.append(entry.lruNode)
-    return addr entry[]
-  return nil
+    return some(entry[])
+  return none(CachedStmt)
 
 proc evictStmtCache*(conn: PgConnection): CachedStmt =
   ## Evict the least recently used entry from the cache. Returns the evicted entry.
