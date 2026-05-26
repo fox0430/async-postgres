@@ -28,30 +28,43 @@ proc main() {.async.} =
   defer:
     await cluster.close()
 
-  # Write operations go to the primary
-  discard await cluster.writeExec(
-    "CREATE TABLE IF NOT EXISTS messages (id serial PRIMARY KEY, body text NOT NULL)"
-  )
-  discard await cluster.writeExec("TRUNCATE messages")
-  discard
-    await cluster.writeExec("INSERT INTO messages (body) VALUES ('hello'), ('world')")
-
-  # Read operations go to the replica (or primary as fallback)
-  let res = await cluster.readQuery("SELECT id, body FROM messages ORDER BY id")
-  echo "Messages:"
-  for row in res.rows:
-    echo "  id=", row.getInt("id"), " body=", row.getStr("body")
-
-  # Using withWriteConnection / withReadConnection for multi-statement operations
+  # Write operations go to the primary. `withWriteConnection` is the safest
+  # default: it auto-releases and runs `resetSession` afterwards.
   cluster.withWriteConnection(conn):
-    discard
-      await conn.exec("INSERT INTO messages (body) VALUES ('from withWriteConnection')")
+    discard await conn.exec(
+      "CREATE TABLE IF NOT EXISTS messages (id serial PRIMARY KEY, body text NOT NULL)"
+    )
+    discard await conn.exec("TRUNCATE messages")
+    discard await conn.exec("INSERT INTO messages (body) VALUES ('hello'), ('world')")
 
-  cluster.withReadConnection(readConn):
-    let count = await readConn.queryValue(int64, "SELECT count(*) FROM messages")
+  # Read operations go to the replica (or primary as fallback).
+  cluster.withReadConnection(conn):
+    let res = await conn.query("SELECT id, body FROM messages ORDER BY id")
+    echo "Messages:"
+    for row in res.rows:
+      echo "  id=", row.getInt("id"), " body=", row.getStr("body")
+
+    let count = await conn.queryValue(int64, "SELECT count(*) FROM messages")
     echo "\nTotal messages: ", count
 
+  # Handle pattern: use `readConnection` / `writeConnection` when the borrowed
+  # connection must outlive a single lexical scope — e.g. selected dynamically,
+  # stored on a struct, or threaded through multiple helpers. The caller must
+  # `defer: h.release()`, and `resetSession` is NOT run automatically.
+  block:
+    let useReplica = true
+    let h =
+      if useReplica:
+        await cluster.readConnection()
+      else:
+        await cluster.writeConnection()
+    defer:
+      h.release()
+    let body = await h.conn.queryValue(string, "SELECT body FROM messages LIMIT 1")
+    echo "\nDynamic selection: ", body
+
   # Cleanup
-  discard await cluster.writeExec("DROP TABLE messages")
+  cluster.withWriteConnection(conn):
+    discard await conn.exec("DROP TABLE messages")
 
 waitFor main()
