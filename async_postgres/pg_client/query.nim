@@ -33,43 +33,24 @@ proc queryImpl*(
   var cachedFields: seq[FieldDescription]
   var cachedColFmts: seq[int16]
   var cachedColOids: seq[int32]
-
   var effectiveResultFormats: seq[int16]
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
-    effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
-    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    effectiveResultFormats = resultFormats
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, paramOids)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    effectiveResultFormats = resultFormats
-    conn.sendBuf.addParse("", sql, paramOids)
-    conn.sendBuf.addBind("", "", formats, params, effectiveResultFormats)
-    conn.sendBuf.addDescribe(dkPortal, "")
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
+  sendExtendedQuery(
+    conn = conn,
+    resultFormats = resultFormats,
+    cached = cached,
+    cacheHit = cacheHit,
+    cacheMiss = cacheMiss,
+    stmtName = stmtName,
+    cachedFields = cachedFields,
+    cachedColFmts = cachedColFmts,
+    cachedColOids = cachedColOids,
+    effectiveResultFormats = effectiveResultFormats,
+    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
+    bindStep =
+      conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats),
+  )
+  await conn.sendBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -96,43 +77,23 @@ proc queryImpl*(
   var cachedFields: seq[FieldDescription]
   var cachedColFmts: seq[int16]
   var cachedColOids: seq[int32]
-
   var effectiveResultFormats: seq[int16]
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
-    effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
-    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    effectiveResultFormats = resultFormats
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, params)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    effectiveResultFormats = resultFormats
-    conn.sendBuf.addParse("", sql, params)
-    conn.sendBuf.addBind("", "", params, effectiveResultFormats)
-    conn.sendBuf.addDescribe(dkPortal, "")
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
+  sendExtendedQuery(
+    conn = conn,
+    resultFormats = resultFormats,
+    cached = cached,
+    cacheHit = cacheHit,
+    cacheMiss = cacheMiss,
+    stmtName = stmtName,
+    cachedFields = cachedFields,
+    cachedColFmts = cachedColFmts,
+    cachedColOids = cachedColOids,
+    effectiveResultFormats = effectiveResultFormats,
+    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
+    bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
+  )
+  await conn.sendBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -160,43 +121,23 @@ proc queryEachImpl*(
   var cachedFields: seq[FieldDescription]
   var cachedColFmts: seq[int16]
   var cachedColOids: seq[int32]
-
   var effectiveResultFormats: seq[int16]
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
-    effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
-    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    effectiveResultFormats = resultFormats
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, params)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    effectiveResultFormats = resultFormats
-    conn.sendBuf.addParse("", sql, params)
-    conn.sendBuf.addBind("", "", params, effectiveResultFormats)
-    conn.sendBuf.addDescribe(dkPortal, "")
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
+  sendExtendedQuery(
+    conn = conn,
+    resultFormats = resultFormats,
+    cached = cached,
+    cacheHit = cacheHit,
+    cacheMiss = cacheMiss,
+    stmtName = stmtName,
+    cachedFields = cachedFields,
+    cachedColFmts = cachedColFmts,
+    cachedColOids = cachedColOids,
+    effectiveResultFormats = effectiveResultFormats,
+    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
+    bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
+  )
+  await conn.sendBufMsg()
 
   var rowCount: int64 = 0
   queryEachRecvLoop(
@@ -298,44 +239,23 @@ proc queryInlineImpl*(
   var cachedColOids: seq[int32]
   var effectiveResultFormats: seq[int16]
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  if cacheHit:
-    stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
-    effectiveResultFormats =
-      if resultFormats.len == 0: cached.resultFormats else: resultFormats
-    conn.sendBuf.addBindRaw(
+  sendExtendedQuery(
+    conn = conn,
+    resultFormats = resultFormats,
+    cached = cached,
+    cacheHit = cacheHit,
+    cacheMiss = cacheMiss,
+    stmtName = stmtName,
+    cachedFields = cachedFields,
+    cachedColFmts = cachedColFmts,
+    cachedColOids = cachedColOids,
+    effectiveResultFormats = effectiveResultFormats,
+    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
+    bindStep = conn.sendBuf.addBindRaw(
       "", stmtName, paramFormats, data, ranges, effectiveResultFormats
-    )
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    effectiveResultFormats = resultFormats
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, paramOids)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBindRaw(
-      "", stmtName, paramFormats, data, ranges, effectiveResultFormats
-    )
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    effectiveResultFormats = resultFormats
-    conn.sendBuf.addParse("", sql, paramOids)
-    conn.sendBuf.addBindRaw("", "", paramFormats, data, ranges, effectiveResultFormats)
-    conn.sendBuf.addDescribe(dkPortal, "")
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
+    ),
+  )
+  await conn.sendBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(

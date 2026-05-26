@@ -29,32 +29,16 @@ proc execImpl*(
   var cacheMiss = false
   var stmtName = ""
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  if cacheHit:
-    stmtName = cached.name
-    conn.sendBuf.addBind("", stmtName, formats, params)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, paramOids)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBind("", stmtName, formats, params)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    conn.sendBuf.addParse("", sql, paramOids)
-    conn.sendBuf.addBind("", "", formats, params)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
+  sendExtendedExec(
+    conn = conn,
+    cached = cached,
+    cacheHit = cacheHit,
+    cacheMiss = cacheMiss,
+    stmtName = stmtName,
+    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
+    bindStep = conn.sendBuf.addBind("", stmtName, formats, params),
+  )
+  await conn.sendBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
@@ -75,32 +59,16 @@ proc execImpl*(
   var cacheMiss = false
   var stmtName = ""
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  if cacheHit:
-    stmtName = cached.name
-    conn.sendBuf.addBind("", stmtName, params)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, params)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBind("", stmtName, params)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    conn.sendBuf.addParse("", sql, params)
-    conn.sendBuf.addBind("", "", params)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
+  sendExtendedExec(
+    conn = conn,
+    cached = cached,
+    cacheHit = cacheHit,
+    cacheMiss = cacheMiss,
+    stmtName = stmtName,
+    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
+    bindStep = conn.sendBuf.addBind("", stmtName, params),
+  )
+  await conn.sendBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
@@ -157,32 +125,16 @@ proc execInlineImpl*(
   var cacheMiss = false
   var stmtName = ""
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  if cacheHit:
-    stmtName = cached.name
-    conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  elif conn.stmtCacheCapacity > 0:
-    cacheMiss = true
-    stmtName = conn.nextStmtName()
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
-    conn.sendBuf.addParse(stmtName, sql, paramOids)
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
-    conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
-  else:
-    conn.sendBuf.addParse("", sql, paramOids)
-    conn.sendBuf.addBindRaw("", "", paramFormats, data, ranges)
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
-    await conn.sendBufMsg()
+  sendExtendedExec(
+    conn = conn,
+    cached = cached,
+    cacheHit = cacheHit,
+    cacheMiss = cacheMiss,
+    stmtName = stmtName,
+    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
+    bindStep = conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges),
+  )
+  await conn.sendBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
