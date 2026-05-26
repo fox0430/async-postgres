@@ -70,7 +70,7 @@ proc queryDirectImpl*(
       )
 
 proc buildInvalidateOnOidMismatchStmt(
-    connSym, sqlSym, cachedPtrSym, cacheHitSym: NimNode, positional: seq[NimNode]
+    connSym, sqlSym, cachedSym, cacheHitSym: NimNode, positional: seq[NimNode]
 ): NimNode =
   ## AST builder for the cache-hit OID-validation call shared by both direct
   ## macros. Emits a single ``invalidateIfOidMismatch`` call with a
@@ -89,9 +89,7 @@ proc buildInvalidateOnOidMismatchStmt(
   for arg in positional:
     bracket.add(newCall(ident"paramOidOf", arg))
   result = quote:
-    invalidateIfOidMismatch(
-      `connSym`, `sqlSym`, `cachedPtrSym`, `bracket`, `cacheHitSym`
-    )
+    invalidateIfOidMismatch(`connSym`, `sqlSym`, `cachedSym`, `bracket`, `cacheHitSym`)
 
 proc scanPlaceholders(sql: string): tuple[seen: HashSet[int], badZero: bool] =
   ## Compile-time SQL scanner: walks ``sql`` and collects every ``$N``
@@ -356,7 +354,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   let connSym = genSym(nskLet, "conn")
   let sqlSym = genSym(nskLet, "sql")
   let timeoutSym = genSym(nskLet, "timeout")
-  let cachedPtrSym = genSym(nskLet, "cachedPtr")
+  let cachedSym = genSym(nskLet, "cached")
   let cacheHitSym = genSym(nskVar, "cacheHit")
   let cacheMissSym = genSym(nskVar, "cacheMiss")
   let stmtNameSym = genSym(nskVar, "stmtName")
@@ -372,8 +370,8 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     `connSym`.checkReady()
     `connSym`.state = csBusy
 
-    let `cachedPtrSym` = `connSym`.lookupStmtCache(`sqlSym`)
-    var `cacheHitSym` = `cachedPtrSym` != nil
+    let `cachedSym` = `connSym`.lookupStmtCache(`sqlSym`)
+    var `cacheHitSym` = `cachedSym` != nil
     var `cacheMissSym` = false
     var `stmtNameSym` = ""
     var `cachedFieldsSym`: seq[FieldDescription]
@@ -382,7 +380,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     var `colOidsSym`: seq[int32]
 
   result.add buildInvalidateOnOidMismatchStmt(
-    connSym, sqlSym, cachedPtrSym, cacheHitSym, positional
+    connSym, sqlSym, cachedSym, cacheHitSym, positional
   )
 
   # Helper to build addBindDirect call with args
@@ -403,11 +401,11 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   # Cache hit path
   let hitBlock = newStmtList()
   hitBlock.add quote do:
-    `stmtNameSym` = `cachedPtrSym`.name
-    `cachedFieldsSym` = `cachedPtrSym`.fields
-    `colFmtsSym` = `cachedPtrSym`.colFmts
-    `colOidsSym` = `cachedPtrSym`.colOids
-    `effectiveRfSym` = `cachedPtrSym`.resultFormats
+    `stmtNameSym` = `cachedSym`.name
+    `cachedFieldsSym` = `cachedSym`.fields
+    `colFmtsSym` = `cachedSym`.colFmts
+    `colOidsSym` = `cachedSym`.colOids
+    `effectiveRfSym` = `cachedSym`.resultFormats
     `connSym`.sendBuf.setLen(0)
     `connSym`.flushPendingStmtCloses()
   let sendBufNode = newDotExpr(connSym, ident"sendBuf")
@@ -545,7 +543,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   let connSym = genSym(nskLet, "conn")
   let sqlSym = genSym(nskLet, "sql")
   let timeoutSym = genSym(nskLet, "timeout")
-  let cachedPtrSym = genSym(nskLet, "cachedPtr")
+  let cachedSym = genSym(nskLet, "cached")
   let cacheHitSym = genSym(nskVar, "cacheHit")
   let cacheMissSym = genSym(nskVar, "cacheMiss")
   let stmtNameSym = genSym(nskVar, "stmtName")
@@ -557,13 +555,13 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     `connSym`.checkReady()
     `connSym`.state = csBusy
 
-    let `cachedPtrSym` = `connSym`.lookupStmtCache(`sqlSym`)
-    var `cacheHitSym` = `cachedPtrSym` != nil
+    let `cachedSym` = `connSym`.lookupStmtCache(`sqlSym`)
+    var `cacheHitSym` = `cachedSym` != nil
     var `cacheMissSym` = false
     var `stmtNameSym` = ""
 
   result.add buildInvalidateOnOidMismatchStmt(
-    connSym, sqlSym, cachedPtrSym, cacheHitSym, positional
+    connSym, sqlSym, cachedSym, cacheHitSym, positional
   )
 
   proc makeBindDirect(buf, portal, stmt: NimNode, argList: NimNode): NimNode =
@@ -586,7 +584,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   # Cache hit path
   let hitBlock = newStmtList()
   hitBlock.add quote do:
-    `stmtNameSym` = `cachedPtrSym`.name
+    `stmtNameSym` = `cachedSym`.name
     `connSym`.sendBuf.setLen(0)
     `connSym`.flushPendingStmtCloses()
   hitBlock.add(makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, argList))
