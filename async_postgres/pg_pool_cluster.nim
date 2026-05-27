@@ -230,6 +230,78 @@ macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped 
       await `resetSessionSym`(`clusterSym`.primary, `connIdent`)
       `connIdent`.release()
 
+macro withTransactionRetry*(
+    cluster: PgPoolCluster, retryOpts: RetryOptions, args: varargs[untyped]
+): untyped =
+  ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool,
+  ## re-running the whole transaction when it fails with a retryable error
+  ## (by default the serialization_failure / deadlock_detected SQLSTATEs — see
+  ## `RetryOptions`). The primary connection is acquired once and reused across
+  ## attempts. On a non-retryable error, or once `maxAttempts` is exhausted, the
+  ## last exception propagates. Using `return` inside the body is a compile-time
+  ## error.
+  ##
+  ## Usage:
+  ##   cluster.withTransactionRetry(RetryOptions(maxAttempts: 3), conn):
+  ##     await conn.exec(...)
+  ##   cluster.withTransactionRetry(RetryOptions(...), conn, seconds(5)):
+  ##     await conn.exec(...)
+  ##   cluster.withTransactionRetry(RetryOptions(...), conn, opts, seconds(5)):
+  ##     await conn.exec(...)
+  ##
+  ## **Idempotency:** `body` runs once per attempt; non-database side effects are
+  ## repeated on every retry. See `withTransaction` for the in-body `conn`
+  ## warning.
+  var connIdent, body: NimNode
+  var beginSql: NimNode
+  var txTimeout: NimNode
+  case args.len
+  of 2:
+    connIdent = args[0]
+    body = args[1]
+    beginSql = newStrLitNode("BEGIN")
+    txTimeout = bindSym"ZeroDuration"
+  of 3:
+    connIdent = args[0]
+    body = args[2]
+    (beginSql, txTimeout) = buildTxBeginAndTimeout(args[1], "withTransactionRetry")
+  of 4:
+    connIdent = args[0]
+    let opts = args[1]
+    txTimeout = args[2]
+    body = args[3]
+    beginSql = newCall(bindSym"buildBeginSql", opts)
+  else:
+    error(
+      "withTransactionRetry expects (retryOpts, conn, body), (retryOpts, conn, timeout, body), (retryOpts, conn, opts, body), or (retryOpts, conn, opts, timeout, body)",
+      args[0],
+    )
+
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withTransactionRetry is not allowed: COMMIT/ROLLBACK would be skipped",
+      body,
+    )
+
+  let clusterExpr = cluster
+  let clusterSym = genSym(nskLet, "cluster")
+  let retryOptsSym = genSym(nskLet, "retryOpts")
+  let resetSessionSym = bindSym"resetSession"
+  # cluster mirrors its non-retry `withTransaction`: a best-effort ROLLBACK that
+  # swallows errors (no `onCleanupSkipped` wiring), hence useCleanupSkipped = false.
+  let loop = buildRetryTxLoop(
+    connIdent, retryOptsSym, beginSql, txTimeout, body, useCleanupSkipped = false
+  )
+  result = quote:
+    let `clusterSym` = `clusterExpr`
+    let `connIdent` = await `clusterSym`.primary.acquire()
+    let `retryOptsSym` = `retryOpts`
+    try:
+      `loop`
+    finally:
+      await `resetSessionSym`(`clusterSym`.primary, `connIdent`)
+      `connIdent`.release()
+
 template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
   ## Create a pipeline on the primary pool.
   cluster.primary.withPipeline(pipeline):

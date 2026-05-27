@@ -5,21 +5,9 @@
 ## (`exec`, `query`, `queryEach`, `queryDirect`, …) reuses. Re-exported through
 ## `pg_client.nim`; submodules import this module directly via `./core`.
 
-import std/[options, tables]
+import std/[options, tables, math, random]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
-
-const copyBatchSize* = 262144 ## 256KB batch threshold for COPY IN buffering
-
-func toFormatCodes*(rf: ResultFormat): seq[int16] =
-  ## Convert a high-level ResultFormat to wire-protocol format codes.
-  case rf
-  of rfAuto:
-    @[]
-  of rfText:
-    @[0'i16]
-  of rfBinary:
-    @[1'i16]
 
 type
   IsolationLevel* = enum
@@ -47,6 +35,39 @@ type
     isolation*: IsolationLevel
     access*: AccessMode
     deferrable*: DeferrableMode
+
+  RetryOptions* = object
+    ## Controls how `withTransactionRetry` re-runs a transaction after a
+    ## retryable failure. Relies on Nim object field defaults, so partial
+    ## construction (e.g. ``RetryOptions(maxAttempts: 5)``) leaves the unset
+    ## fields at their defaults below.
+    maxAttempts*: int = 3
+      ## Total attempts including the first. Values ``<= 1`` run the body exactly
+      ## once with no retry (the body always runs at least once).
+    baseDelayMs*: int = 20 ## Backoff before the first retry, in milliseconds.
+    maxDelayMs*: int = 1000 ## Upper bound on the backoff delay, in milliseconds.
+    multiplier*: float = 2.0 ## Exponential growth factor between attempts.
+    jitter*: bool = true
+      ## Full jitter: pick a random delay in ``0 .. computed``. Uses the
+      ## `std/random` global RNG; to de-correlate retries *across processes*
+      ## the application must call ``randomize()`` once at startup — otherwise
+      ## every process replays the same (default-seeded) jitter sequence.
+    retryableStates*: seq[string] = @["40001", "40P01"]
+      ## SQLSTATE codes that trigger a retry. Defaults to serialization_failure
+      ## (40001) and deadlock_detected (40P01) — the transaction-level conflicts
+      ## PostgreSQL recommends resolving by re-running the whole transaction.
+
+const copyBatchSize* = 262144 ## 256KB batch threshold for COPY IN buffering
+
+func toFormatCodes*(rf: ResultFormat): seq[int16] =
+  ## Convert a high-level ResultFormat to wire-protocol format codes.
+  case rf
+  of rfAuto:
+    @[]
+  of rfText:
+    @[0'i16]
+  of rfBinary:
+    @[1'i16]
 
 proc buildBeginSql*(opts: TransactionOptions): string =
   ## Build a BEGIN SQL statement with the specified transaction options
@@ -77,6 +98,30 @@ proc buildBeginSql*(opts: TransactionOptions): string =
     result.add " DEFERRABLE"
   of dmNotDeferrable:
     result.add " NOT DEFERRABLE"
+
+proc isRetryableTxError*(e: ref CatchableError, states: openArray[string]): bool =
+  ## Whether `e` is a `PgQueryError` whose SQLSTATE is in `states`.
+  ## Non-`PgQueryError` failures (connection drops, timeouts) are never
+  ## retryable here: they leave the connection unusable for a fresh attempt.
+  if e of PgQueryError:
+    (ref PgQueryError)(e).sqlState in states
+  else:
+    false
+
+proc backoffDelayMs*(opts: RetryOptions, attempt: int): int =
+  ## Backoff (milliseconds) to wait after the `attempt`-th failure (1-based).
+  ## Exponential ``baseDelayMs * multiplier^(attempt-1)`` capped at `maxDelayMs`;
+  ## with `jitter` the result is randomized within ``0 .. computed`` to spread
+  ## out retries from many contending clients. Jitter draws from the
+  ## `std/random` global RNG — see `RetryOptions.jitter` on calling
+  ## ``randomize()`` for cross-process de-correlation.
+  let raw = opts.baseDelayMs.float * pow(opts.multiplier, float(attempt - 1))
+  var ms = int(min(raw, opts.maxDelayMs.float))
+  if ms < 0:
+    ms = 0
+  if opts.jitter and ms > 0:
+    ms = rand(ms)
+  ms
 
 proc paramOidsMatch*(cachedOids, currentOids: openArray[int32]): bool =
   ## Whether a cached prepared statement's parse-time parameter OIDs are

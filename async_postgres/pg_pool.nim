@@ -1395,6 +1395,78 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
       await `resetSessionSym`(`poolSym`, `connIdent`)
       `connIdent`.release()
 
+macro withTransactionRetry*(
+    pool: PgPool, retryOpts: RetryOptions, args: varargs[untyped]
+): untyped =
+  ## Execute `body` inside a BEGIN/COMMIT transaction on a pooled connection,
+  ## re-running the whole transaction when it fails with a retryable error
+  ## (by default the serialization_failure / deadlock_detected SQLSTATEs — see
+  ## `RetryOptions`). The pooled connection is acquired once and reused across
+  ## attempts; a ROLLBACK between attempts returns it to a clean `tsIdle` state.
+  ## On a non-retryable error, or once `maxAttempts` is exhausted, the last
+  ## exception propagates. Using `return` inside the body is a compile-time error.
+  ##
+  ## Usage:
+  ##   pool.withTransactionRetry(RetryOptions(maxAttempts: 3), conn):
+  ##     await conn.exec(...)
+  ##   pool.withTransactionRetry(RetryOptions(...), conn, seconds(5)):
+  ##     await conn.exec(...)
+  ##   pool.withTransactionRetry(RetryOptions(...), conn, TransactionOptions(isolation: ilSerializable)):
+  ##     await conn.exec(...)
+  ##   pool.withTransactionRetry(RetryOptions(...), conn, opts, seconds(5)):
+  ##     await conn.exec(...)
+  ##
+  ## **Idempotency:** `body` runs once per attempt, so it must be safe to re-run;
+  ## non-database side effects are repeated on every retry. See `withTransaction`
+  ## for the timeout semantics and the in-body `conn.exec(...)` warning.
+  var connIdent, body: NimNode
+  var beginSql: NimNode
+  var txTimeout: NimNode
+  case args.len
+  of 2:
+    connIdent = args[0]
+    body = args[1]
+    beginSql = newStrLitNode("BEGIN")
+    txTimeout = bindSym"ZeroDuration"
+  of 3:
+    connIdent = args[0]
+    body = args[2]
+    (beginSql, txTimeout) = buildTxBeginAndTimeout(args[1], "withTransactionRetry")
+  of 4:
+    connIdent = args[0]
+    let opts = args[1]
+    txTimeout = args[2]
+    body = args[3]
+    beginSql = newCall(bindSym"buildBeginSql", opts)
+  else:
+    error(
+      "withTransactionRetry expects (retryOpts, conn, body), (retryOpts, conn, timeout, body), (retryOpts, conn, opts, body), or (retryOpts, conn, opts, timeout, body)",
+      args[0],
+    )
+
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withTransactionRetry is not allowed: COMMIT/ROLLBACK would be skipped",
+      body,
+    )
+
+  let poolExpr = pool
+  let poolSym = genSym(nskLet, "pool")
+  let retryOptsSym = genSym(nskLet, "retryOpts")
+  let resetSessionSym = bindSym"resetSession"
+  let loop = buildRetryTxLoop(
+    connIdent, retryOptsSym, beginSql, txTimeout, body, useCleanupSkipped = true
+  )
+  result = quote:
+    let `poolSym` = `poolExpr`
+    let `connIdent` = await `poolSym`.acquire()
+    let `retryOptsSym` = `retryOpts`
+    try:
+      `loop`
+    finally:
+      await `resetSessionSym`(`poolSym`, `connIdent`)
+      `connIdent`.release()
+
 macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single
   ## wall-clock deadline that covers `pool.acquire()`, BEGIN, the body, and
@@ -1546,6 +1618,117 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
         raise newException(
           PgTimeoutError, "withTransactionDeadline (pool): acquire timed out"
         )
+
+macro withTransactionRetryDeadline*(
+    pool: PgPool, retryOpts: RetryOptions, args: varargs[untyped]
+): untyped =
+  ## Execute `body` inside a BEGIN/COMMIT transaction on a pooled connection,
+  ## bounded by a single wall-clock deadline that is **shared across all retry
+  ## attempts** (covering `acquire()`, BEGIN, body, and COMMIT of every attempt),
+  ## re-running the whole transaction on a retryable error while budget remains.
+  ##
+  ## Usage:
+  ##   pool.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), conn, seconds(5)):
+  ##     await conn.exec(...)
+  ##   pool.withTransactionRetryDeadline(RetryOptions(...), conn, TransactionOptions(...), seconds(5)):
+  ##     await conn.exec(...)
+  ##
+  ## Each attempt acquires a *fresh* connection (the previous one is released by
+  ## the per-attempt `finally`), so a failed/poisoned connection is dropped by
+  ## the pool's health check rather than reused. Worst-case wall-clock is
+  ## `deadline`, not `maxAttempts * deadline`.
+  ##
+  ## **On deadline exceeded:** the in-flight connection (if any) is invalidated
+  ## and `PgTimeoutError` is raised — never retried. **On a retryable error:**
+  ## ROLLBACK runs with `rollbackGrace` and the transaction is retried if budget
+  ## remains. See `withTransactionDeadline` for the acquire-race / `completed()`
+  ## rationale and the in-body `conn.exec(...)` warning. **Idempotency:** `body`
+  ## runs once per attempt; non-database side effects repeat. Using `return`
+  ## inside the body is a compile-time error.
+  var connIdent, body: NimNode
+  var beginSql: NimNode
+  var deadline: NimNode
+  case args.len
+  of 3:
+    connIdent = args[0]
+    deadline = args[1]
+    body = args[2]
+    beginSql = newStrLitNode("BEGIN")
+  of 4:
+    connIdent = args[0]
+    beginSql = newCall(bindSym"buildBeginSql", args[1])
+    deadline = args[2]
+    body = args[3]
+  else:
+    error(
+      "withTransactionRetryDeadline expects (retryOpts, conn, deadline, body) or (retryOpts, conn, opts, deadline, body)",
+      args[0],
+    )
+
+  if hasReturnStmt(body):
+    error(
+      "'return' inside withTransactionRetryDeadline is not allowed: COMMIT/ROLLBACK would be skipped",
+      body,
+    )
+
+  let poolExpr = pool
+  let poolSym = genSym(nskLet, "pool")
+  let retryOptsSym = genSym(nskLet, "retryOpts")
+  let eSym = genSym(nskLet, "e")
+  let totalDurSym = genSym(nskLet, "totalDur")
+  let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
+  let bodyFnSym = genSym(nskProc, "poolTxBodyRetryDeadline")
+  let connOptSym = genSym(nskVar, "connOpt")
+  let resetSessionSym = bindSym"resetSession"
+  let remainingSym = bindSym"remainingDeadlineDuration"
+  let graceSym = bindSym"rollbackGrace"
+  let invalidateSym = bindSym"invalidateOnTimeout"
+  # The pool variant acquires a fresh connection per attempt, so its cleanup
+  # (ROLLBACK + release) happens inside bodyFn; the outer loop adds no cleanup
+  # and omits the conn-state retry gate (connForStateCheck = nil).
+  let timeoutElse = quote:
+    if `connOptSym`.isSome:
+      `connOptSym`.get.`invalidateSym`("withTransactionRetryDeadline (pool) exceeded")
+    else:
+      raise newException(
+        PgTimeoutError, "withTransactionRetryDeadline (pool): acquire timed out"
+      )
+  let loop = buildRetryDeadlineLoop(
+    bodyFnSym,
+    retryOptsSym,
+    deadlineMomentSym,
+    connForStateCheck = nil,
+    timeoutElse = timeoutElse,
+    catchableCleanup = newStmtList(),
+  )
+  let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
+  result = quote:
+    let `poolSym` = `poolExpr`
+    let `retryOptsSym` = `retryOpts`
+    let `totalDurSym` = `deadline`
+    let `deadlineMomentSym` = Moment.now() + `totalDurSym`
+    var `connOptSym` = none(PgConnection)
+    proc `bodyFnSym`(): Future[void] {.async.} =
+      `connOptSym` = none(PgConnection)
+      let `connIdent` = await `poolSym`.acquire()
+      `connOptSym` = some(`connIdent`)
+      try:
+        discard await `connIdent`.simpleExec(
+          `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
+        )
+        try:
+          `body`
+          discard await `connIdent`.simpleExec(
+            "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
+          )
+        except CatchableError as `eSym`:
+          `bodyCleanup`
+          raise `eSym`
+      finally:
+        await `resetSessionSym`(`poolSym`, `connIdent`)
+        `connIdent`.release()
+
+    `loop`
 
 template withPipeline*(pool: PgPool, pipeline, body: untyped) =
   ## Acquire a connection, create a Pipeline, execute body, then release.
