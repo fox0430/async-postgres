@@ -219,6 +219,118 @@ proc flattenInline*(
   for p in params:
     appendInlineParam(result.data, result.ranges, result.oids, result.formats, p)
 
+template sendExtendedQuery*(
+    conn: PgConnection,
+    resultFormats: seq[int16],
+    cached: CachedStmt,
+    cacheHit, cacheMiss: var bool,
+    stmtName: var string,
+    cachedFields: var seq[FieldDescription],
+    cachedColFmts: var seq[int16],
+    cachedColOids: var seq[int32],
+    effectiveResultFormats: var seq[int16],
+    parseStep, bindStep: untyped,
+) =
+  ## Emit the extended-query wire sequence (Parse/Bind/Describe/Execute/Sync)
+  ## for a `query`-shaped round-trip into `conn.sendBuf`, branching on the
+  ## prepared-statement cache state:
+  ##
+  ## * cache hit  → Bind, Execute, Sync. Pulls `fields`/`colFmts`/`colOids`/
+  ##   `resultFormats` out of `cached` so the recv loop can reuse them.
+  ## * cache miss → optional Close (eviction), Parse, Describe(Statement),
+  ##   Bind, Execute, Sync. `cachedFields`/`cachedColFmts`/`cachedColOids` are
+  ##   left for the recv loop to populate on RowDescription.
+  ## * cache disabled (`stmtCacheCapacity == 0`) → Parse, Bind,
+  ##   Describe(Portal), Execute, Sync. Describe(Portal) is required so the
+  ##   recv loop sees a RowDescription for `QueryResult.fields`.
+  ##
+  ## `parseStep` and `bindStep` are untyped blocks expanded inline so each
+  ## caller can pick the right `addParse` / `addBind` / `addBindRaw` overload
+  ## (PgParam, raw `Option[seq[byte]]` + OIDs, or inline raw data + ranges)
+  ## without going through a proc-pointer indirection. Both blocks reference
+  ## `stmtName` from the outer scope; the template sets it before expansion
+  ## ("" on the cache-disabled path, the cache-named or freshly-generated
+  ## name otherwise).
+  ##
+  ## Precondition: `cached` may be nil iff `cacheHit == false`; the cache-miss
+  ## and cache-disabled branches never read `cached`.
+  conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
+  if cacheHit:
+    stmtName = cached.name
+    cachedFields = cached.fields
+    cachedColFmts = cached.colFmts
+    cachedColOids = cached.colOids
+    # The `cached.resultFormats` fallback is cache-hit-only: cache-miss and
+    # cache-disabled both re-issue Describe, so the server returns fresh
+    # column formats and the caller-supplied `resultFormats` (possibly empty)
+    # is used directly. On a cache hit we skip Describe, so the previously
+    # negotiated formats must be replayed when the caller didn't override.
+    effectiveResultFormats =
+      if resultFormats.len == 0: cached.resultFormats else: resultFormats
+    bindStep
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+  elif conn.stmtCacheCapacity > 0:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    effectiveResultFormats = resultFormats
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    parseStep
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    bindStep
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+  else:
+    stmtName = ""
+    effectiveResultFormats = resultFormats
+    parseStep
+    bindStep
+    conn.sendBuf.addDescribe(dkPortal, "")
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+
+template sendExtendedExec*(
+    conn: PgConnection,
+    cached: CachedStmt,
+    cacheHit, cacheMiss: var bool,
+    stmtName: var string,
+    parseStep, bindStep: untyped,
+) =
+  ## `exec`-shaped counterpart of `sendExtendedQuery`: same 3-branch send
+  ## sequence, but no Describe(Portal) on the cache-disabled path and no
+  ## result-format / cached-column bookkeeping (exec callers discard rows).
+  ## The cache-miss path still issues Describe(Statement) so the recv loop
+  ## can stash parameter OIDs and field info for future cache hits.
+  ##
+  ## Precondition: `cached` may be nil iff `cacheHit == false`.
+  conn.sendBuf.setLen(0)
+  conn.flushPendingStmtCloses()
+  if cacheHit:
+    stmtName = cached.name
+    bindStep
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+  elif conn.stmtCacheCapacity > 0:
+    cacheMiss = true
+    stmtName = conn.nextStmtName()
+    if conn.stmtCache.len >= conn.stmtCacheCapacity:
+      let evicted = conn.evictStmtCache()
+      conn.sendBuf.addClose(dkStatement, evicted.name)
+    parseStep
+    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    bindStep
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+  else:
+    stmtName = ""
+    parseStep
+    bindStep
+    conn.sendBuf.addExecute("", 0)
+    conn.sendBuf.addSync()
+
 template queryRecvLoop*(
     conn: PgConnection,
     sql: string,
