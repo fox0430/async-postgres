@@ -70,6 +70,9 @@ export core.AccessMode
 export core.DeferrableMode
 export core.TransactionOptions
 export core.buildBeginSql
+export core.RetryOptions
+export core.isRetryableTxError
+export core.backoffDelayMs
 
 export
   exec, query, prepared, copy, transaction, transaction_helpers, pipeline, cursor,

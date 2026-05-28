@@ -12,6 +12,7 @@ when hasChronos:
 import ../async_postgres/pg_client {.all.}
 import ../async_postgres/pg_client/core as pg_client_core
 import ../async_postgres/pg_pool {.all.}
+import ../async_postgres/pg_pool_cluster {.all.}
 import ../async_postgres/pg_connection {.all.}
 
 privateAccess(PgConnection)
@@ -842,6 +843,229 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  test "withTransactionRetry retries on serialization failure then commits":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_retry")
+      discard
+        await conn.exec("CREATE TABLE test_tx_retry (id serial PRIMARY KEY, val text)")
+
+      var attempts = 0
+      conn.withTransactionRetry(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false)
+      ):
+        inc attempts
+        discard await conn.exec(
+          "INSERT INTO test_tx_retry (val) VALUES ($1)", @[toPgParam("retried")]
+        )
+        if attempts < 3:
+          raise (ref PgQueryError)(
+            msg: "synthetic serialization failure", sqlState: "40001"
+          )
+
+      doAssert attempts == 3
+      # Only the committed (3rd) attempt's INSERT must survive; the first two
+      # were rolled back.
+      let res = await conn.query("SELECT val FROM test_tx_retry")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "retried"
+
+      discard await conn.exec("DROP TABLE test_tx_retry")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry does not retry a non-retryable error":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      var raised = false
+      try:
+        conn.withTransactionRetry(RetryOptions(maxAttempts: 5, baseDelayMs: 1)):
+          inc attempts
+          raise (ref PgQueryError)(msg: "unique violation", sqlState: "23505")
+      except PgQueryError as e:
+        raised = true
+        doAssert e.sqlState == "23505"
+
+      doAssert raised
+      doAssert attempts == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry exhausts maxAttempts and raises the last error":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      var raised = false
+      try:
+        conn.withTransactionRetry(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false)
+        ):
+          inc attempts
+          raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+      except PgQueryError as e:
+        raised = true
+        doAssert e.sqlState == "40P01"
+
+      doAssert raised
+      doAssert attempts == 3
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            return
+
+    )
+
+  test "isRetryableTxError / backoffDelayMs unit behavior":
+    let opts = RetryOptions()
+    # default retryable states
+    doAssert isRetryableTxError(
+      (ref PgQueryError)(sqlState: "40001"), opts.retryableStates
+    )
+    doAssert isRetryableTxError(
+      (ref PgQueryError)(sqlState: "40P01"), opts.retryableStates
+    )
+    doAssert not isRetryableTxError(
+      (ref PgQueryError)(sqlState: "23505"), opts.retryableStates
+    )
+    # non-PgQueryError is never retryable
+    doAssert not isRetryableTxError((ref ValueError)(msg: "x"), opts.retryableStates)
+    # exponential growth, capped, jitter off => deterministic
+    let g =
+      RetryOptions(baseDelayMs: 10, maxDelayMs: 100, multiplier: 2.0, jitter: false)
+    doAssert backoffDelayMs(g, 1) == 10
+    doAssert backoffDelayMs(g, 2) == 20
+    doAssert backoffDelayMs(g, 3) == 40
+    doAssert backoffDelayMs(g, 10) == 100 # capped at maxDelayMs
+
+  test "pool.withTransactionRetry retries on serialization failure then commits":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 2))
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_retry")
+      discard await pool.exec(
+        "CREATE TABLE test_pool_retry (id serial PRIMARY KEY, val text)"
+      )
+
+      var attempts = 0
+      pool.withTransactionRetry(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn
+      ):
+        inc attempts
+        discard await conn.exec(
+          "INSERT INTO test_pool_retry (val) VALUES ($1)", @[toPgParam("ok")]
+        )
+        if attempts < 3:
+          raise (ref PgQueryError)(msg: "synthetic", sqlState: "40001")
+
+      doAssert attempts == 3
+      let res = await pool.query("SELECT val FROM test_pool_retry")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "ok"
+
+      discard await pool.exec("DROP TABLE test_pool_retry")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetry exhausts maxAttempts and raises":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 2))
+      var attempts = 0
+      var raised = false
+      try:
+        pool.withTransactionRetry(
+          RetryOptions(maxAttempts: 2, baseDelayMs: 1, jitter: false), conn
+        ):
+          inc attempts
+          raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+      except PgQueryError as e:
+        raised = true
+        doAssert e.sqlState == "40P01"
+
+      doAssert raised
+      doAssert attempts == 2
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetry rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+          pool.withTransactionRetry(RetryOptions(), conn):
+            return
+
+    )
+
+  test "cluster.withTransactionRetry retries on serialization failure then commits":
+    proc t() {.async.} =
+      # Point both primary and replica at the local server. Set tsaReadWrite
+      # explicitly so newPoolCluster does not override the replica with
+      # tsaPreferStandby (which the single standalone server would reject).
+      var cfg = plainConfig()
+      cfg.targetSessionAttrs = tsaReadWrite
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2),
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2),
+      )
+      discard await cluster.primaryPool.exec("DROP TABLE IF EXISTS test_cluster_retry")
+      discard await cluster.primaryPool.exec(
+        "CREATE TABLE test_cluster_retry (id serial PRIMARY KEY, val text)"
+      )
+
+      var attempts = 0
+      cluster.withTransactionRetry(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn
+      ):
+        inc attempts
+        discard await conn.exec(
+          "INSERT INTO test_cluster_retry (val) VALUES ($1)", @[toPgParam("ok")]
+        )
+        if attempts < 3:
+          raise (ref PgQueryError)(msg: "synthetic", sqlState: "40001")
+
+      doAssert attempts == 3
+      let res = await cluster.primaryPool.query("SELECT val FROM test_cluster_retry")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "ok"
+
+      discard await cluster.primaryPool.exec("DROP TABLE test_cluster_retry")
+      await cluster.close()
+
+    waitFor t()
+
+  test "cluster.withTransactionRetry rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          cluster.withTransactionRetry(RetryOptions(), conn):
+            return
+
+    )
+
   test "pool.withTransaction commits on success":
     proc t() {.async.} =
       let pool =
@@ -1591,6 +1815,170 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert res.rows[0].getStr(0) == "pool_deadline"
 
       discard await pool.exec("DROP TABLE test_ptxd")
+      await pool.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline retries within budget then commits":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txrd")
+      discard
+        await conn.exec("CREATE TABLE test_txrd (id serial PRIMARY KEY, val text)")
+
+      var attempts = 0
+      conn.withTransactionRetryDeadline(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), seconds(10)
+      ):
+        inc attempts
+        discard
+          await conn.exec("INSERT INTO test_txrd (val) VALUES ($1)", @[toPgParam("rd")])
+        if attempts < 3:
+          raise (ref PgQueryError)(msg: "synthetic", sqlState: "40001")
+
+      doAssert attempts == 3
+      let res = await conn.query("SELECT val FROM test_txrd")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "rd"
+
+      discard await conn.exec("DROP TABLE test_txrd")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline raises PgTimeoutError when body exceeds deadline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 5), milliseconds(300)
+        ):
+          discard await conn.exec("SELECT pg_sleep(2)")
+      except PgTimeoutError:
+        raised = true
+      doAssert raised
+      # Connection invalidated on timeout; close it.
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline exhausts retries and raises the last error":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      var raised = false
+      try:
+        # Long deadline so the loop ends by exhausting maxAttempts (a retryable
+        # error every time), not by running out of budget.
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), seconds(10)
+        ):
+          inc attempts
+          raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+      except PgQueryError as e:
+        raised = true
+        doAssert e.sqlState == "40P01"
+
+      doAssert raised
+      doAssert attempts == 3
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline rejects return at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetryDeadline(RetryOptions(), seconds(5)):
+            return
+
+    )
+
+  test "pool.withTransactionRetryDeadline retries within budget then commits":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptxrd")
+      discard
+        await pool.exec("CREATE TABLE test_ptxrd (id serial PRIMARY KEY, val text)")
+
+      var attempts = 0
+      pool.withTransactionRetryDeadline(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn, seconds(10)
+      ):
+        inc attempts
+        discard await conn.exec(
+          "INSERT INTO test_ptxrd (val) VALUES ($1)", @[toPgParam("prd")]
+        )
+        if attempts < 3:
+          raise (ref PgQueryError)(msg: "synthetic", sqlState: "40001")
+
+      doAssert attempts == 3
+      let res = await pool.query("SELECT val FROM test_ptxrd")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "prd"
+
+      discard await pool.exec("DROP TABLE test_ptxrd")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline exhausts retries and raises the last error":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+
+      var attempts = 0
+      var raised = false
+      try:
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn, seconds(10)
+        ):
+          inc attempts
+          raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+      except PgQueryError as e:
+        raised = true
+        doAssert e.sqlState == "40P01"
+
+      doAssert raised
+      doAssert attempts == 3
+
+      # Pool still usable after exhausting retries (each attempt released its
+      # connection cleanly via the per-attempt finally).
+      let res = await pool.query("SELECT 1::int")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt(0) == 1'i32
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline drops invalidated connection on deadline":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+
+      var raised = false
+      try:
+        # The body overruns the deadline: the in-flight connection is
+        # invalidated (timeoutElse) and PgTimeoutError raised — never retried.
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 5), conn, milliseconds(300)
+        ):
+          discard await conn.query("SELECT pg_sleep(2)")
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      # The bad connection is dropped, not stuck — subsequent pool ops work.
+      let res = await pool.query("SELECT 1::int")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getInt(0) == 1'i32
+
       await pool.close()
 
     waitFor t()
