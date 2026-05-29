@@ -397,6 +397,45 @@ suite "Large Object: withLargeObject template":
 
     waitFor t()
 
+  test "withLargeObject preserves the original error when the tx is aborted":
+    # Regression: when `body` poisons the transaction, the cleanup `loClose`
+    # itself raises "current transaction is aborted". That cleanup failure
+    # must not mask the real error that `body` raised.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+
+      # Create the object in its own committed transaction so it survives the
+      # rollback triggered by the aborted transaction below.
+      var oid: Oid
+      conn.withTransaction:
+        oid = await conn.loCreate()
+
+      var caught = ""
+      try:
+        conn.withTransaction:
+          conn.withLargeObject(lo, oid, INV_READWRITE):
+            # Poison the transaction: every later statement (including the
+            # cleanup `loClose`) now fails with "current transaction is aborted".
+            try:
+              discard await conn.queryValue("SELECT 1 / 0")
+            except CatchableError:
+              discard
+            raise newException(ValueError, "sentinel body error")
+      except ValueError as e:
+        caught = e.msg
+      except CatchableError as e:
+        caught = "masked by cleanup: " & e.msg
+
+      doAssert caught == "sentinel body error",
+        "withLargeObject did not preserve the original error: " & caught
+
+      conn.withTransaction:
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
 suite "Large Object: streaming API":
   test "loReadStream":
     proc t() {.async.} =
