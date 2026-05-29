@@ -369,3 +369,146 @@ suite "pgoutput decoder":
   test "unknown message type raises":
     expect(ProtocolError):
       discard parsePgOutputMessage(@[byte('Z')])
+
+suite "pgoutput decoder bounds checking":
+  # Each case feeds a truncated or forged message and asserts a catchable
+  # ProtocolError instead of an out-of-bounds read (which would be an
+  # uncatchable IndexDefect, or undefined behaviour under -d:danger).
+
+  test "Begin truncated raises ProtocolError":
+    # 'B' followed by only 4 of the 8 finalLsn bytes
+    var data = @[byte('B'), 0, 0, 0, 0]
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Commit truncated raises ProtocolError":
+    # 'C' + flags only, the three LSN/time fields are missing
+    var data = @[byte('C'), 0]
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Origin truncated raises ProtocolError":
+    var data = @[byte('O'), 0, 0, 0]
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Type truncated raises ProtocolError":
+    var data = @[byte('Y'), 0, 0]
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Insert with column count past end raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('I'))
+    data.addInt32(16384'i32)
+    data.add(byte('N'))
+    data.addInt16(100'i16) # claims 100 columns, none follow
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Insert with negative column count raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('I'))
+    data.addInt32(16384'i32)
+    data.add(byte('N'))
+    data.addInt16(-1'i16)
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Insert tuple data length past end raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('I'))
+    data.addInt32(16384'i32)
+    data.add(byte('N'))
+    data.addInt16(1'i16) # 1 column
+    data.add(byte('t'))
+    data.addInt32(1000'i32) # claims 1000 bytes
+    data.add(byte('x')) # but only 1 present
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Insert tuple with negative data length raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('I'))
+    data.addInt32(16384'i32)
+    data.add(byte('N'))
+    data.addInt16(1'i16)
+    data.add(byte('t'))
+    data.addInt32(-5'i32)
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Relation truncated mid-column raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('R'))
+    data.addInt32(16384'i32)
+    for c in "public":
+      data.add(byte(c))
+    data.add(0'u8)
+    for c in "t":
+      data.add(byte(c))
+    data.add(0'u8)
+    data.add(byte('d')) # replicaIdentity
+    data.addInt16(1'i16) # 1 column
+    data.add(1'u8) # flags
+    for c in "id":
+      data.add(byte(c))
+    data.add(0'u8)
+    data.addInt32(23'i32) # typeOid
+    # typeMod missing — truncated here
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Truncate with oversized relation count raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('T'))
+    data.addInt32(1_000_000'i32) # claims 1M relations
+    data.add(0'u8) # options
+    data.addInt32(16384'i32) # only one actually present
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Truncate with negative relation count raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('T'))
+    data.addInt32(-1'i32)
+    data.add(0'u8)
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Update with marker past end raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('U'))
+    data.addInt32(16384'i32) # relationId, then nothing (no marker byte)
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Message content length past end raises ProtocolError":
+    var data: seq[byte]
+    data.add(byte('M'))
+    data.add(0'u8) # flags
+    data.addInt64(0x800'i64) # lsn
+    for c in "p":
+      data.add(byte(c))
+    data.add(0'u8) # prefix terminator
+    data.addInt32(9999'i32) # claims 9999 bytes
+    data.add(byte('x')) # but only 1 present
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Message truncated header raises ProtocolError":
+    var data = @[byte('M'), 0, 0, 0]
+    expect(ProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "valid messages still decode after hardening":
+    # Regression guard: a well-formed Begin must continue to parse cleanly.
+    var data: seq[byte]
+    data.add(byte('B'))
+    data.addInt64(0x500'i64)
+    data.addInt64(99999'i64)
+    data.addInt32(42'i32)
+    let msg = parsePgOutputMessage(data)
+    check msg.kind == pomkBegin
+    check msg.begin.finalLsn == Lsn(0x500'u64)
+    check msg.begin.xid == 42'i32
