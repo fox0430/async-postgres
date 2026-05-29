@@ -455,8 +455,10 @@ proc executeImpl(
             conn.txStatus = msg.txStatus
             conn.state = csReady
             if queryError != nil:
-              # Invalidate cache for 26000 (prepared statement does not exist)
-              if queryError.sqlState == "26000":
+              # Invalidate cache for 26000 (statement gone) / 0A000 (cached
+              # plan result type changed after DDL) — see
+              # StmtCacheInvalidatingStates.
+              if queryError.sqlState in StmtCacheInvalidatingStates:
                 for i in 0 ..< p.ops.len:
                   if p.ops[i].cacheHit:
                     conn.removeStmtCache(p.ops[i].sql)
@@ -661,7 +663,8 @@ proc executeIsolatedImpl(
             of bmkReadyForQuery:
               conn.txStatus = msg.txStatus
               if opError != nil:
-                if opError.sqlState == "26000" and p.ops[opIdx].cacheHit:
+                if opError.sqlState in StmtCacheInvalidatingStates and
+                    p.ops[opIdx].cacheHit:
                   conn.removeStmtCache(p.ops[opIdx].sql)
                 errors[opIdx] = opError
               elif p.ops[opIdx].cacheMiss and not p.ops[opIdx].cacheSuperseded:
