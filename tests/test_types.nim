@@ -1083,6 +1083,60 @@ suite "Binary clen mismatch raises PgTypeError":
     expect PgTypeError:
       discard row.getTimestampTz(0)
 
+suite "Timestamp/date infinity sentinels":
+  # PostgreSQL encodes 'infinity'/'-infinity' as int64.high/int64.low (timestamp)
+  # and int32.high/int32.low (date). These are not representable as a Nim
+  # DateTime, and the timestamp epoch shift would overflow int64 and raise an
+  # uncatchable OverflowDefect — so the decoders must reject them with a
+  # catchable PgTypeError instead.
+  const
+    tsInfinity = @[0x7F'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] # int64.high
+    tsNegInfinity = @[0x80'u8, 0, 0, 0, 0, 0, 0, 0] # int64.low
+    dateInfinity = @[0x7F'u8, 0xFF, 0xFF, 0xFF] # int32.high
+    dateNegInfinity = @[0x80'u8, 0, 0, 0] # int32.low
+
+  test "decodeBinaryTimestamp infinity raises (no OverflowDefect)":
+    expect PgTypeError:
+      discard decodeBinaryTimestamp(tsInfinity)
+
+  test "decodeBinaryTimestamp -infinity raises (no OverflowDefect)":
+    expect PgTypeError:
+      discard decodeBinaryTimestamp(tsNegInfinity)
+
+  test "decodeBinaryDate infinity raises":
+    expect PgTypeError:
+      discard decodeBinaryDate(dateInfinity)
+
+  test "decodeBinaryDate -infinity raises":
+    expect PgTypeError:
+      discard decodeBinaryDate(dateNegInfinity)
+
+  test "getTimestamp binary infinity raises":
+    let fields = @[mkField(OidTimestamp, 1)]
+    let row = mkRow(@[some(tsInfinity)], fields)
+    expect PgTypeError:
+      discard row.getTimestamp(0)
+
+  test "getTimestampTz binary -infinity raises":
+    let fields = @[mkField(OidTimestampTz, 1)]
+    let row = mkRow(@[some(tsNegInfinity)], fields)
+    expect PgTypeError:
+      discard row.getTimestampTz(0)
+
+  test "getDate binary infinity raises":
+    let fields = @[mkField(OidDate, 1)]
+    let row = mkRow(@[some(dateInfinity)], fields)
+    expect PgTypeError:
+      discard row.getDate(0)
+
+  test "parseTimestampText infinity raises":
+    expect PgTypeError:
+      discard parseTimestampText("infinity")
+
+  test "parseTimestampText -infinity raises":
+    expect PgTypeError:
+      discard parseTimestampText("-infinity")
+
   test "getDate binary unexpected length":
     let fields = @[mkField(OidDate, 1)]
     let row = mkRow(@[some(newSeq[byte](2))], fields) # 2 bytes (expected 4)
