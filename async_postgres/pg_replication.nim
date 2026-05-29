@@ -477,9 +477,13 @@ proc connectReplication*(
 
 # Replication commands (via simple query protocol)
 
-proc identifySystem*(conn: PgConnection): Future[SystemInfo] {.async.} =
+proc identifySystem*(
+    conn: PgConnection, timeout: async_backend.Duration = ZeroDuration
+): Future[SystemInfo] {.async.} =
   ## Execute ``IDENTIFY_SYSTEM`` and return system identification info.
-  let results = await conn.simpleQuery("IDENTIFY_SYSTEM")
+  ##
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  let results = await conn.simpleQuery("IDENTIFY_SYSTEM", timeout)
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "IDENTIFY_SYSTEM returned no results")
   let qr = results[0]
@@ -499,14 +503,17 @@ proc createReplicationSlot*(
     slotName: string,
     plugin: string = "pgoutput",
     temporary: bool = false,
+    timeout: async_backend.Duration = ZeroDuration,
 ): Future[ReplicationSlotInfo] {.async.} =
   ## Create a logical replication slot. Returns slot info including the consistent point LSN.
+  ##
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
   var sql = "CREATE_REPLICATION_SLOT " & quoteIdentifier(slotName)
   if temporary:
     sql.add(" TEMPORARY")
   sql.add(" LOGICAL " & quoteIdentifier(plugin))
 
-  let results = await conn.simpleQuery(sql)
+  let results = await conn.simpleQuery(sql, timeout)
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "CREATE_REPLICATION_SLOT returned no results")
   let qr = results[0]
@@ -521,20 +528,28 @@ proc createReplicationSlot*(
   return info
 
 proc dropReplicationSlot*(
-    conn: PgConnection, slotName: string, wait: bool = false
+    conn: PgConnection,
+    slotName: string,
+    wait: bool = false,
+    timeout: async_backend.Duration = ZeroDuration,
 ): Future[void] {.async.} =
   ## Drop a replication slot.
+  ##
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
   var sql = "DROP_REPLICATION_SLOT " & quoteIdentifier(slotName)
   if wait:
     sql.add(" WAIT")
-  discard await conn.simpleQuery(sql)
+  discard await conn.simpleQuery(sql, timeout)
 
 proc readReplicationSlot*(
-    conn: PgConnection, slotName: string
+    conn: PgConnection, slotName: string, timeout: async_backend.Duration = ZeroDuration
 ): Future[ReplicationSlotInfo] {.async.} =
   ## Read information about an existing replication slot.
-  let results =
-    await conn.simpleQuery("READ_REPLICATION_SLOT " & quoteIdentifier(slotName))
+  ##
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  let results = await conn.simpleQuery(
+    "READ_REPLICATION_SLOT " & quoteIdentifier(slotName), timeout
+  )
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "READ_REPLICATION_SLOT returned no results")
   let qr = results[0]
@@ -548,14 +563,16 @@ proc readReplicationSlot*(
   return info
 
 proc timelineHistory*(
-    conn: PgConnection, timeline: int32
+    conn: PgConnection, timeline: int32, timeout: async_backend.Duration = ZeroDuration
 ): Future[TimelineHistory] {.async.} =
   ## Execute ``TIMELINE_HISTORY <tli>`` and return the history file metadata
   ## plus its raw contents. Required when a physical standby needs to follow
   ## a timeline switch on the primary.
+  ##
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
   if timeline <= 0:
     raise newException(ValueError, "timeline must be > 0, got " & $timeline)
-  let results = await conn.simpleQuery("TIMELINE_HISTORY " & $timeline)
+  let results = await conn.simpleQuery("TIMELINE_HISTORY " & $timeline, timeout)
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "TIMELINE_HISTORY returned no results")
   let qr = results[0]
