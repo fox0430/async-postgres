@@ -149,3 +149,41 @@ suite "E2E: COPY OUT timeout / stall":
       await conn2.close()
 
     waitFor t()
+
+# simpleQuery timeout
+
+suite "E2E: simpleQuery timeout / stall":
+  test "slow simpleQuery with a short timeout raises PgTimeoutError and closes the connection":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # pg_sleep(5) blocks the result for 5s; a 200ms timeout fires long before
+      # the row is produced, so this is robust even on slow CI runners.
+      var timedOut = false
+      try:
+        discard
+          await conn.simpleQuery("SELECT pg_sleep(5)", timeout = milliseconds(200))
+      except PgTimeoutError:
+        timedOut = true
+      doAssert timedOut, "simpleQuery should have timed out"
+      doAssert conn.state == csClosed, $conn.state
+      # A fresh connection works — the closed one is isolated.
+      let conn2 = await connect(plainConfig())
+      let qr = await conn2.query("SELECT 1")
+      doAssert qr.rowCount == 1
+      await conn2.close()
+
+    waitFor t()
+
+  test "simpleQuery within its timeout completes normally and stays ready":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let results = await conn.simpleQuery("SELECT 42 AS answer", timeout = seconds(5))
+      doAssert results.len == 1
+      doAssert results[0].rowCount == 1
+      doAssert conn.state == csReady, $conn.state
+      # The connection is reusable after a successful timed query.
+      let qr = await conn.query("SELECT 1")
+      doAssert qr.rowCount == 1
+      await conn.close()
+
+    waitFor t()
