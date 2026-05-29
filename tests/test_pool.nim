@@ -589,6 +589,25 @@ suite "Pool close":
     check pool.pendingBackgroundTasks.len == 1
     waitFor pool.close()
 
+  test "pipelined exec on closed pool raises instead of hanging":
+    # Regression: the pipelined path used to enqueue the op without checking
+    # `closed`. dispatchBatchImpl early-returns on a closed pool without ever
+    # completing the future, so `await fut` hung forever. It must raise instead.
+    let pool = makePool()
+    pool.config.pipelined = true
+    pool.closed = true
+    expect(PgPoolError):
+      discard waitFor pool.exec("SELECT 1")
+    check pool.pendingOps.len == 0
+
+  test "pipelined query on closed pool raises instead of hanging":
+    let pool = makePool()
+    pool.config.pipelined = true
+    pool.closed = true
+    expect(PgPoolError):
+      discard waitFor pool.query("SELECT 1")
+    check pool.pendingOps.len == 0
+
 suite "Pool active count tracking":
   test "release then acquire roundtrip":
     let pool = makePool()
