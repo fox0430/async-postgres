@@ -223,6 +223,10 @@ proc getInt*(row: Row, col: int): int32 =
   var v: int
   if parseInt(row.bufView(off, clen), v) == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
+  if v < int(int32.low) or v > int(int32.high):
+    raise newException(
+      PgTypeError, "Column " & $col & ": integer value out of int32 range: " & $v
+    )
   result = int32(v)
 
 proc getInt16*(row: Row, col: int): int16 =
@@ -242,6 +246,10 @@ proc getInt16*(row: Row, col: int): int16 =
   var v: int
   if parseInt(row.bufView(off, clen), v) == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
+  if v < int(int16.low) or v > int(int16.high):
+    raise newException(
+      PgTypeError, "Column " & $col & ": integer value out of int16 range: " & $v
+    )
   result = int16(v)
 
 proc getInt64*(row: Row, col: int): int64 =
@@ -899,6 +907,22 @@ optAccessor(getPath, getPathOpt, PgPath)
 optAccessor(getPolygon, getPolygonOpt, PgPolygon)
 optAccessor(getCircle, getCircleOpt, PgCircle)
 
+proc parseInt32Elem(s: string): int32 =
+  ## Parse a text array element into int32, rejecting out-of-range values.
+  ## Plain ``int32(parseInt)`` would silently truncate (wrap) in release builds.
+  let v = parseInt(s)
+  if v < int(int32.low) or v > int(int32.high):
+    raise newException(PgTypeError, "integer array element out of int32 range: " & $v)
+  int32(v)
+
+proc parseInt16Elem(s: string): int16 =
+  ## Parse a text array element into int16, rejecting out-of-range values.
+  ## Plain ``int16(parseInt)`` would silently truncate (wrap) in release builds.
+  let v = parseInt(s)
+  if v < int(int16.low) or v > int(int16.high):
+    raise newException(PgTypeError, "integer array element out of int16 range: " & $v)
+  int16(v)
+
 proc getIntArray*(row: Row, col: int): seq[int32] =
   ## Get a column value as a seq of int32. Handles binary array format.
   if row.isBinaryCol(col):
@@ -923,7 +947,7 @@ proc getIntArray*(row: Row, col: int): seq[int32] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in int array")
-    result.add(int32(parseInt(e.get)))
+    result.add(parseInt32Elem(e.get))
 
 proc getInt16Array*(row: Row, col: int): seq[int16] =
   ## Get a column value as a seq of int16. Handles binary array format.
@@ -949,7 +973,7 @@ proc getInt16Array*(row: Row, col: int): seq[int16] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in int16 array")
-    result.add(int16(parseInt(e.get)))
+    result.add(parseInt16Elem(e.get))
 
 proc getInt64Array*(row: Row, col: int): seq[int64] =
   ## Get a column value as a seq of int64. Handles binary array format.
@@ -1631,7 +1655,7 @@ proc getIntArrayElemOpt*(row: Row, col: int): seq[Option[int32]] =
     if e.isNone:
       result.add(none(int32))
     else:
-      result.add(some(int32(parseInt(e.get))))
+      result.add(some(parseInt32Elem(e.get)))
 
 proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
   if row.isBinaryCol(col):
@@ -1653,7 +1677,7 @@ proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
     if e.isNone:
       result.add(none(int16))
     else:
-      result.add(some(int16(parseInt(e.get))))
+      result.add(some(parseInt16Elem(e.get)))
 
 proc getInt64ArrayElemOpt*(row: Row, col: int): seq[Option[int64]] =
   if row.isBinaryCol(col):
