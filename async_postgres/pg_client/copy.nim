@@ -390,8 +390,17 @@ proc copyOutStream*(
 ): Future[CopyOutInfo] {.async.} =
   ## Execute COPY ... TO STDOUT via simple query protocol, streaming each
   ## CopyData chunk through `callback`. The callback is awaited, providing
-  ## natural TCP backpressure. If the callback raises, the connection is
-  ## marked csClosed (protocol cannot be resynchronized).
+  ## natural TCP backpressure.
+  ##
+  ## If the callback raises, COPY OUT has no client->server abort (CopyFail is
+  ## COPY IN only), so the remaining CopyData is drained up to ReadyForQuery to
+  ## keep the protocol in sync; the connection returns to csReady and stays
+  ## usable, and the callback's error is then re-raised. Because the server
+  ## still streams the whole result before ReadyForQuery, a callback failure on
+  ## an early chunk of a large COPY can mean draining a substantial amount of
+  ## data before the error surfaces — cancel the query out-of-band (`cancel`)
+  ## if you need to abort a large COPY OUT promptly. On timeout the connection
+  ## is instead marked csClosed (protocol out of sync).
   var info: CopyOutInfo
   withConnTracing(
     conn,
