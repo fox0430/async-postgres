@@ -4874,6 +4874,49 @@ when hasChronos:
 
       waitFor t()
 
+    test "onListenError fires when reconnection fails permanently":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        listener.listenReconnectMaxAttempts = 1
+        listener.listenReconnectMaxBackoff = 1
+
+        var errored = false
+        var errMsg = ""
+        listener.onListenError(
+          proc(msg: string) {.gcsafe, raises: [].} =
+            errored = true
+            errMsg = msg
+        )
+
+        await listener.listen("listen_err_cb")
+
+        # Make reconnection fail: point the stored config at an unreachable port
+        # so reconnectInPlace's connect() cannot succeed.
+        listener.config.port = 1
+
+        # Kill the backend so the pump's recv fails and triggers reconnect.
+        let killer = await connect(plainConfig())
+        try:
+          discard await killer.exec(
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
+          )
+        except PgError:
+          discard
+        await killer.close()
+
+        # backoff=1s, then the single reconnect attempt fails → permanent death.
+        await sleepAsync(milliseconds(4000))
+
+        doAssert errored
+        doAssert errMsg.len > 0
+        doAssert "reconnection failed" in errMsg
+        doAssert listener.state == csClosed
+        doAssert listener.listenErrorMsg.len > 0
+
+        await listener.close()
+
+      waitFor t()
+
     test "waitNotification fails on close":
       proc t() {.async.} =
         let listener = await connect(plainConfig())
