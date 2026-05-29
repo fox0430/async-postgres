@@ -108,6 +108,24 @@ proc isRetryableTxError*(e: ref CatchableError, states: openArray[string]): bool
   else:
     false
 
+const StmtCacheInvalidatingStates* = ["26000", "0A000"]
+  ## SQLSTATEs that mean a cache-*hit* prepared statement can no longer be
+  ## reused as cached and must be evicted so the next call re-parses it:
+  ##
+  ## * ``26000`` invalid_sql_statement_name — the server no longer has the
+  ##   prepared statement (e.g. ``DISCARD ALL`` / ``DEALLOCATE`` ran on the
+  ##   session, or a pooled backend was reset). Re-parse recreates it.
+  ## * ``0A000`` feature_not_supported — chiefly "cached plan must not change
+  ##   result type": DDL altered the statement's result columns, so the server
+  ##   rejects the cached (fixed-result) plan on Execute. Because the cache-hit
+  ##   path skips Describe, only a re-parse picks up the new schema; without
+  ##   eviction every subsequent hit would re-raise ``0A000`` forever. Other
+  ##   ``0A000`` causes simply re-parse once more (the error still propagates).
+  ##
+  ## ``42P18`` (indeterminate_datatype) is intentionally absent: it is a
+  ## Parse-phase error and cannot arise on a cache hit (no Parse is sent), and
+  ## a cache *miss* that fails to Parse never reaches ``addStmtCache``.
+
 proc backoffDelayMs*(opts: RetryOptions, attempt: int): int =
   ## Backoff (milliseconds) to wait after the `attempt`-th failure (1-based).
   ## Exponential ``baseDelayMs * multiplier^(attempt-1)`` capped at `maxDelayMs`;
@@ -443,7 +461,7 @@ template queryRecvLoop*(
           conn.txStatus = msg.txStatus
           conn.state = csReady
           if queryError != nil:
-            if cacheHit and queryError.sqlState == "26000":
+            if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
@@ -565,7 +583,7 @@ template queryEachRecvLoop*(
           if callbackError != nil:
             raise callbackError
           if queryError != nil:
-            if cacheHit and queryError.sqlState == "26000":
+            if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
@@ -624,7 +642,7 @@ template execRecvLoop*(
           conn.txStatus = msg.txStatus
           conn.state = csReady
           if queryError != nil:
-            if cacheHit and queryError.sqlState == "26000":
+            if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
