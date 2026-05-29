@@ -325,6 +325,14 @@ suite "Row accessors":
     expect PgTypeError:
       discard row.getInt16(0)
 
+  test "getInt16 out of range raises (no silent truncation)":
+    let row = @[some(toBytes("32768"))]
+    expect PgTypeError:
+      discard row.getInt16(0)
+    let rowNeg = @[some(toBytes("-32769"))]
+    expect PgTypeError:
+      discard rowNeg.getInt16(0)
+
   test "getInt":
     let row = @[some(toBytes("42"))]
     check row.getInt(0) == 42'i32
@@ -337,6 +345,14 @@ suite "Row accessors":
     let row = @[some(toBytes("abc"))]
     expect PgTypeError:
       discard row.getInt(0)
+
+  test "getInt out of range raises (no silent truncation)":
+    let row = @[some(toBytes("2147483648"))]
+    expect PgTypeError:
+      discard row.getInt(0)
+    let rowNeg = @[some(toBytes("-2147483649"))]
+    expect PgTypeError:
+      discard rowNeg.getInt(0)
 
   test "getInt64":
     let row = @[some(toBytes("9999999999"))]
@@ -1743,9 +1759,29 @@ suite "Array row accessors":
     let row: Row = @[some(toBytes("{}"))]
     check row.getIntArray(0).len == 0
 
+  test "getIntArray out of range raises (no silent truncation)":
+    let row: Row = @[some(toBytes("{1,2147483648}"))]
+    expect PgTypeError:
+      discard row.getIntArray(0)
+
   test "getInt16Array":
     let row: Row = @[some(toBytes("{10,-20}"))]
     check row.getInt16Array(0) == @[10'i16, -20'i16]
+
+  test "getInt16Array out of range raises (no silent truncation)":
+    let row: Row = @[some(toBytes("{10,32768}"))]
+    expect PgTypeError:
+      discard row.getInt16Array(0)
+
+  test "getIntArrayElemOpt out of range raises (no silent truncation)":
+    let row: Row = @[some(toBytes("{1,NULL,-2147483649}"))]
+    expect PgTypeError:
+      discard row.getIntArrayElemOpt(0)
+
+  test "getInt16ArrayElemOpt out of range raises (no silent truncation)":
+    let row: Row = @[some(toBytes("{1,NULL,-32769}"))]
+    expect PgTypeError:
+      discard row.getInt16ArrayElemOpt(0)
 
   test "getInt64Array":
     let row: Row = @[some(toBytes("{9999999999,-1}"))]
