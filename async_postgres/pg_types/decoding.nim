@@ -77,6 +77,18 @@ proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
   if data.len < 8:
     raise newException(PgTypeError, "Binary timestamp data too short: " & $data.len)
   let pgUs = fromBE64(data)
+  # PostgreSQL encodes timestamp/timestamptz 'infinity'/'-infinity' as
+  # int64.high/int64.low microseconds since 2000-01-01. Nim's DateTime cannot
+  # represent these, and the epoch shift below would overflow int64 (raising an
+  # uncatchable OverflowDefect), so reject them with a catchable PgTypeError.
+  if pgUs == int64.high:
+    raise newException(
+      PgTypeError, "Binary timestamp is 'infinity', not representable as a DateTime"
+    )
+  if pgUs == int64.low:
+    raise newException(
+      PgTypeError, "Binary timestamp is '-infinity', not representable as a DateTime"
+    )
   let unixUs = pgUs + pgEpochUnix * 1_000_000
   var unixSec = unixUs div 1_000_000
   var fracUs = unixUs mod 1_000_000
@@ -89,6 +101,17 @@ proc decodeBinaryDate*(data: openArray[byte]): DateTime =
   if data.len < 4:
     raise newException(PgTypeError, "Binary date data too short: " & $data.len)
   let pgDays = fromBE32(data)
+  # PostgreSQL encodes date 'infinity'/'-infinity' as int32.high/int32.low days
+  # since 2000-01-01. DateTime cannot represent these (they would otherwise
+  # decode to a meaningless far-future/past date), so reject them explicitly.
+  if pgDays == int32.high:
+    raise newException(
+      PgTypeError, "Binary date is 'infinity', not representable as a DateTime"
+    )
+  if pgDays == int32.low:
+    raise newException(
+      PgTypeError, "Binary date is '-infinity', not representable as a DateTime"
+    )
   let unixSec = (int64(pgDays) + int64(pgEpochDaysOffset)) * 86400
   initTime(unixSec, 0).utc()
 
@@ -305,6 +328,13 @@ proc decodeBinaryComposite*(
       pos += flen
 
 proc parseTimestampText*(s: string): DateTime =
+  # Text-format 'infinity'/'-infinity' mirror the binary sentinels handled in
+  # decodeBinaryTimestamp: not representable as a DateTime, so raise a clear
+  # PgTypeError rather than the generic "Invalid timestamp" below.
+  if s == "infinity" or s == "-infinity":
+    raise newException(
+      PgTypeError, "Timestamp is '" & s & "', not representable as a DateTime"
+    )
   const formats = [
     "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
     "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
