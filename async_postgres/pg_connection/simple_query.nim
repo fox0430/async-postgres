@@ -74,74 +74,46 @@ proc quoteIdentifier*(s: string): string =
 
 # Simple Query Protocol entry points
 
-proc simpleQuery*(conn: PgConnection, sql: string): Future[seq[QueryResult]] {.async.} =
-  ## Execute one or more SQL statements via the **simple query protocol**.
-  ##
-  ## Returns one ``QueryResult`` per statement; supports multiple statements
-  ## separated by ``;`` in a single round trip — this is the main reason to
-  ## choose ``simpleQuery`` over ``query``.
-  ##
-  ## No parameters are supported (the SQL string is sent verbatim — only use
-  ## trusted input) and rows are always in the text wire format. No
-  ## server-side plan cache entry is created.
-  ##
-  ## For single-statement parameterised reads, prefer ``query``; for
-  ## parameter-less commands without rows, prefer ``simpleExec``.
+proc simpleQueryImpl*(
+    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
+): Future[seq[QueryResult]] {.async.} =
   conn.checkReady()
+  conn.state = csBusy
+  await conn.sendMsg(encodeQuery(sql))
 
   var results: seq[QueryResult]
-  var totalRows: int32
-  var lastTag: string
-  # For multi-statement queries (e.g. "SELECT 1; SELECT 2"), the trace end hook
-  # receives the aggregated row count and only the last command tag.
-  withConnTracing(
-    conn,
-    onQueryStart,
-    onQueryEnd,
-    TraceQueryStartData(sql: sql, isExec: false),
-    TraceQueryEndData,
-    TraceQueryEndData(commandTag: lastTag, rowCount: totalRows),
-  ):
-    conn.state = csBusy
-    await conn.sendMsg(encodeQuery(sql))
+  var current = QueryResult()
+  var queryError: ref PgQueryError
 
-    var current = QueryResult()
-    var queryError: ref PgQueryError
-
-    block recvLoop:
-      while true:
-        while (
-          let opt = conn.nextMessage(current.data, addr current.rowCount)
-          opt.isSome
-        )
-        :
-          let msg = opt.get
-          case msg.kind
-          of bmkRowDescription:
-            current =
-              QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
-          of bmkCommandComplete:
-            current.commandTag = msg.commandTag
-            results.add(current)
-            current = QueryResult()
-          of bmkEmptyQueryResponse:
-            results.add(QueryResult())
-          of bmkErrorResponse:
-            queryError = newPgQueryError(msg.errorFields)
-          of bmkReadyForQuery:
-            conn.txStatus = msg.txStatus
-            conn.state = csReady
-            if queryError != nil:
-              raise queryError
-            break recvLoop
-          else:
-            discard
-        await conn.fillRecvBuf()
-
-    for r in results:
-      totalRows += r.rowCount
-      if r.commandTag.len > 0:
-        lastTag = r.commandTag
+  block recvLoop:
+    while true:
+      while (
+        let opt = conn.nextMessage(current.data, addr current.rowCount)
+        opt.isSome
+      )
+      :
+        let msg = opt.get
+        case msg.kind
+        of bmkRowDescription:
+          current =
+            QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
+        of bmkCommandComplete:
+          current.commandTag = msg.commandTag
+          results.add(current)
+          current = QueryResult()
+        of bmkEmptyQueryResponse:
+          results.add(QueryResult())
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            raise queryError
+          break recvLoop
+        else:
+          discard
+      await conn.fillRecvBuf(timeout)
 
   return results
 
@@ -291,6 +263,51 @@ proc simpleExec*(
     else:
       tag = await simpleExecImpl(conn, sql)
   return initCommandResult(tag)
+
+proc simpleQuery*(
+    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
+): Future[seq[QueryResult]] {.async.} =
+  ## Execute one or more SQL statements via the **simple query protocol**.
+  ##
+  ## Returns one ``QueryResult`` per statement; supports multiple statements
+  ## separated by ``;`` in a single round trip — this is the main reason to
+  ## choose ``simpleQuery`` over ``query``.
+  ##
+  ## No parameters are supported (the SQL string is sent verbatim — only use
+  ## trusted input) and rows are always in the text wire format. No
+  ## server-side plan cache entry is created.
+  ##
+  ## For single-statement parameterised reads, prefer ``query``; for
+  ## parameter-less commands without rows, prefer ``simpleExec``.
+  ##
+  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  var results: seq[QueryResult]
+  var totalRows: int32
+  var lastTag: string
+  # For multi-statement queries (e.g. "SELECT 1; SELECT 2"), the trace end hook
+  # receives the aggregated row count and only the last command tag.
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: sql, isExec: false),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: lastTag, rowCount: totalRows),
+  ):
+    if timeout > ZeroDuration:
+      try:
+        results = await simpleQueryImpl(conn, sql, timeout).wait(timeout)
+      except AsyncTimeoutError:
+        conn.invalidateOnTimeout("simpleQuery timed out")
+    else:
+      results = await simpleQueryImpl(conn, sql)
+
+    for r in results:
+      totalRows += r.rowCount
+      if r.commandTag.len > 0:
+        lastTag = r.commandTag
+
+  return results
 
 # Liveness check
 

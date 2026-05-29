@@ -1232,13 +1232,15 @@ proc queryColumn*(
       raise newException(PgNullError, "NULL value in column")
     result.add(row.getStr(0))
 
-proc simpleQuery*(pool: PgPool, sql: string): Future[seq[QueryResult]] {.async.} =
+proc simpleQuery*(
+    pool: PgPool, sql: string, timeout: Duration = ZeroDuration
+): Future[seq[QueryResult]] {.async.} =
   ## Execute one or more SQL statements via the simple query protocol using a
   ## pooled connection. See ``PgConnection.simpleQuery`` for semantics —
   ## multi-statement, no parameters, no plan cache.
   let conn = await pool.acquire()
   try:
-    return await conn.simpleQuery(sql)
+    return await conn.simpleQuery(sql, timeout)
   finally:
     await pool.resetSession(conn)
     conn.release()
