@@ -1454,9 +1454,7 @@ macro withTransactionRetry*(
   let poolSym = genSym(nskLet, "pool")
   let retryOptsSym = genSym(nskLet, "retryOpts")
   let resetSessionSym = bindSym"resetSession"
-  let loop = buildRetryTxLoop(
-    connIdent, retryOptsSym, beginSql, txTimeout, body, useCleanupSkipped = true
-  )
+  let loop = buildRetryTxLoop(connIdent, retryOptsSym, beginSql, txTimeout, body)
   result = quote:
     let `poolSym` = `poolExpr`
     let `connIdent` = await `poolSym`.acquire()

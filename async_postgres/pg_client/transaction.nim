@@ -57,11 +57,10 @@ proc buildTxBeginAndTimeout*(
 
 proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   ## Build the shared `onCleanupSkipped`-wired ROLLBACK cleanup used on a failed
-  ## attempt by the conn/pool transaction macros: skip ROLLBACK on an invalidated
-  ## connection or when the server already ended the transaction (reporting both
-  ## via `onCleanupSkipped`), otherwise ROLLBACK with `rollbackTimeout` as the
-  ## per-call timeout and report a swallowed failure. The cluster variant uses a
-  ## simpler best-effort ROLLBACK instead (see `buildRetryTxLoop`).
+  ## attempt by the conn/pool/cluster transaction macros: skip ROLLBACK on an
+  ## invalidated connection or when the server already ended the transaction
+  ## (reporting both via `onCleanupSkipped`), otherwise ROLLBACK with
+  ## `rollbackTimeout` as the per-call timeout and report a swallowed failure.
   let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let csReadySym = bindSym"csReady"
   let tsInTxSym = bindSym"tsInTransaction"
@@ -81,7 +80,7 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
         )
 
 proc buildRetryTxLoop*(
-    connSym, retryOptsSym, beginSql, txTimeout, body: NimNode, useCleanupSkipped: bool
+    connSym, retryOptsSym, beginSql, txTimeout, body: NimNode
 ): NimNode =
   ## Build the shared BEGIN/body/COMMIT/ROLLBACK retry loop reused by every
   ## `withTransactionRetry` variant (conn / pool / cluster). The caller binds
@@ -89,12 +88,11 @@ proc buildRetryTxLoop*(
   ## and `retryOptsSym` (a `RetryOptions`) in the surrounding scope, then splices
   ## the returned loop in.
   ##
-  ## `useCleanupSkipped` selects the cleanup style on a failed attempt:
-  ## * `true` (conn / pool): the full `onCleanupSkipped` wiring — skip ROLLBACK on
-  ##   an invalidated connection or when the server already ended the transaction,
-  ##   reporting both via `onCleanupSkipped`.
-  ## * `false` (cluster): a best-effort ROLLBACK that swallows errors, matching
-  ##   the cluster's non-retry `withTransaction`.
+  ## On a failed attempt the connection is cleaned up with the shared
+  ## `onCleanupSkipped`-wired ROLLBACK (`buildRollbackCleanup`): ROLLBACK is
+  ## skipped on an invalidated connection or when the server already ended the
+  ## transaction, and both the skip and any swallowed ROLLBACK failure are
+  ## surfaced through `onCleanupSkipped`.
   ##
   ## A retry is taken only when attempts remain, the error is retryable, and the
   ## connection is back to a clean reusable state (`csReady` + `tsIdle`) — so a
@@ -108,15 +106,7 @@ proc buildRetryTxLoop*(
   let backoffSym = bindSym"backoffDelayMs"
   let sleepSym = bindSym"sleepMsAsync"
 
-  let cleanup =
-    if useCleanupSkipped:
-      buildRollbackCleanup(connSym, txTimeout)
-    else:
-      quote:
-        try:
-          discard await `connSym`.simpleExec("ROLLBACK", timeout = `txTimeout`)
-        except CatchableError:
-          discard
+  let cleanup = buildRollbackCleanup(connSym, txTimeout)
 
   quote:
     var `attemptSym` = 0
@@ -372,9 +362,7 @@ macro withTransactionRetry*(
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let retryOptsSym = genSym(nskLet, "retryOpts")
-  let loop = buildRetryTxLoop(
-    connSym, retryOptsSym, beginSql, txTimeout, body, useCleanupSkipped = true
-  )
+  let loop = buildRetryTxLoop(connSym, retryOptsSym, beginSql, txTimeout, body)
   result = quote:
     let `connSym` = `connExpr`
     let `retryOptsSym` = `retryOpts`
