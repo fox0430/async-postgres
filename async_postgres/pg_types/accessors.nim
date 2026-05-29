@@ -407,6 +407,8 @@ proc getBool*(row: Row, col: int): bool =
         "Column " & $col & ": unexpected binary length " & $clen & " for bool",
       )
     return row.data.buf[off] != 0
+  if clen == 0:
+    raise newException(PgTypeError, "Column " & $col & ": empty boolean value")
   let c = char(row.data.buf[off])
   case c
   of 't', '1':
