@@ -990,6 +990,8 @@ proc exec*(
   ## When `pipelined` is enabled, the operation is batched with other concurrent
   ## calls and sent in a single TCP write.
   if pool.config.pipelined:
+    if pool.closed:
+      raise newException(PgPoolError, "Pool is closed")
     let fut = newFuture[CommandResult]("PgPool.exec.pipelined")
     pool.pendingOps.addLast(
       PendingPoolOp(
@@ -1016,6 +1018,8 @@ proc query*(
   ## When `pipelined` is enabled, the operation is batched with other concurrent
   ## calls and sent in a single TCP write.
   if pool.config.pipelined:
+    if pool.closed:
+      raise newException(PgPoolError, "Pool is closed")
     let fut = newFuture[QueryResult]("PgPool.query.pipelined")
     pool.pendingOps.addLast(
       PendingPoolOp(
