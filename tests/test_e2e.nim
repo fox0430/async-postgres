@@ -4882,10 +4882,12 @@ when hasChronos:
 
         var errored = false
         var errMsg = ""
+        var reconnectionAttempted = false
         listener.onListenError(
-          proc(msg: string) {.gcsafe, raises: [].} =
+          proc(err: ref PgListenError) {.gcsafe, raises: [].} =
             errored = true
-            errMsg = msg
+            errMsg = err.msg
+            reconnectionAttempted = err.reconnectionAttempted
         )
 
         await listener.listen("listen_err_cb")
@@ -4910,8 +4912,59 @@ when hasChronos:
         doAssert errored
         doAssert errMsg.len > 0
         doAssert "reconnection failed" in errMsg
+        doAssert reconnectionAttempted
         doAssert listener.state == csClosed
-        doAssert listener.listenErrorMsg.len > 0
+        doAssert listener.listenError != nil
+        doAssert listener.listenError.reconnectionAttempted
+
+        await listener.close()
+
+      waitFor t()
+
+    test "waitNotification raises fresh PgListenError after permanent death":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        listener.listenReconnectMaxAttempts = 1
+        listener.listenReconnectMaxBackoff = 1
+
+        await listener.listen("listen_err_fresh")
+
+        # Make reconnection fail, then kill the backend so the pump dies for good.
+        listener.config.port = 1
+        let killer = await connect(plainConfig())
+        try:
+          discard await killer.exec(
+            "SELECT pg_terminate_backend($1)", @[toPgParam(listener.pid)]
+          )
+        except PgError:
+          discard
+        await killer.close()
+
+        # backoff=1s, then the single reconnect attempt fails → permanent death.
+        await sleepAsync(milliseconds(4000))
+        doAssert listener.listenError != nil
+
+        # The pull API surfaces the structured PgListenError, not a bare PgError.
+        var first: ref PgListenError = nil
+        try:
+          discard await listener.waitNotification()
+        except PgListenError as e:
+          first = e
+        doAssert first != nil
+        doAssert first.reconnectionAttempted
+        doAssert "reconnection failed" in first.msg
+        # Each raise is a fresh instance, never the stored object — re-raising a
+        # single shared ref would let its stack trace accumulate across calls.
+        doAssert first != listener.listenError
+
+        var second: ref PgListenError = nil
+        try:
+          discard await listener.waitNotification()
+        except PgListenError as e:
+          second = e
+        doAssert second != nil
+        doAssert second != first
+        doAssert second != listener.listenError
 
         await listener.close()
 

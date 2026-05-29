@@ -40,3 +40,9 @@ type
 
   PgNotifyOverflowError* = object of PgError
     dropped*: int ## Number of notifications dropped due to queue overflow
+
+  PgListenError* = object of PgConnectionError
+    ## Listen pump died permanently (reconnection failed or connection lost
+    ## with no channels left to re-subscribe).
+    reconnectionAttempted*: bool
+      ## True if the pump attempted reconnection before giving up.
