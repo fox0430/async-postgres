@@ -7,6 +7,36 @@ type
     fallbackNone ## Error when replica is unavailable
     fallbackPrimary ## Fall back to primary when replica is unavailable
 
+  ReadFallbackReason* = enum
+    ## Why `acquireRead` fell back from the replica pool to the primary pool.
+    rfrReplicaUnavailable
+      ## The replica `acquire()` failed before `fallbackTimeout` elapsed
+      ## (e.g. saturation, acquire-queue full, connect failure).
+    rfrReplicaClosed
+      ## The replica pool was closed (`isClosed`). A permanently closed
+      ## replica routes *every* read to the primary — observe this to detect
+      ## a cluster that has silently degraded to primary-only.
+    rfrReplicaTimeout
+      ## The replica `acquire()` exceeded `fallbackTimeout` and was abandoned
+      ## in favour of the primary.
+
+  ReadFallbackCallback* =
+    proc(reason: ReadFallbackReason, err: ref CatchableError) {.gcsafe, raises: [].}
+    ## Advisory hook fired when `acquireRead` (and therefore `readConnection` /
+    ## `withReadConnection`) falls back from the replica pool to the primary
+    ## pool. Fires only when `fallback == fallbackPrimary`, once per read that
+    ## falls back, *before* the primary acquire is attempted. `err` is the
+    ## replica failure that triggered the fallback. Advisory only — routing is
+    ## unchanged. Use it to detect a replica that is down or saturated before
+    ## all read load silently lands on the primary. Must not raise.
+    ##
+    ## **Fires per fallback, not per state change.** A permanently closed or
+    ## saturated replica fires this on *every* read for as long as the
+    ## condition lasts (`rfrReplicaClosed` / `rfrReplicaTimeout`), which can be
+    ## very high frequency under load. This suits counters/metrics, where each
+    ## fallback should be counted; for logging or alerting, dedupe or
+    ## rate-limit on the observer side.
+
   PgPoolCluster* = ref object
     ## Connection pool cluster with explicit read/write routing.
     ##
@@ -18,7 +48,10 @@ type
     replica: PgPool
     fallback: ReplicaFallback
     fallbackTimeout: Duration
-      ## Max time to wait for a fallback acquire (ZeroDuration = use pool's own acquireTimeout)
+      ## Max time to wait for *each* acquire leg of a fallback read — the
+      ## replica acquire and the fallback primary acquire. `ZeroDuration`
+      ## leaves each pool's own `acquireTimeout` in force.
+    onReadFallback: ReadFallbackCallback
     closed: bool
 
 proc primaryPool*(cluster: PgPoolCluster): PgPool =
@@ -39,21 +72,35 @@ proc isClosed*(cluster: PgPoolCluster): bool =
 
 proc fallbackTimeout*(cluster: PgPoolCluster): Duration =
   ## The configured fallback timeout for read operations.
-  ## When `fallbackPrimary` is set and the replica acquire fails, this limits
-  ## how long the fallback primary acquire may wait. `ZeroDuration` means the
-  ## primary pool's own `acquireTimeout` is used as-is.
+  ## When `fallbackPrimary` is set, this bounds *both* the replica acquire and
+  ## the fallback primary acquire, so a saturated replica cannot stall a read
+  ## for its full `acquireTimeout` before the fallback engages. `ZeroDuration`
+  ## leaves each pool's own `acquireTimeout` in force (the replica acquire then
+  ## blocks up to the replica pool's `acquireTimeout` before falling back).
   cluster.fallbackTimeout
+
+proc onReadFallback*(cluster: PgPoolCluster): ReadFallbackCallback =
+  ## The configured replica->primary read-fallback observability hook
+  ## (see `ReadFallbackCallback`).
+  cluster.onReadFallback
 
 proc newPoolCluster*(
     primaryConfig: PoolConfig,
     replicaConfig: PoolConfig,
     fallback = fallbackNone,
     fallbackTimeout = ZeroDuration,
+    onReadFallback: ReadFallbackCallback = nil,
 ): Future[PgPoolCluster] {.async.} =
   ## Create a new pool cluster with separate primary and replica pools.
   ## If `connConfig.targetSessionAttrs` is `tsaAny` (the default), it is
   ## automatically set to `tsaReadWrite` for primary and `tsaPreferStandby`
   ## for replica.
+  ##
+  ## With `fallback == fallbackPrimary`, `fallbackTimeout` (when > `ZeroDuration`)
+  ## bounds *both* the replica and the fallback primary acquire so a saturated
+  ## replica fails over promptly instead of blocking for its full
+  ## `acquireTimeout`. `onReadFallback` is an optional advisory hook invoked on
+  ## each replica->primary read fallback (see `ReadFallbackCallback`).
   var pCfg = primaryConfig
   if pCfg.connConfig.targetSessionAttrs == tsaAny:
     pCfg.connConfig.targetSessionAttrs = tsaReadWrite
@@ -75,33 +122,72 @@ proc newPoolCluster*(
     replica: rPool,
     fallback: fallback,
     fallbackTimeout: fallbackTimeout,
+    onReadFallback: onReadFallback,
     closed: false,
   )
+
+proc fireReadFallback(
+    cluster: PgPoolCluster, reason: ReadFallbackReason, err: ref CatchableError
+) =
+  ## Route a replica->primary read fallback to the cluster's advisory hook.
+  ## Nil hook is a no-op.
+  if cluster.onReadFallback != nil:
+    cluster.onReadFallback(reason, err)
 
 proc acquireRead(
     cluster: PgPoolCluster
 ): Future[tuple[conn: PgConnection, pool: PgPool]] {.async.} =
-  ## Acquire a connection for read operations. Tries replica first;
-  ## falls back to primary if configured.
-  try:
+  ## Acquire a connection for read operations. Tries the replica first; on
+  ## failure, falls back to the primary when `fallback == fallbackPrimary`.
+  ##
+  ## When `fallbackTimeout > ZeroDuration` it bounds *both* the replica and the
+  ## fallback primary acquire, so a saturated replica fails over after
+  ## `fallbackTimeout` instead of blocking for the replica pool's full
+  ## `acquireTimeout`. Each fallback fires `onReadFallback` (if set) before the
+  ## primary acquire is attempted.
+  if cluster.fallback != fallbackPrimary:
     let conn = await cluster.replica.acquire()
     return (conn, cluster.replica)
+
+  # fallbackPrimary: bound the replica leg too (when fallbackTimeout is set) so
+  # a saturated replica does not burn its full acquireTimeout before failover.
+  var replicaErr: ref CatchableError
+  var timedOut = false
+  try:
+    if cluster.fallbackTimeout > ZeroDuration:
+      let conn = await cluster.replica.acquire().wait(cluster.fallbackTimeout)
+      return (conn, cluster.replica)
+    else:
+      let conn = await cluster.replica.acquire()
+      return (conn, cluster.replica)
+  except AsyncTimeoutError as e:
+    replicaErr = e
+    timedOut = true
   except CatchableError as e:
-    if cluster.fallback == fallbackPrimary:
-      if cluster.fallbackTimeout > ZeroDuration:
-        try:
-          let conn = await cluster.primary.acquire().wait(cluster.fallbackTimeout)
-          return (conn, cluster.primary)
-        except AsyncTimeoutError:
-          raise newException(
-            PgPoolError,
-            "Pool cluster fallback acquire timeout (replica error: " & e.msg & ")",
-            e,
-          )
-      else:
-        let conn = await cluster.primary.acquire()
-        return (conn, cluster.primary)
-    raise e
+    replicaErr = e
+
+  let reason =
+    if timedOut:
+      rfrReplicaTimeout
+    elif cluster.replica.isClosed:
+      rfrReplicaClosed
+    else:
+      rfrReplicaUnavailable
+  cluster.fireReadFallback(reason, replicaErr)
+
+  if cluster.fallbackTimeout > ZeroDuration:
+    try:
+      let conn = await cluster.primary.acquire().wait(cluster.fallbackTimeout)
+      return (conn, cluster.primary)
+    except AsyncTimeoutError:
+      raise newException(
+        PgPoolError,
+        "Pool cluster fallback acquire timeout (replica error: " & replicaErr.msg & ")",
+        replicaErr,
+      )
+  else:
+    let conn = await cluster.primary.acquire()
+    return (conn, cluster.primary)
 
 proc readConnection*(cluster: PgPoolCluster): Future[PooledConnHandle] {.async.} =
   ## Acquire a read connection from the replica pool (with optional primary
