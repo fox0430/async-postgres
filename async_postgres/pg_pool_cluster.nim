@@ -212,6 +212,11 @@ macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped 
   let clusterSym = genSym(nskLet, "cluster")
   let eSym = genSym(nskLet, "e")
   let resetSessionSym = bindSym"resetSession"
+  # Mirror the conn/pool `withTransaction` cleanup: skip ROLLBACK on an
+  # invalidated connection or once the server already ended the transaction,
+  # and surface both the skip and any swallowed ROLLBACK failure through
+  # `onCleanupSkipped` instead of silently discarding them.
+  let cleanup = buildRollbackCleanup(connIdent, txTimeout)
   result = quote:
     let `clusterSym` = `clusterExpr`
     let `connIdent` = await `clusterSym`.primary.acquire()
@@ -221,10 +226,7 @@ macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped 
         `body`
         discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
       except CatchableError as `eSym`:
-        try:
-          discard await `connIdent`.simpleExec("ROLLBACK", timeout = `txTimeout`)
-        except CatchableError:
-          discard
+        `cleanup`
         raise `eSym`
     finally:
       await `resetSessionSym`(`clusterSym`.primary, `connIdent`)
@@ -287,11 +289,9 @@ macro withTransactionRetry*(
   let clusterSym = genSym(nskLet, "cluster")
   let retryOptsSym = genSym(nskLet, "retryOpts")
   let resetSessionSym = bindSym"resetSession"
-  # cluster mirrors its non-retry `withTransaction`: a best-effort ROLLBACK that
-  # swallows errors (no `onCleanupSkipped` wiring), hence useCleanupSkipped = false.
-  let loop = buildRetryTxLoop(
-    connIdent, retryOptsSym, beginSql, txTimeout, body, useCleanupSkipped = false
-  )
+  # cluster mirrors its non-retry `withTransaction`: the shared
+  # `onCleanupSkipped`-wired ROLLBACK from `buildRetryTxLoop`.
+  let loop = buildRetryTxLoop(connIdent, retryOptsSym, beginSql, txTimeout, body)
   result = quote:
     let `clusterSym` = `clusterExpr`
     let `connIdent` = await `clusterSym`.primary.acquire()

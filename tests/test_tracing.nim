@@ -4,6 +4,7 @@ import ../async_postgres/async_backend
 
 import ../async_postgres/[pg_client, pg_types, pg_protocol]
 import ../async_postgres/pg_pool {.all.}
+import ../async_postgres/pg_pool_cluster {.all.}
 import ../async_postgres/pg_connection {.all.}
 
 const
@@ -1339,6 +1340,102 @@ suite "Tracing: onCleanupSkipped (pool)":
       doAssert log.cleanupSkipped[0].errMsg == ""
 
       await pool.close()
+
+    waitFor t()
+
+suite "Tracing: onCleanupSkipped (cluster)":
+  # Point both primary and replica at the local server: set tsaReadWrite
+  # explicitly so newPoolCluster does not override the replica with
+  # tsaPreferStandby (which the single standalone server would reject).
+  proc clusterConfig(tracer: PgTracer): ConnConfig =
+    result = tracedConfig(tracer)
+    result.targetSessionAttrs = tsaReadWrite
+
+  test "cluster.withTransaction body error fires no cleanup-skipped event on healthy conn":
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let cfg = clusterConfig(tracer)
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2, tracer: tracer),
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2, tracer: tracer),
+      )
+
+      var raised = false
+      try:
+        cluster.withTransaction(conn):
+          discard await conn.exec("SELECT 1")
+          raise newException(PgError, "body boom")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 0
+
+      await cluster.close()
+
+    waitFor t()
+
+  test "cluster.withTransaction on csClosed conn fires csrConnInvalidated":
+    # Mirror of the conn/pool csClosed tests: drive the cleanup path without a
+    # real per-call timeout by forcing `state = csClosed` mid-body. The cluster
+    # variant must skip ROLLBACK and report the skip the same way.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let cfg = clusterConfig(tracer)
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2, tracer: tracer),
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2, tracer: tracer),
+      )
+
+      var raised = false
+      try:
+        cluster.withTransaction(conn):
+          conn.state = csClosed
+          raise newException(PgError, "simulated timeout invalidation")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 1
+      doAssert log.cleanupSkipped[0].kind == ckTxRollback
+      doAssert log.cleanupSkipped[0].reason == csrConnInvalidated
+      doAssert log.cleanupSkipped[0].errMsg == ""
+
+      await cluster.close()
+
+    waitFor t()
+
+  test "cluster.withTransactionRetry on csClosed conn fires csrConnInvalidated":
+    # The csClosed state both fires the skip report and (via `state == csReady`
+    # in the retry gate) suppresses any retry, so the original error propagates.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      let cfg = clusterConfig(tracer)
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2, tracer: tracer),
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 2, tracer: tracer),
+      )
+
+      var raised = false
+      try:
+        cluster.withTransactionRetry(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn
+        ):
+          conn.state = csClosed
+          raise newException(PgError, "simulated timeout invalidation")
+      except PgError:
+        raised = true
+
+      doAssert raised
+      doAssert log.cleanupSkipped.len == 1
+      doAssert log.cleanupSkipped[0].kind == ckTxRollback
+      doAssert log.cleanupSkipped[0].reason == csrConnInvalidated
+      doAssert log.cleanupSkipped[0].errMsg == ""
+
+      await cluster.close()
 
     waitFor t()
 
