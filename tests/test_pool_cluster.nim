@@ -1,4 +1,4 @@
-import std/[unittest, deques, tables, importutils]
+import std/[unittest, deques, tables, importutils, strutils]
 
 import ../async_postgres/[async_backend, pg_protocol, pg_connection]
 import ../async_postgres/pg_pool {.all.}
@@ -269,15 +269,27 @@ suite "Fallback":
     replicaFut.complete(mockConn())
     primaryFut.complete(mockConn())
 
-  test "fallbackTimeout raises PgPoolError when primary acquire exceeds timeout":
+  test "fallbackTimeout bounds the primary fallback leg and wraps the replica error":
     let cluster =
       makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(50))
     cluster.replica.closed = true
-    # Primary at max with no idle connections — acquire will wait
+    # Primary at max with no idle connections, and makePool leaves the pool's
+    # own acquireTimeout at ZeroDuration — so only fallbackTimeout can end the
+    # wait. Reaching the raise at all proves fallbackTimeout bounds the primary
+    # leg (otherwise this would hang forever).
     cluster.primary.active = cluster.primary.config.maxSize
 
-    expect(PgError):
+    var raised: ref PgError
+    try:
       discard waitFor acquireRead(cluster)
+    except PgError as e:
+      raised = e
+
+    check raised != nil
+    check "fallback acquire timeout" in raised.msg
+    # The replica failure that triggered the fallback is preserved as the cause.
+    check raised.parent != nil
+    check "Pool is closed" in raised.parent.msg
 
   test "fallbackTimeout succeeds when primary available within timeout":
     let cluster = makeCluster(fallback = fallbackPrimary, fallbackTimeout = seconds(5))
@@ -304,6 +316,124 @@ suite "Fallback":
     let (acquired, pool) = waitFor acquireRead(cluster)
     check acquired == primaryConn
     check pool == cluster.primary
+
+  test "fallbackTimeout bounds the replica acquire for fast failover":
+    # Replica would block for its full acquireTimeout (30s) without the
+    # fallbackTimeout bound; with it, the read fails over to the primary
+    # after ~fallbackTimeout instead.
+    let cluster =
+      makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(50))
+    cluster.replica.active = cluster.replica.config.maxSize
+    cluster.replica.config.acquireTimeout = seconds(30)
+    let replicaFut = newFuture[PgConnection]("replica-dummy")
+    cluster.replica.waiters.addLast(Waiter(fut: replicaFut, cancelled: false))
+    cluster.replica.waiterCount = 1
+
+    let primaryConn = mockConn()
+    cluster.primary.idle.addLast(
+      PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+    )
+
+    let (acquired, pool) = waitFor acquireRead(cluster)
+    check acquired == primaryConn
+    check pool == cluster.primary
+
+    replicaFut.complete(mockConn())
+
+  test "onReadFallback fires with rfrReplicaClosed when replica is closed":
+    var fired = 0
+    var seenReason: ReadFallbackReason
+    let cluster = makeCluster(fallback = fallbackPrimary)
+    cluster.onReadFallback = proc(
+        reason: ReadFallbackReason, err: ref CatchableError
+    ) {.gcsafe, raises: [].} =
+      inc fired
+      seenReason = reason
+    cluster.replica.closed = true
+
+    let primaryConn = mockConn()
+    cluster.primary.idle.addLast(
+      PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+    )
+
+    let (acquired, pool) = waitFor acquireRead(cluster)
+    check acquired == primaryConn
+    check pool == cluster.primary
+    check fired == 1
+    check seenReason == rfrReplicaClosed
+
+  test "onReadFallback fires with rfrReplicaUnavailable on transient replica error":
+    var seenReason: ReadFallbackReason
+    var fired = false
+    let cluster = makeCluster(fallback = fallbackPrimary)
+    cluster.onReadFallback = proc(
+        reason: ReadFallbackReason, err: ref CatchableError
+    ) {.gcsafe, raises: [].} =
+      fired = true
+      seenReason = reason
+    # Replica rejects immediately: at max with a full waiter queue.
+    cluster.replica.active = cluster.replica.config.maxSize
+    cluster.replica.config.maxWaiters = 1
+    let dummyFut = newFuture[PgConnection]("dummy")
+    cluster.replica.waiters.addLast(Waiter(fut: dummyFut, cancelled: false))
+    cluster.replica.waiterCount = 1
+
+    let primaryConn = mockConn()
+    cluster.primary.idle.addLast(
+      PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+    )
+
+    let (acquired, pool) = waitFor acquireRead(cluster)
+    check acquired == primaryConn
+    check pool == cluster.primary
+    check fired
+    check seenReason == rfrReplicaUnavailable
+
+    dummyFut.complete(mockConn())
+
+  test "onReadFallback fires with rfrReplicaTimeout when replica acquire times out":
+    var seenReason: ReadFallbackReason
+    var fired = false
+    let cluster =
+      makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(50))
+    cluster.onReadFallback = proc(
+        reason: ReadFallbackReason, err: ref CatchableError
+    ) {.gcsafe, raises: [].} =
+      fired = true
+      seenReason = reason
+    cluster.replica.active = cluster.replica.config.maxSize
+    cluster.replica.config.acquireTimeout = seconds(30)
+    let replicaFut = newFuture[PgConnection]("replica-dummy")
+    cluster.replica.waiters.addLast(Waiter(fut: replicaFut, cancelled: false))
+    cluster.replica.waiterCount = 1
+
+    let primaryConn = mockConn()
+    cluster.primary.idle.addLast(
+      PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+    )
+
+    let (acquired, pool) = waitFor acquireRead(cluster)
+    check acquired == primaryConn
+    check pool == cluster.primary
+    check fired
+    check seenReason == rfrReplicaTimeout
+
+    replicaFut.complete(mockConn())
+
+  test "onReadFallback does not fire when replica succeeds":
+    var fired = false
+    let cluster = makeCluster(fallback = fallbackPrimary)
+    cluster.onReadFallback = proc(
+        reason: ReadFallbackReason, err: ref CatchableError
+    ) {.gcsafe, raises: [].} =
+      fired = true
+    let replicaConn = mockConn()
+    cluster.replica.mockIdle(replicaConn)
+
+    let (acquired, pool) = waitFor acquireRead(cluster)
+    check acquired == replicaConn
+    check pool == cluster.replica
+    check not fired
 
 suite "Close":
   test "close sets closed and closes both pools":
