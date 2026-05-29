@@ -30,7 +30,7 @@ proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
   conn.notifyCallback = callback
 
 proc onListenError*(
-    conn: PgConnection, callback: proc(msg: string) {.gcsafe, raises: [].}
+    conn: PgConnection, callback: proc(err: ref PgListenError) {.gcsafe, raises: [].}
 ) =
   ## Set a callback invoked when the listen pump dies permanently (reconnection
   ## failed, or the connection was lost with no channels left to re-subscribe).
@@ -76,24 +76,34 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
 
 # Background pump and start/stop
 
-proc notifyListenDeath(conn: PgConnection, msg: string) {.raises: [].} =
+proc newListenError(
+    msg: string, reconnectionAttempted: bool
+): ref PgListenError {.raises: [].} =
+  (ref PgListenError)(msg: msg, reconnectionAttempted: reconnectionAttempted)
+
+proc notifyListenDeath(
+    conn: PgConnection, msg: string, reconnectionAttempted: bool
+) {.raises: [].} =
   ## Mark the listen pump as permanently dead and notify both APIs: the pull
   ## API via `notifyWaiter.fail` and the push API via `listenErrorCallback`.
-  conn.listenErrorMsg = msg
+  conn.listenError = newListenError(msg, reconnectionAttempted)
   conn.state = csClosed
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    let err = newException(PgError, msg)
+    # Fail the pull-API waiter with a *fresh* exception, never the stored
+    # `conn.listenError`: that object is re-raised by `checkListenAlive` on every
+    # later call, so sharing one ref would let its stack trace accumulate.
+    #
     # asyncdispatch types `Future.fail`'s callback chain as raising the base
     # `Exception`, so catching `Exception` (not `CatchableError`) is what keeps
     # this proc `raises: []` — same idiom as `dispatchNotification`. `fail` runs
     # no user callbacks synchronously here, so nothing real is masked, and
     # swallowing it guarantees the push-API callback below still fires.
     try:
-      conn.notifyWaiter.fail(err)
+      conn.notifyWaiter.fail(newListenError(msg, reconnectionAttempted))
     except Exception:
       discard
   if conn.listenErrorCallback != nil:
-    conn.listenErrorCallback(msg)
+    conn.listenErrorCallback(conn.listenError)
 
 proc listenPump*(conn: PgConnection) {.async.} =
   ## Background loop: repeatedly receives messages, dispatching notifications.
@@ -121,7 +131,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
       return # Cancelled from close()
     except CatchableError:
       if conn.listenChannels.len == 0:
-        conn.notifyListenDeath("Listen connection lost")
+        conn.notifyListenDeath("Listen connection lost", false)
         return
       # Auto-reconnect with exponential backoff
       let maxAttempts = conn.listenReconnectMaxAttempts
@@ -147,7 +157,8 @@ proc listenPump*(conn: PgConnection) {.async.} =
       if not reconnected:
         conn.notifyListenDeath(
           "Listen connection lost: reconnection failed after " & $maxAttempts &
-            " attempts"
+            " attempts",
+          true,
         )
         return
 
@@ -218,8 +229,10 @@ proc checkNotifyOverflow(conn: PgConnection) =
 
 proc checkListenAlive(conn: PgConnection) =
   ## Raise if the listen pump has died permanently.
-  if conn.listenErrorMsg.len > 0:
-    raise newException(PgConnectionError, conn.listenErrorMsg)
+  if conn.listenError != nil:
+    # Raise a fresh copy, not the stored object: re-raising one shared ref
+    # across repeated calls would let its stack trace grow unbounded.
+    raise newListenError(conn.listenError.msg, conn.listenError.reconnectionAttempted)
   if conn.state == csClosed:
     raise newException(PgConnectionError, "Connection is closed")
 
@@ -229,7 +242,7 @@ proc waitNotification*(
   ## Wait for the next notification from the buffer.
   ## If the buffer is empty, blocks until a notification arrives or timeout expires.
   ## Raises PgNotifyOverflowError if notifications were dropped due to queue overflow.
-  ## Raises PgError if the listen pump has died (e.g. reconnection failed).
+  ## Raises PgListenError if the listen pump has died (e.g. reconnection failed).
   conn.checkNotifyOverflow()
   conn.checkListenAlive()
   if conn.notifyQueue.len > 0:
