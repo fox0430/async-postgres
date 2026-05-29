@@ -352,22 +352,18 @@ proc parseTimeText*(s: string): PgTime =
   if s.len < 8 or s[2] != ':' or s[5] != ':':
     raise newException(PgTypeError, "Invalid time: " & s)
   var h, m, sec, us: int
-  try:
+  pgTypeErrorOnValueError("Invalid time: " & s):
     h = parseInt(s[0 .. 1])
     m = parseInt(s[3 .. 4])
     sec = parseInt(s[6 .. 7])
-  except ValueError:
-    raise newException(PgTypeError, "Invalid time: " & s)
   if h notin 0 .. 23 or m notin 0 .. 59 or sec notin 0 .. 59:
     raise newException(PgTypeError, "Invalid time: " & s)
   if s.len > 8 and s[8] == '.':
     let frac = s[9 .. ^1]
     if frac.len == 0 or frac.len > 6:
       raise newException(PgTypeError, "Invalid time: " & s)
-    try:
+    pgTypeErrorOnValueError("Invalid time: " & s):
       us = parseInt(frac)
-    except ValueError:
-      raise newException(PgTypeError, "Invalid time: " & s)
     # Pad to 6 digits
     for _ in 0 ..< (6 - frac.len):
       us *= 10
@@ -386,7 +382,7 @@ proc parseTimeTzText*(s: string): PgTimeTz =
   let sign = if s[tzPos] == '+': 1 else: -1
   let offStr = s[tzPos + 1 .. ^1]
   var offH, offM, offS: int
-  try:
+  pgTypeErrorOnValueError("Invalid timetz offset: " & s):
     if offStr.len == 2:
       offH = parseInt(offStr)
     elif offStr.len == 5 and offStr[2] == ':':
@@ -398,8 +394,6 @@ proc parseTimeTzText*(s: string): PgTimeTz =
       offS = parseInt(offStr[6 .. 7])
     else:
       raise newException(PgTypeError, "Invalid timetz offset: " & s)
-  except ValueError:
-    raise newException(PgTypeError, "Invalid timetz offset: " & s)
   let utcOff = sign * (offH * 3600 + offM * 60 + offS)
   PgTimeTz(
     hour: t.hour,
@@ -569,14 +563,27 @@ proc parseIntervalText*(s: string): PgInterval =
   PgInterval(months: months, days: days, microseconds: microseconds)
 
 proc parseInetText*(s: string): tuple[address: IpAddress, mask: uint8] =
+  # ``parseIpAddress`` and ``parseInt`` both raise the standard ``ValueError`` on
+  # malformed input; convert to ``PgTypeError`` so callers can rely on the
+  # ``except PgError`` contract (see ``pg_errors``).
   let slashIdx = s.find('/')
-  if slashIdx == -1:
-    let ip = parseIpAddress(s)
-    let defaultMask = if ip.family == IpAddressFamily.IPv4: 32'u8 else: 128'u8
-    return (ip, defaultMask)
-  let addrStr = s.substr(0, slashIdx - 1)
-  let maskStr = s.substr(slashIdx + 1)
-  result = (parseIpAddress(addrStr), uint8(parseInt(maskStr)))
+  pgTypeErrorOnValueError("invalid inet value: " & s):
+    if slashIdx == -1:
+      let ip = parseIpAddress(s)
+      let defaultMask = if ip.family == IpAddressFamily.IPv4: 32'u8 else: 128'u8
+      return (ip, defaultMask)
+    let addrStr = s.substr(0, slashIdx - 1)
+    let maskStr = s.substr(slashIdx + 1)
+    let ip = parseIpAddress(addrStr)
+    # ``uint8(parseInt(...))`` would silently wrap an out-of-range prefix length
+    # (``/300`` -> 44, ``/-5`` -> 251), so validate against the family's maximum
+    # before narrowing; otherwise a malformed mask escapes the ``PgTypeError``
+    # contract as a plausible-but-wrong value instead of an error.
+    let maxMask = if ip.family == IpAddressFamily.IPv4: 32 else: 128
+    let mask = parseInt(maskStr)
+    if mask < 0 or mask > maxMask:
+      raise newException(PgTypeError, "inet mask out of range: " & s)
+    result = (ip, uint8(mask))
 
 proc decodeBinaryTsVector*(data: openArray[byte]): string =
   ## Decode PostgreSQL binary tsvector to text representation.
@@ -723,7 +730,7 @@ proc parsePointText*(s: string): PgPoint =
   let comma = inner.find(',')
   if comma < 0:
     raise newException(PgTypeError, "Invalid point: " & s)
-  PgPoint(x: parseFloat(inner[0 ..< comma]), y: parseFloat(inner[comma + 1 ..^ 1]))
+  PgPoint(x: pgParseFloat(inner[0 ..< comma]), y: pgParseFloat(inner[comma + 1 ..^ 1]))
 
 proc parsePointsText*(s: string): seq[PgPoint] =
   ## Parse a comma-separated list of points like "(x1,y1),(x2,y2),...".

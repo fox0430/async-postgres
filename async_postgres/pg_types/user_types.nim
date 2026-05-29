@@ -128,10 +128,16 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
         value: some(toBytes(encodeEnumTextArray(labels))),
       )
 
+proc pgParseEnum[T: enum](s: string): T =
+  ## Parse an enum label, converting `ValueError` (unknown label) to `PgTypeError`
+  ## so callers can rely on the ``except PgError`` contract (see ``pg_errors``).
+  pgTypeErrorOnValueError("invalid enum value for " & name(T) & ": " & s):
+    parseEnum[T](s)
+
 proc getEnum*[T: enum](row: Row, col: int): T =
   ## Read a PostgreSQL enum column (text format) as a Nim enum.
   ## The column value must exactly match one of ``T``'s string representations.
-  parseEnum[T](row.getStr(col))
+  pgParseEnum[T](row.getStr(col))
 
 proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
   ## Read a PostgreSQL enum column as ``Option[T]``. Returns none if NULL.
@@ -154,13 +160,13 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in enum array")
-      result[i] = parseEnum[T](readString(row.data.buf, off + e.off, e.len))
+      result[i] = pgParseEnum[T](readString(row.data.buf, off + e.off, e.len))
     return
   let s = row.getStr(col)
   for e in parseTextArray(s):
     if e.isNone:
       raise newException(PgTypeError, "NULL element in enum array")
-    result.add(parseEnum[T](e.get))
+    result.add(pgParseEnum[T](e.get))
 
 proc getEnumArrayOpt*[T: enum](row: Row, col: int): Option[seq[T]] =
   ## NULL-safe column-level variant. Element NULL still raises.
@@ -182,14 +188,14 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
       if e.len == -1:
         result[i] = none(T)
       else:
-        result[i] = some(parseEnum[T](readString(row.data.buf, off + e.off, e.len)))
+        result[i] = some(pgParseEnum[T](readString(row.data.buf, off + e.off, e.len)))
     return
   let s = row.getStr(col)
   for e in parseTextArray(s):
     if e.isNone:
       result.add(none(T))
     else:
-      result.add(some(parseEnum[T](e.get)))
+      result.add(some(pgParseEnum[T](e.get)))
 
 # User-defined composite type support
 
@@ -327,17 +333,17 @@ proc compositeFieldFromText[T](s: string): T =
   when T is string:
     s
   elif T is int32:
-    int32(parseInt(s))
+    pgParseInt32(s)
   elif T is int16:
-    int16(parseInt(s))
+    pgParseInt16(s)
   elif T is int64:
-    parseBiggestInt(s)
+    pgParseBiggestInt(s)
   elif T is int:
-    parseInt(s)
+    pgParseInt(s)
   elif T is float64:
-    parseFloat(s)
+    pgParseFloat(s)
   elif T is float32:
-    float32(parseFloat(s))
+    pgParseFloat32(s)
   elif T is bool:
     case s
     of "t", "true", "1":

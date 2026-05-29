@@ -106,6 +106,19 @@ template makeLoWriteCallback*(body: untyped): LoWriteCallback =
         return fut
       r
 
+proc parseLoInt(s, fn: string): BiggestInt =
+  ## Convert a numeric scalar returned by a Large Object server function to an
+  ## integer, surfacing a malformed response as `PgTypeError` (keeps the
+  ## ``except PgError`` contract) instead of leaking a raw `ValueError`.
+  pgTypeErrorOnValueError(fn & " returned a non-numeric result: " & s):
+    parseBiggestInt(s)
+
+proc parseLoOid(s, fn: string): Oid =
+  ## Convert an OID returned by a Large Object server function, surfacing a
+  ## malformed response as `PgTypeError` instead of a raw `ValueError`.
+  pgTypeErrorOnValueError(fn & " returned a non-numeric OID: " & s):
+    Oid(parseUInt(s))
+
 # Core API
 
 proc loCreate*(
@@ -116,7 +129,7 @@ proc loCreate*(
   let s = await conn.queryValue(
     "SELECT lo_create($1)", @[toPgParam(int32(requestedOid))], timeout = timeout
   )
-  return Oid(parseUInt(s))
+  return parseLoOid(s, "lo_create")
 
 proc loUnlink*(
     conn: PgConnection, oid: Oid, timeout: Duration = ZeroDuration
@@ -138,7 +151,7 @@ proc loOpen*(
     @[toPgParam(int32(oid)), toPgParam(mode)],
     timeout = timeout,
   )
-  return LargeObject(conn: conn, fd: int32(parseInt(s)), oid: oid)
+  return LargeObject(conn: conn, fd: int32(parseLoInt(s, "lo_open")), oid: oid)
 
 proc loClose*(
     lo: LargeObject, timeout: Duration = ZeroDuration
@@ -175,7 +188,7 @@ proc loWrite*(
     @[toPgParam(lo.fd), PgParam(oid: OidBytea, format: 1, value: some(data))],
     timeout = timeout,
   )
-  return int32(parseInt(s))
+  return int32(parseLoInt(s, "lowrite"))
 
 proc loSeek*(
     lo: LargeObject,
@@ -189,7 +202,7 @@ proc loSeek*(
     @[toPgParam(lo.fd), toPgParam(offset), toPgParam(whence)],
     timeout = timeout,
   )
-  return parseBiggestInt(s)
+  return parseLoInt(s, "lo_lseek64")
 
 proc loTell*(
     lo: LargeObject, timeout: Duration = ZeroDuration
@@ -198,7 +211,7 @@ proc loTell*(
   let s = await lo.conn.queryValue(
     "SELECT lo_tell64($1)", @[toPgParam(lo.fd)], timeout = timeout
   )
-  return parseBiggestInt(s)
+  return parseLoInt(s, "lo_tell64")
 
 proc loTruncate*(
     lo: LargeObject, length: int64, timeout: Duration = ZeroDuration
@@ -217,7 +230,7 @@ proc loImport*(
   let s = await conn.queryValue(
     "SELECT lo_import($1)", @[toPgParam(filename)], timeout = timeout
   )
-  return Oid(parseUInt(s))
+  return parseLoOid(s, "lo_import")
 
 proc loExport*(
     conn: PgConnection, oid: Oid, filename: string, timeout: Duration = ZeroDuration
