@@ -195,7 +195,7 @@ type
     notifyWaiter*: Future[void]
     sendBuf*: seq[byte] ## Reusable send buffer for COPY IN batching
     notifyDropped*: int ## Count of notifications dropped due to queue overflow
-    listenErrorMsg*: string ## Set when listen pump fails permanently
+    listenError*: ref PgListenError ## Set when listen pump fails permanently
     listenReconnectMaxAttempts*: int
       ## Max reconnect attempts on listen pump failure. Default 10.
       ## 0 or negative = unlimited retries (retry until close()).
@@ -203,7 +203,7 @@ type
       ## Max seconds between reconnect attempts (backoff cap). Default 30.
     reconnectCallback*: proc() {.gcsafe, raises: [].}
     notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
-    listenErrorCallback*: proc(msg: string) {.gcsafe, raises: [].}
+    listenErrorCallback*: proc(err: ref PgListenError) {.gcsafe, raises: [].}
       ## Invoked when the listen pump dies permanently (reconnection failed or
       ## the connection was lost with nothing left to re-subscribe). Lets push
       ## API (`onNotify`) users learn the pump is gone — the pull API surfaces
