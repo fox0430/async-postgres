@@ -203,6 +203,11 @@ type
       ## Max seconds between reconnect attempts (backoff cap). Default 30.
     reconnectCallback*: proc() {.gcsafe, raises: [].}
     notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
+    listenErrorCallback*: proc(msg: string) {.gcsafe, raises: [].}
+      ## Invoked when the listen pump dies permanently (reconnection failed or
+      ## the connection was lost with nothing left to re-subscribe). Lets push
+      ## API (`onNotify`) users learn the pump is gone — the pull API surfaces
+      ## the same failure through `waitNotification`.
     stmtCache*: Table[string, CachedStmt]
     stmtCacheLru*: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
     stmtCounter*: int
