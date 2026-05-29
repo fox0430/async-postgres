@@ -297,8 +297,17 @@ template withLargeObject*(
   let lo = await conn.loOpen(oidVal, mode)
   try:
     body
-  finally:
-    await lo.loClose()
+  except CatchableError as loBodyErr:
+    # ``body`` failed and the surrounding transaction may now be in a failed
+    # state, so ``loClose`` would raise "current transaction is aborted" and
+    # mask the real error. Close best-effort and re-raise the original.
+    try:
+      await lo.loClose()
+    except CatchableError:
+      discard
+    raise loBodyErr
+  # Surface a genuine close failure to the caller.
+  await lo.loClose()
 
 # Streaming API
 
