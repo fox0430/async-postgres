@@ -258,8 +258,19 @@ proc connectToHost*(
     conn.state = csAuthentication
 
     # Authentication loop
-    var scramState: ScramState
-    var sawAuthRequest = false
+    var
+      scramState: ScramState
+      sawAuthRequest = false
+
+    var
+      # SCRAM mutual authentication: once a SASL exchange has begun the client
+      # MUST verify the server's signature (AuthenticationSASLFinal) before
+      # accepting AuthenticationOk. Otherwise a malicious server / MITM could
+      # skip SASLFinal and be accepted without proving it knows the password,
+      # defeating SCRAM's mutual-auth guarantee.
+      scramStarted = false
+      scramFinalVerified = false
+
     block authLoop:
       while true:
         while (let opt = conn.nextMessage(); opt.isSome):
@@ -268,6 +279,12 @@ proc connectToHost*(
           of bmkAuthenticationOk:
             if not sawAuthRequest:
               enforceAuthAllowed(amNone, config.requireAuth)
+            if scramStarted and not scramFinalVerified:
+              raise newException(
+                PgConnectionError,
+                "server sent AuthenticationOk before completing SCRAM server " &
+                  "signature verification (possible downgrade or MITM)",
+              )
             break authLoop
           of bmkAuthenticationCleartextPassword:
             sawAuthRequest = true
@@ -292,6 +309,7 @@ proc connectToHost*(
               ncutils.burnMem(hashMsg)
           of bmkAuthenticationSASL:
             sawAuthRequest = true
+            scramStarted = true
             let filtered =
               filterSaslByRequireAuth(msg.saslMechanisms, config.requireAuth)
             if config.requireAuth.len > 0 and filtered.len == 0:
@@ -334,6 +352,7 @@ proc connectToHost*(
               raise newException(
                 PgConnectionError, "SCRAM server signature verification failed"
               )
+            scramFinalVerified = true
           of bmkErrorResponse:
             raise newException(PgConnectionError, formatError(msg.errorFields))
           else:
