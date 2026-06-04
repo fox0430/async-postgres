@@ -612,7 +612,7 @@ proc getInt4Range*(row: Row, col: int): PgRange[int32] =
   parseRangeText[int32](
     s,
     proc(e: string): int32 {.gcsafe, raises: [CatchableError].} =
-      int32(parseInt(e)),
+      pgParseInt32(e),
   )
 
 proc getInt8Range*(row: Row, col: int): PgRange[int64] =
@@ -626,7 +626,7 @@ proc getInt8Range*(row: Row, col: int): PgRange[int64] =
   parseRangeText[int64](
     s,
     proc(e: string): int64 {.gcsafe, raises: [CatchableError].} =
-      parseBiggestInt(e),
+      pgParseBiggestInt(e),
   )
 
 proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
@@ -1039,7 +1039,7 @@ proc getInt4Multirange*(row: Row, col: int): PgMultirange[int32] =
   parseMultirangeText[int32](
     s,
     proc(e: string): int32 {.gcsafe, raises: [CatchableError].} =
-      int32(parseInt(e)),
+      pgParseInt32(e),
   )
 
 proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
@@ -1059,7 +1059,7 @@ proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
   parseMultirangeText[int64](
     s,
     proc(e: string): int64 {.gcsafe, raises: [CatchableError].} =
-      parseBiggestInt(e),
+      pgParseBiggestInt(e),
   )
 
 proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
@@ -1202,7 +1202,7 @@ proc getInt4MultirangeArray*(row: Row, col: int): seq[PgMultirange[int32]] =
       parseMultirangeText[int32](
         e.get,
         proc(x: string): int32 {.gcsafe, raises: [CatchableError].} =
-          int32(parseInt(x)),
+          pgParseInt32(x),
       )
     )
 
@@ -1236,7 +1236,7 @@ proc getInt8MultirangeArray*(row: Row, col: int): seq[PgMultirange[int64]] =
       parseMultirangeText[int64](
         e.get,
         proc(x: string): int64 {.gcsafe, raises: [CatchableError].} =
-          parseBiggestInt(x),
+          pgParseBiggestInt(x),
       )
     )
 
@@ -1435,7 +1435,7 @@ proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
       parseRangeText[int32](
         e.get,
         proc(x: string): int32 {.gcsafe, raises: [CatchableError].} =
-          int32(parseInt(x)),
+          pgParseInt32(x),
       )
     )
 
@@ -1464,7 +1464,7 @@ proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
       parseRangeText[int64](
         e.get,
         proc(x: string): int64 {.gcsafe, raises: [CatchableError].} =
-          parseBiggestInt(x),
+          pgParseBiggestInt(x),
       )
     )
 

@@ -3451,7 +3451,7 @@ suite "User-defined enum":
     var raised = false
     try:
       discard getEnum[Mood](row, 0)
-    except ValueError:
+    except PgTypeError:
       raised = true
     check raised
 
@@ -7127,7 +7127,7 @@ suite "enum arrays":
     var raised = false
     try:
       discard getEnumArray[Mood](row, 0)
-    except ValueError:
+    except PgTypeError:
       raised = true
     check raised
 
@@ -7915,3 +7915,140 @@ suite "expectedElemCount strictness":
       discard expectedElemCount(@[2'i32, 0])
     expect PgError:
       discard expectedElemCount(@[0'i32])
+
+suite "Text-path parse errors raise PgTypeError (not ValueError)":
+  # REVIEW A.1: text-format accessors must convert the standard ``ValueError``
+  # raised by the throwing ``parseInt``/``parseFloat``/``parseBiggestInt``/
+  # ``parseHexInt``/``parseIpAddress``/``parseEnum`` into the library's
+  # ``PgTypeError`` so callers can rely on a single ``except PgError`` clause.
+  test "getIntArray non-numeric element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1,abc}"))]).getIntArray(0)
+
+  test "getInt16Array non-numeric element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1,abc}"))]).getInt16Array(0)
+
+  test "getInt64Array non-numeric element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1,abc}"))]).getInt64Array(0)
+
+  test "getFloatArray non-numeric element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1.0,abc}"))]).getFloatArray(0)
+
+  test "getFloat32Array non-numeric element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1.0,abc}"))]).getFloat32Array(0)
+
+  test "getIntArrayElemOpt non-numeric element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1,abc}"))]).getIntArrayElemOpt(0)
+
+  test "getInt4Range non-numeric bound":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("[1,abc)"))]).getInt4Range(0)
+
+  test "getInt4Range out-of-range bound (no silent truncation)":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("[1,2147483648)"))]).getInt4Range(0)
+
+  test "getInt8Range non-numeric bound":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("[1,abc)"))]).getInt8Range(0)
+
+  test "getBytes invalid hex":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("\\xZZ"))]).getBytes(0)
+
+  test "getBytes odd-length hex":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("\\xABC"))]).getBytes(0)
+
+  test "getBytesArray odd-length hex element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{\\xABC}"))]).getBytesArray(0)
+
+  test "getInet invalid mask":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("10.0.0.0/xx"))]).getInet(0)
+
+  test "getInet invalid address":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("999.999.999.999/8"))]).getInet(0)
+
+  # Out-of-range prefix lengths must raise, not silently wrap through
+  # ``uint8(parseInt(...))`` (``/300`` -> 44, ``/-5`` -> 251). IPv6 caps at 128.
+  test "getInet out-of-range mask (no silent wrap)":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("10.0.0.0/300"))]).getInet(0)
+    expect PgTypeError:
+      discard (Row @[some(toBytes("10.0.0.0/-5"))]).getInet(0)
+    expect PgTypeError:
+      discard (Row @[some(toBytes("2001:db8::/200"))]).getInet(0)
+
+  test "getPoint non-numeric coordinate":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("(a,b)"))]).getPoint(0)
+
+  test "getComposite non-numeric field":
+    expect PgTypeError:
+      discard getComposite[PointRecord](Row @[some(toBytes("(a,b)"))], 0)
+
+  test "getTime non-numeric field":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("aa:bb:cc"))]).getTime(0)
+
+  test "getTimeTz non-numeric offset":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("12:00:00+ab"))]).getTimeTz(0)
+
+  # Out-of-range / overflow bounds must raise PgTypeError too, not silently
+  # wrap (int) or collapse to inf (float32) — see pgParseInt16/pgParseBiggestInt
+  # /pgParseFloat32 in core.nim.
+  test "getInt16Array out-of-range element (no silent truncation)":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1,32768}"))]).getInt16Array(0)
+
+  test "getInt64Array out-of-range element":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1,9223372036854775808}"))]).getInt64Array(0)
+
+  test "getFloat32Array overflow element (no silent inf)":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("{1.0,1e40}"))]).getFloat32Array(0)
+
+  test "getFloat32 scalar overflow (no silent inf)":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("1e40"))]).getFloat32(0)
+
+suite "Float text path accepts PostgreSQL Infinity/-Infinity/NaN":
+  # PostgreSQL prints float infinities as the full word ``Infinity``/``-Infinity``
+  # (and NaN as ``NaN``). Nim's ``parseFloat`` only takes the ``inf`` form, so the
+  # text path must special-case the full word to stay symmetric with the binary
+  # path. NaN is already parsed natively.
+  test "getFloat scalar Infinity/-Infinity":
+    check (Row @[some(toBytes("Infinity"))]).getFloat(0) == Inf
+    check (Row @[some(toBytes("-Infinity"))]).getFloat(0) == NegInf
+
+  test "getFloat32 scalar Infinity/-Infinity":
+    check (Row @[some(toBytes("Infinity"))]).getFloat32(0) == float32(Inf)
+    check (Row @[some(toBytes("-Infinity"))]).getFloat32(0) == float32(NegInf)
+
+  test "getFloat scalar NaN":
+    check (Row @[some(toBytes("NaN"))]).getFloat(0).classify == fcNan
+
+  test "getFloat32 scalar NaN":
+    check (Row @[some(toBytes("NaN"))]).getFloat32(0).classify == fcNan
+
+  test "getFloatArray Infinity/-Infinity/NaN":
+    let v = (Row @[some(toBytes("{Infinity,-Infinity,NaN,1.5}"))]).getFloatArray(0)
+    check v[0] == Inf
+    check v[1] == NegInf
+    check v[2].classify == fcNan
+    check v[3] == 1.5
+
+  test "getFloat32Array Infinity (genuine, not a false overflow reject)":
+    let v = (Row @[some(toBytes("{Infinity,-Infinity}"))]).getFloat32Array(0)
+    check v[0] == float32(Inf)
+    check v[1] == float32(NegInf)

@@ -5,6 +5,8 @@ import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 import pkg/nimcrypto/utils as ncutils
 
+import pg_errors
+
 template burnStr*(s: var string) =
   ## Wipe a string's heap buffer. Compiler is prevented from eliding the
   ## write because nimcrypto's `burnMem` uses a volatile memset.
@@ -59,7 +61,7 @@ proc scramClientFirstMessage*(
   var nonceBuf: array[24, byte]
   let n = randomBytes(nonceBuf)
   if n != 24:
-    raise newException(CatchableError, "SCRAM: failed to generate random nonce")
+    raise newException(PgConnectionError, "SCRAM: failed to generate random nonce")
   state.clientNonce = base64.encode(nonceBuf)
   state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & state.clientNonce
   state.gs2Header =
@@ -108,33 +110,34 @@ proc scramClientFinalMessage*(
       try:
         iterations = parseInt(part[2 .. ^1])
       except ValueError:
-        raise newException(CatchableError, "SCRAM: invalid iteration count")
+        raise newException(PgConnectionError, "SCRAM: invalid iteration count")
       hasIterations = true
 
   if not hasNonce:
-    raise newException(CatchableError, "SCRAM: server response missing nonce (r=)")
+    raise newException(PgConnectionError, "SCRAM: server response missing nonce (r=)")
   if not hasSalt:
-    raise newException(CatchableError, "SCRAM: server response missing salt (s=)")
+    raise newException(PgConnectionError, "SCRAM: server response missing salt (s=)")
   if not hasIterations:
     raise newException(
-      CatchableError, "SCRAM: server response missing iteration count (i=)"
+      PgConnectionError, "SCRAM: server response missing iteration count (i=)"
     )
   if iterations <= 0:
-    raise newException(CatchableError, "SCRAM: iteration count must be positive")
+    raise newException(PgConnectionError, "SCRAM: iteration count must be positive")
   if iterations > 600_000:
-    raise
-      newException(CatchableError, "SCRAM: iteration count too large: " & $iterations)
+    raise newException(
+      PgConnectionError, "SCRAM: iteration count too large: " & $iterations
+    )
 
   if not combinedNonce.startsWith(state.clientNonce):
     raise newException(
-      CatchableError, "SCRAM: server nonce doesn't start with client nonce"
+      PgConnectionError, "SCRAM: server nonce doesn't start with client nonce"
     )
 
   let salt =
     try:
       base64.decode(saltB64)
     except ValueError:
-      raise newException(CatchableError, "SCRAM: invalid base64 in salt")
+      raise newException(PgConnectionError, "SCRAM: invalid base64 in salt")
 
   var saltedPassword: seq[byte]
   var clientKey, storedKey, clientSignature, serverKey: array[32, byte]

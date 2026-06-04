@@ -528,6 +528,20 @@ proc connectReplication*(
   cfg.extraParams.add(("replication", replicationParamValue(mode)))
   connect(cfg)
 
+proc parseTimelineId*(s: string): int32 =
+  ## Parse the timeline id from an ``IDENTIFY_SYSTEM`` result row (text format).
+  ## Converts a non-numeric value and an out-of-``int32``-range value into
+  ## `PgTypeError` so callers stay under the ``except PgError`` contract.
+  ## Range-check before narrowing: a bare ``parseInt(...).int32`` would raise
+  ## ``RangeDefect`` (a Defect, outside ``PgError``) on an out-of-range value.
+  pgTypeErrorOnValueError("IDENTIFY_SYSTEM returned a non-numeric timeline: " & s):
+    let t = parseInt(s)
+    if t < int(int32.low) or t > int(int32.high):
+      raise newException(
+        PgTypeError, "IDENTIFY_SYSTEM returned a timeline out of int32 range: " & s
+      )
+    t.int32
+
 # Replication commands (via simple query protocol)
 
 proc identifySystem*(
@@ -543,7 +557,7 @@ proc identifySystem*(
   let row = initRow(qr.data, 0)
   var info = SystemInfo()
   info.systemId = row.getStr(0)
-  info.timeline = parseInt(row.getStr(1)).int32
+  info.timeline = parseTimelineId(row.getStr(1))
   info.xLogPos = parseLsn(row.getStr(2))
   # On physical replication connections (``replication=true``) the dbName
   # column is NULL because the session is not bound to a database.

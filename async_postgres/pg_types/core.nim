@@ -1,4 +1,4 @@
-import std/[hashes, options, sequtils, strutils, tables, net]
+import std/[hashes, math, options, parseutils, sequtils, strutils, tables, net]
 
 import ../pg_errors
 export pg_errors
@@ -288,6 +288,100 @@ const
   PgInlineBufSize* = 16
     ## Maximum payload size that fits in `PgParamInline.inlineBuf` without a
     ## heap allocation. Values longer than this are stored in `overflow`.
+
+# Safe text-value parsing helpers.
+#
+# `std/strutils`' throwing `parseInt`/`parseFloat`/`parseBiggestInt`/`parseHexInt`
+# raise the standard `ValueError`, which escapes the library's `except PgError`
+# contract (see ``pg_errors``). Text-format accessors must route their parsing
+# through these wrappers so a malformed value surfaces as a catchable
+# `PgTypeError` instead of a raw `ValueError`. The scalar `getInt`/`getFloat`
+# accessors already achieve this via the non-throwing `parseInt(s, v) == 0`
+# overloads; these helpers extend the same guarantee to the array/range/bytea/
+# geometric/composite paths.
+
+template pgTypeErrorOnValueError*(context: string, body: untyped): untyped =
+  ## Evaluate ``body`` and convert any standard ``ValueError`` it raises into a
+  ## `PgTypeError` whose message is ``context`` plus the original detail. Use at
+  ## call sites that parse a server text value but need a context-specific
+  ## message the generic ``pgParse*`` helpers can't carry (function name,
+  ## protocol field, enum type, …). Keeps the ``except PgError`` contract (see
+  ## ``pg_errors``) without re-spelling the same try/except at every site.
+  try:
+    body
+  except ValueError:
+    raise newException(PgTypeError, context & " (" & getCurrentExceptionMsg() & ")")
+
+proc pgParseInt*(s: string): int =
+  ## Parse a text integer, converting `ValueError` (invalid or overflowing) to `PgTypeError`.
+  pgTypeErrorOnValueError("invalid integer value"):
+    parseInt(s)
+
+proc pgParseInt32*(s: string): int32 =
+  ## Parse a text integer into int32, rejecting non-numeric and out-of-range values.
+  ## Plain ``int32(parseInt)`` would silently truncate (wrap) in release builds.
+  let v = pgParseInt(s)
+  if v < int(int32.low) or v > int(int32.high):
+    raise newException(PgTypeError, "integer value out of int32 range: " & s)
+  int32(v)
+
+proc pgParseInt16*(s: string): int16 =
+  ## Parse a text integer into int16, rejecting non-numeric and out-of-range values.
+  ## Plain ``int16(parseInt)`` would silently truncate (wrap) in release builds.
+  let v = pgParseInt(s)
+  if v < int(int16.low) or v > int(int16.high):
+    raise newException(PgTypeError, "integer value out of int16 range: " & s)
+  int16(v)
+
+proc pgParseBiggestInt*(s: string): BiggestInt =
+  ## Parse a text integer into BiggestInt, converting `ValueError` to `PgTypeError`.
+  pgTypeErrorOnValueError("invalid integer value"):
+    parseBiggestInt(s)
+
+proc oaToString(s: openArray[char]): string =
+  ## Materialise an ``openArray[char]`` view into a ``string``. Only used on the
+  ## error path of the float parsers, which take a zero-copy view so the scalar
+  ## ``getFloat``/``getFloat32`` accessors can parse straight out of the row
+  ## buffer without an allocation.
+  result = newString(s.len)
+  for i in 0 ..< s.len:
+    result[i] = s[i]
+
+proc pgParseFloat*(s: openArray[char]): float =
+  ## Parse a text float, raising `PgTypeError` on malformed input. Also accepts
+  ## PostgreSQL's full-word ``Infinity``/``-Infinity`` spelling, which Nim's
+  ## ``parseFloat`` rejects (it only takes the ``inf`` form); ``NaN`` is parsed
+  ## natively. This keeps the text path symmetric with the binary path, where
+  ## float infinities decode fine. Takes an ``openArray[char]`` so the scalar
+  ## accessors can pass a zero-copy view of the row buffer (a ``string`` argument
+  ## converts implicitly, so the array/geometric/composite callers are unaffected).
+  if s == "Infinity":
+    return Inf
+  if s == "-Infinity":
+    return NegInf
+  # Mirror ``strutils.parseFloat``'s strictness (entire input must parse) but on a
+  # view, without its throwing `string` overload's allocation/`ValueError`.
+  let n = parseutils.parseFloat(s, result)
+  if n == 0 or n != s.len:
+    raise newException(PgTypeError, "invalid float value: " & oaToString(s))
+
+proc pgParseFloat32*(s: openArray[char]): float32 =
+  ## Parse a text float into float32, raising `PgTypeError` on malformed input and
+  ## rejecting finite values that overflow float32's range (a plain
+  ## ``float32(parseFloat)`` would silently collapse them to ``inf``). Genuine
+  ## ``Infinity``/``-Infinity`` inputs (recognised by ``pgParseFloat``) are
+  ## preserved.
+  let v = pgParseFloat(s)
+  result = float32(v)
+  if result.classify in {fcInf, fcNegInf} and v.classify notin {fcInf, fcNegInf}:
+    raise
+      newException(PgTypeError, "float value out of float32 range: " & oaToString(s))
+
+proc pgParseHexInt*(s: string): int =
+  ## Parse a hex string, converting `ValueError` to `PgTypeError`.
+  ## Used to decode hex-encoded bytea (``\xDEADBEEF``) text pairs.
+  pgTypeErrorOnValueError("invalid hex value"):
+    parseHexInt(s)
 
 proc `+`*(a: int, b: RelOff): int {.inline.} =
   ## Combine an absolute parent-buffer origin with a relative decoder offset.
@@ -630,6 +724,9 @@ proc parsePgNumeric*(s: string): PgNumeric =
     intPadded = repeat('0', 4 - intPadded.len mod 4) & intPadded
   # Parse base-10000 digit groups: integer part then fractional part
   var digits: seq[int16]
+  # ``intPadded``/``fracPadded`` contain only digits (validated above and zero-padded),
+  # so each 4-char group is always in 0..9999. Plain ``parseInt`` cannot raise here —
+  # there is no ``ValueError`` to convert — so skip ``pgParseInt``'s redundant guard.
   for i in countup(0, intPadded.len - 1, 4):
     digits.add(int16(parseInt(intPadded[i ..< i + 4])))
   for i in countup(0, fracPadded.len - 1, 4):

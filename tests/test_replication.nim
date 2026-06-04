@@ -1,6 +1,6 @@
 import std/unittest
 
-import ../async_postgres/[pg_protocol, pg_replication]
+import ../async_postgres/[pg_errors, pg_protocol, pg_replication]
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
   ## Helper to build a raw backend message from type char + body bytes
@@ -512,3 +512,20 @@ suite "pgoutput decoder bounds checking":
     check msg.kind == pomkBegin
     check msg.begin.finalLsn == Lsn(0x500'u64)
     check msg.begin.xid == 42'i32
+
+suite "parseTimelineId":
+  # IDENTIFY_SYSTEM's timeline column is text. parseTimelineId must convert both
+  # the non-numeric ValueError and the out-of-int32-range case into PgTypeError
+  # (not leak a raw ValueError or a RangeDefect) so callers stay under the single
+  # `except PgError` contract.
+  test "valid timeline":
+    check parseTimelineId("1") == 1'i32
+    check parseTimelineId("2147483647") == int32.high
+
+  test "non-numeric raises PgTypeError":
+    expect(PgTypeError):
+      discard parseTimelineId("abc")
+
+  test "out-of-int32-range raises PgTypeError (no RangeDefect)":
+    expect(PgTypeError):
+      discard parseTimelineId("2147483648")
