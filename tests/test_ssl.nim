@@ -881,8 +881,10 @@ suite "selectScramMechanism":
       mode = cbPrefer,
     )
     check choice.mechanism == "SCRAM-SHA-256"
-    # Over TLS the client still advertises CB support via "y,,".
-    check choice.cbSupportedButUnused == true
+    # The server *did* offer SCRAM-SHA-256-PLUS, so this is not a downgrade — the
+    # cert is simply unavailable. Sending "y,," here would make the server abort
+    # with a channel binding negotiation error, so send "n,," instead.
+    check choice.cbSupportedButUnused == false
 
   test "cbRequire succeeds when SSL + cert + PLUS all available":
     let choice = selectScramMechanism(

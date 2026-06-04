@@ -65,10 +65,12 @@ proc selectScramMechanism*(
 ] =
   ## Pick the SCRAM mechanism and channel-binding material for a SASL
   ## authentication attempt. Raises `PgConnectionError` when the server-offered
-  ## mechanisms cannot satisfy `mode`. `cbSupportedButUnused` is true when TLS is
-  ## in use but plain SCRAM-SHA-256 was selected; the caller then emits a "y,,"
-  ## gs2 header so the server can detect a SCRAM-SHA-256-PLUS downgrade (libpq
-  ## parity). `cbDisable` leaves it false so a "n,," header is sent.
+  ## mechanisms cannot satisfy `mode`. `cbSupportedButUnused` is true only when
+  ## TLS is in use, plain SCRAM-SHA-256 was selected, and the server did *not*
+  ## offer SCRAM-SHA-256-PLUS; the caller then emits a "y,," gs2 header so the
+  ## server can detect a SCRAM-SHA-256-PLUS downgrade (libpq parity). When the
+  ## server offered -PLUS but it could not be used (e.g. the certificate was
+  ## unavailable), or for `cbDisable`, it stays false so a "n,," header is sent.
   let serverHasPlus = "SCRAM-SHA-256-PLUS" in saslMechanisms
   let serverHasScram = "SCRAM-SHA-256" in saslMechanisms
   let canUsePlus = sslEnabled and serverCertDer.len > 0 and serverHasPlus
@@ -98,10 +100,14 @@ proc selectScramMechanism*(
       result.cbData = computeTlsServerEndpoint(serverCertDer)
     elif serverHasScram:
       result.mechanism = "SCRAM-SHA-256"
-      # TLS is in use but channel binding was not negotiated. Signal "y,," so a
-      # MITM that stripped SCRAM-SHA-256-PLUS from the offered mechanisms is
-      # detected server-side (the server knows it offered -PLUS).
-      result.cbSupportedButUnused = sslEnabled
+      # TLS is in use but plain SCRAM-SHA-256 was selected. Only signal "y,,"
+      # when the server did not offer SCRAM-SHA-256-PLUS: that is the genuine
+      # downgrade case (a MITM may have stripped -PLUS from the offered list),
+      # and the real server detects it because it knows it offered -PLUS. If the
+      # server *did* offer -PLUS but we couldn't use it (e.g. the certificate was
+      # unavailable), sending "y,," would make the server abort with a channel
+      # binding negotiation error, so fall back to "n,," instead.
+      result.cbSupportedButUnused = sslEnabled and not serverHasPlus
     else:
       raise newException(
         PgConnectionError, "server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS"
