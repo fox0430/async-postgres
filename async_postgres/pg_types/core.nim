@@ -295,10 +295,12 @@ const
 # raise the standard `ValueError`, which escapes the library's `except PgError`
 # contract (see ``pg_errors``). Text-format accessors must route their parsing
 # through these wrappers so a malformed value surfaces as a catchable
-# `PgTypeError` instead of a raw `ValueError`. The scalar `getInt`/`getFloat`
-# accessors already achieve this via the non-throwing `parseInt(s, v) == 0`
-# overloads; these helpers extend the same guarantee to the array/range/bytea/
-# geometric/composite paths.
+# `PgTypeError` instead of a raw `ValueError`. This applies to the scalar
+# accessors too: the non-throwing `parseInt(s, v)` overload returns 0 only for
+# the "no digits" case but still raises a raw `ValueError` on overflow, so
+# `getInt`/`getInt16`/`getInt64` wrap the parse in `pgTypeErrorOnValueError`
+# (and `getFloat`/`getFloat32` route through `pgParseFloat`). These helpers
+# carry the same guarantee to the array/range/bytea/geometric/composite paths.
 
 template pgTypeErrorOnValueError*(context: string, body: untyped): untyped =
   ## Evaluate ``body`` and convert any standard ``ValueError`` it raises into a

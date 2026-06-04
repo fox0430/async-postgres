@@ -221,7 +221,14 @@ proc getInt*(row: Row, col: int): int32 =
         "Column " & $col & ": unexpected binary length " & $clen & " for int32",
       )
   var v: int
-  if parseInt(row.bufView(off, clen), v) == 0:
+  var n: int
+  # ``parseInt(s, v)`` returns 0 for "no digits" but raises a raw ``ValueError``
+  # when the value overflows ``int``; route that through ``pgTypeErrorOnValueError``
+  # so an oversized text value surfaces as a catchable ``PgTypeError`` instead of
+  # escaping the ``except PgError`` contract.
+  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+    n = parseInt(row.bufView(off, clen), v)
+  if n == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
   if v < int(int32.low) or v > int(int32.high):
     raise newException(
@@ -244,7 +251,11 @@ proc getInt16*(row: Row, col: int): int16 =
         "Column " & $col & ": unexpected binary length " & $clen & " for int16",
       )
   var v: int
-  if parseInt(row.bufView(off, clen), v) == 0:
+  var n: int
+  # Convert ``parseInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
+  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+    n = parseInt(row.bufView(off, clen), v)
+  if n == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
   if v < int(int16.low) or v > int(int16.high):
     raise newException(
@@ -283,7 +294,11 @@ proc getInt64*(row: Row, col: int): int64 =
         "Column " & $col & ": unexpected binary length " & $clen & " for int64",
       )
   var v: BiggestInt
-  if parseBiggestInt(row.bufView(off, clen), v) == 0:
+  var n: int
+  # Convert ``parseBiggestInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
+  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+    n = parseBiggestInt(row.bufView(off, clen), v)
+  if n == 0:
     raise newException(PgTypeError, "Column " & $col & ": invalid int64 value")
   result = v
 
