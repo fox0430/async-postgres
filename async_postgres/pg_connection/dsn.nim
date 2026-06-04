@@ -171,6 +171,7 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
   result.keepAlive = true
   result.host = "127.0.0.1"
   result.port = 5432
+  result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
 
   # Tokenize into (key, value) pairs
   var pairs: seq[(string, string)]
@@ -238,6 +239,7 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
 proc parseUriDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL URI connection string into a ConnConfig.
   result.keepAlive = true
+  result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
   let scheme =
     if dsn.startsWith("postgresql://"):
       "postgresql"
@@ -345,7 +347,7 @@ proc initConnConfig*(
     user = "",
     password = "",
     database = "",
-    sslMode = sslDisable,
+    sslMode = sslPrefer,
     sslRootCert = "",
     channelBinding = cbPrefer,
     applicationName = "",

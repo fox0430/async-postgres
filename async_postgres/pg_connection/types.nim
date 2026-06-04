@@ -48,9 +48,14 @@ type
 
   SslMode* = enum
     ## SSL/TLS negotiation mode for the connection.
-    sslDisable ## Disable SSL (default)
+    ##
+    ## Note: `sslDisable` is the enum's zero value, so a zero-initialized
+    ## `ConnConfig` has SSL disabled. The constructor helpers `parseDsn` and
+    ## `initConnConfig`, however, default to `sslPrefer` to match libpq and
+    ## avoid silently sending credentials in plaintext.
+    sslDisable ## Disable SSL
     sslAllow ## Try plaintext; fall back to SSL if refused
-    sslPrefer ## Try SSL; fall back to plaintext if refused
+    sslPrefer ## Try SSL; fall back to plaintext if refused (libpq default)
     sslRequire ## Require SSL (no certificate verification)
     sslVerifyCa ## Require SSL + verify CA chain (no hostname verification)
     sslVerifyFull ## Require SSL + verify CA chain and hostname
@@ -91,6 +96,9 @@ type
     password*: string
     database*: string
     sslMode*: SslMode
+      ## SSL/TLS negotiation mode. `parseDsn` and `initConnConfig` default this
+      ## to `sslPrefer` (libpq parity); a raw zero-initialized `ConnConfig` has
+      ## `sslDisable`.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the

@@ -60,7 +60,7 @@ suite "initConnConfig":
     check cfg.user == ""
     check cfg.password == ""
     check cfg.database == ""
-    check cfg.sslMode == sslDisable
+    check cfg.sslMode == sslPrefer # libpq default; secure-by-default
     check cfg.sslRootCert == ""
     check cfg.applicationName == ""
     check cfg.connectTimeout == ZeroDuration

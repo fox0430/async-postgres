@@ -75,6 +75,9 @@ suite "parseDsn":
     let cfg = parseDsn("postgresql://host/my%2Fdb")
     check cfg.database == "my/db"
 
+  test "sslmode defaults to prefer when unspecified (libpq parity)":
+    check parseDsn("postgresql://host/db").sslMode == sslPrefer
+
   test "query param sslmode":
     for mode in ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]:
       let cfg = parseDsn("postgresql://host/db?sslmode=" & mode)
@@ -491,6 +494,10 @@ suite "parseDsn keyword=value":
     let cfg = parseDsn("hostaddr=192.168.1.1 dbname=test")
     check cfg.host == "192.168.1.1"
     check cfg.database == "test"
+
+  test "sslmode defaults to prefer when unspecified (libpq parity)":
+    let cfg = parseDsn("host=h dbname=d")
+    check cfg.sslMode == sslPrefer
 
   test "sslmode parameter":
     let cfg = parseDsn("host=h dbname=d sslmode=require")
