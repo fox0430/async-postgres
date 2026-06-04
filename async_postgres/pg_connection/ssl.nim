@@ -24,6 +24,50 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[net, openssl, tempfiles, os]
 
+when hasAsyncDispatch and defined(ssl):
+  # std/net's `wrapConnectedSocket` gates its certificate-name check behind
+  # `not isIpAddress(hostname)` (see lib/pure/net.nim), so when the connect
+  # host is an IP literal it performs *no* SAN/CN matching at all — only chain
+  # verification. sslVerifyFull would then accept any CA-trusted certificate
+  # regardless of which host/IP it was issued for, defeating MITM protection.
+  # (The chronos/BearSSL backend still matches the IP against the cert and
+  # fails closed, so this gap is asymmetric and OpenSSL-only.) OpenSSL exposes
+  # `X509_check_ip_asc` to match an IP literal against the certificate's
+  # iPAddress SANs; std/openssl doesn't bind it, so declare it and enforce it
+  # ourselves for verify-full.
+  proc X509_check_ip_asc(
+    cert: PX509, ipasc: cstring, flags: cuint
+  ): cint {.cdecl, dynlib: DLLSSLName, importc.}
+
+  template needsManualIpVerification(sslMode: SslMode, host: string): bool =
+    ## verify-full to an IP literal needs an explicit IP-SAN check because
+    ## `wrapConnectedSocket` skips it. Other modes and DNS hostnames are already
+    ## verified by `wrapConnectedSocket`.
+    sslMode == sslVerifyFull and isIpAddress(host)
+
+  template certMatchesIp(cert: PX509, host: string): bool =
+    ## True if `host` (an IP literal) matches an iPAddress SAN in `cert`.
+    X509_check_ip_asc(cert, host.cstring, 0) == 1
+
+  proc verifyPeerIpSan(socket: AsyncSocket, host: string) =
+    ## Raise `PgConnectionError` unless the peer certificate covers `host`
+    ## (an IP literal) via an iPAddress SAN. Closes the verify-full gap that
+    ## `wrapConnectedSocket` leaves open for IP connections.
+    let cert = SSL_get_peer_certificate(socket.sslHandle)
+    if cert == nil:
+      raise newException(
+        PgConnectionError,
+        "sslmode=verify-full: server presented no certificate for IP host " & host,
+      )
+    try:
+      if not certMatchesIp(cert, host):
+        raise newException(
+          PgConnectionError,
+          "sslmode=verify-full: server certificate has no matching IP SAN for " & host,
+        )
+    finally:
+      X509_free(cert)
+
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig) {.async.} =
   ## Send SSLRequest and negotiate TLS if server accepts.
   let sslReq = encodeSSLRequest()
@@ -114,6 +158,10 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig) {.async.} =
         try:
           let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
           wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
+          # wrapConnectedSocket skips name verification for IP hostnames; for
+          # verify-full we must match the IP against the cert's SANs ourselves.
+          if needsManualIpVerification(config.sslMode, config.host):
+            verifyPeerIpSan(conn.socket, config.host)
           conn.sslEnabled = true
           # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
           # If unavailable, cbPrefer will silently fall back to SCRAM-SHA-256 —
