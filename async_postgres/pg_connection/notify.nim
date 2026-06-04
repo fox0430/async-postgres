@@ -43,10 +43,12 @@ proc onListenError*(
 proc reconnectInPlace*(conn: PgConnection) {.async.} =
   ## Reconnect using stored config, re-LISTENing on all channels.
   await conn.closeTransport()
+
   conn.recvBuf.setLen(0)
   conn.recvBufStart = 0
   conn.clearStmtCache()
   conn.state = csConnecting
+
   var newConn: PgConnection
   try:
     newConn = await connect(conn.config)
@@ -63,14 +65,17 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
     conn.trustAnchorBufs = newConn.trustAnchorBufs
   elif hasAsyncDispatch:
     conn.socket = newConn.socket
+
   conn.sslEnabled = newConn.sslEnabled
   conn.recvBuf = newConn.recvBuf
+  conn.recvBufStart = newConn.recvBufStart
   conn.pid = newConn.pid
   conn.secretKey = newConn.secretKey
   conn.serverParams = newConn.serverParams
   conn.txStatus = newConn.txStatus
   conn.state = csReady
   conn.createdAt = newConn.createdAt
+
   for ch in conn.listenChannels:
     discard await conn.simpleQuery("LISTEN " & quoteIdentifier(ch))
 
