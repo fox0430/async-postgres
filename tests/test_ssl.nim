@@ -836,6 +836,29 @@ suite "selectScramMechanism":
     check choice.mechanism == "SCRAM-SHA-256"
     check choice.cbType == ""
     check choice.cbData.len == 0
+    # cbDisable always sends "n,,", never the downgrade-detection "y,,".
+    check choice.cbSupportedButUnused == false
+
+  test "cbPrefer signals y,, over SSL when server omits PLUS (downgrade detect)":
+    let choice = selectScramMechanism(
+      sslEnabled = true,
+      serverCertDer = fakeCert,
+      saslMechanisms = @["SCRAM-SHA-256"],
+      mode = cbPrefer,
+    )
+    check choice.mechanism == "SCRAM-SHA-256"
+    check choice.cbType == ""
+    check choice.cbSupportedButUnused == true
+
+  test "cbPrefer sends n,, without SSL even when CB unavailable":
+    let choice = selectScramMechanism(
+      sslEnabled = false,
+      serverCertDer = @[],
+      saslMechanisms = @["SCRAM-SHA-256"],
+      mode = cbPrefer,
+    )
+    check choice.mechanism == "SCRAM-SHA-256"
+    check choice.cbSupportedButUnused == false
 
   test "cbPrefer picks PLUS when SSL + cert + server support all present":
     let choice = selectScramMechanism(
@@ -847,6 +870,8 @@ suite "selectScramMechanism":
     check choice.mechanism == "SCRAM-SHA-256-PLUS"
     check choice.cbType == "tls-server-end-point"
     check choice.cbData.len > 0
+    # Channel binding is in use ("p=,,"), so no downgrade signal needed.
+    check choice.cbSupportedButUnused == false
 
   test "cbPrefer falls back to SCRAM-SHA-256 when cert is missing":
     let choice = selectScramMechanism(
@@ -856,6 +881,10 @@ suite "selectScramMechanism":
       mode = cbPrefer,
     )
     check choice.mechanism == "SCRAM-SHA-256"
+    # The server *did* offer SCRAM-SHA-256-PLUS, so this is not a downgrade — the
+    # cert is simply unavailable. Sending "y,," here would make the server abort
+    # with a channel binding negotiation error, so send "n,," instead.
+    check choice.cbSupportedButUnused == false
 
   test "cbRequire succeeds when SSL + cert + PLUS all available":
     let choice = selectScramMechanism(
