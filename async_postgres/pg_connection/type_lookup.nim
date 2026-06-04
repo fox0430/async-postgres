@@ -31,6 +31,14 @@ proc isSafeTypeName(name: string): bool =
       return false
   true
 
+proc parseOidText(s: string): int32 =
+  ## Parse the text form of a ``::int4``-cast OID column. The query casts
+  ## ``t.oid``/``t.typarray`` to ``int4``, so the value is always within
+  ## ``int32`` range (large OIDs come back as negative ``int4``). Callers wrap
+  ## this in ``except ValueError`` to skip malformed catalog rows, so this keeps
+  ## the standard ``ValueError`` contract rather than raising ``PgTypeError``.
+  int32(parseInt(s))
+
 proc lookupTypeOids*(
     conn: PgConnection, names: seq[string]
 ): Future[Table[string, TypeOidInfo]] {.async.} =
@@ -86,14 +94,14 @@ proc lookupTypeOids*(
       continue
     var oid: int32
     try:
-      oid = int32(parseInt(bytesToString(oidOpt.get)))
+      oid = parseOidText(bytesToString(oidOpt.get))
     except ValueError:
       continue
     var arrOid: int32 = 0
     let arrOpt = row[2]
     if arrOpt.isSome:
       try:
-        arrOid = int32(parseInt(bytesToString(arrOpt.get)))
+        arrOid = parseOidText(bytesToString(arrOpt.get))
       except ValueError:
         arrOid = 0
     result[name] = (oid: oid, arrayOid: arrOid)

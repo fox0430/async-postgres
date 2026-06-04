@@ -312,8 +312,12 @@ proc getFloat*(row: Row, col: int): float64 =
         PgTypeError,
         "Column " & $col & ": unexpected binary length " & $clen & " for float64",
       )
-  if parseFloat(row.bufView(off, clen), result) == 0:
-    raise newException(PgTypeError, "Column " & $col & ": invalid float value")
+  # Route through `pgParseFloat` so the text path accepts PostgreSQL's
+  # ``Infinity``/``-Infinity`` spelling and surfaces failures as `PgTypeError`,
+  # matching the array/range paths. Parse the zero-copy ``bufView`` of the already
+  # known ``(off, clen)`` rather than re-running ``getStr``'s NULL/binary checks
+  # or allocating an intermediate string.
+  result = pgParseFloat(row.bufView(off, clen))
 
 proc getFloat32*(row: Row, col: int): float32 =
   ## Get a column value as float32. Handles binary float4 directly. Raises `PgTypeError` on NULL.
@@ -332,10 +336,12 @@ proc getFloat32*(row: Row, col: int): float32 =
         PgTypeError,
         "Column " & $col & ": unexpected binary length " & $clen & " for float32",
       )
-  var f: float64
-  if parseFloat(row.bufView(off, clen), f) == 0:
-    raise newException(PgTypeError, "Column " & $col & ": invalid float32 value")
-  result = float32(f)
+  # `pgParseFloat32` adds `Infinity`/`-Infinity` support and rejects finite
+  # values that overflow float32's range (the old `float32(parseFloat)` collapsed
+  # them silently to `inf`), keeping the scalar path consistent with the arrays.
+  # Parse the zero-copy ``bufView`` to skip ``getStr``'s redundant NULL/binary
+  # re-checks and avoid an intermediate string allocation.
+  result = pgParseFloat32(row.bufView(off, clen))
 
 proc getNumeric*(row: Row, col: int): PgNumeric =
   ## Get a column value as PgNumeric. Handles binary numeric format.
@@ -433,12 +439,16 @@ proc getBytes*(row: Row, col: int): seq[byte] =
     'x'
   ):
     let hexLen = clen - 2
+    if hexLen mod 2 != 0:
+      raise newException(
+        PgTypeError, "Column " & $col & ": odd-length hex in bytea text value"
+      )
     var hex = newString(hexLen)
     for i in 0 ..< hexLen:
       hex[i] = char(row.data.buf[off + 2 + i])
     result = newSeq[byte](hexLen div 2)
     for i in 0 ..< result.len:
-      result[i] = byte(parseHexInt(hex[i * 2 .. i * 2 + 1]))
+      result[i] = byte(pgParseHexInt(hex[i * 2 .. i * 2 + 1]))
   else:
     result = readBytes(row.data.buf, off, clen)
 
@@ -716,7 +726,9 @@ proc getLine*(row: Row, col: int): PgLine =
   let parts = inner.split(',')
   if parts.len != 3:
     raise newException(PgTypeError, "Invalid line: " & s)
-  PgLine(a: parseFloat(parts[0]), b: parseFloat(parts[1]), c: parseFloat(parts[2]))
+  PgLine(
+    a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
+  )
 
 proc getLseg*(row: Row, col: int): PgLseg =
   ## Get a column value as PgLseg. Handles binary format.
@@ -856,7 +868,7 @@ proc getCircle*(row: Row, col: int): PgCircle =
   if lastComma < 0:
     raise newException(PgTypeError, "Invalid circle: " & s)
   let center = parsePointText(inner[0 ..< lastComma])
-  let radius = parseFloat(inner[lastComma + 1 ..^ 1])
+  let radius = pgParseFloat(inner[lastComma + 1 ..^ 1])
   PgCircle(center: center, radius: radius)
 
 # NULL-safe Option accessors — return `none` for NULL instead of raising.
@@ -909,22 +921,6 @@ optAccessor(getPath, getPathOpt, PgPath)
 optAccessor(getPolygon, getPolygonOpt, PgPolygon)
 optAccessor(getCircle, getCircleOpt, PgCircle)
 
-proc parseInt32Elem(s: string): int32 =
-  ## Parse a text array element into int32, rejecting out-of-range values.
-  ## Plain ``int32(parseInt)`` would silently truncate (wrap) in release builds.
-  let v = parseInt(s)
-  if v < int(int32.low) or v > int(int32.high):
-    raise newException(PgTypeError, "integer array element out of int32 range: " & $v)
-  int32(v)
-
-proc parseInt16Elem(s: string): int16 =
-  ## Parse a text array element into int16, rejecting out-of-range values.
-  ## Plain ``int16(parseInt)`` would silently truncate (wrap) in release builds.
-  let v = parseInt(s)
-  if v < int(int16.low) or v > int(int16.high):
-    raise newException(PgTypeError, "integer array element out of int16 range: " & $v)
-  int16(v)
-
 proc getIntArray*(row: Row, col: int): seq[int32] =
   ## Get a column value as a seq of int32. Handles binary array format.
   if row.isBinaryCol(col):
@@ -949,7 +945,7 @@ proc getIntArray*(row: Row, col: int): seq[int32] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in int array")
-    result.add(parseInt32Elem(e.get))
+    result.add(pgParseInt32(e.get))
 
 proc getInt16Array*(row: Row, col: int): seq[int16] =
   ## Get a column value as a seq of int16. Handles binary array format.
@@ -975,7 +971,7 @@ proc getInt16Array*(row: Row, col: int): seq[int16] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in int16 array")
-    result.add(parseInt16Elem(e.get))
+    result.add(pgParseInt16(e.get))
 
 proc getInt64Array*(row: Row, col: int): seq[int64] =
   ## Get a column value as a seq of int64. Handles binary array format.
@@ -1001,7 +997,7 @@ proc getInt64Array*(row: Row, col: int): seq[int64] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in int64 array")
-    result.add(parseBiggestInt(e.get))
+    result.add(pgParseBiggestInt(e.get))
 
 proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## Get a column value as a seq of PgMoney. Handles binary array format and
@@ -1068,7 +1064,7 @@ proc getFloatArray*(row: Row, col: int): seq[float64] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in float array")
-    result.add(parseFloat(e.get))
+    result.add(pgParseFloat(e.get))
 
 proc getFloat32Array*(row: Row, col: int): seq[float32] =
   ## Get a column value as a seq of float32. Handles binary array format.
@@ -1096,7 +1092,7 @@ proc getFloat32Array*(row: Row, col: int): seq[float32] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in float32 array")
-    result.add(float32(parseFloat(e.get)))
+    result.add(pgParseFloat32(e.get))
 
 proc getBoolArray*(row: Row, col: int): seq[bool] =
   ## Get a column value as a seq of bool. Handles binary array format.
@@ -1371,9 +1367,11 @@ genArrayDecoder(
 proc bytesElemFromText(s: string): seq[byte] =
   if s.len >= 2 and s[0] == '\\' and s[1] == 'x':
     let hexStr = s[2 ..^ 1]
+    if hexStr.len mod 2 != 0:
+      raise newException(PgTypeError, "odd-length hex in bytea array element: " & s)
     result = newSeq[byte](hexStr.len div 2)
     for j in 0 ..< result.len:
-      result[j] = byte(parseHexInt(hexStr[j * 2 .. j * 2 + 1]))
+      result[j] = byte(pgParseHexInt(hexStr[j * 2 .. j * 2 + 1]))
   else:
     result = toBytes(s)
 
@@ -1443,7 +1441,9 @@ proc lineElemFromText(s: string): PgLine =
   let parts = inner.split(',')
   if parts.len != 3:
     raise newException(PgTypeError, "Invalid line: " & v)
-  PgLine(a: parseFloat(parts[0]), b: parseFloat(parts[1]), c: parseFloat(parts[2]))
+  PgLine(
+    a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
+  )
 
 genArrayDecoder(
   getLineArray,
@@ -1589,7 +1589,7 @@ proc circleElemFromText(s: string): PgCircle =
     raise newException(PgTypeError, "Invalid circle: " & v)
   PgCircle(
     center: parsePointText(inner[0 ..< lastComma]),
-    radius: parseFloat(inner[lastComma + 1 ..^ 1]),
+    radius: pgParseFloat(inner[lastComma + 1 ..^ 1]),
   )
 
 genArrayDecoder(
@@ -1657,7 +1657,7 @@ proc getIntArrayElemOpt*(row: Row, col: int): seq[Option[int32]] =
     if e.isNone:
       result.add(none(int32))
     else:
-      result.add(some(parseInt32Elem(e.get)))
+      result.add(some(pgParseInt32(e.get)))
 
 proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
   if row.isBinaryCol(col):
@@ -1679,7 +1679,7 @@ proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
     if e.isNone:
       result.add(none(int16))
     else:
-      result.add(some(parseInt16Elem(e.get)))
+      result.add(some(pgParseInt16(e.get)))
 
 proc getInt64ArrayElemOpt*(row: Row, col: int): seq[Option[int64]] =
   if row.isBinaryCol(col):
@@ -1701,7 +1701,7 @@ proc getInt64ArrayElemOpt*(row: Row, col: int): seq[Option[int64]] =
     if e.isNone:
       result.add(none(int64))
     else:
-      result.add(some(parseBiggestInt(e.get)))
+      result.add(some(pgParseBiggestInt(e.get)))
 
 proc getFloatArrayElemOpt*(row: Row, col: int): seq[Option[float64]] =
   if row.isBinaryCol(col):
@@ -1734,7 +1734,7 @@ proc getFloatArrayElemOpt*(row: Row, col: int): seq[Option[float64]] =
     if e.isNone:
       result.add(none(float64))
     else:
-      result.add(some(parseFloat(e.get)))
+      result.add(some(pgParseFloat(e.get)))
 
 proc getFloat32ArrayElemOpt*(row: Row, col: int): seq[Option[float32]] =
   if row.isBinaryCol(col):
@@ -1759,7 +1759,7 @@ proc getFloat32ArrayElemOpt*(row: Row, col: int): seq[Option[float32]] =
     if e.isNone:
       result.add(none(float32))
     else:
-      result.add(some(float32(parseFloat(e.get))))
+      result.add(some(pgParseFloat32(e.get)))
 
 proc getBoolArrayElemOpt*(row: Row, col: int): seq[Option[bool]] =
   if row.isBinaryCol(col):
