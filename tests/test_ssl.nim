@@ -6,6 +6,9 @@ import ../async_postgres/pg_connection {.all.}
 
 when hasAsyncDispatch:
   import std/asyncnet
+  when defined(ssl):
+    import std/[openssl, base64]
+    import ../async_postgres/pg_connection/ssl {.all.}
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
   result = @[byte(msgType)]
@@ -885,3 +888,74 @@ suite "selectScramMechanism":
         saslMechanisms = @["SOMETHING-ELSE"],
         mode = cbPrefer,
       )
+
+when hasAsyncDispatch and defined(ssl):
+  # Self-signed test certificates (DER, base64). Regenerate with:
+  #   openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem \
+  #     -days 3650 -subj "/CN=pgtest" -addext "subjectAltName=IP:127.0.0.1"
+  #   openssl x509 -in c.pem -outform DER | base64 -w0
+  const ipSanCertDerB64 =
+    "MIIDFDCCAfygAwIBAgIUBC/ksOrlAHotFl9NjclhJw3G2O4wDQYJKoZIhvcNAQELBQAwETEPMA0G" &
+    "A1UEAwwGcGd0ZXN0MB4XDTI2MDYwNDEwMDkxOVoXDTM2MDYwMTEwMDkxOVowETEPMA0GA1UEAwwG" &
+    "cGd0ZXN0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp2J791gza2g6udeU/GqjOPo3" &
+    "R3+qQjmnMMoseROShwYvy3jx3104MQjET3+CKSq+WE5s7/klCdth8OSXIx5v8pYXYWpv0pttoLY9u" &
+    "EELVuDtakKDn6/JUGnqSLICaXROgwt+BFRvcowZDnQAN2NK2JLyjdniUb9/v2rJBei7dduPeXXGYX" &
+    "TxFiD3CZARH3v0vHX7q8BLJcvvQyF7e4OjciPn6TElWwCQ8dhl+EbhZToqiB/Y2e/bFRc4akxVCsF" &
+    "QkzPoL8ZjjtRZ+TdI2yA309ijQZjtl5NEyvZrepRDwcdi9YJ0jNrSwVvCc/kvwbIFX+ZPoaqjmWQ" &
+    "MBl6eUJRy5QIDAQABo2QwYjAdBgNVHQ4EFgQUbk2YkIqLrUFiGt60lUd18n3TFU8wHwYDVR0jBBgw" &
+    "FoAUbk2YkIqLrUFiGt60lUd18n3TFU8wDwYDVR0TAQH/BAUwAwEB/zAPBgNVHREECDAGhwR/AAABM" &
+    "A0GCSqGSIb3DQEBCwUAA4IBAQCKxKeRBH89U/v3F/CCtc7yETsZTycPitHT+hhEZ27Q5lLsk6Ij6U" &
+    "KXWpe9Jeols9IpchYGN6pa2BAj299504dLaEYe49qelytB9nS1PqZ5zPbulOu21cxLnlf2ZJWyn3N" &
+    "WmcTyxI5RyG7I0jC1eXzlDOHgu9v9ZR2hlAzeXn01L73uU41AqJHO8lFOWdwfBxpCmWwznDjjHDUk" &
+    "jFbr+SOpxKSCqQx7lDF+9Cvov2S4+h4X2VJIVPHunhafu50/8DSSzofhe4koJVi9SzY79P8ftBq+K" &
+    "wgmje3FeNkhuoU5UNfDpUjxYvCj6qf5czhNYFUuj7MuHomym/pfH0vARKEA"
+
+  # Same identity but SAN is DNS:example.com — no iPAddress entry at all.
+  const dnsOnlyCertDerB64 =
+    "MIIDGzCCAgOgAwIBAgIUTdXfQzY0TPGM5QtLNrtMKFZhSiwwDQYJKoZIhvcNAQELBQAwETEPMA0G" &
+    "A1UEAwwGcGd0ZXN0MB4XDTI2MDYwNDEwMDkxOVoXDTM2MDYwMTEwMDkxOVowETEPMA0GA1UEAwwG" &
+    "cGd0ZXN0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvpF69ndENQ0GoYmc1W66TykY3" &
+    "GXR5xjj9WYRu2CQoSbpsEkjUy1aLeVd21FCP0EnHeld19ubu13R4G79uxm/WHWDVWb6vkUT7SjG0t" &
+    "tulwwo3HB1BEhBam6gM26O5XeTMc/QYfUC/qvCkgYr4rNk8PMscygOlKrMTGef7wxp/Xq3r1x/K+S" &
+    "4j3mhSiXJLz9bs3akYMnUuXrHhLwpLMGEu3iLwyByU69jqafm7mtsL0dzUVT/tfUPYAK/XB04wZlm" &
+    "Lj1ELStyE/YE3Xz4hDp+w6HLo1o8LJS/uSqVKV2ewkvV3VlGhsJ8w7lXqaFX3E8HccLUlq227h6p7" &
+    "Yt5oqd8YQIDAQABo2swaTAdBgNVHQ4EFgQUGczIcS+cbD+81sWdz9RUezuv/owwHwYDVR0jBBgwFo" &
+    "AUGczIcS+cbD+81sWdz9RUezuv/owwDwYDVR0TAQH/BAUwAwEB/zAWBgNVHREEDzANggtleGFtcGxl" &
+    "LmNvbTANBgkqhkiG9w0BAQsFAAOCAQEAPkrlJ66nQyFo70GOZ86HnKP2QXZnX1jV3JAUsIwyuP7Dx" &
+    "IIohD05OO9aYg83H82ws407S+irdMiVoQ2Gfc1pPynZs05UZ8z1BTyhQxy0yANkBSz5+tKch3XbOR" &
+    "rnQ7nuOgtIoWzaBYYoURN6q7kSk0nazgmBjHGfiE2SdP54PbUGFMENmySVSINJHvARYb3wC4w6E0o" &
+    "LJlsnOUOJCVD64UVolb7UB2Ar/oLf5eqkNFjxBIgDu+Hh6drh58gzhFYE7EiA6LDLorjJssa9Vo+d" &
+    "Fq+ENKzk1ucMPe+uxWNR+L3idun/UEXb7cyUDisqv9xsZH0m/c/vi1q2ZPTnYsto0A=="
+
+  template withCert(b64: string, certVar, body: untyped) =
+    let der = base64.decode(b64)
+    let certVar {.inject.} = d2i_X509(der)
+    try:
+      body
+    finally:
+      X509_free(certVar)
+
+  suite "SSL verify-full - IP SAN verification (OpenSSL backend)":
+    test "needsManualIpVerification only triggers for verify-full + IP literal":
+      check needsManualIpVerification(sslVerifyFull, "127.0.0.1")
+      check needsManualIpVerification(sslVerifyFull, "::1")
+      # DNS hostnames are handled by wrapConnectedSocket, not us.
+      check not needsManualIpVerification(sslVerifyFull, "db.example.com")
+      # Weaker modes don't enforce hostname/IP at all.
+      check not needsManualIpVerification(sslVerifyCa, "127.0.0.1")
+      check not needsManualIpVerification(sslRequire, "127.0.0.1")
+      check not needsManualIpVerification(sslPrefer, "127.0.0.1")
+
+    test "certMatchesIp accepts a matching iPAddress SAN":
+      withCert(ipSanCertDerB64, cert):
+        check certMatchesIp(cert, "127.0.0.1")
+
+    test "certMatchesIp rejects a non-matching IP":
+      withCert(ipSanCertDerB64, cert):
+        check not certMatchesIp(cert, "10.0.0.1")
+
+    test "certMatchesIp rejects a cert with no iPAddress SAN":
+      # Pre-fix this cert (chain-valid, DNS-only) was silently accepted for an
+      # IP connection under verify-full — the core of H-3.
+      withCert(dnsOnlyCertDerB64, cert):
+        check not certMatchesIp(cert, "127.0.0.1")
