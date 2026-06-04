@@ -6,7 +6,10 @@
 ## the expected exception type and leaves the connection in a state that
 ## prevents accidental reuse (`csClosed`).
 
-import std/[unittest]
+import std/[unittest, strutils, base64]
+
+import pkg/nimcrypto
+import pkg/nimcrypto/pbkdf2
 
 import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
@@ -326,3 +329,121 @@ suite "Network failure: mid-query disconnects":
 
     waitFor testBody()
     check raised
+
+# SCRAM mutual-authentication enforcement (CR-1 regression)
+#
+# A malicious server / MITM must not be able to skip AuthenticationSASLFinal
+# (which carries the server signature proving it knows the password) and have
+# the client accept a bare AuthenticationOk. The client must verify the server
+# signature before treating SCRAM as successful.
+
+const scramSalt = @[
+  byte 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67, 0x89,
+  0xAB, 0xCD, 0xEF,
+]
+const scramIterations = 4096
+
+proc driveScramUntilClientFinal(
+    st: MockClient
+): Future[tuple[clientFirstBare, serverFirst, clientFinal: string]] {.async.} =
+  ## Run the server side of a SCRAM-SHA-256 exchange up to (and including)
+  ## reading the client's client-final message. Returns the strings needed to
+  ## compute the server signature.
+  await drainStartupMessage(st)
+  await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+  let (_, initBody) = await drainFrontendMessage(st)
+  let clientFirst = parseSaslInitialClientFirst(initBody)
+  # Non-PLUS gs2 header is "n,," (3 bytes); the rest is the client-first-bare.
+  let clientFirstBare = clientFirst[3 .. ^1]
+  let rpos = clientFirstBare.rfind("r=")
+  let clientNonce = clientFirstBare[rpos + 2 .. ^1]
+  let serverFirst =
+    "r=" & clientNonce & "serverNoncePart,s=" & base64.encode(scramSalt) & ",i=" &
+    $scramIterations
+  await sendBytes(st, buildAuthSASLContinue(serverFirst))
+  let (_, finalBody) = await drainFrontendMessage(st)
+  let clientFinal = cast[string](finalBody)
+  return (clientFirstBare, serverFirst, clientFinal)
+
+proc serverSignatureFor(
+    password, clientFirstBare, serverFirst, clientFinal: string
+): string =
+  ## Compute the correct ``v=...`` SASLFinal payload for the given exchange.
+  let cfwp = clientFinal[0 ..< clientFinal.find(",p=")]
+  let authMessage = clientFirstBare & "," & serverFirst & "," & cfwp
+  let saltedPassword = sha256.pbkdf2(password, scramSalt, scramIterations, 32)
+  let serverKey = sha256.hmac(saltedPassword, "Server Key").data
+  let serverSig = sha256.hmac(serverKey, authMessage).data
+  "v=" & base64.encode(serverSig)
+
+suite "SCRAM mutual-auth enforcement":
+  test "rejects AuthenticationOk sent before SASLFinal":
+    var raised = false
+    var sawScramMsg = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await driveScramUntilClientFinal(st)
+          # Malicious: skip AuthenticationSASLFinal entirely and jump to AuthOk.
+          await sendBytes(st, buildAuthOk())
+          await sendBytes(st, buildBackendKeyData(1, 2))
+          await sendBytes(st, buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      try:
+        let conn = await connect(mockConfig(ms.port))
+        await conn.close()
+      except PgConnectionError as e:
+        raised = true
+        sawScramMsg = e.msg.contains("SCRAM")
+      except CatchableError:
+        discard
+      try:
+        await serverFut
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check sawScramMsg
+
+  test "accepts a valid SASLFinal server signature":
+    var connected = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
+          # mockConfig sets no password, so both sides use "".
+          await sendBytes(st, buildAuthSASLFinal(serverSignatureFor("", cfb, sf, cf)))
+          await sendBytes(st, buildAuthOk())
+          await sendBytes(st, buildBackendKeyData(1, 2))
+          await sendBytes(st, buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      try:
+        let conn = await connect(mockConfig(ms.port))
+        connected = conn.state == csReady
+        await conn.close()
+      except CatchableError:
+        discard
+      try:
+        await serverFut
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check connected
