@@ -101,6 +101,46 @@ proc buildBackendMsg*(msgType: char, body: openArray[byte]): seq[byte] =
 proc buildAuthOk*(): seq[byte] =
   buildBackendMsg('R', @[byte 0, 0, 0, 0])
 
+proc buildAuthSASL*(mechanisms: seq[string] = @["SCRAM-SHA-256"]): seq[byte] =
+  ## AuthenticationSASL (R, subtype 10): advertise SASL mechanism names as a
+  ## null-terminated list followed by a final null terminator.
+  var body: seq[byte]
+  body.addInt32(10)
+  for m in mechanisms:
+    for c in m:
+      body.add(byte(c))
+    body.add(0'u8)
+  body.add(0'u8) # mechanism list terminator
+  buildBackendMsg('R', body)
+
+proc buildAuthSASLContinue*(data: string): seq[byte] =
+  ## AuthenticationSASLContinue (R, subtype 11): SCRAM server-first data.
+  var body: seq[byte]
+  body.addInt32(11)
+  for c in data:
+    body.add(byte(c))
+  buildBackendMsg('R', body)
+
+proc buildAuthSASLFinal*(data: string): seq[byte] =
+  ## AuthenticationSASLFinal (R, subtype 12): SCRAM server-final data (``v=...``).
+  var body: seq[byte]
+  body.addInt32(12)
+  for c in data:
+    body.add(byte(c))
+  buildBackendMsg('R', body)
+
+proc parseSaslInitialClientFirst*(body: seq[byte]): string =
+  ## Given a SASLInitialResponse body (mechanism cstring + int32 length +
+  ## client-first bytes), return the client-first message as a string.
+  var i = 0
+  while i < body.len and body[i] != 0'u8: # skip mechanism cstring
+    inc i
+  inc i # skip the null terminator
+  i += 4 # skip the int32 length prefix
+  result = newString(body.len - i)
+  for j in 0 ..< result.len:
+    result[j] = char(body[i + j])
+
 proc buildParameterStatus*(name, value: string): seq[byte] =
   var body: seq[byte]
   for c in name:
