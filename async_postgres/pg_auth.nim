@@ -19,7 +19,10 @@ type ScramState* = object
   clientNonce*: string
   clientFirstBare*: string
   serverSignature*: array[32, byte]
-  gs2Header*: string ## GS2 header: "n,," (no binding) or "p=tls-server-end-point,,"
+  gs2Header*: string
+    ## GS2 header: "n,," (no channel binding), "y,," (channel binding supported
+    ## but not negotiated — downgrade-detection signal), or
+    ## "p=tls-server-end-point,," (channel binding in use).
   channelBindingData*: seq[byte] ## Channel binding data (empty for non-PLUS)
 
 proc toBytes(s: string): seq[byte] =
@@ -54,10 +57,18 @@ proc scramEscapeUsername*(user: string): string =
   result = user.replace("=", "=3D").replace(",", "=2C")
 
 proc scramClientFirstMessage*(
-    user: string, state: var ScramState, cbType: string = "", cbData: seq[byte] = @[]
+    user: string,
+    state: var ScramState,
+    cbType: string = "",
+    cbData: seq[byte] = @[],
+    cbSupportedButUnused: bool = false,
 ): seq[byte] =
   ## Generate the SCRAM-SHA-256 client-first message with a random nonce.
-  ## When `cbType` is non-empty, use channel binding (SCRAM-SHA-256-PLUS).
+  ## When `cbType` is non-empty, use channel binding (SCRAM-SHA-256-PLUS) and
+  ## emit a "p=<type>,," gs2 header. When `cbSupportedButUnused` is set (TLS is
+  ## in use but channel binding was not negotiated), emit "y,," so the server can
+  ## detect a man-in-the-middle that stripped SCRAM-SHA-256-PLUS from the offered
+  ## mechanisms. Otherwise emit "n,," (channel binding not supported).
   var nonceBuf: array[24, byte]
   let n = randomBytes(nonceBuf)
   if n != 24:
@@ -67,6 +78,8 @@ proc scramClientFirstMessage*(
   state.gs2Header =
     if cbType.len > 0:
       "p=" & cbType & ",,"
+    elif cbSupportedButUnused:
+      "y,,"
     else:
       "n,,"
   state.channelBindingData = cbData
@@ -78,6 +91,7 @@ proc scramClientFirstMessage*(
     state: var ScramState,
     cbType: string = "",
     cbData: seq[byte] = @[],
+    cbSupportedButUnused: bool = false,
 ): seq[byte] =
   ## Overload with explicit nonce for testing.
   state.clientNonce = nonce
@@ -85,6 +99,8 @@ proc scramClientFirstMessage*(
   state.gs2Header =
     if cbType.len > 0:
       "p=" & cbType & ",,"
+    elif cbSupportedButUnused:
+      "y,,"
     else:
       "n,,"
   state.channelBindingData = cbData

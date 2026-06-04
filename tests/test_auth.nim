@@ -182,6 +182,27 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     check state.gs2Header == "n,,"
     check state.channelBindingData.len == 0
 
+  test "clientFirstMessage emits y,, when CB supported but unused (downgrade)":
+    var state: ScramState
+    let msg =
+      scramClientFirstMessage("user", "testNonce", state, cbSupportedButUnused = true)
+    check toString(msg) == "y,,n=user,r=testNonce"
+    check state.gs2Header == "y,,"
+    check state.channelBindingData.len == 0
+
+  test "clientFirstMessage prefers p=,, over y,, when channel binding is in use":
+    var state: ScramState
+    let cbData = @[0x01'u8, 0x02, 0x03]
+    discard scramClientFirstMessage(
+      "user",
+      "testNonce",
+      state,
+      cbType = "tls-server-end-point",
+      cbData = cbData,
+      cbSupportedButUnused = true,
+    )
+    check state.gs2Header == "p=tls-server-end-point,,"
+
   test "clientFinalMessage with channel binding encodes cbind-input":
     var state: ScramState
     let cbData = @[0xAA'u8, 0xBB, 0xCC]

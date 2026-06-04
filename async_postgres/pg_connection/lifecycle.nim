@@ -60,10 +60,15 @@ proc selectScramMechanism*(
     serverCertDer: openArray[byte],
     saslMechanisms: seq[string],
     mode: ChannelBindingMode,
-): tuple[mechanism: string, cbType: string, cbData: seq[byte]] =
+): tuple[
+  mechanism: string, cbType: string, cbData: seq[byte], cbSupportedButUnused: bool
+] =
   ## Pick the SCRAM mechanism and channel-binding material for a SASL
   ## authentication attempt. Raises `PgConnectionError` when the server-offered
-  ## mechanisms cannot satisfy `mode`.
+  ## mechanisms cannot satisfy `mode`. `cbSupportedButUnused` is true when TLS is
+  ## in use but plain SCRAM-SHA-256 was selected; the caller then emits a "y,,"
+  ## gs2 header so the server can detect a SCRAM-SHA-256-PLUS downgrade (libpq
+  ## parity). `cbDisable` leaves it false so a "n,," header is sent.
   let serverHasPlus = "SCRAM-SHA-256-PLUS" in saslMechanisms
   let serverHasScram = "SCRAM-SHA-256" in saslMechanisms
   let canUsePlus = sslEnabled and serverCertDer.len > 0 and serverHasPlus
@@ -93,6 +98,10 @@ proc selectScramMechanism*(
       result.cbData = computeTlsServerEndpoint(serverCertDer)
     elif serverHasScram:
       result.mechanism = "SCRAM-SHA-256"
+      # TLS is in use but channel binding was not negotiated. Signal "y,," so a
+      # MITM that stripped SCRAM-SHA-256-PLUS from the offered mechanisms is
+      # detected server-side (the server knows it offered -PLUS).
+      result.cbSupportedButUnused = sslEnabled
     else:
       raise newException(
         PgConnectionError, "server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS"
@@ -315,7 +324,8 @@ proc connectToHost*(
             # filtered list).
             enforceAuthAllowed(chosen, config.requireAuth, $msg.saslMechanisms)
             let clientFirst = scramClientFirstMessage(
-              config.user, scramState, choice.cbType, choice.cbData
+              config.user, scramState, choice.cbType, choice.cbData,
+              choice.cbSupportedButUnused,
             )
             await conn.sendMsg(encodeSASLInitialResponse(choice.mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
