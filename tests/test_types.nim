@@ -363,6 +363,27 @@ suite "Row accessors":
     expect PgTypeError:
       discard row.getInt64(0)
 
+  test "getInt64 overflow raises PgTypeError (not raw ValueError)":
+    # A text/numeric column whose value exceeds int64 makes the non-throwing
+    # parseBiggestInt raise a raw ValueError; it must be converted to PgTypeError
+    # so it stays catchable via `except PgError`.
+    let row = @[some(toBytes("99999999999999999999999999"))]
+    expect PgTypeError:
+      discard row.getInt64(0)
+    let rowNeg = @[some(toBytes("-99999999999999999999999999"))]
+    expect PgTypeError:
+      discard rowNeg.getInt64(0)
+
+  test "getInt overflow raises PgTypeError (not raw ValueError)":
+    let row = @[some(toBytes("99999999999999999999999999"))]
+    expect PgTypeError:
+      discard row.getInt(0)
+
+  test "getInt16 overflow raises PgTypeError (not raw ValueError)":
+    let row = @[some(toBytes("99999999999999999999999999"))]
+    expect PgTypeError:
+      discard row.getInt16(0)
+
   test "getFloat32":
     let row = @[some(toBytes("2.5"))]
     check abs(row.getFloat32(0) - 2.5'f32) < 1e-6
