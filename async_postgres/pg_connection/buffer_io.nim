@@ -12,7 +12,7 @@
 ## Re-exported through `pg_connection.nim`; depends only on `types.nim` and
 ## the protocol/error/backend abstraction modules.
 
-import std/[deques, options]
+import std/[deques, options, tables]
 when defined(posix):
   import std/posix
 
@@ -236,6 +236,8 @@ proc nextMessage*(
   ## Synchronously parse the next message from the receive buffer.
   ## Returns none if the buffer doesn't contain a complete message.
   ## Notification/Notice messages are dispatched internally.
+  ## ParameterStatus messages are recorded into `conn.serverParams` and
+  ## consumed, so callers never see them.
   ## DataRow messages are counted (if rowCount != nil) and consumed.
   ##
   ## On `ProtocolError` the protocol stream is desynchronised — the connection
@@ -267,6 +269,12 @@ proc nextMessage*(
       continue
     if res.message.kind == bmkNoticeResponse:
       conn.dispatchNotice(res.message)
+      continue
+    if res.message.kind == bmkParameterStatus:
+      # Keep serverParams current for the whole session (e.g. in_hot_standby
+      # after a standby promotion), like libpq's pqSaveParameterStatus.
+      let m = res.message
+      conn.serverParams[m.paramName] = m.paramValue
       continue
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1

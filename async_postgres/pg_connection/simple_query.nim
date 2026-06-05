@@ -8,7 +8,8 @@
 ## - `cancel` / `cancelNoWait` / `invalidateOnTimeout` — out-of-band cancel
 ##   request over a separate socket plus the standard "the wait timed out,
 ##   poison this connection" recovery path used by every timeout wrapper.
-## - `checkSessionAttrs` — `SHOW transaction_read_only` probe used by the
+## - `checkSessionAttrs` — server-role probe (`SHOW transaction_read_only` /
+##   `in_hot_standby` / `SELECT pg_catalog.pg_is_in_recovery()`) used by the
 ##   multi-host failover logic in `lifecycle.connect`.
 ## - `quoteIdentifier` — SQL identifier escaping used by `LISTEN`/`UNLISTEN`
 ##   and other identifier-bearing simple-query call sites.
@@ -20,7 +21,7 @@
 ##
 ## Re-exported through `pg_connection.nim`.
 
-import std/[options, strutils]
+import std/[options, strutils, tables]
 
 import ../[async_backend, pg_errors, pg_protocol, pg_types]
 import types, buffer_io
@@ -361,23 +362,73 @@ proc bytesToString*(data: seq[byte]): string =
   for i in 0 ..< data.len:
     result[i] = char(data[i])
 
+proc probeBool(conn: PgConnection, sql, trueLiteral: string): Future[bool] {.async.} =
+  ## Run a single-row, single-column probe and compare its text value against
+  ## `trueLiteral`. Raise if the result carries no usable value (empty / zero
+  ## rows / NULL) so an indeterminate probe fails the host rather than silently
+  ## defaulting to a match — matching libpq, which advances to the next host.
+  let results = await conn.simpleQuery(sql)
+  if results.len > 0 and results[0].rowCount > 0:
+    let val = results[0].rows[0][0]
+    if val.isSome:
+      return bytesToString(val.get) == trueLiteral
+  raise
+    newException(PgConnectionError, "probe \"" & sql & "\" returned no usable result")
+
+proc isPhysicalReplicationConn(conn: PgConnection): bool =
+  ## Physical replication connections cannot execute arbitrary SQL, so a
+  ## recovery probe must avoid `SELECT`. `connectReplication` always sets
+  ## `replication=true`, but the server also accepts the other boolean
+  ## spellings, which can reach `extraParams` verbatim via a user DSN
+  ## (`replication=database` is logical replication and *can* run SQL).
+  for (k, v) in conn.config.extraParams:
+    if k == "replication" and v in ["true", "on", "yes", "1"]:
+      return true
+  false
+
+proc inRecovery(conn: PgConnection): Future[bool] {.async.} =
+  ## Recovery state. PostgreSQL 14+ reports `in_hot_standby`, so no query is
+  ## needed; older servers are probed with `SELECT pg_catalog.pg_is_in_recovery()`.
+  ## Physical replication connections reject `SELECT`, so they fall back to the
+  ## walsender-accepted `SHOW transaction_read_only`. Note: on a pre-14 physical
+  ## replication connection that is a recovery-state approximation, not the
+  ## exact recovery state — unavoidable when `in_hot_standby` is absent.
+  let ihs = conn.serverParams.getOrDefault("in_hot_standby", "")
+  if ihs.len > 0:
+    return ihs == "on"
+  if conn.isPhysicalReplicationConn:
+    return await conn.probeBool("SHOW transaction_read_only", "on")
+  return await conn.probeBool("SELECT pg_catalog.pg_is_in_recovery()", "t")
+
+proc isReadOnly(conn: PgConnection): Future[bool] {.async.} =
+  ## Read-only state. PostgreSQL 14+ reports both `default_transaction_read_only`
+  ## and `in_hot_standby`, so the answer needs no round-trip (libpq parity);
+  ## otherwise fall back to `SHOW transaction_read_only`.
+  let dtro = conn.serverParams.getOrDefault("default_transaction_read_only", "")
+  let ihs = conn.serverParams.getOrDefault("in_hot_standby", "")
+  if dtro.len > 0 and ihs.len > 0:
+    return dtro == "on" or ihs == "on"
+  return await conn.probeBool("SHOW transaction_read_only", "on")
+
 proc checkSessionAttrs*(
     conn: PgConnection, attrs: TargetSessionAttrs
 ): Future[bool] {.async.} =
   ## Check whether a connection matches the desired target_session_attrs.
-  ## Uses `SHOW transaction_read_only` to determine server role.
-  if attrs == tsaAny:
-    return true
-  let results = await conn.simpleQuery("SHOW transaction_read_only")
-  var readOnly = false
-  if results.len > 0 and results[0].rowCount > 0:
-    let val = results[0].rows[0][0]
-    if val.isSome:
-      readOnly = bytesToString(val.get) == "on"
+  ## Follows libpq: `tsaReadWrite`/`tsaReadOnly` are judged on the session's
+  ## read-only state, while `tsaPrimary`/`tsaStandby` are judged on the recovery
+  ## state — the `in_hot_standby` ParameterStatus reported by PostgreSQL 14+,
+  ## with a `SELECT pg_catalog.pg_is_in_recovery()` probe as fallback for older
+  ## servers. `tsaPreferStandby` is permissive: as a standalone predicate any
+  ## server matches (the multi-host failover in `lifecycle.connect` handles the
+  ## standby preference with a two-pass scan). Raises on an indeterminate probe.
   case attrs
-  of tsaAny:
-    true # unreachable, handled above
-  of tsaReadWrite, tsaPrimary:
-    not readOnly
-  of tsaReadOnly, tsaStandby, tsaPreferStandby:
-    readOnly
+  of tsaAny, tsaPreferStandby:
+    return true
+  of tsaReadWrite:
+    return not await conn.isReadOnly()
+  of tsaReadOnly:
+    return await conn.isReadOnly()
+  of tsaPrimary:
+    return not await conn.inRecovery()
+  of tsaStandby:
+    return await conn.inRecovery()

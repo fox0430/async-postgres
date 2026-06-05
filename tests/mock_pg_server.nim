@@ -160,6 +160,44 @@ proc buildBackendKeyData*(pid, secretKey: int32): seq[byte] =
 proc buildReadyForQuery*(status: char = 'I'): seq[byte] =
   buildBackendMsg('Z', @[byte(status)])
 
+proc buildRowDescriptionFields*(
+    cols: openArray[tuple[name: string, typeOid: int32, typeSize: int16]]
+): seq[byte] =
+  ## RowDescription ('T') with the given text-format columns.
+  var body: seq[byte]
+  body.addInt16(int16(cols.len)) # field count
+  for c in cols:
+    body.addCString(c.name)
+    body.addInt32(0) # table OID
+    body.addInt16(0) # column attribute number
+    body.addInt32(c.typeOid) # type OID
+    body.addInt16(c.typeSize) # type size
+    body.addInt32(-1) # type modifier
+    body.addInt16(0) # format code (text)
+  buildBackendMsg('T', body)
+
+proc buildRowDescription*(colName: string): seq[byte] =
+  ## RowDescription with a single text-format `text` column.
+  buildRowDescriptionFields(@[(colName, 25'i32, -1'i16)])
+
+proc buildDataRowText*(cols: openArray[string]): seq[byte] =
+  ## DataRow ('D') with text-format columns. Does not emit SQL NULL.
+  var body: seq[byte]
+  body.addInt16(int16(cols.len)) # column count
+  for c in cols:
+    body.addInt32(int32(c.len))
+    for ch in c:
+      body.add(byte(ch))
+  buildBackendMsg('D', body)
+
+proc buildDataRow*(value: string): seq[byte] =
+  ## DataRow with a single text-format column.
+  buildDataRowText([value])
+
+proc queryText*(body: seq[byte]): string =
+  ## Extract the SQL string from a Query ('Q') message body (a single cstring).
+  decodeCString(body, 0)[0]
+
 proc buildCommandComplete*(tag: string): seq[byte] =
   var body: seq[byte]
   for c in tag:
@@ -226,12 +264,15 @@ proc sendFullHandshake*(
   await sendBytes(client, resp)
 
 proc acceptAndReady*(
-    ms: MockServer, pid: int32 = 1234, secretKey: int32 = 5678
+    ms: MockServer,
+    pid: int32 = 1234,
+    secretKey: int32 = 5678,
+    params: seq[(string, string)] = @[],
 ): Future[MockClient] {.async.} =
-  ## End-to-end helper: accept a client and complete startup + handshake.
-  ## On return the client is positioned at `csReady` with no outstanding
-  ## requests.
+  ## End-to-end helper: accept a client and complete startup + handshake,
+  ## reporting `params` via ParameterStatus during the handshake. On return
+  ## the client is positioned at `csReady` with no outstanding requests.
   let client = await ms.accept()
   await drainStartupMessage(client)
-  await sendFullHandshake(client, pid, secretKey)
+  await sendFullHandshake(client, pid, secretKey, params)
   client
