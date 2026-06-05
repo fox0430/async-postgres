@@ -488,11 +488,34 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       TraceConnectEndData,
       TraceConnectEndData(conn: conn),
     ):
-      conn =
-        if config.connectTimeout != default(Duration):
-          await perform().wait(config.connectTimeout)
+      if config.connectTimeout != default(Duration):
+        when hasAsyncDispatch:
+          # asyncdispatch's wait() cannot cancel the attempt: on timeout,
+          # perform() keeps running in the background (see async_backend.wait).
+          # If it later succeeds, nobody reads the result, so close the
+          # orphaned connection instead of leaking a socket and a server slot.
+          # chronos is unaffected: wait() cancels perform(), and connectToHost
+          # tears down its transport on the way out.
+          let attempt = perform()
+          try:
+            conn = await attempt.wait(config.connectTimeout)
+          except AsyncTimeoutError as e:
+            proc closeOrphan() {.async.} =
+              try:
+                await attempt.read().close()
+              except CatchableError:
+                discard
+
+            attempt.addCallback(
+              proc() =
+                if attempt.completed():
+                  asyncSpawn closeOrphan()
+            )
+            raise e
         else:
-          await perform()
+          conn = await perform().wait(config.connectTimeout)
+      else:
+        conn = await perform()
       conn.tracer = config.tracer
     return conn
 

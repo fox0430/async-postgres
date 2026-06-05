@@ -461,6 +461,24 @@ suite "Close":
     check cluster.primary.idle.len == 0
     check cluster.replica.idle.len == 0
 
+  test "close with timeout drains primary and replica concurrently":
+    ## Regression: serial primary→replica drains made close wait up to
+    ## 2*timeout when both pools had unreleased active connections.
+    let cluster = makeCluster()
+    cluster.primary.active = 1
+    cluster.replica.active = 1
+
+    let start = Moment.now()
+    waitFor cluster.close(milliseconds(400))
+    let elapsed = Moment.now() - start
+
+    # Concurrent drains overlap: ~400ms total. The old serial path took
+    # >= 800ms. 700ms splits the two with slack for a slow scheduler.
+    check elapsed < milliseconds(700)
+    check cluster.closed
+    check cluster.primary.closed
+    check cluster.replica.closed
+
   test "close closes replica even if primary.close raises":
     ## Ensures try/finally guarantees replica cleanup when primary fails.
     let cluster = makeCluster()
