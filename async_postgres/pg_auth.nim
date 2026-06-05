@@ -138,9 +138,11 @@ proc scramClientFinalMessage*(
       PgConnectionError, "SCRAM: server response missing iteration count (i=)"
     )
   if iterations < 4096:
-    # RFC 5802 sets no floor, but PostgreSQL's minimum (and default) is 4096.
+    # RFC 5802 sets no floor, but PostgreSQL's default (and the hardcoded
+    # minimum before the scram_iterations GUC of PostgreSQL 16) is 4096.
     # A malicious server returning a low count would make an offline brute-force
     # of the password from the ClientProof dramatically cheaper, so reject it.
+    # Stricter than libpq, which accepts any count the server sends.
     raise newException(
       PgConnectionError, "SCRAM: iteration count too small: " & $iterations
     )
