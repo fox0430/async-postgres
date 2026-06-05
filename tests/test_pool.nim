@@ -823,6 +823,103 @@ when hasChronos:
         discard waitFor pool.acquire()
       check pool.idle.len == 0
 
+suite "Acquire deadline budget":
+  ## Regression for acquire latency exceeding acquireTimeout: health-check
+  ## pings and a caller-driven connect used to run on their own budgets
+  ## (pingTimeout*N + connectTimeout) *before* acquireTimeout even started.
+
+  when hasChronos:
+    test "acquireTimeout bounds idle health-check pings":
+      proc t() {.async.} =
+        let pool = makePool()
+        pool.config.healthCheckTimeout = seconds(60)
+        # Without the shared budget the first ping alone would block for 60s.
+        pool.config.pingTimeout = seconds(60)
+        pool.config.acquireTimeout = milliseconds(300)
+        # Fill the pool so the post-ping path queues instead of dialing a
+        # (nonexistent) server.
+        pool.active = pool.config.maxSize
+
+        let (hanging, server, serverTransport) = await makeHangingConn()
+        pool.idle.addLast(
+          PooledConn(conn: hanging, lastUsedAt: Moment.now() - minutes(2))
+        )
+
+        let start = Moment.now()
+        var msg = ""
+        try:
+          discard await pool.acquire()
+        except PgPoolError as e:
+          msg = e.msg
+        let elapsed = Moment.now() - start
+
+        doAssert "timeout" in msg.toLowerAscii()
+        doAssert elapsed < seconds(5)
+        doAssert hanging.state == csClosed
+        doAssert pool.metrics.timeoutCount == 1
+
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
+  test "acquireTimeout bounds caller-driven connect":
+    proc t() {.async.} =
+      # A server that accepts TCP but never answers the startup message:
+      # without the shared budget, connect() would block indefinitely here
+      # (connectTimeout defaults to ZeroDuration = unlimited).
+      let ms = startMockServer()
+      let pool = makePool()
+      pool.config.connConfig.host = "127.0.0.1"
+      pool.config.connConfig.port = ms.port
+      pool.config.acquireTimeout = milliseconds(300)
+
+      let start = Moment.now()
+      var msg = ""
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        msg = e.msg
+      let elapsed = Moment.now() - start
+
+      doAssert "timeout" in msg.toLowerAscii()
+      doAssert elapsed < seconds(5)
+      doAssert pool.active == 0
+      doAssert pool.metrics.timeoutCount == 1
+
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "nearly exhausted deadline returns idle conn unpinged":
+    proc t() {.async.} =
+      # With less than pingBudgetFloor (10ms) of budget left, acquire must
+      # give up *before* pinging: a doomed ping would close a connection
+      # that may well be healthy.
+      let pool = makePool()
+      pool.config.healthCheckTimeout = milliseconds(1)
+      pool.config.pingTimeout = seconds(5)
+      pool.config.acquireTimeout = milliseconds(5) # below the 10ms floor
+
+      let conn = mockConn()
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now() - minutes(2)))
+
+      var msg = ""
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        msg = e.msg
+
+      doAssert "timeout" in msg.toLowerAscii()
+      # The conn went back untouched: a ping on this transport-less mock
+      # would have failed and discarded it.
+      doAssert pool.idle.len == 1
+      doAssert pool.idle[0].conn == conn
+      doAssert conn.state == csReady
+      doAssert pool.metrics.timeoutCount == 1
+      doAssert pool.metrics.closeCount == 0
+
+    waitFor t()
+
 suite "Max waiters":
   test "maxWaiters -1 allows unlimited waiters":
     let pool = makePool(maxSize = 1)

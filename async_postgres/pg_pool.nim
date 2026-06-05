@@ -4,10 +4,6 @@ import async_backend, pg_protocol, pg_connection, pg_types, pg_client
 
 privateAccess(PgConnection)
 
-const bgTaskPruneThreshold = 16
-  ## Sweep `pool.pendingBackgroundTasks` for finished futures only once its
-  ## length reaches this threshold, so the O(n) prune is amortized across calls.
-
 type
   PoolConfig* = object
     ## Configuration for the connection pool. Create via `initPoolConfig`.
@@ -31,7 +27,11 @@ type
     pingTimeout*: Duration
       ## Max time to wait for a health check ping response (default 5s, ZeroDuration=no timeout)
     acquireTimeout*: Duration
-      ## Max time to wait for an available connection (default 30s, ZeroDuration=no timeout)
+      ## Deadline for the entire `acquire` call (default 30s, ZeroDuration=no
+      ## timeout). Idle health-check pings, a caller-driven connect, and the
+      ## wait for a released connection all draw from this one budget, so
+      ## acquire latency is bounded by ~`acquireTimeout` rather than
+      ## `pingTimeout*N + connectTimeout + acquireTimeout`.
     maxWaiters*: int = -1
       ## Max queued acquire waiters (default -1=unlimited, 0=no waiting). Rejects with PgPoolError when full.
     resetQuery*: string
@@ -133,6 +133,17 @@ type
     nextConnectRetryAt: Moment
       ## Monotonic deadline before the maintenance loop is allowed to retry
       ## opening a new connection. Zero means "no pending backoff".
+
+const bgTaskPruneThreshold = 16
+  ## Sweep `pool.pendingBackgroundTasks` for finished futures only once its
+  ## length reaches this threshold, so the O(n) prune is amortized across calls.
+
+const pingBudgetFloor = milliseconds(10)
+  ## Minimum remaining acquire-deadline budget required to start a
+  ## health-check ping. Once a ping is on the wire, a timeout forces a close
+  ## (the connection cannot be safely reused mid-ping), so a ping started
+  ## with less than a realistic round trip's worth of budget would just burn
+  ## a healthy connection on an acquire that is about to time out anyway.
 
 proc initPoolConfig*(
     connConfig: ConnConfig,
@@ -653,6 +664,21 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   pool.cachedNow = Moment.now()
   let acquireStart = pool.cachedNow
 
+  # `acquireTimeout` is a deadline for the whole acquire: idle health-check
+  # pings, a caller-driven connect, and the final waiter wait all draw from
+  # this one budget. Without it, acquire latency could reach
+  # pingTimeout*N + connectTimeout + acquireTimeout.
+  let hasDeadline = pool.config.acquireTimeout > ZeroDuration
+  let deadline = acquireStart + pool.config.acquireTimeout
+    # only meaningful when hasDeadline
+
+  template remainingBudget(): Duration =
+    deadline - Moment.now()
+
+  template raiseAcquireTimeout() =
+    pool.metrics.timeoutCount.inc
+    raise newException(PgPoolError, "Pool acquire timeout")
+
   template recordAcquire() =
     pool.metrics.acquireCount.inc
     pool.metrics.acquireDuration =
@@ -685,8 +711,29 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         else:
           pool.config.healthCheckTimeout
       if idleThreshold > ZeroDuration and pool.cachedNow - pc.lastUsedAt > idleThreshold:
+        var pingBudget = pool.config.pingTimeout
+        if hasDeadline:
+          let rem = remainingBudget()
+          # Don't start a ping unless a realistic round trip's worth of
+          # budget remains (`pingBudgetFloor`, or the user's own tighter
+          # `pingTimeout`): a ping doomed to time out would discard a
+          # connection that may well be healthy. Put it back for the next
+          # acquirer instead and report the timeout.
+          let pingFloor =
+            if pingBudget > ZeroDuration:
+              min(pingBudget, pingBudgetFloor)
+            else:
+              pingBudgetFloor
+          if rem < pingFloor:
+            pool.idle.addFirst(pc)
+            raiseAcquireTimeout()
+          pingBudget =
+            if pingBudget == ZeroDuration:
+              rem
+            else:
+              min(pingBudget, rem)
         try:
-          await pc.conn.ping(pool.config.pingTimeout)
+          await pc.conn.ping(pingBudget)
         except CatchableError:
           pool.metrics.closeCount.inc
           await pool.tracedClose(pc.conn)
@@ -697,9 +744,18 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
 
     # No idle connections; create new if under limit
     if pool.active < pool.config.maxSize:
+      var connCfg = pool.config.connConfig
+      var cappedByDeadline = false
+      if hasDeadline:
+        let rem = remainingBudget()
+        if rem <= ZeroDuration:
+          raiseAcquireTimeout()
+        if connCfg.connectTimeout == ZeroDuration or rem < connCfg.connectTimeout:
+          connCfg.connectTimeout = rem
+          cappedByDeadline = true
       pool.active.inc
       try:
-        let conn = await connect(pool.config.connConfig)
+        let conn = await connect(connCfg)
         conn.ownerPool = pool
         pool.metrics.createCount.inc
         # A successful caller-driven connect signals the DB is reachable —
@@ -709,6 +765,12 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         return (conn, true)
       except CatchableError as e:
         pool.active.dec
+        # A connect cut short by the acquire deadline surfaces as the same
+        # timeout error as the waiter path; a genuine connect failure (or a
+        # user-configured connectTimeout firing first) propagates as-is.
+        if cappedByDeadline and e of AsyncTimeoutError:
+          pool.metrics.timeoutCount.inc
+          raise newException(PgPoolError, "Pool acquire timeout", e)
         raise e
 
   # Either max connections are reached or waiters are queued ahead of us;
@@ -718,6 +780,13 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       PgPoolError,
       "Pool acquire queue full (maxWaiters=" & $pool.config.maxWaiters & ")",
     )
+  # Compute the remaining budget before queueing; whatever the idle
+  # health-check pings consumed comes out of the waiter wait below.
+  var waitBudget = ZeroDuration
+  if hasDeadline:
+    waitBudget = remainingBudget()
+    if waitBudget <= ZeroDuration:
+      raiseAcquireTimeout()
   let fut = newFuture[PgConnection]("PgPool.acquire")
   let waiter = Waiter(fut: fut, cancelled: false)
   pool.waiters.addLast(waiter)
@@ -733,9 +802,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     pool.active.inc
     pool.spawnConnectForWaiter()
 
-  if pool.config.acquireTimeout > ZeroDuration:
+  if hasDeadline:
     try:
-      let conn = await fut.wait(pool.config.acquireTimeout)
+      let conn = await fut.wait(waitBudget)
       recordAcquire()
       return (conn, false)
     except AsyncTimeoutError:
