@@ -394,15 +394,20 @@ template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
     body
 
 proc close*(cluster: PgPoolCluster, timeout = ZeroDuration): Future[void] {.async.} =
-  ## Close both primary and replica pools.
+  ## Close both primary and replica pools. Both closes run concurrently so
+  ## their drain windows overlap and the total wait stays bounded by
+  ## `timeout` instead of doubling when both pools have active connections.
   cluster.closed = true
+  let
+    primaryFut = cluster.primary.close(timeout)
+    replicaFut = cluster.replica.close(timeout)
   var firstErr: ref CatchableError
   try:
-    await cluster.primary.close(timeout)
+    await primaryFut
   except CatchableError as e:
     firstErr = e
   try:
-    await cluster.replica.close(timeout)
+    await replicaFut
   except CatchableError as e:
     if firstErr == nil:
       firstErr = e

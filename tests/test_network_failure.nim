@@ -70,6 +70,50 @@ suite "Network failure: handshake":
     waitFor testBody()
     check raised
 
+when hasAsyncDispatch:
+  suite "Network failure: connect timeout orphan":
+    test "timed-out connect closes the late-arriving connection":
+      ## asyncdispatch's wait() cannot cancel a timed-out connect; the
+      ## attempt keeps running in the background. If it eventually succeeds,
+      ## the orphaned connection must be closed, not leaked.
+      var timedOut = false
+      var serverSawClose = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await ms.accept()
+          await drainStartupMessage(st)
+          # Complete the handshake well after the client's connectTimeout.
+          await sleepMsAsync(250)
+          await sendFullHandshake(st)
+          # The orphan close path sends Terminate and drops the socket:
+          # keep reading until EOF. The 5s guard turns a leaked connection
+          # into a test failure instead of a hang.
+          try:
+            while true:
+              discard await readN(st, 1).wait(seconds(5))
+          except AsyncTimeoutError:
+            serverSawClose = false
+          except CatchableError:
+            serverSawClose = true
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+        var cfg = mockConfig(ms.port)
+        cfg.connectTimeout = milliseconds(50)
+        try:
+          discard await connect(cfg)
+        except AsyncTimeoutError:
+          timedOut = true
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody()
+      check timedOut
+      check serverSawClose
+
 # Malformed / truncated backend messages
 
 suite "Network failure: malformed server messages":
