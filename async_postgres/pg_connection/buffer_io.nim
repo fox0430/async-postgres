@@ -46,7 +46,13 @@ proc getHosts*(config: ConnConfig): seq[HostEntry] =
   if config.hosts.len > 0:
     config.hosts
   else:
-    @[HostEntry(host: config.host, port: if config.port == 0: 5432 else: config.port)]
+    @[
+      HostEntry(
+        host: config.host,
+        hostaddr: config.hostaddr,
+        port: if config.port == 0: 5432 else: config.port,
+      )
+    ]
 
 # COPY callback factories (cross-backend)
 

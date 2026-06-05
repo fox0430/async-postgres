@@ -85,13 +85,19 @@ type
     tsaPreferStandby ## Prefer standby, fall back to any
 
   HostEntry* = object ## A single host:port entry for multi-host connection.
-    host*: string
+    host*: string ## Host name (or Unix socket dir); used for SSL verification
+    hostaddr*: string
+      ## Numeric address dialed instead of resolving `host` (libpq `hostaddr`).
+      ## Empty = resolve `host`.
     port*: int
 
   ConnConfig* = object
     ## Connection configuration. Construct via `parseDsn` or set fields directly.
     host*: string
     port*: int # default 5432
+    hostaddr*: string
+      ## Numeric address dialed instead of resolving `host` (libpq `hostaddr`).
+      ## `host` is still the name used for SSL certificate verification.
     user*: string
     password*: string
     database*: string
@@ -536,6 +542,18 @@ else:
     ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
 
 const RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
+
+# HostEntry accessors
+
+func dialAddr*(entry: HostEntry): string {.inline.} =
+  ## The address actually dialed: `hostaddr` bypasses name resolution when
+  ## given, otherwise `host` is resolved (libpq semantics).
+  if entry.hostaddr.len > 0: entry.hostaddr else: entry.host
+
+func displayHost*(entry: HostEntry): string {.inline.} =
+  ## Host name for display and back-compat scalars: `host`, falling back to
+  ## `hostaddr` (mirrors libpq's PQhost()).
+  if entry.host.len > 0: entry.host else: entry.hostaddr
 
 # Internal accessor for cross-module use within the library
 
