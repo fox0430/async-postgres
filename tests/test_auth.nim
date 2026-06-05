@@ -145,6 +145,19 @@ suite "SCRAM-SHA-256":
     expect CatchableError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
+  test "scramClientFinalMessage rejects iteration count below 4096":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=1"
+    expect CatchableError:
+      discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage accepts minimum iteration count 4096":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
   test "scramClientFinalMessage rejects excessive iteration count":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)

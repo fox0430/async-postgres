@@ -137,8 +137,13 @@ proc scramClientFinalMessage*(
     raise newException(
       PgConnectionError, "SCRAM: server response missing iteration count (i=)"
     )
-  if iterations <= 0:
-    raise newException(PgConnectionError, "SCRAM: iteration count must be positive")
+  if iterations < 4096:
+    # RFC 5802 sets no floor, but PostgreSQL's minimum (and default) is 4096.
+    # A malicious server returning a low count would make an offline brute-force
+    # of the password from the ClientProof dramatically cheaper, so reject it.
+    raise newException(
+      PgConnectionError, "SCRAM: iteration count too small: " & $iterations
+    )
   if iterations > 600_000:
     raise newException(
       PgConnectionError, "SCRAM: iteration count too large: " & $iterations
