@@ -1753,6 +1753,146 @@ suite "Error type granularity":
       caught = true
     check caught
 
+  test "acquire connect failure raises PgPoolError with parent":
+    # Caller-driven connect path: the underlying PgConnectionError must not
+    # escape acquire() raw — it is wrapped in PgPoolError with `parent` set.
+    proc t() {.async.} =
+      # Grab a port that is guaranteed closed: bind, read it, release it.
+      let ms = startMockServer()
+      let port = ms.port
+      await closeServer(ms)
+
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig.port = port
+      # Backstop so the test cannot hang if the connect is not refused
+      # promptly; a timeout is wrapped the same way as a refusal.
+      pool.config.connConfig.connectTimeout = milliseconds(500)
+
+      var caught: ref PgPoolError
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        caught = e
+      doAssert caught != nil
+      doAssert caught.parent != nil
+      doAssert pool.active == 0
+      await pool.close()
+
+    waitFor t()
+
+  test "spawn connect failure fails waiter with PgPoolError with parent":
+    # Waiter path: a broken-conn release kicks off spawnConnectForWaiter;
+    # its connect failure must reach the queued acquire as PgPoolError
+    # (wrapping the original error), not as a raw PgConnectionError.
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let port = ms.port
+      await closeServer(ms) # guaranteed connection-refused port
+
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig.port = port
+      pool.config.connConfig.connectTimeout = milliseconds(500)
+      pool.config.acquireTimeout = seconds(5)
+      pool.active = 1 # simulated borrower at maxSize
+
+      let acqFut = pool.acquire() # queues as a waiter (deadline path)
+      # Broken-conn release frees the slot and spawns a connect for the waiter.
+      pool.release(mockConn(csClosed))
+
+      var caught: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        caught = e
+      doAssert caught != nil
+      doAssert caught.parent != nil
+      doAssert pool.waiterCount == 0
+      doAssert pool.active == 0
+      await pool.close()
+
+    waitFor t()
+
+  test "spawn connect timeout does not corrupt waiterCount":
+    # Regression: a raw AsyncTimeoutError from the spawn's connectTimeout
+    # used to reach the waiter's own wait-budget handler, which decremented
+    # waiterCount a second time (failNextWaiter had already done so). The
+    # resulting negative count permanently disabled the FIFO fast path.
+    proc t() {.async.} =
+      # The mock server accepts TCP (listen backlog) but never answers the
+      # startup message, so the connect attempt hangs until connectTimeout.
+      let ms = startMockServer()
+
+      let pool = makePool(maxSize = 1)
+      # The mock server listens on 127.0.0.1 only; "localhost" may resolve
+      # to ::1 first, which would fail fast with refused instead of hanging.
+      pool.config.connConfig.host = "127.0.0.1"
+      pool.config.connConfig.port = ms.port
+      pool.config.connConfig.connectTimeout = milliseconds(100)
+      pool.config.acquireTimeout = seconds(5)
+      pool.active = 1
+
+      let acqFut = pool.acquire() # queues as a waiter (deadline path)
+      pool.release(mockConn(csClosed)) # spawn-for-waiter kicks in
+
+      var caught: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        caught = e
+      doAssert caught != nil
+      doAssert caught.parent of AsyncTimeoutError
+      doAssert pool.waiterCount == 0
+      doAssert pool.active == 0
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  when hasChronos:
+    # asyncdispatch has no cancellation (cancelAndWait is a no-op shim), so
+    # the spawn-cancellation path is only reachable under chronos.
+    test "cancelled spawn connect is not treated as a connect failure":
+      # A cancelled spawn-for-waiter must not bump the backoff counter or
+      # fail the waiter with a pool error: cancellation is not a connect
+      # failure. The capacity reservation is still released.
+      proc t() {.async.} =
+        # Accepts TCP but never answers the startup message, so the connect
+        # attempt stays suspended until we cancel it.
+        let ms = startMockServer()
+
+        let pool = makePool(maxSize = 1)
+        pool.config.connConfig.host = "127.0.0.1"
+        pool.config.connConfig.port = ms.port
+        # Backstop: if cancellation failed to reach the spawn, the connect
+        # would fail on its own and trip the assertions below instead of
+        # hanging the test.
+        pool.config.connConfig.connectTimeout = seconds(2)
+        pool.config.acquireTimeout = seconds(5)
+        pool.active = 1
+
+        let acqFut = pool.acquire() # queues as a waiter (deadline path)
+        pool.release(mockConn(csClosed)) # spawn-for-waiter kicks in
+        # release() queues the broken conn's closeNoWait first, then the
+        # spawn-for-waiter — the spawn future is the last entry.
+        doAssert pool.pendingBackgroundTasks.len >= 1
+        await cancelAndWait(pool.pendingBackgroundTasks[^1])
+
+        doAssert pool.consecutiveConnectFailures == 0
+        doAssert pool.waiterCount == 1 # waiter still queued, not failed
+        doAssert pool.active == 0 # reservation released by `finally`
+
+        # close() settles the still-queued waiter with "Pool closed".
+        await pool.close()
+        var caught: ref PgPoolError
+        try:
+          discard await acqFut
+        except PgPoolError as e:
+          caught = e
+        doAssert caught != nil
+        await closeServer(ms)
+
+      waitFor t()
+
 suite "Pool metrics":
   test "initial metrics are zero":
     let pool = makePool()
