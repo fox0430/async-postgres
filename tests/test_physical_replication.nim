@@ -40,39 +40,6 @@ proc buildXLogData(startLsn, walEnd, sendTime: int64, walData: seq[byte]): seq[b
 proc buildCopyDone(): seq[byte] =
   @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
 
-proc buildRowDescriptionPair(
-    n1: string, oid1: int32, sz1: int32, n2: string, oid2: int32, sz2: int32
-): seq[byte] =
-  ## RowDescription with two fields.
-  var body: seq[byte]
-  body.addInt16(2'i16)
-  body.addCString(n1)
-  body.addInt32(0'i32)
-  body.addInt16(0'i16)
-  body.addInt32(oid1)
-  body.addInt16(int16(sz1))
-  body.addInt32(-1'i32)
-  body.addInt16(0'i16)
-  body.addCString(n2)
-  body.addInt32(0'i32)
-  body.addInt16(0'i16)
-  body.addInt32(oid2)
-  body.addInt16(int16(sz2))
-  body.addInt32(-1'i32)
-  body.addInt16(0'i16)
-  buildBackendMsg('T', body)
-
-proc buildDataRowText(cols: openArray[string]): seq[byte] =
-  ## DataRow with text-format columns. NULL is signalled by an empty string
-  ## here only via length; this helper does not emit NULL.
-  var body: seq[byte]
-  body.addInt16(int16(cols.len))
-  for c in cols:
-    body.addInt32(int32(c.len))
-    for ch in c:
-      body.add(byte(ch))
-  buildBackendMsg('D', body)
-
 proc readStartupMessage(client: MockClient): Future[seq[byte]] {.async.} =
   ## Same as drainStartupMessage but returns the body so tests can inspect
   ## the startup parameters.
@@ -117,12 +84,7 @@ suite "Physical replication: SQL building":
         # Capture the START_REPLICATION query.
         let q = await drainFrontendMessage(st)
         if q.msgType == 'Q':
-          # Query body is a cstring; strip the trailing NUL.
-          var s = newString(q.body.len)
-          for i, b in q.body:
-            s[i] = char(b)
-          if s.len > 0 and s[^1] == '\0':
-            s.setLen(s.len - 1)
+          let s = queryText(q.body)
           {.cast(gcsafe).}:
             capturedSql = s
         var burst: seq[byte]
@@ -342,7 +304,9 @@ suite "timelineHistory":
         var burst: seq[byte]
         # RowDescription: filename text(oid=25), content text(oid=25)
         burst.add(
-          buildRowDescriptionPair("filename", 25'i32, -1'i32, "content", 25'i32, -1'i32)
+          buildRowDescriptionFields(
+            @[("filename", 25'i32, -1'i16), ("content", 25'i32, -1'i16)]
+          )
         )
         burst.add(buildDataRowText(["00000002.history", "first line\n"]))
         burst.add(buildCommandComplete("TIMELINE_HISTORY"))

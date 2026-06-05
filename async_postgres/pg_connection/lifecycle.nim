@@ -380,9 +380,9 @@ proc connectToHost*(
       while true:
         while (let opt = conn.nextMessage(); opt.isSome):
           let msg = opt.get
+          # ParameterStatus is recorded into conn.serverParams centrally by
+          # nextMessage, so it is never returned here.
           case msg.kind
-          of bmkParameterStatus:
-            conn.serverParams[msg.paramName] = msg.paramValue
           of bmkBackendKeyData:
             conn.pid = msg.backendPid
             conn.secretKey = msg.backendSecretKey
@@ -425,6 +425,27 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
 
 # Multi-host connect
 
+proc matchesOrClose(
+    conn: PgConnection, attrs: TargetSessionAttrs
+): Future[bool] {.async.} =
+  ## Probe `conn` against `attrs`. On a match leave it open and return true.
+  ## On a non-match, or any failure (including cancellation), close `conn`
+  ## first — so a raising probe never leaks the connection — then return
+  ## false or re-raise. Failover callers must not close `conn` themselves.
+  try:
+    if await conn.checkSessionAttrs(attrs):
+      return true
+  except CatchableError:
+    # A cancelled connection's bare awaits re-raise immediately, so force the
+    # teardown to run under chronos; close() swallows its own errors.
+    when hasChronos:
+      await noCancel conn.close()
+    else:
+      await conn.close()
+    raise
+  await conn.close()
+  return false
+
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Establish a new connection to a PostgreSQL server.
   ## Supports multi-host failover: tries each host in order.
@@ -439,9 +460,8 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       for entry in hosts:
         try:
           let conn = await connectToHost(config, entry.host, entry.port)
-          if await conn.checkSessionAttrs(tsaStandby):
+          if await conn.matchesOrClose(tsaStandby):
             return conn
-          await conn.close()
         except CancelledError as e:
           raise e
         except CatchableError as e:
@@ -460,9 +480,8 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         try:
           let conn = await connectToHost(config, entry.host, entry.port)
           if config.targetSessionAttrs == tsaAny or
-              await conn.checkSessionAttrs(config.targetSessionAttrs):
+              await conn.matchesOrClose(config.targetSessionAttrs):
             return conn
-          await conn.close()
           errors.add(
             entry.host & ":" & $entry.port &
               ": server does not match target_session_attrs " &
