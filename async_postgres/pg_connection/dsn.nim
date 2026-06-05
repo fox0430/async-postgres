@@ -116,8 +116,16 @@ proc buildHosts(hostStr, hostaddrStr, portStr: string): seq[HostEntry] =
       "Could not match " & $portList.len & " port numbers to " & $count & " hosts",
     )
   for i in 0 ..< count:
-    let h = if hostStr.len > 0: hostList[i] else: ""
-    let a = if hostaddrStr.len > 0: addrList[i] else: ""
+    let h =
+      if hostStr.len > 0:
+        hostList[i]
+      else:
+        ""
+    let a =
+      if hostaddrStr.len > 0:
+        addrList[i]
+      else:
+        ""
     let p =
       if portList.len == 1:
         portList[0]
