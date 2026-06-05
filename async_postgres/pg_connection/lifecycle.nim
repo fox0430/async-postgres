@@ -124,9 +124,11 @@ proc selectScramMechanism*(
 # Single-host bootstrap
 
 proc connectToHost*(
-    config: ConnConfig, hostAddr: string, hostPort: int
+    config: ConnConfig, entry: HostEntry
 ): Future[PgConnection] {.async.} =
   ## Connect to a single PostgreSQL host. Internal helper for multi-host connect.
+  ## Dials `entry.hostaddr` when given (bypassing name resolution), otherwise
+  ## `entry.host`; SSL certificate verification always uses `entry.host`.
 
   if config.sslMode == sslAllow:
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
@@ -137,7 +139,7 @@ proc connectToHost*(
     plainConfig.sslMode = sslDisable
     var plainErrMsg = ""
     try:
-      return await connectToHost(plainConfig, hostAddr, hostPort)
+      return await connectToHost(plainConfig, entry)
     except CancelledError as e:
       raise e
     except CatchableError as e:
@@ -149,7 +151,7 @@ proc connectToHost*(
     var sslConfig = config
     sslConfig.sslMode = sslRequire
     try:
-      return await connectToHost(sslConfig, hostAddr, hostPort)
+      return await connectToHost(sslConfig, entry)
     except CancelledError as e:
       raise e
     except CatchableError as e:
@@ -163,6 +165,8 @@ proc connectToHost*(
 
   var conn: PgConnection
 
+  let hostAddr = entry.dialAddr
+  let hostPort = entry.port
   let isUnix = isUnixSocket(hostAddr)
 
   when hasChronos:
@@ -253,9 +257,12 @@ proc connectToHost*(
     )
 
   try:
-    # SSL negotiation (before StartupMessage) — skip for Unix sockets
+    # SSL negotiation (before StartupMessage) — skip for Unix sockets.
+    # Certificate verification must use the host *name*, never the dialed
+    # hostaddr, and must be per-entry: with multi-host failover config.host
+    # only reflects the first entry.
     if config.sslMode != sslDisable and not isUnix:
-      await negotiateSSL(conn, config)
+      await negotiateSSL(conn, config, entry.host)
 
     when hasChronos:
       # If SSL was not established, create plain streams
@@ -462,38 +469,38 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       # First pass: look for a standby
       for entry in hosts:
         try:
-          let conn = await connectToHost(config, entry.host, entry.port)
+          let conn = await connectToHost(config, entry)
           if await conn.matchesOrClose(tsaStandby):
             return conn
         except CancelledError as e:
           raise e
         except CatchableError as e:
-          errors.add(entry.host & ":" & $entry.port & ": " & e.msg)
+          errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
       # Second pass: accept any server
       for entry in hosts:
         try:
-          let conn = await connectToHost(config, entry.host, entry.port)
+          let conn = await connectToHost(config, entry)
           return conn
         except CancelledError as e:
           raise e
         except CatchableError as e:
-          errors.add(entry.host & ":" & $entry.port & ": " & e.msg)
+          errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
     else:
       for entry in hosts:
         try:
-          let conn = await connectToHost(config, entry.host, entry.port)
+          let conn = await connectToHost(config, entry)
           if config.targetSessionAttrs == tsaAny or
               await conn.matchesOrClose(config.targetSessionAttrs):
             return conn
           errors.add(
-            entry.host & ":" & $entry.port &
+            entry.displayHost & ":" & $entry.port &
               ": server does not match target_session_attrs " &
               $config.targetSessionAttrs
           )
         except CancelledError as e:
           raise e
         except CatchableError as e:
-          errors.add(entry.host & ":" & $entry.port & ": " & e.msg)
+          errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
 
     raise newException(
       PgConnectionError, "Could not connect to any host: " & errors.join("; ")
