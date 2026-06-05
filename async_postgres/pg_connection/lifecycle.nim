@@ -435,14 +435,17 @@ proc matchesOrClose(
   try:
     if await conn.checkSessionAttrs(attrs):
       return true
-  except CatchableError:
+  except CatchableError as e:
     # A cancelled connection's bare awaits re-raise immediately, so force the
     # teardown to run under chronos; close() swallows its own errors.
     when hasChronos:
       await noCancel conn.close()
     else:
       await conn.close()
-    raise
+    # Re-raise the captured exception rather than a bare `raise`: if close()
+    # suspended, the resumed coroutine has no "current exception" and a bare
+    # raise dies with ReraiseDefect ("no exception to reraise").
+    raise e
   await conn.close()
   return false
 
