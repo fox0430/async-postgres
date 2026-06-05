@@ -385,9 +385,10 @@ proc spawnConnectForWaiter(pool: PgPool) =
   ## - connect failed / no waiter remained / pool closed: reservation is
   ##   released via `active.dec`
   ##
-  ## On connect failure the front waiter is failed with the underlying
-  ## error so the caller's `acquire` returns promptly rather than waiting
-  ## for `acquireTimeout`. The spawned future is tracked in
+  ## On connect failure the front waiter is failed with a `PgPoolError`
+  ## wrapping the underlying error (available via `parent`) so the caller's
+  ## `acquire` returns promptly rather than waiting for `acquireTimeout`.
+  ## The spawned future is tracked in
   ## `pendingBackgroundTasks` so `pool.close()` drains it before returning.
   proc run() {.async.} =
     var consumed = false
@@ -405,6 +406,16 @@ proc spawnConnectForWaiter(pool: PgPool) =
       # No waiter remained (all cancelled); park the conn in idle so it
       # is not lost.
       pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+    except CancelledError:
+      # Task cancellation is not a connect failure: don't bump the backoff
+      # counter or fail the waiter with a pool error. Nothing cancels these
+      # spawns today (close() awaits them via `pendingBackgroundTasks`), so
+      # this is defensive. Swallowed rather than re-raised: this future is
+      # `asyncSpawn`ed, and chronos treats a spawned task that finishes
+      # cancelled as a FutureDefect. The reservation is released by
+      # `finally`; the waiter stays queued, bounded by its own wait budget
+      # or failed by close().
+      discard
     except CatchableError as e:
       pool.consecutiveConnectFailures.inc
       let delay = computeConnectBackoff(
@@ -419,7 +430,16 @@ proc spawnConnectForWaiter(pool: PgPool) =
       # re-spawn for siblings — `canAttemptConnect()` is now false during
       # the backoff window, so further spawns are deferred until backoff
       # expires (then triggered by the next acquire or release).
-      discard pool.failNextWaiter(e)
+      #
+      # Wrap in PgPoolError before failing the waiter: acquire() documents
+      # PgPoolError for every failure mode, and a raw AsyncTimeoutError from
+      # `connConfig.connectTimeout` would otherwise be indistinguishable from
+      # the waiter's own wait-budget timeout in acquireImpl — whose handler
+      # decrements `waiterCount` a second time (failNextWaiter below already
+      # did) and permanently corrupts the FIFO fast-path guard.
+      discard pool.failNextWaiter(
+        newException(PgPoolError, "Pool connect for waiter failed", e)
+      )
     finally:
       if not consumed and pool.active > 0:
         pool.active.dec
@@ -763,15 +783,22 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         pool.consecutiveConnectFailures = 0
         recordAcquire()
         return (conn, true)
+      except CancelledError as e:
+        # Cancellation (e.g. a caller's wait()-style deadline) must propagate
+        # unwrapped so the canceller's machinery sees it.
+        pool.active.dec
+        raise e
       except CatchableError as e:
         pool.active.dec
         # A connect cut short by the acquire deadline surfaces as the same
-        # timeout error as the waiter path; a genuine connect failure (or a
-        # user-configured connectTimeout firing first) propagates as-is.
+        # timeout error as the waiter path; any other connect failure
+        # (including a user-configured connectTimeout firing before the
+        # deadline) is wrapped so acquire() keeps its documented PgPoolError
+        # contract — the original error stays available via `parent`.
         if cappedByDeadline and e of AsyncTimeoutError:
           pool.metrics.timeoutCount.inc
           raise newException(PgPoolError, "Pool acquire timeout", e)
-        raise e
+        raise newException(PgPoolError, "Pool connect failed", e)
 
   # Either max connections are reached or waiters are queued ahead of us;
   # queue up and wait for delivery.
@@ -840,7 +867,10 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## Acquire a connection from the pool. Tries idle connections first (with
   ## health checks), creates a new one if under `maxSize`, or waits for a
-  ## release. Raises `PgPoolError` on timeout or if the pool is closed.
+  ## release. Raises `PgPoolError` on every failure mode: acquire timeout,
+  ## pool closed, waiter queue full, or a failed connect attempt — for
+  ## connect failures the underlying error (e.g. `PgConnectionError`) is
+  ## preserved as the `parent` of the raised `PgPoolError`.
   if pool.config.tracer == nil:
     let ar = await pool.acquireImpl()
     return ar.conn
@@ -1828,16 +1858,17 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   if pool.maintenanceTask != nil and not pool.maintenanceTask.finished:
     await cancelAndWait(pool.maintenanceTask)
 
-  # Cancel all waiters
+  # Cancel all waiters. PgPoolError (not bare PgError) so a waiter failed
+  # by close() matches acquire()'s documented error contract.
   while pool.waiters.len > 0:
     let waiter = pool.waiters.popFirst()
     if not waiter.cancelled:
-      waiter.fut.fail(newException(PgError, "Pool closed"))
+      waiter.fut.fail(newException(PgPoolError, "Pool closed"))
   pool.waiterCount = 0
 
   # Fail all pending pipeline ops
   pool.dispatchScheduled = false
-  let closeErr = newException(PgError, "Pool closed")
+  let closeErr = newException(PgPoolError, "Pool closed")
   while pool.pendingOps.len > 0:
     let op = pool.pendingOps.popFirst()
     failPendingOp(op, closeErr)
