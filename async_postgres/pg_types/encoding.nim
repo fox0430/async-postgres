@@ -596,6 +596,10 @@ proc toPgBinaryParam*(v: PgTimeTz): PgParam =
 
 proc encodeNumericBinary*(v: PgNumeric): seq[byte] =
   ## Encode PgNumeric as PostgreSQL binary numeric format.
+  if v.digits.len > int(int16.high):
+    raise newException(
+      PgTypeError, "Numeric binary: too many digit groups: " & $v.digits.len
+    )
   let ndigits = int16(v.digits.len)
   let signVal = cast[int16](v.sign.uint16)
   result = newSeq[byte](8 + ndigits.int * 2)
@@ -604,7 +608,13 @@ proc encodeNumericBinary*(v: PgNumeric): seq[byte] =
   result.writeBE16(4, signVal)
   result.writeBE16(6, v.dscale)
   for i in 0 ..< ndigits.int:
-    result.writeBE16(8 + i * 2, v.digits[i])
+    let digit = v.digits[i]
+    # Mirror decodeNumericBinary: each base-10000 digit must be in [0, 9999].
+    # The server's numeric_recv would reject out-of-range values anyway, so
+    # fail locally with a clear error instead of a server-side one.
+    if digit < 0 or digit > 9999:
+      raise newException(PgTypeError, "Numeric binary: invalid digit " & $digit)
+    result.writeBE16(8 + i * 2, digit)
 
 proc toPgBinaryParam*(v: PgNumeric): PgParam =
   PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
