@@ -393,11 +393,60 @@ suite "parseDsn":
     check cfg.hosts[1].host == "h2"
     check cfg.hosts[1].port == 5433
 
-  test "multi-host skips empty entries":
+  test "multi-host empty entry selects default (libpq parity)":
     let cfg = parseDsn("postgresql://h1,,h3/db")
-    check cfg.hosts.len == 2
+    check cfg.hosts.len == 3
     check cfg.hosts[0].host == "h1"
-    check cfg.hosts[1].host == "h3"
+    check cfg.hosts[1].host == "127.0.0.1"
+    check cfg.hosts[1].port == 5432
+    check cfg.hosts[2].host == "h3"
+
+  test "host and port as query parameters (libpq documented form)":
+    let cfg = parseDsn("postgresql:///mydb?host=localhost&port=5433")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "localhost"
+    check cfg.hosts[0].port == 5433
+    check cfg.host == "localhost"
+    check cfg.port == 5433
+    check cfg.database == "mydb"
+
+  test "multi-host via query parameters":
+    let cfg = parseDsn("postgresql:///db?host=h1,h2&port=5433,5434")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5434)
+
+  test "query parameter host overrides authority host (last wins)":
+    let cfg = parseDsn("postgresql://ignored:9999/db?host=real&port=5433")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0] == HostEntry(host: "real", port: 5433)
+
+  test "query parameter port applies to all authority hosts":
+    let cfg = parseDsn("postgresql://h1,h2/db?port=5433")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5433)
+
+  test "error: URI port count mismatch via query parameters":
+    expect PgError:
+      discard parseDsn("postgresql:///db?host=h1,h2,h3&port=5433,5434")
+
+  test "hostaddr query parameter kept separate from authority host":
+    let cfg = parseDsn("postgresql://db.example.com/db?hostaddr=10.0.0.1")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "db.example.com"
+    check cfg.hosts[0].hostaddr == "10.0.0.1"
+    check cfg.hosts[0].dialAddr == "10.0.0.1"
+    check cfg.host == "db.example.com"
+    check cfg.hostaddr == "10.0.0.1"
+
+  test "error: host names and hostaddr values count mismatch (URI)":
+    expect PgError:
+      discard parseDsn("postgresql://h1,h2/db?hostaddr=10.0.0.1")
+
+  test "error: unexpected character after IPv6 bracket":
+    expect PgError:
+      discard parseDsn("postgresql://[::1]junk:5433/db")
 
   test "target_session_attrs all values":
     check parseDsn("postgresql://h/db?target_session_attrs=any").targetSessionAttrs ==
@@ -492,8 +541,97 @@ suite "parseDsn keyword=value":
 
   test "hostaddr keyword":
     let cfg = parseDsn("hostaddr=192.168.1.1 dbname=test")
+    # No host name given: entry host stays empty (no name to verify SSL
+    # against), the scalar falls back to hostaddr like libpq's PQhost().
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == ""
+    check cfg.hosts[0].hostaddr == "192.168.1.1"
+    check cfg.hosts[0].dialAddr == "192.168.1.1"
+    check cfg.hosts[0].displayHost == "192.168.1.1"
     check cfg.host == "192.168.1.1"
+    check cfg.hostaddr == "192.168.1.1"
     check cfg.database == "test"
+
+  test "host and hostaddr kept separate":
+    let cfg = parseDsn("host=db.example.com hostaddr=10.0.0.1")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "db.example.com"
+    check cfg.hosts[0].hostaddr == "10.0.0.1"
+    check cfg.hosts[0].dialAddr == "10.0.0.1"
+    check cfg.host == "db.example.com"
+    check cfg.hostaddr == "10.0.0.1"
+
+  test "single host populates hosts":
+    let cfg = parseDsn("host=myhost port=5433")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0] == HostEntry(host: "myhost", port: 5433)
+
+  test "multi-host comma-separated":
+    let cfg = parseDsn("host=h1,h2 dbname=test")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5432)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5432)
+    check cfg.host == "h1"
+    check cfg.port == 5432
+
+  test "multi-host with single port applies to all":
+    let cfg = parseDsn("host=h1,h2 port=5433")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5433)
+
+  test "multi-host with matching port list":
+    let cfg = parseDsn("host=h1,h2 port=5433,5434")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5434)
+
+  test "multi-host port order independent":
+    let cfg = parseDsn("port=5433,5434 host=h1,h2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5434)
+
+  test "multi-host empty entry selects default":
+    let cfg = parseDsn("host=h1,,h3 port=5433,,5435")
+    check cfg.hosts.len == 3
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "127.0.0.1", port: 5432)
+    check cfg.hosts[2] == HostEntry(host: "h3", port: 5435)
+
+  test "multi-host hostaddr comma-separated":
+    let cfg = parseDsn("hostaddr=10.0.0.1,10.0.0.2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].hostaddr == "10.0.0.1"
+    check cfg.hosts[1].hostaddr == "10.0.0.2"
+    check cfg.hosts[0].dialAddr == "10.0.0.1"
+    check cfg.hosts[1].dialAddr == "10.0.0.2"
+
+  test "multi-host with matching hostaddr list":
+    let cfg = parseDsn("host=h1,h2 hostaddr=10.0.0.1,10.0.0.2 port=5433")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", hostaddr: "10.0.0.1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "h2", hostaddr: "10.0.0.2", port: 5433)
+
+  test "error: host names and hostaddr values count mismatch":
+    expect PgError:
+      discard parseDsn("host=h1,h2 hostaddr=10.0.0.1")
+
+  test "error: port count mismatch with hosts":
+    expect PgError:
+      discard parseDsn("host=h1,h2,h3 port=5433,5434")
+
+  test "error: multiple ports with single host":
+    expect PgError:
+      discard parseDsn("host=h1 port=5433,5434")
+
+  test "error: multiple ports without host":
+    expect PgError:
+      discard parseDsn("port=5433,5434")
+
+  test "error: invalid port inside port list":
+    expect PgError:
+      discard parseDsn("host=h1,h2 port=5433,bogus")
 
   test "sslmode defaults to prefer when unspecified (libpq parity)":
     let cfg = parseDsn("host=h dbname=d")

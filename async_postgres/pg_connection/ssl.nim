@@ -68,8 +68,16 @@ when hasAsyncDispatch and defined(ssl):
     finally:
       X509_free(cert)
 
-proc negotiateSSL*(conn: PgConnection, config: ConnConfig) {.async.} =
+proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
   ## Send SSLRequest and negotiate TLS if server accepts.
+  ## `sslHost` is the host *name* the server certificate is verified against
+  ## (the entry's `host`, never its `hostaddr` — libpq semantics).
+  if config.sslMode == sslVerifyFull and sslHost.len == 0:
+    # hostaddr without host: there is no name to match the certificate
+    # against (libpq raises the same way).
+    raise newException(
+      PgConnectionError, "A host name must be specified for a verified SSL connection"
+    )
   let sslReq = encodeSSLRequest()
   var respChar: char
 
@@ -102,7 +110,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig) {.async.} =
         else:
           {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
 
-      let serverName = if config.sslMode == sslVerifyFull: config.host else: ""
+      let serverName = if config.sslMode == sslVerifyFull: sslHost else: ""
 
       if config.sslRootCert.len > 0:
         let parsed = parseTrustAnchors(config.sslRootCert)
@@ -156,12 +164,12 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig) {.async.} =
           ctx = newContext(verifyMode = verifyMode)
 
         try:
-          let hostname = if config.sslMode == sslVerifyFull: config.host else: ""
+          let hostname = if config.sslMode == sslVerifyFull: sslHost else: ""
           wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
           # wrapConnectedSocket skips name verification for IP hostnames; for
           # verify-full we must match the IP against the cert's SANs ourselves.
-          if needsManualIpVerification(config.sslMode, config.host):
-            verifyPeerIpSan(conn.socket, config.host)
+          if needsManualIpVerification(config.sslMode, sslHost):
+            verifyPeerIpSan(conn.socket, sslHost)
           conn.sslEnabled = true
           # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
           # If unavailable, cbPrefer will silently fall back to SCRAM-SHA-256 —
