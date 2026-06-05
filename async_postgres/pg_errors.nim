@@ -36,7 +36,10 @@ type
 
   PgTimeoutError* = object of PgError ## Operation timed out.
 
-  PgPoolError* = object of PgError ## Pool exhaustion, pool closed, or acquire timeout.
+  PgPoolError* = object of PgError
+    ## Pool-level acquire failure: acquire timeout, pool closed, waiter queue
+    ## full, or a failed connect attempt during acquire (the underlying error,
+    ## e.g. ``PgConnectionError``, is preserved as ``parent``).
 
   PgNotifyOverflowError* = object of PgError
     dropped*: int ## Number of notifications dropped due to queue overflow
