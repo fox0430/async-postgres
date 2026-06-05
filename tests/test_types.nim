@@ -2045,6 +2045,18 @@ suite "PgNumeric":
       let decoded = $decodeNumericBinary(p.value.get)
       check decoded == s
 
+  test "encodeNumericBinary rejects out-of-range base-10000 digit":
+    # User-constructed PgNumeric with digits outside [0, 9999] must fail
+    # locally instead of sending invalid wire data the server would reject.
+    expect PgTypeError:
+      discard encodeNumericBinary(
+        PgNumeric(weight: 1, sign: pgPositive, dscale: 0, digits: @[12345'i16, 6'i16])
+      )
+    expect PgTypeError:
+      discard encodeNumericBinary(
+        PgNumeric(weight: 0, sign: pgPositive, dscale: 0, digits: @[-1'i16])
+      )
+
   test "getNumeric text format":
     let row: Row = @[some(toBytes("12345.6789012345678901234567890"))]
     let v = row.getNumeric(0)
