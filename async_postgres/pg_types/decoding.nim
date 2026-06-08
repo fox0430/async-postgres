@@ -116,13 +116,15 @@ proc decodeBinaryDate*(data: openArray[byte]): DateTime =
   initTime(unixSec, 0).utc()
 
 const pgTimeMaxUs = 86_400_000_000'i64
-  ## PostgreSQL time-of-day is microseconds since midnight in [0, 86_400_000_000).
+  ## Microseconds for '24:00:00', PostgreSQL's inclusive end-of-day bound for
+  ## time-of-day. Valid range is [0, pgTimeMaxUs]; '24:00:00' itself is allowed
+  ## but nothing past it.
 
 proc decodeBinaryTime*(data: openArray[byte]): PgTime =
   if data.len < 8:
     raise newException(PgTypeError, "Binary time data too short: " & $data.len)
   let us = fromBE64(data)
-  if us < 0 or us >= pgTimeMaxUs:
+  if us < 0 or us > pgTimeMaxUs:
     raise newException(PgTypeError, "Binary time: microseconds out of range " & $us)
   let hours = int32(us div 3_600_000_000)
   let rem1 = us mod 3_600_000_000
@@ -136,7 +138,7 @@ proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz =
   if data.len < 12:
     raise newException(PgTypeError, "Binary timetz data too short: " & $data.len)
   let us = fromBE64(data)
-  if us < 0 or us >= pgTimeMaxUs:
+  if us < 0 or us > pgTimeMaxUs:
     raise newException(PgTypeError, "Binary timetz: microseconds out of range " & $us)
   let pgOffset = fromBE32(data.toOpenArray(8, 11))
   let hours = int32(us div 3_600_000_000)
@@ -356,7 +358,7 @@ proc parseTimeText*(s: string): PgTime =
     h = parseInt(s[0 .. 1])
     m = parseInt(s[3 .. 4])
     sec = parseInt(s[6 .. 7])
-  if h notin 0 .. 23 or m notin 0 .. 59 or sec notin 0 .. 59:
+  if h notin 0 .. 24 or m notin 0 .. 59 or sec notin 0 .. 59:
     raise newException(PgTypeError, "Invalid time: " & s)
   if s.len > 8 and s[8] == '.':
     let frac = s[9 .. ^1]
@@ -367,6 +369,10 @@ proc parseTimeText*(s: string): PgTime =
     # Pad to 6 digits
     for _ in 0 ..< (6 - frac.len):
       us *= 10
+  # PostgreSQL accepts '24:00:00' as the inclusive end-of-day bound, but nothing
+  # past it (no '24:00:01', no '24:00:00.000001').
+  if h == 24 and (m != 0 or sec != 0 or us != 0):
+    raise newException(PgTypeError, "Invalid time: " & s)
   PgTime(hour: int32(h), minute: int32(m), second: int32(sec), microsecond: int32(us))
 
 proc parseTimeTzText*(s: string): PgTimeTz =

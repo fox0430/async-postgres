@@ -627,6 +627,40 @@ suite "PgTime":
     let result = row.getTime(0)
     check result == t
 
+  test "getTime text '24:00:00' end-of-day bound":
+    # PostgreSQL allows '24:00:00' as the inclusive upper bound of time-of-day.
+    let row = @[some(toBytes("24:00:00"))]
+    let t = row.getTime(0)
+    check t == PgTime(hour: 24, minute: 0, second: 0, microsecond: 0)
+
+  test "getTime binary '24:00:00' roundtrip":
+    let t = PgTime(hour: 24, minute: 0, second: 0, microsecond: 0)
+    let p = toPgBinaryParam(t)
+    let fields = @[mkField(OidTime, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getTime(0) == t
+
+  test "getTime past end-of-day raises":
+    # Nothing past '24:00:00' is valid, in either path.
+    for bad in ["24:00:01", "24:01:00", "24:00:00.000001", "25:00:00"]:
+      let row = @[some(toBytes(bad))]
+      var raised = false
+      try:
+        discard row.getTime(0)
+      except PgTypeError:
+        raised = true
+      check raised
+    # Binary: one microsecond past 24:00:00.
+    let pastUs = 86_400_000_001'i64
+    let fields = @[mkField(OidTime, 1)]
+    let row = mkRow(@[some(@(toBE64(pastUs)))], fields)
+    var raised = false
+    try:
+      discard row.getTime(0)
+    except PgTypeError:
+      raised = true
+    check raised
+
   test "getTimeOpt NULL returns none":
     let row = @[none(seq[byte])]
     check row.getTimeOpt(0).isNone
@@ -716,6 +750,31 @@ suite "PgTimeTz":
     let row = mkRow(@[p.value], fields)
     let result = row.getTimeTz(0)
     check result == t
+
+  test "getTimeTz text '24:00:00' end-of-day bound":
+    let row = @[some(toBytes("24:00:00+05"))]
+    let t = row.getTimeTz(0)
+    check t.hour == 24
+    check t.minute == 0
+    check t.second == 0
+    check t.microsecond == 0
+    check t.utcOffset == 18000
+
+  test "getTimeTz binary '24:00:00' roundtrip":
+    let t = PgTimeTz(hour: 24, minute: 0, second: 0, microsecond: 0, utcOffset: 18000)
+    let p = toPgBinaryParam(t)
+    let fields = @[mkField(OidTimeTz, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getTimeTz(0) == t
+
+  test "getTimeTz past end-of-day raises":
+    let row = @[some(toBytes("24:00:01+05"))]
+    var raised = false
+    try:
+      discard row.getTimeTz(0)
+    except PgTypeError:
+      raised = true
+    check raised
 
   test "getTimeTzOpt NULL returns none":
     let row = @[none(seq[byte])]
