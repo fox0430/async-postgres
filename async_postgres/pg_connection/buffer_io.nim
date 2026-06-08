@@ -29,6 +29,21 @@ when defined(posix):
   var TCP_NODELAY* {.importc, header: "<netinet/tcp.h>".}: cint
   var MSG_DONTWAIT* {.importc, header: "<sys/socket.h>".}: cint
 
+type RecvWatch* = ref object
+  ## A single in-flight background socket read used to watch for an unsolicited
+  ## backend message while the client is busy sending.
+  ##
+  ## A `ref` so it can be passed into and mutated by `async` helpers (a `var` of
+  ## a value type cannot be captured across an `await`).
+  ##
+  ## Contract: at most one background read per connection is in flight at a
+  ## time. The read carries no per-read timeout — bound the whole operation with
+  ## an outer `wait`. Before reusing the normal recv path (`fillRecvBuf` /
+  ## `nextMessage` on freshly read bytes) the watch must be settled: either
+  ## consume it via `take` + `await`, or drop it with `cancel` immediately
+  ## before raising.
+  fut: Future[void]
+
 # Host / address helpers
 
 proc isUnixSocket*(host: string): bool {.inline.} =
@@ -300,6 +315,64 @@ proc recvMessage*(
     if opt.isSome:
       return opt.get
     await conn.fillRecvBuf(timeout)
+
+# Non-blocking receive watch
+#
+# During an otherwise send-only phase (COPY IN) the client must keep streaming
+# while still noticing an unsolicited backend message — typically an
+# ErrorResponse aborting the COPY (constraint violation, disk full, …). The
+# blocking-only read path (`fillRecvBuf`) cannot be polled, and there is no
+# portable non-blocking socket read that also works over TLS and the two async
+# backends. `RecvWatch` provides one: it keeps a single background read in
+# flight whose completion is observed cheaply with `Future.finished`, adding no
+# latency to the common (no early error) path.
+
+proc startRecvWatch*(conn: PgConnection): RecvWatch =
+  ## Begin watching for an unsolicited backend message. The bytes are committed
+  ## to `recvBuf` when the read completes; poll with `ready`, then `take` +
+  ## `await` (immediate once ready) and parse with `nextMessage`.
+  RecvWatch(fut: conn.fillRecvBuf(ZeroDuration))
+
+proc pending*(w: RecvWatch): bool =
+  ## Whether a background read is currently in flight.
+  w.fut != nil
+
+proc ready*(w: RecvWatch): bool =
+  ## Whether the in-flight read has settled, so `take` + `await` will not block.
+  ## A read that failed also reports ready; awaiting it then re-raises.
+  w.fut != nil and w.fut.finished
+
+proc take*(w: RecvWatch): Future[void] =
+  ## Surrender the in-flight read for the caller to `await` (immediate when
+  ## `ready`). Clears the watch; the caller owns the returned Future.
+  result = w.fut
+  w.fut = nil
+
+proc rearm*(w: RecvWatch, conn: PgConnection) =
+  ## Resume watching with a fresh background read. Only call once the previous
+  ## read has been consumed (`take` + `await`), never while one is still in
+  ## flight.
+  w.fut = conn.fillRecvBuf(ZeroDuration)
+
+proc cancel*(w: RecvWatch) =
+  ## Abandon any in-flight read. Must be followed immediately by raising/exit:
+  ## on chronos the read is cancelled asynchronously (`cancelSoon`), so starting
+  ## a new read before unwinding would race the cancellation against the shared
+  ## `recvBuf`. On asyncdispatch (no cancellation) the read keeps running; its
+  ## eventual result is swallowed so it never surfaces as an unhandled future
+  ## error.
+  if w.fut != nil and not w.fut.finished:
+    when hasChronos:
+      w.fut.cancelSoon()
+    elif hasAsyncDispatch:
+      w.fut.addCallback(
+        proc(f: Future[void]) {.gcsafe.} =
+          try:
+            f.read()
+          except CatchableError:
+            discard
+      )
+  w.fut = nil
 
 # Send helpers
 
