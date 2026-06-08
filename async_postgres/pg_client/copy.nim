@@ -82,9 +82,9 @@ proc copyInRawImpl*(
       conn.sendBuf.addCopyDone()
       await conn.sendBufMsg()
       conn.sendBuf.setLen(0)
-  except CatchableError:
+  except CatchableError as e:
     watch.cancel()
-    raise
+    raise e
 
   # Settle the in-flight watch read before parsing: on normal completion it
   # carries the CommandComplete/ReadyForQuery response; on an early error it was
@@ -263,10 +263,10 @@ proc copyInStreamImpl*(
     conn.sendBuf.setLen(0)
     try:
       await conn.sendMsg(encodeCopyFail(callbackError.msg))
-    except CatchableError:
+    except CatchableError as e:
       # Transport is gone; abandon the watch read and surface the failure.
       watch.cancel()
-      raise
+      raise e
     # Fold the in-flight watch read to receive the CopyFail response, then drain.
     if watch.pending:
       await watch.take()
