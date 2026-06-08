@@ -84,3 +84,96 @@ suite "reconnectInPlace buffer pairing":
     # finalLen > 0, so the next read would re-parse stale auth bytes and desync.
     check finalLen > 0
     check finalStart == finalLen
+
+## Regression target (M-7): when multi-host failover reconnects to a *different*
+## host, `reconnectInPlace` must copy `newConn.host`/`newConn.port` too — not just
+## `pid`/`secretKey`. `cancel()` dials `conn.host`/`conn.port` with the (updated)
+## backend secretKey; leaving host/port stale sends the CancelRequest to the old,
+## now-dead host where the new key is unknown, so the cancel silently no-ops.
+##
+## We use a two-host config [A, B]. The initial connect lands on A; we then take
+## A's listener down and `reconnectInPlace`, which dials A (refused) and fails
+## over to B. B completes the handshake with a *distinct* pid/secretKey, so the
+## connection's identity provably moved. The assertion is that host/port follow
+## the transport to B. Pre-fix, port stays at A's while the transport talks to B.
+
+proc failoverConfig(portA, portB: int): ConnConfig =
+  ConnConfig(
+    host: "127.0.0.1",
+    port: portA,
+    user: "test",
+    database: "test",
+    sslMode: sslDisable,
+    hosts: @[
+      HostEntry(host: "127.0.0.1", port: portA),
+      HostEntry(host: "127.0.0.1", port: portB),
+    ],
+  )
+
+suite "reconnectInPlace host/port failover":
+  test "host/port follow the transport when failover picks a new host":
+    const
+      aPid = 1111'i32
+      aSecret = 2222'i32
+      bPid = 3333'i32
+      bSecret = 4444'i32
+    var portA, portB = -1
+    var initialPort = -1
+    var finalState: PgConnState
+    var finalHostIsLoopback = false
+    var finalPort, finalPid, finalSecret = -1
+
+    proc testBody() {.async.} =
+      let msA = startMockServer()
+      let msB = startMockServer()
+      portA = msA.port
+      portB = msB.port
+      var scA, scB: MockClient
+      proc serverHandler() {.async.} =
+        # Connection 1: original transport, served by host A.
+        scA = await acceptAndReady(msA, pid = aPid, secretKey = aSecret)
+        # Connection 2: the failover target. reconnectInPlace dials A (refused,
+        # listener closed below) then B, which answers with a distinct key.
+        scB = await acceptAndReady(msB, pid = bPid, secretKey = bSecret)
+
+      let serverFut = serverHandler()
+      let conn = await connect(failoverConfig(msA.port, msB.port))
+      # Landed on the first host A.
+      initialPort = conn.port
+
+      # Take A down so the reconnect's dial to A is refused and failover moves
+      # to B. Closing the listener leaves the already-accepted scA untouched.
+      await closeServer(msA)
+      await conn.reconnectInPlace()
+      finalState = conn.state
+      finalHostIsLoopback = conn.host == "127.0.0.1"
+      finalPort = conn.port
+      finalPid = conn.pid
+      finalSecret = conn.secretKey
+
+      await serverFut
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      try:
+        await closeClient(scA)
+      except CatchableError:
+        discard
+      await closeClient(scB)
+      await closeServer(msB)
+
+    waitFor testBody()
+    # Sanity: the initial connect really used host A, and the two endpoints
+    # differ — otherwise "failover changed the host" proves nothing.
+    check initialPort == portA
+    check portA != portB
+    check finalState == csReady
+    # pid/secretKey track the new backend (true even pre-fix); asserting them
+    # pins down that the transport genuinely moved to B.
+    check finalPid == bPid
+    check finalSecret == bSecret
+    # The fix: host/port copied from newConn, so they point at B — the host
+    # cancel() will dial. Pre-fix, finalPort stays at portA (the dead host).
+    check finalHostIsLoopback
+    check finalPort == portB
