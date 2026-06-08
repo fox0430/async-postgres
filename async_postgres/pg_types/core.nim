@@ -48,13 +48,13 @@ type
     microseconds*: int64
 
   PgTime* = object ## PostgreSQL time without time zone.
-    hour*: int32 ## 0..23
+    hour*: int32 ## 0..24 (24 only as '24:00:00', PostgreSQL's end-of-day bound)
     minute*: int32 ## 0..59
     second*: int32 ## 0..59
     microsecond*: int32 ## 0..999999
 
   PgTimeTz* = object ## PostgreSQL time with time zone.
-    hour*: int32 ## 0..23
+    hour*: int32 ## 0..24 (24 only as '24:00:00', PostgreSQL's end-of-day bound)
     minute*: int32 ## 0..59
     second*: int32 ## 0..59
     microsecond*: int32 ## 0..999999
