@@ -5515,6 +5515,106 @@ suite "E2E: COPY Failure Recovery":
 
     waitFor t()
 
+suite "E2E: COPY IN Early Error Detection":
+  # These exercise the multi-batch send path (data exceeds the 256KB COPY batch
+  # threshold), where the client streams several batches and polls for an
+  # unsolicited server ErrorResponse between them via the RecvWatch primitive.
+
+  test "copyIn multi-batch valid data: no false early abort":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_mb_ok")
+      discard await conn.exec("CREATE TABLE test_copy_mb_ok (id int, val text)")
+
+      # ~2.1MB of rows -> spans many 256KB batches.
+      let pad = 'x'.repeat(100)
+      var data = ""
+      for i in 0 ..< 20000:
+        data.add($i & "\t" & pad & "\n")
+      doAssert data.len > 5 * 262144
+
+      let tag = await conn.copyIn("COPY test_copy_mb_ok FROM STDIN", data)
+      doAssert "COPY 20000" in tag
+      doAssert conn.state == csReady
+
+      let res = await conn.query("SELECT count(*) FROM test_copy_mb_ok")
+      doAssert res.rows[0].getStr(0) == "20000"
+
+      discard await conn.exec("DROP TABLE test_copy_mb_ok")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyIn multi-batch early server error surfaces and recovers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_mb_err")
+      discard await conn.exec("CREATE TABLE test_copy_mb_err (id int, val text)")
+
+      # The second row carries a non-integer id: the server aborts the COPY very
+      # early, while the client is still streaming the remaining ~2MB.
+      let pad = 'x'.repeat(100)
+      var data = "0\t" & pad & "\n"
+      data.add("not_an_int\t" & pad & "\n")
+      for i in 2 ..< 20000:
+        data.add($i & "\t" & pad & "\n")
+      doAssert data.len > 5 * 262144
+
+      var raised = false
+      try:
+        discard await conn.copyIn("COPY test_copy_mb_err FROM STDIN", data)
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      # Connection is still usable and the failed COPY inserted nothing.
+      let res = await conn.query("SELECT count(*) FROM test_copy_mb_err")
+      doAssert res.rows[0].getStr(0) == "0"
+
+      discard await conn.exec("DROP TABLE test_copy_mb_err")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream multi-batch early server error surfaces and recovers":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyin_mb_err")
+      discard await conn.exec("CREATE TABLE test_copyin_mb_err (id int, val text)")
+
+      let pad = 'x'.repeat(100)
+      var idx = 0
+      let cb = makeCopyInCallback:
+        if idx < 20000:
+          let row =
+            if idx == 1:
+              ("not_an_int\t" & pad & "\n").toBytes()
+            else:
+              ($idx & "\t" & pad & "\n").toBytes()
+          inc idx
+          row
+        else:
+          newSeq[byte]()
+
+      var raised = false
+      try:
+        discard await conn.copyInStream("COPY test_copyin_mb_err FROM STDIN", cb)
+      except PgError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      let res = await conn.query("SELECT count(*) FROM test_copyin_mb_err")
+      doAssert res.rows[0].getStr(0) == "0"
+
+      discard await conn.exec("DROP TABLE test_copyin_mb_err")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: COPY IN openArray[byte]":
   test "copyIn with openArray[byte] inserts rows":
     proc t() {.async.} =
