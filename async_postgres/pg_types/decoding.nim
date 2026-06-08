@@ -171,6 +171,11 @@ proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: u
   if family == 2:
     if data.len < 8:
       raise newException(PgTypeError, "Binary inet IPv4 data too short: " & $data.len)
+    # Match the text path (parseInetText): reject a netmask wider than the
+    # family allows so a malformed wire value surfaces as PgTypeError rather
+    # than a plausible-but-wrong mask. ``bits`` is uint8, so 0 is implicit.
+    if bits > 32:
+      raise newException(PgTypeError, "Binary inet IPv4 mask out of range: " & $bits)
     var ip = IpAddress(family: IpAddressFamily.IPv4)
     for i in 0 ..< 4:
       ip.address_v4[i] = data[4 + i]
@@ -178,6 +183,8 @@ proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: u
   else:
     if data.len < 20:
       raise newException(PgTypeError, "Binary inet IPv6 data too short: " & $data.len)
+    if bits > 128:
+      raise newException(PgTypeError, "Binary inet IPv6 mask out of range: " & $bits)
     var ip = IpAddress(family: IpAddressFamily.IPv6)
     for i in 0 ..< 16:
       ip.address_v6[i] = data[4 + i]

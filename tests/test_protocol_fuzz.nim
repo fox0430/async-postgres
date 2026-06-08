@@ -353,6 +353,24 @@ suite "Binary type decoders: malformed input":
     expectTypeError:
       discard decodeInetBinary(@[byte 3, 128, 0, 16])
 
+  test "decodeInetBinary rejects out-of-range mask":
+    # IPv4 mask > 32 is invalid (consistent with parseInetText text path).
+    expectTypeError:
+      discard decodeInetBinary(@[byte 2, 33, 0, 4, 192, 168, 0, 1])
+    # IPv6 mask > 128 is invalid.
+    expectTypeError:
+      discard decodeInetBinary(
+        @[byte 3, 129, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+      )
+
+  test "decodeInetBinary accepts boundary masks":
+    let v4 = decodeInetBinary(@[byte 2, 32, 0, 4, 192, 168, 0, 1])
+    check v4.mask == 32'u8
+    let v6 = decodeInetBinary(
+      @[byte 3, 128, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    )
+    check v6.mask == 128'u8
+
   test "decodePointBinary bounds":
     expectTypeError:
       discard decodePointBinary(@[], 0)
