@@ -448,7 +448,7 @@ proc getDomain*[T: distinct](row: Row, col: int): T =
   when distinctBase(T) is string:
     T(row.getStr(col))
   elif distinctBase(T) is int16:
-    T(int16(row.getInt(col)))
+    T(row.getInt16(col))
   elif distinctBase(T) is int32:
     T(row.getInt(col))
   elif distinctBase(T) is int64:
