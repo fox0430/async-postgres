@@ -7333,6 +7333,78 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: execute recovers pre-error cache-miss statements (M-9)":
+    # A mid-batch error must not orphan the server-side prepared statements of
+    # cache-miss ops that completed before the failure. They are recovered into
+    # the cache and reused, instead of being re-parsed under a fresh name.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      doAssert conn.stmtCache.len == 0
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT $1::int4", @[toPgParam(7'i32)]) # miss, succeeds
+      p.addQuery("SELECT 1 / $1::int4", @[toPgParam(0'i32)]) # miss, Execute fails
+      var state = ""
+      try:
+        discard await p.execute()
+      except PgQueryError as e:
+        state = e.sqlState
+      doAssert state == "22012" # division_by_zero
+
+      # Succeeded-before-error op is cached; the failing op is not.
+      doAssert conn.stmtCache.hasKey("SELECT $1::int4")
+      doAssert not conn.stmtCache.hasKey("SELECT 1 / $1::int4")
+
+      # Reuse: a fresh pipeline with the same SQL is a cache hit and adds no new
+      # entry (with the bug it was a miss -> a new entry and a leaked _sc_N).
+      let cacheLen = conn.stmtCache.len
+      let p2 = newPipeline(conn)
+      p2.addQuery("SELECT $1::int4", @[toPgParam(9'i32)])
+      let r2 = await p2.execute()
+      doAssert r2[0].queryResult.rows[0].getStr(0) == "9"
+      doAssert conn.stmtCache.len == cacheLen
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: execute evicts only the failing op's cached statement (M-9)":
+    # On a cache-invalidating error (0A000), only the op that actually failed
+    # is evicted — an unrelated cache hit in the same batch is kept — and the
+    # evicted (still-live) statement gets a Close queued so it is not orphaned.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.query("DROP TABLE IF EXISTS t_m9_evict")
+      discard await conn.query("CREATE TABLE t_m9_evict(a int4)")
+      discard await conn.query("INSERT INTO t_m9_evict VALUES (1)")
+
+      # Prime the cache: one unrelated stmt, one whose plan DDL will invalidate.
+      discard await conn.query("SELECT 12345::int4")
+      discard await conn.query("SELECT * FROM t_m9_evict")
+      doAssert conn.stmtCache.hasKey("SELECT 12345::int4")
+      doAssert conn.stmtCache.hasKey("SELECT * FROM t_m9_evict")
+
+      discard await conn.query("ALTER TABLE t_m9_evict ADD COLUMN b int4")
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT 12345::int4") # cache hit, succeeds (op 0)
+      p.addQuery("SELECT * FROM t_m9_evict") # cache hit, fails 0A000 (op 1)
+      var state = ""
+      try:
+        discard await p.execute()
+      except PgQueryError as e:
+        state = e.sqlState
+      doAssert state == "0A000" # cached plan must not change result type
+
+      doAssert conn.stmtCache.hasKey("SELECT 12345::int4") # unrelated, kept
+      doAssert not conn.stmtCache.hasKey("SELECT * FROM t_m9_evict") # evicted
+      doAssert conn.pendingStmtCloses.len >= 1 # Close queued for the evicted stmt
+
+      discard await conn.query("DROP TABLE IF EXISTS t_m9_evict")
+      await conn.close()
+
+    waitFor t()
+
   test "pipeline: PgParam raw overload":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
