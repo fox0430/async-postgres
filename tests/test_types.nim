@@ -3908,6 +3908,13 @@ suite "User-defined domain":
     let row: Row = @[some(toBytes("7"))]
     check getDomain[SmallCount](row, 0) == SmallCount(7)
 
+  test "getDomain text format int16 out of range raises PgTypeError":
+    # int32-legal but int16-overflowing text must raise a catchable PgTypeError,
+    # not silently wrap (release) or escape as a RangeDefect (debug).
+    let row: Row = @[some(toBytes("40000"))]
+    expect PgTypeError:
+      discard getDomain[SmallCount](row, 0)
+
   test "getDomain text format int32":
     let row: Row = @[some(toBytes("42"))]
     check getDomain[PositiveInt](row, 0) == PositiveInt(42)
