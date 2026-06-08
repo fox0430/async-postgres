@@ -6,6 +6,27 @@ import std/[options]
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ./core
 
+proc pollCopyInError(
+    conn: PgConnection, watch: RecvWatch
+): Future[ref PgQueryError] {.async.} =
+  ## Non-blocking check, between COPY IN batches, for an unsolicited server
+  ## ErrorResponse aborting the COPY (constraint violation, disk full, …).
+  ##
+  ## Returns the error — in which case `watch` has been consumed and the caller
+  ## must drain to ReadyForQuery and raise — or `nil`, leaving `watch` armed to
+  ## keep watching. A transport failure on the background read is re-raised.
+  ## Only ever parses after the in-flight read has settled, so it never reads
+  ## the read's uninitialised buffer tail.
+  if not watch.ready:
+    return nil
+  await watch.take()
+  while (let opt = conn.nextMessage(); opt.isSome):
+    if opt.get.kind == bmkErrorResponse:
+      return newPgQueryError(opt.get.errorFields)
+  # Only a partial / non-error message buffered so far — resume watching.
+  watch.rearm(conn)
+  return nil
+
 proc copyInRawImpl*(
     conn: PgConnection, sql: string, data: seq[byte], timeout: Duration = ZeroDuration
 ): Future[string] {.async.} =
@@ -36,21 +57,41 @@ proc copyInRawImpl*(
           discard
       await conn.fillRecvBuf(timeout)
 
-  # Send CopyData in batches, slicing from the input buffer
+  # Send CopyData in batches, slicing from the input buffer, while watching for
+  # an early server ErrorResponse so a doomed COPY stops streaming instead of
+  # blindly sending the whole input and only learning of the failure after
+  # CopyDone.
   const maxPayload = copyBatchSize - 5 # leave room for CopyData header
   conn.sendBuf.setLen(0)
+  let watch = conn.startRecvWatch()
   var offset = 0
-  while offset < data.len:
-    let endIdx = min(offset + maxPayload - 1, data.len - 1)
-    encodeCopyData(conn.sendBuf, data.toOpenArray(offset, endIdx))
-    offset = endIdx + 1
-    if conn.sendBuf.len >= copyBatchSize:
+  try:
+    while offset < data.len:
+      let endIdx = min(offset + maxPayload - 1, data.len - 1)
+      encodeCopyData(conn.sendBuf, data.toOpenArray(offset, endIdx))
+      offset = endIdx + 1
+      if conn.sendBuf.len >= copyBatchSize:
+        await conn.sendBufMsg()
+        conn.sendBuf.setLen(0)
+        queryError = await conn.pollCopyInError(watch)
+        if queryError != nil:
+          conn.sendBuf.setLen(0)
+          break
+    if queryError == nil:
+      # Flush remaining data + CopyDone in one send
+      conn.sendBuf.addCopyDone()
       await conn.sendBufMsg()
       conn.sendBuf.setLen(0)
-  # Flush remaining data + CopyDone in one send
-  conn.sendBuf.addCopyDone()
-  await conn.sendBufMsg()
-  conn.sendBuf.setLen(0)
+  except CatchableError as e:
+    watch.cancel()
+    raise e
+
+  # Settle the in-flight watch read before parsing: on normal completion it
+  # carries the CommandComplete/ReadyForQuery response; on an early error it was
+  # already consumed (`watch.pending` is false) and the remaining bytes drain
+  # via fillRecvBuf.
+  if watch.pending:
+    await watch.take()
 
   # Wait for CommandComplete + ReadyForQuery
   block recvLoop2:
@@ -79,6 +120,10 @@ proc copyIn*(
 ): Future[CommandResult] {.async.} =
   ## Execute COPY ... FROM STDIN with a single contiguous ``seq[byte]``.
   ## Avoids the copy that the ``openArray[byte]`` overload performs.
+  ##
+  ## A server-side abort (constraint violation, disk full, …) is detected
+  ## between batches, so a doomed COPY stops streaming early and raises the
+  ## server's ``PgQueryError`` instead of sending the whole input first.
   var tag: string
   withConnTracing(
     conn,
@@ -173,10 +218,13 @@ proc copyInStreamImpl*(
           discard
       await conn.fillRecvBuf(timeout)
 
-  # Pull data from callback and send as CopyData in batches
+  # Pull data from the callback and send as CopyData in batches, watching for an
+  # early server ErrorResponse so a doomed COPY stops pulling/streaming instead
+  # of draining the whole callback and only failing after CopyDone.
   const batchThreshold = copyBatchSize
   var callbackError: ref CatchableError = nil
   conn.sendBuf.setLen(0)
+  let watch = conn.startRecvWatch()
   try:
     while true:
       let chunk = await callback()
@@ -186,13 +234,42 @@ proc copyInStreamImpl*(
       if conn.sendBuf.len >= batchThreshold:
         await conn.sendBufMsg()
         conn.sendBuf.setLen(0)
+        queryError = await conn.pollCopyInError(watch)
+        if queryError != nil:
+          break
   except CatchableError as e:
     callbackError = e
 
-  if callbackError != nil:
+  if queryError != nil:
+    # Server aborted the COPY mid-stream (already detected; watch consumed). In
+    # the simple-query protocol the backend has left copy-in mode and will emit
+    # ReadyForQuery, so neither CopyDone nor CopyFail is needed — drain and raise.
+    conn.sendBuf.setLen(0)
+    block drainErr:
+      while true:
+        while (let opt = conn.nextMessage(); opt.isSome):
+          let msg = opt.get
+          case msg.kind
+          of bmkReadyForQuery:
+            conn.txStatus = msg.txStatus
+            conn.state = csReady
+            break drainErr
+          else:
+            discard
+        await conn.fillRecvBuf(timeout)
+    raise queryError
+  elif callbackError != nil:
     # Callback raised: flush pending data is pointless, send CopyFail
     conn.sendBuf.setLen(0)
-    await conn.sendMsg(encodeCopyFail(callbackError.msg))
+    try:
+      await conn.sendMsg(encodeCopyFail(callbackError.msg))
+    except CatchableError as e:
+      # Transport is gone; abandon the watch read and surface the failure.
+      watch.cancel()
+      raise e
+    # Fold the in-flight watch read to receive the CopyFail response, then drain.
+    if watch.pending:
+      await watch.take()
     block drainLoop:
       while true:
         while (let opt = conn.nextMessage(); opt.isSome):
@@ -211,6 +288,10 @@ proc copyInStreamImpl*(
     conn.sendBuf.addCopyDone()
     await conn.sendBufMsg()
     conn.sendBuf.setLen(0)
+
+  # Settle the in-flight watch read (normal completion) before parsing.
+  if watch.pending:
+    await watch.take()
 
   # Wait for CommandComplete + ReadyForQuery
   block recvLoop2:
@@ -244,6 +325,13 @@ proc copyInStream*(
   ## from ``callback``. The callback is called repeatedly; returning an empty
   ## ``seq[byte]`` signals EOF. If the callback raises, CopyFail is sent and
   ## the connection returns to csReady.
+  ##
+  ## If the server aborts the COPY (constraint violation, disk full, …) while
+  ## the client is still streaming, the error is detected between batches and
+  ## the COPY stops pulling from ``callback`` instead of draining it in full;
+  ## the server's ``PgQueryError`` is then raised. Detection is best-effort —
+  ## an error arriving mid-batch only surfaces after the current batch — so a
+  ## doomed COPY is bounded by one batch of extra streaming, not the whole input.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   var info: CopyInInfo
   withConnTracing(
