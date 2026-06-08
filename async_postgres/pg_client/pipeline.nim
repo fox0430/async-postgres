@@ -5,7 +5,7 @@
 import std/[options, tables]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ./core
+import core
 
 type
   PipelineOpKind* = enum
@@ -358,6 +358,28 @@ proc executeImpl(
     else:
       results[i] = PipelineResult(kind: prkExec)
 
+  template addCacheMissOp(i: int) =
+    ## Add op `i`'s freshly-Parsed prepared statement to the cache. Shared by the
+    ## success path (all ops) and the error path (only ops before the failure),
+    ## so a mid-batch error cannot orphan the statements of ops that completed
+    ## before it. Skips ops superseded by a later same-SQL op (already Closed in
+    ## buildSendPhase).
+    if p.ops[i].cacheMiss and not p.ops[i].cacheSuperseded:
+      let fields =
+        if cachedFieldsPerOp.len > 0:
+          cachedFieldsPerOp[i]
+        else:
+          @[]
+      let paramOids =
+        if cachedParamOidsPerOp.len > 0:
+          cachedParamOidsPerOp[i]
+        else:
+          @[]
+      conn.addStmtCache(
+        p.ops[i].sql,
+        CachedStmt(name: p.ops[i].stmtName, fields: fields, paramOids: paramOids),
+      )
+
   try:
     block recvLoop:
       while true:
@@ -455,35 +477,33 @@ proc executeImpl(
             conn.txStatus = msg.txStatus
             conn.state = csReady
             if queryError != nil:
-              # Invalidate cache for 26000 (statement gone) / 0A000 (cached
-              # plan result type changed after DDL) — see
+              # The batch ran as one implicit transaction that aborted, but
+              # prepared statements created by Parse survive the rollback (they
+              # are session state, not transactional data). Every op before the
+              # failing one (activeOpIdx) was fully Parse/Describe/Execute'd, so
+              # its server statement still exists — recover each cache-miss into
+              # the cache instead of orphaning it. The failing op and everything
+              # after it were skipped by the server until Sync, so leave them
+              # alone (the failing op's stmt may never have been Parsed).
+              for i in 0 ..< activeOpIdx:
+                addCacheMissOp(i)
+              # Invalidate only the *failing* op's cache entry for 26000
+              # (statement gone) / 0A000 (cached plan result type changed after
+              # DDL) — not every cache hit in the batch. Ride a server-side
+              # Close along on the next operation so a still-live statement
+              # (0A000) is reclaimed instead of leaked; Close of an already-gone
+              # statement (26000) is a harmless no-op. See
               # StmtCacheInvalidatingStates.
-              if queryError.sqlState in StmtCacheInvalidatingStates:
-                for i in 0 ..< p.ops.len:
-                  if p.ops[i].cacheHit:
-                    conn.removeStmtCache(p.ops[i].sql)
+              if queryError.sqlState in StmtCacheInvalidatingStates and
+                  activeOpIdx < p.ops.len and p.ops[activeOpIdx].cacheHit:
+                conn.pendingStmtCloses.add(p.ops[activeOpIdx].stmtName)
+                conn.removeStmtCache(p.ops[activeOpIdx].sql)
               raise queryError
             # Cache misses: add to cache (skip ops superseded by a later
             # same-SQL op in this same pipeline — those stmts were already
             # Closed in buildSendPhase).
             for i in 0 ..< p.ops.len:
-              if p.ops[i].cacheMiss and not p.ops[i].cacheSuperseded:
-                let fields =
-                  if cachedFieldsPerOp.len > 0:
-                    cachedFieldsPerOp[i]
-                  else:
-                    @[]
-                let paramOids =
-                  if cachedParamOidsPerOp.len > 0:
-                    cachedParamOidsPerOp[i]
-                  else:
-                    @[]
-                conn.addStmtCache(
-                  p.ops[i].sql,
-                  CachedStmt(
-                    name: p.ops[i].stmtName, fields: fields, paramOids: paramOids
-                  ),
-                )
+              addCacheMissOp(i)
             break recvLoop
           else:
             discard
