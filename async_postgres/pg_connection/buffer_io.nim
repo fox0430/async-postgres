@@ -443,8 +443,9 @@ proc socketHasFin*(conn: PgConnection): bool =
   ## Returns `true` when the kernel has already observed a peer-side FIN/RST
   ## on this connection's underlying socket. Returns `false` when the socket
   ## is alive and idle, when there is pending data (which the next operation
-  ## will handle), or when there is no transport handle to probe (e.g. mock
-  ## connections, or after `close`).
+  ## will handle), when the probe hits transient kernel resource exhaustion
+  ## (`ENOMEM`/`ENOBUFS`, which says nothing about peer state), or when there
+  ## is no transport handle to probe (e.g. mock connections, or after `close`).
   ##
   ## A single `recv(MSG_PEEK | MSG_DONTWAIT)` syscall — no round trip. For
   ## TLS connections this still detects TCP-level FIN/RST, but not TLS-layer
@@ -473,6 +474,12 @@ proc socketHasFin*(conn: PgConnection): bool =
         return false
       if err == EINTR:
         continue
+      if err == ENOMEM or err == ENOBUFS:
+        # Transient kernel resource exhaustion, not a peer-side FIN/RST. Treat
+        # the connection as still alive so a momentary memory/buffer shortage
+        # doesn't condemn (and force a reconnect of) a live socket; a genuine
+        # close still surfaces on the next real read.
+        return false
       return true
   else:
     false
