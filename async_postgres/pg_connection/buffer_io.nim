@@ -135,23 +135,29 @@ proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: []
   let notif = Notification(
     pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
   )
+  # A positive `notifyMaxQueue` caps the pull-API queue and drops the oldest
+  # notifications on overflow. `<= 0` means an unbounded queue (libpq/psycopg
+  # convention, mirroring Python's `queue.Queue(maxsize<=0)`): never drop, just
+  # accumulate until `waitNotification` drains it. The queue is enqueued and the
+  # pull-API waiter completed unconditionally, so `waitNotification` works for
+  # every `notifyMaxQueue`; only the overflow bookkeeping is gated on a cap.
+  var droppedNow = 0
   if conn.notifyMaxQueue > 0:
-    var droppedNow = 0
     while conn.notifyQueue.len >= conn.notifyMaxQueue:
       discard conn.notifyQueue.popFirst()
       if conn.notifyDropped < high(int):
         conn.notifyDropped.inc
       droppedNow.inc
-    conn.notifyQueue.addLast(notif)
-    if droppedNow > 0 and conn.notifyOverflowCallback != nil:
-      conn.notifyOverflowCallback(droppedNow)
-    if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-      # asyncdispatch's `Future.complete` has inferred effect `Exception`
-      # via the callback chain; swallow it to keep this proc `raises: []`.
-      try:
-        conn.notifyWaiter.complete()
-      except Exception:
-        discard
+  conn.notifyQueue.addLast(notif)
+  if droppedNow > 0 and conn.notifyOverflowCallback != nil:
+    conn.notifyOverflowCallback(droppedNow)
+  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+    # asyncdispatch's `Future.complete` has inferred effect `Exception`
+    # via the callback chain; swallow it to keep this proc `raises: []`.
+    try:
+      conn.notifyWaiter.complete()
+    except Exception:
+      discard
   if conn.notifyCallback != nil:
     conn.notifyCallback(notif)
 

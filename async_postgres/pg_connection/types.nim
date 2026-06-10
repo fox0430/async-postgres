@@ -206,6 +206,12 @@ type
     config*: ConnConfig
     notifyQueue*: Deque[Notification]
     notifyMaxQueue*: int
+      ## Pull-API (`waitNotification`) queue cap. Default 1024. A positive value
+      ## bounds the queue and drops the oldest notifications on overflow
+      ## (tracked via `notifyDropped`). `0` or negative means unbounded — the
+      ## queue grows until drained, matching libpq/psycopg and Python's
+      ## `queue.Queue(maxsize<=0)`. The push API (`onNotify`) is unaffected by
+      ## this setting and always fires.
     notifyWaiter*: Future[void]
     sendBuf*: seq[byte] ## Reusable send buffer for COPY IN batching
     notifyDropped*: int ## Count of notifications dropped due to queue overflow

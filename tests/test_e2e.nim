@@ -4566,6 +4566,60 @@ suite "E2E: Notification Buffering":
 
     waitFor t()
 
+  test "notifyMaxQueue <= 0 means an unbounded queue (no drops)":
+    proc t() {.async.} =
+      let listener = await connect(plainConfig())
+      let sender = await connect(plainConfig())
+
+      listener.notifyMaxQueue = 0 # unbounded
+      await listener.listen("buf_unbounded")
+
+      for i in 1 .. 20:
+        await sender.notify("buf_unbounded", $i)
+      await sleepAsync(milliseconds(300))
+
+      # All retained in order, nothing dropped despite exceeding any small cap
+      doAssert listener.notifyQueue.len == 20
+      doAssert listener.notifyDropped == 0
+      let n = await listener.waitNotification()
+      doAssert n.payload == "1"
+
+      await listener.unlisten("buf_unbounded")
+      await listener.close()
+      await sender.close()
+
+    waitFor t()
+
+  test "notifyMaxQueue == 0 still wakes a pending waitNotification":
+    # Regression: with notifyMaxQueue == 0 the queue and waiter were gated
+    # behind `> 0`, so waitNotification blocked forever even as notifications
+    # arrived. Unbounded must still enqueue and complete the waiter.
+    proc t() {.async.} =
+      let listener = await connect(plainConfig())
+      let sender = await connect(plainConfig())
+
+      listener.notifyMaxQueue = 0 # unbounded
+      await listener.listen("buf_unbounded_wait")
+
+      # Start waiting before any notification exists: exercises the
+      # notifyWaiter.complete() path, not the fast queue-hit path.
+      let waitFut = listener.waitNotification()
+      await sleepAsync(milliseconds(50))
+      doAssert not waitFut.finished
+
+      await sender.notify("buf_unbounded_wait", "woke")
+      await sleepAsync(milliseconds(200))
+
+      doAssert waitFut.finished
+      let n = await waitFut
+      doAssert n.payload == "woke"
+
+      await listener.unlisten("buf_unbounded_wait")
+      await listener.close()
+      await sender.close()
+
+    waitFor t()
+
   test "notifyOverflowCallback fires on drop":
     proc t() {.async.} =
       let listener = await connect(plainConfig())
