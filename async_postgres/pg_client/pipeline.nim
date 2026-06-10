@@ -317,9 +317,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   if not perOpSync:
     conn.sendBuf.addSync()
 
-proc executeImpl(
-    p: Pipeline, timeout: Duration = ZeroDuration
-): Future[seq[PipelineResult]] {.async.} =
+proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
   let conn = p.conn
   conn.checkReady()
   conn.state = csBusy
@@ -507,7 +505,7 @@ proc executeImpl(
             break recvLoop
           else:
             discard
-        await conn.fillRecvBuf(timeout)
+        await conn.fillRecvBuf()
 
     when hasChronos:
       # Normal path: drain sendFut to propagate any stored write error.
@@ -551,19 +549,17 @@ proc execute*(
     ):
       if timeout > ZeroDuration:
         try:
-          results = await executeImpl(p, timeout).wait(timeout)
+          results = await executeImpl(p).wait(timeout)
         except AsyncTimeoutError:
           p.conn.invalidateOnTimeout("Pipeline execute timed out")
       else:
-        results = await executeImpl(p, timeout)
+        results = await executeImpl(p)
   finally:
     if p.autoReset:
       p.reset()
   return results
 
-proc executeIsolatedImpl(
-    p: Pipeline, timeout: Duration = ZeroDuration
-): Future[IsolatedPipelineResults] {.async.} =
+proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.} =
   ## Execute pipeline ops with per-query SYNC for error isolation.
   ## Each op gets its own ReadyForQuery; a failed op does not abort others.
   let conn = p.conn
@@ -699,7 +695,7 @@ proc executeIsolatedImpl(
               break opRecv
             else:
               discard
-          await conn.fillRecvBuf(timeout)
+          await conn.fillRecvBuf()
 
     when hasChronos:
       # Normal path: drain sendFut to propagate any stored write error.
@@ -745,11 +741,11 @@ proc executeIsolated*(
     ):
       if timeout > ZeroDuration:
         try:
-          ir = await executeIsolatedImpl(p, timeout).wait(timeout)
+          ir = await executeIsolatedImpl(p).wait(timeout)
         except AsyncTimeoutError:
           p.conn.invalidateOnTimeout("Pipeline executeIsolated timed out")
       else:
-        ir = await executeIsolatedImpl(p, timeout)
+        ir = await executeIsolatedImpl(p)
   finally:
     if p.autoReset:
       p.reset()

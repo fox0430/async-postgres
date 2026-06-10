@@ -16,7 +16,6 @@ proc queryDirectRunImpl*(
     cacheMiss: bool,
     stmtName: string,
     cachedFields: seq[FieldDescription],
-    timeout: Duration,
 ): Future[QueryResult] {.async.} =
   ## Inner send + receive loop for queryDirect. Pulled out so the outer Impl
   ## can wrap the returned Future with ``.wait(timeout)`` without paying for
@@ -27,7 +26,7 @@ proc queryDirectRunImpl*(
   var cf = cachedFields
   queryRecvLoop(
     conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cf, colFmts, colOids,
-    result, timeout,
+    result,
   )
 
 proc queryDirectImpl*(
@@ -58,7 +57,7 @@ proc queryDirectImpl*(
       try:
         result = await queryDirectRunImpl(
           conn, sql, resultFormats, colFmts, colOids, cacheHit, cacheMiss, stmtName,
-          cachedFields, timeout,
+          cachedFields,
         )
           .wait(timeout)
       except AsyncTimeoutError:
@@ -66,7 +65,7 @@ proc queryDirectImpl*(
     else:
       result = await queryDirectRunImpl(
         conn, sql, resultFormats, colFmts, colOids, cacheHit, cacheMiss, stmtName,
-        cachedFields, ZeroDuration,
+        cachedFields,
       )
 
 proc buildInvalidateOnOidMismatchStmt(
@@ -477,19 +476,14 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     )
 
 proc execDirectRunImpl*(
-    conn: PgConnection,
-    sql: string,
-    cacheHit: bool,
-    cacheMiss: bool,
-    stmtName: string,
-    timeout: Duration,
+    conn: PgConnection, sql: string, cacheHit: bool, cacheMiss: bool, stmtName: string
 ): Future[string] {.async.} =
   ## Inner send + receive loop for execDirect. Returns the command tag and
   ## handles error reporting / cache bookkeeping. Split out so the outer
   ## Impl can apply ``.wait(timeout)`` without an extra closure alloc.
   await conn.sendBufMsg()
   var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
   return commandTag
 
 proc execDirectImpl*(
@@ -514,13 +508,13 @@ proc execDirectImpl*(
   ):
     if timeout > ZeroDuration:
       try:
-        tag = await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName, timeout)
-          .wait(timeout)
+        tag = await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName).wait(
+          timeout
+        )
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("execDirect timed out")
     else:
-      tag =
-        await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName, ZeroDuration)
+      tag = await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName)
   return initCommandResult(tag)
 
 macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =

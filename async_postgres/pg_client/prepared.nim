@@ -26,7 +26,7 @@ proc columnIndex*(stmt: PreparedStatement, name: string): int =
   stmt.fields.columnIndex(name)
 
 proc prepareImpl*(
-    conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
+    conn: PgConnection, name: string, sql: string
 ): Future[PreparedStatement] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -63,7 +63,7 @@ proc prepareImpl*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return stmt
 
@@ -83,7 +83,7 @@ proc prepare*(
   ):
     if timeout > ZeroDuration:
       try:
-        stmt = await prepareImpl(conn, name, sql, timeout).wait(timeout)
+        stmt = await prepareImpl(conn, name, sql).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("Prepare timed out")
     else:
@@ -91,10 +91,7 @@ proc prepare*(
   return stmt
 
 proc executeImpl*(
-    stmt: PreparedStatement,
-    params: seq[PgParam] = @[],
-    resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
+    stmt: PreparedStatement, params: seq[PgParam] = @[], resultFormats: seq[int16] = @[]
 ): Future[QueryResult] {.async.} =
   let conn = stmt.conn
 
@@ -160,7 +157,7 @@ proc executeImpl*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return qr
 
@@ -189,16 +186,14 @@ proc execute*(
     let resultFormats = resultFormat.toFormatCodes()
     if timeout > ZeroDuration:
       try:
-        qr = await executeImpl(stmt, params, resultFormats, timeout).wait(timeout)
+        qr = await executeImpl(stmt, params, resultFormats).wait(timeout)
       except AsyncTimeoutError:
         stmt.conn.invalidateOnTimeout("Execute timed out")
     else:
       qr = await executeImpl(stmt, params, resultFormats)
   return qr
 
-proc closeImpl*(
-    stmt: PreparedStatement, timeout: Duration = ZeroDuration
-): Future[void] {.async.} =
+proc closeImpl*(stmt: PreparedStatement): Future[void] {.async.} =
   let conn = stmt.conn
 
   conn.checkReady()
@@ -228,7 +223,7 @@ proc closeImpl*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
 proc close*(
     stmt: PreparedStatement, timeout: Duration = ZeroDuration
@@ -237,7 +232,7 @@ proc close*(
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if timeout > ZeroDuration:
     try:
-      await closeImpl(stmt, timeout).wait(timeout)
+      await closeImpl(stmt).wait(timeout)
     except AsyncTimeoutError:
       stmt.conn.invalidateOnTimeout("Statement close timed out")
   else:
