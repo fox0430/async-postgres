@@ -14,7 +14,6 @@ proc queryImpl*(
     paramOids: seq[int32],
     paramFormats: seq[int16],
     resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -55,7 +54,7 @@ proc queryImpl*(
   var qr = QueryResult()
   queryRecvLoop(
     conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr, timeout,
+    cachedColFmts, cachedColOids, qr,
   )
   return qr
 
@@ -64,7 +63,6 @@ proc queryImpl*(
     sql: string,
     params: seq[PgParam] = @[],
     resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -98,7 +96,7 @@ proc queryImpl*(
   var qr = QueryResult()
   queryRecvLoop(
     conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr, timeout,
+    cachedColFmts, cachedColOids, qr,
   )
   return qr
 
@@ -108,7 +106,6 @@ proc queryEachImpl*(
     params: seq[PgParam] = @[],
     callback: RowCallback,
     resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -142,7 +139,7 @@ proc queryEachImpl*(
   var rowCount: int64 = 0
   queryEachRecvLoop(
     conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, callback, rowCount, timeout,
+    cachedColFmts, cachedColOids, callback, rowCount,
   )
   return rowCount
 
@@ -174,8 +171,8 @@ proc queryEach*(
     let resultFormats = resultFormat.toFormatCodes()
     if timeout > ZeroDuration:
       try:
-        count = await queryEachImpl(conn, sql, params, callback, resultFormats, timeout)
-          .wait(timeout)
+        count =
+          await queryEachImpl(conn, sql, params, callback, resultFormats).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("queryEach timed out")
     else:
@@ -209,7 +206,7 @@ proc query*(
     let resultFormats = resultFormat.toFormatCodes()
     if timeout > ZeroDuration:
       try:
-        qr = await queryImpl(conn, sql, params, resultFormats, timeout).wait(timeout)
+        qr = await queryImpl(conn, sql, params, resultFormats).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("Query timed out")
     else:
@@ -224,7 +221,6 @@ proc queryInlineImpl*(
     paramOids: seq[int32],
     paramFormats: seq[int16],
     resultFormats: seq[int16] = @[],
-    timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -260,7 +256,7 @@ proc queryInlineImpl*(
   var qr = QueryResult()
   queryRecvLoop(
     conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr, timeout,
+    cachedColFmts, cachedColOids, qr,
   )
   return qr
 
@@ -288,7 +284,7 @@ proc query*(
     if timeout > ZeroDuration:
       try:
         qr = await queryInlineImpl(
-          conn, sql, data, ranges, oids, formats, resultFormats, timeout
+          conn, sql, data, ranges, oids, formats, resultFormats
         )
           .wait(timeout)
       except AsyncTimeoutError:

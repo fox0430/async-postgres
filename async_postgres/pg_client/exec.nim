@@ -12,7 +12,6 @@ proc execImpl*(
     params: seq[Option[seq[byte]]],
     paramOids: seq[int32],
     paramFormats: seq[int16],
-    timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -41,14 +40,11 @@ proc execImpl*(
   await conn.sendBufMsg()
 
   var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
   return commandTag
 
 proc execImpl*(
-    conn: PgConnection,
-    sql: string,
-    params: seq[PgParam] = @[],
-    timeout: Duration = ZeroDuration,
+    conn: PgConnection, sql: string, params: seq[PgParam] = @[]
 ): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -71,7 +67,7 @@ proc execImpl*(
   await conn.sendBufMsg()
 
   var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
   return commandTag
 
 proc exec*(
@@ -100,7 +96,7 @@ proc exec*(
   ):
     if timeout > ZeroDuration:
       try:
-        tag = await execImpl(conn, sql, params, timeout).wait(timeout)
+        tag = await execImpl(conn, sql, params).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("Exec timed out")
     else:
@@ -114,7 +110,6 @@ proc execInlineImpl*(
     ranges: seq[tuple[off: int32, len: int32]],
     paramOids: seq[int32],
     paramFormats: seq[int16],
-    timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -137,7 +132,7 @@ proc execInlineImpl*(
   await conn.sendBufMsg()
 
   var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, timeout)
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
   return commandTag
 
 proc exec*(
@@ -161,9 +156,7 @@ proc exec*(
   ):
     if timeout > ZeroDuration:
       try:
-        tag = await execInlineImpl(conn, sql, data, ranges, oids, formats, timeout).wait(
-          timeout
-        )
+        tag = await execInlineImpl(conn, sql, data, ranges, oids, formats).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("Exec timed out")
     else:

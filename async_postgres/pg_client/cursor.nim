@@ -29,7 +29,6 @@ proc openCursorImpl(
     paramFormats: seq[int16],
     resultFormats: seq[int16],
     chunkSize: int32,
-    timeout: Duration = ZeroDuration,
 ): Future[Cursor] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -89,7 +88,7 @@ proc openCursorImpl(
                   break drainLoop
                 else:
                   discard
-              await conn.fillRecvBuf(timeout)
+              await conn.fillRecvBuf()
           break recvLoop
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
@@ -102,17 +101,15 @@ proc openCursorImpl(
                   conn.txStatus = ropt.get.txStatus
                   conn.state = csReady
                   break errDrain
-              await conn.fillRecvBuf(timeout)
+              await conn.fillRecvBuf()
           raise queryError
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return cursor
 
-proc fetchNextImpl(
-    cursor: Cursor, timeout: Duration = ZeroDuration
-): Future[seq[Row]] {.async.} =
+proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
   let rd = newRowData(int16(cursor.fields.len))
   rd.fields = cursor.fields
@@ -151,7 +148,7 @@ proc fetchNextImpl(
                   break drainLoop
                 else:
                   discard
-              await conn.fillRecvBuf(timeout)
+              await conn.fillRecvBuf()
           break recvLoop
         of bmkErrorResponse:
           let queryError = newPgQueryError(msg.errorFields)
@@ -163,11 +160,11 @@ proc fetchNextImpl(
                   conn.txStatus = ropt.get.txStatus
                   conn.state = csReady
                   break errDrain
-              await conn.fillRecvBuf(timeout)
+              await conn.fillRecvBuf()
           raise queryError
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   result = newSeq[Row](rowCount)
   for i in 0 ..< rowCount:
@@ -190,15 +187,13 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
 
   if cursor.timeout > ZeroDuration:
     try:
-      return await fetchNextImpl(cursor, cursor.timeout).wait(cursor.timeout)
+      return await fetchNextImpl(cursor).wait(cursor.timeout)
     except AsyncTimeoutError:
       cursor.conn.invalidateOnTimeout("Cursor fetch timed out")
   else:
     return await fetchNextImpl(cursor)
 
-proc closeCursorImpl(
-    cursor: Cursor, timeout: Duration = ZeroDuration
-): Future[void] {.async.} =
+proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
   if cursor.exhausted:
     return
 
@@ -228,7 +223,7 @@ proc closeCursorImpl(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   cursor.exhausted = true
 
@@ -237,7 +232,7 @@ proc close*(cursor: Cursor): Future[void] {.async.} =
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   if cursor.timeout > ZeroDuration:
     try:
-      await closeCursorImpl(cursor, cursor.timeout).wait(cursor.timeout)
+      await closeCursorImpl(cursor).wait(cursor.timeout)
     except AsyncTimeoutError:
       cursor.conn.invalidateOnTimeout("Cursor close timed out")
   else:
@@ -274,7 +269,7 @@ proc openCursor*(
   if timeout > ZeroDuration:
     try:
       result = await openCursorImpl(
-        conn, sql, values, oids, formats, resultFormats, chunkSize, timeout
+        conn, sql, values, oids, formats, resultFormats, chunkSize
       )
         .wait(timeout)
     except AsyncTimeoutError:

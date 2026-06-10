@@ -14,7 +14,6 @@ proc execInTransactionImpl(
     params: seq[Option[seq[byte]]],
     paramOids: seq[int32],
     paramFormats: seq[int16],
-    timeout: Duration = ZeroDuration,
 ): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -75,7 +74,7 @@ proc execInTransactionImpl(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return userCommandTag
 
@@ -100,15 +99,12 @@ proc execInTransaction*(
     let (oids, formats, values) = extractParams(params)
     if timeout > ZeroDuration:
       try:
-        tag = await execInTransactionImpl(
-          conn, "BEGIN", sql, values, oids, formats, timeout
-        )
+        tag = await execInTransactionImpl(conn, "BEGIN", sql, values, oids, formats)
           .wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("execInTransaction timed out")
     else:
-      tag =
-        await execInTransactionImpl(conn, "BEGIN", sql, values, oids, formats, timeout)
+      tag = await execInTransactionImpl(conn, "BEGIN", sql, values, oids, formats)
   return initCommandResult(tag)
 
 proc execInTransaction*(
@@ -132,15 +128,12 @@ proc execInTransaction*(
     let beginSql = buildBeginSql(opts)
     if timeout > ZeroDuration:
       try:
-        tag = await execInTransactionImpl(
-          conn, beginSql, sql, values, oids, formats, timeout
-        )
+        tag = await execInTransactionImpl(conn, beginSql, sql, values, oids, formats)
           .wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("execInTransaction timed out")
     else:
-      tag =
-        await execInTransactionImpl(conn, beginSql, sql, values, oids, formats, timeout)
+      tag = await execInTransactionImpl(conn, beginSql, sql, values, oids, formats)
   return initCommandResult(tag)
 
 proc queryInTransactionImpl(
@@ -151,7 +144,6 @@ proc queryInTransactionImpl(
     paramOids: seq[int32],
     paramFormats: seq[int16],
     resultFormats: seq[int16],
-    timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -217,7 +209,7 @@ proc queryInTransactionImpl(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return qr
 
@@ -245,14 +237,14 @@ proc queryInTransaction*(
     if timeout > ZeroDuration:
       try:
         qr = await queryInTransactionImpl(
-          conn, "BEGIN", sql, values, oids, formats, resultFormats, timeout
+          conn, "BEGIN", sql, values, oids, formats, resultFormats
         )
           .wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("queryInTransaction timed out")
     else:
       qr = await queryInTransactionImpl(
-        conn, "BEGIN", sql, values, oids, formats, resultFormats, timeout
+        conn, "BEGIN", sql, values, oids, formats, resultFormats
       )
   return qr
 
@@ -280,13 +272,13 @@ proc queryInTransaction*(
     if timeout > ZeroDuration:
       try:
         qr = await queryInTransactionImpl(
-          conn, beginSql, sql, values, oids, formats, resultFormats, timeout
+          conn, beginSql, sql, values, oids, formats, resultFormats
         )
           .wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("queryInTransaction timed out")
     else:
       qr = await queryInTransactionImpl(
-        conn, beginSql, sql, values, oids, formats, resultFormats, timeout
+        conn, beginSql, sql, values, oids, formats, resultFormats
       )
   return qr
