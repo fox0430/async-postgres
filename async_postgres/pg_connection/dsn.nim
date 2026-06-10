@@ -392,6 +392,14 @@ proc parseUriDsn*(dsn: string): ConnConfig =
       else:
         let cpos = part.rfind(':')
         if cpos >= 0:
+          # A bare host:port has exactly one ':'. More than one means an
+          # unbracketed IPv6 literal (e.g. ::1), which is ambiguous in a URI
+          # authority — RFC 3986 requires IPv6 literals to be bracketed.
+          # Reject it instead of silently splitting host=":" port="1".
+          if part.find(':') != cpos:
+            raise newException(
+              PgError, "IPv6 address in DSN must be bracketed, e.g. [::1]:5432: " & part
+            )
           hostParts.add part[0 ..< cpos]
           portParts.add part[cpos + 1 .. ^1]
         else:
