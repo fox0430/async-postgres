@@ -74,6 +74,10 @@ proc execInTransactionImpl(
             if msg.txStatus == tsInFailedTransaction:
               try:
                 discard await conn.simpleExec("ROLLBACK")
+              except CancelledError as e:
+                # Don't swallow cancellation (e.g. the outer wait(timeout)
+                # cancelling this future under chronos) — propagate it.
+                raise e
               except CatchableError:
                 discard
             raise queryError
@@ -214,6 +218,10 @@ proc queryInTransactionImpl(
             if msg.txStatus == tsInFailedTransaction:
               try:
                 discard await conn.simpleExec("ROLLBACK")
+              except CancelledError as e:
+                # Don't swallow cancellation (e.g. the outer wait(timeout)
+                # cancelling this future under chronos) — propagate it.
+                raise e
               except CatchableError:
                 discard
             raise queryError
