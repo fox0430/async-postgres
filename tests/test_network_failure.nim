@@ -114,6 +114,70 @@ when hasAsyncDispatch:
       check timedOut
       check serverSawClose
 
+# Per-host connect timeout (multi-host failover)
+
+suite "Network failure: per-host connect timeout":
+  test "a hung first host fails over to a healthy second host":
+    ## `connectTimeout` is applied per host (libpq semantics): a host that
+    ## accepts TCP but never answers the startup message consumes only its own
+    ## timeout budget, after which failover reaches the next, healthy host.
+    ## A summed budget would let the first host exhaust it and the second host
+    ## would never be tried.
+    var connected = false
+
+    proc testBody() {.async.} =
+      let slow = startMockServer() # accepts TCP but stalls the handshake
+      let fast = startMockServer() # completes the handshake promptly
+
+      proc slowHandler() {.async.} =
+        let st = await slow.accept()
+        try:
+          await drainStartupMessage(st)
+          # Answer only well after the per-host timeout has fired and failover
+          # has moved on. Under asyncdispatch the abandoned attempt then
+          # completes and its orphan-close path tears this connection down;
+          # under chronos the attempt was already cancelled.
+          await sleepMsAsync(300)
+          await sendFullHandshake(st)
+          while true:
+            discard await readN(st, 1).wait(seconds(5))
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      proc fastHandler() {.async.} =
+        let st = await acceptAndReady(fast)
+        try:
+          discard await drainFrontendMessage(st) # Terminate from close()
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let slowFut = slowHandler()
+      let fastFut = fastHandler()
+
+      let cfg = ConnConfig(
+        hosts: @[
+          HostEntry(host: "127.0.0.1", port: slow.port),
+          HostEntry(host: "127.0.0.1", port: fast.port),
+        ],
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+        connectTimeout: milliseconds(100),
+      )
+      let conn = await connect(cfg)
+      connected = conn.isConnected()
+      await conn.close()
+
+      await closeServer(slow)
+      await closeServer(fast)
+      await fastFut
+      await slowFut
+
+    waitFor testBody()
+    check connected
+
 # Malformed / truncated backend messages
 
 suite "Network failure: malformed server messages":
