@@ -7,6 +7,14 @@ import ./core
 
 type PreparedStatement* = object
   ## A server-side prepared statement returned by `prepare`.
+  ##
+  ## Valid only within the server session that prepared it. A session reset
+  ## (``DISCARD ALL`` / ``DEALLOCATE``, or a pooled backend being recycled)
+  ## drops the statement; a later `execute` then raises ``PgQueryError`` with
+  ## SQLSTATE ``26000`` (invalid_sql_statement_name) and the caller must
+  ## `prepare` it again. There is no transparent re-prepare here — that is
+  ## reserved for the auto-prepare statement cache (see the cache path's
+  ## ``StmtCacheInvalidatingStates`` handling in `pg_client/core`).
   conn*: PgConnection
   name*: string
   sql*: string
@@ -163,6 +171,12 @@ proc execute*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a prepared statement with typed parameters.
+  ##
+  ## If the server session has lost the statement (``DISCARD ALL`` /
+  ## ``DEALLOCATE``, or a pooled backend reset), this raises ``PgQueryError``
+  ## with SQLSTATE ``26000``; recover by calling `prepare` again. The error is
+  ## propagated, not retried — unlike the auto-prepare cache, an explicit
+  ## `PreparedStatement` is never re-prepared transparently.
   var qr: QueryResult
   withConnTracing(
     stmt.conn,
