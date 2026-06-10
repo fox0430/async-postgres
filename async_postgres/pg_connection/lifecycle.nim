@@ -456,41 +456,96 @@ proc matchesOrClose(
   await conn.close()
   return false
 
+proc attemptHost(
+    config: ConnConfig, entry: HostEntry, attrs: TargetSessionAttrs
+): Future[PgConnection] {.async.} =
+  ## One per-host connection attempt: dial the host, then (unless `attrs` is
+  ## `tsaAny`) verify the server matches the requested role via `matchesOrClose`.
+  ## Returns the live connection on success, or `nil` if the host connected but
+  ## did not match (`matchesOrClose` has already closed it). Raises on dial,
+  ## handshake, or probe failure.
+  let conn = await connectToHost(config, entry)
+  if attrs == tsaAny or await conn.matchesOrClose(attrs):
+    return conn
+  return nil
+
+proc attemptHostTimed(
+    config: ConnConfig, entry: HostEntry, attrs: TargetSessionAttrs
+): Future[PgConnection] {.async.} =
+  ## `attemptHost` bounded by a *per-host* `connectTimeout`. libpq applies
+  ## connect_timeout to each host separately, so a slow or unreachable host
+  ## consumes at most one timeout before failover moves on — the budget is not
+  ## shared across the whole host list.
+  if config.connectTimeout == default(Duration):
+    return await attemptHost(config, entry, attrs)
+  when hasAsyncDispatch:
+    # asyncdispatch's wait() cannot cancel the attempt: on timeout it keeps
+    # running in the background. If it later produces a live connection nobody
+    # is waiting for it, so close the orphan instead of leaking a socket and a
+    # server slot. (chronos's wait() cancels the attempt, and connectToHost /
+    # matchesOrClose tear down their transports on the way out.)
+    let attempt = attemptHost(config, entry, attrs)
+    try:
+      return await attempt.wait(config.connectTimeout)
+    except AsyncTimeoutError as e:
+      proc closeOrphan() {.async.} =
+        try:
+          let orphan = attempt.read()
+          if orphan != nil:
+            await orphan.close()
+        except CatchableError:
+          discard
+
+      attempt.addCallback(
+        proc() =
+          if attempt.completed():
+            asyncSpawn closeOrphan()
+      )
+      raise e
+  else:
+    return await attemptHost(config, entry, attrs).wait(config.connectTimeout)
+
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Establish a new connection to a PostgreSQL server.
   ## Supports multi-host failover: tries each host in order.
   ## Respects `targetSessionAttrs` to select the appropriate server type.
-  ## The `connectTimeout` wraps the entire multi-host connection attempt.
+  ## `connectTimeout` is applied per host (libpq semantics): each host attempt
+  ## gets its own budget, so the total wait may reach `connectTimeout * hosts`.
   proc perform(): Future[PgConnection] {.async.} =
     let hosts = config.getHosts()
     var errors: seq[string]
+    # With a single host there is no failover. Preserve the contract that its
+    # `connectTimeout` surfaces as a raw `AsyncTimeoutError` (callers and the
+    # pool branch on the type) instead of being folded into the aggregate
+    # `PgConnectionError` below — which only makes sense across multiple hosts.
+    var lastFailure: ref CatchableError
 
     if config.targetSessionAttrs == tsaPreferStandby:
       # First pass: look for a standby
       for entry in hosts:
         try:
-          let conn = await connectToHost(config, entry)
-          if await conn.matchesOrClose(tsaStandby):
+          let conn = await attemptHostTimed(config, entry, tsaStandby)
+          if conn != nil:
             return conn
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
       # Second pass: accept any server
       for entry in hosts:
         try:
-          let conn = await connectToHost(config, entry)
-          return conn
+          return await attemptHostTimed(config, entry, tsaAny)
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
     else:
       for entry in hosts:
         try:
-          let conn = await connectToHost(config, entry)
-          if config.targetSessionAttrs == tsaAny or
-              await conn.matchesOrClose(config.targetSessionAttrs):
+          let conn = await attemptHostTimed(config, entry, config.targetSessionAttrs)
+          if conn != nil:
             return conn
           errors.add(
             entry.displayHost & ":" & $entry.port &
@@ -500,8 +555,11 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
 
+    if hosts.len == 1 and lastFailure != nil and lastFailure of AsyncTimeoutError:
+      raise lastFailure
     raise newException(
       PgConnectionError, "Could not connect to any host: " & errors.join("; ")
     )
@@ -517,34 +575,9 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       TraceConnectEndData,
       TraceConnectEndData(conn: conn),
     ):
-      if config.connectTimeout != default(Duration):
-        when hasAsyncDispatch:
-          # asyncdispatch's wait() cannot cancel the attempt: on timeout,
-          # perform() keeps running in the background (see async_backend.wait).
-          # If it later succeeds, nobody reads the result, so close the
-          # orphaned connection instead of leaking a socket and a server slot.
-          # chronos is unaffected: wait() cancels perform(), and connectToHost
-          # tears down its transport on the way out.
-          let attempt = perform()
-          try:
-            conn = await attempt.wait(config.connectTimeout)
-          except AsyncTimeoutError as e:
-            proc closeOrphan() {.async.} =
-              try:
-                await attempt.read().close()
-              except CatchableError:
-                discard
-
-            attempt.addCallback(
-              proc() =
-                if attempt.completed():
-                  asyncSpawn closeOrphan()
-            )
-            raise e
-        else:
-          conn = await perform().wait(config.connectTimeout)
-      else:
-        conn = await perform()
+      # `connectTimeout` is enforced per host inside `attemptHostTimed`, so
+      # `perform()` is awaited directly here — no outer total-timeout wrapper.
+      conn = await perform()
       conn.tracer = config.tracer
     return conn
 
