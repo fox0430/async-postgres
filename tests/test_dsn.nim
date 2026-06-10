@@ -448,6 +448,16 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://[::1]junk:5433/db")
 
+  test "error: unbracketed IPv6 literal in DSN":
+    # `::1` must be bracketed; without brackets rfind(':') would otherwise
+    # silently mis-split it into host=":" port="1".
+    expect PgError:
+      discard parseDsn("postgresql://user:pass@::1/db")
+
+  test "error: unbracketed IPv6 literal with trailing port in DSN":
+    expect PgError:
+      discard parseDsn("postgresql://user:pass@2001:db8::1:5432/db")
+
   test "target_session_attrs all values":
     check parseDsn("postgresql://h/db?target_session_attrs=any").targetSessionAttrs ==
       tsaAny
