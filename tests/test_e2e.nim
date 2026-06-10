@@ -10300,6 +10300,32 @@ suite "E2E: Logical Replication":
 
     waitFor t()
 
+  test "unsupported pgoutput proto_version raises ValueError":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig())
+
+      let cb = makeReplicationCallback:
+        discard
+
+      var raised = false
+      try:
+        await replConn.startReplication(
+          "no_such_slot", InvalidLsn, options = @{"proto_version": "'2'"}, callback = cb
+        )
+      except ValueError:
+        raised = true
+      doAssert raised, "proto_version other than 1 should raise ValueError"
+
+      # Validation runs before checkReady / state change / wire I/O, so the
+      # connection stays usable and the nonexistent slot is never referenced.
+      doAssert replConn.state == csReady
+      let info = await replConn.identifySystem()
+      doAssert info.systemId.len > 0
+
+      await replConn.close()
+
+    waitFor t()
+
 suite "E2E: Physical Replication":
   test "connectReplication(rmPhysical) + identifySystem":
     proc t() {.async.} =
