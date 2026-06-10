@@ -67,9 +67,15 @@ proc execInTransactionImpl(
           conn.txStatus = msg.txStatus
           conn.state = csReady
           if queryError != nil:
-            # Error occurred: if we're in a failed transaction, send ROLLBACK
+            # Error occurred: if we're in a failed transaction, ROLLBACK to
+            # release it. Swallow any failure so a ROLLBACK error cannot mask
+            # the original query error (which is what the caller needs to see);
+            # the public proc's outer wait(timeout) bounds the cleanup.
             if msg.txStatus == tsInFailedTransaction:
-              discard await conn.simpleExec("ROLLBACK")
+              try:
+                discard await conn.simpleExec("ROLLBACK")
+              except CatchableError:
+                discard
             raise queryError
           break recvLoop
         else:
@@ -203,8 +209,13 @@ proc queryInTransactionImpl(
           conn.txStatus = msg.txStatus
           conn.state = csReady
           if queryError != nil:
+            # ROLLBACK a failed transaction, swallowing any failure so it cannot
+            # mask the query error; the outer wait(timeout) bounds the cleanup.
             if msg.txStatus == tsInFailedTransaction:
-              discard await conn.simpleExec("ROLLBACK")
+              try:
+                discard await conn.simpleExec("ROLLBACK")
+              except CatchableError:
+                discard
             raise queryError
           break recvLoop
         else:
