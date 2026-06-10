@@ -767,6 +767,26 @@ proc startReplication*(
   ## The proc returns when the server sends ``CopyDone`` or the connection closes.
   ## To stop replication from the client side, call ``stopReplication`` from within
   ## the callback (or from a concurrent task).
+  ##
+  ## The bundled ``pgoutput`` decoder (``parsePgOutputMessage`` /
+  ## ``decodePgOutput``) supports protocol version 1 only. Passing a
+  ## ``proto_version`` other than ``1`` in ``options`` raises ``ValueError``,
+  ## because a v2/v3 stream reshapes and adds messages the decoder cannot parse.
+  # The bundled pgoutput decoder implements protocol version 1 only. A v2/v3
+  # stream adds messages and reshapes existing ones (e.g. an xid prefix on
+  # streamed tuples), which parsePgOutputMessage cannot decode. Reject an
+  # unsupported proto_version before touching connection state so the failure is
+  # a plain input error rather than a later mid-stream decode break.
+  for (k, v) in options:
+    if k.cmpIgnoreCase("proto_version") == 0:
+      let pv = v.strip(chars = {'\'', '"', ' ', '\t'})
+      if pv.len > 0 and pv != "1":
+        raise newException(
+          ValueError,
+          "Unsupported pgoutput proto_version " & v &
+            ": the bundled decoder supports proto_version 1 only",
+        )
+
   conn.checkReady()
   conn.state = csBusy
 
