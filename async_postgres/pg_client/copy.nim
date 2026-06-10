@@ -28,7 +28,7 @@ proc pollCopyInError(
   return nil
 
 proc copyInRawImpl*(
-    conn: PgConnection, sql: string, data: seq[byte], timeout: Duration = ZeroDuration
+    conn: PgConnection, sql: string, data: seq[byte]
 ): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -55,7 +55,7 @@ proc copyInRawImpl*(
           return commandTag
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   # Send CopyData in batches, slicing from the input buffer, while watching for
   # an early server ErrorResponse so a doomed COPY stops streaming instead of
@@ -111,7 +111,7 @@ proc copyInRawImpl*(
           break recvLoop2
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return commandTag
 
@@ -135,7 +135,7 @@ proc copyIn*(
   ):
     if timeout > ZeroDuration:
       try:
-        tag = await copyInRawImpl(conn, sql, data, timeout).wait(timeout)
+        tag = await copyInRawImpl(conn, sql, data).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("COPY IN timed out")
     else:
@@ -184,10 +184,7 @@ proc copyIn*(
   copyIn(conn, sql, combined, timeout)
 
 proc copyInStreamImpl*(
-    conn: PgConnection,
-    sql: string,
-    callback: CopyInCallback,
-    timeout: Duration = ZeroDuration,
+    conn: PgConnection, sql: string, callback: CopyInCallback
 ): Future[CopyInInfo] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -216,7 +213,7 @@ proc copyInStreamImpl*(
           return info
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   # Pull data from the callback and send as CopyData in batches, watching for an
   # early server ErrorResponse so a doomed COPY stops pulling/streaming instead
@@ -256,7 +253,7 @@ proc copyInStreamImpl*(
             break drainErr
           else:
             discard
-        await conn.fillRecvBuf(timeout)
+        await conn.fillRecvBuf()
     raise queryError
   elif callbackError != nil:
     # Callback raised: flush pending data is pointless, send CopyFail
@@ -281,7 +278,7 @@ proc copyInStreamImpl*(
             break drainLoop
           else:
             discard
-        await conn.fillRecvBuf(timeout)
+        await conn.fillRecvBuf()
     raise callbackError
   else:
     # Normal completion: flush remaining data + CopyDone in one send
@@ -311,7 +308,7 @@ proc copyInStreamImpl*(
           break recvLoop2
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return info
 
@@ -344,16 +341,14 @@ proc copyInStream*(
   ):
     if timeout > ZeroDuration:
       try:
-        info = await copyInStreamImpl(conn, sql, callback, timeout).wait(timeout)
+        info = await copyInStreamImpl(conn, sql, callback).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("COPY IN stream timed out")
     else:
       info = await copyInStreamImpl(conn, sql, callback)
   return info
 
-proc copyOutImpl*(
-    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
-): Future[CopyResult] {.async.} =
+proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
   conn.checkReady()
   conn.state = csBusy
   await conn.sendMsg(encodeQuery(sql))
@@ -385,7 +380,7 @@ proc copyOutImpl*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return cr
 
@@ -406,7 +401,7 @@ proc copyOut*(
   ):
     if timeout > ZeroDuration:
       try:
-        cr = await copyOutImpl(conn, sql, timeout).wait(timeout)
+        cr = await copyOutImpl(conn, sql).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("COPY OUT timed out")
     else:
@@ -414,10 +409,7 @@ proc copyOut*(
   return cr
 
 proc copyOutStreamImpl*(
-    conn: PgConnection,
-    sql: string,
-    callback: CopyOutCallback,
-    timeout: Duration = ZeroDuration,
+    conn: PgConnection, sql: string, callback: CopyOutCallback
 ): Future[CopyOutInfo] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -450,7 +442,7 @@ proc copyOutStreamImpl*(
                     break drainLoop
                   else:
                     discard
-                await conn.fillRecvBuf(timeout)
+                await conn.fillRecvBuf()
             raise e
         of bmkCopyDone:
           discard
@@ -466,7 +458,7 @@ proc copyOutStreamImpl*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return info
 
@@ -500,7 +492,7 @@ proc copyOutStream*(
   ):
     if timeout > ZeroDuration:
       try:
-        info = await copyOutStreamImpl(conn, sql, callback, timeout).wait(timeout)
+        info = await copyOutStreamImpl(conn, sql, callback).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("COPY OUT stream timed out")
     else:

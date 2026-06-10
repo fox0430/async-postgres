@@ -76,7 +76,7 @@ proc quoteIdentifier*(s: string): string =
 # Simple Query Protocol entry points
 
 proc simpleQueryImpl*(
-    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
+    conn: PgConnection, sql: string
 ): Future[seq[QueryResult]] {.async.} =
   conn.checkReady()
   conn.state = csBusy
@@ -114,13 +114,11 @@ proc simpleQueryImpl*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
   return results
 
-proc simpleExecImpl*(
-    conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
-): Future[string] {.async.} =
+proc simpleExecImpl*(conn: PgConnection, sql: string): Future[string] {.async.} =
   conn.checkReady()
   conn.state = csBusy
   await conn.sendMsg(encodeQuery(sql))
@@ -145,7 +143,7 @@ proc simpleExecImpl*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
   return commandTag
 
 # Cancellation (out-of-band CancelRequest over a separate socket)
@@ -258,7 +256,7 @@ proc simpleExec*(
   ):
     if timeout > ZeroDuration:
       try:
-        tag = await simpleExecImpl(conn, sql, timeout).wait(timeout)
+        tag = await simpleExecImpl(conn, sql).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("simpleExec timed out")
     else:
@@ -297,7 +295,7 @@ proc simpleQuery*(
   ):
     if timeout > ZeroDuration:
       try:
-        results = await simpleQueryImpl(conn, sql, timeout).wait(timeout)
+        results = await simpleQueryImpl(conn, sql).wait(timeout)
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("simpleQuery timed out")
     else:
@@ -342,7 +340,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
             break recvLoop
           else:
             discard
-        await conn.fillRecvBuf(timeout)
+        await conn.fillRecvBuf()
 
   if timeout > ZeroDuration:
     proc withTimeout(): Future[void] {.async.} =

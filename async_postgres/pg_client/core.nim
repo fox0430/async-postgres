@@ -404,7 +404,6 @@ template queryRecvLoop*(
     cachedColFmts: seq[int16],
     cachedColOids: seq[int32],
     qr: var QueryResult,
-    timeout: Duration = ZeroDuration,
 ) =
   var queryError: ref PgQueryError
   var cachedParamOids: seq[int32]
@@ -474,7 +473,7 @@ template queryRecvLoop*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
 template queryEachRecvLoop*(
     conn: PgConnection,
@@ -487,7 +486,6 @@ template queryEachRecvLoop*(
     cachedColOids: seq[int32],
     callback: RowCallback,
     rowCount: var int64,
-    timeout: Duration = ZeroDuration,
 ) =
   var queryError: ref PgQueryError
   var rd: RowData
@@ -597,7 +595,7 @@ template queryEachRecvLoop*(
         else:
           discard
         conn.recvBufStart = pos
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
 
 template execRecvLoop*(
     conn: PgConnection,
@@ -605,7 +603,6 @@ template execRecvLoop*(
     cacheHit, cacheMiss: bool,
     stmtName: string,
     commandTag: var string,
-    timeout: Duration = ZeroDuration,
 ) =
   ## Receive-loop counterpart of `queryRecvLoop` for the extended-query exec
   ## path: discards `DataRow`s (exec callers don't need rows) and exposes only
@@ -655,4 +652,4 @@ template execRecvLoop*(
           break recvLoop
         else:
           discard
-      await conn.fillRecvBuf(timeout)
+      await conn.fillRecvBuf()
