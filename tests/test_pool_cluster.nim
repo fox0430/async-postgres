@@ -340,6 +340,43 @@ suite "Fallback":
 
     replicaFut.complete(mockConn())
 
+  when hasAsyncDispatch:
+    test "abandoned replica acquire returns its late connection to the pool":
+      # asyncdispatch `wait()` cannot cancel the inner replica acquire: it
+      # keeps running after `fallbackTimeout` and a later release hands its
+      # connection to the abandoned waiter. `drainAbandonedAcquire` must
+      # return that connection to the pool instead of leaking the `active`
+      # slot. (Under chronos the acquire is cancelled outright and cleans up
+      # its own accounting in acquireImpl, so this scenario cannot arise.)
+      let cluster =
+        makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(50))
+      # Saturate the replica so acquireRead queues a waiter and times out.
+      cluster.replica.active = cluster.replica.config.maxSize
+      cluster.replica.config.acquireTimeout = seconds(30)
+
+      let primaryConn = mockConn()
+      cluster.primary.idle.addLast(
+        PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+      )
+
+      let (acquired, pool) = waitFor acquireRead(cluster)
+      check acquired == primaryConn
+      check pool == cluster.primary
+      check cluster.replica.waiterCount == 1
+
+      # A borrower releases a connection: the FIFO handoff serves the
+      # abandoned waiter, whose acquire nobody awaits anymore.
+      let lateConn = mockConn(pool = cluster.replica)
+      lateConn.release()
+
+      # Let the abandoned acquire complete and the drain release the conn.
+      waitFor sleepMsAsync(100)
+
+      check cluster.replica.waiterCount == 0
+      check cluster.replica.active == cluster.replica.config.maxSize - 1
+      check cluster.replica.idle.len == 1
+      check cluster.replica.idle.peekFirst().conn == lateConn
+
   test "onReadFallback fires with rfrReplicaClosed when replica is closed":
     var fired = 0
     var seenReason: ReadFallbackReason
