@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       matrix:
@@ -68,14 +68,23 @@ jobs:
       - name: Generate test certificates
         run: bash tests/gen_certs.sh
 
+      # macOS runners have no Docker, so PostgreSQL is only available on Linux.
       - name: Start PostgreSQL
+        if: runner.os == 'Linux'
         run: docker compose up -d --wait
 
       - name: Install chronos
         run: nimble install chronos -y
 
+      # Linux runs the full suite against the live PostgreSQL above.
       - name: Run tests
+        if: runner.os == 'Linux'
         run: nimble test -y
+
+      # macOS has no PostgreSQL; run only the unit and mock-server tests.
+      - name: Run unit tests
+        if: runner.os != 'Linux'
+        run: nimble test_unit -y
 
       - name: Install async_postgres
         run: |
@@ -88,6 +97,8 @@ jobs:
       - name: Compile examples (chronos)
         run: for f in examples/*.nim; do nim c -d:asyncBackend=chronos "$f"; done
 
+      # Doc generation is platform-independent; run it once (on Linux).
       - name: Gen docs
+        if: runner.os == 'Linux'
         run: |
           nim doc --project --index:on --outdir:./htmldocs ./async_postgres.nim

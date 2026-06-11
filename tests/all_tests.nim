@@ -1,8 +1,6 @@
+## Full test suite: the unit/mock tests plus the live-PostgreSQL integration
+## tests. Requires a running PostgreSQL (see docker-compose.yml). For a run
+## that needs no database, use all_tests_unit.nim instead.
 {.push warning[UnusedImport]: off.}
-import
-  test_abandonment_e2e, test_advisory_lock, test_auth, test_cancel_e2e, test_dsn,
-  test_e2e, test_fill_recvbuf, test_keepalive, test_largeobject, test_listen_reconnect,
-  test_network_failure, test_physical_replication, test_pool, test_protocol,
-  test_protocol_fuzz, test_replication, test_replication_keepalive, test_rowdata,
-  test_session_attrs, test_sql, test_ssl, test_tracing, test_types, test_pool_cluster
+import all_tests_unit, all_tests_integration
 {.pop.}
