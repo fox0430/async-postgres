@@ -624,6 +624,70 @@ suite "newPgQueryError":
       caughtAsPgError = true
     check caughtAsPgError
 
+  test "raw fields are preserved and accessible":
+    let fields = @[
+      ErrorField(code: 'S', value: "ERROR"),
+      ErrorField(code: 'C', value: "23505"),
+      ErrorField(
+        code: 'M',
+        value: "duplicate key value violates unique constraint \"users_email_key\"",
+      ),
+      ErrorField(code: 's', value: "public"),
+      ErrorField(code: 't', value: "users"),
+      ErrorField(code: 'n', value: "users_email_key"),
+      ErrorField(code: 'R', value: "_bt_check_unique"),
+    ]
+    let err = newPgQueryError(fields)
+    check err.fields == fields
+    check err.schemaName == "public"
+    check err.tableName == "users"
+    check err.constraintName == "users_email_key"
+    check err.columnName == ""
+    check err.dataTypeName == ""
+    check err.where == ""
+    check err.errorField('R') == "_bt_check_unique"
+    check err.errorField('X') == ""
+
+  test "position accessors":
+    let fields = @[
+      ErrorField(code: 'S', value: "ERROR"),
+      ErrorField(code: 'C', value: "42601"),
+      ErrorField(code: 'M', value: "syntax error at or near \"FORM\""),
+      ErrorField(code: 'P', value: "15"),
+    ]
+    let err = newPgQueryError(fields)
+    check err.position == 15
+    check err.internalPosition == 0
+    check err.internalQuery == ""
+
+  test "position defaults to 0 when absent or malformed":
+    let absent = newPgQueryError(@[ErrorField(code: 'C', value: "42601")])
+    check absent.position == 0
+    let malformed = newPgQueryError(
+      @[ErrorField(code: 'C', value: "42601"), ErrorField(code: 'P', value: "abc")]
+    )
+    check malformed.position == 0
+
+  test "SQLSTATE predicates":
+    proc errWithState(state: string): ref PgQueryError =
+      newPgQueryError(
+        @[ErrorField(code: 'S', value: "ERROR"), ErrorField(code: 'C', value: state)]
+      )
+
+    check errWithState(SqlStateUniqueViolation).isUniqueViolation
+    check errWithState("23505").isIntegrityConstraintViolation
+    check errWithState(SqlStateForeignKeyViolation).isForeignKeyViolation
+    check errWithState(SqlStateNotNullViolation).isNotNullViolation
+    check errWithState(SqlStateCheckViolation).isCheckViolation
+    check errWithState(SqlStateExclusionViolation).isExclusionViolation
+    check errWithState(SqlStateExclusionViolation).isIntegrityConstraintViolation
+    check errWithState(SqlStateSerializationFailure).isSerializationFailure
+    check errWithState(SqlStateDeadlockDetected).isDeadlockDetected
+    check errWithState(SqlStateQueryCanceled).isQueryCanceled
+    check not errWithState("42P01").isUniqueViolation
+    check not errWithState("42P01").isIntegrityConstraintViolation
+    check not errWithState("").isIntegrityConstraintViolation
+
 suite "Utility":
   test "formatError":
     let fields = @[

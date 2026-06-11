@@ -7,6 +7,11 @@
 ## and re-establish the connection.
 
 type
+  ErrorField* = object
+    ## A single field from an ErrorResponse or NoticeResponse message.
+    code*: char
+    value*: string
+
   PgError* = object of CatchableError
     ## General PostgreSQL error. Base type for all pg-specific errors.
 
@@ -29,10 +34,18 @@ type
 
   PgQueryError* = object of PgError
     ## SQL execution errors from the server (ErrorResponse).
+    ##
+    ## The most common fields are stored directly; everything else the server
+    ## sent (schema/table/column/constraint name, error position, …) is kept
+    ## verbatim in ``fields`` and exposed through accessors such as
+    ## ``constraintName`` and ``position``.
     sqlState*: string ## 5-char SQLSTATE code (e.g. "42P01"), empty if unavailable.
     severity*: string ## e.g. "ERROR", "FATAL"
     detail*: string ## DETAIL field, empty if not present.
     hint*: string ## HINT field, empty if not present.
+    fields*: seq[ErrorField]
+      ## All raw ErrorResponse fields as sent by the server, including any
+      ## not covered by the named accessors below.
 
   PgTimeoutError* = object of PgError ## Operation timed out.
 
@@ -49,3 +62,103 @@ type
     ## with no channels left to re-subscribe).
     reconnectionAttempted*: bool
       ## True if the pump attempted reconnection before giving up.
+
+const
+  # Commonly dispatched-on SQLSTATE codes
+  SqlStateNotNullViolation* = "23502"
+  SqlStateForeignKeyViolation* = "23503"
+  SqlStateUniqueViolation* = "23505"
+  SqlStateCheckViolation* = "23514"
+  SqlStateExclusionViolation* = "23P01"
+  SqlStateSerializationFailure* = "40001"
+  SqlStateDeadlockDetected* = "40P01"
+  SqlStateSyntaxError* = "42601"
+  SqlStateUndefinedTable* = "42P01"
+  SqlStateQueryCanceled* = "57014"
+
+func getErrorField*(fields: seq[ErrorField], code: char): string =
+  ## Get the value of an error field by its single-char code (e.g. 'M' for message).
+  for f in fields:
+    if f.code == code:
+      return f.value
+
+# PgQueryError field accessors. Field codes are defined by the wire protocol
+# All return "" (or 0 for positions) when the server did not send the field.
+
+func errorField*(e: ref PgQueryError, code: char): string =
+  ## Raw ErrorResponse field by single-char code, "" if not present.
+  getErrorField(e.fields, code)
+
+func schemaName*(e: ref PgQueryError): string =
+  ## Schema containing the object the error refers to.
+  getErrorField(e.fields, 's')
+
+func tableName*(e: ref PgQueryError): string =
+  ## Table the error refers to.
+  getErrorField(e.fields, 't')
+
+func columnName*(e: ref PgQueryError): string =
+  ## Column the error refers to.
+  getErrorField(e.fields, 'c')
+
+func dataTypeName*(e: ref PgQueryError): string =
+  ## Data type the error refers to.
+  getErrorField(e.fields, 'd')
+
+func constraintName*(e: ref PgQueryError): string =
+  ## Constraint the error refers to (e.g. the violated unique index).
+  getErrorField(e.fields, 'n')
+
+func where*(e: ref PgQueryError): string =
+  ## Context call stack (PL/pgSQL traceback etc.).
+  getErrorField(e.fields, 'W')
+
+func internalQuery*(e: ref PgQueryError): string =
+  ## Text of the internally-generated query that failed (e.g. inside a function).
+  getErrorField(e.fields, 'q')
+
+func parsePosition(v: string): int =
+  # Server sends a 1-based decimal character index; 0 means "not present".
+  for c in v:
+    if c < '0' or c > '9':
+      return 0
+    result = result * 10 + (ord(c) - ord('0'))
+
+func position*(e: ref PgQueryError): int =
+  ## 1-based character index into the original query where the error occurred,
+  ## 0 if the server did not report a position.
+  parsePosition(getErrorField(e.fields, 'P'))
+
+func internalPosition*(e: ref PgQueryError): int =
+  ## Like ``position`` but for ``internalQuery``, 0 if not reported.
+  parsePosition(getErrorField(e.fields, 'p'))
+
+# SQLSTATE predicates
+
+func isUniqueViolation*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateUniqueViolation
+
+func isForeignKeyViolation*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateForeignKeyViolation
+
+func isNotNullViolation*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateNotNullViolation
+
+func isCheckViolation*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateCheckViolation
+
+func isExclusionViolation*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateExclusionViolation
+
+func isIntegrityConstraintViolation*(e: ref PgQueryError): bool =
+  ## Any SQLSTATE in class 23 (integrity constraint violation).
+  e.sqlState.len == 5 and e.sqlState[0] == '2' and e.sqlState[1] == '3'
+
+func isSerializationFailure*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateSerializationFailure
+
+func isDeadlockDetected*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateDeadlockDetected
+
+func isQueryCanceled*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateQueryCanceled

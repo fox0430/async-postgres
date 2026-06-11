@@ -52,7 +52,9 @@ type
       ## `std/random` global RNG; to de-correlate retries *across processes*
       ## the application must call ``randomize()`` once at startup — otherwise
       ## every process replays the same (default-seeded) jitter sequence.
-    retryableStates*: seq[string] = @["40001", "40P01"]
+    retryableStates*: seq[string] = @[
+      SqlStateSerializationFailure, SqlStateDeadlockDetected
+    ]
       ## SQLSTATE codes that trigger a retry. Defaults to serialization_failure
       ## (40001) and deadlock_detected (40P01) — the transaction-level conflicts
       ## PostgreSQL recommends resolving by re-running the whole transaction.
