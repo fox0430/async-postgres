@@ -134,6 +134,23 @@ proc fireReadFallback(
   if cluster.onReadFallback != nil:
     cluster.onReadFallback(reason, err)
 
+proc drainAbandonedAcquire(acquireFut: Future[PgConnection]) {.async.} =
+  ## Reclaim the connection from a pool acquire abandoned by `fallbackTimeout`.
+  ##
+  ## Under asyncdispatch, `wait()` cannot cancel the inner `acquire()`: it
+  ## keeps running after the timeout and may later complete with a connection
+  ## nobody awaits, permanently leaking the pool's `active` slot (repeated
+  ## fallbacks would drain the replica pool and silently route every read to
+  ## the primary). Awaiting its eventual completion returns that late
+  ## connection to its pool. Under chronos, `wait()` cancels the acquire and
+  ## the pool cleans up its own accounting (see `acquireImpl`), so this
+  ## resolves immediately without a connection.
+  try:
+    let conn = await acquireFut
+    conn.release()
+  except CatchableError:
+    discard # a failed/cancelled acquire cleans up its own pool accounting
+
 proc acquireRead(
     cluster: PgPoolCluster
 ): Future[tuple[conn: PgConnection, pool: PgPool]] {.async.} =
@@ -153,18 +170,23 @@ proc acquireRead(
   # a saturated replica does not burn its full acquireTimeout before failover.
   var replicaErr: ref CatchableError
   var timedOut = false
-  try:
-    if cluster.fallbackTimeout > ZeroDuration:
-      let conn = await cluster.replica.acquire().wait(cluster.fallbackTimeout)
+  if cluster.fallbackTimeout > ZeroDuration:
+    let replicaFut = cluster.replica.acquire()
+    try:
+      let conn = await replicaFut.wait(cluster.fallbackTimeout)
       return (conn, cluster.replica)
-    else:
+    except AsyncTimeoutError as e:
+      asyncSpawn drainAbandonedAcquire(replicaFut)
+      replicaErr = e
+      timedOut = true
+    except CatchableError as e:
+      replicaErr = e
+  else:
+    try:
       let conn = await cluster.replica.acquire()
       return (conn, cluster.replica)
-  except AsyncTimeoutError as e:
-    replicaErr = e
-    timedOut = true
-  except CatchableError as e:
-    replicaErr = e
+    except CatchableError as e:
+      replicaErr = e
 
   let reason =
     if timedOut:
@@ -176,10 +198,12 @@ proc acquireRead(
   cluster.fireReadFallback(reason, replicaErr)
 
   if cluster.fallbackTimeout > ZeroDuration:
+    let primaryFut = cluster.primary.acquire()
     try:
-      let conn = await cluster.primary.acquire().wait(cluster.fallbackTimeout)
+      let conn = await primaryFut.wait(cluster.fallbackTimeout)
       return (conn, cluster.primary)
     except AsyncTimeoutError:
+      asyncSpawn drainAbandonedAcquire(primaryFut)
       raise newException(
         PgPoolError,
         "Pool cluster fallback acquire timeout (replica error: " & replicaErr.msg & ")",
