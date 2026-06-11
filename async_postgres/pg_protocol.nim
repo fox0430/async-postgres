@@ -65,11 +65,6 @@ type
     tsIdle = 'I'
     tsInTransaction = 'T'
 
-  ErrorField* = object
-    ## A single field from an ErrorResponse or NoticeResponse message.
-    code*: char
-    value*: string
-
   FieldDescription* = object ## Column metadata from a RowDescription message.
     name*: string
     tableOid*: int32
@@ -1174,13 +1169,6 @@ proc parseBackendMessage*(
   result = ParseResult(state: psComplete, message: msg)
 
 # Utility
-
-proc getErrorField*(fields: seq[ErrorField], code: char): string =
-  ## Get the value of an error field by its single-char code (e.g. 'M' for message).
-  for f in fields:
-    if f.code == code:
-      return f.value
-  return ""
 
 proc formatError*(fields: seq[ErrorField]): string =
   ## Format error fields into a human-readable error message with severity, SQLSTATE, detail, and hint.

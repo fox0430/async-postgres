@@ -585,6 +585,7 @@ proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
     severity: severity,
     detail: detail,
     hint: hint,
+    fields: fields,
   )
 
 # Tracer fire helpers (cross-module use)
