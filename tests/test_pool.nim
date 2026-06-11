@@ -1349,6 +1349,34 @@ when hasChronos:
 
       waitFor t()
 
+    test "external cancel of deadline-path acquire cleans up waiter":
+      # Regression: the deadline branch only handled AsyncTimeoutError, so an
+      # external cancellation (e.g. a caller's wait()-style deadline) left
+      # `waiterCount` permanently inflated — disabling the fast-path guard —
+      # and a later release() would call complete() on the cancelled future,
+      # raising a Defect.
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = seconds(5) # deadline path
+        pool.active = 1
+
+        let fut = pool.acquire()
+        doAssert pool.waiterCount == 1
+
+        await cancelAndWait(fut)
+        doAssert fut.cancelled()
+        doAssert pool.waiterCount == 0
+        doAssert pool.waiters.len == 1 # cancelled entry swept lazily
+
+        # release() must skip the cancelled waiter (no Defect) and park the
+        # conn in idle.
+        pool.release(mockConn())
+        doAssert pool.waiters.len == 0
+        doAssert pool.idle.len == 1
+        doAssert pool.active == 0
+
+      waitFor t()
+
     test "cancelling maintenance task does not disturb pending waiters":
       proc t() {.async.} =
         let pool = makePool(maxSize = 1, minSize = 0)

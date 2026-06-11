@@ -845,6 +845,19 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       if fut.completed():
         fut.read().release()
       raise newException(PgPoolError, "Pool acquire timeout")
+    except CancelledError as e:
+      # External cancellation (e.g. a caller's `wait()`-style deadline such as
+      # pool.withTransactionDeadline or a cluster fallback timeout) can land
+      # here too: `fut.wait()` propagates cancellation into `fut`. Same
+      # cleanup as the no-deadline branch below — mark the waiter so
+      # release()/handoff skips it instead of calling `complete()` on a
+      # finished future (a Defect), and hand back a connection that slipped
+      # in on the same tick.
+      waiter.cancelled = true
+      pool.waiterCount.dec
+      if fut.completed():
+        fut.read().release()
+      raise e
   else:
     try:
       let conn = await fut
