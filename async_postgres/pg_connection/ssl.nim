@@ -13,14 +13,13 @@
 ## Re-exported through `pg_connection.nim`.
 
 import ../[async_backend, pg_errors, pg_protocol]
-import types
+import types, buffer_io
 
 when hasChronos:
   import chronos/streams/tlsstream
   import ../pg_bearssl
 elif hasAsyncDispatch:
   import std/asyncnet
-  import buffer_io
   when defined(ssl):
     import std/[net, openssl, tempfiles, os]
 
@@ -80,16 +79,30 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     )
   let sslReq = encodeSSLRequest()
   var respChar: char
+  var extraBytesBuffered = false
+    ## True when the SSLRequest-reply read pulled in more than the single
+    ## response byte, i.e. the transport had already buffered bytes the server
+    ## should not have sent before the TLS handshake (pre-TLS injection).
 
   when hasChronos:
     discard await conn.transport.write(sslReq)
-    var response: array[1, byte]
-    let n = await conn.transport.readOnce(addr response[0], 1)
+    # Read up to two bytes so a man-in-the-middle who appended plaintext to the
+    # 'S' reply (CVE-2021-23214 family) is caught even when chronos drains the
+    # whole TCP segment into its own transport buffer (where a kernel-level
+    # MSG_PEEK can no longer see it). A compliant server sends exactly one byte
+    # and then waits for our ClientHello, and `readOnce` returns as soon as any
+    # data is available, so this never blocks on a second byte that will not come.
+    var response: array[2, byte]
+    let n = await conn.transport.readOnce(addr response[0], 2)
     if n == 0:
       raise newException(PgConnectionError, "Connection closed during SSL negotiation")
     respChar = char(response[0])
+    extraBytesBuffered = n > 1
   elif hasAsyncDispatch:
     await conn.socket.sendRawBytes(sslReq)
+    # The socket is unbuffered (`newAsyncSocket(buffered = false)`), so `recv(1)`
+    # issues a single recv syscall for at most one byte; any injected bytes stay
+    # in the kernel buffer and are caught by `socketHasPendingData` below.
     let respStr = await conn.socket.recv(1)
     if respStr.len == 0:
       raise newException(PgConnectionError, "Connection closed during SSL negotiation")
@@ -97,6 +110,18 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
 
   case respChar
   of 'S':
+    # Reject pre-TLS byte injection before starting the handshake. A server
+    # that accepts SSL must not send anything between the 'S' reply and the TLS
+    # ClientHello, so bytes already readable here were injected by a
+    # man-in-the-middle to be smuggled ahead of (and possibly mistaken for part
+    # of) the encrypted stream. libpq performs the same check. `extraBytesBuffered`
+    # catches bytes the transport already drained; `socketHasPendingData` catches
+    # bytes still sitting in the kernel buffer.
+    if extraBytesBuffered or conn.socketHasPendingData():
+      raise newException(
+        PgConnectionError,
+        "Received unencrypted data after SSL response (possible man-in-the-middle)",
+      )
     when hasChronos:
       conn.baseReader = newAsyncStreamReader(conn.transport)
       conn.baseWriter = newAsyncStreamWriter(conn.transport)
