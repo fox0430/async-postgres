@@ -14,6 +14,7 @@ privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
 privateAccess(Waiter)
+privateAccess(PendingPoolOp)
 
 proc mockConn(state: PgConnState = csReady, pool: PgPool = nil): PgConnection =
   result = PgConnection(
@@ -253,6 +254,52 @@ suite "computeConnectBackoff":
 
   test "initial already exceeds max returns max":
     check computeConnectBackoff(seconds(120), seconds(60), 1) == seconds(60)
+
+suite "batchTimeout":
+  proc op(timeout: Duration): PendingPoolOp =
+    PendingPoolOp(kind: popExec, timeout: timeout)
+
+  test "empty batch is unlimited":
+    check batchTimeout(@[]) == ZeroDuration
+
+  test "single finite timeout is used as-is":
+    check batchTimeout(@[op(seconds(5))]) == seconds(5)
+
+  test "all finite timeouts take the largest":
+    check batchTimeout(@[op(seconds(2)), op(seconds(5)), op(seconds(3))]) == seconds(5)
+
+  test "an unlimited op makes the whole batch unlimited":
+    # ZeroDuration means "no timeout"; it must win over finite siblings rather
+    # than being treated as the smallest value by max().
+    check batchTimeout(@[op(seconds(5)), op(ZeroDuration), op(seconds(2))]) ==
+      ZeroDuration
+
+  test "leading unlimited op stays unlimited":
+    check batchTimeout(@[op(ZeroDuration), op(seconds(5))]) == ZeroDuration
+
+suite "splitBatchBudget":
+  test "equal classes split the budget evenly":
+    check splitBatchBudget(5, 5, 4) == (2, 2)
+
+  test "budget is shared proportionally to op counts":
+    # finite dominates -> gets the larger share, unlimited still keeps one.
+    check splitBatchBudget(9, 1, 4) == (3, 1)
+    # unlimited dominates -> the reverse.
+    check splitBatchBudget(1, 9, 4) == (1, 3)
+
+  test "each present class gets at least one connection":
+    # A class that would round to zero is floored to one.
+    check splitBatchBudget(1, 100, 8) == (1, 7)
+    check splitBatchBudget(100, 1, 8) == (7, 1)
+
+  test "a cap of one still gives each class one connection":
+    check splitBatchBudget(3, 3, 1) == (1, 1)
+
+  test "the two shares never exceed the budget above a cap of one":
+    for cap in 2 .. 16:
+      let (a, b) = splitBatchBudget(3, 5, cap)
+      check a >= 1 and b >= 1
+      check a + b == cap
 
 suite "Pool release":
   test "release to idle queue":

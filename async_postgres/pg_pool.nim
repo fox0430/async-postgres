@@ -990,16 +990,38 @@ proc failAllPending(pool: PgPool, e: ref CatchableError) {.raises: [].} =
   except Exception:
     discard
 
+proc batchTimeout(batch: seq[PendingPoolOp]): Duration =
+  ## Timeout applied to a pipelined batch, derived from its ops.
+  ##
+  ## `ZeroDuration` means "no timeout". A batch runs as a single pipeline, so if
+  ## any op opted out of a deadline the whole batch must be unlimited —
+  ## otherwise the max() below would clamp that op to a sibling's finite
+  ## timeout. Only when every op has a finite timeout does the batch run under
+  ## the largest of them.
+  result = ZeroDuration
+  for op in batch:
+    if op.timeout == ZeroDuration:
+      return ZeroDuration
+    if op.timeout > result:
+      result = op.timeout
+
+proc splitBatchBudget(
+    finiteLen, unlimitedLen, cap: int
+): tuple[finite, unlimited: int] =
+  ## Divide a connection budget between the two timeout classes of a mixed
+  ## batch. The split is proportional to each class's op count, and every
+  ## present class is guaranteed at least one connection so neither is starved
+  ## behind the other. With `cap == 1` both still get one (total two), which a
+  ## pool that small can spare for the duration of a batch.
+  let total = finiteLen + unlimitedLen
+  let finite = max(1, min(cap - 1, cap * finiteLen div total))
+  result = (finite, max(1, cap - finite))
+
 proc executeBatch(
     pool: PgPool, conn: PgConnection, batch: seq[PendingPoolOp]
 ): Future[void] {.async.} =
   ## Execute a batch of pending operations on a single connection via pipeline.
-  let batchTimeout = block:
-    var t = ZeroDuration
-    for op in batch:
-      if op.timeout > t:
-        t = op.timeout
-    t
+  let timeout = batchTimeout(batch)
   try:
     let pipeline = newPipeline(conn)
     for op in batch:
@@ -1008,7 +1030,7 @@ proc executeBatch(
         pipeline.addExec(op.sql, op.params)
       of popQuery:
         pipeline.addQuery(op.sql, op.params, op.resultFormat)
-    let ir = await pipeline.executeIsolated(batchTimeout)
+    let ir = await pipeline.executeIsolated(timeout)
     for i in 0 ..< batch.len:
       let op = batch[i]
       if ir.errors[i] != nil:
@@ -1030,19 +1052,17 @@ proc executeBatch(
     await pool.resetSession(conn)
     conn.release()
 
-proc dispatchBatchImpl(pool: PgPool) {.async.} =
-  ## Drain the pending ops queue and execute them via pipelined connections.
-  pool.dispatchScheduled = false
-  if pool.pendingOps.len == 0 or pool.closed:
+proc dispatchHomogeneous(
+    pool: PgPool, ops: seq[PendingPoolOp], maxConns: int
+) {.async.} =
+  ## Execute a set of ops that share one timeout class (all finite, or all
+  ## unlimited). A pipeline runs under a single timeout, so a batch must stay
+  ## single-class: mixing a finite op with an unlimited one would force one
+  ## onto the other's deadline (see `batchTimeout`). A lone op skips the
+  ## pipeline; otherwise ops are spread round-robin over up to `maxConns`
+  ## connections and run in parallel.
+  if ops.len == 0:
     return
-
-  # Drain queue (respect maxPipelineSize)
-  var ops: seq[PendingPoolOp]
-  let maxOps = pool.config.maxPipelineSize
-  while pool.pendingOps.len > 0:
-    if maxOps > 0 and ops.len >= maxOps:
-      break
-    ops.add(pool.pendingOps.popFirst())
 
   # Fast path: single op, skip pipeline overhead
   if ops.len == 1:
@@ -1067,10 +1087,9 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
     return
 
   # Multi-op path: acquire connections and distribute.
-  # Limit to at most half the pool to avoid starving other users.
   var conns: seq[PgConnection]
-  let maxConns = min(ops.len, max(1, pool.config.maxSize div 2))
-  for i in 0 ..< maxConns:
+  let nConns = min(ops.len, max(1, maxConns))
+  for i in 0 ..< nConns:
     try:
       let conn = await pool.acquire()
       conns.add(conn)
@@ -1098,6 +1117,46 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
     batchFuts.add(executeBatch(pool, conns[ci], connOps[ci]))
 
   await allFutures(batchFuts)
+
+proc dispatchBatchImpl(pool: PgPool) {.async.} =
+  ## Drain the pending ops queue and execute them via pipelined connections.
+  pool.dispatchScheduled = false
+  if pool.pendingOps.len == 0 or pool.closed:
+    return
+
+  # Drain queue (respect maxPipelineSize)
+  var ops: seq[PendingPoolOp]
+  let maxOps = pool.config.maxPipelineSize
+  while pool.pendingOps.len > 0:
+    if maxOps > 0 and ops.len >= maxOps:
+      break
+    ops.add(pool.pendingOps.popFirst())
+
+  # Segregate finite-timeout ops from unlimited ones. A pipelined batch runs
+  # under a single timeout, so a finite op sharing a batch with an unlimited
+  # sibling would be widened to no deadline at all (see `batchTimeout`).
+  # Running each class as its own batch keeps every op under its own bound.
+  var finiteOps, unlimitedOps: seq[PendingPoolOp]
+  for op in ops:
+    if op.timeout > ZeroDuration:
+      finiteOps.add(op)
+    else:
+      unlimitedOps.add(op)
+
+  # Cap total concurrency at half the pool to avoid starving other users; when
+  # both classes are present, split that budget between them.
+  let cap = max(1, pool.config.maxSize div 2)
+  if finiteOps.len == 0 or unlimitedOps.len == 0:
+    await pool.dispatchHomogeneous(ops, cap)
+  else:
+    let (finiteCap, unlimitedCap) =
+      splitBatchBudget(finiteOps.len, unlimitedOps.len, cap)
+    await allFutures(
+      @[
+        pool.dispatchHomogeneous(finiteOps, finiteCap),
+        pool.dispatchHomogeneous(unlimitedOps, unlimitedCap),
+      ]
+    )
 
 proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
   ## Schedule a batch dispatch on the next event loop tick.
@@ -1140,6 +1199,11 @@ proc exec*(
   ## Execute a statement with typed parameters using a pooled connection.
   ## When `pipelined` is enabled, the operation is batched with other concurrent
   ## calls and sent in a single TCP write.
+  ##
+  ## In pipelined mode a batch runs under a single timeout, so a finite
+  ## `timeout` may be widened to the largest finite timeout among the ops it is
+  ## batched with. An op with no timeout (`ZeroDuration`) is batched separately
+  ## and stays unlimited.
   if pool.config.pipelined:
     if pool.closed:
       raise newException(PgPoolError, "Pool is closed")
@@ -1168,6 +1232,11 @@ proc query*(
   ## Execute a query with typed parameters using a pooled connection.
   ## When `pipelined` is enabled, the operation is batched with other concurrent
   ## calls and sent in a single TCP write.
+  ##
+  ## In pipelined mode a batch runs under a single timeout, so a finite
+  ## `timeout` may be widened to the largest finite timeout among the ops it is
+  ## batched with. An op with no timeout (`ZeroDuration`) is batched separately
+  ## and stays unlimited.
   if pool.config.pipelined:
     if pool.closed:
       raise newException(PgPoolError, "Pool is closed")
