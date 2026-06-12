@@ -323,6 +323,52 @@ suite "SSL negotiation - error handling":
     check raised
     check msgHasUnexpected
 
+suite "SSL negotiation - pre-TLS byte injection":
+  test "residual bytes after 'S' response are rejected (CVE-2021-23214 family)":
+    # A man-in-the-middle appends plaintext to the server's 'S' reply to smuggle
+    # it ahead of the encrypted stream. A compliant server sends only 'S' and
+    # then waits for the client's ClientHello, so any byte already readable here
+    # is injected and the connection must be refused before the TLS handshake.
+    var raised = false
+    var msgMatches = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8) # SSLRequest
+          # 'S' plus injected plaintext, sent as a single segment.
+          await sendBytes(st, @[byte('S'), byte('X'), byte('Y'), byte('Z')])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "unencrypted data" in e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+
 suite "SSL negotiation - sslVerifyCa":
   test "sslVerifyCa raises PgError when server responds N":
     var raised = false
