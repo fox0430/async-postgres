@@ -251,6 +251,25 @@ type
       ## a `PgPool` (or a pool inside `PgPoolCluster`); `nil` for standalone
       ## connections created via `connect`. Used by `release(conn)` to route
       ## the connection back to the correct pool.
+    borrowed*: bool
+      ## Whether this connection is currently checked out from its owning pool.
+      ## Set when `acquire` hands it to a caller (or directly to a queued
+      ## waiter) and cleared when it returns to the pool's idle set or is
+      ## discarded. `release(conn)` uses it to turn a duplicate release of an
+      ## already-returned connection into a no-op (reported via the tracer's
+      ## `onPoolDoubleRelease`) instead of registering the same connection in
+      ## the idle deque twice — which would otherwise hand one connection to
+      ## two borrowers and corrupt their wire protocol. Always false for
+      ## standalone connections created via `connect`.
+      ##
+      ## This guards the common double release — a connection that is already
+      ## sitting idle. It does NOT catch a back-to-back double release whose
+      ## first release served a queued waiter: the handoff re-marks the
+      ## connection `borrowed` for the waiter, so an erroneous second release
+      ## passes the guard and can hand the in-use connection to yet another
+      ## borrower. Raw `acquire` / `release(conn)` callers carry that risk;
+      ## `PooledConnHandle` (its own `released` flag) and the `with*` templates
+      ## are the fully safe paths.
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -347,6 +366,15 @@ type
   TracePoolReleaseEndData* = object ## Data passed to the pool release end hook.
     wasClosed*: bool ## true if connection was closed instead of returned to pool
     handedToWaiter*: bool ## true if connection was given directly to a waiting acquirer
+
+  TracePoolDoubleReleaseData* = object
+    ## Data passed to the pool double-release hook. Fired when `release(conn)`
+    ## is called on a connection that is not currently checked out — a
+    ## duplicate release, or a connection that never came from this pool's
+    ## `acquire`. The release is a no-op (the connection is left untouched), so
+    ## this hook is the only signal that a borrow-site bug double-returned a
+    ## connection.
+    conn*: PgConnection
 
   TracePoolCloseErrorData* = object
     ## Data passed to the pool close-error hook. Fired when a pool-initiated
@@ -481,6 +509,13 @@ type
       proc(data: TracePoolReleaseStartData): TraceContext {.gcsafe, raises: [].}
     onPoolReleaseEnd*:
       proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
+    onPoolDoubleRelease*: proc(data: TracePoolDoubleReleaseData) {.gcsafe, raises: [].}
+      ## Fires when `release(conn)` is called on a connection that is not
+      ## currently checked out (a duplicate release, or a connection not
+      ## borrowed from this pool). Advisory only — the duplicate release is a
+      ## no-op, which is what keeps the same connection from being handed to
+      ## two borrowers. Use this to surface double-`release` bugs at the
+      ## borrow site.
     onPoolCloseError*: proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].}
     onTransportCloseError*:
       proc(data: TraceTransportCloseErrorData) {.gcsafe, raises: [].}

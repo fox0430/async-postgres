@@ -45,11 +45,14 @@ proc toPooled(conn: PgConnection): PooledConn =
   PooledConn(conn: conn, lastUsedAt: Moment.now())
 
 proc release(pool: PgPool, conn: PgConnection) =
-  ## Test-only shim that wires `ownerPool` on throw-away mock connections
-  ## and delegates to the public `conn.release()` API. Production callers
-  ## should use `conn.release()` directly; pool-acquired connections already
-  ## have `ownerPool` set.
+  ## Test-only shim that wires `ownerPool` on throw-away mock connections and
+  ## marks them checked out (mirroring an `acquire`) before delegating to the
+  ## public `conn.release()` API. The `borrowed` flag keeps the release from
+  ## being treated as a no-op double-release. Production callers should use
+  ## `conn.release()` directly; pool-acquired connections already have
+  ## `ownerPool` set and are marked `borrowed` by `acquire`.
   conn.ownerPool = pool
+  conn.borrowed = true
   conn.release()
 
 suite "initConnConfig":
@@ -621,23 +624,28 @@ suite "Pool active count tracking":
 
   test "double release of broken connection does not underflow active":
     let pool = makePool()
-    let conn = mockConn(csClosed)
+    let conn = mockConn(csClosed, pool = pool)
+    conn.borrowed = true
     pool.active = 1
-    pool.release(conn)
+    conn.release()
     check pool.active == 0
-    pool.release(conn)
+    # Second release is a no-op: the connection is no longer checked out.
+    conn.release()
     check pool.active == 0
 
   test "double release of normal connection does not underflow active":
     let pool = makePool()
-    let conn = mockConn()
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
     pool.active = 1
-    pool.release(conn)
+    conn.release()
     check pool.active == 0
     check pool.idle.len == 1
-    # Second release — conn is now in idle, but active is already 0
-    pool.release(conn)
+    # Second release — conn is already idle. It must NOT be registered again,
+    # otherwise two future borrowers would receive the same connection.
+    conn.release()
     check pool.active == 0
+    check pool.idle.len == 1
 
   test "waiter transfer preserves active count":
     let pool = makePool(maxSize = 1)
@@ -650,6 +658,109 @@ suite "Pool active count tracking":
     check pool.active == 1
 
     discard waitFor acquireFut
+    check pool.active == 1
+
+suite "Pool double release":
+  test "borrowed flag toggles across acquire/release roundtrip":
+    let pool = makePool()
+    let conn = mockConn(pool = pool)
+    pool.idle.addLast(toPooled(conn))
+
+    let acquired = waitFor pool.acquire()
+    check acquired == conn
+    check conn.borrowed
+    conn.release()
+    check not conn.borrowed
+    check pool.idle.len == 1
+
+  test "release-to-waiter keeps the connection borrowed":
+    # The connection is handed straight to the next acquirer, so it stays
+    # checked out — the waiter (not the releaser) now owns it.
+    let pool = makePool()
+    pool.active = 1
+    let fut = newFuture[PgConnection]("test.waiter")
+    pool.waiters.addLast(Waiter(fut: fut, cancelled: false))
+    pool.waiterCount = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    conn.release()
+    check fut.finished
+    check fut.read() == conn
+    check conn.borrowed
+
+  test "double release does not register the same conn in idle twice":
+    # Without a borrowed flag the second release re-adds `conn` to the idle
+    # deque, so two subsequent acquires both receive it and corrupt each
+    # other's wire protocol. The second release must be a no-op, leaving a
+    # single idle entry.
+    let pool = makePool(maxSize = 5)
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    pool.active = 1
+    conn.release()
+    check pool.idle.len == 1
+    conn.release()
+    check pool.idle.len == 1
+
+    # The single idle entry is checked out exactly once; idle then drains to
+    # empty rather than yielding a phantom duplicate.
+    let acquired = waitFor pool.acquire()
+    check acquired == conn
+    check pool.idle.len == 0
+
+  test "double release does not hand an idle conn to a queued waiter":
+    let pool = makePool(maxSize = 5)
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    pool.active = 1
+    conn.release()
+    check pool.idle.len == 1
+
+    # Queue a waiter, then double-release the already-idle conn. The no-op
+    # release must not complete the waiter with a connection that is also
+    # sitting in idle (which a fresh acquire could grab in parallel).
+    let fut = newFuture[PgConnection]("test.waiter")
+    pool.waiters.addLast(Waiter(fut: fut, cancelled: false))
+    pool.waiterCount = 1
+    conn.release()
+    check not fut.finished
+    check pool.waiterCount == 1
+    check pool.idle.len == 1
+
+  test "double release notifies the tracer":
+    var doubleReleases = 0
+    var sawConn = true
+    let tracer = PgTracer()
+    tracer.onPoolDoubleRelease = proc(
+        data: TracePoolDoubleReleaseData
+    ) {.gcsafe, raises: [].} =
+      if data.conn == nil:
+        sawConn = false
+      doubleReleases.inc
+
+    let pool = makePool()
+    pool.config.tracer = tracer
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    pool.active = 1
+    conn.release()
+    check doubleReleases == 0
+    conn.release()
+    check doubleReleases == 1
+    # A third release is still a no-op and still observable.
+    conn.release()
+    check doubleReleases == 2
+    check sawConn
+
+  test "release of a never-borrowed connection is a no-op":
+    # A connection that was never checked out (e.g. wired straight into idle by
+    # the maintenance loop) must not be returned again by a stray release.
+    let pool = makePool()
+    let conn = mockConn(pool = pool)
+    check not conn.borrowed
+    pool.active = 1
+    conn.release()
+    check pool.idle.len == 0
     check pool.active == 1
 
 when hasChronos:
