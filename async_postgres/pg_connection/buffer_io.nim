@@ -29,20 +29,30 @@ when defined(posix):
   var TCP_NODELAY* {.importc, header: "<netinet/tcp.h>".}: cint
   var MSG_DONTWAIT* {.importc, header: "<sys/socket.h>".}: cint
 
-type RecvWatch* = ref object
-  ## A single in-flight background socket read used to watch for an unsolicited
-  ## backend message while the client is busy sending.
-  ##
-  ## A `ref` so it can be passed into and mutated by `async` helpers (a `var` of
-  ## a value type cannot be captured across an `await`).
-  ##
-  ## Contract: at most one background read per connection is in flight at a
-  ## time. The read carries no per-read timeout — bound the whole operation with
-  ## an outer `wait`. Before reusing the normal recv path (`fillRecvBuf` /
-  ## `nextMessage` on freshly read bytes) the watch must be settled: either
-  ## consume it via `take` + `await`, or drop it with `cancel` immediately
-  ## before raising.
-  fut: Future[void]
+type
+  RecvWatch* = ref object
+    ## A single in-flight background socket read used to watch for an unsolicited
+    ## backend message while the client is busy sending.
+    ##
+    ## A `ref` so it can be passed into and mutated by `async` helpers (a `var` of
+    ## a value type cannot be captured across an `await`).
+    ##
+    ## Contract: at most one background read per connection is in flight at a
+    ## time. The read carries no per-read timeout — bound the whole operation with
+    ## an outer `wait`. Before reusing the normal recv path (`fillRecvBuf` /
+    ## `nextMessage` on freshly read bytes) the watch must be settled: either
+    ## consume it via `take` + `await`, or drop it with `cancel` immediately
+    ## before raising.
+    fut: Future[void]
+
+  SocketPeek = enum
+    ## Outcome of a single non-blocking `MSG_PEEK` byte probe of a socket.
+    spData ## bytes are readable in the kernel buffer (`recv` > 0)
+    spClosed ## peer has closed: FIN/RST observed (`recv` == 0)
+    spIdle ## socket alive with no data ready (`EAGAIN`/`EWOULDBLOCK`)
+    spTransient ## transient kernel resource exhaustion (`ENOMEM`/`ENOBUFS`)
+    spError ## any other `recv` error
+    spUnavailable ## no transport handle, or probe unsupported (non-POSIX)
 
 # Host / address helpers
 
@@ -443,6 +453,39 @@ proc closeTransport*(conn: PgConnection) {.async.} =
 
 # Liveness probes
 
+proc peekSocket(conn: PgConnection): SocketPeek =
+  ## Single `recv(MSG_PEEK | MSG_DONTWAIT)` byte probe shared by the liveness
+  ## and pre-TLS-injection checks. Classifies the kernel's view of the socket
+  ## without consuming data or blocking; retries on `EINTR`. Callers decide
+  ## what each outcome means (see `socketHasFin` / `socketHasPendingData`).
+  when defined(posix):
+    when hasChronos:
+      if conn.transport.isNil:
+        return spUnavailable
+      let fd = posix.SocketHandle(conn.transport.fd)
+    elif hasAsyncDispatch:
+      if conn.socket.isNil:
+        return spUnavailable
+      let fd = posix.SocketHandle(conn.socket.getFd())
+    var buf: byte
+    let flags = posix.MSG_PEEK or MSG_DONTWAIT
+    while true:
+      let n = posix.recv(fd, addr buf, 1, flags)
+      if n > 0:
+        return spData
+      if n == 0:
+        return spClosed
+      let err = errno
+      if err == EINTR:
+        continue
+      if err == EAGAIN or err == EWOULDBLOCK:
+        return spIdle
+      if err == ENOMEM or err == ENOBUFS:
+        return spTransient
+      return spError
+  else:
+    spUnavailable
+
 proc socketHasFin*(conn: PgConnection): bool =
   ## Non-blocking OS-level half-open probe (POSIX only).
   ##
@@ -458,37 +501,41 @@ proc socketHasFin*(conn: PgConnection): bool =
   ## errors that haven't been read yet; use `ping` for that.
   ##
   ## On non-POSIX platforms this always returns `false` (no probe available).
-  when defined(posix):
-    when hasChronos:
-      if conn.transport.isNil:
-        return false
-      let fd = posix.SocketHandle(conn.transport.fd)
-    elif hasAsyncDispatch:
-      if conn.socket.isNil:
-        return false
-      let fd = posix.SocketHandle(conn.socket.getFd())
-    var buf: byte
-    let flags = posix.MSG_PEEK or MSG_DONTWAIT
-    while true:
-      let n = posix.recv(fd, addr buf, 1, flags)
-      if n > 0:
-        return false
-      if n == 0:
-        return true
-      let err = errno
-      if err == EAGAIN or err == EWOULDBLOCK:
-        return false
-      if err == EINTR:
-        continue
-      if err == ENOMEM or err == ENOBUFS:
-        # Transient kernel resource exhaustion, not a peer-side FIN/RST. Treat
-        # the connection as still alive so a momentary memory/buffer shortage
-        # doesn't condemn (and force a reconnect of) a live socket; a genuine
-        # close still surfaces on the next real read.
-        return false
-      return true
-  else:
+  case conn.peekSocket()
+  of spClosed, spError:
+    # FIN/RST observed, or an unclassified error we conservatively read as a
+    # peer-side close.
+    true
+  of spData, spIdle, spTransient, spUnavailable:
+    # Data pending (alive), idle, transient resource shortage (says nothing
+    # about peer state, so keep the live socket rather than force a reconnect),
+    # or no probe available.
     false
+
+proc socketHasPendingData*(conn: PgConnection): bool =
+  ## Non-blocking OS-level check: does the kernel currently hold readable
+  ## bytes on this connection's socket? (POSIX only.)
+  ##
+  ## Used by SSL negotiation to detect pre-TLS plaintext injection
+  ## (CVE-2021-23214 / CVE-2021-23222 family): after a server answers the
+  ## SSLRequest with `'S'` it must stay silent until the client sends the TLS
+  ## ClientHello, so any byte already readable was injected by a
+  ## man-in-the-middle to be smuggled ahead of the encrypted stream.
+  ##
+  ## A single `recv(MSG_PEEK | MSG_DONTWAIT)` syscall — no round trip. Only a
+  ## positive read of buffered bytes yields `true`. Returns `false` when the
+  ## socket is idle (`EAGAIN`), when the peer has closed (`FIN`: nothing was
+  ## injected), on `EINTR`/other transient errors, and where the probe is
+  ## unavailable (non-POSIX, or no transport handle).
+  ##
+  ## Note: this sees only bytes still in the *kernel* buffer. Data the
+  ## higher-level transport has already drained into its own buffer (the
+  ## chronos `StreamTransport` may do this) is invisible here and must be
+  ## detected by the caller reading more than the single response byte.
+  ##
+  ## Fail open: any non-data outcome (idle, FIN, transient or other error)
+  ## yields `false` so a probe error never rejects a legitimate connection.
+  conn.peekSocket() == spData
 
 proc isConnected*(conn: PgConnection): bool =
   ## Whether the underlying transport is present and the OS has not yet
