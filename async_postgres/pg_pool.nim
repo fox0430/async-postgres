@@ -353,6 +353,7 @@ proc tryHandoffToWaiter(pool: PgPool, conn: PgConnection): bool =
     if waiter.cancelled:
       continue
     pool.waiterCount.dec
+    conn.borrowed = true
     waiter.fut.complete(conn)
     return true
   return false
@@ -633,6 +634,7 @@ proc releaseCore(
     if waiter.cancelled:
       continue
     pool.waiterCount.dec
+    conn.borrowed = true
     waiter.fut.complete(conn)
     return (false, true)
   if pool.active > 0:
@@ -659,7 +661,31 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## connection to be discarded: callers who route through `resetSession`
   ## clear them ahead of time, so anything reaching here with locks still
   ## held has bypassed that path and must not return to the idle queue.
+  ##
+  ## Double-release guard: a connection that is not currently checked out
+  ## (`borrowed == false`) has already been returned to the pool — or never
+  ## came from this pool's `acquire`. Returning it again would register the
+  ## same connection in `idle` a second time, so two future borrowers would
+  ## receive it and corrupt each other's wire protocol. Such a release is a
+  ## no-op, surfaced through the tracer's `onPoolDoubleRelease` so the
+  ## borrow-site bug stays observable. Cleared here (the releaser no longer
+  ## holds the connection); the FIFO handoff in `releaseCore` re-sets it for
+  ## the waiter that takes over.
+  ##
+  ## Limitation: the flag only catches a double release of an already-idle
+  ## connection. If the first release handed the connection to a queued
+  ## waiter, `releaseCore` re-marks it `borrowed` for that waiter, so a
+  ## back-to-back second release from the original caller passes this guard
+  ## and can re-route the now-in-use connection. The raw `acquire` /
+  ## `release(conn)` API cannot close this gap (it carries no per-borrow
+  ## token); `PooledConnHandle` and the `with*` templates are the fully safe
+  ## paths.
   let tracer = pool.config.tracer
+  if not conn.borrowed:
+    if tracer != nil and tracer.onPoolDoubleRelease != nil:
+      tracer.onPoolDoubleRelease(TracePoolDoubleReleaseData(conn: conn))
+    return
+  conn.borrowed = false
   if conn.heldSessionLocks > 0 and tracer != nil and tracer.onLeakedSessionLocks != nil:
     tracer.onLeakedSessionLocks(
       TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
@@ -798,6 +824,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           await pool.tracedClose(pc.conn)
           continue
       pool.active.inc
+      pc.conn.borrowed = true
       recordAcquire()
       return (pc.conn, false)
 
@@ -816,6 +843,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       try:
         let conn = await connect(connCfg)
         conn.ownerPool = pool
+        conn.borrowed = true
         pool.metrics.createCount.inc
         # A successful caller-driven connect signals the DB is reachable —
         # let the maintenance loop resume immediate replenishment.

@@ -365,8 +365,11 @@ suite "Fallback":
       check cluster.replica.waiterCount == 1
 
       # A borrower releases a connection: the FIFO handoff serves the
-      # abandoned waiter, whose acquire nobody awaits anymore.
+      # abandoned waiter, whose acquire nobody awaits anymore. A real borrower
+      # is marked `borrowed` by `acquire`; mirror that so the release is not
+      # treated as a no-op double-release and the handoff actually fires.
       let lateConn = mockConn(pool = cluster.replica)
+      lateConn.borrowed = true
       lateConn.release()
 
       # Let the abandoned acquire complete and the drain release the conn.
