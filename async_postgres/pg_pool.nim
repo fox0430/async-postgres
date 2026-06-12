@@ -449,6 +449,30 @@ proc spawnConnectForWaiter(pool: PgPool) =
   pool.pendingBackgroundTasks.add(fut)
   asyncSpawn fut
 
+proc closeLateConnect(pool: PgPool, connectFut: Future[PgConnection]) =
+  ## Guard against asyncdispatch's non-cancelling `wait()`: when a bounded
+  ## `connect()` times out, the inner future keeps running and may still yield
+  ## a live connection that nobody is awaiting. Register a callback to close
+  ## such an orphan rather than leaking its socket and a server-side backend
+  ## slot. No-op on chronos, whose `wait()` actually cancels the connect, so
+  ## the future never reaches `completed()`.
+  when hasAsyncDispatch:
+    proc closeOrphan() {.async.} =
+      try:
+        let orphan = connectFut.read()
+        if orphan != nil:
+          await pool.tracedClose(orphan)
+      except CatchableError:
+        discard
+
+    connectFut.addCallback(
+      proc() =
+        if connectFut.completed():
+          asyncSpawn closeOrphan()
+    )
+  else:
+    discard
+
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
     await sleepAsync(pool.config.maintenanceInterval)
@@ -506,11 +530,22 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     for i in 0 ..< needed:
       if pool.closed:
         break
+      let connectFut = connect(pool.config.connConfig)
       try:
-        let conn = await connect(pool.config.connConfig).wait(replenishTimeout)
+        let conn = await connectFut.wait(replenishTimeout)
         conn.ownerPool = pool
         pool.metrics.createCount.inc
         pool.consecutiveConnectFailures = 0
+        # The pool may have been closed while we awaited connect (and on
+        # chronos this loop can be cancelled then resumed from an
+        # already-completed connect). Parking a fresh conn in a closed pool's
+        # idle deque — or handing it to a waiter close() has already failed —
+        # leaks its socket, so re-check first, mirroring spawnConnectForWaiter.
+        # closeNoWait (not `await tracedClose`) because a pending cancellation
+        # would interrupt a fresh await before the close runs.
+        if pool.closed:
+          pool.closeNoWait(conn)
+          break
         # FIFO fairness: if a waiter is already queued, hand the freshly
         # opened connection to them directly rather than parking it in
         # idle (which would let a later acquire jump the queue).
@@ -519,6 +554,10 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         else:
           pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
       except CatchableError:
+        # asyncdispatch's wait() cannot cancel connectFut: after the timeout it
+        # keeps running and may still produce a live connection nobody awaits.
+        # Close that orphan so it leaks neither a socket nor a server slot.
+        pool.closeLateConnect(connectFut)
         pool.consecutiveConnectFailures.inc
         let delay = computeConnectBackoff(
           pool.config.connectBackoffInitial, pool.config.connectBackoffMax,

@@ -2281,3 +2281,80 @@ suite "Pool broken connection handling (integration)":
       check stateAtAcquire == csReady
       check closeCountDelta == 1
       check idleAfter == 0
+
+suite "Pool replenish close-race":
+  test "replenish closes a connection won after the pool is closed":
+    # Regression: if the pool is closed while the maintenance loop is awaiting a
+    # replenishment connect, the freshly opened connection must be closed — not
+    # parked in the closed pool's idle deque, where its socket would leak. We
+    # gate the handshake on the server side so the connect is provably in flight
+    # when we flip `pool.closed`, then let it complete.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      # A large per-connect budget keeps the outer wait() open while we hold the
+      # handshake, so this exercises the post-connect closed re-check rather
+      # than the timeout path.
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.maintenanceInterval = milliseconds(10)
+      pool.maintenanceTask = maintenanceLoop(pool)
+
+      # The loop sleeps one interval, then opens the replenishment connect.
+      # accept() resolves once that connect's TCP is up; draining the startup
+      # message leaves connect() suspended awaiting the handshake.
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+
+      # Close the pool mid-connect, then let the handshake complete so the loop
+      # resumes and runs the re-check.
+      pool.closed = true
+      await sendFullHandshake(client)
+      await sleepAsync(milliseconds(80))
+
+      doAssert pool.idle.len == 0 # closed, not parked in the closed pool
+      doAssert pool.active == 0
+      doAssert pool.metrics.createCount == 1
+      doAssert pool.metrics.closeCount == 1
+
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  when hasAsyncDispatch:
+    # chronos's wait() truly cancels the abandoned connect, so this leak — and
+    # the closeLateConnect guard against it — is asyncdispatch-only.
+    test "an abandoned replenish connect that succeeds late is closed":
+      # Regression: asyncdispatch's wait() cannot cancel an in-flight connect,
+      # so a replenish connect that times out but then succeeds would leak its
+      # socket. The except branch arms closeLateConnect on the abandoned future;
+      # the late connection must be torn down, not leaked.
+      proc t() {.async.} =
+        let ms = startMockServer()
+        proc serverHandler() {.async.} =
+          let st = await acceptAndReady(ms)
+          await sleepAsync(milliseconds(120))
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+
+        let pool = makePool()
+        # Stand in for the post-timeout state: the outer wait() has already
+        # raised, so the future is abandoned and the orphan-closer is armed,
+        # exactly as the maintenance loop's except branch does.
+        let connectFut = connect(mockConfig(ms.port))
+        pool.closeLateConnect(connectFut)
+
+        # The handshake finishes in the background; the completion callback then
+        # closes the orphan.
+        await sleepAsync(milliseconds(80))
+        doAssert connectFut.completed()
+        let orphan = connectFut.read()
+        doAssert orphan.state == csClosed # closed by the callback, not leaked
+
+        await serverFut
+        await closeServer(ms)
+
+      waitFor t()
