@@ -43,6 +43,33 @@ suite "Large Object: create and unlink":
 
     waitFor t()
 
+  test "loCreate with requested OID >= 2^31 does not raise RangeDefect":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      conn.withTransaction:
+        # OID counter wraparound on long-lived clusters can produce OIDs whose
+        # high bit is set. ``int32(oid)`` would raise an uncatchable RangeDefect
+        # here; the implementation must preserve the bit pattern instead.
+        let requestedOid = 0x80000000'u32
+        let oid = await conn.loCreate(requestedOid)
+        doAssert oid == requestedOid
+
+        let lo = await conn.loOpen(oid, INV_READWRITE)
+        let testData = toBytes("high-bit OID round-trip")
+        let written = await lo.loWrite(testData)
+        doAssert written == int32(testData.len)
+
+        discard await lo.loSeek(0, SEEK_SET)
+        let readBack = await lo.loRead(int32(testData.len))
+        doAssert readBack == testData
+
+        await lo.loClose()
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
 suite "Large Object: basic read/write":
   test "write and read round-trip":
     proc t() {.async.} =
