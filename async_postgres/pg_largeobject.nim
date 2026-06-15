@@ -119,6 +119,12 @@ proc parseLoOid(s, fn: string): Oid =
   pgTypeErrorOnValueError(fn & " returned a non-numeric OID: " & s):
     Oid(parseUInt(s))
 
+proc oidToInt32(oid: Oid): int32 =
+  ## Cast a uint32 OID to int32 preserving the bit pattern.
+  ## ``int32(oid)`` would raise ``RangeDefect`` for OIDs above ``int32.high``,
+  ## which occurs on long-lived clusters where OIDs have wrapped past 2^31.
+  cast[int32](oid)
+
 # Core API
 
 proc loCreate*(
@@ -127,7 +133,7 @@ proc loCreate*(
   ## Create a new Large Object, returning its OID.
   ## Pass ``requestedOid = 0`` to let the server assign an OID.
   let s = await conn.queryValue(
-    "SELECT lo_create($1)", @[toPgParam(int32(requestedOid))], timeout = timeout
+    "SELECT lo_create($1)", @[toPgParam(oidToInt32(requestedOid))], timeout = timeout
   )
   return parseLoOid(s, "lo_create")
 
@@ -136,7 +142,7 @@ proc loUnlink*(
 ): Future[void] {.async.} =
   ## Delete a Large Object.
   discard await conn.queryValue(
-    "SELECT lo_unlink($1)", @[toPgParam(int32(oid))], timeout = timeout
+    "SELECT lo_unlink($1)", @[toPgParam(oidToInt32(oid))], timeout = timeout
   )
 
 proc loOpen*(
@@ -148,7 +154,7 @@ proc loOpen*(
   ## Open a Large Object for reading/writing. Returns a ``LargeObject`` handle.
   let s = await conn.queryValue(
     "SELECT lo_open($1, $2)",
-    @[toPgParam(int32(oid)), toPgParam(mode)],
+    @[toPgParam(oidToInt32(oid)), toPgParam(mode)],
     timeout = timeout,
   )
   return LargeObject(conn: conn, fd: int32(parseLoInt(s, "lo_open")), oid: oid)
@@ -238,7 +244,7 @@ proc loExport*(
   ## Export a Large Object to a server-side file.
   discard await conn.queryValue(
     "SELECT lo_export($1, $2)",
-    @[toPgParam(int32(oid)), toPgParam(filename)],
+    @[toPgParam(oidToInt32(oid)), toPgParam(filename)],
     timeout = timeout,
   )
 
