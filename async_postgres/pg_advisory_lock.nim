@@ -312,10 +312,60 @@ proc advisoryTryLockXactShared*(
 #
 # These are macros (not templates) so that ``conn``, ``key`` etc. are
 # evaluated exactly once via ``genSym``-bound ``let`` bindings.
+#
+# In the ``finally`` blocks, ``advisoryUnlock*`` failures are swallowed so
+# they cannot mask the original exception raised by ``body``. The failure is
+# reported through the connection's tracer (``onAdvisoryUnlockFailed``). If
+# the connection is lost the session lock is released server-side anyway.
+
+template withAdvisoryLockCore(
+    c: PgConnection,
+    lockProc, unlockProc: untyped,
+    k: int64,
+    k1, k2: int32,
+    shared, twoKey, hasTimeout: static bool,
+    t: Duration,
+    body: untyped,
+) =
+  ## Internal helper implementing the acquire/try/finally pattern for all
+  ## session-level ``withAdvisoryLock*`` macros. ``c``, ``k``/``k1``/``k2``
+  ## must already be bound to ``let`` symbols by the caller macro.
+  when hasTimeout:
+    when twoKey:
+      await c.lockProc(k1, k2, timeout = t)
+    else:
+      await c.lockProc(k, timeout = t)
+  else:
+    when twoKey:
+      await c.lockProc(k1, k2)
+    else:
+      await c.lockProc(k)
+
+  try:
+    body
+  finally:
+    try:
+      var released: bool
+      when twoKey:
+        released = await c.unlockProc(k1, k2)
+      else:
+        released = await c.unlockProc(k)
+      if not released:
+        # The unlock query succeeded but the server reports the lock was not
+        # held (``pg_advisory_unlock*`` returned ``false``). Report it with a
+        # nil ``err`` so observers can distinguish it from a raised failure.
+        fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, nil)
+    except CatchableError as e:
+      fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, e)
 
 macro withAdvisoryLock*(conn: PgConnection, key: int64, body: untyped): untyped =
   ## Acquire a session-level exclusive advisory lock, execute ``body``,
   ## then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k = genSym(nskLet, "key")
   let connExpr = conn
@@ -323,17 +373,22 @@ macro withAdvisoryLock*(conn: PgConnection, key: int64, body: untyped): untyped 
   result = quote:
     let `c` = `connExpr`
     let `k` = `keyExpr`
-    await `c`.advisoryLock(`k`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLock, advisoryUnlock, `k`, 0'i32, 0'i32, false, false, false,
+      ZeroDuration,
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlock(`k`)
 
 macro withAdvisoryLock*(
     conn: PgConnection, key: int64, timeout: Duration, body: untyped
 ): untyped =
   ## Acquire a session-level exclusive advisory lock with a timeout,
   ## execute ``body``, then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k = genSym(nskLet, "key")
   let t = genSym(nskLet, "timeout")
@@ -344,15 +399,19 @@ macro withAdvisoryLock*(
     let `c` = `connExpr`
     let `k` = `keyExpr`
     let `t` = `timeoutExpr`
-    await `c`.advisoryLock(`k`, timeout = `t`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLock, advisoryUnlock, `k`, 0'i32, 0'i32, false, false, true, `t`
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlock(`k`)
 
 macro withAdvisoryLock*(conn: PgConnection, key1, key2: int32, body: untyped): untyped =
   ## Acquire a session-level exclusive advisory lock (two int32 keys),
   ## execute ``body``, then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k1 = genSym(nskLet, "key1")
   let k2 = genSym(nskLet, "key2")
@@ -363,17 +422,22 @@ macro withAdvisoryLock*(conn: PgConnection, key1, key2: int32, body: untyped): u
     let `c` = `connExpr`
     let `k1` = `key1Expr`
     let `k2` = `key2Expr`
-    await `c`.advisoryLock(`k1`, `k2`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLock, advisoryUnlock, 0'i64, `k1`, `k2`, false, true, false,
+      ZeroDuration,
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlock(`k1`, `k2`)
 
 macro withAdvisoryLock*(
     conn: PgConnection, key1, key2: int32, timeout: Duration, body: untyped
 ): untyped =
   ## Acquire a session-level exclusive advisory lock (two int32 keys)
   ## with a timeout, execute ``body``, then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k1 = genSym(nskLet, "key1")
   let k2 = genSym(nskLet, "key2")
@@ -387,15 +451,19 @@ macro withAdvisoryLock*(
     let `k1` = `key1Expr`
     let `k2` = `key2Expr`
     let `t` = `timeoutExpr`
-    await `c`.advisoryLock(`k1`, `k2`, timeout = `t`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLock, advisoryUnlock, 0'i64, `k1`, `k2`, false, true, true, `t`
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlock(`k1`, `k2`)
 
 macro withAdvisoryLockShared*(conn: PgConnection, key: int64, body: untyped): untyped =
   ## Acquire a session-level shared advisory lock, execute ``body``,
   ## then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k = genSym(nskLet, "key")
   let connExpr = conn
@@ -403,17 +471,22 @@ macro withAdvisoryLockShared*(conn: PgConnection, key: int64, body: untyped): un
   result = quote:
     let `c` = `connExpr`
     let `k` = `keyExpr`
-    await `c`.advisoryLockShared(`k`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLockShared, advisoryUnlockShared, `k`, 0'i32, 0'i32, true, false,
+      false, ZeroDuration,
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlockShared(`k`)
 
 macro withAdvisoryLockShared*(
     conn: PgConnection, key: int64, timeout: Duration, body: untyped
 ): untyped =
   ## Acquire a session-level shared advisory lock with a timeout,
   ## execute ``body``, then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k = genSym(nskLet, "key")
   let t = genSym(nskLet, "timeout")
@@ -424,17 +497,22 @@ macro withAdvisoryLockShared*(
     let `c` = `connExpr`
     let `k` = `keyExpr`
     let `t` = `timeoutExpr`
-    await `c`.advisoryLockShared(`k`, timeout = `t`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLockShared, advisoryUnlockShared, `k`, 0'i32, 0'i32, true, false,
+      true, `t`,
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlockShared(`k`)
 
 macro withAdvisoryLockShared*(
     conn: PgConnection, key1, key2: int32, body: untyped
 ): untyped =
   ## Acquire a session-level shared advisory lock (two int32 keys),
   ## execute ``body``, then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k1 = genSym(nskLet, "key1")
   let k2 = genSym(nskLet, "key2")
@@ -445,17 +523,22 @@ macro withAdvisoryLockShared*(
     let `c` = `connExpr`
     let `k1` = `key1Expr`
     let `k2` = `key2Expr`
-    await `c`.advisoryLockShared(`k1`, `k2`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLockShared, advisoryUnlockShared, 0'i64, `k1`, `k2`, true, true,
+      false, ZeroDuration,
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlockShared(`k1`, `k2`)
 
 macro withAdvisoryLockShared*(
     conn: PgConnection, key1, key2: int32, timeout: Duration, body: untyped
 ): untyped =
   ## Acquire a session-level shared advisory lock (two int32 keys)
   ## with a timeout, execute ``body``, then release the lock (even on exception).
+  ##
+  ## If unlocking fails (for example because the connection was lost), the
+  ## failure is reported through the connection's tracer
+  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
+  ## not masked.
   let c = genSym(nskLet, "conn")
   let k1 = genSym(nskLet, "key1")
   let k2 = genSym(nskLet, "key2")
@@ -469,11 +552,11 @@ macro withAdvisoryLockShared*(
     let `k1` = `key1Expr`
     let `k2` = `key2Expr`
     let `t` = `timeoutExpr`
-    await `c`.advisoryLockShared(`k1`, `k2`, timeout = `t`)
-    try:
+    withAdvisoryLockCore(
+      `c`, advisoryLockShared, advisoryUnlockShared, 0'i64, `k1`, `k2`, true, true,
+      true, `t`,
+    ):
       `body`
-    finally:
-      discard await `c`.advisoryUnlockShared(`k1`, `k2`)
 
 # Transaction-level convenience templates
 
