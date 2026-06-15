@@ -269,7 +269,7 @@ proc fillRecvBuf*(
 
 proc nextMessage*(
     conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
-): Option[BackendMessage] {.raises: [ProtocolError].} =
+): Option[BackendMessage] {.raises: [PgProtocolError].} =
   ## Synchronously parse the next message from the receive buffer.
   ## Returns none if the buffer doesn't contain a complete message.
   ## Notification/Notice messages are dispatched internally.
@@ -277,7 +277,7 @@ proc nextMessage*(
   ## consumed, so callers never see them.
   ## DataRow messages are counted (if rowCount != nil) and consumed.
   ##
-  ## On `ProtocolError` the protocol stream is desynchronised — the connection
+  ## On `PgProtocolError` the protocol stream is desynchronised — the connection
   ## is transitioned to `csClosed` before re-raising so that it is never
   ## reused (in particular, by the connection pool).
   var pos = conn.recvBufStart
@@ -289,7 +289,7 @@ proc nextMessage*(
         parseBackendMessage(
           conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData, maxLen
         )
-      except ProtocolError as e:
+      except PgProtocolError as e:
         conn.state = csClosed
         raise e
     if res.state == psIncomplete:

@@ -256,17 +256,17 @@ proc currentPgTimestamp*(): int64 =
 # compiled out under ``-d:danger`` (and raise the uncatchable ``IndexDefect``
 # otherwise), so feeding a truncated or malicious WAL stream through the
 # decoder could read past the end of the buffer. These wrappers validate the
-# available length first and raise ``ProtocolError`` (a ``CatchableError`` and
+# available length first and raise ``PgProtocolError`` (a ``CatchableError`` and
 # ``PgError`` subtype) on any shortfall, matching how the rest of the wire
 # parsing reports protocol violations.
 
 proc ensureAvail(buf: openArray[byte], pos, n: int) {.inline.} =
-  ## Raise ``ProtocolError`` unless ``n`` bytes are readable at ``pos``.
+  ## Raise ``PgProtocolError`` unless ``n`` bytes are readable at ``pos``.
   ## ``n > buf.len - pos`` is written so it cannot overflow and so a ``pos``
   ## past the end (negative ``buf.len - pos``) is rejected for any ``n >= 0``.
   if pos < 0 or n < 0 or n > buf.len - pos:
     raise newException(
-      ProtocolError,
+      PgProtocolError,
       "pgoutput: truncated message (need " & $n & " byte(s) at offset " & $pos &
         ", buffer holds " & $buf.len & ")",
     )
@@ -296,12 +296,12 @@ proc readBytesAt(buf: openArray[byte], pos, n: int): seq[byte] {.inline.} =
 proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at offset. Returns (string, next offset).
   if offset >= buf.len:
-    raise newException(ProtocolError, "decodeCStringAt: offset past end of buffer")
+    raise newException(PgProtocolError, "decodeCStringAt: offset past end of buffer")
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
   if i >= buf.len:
-    raise newException(ProtocolError, "decodeCStringAt: missing null terminator")
+    raise newException(PgProtocolError, "decodeCStringAt: missing null terminator")
   let slen = i - offset
   let s = readString(buf, offset, slen)
   inc i # skip null
@@ -313,7 +313,7 @@ proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
   let numCols = readInt16At(buf, pos)
   pos += 2
   if numCols < 0:
-    raise newException(ProtocolError, "pgoutput tuple: negative column count")
+    raise newException(PgProtocolError, "pgoutput tuple: negative column count")
   var fields = newSeq[TupleField](numCols)
   for i in 0 ..< numCols:
     let kind = char(readByteAt(buf, pos))
@@ -330,13 +330,13 @@ proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
       pos += int(dataLen)
       fields[i] = TupleField(kind: if kind == 't': tdkText else: tdkBinary, data: data)
     else:
-      raise newException(ProtocolError, "Unknown tuple field kind: " & kind)
+      raise newException(PgProtocolError, "Unknown tuple field kind: " & kind)
   (fields, pos)
 
 proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
   ## Decode a pgoutput logical decoding message from raw WAL bytes.
   if data.len == 0:
-    raise newException(ProtocolError, "Empty pgoutput message")
+    raise newException(PgProtocolError, "Empty pgoutput message")
   let msgType = char(data[0])
   case msgType
   of 'B': # Begin
@@ -373,7 +373,7 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     let numCols = readInt16At(data, pos)
     pos += 2
     if numCols < 0:
-      raise newException(ProtocolError, "pgoutput Relation: negative column count")
+      raise newException(PgProtocolError, "pgoutput Relation: negative column count")
     msg.columns = newSeq[RelationColumn](numCols)
     for i in 0 ..< numCols:
       var col = RelationColumn()
@@ -419,7 +419,7 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
       pos = nextPos
       inc pos # skip 'N' marker for new tuple
     elif marker != 'N':
-      raise newException(ProtocolError, "Unknown Update tuple marker: " & marker)
+      raise newException(PgProtocolError, "Unknown Update tuple marker: " & marker)
     let (newFields, _) = decodeTuple(data, pos)
     msg.newTuple = newFields
     PgOutputMessage(kind: pomkUpdate, update: msg)
@@ -441,7 +441,7 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     # remaining buffer before allocating, so a forged count can neither trigger
     # a huge allocation nor over-read in the loop below.
     if numRels < 0 or numRels.int > (data.len - pos) div 4:
-      raise newException(ProtocolError, "pgoutput Truncate: invalid relation count")
+      raise newException(PgProtocolError, "pgoutput Truncate: invalid relation count")
     msg.relationIds = newSeq[int32](numRels)
     for i in 0 ..< numRels:
       msg.relationIds[i] = readInt32At(data, pos)
@@ -460,7 +460,7 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     msg.content = readBytesAt(data, pos, int(contentLen))
     PgOutputMessage(kind: pomkMessage, message: msg)
   else:
-    raise newException(ProtocolError, "Unknown pgoutput message type: " & msgType)
+    raise newException(PgProtocolError, "Unknown pgoutput message type: " & msgType)
 
 proc receivedEndLsn*(msg: XLogData): Lsn =
   ## End LSN of the WAL data actually contained in this message
@@ -656,12 +656,12 @@ proc timelineHistory*(
 proc parseReplicationMessage*(copyData: seq[byte]): ReplicationMessage =
   ## Parse a CopyData payload into a ReplicationMessage.
   if copyData.len == 0:
-    raise newException(ProtocolError, "Empty replication CopyData")
+    raise newException(PgProtocolError, "Empty replication CopyData")
   let kind = char(copyData[0])
   case kind
   of 'w': # XLogData
     if copyData.len < 25:
-      raise newException(ProtocolError, "XLogData message too short")
+      raise newException(PgProtocolError, "XLogData message too short")
     var xlog = XLogData()
     xlog.startLsn = Lsn(cast[uint64](decodeInt64(copyData, 1)))
     xlog.walEnd = Lsn(cast[uint64](decodeInt64(copyData, 9)))
@@ -672,14 +672,14 @@ proc parseReplicationMessage*(copyData: seq[byte]): ReplicationMessage =
     ReplicationMessage(kind: rmkXLogData, xlogData: xlog)
   of 'k': # Primary Keepalive
     if copyData.len < 18:
-      raise newException(ProtocolError, "Primary Keepalive message too short")
+      raise newException(PgProtocolError, "Primary Keepalive message too short")
     var ka = PrimaryKeepalive()
     ka.walEnd = Lsn(cast[uint64](decodeInt64(copyData, 1)))
     ka.sendTime = decodeInt64(copyData, 9)
     ka.replyRequested = copyData[17] != 0
     ReplicationMessage(kind: rmkPrimaryKeepalive, keepalive: ka)
   else:
-    raise newException(ProtocolError, "Unknown replication message type: " & kind)
+    raise newException(PgProtocolError, "Unknown replication message type: " & kind)
 
 proc sendCopyData*(conn: PgConnection, data: openArray[byte]): Future[void] =
   ## Send a raw CopyData frame to the server during a CopyBoth stream
