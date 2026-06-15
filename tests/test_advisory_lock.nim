@@ -314,6 +314,24 @@ suite "Advisory Lock: withAdvisoryLock template":
 
     waitFor t()
 
+  test "withAdvisoryLock preserves body exception when unlock fails":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(50004'i64):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      # The unlock attempt fails because the connection is closed, but the
+      # original body exception must still propagate.
+      doAssert bodyMsg == "original body error"
+
+    waitFor t()
+
 suite "Advisory Lock: withAdvisoryLockXact template":
   test "withAdvisoryLockXact int64":
     proc t() {.async.} =
@@ -647,5 +665,253 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
 
       doAssert log.counts.len == 0
       doAssert pool.idle.len == 1
+
+    waitFor t()
+
+suite "Advisory Lock: onAdvisoryUnlockFailed tracer hook":
+  type UnlockFailLog = ref object
+    data: seq[TraceAdvisoryUnlockFailedData]
+
+  proc buildUnlockFailTracer(log: UnlockFailLog): PgTracer =
+    let tracer = PgTracer()
+    tracer.onAdvisoryUnlockFailed = proc(
+        data: TraceAdvisoryUnlockFailedData
+    ) {.gcsafe, raises: [].} =
+      log.data.add(data)
+    tracer
+
+  test "withAdvisoryLock int64 reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(50005'i64):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key == 50005'i64
+      doAssert log.data[0].shared == false
+      doAssert log.data[0].twoKey == false
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLockShared int64 reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLockShared(50006'i64):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key == 50006'i64
+      doAssert log.data[0].shared == true
+      doAssert log.data[0].twoKey == false
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLock two-key reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(31'i32, 32'i32):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key1 == 31'i32
+      doAssert log.data[0].key2 == 32'i32
+      doAssert log.data[0].shared == false
+      doAssert log.data[0].twoKey == true
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLockShared two-key reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLockShared(33'i32, 34'i32):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key1 == 33'i32
+      doAssert log.data[0].key2 == 34'i32
+      doAssert log.data[0].shared == true
+      doAssert log.data[0].twoKey == true
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLock int64 timeout reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(50007'i64, 5.seconds):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key == 50007'i64
+      doAssert log.data[0].shared == false
+      doAssert log.data[0].twoKey == false
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLockShared int64 timeout reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLockShared(50008'i64, 5.seconds):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key == 50008'i64
+      doAssert log.data[0].shared == true
+      doAssert log.data[0].twoKey == false
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLock two-key timeout reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(35'i32, 36'i32, 5.seconds):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key1 == 35'i32
+      doAssert log.data[0].key2 == 36'i32
+      doAssert log.data[0].shared == false
+      doAssert log.data[0].twoKey == true
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLockShared two-key timeout reports unlock failure":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLockShared(37'i32, 38'i32, 5.seconds):
+          await conn.close()
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key1 == 37'i32
+      doAssert log.data[0].key2 == 38'i32
+      doAssert log.data[0].shared == true
+      doAssert log.data[0].twoKey == true
+      doAssert log.data[0].err != nil
+
+    waitFor t()
+
+  test "withAdvisoryLock int64 reports unlock returning false":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      conn.withAdvisoryLock(50009'i64):
+        # Release the lock out-of-band so the macro's own unlock returns false.
+        discard await conn.advisoryUnlock(50009'i64)
+      doAssert log.data.len == 1
+      doAssert log.data[0].key == 50009'i64
+      doAssert log.data[0].shared == false
+      doAssert log.data[0].twoKey == false
+      # A false return is reported with a nil err to distinguish it from a raise.
+      doAssert log.data[0].err == nil
+
+    waitFor t()
+
+  test "withAdvisoryLockShared two-key reports unlock returning false":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockFailTracer(log)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      conn.withAdvisoryLockShared(39'i32, 40'i32):
+        # Release the lock out-of-band so the macro's own unlock returns false.
+        discard await conn.advisoryUnlockShared(39'i32, 40'i32)
+      doAssert log.data.len == 1
+      doAssert log.data[0].key1 == 39'i32
+      doAssert log.data[0].key2 == 40'i32
+      doAssert log.data[0].shared == true
+      doAssert log.data[0].twoKey == true
+      doAssert log.data[0].err == nil
 
     waitFor t()

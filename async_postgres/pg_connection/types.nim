@@ -445,6 +445,14 @@ type
     ## bypassed. Use this hook to detect missing ``advisoryUnlock`` /
     ## ``advisoryUnlockAll`` calls at the borrow site, since silent cleanup
     ## would otherwise mask the leak.
+    ##
+    ## A failed ``withAdvisoryLock*`` unlock (see ``onAdvisoryUnlockFailed``)
+    ## does not decrement ``heldSessionLocks`` — the lock may still be held
+    ## server-side — so the same lock is reported again here when its
+    ## connection is returned to the pool, where ``pg_advisory_unlock_all``
+    ## finally clears it. The two hooks are distinct observation points
+    ## (unlock attempt vs. pool-return detection); de-duplicate per ``conn``
+    ## if a single event is wanted.
     conn*: PgConnection
     count*: int ## Value of ``heldSessionLocks`` at detection time
 
@@ -465,6 +473,33 @@ type
     ## `ConnConfig.requireAuth` for actual enforcement.
     conn*: PgConnection
     authMethod*: AuthMethod ## The method the server requested
+
+  TraceAdvisoryUnlockFailedData* = object
+    ## Advisory notification that an explicit advisory unlock initiated by a
+    ## ``withAdvisoryLock*`` macro failed. The failure is swallowed so the
+    ## original exception raised by ``body`` is not masked. Session-level
+    ## advisory locks are released server-side when the connection closes,
+    ## so the macro's behaviour is unchanged. Use this hook to observe
+    ## unlock failures that would otherwise be invisible.
+    ##
+    ## A failed unlock does not decrement ``heldSessionLocks``, so the same
+    ## lock is also reported through ``onLeakedSessionLocks`` when its
+    ## connection is later returned to the pool (where it is finally cleared).
+    conn*: PgConnection
+    key*: int64
+      ## Lock identifier for single-key variants. Zero when ``twoKey`` is
+      ## ``true``.
+    key1*: int32 ## First key for two-key variants. Zero for single-key variants.
+    key2*: int32 ## Second key for two-key variants. Zero for single-key variants.
+    shared*: bool
+      ## ``true`` for ``withAdvisoryLockShared*``, ``false`` for
+      ## ``withAdvisoryLock*``.
+    twoKey*: bool ## ``true`` for two-key variants, ``false`` for single-key variants.
+    err*: ref CatchableError
+      ## The exception raised by ``advisoryUnlock*`` /
+      ## ``advisoryUnlockShared*``. ``nil`` when the unlock query itself
+      ## succeeded but the server reported the lock was not held
+      ## (``pg_advisory_unlock*`` returned ``false``).
 
   PgTracer* = ref object
     ## Tracing hooks for async-postgres operations.
@@ -529,6 +564,8 @@ type
       ## locks acquired through the typed API. Advisory only — the pool
       ## handles cleanup as described in `TraceLeakedSessionLocksData`. Use
       ## this to surface missing ``advisoryUnlock`` calls at the borrow site.
+      ## May also fire for a lock whose ``withAdvisoryLock*`` unlock already
+      ## failed via `onAdvisoryUnlockFailed`; see that type for details.
     onCleanupSkipped*: proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].}
       ## Fires from `withTransaction*` / `withSavepoint*` error paths when
       ## an automatic ROLLBACK is either skipped (connection already
@@ -555,6 +592,14 @@ type
       ## weak / deprecated regardless of transport (currently: MD5).
       ## Advisory only; does not abort the connection. Use
       ## `ConnConfig.requireAuth` to enforce.
+    onAdvisoryUnlockFailed*:
+      proc(data: TraceAdvisoryUnlockFailedData) {.gcsafe, raises: [].}
+      ## Fires when ``withAdvisoryLock*`` / ``withAdvisoryLockShared*``
+      ## swallows an ``advisoryUnlock*`` failure to preserve the original
+      ## exception from ``body``. The unlock is considered failed when it
+      ## raises (``data.err`` non-nil) or returns ``false`` (``data.err``
+      ## nil). Advisory only — the macro's behaviour is unchanged. Use this
+      ## to observe unlock failures that would otherwise be invisible.
 
 when hasChronos:
   type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
@@ -638,6 +683,31 @@ proc fireDeprecatedAuth*(conn: PgConnection, authMethod: AuthMethod) =
   let t = conn.config.tracer
   if t != nil and t.onDeprecatedAuth != nil:
     t.onDeprecatedAuth(TraceDeprecatedAuthData(conn: conn, authMethod: authMethod))
+
+proc fireAdvisoryUnlockFailed*(
+    conn: PgConnection,
+    key: int64,
+    key1, key2: int32,
+    shared, twoKey: bool,
+    err: ref CatchableError,
+) =
+  ## Route a swallowed ``withAdvisoryLock*`` / ``withAdvisoryLockShared*``
+  ## unlock failure to the tracer. Reads from ``conn.config.tracer`` so the
+  ## event fires regardless of the runtime ``conn.tracer`` alias. Nil hook
+  ## is a no-op.
+  let t = conn.config.tracer
+  if t != nil and t.onAdvisoryUnlockFailed != nil:
+    t.onAdvisoryUnlockFailed(
+      TraceAdvisoryUnlockFailedData(
+        conn: conn,
+        key: key,
+        key1: key1,
+        key2: key2,
+        shared: shared,
+        twoKey: twoKey,
+        err: err,
+      )
+    )
 
 proc fireCleanupSkipped*(
     conn: PgConnection,
