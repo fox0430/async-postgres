@@ -129,6 +129,58 @@ suite "Large Object: seek and tell":
 
     waitFor t()
 
+  test "loSeek/loTell/loSize handle 64-bit offsets beyond 2GB (sparse)":
+    # Exercises the lo_lseek64/lo_tell64 path with an offset that would be
+    # truncated (and go negative) if cast to int32. Stays cheap because a
+    # sparse write only stores the single page actually touched, not the
+    # multi-GB hole preceding it.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      conn.withTransaction:
+        let oid = await conn.loCreate()
+        let lo = await conn.loOpen(oid, INV_READWRITE)
+
+        # Beyond 2^32 so a 32-bit truncation (signed or unsigned) is caught.
+        const bigOffset = 5_000_000_000'i64
+
+        let seeked = await lo.loSeek(bigOffset, SEEK_SET)
+        doAssert seeked == bigOffset
+
+        let marker = toBytes("64bit-marker")
+        let written = await lo.loWrite(marker)
+        doAssert written == int32(marker.len)
+
+        # Position advanced past the write, still in 64-bit territory.
+        let pos = await lo.loTell()
+        doAssert pos == bigOffset + int64(marker.len)
+
+        # Size reflects the sparse extent (offset + bytes written).
+        let size = await lo.loSize()
+        doAssert size == bigOffset + int64(marker.len)
+        # loSize must restore the position it found.
+        doAssert (await lo.loTell()) == bigOffset + int64(marker.len)
+
+        # SEEK_END from a >2GB end position must report the 64-bit position.
+        let fromEnd = await lo.loSeek(-int64(marker.len), SEEK_END)
+        doAssert fromEnd == bigOffset
+
+        # The marker round-trips when read back at the sparse offset.
+        discard await lo.loSeek(bigOffset, SEEK_SET)
+        let readBack = await lo.loRead(int32(marker.len))
+        doAssert readBack == marker
+
+        # The leading hole reads back as zeros.
+        discard await lo.loSeek(0, SEEK_SET)
+        let hole = await lo.loRead(16)
+        doAssert hole == newSeq[byte](16)
+
+        await lo.loClose()
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
 suite "Large Object: truncate":
   test "loTruncate":
     proc t() {.async.} =
