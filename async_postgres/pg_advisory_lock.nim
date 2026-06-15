@@ -313,10 +313,13 @@ proc advisoryTryLockXactShared*(
 # These are macros (not templates) so that ``conn``, ``key`` etc. are
 # evaluated exactly once via ``genSym``-bound ``let`` bindings.
 #
-# In the ``finally`` blocks, ``advisoryUnlock*`` failures are swallowed so
-# they cannot mask the original exception raised by ``body``. The failure is
-# reported through the connection's tracer (``onAdvisoryUnlockFailed``). If
-# the connection is lost the session lock is released server-side anyway.
+# ``advisoryUnlock*`` failures are swallowed so they cannot mask the original
+# exception raised by ``body``: the body exception is captured and re-raised
+# after the unlock attempt. (A ``finally`` block cannot be used here because an
+# ``await`` inside ``finally`` clobbers the in-flight exception under
+# asyncdispatch, silently discarding the body's error.) The unlock failure is
+# reported through the connection's tracer (``onAdvisoryUnlockFailed``). If the
+# connection is lost the session lock is released server-side anyway.
 
 template withAdvisoryLockCore(
     c: PgConnection,
@@ -341,22 +344,30 @@ template withAdvisoryLockCore(
     else:
       await c.lockProc(k)
 
+  var bodyErr: ref CatchableError = nil
   try:
     body
-  finally:
-    try:
-      var released: bool
-      when twoKey:
-        released = await c.unlockProc(k1, k2)
-      else:
-        released = await c.unlockProc(k)
-      if not released:
-        # The unlock query succeeded but the server reports the lock was not
-        # held (``pg_advisory_unlock*`` returned ``false``). Report it with a
-        # nil ``err`` so observers can distinguish it from a raised failure.
-        fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, nil)
-    except CatchableError as e:
-      fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, e)
+  except CatchableError as e:
+    bodyErr = e
+
+  try:
+    var released: bool
+    when twoKey:
+      released = await c.unlockProc(k1, k2)
+    else:
+      released = await c.unlockProc(k)
+    if not released:
+      # The unlock query succeeded but the server reports the lock was not
+      # held (``pg_advisory_unlock*`` returned ``false``). Report it with a
+      # nil ``err`` so observers can distinguish it from a raised failure.
+      fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, nil)
+  except CatchableError as e:
+    fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, e)
+
+  if bodyErr != nil:
+    # Re-raise the original body exception (if any) now that the lock has been
+    # released, so a swallowed unlock failure can never mask it.
+    raise bodyErr
 
 macro withAdvisoryLock*(conn: PgConnection, key: int64, body: untyped): untyped =
   ## Acquire a session-level exclusive advisory lock, execute ``body``,
