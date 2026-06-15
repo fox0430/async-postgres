@@ -639,7 +639,7 @@ proc releaseCore(
     return (false, true)
   if pool.active > 0:
     pool.active.dec
-  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
   return (false, false)
 
 proc releaseImpl(pool: PgPool, conn: PgConnection) =

@@ -377,15 +377,18 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
-  test "release stores PooledConn with cachedNow as lastUsedAt":
+  test "release stamps lastUsedAt with the return time, not stale cachedNow":
     let pool = makePool()
     pool.active = 1
-    pool.cachedNow = Moment.now()
+    let staleNow = Moment.now() - minutes(30)
+    pool.cachedNow = staleNow
+    let beforeRelease = Moment.now()
     let conn = mockConn()
     pool.release(conn)
     check pool.idle.len == 1
     check pool.idle[0].conn == conn
-    check pool.idle[0].lastUsedAt == pool.cachedNow
+    check pool.idle[0].lastUsedAt >= beforeRelease
+    check pool.idle[0].lastUsedAt > staleNow
 
   test "release discards connection in transaction":
     let pool = makePool()
@@ -1576,6 +1579,34 @@ when hasChronos:
         await sleepAsync(milliseconds(60))
 
         doAssert pool.idle.len == 0
+
+        pool.closed = true
+        await cancelAndWait(pool.maintenanceTask)
+
+      waitFor t()
+
+    test "release after a long borrow survives the idle reaper":
+      proc t() {.async.} =
+        let pool = makePool(minSize = 0)
+        pool.config.idleTimeout = milliseconds(200)
+        pool.config.maintenanceInterval = milliseconds(20)
+
+        # Emulate a long borrow: `cachedNow` froze at acquire time, far older
+        # than idleTimeout. With a correct release, `lastUsedAt` is stamped at
+        # the actual return time, so the just-returned conn is well within the
+        # idle window and must not be reaped.
+        pool.cachedNow = Moment.now() - seconds(10)
+        pool.active = 1
+        let conn = mockConn()
+        pool.release(conn)
+        doAssert pool.idle.len == 1
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+        await sleepAsync(milliseconds(60))
+
+        # idleTimeout (200ms) has not elapsed since the real return time, so the
+        # conn survives. The stale cachedNow (10s ago) would have evicted it.
+        doAssert pool.idle.len == 1
 
         pool.closed = true
         await cancelAndWait(pool.maintenanceTask)
