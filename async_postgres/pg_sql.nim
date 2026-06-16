@@ -1,13 +1,23 @@
 ## SQL query helpers: ``?``-placeholder conversion and ``sql`` string-literal macro.
 ##
 ## ``sqlParams`` converts ``?``-style placeholders (compatible with Nim's
-## ``db_connector``) to PostgreSQL's ``$1, $2, ...`` positional format.
-## This lets you combine ``std/strformat`` with parameterised queries:
+## ``db_connector``) to PostgreSQL's ``$1, $2, ...`` positional format. Bind
+## every value through a ``?`` placeholder so the server treats it as data:
+##
+## .. code-block:: nim
+##   await conn.query("SELECT * FROM users WHERE age > ? LIMIT ?".sqlParams,
+##     pgParams(minAge, n))
+##
+## **Warning:** ``std/strformat`` (``fmt"..."``) interpolates text directly into
+## the SQL string with no escaping, so never interpolate user-supplied values —
+## that is a SQL injection vector. Use it only for trusted identifiers such as a
+## table or column name, and always pass it through ``quoteIdentifier``:
 ##
 ## .. code-block:: nim
 ##   import std/strformat
-##   await conn.query(fmt"SELECT * FROM {tbl} WHERE age > ? LIMIT {n}".sqlParams,
-##     pgParams(minAge))
+##   await conn.query(
+##     fmt"SELECT * FROM {quoteIdentifier(tbl)} WHERE age > ? LIMIT ?".sqlParams,
+##     pgParams(minAge, n))
 ##
 ## The ``sql`` string-literal macro extracts ``{expr}`` placeholders at compile
 ## time, producing a ``SqlQuery`` that bundles the rewritten SQL and its
