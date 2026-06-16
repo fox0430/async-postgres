@@ -117,22 +117,22 @@ suite "Byte helpers":
 
   test "decodeCString at end of buffer":
     let buf = @[byte('a'), 0'u8]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard decodeCString(buf, 2)
 
   test "decodeCString offset past end of buffer":
     let buf = @[byte('a'), 0'u8]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard decodeCString(buf, 3)
 
   test "decodeCString offset past end of empty buffer":
     let buf: seq[byte] = @[]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard decodeCString(buf, 1)
 
   test "decodeCString missing null terminator":
     let buf = @[byte('h'), byte('i')]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard decodeCString(buf, 0)
 
 suite "Frontend encoding":
@@ -798,45 +798,45 @@ suite "Backend decoding - edge cases":
     let res = parseBackendMessage(buf)
     check res.message.columns[0].get.len == 1000
 
-  test "DataRow with negative column length raises ProtocolError":
+  test "DataRow with negative column length raises PgProtocolError":
     var body: seq[byte] = @[]
     body.addInt16(1)
     body.addInt32(-2) # invalid: only -1 (NULL) is valid
     var buf = buildMsg('D', body)
-    expect ProtocolError:
+    expect PgProtocolError:
       discard parseBackendMessage(buf)
 
-  test "unknown message type raises ProtocolError":
+  test "unknown message type raises PgProtocolError":
     var buf = buildMsg('?', @[0'u8])
-    expect ProtocolError:
+    expect PgProtocolError:
       discard parseBackendMessage(buf)
 
-  test "unknown authentication type raises ProtocolError":
+  test "unknown authentication type raises PgProtocolError":
     var body: seq[byte] = @[]
     body.addInt32(99) # unknown auth type
     var buf = buildMsg('R', body)
-    expect ProtocolError:
+    expect PgProtocolError:
       discard parseBackendMessage(buf)
 
-  test "invalid message length raises ProtocolError":
+  test "invalid message length raises PgProtocolError":
     # length < 4 is invalid
     var buf = @[byte('Z'), 0'u8, 0, 0, 3, byte('I')]
-    expect ProtocolError:
+    expect PgProtocolError:
       discard parseBackendMessage(buf)
 
-  test "oversized message length raises ProtocolError before allocation":
+  test "oversized message length raises PgProtocolError before allocation":
     # Header advertises a near-int32-max body; without a cap this would
     # cause the recv loop to grow recvBuf until OOM. The parser must
     # reject such headers before any further read.
     var buf = @[byte('D'), 0x7F'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8] # msgLen = int32.high
-    expect ProtocolError:
+    expect PgProtocolError:
       discard parseBackendMessage(buf)
 
   test "configurable maxLen rejects header above caller's threshold":
     # 100-byte body declared, but caller permits only 32 bytes total.
     var buf = @[byte('C'), 0'u8, 0, 0, 100'u8]
     var consumed: int
-    expect ProtocolError:
+    expect PgProtocolError:
       discard parseBackendMessage(buf, consumed, nil, 32)
 
   test "maxLen permits message exactly at the limit":
@@ -994,7 +994,7 @@ suite "nextMessage recvBufStart update":
 
     var rd = newRowData(1)
     var count: int32 = 0
-    expect ProtocolError:
+    expect PgProtocolError:
       discard conn.nextMessage(rd, addr count)
 
     # recvBufStart should have advanced past the valid DataRow

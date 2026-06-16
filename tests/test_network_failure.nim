@@ -181,7 +181,7 @@ suite "Network failure: per-host connect timeout":
 # Malformed / truncated backend messages
 
 suite "Network failure: malformed server messages":
-  test "unknown backend message type 'X' raises ProtocolError":
+  test "unknown backend message type 'X' raises PgProtocolError":
     var raised = false
     var finalState: PgConnState
 
@@ -201,7 +201,7 @@ suite "Network failure: malformed server messages":
       let conn = await connect(mockConfig(ms.port))
       try:
         discard await conn.simpleQuery("SELECT 1")
-      except ProtocolError:
+      except PgProtocolError:
         raised = true
       except CatchableError:
         raised = true
@@ -256,7 +256,7 @@ suite "Network failure: malformed server messages":
     waitFor testBody()
     check raised
 
-  test "claimed msgLen below minimum (3) raises ProtocolError":
+  test "claimed msgLen below minimum (3) raises PgProtocolError":
     var raised = false
     var gotProtocolError = false
 
@@ -282,7 +282,7 @@ suite "Network failure: malformed server messages":
       let conn = await connect(mockConfig(ms.port))
       try:
         discard await conn.simpleQuery("SELECT 1")
-      except ProtocolError:
+      except PgProtocolError:
         raised = true
         gotProtocolError = true
       except CatchableError:
@@ -298,7 +298,7 @@ suite "Network failure: malformed server messages":
     check raised
     check gotProtocolError
 
-  test "malformed CommandComplete without null terminator raises ProtocolError":
+  test "malformed CommandComplete without null terminator raises PgProtocolError":
     var raised = false
     var gotProtocolError = false
 
@@ -324,7 +324,7 @@ suite "Network failure: malformed server messages":
       let conn = await connect(mockConfig(ms.port))
       try:
         discard await conn.simpleQuery("SELECT 1")
-      except ProtocolError:
+      except PgProtocolError:
         raised = true
         gotProtocolError = true
       except CatchableError:
@@ -345,7 +345,7 @@ suite "Network failure: malformed server messages":
 suite "Network failure: mid-query disconnects":
   test "server closes after sending partial DataRow":
     # Note: csClosed here is reached via the EOF / socket-close path, not via
-    # the `ProtocolError -> csClosed` transition in `nextMessage`. If future
+    # the `PgProtocolError -> csClosed` transition in `nextMessage`. If future
     # changes decouple socket close from state transition, this assertion may
     # start failing silently (the state would no longer be csClosed).
     var raised = false

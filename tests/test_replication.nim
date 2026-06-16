@@ -322,7 +322,7 @@ suite "pgoutput decoder":
     data.add(byte('h'))
     data.add(byte('i'))
 
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
   test "Truncate message":
@@ -363,59 +363,59 @@ suite "pgoutput decoder":
     ]
 
   test "empty data raises":
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(newSeq[byte]())
 
   test "unknown message type raises":
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(@[byte('Z')])
 
 suite "pgoutput decoder bounds checking":
   # Each case feeds a truncated or forged message and asserts a catchable
-  # ProtocolError instead of an out-of-bounds read (which would be an
+  # PgProtocolError instead of an out-of-bounds read (which would be an
   # uncatchable IndexDefect, or undefined behaviour under -d:danger).
 
-  test "Begin truncated raises ProtocolError":
+  test "Begin truncated raises PgProtocolError":
     # 'B' followed by only 4 of the 8 finalLsn bytes
     var data = @[byte('B'), 0, 0, 0, 0]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Commit truncated raises ProtocolError":
+  test "Commit truncated raises PgProtocolError":
     # 'C' + flags only, the three LSN/time fields are missing
     var data = @[byte('C'), 0]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Origin truncated raises ProtocolError":
+  test "Origin truncated raises PgProtocolError":
     var data = @[byte('O'), 0, 0, 0]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Type truncated raises ProtocolError":
+  test "Type truncated raises PgProtocolError":
     var data = @[byte('Y'), 0, 0]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Insert with column count past end raises ProtocolError":
+  test "Insert with column count past end raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('I'))
     data.addInt32(16384'i32)
     data.add(byte('N'))
     data.addInt16(100'i16) # claims 100 columns, none follow
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Insert with negative column count raises ProtocolError":
+  test "Insert with negative column count raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('I'))
     data.addInt32(16384'i32)
     data.add(byte('N'))
     data.addInt16(-1'i16)
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Insert tuple data length past end raises ProtocolError":
+  test "Insert tuple data length past end raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('I'))
     data.addInt32(16384'i32)
@@ -424,10 +424,10 @@ suite "pgoutput decoder bounds checking":
     data.add(byte('t'))
     data.addInt32(1000'i32) # claims 1000 bytes
     data.add(byte('x')) # but only 1 present
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Insert tuple with negative data length raises ProtocolError":
+  test "Insert tuple with negative data length raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('I'))
     data.addInt32(16384'i32)
@@ -435,10 +435,10 @@ suite "pgoutput decoder bounds checking":
     data.addInt16(1'i16)
     data.add(byte('t'))
     data.addInt32(-5'i32)
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Relation truncated mid-column raises ProtocolError":
+  test "Relation truncated mid-column raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('R'))
     data.addInt32(16384'i32)
@@ -456,34 +456,34 @@ suite "pgoutput decoder bounds checking":
     data.add(0'u8)
     data.addInt32(23'i32) # typeOid
     # typeMod missing — truncated here
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Truncate with oversized relation count raises ProtocolError":
+  test "Truncate with oversized relation count raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('T'))
     data.addInt32(1_000_000'i32) # claims 1M relations
     data.add(0'u8) # options
     data.addInt32(16384'i32) # only one actually present
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Truncate with negative relation count raises ProtocolError":
+  test "Truncate with negative relation count raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('T'))
     data.addInt32(-1'i32)
     data.add(0'u8)
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Update with marker past end raises ProtocolError":
+  test "Update with marker past end raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('U'))
     data.addInt32(16384'i32) # relationId, then nothing (no marker byte)
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Message content length past end raises ProtocolError":
+  test "Message content length past end raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('M'))
     data.add(0'u8) # flags
@@ -493,12 +493,12 @@ suite "pgoutput decoder bounds checking":
     data.add(0'u8) # prefix terminator
     data.addInt32(9999'i32) # claims 9999 bytes
     data.add(byte('x')) # but only 1 present
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
-  test "Message truncated header raises ProtocolError":
+  test "Message truncated header raises PgProtocolError":
     var data = @[byte('M'), 0, 0, 0]
-    expect(ProtocolError):
+    expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
   test "valid messages still decode after hardening":

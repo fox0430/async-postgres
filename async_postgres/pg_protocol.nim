@@ -346,7 +346,7 @@ proc patchLen*(buf: var seq[byte], offset: int = 1) =
   ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
   if offset < 0 or offset + 3 >= buf.len:
     raise newException(
-      ProtocolError,
+      PgProtocolError,
       "patchLen: offset " & $offset & " out of range for buf.len " & $buf.len,
     )
   let length = int32(buf.high)
@@ -360,7 +360,7 @@ proc patchMsgLen*(buf: var seq[byte], msgStart: int) {.inline.} =
   ## Length = total message size minus the type byte.
   if msgStart < 0 or msgStart + 4 >= buf.len:
     raise newException(
-      ProtocolError,
+      PgProtocolError,
       "patchMsgLen: msgStart " & $msgStart & " out of range for buf.len " & $buf.len,
     )
   let length = int32(buf.len - msgStart - 1)
@@ -407,12 +407,12 @@ proc decodeInt64*(buf: openArray[byte], offset: int): int64 =
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at the given offset. Returns (string, bytes consumed).
   if offset >= buf.len:
-    raise newException(ProtocolError, "decodeCString: offset past end of buffer")
+    raise newException(PgProtocolError, "decodeCString: offset past end of buffer")
   var i = offset
   while i < buf.len and buf[i] != 0:
     inc i
   if i >= buf.len:
-    raise newException(ProtocolError, "decodeCString: missing null terminator")
+    raise newException(PgProtocolError, "decodeCString: missing null terminator")
   let slen = i - offset
   let s = readString(buf, offset, slen)
   inc i # skip null terminator
@@ -709,7 +709,7 @@ proc encodeCopyFail*(errorMsg: string): seq[byte] =
 
 proc parseAuthentication(body: openArray[byte]): BackendMessage =
   if body.len < 4:
-    raise newException(ProtocolError, "Authentication message too short")
+    raise newException(PgProtocolError, "Authentication message too short")
 
   let authType = decodeInt32(body, 0)
   case authType
@@ -719,7 +719,7 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
     result = BackendMessage(kind: bmkAuthenticationCleartextPassword)
   of 5:
     if body.len < 8:
-      raise newException(ProtocolError, "MD5 auth message too short")
+      raise newException(PgProtocolError, "MD5 auth message too short")
     result = BackendMessage(kind: bmkAuthenticationMD5Password)
     for i, b in body[4 .. 7]:
       result.md5Salt[i] = b
@@ -743,11 +743,11 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
     result = BackendMessage(kind: bmkAuthenticationSASLFinal)
     result.saslFinalData = @(body.toOpenArray(4, body.len - 1))
   else:
-    raise newException(ProtocolError, "Unknown authentication type: " & $authType)
+    raise newException(PgProtocolError, "Unknown authentication type: " & $authType)
 
 proc parseBackendKeyData(body: openArray[byte]): BackendMessage =
   if body.len < 8:
-    raise newException(ProtocolError, "BackendKeyData message too short")
+    raise newException(PgProtocolError, "BackendKeyData message too short")
   result = BackendMessage(kind: bmkBackendKeyData)
   result.backendPid = decodeInt32(body, 0)
   result.backendSecretKey = decodeInt32(body, 4)
@@ -759,25 +759,25 @@ proc parseCommandComplete(body: openArray[byte]): BackendMessage =
 
 proc parseDataRow(body: openArray[byte]): BackendMessage =
   if body.len < 2:
-    raise newException(ProtocolError, "DataRow message too short")
+    raise newException(PgProtocolError, "DataRow message too short")
   result = BackendMessage(kind: bmkDataRow)
   let numCols = decodeInt16(body, 0)
   if numCols < 0:
-    raise newException(ProtocolError, "DataRow: invalid column count " & $numCols)
+    raise newException(PgProtocolError, "DataRow: invalid column count " & $numCols)
   result.columns = newSeq[Option[seq[byte]]](numCols)
   var offset = 2
   for i in 0 ..< numCols:
     if offset + 4 > body.len:
-      raise newException(ProtocolError, "DataRow: unexpected end of data")
+      raise newException(PgProtocolError, "DataRow: unexpected end of data")
     let colLen = decodeInt32(body, offset)
     offset += 4
     if colLen < -1:
-      raise newException(ProtocolError, "DataRow: invalid column length " & $colLen)
+      raise newException(PgProtocolError, "DataRow: invalid column length " & $colLen)
     elif colLen == -1:
       result.columns[i] = none(seq[byte])
     else:
       if offset + colLen > body.len:
-        raise newException(ProtocolError, "DataRow: column data truncated")
+        raise newException(PgProtocolError, "DataRow: column data truncated")
       result.columns[i] = some(@(body.toOpenArray(offset, offset + colLen - 1)))
       offset += colLen
 
@@ -804,7 +804,7 @@ proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
 
 proc parseNotification(body: openArray[byte]): BackendMessage =
   if body.len < 4:
-    raise newException(ProtocolError, "Notification message too short")
+    raise newException(PgProtocolError, "Notification message too short")
   result = BackendMessage(kind: bmkNotificationResponse)
   result.notifPid = decodeInt32(body, 0)
   var offset = 4
@@ -823,19 +823,19 @@ proc parseParameterStatus(body: openArray[byte]): BackendMessage =
 
 proc parseRowDescription(body: openArray[byte]): BackendMessage =
   if body.len < 2:
-    raise newException(ProtocolError, "RowDescription message too short")
+    raise newException(PgProtocolError, "RowDescription message too short")
   result = BackendMessage(kind: bmkRowDescription)
   let numFields = decodeInt16(body, 0)
   if numFields < 0:
     raise
-      newException(ProtocolError, "RowDescription: invalid field count " & $numFields)
+      newException(PgProtocolError, "RowDescription: invalid field count " & $numFields)
   result.fields = newSeq[FieldDescription](numFields)
   var offset = 2
   for i in 0 ..< numFields:
     let (name, consumed) = decodeCString(body, offset)
     offset += consumed
     if offset + 18 > body.len:
-      raise newException(ProtocolError, "RowDescription: unexpected end of data")
+      raise newException(PgProtocolError, "RowDescription: unexpected end of data")
     result.fields[i] = FieldDescription(
       name: name,
       tableOid: decodeInt32(body, offset),
@@ -849,7 +849,7 @@ proc parseRowDescription(body: openArray[byte]): BackendMessage =
 
 proc parseReadyForQuery(body: openArray[byte]): BackendMessage =
   if body.len < 1:
-    raise newException(ProtocolError, "ReadyForQuery message too short")
+    raise newException(PgProtocolError, "ReadyForQuery message too short")
   result = BackendMessage(kind: bmkReadyForQuery)
   case char(body[0])
   of 'I':
@@ -859,28 +859,28 @@ proc parseReadyForQuery(body: openArray[byte]): BackendMessage =
   of 'E':
     result.txStatus = tsInFailedTransaction
   else:
-    raise newException(ProtocolError, "Unknown transaction status: " & $char(body[0]))
+    raise newException(PgProtocolError, "Unknown transaction status: " & $char(body[0]))
 
 proc parseParameterDescription(body: openArray[byte]): BackendMessage =
   if body.len < 2:
-    raise newException(ProtocolError, "ParameterDescription too short")
+    raise newException(PgProtocolError, "ParameterDescription too short")
   result = BackendMessage(kind: bmkParameterDescription)
   let numParams = decodeInt16(body, 0)
   if numParams < 0:
     raise newException(
-      ProtocolError, "ParameterDescription: invalid param count " & $numParams
+      PgProtocolError, "ParameterDescription: invalid param count " & $numParams
     )
   result.paramTypeOids = newSeq[int32](numParams)
   var offset = 2
   for i in 0 ..< numParams:
     if offset + 4 > body.len:
-      raise newException(ProtocolError, "ParameterDescription truncated")
+      raise newException(PgProtocolError, "ParameterDescription truncated")
     result.paramTypeOids[i] = decodeInt32(body, offset)
     offset += 4
 
 proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
   if body.len < 3:
-    raise newException(ProtocolError, "CopyResponse message too short")
+    raise newException(PgProtocolError, "CopyResponse message too short")
   if isIn:
     result = BackendMessage(kind: bmkCopyInResponse)
   else:
@@ -888,29 +888,31 @@ proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
   result.copyFormat = if body[0] == 0: cfText else: cfBinary
   let numCols = decodeInt16(body, 1)
   if numCols < 0:
-    raise newException(ProtocolError, "CopyResponse: invalid column count " & $numCols)
+    raise
+      newException(PgProtocolError, "CopyResponse: invalid column count " & $numCols)
   result.copyColumnFormats = newSeq[int16](numCols)
   var offset = 3
   for i in 0 ..< numCols:
     if offset + 2 > body.len:
-      raise newException(ProtocolError, "CopyResponse truncated")
+      raise newException(PgProtocolError, "CopyResponse truncated")
     result.copyColumnFormats[i] = decodeInt16(body, offset)
     offset += 2
 
 proc parseCopyBothResponse(body: openArray[byte]): BackendMessage =
   if body.len < 3:
-    raise newException(ProtocolError, "CopyBothResponse message too short")
+    raise newException(PgProtocolError, "CopyBothResponse message too short")
   result = BackendMessage(kind: bmkCopyBothResponse)
   result.copyFormat = if body[0] == 0: cfText else: cfBinary
   let numCols = decodeInt16(body, 1)
   if numCols < 0:
-    raise
-      newException(ProtocolError, "CopyBothResponse: invalid column count " & $numCols)
+    raise newException(
+      PgProtocolError, "CopyBothResponse: invalid column count " & $numCols
+    )
   result.copyColumnFormats = newSeq[int16](numCols)
   var offset = 3
   for i in 0 ..< numCols:
     if offset + 2 > body.len:
-      raise newException(ProtocolError, "CopyBothResponse truncated")
+      raise newException(PgProtocolError, "CopyBothResponse truncated")
     result.copyColumnFormats[i] = decodeInt16(body, offset)
     offset += 2
 
@@ -1012,10 +1014,10 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   ## Uses a single bulk copyMem for the entire row payload, then walks the
   ## copied buffer to build cellIndex entries.
   if body.len < 2:
-    raise newException(ProtocolError, "DataRow message too short")
+    raise newException(PgProtocolError, "DataRow message too short")
   let numCols = decodeInt16(body, 0)
   if numCols < 0:
-    raise newException(ProtocolError, "DataRow: invalid column count " & $numCols)
+    raise newException(PgProtocolError, "DataRow: invalid column count " & $numCols)
   # Pre-extend cellIndex for this row
   let cellBase = rd.cellIndex.len
   rd.cellIndex.setLen(cellBase + int(numCols) * 2)
@@ -1032,7 +1034,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
     if pos + 4 > bufEnd:
       rd.cellIndex.setLen(cellBase)
       rd.buf.setLen(bufBase)
-      raise newException(ProtocolError, "DataRow: unexpected end of data")
+      raise newException(PgProtocolError, "DataRow: unexpected end of data")
     # Decode column length from copied buffer (big-endian int32)
     let colLen =
       int32(rd.buf[pos]) shl 24 or int32(rd.buf[pos + 1]) shl 16 or
@@ -1042,7 +1044,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
     if colLen < -1:
       rd.cellIndex.setLen(cellBase)
       rd.buf.setLen(bufBase)
-      raise newException(ProtocolError, "DataRow: invalid column length " & $colLen)
+      raise newException(PgProtocolError, "DataRow: invalid column length " & $colLen)
     elif colLen == -1:
       rd.cellIndex[ci] = 0'i32
       rd.cellIndex[ci + 1] = -1'i32
@@ -1050,7 +1052,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
       if pos + colLen > bufEnd:
         rd.cellIndex.setLen(cellBase)
         rd.buf.setLen(bufBase)
-        raise newException(ProtocolError, "DataRow: column data truncated")
+        raise newException(PgProtocolError, "DataRow: column data truncated")
       rd.cellIndex[ci] = int32(pos)
       rd.cellIndex[ci + 1] = colLen
       pos += int(colLen)
@@ -1069,12 +1071,12 @@ proc parseBackendMessage*(
     consumed: var int,
     rowData: RowData = nil,
     maxLen: int = DefaultMaxBackendMessageLen,
-): ParseResult {.raises: [ProtocolError].} =
+): ParseResult {.raises: [PgProtocolError].} =
   ## Parse a single backend message from `buf`.
   ## On success, sets `consumed` to the number of bytes used.
   ## The caller is responsible for discarding those bytes from the buffer.
   ## A message whose declared length exceeds `maxLen` is rejected with
-  ## `ProtocolError` before any allocation, capping recv-buffer growth.
+  ## `PgProtocolError` before any allocation, capping recv-buffer growth.
   ## ``maxLen <= 0`` disables the cap (intended for tests); production
   ## callers should resolve the default via ``ConnConfig.maxMessageSize``
   ## and ``effectiveMaxMessageSize``.
@@ -1088,14 +1090,14 @@ proc parseBackendMessage*(
   let msgLen = decodeInt32(buf, 1) # includes self but not type byte
 
   if msgLen < 4:
-    raise newException(ProtocolError, "Invalid message length: " & $msgLen)
+    raise newException(PgProtocolError, "Invalid message length: " & $msgLen)
   # Compare in int64 to avoid overflow on 32-bit platforms where `int` is
   # 32-bit and `msgLen + 1` would wrap when msgLen approaches int32.high.
   # Total message size is `msgLen + 1` (type byte), so reject when that
   # would exceed maxLen, i.e. when `msgLen >= maxLen`.
   if maxLen > 0 and int64(msgLen) >= int64(maxLen):
     raise newException(
-      ProtocolError,
+      PgProtocolError,
       "Backend message too large: " & $msgLen & " bytes (max " & $maxLen & ")",
     )
 
@@ -1163,7 +1165,7 @@ proc parseBackendMessage*(
   of 'c':
     msg = BackendMessage(kind: bmkCopyDone)
   else:
-    raise newException(ProtocolError, "Unknown backend message type: " & msgType)
+    raise newException(PgProtocolError, "Unknown backend message type: " & msgType)
 
   consumed = totalLen
   result = ParseResult(state: psComplete, message: msg)
