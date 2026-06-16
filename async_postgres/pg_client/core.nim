@@ -516,7 +516,7 @@ template queryEachRecvLoop*(
             parseBackendMessage(
               conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rd, maxLen
             )
-          except ProtocolError as e:
+          except PgProtocolError as e:
             conn.state = csClosed
             raise e
         if res.state == psIncomplete:

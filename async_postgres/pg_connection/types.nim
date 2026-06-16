@@ -131,7 +131,7 @@ type
     maxMessageSize*: int
       ## Upper bound (in bytes) on a single backend message including
       ## its 1-byte type and 4-byte length header. A server claiming a
-      ## larger message is rejected with `ProtocolError` before any
+      ## larger message is rejected with `PgProtocolError` before any
       ## further recv-buffer growth, capping memory exposure to a
       ## misbehaving or malicious peer. ``0`` (default) selects
       ## `DefaultMaxBackendMessageLen` (1 GiB).

@@ -1,7 +1,7 @@
 ## Exception hierarchy.
 ##
 ## All library-raised exceptions derive from ``PgError`` so callers can catch
-## every pg-specific failure with a single ``except PgError`` clause. ``ProtocolError``
+## every pg-specific failure with a single ``except PgError`` clause. ``PgProtocolError``
 ## is a subtype of ``PgConnectionError`` because a protocol-level violation
 ## desynchronises the wire stream — the only viable recovery is to tear down
 ## and re-establish the connection.
@@ -28,9 +28,12 @@ type
   PgConnectionError* = object of PgError
     ## Connection failures, disconnections, SSL/auth errors.
 
-  ProtocolError* = object of PgConnectionError
+  PgProtocolError* = object of PgConnectionError
     ## Raised on PostgreSQL wire protocol violations. The connection stream is
     ## desynchronised after this error and must be torn down.
+
+  ProtocolError* {.deprecated: "use PgProtocolError".} = PgProtocolError
+    ## Deprecated alias for `PgProtocolError`, kept for backwards compatibility.
 
   PgQueryError* = object of PgError
     ## SQL execution errors from the server (ErrorResponse).

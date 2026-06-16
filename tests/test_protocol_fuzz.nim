@@ -5,7 +5,7 @@
 ## input are:
 ##   * `psIncomplete` (need more bytes)
 ##   * `psComplete` / `psDataRow` (valid message recognised)
-##   * raising `ProtocolError` (wire protocol violation)
+##   * raising `PgProtocolError` (wire protocol violation)
 ##   * raising `PgTypeError` (unparseable type payload)
 ## Anything else — in particular `IndexDefect`, `RangeDefect`, `DivByZeroDefect`
 ## — is a bug in the decoder.
@@ -39,11 +39,11 @@ proc header(msgType: char, claimedLen: int32): seq[byte] =
   result[4] = byte(claimedLen and 0xFF)
 
 template expectParseError(body: untyped) =
-  ## Assert that `body` raises `ProtocolError` (not `Defect`).
+  ## Assert that `body` raises `PgProtocolError` (not `Defect`).
   var raised = false
   try:
     body
-  except ProtocolError:
+  except PgProtocolError:
     raised = true
   check raised
 
@@ -56,7 +56,7 @@ template expectTypeError(body: untyped) =
   check raised
 
 proc tryParse(buf: openArray[byte]): tuple[state: ParseState, consumed: int] =
-  ## Run `parseBackendMessage` and normalise the outcome. Raises `ProtocolError`
+  ## Run `parseBackendMessage` and normalise the outcome. Raises `PgProtocolError`
   ## on wire-protocol violations; all other exceptions escape (test failure).
   var consumed = 0
   let res = parseBackendMessage(buf, consumed)
@@ -77,21 +77,21 @@ suite "parseBackendMessage: framing":
     check res.state == psIncomplete
     check consumed == 0
 
-  test "msgLen == 0 raises ProtocolError":
+  test "msgLen == 0 raises PgProtocolError":
     expectParseError:
       discard tryParse(header('C', 0))
 
-  test "msgLen == 3 (below minimum 4) raises ProtocolError":
+  test "msgLen == 3 (below minimum 4) raises PgProtocolError":
     expectParseError:
       discard tryParse(header('C', 3))
 
-  test "negative msgLen raises ProtocolError":
+  test "negative msgLen raises PgProtocolError":
     expectParseError:
       discard tryParse(header('C', -1))
     expectParseError:
       discard tryParse(header('C', int32.low))
 
-  test "msgLen above default cap raises ProtocolError":
+  test "msgLen above default cap raises PgProtocolError":
     # int32.high (~2 GiB) exceeds DefaultMaxBackendMessageLen (1 GiB) and
     # must be rejected before the recv loop can grow the buffer further.
     expectParseError:
@@ -105,11 +105,11 @@ suite "parseBackendMessage: framing":
     check state == psIncomplete
     check consumed == 0
 
-  test "unknown message type 'X' raises ProtocolError":
+  test "unknown message type 'X' raises PgProtocolError":
     expectParseError:
       discard tryParse(wrap('X', @[]))
 
-  test "bytes unassigned on the backend side raise ProtocolError":
+  test "bytes unassigned on the backend side raise PgProtocolError":
     # 'P', 'B', 'F', 'Q' are frontend message types; the rest are truly
     # unassigned. All should be rejected by the backend parser.
     for ch in ['x', 'Y', 'Q', 'P', 'B', 'F', '!', '@']:
@@ -167,7 +167,7 @@ suite "parseBackendMessage: per-kind malformed bodies":
     expectParseError:
       discard tryParse(wrap('D', body))
 
-  test "DataRow with negative column count raises ProtocolError":
+  test "DataRow with negative column count raises PgProtocolError":
     let body = @[byte 0xFF, 0xFF]
     expectParseError:
       discard tryParse(wrap('D', body))
@@ -262,7 +262,7 @@ suite "parseBackendMessage: seeded random fuzz":
 
   test "random bytes never crash parseBackendMessage":
     # The contract: any input produces psComplete/psDataRow/psIncomplete or
-    # raises ProtocolError. Any other exception escapes and fails the test.
+    # raises PgProtocolError. Any other exception escapes and fails the test.
     for seed in seeds:
       var r = initRand(seed)
       for _ in 0 ..< itersPerSeed:
@@ -275,7 +275,7 @@ suite "parseBackendMessage: seeded random fuzz":
           let res = parseBackendMessage(buf, consumed)
           if res.state == psIncomplete:
             check consumed == 0
-        except ProtocolError:
+        except PgProtocolError:
           discard
 
   test "random buffers whose first byte picks a valid message type":
@@ -296,7 +296,7 @@ suite "parseBackendMessage: seeded random fuzz":
         try:
           var consumed = 0
           discard parseBackendMessage(buf, consumed)
-        except ProtocolError:
+        except PgProtocolError:
           discard
 
   test "random buffer fed into streaming RowData sink never crashes":
@@ -313,7 +313,7 @@ suite "parseBackendMessage: seeded random fuzz":
         try:
           var consumed = 0
           discard parseBackendMessage(buf, consumed, rd)
-        except ProtocolError:
+        except PgProtocolError:
           discard
 
 # Hand-written negative paths: binary type decoders
