@@ -17,6 +17,9 @@ when hasAsyncDispatch:
 
 # Types and low-level transport
 
+type AutoKeepaliveResult* =
+  tuple[msgType: char, receive: int64, flush: int64, apply: int64]
+
 when hasChronos:
   type
     MockServer* = object
@@ -223,6 +226,48 @@ proc buildErrorResponse*(sqlState, message: string): seq[byte] =
   body.add(0'u8) # field list terminator
   buildBackendMsg('E', body)
 
+# Replication (CopyBothResponse / CopyData) builders and decoders, shared by the
+# replication test suites.
+
+proc buildCopyBothResponse*(): seq[byte] =
+  ## CopyBothResponse: format(1=binary) + numCols(0).
+  var body: seq[byte]
+  body.add(1'u8)
+  body.addInt16(0'i16)
+  buildBackendMsg('W', body)
+
+proc buildCopyData*(payload: openArray[byte]): seq[byte] =
+  buildBackendMsg('d', payload)
+
+proc buildXLogData*(startLsn, walEnd, sendTime: int64, walData: seq[byte]): seq[byte] =
+  ## CopyData('w' + startLsn + walEnd + sendTime + walData).
+  var payload: seq[byte]
+  payload.add(byte('w'))
+  payload.addInt64(startLsn)
+  payload.addInt64(walEnd)
+  payload.addInt64(sendTime)
+  payload.add(walData)
+  buildCopyData(payload)
+
+proc buildKeepalive*(walEnd, sendTime: int64, replyRequested: bool): seq[byte] =
+  ## CopyData('k' + walEnd + sendTime + replyRequested).
+  var payload: seq[byte]
+  payload.add(byte('k'))
+  payload.addInt64(walEnd)
+  payload.addInt64(sendTime)
+  payload.add(if replyRequested: 1'u8 else: 0'u8)
+  buildCopyData(payload)
+
+proc buildCopyDone*(): seq[byte] =
+  @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
+
+proc decodeStandbyStatus*(body: seq[byte]): tuple[receive, flush, apply: int64] =
+  ## Frontend CopyData body for a Standby Status Update:
+  ## 'r' + receive(8) + flush(8) + apply(8) + clock(8) + replyRequested(1).
+  doAssert body.len == 1 + 8 + 8 + 8 + 8 + 1, "unexpected standby status size"
+  doAssert body[0] == byte('r'), "expected standby status type byte 'r'"
+  (decodeInt64(body, 1), decodeInt64(body, 9), decodeInt64(body, 17))
+
 # Frontend readers
 
 proc drainStartupMessage*(client: MockClient) {.async.} =
@@ -243,6 +288,39 @@ proc drainFrontendMessage*(
   let msgLen = decodeInt32(lenBuf, 0)
   if msgLen > 4:
     result.body = await readN(client, msgLen - 4)
+
+proc runAutoKeepaliveServer*(
+    client: MockClient,
+    startLsn, walEnd, keepaliveWalEnd: int64,
+    walData: seq[byte],
+    endStream: bool = true,
+): Future[AutoKeepaliveResult] {.async.} =
+  ## Server-side helper for auto-keepalive reply tests. Drains the
+  ## START_REPLICATION query, sends CopyBothResponse + XLogData +
+  ## PrimaryKeepalive(replyRequested=true), captures the client's Standby Status
+  ## Update reply, and optionally ends the stream with CopyDone + ReadyForQuery
+  ## (consuming the client's CopyDone reply). Returns the decoded reply fields.
+  discard await drainFrontendMessage(client) # START_REPLICATION
+  var burst: seq[byte]
+  burst.add(buildCopyBothResponse())
+  burst.add(buildXLogData(startLsn, walEnd, 0, walData))
+  burst.add(buildKeepalive(keepaliveWalEnd, 0, replyRequested = true))
+  await sendBytes(client, burst)
+  let reply = await drainFrontendMessage(client)
+  var observed: AutoKeepaliveResult
+  observed.msgType = reply.msgType
+  if reply.msgType == 'd':
+    let ssu = decodeStandbyStatus(reply.body)
+    observed.receive = ssu.receive
+    observed.flush = ssu.flush
+    observed.apply = ssu.apply
+  if endStream:
+    var tail: seq[byte]
+    tail.add(buildCopyDone())
+    tail.add(buildReadyForQuery('I'))
+    await sendBytes(client, tail)
+    discard await drainFrontendMessage(client) # client's CopyDone
+  return observed
 
 # Full handshake shortcut
 
