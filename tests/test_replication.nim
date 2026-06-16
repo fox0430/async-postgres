@@ -249,6 +249,20 @@ suite "pgoutput decoder":
     check msg.insert.newTuple[0].data == @[byte('4'), byte('2')]
     check msg.insert.newTuple[1].kind == tdkNull
 
+  test "Insert message with invalid marker raises":
+    var data: seq[byte]
+    data.add(byte('I'))
+    data.addInt32(16384'i32) # relationId
+    data.add(byte('X')) # invalid marker (should be 'N')
+    data.addInt16(1'i16)
+    data.add(byte('t'))
+    data.addInt32(2'i32)
+    data.add(byte('4'))
+    data.add(byte('2'))
+
+    expect(PgProtocolError):
+      discard parsePgOutputMessage(data)
+
   test "Delete message":
     var data: seq[byte]
     data.add(byte('D'))
@@ -264,8 +278,39 @@ suite "pgoutput decoder":
     let msg = parsePgOutputMessage(data)
     check msg.kind == pomkDelete
     check msg.delete.relationId == 16384'i32
+    check msg.delete.keyKind == 'K'
     check msg.delete.oldTuple.len == 1
     check msg.delete.oldTuple[0].kind == tdkText
+
+  test "Delete message with full old tuple":
+    var data: seq[byte]
+    data.add(byte('D'))
+    data.addInt32(16384'i32) # relationId
+    data.add(byte('O')) # old tuple marker (REPLICA IDENTITY FULL)
+    data.addInt16(1'i16) # 1 column
+    data.add(byte('t'))
+    data.addInt32(2'i32)
+    data.add(byte('4'))
+    data.add(byte('2'))
+
+    let msg = parsePgOutputMessage(data)
+    check msg.kind == pomkDelete
+    check msg.delete.keyKind == 'O'
+    check msg.delete.oldTuple.len == 1
+
+  test "Delete message with invalid marker raises":
+    var data: seq[byte]
+    data.add(byte('D'))
+    data.addInt32(16384'i32) # relationId
+    data.add(byte('X')) # invalid marker
+    data.addInt16(1'i16)
+    data.add(byte('t'))
+    data.addInt32(2'i32)
+    data.add(byte('4'))
+    data.add(byte('2'))
+
+    expect(PgProtocolError):
+      discard parsePgOutputMessage(data)
 
   test "Update message with old tuple":
     var data: seq[byte]
@@ -289,10 +334,36 @@ suite "pgoutput decoder":
     let msg = parsePgOutputMessage(data)
     check msg.kind == pomkUpdate
     check msg.update.hasOldTuple == true
+    check msg.update.keyKind == 'O'
     check msg.update.oldTuple.len == 1
     check msg.update.oldTuple[0].data == @[byte('o'), byte('l'), byte('d')]
     check msg.update.newTuple.len == 1
     check msg.update.newTuple[0].data == @[byte('n'), byte('e'), byte('w')]
+
+  test "Update message with old key only":
+    var data: seq[byte]
+    data.add(byte('U'))
+    data.addInt32(16384'i32) # relationId
+    data.add(byte('K')) # old key marker
+    data.addInt16(1'i16) # 1 column in old key
+    data.add(byte('t'))
+    data.addInt32(2'i32)
+    data.add(byte('4'))
+    data.add(byte('2'))
+    data.add(byte('N')) # new tuple marker
+    data.addInt16(1'i16) # 1 column in new tuple
+    data.add(byte('t'))
+    data.addInt32(3'i32)
+    data.add(byte('n'))
+    data.add(byte('e'))
+    data.add(byte('w'))
+
+    let msg = parsePgOutputMessage(data)
+    check msg.kind == pomkUpdate
+    check msg.update.hasOldTuple == true
+    check msg.update.keyKind == 'K'
+    check msg.update.oldTuple.len == 1
+    check msg.update.newTuple.len == 1
 
   test "Update message without old tuple":
     var data: seq[byte]
@@ -308,6 +379,7 @@ suite "pgoutput decoder":
     let msg = parsePgOutputMessage(data)
     check msg.kind == pomkUpdate
     check msg.update.hasOldTuple == false
+    check msg.update.keyKind == '\0'
     check msg.update.oldTuple.len == 0
     check msg.update.newTuple.len == 1
 
@@ -321,6 +393,28 @@ suite "pgoutput decoder":
     data.addInt32(2'i32)
     data.add(byte('h'))
     data.add(byte('i'))
+
+    expect(PgProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Update message with invalid new tuple marker raises":
+    var data: seq[byte]
+    data.add(byte('U'))
+    data.addInt32(16384'i32) # relationId
+    data.add(byte('O')) # old tuple marker
+    data.addInt16(1'i16) # 1 column in old tuple
+    data.add(byte('t'))
+    data.addInt32(3'i32)
+    data.add(byte('o'))
+    data.add(byte('l'))
+    data.add(byte('d'))
+    data.add(byte('X')) # invalid new tuple marker (should be 'N')
+    data.addInt16(1'i16)
+    data.add(byte('t'))
+    data.addInt32(3'i32)
+    data.add(byte('n'))
+    data.add(byte('e'))
+    data.add(byte('w'))
 
     expect(PgProtocolError):
       discard parsePgOutputMessage(data)
