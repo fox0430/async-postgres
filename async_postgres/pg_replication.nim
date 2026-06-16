@@ -145,11 +145,18 @@ type
   UpdateMessage* = object ## Row update.
     relationId*: int32
     hasOldTuple*: bool ## True if old key/full row is included
+    keyKind*: char
+      ## When hasOldTuple is true: 'K' if oldTuple holds only the replica
+      ## identity key, 'O' if it holds the full old row (REPLICA IDENTITY FULL).
+      ## '\0' when no old tuple is present.
     oldTuple*: seq[TupleField]
     newTuple*: seq[TupleField]
 
   DeleteMessage* = object ## Row deletion.
     relationId*: int32
+    keyKind*: char
+      ## 'K' if oldTuple holds only the replica identity key,
+      ## 'O' if it holds the full old row (REPLICA IDENTITY FULL).
     oldTuple*: seq[TupleField]
 
   TruncateMessage* = object ## Table truncation.
@@ -401,7 +408,9 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
   of 'I': # Insert
     var msg = InsertMessage()
     msg.relationId = readInt32At(data, 1)
-    # byte at offset 5 is 'N' (new tuple marker)
+    let marker = char(readByteAt(data, 5)) # 'N' (new tuple marker)
+    if marker != 'N':
+      raise newException(PgProtocolError, "Unknown Insert tuple marker: " & marker)
     let (fields, _) = decodeTuple(data, 6)
     msg.newTuple = fields
     PgOutputMessage(kind: pomkInsert, insert: msg)
@@ -414,10 +423,15 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     if marker == 'K' or marker == 'O':
       # Old key or old tuple included
       msg.hasOldTuple = true
+      msg.keyKind = marker
       let (oldFields, nextPos) = decodeTuple(data, pos)
       msg.oldTuple = oldFields
       pos = nextPos
-      inc pos # skip 'N' marker for new tuple
+      let newMarker = char(readByteAt(data, pos)) # 'N' (new tuple marker)
+      if newMarker != 'N':
+        raise
+          newException(PgProtocolError, "Unknown Update new tuple marker: " & newMarker)
+      inc pos
     elif marker != 'N':
       raise newException(PgProtocolError, "Unknown Update tuple marker: " & marker)
     let (newFields, _) = decodeTuple(data, pos)
@@ -427,7 +441,10 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     var msg = DeleteMessage()
     msg.relationId = readInt32At(data, 1)
     var pos = 5
-    # byte at offset 5 is 'K' (key) or 'O' (old tuple)
+    let marker = char(readByteAt(data, pos)) # 'K' (key) or 'O' (old tuple)
+    if marker != 'K' and marker != 'O':
+      raise newException(PgProtocolError, "Unknown Delete tuple marker: " & marker)
+    msg.keyKind = marker
     inc pos
     let (fields, _) = decodeTuple(data, pos)
     msg.oldTuple = fields
