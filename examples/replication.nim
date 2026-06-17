@@ -81,17 +81,30 @@ proc main() {.async.} =
       else:
         echo "Other: ", pgMsg.kind
 
-      # Acknowledge progress. Use receivedEndLsn (startLsn + data.len), not
-      # walEnd: walEnd is the server's current WAL position and may point past
-      # what this message actually carries.
-      await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
+      # Mark the received changes durable. confirmFlushed only records the
+      # flush/apply position locally; the automatic keepalive reply
+      # (autoKeepaliveReply, default) carries it to the server on the next
+      # reply-requested keepalive, and stopReplication flushes it on a clean
+      # stop — together advancing the slot's confirmed_flush_lsn. Call it only
+      # *after* the change is durably processed (here, echoed above). Use
+      # receivedEndLsn (startLsn + data.len), not walEnd: walEnd is the server's
+      # current WAL position and may point past what this message actually
+      # carries.
+      #
+      # To advance the slot eagerly on every message instead, call
+      # `await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)` here and
+      # pass `autoKeepaliveReply = false` to startReplication — otherwise the
+      # auto-reply would report a flush position behind your manual ACKs.
+      discard replConn.confirmFlushed(msg.xlogData.receivedEndLsn)
 
       inc msgCount
       if msgCount >= 10:
         await replConn.stopReplication()
     of rmkPrimaryKeepalive:
-      # startReplication's autoKeepaliveReply (default) already responds with
-      # the highest receivedEndLsn observed so far. No manual reply needed.
+      # startReplication's autoKeepaliveReply (default) answers keepalives for
+      # us: the receive LSN is the highest receivedEndLsn observed, while
+      # flush/apply reflect the confirmFlushed position set above. No manual
+      # reply needed.
       discard
 
   echo "Starting replication from ", slot.consistentPoint
