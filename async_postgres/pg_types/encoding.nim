@@ -1440,7 +1440,7 @@ proc addParse*(
   buf.addInt32(0) # length placeholder
   buf.addCString(stmtName)
   buf.addCString(sql)
-  buf.addInt16(int16(params.len))
+  buf.addCount16(params.len, "Parse parameter-type")
   for p in params:
     buf.addInt32(p.oid)
   buf.patchMsgLen(msgStart)
@@ -1458,20 +1458,20 @@ proc addBind*(
   buf.addCString(portalName)
   buf.addCString(stmtName)
   # Parameter format codes
-  buf.addInt16(int16(params.len))
+  buf.addCount16(params.len, "Bind parameter-format")
   for p in params:
     buf.addInt16(p.format)
   # Parameter values
-  buf.addInt16(int16(params.len))
+  buf.addCount16(params.len, "Bind parameter")
   for p in params:
     if p.value.isNone:
       buf.addInt32(-1) # NULL
     else:
       let data = p.value.get
-      buf.addInt32(int32(data.len))
+      buf.addLen32(data.len, "Bind parameter value")
       buf.appendBytes(data)
   # Result format codes
-  buf.addInt16(int16(resultFormats.len))
+  buf.addCount16(resultFormats.len, "Bind result-format")
   for f in resultFormats:
     buf.addInt16(f)
   buf.patchMsgLen(msgStart)
@@ -1542,12 +1542,12 @@ proc writeParamValue*(buf: var seq[byte], v: bool) =
   buf.add(if v: 1'u8 else: 0'u8)
 
 proc writeParamValue*(buf: var seq[byte], v: string) =
-  buf.addInt32(int32(v.len))
+  buf.addLen32(v.len, "parameter value")
   if v.len > 0:
     buf.appendBytes(v.toOpenArrayByte(0, v.high))
 
 proc writeParamValue*(buf: var seq[byte], v: seq[byte]) =
-  buf.addInt32(int32(v.len))
+  buf.addLen32(v.len, "parameter value")
   buf.appendBytes(v)
 
 proc writeParamValue*(buf: var seq[byte], v: PgNumeric) =

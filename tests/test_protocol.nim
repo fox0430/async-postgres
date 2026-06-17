@@ -1,7 +1,7 @@
 import std/[unittest, options, strutils, tables, importutils]
 
-import ../async_postgres/async_backend
-import ../async_postgres/[pg_protocol, pg_connection]
+import ../async_postgres/[async_backend, pg_protocol, pg_connection]
+import ../async_postgres/pg_types/[core, encoding]
 
 privateAccess(PgConnection)
 
@@ -199,6 +199,112 @@ suite "Frontend encoding":
     let msg = encodeBind("", "stmt1", @[0'i16, 0'i16], paramValues)
     check msg[0] == byte('B')
     check decodeInt32(msg, 1) == int32(msg.len - 1)
+
+  const maxCount = int(high(int16)) # 32767: wire Int16 count-field maximum
+
+  test "encodeParse rejects param-type count over the Int16 maximum":
+    # int16(n) would raise an uncatchable RangeDefect (or wrap under -d:danger);
+    # the explicit guard turns it into a catchable ValueError before encoding.
+    expect(ValueError):
+      discard encodeParse("s", "SELECT 1", newSeq[int32](maxCount + 1))
+
+  test "encodeBind rejects counts over the Int16 maximum":
+    expect( # parameter-value count
+      ValueError
+    ):
+      discard encodeBind("", "s", @[], newSeq[Option[seq[byte]]](maxCount + 1))
+    expect( # parameter-format count
+      ValueError
+    ):
+      discard encodeBind("", "s", newSeq[int16](maxCount + 1), @[])
+    expect( # result-format count
+      ValueError
+    ):
+      discard encodeBind("", "s", @[], @[], newSeq[int16](maxCount + 1))
+
+  test "addBindRaw rejects param-range count over the Int16 maximum":
+    var buf: seq[byte] = @[]
+    expect(ValueError):
+      buf.addBindRaw("", "s", @[], @[], newSeq[tuple[off, len: int32]](maxCount + 1))
+
+  test "encodeBind accepts exactly the Int16 maximum count":
+    # Boundary: maxCount elements must encode cleanly (no off-by-one rejection).
+    let msg = encodeBind("", "", @[], newSeq[Option[seq[byte]]](maxCount))
+    check msg[0] == byte('B')
+    check decodeInt32(msg, 1) == int32(msg.len - 1)
+    # Parameter-value count field follows portal+stmt names (both empty: 2 NULs)
+    # and the 2-byte parameter-format count (0). Offset = 1+4+1+1+2 = 9.
+    check decodeInt16(msg, 9) == int16(maxCount)
+
+  const maxLen = int(high(int32)) # 2147483647: wire Int32 length-field maximum
+
+  test "addLen32 accepts and encodes the exact Int32 maximum length":
+    # Boundary: maxLen must encode cleanly. addLen32 writes only the 4-byte
+    # length (callers append the payload separately), so no large allocation is
+    # needed to exercise the guard at its limit. Length-prefixed value fields in
+    # encodeBind/encodeSASLInitialResponse/addCopyField* all route through it.
+    var buf: seq[byte] = @[]
+    buf.addLen32(maxLen, "test")
+    check buf.len == 4
+    check decodeInt32(buf, 0) == int32(maxLen)
+
+  test "addLen32 rejects a length over the Int32 maximum":
+    # int32(n) would raise an uncatchable RangeDefect (or wrap under -d:danger);
+    # the guard turns it into a catchable ValueError before any payload is
+    # appended. Exceeding the limit requires a 64-bit `int`.
+    when sizeof(int) > 4:
+      var buf: seq[byte] = @[]
+      expect(ValueError):
+        buf.addLen32(maxLen + 1, "test")
+      check buf.len == 0 # nothing written on rejection
+
+  test "addCount16 rejects negative count":
+    var buf: seq[byte] = @[]
+    expect(ValueError):
+      buf.addCount16(-1, "test")
+    check buf.len == 0 # nothing written on rejection
+
+  test "addLen32 rejects negative length":
+    var buf: seq[byte] = @[]
+    expect(ValueError):
+      buf.addLen32(-1, "test")
+    check buf.len == 0 # nothing written on rejection
+
+  test "writeParamValue encodes string and seq[byte] lengths":
+    var buf: seq[byte] = @[]
+    buf.writeParamValue("abc")
+    check decodeInt32(buf, 0) == 3'i32
+    check buf.len == 4 + 3
+
+    buf.setLen(0)
+    buf.writeParamValue(@[1'u8, 2, 3, 4])
+    check decodeInt32(buf, 0) == 4'i32
+    check buf.len == 4 + 4
+
+  test "encoding addParse rejects param count over Int16 maximum":
+    # The PgParam overload in pg_types/encoding is the path used by the real
+    # client; it must guard the Int16 parameter-type count just like the
+    # low-level encodeParse overload in pg_protocol. The message header is
+    # written before the count field, so the buffer is not empty on rejection.
+    var buf: seq[byte] = @[]
+    expect(ValueError):
+      buf.addParse("s", "SELECT 1", newSeq[PgParam](maxCount + 1))
+
+  test "encoding addBind rejects param count over Int16 maximum":
+    var buf: seq[byte] = @[]
+    expect(ValueError):
+      buf.addBind("", "s", newSeq[PgParam](maxCount + 1))
+
+  test "encoding addBind accepts exactly the Int16 maximum count":
+    # Boundary: maxCount PgParam elements must encode cleanly.
+    var buf: seq[byte] = @[]
+    buf.addBind("", "", newSeq[PgParam](maxCount))
+    check buf[0] == byte('B')
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+    # Layout: 'B'(1) + len(4) + portal NUL + stmt NUL + format count(2) +
+    #         maxCount * format(2) + value count(2) + ...
+    check decodeInt16(buf, 7) == int16(maxCount) # format count
+    check decodeInt16(buf, 9 + 2 * maxCount) == int16(maxCount) # value count
 
   test "encodeDescribe":
     let msg = encodeDescribe(dkStatement, "stmt1")
