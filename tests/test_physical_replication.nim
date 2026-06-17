@@ -52,6 +52,10 @@ var physObservedReceiveLsn: int64 = -1
 var physObservedFlushLsn: int64 = -1
 var physObservedApplyLsn: int64 = -1
 var physObservedReplyMsgType: char = '\0'
+var physStatusIntervalReceiveLsn: int64 = -1
+var physStatusIntervalFlushLsn: int64 = -1
+var physStatusIntervalApplyLsn: int64 = -1
+var physStatusIntervalReplyMsgType: char = '\0'
 
 suite "Physical replication: SQL building":
   proc runOneSqlTest(
@@ -270,6 +274,83 @@ suite "Physical replication: auto keepalive reply":
     check physObservedFlushLsn == physReceivedEndLsn
     check physObservedApplyLsn == physReceivedEndLsn
     check capturedReceivedKinds == @[rmkXLogData, rmkPrimaryKeepalive]
+
+suite "Physical replication: proactive status interval":
+  test "statusInterval sends a Standby Status without a reply-requested keepalive":
+    physStatusIntervalReplyMsgType = '\0'
+    physStatusIntervalReceiveLsn = -1
+    physStatusIntervalFlushLsn = -1
+    physStatusIntervalApplyLsn = -1
+
+    const
+      physStartLsn = 0x0000_0000_0000_1000'i64
+      physWalData: seq[byte] = @[1'u8, 2, 3]
+      physReceivedEndLsn = physStartLsn + physWalData.len
+      physWalEnd = 0x0000_0000_0000_5000'i64
+      physKeepaliveWalEnd = 0x0000_0000_0000_9999'i64
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        var burst: seq[byte]
+        burst.add(buildCopyBothResponse())
+        # XLogData only — no PrimaryKeepalive(replyRequested=true).
+        burst.add(buildXLogData(physStartLsn, physWalEnd, 0, physWalData))
+        await sendBytes(st, burst)
+        # Let the status interval (50ms) elapse, then send a non-reply keepalive
+        # to unblock the asyncdispatch read (which cannot wake on a timer);
+        # chronos has already emitted updates on its own by now.
+        await sleepAsync(milliseconds(150))
+        await sendBytes(
+          st, buildKeepalive(physKeepaliveWalEnd, 0, replyRequested = false)
+        )
+        let reply = await drainFrontendMessage(st)
+        physStatusIntervalReplyMsgType = reply.msgType
+        if reply.msgType == 'd':
+          let ssu = decodeStandbyStatus(reply.body)
+          physStatusIntervalReceiveLsn = ssu.receive
+          physStatusIntervalFlushLsn = ssu.flush
+          physStatusIntervalApplyLsn = ssu.apply
+        # End the stream. Drain any further proactive updates plus the client's
+        # CopyDone so its CopyDone send sees an open socket.
+        var tail: seq[byte]
+        tail.add(buildCopyDone())
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          if m.msgType == 'c': # client's CopyDone
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          if msg.kind == rmkXLogData:
+            discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
+
+      await conn.startPhysicalReplication(
+        startLsn = Lsn(uint64(physStartLsn)),
+        statusInterval = milliseconds(50),
+        callback = cb,
+      )
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check physStatusIntervalReplyMsgType == 'd'
+    check physStatusIntervalReceiveLsn == physReceivedEndLsn
+    check physStatusIntervalFlushLsn == physReceivedEndLsn
+    check physStatusIntervalApplyLsn == physReceivedEndLsn
 
 suite "connectReplication mode":
   test "rmPhysical sends replication=true in StartupMessage":

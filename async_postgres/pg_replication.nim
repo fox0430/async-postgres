@@ -851,40 +851,62 @@ proc resetReplLsnTracking(conn: PgConnection, startLsn: Lsn) =
   conn.initReplLsnTracking(startLsn.toUInt64)
 
 proc replFillRecvBuf(
-    conn: PgConnection, statusInterval: async_backend.Duration, lastStatusSent: Moment
-): Future[void] {.async.} =
+    conn: PgConnection,
+    statusInterval: async_backend.Duration,
+    lastStatusSent: Moment,
+    pendingRead: Future[void],
+): Future[Future[void]] {.async.} =
   ## Wait for more replication data, but wake early enough that the caller can
   ## emit a proactive Standby Status Update when ``statusInterval`` is set.
+  ##
+  ## ``pendingRead`` carries a single in-flight read across calls (``nil`` when
+  ## none is outstanding). The updated read is returned: still pending after a
+  ## timed wake, or ``nil`` once it has been consumed. The caller threads the
+  ## returned value back in on the next call.
   ##
   ## With ``statusInterval == ZeroDuration`` (the default) this blocks until data
   ## arrives, exactly like a bare ``fillRecvBuf``.
   ##
-  ## With a positive ``statusInterval`` under **chronos**, the read is bounded by
-  ## the time left until the next status update is due; on the resulting
-  ## ``AsyncTimeoutError`` the read is cleanly cancelled (no bytes consumed, so
-  ## the stream stays intact) and we return normally, letting the caller send the
-  ## update and resume. Under **asyncdispatch** a timed read cannot be cancelled —
-  ## the abandoned read would consume and drop bytes, desyncing the stream — so we
-  ## fall back to an unbounded read. The caller still emits status updates
-  ## opportunistically after each received message, which covers a busy stream
-  ## (where WAL actually accumulates); a fully idle asyncdispatch stream sends
-  ## nothing until the next message arrives.
+  ## With a positive ``statusInterval`` under **chronos**, a single background read
+  ## is raced against a timer sized to the time left until the next status update
+  ## is due. On a timer wake the read is **left in flight** (never cancelled) and
+  ## resumed on the next call: cancelling an in-flight transport read and then
+  ## starting another races chronos' asynchronous cancellation (see
+  ## ``RecvWatch.cancel``) and can surface as a "Read operation already pending"
+  ## ``AsyncStreamReadError``. ``fillRecvBufDetached`` commits its bytes to ``recvBuf``
+  ## only when awaited, so a read that completes during the timed wait is neither
+  ## lost nor double-counted. Under **asyncdispatch** there is no timer-bounded
+  ## wake — a timed read cannot be cancelled, and the abandoned read would consume
+  ## and drop bytes, desyncing the stream — so it falls back to an unbounded read.
+  ## The caller still emits status updates opportunistically after each received
+  ## message, which covers a busy stream (where WAL actually accumulates); a fully
+  ## idle asyncdispatch stream sends nothing until the next message arrives.
   if statusInterval <= ZeroDuration:
     await conn.fillRecvBuf()
-    return
+    return nil
   when hasChronos:
-    let sinceLast = Moment.now() - lastStatusSent
-    let remaining =
-      if sinceLast >= statusInterval:
-        async_backend.milliseconds(1)
-      else:
-        statusInterval - sinceLast
-    try:
-      await conn.fillRecvBuf(remaining)
-    except AsyncTimeoutError:
-      discard # woke to send a periodic status update, not a transport failure
+    var read = pendingRead
+    if read == nil:
+      read = conn.fillRecvBufDetached()
+    if not read.finished:
+      let sinceLast = Moment.now() - lastStatusSent
+      let remaining =
+        if sinceLast >= statusInterval:
+          async_backend.milliseconds(1)
+        else:
+          statusInterval - sinceLast
+      let timer = sleepAsync(remaining)
+      try:
+        discard await race(read, timer)
+      finally:
+        cancelTimer(timer)
+    if read.finished:
+      await read # commit bytes to recvBuf (or re-raise a transport failure)
+      return nil
+    return read # timed wake: read still in flight, resume it on the next call
   else:
     await conn.fillRecvBuf()
+    return nil
 
 proc maybeSendPeriodicStatus(
     conn: PgConnection,
@@ -918,7 +940,8 @@ proc handleReplicationData(
     copyData: seq[byte],
     autoKeepaliveReply: bool,
     callback: ReplicationCallback,
-): Future[void] {.async.} =
+    lastStatusSent: Moment,
+): Future[Moment] {.async.} =
   ## Process one CopyData frame from a replication stream: parse it, advance the
   ## received-WAL position on ``XLogData`` (the single source of truth read by
   ## ``confirmFlushed`` and the auto-reply), emit an automatic keepalive reply on
@@ -926,6 +949,12 @@ proc handleReplicationData(
   ## set, then invoke the user ``callback``. Shared by ``startReplication`` and
   ## ``startPhysicalReplication`` so the received-tracking and auto-reply logic
   ## lives in exactly one place.
+  ##
+  ## Returns the timestamp to record as ``lastStatusSent``; it is updated when
+  ## an automatic keepalive reply is sent so that ``statusInterval`` tracks the
+  ## last time the server saw a Standby Status Update, preventing duplicate
+  ## proactive updates.
+  var newLastStatusSent = lastStatusSent
   let replMsg = parseReplicationMessage(copyData)
   case replMsg.kind
   of rmkXLogData:
@@ -934,7 +963,9 @@ proc handleReplicationData(
   of rmkPrimaryKeepalive:
     if autoKeepaliveReply and replMsg.keepalive.replyRequested:
       await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+      newLastStatusSent = Moment.now()
   await callback(replMsg)
+  return newLastStatusSent
 
 proc startReplication*(
     conn: PgConnection,
@@ -1096,6 +1127,15 @@ proc startReplication*(
   # inherit a stale value.
   conn.resetReplLsnTracking(startLsn)
   var lastStatusSent = Moment.now()
+  var pendingRead: Future[void] = nil # in-flight timed read, threaded across waits
+  when hasChronos:
+    # If an error unwinds the loop while a timed read is still in flight, abandon
+    # it so it is not left dangling on the torn-down connection. Normal exits
+    # (CopyDone / ReadyForQuery) only happen after a read has been consumed, so
+    # `pendingRead` is nil then and this is a no-op — never a cancel-then-reread.
+    defer:
+      if pendingRead != nil and not pendingRead.finished:
+        pendingRead.cancelSoon()
 
   # Streaming loop
   block recvLoop:
@@ -1104,7 +1144,9 @@ proc startReplication*(
         let msg = opt.get
         case msg.kind
         of bmkCopyData:
-          await conn.handleReplicationData(msg.copyData, autoKeepaliveReply, callback)
+          lastStatusSent = await conn.handleReplicationData(
+            msg.copyData, autoKeepaliveReply, callback, lastStatusSent
+          )
         of bmkCopyDone:
           # Server ended the stream; reply with CopyDone before draining
           await conn.sendMsg(@copyDoneMsg)
@@ -1126,7 +1168,8 @@ proc startReplication*(
       )
       if conn.state == csClosed:
         raise newException(PgConnectionError, "Connection closed during replication")
-      await conn.replFillRecvBuf(statusInterval, lastStatusSent)
+      pendingRead =
+        await conn.replFillRecvBuf(statusInterval, lastStatusSent, pendingRead)
       # Send again after a timed wake with no new data (idle coverage on chronos).
       lastStatusSent = await conn.maybeSendPeriodicStatus(
         autoKeepaliveReply, statusInterval, lastStatusSent
@@ -1269,6 +1312,13 @@ proc startPhysicalReplication*(
   # to the resume point so a reused connection does not inherit a stale value.
   conn.resetReplLsnTracking(startLsn)
   var lastStatusSent = Moment.now()
+  var pendingRead: Future[void] = nil # in-flight timed read, threaded across waits
+  when hasChronos:
+    # See startReplication: drop a still-in-flight timed read if an error unwinds
+    # the loop; nil (and so a no-op) on the normal CopyDone / ReadyForQuery exits.
+    defer:
+      if pendingRead != nil and not pendingRead.finished:
+        pendingRead.cancelSoon()
 
   block recvLoop:
     while true:
@@ -1276,7 +1326,9 @@ proc startPhysicalReplication*(
         let msg = opt.get
         case msg.kind
         of bmkCopyData:
-          await conn.handleReplicationData(msg.copyData, autoKeepaliveReply, callback)
+          lastStatusSent = await conn.handleReplicationData(
+            msg.copyData, autoKeepaliveReply, callback, lastStatusSent
+          )
         of bmkCopyDone:
           await conn.sendMsg(@copyDoneMsg)
           break recvLoop
@@ -1299,7 +1351,8 @@ proc startPhysicalReplication*(
         raise newException(
           PgConnectionError, "Connection closed during physical replication"
         )
-      await conn.replFillRecvBuf(statusInterval, lastStatusSent)
+      pendingRead =
+        await conn.replFillRecvBuf(statusInterval, lastStatusSent, pendingRead)
       lastStatusSent = await conn.maybeSendPeriodicStatus(
         autoKeepaliveReply, statusInterval, lastStatusSent
       )
