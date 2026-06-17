@@ -670,7 +670,7 @@ proc timelineHistory*(
 
 # Replication streaming
 
-proc parseReplicationMessage*(copyData: seq[byte]): ReplicationMessage =
+proc parseReplicationMessage*(copyData: openArray[byte]): ReplicationMessage =
   ## Parse a CopyData payload into a ReplicationMessage.
   if copyData.len == 0:
     raise newException(PgProtocolError, "Empty replication CopyData")
@@ -718,6 +718,24 @@ proc sendCopyData*(conn: PgConnection, data: openArray[byte]): Future[void] =
   encodeCopyData(buf, data)
   conn.sendMsg(buf)
 
+proc sendStandbyStatusRaw(
+    conn: PgConnection, receiveLsn, flushLsn, applyLsn: Lsn, replyRequested: bool
+): Future[void] {.async.} =
+  ## Encode and send a Standby Status Update with the given receive/flush/apply
+  ## LSNs verbatim — no ``InvalidLsn`` defaulting. This is the single place the
+  ## wire encoding lives; the public ``sendStandbyStatus`` (which applies the
+  ## up-to-receive defaulting) and ``sendConfirmedStatus`` (which sends the
+  ## confirmed position verbatim) both route through it. Callers are responsible
+  ## for the ``csReplicating`` guard.
+  let msg = encodeStandbyStatusUpdate(
+    receiveLsn.toInt64,
+    flushLsn.toInt64,
+    applyLsn.toInt64,
+    currentPgTimestamp(),
+    if replyRequested: 1'u8 else: 0'u8,
+  )
+  await conn.sendMsg(msg)
+
 proc sendStandbyStatus*(
     conn: PgConnection,
     receiveLsn: Lsn,
@@ -727,6 +745,14 @@ proc sendStandbyStatus*(
 ): Future[void] {.async.} =
   ## Send a Standby Status Update to the server during replication streaming.
   ## Must be called while the connection is in ``csReplicating`` state.
+  ##
+  ## When ``flushLsn``/``applyLsn`` are left at ``InvalidLsn`` (``0/0``) they
+  ## default *up to* ``receiveLsn`` — convenient for callers that ACK received
+  ## data eagerly. Pass an explicit ``flushLsn``/``applyLsn`` to report a
+  ## position behind ``receiveLsn`` (e.g. only what the callback has durably
+  ## flushed). The automatic keepalive reply does not use this proc; it sends
+  ## the confirmed-flush position verbatim via an internal path so it never
+  ## inflates flush to merely-received WAL.
   if conn.state != csReplicating:
     raise newException(
       PgConnectionError,
@@ -735,14 +761,117 @@ proc sendStandbyStatus*(
     )
   let flushVal = if flushLsn == InvalidLsn: receiveLsn else: flushLsn
   let applyVal = if applyLsn == InvalidLsn: receiveLsn else: applyLsn
-  let msg = encodeStandbyStatusUpdate(
-    receiveLsn.toInt64,
-    flushVal.toInt64,
-    applyVal.toInt64,
-    currentPgTimestamp(),
-    if replyRequested: 1'u8 else: 0'u8,
+  await conn.sendStandbyStatusRaw(receiveLsn, flushVal, applyVal, replyRequested)
+
+proc confirmedFlushLsn*(conn: PgConnection): Lsn {.inline.} =
+  ## Highest LSN the application has confirmed durably flushed for the current
+  ## replication stream via ``confirmFlushed``. Initialised to the stream's
+  ## ``startLsn`` by ``startReplication`` / ``startPhysicalReplication``; this is
+  ## the flush/apply position carried by automatic keepalive replies.
+  ##
+  ## Only meaningful during an active stream: outside ``csReplicating`` (before a
+  ## stream starts or after it ends) this returns ``InvalidLsn`` (``0/0``) rather
+  ## than a stale value left over from a previous stream.
+  if conn.state != csReplicating:
+    return InvalidLsn
+  Lsn(conn.replConfirmedFlushLsn())
+
+proc confirmFlushed*(conn: PgConnection, lsn: Lsn): bool =
+  ## Record that received WAL up to and including ``lsn`` has been durably
+  ## persisted by the application, so automatic keepalive replies (see
+  ## ``autoKeepaliveReply`` on ``startReplication``) report it as the flush/apply
+  ## position and let the server advance ``confirmed_flush_lsn`` and recycle WAL.
+  ##
+  ## Call this from the replication callback *after* the received changes are
+  ## durable. Until you do, the automatic reply acknowledges only *receipt* (the
+  ## receive LSN), never flush — so a crash re-streams the unprocessed WAL,
+  ## giving at-least-once delivery. Calls that would move the confirmed position
+  ## backwards are ignored, so duplicate or out-of-order confirmations are safe.
+  ##
+  ## ``lsn`` is clamped to the WAL actually received: you cannot have durably
+  ## persisted WAL you have not yet received, so an ``lsn`` beyond the highest
+  ## ``XLogData.receivedEndLsn`` observed confirms only up to that received
+  ## position (passing ``walEnd`` — which runs ahead of the data this message
+  ## carries — therefore confirms received WAL rather than over-advancing).
+  ## Because of this clamp the confirmed position can never exceed received WAL,
+  ## so automatic replies never emit a flush ahead of receive, and the call never
+  ## raises on an out-of-range LSN (an uncaught raise from the callback would
+  ## strand the stream). Must be called while the connection is ``csReplicating``
+  ## (i.e. from the replication callback); calling it outside an active stream
+  ## raises ``PgConnectionError``.
+  ##
+  ## Returns ``true`` when the confirmed-flush position actually moved forward
+  ## (after clamping and the monotonic guard). ``false`` means the request was
+  ## ignored because it was behind the current confirmed position.
+  if conn.state != csReplicating:
+    raise newException(
+      PgConnectionError,
+      "confirmFlushed: connection is not in replicating state (state: " & $conn.state &
+        ")",
+    )
+  # Clamp to received WAL: durably-persisted WAL can never exceed what was
+  # received. Clamping (rather than raising) keeps automatic replies from
+  # emitting flush ahead of receive without letting an out-of-range LSN — e.g.
+  # the readily-available ``walEnd`` — throw out of the callback and strand the
+  # connection in ``csReplicating``. The raw helper in pg_connection/types
+  # performs the clamp and the monotonic advance in one place.
+  return conn.confirmReplFlushed(lsn.toUInt64)
+
+proc sendConfirmedStatus(conn: PgConnection, receiveLsn: Lsn): Future[void] {.async.} =
+  ## Send a Standby Status Update carrying ``receiveLsn`` in the *receive* field
+  ## (which resets ``wal_sender_timeout`` on the server) and the
+  ## ``confirmFlushed`` position in flush/apply. The confirmed position is sent
+  ## verbatim — it is the stream's ``startLsn`` until ``confirmFlushed`` advances
+  ## it, so when nothing has been confirmed and ``startLsn`` was left at its
+  ## default ``InvalidLsn`` it is ``0/0``, which PostgreSQL reads as "position
+  ## unknown" and will not move the slot backwards. Either way flush never
+  ## advances past WAL the callback has not yet confirmed durable. Used by the
+  ## automatic keepalive reply and by ``stopReplication``.
+  ##
+  ## Only valid while ``csReplicating``, where ``confirmedFlushLsn`` is bounded
+  ## by received WAL (see ``confirmFlushed``), so flush never exceeds receive.
+  ## Calling this outside an active replication stream raises ``PgConnectionError``.
+  if conn.state != csReplicating:
+    raise newException(
+      PgConnectionError,
+      "sendConfirmedStatus: connection is not in replicating state (state: " &
+        $conn.state & ")",
+    )
+  let flushLsn = conn.confirmedFlushLsn
+  await conn.sendStandbyStatusRaw(
+    receiveLsn, flushLsn, flushLsn, replyRequested = false
   )
-  await conn.sendMsg(msg)
+
+proc resetReplLsnTracking(conn: PgConnection, startLsn: Lsn) =
+  ## Reset the per-stream confirmed-flush and max-received positions to the
+  ## resume point at the start of a stream, so a reused connection never inherits
+  ## a stale value from a previous stream. The confirmed-flush position then
+  ## advances only via ``confirmFlushed``; the max-received position advances as
+  ## ``XLogData`` arrives and bounds what ``confirmFlushed`` will accept.
+  conn.initReplLsnTracking(startLsn.toUInt64)
+
+proc handleReplicationData(
+    conn: PgConnection,
+    copyData: seq[byte],
+    autoKeepaliveReply: bool,
+    callback: ReplicationCallback,
+): Future[void] {.async.} =
+  ## Process one CopyData frame from a replication stream: parse it, advance the
+  ## received-WAL position on ``XLogData`` (the single source of truth read by
+  ## ``confirmFlushed`` and the auto-reply), emit an automatic keepalive reply on
+  ## a ``PrimaryKeepalive`` with ``replyRequested`` when ``autoKeepaliveReply`` is
+  ## set, then invoke the user ``callback``. Shared by ``startReplication`` and
+  ## ``startPhysicalReplication`` so the received-tracking and auto-reply logic
+  ## lives in exactly one place.
+  let replMsg = parseReplicationMessage(copyData)
+  case replMsg.kind
+  of rmkXLogData:
+    let received = replMsg.xlogData.receivedEndLsn
+    discard conn.updateReplMaxReceivedLsn(received.toUInt64)
+  of rmkPrimaryKeepalive:
+    if autoKeepaliveReply and replMsg.keepalive.replyRequested:
+      await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+  await callback(replMsg)
 
 proc startReplication*(
     conn: PgConnection,
@@ -756,25 +885,45 @@ proc startReplication*(
   ##
   ## The ``callback`` is invoked for each ``XLogData`` or ``PrimaryKeepalive``
   ## message received. The callback is awaited, providing natural TCP backpressure.
-  ## Within the callback, use ``sendStandbyStatus`` to acknowledge received data.
+  ## From the callback, acknowledge durable progress with ``confirmFlushed`` (the
+  ## default path; see below). With ``autoKeepaliveReply = false`` you instead
+  ## drive replies yourself with ``sendStandbyStatus``; do not mix the two, since
+  ## the auto-reply would report a flush position behind your manual ACKs.
   ##
   ## When ``autoKeepaliveReply`` is true (the default), the library responds
   ## automatically to ``PrimaryKeepalive`` messages with ``replyRequested = true``
-  ## *before* invoking the callback, sending the highest ``receivedEndLsn``
-  ## (``startLsn + data.len``) observed so far across received ``XLogData``
-  ## messages — or the caller-supplied ``startLsn`` if no ``XLogData`` has
-  ## arrived yet — as receive/flush/apply LSN. This prevents silent disconnects
-  ## from ``wal_sender_timeout`` when the callback is slow. The keepalive is
-  ## still delivered to the callback. Set ``autoKeepaliveReply = false`` to
-  ## manage replies manually — for example, when the flush/apply LSN must
-  ## reflect callback-side progress (durable writes) rather than what has merely
-  ## been received from the wire.
+  ## *before* invoking the callback. The reply reports the highest
+  ## ``receivedEndLsn`` (``startLsn + data.len``) observed so far across received
+  ## ``XLogData`` messages — or the caller-supplied ``startLsn`` if no
+  ## ``XLogData`` has arrived yet — as the **receive** LSN, which resets
+  ## ``wal_sender_timeout`` and prevents silent disconnects when the callback is
+  ## slow. The **flush/apply** LSN, however, carries only what you have confirmed
+  ## durable via ``confirmFlushed`` (initially ``startLsn``), *not* the receive
+  ## LSN. This keeps ``confirmed_flush_lsn`` from advancing past WAL the callback
+  ## has not yet persisted, so a crash re-streams unprocessed changes
+  ## (at-least-once delivery). The keepalive is still delivered to the callback.
   ##
-  ## If no ``XLogData`` has arrived and ``startLsn`` was left at its default
-  ## ``InvalidLsn`` (``0/0``), the auto-reply will carry ``0/0`` for
-  ## receive/flush/apply. PostgreSQL treats this as "position unknown" and will
-  ## not move ``confirmed_flush_lsn`` backwards, so the reply is still useful
-  ## for resetting ``wal_sender_timeout`` without risking data loss.
+  ## To advance the slot, call ``confirmFlushed(conn, lsn)`` from the callback
+  ## once the received changes are durable. The confirmed position reaches the
+  ## server on the next reply-requested keepalive and on ``stopReplication`` (a
+  ## clean stop flushes it), not on the ``confirmFlushed`` call itself. Set
+  ## ``autoKeepaliveReply = false`` to manage replies entirely by hand with
+  ## ``sendStandbyStatus`` instead — for example, to batch acknowledgements or
+  ## report apply separately from flush.
+  ##
+  ## Until ``confirmFlushed`` is called and while ``startLsn`` is at its default
+  ## ``InvalidLsn`` (``0/0``), the auto-reply carries ``0/0`` for flush/apply.
+  ## PostgreSQL treats this as "position unknown" and will not move
+  ## ``confirmed_flush_lsn`` backwards, so the reply is still useful for resetting
+  ## ``wal_sender_timeout`` without risking data loss.
+  ##
+  ## **Synchronous standbys:** because the auto-reply reports receive and
+  ## flush/apply separately, a consumer listed in ``synchronous_standby_names``
+  ## (with ``synchronous_commit`` at ``on``/``remote_write``/``remote_apply``)
+  ## that never calls ``confirmFlushed`` keeps ``wal_sender_timeout`` reset via
+  ## the receive field yet never advances flush — so the primary's ``COMMIT``s
+  ## block indefinitely waiting for a flush confirmation that never arrives.
+  ## Call ``confirmFlushed`` promptly (or manage replies manually) in that setup.
   ##
   ## If the auto-reply itself fails (for example, the connection is lost
   ## between receiving the keepalive and writing the Standby Status Update),
@@ -856,13 +1005,16 @@ proc startReplication*(
           discard
       await conn.fillRecvBuf()
 
-  # Highest end LSN of WAL data actually received from the wire — computed as
-  # XLogData.startLsn + data.len, *not* XLogData.walEnd. ``walEnd`` is the
-  # server's current WAL position at the time the message was sent and can be
-  # ahead of the bytes this message carries; acknowledging ``walEnd`` would
+  # Track the highest end LSN of WAL data actually received from the wire —
+  # computed as XLogData.startLsn + data.len, *not* XLogData.walEnd. ``walEnd``
+  # is the server's current WAL position at the time the message was sent and can
+  # be ahead of the bytes this message carries; acknowledging ``walEnd`` would
   # falsely advance ``confirmed_flush_lsn`` past unprocessed WAL and cause data
-  # loss on slot restart.
-  var lastReceivedLsn: Lsn = startLsn
+  # loss on slot restart. The position lives on the connection (the single source
+  # of truth, read by confirmFlushed and the auto-reply); reset it and the
+  # confirmed-flush position to the resume point so a reused connection does not
+  # inherit a stale value.
+  conn.resetReplLsnTracking(startLsn)
 
   # Streaming loop
   block recvLoop:
@@ -871,16 +1023,7 @@ proc startReplication*(
         let msg = opt.get
         case msg.kind
         of bmkCopyData:
-          let replMsg = parseReplicationMessage(msg.copyData)
-          case replMsg.kind
-          of rmkXLogData:
-            let received = replMsg.xlogData.receivedEndLsn
-            if received > lastReceivedLsn:
-              lastReceivedLsn = received
-          of rmkPrimaryKeepalive:
-            if autoKeepaliveReply and replMsg.keepalive.replyRequested:
-              await sendStandbyStatus(conn, lastReceivedLsn)
-          await callback(replMsg)
+          await conn.handleReplicationData(msg.copyData, autoKeepaliveReply, callback)
         of bmkCopyDone:
           # Server ended the stream; reply with CopyDone before draining
           await conn.sendMsg(@copyDoneMsg)
@@ -918,15 +1061,33 @@ proc startReplication*(
       await conn.fillRecvBuf()
 
 proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
-  ## Send CopyDone to gracefully terminate the replication stream.
-  ## The server will respond with CopyDone and ReadyForQuery, which
-  ## will be handled by the ``startReplication`` recv loop.
+  ## Gracefully terminate the replication stream.
+  ##
+  ## Before sending CopyDone, this flushes the latest ``confirmFlushed`` position
+  ## to the server (receive = highest WAL received, flush/apply = confirmed) so a
+  ## clean shutdown does not lose the final acknowledgement. ``confirmFlushed``
+  ## only records locally; without this flush the confirmed position would reach
+  ## the server only on the next ``PrimaryKeepalive(replyRequested)``, which may
+  ## never arrive before stop — leaving the slot behind and re-streaming the last
+  ## batch on restart. When nothing has been confirmed the flush is the stream's
+  ## ``startLsn`` (``0/0`` only when ``startLsn`` was left at its default
+  ## ``InvalidLsn``, which PostgreSQL reads as "position unknown" and will not
+  ## move the slot backwards), so manual-ACK callers are unaffected.
+  ##
+  ## The server responds with CopyDone and ReadyForQuery, which are handled by
+  ## the ``startReplication`` recv loop.
+  ##
+  ## If flushing the confirmed position fails (for example because the
+  ## connection is already lost), the exception propagates and CopyDone is not
+  ## sent. In that situation the server has already dropped the connection, so
+  ## the missing CopyDone does not change the outcome.
   if conn.state != csReplicating:
     raise newException(
       PgConnectionError,
       "stopReplication: connection is not in replicating state (state: " & $conn.state &
         ")",
     )
+  await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
   await conn.sendMsg(@copyDoneMsg)
 
 proc startPhysicalReplication*(
@@ -950,8 +1111,15 @@ proc startPhysicalReplication*(
   ## pgoutput decoding applies.
   ##
   ## ``autoKeepaliveReply`` behaves identically to ``startReplication``: when
-  ## true, ``PrimaryKeepalive(replyRequested=true)`` is acknowledged with the
-  ## highest observed ``receivedEndLsn`` before the callback is invoked.
+  ## true, ``PrimaryKeepalive(replyRequested=true)`` is answered before the
+  ## callback runs, reporting the highest observed ``receivedEndLsn`` as the
+  ## receive LSN and the ``confirmFlushed`` position (initially ``startLsn``) as
+  ## flush/apply. For physical replication the flush LSN governs how much WAL the
+  ## primary may recycle, so call ``confirmFlushed`` only once that WAL is safely
+  ## on durable storage. A physical standby listed in ``synchronous_standby_names``
+  ## that relies on the auto-reply must likewise call ``confirmFlushed`` (or reply
+  ## manually), or the primary's synchronous ``COMMIT``s will block waiting for a
+  ## flush position that never advances.
   ##
   ## On a timeline switch the server may send a final result set describing
   ## the next timeline (``RowDescription`` + ``DataRow`` + ``CommandComplete``)
@@ -998,8 +1166,10 @@ proc startPhysicalReplication*(
       await conn.fillRecvBuf()
 
   # Highest end LSN of WAL data actually received — see startReplication for
-  # why we track ``startLsn + data.len`` rather than ``walEnd``.
-  var lastReceivedLsn: Lsn = startLsn
+  # why we track ``startLsn + data.len`` rather than ``walEnd``, and why the
+  # position lives on the connection. Reset it and the confirmed-flush position
+  # to the resume point so a reused connection does not inherit a stale value.
+  conn.resetReplLsnTracking(startLsn)
 
   block recvLoop:
     while true:
@@ -1007,16 +1177,7 @@ proc startPhysicalReplication*(
         let msg = opt.get
         case msg.kind
         of bmkCopyData:
-          let replMsg = parseReplicationMessage(msg.copyData)
-          case replMsg.kind
-          of rmkXLogData:
-            let received = replMsg.xlogData.receivedEndLsn
-            if received > lastReceivedLsn:
-              lastReceivedLsn = received
-          of rmkPrimaryKeepalive:
-            if autoKeepaliveReply and replMsg.keepalive.replyRequested:
-              await sendStandbyStatus(conn, lastReceivedLsn)
-          await callback(replMsg)
+          await conn.handleReplicationData(msg.copyData, autoKeepaliveReply, callback)
         of bmkCopyDone:
           await conn.sendMsg(@copyDoneMsg)
           break recvLoop

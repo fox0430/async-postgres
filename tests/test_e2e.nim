@@ -10225,7 +10225,9 @@ suite "E2E: Logical Replication":
           else:
             discard
         of rmkPrimaryKeepalive:
-          # autoKeepaliveReply (default) responds with receivedEndLsn.
+          # autoKeepaliveReply (default) already replied: receivedEndLsn in the
+          # receive field (resets wal_sender_timeout); flush/apply track the
+          # confirmFlushed position. No manual reply needed.
           discard
 
       # Insert a row from the writer connection after a short delay
@@ -10276,8 +10278,9 @@ suite "E2E: Logical Replication":
         of rmkXLogData:
           await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
         of rmkPrimaryKeepalive:
-          # Stop immediately on first keepalive.
-          # autoKeepaliveReply (default) handles the ACK with receivedEndLsn.
+          # Stop immediately on first keepalive. autoKeepaliveReply (default)
+          # already replied (receive = receivedEndLsn); flush/apply track the
+          # confirmFlushed position.
           await replConn.stopReplication()
 
       await replConn.startReplication(

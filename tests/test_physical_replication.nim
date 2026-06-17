@@ -19,27 +19,6 @@ proc mockConfig(port: int): ConnConfig =
     host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
   )
 
-proc buildCopyBothResponse(): seq[byte] =
-  var body: seq[byte]
-  body.add(1'u8)
-  body.addInt16(0'i16)
-  buildBackendMsg('W', body)
-
-proc buildCopyData(payload: openArray[byte]): seq[byte] =
-  buildBackendMsg('d', payload)
-
-proc buildXLogData(startLsn, walEnd, sendTime: int64, walData: seq[byte]): seq[byte] =
-  var payload: seq[byte]
-  payload.add(byte('w'))
-  payload.addInt64(startLsn)
-  payload.addInt64(walEnd)
-  payload.addInt64(sendTime)
-  payload.add(walData)
-  buildCopyData(payload)
-
-proc buildCopyDone(): seq[byte] =
-  @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
-
 proc readStartupMessage(client: MockClient): Future[seq[byte]] {.async.} =
   ## Same as drainStartupMessage but returns the body so tests can inspect
   ## the startup parameters.
@@ -69,6 +48,10 @@ var capturedRaised: bool = false
 var capturedFinalState: PgConnState = csClosed
 var capturedFilename: string = ""
 var capturedContent: seq[byte]
+var physObservedReceiveLsn: int64 = -1
+var physObservedFlushLsn: int64 = -1
+var physObservedApplyLsn: int64 = -1
+var physObservedReplyMsgType: char = '\0'
 
 suite "Physical replication: SQL building":
   proc runOneSqlTest(
@@ -234,6 +217,59 @@ suite "sendCopyData public API":
 
     waitFor testBody()
     check capturedRaised
+
+suite "Physical replication: auto keepalive reply":
+  test "auto-reply uses receivedEndLsn and confirmedFlushLsn":
+    physObservedReceiveLsn = -1
+    physObservedFlushLsn = -1
+    physObservedApplyLsn = -1
+    physObservedReplyMsgType = '\0'
+    capturedReceivedKinds.setLen(0)
+
+    const
+      physStartLsn = 0x0000_0000_0000_1000'i64
+      physWalData: seq[byte] = @[1'u8, 2, 3]
+      physReceivedEndLsn = physStartLsn + physWalData.len
+      physWalEnd = 0x0000_0000_0000_5000'i64
+      physKeepaliveWalEnd = 0x0000_0000_0000_9999'i64
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        let ssu = await runAutoKeepaliveServer(
+          st, physStartLsn, physWalEnd, physKeepaliveWalEnd, physWalData
+        )
+        physObservedReplyMsgType = ssu.msgType
+        physObservedReceiveLsn = ssu.receive
+        physObservedFlushLsn = ssu.flush
+        physObservedApplyLsn = ssu.apply
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          capturedReceivedKinds.add(msg.kind)
+          if msg.kind == rmkXLogData:
+            discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
+
+      await conn.startPhysicalReplication(
+        startLsn = Lsn(uint64(physStartLsn)), callback = cb
+      )
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check physObservedReplyMsgType == 'd'
+    check physObservedReceiveLsn == physReceivedEndLsn
+    check physObservedReceiveLsn != physWalEnd
+    check physObservedReceiveLsn != physKeepaliveWalEnd
+    check physObservedFlushLsn == physReceivedEndLsn
+    check physObservedApplyLsn == physReceivedEndLsn
+    check capturedReceivedKinds == @[rmkXLogData, rmkPrimaryKeepalive]
 
 suite "connectReplication mode":
   test "rmPhysical sends replication=true in StartupMessage":
