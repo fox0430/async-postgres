@@ -850,6 +850,69 @@ proc resetReplLsnTracking(conn: PgConnection, startLsn: Lsn) =
   ## ``XLogData`` arrives and bounds what ``confirmFlushed`` will accept.
   conn.initReplLsnTracking(startLsn.toUInt64)
 
+proc replFillRecvBuf(
+    conn: PgConnection, statusInterval: async_backend.Duration, lastStatusSent: Moment
+): Future[void] {.async.} =
+  ## Wait for more replication data, but wake early enough that the caller can
+  ## emit a proactive Standby Status Update when ``statusInterval`` is set.
+  ##
+  ## With ``statusInterval == ZeroDuration`` (the default) this blocks until data
+  ## arrives, exactly like a bare ``fillRecvBuf``.
+  ##
+  ## With a positive ``statusInterval`` under **chronos**, the read is bounded by
+  ## the time left until the next status update is due; on the resulting
+  ## ``AsyncTimeoutError`` the read is cleanly cancelled (no bytes consumed, so
+  ## the stream stays intact) and we return normally, letting the caller send the
+  ## update and resume. Under **asyncdispatch** a timed read cannot be cancelled —
+  ## the abandoned read would consume and drop bytes, desyncing the stream — so we
+  ## fall back to an unbounded read. The caller still emits status updates
+  ## opportunistically after each received message, which covers a busy stream
+  ## (where WAL actually accumulates); a fully idle asyncdispatch stream sends
+  ## nothing until the next message arrives.
+  if statusInterval <= ZeroDuration:
+    await conn.fillRecvBuf()
+    return
+  when hasChronos:
+    let sinceLast = Moment.now() - lastStatusSent
+    let remaining =
+      if sinceLast >= statusInterval:
+        async_backend.milliseconds(1)
+      else:
+        statusInterval - sinceLast
+    try:
+      await conn.fillRecvBuf(remaining)
+    except AsyncTimeoutError:
+      discard # woke to send a periodic status update, not a transport failure
+  else:
+    await conn.fillRecvBuf()
+
+proc maybeSendPeriodicStatus(
+    conn: PgConnection,
+    autoKeepaliveReply: bool,
+    statusInterval: async_backend.Duration,
+    lastStatusSent: Moment,
+): Future[Moment] {.async.} =
+  ## Emit a proactive Standby Status Update if ``statusInterval`` has elapsed
+  ## since the last one, so ``confirmed_flush_lsn`` advances (and
+  ## ``wal_sender_timeout`` resets) even when the server never requests a reply —
+  ## e.g. a server configured with ``wal_sender_timeout = 0``. The update reports
+  ## the highest received LSN as receive and the ``confirmFlushed`` position as
+  ## flush/apply, identical to the automatic keepalive reply, so it never advances
+  ## flush past WAL the callback has confirmed durable. Returns the timestamp to
+  ## record as the new ``lastStatusSent`` (unchanged when nothing was sent).
+  ##
+  ## Only active together with ``autoKeepaliveReply``: under manual reply
+  ## management the caller owns the cadence and the reported LSNs via
+  ## ``sendStandbyStatus``.
+  if not autoKeepaliveReply or statusInterval <= ZeroDuration:
+    return lastStatusSent
+  if conn.state != csReplicating:
+    return lastStatusSent
+  if Moment.now() - lastStatusSent < statusInterval:
+    return lastStatusSent
+  await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+  return Moment.now()
+
 proc handleReplicationData(
     conn: PgConnection,
     copyData: seq[byte],
@@ -879,6 +942,7 @@ proc startReplication*(
     startLsn: Lsn = InvalidLsn,
     options: seq[(string, string)] = @[],
     autoKeepaliveReply: bool = true,
+    statusInterval: async_backend.Duration = ZeroDuration,
     callback: ReplicationCallback,
 ): Future[void] {.async.} =
   ## Begin logical replication streaming from the given slot.
@@ -924,6 +988,22 @@ proc startReplication*(
   ## the receive field yet never advances flush — so the primary's ``COMMIT``s
   ## block indefinitely waiting for a flush confirmation that never arrives.
   ## Call ``confirmFlushed`` promptly (or manage replies manually) in that setup.
+  ##
+  ## **Proactive status interval:** ``statusInterval`` (``ZeroDuration`` = off,
+  ## the default) makes the library send a Standby Status Update on its own at
+  ## least that often, in addition to answering reply-requested keepalives. The
+  ## proactive update reports the highest received LSN as receive and the
+  ## ``confirmFlushed`` position as flush/apply — same as the auto-reply — so it
+  ## advances ``confirmed_flush_lsn`` (letting the server recycle WAL) without
+  ## ever flushing past unconfirmed WAL. Set it when the server uses
+  ## ``wal_sender_timeout = 0`` (or a long timeout): such a server never asks for
+  ## a reply, so without a proactive interval the slot only advances on
+  ## ``stopReplication`` and WAL accumulates meanwhile. It is honoured only when
+  ## ``autoKeepaliveReply`` is true; under manual reply management drive the
+  ## cadence yourself with ``sendStandbyStatus``. Under **asyncdispatch** the
+  ## interval only fires while messages are flowing (it cannot safely interrupt a
+  ## blocked read, so a fully idle stream sends nothing until the next message);
+  ## **chronos** honours it even on a completely idle stream.
   ##
   ## If the auto-reply itself fails (for example, the connection is lost
   ## between receiving the keepalive and writing the Standby Status Update),
@@ -1015,6 +1095,7 @@ proc startReplication*(
   # confirmed-flush position to the resume point so a reused connection does not
   # inherit a stale value.
   conn.resetReplLsnTracking(startLsn)
+  var lastStatusSent = Moment.now()
 
   # Streaming loop
   block recvLoop:
@@ -1038,9 +1119,18 @@ proc startReplication*(
           return
         else:
           discard
+      # Send a proactive status update if one is due after draining this batch
+      # (covers a busy stream on both backends).
+      lastStatusSent = await conn.maybeSendPeriodicStatus(
+        autoKeepaliveReply, statusInterval, lastStatusSent
+      )
       if conn.state == csClosed:
         raise newException(PgConnectionError, "Connection closed during replication")
-      await conn.fillRecvBuf()
+      await conn.replFillRecvBuf(statusInterval, lastStatusSent)
+      # Send again after a timed wake with no new data (idle coverage on chronos).
+      lastStatusSent = await conn.maybeSendPeriodicStatus(
+        autoKeepaliveReply, statusInterval, lastStatusSent
+      )
 
   # After CopyDone, drain to ReadyForQuery
   block drainLoop:
@@ -1096,6 +1186,7 @@ proc startPhysicalReplication*(
     slotName: string = "",
     timeline: int32 = 0,
     autoKeepaliveReply: bool = true,
+    statusInterval: async_backend.Duration = ZeroDuration,
     callback: ReplicationCallback,
 ): Future[void] {.async.} =
   ## Begin **physical** replication streaming.
@@ -1120,6 +1211,13 @@ proc startPhysicalReplication*(
   ## that relies on the auto-reply must likewise call ``confirmFlushed`` (or reply
   ## manually), or the primary's synchronous ``COMMIT``s will block waiting for a
   ## flush position that never advances.
+  ##
+  ## ``statusInterval`` behaves as documented on ``startReplication``: a positive
+  ## value makes the standby send a proactive Standby Status Update at least that
+  ## often (receive = highest received, flush/apply = ``confirmFlushed``) so the
+  ## primary can recycle WAL even when it never requests a reply (e.g.
+  ## ``wal_sender_timeout = 0``); it is honoured only with ``autoKeepaliveReply``,
+  ## and on asyncdispatch only fires while messages are flowing.
   ##
   ## On a timeline switch the server may send a final result set describing
   ## the next timeline (``RowDescription`` + ``DataRow`` + ``CommandComplete``)
@@ -1170,6 +1268,7 @@ proc startPhysicalReplication*(
   # position lives on the connection. Reset it and the confirmed-flush position
   # to the resume point so a reused connection does not inherit a stale value.
   conn.resetReplLsnTracking(startLsn)
+  var lastStatusSent = Moment.now()
 
   block recvLoop:
     while true:
@@ -1191,11 +1290,19 @@ proc startPhysicalReplication*(
           return
         else:
           discard
+      # See startReplication: send a proactive status update when one is due,
+      # both after draining a batch and after a timed idle wake.
+      lastStatusSent = await conn.maybeSendPeriodicStatus(
+        autoKeepaliveReply, statusInterval, lastStatusSent
+      )
       if conn.state == csClosed:
         raise newException(
           PgConnectionError, "Connection closed during physical replication"
         )
-      await conn.fillRecvBuf()
+      await conn.replFillRecvBuf(statusInterval, lastStatusSent)
+      lastStatusSent = await conn.maybeSendPeriodicStatus(
+        autoKeepaliveReply, statusInterval, lastStatusSent
+      )
 
   # After CopyDone, drain to ReadyForQuery. Accept the optional timeline-switch
   # result set (RowDescription + DataRow + CommandComplete) the server emits
