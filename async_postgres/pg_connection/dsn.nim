@@ -84,6 +84,15 @@ proc parseTargetSessionAttrs*(s: string): TargetSessionAttrs =
   else:
     raise newException(PgError, "Invalid target_session_attrs: " & s)
 
+proc parseLoadBalanceHosts*(s: string): LoadBalanceHosts =
+  case s
+  of "disable":
+    lbhDisable
+  of "random":
+    lbhRandom
+  else:
+    raise newException(PgError, "Invalid load_balance_hosts: " & s)
+
 proc parsePort*(s: string): int =
   try:
     result = parseInt(s)
@@ -207,6 +216,8 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "keepalives_count must be non-negative: " & val)
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
+  of "load_balance_hosts":
+    result.loadBalanceHosts = parseLoadBalanceHosts(val)
   of "max_message_size":
     try:
       result.maxMessageSize = parseInt(val)
@@ -451,6 +462,7 @@ proc initConnConfig*(
     keepAliveCount = 0,
     hosts: seq[HostEntry] = @[],
     targetSessionAttrs = tsaAny,
+    loadBalanceHosts = lbhDisable,
     requireAuth: set[AuthMethod] = {},
     extraParams: seq[(string, string)] = @[],
     maxMessageSize = 0,
@@ -475,6 +487,7 @@ proc initConnConfig*(
     keepAliveCount: keepAliveCount,
     hosts: hosts,
     targetSessionAttrs: targetSessionAttrs,
+    loadBalanceHosts: loadBalanceHosts,
     requireAuth: requireAuth,
     extraParams: extraParams,
     maxMessageSize: maxMessageSize,

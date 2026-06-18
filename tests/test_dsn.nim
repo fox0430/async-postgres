@@ -1,4 +1,4 @@
-import std/unittest
+import std/[random, unittest]
 
 import ../async_postgres/[async_backend, pg_connection]
 
@@ -475,6 +475,87 @@ suite "parseDsn":
   test "error: invalid target_session_attrs":
     expect PgError:
       discard parseDsn("postgresql://h/db?target_session_attrs=bogus")
+
+  test "load_balance_hosts all values":
+    check parseDsn("postgresql://h/db?load_balance_hosts=disable").loadBalanceHosts ==
+      lbhDisable
+    check parseDsn("postgresql://h/db?load_balance_hosts=random").loadBalanceHosts ==
+      lbhRandom
+
+  test "load_balance_hosts defaults to disable":
+    check parseDsn("postgresql://h1,h2/db").loadBalanceHosts == lbhDisable
+
+  test "load_balance_hosts keyword=value form":
+    check parseDsn("host=h1,h2 load_balance_hosts=random").loadBalanceHosts == lbhRandom
+
+  test "error: invalid load_balance_hosts":
+    expect PgError:
+      discard parseDsn("postgresql://h/db?load_balance_hosts=bogus")
+
+  test "orderedHosts: lbhDisable preserves configured order":
+    let cfg = parseDsn("postgresql://h1,h2,h3/db?load_balance_hosts=disable")
+    check cfg.orderedHosts() == cfg.getHosts()
+
+  test "orderedHosts: lbhRandom is a permutation and reorders":
+    let cfg = parseDsn("postgresql://h1,h2,h3,h4,h5/db?load_balance_hosts=random")
+    let base = cfg.getHosts()
+    var sawReorder = false
+    for _ in 0 ..< 100:
+      let o = cfg.orderedHosts()
+      check o.len == base.len
+      for h in base: # same multiset of hosts, just reordered
+        check h in o
+      if o != base:
+        sawReorder = true
+    check sawReorder
+
+  test "orderedHosts: single host is never shuffled under lbhRandom":
+    let cfg = parseDsn("postgresql://only/db?load_balance_hosts=random")
+    check cfg.orderedHosts() == cfg.getHosts()
+
+  test "orderedHosts: exactly two hosts are eligible for shuffling":
+    # Boundary of the `result.len > 1` guard: two hosts (the smallest pool that
+    # can be balanced) must be reorderable, so a `> 2` off-by-one regression
+    # that silently disabled load balancing for 2-host pools would be caught.
+    let cfg = parseDsn("postgresql://h1,h2/db?load_balance_hosts=random")
+    let base = cfg.getHosts()
+    var sawReorder = false
+    for _ in 0 ..< 100:
+      let o = cfg.orderedHosts()
+      check o.len == 2
+      for h in base:
+        check h in o
+      if o != base:
+        sawReorder = true
+    check sawReorder
+
+  test "orderedHosts: lbhRandom is independent of the global RNG seed":
+    # The shuffle must come from a local RNG seeded by the OS entropy source,
+    # not std/random's global RNG. Pinning the global RNG to the same seed
+    # before every call must NOT make the order reproducible: a buggy
+    # implementation that shuffled via the global RNG would return an identical
+    # order each time the global seed was reset to the same value.
+    let cfg = parseDsn("postgresql://h1,h2,h3,h4,h5/db?load_balance_hosts=random")
+    let base = cfg.getHosts()
+    randomize(123456789)
+    let first = cfg.orderedHosts()
+    var sawDifferent = false
+    for _ in 0 ..< 50:
+      randomize(123456789) # reset the global RNG to an identical state each time
+      let o = cfg.orderedHosts()
+      check o.len == base.len
+      for h in base:
+        check h in o
+      if o != first:
+        sawDifferent = true
+    # With a global-RNG implementation every `o` would equal `first`;
+    # independence means we still observe variation despite the fixed seed.
+    check sawDifferent
+    randomize() # restore a non-deterministic global RNG (avoid cross-test leak)
+
+  # The invariant that connect() shuffles once and reuses that single order for
+  # both the connect-start trace and every host attempt (including both
+  # prefer-standby passes) is covered end-to-end in tests/test_tracing.nim.
 
   test "single host backward compat - hosts has one entry":
     let cfg = parseDsn("postgresql://myhost:5433/db")
