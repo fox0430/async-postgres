@@ -7,13 +7,15 @@
 ##   auth loop → ParameterStatus/BackendKeyData → extension OID discovery.
 ## - `connect` — the public entry: multi-host failover, `targetSessionAttrs`
 ##   handling, optional `connectTimeout`, top-level connect tracing.
+## - `orderedHosts` — the host list to try, reordered per `loadBalanceHosts`
+##   (`lbhRandom` shuffles it once per connection).
 ## - `close` — idempotent teardown: stop background listen pump, send
 ##   `Terminate`, drop transport handles.
 ##
 ## Imports `simple_query` for `checkSessionAttrs` (failover probe).
 ## Re-exported through `pg_connection.nim`.
 
-import std/[options, strutils, tables]
+import std/[options, random, strutils, sysrand, tables]
 
 import ../[async_backend, pg_errors, pg_protocol, pg_auth]
 import pkg/nimcrypto/utils as ncutils
@@ -505,14 +507,47 @@ proc attemptHostTimed(
   else:
     return await attemptHost(config, entry, attrs).wait(config.connectTimeout)
 
+proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
+  ## `getHosts`, reordered per `config.loadBalanceHosts`. With `lbhRandom`
+  ## (libpq `load_balance_hosts=random`) the configured host list is shuffled
+  ## once per call, so a pool of connections spreads across hosts. With
+  ## `lbhDisable` (default) the configured order is preserved. Only the
+  ## multi-host list is reordered — multiple addresses behind a single host
+  ## name are not shuffled (`attemptHost` dials the first resolved address).
+  ##
+  ## The shuffle is seeded from the OS secure random source (`std/sysrand`)
+  ## into a local `std/random` RNG, so it is safe under `--threads:on`, does
+  ## not require the application to call `randomize()`, and keeps no
+  ## module-level state.
+  result = config.getHosts()
+  if config.loadBalanceHosts == lbhRandom and result.len > 1:
+    let bytes =
+      try:
+        urandom(8)
+      except OSError as e:
+        raise newException(
+          PgConnectionError,
+          "Failed to read entropy for load_balance_hosts=random: " & e.msg,
+        )
+    var seed: uint64
+    for b in bytes:
+      seed = (seed shl 8) or b
+    # initRand expects a signed seed; use a bit-preserving cast so any
+    # 64-bit random value is valid, not just values <= int64.high.
+    var rng = initRand(cast[int64](seed))
+    rng.shuffle(result)
+
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Establish a new connection to a PostgreSQL server.
-  ## Supports multi-host failover: tries each host in order.
+  ## Supports multi-host failover: tries each host in order, or in a random
+  ## order when `loadBalanceHosts == lbhRandom` (libpq `load_balance_hosts`).
   ## Respects `targetSessionAttrs` to select the appropriate server type.
   ## `connectTimeout` is applied per host (libpq semantics): each host attempt
   ## gets its own budget, so the total wait may reach `connectTimeout * hosts`.
-  proc perform(): Future[PgConnection] {.async.} =
-    let hosts = config.getHosts()
+  proc perform(hosts: seq[HostEntry]): Future[PgConnection] {.async.} =
+    # `hosts` is already ordered by the caller (shuffled under lbhRandom), so
+    # both the preferStandby two-pass loop and the single-pass loop below share
+    # one order.
     var errors: seq[string]
     # With a single host there is no failover. Preserve the contract that its
     # `connectTimeout` surfaces as a raw `AsyncTimeoutError` (callers and the
@@ -565,7 +600,9 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     )
 
   proc wrapped(): Future[PgConnection] {.async.} =
-    let hosts = config.getHosts()
+    # Compute the ordered host list once so the trace and the actual connection
+    # attempts see the same order under lbhRandom.
+    let hosts = config.orderedHosts()
     var conn: PgConnection
     withTracing(
       config.tracer,
@@ -577,7 +614,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     ):
       # `connectTimeout` is enforced per host inside `attemptHostTimed`, so
       # `perform()` is awaited directly here — no outer total-timeout wrapper.
-      conn = await perform()
+      conn = await perform(hosts)
       conn.tracer = config.tracer
     return conn
 

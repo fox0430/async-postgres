@@ -17,6 +17,9 @@ Async PostgreSQL client in Nim.
 - Unix socket connection
 - Multi-host failover
 - Target session attributes (any, read-write, read-only, primary, standby, prefer-standby)
+- `load_balance_hosts=random` shuffles the configured host list per connection to
+  spread a pool across replicas (reorders the multi-host list only, not multiple
+  addresses behind a single DNS name)
 
 ### Queries & Statements
 - `sql` macro — compile-time `{expr}` placeholder extraction with automatic parameterization

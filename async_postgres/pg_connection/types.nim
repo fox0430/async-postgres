@@ -84,6 +84,16 @@ type
     tsaStandby ## Standby server
     tsaPreferStandby ## Prefer standby, fall back to any
 
+  LoadBalanceHosts* = enum
+    ## Host connection ordering for a multi-host connection (libpq compatible).
+    lbhDisable ## Try hosts in the configured order (default)
+    lbhRandom
+      ## Shuffle the configured host list once per connection so a pool of
+      ## connections spreads across hosts (e.g. read replicas). Only the
+      ## multi-host list is reordered — multiple addresses behind a single host
+      ## name are not shuffled. See `orderedHosts` for the seeding and
+      ## thread-safety details.
+
   HostEntry* = object ## A single host:port entry for multi-host connection.
     host*: string ## Host name (or Unix socket dir); used for SSL verification
     hostaddr*: string
@@ -127,6 +137,10 @@ type
     keepAliveCount*: int ## Number of probes before giving up (0 = OS default)
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
+    loadBalanceHosts*: LoadBalanceHosts
+      ## Host ordering for multi-host connections (libpq `load_balance_hosts`);
+      ## see `LoadBalanceHosts`. `lbhDisable` (default) preserves the configured
+      ## order.
     extraParams*: seq[(string, string)] ## Additional startup parameters
     maxMessageSize*: int
       ## Upper bound (in bytes) on a single backend message including

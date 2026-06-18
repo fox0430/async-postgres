@@ -370,6 +370,101 @@ suite "Tracing: connect":
 
     waitFor t()
 
+  test "lbhRandom connect: connect-start trace reflects the real attempt order":
+    # Real end-to-end check (replaces the earlier tautological proxy): connect()
+    # must compute the shuffled order once and use that single order for BOTH the
+    # connect-start trace and the actual host attempts. All hosts dial a closed
+    # loopback port so the attempt loop runs without a live server; the
+    # aggregated error message begins with the first host actually dialled.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var cfg = parseDsn(
+        "host=lbh1,lbh2,lbh3,lbh4,lbh5 " &
+          "hostaddr=127.0.0.1,127.0.0.1,127.0.0.1,127.0.0.1,127.0.0.1 " &
+          "port=19999 dbname=db sslmode=disable load_balance_hosts=random"
+      )
+      cfg.tracer = tracer
+
+      var errMsg = ""
+      try:
+        let conn = await connect(cfg)
+        await conn.close()
+      except CatchableError as e:
+        errMsg = e.msg
+
+      doAssert errMsg.len > 0, "expected the multi-host connect to fail"
+      doAssert log.connectStarts.len == 1
+      let traced = log.connectStarts[0].hosts
+      doAssert traced.len == 5
+
+      # The tracer sees a permutation of all configured hosts.
+      for name in ["lbh1", "lbh2", "lbh3", "lbh4", "lbh5"]:
+        var found = false
+        for h in traced:
+          if h.host == name:
+            found = true
+        doAssert found, "trace missing host " & name
+
+      # The first host actually dialled (the aggregated error starts with it)
+      # must equal the first host in the traced order — i.e. perform() uses the
+      # same single shuffled order that was reported to the tracer, not a fresh
+      # shuffle. Only the leading host name is parsed, so this stays robust
+      # across backends (asyncdispatch interleaves multi-line tracebacks into
+      # later parts of the message). "127.0.0.1" never collides with "lbh".
+      let idx = errMsg.find("lbh")
+      doAssert idx >= 0
+      doAssert errMsg[idx ..< idx + 4] == traced[0].host
+
+    waitFor t()
+
+  test "lbhRandom + prefer-standby reuse one order for both attempt passes":
+    # connect() runs the prefer-standby passes (standby-first, then any) over the
+    # single shuffled list. On chronos the aggregated error lists every attempt
+    # in a clean message, so both passes must spell out the same traced order.
+    # (asyncdispatch embeds async tracebacks in the message, so the full order is
+    # asserted only on the clean-message backend.)
+    when hasChronos:
+      proc t() {.async.} =
+        let log = newTraceLog()
+        let tracer = buildTracer(log)
+        var cfg = parseDsn(
+          "host=lbh1,lbh2,lbh3,lbh4,lbh5 " &
+            "hostaddr=127.0.0.1,127.0.0.1,127.0.0.1,127.0.0.1,127.0.0.1 " &
+            "port=19999 dbname=db sslmode=disable " &
+            "load_balance_hosts=random target_session_attrs=prefer-standby"
+        )
+        cfg.tracer = tracer
+
+        var errMsg = ""
+        try:
+          let conn = await connect(cfg)
+          await conn.close()
+        except CatchableError as e:
+          errMsg = e.msg
+
+        doAssert log.connectStarts.len == 1
+        var traced: seq[string]
+        for h in log.connectStarts[0].hosts:
+          traced.add(h.host)
+        doAssert traced.len == 5
+
+        var attempted: seq[string]
+        var i = 0
+        while true:
+          let idx = errMsg.find("lbh", i)
+          if idx < 0:
+            break
+          attempted.add(errMsg[idx ..< idx + 4]) # "lbhN"
+          i = idx + 4
+
+        doAssert attempted.len == 10,
+          "expected 5 hosts x 2 prefer-standby passes, got " & $attempted.len
+        doAssert attempted[0 ..< 5] == traced # standby-first pass
+        doAssert attempted[5 ..< 10] == traced # any pass — same single order
+
+      waitFor t()
+
 suite "Tracing: exec":
   test "onQueryStart(isExec=true) and onQueryEnd with commandTag":
     proc t() {.async.} =
