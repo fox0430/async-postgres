@@ -16,8 +16,9 @@
 ##                                  `nextMessage`, `recvMessage`,
 ##                                  `sendMsg`), TCP keepalive,
 ##                                  `closeTransport`, notification/notice
-##                                  dispatch and `isConnected` /
-##                                  `socketHasFin`.
+##                                  dispatch, `isConnected` /
+##                                  `socketHasFin`, and the `getHosts`
+##                                  host helper.
 ## - `pg_connection/ssl`          — SSL negotiation (`negotiateSSL`) for
 ##                                  chronos+BearSSL and asyncdispatch+OpenSSL.
 ## - `pg_connection/cache`        — client-side prepared-statement LRU.
@@ -25,8 +26,10 @@
 ##                                  `cancel` / `invalidateOnTimeout`,
 ##                                  `checkSessionAttrs`, `quoteIdentifier`,
 ##                                  `QueryResult` helpers.
-## - `pg_connection/lifecycle`    — `connect` / `connectToHost` / `close`
-##                                  and the SCRAM/require_auth helpers.
+## - `pg_connection/lifecycle`    — `connect` / `connectToHost` / `close`,
+##                                  `orderedHosts` (load-balanced host
+##                                  ordering) and the SCRAM/require_auth
+##                                  helpers.
 ## - `pg_connection/notify`       — LISTEN/NOTIFY pump, `waitNotification`,
 ##                                  `reconnectInPlace`.
 ## - `pg_connection/type_lookup`  — `lookupTypeOids` generic helper to
