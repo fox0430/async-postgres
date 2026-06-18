@@ -284,6 +284,12 @@ type
       ## by `startReplication` / `startPhysicalReplication`. Used by
       ## `confirmFlushed` to reject confirmations beyond received WAL.
       ## Manipulated via the exported helpers in this module (see below).
+    replReadScratch*: seq[byte]
+      ## Reusable scratch buffer for `fillRecvBufDetached` (chronos only). The
+      ## proactive status-interval path keeps a single read in flight across
+      ## timer wakes; reading into this private buffer (instead of growing
+      ## `recvBuf` up front like `fillRecvBuf`) keeps `recvBuf` parseable while
+      ## that read is still pending. Allocated lazily to `RecvBufSize` and reused.
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
