@@ -267,6 +267,35 @@ proc fillRecvBuf*(
     conn.recvBuf.setLen(oldLen + data.len)
     copyMem(addr conn.recvBuf[oldLen], addr data[0], data.len)
 
+when hasChronos:
+  proc fillRecvBufDetached*(conn: PgConnection): Future[void] {.async.} =
+    ## Read one chunk into a private scratch buffer and append it to ``recvBuf``
+    ## only once the read settles, leaving ``recvBuf`` parseable while the read is
+    ## still in flight.
+    ##
+    ## ``fillRecvBuf`` grows ``recvBuf`` by ``RecvBufSize`` up front to hand the
+    ## chronos ``readOnce`` a destination pointer, so a caller that parses
+    ## ``recvBuf`` before the read completes would see uninitialised tail bytes.
+    ## The replication status-interval path keeps a single read pending across
+    ## timer wakes and parses between them, so it reads through here instead (see
+    ## ``replFillRecvBuf``). On any read failure the connection is marked
+    ## ``csClosed`` before re-raising, matching ``fillRecvBuf``.
+    if conn.replReadScratch.len < RecvBufSize:
+      conn.replReadScratch.setLen(RecvBufSize)
+    let n =
+      try:
+        await conn.reader.readOnce(addr conn.replReadScratch[0], RecvBufSize)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
+    if n == 0:
+      conn.state = csClosed
+      raise newException(PgConnectionError, "Connection closed by server")
+    conn.compactRecvBuf()
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + n)
+    copyMem(addr conn.recvBuf[oldLen], addr conn.replReadScratch[0], n)
+
 proc nextMessage*(
     conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
 ): Option[BackendMessage] {.raises: [PgProtocolError].} =

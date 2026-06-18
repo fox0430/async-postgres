@@ -330,3 +330,80 @@ suite "Replication: auto keepalive reply":
     check firstAdvanced
     check not secondAdvanced
     check not thirdAdvanced
+
+suite "Replication: proactive status interval":
+  test "statusInterval sends a Standby Status without a reply-requested keepalive":
+    # A server with wal_sender_timeout = 0 never requests a reply, so the slot
+    # only advances if the standby sends status updates on its own. With a
+    # positive statusInterval the library must emit a Standby Status Update
+    # (receive = received LSN, flush/apply = confirmFlushed) even though the
+    # server set replyRequested only never. Works on both backends: chronos via a
+    # timed idle wake, asyncdispatch via the post-message path nudged below.
+    observedReceiveLsn = -1
+    observedFlushLsn = -1
+    observedApplyLsn = -1
+    observedReplyMsgType = '\0'
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        var burst: seq[byte]
+        burst.add(buildCopyBothResponse())
+        # XLogData only — crucially, no PrimaryKeepalive(replyRequested=true).
+        burst.add(buildXLogData(testStartLsn, testXLogWalEnd, 0, testWalData))
+        await sendBytes(st, burst)
+        # Let the status interval (50ms) elapse, then send a non-reply keepalive
+        # to unblock the asyncdispatch read (which cannot wake on a timer);
+        # chronos has already emitted updates on its own by now.
+        await sleepAsync(milliseconds(150))
+        await sendBytes(
+          st, buildKeepalive(testKeepaliveWalEnd, 0, replyRequested = false)
+        )
+        let reply = await drainFrontendMessage(st)
+        observedReplyMsgType = reply.msgType
+        if reply.msgType == 'd':
+          let ssu = decodeStandbyStatus(reply.body)
+          observedReceiveLsn = ssu.receive
+          observedFlushLsn = ssu.flush
+          observedApplyLsn = ssu.apply
+        # End the stream. Drain any further proactive updates plus the client's
+        # CopyDone so its CopyDone send sees an open socket.
+        var tail: seq[byte]
+        tail.add(buildCopyDone())
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          if m.msgType == 'c': # client's CopyDone
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          if msg.kind == rmkXLogData:
+            discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
+
+      await conn.startReplication(
+        "test_slot", statusInterval = milliseconds(50), callback = cb
+      )
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    # A proactive Standby Status Update arrived even though the server never set
+    # replyRequested: receive carries the received LSN, flush/apply the confirmed
+    # position (here equal, since the callback confirmed the full received range).
+    check observedReplyMsgType == 'd'
+    check observedReceiveLsn == testReceivedEndLsn
+    check observedFlushLsn == testReceivedEndLsn
+    check observedApplyLsn == testReceivedEndLsn
