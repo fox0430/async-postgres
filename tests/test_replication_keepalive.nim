@@ -407,3 +407,50 @@ suite "Replication: proactive status interval":
     check observedReceiveLsn == testReceivedEndLsn
     check observedFlushLsn == testReceivedEndLsn
     check observedApplyLsn == testReceivedEndLsn
+
+var poisonRaised: bool
+var poisonFinalState: PgConnState
+
+suite "Replication: callback exception invalidates the connection":
+  test "a raising callback poisons the connection (csClosed) and propagates":
+    # A user callback raising mid-stream must not strand the connection in
+    # csReplicating (where every later call would raise a misleading
+    # PgStateError). startReplication invalidates it (csClosed) and re-raises so
+    # the caller can reconnect and resume from the last confirmed LSN.
+    poisonRaised = false
+    poisonFinalState = csReady
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        var burst: seq[byte]
+        burst.add(buildCopyBothResponse())
+        burst.add(buildXLogData(testStartLsn, testXLogWalEnd, 0, testWalData))
+        await sendBytes(st, burst)
+        # The client errors out of the stream and never sends CopyDone; close.
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          discard msg
+          raise newException(ValueError, "boom from replication callback")
+
+      try:
+        await conn.startReplication("test_slot", callback = cb)
+      except ValueError:
+        {.cast(gcsafe).}:
+          poisonRaised = true
+      {.cast(gcsafe).}:
+        poisonFinalState = conn.state
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check poisonRaised
+    check poisonFinalState == csClosed

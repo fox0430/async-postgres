@@ -967,6 +967,27 @@ proc handleReplicationData(
   await callback(replMsg)
   return newLastStatusSent
 
+proc invalidateAbandonedStream(conn: PgConnection) =
+  ## Poison a connection whose CopyBoth replication stream was torn down
+  ## mid-flight — most often because the user ``callback`` raised, but also any
+  ## other failure that unwinds the streaming loop while the stream is still
+  ## open. The half-finished CopyBoth exchange leaves the protocol stream out of
+  ## sync (the server is still streaming WAL the client will never drain), so the
+  ## connection cannot be reused; mark it ``csClosed`` so the next operation
+  ## fails fast and a pool discards it.
+  ##
+  ## Without this the connection would be stranded in ``csReplicating``: every
+  ## later call would raise a misleading ``PgStateError`` ("connection is in
+  ## use") for an apparently-live stream when the stream is in fact dead, and the
+  ## only recovery is to reconnect and resume (see ``examples/replication.nim``).
+  ## A clean stop (CopyDone -> ReadyForQuery) and a server-side error followed by
+  ## ReadyForQuery both return the connection to ``csReady`` first, and the I/O
+  ## helpers (``fillRecvBuf`` / ``sendMsg``) mark ``csClosed`` themselves on a
+  ## dead socket — so only a still-``csReplicating`` state, the stranded case, is
+  ## changed here.
+  if conn.state == csReplicating:
+    conn.state = csClosed
+
 proc startReplication*(
     conn: PgConnection,
     slotName: string,
@@ -1040,6 +1061,18 @@ proc startReplication*(
   ## between receiving the keepalive and writing the Standby Status Update),
   ## the exception is propagated out of ``startReplication`` and the callback
   ## is *not* invoked for that keepalive.
+  ##
+  ## **Errors invalidate the connection.** If the ``callback`` raises — or the
+  ## stream fails for any other reason mid-flight — the exception propagates out
+  ## of this proc and the connection is poisoned (marked closed): the CopyBoth
+  ## exchange is left half-open and the protocol stream is out of sync, so the
+  ## connection cannot be reused. There is no built-in reconnect; treat the
+  ## connection as dead, ``close`` it (a pool discards it automatically), and
+  ## resume on a fresh connection. Because ``confirmFlushed`` /
+  ## ``confirmedFlushLsn`` reset once the stream ends, track the last LSN you
+  ## confirmed durable yourself in the callback so you know the restart point,
+  ## then pass it as ``startLsn`` on the new stream. See
+  ## ``examples/replication.nim`` for a reconnect-and-resume loop.
   ##
   ## The proc returns when the server sends ``CopyDone`` or the connection closes.
   ## To stop replication from the client side, call ``stopReplication`` from within
@@ -1126,6 +1159,16 @@ proc startReplication*(
   # confirmed-flush position to the resume point so a reused connection does not
   # inherit a stale value.
   conn.resetReplLsnTracking(startLsn)
+
+  # If anything unwinds the streaming loop while the connection is still
+  # mid-CopyBoth — most often the user callback raising — the protocol stream is
+  # left out of sync. Poison the connection on the way out so it is not stranded
+  # in csReplicating (where every later call raises a misleading PgStateError).
+  # The clean stop (CopyDone -> ReadyForQuery) returns it to csReady first, so
+  # this is a no-op on the normal exit. See invalidateAbandonedStream.
+  defer:
+    conn.invalidateAbandonedStream()
+
   var lastStatusSent = Moment.now()
   var pendingRead: Future[void] = nil # in-flight timed read, threaded across waits
   when hasChronos:
@@ -1262,6 +1305,10 @@ proc startPhysicalReplication*(
   ## ``wal_sender_timeout = 0``); it is honoured only with ``autoKeepaliveReply``,
   ## and on asyncdispatch only fires while messages are flowing.
   ##
+  ## Error handling matches ``startReplication``: a callback exception or any
+  ## other mid-stream failure poisons the connection (marked closed) and
+  ## propagates, so reconnect and resume from the last LSN you tracked durable.
+  ##
   ## On a timeline switch the server may send a final result set describing
   ## the next timeline (``RowDescription`` + ``DataRow`` + ``CommandComplete``)
   ## between ``CopyDone`` and ``ReadyForQuery``. This proc drains and discards
@@ -1311,6 +1358,13 @@ proc startPhysicalReplication*(
   # position lives on the connection. Reset it and the confirmed-flush position
   # to the resume point so a reused connection does not inherit a stale value.
   conn.resetReplLsnTracking(startLsn)
+
+  # See startReplication: poison the connection if the streaming loop unwinds
+  # while still mid-CopyBoth (e.g. the callback raised), so it is not stranded in
+  # csReplicating. No-op on the clean CopyDone -> ReadyForQuery exit.
+  defer:
+    conn.invalidateAbandonedStream()
+
   var lastStatusSent = Moment.now()
   var pendingRead: Future[void] = nil # in-flight timed read, threaded across waits
   when hasChronos:

@@ -1,6 +1,11 @@
 ## Logical Replication example.
 ##
-## Demonstrates PostgreSQL logical replication using the pgoutput plugin.
+## Demonstrates PostgreSQL logical replication using the pgoutput plugin,
+## including a **reconnect-and-resume** loop: `startReplication` poisons its
+## connection on any mid-stream error (a callback exception, a dropped TCP
+## connection, ...), so a long-running consumer must reconnect on a fresh
+## connection and resume from the last LSN it confirmed durable.
+##
 ## Requires PostgreSQL configured with wal_level=logical and a user with
 ## REPLICATION privilege.
 ##
@@ -17,106 +22,131 @@ import std/tables
 
 import pkg/async_postgres
 
+const
+  dsn = "postgresql://myuser:mypass@127.0.0.1:5432/mydb"
+  slotName = "example_slot"
+
 proc main() {.async.} =
-  let dsn = "postgresql://myuser:mypass@127.0.0.1:5432/mydb"
+  # Use a *permanent* slot (the default) so it survives reconnects — a temporary
+  # slot would vanish the moment its connection drops, defeating resume. Create
+  # it once with a short-lived connection (or reuse it if the example was
+  # restarted) and report the consistent point.
+  block createSlot:
+    let conn = await connectReplication(dsn)
+    defer:
+      await conn.close()
+    let sysInfo = await conn.identifySystem()
+    echo "System ID: ", sysInfo.systemId, " timeline ", sysInfo.timeline
+    let slot =
+      try:
+        await conn.createReplicationSlot(slotName, "pgoutput")
+      except PgQueryError as e:
+        # 42710 = duplicate_object: the slot already exists from a prior run.
+        if e.sqlState == "42710":
+          echo "Slot already exists, reusing it"
+          await conn.readReplicationSlot(slotName)
+        else:
+          raise
+    echo "Using slot: ", slot.slotName, " at ", slot.consistentPoint
 
-  # Connect with replication mode
-  let replConn = await connectReplication(dsn)
-  defer:
-    await replConn.close()
-
-  # Identify the system
-  let sysInfo = await replConn.identifySystem()
-  echo "System ID: ", sysInfo.systemId
-  echo "Timeline: ", sysInfo.timeline
-  echo "WAL position: ", sysInfo.xLogPos
-
-  # Create a temporary replication slot
-  let slot =
-    await replConn.createReplicationSlot("example_slot", "pgoutput", temporary = true)
-  echo "Created slot: ", slot.slotName, " at ", slot.consistentPoint
-
-  # Use a separate connection to make changes
-  let writerConn = await connect(dsn)
-  defer:
-    await writerConn.close()
-
-  # Track relation metadata
+  # The resume point. confirmFlushed / confirmedFlushLsn reset once a stream
+  # ends, so we cannot read the restart position back off a poisoned connection
+  # — we track the last durably-processed LSN ourselves. InvalidLsn (0/0) tells
+  # the server to start from the slot's confirmed_flush_lsn on the first attempt.
+  var resumeLsn = InvalidLsn
   var relations: RelationCache
-
-  # Start replication with pgoutput plugin
   var msgCount = 0
-  let cb = makeReplicationCallback:
-    case msg.kind
-    of rmkXLogData:
-      let pgMsg = decodePgOutput(msg.xlogData)
-      case pgMsg.kind
-      of pomkRelation:
-        relations[pgMsg.relation.relationId] = pgMsg.relation
-        echo "Relation: ", pgMsg.relation.namespace, ".", pgMsg.relation.name
-      of pomkBegin:
-        echo "BEGIN xid=", pgMsg.begin.xid
-      of pomkCommit:
-        echo "COMMIT"
-      of pomkInsert:
-        let rel = relations[pgMsg.insert.relationId]
-        echo "INSERT into ", rel.name, ":"
-        for i, field in pgMsg.insert.newTuple:
-          let colName =
-            if i < rel.columns.len:
-              rel.columns[i].name
+  var done = false # set when we have consumed enough and stopped cleanly
+
+  # Reconnect-and-resume loop. Each attempt uses a fresh connection (the previous
+  # one is poisoned on any error) and resumes from `resumeLsn`.
+  while not done:
+    let replConn = await connectReplication(dsn)
+
+    # Build the callback for *this* connection. It records progress both locally
+    # (`resumeLsn`, used to restart) and on the connection (`confirmFlushed`,
+    # which the automatic keepalive reply carries to the server to advance the
+    # slot's confirmed_flush_lsn and let it recycle WAL).
+    let cb = makeReplicationCallback:
+      case msg.kind
+      of rmkXLogData:
+        let pgMsg = decodePgOutput(msg.xlogData)
+        case pgMsg.kind
+        of pomkRelation:
+          relations[pgMsg.relation.relationId] = pgMsg.relation
+          echo "Relation: ", pgMsg.relation.namespace, ".", pgMsg.relation.name
+        of pomkBegin:
+          echo "BEGIN xid=", pgMsg.begin.xid
+        of pomkCommit:
+          echo "COMMIT"
+        of pomkInsert:
+          let rel = relations[pgMsg.insert.relationId]
+          echo "INSERT into ", rel.name, ":"
+          for i, field in pgMsg.insert.newTuple:
+            let colName =
+              if i < rel.columns.len:
+                rel.columns[i].name
+              else:
+                $i
+            case field.kind
+            of tdkNull:
+              echo "  ", colName, " = NULL"
+            of tdkText:
+              echo "  ", colName, " = ", field.toString()
             else:
-              $i
-          case field.kind
-          of tdkNull:
-            echo "  ", colName, " = NULL"
-          of tdkText:
-            echo "  ", colName, " = ", field.toString()
-          else:
-            echo "  ", colName, " = <", field.kind, ">"
-      of pomkUpdate:
-        echo "UPDATE on ", relations[pgMsg.update.relationId].name
-      of pomkDelete:
-        echo "DELETE on ", relations[pgMsg.delete.relationId].name
-      else:
-        echo "Other: ", pgMsg.kind
+              echo "  ", colName, " = <", field.kind, ">"
+        of pomkUpdate:
+          echo "UPDATE on ", relations[pgMsg.update.relationId].name
+        of pomkDelete:
+          echo "DELETE on ", relations[pgMsg.delete.relationId].name
+        else:
+          echo "Other: ", pgMsg.kind
 
-      # Mark the received changes durable. confirmFlushed only records the
-      # flush/apply position locally; the automatic keepalive reply
-      # (autoKeepaliveReply, default) carries it to the server on the next
-      # reply-requested keepalive, and stopReplication flushes it on a clean
-      # stop — together advancing the slot's confirmed_flush_lsn. Call it only
-      # *after* the change is durably processed (here, echoed above). Use
-      # receivedEndLsn (startLsn + data.len), not walEnd: walEnd is the server's
-      # current WAL position and may point past what this message actually
-      # carries.
-      #
-      # To advance the slot eagerly on every message instead, call
-      # `await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)` here and
-      # pass `autoKeepaliveReply = false` to startReplication — otherwise the
-      # auto-reply would report a flush position behind your manual ACKs.
-      discard replConn.confirmFlushed(msg.xlogData.receivedEndLsn)
+        # Mark the received changes durable. Use receivedEndLsn (startLsn +
+        # data.len), not walEnd: walEnd is the server's current WAL position and
+        # may point past what this message carries. Record it locally as the
+        # resume point *and* confirm it on the connection so the auto-reply
+        # advances the slot. Do this only *after* the change is durably
+        # processed (here, echoed above) — until then a crash re-streams it.
+        resumeLsn = msg.xlogData.receivedEndLsn
+        discard replConn.confirmFlushed(msg.xlogData.receivedEndLsn)
 
-      inc msgCount
-      if msgCount >= 10:
-        await replConn.stopReplication()
-    of rmkPrimaryKeepalive:
-      # startReplication's autoKeepaliveReply (default) answers keepalives for
-      # us: the receive LSN is the highest receivedEndLsn observed, while
-      # flush/apply reflect the confirmFlushed position set above. No manual
-      # reply needed.
-      discard
+        inc msgCount
+        if msgCount >= 10:
+          # Enough consumed: stop the stream cleanly so startReplication returns
+          # normally (CopyDone -> ReadyForQuery) instead of being poisoned.
+          done = true
+          await replConn.stopReplication()
+      of rmkPrimaryKeepalive:
+        # autoKeepaliveReply (default) answers reply-requested keepalives for us,
+        # carrying the confirmFlushed position above. No manual reply needed.
+        discard
 
-  echo "Starting replication from ", slot.consistentPoint
-  echo "Insert rows into test_repl from another session to see changes..."
+    echo "Starting replication from ", resumeLsn
+    echo "Insert rows into test_repl from another session to see changes..."
+    try:
+      await replConn.startReplication(
+        slotName,
+        resumeLsn,
+        options = @{"proto_version": "'1'", "publication_names": "'test_pub'"},
+        callback = cb,
+      )
+    except CatchableError as e:
+      # Mid-stream failure (callback exception, dropped connection, server
+      # error, ...). The connection is already poisoned; close it and loop to
+      # resume from resumeLsn on a fresh connection. A real consumer would back
+      # off / cap retries here.
+      echo "Replication interrupted (", e.msg, "); resuming from ", resumeLsn
+    finally:
+      await replConn.close()
 
-  await replConn.startReplication(
-    "example_slot",
-    slot.consistentPoint,
-    options = @{"proto_version": "'1'", "publication_names": "'test_pub'"},
-    callback = cb,
-  )
+  echo "Replication ended after ", msgCount, " messages."
 
-  echo "Replication ended."
+  # Clean up the permanent slot (wait for it to go inactive after the stream).
+  block dropSlot:
+    let conn = await connectReplication(dsn)
+    defer:
+      await conn.close()
+    await conn.dropReplicationSlot(slotName, wait = true)
 
 waitFor main()
