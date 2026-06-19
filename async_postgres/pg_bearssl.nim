@@ -23,27 +23,13 @@ when hasChronos:
       backing*: seq[seq[byte]] ## Owns memory pointed to by trust anchor fields
 
   proc appendDnCallback(
-      ctx: pointer, buf: pointer, len: uint
-  ) {.exportc: "pg_append_dn_nim", cdecl, gcsafe, noSideEffect, raises: [].} =
+      ctx: pointer, buf: ConstPointer, len: csize_t
+  ) {.cdecl, gcsafe, noSideEffect, raises: [].} =
     ## DN accumulation callback
     let s = cast[ptr seq[byte]](ctx)
     let p = cast[ptr UncheckedArray[byte]](buf)
     for i in 0 ..< int(len):
       s[].add(p[i])
-
-  # C shim with const void* to satisfy BearSSL's br_x509_decoder_init signature
-  {.
-    emit: """
-  static void pg_append_dn_shim(void *ctx, const void *buf, size_t len) {
-    pg_append_dn_nim(ctx, (void*)buf, len);
-  }
-  """
-  .}
-
-  proc initX509Decoder(ctx: var X509DecoderContext, appendDnCtx: pointer) =
-    {.
-      emit: ["br_x509_decoder_init(&", ctx, ", pg_append_dn_shim, ", appendDnCtx, ");"]
-    .}
 
   # X509 certificate capture callbacks
   # Intercepts BearSSL X509 callbacks to capture the leaf certificate DER bytes,
@@ -70,7 +56,7 @@ when hasChronos:
     inner[].startCert(inner, length)
 
   proc x509CaptureAppend(
-      ctx: ptr ptr X509Class, buf: ptr byte, len: csize_t
+      ctx: ptr ptr X509Class, buf: ConstPtrByte, len: csize_t
   ) {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
     if self.capturing:
@@ -141,7 +127,7 @@ when hasChronos:
 
       var dnBuf: seq[byte]
       var decoder: X509DecoderContext
-      initX509Decoder(decoder, addr dnBuf)
+      x509DecoderInit(decoder, appendDnCallback, addr dnBuf)
       x509DecoderPush(decoder, addr item.data[0], uint(item.data.len))
 
       if x509DecoderLastError(decoder) != 0:
