@@ -146,9 +146,12 @@ suite "E2E: COPY OUT timeout / stall":
       var timedOut = false
       try:
         discard await conn.copyOut(sql, timeout = milliseconds(200))
-      except PgTimeoutError:
-        timedOut = true
-      doAssert timedOut, "copyOut should have timed out"
+      except PgConnectionError as e:
+        # A timeout poisons the connection (csClosed), so it must surface to an
+        # `except PgConnectionError` reconnect loop while still being a
+        # PgTimeoutError for callers that distinguish the cause.
+        timedOut = e of ref PgTimeoutError
+      doAssert timedOut, "copyOut timeout must be catchable as a PgConnectionError"
       doAssert conn.state == csClosed, $conn.state
       # A fresh connection works — the closed one is isolated.
       let conn2 = await connect(plainConfig())
@@ -170,9 +173,12 @@ suite "E2E: simpleQuery timeout / stall":
       try:
         discard
           await conn.simpleQuery("SELECT pg_sleep(5)", timeout = milliseconds(200))
-      except PgTimeoutError:
-        timedOut = true
-      doAssert timedOut, "simpleQuery should have timed out"
+      except PgConnectionError as e:
+        # A timeout poisons the connection (csClosed), so it must surface to an
+        # `except PgConnectionError` reconnect loop while still being a
+        # PgTimeoutError for callers that distinguish the cause.
+        timedOut = e of ref PgTimeoutError
+      doAssert timedOut, "simpleQuery timeout must be catchable as a PgConnectionError"
       doAssert conn.state == csClosed, $conn.state
       # A fresh connection works — the closed one is isolated.
       let conn2 = await connect(plainConfig())
