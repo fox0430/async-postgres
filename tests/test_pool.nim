@@ -304,6 +304,73 @@ suite "splitBatchBudget":
       check a >= 1 and b >= 1
       check a + b == cap
 
+suite "checkReady error classification":
+  # A-8: a connection that is alive but busy (a single connection used
+  # concurrently) is a programming error, not a network failure. checkReady
+  # must distinguish it from a genuinely dead connection so reconnect-on-
+  # PgConnectionError recovery does not spin on an unfixable condition.
+  test "csBusy raises PgStateError, not PgConnectionError":
+    let conn = mockConn(csBusy)
+    var stateErr = false
+    var connErr = false
+    try:
+      conn.checkReady()
+    except PgConnectionError:
+      connErr = true
+    except PgStateError:
+      stateErr = true
+    check stateErr
+    check not connErr
+
+  test "csReplicating raises PgStateError":
+    let conn = mockConn(csReplicating)
+    var stateErr = false
+    try:
+      conn.checkReady()
+    except PgStateError:
+      stateErr = true
+    check stateErr
+
+  test "csConnecting raises PgStateError":
+    let conn = mockConn(csConnecting)
+    var stateErr = false
+    try:
+      conn.checkReady()
+    except PgStateError:
+      stateErr = true
+    check stateErr
+
+  test "csAuthentication raises PgStateError":
+    let conn = mockConn(csAuthentication)
+    var stateErr = false
+    try:
+      conn.checkReady()
+    except PgStateError:
+      stateErr = true
+    check stateErr
+
+  test "csListening raises PgStateError":
+    let conn = mockConn(csListening)
+    var stateErr = false
+    try:
+      conn.checkReady()
+    except PgStateError:
+      stateErr = true
+    check stateErr
+
+  test "csClosed raises PgConnectionError (reconnect is the right recovery)":
+    let conn = mockConn(csClosed)
+    var connErr = false
+    try:
+      conn.checkReady()
+    except PgConnectionError:
+      connErr = true
+    check connErr
+
+  test "csReady passes":
+    let conn = mockConn(csReady)
+    conn.checkReady()
+
 suite "Pool release":
   test "release to idle queue":
     let pool = makePool()

@@ -5,6 +5,12 @@
 ## is a subtype of ``PgConnectionError`` because a protocol-level violation
 ## desynchronises the wire stream — the only viable recovery is to tear down
 ## and re-establish the connection.
+##
+## ``PgStateError`` is deliberately a *sibling* of ``PgConnectionError`` (both
+## under ``PgError``) rather than a subtype: it signals a programming error
+## (e.g. a single connection used concurrently), for which reconnecting is
+## pointless, so it must stay out of ``except PgConnectionError`` reconnect
+## loops.
 
 type
   ErrorField* = object
@@ -34,6 +40,18 @@ type
 
   ProtocolError* {.deprecated: "use PgProtocolError".} = PgProtocolError
     ## Deprecated alias for `PgProtocolError`, kept for backwards compatibility.
+
+  PgStateError* = object of PgError
+    ## Raised when an operation is attempted on a connection that is alive but
+    ## in the wrong state for that operation — most commonly a single connection
+    ## used concurrently: a second query started while the first is still in
+    ## flight finds the connection ``csBusy``.
+    ##
+    ## This is a programming error, not a connection failure. Reconnecting does
+    ## not fix it, so ``PgStateError`` is intentionally **not** a subtype of
+    ## ``PgConnectionError`` — code that recovers via ``except PgConnectionError``
+    ## will not spin on it. The fix is to give each concurrent caller its own
+    ## connection (e.g. via a ``PgPool``).
 
   PgQueryError* = object of PgError
     ## SQL execution errors from the server (ErrorResponse).

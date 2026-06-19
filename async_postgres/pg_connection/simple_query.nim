@@ -61,11 +61,23 @@ iterator items*(qr: QueryResult): Row =
 # State assertion
 
 proc checkReady*(conn: PgConnection) =
-  ## Assert that the connection is in `csReady` state. Raises `PgConnectionError` otherwise.
-  if conn.state != csReady:
-    raise newException(
-      PgConnectionError, "Connection is not ready (state: " & $conn.state & ")"
-    )
+  ## Assert that the connection is in `csReady` before starting an operation.
+  ##
+  ## A `csClosed` connection is genuinely gone, so this raises
+  ## `PgConnectionError` — reconnecting is the correct recovery. Any other
+  ## non-ready state (`csBusy`, `csReplicating`, …) means the connection is
+  ## alive but already in use, almost always a single connection driven
+  ## concurrently; that raises `PgStateError` (a programming error), which is
+  ## *not* a `PgConnectionError` and so never feeds a reconnect-on-failure loop.
+  if conn.state == csReady:
+    return
+  if conn.state == csClosed:
+    raise newException(PgConnectionError, "Connection is closed")
+  raise newException(
+    PgStateError,
+    "Connection is not ready (state: " & $conn.state &
+      "); a single connection cannot be used concurrently",
+  )
 
 # Identifier escaping
 

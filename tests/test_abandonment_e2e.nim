@@ -22,20 +22,28 @@ suite "E2E: Cursor lifecycle invariants":
   test "cursor keeps connection csBusy until close() or exhaustion":
     # Pinning the documented invariant: after openCursor returns with rows
     # suspended server-side, the connection is csBusy and any attempt to
-    # issue a direct conn.query MUST fail with PgConnectionError. This is
-    # what prevents a pool from handing out the connection while a cursor
-    # is live.
+    # issue a direct conn.query MUST fail. Concurrent use of one connection is
+    # a programming error, so it surfaces as PgStateError — NOT
+    # PgConnectionError, which would wrongly drive a reconnect-on-failure
+    # recovery loop. This refusal is what prevents a pool from handing out the
+    # connection while a cursor is live.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let cursor =
         await conn.openCursor("SELECT i FROM generate_series(1, 100) i", chunkSize = 10)
       doAssert conn.state == csBusy, $conn.state
       var blocked = false
+      var notConnError = false
       try:
         discard await conn.query("SELECT 1")
       except PgConnectionError:
         blocked = true
+      except PgStateError:
+        blocked = true
+        notConnError = true
       doAssert blocked, "conn.query must refuse while cursor is active"
+      doAssert notConnError,
+        "concurrent use must raise PgStateError, not PgConnectionError"
       await cursor.close()
       doAssert conn.state == csReady
       let qr = await conn.query("SELECT 1")
