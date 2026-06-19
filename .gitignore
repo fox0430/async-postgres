@@ -31,4 +31,4 @@ examples/*
 htmldocs/
 htmdocs/
 
-async_postgres.out
+*.out
