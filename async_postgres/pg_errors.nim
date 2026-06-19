@@ -11,6 +11,19 @@
 ## (e.g. a single connection used concurrently), for which reconnecting is
 ## pointless, so it must stay out of ``except PgConnectionError`` reconnect
 ## loops.
+##
+## ``PgTimeoutError`` is a subtype of ``PgConnectionError`` for the opposite
+## reason. A timed-out query/exec/copy/prepare/transaction dispatches a
+## best-effort CancelRequest and marks the connection ``csClosed`` (the wire may
+## be mid-exchange and is no longer trustworthy), so reconnecting *is* the
+## correct recovery and the error must be visible to ``except PgConnectionError``
+## loops. The two timeouts that leave the connection usable —
+## ``waitNotification`` and an acquire timeout inside
+## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` — still raise
+## ``PgTimeoutError`` and are therefore also caught by ``except PgConnectionError``;
+## a caller that needs to tell a timeout apart from a hard connection failure
+## catches ``PgTimeoutError`` in a clause placed *before* the
+## ``PgConnectionError`` one.
 
 type
   ErrorField* = object
@@ -68,7 +81,21 @@ type
       ## All raw ErrorResponse fields as sent by the server, including any
       ## not covered by the named accessors below.
 
-  PgTimeoutError* = object of PgError ## Operation timed out.
+  PgTimeoutError* = object of PgConnectionError
+    ## Raised when an operation times out.
+    ##
+    ## A timeout on a query/exec/copy/prepare/transaction invalidates the
+    ## connection: a best-effort CancelRequest is dispatched and the connection
+    ## is marked ``csClosed`` because the protocol may be mid-exchange. The only
+    ## viable recovery is to reconnect, so ``PgTimeoutError`` is a subtype of
+    ## ``PgConnectionError`` — an ``except PgConnectionError`` reconnect loop
+    ## catches it instead of silently dropping the timeout-poisoned connection.
+    ##
+    ## ``waitNotification`` and an acquire timeout inside
+    ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` also raise
+    ## ``PgTimeoutError`` but do **not** close the connection; catch
+    ## ``PgTimeoutError`` before any ``PgConnectionError`` clause if you need to
+    ## distinguish those.
 
   PgPoolError* = object of PgError
     ## Pool-level acquire failure: acquire timeout, pool closed, waiter queue
