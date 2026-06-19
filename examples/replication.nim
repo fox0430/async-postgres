@@ -46,7 +46,7 @@ proc main() {.async.} =
           echo "Slot already exists, reusing it"
           await conn.readReplicationSlot(slotName)
         else:
-          raise
+          raise e
     echo "Using slot: ", slot.slotName, " at ", slot.consistentPoint
 
   # The resume point. confirmFlushed / confirmedFlushLsn reset once a stream
