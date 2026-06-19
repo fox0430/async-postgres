@@ -371,6 +371,32 @@ suite "checkReady error classification":
     let conn = mockConn(csReady)
     conn.checkReady()
 
+suite "PgTimeoutError recovery classification":
+  # A timed-out operation leaves the connection csClosed, so reconnecting is the
+  # only viable recovery. PgTimeoutError must therefore be visible to an
+  # `except PgConnectionError` reconnect loop, while a more specific
+  # `except PgTimeoutError` clause (placed first) still distinguishes it.
+  test "PgTimeoutError is caught by except PgConnectionError":
+    var caughtAsConn = false
+    var isTimeout = false
+    try:
+      raise newException(PgTimeoutError, "timed out")
+    except PgConnectionError as e:
+      caughtAsConn = true
+      isTimeout = e of ref PgTimeoutError
+    check caughtAsConn
+    check isTimeout
+
+  test "except PgTimeoutError takes precedence when ordered first":
+    var branch = ""
+    try:
+      raise newException(PgTimeoutError, "timed out")
+    except PgTimeoutError:
+      branch = "timeout"
+    except PgConnectionError:
+      branch = "conn"
+    check branch == "timeout"
+
 suite "Pool release":
   test "release to idle queue":
     let pool = makePool()
