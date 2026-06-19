@@ -198,6 +198,48 @@ suite "Physical replication: streaming and drain":
     check capturedRaised
     check capturedFinalState == csReady
 
+  test "callback exception poisons the connection (csClosed) and propagates":
+    # A user callback raising mid-stream must not leave the connection stranded
+    # in csReplicating: the CopyBoth exchange is half-open, so the connection is
+    # invalidated (csClosed) and the exception propagates unchanged.
+    capturedRaised = false
+    capturedFinalState = csReady
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION query
+        var burst: seq[byte]
+        burst.add(buildCopyBothResponse())
+        burst.add(buildXLogData(0x1000'i64, 0x5000'i64, 0, @[1'u8, 2, 3]))
+        await sendBytes(st, burst)
+        # The client never replies with CopyDone (it errors out), so just close.
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          discard msg
+          raise newException(ValueError, "boom from replication callback")
+
+      try:
+        await conn.startPhysicalReplication(startLsn = Lsn(0x1000'u64), callback = cb)
+      except ValueError:
+        {.cast(gcsafe).}:
+          capturedRaised = true
+      {.cast(gcsafe).}:
+        capturedFinalState = conn.state
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check capturedRaised
+    check capturedFinalState == csClosed
+
 suite "sendCopyData public API":
   test "errors when connection is not in csReplicating state":
     capturedRaised = false
