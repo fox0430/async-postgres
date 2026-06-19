@@ -819,6 +819,14 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
               min(pingBudget, rem)
         try:
           await pc.conn.ping(pingBudget)
+        except CancelledError as e:
+          # CancelledError is a CatchableError; the generic handler below would
+          # swallow it, letting acquire run on and return a connection the
+          # departed canceller leaks. The interrupted ping leaves the protocol
+          # out of sync, so close the popped conn (closeNoWait, since the pending
+          # cancellation would interrupt a fresh await) and re-raise.
+          pool.closeNoWait(pc.conn)
+          raise e
         except CatchableError:
           pool.metrics.closeCount.inc
           await pool.tracedClose(pc.conn)
