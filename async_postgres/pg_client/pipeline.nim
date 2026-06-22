@@ -251,12 +251,18 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
         result[i] = cached
       var effectiveResultFormats: seq[int16]
       if p.ops[i].kind == pokQuery:
+        # Replay the cached result formats when the caller didn't override, so a
+        # no-override cache hit re-Binds the format negotiated at first Parse.
+        # Leave `p.ops[i].resultFormats` untouched (don't freeze an rfAuto op
+        # into resolved formats across re-executes): the receive phase derives
+        # the same decode formats via `cacheHitColFmts(p.ops[i].resultFormats,
+        # c.colFmts, ...)`, whose empty branch returns `c.colFmts` — equal to
+        # these `cached.resultFormats` (both are `buildResultFormats` output).
         effectiveResultFormats =
           if p.ops[i].resultFormats.len == 0:
             cached.resultFormats
           else:
             p.ops[i].resultFormats
-        p.ops[i].resultFormats = effectiveResultFormats
       emitBind(cached.name, effectiveResultFormats)
       conn.sendBuf.addExecute("", 0)
     elif conn.stmtCacheCapacity > 0:
@@ -346,12 +352,18 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
       if p.ops[i].cacheHit:
         let c = cachedStmts[i]
         results[i].queryResult.fields = c.fields
-        if p.ops[i].resultFormats.len > 0 and c.colFmts.len > 0:
-          for j in 0 ..< results[i].queryResult.fields.len:
-            results[i].queryResult.fields[j].formatCode = c.colFmts[j]
         if results[i].queryResult.fields.len > 0:
+          # Decode with the formats this op's Bind requested, not the cached
+          # first-Parse formats (see `cacheHitColFmts`) — mirrors the
+          # queryRecvLoop fix so a cache hit that switches result format doesn't
+          # reinterpret the row bytes.
+          let colFmts = cacheHitColFmts(
+            p.ops[i].resultFormats, c.colFmts, results[i].queryResult.fields.len
+          )
+          for j in 0 ..< results[i].queryResult.fields.len:
+            results[i].queryResult.fields[j].formatCode = colFmts[j]
           results[i].queryResult.data =
-            newRowData(int16(results[i].queryResult.fields.len), c.colFmts, c.colOids)
+            newRowData(int16(results[i].queryResult.fields.len), colFmts, c.colOids)
           results[i].queryResult.data.fields = results[i].queryResult.fields
     else:
       results[i] = PipelineResult(kind: prkExec)
@@ -411,18 +423,11 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
                   cachedFieldsPerOp[activeOpIdx] = msg.fields
                 results[activeOpIdx].queryResult.fields = msg.fields
                 if p.ops[activeOpIdx].resultFormats.len > 0:
-                  cf = newSeq[int16](msg.fields.len)
+                  cf = deriveColFmts(p.ops[activeOpIdx].resultFormats, msg.fields.len)
                   co = newSeq[int32](msg.fields.len)
                   for j in 0 ..< msg.fields.len:
                     co[j] = msg.fields[j].typeOid
-                    if p.ops[activeOpIdx].resultFormats.len == 1:
-                      results[activeOpIdx].queryResult.fields[j].formatCode =
-                        p.ops[activeOpIdx].resultFormats[0]
-                      cf[j] = p.ops[activeOpIdx].resultFormats[0]
-                    elif j < p.ops[activeOpIdx].resultFormats.len:
-                      results[activeOpIdx].queryResult.fields[j].formatCode =
-                        p.ops[activeOpIdx].resultFormats[j]
-                      cf[j] = p.ops[activeOpIdx].resultFormats[j]
+                    results[activeOpIdx].queryResult.fields[j].formatCode = cf[j]
               else:
                 results[activeOpIdx].queryResult.fields = msg.fields
                 # cacheShare: this op skipped Describe(Statement) but still
@@ -586,12 +591,18 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
       if p.ops[i].cacheHit:
         let c = cachedStmts[i]
         results[i].queryResult.fields = c.fields
-        if p.ops[i].resultFormats.len > 0 and c.colFmts.len > 0:
-          for j in 0 ..< results[i].queryResult.fields.len:
-            results[i].queryResult.fields[j].formatCode = c.colFmts[j]
         if results[i].queryResult.fields.len > 0:
+          # Decode with the formats this op's Bind requested, not the cached
+          # first-Parse formats (see `cacheHitColFmts`) — mirrors the
+          # queryRecvLoop fix so a cache hit that switches result format doesn't
+          # reinterpret the row bytes.
+          let colFmts = cacheHitColFmts(
+            p.ops[i].resultFormats, c.colFmts, results[i].queryResult.fields.len
+          )
+          for j in 0 ..< results[i].queryResult.fields.len:
+            results[i].queryResult.fields[j].formatCode = colFmts[j]
           results[i].queryResult.data =
-            newRowData(int16(results[i].queryResult.fields.len), c.colFmts, c.colOids)
+            newRowData(int16(results[i].queryResult.fields.len), colFmts, c.colOids)
           results[i].queryResult.data.fields = results[i].queryResult.fields
     else:
       results[i] = PipelineResult(kind: prkExec)
@@ -628,18 +639,11 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                   var cf: seq[int16]
                   var co: seq[int32]
                   if p.ops[opIdx].resultFormats.len > 0:
-                    cf = newSeq[int16](msg.fields.len)
+                    cf = deriveColFmts(p.ops[opIdx].resultFormats, msg.fields.len)
                     co = newSeq[int32](msg.fields.len)
                     for j in 0 ..< msg.fields.len:
                       co[j] = msg.fields[j].typeOid
-                      if p.ops[opIdx].resultFormats.len == 1:
-                        results[opIdx].queryResult.fields[j].formatCode =
-                          p.ops[opIdx].resultFormats[0]
-                        cf[j] = p.ops[opIdx].resultFormats[0]
-                      elif j < p.ops[opIdx].resultFormats.len:
-                        results[opIdx].queryResult.fields[j].formatCode =
-                          p.ops[opIdx].resultFormats[j]
-                        cf[j] = p.ops[opIdx].resultFormats[j]
+                      results[opIdx].queryResult.fields[j].formatCode = cf[j]
                   results[opIdx].queryResult.data =
                     newRowData(int16(msg.fields.len), cf, co)
                   results[opIdx].queryResult.data.fields =
