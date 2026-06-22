@@ -3385,6 +3385,45 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "binary result format decodes across chunks":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_cursor_bin")
+      discard await conn.exec("CREATE TABLE test_cursor_bin (id int4, big int8)")
+      for i in 1 .. 25:
+        discard await conn.exec(
+          "INSERT INTO test_cursor_bin (id, big) VALUES ($1, $2)",
+          @[toPgParam(i.int32), toPgParam((i * 1000000000'i64))],
+        )
+
+      # chunkSize < row count so both the openCursor-buffered first chunk and
+      # subsequent fetchNext (fetchNextImpl) chunks are exercised under binary.
+      let cursor = await conn.openCursor(
+        "SELECT id, big FROM test_cursor_bin ORDER BY id",
+        resultFormat = rfBinary,
+        chunkSize = 10,
+      )
+      doAssert cursor.fields.len == 2
+
+      var allRows: seq[Row]
+      while true:
+        let chunk = await cursor.fetchNext()
+        if chunk.len == 0:
+          break
+        allRows.add(chunk)
+
+      doAssert allRows.len == 25
+      for i in 0 ..< 25:
+        doAssert allRows[i].getInt(0) == int32(i + 1)
+        doAssert allRows[i].getInt64(1) == (i + 1).int64 * 1000000000'i64
+      doAssert cursor.exhausted
+      doAssert conn.state == csReady
+
+      discard await conn.exec("DROP TABLE test_cursor_bin")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Operation Timeouts":
   test "exec with timeout succeeds when fast enough":
     proc t() {.async.} =

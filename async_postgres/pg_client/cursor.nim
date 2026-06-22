@@ -13,6 +13,8 @@ type Cursor* = ref object
   chunkSize: int32
   timeout: Duration
   fields*: seq[FieldDescription]
+  colFormats: seq[int16]
+  colTypeOids: seq[int32]
   exhausted*: bool
   bufferedData: RowData
   bufferedCount: int32
@@ -67,7 +69,23 @@ proc openCursorImpl(
           discard
         of bmkRowDescription:
           cursor.fields = msg.fields
-          cursor.bufferedData = newRowData(int16(msg.fields.len))
+          # Describe(Portal) runs after Bind, so the server reports the bound
+          # result formats. Mirror the query path: derive per-column format
+          # codes and type OIDs so binary DataRows are decoded as binary
+          # rather than misread as text.
+          if resultFormats.len > 0:
+            cursor.colFormats = newSeq[int16](cursor.fields.len)
+            cursor.colTypeOids = newSeq[int32](cursor.fields.len)
+            for i in 0 ..< cursor.fields.len:
+              cursor.colTypeOids[i] = cursor.fields[i].typeOid
+              if resultFormats.len == 1:
+                cursor.fields[i].formatCode = resultFormats[0]
+                cursor.colFormats[i] = resultFormats[0]
+              elif i < resultFormats.len:
+                cursor.fields[i].formatCode = resultFormats[i]
+                cursor.colFormats[i] = resultFormats[i]
+          cursor.bufferedData =
+            newRowData(int16(msg.fields.len), cursor.colFormats, cursor.colTypeOids)
           cursor.bufferedData.fields = cursor.fields
         of bmkNoData:
           discard
@@ -111,7 +129,7 @@ proc openCursorImpl(
 
 proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
-  let rd = newRowData(int16(cursor.fields.len))
+  let rd = newRowData(int16(cursor.fields.len), cursor.colFormats, cursor.colTypeOids)
   rd.fields = cursor.fields
   var rowCount: int32 = 0
 
