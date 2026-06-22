@@ -555,3 +555,87 @@ suite "SCRAM mutual-auth enforcement":
 
     waitFor testBody()
     check connected
+
+  test "rejects SASLContinue without a preceding AuthenticationSASL":
+    # A malicious server / MITM that skips AuthenticationSASL leaves scramState
+    # default-initialized (clientNonce == ""), which would otherwise make the
+    # nonce-binding check pass vacuously. The client must reject the message.
+    var raised = false
+    var sawScramMsg = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          # Forge a server-first message without ever sending AuthenticationSASL.
+          let serverFirst =
+            "r=forgedNonce,s=" & base64.encode(scramSalt) & ",i=" & $scramIterations
+          await sendBytes(st, buildAuthSASLContinue(serverFirst))
+          await sendBytes(st, buildAuthOk())
+          await sendBytes(st, buildBackendKeyData(1, 2))
+          await sendBytes(st, buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      try:
+        let conn = await connect(mockConfig(ms.port))
+        await conn.close()
+      except PgConnectionError as e:
+        raised = true
+        sawScramMsg = e.msg.contains("AuthenticationSASL")
+      except CatchableError:
+        discard
+      try:
+        await serverFut
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check sawScramMsg
+
+  test "rejects SASLFinal without a preceding AuthenticationSASL":
+    # A malicious server / MITM that skips AuthenticationSASL leaves scramState
+    # default-initialized (serverSignature zeroed) and would otherwise bypass
+    # the SCRAM server-signature verification path. The client must reject it.
+    var raised = false
+    var sawScramMsg = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          # Forge a server-final message without ever sending AuthenticationSASL.
+          await sendBytes(st, buildAuthSASLFinal("v=forgedSignature"))
+          await sendBytes(st, buildAuthOk())
+          await sendBytes(st, buildBackendKeyData(1, 2))
+          await sendBytes(st, buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      try:
+        let conn = await connect(mockConfig(ms.port))
+        await conn.close()
+      except PgConnectionError as e:
+        raised = true
+        sawScramMsg = e.msg.contains("AuthenticationSASL")
+      except CatchableError:
+        discard
+      try:
+        await serverFut
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check sawScramMsg

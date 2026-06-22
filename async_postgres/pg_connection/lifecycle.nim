@@ -362,6 +362,17 @@ proc connectToHost*(
             )
             await conn.sendMsg(encodeSASLInitialResponse(choice.mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
+            if not scramStarted:
+              # No AuthenticationSASL preceded this. scramState is still
+              # default-initialized (clientNonce == ""), which would make the
+              # nonce-binding check in scramClientFinalMessage pass vacuously
+              # (combinedNonce.startsWith("") is always true). Reject instead so
+              # a malicious server / MITM cannot inject a forged SCRAM exchange.
+              raise newException(
+                PgConnectionError,
+                "server sent AuthenticationSASLContinue without a preceding " &
+                  "AuthenticationSASL (possible protocol violation or MITM)",
+              )
             var clientFinal =
               scramClientFinalMessage(config.password, msg.saslData, scramState)
             var saslMsg = encodeSASLResponse(clientFinal)
@@ -371,6 +382,15 @@ proc connectToHost*(
             finally:
               ncutils.burnMem(saslMsg)
           of bmkAuthenticationSASLFinal:
+            if not scramStarted:
+              # As with SASLContinue: without a preceding AuthenticationSASL the
+              # serverSignature in scramState is zeroed, so reject rather than
+              # let a forged exchange reach scramVerifyServerFinal.
+              raise newException(
+                PgConnectionError,
+                "server sent AuthenticationSASLFinal without a preceding " &
+                  "AuthenticationSASL (possible protocol violation or MITM)",
+              )
             let ok = scramVerifyServerFinal(msg.saslFinalData, scramState)
             ncutils.burnMem(scramState.serverSignature)
             if not ok:
