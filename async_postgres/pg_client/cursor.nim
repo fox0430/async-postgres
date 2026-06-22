@@ -198,6 +198,18 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
     return
 
   let conn = cursor.conn
+  # A connection retired by `invalidateOnTimeout` (e.g. a `fetchNext` timeout that
+  # left the protocol out of sync) is `csClosed`. Sending Close/Sync on it would
+  # write to a corrupted stream, and promoting it back to `csReady` on
+  # ReadyForQuery below would let `releaseCore` hand the broken socket to the next
+  # borrower. Leave the connection retired. (`csClosed` only: a `fetchNext` query
+  # error drains cleanly to `csReady`, where the portal still needs closing.)
+  # Still mark the cursor exhausted so a stray `fetchNext` after `close` short-
+  # circuits to `@[]` instead of writing to the corrupted socket.
+  if conn.state == csClosed:
+    cursor.exhausted = true
+    return
+
   var batch = newSeqOfCap[byte](cursor.portalName.len + 16)
   conn.flushPendingStmtCloses(batch)
   batch.addClose(dkPortal, cursor.portalName)
