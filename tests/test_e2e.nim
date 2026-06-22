@@ -3256,6 +3256,43 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "close after fetchNext timeout keeps connection retired":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Same setup as "fetchNext times out": v=1 returns instantly, v>=2 sleeps
+      # 2s — the second fetch overruns the 500ms timeout.
+      let cursor = await conn.openCursor(
+        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
+          "FROM generate_series(1, 5) AS v",
+        chunkSize = 1,
+        timeout = milliseconds(500),
+      )
+      let chunk1 = await cursor.fetchNext() # buffered v=1, no I/O
+      doAssert chunk1.len == 1
+
+      var raised = false
+      try:
+        discard await cursor.fetchNext() # v=2 sleeps 2s → timeout
+      except PgTimeoutError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csClosed
+
+      # The timeout left the protocol out of sync and retired the connection.
+      # close() (as withCursor's finally calls it) must NOT revive it to csReady
+      # on ReadyForQuery — a pool would otherwise hand the corrupted socket to
+      # the next borrower.
+      await cursor.close()
+      doAssert conn.state == csClosed
+      # close() must still mark the cursor exhausted so a stray fetchNext
+      # short-circuits instead of writing to the corrupted socket.
+      doAssert cursor.exhausted
+
+      await conn.close()
+
+    waitFor t()
+
   test "cursor with chunkSize 1 fetches one row at a time":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
