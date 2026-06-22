@@ -71,6 +71,41 @@ func toFormatCodes*(rf: ResultFormat): seq[int16] =
   of rfBinary:
     @[1'i16]
 
+func deriveColFmts*(resultFormats: openArray[int16], numCols: int): seq[int16] =
+  ## Expand wire-level Bind result-format codes to one code per column.
+  ## A single code broadcasts to every column (Bind's "apply to all" form);
+  ## a per-column array is applied positionally; any column past the end of a
+  ## multi-element array defaults to text (0). Shared by every Extended Query
+  ## path that has to decode rows under the formats this Bind actually
+  ## requested (cache hit and cache miss alike).
+  result = newSeq[int16](numCols)
+  for i in 0 ..< numCols:
+    result[i] =
+      if resultFormats.len == 1:
+        resultFormats[0]
+      elif i < resultFormats.len:
+        resultFormats[i]
+      else:
+        0'i16
+
+func cacheHitColFmts*(
+    resultFormats: openArray[int16], cachedColFmts: seq[int16], numCols: int
+): seq[int16] =
+  ## Per-column decode formats for a statement-cache HIT. Use the formats this
+  ## Bind actually requested (`deriveColFmts` of `resultFormats`, which on a
+  ## cache hit is `effectiveResultFormats`), not the formats negotiated when the
+  ## statement was first cached: the same SQL can be re-issued with a different
+  ## `resultFormat` (e.g. cached as rfAuto/rfBinary, now rfText) and the server
+  ## returns rows in the format this Bind asked for; reusing the stale cached
+  ## format would reinterpret the bytes and silently corrupt values (text "42"
+  ## decoded as a big-endian int, etc.). The `cachedColFmts` fallback covers the
+  ## caller-didn't-override / zero-column cases, where `resultFormats` is empty.
+  ## Shared by all four cache-hit Extended Query paths so they cannot drift.
+  if resultFormats.len > 0 and numCols > 0:
+    deriveColFmts(resultFormats, numCols)
+  else:
+    cachedColFmts
+
 proc buildBeginSql*(opts: TransactionOptions): string =
   ## Build a BEGIN SQL statement with the specified transaction options
   ## (isolation level, access mode, deferrable mode).
@@ -411,12 +446,18 @@ template queryRecvLoop*(
   var cachedParamOids: seq[int32]
 
   if cacheHit:
-    swap(qr.fields, cachedFields)
-    if resultFormats.len > 0 and cachedColFmts.len > 0:
-      for i in 0 ..< qr.fields.len:
-        qr.fields[i].formatCode = cachedColFmts[i]
+    # Take the cached field descriptions (already a private copy of the cache
+    # entry) so we can update formatCode without mutating the statement cache.
+    qr.fields = cachedFields
     if qr.fields.len > 0:
-      qr.data = newRowData(int16(qr.fields.len), cachedColFmts, cachedColOids)
+      # Decode with the column formats this Bind actually requested, not the
+      # stale cached formats (see `cacheHitColFmts`), then reflect them back
+      # into the returned metadata so QueryResult.fields.formatCode stays
+      # consistent with the formats used for decoding.
+      let colFmts = cacheHitColFmts(resultFormats, cachedColFmts, qr.fields.len)
+      for i in 0 ..< qr.fields.len:
+        qr.fields[i].formatCode = colFmts[i]
+      qr.data = newRowData(int16(qr.fields.len), colFmts, cachedColOids)
       qr.data.fields = qr.fields
 
   block recvLoop:
@@ -430,24 +471,18 @@ template queryRecvLoop*(
           if cacheMiss:
             cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
+          var fields = msg.fields
           var cf: seq[int16]
           var co: seq[int32]
           if cacheMiss:
             cachedFields = msg.fields
-            qr.fields = cachedFields
             if resultFormats.len > 0:
-              cf = newSeq[int16](qr.fields.len)
-              co = newSeq[int32](qr.fields.len)
-              for i in 0 ..< qr.fields.len:
-                co[i] = qr.fields[i].typeOid
-                if resultFormats.len == 1:
-                  qr.fields[i].formatCode = resultFormats[0]
-                  cf[i] = resultFormats[0]
-                elif i < resultFormats.len:
-                  qr.fields[i].formatCode = resultFormats[i]
-                  cf[i] = resultFormats[i]
-          else:
-            qr.fields = msg.fields
+              cf = deriveColFmts(resultFormats, fields.len)
+              co = newSeq[int32](fields.len)
+              for i in 0 ..< fields.len:
+                co[i] = fields[i].typeOid
+                fields[i].formatCode = cf[i]
+          qr.fields = fields
           qr.data = newRowData(int16(qr.fields.len), cf, co)
           qr.data.fields = qr.fields
         of bmkNoData:
@@ -495,14 +530,19 @@ template queryEachRecvLoop*(
   var cachedParamOids: seq[int32]
 
   if cacheHit:
-    if cachedColFmts.len > 0 or cachedColOids.len > 0:
-      rd = newRowData(int16(cachedFields.len), cachedColFmts, cachedColOids)
+    # Decode with the formats this Bind requested (`resultFormats`), not the
+    # cached first-Parse formats — see `queryRecvLoop` for the silent corruption
+    # this avoids when the same SQL is re-issued with a different `resultFormat`.
+    # Take the cached fields (a private copy) so the statement cache is not mutated.
+    var fields = cachedFields
+    let colFmts = cacheHitColFmts(resultFormats, cachedColFmts, fields.len)
+    for i in 0 ..< fields.len:
+      fields[i].formatCode = colFmts[i]
+    if colFmts.len > 0 or cachedColOids.len > 0:
+      rd = newRowData(int16(fields.len), colFmts, cachedColOids)
     else:
-      rd = newRowData(int16(cachedFields.len))
-    rd.fields = cachedFields
-    if resultFormats.len > 0 and cachedColFmts.len > 0:
-      for i in 0 ..< cachedFields.len:
-        rd.colFormats[i] = cachedColFmts[i]
+      rd = newRowData(int16(fields.len))
+    rd.fields = fields
 
   let maxLen = conn.effectiveMaxMessageSize()
   block recvLoop:
@@ -549,25 +589,19 @@ template queryEachRecvLoop*(
           if cacheMiss:
             cachedParamOids = msg.paramTypeOids
         of bmkRowDescription:
+          var fields = msg.fields
           var cf: seq[int16]
           var co: seq[int32]
           if cacheMiss:
             cachedFields = msg.fields
             if resultFormats.len > 0:
-              cf = newSeq[int16](cachedFields.len)
-              co = newSeq[int32](cachedFields.len)
-              for i in 0 ..< cachedFields.len:
-                co[i] = cachedFields[i].typeOid
-                if resultFormats.len == 1:
-                  cachedFields[i].formatCode = resultFormats[0]
-                  cf[i] = resultFormats[0]
-                elif i < resultFormats.len:
-                  cachedFields[i].formatCode = resultFormats[i]
-                  cf[i] = resultFormats[i]
-          else:
-            cachedFields = msg.fields
-          rd = newRowData(int16(cachedFields.len), cf, co)
-          rd.fields = cachedFields
+              cf = deriveColFmts(resultFormats, fields.len)
+              co = newSeq[int32](fields.len)
+              for i in 0 ..< fields.len:
+                co[i] = fields[i].typeOid
+                fields[i].formatCode = cf[i]
+          rd = newRowData(int16(fields.len), cf, co)
+          rd.fields = fields
         of bmkNoData:
           discard
         of bmkCommandComplete:

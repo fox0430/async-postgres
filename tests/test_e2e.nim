@@ -6629,6 +6629,162 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: switching result format on cache hit decodes correctly":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Cache the statement in binary format first.
+      let rBin = await conn.query("SELECT 42::int4 AS v", resultFormat = rfBinary)
+      doAssert rBin.rows[0].getInt(0) == 42
+      doAssert conn.stmtCache.len == 1
+
+      # Cache hit, but now request text. The decoder must follow the text wire
+      # format this Bind requested, not the binary format cached at first Parse;
+      # otherwise the ASCII bytes are reinterpreted as a big-endian int.
+      let rText = await conn.query("SELECT 42::int4 AS v", resultFormat = rfText)
+      doAssert conn.stmtCache.len == 1 # still a hit, no re-parse
+      doAssert rText.rows[0].getStr(0) == "42"
+      doAssert rText.rows[0].getInt(0) == 42
+
+      # Switch back to binary on the same cached statement.
+      let rBin2 = await conn.query("SELECT 42::int4 AS v", resultFormat = rfBinary)
+      doAssert conn.stmtCache.len == 1
+      doAssert rBin2.rows[0].getInt(0) == 42
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: queryEach follows requested format on cache hit":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Cache the statement in binary format via query.
+      let rBin = await conn.query("SELECT 7::int4 AS v", resultFormat = rfBinary)
+      doAssert rBin.rows[0].getInt(0) == 7
+      doAssert conn.stmtCache.len == 1
+
+      # Cache hit through queryEach with text: rows must decode as text.
+      var values: seq[string]
+      let rowCount = await conn.queryEach(
+        "SELECT 7::int4 AS v",
+        resultFormat = rfText,
+        callback = proc(row: Row) =
+          values.add(row.getStr(0)),
+      )
+      doAssert conn.stmtCache.len == 1
+      doAssert rowCount == 1
+      doAssert values == @["7"]
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: format switches do not mutate cached field metadata":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 42::int4 AS v"
+
+      # First call populates the cache.
+      let rBin = await conn.query(sql, resultFormat = rfBinary)
+      doAssert rBin.rows[0].getInt(0) == 42
+      doAssert conn.stmtCache.len == 1
+      let cached = conn.stmtCache[sql]
+      # Cached metadata must stay in the Describe(Statement) canonical form
+      # (formatCode = text/0); the per-call format belongs in resultFormats/colFmts.
+      doAssert cached.fields.len == 1
+      doAssert cached.fields[0].formatCode == 0
+
+      # QueryResult reflects the actual binary decode format.
+      doAssert rBin.fields[0].formatCode == 1
+
+      # Cache hit with a different format must not rewrite cached.fields.
+      let rText = await conn.query(sql, resultFormat = rfText)
+      doAssert conn.stmtCache.len == 1
+      doAssert cached.fields[0].formatCode == 0
+      doAssert rText.fields[0].formatCode == 0
+      doAssert rText.rows[0].getStr(0) == "42"
+
+      # Switch back to binary; cache metadata is still untouched.
+      let rBin2 = await conn.query(sql, resultFormat = rfBinary)
+      doAssert conn.stmtCache.len == 1
+      doAssert cached.fields[0].formatCode == 0
+      doAssert rBin2.fields[0].formatCode == 1
+      doAssert rBin2.rows[0].getInt(0) == 42
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: pipeline follows requested format on cache hit":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 42::int4 AS v"
+
+      # Populate the cache via query. The cached column formats are binary for
+      # int4 (a binary-safe type), independent of the format this call asked for.
+      let rBin = await conn.query(sql, resultFormat = rfBinary)
+      doAssert rBin.rows[0].getInt(0) == 42
+      doAssert conn.stmtCache.len == 1
+
+      # Cache hit through a pipeline requesting text: rows must decode as text,
+      # following this op's Bind rather than the cached binary format.
+      let p = newPipeline(conn)
+      p.addQuery(sql, resultFormat = rfText)
+      let rText = await p.execute()
+      doAssert conn.stmtCache.len == 1 # still a hit, no re-parse
+      doAssert rText[0].queryResult.rows[0].getStr(0) == "42"
+      doAssert rText[0].queryResult.rows[0].getInt(0) == 42
+
+      # Cache hit through a pipeline requesting binary still decodes correctly.
+      let p2 = newPipeline(conn)
+      p2.addQuery(sql, resultFormat = rfBinary)
+      let rBin2 = await p2.execute()
+      doAssert conn.stmtCache.len == 1
+      doAssert rBin2[0].queryResult.rows[0].getInt(0) == 42
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: pipeline format switch keeps cached metadata and honors no-override":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 42::int4 AS v"
+
+      # Cache the statement (binary-preferred formats for int4).
+      let rBin = await conn.query(sql, resultFormat = rfBinary)
+      doAssert rBin.rows[0].getInt(0) == 42
+      doAssert conn.stmtCache.len == 1
+      let cached = conn.stmtCache[sql]
+      # Cached metadata stays in the Describe(Statement) canonical form (text/0).
+      doAssert cached.fields[0].formatCode == 0
+
+      # Pipeline cache hit switching to text must not rewrite cached.fields, and
+      # the returned QueryResult must reflect the actual text decode format.
+      let p = newPipeline(conn)
+      p.addQuery(sql, resultFormat = rfText)
+      let rText = await p.execute()
+      doAssert conn.stmtCache.len == 1
+      doAssert cached.fields[0].formatCode == 0
+      doAssert rText[0].queryResult.fields[0].formatCode == 0
+      doAssert rText[0].queryResult.rows[0].getStr(0) == "42"
+
+      # Pipeline cache hit with NO override (rfAuto) replays the cached
+      # binary-preferred format: rows decode as binary and the returned metadata
+      # reflects it, without the op freezing into a resolved format.
+      let p2 = newPipeline(conn)
+      p2.addQuery(sql)
+      let rAuto = await p2.execute()
+      doAssert conn.stmtCache.len == 1
+      doAssert cached.fields[0].formatCode == 0
+      doAssert rAuto[0].queryResult.fields[0].formatCode == 1
+      doAssert rAuto[0].queryResult.rows[0].getInt(0) == 42
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: clearStmtCache works":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

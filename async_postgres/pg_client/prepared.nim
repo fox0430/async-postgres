@@ -121,11 +121,9 @@ proc executeImpl*(
 
   var qr = QueryResult(fields: stmt.fields)
   if resultFormats.len > 0:
+    let colFmts = deriveColFmts(resultFormats, qr.fields.len)
     for i in 0 ..< qr.fields.len:
-      if resultFormats.len == 1:
-        qr.fields[i].formatCode = resultFormats[0]
-      elif i < resultFormats.len:
-        qr.fields[i].formatCode = resultFormats[i]
+      qr.fields[i].formatCode = colFmts[i]
   if qr.fields.len > 0:
     var colFmts = newSeq[int16](qr.fields.len)
     var colOids = newSeq[int32](qr.fields.len)
