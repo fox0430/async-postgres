@@ -721,6 +721,55 @@ suite "Pool close":
     check pool.closed
     check pool.pendingBackgroundTasks.len == 0
 
+  test "close awaits a conn abandoned by a handed-off waiter":
+    # Regression: a handed-off waiter's acquire continuation is scheduled but
+    # not yet resumed, so close()'s waiter loop can't see it. Abandoning it on a
+    # closed pool runs settleAbandonedWaiter -> release() -> closeNoWait, which
+    # used to push a Terminate task after close() had already drained. close()
+    # now yields once before draining so that task is enqueued in time to await.
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.active = 1
+
+      # Hand a conn off to a queued waiter: pops it, completes its future, marks
+      # it borrowed. csClosed so the eventual release discards via closeNoWait
+      # (and conn.close() short-circuits without touching a real socket).
+      let waiter = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+      pool.waiters.addLast(waiter)
+      pool.waiterCount.inc
+      let conn = mockConn(csClosed, pool = pool)
+      doAssert pool.tryHandoffToWaiter(conn)
+
+      # Model the waiter's not-yet-resumed continuation: scheduled on the loop,
+      # it abandons the acquire on the next tick — after close() has started.
+      # Record whether it ran and any exception it raised, rather than swallowing
+      # them: a silent `except: discard` would let a broken abandon path pass.
+      var continuationRan = false
+      var settleErr: ref Exception = nil
+      scheduleSoon(
+        proc() {.gcsafe, raises: [].} =
+          {.cast(gcsafe).}:
+            try:
+              pool.settleAbandonedWaiter(waiter)
+              continuationRan = true
+            except Exception as e:
+              settleErr = e
+      )
+
+      # close() must yield so that continuation runs and its closeNoWait task is
+      # enqueued before the drain, not after close() returns.
+      await pool.close()
+      doAssert pool.closed
+      doAssert settleErr == nil # the abandon path did not raise
+      # The discriminating check: without the pre-drain yield, close() never
+      # suspends here, so the scheduled continuation has not run yet when close()
+      # returns. (settleAbandonedWaiter takes the completed() branch, which no
+      # longer sets `cancelled`, so observe that the continuation ran directly.)
+      doAssert continuationRan
+      doAssert pool.pendingBackgroundTasks.len == 0 # its late closeNoWait was awaited
+
+    waitFor t()
+
   test "closeNoWait prunes finished futures once threshold is reached":
     let pool = makePool()
     # Inject pre-finished dummies up to the prune threshold so the next
@@ -1631,6 +1680,41 @@ when hasChronos:
 
       waitFor t()
 
+    test "handoff skips a waiter cancelled before settle (no double-decrement, no leak)":
+      # Regression: chronos `wait()` cancels the inner future *synchronously* on
+      # timeout/cancel, so the waiter stays in `pool.waiters` with
+      # `cancelled == false` but an already-cancelled future until
+      # `settleAbandonedWaiter` runs. A handoff landing in that window must skip
+      # it — `complete()` on a cancelled future is a silent no-op, so delivering
+      # would leak the conn (marked borrowed, owned by nobody, `active` never
+      # returned) and let settle fall through to a *second* `waiterCount.dec`,
+      # driving it negative and disabling the FIFO fast-path guard / `maxWaiters`.
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.active = 1
+        let waiter = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+        pool.waiters.addLast(waiter)
+        pool.waiterCount.inc
+
+        # Model the cancel window: inner future cancelled, settle not yet run.
+        await cancelAndWait(waiter.fut)
+        doAssert waiter.fut.cancelled()
+        doAssert not waiter.cancelled
+
+        # A conn arrives in the window: the handoff must not deliver to the
+        # cancelled waiter and must not decrement `waiterCount` for it.
+        let conn = mockConn(pool = pool)
+        doAssert not pool.tryHandoffToWaiter(conn)
+        doAssert not conn.borrowed # conn not handed to the dead waiter (no leak)
+        doAssert pool.waiterCount == 1 # not decremented for the cancelled waiter
+
+        # settle then performs the single decrement for this still-queued waiter.
+        pool.settleAbandonedWaiter(waiter)
+        doAssert pool.waiterCount == 0 # exactly one decrement, not -1
+        doAssert waiter.cancelled
+
+      waitFor t()
+
     test "cancelling maintenance task does not disturb pending waiters":
       proc t() {.async.} =
         let pool = makePool(maxSize = 1, minSize = 0)
@@ -1897,6 +1981,83 @@ suite "FIFO fairness":
     pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("c"), cancelled: true))
     check not pool.tryHandoffToWaiter(mockConn())
     check pool.waiters.len == 0
+
+  test "abandoned waiter handed off on same tick does not double-decrement":
+    # Regression: the timeout/cancel cleanup decremented `waiterCount`
+    # unconditionally. A handoff (tryHandoffToWaiter/releaseCore) decrements and
+    # completes the future in one step, but asyncdispatch `wait()` can still
+    # surface a timeout on the same event-loop tick the handoff landed. The
+    # second decrement drove `waiterCount` negative, permanently disabling the
+    # FIFO fast-path guard and the `maxWaiters` bound.
+    let pool = makePool(maxSize = 1)
+    let waiter = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(waiter)
+    pool.waiterCount.inc
+    check pool.waiterCount == 1
+
+    # A handed-off conn is a live borrow occupying an `active` slot (the handoff
+    # leaves `active` untouched); model that to exercise the return-to-pool path.
+    pool.active = 1
+
+    # Handoff delivers a conn: pops the waiter, decrements, completes the future.
+    let conn = mockConn(pool = pool)
+    check pool.tryHandoffToWaiter(conn)
+    check pool.waiterCount == 0
+    check waiter.fut.completed()
+
+    # The acquire then observes a timeout/cancel on the same tick. Cleanup must
+    # not decrement again and must return the delivered conn instead of leaking.
+    # No `cancelled` flag is set here: the handoff already popped the waiter from
+    # `pool.waiters`, so nothing can re-handoff to it and the flag is moot.
+    pool.settleAbandonedWaiter(waiter)
+    check pool.waiterCount == 0 # not -1
+    check pool.idle.len == 1 # delivered conn returned to the pool
+    check pool.active == 0 # the freed slot is given back
+
+  test "genuinely abandoned waiter decrements waiterCount exactly once":
+    # The other side of the guard: a waiter that was never handed off (its
+    # future is still pending) must drop its live slot on abandonment.
+    let pool = makePool(maxSize = 1)
+    let waiter = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(waiter)
+    pool.waiterCount.inc
+
+    pool.settleAbandonedWaiter(waiter)
+    check pool.waiterCount == 0
+    check waiter.cancelled
+    check pool.idle.len == 0 # nothing was delivered, nothing to return
+
+  test "waiter failed on same tick does not double-decrement waiterCount":
+    # The fail-path sibling of the handoff race: `failNextWaiter` (spawn connect
+    # failure or `close`) pops the waiter, decrements `waiterCount`, and *fails*
+    # the future. asyncdispatch `wait()` can still surface AsyncTimeoutError on
+    # the same tick when its timeout side wins the `withTimeout` race. Cleanup
+    # must skip the decrement for a failed future too (not just a completed one),
+    # or `waiterCount` drifts negative like the handoff case.
+    let pool = makePool(maxSize = 1)
+    let waiter = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(waiter)
+    pool.waiterCount.inc
+
+    # failNextWaiter pops the waiter, decrements, and fails the future.
+    check pool.failNextWaiter(newException(PgPoolError, "connect failed"))
+    check pool.waiterCount == 0
+    check waiter.fut.failed()
+
+    # The acquire then observes a timeout/cancel on the same tick. Cleanup must
+    # not decrement again; a failed future carries no conn to return. As with the
+    # handoff case, `failNextWaiter` already popped the waiter, so no `cancelled`
+    # flag is set.
+    pool.settleAbandonedWaiter(waiter)
+    check pool.waiterCount == 0 # not -1
+    check pool.idle.len == 0 # nothing delivered, nothing to return
+
+    # Drain the stored failure so it isn't flagged as unhandled at teardown
+    # (production suppresses this via the no-op callback `wait()` attaches).
+    try:
+      discard waiter.fut.read()
+    except PgPoolError:
+      discard
 
   test "acquire does not jump idle when waiters are already queued":
     # Pre-fix bug: a fresh acquire would pop the idle conn and bypass any
