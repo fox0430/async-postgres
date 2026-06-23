@@ -10803,6 +10803,28 @@ suite "E2E: User-Defined Types":
 
     waitFor t()
 
+  test "composite literal NULL string param preserved":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_nullable2 CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TYPE test_e2e_nullable2 AS (name text, age int4, note text)"
+      )
+
+      # The literal string "NULL" must round-trip as a string, not become SQL NULL.
+      let v = TestNullable(name: "NULL", age: some(7'i32), note: some("null"))
+      let res = await conn.query("SELECT $1::test_e2e_nullable2", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = getComposite[TestNullable](res.rows[0], 0)
+      doAssert got.name == "NULL"
+      doAssert got.age == some(7'i32)
+      doAssert got.note == some("null")
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_nullable2")
+      await conn.close()
+
+    waitFor t()
+
   test "enum roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

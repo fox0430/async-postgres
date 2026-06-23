@@ -3700,6 +3700,13 @@ suite "Composite text parser":
     let s = encodeCompositeText(@[some(""), some("42")])
     check s == "(\"\",42)"
 
+  test "encodeCompositeText literal NULL string quoted":
+    # An unquoted NULL token (any case) would be read back as a SQL NULL by
+    # PostgreSQL's record input, so the literal string must be quoted.
+    check encodeCompositeText(@[some("NULL"), some("42")]) == "(\"NULL\",42)"
+    check encodeCompositeText(@[some("null")]) == "(\"null\")"
+    check encodeCompositeText(@[some("Null")]) == "(\"Null\")"
+
   test "roundtrip text encode/parse":
     let fields = @[some("hello world"), some("42"), none(string), some("with,comma")]
     let encoded = encodeCompositeText(fields)
