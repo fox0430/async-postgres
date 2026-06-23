@@ -21,6 +21,70 @@ proc hasReturnStmt*(n: NimNode): bool =
       return true
   return false
 
+proc hasLoopEscapeStmt*(n: NimNode): bool =
+  ## Check whether an AST contains a `break`/`continue` that would escape the
+  ## body: one not captured by a loop (for `continue`) or by a loop / `block`
+  ## (for `break`) declared *within* the body. Such a statement binds to an
+  ## enclosing loop outside the macro expansion — a caller's `for`/`while`, or
+  ## the macro's own retry `while` — and would silently skip the COMMIT / RELEASE
+  ## that the macro appends after the body. Nested loops, `block`s and proc-like
+  ## definitions capture their own `break`/`continue` and are not flagged.
+  ##
+  ## Note: any `break`/`continue` sitting inside a local `block:` is
+  ## conservatively treated as captured by that block, regardless of whether
+  ## it carries a label. This means an *unlabeled* `break` inside a local
+  ## `block:` will be silently accepted even though it would in fact escape
+  ## to an enclosing loop (Nim binds it to the innermost enclosing loop, not
+  ## to a `block:`). In practice this is rare and the miss goes in the safe
+  ## direction (no spurious compile error), and the `UnnamedBreak` deprecation
+  ## warning from the compiler already flags the construct.
+  proc walk(n: NimNode, inLoop, inBlock: bool): bool =
+    case n.kind
+    of nnkContinueStmt:
+      return not inLoop
+    of nnkBreakStmt:
+      return not (inLoop or inBlock)
+    of nnkProcDef, nnkFuncDef, nnkMethodDef, nnkIteratorDef, nnkLambda, nnkDo,
+        nnkConverterDef, nnkTemplateDef, nnkMacroDef:
+      return false
+    of nnkForStmt, nnkWhileStmt:
+      for child in n:
+        if walk(child, inLoop = true, inBlock = inBlock):
+          return true
+      return false
+    of nnkBlockStmt, nnkBlockExpr:
+      for child in n:
+        if walk(child, inLoop = inLoop, inBlock = true):
+          return true
+      return false
+    else:
+      for child in n:
+        if walk(child, inLoop, inBlock):
+          return true
+      return false
+
+  return walk(n, inLoop = false, inBlock = false)
+
+proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string) =
+  ## Reject control flow inside a transaction/savepoint macro `body` that would
+  ## bypass the trailing `cleanup` (`"COMMIT/ROLLBACK"` or `"RELEASE/ROLLBACK"`):
+  ## a `return`, or a `break`/`continue` that escapes the body to an enclosing
+  ## loop. Either would skip the COMMIT/RELEASE the macro appends after `body`,
+  ## silently discarding the transaction's work. Shared by every `withTransaction`
+  ## / `withSavepoint` variant (conn / pool / cluster).
+  if hasReturnStmt(body):
+    error(
+      "'return' inside " & macroName & " is not allowed: " & cleanup &
+        " would be skipped",
+      body,
+    )
+  if hasLoopEscapeStmt(body):
+    error(
+      "'break'/'continue' escaping " & macroName & " is not allowed: " & cleanup &
+        " would be skipped",
+      body,
+    )
+
 proc bindCleanupSkippedSyms(): tuple[fire, invalidated, failed: NimNode] {.compileTime.} =
   ## Common `bindSym` set for the `onCleanupSkipped` wiring shared by
   ## `withTransaction*` / `withSavepoint*`. Returned as a tuple so each
@@ -252,11 +316,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransaction is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -353,11 +413,7 @@ macro withTransactionRetry*(
       retryOpts,
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransactionRetry is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -434,11 +490,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withSavepoint is not allowed: RELEASE/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withSavepoint", "RELEASE/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -549,11 +601,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransactionDeadline is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -667,11 +715,7 @@ macro withTransactionRetryDeadline*(
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransactionRetryDeadline is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -752,11 +796,7 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withSavepointDeadline is not allowed: RELEASE/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withSavepointDeadline", "RELEASE/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")

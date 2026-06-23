@@ -1635,11 +1635,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransaction is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
@@ -1734,11 +1730,7 @@ macro withTransactionRetry*(
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransactionRetry is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
@@ -1813,11 +1805,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransactionDeadline is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
@@ -1953,11 +1941,7 @@ macro withTransactionRetryDeadline*(
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransactionRetryDeadline is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
