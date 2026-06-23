@@ -34,13 +34,6 @@ when hasChronos:
   # X509 certificate capture callbacks
   # Intercepts BearSSL X509 callbacks to capture the leaf certificate DER bytes,
   # then delegates to the original X509 engine for actual validation.
-  #
-  # BearSSL X509 callbacks take `const br_x509_class**` (get_pkey takes
-  # `const br_x509_class *const *`), mapped by the binding to X509ClassPointerConst
-  # / X509ClassPointerConstConst. We delegate to the inner engine by passing our
-  # non-const `ptr ptr X509Class`, so suppress the incompatible-pointer-types
-  # warning from GCC for this module.
-  {.localPassC: "-Wno-incompatible-pointer-types".}
 
   proc x509CaptureStartChain(
       ctx: X509ClassPointerConst, serverName: ConstCstring
