@@ -1577,6 +1577,101 @@ suite "E2E: Transaction":
 
     )
 
+  test "withTransaction rejects break escaping to an enclosing loop":
+    # Without the guard the `break` binds to the caller's `for` and skips COMMIT.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withTransaction:
+              break
+
+    )
+
+  test "withTransaction rejects continue escaping to an enclosing loop":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withTransaction:
+              continue
+
+    )
+
+  test "pool.withTransaction rejects break escaping to an enclosing loop":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withTransaction(conn):
+              break
+
+    )
+
+  test "withTransactionRetry rejects break at compile time":
+    # The retry loop is a `while true` the macro owns; a body `break` would bind
+    # to it and skip COMMIT even without a caller loop.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            break
+
+    )
+
+  test "withTransactionRetry rejects continue at compile time":
+    # A body `continue` would re-run BEGIN on the existing transaction.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            continue
+
+    )
+
+  test "withSavepoint rejects break escaping to an enclosing loop":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withSavepoint:
+              break
+
+    )
+
+  test "break/continue inside a nested loop is allowed in withTransaction":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            for i in 0 ..< 3:
+              if i == 1:
+                continue
+              if i == 2:
+                break
+              discard i
+
+    )
+
+  test "break inside a nested block is allowed in withTransaction":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            block inner:
+              break inner
+
+    )
+
   test "withTransaction skips ROLLBACK when COMMIT fails":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

@@ -312,11 +312,7 @@ macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped 
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransaction is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
 
   let clusterExpr = cluster
   let clusterSym = genSym(nskLet, "cluster")
@@ -389,11 +385,7 @@ macro withTransactionRetry*(
       args[0],
     )
 
-  if hasReturnStmt(body):
-    error(
-      "'return' inside withTransactionRetry is not allowed: COMMIT/ROLLBACK would be skipped",
-      body,
-    )
+  checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
 
   let clusterExpr = cluster
   let clusterSym = genSym(nskLet, "cluster")
