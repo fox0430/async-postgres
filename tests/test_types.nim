@@ -802,6 +802,33 @@ suite "date parameter encoding":
     check result.month == mJan
     check result.monthday == 15
 
+  test "toPgBinaryDateParam roundtrip before 1970":
+    # 1969-12-31 12:00 UTC has a negative Unix time (-43200). Truncating
+    # division rounds toward zero (yielding day 0 = 1970-01-01); floor
+    # division must round down so the date stays on 1969-12-31.
+    let dt = dateTime(1969, mDec, 31, 12, 0, 0, 0, utc())
+    let p = toPgBinaryDateParam(dt)
+    check p.oid == OidDate
+    check p.format == 1
+    let fields = @[mkField(OidDate, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getDate(0)
+    check result.year == 1969
+    check result.month == mDec
+    check result.monthday == 31
+
+  test "toPgBinaryDateParam drops time of day":
+    # Binary date encoding must round down to the day, not round to the
+    # nearest day. 23:59:59 on 2024-01-15 must still decode as 2024-01-15.
+    let dt = dateTime(2024, mJan, 15, 23, 59, 59, 0, utc())
+    let p = toPgBinaryDateParam(dt)
+    let fields = @[mkField(OidDate, 1)]
+    let row = mkRow(@[p.value], fields)
+    let result = row.getDate(0)
+    check result.year == 2024
+    check result.month == mJan
+    check result.monthday == 15
+
 suite "getTimestampTz accessor":
   test "timestamptz with tz":
     let row = @[some(toBytes("2024-01-15 10:30:00.000000+05:00"))]
@@ -4447,6 +4474,22 @@ suite "Range binary decoding (roundtrip)":
     check decoded.lower.value.month == mJan
     check decoded.lower.value.monthday == 1
 
+  test "daterange roundtrip before 1970":
+    # Lower bound 1969-12-31 12:00 UTC has a negative Unix time. Floor
+    # division must keep the encoded day on 1969-12-31 instead of rounding
+    # toward zero into 1970-01-01.
+    let dt1 = dateTime(1969, mDec, 31, 12, zone = utc())
+    let dt2 = dateTime(1970, mJan, 2, zone = utc())
+    let orig = rangeOf(dt1, dt2)
+    let p = toPgBinaryDateRangeParam(orig)
+    let fields = @[mkField(OidDateRange, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getDateRange(0)
+    check decoded.hasLower == true
+    check decoded.lower.value.year == 1969
+    check decoded.lower.value.month == mDec
+    check decoded.lower.value.monthday == 31
+
 suite "Range row getters":
   test "getInt4Range text":
     let row: Row = @[some(toBytes("[1,10)"))]
@@ -4715,6 +4758,25 @@ suite "Multirange binary roundtrip":
     check decoded[0].lower.value.year == 2023
     check decoded[0].lower.value.month == mJan
     check decoded[0].upper.value.month == mDec
+
+  test "datemultirange binary roundtrip before 1970":
+    # Lower bound 1969-12-31 12:00 UTC has a negative Unix time. Floor
+    # division must keep the encoded day on 1969-12-31 instead of rounding
+    # toward zero into 1970-01-01.
+    let dt1 = dateTime(1969, mDec, 31, 12, zone = utc())
+    let dt2 = dateTime(1970, mJan, 2, zone = utc())
+    let orig = toMultirange(rangeOf(dt1, dt2))
+    let p = toPgBinaryDateMultirangeParam(orig)
+    let fields = @[mkField(OidDateMultirange, 1'i16)]
+    let row = mkRow(@[p.value], fields)
+    let decoded = row.getDateMultirange(0)
+    check decoded.len == 1
+    check decoded[0].lower.value.year == 1969
+    check decoded[0].lower.value.month == mDec
+    check decoded[0].lower.value.monthday == 31
+    check decoded[0].upper.value.year == 1970
+    check decoded[0].upper.value.month == mJan
+    check decoded[0].upper.value.monthday == 2
 
 suite "Range array binary roundtrip":
   test "int4range[] roundtrip":

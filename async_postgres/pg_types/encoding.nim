@@ -1,4 +1,4 @@
-import std/[options, json, macros, strutils, tables, times, net]
+import std/[options, json, macros, strutils, tables, times, net, math]
 
 import ../[pg_bytes, pg_protocol]
 import core, array
@@ -569,7 +569,7 @@ proc toPgBinaryParam*(v: DateTime): PgParam =
 proc toPgBinaryDateParam*(v: DateTime): PgParam =
   ## Encode a DateTime as a binary date parameter (OID 1082).
   let t = v.toTime()
-  let pgDays = int32(t.toUnix() div 86400 - int64(pgEpochDaysOffset))
+  let pgDays = int32(floorDiv(t.toUnix(), 86400'i64) - int64(pgEpochDaysOffset))
   PgParam(oid: OidDate, format: 1, value: some(@(toBE32(pgDays))))
 
 proc toPgBinaryTimestampTzParam*(v: DateTime): PgParam =

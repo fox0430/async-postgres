@@ -1,4 +1,4 @@
-import std/[options, strutils, times]
+import std/[options, strutils, times, math]
 
 import ../pg_protocol
 import ./core
@@ -415,7 +415,7 @@ proc encodeBinaryTimestamp(dt: DateTime): seq[byte] =
 
 proc encodeBinaryDate(dt: DateTime): seq[byte] =
   let t = dt.toTime()
-  let pgDays = int32(t.toUnix() div 86400 - int64(pgEpochDaysOffset))
+  let pgDays = int32(floorDiv(t.toUnix(), 86400'i64) - int64(pgEpochDaysOffset))
   @(toBE32(pgDays))
 
 proc encodeRangeBinary[T](
