@@ -35,19 +35,23 @@ when hasChronos:
   # Intercepts BearSSL X509 callbacks to capture the leaf certificate DER bytes,
   # then delegates to the original X509 engine for actual validation.
   #
-  # BearSSL X509 callbacks expect `const br_x509_class**` but the Nim binding
-  # maps them to `ptr ptr X509Class` (non-const). Suppress the resulting
-  # incompatible-pointer-types error from GCC for this module.
+  # BearSSL X509 callbacks take `const br_x509_class**` (get_pkey takes
+  # `const br_x509_class *const *`), mapped by the binding to X509ClassPointerConst
+  # / X509ClassPointerConstConst. We delegate to the inner engine by passing our
+  # non-const `ptr ptr X509Class`, so suppress the incompatible-pointer-types
+  # warning from GCC for this module.
   {.localPassC: "-Wno-incompatible-pointer-types".}
 
-  proc x509CaptureStartChain(ctx: ptr ptr X509Class, serverName: cstring) {.cdecl.} =
+  proc x509CaptureStartChain(
+      ctx: X509ClassPointerConst, serverName: ConstCstring
+  ) {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
     self.depth = 0
     self.capturing = false
     let inner = cast[ptr ptr X509Class](self.inner)
     inner[].startChain(inner, serverName)
 
-  proc x509CaptureStartCert(ctx: ptr ptr X509Class, length: uint32) {.cdecl.} =
+  proc x509CaptureStartCert(ctx: X509ClassPointerConst, length: uint32) {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
     if self.depth == 0:
       self.capturing = true
@@ -56,7 +60,7 @@ when hasChronos:
     inner[].startCert(inner, length)
 
   proc x509CaptureAppend(
-      ctx: ptr ptr X509Class, buf: ConstPtrByte, len: csize_t
+      ctx: X509ClassPointerConst, buf: ConstPtrByte, len: csize_t
   ) {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
     if self.capturing:
@@ -66,7 +70,7 @@ when hasChronos:
     let inner = cast[ptr ptr X509Class](self.inner)
     inner[].append(inner, buf, len)
 
-  proc x509CaptureEndCert(ctx: ptr ptr X509Class) {.cdecl.} =
+  proc x509CaptureEndCert(ctx: X509ClassPointerConst) {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
     if self.capturing:
       self.capturing = false
@@ -74,14 +78,14 @@ when hasChronos:
     let inner = cast[ptr ptr X509Class](self.inner)
     inner[].endCert(inner)
 
-  proc x509CaptureEndChain(ctx: ptr ptr X509Class): cuint {.cdecl.} =
+  proc x509CaptureEndChain(ctx: X509ClassPointerConst): cuint {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
     let inner = cast[ptr ptr X509Class](self.inner)
     result = inner[].endChain(inner)
 
   proc x509CaptureGetPkey(
-      ctx: ptr ptr X509Class, usages: ptr cuint
-  ): ptr X509Pkey {.cdecl.} =
+      ctx: X509ClassPointerConstConst, usages: ptr cuint
+  ): ConstPtrX509Pkey {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
     let inner = cast[ptr ptr X509Class](self.inner)
     result = inner[].getPkey(inner, usages)
