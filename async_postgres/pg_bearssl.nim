@@ -23,7 +23,7 @@ when hasChronos:
       backing*: seq[seq[byte]] ## Owns memory pointed to by trust anchor fields
 
   proc appendDnCallback(
-      ctx: pointer, buf: ConstPointer, len: csize_t
+      ctx: X509ClassPointerConst, buf: ConstPtrByte, len: csize_t
   ) {.cdecl, gcsafe, noSideEffect, raises: [].} =
     ## DN accumulation callback
     let s = cast[ptr seq[byte]](ctx)
