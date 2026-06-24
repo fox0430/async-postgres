@@ -105,6 +105,14 @@ suite "parseDsn":
     let cfg = parseDsn("postgresql://host/db?connect_timeout=30")
     check cfg.connectTimeout == seconds(30)
 
+  test "query param connect_timeout zero means no timeout":
+    let cfg = parseDsn("postgresql://host/db?connect_timeout=0")
+    check cfg.connectTimeout == ZeroDuration
+
+  test "query param connect_timeout negative means no timeout":
+    let cfg = parseDsn("postgresql://host/db?connect_timeout=-1")
+    check cfg.connectTimeout == ZeroDuration
+
   test "unknown query params go to extraParams":
     let cfg = parseDsn(
       "postgresql://host/db?search_path=public&options=-c%20log_statement%3Dall"
@@ -735,6 +743,14 @@ suite "parseDsn keyword=value":
   test "connect_timeout parameter":
     let cfg = parseDsn("host=h connect_timeout=30")
     check cfg.connectTimeout == seconds(30)
+
+  test "connect_timeout zero means no timeout":
+    let cfg = parseDsn("host=h connect_timeout=0")
+    check cfg.connectTimeout == ZeroDuration
+
+  test "connect_timeout negative means no timeout":
+    let cfg = parseDsn("host=h connect_timeout=-5")
+    check cfg.connectTimeout == ZeroDuration
 
   test "keepalive parameters":
     let cfg = parseDsn(
