@@ -179,10 +179,20 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
   of "application_name":
     result.applicationName = val
   of "connect_timeout":
+    var secs: int
     try:
-      result.connectTimeout = seconds(parseInt(val))
+      secs = parseInt(val)
     except ValueError:
       raise newException(PgError, "Invalid connect_timeout: " & val)
+    # libpq treats a zero or negative connect_timeout as "wait indefinitely";
+    # ZeroDuration is this codebase's "no timeout" sentinel. Mapping <= 0 here
+    # avoids building a negative Duration, which would make `wait` time out
+    # every host immediately — the exact opposite of libpq's behavior.
+    result.connectTimeout =
+      if secs <= 0:
+        ZeroDuration
+      else:
+        seconds(secs)
   of "sslrootcert":
     try:
       result.sslRootCert = readFile(val)
