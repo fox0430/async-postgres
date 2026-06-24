@@ -27,6 +27,47 @@ proc pollCopyInError(
   watch.rearm(conn)
   return nil
 
+proc drainToReady(conn: PgConnection) {.async.} =
+  ## Discard buffered/incoming backend messages until ReadyForQuery, commit the
+  ## transaction status it carries, and return the connection to csReady. Used to
+  ## resynchronise once a COPY has otherwise concluded (server abort, callback
+  ## CopyFail response, callback-side COPY OUT error). A transport failure here is
+  ## re-raised after `fillRecvBuf` has already marked the connection csClosed;
+  ## callers that want to surface a previously captured error instead use
+  ## `drainToReadyBestEffort`, which swallows that secondary failure.
+  block drainLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        if msg.kind == bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          break drainLoop
+      await conn.fillRecvBuf()
+
+proc drainToReadyBestEffort(conn: PgConnection) {.async.} =
+  ## `drainToReady`, but swallow a secondary transport failure so a previously
+  ## captured error (a server abort or a callback failure) stays the one that is
+  ## surfaced. A `CancelledError` still propagates — cancellation must never be
+  ## swallowed.
+  try:
+    await conn.drainToReady()
+  except CancelledError as e:
+    raise e
+  except CatchableError:
+    discard
+
+proc abortCopyWatch(conn: PgConnection, watch: RecvWatch) =
+  ## An unrecoverable transport failure (or a teardown) mid-COPY: abandon the
+  ## in-flight watch read and mark the connection csClosed so the now
+  ## protocol-desynced connection is never reused (the next caller must reconnect
+  ## rather than see a misleading busy state). Call immediately before re-raising
+  ## — on chronos `cancel` schedules the read's cancellation, so no further
+  ## await / recvBuf access may run before unwinding. `cancel` is a no-op when the
+  ## watch read has already been consumed.
+  watch.cancel()
+  conn.state = csClosed
+
 proc copyInRawImpl*(
     conn: PgConnection, sql: string, data: seq[byte]
 ): Future[string] {.async.} =
@@ -83,7 +124,9 @@ proc copyInRawImpl*(
       await conn.sendBufMsg()
       conn.sendBuf.setLen(0)
   except CatchableError as e:
-    watch.cancel()
+    # Transport failure mid-stream: the protocol is out of sync, so invalidate
+    # the connection and surface the original error.
+    conn.abortCopyWatch(watch)
     raise e
 
   # Settle the in-flight watch read before parsing: on normal completion it
@@ -224,10 +267,26 @@ proc copyInStreamImpl*(
   let watch = conn.startRecvWatch()
   try:
     while true:
-      let chunk = await callback()
-      if chunk.len == 0:
+      var chunk: seq[byte]
+      try:
+        chunk = await callback()
+        if chunk.len == 0:
+          break
+        encodeCopyData(conn.sendBuf, chunk)
+      except CancelledError as e:
+        # Cancellation (e.g. a `wait()`-driven timeout tearing down the stream)
+        # is not a recoverable callback failure: let it reach the outer handler,
+        # which abandons the watch read and invalidates the connection rather
+        # than attempting CopyFail on a future that is being unwound.
+        raise e
+      except CatchableError as e:
+        # A callback failure — or a local error encoding its chunk (e.g. an
+        # oversized chunk that overflows the CopyData length field) — is
+        # recoverable: the transport is still healthy, so CopyFail can abort the
+        # COPY cleanly (handled below). Only these errors take this path —
+        # transport failures must not be sent CopyFail.
+        callbackError = e
         break
-      encodeCopyData(conn.sendBuf, chunk)
       if conn.sendBuf.len >= batchThreshold:
         await conn.sendBufMsg()
         conn.sendBuf.setLen(0)
@@ -235,55 +294,82 @@ proc copyInStreamImpl*(
         if queryError != nil:
           break
   except CatchableError as e:
-    callbackError = e
+    # Transport failure on the send or on the background watch read
+    # (`pollCopyInError` re-raises those). The recv side is already gone, so
+    # attempting CopyFail would only raise a secondary send error and mask the
+    # real failure — abandon the watch read, invalidate the connection and
+    # surface the original error.
+    conn.abortCopyWatch(watch)
+    raise e
 
   if queryError != nil:
     # Server aborted the COPY mid-stream (already detected; watch consumed). In
     # the simple-query protocol the backend has left copy-in mode and will emit
     # ReadyForQuery, so neither CopyDone nor CopyFail is needed — drain and raise.
+    # If the transport dies before the drain reaches ReadyForQuery the connection
+    # is already csClosed; surface the server's error, not that secondary failure.
     conn.sendBuf.setLen(0)
-    block drainErr:
-      while true:
-        while (let opt = conn.nextMessage(); opt.isSome):
-          let msg = opt.get
-          case msg.kind
-          of bmkReadyForQuery:
-            conn.txStatus = msg.txStatus
-            conn.state = csReady
-            break drainErr
-          else:
-            discard
-        await conn.fillRecvBuf()
+    await conn.drainToReadyBestEffort()
     raise queryError
   elif callbackError != nil:
-    # Callback raised: flush pending data is pointless, send CopyFail
+    # The callback raised. Flushing pending data is pointless, but before
+    # sending CopyFail check whether the server already aborted the COPY in the
+    # window between the last `pollCopyInError` rearm and the raise: if it did,
+    # the backend has left copy-in mode and a CopyFail would be a stray message
+    # that desyncs the stream, so drain the abort and surface the server's error
+    # instead of the callback's.
     conn.sendBuf.setLen(0)
+    try:
+      queryError = await conn.pollCopyInError(watch)
+    except CatchableError as e:
+      # `pollCopyInError` re-raises a transport failure on the watch read. The
+      # recv side is gone, so (like the outer handler and copyInRawImpl) abandon
+      # the watch read, invalidate the connection and surface the transport
+      # failure rather than attempting CopyFail.
+      conn.abortCopyWatch(watch)
+      raise e
+    if queryError != nil:
+      # Backend already left copy-in mode; drain its abort and surface the
+      # server's error, preferring it over a secondary transport failure here.
+      await conn.drainToReadyBestEffort()
+      raise queryError
+    # Transport healthy and the backend still in copy-in mode: abort cleanly.
     try:
       await conn.sendMsg(encodeCopyFail(callbackError.msg))
     except CatchableError as e:
-      # Transport is gone; abandon the watch read and surface the failure.
-      watch.cancel()
+      # Transport is gone before CopyFail was delivered; invalidate the
+      # connection and surface the transport failure.
+      conn.abortCopyWatch(watch)
       raise e
-    # Fold the in-flight watch read to receive the CopyFail response, then drain.
-    if watch.pending:
-      await watch.take()
-    block drainLoop:
-      while true:
-        while (let opt = conn.nextMessage(); opt.isSome):
-          let msg = opt.get
-          case msg.kind
-          of bmkReadyForQuery:
-            conn.txStatus = msg.txStatus
-            conn.state = csReady
-            break drainLoop
-          else:
-            discard
-        await conn.fillRecvBuf()
+    # CopyFail was sent; fold the in-flight watch read to receive its response
+    # and drain. `take` consumes the watch read here, so on failure there is
+    # nothing left to abandon — just invalidate the connection. If the transport
+    # dies the abort was already delivered, so surface the original callback error
+    # rather than the secondary transport failure.
+    try:
+      if watch.pending:
+        await watch.take()
+      await conn.drainToReady()
+    except CancelledError as e:
+      # Cancellation tears the operation down: invalidate and propagate it rather
+      # than masking it with the callback error.
+      conn.state = csClosed
+      raise e
+    except CatchableError:
+      conn.state = csClosed
+      raise callbackError
     raise callbackError
   else:
     # Normal completion: flush remaining data + CopyDone in one send
     conn.sendBuf.addCopyDone()
-    await conn.sendBufMsg()
+    try:
+      await conn.sendBufMsg()
+    except CatchableError as e:
+      # Transport failure on the final CopyDone flush: the protocol is out of
+      # sync, so abandon the watch read, invalidate the connection and surface
+      # the original error. Mirrors copyInRawImpl and the outer handler.
+      conn.abortCopyWatch(watch)
+      raise e
     conn.sendBuf.setLen(0)
 
   # Settle the in-flight watch read (normal completion) before parsing.
@@ -429,20 +515,21 @@ proc copyOutStreamImpl*(
         of bmkCopyData:
           try:
             await callback(msg.copyData)
+          except CancelledError as e:
+            # Cancellation tears the operation down; do not run the recovery
+            # drain (more I/O on a future being unwound). The COPY OUT is left
+            # mid-stream so the protocol is out of sync — invalidate the
+            # connection (the next caller must reconnect rather than see a
+            # misleading busy state) and propagate the cancellation as-is.
+            conn.state = csClosed
+            raise e
           except CatchableError as e:
-            # Drain remaining messages until ReadyForQuery to keep protocol in sync
-            block drainLoop:
-              while true:
-                while (let opt2 = conn.nextMessage(); opt2.isSome):
-                  let msg2 = opt2.get
-                  case msg2.kind
-                  of bmkReadyForQuery:
-                    conn.txStatus = msg2.txStatus
-                    conn.state = csReady
-                    break drainLoop
-                  else:
-                    discard
-                await conn.fillRecvBuf()
+            # The callback raised. Drain remaining messages until ReadyForQuery
+            # to keep the protocol in sync, then re-raise the callback error. If
+            # the transport dies during the drain, `fillRecvBuf` has already
+            # invalidated the connection (csClosed); surface the original
+            # callback error rather than that secondary transport failure.
+            await conn.drainToReadyBestEffort()
             raise e
         of bmkCopyDone:
           discard
