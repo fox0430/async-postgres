@@ -998,7 +998,7 @@ proc toPgParam*(v: seq[PgHstore]): PgParam =
   ## explicit ``::hstore[]`` cast in the SQL statement (e.g.
   ## ``SELECT $1::hstore[]``), since the parameter is typed as ``text[]``. No
   ## connection-specific OID is needed; prefer ``toPgBinaryParam`` when the
-  ## hstore / hstore[] OIDs are available via ``lookupTypeOids`` (faster, no
+  ## hstore / ``hstore[]`` OIDs are available via ``lookupTypeOids`` (faster, no
   ## cast required).
   if v.len == 0:
     return PgParam(oid: OidTextArray, format: 0, value: some(toBytes("{}")))
