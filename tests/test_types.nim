@@ -6291,6 +6291,13 @@ suite "Binary decoder validation":
     expect PgTypeError:
       discard decodeMultirangeBinaryRaw(data)
 
+  test "decodeMultirangeBinaryRaw rejects count exceeding data":
+    var data: seq[byte] = @[
+      0x7F'u8, 0xFF, 0xFF, 0xFF # count = 2147483647 but no range data
+    ]
+    expect PgTypeError:
+      discard decodeMultirangeBinaryRaw(data)
+
   test "decodeBinaryComposite rejects negative field count":
     var data: seq[byte] = @[
       0xFF'u8, 0xFF, 0xFF, 0xFF # numFields = -1
