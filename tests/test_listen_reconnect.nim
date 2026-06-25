@@ -20,7 +20,7 @@
 ## re-LISTEN loop is a no-op, isolating the buffer copy, and assert the pairing
 ## invariant directly — deterministic, no timing dependence on either backend.
 
-import std/[unittest, sets]
+import std/[unittest, sets, strutils]
 
 import ../async_postgres/async_backend
 import ../async_postgres/pg_connection {.all.}
@@ -366,3 +366,110 @@ suite "stopListening during reconnect":
     check finalTaskNil
     check not finalStopRequested
     check not finalReconnecting
+
+suite "listenPump async ErrorResponse":
+  ## Regression: an asynchronous ErrorResponse delivered to the idle listen pump
+  ## must not be silently discarded. PostgreSQL sends a FATAL ErrorResponse (e.g.
+  ## 57P01 "terminating connection due to administrator command" on
+  ## `pg_terminate_backend`) just before tearing down a backend. The pump's recv
+  ## loop used to `discard` every message it got back, so that diagnostic was
+  ## dropped on the floor; the loss was only noticed one recv later as the generic
+  ## "Connection closed by server", and the server's actual reason never reached
+  ## the caller.
+  ##
+  ## The fix raises the ErrorResponse from the recv loop so its reason drives the
+  ## failure path. With channels subscribed the pump reconnects; when reconnection
+  ## is then refused, the permanent-death notification must carry the original
+  ## FATAL reason, not just a retry count. We reproduce it deterministically: the
+  ## mock server completes the LISTEN, sends the FATAL, and closes; we then take
+  ## the listener down so the single reconnect attempt is refused and assert the
+  ## surfaced `PgListenError.msg` contains the server's reason.
+
+  test "FATAL ErrorResponse reason surfaces in listen death instead of being discarded":
+    var errored = false
+    var reconnectionAttempted = false
+    var finalState: PgConnState
+
+    proc testBody() {.async.} =
+      # Locals (not the test-scope vars) so the gcsafe `onListenError` callback
+      # closes over stack memory. The captured string never escapes to a global —
+      # under the chronos backend assigning a GC'd value to a module-level var
+      # makes this async proc non-gcsafe — so its content is asserted in-place
+      # below; only the non-GC'd bool/enum results flow out for the final checks.
+      var cbErrored = false
+      var cbErrMsg = ""
+      var cbReconnectionAttempted = false
+      let ms = startMockServer()
+      var sc1: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1) # LISTEN "x"
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        # Pump is now parked in its recv loop. Deliver the async FATAL the way
+        # `pg_terminate_backend` does — an ErrorResponse, then a close — and let
+        # the pump observe it before the socket goes away.
+        await pumpStarted
+        await sendBytes(
+          sc1,
+          buildErrorResponse(
+            "57P01", "terminating connection due to administrator command"
+          ),
+        )
+        await closeClient(sc1)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      # One refused reconnect attempt, minimum backoff: the pump dies permanently
+      # so the death notification (carrying the FATAL reason) is observable.
+      conn.listenReconnectMaxAttempts = 1
+      conn.listenReconnectMaxBackoff = 1
+      conn.onListenError(
+        proc(err: ref PgListenError) {.gcsafe, raises: [].} =
+          cbErrored = true
+          cbErrMsg = err.msg
+          cbReconnectionAttempted = err.reconnectionAttempted
+      )
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      # Let the server hand over the FATAL and close, then take the listener down
+      # so the pump's single reconnect dial is refused → permanent death. Closing
+      # well within the 1s backoff guarantees the dial finds no listener (a live
+      # listener with no acceptor would instead hang the reconnect handshake).
+      await serverFut.wait(seconds(10))
+      await closeServer(ms)
+
+      # Poll for the death callback (1s backoff + a refused dial), bounded so a
+      # regression that never surfaces the error fails instead of hanging.
+      var spins = 0
+      while not cbErrored and spins < 5000:
+        inc spins
+        await sleepAsync(milliseconds(2))
+
+      finalState = conn.state
+      errored = cbErrored
+      reconnectionAttempted = cbReconnectionAttempted
+
+      # The fix: the previously-discarded ErrorResponse's reason now reaches the
+      # caller. Pre-fix the pump swallowed it and reported only a generic
+      # transport loss, so this substring was absent. `doAssert` (not `check`)
+      # because this runs inside an async proc whose effect signature forbids the
+      # Exception `check` can raise.
+      doAssert cbErrored, "listen pump never reported permanent death"
+      doAssert "terminating connection due to administrator command" in cbErrMsg,
+        "FATAL reason was discarded; death message was: " & cbErrMsg
+      # Layered under the reconnect-failure context: it took the reconnect path
+      # (channels present) and still preserved the original cause.
+      doAssert "reconnection failed" in cbErrMsg
+
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+
+    waitFor testBody()
+    check errored
+    check reconnectionAttempted
+    check finalState == csClosed

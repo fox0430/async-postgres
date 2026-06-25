@@ -119,7 +119,10 @@ proc notifyListenDeath(
 
 proc listenPump*(conn: PgConnection) {.async.} =
   ## Background loop: repeatedly receives messages, dispatching notifications.
-  ## Non-notification messages are discarded (recvMessage handles dispatch).
+  ## NotificationResponse/NoticeResponse are dispatched inside `recvMessage`; an
+  ## asynchronous ErrorResponse (the server terminating this backend) is raised so
+  ## its diagnostic drives the failure path rather than being silently dropped.
+  ## Any other non-notification message is discarded.
   ## On connection failure, attempts automatic reconnection with exponential
   ## backoff (up to `listenReconnectMaxAttempts` attempts; 0 or negative =
   ## unlimited) and re-subscribes to all channels.
@@ -134,7 +137,18 @@ proc listenPump*(conn: PgConnection) {.async.} =
   while true:
     try:
       while conn.state == csListening:
-        discard await conn.recvMessage()
+        let msg = await conn.recvMessage()
+        if msg.kind == bmkErrorResponse:
+          # An asynchronous ErrorResponse on an idle LISTEN connection is the
+          # server tearing down this backend (FATAL: administrator command,
+          # recovery conflict, idle-session timeout, …) — `recvMessage` already
+          # dispatched NotificationResponse/NoticeResponse internally, so this is
+          # the one server-initiated message left to handle. Don't discard it and
+          # fall through to the generic "Connection closed by server" the next
+          # recv would raise once the socket closes: raise the server's own
+          # diagnostic so the reconnect-failure death below reports the real
+          # reason instead of swallowing it.
+          raise newPgQueryError(msg.errorFields)
       # State changed: drain the stop-signal query response until ReadyForQuery
       block drainLoop:
         while true:
@@ -147,9 +161,9 @@ proc listenPump*(conn: PgConnection) {.async.} =
       return # Clean exit via stopListening
     except CancelledError:
       return # Cancelled from close()
-    except CatchableError:
+    except CatchableError as e:
       if conn.listenChannels.len == 0:
-        conn.notifyListenDeath("Listen connection lost", false)
+        conn.notifyListenDeath("Listen connection lost: " & e.msg, false)
         return
       # Auto-reconnect with exponential backoff. `listenReconnecting` marks this
       # window for a concurrent `stopListening`: while the transport is being
@@ -211,9 +225,12 @@ proc listenPump*(conn: PgConnection) {.async.} =
           conn.state = csClosed
           return
         if not reconnected:
+          # Carry the original loss reason (`e` — e.g. the FATAL ErrorResponse the
+          # recv loop surfaced) into the death message; it is the actual cause the
+          # caller wants, not just the count of failed retries.
           conn.notifyListenDeath(
-            "Listen connection lost: reconnection failed after " & $maxAttempts &
-              " attempts",
+            "Listen connection lost (" & e.msg & "): reconnection failed after " &
+              $maxAttempts & " attempts",
             true,
           )
           return
