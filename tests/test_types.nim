@@ -2926,6 +2926,10 @@ suite "PgInterval":
     let s = $v
     check s.len > 0
     check s.startsWith("-")
+    # |int64.low| = 9223372036854775808us = 2562047788h + 54775808us
+    # = 2562047788:00:54.775808. Clamping to int64.high would lose 1us
+    # and print .775807 instead.
+    check s == "-2562047788:00:54.775808"
 
   test "$ plural vs singular":
     check $PgInterval(months: 12, days: 0, microseconds: 0) == "1 year"

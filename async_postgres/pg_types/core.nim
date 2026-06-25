@@ -987,19 +987,20 @@ proc `$`*(v: PgInterval): string =
       parts.add($mons & " mon" & (if mons != 1 and mons != -1: "s" else: ""))
   if v.days != 0:
     parts.add($v.days & " day" & (if v.days != 1 and v.days != -1: "s" else: ""))
-  var us = v.microseconds
+  let us = v.microseconds
   let neg = us < 0
-  if neg:
-    if us == int64.low:
-      us = int64.high # -int64.min overflows; clamp to int64.max
+  # Avoid overflow on int64.low by working in uint64 for the magnitude.
+  let mag =
+    if neg:
+      uint64(not us) + 1'u64
     else:
-      us = -us
-  let hours = us div 3_600_000_000
-  us = us mod 3_600_000_000
-  let mins = us div 60_000_000
-  us = us mod 60_000_000
-  let secs = us div 1_000_000
-  let frac = us mod 1_000_000
+      uint64(us)
+  let hours = mag div 3_600_000_000'u64
+  var r = mag mod 3_600_000_000'u64
+  let mins = r div 60_000_000'u64
+  r = r mod 60_000_000'u64
+  let secs = r div 1_000_000'u64
+  let frac = r mod 1_000_000'u64
   var timePart =
     (if neg: "-" else: "") & align($hours, 2, '0') & ":" & align($mins, 2, '0') & ":" &
     align($secs, 2, '0')
