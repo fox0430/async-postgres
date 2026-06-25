@@ -23,6 +23,11 @@ import types, buffer_io, cache, simple_query, lifecycle
 when hasChronos:
   import chronos/streams/tlsstream
 
+const listenBackoffTickMs = 50
+  ## Granularity of the listen pump's interruptible reconnect backoff: the pump
+  ## sleeps in ticks this size and re-checks `listenStopRequested` between them,
+  ## bounding how long a `stopListening` issued mid-backoff waits to be observed.
+
 # Callback registration
 
 proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
@@ -119,7 +124,13 @@ proc listenPump*(conn: PgConnection) {.async.} =
   ## backoff (up to `listenReconnectMaxAttempts` attempts; 0 or negative =
   ## unlimited) and re-subscribes to all channels.
   ## Exits cleanly when state changes from csListening (via stopListening
-  ## sending an empty query), then drains until ReadyForQuery.
+  ## sending an empty query), then drains until ReadyForQuery. A stop requested
+  ## while reconnecting (`listenStopRequested`) is honored at every yield point
+  ## of the reconnect loop, so stopListening never strands on a pump that would
+  ## otherwise loop back into csListening after a successful reconnect. The
+  ## inter-attempt backoff is slept in short ticks that re-check the stop flag,
+  ## so a stop mid-backoff is observed within a tick instead of after the full
+  ## interval.
   while true:
     try:
       while conn.state == csListening:
@@ -140,65 +151,149 @@ proc listenPump*(conn: PgConnection) {.async.} =
       if conn.listenChannels.len == 0:
         conn.notifyListenDeath("Listen connection lost", false)
         return
-      # Auto-reconnect with exponential backoff
-      let maxAttempts = conn.listenReconnectMaxAttempts
-      let maxBackoff = max(1, conn.listenReconnectMaxBackoff)
-      let unlimited = maxAttempts <= 0
-      var reconnected = false
-      var backoff = 1
-      var attempt = 0
-      while unlimited or attempt < maxAttempts:
-        try:
-          await sleepAsync(seconds(backoff))
-          await conn.reconnectInPlace()
-          conn.state = csListening
-          reconnected = true
-          if conn.reconnectCallback != nil:
-            conn.reconnectCallback()
-          break
-        except CancelledError:
+      # Auto-reconnect with exponential backoff. `listenReconnecting` marks this
+      # window for a concurrent `stopListening`: while the transport is being
+      # rebuilt the empty-query unblock it normally uses would interleave with
+      # the reconnect's own LISTEN round trips and desync the stream, so it
+      # signals a stop via `listenStopRequested` instead — checked at every
+      # yield point below so the request is never lost.
+      conn.listenReconnecting = true
+      # Cleared once for every exit from the reconnect window by the `finally`
+      # below, so no individual exit path (stop-wins, cancellation, post-loop)
+      # can leak it true and mislead the next `stopListening`.
+      try:
+        let maxAttempts = conn.listenReconnectMaxAttempts
+        let maxBackoff = max(1, conn.listenReconnectMaxBackoff)
+        let unlimited = maxAttempts <= 0
+        var reconnected = false
+        var backoff = 1
+        var attempt = 0
+        while (unlimited or attempt < maxAttempts) and not conn.listenStopRequested:
+          try:
+            # Interruptible backoff: sleep in short ticks and re-check the stop
+            # flag each tick, so a concurrent `stopListening` is observed within
+            # a tick instead of after the full interval — a bare
+            # `sleepAsync(seconds(backoff))` would strand the stop for up to
+            # `listenReconnectMaxBackoff` seconds.
+            var remainingMs = backoff * 1000
+            while remainingMs > 0 and not conn.listenStopRequested:
+              let tickMs = min(remainingMs, listenBackoffTickMs)
+              await sleepAsync(milliseconds(tickMs))
+              remainingMs -= tickMs
+            if conn.listenStopRequested:
+              break
+            await conn.reconnectInPlace()
+            if conn.listenStopRequested:
+              # Stop won the race with a successful reconnect. The new transport
+              # is live and already `csReady` (reconnectInPlace set it); do *not*
+              # restore csListening — that overwrite is exactly what used to
+              # strand the awaiting stopListening. Exit so it sees a finished pump
+              # and a reusable connection. `reconnectCallback` is intentionally
+              # skipped: the caller asked to stop, so the connection is handed
+              # back csReady and *not* listening — firing a "reconnected, still
+              # listening" notification would misrepresent that. The fresh backend
+              # identity (pid/secretKey) is already on `conn` regardless.
+              return
+            conn.state = csListening
+            reconnected = true
+            if conn.reconnectCallback != nil:
+              conn.reconnectCallback()
+            break
+          except CancelledError:
+            return
+          except CatchableError:
+            backoff = min(backoff * 2, maxBackoff)
+          inc attempt
+        if conn.listenStopRequested:
+          # Asked to stop before any live transport was restored: the old one is
+          # already gone, so the connection is unusable. Mark it closed; the
+          # awaiting stopListening surfaces that state.
+          conn.state = csClosed
           return
-        except CatchableError:
-          backoff = min(backoff * 2, maxBackoff)
-        inc attempt
-      if not reconnected:
-        conn.notifyListenDeath(
-          "Listen connection lost: reconnection failed after " & $maxAttempts &
-            " attempts",
-          true,
-        )
-        return
+        if not reconnected:
+          conn.notifyListenDeath(
+            "Listen connection lost: reconnection failed after " & $maxAttempts &
+              " attempts",
+            true,
+          )
+          return
+      finally:
+        conn.listenReconnecting = false
 
 proc startListening*(conn: PgConnection) =
+  conn.listenStopRequested = false
+  conn.listenReconnecting = false
   conn.state = csListening
   conn.listenTask = conn.listenPump()
 
+proc abortListenTask(conn: PgConnection) {.async.} =
+  ## Shared `stopListening` failure cleanup: the pump's transport is dead, so
+  ## cancel the task if it is still running and mark the connection closed. The
+  ## caller nils `listenTask`; `stopListening`'s `finally` clears
+  ## `listenStopRequested`.
+  if conn.listenTask != nil and not conn.listenTask.finished:
+    await cancelAndWait(conn.listenTask)
+  conn.state = csClosed
+
 proc stopListening*(conn: PgConnection) {.async.} =
-  ## Stop the background listen pump and return the connection to `csReady`.
+  ## Stop the background listen pump and return the connection to `csReady`
+  ## (or leave it `csClosed` if the transport died with no live reconnect).
+  ## `listenStopRequested` is cleared on *every* exit — including when the caller
+  ## cancels this future mid-stop — so a later reconnect never trips over a stale
+  ## stop request and silently closes the pump.
   if conn.listenTask == nil or conn.listenTask.finished:
     conn.listenTask = nil
+    conn.listenStopRequested = false
     if conn.state == csListening:
       conn.state = csReady
     return
-  # Signal pump to exit by changing state, then send empty query to unblock read
-  conn.state = csBusy
+  # Request the stop up front, before choosing how to deliver it: this also
+  # covers the pump tripping into its reconnect loop *after* we pick the normal
+  # path below (a recv that fails the instant we signal) — it still observes the
+  # request there and exits instead of looping back into csListening.
+  conn.listenStopRequested = true
   try:
-    await conn.sendMsg(encodeQuery(""))
-    # Wait for pump to drain and exit naturally
-    await conn.listenTask
-  except CancelledError as e:
-    raise e
-  except CatchableError:
-    # Send or pump failed: connection is dead
-    if conn.listenTask != nil and not conn.listenTask.finished:
-      await cancelAndWait(conn.listenTask)
+    if conn.listenReconnecting:
+      # The pump is rebuilding a dead transport. The empty-query unblock the
+      # normal path uses would race the reconnect's LISTEN round trips and
+      # desync the stream, so just wait for the pump to observe
+      # `listenStopRequested` and exit. It leaves the connection `csReady` (a
+      # reconnect completed before the stop) or `csClosed` (none did) — either
+      # way a finished pump, never a hang. A pump parked in its backoff observes
+      # the stop within one short tick (see the reconnect loop); otherwise we
+      # wait only for the in-flight reconnect round trips to finish.
+      try:
+        await conn.listenTask
+      except CancelledError as e:
+        # The pump is still running and owns the live future; leave the handle
+        # intact (the `finally` only clears the stop flag) so close() can cancel
+        # it, then propagate the cancellation.
+        raise e
+      except CatchableError:
+        await conn.abortListenTask()
+      conn.listenTask = nil
+      return
+    # Normal path: pump parked in the recv loop. Signal exit by changing state,
+    # then send an empty query to unblock the read.
+    conn.state = csBusy
+    try:
+      await conn.sendMsg(encodeQuery(""))
+      # Wait for pump to drain and exit naturally
+      await conn.listenTask
+    except CancelledError as e:
+      raise e
+    except CatchableError:
+      # Send or pump failed: connection is dead
+      await conn.abortListenTask()
     conn.listenTask = nil
-    conn.state = csClosed
-    return
-  conn.listenTask = nil
-  # Preserve csClosed if pump detected a connection error
-  if conn.state != csClosed:
-    conn.state = csReady
+    # Preserve csClosed if pump detected a connection error
+    if conn.state != csClosed:
+      conn.state = csReady
+  finally:
+    # Runs on the normal, failed, *and* cancelled paths: a stop request left set
+    # would later abort a legitimate reconnect (the pump's reconnect loop reads
+    # it at every yield point), so it must never outlive this call.
+    conn.listenStopRequested = false
 
 # LISTEN / UNLISTEN entry points
 

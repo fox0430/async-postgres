@@ -1346,6 +1346,118 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard row.getMoneyArray(0)
 
+  test "getIntArrayElemOpt binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 4)
+    let bin = encodeBinaryArray(OidInt4, elements)
+    let fields = @[mkField(OidInt4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getIntArrayElemOpt(0)
+
+  test "getInt16ArrayElemOpt binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 2)
+    let bin = encodeBinaryArray(OidInt2, elements)
+    let fields = @[mkField(OidInt2Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getInt16ArrayElemOpt(0)
+
+  test "getInt64ArrayElemOpt binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0]] # 4 bytes (expected 8)
+    let bin = encodeBinaryArray(OidInt8, elements)
+    let fields = @[mkField(OidInt8Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getInt64ArrayElemOpt(0)
+
+  test "getFloatArrayElemOpt binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 4 or 8)
+    let bin = encodeBinaryArray(OidFloat8, elements)
+    let fields = @[mkField(OidFloat8Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getFloatArrayElemOpt(0)
+
+  test "getFloat32ArrayElemOpt binary element length mismatch":
+    let elements = @[@[0'u8, 0]] # 2 bytes (expected 4)
+    let bin = encodeBinaryArray(OidFloat4, elements)
+    let fields = @[mkField(OidFloat4Array, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getFloat32ArrayElemOpt(0)
+
+  test "getBoolArrayElemOpt binary element length mismatch":
+    let elements = @[@[1'u8, 1]] # 2 bytes (expected 1)
+    let bin = encodeBinaryArray(OidBool, elements)
+    let fields = @[mkField(OidBoolArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getBoolArrayElemOpt(0)
+
+  test "getTimestampArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0]] # 4 bytes (expected 8)
+    let bin = encodeBinaryArray(OidTimestamp, elements)
+    let fields = @[mkField(OidTimestampArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getTimestampArray(0)
+
+  test "getTimestampTzArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0]] # 4 bytes (expected 8)
+    let bin = encodeBinaryArray(OidTimestampTz, elements)
+    let fields = @[mkField(OidTimestampTzArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getTimestampTzArray(0)
+
+  test "getDateArray binary element length mismatch":
+    let elements = @[@[0'u8, 0]] # 2 bytes (expected 4)
+    let bin = encodeBinaryArray(OidDate, elements)
+    let fields = @[mkField(OidDateArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getDateArray(0)
+
+  test "getTimeArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0]] # 4 bytes (expected 8)
+    let bin = encodeBinaryArray(OidTime, elements)
+    let fields = @[mkField(OidTimeArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getTimeArray(0)
+
+  test "getTimeTzArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0, 0, 0, 0, 0]] # 8 bytes (expected 12)
+    let bin = encodeBinaryArray(OidTimeTz, elements)
+    let fields = @[mkField(OidTimeTzArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getTimeTzArray(0)
+
+  test "getPointArray binary element length mismatch":
+    let elements = @[@[0'u8, 0, 0, 0, 0, 0, 0, 0]] # 8 bytes (expected 16)
+    let bin = encodeBinaryArray(OidPoint, elements)
+    let fields = @[mkField(OidPointArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getPointArray(0)
+
+  test "getLsegArray binary element length mismatch":
+    let elements = @[newSeq[byte](16)] # 16 bytes (expected 32)
+    let bin = encodeBinaryArray(OidLseg, elements)
+    let fields = @[mkField(OidLsegArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getLsegArray(0)
+
+  test "getBoxArray binary element length mismatch":
+    let elements = @[newSeq[byte](16)] # 16 bytes (expected 32)
+    let bin = encodeBinaryArray(OidBox, elements)
+    let fields = @[mkField(OidBoxArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    expect PgTypeError:
+      discard row.getBoxArray(0)
+
   test "getPath binary npts exceeds clen":
     # closed(1) + npts(4) = 5-byte header; claim 100 points (1600 bytes) but pass 5 bytes
     var bin = newSeq[byte](5)

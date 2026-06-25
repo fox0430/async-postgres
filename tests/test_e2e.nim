@@ -7589,6 +7589,22 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "execInTransaction with comment-only SQL does not capture COMMIT tag":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Comment-only (or empty) user SQL yields EmptyQueryResponse instead of
+      # CommandComplete. The returned tag must reflect the empty user statement,
+      # never the trailing COMMIT.
+      let tag = await conn.execInTransaction("-- nothing here")
+      doAssert tag == ""
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
   test "queryInTransaction returns rows":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -7636,6 +7652,22 @@ suite "E2E: execInTransaction / queryInTransaction":
         TransactionOptions(isolation: ilSerializable, access: amReadOnly),
       )
       doAssert qr.rows.len == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "queryInTransaction with comment-only SQL does not capture COMMIT tag":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Comment-only (or empty) user SQL yields EmptyQueryResponse instead of
+      # CommandComplete. commandTag must stay empty, never the trailing COMMIT.
+      let qr = await conn.queryInTransaction("/* empty */")
+      doAssert qr.rows.len == 0
+      doAssert qr.commandTag == ""
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
 
       await conn.close()
 

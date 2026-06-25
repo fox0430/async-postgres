@@ -213,6 +213,16 @@ type
     noticeCallback*: NoticeCallback
     listenChannels*: HashSet[string]
     listenTask*: Future[void]
+    listenStopRequested*: bool
+      ## Set by `stopListening` to ask the background pump to exit. The pump
+      ## checks it at every yield point of its auto-reconnect loop so a stop
+      ## requested while the transport is being rebuilt is honored instead of
+      ## being lost when a successful reconnect restores `csListening`.
+    listenReconnecting*: bool
+      ## True while the pump is inside its auto-reconnect loop. Tells
+      ## `stopListening` that the empty-query unblock it normally uses would race
+      ## the reconnect's own LISTEN round trips, so it must wait for the pump to
+      ## observe `listenStopRequested` instead of sending the query.
     host*: string
     port*: int
     createdAt*: Moment

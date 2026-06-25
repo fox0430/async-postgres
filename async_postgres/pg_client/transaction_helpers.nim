@@ -54,8 +54,13 @@ proc execInTransactionImpl(
         case msg.kind
         of bmkParseComplete, bmkBindComplete:
           discard
-        of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
+        of bmkRowDescription, bmkDataRow:
           discard
+        of bmkEmptyQueryResponse:
+          # Empty/comment-only user SQL yields EmptyQueryResponse instead of
+          # CommandComplete; advance the phase anyway so the trailing COMMIT's
+          # CommandComplete isn't captured as the user statement's tag.
+          inc phase
         of bmkCommandComplete:
           if phase == 1:
             userCommandTag = msg.commandTag
@@ -201,7 +206,10 @@ proc queryInTransactionImpl(
         of bmkNoData:
           discard
         of bmkEmptyQueryResponse:
-          discard
+          # Empty/comment-only user SQL yields EmptyQueryResponse instead of
+          # CommandComplete; advance the phase anyway so the trailing COMMIT's
+          # CommandComplete isn't captured as the user statement's tag.
+          inc phase
         of bmkCommandComplete:
           if phase == 1:
             qr.commandTag = msg.commandTag

@@ -1233,20 +1233,34 @@ template genArrayDecoder(
 
 # Temporal array decoders
 
+proc timestampElemFromBinary(
+    buf: openArray[byte], off, elen: int, typeName: string
+): DateTime =
+  if elen != 8:
+    raise newException(
+      PgTypeError, "Invalid binary " & typeName & " element length: " & $elen
+    )
+  decodeBinaryTimestamp(buf.toOpenArray(off, off + elen - 1))
+
 genArrayDecoder(
   getTimestampArray,
   DateTime,
   "timestamp",
-  decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7)),
+  timestampElemFromBinary(row.data.buf, off + e.off, e.len, "timestamp"),
   parseTimestampText(e.get),
 )
 genArrayDecoder(
   getTimestampTzArray,
   DateTime,
   "timestamptz",
-  decodeBinaryTimestamp(row.data.buf.toOpenArray(off + e.off, off + e.off + 7)),
+  timestampElemFromBinary(row.data.buf, off + e.off, e.len, "timestamptz"),
   parseTimestampText(e.get),
 )
+
+proc dateElemFromBinary(buf: openArray[byte], off, elen: int): DateTime =
+  if elen != 4:
+    raise newException(PgTypeError, "Invalid binary date element length: " & $elen)
+  decodeBinaryDate(buf.toOpenArray(off, off + elen - 1))
 
 proc dateElemFromText(s: string): DateTime =
   try:
@@ -1258,21 +1272,33 @@ genArrayDecoder(
   getDateArray,
   DateTime,
   "date",
-  decodeBinaryDate(row.data.buf.toOpenArray(off + e.off, off + e.off + 3)),
+  dateElemFromBinary(row.data.buf, off + e.off, e.len),
   dateElemFromText(e.get),
 )
+
+proc timeElemFromBinary(buf: openArray[byte], off, elen: int): PgTime =
+  if elen != 8:
+    raise newException(PgTypeError, "Invalid binary time element length: " & $elen)
+  decodeBinaryTime(buf.toOpenArray(off, off + elen - 1))
+
 genArrayDecoder(
   getTimeArray,
   PgTime,
   "time",
-  decodeBinaryTime(row.data.buf.toOpenArray(off + e.off, off + e.off + 7)),
+  timeElemFromBinary(row.data.buf, off + e.off, e.len),
   parseTimeText(e.get),
 )
+
+proc timeTzElemFromBinary(buf: openArray[byte], off, elen: int): PgTimeTz =
+  if elen != 12:
+    raise newException(PgTypeError, "Invalid binary timetz element length: " & $elen)
+  decodeBinaryTimeTz(buf.toOpenArray(off, off + elen - 1))
+
 genArrayDecoder(
   getTimeTzArray,
   PgTimeTz,
   "timetz",
-  decodeBinaryTimeTz(row.data.buf.toOpenArray(off + e.off, off + e.off + 11)),
+  timeTzElemFromBinary(row.data.buf, off + e.off, e.len),
   parseTimeTzText(e.get),
 )
 
@@ -1431,11 +1457,16 @@ genArrayDecoder(
 
 # Geometric array decoders
 
+proc pointElemFromBinary(buf: openArray[byte], off, elen: int): PgPoint =
+  if elen != 16:
+    raise newException(PgTypeError, "Invalid binary point element length: " & $elen)
+  decodePointBinary(buf, off)
+
 genArrayDecoder(
   getPointArray,
   PgPoint,
   "point",
-  decodePointBinary(row.data.buf, off + e.off),
+  pointElemFromBinary(row.data.buf, off + e.off, e.len),
   parsePointText(e.get),
 )
 
@@ -1468,7 +1499,9 @@ genArrayDecoder(
   lineElemFromText(e.get),
 )
 
-proc lsegElemFromBinary(buf: openArray[byte], off: int): PgLseg =
+proc lsegElemFromBinary(buf: openArray[byte], off, elen: int): PgLseg =
+  if elen != 32:
+    raise newException(PgTypeError, "Invalid binary lseg element length: " & $elen)
   PgLseg(p1: decodePointBinary(buf, off), p2: decodePointBinary(buf, off + 16))
 
 proc lsegElemFromText(s: string): PgLseg =
@@ -1485,7 +1518,7 @@ genArrayDecoder(
   getLsegArray,
   PgLseg,
   "lseg",
-  lsegElemFromBinary(row.data.buf, off + e.off),
+  lsegElemFromBinary(row.data.buf, off + e.off, e.len),
   lsegElemFromText(e.get),
 )
 
@@ -1500,6 +1533,8 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
     for i, e in decoded.elements:
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in box array")
+      if e.len != 32:
+        raise newException(PgTypeError, "Invalid binary box element length: " & $e.len)
       result[i] = PgBox(
         high: decodePointBinary(row.data.buf, off + e.off),
         low: decodePointBinary(row.data.buf, off + e.off + 16),
@@ -1663,6 +1698,10 @@ proc getIntArrayElemOpt*(row: Row, col: int): seq[Option[int32]] =
     for i, e in decoded.elements:
       if e.len == -1:
         result[i] = none(int32)
+      elif e.len != 4:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for int4 array"
+        )
       else:
         result[i] =
           some(fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
@@ -1685,6 +1724,10 @@ proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
     for i, e in decoded.elements:
       if e.len == -1:
         result[i] = none(int16)
+      elif e.len != 2:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for int2 array"
+        )
       else:
         result[i] =
           some(fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
@@ -1707,6 +1750,10 @@ proc getInt64ArrayElemOpt*(row: Row, col: int): seq[Option[int64]] =
     for i, e in decoded.elements:
       if e.len == -1:
         result[i] = none(int64)
+      elif e.len != 8:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for int8 array"
+        )
       else:
         result[i] =
           some(fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
@@ -1737,11 +1784,15 @@ proc getFloatArrayElemOpt*(row: Row, col: int): seq[Option[float64]] =
             )))
           )
         )
-      else:
+      elif e.len == 8:
         result[i] = some(
           cast[float64](cast[uint64](fromBE64(
             row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
           )))
+        )
+      else:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for float array"
         )
     return
   let s = row.getStr(col)
@@ -1762,6 +1813,11 @@ proc getFloat32ArrayElemOpt*(row: Row, col: int): seq[Option[float32]] =
     for i, e in decoded.elements:
       if e.len == -1:
         result[i] = none(float32)
+      elif e.len != 4:
+        raise newException(
+          PgTypeError,
+          "Unexpected binary element length " & $e.len & " for float32 array",
+        )
       else:
         result[i] = some(
           cast[float32](cast[uint32](fromBE32(
@@ -1787,6 +1843,10 @@ proc getBoolArrayElemOpt*(row: Row, col: int): seq[Option[bool]] =
     for i, e in decoded.elements:
       if e.len == -1:
         result[i] = none(bool)
+      elif e.len != 1:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for bool array"
+        )
       else:
         result[i] = some(row.data.buf[off + e.off] == 1'u8)
     return

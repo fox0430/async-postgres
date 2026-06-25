@@ -20,7 +20,7 @@
 ## re-LISTEN loop is a no-op, isolating the buffer copy, and assert the pairing
 ## invariant directly — deterministic, no timing dependence on either backend.
 
-import std/[unittest]
+import std/[unittest, sets]
 
 import ../async_postgres/async_backend
 import ../async_postgres/pg_connection {.all.}
@@ -177,3 +177,192 @@ suite "reconnectInPlace host/port failover":
     # cancel() will dial. Pre-fix, finalPort stays at portA (the dead host).
     check finalHostIsLoopback
     check finalPort == portB
+
+## Regression: `stopListening` must not hang when it races a successful in-place
+## reconnect by the listen pump.
+##
+## When the pump loses its transport it enters the auto-reconnect loop, and the
+## moment `reconnectInPlace` swaps in a live transport it used to unconditionally
+## restore `csListening`. A `stopListening` issued during that window set its stop
+## signal (`csBusy`) only to have it overwritten by the reconnect's csListening,
+## so the pump looped straight back into the recv loop and `await listenTask`
+## never returned — a permanent hang.
+##
+## The fix routes the stop through `listenStopRequested`, which the pump checks
+## right after `reconnectInPlace` succeeds (before restoring csListening) and at
+## every other reconnect-loop yield point. We reproduce the race deterministically
+## with the mock server: it withholds the re-LISTEN response until stopListening
+## has suspended on the pump, then answers it — so the pump observes the stop just
+## as the reconnect completes. The assertion is simply that stopListening returns
+## (bounded by a `wait`) and leaves the freshly reconnected connection `csReady`.
+
+suite "stopListening during reconnect":
+  test "stopListening returns and leaves csReady when it races a reconnect":
+    var finalState: PgConnState
+    var finalChannels = -1
+    var stopReturned = false
+    var finalTaskNil = false
+    var finalStopRequested = true
+    var finalReconnecting = true
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+      let reListenSeen = newFuture[void]("reListenSeen")
+      let stopIssued = newFuture[void]("stopIssued")
+
+      proc serverHandler() {.async.} =
+        # Connection 1: initial connect + first LISTEN.
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1) # LISTEN "x"
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        # Wait until the pump is parked reading sc1, then kill the transport so
+        # the pump enters its auto-reconnect loop.
+        await pumpStarted
+        await closeClient(sc1)
+        # Connection 2: the reconnect target. acceptAndReady completes the
+        # handshake; reconnectInPlace then re-LISTENs and parks awaiting our
+        # response — that read is what `drainFrontendMessage` below observes.
+        sc2 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc2) # re-LISTEN "x"
+        # Pump is now suspended mid-reconnect (listenReconnecting = true).
+        reListenSeen.complete()
+        # Hold the LISTEN response until stopListening has suspended on the pump,
+        # so the stop and the reconnect's completion genuinely race.
+        await stopIssued
+        await sendBytes(sc2, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      try:
+        # Wait until the pump is mid-reconnect, then stop. Pre-fix this hangs;
+        # every `wait` here turns a regression into a test failure instead of a
+        # stuck CI rather than relying on an unbounded await.
+        await reListenSeen.wait(seconds(10))
+        let stopFut = conn.stopListening()
+        stopIssued.complete()
+        await stopFut.wait(seconds(10))
+        stopReturned = true
+        finalState = conn.state
+        finalChannels = conn.listenChannels.len
+        # The pump must have fully exited and left no stale stop/reconnect state.
+        finalTaskNil = conn.listenTask.isNil
+        finalStopRequested = conn.listenStopRequested
+        finalReconnecting = conn.listenReconnecting
+      finally:
+        # Always tear down — even if a `wait` above timed out — so a leaked mock
+        # server socket can't break later tests in the suite. Unblock the server
+        # handler first in case we never reached the stop.
+        if not stopIssued.finished:
+          stopIssued.complete()
+        try:
+          await serverFut.wait(seconds(10))
+        except CatchableError:
+          discard
+        try:
+          await conn.close()
+        except CatchableError:
+          discard
+        if not sc2.isNil:
+          try:
+            await closeClient(sc2)
+          except CatchableError:
+            discard
+        await closeServer(ms)
+
+    waitFor testBody()
+    # The fix: stopListening returns promptly instead of hanging, and the pump
+    # exited without resuming the recv loop, leaving the reconnected connection
+    # ready for reuse. Pre-fix `stopReturned` never becomes true (the await never
+    # completes); the `wait` would raise first.
+    check stopReturned
+    check finalState == csReady
+    # stopListening stops the pump but does not UNLISTEN, matching its contract.
+    check finalChannels == 1
+    # The pump handle is released and no stop/reconnect flag leaked — a fix that
+    # left either set (e.g. a missed reset on the stop-wins path) would pass the
+    # state check above but fail here.
+    check finalTaskNil
+    check not finalStopRequested
+    check not finalReconnecting
+
+  test "stopListening returns csClosed when it races a reconnect that cannot complete":
+    # Covers the *other* stop-during-reconnect exit: the pump is mid-reconnect
+    # but no live transport is ever restored, so the stop must drive it to
+    # csClosed via the post-loop check — not the csReady reconnect-won path the
+    # test above exercises. We kill the listener so every dial is refused, wait
+    # until the pump is in its reconnect loop, then stop.
+    var finalState: PgConnState
+    var stopReturned = false
+    var finalTaskNil = false
+    var finalStopRequested = true
+    var finalReconnecting = true
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1) # LISTEN "x"
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        # Wait until the pump is parked reading sc1, then kill the transport so
+        # the pump enters its auto-reconnect loop.
+        await pumpStarted
+        await closeClient(sc1)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await conn.listen("x")
+      pumpStarted.complete()
+      await serverFut.wait(seconds(10))
+
+      try:
+        # Take the listener down so the pump's reconnect dials are refused
+        # outright and it can never restore a live transport.
+        await closeServer(ms)
+        # Wait until the pump is inside its reconnect loop (it sleeps one backoff
+        # interval before the first dial), so stopListening takes the
+        # `listenReconnecting` branch. There is no server-side event to wait on
+        # here — the reconnect dials are refused — so poll the flag, bounded so a
+        # stuck pump fails rather than hangs.
+        var spins = 0
+        while not conn.listenReconnecting and spins < 10000:
+          inc spins
+          await sleepAsync(milliseconds(1))
+        # Fail loudly if the window was missed: otherwise stopListening would take
+        # the normal path, also land on csClosed via the dead transport, and pass
+        # the assertions below without ever exercising the reconnecting branch.
+        # `doAssert` (not `check`) because this runs inside an async proc, whose
+        # effect signature forbids the `Exception` that `check` can raise.
+        doAssert conn.listenReconnecting, "pump never entered its reconnect loop"
+        let stopFut = conn.stopListening()
+        await stopFut.wait(seconds(10))
+        stopReturned = true
+        finalState = conn.state
+        finalTaskNil = conn.listenTask.isNil
+        finalStopRequested = conn.listenStopRequested
+        finalReconnecting = conn.listenReconnecting
+      finally:
+        try:
+          await serverFut.wait(seconds(10))
+        except CatchableError:
+          discard
+        try:
+          await conn.close()
+        except CatchableError:
+          discard
+
+    waitFor testBody()
+    # The stop won the race before any reconnect completed: the pump exited via
+    # the post-loop csClosed path, releasing its handle and clearing both flags.
+    check stopReturned
+    check finalState == csClosed
+    check finalTaskNil
+    check not finalStopRequested
+    check not finalReconnecting
