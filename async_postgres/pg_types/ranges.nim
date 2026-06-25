@@ -166,6 +166,11 @@ proc decodeMultirangeBinaryRaw*(
   let count = int(fromBE32(data.toOpenArray(0, 3)))
   if count < 0:
     raise newException(PgTypeError, "Binary multirange: invalid count " & $count)
+  # Each range carries at least a 4-byte length prefix after the 4-byte count,
+  # so count cannot exceed (data.len - 4) div 4. This guard stops a crafted
+  # count from triggering a multi-GB allocation on malformed input.
+  if count > (data.len - 4) div 4:
+    raise newException(PgTypeError, "Binary multirange: count exceeds data")
   result = newSeq[tuple[off: RelOff, len: int]](count)
   var pos = 4
   for i in 0 ..< count:
