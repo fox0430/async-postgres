@@ -46,7 +46,8 @@ proc onListenError*(
 # In-place reconnect (preserves PgConnection identity for listeners)
 
 proc reconnectInPlace*(conn: PgConnection) {.async.} =
-  ## Reconnect using stored config, re-LISTENing on all channels.
+  ## Reconnect using stored config, re-LISTENing on all channels. A re-LISTEN
+  ## failure closes the freshly opened transport so the reconnect never leaks it.
   await conn.closeTransport()
 
   conn.recvBuf.setLen(0)
@@ -83,8 +84,18 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.state = csReady
   conn.createdAt = newConn.createdAt
 
-  for ch in conn.listenChannels:
-    discard await conn.simpleQuery("LISTEN " & quoteIdentifier(ch))
+  try:
+    for ch in conn.listenChannels:
+      discard await conn.simpleQuery("LISTEN " & quoteIdentifier(ch))
+  except CancelledError as e:
+    # Pump teardown: let close()'s own closeTransport reclaim the transport.
+    raise e
+  except CatchableError as e:
+    # connect() succeeded but re-LISTEN failed: close the fresh transport so the
+    # failed reconnect never leaks it (notifyListenDeath only sets csClosed).
+    await conn.closeTransport()
+    conn.state = csClosed
+    raise e
 
 # Background pump and start/stop
 
