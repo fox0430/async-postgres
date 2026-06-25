@@ -6812,6 +6812,27 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "queryEach records ParameterStatus into serverParams":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # queryEach parses messages directly from recvBuf (not via nextMessage),
+      # so it must record GUC_REPORT ParameterStatus updates itself. Changing a
+      # reported GUC (application_name) through queryEach must reach serverParams.
+      const newName = "queryeach_param_status_test"
+      doAssert conn.serverParams.getOrDefault("application_name", "") != newName
+      let rowCount = await conn.queryEach(
+        "SET application_name = '" & newName & "'",
+        callback = proc(row: Row) =
+          discard,
+      )
+      doAssert rowCount == 0
+      doAssert conn.serverParams.getOrDefault("application_name", "") == newName
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: format switches do not mutate cached field metadata":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
