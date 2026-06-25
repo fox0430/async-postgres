@@ -583,6 +583,11 @@ template queryEachRecvLoop*(
         of bmkNoticeResponse:
           conn.dispatchNotice(msg)
           continue
+        of bmkParameterStatus:
+          # Parsed directly from recvBuf, so not recorded by `nextMessage`;
+          # mirror buffer_io to keep serverParams current (e.g. SET, promotion).
+          conn.serverParams[msg.paramName] = msg.paramValue
+          continue
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
