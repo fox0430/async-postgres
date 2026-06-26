@@ -179,6 +179,11 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
                   conn.state = csReady
                   break errDrain
               await conn.fillRecvBuf()
+          # The Sync above aborts the (implicit) transaction holding the portal,
+          # so the portal is already gone. Mark the cursor exhausted so a later
+          # `close()` short-circuits instead of issuing a wasteful Close/Sync
+          # round-trip against a portal the server has dropped.
+          cursor.exhausted = true
           raise queryError
         else:
           discard
