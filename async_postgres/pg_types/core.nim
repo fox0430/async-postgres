@@ -3,6 +3,9 @@ import std/[hashes, math, options, parseutils, sequtils, strutils, tables, net]
 import ../pg_errors
 export pg_errors
 
+import ../pg_bytes
+export pg_bytes
+
 type
   RelOff* = distinct int
     ## Offset relative to the start of a slice that was passed into a binary
@@ -1053,49 +1056,7 @@ proc toString*(s: seq[byte]): string =
   if s.len > 0:
     copyMem(addr result[0], addr s[0], s.len)
 
-proc toBE16*(v: int16): array[2, byte] =
-  [byte((v shr 8) and 0xFF), byte(v and 0xFF)]
-
-proc toBE32*(v: int32): array[4, byte] =
-  [
-    byte((v shr 24) and 0xFF),
-    byte((v shr 16) and 0xFF),
-    byte((v shr 8) and 0xFF),
-    byte(v and 0xFF),
-  ]
-
-proc toBE64*(v: int64): array[8, byte] =
-  [
-    byte((v shr 56) and 0xFF),
-    byte((v shr 48) and 0xFF),
-    byte((v shr 40) and 0xFF),
-    byte((v shr 32) and 0xFF),
-    byte((v shr 24) and 0xFF),
-    byte((v shr 16) and 0xFF),
-    byte((v shr 8) and 0xFF),
-    byte(v and 0xFF),
-  ]
-
-proc fromBE16*(data: openArray[byte]): int16 =
-  ## Decode a 16-bit integer from big-endian bytes.
-  int16(data[0]) shl 8 or int16(data[1])
-
-proc fromBE32*(data: openArray[byte]): int32 =
-  ## Decode a 32-bit integer from big-endian bytes.
-  int32(data[0]) shl 24 or int32(data[1]) shl 16 or int32(data[2]) shl 8 or
-    int32(data[3])
-
-proc fromBE64*(data: openArray[byte]): int64 =
-  ## Decode a 64-bit integer from big-endian bytes.
-  int64(data[0]) shl 56 or int64(data[1]) shl 48 or int64(data[2]) shl 40 or
-    int64(data[3]) shl 32 or int64(data[4]) shl 24 or int64(data[5]) shl 16 or
-    int64(data[6]) shl 8 or int64(data[7])
-
-proc decodeFloat64BE*(data: openArray[byte], offset: int = 0): float64 =
-  ## Decode a big-endian 64-bit float from bytes at the given offset.
-  let bits =
-    (uint64(data[offset]) shl 56) or (uint64(data[offset + 1]) shl 48) or
-    (uint64(data[offset + 2]) shl 40) or (uint64(data[offset + 3]) shl 32) or
-    (uint64(data[offset + 4]) shl 24) or (uint64(data[offset + 5]) shl 16) or
-    (uint64(data[offset + 6]) shl 8) or uint64(data[offset + 7])
-  cast[float64](bits)
+# Big-endian integer/float encode/decode helpers live in ``pg_bytes`` (the
+# dependency-free module shared with ``pg_protocol``) and are re-exported above
+# via ``export pg_bytes``: ``toBE16/32/64``, ``fromBE16/32/64``,
+# ``decodeFloat32BE``/``decodeFloat64BE``.

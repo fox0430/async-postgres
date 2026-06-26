@@ -369,9 +369,9 @@ template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
   elif typeof(val) is (int64 or int):
     val = typeof(val)(fromBE64(buf.toOpenArray(fOff, fEnd)))
   elif typeof(val) is float64:
-    val = cast[float64](cast[uint64](fromBE64(buf.toOpenArray(fOff, fEnd))))
+    val = decodeFloat64BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is float32:
-    val = cast[float32](cast[uint32](fromBE32(buf.toOpenArray(fOff, fEnd))))
+    val = decodeFloat32BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is bool:
     val = buf[fOff] != 0
   else:

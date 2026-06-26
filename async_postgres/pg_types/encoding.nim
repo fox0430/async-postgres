@@ -1592,8 +1592,7 @@ proc coerceBinaryParam*(param: PgParam, serverOid: int32): PgParam =
 
   # float4 -> float8
   if param.oid == OidFloat4 and serverOid == OidFloat8 and data.len == 4:
-    let f = cast[float32](fromBE32(data))
-    let d = float64(f)
+    let d = float64(decodeFloat32BE(data))
     return PgParam(oid: OidFloat8, format: 1, value: some(@(toBE64(cast[int64](d)))))
 
   raise newException(

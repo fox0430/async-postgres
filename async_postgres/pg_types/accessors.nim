@@ -146,53 +146,35 @@ proc getStr*(row: Row, col: int): string =
           PgTypeError,
           "Column " & $col & ": unexpected binary length " & $clen & " for int2",
         )
-      return $int16((uint16(b[off]) shl 8) or uint16(b[off + 1]))
+      return $fromBE16(b, off)
     of 23: # int4
       if clen != 4:
         raise newException(
           PgTypeError,
           "Column " & $col & ": unexpected binary length " & $clen & " for int4",
         )
-      return $int32(
-        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-          (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-      )
+      return $fromBE32(b, off)
     of 20: # int8
       if clen != 8:
         raise newException(
           PgTypeError,
           "Column " & $col & ": unexpected binary length " & $clen & " for int8",
         )
-      return $int64(
-        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
-          (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
-          (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
-          (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
-      )
+      return $fromBE64(b, off)
     of 700: # float4
       if clen != 4:
         raise newException(
           PgTypeError,
           "Column " & $col & ": unexpected binary length " & $clen & " for float4",
         )
-      let bits = uint32(
-        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-          (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-      )
-      return $cast[float32](bits)
+      return $decodeFloat32BE(b, off)
     of 701: # float8
       if clen != 8:
         raise newException(
           PgTypeError,
           "Column " & $col & ": unexpected binary length " & $clen & " for float8",
         )
-      let bits = uint64(
-        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
-          (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
-          (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
-          (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
-      )
-      return $cast[float64](bits)
+      return $decodeFloat64BE(b, off)
     of OidNumeric:
       raiseIfBadNumericBinary(col, clen)
       return $decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
@@ -207,14 +189,9 @@ proc getInt*(row: Row, col: int): int32 =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 4:
-      let b = row.data.buf
-      return int32(
-        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-          (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-      )
+      return fromBE32(row.data.buf, off)
     elif clen == 2:
-      let b = row.data.buf
-      return int32(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
+      return int32(fromBE16(row.data.buf, off))
     else:
       raise newException(
         PgTypeError,
@@ -243,8 +220,7 @@ proc getInt16*(row: Row, col: int): int16 =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 2:
-      let b = row.data.buf
-      return int16((uint16(b[off]) shl 8) or uint16(b[off + 1]))
+      return fromBE16(row.data.buf, off)
     else:
       raise newException(
         PgTypeError,
@@ -270,24 +246,11 @@ proc getInt64*(row: Row, col: int): int64 =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 8:
-      let b = row.data.buf
-      return int64(
-        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
-          (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
-          (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
-          (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
-      )
+      return fromBE64(row.data.buf, off)
     elif clen == 4:
-      let b = row.data.buf
-      return int64(
-        int32(
-          (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-            (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-        )
-      )
+      return int64(fromBE32(row.data.buf, off))
     elif clen == 2:
-      let b = row.data.buf
-      return int64(int16((uint16(b[off]) shl 8) or uint16(b[off + 1])))
+      return int64(fromBE16(row.data.buf, off))
     else:
       raise newException(
         PgTypeError,
@@ -309,19 +272,9 @@ proc getFloat*(row: Row, col: int): float64 =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 8:
-      let b = row.data.buf
-      let bits =
-        (uint64(b[off]) shl 56) or (uint64(b[off + 1]) shl 48) or
-        (uint64(b[off + 2]) shl 40) or (uint64(b[off + 3]) shl 32) or
-        (uint64(b[off + 4]) shl 24) or (uint64(b[off + 5]) shl 16) or
-        (uint64(b[off + 6]) shl 8) or uint64(b[off + 7])
-      return cast[float64](bits)
+      return decodeFloat64BE(row.data.buf, off)
     elif clen == 4:
-      let b = row.data.buf
-      let bits =
-        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-        (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-      return float64(cast[float32](bits))
+      return float64(decodeFloat32BE(row.data.buf, off))
     else:
       raise newException(
         PgTypeError,
@@ -341,11 +294,7 @@ proc getFloat32*(row: Row, col: int): float32 =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 4:
-      let b = row.data.buf
-      let bits =
-        (uint32(b[off]) shl 24) or (uint32(b[off + 1]) shl 16) or
-        (uint32(b[off + 2]) shl 8) or uint32(b[off + 3])
-      return cast[float32](bits)
+      return decodeFloat32BE(row.data.buf, off)
     else:
       raise newException(
         PgTypeError,
@@ -1060,15 +1009,9 @@ proc getFloatArray*(row: Row, col: int): seq[float64] =
       if e.len == -1:
         raise newException(PgTypeError, "NULL element in float array")
       if e.len == 4:
-        result[i] = float64(
-          cast[float32](cast[uint32](fromBE32(
-            row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-          )))
-        )
+        result[i] = float64(decodeFloat32BE(row.data.buf, off + e.off))
       elif e.len == 8:
-        result[i] = cast[float64](cast[uint64](fromBE64(
-          row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-        )))
+        result[i] = decodeFloat64BE(row.data.buf, off + e.off)
       else:
         raise newException(
           PgTypeError, "Unexpected binary element length " & $e.len & " for float array"
@@ -1098,9 +1041,7 @@ proc getFloat32Array*(row: Row, col: int): seq[float32] =
           PgTypeError,
           "Unexpected binary element length " & $e.len & " for float32 array",
         )
-      result[i] = cast[float32](cast[uint32](fromBE32(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )))
+      result[i] = decodeFloat32BE(row.data.buf, off + e.off)
     return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
@@ -1777,19 +1718,9 @@ proc getFloatArrayElemOpt*(row: Row, col: int): seq[Option[float64]] =
       if e.len == -1:
         result[i] = none(float64)
       elif e.len == 4:
-        result[i] = some(
-          float64(
-            cast[float32](cast[uint32](fromBE32(
-              row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-            )))
-          )
-        )
+        result[i] = some(float64(decodeFloat32BE(row.data.buf, off + e.off)))
       elif e.len == 8:
-        result[i] = some(
-          cast[float64](cast[uint64](fromBE64(
-            row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-          )))
-        )
+        result[i] = some(decodeFloat64BE(row.data.buf, off + e.off))
       else:
         raise newException(
           PgTypeError, "Unexpected binary element length " & $e.len & " for float array"
@@ -1819,11 +1750,7 @@ proc getFloat32ArrayElemOpt*(row: Row, col: int): seq[Option[float32]] =
           "Unexpected binary element length " & $e.len & " for float32 array",
         )
       else:
-        result[i] = some(
-          cast[float32](cast[uint32](fromBE32(
-            row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-          )))
-        )
+        result[i] = some(decodeFloat32BE(row.data.buf, off + e.off))
     return
   let s = row.getStr(col)
   for e in parseTextArray(s):
@@ -1949,14 +1876,14 @@ proc decodePgArrayElement*(
 ): float32 {.inline.} =
   if buf.len != 4:
     raise newException(PgTypeError, "float4 array element: bad length " & $buf.len)
-  cast[float32](cast[uint32](fromBE32(buf)))
+  decodeFloat32BE(buf)
 
 proc decodePgArrayElement*(
     _: typedesc[float64], buf: openArray[byte]
 ): float64 {.inline.} =
   if buf.len != 8:
     raise newException(PgTypeError, "float8 array element: bad length " & $buf.len)
-  cast[float64](cast[uint64](fromBE64(buf)))
+  decodeFloat64BE(buf)
 
 proc decodePgArrayElement*(_: typedesc[bool], buf: openArray[byte]): bool {.inline.} =
   if buf.len != 1:
