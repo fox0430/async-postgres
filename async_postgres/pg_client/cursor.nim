@@ -277,11 +277,31 @@ template withCursor*(
 ) =
   ## Open a cursor, execute `body`, then close the cursor automatically.
   ## The cursor is available as `cursorName` inside the body.
+  ##
+  ## A failure in the automatic `close` never masks an exception raised by
+  ## `body`: the body error is captured and re-raised after the close attempt.
+  ## (A `finally` block cannot be used here because an `await` inside `finally`
+  ## clobbers the in-flight exception under asyncdispatch, silently discarding
+  ## the body's error.) If `body` succeeds, a close failure propagates to the
+  ## caller.
   let cursorName =
     await conn.openCursor(sql, chunkSize = chunks, timeout = cursorTimeout)
+  var bodyErr: ref CatchableError = nil
   try:
     body
-  finally:
+  except CatchableError as e:
+    bodyErr = e
+
+  if bodyErr != nil:
+    # Body failed: still close the cursor, but never let a close failure mask
+    # the original error.
+    try:
+      await cursorName.close()
+    except CatchableError:
+      discard
+    raise bodyErr
+  else:
+    # Body succeeded: surface any close failure to the caller.
     await cursorName.close()
 
 proc openCursor*(
