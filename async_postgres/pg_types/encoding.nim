@@ -703,47 +703,41 @@ proc toPgBinaryParam*(v: PgInterval): PgParam =
   data.writeIntervalAt(0, v)
   PgParam(oid: OidInterval, format: 1, value: some(data))
 
+proc encodeInetBinary*(address: IpAddress, mask: uint8, isCidr: bool): seq[byte] =
+  ## Encode PostgreSQL binary inet/cidr format:
+  ##   ``family(1) + bits(1) + is_cidr(1) + addrlen(1) + addr(4|16)``.
+  ## Shared by ``inet`` and ``cidr`` (which differ only in the ``is_cidr``
+  ## byte and OID); mirrors ``decodeInetBinary`` on the decode side, which
+  ## ignores ``is_cidr`` on the way back.
+  let cidrByte = if isCidr: 1'u8 else: 0'u8
+  if address.family == IpAddressFamily.IPv4:
+    result = newSeq[byte](8)
+    result[0] = 2 # AF_INET
+    result[1] = mask
+    result[2] = cidrByte
+    result[3] = 4 # addrlen
+    for i in 0 ..< 4:
+      result[4 + i] = address.address_v4[i]
+  else:
+    result = newSeq[byte](20)
+    result[0] = 3 # AF_INET6
+    result[1] = mask
+    result[2] = cidrByte
+    result[3] = 16 # addrlen
+    for i in 0 ..< 16:
+      result[4 + i] = address.address_v6[i]
+
 proc toPgBinaryParam*(v: PgInet): PgParam =
   ## Binary format: family(1) + bits(1) + is_cidr(1) + addrlen(1) + addr(4|16)
-  if v.address.family == IpAddressFamily.IPv4:
-    var data = newSeq[byte](8)
-    data[0] = 2 # AF_INET
-    data[1] = v.mask
-    data[2] = 0 # is_cidr = false
-    data[3] = 4 # addrlen
-    for i in 0 ..< 4:
-      data[4 + i] = v.address.address_v4[i]
-    PgParam(oid: OidInet, format: 1, value: some(data))
-  else:
-    var data = newSeq[byte](20)
-    data[0] = 3 # AF_INET6
-    data[1] = v.mask
-    data[2] = 0 # is_cidr = false
-    data[3] = 16 # addrlen
-    for i in 0 ..< 16:
-      data[4 + i] = v.address.address_v6[i]
-    PgParam(oid: OidInet, format: 1, value: some(data))
+  PgParam(
+    oid: OidInet, format: 1, value: some(encodeInetBinary(v.address, v.mask, false))
+  )
 
 proc toPgBinaryParam*(v: PgCidr): PgParam =
   ## Binary format: family(1) + bits(1) + is_cidr(1) + addrlen(1) + addr(4|16)
-  if v.address.family == IpAddressFamily.IPv4:
-    var data = newSeq[byte](8)
-    data[0] = 2 # AF_INET
-    data[1] = v.mask
-    data[2] = 1 # is_cidr = true
-    data[3] = 4 # addrlen
-    for i in 0 ..< 4:
-      data[4 + i] = v.address.address_v4[i]
-    PgParam(oid: OidCidr, format: 1, value: some(data))
-  else:
-    var data = newSeq[byte](20)
-    data[0] = 3 # AF_INET6
-    data[1] = v.mask
-    data[2] = 1 # is_cidr = true
-    data[3] = 16 # addrlen
-    for i in 0 ..< 16:
-      data[4 + i] = v.address.address_v6[i]
-    PgParam(oid: OidCidr, format: 1, value: some(data))
+  PgParam(
+    oid: OidCidr, format: 1, value: some(encodeInetBinary(v.address, v.mask, true))
+  )
 
 proc writeMacAt(buf: var openArray[byte], pos: int, s: string, n: int, label: string) =
   ## Write ``n`` raw MAC octets parsed from ``s`` at ``buf[pos ..< pos + n]``.
@@ -919,15 +913,20 @@ proc toPgByteaArrayParam*(v: seq[seq[byte]]): PgParam =
     value: some(encodeBinaryArray(OidBytea, dimsFor1D(v.len), elements)),
   )
 
+proc encodeJsonbBinary*(node: JsonNode): seq[byte] =
+  ## Encode a JsonNode as PostgreSQL jsonb binary format: a leading ``0x01``
+  ## version byte followed by the JSON text. Mirrors the decode side
+  ## (``getJson`` strips the version byte when ``elemOid == OidJsonb``).
+  let jsonBytes = toBytes($node)
+  result = newSeq[byte](1 + jsonBytes.len)
+  result[0] = 1 # jsonb version byte
+  for j in 0 ..< jsonBytes.len:
+    result[j + 1] = jsonBytes[j]
+
 proc toPgParam*(v: seq[JsonNode]): PgParam =
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, x in v:
-    let jsonBytes = toBytes($x)
-    var data = newSeq[byte](1 + jsonBytes.len)
-    data[0] = 1 # jsonb version byte
-    for j in 0 ..< jsonBytes.len:
-      data[j + 1] = jsonBytes[j]
-    elements[i] = some(data)
+    elements[i] = some(encodeJsonbBinary(x))
   PgParam(
     oid: OidJsonbArray,
     format: 1,
@@ -1015,12 +1014,7 @@ proc toPgBinaryParam*(v: PgCircle): PgParam =
   PgParam(oid: OidCircle, format: 1, value: some(data))
 
 proc toPgBinaryParam*(v: JsonNode): PgParam =
-  let jsonBytes = toBytes($v)
-  var data = newSeq[byte](1 + jsonBytes.len)
-  data[0] = 1 # jsonb version byte
-  for i in 0 ..< jsonBytes.len:
-    data[i + 1] = jsonBytes[i]
-  PgParam(oid: OidJsonb, format: 1, value: some(data))
+  PgParam(oid: OidJsonb, format: 1, value: some(encodeJsonbBinary(v)))
 
 # Geometric array encoders
 
@@ -1284,7 +1278,7 @@ proc pgArrayArrayOid*(_: typedesc[PgInet]): int32 =
   OidInetArray
 
 proc encodePgArrayElement*(v: PgInet): seq[byte] =
-  toPgBinaryParam(v).value.get
+  encodeInetBinary(v.address, v.mask, false)
 
 proc pgArrayElemOid*(_: typedesc[PgCidr]): int32 =
   OidCidr
@@ -1293,7 +1287,7 @@ proc pgArrayArrayOid*(_: typedesc[PgCidr]): int32 =
   OidCidrArray
 
 proc encodePgArrayElement*(v: PgCidr): seq[byte] =
-  toPgBinaryParam(v).value.get
+  encodeInetBinary(v.address, v.mask, true)
 
 proc pgArrayElemOid*(_: typedesc[PgMacAddr]): int32 =
   OidMacAddr
@@ -1392,11 +1386,7 @@ proc pgArrayArrayOid*(_: typedesc[JsonNode]): int32 =
   OidJsonbArray
 
 proc encodePgArrayElement*(v: JsonNode): seq[byte] =
-  let jsonBytes = toBytes($v)
-  result = newSeq[byte](1 + jsonBytes.len)
-  result[0] = 1 # jsonb version byte
-  for j in 0 ..< jsonBytes.len:
-    result[j + 1] = jsonBytes[j]
+  encodeJsonbBinary(v)
 
 # Fixed-width registry: element byte width plus a write-in-place primitive for
 # the types whose binary form is a compile-time constant size. The generic
