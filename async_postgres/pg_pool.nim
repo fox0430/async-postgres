@@ -605,15 +605,37 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
 
   try:
     pool.cachedNow = Moment.now()
+    # Open all `minSize` connections concurrently. `allFutures` waits for
+    # every connect to settle (success or failure) without short-circuiting,
+    # so a failure in one does not abandon the others mid-handshake — the
+    # server observes a clean Terminate for each socket that did come up.
+    # Successful connections are parked in `idle`; the first failure (if any)
+    # is raised so the except branch closes the ones that succeeded.
+    var connectFuts: seq[Future[PgConnection]]
     for i in 0 ..< cfg.minSize:
-      let conn = await connect(cfg.connConfig)
-      conn.ownerPool = pool
-      pool.metrics.createCount.inc
-      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+      connectFuts.add(connect(cfg.connConfig))
+    await allFutures(connectFuts)
+    var firstErr: ref CatchableError = nil
+    for f in connectFuts:
+      if f.failed():
+        if firstErr == nil:
+          # `connect` only raises `CatchableError`, so the stored exception is
+          # always safe to downcast from `ref Exception` (asyncdispatch) /
+          # `ref CatchableError` (chronos) to the typed `ref CatchableError`.
+          firstErr = cast[ref CatchableError](f.error)
+      else:
+        let conn = f.read()
+        conn.ownerPool = pool
+        pool.metrics.createCount.inc
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+    if firstErr != nil:
+      raise firstErr
   except CatchableError as e:
+    var closeFuts: seq[Future[void]]
     while pool.idle.len > 0:
       let pc = pool.idle.popFirst()
-      await pool.tracedClose(pc.conn)
+      closeFuts.add(pool.tracedClose(pc.conn))
+    await allFutures(closeFuts)
     raise e
 
   pool.maintenanceTask = maintenanceLoop(pool)
@@ -2051,11 +2073,15 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     while pool.active > 0 and Moment.now() < deadline:
       await sleepAsync(milliseconds(50))
 
-  # Close all idle connections
+  # Close all idle connections in parallel. `tracedClose` swallows its own
+  # errors (routing them to the tracer), so a failure in one close does not
+  # short-circuit the rest or escape this proc.
+  var closeFuts: seq[Future[void]]
   while pool.idle.len > 0:
     let pc = pool.idle.popFirst()
     pool.metrics.closeCount.inc
-    await pool.tracedClose(pc.conn)
+    closeFuts.add(pool.tracedClose(pc.conn))
+  await allFutures(closeFuts)
 
   # Yield once after closing idle connections and before draining background
   # tasks, but only when a borrow is still outstanding. A conn handed off to a

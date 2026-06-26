@@ -2801,3 +2801,118 @@ suite "Pool replenish close-race":
         await closeServer(ms)
 
       waitFor t()
+
+suite "Pool warmup parallelization":
+  test "newPool opens minSize connections in parallel":
+    # `newPool` should open all `minSize` connections concurrently (via
+    # `allFutures`), not sequentially. The server handler accepts that many
+    # handshakes; if warmup were serial this would still pass, so the assertion
+    # is on the count and createCount rather than timing — but the parallel
+    # path is what makes the open non-blocking under concurrent handshakes.
+    var idleAfter = -1
+    var createCount: int64 = -1
+
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        var clients: seq[MockClient]
+        for i in 0 ..< 3:
+          try:
+            clients.add(await acceptAndReady(ms))
+          except CatchableError:
+            break
+        await sleepAsync(milliseconds(100))
+        for c in clients:
+          await closeClient(c)
+
+      let serverFut = serverHandler()
+      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 3, maxSize = 5)
+      let pool = await newPool(cfg)
+      idleAfter = pool.idle.len
+      createCount = pool.metrics.createCount
+      await pool.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor t()
+    check idleAfter == 3
+    check createCount == 3
+
+  test "newPool raises when all initial connects fail":
+    # When every warmup connect fails, `newPool` must raise the first error
+    # (and the empty-idle cleanup loop is a no-op). Connects target a port we
+    # freed by closing a mock server so they get ECONNREFUSED.
+    var raised = false
+
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let freePort = ms.port
+      await closeServer(ms)
+      var cfg = initPoolConfig(
+        ConnConfig(
+          host: "127.0.0.1",
+          port: freePort,
+          user: "t",
+          database: "t",
+          sslMode: sslDisable,
+        ),
+        minSize = 2,
+        maxSize = 5,
+      )
+      cfg.connConfig.connectTimeout = milliseconds(300)
+      try:
+        discard await newPool(cfg)
+      except CatchableError:
+        raised = true
+
+    waitFor t()
+    check raised
+
+  test "newPool issues warmup connects concurrently (gate-based)":
+    # Prove that `newPool` opens all `minSize` connects in parallel, not
+    # serially. The server accepts client #1 and drains its startup message
+    # but withholds the handshake until client #2 also connects. If warmup
+    # were serial, client #2's connect would never start while #1's handshake
+    # is pending — the second `accept` would hang until `connectTimeout` fires
+    # and `newPool` would raise. With parallel warmup both TCP connections are
+    # up immediately, the server sees #2, both handshakes complete, and
+    # `newPool` returns within the timeout.
+    var ok = true
+    var idleAfter = -1
+
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        var clients: seq[MockClient]
+        try:
+          let c1 = await ms.accept()
+          clients.add(c1)
+          await drainStartupMessage(c1)
+          # Gate: withhold c1's handshake until c2 also connects. Under serial
+          # warmup this accept never completes and the test fails via timeout.
+          let c2 = await ms.accept()
+          clients.add(c2)
+          await drainStartupMessage(c2)
+          await sendFullHandshake(c1)
+          await sendFullHandshake(c2)
+        except CatchableError:
+          discard
+        for c in clients:
+          try: await closeClient(c)
+          except CatchableError: discard
+
+      let serverFut = serverHandler()
+      var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 4)
+      cfg.connConfig.connectTimeout = milliseconds(500)
+      try:
+        let pool = await newPool(cfg)
+        idleAfter = pool.idle.len
+        await pool.close()
+      except CatchableError:
+        ok = false
+      await closeServer(ms)
+      await serverFut
+
+    waitFor t()
+    check ok
+    check idleAfter == 2
