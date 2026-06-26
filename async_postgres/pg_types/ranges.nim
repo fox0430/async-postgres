@@ -1,4 +1,4 @@
-import std/[options, strutils, times, math]
+import std/[options, strutils, times]
 
 import ../pg_protocol
 import ./core
@@ -413,15 +413,13 @@ proc toPgRangeParam*[T](v: PgRange[T], oid: int32): PgParam =
 # Binary encoding helpers
 
 proc encodeBinaryTimestamp(dt: DateTime): seq[byte] =
-  let t = dt.toTime()
-  let pgUs =
-    t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000) - pgEpochUnix * 1_000_000
-  @(toBE64(pgUs))
+  ## Shares the epoch math with ``encoding.pgTimestampMicros`` so the range and
+  ## scalar/array timestamp paths cannot drift.
+  @(toBE64(pgTimestampMicros(dt)))
 
 proc encodeBinaryDate(dt: DateTime): seq[byte] =
-  let t = dt.toTime()
-  let pgDays = int32(floorDiv(t.toUnix(), 86400'i64) - int64(pgEpochDaysOffset))
-  @(toBE32(pgDays))
+  ## Shares the epoch math with ``encoding.pgDateDays`` (see above).
+  @(toBE32(pgDateDays(dt)))
 
 proc encodeRangeBinary[T](
     v: PgRange[T], oid: int32, encodeBound: proc(v: T): seq[byte]
