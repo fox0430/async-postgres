@@ -2898,8 +2898,10 @@ suite "Pool warmup parallelization":
         except CatchableError:
           discard
         for c in clients:
-          try: await closeClient(c)
-          except CatchableError: discard
+          try:
+            await closeClient(c)
+          except CatchableError:
+            discard
 
       let serverFut = serverHandler()
       var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 4)
