@@ -319,24 +319,19 @@ func isBinarySafeOid*(oid: int32): bool =
 
 # Byte-level helpers
 
-proc encodeInt16*(val: int16): array[2, byte] =
+proc encodeInt16*(val: int16): array[2, byte] {.inline.} =
   ## Encode a 16-bit integer as big-endian bytes.
-  result[0] = byte((val shr 8) and 0xFF)
-  result[1] = byte(val and 0xFF)
+  toBE16(val)
 
-proc encodeInt32*(val: int32): array[4, byte] =
+proc encodeInt32*(val: int32): array[4, byte] {.inline.} =
   ## Encode a 32-bit integer as big-endian bytes.
-  result[0] = byte((val shr 24) and 0xFF)
-  result[1] = byte((val shr 16) and 0xFF)
-  result[2] = byte((val shr 8) and 0xFF)
-  result[3] = byte(val and 0xFF)
+  toBE32(val)
 
 proc addInt16*(buf: var seq[byte], val: int16) =
   ## Append a 16-bit integer in big-endian format to the buffer.
   let oldLen = buf.len
   buf.setLen(oldLen + 2)
-  buf[oldLen] = byte((val shr 8) and 0xFF)
-  buf[oldLen + 1] = byte(val and 0xFF)
+  buf.writeBE16(oldLen, val)
 
 proc addCount16*(buf: var seq[byte], n: int, what: string) =
   ## Append an Int16 count field, rejecting counts that overflow the wire's
@@ -361,10 +356,7 @@ proc addInt32*(buf: var seq[byte], val: int32) =
   ## Append a 32-bit integer in big-endian format to the buffer.
   let oldLen = buf.len
   buf.setLen(oldLen + 4)
-  buf[oldLen] = byte((val shr 24) and 0xFF)
-  buf[oldLen + 1] = byte((val shr 16) and 0xFF)
-  buf[oldLen + 2] = byte((val shr 8) and 0xFF)
-  buf[oldLen + 3] = byte(val and 0xFF)
+  buf.writeBE32(oldLen, val)
 
 proc addLen32*(buf: var seq[byte], n: int, what: string) =
   ## Append an Int32 length field, rejecting payloads that overflow the wire's
@@ -389,14 +381,7 @@ proc addInt64*(buf: var seq[byte], val: int64) =
   ## Append a 64-bit integer in big-endian format to the buffer.
   let oldLen = buf.len
   buf.setLen(oldLen + 8)
-  buf[oldLen] = byte((val shr 56) and 0xFF)
-  buf[oldLen + 1] = byte((val shr 48) and 0xFF)
-  buf[oldLen + 2] = byte((val shr 40) and 0xFF)
-  buf[oldLen + 3] = byte((val shr 32) and 0xFF)
-  buf[oldLen + 4] = byte((val shr 24) and 0xFF)
-  buf[oldLen + 5] = byte((val shr 16) and 0xFF)
-  buf[oldLen + 6] = byte((val shr 8) and 0xFF)
-  buf[oldLen + 7] = byte(val and 0xFF)
+  buf.writeBE64(oldLen, val)
 
 proc patchLen*(buf: var seq[byte], offset: int = 1) =
   ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
@@ -416,10 +401,7 @@ proc patchLen*(buf: var seq[byte], offset: int = 1) =
         $maxInt32Len,
     )
   let length = int32(buf.high)
-  buf[offset] = byte((length shr 24) and 0xFF)
-  buf[offset + 1] = byte((length shr 16) and 0xFF)
-  buf[offset + 2] = byte((length shr 8) and 0xFF)
-  buf[offset + 3] = byte(length and 0xFF)
+  buf.writeBE32(offset, length)
 
 proc patchMsgLen*(buf: var seq[byte], msgStart: int) =
   ## Patch the length field of a message starting at `msgStart`.
@@ -440,10 +422,7 @@ proc patchMsgLen*(buf: var seq[byte], msgStart: int) =
         " exceeds Int32 maximum of " & $maxInt32Len,
     )
   let length = int32(buf.len - msgStart - 1)
-  buf[msgStart + 1] = byte((length shr 24) and 0xFF)
-  buf[msgStart + 2] = byte((length shr 16) and 0xFF)
-  buf[msgStart + 3] = byte((length shr 8) and 0xFF)
-  buf[msgStart + 4] = byte(length and 0xFF)
+  buf.writeBE32(msgStart + 1, length)
 
 proc addCString*(buf: var seq[byte], s: string) =
   ## Append a null-terminated C string to the buffer.
@@ -462,23 +441,17 @@ proc addCString*(buf: var seq[byte], s: string) =
     buf.writeBytesAt(oldLen, s.toOpenArrayByte(0, s.high))
   buf[oldLen + s.len] = 0'u8
 
-proc decodeInt16*(buf: openArray[byte], offset: int): int16 =
+proc decodeInt16*(buf: openArray[byte], offset: int): int16 {.inline.} =
   ## Decode a 16-bit integer from big-endian bytes at the given offset.
-  result = int16(buf[offset]) shl 8 or int16(buf[offset + 1])
+  fromBE16(buf, offset)
 
-proc decodeInt32*(buf: openArray[byte], offset: int): int32 =
+proc decodeInt32*(buf: openArray[byte], offset: int): int32 {.inline.} =
   ## Decode a 32-bit integer from big-endian bytes at the given offset.
-  result =
-    int32(buf[offset]) shl 24 or int32(buf[offset + 1]) shl 16 or
-    int32(buf[offset + 2]) shl 8 or int32(buf[offset + 3])
+  fromBE32(buf, offset)
 
-proc decodeInt64*(buf: openArray[byte], offset: int): int64 =
+proc decodeInt64*(buf: openArray[byte], offset: int): int64 {.inline.} =
   ## Decode a 64-bit integer from big-endian bytes at the given offset.
-  result =
-    int64(buf[offset]) shl 56 or int64(buf[offset + 1]) shl 48 or
-    int64(buf[offset + 2]) shl 40 or int64(buf[offset + 3]) shl 32 or
-    int64(buf[offset + 4]) shl 24 or int64(buf[offset + 5]) shl 16 or
-    int64(buf[offset + 6]) shl 8 or int64(buf[offset + 7])
+  fromBE64(buf, offset)
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at the given offset. Returns (string, bytes consumed).
@@ -784,10 +757,7 @@ proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
   let oldLen = buf.len
   buf.setLen(oldLen + 5 + data.len)
   buf[oldLen] = byte('d')
-  buf[oldLen + 1] = byte((msgLen shr 24) and 0xFF)
-  buf[oldLen + 2] = byte((msgLen shr 16) and 0xFF)
-  buf[oldLen + 3] = byte((msgLen shr 8) and 0xFF)
-  buf[oldLen + 4] = byte(msgLen and 0xFF)
+  buf.writeBE32(oldLen + 1, msgLen)
   buf.writeBytesAt(oldLen + 5, data)
 
 proc encodeCopyDone*(): seq[byte] =
@@ -1132,9 +1102,7 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
       rd.buf.setLen(bufBase)
       raise newException(PgProtocolError, "DataRow: unexpected end of data")
     # Decode column length from copied buffer (big-endian int32)
-    let colLen =
-      int32(rd.buf[pos]) shl 24 or int32(rd.buf[pos + 1]) shl 16 or
-      int32(rd.buf[pos + 2]) shl 8 or int32(rd.buf[pos + 3])
+    let colLen = fromBE32(rd.buf, pos)
     pos += 4
     let ci = cellBase + int(i) * 2
     if colLen < -1:

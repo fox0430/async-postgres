@@ -194,20 +194,8 @@ proc decodePointBinary*(data: openArray[byte], off: int): PgPoint =
   ## Decode a point from 16 bytes at offset.
   if off < 0 or off + 16 > data.len:
     raise newException(PgTypeError, "Binary point data truncated at offset " & $off)
-  let xBits = uint64(
-    (uint64(data[off]) shl 56) or (uint64(data[off + 1]) shl 48) or
-      (uint64(data[off + 2]) shl 40) or (uint64(data[off + 3]) shl 32) or
-      (uint64(data[off + 4]) shl 24) or (uint64(data[off + 5]) shl 16) or
-      (uint64(data[off + 6]) shl 8) or uint64(data[off + 7])
-  )
-  let yBits = uint64(
-    (uint64(data[off + 8]) shl 56) or (uint64(data[off + 9]) shl 48) or
-      (uint64(data[off + 10]) shl 40) or (uint64(data[off + 11]) shl 32) or
-      (uint64(data[off + 12]) shl 24) or (uint64(data[off + 13]) shl 16) or
-      (uint64(data[off + 14]) shl 8) or uint64(data[off + 15])
-  )
-  result.x = cast[float64](xBits)
-  result.y = cast[float64](yBits)
+  result.x = decodeFloat64BE(data, off)
+  result.y = decodeFloat64BE(data, off + 8)
 
 proc decodeBinaryArray*(
     data: openArray[byte]
