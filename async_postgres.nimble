@@ -8,7 +8,7 @@ license = "MIT"
 # Dependencies
 
 requires "nim >= 2.2.4"
-requires "nimcrypto >= 0.6.0"
+requires "nimcrypto >= 0.7.3"
 requires "checksums >= 0.2.2"
 
 task test, "test":
