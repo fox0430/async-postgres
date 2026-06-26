@@ -7905,6 +7905,49 @@ suite "toPgMoneyArrayNDParam":
     check fromBE32(data.toOpenArray(0, 3)) == 0'i32 # ndim=0
     check data.len == 12
 
+suite "toPgMoneyArrayParam":
+  test "toPgParam seq[PgMoney] default scale=2 roundtrip":
+    let values = @[initPgMoney(100), initPgMoney(-50), initPgMoney(999999)]
+    let p = toPgParam(values)
+    check p.oid == OidMoneyArray
+    check p.format == 1
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getMoneyArray(0) == values
+
+  test "toPgParam seq[PgMoney] rejects non-default element scale":
+    # The bare toPgParam path declares scale=2; a scale-0 element would be
+    # silently encoded as the wrong money value, so it must be rejected.
+    expect PgError:
+      discard toPgParam(@[initPgMoney(100), initPgMoney(50, scale = 0)])
+
+  test "toPgMoneyArrayParam honors explicit scale=0 roundtrip":
+    let values = @[initPgMoney(100, scale = 0), initPgMoney(-50, scale = 0)]
+    let p = toPgMoneyArrayParam(values, scale = 0)
+    check p.oid == OidMoneyArray
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getMoneyArray(0, scale = 0) == values
+
+  test "toPgMoneyArrayParam rejects element scale mismatch":
+    let values = @[initPgMoney(1, scale = 2), initPgMoney(2, scale = 3)]
+    expect PgError:
+      discard toPgMoneyArrayParam(values, scale = 2)
+
+  test "toPgMoneyArrayParam rejects bad scale argument":
+    let values = @[initPgMoney(1)]
+    expect PgError:
+      discard toPgMoneyArrayParam(values, scale = -1)
+    expect PgError:
+      discard toPgMoneyArrayParam(values, scale = 19)
+
+  test "toPgMoneyArrayParam empty array":
+    let p = toPgMoneyArrayParam(newSeq[PgMoney]())
+    check p.oid == OidMoneyArray
+    let data = p.value.get
+    check fromBE32(data.toOpenArray(0, 3)) == 0'i32 # ndim=0
+    check data.len == 12
+
 suite "PgArray[T] elemOid validation":
   test "getArrayND[int32] rejects text[] column":
     # Encode a text[] payload, try to read as int32[].

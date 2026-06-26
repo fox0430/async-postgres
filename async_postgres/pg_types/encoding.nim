@@ -825,7 +825,49 @@ genArrayEncoder(PgInet, OidInetArray, OidInet)
 genArrayEncoder(PgCidr, OidCidrArray, OidCidr)
 genArrayEncoder(PgMacAddr, OidMacAddrArray, OidMacAddr)
 genArrayEncoder(PgMacAddr8, OidMacAddr8Array, OidMacAddr8)
-genArrayEncoder(PgMoney, OidMoneyArray, OidMoney)
+
+# ``PgMoney`` is intentionally not routed through ``genArrayEncoder``: the
+# generated encoder would send each element's raw ``amount`` and silently drop
+# its ``scale``. ``money``'s binary wire format carries only the integer amount,
+# so the fractional-digit count (``frac_digits``) is fixed by the server's
+# ``lc_monetary``. A ``seq[PgMoney]`` with mixed scales — or a scale that
+# disagrees with the server — would otherwise be encoded into a silently wrong
+# ``money[]``. The dedicated encoders below validate ``scale`` instead, mirroring
+# ``toPgMoneyArrayNDParam`` (N-D) and ``getMoneyArray`` (decode).
+proc toPgMoneyArrayParam*(v: seq[PgMoney], scale: int = 2): PgParam =
+  ## 1-D counterpart to ``toPgMoneyArrayNDParam`` and encoder counterpart to
+  ## ``getMoneyArray``. ``scale`` declares the ``frac_digits`` the caller's
+  ## ``PgMoney.amount`` values are scaled for (the server's ``lc_monetary``),
+  ## and every element's ``scale`` field must match it — otherwise a silent
+  ## value mismatch on the server is likely.
+  ##
+  ## Raises ``PgError`` when ``scale`` is outside ``0..18`` or when any
+  ## element's ``scale`` differs from the parameter.
+  if scale < 0 or scale > 18:
+    raise newException(PgError, "PgMoney scale out of range: " & $scale)
+  var elements = newSeq[Option[seq[byte]]](v.len)
+  for i, m in v:
+    if int(m.scale) != scale:
+      raise newException(
+        PgError,
+        "PgMoney array element[" & $i & "].scale=" & $m.scale &
+          " does not match declared scale=" & $scale &
+          " (server lc_monetary frac_digits)",
+      )
+    elements[i] = some(@(toBE64(m.amount)))
+  PgParam(
+    oid: OidMoneyArray,
+    format: 1,
+    value: some(encodeBinaryArray(OidMoney, dimsFor1D(v.len), elements)),
+  )
+
+proc toPgParam*(v: seq[PgMoney]): PgParam =
+  ## Encode a ``seq[PgMoney]`` as a ``money[]`` binary parameter using the
+  ## default ``scale = 2`` (matching ``getMoneyArray``'s default). Every
+  ## element's ``scale`` must be ``2``; for other ``lc_monetary`` locales use
+  ## ``toPgMoneyArrayParam(v, scale = ...)`` to declare the server's
+  ## ``frac_digits`` explicitly.
+  toPgMoneyArrayParam(v, scale = 2)
 
 # Numeric / binary / JSON array encoders
 
