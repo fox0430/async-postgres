@@ -9,7 +9,7 @@ license = "MIT"
 
 requires "nim >= 2.2.4"
 requires "nimcrypto >= 0.6.0"
-requires "checksums >= 0.2.0"
+requires "checksums >= 0.2.2"
 
 task test, "test":
   exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
