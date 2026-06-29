@@ -1982,6 +1982,64 @@ suite "FIFO fairness":
     check not pool.tryHandoffToWaiter(mockConn())
     check pool.waiters.len == 0
 
+  test "failLastWaiter fails the tail and preserves the head":
+    # FIFO fairness: a spawn connect failure must not strike the head waiter,
+    # which has waited longest and keeps its claim on the next good connection.
+    # The youngest (tail) waiter absorbs the failure instead.
+    let pool = makePool()
+    let headFut = newFuture[PgConnection]("head")
+    let tailFut = newFuture[PgConnection]("tail")
+    pool.waiters.addLast(Waiter(fut: headFut, cancelled: false))
+    pool.waiters.addLast(Waiter(fut: tailFut, cancelled: false))
+    pool.waiterCount = 2
+
+    check pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+    check pool.waiterCount == 1
+    check tailFut.failed() # youngest waiter took the failure
+    check not headFut.finished() # oldest waiter still queued for delivery
+
+    # A subsequent success still goes to the head, in FIFO order.
+    let conn = mockConn()
+    check pool.tryHandoffToWaiter(conn)
+    check pool.waiterCount == 0
+    check headFut.completed()
+    check headFut.read() == conn
+
+    # Drain the stored failure so it isn't flagged as unhandled at teardown.
+    try:
+      discard tailFut.read()
+    except PgPoolError:
+      discard
+
+  test "failLastWaiter skips abandoned waiters from the back":
+    # A cancelled waiter at the tail is inert (already settled): skip it and
+    # fail the next live waiter, without touching waiterCount for the cancelled
+    # one (settleAbandonedWaiter already decremented it).
+    let pool = makePool()
+    let liveFut = newFuture[PgConnection]("live")
+    pool.waiters.addLast(Waiter(fut: liveFut, cancelled: false))
+    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("c"), cancelled: true))
+    pool.waiterCount = 1
+
+    check pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+    check pool.waiterCount == 0
+    check pool.waiters.len == 0
+    check liveFut.failed()
+
+    try:
+      discard liveFut.read()
+    except PgPoolError:
+      discard
+
+  test "failLastWaiter returns false with no live waiters":
+    let pool = makePool()
+    check not pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+
+    # All-cancelled waiters are equivalent to no waiters and get drained.
+    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("c"), cancelled: true))
+    check not pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+    check pool.waiters.len == 0
+
   test "abandoned waiter handed off on same tick does not double-decrement":
     # Regression: the timeout/cancel cleanup decremented `waiterCount`
     # unconditionally. A handoff (tryHandoffToWaiter/releaseCore) decrements and
@@ -2028,7 +2086,7 @@ suite "FIFO fairness":
     check pool.idle.len == 0 # nothing was delivered, nothing to return
 
   test "waiter failed on same tick does not double-decrement waiterCount":
-    # The fail-path sibling of the handoff race: `failNextWaiter` (spawn connect
+    # The fail-path sibling of the handoff race: `failLastWaiter` (spawn connect
     # failure or `close`) pops the waiter, decrements `waiterCount`, and *fails*
     # the future. asyncdispatch `wait()` can still surface AsyncTimeoutError on
     # the same tick when its timeout side wins the `withTimeout` race. Cleanup
@@ -2039,14 +2097,14 @@ suite "FIFO fairness":
     pool.waiters.addLast(waiter)
     pool.waiterCount.inc
 
-    # failNextWaiter pops the waiter, decrements, and fails the future.
-    check pool.failNextWaiter(newException(PgPoolError, "connect failed"))
+    # failLastWaiter pops the waiter, decrements, and fails the future.
+    check pool.failLastWaiter(newException(PgPoolError, "connect failed"))
     check pool.waiterCount == 0
     check waiter.fut.failed()
 
     # The acquire then observes a timeout/cancel on the same tick. Cleanup must
     # not decrement again; a failed future carries no conn to return. As with the
-    # handoff case, `failNextWaiter` already popped the waiter, so no `cancelled`
+    # handoff case, `failLastWaiter` already popped the waiter, so no `cancelled`
     # flag is set.
     pool.settleAbandonedWaiter(waiter)
     check pool.waiterCount == 0 # not -1
@@ -2286,7 +2344,7 @@ suite "Error type granularity":
   test "spawn connect timeout does not corrupt waiterCount":
     # Regression: a raw AsyncTimeoutError from the spawn's connectTimeout
     # used to reach the waiter's own wait-budget handler, which decremented
-    # waiterCount a second time (failNextWaiter had already done so). The
+    # waiterCount a second time (failLastWaiter had already done so). The
     # resulting negative count permanently disabled the FIFO fast path.
     proc t() {.async.} =
       # The mock server accepts TCP (listen backlog) but never answers the
