@@ -236,6 +236,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     raise newException(
       PgConnectionError, "A host name must be specified for a verified SSL connection"
     )
+  if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
+    raise newException(PgConnectionError, ClientCertPairingErrorMsg)
   let sslReq = encodeSSLRequest()
   var respChar: char
   var extraBytesBuffered = false
@@ -303,6 +305,21 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         else:
           sniName(sslHost, config.sslSni)
 
+      # ``newTLSClientAsyncStream`` stores these on ``TLSAsyncStream``
+      # (clientCertificate/clientPrivateKey) so BearSSL keeps a valid
+      # reference for the lifetime of conn.tlsStream — no extra retention
+      # on PgConnection is needed (unlike trustAnchorBufs above).
+      var clientCert: TLSCertificate
+      var clientKey: TLSPrivateKey
+      if config.sslCert.len > 0 and config.sslKey.len > 0:
+        try:
+          clientCert = TLSCertificate.init(config.sslCert)
+          clientKey = TLSPrivateKey.init(config.sslKey)
+        except TLSStreamProtocolError as e:
+          raise newException(
+            PgConnectionError, "Failed to load client certificate/key: " & e.msg
+          )
+
       if config.sslMode in {sslVerifyCa, sslVerifyFull}:
         let parsed = parseTrustAnchors(config.sslRootCert)
         conn.trustAnchorBufs = parsed.backing
@@ -315,6 +332,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
           minVersion = TLSVersion.TLS12,
           maxVersion = TLSVersion.TLS12,
           trustAnchors = parsed.store,
+          certificate = clientCert,
+          privateKey = clientKey,
         )
       else:
         # NoVerifyHost is set, so trust anchors are ignored regardless.
@@ -325,6 +344,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
           flags = flags,
           minVersion = TLSVersion.TLS12,
           maxVersion = TLSVersion.TLS12,
+          certificate = clientCert,
+          privateKey = clientKey,
         )
       installX509Capture(
         conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
@@ -336,21 +357,54 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     elif hasAsyncDispatch:
       when defined(ssl):
         var ctx: SslContext
-        var tmpPath: string
-        if config.sslMode in {sslVerifyCa, sslVerifyFull}:
-          let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
-          tmpPath = tp
+        var tmpPaths: seq[string]
+
+        # std/net's newContext only accepts cert/key/CA as filesystem paths, so
+        # each PEM is written to a private temp file (0600, O_EXCL — see
+        # createTempFile) and removed in the `finally` below. The write is
+        # wrapped so the File handle is closed even if `write` throws (otherwise
+        # the fd would leak, holding the now-unlinked key contents open).
+        proc writeTempPem(content, prefix: string): string =
+          if content.len == 0:
+            return ""
+          let (f, p) = createTempFile(prefix, ".pem")
+          tmpPaths.add(p)
           try:
-            tmpFile.write(config.sslRootCert)
-            tmpFile.close()
-            ctx = newContext(verifyMode = CVerifyPeer, caFile = tmpPath)
-          except:
-            removeFile(tmpPath)
-            raise
-        else:
-          ctx = newContext(verifyMode = CVerifyNone)
+            f.write(content)
+          finally:
+            f.close()
+          p
 
         try:
+          let caPath =
+            if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+              writeTempPem(config.sslRootCert, "pg_ca_")
+            else:
+              ""
+          let certPath = writeTempPem(config.sslCert, "pg_cert_")
+          let keyPath = writeTempPem(config.sslKey, "pg_key_")
+
+          try:
+            ctx = newContext(
+              verifyMode =
+                if config.sslMode in {sslVerifyCa, sslVerifyFull}: CVerifyPeer
+                else: CVerifyNone,
+              certFile = certPath,
+              keyFile = keyPath,
+              caFile = caPath,
+            )
+          except CatchableError as e:
+            # std/net surfaces a malformed/mismatched client cert or key (and CA
+            # load failures) as a raw SslError/IOError. Translate to
+            # PgConnectionError so the asyncdispatch backend reports cert/key
+            # problems like the chronos backend does (which wraps
+            # TLSStreamProtocolError above).
+            raise newException(
+              PgConnectionError,
+              "Failed to load client certificate/key or CA: " & e.msg,
+              e,
+            )
+
           let hostname = sniName(sslHost, config.sslSni)
           wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
           # asyncnet does no name matching and defers the handshake, so have
@@ -382,8 +436,15 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
           else:
             stderr.writeLine "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
         finally:
-          if tmpPath.len > 0:
-            removeFile(tmpPath)
+          # Each removal is wrapped so one failure does not skip the rest, but
+          # we still surface failures because tmpPaths may contain the client
+          # private key PEM — silently leaving it in /tmp would be a footgun.
+          for p in tmpPaths:
+            try:
+              removeFile(p)
+            except OSError as e:
+              stderr.writeLine "pg_connection: failed to remove temp SSL file " & p &
+                ": " & e.msg
       else:
         raise
           newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
@@ -395,5 +456,10 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     # attacker can intercept the SSLRequest and reply 'N' to force
     # plaintext. Use sslRequire or stronger if security is needed.
     stderr.writeLine "pg_connection: SSL refused by server, falling back to plaintext (sslmode=prefer)"
+    if config.sslCert.len > 0:
+      # The configured client certificate cannot be presented over a plaintext
+      # connection — make the silent mTLS drop observable (sslmode=prefer allows
+      # this fallback; use sslmode=require or stronger to enforce the cert).
+      stderr.writeLine "pg_connection: client certificate will NOT be sent over the plaintext fallback connection"
   else:
     raise newException(PgConnectionError, "Unexpected SSL response: " & $respChar)

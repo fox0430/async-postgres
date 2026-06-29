@@ -8,6 +8,8 @@
 ## (in particular, does not touch `PgConnection`).
 
 import std/[strutils, uri]
+when defined(posix):
+  import std/posix
 
 import ../[async_backend, pg_errors]
 import types
@@ -150,6 +152,61 @@ proc buildHosts(hostStr, hostaddrStr, portStr: string): seq[HostEntry] =
           parsePort(p),
     )
 
+proc validateClientCertConfig*(config: ConnConfig) =
+  ## Reject inconsistent client certificate configurations early (at config
+  ## build time, before any connection is opened). Both halves of an mTLS
+  ## credential must be present together, and the SSL mode must actually
+  ## negotiate TLS — otherwise the cert/key would be silently ignored.
+  if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
+    raise newException(PgError, ClientCertPairingErrorMsg)
+  if (config.sslCert.len > 0 or config.sslKey.len > 0) and
+      config.sslMode in {sslDisable, sslAllow}:
+    raise newException(
+      PgError,
+      "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
+        "); they would otherwise be silently unused",
+    )
+
+proc readPemFileParam(path, label: string): string =
+  ## Read a PEM parameter file (sslrootcert/sslcert), wrapping the stdlib
+  ## `IOError` into a `PgError` with the parameter name so the three sslX file
+  ## params share one read+error-wrap path.
+  try:
+    result = readFile(path)
+  except IOError:
+    raise newException(PgError, "Cannot read " & label & " file: " & path)
+
+proc readPrivateKeyFile(path: string): string =
+  ## Read an SSL private key file, rejecting it (libpq parity) when it is group-
+  ## or world-accessible. On POSIX the permission check and the read share one
+  ## file descriptor (`fstat` on the open handle, then read), so the bytes
+  ## returned are guaranteed to come from the inode that passed the check — this
+  ## closes the TOCTOU window a separate `stat()`+`readFile()` would leave open
+  ## when the key lives in an attacker-writable directory.
+  when defined(posix):
+    var f: File
+    if not open(f, path, fmRead):
+      raise newException(PgError, "Cannot read sslkey file: " & path)
+    try:
+      var st: Stat
+      if fstat(getFileHandle(f), st) != 0:
+        raise newException(PgError, "Cannot stat sslkey file: " & path)
+      if (st.st_mode.int and (S_IRWXG or S_IRWXO).int) != 0:
+        raise newException(
+          PgError,
+          "sslkey file has group or world accessible permissions, refusing to use: " &
+            path,
+        )
+      result = readAll(f)
+    finally:
+      close(f)
+  else:
+    # No POSIX permission model to check (libpq also skips this on Windows).
+    try:
+      result = readFile(path)
+    except IOError:
+      raise newException(PgError, "Cannot read sslkey file: " & path)
+
 proc applyParam*(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
   ##
@@ -194,10 +251,11 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       else:
         seconds(secs)
   of "sslrootcert":
-    try:
-      result.sslRootCert = readFile(val)
-    except IOError:
-      raise newException(PgError, "Cannot read sslrootcert file: " & val)
+    result.sslRootCert = readPemFileParam(val, "sslrootcert")
+  of "sslcert":
+    result.sslCert = readPemFileParam(val, "sslcert")
+  of "sslkey":
+    result.sslKey = readPrivateKeyFile(val)
   of "sslsni":
     try:
       result.sslSni = parseInt(val) != 0
@@ -477,6 +535,8 @@ proc initConnConfig*(
     database = "",
     sslMode = sslPrefer,
     sslRootCert = "",
+    sslCert = "",
+    sslKey = "",
     sslSni = true,
     channelBinding = cbPrefer,
     applicationName = "",
@@ -495,7 +555,7 @@ proc initConnConfig*(
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
-  ConnConfig(
+  result = ConnConfig(
     host: host,
     port: port,
     hostaddr: hostaddr,
@@ -504,6 +564,8 @@ proc initConnConfig*(
     database: database,
     sslMode: sslMode,
     sslRootCert: sslRootCert,
+    sslCert: sslCert,
+    sslKey: sslKey,
     sslSni: sslSni,
     channelBinding: channelBinding,
     applicationName: applicationName,
@@ -520,6 +582,7 @@ proc initConnConfig*(
     maxMessageSize: maxMessageSize,
     maxScramIterations: maxScramIterations,
   )
+  validateClientCertConfig(result)
 
 proc parseDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL connection string into a ConnConfig.
@@ -530,6 +593,7 @@ proc parseDsn*(dsn: string): ConnConfig =
   ##
   ## Both ``postgresql://`` and ``postgres://`` schemes are accepted for URI format.
   if dsn.startsWith("postgresql://") or dsn.startsWith("postgres://"):
-    parseUriDsn(dsn)
+    result = parseUriDsn(dsn)
   else:
-    parseKeyValueDsn(dsn)
+    result = parseKeyValueDsn(dsn)
+  validateClientCertConfig(result)

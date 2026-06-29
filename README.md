@@ -10,7 +10,7 @@ Async PostgreSQL client in Nim.
 - Pipeline mode — batch multiple operations in a single network round trip
 - Connection pooling with health checks and maintenance (broken connections discarded on acquire/release)
 - Pool cluster with read replica routing
-- SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full)
+- SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full) with optional client certificate authentication (mTLS)
 - MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
 - `channel_binding` policy (disable, prefer, require) to harden SCRAM against downgrade
 - DSN connection string parsing
@@ -128,6 +128,17 @@ nim c -d:asyncBackend=chronos your_app.nim
 SSL backend differs by async backend:
 - asyncdispatch: OpenSSL (requires `-d:ssl`)
 - chronos: BearSSL (via [nim-bearssl](https://github.com/status-im/nim-bearssl); TLS 1.2 only due to BearSSL limitation)
+
+Client certificate authentication (mTLS) is enabled by setting `sslCert` and
+`sslKey` on `ConnConfig` (or `sslcert=` / `sslkey=` in a DSN, which load the
+files from disk). Both must be provided together, and `sslMode` must be
+`sslPrefer` or stronger (`sslcert`/`sslkey` paired with `sslDisable` or
+`sslAllow` is rejected at config time because TLS would not be negotiated).
+The private key must be **unencrypted** on both backends — neither chronos
+(BearSSL) nor asyncdispatch (OpenSSL) is wired to a passphrase callback. On
+chronos the key specifically must be PKCS#8 PEM (RSA or EC); PKCS#1 is not
+supported. When loaded via DSN on POSIX, the `sslkey` file must not be group-
+or world-accessible (libpq parity).
 
 ## Examples
 
