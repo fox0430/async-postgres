@@ -24,13 +24,21 @@ suite "LSN":
     check $lsn == "FFFFFFFF/FFFFFFFF"
     check lsn.toUInt64 == 0xFFFFFFFF_FFFFFFFF'u64
 
+  # IDENTIFY_SYSTEM / CREATE_REPLICATION_SLOT return the LSN as text. Like
+  # parseTimelineId, parseLsn must convert a malformed value into PgTypeError
+  # (not leak a raw ValueError, including the one fromHex throws on non-hex
+  # halves) so callers stay under the single `except PgError` contract.
   test "parseLsn invalid format":
-    expect(ValueError):
+    expect(PgTypeError):
       discard parseLsn("invalid")
 
   test "parseLsn empty parts":
-    expect(ValueError):
+    expect(PgTypeError):
       discard parseLsn("12345678")
+
+  test "parseLsn non-hex half":
+    expect(PgTypeError):
+      discard parseLsn("0/XYZ")
 
   test "InvalidLsn":
     check $InvalidLsn == "0/0"

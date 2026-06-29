@@ -8,8 +8,8 @@ license = "MIT"
 # Dependencies
 
 requires "nim >= 2.2.4"
-requires "nimcrypto >= 0.6.0"
-requires "checksums >= 0.2.0"
+requires "nimcrypto >= 0.7.3"
+requires "checksums >= 0.2.2"
 
 task test, "run the full suite (requires a live PostgreSQL on 127.0.0.1:15432)":
   exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"

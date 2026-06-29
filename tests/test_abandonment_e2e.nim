@@ -83,6 +83,38 @@ suite "E2E: Cursor lifecycle invariants":
 
     waitFor t()
 
+  test "fetchNext error marks cursor exhausted so close() skips a wasted round-trip":
+    # An ErrorResponse mid-fetch drains a Sync that aborts the implicit
+    # transaction holding the portal, so the server has already dropped it.
+    # The cursor must be marked exhausted so a subsequent close() short-circuits
+    # instead of issuing Close/Sync against a portal that no longer exists.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # Errors with division by zero once the series reaches i == 5; chunkSize 3
+      # so the first (buffered) chunk succeeds and a later fetchNext hits it.
+      let cursor = await conn.openCursor(
+        "SELECT 1 / (i - 5) FROM generate_series(1, 20) i", chunkSize = 3
+      )
+      discard await cursor.fetchNext() # buffered chunk: i = 1, 2, 3
+      var raised = false
+      try:
+        while true:
+          let rows = await cursor.fetchNext()
+          if rows.len == 0:
+            break
+      except PgQueryError:
+        raised = true
+      doAssert raised, "fetchNext must surface the server error"
+      doAssert cursor.exhausted, "error path must mark the cursor exhausted"
+      doAssert conn.state == csReady, $conn.state
+      await cursor.close() # short-circuits on exhausted; no extra Close/Sync
+      doAssert conn.state == csReady, $conn.state
+      let qr = await conn.query("SELECT 1")
+      doAssert qr.rowCount == 1
+      await conn.close()
+
+    waitFor t()
+
 # Pipeline error recovery beyond existing coverage
 
 suite "E2E: Pipeline error recovery":

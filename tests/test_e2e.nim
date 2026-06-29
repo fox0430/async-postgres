@@ -3222,6 +3222,49 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "withCursor body error survives a failing close":
+    # When `body` raises and the automatic close() also fails, the original
+    # body exception must propagate — the close failure must not mask it.
+    # The backend is terminated mid-body so close()'s Close/Sync hits a dead
+    # socket and raises PgConnectionError.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_cursor_mask")
+      discard await conn.exec("CREATE TABLE test_cursor_mask (id int)")
+      for i in 1 .. 10:
+        discard await conn.exec(
+          "INSERT INTO test_cursor_mask (id) VALUES ($1)", @[toPgParam(i.int32)]
+        )
+
+      let pidRes = await conn.query("SELECT pg_backend_pid()")
+      let pid = pidRes.rows[0].getInt(0)
+
+      let killer = await connect(plainConfig())
+
+      var raised = false
+      try:
+        conn.withCursor("SELECT id FROM test_cursor_mask ORDER BY id", 5'i32, cur):
+          let chunk = await cur.fetchNext()
+          doAssert chunk.len == 5
+          # Kill this cursor's own backend so the automatic close() fails.
+          discard
+            await killer.exec("SELECT pg_terminate_backend($1)", @[toPgParam(pid)])
+          await sleepAsync(milliseconds(200))
+          raise newException(ValueError, "intentional body error")
+      except ValueError as e:
+        raised = true
+        doAssert e.msg == "intentional body error"
+
+      doAssert raised
+
+      await killer.close()
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+
+    waitFor t()
+
   test "openCursor with invalid SQL raises PgError":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -6807,6 +6850,27 @@ suite "E2E: Convenience Query Methods":
       doAssert conn.stmtCache.len == 1
       doAssert rowCount == 1
       doAssert values == @["7"]
+
+      await conn.close()
+
+    waitFor t()
+
+  test "queryEach records ParameterStatus into serverParams":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # queryEach parses messages directly from recvBuf (not via nextMessage),
+      # so it must record GUC_REPORT ParameterStatus updates itself. Changing a
+      # reported GUC (application_name) through queryEach must reach serverParams.
+      const newName = "queryeach_param_status_test"
+      doAssert conn.serverParams.getOrDefault("application_name", "") != newName
+      let rowCount = await conn.queryEach(
+        "SET application_name = '" & newName & "'",
+        callback = proc(row: Row) =
+          discard,
+      )
+      doAssert rowCount == 0
+      doAssert conn.serverParams.getOrDefault("application_name", "") == newName
 
       await conn.close()
 

@@ -239,13 +239,16 @@ proc `$`*(lsn: Lsn): string =
   stripLeadingZeros(toHex(uint32(hi))) & "/" & stripLeadingZeros(toHex(uint32(lo)))
 
 proc parseLsn*(s: string): Lsn =
-  ## Parse an LSN from ``"X/Y"`` hex string. Raises ``ValueError`` on invalid format.
+  ## Parse an LSN from ``"X/Y"`` hex string. Converts a malformed value (wrong
+  ## shape or non-hex halves) into `PgTypeError` so callers stay under the
+  ## ``except PgError`` contract, mirroring `parseTimelineId`.
   let parts = s.split('/')
   if parts.len != 2:
-    raise newException(ValueError, "Invalid LSN format: " & s)
-  let hi = fromHex[uint64](parts[0])
-  let lo = fromHex[uint64](parts[1])
-  Lsn((hi shl 32) or lo)
+    raise newException(PgTypeError, "Invalid LSN format: " & s)
+  pgTypeErrorOnValueError("Invalid LSN format: " & s):
+    let hi = fromHex[uint64](parts[0])
+    let lo = fromHex[uint64](parts[1])
+    Lsn((hi shl 32) or lo)
 
 # PostgreSQL timestamp helpers
 

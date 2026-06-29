@@ -375,11 +375,15 @@ proc tryHandoffToWaiter(pool: PgPool, conn: PgConnection): bool =
     return true
   return false
 
-proc failNextWaiter(pool: PgPool, err: ref CatchableError): bool =
-  ## Fail the next live (non-abandoned) waiter with `err`. Returns true if a
-  ## waiter was failed.
+proc failLastWaiter(pool: PgPool, err: ref CatchableError): bool =
+  ## Fail the most-recently-queued live (non-abandoned) waiter with `err`,
+  ## scanning from the back. Returns true if a waiter was failed.
+  ##
+  ## FIFO fairness: charge failures to the tail, never the head. A spawn failure
+  ## isn't bound to any waiter, so failing the head would hand its turn to a
+  ## younger waiter once a sibling spawn or release delivers from the front.
   while pool.waiters.len > 0:
-    let waiter = pool.waiters.popFirst()
+    let waiter = pool.waiters.popLast()
     if waiter.isAbandoned:
       continue
     pool.waiterCount.dec
@@ -403,9 +407,11 @@ proc spawnConnectForWaiter(pool: PgPool) =
   ## - connect failed / no waiter remained / pool closed: reservation is
   ##   released via `active.dec`
   ##
-  ## On connect failure the front waiter is failed with a `PgPoolError`
-  ## wrapping the underlying error (available via `parent`) so the caller's
-  ## `acquire` returns promptly rather than waiting for `acquireTimeout`.
+  ## On connect failure the most-recently-queued (tail) waiter is failed with a
+  ## `PgPoolError` wrapping the underlying error (available via `parent`) so the
+  ## caller's `acquire` returns promptly rather than waiting for `acquireTimeout`.
+  ## Failing the tail rather than the head preserves FIFO fairness (see
+  ## `failLastWaiter`).
   ## The spawned future is tracked in
   ## `pendingBackgroundTasks` so `pool.close()` drains it before returning.
   proc run() {.async.} =
@@ -442,20 +448,21 @@ proc spawnConnectForWaiter(pool: PgPool) =
       )
       if delay > ZeroDuration:
         pool.nextConnectRetryAt = Moment.now() + delay
-      # Only the front waiter is failed here: this spawn's reservation was
-      # for that one waiter, and other waiters may still be served by
-      # existing borrowers' releases. We don't blanket-fail the queue or
-      # re-spawn for siblings — `canAttemptConnect()` is now false during
-      # the backoff window, so further spawns are deferred until backoff
-      # expires (then triggered by the next acquire or release).
+      # Only one waiter is failed here: this spawn reserved capacity for a
+      # single queue slot, and other waiters may still be served by existing
+      # borrowers' releases. We don't blanket-fail the queue or re-spawn for
+      # siblings — `canAttemptConnect()` is now false during the backoff window,
+      # so further spawns are deferred until backoff expires (then triggered by
+      # the next acquire or release). The tail waiter is failed (see
+      # `failLastWaiter`) to keep the head's FIFO claim on the next connection.
       #
       # Wrap in PgPoolError before failing the waiter: acquire() documents
       # PgPoolError for every failure mode, and a raw AsyncTimeoutError from
       # `connConfig.connectTimeout` would otherwise be indistinguishable from
       # the waiter's own wait-budget timeout in acquireImpl — whose handler
-      # decrements `waiterCount` a second time (failNextWaiter below already
+      # decrements `waiterCount` a second time (failLastWaiter below already
       # did) and permanently corrupts the FIFO fast-path guard.
-      discard pool.failNextWaiter(
+      discard pool.failLastWaiter(
         newException(PgPoolError, "Pool connect for waiter failed", e)
       )
     finally:
@@ -605,15 +612,37 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
 
   try:
     pool.cachedNow = Moment.now()
+    # Open all `minSize` connections concurrently. `allFutures` waits for
+    # every connect to settle (success or failure) without short-circuiting,
+    # so a failure in one does not abandon the others mid-handshake — the
+    # server observes a clean Terminate for each socket that did come up.
+    # Successful connections are parked in `idle`; the first failure (if any)
+    # is raised so the except branch closes the ones that succeeded.
+    var connectFuts: seq[Future[PgConnection]]
     for i in 0 ..< cfg.minSize:
-      let conn = await connect(cfg.connConfig)
-      conn.ownerPool = pool
-      pool.metrics.createCount.inc
-      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+      connectFuts.add(connect(cfg.connConfig))
+    await allFutures(connectFuts)
+    var firstErr: ref CatchableError = nil
+    for f in connectFuts:
+      if f.failed():
+        if firstErr == nil:
+          # `connect` only raises `CatchableError`, so the stored exception is
+          # always safe to downcast from `ref Exception` (asyncdispatch) /
+          # `ref CatchableError` (chronos) to the typed `ref CatchableError`.
+          firstErr = cast[ref CatchableError](f.error)
+      else:
+        let conn = f.read()
+        conn.ownerPool = pool
+        pool.metrics.createCount.inc
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+    if firstErr != nil:
+      raise firstErr
   except CatchableError as e:
+    var closeFuts: seq[Future[void]]
     while pool.idle.len > 0:
       let pc = pool.idle.popFirst()
-      await pool.tracedClose(pc.conn)
+      closeFuts.add(pool.tracedClose(pc.conn))
+    await allFutures(closeFuts)
     raise e
 
   pool.maintenanceTask = maintenanceLoop(pool)
@@ -762,7 +791,7 @@ proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
   ## cancellation.
   ##
   ## Skip the decrement when the pool already settled this waiter — a handoff
-  ## (`completed()`) or a `failNextWaiter`/`close` (`failed()`) already
+  ## (`completed()`) or a `failLastWaiter`/`close` (`failed()`) already
   ## decremented `waiterCount`, and a second decrement would drive it negative,
   ## permanently disabling the FIFO fast-path guard and the `maxWaiters` bound.
   ## Such a settle can still race with this cleanup: under asyncdispatch `wait()`
@@ -783,7 +812,7 @@ proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
   if waiter.fut.completed():
     waiter.fut.read().release()
   elif waiter.fut.failed():
-    discard # failNextWaiter/close already decremented; no conn was delivered
+    discard # failLastWaiter/close already decremented; no conn was delivered
   else:
     waiter.cancelled = true
     if pool.waiterCount > 0:
@@ -2051,11 +2080,15 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     while pool.active > 0 and Moment.now() < deadline:
       await sleepAsync(milliseconds(50))
 
-  # Close all idle connections
+  # Close all idle connections in parallel. `tracedClose` swallows its own
+  # errors (routing them to the tracer), so a failure in one close does not
+  # short-circuit the rest or escape this proc.
+  var closeFuts: seq[Future[void]]
   while pool.idle.len > 0:
     let pc = pool.idle.popFirst()
     pool.metrics.closeCount.inc
-    await pool.tracedClose(pc.conn)
+    closeFuts.add(pool.tracedClose(pc.conn))
+  await allFutures(closeFuts)
 
   # Yield once after closing idle connections and before draining background
   # tasks, but only when a borrow is still outstanding. A conn handed off to a
