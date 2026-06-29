@@ -184,6 +184,22 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?channel_binding=bogus")
 
+  test "query param sslnegotiation":
+    check parseDsn("postgresql://host/db?sslnegotiation=postgres").sslNegotiation ==
+      sslnPostgres
+    check parseDsn("postgresql://host/db?sslnegotiation=direct").sslNegotiation ==
+      sslnDirect
+
+  test "sslnegotiation default is postgres":
+    check parseDsn("postgresql://host/db").sslNegotiation == sslnPostgres
+
+  test "ConnConfig zero init has sslnPostgres":
+    check ConnConfig().sslNegotiation == sslnPostgres
+
+  test "error: invalid sslnegotiation":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslnegotiation=bogus")
+
   test "require_auth default is empty set":
     let cfg = parseDsn("postgresql://host/db")
     check cfg.requireAuth == {}
@@ -847,6 +863,13 @@ suite "parseDsn keyword=value":
   test "error: invalid channel_binding":
     expect PgError:
       discard parseDsn("host=h channel_binding=bogus")
+
+  test "sslnegotiation parameter":
+    check parseDsn("host=h sslnegotiation=direct").sslNegotiation == sslnDirect
+
+  test "error: invalid sslnegotiation":
+    expect PgError:
+      discard parseDsn("host=h sslnegotiation=bogus")
 
   test "error: invalid connect_timeout":
     expect PgError:

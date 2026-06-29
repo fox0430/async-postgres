@@ -11,6 +11,7 @@ Async PostgreSQL client in Nim.
 - Connection pooling with health checks and maintenance (broken connections discarded on acquire/release)
 - Pool cluster with read replica routing
 - SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full)
+- `sslnegotiation` mode (postgres, direct) for Direct SSL connections (PostgreSQL 17+)
 - MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
 - `channel_binding` policy (disable, prefer, require) to harden SCRAM against downgrade
 - DSN connection string parsing
@@ -128,6 +129,10 @@ nim c -d:asyncBackend=chronos your_app.nim
 SSL backend differs by async backend:
 - asyncdispatch: OpenSSL (requires `-d:ssl`)
 - chronos: BearSSL (via [nim-bearssl](https://github.com/status-im/nim-bearssl); TLS 1.2 only due to BearSSL limitation)
+
+Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
+stronger. On the chronos backend it needs chronos' ALPN support, currently only
+in the development HEAD (`nimble install "https://github.com/status-im/nim-chronos@#head"`).
 
 ## Examples
 
