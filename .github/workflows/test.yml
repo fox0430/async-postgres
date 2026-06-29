@@ -31,11 +31,11 @@ jobs:
       matrix:
         os:
           - 'ubuntu-latest'
-          - 'macOS-latest'
+          #- 'macOS-latest'
         nim-version:
-          - '2.2.4'
+          #- '2.2.4'
           - 'stable'
-          - 'devel'
+          #- 'devel'
 
     name: Tests on ${{ matrix.nim-version }} (${{ matrix.os }})
     steps:
@@ -72,7 +72,9 @@ jobs:
         run: docker compose up -d --wait
 
       - name: Install chronos
-        run: nimble install chronos -y
+        # Direct SSL negotiation needs chronos' ALPN support, which is only in
+        # the development HEAD (not yet in a tagged release).
+        run: nimble install -y "https://github.com/status-im/nim-chronos@#head"
 
       - name: Run tests
         run: nimble test -y

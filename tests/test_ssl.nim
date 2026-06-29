@@ -642,6 +642,97 @@ suite "SSL negotiation - sslDisable":
     check connState == csReady
     check connSslEnabled == false
 
+suite "Direct SSL negotiation":
+  test "sslnegotiation=direct rejects weak sslmode before any bytes are sent":
+    var raised = false
+    var errMentionsDirect = false
+    var bytesFromClient = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          # The client must reject the weak sslmode locally and never send the
+          # SSLRequest or a ClientHello; the read returns 0 once it closes.
+          let data = await readN(st, 1)
+          bytesFromClient = data.len
+        except CatchableError:
+          bytesFromClient = 0
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslPrefer,
+        sslNegotiation: sslnDirect,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        errMentionsDirect = "sslnegotiation=direct" in e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check errMentionsDirect
+    check bytesFromClient == 0
+
+  test "sslnegotiation=direct starts TLS immediately without an SSLRequest":
+    var raised = false
+    var firstByte: int = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          # Direct SSL skips the 8-byte SSLRequest (whose first byte is 0x00) and
+          # opens with a TLS handshake record (content type 0x16). Capture the
+          # opening byte, then drop the connection so the handshake fails fast.
+          let data = await readN(st, 1)
+          firstByte = int(data[0])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslNegotiation: sslnDirect,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        # The dumb mock cannot complete the TLS handshake, so connect fails after
+        # the ClientHello is observed — exactly what this test inspects.
+        raised = true
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check firstByte == 0x16
+    check raised
+
 proc sendAuthSasl(client: MockClient, mechanisms: seq[string]): Future[void] {.async.} =
   var body: seq[byte] = @[]
   body.addInt32(10) # AuthenticationSASL

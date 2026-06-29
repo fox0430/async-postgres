@@ -1,7 +1,10 @@
 ## TLS/SSL negotiation for PostgreSQL connections.
 ##
-## Implements the libpq-compatible SSLRequest handshake and the subsequent
-## TLS handshake under both async backends:
+## Implements both libpq negotiation styles: the traditional SSLRequest
+## handshake (`sslnegotiation=postgres`) and Direct SSL, which starts TLS
+## immediately and requires the "postgresql" ALPN protocol
+## (`sslnegotiation=direct`, PostgreSQL 17+). The TLS handshake itself is shared
+## by `establishTls` under both async backends:
 ##
 ## - **chronos**: BearSSL-based TLS via `chronos/streams/tlsstream`, with
 ##   custom trust anchor parsing (`parseTrustAnchors`) and X.509 capture for
@@ -22,6 +25,10 @@ elif hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
     import std/[net, openssl, tempfiles, os]
+
+const PgAlpnProtocol = "postgresql"
+  ## ALPN protocol name a Direct SSL connection must negotiate (PostgreSQL 17+).
+  ## libpq sends and requires the same name for `sslnegotiation=direct`.
 
 when hasAsyncDispatch and defined(ssl):
   # std/net's `wrapConnectedSocket` gates its certificate-name check behind
@@ -67,16 +74,168 @@ when hasAsyncDispatch and defined(ssl):
     finally:
       X509_free(cert)
 
+proc establishTls(
+    conn: PgConnection, config: ConnConfig, sslHost: string, direct: bool
+) {.async.} =
+  ## Run the TLS handshake over `conn`'s transport and wire up the encrypted
+  ## reader/writer. Shared by traditional (post-`SSLRequest`) and Direct SSL
+  ## negotiation. When `direct` is true the client offers the "postgresql" ALPN
+  ## protocol and requires the server to select it, matching libpq's
+  ## `sslnegotiation=direct` behaviour (PostgreSQL 17+).
+  when hasChronos:
+    conn.baseReader = newAsyncStreamReader(conn.transport)
+    conn.baseWriter = newAsyncStreamWriter(conn.transport)
+
+    let flags =
+      case config.sslMode
+      of sslVerifyFull:
+        {}
+      of sslVerifyCa:
+        {TLSFlags.NoVerifyServerName}
+      else:
+        {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
+
+    let serverName = if config.sslMode == sslVerifyFull: sslHost else: ""
+    let alpn =
+      if direct:
+        @[PgAlpnProtocol]
+      else:
+        @[]
+
+    if config.sslRootCert.len > 0:
+      let parsed = parseTrustAnchors(config.sslRootCert)
+      conn.trustAnchorBufs = parsed.backing
+        # Must outlive TLS session (see parseTrustAnchors doc)
+      conn.tlsStream = newTLSClientAsyncStream(
+        conn.baseReader,
+        conn.baseWriter,
+        serverName,
+        flags = flags,
+        minVersion = TLSVersion.TLS12,
+        maxVersion = TLSVersion.TLS12,
+        trustAnchors = parsed.store,
+        alpnProtocols = alpn,
+      )
+    else:
+      conn.tlsStream = newTLSClientAsyncStream(
+        conn.baseReader,
+        conn.baseWriter,
+        serverName,
+        flags = flags,
+        minVersion = TLSVersion.TLS12,
+        maxVersion = TLSVersion.TLS12,
+        alpnProtocols = alpn,
+      )
+    installX509Capture(
+      conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+    )
+    await conn.tlsStream.handshake()
+    if direct and conn.tlsStream.getSelectedAlpnProtocol() != PgAlpnProtocol:
+      raise newException(
+        PgConnectionError,
+        "direct SSL connection established without ALPN: the server does not " &
+          "support sslnegotiation=direct (requires PostgreSQL 17+)",
+      )
+    conn.reader = conn.tlsStream.reader
+    conn.writer = conn.tlsStream.writer
+    conn.sslEnabled = true
+  elif hasAsyncDispatch:
+    when defined(ssl):
+      let verifyMode =
+        case config.sslMode
+        of sslVerifyCa, sslVerifyFull: SslCVerifyMode.CVerifyPeer
+        else: SslCVerifyMode.CVerifyNone
+
+      var ctx: SslContext
+      var tmpPath: string
+      if config.sslRootCert.len > 0:
+        let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
+        tmpPath = tp
+        try:
+          tmpFile.write(config.sslRootCert)
+          tmpFile.close()
+          ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
+        except:
+          removeFile(tmpPath)
+          raise
+      else:
+        ctx = newContext(verifyMode = verifyMode)
+
+      if direct:
+        # Direct SSL requires offering the "postgresql" ALPN protocol; the wire
+        # form is a 1-byte length prefix followed by the protocol name. Setting
+        # it on the context makes `wrapConnectedSocket`'s ClientHello advertise
+        # it, which is what a PostgreSQL 17+ direct-SSL server keys off.
+        #
+        # Unlike the chronos backend, we cannot *verify* the negotiated ALPN
+        # here: `wrapConnectedSocket` on an AsyncSocket only sets connect state
+        # and defers the TLS handshake to the first send (the StartupMessage in
+        # `connectToHost`), so the selected protocol — like the peer certificate
+        # captured below — is not yet available. A server that fails to negotiate
+        # the handshake still surfaces as a connection error on that first send.
+        const alpnProto = "\x0a" & PgAlpnProtocol
+        discard
+          SSL_CTX_set_alpn_protos(ctx.context, alpnProto.cstring, cuint(alpnProto.len))
+
+      try:
+        let hostname = if config.sslMode == sslVerifyFull: sslHost else: ""
+        wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
+        # wrapConnectedSocket skips name verification for IP hostnames; for
+        # verify-full we must match the IP against the cert's SANs ourselves.
+        if needsManualIpVerification(config.sslMode, sslHost):
+          verifyPeerIpSan(conn.socket, sslHost)
+        conn.sslEnabled = true
+        # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
+        # If unavailable, cbPrefer will silently fall back to SCRAM-SHA-256 —
+        # warn the operator so the loss of channel binding is observable.
+        # (cbRequire is enforced in selectScramMechanism.)
+        let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
+        if peerCert != nil:
+          try:
+            let derStr = i2d_X509(peerCert)
+            if derStr.len > 0:
+              conn.serverCertDer = newSeq[byte](derStr.len)
+              for i in 0 ..< derStr.len:
+                conn.serverCertDer[i] = byte(derStr[i])
+            else:
+              stderr.writeLine "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
+          finally:
+            X509_free(peerCert)
+        else:
+          stderr.writeLine "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
+      finally:
+        if tmpPath.len > 0:
+          removeFile(tmpPath)
+    else:
+      raise
+        newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
+
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
-  ## Send SSLRequest and negotiate TLS if server accepts.
-  ## `sslHost` is the host *name* the server certificate is verified against
-  ## (the entry's `host`, never its `hostaddr` — libpq semantics).
+  ## Negotiate TLS for the connection. With `sslnegotiation=postgres` (default)
+  ## this sends an `SSLRequest` and starts TLS only if the server accepts;
+  ## with `sslnegotiation=direct` it starts TLS immediately without the
+  ## round-trip (PostgreSQL 17+). `sslHost` is the host *name* the server
+  ## certificate is verified against (the entry's `host`, never its `hostaddr` —
+  ## libpq semantics).
   if config.sslMode == sslVerifyFull and sslHost.len == 0:
     # hostaddr without host: there is no name to match the certificate
     # against (libpq raises the same way).
     raise newException(
       PgConnectionError, "A host name must be specified for a verified SSL connection"
     )
+
+  if config.sslNegotiation == sslnDirect:
+    # Direct SSL skips the SSLRequest probe, so there is no plaintext path to
+    # fall back to. libpq rejects weak sslmodes here for the same reason; SSL
+    # must actually be required.
+    if config.sslMode notin {sslRequire, sslVerifyCa, sslVerifyFull}:
+      raise newException(
+        PgConnectionError,
+        "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
+      )
+    await establishTls(conn, config, sslHost, direct = true)
+    return
+
   let sslReq = encodeSSLRequest()
   var respChar: char
   var extraBytesBuffered = false
@@ -122,104 +281,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         PgConnectionError,
         "Received unencrypted data after SSL response (possible man-in-the-middle)",
       )
-    when hasChronos:
-      conn.baseReader = newAsyncStreamReader(conn.transport)
-      conn.baseWriter = newAsyncStreamWriter(conn.transport)
-
-      let flags =
-        case config.sslMode
-        of sslVerifyFull:
-          {}
-        of sslVerifyCa:
-          {TLSFlags.NoVerifyServerName}
-        else:
-          {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
-
-      let serverName = if config.sslMode == sslVerifyFull: sslHost else: ""
-
-      if config.sslRootCert.len > 0:
-        let parsed = parseTrustAnchors(config.sslRootCert)
-        conn.trustAnchorBufs = parsed.backing
-          # Must outlive TLS session (see parseTrustAnchors doc)
-        conn.tlsStream = newTLSClientAsyncStream(
-          conn.baseReader,
-          conn.baseWriter,
-          serverName,
-          flags = flags,
-          minVersion = TLSVersion.TLS12,
-          maxVersion = TLSVersion.TLS12,
-          trustAnchors = parsed.store,
-        )
-      else:
-        conn.tlsStream = newTLSClientAsyncStream(
-          conn.baseReader,
-          conn.baseWriter,
-          serverName,
-          flags = flags,
-          minVersion = TLSVersion.TLS12,
-          maxVersion = TLSVersion.TLS12,
-        )
-      installX509Capture(
-        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
-      )
-      await conn.tlsStream.handshake()
-      conn.reader = conn.tlsStream.reader
-      conn.writer = conn.tlsStream.writer
-      conn.sslEnabled = true
-    elif hasAsyncDispatch:
-      when defined(ssl):
-        let verifyMode =
-          case config.sslMode
-          of sslVerifyCa, sslVerifyFull: SslCVerifyMode.CVerifyPeer
-          else: SslCVerifyMode.CVerifyNone
-
-        var ctx: SslContext
-        var tmpPath: string
-        if config.sslRootCert.len > 0:
-          let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
-          tmpPath = tp
-          try:
-            tmpFile.write(config.sslRootCert)
-            tmpFile.close()
-            ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
-          except:
-            removeFile(tmpPath)
-            raise
-        else:
-          ctx = newContext(verifyMode = verifyMode)
-
-        try:
-          let hostname = if config.sslMode == sslVerifyFull: sslHost else: ""
-          wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
-          # wrapConnectedSocket skips name verification for IP hostnames; for
-          # verify-full we must match the IP against the cert's SANs ourselves.
-          if needsManualIpVerification(config.sslMode, sslHost):
-            verifyPeerIpSan(conn.socket, sslHost)
-          conn.sslEnabled = true
-          # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
-          # If unavailable, cbPrefer will silently fall back to SCRAM-SHA-256 —
-          # warn the operator so the loss of channel binding is observable.
-          # (cbRequire is enforced in selectScramMechanism.)
-          let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
-          if peerCert != nil:
-            try:
-              let derStr = i2d_X509(peerCert)
-              if derStr.len > 0:
-                conn.serverCertDer = newSeq[byte](derStr.len)
-                for i in 0 ..< derStr.len:
-                  conn.serverCertDer[i] = byte(derStr[i])
-              else:
-                stderr.writeLine "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
-            finally:
-              X509_free(peerCert)
-          else:
-            stderr.writeLine "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
-        finally:
-          if tmpPath.len > 0:
-            removeFile(tmpPath)
-      else:
-        raise
-          newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
+    await establishTls(conn, config, sslHost, direct = false)
   of 'N':
     if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
       raise newException(PgConnectionError, "Server does not support SSL")
