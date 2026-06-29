@@ -116,6 +116,16 @@ type
       ## to `sslPrefer` (libpq parity); a raw zero-initialized `ConnConfig` has
       ## `sslDisable`.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    sslCert*: string
+      ## PEM-encoded client certificate (and any intermediates) for mutual TLS.
+      ## Must be paired with ``sslKey``; ``sslMode`` must also be ``sslPrefer``
+      ## or stronger, otherwise TLS would not be negotiated and the credential
+      ## would be silently unused — config validation rejects that.
+    sslKey*: string
+      ## PEM-encoded client private key for mutual TLS. The key must be
+      ## **unencrypted** on both backends (no passphrase callback is wired up).
+      ## On chronos/BearSSL specifically it must be PKCS#8 (RSA or EC); PKCS#1
+      ## is not supported. Must be paired with ``sslCert``.
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
@@ -671,7 +681,14 @@ else:
   type CopyInCallback* = proc(): Future[seq[byte]] {.gcsafe.}
     ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
 
-const RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
+const
+  RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
+
+  ClientCertPairingErrorMsg* =
+    "sslcert and sslkey must be provided together for client certificate auth"
+    ## Shared by the config-time validation (`validateClientCertConfig`, raised as
+    ## `PgError`) and the connect-time guard in `negotiateSSL` (raised as
+    ## `PgConnectionError`); kept here so the wording can't drift between them.
 
 # HostEntry accessors
 
