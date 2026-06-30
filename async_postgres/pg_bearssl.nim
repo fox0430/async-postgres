@@ -2,11 +2,23 @@
 ## Wraps BearSSL callbacks to capture the leaf certificate DER bytes during
 ## TLS handshake, and provides trust anchor parsing from PEM data.
 
-import async_backend, pg_types
+import async_backend
 
 when hasChronos:
   import chronos/streams/tlsstream
   import bearssl/[x509, rsa, ec, ssl]
+
+  when defined(clang):
+    # BearSSL's X509 class callbacks (const br_x509_class**, const unsigned char*)
+    # and the x509_decoder append_dn callback (void*, void*) are structurally
+    # identical Nim proc types, so Nim emits a single shared C typedef for both.
+    # Which of the two C parameter spellings that typedef adopts is
+    # compilation-order dependent, so one of the call sites always disagrees with
+    # the typedef. clang 16+ (including Apple clang) promotes that mismatch from
+    # -Wincompatible-function-pointer-types to a hard error, breaking the build.
+    # The pointers are ABI-identical, so demote it back to a warning (silenced by
+    # Nim's -w). gcc keeps it a warning by default and rejects this flag name.
+    {.passC: "-Wno-error=incompatible-function-pointer-types".}
 
   type
     X509CertCaptureContext* = object
