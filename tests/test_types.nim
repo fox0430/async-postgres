@@ -1226,6 +1226,20 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard decodeBinaryTimestamp(tsNegInfinity)
 
+  test "decodeBinaryTimestamp near-int64.high raises (no OverflowDefect)":
+    # int64.high - 1: not the 'infinity' sentinel, but the epoch shift still
+    # overflows int64. Must surface as PgTypeError, not crash.
+    const tsNearHigh = @[0x7F'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
+    expect PgTypeError:
+      discard decodeBinaryTimestamp(tsNearHigh)
+
+  test "decodeBinaryTimeTz int32.low offset raises (no OverflowDefect)":
+    # us = 0 (00:00:00), offset = int32.low. Un-negating int32.low overflows
+    # int32, so the decoder must reject it as PgTypeError.
+    const tt = @[0'u8, 0, 0, 0, 0, 0, 0, 0, 0x80'u8, 0, 0, 0] # 8 bytes us=0 + int32.low
+    expect PgTypeError:
+      discard decodeBinaryTimeTz(tt)
+
   test "decodeBinaryDate infinity raises":
     expect PgTypeError:
       discard decodeBinaryDate(dateInfinity)
