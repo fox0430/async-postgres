@@ -1503,7 +1503,7 @@ proc pathElemFromBinary(buf: openArray[byte], off, elen: int): PgPath =
     raise newException(PgTypeError, "Invalid binary path element: too short " & $elen)
   result.closed = buf[off] != 0
   let npts = fromBE32(buf.toOpenArray(off + 1, off + 4))
-  if npts < 0 or elen != 5 + npts * 16:
+  if npts < 0 or int64(elen) != 5 + int64(npts) * 16:
     raise newException(
       PgTypeError,
       "Invalid binary path element: bad npts " & $npts & " (elen " & $elen & ")",
@@ -1533,7 +1533,7 @@ proc polygonElemFromBinary(buf: openArray[byte], off, elen: int): PgPolygon =
     raise
       newException(PgTypeError, "Invalid binary polygon element: too short " & $elen)
   let npts = fromBE32(buf.toOpenArray(off, off + 3))
-  if npts < 0 or elen != 4 + npts * 16:
+  if npts < 0 or int64(elen) != 4 + int64(npts) * 16:
     raise newException(
       PgTypeError,
       "Invalid binary polygon element: bad npts " & $npts & " (elen " & $elen & ")",
@@ -2011,7 +2011,7 @@ proc decodePgArrayElement*(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
     raise newException(PgTypeError, "path array element too short")
   result.closed = buf[0] != 0
   let npts = fromBE32(buf.toOpenArray(1, 4))
-  if npts < 0 or buf.len != 5 + npts * 16:
+  if npts < 0 or int64(buf.len) != 5 + int64(npts) * 16:
     raise newException(
       PgTypeError,
       "path array element: bad npts " & $npts & " (buf.len " & $buf.len & ")",
@@ -2024,7 +2024,7 @@ proc decodePgArrayElement*(_: typedesc[PgPolygon], buf: openArray[byte]): PgPoly
   if buf.len < 4:
     raise newException(PgTypeError, "polygon array element too short")
   let npts = fromBE32(buf.toOpenArray(0, 3))
-  if npts < 0 or buf.len != 4 + npts * 16:
+  if npts < 0 or int64(buf.len) != 4 + int64(npts) * 16:
     raise newException(
       PgTypeError,
       "polygon array element: bad npts " & $npts & " (buf.len " & $buf.len & ")",
