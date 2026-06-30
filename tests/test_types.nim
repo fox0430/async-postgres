@@ -2173,6 +2173,20 @@ suite "Binary array encode/decode roundtrip":
     let row = mkRow(@[some(encoded)], fields)
     check row.getBoolArray(0) == @[true, false, true]
 
+  test "getBoolArray binary treats any non-zero byte as true":
+    # PostgreSQL only ever sends 0/1, but decode non-canonical bytes the same
+    # way the scalar getBool does (!= 0), not just == 1.
+    let encoded = encodeBinaryArray(OidBool, @[@[2'u8], @[0xFF'u8], @[0'u8]])
+    let fields = @[mkField(OidBoolArray, 1)]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getBoolArray(0) == @[true, true, false]
+
+  test "getBoolArrayElemOpt binary treats any non-zero byte as true":
+    let encoded = encodeBinaryArray(OidBool, @[@[2'u8], @[0xFF'u8], @[0'u8]])
+    let fields = @[mkField(OidBoolArray, 1)]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getBoolArrayElemOpt(0) == @[some(true), some(true), some(false)]
+
   test "getStrArray binary format":
     let encoded = encodeBinaryArray(OidText, @[toBytes("hello"), toBytes("world")])
     let fields = @[mkField(OidTextArray, 1)]

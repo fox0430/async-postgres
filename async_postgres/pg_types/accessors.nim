@@ -1066,7 +1066,7 @@ proc getBoolArray*(row: Row, col: int): seq[bool] =
         raise newException(
           PgTypeError, "Unexpected binary element length " & $e.len & " for bool array"
         )
-      result[i] = row.data.buf[off + e.off] == 1'u8
+      result[i] = row.data.buf[off + e.off] != 0'u8
     return
   let s = row.getStr(col)
   let elems = parseTextArray(s)
@@ -1775,7 +1775,7 @@ proc getBoolArrayElemOpt*(row: Row, col: int): seq[Option[bool]] =
           PgTypeError, "Unexpected binary element length " & $e.len & " for bool array"
         )
       else:
-        result[i] = some(row.data.buf[off + e.off] == 1'u8)
+        result[i] = some(row.data.buf[off + e.off] != 0'u8)
     return
   let s = row.getStr(col)
   for e in parseTextArray(s):
