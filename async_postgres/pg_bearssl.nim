@@ -8,6 +8,8 @@ when hasChronos:
   import chronos/streams/tlsstream
   import bearssl/[x509, rsa, ec, ssl]
 
+  import pg_types
+
   when defined(clang):
     # BearSSL's X509 class callbacks (const br_x509_class**, const unsigned char*)
     # and the x509_decoder append_dn callback (void*, void*) are structurally
