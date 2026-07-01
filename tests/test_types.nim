@@ -1226,6 +1226,20 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard decodeBinaryTimestamp(tsNegInfinity)
 
+  test "decodeBinaryTimestamp near-int64.high raises (no OverflowDefect)":
+    # int64.high - 1: not the 'infinity' sentinel, but the epoch shift still
+    # overflows int64. Must surface as PgTypeError, not crash.
+    const tsNearHigh = @[0x7F'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
+    expect PgTypeError:
+      discard decodeBinaryTimestamp(tsNearHigh)
+
+  test "decodeBinaryTimeTz int32.low offset raises (no OverflowDefect)":
+    # us = 0 (00:00:00), offset = int32.low. Un-negating int32.low overflows
+    # int32, so the decoder must reject it as PgTypeError.
+    const tt = @[0'u8, 0, 0, 0, 0, 0, 0, 0, 0x80'u8, 0, 0, 0] # 8 bytes us=0 + int32.low
+    expect PgTypeError:
+      discard decodeBinaryTimeTz(tt)
+
   test "decodeBinaryDate infinity raises":
     expect PgTypeError:
       discard decodeBinaryDate(dateInfinity)
@@ -2172,6 +2186,20 @@ suite "Binary array encode/decode roundtrip":
     let fields = @[mkField(OidBoolArray, 1)]
     let row = mkRow(@[some(encoded)], fields)
     check row.getBoolArray(0) == @[true, false, true]
+
+  test "getBoolArray binary treats any non-zero byte as true":
+    # PostgreSQL only ever sends 0/1, but decode non-canonical bytes the same
+    # way the scalar getBool does (!= 0), not just == 1.
+    let encoded = encodeBinaryArray(OidBool, @[@[2'u8], @[0xFF'u8], @[0'u8]])
+    let fields = @[mkField(OidBoolArray, 1)]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getBoolArray(0) == @[true, true, false]
+
+  test "getBoolArrayElemOpt binary treats any non-zero byte as true":
+    let encoded = encodeBinaryArray(OidBool, @[@[2'u8], @[0xFF'u8], @[0'u8]])
+    let fields = @[mkField(OidBoolArray, 1)]
+    let row = mkRow(@[some(encoded)], fields)
+    check row.getBoolArrayElemOpt(0) == @[some(true), some(true), some(false)]
 
   test "getStrArray binary format":
     let encoded = encodeBinaryArray(OidText, @[toBytes("hello"), toBytes("world")])
@@ -8063,6 +8091,21 @@ suite "PgArray[T] element decoder validation":
     expect PgTypeError:
       discard decodePgArrayElement(PgPolygon, buf)
 
+  test "decodePgArrayElement[PgPath] rejects npts that overflows int32":
+    # npts = 0x10000000: in int32, npts*16 wraps to 0 and would spoof the
+    # 5-byte length check. The decoder must widen to int64 and reject.
+    var buf = newSeq[byte](5)
+    buf[0] = 0
+    buf.writeBE32(1, 0x10000000'i32)
+    expect PgTypeError:
+      discard decodePgArrayElement(PgPath, buf)
+
+  test "decodePgArrayElement[PgPolygon] rejects npts that overflows int32":
+    var buf = newSeq[byte](4)
+    buf.writeBE32(0, 0x10000000'i32)
+    expect PgTypeError:
+      discard decodePgArrayElement(PgPolygon, buf)
+
 suite "1-D path/polygon binary element validation":
   test "pathElemFromBinary rejects negative npts via getPathArray":
     # Build a path[] payload whose single element has npts = -1 (0xFFFFFFFF).
@@ -8161,6 +8204,43 @@ suite "1-D path/polygon binary element validation":
     # Element wire: npts(4)=0 + extra(8) = 12 bytes. 12 != 4 + 0*16 → reject.
     var elem = newSeq[byte](12)
     elem.writeBE32(0, 0'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidPolygon)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPolygonArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPolygonArray(0)
+
+  test "pathElemFromBinary rejects npts that overflows int32 via getPathArray":
+    # npts = 0x10000000 makes npts*16 wrap to 0 in int32, spoofing the 5-byte
+    # element-length check; the int64 check must still reject it.
+    var elem = newSeq[byte](5)
+    elem[0] = 0
+    elem.writeBE32(1, 0x10000000'i32)
+    var data = newSeq[byte](20 + 4 + elem.len)
+    data.writeBE32(0, 1'i32)
+    data.writeBE32(4, 0'i32)
+    data.writeBE32(8, OidPath)
+    data.writeBE32(12, 1'i32)
+    data.writeBE32(16, 1'i32)
+    data.writeBE32(20, int32(elem.len))
+    for i, b in elem:
+      data[24 + i] = b
+    let fields = @[mkField(OidPathArray, 1)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard row.getPathArray(0)
+
+  test "polygonElemFromBinary rejects npts that overflows int32 via getPolygonArray":
+    var elem = newSeq[byte](4)
+    elem.writeBE32(0, 0x10000000'i32)
     var data = newSeq[byte](20 + 4 + elem.len)
     data.writeBE32(0, 1'i32)
     data.writeBE32(4, 0'i32)

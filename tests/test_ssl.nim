@@ -7,7 +7,7 @@ import ../async_postgres/pg_connection {.all.}
 when hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
-    import std/[openssl, base64]
+    import std/[net, openssl, base64]
     import ../async_postgres/pg_connection/ssl {.all.}
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
@@ -1010,27 +1010,63 @@ when hasAsyncDispatch and defined(ssl):
     finally:
       X509_free(certVar)
 
-  suite "SSL verify-full - IP SAN verification (OpenSSL backend)":
-    test "needsManualIpVerification only triggers for verify-full + IP literal":
-      check needsManualIpVerification(sslVerifyFull, "127.0.0.1")
-      check needsManualIpVerification(sslVerifyFull, "::1")
-      # DNS hostnames are handled by wrapConnectedSocket, not us.
-      check not needsManualIpVerification(sslVerifyFull, "db.example.com")
-      # Weaker modes don't enforce hostname/IP at all.
-      check not needsManualIpVerification(sslVerifyCa, "127.0.0.1")
-      check not needsManualIpVerification(sslRequire, "127.0.0.1")
-      check not needsManualIpVerification(sslPrefer, "127.0.0.1")
+  # std/openssl doesn't bind these; declare them for the tests below.
+  proc X509_check_ip_asc(
+    cert: PX509, ipasc: cstring, flags: cuint
+  ): cint {.cdecl, dynlib: DLLUtilName, importc.}
 
-    test "certMatchesIp accepts a matching iPAddress SAN":
+  proc X509_VERIFY_PARAM_get0_host(
+    param: pointer, idx: cint
+  ): cstring {.cdecl, dynlib: DLLUtilName, importc.}
+
+  # The matching OpenSSL applies during the handshake after
+  # `enforceVerifyFullIdentity` installs the identity: a DNS name via
+  # `X509_check_host` (default flags: SAN dNSNames, CN only when no dNSName SAN),
+  # an IP literal via `X509_check_ip_asc` against iPAddress SANs.
+  proc dnsMatches(cert: PX509, name: string): bool =
+    X509_check_host(cert, name.cstring, name.len.cint, 0.cuint, nil) == 1
+
+  proc ipMatches(cert: PX509, ip: string): bool =
+    X509_check_ip_asc(cert, ip.cstring, 0.cuint) == 1
+
+  suite "SSL verify-full - certificate identity contract (OpenSSL backend)":
+    test "IP-SAN cert matches its IP and rejects others":
       withCert(ipSanCertDerB64, cert):
-        check certMatchesIp(cert, "127.0.0.1")
+        check ipMatches(cert, "127.0.0.1")
+        check not ipMatches(cert, "10.0.0.1")
+        # IP-only cert: no dNSName SAN, so CN=pgtest is used and rejects a name.
+        check not dnsMatches(cert, "example.com")
 
-    test "certMatchesIp rejects a non-matching IP":
-      withCert(ipSanCertDerB64, cert):
-        check not certMatchesIp(cert, "10.0.0.1")
-
-    test "certMatchesIp rejects a cert with no iPAddress SAN":
-      # Pre-fix this cert (chain-valid, DNS-only) was silently accepted for an
-      # IP connection under verify-full — the core of H-3.
+    test "DNS-SAN cert matches its hostname and rejects others":
+      # Pre-fix this chain-valid cert was accepted for *any* verify-full host.
       withCert(dnsOnlyCertDerB64, cert):
-        check not certMatchesIp(cert, "127.0.0.1")
+        check dnsMatches(cert, "example.com")
+        check not dnsMatches(cert, "evil.example.com")
+        # A dNSName SAN is present, so the CN (pgtest) must be ignored.
+        check not dnsMatches(cert, "pgtest")
+        # And a DNS-only cert must not satisfy a verify-full connection to an IP.
+        check not ipMatches(cert, "127.0.0.1")
+
+  suite "SSL verify-full - enforceVerifyFullIdentity (OpenSSL backend)":
+    test "installs the DNS host on the SSL handle":
+      # CVerifyNone avoids a system trust-store scan; the host is recorded anyway.
+      let ctx = newContext(verifyMode = CVerifyNone)
+      let ssl = SSL_new(ctx.context)
+      doAssert ssl != nil
+      try:
+        enforceVerifyFullIdentity(ssl, "db.example.com")
+        check $X509_VERIFY_PARAM_get0_host(SSL_get0_param(ssl), 0.cint) ==
+          "db.example.com"
+      finally:
+        SSL_free(ssl)
+
+    test "accepts IP literals without error":
+      let ctx = newContext(verifyMode = CVerifyNone)
+      let ssl = SSL_new(ctx.context)
+      doAssert ssl != nil
+      try:
+        # Goes through the iPAddress-SAN path; must not raise.
+        enforceVerifyFullIdentity(ssl, "127.0.0.1")
+        enforceVerifyFullIdentity(ssl, "::1")
+      finally:
+        SSL_free(ssl)

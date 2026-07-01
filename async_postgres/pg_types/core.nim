@@ -888,12 +888,6 @@ proc `<`*(a, b: PgNumeric): bool =
 proc `<=`*(a, b: PgNumeric): bool =
   cmp(a, b) <= 0
 
-proc `>`*(a, b: PgNumeric): bool =
-  cmp(a, b) > 0
-
-proc `>=`*(a, b: PgNumeric): bool =
-  cmp(a, b) >= 0
-
 proc hash*(v: PgNumeric): Hash =
   ## Hash consistent with value-based ==.
   if v.sign == pgNaN:

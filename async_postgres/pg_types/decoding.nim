@@ -89,7 +89,16 @@ proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
     raise newException(
       PgTypeError, "Binary timestamp is '-infinity', not representable as a DateTime"
     )
-  let unixUs = pgUs + pgEpochUnix * 1_000_000
+  # Non-sentinel values within ``pgEpochUs`` of ``int64.high`` are not the
+  # 'infinity' marker but still overflow the epoch shift below; reject them as a
+  # catchable PgTypeError rather than crash with an uncatchable OverflowDefect.
+  # Adding the positive ``pgEpochUs`` can only overflow at the high end, so no
+  # symmetric low-end guard is needed.
+  const pgEpochUs = pgEpochUnix * 1_000_000
+  if pgUs > int64.high - pgEpochUs:
+    raise
+      newException(PgTypeError, "Binary timestamp out of representable range: " & $pgUs)
+  let unixUs = pgUs + pgEpochUs
   var unixSec = unixUs div 1_000_000
   var fracUs = unixUs mod 1_000_000
   if fracUs < 0:
@@ -141,6 +150,12 @@ proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz =
   if us < 0 or us > pgTimeMaxUs:
     raise newException(PgTypeError, "Binary timetz: microseconds out of range " & $us)
   let pgOffset = fromBE32(data.toOpenArray(8, 11))
+  # ``utcOffset`` un-negates the wire value, but negating ``int32.low`` overflows
+  # int32 (raising an uncatchable OverflowDefect), so reject it. Real timezone
+  # offsets are tiny; only a crafted/corrupt value reaches this bound.
+  if pgOffset == int32.low:
+    raise
+      newException(PgTypeError, "Binary timetz: UTC offset out of range " & $pgOffset)
   let hours = int32(us div 3_600_000_000)
   let rem1 = us mod 3_600_000_000
   let minutes = int32(rem1 div 60_000_000)
