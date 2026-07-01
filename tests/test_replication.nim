@@ -40,6 +40,21 @@ suite "LSN":
     expect(PgTypeError):
       discard parseLsn("0/XYZ")
 
+  test "parseLsn half wider than 32 bits":
+    # A wider half must be rejected, not silently truncated to 32 bits.
+    expect(PgTypeError):
+      discard parseLsn("100000000/0")
+
+  test "parseLsn half wider than 64 bits":
+    # fromHex wraps modulo 2^64 past 16 hex digits instead of raising.
+    expect(PgTypeError):
+      discard parseLsn("10000000000000000/0")
+
+  test "parseLsn zero-padded half longer than 16 characters still parses":
+    # Leading zeros pad past 16 characters but the value is still in-range.
+    let lsn = parseLsn("000000000000000001/1")
+    check lsn.toUInt64 == 0x1_00000001'u64
+
   test "InvalidLsn":
     check $InvalidLsn == "0/0"
     check InvalidLsn.toUInt64 == 0'u64
@@ -142,6 +157,14 @@ suite "Replication message parsing":
     check replMsg.xlogData.data == @[1'u8, 2, 3]
     # receivedEndLsn = startLsn + data.len, independent of walEnd
     check replMsg.xlogData.receivedEndLsn == Lsn(0x103'u64)
+
+  test "receivedEndLsn raises instead of wrapping past uint64.high":
+    # Unreachable from a real server's WAL position, but the addition must
+    # not silently wrap into a smaller, wrong LSN.
+    let xlog =
+      XLogData(startLsn: Lsn(high(uint64) - 1), walEnd: Lsn(0'u64), data: @[1'u8, 2, 3])
+    expect(PgProtocolError):
+      discard xlog.receivedEndLsn
 
   test "parse PrimaryKeepalive":
     var payload: seq[byte]
@@ -517,6 +540,19 @@ suite "pgoutput decoder bounds checking":
     expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
+  test "Insert with column count over PG's 1600 column limit raises PgProtocolError":
+    # 2000 well-formed 'n' (NULL) columns would otherwise decode successfully;
+    # the explicit upper bound must reject it before the loop inspects the buffer.
+    var data: seq[byte]
+    data.add(byte('I'))
+    data.addInt32(16384'i32)
+    data.add(byte('N'))
+    data.addInt16(2000'i16)
+    for _ in 0 ..< 2000:
+      data.add(byte('n'))
+    expect(PgProtocolError):
+      discard parsePgOutputMessage(data)
+
   test "Insert tuple data length past end raises PgProtocolError":
     var data: seq[byte]
     data.add(byte('I'))
@@ -558,6 +594,21 @@ suite "pgoutput decoder bounds checking":
     data.add(0'u8)
     data.addInt32(23'i32) # typeOid
     # typeMod missing — truncated here
+    expect(PgProtocolError):
+      discard parsePgOutputMessage(data)
+
+  test "Relation with column count over PG's 1600 column limit raises PgProtocolError":
+    var data: seq[byte]
+    data.add(byte('R'))
+    data.addInt32(16384'i32)
+    for c in "public":
+      data.add(byte(c))
+    data.add(0'u8)
+    for c in "t":
+      data.add(byte(c))
+    data.add(0'u8)
+    data.add(byte('d')) # replicaIdentity
+    data.addInt16(2000'i16) # over the limit; no column entries need to follow
     expect(PgProtocolError):
       discard parsePgOutputMessage(data)
 
