@@ -204,6 +204,10 @@ const
   pgEpochOffset* = 946_684_800'i64
     ## Seconds between Unix epoch (1970-01-01) and PostgreSQL epoch (2000-01-01).
 
+  MaxRelationColumns = 1600
+    ## PostgreSQL's max columns per table (``MaxHeapAttributeNumber``).
+    ## pgoutput's column-count wire field can never exceed this in practice.
+
 proc `==`*(a, b: Lsn): bool {.borrow.}
 proc `<`*(a, b: Lsn): bool {.borrow.}
 proc `<=`*(a, b: Lsn): bool {.borrow.}
@@ -240,14 +244,23 @@ proc `$`*(lsn: Lsn): string =
 
 proc parseLsn*(s: string): Lsn =
   ## Parse an LSN from ``"X/Y"`` hex string. Converts a malformed value (wrong
-  ## shape or non-hex halves) into `PgTypeError` so callers stay under the
-  ## ``except PgError`` contract, mirroring `parseTimelineId`.
+  ## shape, non-hex halves, or a half wider than 32 bits) into `PgTypeError`
+  ## so callers stay under the ``except PgError`` contract, mirroring
+  ## `parseTimelineId`.
   let parts = s.split('/')
   if parts.len != 2:
+    raise newException(PgTypeError, "Invalid LSN format: " & s)
+  # fromHex[uint64] wraps silently past 16 significant hex digits instead of
+  # raising; compare significant digits, not raw length, so a zero-padded but
+  # in-range half isn't rejected.
+  if stripLeadingZeros(parts[0]).len > 16 or stripLeadingZeros(parts[1]).len > 16:
     raise newException(PgTypeError, "Invalid LSN format: " & s)
   pgTypeErrorOnValueError("Invalid LSN format: " & s):
     let hi = fromHex[uint64](parts[0])
     let lo = fromHex[uint64](parts[1])
+    # A half > 32 bits would have its excess bits silently dropped by `hi shl 32` below.
+    if hi > 0xFFFF_FFFF'u64 or lo > 0xFFFF_FFFF'u64:
+      raise newException(PgTypeError, "Invalid LSN format: " & s)
     Lsn((hi shl 32) or lo)
 
 # PostgreSQL timestamp helpers
@@ -303,6 +316,14 @@ proc readBytesAt(buf: openArray[byte], pos, n: int): seq[byte] {.inline.} =
   ensureAvail(buf, pos, n)
   readBytes(buf, pos, n)
 
+proc readColumnCountAt(
+    buf: openArray[byte], pos: int, context: string
+): int16 {.inline.} =
+  ## Read a pgoutput column-count field, bounded by ``MaxRelationColumns``.
+  result = readInt16At(buf, pos)
+  if result < 0 or result.int > MaxRelationColumns:
+    raise newException(PgProtocolError, context & ": invalid column count " & $result)
+
 proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at offset. Returns (string, next offset).
   if offset >= buf.len:
@@ -320,10 +341,8 @@ proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
 proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
   ## Decode a pgoutput TupleData structure.
   var pos = offset
-  let numCols = readInt16At(buf, pos)
+  let numCols = readColumnCountAt(buf, pos, "pgoutput tuple")
   pos += 2
-  if numCols < 0:
-    raise newException(PgProtocolError, "pgoutput tuple: negative column count")
   var fields = newSeq[TupleField](numCols)
   for i in 0 ..< numCols:
     let kind = char(readByteAt(buf, pos))
@@ -380,10 +399,8 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     pos = pos3
     msg.replicaIdentity = char(readByteAt(data, pos))
     inc pos
-    let numCols = readInt16At(data, pos)
+    let numCols = readColumnCountAt(data, pos, "pgoutput Relation")
     pos += 2
-    if numCols < 0:
-      raise newException(PgProtocolError, "pgoutput Relation: negative column count")
     msg.columns = newSeq[RelationColumn](numCols)
     for i in 0 ..< numCols:
       var col = RelationColumn()
@@ -487,7 +504,14 @@ proc receivedEndLsn*(msg: XLogData): Lsn =
   ## (``startLsn + len(data)``). Use this when acknowledging received data via
   ## ``sendStandbyStatus``; do not use ``walEnd``, which is the server's
   ## current WAL position and may point past data this message does not carry.
-  Lsn(uint64(msg.startLsn) + uint64(msg.data.len))
+  let startLsn = uint64(msg.startLsn)
+  let dataLen = uint64(msg.data.len)
+  # Unsigned addition wraps silently instead of raising; check before adding.
+  if dataLen > high(uint64) - startLsn:
+    raise newException(
+      PgProtocolError, "receivedEndLsn: startLsn + data.len overflows uint64"
+    )
+  Lsn(startLsn + dataLen)
 
 proc decodePgOutput*(msg: XLogData): PgOutputMessage =
   ## Convenience: decode the pgoutput message from an XLogData's data field.
