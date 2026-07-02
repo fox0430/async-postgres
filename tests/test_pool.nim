@@ -470,18 +470,15 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
-  test "release stamps lastUsedAt with the return time, not stale cachedNow":
+  test "release stamps lastUsedAt with the return time, not a stale acquire-time timestamp":
     let pool = makePool()
     pool.active = 1
-    let staleNow = Moment.now() - minutes(30)
-    pool.cachedNow = staleNow
     let beforeRelease = Moment.now()
     let conn = mockConn()
     pool.release(conn)
     check pool.idle.len == 1
     check pool.idle[0].conn == conn
     check pool.idle[0].lastUsedAt >= beforeRelease
-    check pool.idle[0].lastUsedAt > staleNow
 
   test "release discards connection in transaction":
     let pool = makePool()
@@ -1768,11 +1765,9 @@ when hasChronos:
         pool.config.idleTimeout = milliseconds(200)
         pool.config.maintenanceInterval = milliseconds(20)
 
-        # Emulate a long borrow: `cachedNow` froze at acquire time, far older
-        # than idleTimeout. With a correct release, `lastUsedAt` is stamped at
-        # the actual return time, so the just-returned conn is well within the
-        # idle window and must not be reaped.
-        pool.cachedNow = Moment.now() - seconds(10)
+        # Emulate a long borrow: release must stamp `lastUsedAt` at the actual
+        # return time, so the just-returned conn is well within the idle window
+        # and must not be reaped.
         pool.active = 1
         let conn = mockConn()
         pool.release(conn)
@@ -1782,7 +1777,7 @@ when hasChronos:
         await sleepAsync(milliseconds(60))
 
         # idleTimeout (200ms) has not elapsed since the real return time, so the
-        # conn survives. The stale cachedNow (10s ago) would have evicted it.
+        # conn survives. A stale timestamp would have evicted it.
         doAssert pool.idle.len == 1
 
         pool.closed = true

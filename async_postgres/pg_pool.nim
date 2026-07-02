@@ -118,8 +118,6 @@ type
     waiterCount: int ## Number of non-cancelled waiters
     closed: bool
     maintenanceTask: Future[void]
-    cachedNow: Moment
-      ## Updated on acquire(); reused by release() to avoid extra syscalls
     metrics: PoolMetrics
     pendingOps: Deque[PendingPoolOp] ## Queue for implicit pipeline batching
     dispatchScheduled: bool ## Whether a dispatch callback is pending
@@ -611,7 +609,7 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   )
 
   try:
-    pool.cachedNow = Moment.now()
+    let now = Moment.now()
     # Open all `minSize` connections concurrently. `allFutures` waits for
     # every connect to settle (success or failure) without short-circuiting,
     # so a failure in one does not abandon the others mid-handshake — the
@@ -634,7 +632,7 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
         let conn = f.read()
         conn.ownerPool = pool
         pool.metrics.createCount.inc
-        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
     if firstErr != nil:
       raise firstErr
   except CatchableError as e:
@@ -824,8 +822,8 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   if pool.closed:
     raise newException(PgPoolError, "Pool is closed")
 
-  pool.cachedNow = Moment.now()
-  let acquireStart = pool.cachedNow
+  let now = Moment.now()
+  let acquireStart = now
 
   # `acquireTimeout` is a deadline for the whole acquire: idle health-check
   # pings, a caller-driven connect, and the final waiter wait all draw from
@@ -860,7 +858,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         await pool.tracedClose(pc.conn)
         continue
       if pool.config.maxLifetime > ZeroDuration and
-          pool.cachedNow - pc.conn.createdAt > pool.config.maxLifetime:
+          now - pc.conn.createdAt > pool.config.maxLifetime:
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
         continue
@@ -873,7 +871,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           pool.config.tlsHealthCheckTimeout
         else:
           pool.config.healthCheckTimeout
-      if idleThreshold > ZeroDuration and pool.cachedNow - pc.lastUsedAt > idleThreshold:
+      if idleThreshold > ZeroDuration and now - pc.lastUsedAt > idleThreshold:
         var pingBudget = pool.config.pingTimeout
         if hasDeadline:
           let rem = remainingBudget()
