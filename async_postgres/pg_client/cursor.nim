@@ -102,7 +102,8 @@ proc openCursorImpl(
                 case rmsg.kind
                 of bmkReadyForQuery:
                   conn.txStatus = rmsg.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break drainLoop
                 else:
                   discard
@@ -117,7 +118,8 @@ proc openCursorImpl(
               while (let ropt = conn.nextMessage(); ropt.isSome):
                 if ropt.get.kind == bmkReadyForQuery:
                   conn.txStatus = ropt.get.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break errDrain
               await conn.fillRecvBuf()
           raise queryError
@@ -162,7 +164,8 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
                   discard
                 of bmkReadyForQuery:
                   conn.txStatus = rmsg.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break drainLoop
                 else:
                   discard
@@ -176,7 +179,8 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
               while (let ropt = conn.nextMessage(); ropt.isSome):
                 if ropt.get.kind == bmkReadyForQuery:
                   conn.txStatus = ropt.get.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break errDrain
               await conn.fillRecvBuf()
           # The Sync above aborts the (implicit) transaction holding the portal,
@@ -252,7 +256,8 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop

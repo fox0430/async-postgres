@@ -478,7 +478,8 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
               queryError = newPgQueryError(msg.errorFields)
           of bmkReadyForQuery:
             conn.txStatus = msg.txStatus
-            conn.state = csReady
+            if conn.state != csClosed:
+              conn.state = csReady
             if queryError != nil:
               # The batch ran as one implicit transaction that aborted, but
               # prepared statements created by Parse survive the rollback (they
@@ -719,7 +720,8 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
           discard
     raise e
 
-  conn.state = csReady
+  if conn.state != csClosed:
+    conn.state = csReady
   return IsolatedPipelineResults(results: results, errors: errors)
 
 proc executeIsolated*(

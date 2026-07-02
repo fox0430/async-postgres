@@ -57,7 +57,8 @@ proc prepareImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop
@@ -149,7 +150,8 @@ proc executeImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop
@@ -215,7 +217,8 @@ proc closeImpl*(stmt: PreparedStatement): Future[void] {.async.} =
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop
