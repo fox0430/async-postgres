@@ -1574,6 +1574,26 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "queryInTransaction with rfBinary decodes binary rows":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # rfBinary makes the server send binary DataRows; the recv loop must
+      # record the requested column formats so accessors take the binary
+      # decode path instead of reading raw big-endian bytes as text.
+      let qr = await conn.queryInTransaction(
+        "SELECT 42::int4, 'hello'::text", @[], resultFormat = rfBinary
+      )
+      doAssert qr.rows.len == 1
+      doAssert qr.fields[0].formatCode == 1
+      doAssert qr.fields[1].formatCode == 1
+      doAssert qr.rows[0].getInt(0) == 42
+      doAssert qr.rows[0].getStr(1) == "hello"
+
+      await conn.close()
+
+    waitFor t()
+
   test "queryInTransaction with comment-only SQL does not capture COMMIT tag":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
