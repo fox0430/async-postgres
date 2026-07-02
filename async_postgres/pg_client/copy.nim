@@ -41,7 +41,8 @@ proc drainToReady(conn: PgConnection) {.async.} =
         let msg = opt.get
         if msg.kind == bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           break drainLoop
       await conn.fillRecvBuf()
 
@@ -90,7 +91,8 @@ proc copyInRawImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           return commandTag
@@ -148,7 +150,8 @@ proc copyInRawImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop2
@@ -250,7 +253,8 @@ proc copyInStreamImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           return info
@@ -388,7 +392,8 @@ proc copyInStreamImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop2
@@ -460,7 +465,8 @@ proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.}
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop
@@ -539,7 +545,8 @@ proc copyOutStreamImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop

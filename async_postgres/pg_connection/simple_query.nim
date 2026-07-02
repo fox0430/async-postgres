@@ -120,7 +120,8 @@ proc simpleQueryImpl*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop
@@ -149,7 +150,8 @@ proc simpleExecImpl*(conn: PgConnection, sql: string): Future[string] {.async.} 
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             raise queryError
           break recvLoop
@@ -346,7 +348,8 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
             queryError = newPgQueryError(msg.errorFields)
           of bmkReadyForQuery:
             conn.txStatus = msg.txStatus
-            conn.state = csReady
+            if conn.state != csClosed:
+              conn.state = csReady
             if queryError != nil:
               raise queryError
             break recvLoop

@@ -70,7 +70,8 @@ proc execInTransactionImpl(
             queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             # Error occurred: if we're in a failed transaction, ROLLBACK to
             # release it. Swallow any failure so a ROLLBACK error cannot mask
@@ -228,7 +229,8 @@ proc queryInTransactionImpl(
             queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             # ROLLBACK a failed transaction, swallowing any failure so it cannot
             # mask the query error; the outer wait(timeout) bounds the cleanup.

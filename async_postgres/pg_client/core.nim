@@ -495,7 +495,10 @@ template queryRecvLoop*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          # csClosed is terminal — an orphan loop after `invalidateOnTimeout`
+          # must not resurrect the connection.
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
               conn.removeStmtCache(sql)
@@ -618,7 +621,8 @@ template queryEachRecvLoop*(
         of bmkReadyForQuery:
           conn.recvBufStart = pos
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if callbackError != nil:
             raise callbackError
           if queryError != nil:
@@ -678,7 +682,8 @@ template execRecvLoop*(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          if conn.state != csClosed:
+            conn.state = csReady
           if queryError != nil:
             if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
               conn.removeStmtCache(sql)
