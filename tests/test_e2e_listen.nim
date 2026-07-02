@@ -293,6 +293,42 @@ suite "E2E: Background LISTEN Pump":
 
     waitFor t()
 
+  test "close on listening connection does not resurrect via reconnect":
+    # Regression: under asyncdispatch, cancelAndWait on the pump is a no-op.
+    # A naive close() left listenStopRequested unset, so the pump's recv failed
+    # on the closed transport, its reconnect loop saw a populated
+    # listenChannels, and it re-LISTENed into an orphan socket that leaked.
+    proc t() {.async.} =
+      let listener = await connect(plainConfig())
+      let originalPid = listener.pid
+
+      listener.onNotify(
+        proc(n: Notification) {.gcsafe, raises: [].} =
+          discard
+      )
+      await listener.listen("close_no_resurrect")
+      doAssert listener.state == csListening
+
+      await listener.close()
+      doAssert listener.state == csClosed
+      doAssert listener.listenTask == nil
+
+      # First reconnect attempt fires after a 1s backoff; wait past it and
+      # confirm the pump did not flip the state back to csListening or take a
+      # fresh backend pid.
+      await sleepAsync(milliseconds(1500))
+      doAssert listener.state == csClosed
+      doAssert listener.pid == originalPid
+
+      # A sender publishing to the channel must not be able to revive delivery.
+      let sender = await connect(plainConfig())
+      await sender.notify("close_no_resurrect", "should_not_arrive")
+      await sleepAsync(milliseconds(200))
+      doAssert listener.state == csClosed
+      await sender.close()
+
+    waitFor t()
+
   test "unlisten partial channels keeps pump running":
     proc t() {.async.} =
       let listener = await connect(plainConfig())
