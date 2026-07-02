@@ -200,8 +200,17 @@ proc queryInTransactionImpl(
         of bmkParseComplete, bmkBindComplete:
           discard
         of bmkRowDescription:
-          qr.fields = msg.fields
-          qr.data = newRowData(int16(msg.fields.len))
+          var fields = msg.fields
+          var cf: seq[int16]
+          var co: seq[int32]
+          if resultFormats.len > 0:
+            cf = deriveColFmts(resultFormats, fields.len)
+            co = newSeq[int32](fields.len)
+            for i in 0 ..< fields.len:
+              co[i] = fields[i].typeOid
+              fields[i].formatCode = cf[i]
+          qr.fields = fields
+          qr.data = newRowData(int16(qr.fields.len), cf, co)
           qr.data.fields = qr.fields
         of bmkNoData:
           discard
