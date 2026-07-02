@@ -5,7 +5,7 @@ import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 import pkg/nimcrypto/utils as ncutils
 
-import pg_errors
+import pg_errors, pg_saslprep
 
 template burnStr*(s: var string) =
   ## Wipe a string's heap buffer. Compiler is prevented from eliding the
@@ -167,8 +167,9 @@ proc scramClientFinalMessage*(
   var cbindInput: seq[byte]
   var authMessage: string
   var clientProof: array[32, byte]
+  let preparedPassword = saslprep(password)
   try:
-    saltedPassword = sha256.pbkdf2(password, salt, iterations, 32)
+    saltedPassword = sha256.pbkdf2(preparedPassword, salt, iterations, 32)
     clientKey = sha256.hmac(saltedPassword, "Client Key").data
     storedKey = sha256.digest(clientKey).data
     cbindInput = toBytes(state.gs2Header)
