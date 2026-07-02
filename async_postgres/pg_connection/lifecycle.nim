@@ -437,7 +437,20 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
   ## Close the connection. Idempotent: safe to call multiple times.
   # Stop background listen pump if running
   if conn.listenTask != nil and not conn.listenTask.finished:
-    await cancelAndWait(conn.listenTask)
+    when hasAsyncDispatch:
+      # cancelAndWait is a no-op here: signal stop so the pump's reconnect loop
+      # bails instead of re-LISTENing into an orphan socket, close the transport
+      # to break its recv, then await the pump before dropping the handle.
+      conn.listenStopRequested = true
+      let pump = conn.listenTask
+      await conn.closeTransport()
+      try:
+        await pump
+      except CatchableError:
+        discard
+      conn.listenStopRequested = false
+    else:
+      await cancelAndWait(conn.listenTask)
   conn.listenTask = nil
   # Only send Terminate if we haven't already detected the connection is dead
   if conn.state != csClosed and conn.isConnected():
