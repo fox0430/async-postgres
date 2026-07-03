@@ -18,7 +18,12 @@ import ./mock_pg_server
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
-    host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
+    host: "127.0.0.1",
+    port: port,
+    user: "test",
+    database: "test",
+    password: "pencil",
+    sslMode: sslDisable,
   )
 
 # Handshake failures
@@ -531,8 +536,10 @@ suite "SCRAM mutual-auth enforcement":
         let st = await ms.accept()
         try:
           let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
-          # mockConfig sets no password, so both sides use "".
-          await sendBytes(st, buildAuthSASLFinal(serverSignatureFor("", cfb, sf, cf)))
+          # mockConfig sets password "pencil"; both sides must use the same.
+          await sendBytes(
+            st, buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf))
+          )
           await sendBytes(st, buildAuthOk())
           await sendBytes(st, buildBackendKeyData(1, 2))
           await sendBytes(st, buildReadyForQuery('I'))
