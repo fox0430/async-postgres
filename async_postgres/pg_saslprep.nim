@@ -4,8 +4,10 @@
 ## Unicode form differs from the raw input (e.g. U+00A0 -> U+0020,
 ## U+FB01 "fi" ligature -> "fi", NFKC-decomposed forms).
 ##
-## Unassigned code points are permitted (RFC 3454 query-mode semantics per
-## RFC 4013 for password inputs), matching PostgreSQL's pg_saslprep.
+## Unassigned code points (RFC 3454 Table A.1, Unicode 3.2) are not
+## prohibited here. This deviates from PostgreSQL's pg_saslprep, which
+## rejects them; the A.1 table is large and the practical impact is low
+## (such a password could not have been set via `CREATE ROLE` either).
 
 import std/[strutils, unicode]
 
@@ -85,7 +87,7 @@ proc isProhibited(cp: int32): bool =
 
 proc saslprep*(input: string): string =
   ## Apply RFC 4013 SASLprep. Raises `PgConnectionError` for prohibited
-  ## code points or bidi rule violations.
+  ## code points, bidi rule violations, or empty passwords.
   # Fast path: SASLprep is the identity on printable ASCII (0x20..0x7E).
   var asciiFast = true
   for c in input:
@@ -94,62 +96,67 @@ proc saslprep*(input: string): string =
       asciiFast = false
       break
   if asciiFast:
-    return input
+    if input.len == 0:
+      raise newException(PgConnectionError, "SASLprep: empty password")
+    # Return a heap-allocated copy (not sharing the caller's buffer) so the
+    # caller can safely wipe the result.
+    result = newString(input.len)
+    copyMem(addr result[0], unsafeAddr input[0], input.len)
+    return
 
-  # Step 1: map (B.1 -> delete, C.1.2 -> U+0020). B.1 takes precedence, so
-  # code points in both (U+200B..U+200D) are deleted rather than spaced.
+  # Step 1: map (C.1.2 -> U+0020 takes precedence over B.1 -> delete).
+  # U+200B is the only code point in both tables; PostgreSQL maps it to
+  # space, so non-ASCII space is checked first.
   var mapped = newStringOfCap(input.len)
   try:
     for r in runes(input):
       let cp = int32(r)
-      if isMapToNothing(cp):
-        continue
       if isNonAsciiSpace(cp):
         mapped.add(char(0x20))
+      elif isMapToNothing(cp):
+        discard
       else:
         mapped.add(r.toUTF8)
 
+    if mapped.len == 0:
+      raise newException(PgConnectionError, "SASLprep: empty password")
+
+    # Step 3 + 4: prohibit + bidi (RFC 3454 Section 6), run on the
+    # post-mapping string (matching PostgreSQL's pg_saslprep).
+    var hasRandAL = false
+    var hasL = false
+    var firstBidi = ""
+    var lastBidi = ""
+    var first = true
+    for r in runes(mapped):
+      let cp = int32(r)
+      if isProhibited(cp):
+        raise newException(
+          PgConnectionError, "SASLprep: prohibited code point U+" & toHex(cp.int64, 4)
+        )
+      let bidi = bidirectional(r)
+      if bidi == "R" or bidi == "AL":
+        hasRandAL = true
+      elif bidi == "L":
+        hasL = true
+      if first:
+        firstBidi = bidi
+        first = false
+      lastBidi = bidi
+
+    if hasRandAL and hasL:
+      raise newException(
+        PgConnectionError, "SASLprep: bidi violation (RandALCat and LCat both present)"
+      )
+    if hasRandAL and (
+      (firstBidi != "R" and firstBidi != "AL") or (lastBidi != "R" and lastBidi != "AL")
+    ):
+      raise newException(
+        PgConnectionError,
+        "SASLprep: bidi violation (RandALCat string must start and end with RandALCat)",
+      )
+
     # Step 2: NFKC normalize.
-    var normalized = toNFKC(mapped)
-    try:
-      # Step 3 + 4: prohibit + bidi (RFC 3454 Section 6).
-      var hasRandAL = false
-      var hasL = false
-      var firstBidi = ""
-      var lastBidi = ""
-      var first = true
-      for r in runes(normalized):
-        let cp = int32(r)
-        if isProhibited(cp):
-          raise newException(
-            PgConnectionError, "SASLprep: prohibited code point U+" & toHex(cp.int64, 4)
-          )
-        let bidi = bidirectional(r)
-        if bidi == "R" or bidi == "AL":
-          hasRandAL = true
-        elif bidi == "L":
-          hasL = true
-        if first:
-          firstBidi = bidi
-          first = false
-        lastBidi = bidi
-
-      if hasRandAL and hasL:
-        raise newException(
-          PgConnectionError,
-          "SASLprep: bidi violation (RandALCat and LCat both present)",
-        )
-      if hasRandAL and (
-        (firstBidi != "R" and firstBidi != "AL") or
-        (lastBidi != "R" and lastBidi != "AL")
-      ):
-        raise newException(
-          PgConnectionError,
-          "SASLprep: bidi violation (RandALCat string must start and end with RandALCat)",
-        )
-
-      result = normalized
-    finally:
-      burnString(normalized)
+    result = toNFKC(mapped)
   finally:
     burnString(mapped)

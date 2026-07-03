@@ -167,7 +167,7 @@ proc scramClientFinalMessage*(
   var cbindInput: seq[byte]
   var authMessage: string
   var clientProof: array[32, byte]
-  let preparedPassword = saslprep(password)
+  var preparedPassword = saslprep(password)
   try:
     saltedPassword = sha256.pbkdf2(preparedPassword, salt, iterations, 32)
     clientKey = sha256.hmac(saltedPassword, "Client Key").data
@@ -196,6 +196,7 @@ proc scramClientFinalMessage*(
     ncutils.burnMem(serverKey)
     ncutils.burnMem(clientProof)
     burnStr(authMessage)
+    burnStr(preparedPassword)
 
 proc computeTlsServerEndpoint*(certDer: openArray[byte]): seq[byte] =
   ## Compute tls-server-end-point channel binding data per RFC 5929.

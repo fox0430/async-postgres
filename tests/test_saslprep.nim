@@ -3,8 +3,9 @@ import std/unittest
 import ../async_postgres/[pg_saslprep, pg_errors]
 
 suite "SASLprep - ASCII fast path":
-  test "empty string":
-    check saslprep("") == ""
+  test "empty string is rejected":
+    expect PgConnectionError:
+      discard saslprep("")
 
   test "printable ASCII is identity":
     check saslprep("pencil") == "pencil"
@@ -25,10 +26,16 @@ suite "SASLprep - RFC 3454 B.1 (map to nothing)":
   test "soft hyphen U+00AD is deleted":
     check saslprep("I\xC2\xADX") == "IX"
 
-  test "ZWNJ U+200C is deleted (B.1 wins over C.2.2 prohibit)":
-    # 0x200C is in both B.1 (delete) and C.2.2 (prohibited). B.1 mapping
-    # runs first so the character is removed before the prohibit check.
+  test "ZWNJ U+200C is deleted (B.1, not in C.1.2)":
+    # 0x200C is in B.1 (delete) and C.2.2 (prohibited) but not C.1.2.
+    # B.1 mapping runs first so the character is removed before the
+    # prohibit check.
     check saslprep("a\xE2\x80\x8Cb") == "ab"
+
+  test "ZWSP U+200B is mapped to space (C.1.2 wins over B.1)":
+    # 0x200B is in both C.1.2 (map to space) and B.1 (delete).
+    # PostgreSQL checks C.1.2 first, so it becomes U+0020.
+    check saslprep("a\xE2\x80\x8Bb") == "a b"
 
   test "variation selectors U+FE00..U+FE0F are deleted":
     check saslprep("a\xEF\xB8\x80b") == "ab" # U+FE00
@@ -43,6 +50,9 @@ suite "SASLprep - RFC 3454 C.1.2 (non-ASCII space -> U+0020)":
 
   test "narrow no-break space U+202F becomes ASCII space":
     check saslprep("a\xE2\x80\xAFb") == "a b"
+
+  test "Ogham space mark U+1680 becomes ASCII space":
+    check saslprep("a\xE1\x9A\x80b") == "a b"
 
 suite "SASLprep - NFKC normalization":
   test "compat decomposition of feminine ordinal U+00AA -> a":
@@ -117,11 +127,12 @@ suite "SASLprep - bidirectional (RFC 3454 Section 6)":
     let s = "\xD8\xA7\xD8\xA8"
     check saslprep(s) == s
 
-suite "SASLprep - unassigned code points":
-  test "unassigned code point in Supplementary Private Use Area-A":
-    # RFC 4013 for passwords uses query semantics: unassigned code points
-    # are allowed. U+FDEF+1 = U+FDF0 is unassigned in older Unicode and
-    # not prohibited. Use U+0870 (was unassigned in earlier Unicode,
-    # assigned later) to demonstrate query-mode permissiveness.
-    # We instead validate by round-tripping an assigned-but-uncommon char.
-    check saslprep("\xE1\x9A\x80").len > 0 # U+1680 -> mapped to space
+suite "SASLprep - empty password handling":
+  test "password of only B.1 characters is rejected":
+    # Soft hyphen maps to nothing; the result is empty, which PostgreSQL
+    # rejects.
+    expect PgConnectionError:
+      discard saslprep("\xC2\xAD")
+
+  test "password of only ZWSP maps to a single space and is accepted":
+    check saslprep("\xE2\x80\x8B") == " "
