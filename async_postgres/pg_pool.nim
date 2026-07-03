@@ -840,6 +840,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     pool.metrics.timeoutCount.inc
     raise newException(PgPoolError, "Pool acquire timeout")
 
+  template raisePoolClosed() =
+    raise newException(PgPoolError, "Pool is closed")
+
   template recordAcquire() =
     pool.metrics.acquireCount.inc
     pool.metrics.acquireDuration =
@@ -856,11 +859,15 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       if pc.conn.state != csReady or pc.conn.socketHasFin():
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
+        if pool.closed:
+          raisePoolClosed()
         continue
       if pool.config.maxLifetime > ZeroDuration and
           now - pc.conn.createdAt > pool.config.maxLifetime:
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
+        if pool.closed:
+          raisePoolClosed()
         continue
       # Health check: ping connections that have been idle too long.
       # TLS connections use the tighter `tlsHealthCheckTimeout` window because
@@ -906,7 +913,15 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         except CatchableError:
           pool.metrics.closeCount.inc
           await pool.tracedClose(pc.conn)
+          if pool.closed:
+            raisePoolClosed()
           continue
+      # Popped conn is out of `idle`, so a `close()` that ran during ping/
+      # tracedClose above didn't drain it — discard here rather than hand a
+      # live conn back from a closed pool.
+      if pool.closed:
+        pool.closeNoWait(pc.conn)
+        raisePoolClosed()
       pool.active.inc
       pc.conn.borrowed = true
       recordAcquire()
@@ -924,16 +939,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           connCfg.connectTimeout = rem
           cappedByDeadline = true
       pool.active.inc
+      var newConn: PgConnection
       try:
-        let conn = await connect(connCfg)
-        conn.ownerPool = pool
-        conn.borrowed = true
-        pool.metrics.createCount.inc
-        # A successful caller-driven connect signals the DB is reachable —
-        # let the maintenance loop resume immediate replenishment.
-        pool.consecutiveConnectFailures = 0
-        recordAcquire()
-        return (conn, true)
+        newConn = await connect(connCfg)
       except CancelledError as e:
         # Cancellation (e.g. a caller's wait()-style deadline) must propagate
         # unwrapped so the canceller's machinery sees it.
@@ -950,6 +958,18 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           pool.metrics.timeoutCount.inc
           raise newException(PgPoolError, "Pool acquire timeout", e)
         raise newException(PgPoolError, "Pool connect failed", e)
+      pool.metrics.createCount.inc
+      # A successful caller-driven connect signals the DB is reachable —
+      # let the maintenance loop resume immediate replenishment.
+      pool.consecutiveConnectFailures = 0
+      if pool.closed:
+        pool.active.dec
+        pool.closeNoWait(newConn)
+        raisePoolClosed()
+      newConn.ownerPool = pool
+      newConn.borrowed = true
+      recordAcquire()
+      return (newConn, true)
 
   # Either max connections are reached or waiters are queued ahead of us;
   # queue up and wait for delivery.
@@ -965,6 +985,10 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     waitBudget = remainingBudget()
     if waitBudget <= ZeroDuration:
       raiseAcquireTimeout()
+  # If `close()` finished during any await above, its waiter sweep is done and
+  # nothing will fail a waiter enqueued after it — `await fut` would hang.
+  if pool.closed:
+    raisePoolClosed()
   let fut = newFuture[PgConnection]("PgPool.acquire")
   let waiter = Waiter(fut: fut, cancelled: false)
   pool.waiters.addLast(waiter)

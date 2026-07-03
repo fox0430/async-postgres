@@ -2855,6 +2855,92 @@ suite "Pool replenish close-race":
 
       waitFor t()
 
+suite "Pool acquire close-race":
+  test "acquire discards a connection won after the pool is closed":
+    # Regression: acquireImpl's `await connect()` in the new-conn branch could
+    # complete after close() finished, returning a live conn from a closed pool.
+    # Gate the handshake so the connect is provably in flight when we flip
+    # `closed`, then let it complete.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = seconds(5)
+
+      let acquireFut = pool.acquire()
+
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+
+      pool.closed = true
+      await sendFullHandshake(client)
+      await sleepAsync(milliseconds(80))
+
+      doAssert acquireFut.finished
+      doAssert acquireFut.failed
+      let err = acquireFut.readError()
+      doAssert err of PgPoolError
+      doAssert "closed" in err.msg
+      doAssert pool.active == 0
+      doAssert pool.metrics.createCount == 1
+      doAssert pool.metrics.closeCount == 1
+      doAssert pool.idle.len == 0
+
+      await pool.close()
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "acquire discards an idle conn whose ping resolves after close":
+    # Regression: after a health-check ping suspends, close() could complete
+    # before the ping's response, and the popped idle conn — no longer in
+    # `idle`, so not drained by close() — was returned live from a closed pool.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 2)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.healthCheckTimeout = milliseconds(1)
+      pool.config.pingTimeout = seconds(5)
+
+      # Warm one idle conn against the mock server, then age it so the next
+      # acquire triggers a ping.
+      let handshake = acceptAndReady(ms)
+      let conn = await connect(mockConfig(ms.port))
+      let client = await handshake
+      conn.ownerPool = pool
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now() - seconds(1)))
+
+      let acquireFut = pool.acquire()
+
+      # Drain the ping's Query(""), then flip closed before responding so
+      # acquireImpl sees pool.closed = true post-ping.
+      discard await drainFrontendMessage(client)
+      pool.closed = true
+
+      var resp: seq[byte]
+      resp.add(buildBackendMsg('I', @[])) # EmptyQueryResponse
+      resp.add(buildReadyForQuery('I'))
+      await sendBytes(client, resp)
+
+      await sleepAsync(milliseconds(80))
+
+      doAssert acquireFut.finished
+      doAssert acquireFut.failed
+      let err = acquireFut.readError()
+      doAssert err of PgPoolError
+      doAssert "closed" in err.msg
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 0
+
+      await pool.close()
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "Pool warmup parallelization":
   test "newPool opens minSize connections in parallel":
     # `newPool` should open all `minSize` connections concurrently (via
