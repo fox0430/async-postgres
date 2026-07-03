@@ -1294,6 +1294,60 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  when hasChronos:
+    # Same handoff-poisoning regression guard as the withTransactionDeadline
+    # version above; the retry variant's timeoutElse branches identically on
+    # `releasedSym`, so a clean unwind must hand a healthy conn to the waiter.
+    test "pool.withTransactionRetryDeadline hands off healthy conn when body unwinds cleanly on deadline":
+      proc t() {.async.} =
+        let pool =
+          await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+        let blocker = await pool.acquire()
+
+        var raised = false
+        proc macroTask() {.async.} =
+          try:
+            pool.withTransactionRetryDeadline(
+              RetryOptions(maxAttempts: 5), conn, milliseconds(200)
+            ):
+              # BEGIN completes well within the deadline, leaving the conn
+              # csReady. The cancellation arrives at the sleepAsync await with
+              # the conn idle, so bodyFn's `except CancelledError` leaves it
+              # untouched and finally's resetSession + release hands a healthy
+              # conn to the queued waiter.
+              await sleepAsync(seconds(1))
+          except PgTimeoutError:
+            raised = true
+
+        let macroFut = macroTask()
+        # Yield so macroTask queues its acquire before the waiter.
+        await sleepAsync(milliseconds(5))
+
+        var waiterOk = false
+        proc waiterTask() {.async.} =
+          let c = await pool.acquire()
+          # A poisoned (csClosed) conn handed via FIFO would fail here.
+          let res = await c.query("SELECT 1::int")
+          waiterOk = res.rows.len == 1 and res.rows[0].getInt(0) == 1'i32
+          c.release()
+
+        let waiterFut = waiterTask()
+
+        # Release blocker: conn goes to macroTask (FIFO head), waiter queued.
+        blocker.release()
+
+        await macroFut
+        doAssert raised, "deadline should have raised PgTimeoutError"
+
+        # macroTask released a healthy conn; waiter should complete with a
+        # usable connection rather than a poisoned one.
+        await waiterFut
+        doAssert waiterOk, "waiter should have received a usable connection"
+
+        await pool.close()
+
+      waitFor t()
+
   test "pool.withTransactionDeadline drops invalidated connection on deadline":
     proc t() {.async.} =
       let pool =
@@ -1315,6 +1369,62 @@ suite "E2E: Deadline-bounded Transaction":
       await pool.close()
 
     waitFor t()
+
+  when hasChronos:
+    # Under chronos, wait() cancels bodyFn and runs its finally (release)
+    # before the timeout handler runs. When the body unwinds cleanly (conn
+    # csReady), release() FIFO-hands a healthy connection to a queued waiter,
+    # skipping the health check. The handler must NOT then invalidate that
+    # already-handed-off connection — a regression that unconditionally calls
+    # invalidateOnTimeout would mark it csClosed *after* the handoff, leaving
+    # the waiter with a poisoned connection.
+    test "pool.withTransactionDeadline hands off healthy conn when body unwinds cleanly on deadline":
+      proc t() {.async.} =
+        let pool =
+          await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+        let blocker = await pool.acquire()
+
+        var raised = false
+        proc macroTask() {.async.} =
+          try:
+            pool.withTransactionDeadline(conn, milliseconds(200)):
+              # BEGIN completes well within the deadline, leaving the conn
+              # csReady. The cancellation arrives at the sleepAsync await with
+              # the conn idle, so bodyFn's `except CancelledError` leaves it
+              # untouched and finally's resetSession + release hands a healthy
+              # conn to the queued waiter.
+              await sleepAsync(seconds(1))
+          except PgTimeoutError:
+            raised = true
+
+        let macroFut = macroTask()
+        # Yield so macroTask queues its acquire before the waiter.
+        await sleepAsync(milliseconds(5))
+
+        var waiterOk = false
+        proc waiterTask() {.async.} =
+          let c = await pool.acquire()
+          # A poisoned (csClosed) conn handed via FIFO would fail here.
+          let res = await c.query("SELECT 1::int")
+          waiterOk = res.rows.len == 1 and res.rows[0].getInt(0) == 1'i32
+          c.release()
+
+        let waiterFut = waiterTask()
+
+        # Release blocker: conn goes to macroTask (FIFO head), waiter queued.
+        blocker.release()
+
+        await macroFut
+        doAssert raised, "deadline should have raised PgTimeoutError"
+
+        # macroTask released a healthy conn; waiter should complete with a
+        # usable connection rather than a poisoned one.
+        await waiterFut
+        doAssert waiterOk, "waiter should have received a usable connection"
+
+        await pool.close()
+
+      waitFor t()
 
   test "pool.withTransactionDeadline raises PgTimeoutError when acquire times out":
     proc t() {.async.} =
