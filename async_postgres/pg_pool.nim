@@ -900,6 +900,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
               rem
             else:
               min(pingBudget, rem)
+        # Count the conn as active across the ping so a concurrent acquire
+        # can't overshoot maxSize while it is off `idle`.
+        pool.active.inc
         try:
           await pc.conn.ping(pingBudget)
         except CancelledError as e:
@@ -908,17 +911,24 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           # departed canceller leaks. The interrupted ping leaves the protocol
           # out of sync, so close the popped conn (closeNoWait, since the pending
           # cancellation would interrupt a fresh await) and re-raise.
+          pool.active.dec
           pool.closeNoWait(pc.conn)
           raise e
         except CatchableError:
+          pool.active.dec
           pool.metrics.closeCount.inc
           await pool.tracedClose(pc.conn)
           if pool.closed:
             raisePoolClosed()
           continue
-      # Popped conn is out of `idle`, so a `close()` that ran during ping/
-      # tracedClose above didn't drain it — discard here rather than hand a
-      # live conn back from a closed pool.
+        # A close() during the ping didn't drain the popped conn — discard it.
+        if pool.closed:
+          pool.active.dec
+          pool.closeNoWait(pc.conn)
+          raisePoolClosed()
+        pc.conn.borrowed = true
+        recordAcquire()
+        return (pc.conn, false)
       if pool.closed:
         pool.closeNoWait(pc.conn)
         raisePoolClosed()

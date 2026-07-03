@@ -1109,6 +1109,48 @@ when hasChronos:
 
       waitFor t()
 
+    test "concurrent acquire during health-check ping cannot exceed maxSize":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.healthCheckTimeout = seconds(60)
+        pool.config.pingTimeout = seconds(60)
+
+        let (pinged, server, serverTransport) = await makeHangingConn()
+        pool.idle.addLast(
+          PooledConn(conn: pinged, lastUsedAt: Moment.now() - minutes(2))
+        )
+
+        # Acquirer A suspends inside the health-check ping; the conn under
+        # inspection must already hold the active slot.
+        let futA = pool.acquire()
+        doAssert not futA.finished
+        doAssert pool.active == 1
+
+        # Acquirer B must queue instead of dialing a second conn past maxSize.
+        let futB = pool.acquire()
+        doAssert not futB.finished
+        doAssert pool.active == 1
+        doAssert pool.waiterCount == 1
+
+        # Server answers the ping: A borrows the pinged conn without
+        # double-counting it.
+        discard await serverTransport.write(
+          buildBackendMsg('I', newSeq[byte]()) & buildReadyForQuery('I')
+        )
+        let connA = await futA
+        doAssert connA == pinged
+        doAssert pool.active == 1
+
+        pool.release(connA)
+        let connB = await futB
+        doAssert connB == pinged
+        doAssert pool.active == 1
+
+        await connB.close()
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
     test "all stale connections fail health check then creates new":
       let pool = makePool()
       pool.config.healthCheckTimeout = milliseconds(1)
