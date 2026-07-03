@@ -70,6 +70,62 @@ suite "E2E: COPY Protocol":
 
     waitFor t()
 
+  test "copyIn with COPY TO STDOUT raises PgQueryError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copy_wrongdir")
+      discard await conn.exec("CREATE TABLE test_copy_wrongdir (id int)")
+      discard await conn.exec("INSERT INTO test_copy_wrongdir VALUES (1), (2)")
+
+      var raised = false
+      try:
+        discard
+          await conn.copyIn("COPY test_copy_wrongdir TO STDOUT", @["3\n".toBytes()])
+      except PgQueryError as e:
+        raised = true
+        doAssert "copyOut" in e.msg
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Connection stays usable and no data was inserted
+      let res = await conn.query("SELECT count(*) FROM test_copy_wrongdir")
+      doAssert res.rows[0].getStr(0) == "2"
+
+      discard await conn.exec("DROP TABLE test_copy_wrongdir")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyIn with non-COPY statement raises PgQueryError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Row-returning statement (RowDescription)
+      var raised = false
+      try:
+        discard await conn.copyIn("SELECT 1", @["1\n".toBytes()])
+      except PgQueryError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Non-row statement (CommandComplete only)
+      raised = false
+      try:
+        discard await conn.copyIn("SET search_path TO public", @["1\n".toBytes()])
+      except PgQueryError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Connection stays usable
+      let res = await conn.query("SELECT 1")
+      doAssert res.rows[0].getStr(0) == "1"
+
+      await conn.close()
+
+    waitFor t()
+
   test "copyOut with invalid SQL raises PgError":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -455,6 +511,32 @@ suite "E2E: COPY IN Stream":
       doAssert conn.state == csReady
 
       # Connection should still be usable
+      let res = await conn.simpleQuery("SELECT 1")
+      doAssert res[0].rows[0][0].get().toString() == "1"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "copyInStream non-COPY statement raises without pulling callback":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var callCount = 0
+      let cb = makeCopyInCallback:
+        inc callCount
+        newSeq[byte]()
+
+      var raised = false
+      try:
+        discard await conn.copyInStream("SELECT 1", cb)
+      except PgQueryError:
+        raised = true
+      doAssert raised
+      doAssert callCount == 0
+      doAssert conn.state == csReady
+
+      # Connection stays usable
       let res = await conn.simpleQuery("SELECT 1")
       doAssert res[0].rows[0][0].get().toString() == "1"
 

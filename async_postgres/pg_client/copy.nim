@@ -87,6 +87,18 @@ proc copyInRawImpl*(
         case msg.kind
         of bmkCopyInResponse:
           break recvLoop
+        of bmkCopyOutResponse:
+          # Wrong direction; keep draining to ReadyForQuery, then raise there.
+          if queryError == nil:
+            queryError = newException(
+              PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOut"
+            )
+        of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
+          # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+          if queryError == nil:
+            queryError = newException(
+              PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement"
+            )
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
@@ -170,6 +182,10 @@ proc copyIn*(
   ## A server-side abort (constraint violation, disk full, …) is detected
   ## between batches, so a doomed COPY stops streaming early and raises the
   ## server's ``PgQueryError`` instead of sending the whole input first.
+  ##
+  ## A statement that is not ``COPY ... FROM STDIN`` (e.g. ``COPY ... TO
+  ## STDOUT`` or a plain query) raises ``PgQueryError`` instead of silently
+  ## succeeding without sending any data.
   var tag: string
   withConnTracing(
     conn,
@@ -249,6 +265,18 @@ proc copyInStreamImpl*(
           info.format = msg.copyFormat
           info.columnFormats = msg.copyColumnFormats
           break recvLoop
+        of bmkCopyOutResponse:
+          # Wrong direction; keep draining to ReadyForQuery, then raise there.
+          if queryError == nil:
+            queryError = newException(
+              PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOutStream"
+            )
+        of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
+          # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+          if queryError == nil:
+            queryError = newException(
+              PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement"
+            )
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
@@ -421,6 +449,9 @@ proc copyInStream*(
   ## an error arriving mid-batch only surfaces after the current batch — so a
   ## doomed COPY is bounded by one batch of extra streaming, not the whole input.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ##
+  ## A statement that is not ``COPY ... FROM STDIN`` raises ``PgQueryError``
+  ## instead of silently succeeding without pulling from ``callback``.
   var info: CopyInInfo
   withConnTracing(
     conn,
