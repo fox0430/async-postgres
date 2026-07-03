@@ -140,6 +140,113 @@ suite "E2E: COPY Protocol":
 
     waitFor t()
 
+  test "copyOut with COPY FROM STDIN raises PgQueryError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyout_wrongdir")
+      discard await conn.exec("CREATE TABLE test_copyout_wrongdir (id int)")
+
+      var raised = false
+      try:
+        # Would deadlock without the CopyFail abort; timeout is a regression guard
+        discard await conn.copyOut(
+          "COPY test_copyout_wrongdir FROM STDIN", timeout = seconds(5)
+        )
+      except PgQueryError as e:
+        raised = true
+        doAssert "copyIn" in e.msg
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Connection stays usable and no rows were inserted
+      let res = await conn.query("SELECT count(*) FROM test_copyout_wrongdir")
+      doAssert res.rows[0].getStr(0) == "0"
+
+      discard await conn.exec("DROP TABLE test_copyout_wrongdir")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyOut with non-COPY statement raises PgQueryError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      # Row-returning statement (RowDescription)
+      var raised = false
+      try:
+        discard await conn.copyOut("SELECT 1")
+      except PgQueryError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Non-row statement (CommandComplete only)
+      raised = false
+      try:
+        discard await conn.copyOut("SET search_path TO public")
+      except PgQueryError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+
+      # Connection stays usable
+      let res = await conn.query("SELECT 1")
+      doAssert res.rows[0].getStr(0) == "1"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "copyOutStream with COPY FROM STDIN raises without invoking callback":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyout_stream_wrongdir")
+      discard await conn.exec("CREATE TABLE test_copyout_stream_wrongdir (id int)")
+
+      var callCount = 0
+      let cb = makeCopyOutCallback:
+        inc callCount
+      var raised = false
+      try:
+        discard await conn.copyOutStream(
+          "COPY test_copyout_stream_wrongdir FROM STDIN", cb, timeout = seconds(5)
+        )
+      except PgQueryError as e:
+        raised = true
+        doAssert "copyInStream" in e.msg
+      doAssert raised
+      doAssert callCount == 0
+      doAssert conn.state == csReady
+
+      discard await conn.exec("DROP TABLE test_copyout_stream_wrongdir")
+      await conn.close()
+
+    waitFor t()
+
+  test "copyOutStream with non-COPY statement raises without invoking callback":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var callCount = 0
+      let cb = makeCopyOutCallback:
+        inc callCount
+      var raised = false
+      try:
+        discard await conn.copyOutStream("SELECT 1", cb)
+      except PgQueryError:
+        raised = true
+      doAssert raised
+      doAssert callCount == 0
+      doAssert conn.state == csReady
+
+      # Connection stays usable
+      let res = await conn.query("SELECT 1")
+      doAssert res.rows[0].getStr(0) == "1"
+
+      await conn.close()
+
+    waitFor t()
+
   test "copyIn empty data":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
