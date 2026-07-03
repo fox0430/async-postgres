@@ -269,7 +269,8 @@ proc copyInStreamImpl*(
           # Wrong direction; keep draining to ReadyForQuery, then raise there.
           if queryError == nil:
             queryError = newException(
-              PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOutStream"
+              PgQueryError,
+              "COPY IN got a COPY ... TO STDOUT statement; use copyOutStream",
             )
         of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
           # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
