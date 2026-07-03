@@ -179,12 +179,16 @@ proc acquireRead(
       asyncSpawn drainAbandonedAcquire(replicaFut)
       replicaErr = e
       timedOut = true
+    except CancelledError as e:
+      raise e
     except CatchableError as e:
       replicaErr = e
   else:
     try:
       let conn = await cluster.replica.acquire()
       return (conn, cluster.replica)
+    except CancelledError as e:
+      raise e
     except CatchableError as e:
       replicaErr = e
 
