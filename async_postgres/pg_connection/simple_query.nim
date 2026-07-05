@@ -228,14 +228,13 @@ proc invalidateOnTimeout*(conn: PgConnection, reason: string) =
   ## `cancelNoWait`, marks the connection `csClosed` so it cannot be reused,
   ## and raises `PgTimeoutError` with `reason`.
   ##
-  ## Under asyncdispatch this is the **only** safe recovery path: the inner
-  ## future keeps running in the background after `wait()` fires, and may
-  ## still write to the socket. Reusing the connection would interleave its
-  ## stale write with a new request and corrupt the protocol stream. chronos
-  ## cancels the inner future properly, but we still invalidate unconditionally
-  ## — the server may have processed the request partially and the cached
-  ## session state (prepared statements, portals, transaction status) is no
-  ## longer reliable.
+  ## Under asyncdispatch the inner future keeps running in the background after
+  ## ``wait()`` times out (see ``wait()``'s ``onOrphan`` hook in
+  ## ``async_backend``). Reusing the connection would interleave its stale
+  ## write with a new request and corrupt the protocol stream, so we mark
+  ## ``csClosed`` unconditionally — the server may have processed the request
+  ## partially and the cached session state (prepared statements, portals,
+  ## transaction status) is no longer reliable.
   conn.cancelNoWait()
   conn.state = csClosed
   raise newException(PgTimeoutError, reason)

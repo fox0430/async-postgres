@@ -2883,7 +2883,11 @@ suite "Pool replenish close-race":
         # raised, so the future is abandoned and the orphan-closer is armed,
         # exactly as the maintenance loop's except branch does.
         let connectFut = connect(mockConfig(ms.port))
-        pool.closeLateConnect(connectFut)
+        let onOrphan = pool.closeLateConnect()
+        connectFut.addCallback(
+          proc() =
+            onOrphan(connectFut)
+        )
 
         # The handshake finishes in the background; the completion callback then
         # closes the orphan.

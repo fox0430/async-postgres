@@ -472,29 +472,28 @@ proc spawnConnectForWaiter(pool: PgPool) =
   pool.pendingBackgroundTasks.add(fut)
   asyncSpawn fut
 
-proc closeLateConnect(pool: PgPool, connectFut: Future[PgConnection]) =
-  ## Guard against asyncdispatch's non-cancelling `wait()`: when a bounded
-  ## `connect()` times out, the inner future keeps running and may still yield
-  ## a live connection that nobody is awaiting. Register a callback to close
-  ## such an orphan rather than leaking its socket and a server-side backend
-  ## slot. No-op on chronos, whose `wait()` actually cancels the connect, so
-  ## the future never reaches `completed()`.
+proc closeLateConnect(pool: PgPool): proc(fut: Future[PgConnection]) {.gcsafe.} =
+  ## Return an ``onOrphan`` callback for ``wait()`` that closes a live
+  ## connection the orphan future produces. Under asyncdispatch the inner
+  ## future keeps running after ``wait()`` times out and may yield a
+  ## connection nobody is awaiting; this callback closes it to prevent
+  ## leaking a socket and a server-side backend slot.
+  ## Under chronos ``wait()`` cancels the inner future so ``onOrphan`` is
+  ## never called — no-op.
   when hasAsyncDispatch:
-    proc closeOrphan() {.async.} =
-      try:
-        let orphan = connectFut.read()
-        if orphan != nil:
-          await pool.tracedClose(orphan)
-      except CatchableError:
-        discard
-
-    connectFut.addCallback(
-      proc() =
-        if connectFut.completed():
-          asyncSpawn closeOrphan()
-    )
+    result = proc(fut: Future[PgConnection]) {.gcsafe.} =
+      if fut.completed():
+        asyncSpawn (
+          proc() {.async.} =
+            try:
+              let orphan = fut.read()
+              if orphan != nil:
+                await pool.tracedClose(orphan)
+            except CatchableError:
+              discard
+        )()
   else:
-    discard
+    result = nil
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
@@ -555,7 +554,8 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         break
       let connectFut = connect(pool.config.connConfig)
       try:
-        let conn = await connectFut.wait(replenishTimeout)
+        let conn =
+          await connectFut.wait(replenishTimeout, onOrphan = pool.closeLateConnect())
         conn.ownerPool = pool
         pool.metrics.createCount.inc
         pool.consecutiveConnectFailures = 0
@@ -577,10 +577,8 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         else:
           pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
       except CatchableError:
-        # asyncdispatch's wait() cannot cancel connectFut: after the timeout it
-        # keeps running and may still produce a live connection nobody awaits.
-        # Close that orphan so it leaks neither a socket nor a server slot.
-        pool.closeLateConnect(connectFut)
+        # onOrphan (closeLateConnect) handles the orphan connection on timeout;
+        # here we just update failure tracking and backoff.
         pool.consecutiveConnectFailures.inc
         let delay = computeConnectBackoff(
           pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
