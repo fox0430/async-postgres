@@ -321,13 +321,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
-  let tsInTxSym = bindSym"tsInTransaction"
-  let tsInFailedSym = bindSym"tsInFailedTransaction"
-  let csReadySym = bindSym"csReady"
-  let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
-    bindCleanupSkippedSyms()
-  let ckTxRollbackSym = bindSym"ckTxRollback"
+  let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   result = quote:
     let `connSym` = `connExpr`
     try:
@@ -335,23 +329,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
     except CatchableError as `eSym`:
-      # Only ROLLBACK if the server is still in a transaction AND the connection
-      # is usable. After a failed COMMIT, PostgreSQL has already ended the
-      # transaction (txStatus = tsIdle), so an extra ROLLBACK would just emit
-      # "no transaction in progress". On per-call timeout the connection is
-      # csClosed but txStatus is stale (no RFQ received) — the state guard
-      # avoids dispatching a ROLLBACK that would fail at checkReady(). Both
-      # the csClosed skip and any swallowed inner-ROLLBACK failure are
-      # reported via `onCleanupSkipped` so the timeout path is not silent.
-      if `connSym`.state != `csReadySym`:
-        `fireCleanupSkippedSym`(`connSym`, `ckTxRollbackSym`, `csrConnInvalidatedSym`)
-      elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
-        try:
-          discard await `connSym`.simpleExec("ROLLBACK", timeout = `txTimeout`)
-        except CatchableError as `cleanupErrSym`:
-          `fireCleanupSkippedSym`(
-            `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
-          )
+      `bodyCleanup`
       raise `eSym`
 
 macro withTransactionRetry*(
@@ -606,21 +584,15 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "txBodyDeadline")
   let bodyFutSym = genSym(nskLet, "bodyFut")
-  let tsInTxSym = bindSym"tsInTransaction"
-  let tsInFailedSym = bindSym"tsInFailedTransaction"
-  let csReadySym = bindSym"csReady"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
-  let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
-    bindCleanupSkippedSyms()
-  let ckTxRollbackSym = bindSym"ckTxRollback"
+  let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
   result = quote:
     let `connSym` = `connExpr`
     let `totalDurSym` = `deadline`
@@ -652,20 +624,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
         # PgTimeoutError — control does not return from this call.
         `connSym`.invalidateOnTimeout("withTransactionDeadline exceeded")
     except CatchableError as `eSym`:
-      # Skip ROLLBACK when the connection is already csClosed (e.g. a per-call
-      # timeout inside body invalidated it) — checkReady would just raise and
-      # the failure would be swallowed by the inner except. Both the
-      # csClosed skip and any swallowed inner-ROLLBACK failure are reported
-      # via `onCleanupSkipped`.
-      if `connSym`.state != `csReadySym`:
-        `fireCleanupSkippedSym`(`connSym`, `ckTxRollbackSym`, `csrConnInvalidatedSym`)
-      elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
-        try:
-          discard await `connSym`.simpleExec("ROLLBACK", timeout = `graceSym`)
-        except CatchableError as `cleanupErrSym`:
-          `fireCleanupSkippedSym`(
-            `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
-          )
+      `bodyCleanup`
       raise `eSym`
 
 macro withTransactionRetryDeadline*(
