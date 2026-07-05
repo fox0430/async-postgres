@@ -1044,7 +1044,8 @@ proc runReplicationStream(
           if queryError != nil:
             raise queryError
           raise newException(
-            PgConnectionError, "START_REPLICATION " & context & " ended without CopyBothResponse"
+            PgConnectionError,
+            "START_REPLICATION " & context & " ended without CopyBothResponse",
           )
         else:
           discard
