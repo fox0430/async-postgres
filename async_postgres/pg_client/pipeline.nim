@@ -323,6 +323,44 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   if not perOpSync:
     conn.sendBuf.addSync()
 
+template initPipelineResults(
+    results: var seq[PipelineResult], p: Pipeline, cachedStmts: seq[CachedStmt]
+) =
+  ## Initialize prkQuery results from cache-hit CachedStmts; prkExec results
+  ## get a default PipelineResult. Shared by executeImpl and executeIsolatedImpl.
+  for i in 0 ..< p.ops.len:
+    if p.ops[i].kind == pokQuery:
+      results[i] = PipelineResult(kind: prkQuery)
+      if p.ops[i].cacheHit:
+        let c = cachedStmts[i]
+        results[i].queryResult.fields = c.fields
+        if results[i].queryResult.fields.len > 0:
+          let colFmts = cacheHitColFmts(
+            p.ops[i].resultFormats, c.colFmts, results[i].queryResult.fields.len
+          )
+          for j in 0 ..< results[i].queryResult.fields.len:
+            results[i].queryResult.fields[j].formatCode = colFmts[j]
+          results[i].queryResult.data =
+            newRowData(int16(results[i].queryResult.fields.len), colFmts, c.colOids)
+          results[i].queryResult.data.fields = results[i].queryResult.fields
+    else:
+      results[i] = PipelineResult(kind: prkExec)
+
+template settleSendFut(sendFut: untyped) =
+  ## Cancel or drain sendFut so the Future never leaks on abnormal exit.
+  ## Shared by executeImpl and executeIsolatedImpl.
+  when hasChronos:
+    if not sendFut.finished:
+      try:
+        await cancelAndWait(sendFut)
+      except CatchableError:
+        discard
+    else:
+      try:
+        await sendFut
+      except CatchableError:
+        discard
+
 proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
   let conn = p.conn
   conn.checkReady()
@@ -345,28 +383,7 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
   var cachedFieldsPerOp: seq[seq[FieldDescription]] # lazy-init for cache misses
   var cachedParamOidsPerOp: seq[seq[int32]] # lazy-init, parallel to ops
 
-  # Initialize query results
-  for i in 0 ..< p.ops.len:
-    if p.ops[i].kind == pokQuery:
-      results[i] = PipelineResult(kind: prkQuery)
-      if p.ops[i].cacheHit:
-        let c = cachedStmts[i]
-        results[i].queryResult.fields = c.fields
-        if results[i].queryResult.fields.len > 0:
-          # Decode with the formats this op's Bind requested, not the cached
-          # first-Parse formats (see `cacheHitColFmts`) — mirrors the
-          # queryRecvLoop fix so a cache hit that switches result format doesn't
-          # reinterpret the row bytes.
-          let colFmts = cacheHitColFmts(
-            p.ops[i].resultFormats, c.colFmts, results[i].queryResult.fields.len
-          )
-          for j in 0 ..< results[i].queryResult.fields.len:
-            results[i].queryResult.fields[j].formatCode = colFmts[j]
-          results[i].queryResult.data =
-            newRowData(int16(results[i].queryResult.fields.len), colFmts, c.colOids)
-          results[i].queryResult.data.fields = results[i].queryResult.fields
-    else:
-      results[i] = PipelineResult(kind: prkExec)
+  initPipelineResults(results, p, cachedStmts)
 
   template addCacheMissOp(i: int) =
     ## Add op `i`'s freshly-Parsed prepared statement to the cache. Shared by the
@@ -514,22 +531,9 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
         await conn.fillRecvBuf()
 
     when hasChronos:
-      # Normal path: drain sendFut to propagate any stored write error.
       await sendFut
   except CatchableError as e:
-    when hasChronos:
-      # Abnormal path (recv error, cancellation, failed stored write):
-      # ensure sendFut never escapes as an unhandled Future.
-      if not sendFut.finished:
-        try:
-          await cancelAndWait(sendFut)
-        except CatchableError:
-          discard
-      else:
-        try:
-          await sendFut
-        except CatchableError:
-          discard
+    settleSendFut(sendFut)
     raise e
 
   return results
@@ -585,28 +589,7 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
   var results = newSeq[PipelineResult](p.ops.len)
   var errors = newSeq[ref CatchableError](p.ops.len)
 
-  # Initialize query results
-  for i in 0 ..< p.ops.len:
-    if p.ops[i].kind == pokQuery:
-      results[i] = PipelineResult(kind: prkQuery)
-      if p.ops[i].cacheHit:
-        let c = cachedStmts[i]
-        results[i].queryResult.fields = c.fields
-        if results[i].queryResult.fields.len > 0:
-          # Decode with the formats this op's Bind requested, not the cached
-          # first-Parse formats (see `cacheHitColFmts`) — mirrors the
-          # queryRecvLoop fix so a cache hit that switches result format doesn't
-          # reinterpret the row bytes.
-          let colFmts = cacheHitColFmts(
-            p.ops[i].resultFormats, c.colFmts, results[i].queryResult.fields.len
-          )
-          for j in 0 ..< results[i].queryResult.fields.len:
-            results[i].queryResult.fields[j].formatCode = colFmts[j]
-          results[i].queryResult.data =
-            newRowData(int16(results[i].queryResult.fields.len), colFmts, c.colOids)
-          results[i].queryResult.data.fields = results[i].queryResult.fields
-    else:
-      results[i] = PipelineResult(kind: prkExec)
+  initPipelineResults(results, p, cachedStmts)
 
   try:
     for opIdx in 0 ..< p.ops.len:
@@ -703,21 +686,9 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
           await conn.fillRecvBuf()
 
     when hasChronos:
-      # Normal path: drain sendFut to propagate any stored write error.
       await sendFut
   except CatchableError as e:
-    when hasChronos:
-      # Abnormal path: cancel or drain sendFut so the Future never leaks.
-      if not sendFut.finished:
-        try:
-          await cancelAndWait(sendFut)
-        except CatchableError:
-          discard
-      else:
-        try:
-          await sendFut
-        except CatchableError:
-          discard
+    settleSendFut(sendFut)
     raise e
 
   if conn.state != csClosed:
