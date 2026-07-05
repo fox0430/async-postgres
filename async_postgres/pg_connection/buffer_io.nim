@@ -361,6 +361,74 @@ proc recvMessage*(
       return opt.get
     await conn.fillRecvBuf(timeout)
 
+template pumpUntilReady*(
+    conn: PgConnection,
+    resultData: untyped,
+    rowCountPtr: untyped,
+    body: untyped,
+    readyBody: untyped,
+) {.dirty.} =
+  ## Generic protocol pump loop.  `pumpMsg` and `queryError` are accessible
+  ## in `body` and `readyBody`.  `DataRow` messages are decoded in-place into
+  ## `resultData` and counted through `rowCountPtr` by `nextMessage`, so they
+  ## never surface in `body`.
+  ##
+  ## The loop is spelled out in both overloads rather than one forwarding to
+  ## the other: `{.dirty.}` injection only reaches `body`/`readyBody` across a
+  ## single template boundary, so forwarding would leave their references to
+  ## `pumpMsg`/`queryError` undeclared.  A single template with defaulted
+  ## `resultData`/`rowCountPtr` fails the same way — typed params ahead of the
+  ## untyped bodies suppress the injection (Nim 2.2.x).
+  block pumpLoop:
+    # Declared inside the block so two pumps in one proc scope (e.g. copy.nim's
+    # main loop plus its recvLoop2) don't collide on these dirty-injected names.
+    var queryError: ref PgQueryError
+    var pumpMsg: BackendMessage
+    while true:
+      while (let opt = conn.nextMessage(resultData, rowCountPtr); opt.isSome):
+        pumpMsg = opt.get
+        if pumpMsg.kind == bmkErrorResponse:
+          if queryError == nil:
+            queryError = newPgQueryError(pumpMsg.errorFields)
+        elif pumpMsg.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsg.txStatus
+          if conn.state != csClosed:
+            conn.state = csReady
+          readyBody
+          if queryError != nil:
+            raise queryError
+          break pumpLoop
+        else:
+          body
+      await conn.fillRecvBuf()
+
+template pumpUntilReady*(
+    conn: PgConnection, body: untyped, readyBody: untyped
+) {.dirty.} =
+  ## Bare overload for callers that decode `DataRow` inside `body` (or ignore
+  ## it) instead of accumulating into a `RowData`.  Body mirrors the data
+  ## overload above with `nextMessage()` in place of the accumulating call.
+  block pumpLoop:
+    var queryError: ref PgQueryError
+    var pumpMsg: BackendMessage
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        pumpMsg = opt.get
+        if pumpMsg.kind == bmkErrorResponse:
+          if queryError == nil:
+            queryError = newPgQueryError(pumpMsg.errorFields)
+        elif pumpMsg.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsg.txStatus
+          if conn.state != csClosed:
+            conn.state = csReady
+          readyBody
+          if queryError != nil:
+            raise queryError
+          break pumpLoop
+        else:
+          body
+      await conn.fillRecvBuf()
+
 # Non-blocking receive watch
 #
 # During an otherwise send-only phase (COPY IN) the client must keep streaming
