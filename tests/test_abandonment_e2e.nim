@@ -65,6 +65,21 @@ suite "E2E: Cursor lifecycle invariants":
 
     waitFor t()
 
+  test "fetchNext after conn.close() raises PgConnectionError, not SIGSEGV":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let cursor =
+        await conn.openCursor("SELECT i FROM generate_series(1, 100) i", chunkSize = 10)
+      await conn.close()
+      var raised = false
+      try:
+        discard await cursor.fetchNext()
+      except PgConnectionError:
+        raised = true
+      doAssert raised, "fetchNext after close must raise PgConnectionError"
+
+    waitFor t()
+
   test "openCursor with invalid SQL raises and leaves connection ready":
     # Recovery path: ErrorResponse during openCursor drains Sync back to
     # ReadyForQuery so the connection is reusable immediately.

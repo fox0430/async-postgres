@@ -131,6 +131,8 @@ proc openCursorImpl(
 
 proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
+  if conn.state == csClosed:
+    raise newException(PgConnectionError, "Connection is closed")
   let rd = newRowData(int16(cursor.fields.len), cursor.colFormats, cursor.colTypeOids)
   rd.fields = cursor.fields
   var rowCount: int32 = 0
