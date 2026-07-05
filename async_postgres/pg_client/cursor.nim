@@ -63,12 +63,12 @@ proc openCursorImpl(
         opt.isSome
       )
       :
-        let msg = opt.get
-        case msg.kind
+        let pumpMsg = opt.get
+        case pumpMsg.kind
         of bmkParseComplete, bmkBindComplete:
           discard
         of bmkRowDescription:
-          cursor.fields = msg.fields
+          cursor.fields = pumpMsg.fields
           # Describe(Portal) runs after Bind, so the server reports the bound
           # result formats. Mirror the query path: derive per-column format
           # codes and type OIDs so binary DataRows are decoded as binary
@@ -85,7 +85,7 @@ proc openCursorImpl(
                 cursor.fields[i].formatCode = resultFormats[i]
                 cursor.colFormats[i] = resultFormats[i]
           cursor.bufferedData =
-            newRowData(int16(msg.fields.len), cursor.colFormats, cursor.colTypeOids)
+            newRowData(int16(pumpMsg.fields.len), cursor.colFormats, cursor.colTypeOids)
           cursor.bufferedData.fields = cursor.fields
         of bmkNoData:
           discard
@@ -110,7 +110,7 @@ proc openCursorImpl(
               await conn.fillRecvBuf()
           break recvLoop
         of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
+          queryError = newPgQueryError(pumpMsg.errorFields)
           # Drain until ReadyForQuery
           await conn.sendMsg(encodeSync())
           block errDrain:
@@ -144,8 +144,8 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   block recvLoop:
     while true:
       while (let opt = conn.nextMessage(rd, addr rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
+        let pumpMsg = opt.get
+        case pumpMsg.kind
         of bmkPortalSuspended:
           break recvLoop
         of bmkCommandComplete:
@@ -172,7 +172,7 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
               await conn.fillRecvBuf()
           break recvLoop
         of bmkErrorResponse:
-          let queryError = newPgQueryError(msg.errorFields)
+          let queryError = newPgQueryError(pumpMsg.errorFields)
           await conn.sendMsg(encodeSync())
           block errDrain:
             while true:
@@ -243,27 +243,12 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
   batch.addSync()
   await conn.sendMsg(batch)
 
-  var queryError: ref PgQueryError
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCloseComplete:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          if conn.state != csClosed:
-            conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCloseComplete: discard
+    else: discard
+  do:
+    discard
 
   cursor.exhausted = true
 

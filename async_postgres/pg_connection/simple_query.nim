@@ -96,38 +96,22 @@ proc simpleQueryImpl*(
 
   var results: seq[QueryResult]
   var current = QueryResult()
-  var queryError: ref PgQueryError
 
-  block recvLoop:
-    while true:
-      while (
-        let opt = conn.nextMessage(current.data, addr current.rowCount)
-        opt.isSome
-      )
-      :
-        let msg = opt.get
-        case msg.kind
-        of bmkRowDescription:
-          current =
-            QueryResult(fields: msg.fields, data: newRowData(int16(msg.fields.len)))
-        of bmkCommandComplete:
-          current.commandTag = msg.commandTag
-          results.add(current)
-          current = QueryResult()
-        of bmkEmptyQueryResponse:
-          results.add(QueryResult())
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          if conn.state != csClosed:
-            conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady(current.data, addr current.rowCount):
+    case pumpMsg.kind
+    of bmkRowDescription:
+      current =
+        QueryResult(fields: pumpMsg.fields, data: newRowData(int16(pumpMsg.fields.len)))
+    of bmkCommandComplete:
+      current.commandTag = pumpMsg.commandTag
+      results.add(current)
+      current = QueryResult()
+    of bmkEmptyQueryResponse:
+      results.add(QueryResult())
+    else:
+      discard
+  do:
+    discard
 
   return results
 
@@ -136,28 +120,16 @@ proc simpleExecImpl*(conn: PgConnection, sql: string): Future[string] {.async.} 
   conn.state = csBusy
   await conn.sendMsg(encodeQuery(sql))
   var commandTag = ""
-  var queryError: ref PgQueryError
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCommandComplete:
-          commandTag = msg.commandTag
-        of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          if conn.state != csClosed:
-            conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCommandComplete:
+      commandTag = pumpMsg.commandTag
+    of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
+      discard
+    else:
+      discard
+  do:
+    discard
   return commandTag
 
 # Cancellation (out-of-band CancelRequest over a separate socket)
@@ -336,26 +308,12 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
     conn.state = csBusy
     await conn.sendMsg(encodeQuery(""))
 
-    var queryError: ref PgQueryError
-    block recvLoop:
-      while true:
-        while (let opt = conn.nextMessage(); opt.isSome):
-          let msg = opt.get
-          case msg.kind
-          of bmkEmptyQueryResponse:
-            discard
-          of bmkErrorResponse:
-            queryError = newPgQueryError(msg.errorFields)
-          of bmkReadyForQuery:
-            conn.txStatus = msg.txStatus
-            if conn.state != csClosed:
-              conn.state = csReady
-            if queryError != nil:
-              raise queryError
-            break recvLoop
-          else:
-            discard
-        await conn.fillRecvBuf()
+    conn.pumpUntilReady:
+      case pumpMsg.kind
+      of bmkEmptyQueryResponse: discard
+      else: discard
+    do:
+      discard
 
   if timeout > ZeroDuration:
     proc withTimeout(): Future[void] {.async.} =

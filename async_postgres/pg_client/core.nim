@@ -442,7 +442,6 @@ template queryRecvLoop*(
     cachedColOids: seq[int32],
     qr: var QueryResult,
 ) =
-  var queryError: ref PgQueryError
   var cachedParamOids: seq[int32]
 
   if cacheHit:
@@ -460,60 +459,45 @@ template queryRecvLoop*(
       qr.data = newRowData(int16(qr.fields.len), colFmts, cachedColOids)
       qr.data.fields = qr.fields
 
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-          discard
-        of bmkParameterDescription:
-          if cacheMiss:
-            cachedParamOids = msg.paramTypeOids
-        of bmkRowDescription:
-          var fields = msg.fields
-          var cf: seq[int16]
-          var co: seq[int32]
-          if cacheMiss:
-            cachedFields = msg.fields
-            if resultFormats.len > 0:
-              cf = deriveColFmts(resultFormats, fields.len)
-              co = newSeq[int32](fields.len)
-              for i in 0 ..< fields.len:
-                co[i] = fields[i].typeOid
-                fields[i].formatCode = cf[i]
-          qr.fields = fields
-          qr.data = newRowData(int16(qr.fields.len), cf, co)
-          qr.data.fields = qr.fields
-        of bmkNoData:
-          discard
-        of bmkCommandComplete:
-          qr.commandTag = msg.commandTag
-        of bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          # csClosed is terminal — an orphan loop after `invalidateOnTimeout`
-          # must not resurrect the connection.
-          if conn.state != csClosed:
-            conn.state = csReady
-          if queryError != nil:
-            if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-              conn.removeStmtCache(sql)
-            raise queryError
-          if cacheMiss:
-            conn.addStmtCache(
-              sql,
-              CachedStmt(
-                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
-              ),
-            )
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady(qr.data, addr qr.rowCount):
+    case pumpMsg.kind
+    of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+      discard
+    of bmkParameterDescription:
+      if cacheMiss:
+        cachedParamOids = pumpMsg.paramTypeOids
+    of bmkRowDescription:
+      var fields = pumpMsg.fields
+      var cf: seq[int16]
+      var co: seq[int32]
+      if cacheMiss:
+        cachedFields = pumpMsg.fields
+        if resultFormats.len > 0:
+          cf = deriveColFmts(resultFormats, fields.len)
+          co = newSeq[int32](fields.len)
+          for i in 0 ..< fields.len:
+            co[i] = fields[i].typeOid
+            fields[i].formatCode = cf[i]
+      qr.fields = fields
+      qr.data = newRowData(int16(qr.fields.len), cf, co)
+      qr.data.fields = qr.fields
+    of bmkNoData:
+      discard
+    of bmkCommandComplete:
+      qr.commandTag = pumpMsg.commandTag
+    of bmkEmptyQueryResponse:
+      discard
+    else:
+      discard
+  do:
+    if queryError != nil:
+      if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
+        conn.removeStmtCache(sql)
+    elif cacheMiss:
+      conn.addStmtCache(
+        sql,
+        CachedStmt(name: stmtName, fields: cachedFields, paramOids: cachedParamOids),
+      )
 
 template queryEachRecvLoop*(
     conn: PgConnection,
@@ -578,30 +562,30 @@ template queryEachRecvLoop*(
           rd.buf.setLen(0)
           rd.cellIndex.setLen(0)
           continue
-        let msg = res.message
-        case msg.kind
+        let pumpMsg = res.message
+        case pumpMsg.kind
         of bmkNotificationResponse:
-          conn.dispatchNotification(msg)
+          conn.dispatchNotification(pumpMsg)
           continue
         of bmkNoticeResponse:
-          conn.dispatchNotice(msg)
+          conn.dispatchNotice(pumpMsg)
           continue
         of bmkParameterStatus:
           # Parsed directly from recvBuf, so not recorded by `nextMessage`;
           # mirror buffer_io to keep serverParams current (e.g. SET, promotion).
-          conn.serverParams[msg.paramName] = msg.paramValue
+          conn.serverParams[pumpMsg.paramName] = pumpMsg.paramValue
           continue
         of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
           discard
         of bmkParameterDescription:
           if cacheMiss:
-            cachedParamOids = msg.paramTypeOids
+            cachedParamOids = pumpMsg.paramTypeOids
         of bmkRowDescription:
-          var fields = msg.fields
+          var fields = pumpMsg.fields
           var cf: seq[int16]
           var co: seq[int32]
           if cacheMiss:
-            cachedFields = msg.fields
+            cachedFields = pumpMsg.fields
             if resultFormats.len > 0:
               cf = deriveColFmts(resultFormats, fields.len)
               co = newSeq[int32](fields.len)
@@ -617,10 +601,10 @@ template queryEachRecvLoop*(
         of bmkEmptyQueryResponse:
           discard
         of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
+          queryError = newPgQueryError(pumpMsg.errorFields)
         of bmkReadyForQuery:
           conn.recvBufStart = pos
-          conn.txStatus = msg.txStatus
+          conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
             conn.state = csReady
           if callbackError != nil:
@@ -653,49 +637,35 @@ template execRecvLoop*(
   ## path: discards `DataRow`s (exec callers don't need rows) and exposes only
   ## the `CommandComplete` tag via the `commandTag` out-parameter. Shared by
   ## `execImpl` (both overloads), `execInlineImpl`, and `execDirectRunImpl`.
-  var queryError: ref PgQueryError
   var cachedFields: seq[FieldDescription]
   var cachedParamOids: seq[int32]
 
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-          discard
-        of bmkParameterDescription:
-          if cacheMiss:
-            cachedParamOids = msg.paramTypeOids
-        of bmkRowDescription:
-          if cacheMiss:
-            cachedFields = msg.fields
-        of bmkNoData:
-          discard
-        of bmkDataRow:
-          discard
-        of bmkCommandComplete:
-          commandTag = msg.commandTag
-        of bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          if conn.state != csClosed:
-            conn.state = csReady
-          if queryError != nil:
-            if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-              conn.removeStmtCache(sql)
-            raise queryError
-          if cacheMiss:
-            conn.addStmtCache(
-              sql,
-              CachedStmt(
-                name: stmtName, fields: cachedFields, paramOids: cachedParamOids
-              ),
-            )
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
+      discard
+    of bmkParameterDescription:
+      if cacheMiss:
+        cachedParamOids = pumpMsg.paramTypeOids
+    of bmkRowDescription:
+      if cacheMiss:
+        cachedFields = pumpMsg.fields
+    of bmkNoData:
+      discard
+    of bmkDataRow:
+      discard
+    of bmkCommandComplete:
+      commandTag = pumpMsg.commandTag
+    of bmkEmptyQueryResponse:
+      discard
+    else:
+      discard
+  do:
+    if queryError != nil:
+      if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
+        conn.removeStmtCache(sql)
+    elif cacheMiss:
+      conn.addStmtCache(
+        sql,
+        CachedStmt(name: stmtName, fields: cachedFields, paramOids: cachedParamOids),
+      )

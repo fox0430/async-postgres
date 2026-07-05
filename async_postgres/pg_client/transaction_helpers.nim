@@ -46,63 +46,50 @@ proc queryInTransactionImpl(
 
   var qr = QueryResult()
   var phase = 0
-  var queryError: ref PgQueryError
 
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete:
+  conn.pumpUntilReady(qr.data, addr qr.rowCount):
+    case pumpMsg.kind
+    of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkRowDescription:
+      var fields = pumpMsg.fields
+      var cf: seq[int16]
+      var co: seq[int32]
+      if resultFormats.len > 0:
+        cf = deriveColFmts(resultFormats, fields.len)
+        co = newSeq[int32](fields.len)
+        for i in 0 ..< fields.len:
+          co[i] = fields[i].typeOid
+          fields[i].formatCode = cf[i]
+      qr.fields = fields
+      qr.data = newRowData(int16(qr.fields.len), cf, co)
+      qr.data.fields = qr.fields
+    of bmkNoData:
+      discard
+    of bmkEmptyQueryResponse:
+      # Empty/comment-only user SQL yields EmptyQueryResponse instead of
+      # CommandComplete; advance the phase anyway so the trailing COMMIT's
+      # CommandComplete isn't captured as the user statement's tag.
+      inc phase
+    of bmkCommandComplete:
+      if phase == 1:
+        qr.commandTag = pumpMsg.commandTag
+      inc phase
+    else:
+      discard
+  do:
+    if queryError != nil:
+      # ROLLBACK a failed transaction, swallowing any failure so it cannot
+      # mask the query error; the outer wait(timeout) bounds the cleanup.
+      if conn.txStatus == tsInFailedTransaction:
+        try:
+          discard await conn.simpleExec("ROLLBACK")
+        except CancelledError as e:
+          # Don't swallow cancellation (e.g. the outer wait(timeout)
+          # cancelling this future under chronos) — propagate it.
+          raise e
+        except CatchableError:
           discard
-        of bmkRowDescription:
-          var fields = msg.fields
-          var cf: seq[int16]
-          var co: seq[int32]
-          if resultFormats.len > 0:
-            cf = deriveColFmts(resultFormats, fields.len)
-            co = newSeq[int32](fields.len)
-            for i in 0 ..< fields.len:
-              co[i] = fields[i].typeOid
-              fields[i].formatCode = cf[i]
-          qr.fields = fields
-          qr.data = newRowData(int16(qr.fields.len), cf, co)
-          qr.data.fields = qr.fields
-        of bmkNoData:
-          discard
-        of bmkEmptyQueryResponse:
-          # Empty/comment-only user SQL yields EmptyQueryResponse instead of
-          # CommandComplete; advance the phase anyway so the trailing COMMIT's
-          # CommandComplete isn't captured as the user statement's tag.
-          inc phase
-        of bmkCommandComplete:
-          if phase == 1:
-            qr.commandTag = msg.commandTag
-          inc phase
-        of bmkErrorResponse:
-          if queryError == nil:
-            queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          if conn.state != csClosed:
-            conn.state = csReady
-          if queryError != nil:
-            # ROLLBACK a failed transaction, swallowing any failure so it cannot
-            # mask the query error; the outer wait(timeout) bounds the cleanup.
-            if msg.txStatus == tsInFailedTransaction:
-              try:
-                discard await conn.simpleExec("ROLLBACK")
-              except CancelledError as e:
-                # Don't swallow cancellation (e.g. the outer wait(timeout)
-                # cancelling this future under chronos) — propagate it.
-                raise e
-              except CatchableError:
-                discard
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
 
   return qr
 
