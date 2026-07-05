@@ -517,26 +517,26 @@ proc attemptHostTimed(
     # asyncdispatch's wait() cannot cancel the attempt: on timeout it keeps
     # running in the background. If it later produces a live connection nobody
     # is waiting for it, so close the orphan instead of leaking a socket and a
-    # server slot. (chronos's wait() cancels the attempt, and connectToHost /
-    # matchesOrClose tear down their transports on the way out.)
+    # server slot. onOrphan on wait() registers the cleanup so the caller
+    # doesn't need a separate addCallback. (chronos's wait() cancels the
+    # attempt, and connectToHost / matchesOrClose tear down their transports
+    # on the way out.)
     let attempt = attemptHost(config, entry, attrs)
-    try:
-      return await attempt.wait(config.connectTimeout)
-    except AsyncTimeoutError as e:
-      proc closeOrphan() {.async.} =
-        try:
-          let orphan = attempt.read()
-          if orphan != nil:
-            await orphan.close()
-        except CatchableError:
-          discard
-
-      attempt.addCallback(
-        proc() =
-          if attempt.completed():
-            asyncSpawn closeOrphan()
-      )
-      raise e
+    return await attempt.wait(
+      config.connectTimeout,
+      onOrphan = proc(fut: Future[PgConnection]) =
+        if fut.completed():
+          asyncSpawn (
+            proc() {.async.} =
+              try:
+                let orphan = fut.read()
+                if orphan != nil:
+                  await orphan.close()
+              except CatchableError:
+                discard
+          )()
+      ,
+    )
   else:
     return await attemptHost(config, entry, attrs).wait(config.connectTimeout)
 
