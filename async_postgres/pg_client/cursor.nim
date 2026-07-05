@@ -131,6 +131,8 @@ proc openCursorImpl(
 
 proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
+  if conn.state == csClosed:
+    raise newException(PgConnectionError, "Connection is closed")
   let rd = newRowData(int16(cursor.fields.len), cursor.colFormats, cursor.colTypeOids)
   rd.fields = cursor.fields
   var rowCount: int32 = 0
@@ -201,6 +203,9 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Fetch the next chunk of rows from the cursor.
   ## Returns an empty seq when the cursor is exhausted.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  let conn = cursor.conn
+  if conn.state == csClosed:
+    raise newException(PgConnectionError, "Connection is closed")
   if cursor.bufferedCount > 0:
     result = newSeq[Row](cursor.bufferedCount)
     for i in 0 ..< cursor.bufferedCount:
