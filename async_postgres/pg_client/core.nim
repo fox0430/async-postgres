@@ -492,6 +492,7 @@ template queryRecvLoop*(
   do:
     if queryError != nil:
       if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
+        conn.pendingStmtCloses.add(stmtName)
         conn.removeStmtCache(sql)
     elif cacheMiss:
       conn.addStmtCache(
@@ -611,6 +612,7 @@ template queryEachRecvLoop*(
             raise callbackError
           if queryError != nil:
             if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
+              conn.pendingStmtCloses.add(stmtName)
               conn.removeStmtCache(sql)
             raise queryError
           if cacheMiss:
@@ -663,6 +665,7 @@ template execRecvLoop*(
   do:
     if queryError != nil:
       if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
+        conn.pendingStmtCloses.add(stmtName)
         conn.removeStmtCache(sql)
     elif cacheMiss:
       conn.addStmtCache(
