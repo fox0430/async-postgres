@@ -653,7 +653,12 @@ proc decodeBinaryTsVector*(data: openArray[byte]): string =
     parts[i] = part
   parts.join(" ")
 
-proc parseTsQueryNode(data: openArray[byte], pos: var int): string =
+proc parseTsQueryNode(data: openArray[byte], pos: var int, depth: int = 0): string =
+  const maxDepth = 1000
+  if depth >= maxDepth:
+    raise newException(
+      PgTypeError, "tsquery binary: nesting depth exceeds limit (" & $maxDepth & ")"
+    )
   if pos >= data.len:
     raise newException(PgTypeError, "tsquery binary truncated")
   let tokenType = data[pos]
@@ -698,23 +703,23 @@ proc parseTsQueryNode(data: openArray[byte], pos: var int): string =
     inc pos
     case op
     of 1: # NOT
-      let arg = parseTsQueryNode(data, pos)
+      let arg = parseTsQueryNode(data, pos, depth + 1)
       "!" & arg
     of 2: # AND
-      let left = parseTsQueryNode(data, pos)
-      let right = parseTsQueryNode(data, pos)
+      let left = parseTsQueryNode(data, pos, depth + 1)
+      let right = parseTsQueryNode(data, pos, depth + 1)
       left & " & " & right
     of 3: # OR
-      let left = parseTsQueryNode(data, pos)
-      let right = parseTsQueryNode(data, pos)
+      let left = parseTsQueryNode(data, pos, depth + 1)
+      let right = parseTsQueryNode(data, pos, depth + 1)
       "( " & left & " | " & right & " )"
     of 4: # PHRASE
       if pos + 1 >= data.len:
         raise newException(PgTypeError, "tsquery PHRASE distance truncated")
       let distance = int(fromBE16(data.toOpenArray(pos, pos + 1)))
       pos += 2
-      let left = parseTsQueryNode(data, pos)
-      let right = parseTsQueryNode(data, pos)
+      let left = parseTsQueryNode(data, pos, depth + 1)
+      let right = parseTsQueryNode(data, pos, depth + 1)
       if distance == 1:
         left & " <-> " & right
       else:
