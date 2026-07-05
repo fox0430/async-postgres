@@ -491,22 +491,42 @@ proc cancel*(w: RecvWatch) =
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
   ## Send raw bytes to the PostgreSQL server over the connection.
+  ## On failure the connection is marked ``csClosed`` (the stream may be
+  ## partially written), symmetric with ``fillRecvBuf``.
   when hasChronos:
-    await conn.writer.write(data)
+    try:
+      await conn.writer.write(data)
+    except CatchableError as e:
+      conn.state = csClosed
+      raise e
   elif hasAsyncDispatch:
     if data.len > 0:
-      await conn.socket.sendRawBytes(data)
+      try:
+        await conn.socket.sendRawBytes(data)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
 
 proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
   ## Send conn.sendBuf to the server.
   ## The transport receives its own copy of the buffer, so conn.sendBuf is safe
   ## to mutate while the returned Future is still pending.
+  ## On failure the connection is marked ``csClosed`` (the stream may be
+  ## partially written), symmetric with ``sendMsg``.
   when hasChronos:
     if conn.sendBuf.len > 0:
-      await conn.writer.write(conn.sendBuf)
+      try:
+        await conn.writer.write(conn.sendBuf)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
   elif hasAsyncDispatch:
     if conn.sendBuf.len > 0:
-      await conn.socket.sendRawBytes(conn.sendBuf)
+      try:
+        await conn.socket.sendRawBytes(conn.sendBuf)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
 
 # Transport teardown
 
