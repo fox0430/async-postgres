@@ -468,7 +468,7 @@ proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.}
         conn.state = csClosed
         raise e
     of bmkCopyData:
-      cr.data.add(pumpMsg.copyData)
+      cr.data.add(move(pumpMsg.copyData))
     of bmkCopyDone:
       discard
     of bmkRowDescription, bmkEmptyQueryResponse:
