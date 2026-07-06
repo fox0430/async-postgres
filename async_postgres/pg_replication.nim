@@ -326,17 +326,8 @@ proc readColumnCountAt(
 
 proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at offset. Returns (string, next offset).
-  if offset >= buf.len:
-    raise newException(PgProtocolError, "decodeCStringAt: offset past end of buffer")
-  var i = offset
-  while i < buf.len and buf[i] != 0:
-    inc i
-  if i >= buf.len:
-    raise newException(PgProtocolError, "decodeCStringAt: missing null terminator")
-  let slen = i - offset
-  let s = readString(buf, offset, slen)
-  inc i # skip null
-  (s, i)
+  let (s, consumed) = decodeCString(buf, offset)
+  (s, offset + consumed)
 
 proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
   ## Decode a pgoutput TupleData structure.
