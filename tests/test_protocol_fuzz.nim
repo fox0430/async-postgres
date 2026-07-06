@@ -549,7 +549,7 @@ suite "Binary type decoders: malformed input":
   test "decodeHstoreBinary negative numPairs":
     # numPairs = -1 (0xFFFFFFFF) should raise PgTypeError
     var data = newSeq[byte](4)
-    for i in 0..3:
+    for i in 0 .. 3:
       data[i] = 0xFF
     expectTypeError:
       discard decodeHstoreBinary(data)
