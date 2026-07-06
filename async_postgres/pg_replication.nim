@@ -201,9 +201,6 @@ type
 const
   InvalidLsn* = Lsn(0) ## Sentinel value representing an invalid or unset LSN.
 
-  pgEpochOffset* = 946_684_800'i64
-    ## Seconds between Unix epoch (1970-01-01) and PostgreSQL epoch (2000-01-01).
-
   MaxRelationColumns = 1600
     ## PostgreSQL's max columns per table (``MaxHeapAttributeNumber``).
     ## pgoutput's column-count wire field can never exceed this in practice.
@@ -267,8 +264,9 @@ proc parseLsn*(s: string): Lsn =
 
 proc currentPgTimestamp*(): int64 =
   ## Current time as microseconds since the PostgreSQL epoch (2000-01-01 UTC).
-  let now = epochTime()
-  int64((now - float64(pgEpochOffset)) * 1_000_000.0)
+  let t = getTime()
+  let unixUs = t.toUnix() * 1_000_000'i64 + int64(t.nanosecond div 1000)
+  unixUs - pgEpochUnix * 1_000_000'i64
 
 # pgoutput decoder
 
