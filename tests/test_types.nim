@@ -6921,6 +6921,16 @@ suite "toPgParamInline":
     check p.format == 0
     check p.len == -1
 
+  test "string too large raises ValueError":
+    when sizeof(int) >= 8:
+      expect ValueError:
+        discard toPgParamInline(newString(int(int32.high) + 1))
+
+  test "seq[byte] too large raises ValueError":
+    when sizeof(int) >= 8:
+      expect ValueError:
+        discard toPgParamInline(newSeq[byte](int(int32.high) + 1))
+
 suite "addBindRaw wire-format parity":
   test "single int32 param matches addBind":
     let old = toPgParam(42'i32)

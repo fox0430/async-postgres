@@ -284,7 +284,7 @@ const
     ## Parameter-type, format-code, and parameter-value counts in Parse/Bind
     ## messages are all Int16, so they cannot represent more elements than this.
 
-  maxInt32Len = int(high(int32))
+  maxInt32Len* = int(high(int32))
     ## Maximum byte length encodable in a wire Int32 length field (2147483647).
     ## Parameter values, SASL data, binary COPY fields, and every message length
     ## are Int32. PostgreSQL further caps a single value at `MaxAllocSize`
