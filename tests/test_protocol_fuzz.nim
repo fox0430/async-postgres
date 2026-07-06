@@ -579,6 +579,22 @@ suite "Binary type decoders: malformed input":
     expectTypeError:
       discard decodeBinaryTsQuery(data)
 
+  test "decodeBinaryTsQuery nesting depth limit":
+    # Build a chain of 1001 NOT operators (depth >= 1000) wrapping an operand.
+    # Each NOT = [2, 1], operand = [1, 0, 0, 'x', 0].
+    const nNot = 1001
+    const operand = @[byte 1, 0, 0, byte('x'), 0]
+    var data = newSeq[byte](4 + nNot * 2 + operand.len)
+    data[0 .. 3] = toBE32((nNot + 1).int32)
+    var pos = 4
+    for _ in 0 ..< nNot:
+      data[pos] = 2
+      data[pos + 1] = 1
+      pos += 2
+    data[pos ..^ 1] = operand
+    expectTypeError:
+      discard decodeBinaryTsQuery(data)
+
 # Seeded random fuzz on binary type decoders
 
 suite "Binary type decoders: seeded random fuzz":
