@@ -1090,8 +1090,9 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   let bufBase = rd.buf.len
   let dataLen = body.len - 2
   if bufBase + dataLen > int32.high:
-    raise newException(PgProtocolError,
-      "DataRow: result set exceeds maximum addressable size (2 GiB)")
+    raise newException(
+      PgProtocolError, "DataRow: result set exceeds maximum addressable size (2 GiB)"
+    )
 
   # Pre-extend cellIndex for this row
   let cellBase = rd.cellIndex.len
