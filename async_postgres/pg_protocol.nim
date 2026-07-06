@@ -1081,18 +1081,28 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   ## copied buffer to build cellIndex entries.
   if body.len < 2:
     raise newException(PgProtocolError, "DataRow message too short")
+
   let numCols = decodeInt16(body, 0)
   if numCols < 0:
     raise newException(PgProtocolError, "DataRow: invalid column count " & $numCols)
+
+  # Check cumulative buffer size before any mutation
+  let bufBase = rd.buf.len
+  let dataLen = body.len - 2
+  if bufBase + dataLen > int32.high:
+    raise newException(
+      PgProtocolError, "DataRow: result set exceeds maximum addressable size (2 GiB)"
+    )
+
   # Pre-extend cellIndex for this row
   let cellBase = rd.cellIndex.len
   rd.cellIndex.setLen(cellBase + int(numCols) * 2)
+
   # Bulk-copy everything after the 2-byte numCols into rd.buf
-  let bufBase = rd.buf.len
-  let dataLen = body.len - 2
   rd.buf.setLen(bufBase + dataLen)
   if dataLen > 0:
     rd.buf.writeBytesAt(bufBase, body.toOpenArray(2, 2 + dataLen - 1))
+
   # Walk the copied buffer to build cellIndex
   var pos = bufBase # current position in rd.buf
   let bufEnd = bufBase + dataLen
