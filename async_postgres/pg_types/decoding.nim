@@ -10,7 +10,11 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
   result = initTable[string, Option[string]]()
   if data.len < 4:
     raise newException(PgTypeError, "hstore binary data too short")
+
   let numPairs = int(fromBE32(data.toOpenArray(0, 3)))
+  if numPairs < 0:
+    raise newException(PgTypeError, "hstore binary: invalid number of pairs " & $numPairs)
+
   var pos = 4
   for _ in 0 ..< numPairs:
     if pos + 4 > data.len:
