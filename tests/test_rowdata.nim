@@ -286,3 +286,27 @@ suite "Row.clone":
     let row = initRow(nil, 0)
     let cloned = row.clone()
     check cloned.data == nil
+
+suite "parseDataRowInto overflow guard":
+  test "raises PgProtocolError when cumulative buf exceeds int32.high":
+    var rd = newRowData(1)
+    rd.buf.setLen(int32.high)
+    expect PgProtocolError:
+      parseDataRowInto(buildDataRowBody(["x"]), rd)
+
+  test "state unchanged on overflow error":
+    var rd = newRowData(1)
+    let saveLen = int32.high - 4
+    rd.buf.setLen(saveLen)
+    let savedCellBase = rd.cellIndex.len
+    expect PgProtocolError:
+      parseDataRowInto(buildDataRowBody(["x"]), rd)
+    check rd.buf.len == saveLen
+    check rd.cellIndex.len == savedCellBase
+
+  test "no error just below int32.high":
+    var rd = newRowData(1)
+    rd.buf.setLen(int32.high - 5)
+    parseDataRowInto(buildDataRowBody(["x"]), rd)
+    check rd.buf.len == int32.high
+    check rd.cellIndex.len == 2
