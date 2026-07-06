@@ -13,7 +13,8 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
 
   let numPairs = int(fromBE32(data.toOpenArray(0, 3)))
   if numPairs < 0:
-    raise newException(PgTypeError, "hstore binary: invalid number of pairs " & $numPairs)
+    raise
+      newException(PgTypeError, "hstore binary: invalid number of pairs " & $numPairs)
 
   var pos = 4
   for _ in 0 ..< numPairs:
