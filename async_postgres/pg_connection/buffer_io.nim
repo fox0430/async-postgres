@@ -438,10 +438,7 @@ template pumpUntilReady*(
     var queryError: ref PgQueryError
     var pumpMsg: BackendMessage
     while true:
-      while (
-        let opt = conn.nextMessage(resultData, nil, onRow, onRowErr)
-        opt.isSome
-      ):
+      while (let opt = conn.nextMessage(resultData, nil, onRow, onRowErr); opt.isSome):
         pumpMsg = opt.get
         if pumpMsg.kind == bmkErrorResponse:
           if queryError == nil:
