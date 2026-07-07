@@ -912,6 +912,46 @@ suite "Backend decoding - edge cases":
     expect PgProtocolError:
       discard parseBackendMessage(buf)
 
+  test "DataRow with skipDataRow=true consumes without decoding columns":
+    var body: seq[byte] = @[]
+    body.addInt16(2)
+    body.addInt32(3)
+    body.add(cast[seq[byte]]("abc"))
+    body.addInt32(-1)
+    let buf = buildMsg('D', body)
+    var consumed: int
+    let res = parseBackendMessage(buf, consumed, skipDataRow = true)
+    check res.state == psDataRow
+    check consumed == buf.len
+
+  test "skipDataRow ignored when rowData is provided":
+    var body: seq[byte] = @[]
+    body.addInt16(1)
+    body.addInt32(2)
+    body.add(cast[seq[byte]]("hi"))
+    let buf = buildMsg('D', body)
+    var consumed: int
+    let rd = newRowData(1'i16)
+    let res = parseBackendMessage(buf, consumed, rd, skipDataRow = true)
+    check res.state == psDataRow
+    check consumed == buf.len
+    # Column decoded into RowData
+    check rd.cellIndex.len == 2
+    check rd.cellIndex[1] == 2'i32 # column length
+
+  test "skipDataRow=false preserves legacy full-decode behaviour":
+    var body: seq[byte] = @[]
+    body.addInt16(1)
+    body.addInt32(2)
+    body.add(cast[seq[byte]]("hi"))
+    let buf = buildMsg('D', body)
+    var consumed: int
+    let res = parseBackendMessage(buf, consumed) # default skipDataRow = false
+    check res.state == psComplete
+    check res.message.kind == bmkDataRow
+    check res.message.columns.len == 1
+    check cast[string](res.message.columns[0].get) == "hi"
+
   test "unknown message type raises PgProtocolError":
     var buf = buildMsg('?', @[0'u8])
     expect PgProtocolError:
@@ -1128,3 +1168,91 @@ suite "nextMessage recvBufStart update":
     check opt.get.kind == bmkCommandComplete
     check count == 2
     check conn.recvBufStart == row1.len + row2.len + cc.len
+
+suite "nextMessage skipDataRow":
+  proc buildMsg(msgType: char, body: seq[byte]): seq[byte] =
+    result = @[byte(msgType)]
+    result.addInt32(int32(4 + body.len))
+    result.add(body)
+
+  proc buildDataRowMsg(values: openArray[string]): seq[byte] =
+    var body: seq[byte] = @[]
+    body.addInt16(int16(values.len))
+    for v in values:
+      body.addInt32(int32(v.len))
+      for c in v:
+        body.add(byte(c))
+    buildMsg('D', body)
+
+  proc buildCommandComplete(tag: string): seq[byte] =
+    var body: seq[byte] = @[]
+    for c in tag:
+      body.add(byte(c))
+    body.add(0'u8)
+    buildMsg('C', body)
+
+  proc mockConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "skipDataRow=true skips a DataRow and surfaces the next non-DataRow":
+    var conn = mockConn()
+    let row = buildDataRowMsg(["hello"])
+    let cc = buildCommandComplete("SELECT 1")
+    conn.recvBuf = row & cc
+    conn.recvBufStart = 0
+
+    let opt = conn.nextMessage(skipDataRow = true)
+    check opt.isSome
+    check opt.get.kind == bmkCommandComplete
+    check conn.recvBufStart == row.len + cc.len
+
+  test "skipDataRow=true skips multiple DataRows before CommandComplete":
+    var conn = mockConn()
+    let row1 = buildDataRowMsg(["a"])
+    let row2 = buildDataRowMsg(["bb"])
+    let cc = buildCommandComplete("SELECT 2")
+    conn.recvBuf = row1 & row2 & cc
+    conn.recvBufStart = 0
+
+    let opt = conn.nextMessage(skipDataRow = true)
+    check opt.isSome
+    check opt.get.kind == bmkCommandComplete
+    check conn.recvBufStart == row1.len + row2.len + cc.len
+
+  test "skipDataRow=true still increments rowCount":
+    var conn = mockConn()
+    let row1 = buildDataRowMsg(["a"])
+    let row2 = buildDataRowMsg(["bb"])
+    let cc = buildCommandComplete("SELECT 2")
+    conn.recvBuf = row1 & row2 & cc
+    conn.recvBufStart = 0
+
+    var count: int32 = 0
+    let opt = conn.nextMessage(rowCount = addr count, skipDataRow = true)
+    check opt.isSome
+    check opt.get.kind == bmkCommandComplete
+    check count == 2
+
+  test "skipDataRow gated when rowData is provided — row is decoded":
+    var conn = mockConn()
+    let row = buildDataRowMsg(["hi"])
+    conn.recvBuf = row
+    conn.recvBufStart = 0
+
+    var rd = newRowData(1)
+    var count: int32 = 0
+    # rowData != nil overrides skipDataRow: the row is decoded into rd,
+    # then the loop hits psIncomplete and returns none.
+    let opt = conn.nextMessage(rd, addr count, skipDataRow = true)
+    check opt.isNone
+    check count == 1
+    check rd.cellIndex.len == 2 # 1 column * (offset, length)
+    check rd.cellIndex[1] == 2'i32 # "hi" length
+    check conn.recvBufStart == row.len

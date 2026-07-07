@@ -585,9 +585,10 @@ template execRecvLoop*(
     commandTag: var string,
 ) =
   ## Receive-loop counterpart of `queryRecvLoop` for the extended-query exec
-  ## path: discards `DataRow`s (exec callers don't need rows) and exposes only
-  ## the `CommandComplete` tag via the `commandTag` out-parameter. Shared by
-  ## `execImpl` (both overloads), `execInlineImpl`, and `execDirectRunImpl`.
+  ## path: `DataRow`s are dropped by the parser (bare `pumpUntilReady` uses
+  ## `skipDataRow = true`); this loop only exposes the `CommandComplete` tag
+  ## via the `commandTag` out-parameter. Shared by `execImpl` (both
+  ## overloads), `execInlineImpl`, and `execDirectRunImpl`.
   var cachedFields: seq[FieldDescription]
   var cachedParamOids: seq[int32]
 
@@ -602,8 +603,6 @@ template execRecvLoop*(
       if cacheMiss:
         cachedFields = pumpMsg.fields
     of bmkNoData:
-      discard
-    of bmkDataRow:
       discard
     of bmkCommandComplete:
       commandTag = pumpMsg.commandTag

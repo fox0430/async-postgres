@@ -1138,6 +1138,7 @@ proc parseBackendMessage*(
     consumed: var int,
     rowData: RowData = nil,
     maxLen: int = DefaultMaxBackendMessageLen,
+    skipDataRow: bool = false,
 ): ParseResult {.raises: [PgProtocolError].} =
   ## Parse a single backend message from `buf`.
   ## On success, sets `consumed` to the number of bytes used.
@@ -1147,6 +1148,11 @@ proc parseBackendMessage*(
   ## ``maxLen <= 0`` disables the cap (intended for tests); production
   ## callers should resolve the default via ``ConnConfig.maxMessageSize``
   ## and ``effectiveMaxMessageSize``.
+  ## When ``rowData == nil`` and ``skipDataRow`` is true, a ``DataRow`` message
+  ## is only framed and consumed — the columns are NOT decoded, avoiding the
+  ## per-row ``seq[Option[seq[byte]]]`` + per-cell ``seq`` allocation that the
+  ## caller would immediately discard. Result state is ``psDataRow`` in that
+  ## case, with ``message`` left default-initialised.
   consumed = 0
 
   # Need at least 5 bytes: 1 type + 4 length
@@ -1190,6 +1196,11 @@ proc parseBackendMessage*(
   of 'D':
     if rowData != nil:
       parseDataRowInto(body, rowData)
+      consumed = totalLen
+      return ParseResult(state: psDataRow)
+    elif skipDataRow:
+      # Caller does not want the row — skip decoding entirely to avoid the
+      # per-row seq[Option[seq[byte]]] + per-cell seq allocation.
       consumed = totalLen
       return ParseResult(state: psDataRow)
     else:
