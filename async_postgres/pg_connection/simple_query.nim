@@ -124,7 +124,7 @@ proc simpleExecImpl*(conn: PgConnection, sql: string): Future[string] {.async.} 
     case pumpMsg.kind
     of bmkCommandComplete:
       commandTag = pumpMsg.commandTag
-    of bmkRowDescription, bmkDataRow, bmkEmptyQueryResponse:
+    of bmkRowDescription, bmkEmptyQueryResponse:
       discard
     else:
       discard

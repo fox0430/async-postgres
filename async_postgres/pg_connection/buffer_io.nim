@@ -302,6 +302,7 @@ proc nextMessage*(
     rowCount: ptr int32 = nil,
     onRow: RowCallback = nil,
     onRowError: ptr ref CatchableError = nil,
+    skipDataRow: bool = false,
 ): Option[BackendMessage] {.raises: [PgProtocolError].} =
   ## Synchronously parse the next message from the receive buffer.
   ## Returns none if the buffer doesn't contain a complete message.
@@ -316,6 +317,10 @@ proc nextMessage*(
   ## the error is captured into ``onRowError[]`` (required to be non-nil
   ## when `onRow` is set) and subsequent rows are drained without
   ## re-invoking the callback.
+  ## When ``rowData == nil`` and ``onRow == nil`` and ``skipDataRow`` is true,
+  ## DataRow messages are also skipped without decoding their columns — used
+  ## by discard-only consumers (exec paths, simple-protocol exec) to avoid a
+  ## per-row ``seq[Option[seq[byte]]]`` + per-cell ``seq`` allocation.
   ##
   ## On `PgProtocolError` the protocol stream is desynchronised — the connection
   ## is transitioned to `csClosed` before re-raising so that it is never
@@ -327,7 +332,11 @@ proc nextMessage*(
     let res =
       try:
         parseBackendMessage(
-          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData, maxLen
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1),
+          consumed,
+          rowData,
+          maxLen,
+          skipDataRow = skipDataRow and rowData == nil and onRow == nil,
         )
       except PgProtocolError as e:
         conn.state = csClosed
@@ -458,14 +467,21 @@ template pumpUntilReady*(
 template pumpUntilReady*(
     conn: PgConnection, body: untyped, readyBody: untyped
 ) {.dirty.} =
-  ## Bare overload for callers that decode `DataRow` inside `body` (or ignore
-  ## it) instead of accumulating into a `RowData`.  Body mirrors the data
-  ## overload above with `nextMessage()` in place of the accumulating call.
+  ## Bare overload for callers that do not accumulate into a `RowData`.
+  ## Body mirrors the data overload above with `nextMessage()` in place of
+  ## the accumulating call.
+  ##
+  ## `DataRow` is skipped in the parser here — no current caller inspects
+  ## rows inside `body`: exec paths (extended-query, simple-protocol)
+  ## discard them, and the remaining callers (prepare, close, cursor
+  ## close, COPY setup, ping) never receive `DataRow` in a well-formed
+  ## reply. If a future caller needs the row bytes, drop
+  ## `skipDataRow = true` here.
   block pumpLoop:
     var queryError: ref PgQueryError
     var pumpMsg: BackendMessage
     while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
+      while (let opt = conn.nextMessage(skipDataRow = true); opt.isSome):
         pumpMsg = opt.get
         if pumpMsg.kind == bmkErrorResponse:
           if queryError == nil:
