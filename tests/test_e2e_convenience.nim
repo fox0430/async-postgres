@@ -798,9 +798,8 @@ suite "E2E: Convenience Query Methods":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      # queryEach parses messages directly from recvBuf (not via nextMessage),
-      # so it must record GUC_REPORT ParameterStatus updates itself. Changing a
-      # reported GUC (application_name) through queryEach must reach serverParams.
+      # queryEach dispatches messages through nextMessage, so GUC_REPORT
+      # ParameterStatus updates (e.g. application_name) must reach serverParams.
       const newName = "queryeach_param_status_test"
       doAssert conn.serverParams.getOrDefault("application_name", "") != newName
       let rowCount = await conn.queryEach(

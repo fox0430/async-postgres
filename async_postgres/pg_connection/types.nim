@@ -645,15 +645,9 @@ type
       ## nil). Advisory only — the macro's behaviour is unchanged. Use this
       ## to observe unlock failures that would otherwise be invisible.
 
-when hasChronos:
-  type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
-    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
-    ## inside the callback — its backing buffer is reused for the next row.
-
-else:
-  type RowCallback* = proc(row: Row) {.gcsafe.}
-    ## Callback invoked once per row during `queryEach`. The `Row` is only valid
-    ## inside the callback — its backing buffer is reused for the next row.
+type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
+  ## Callback invoked once per row during `queryEach`. The `Row` is only valid
+  ## inside the callback — its backing buffer is reused for the next row.
 
 when hasChronos:
   type CopyOutCallback* =
