@@ -297,14 +297,25 @@ when hasChronos:
     copyMem(addr conn.recvBuf[oldLen], addr conn.replReadScratch[0], n)
 
 proc nextMessage*(
-    conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
+    conn: PgConnection,
+    rowData: RowData = nil,
+    rowCount: ptr int32 = nil,
+    onRow: RowCallback = nil,
+    onRowError: ptr ref CatchableError = nil,
 ): Option[BackendMessage] {.raises: [PgProtocolError].} =
   ## Synchronously parse the next message from the receive buffer.
   ## Returns none if the buffer doesn't contain a complete message.
   ## Notification/Notice messages are dispatched internally.
   ## ParameterStatus messages are recorded into `conn.serverParams` and
   ## consumed, so callers never see them.
-  ## DataRow messages are counted (if rowCount != nil) and consumed.
+  ## DataRow messages are consumed: when `onRow` is nil, they are counted
+  ## (if `rowCount != nil`) and left decoded in `rowData` for the caller;
+  ## when `onRow` is set, it is invoked once per row and `rowData.buf` /
+  ## `rowData.cellIndex` are reset before the next row, giving streaming
+  ## callers (e.g. ``queryEach``) constant memory. When `onRow` raises,
+  ## the error is captured into ``onRowError[]`` (required to be non-nil
+  ## when `onRow` is set) and subsequent rows are drained without
+  ## re-invoking the callback.
   ##
   ## On `PgProtocolError` the protocol stream is desynchronised — the connection
   ## is transitioned to `csClosed` before re-raising so that it is never
@@ -326,8 +337,17 @@ proc nextMessage*(
     pos += consumed
     conn.recvBufStart = pos
     if res.state == psDataRow:
-      # DataRow already parsed in-place into rowData; just count it
-      if rowCount != nil:
+      if onRow != nil:
+        if onRowError[] == nil:
+          try:
+            onRow(initRow(rowData, 0))
+            if rowCount != nil:
+              rowCount[] += 1
+          except CatchableError as e:
+            onRowError[] = e
+        rowData.buf.setLen(0)
+        rowData.cellIndex.setLen(0)
+      elif rowCount != nil:
         rowCount[] += 1
       continue
     if res.message.kind == bmkNotificationResponse:
@@ -386,6 +406,42 @@ template pumpUntilReady*(
     var pumpMsg: BackendMessage
     while true:
       while (let opt = conn.nextMessage(resultData, rowCountPtr); opt.isSome):
+        pumpMsg = opt.get
+        if pumpMsg.kind == bmkErrorResponse:
+          if queryError == nil:
+            queryError = newPgQueryError(pumpMsg.errorFields)
+        elif pumpMsg.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsg.txStatus
+          if conn.state != csClosed:
+            conn.state = csReady
+          readyBody
+          if queryError != nil:
+            raise queryError
+          break pumpLoop
+        else:
+          body
+      await conn.fillRecvBuf()
+
+template pumpUntilReady*(
+    conn: PgConnection,
+    resultData: untyped,
+    onRow: untyped,
+    onRowErr: untyped,
+    body: untyped,
+    readyBody: untyped,
+) {.dirty.} =
+  ## Streaming overload: `resultData` is a `RowData` for in-place DataRow
+  ## decoding, `onRow` a `RowCallback` invoked per row, `onRowErr` a
+  ## `ptr ref CatchableError` capturing the first callback failure so
+  ## remaining rows drain without re-invoking `onRow`.
+  block pumpLoop:
+    var queryError: ref PgQueryError
+    var pumpMsg: BackendMessage
+    while true:
+      while (
+        let opt = conn.nextMessage(resultData, nil, onRow, onRowErr)
+        opt.isSome
+      ):
         pumpMsg = opt.get
         if pumpMsg.kind == bmkErrorResponse:
           if queryError == nil:
