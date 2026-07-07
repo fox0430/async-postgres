@@ -850,6 +850,13 @@ template nameAccessor*(getProc: untyped, T: typedesc) =
   proc getProc*(row: Row, name: string): T =
     row.getProc(row.columnIndex(name))
 
+template nameAccessorScale*(getProc: untyped, T: typedesc) =
+  ## Like ``nameAccessor`` but forwards ``scale`` to the index-based overload,
+  ## so callers can pass ``row.getMoney("col", scale = 3)`` etc. instead of
+  ## silently getting the default.
+  proc getProc*(row: Row, name: string, scale: int = 2): T =
+    row.getProc(row.columnIndex(name), scale)
+
 optAccessor(getStr, getStrOpt, string)
 optAccessor(getInt, getIntOpt, int32)
 optAccessor(getInt16, getInt16Opt, int16)
