@@ -671,13 +671,7 @@ proc releaseCore(
   # reservation kicked off at queue-time (acquireImpl) or at the broken-release
   # that freed a slot, so the queue is already covered by in-flight spawns or
   # by the next release.
-  while pool.waiters.len > 0:
-    let waiter = pool.waiters.popFirst()
-    if waiter.isAbandoned:
-      continue
-    pool.waiterCount.dec
-    conn.borrowed = true
-    waiter.fut.complete(conn)
+  if pool.tryHandoffToWaiter(conn):
     return (false, true)
   if pool.active > 0:
     pool.active.dec
