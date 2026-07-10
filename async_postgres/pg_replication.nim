@@ -686,8 +686,10 @@ proc timelineHistory*(
 
 # Replication streaming
 
-proc parseReplicationMessage*(copyData: openArray[byte]): ReplicationMessage =
-  ## Parse a CopyData payload into a ReplicationMessage.
+proc parseReplicationMessage*(copyData: sink seq[byte]): ReplicationMessage =
+  ## Parse a CopyData payload into a ReplicationMessage. Takes ownership of
+  ## ``copyData`` so the XLogData path can reuse the incoming buffer for
+  ## ``xlogData.data`` instead of slicing into a fresh allocation.
   if copyData.len == 0:
     raise newException(PgProtocolError, "Empty replication CopyData")
   let kind = char(copyData[0])
@@ -699,9 +701,14 @@ proc parseReplicationMessage*(copyData: openArray[byte]): ReplicationMessage =
     xlog.startLsn = Lsn(cast[uint64](decodeInt64(copyData, 1)))
     xlog.walEnd = Lsn(cast[uint64](decodeInt64(copyData, 9)))
     xlog.sendTime = decodeInt64(copyData, 17)
-    let dataStart = 25
+    const dataStart = 25
     if copyData.len > dataStart:
-      xlog.data = copyData[dataStart ..< copyData.len]
+      # Reuse the incoming buffer: strip the 25-byte header in place instead
+      # of allocating a fresh seq for the payload slice.
+      xlog.data = move(copyData)
+      let newLen = xlog.data.len - dataStart
+      moveMem(addr xlog.data[0], addr xlog.data[dataStart], newLen)
+      xlog.data.setLen(newLen)
     ReplicationMessage(kind: rmkXLogData, xlogData: xlog)
   of 'k': # Primary Keepalive
     if copyData.len < 18:
@@ -953,7 +960,7 @@ proc maybeSendPeriodicStatus(
 
 proc handleReplicationData(
     conn: PgConnection,
-    copyData: seq[byte],
+    copyData: sink seq[byte],
     autoKeepaliveReply: bool,
     callback: ReplicationCallback,
     lastStatusSent: Moment,
@@ -971,7 +978,7 @@ proc handleReplicationData(
   ## last time the server saw a Standby Status Update, preventing duplicate
   ## proactive updates.
   var newLastStatusSent = lastStatusSent
-  let replMsg = parseReplicationMessage(copyData)
+  let replMsg = parseReplicationMessage(move(copyData))
   case replMsg.kind
   of rmkXLogData:
     let received = replMsg.xlogData.receivedEndLsn
@@ -1055,11 +1062,11 @@ proc runReplicationStream(
   block recvLoop:
     while true:
       while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
+        var msg = opt.get
         case msg.kind
         of bmkCopyData:
           lastStatusSent = await conn.handleReplicationData(
-            msg.copyData, autoKeepaliveReply, callback, lastStatusSent
+            move(msg.copyData), autoKeepaliveReply, callback, lastStatusSent
           )
         of bmkCopyDone:
           await conn.sendMsg(@copyDoneMsg)
