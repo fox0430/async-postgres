@@ -81,27 +81,30 @@ proc copyInRawImpl*(
   # loop; kept separate from the pumps' own injected `queryError`.
   var abortError: ref PgQueryError
 
-  # Wait for CopyInResponse (or error)
-  conn.pumpUntilReady:
-    case pumpMsg.kind
-    of bmkCopyInResponse:
-      break pumpLoop
-    of bmkCopyOutResponse:
-      # Wrong direction; keep draining to ReadyForQuery, then raise there.
-      if queryError == nil:
-        queryError = newException(
-          PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOut"
-        )
-    of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
-      # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
-      if queryError == nil:
-        queryError =
-          newException(PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement")
-    else:
+  # Outer block splits the two exits: CopyInResponse → continue to send;
+  # ReadyForQuery fallthrough → return (template already raised any queryError).
+  block waitCopyIn:
+    conn.pumpUntilReady:
+      case pumpMsg.kind
+      of bmkCopyInResponse:
+        break waitCopyIn
+      of bmkCopyOutResponse:
+        # Wrong direction; keep draining to ReadyForQuery, then raise there.
+        if queryError == nil:
+          queryError = newException(
+            PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOut"
+          )
+      of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
+        # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+        if queryError == nil:
+          queryError = newException(
+            PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement"
+          )
+      else:
+        discard
+    do:
       discard
-  do:
-    if queryError != nil:
-      raise queryError
+
     return commandTag
 
   # Send CopyData in batches, slicing from the input buffer, while watching for
@@ -246,29 +249,32 @@ proc copyInStreamImpl*(
   # loop; kept separate from the pumps' own injected `queryError`.
   var abortError: ref PgQueryError
 
-  # Wait for CopyInResponse (or error)
-  conn.pumpUntilReady:
-    case pumpMsg.kind
-    of bmkCopyInResponse:
-      info.format = pumpMsg.copyFormat
-      info.columnFormats = pumpMsg.copyColumnFormats
-      break pumpLoop
-    of bmkCopyOutResponse:
-      # Wrong direction; keep draining to ReadyForQuery, then raise there.
-      if queryError == nil:
-        queryError = newException(
-          PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOutStream"
-        )
-    of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
-      # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
-      if queryError == nil:
-        queryError =
-          newException(PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement")
-    else:
+  # Outer block splits the two exits; see `copyInRawImpl`.
+  block waitCopyIn:
+    conn.pumpUntilReady:
+      case pumpMsg.kind
+      of bmkCopyInResponse:
+        info.format = pumpMsg.copyFormat
+        info.columnFormats = pumpMsg.copyColumnFormats
+        break waitCopyIn
+      of bmkCopyOutResponse:
+        # Wrong direction; keep draining to ReadyForQuery, then raise there.
+        if queryError == nil:
+          queryError = newException(
+            PgQueryError,
+            "COPY IN got a COPY ... TO STDOUT statement; use copyOutStream",
+          )
+      of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
+        # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+        if queryError == nil:
+          queryError = newException(
+            PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement"
+          )
+      else:
+        discard
+    do:
       discard
-  do:
-    if queryError != nil:
-      raise queryError
+
     return info
 
   # Pull data from the callback and send as CopyData in batches, watching for an

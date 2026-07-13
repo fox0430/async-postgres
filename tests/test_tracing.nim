@@ -1251,9 +1251,11 @@ suite "Tracing: onCleanupSkipped":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransaction:
           discard await conn.exec("SELECT 1")
           raise newException(PgError, "body boom")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1275,12 +1277,14 @@ suite "Tracing: onCleanupSkipped":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransaction:
           # Stand-in for "per-call timeout invalidated the conn after BEGIN":
           # mark csClosed by hand and raise. The macro must observe the
           # invalidated state and skip ROLLBACK while reporting the skip.
           conn.state = csClosed
           raise newException(PgError, "simulated timeout invalidation")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1303,10 +1307,12 @@ suite "Tracing: onCleanupSkipped":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransaction:
           conn.withSavepoint:
             conn.state = csClosed
             raise newException(PgError, "simulated timeout invalidation")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1369,9 +1375,11 @@ suite "Tracing: onCleanupSkipped (pool)":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransaction(conn):
           discard await conn.exec("SELECT 1")
           raise newException(PgError, "body boom")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1396,9 +1404,11 @@ suite "Tracing: onCleanupSkipped (pool)":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransaction(conn):
           conn.state = csClosed
           raise newException(PgError, "simulated timeout invalidation")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1422,9 +1432,11 @@ suite "Tracing: onCleanupSkipped (pool)":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransactionDeadline(conn, seconds(30)):
           conn.state = csClosed
           raise newException(PgError, "simulated timeout invalidation")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1458,9 +1470,11 @@ suite "Tracing: onCleanupSkipped (cluster)":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         cluster.withTransaction(conn):
           discard await conn.exec("SELECT 1")
           raise newException(PgError, "body boom")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1486,9 +1500,11 @@ suite "Tracing: onCleanupSkipped (cluster)":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         cluster.withTransaction(conn):
           conn.state = csClosed
           raise newException(PgError, "simulated timeout invalidation")
+        {.pop.}
       except PgError:
         raised = true
 
@@ -1516,11 +1532,13 @@ suite "Tracing: onCleanupSkipped (cluster)":
 
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         cluster.withTransactionRetry(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn
         ):
           conn.state = csClosed
           raise newException(PgError, "simulated timeout invalidation")
+        {.pop.}
       except PgError:
         raised = true
 
