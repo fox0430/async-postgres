@@ -1,8 +1,11 @@
-import std/[unittest, strutils]
+import std/[unittest, strutils, os]
 
 import ../async_postgres/[async_backend, pg_protocol]
 
 import ../async_postgres/pg_connection {.all.}
+
+proc testCaCert(): string =
+  readFile(currentSourcePath().parentDir / "certs" / "ca.crt")
 
 when hasAsyncDispatch:
   import std/asyncnet
@@ -191,6 +194,7 @@ suite "SSL negotiation - server rejects SSL":
         user: "test",
         database: "test",
         sslMode: sslVerifyFull,
+        sslRootCert: testCaCert(),
       )
 
       try:
@@ -393,6 +397,7 @@ suite "SSL negotiation - sslVerifyCa":
         user: "test",
         database: "test",
         sslMode: sslVerifyCa,
+        sslRootCert: testCaCert(),
       )
 
       try:
@@ -406,6 +411,103 @@ suite "SSL negotiation - sslVerifyCa":
 
     waitFor testBody()
     check raised
+
+  test "sslVerifyCa without sslRootCert fails closed before I/O":
+    # Web PKI fallback would let any publicly-issued cert MITM (no hostname check).
+    var raised = false
+    var msgMatches = false
+    var sslRequestSeen = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        try:
+          let st = await ms.accept()
+          try:
+            discard await readN(st, 8)
+            sslRequestSeen = true
+          except CatchableError:
+            discard
+          await closeClient(st)
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslVerifyCa,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "sslrootcert" in e.msg
+
+      await closeServer(ms)
+      try:
+        await serverFut
+      except CatchableError:
+        discard
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+    check not sslRequestSeen
+
+  test "sslVerifyFull without sslRootCert fails closed before I/O":
+    var raised = false
+    var msgMatches = false
+    var sslRequestSeen = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        try:
+          let st = await ms.accept()
+          try:
+            discard await readN(st, 8)
+            sslRequestSeen = true
+          except CatchableError:
+            discard
+          await closeClient(st)
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslVerifyFull,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "sslrootcert" in e.msg
+
+      await closeServer(ms)
+      try:
+        await serverFut
+      except CatchableError:
+        discard
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+    check not sslRequestSeen
 
   test "sslAllow ordinal is between sslDisable and sslPrefer":
     check ord(sslAllow) > ord(sslDisable)
@@ -1066,7 +1168,8 @@ when hasAsyncDispatch and defined(ssl):
   suite "SSL verify-full - enforceVerifyFullIdentity (OpenSSL backend)":
     test "installs the DNS host on the SSL handle":
       resolveX509TestSyms()
-      if x509GetHostFn == nil:
+      let getParam = sslGet0Param()
+      if x509GetHostFn == nil or getParam == nil:
         skip()
       else:
         let ctx = newContext(verifyMode = CVerifyNone)
@@ -1074,7 +1177,7 @@ when hasAsyncDispatch and defined(ssl):
         doAssert ssl != nil
         try:
           enforceVerifyFullIdentity(ssl, "db.example.com")
-          check $x509GetHostFn(SSL_get0_param(ssl), 0.cint) == "db.example.com"
+          check $x509GetHostFn(getParam(ssl), 0.cint) == "db.example.com"
         finally:
           SSL_free(ssl)
 
