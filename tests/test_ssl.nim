@@ -7,7 +7,7 @@ import ../async_postgres/pg_connection {.all.}
 when hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
-    import std/[net, openssl, base64]
+    import std/[dynlib, net, openssl, base64]
     import ../async_postgres/pg_connection/ssl {.all.}
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
@@ -1010,63 +1010,83 @@ when hasAsyncDispatch and defined(ssl):
     finally:
       X509_free(certVar)
 
-  # std/openssl doesn't bind these; declare them for the tests below.
-  proc X509_check_ip_asc(
-    cert: PX509, ipasc: cstring, flags: cuint
-  ): cint {.cdecl, dynlib: DLLUtilName, importc.}
+  # Lazy-load these too: Apple's system libcrypto omits some LibreSSL exports
+  # and an eager `{.dynlib.}` binding would abort the test binary at startup.
+  type
+    X509CheckIpAscFn = proc(cert: PX509, ipasc: cstring, flags: cuint): cint {.
+      cdecl, gcsafe, raises: []
+    .}
+    X509GetHostFn =
+      proc(param: pointer, idx: cint): cstring {.cdecl, gcsafe, raises: [].}
 
-  proc X509_VERIFY_PARAM_get0_host(
-    param: pointer, idx: cint
-  ): cstring {.cdecl, dynlib: DLLUtilName, importc.}
+  var
+    x509CheckIpAscFn: X509CheckIpAscFn
+    x509GetHostFn: X509GetHostFn
+    x509TestSymsResolved: bool
 
-  # The matching OpenSSL applies during the handshake after
-  # `enforceVerifyFullIdentity` installs the identity: a DNS name via
-  # `X509_check_host` (default flags: SAN dNSNames, CN only when no dNSName SAN),
-  # an IP literal via `X509_check_ip_asc` against iPAddress SANs.
+  proc resolveX509TestSyms() =
+    if x509TestSymsResolved:
+      return
+    let lib = loadLibPattern(DLLUtilName)
+    if lib != nil:
+      x509CheckIpAscFn = cast[X509CheckIpAscFn](symAddr(lib, "X509_check_ip_asc"))
+      x509GetHostFn = cast[X509GetHostFn](symAddr(lib, "X509_VERIFY_PARAM_get0_host"))
+    x509TestSymsResolved = true
+
   proc dnsMatches(cert: PX509, name: string): bool =
     X509_check_host(cert, name.cstring, name.len.cint, 0.cuint, nil) == 1
 
   proc ipMatches(cert: PX509, ip: string): bool =
-    X509_check_ip_asc(cert, ip.cstring, 0.cuint) == 1
+    resolveX509TestSyms()
+    doAssert x509CheckIpAscFn != nil, "X509_check_ip_asc unavailable"
+    x509CheckIpAscFn(cert, ip.cstring, 0.cuint) == 1
 
   suite "SSL verify-full - certificate identity contract (OpenSSL backend)":
     test "IP-SAN cert matches its IP and rejects others":
-      withCert(ipSanCertDerB64, cert):
-        check ipMatches(cert, "127.0.0.1")
-        check not ipMatches(cert, "10.0.0.1")
-        # IP-only cert: no dNSName SAN, so CN=pgtest is used and rejects a name.
-        check not dnsMatches(cert, "example.com")
+      resolveX509TestSyms()
+      if x509CheckIpAscFn == nil:
+        skip()
+      else:
+        withCert(ipSanCertDerB64, cert):
+          check ipMatches(cert, "127.0.0.1")
+          check not ipMatches(cert, "10.0.0.1")
+          check not dnsMatches(cert, "example.com")
 
     test "DNS-SAN cert matches its hostname and rejects others":
-      # Pre-fix this chain-valid cert was accepted for *any* verify-full host.
-      withCert(dnsOnlyCertDerB64, cert):
-        check dnsMatches(cert, "example.com")
-        check not dnsMatches(cert, "evil.example.com")
-        # A dNSName SAN is present, so the CN (pgtest) must be ignored.
-        check not dnsMatches(cert, "pgtest")
-        # And a DNS-only cert must not satisfy a verify-full connection to an IP.
-        check not ipMatches(cert, "127.0.0.1")
+      resolveX509TestSyms()
+      if x509CheckIpAscFn == nil:
+        skip()
+      else:
+        withCert(dnsOnlyCertDerB64, cert):
+          check dnsMatches(cert, "example.com")
+          check not dnsMatches(cert, "evil.example.com")
+          check not dnsMatches(cert, "pgtest")
+          check not ipMatches(cert, "127.0.0.1")
 
   suite "SSL verify-full - enforceVerifyFullIdentity (OpenSSL backend)":
     test "installs the DNS host on the SSL handle":
-      # CVerifyNone avoids a system trust-store scan; the host is recorded anyway.
-      let ctx = newContext(verifyMode = CVerifyNone)
-      let ssl = SSL_new(ctx.context)
-      doAssert ssl != nil
-      try:
-        enforceVerifyFullIdentity(ssl, "db.example.com")
-        check $X509_VERIFY_PARAM_get0_host(SSL_get0_param(ssl), 0.cint) ==
-          "db.example.com"
-      finally:
-        SSL_free(ssl)
+      resolveX509TestSyms()
+      if x509GetHostFn == nil:
+        skip()
+      else:
+        let ctx = newContext(verifyMode = CVerifyNone)
+        let ssl = SSL_new(ctx.context)
+        doAssert ssl != nil
+        try:
+          enforceVerifyFullIdentity(ssl, "db.example.com")
+          check $x509GetHostFn(SSL_get0_param(ssl), 0.cint) == "db.example.com"
+        finally:
+          SSL_free(ssl)
 
     test "accepts IP literals without error":
-      let ctx = newContext(verifyMode = CVerifyNone)
-      let ssl = SSL_new(ctx.context)
-      doAssert ssl != nil
-      try:
-        # Goes through the iPAddress-SAN path; must not raise.
-        enforceVerifyFullIdentity(ssl, "127.0.0.1")
-        enforceVerifyFullIdentity(ssl, "::1")
-      finally:
-        SSL_free(ssl)
+      if x509VerifyParamSet1IpAsc() == nil:
+        skip()
+      else:
+        let ctx = newContext(verifyMode = CVerifyNone)
+        let ssl = SSL_new(ctx.context)
+        doAssert ssl != nil
+        try:
+          enforceVerifyFullIdentity(ssl, "127.0.0.1")
+          enforceVerifyFullIdentity(ssl, "::1")
+        finally:
+          SSL_free(ssl)

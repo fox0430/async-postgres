@@ -21,7 +21,7 @@ when hasChronos:
 elif hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
-    import std/[net, openssl, tempfiles, os]
+    import std/[dynlib, net, openssl, tempfiles, os]
 
 when hasAsyncDispatch and defined(ssl):
   # On asyncdispatch `conn.socket` is an `AsyncSocket`, so `wrapConnectedSocket`
@@ -38,9 +38,23 @@ when hasAsyncDispatch and defined(ssl):
 
   proc SSL_get0_param(ssl: SslPtr): pointer {.cdecl, dynlib: DLLSSLName, importc.}
 
-  proc X509_VERIFY_PARAM_set1_ip_asc(
-    param: pointer, ipasc: cstring
-  ): cint {.cdecl, dynlib: DLLUtilName, importc.}
+  type X509SetIpAscFn =
+    proc(param: pointer, ipasc: cstring): cint {.cdecl, gcsafe, raises: [].}
+
+  # Apple's system libcrypto omits this symbol; an eager `{.dynlib.}` binding
+  # would abort the process at startup. Resolve lazily and let callers handle nil.
+  var
+    x509SetIpAscFn: X509SetIpAscFn
+    x509SetIpAscResolved: bool
+
+  proc x509VerifyParamSet1IpAsc*(): X509SetIpAscFn =
+    if not x509SetIpAscResolved:
+      let lib = loadLibPattern(DLLUtilName)
+      if lib != nil:
+        x509SetIpAscFn =
+          cast[X509SetIpAscFn](symAddr(lib, "X509_VERIFY_PARAM_set1_ip_asc"))
+      x509SetIpAscResolved = true
+    x509SetIpAscFn
 
   proc enforceVerifyFullIdentity(sslHandle: SslPtr, host: string) =
     ## Make OpenSSL match the peer certificate against `host` during the deferred
@@ -49,7 +63,14 @@ when hasAsyncDispatch and defined(ssl):
     ## identity cannot be installed, so it never silently degrades to chain-only.
     let ok =
       if isIpAddress(host):
-        X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(sslHandle), host.cstring)
+        let fn = x509VerifyParamSet1IpAsc()
+        if fn == nil:
+          raise newException(
+            PgConnectionError,
+            "sslmode=verify-full: libcrypto does not export " &
+              "X509_VERIFY_PARAM_set1_ip_asc; cannot verify " & host,
+          )
+        fn(SSL_get0_param(sslHandle), host.cstring)
       else:
         SSL_set1_host(sslHandle, host.cstring)
     if ok != 1:
