@@ -2920,6 +2920,19 @@ suite "PgMoney":
     expect(PgTypeError):
       discard row.getMoneyArray(0, scale = 19)
 
+  test "getMoney by name forwards scale":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(987654'i64)))], fields)
+    check row.getMoney("test") == initPgMoney(987654)
+    check row.getMoney("test", scale = 0) == initPgMoney(987654, scale = 0)
+
+  test "getMoneyArray by name forwards scale":
+    let values = @[initPgMoney(100, scale = 0), initPgMoney(-50, scale = 0)]
+    let p = toPgParam(@[initPgMoney(100), initPgMoney(-50)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    check row.getMoneyArray("test", scale = 0) == values
+
 suite "PgInterval":
   test "$ zero interval":
     let v = PgInterval(months: 0, days: 0, microseconds: 0)
@@ -6921,6 +6934,16 @@ suite "toPgParamInline":
     check p.format == 0
     check p.len == -1
 
+  test "string too large raises ValueError":
+    when sizeof(int) >= 8:
+      expect ValueError:
+        discard toPgParamInline(newString(int(int32.high) + 1))
+
+  test "seq[byte] too large raises ValueError":
+    when sizeof(int) >= 8:
+      expect ValueError:
+        discard toPgParamInline(newSeq[byte](int(int32.high) + 1))
+
 suite "addBindRaw wire-format parity":
   test "single int32 param matches addBind":
     let old = toPgParam(42'i32)
@@ -7870,6 +7893,20 @@ suite "getMoneyArrayND scale":
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[none(seq[byte])], fields)
     check getMoneyArrayNDOpt(row, 0) == none(PgArray[PgMoney])
+
+  test "getMoneyArrayND by name forwards scale":
+    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let bin = toPgMoneyArrayNDParam(src, scale = 3).value.get
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    let got = row.getMoneyArrayND("test", scale = 3)
+    check got.elements[0].get.scale == 3
+    check got.elements[0].get.amount == 12345
+
+  test "getMoneyArrayNDOpt by name returns none for NULL":
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[none(seq[byte])], fields)
+    check row.getMoneyArrayNDOpt("test") == none(PgArray[PgMoney])
 
 suite "toPgMoneyArrayNDParam":
   test "toPgMoneyArrayNDParam roundtrip with default scale":

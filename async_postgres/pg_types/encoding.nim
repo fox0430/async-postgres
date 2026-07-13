@@ -47,6 +47,11 @@ proc toPgParamInline*(v: bool): PgParamInline =
 proc toPgParamInline*(v: string): PgParamInline =
   result.oid = OidText
   result.format = 0
+  if v.len > maxInt32Len:
+    raise newException(
+      ValueError,
+      "string length " & $v.len & " exceeds protocol maximum of " & $maxInt32Len,
+    )
   result.len = int32(v.len)
   if v.len == 0:
     discard
@@ -59,6 +64,11 @@ proc toPgParamInline*(v: string): PgParamInline =
 proc toPgParamInline*(v: seq[byte]): PgParamInline =
   result.oid = OidBytea
   result.format = 0
+  if v.len > maxInt32Len:
+    raise newException(
+      ValueError,
+      "bytea length " & $v.len & " exceeds protocol maximum of " & $maxInt32Len,
+    )
   result.len = int32(v.len)
   if v.len == 0:
     discard

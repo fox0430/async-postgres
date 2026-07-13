@@ -38,10 +38,11 @@ proc drainToReady(conn: PgConnection) {.async.} =
   block drainLoop:
     while true:
       while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        if msg.kind == bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
+        let pumpMsg = opt.get
+        if pumpMsg.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsg.txStatus
+          if conn.state != csClosed:
+            conn.state = csReady
           break drainLoop
       await conn.fillRecvBuf()
 
@@ -76,27 +77,32 @@ proc copyInRawImpl*(
   await conn.sendMsg(encodeQuery(sql))
 
   var commandTag = ""
-  var queryError: ref PgQueryError
+  # Server-abort error detected by pollCopyInError during the CopyData send
+  # loop; kept separate from the pumps' own injected `queryError`.
+  var abortError: ref PgQueryError
 
   # Wait for CopyInResponse (or error)
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyInResponse:
-          break recvLoop
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          return commandTag
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCopyInResponse:
+      break pumpLoop
+    of bmkCopyOutResponse:
+      # Wrong direction; keep draining to ReadyForQuery, then raise there.
+      if queryError == nil:
+        queryError = newException(
+          PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOut"
+        )
+    of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
+      # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+      if queryError == nil:
+        queryError =
+          newException(PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement")
+    else:
+      discard
+  do:
+    if queryError != nil:
+      raise queryError
+    return commandTag
 
   # Send CopyData in batches, slicing from the input buffer, while watching for
   # an early server ErrorResponse so a doomed COPY stops streaming instead of
@@ -114,11 +120,11 @@ proc copyInRawImpl*(
       if conn.sendBuf.len >= copyBatchSize:
         await conn.sendBufMsg()
         conn.sendBuf.setLen(0)
-        queryError = await conn.pollCopyInError(watch)
-        if queryError != nil:
+        abortError = await conn.pollCopyInError(watch)
+        if abortError != nil:
           conn.sendBuf.setLen(0)
           break
-    if queryError == nil:
+    if abortError == nil:
       # Flush remaining data + CopyDone in one send
       conn.sendBuf.addCopyDone()
       await conn.sendBufMsg()
@@ -129,6 +135,14 @@ proc copyInRawImpl*(
     conn.abortCopyWatch(watch)
     raise e
 
+  if abortError != nil:
+    # Server aborted the COPY mid-stream (already consumed by pollCopyInError):
+    # the backend has left copy-in mode, so drain to ReadyForQuery and raise,
+    # mirroring copyInStreamImpl. (The second pump cannot surface it.)
+    conn.sendBuf.setLen(0)
+    await conn.drainToReadyBestEffort()
+    raise abortError
+
   # Settle the in-flight watch read before parsing: on normal completion it
   # carries the CommandComplete/ReadyForQuery response; on an early error it was
   # already consumed (`watch.pending` is false) and the remaining bytes drain
@@ -137,24 +151,14 @@ proc copyInRawImpl*(
     await watch.take()
 
   # Wait for CommandComplete + ReadyForQuery
-  block recvLoop2:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCommandComplete:
-          commandTag = msg.commandTag
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop2
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCommandComplete:
+      commandTag = pumpMsg.commandTag
+    else:
+      discard
+  do:
+    discard
 
   return commandTag
 
@@ -167,6 +171,10 @@ proc copyIn*(
   ## A server-side abort (constraint violation, disk full, …) is detected
   ## between batches, so a doomed COPY stops streaming early and raises the
   ## server's ``PgQueryError`` instead of sending the whole input first.
+  ##
+  ## A statement that is not ``COPY ... FROM STDIN`` (e.g. ``COPY ... TO
+  ## STDOUT`` or a plain query) raises ``PgQueryError`` instead of silently
+  ## succeeding without sending any data.
   var tag: string
   withConnTracing(
     conn,
@@ -234,29 +242,34 @@ proc copyInStreamImpl*(
   await conn.sendMsg(encodeQuery(sql))
 
   var info = CopyInInfo()
-  var queryError: ref PgQueryError
+  # Server-abort error detected by pollCopyInError during the CopyData send
+  # loop; kept separate from the pumps' own injected `queryError`.
+  var abortError: ref PgQueryError
 
   # Wait for CopyInResponse (or error)
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyInResponse:
-          info.format = msg.copyFormat
-          info.columnFormats = msg.copyColumnFormats
-          break recvLoop
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          return info
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCopyInResponse:
+      info.format = pumpMsg.copyFormat
+      info.columnFormats = pumpMsg.copyColumnFormats
+      break pumpLoop
+    of bmkCopyOutResponse:
+      # Wrong direction; keep draining to ReadyForQuery, then raise there.
+      if queryError == nil:
+        queryError = newException(
+          PgQueryError, "COPY IN got a COPY ... TO STDOUT statement; use copyOutStream"
+        )
+    of bmkRowDescription, bmkCommandComplete, bmkEmptyQueryResponse:
+      # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+      if queryError == nil:
+        queryError =
+          newException(PgQueryError, "COPY IN requires a COPY ... FROM STDIN statement")
+    else:
+      discard
+  do:
+    if queryError != nil:
+      raise queryError
+    return info
 
   # Pull data from the callback and send as CopyData in batches, watching for an
   # early server ErrorResponse so a doomed COPY stops pulling/streaming instead
@@ -290,8 +303,8 @@ proc copyInStreamImpl*(
       if conn.sendBuf.len >= batchThreshold:
         await conn.sendBufMsg()
         conn.sendBuf.setLen(0)
-        queryError = await conn.pollCopyInError(watch)
-        if queryError != nil:
+        abortError = await conn.pollCopyInError(watch)
+        if abortError != nil:
           break
   except CatchableError as e:
     # Transport failure on the send or on the background watch read
@@ -302,7 +315,7 @@ proc copyInStreamImpl*(
     conn.abortCopyWatch(watch)
     raise e
 
-  if queryError != nil:
+  if abortError != nil:
     # Server aborted the COPY mid-stream (already detected; watch consumed). In
     # the simple-query protocol the backend has left copy-in mode and will emit
     # ReadyForQuery, so neither CopyDone nor CopyFail is needed — drain and raise.
@@ -310,7 +323,7 @@ proc copyInStreamImpl*(
     # is already csClosed; surface the server's error, not that secondary failure.
     conn.sendBuf.setLen(0)
     await conn.drainToReadyBestEffort()
-    raise queryError
+    raise abortError
   elif callbackError != nil:
     # The callback raised. Flushing pending data is pointless, but before
     # sending CopyFail check whether the server already aborted the COPY in the
@@ -320,7 +333,7 @@ proc copyInStreamImpl*(
     # instead of the callback's.
     conn.sendBuf.setLen(0)
     try:
-      queryError = await conn.pollCopyInError(watch)
+      abortError = await conn.pollCopyInError(watch)
     except CatchableError as e:
       # `pollCopyInError` re-raises a transport failure on the watch read. The
       # recv side is gone, so (like the outer handler and copyInRawImpl) abandon
@@ -328,11 +341,11 @@ proc copyInStreamImpl*(
       # failure rather than attempting CopyFail.
       conn.abortCopyWatch(watch)
       raise e
-    if queryError != nil:
+    if abortError != nil:
       # Backend already left copy-in mode; drain its abort and surface the
       # server's error, preferring it over a secondary transport failure here.
       await conn.drainToReadyBestEffort()
-      raise queryError
+      raise abortError
     # Transport healthy and the backend still in copy-in mode: abort cleanly.
     try:
       await conn.sendMsg(encodeCopyFail(callbackError.msg))
@@ -377,24 +390,14 @@ proc copyInStreamImpl*(
     await watch.take()
 
   # Wait for CommandComplete + ReadyForQuery
-  block recvLoop2:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCommandComplete:
-          info.commandTag = msg.commandTag
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop2
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCommandComplete:
+      info.commandTag = pumpMsg.commandTag
+    else:
+      discard
+  do:
+    discard
 
   return info
 
@@ -416,6 +419,9 @@ proc copyInStream*(
   ## an error arriving mid-batch only surfaces after the current batch — so a
   ## doomed COPY is bounded by one batch of extra streaming, not the whole input.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ##
+  ## A statement that is not ``COPY ... FROM STDIN`` raises ``PgQueryError``
+  ## instead of silently succeeding without pulling from ``callback``.
   var info: CopyInInfo
   withConnTracing(
     conn,
@@ -440,33 +446,47 @@ proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.}
   await conn.sendMsg(encodeQuery(sql))
 
   var cr = CopyResult()
-  var queryError: ref PgQueryError
+  var sawCopyOut = false
 
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyOutResponse:
-          cr.format = msg.copyFormat
-          cr.columnFormats = msg.copyColumnFormats
-        of bmkCopyData:
-          cr.data.add(msg.copyData)
-        of bmkCopyDone:
-          discard
-        of bmkCommandComplete:
-          cr.commandTag = msg.commandTag
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCopyOutResponse:
+      sawCopyOut = true
+      cr.format = pumpMsg.copyFormat
+      cr.columnFormats = pumpMsg.copyColumnFormats
+    of bmkCopyInResponse:
+      # Wrong direction: the backend waits for our CopyData, so send
+      # CopyFail before draining — a plain drain would deadlock.
+      if queryError == nil:
+        queryError = newException(
+          PgQueryError, "COPY OUT got a COPY ... FROM STDIN statement; use copyIn"
+        )
+      try:
+        await conn.sendMsg(encodeCopyFail("COPY OUT got a COPY FROM STDIN statement"))
+      except CatchableError as e:
+        # CopyFail undelivered: protocol out of sync, invalidate.
+        conn.state = csClosed
+        raise e
+    of bmkCopyData:
+      cr.data.add(move(pumpMsg.copyData))
+    of bmkCopyDone:
+      discard
+    of bmkRowDescription, bmkEmptyQueryResponse:
+      # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+      if queryError == nil:
+        queryError =
+          newException(PgQueryError, "COPY OUT requires a COPY ... TO STDOUT statement")
+    of bmkCommandComplete:
+      if sawCopyOut:
+        cr.commandTag = pumpMsg.commandTag
+      elif queryError == nil:
+        # Completed without entering copy-out mode (e.g. INSERT/SET).
+        queryError =
+          newException(PgQueryError, "COPY OUT requires a COPY ... TO STDOUT statement")
+    else:
+      discard
+  do:
+    discard
 
   return cr
 
@@ -476,6 +496,10 @@ proc copyOut*(
   ## Execute COPY ... TO STDOUT via simple query protocol.
   ## Collects all CopyData messages and returns them in a CopyResult.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ##
+  ## A statement that is not ``COPY ... TO STDOUT`` raises ``PgQueryError``;
+  ## a ``COPY ... FROM STDIN`` statement is aborted with CopyFail instead of
+  ## deadlocking.
   var cr: CopyResult
   withConnTracing(
     conn,
@@ -502,50 +526,67 @@ proc copyOutStreamImpl*(
   await conn.sendMsg(encodeQuery(sql))
 
   var info = CopyOutInfo()
-  var queryError: ref PgQueryError
+  var sawCopyOut = false
 
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyOutResponse:
-          info.format = msg.copyFormat
-          info.columnFormats = msg.copyColumnFormats
-        of bmkCopyData:
-          try:
-            await callback(msg.copyData)
-          except CancelledError as e:
-            # Cancellation tears the operation down; do not run the recovery
-            # drain (more I/O on a future being unwound). The COPY OUT is left
-            # mid-stream so the protocol is out of sync — invalidate the
-            # connection (the next caller must reconnect rather than see a
-            # misleading busy state) and propagate the cancellation as-is.
-            conn.state = csClosed
-            raise e
-          except CatchableError as e:
-            # The callback raised. Drain remaining messages until ReadyForQuery
-            # to keep the protocol in sync, then re-raise the callback error. If
-            # the transport dies during the drain, `fillRecvBuf` has already
-            # invalidated the connection (csClosed); surface the original
-            # callback error rather than that secondary transport failure.
-            await conn.drainToReadyBestEffort()
-            raise e
-        of bmkCopyDone:
-          discard
-        of bmkCommandComplete:
-          info.commandTag = msg.commandTag
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCopyOutResponse:
+      sawCopyOut = true
+      info.format = pumpMsg.copyFormat
+      info.columnFormats = pumpMsg.copyColumnFormats
+    of bmkCopyInResponse:
+      # Wrong direction: the backend waits for our CopyData, so send
+      # CopyFail before draining — a plain drain would deadlock.
+      if queryError == nil:
+        queryError = newException(
+          PgQueryError, "COPY OUT got a COPY ... FROM STDIN statement; use copyInStream"
+        )
+      try:
+        await conn.sendMsg(encodeCopyFail("COPY OUT got a COPY FROM STDIN statement"))
+      except CatchableError as e:
+        # CopyFail undelivered: protocol out of sync, invalidate.
+        conn.state = csClosed
+        raise e
+    of bmkCopyData:
+      if queryError != nil:
+        # Misuse error pending; don't feed a doomed callback.
+        continue
+      try:
+        await callback(pumpMsg.copyData)
+      except CancelledError as e:
+        # Cancellation tears the operation down; do not run the recovery
+        # drain (more I/O on a future being unwound). The COPY OUT is left
+        # mid-stream so the protocol is out of sync — invalidate the
+        # connection (the next caller must reconnect rather than see a
+        # misleading busy state) and propagate the cancellation as-is.
+        conn.state = csClosed
+        raise e
+      except CatchableError as e:
+        # The callback raised. Drain remaining messages until ReadyForQuery
+        # to keep the protocol in sync, then re-raise the callback error. If
+        # the transport dies during the drain, `fillRecvBuf` has already
+        # invalidated the connection (csClosed); surface the original
+        # callback error rather than that secondary transport failure.
+        await conn.drainToReadyBestEffort()
+        raise e
+    of bmkCopyDone:
+      discard
+    of bmkRowDescription, bmkEmptyQueryResponse:
+      # Not a COPY statement; keep draining to ReadyForQuery, then raise there.
+      if queryError == nil:
+        queryError =
+          newException(PgQueryError, "COPY OUT requires a COPY ... TO STDOUT statement")
+    of bmkCommandComplete:
+      if sawCopyOut:
+        info.commandTag = pumpMsg.commandTag
+      elif queryError == nil:
+        # Completed without entering copy-out mode (e.g. INSERT/SET).
+        queryError =
+          newException(PgQueryError, "COPY OUT requires a COPY ... TO STDOUT statement")
+    else:
+      discard
+  do:
+    discard
 
   return info
 
@@ -568,6 +609,10 @@ proc copyOutStream*(
   ## data before the error surfaces — cancel the query out-of-band (`cancel`)
   ## if you need to abort a large COPY OUT promptly. On timeout the connection
   ## is instead marked csClosed (protocol out of sync).
+  ##
+  ## A statement that is not ``COPY ... TO STDOUT`` raises ``PgQueryError``
+  ## without invoking ``callback``; ``COPY ... FROM STDIN`` is aborted with
+  ## CopyFail instead of deadlocking.
   var info: CopyOutInfo
   withConnTracing(
     conn,

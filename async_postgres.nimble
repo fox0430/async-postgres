@@ -10,6 +10,8 @@ license = "MIT"
 requires "nim >= 2.2.4"
 requires "nimcrypto >= 0.7.3"
 requires "checksums >= 0.2.2"
+requires "unicodedb >= 0.13.2"
+requires "normalize >= 0.9.0"
 
 task test, "run the full suite (requires a live PostgreSQL on 127.0.0.1:15432)":
   exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"

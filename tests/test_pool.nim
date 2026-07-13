@@ -470,18 +470,15 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
-  test "release stamps lastUsedAt with the return time, not stale cachedNow":
+  test "release stamps lastUsedAt with the return time, not a stale acquire-time timestamp":
     let pool = makePool()
     pool.active = 1
-    let staleNow = Moment.now() - minutes(30)
-    pool.cachedNow = staleNow
     let beforeRelease = Moment.now()
     let conn = mockConn()
     pool.release(conn)
     check pool.idle.len == 1
     check pool.idle[0].conn == conn
     check pool.idle[0].lastUsedAt >= beforeRelease
-    check pool.idle[0].lastUsedAt > staleNow
 
   test "release discards connection in transaction":
     let pool = makePool()
@@ -1108,6 +1105,48 @@ when hasChronos:
         doAssert pool.idle.len == 0
         doAssert hanging.state == csClosed
 
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
+    test "concurrent acquire during health-check ping cannot exceed maxSize":
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.healthCheckTimeout = seconds(60)
+        pool.config.pingTimeout = seconds(60)
+
+        let (pinged, server, serverTransport) = await makeHangingConn()
+        pool.idle.addLast(
+          PooledConn(conn: pinged, lastUsedAt: Moment.now() - minutes(2))
+        )
+
+        # Acquirer A suspends inside the health-check ping; the conn under
+        # inspection must already hold the active slot.
+        let futA = pool.acquire()
+        doAssert not futA.finished
+        doAssert pool.active == 1
+
+        # Acquirer B must queue instead of dialing a second conn past maxSize.
+        let futB = pool.acquire()
+        doAssert not futB.finished
+        doAssert pool.active == 1
+        doAssert pool.waiterCount == 1
+
+        # Server answers the ping: A borrows the pinged conn without
+        # double-counting it.
+        discard await serverTransport.write(
+          buildBackendMsg('I', newSeq[byte]()) & buildReadyForQuery('I')
+        )
+        let connA = await futA
+        doAssert connA == pinged
+        doAssert pool.active == 1
+
+        pool.release(connA)
+        let connB = await futB
+        doAssert connB == pinged
+        doAssert pool.active == 1
+
+        await connB.close()
         await cleanupHanging(server, serverTransport)
 
       waitFor t()
@@ -1768,11 +1807,9 @@ when hasChronos:
         pool.config.idleTimeout = milliseconds(200)
         pool.config.maintenanceInterval = milliseconds(20)
 
-        # Emulate a long borrow: `cachedNow` froze at acquire time, far older
-        # than idleTimeout. With a correct release, `lastUsedAt` is stamped at
-        # the actual return time, so the just-returned conn is well within the
-        # idle window and must not be reaped.
-        pool.cachedNow = Moment.now() - seconds(10)
+        # Emulate a long borrow: release must stamp `lastUsedAt` at the actual
+        # return time, so the just-returned conn is well within the idle window
+        # and must not be reaped.
         pool.active = 1
         let conn = mockConn()
         pool.release(conn)
@@ -1782,7 +1819,7 @@ when hasChronos:
         await sleepAsync(milliseconds(60))
 
         # idleTimeout (200ms) has not elapsed since the real return time, so the
-        # conn survives. The stale cachedNow (10s ago) would have evicted it.
+        # conn survives. A stale timestamp would have evicted it.
         doAssert pool.idle.len == 1
 
         pool.closed = true
@@ -2846,7 +2883,11 @@ suite "Pool replenish close-race":
         # raised, so the future is abandoned and the orphan-closer is armed,
         # exactly as the maintenance loop's except branch does.
         let connectFut = connect(mockConfig(ms.port))
-        pool.closeLateConnect(connectFut)
+        let onOrphan = pool.closeLateConnect()
+        connectFut.addCallback(
+          proc() =
+            onOrphan(connectFut)
+        )
 
         # The handshake finishes in the background; the completion callback then
         # closes the orphan.
@@ -2859,6 +2900,92 @@ suite "Pool replenish close-race":
         await closeServer(ms)
 
       waitFor t()
+
+suite "Pool acquire close-race":
+  test "acquire discards a connection won after the pool is closed":
+    # Regression: acquireImpl's `await connect()` in the new-conn branch could
+    # complete after close() finished, returning a live conn from a closed pool.
+    # Gate the handshake so the connect is provably in flight when we flip
+    # `closed`, then let it complete.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = seconds(5)
+
+      let acquireFut = pool.acquire()
+
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+
+      pool.closed = true
+      await sendFullHandshake(client)
+      await sleepAsync(milliseconds(80))
+
+      doAssert acquireFut.finished
+      doAssert acquireFut.failed
+      let err = acquireFut.readError()
+      doAssert err of PgPoolError
+      doAssert "closed" in err.msg
+      doAssert pool.active == 0
+      doAssert pool.metrics.createCount == 1
+      doAssert pool.metrics.closeCount == 1
+      doAssert pool.idle.len == 0
+
+      await pool.close()
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "acquire discards an idle conn whose ping resolves after close":
+    # Regression: after a health-check ping suspends, close() could complete
+    # before the ping's response, and the popped idle conn — no longer in
+    # `idle`, so not drained by close() — was returned live from a closed pool.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 2)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.healthCheckTimeout = milliseconds(1)
+      pool.config.pingTimeout = seconds(5)
+
+      # Warm one idle conn against the mock server, then age it so the next
+      # acquire triggers a ping.
+      let handshake = acceptAndReady(ms)
+      let conn = await connect(mockConfig(ms.port))
+      let client = await handshake
+      conn.ownerPool = pool
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now() - seconds(1)))
+
+      let acquireFut = pool.acquire()
+
+      # Drain the ping's Query(""), then flip closed before responding so
+      # acquireImpl sees pool.closed = true post-ping.
+      discard await drainFrontendMessage(client)
+      pool.closed = true
+
+      var resp: seq[byte]
+      resp.add(buildBackendMsg('I', @[])) # EmptyQueryResponse
+      resp.add(buildReadyForQuery('I'))
+      await sendBytes(client, resp)
+
+      await sleepAsync(milliseconds(80))
+
+      doAssert acquireFut.finished
+      doAssert acquireFut.failed
+      let err = acquireFut.readError()
+      doAssert err of PgPoolError
+      doAssert "closed" in err.msg
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 0
+
+      await pool.close()
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
 
 suite "Pool warmup parallelization":
   test "newPool opens minSize connections in parallel":

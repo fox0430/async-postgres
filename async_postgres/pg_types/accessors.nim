@@ -850,6 +850,13 @@ template nameAccessor*(getProc: untyped, T: typedesc) =
   proc getProc*(row: Row, name: string): T =
     row.getProc(row.columnIndex(name))
 
+template nameAccessorScale*(getProc: untyped, T: typedesc) =
+  ## Like ``nameAccessor`` but forwards ``scale`` to the index-based overload,
+  ## so callers can pass ``row.getMoney("col", scale = 3)`` etc. instead of
+  ## silently getting the default.
+  proc getProc*(row: Row, name: string, scale: int = 2): T =
+    row.getProc(row.columnIndex(name), scale)
+
 optAccessor(getStr, getStrOpt, string)
 optAccessor(getInt, getIntOpt, int32)
 optAccessor(getInt16, getInt16Opt, int16)
@@ -885,83 +892,78 @@ optAccessor(getPath, getPathOpt, PgPath)
 optAccessor(getPolygon, getPolygonOpt, PgPolygon)
 optAccessor(getCircle, getCircleOpt, PgCircle)
 
-proc getIntArray*(row: Row, col: int): seq[int32] =
-  ## Get a column value as a seq of int32. Handles binary array format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[int32](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in int array")
-      if e.len != 4:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for int4 array"
-        )
-      result[i] =
-        fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in int array")
-    result.add(pgParseInt32(e.get))
+# Generic array decoder skeleton: handles binary array header parsing and the
+# binary/text NULL-element checks. ``binBody`` is the expression that decodes
+# one binary element (with ``row``/``off``/``e``/``decoded`` in scope), and
+# ``textBody`` decodes one text element (with ``e`` — an ``Option[string]`` —
+# in scope).
+template genArrayDecoder(
+    getProc: untyped, T: typedesc, typeName: static string, binBody, textBody: untyped
+) {.dirty.} =
+  proc getProc*(row: Row, col: int): seq[T] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      rejectMultiDim(decoded)
+      result = newSeq[T](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in " & typeName & " array")
+        result[i] = binBody
+      return
+    for e in parseTextArray(row.getStr(col)):
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in " & typeName & " array")
+      result.add(textBody)
 
-proc getInt16Array*(row: Row, col: int): seq[int16] =
-  ## Get a column value as a seq of int16. Handles binary array format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[int16](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in int16 array")
-      if e.len != 2:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for int2 array"
-        )
-      result[i] =
-        fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in int16 array")
-    result.add(pgParseInt16(e.get))
+# Scalar array decoders
 
-proc getInt64Array*(row: Row, col: int): seq[int64] =
-  ## Get a column value as a seq of int64. Handles binary array format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[int64](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in int64 array")
-      if e.len != 8:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for int8 array"
-        )
-      result[i] =
-        fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in int64 array")
-    result.add(pgParseBiggestInt(e.get))
+proc intElemFromBinary(buf: openArray[byte], off, elen: int): int32 =
+  if elen != 4:
+    raise newException(
+      PgTypeError, "Unexpected binary element length " & $elen & " for int4 array"
+    )
+  fromBE32(buf.toOpenArray(off, off + elen - 1))
+
+genArrayDecoder(
+  getIntArray,
+  int32,
+  "int",
+  intElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseInt32(e.get),
+)
+
+proc int16ElemFromBinary(buf: openArray[byte], off, elen: int): int16 =
+  if elen != 2:
+    raise newException(
+      PgTypeError, "Unexpected binary element length " & $elen & " for int2 array"
+    )
+  fromBE16(buf.toOpenArray(off, off + elen - 1))
+
+genArrayDecoder(
+  getInt16Array,
+  int16,
+  "int16",
+  int16ElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseInt16(e.get),
+)
+
+proc int64ElemFromBinary(buf: openArray[byte], off, elen: int): int64 =
+  if elen != 8:
+    raise newException(
+      PgTypeError, "Unexpected binary element length " & $elen & " for int8 array"
+    )
+  fromBE64(buf.toOpenArray(off, off + elen - 1))
+
+genArrayDecoder(
+  getInt64Array,
+  int64,
+  "int64",
+  int64ElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseBiggestInt(e.get),
+)
 
 proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## Get a column value as a seq of PgMoney. Handles binary array format and
@@ -996,181 +998,99 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
       raise newException(PgTypeError, "NULL element in money array")
     result.add(parsePgMoney(e.get, scale))
 
-proc getFloatArray*(row: Row, col: int): seq[float64] =
-  ## Get a column value as a seq of float64. Handles binary array format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[float64](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in float array")
-      if e.len == 4:
-        result[i] = float64(decodeFloat32BE(row.data.buf, off + e.off))
-      elif e.len == 8:
-        result[i] = decodeFloat64BE(row.data.buf, off + e.off)
-      else:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for float array"
-        )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in float array")
-    result.add(pgParseFloat(e.get))
+proc floatElemFromBinary(buf: openArray[byte], off, elen: int): float64 =
+  if elen == 4:
+    float64(decodeFloat32BE(buf, off))
+  elif elen == 8:
+    decodeFloat64BE(buf, off)
+  else:
+    raise newException(
+      PgTypeError, "Unexpected binary element length " & $elen & " for float array"
+    )
 
-proc getFloat32Array*(row: Row, col: int): seq[float32] =
-  ## Get a column value as a seq of float32. Handles binary array format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[float32](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in float32 array")
-      if e.len != 4:
-        raise newException(
-          PgTypeError,
-          "Unexpected binary element length " & $e.len & " for float32 array",
-        )
-      result[i] = decodeFloat32BE(row.data.buf, off + e.off)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in float32 array")
-    result.add(pgParseFloat32(e.get))
+genArrayDecoder(
+  getFloatArray,
+  float64,
+  "float",
+  floatElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseFloat(e.get),
+)
 
-proc getBoolArray*(row: Row, col: int): seq[bool] =
-  ## Get a column value as a seq of bool. Handles binary array format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[bool](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in bool array")
-      if e.len != 1:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for bool array"
-        )
-      result[i] = row.data.buf[off + e.off] != 0'u8
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in bool array")
-    case e.get
-    of "t", "true", "1":
-      result.add(true)
-    of "f", "false", "0":
-      result.add(false)
-    else:
-      raise newException(PgTypeError, "Invalid boolean: " & e.get)
+proc float32ElemFromBinary(buf: openArray[byte], off, elen: int): float32 =
+  if elen != 4:
+    raise newException(
+      PgTypeError, "Unexpected binary element length " & $elen & " for float32 array"
+    )
+  decodeFloat32BE(buf, off)
 
-proc getStrArray*(row: Row, col: int): seq[string] =
-  ## Get a column value as a seq of strings. Handles binary array format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[string](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in string array")
-      result[i] = readString(row.data.buf, off + e.off, e.len)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in string array")
-    result.add(e.get)
+genArrayDecoder(
+  getFloat32Array,
+  float32,
+  "float32",
+  float32ElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseFloat32(e.get),
+)
 
-proc getBitArray*(row: Row, col: int): seq[PgBit] =
-  ## Get a column value as a seq of PgBit. Handles both text and binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgBit](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in bit array")
-      if e.len < 4:
-        raise newException(PgTypeError, "Invalid binary bit element: too short")
-      let nbits = fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + 3))
-      if nbits < 0:
-        raise newException(
-          PgTypeError, "Invalid binary bit element: negative nbits " & $nbits
-        )
-      if nbits > PgBitMaxBits:
-        raise newException(
-          PgTypeError,
-          "Invalid binary bit element: nbits " & $nbits & " exceeds limit (" &
-            $PgBitMaxBits & ")",
-        )
-      let dataLen = e.len - 4
-      if (int64(nbits) + 7) div 8 != int64(dataLen):
-        raise newException(
-          PgTypeError,
-          "Invalid binary bit element: nbits=" & $nbits & " inconsistent with dataLen=" &
-            $dataLen,
-        )
-      var data = newSeq[byte](dataLen)
-      for j in 0 ..< dataLen:
-        data[j] = row.data.buf[off + e.off + 4 + j]
-      result[i] = PgBit(nbits: nbits, data: data)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in bit array")
-    result.add(parseBitString(e.get))
+proc boolElemFromBinary(buf: openArray[byte], off, elen: int): bool =
+  if elen != 1:
+    raise newException(
+      PgTypeError, "Unexpected binary element length " & $elen & " for bool array"
+    )
+  buf[off] != 0'u8
 
-# Generic array decoder skeleton: handles binary array header parsing and the
-# binary/text NULL-element checks. ``binBody`` is the expression that decodes
-# one binary element (with ``row``/``off``/``e``/``decoded`` in scope), and
-# ``textBody`` decodes one text element (with ``e`` — an ``Option[string]`` —
-# in scope).
-template genArrayDecoder(
-    getProc: untyped, T: typedesc, typeName: static string, binBody, textBody: untyped
-) {.dirty.} =
-  proc getProc*(row: Row, col: int): seq[T] =
-    if row.isBinaryCol(col):
-      let (off, clen) = cellInfo(row, col)
-      if clen == -1:
-        raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      rejectMultiDim(decoded)
-      result = newSeq[T](decoded.elements.len)
-      for i, e in decoded.elements:
-        if e.len == -1:
-          raise newException(PgTypeError, "NULL element in " & typeName & " array")
-        result[i] = binBody
-      return
-    for e in parseTextArray(row.getStr(col)):
-      if e.isNone:
-        raise newException(PgTypeError, "NULL element in " & typeName & " array")
-      result.add(textBody)
+proc boolElemFromText(s: string): bool =
+  case s
+  of "t", "true", "1":
+    true
+  of "f", "false", "0":
+    false
+  else:
+    raise newException(PgTypeError, "Invalid boolean: " & s)
+
+genArrayDecoder(
+  getBoolArray,
+  bool,
+  "bool",
+  boolElemFromBinary(row.data.buf, off + e.off, e.len),
+  boolElemFromText(e.get),
+)
+
+genArrayDecoder(
+  getStrArray, string, "string", readString(row.data.buf, off + e.off, e.len), e.get
+)
+
+proc bitElemFromBinary(buf: openArray[byte], off, elen: int): PgBit =
+  if elen < 4:
+    raise newException(PgTypeError, "Invalid binary bit element: too short")
+  let nbits = fromBE32(buf.toOpenArray(off, off + 3))
+  if nbits < 0:
+    raise
+      newException(PgTypeError, "Invalid binary bit element: negative nbits " & $nbits)
+  if nbits > PgBitMaxBits:
+    raise newException(
+      PgTypeError,
+      "Invalid binary bit element: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits &
+        ")",
+    )
+  let dataLen = elen - 4
+  if (int64(nbits) + 7) div 8 != int64(dataLen):
+    raise newException(
+      PgTypeError,
+      "Invalid binary bit element: nbits=" & $nbits & " inconsistent with dataLen=" &
+        $dataLen,
+    )
+  var data = newSeq[byte](dataLen)
+  for j in 0 ..< dataLen:
+    data[j] = buf[off + 4 + j]
+  PgBit(nbits: nbits, data: data)
+
+genArrayDecoder(
+  getBitArray,
+  PgBit,
+  "bit",
+  bitElemFromBinary(row.data.buf, off + e.off, e.len),
+  parseBitString(e.get),
+)
 
 # Temporal array decoders
 
@@ -1628,184 +1548,71 @@ genArrayDecoder(
 
 # Element-level NULL-safe array getters
 
-proc getIntArrayElemOpt*(row: Row, col: int): seq[Option[int32]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[Option[int32]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(int32)
-      elif e.len != 4:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for int4 array"
-        )
+# Like ``genArrayDecoder`` but yields ``seq[Option[T]]``: a NULL element maps to
+# ``none(T)`` instead of raising. ``binBody``/``textBody`` decode one non-NULL
+# element (same scope as ``genArrayDecoder``).
+template genArrayDecoderElemOpt(
+    getProc: untyped, T: typedesc, binBody, textBody: untyped
+) {.dirty.} =
+  proc getProc*(row: Row, col: int): seq[Option[T]] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      rejectMultiDim(decoded)
+      result = newSeq[Option[T]](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          result[i] = none(T)
+        else:
+          result[i] = some(binBody)
+      return
+    for e in parseTextArray(row.getStr(col)):
+      if e.isNone:
+        result.add(none(T))
       else:
-        result[i] =
-          some(fromBE32(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
-    return
-  let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      result.add(none(int32))
-    else:
-      result.add(some(pgParseInt32(e.get)))
+        result.add(some(textBody))
 
-proc getInt16ArrayElemOpt*(row: Row, col: int): seq[Option[int16]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[Option[int16]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(int16)
-      elif e.len != 2:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for int2 array"
-        )
-      else:
-        result[i] =
-          some(fromBE16(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
-    return
-  let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      result.add(none(int16))
-    else:
-      result.add(some(pgParseInt16(e.get)))
-
-proc getInt64ArrayElemOpt*(row: Row, col: int): seq[Option[int64]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[Option[int64]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(int64)
-      elif e.len != 8:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for int8 array"
-        )
-      else:
-        result[i] =
-          some(fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)))
-    return
-  let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      result.add(none(int64))
-    else:
-      result.add(some(pgParseBiggestInt(e.get)))
-
-proc getFloatArrayElemOpt*(row: Row, col: int): seq[Option[float64]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[Option[float64]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(float64)
-      elif e.len == 4:
-        result[i] = some(float64(decodeFloat32BE(row.data.buf, off + e.off)))
-      elif e.len == 8:
-        result[i] = some(decodeFloat64BE(row.data.buf, off + e.off))
-      else:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for float array"
-        )
-    return
-  let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      result.add(none(float64))
-    else:
-      result.add(some(pgParseFloat(e.get)))
-
-proc getFloat32ArrayElemOpt*(row: Row, col: int): seq[Option[float32]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[Option[float32]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(float32)
-      elif e.len != 4:
-        raise newException(
-          PgTypeError,
-          "Unexpected binary element length " & $e.len & " for float32 array",
-        )
-      else:
-        result[i] = some(decodeFloat32BE(row.data.buf, off + e.off))
-    return
-  let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      result.add(none(float32))
-    else:
-      result.add(some(pgParseFloat32(e.get)))
-
-proc getBoolArrayElemOpt*(row: Row, col: int): seq[Option[bool]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[Option[bool]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(bool)
-      elif e.len != 1:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for bool array"
-        )
-      else:
-        result[i] = some(row.data.buf[off + e.off] != 0'u8)
-    return
-  let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      result.add(none(bool))
-    else:
-      case e.get
-      of "t", "true", "1":
-        result.add(some(true))
-      of "f", "false", "0":
-        result.add(some(false))
-      else:
-        raise newException(PgTypeError, "Invalid boolean: " & e.get)
-
-proc getStrArrayElemOpt*(row: Row, col: int): seq[Option[string]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[Option[string]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(string)
-      else:
-        result[i] = some(readString(row.data.buf, off + e.off, e.len))
-    return
-  let s = row.getStr(col)
-  result = parseTextArray(s)
+genArrayDecoderElemOpt(
+  getIntArrayElemOpt,
+  int32,
+  intElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseInt32(e.get),
+)
+genArrayDecoderElemOpt(
+  getInt16ArrayElemOpt,
+  int16,
+  int16ElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseInt16(e.get),
+)
+genArrayDecoderElemOpt(
+  getInt64ArrayElemOpt,
+  int64,
+  int64ElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseBiggestInt(e.get),
+)
+genArrayDecoderElemOpt(
+  getFloatArrayElemOpt,
+  float64,
+  floatElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseFloat(e.get),
+)
+genArrayDecoderElemOpt(
+  getFloat32ArrayElemOpt,
+  float32,
+  float32ElemFromBinary(row.data.buf, off + e.off, e.len),
+  pgParseFloat32(e.get),
+)
+genArrayDecoderElemOpt(
+  getBoolArrayElemOpt,
+  bool,
+  boolElemFromBinary(row.data.buf, off + e.off, e.len),
+  boolElemFromText(e.get),
+)
+genArrayDecoderElemOpt(
+  getStrArrayElemOpt, string, readString(row.data.buf, off + e.off, e.len), e.get
+)
 
 # Array Opt accessors (text format)
 

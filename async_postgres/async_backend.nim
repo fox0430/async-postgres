@@ -15,6 +15,18 @@ when hasChronos:
   import chronos
   export chronos
 
+  proc wait*[T](
+      fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.}
+  ): Future[T] {.async.} =
+    ## Wait for a future with a timeout. Raises AsyncTimeoutError on timeout.
+    ##
+    ## ``onOrphan`` is never called under chronos — the inner future is properly
+    ## cancelled on timeout, so no orphan can exist. Accepted for API parity with
+    ## the asyncdispatch backend, where the hook handles futures that keep running
+    ## after ``wait()`` fires.
+    let _ = onOrphan
+    return await chronos.wait(fut, timeout)
+
   proc sleepMsAsync*(ms: int): Future[void] =
     ## Sleep for `ms` milliseconds. Wrapper around chronos Duration-based API.
     sleepAsync(milliseconds(ms))
@@ -151,31 +163,30 @@ elif hasAsyncDispatch:
   proc `>`*(a, b: Moment): bool =
     a.ticks > b.ticks
 
-  proc wait*[T](fut: Future[T], timeout: Duration): Future[T] {.async.} =
+  proc wait*[T](
+      fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.} = nil
+  ): Future[T] {.async.} =
     ## Wait for a future with a timeout. Raises AsyncTimeoutError on timeout.
     ## API-compatible with chronos Future.wait().
     ##
-    ## .. warning::
-    ##   asyncdispatch has no cancellation. When a timeout fires, the inner
-    ##   future keeps running in the background until its I/O completes. For
-    ##   this reason **the underlying connection MUST NOT be reused after an
-    ##   AsyncTimeoutError** — a late write from the suspended future would
-    ##   corrupt the protocol stream of whoever reuses it next. The pg_client
-    ##   layer forces `csClosed` on timeout under asyncdispatch; see
-    ##   `invalidateOnTimeout` in pg_client.nim. chronos is not affected because
-    ##   its futures are actually cancelled.
+    ## ``onOrphan`` cleanup hook
+    ## asyncdispatch has **no cancellation**. When a timeout fires, the inner
+    ## future keeps running in the background until its I/O completes. This
+    ## ``onOrphan`` callback is registered on the inner future and called once
+    ## that orphan eventually completes. Use it to close a live connection or
+    ## release other resources the orphan holds. Without it the orphan produces
+    ## an unhandled ``FutureCompleted`` warning at best and a leaked socket /
+    ## server slot at worst.
     ##
-    ## Note: we add a no-op callback to suppress unhandled exception warnings
-    ## when the suspended inner future eventually fails.
+    ## Under chronos the ``onOrphan`` argument is accepted but never called —
+    ## futures are properly cancelled on timeout and no orphan remains.
     let ms = toMilliseconds(timeout)
     let completed = await withTimeout(fut, ms)
     if not completed:
-      # Don't call fut.fail() — the inner future is still running and would
-      # trigger "Future completed more than once" when it eventually finishes.
-      # Instead, add a callback to suppress unhandled exception warnings.
       fut.addCallback(
         proc() =
-          discard
+          if not onOrphan.isNil:
+            onOrphan(fut)
       )
       raise newException(AsyncTimeoutError, "Timeout")
     when T is void:

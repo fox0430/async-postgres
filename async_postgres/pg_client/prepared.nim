@@ -38,32 +38,21 @@ proc prepareImpl*(
   await conn.sendMsg(batch)
 
   var stmt = PreparedStatement(conn: conn, name: name, sql: sql)
-  var queryError: ref PgQueryError
 
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete:
-          discard
-        of bmkParameterDescription:
-          stmt.paramOids = msg.paramTypeOids
-        of bmkRowDescription:
-          stmt.fields = msg.fields
-        of bmkNoData:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkParseComplete:
+      discard
+    of bmkParameterDescription:
+      stmt.paramOids = pumpMsg.paramTypeOids
+    of bmkRowDescription:
+      stmt.fields = pumpMsg.fields
+    of bmkNoData:
+      discard
+    else:
+      discard
+  do:
+    discard
 
   return stmt
 
@@ -132,30 +121,18 @@ proc executeImpl*(
       colOids[i] = qr.fields[i].typeOid
     qr.data = newRowData(int16(qr.fields.len), colFmts, colOids)
     qr.data.fields = qr.fields
-  var queryError: ref PgQueryError
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkBindComplete:
-          discard
-        of bmkCommandComplete:
-          qr.commandTag = msg.commandTag
-        of bmkEmptyQueryResponse:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady(qr.data, addr qr.rowCount):
+    case pumpMsg.kind
+    of bmkBindComplete:
+      discard
+    of bmkCommandComplete:
+      qr.commandTag = pumpMsg.commandTag
+    of bmkEmptyQueryResponse:
+      discard
+    else:
+      discard
+  do:
+    discard
 
   return qr
 
@@ -202,26 +179,12 @@ proc closeImpl*(stmt: PreparedStatement): Future[void] {.async.} =
   batch.addSync()
   await conn.sendMsg(batch)
 
-  var queryError: ref PgQueryError
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCloseComplete:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCloseComplete: discard
+    else: discard
+  do:
+    discard
 
 proc close*(
     stmt: PreparedStatement, timeout: Duration = ZeroDuration

@@ -297,14 +297,30 @@ when hasChronos:
     copyMem(addr conn.recvBuf[oldLen], addr conn.replReadScratch[0], n)
 
 proc nextMessage*(
-    conn: PgConnection, rowData: RowData = nil, rowCount: ptr int32 = nil
+    conn: PgConnection,
+    rowData: RowData = nil,
+    rowCount: ptr int32 = nil,
+    onRow: RowCallback = nil,
+    onRowError: ptr ref CatchableError = nil,
+    skipDataRow: bool = false,
 ): Option[BackendMessage] {.raises: [PgProtocolError].} =
   ## Synchronously parse the next message from the receive buffer.
   ## Returns none if the buffer doesn't contain a complete message.
   ## Notification/Notice messages are dispatched internally.
   ## ParameterStatus messages are recorded into `conn.serverParams` and
   ## consumed, so callers never see them.
-  ## DataRow messages are counted (if rowCount != nil) and consumed.
+  ## DataRow messages are consumed: when `onRow` is nil, they are counted
+  ## (if `rowCount != nil`) and left decoded in `rowData` for the caller;
+  ## when `onRow` is set, it is invoked once per row and `rowData.buf` /
+  ## `rowData.cellIndex` are reset before the next row, giving streaming
+  ## callers (e.g. ``queryEach``) constant memory. When `onRow` raises,
+  ## the error is captured into ``onRowError[]`` (required to be non-nil
+  ## when `onRow` is set) and subsequent rows are drained without
+  ## re-invoking the callback.
+  ## When ``rowData == nil`` and ``onRow == nil`` and ``skipDataRow`` is true,
+  ## DataRow messages are also skipped without decoding their columns — used
+  ## by discard-only consumers (exec paths, simple-protocol exec) to avoid a
+  ## per-row ``seq[Option[seq[byte]]]`` + per-cell ``seq`` allocation.
   ##
   ## On `PgProtocolError` the protocol stream is desynchronised — the connection
   ## is transitioned to `csClosed` before re-raising so that it is never
@@ -316,7 +332,11 @@ proc nextMessage*(
     let res =
       try:
         parseBackendMessage(
-          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1), consumed, rowData, maxLen
+          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1),
+          consumed,
+          rowData,
+          maxLen,
+          skipDataRow = skipDataRow and rowData == nil and onRow == nil,
         )
       except PgProtocolError as e:
         conn.state = csClosed
@@ -326,8 +346,17 @@ proc nextMessage*(
     pos += consumed
     conn.recvBufStart = pos
     if res.state == psDataRow:
-      # DataRow already parsed in-place into rowData; just count it
-      if rowCount != nil:
+      if onRow != nil:
+        if onRowError[] == nil:
+          try:
+            onRow(initRow(rowData, 0))
+            if rowCount != nil:
+              rowCount[] += 1
+          except CatchableError as e:
+            onRowError[] = e
+        rowData.buf.setLen(0)
+        rowData.cellIndex.setLen(0)
+      elif rowCount != nil:
         rowCount[] += 1
       continue
     if res.message.kind == bmkNotificationResponse:
@@ -360,6 +389,114 @@ proc recvMessage*(
     if opt.isSome:
       return opt.get
     await conn.fillRecvBuf(timeout)
+
+template pumpUntilReady*(
+    conn: PgConnection,
+    resultData: untyped,
+    rowCountPtr: untyped,
+    body: untyped,
+    readyBody: untyped,
+) {.dirty.} =
+  ## Generic protocol pump loop.  `pumpMsg` and `queryError` are accessible
+  ## in `body` and `readyBody`.  `DataRow` messages are decoded in-place into
+  ## `resultData` and counted through `rowCountPtr` by `nextMessage`, so they
+  ## never surface in `body`.
+  ##
+  ## The loop is spelled out in both overloads rather than one forwarding to
+  ## the other: `{.dirty.}` injection only reaches `body`/`readyBody` across a
+  ## single template boundary, so forwarding would leave their references to
+  ## `pumpMsg`/`queryError` undeclared.  A single template with defaulted
+  ## `resultData`/`rowCountPtr` fails the same way — typed params ahead of the
+  ## untyped bodies suppress the injection (Nim 2.2.x).
+  block pumpLoop:
+    # Declared inside the block so two pumps in one proc scope (e.g. copy.nim's
+    # main loop plus its recvLoop2) don't collide on these dirty-injected names.
+    var queryError: ref PgQueryError
+    var pumpMsg: BackendMessage
+    while true:
+      while (let opt = conn.nextMessage(resultData, rowCountPtr); opt.isSome):
+        pumpMsg = opt.get
+        if pumpMsg.kind == bmkErrorResponse:
+          if queryError == nil:
+            queryError = newPgQueryError(pumpMsg.errorFields)
+        elif pumpMsg.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsg.txStatus
+          if conn.state != csClosed:
+            conn.state = csReady
+          readyBody
+          if queryError != nil:
+            raise queryError
+          break pumpLoop
+        else:
+          body
+      await conn.fillRecvBuf()
+
+template pumpUntilReady*(
+    conn: PgConnection,
+    resultData: untyped,
+    onRow: untyped,
+    onRowErr: untyped,
+    body: untyped,
+    readyBody: untyped,
+) {.dirty.} =
+  ## Streaming overload: `resultData` is a `RowData` for in-place DataRow
+  ## decoding, `onRow` a `RowCallback` invoked per row, `onRowErr` a
+  ## `ptr ref CatchableError` capturing the first callback failure so
+  ## remaining rows drain without re-invoking `onRow`.
+  block pumpLoop:
+    var queryError: ref PgQueryError
+    var pumpMsg: BackendMessage
+    while true:
+      while (let opt = conn.nextMessage(resultData, nil, onRow, onRowErr); opt.isSome):
+        pumpMsg = opt.get
+        if pumpMsg.kind == bmkErrorResponse:
+          if queryError == nil:
+            queryError = newPgQueryError(pumpMsg.errorFields)
+        elif pumpMsg.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsg.txStatus
+          if conn.state != csClosed:
+            conn.state = csReady
+          readyBody
+          if queryError != nil:
+            raise queryError
+          break pumpLoop
+        else:
+          body
+      await conn.fillRecvBuf()
+
+template pumpUntilReady*(
+    conn: PgConnection, body: untyped, readyBody: untyped
+) {.dirty.} =
+  ## Bare overload for callers that do not accumulate into a `RowData`.
+  ## Body mirrors the data overload above with `nextMessage()` in place of
+  ## the accumulating call.
+  ##
+  ## `DataRow` is skipped in the parser here — no current caller inspects
+  ## rows inside `body`: exec paths (extended-query, simple-protocol)
+  ## discard them, and the remaining callers (prepare, close, cursor
+  ## close, COPY setup, ping) never receive `DataRow` in a well-formed
+  ## reply. If a future caller needs the row bytes, drop
+  ## `skipDataRow = true` here.
+  block pumpLoop:
+    var queryError: ref PgQueryError
+    var pumpMsg: BackendMessage
+    while true:
+      while (let opt = conn.nextMessage(skipDataRow = true); opt.isSome):
+        pumpMsg = opt.get
+        if pumpMsg.kind == bmkErrorResponse:
+          if queryError == nil:
+            queryError = newPgQueryError(pumpMsg.errorFields)
+        elif pumpMsg.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsg.txStatus
+          if conn.state != csClosed:
+            conn.state = csReady
+          readyBody
+          if queryError != nil:
+            raise queryError
+          break pumpLoop
+        else:
+          body
+      await conn.fillRecvBuf()
 
 # Non-blocking receive watch
 #
@@ -423,22 +560,42 @@ proc cancel*(w: RecvWatch) =
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
   ## Send raw bytes to the PostgreSQL server over the connection.
+  ## On failure the connection is marked ``csClosed`` (the stream may be
+  ## partially written), symmetric with ``fillRecvBuf``.
   when hasChronos:
-    await conn.writer.write(data)
+    try:
+      await conn.writer.write(data)
+    except CatchableError as e:
+      conn.state = csClosed
+      raise e
   elif hasAsyncDispatch:
     if data.len > 0:
-      await conn.socket.sendRawBytes(data)
+      try:
+        await conn.socket.sendRawBytes(data)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
 
 proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
   ## Send conn.sendBuf to the server.
   ## The transport receives its own copy of the buffer, so conn.sendBuf is safe
   ## to mutate while the returned Future is still pending.
+  ## On failure the connection is marked ``csClosed`` (the stream may be
+  ## partially written), symmetric with ``sendMsg``.
   when hasChronos:
     if conn.sendBuf.len > 0:
-      await conn.writer.write(conn.sendBuf)
+      try:
+        await conn.writer.write(conn.sendBuf)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
   elif hasAsyncDispatch:
     if conn.sendBuf.len > 0:
-      await conn.socket.sendRawBytes(conn.sendBuf)
+      try:
+        await conn.socket.sendRawBytes(conn.sendBuf)
+      except CatchableError as e:
+        conn.state = csClosed
+        raise e
 
 # Transport teardown
 

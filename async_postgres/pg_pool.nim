@@ -118,8 +118,6 @@ type
     waiterCount: int ## Number of non-cancelled waiters
     closed: bool
     maintenanceTask: Future[void]
-    cachedNow: Moment
-      ## Updated on acquire(); reused by release() to avoid extra syscalls
     metrics: PoolMetrics
     pendingOps: Deque[PendingPoolOp] ## Queue for implicit pipeline batching
     dispatchScheduled: bool ## Whether a dispatch callback is pending
@@ -474,29 +472,28 @@ proc spawnConnectForWaiter(pool: PgPool) =
   pool.pendingBackgroundTasks.add(fut)
   asyncSpawn fut
 
-proc closeLateConnect(pool: PgPool, connectFut: Future[PgConnection]) =
-  ## Guard against asyncdispatch's non-cancelling `wait()`: when a bounded
-  ## `connect()` times out, the inner future keeps running and may still yield
-  ## a live connection that nobody is awaiting. Register a callback to close
-  ## such an orphan rather than leaking its socket and a server-side backend
-  ## slot. No-op on chronos, whose `wait()` actually cancels the connect, so
-  ## the future never reaches `completed()`.
+proc closeLateConnect(pool: PgPool): proc(fut: Future[PgConnection]) {.gcsafe.} =
+  ## Return an ``onOrphan`` callback for ``wait()`` that closes a live
+  ## connection the orphan future produces. Under asyncdispatch the inner
+  ## future keeps running after ``wait()`` times out and may yield a
+  ## connection nobody is awaiting; this callback closes it to prevent
+  ## leaking a socket and a server-side backend slot.
+  ## Under chronos ``wait()`` cancels the inner future so ``onOrphan`` is
+  ## never called — no-op.
   when hasAsyncDispatch:
-    proc closeOrphan() {.async.} =
-      try:
-        let orphan = connectFut.read()
-        if orphan != nil:
-          await pool.tracedClose(orphan)
-      except CatchableError:
-        discard
-
-    connectFut.addCallback(
-      proc() =
-        if connectFut.completed():
-          asyncSpawn closeOrphan()
-    )
+    result = proc(fut: Future[PgConnection]) {.gcsafe.} =
+      if fut.completed():
+        asyncSpawn (
+          proc() {.async.} =
+            try:
+              let orphan = fut.read()
+              if orphan != nil:
+                await pool.tracedClose(orphan)
+            except CatchableError:
+              discard
+        )()
   else:
-    discard
+    result = nil
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
@@ -557,7 +554,8 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         break
       let connectFut = connect(pool.config.connConfig)
       try:
-        let conn = await connectFut.wait(replenishTimeout)
+        let conn =
+          await connectFut.wait(replenishTimeout, onOrphan = pool.closeLateConnect())
         conn.ownerPool = pool
         pool.metrics.createCount.inc
         pool.consecutiveConnectFailures = 0
@@ -579,10 +577,8 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         else:
           pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
       except CatchableError:
-        # asyncdispatch's wait() cannot cancel connectFut: after the timeout it
-        # keeps running and may still produce a live connection nobody awaits.
-        # Close that orphan so it leaks neither a socket nor a server slot.
-        pool.closeLateConnect(connectFut)
+        # onOrphan (closeLateConnect) handles the orphan connection on timeout;
+        # here we just update failure tracking and backoff.
         pool.consecutiveConnectFailures.inc
         let delay = computeConnectBackoff(
           pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
@@ -611,7 +607,7 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   )
 
   try:
-    pool.cachedNow = Moment.now()
+    let now = Moment.now()
     # Open all `minSize` connections concurrently. `allFutures` waits for
     # every connect to settle (success or failure) without short-circuiting,
     # so a failure in one does not abandon the others mid-handshake — the
@@ -634,7 +630,7 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
         let conn = f.read()
         conn.ownerPool = pool
         pool.metrics.createCount.inc
-        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: pool.cachedNow))
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
     if firstErr != nil:
       raise firstErr
   except CatchableError as e:
@@ -675,13 +671,7 @@ proc releaseCore(
   # reservation kicked off at queue-time (acquireImpl) or at the broken-release
   # that freed a slot, so the queue is already covered by in-flight spawns or
   # by the next release.
-  while pool.waiters.len > 0:
-    let waiter = pool.waiters.popFirst()
-    if waiter.isAbandoned:
-      continue
-    pool.waiterCount.dec
-    conn.borrowed = true
-    waiter.fut.complete(conn)
+  if pool.tryHandoffToWaiter(conn):
     return (false, true)
   if pool.active > 0:
     pool.active.dec
@@ -824,8 +814,8 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   if pool.closed:
     raise newException(PgPoolError, "Pool is closed")
 
-  pool.cachedNow = Moment.now()
-  let acquireStart = pool.cachedNow
+  let now = Moment.now()
+  let acquireStart = now
 
   # `acquireTimeout` is a deadline for the whole acquire: idle health-check
   # pings, a caller-driven connect, and the final waiter wait all draw from
@@ -841,6 +831,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   template raiseAcquireTimeout() =
     pool.metrics.timeoutCount.inc
     raise newException(PgPoolError, "Pool acquire timeout")
+
+  template raisePoolClosed() =
+    raise newException(PgPoolError, "Pool is closed")
 
   template recordAcquire() =
     pool.metrics.acquireCount.inc
@@ -858,11 +851,15 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       if pc.conn.state != csReady or pc.conn.socketHasFin():
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
+        if pool.closed:
+          raisePoolClosed()
         continue
       if pool.config.maxLifetime > ZeroDuration and
-          pool.cachedNow - pc.conn.createdAt > pool.config.maxLifetime:
+          now - pc.conn.createdAt > pool.config.maxLifetime:
         pool.metrics.closeCount.inc
         await pool.tracedClose(pc.conn)
+        if pool.closed:
+          raisePoolClosed()
         continue
       # Health check: ping connections that have been idle too long.
       # TLS connections use the tighter `tlsHealthCheckTimeout` window because
@@ -873,7 +870,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           pool.config.tlsHealthCheckTimeout
         else:
           pool.config.healthCheckTimeout
-      if idleThreshold > ZeroDuration and pool.cachedNow - pc.lastUsedAt > idleThreshold:
+      if idleThreshold > ZeroDuration and now - pc.lastUsedAt > idleThreshold:
         var pingBudget = pool.config.pingTimeout
         if hasDeadline:
           let rem = remainingBudget()
@@ -895,6 +892,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
               rem
             else:
               min(pingBudget, rem)
+        # Count the conn as active across the ping so a concurrent acquire
+        # can't overshoot maxSize while it is off `idle`.
+        pool.active.inc
         try:
           await pc.conn.ping(pingBudget)
         except CancelledError as e:
@@ -903,12 +903,27 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           # departed canceller leaks. The interrupted ping leaves the protocol
           # out of sync, so close the popped conn (closeNoWait, since the pending
           # cancellation would interrupt a fresh await) and re-raise.
+          pool.active.dec
           pool.closeNoWait(pc.conn)
           raise e
         except CatchableError:
+          pool.active.dec
           pool.metrics.closeCount.inc
           await pool.tracedClose(pc.conn)
+          if pool.closed:
+            raisePoolClosed()
           continue
+        # A close() during the ping didn't drain the popped conn — discard it.
+        if pool.closed:
+          pool.active.dec
+          pool.closeNoWait(pc.conn)
+          raisePoolClosed()
+        pc.conn.borrowed = true
+        recordAcquire()
+        return (pc.conn, false)
+      if pool.closed:
+        pool.closeNoWait(pc.conn)
+        raisePoolClosed()
       pool.active.inc
       pc.conn.borrowed = true
       recordAcquire()
@@ -926,16 +941,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           connCfg.connectTimeout = rem
           cappedByDeadline = true
       pool.active.inc
+      var newConn: PgConnection
       try:
-        let conn = await connect(connCfg)
-        conn.ownerPool = pool
-        conn.borrowed = true
-        pool.metrics.createCount.inc
-        # A successful caller-driven connect signals the DB is reachable —
-        # let the maintenance loop resume immediate replenishment.
-        pool.consecutiveConnectFailures = 0
-        recordAcquire()
-        return (conn, true)
+        newConn = await connect(connCfg)
       except CancelledError as e:
         # Cancellation (e.g. a caller's wait()-style deadline) must propagate
         # unwrapped so the canceller's machinery sees it.
@@ -952,6 +960,18 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           pool.metrics.timeoutCount.inc
           raise newException(PgPoolError, "Pool acquire timeout", e)
         raise newException(PgPoolError, "Pool connect failed", e)
+      pool.metrics.createCount.inc
+      # A successful caller-driven connect signals the DB is reachable —
+      # let the maintenance loop resume immediate replenishment.
+      pool.consecutiveConnectFailures = 0
+      if pool.closed:
+        pool.active.dec
+        pool.closeNoWait(newConn)
+        raisePoolClosed()
+      newConn.ownerPool = pool
+      newConn.borrowed = true
+      recordAcquire()
+      return (newConn, true)
 
   # Either max connections are reached or waiters are queued ahead of us;
   # queue up and wait for delivery.
@@ -967,6 +987,10 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     waitBudget = remainingBudget()
     if waitBudget <= ZeroDuration:
       raiseAcquireTimeout()
+  # If `close()` finished during any await above, its waiter sweep is done and
+  # nothing will fail a waiter enqueued after it — `await fut` would hang.
+  if pool.closed:
+    raisePoolClosed()
   let fut = newFuture[PgConnection]("PgPool.acquire")
   let waiter = Waiter(fut: fut, cancelled: false)
   pool.waiters.addLast(waiter)
@@ -1669,15 +1693,8 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let resetSessionSym = bindSym"resetSession"
-  let csReadySym = bindSym"csReady"
-  let tsInTxSym = bindSym"tsInTransaction"
-  let tsInFailedSym = bindSym"tsInFailedTransaction"
-  let fireCleanupSkippedSym = bindSym"fireCleanupSkipped"
-  let ckTxRollbackSym = bindSym"ckTxRollback"
-  let csrConnInvalidatedSym = bindSym"csrConnInvalidated"
-  let csrCleanupFailedSym = bindSym"csrCleanupFailed"
+  let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
   result = quote:
     let `poolSym` = `poolExpr`
     let `connIdent` = await `poolSym`.acquire()
@@ -1687,24 +1704,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         `body`
         discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
       except CatchableError as `eSym`:
-        # Mirror the per-call rationale from pg_client's `withTransaction`:
-        # skip ROLLBACK on an already-invalidated connection (per-call
-        # timeout marked it csClosed but txStatus may still be stale) and
-        # avoid a futile cleanup when the server has already ended the
-        # transaction. The csClosed skip and any swallowed inner-ROLLBACK
-        # failure are surfaced through `onCleanupSkipped` so the diagnostic
-        # asymmetry with the body-error path goes away.
-        if `connIdent`.state != `csReadySym`:
-          `fireCleanupSkippedSym`(
-            `connIdent`, `ckTxRollbackSym`, `csrConnInvalidatedSym`
-          )
-        elif `connIdent`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
-          try:
-            discard await `connIdent`.simpleExec("ROLLBACK", timeout = `txTimeout`)
-          except CatchableError as `cleanupErrSym`:
-            `fireCleanupSkippedSym`(
-              `connIdent`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
-            )
+        `bodyCleanup`
         raise `eSym`
     finally:
       await `resetSessionSym`(`poolSym`, `connIdent`)
@@ -1787,10 +1787,13 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ##   pool.withTransactionDeadline(conn, TransactionOptions(...), seconds(5)):
   ##     await conn.exec(...)
   ##
-  ## **On deadline exceeded:** if a connection was already acquired, it is
-  ## invalidated via `invalidateOnTimeout` (marked `csClosed`) and the pool
-  ## drops it on release. ROLLBACK is *not* attempted. `PgTimeoutError` is
-  ## raised. If the timeout fires while still waiting for `acquire()`, the
+  ## **On deadline exceeded:** `PgTimeoutError` is raised. Under chronos the
+  ## body future is cancelled: a connection with a request in flight is
+  ## invalidated (server-side CancelRequest, dropped on release), while one
+  ## that unwinds cleanly (grace ROLLBACK succeeded) returns to the pool
+  ## healthy. Under asyncdispatch the still-running body keeps the connection;
+  ## it is invalidated via `invalidateOnTimeout` and dropped on its eventual
+  ## release. If the timeout fires while still waiting for `acquire()`, the
   ## waiter remains queued (cancelled best-effort) until the underlying
   ## acquire future settles; this is unavoidable under asyncdispatch.
   ##
@@ -1839,31 +1842,30 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "poolTxBodyDeadline")
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let connOptSym = genSym(nskVar, "connOpt")
+  let releasedSym = genSym(nskVar, "released")
+  let cancelledSym = genSym(nskLet, "cancelled")
   let resetSessionSym = bindSym"resetSession"
   let csReadySym = bindSym"csReady"
-  let tsInTxSym = bindSym"tsInTransaction"
-  let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let csClosedSym = bindSym"csClosed"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let invalidateSym = bindSym"invalidateOnTimeout"
-  let fireCleanupSkippedSym = bindSym"fireCleanupSkipped"
-  let ckTxRollbackSym = bindSym"ckTxRollback"
-  let csrConnInvalidatedSym = bindSym"csrConnInvalidated"
-  let csrCleanupFailedSym = bindSym"csrCleanupFailed"
+  let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
 
   result = quote:
     let `poolSym` = `poolExpr`
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     var `connOptSym` = none(PgConnection)
+    var `releasedSym` = false
     proc `bodyFnSym`(): Future[void] {.async.} =
       let `connIdent` = await `poolSym`.acquire()
       `connOptSym` = some(`connIdent`)
@@ -1877,25 +1879,19 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
             "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
           )
         except CatchableError as `eSym`:
-          # Mirror pg_client's `withTransactionDeadline`: skip ROLLBACK on a
-          # csClosed connection (per-call body timeout invalidated it) and
-          # report the skip / any swallowed inner-ROLLBACK failure through
-          # `onCleanupSkipped` so the timeout path is observable.
-          if `connIdent`.state != `csReadySym`:
-            `fireCleanupSkippedSym`(
-              `connIdent`, `ckTxRollbackSym`, `csrConnInvalidatedSym`
-            )
-          elif `connIdent`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
-            try:
-              discard await `connIdent`.simpleExec("ROLLBACK", timeout = `graceSym`)
-            except CatchableError as `cleanupErrSym`:
-              `fireCleanupSkippedSym`(
-                `connIdent`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
-              )
+          `bodyCleanup`
           raise `eSym`
+      except CancelledError as `cancelledSym`:
+        # Cancelled mid-request (chronos deadline): abort it server-side and
+        # mark csClosed so release() discards the conn instead of reusing it.
+        if `connIdent`.state notin {`csReadySym`, `csClosedSym`}:
+          `cancelNoWaitSym`(`connIdent`)
+          `connIdent`.state = `csClosedSym`
+        raise `cancelledSym`
       finally:
         await `resetSessionSym`(`poolSym`, `connIdent`)
         `connIdent`.release()
+        `releasedSym` = true
 
     let `bodyFutSym` = `bodyFnSym`()
     try:
@@ -1909,20 +1905,20 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
       # the-same-tick should suppress the timeout report.
       if `bodyFutSym`.completed():
         discard
-      elif `connOptSym`.isSome:
-        # invalidateOnTimeout marks the connection csClosed and raises
-        # PgTimeoutError — control does not return from this call.
-        # Ordering note: under chronos, `wait` cancels `bodyFut`, which runs
-        # `bodyFn`'s `finally` (resetSession + release) before this handler
-        # gets control. The connection has therefore already been returned
-        # to the pool when we invalidate it here. That is safe: the pool's
-        # next `acquire` health-check drops `csClosed` connections, so the
-        # bad conn cannot escape back to a caller.
-        `connOptSym`.get.`invalidateSym`("withTransactionDeadline (pool) exceeded")
-      else:
+      elif `connOptSym`.isNone:
         raise newException(
           PgTimeoutError, "withTransactionDeadline (pool): acquire timed out"
         )
+      elif `releasedSym`:
+        # chronos: the cancellation already ran bodyFn's finally, so the conn
+        # is back in the pool — possibly handed to a waiter — and must not be
+        # invalidated here. bodyFn marked it csClosed before release if a
+        # request was in flight.
+        raise newException(PgTimeoutError, "withTransactionDeadline (pool) exceeded")
+      else:
+        # asyncdispatch: bodyFn still owns the conn; invalidateOnTimeout marks
+        # it csClosed (and raises PgTimeoutError) so release() will discard it.
+        `connOptSym`.get.`invalidateSym`("withTransactionDeadline (pool) exceeded")
 
 macro withTransactionRetryDeadline*(
     pool: PgPool, retryOpts: RetryOptions, args: varargs[untyped]
@@ -1943,8 +1939,9 @@ macro withTransactionRetryDeadline*(
   ## the pool's health check rather than reused. Worst-case wall-clock is
   ## `deadline`, not `maxAttempts * deadline`.
   ##
-  ## **On deadline exceeded:** the in-flight connection (if any) is invalidated
-  ## and `PgTimeoutError` is raised — never retried. **On a retryable error:**
+  ## **On deadline exceeded:** `PgTimeoutError` is raised — never retried; the
+  ## in-flight connection is handled as in `withTransactionDeadline`.
+  ## **On a retryable error:**
   ## ROLLBACK runs with `rollbackGrace` and the transaction is retried if budget
   ## remains. See `withTransactionDeadline` for the acquire-race / `completed()`
   ## rationale and the in-body `conn.exec(...)` warning. **Idempotency:** `body`
@@ -1980,20 +1977,28 @@ macro withTransactionRetryDeadline*(
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "poolTxBodyRetryDeadline")
   let connOptSym = genSym(nskVar, "connOpt")
+  let releasedSym = genSym(nskVar, "released")
+  let cancelledSym = genSym(nskLet, "cancelled")
   let resetSessionSym = bindSym"resetSession"
+  let csReadySym = bindSym"csReady"
+  let csClosedSym = bindSym"csClosed"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let invalidateSym = bindSym"invalidateOnTimeout"
   # The pool variant acquires a fresh connection per attempt, so its cleanup
   # (ROLLBACK + release) happens inside bodyFn; the outer loop adds no cleanup
   # and omits the conn-state retry gate (connForStateCheck = nil).
+  # See withTransactionDeadline for the released/isNone branch rationale.
   let timeoutElse = quote:
-    if `connOptSym`.isSome:
-      `connOptSym`.get.`invalidateSym`("withTransactionRetryDeadline (pool) exceeded")
-    else:
+    if `connOptSym`.isNone:
       raise newException(
         PgTimeoutError, "withTransactionRetryDeadline (pool): acquire timed out"
       )
+    elif `releasedSym`:
+      raise newException(PgTimeoutError, "withTransactionRetryDeadline (pool) exceeded")
+    else:
+      `connOptSym`.get.`invalidateSym`("withTransactionRetryDeadline (pool) exceeded")
   let loop = buildRetryDeadlineLoop(
     bodyFnSym,
     retryOptsSym,
@@ -2009,8 +2014,10 @@ macro withTransactionRetryDeadline*(
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     var `connOptSym` = none(PgConnection)
+    var `releasedSym` = false
     proc `bodyFnSym`(): Future[void] {.async.} =
       `connOptSym` = none(PgConnection)
+      `releasedSym` = false
       let `connIdent` = await `poolSym`.acquire()
       `connOptSym` = some(`connIdent`)
       try:
@@ -2025,9 +2032,17 @@ macro withTransactionRetryDeadline*(
         except CatchableError as `eSym`:
           `bodyCleanup`
           raise `eSym`
+      except CancelledError as `cancelledSym`:
+        # Cancelled mid-request (chronos deadline): abort it server-side and
+        # mark csClosed so release() discards the conn instead of reusing it.
+        if `connIdent`.state notin {`csReadySym`, `csClosedSym`}:
+          `cancelNoWaitSym`(`connIdent`)
+          `connIdent`.state = `csClosedSym`
+        raise `cancelledSym`
       finally:
         await `resetSessionSym`(`poolSym`, `connIdent`)
         `connIdent`.release()
+        `releasedSym` = true
 
     `loop`
 

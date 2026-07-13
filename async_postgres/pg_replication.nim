@@ -201,9 +201,6 @@ type
 const
   InvalidLsn* = Lsn(0) ## Sentinel value representing an invalid or unset LSN.
 
-  pgEpochOffset* = 946_684_800'i64
-    ## Seconds between Unix epoch (1970-01-01) and PostgreSQL epoch (2000-01-01).
-
   MaxRelationColumns = 1600
     ## PostgreSQL's max columns per table (``MaxHeapAttributeNumber``).
     ## pgoutput's column-count wire field can never exceed this in practice.
@@ -267,8 +264,9 @@ proc parseLsn*(s: string): Lsn =
 
 proc currentPgTimestamp*(): int64 =
   ## Current time as microseconds since the PostgreSQL epoch (2000-01-01 UTC).
-  let now = epochTime()
-  int64((now - float64(pgEpochOffset)) * 1_000_000.0)
+  let t = getTime()
+  let unixUs = t.toUnix() * 1_000_000'i64 + int64(t.nanosecond div 1000)
+  unixUs - pgEpochUnix * 1_000_000'i64
 
 # pgoutput decoder
 
@@ -326,17 +324,8 @@ proc readColumnCountAt(
 
 proc decodeCStringAt(buf: openArray[byte], offset: int): (string, int) =
   ## Decode a null-terminated string at offset. Returns (string, next offset).
-  if offset >= buf.len:
-    raise newException(PgProtocolError, "decodeCStringAt: offset past end of buffer")
-  var i = offset
-  while i < buf.len and buf[i] != 0:
-    inc i
-  if i >= buf.len:
-    raise newException(PgProtocolError, "decodeCStringAt: missing null terminator")
-  let slen = i - offset
-  let s = readString(buf, offset, slen)
-  inc i # skip null
-  (s, i)
+  let (s, consumed) = decodeCString(buf, offset)
+  (s, offset + consumed)
 
 proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
   ## Decode a pgoutput TupleData structure.
@@ -697,8 +686,10 @@ proc timelineHistory*(
 
 # Replication streaming
 
-proc parseReplicationMessage*(copyData: openArray[byte]): ReplicationMessage =
-  ## Parse a CopyData payload into a ReplicationMessage.
+proc parseReplicationMessage*(copyData: sink seq[byte]): ReplicationMessage =
+  ## Parse a CopyData payload into a ReplicationMessage. Takes ownership of
+  ## ``copyData`` so the XLogData path can reuse the incoming buffer for
+  ## ``xlogData.data`` instead of slicing into a fresh allocation.
   if copyData.len == 0:
     raise newException(PgProtocolError, "Empty replication CopyData")
   let kind = char(copyData[0])
@@ -710,9 +701,14 @@ proc parseReplicationMessage*(copyData: openArray[byte]): ReplicationMessage =
     xlog.startLsn = Lsn(cast[uint64](decodeInt64(copyData, 1)))
     xlog.walEnd = Lsn(cast[uint64](decodeInt64(copyData, 9)))
     xlog.sendTime = decodeInt64(copyData, 17)
-    let dataStart = 25
+    const dataStart = 25
     if copyData.len > dataStart:
-      xlog.data = copyData[dataStart ..< copyData.len]
+      # Reuse the incoming buffer: strip the 25-byte header in place instead
+      # of allocating a fresh seq for the payload slice.
+      xlog.data = move(copyData)
+      let newLen = xlog.data.len - dataStart
+      moveMem(addr xlog.data[0], addr xlog.data[dataStart], newLen)
+      xlog.data.setLen(newLen)
     ReplicationMessage(kind: rmkXLogData, xlogData: xlog)
   of 'k': # Primary Keepalive
     if copyData.len < 18:
@@ -964,7 +960,7 @@ proc maybeSendPeriodicStatus(
 
 proc handleReplicationData(
     conn: PgConnection,
-    copyData: seq[byte],
+    copyData: sink seq[byte],
     autoKeepaliveReply: bool,
     callback: ReplicationCallback,
     lastStatusSent: Moment,
@@ -982,7 +978,7 @@ proc handleReplicationData(
   ## last time the server saw a Standby Status Update, preventing duplicate
   ## proactive updates.
   var newLastStatusSent = lastStatusSent
-  let replMsg = parseReplicationMessage(copyData)
+  let replMsg = parseReplicationMessage(move(copyData))
   case replMsg.kind
   of rmkXLogData:
     let received = replMsg.xlogData.receivedEndLsn
@@ -1014,6 +1010,104 @@ proc invalidateAbandonedStream(conn: PgConnection) =
   ## changed here.
   if conn.state == csReplicating:
     conn.state = csClosed
+
+proc runReplicationStream(
+    conn: PgConnection,
+    startLsn: Lsn,
+    autoKeepaliveReply: bool,
+    statusInterval: async_backend.Duration,
+    callback: ReplicationCallback,
+    context: string,
+): Future[void] {.async.} =
+  ## Shared replication stream body. Caller must have already sent the
+  ## ``START_REPLICATION`` query. ``context`` appears in error messages
+  ## (e.g. ``"replication"`` / ``"physical replication"``).
+  var queryError: ref PgQueryError
+
+  block waitCopyBoth:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkCopyBothResponse:
+          conn.state = csReplicating
+          break waitCopyBoth
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            raise queryError
+          raise newException(
+            PgConnectionError,
+            "START_REPLICATION " & context & " ended without CopyBothResponse",
+          )
+        else:
+          discard
+      await conn.fillRecvBuf()
+
+  conn.resetReplLsnTracking(startLsn)
+
+  defer:
+    conn.invalidateAbandonedStream()
+
+  var lastStatusSent = Moment.now()
+  var pendingRead: Future[void] = nil
+  when hasChronos:
+    defer:
+      if pendingRead != nil and not pendingRead.finished:
+        pendingRead.cancelSoon()
+
+  block recvLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        var msg = opt.get
+        case msg.kind
+        of bmkCopyData:
+          lastStatusSent = await conn.handleReplicationData(
+            move(msg.copyData), autoKeepaliveReply, callback, lastStatusSent
+          )
+        of bmkCopyDone:
+          await conn.sendMsg(@copyDoneMsg)
+          break recvLoop
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            raise queryError
+          return
+        else:
+          discard
+      lastStatusSent = await conn.maybeSendPeriodicStatus(
+        autoKeepaliveReply, statusInterval, lastStatusSent
+      )
+      if conn.state == csClosed:
+        raise newException(PgConnectionError, "Connection closed during " & context)
+      pendingRead =
+        await conn.replFillRecvBuf(statusInterval, lastStatusSent, pendingRead)
+      lastStatusSent = await conn.maybeSendPeriodicStatus(
+        autoKeepaliveReply, statusInterval, lastStatusSent
+      )
+
+  block drainLoop:
+    while true:
+      while (let opt = conn.nextMessage(); opt.isSome):
+        let msg = opt.get
+        case msg.kind
+        of bmkErrorResponse:
+          queryError = newPgQueryError(msg.errorFields)
+        of bmkReadyForQuery:
+          conn.txStatus = msg.txStatus
+          conn.state = csReady
+          if queryError != nil:
+            raise queryError
+          break drainLoop
+        else:
+          discard
+      await conn.fillRecvBuf()
 
 proc startReplication*(
     conn: PgConnection,
@@ -1148,120 +1242,9 @@ proc startReplication*(
     sql.add(")")
 
   await conn.sendMsg(encodeQuery(sql))
-
-  # Wait for CopyBothResponse. The block exits only via the CopyBothResponse
-  # break or by raising — fillRecvBuf re-raises connection errors, and a
-  # ReadyForQuery before CopyBothResponse always raises.
-  var queryError: ref PgQueryError
-
-  block waitCopyBoth:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyBothResponse:
-          conn.state = csReplicating
-          break waitCopyBoth
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          raise newException(
-            PgConnectionError, "START_REPLICATION ended without CopyBothResponse"
-          )
-        else:
-          discard
-      await conn.fillRecvBuf()
-
-  # Track the highest end LSN of WAL data actually received from the wire —
-  # computed as XLogData.startLsn + data.len, *not* XLogData.walEnd. ``walEnd``
-  # is the server's current WAL position at the time the message was sent and can
-  # be ahead of the bytes this message carries; acknowledging ``walEnd`` would
-  # falsely advance ``confirmed_flush_lsn`` past unprocessed WAL and cause data
-  # loss on slot restart. The position lives on the connection (the single source
-  # of truth, read by confirmFlushed and the auto-reply); reset it and the
-  # confirmed-flush position to the resume point so a reused connection does not
-  # inherit a stale value.
-  conn.resetReplLsnTracking(startLsn)
-
-  # If anything unwinds the streaming loop while the connection is still
-  # mid-CopyBoth — most often the user callback raising — the protocol stream is
-  # left out of sync. Poison the connection on the way out so it is not stranded
-  # in csReplicating (where every later call raises a misleading PgStateError).
-  # The clean stop (CopyDone -> ReadyForQuery) returns it to csReady first, so
-  # this is a no-op on the normal exit. See invalidateAbandonedStream.
-  defer:
-    conn.invalidateAbandonedStream()
-
-  var lastStatusSent = Moment.now()
-  var pendingRead: Future[void] = nil # in-flight timed read, threaded across waits
-  when hasChronos:
-    # If an error unwinds the loop while a timed read is still in flight, abandon
-    # it so it is not left dangling on the torn-down connection. Normal exits
-    # (CopyDone / ReadyForQuery) only happen after a read has been consumed, so
-    # `pendingRead` is nil then and this is a no-op — never a cancel-then-reread.
-    defer:
-      if pendingRead != nil and not pendingRead.finished:
-        pendingRead.cancelSoon()
-
-  # Streaming loop
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyData:
-          lastStatusSent = await conn.handleReplicationData(
-            msg.copyData, autoKeepaliveReply, callback, lastStatusSent
-          )
-        of bmkCopyDone:
-          # Server ended the stream; reply with CopyDone before draining
-          await conn.sendMsg(@copyDoneMsg)
-          break recvLoop
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          return
-        else:
-          discard
-      # Send a proactive status update if one is due after draining this batch
-      # (covers a busy stream on both backends).
-      lastStatusSent = await conn.maybeSendPeriodicStatus(
-        autoKeepaliveReply, statusInterval, lastStatusSent
-      )
-      if conn.state == csClosed:
-        raise newException(PgConnectionError, "Connection closed during replication")
-      pendingRead =
-        await conn.replFillRecvBuf(statusInterval, lastStatusSent, pendingRead)
-      # Send again after a timed wake with no new data (idle coverage on chronos).
-      lastStatusSent = await conn.maybeSendPeriodicStatus(
-        autoKeepaliveReply, statusInterval, lastStatusSent
-      )
-
-  # After CopyDone, drain to ReadyForQuery
-  block drainLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break drainLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  await runReplicationStream(
+    conn, startLsn, autoKeepaliveReply, statusInterval, callback, "replication"
+  )
 
 proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
   ## Gracefully terminate the replication stream.
@@ -1352,108 +1335,6 @@ proc startPhysicalReplication*(
     sql.add(" TIMELINE " & $timeline)
 
   await conn.sendMsg(encodeQuery(sql))
-
-  # See startReplication for the invariants of this block — it can only exit
-  # via the CopyBothResponse break or by raising.
-  var queryError: ref PgQueryError
-
-  block waitCopyBoth:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyBothResponse:
-          conn.state = csReplicating
-          break waitCopyBoth
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          raise newException(
-            PgConnectionError,
-            "START_REPLICATION PHYSICAL ended without CopyBothResponse",
-          )
-        else:
-          discard
-      await conn.fillRecvBuf()
-
-  # Highest end LSN of WAL data actually received — see startReplication for
-  # why we track ``startLsn + data.len`` rather than ``walEnd``, and why the
-  # position lives on the connection. Reset it and the confirmed-flush position
-  # to the resume point so a reused connection does not inherit a stale value.
-  conn.resetReplLsnTracking(startLsn)
-
-  # See startReplication: poison the connection if the streaming loop unwinds
-  # while still mid-CopyBoth (e.g. the callback raised), so it is not stranded in
-  # csReplicating. No-op on the clean CopyDone -> ReadyForQuery exit.
-  defer:
-    conn.invalidateAbandonedStream()
-
-  var lastStatusSent = Moment.now()
-  var pendingRead: Future[void] = nil # in-flight timed read, threaded across waits
-  when hasChronos:
-    # See startReplication: drop a still-in-flight timed read if an error unwinds
-    # the loop; nil (and so a no-op) on the normal CopyDone / ReadyForQuery exits.
-    defer:
-      if pendingRead != nil and not pendingRead.finished:
-        pendingRead.cancelSoon()
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCopyData:
-          lastStatusSent = await conn.handleReplicationData(
-            msg.copyData, autoKeepaliveReply, callback, lastStatusSent
-          )
-        of bmkCopyDone:
-          await conn.sendMsg(@copyDoneMsg)
-          break recvLoop
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          return
-        else:
-          discard
-      # See startReplication: send a proactive status update when one is due,
-      # both after draining a batch and after a timed idle wake.
-      lastStatusSent = await conn.maybeSendPeriodicStatus(
-        autoKeepaliveReply, statusInterval, lastStatusSent
-      )
-      if conn.state == csClosed:
-        raise newException(
-          PgConnectionError, "Connection closed during physical replication"
-        )
-      pendingRead =
-        await conn.replFillRecvBuf(statusInterval, lastStatusSent, pendingRead)
-      lastStatusSent = await conn.maybeSendPeriodicStatus(
-        autoKeepaliveReply, statusInterval, lastStatusSent
-      )
-
-  # After CopyDone, drain to ReadyForQuery. Accept the optional timeline-switch
-  # result set (RowDescription + DataRow + CommandComplete) the server emits
-  # when the stream stopped because the standby reached the end of a timeline.
-  block drainLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break drainLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  await runReplicationStream(
+    conn, startLsn, autoKeepaliveReply, statusInterval, callback, "physical replication"
+  )

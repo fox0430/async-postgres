@@ -284,7 +284,7 @@ const
     ## Parameter-type, format-code, and parameter-value counts in Parse/Bind
     ## messages are all Int16, so they cannot represent more elements than this.
 
-  maxInt32Len = int(high(int32))
+  maxInt32Len* = int(high(int32))
     ## Maximum byte length encodable in a wire Int32 length field (2147483647).
     ## Parameter values, SASL data, binary COPY fields, and every message length
     ## are Int32. PostgreSQL further caps a single value at `MaxAllocSize`
@@ -1081,18 +1081,28 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   ## copied buffer to build cellIndex entries.
   if body.len < 2:
     raise newException(PgProtocolError, "DataRow message too short")
+
   let numCols = decodeInt16(body, 0)
   if numCols < 0:
     raise newException(PgProtocolError, "DataRow: invalid column count " & $numCols)
+
+  # Check cumulative buffer size before any mutation
+  let bufBase = rd.buf.len
+  let dataLen = body.len - 2
+  if bufBase + dataLen > int32.high:
+    raise newException(
+      PgProtocolError, "DataRow: result set exceeds maximum addressable size (2 GiB)"
+    )
+
   # Pre-extend cellIndex for this row
   let cellBase = rd.cellIndex.len
   rd.cellIndex.setLen(cellBase + int(numCols) * 2)
+
   # Bulk-copy everything after the 2-byte numCols into rd.buf
-  let bufBase = rd.buf.len
-  let dataLen = body.len - 2
   rd.buf.setLen(bufBase + dataLen)
   if dataLen > 0:
     rd.buf.writeBytesAt(bufBase, body.toOpenArray(2, 2 + dataLen - 1))
+
   # Walk the copied buffer to build cellIndex
   var pos = bufBase # current position in rd.buf
   let bufEnd = bufBase + dataLen
@@ -1128,6 +1138,7 @@ proc parseBackendMessage*(
     consumed: var int,
     rowData: RowData = nil,
     maxLen: int = DefaultMaxBackendMessageLen,
+    skipDataRow: bool = false,
 ): ParseResult {.raises: [PgProtocolError].} =
   ## Parse a single backend message from `buf`.
   ## On success, sets `consumed` to the number of bytes used.
@@ -1137,6 +1148,11 @@ proc parseBackendMessage*(
   ## ``maxLen <= 0`` disables the cap (intended for tests); production
   ## callers should resolve the default via ``ConnConfig.maxMessageSize``
   ## and ``effectiveMaxMessageSize``.
+  ## When ``rowData == nil`` and ``skipDataRow`` is true, a ``DataRow`` message
+  ## is only framed and consumed — the columns are NOT decoded, avoiding the
+  ## per-row ``seq[Option[seq[byte]]]`` + per-cell ``seq`` allocation that the
+  ## caller would immediately discard. Result state is ``psDataRow`` in that
+  ## case, with ``message`` left default-initialised.
   consumed = 0
 
   # Need at least 5 bytes: 1 type + 4 length
@@ -1180,6 +1196,11 @@ proc parseBackendMessage*(
   of 'D':
     if rowData != nil:
       parseDataRowInto(body, rowData)
+      consumed = totalLen
+      return ParseResult(state: psDataRow)
+    elif skipDataRow:
+      # Caller does not want the row — skip decoding entirely to avoid the
+      # per-row seq[Option[seq[byte]]] + per-cell seq allocation.
       consumed = totalLen
       return ParseResult(state: psDataRow)
     else:

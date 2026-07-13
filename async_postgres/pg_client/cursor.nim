@@ -63,12 +63,12 @@ proc openCursorImpl(
         opt.isSome
       )
       :
-        let msg = opt.get
-        case msg.kind
+        let pumpMsg = opt.get
+        case pumpMsg.kind
         of bmkParseComplete, bmkBindComplete:
           discard
         of bmkRowDescription:
-          cursor.fields = msg.fields
+          cursor.fields = pumpMsg.fields
           # Describe(Portal) runs after Bind, so the server reports the bound
           # result formats. Mirror the query path: derive per-column format
           # codes and type OIDs so binary DataRows are decoded as binary
@@ -85,7 +85,7 @@ proc openCursorImpl(
                 cursor.fields[i].formatCode = resultFormats[i]
                 cursor.colFormats[i] = resultFormats[i]
           cursor.bufferedData =
-            newRowData(int16(msg.fields.len), cursor.colFormats, cursor.colTypeOids)
+            newRowData(int16(pumpMsg.fields.len), cursor.colFormats, cursor.colTypeOids)
           cursor.bufferedData.fields = cursor.fields
         of bmkNoData:
           discard
@@ -102,14 +102,15 @@ proc openCursorImpl(
                 case rmsg.kind
                 of bmkReadyForQuery:
                   conn.txStatus = rmsg.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break drainLoop
                 else:
                   discard
               await conn.fillRecvBuf()
           break recvLoop
         of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
+          queryError = newPgQueryError(pumpMsg.errorFields)
           # Drain until ReadyForQuery
           await conn.sendMsg(encodeSync())
           block errDrain:
@@ -117,7 +118,8 @@ proc openCursorImpl(
               while (let ropt = conn.nextMessage(); ropt.isSome):
                 if ropt.get.kind == bmkReadyForQuery:
                   conn.txStatus = ropt.get.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break errDrain
               await conn.fillRecvBuf()
           raise queryError
@@ -129,6 +131,8 @@ proc openCursorImpl(
 
 proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
+  if conn.state == csClosed:
+    raise newException(PgConnectionError, "Connection is closed")
   let rd = newRowData(int16(cursor.fields.len), cursor.colFormats, cursor.colTypeOids)
   rd.fields = cursor.fields
   var rowCount: int32 = 0
@@ -142,8 +146,8 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   block recvLoop:
     while true:
       while (let opt = conn.nextMessage(rd, addr rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
+        let pumpMsg = opt.get
+        case pumpMsg.kind
         of bmkPortalSuspended:
           break recvLoop
         of bmkCommandComplete:
@@ -162,21 +166,23 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
                   discard
                 of bmkReadyForQuery:
                   conn.txStatus = rmsg.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break drainLoop
                 else:
                   discard
               await conn.fillRecvBuf()
           break recvLoop
         of bmkErrorResponse:
-          let queryError = newPgQueryError(msg.errorFields)
+          let queryError = newPgQueryError(pumpMsg.errorFields)
           await conn.sendMsg(encodeSync())
           block errDrain:
             while true:
               while (let ropt = conn.nextMessage(); ropt.isSome):
                 if ropt.get.kind == bmkReadyForQuery:
                   conn.txStatus = ropt.get.txStatus
-                  conn.state = csReady
+                  if conn.state != csClosed:
+                    conn.state = csReady
                   break errDrain
               await conn.fillRecvBuf()
           # The Sync above aborts the (implicit) transaction holding the portal,
@@ -197,6 +203,9 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Fetch the next chunk of rows from the cursor.
   ## Returns an empty seq when the cursor is exhausted.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  let conn = cursor.conn
+  if conn.state == csClosed:
+    raise newException(PgConnectionError, "Connection is closed")
   if cursor.bufferedCount > 0:
     result = newSeq[Row](cursor.bufferedCount)
     for i in 0 ..< cursor.bufferedCount:
@@ -239,26 +248,12 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
   batch.addSync()
   await conn.sendMsg(batch)
 
-  var queryError: ref PgQueryError
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkCloseComplete:
-          discard
-        of bmkErrorResponse:
-          queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
+  conn.pumpUntilReady:
+    case pumpMsg.kind
+    of bmkCloseComplete: discard
+    else: discard
+  do:
+    discard
 
   cursor.exhausted = true
 

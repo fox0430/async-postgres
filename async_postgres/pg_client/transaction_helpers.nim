@@ -7,14 +7,15 @@ import std/[options]
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ./core
 
-proc execInTransactionImpl(
+proc queryInTransactionImpl(
     conn: PgConnection,
     beginSql: string,
     sql: string,
     params: seq[Option[seq[byte]]],
     paramOids: seq[int32],
     paramFormats: seq[int16],
-): Future[string] {.async.} =
+    resultFormats: seq[int16],
+): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.state = csBusy
 
@@ -24,7 +25,7 @@ proc execInTransactionImpl(
     else:
       newSeq[int16](params.len)
 
-  # Pipeline: Parse+Bind+Execute for BEGIN, user SQL, COMMIT + single Sync
+  # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
   conn.sendBuf.setLen(0)
   # BEGIN
   conn.sendBuf.addParse("", beginSql)
@@ -32,7 +33,8 @@ proc execInTransactionImpl(
   conn.sendBuf.addExecute("", 0)
   # User SQL
   conn.sendBuf.addParse("", sql, paramOids)
-  conn.sendBuf.addBind("", "", formats, params)
+  conn.sendBuf.addBind("", "", formats, params, resultFormats)
+  conn.sendBuf.addDescribe(dkPortal, "")
   conn.sendBuf.addExecute("", 0)
   # COMMIT
   conn.sendBuf.addParse("", "COMMIT")
@@ -42,56 +44,67 @@ proc execInTransactionImpl(
   conn.sendBuf.addSync()
   await conn.sendBufMsg()
 
-  # Parse response: 3 phases (BEGIN=0, user=1, COMMIT=2)
+  var qr = QueryResult()
   var phase = 0
-  var userCommandTag = ""
-  var queryError: ref PgQueryError
 
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete:
+  conn.pumpUntilReady(qr.data, addr qr.rowCount):
+    case pumpMsg.kind
+    of bmkParseComplete, bmkBindComplete:
+      discard
+    of bmkRowDescription:
+      var fields = pumpMsg.fields
+      var cf: seq[int16]
+      var co: seq[int32]
+      if resultFormats.len > 0:
+        cf = deriveColFmts(resultFormats, fields.len)
+        co = newSeq[int32](fields.len)
+        for i in 0 ..< fields.len:
+          co[i] = fields[i].typeOid
+          fields[i].formatCode = cf[i]
+      qr.fields = fields
+      qr.data = newRowData(int16(qr.fields.len), cf, co)
+      qr.data.fields = qr.fields
+    of bmkNoData:
+      discard
+    of bmkEmptyQueryResponse:
+      # Empty/comment-only user SQL yields EmptyQueryResponse instead of
+      # CommandComplete; advance the phase anyway so the trailing COMMIT's
+      # CommandComplete isn't captured as the user statement's tag.
+      inc phase
+    of bmkCommandComplete:
+      if phase == 1:
+        qr.commandTag = pumpMsg.commandTag
+      inc phase
+    else:
+      discard
+  do:
+    if queryError != nil:
+      # ROLLBACK a failed transaction, swallowing any failure so it cannot
+      # mask the query error; the outer wait(timeout) bounds the cleanup.
+      if conn.txStatus == tsInFailedTransaction:
+        try:
+          discard await conn.simpleExec("ROLLBACK")
+        except CancelledError as e:
+          # Don't swallow cancellation (e.g. the outer wait(timeout)
+          # cancelling this future under chronos) — propagate it.
+          raise e
+        except CatchableError:
           discard
-        of bmkRowDescription, bmkDataRow:
-          discard
-        of bmkEmptyQueryResponse:
-          # Empty/comment-only user SQL yields EmptyQueryResponse instead of
-          # CommandComplete; advance the phase anyway so the trailing COMMIT's
-          # CommandComplete isn't captured as the user statement's tag.
-          inc phase
-        of bmkCommandComplete:
-          if phase == 1:
-            userCommandTag = msg.commandTag
-          inc phase
-        of bmkErrorResponse:
-          if queryError == nil:
-            queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            # Error occurred: if we're in a failed transaction, ROLLBACK to
-            # release it. Swallow any failure so a ROLLBACK error cannot mask
-            # the original query error (which is what the caller needs to see);
-            # the public proc's outer wait(timeout) bounds the cleanup.
-            if msg.txStatus == tsInFailedTransaction:
-              try:
-                discard await conn.simpleExec("ROLLBACK")
-              except CancelledError as e:
-                # Don't swallow cancellation (e.g. the outer wait(timeout)
-                # cancelling this future under chronos) — propagate it.
-                raise e
-              except CatchableError:
-                discard
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
 
-  return userCommandTag
+  return qr
+
+proc execInTransactionImpl(
+    conn: PgConnection,
+    beginSql: string,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+): Future[string] {.async.} =
+  let qr = await queryInTransactionImpl(
+    conn, beginSql, sql, params, paramOids, paramFormats, @[]
+  )
+  return qr.commandTag
 
 proc execInTransaction*(
     conn: PgConnection,
@@ -150,95 +163,6 @@ proc execInTransaction*(
     else:
       tag = await execInTransactionImpl(conn, beginSql, sql, values, oids, formats)
   return initCommandResult(tag)
-
-proc queryInTransactionImpl(
-    conn: PgConnection,
-    beginSql: string,
-    sql: string,
-    params: seq[Option[seq[byte]]],
-    paramOids: seq[int32],
-    paramFormats: seq[int16],
-    resultFormats: seq[int16],
-): Future[QueryResult] {.async.} =
-  conn.checkReady()
-  conn.state = csBusy
-
-  let formats =
-    if paramFormats.len > 0:
-      paramFormats
-    else:
-      newSeq[int16](params.len)
-
-  # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
-  conn.sendBuf.setLen(0)
-  # BEGIN
-  conn.sendBuf.addParse("", beginSql)
-  conn.sendBuf.addBind("", "", @[], @[])
-  conn.sendBuf.addExecute("", 0)
-  # User SQL
-  conn.sendBuf.addParse("", sql, paramOids)
-  conn.sendBuf.addBind("", "", formats, params, resultFormats)
-  conn.sendBuf.addDescribe(dkPortal, "")
-  conn.sendBuf.addExecute("", 0)
-  # COMMIT
-  conn.sendBuf.addParse("", "COMMIT")
-  conn.sendBuf.addBind("", "", @[], @[])
-  conn.sendBuf.addExecute("", 0)
-  # Single Sync
-  conn.sendBuf.addSync()
-  await conn.sendBufMsg()
-
-  var qr = QueryResult()
-  var phase = 0
-  var queryError: ref PgQueryError
-
-  block recvLoop:
-    while true:
-      while (let opt = conn.nextMessage(qr.data, addr qr.rowCount); opt.isSome):
-        let msg = opt.get
-        case msg.kind
-        of bmkParseComplete, bmkBindComplete:
-          discard
-        of bmkRowDescription:
-          qr.fields = msg.fields
-          qr.data = newRowData(int16(msg.fields.len))
-          qr.data.fields = qr.fields
-        of bmkNoData:
-          discard
-        of bmkEmptyQueryResponse:
-          # Empty/comment-only user SQL yields EmptyQueryResponse instead of
-          # CommandComplete; advance the phase anyway so the trailing COMMIT's
-          # CommandComplete isn't captured as the user statement's tag.
-          inc phase
-        of bmkCommandComplete:
-          if phase == 1:
-            qr.commandTag = msg.commandTag
-          inc phase
-        of bmkErrorResponse:
-          if queryError == nil:
-            queryError = newPgQueryError(msg.errorFields)
-        of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.state = csReady
-          if queryError != nil:
-            # ROLLBACK a failed transaction, swallowing any failure so it cannot
-            # mask the query error; the outer wait(timeout) bounds the cleanup.
-            if msg.txStatus == tsInFailedTransaction:
-              try:
-                discard await conn.simpleExec("ROLLBACK")
-              except CancelledError as e:
-                # Don't swallow cancellation (e.g. the outer wait(timeout)
-                # cancelling this future under chronos) — propagate it.
-                raise e
-              except CatchableError:
-                discard
-            raise queryError
-          break recvLoop
-        else:
-          discard
-      await conn.fillRecvBuf()
-
-  return qr
 
 proc queryInTransaction*(
     conn: PgConnection,
