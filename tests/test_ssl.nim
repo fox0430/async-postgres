@@ -1169,7 +1169,7 @@ when hasAsyncDispatch and defined(ssl):
     test "installs the DNS host on the SSL handle":
       resolveX509TestSyms()
       let getParam = sslGet0Param()
-      if x509GetHostFn == nil or getParam == nil:
+      if x509GetHostFn == nil or getParam == nil or sslSet1Host() == nil:
         skip()
       else:
         let ctx = newContext(verifyMode = CVerifyNone)
