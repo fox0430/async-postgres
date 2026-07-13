@@ -31,12 +31,11 @@ when hasAsyncDispatch and defined(ssl):
   # requesting only `SSL_VERIFY_PEER` (chain verification), sslVerifyFull would
   # accept any CA-trusted cert for any host. So tell OpenSSL the expected identity
   # *before* the handshake; it then matches the cert during its own verification
-  # and fails closed. std/openssl doesn't bind these, so declare them.
-  proc SSL_set1_host(
-    ssl: SslPtr, hostname: cstring
-  ): cint {.cdecl, dynlib: DLLSSLName, importc.}
-
+  # and fails closed. std/openssl doesn't bind these symbols, so resolve them
+  # ourselves.
   type
+    SslSet1HostFn =
+      proc(ssl: SslPtr, hostname: cstring): cint {.cdecl, gcsafe, raises: [].}
     SslGet0ParamFn = proc(ssl: SslPtr): pointer {.cdecl, gcsafe, raises: [].}
     X509SetIpAscFn =
       proc(param: pointer, ipasc: cstring): cint {.cdecl, gcsafe, raises: [].}
@@ -45,10 +44,20 @@ when hasAsyncDispatch and defined(ssl):
   # binding would abort the process at startup. Resolve lazily and let callers
   # handle nil.
   var
+    sslSet1HostFn: SslSet1HostFn
+    sslSet1HostResolved: bool
     sslGet0ParamFn: SslGet0ParamFn
     sslGet0ParamResolved: bool
     x509SetIpAscFn: X509SetIpAscFn
     x509SetIpAscResolved: bool
+
+  proc sslSet1Host*(): SslSet1HostFn =
+    if not sslSet1HostResolved:
+      let lib = loadLibPattern(DLLSSLName)
+      if lib != nil:
+        sslSet1HostFn = cast[SslSet1HostFn](symAddr(lib, "SSL_set1_host"))
+      sslSet1HostResolved = true
+    sslSet1HostFn
 
   proc sslGet0Param*(): SslGet0ParamFn =
     if not sslGet0ParamResolved:
@@ -90,7 +99,14 @@ when hasAsyncDispatch and defined(ssl):
           )
         fn(getParam(sslHandle), host.cstring)
       else:
-        SSL_set1_host(sslHandle, host.cstring)
+        let fn = sslSet1Host()
+        if fn == nil:
+          raise newException(
+            PgConnectionError,
+            "sslmode=verify-full: libssl does not export SSL_set1_host; " &
+              "cannot verify " & host,
+          )
+        fn(sslHandle, host.cstring)
     if ok != 1:
       raise newException(
         PgConnectionError,
