@@ -493,6 +493,7 @@ suite "Large Object: withLargeObject template":
 
       var caught = ""
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransaction:
           conn.withLargeObject(lo, oid, INV_READWRITE):
             # Poison the transaction: every later statement (including the
@@ -502,6 +503,7 @@ suite "Large Object: withLargeObject template":
             except CatchableError:
               discard
             raise newException(ValueError, "sentinel body error")
+        {.pop.}
       except ValueError as e:
         caught = e.msg
       except CatchableError as e:
