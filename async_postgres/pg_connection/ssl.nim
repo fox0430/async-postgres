@@ -36,16 +36,27 @@ when hasAsyncDispatch and defined(ssl):
     ssl: SslPtr, hostname: cstring
   ): cint {.cdecl, dynlib: DLLSSLName, importc.}
 
-  proc SSL_get0_param(ssl: SslPtr): pointer {.cdecl, dynlib: DLLSSLName, importc.}
+  type
+    SslGet0ParamFn = proc(ssl: SslPtr): pointer {.cdecl, gcsafe, raises: [].}
+    X509SetIpAscFn =
+      proc(param: pointer, ipasc: cstring): cint {.cdecl, gcsafe, raises: [].}
 
-  type X509SetIpAscFn =
-    proc(param: pointer, ipasc: cstring): cint {.cdecl, gcsafe, raises: [].}
-
-  # Apple's system libcrypto omits this symbol; an eager `{.dynlib.}` binding
-  # would abort the process at startup. Resolve lazily and let callers handle nil.
+  # Apple's system libssl/libcrypto omit these symbols; an eager `{.dynlib.}`
+  # binding would abort the process at startup. Resolve lazily and let callers
+  # handle nil.
   var
+    sslGet0ParamFn: SslGet0ParamFn
+    sslGet0ParamResolved: bool
     x509SetIpAscFn: X509SetIpAscFn
     x509SetIpAscResolved: bool
+
+  proc sslGet0Param*(): SslGet0ParamFn =
+    if not sslGet0ParamResolved:
+      let lib = loadLibPattern(DLLSSLName)
+      if lib != nil:
+        sslGet0ParamFn = cast[SslGet0ParamFn](symAddr(lib, "SSL_get0_param"))
+      sslGet0ParamResolved = true
+    sslGet0ParamFn
 
   proc x509VerifyParamSet1IpAsc*(): X509SetIpAscFn =
     if not x509SetIpAscResolved:
@@ -70,7 +81,14 @@ when hasAsyncDispatch and defined(ssl):
             "sslmode=verify-full: libcrypto does not export " &
               "X509_VERIFY_PARAM_set1_ip_asc; cannot verify " & host,
           )
-        fn(SSL_get0_param(sslHandle), host.cstring)
+        let getParam = sslGet0Param()
+        if getParam == nil:
+          raise newException(
+            PgConnectionError,
+            "sslmode=verify-full: libssl does not export SSL_get0_param; " &
+              "cannot verify " & host,
+          )
+        fn(getParam(sslHandle), host.cstring)
       else:
         SSL_set1_host(sslHandle, host.cstring)
     if ok != 1:
