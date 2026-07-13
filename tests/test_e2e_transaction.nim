@@ -98,9 +98,11 @@ suite "E2E: Transaction":
       var attempts = 0
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionRetry(RetryOptions(maxAttempts: 5, baseDelayMs: 1)):
           inc attempts
           raise (ref PgQueryError)(msg: "unique violation", sqlState: "23505")
+        {.pop.}
       except PgQueryError as e:
         raised = true
         doAssert e.sqlState == "23505"
@@ -119,11 +121,13 @@ suite "E2E: Transaction":
       var attempts = 0
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionRetry(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false)
         ):
           inc attempts
           raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+        {.pop.}
       except PgQueryError as e:
         raised = true
         doAssert e.sqlState == "40P01"
@@ -204,11 +208,13 @@ suite "E2E: Transaction":
       var attempts = 0
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransactionRetry(
           RetryOptions(maxAttempts: 2, baseDelayMs: 1, jitter: false), conn
         ):
           inc attempts
           raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+        {.pop.}
       except PgQueryError as e:
         raised = true
         doAssert e.sqlState == "40P01"
@@ -947,11 +953,13 @@ suite "E2E: Transaction":
       discard await conn.exec("BEGIN")
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withSavepoint("sp_outer_done"):
           # End the outer transaction from inside the savepoint, so the
           # savepoint no longer exists by the time we raise.
           discard await conn.exec("ROLLBACK")
           raise newException(ValueError, "boom")
+        {.pop.}
       except ValueError:
         raised = true
 
@@ -1183,11 +1191,13 @@ suite "E2E: Deadline-bounded Transaction":
       try:
         # Long deadline so the loop ends by exhausting maxAttempts (a retryable
         # error every time), not by running out of budget.
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionRetryDeadline(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), seconds(10)
         ):
           inc attempts
           raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+        {.pop.}
       except PgQueryError as e:
         raised = true
         doAssert e.sqlState == "40P01"
@@ -1246,11 +1256,13 @@ suite "E2E: Deadline-bounded Transaction":
       var attempts = 0
       var raised = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransactionRetryDeadline(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn, seconds(10)
         ):
           inc attempts
           raise (ref PgQueryError)(msg: "deadlock", sqlState: "40P01")
+        {.pop.}
       except PgQueryError as e:
         raised = true
         doAssert e.sqlState == "40P01"
