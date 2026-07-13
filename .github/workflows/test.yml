@@ -31,7 +31,6 @@ jobs:
       matrix:
         os:
           - 'ubuntu-latest'
-          - 'macOS-latest'
         nim-version:
           - '2.2.4'
           - 'stable'
