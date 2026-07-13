@@ -1168,7 +1168,8 @@ when hasAsyncDispatch and defined(ssl):
   suite "SSL verify-full - enforceVerifyFullIdentity (OpenSSL backend)":
     test "installs the DNS host on the SSL handle":
       resolveX509TestSyms()
-      if x509GetHostFn == nil:
+      let getParam = sslGet0Param()
+      if x509GetHostFn == nil or getParam == nil:
         skip()
       else:
         let ctx = newContext(verifyMode = CVerifyNone)
@@ -1176,7 +1177,7 @@ when hasAsyncDispatch and defined(ssl):
         doAssert ssl != nil
         try:
           enforceVerifyFullIdentity(ssl, "db.example.com")
-          check $x509GetHostFn(SSL_get0_param(ssl), 0.cint) == "db.example.com"
+          check $x509GetHostFn(getParam(ssl), 0.cint) == "db.example.com"
         finally:
           SSL_free(ssl)
 
