@@ -84,6 +84,13 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
   ## Send SSLRequest and negotiate TLS if server accepts.
   ## `sslHost` is the host *name* the server certificate is verified against
   ## (the entry's `host`, never its `hostaddr` — libpq semantics).
+  if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:
+    # Both backends silently fall back to a Web PKI store (chronos:
+    # MozillaTrustAnchors, std/net: OS CA bundle) — for verify-ca that also
+    # skips hostname checks, so any publicly-issued cert MITMs. Fail closed.
+    raise newException(
+      PgConnectionError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
+    )
   if config.sslMode == sslVerifyFull and sslHost.len == 0:
     # hostaddr without host: there is no name to match the certificate
     # against (libpq raises the same way).
@@ -150,7 +157,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
 
       let serverName = if config.sslMode == sslVerifyFull: sslHost else: ""
 
-      if config.sslRootCert.len > 0:
+      if config.sslMode in {sslVerifyCa, sslVerifyFull}:
         let parsed = parseTrustAnchors(config.sslRootCert)
         conn.trustAnchorBufs = parsed.backing
           # Must outlive TLS session (see parseTrustAnchors doc)
@@ -164,6 +171,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
           trustAnchors = parsed.store,
         )
       else:
+        # NoVerifyHost is set, so trust anchors are ignored regardless.
         conn.tlsStream = newTLSClientAsyncStream(
           conn.baseReader,
           conn.baseWriter,
@@ -181,25 +189,20 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
       conn.sslEnabled = true
     elif hasAsyncDispatch:
       when defined(ssl):
-        let verifyMode =
-          case config.sslMode
-          of sslVerifyCa, sslVerifyFull: SslCVerifyMode.CVerifyPeer
-          else: SslCVerifyMode.CVerifyNone
-
         var ctx: SslContext
         var tmpPath: string
-        if config.sslRootCert.len > 0:
+        if config.sslMode in {sslVerifyCa, sslVerifyFull}:
           let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
           tmpPath = tp
           try:
             tmpFile.write(config.sslRootCert)
             tmpFile.close()
-            ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
+            ctx = newContext(verifyMode = CVerifyPeer, caFile = tmpPath)
           except:
             removeFile(tmpPath)
             raise
         else:
-          ctx = newContext(verifyMode = verifyMode)
+          ctx = newContext(verifyMode = CVerifyNone)
 
         try:
           let hostname = if config.sslMode == sslVerifyFull: sslHost else: ""
