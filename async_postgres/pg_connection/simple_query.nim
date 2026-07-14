@@ -79,6 +79,18 @@ proc checkReady*(conn: PgConnection) =
       "); a single connection cannot be used concurrently",
   )
 
+proc checkTxIdle*(conn: PgConnection) =
+  ## Reject entry to a top-level BEGIN/COMMIT scope when a transaction is
+  ## already active: nested BEGIN is a server-side no-op, so the inner COMMIT
+  ## would confirm the outer transaction's work. Use `withSavepoint` to nest.
+  if conn.txStatus == tsIdle:
+    return
+  raise newException(
+    PgStateError,
+    "Connection already has an active transaction (txStatus: " & $conn.txStatus &
+      "); use withSavepoint for nested scopes",
+  )
+
 # Identifier escaping
 
 proc quoteIdentifier*(s: string): string =

@@ -3104,3 +3104,132 @@ suite "E2E: execInTransaction / queryInTransaction":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: Nested BEGIN rejection":
+  # Nested BEGIN is a server-side no-op; the inner COMMIT would silently end the
+  # outer transaction and confirm its uncommitted work. Every top-level
+  # BEGIN/COMMIT scope must reject entry when a transaction is already active.
+
+  test "withTransaction rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransaction:
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransactionRetry(RetryOptions(maxAttempts: 2)):
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransactionDeadline(seconds(5)):
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 2), seconds(5)):
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "execInTransaction rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          discard await conn.execInTransaction("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "queryInTransaction rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          discard await conn.queryInTransaction("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "outer withTransaction ROLLBACKs on inner rejection, not COMMITs":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_nest_reject")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_nest_reject (id serial PRIMARY KEY, val text)"
+      )
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          discard await conn.exec(
+            "INSERT INTO test_tx_nest_reject (val) VALUES ($1)", @[toPgParam("outer")]
+          )
+          conn.withTransaction:
+            discard await conn.exec("SELECT 1")
+      except PgStateError:
+        raised = true
+
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      let res = await conn.query("SELECT count(*) FROM test_tx_nest_reject")
+      doAssert res.rows[0].getInt64(0) == 0,
+        "outer INSERT must have been rolled back, not committed by inner COMMIT"
+
+      discard await conn.exec("DROP TABLE test_tx_nest_reject")
+      await conn.close()
+
+    waitFor t()
