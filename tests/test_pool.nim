@@ -597,6 +597,34 @@ suite "Pool acquire":
     check pool.active == 1
     check pool.idle.len == 0
 
+  test "acquire disposes idle broken conn via closeNoWait (no await point)":
+    # Regression: `await tracedClose` here would let a caller's cancellation
+    # be swallowed by tracedClose's `except CatchableError`, leaking the
+    # next-acquired conn to a departed caller.
+    let pool = makePool()
+    let broken = mockConn(csClosed)
+    let good = mockConn(csReady)
+    pool.idle.addLast(broken.toPooled())
+    pool.idle.addLast(good.toPooled())
+
+    let acquired = waitFor pool.acquire()
+    check acquired == good
+    check pool.pendingBackgroundTasks.len >= 1
+
+  test "acquire disposes maxLifetime-expired idle conn via closeNoWait":
+    let pool = makePool()
+    pool.config.maxLifetime = seconds(1)
+    let expired = mockConn()
+    expired.createdAt = Moment.now() - seconds(5)
+    expired.state = csClosed
+    let good = mockConn()
+    pool.idle.addLast(expired.toPooled())
+    pool.idle.addLast(good.toPooled())
+
+    let acquired = waitFor pool.acquire()
+    check acquired == good
+    check pool.pendingBackgroundTasks.len >= 1
+
   test "acquire registers waiter when at max":
     let pool = makePool(maxSize = 1)
     pool.active = 1

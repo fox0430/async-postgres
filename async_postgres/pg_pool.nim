@@ -821,17 +821,13 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     while pool.idle.len > 0:
       let pc = pool.idle.popFirst()
       if pc.conn.state != csReady or pc.conn.socketHasFin():
-        pool.metrics.closeCount.inc
-        await pool.tracedClose(pc.conn)
-        if pool.closed:
-          raisePoolClosed()
+        # closeNoWait: avoid an await point where a cancellation could be
+        # swallowed by tracedClose and leak the next acquired conn (see ping guard).
+        pool.closeNoWait(pc.conn)
         continue
       if pool.config.maxLifetime > ZeroDuration and
           now - pc.conn.createdAt > pool.config.maxLifetime:
-        pool.metrics.closeCount.inc
-        await pool.tracedClose(pc.conn)
-        if pool.closed:
-          raisePoolClosed()
+        pool.closeNoWait(pc.conn)
         continue
       # Health check: ping connections that have been idle too long.
       # TLS connections use the tighter `tlsHealthCheckTimeout` window because
@@ -880,10 +876,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           raise e
         except CatchableError:
           pool.active.dec
-          pool.metrics.closeCount.inc
-          await pool.tracedClose(pc.conn)
-          if pool.closed:
-            raisePoolClosed()
+          pool.closeNoWait(pc.conn)
           continue
         # A close() during the ping didn't drain the popped conn — discard it.
         if pool.closed:
