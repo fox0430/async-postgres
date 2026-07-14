@@ -310,3 +310,30 @@ suite "parseDataRowInto overflow guard":
     parseDataRowInto(buildDataRowBody(["x"]), rd)
     check rd.buf.len == int32.high
     check rd.cellIndex.len == 2
+
+suite "parseDataRowInto numCols mismatch":
+  test "raises when wire numCols is less than rd.numCols":
+    var rd = newRowData(3)
+    expect PgProtocolError:
+      parseDataRowInto(buildDataRowBody(["a", "b"]), rd)
+
+  test "raises when wire numCols exceeds rd.numCols":
+    var rd = newRowData(2)
+    expect PgProtocolError:
+      parseDataRowInto(buildDataRowBody(["a", "b", "c"]), rd)
+
+  test "state unchanged on numCols mismatch":
+    var rd = newRowData(2)
+    parseDataRowInto(buildDataRowBody(["a", "b"]), rd)
+    let bufLen = rd.buf.len
+    let cellLen = rd.cellIndex.len
+    expect PgProtocolError:
+      parseDataRowInto(buildDataRowBody(["x", "y", "z"]), rd)
+    check rd.buf.len == bufLen
+    check rd.cellIndex.len == cellLen
+
+  test "accepts matching numCols":
+    var rd = newRowData(3)
+    parseDataRowInto(buildDataRowBody(["a", "b", "c"]), rd)
+    check getCell(rd, 0, 0) == "a"
+    check getCell(rd, 0, 2) == "c"

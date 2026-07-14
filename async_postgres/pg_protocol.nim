@@ -1085,6 +1085,14 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   let numCols = decodeInt16(body, 0)
   if numCols < 0:
     raise newException(PgProtocolError, "DataRow: invalid column count " & $numCols)
+  # cellInfo strides cellIndex by rd.numCols; a mismatched row would misalign
+  # every subsequent row (wrong-cell reads or IndexDefect).
+  if numCols != rd.numCols:
+    raise newException(
+      PgProtocolError,
+      "DataRow: column count " & $numCols & " does not match RowDescription " &
+        $rd.numCols,
+    )
 
   # Check cumulative buffer size before any mutation
   let bufBase = rd.buf.len
