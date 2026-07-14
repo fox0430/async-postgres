@@ -1893,6 +1893,101 @@ when hasChronos:
 
       waitFor t()
 
+    test "sweep schedules closes off-loop so healthy conns stay counted":
+      # Regression: the sweep once popped healthy conns into a local deque and
+      # awaited each broken close inline. During that await, healthy entries were
+      # invisible to `pool.idle` / `pool.active`, letting concurrent acquires
+      # overshoot maxSize. The fix routes closes through `closeNoWait`, so the
+      # sweep never yields — the closes appear as pendingBackgroundTasks instead.
+      proc t() {.async.} =
+        let pool = makePool(minSize = 0, maxSize = 10)
+        pool.config.maintenanceInterval = milliseconds(10)
+
+        for i in 0 ..< 3:
+          let healthy = mockConn()
+          pool.idle.addLast(PooledConn(conn: healthy, lastUsedAt: Moment.now()))
+        for i in 0 ..< 5:
+          let broken = mockConn(state = csClosed)
+          pool.idle.addLast(PooledConn(conn: broken, lastUsedAt: Moment.now()))
+
+        doAssert pool.pendingBackgroundTasks.len == 0
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+        await sleepAsync(milliseconds(50))
+
+        doAssert pool.idle.len == 3
+        doAssert pool.metrics.closeCount == 5
+        # Fewer than bgTaskPruneThreshold (16) closes, so none pruned yet
+        doAssert pool.pendingBackgroundTasks.len == 5
+
+        pool.closed = true
+        await cancelAndWait(pool.maintenanceTask)
+
+      waitFor t()
+
+    test "pool.close drains sweep-scheduled background closes":
+      # closeNoWait tracks each close in pendingBackgroundTasks; pool.close()
+      # must await them so the fix does not turn broken-conn cleanup into a leak.
+      proc t() {.async.} =
+        let pool = makePool(minSize = 0, maxSize = 5)
+        pool.config.maintenanceInterval = milliseconds(10)
+
+        for i in 0 ..< 4:
+          let broken = mockConn(state = csClosed)
+          pool.idle.addLast(PooledConn(conn: broken, lastUsedAt: Moment.now()))
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+        await sleepAsync(milliseconds(50))
+        doAssert pool.pendingBackgroundTasks.len == 4
+
+        await pool.close()
+        doAssert pool.pendingBackgroundTasks.len == 0
+
+      waitFor t()
+
+    test "concurrent acquires during sweep never overshoot maxSize":
+      # With the OLD code, healthy conns popped into the local `remaining` deque
+      # were invisible to concurrent acquires; those acquires would see
+      # `pool.active < maxSize` and open replacements even though the total
+      # (remaining + active) already reached maxSize. Interleaving acquires with
+      # the sweep must keep total under maxSize.
+      proc t() {.async.} =
+        let pool = makePool(minSize = 0, maxSize = 4)
+        pool.config.maintenanceInterval = milliseconds(5)
+
+        # Fill idle: 2 healthy + 2 broken. Sweep will close the 2 broken.
+        for i in 0 ..< 2:
+          pool.idle.addLast(PooledConn(conn: mockConn(), lastUsedAt: Moment.now()))
+        for i in 0 ..< 2:
+          pool.idle.addLast(
+            PooledConn(conn: mockConn(state = csClosed), lastUsedAt: Moment.now())
+          )
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+
+        # Race the sweep with acquires. Only 2 healthy conns exist; the rest must
+        # queue as waiters rather than triggering fresh connects (which would
+        # fail: no server) or somehow overshooting maxSize.
+        var futs: seq[Future[PgConnection]]
+        for i in 0 ..< 4:
+          futs.add(pool.acquire())
+
+        await sleepAsync(milliseconds(20))
+
+        # At most maxSize total exist at any point. The two healthy conns get
+        # borrowed; the other two acquires either queue as waiters or fail (no
+        # real server for a fresh connect), never producing extra conns.
+        doAssert pool.active + pool.idle.len <= pool.config.maxSize
+        doAssert pool.active <= 2 # only the 2 healthy conns can serve
+
+        pool.closed = true
+        await cancelAndWait(pool.maintenanceTask)
+        for f in futs:
+          if not f.finished:
+            f.fail(newException(PgPoolError, "test teardown"))
+
+      waitFor t()
+
 suite "Pool high concurrency":
   test "parallel acquire saturates maxSize and queues remainder":
     let pool = makePool(maxSize = 5)
