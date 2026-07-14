@@ -478,6 +478,9 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     if pool.closed:
       break
 
+    # closeNoWait keeps the sweep yield-free: a yield here would leave healthy
+    # entries popped into `remaining` but uncounted, so concurrent acquires
+    # could overshoot maxSize opening replacements.
     var remaining = initDeque[PooledConn]()
     let now = Moment.now()
 
@@ -486,15 +489,13 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
 
       # Always close broken or in-transaction connections (unusable)
       if pc.conn.state != csReady or pc.conn.txStatus != tsIdle:
-        pool.metrics.closeCount.inc
-        await pool.tracedClose(pc.conn)
+        pool.closeNoWait(pc.conn)
         continue
 
       # Always close max-lifetime-exceeded connections (acquire rejects them anyway)
       if pool.config.maxLifetime > ZeroDuration and
           now - pc.conn.createdAt > pool.config.maxLifetime:
-        pool.metrics.closeCount.inc
-        await pool.tracedClose(pc.conn)
+        pool.closeNoWait(pc.conn)
         continue
 
       # Idle timeout respects minSize
@@ -502,8 +503,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
           now - pc.lastUsedAt > pool.config.idleTimeout:
         let totalCount = remaining.len + pool.idle.len + pool.active
         if totalCount >= pool.config.minSize:
-          pool.metrics.closeCount.inc
-          await pool.tracedClose(pc.conn)
+          pool.closeNoWait(pc.conn)
           continue
 
       remaining.addLast(pc)
