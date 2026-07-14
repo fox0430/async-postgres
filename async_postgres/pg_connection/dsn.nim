@@ -235,6 +235,13 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "Invalid max_message_size: " & val)
     if result.maxMessageSize < 0:
       raise newException(PgError, "max_message_size must be non-negative: " & val)
+  of "max_scram_iterations":
+    try:
+      result.maxScramIterations = parseInt(val)
+    except ValueError:
+      raise newException(PgError, "Invalid max_scram_iterations: " & val)
+    if result.maxScramIterations < 0:
+      raise newException(PgError, "max_scram_iterations must be non-negative: " & val)
   else:
     result.extraParams.add((key, val))
 
@@ -476,6 +483,7 @@ proc initConnConfig*(
     requireAuth: set[AuthMethod] = {},
     extraParams: seq[(string, string)] = @[],
     maxMessageSize = 0,
+    maxScramIterations = 0,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
@@ -501,6 +509,7 @@ proc initConnConfig*(
     requireAuth: requireAuth,
     extraParams: extraParams,
     maxMessageSize: maxMessageSize,
+    maxScramIterations: maxScramIterations,
   )
 
 proc parseDsn*(dsn: string): ConnConfig =

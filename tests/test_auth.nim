@@ -154,9 +154,29 @@ suite "SCRAM-SHA-256":
   test "scramClientFinalMessage rejects excessive iteration count":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
-    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=600001"
+    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=10000001"
     expect CatchableError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage accepts iteration count above 600000":
+    # PG16+ scram_iterations may legitimately exceed the OWASP-recommended 600k
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000000"
+    discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage enforces custom maxIterations":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=5001"
+    expect CatchableError:
+      discard scramClientFinalMessage(
+        "password", toBytes(serverFirst), state, maxIterations = 5000
+      )
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let atLimit = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=5000"
+    discard
+      scramClientFinalMessage("password", toBytes(atLimit), state, maxIterations = 5000)
 
   test "scramClientFinalMessage rejects invalid base64 salt":
     var state: ScramState

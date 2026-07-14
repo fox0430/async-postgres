@@ -14,6 +14,11 @@ template burnStr*(s: var string) =
     ncutils.burnMem(addr s[0], s.len)
     s.setLen(0)
 
+const DefaultMaxScramIterations* = 10_000_000
+  ## Default cap on the server-requested SCRAM iteration count. PBKDF2 runs
+  ## synchronously on the event loop, so an unbounded count would let a
+  ## malicious server pin the process; 10M is far above realistic settings.
+
 type ScramState* = object
   ## Intermediate state for SCRAM-SHA-256 authentication handshake.
   clientNonce*: string
@@ -107,7 +112,10 @@ proc scramClientFirstMessage*(
   result = toBytes(state.gs2Header & state.clientFirstBare)
 
 proc scramClientFinalMessage*(
-    password: string, serverFirstData: openArray[byte], state: var ScramState
+    password: string,
+    serverFirstData: openArray[byte],
+    state: var ScramState,
+    maxIterations: int = DefaultMaxScramIterations,
 ): seq[byte] =
   ## Generate the SCRAM-SHA-256 client-final message from the server's first response.
   ## Computes the client proof and stores the expected server signature in `state`.
@@ -146,7 +154,7 @@ proc scramClientFinalMessage*(
     raise newException(
       PgConnectionError, "SCRAM: iteration count too small: " & $iterations
     )
-  if iterations > 600_000:
+  if iterations > maxIterations:
     raise newException(
       PgConnectionError, "SCRAM: iteration count too large: " & $iterations
     )
