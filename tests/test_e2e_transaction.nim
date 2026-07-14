@@ -964,7 +964,7 @@ suite "E2E: Transaction":
         raised = true
 
       doAssert raised
-      doAssert "SAVEPOINT sp_outer_done" in queries
+      doAssert "SAVEPOINT \"sp_outer_done\"" in queries
       var hasRollbackToSp = false
       for q in queries:
         if q.startsWith("ROLLBACK TO SAVEPOINT"):
@@ -974,6 +974,45 @@ suite "E2E: Transaction":
       doAssert conn.txStatus == tsIdle
 
       conn.tracer = nil
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepoint quotes savepoint name (SQL injection guard)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS sp_injection_probe2")
+      discard
+        await conn.exec("CREATE TABLE sp_injection_probe2 (id serial PRIMARY KEY)")
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      # withSavepoint requires a string-literal name; still worth verifying it
+      # is emitted quoted so identifier-legal characters (e.g. dashes) round-trip.
+      conn.withTransaction:
+        conn.withSavepoint("odd-name"):
+          discard await conn.exec("SELECT 1")
+
+      var sawSavepoint = false
+      var sawRelease = false
+      for q in queries:
+        if q == "SAVEPOINT \"odd-name\"":
+          sawSavepoint = true
+        elif q == "RELEASE SAVEPOINT \"odd-name\"":
+          sawRelease = true
+      doAssert sawSavepoint
+      doAssert sawRelease
+
+      conn.tracer = nil
+      discard await conn.exec("DROP TABLE sp_injection_probe2")
       await conn.close()
 
     waitFor t()
@@ -1531,6 +1570,55 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert res.rows[1].getStr(0) == "auto2"
 
       discard await conn.exec("DROP TABLE test_spd_auto")
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepointDeadline quotes savepoint name (SQL injection guard)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS sp_injection_probe")
+      discard await conn.exec("CREATE TABLE sp_injection_probe (id serial PRIMARY KEY)")
+
+      # Name containing ';' and embedded '"' — if concatenated unquoted into
+      # simpleExec it would execute the trailing DROP TABLE via the simple
+      # query protocol's multi-statement support.
+      let hostileName = "sp\"; DROP TABLE sp_injection_probe; --"
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      conn.withTransaction:
+        conn.withSavepointDeadline(hostileName, seconds(5)):
+          discard await conn.exec("SELECT 1")
+
+      # Probe table must survive — injection payload never executed.
+      let res = await conn.query(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'sp_injection_probe'"
+      )
+      doAssert res.rows.len == 1
+
+      # Quoted-identifier form: embedded '"' doubled per SQL rules.
+      let quoted = "\"sp\"\"; DROP TABLE sp_injection_probe; --\""
+      var sawSavepoint = false
+      var sawRelease = false
+      for q in queries:
+        if q == "SAVEPOINT " & quoted:
+          sawSavepoint = true
+        elif q == "RELEASE SAVEPOINT " & quoted:
+          sawRelease = true
+      doAssert sawSavepoint
+      doAssert sawRelease
+
+      conn.tracer = nil
+      discard await conn.exec("DROP TABLE sp_injection_probe")
       await conn.close()
 
     waitFor t()

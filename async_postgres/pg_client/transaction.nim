@@ -483,12 +483,13 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
     bindCleanupSkippedSyms()
   let ckSpRollbackSym = bindSym"ckSavepointRollback"
+  let quoteIdentSym = bindSym"quoteIdentifier"
 
   let nameExpr = savepointNameExpr(connSym, spName)
 
   result = quote:
     let `connSym` = `connExpr`
-    let `spNameSym` = `nameExpr`
+    let `spNameSym` = `quoteIdentSym`(`nameExpr`)
     try:
       discard
         await `connSym`.simpleExec("SAVEPOINT " & `spNameSym`, timeout = `spTimeout`)
@@ -780,12 +781,13 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
     bindCleanupSkippedSyms()
   let ckSpRollbackSym = bindSym"ckSavepointRollback"
+  let quoteIdentSym = bindSym"quoteIdentifier"
 
   let nameExpr = savepointNameExpr(connSym, spName)
 
   result = quote:
     let `connSym` = `connExpr`
-    let `spNameSym` = `nameExpr`
+    let `spNameSym` = `quoteIdentSym`(`nameExpr`)
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     proc `bodyFnSym`(): Future[void] {.async.} =
