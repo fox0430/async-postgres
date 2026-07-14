@@ -407,12 +407,11 @@ proc getBytes*(row: Row, col: int): seq[byte] =
       raise newException(
         PgTypeError, "Column " & $col & ": odd-length hex in bytea text value"
       )
-    var hex = newString(hexLen)
-    for i in 0 ..< hexLen:
-      hex[i] = char(row.data.buf[off + 2 + i])
     result = newSeq[byte](hexLen div 2)
+    let hexOff = off + 2
+    let errCtx = "Column " & $col
     for i in 0 ..< result.len:
-      result[i] = byte(pgParseHexInt(hex[i * 2 .. i * 2 + 1]))
+      result[i] = decodeHexPair(row.data.buf, hexOff + i * 2, errCtx)
   else:
     result = readBytes(row.data.buf, off, clen)
 
@@ -1268,12 +1267,13 @@ genArrayDecoder(
 
 proc bytesElemFromText(s: string): seq[byte] =
   if s.len >= 2 and s[0] == '\\' and s[1] == 'x':
-    let hexStr = s[2 ..^ 1]
-    if hexStr.len mod 2 != 0:
+    let hexLen = s.len - 2
+    if hexLen mod 2 != 0:
       raise newException(PgTypeError, "odd-length hex in bytea array element: " & s)
-    result = newSeq[byte](hexStr.len div 2)
+    const errCtx = "bytea array element"
+    result = newSeq[byte](hexLen div 2)
     for j in 0 ..< result.len:
-      result[j] = byte(pgParseHexInt(hexStr[j * 2 .. j * 2 + 1]))
+      result[j] = decodeHexPair(s, 2 + j * 2, errCtx)
   else:
     result = toBytes(s)
 
