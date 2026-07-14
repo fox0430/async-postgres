@@ -29,12 +29,12 @@ proc prepareImpl*(
     conn: PgConnection, name: string, sql: string
 ): Future[PreparedStatement] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   var batch = newSeqOfCap[byte](sql.len + name.len + 32)
   batch.addParse(name, sql)
   batch.addDescribe(dkStatement, name)
   batch.addSync()
+  conn.state = csBusy
   await conn.sendMsg(batch)
 
   var stmt = PreparedStatement(conn: conn, name: name, sql: sql)
@@ -85,7 +85,6 @@ proc executeImpl*(
   let conn = stmt.conn
 
   conn.checkReady()
-  conn.state = csBusy
 
   # Coerce binary parameters to match server-inferred types from prepare().
   var coerced: seq[PgParam]
@@ -106,6 +105,7 @@ proc executeImpl*(
   )
   conn.sendBuf.addExecute("", 0)
   conn.sendBuf.addSync()
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult(fields: stmt.fields)
@@ -172,11 +172,11 @@ proc closeImpl*(stmt: PreparedStatement): Future[void] {.async.} =
   let conn = stmt.conn
 
   conn.checkReady()
-  conn.state = csBusy
 
   var batch = newSeqOfCap[byte](stmt.name.len + 16)
   batch.addClose(dkStatement, stmt.name)
   batch.addSync()
+  conn.state = csBusy
   await conn.sendMsg(batch)
 
   conn.pumpUntilReady:

@@ -33,7 +33,6 @@ proc openCursorImpl(
     chunkSize: int32,
 ): Future[Cursor] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   inc conn.portalCounter
   let portalName = "_cursor_" & $conn.portalCounter
@@ -50,6 +49,7 @@ proc openCursorImpl(
   batch.addDescribe(dkPortal, portalName)
   batch.addExecute(portalName, chunkSize)
   batch.addFlush()
+  conn.state = csBusy
   await conn.sendMsg(batch)
 
   var cursor =

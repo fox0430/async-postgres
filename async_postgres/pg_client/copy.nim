@@ -73,8 +73,9 @@ proc copyInRawImpl*(
     conn: PgConnection, sql: string, data: seq[byte]
 ): Future[string] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var commandTag = ""
   # Server-abort error detected by pollCopyInError during the CopyData send
@@ -241,8 +242,9 @@ proc copyInStreamImpl*(
     conn: PgConnection, sql: string, callback: CopyInCallback
 ): Future[CopyInInfo] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var info = CopyInInfo()
   # Server-abort error detected by pollCopyInError during the CopyData send
@@ -448,8 +450,9 @@ proc copyInStream*(
 
 proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var cr = CopyResult()
   var sawCopyOut = false
@@ -528,8 +531,9 @@ proc copyOutStreamImpl*(
     conn: PgConnection, sql: string, callback: CopyOutCallback
 ): Future[CopyOutInfo] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var info = CopyOutInfo()
   var sawCopyOut = false
