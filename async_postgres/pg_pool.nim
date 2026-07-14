@@ -308,17 +308,18 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   ## tracer hook — are swallowed.
   if conn.state != csReady or conn.txStatus != tsIdle:
     return
-  if pool.config.resetQuery.len == 0 and conn.heldSessionLocks == 0:
+  if pool.config.resetQuery.len == 0 and not conn.sessionLockDirty:
     return
   try:
-    if conn.heldSessionLocks > 0:
+    if conn.sessionLockDirty:
       let t = pool.config.tracer
-      if t != nil and t.onLeakedSessionLocks != nil:
+      if t != nil and t.onLeakedSessionLocks != nil and conn.heldSessionLocks > 0:
         t.onLeakedSessionLocks(
           TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
         )
       discard await conn.simpleExec("SELECT pg_advisory_unlock_all()")
       conn.heldSessionLocks = 0
+      conn.sessionLockDirty = false
     if pool.config.resetQuery.len > 0:
       discard await conn.simpleExec(pool.config.resetQuery)
       conn.clearStmtCache()
@@ -623,7 +624,7 @@ proc releaseCore(
   ## `releaseImpl`. Returns flags describing the disposition of `conn` so
   ## the caller can report them to the tracer.
   if pool.closed or conn.state != csReady or conn.txStatus != tsIdle or
-      conn.heldSessionLocks > 0:
+      conn.sessionLockDirty:
     if pool.active > 0:
       pool.active.dec
     pool.closeNoWait(conn)
@@ -665,10 +666,10 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## Transaction-in-progress (`txStatus != tsIdle`) is treated as failure
   ## to reset the session, so the connection is closed rather than leaking
   ## transaction state to the next borrower.
-  ## Session-level advisory locks (`heldSessionLocks > 0`) likewise force the
+  ## Session-level advisory locks (`sessionLockDirty`) likewise force the
   ## connection to be discarded: callers who route through `resetSession`
-  ## clear them ahead of time, so anything reaching here with locks still
-  ## held has bypassed that path and must not return to the idle queue.
+  ## clear them ahead of time, so anything reaching here still dirty has
+  ## bypassed that path and must not return to the idle queue.
   ##
   ## Double-release guard: a connection that is not currently checked out
   ## (`borrowed == false`) has already been returned to the pool — or never
@@ -694,7 +695,8 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
       tracer.onPoolDoubleRelease(TracePoolDoubleReleaseData(conn: conn))
     return
   conn.borrowed = false
-  if conn.heldSessionLocks > 0 and tracer != nil and tracer.onLeakedSessionLocks != nil:
+  if conn.sessionLockDirty and conn.heldSessionLocks > 0 and tracer != nil and
+      tracer.onLeakedSessionLocks != nil:
     tracer.onLeakedSessionLocks(
       TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
     )

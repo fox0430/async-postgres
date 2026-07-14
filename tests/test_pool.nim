@@ -503,6 +503,7 @@ suite "Pool release":
     pool.active = 1
     let conn = mockConn()
     conn.heldSessionLocks = 1
+    conn.sessionLockDirty = true
     pool.release(conn)
     check pool.active == 0
     check pool.idle.len == 0
