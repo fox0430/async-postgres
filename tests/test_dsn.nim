@@ -360,6 +360,26 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?max_message_size=-1")
 
+  test "max_scram_iterations from URI DSN":
+    let cfg = parseDsn("postgresql://host/db?max_scram_iterations=1000000")
+    check cfg.maxScramIterations == 1000000
+
+  test "max_scram_iterations from keyword DSN":
+    let cfg = parseDsn("host=h dbname=d max_scram_iterations=2000000")
+    check cfg.maxScramIterations == 2000000
+
+  test "max_scram_iterations default is zero (use library default)":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.maxScramIterations == 0
+
+  test "error: invalid max_scram_iterations value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_scram_iterations=abc")
+
+  test "error: negative max_scram_iterations":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_scram_iterations=-1")
+
   test "error: sslrootcert file not found":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")

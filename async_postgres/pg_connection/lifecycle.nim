@@ -373,8 +373,10 @@ proc connectToHost*(
                 "server sent AuthenticationSASLContinue without a preceding " &
                   "AuthenticationSASL (possible protocol violation or MITM)",
               )
-            var clientFinal =
-              scramClientFinalMessage(config.password, msg.saslData, scramState)
+            var clientFinal = scramClientFinalMessage(
+              config.password, msg.saslData, scramState,
+              config.effectiveMaxScramIterations,
+            )
             var saslMsg = encodeSASLResponse(clientFinal)
             ncutils.burnMem(clientFinal)
             try:

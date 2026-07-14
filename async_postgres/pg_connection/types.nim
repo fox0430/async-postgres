@@ -10,7 +10,7 @@ import std/[tables, sets, deques, lists]
 when defined(posix):
   import std/posix
 
-import ../[async_backend, pg_errors, pg_protocol, pg_types]
+import ../[async_backend, pg_auth, pg_errors, pg_protocol, pg_types]
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -149,6 +149,10 @@ type
       ## further recv-buffer growth, capping memory exposure to a
       ## misbehaving or malicious peer. ``0`` (default) selects
       ## `DefaultMaxBackendMessageLen` (1 GiB).
+    maxScramIterations*: int
+      ## Upper bound on the server-requested SCRAM iteration count
+      ## (PostgreSQL 16+ `scram_iterations`), capping CPU spent in PBKDF2.
+      ## ``0`` (default) selects `DefaultMaxScramIterations` (10,000,000).
     tracer*: PgTracer ## Optional tracer for connection-level hooks
 
   Notification* = object ## A NOTIFY message received from PostgreSQL.
@@ -691,6 +695,14 @@ func effectiveMaxMessageSize*(conn: PgConnection): int {.inline.} =
     conn.config.maxMessageSize
   else:
     DefaultMaxBackendMessageLen
+
+func effectiveMaxScramIterations*(config: ConnConfig): int {.inline.} =
+  ## Resolves the ``ConnConfig.maxScramIterations`` default (0) to
+  ## ``DefaultMaxScramIterations``.
+  if config.maxScramIterations > 0:
+    config.maxScramIterations
+  else:
+    DefaultMaxScramIterations
 
 # Internal replication LSN plumbing (cross-module use within the library)
 #
