@@ -668,7 +668,7 @@ proc toPgBinaryParam*(v: PgMoney): PgParam =
   data.writeMoneyAt(0, v)
   PgParam(oid: OidMoney, format: 1, value: some(data))
 
-proc hexNibble(c: char): int =
+proc hexNibble*(c: char): int =
   case c
   of '0' .. '9':
     ord(c) - ord('0')
@@ -679,13 +679,20 @@ proc hexNibble(c: char): int =
   else:
     -1
 
-proc decodeHexPair(s: string, i: int, errCtx: string): byte =
+proc decodeHexPair*(s: string, i: int, errCtx: string): byte =
   let hi = hexNibble(s[i])
   let lo = hexNibble(s[i + 1])
   if hi < 0 or lo < 0:
     raise newException(
       PgTypeError, errCtx & ": non-hex character at position " & $i & " in " & s.escape
     )
+  byte((hi shl 4) or lo)
+
+proc decodeHexPair*(buf: openArray[byte], i: int, errCtx: string): byte =
+  let hi = hexNibble(char(buf[i]))
+  let lo = hexNibble(char(buf[i + 1]))
+  if hi < 0 or lo < 0:
+    raise newException(PgTypeError, errCtx & ": non-hex character at position " & $i)
   byte((hi shl 4) or lo)
 
 proc writeUuidAt(buf: var openArray[byte], pos: int, v: PgUuid) =
