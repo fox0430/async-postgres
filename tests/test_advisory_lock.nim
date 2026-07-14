@@ -166,6 +166,30 @@ suite "Advisory Lock: transaction-level (int64)":
 
     waitFor t()
 
+  test "xact lock outside transaction raises PgStateError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXact(40010'i64)
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXactShared(40011'i64)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXact(40012'i64)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXactShared(40013'i64)
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXact(1'i32, 2'i32)
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXactShared(3'i32, 4'i32)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXact(5'i32, 6'i32)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXactShared(7'i32, 8'i32)
+
+    waitFor t()
+
 suite "Advisory Lock: two-key (int32, int32)":
   test "lock and unlock":
     proc t() {.async.} =
@@ -228,8 +252,9 @@ suite "Advisory Lock: two-key (int32, int32)":
         await conn2.close()
       conn1.withTransaction:
         await conn1.advisoryLockXactShared(9'i32, 10'i32)
-        let acquired = await conn2.advisoryTryLockXactShared(9'i32, 10'i32)
+        let acquired = await conn2.advisoryTryLockShared(9'i32, 10'i32)
         doAssert acquired
+        discard await conn2.advisoryUnlockShared(9'i32, 10'i32)
 
     waitFor t()
 
@@ -392,8 +417,9 @@ suite "Advisory Lock: withAdvisoryLockXact template":
         await conn2.close()
       conn1.withTransaction:
         conn1.withAdvisoryLockXactShared(17'i32, 18'i32):
-          let acquired = await conn2.advisoryTryLockXactShared(17'i32, 18'i32)
+          let acquired = await conn2.advisoryTryLockShared(17'i32, 18'i32)
           doAssert acquired
+          discard await conn2.advisoryUnlockShared(17'i32, 18'i32)
 
     waitFor t()
 

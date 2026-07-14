@@ -56,7 +56,7 @@
 
 import std/[macros, importutils]
 
-import async_backend, pg_types, pg_connection, pg_client
+import async_backend, pg_protocol, pg_types, pg_connection, pg_client
 
 privateAccess(PgConnection)
 
@@ -89,14 +89,26 @@ template unlockSessionLock(
     dec conn.heldSessionLocks
   released
 
+proc ensureXactScope(conn: PgConnection) {.inline.} =
+  # In tsIdle the acquire's implicit tx would commit and drop the lock before
+  # body runs, silently losing mutual exclusion.
+  if conn.txStatus != tsInTransaction:
+    raise newException(
+      PgStateError,
+      "transaction-level advisory lock requires an active transaction " & "(txStatus: " &
+        $conn.txStatus & "); wrap the call in withTransaction",
+    )
+
 template acquireXactLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ) =
+  ensureXactScope(conn)
   discard await conn.queryValue(sql, params, timeout = t)
 
 template tryXactLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ): bool =
+  ensureXactScope(conn)
   await conn.queryValue(bool, sql, params, timeout = t)
 
 # Session-level exclusive locks
