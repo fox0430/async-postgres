@@ -367,7 +367,6 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     let `sqlSym` = `sql`
     let `timeoutSym`: Duration = `timeoutExpr`
     `connSym`.checkReady()
-    `connSym`.state = csBusy
 
     let `cachedSym` = `connSym`.lookupStmtCache(`sqlSym`)
     var `cacheHitSym` = `cachedSym` != nil
@@ -470,6 +469,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   result.add(ifNode)
 
   result.add quote do:
+    `connSym`.state = csBusy
     queryDirectImpl(
       `connSym`, `sqlSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`, `cacheHitSym`,
       `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, `timeoutSym`,
@@ -547,7 +547,6 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     let `sqlSym` = `sql`
     let `timeoutSym`: Duration = `timeoutExpr`
     `connSym`.checkReady()
-    `connSym`.state = csBusy
 
     let `cachedSym` = `connSym`.lookupStmtCache(`sqlSym`)
     var `cacheHitSym` = `cachedSym` != nil
@@ -634,6 +633,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   result.add(ifNode)
 
   result.add quote do:
+    `connSym`.state = csBusy
     execDirectImpl(
       `connSym`, `sqlSym`, `cacheHitSym`, `cacheMissSym`, `stmtNameSym`, `timeoutSym`
     )

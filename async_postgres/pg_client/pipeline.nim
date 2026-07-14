@@ -364,9 +364,9 @@ template settleSendFut(sendFut: untyped) =
 proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
   let conn = p.conn
   conn.checkReady()
-  conn.state = csBusy
 
   let cachedStmts = buildSendPhase(p, perOpSync = false)
+  conn.state = csBusy
   when hasChronos:
     # chronos drains the send Future in the background while we descend into
     # the receive loop. The outer try/except below owns sendFut's lifetime:
@@ -574,9 +574,9 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
   ## Each op gets its own ReadyForQuery; a failed op does not abort others.
   let conn = p.conn
   conn.checkReady()
-  conn.state = csBusy
 
   let cachedStmts = buildSendPhase(p, perOpSync = true)
+  conn.state = csBusy
   when hasChronos:
     # Same concurrent-send pattern as executeImpl: the write drains while the
     # recv loop consumes per-op ReadyForQuery messages. Per-op SYNC still

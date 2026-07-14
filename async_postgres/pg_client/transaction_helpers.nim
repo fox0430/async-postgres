@@ -18,7 +18,6 @@ proc queryInTransactionImpl(
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.checkTxIdle()
-  conn.state = csBusy
 
   let formats =
     if paramFormats.len > 0:
@@ -43,6 +42,7 @@ proc queryInTransactionImpl(
   conn.sendBuf.addExecute("", 0)
   # Single Sync
   conn.sendBuf.addSync()
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()

@@ -103,8 +103,9 @@ proc simpleQueryImpl*(
     conn: PgConnection, sql: string
 ): Future[seq[QueryResult]] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var results: seq[QueryResult]
   var current = QueryResult()
@@ -129,8 +130,9 @@ proc simpleQueryImpl*(
 
 proc simpleExecImpl*(conn: PgConnection, sql: string): Future[string] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
   var commandTag = ""
   conn.pumpUntilReady:
     case pumpMsg.kind

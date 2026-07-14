@@ -1219,7 +1219,6 @@ proc startReplication*(
         )
 
   conn.checkReady()
-  conn.state = csBusy
 
   # Build START_REPLICATION command
   var sql =
@@ -1241,7 +1240,9 @@ proc startReplication*(
         sql.add(" " & v)
     sql.add(")")
 
-  await conn.sendMsg(encodeQuery(sql))
+  let msg = encodeQuery(sql)
+  conn.state = csBusy
+  await conn.sendMsg(msg)
   await runReplicationStream(
     conn, startLsn, autoKeepaliveReply, statusInterval, callback, "replication"
   )
@@ -1325,7 +1326,6 @@ proc startPhysicalReplication*(
   ## those messages; callers that need the next-timeline information should
   ## re-issue ``IDENTIFY_SYSTEM`` after this proc returns.
   conn.checkReady()
-  conn.state = csBusy
 
   var sql = "START_REPLICATION"
   if slotName.len > 0:
@@ -1334,7 +1334,9 @@ proc startPhysicalReplication*(
   if timeline > 0:
     sql.add(" TIMELINE " & $timeline)
 
-  await conn.sendMsg(encodeQuery(sql))
+  let msg = encodeQuery(sql)
+  conn.state = csBusy
+  await conn.sendMsg(msg)
   await runReplicationStream(
     conn, startLsn, autoKeepaliveReply, statusInterval, callback, "physical replication"
   )

@@ -236,3 +236,103 @@ suite "E2E: Prepared Statement Edge Cases":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: encode-time exception leaves connection usable":
+  test "simpleQuery with NUL in SQL keeps conn csReady":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.simpleQuery("SELECT 1\0extra")
+      except ValueError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      let res = await conn.simpleQuery("SELECT 42")
+      doAssert res[0].rows[0][0].get().toString() == "42"
+      await conn.close()
+
+    waitFor t()
+
+  test "simpleExec with NUL in SQL keeps conn csReady":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.simpleExec("SELECT 1\0extra")
+      except ValueError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      let tag = await conn.simpleExec("SELECT 1")
+      doAssert "SELECT" in tag.commandTag
+      await conn.close()
+
+    waitFor t()
+
+  test "query (extended) with NUL in SQL keeps conn csReady":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.query("SELECT $1\0::text", @[toPgParam("x")])
+      except ValueError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      let res = await conn.query("SELECT 42")
+      doAssert res.rows[0].getStr(0) == "42"
+      await conn.close()
+
+    waitFor t()
+
+  test "exec (extended) with NUL in SQL keeps conn csReady":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.exec("SELECT $1\0::text", @[toPgParam("x")])
+      except ValueError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      let tag = await conn.exec("SELECT 1")
+      doAssert "SELECT" in tag.commandTag
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect with NUL in runtime SQL keeps conn csReady":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # Runtime SQL bypasses the macro's compile-time literal check.
+      let badSql = "SELECT $1\0::int"
+      var raised = false
+      try:
+        discard await conn.queryDirect(badSql, 1)
+      except ValueError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      let res = await conn.query("SELECT 42")
+      doAssert res.rows[0].getStr(0) == "42"
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect with NUL in runtime SQL keeps conn csReady":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let badSql = "SELECT $1\0::int"
+      var raised = false
+      try:
+        discard await conn.execDirect(badSql, 1)
+      except ValueError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      let tag = await conn.exec("SELECT 1")
+      doAssert "SELECT" in tag.commandTag
+      await conn.close()
+
+    waitFor t()

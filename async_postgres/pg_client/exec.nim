@@ -14,7 +14,6 @@ proc execImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let formats =
     if paramFormats.len > 0:
@@ -37,6 +36,7 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBind("", stmtName, formats, params),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var commandTag = ""
@@ -47,7 +47,6 @@ proc execImpl*(
     conn: PgConnection, sql: string, params: seq[PgParam] = @[]
 ): Future[string] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -64,6 +63,7 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var commandTag = ""
@@ -112,7 +112,6 @@ proc execInlineImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -129,6 +128,7 @@ proc execInlineImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var commandTag = ""

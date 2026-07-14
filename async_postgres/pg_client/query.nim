@@ -16,7 +16,6 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let formats =
     if paramFormats.len > 0:
@@ -49,6 +48,7 @@ proc queryImpl*(
     bindStep =
       conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()
@@ -65,7 +65,6 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -91,6 +90,7 @@ proc queryImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()
@@ -108,7 +108,6 @@ proc queryEachImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[int64] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -134,6 +133,7 @@ proc queryEachImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var rowCount: int64 = 0
@@ -223,7 +223,6 @@ proc queryInlineImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -251,6 +250,7 @@ proc queryInlineImpl*(
       "", stmtName, paramFormats, data, ranges, effectiveResultFormats
     ),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()
