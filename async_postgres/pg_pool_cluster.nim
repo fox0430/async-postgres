@@ -109,13 +109,34 @@ proc newPoolCluster*(
   if rCfg.connConfig.targetSessionAttrs == tsaAny:
     rCfg.connConfig.targetSessionAttrs = tsaPreferStandby
 
-  let pPool = await newPool(pCfg)
-  var rPool: PgPool
-  try:
-    rPool = await newPool(rCfg)
-  except CatchableError as e:
-    await pPool.close()
-    raise e
+  # allFutures settles both sides, so a one-side failure never abandons the
+  # other mid-handshake; close the survivor before raising.
+  let
+    pPoolFut = newPool(pCfg)
+    rPoolFut = newPool(rCfg)
+  await allFutures(@[pPoolFut, rPoolFut])
+
+  var
+    pPool, rPool: PgPool
+    firstErr: ref CatchableError
+  if pPoolFut.failed():
+    firstErr = cast[ref CatchableError](pPoolFut.error)
+  else:
+    pPool = pPoolFut.read()
+  if rPoolFut.failed():
+    if firstErr == nil:
+      firstErr = cast[ref CatchableError](rPoolFut.error)
+  else:
+    rPool = rPoolFut.read()
+
+  if firstErr != nil:
+    var closeFuts: seq[Future[void]]
+    if pPool != nil:
+      closeFuts.add(pPool.close())
+    if rPool != nil:
+      closeFuts.add(rPool.close())
+    await allFutures(closeFuts)
+    raise firstErr
 
   return PgPoolCluster(
     primary: pPool,
