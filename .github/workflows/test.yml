@@ -68,18 +68,27 @@ jobs:
         run: bash tests/gen_certs.sh
 
       - name: Start PostgreSQL
+        id: start-psql
         run: docker compose up -d --wait
+        background: true
 
       - name: Install chronos
+        id: install-chronos
         run: nimble install chronos -y
+        background: true
 
-      - name: Run tests
-        run: nimble test -y
+      - name: Wait setup
+        wait: [start-psql, install-chronos]
 
       - name: Install async_postgres
         run: |
           rm -rf ~/.nimble/pkgs2/async_postgres-*
           nimble install -y
+
+      - name: Run tests
+        id: run-tests
+        run: nimble test -y
+        background: true
 
       - name: Compile examples (asyncdispatch)
         run: for f in examples/*.nim; do nim c "$f"; done
@@ -90,3 +99,6 @@ jobs:
       - name: Gen docs
         run: |
           nim doc --project --index:on --outdir:./htmldocs ./async_postgres.nim
+
+      - name: Wait setup
+        wait: [run-tests]
