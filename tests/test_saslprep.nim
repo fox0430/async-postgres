@@ -127,6 +127,29 @@ suite "SASLprep - bidirectional (RFC 3454 Section 6)":
     let s = "\xD8\xA7\xD8\xA8"
     check saslprep(s) == s
 
+suite "SASLprep - invalid UTF-8 fallback (matches PostgreSQL)":
+  # PG server and libpq both use the raw bytes when input is not valid
+  # UTF-8; returning input unchanged keeps our client verifier in sync.
+
+  test "bare Latin-1 byte is returned as-is":
+    let raw = "p\xE9ss" # 0xE9 = Latin-1 'e-acute'
+    check saslprep(raw) == raw
+
+  test "bare continuation byte is returned as-is":
+    let raw = "x\x80y"
+    check saslprep(raw) == raw
+
+  test "truncated 2-byte sequence is returned as-is":
+    let raw = "x\xC2y"
+    check saslprep(raw) == raw
+
+  test "overlong ASCII encoding is returned as-is":
+    let raw = "\xC0\xAF" # would 2-byte encode '/'
+    check saslprep(raw) == raw
+
+  test "ASCII fast path still wins over the fallback":
+    check saslprep("Password123!") == "Password123!"
+
 suite "SASLprep - empty password handling":
   test "password of only B.1 characters is rejected":
     # Soft hyphen maps to nothing; the result is empty, which PostgreSQL
