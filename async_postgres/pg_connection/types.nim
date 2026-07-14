@@ -266,9 +266,19 @@ type
       ## to the gap until the next operation.
     heldSessionLocks*: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
-      ## API. The pool releases or discards connections with a non-zero count
-      ## so that locks never leak to subsequent borrowers. Raw-SQL acquires
-      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass this counter.
+      ## API, minus tracked releases. Reported by the `onLeakedSessionLocks`
+      ## tracer hook. Raw-SQL acquires
+      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass this counter,
+      ## so it is best-effort under mixed typed/raw usage — the pool's
+      ## reset/discard decision uses `sessionLockDirty` instead so a raw
+      ## acquire released through the typed API cannot forge a `== 0` count
+      ## and leak a tracked lock into the next borrower.
+    sessionLockDirty*: bool
+      ## Sticky flag: set on any tracked session-level acquire, cleared only
+      ## by `advisoryUnlockAll` or connection reset. Drives the pool's
+      ## reset/discard decision so `pg_advisory_unlock_all` runs whenever a
+      ## tracked acquire ever happened, even if the tracked counter was
+      ## decremented back to zero by a typed unlock of a raw-acquired key.
     tracer*: PgTracer ## Inherited from ConnConfig on connect
     ownerPool*: PgPoolOwner
       ## Owning pool back-reference. Set when this connection is managed by

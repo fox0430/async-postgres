@@ -460,6 +460,7 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
       discard
   conn.state = csClosed
   conn.heldSessionLocks = 0
+  conn.sessionLockDirty = false
   # Fail any pending notification waiter
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
     conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
