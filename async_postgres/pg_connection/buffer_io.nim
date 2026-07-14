@@ -83,7 +83,7 @@ proc getHosts*(config: ConnConfig): seq[HostEntry] =
 
 template makeCopyOutCallback*(body: untyped): CopyOutCallback =
   ## Create a ``CopyOutCallback`` that works with both asyncdispatch and chronos.
-  ## Inside ``body``, the current chunk is available as ``data: seq[byte]``.
+  ## Inside ``body``, the current chunk is available as ``data: sink seq[byte]``.
   ##
   ## .. code-block:: nim
   ##   var chunks: seq[seq[byte]]
@@ -92,12 +92,12 @@ template makeCopyOutCallback*(body: untyped): CopyOutCallback =
   block:
     when hasChronos:
       let r: CopyOutCallback = proc(
-          data {.inject.}: seq[byte]
+          data {.inject.}: sink seq[byte]
       ) {.async: (raises: [CatchableError]).} =
         body
       r
     else:
-      let r: CopyOutCallback = proc(data {.inject.}: seq[byte]) {.async.} =
+      let r: CopyOutCallback = proc(data {.inject.}: sink seq[byte]) {.async.} =
         body
       r
 
