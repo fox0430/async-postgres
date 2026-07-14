@@ -558,7 +558,7 @@ proc copyOutStreamImpl*(
         # Misuse error pending; don't feed a doomed callback.
         continue
       try:
-        await callback(pumpMsg.copyData)
+        await callback(move(pumpMsg.copyData))
       except CancelledError as e:
         # Cancellation tears the operation down; do not run the recovery
         # drain (more I/O on a future being unwound). The COPY OUT is left
