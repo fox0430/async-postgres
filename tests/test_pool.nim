@@ -2861,46 +2861,6 @@ suite "Pool replenish close-race":
 
     waitFor t()
 
-  when hasAsyncDispatch:
-    # chronos's wait() truly cancels the abandoned connect, so this leak — and
-    # the closeLateConnect guard against it — is asyncdispatch-only.
-    test "an abandoned replenish connect that succeeds late is closed":
-      # Regression: asyncdispatch's wait() cannot cancel an in-flight connect,
-      # so a replenish connect that times out but then succeeds would leak its
-      # socket. The except branch arms closeLateConnect on the abandoned future;
-      # the late connection must be torn down, not leaked.
-      proc t() {.async.} =
-        let ms = startMockServer()
-        proc serverHandler() {.async.} =
-          let st = await acceptAndReady(ms)
-          await sleepAsync(milliseconds(120))
-          await closeClient(st)
-
-        let serverFut = serverHandler()
-
-        let pool = makePool()
-        # Stand in for the post-timeout state: the outer wait() has already
-        # raised, so the future is abandoned and the orphan-closer is armed,
-        # exactly as the maintenance loop's except branch does.
-        let connectFut = connect(mockConfig(ms.port))
-        let onOrphan = pool.closeLateConnect()
-        connectFut.addCallback(
-          proc() =
-            onOrphan(connectFut)
-        )
-
-        # The handshake finishes in the background; the completion callback then
-        # closes the orphan.
-        await sleepAsync(milliseconds(80))
-        doAssert connectFut.completed()
-        let orphan = connectFut.read()
-        doAssert orphan.state == csClosed # closed by the callback, not leaked
-
-        await serverFut
-        await closeServer(ms)
-
-      waitFor t()
-
 suite "Pool acquire close-race":
   test "acquire discards a connection won after the pool is closed":
     # Regression: acquireImpl's `await connect()` in the new-conn branch could

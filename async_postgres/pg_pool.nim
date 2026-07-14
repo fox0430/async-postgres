@@ -472,29 +472,6 @@ proc spawnConnectForWaiter(pool: PgPool) =
   pool.pendingBackgroundTasks.add(fut)
   asyncSpawn fut
 
-proc closeLateConnect(pool: PgPool): proc(fut: Future[PgConnection]) {.gcsafe.} =
-  ## Return an ``onOrphan`` callback for ``wait()`` that closes a live
-  ## connection the orphan future produces. Under asyncdispatch the inner
-  ## future keeps running after ``wait()`` times out and may yield a
-  ## connection nobody is awaiting; this callback closes it to prevent
-  ## leaking a socket and a server-side backend slot.
-  ## Under chronos ``wait()`` cancels the inner future so ``onOrphan`` is
-  ## never called — no-op.
-  when hasAsyncDispatch:
-    result = proc(fut: Future[PgConnection]) {.gcsafe.} =
-      if fut.completed():
-        asyncSpawn (
-          proc() {.async.} =
-            try:
-              let orphan = fut.read()
-              if orphan != nil:
-                await pool.tracedClose(orphan)
-            except CatchableError:
-              discard
-        )()
-  else:
-    result = nil
-
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
     await sleepAsync(pool.config.maintenanceInterval)
@@ -540,53 +517,48 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     if pool.consecutiveConnectFailures > 0 and Moment.now() < pool.nextConnectRetryAt:
       continue
 
-    # Replenish to minSize (best-effort)
+    # Replenish to minSize (best-effort). Open all needed connections
+    # concurrently via `allFutures` so they complete in the time of the
+    # slowest one rather than sequentially. A failure in one connect does
+    # not prevent the others from completing.
     let currentTotal = pool.idle.len + pool.active
     let needed = max(0, pool.config.minSize - currentTotal)
-    # Use connectTimeout if set, otherwise cap at maintenanceInterval to avoid blocking
-    let replenishTimeout =
-      if pool.config.connConfig.connectTimeout > ZeroDuration:
-        pool.config.connConfig.connectTimeout
-      else:
-        pool.config.maintenanceInterval
-    for i in 0 ..< needed:
+    if needed > 0:
       if pool.closed:
         break
-      let connectFut = connect(pool.config.connConfig)
-      try:
-        let conn =
-          await connectFut.wait(replenishTimeout, onOrphan = pool.closeLateConnect())
-        conn.ownerPool = pool
-        pool.metrics.createCount.inc
-        pool.consecutiveConnectFailures = 0
-        # The pool may have been closed while we awaited connect (and on
-        # chronos this loop can be cancelled then resumed from an
-        # already-completed connect). Parking a fresh conn in a closed pool's
-        # idle deque — or handing it to a waiter close() has already failed —
-        # leaks its socket, so re-check first, mirroring spawnConnectForWaiter.
-        # closeNoWait (not `await tracedClose`) because a pending cancellation
-        # would interrupt a fresh await before the close runs.
-        if pool.closed:
-          pool.closeNoWait(conn)
-          break
-        # FIFO fairness: if a waiter is already queued, hand the freshly
-        # opened connection to them directly rather than parking it in
-        # idle (which would let a later acquire jump the queue).
-        if pool.tryHandoffToWaiter(conn):
-          pool.active.inc
-        else:
-          pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
-      except CatchableError:
-        # onOrphan (closeLateConnect) handles the orphan connection on timeout;
-        # here we just update failure tracking and backoff.
-        pool.consecutiveConnectFailures.inc
+      var connectFuts: seq[Future[PgConnection]]
+      for i in 0 ..< needed:
+        var connCfg = pool.config.connConfig
+        if connCfg.connectTimeout == ZeroDuration:
+          connCfg.connectTimeout = pool.config.maintenanceInterval
+        connectFuts.add(connect(connCfg))
+      await allFutures(connectFuts)
+      for f in connectFuts:
+        if not f.failed():
+          let conn = f.read()
+          conn.ownerPool = pool
+          pool.metrics.createCount.inc
+          pool.consecutiveConnectFailures = 0
+          # The pool may have been closed while we awaited connect. Parking a
+          # fresh conn in a closed pool leaks its socket — re-check and close.
+          # closeNoWait (not `await tracedClose`) because a pending cancellation
+          # would interrupt a fresh await before the close runs.
+          if pool.closed:
+            pool.closeNoWait(conn)
+          elif pool.tryHandoffToWaiter(conn):
+            pool.active.inc
+          else:
+            pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
+      for f in connectFuts:
+        if f.failed():
+          pool.consecutiveConnectFailures.inc
+      if pool.consecutiveConnectFailures > 0:
         let delay = computeConnectBackoff(
           pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
           pool.consecutiveConnectFailures,
         )
         if delay > ZeroDuration:
           pool.nextConnectRetryAt = Moment.now() + delay
-        break # best-effort, retry next interval (or after backoff)
 
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   ## Create a new connection pool and establish `minSize` initial connections.
