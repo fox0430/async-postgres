@@ -104,6 +104,13 @@ proc saslprep*(input: string): string =
     copyMem(addr result[0], unsafeAddr input[0], input.len)
     return
 
+  # On invalid UTF-8, PG server and libpq both fall back to the raw input;
+  # match them so the client verifier stays in sync.
+  if validateUtf8(input) != -1:
+    result = newString(input.len)
+    copyMem(addr result[0], unsafeAddr input[0], input.len)
+    return
+
   # Step 1: map (C.1.2 -> U+0020 takes precedence over B.1 -> delete).
   # U+200B is the only code point in both tables; PostgreSQL maps it to
   # space, so non-ASCII space is checked first.
