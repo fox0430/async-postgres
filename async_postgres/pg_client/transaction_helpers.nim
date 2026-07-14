@@ -17,6 +17,7 @@ proc queryInTransactionImpl(
     resultFormats: seq[int16],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
+  conn.checkTxIdle()
   conn.state = csBusy
 
   let formats =

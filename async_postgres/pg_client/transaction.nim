@@ -324,6 +324,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     try:
       discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
       `body`
@@ -399,6 +400,7 @@ macro withTransactionRetry*(
   let loop = buildRetryTxLoop(connSym, retryOptsSym, beginSql, txTimeout, body)
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     let `retryOptsSym` = `retryOpts`
     `loop`
 
@@ -595,6 +597,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     proc `bodyFnSym`(): Future[void] {.async.} =
@@ -696,6 +699,7 @@ macro withTransactionRetryDeadline*(
   )
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     let `retryOptsSym` = `retryOpts`
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
