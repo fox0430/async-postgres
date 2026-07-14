@@ -502,14 +502,9 @@ proc getJson*(row: Row, col: int): JsonNode =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     var jsonStr: string
     if row.colTypeOid(col) == OidJsonb and clen > 0 and row.data.buf[off] == 1:
-      # jsonb binary: skip version byte
-      jsonStr = newString(clen - 1)
-      for i in 1 ..< clen:
-        jsonStr[i - 1] = char(row.data.buf[off + i])
+      jsonStr = readString(row.data.buf, off + 1, clen - 1)
     else:
-      jsonStr = newString(clen)
-      for i in 0 ..< clen:
-        jsonStr[i] = char(row.data.buf[off + i])
+      jsonStr = readString(row.data.buf, off, clen)
     try:
       return parseJson(jsonStr)
     except JsonParsingError:
@@ -643,9 +638,7 @@ proc getXml*(row: Row, col: int): PgXml =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    var s = newString(clen)
-    for i in 0 ..< clen:
-      s[i] = char(row.data.buf[off + i])
+    let s = readString(row.data.buf, off, clen)
     return PgXml(s)
   PgXml(row.getStr(col))
 
@@ -1290,13 +1283,9 @@ proc jsonElemFromBinary(
 ): JsonNode =
   var jsonStr: string
   if elemOid == OidJsonb and elen > 0 and buf[off] == 1:
-    jsonStr = newString(elen - 1)
-    for j in 1 ..< elen:
-      jsonStr[j - 1] = char(buf[off + j])
+    jsonStr = readString(buf, off + 1, elen - 1)
   else:
-    jsonStr = newString(elen)
-    for j in 0 ..< elen:
-      jsonStr[j] = char(buf[off + j])
+    jsonStr = readString(buf, off, elen)
   try:
     parseJson(jsonStr)
   except JsonParsingError:
