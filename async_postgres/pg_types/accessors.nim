@@ -14,7 +14,14 @@ proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
 
 template bufView*(row: Row, off, clen: int): openArray[char] =
   ## Zero-copy char view into row.data.buf for parseutils.
-  cast[ptr UncheckedArray[char]](addr row.data.buf[off]).toOpenArray(0, clen - 1)
+  ## clen <= 0 skips `addr buf[off]`: a trailing empty cell has off == buf.len,
+  ## which would otherwise raise an uncatchable IndexDefect.
+  (
+    if clen > 0:
+      cast[ptr UncheckedArray[char]](addr row.data.buf[off]).toOpenArray(0, clen - 1)
+    else:
+      cast[ptr UncheckedArray[char]](nil).toOpenArray(0, -1)
+  )
 
 proc len*(row: Row): int {.inline.} =
   ## Return the number of columns in this row.

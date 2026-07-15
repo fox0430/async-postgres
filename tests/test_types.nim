@@ -423,6 +423,21 @@ suite "Row accessors":
     let row = @[some(toBytes("3.14"))]
     check abs(row.getFloat(0) - 3.14) < 1e-10
 
+  test "trailing empty text cell raises PgTypeError not IndexDefect":
+    # A trailing empty cell has off == buf.len; bufView must not `addr buf[off]`
+    # (Defect would escape `except PgError`).
+    let row = @[some(toBytes("hello")), some(newSeq[byte](0))]
+    expect PgTypeError:
+      discard row.getInt(1)
+    expect PgTypeError:
+      discard row.getInt16(1)
+    expect PgTypeError:
+      discard row.getInt64(1)
+    expect PgTypeError:
+      discard row.getFloat(1)
+    expect PgTypeError:
+      discard row.getFloat32(1)
+
   test "getBool true variants":
     check @[some(toBytes("t"))].getBool(0) == true
     check @[some(toBytes("true"))].getBool(0) == true
