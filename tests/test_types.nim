@@ -507,6 +507,21 @@ suite "getTimestamp accessor":
     check dt.year == 2024
     check dt.hour == 10
 
+  test "timestamp with trimmed fractional seconds":
+    # PG trims trailing zeros: .500000 -> .5, .123000 -> .123, .100 -> .1
+    let cases = {
+      "2024-01-15 10:30:00.5": 500_000_000,
+      "2024-01-15 10:30:00.12": 120_000_000,
+      "2024-01-15 10:30:00.123": 123_000_000,
+      "2024-01-15 10:30:00.1234": 123_400_000,
+      "2024-01-15 10:30:00.12345": 123_450_000,
+      "2024-01-15 10:30:00.123456": 123_456_000,
+    }
+    for (s, ns) in cases:
+      let dt = @[some(toBytes(s))].getTimestamp(0)
+      check dt.year == 2024
+      check dt.nanosecond == ns
+
   test "invalid timestamp raises":
     let row = @[some(toBytes("not-a-timestamp"))]
     var raised = false
@@ -870,6 +885,17 @@ suite "getTimestampTz accessor":
     # The parsed DateTime is converted to local timezone by Nim's parse(),
     # so we compare using UTC.
     check dt.utc().hour == 14
+
+  test "timestamptz with trimmed fractional seconds":
+    let cases = {
+      "2024-01-15 10:30:00.5+00": 500_000_000,
+      "2024-01-15 10:30:00.123+00:00": 123_000_000,
+      "2024-01-15 10:30:00.1234+05:30": 123_400_000,
+    }
+    for (s, ns) in cases:
+      let dt = @[some(toBytes(s))].getTimestampTz(0)
+      check dt.year == 2024
+      check dt.nanosecond == ns
 
   test "invalid timestamptz raises":
     let row = @[some(toBytes("not-a-timestamp"))]
@@ -6453,6 +6479,20 @@ suite "Temporal array types":
     check arr.len == 2
     check arr[0].year == 2023
     check arr[1].month == mJun
+
+  test "getTimestampArray text format with trimmed fractional seconds":
+    let row: Row = @[
+      some(
+        toBytes(
+          "{\"2023-01-15 10:30:00.5\",\"2024-06-20 14:45:30.123\",\"2025-03-10 08:00:00.123456\"}"
+        )
+      )
+    ]
+    let arr = row.getTimestampArray(0)
+    check arr.len == 3
+    check arr[0].nanosecond == 500_000_000
+    check arr[1].nanosecond == 123_000_000
+    check arr[2].nanosecond == 123_456_000
 
   test "getTimestampArrayOpt none":
     let fields = @[mkField(OidTimestampArray, 1'i16)]
