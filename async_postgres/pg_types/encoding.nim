@@ -63,7 +63,7 @@ proc toPgParamInline*(v: string): PgParamInline =
 
 proc toPgParamInline*(v: seq[byte]): PgParamInline =
   result.oid = OidBytea
-  result.format = 0
+  result.format = 1
   if v.len > maxInt32Len:
     raise newException(
       ValueError,
@@ -132,7 +132,7 @@ proc toPgParam*(v: bool): PgParam =
   PgParam(oid: OidBool, format: 1, value: some(@[if v: 1'u8 else: 0'u8]))
 
 proc toPgParam*(v: seq[byte]): PgParam =
-  PgParam(oid: OidBytea, format: 0, value: some(v))
+  PgParam(oid: OidBytea, format: 1, value: some(v))
 
 proc toPgParam*(v: DateTime): PgParam =
   let s = v.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
