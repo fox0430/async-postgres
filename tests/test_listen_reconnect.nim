@@ -178,6 +178,46 @@ suite "reconnectInPlace host/port failover":
     check finalHostIsLoopback
     check finalPort == portB
 
+suite "reconnectInPlace TLS field pairing":
+  test "serverCertDer is copied from the fresh connection":
+    ## Regression: `reconnectInPlace` must overwrite `serverCertDer` from the fresh
+    ## connection. Pre-fix the stale DER survived the swap, so any post-reconnect
+    ## reader (SCRAM channel binding — since #470 the tls-server-end-point hash is
+    ## picked from the cert's own signatureAlgorithm) saw a cert that no longer
+    ## matched the live transport.
+    var preCertLen = -1
+    var finalCertLen = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        sc2 = await acceptAndReady(ms)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      # Non-TLS mock leaves serverCertDer empty; seeding it distinguishes copy
+      # from no-op.
+      conn.serverCertDer = @[byte 0xDE, 0xAD, 0xBE, 0xEF]
+      preCertLen = conn.serverCertDer.len
+
+      await conn.reconnectInPlace()
+      finalCertLen = conn.serverCertDer.len
+
+      await serverFut
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await closeClient(sc1)
+      await closeClient(sc2)
+      await closeServer(ms)
+
+    waitFor testBody()
+    check preCertLen == 4
+    check finalCertLen == 0
+
 ## Regression: `stopListening` must not hang when it races a successful in-place
 ## reconnect by the listen pump.
 ##

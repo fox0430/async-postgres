@@ -69,10 +69,12 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
     conn.writer = newConn.writer
     conn.tlsStream = newConn.tlsStream
     conn.trustAnchorBufs = newConn.trustAnchorBufs
+    conn.x509Capture = newConn.x509Capture
   elif hasAsyncDispatch:
     conn.socket = newConn.socket
 
   conn.sslEnabled = newConn.sslEnabled
+  conn.serverCertDer = newConn.serverCertDer
   conn.recvBuf = newConn.recvBuf
   conn.recvBufStart = newConn.recvBufStart
   conn.host = newConn.host
