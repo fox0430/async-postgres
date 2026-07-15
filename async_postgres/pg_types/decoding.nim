@@ -368,9 +368,11 @@ proc parseTimestampText*(s: string): DateTime =
     "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
     "yyyy-MM-dd HH:mm:ss",
   ]
+  # Fallback zone is utc() so zoneless input decodes to the same absolute instant
+  # as decodeBinaryTimestamp. Formats carrying zzz/zz still use their own zone.
   for fmt in formats:
     try:
-      return parse(norm, fmt)
+      return parse(norm, fmt, utc())
     except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp: " & s)

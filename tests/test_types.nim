@@ -522,6 +522,17 @@ suite "getTimestamp accessor":
       check dt.year == 2024
       check dt.nanosecond == ns
 
+  test "zoneless text decodes as UTC (symmetric with binary)":
+    # The wall-clock fields are stored verbatim; the zone label is utc() so the
+    # resulting absolute instant matches decodeBinaryTimestamp for the same PG
+    # value regardless of the host's local zone.
+    let dt = @[some(toBytes("2024-01-15 10:30:00.123456"))].getTimestamp(0)
+    check dt.timezone == utc()
+    check dt == dateTime(2024, mJan, 15, 10, 30, 0, 123_456_000, utc())
+    let dt2 = @[some(toBytes("2024-01-15 10:30:00"))].getTimestamp(0)
+    check dt2.timezone == utc()
+    check dt2 == dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+
   test "invalid timestamp raises":
     let row = @[some(toBytes("not-a-timestamp"))]
     var raised = false
@@ -896,6 +907,13 @@ suite "getTimestampTz accessor":
       let dt = @[some(toBytes(s))].getTimestampTz(0)
       check dt.year == 2024
       check dt.nanosecond == ns
+
+  test "zoneless text fallback decodes as UTC":
+    # Defensive: PG timestamptz text always carries a zone, but if the fallback
+    # zoneless format matches, the label must be utc() rather than the host's
+    # local zone (see getTimestamp symmetry test).
+    let dt = @[some(toBytes("2024-01-15 10:30:00"))].getTimestampTz(0)
+    check dt.timezone == utc()
 
   test "invalid timestamptz raises":
     let row = @[some(toBytes("not-a-timestamp"))]
@@ -6495,6 +6513,12 @@ suite "Temporal array types":
     check arr[0].nanosecond == 500_000_000
     check arr[1].nanosecond == 123_000_000
     check arr[2].nanosecond == 123_456_000
+
+  test "getTimestampArray text elements decode as UTC":
+    let row: Row = @[some(toBytes("{\"2023-01-15 10:30:00\",\"2024-06-20 14:45:30\"}"))]
+    let arr = row.getTimestampArray(0)
+    check arr[0].timezone == utc()
+    check arr[1].timezone == utc()
 
   test "getTimestampArrayOpt none":
     let fields = @[mkField(OidTimestampArray, 1'i16)]
