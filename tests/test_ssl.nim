@@ -127,6 +127,27 @@ suite "SslMode and ConnConfig defaults":
   test "sslDisable is ordinal 0":
     check ord(sslDisable) == 0
 
+suite "sniName":
+  test "returns host for DNS name when sslSni is true":
+    check sniName("db.example.com", true) == "db.example.com"
+
+  test "empty when sslSni is false":
+    check sniName("db.example.com", false) == ""
+
+  test "empty for empty host (hostaddr-only)":
+    check sniName("", true) == ""
+
+  test "empty for IPv4 literal (RFC 6066)":
+    check sniName("127.0.0.1", true) == ""
+    check sniName("10.0.0.1", true) == ""
+
+  test "empty for IPv6 literal (RFC 6066)":
+    check sniName("::1", true) == ""
+    check sniName("2001:db8::1", true) == ""
+
+  test "returns hostname that only looks numeric":
+    check sniName("db1.example.com", true) == "db1.example.com"
+
 suite "SSL negotiation - server rejects SSL":
   test "sslRequire raises PgError when server responds N":
     var raised = false

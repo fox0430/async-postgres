@@ -384,6 +384,19 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")
 
+  test "sslsni defaults to true (libpq parity)":
+    check parseDsn("postgresql://host/db").sslSni == true
+
+  test "sslsni=0 disables SNI":
+    check parseDsn("postgresql://host/db?sslsni=0").sslSni == false
+
+  test "sslsni=1 enables SNI":
+    check parseDsn("postgresql://host/db?sslsni=1").sslSni == true
+
+  test "error: invalid sslsni":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslsni=bogus")
+
   test "multi-host DSN":
     let cfg = parseDsn("postgresql://h1:5432,h2:5433/db")
     check cfg.hosts.len == 2
@@ -816,6 +829,16 @@ suite "parseDsn keyword=value":
   test "error: invalid sslmode":
     expect PgError:
       discard parseDsn("host=h sslmode=bogus")
+
+  test "sslsni defaults to true (libpq parity)":
+    check parseDsn("host=h dbname=d").sslSni == true
+
+  test "sslsni=0 disables SNI":
+    check parseDsn("host=h dbname=d sslsni=0").sslSni == false
+
+  test "error: invalid sslsni":
+    expect PgError:
+      discard parseDsn("host=h sslsni=bogus")
 
   test "channel_binding parameter":
     let cfg = parseDsn("host=h channel_binding=require")

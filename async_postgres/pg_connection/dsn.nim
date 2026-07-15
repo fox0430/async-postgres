@@ -198,6 +198,11 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       result.sslRootCert = readFile(val)
     except IOError:
       raise newException(PgError, "Cannot read sslrootcert file: " & val)
+  of "sslsni":
+    try:
+      result.sslSni = parseInt(val) != 0
+    except ValueError:
+      raise newException(PgError, "Invalid sslsni: " & val)
   of "keepalives":
     try:
       result.keepAlive = parseInt(val) != 0
@@ -257,6 +262,7 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
   ## multi-host failover (libpq compatible): ``host=h1,h2 port=5433,5434``.
   result.keepAlive = true
   result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
+  result.sslSni = true # libpq default
 
   # Tokenize into (key, value) pairs
   var pairs: seq[(string, string)]
@@ -341,6 +347,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL URI connection string into a ConnConfig.
   result.keepAlive = true
   result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
+  result.sslSni = true # libpq default
   let scheme =
     if dsn.startsWith("postgresql://"):
       "postgresql"
@@ -470,6 +477,7 @@ proc initConnConfig*(
     database = "",
     sslMode = sslPrefer,
     sslRootCert = "",
+    sslSni = true,
     channelBinding = cbPrefer,
     applicationName = "",
     connectTimeout = ZeroDuration,
@@ -496,6 +504,7 @@ proc initConnConfig*(
     database: database,
     sslMode: sslMode,
     sslRootCert: sslRootCert,
+    sslSni: sslSni,
     channelBinding: channelBinding,
     applicationName: applicationName,
     connectTimeout: connectTimeout,

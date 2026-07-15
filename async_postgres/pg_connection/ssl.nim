@@ -12,6 +12,7 @@
 ##
 ## Re-exported through `pg_connection.nim`.
 
+import std/net
 import ../[async_backend, pg_errors, pg_protocol]
 import types, buffer_io
 
@@ -21,7 +22,7 @@ when hasChronos:
 elif hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
-    import std/[dynlib, net, openssl, tempfiles, os]
+    import std/[dynlib, openssl, tempfiles, os]
 
 when hasAsyncDispatch and defined(ssl):
   # On asyncdispatch `conn.socket` is an `AsyncSocket`, so `wrapConnectedSocket`
@@ -114,6 +115,19 @@ when hasAsyncDispatch and defined(ssl):
           host,
       )
 
+proc sniName*(sslHost: string, sslSni: bool): string =
+  ## Value for the TLS SNI extension. Empty means "do not send SNI".
+  ## Matches libpq: SNI is on by default and suppressed for IP literals
+  ## (RFC 6066 §3 forbids IPs in server_name) and when the host name is
+  ## unknown (hostaddr-only).
+  if not sslSni:
+    return ""
+  if sslHost.len == 0:
+    return ""
+  if isIpAddress(sslHost):
+    return ""
+  sslHost
+
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
   ## Send SSLRequest and negotiate TLS if server accepts.
   ## `sslHost` is the host *name* the server certificate is verified against
@@ -189,7 +203,14 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         else:
           {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
 
-      let serverName = if config.sslMode == sslVerifyFull: sslHost else: ""
+      # BearSSL's `serverName` doubles as SNI wire value and X509 name check
+      # input. Under verify-full it must be `sslHost` for BearSSL to verify;
+      # other modes honor sslSni and RFC 6066 IP-literal suppression.
+      let serverName =
+        if config.sslMode == sslVerifyFull:
+          sslHost
+        else:
+          sniName(sslHost, config.sslSni)
 
       if config.sslMode in {sslVerifyCa, sslVerifyFull}:
         let parsed = parseTrustAnchors(config.sslRootCert)
@@ -239,7 +260,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
           ctx = newContext(verifyMode = CVerifyNone)
 
         try:
-          let hostname = if config.sslMode == sslVerifyFull: sslHost else: ""
+          let hostname = sniName(sslHost, config.sslSni)
           wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
           # asyncnet does no name matching and defers the handshake, so have
           # OpenSSL enforce the hostname/IP match itself during that handshake.

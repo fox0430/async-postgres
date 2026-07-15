@@ -116,6 +116,13 @@ type
       ## to `sslPrefer` (libpq parity); a raw zero-initialized `ConnConfig` has
       ## `sslDisable`.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    sslSni*: bool
+      ## Send TLS SNI extension during the handshake (libpq `sslsni`, default
+      ## true). Applies to every mode that establishes TLS. Suppressed
+      ## automatically when the host is an IP literal (RFC 6066 §3) or empty
+      ## (hostaddr-only). Set false only for backends that reject or misroute
+      ## on SNI (a raw zero-initialized `ConnConfig` therefore has SNI off —
+      ## use `parseDsn` or `initConnConfig` for the libpq-parity default).
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
