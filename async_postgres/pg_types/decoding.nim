@@ -352,6 +352,17 @@ proc parseTimestampText*(s: string): DateTime =
     raise newException(
       PgTypeError, "Timestamp is '" & s & "', not representable as a DateTime"
     )
+  # PG trims trailing zeros in text output ('.500000' -> '.5'), but Nim's
+  # 'ffffff' requires exactly 6 digits. Right-pad short fractions before parse.
+  var norm = s
+  let dot = s.find('.')
+  if dot >= 0:
+    var e = dot + 1
+    while e < s.len and s[e] in {'0' .. '9'}:
+      inc e
+    let fracLen = e - dot - 1
+    if fracLen in 1 .. 5:
+      norm = s[0 ..< e] & repeat('0', 6 - fracLen) & s[e .. ^1]
   const formats = [
     "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
     "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
@@ -359,7 +370,7 @@ proc parseTimestampText*(s: string): DateTime =
   ]
   for fmt in formats:
     try:
-      return parse(s, fmt)
+      return parse(norm, fmt)
     except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp: " & s)
