@@ -230,6 +230,32 @@ suite "toPgParam":
     let s = toString(p.value.get)
     check s.startsWith("2024-01-15 10:30:00")
 
+  test "DateTime with non-UTC zone encodes the UTC instant":
+    # Regression: text OidTimestamp used to serialize the DateTime's local wall
+    # clock, so a zoned value stored a different absolute time than the binary
+    # encoder produced from the same DateTime. utcOffset counts seconds WEST of
+    # UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let p = toPgParam(dt)
+    check p.oid == OidTimestamp
+    check toString(p.value.get) == "2026-07-15 12:00:00.000000"
+    # Binary path already encodes the absolute instant; both should agree now.
+    let bin = toPgBinaryParam(dt)
+    check bin.oid == OidTimestamp
+    check bin.format == 1
+
   test "PgUuid":
     let uuid = PgUuid("550e8400-e29b-41d4-a716-446655440000")
     let p = toPgParam(uuid)
