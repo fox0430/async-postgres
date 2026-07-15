@@ -236,6 +236,30 @@ suite "E2E: Transaction":
 
     )
 
+  test "pool.withTransactionRetry does not leak a connection when retryOpts raises":
+    proc raisingRetryOpts(): RetryOptions =
+      raise newException(ValueError, "compute retryOpts failed")
+
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 0, maxSize: 1))
+
+      var raised = false
+      try:
+        pool.withTransactionRetry(raisingRetryOpts(), conn):
+          discard await conn.exec("SELECT 1")
+      except ValueError:
+        raised = true
+
+      doAssert raised
+      doAssert pool.activeCount == 0
+      # A leaked slot would starve this acquire on a maxSize=1 pool.
+      let c = await pool.acquire()
+      c.release()
+      await pool.close()
+
+    waitFor t()
+
   test "cluster.withTransactionRetry retries on serialization failure then commits":
     proc t() {.async.} =
       # Point both primary and replica at the local server. Set tsaReadWrite
@@ -287,6 +311,33 @@ suite "E2E: Transaction":
             return
 
     )
+
+  test "cluster.withTransactionRetry does not leak a connection when retryOpts raises":
+    proc raisingRetryOpts(): RetryOptions =
+      raise newException(ValueError, "compute retryOpts failed")
+
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.targetSessionAttrs = tsaReadWrite
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 0, maxSize: 1),
+        PoolConfig(connConfig: cfg, minSize: 0, maxSize: 1),
+      )
+
+      var raised = false
+      try:
+        cluster.withTransactionRetry(raisingRetryOpts(), conn):
+          discard await conn.exec("SELECT 1")
+      except ValueError:
+        raised = true
+
+      doAssert raised
+      doAssert cluster.primaryPool.activeCount == 0
+      let c = await cluster.primaryPool.acquire()
+      c.release()
+      await cluster.close()
+
+    waitFor t()
 
   test "pool.withTransaction commits on success":
     proc t() {.async.} =

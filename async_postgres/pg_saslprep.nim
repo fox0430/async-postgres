@@ -9,7 +9,7 @@
 ## rejects them; the A.1 table is large and the practical impact is low
 ## (such a password could not have been set via `CREATE ROLE` either).
 
-import std/[strutils, unicode]
+import std/unicode
 
 import pkg/nimcrypto/utils as ncutils
 import pkg/normalize
