@@ -278,6 +278,8 @@ proc loWriteAll*(
   ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
   ## reach `N × timeout` for N chunks. Use `loWriteAllDeadline` for a single
   ## wall-clock deadline covering the whole write.
+  if chunkSize <= 0:
+    raise newException(ValueError, "loWriteAll: chunkSize must be positive")
   var offset = 0
   while offset < data.len:
     let endIdx = min(offset + chunkSize, data.len)
@@ -411,6 +413,8 @@ proc loWriteAllDeadline*(
 ): Future[void] {.async.} =
   ## Like `loWriteAll` but `deadline` bounds total wall-clock across all chunks.
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  if chunkSize <= 0:
+    raise newException(ValueError, "loWriteAllDeadline: chunkSize must be positive")
   let deadlineMoment = Moment.now() + deadline
   var offset = 0
   while offset < data.len:

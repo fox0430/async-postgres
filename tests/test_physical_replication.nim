@@ -161,6 +161,74 @@ suite "Physical replication: streaming and drain":
     check capturedFinalState == csReady # drain returned us to csReady
     check capturedReceivedKinds == @[rmkXLogData]
 
+  test "server-initiated CopyDone flushes the latest confirmFlushed position":
+    # Regression: a walsender-timeout / pg_terminate_backend / slot drop makes
+    # the server send CopyDone first. Without the pre-CopyDone Standby Status
+    # Update, the last confirmFlushed advance is lost and the primary re-streams
+    # already-processed WAL on reconnect.
+    var frontendReplies: seq[tuple[msgType: char, receive, flush, apply: int64]]
+    capturedReceivedKinds.setLen(0)
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION query
+        var burst: seq[byte]
+        burst.add(buildCopyBothResponse())
+        # XLogData carrying a small chunk so the client observes a receive LSN.
+        # startLsn = 0x1000, data 4 bytes -> receivedEndLsn = 0x1004.
+        burst.add(buildXLogData(0x1000'i64, 0x2000'i64, 0, @[1'u8, 2, 3, 4]))
+        # Server initiates the shutdown before any keepalive-with-reply arrives.
+        burst.add(buildCopyDone())
+        burst.add(buildCommandComplete("START_STREAMING"))
+        burst.add(buildReadyForQuery('I'))
+        await sendBytes(st, burst)
+        # Client must send a Standby Status Update first (the new flush), then
+        # its own CopyDone reply.
+        while true:
+          let reply = await drainFrontendMessage(st)
+          if reply.msgType == 'd':
+            let ssu = decodeStandbyStatus(reply.body)
+            {.cast(gcsafe).}:
+              frontendReplies.add(
+                (msgType: 'd', receive: ssu.receive, flush: ssu.flush, apply: ssu.apply)
+              )
+          elif reply.msgType == 'c':
+            {.cast(gcsafe).}:
+              frontendReplies.add(
+                (msgType: 'c', receive: 0'i64, flush: 0'i64, apply: 0'i64)
+              )
+            break
+          else:
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          capturedReceivedKinds.add(msg.kind)
+          if msg.kind == rmkXLogData:
+            # Confirm receipt of the WAL we just got so the fix has something
+            # non-default to flush.
+            discard conn.confirmFlushed(Lsn(0x1004'u64))
+
+      await conn.startPhysicalReplication(startLsn = Lsn(0x1000'u64), callback = cb)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check capturedReceivedKinds == @[rmkXLogData]
+    # Expect: Standby Status Update carrying the confirmed flush, then CopyDone.
+    check frontendReplies.len == 2
+    check frontendReplies[0].msgType == 'd'
+    check frontendReplies[0].flush == 0x1004'i64
+    check frontendReplies[0].apply == 0x1004'i64
+    check frontendReplies[1].msgType == 'c'
+
   test "errors when START_REPLICATION returns ErrorResponse":
     capturedFinalState = csClosed
     capturedRaised = false

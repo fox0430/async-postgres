@@ -315,6 +315,22 @@ proc validatePlaceholderArity(
       sqlNode,
     )
 
+proc bindPositionalOnce(
+    positional: seq[NimNode]
+): tuple[bindings: NimNode, syms: seq[NimNode]] =
+  ## Emit ``let tmp = <arg>`` for each positional argument so downstream
+  ## fan-out (``paramOidOf`` in the invalidate call plus ``writeParamOid`` /
+  ## ``writeParamFormat`` / ``writeParamValue`` in the Bind/Parse macros)
+  ## substitutes the temporary, not the source expression. Without this a
+  ## side-effecting argument such as ``getNextId()`` would fire 3–4 times per
+  ## direct call.
+  result.bindings = newStmtList()
+  result.syms = newSeq[NimNode](positional.len)
+  for i, arg in positional:
+    let tmp = genSym(nskLet, "directArg" & $i)
+    result.syms[i] = tmp
+    result.bindings.add(newLetStmt(tmp, arg))
+
 proc extractTimeoutArg(
     args: NimNode
 ): tuple[positional: seq[NimNode], timeout: NimNode] =
@@ -377,8 +393,11 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     var `colFmtsSym`: seq[int16]
     var `colOidsSym`: seq[int32]
 
+  let (argBindings, argSyms) = bindPositionalOnce(positional)
+  result.add argBindings
+
   result.add buildInvalidateOnOidMismatchStmt(
-    connSym, sqlSym, cachedSym, cacheHitSym, positional
+    connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
 
   # Helper to build addBindDirect call with args
@@ -393,8 +412,8 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
       result.add(argList[i])
 
   let argList = newNimNode(nnkBracket)
-  for arg in positional:
-    argList.add(arg)
+  for sym in argSyms:
+    argList.add(sym)
 
   # Cache hit path
   let hitBlock = newStmtList()
@@ -553,8 +572,11 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     var `cacheMissSym` = false
     var `stmtNameSym` = ""
 
+  let (argBindings, argSyms) = bindPositionalOnce(positional)
+  result.add argBindings
+
   result.add buildInvalidateOnOidMismatchStmt(
-    connSym, sqlSym, cachedSym, cacheHitSym, positional
+    connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
 
   proc makeBindDirect(buf, portal, stmt: NimNode, argList: NimNode): NimNode =
@@ -569,8 +591,8 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
       result.add(argList[i])
 
   let argList = newNimNode(nnkBracket)
-  for arg in positional:
-    argList.add(arg)
+  for sym in argSyms:
+    argList.add(sym)
 
   let sendBufNode = newDotExpr(connSym, ident"sendBuf")
 

@@ -1069,6 +1069,13 @@ proc runReplicationStream(
             move(msg.copyData), autoKeepaliveReply, callback, lastStatusSent
           )
         of bmkCopyDone:
+          # Mirror stopReplication: flush the latest confirmed position before
+          # returning CopyDone, so a server-initiated stop (walsender timeout,
+          # pg_terminate_backend, slot drop) still delivers the final ACK.
+          try:
+            await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+          except CatchableError:
+            discard
           await conn.sendMsg(@copyDoneMsg)
           break recvLoop
         of bmkErrorResponse:

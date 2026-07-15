@@ -206,7 +206,9 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
     raise newException(PgTypeError, "Invalid composite literal: " & s)
   let inner = s[1 ..^ 2]
   if inner.len == 0:
-    return @[]
+    # PostgreSQL emits `()` for a 1-field composite whose sole field is NULL;
+    # a 0-field composite is not representable, so treat empty as one NULL.
+    return @[none(string)]
   var i = 0
   while i < inner.len:
     if inner[i] == ',':

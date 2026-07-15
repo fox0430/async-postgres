@@ -3902,9 +3902,11 @@ suite "Composite text parser":
     check parts[0] == some("")
     check parts[1] == some("42")
 
-  test "parseCompositeText empty":
+  test "parseCompositeText () is one NULL field":
+    # PostgreSQL emits `()` for a 1-field composite whose sole field is NULL.
     let parts = parseCompositeText("()")
-    check parts.len == 0
+    check parts.len == 1
+    check parts[0] == none(string)
 
   test "parseCompositeText single NULL":
     let parts = parseCompositeText("(,)")
