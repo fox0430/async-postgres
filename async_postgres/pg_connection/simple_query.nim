@@ -225,6 +225,43 @@ proc invalidateOnTimeout*(conn: PgConnection, reason: string) =
   conn.state = csClosed
   raise newException(PgTimeoutError, reason)
 
+template awaitOrInvalidate*(
+    connExpr: PgConnection,
+    dest: untyped,
+    fut: untyped,
+    timeout: Duration,
+    reason: static string,
+) =
+  ## Await `fut` with optional `timeout`, assigning the result to `dest`.
+  ## On timeout, invalidates `connExpr` via `invalidateOnTimeout` (marks
+  ## csClosed, dispatches CancelRequest, raises PgTimeoutError).
+  ##
+  ## Consolidates the repeated `if timeout > ZeroDuration / try / except
+  ## AsyncTimeoutError / else` pattern so a single-site omission cannot leave
+  ## the connection poisoned for the next borrower — see the
+  ## `invalidateOnTimeout` doc-comment for why in-flight timeouts must always
+  ## retire the connection under asyncdispatch.
+  if timeout > ZeroDuration:
+    try:
+      dest = await fut.wait(timeout)
+    except AsyncTimeoutError:
+      connExpr.invalidateOnTimeout(reason)
+  else:
+    dest = await fut
+
+template awaitVoidOrInvalidate*(
+    connExpr: PgConnection, fut: untyped, timeout: Duration, reason: static string
+) =
+  ## Void-returning variant of `awaitOrInvalidate` for `Future[void]` sites
+  ## (e.g. `close` on a prepared statement or cursor).
+  if timeout > ZeroDuration:
+    try:
+      await fut.wait(timeout)
+    except AsyncTimeoutError:
+      connExpr.invalidateOnTimeout(reason)
+  else:
+    await fut
+
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
@@ -253,13 +290,9 @@ proc simpleExec*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await simpleExecImpl(conn, sql).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("simpleExec timed out")
-    else:
-      tag = await simpleExecImpl(conn, sql)
+    awaitOrInvalidate(
+      conn, tag, simpleExecImpl(conn, sql), timeout, "simpleExec timed out"
+    )
   return initCommandResult(tag)
 
 proc simpleQuery*(
@@ -292,13 +325,9 @@ proc simpleQuery*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: lastTag, rowCount: totalRows),
   ):
-    if timeout > ZeroDuration:
-      try:
-        results = await simpleQueryImpl(conn, sql).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("simpleQuery timed out")
-    else:
-      results = await simpleQueryImpl(conn, sql)
+    awaitOrInvalidate(
+      conn, results, simpleQueryImpl(conn, sql), timeout, "simpleQuery timed out"
+    )
 
     for r in results:
       totalRows += r.rowCount

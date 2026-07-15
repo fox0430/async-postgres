@@ -94,13 +94,7 @@ proc exec*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await execImpl(conn, sql, params).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("Exec timed out")
-    else:
-      tag = await execImpl(conn, sql, params)
+    awaitOrInvalidate(conn, tag, execImpl(conn, sql, params), timeout, "Exec timed out")
   return initCommandResult(tag)
 
 proc execInlineImpl*(
@@ -154,13 +148,13 @@ proc exec*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await execInlineImpl(conn, sql, data, ranges, oids, formats).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("Exec timed out")
-    else:
-      tag = await execInlineImpl(conn, sql, data, ranges, oids, formats)
+    awaitOrInvalidate(
+      conn,
+      tag,
+      execInlineImpl(conn, sql, data, ranges, oids, formats),
+      timeout,
+      "Exec timed out",
+    )
   return initCommandResult(tag)
 
 proc notify*(

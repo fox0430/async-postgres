@@ -70,13 +70,9 @@ proc prepare*(
     TracePrepareEndData,
     TracePrepareEndData(),
   ):
-    if timeout > ZeroDuration:
-      try:
-        stmt = await prepareImpl(conn, name, sql).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("Prepare timed out")
-    else:
-      stmt = await prepareImpl(conn, name, sql)
+    awaitOrInvalidate(
+      conn, stmt, prepareImpl(conn, name, sql), timeout, "Prepare timed out"
+    )
   return stmt
 
 proc executeImpl*(
@@ -159,13 +155,13 @@ proc execute*(
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
   ):
     let resultFormats = resultFormat.toFormatCodes()
-    if timeout > ZeroDuration:
-      try:
-        qr = await executeImpl(stmt, params, resultFormats).wait(timeout)
-      except AsyncTimeoutError:
-        stmt.conn.invalidateOnTimeout("Execute timed out")
-    else:
-      qr = await executeImpl(stmt, params, resultFormats)
+    awaitOrInvalidate(
+      stmt.conn,
+      qr,
+      executeImpl(stmt, params, resultFormats),
+      timeout,
+      "Execute timed out",
+    )
   return qr
 
 proc closeImpl*(stmt: PreparedStatement): Future[void] {.async.} =
@@ -191,10 +187,6 @@ proc close*(
 ): Future[void] {.async.} =
   ## Close a prepared statement.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if timeout > ZeroDuration:
-    try:
-      await closeImpl(stmt).wait(timeout)
-    except AsyncTimeoutError:
-      stmt.conn.invalidateOnTimeout("Statement close timed out")
-  else:
-    await closeImpl(stmt)
+  awaitVoidOrInvalidate(
+    stmt.conn, closeImpl(stmt), timeout, "Statement close timed out"
+  )

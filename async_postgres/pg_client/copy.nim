@@ -188,13 +188,9 @@ proc copyIn*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await copyInRawImpl(conn, sql, data).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY IN timed out")
-    else:
-      tag = await copyInRawImpl(conn, sql, data)
+    awaitOrInvalidate(
+      conn, tag, copyInRawImpl(conn, sql, data), timeout, "COPY IN timed out"
+    )
   return initCommandResult(tag)
 
 proc copyIn*(
@@ -439,13 +435,13 @@ proc copyInStream*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: info.commandTag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        info = await copyInStreamImpl(conn, sql, callback).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY IN stream timed out")
-    else:
-      info = await copyInStreamImpl(conn, sql, callback)
+    awaitOrInvalidate(
+      conn,
+      info,
+      copyInStreamImpl(conn, sql, callback),
+      timeout,
+      "COPY IN stream timed out",
+    )
   return info
 
 proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
@@ -518,13 +514,7 @@ proc copyOut*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: cr.commandTag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        cr = await copyOutImpl(conn, sql).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY OUT timed out")
-    else:
-      cr = await copyOutImpl(conn, sql)
+    awaitOrInvalidate(conn, cr, copyOutImpl(conn, sql), timeout, "COPY OUT timed out")
   return cr
 
 proc copyOutStreamImpl*(
@@ -632,11 +622,11 @@ proc copyOutStream*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: info.commandTag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        info = await copyOutStreamImpl(conn, sql, callback).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY OUT stream timed out")
-    else:
-      info = await copyOutStreamImpl(conn, sql, callback)
+    awaitOrInvalidate(
+      conn,
+      info,
+      copyOutStreamImpl(conn, sql, callback),
+      timeout,
+      "COPY OUT stream timed out",
+    )
   return info
