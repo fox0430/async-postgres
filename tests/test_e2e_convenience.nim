@@ -2057,3 +2057,61 @@ suite "Compile-time: queryDirect / execDirect arity":
           discard await conn.execDirect(SQL_BAD_EXEC, 1'i32, 2'i32)
 
     )
+
+  test "queryDirect evaluates side-effecting args exactly once per call":
+    # The direct macros fan the arg out to paramOidOf / writeParamOid /
+    # writeParamFormat / writeParamValue (3-4 sites depending on cache state).
+    # Without a single let-binding upfront each site would re-run the source
+    # expression, so a counter-bumping arg would advance 3-4× per call.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var evalCount = 0
+      proc nextParam(): int32 =
+        inc evalCount
+        int32(evalCount)
+
+      # First call: cache-miss path (paramOidOf + writeParamOid + Format + Value).
+      let r1 = await conn.queryDirect("SELECT $1::int4 AS v", nextParam())
+      doAssert evalCount == 1
+      doAssert r1.rows[0].getInt(0) == 1
+
+      # Second call: cache-hit path (paramOidOf + Format + Value).
+      let r2 = await conn.queryDirect("SELECT $1::int4 AS v", nextParam())
+      doAssert evalCount == 2
+      doAssert r2.rows[0].getInt(0) == 2
+
+      await conn.close()
+
+    waitFor t()
+
+  test "execDirect evaluates side-effecting args exactly once per call":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_direct_singleeval")
+      discard await conn.exec(
+        "CREATE TABLE test_direct_singleeval (id serial PRIMARY KEY, val int NOT NULL)"
+      )
+      var evalCount = 0
+      proc nextParam(): int32 =
+        inc evalCount
+        int32(evalCount * 10)
+
+      discard await conn.execDirect(
+        "INSERT INTO test_direct_singleeval (val) VALUES ($1)", nextParam()
+      )
+      doAssert evalCount == 1
+
+      discard await conn.execDirect(
+        "INSERT INTO test_direct_singleeval (val) VALUES ($1)", nextParam()
+      )
+      doAssert evalCount == 2
+
+      let qr = await conn.query("SELECT val FROM test_direct_singleeval ORDER BY id")
+      doAssert qr.rowCount == 2
+      doAssert qr.rows[0].getInt(0) == 10
+      doAssert qr.rows[1].getInt(0) == 20
+
+      discard await conn.exec("DROP TABLE test_direct_singleeval")
+      await conn.close()
+
+    waitFor t()
