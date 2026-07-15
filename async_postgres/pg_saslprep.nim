@@ -15,8 +15,6 @@ import pkg/nimcrypto/utils as ncutils
 import pkg/normalize
 import pkg/unicodedb/properties
 
-import pg_errors
-
 template burnString(s: var string) =
   if s.len > 0:
     ncutils.burnMem(addr s[0], s.len)
@@ -85,9 +83,15 @@ proc isProhibited(cp: int32): bool =
     return true # C.9
   return false
 
+proc rawCopy(input: string): string =
+  result = newString(input.len)
+  if input.len > 0:
+    copyMem(addr result[0], unsafeAddr input[0], input.len)
+
 proc saslprep*(input: string): string =
-  ## Apply RFC 4013 SASLprep. Raises `PgConnectionError` for prohibited
-  ## code points, bidi rule violations, or empty passwords.
+  ## Apply RFC 4013 SASLprep. On invalid UTF-8, prohibited code points,
+  ## bidi violations, or an empty post-mapping result, fall back to the
+  ## raw input to match libpq and PG server behavior.
   # Fast path: SASLprep is the identity on printable ASCII (0x20..0x7E).
   var asciiFast = true
   for c in input:
@@ -96,20 +100,10 @@ proc saslprep*(input: string): string =
       asciiFast = false
       break
   if asciiFast:
-    if input.len == 0:
-      raise newException(PgConnectionError, "SASLprep: empty password")
-    # Return a heap-allocated copy (not sharing the caller's buffer) so the
-    # caller can safely wipe the result.
-    result = newString(input.len)
-    copyMem(addr result[0], unsafeAddr input[0], input.len)
-    return
+    return rawCopy(input)
 
-  # On invalid UTF-8, PG server and libpq both fall back to the raw input;
-  # match them so the client verifier stays in sync.
   if validateUtf8(input) != -1:
-    result = newString(input.len)
-    copyMem(addr result[0], unsafeAddr input[0], input.len)
-    return
+    return rawCopy(input)
 
   # Step 1: map (C.1.2 -> U+0020 takes precedence over B.1 -> delete).
   # U+200B is the only code point in both tables; PostgreSQL maps it to
@@ -126,7 +120,7 @@ proc saslprep*(input: string): string =
         mapped.add(r.toUTF8)
 
     if mapped.len == 0:
-      raise newException(PgConnectionError, "SASLprep: empty password")
+      return rawCopy(input)
 
     # Step 3 + 4: prohibit + bidi (RFC 3454 Section 6), run on the
     # post-mapping string (matching PostgreSQL's pg_saslprep).
@@ -138,9 +132,7 @@ proc saslprep*(input: string): string =
     for r in runes(mapped):
       let cp = int32(r)
       if isProhibited(cp):
-        raise newException(
-          PgConnectionError, "SASLprep: prohibited code point U+" & toHex(cp.int64, 4)
-        )
+        return rawCopy(input)
       let bidi = bidirectional(r)
       if bidi == "R" or bidi == "AL":
         hasRandAL = true
@@ -152,16 +144,11 @@ proc saslprep*(input: string): string =
       lastBidi = bidi
 
     if hasRandAL and hasL:
-      raise newException(
-        PgConnectionError, "SASLprep: bidi violation (RandALCat and LCat both present)"
-      )
+      return rawCopy(input)
     if hasRandAL and (
       (firstBidi != "R" and firstBidi != "AL") or (lastBidi != "R" and lastBidi != "AL")
     ):
-      raise newException(
-        PgConnectionError,
-        "SASLprep: bidi violation (RandALCat string must start and end with RandALCat)",
-      )
+      return rawCopy(input)
 
     # Step 2: NFKC normalize.
     result = toNFKC(mapped)
