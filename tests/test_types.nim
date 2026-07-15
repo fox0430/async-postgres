@@ -5908,7 +5908,7 @@ suite "hstore":
     var h: PgHstore = initTable[string, Option[string]]()
     h["k"] = some("v")
     let p = toPgParam(h)
-    check p.oid == OidText
+    check p.oid == 0'i32
     check p.format == 0
     check p.value.isSome
     check toString(p.value.get) == "\"k\"=>\"v\""
@@ -5959,7 +5959,7 @@ suite "hstore":
     var h2: PgHstore = initTable[string, Option[string]]()
     h2["b"] = none(string)
     let p = toPgParam(@[h1, h2])
-    check p.oid == OidTextArray
+    check p.oid == 0'i32
     check p.format == 0
     let fields = @[mkField(OidTextArray, 0'i16)]
     let row = mkRow(@[p.value], fields)
@@ -5970,7 +5970,7 @@ suite "hstore":
 
   test "toPgParam seq[PgHstore] empty":
     let p = toPgParam(newSeq[PgHstore]())
-    check p.oid == OidTextArray
+    check p.oid == 0'i32
     check p.format == 0
     check toString(p.value.get) == "{}"
 

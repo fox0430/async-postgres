@@ -241,8 +241,11 @@ proc encodeHstoreText*(v: PgHstore): string =
   parts.join(", ")
 
 proc toPgParam*(v: PgHstore): PgParam =
-  ## Send hstore as text format. PostgreSQL casts text to hstore implicitly.
-  PgParam(oid: OidText, format: 0, value: some(toBytes(encodeHstoreText(v))))
+  ## Send hstore as text format with OID 0 (unknown) so PostgreSQL infers the
+  ## parameter type from context. Works with both ``SELECT $1::hstore`` and
+  ## ``INSERT INTO t(hstore_col) VALUES($1)``; declaring ``OidText`` would fail
+  ## the latter with 42804 because there is no text→hstore assignment cast.
+  PgParam(oid: 0'i32, format: 0, value: some(toBytes(encodeHstoreText(v))))
 
 proc encodeBinaryArray*(
     elemOid: int32,
@@ -1115,14 +1118,13 @@ proc toPgBinaryParam*(v: PgHstore, oid: int32): PgParam =
   PgParam(oid: oid, format: 1, value: some(encodeHstoreBinary(v)))
 
 proc toPgParam*(v: seq[PgHstore]): PgParam =
-  ## Send ``hstore[]`` in text format using ``OidTextArray``. Requires an
-  ## explicit ``::hstore[]`` cast in the SQL statement (e.g.
-  ## ``SELECT $1::hstore[]``), since the parameter is typed as ``text[]``. No
-  ## connection-specific OID is needed; prefer ``toPgBinaryParam`` when the
-  ## hstore / ``hstore[]`` OIDs are available via ``lookupTypeOids`` (faster, no
-  ## cast required).
+  ## Send ``hstore[]`` in text format with OID 0 (unknown) so PostgreSQL infers
+  ## the parameter type from context. Works with both ``SELECT $1::hstore[]``
+  ## and ``INSERT INTO t(hstore_arr_col) VALUES($1)``. Prefer
+  ## ``toPgBinaryParam`` when the hstore / ``hstore[]`` OIDs are available via
+  ## ``lookupTypeOids`` (binary format, faster).
   if v.len == 0:
-    return PgParam(oid: OidTextArray, format: 0, value: some(toBytes("{}")))
+    return PgParam(oid: 0'i32, format: 0, value: some(toBytes("{}")))
   var s = "{"
   for i, h in v:
     if i > 0:
@@ -1134,7 +1136,7 @@ proc toPgParam*(v: seq[PgHstore]): PgParam =
       s.add(c)
     s.add('"')
   s.add('}')
-  PgParam(oid: OidTextArray, format: 0, value: some(toBytes(s)))
+  PgParam(oid: 0'i32, format: 0, value: some(toBytes(s)))
 
 proc toPgBinaryParam*(v: seq[PgHstore], elemOid: int32, arrayOid: int32): PgParam =
   ## Encode ``hstore[]`` in binary format. Requires the dynamic hstore and
