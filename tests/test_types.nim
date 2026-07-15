@@ -416,7 +416,7 @@ suite "Row accessors":
     check raised
 
 suite "PgParam format field":
-  test "toPgParam uses binary for numeric and bool, text for others":
+  test "toPgParam uses binary for numeric, bool, and bytea, text for others":
     check toPgParam("x").format == 0
     check toPgParam(1'i16).format == 1
     check toPgParam(1'i32).format == 1
@@ -424,7 +424,7 @@ suite "PgParam format field":
     check toPgParam(1.0'f32).format == 1
     check toPgParam(1.0).format == 1
     check toPgParam(true).format == 1
-    check toPgParam(@[1'u8]).format == 0
+    check toPgParam(@[1'u8]).format == 1
     check toPgParam(dateTime(2024, mJan, 1, 0, 0, 0, 0, utc())).format == 0
     check toPgParam(PgUuid("test")).format == 0
 
