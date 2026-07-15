@@ -481,6 +481,17 @@ proc spawnConnectForWaiter(pool: PgPool) =
   pool.pendingBackgroundTasks.add(fut)
   asyncSpawn fut
 
+proc respawnForStrandedWaiter(pool: PgPool) =
+  ## Kick a background connect for the head waiter after a caller-driven
+  ## acquire failure released its reserved `active` slot. Without this, a
+  ## waiter that queued while the failed caller held the slot has no spawn
+  ## attached (queue-time spawn was skipped because `active == maxSize`) and
+  ## no borrower to release, so it would sit until its own wait budget elapses.
+  if not pool.closed and pool.waiterCount > 0 and pool.active < pool.config.maxSize and
+      pool.canAttemptConnect():
+    pool.active.inc
+    pool.spawnConnectForWaiter()
+
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
     await sleepAsync(pool.config.maintenanceInterval)
@@ -636,22 +647,15 @@ proc releaseCore(
     if pool.active > 0:
       pool.active.dec
     pool.closeNoWait(conn)
-    # FIFO fairness: a discarded conn does not serve a waiter, but it frees
-    # an `active` slot. If a waiter is queued and the pool can still grow,
-    # open a replacement out-of-band so the front waiter is not stranded
-    # until the next release or maintenance tick.
-    if not pool.closed and pool.waiterCount > 0 and pool.active < pool.config.maxSize and
-        pool.canAttemptConnect():
-      pool.active.inc
-      pool.spawnConnectForWaiter()
+    # A discarded conn frees an `active` slot without serving a waiter;
+    # spawn a replacement so the head waiter is not stranded.
+    pool.respawnForStrandedWaiter()
     return (true, false)
   # FIFO handoff: serve the head waiter directly with the released conn.
   # `active` is intentionally not decremented — the conn is still in use, just
-  # by a different borrower. Any remaining waiters behind the head are not
-  # spawned for here: each one already had a `spawnConnectForWaiter`
-  # reservation kicked off at queue-time (acquireImpl) or at the broken-release
-  # that freed a slot, so the queue is already covered by in-flight spawns or
-  # by the next release.
+  # by a different borrower. Waiters behind the head are covered by the spawns
+  # emitted at queue-time (acquireImpl), by broken-release replacements, or by
+  # `respawnForStrandedWaiter` on caller-driven connect failures.
   if pool.tryHandoffToWaiter(conn):
     return (false, true)
   if pool.active > 0:
@@ -883,6 +887,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           # cancellation would interrupt a fresh await) and re-raise.
           pool.active.dec
           pool.closeNoWait(pc.conn)
+          pool.respawnForStrandedWaiter()
           raise e
         except CatchableError:
           pool.active.dec
@@ -945,9 +950,11 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         # Cancellation (e.g. a caller's wait()-style deadline) must propagate
         # unwrapped so the canceller's machinery sees it.
         pool.active.dec
+        pool.respawnForStrandedWaiter()
         raise e
       except CatchableError as e:
         pool.active.dec
+        pool.respawnForStrandedWaiter()
         # `perform()` aggregates per-host errors into `PgConnectionError`, so
         # the exception type alone can't tell an acquire timeout from a run of
         # connect failures — the deadline is authoritative. The 1ms slack

@@ -2426,6 +2426,112 @@ suite "FIFO fairness":
 
     waitFor t()
 
+  test "respawnForStrandedWaiter reserves a slot when a waiter is queued":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig.connectTimeout = milliseconds(100)
+      let waitFut = newFuture[PgConnection]("waiter")
+      pool.waiters.addLast(Waiter(fut: waitFut, cancelled: false))
+      pool.waiterCount = 1
+
+      pool.respawnForStrandedWaiter()
+
+      doAssert pool.active == 1
+      doAssert pool.waiterCount == 1
+      doAssert pool.pendingBackgroundTasks.len >= 1
+
+      await pool.close()
+
+    waitFor t()
+
+  test "respawnForStrandedWaiter is a no-op without a queued waiter":
+    let pool = makePool(maxSize = 1)
+    pool.respawnForStrandedWaiter()
+    check pool.active == 0
+    check pool.pendingBackgroundTasks.len == 0
+
+  test "respawnForStrandedWaiter is a no-op when the pool is at maxSize":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("w"), cancelled: false))
+    pool.waiterCount = 1
+    pool.respawnForStrandedWaiter()
+    check pool.active == 1
+    check pool.pendingBackgroundTasks.len == 0
+
+  test "respawnForStrandedWaiter honors the connect-backoff window":
+    let pool = makePool(maxSize = 1)
+    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("w"), cancelled: false))
+    pool.waiterCount = 1
+    pool.consecutiveConnectFailures = 1
+    pool.nextConnectRetryAt = Moment.now() + seconds(60)
+    pool.respawnForStrandedWaiter()
+    check pool.active == 0
+    check pool.pendingBackgroundTasks.len == 0
+
+  test "respawnForStrandedWaiter is a no-op on a closed pool":
+    let pool = makePool(maxSize = 1)
+    pool.closed = true
+    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("w"), cancelled: false))
+    pool.waiterCount = 1
+    pool.respawnForStrandedWaiter()
+    check pool.active == 0
+    check pool.pendingBackgroundTasks.len == 0
+
+  when hasChronos:
+    test "failed caller-driven connect respawns for the waiter queued behind it":
+      # A takes the fresh-connect fast path (waiterCount==0) and reserves the
+      # only slot. B queues while A is suspended, sees active==maxSize, and
+      # skips the queue-time spawn. When A's connect times out and releases
+      # the slot, B would sit until its own budget elapses unless the failure
+      # path also emits a spawn.
+      proc t() {.async.} =
+        let ms = startMockServer()
+
+        let pool = makePool(maxSize = 1)
+        pool.config.connConfig.host = "127.0.0.1"
+        pool.config.connConfig.port = ms.port
+        pool.config.connConfig.connectTimeout = milliseconds(150)
+        pool.config.acquireTimeout = seconds(10)
+
+        let futA = pool.acquire()
+        # Let A reach the suspended connect() await.
+        await sleepAsync(milliseconds(20))
+        doAssert not futA.finished
+        doAssert pool.active == 1
+        doAssert pool.waiterCount == 0
+
+        let futB = pool.acquire()
+        doAssert not futB.finished
+        doAssert pool.waiterCount == 1
+        doAssert pool.active == 1
+
+        var errA = ""
+        try:
+          discard await futA
+        except PgPoolError as e:
+          errA = e.msg
+        doAssert "Pool connect failed" in errA
+
+        # With the fix, B is served by the spawn (which also fails against the
+        # unresponsive mock) and returns fast; without it, B would time out on
+        # acquireTimeout with "Pool acquire timeout".
+        var errB = ""
+        let bStart = Moment.now()
+        try:
+          discard await futB
+        except PgPoolError as e:
+          errB = e.msg
+        let bElapsed = Moment.now() - bStart
+        doAssert "Pool connect for waiter failed" in errB
+        doAssert "acquire timeout" notin errB
+        doAssert bElapsed < seconds(2)
+
+        await pool.close()
+        await closeServer(ms)
+
+      waitFor t()
+
 suite "Error type granularity":
   test "closed pool raises PgPoolError":
     let pool = makePool()
