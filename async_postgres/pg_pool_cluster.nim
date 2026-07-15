@@ -419,10 +419,12 @@ macro withTransactionRetry*(
   # cluster mirrors its non-retry `withTransaction`: the shared
   # `onCleanupSkipped`-wired ROLLBACK from `buildRetryTxLoop`.
   let loop = buildRetryTxLoop(connIdent, retryOptsSym, beginSql, txTimeout, body)
+  # Evaluate retryOpts before acquire(): a raise from the expression would
+  # otherwise leak the pooled connection past the try/finally.
   result = quote:
     let `clusterSym` = `clusterExpr`
-    let `connIdent` = await `clusterSym`.primary.acquire()
     let `retryOptsSym` = `retryOpts`
+    let `connIdent` = await `clusterSym`.primary.acquire()
     try:
       `loop`
     finally:
