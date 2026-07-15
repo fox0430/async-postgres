@@ -1099,6 +1099,78 @@ suite "E2E: Numeric / binary / JSON array types":
 
     waitFor t()
 
+  test "hstore INSERT without explicit cast":
+    # OID 0 lets the server infer $1 as hstore from the column type; declaring
+    # OidText would fail with 42804 (no text→hstore assignment cast).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      discard await conn.simpleQuery("DROP TABLE IF EXISTS test_e2e_hstore_tbl CASCADE")
+      discard
+        await conn.simpleQuery("CREATE TABLE test_e2e_hstore_tbl (id serial, h hstore)")
+      var h: PgHstore = initTable[string, Option[string]]()
+      h["a"] = some("1")
+      h["b"] = none(string)
+      discard await conn.exec(
+        "INSERT INTO test_e2e_hstore_tbl (h) VALUES ($1)", @[toPgParam(h)]
+      )
+      let res = await conn.query("SELECT h FROM test_e2e_hstore_tbl WHERE id = 1")
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getHstore(0)
+      doAssert got == h
+      discard await conn.simpleQuery("DROP TABLE test_e2e_hstore_tbl")
+      await conn.close()
+
+    waitFor t()
+
+  test "hstore[] INSERT without explicit cast":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      discard
+        await conn.simpleQuery("DROP TABLE IF EXISTS test_e2e_hstore_arr_tbl CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TABLE test_e2e_hstore_arr_tbl (id serial, h hstore[])"
+      )
+      var h1: PgHstore = initTable[string, Option[string]]()
+      h1["a"] = some("1")
+      var h2: PgHstore = initTable[string, Option[string]]()
+      h2["b"] = none(string)
+      discard await conn.exec(
+        "INSERT INTO test_e2e_hstore_arr_tbl (h) VALUES ($1)", @[toPgParam(@[h1, h2])]
+      )
+      let res = await conn.query("SELECT h FROM test_e2e_hstore_arr_tbl WHERE id = 1")
+      doAssert res.rows.len == 1
+      let arr = res.rows[0].getHstoreArray(0)
+      doAssert arr.len == 2
+      doAssert arr[0] == h1
+      doAssert arr[1] == h2
+      discard await conn.simpleQuery("DROP TABLE test_e2e_hstore_arr_tbl")
+      await conn.close()
+
+    waitFor t()
+
+  test "empty hstore[] INSERT without explicit cast":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery("CREATE EXTENSION IF NOT EXISTS hstore;")
+      discard
+        await conn.simpleQuery("DROP TABLE IF EXISTS test_e2e_hstore_empty_tbl CASCADE")
+      discard await conn.simpleQuery(
+        "CREATE TABLE test_e2e_hstore_empty_tbl (id serial, h hstore[])"
+      )
+      discard await conn.exec(
+        "INSERT INTO test_e2e_hstore_empty_tbl (h) VALUES ($1)",
+        @[toPgParam(newSeq[PgHstore]())],
+      )
+      let res = await conn.query("SELECT h FROM test_e2e_hstore_empty_tbl WHERE id = 1")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getHstoreArray(0).len == 0
+      discard await conn.simpleQuery("DROP TABLE test_e2e_hstore_empty_tbl")
+      await conn.close()
+
+    waitFor t()
+
   test "bytea array roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
