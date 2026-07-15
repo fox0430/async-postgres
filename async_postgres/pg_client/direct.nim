@@ -53,20 +53,16 @@ proc queryDirectImpl*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: result.commandTag, rowCount: result.rowCount),
   ):
-    if timeout > ZeroDuration:
-      try:
-        result = await queryDirectRunImpl(
-          conn, sql, resultFormats, colFmts, colOids, cacheHit, cacheMiss, stmtName,
-          cachedFields,
-        )
-          .wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("queryDirect timed out")
-    else:
-      result = await queryDirectRunImpl(
+    awaitOrInvalidate(
+      conn,
+      result,
+      queryDirectRunImpl(
         conn, sql, resultFormats, colFmts, colOids, cacheHit, cacheMiss, stmtName,
         cachedFields,
-      )
+      ),
+      timeout,
+      "queryDirect timed out",
+    )
 
 proc buildInvalidateOnOidMismatchStmt(
     connSym, sqlSym, cachedSym, cacheHitSym: NimNode, positional: seq[NimNode]
@@ -525,15 +521,13 @@ proc execDirectImpl*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName).wait(
-          timeout
-        )
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("execDirect timed out")
-    else:
-      tag = await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName)
+    awaitOrInvalidate(
+      conn,
+      tag,
+      execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName),
+      timeout,
+      "execDirect timed out",
+    )
   return initCommandResult(tag)
 
 macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =

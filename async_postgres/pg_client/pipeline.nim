@@ -557,13 +557,9 @@ proc execute*(
       TracePipelineEndData,
       TracePipelineEndData(),
     ):
-      if timeout > ZeroDuration:
-        try:
-          results = await executeImpl(p).wait(timeout)
-        except AsyncTimeoutError:
-          p.conn.invalidateOnTimeout("Pipeline execute timed out")
-      else:
-        results = await executeImpl(p)
+      awaitOrInvalidate(
+        p.conn, results, executeImpl(p), timeout, "Pipeline execute timed out"
+      )
   finally:
     if p.autoReset:
       p.reset()
@@ -719,13 +715,13 @@ proc executeIsolated*(
       TracePipelineEndData,
       TracePipelineEndData(),
     ):
-      if timeout > ZeroDuration:
-        try:
-          ir = await executeIsolatedImpl(p).wait(timeout)
-        except AsyncTimeoutError:
-          p.conn.invalidateOnTimeout("Pipeline executeIsolated timed out")
-      else:
-        ir = await executeIsolatedImpl(p)
+      awaitOrInvalidate(
+        p.conn,
+        ir,
+        executeIsolatedImpl(p),
+        timeout,
+        "Pipeline executeIsolated timed out",
+      )
   finally:
     if p.autoReset:
       p.reset()
