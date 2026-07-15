@@ -3161,6 +3161,42 @@ suite "Pool spawn-connect close-race":
 
     waitFor t()
 
+  test "close does not hang when spawn-for-waiter connect stalls with unset connectTimeout":
+    # Regression: close()'s final pendingBackgroundTasks drain awaited
+    # spawnConnectForWaiter with no bound. With connectTimeout unset, a stalled
+    # handshake pinned close() indefinitely. spawnConnectForWaiter now caps an
+    # unset connectTimeout with maintenanceInterval.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = ZeroDuration
+      pool.config.maintenanceInterval = milliseconds(300)
+      pool.active = 1
+
+      let acqFut = pool.acquire()
+      pool.release(mockConn(csClosed))
+
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+      # No sendFullHandshake: the spawn is now suspended awaiting auth.
+      doAssert pool.pendingBackgroundTasks.len >= 1
+
+      let closeStart = Moment.now()
+      await pool.close().wait(seconds(5))
+      let elapsed = Moment.now() - closeStart
+
+      # Fallback fires at ~300ms; allow generous headroom.
+      doAssert elapsed < seconds(2), $elapsed
+      doAssert acqFut.finished
+      doAssert pool.pendingBackgroundTasks.len == 0
+
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "Pool warmup parallelization":
   test "newPool opens minSize connections in parallel":
     # `newPool` should open all `minSize` connections concurrently (via
