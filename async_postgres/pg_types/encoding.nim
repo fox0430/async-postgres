@@ -135,7 +135,10 @@ proc toPgParam*(v: seq[byte]): PgParam =
   PgParam(oid: OidBytea, format: 1, value: some(v))
 
 proc toPgParam*(v: DateTime): PgParam =
-  let s = v.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
+  # Format the UTC wall clock so a zoned DateTime encodes the same absolute
+  # instant as toPgBinaryParam. Formatting v directly would emit local fields
+  # that OidTimestamp (no zone) then stores verbatim, drifting by the offset.
+  let s = v.utc.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
   PgParam(oid: OidTimestamp, format: 0, value: some(toBytes(s)))
 
 proc toPgDateParam*(v: DateTime): PgParam =
