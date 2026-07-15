@@ -413,10 +413,17 @@ proc spawnConnectForWaiter(pool: PgPool) =
   ## `failLastWaiter`).
   ## The spawned future is tracked in
   ## `pendingBackgroundTasks` so `pool.close()` drains it before returning.
+  # Bound an unset connectTimeout with maintenanceInterval so a stuck TCP
+  # connect can't hold close()'s final pendingBackgroundTasks drain open
+  # indefinitely. Mirrors maintenanceLoop's fallback.
+  var connCfg = pool.config.connConfig
+  if connCfg.connectTimeout == ZeroDuration:
+    connCfg.connectTimeout = pool.config.maintenanceInterval
+
   proc run() {.async.} =
     var consumed = false
     try:
-      let conn = await connect(pool.config.connConfig)
+      let conn = await connect(connCfg)
       conn.ownerPool = pool
       pool.metrics.createCount.inc
       pool.consecutiveConnectFailures = 0
