@@ -188,7 +188,7 @@ suite "toPgParam":
     let data = @[0x01'u8, 0x02, 0xFF]
     let p = toPgParam(data)
     check p.oid == OidBytea
-    check p.format == 0
+    check p.format == 1
     check p.value.isSome
     check p.value.get == data
 
