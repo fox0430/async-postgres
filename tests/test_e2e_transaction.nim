@@ -2116,6 +2116,41 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: executeIsolated evicts and queues Close for failing op":
+    # executeIsolated counterpart: 0A000 on a cache hit must both evict the
+    # entry and queue a server-side Close so the still-live statement is
+    # reclaimed on the next op.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.query("DROP TABLE IF EXISTS t_iso_evict")
+      discard await conn.query("CREATE TABLE t_iso_evict(a int4)")
+      discard await conn.query("INSERT INTO t_iso_evict VALUES (1)")
+
+      discard await conn.query("SELECT 54321::int4")
+      discard await conn.query("SELECT * FROM t_iso_evict")
+      doAssert conn.stmtCache.hasKey("SELECT 54321::int4")
+      doAssert conn.stmtCache.hasKey("SELECT * FROM t_iso_evict")
+
+      discard await conn.query("ALTER TABLE t_iso_evict ADD COLUMN b int4")
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT 54321::int4") # cache hit, succeeds
+      p.addQuery("SELECT * FROM t_iso_evict") # cache hit, fails 0A000
+      let ir = await p.executeIsolated()
+
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert (ref PgQueryError)(ir.errors[1]).sqlState == "0A000"
+
+      doAssert conn.stmtCache.hasKey("SELECT 54321::int4")
+      doAssert not conn.stmtCache.hasKey("SELECT * FROM t_iso_evict")
+      doAssert conn.pendingStmtCloses.len >= 1
+
+      discard await conn.query("DROP TABLE IF EXISTS t_iso_evict")
+      await conn.close()
+
+    waitFor t()
+
   test "pipeline: PgParam raw overload":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
