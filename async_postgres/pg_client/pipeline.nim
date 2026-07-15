@@ -669,6 +669,9 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
               if opError != nil:
                 if opError.sqlState in StmtCacheInvalidatingStates and
                     p.ops[opIdx].cacheHit:
+                  # Mirror executeImpl: ride a Close along so 0A000 doesn't
+                  # leak the still-live server statement.
+                  conn.pendingStmtCloses.add(p.ops[opIdx].stmtName)
                   conn.removeStmtCache(p.ops[opIdx].sql)
                 errors[opIdx] = opError
               elif p.ops[opIdx].cacheMiss and not p.ops[opIdx].cacheSuperseded:
