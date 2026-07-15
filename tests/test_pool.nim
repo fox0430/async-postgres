@@ -3071,6 +3071,54 @@ suite "Pool acquire close-race":
 
     waitFor t()
 
+suite "Pool spawn-connect close-race":
+  test "spawn-for-waiter closes a connection won after the pool is closed":
+    # Regression: spawnConnectForWaiter's closed-branch used to close the fresh
+    # conn without bumping closeCount. A spawn whose connect returned success
+    # after pool.close() flipped `closed` left createCount incremented but
+    # closeCount not — a permanent skew poisoning all metric-based accounting.
+    # Gate the handshake so the connect is provably in flight when we close.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.active = 1 # simulated borrower at maxSize
+
+      let acqFut = pool.acquire() # queues as a waiter
+      # Broken-conn release frees the slot and spawns a connect for the waiter.
+      # This bumps closeCount for the mock, so snapshot AFTER it.
+      pool.release(mockConn(csClosed))
+
+      # accept() resolves once the spawn's TCP is up; draining the startup
+      # message leaves connect() suspended awaiting the handshake.
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+
+      let createBefore = pool.metrics.createCount
+      let closeBefore = pool.metrics.closeCount
+
+      # Start close() (synchronously flips `closed` and fails waiters), then
+      # let the handshake complete so the spawn resumes into the closed-branch.
+      # close() awaits pendingBackgroundTasks, so the spawn is drained by the
+      # time closeFut resolves.
+      let closeFut = pool.close()
+      await sendFullHandshake(client)
+      await closeFut
+
+      doAssert acqFut.finished
+      doAssert acqFut.failed
+      doAssert pool.active == 0
+      doAssert pool.metrics.createCount - createBefore == 1
+      doAssert pool.metrics.closeCount - closeBefore == 1
+      doAssert pool.idle.len == 0
+
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "Pool warmup parallelization":
   test "newPool opens minSize connections in parallel":
     # `newPool` should open all `minSize` connections concurrently (via

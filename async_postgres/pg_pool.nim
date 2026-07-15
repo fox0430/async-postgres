@@ -421,6 +421,7 @@ proc spawnConnectForWaiter(pool: PgPool) =
       pool.metrics.createCount.inc
       pool.consecutiveConnectFailures = 0
       if pool.closed:
+        pool.metrics.closeCount.inc
         await pool.tracedClose(conn)
         return
       if pool.tryHandoffToWaiter(conn):
