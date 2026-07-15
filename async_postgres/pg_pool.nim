@@ -899,19 +899,41 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
 
     # No idle connections; create new if under limit
     if pool.active < pool.config.maxSize:
-      var connCfg = pool.config.connConfig
-      var cappedByDeadline = false
+      let connCfg = pool.config.connConfig
+      var rem = ZeroDuration
       if hasDeadline:
-        let rem = remainingBudget()
+        rem = remainingBudget()
         if rem <= ZeroDuration:
           raiseAcquireTimeout()
-        if connCfg.connectTimeout == ZeroDuration or rem < connCfg.connectTimeout:
-          connCfg.connectTimeout = rem
-          cappedByDeadline = true
       pool.active.inc
       var newConn: PgConnection
       try:
-        newConn = await connect(connCfg)
+        if hasDeadline:
+          # Bound the whole connect (across multi-host failover) by the acquire
+          # budget: per-host `connectTimeout` alone lets total wait reach
+          # `connectTimeout * hosts`. Under asyncdispatch the orphan close
+          # mirrors `attemptHostTimed`'s handling.
+          let attempt = connect(connCfg)
+          when hasAsyncDispatch:
+            newConn = await attempt.wait(
+              rem,
+              onOrphan = proc(fut: Future[PgConnection]) =
+                if fut.completed():
+                  asyncSpawn (
+                    proc() {.async.} =
+                      try:
+                        let orphan = fut.read()
+                        if orphan != nil:
+                          await orphan.close()
+                      except CatchableError:
+                        discard
+                  )()
+              ,
+            )
+          else:
+            newConn = await attempt.wait(rem)
+        else:
+          newConn = await connect(connCfg)
       except CancelledError as e:
         # Cancellation (e.g. a caller's wait()-style deadline) must propagate
         # unwrapped so the canceller's machinery sees it.
@@ -919,12 +941,12 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         raise e
       except CatchableError as e:
         pool.active.dec
-        # A connect cut short by the acquire deadline surfaces as the same
-        # timeout error as the waiter path; any other connect failure
-        # (including a user-configured connectTimeout firing before the
-        # deadline) is wrapped so acquire() keeps its documented PgPoolError
-        # contract — the original error stays available via `parent`.
-        if cappedByDeadline and e of AsyncTimeoutError:
+        # `perform()` aggregates per-host errors into `PgConnectionError`, so
+        # the exception type alone can't tell an acquire timeout from a run of
+        # connect failures — the deadline is authoritative. The 1ms slack
+        # absorbs asyncdispatch's timer imprecision (it can fire hundreds of
+        # microseconds early).
+        if hasDeadline and remainingBudget() <= milliseconds(1):
           pool.metrics.timeoutCount.inc
           raise newException(PgPoolError, "Pool acquire timeout", e)
         raise newException(PgPoolError, "Pool connect failed", e)

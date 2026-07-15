@@ -1291,6 +1291,48 @@ suite "Acquire deadline budget":
 
     waitFor t()
 
+  test "acquireTimeout bounds multi-host connect":
+    proc t() {.async.} =
+      # Three mock servers that accept TCP but never answer the startup
+      # message. connectTimeout is applied per host, so without a total
+      # deadline the acquire would burn ~acquireTimeout on each host.
+      let ms1 = startMockServer()
+      let ms2 = startMockServer()
+      let ms3 = startMockServer()
+
+      let pool = makePool()
+      pool.config.connConfig = ConnConfig(
+        hosts: @[
+          HostEntry(host: "127.0.0.1", port: ms1.port),
+          HostEntry(host: "127.0.0.1", port: ms2.port),
+          HostEntry(host: "127.0.0.1", port: ms3.port),
+        ],
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+      )
+      pool.config.acquireTimeout = milliseconds(200)
+
+      let start = Moment.now()
+      var msg = ""
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        msg = e.msg
+      let elapsed = Moment.now() - start
+
+      doAssert "timeout" in msg.toLowerAscii(), "msg=" & msg
+      doAssert elapsed < milliseconds(400), "elapsed=" & $elapsed
+      doAssert pool.active == 0
+      doAssert pool.metrics.timeoutCount == 1,
+        "timeoutCount=" & $pool.metrics.timeoutCount
+
+      await ms1.closeServer()
+      await ms2.closeServer()
+      await ms3.closeServer()
+
+    waitFor t()
+
 suite "Max waiters":
   test "maxWaiters -1 allows unlimited waiters":
     let pool = makePool(maxSize = 1)
