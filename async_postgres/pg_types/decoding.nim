@@ -344,7 +344,7 @@ proc decodeBinaryComposite*(
       result[i].len = flen
       pos += flen
 
-proc parseTimestampText*(s: string): DateTime =
+proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
   # Text-format 'infinity'/'-infinity' mirror the binary sentinels handled in
   # decodeBinaryTimestamp: not representable as a DateTime, so raise a clear
   # PgTypeError rather than the generic "Invalid timestamp" below.
@@ -376,6 +376,18 @@ proc parseTimestampText*(s: string): DateTime =
     except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp: " & s)
+
+proc parseDateText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
+  # Text-format 'infinity'/'-infinity' mirror the binary sentinels handled in
+  # decodeBinaryDate: not representable as a DateTime, so raise a clear
+  # PgTypeError rather than the generic "Invalid date" below.
+  if s == "infinity" or s == "-infinity":
+    raise
+      newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
+  try:
+    return parse(s, "yyyy-MM-dd")
+  except TimeParseError, IndexDefect:
+    raise newException(PgTypeError, "Invalid date: " & s)
 
 proc parseTimeText*(s: string): PgTime =
   ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".
