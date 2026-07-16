@@ -654,17 +654,7 @@ proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseRangeText[DateTime](
-    s,
-    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
-      const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
-      for fmt in formats:
-        try:
-          return parse(e, fmt)
-        except TimeParseError:
-          discard
-      raise newException(PgTypeError, "Invalid timestamp in range: " & e),
-  )
+  parseRangeText[DateTime](s, parseTimestampText)
 
 proc getTsTzRange*(row: Row, col: int): PgRange[DateTime] =
   ## Get a column value as a tstzrange. Handles binary format.
@@ -674,21 +664,7 @@ proc getTsTzRange*(row: Row, col: int): PgRange[DateTime] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseRangeText[DateTime](
-    s,
-    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
-      const formats = [
-        "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
-        "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
-        "yyyy-MM-dd HH:mm:sszz", "yyyy-MM-dd HH:mm:ss",
-      ]
-      for fmt in formats:
-        try:
-          return parse(e, fmt)
-        except TimeParseError:
-          discard
-      raise newException(PgTypeError, "Invalid timestamptz in range: " & e),
-  )
+  parseRangeText[DateTime](s, parseTimestampText)
 
 proc getDateRange*(row: Row, col: int): PgRange[DateTime] =
   ## Get a column value as a daterange. Handles binary format.
@@ -698,14 +674,7 @@ proc getDateRange*(row: Row, col: int): PgRange[DateTime] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return decodeDateRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseRangeText[DateTime](
-    s,
-    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
-      try:
-        return parse(e, "yyyy-MM-dd")
-      except TimeParseError:
-        raise newException(PgTypeError, "Invalid date in range: " & e),
-  )
+  parseRangeText[DateTime](s, parseDateText)
 
 # Range Opt accessors (text format)
 
@@ -1099,17 +1068,7 @@ proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
       )
     return PgMultirange[DateTime](ranges)
   let s = row.getStr(col)
-  parseMultirangeText[DateTime](
-    s,
-    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
-      const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
-      for fmt in formats:
-        try:
-          return parse(e, fmt)
-        except TimeParseError:
-          discard
-      raise newException(PgTypeError, "Invalid timestamp in multirange: " & e),
-  )
+  parseMultirangeText[DateTime](s, parseTimestampText)
 
 proc getTsTzMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   ## Get a column value as a tstzmultirange. Handles binary format.
@@ -1125,21 +1084,7 @@ proc getTsTzMultirange*(row: Row, col: int): PgMultirange[DateTime] =
       )
     return PgMultirange[DateTime](ranges)
   let s = row.getStr(col)
-  parseMultirangeText[DateTime](
-    s,
-    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
-      const formats = [
-        "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
-        "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
-        "yyyy-MM-dd HH:mm:sszz", "yyyy-MM-dd HH:mm:ss",
-      ]
-      for fmt in formats:
-        try:
-          return parse(e, fmt)
-        except TimeParseError:
-          discard
-      raise newException(PgTypeError, "Invalid timestamptz in multirange: " & e),
-  )
+  parseMultirangeText[DateTime](s, parseTimestampText)
 
 proc getDateMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   ## Get a column value as a datemultirange. Handles binary format.
@@ -1155,14 +1100,7 @@ proc getDateMultirange*(row: Row, col: int): PgMultirange[DateTime] =
       )
     return PgMultirange[DateTime](ranges)
   let s = row.getStr(col)
-  parseMultirangeText[DateTime](
-    s,
-    proc(e: string): DateTime {.gcsafe, raises: [CatchableError].} =
-      try:
-        return parse(e, "yyyy-MM-dd")
-      except TimeParseError:
-        raise newException(PgTypeError, "Invalid date in multirange: " & e),
-  )
+  parseMultirangeText[DateTime](s, parseDateText)
 
 # Multirange Opt accessors (text format)
 
@@ -1303,19 +1241,7 @@ proc getTsMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(
-      parseMultirangeText[DateTime](
-        e.get,
-        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
-          const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
-          for fmt in formats:
-            try:
-              return parse(x, fmt)
-            except TimeParseError, IndexDefect:
-              discard
-          raise newException(PgTypeError, "Invalid timestamp in multirange: " & x),
-      )
-    )
+    result.add(parseMultirangeText[DateTime](e.get, parseTimestampText))
 
 proc getTsTzMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
   if row.isBinaryCol(col):
@@ -1343,23 +1269,7 @@ proc getTsTzMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(
-      parseMultirangeText[DateTime](
-        e.get,
-        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
-          const formats = [
-            "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
-            "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
-            "yyyy-MM-dd HH:mm:sszz", "yyyy-MM-dd HH:mm:ss",
-          ]
-          for fmt in formats:
-            try:
-              return parse(x, fmt)
-            except TimeParseError, IndexDefect:
-              discard
-          raise newException(PgTypeError, "Invalid timestamptz in multirange: " & x),
-      )
-    )
+    result.add(parseMultirangeText[DateTime](e.get, parseTimestampText))
 
 proc getDateMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
   if row.isBinaryCol(col):
@@ -1387,16 +1297,7 @@ proc getDateMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(
-      parseMultirangeText[DateTime](
-        e.get,
-        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
-          try:
-            return parse(x, "yyyy-MM-dd")
-          except TimeParseError:
-            raise newException(PgTypeError, "Invalid date in multirange: " & x),
-      )
-    )
+    result.add(parseMultirangeText[DateTime](e.get, parseDateText))
 
 optAccessor(getInt4MultirangeArray, getInt4MultirangeArrayOpt, seq[PgMultirange[int32]])
 optAccessor(getInt8MultirangeArray, getInt8MultirangeArrayOpt, seq[PgMultirange[int64]])
@@ -1521,19 +1422,7 @@ proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in range array")
-    result.add(
-      parseRangeText[DateTime](
-        e.get,
-        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
-          const formats = ["yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:ss"]
-          for fmt in formats:
-            try:
-              return parse(x, fmt)
-            except TimeParseError:
-              discard
-          raise newException(PgTypeError, "Invalid timestamp in range array: " & x),
-      )
-    )
+    result.add(parseRangeText[DateTime](e.get, parseTimestampText))
 
 proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
   ## Get a column value as a ``tstzrange[]``. Handles binary format.
@@ -1556,23 +1445,7 @@ proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in range array")
-    result.add(
-      parseRangeText[DateTime](
-        e.get,
-        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
-          const formats = [
-            "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
-            "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz",
-            "yyyy-MM-dd HH:mm:sszz", "yyyy-MM-dd HH:mm:ss",
-          ]
-          for fmt in formats:
-            try:
-              return parse(x, fmt)
-            except TimeParseError:
-              discard
-          raise newException(PgTypeError, "Invalid timestamptz in range array: " & x),
-      )
-    )
+    result.add(parseRangeText[DateTime](e.get, parseTimestampText))
 
 proc getDateRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
   ## Get a column value as a ``daterange[]``. Handles binary format.
@@ -1595,16 +1468,7 @@ proc getDateRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in range array")
-    result.add(
-      parseRangeText[DateTime](
-        e.get,
-        proc(x: string): DateTime {.gcsafe, raises: [CatchableError].} =
-          try:
-            return parse(x, "yyyy-MM-dd")
-          except TimeParseError:
-            raise newException(PgTypeError, "Invalid date in range array: " & x),
-      )
-    )
+    result.add(parseRangeText[DateTime](e.get, parseDateText))
 
 # Range array Opt accessors
 
