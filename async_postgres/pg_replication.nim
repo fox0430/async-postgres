@@ -926,10 +926,10 @@ proc replFillRecvBuf(
       let timer = sleepAsync(remaining)
       try:
         discard await race(read, timer)
-      except CancelledError:
+      except CancelledError as e:
         if readIsLocal and not read.finished:
           read.cancelSoon()
-        raise
+        raise e
       finally:
         cancelTimer(timer)
     if read.finished:
