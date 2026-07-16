@@ -89,17 +89,7 @@ template makeCopyOutCallback*(body: untyped): CopyOutCallback =
   ##   var chunks: seq[seq[byte]]
   ##   let cb = makeCopyOutCallback:
   ##     chunks.add(data)
-  block:
-    when hasChronos:
-      let r: CopyOutCallback = proc(
-          data {.inject.}: sink seq[byte]
-      ) {.async: (raises: [CatchableError]).} =
-        body
-      r
-    else:
-      let r: CopyOutCallback = proc(data {.inject.}: sink seq[byte]) {.async.} =
-        body
-      r
+  makeAsyncSinkByteCallback(CopyOutCallback, body)
 
 template makeCopyInCallback*(body: untyped): CopyInCallback =
   ## Create a ``CopyInCallback`` that works with both asyncdispatch and chronos.
@@ -118,26 +108,7 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
   ##       chunk
   ##     else:
   ##       newSeq[byte]()
-  block:
-    when hasChronos:
-      let r: CopyInCallback = proc(): Future[seq[byte]] {.
-          async: (raises: [CatchableError])
-      .} =
-        body
-      r
-    else:
-      # asyncdispatch's {.async.} doesn't support non-void return types on
-      # anonymous procs. Wrap in manual Future construction instead.
-      # Note: body must be synchronous (no await).
-      let r: CopyInCallback = proc(): Future[seq[byte]] {.gcsafe.} =
-        let fut = newFuture[seq[byte]]("makeCopyInCallback")
-        try:
-          let res: seq[byte] = body
-          fut.complete(res)
-        except CatchableError as e:
-          fut.fail(e)
-        return fut
-      r
+  makeAsyncSeqByteCallback(CopyInCallback, "makeCopyInCallback", body)
 
 # Notification / notice dispatch
 

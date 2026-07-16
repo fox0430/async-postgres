@@ -508,18 +508,18 @@ proc decodePgOutput*(msg: XLogData): PgOutputMessage =
 
 # Replication callback types
 
-when hasChronos:
-  type ReplicationCallback* = proc(msg: ReplicationMessage): Future[void] {.
-    async: (raises: [CatchableError]), gcsafe
-  .} ## Callback invoked for each replication message during streaming.
-
-else:
-  type ReplicationCallback* = proc(msg: ReplicationMessage): Future[void] {.gcsafe.}
-    ## Callback invoked for each replication message during streaming.
+declareAsyncCallback(
+  ReplicationCallback, proc(msg: ReplicationMessage): Future[void],
+  "Callback invoked for each replication message during streaming.",
+)
 
 template makeReplicationCallback*(body: untyped): ReplicationCallback =
   ## Create a ``ReplicationCallback`` that works with both asyncdispatch and chronos.
   ## Inside ``body``, the current message is available as ``msg: ReplicationMessage``.
+  ##
+  ## Kept module-local: routing this through a shared template with an
+  ## `untyped`/`typedesc` param for the parameter type trips asyncdispatch's
+  ## `{.async.}` macro ("cannot use symbol of kind 'func' as a 'param'").
   block:
     when hasChronos:
       let r: ReplicationCallback = proc(

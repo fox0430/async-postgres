@@ -670,24 +670,15 @@ type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
   ## Callback invoked once per row during `queryEach`. The `Row` is only valid
   ## inside the callback — its backing buffer is reused for the next row.
 
-when hasChronos:
-  type CopyOutCallback* = proc(data: sink seq[byte]): Future[void] {.
-    async: (raises: [CatchableError]), gcsafe
-  .}
-    ## Callback receiving each chunk during streaming COPY OUT. ``data`` is
-    ## ``sink`` so the receive buffer moves in without a copy.
+declareAsyncCallback(
+  CopyOutCallback, proc(data: sink seq[byte]): Future[void],
+  "Callback receiving each chunk during streaming COPY OUT. `data` is `sink` so the receive buffer moves in without a copy.",
+)
 
-  type CopyInCallback* =
-    proc(): Future[seq[byte]] {.async: (raises: [CatchableError]), gcsafe.}
-    ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
-
-else:
-  type CopyOutCallback* = proc(data: sink seq[byte]): Future[void] {.gcsafe.}
-    ## Callback receiving each chunk during streaming COPY OUT. ``data`` is
-    ## ``sink`` so the receive buffer moves in without a copy.
-
-  type CopyInCallback* = proc(): Future[seq[byte]] {.gcsafe.}
-    ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
+declareAsyncCallback(
+  CopyInCallback, proc(): Future[seq[byte]],
+  "Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.",
+)
 
 const RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
 
