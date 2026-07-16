@@ -39,17 +39,9 @@ type
     fd*: int32
     oid*: Oid
 
-# Callback types for streaming, matching CopyOutCallback/CopyInCallback pattern
-when hasChronos:
-  type LoReadCallback* =
-    proc(data: seq[byte]): Future[void] {.async: (raises: [CatchableError]), gcsafe.}
-
-  type LoWriteCallback* =
-    proc(): Future[seq[byte]] {.async: (raises: [CatchableError]), gcsafe.}
-
-else:
-  type LoReadCallback* = proc(data: seq[byte]): Future[void] {.gcsafe.}
-  type LoWriteCallback* = proc(): Future[seq[byte]] {.gcsafe.}
+# Streaming callback types (share the CopyOut/CopyIn shape).
+declareAsyncCallback(LoReadCallback, proc(data: seq[byte]): Future[void])
+declareAsyncCallback(LoWriteCallback, proc(): Future[seq[byte]])
 
 template makeLoReadCallback*(body: untyped): LoReadCallback =
   ## Create a ``LoReadCallback`` that works with both asyncdispatch and chronos.
@@ -59,6 +51,10 @@ template makeLoReadCallback*(body: untyped): LoReadCallback =
   ##   var chunks: seq[seq[byte]]
   ##   let cb = makeLoReadCallback:
   ##     chunks.add(data)
+  ##
+  ## Kept module-local: routing this through a shared template with an
+  ## `untyped`/`typedesc` param for the parameter type trips asyncdispatch's
+  ## `{.async.}` macro ("cannot use symbol of kind 'func' as a 'param'").
   block:
     when hasChronos:
       let r: LoReadCallback = proc(
@@ -88,23 +84,7 @@ template makeLoWriteCallback*(body: untyped): LoWriteCallback =
   ##       chunk
   ##     else:
   ##       newSeq[byte]()
-  block:
-    when hasChronos:
-      let r: LoWriteCallback = proc(): Future[seq[byte]] {.
-          async: (raises: [CatchableError])
-      .} =
-        body
-      r
-    else:
-      let r: LoWriteCallback = proc(): Future[seq[byte]] {.gcsafe.} =
-        let fut = newFuture[seq[byte]]("makeLoWriteCallback")
-        try:
-          let res: seq[byte] = body
-          fut.complete(res)
-        except CatchableError as e:
-          fut.fail(e)
-        return fut
-      r
+  makeAsyncSeqByteCallback(LoWriteCallback, "makeLoWriteCallback", body)
 
 proc parseLoInt(s, fn: string): BiggestInt =
   ## Convert a numeric scalar returned by a Large Object server function to an
