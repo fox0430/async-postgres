@@ -361,20 +361,36 @@ proc compositeFieldFromText[T](s: string): T =
   else:
     raise newException(PgTypeError, "Unsupported composite field type")
 
+template checkFieldLen(actual, expected: int, typeName: string) =
+  # Guard against DB-column / Nim-field width mismatch: without this,
+  # a wider wire value would silently truncate and a narrower one IndexDefect.
+  if actual != expected:
+    raise newException(
+      PgTypeError,
+      "Composite binary field length " & $actual & " does not match " & typeName &
+        " (expected " & $expected & ")",
+    )
+
 template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
   when typeof(val) is string:
     val = readString(buf, fOff, fLen)
   elif typeof(val) is int16:
+    checkFieldLen(fLen, 2, "int16")
     val = fromBE16(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is int32:
+    checkFieldLen(fLen, 4, "int32")
     val = fromBE32(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is (int64 or int):
+    checkFieldLen(fLen, 8, "int64")
     val = typeof(val)(fromBE64(buf.toOpenArray(fOff, fEnd)))
   elif typeof(val) is float64:
+    checkFieldLen(fLen, 8, "float64")
     val = decodeFloat64BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is float32:
+    checkFieldLen(fLen, 4, "float32")
     val = decodeFloat32BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is bool:
+    checkFieldLen(fLen, 1, "bool")
     val = buf[fOff] != 0
   else:
     val = compositeFieldFromText[typeof(val)](readString(buf, fOff, fLen))
