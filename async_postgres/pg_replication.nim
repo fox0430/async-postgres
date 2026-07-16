@@ -909,7 +909,12 @@ proc replFillRecvBuf(
     return nil
   when hasChronos:
     var read = pendingRead
-    if read == nil:
+    # A locally spawned read isn't visible to the caller yet: chronos ``race``
+    # does not cancel its children, and a cancel here unwinds before we can
+    # return it — so drop it explicitly. A passed-in read is already tracked by
+    # the caller's cleanup.
+    let readIsLocal = read == nil
+    if readIsLocal:
       read = conn.fillRecvBufDetached()
     if not read.finished:
       let sinceLast = Moment.now() - lastStatusSent
@@ -921,6 +926,10 @@ proc replFillRecvBuf(
       let timer = sleepAsync(remaining)
       try:
         discard await race(read, timer)
+      except CancelledError:
+        if readIsLocal and not read.finished:
+          read.cancelSoon()
+        raise
       finally:
         cancelTimer(timer)
     if read.finished:
