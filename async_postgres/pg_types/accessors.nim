@@ -846,15 +846,16 @@ template optAccessor*(getProc, optProc: untyped, T: typedesc) =
 
 template nameAccessor*(getProc: untyped, T: typedesc) =
   ## Generate ``getProc*(row, name): T`` that delegates to the index-based overload.
-  proc getProc*(row: Row, name: string): T =
-    row.getProc(row.columnIndex(name))
+  ## Auto-detects a ``scale`` parameter on the index-based proc and forwards it —
+  ## so a scaled accessor like ``getMoney`` cannot silently drop the kwarg when
+  ## its index-based signature grows one.
+  when compiles((var r: Row; discard r.getProc(0, scale = 2))):
+    proc getProc*(row: Row, name: string, scale: int = 2): T =
+      row.getProc(row.columnIndex(name), scale)
 
-template nameAccessorScale*(getProc: untyped, T: typedesc) =
-  ## Like ``nameAccessor`` but forwards ``scale`` to the index-based overload,
-  ## so callers can pass ``row.getMoney("col", scale = 3)`` etc. instead of
-  ## silently getting the default.
-  proc getProc*(row: Row, name: string, scale: int = 2): T =
-    row.getProc(row.columnIndex(name), scale)
+  else:
+    proc getProc*(row: Row, name: string): T =
+      row.getProc(row.columnIndex(name))
 
 optAccessor(getStr, getStrOpt, string)
 optAccessor(getInt, getIntOpt, int32)
