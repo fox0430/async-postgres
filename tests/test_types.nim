@@ -3898,9 +3898,14 @@ type
     age: Option[int32]
     note: Option[string]
 
+  WideIntRecord = object
+    name: string
+    n: int64
+
 pgComposite(PointRecord)
 pgComposite(PersonRecord, 50000'i32)
 pgComposite(NullableRecord)
+pgComposite(WideIntRecord)
 
 suite "Composite text parser":
   test "parseCompositeText simple":
@@ -4211,6 +4216,61 @@ suite "User-defined composite":
     let p = toPgParam(none(PointRecord))
     check p.oid == 0'i32
     check p.value.isNone
+
+  test "getComposite binary wider wire int than Nim field raises":
+    # Nim field is int32 but wire sends int8 (bigint, 8 bytes). Without a
+    # length check, fromBE32 would silently keep only the top 4 bytes.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Grace"))),
+      (oid: OidInt8, data: some(@(toBE64(1'i64)))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary narrower wire int than Nim field raises":
+    # Nim field is int64 but wire sends int4 (4 bytes). Without a length
+    # check, fromBE64 would run past the field and IndexDefect.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Heidi"))),
+      (oid: OidInt4, data: some(@(toBE32(7'i32)))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(0'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[WideIntRecord](row, 0)
+
+  test "getComposite binary wider wire float than Nim field raises":
+    # Nim field is float64 but wire sends float4 (4 bytes) — narrower than
+    # expected 8, so fromBE64 would IndexDefect.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Ivan"))),
+      (oid: OidInt4, data: some(@(toBE32(10'i32)))),
+      (oid: OidFloat4, data: some(@(toBE32(cast[int32](1.5'f32))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary Option field width mismatch raises":
+    # Same guard applies inside the Option branch: age is Option[int32],
+    # wire sends 8-byte int8 → must raise, not silently truncate.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Judy"))),
+      (oid: OidInt8, data: some(@(toBE64(99'i64)))),
+      (oid: OidText, data: some(toBytes("n"))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(0'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[NullableRecord](row, 0)
 
 suite "User-defined domain":
   test "pgDomain generates toPgParam with base type OID":
