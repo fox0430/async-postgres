@@ -349,13 +349,7 @@ proc compositeFieldFromText[T](s: string): T =
   elif T is float32:
     pgParseFloat32(s)
   elif T is bool:
-    case s
-    of "t", "true", "1":
-      true
-    of "f", "false", "0":
-      false
-    else:
-      raise newException(PgTypeError, "Invalid boolean in composite: " & s)
+    parsePgBoolText(s)
   elif T is PgNumeric:
     parsePgNumeric(s)
   else:

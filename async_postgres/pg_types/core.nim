@@ -388,6 +388,23 @@ proc pgParseHexInt*(s: string): int =
   pgTypeErrorOnValueError("invalid hex value"):
     parseHexInt(s)
 
+proc parsePgBoolText*(s: string): bool =
+  ## Parse a PostgreSQL text-format bool value. PostgreSQL itself always emits
+  ## ``t``/``f`` on the wire; the multi-char spellings (``true``/``false``,
+  ## ``1``/``0``) are accepted defensively so composite / array / user-supplied
+  ## text (e.g. an explicit ``'true'::text`` cast) parses uniformly across the
+  ## scalar, array-element, and composite-field decoders. Any other input
+  ## raises ``PgTypeError`` — including strings that merely start with an
+  ## accepted character (``typo``, ``finalize``), which older byte-level
+  ## implementations silently accepted.
+  case s
+  of "t", "true", "1":
+    true
+  of "f", "false", "0":
+    false
+  else:
+    raise newException(PgTypeError, "Invalid boolean value: " & s)
+
 proc `+`*(a: int, b: RelOff): int {.inline.} =
   ## Combine an absolute parent-buffer origin with a relative decoder offset.
   ## ``RelOff`` cannot be added to itself or used as a buffer index directly,

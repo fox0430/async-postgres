@@ -425,16 +425,10 @@ proc getBool*(row: Row, col: int): bool =
         "Column " & $col & ": unexpected binary length " & $clen & " for bool",
       )
     return row.data.buf[off] != 0
-  if clen == 0:
-    raise newException(PgTypeError, "Column " & $col & ": empty boolean value")
-  let c = char(row.data.buf[off])
-  case c
-  of 't', '1':
-    true
-  of 'f', '0':
-    false
-  else:
-    raise newException(PgTypeError, "Invalid boolean value: " & c)
+  try:
+    parsePgBoolText(readString(row.data.buf, off, clen))
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getBytes*(row: Row, col: int): seq[byte] =
   ## Get a column value as raw bytes. Decodes hex-encoded bytea in text format.
@@ -1157,16 +1151,7 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
 genArrayDecoder(getFloatArray, float64, "float", pgParseFloat(e.get))
 genArrayDecoder(getFloat32Array, float32, "float32", pgParseFloat32(e.get))
 
-proc boolElemFromText(s: string): bool =
-  case s
-  of "t", "true", "1":
-    true
-  of "f", "false", "0":
-    false
-  else:
-    raise newException(PgTypeError, "Invalid boolean: " & s)
-
-genArrayDecoder(getBoolArray, bool, "bool", boolElemFromText(e.get))
+genArrayDecoder(getBoolArray, bool, "bool", parsePgBoolText(e.get))
 genArrayDecoder(getStrArray, string, "string", e.get)
 genArrayDecoder(getBitArray, PgBit, "bit", parseBitString(e.get))
 
@@ -1408,7 +1393,7 @@ genArrayDecoderElemOpt(getInt16ArrayElemOpt, int16, pgParseInt16(e.get))
 genArrayDecoderElemOpt(getInt64ArrayElemOpt, int64, pgParseBiggestInt(e.get))
 genArrayDecoderElemOpt(getFloatArrayElemOpt, float64, pgParseFloat(e.get))
 genArrayDecoderElemOpt(getFloat32ArrayElemOpt, float32, pgParseFloat32(e.get))
-genArrayDecoderElemOpt(getBoolArrayElemOpt, bool, boolElemFromText(e.get))
+genArrayDecoderElemOpt(getBoolArrayElemOpt, bool, parsePgBoolText(e.get))
 genArrayDecoderElemOpt(getStrArrayElemOpt, string, e.get)
 
 # Array Opt accessors (text format)
