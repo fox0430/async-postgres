@@ -264,9 +264,7 @@ proc parseLsn*(s: string): Lsn =
 
 proc currentPgTimestamp*(): int64 =
   ## Current time as microseconds since the PostgreSQL epoch (2000-01-01 UTC).
-  let t = getTime()
-  let unixUs = t.toUnix() * 1_000_000'i64 + int64(t.nanosecond div 1000)
-  unixUs - pgEpochUnix * 1_000_000'i64
+  pgTimestampMicros(getTime())
 
 # pgoutput decoder
 
