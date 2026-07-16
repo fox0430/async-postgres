@@ -347,29 +347,70 @@ proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
     )
   parsePgMoney(row.getStr(col), scale)
 
+# Binary decoders for types whose scalar accessors reuse the same body as the
+# array-element decoders below. Defined here (above the scalars) so both call
+# sites route through a single implementation. The rest of the
+# `decodePgArrayElement*` overload set — plus text-only helpers — lives in the
+# registry section further down.
+
+proc decodePgArrayElement*(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
+  if buf.len != 16:
+    raise newException(PgTypeError, "uuid: bad length " & $buf.len)
+  const hexChars = "0123456789abcdef"
+  var s = newString(36)
+  var pos = 0
+  for j in 0 ..< 16:
+    if j == 4 or j == 6 or j == 8 or j == 10:
+      s[pos] = '-'
+      inc pos
+    let b = buf[j]
+    s[pos] = hexChars[int(b shr 4)]
+    s[pos + 1] = hexChars[int(b and 0x0F)]
+    pos += 2
+  PgUuid(s)
+
+proc decodePgArrayElement*(_: typedesc[PgInterval], buf: openArray[byte]): PgInterval =
+  if buf.len != 16:
+    raise newException(PgTypeError, "interval: bad length " & $buf.len)
+  result.microseconds = fromBE64(buf.toOpenArray(0, 7))
+  result.days = fromBE32(buf.toOpenArray(8, 11))
+  result.months = fromBE32(buf.toOpenArray(12, 15))
+
+proc decodePgArrayElement*(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacAddr =
+  if buf.len != 6:
+    raise newException(PgTypeError, "macaddr: bad length " & $buf.len)
+  var parts = newSeq[string](6)
+  for j in 0 ..< 6:
+    parts[j] = toHex(buf[j], 2).toLowerAscii()
+  PgMacAddr(parts.join(":"))
+
+proc decodePgArrayElement*(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacAddr8 =
+  if buf.len != 8:
+    raise newException(PgTypeError, "macaddr8: bad length " & $buf.len)
+  var parts = newSeq[string](8)
+  for j in 0 ..< 8:
+    parts[j] = toHex(buf[j], 2).toLowerAscii()
+  PgMacAddr8(parts.join(":"))
+
+proc decodeJsonArrayElem*(buf: openArray[byte], elemOid: int32): JsonNode =
+  # Strip the leading jsonb version byte only when elemOid says jsonb.
+  let jsonStr =
+    if elemOid == OidJsonb and buf.len > 0 and buf[0] == 1:
+      readString(buf, 1, buf.len - 1)
+    else:
+      readString(buf, 0, buf.len)
+  try:
+    parseJson(jsonStr)
+  except JsonParsingError:
+    raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
+
 proc getUuid*(row: Row, col: int): PgUuid =
   ## Get a column value as PgUuid. Handles binary format (16 bytes).
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    if clen != 16:
-      raise newException(
-        PgTypeError,
-        "Column " & $col & ": unexpected binary length " & $clen & " for uuid",
-      )
-    const hexChars = "0123456789abcdef"
-    var s = newString(36)
-    var pos = 0
-    for i in 0 ..< 16:
-      if i == 4 or i == 6 or i == 8 or i == 10:
-        s[pos] = '-'
-        inc pos
-      let b = row.data.buf[off + i]
-      s[pos] = hexChars[int(b shr 4)]
-      s[pos + 1] = hexChars[int(b and 0x0F)]
-      pos += 2
-    return PgUuid(s)
+    return decodePgArrayElement(PgUuid, row.data.buf.toOpenArray(off, off + clen - 1))
   PgUuid(row.getStr(col))
 
 proc getBool*(row: Row, col: int): bool =
@@ -506,15 +547,9 @@ proc getJson*(row: Row, col: int): JsonNode =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    var jsonStr: string
-    if row.colTypeOid(col) == OidJsonb and clen > 0 and row.data.buf[off] == 1:
-      jsonStr = readString(row.data.buf, off + 1, clen - 1)
-    else:
-      jsonStr = readString(row.data.buf, off, clen)
-    try:
-      return parseJson(jsonStr)
-    except JsonParsingError:
-      raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
+    return decodeJsonArrayElem(
+      row.data.buf.toOpenArray(off, off + clen - 1), row.colTypeOid(col)
+    )
   let s = row.getStr(col)
   try:
     return parseJson(s)
@@ -527,12 +562,8 @@ proc getInterval*(row: Row, col: int): PgInterval =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    if clen != 16:
-      raise newException(PgTypeError, "Invalid binary interval length: " & $clen)
-    result.microseconds = fromBE64(row.data.buf.toOpenArray(off, off + 7))
-    result.days = fromBE32(row.data.buf.toOpenArray(off + 8, off + 11))
-    result.months = fromBE32(row.data.buf.toOpenArray(off + 12, off + 15))
     return
+      decodePgArrayElement(PgInterval, row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
   parseIntervalText(s)
 
@@ -566,12 +597,8 @@ proc getMacAddr*(row: Row, col: int): PgMacAddr =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    if clen != 6:
-      raise newException(PgTypeError, "Invalid binary macaddr length: " & $clen)
-    var parts = newSeq[string](6)
-    for i in 0 ..< 6:
-      parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
-    return PgMacAddr(parts.join(":"))
+    return
+      decodePgArrayElement(PgMacAddr, row.data.buf.toOpenArray(off, off + clen - 1))
   PgMacAddr(row.getStr(col))
 
 proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
@@ -580,12 +607,8 @@ proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    if clen != 8:
-      raise newException(PgTypeError, "Invalid binary macaddr8 length: " & $clen)
-    var parts = newSeq[string](8)
-    for i in 0 ..< 8:
-      parts[i] = toHex(row.data.buf[off + i], 2).toLowerAscii()
-    return PgMacAddr8(parts.join(":"))
+    return
+      decodePgArrayElement(PgMacAddr8, row.data.buf.toOpenArray(off, off + clen - 1))
   PgMacAddr8(row.getStr(col))
 
 proc getBit*(row: Row, col: int): PgBit =
@@ -930,22 +953,6 @@ proc decodePgArrayElement*(_: typedesc[string], buf: openArray[byte]): string =
 proc decodePgArrayElement*(_: typedesc[seq[byte]], buf: openArray[byte]): seq[byte] =
   readBytes(buf, 0, buf.len)
 
-proc decodePgArrayElement*(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
-  if buf.len != 16:
-    raise newException(PgTypeError, "uuid array element: bad length " & $buf.len)
-  const hexChars = "0123456789abcdef"
-  var s = newString(36)
-  var pos = 0
-  for j in 0 ..< 16:
-    if j == 4 or j == 6 or j == 8 or j == 10:
-      s[pos] = '-'
-      inc pos
-    let b = buf[j]
-    s[pos] = hexChars[int(b shr 4)]
-    s[pos + 1] = hexChars[int(b and 0x0F)]
-    pos += 2
-  PgUuid(s)
-
 proc decodePgArrayElement*(_: typedesc[PgNumeric], buf: openArray[byte]): PgNumeric =
   decodeNumericBinary(buf)
 
@@ -973,13 +980,6 @@ proc decodePgArrayElement*(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
     data[j] = buf[4 + j]
   PgBit(nbits: nbits, data: data)
 
-proc decodePgArrayElement*(_: typedesc[PgInterval], buf: openArray[byte]): PgInterval =
-  if buf.len != 16:
-    raise newException(PgTypeError, "interval array element: bad length " & $buf.len)
-  result.microseconds = fromBE64(buf.toOpenArray(0, 7))
-  result.days = fromBE32(buf.toOpenArray(8, 11))
-  result.months = fromBE32(buf.toOpenArray(12, 15))
-
 proc decodePgArrayElement*(_: typedesc[PgTime], buf: openArray[byte]): PgTime =
   if buf.len != 8:
     raise newException(PgTypeError, "time array element: bad length " & $buf.len)
@@ -995,22 +995,6 @@ proc decodePgArrayElement*[T: PgInet | PgCidr](
 ): T =
   let (ip, mask) = decodeInetBinary(buf)
   T(address: ip, mask: mask)
-
-proc decodePgArrayElement*(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacAddr =
-  if buf.len != 6:
-    raise newException(PgTypeError, "macaddr array element: bad length " & $buf.len)
-  var parts = newSeq[string](6)
-  for j in 0 ..< 6:
-    parts[j] = toHex(buf[j], 2).toLowerAscii()
-  PgMacAddr(parts.join(":"))
-
-proc decodePgArrayElement*(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacAddr8 =
-  if buf.len != 8:
-    raise newException(PgTypeError, "macaddr8 array element: bad length " & $buf.len)
-  var parts = newSeq[string](8)
-  for j in 0 ..< 8:
-    parts[j] = toHex(buf[j], 2).toLowerAscii()
-  PgMacAddr8(parts.join(":"))
 
 proc decodePgArrayElement*[T: PgXml | PgTsVector | PgTsQuery](
     _: typedesc[T], buf: openArray[byte]
@@ -1092,17 +1076,8 @@ proc decodeDateArrayElem*(buf: openArray[byte]): DateTime =
     raise newException(PgTypeError, "Invalid binary date element length: " & $buf.len)
   decodeBinaryDate(buf)
 
-proc decodeJsonArrayElem*(buf: openArray[byte], elemOid: int32): JsonNode =
-  # Strip the leading jsonb version byte only when elemOid says jsonb.
-  let jsonStr =
-    if elemOid == OidJsonb and buf.len > 0 and buf[0] == 1:
-      readString(buf, 1, buf.len - 1)
-    else:
-      readString(buf, 0, buf.len)
-  try:
-    parseJson(jsonStr)
-  except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON element: " & jsonStr)
+# ``decodeJsonArrayElem`` is defined above (near the scalar accessors) so
+# ``getJson`` can delegate to it without a forward declaration.
 
 # Array decoder skeletons. ``genArrayDecoder`` hardcodes the binary body to
 # ``decodePgArrayElement(T, slice)``; ``genArrayDecoderCustom`` takes an
