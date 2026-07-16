@@ -222,6 +222,10 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   )
 
 proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
+  # `fetchNext` checks bufferedCount before exhausted, so clear it before any
+  # early return to keep the post-close @[] contract.
+  cursor.bufferedData = nil
+  cursor.bufferedCount = 0
   if cursor.exhausted:
     return
 

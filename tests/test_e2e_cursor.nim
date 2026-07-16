@@ -139,6 +139,30 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "fetchNext after close returns empty even when open buffered rows":
+    # Single-chunk results are buffered during openCursor. If close() leaves that
+    # buffer intact, a later fetchNext returns stale rows instead of the
+    # documented empty seq.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_cursor_closed_buf")
+      discard await conn.exec("CREATE TABLE test_cursor_closed_buf (id int)")
+      discard
+        await conn.exec("INSERT INTO test_cursor_closed_buf (id) VALUES (1), (2), (3)")
+
+      let cursor = await conn.openCursor(
+        "SELECT id FROM test_cursor_closed_buf ORDER BY id", chunkSize = 100
+      )
+      await cursor.close()
+      let chunk = await cursor.fetchNext()
+      doAssert chunk.len == 0
+      doAssert conn.state == csReady
+
+      discard await conn.exec("DROP TABLE test_cursor_closed_buf")
+      await conn.close()
+
+    waitFor t()
+
   test "withCursor cleans up on exception":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
