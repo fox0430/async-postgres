@@ -1093,8 +1093,11 @@ proc runReplicationStream(
       )
       if conn.state == csClosed:
         raise newException(PgConnectionError, "Connection closed during " & context)
+      # Without autoKeepaliveReply, lastStatusSent never advances, so a timer
+      # race here would rearm every ~1 ms.
+      let effectiveInterval = if autoKeepaliveReply: statusInterval else: ZeroDuration
       pendingRead =
-        await conn.replFillRecvBuf(statusInterval, lastStatusSent, pendingRead)
+        await conn.replFillRecvBuf(effectiveInterval, lastStatusSent, pendingRead)
       lastStatusSent = await conn.maybeSendPeriodicStatus(
         autoKeepaliveReply, statusInterval, lastStatusSent
       )
