@@ -1409,10 +1409,12 @@ proc queryRowOpt*(
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
   ## Execute a query and return the first row, or `none` if no rows.
-  let qr = await pool.query(sql, params, resultFormat, timeout)
-  if qr.rowCount > 0:
-    return some(initRow(qr.data, 0))
-  return none(Row)
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryRowOpt(sql, params, resultFormat, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryRow*(
     pool: PgPool,
@@ -1423,11 +1425,12 @@ proc queryRow*(
 ): Future[Row] {.async.} =
   ## Execute a query and return the first row.
   ## Raises `PgNoRowsError` if no rows are returned.
-  let row =
-    await pool.queryRowOpt(sql, params, resultFormat = resultFormat, timeout = timeout)
-  if row.isNone:
-    raise newException(PgNoRowsError, "Query returned no rows")
-  return row.get
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryRow(sql, params, resultFormat, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryValue*(
     pool: PgPool,
@@ -1437,13 +1440,12 @@ proc queryValue*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  if qr.rowCount == 0:
-    raise newException(PgNoRowsError, "Query returned no rows")
-  let row = initRow(qr.data, 0)
-  if row.isNull(0):
-    raise newException(PgNullError, "Query returned NULL")
-  return row.getStr(0)
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValue(sql, params, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryValue*[T](
     pool: PgPool,
@@ -1454,13 +1456,12 @@ proc queryValue*[T](
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  if qr.rowCount == 0:
-    raise newException(PgNoRowsError, "Query returned no rows")
-  let row = initRow(qr.data, 0)
-  if row.isNull(0):
-    raise newException(PgNullError, "Query returned NULL")
-  return row.get(0, T)
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValue(T, sql, params, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryValueOpt*(
     pool: PgPool,
@@ -1470,13 +1471,12 @@ proc queryValueOpt*(
 ): Future[Option[string]] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `none` if no rows or the value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  if qr.rowCount == 0:
-    return none(string)
-  let row = initRow(qr.data, 0)
-  if row.isNull(0):
-    return none(string)
-  return some(row.getStr(0))
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOpt(sql, params, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryValueOpt*[T](
     pool: PgPool,
@@ -1487,13 +1487,12 @@ proc queryValueOpt*[T](
 ): Future[Option[T]] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `none` if no rows or the value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  if qr.rowCount == 0:
-    return none(T)
-  let row = initRow(qr.data, 0)
-  if row.isNull(0):
-    return none(T)
-  return some(row.get(0, T))
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOpt(T, sql, params, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryValueOrDefault*(
     pool: PgPool,
@@ -1504,13 +1503,12 @@ proc queryValueOrDefault*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `default` if no rows or the value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  if qr.rowCount == 0:
-    return default
-  let row = initRow(qr.data, 0)
-  if row.isNull(0):
-    return default
-  return row.getStr(0)
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOrDefault(sql, params, default, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryValueOrDefault*[T](
     pool: PgPool,
@@ -1522,13 +1520,12 @@ proc queryValueOrDefault*[T](
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `default` if no rows or the value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  if qr.rowCount == 0:
-    return default
-  let row = initRow(qr.data, 0)
-  if row.isNull(0):
-    return default
-  return row.get(0, T)
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOrDefault(T, sql, params, default, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryValueOrDefault*[T](
     pool: PgPool,
@@ -1540,13 +1537,12 @@ proc queryValueOrDefault*[T](
   ## Execute a query and return the first column of the first row as `T`,
   ## inferring `T` from `default`.
   ## Returns `default` if no rows or the value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  if qr.rowCount == 0:
-    return default
-  let row = initRow(qr.data, 0)
-  if row.isNull(0):
-    return default
-  return row.get(0, T)
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryValueOrDefault(sql, params, default, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryExists*(
     pool: PgPool,
@@ -1555,8 +1551,12 @@ proc queryExists*(
     timeout: Duration = ZeroDuration,
 ): Future[bool] {.async.} =
   ## Execute a query and return whether any rows exist.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  return qr.rowCount > 0
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryExists(sql, params, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc queryColumn*(
     pool: PgPool,
@@ -1566,12 +1566,12 @@ proc queryColumn*(
 ): Future[seq[string]] {.async.} =
   ## Execute a query and return the first column of all rows as strings.
   ## Raises `PgNullError` if any value is NULL.
-  let qr = await pool.query(sql, params, timeout = timeout)
-  for i in 0 ..< qr.rowCount:
-    let row = initRow(qr.data, i)
-    if row.isNull(0):
-      raise newException(PgNullError, "NULL value in column")
-    result.add(row.getStr(0))
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryColumn(sql, params, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
 
 proc simpleQuery*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
