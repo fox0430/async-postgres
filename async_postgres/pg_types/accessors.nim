@@ -449,11 +449,7 @@ proc getDate*(row: Row, col: int): DateTime =
         "Column " & $col & ": unexpected binary length " & $clen & " for date",
       )
     return decodeBinaryDate(row.data.buf.toOpenArray(off, off + 3))
-  let s = row.getStr(col)
-  try:
-    return parse(s, "yyyy-MM-dd")
-  except TimeParseError:
-    raise newException(PgTypeError, "Invalid date: " & s)
+  parseDateText(row.getStr(col))
 
 proc getTimestampTz*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime from a timestamptz column.
@@ -1220,18 +1216,12 @@ genArrayDecoderCustom(
   parseTimestampText(e.get),
 )
 
-proc dateElemFromText(s: string): DateTime =
-  try:
-    parse(s, "yyyy-MM-dd")
-  except TimeParseError:
-    raise newException(PgTypeError, "Invalid date: " & s)
-
 genArrayDecoderCustom(
   getDateArray,
   DateTime,
   "date",
   decodeDateArrayElem(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
-  dateElemFromText(e.get),
+  parseDateText(e.get),
 )
 
 genArrayDecoder(getTimeArray, PgTime, "time", parseTimeText(e.get))
