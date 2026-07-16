@@ -480,12 +480,17 @@ proc pgTimeFieldsMicros(hour, minute, second, microsecond: int32): int64 {.inlin
   int64(hour) * 3_600_000_000'i64 + int64(minute) * 60_000_000'i64 +
     int64(second) * 1_000_000'i64 + int64(microsecond)
 
+proc pgTimestampMicros*(t: Time): int64 {.inline.} =
+  ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for a ``Time``.
+  ## Shared with the ``DateTime`` overload, ``ranges.nim``, and
+  ## ``pg_replication.currentPgTimestamp``.
+  let unixUs = t.toUnix() * 1_000_000'i64 + int64(t.nanosecond div 1000)
+  unixUs - pgEpochUnix * 1_000_000'i64
+
 proc pgTimestampMicros*(v: DateTime): int64 {.inline.} =
   ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for ``timestamp``
   ## / ``timestamptz`` binary format. Shared with ``ranges.nim``.
-  let t = v.toTime()
-  let unixUs = t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000)
-  unixUs - pgEpochUnix * 1_000_000
+  pgTimestampMicros(v.toTime())
 
 proc pgDateDays*(v: DateTime): int32 {.inline.} =
   ## Days since the PostgreSQL epoch (2000-01-01) for ``date`` binary format.
