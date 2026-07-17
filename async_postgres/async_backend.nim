@@ -113,11 +113,6 @@ elif hasAsyncDispatch:
   proc `==`*(a, b: Duration): bool {.borrow.}
   proc `<`*(a, b: Duration): bool {.borrow.}
   proc `<=`*(a, b: Duration): bool {.borrow.}
-  proc `>`*(a, b: Duration): bool =
-    int64(a) > int64(b)
-
-  proc `>=`*(a, b: Duration): bool =
-    int64(a) >= int64(b)
 
   proc `-`*(a, b: Duration): Duration {.borrow.}
   proc `+`*(a, b: Duration): Duration {.borrow.}
@@ -153,17 +148,11 @@ elif hasAsyncDispatch:
   proc `+`*(a: Moment, b: Duration): Moment =
     Moment(ticks: a.ticks + int64(b))
 
-  proc `>=`*(a, b: Moment): bool =
-    a.ticks >= b.ticks
-
   proc `<=`*(a, b: Moment): bool =
     a.ticks <= b.ticks
 
   proc `<`*(a, b: Moment): bool =
     a.ticks < b.ticks
-
-  proc `>`*(a, b: Moment): bool =
-    a.ticks > b.ticks
 
   proc wait*[T](
       fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.} = nil
