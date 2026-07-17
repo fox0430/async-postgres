@@ -919,6 +919,111 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: cached entry retains resultFormats/colFmts/colOids after miss":
+    # If empty, no-override cache hits lose per-OID default formats and
+    # binary decode metadata.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 42::int4 AS a, 'hi'::text AS b, 3.14::float8 AS c"
+
+      discard await conn.query(sql, resultFormat = rfBinary)
+      doAssert conn.stmtCache.hasKey(sql)
+      let cached = conn.stmtCache[sql]
+      doAssert cached.fields.len == 3
+      doAssert cached.resultFormats.len == 3
+      doAssert cached.colFmts.len == 3
+      doAssert cached.colOids.len == 3
+      for i in 0 ..< cached.fields.len:
+        doAssert cached.colOids[i] == cached.fields[i].typeOid
+        doAssert cached.colFmts[i] == cached.resultFormats[i]
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: no-override cache hit after rfBinary decodes correctly":
+    # rfAuto after rfBinary must not silently degrade binary-safe columns.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 12345::int4 AS a, 6789::int8 AS b"
+
+      let r1 = await conn.query(sql, resultFormat = rfBinary)
+      doAssert r1.rows[0].getInt(0) == 12345
+      doAssert r1.rows[0].getInt64(1) == 6789
+      doAssert conn.stmtCache.len == 1
+
+      let r2 = await conn.query(sql) # rfAuto, cache hit
+      doAssert conn.stmtCache.len == 1
+      doAssert r2.fields[0].formatCode == 1
+      doAssert r2.fields[1].formatCode == 1
+      doAssert r2.rows[0].getInt(0) == 12345
+      doAssert r2.rows[0].getInt64(1) == 6789
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: queryDirect cache hit uses cached decode metadata":
+    # queryDirect has no resultFormat arg, so seed the cache via query(rfBinary)
+    # to exercise the cache-hit decode path with binary metadata.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 12345::int4"
+
+      let r1 = await conn.query(sql, resultFormat = rfBinary)
+      doAssert r1.rows[0].getInt(0) == 12345
+      doAssert conn.stmtCache.len == 1
+
+      let r2 = await conn.queryDirect(sql) # cache hit
+      doAssert conn.stmtCache.len == 1
+      doAssert r2.fields[0].formatCode == 1
+      doAssert r2.rows[0].getInt(0) == 12345
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: pipeline no-override cache hit after rfBinary decodes correctly":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 987654::int4 AS v"
+
+      let rBin = await conn.query(sql, resultFormat = rfBinary)
+      doAssert rBin.rows[0].getInt(0) == 987654
+      doAssert conn.stmtCache.len == 1
+
+      let p = newPipeline(conn)
+      p.addQuery(sql) # rfAuto
+      let rAuto = await p.execute()
+      doAssert conn.stmtCache.len == 1
+      doAssert rAuto[0].queryResult.fields[0].formatCode == 1
+      doAssert rAuto[0].queryResult.rows[0].getInt(0) == 987654
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: exec then query on same SQL preserves cached decode metadata":
+    # exec's addStmtCache path must populate decode metadata for a later query hit.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 42::int4 AS v"
+
+      discard await conn.exec(sql)
+      doAssert conn.stmtCache.hasKey(sql)
+      let cached = conn.stmtCache[sql]
+      doAssert cached.resultFormats.len == 1
+      doAssert cached.colFmts.len == 1
+      doAssert cached.colOids.len == 1
+
+      let r = await conn.query(sql) # rfAuto cache hit
+      doAssert r.fields[0].formatCode == 1
+      doAssert r.rows[0].getInt(0) == 42
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: clearStmtCache works":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
