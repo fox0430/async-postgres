@@ -144,10 +144,9 @@ type
 
   UpdateMessage* = object ## Row update.
     relationId*: int32
-    hasOldTuple*: bool ## True if old key/full row is included
     keyKind*: char
-      ## When hasOldTuple is true: 'K' if oldTuple holds only the replica
-      ## identity key, 'O' if it holds the full old row (REPLICA IDENTITY FULL).
+      ## 'K' if oldTuple holds only the replica identity key,
+      ## 'O' if it holds the full old row (REPLICA IDENTITY FULL),
       ## '\0' when no old tuple is present.
     oldTuple*: seq[TupleField]
     newTuple*: seq[TupleField]
@@ -213,6 +212,10 @@ proc `>`*(a, b: Lsn): bool {.inline.} =
 
 proc `>=`*(a, b: Lsn): bool {.inline.} =
   b <= a
+
+proc hasOldTuple*(msg: UpdateMessage): bool {.inline.} =
+  ## True if the update carries an old tuple (replica identity key or full row).
+  msg.keyKind != '\0'
 
 proc toString*(field: TupleField): string =
   ## Convert a TupleField's data to a string by copying the bytes.
@@ -429,7 +432,6 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     inc pos
     if marker == 'K' or marker == 'O':
       # Old key or old tuple included
-      msg.hasOldTuple = true
       msg.keyKind = marker
       let (oldFields, nextPos) = decodeTuple(data, pos)
       msg.oldTuple = oldFields
