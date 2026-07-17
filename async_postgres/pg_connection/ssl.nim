@@ -40,6 +40,7 @@ when hasAsyncDispatch and defined(ssl):
     SslGet0ParamFn = proc(ssl: SslPtr): pointer {.cdecl, gcsafe, raises: [].}
     X509SetIpAscFn =
       proc(param: pointer, ipasc: cstring): cint {.cdecl, gcsafe, raises: [].}
+    SslGetBioFn = proc(ssl: SslPtr): BIO {.cdecl, gcsafe, raises: [].}
 
   # Apple's system libssl/libcrypto omit these symbols; an eager `{.dynlib.}`
   # binding would abort the process at startup. Resolve lazily and let callers
@@ -51,6 +52,10 @@ when hasAsyncDispatch and defined(ssl):
     sslGet0ParamResolved: bool
     x509SetIpAscFn: X509SetIpAscFn
     x509SetIpAscResolved: bool
+    sslGetRbioFn: SslGetBioFn
+    sslGetRbioResolved: bool
+    sslGetWbioFn: SslGetBioFn
+    sslGetWbioResolved: bool
 
   proc sslSet1Host*(): SslSet1HostFn =
     if not sslSet1HostResolved:
@@ -76,6 +81,92 @@ when hasAsyncDispatch and defined(ssl):
           cast[X509SetIpAscFn](symAddr(lib, "X509_VERIFY_PARAM_set1_ip_asc"))
       x509SetIpAscResolved = true
     x509SetIpAscFn
+
+  proc sslGetRbio*(): SslGetBioFn =
+    if not sslGetRbioResolved:
+      let lib = loadLibPattern(DLLSSLName)
+      if lib != nil:
+        sslGetRbioFn = cast[SslGetBioFn](symAddr(lib, "SSL_get_rbio"))
+      sslGetRbioResolved = true
+    sslGetRbioFn
+
+  proc sslGetWbio*(): SslGetBioFn =
+    if not sslGetWbioResolved:
+      let lib = loadLibPattern(DLLSSLName)
+      if lib != nil:
+        sslGetWbioFn = cast[SslGetBioFn](symAddr(lib, "SSL_get_wbio"))
+      sslGetWbioResolved = true
+    sslGetWbioFn
+
+  proc formatSslError(prefix: string): string =
+    result = prefix
+    let code = ERR_peek_last_error()
+    if code != 0:
+      result &= ": " & $ERR_error_string(code, nil)
+
+  proc driveTlsHandshake(socket: AsyncSocket) {.async.} =
+    ## Drive `wrapConnectedSocket`'s deferred client handshake to completion,
+    ## shuttling bytes between OpenSSL's memory BIOs and the raw AsyncFD.
+    ## Required so `SSL_get_peer_certificate` returns the leaf cert for SCRAM
+    ## channel binding (asyncnet only performs the handshake on the first
+    ## application send/recv, and its `sslLoop`/BIO plumbing is not exported).
+    const HandshakeBufSize = 4096
+    let ssl = socket.sslHandle
+    if ssl == nil:
+      raise
+        newException(PgConnectionError, "TLS handshake: SSL handle is not initialised")
+    let getRbio = sslGetRbio()
+    let getWbio = sslGetWbio()
+    if getRbio == nil or getWbio == nil:
+      raise newException(
+        PgConnectionError,
+        "TLS handshake: libssl does not export SSL_get_rbio / SSL_get_wbio",
+      )
+    let rbio = getRbio(ssl)
+    let wbio = getWbio(ssl)
+    if rbio == nil or wbio == nil:
+      raise newException(PgConnectionError, "TLS handshake: memory BIOs unavailable")
+    let fd = socket.getFd.AsyncFD
+    while true:
+      ErrClearError()
+      let ret = sslDoHandshake(ssl)
+      # Flush anything OpenSSL wrote to the outgoing memory BIO (ClientHello,
+      # key exchange, Finished, …) regardless of `ret`, so a WANT_READ still
+      # sends its handshake record before we block on the peer's reply.
+      let pending = bioCtrlPending(wbio)
+      if pending > 0:
+        var outBuf = newString(pending)
+        let read = bioRead(wbio, cast[cstring](addr outBuf[0]), pending)
+        if read <= 0:
+          raise newException(
+            PgConnectionError, formatSslError("TLS handshake: BIO_read failed")
+          )
+        outBuf.setLen(read)
+        # Qualified to force asyncdispatch's raw AsyncFD overload — asyncnet's
+        # `send` would recurse into the very handshake loop we drive.
+        await asyncdispatch.send(fd, outBuf, flags = {})
+      if ret == 1:
+        return
+      let err = SSL_get_error(ssl, ret)
+      case err
+      of SSL_ERROR_WANT_READ:
+        let data = await asyncdispatch.recv(fd, HandshakeBufSize, flags = {})
+        if data.len == 0:
+          raise
+            newException(PgConnectionError, "TLS handshake: connection closed by peer")
+        let wrote = bioWrite(rbio, cast[cstring](unsafeAddr data[0]), data.len.cint)
+        if wrote <= 0:
+          raise newException(
+            PgConnectionError, formatSslError("TLS handshake: BIO_write failed")
+          )
+      of SSL_ERROR_WANT_WRITE:
+        # Nothing to do: pending output was flushed above. Loop and retry.
+        discard
+      else:
+        raise newException(
+          PgConnectionError,
+          formatSslError("TLS handshake failed (SSL_get_error=" & $err & ")"),
+        )
 
   proc enforceVerifyFullIdentity(sslHandle: SslPtr, host: string) =
     ## Make OpenSSL match the peer certificate against `host` during the deferred
@@ -266,6 +357,11 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
           # OpenSSL enforce the hostname/IP match itself during that handshake.
           if config.sslMode == sslVerifyFull:
             enforceVerifyFullIdentity(conn.socket.sslHandle, sslHost)
+          # Drive the handshake here rather than letting the first application
+          # send/recv trigger it: the peer cert is required *before* SCRAM to
+          # decide channel binding, and OpenSSL only populates it once the
+          # handshake completes.
+          await driveTlsHandshake(conn.socket)
           conn.sslEnabled = true
           # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
           # If unavailable, cbPrefer will silently fall back to SCRAM-SHA-256 —
