@@ -4,6 +4,8 @@
 ## Select the backend at compile time with `-d:asyncBackend=asyncdispatch|chronos`.
 ## Default backend is asyncdispatch.
 
+import std/[macros, strutils]
+
 const asyncBackend {.strdefine.} = "asyncdispatch"
 
 const hasAsyncDispatch* = asyncBackend == "asyncdispatch"
@@ -283,6 +285,66 @@ elif hasAsyncDispatch:
 
 else:
   {.fatal: "Unknown asyncBackend. Use -d:asyncBackend=asyncdispatch|chronos".}
+
+macro declareAsyncCallback*(
+    name: untyped, procType: untyped, doc: static string = ""
+): untyped =
+  ## Declare `name*` as an async callback proc-type, injecting
+  ## backend-appropriate pragmas so callers do not repeat
+  ## `when hasChronos: ... else: ...` blocks.
+  ##
+  ## chronos gets `{.async: (raises: [CatchableError]), gcsafe.}`; asyncdispatch
+  ## gets `{.gcsafe.}`. `procType` must be a bare proc-type expression with no
+  ## pragmas attached. Optional `doc` becomes the emitted type's docstring.
+  when hasChronos:
+    const pragmas = "{.async: (raises: [CatchableError]), gcsafe.}"
+  else:
+    const pragmas = "{.gcsafe.}"
+  var src = "type " & $name & "* = " & procType.repr & " " & pragmas
+  if doc.len > 0:
+    src.add("\n  ## ")
+    src.add(doc.replace("\n", "\n  ## "))
+  result = parseStmt(src)
+
+template makeAsyncSinkByteCallback*(cbType: typedesc, body: untyped): untyped =
+  ## Build a `cbType` async callback receiving `data: sink seq[byte]` and
+  ## returning `Future[void]`. Split from a generic void-shape maker because
+  ## splicing the parameter type through an `untyped` template param confuses
+  ## asyncdispatch's `{.async.}` macro; keeping the whole parameter literal
+  ## sidesteps that. `data` is injected into `body`'s scope.
+  block:
+    when hasChronos:
+      let r: cbType = proc(
+          data {.inject.}: sink seq[byte]
+      ) {.async: (raises: [CatchableError]).} =
+        body
+      r
+    else:
+      let r: cbType = proc(data {.inject.}: sink seq[byte]) {.async.} =
+        body
+      r
+
+template makeAsyncSeqByteCallback*(
+    cbType: typedesc, futName: static string, body: untyped
+): untyped =
+  ## Build a `cbType` producer callback returning `Future[seq[byte]]`.
+  ## Under asyncdispatch `body` must be synchronous: `async` cannot annotate a
+  ## non-void anonymous proc, so the Future is constructed manually.
+  block:
+    when hasChronos:
+      let r: cbType = proc(): Future[seq[byte]] {.async: (raises: [CatchableError]).} =
+        body
+      r
+    else:
+      let r: cbType = proc(): Future[seq[byte]] {.gcsafe.} =
+        let fut = newFuture[seq[byte]](futName)
+        try:
+          let res: seq[byte] = body
+          fut.complete(res)
+        except CatchableError as e:
+          fut.fail(e)
+        return fut
+      r
 
 proc remainingDeadlineDuration*(deadline: Moment): Duration =
   ## Compute the remaining Duration until `deadline`. When the deadline has

@@ -17,7 +17,7 @@ proc queryInTransactionImpl(
     resultFormats: seq[int16],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
+  conn.checkTxIdle()
 
   let formats =
     if paramFormats.len > 0:
@@ -42,6 +42,7 @@ proc queryInTransactionImpl(
   conn.sendBuf.addExecute("", 0)
   # Single Sync
   conn.sendBuf.addSync()
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()
@@ -125,14 +126,13 @@ proc execInTransaction*(
     TraceQueryEndData(commandTag: tag),
   ):
     let (oids, formats, values) = extractParams(params)
-    if timeout > ZeroDuration:
-      try:
-        tag = await execInTransactionImpl(conn, "BEGIN", sql, values, oids, formats)
-          .wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("execInTransaction timed out")
-    else:
-      tag = await execInTransactionImpl(conn, "BEGIN", sql, values, oids, formats)
+    awaitOrInvalidate(
+      conn,
+      tag,
+      execInTransactionImpl(conn, "BEGIN", sql, values, oids, formats),
+      timeout,
+      "execInTransaction timed out",
+    )
   return initCommandResult(tag)
 
 proc execInTransaction*(
@@ -154,14 +154,13 @@ proc execInTransaction*(
   ):
     let (oids, formats, values) = extractParams(params)
     let beginSql = buildBeginSql(opts)
-    if timeout > ZeroDuration:
-      try:
-        tag = await execInTransactionImpl(conn, beginSql, sql, values, oids, formats)
-          .wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("execInTransaction timed out")
-    else:
-      tag = await execInTransactionImpl(conn, beginSql, sql, values, oids, formats)
+    awaitOrInvalidate(
+      conn,
+      tag,
+      execInTransactionImpl(conn, beginSql, sql, values, oids, formats),
+      timeout,
+      "execInTransaction timed out",
+    )
   return initCommandResult(tag)
 
 proc queryInTransaction*(
@@ -185,18 +184,13 @@ proc queryInTransaction*(
   ):
     let (oids, formats, values) = extractParams(params)
     let resultFormats = resultFormat.toFormatCodes()
-    if timeout > ZeroDuration:
-      try:
-        qr = await queryInTransactionImpl(
-          conn, "BEGIN", sql, values, oids, formats, resultFormats
-        )
-          .wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("queryInTransaction timed out")
-    else:
-      qr = await queryInTransactionImpl(
-        conn, "BEGIN", sql, values, oids, formats, resultFormats
-      )
+    awaitOrInvalidate(
+      conn,
+      qr,
+      queryInTransactionImpl(conn, "BEGIN", sql, values, oids, formats, resultFormats),
+      timeout,
+      "queryInTransaction timed out",
+    )
   return qr
 
 proc queryInTransaction*(
@@ -220,16 +214,11 @@ proc queryInTransaction*(
     let (oids, formats, values) = extractParams(params)
     let resultFormats = resultFormat.toFormatCodes()
     let beginSql = buildBeginSql(opts)
-    if timeout > ZeroDuration:
-      try:
-        qr = await queryInTransactionImpl(
-          conn, beginSql, sql, values, oids, formats, resultFormats
-        )
-          .wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("queryInTransaction timed out")
-    else:
-      qr = await queryInTransactionImpl(
-        conn, beginSql, sql, values, oids, formats, resultFormats
-      )
+    awaitOrInvalidate(
+      conn,
+      qr,
+      queryInTransactionImpl(conn, beginSql, sql, values, oids, formats, resultFormats),
+      timeout,
+      "queryInTransaction timed out",
+    )
   return qr

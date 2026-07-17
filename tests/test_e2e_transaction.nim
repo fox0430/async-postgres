@@ -236,6 +236,30 @@ suite "E2E: Transaction":
 
     )
 
+  test "pool.withTransactionRetry does not leak a connection when retryOpts raises":
+    proc raisingRetryOpts(): RetryOptions =
+      raise newException(ValueError, "compute retryOpts failed")
+
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 0, maxSize: 1))
+
+      var raised = false
+      try:
+        pool.withTransactionRetry(raisingRetryOpts(), conn):
+          discard await conn.exec("SELECT 1")
+      except ValueError:
+        raised = true
+
+      doAssert raised
+      doAssert pool.activeCount == 0
+      # A leaked slot would starve this acquire on a maxSize=1 pool.
+      let c = await pool.acquire()
+      c.release()
+      await pool.close()
+
+    waitFor t()
+
   test "cluster.withTransactionRetry retries on serialization failure then commits":
     proc t() {.async.} =
       # Point both primary and replica at the local server. Set tsaReadWrite
@@ -287,6 +311,33 @@ suite "E2E: Transaction":
             return
 
     )
+
+  test "cluster.withTransactionRetry does not leak a connection when retryOpts raises":
+    proc raisingRetryOpts(): RetryOptions =
+      raise newException(ValueError, "compute retryOpts failed")
+
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.targetSessionAttrs = tsaReadWrite
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 0, maxSize: 1),
+        PoolConfig(connConfig: cfg, minSize: 0, maxSize: 1),
+      )
+
+      var raised = false
+      try:
+        cluster.withTransactionRetry(raisingRetryOpts(), conn):
+          discard await conn.exec("SELECT 1")
+      except ValueError:
+        raised = true
+
+      doAssert raised
+      doAssert cluster.primaryPool.activeCount == 0
+      let c = await cluster.primaryPool.acquire()
+      c.release()
+      await cluster.close()
+
+    waitFor t()
 
   test "pool.withTransaction commits on success":
     proc t() {.async.} =
@@ -964,7 +1015,7 @@ suite "E2E: Transaction":
         raised = true
 
       doAssert raised
-      doAssert "SAVEPOINT sp_outer_done" in queries
+      doAssert "SAVEPOINT \"sp_outer_done\"" in queries
       var hasRollbackToSp = false
       for q in queries:
         if q.startsWith("ROLLBACK TO SAVEPOINT"):
@@ -974,6 +1025,45 @@ suite "E2E: Transaction":
       doAssert conn.txStatus == tsIdle
 
       conn.tracer = nil
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepoint quotes savepoint name (SQL injection guard)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS sp_injection_probe2")
+      discard
+        await conn.exec("CREATE TABLE sp_injection_probe2 (id serial PRIMARY KEY)")
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      # withSavepoint requires a string-literal name; still worth verifying it
+      # is emitted quoted so identifier-legal characters (e.g. dashes) round-trip.
+      conn.withTransaction:
+        conn.withSavepoint("odd-name"):
+          discard await conn.exec("SELECT 1")
+
+      var sawSavepoint = false
+      var sawRelease = false
+      for q in queries:
+        if q == "SAVEPOINT \"odd-name\"":
+          sawSavepoint = true
+        elif q == "RELEASE SAVEPOINT \"odd-name\"":
+          sawRelease = true
+      doAssert sawSavepoint
+      doAssert sawRelease
+
+      conn.tracer = nil
+      discard await conn.exec("DROP TABLE sp_injection_probe2")
       await conn.close()
 
     waitFor t()
@@ -1535,6 +1625,55 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  test "withSavepointDeadline quotes savepoint name (SQL injection guard)":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS sp_injection_probe")
+      discard await conn.exec("CREATE TABLE sp_injection_probe (id serial PRIMARY KEY)")
+
+      # Name containing ';' and embedded '"' — if concatenated unquoted into
+      # simpleExec it would execute the trailing DROP TABLE via the simple
+      # query protocol's multi-statement support.
+      let hostileName = "sp\"; DROP TABLE sp_injection_probe; --"
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      conn.tracer = tracer
+
+      conn.withTransaction:
+        conn.withSavepointDeadline(hostileName, seconds(5)):
+          discard await conn.exec("SELECT 1")
+
+      # Probe table must survive — injection payload never executed.
+      let res = await conn.query(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'sp_injection_probe'"
+      )
+      doAssert res.rows.len == 1
+
+      # Quoted-identifier form: embedded '"' doubled per SQL rules.
+      let quoted = "\"sp\"\"; DROP TABLE sp_injection_probe; --\""
+      var sawSavepoint = false
+      var sawRelease = false
+      for q in queries:
+        if q == "SAVEPOINT " & quoted:
+          sawSavepoint = true
+        elif q == "RELEASE SAVEPOINT " & quoted:
+          sawRelease = true
+      doAssert sawSavepoint
+      doAssert sawRelease
+
+      conn.tracer = nil
+      discard await conn.exec("DROP TABLE sp_injection_probe")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: execInTransaction / queryInTransaction":
   test "execInTransaction commits successfully":
     proc t() {.async.} =
@@ -1973,6 +2112,41 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert conn.pendingStmtCloses.len >= 1 # Close queued for the evicted stmt
 
       discard await conn.query("DROP TABLE IF EXISTS t_m9_evict")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated evicts and queues Close for failing op":
+    # executeIsolated counterpart: 0A000 on a cache hit must both evict the
+    # entry and queue a server-side Close so the still-live statement is
+    # reclaimed on the next op.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.query("DROP TABLE IF EXISTS t_iso_evict")
+      discard await conn.query("CREATE TABLE t_iso_evict(a int4)")
+      discard await conn.query("INSERT INTO t_iso_evict VALUES (1)")
+
+      discard await conn.query("SELECT 54321::int4")
+      discard await conn.query("SELECT * FROM t_iso_evict")
+      doAssert conn.stmtCache.hasKey("SELECT 54321::int4")
+      doAssert conn.stmtCache.hasKey("SELECT * FROM t_iso_evict")
+
+      discard await conn.query("ALTER TABLE t_iso_evict ADD COLUMN b int4")
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT 54321::int4") # cache hit, succeeds
+      p.addQuery("SELECT * FROM t_iso_evict") # cache hit, fails 0A000
+      let ir = await p.executeIsolated()
+
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] != nil
+      doAssert (ref PgQueryError)(ir.errors[1]).sqlState == "0A000"
+
+      doAssert conn.stmtCache.hasKey("SELECT 54321::int4")
+      doAssert not conn.stmtCache.hasKey("SELECT * FROM t_iso_evict")
+      doAssert conn.pendingStmtCloses.len >= 1
+
+      discard await conn.query("DROP TABLE IF EXISTS t_iso_evict")
       await conn.close()
 
     waitFor t()
@@ -3101,6 +3275,135 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert ir.results[1].queryResult.rows[0].isBinaryCol(0)
 
       doAssert conn.stmtCache.len == 1
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Nested BEGIN rejection":
+  # Nested BEGIN is a server-side no-op; the inner COMMIT would silently end the
+  # outer transaction and confirm its uncommitted work. Every top-level
+  # BEGIN/COMMIT scope must reject entry when a transaction is already active.
+
+  test "withTransaction rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransaction:
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransactionRetry(RetryOptions(maxAttempts: 2)):
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransactionDeadline(seconds(5)):
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 2), seconds(5)):
+            discard await conn.exec("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "execInTransaction rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          discard await conn.execInTransaction("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "queryInTransaction rejects nested BEGIN":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      conn.withTransaction:
+        try:
+          discard await conn.queryInTransaction("SELECT 1")
+        except PgStateError:
+          raised = true
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      await conn.close()
+
+    waitFor t()
+
+  test "outer withTransaction ROLLBACKs on inner rejection, not COMMITs":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_nest_reject")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_nest_reject (id serial PRIMARY KEY, val text)"
+      )
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          discard await conn.exec(
+            "INSERT INTO test_tx_nest_reject (val) VALUES ($1)", @[toPgParam("outer")]
+          )
+          conn.withTransaction:
+            discard await conn.exec("SELECT 1")
+      except PgStateError:
+        raised = true
+
+      doAssert raised
+      doAssert conn.txStatus == tsIdle
+      let res = await conn.query("SELECT count(*) FROM test_tx_nest_reject")
+      doAssert res.rows[0].getInt64(0) == 0,
+        "outer INSERT must have been rolled back, not committed by inner COMMIT"
+
+      discard await conn.exec("DROP TABLE test_tx_nest_reject")
       await conn.close()
 
     waitFor t()

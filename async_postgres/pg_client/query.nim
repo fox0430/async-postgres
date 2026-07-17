@@ -16,7 +16,6 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let formats =
     if paramFormats.len > 0:
@@ -49,6 +48,7 @@ proc queryImpl*(
     bindStep =
       conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()
@@ -65,7 +65,6 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -91,6 +90,7 @@ proc queryImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()
@@ -108,7 +108,6 @@ proc queryEachImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[int64] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -134,6 +133,7 @@ proc queryEachImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var rowCount: int64 = 0
@@ -169,14 +169,13 @@ proc queryEach*(
     TraceQueryEndData(rowCount: count),
   ):
     let resultFormats = resultFormat.toFormatCodes()
-    if timeout > ZeroDuration:
-      try:
-        count =
-          await queryEachImpl(conn, sql, params, callback, resultFormats).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("queryEach timed out")
-    else:
-      count = await queryEachImpl(conn, sql, params, callback, resultFormats)
+    awaitOrInvalidate(
+      conn,
+      count,
+      queryEachImpl(conn, sql, params, callback, resultFormats),
+      timeout,
+      "queryEach timed out",
+    )
   return count
 
 proc query*(
@@ -204,13 +203,9 @@ proc query*(
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
   ):
     let resultFormats = resultFormat.toFormatCodes()
-    if timeout > ZeroDuration:
-      try:
-        qr = await queryImpl(conn, sql, params, resultFormats).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("Query timed out")
-    else:
-      qr = await queryImpl(conn, sql, params, resultFormats)
+    awaitOrInvalidate(
+      conn, qr, queryImpl(conn, sql, params, resultFormats), timeout, "Query timed out"
+    )
   return qr
 
 proc queryInlineImpl*(
@@ -223,7 +218,6 @@ proc queryInlineImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -251,6 +245,7 @@ proc queryInlineImpl*(
       "", stmtName, paramFormats, data, ranges, effectiveResultFormats
     ),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var qr = QueryResult()
@@ -281,16 +276,13 @@ proc query*(
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
   ):
     let resultFormats = resultFormat.toFormatCodes()
-    if timeout > ZeroDuration:
-      try:
-        qr = await queryInlineImpl(
-          conn, sql, data, ranges, oids, formats, resultFormats
-        )
-          .wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("Query timed out")
-    else:
-      qr = await queryInlineImpl(conn, sql, data, ranges, oids, formats, resultFormats)
+    awaitOrInvalidate(
+      conn,
+      qr,
+      queryInlineImpl(conn, sql, data, ranges, oids, formats, resultFormats),
+      timeout,
+      "Query timed out",
+    )
   return qr
 
 proc queryRowOpt*(

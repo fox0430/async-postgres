@@ -14,6 +14,11 @@ template burnStr*(s: var string) =
     ncutils.burnMem(addr s[0], s.len)
     s.setLen(0)
 
+const DefaultMaxScramIterations* = 10_000_000
+  ## Default cap on the server-requested SCRAM iteration count. PBKDF2 runs
+  ## synchronously on the event loop, so an unbounded count would let a
+  ## malicious server pin the process; 10M is far above realistic settings.
+
 type ScramState* = object
   ## Intermediate state for SCRAM-SHA-256 authentication handshake.
   clientNonce*: string
@@ -107,7 +112,10 @@ proc scramClientFirstMessage*(
   result = toBytes(state.gs2Header & state.clientFirstBare)
 
 proc scramClientFinalMessage*(
-    password: string, serverFirstData: openArray[byte], state: var ScramState
+    password: string,
+    serverFirstData: openArray[byte],
+    state: var ScramState,
+    maxIterations: int = DefaultMaxScramIterations,
 ): seq[byte] =
   ## Generate the SCRAM-SHA-256 client-final message from the server's first response.
   ## Computes the client proof and stores the expected server signature in `state`.
@@ -146,7 +154,7 @@ proc scramClientFinalMessage*(
     raise newException(
       PgConnectionError, "SCRAM: iteration count too small: " & $iterations
     )
-  if iterations > 600_000:
+  if iterations > maxIterations:
     raise newException(
       PgConnectionError, "SCRAM: iteration count too large: " & $iterations
     )
@@ -198,11 +206,79 @@ proc scramClientFinalMessage*(
     burnStr(authMessage)
     burnStr(preparedPassword)
 
+proc derReadLen(data: openArray[byte], pos: var int): int =
+  ## DER definite-form length; -1 on malformed input.
+  if pos >= data.len:
+    return -1
+  let first = data[pos]
+  inc pos
+  if first < 0x80:
+    return int(first)
+  let n = int(first and 0x7F)
+  if n == 0 or n > 4 or pos + n > data.len:
+    return -1
+  var v = 0
+  for i in 0 ..< n:
+    v = (v shl 8) or int(data[pos + i])
+  pos += n
+  return v
+
+proc certSignatureOid(certDer: openArray[byte]): seq[byte] =
+  ## Extract signatureAlgorithm OID from an X.509 DER cert; @[] on parse failure.
+  var pos = 0
+  if pos >= certDer.len or certDer[pos] != 0x30:
+    return @[]
+  inc pos
+  let outerLen = derReadLen(certDer, pos)
+  if outerLen < 0 or pos + outerLen > certDer.len:
+    return @[]
+  let outerEnd = pos + outerLen
+
+  if pos >= outerEnd or certDer[pos] != 0x30:
+    return @[]
+  inc pos
+  let tbsLen = derReadLen(certDer, pos)
+  if tbsLen < 0 or pos + tbsLen > outerEnd:
+    return @[]
+  pos += tbsLen
+
+  if pos >= outerEnd or certDer[pos] != 0x30:
+    return @[]
+  inc pos
+  let sigAlgLen = derReadLen(certDer, pos)
+  if sigAlgLen < 0 or pos + sigAlgLen > outerEnd:
+    return @[]
+  let sigAlgEnd = pos + sigAlgLen
+
+  if pos >= sigAlgEnd or certDer[pos] != 0x06:
+    return @[]
+  inc pos
+  let oidLen = derReadLen(certDer, pos)
+  if oidLen < 0 or pos + oidLen > sigAlgEnd:
+    return @[]
+  result = newSeq[byte](oidLen)
+  for i in 0 ..< oidLen:
+    result[i] = certDer[pos + i]
+
+# Signature-algorithm OID contents (no tag/length prefix).
+const
+  oidSha384Rsa = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C]
+  oidSha512Rsa = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D]
+  oidEcdsaSha384 = [byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]
+  oidEcdsaSha512 = [byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]
+  oidDsaSha384 = [byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x03]
+  oidDsaSha512 = [byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x04]
+
 proc computeTlsServerEndpoint*(certDer: openArray[byte]): seq[byte] =
-  ## Compute tls-server-end-point channel binding data per RFC 5929.
-  ## Always uses SHA-256, matching PostgreSQL (libpq) behavior.
-  let hash = sha256.digest(certDer)
-  result = @(hash.data)
+  ## RFC 5929 §4 tls-server-end-point: hash follows the cert's signatureAlgorithm.
+  ## SHA-384/SHA-512 preserved; MD5/SHA-1/unknown/parse-failure → SHA-256 (libpq parity).
+  let oid = certSignatureOid(certDer)
+  if oid == oidSha384Rsa or oid == oidEcdsaSha384 or oid == oidDsaSha384:
+    result = @(sha384.digest(certDer).data)
+  elif oid == oidSha512Rsa or oid == oidEcdsaSha512 or oid == oidDsaSha512:
+    result = @(sha512.digest(certDer).data)
+  else:
+    result = @(sha256.digest(certDer).data)
 
 proc scramVerifyServerFinal*(
     serverFinalData: openArray[byte], state: ScramState

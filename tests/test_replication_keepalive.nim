@@ -14,7 +14,10 @@ import std/unittest
 import ../async_postgres/[async_backend, pg_replication]
 import ../async_postgres/pg_connection {.all.}
 
-import ./mock_pg_server
+import mock_pg_server
+
+when hasChronos:
+  from std/times import cpuTime
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
@@ -454,3 +457,154 @@ suite "Replication: callback exception invalidates the connection":
     waitFor testBody()
     check poisonRaised
     check poisonFinalState == csClosed
+
+when hasChronos:
+  suite "Replication: idle wakeup rate":
+    test "statusInterval + autoKeepaliveReply=false does not busy-spin while idle":
+      # Regression: replFillRecvBuf entered its 1 ms timer race whenever
+      # statusInterval > 0. With autoKeepaliveReply=false the paired
+      # maybeSendPeriodicStatus is a no-op, so lastStatusSent never advanced
+      # past the statusInterval and the race rearmed at ~1 kHz for the whole
+      # idle period. The fix drops the effective interval to ZeroDuration in
+      # that mode so the read blocks until data arrives.
+      var callbackCalls = 0
+      var elapsedCpu = 0.0
+      var elapsedWallMs: int64 = 0
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await acceptAndReady(ms)
+          discard await drainFrontendMessage(st) # START_REPLICATION
+          var burst: seq[byte]
+          burst.add(buildCopyBothResponse())
+          burst.add(buildXLogData(testStartLsn, testXLogWalEnd, 0, testWalData))
+          await sendBytes(st, burst)
+          # The whole point of the test: stay silent long enough that a
+          # ~1 kHz rearm would burn hundreds of iterations.
+          await sleepAsync(milliseconds(400))
+          var tail: seq[byte]
+          tail.add(buildCopyDone())
+          tail.add(buildReadyForQuery('I'))
+          await sendBytes(st, tail)
+          while true:
+            let m =
+              try:
+                await drainFrontendMessage(st)
+              except CatchableError:
+                break
+            if m.msgType == 'c':
+              break
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+        let cb = makeReplicationCallback:
+          {.cast(gcsafe).}:
+            discard msg
+            callbackCalls.inc
+
+        let cpuBefore = cpuTime()
+        let wallBefore = Moment.now()
+        await conn.startReplication(
+          "test_slot",
+          autoKeepaliveReply = false,
+          statusInterval = milliseconds(50),
+          callback = cb,
+        )
+        elapsedCpu = cpuTime() - cpuBefore
+        elapsedWallMs = (Moment.now() - wallBefore).milliseconds
+
+        await conn.close()
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody()
+      # Only the initial XLogData is delivered; no keepalive requested a reply.
+      check callbackCalls == 1
+      # Sanity: the 400 ms idle period actually elapsed on the wall clock.
+      check elapsedWallMs >= 300
+      # Regression guard: pre-fix, CPU time tracked wall time (≈ 400 ms) because
+      # the timer race rearmed every ~1 ms. Post-fix, an idle stream costs only
+      # what one XLogData handler plus the connection close spends. 100 ms of
+      # CPU here is well over an order of magnitude above the fixed cost and
+      # well below the busy-spin regime, so it survives CI jitter cleanly.
+      check elapsedCpu < 0.1
+
+  var cancelReplFutCancelled: bool
+  var cancelConnStateAfterCancel: PgConnState
+  var cancelRecvBufLenAfterCancel: int
+  var cancelRecvBufLenAfterMarker: int
+
+  suite "Replication: cancellation with statusInterval":
+    test "cancel while idle drops the locally-spawned detached read":
+      # Regression: chronos race() does not cancel its children. When the
+      # replication future is cancelled while blocked in
+      # replFillRecvBuf's race(read, timer) on the very first idle wait,
+      # the freshly-spawned `read` is not yet visible to the caller's
+      # cleanup — it would stay in flight, holding the AsyncStream reader
+      # and eventually committing bytes into recvBuf after the connection
+      # was already marked csClosed. The fix cancels the locally-owned
+      # read on the CancelledError path.
+      cancelReplFutCancelled = false
+      cancelConnStateAfterCancel = csReady
+      cancelRecvBufLenAfterCancel = -1
+      cancelRecvBufLenAfterMarker = -1
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        var serverClient: MockClient
+
+        proc serverHandler() {.async.} =
+          serverClient = await acceptAndReady(ms)
+          discard await drainFrontendMessage(serverClient) # START_REPLICATION
+          # Send only CopyBothResponse; stay silent so the client sits in
+          # race(read, timer) with a locally-spawned read. statusInterval is
+          # set well above the test's cancel delay so the timer cannot win.
+          await sendBytes(serverClient, buildCopyBothResponse())
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+
+        let cb = makeReplicationCallback:
+          {.cast(gcsafe).}:
+            discard msg
+
+        let replFut =
+          conn.startReplication("test_slot", statusInterval = seconds(5), callback = cb)
+        # Let the client enter its recvLoop and spawn the detached read. The
+        # server handler drains START_REPLICATION and sends CopyBothResponse
+        # during this window, so serverFut becomes ready to await.
+        await sleepAsync(milliseconds(80))
+        await serverFut
+        await replFut.cancelAndWait()
+        cancelReplFutCancelled = replFut.cancelled()
+        cancelConnStateAfterCancel = conn.state
+        cancelRecvBufLenAfterCancel = conn.recvBuf.len
+        # Push a distinctive marker from the server side. Pre-fix, the
+        # orphaned readOnce would consume these bytes into replReadScratch
+        # and fillRecvBufDetached's tail would append them to conn.recvBuf.
+        # Post-fix, cancelSoon() releases the reader before the marker is
+        # sent, so the bytes stay queued at the transport instead. Inlined
+        # to avoid a captured GC seq tripping chronos' gcsafe check.
+        await sendBytes(
+          serverClient, @[0xDE'u8, 0xAD, 0xBE, 0xEF, 0x42, 0x42, 0x42, 0x42]
+        )
+        for _ in 0 .. 8:
+          await sleepAsync(milliseconds(5))
+        cancelRecvBufLenAfterMarker = conn.recvBuf.len
+
+        await closeClient(serverClient)
+        try:
+          await conn.close()
+        except CatchableError:
+          discard
+        await closeServer(ms)
+
+      waitFor testBody()
+      check cancelReplFutCancelled
+      check cancelConnStateAfterCancel == csClosed
+      # The core assertion: no bytes were committed into recvBuf after the
+      # cancel. Pre-fix this would grow by the marker length.
+      check cancelRecvBufLenAfterMarker == cancelRecvBufLenAfterCancel

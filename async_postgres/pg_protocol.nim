@@ -944,41 +944,22 @@ proc parseParameterDescription(body: openArray[byte]): BackendMessage =
     result.paramTypeOids[i] = decodeInt32(body, offset)
     offset += 4
 
-proc parseCopyResponse(body: openArray[byte], isIn: bool): BackendMessage =
+proc parseCopyResponse(
+    body: openArray[byte], kind: BackendMessageKind
+): BackendMessage =
+  let label = if kind == bmkCopyBothResponse: "CopyBothResponse" else: "CopyResponse"
   if body.len < 3:
-    raise newException(PgProtocolError, "CopyResponse message too short")
-  if isIn:
-    result = BackendMessage(kind: bmkCopyInResponse)
-  else:
-    result = BackendMessage(kind: bmkCopyOutResponse)
+    raise newException(PgProtocolError, label & " message too short")
+  result = BackendMessage(kind: kind)
   result.copyFormat = if body[0] == 0: cfText else: cfBinary
   let numCols = decodeInt16(body, 1)
   if numCols < 0:
-    raise
-      newException(PgProtocolError, "CopyResponse: invalid column count " & $numCols)
+    raise newException(PgProtocolError, label & ": invalid column count " & $numCols)
   result.copyColumnFormats = newSeq[int16](numCols)
   var offset = 3
   for i in 0 ..< numCols:
     if offset + 2 > body.len:
-      raise newException(PgProtocolError, "CopyResponse truncated")
-    result.copyColumnFormats[i] = decodeInt16(body, offset)
-    offset += 2
-
-proc parseCopyBothResponse(body: openArray[byte]): BackendMessage =
-  if body.len < 3:
-    raise newException(PgProtocolError, "CopyBothResponse message too short")
-  result = BackendMessage(kind: bmkCopyBothResponse)
-  result.copyFormat = if body[0] == 0: cfText else: cfBinary
-  let numCols = decodeInt16(body, 1)
-  if numCols < 0:
-    raise newException(
-      PgProtocolError, "CopyBothResponse: invalid column count " & $numCols
-    )
-  result.copyColumnFormats = newSeq[int16](numCols)
-  var offset = 3
-  for i in 0 ..< numCols:
-    if offset + 2 > body.len:
-      raise newException(PgProtocolError, "CopyBothResponse truncated")
+      raise newException(PgProtocolError, label & " truncated")
     result.copyColumnFormats[i] = decodeInt16(body, offset)
     offset += 2
 
@@ -1085,6 +1066,14 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
   let numCols = decodeInt16(body, 0)
   if numCols < 0:
     raise newException(PgProtocolError, "DataRow: invalid column count " & $numCols)
+  # cellInfo strides cellIndex by rd.numCols; a mismatched row would misalign
+  # every subsequent row (wrong-cell reads or IndexDefect).
+  if numCols != rd.numCols:
+    raise newException(
+      PgProtocolError,
+      "DataRow: column count " & $numCols & " does not match RowDescription " &
+        $rd.numCols,
+    )
 
   # Check cumulative buffer size before any mutation
   let bufBase = rd.buf.len
@@ -1232,11 +1221,11 @@ proc parseBackendMessage*(
   of 's':
     msg = BackendMessage(kind: bmkPortalSuspended)
   of 'G':
-    msg = parseCopyResponse(body, isIn = true)
+    msg = parseCopyResponse(body, bmkCopyInResponse)
   of 'H':
-    msg = parseCopyResponse(body, isIn = false)
+    msg = parseCopyResponse(body, bmkCopyOutResponse)
   of 'W':
-    msg = parseCopyBothResponse(body)
+    msg = parseCopyResponse(body, bmkCopyBothResponse)
   of 'd':
     msg = BackendMessage(kind: bmkCopyData)
     msg.copyData = @(body)

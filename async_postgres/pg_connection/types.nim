@@ -10,7 +10,7 @@ import std/[tables, sets, deques, lists]
 when defined(posix):
   import std/posix
 
-import ../[async_backend, pg_errors, pg_protocol, pg_types]
+import ../[async_backend, pg_auth, pg_errors, pg_protocol, pg_types]
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -116,6 +116,13 @@ type
       ## to `sslPrefer` (libpq parity); a raw zero-initialized `ConnConfig` has
       ## `sslDisable`.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    sslSni*: bool
+      ## Send TLS SNI extension during the handshake (libpq `sslsni`, default
+      ## true). Applies to every mode that establishes TLS. Suppressed
+      ## automatically when the host is an IP literal (RFC 6066 §3) or empty
+      ## (hostaddr-only). Set false only for backends that reject or misroute
+      ## on SNI (a raw zero-initialized `ConnConfig` therefore has SNI off —
+      ## use `parseDsn` or `initConnConfig` for the libpq-parity default).
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
@@ -149,6 +156,10 @@ type
       ## further recv-buffer growth, capping memory exposure to a
       ## misbehaving or malicious peer. ``0`` (default) selects
       ## `DefaultMaxBackendMessageLen` (1 GiB).
+    maxScramIterations*: int
+      ## Upper bound on the server-requested SCRAM iteration count
+      ## (PostgreSQL 16+ `scram_iterations`), capping CPU spent in PBKDF2.
+      ## ``0`` (default) selects `DefaultMaxScramIterations` (10,000,000).
     tracer*: PgTracer ## Optional tracer for connection-level hooks
 
   Notification* = object ## A NOTIFY message received from PostgreSQL.
@@ -266,9 +277,19 @@ type
       ## to the gap until the next operation.
     heldSessionLocks*: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
-      ## API. The pool releases or discards connections with a non-zero count
-      ## so that locks never leak to subsequent borrowers. Raw-SQL acquires
-      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass this counter.
+      ## API, minus tracked releases. Reported by the `onLeakedSessionLocks`
+      ## tracer hook. Raw-SQL acquires
+      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass this counter,
+      ## so it is best-effort under mixed typed/raw usage — the pool's
+      ## reset/discard decision uses `sessionLockDirty` instead so a raw
+      ## acquire released through the typed API cannot forge a `== 0` count
+      ## and leak a tracked lock into the next borrower.
+    sessionLockDirty*: bool
+      ## Sticky flag: set on any tracked session-level acquire, cleared only
+      ## by `advisoryUnlockAll` or connection reset. Drives the pool's
+      ## reset/discard decision so `pg_advisory_unlock_all` runs whenever a
+      ## tracked acquire ever happened, even if the tracked counter was
+      ## decremented back to zero by a typed unlock of a raw-acquired key.
     tracer*: PgTracer ## Inherited from ConnConfig on connect
     ownerPool*: PgPoolOwner
       ## Owning pool back-reference. Set when this connection is managed by
@@ -649,21 +670,15 @@ type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
   ## Callback invoked once per row during `queryEach`. The `Row` is only valid
   ## inside the callback — its backing buffer is reused for the next row.
 
-when hasChronos:
-  type CopyOutCallback* =
-    proc(data: seq[byte]): Future[void] {.async: (raises: [CatchableError]), gcsafe.}
-    ## Callback receiving each chunk during streaming COPY OUT.
+declareAsyncCallback(
+  CopyOutCallback, proc(data: sink seq[byte]): Future[void],
+  "Callback receiving each chunk during streaming COPY OUT. `data` is `sink` so the receive buffer moves in without a copy.",
+)
 
-  type CopyInCallback* =
-    proc(): Future[seq[byte]] {.async: (raises: [CatchableError]), gcsafe.}
-    ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
-
-else:
-  type CopyOutCallback* = proc(data: seq[byte]): Future[void] {.gcsafe.}
-    ## Callback receiving each chunk during streaming COPY OUT.
-
-  type CopyInCallback* = proc(): Future[seq[byte]] {.gcsafe.}
-    ## Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.
+declareAsyncCallback(
+  CopyInCallback, proc(): Future[seq[byte]],
+  "Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.",
+)
 
 const RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
 
@@ -688,6 +703,14 @@ func effectiveMaxMessageSize*(conn: PgConnection): int {.inline.} =
     conn.config.maxMessageSize
   else:
     DefaultMaxBackendMessageLen
+
+func effectiveMaxScramIterations*(config: ConnConfig): int {.inline.} =
+  ## Resolves the ``ConnConfig.maxScramIterations`` default (0) to
+  ## ``DefaultMaxScramIterations``.
+  if config.maxScramIterations > 0:
+    config.maxScramIterations
+  else:
+    DefaultMaxScramIterations
 
 # Internal replication LSN plumbing (cross-module use within the library)
 #

@@ -154,9 +154,29 @@ suite "SCRAM-SHA-256":
   test "scramClientFinalMessage rejects excessive iteration count":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
-    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=600001"
+    let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=10000001"
     expect CatchableError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage accepts iteration count above 600000":
+    # PG16+ scram_iterations may legitimately exceed the OWASP-recommended 600k
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000000"
+    discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+
+  test "scramClientFinalMessage enforces custom maxIterations":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=5001"
+    expect CatchableError:
+      discard scramClientFinalMessage(
+        "password", toBytes(serverFirst), state, maxIterations = 5000
+      )
+    discard scramClientFirstMessage("user", "myNonce", state)
+    let atLimit = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=5000"
+    discard
+      scramClientFinalMessage("password", toBytes(atLimit), state, maxIterations = 5000)
 
   test "scramClientFinalMessage rejects invalid base64 salt":
     var state: ScramState
@@ -361,28 +381,91 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     let expectedCbind = base64.encode("p=tls-server-end-point,,")
     check clientFinalStr.startsWith("c=" & expectedCbind & ",r=")
 
-  test "computeTlsServerEndpoint with empty input":
-    let binding = computeTlsServerEndpoint(@[])
-    check binding.len == 32
-    # SHA-256 of empty input is a well-known value
-    let expected = sha256.digest(@(newSeq[byte](0))).data
-    check binding == @(expected)
+  # Minimal X.509 shell: outer SEQ + empty tbs + AlgorithmIdentifier(oid).
+  proc syntheticCert(oid: openArray[byte]): seq[byte] =
+    let oidBlock = @[byte 0x06, byte(oid.len)] & @oid
+    let sigAlg = @[byte 0x30, byte(oidBlock.len)] & oidBlock
+    let tbs = @[byte 0x30, 0x00]
+    let inner = tbs & sigAlg
+    result = @[byte 0x30, byte(inner.len)] & inner
 
-  test "computeTlsServerEndpoint matches known SHA-256":
-    let input = @[0x30'u8, 0x82, 0x01, 0x00]
-    let binding = computeTlsServerEndpoint(input)
+  test "computeTlsServerEndpoint falls back to SHA-256 on parse failure":
+    let empty = computeTlsServerEndpoint(@[])
+    check empty.len == 32
+    check empty == @(sha256.digest(@(newSeq[byte](0))).data)
+    let garbage = @[byte 0x30, 0x82, 0x01, 0x00]
+    let g = computeTlsServerEndpoint(garbage)
+    check g.len == 32
+    check g == @(sha256.digest(garbage).data)
+
+  test "computeTlsServerEndpoint uses SHA-256 for sha256WithRSAEncryption":
+    let cert =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B])
+    let binding = computeTlsServerEndpoint(cert)
     check binding.len == 32
-    # Verify against independently computed SHA-256
-    let expected = sha256.digest(input).data
-    check binding == @(expected)
+    check binding == @(sha256.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-384 for sha384WithRSAEncryption":
+    let cert =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 48
+    check binding == @(sha384.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-512 for sha512WithRSAEncryption":
+    let cert =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 64
+    check binding == @(sha512.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-384 for ecdsa-with-SHA384":
+    let cert = syntheticCert([byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 48
+    check binding == @(sha384.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-512 for ecdsa-with-SHA512":
+    let cert = syntheticCert([byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 64
+    check binding == @(sha512.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-384 for dsa-with-SHA384":
+    let cert =
+      syntheticCert([byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x03])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 48
+    check binding == @(sha384.digest(cert).data)
+
+  test "computeTlsServerEndpoint promotes SHA-1 to SHA-256 per RFC 5929":
+    let cert =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 32
+    check binding == @(sha256.digest(cert).data)
+
+  test "computeTlsServerEndpoint promotes MD5 to SHA-256 per RFC 5929":
+    let cert =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 32
+    check binding == @(sha256.digest(cert).data)
+
+  test "computeTlsServerEndpoint falls back to SHA-256 for unknown OID":
+    let cert = syntheticCert([byte 0x2A, 0x03, 0x04, 0x05])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 32
+    check binding == @(sha256.digest(cert).data)
 
   test "computeTlsServerEndpoint is deterministic":
-    let cert = @[0x01'u8, 0x02, 0x03, 0x04, 0x05]
-    let b1 = computeTlsServerEndpoint(cert)
-    let b2 = computeTlsServerEndpoint(cert)
-    check b1 == b2
+    let cert =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C])
+    check computeTlsServerEndpoint(cert) == computeTlsServerEndpoint(cert)
 
   test "computeTlsServerEndpoint differs for different certs":
-    let cert1 = @[0x01'u8, 0x02, 0x03]
-    let cert2 = @[0x04'u8, 0x05, 0x06]
+    let cert1 =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B])
+    let cert2 =
+      syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C])
     check computeTlsServerEndpoint(cert1) != computeTlsServerEndpoint(cert2)

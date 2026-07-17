@@ -188,7 +188,7 @@ suite "toPgParam":
     let data = @[0x01'u8, 0x02, 0xFF]
     let p = toPgParam(data)
     check p.oid == OidBytea
-    check p.format == 0
+    check p.format == 1
     check p.value.isSome
     check p.value.get == data
 
@@ -229,6 +229,32 @@ suite "toPgParam":
     check p.format == 0
     let s = toString(p.value.get)
     check s.startsWith("2024-01-15 10:30:00")
+
+  test "DateTime with non-UTC zone encodes the UTC instant":
+    # Regression: text OidTimestamp used to serialize the DateTime's local wall
+    # clock, so a zoned value stored a different absolute time than the binary
+    # encoder produced from the same DateTime. utcOffset counts seconds WEST of
+    # UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let p = toPgParam(dt)
+    check p.oid == OidTimestamp
+    check toString(p.value.get) == "2026-07-15 12:00:00.000000"
+    # Binary path already encodes the absolute instant; both should agree now.
+    let bin = toPgBinaryParam(dt)
+    check bin.oid == OidTimestamp
+    check bin.format == 1
 
   test "PgUuid":
     let uuid = PgUuid("550e8400-e29b-41d4-a716-446655440000")
@@ -397,6 +423,21 @@ suite "Row accessors":
     let row = @[some(toBytes("3.14"))]
     check abs(row.getFloat(0) - 3.14) < 1e-10
 
+  test "trailing empty text cell raises PgTypeError not IndexDefect":
+    # A trailing empty cell has off == buf.len; bufView must not `addr buf[off]`
+    # (Defect would escape `except PgError`).
+    let row = @[some(toBytes("hello")), some(newSeq[byte](0))]
+    expect PgTypeError:
+      discard row.getInt(1)
+    expect PgTypeError:
+      discard row.getInt16(1)
+    expect PgTypeError:
+      discard row.getInt64(1)
+    expect PgTypeError:
+      discard row.getFloat(1)
+    expect PgTypeError:
+      discard row.getFloat32(1)
+
   test "getBool true variants":
     check @[some(toBytes("t"))].getBool(0) == true
     check @[some(toBytes("true"))].getBool(0) == true
@@ -416,7 +457,7 @@ suite "Row accessors":
     check raised
 
 suite "PgParam format field":
-  test "toPgParam uses binary for numeric and bool, text for others":
+  test "toPgParam uses binary for numeric, bool, and bytea, text for others":
     check toPgParam("x").format == 0
     check toPgParam(1'i16).format == 1
     check toPgParam(1'i32).format == 1
@@ -424,7 +465,7 @@ suite "PgParam format field":
     check toPgParam(1.0'f32).format == 1
     check toPgParam(1.0).format == 1
     check toPgParam(true).format == 1
-    check toPgParam(@[1'u8]).format == 0
+    check toPgParam(@[1'u8]).format == 1
     check toPgParam(dateTime(2024, mJan, 1, 0, 0, 0, 0, utc())).format == 0
     check toPgParam(PgUuid("test")).format == 0
 
@@ -480,6 +521,32 @@ suite "getTimestamp accessor":
     let dt = row.getTimestamp(0)
     check dt.year == 2024
     check dt.hour == 10
+
+  test "timestamp with trimmed fractional seconds":
+    # PG trims trailing zeros: .500000 -> .5, .123000 -> .123, .100 -> .1
+    let cases = {
+      "2024-01-15 10:30:00.5": 500_000_000,
+      "2024-01-15 10:30:00.12": 120_000_000,
+      "2024-01-15 10:30:00.123": 123_000_000,
+      "2024-01-15 10:30:00.1234": 123_400_000,
+      "2024-01-15 10:30:00.12345": 123_450_000,
+      "2024-01-15 10:30:00.123456": 123_456_000,
+    }
+    for (s, ns) in cases:
+      let dt = @[some(toBytes(s))].getTimestamp(0)
+      check dt.year == 2024
+      check dt.nanosecond == ns
+
+  test "zoneless text decodes as UTC (symmetric with binary)":
+    # The wall-clock fields are stored verbatim; the zone label is utc() so the
+    # resulting absolute instant matches decodeBinaryTimestamp for the same PG
+    # value regardless of the host's local zone.
+    let dt = @[some(toBytes("2024-01-15 10:30:00.123456"))].getTimestamp(0)
+    check dt.timezone == utc()
+    check dt == dateTime(2024, mJan, 15, 10, 30, 0, 123_456_000, utc())
+    let dt2 = @[some(toBytes("2024-01-15 10:30:00"))].getTimestamp(0)
+    check dt2.timezone == utc()
+    check dt2 == dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
 
   test "invalid timestamp raises":
     let row = @[some(toBytes("not-a-timestamp"))]
@@ -844,6 +911,24 @@ suite "getTimestampTz accessor":
     # The parsed DateTime is converted to local timezone by Nim's parse(),
     # so we compare using UTC.
     check dt.utc().hour == 14
+
+  test "timestamptz with trimmed fractional seconds":
+    let cases = {
+      "2024-01-15 10:30:00.5+00": 500_000_000,
+      "2024-01-15 10:30:00.123+00:00": 123_000_000,
+      "2024-01-15 10:30:00.1234+05:30": 123_400_000,
+    }
+    for (s, ns) in cases:
+      let dt = @[some(toBytes(s))].getTimestampTz(0)
+      check dt.year == 2024
+      check dt.nanosecond == ns
+
+  test "zoneless text fallback decodes as UTC":
+    # Defensive: PG timestamptz text always carries a zone, but if the fallback
+    # zoneless format matches, the label must be utc() rather than the host's
+    # local zone (see getTimestamp symmetry test).
+    let dt = @[some(toBytes("2024-01-15 10:30:00"))].getTimestampTz(0)
+    check dt.timezone == utc()
 
   test "invalid timestamptz raises":
     let row = @[some(toBytes("not-a-timestamp"))]
@@ -3813,9 +3898,14 @@ type
     age: Option[int32]
     note: Option[string]
 
+  WideIntRecord = object
+    name: string
+    n: int64
+
 pgComposite(PointRecord)
 pgComposite(PersonRecord, 50000'i32)
 pgComposite(NullableRecord)
+pgComposite(WideIntRecord)
 
 suite "Composite text parser":
   test "parseCompositeText simple":
@@ -3850,9 +3940,11 @@ suite "Composite text parser":
     check parts[0] == some("")
     check parts[1] == some("42")
 
-  test "parseCompositeText empty":
+  test "parseCompositeText () is one NULL field":
+    # PostgreSQL emits `()` for a 1-field composite whose sole field is NULL.
     let parts = parseCompositeText("()")
-    check parts.len == 0
+    check parts.len == 1
+    check parts[0] == none(string)
 
   test "parseCompositeText single NULL":
     let parts = parseCompositeText("(,)")
@@ -4124,6 +4216,61 @@ suite "User-defined composite":
     let p = toPgParam(none(PointRecord))
     check p.oid == 0'i32
     check p.value.isNone
+
+  test "getComposite binary wider wire int than Nim field raises":
+    # Nim field is int32 but wire sends int8 (bigint, 8 bytes). Without a
+    # length check, fromBE32 would silently keep only the top 4 bytes.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Grace"))),
+      (oid: OidInt8, data: some(@(toBE64(1'i64)))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary narrower wire int than Nim field raises":
+    # Nim field is int64 but wire sends int4 (4 bytes). Without a length
+    # check, fromBE64 would run past the field and IndexDefect.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Heidi"))),
+      (oid: OidInt4, data: some(@(toBE32(7'i32)))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(0'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[WideIntRecord](row, 0)
+
+  test "getComposite binary wider wire float than Nim field raises":
+    # Nim field is float64 but wire sends float4 (4 bytes) — narrower than
+    # expected 8, so fromBE64 would IndexDefect.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Ivan"))),
+      (oid: OidInt4, data: some(@(toBE32(10'i32)))),
+      (oid: OidFloat4, data: some(@(toBE32(cast[int32](1.5'f32))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary Option field width mismatch raises":
+    # Same guard applies inside the Option branch: age is Option[int32],
+    # wire sends 8-byte int8 → must raise, not silently truncate.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Judy"))),
+      (oid: OidInt8, data: some(@(toBE64(99'i64)))),
+      (oid: OidText, data: some(toBytes("n"))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(0'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[NullableRecord](row, 0)
 
 suite "User-defined domain":
   test "pgDomain generates toPgParam with base type OID":
@@ -5908,7 +6055,7 @@ suite "hstore":
     var h: PgHstore = initTable[string, Option[string]]()
     h["k"] = some("v")
     let p = toPgParam(h)
-    check p.oid == OidText
+    check p.oid == 0'i32
     check p.format == 0
     check p.value.isSome
     check toString(p.value.get) == "\"k\"=>\"v\""
@@ -5959,7 +6106,7 @@ suite "hstore":
     var h2: PgHstore = initTable[string, Option[string]]()
     h2["b"] = none(string)
     let p = toPgParam(@[h1, h2])
-    check p.oid == OidTextArray
+    check p.oid == 0'i32
     check p.format == 0
     let fields = @[mkField(OidTextArray, 0'i16)]
     let row = mkRow(@[p.value], fields)
@@ -5970,7 +6117,7 @@ suite "hstore":
 
   test "toPgParam seq[PgHstore] empty":
     let p = toPgParam(newSeq[PgHstore]())
-    check p.oid == OidTextArray
+    check p.oid == 0'i32
     check p.format == 0
     check toString(p.value.get) == "{}"
 
@@ -6427,6 +6574,26 @@ suite "Temporal array types":
     check arr.len == 2
     check arr[0].year == 2023
     check arr[1].month == mJun
+
+  test "getTimestampArray text format with trimmed fractional seconds":
+    let row: Row = @[
+      some(
+        toBytes(
+          "{\"2023-01-15 10:30:00.5\",\"2024-06-20 14:45:30.123\",\"2025-03-10 08:00:00.123456\"}"
+        )
+      )
+    ]
+    let arr = row.getTimestampArray(0)
+    check arr.len == 3
+    check arr[0].nanosecond == 500_000_000
+    check arr[1].nanosecond == 123_000_000
+    check arr[2].nanosecond == 123_456_000
+
+  test "getTimestampArray text elements decode as UTC":
+    let row: Row = @[some(toBytes("{\"2023-01-15 10:30:00\",\"2024-06-20 14:45:30\"}"))]
+    let arr = row.getTimestampArray(0)
+    check arr[0].timezone == utc()
+    check arr[1].timezone == utc()
 
   test "getTimestampArrayOpt none":
     let fields = @[mkField(OidTimestampArray, 1'i16)]

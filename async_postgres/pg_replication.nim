@@ -144,10 +144,9 @@ type
 
   UpdateMessage* = object ## Row update.
     relationId*: int32
-    hasOldTuple*: bool ## True if old key/full row is included
     keyKind*: char
-      ## When hasOldTuple is true: 'K' if oldTuple holds only the replica
-      ## identity key, 'O' if it holds the full old row (REPLICA IDENTITY FULL).
+      ## 'K' if oldTuple holds only the replica identity key,
+      ## 'O' if it holds the full old row (REPLICA IDENTITY FULL),
       ## '\0' when no old tuple is present.
     oldTuple*: seq[TupleField]
     newTuple*: seq[TupleField]
@@ -214,6 +213,10 @@ proc `>`*(a, b: Lsn): bool {.inline.} =
 proc `>=`*(a, b: Lsn): bool {.inline.} =
   b <= a
 
+proc hasOldTuple*(msg: UpdateMessage): bool {.inline.} =
+  ## True if the update carries an old tuple (replica identity key or full row).
+  msg.keyKind != '\0'
+
 proc toString*(field: TupleField): string =
   ## Convert a TupleField's data to a string by copying the bytes.
   result = readString(field.data, 0, field.data.len)
@@ -264,9 +267,7 @@ proc parseLsn*(s: string): Lsn =
 
 proc currentPgTimestamp*(): int64 =
   ## Current time as microseconds since the PostgreSQL epoch (2000-01-01 UTC).
-  let t = getTime()
-  let unixUs = t.toUnix() * 1_000_000'i64 + int64(t.nanosecond div 1000)
-  unixUs - pgEpochUnix * 1_000_000'i64
+  pgTimestampMicros(getTime())
 
 # pgoutput decoder
 
@@ -431,7 +432,6 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     inc pos
     if marker == 'K' or marker == 'O':
       # Old key or old tuple included
-      msg.hasOldTuple = true
       msg.keyKind = marker
       let (oldFields, nextPos) = decodeTuple(data, pos)
       msg.oldTuple = oldFields
@@ -508,18 +508,18 @@ proc decodePgOutput*(msg: XLogData): PgOutputMessage =
 
 # Replication callback types
 
-when hasChronos:
-  type ReplicationCallback* = proc(msg: ReplicationMessage): Future[void] {.
-    async: (raises: [CatchableError]), gcsafe
-  .} ## Callback invoked for each replication message during streaming.
-
-else:
-  type ReplicationCallback* = proc(msg: ReplicationMessage): Future[void] {.gcsafe.}
-    ## Callback invoked for each replication message during streaming.
+declareAsyncCallback(
+  ReplicationCallback, proc(msg: ReplicationMessage): Future[void],
+  "Callback invoked for each replication message during streaming.",
+)
 
 template makeReplicationCallback*(body: untyped): ReplicationCallback =
   ## Create a ``ReplicationCallback`` that works with both asyncdispatch and chronos.
   ## Inside ``body``, the current message is available as ``msg: ReplicationMessage``.
+  ##
+  ## Kept module-local: routing this through a shared template with an
+  ## `untyped`/`typedesc` param for the parameter type trips asyncdispatch's
+  ## `{.async.}` macro ("cannot use symbol of kind 'func' as a 'param'").
   block:
     when hasChronos:
       let r: ReplicationCallback = proc(
@@ -909,7 +909,12 @@ proc replFillRecvBuf(
     return nil
   when hasChronos:
     var read = pendingRead
-    if read == nil:
+    # A locally spawned read isn't visible to the caller yet: chronos ``race``
+    # does not cancel its children, and a cancel here unwinds before we can
+    # return it — so drop it explicitly. A passed-in read is already tracked by
+    # the caller's cleanup.
+    let readIsLocal = read == nil
+    if readIsLocal:
       read = conn.fillRecvBufDetached()
     if not read.finished:
       let sinceLast = Moment.now() - lastStatusSent
@@ -921,6 +926,10 @@ proc replFillRecvBuf(
       let timer = sleepAsync(remaining)
       try:
         discard await race(read, timer)
+      except CancelledError as e:
+        if readIsLocal and not read.finished:
+          read.cancelSoon()
+        raise e
       finally:
         cancelTimer(timer)
     if read.finished:
@@ -1069,6 +1078,13 @@ proc runReplicationStream(
             move(msg.copyData), autoKeepaliveReply, callback, lastStatusSent
           )
         of bmkCopyDone:
+          # Mirror stopReplication: flush the latest confirmed position before
+          # returning CopyDone, so a server-initiated stop (walsender timeout,
+          # pg_terminate_backend, slot drop) still delivers the final ACK.
+          try:
+            await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+          except CatchableError:
+            discard
           await conn.sendMsg(@copyDoneMsg)
           break recvLoop
         of bmkErrorResponse:
@@ -1086,8 +1102,11 @@ proc runReplicationStream(
       )
       if conn.state == csClosed:
         raise newException(PgConnectionError, "Connection closed during " & context)
+      # Without autoKeepaliveReply, lastStatusSent never advances, so a timer
+      # race here would rearm every ~1 ms.
+      let effectiveInterval = if autoKeepaliveReply: statusInterval else: ZeroDuration
       pendingRead =
-        await conn.replFillRecvBuf(statusInterval, lastStatusSent, pendingRead)
+        await conn.replFillRecvBuf(effectiveInterval, lastStatusSent, pendingRead)
       lastStatusSent = await conn.maybeSendPeriodicStatus(
         autoKeepaliveReply, statusInterval, lastStatusSent
       )
@@ -1219,7 +1238,6 @@ proc startReplication*(
         )
 
   conn.checkReady()
-  conn.state = csBusy
 
   # Build START_REPLICATION command
   var sql =
@@ -1241,7 +1259,9 @@ proc startReplication*(
         sql.add(" " & v)
     sql.add(")")
 
-  await conn.sendMsg(encodeQuery(sql))
+  let msg = encodeQuery(sql)
+  conn.state = csBusy
+  await conn.sendMsg(msg)
   await runReplicationStream(
     conn, startLsn, autoKeepaliveReply, statusInterval, callback, "replication"
   )
@@ -1325,7 +1345,6 @@ proc startPhysicalReplication*(
   ## those messages; callers that need the next-timeline information should
   ## re-issue ``IDENTIFY_SYSTEM`` after this proc returns.
   conn.checkReady()
-  conn.state = csBusy
 
   var sql = "START_REPLICATION"
   if slotName.len > 0:
@@ -1334,7 +1353,9 @@ proc startPhysicalReplication*(
   if timeline > 0:
     sql.add(" TIMELINE " & $timeline)
 
-  await conn.sendMsg(encodeQuery(sql))
+  let msg = encodeQuery(sql)
+  conn.state = csBusy
+  await conn.sendMsg(msg)
   await runReplicationStream(
     conn, startLsn, autoKeepaliveReply, statusInterval, callback, "physical replication"
   )

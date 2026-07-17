@@ -73,8 +73,9 @@ proc copyInRawImpl*(
     conn: PgConnection, sql: string, data: seq[byte]
 ): Future[string] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var commandTag = ""
   # Server-abort error detected by pollCopyInError during the CopyData send
@@ -187,13 +188,9 @@ proc copyIn*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await copyInRawImpl(conn, sql, data).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY IN timed out")
-    else:
-      tag = await copyInRawImpl(conn, sql, data)
+    awaitOrInvalidate(
+      conn, tag, copyInRawImpl(conn, sql, data), timeout, "COPY IN timed out"
+    )
   return initCommandResult(tag)
 
 proc copyIn*(
@@ -241,8 +238,9 @@ proc copyInStreamImpl*(
     conn: PgConnection, sql: string, callback: CopyInCallback
 ): Future[CopyInInfo] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var info = CopyInInfo()
   # Server-abort error detected by pollCopyInError during the CopyData send
@@ -437,19 +435,20 @@ proc copyInStream*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: info.commandTag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        info = await copyInStreamImpl(conn, sql, callback).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY IN stream timed out")
-    else:
-      info = await copyInStreamImpl(conn, sql, callback)
+    awaitOrInvalidate(
+      conn,
+      info,
+      copyInStreamImpl(conn, sql, callback),
+      timeout,
+      "COPY IN stream timed out",
+    )
   return info
 
 proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var cr = CopyResult()
   var sawCopyOut = false
@@ -515,21 +514,16 @@ proc copyOut*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: cr.commandTag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        cr = await copyOutImpl(conn, sql).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY OUT timed out")
-    else:
-      cr = await copyOutImpl(conn, sql)
+    awaitOrInvalidate(conn, cr, copyOutImpl(conn, sql), timeout, "COPY OUT timed out")
   return cr
 
 proc copyOutStreamImpl*(
     conn: PgConnection, sql: string, callback: CopyOutCallback
 ): Future[CopyOutInfo] {.async.} =
   conn.checkReady()
+  let msg = encodeQuery(sql)
   conn.state = csBusy
-  await conn.sendMsg(encodeQuery(sql))
+  await conn.sendMsg(msg)
 
   var info = CopyOutInfo()
   var sawCopyOut = false
@@ -558,7 +552,7 @@ proc copyOutStreamImpl*(
         # Misuse error pending; don't feed a doomed callback.
         continue
       try:
-        await callback(pumpMsg.copyData)
+        await callback(move(pumpMsg.copyData))
       except CancelledError as e:
         # Cancellation tears the operation down; do not run the recovery
         # drain (more I/O on a future being unwound). The COPY OUT is left
@@ -628,11 +622,11 @@ proc copyOutStream*(
     TraceCopyEndData,
     TraceCopyEndData(commandTag: info.commandTag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        info = await copyOutStreamImpl(conn, sql, callback).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("COPY OUT stream timed out")
-    else:
-      info = await copyOutStreamImpl(conn, sql, callback)
+    awaitOrInvalidate(
+      conn,
+      info,
+      copyOutStreamImpl(conn, sql, callback),
+      timeout,
+      "COPY OUT stream timed out",
+    )
   return info

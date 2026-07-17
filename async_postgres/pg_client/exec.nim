@@ -14,7 +14,6 @@ proc execImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let formats =
     if paramFormats.len > 0:
@@ -37,6 +36,7 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBind("", stmtName, formats, params),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var commandTag = ""
@@ -47,7 +47,6 @@ proc execImpl*(
     conn: PgConnection, sql: string, params: seq[PgParam] = @[]
 ): Future[string] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -64,6 +63,7 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var commandTag = ""
@@ -94,13 +94,7 @@ proc exec*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await execImpl(conn, sql, params).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("Exec timed out")
-    else:
-      tag = await execImpl(conn, sql, params)
+    awaitOrInvalidate(conn, tag, execImpl(conn, sql, params), timeout, "Exec timed out")
   return initCommandResult(tag)
 
 proc execInlineImpl*(
@@ -112,7 +106,6 @@ proc execInlineImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -129,6 +122,7 @@ proc execInlineImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges),
   )
+  conn.state = csBusy
   await conn.sendBufMsg()
 
   var commandTag = ""
@@ -154,13 +148,13 @@ proc exec*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await execInlineImpl(conn, sql, data, ranges, oids, formats).wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("Exec timed out")
-    else:
-      tag = await execInlineImpl(conn, sql, data, ranges, oids, formats)
+    awaitOrInvalidate(
+      conn,
+      tag,
+      execInlineImpl(conn, sql, data, ranges, oids, formats),
+      timeout,
+      "Exec timed out",
+    )
   return initCommandResult(tag)
 
 proc notify*(

@@ -198,6 +198,11 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       result.sslRootCert = readFile(val)
     except IOError:
       raise newException(PgError, "Cannot read sslrootcert file: " & val)
+  of "sslsni":
+    try:
+      result.sslSni = parseInt(val) != 0
+    except ValueError:
+      raise newException(PgError, "Invalid sslsni: " & val)
   of "keepalives":
     try:
       result.keepAlive = parseInt(val) != 0
@@ -235,6 +240,13 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "Invalid max_message_size: " & val)
     if result.maxMessageSize < 0:
       raise newException(PgError, "max_message_size must be non-negative: " & val)
+  of "max_scram_iterations":
+    try:
+      result.maxScramIterations = parseInt(val)
+    except ValueError:
+      raise newException(PgError, "Invalid max_scram_iterations: " & val)
+    if result.maxScramIterations < 0:
+      raise newException(PgError, "max_scram_iterations must be non-negative: " & val)
   else:
     result.extraParams.add((key, val))
 
@@ -250,6 +262,7 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
   ## multi-host failover (libpq compatible): ``host=h1,h2 port=5433,5434``.
   result.keepAlive = true
   result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
+  result.sslSni = true # libpq default
 
   # Tokenize into (key, value) pairs
   var pairs: seq[(string, string)]
@@ -334,6 +347,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL URI connection string into a ConnConfig.
   result.keepAlive = true
   result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
+  result.sslSni = true # libpq default
   let scheme =
     if dsn.startsWith("postgresql://"):
       "postgresql"
@@ -463,6 +477,7 @@ proc initConnConfig*(
     database = "",
     sslMode = sslPrefer,
     sslRootCert = "",
+    sslSni = true,
     channelBinding = cbPrefer,
     applicationName = "",
     connectTimeout = ZeroDuration,
@@ -476,6 +491,7 @@ proc initConnConfig*(
     requireAuth: set[AuthMethod] = {},
     extraParams: seq[(string, string)] = @[],
     maxMessageSize = 0,
+    maxScramIterations = 0,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
@@ -488,6 +504,7 @@ proc initConnConfig*(
     database: database,
     sslMode: sslMode,
     sslRootCert: sslRootCert,
+    sslSni: sslSni,
     channelBinding: channelBinding,
     applicationName: applicationName,
     connectTimeout: connectTimeout,
@@ -501,6 +518,7 @@ proc initConnConfig*(
     requireAuth: requireAuth,
     extraParams: extraParams,
     maxMessageSize: maxMessageSize,
+    maxScramIterations: maxScramIterations,
   )
 
 proc parseDsn*(dsn: string): ConnConfig =

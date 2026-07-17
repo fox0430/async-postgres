@@ -63,7 +63,7 @@ proc toPgParamInline*(v: string): PgParamInline =
 
 proc toPgParamInline*(v: seq[byte]): PgParamInline =
   result.oid = OidBytea
-  result.format = 0
+  result.format = 1
   if v.len > maxInt32Len:
     raise newException(
       ValueError,
@@ -132,10 +132,13 @@ proc toPgParam*(v: bool): PgParam =
   PgParam(oid: OidBool, format: 1, value: some(@[if v: 1'u8 else: 0'u8]))
 
 proc toPgParam*(v: seq[byte]): PgParam =
-  PgParam(oid: OidBytea, format: 0, value: some(v))
+  PgParam(oid: OidBytea, format: 1, value: some(v))
 
 proc toPgParam*(v: DateTime): PgParam =
-  let s = v.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
+  # Format the UTC wall clock so a zoned DateTime encodes the same absolute
+  # instant as toPgBinaryParam. Formatting v directly would emit local fields
+  # that OidTimestamp (no zone) then stores verbatim, drifting by the offset.
+  let s = v.utc.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
   PgParam(oid: OidTimestamp, format: 0, value: some(toBytes(s)))
 
 proc toPgDateParam*(v: DateTime): PgParam =
@@ -241,8 +244,11 @@ proc encodeHstoreText*(v: PgHstore): string =
   parts.join(", ")
 
 proc toPgParam*(v: PgHstore): PgParam =
-  ## Send hstore as text format. PostgreSQL casts text to hstore implicitly.
-  PgParam(oid: OidText, format: 0, value: some(toBytes(encodeHstoreText(v))))
+  ## Send hstore as text format with OID 0 (unknown) so PostgreSQL infers the
+  ## parameter type from context. Works with both ``SELECT $1::hstore`` and
+  ## ``INSERT INTO t(hstore_col) VALUES($1)``; declaring ``OidText`` would fail
+  ## the latter with 42804 because there is no text→hstore assignment cast.
+  PgParam(oid: 0'i32, format: 0, value: some(toBytes(encodeHstoreText(v))))
 
 proc encodeBinaryArray*(
     elemOid: int32,
@@ -474,12 +480,17 @@ proc pgTimeFieldsMicros(hour, minute, second, microsecond: int32): int64 {.inlin
   int64(hour) * 3_600_000_000'i64 + int64(minute) * 60_000_000'i64 +
     int64(second) * 1_000_000'i64 + int64(microsecond)
 
+proc pgTimestampMicros*(t: Time): int64 {.inline.} =
+  ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for a ``Time``.
+  ## Shared with the ``DateTime`` overload, ``ranges.nim``, and
+  ## ``pg_replication.currentPgTimestamp``.
+  let unixUs = t.toUnix() * 1_000_000'i64 + int64(t.nanosecond div 1000)
+  unixUs - pgEpochUnix * 1_000_000'i64
+
 proc pgTimestampMicros*(v: DateTime): int64 {.inline.} =
   ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for ``timestamp``
   ## / ``timestamptz`` binary format. Shared with ``ranges.nim``.
-  let t = v.toTime()
-  let unixUs = t.toUnix() * 1_000_000 + int64(t.nanosecond div 1000)
-  unixUs - pgEpochUnix * 1_000_000
+  pgTimestampMicros(v.toTime())
 
 proc pgDateDays*(v: DateTime): int32 {.inline.} =
   ## Days since the PostgreSQL epoch (2000-01-01) for ``date`` binary format.
@@ -668,7 +679,7 @@ proc toPgBinaryParam*(v: PgMoney): PgParam =
   data.writeMoneyAt(0, v)
   PgParam(oid: OidMoney, format: 1, value: some(data))
 
-proc hexNibble(c: char): int =
+proc hexNibble*(c: char): int =
   case c
   of '0' .. '9':
     ord(c) - ord('0')
@@ -679,13 +690,20 @@ proc hexNibble(c: char): int =
   else:
     -1
 
-proc decodeHexPair(s: string, i: int, errCtx: string): byte =
+proc decodeHexPair*(s: string, i: int, errCtx: string): byte =
   let hi = hexNibble(s[i])
   let lo = hexNibble(s[i + 1])
   if hi < 0 or lo < 0:
     raise newException(
       PgTypeError, errCtx & ": non-hex character at position " & $i & " in " & s.escape
     )
+  byte((hi shl 4) or lo)
+
+proc decodeHexPair*(buf: openArray[byte], i: int, errCtx: string): byte =
+  let hi = hexNibble(char(buf[i]))
+  let lo = hexNibble(char(buf[i + 1]))
+  if hi < 0 or lo < 0:
+    raise newException(PgTypeError, errCtx & ": non-hex character at position " & $i)
   byte((hi shl 4) or lo)
 
 proc writeUuidAt(buf: var openArray[byte], pos: int, v: PgUuid) =
@@ -1108,14 +1126,13 @@ proc toPgBinaryParam*(v: PgHstore, oid: int32): PgParam =
   PgParam(oid: oid, format: 1, value: some(encodeHstoreBinary(v)))
 
 proc toPgParam*(v: seq[PgHstore]): PgParam =
-  ## Send ``hstore[]`` in text format using ``OidTextArray``. Requires an
-  ## explicit ``::hstore[]`` cast in the SQL statement (e.g.
-  ## ``SELECT $1::hstore[]``), since the parameter is typed as ``text[]``. No
-  ## connection-specific OID is needed; prefer ``toPgBinaryParam`` when the
-  ## hstore / ``hstore[]`` OIDs are available via ``lookupTypeOids`` (faster, no
-  ## cast required).
+  ## Send ``hstore[]`` in text format with OID 0 (unknown) so PostgreSQL infers
+  ## the parameter type from context. Works with both ``SELECT $1::hstore[]``
+  ## and ``INSERT INTO t(hstore_arr_col) VALUES($1)``. Prefer
+  ## ``toPgBinaryParam`` when the hstore / ``hstore[]`` OIDs are available via
+  ## ``lookupTypeOids`` (binary format, faster).
   if v.len == 0:
-    return PgParam(oid: OidTextArray, format: 0, value: some(toBytes("{}")))
+    return PgParam(oid: 0'i32, format: 0, value: some(toBytes("{}")))
   var s = "{"
   for i, h in v:
     if i > 0:
@@ -1127,7 +1144,7 @@ proc toPgParam*(v: seq[PgHstore]): PgParam =
       s.add(c)
     s.add('"')
   s.add('}')
-  PgParam(oid: OidTextArray, format: 0, value: some(toBytes(s)))
+  PgParam(oid: 0'i32, format: 0, value: some(toBytes(s)))
 
 proc toPgBinaryParam*(v: seq[PgHstore], elemOid: int32, arrayOid: int32): PgParam =
   ## Encode ``hstore[]`` in binary format. Requires the dynamic hstore and

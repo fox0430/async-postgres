@@ -178,23 +178,64 @@ suite "E2E: Extended Type Roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       discard await conn.exec("CREATE TEMP TABLE test_bytea (data bytea)")
-      # Insert via SQL hex literal (toPgParam for bytea uses text format, so
-      # raw non-UTF8 bytes are rejected by PostgreSQL — use hex literals instead)
+      let raw = @[0x00'u8, 0xDE, 0xAD, 0xBE, 0xEF, 0xFF]
       discard
-        await conn.exec("INSERT INTO test_bytea (data) VALUES ('\\x00DEADBEEFFF')")
-      let res = await conn.query("SELECT data FROM test_bytea")
+        await conn.exec("INSERT INTO test_bytea (data) VALUES ($1)", @[toPgParam(raw)])
+      let res = await conn.query(
+        "SELECT data FROM test_bytea WHERE data = $1", @[toPgParam(raw)]
+      )
       doAssert res.rows.len == 1
-      doAssert res.rows[0].getBytes(0) == @[0x00'u8, 0xDE, 0xAD, 0xBE, 0xEF, 0xFF]
-      # Also test toPgParam with ASCII-safe bytes
-      let safeInput = @[0x41'u8, 0x42, 0x43] # "ABC"
+      doAssert res.rows[0].getBytes(0) == raw
+      await conn.close()
+
+    waitFor t()
+
+  test "bytea roundtrip with backslash and hex-prefix patterns":
+    # Regression: text-format bytea would either error out or silently
+    # collapse \\ → \ and decode \x-prefixed inputs as hex.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("CREATE TEMP TABLE test_bytea_esc (data bytea)")
+      let cases: seq[seq[byte]] = @[
+        @[0x5C'u8, 0x5C], # \\
+        @[0x5C'u8, 0x78, 0x61, 0x62], # \xab
+        @[0x5C'u8, 0x30, 0x30, 0x30], # \000
+        @[0x00'u8, 0x01, 0x02, 0x7F, 0x80, 0xFE, 0xFF],
+        @[], # empty
+      ]
+      for input in cases:
+        discard await conn.exec(
+          "INSERT INTO test_bytea_esc (data) VALUES ($1)", @[toPgParam(input)]
+        )
+        let qr = await conn.query(
+          "SELECT data FROM test_bytea_esc WHERE data = $1", @[toPgParam(input)]
+        )
+        doAssert qr.rows.len == 1
+        doAssert qr.rows[0].getBytes(0) == input
+        discard await conn.exec("DELETE FROM test_bytea_esc")
+      await conn.close()
+
+    waitFor t()
+
+  test "bytea roundtrip via toPgParamInline":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("CREATE TEMP TABLE test_bytea_inl (data bytea)")
+      let short = @[0x5C'u8, 0x5C, 0x00, 0xFF]
+      var long = newSeq[byte](128)
+      for i in 0 ..< long.len:
+        long[i] = byte(i)
       discard await conn.exec(
-        "INSERT INTO test_bytea (data) VALUES ($1)", @[toPgParam(safeInput)]
+        "INSERT INTO test_bytea_inl (data) VALUES ($1)", @[toPgParamInline(short)]
       )
-      let res2 = await conn.query(
-        "SELECT data FROM test_bytea WHERE data = $1", @[toPgParam(safeInput)]
+      discard await conn.exec(
+        "INSERT INTO test_bytea_inl (data) VALUES ($1)", @[toPgParamInline(long)]
       )
-      doAssert res2.rows.len == 1
-      doAssert res2.rows[0].getBytes(0) == safeInput
+      let qr =
+        await conn.query("SELECT data FROM test_bytea_inl ORDER BY octet_length(data)")
+      doAssert qr.rows.len == 2
+      doAssert qr.rows[0].getBytes(0) == short
+      doAssert qr.rows[1].getBytes(0) == long
       await conn.close()
 
     waitFor t()

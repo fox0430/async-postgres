@@ -256,6 +256,44 @@ suite "Large Object: convenience API":
 
     waitFor t()
 
+  test "loWriteAll rejects non-positive chunkSize":
+    # Without the guard, chunkSize=0 loops forever and negative values raise
+    # RangeDefect from the slice expression.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      conn.withTransaction:
+        let oid = await conn.loCreate()
+        let lo = await conn.loOpen(oid, INV_READWRITE)
+
+        let payload = toBytes("nonempty")
+        var raisedZero = false
+        try:
+          await lo.loWriteAll(payload, chunkSize = 0)
+        except ValueError:
+          raisedZero = true
+        doAssert raisedZero
+
+        var raisedNeg = false
+        try:
+          await lo.loWriteAll(payload, chunkSize = -1)
+        except ValueError:
+          raisedNeg = true
+        doAssert raisedNeg
+
+        var raisedZeroDeadline = false
+        try:
+          await lo.loWriteAllDeadline(payload, seconds(1), chunkSize = 0)
+        except ValueError:
+          raisedZeroDeadline = true
+        doAssert raisedZeroDeadline
+
+        await lo.loClose()
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
   test "loSize":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

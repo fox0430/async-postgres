@@ -70,26 +70,37 @@ jobs:
 
       # macOS runners have no Docker, so PostgreSQL is only available on Linux.
       - name: Start PostgreSQL
+        id: start-psql
         if: runner.os == 'Linux'
         run: docker compose up -d --wait
+        background: true
 
       - name: Install chronos
+        id: install-chronos
         run: nimble install chronos -y
+        background: true
 
-      # Linux runs the full suite against the live PostgreSQL above.
-      - name: Run tests
-        if: runner.os == 'Linux'
-        run: nimble test -y
-
-      # macOS has no PostgreSQL; run only the unit and mock-server tests.
-      - name: Run unit tests
-        if: runner.os != 'Linux'
-        run: nimble test_unit -y
+      - name: Wait setup
+        wait: [start-psql, install-chronos]
 
       - name: Install async_postgres
         run: |
           rm -rf ~/.nimble/pkgs2/async_postgres-*
           nimble install -y
+
+      # Linux runs the full suite against the live PostgreSQL above.
+      - name: Run tests
+        id: run-tests
+        if: runner.os == 'Linux'
+        run: nimble test -y
+        background: true
+
+      # macOS has no PostgreSQL; run only the unit and mock-server tests.
+      - name: Run unit tests
+        id: run-unit-tests
+        if: runner.os != 'Linux'
+        run: nimble test_unit -y
+        background: true
 
       - name: Compile examples (asyncdispatch)
         run: for f in examples/*.nim; do nim c "$f"; done
@@ -102,3 +113,6 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           nim doc --project --index:on --outdir:./htmldocs ./async_postgres.nim
+
+      - name: Wait tests
+        wait: [run-tests, run-unit-tests]

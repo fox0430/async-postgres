@@ -360,9 +360,42 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?max_message_size=-1")
 
+  test "max_scram_iterations from URI DSN":
+    let cfg = parseDsn("postgresql://host/db?max_scram_iterations=1000000")
+    check cfg.maxScramIterations == 1000000
+
+  test "max_scram_iterations from keyword DSN":
+    let cfg = parseDsn("host=h dbname=d max_scram_iterations=2000000")
+    check cfg.maxScramIterations == 2000000
+
+  test "max_scram_iterations default is zero (use library default)":
+    let cfg = parseDsn("postgresql://host/db")
+    check cfg.maxScramIterations == 0
+
+  test "error: invalid max_scram_iterations value":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_scram_iterations=abc")
+
+  test "error: negative max_scram_iterations":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?max_scram_iterations=-1")
+
   test "error: sslrootcert file not found":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslrootcert=/nonexistent/file.pem")
+
+  test "sslsni defaults to true (libpq parity)":
+    check parseDsn("postgresql://host/db").sslSni == true
+
+  test "sslsni=0 disables SNI":
+    check parseDsn("postgresql://host/db?sslsni=0").sslSni == false
+
+  test "sslsni=1 enables SNI":
+    check parseDsn("postgresql://host/db?sslsni=1").sslSni == true
+
+  test "error: invalid sslsni":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslsni=bogus")
 
   test "multi-host DSN":
     let cfg = parseDsn("postgresql://h1:5432,h2:5433/db")
@@ -796,6 +829,16 @@ suite "parseDsn keyword=value":
   test "error: invalid sslmode":
     expect PgError:
       discard parseDsn("host=h sslmode=bogus")
+
+  test "sslsni defaults to true (libpq parity)":
+    check parseDsn("host=h dbname=d").sslSni == true
+
+  test "sslsni=0 disables SNI":
+    check parseDsn("host=h dbname=d sslsni=0").sslSni == false
+
+  test "error: invalid sslsni":
+    expect PgError:
+      discard parseDsn("host=h sslsni=bogus")
 
   test "channel_binding parameter":
     let cfg = parseDsn("host=h channel_binding=require")

@@ -1062,6 +1062,37 @@ when hasChronos:
 
       waitFor t()
 
+    test "waitNotification fails on stopListening":
+      proc t() {.async.} =
+        let listener = await connect(plainConfig())
+        await listener.listen("wait_stop")
+
+        let waitFut = listener.waitNotification()
+        await sleepAsync(milliseconds(50))
+        doAssert not waitFut.finished
+
+        await listener.stopListening()
+        doAssert listener.state == csReady
+
+        var raised = false
+        try:
+          discard await waitFut
+        except PgError:
+          raised = true
+        doAssert raised
+
+        # Subsequent waitNotification after a clean stop must not hang either.
+        raised = false
+        try:
+          discard await listener.waitNotification()
+        except PgError:
+          raised = true
+        doAssert raised
+
+        await listener.close()
+
+      waitFor t()
+
     test "concurrent waitNotification raises error":
       proc t() {.async.} =
         let listener = await connect(plainConfig())

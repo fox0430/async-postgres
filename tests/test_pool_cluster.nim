@@ -4,6 +4,8 @@ import ../async_postgres/[async_backend, pg_protocol, pg_connection]
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_pool_cluster {.all.}
 
+import mock_pg_server
+
 privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
@@ -590,3 +592,147 @@ suite "Closed pool cluster":
 
     expect(PgError):
       discard waitFor cluster.primary.acquire()
+
+proc clusterMockConfig(port: int): ConnConfig =
+  ConnConfig(
+    host: "127.0.0.1",
+    port: port,
+    user: "test",
+    database: "test",
+    sslMode: sslDisable,
+    targetSessionAttrs: tsaAny,
+  )
+
+const
+  primaryHandshakeParams = @[
+    ("in_hot_standby", "off"), ("default_transaction_read_only", "off")
+  ]
+    ## Reports the session as a writable primary — matches tsaReadWrite in
+    ## one pass without a SHOW/SELECT probe.
+  replicaHandshakeParams = @[
+    ("in_hot_standby", "on"), ("default_transaction_read_only", "on")
+  ]
+    ## Reports the session as a standby — matches the first pass of
+    ## tsaPreferStandby (tsaStandby) without a second dial.
+
+suite "newPoolCluster concurrent warmup":
+  test "warms primary and replica pools in parallel (gate-based)":
+    # Two mock servers, one per role. Each handler completes its accept, then
+    # blocks on the peer's `accepted` future before sending the handshake.
+    # Serial warmup: the first pool's connect stalls forever waiting for the
+    # other server's accept that never starts, connectTimeout fires, newPool
+    # raises. Parallel warmup: both accepts land, both gates open, both
+    # handshakes complete.
+    var ok = true
+
+    proc t() {.async.} =
+      let primaryMs = startMockServer()
+      let replicaMs = startMockServer()
+      let primaryAccepted = newFuture[void]("primaryAccepted")
+      let replicaAccepted = newFuture[void]("replicaAccepted")
+
+      proc primaryHandler() {.async.} =
+        var c: MockClient
+        try:
+          c = await primaryMs.accept()
+          primaryAccepted.complete()
+          await drainStartupMessage(c)
+          await replicaAccepted
+          await sendFullHandshake(c, params = primaryHandshakeParams)
+          # Consume Terminate from cluster.close().
+          discard await drainFrontendMessage(c)
+        except CatchableError:
+          discard
+        if c != nil:
+          try:
+            await closeClient(c)
+          except CatchableError:
+            discard
+
+      proc replicaHandler() {.async.} =
+        var c: MockClient
+        try:
+          c = await replicaMs.accept()
+          replicaAccepted.complete()
+          await drainStartupMessage(c)
+          await primaryAccepted
+          await sendFullHandshake(c, params = replicaHandshakeParams)
+          discard await drainFrontendMessage(c)
+        except CatchableError:
+          discard
+        if c != nil:
+          try:
+            await closeClient(c)
+          except CatchableError:
+            discard
+
+      let primaryFut = primaryHandler()
+      let replicaFut = replicaHandler()
+      var pCfg =
+        initPoolConfig(clusterMockConfig(primaryMs.port), minSize = 1, maxSize = 1)
+      var rCfg =
+        initPoolConfig(clusterMockConfig(replicaMs.port), minSize = 1, maxSize = 1)
+      pCfg.connConfig.connectTimeout = seconds(1)
+      rCfg.connConfig.connectTimeout = seconds(1)
+      try:
+        let cluster = await newPoolCluster(pCfg, rCfg)
+        await cluster.close()
+      except CatchableError:
+        ok = false
+      await primaryFut
+      await replicaFut
+      await closeServer(primaryMs)
+      await closeServer(replicaMs)
+
+    waitFor t()
+    check ok
+
+  test "closes successfully-warmed replica when primary connect fails":
+    # Point primary at a freed port (ECONNREFUSED) and replica at a live mock
+    # server. Parallel warmup means the replica pool comes up while primary
+    # fails; newPoolCluster must close that survivor rather than leak it.
+    # Observing a Terminate ('X') on the replica server side proves the pool
+    # was actually closed by the cluster cleanup (not by the pass-1 role
+    # probe — the standby params match tsaStandby without a second dial).
+    var raised = false
+    var replicaTerminated = false
+
+    proc t() {.async.} =
+      let deadMs = startMockServer()
+      let deadPort = deadMs.port
+      await closeServer(deadMs)
+
+      let replicaMs = startMockServer()
+      proc replicaHandler() {.async.} =
+        var c: MockClient
+        try:
+          c = await replicaMs.accept()
+          await drainStartupMessage(c)
+          await sendFullHandshake(c, params = replicaHandshakeParams)
+          let msg = await drainFrontendMessage(c)
+          if msg.msgType == 'X':
+            replicaTerminated = true
+        except CatchableError:
+          discard
+        if c != nil:
+          try:
+            await closeClient(c)
+          except CatchableError:
+            discard
+
+      let serverFut = replicaHandler()
+      var pCfg = initPoolConfig(clusterMockConfig(deadPort), minSize = 1, maxSize = 1)
+      var rCfg =
+        initPoolConfig(clusterMockConfig(replicaMs.port), minSize = 1, maxSize = 1)
+      pCfg.connConfig.connectTimeout = milliseconds(300)
+      rCfg.connConfig.connectTimeout = seconds(2)
+      try:
+        discard await newPoolCluster(pCfg, rCfg)
+      except CatchableError:
+        raised = true
+      await serverFut
+      await closeServer(replicaMs)
+
+    waitFor t()
+    check raised
+    check replicaTerminated

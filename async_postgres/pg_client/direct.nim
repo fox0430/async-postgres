@@ -53,20 +53,16 @@ proc queryDirectImpl*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: result.commandTag, rowCount: result.rowCount),
   ):
-    if timeout > ZeroDuration:
-      try:
-        result = await queryDirectRunImpl(
-          conn, sql, resultFormats, colFmts, colOids, cacheHit, cacheMiss, stmtName,
-          cachedFields,
-        )
-          .wait(timeout)
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("queryDirect timed out")
-    else:
-      result = await queryDirectRunImpl(
+    awaitOrInvalidate(
+      conn,
+      result,
+      queryDirectRunImpl(
         conn, sql, resultFormats, colFmts, colOids, cacheHit, cacheMiss, stmtName,
         cachedFields,
-      )
+      ),
+      timeout,
+      "queryDirect timed out",
+    )
 
 proc buildInvalidateOnOidMismatchStmt(
     connSym, sqlSym, cachedSym, cacheHitSym: NimNode, positional: seq[NimNode]
@@ -315,6 +311,22 @@ proc validatePlaceholderArity(
       sqlNode,
     )
 
+proc bindPositionalOnce(
+    positional: seq[NimNode]
+): tuple[bindings: NimNode, syms: seq[NimNode]] =
+  ## Emit ``let tmp = <arg>`` for each positional argument so downstream
+  ## fan-out (``paramOidOf`` in the invalidate call plus ``writeParamOid`` /
+  ## ``writeParamFormat`` / ``writeParamValue`` in the Bind/Parse macros)
+  ## substitutes the temporary, not the source expression. Without this a
+  ## side-effecting argument such as ``getNextId()`` would fire 3–4 times per
+  ## direct call.
+  result.bindings = newStmtList()
+  result.syms = newSeq[NimNode](positional.len)
+  for i, arg in positional:
+    let tmp = genSym(nskLet, "directArg" & $i)
+    result.syms[i] = tmp
+    result.bindings.add(newLetStmt(tmp, arg))
+
 proc extractTimeoutArg(
     args: NimNode
 ): tuple[positional: seq[NimNode], timeout: NimNode] =
@@ -367,7 +379,6 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     let `sqlSym` = `sql`
     let `timeoutSym`: Duration = `timeoutExpr`
     `connSym`.checkReady()
-    `connSym`.state = csBusy
 
     let `cachedSym` = `connSym`.lookupStmtCache(`sqlSym`)
     var `cacheHitSym` = `cachedSym` != nil
@@ -378,8 +389,11 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     var `colFmtsSym`: seq[int16]
     var `colOidsSym`: seq[int32]
 
+  let (argBindings, argSyms) = bindPositionalOnce(positional)
+  result.add argBindings
+
   result.add buildInvalidateOnOidMismatchStmt(
-    connSym, sqlSym, cachedSym, cacheHitSym, positional
+    connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
 
   # Helper to build addBindDirect call with args
@@ -394,8 +408,8 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
       result.add(argList[i])
 
   let argList = newNimNode(nnkBracket)
-  for arg in positional:
-    argList.add(arg)
+  for sym in argSyms:
+    argList.add(sym)
 
   # Cache hit path
   let hitBlock = newStmtList()
@@ -470,6 +484,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   result.add(ifNode)
 
   result.add quote do:
+    `connSym`.state = csBusy
     queryDirectImpl(
       `connSym`, `sqlSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`, `cacheHitSym`,
       `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, `timeoutSym`,
@@ -506,15 +521,13 @@ proc execDirectImpl*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
-    if timeout > ZeroDuration:
-      try:
-        tag = await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName).wait(
-          timeout
-        )
-      except AsyncTimeoutError:
-        conn.invalidateOnTimeout("execDirect timed out")
-    else:
-      tag = await execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName)
+    awaitOrInvalidate(
+      conn,
+      tag,
+      execDirectRunImpl(conn, sql, cacheHit, cacheMiss, stmtName),
+      timeout,
+      "execDirect timed out",
+    )
   return initCommandResult(tag)
 
 macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =
@@ -547,15 +560,17 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     let `sqlSym` = `sql`
     let `timeoutSym`: Duration = `timeoutExpr`
     `connSym`.checkReady()
-    `connSym`.state = csBusy
 
     let `cachedSym` = `connSym`.lookupStmtCache(`sqlSym`)
     var `cacheHitSym` = `cachedSym` != nil
     var `cacheMissSym` = false
     var `stmtNameSym` = ""
 
+  let (argBindings, argSyms) = bindPositionalOnce(positional)
+  result.add argBindings
+
   result.add buildInvalidateOnOidMismatchStmt(
-    connSym, sqlSym, cachedSym, cacheHitSym, positional
+    connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
 
   proc makeBindDirect(buf, portal, stmt: NimNode, argList: NimNode): NimNode =
@@ -570,8 +585,8 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
       result.add(argList[i])
 
   let argList = newNimNode(nnkBracket)
-  for arg in positional:
-    argList.add(arg)
+  for sym in argSyms:
+    argList.add(sym)
 
   let sendBufNode = newDotExpr(connSym, ident"sendBuf")
 
@@ -634,6 +649,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   result.add(ifNode)
 
   result.add quote do:
+    `connSym`.state = csBusy
     execDirectImpl(
       `connSym`, `sqlSym`, `cacheHitSym`, `cacheMissSym`, `stmtNameSym`, `timeoutSym`
     )

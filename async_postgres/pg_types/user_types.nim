@@ -206,7 +206,9 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
     raise newException(PgTypeError, "Invalid composite literal: " & s)
   let inner = s[1 ..^ 2]
   if inner.len == 0:
-    return @[]
+    # PostgreSQL emits `()` for a 1-field composite whose sole field is NULL;
+    # a 0-field composite is not representable, so treat empty as one NULL.
+    return @[none(string)]
   var i = 0
   while i < inner.len:
     if inner[i] == ',':
@@ -347,32 +349,42 @@ proc compositeFieldFromText[T](s: string): T =
   elif T is float32:
     pgParseFloat32(s)
   elif T is bool:
-    case s
-    of "t", "true", "1":
-      true
-    of "f", "false", "0":
-      false
-    else:
-      raise newException(PgTypeError, "Invalid boolean in composite: " & s)
+    parsePgBoolText(s)
   elif T is PgNumeric:
     parsePgNumeric(s)
   else:
     raise newException(PgTypeError, "Unsupported composite field type")
 
+template checkFieldLen(actual, expected: int, typeName: string) =
+  # Guard against DB-column / Nim-field width mismatch: without this,
+  # a wider wire value would silently truncate and a narrower one IndexDefect.
+  if actual != expected:
+    raise newException(
+      PgTypeError,
+      "Composite binary field length " & $actual & " does not match " & typeName &
+        " (expected " & $expected & ")",
+    )
+
 template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
   when typeof(val) is string:
     val = readString(buf, fOff, fLen)
   elif typeof(val) is int16:
+    checkFieldLen(fLen, 2, "int16")
     val = fromBE16(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is int32:
+    checkFieldLen(fLen, 4, "int32")
     val = fromBE32(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is (int64 or int):
+    checkFieldLen(fLen, 8, "int64")
     val = typeof(val)(fromBE64(buf.toOpenArray(fOff, fEnd)))
   elif typeof(val) is float64:
+    checkFieldLen(fLen, 8, "float64")
     val = decodeFloat64BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is float32:
+    checkFieldLen(fLen, 4, "float32")
     val = decodeFloat32BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is bool:
+    checkFieldLen(fLen, 1, "bool")
     val = buf[fOff] != 0
   else:
     val = compositeFieldFromText[typeof(val)](readString(buf, fOff, fLen))

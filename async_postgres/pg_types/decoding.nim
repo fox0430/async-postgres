@@ -344,7 +344,7 @@ proc decodeBinaryComposite*(
       result[i].len = flen
       pos += flen
 
-proc parseTimestampText*(s: string): DateTime =
+proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
   # Text-format 'infinity'/'-infinity' mirror the binary sentinels handled in
   # decodeBinaryTimestamp: not representable as a DateTime, so raise a clear
   # PgTypeError rather than the generic "Invalid timestamp" below.
@@ -352,17 +352,42 @@ proc parseTimestampText*(s: string): DateTime =
     raise newException(
       PgTypeError, "Timestamp is '" & s & "', not representable as a DateTime"
     )
+  # PG trims trailing zeros in text output ('.500000' -> '.5'), but Nim's
+  # 'ffffff' requires exactly 6 digits. Right-pad short fractions before parse.
+  var norm = s
+  let dot = s.find('.')
+  if dot >= 0:
+    var e = dot + 1
+    while e < s.len and s[e] in {'0' .. '9'}:
+      inc e
+    let fracLen = e - dot - 1
+    if fracLen in 1 .. 5:
+      norm = s[0 ..< e] & repeat('0', 6 - fracLen) & s[e .. ^1]
   const formats = [
     "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
     "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
     "yyyy-MM-dd HH:mm:ss",
   ]
+  # Fallback zone is utc() so zoneless input decodes to the same absolute instant
+  # as decodeBinaryTimestamp. Formats carrying zzz/zz still use their own zone.
   for fmt in formats:
     try:
-      return parse(s, fmt)
+      return parse(norm, fmt, utc())
     except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp: " & s)
+
+proc parseDateText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
+  # Text-format 'infinity'/'-infinity' mirror the binary sentinels handled in
+  # decodeBinaryDate: not representable as a DateTime, so raise a clear
+  # PgTypeError rather than the generic "Invalid date" below.
+  if s == "infinity" or s == "-infinity":
+    raise
+      newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
+  try:
+    return parse(s, "yyyy-MM-dd")
+  except TimeParseError, IndexDefect:
+    raise newException(PgTypeError, "Invalid date: " & s)
 
 proc parseTimeText*(s: string): PgTime =
   ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".

@@ -1,26 +1,22 @@
 import std/unittest
 
-import ../async_postgres/[pg_saslprep, pg_errors]
+import ../async_postgres/pg_saslprep
 
 suite "SASLprep - ASCII fast path":
-  test "empty string is rejected":
-    expect PgConnectionError:
-      discard saslprep("")
+  test "empty string returns empty":
+    check saslprep("") == ""
 
   test "printable ASCII is identity":
     check saslprep("pencil") == "pencil"
     check saslprep("Password123!") == "Password123!"
     check saslprep("a b c") == "a b c"
 
-  test "ASCII control characters are prohibited (fast path bypassed)":
+  test "ASCII control characters fall back to raw (fast path bypassed)":
     # Fast path checks 0x20..0x7E; anything else falls through to the
-    # prohibit stage, which rejects C.2.1.
-    expect PgConnectionError:
-      discard saslprep("bad\x07pass") # BEL
-    expect PgConnectionError:
-      discard saslprep("tab\tpass") # TAB is 0x09
-    expect PgConnectionError:
-      discard saslprep("del\x7Fpass") # DEL
+    # prohibit stage, which now falls back to raw instead of raising.
+    check saslprep("bad\x07pass") == "bad\x07pass" # BEL
+    check saslprep("tab\tpass") == "tab\tpass" # TAB is 0x09
+    check saslprep("del\x7Fpass") == "del\x7Fpass" # DEL
 
 suite "SASLprep - RFC 3454 B.1 (map to nothing)":
   test "soft hyphen U+00AD is deleted":
@@ -67,57 +63,67 @@ suite "SASLprep - NFKC normalization":
   test "full-width Latin A U+FF21 -> A":
     check saslprep("\xEF\xBC\xA1BC") == "ABC"
 
-suite "SASLprep - prohibited outputs":
-  test "ASCII control (C.2.1)":
-    expect PgConnectionError:
-      discard saslprep("x\x00y")
+suite "SASLprep - prohibited fallback (matches PostgreSQL)":
+  # PG server and libpq fall back to raw bytes when SASLprep rejects the
+  # post-mapping string; the raw password is then hashed as-is. Match this
+  # so a role created with `CREATE ROLE ... PASSWORD '<contains-prohibited>'`
+  # can authenticate.
 
-  test "non-ASCII control range 0x80..0x9F (C.2.2)":
-    expect PgConnectionError:
-      discard saslprep("x\xC2\x85y") # U+0085 NEL
+  test "ASCII NUL (C.2.1) falls back to raw":
+    let raw = "x\x00y"
+    check saslprep(raw) == raw
 
-  test "line separator U+2028 (C.2.2)":
-    expect PgConnectionError:
-      discard saslprep("x\xE2\x80\xA8y")
+  test "non-ASCII control U+0085 NEL (C.2.2) falls back to raw":
+    let raw = "x\xC2\x85y"
+    check saslprep(raw) == raw
 
-  test "BOM U+FEFF (C.2.2)":
+  test "line separator U+2028 (C.2.2) falls back to raw":
+    let raw = "x\xE2\x80\xA8y"
+    check saslprep(raw) == raw
+
+  test "BOM U+FEFF is deleted by B.1 (not rejected)":
     # U+FEFF is in B.1 too; B.1 wins so it is deleted rather than rejected.
     check saslprep("a\xEF\xBB\xBFb") == "ab"
 
-  test "private use U+E000 (C.3)":
-    expect PgConnectionError:
-      discard saslprep("x\xEE\x80\x80y")
+  test "private use U+E000 (C.3) falls back to raw":
+    let raw = "x\xEE\x80\x80y"
+    check saslprep(raw) == raw
 
-  test "non-character U+FFFE (C.4)":
-    expect PgConnectionError:
-      discard saslprep("x\xEF\xBF\xBEy")
+  test "non-character U+FFFE (C.4) falls back to raw":
+    let raw = "x\xEF\xBF\xBEy"
+    check saslprep(raw) == raw
 
-  test "non-character U+FDD0 (C.4)":
-    expect PgConnectionError:
-      discard saslprep("x\xEF\xB7\x90y")
+  test "non-character U+FDD0 (C.4) falls back to raw":
+    let raw = "x\xEF\xB7\x90y"
+    check saslprep(raw) == raw
 
-  test "inappropriate for plain text U+FFFD (C.6)":
-    expect PgConnectionError:
-      discard saslprep("x\xEF\xBF\xBDy")
+  test "inappropriate for plain text U+FFFD (C.6) falls back to raw":
+    let raw = "x\xEF\xBF\xBDy"
+    check saslprep(raw) == raw
 
-  test "left-to-right mark U+200E (C.8)":
-    expect PgConnectionError:
-      discard saslprep("x\xE2\x80\x8Ey")
+  test "left-to-right mark U+200E (C.8) falls back to raw":
+    let raw = "x\xE2\x80\x8Ey"
+    check saslprep(raw) == raw
+
+  test "fallback preserves original bytes, not post-mapping bytes":
+    # U+00A0 would map to 0x20 under normal SASLprep; the prohibited
+    # NEL (U+0085) triggers fallback, so the mapping must be discarded
+    # and the raw input returned verbatim.
+    let raw = "a\xC2\xA0b\xC2\x85c"
+    check saslprep(raw) == raw
 
 suite "SASLprep - bidirectional (RFC 3454 Section 6)":
   test "ARABIC ALEF alone is accepted":
     let alef = "\xD8\xA7" # U+0627
     check saslprep(alef) == alef
 
-  test "RandALCat mixed with LCat is rejected":
-    # U+0627 (AL) + Latin 'A' (L) → violation.
-    expect PgConnectionError:
-      discard saslprep("\xD8\xA7A")
+  test "RandALCat mixed with LCat falls back to raw":
+    let raw = "\xD8\xA7A" # U+0627 (AL) + Latin 'A' (L)
+    check saslprep(raw) == raw
 
-  test "RandALCat must start and end with RandALCat":
-    # U+0627 (AL) + '1' (EN, neither AL nor L). Ends with EN → violation.
-    expect PgConnectionError:
-      discard saslprep("\xD8\xA71")
+  test "RandALCat must start and end with RandALCat, else raw":
+    let raw = "\xD8\xA71" # U+0627 (AL) + '1' (EN) → ends non-RandALCat
+    check saslprep(raw) == raw
 
   test "LCat-only string is accepted":
     check saslprep("abc") == "abc"
@@ -127,12 +133,35 @@ suite "SASLprep - bidirectional (RFC 3454 Section 6)":
     let s = "\xD8\xA7\xD8\xA8"
     check saslprep(s) == s
 
-suite "SASLprep - empty password handling":
-  test "password of only B.1 characters is rejected":
-    # Soft hyphen maps to nothing; the result is empty, which PostgreSQL
-    # rejects.
-    expect PgConnectionError:
-      discard saslprep("\xC2\xAD")
+suite "SASLprep - invalid UTF-8 fallback (matches PostgreSQL)":
+  # PG server and libpq both use the raw bytes when input is not valid
+  # UTF-8; returning input unchanged keeps our client verifier in sync.
 
-  test "password of only ZWSP maps to a single space and is accepted":
+  test "bare Latin-1 byte is returned as-is":
+    let raw = "p\xE9ss" # 0xE9 = Latin-1 'e-acute'
+    check saslprep(raw) == raw
+
+  test "bare continuation byte is returned as-is":
+    let raw = "x\x80y"
+    check saslprep(raw) == raw
+
+  test "truncated 2-byte sequence is returned as-is":
+    let raw = "x\xC2y"
+    check saslprep(raw) == raw
+
+  test "overlong ASCII encoding is returned as-is":
+    let raw = "\xC0\xAF" # would 2-byte encode '/'
+    check saslprep(raw) == raw
+
+  test "ASCII fast path still wins over the fallback":
+    check saslprep("Password123!") == "Password123!"
+
+suite "SASLprep - empty post-mapping fallback":
+  test "B.1-only input falls back to raw (not empty)":
+    # Soft hyphen maps to nothing; the mapped result is empty, so we
+    # fall back to the raw input rather than raising or returning "".
+    let raw = "\xC2\xAD"
+    check saslprep(raw) == raw
+
+  test "ZWSP-only input maps to a single space":
     check saslprep("\xE2\x80\x8B") == " "

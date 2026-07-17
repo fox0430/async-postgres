@@ -33,7 +33,6 @@ proc openCursorImpl(
     chunkSize: int32,
 ): Future[Cursor] {.async.} =
   conn.checkReady()
-  conn.state = csBusy
 
   inc conn.portalCounter
   let portalName = "_cursor_" & $conn.portalCounter
@@ -50,6 +49,7 @@ proc openCursorImpl(
   batch.addDescribe(dkPortal, portalName)
   batch.addExecute(portalName, chunkSize)
   batch.addFlush()
+  conn.state = csBusy
   await conn.sendMsg(batch)
 
   var cursor =
@@ -217,15 +217,15 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   if cursor.exhausted:
     return @[]
 
-  if cursor.timeout > ZeroDuration:
-    try:
-      return await fetchNextImpl(cursor).wait(cursor.timeout)
-    except AsyncTimeoutError:
-      cursor.conn.invalidateOnTimeout("Cursor fetch timed out")
-  else:
-    return await fetchNextImpl(cursor)
+  awaitOrInvalidate(
+    cursor.conn, result, fetchNextImpl(cursor), cursor.timeout, "Cursor fetch timed out"
+  )
 
 proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
+  # `fetchNext` checks bufferedCount before exhausted, so clear it before any
+  # early return to keep the post-close @[] contract.
+  cursor.bufferedData = nil
+  cursor.bufferedCount = 0
   if cursor.exhausted:
     return
 
@@ -260,13 +260,9 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
 proc close*(cursor: Cursor): Future[void] {.async.} =
   ## Close the cursor and return the connection to ready state.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
-  if cursor.timeout > ZeroDuration:
-    try:
-      await closeCursorImpl(cursor).wait(cursor.timeout)
-    except AsyncTimeoutError:
-      cursor.conn.invalidateOnTimeout("Cursor close timed out")
-  else:
-    await closeCursorImpl(cursor)
+  awaitVoidOrInvalidate(
+    cursor.conn, closeCursorImpl(cursor), cursor.timeout, "Cursor close timed out"
+  )
 
 template withCursor*(
     conn: PgConnection,
@@ -316,15 +312,11 @@ proc openCursor*(
   ## On timeout, the connection is marked csClosed (protocol out of sync).
   let (oids, formats, values) = extractParams(params)
   let resultFormats = resultFormat.toFormatCodes()
-  if timeout > ZeroDuration:
-    try:
-      result = await openCursorImpl(
-        conn, sql, values, oids, formats, resultFormats, chunkSize
-      )
-        .wait(timeout)
-    except AsyncTimeoutError:
-      conn.invalidateOnTimeout("Cursor open timed out")
-  else:
-    result =
-      await openCursorImpl(conn, sql, values, oids, formats, resultFormats, chunkSize)
+  awaitOrInvalidate(
+    conn,
+    result,
+    openCursorImpl(conn, sql, values, oids, formats, resultFormats, chunkSize),
+    timeout,
+    "Cursor open timed out",
+  )
   result.timeout = timeout

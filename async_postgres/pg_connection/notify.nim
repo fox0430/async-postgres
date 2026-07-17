@@ -69,10 +69,12 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
     conn.writer = newConn.writer
     conn.tlsStream = newConn.tlsStream
     conn.trustAnchorBufs = newConn.trustAnchorBufs
+    conn.x509Capture = newConn.x509Capture
   elif hasAsyncDispatch:
     conn.socket = newConn.socket
 
   conn.sslEnabled = newConn.sslEnabled
+  conn.serverCertDer = newConn.serverCertDer
   conn.recvBuf = newConn.recvBuf
   conn.recvBufStart = newConn.recvBufStart
   conn.host = newConn.host
@@ -263,6 +265,15 @@ proc abortListenTask(conn: PgConnection) {.async.} =
     await cancelAndWait(conn.listenTask)
   conn.state = csClosed
 
+proc failNotifyWaiter(conn: PgConnection) {.raises: [].} =
+  ## Release the pull-API waiter when the pump has stopped so `waitNotification`
+  ## does not hang: no future dispatch can complete it.
+  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+    try:
+      conn.notifyWaiter.fail(newException(PgError, "Listener stopped"))
+    except Exception:
+      discard
+
 proc stopListening*(conn: PgConnection) {.async.} =
   ## Stop the background listen pump and return the connection to `csReady`
   ## (or leave it `csClosed` if the transport died with no live reconnect).
@@ -274,6 +285,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
     conn.listenStopRequested = false
     if conn.state == csListening:
       conn.state = csReady
+    conn.failNotifyWaiter()
     return
   # Request the stop up front, before choosing how to deliver it: this also
   # covers the pump tripping into its reconnect loop *after* we pick the normal
@@ -300,6 +312,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
       except CatchableError:
         await conn.abortListenTask()
       conn.listenTask = nil
+      conn.failNotifyWaiter()
       return
     # Normal path: pump parked in the recv loop. Signal exit by changing state,
     # then send an empty query to unblock the read.
@@ -317,6 +330,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
     # Preserve csClosed if pump detected a connection error
     if conn.state != csClosed:
       conn.state = csReady
+    conn.failNotifyWaiter()
   finally:
     # Runs on the normal, failed, *and* cancelled paths: a stop request left set
     # would later abort a legitimate reconnect (the pump's reconnect loop reads
@@ -377,6 +391,10 @@ proc waitNotification*(
   conn.checkListenAlive()
   if conn.notifyQueue.len > 0:
     return conn.notifyQueue.popFirst()
+  # No pump means nothing will ever complete the waiter, so refuse instead of
+  # blocking forever. During reconnect the task is still running.
+  if conn.listenTask == nil or conn.listenTask.finished:
+    raise newException(PgError, "Listener stopped")
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
     raise newException(PgError, "Another waitNotification is already active")
   conn.notifyWaiter = newFuture[void]("waitNotification")

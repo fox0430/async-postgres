@@ -373,8 +373,10 @@ proc connectToHost*(
                 "server sent AuthenticationSASLContinue without a preceding " &
                   "AuthenticationSASL (possible protocol violation or MITM)",
               )
-            var clientFinal =
-              scramClientFinalMessage(config.password, msg.saslData, scramState)
+            var clientFinal = scramClientFinalMessage(
+              config.password, msg.saslData, scramState,
+              config.effectiveMaxScramIterations,
+            )
             var saslMsg = encodeSASLResponse(clientFinal)
             ncutils.burnMem(clientFinal)
             try:
@@ -460,6 +462,7 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
       discard
   conn.state = csClosed
   conn.heldSessionLocks = 0
+  conn.sessionLockDirty = false
   # Fail any pending notification waiter
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
     conn.notifyWaiter.fail(newException(PgError, "Connection closed"))

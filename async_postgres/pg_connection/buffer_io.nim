@@ -83,23 +83,13 @@ proc getHosts*(config: ConnConfig): seq[HostEntry] =
 
 template makeCopyOutCallback*(body: untyped): CopyOutCallback =
   ## Create a ``CopyOutCallback`` that works with both asyncdispatch and chronos.
-  ## Inside ``body``, the current chunk is available as ``data: seq[byte]``.
+  ## Inside ``body``, the current chunk is available as ``data: sink seq[byte]``.
   ##
   ## .. code-block:: nim
   ##   var chunks: seq[seq[byte]]
   ##   let cb = makeCopyOutCallback:
   ##     chunks.add(data)
-  block:
-    when hasChronos:
-      let r: CopyOutCallback = proc(
-          data {.inject.}: seq[byte]
-      ) {.async: (raises: [CatchableError]).} =
-        body
-      r
-    else:
-      let r: CopyOutCallback = proc(data {.inject.}: seq[byte]) {.async.} =
-        body
-      r
+  makeAsyncSinkByteCallback(CopyOutCallback, body)
 
 template makeCopyInCallback*(body: untyped): CopyInCallback =
   ## Create a ``CopyInCallback`` that works with both asyncdispatch and chronos.
@@ -118,26 +108,7 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
   ##       chunk
   ##     else:
   ##       newSeq[byte]()
-  block:
-    when hasChronos:
-      let r: CopyInCallback = proc(): Future[seq[byte]] {.
-          async: (raises: [CatchableError])
-      .} =
-        body
-      r
-    else:
-      # asyncdispatch's {.async.} doesn't support non-void return types on
-      # anonymous procs. Wrap in manual Future construction instead.
-      # Note: body must be synchronous (no await).
-      let r: CopyInCallback = proc(): Future[seq[byte]] {.gcsafe.} =
-        let fut = newFuture[seq[byte]]("makeCopyInCallback")
-        try:
-          let res: seq[byte] = body
-          fut.complete(res)
-        except CatchableError as e:
-          fut.fail(e)
-        return fut
-      r
+  makeAsyncSeqByteCallback(CopyInCallback, "makeCopyInCallback", body)
 
 # Notification / notice dispatch
 
@@ -249,23 +220,32 @@ proc fillRecvBuf*(
       raise newException(PgConnectionError, "Connection closed by server")
     conn.recvBuf.setLen(oldLen + n)
   elif hasAsyncDispatch:
-    let data =
-      try:
+    # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
+    # into `recvBuf[oldLen..]` after we truncate. Safe because `invalidateOnTimeout`
+    # marks csClosed (no further extender) and seq shrink keeps capacity.
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + RecvBufSize)
+    var n: int
+    try:
+      n =
         if timeout == ZeroDuration:
-          await conn.socket.recv(RecvBufSize)
+          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize)
         else:
-          await conn.socket.recv(RecvBufSize).wait(timeout)
-      except AsyncTimeoutError as e:
-        raise e
-      except CatchableError as e:
-        conn.state = csClosed
-        raise e
-    if data.len == 0:
+          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize).wait(
+            timeout
+          )
+    except AsyncTimeoutError as e:
+      conn.recvBuf.setLen(oldLen)
+      raise e
+    except CatchableError as e:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise e
+    if n == 0:
+      conn.recvBuf.setLen(oldLen)
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + data.len)
-    copyMem(addr conn.recvBuf[oldLen], addr data[0], data.len)
+    conn.recvBuf.setLen(oldLen + n)
 
 when hasChronos:
   proc fillRecvBufDetached*(conn: PgConnection): Future[void] {.async.} =
@@ -748,6 +728,15 @@ proc isConnected*(conn: PgConnection): bool =
 # TCP socket options
 
 when defined(posix):
+  proc setSockOptInt(
+      fd: posix.SocketHandle, level, optname: cint, value: cint, name: string
+  ) =
+    var optval = value
+    if setsockopt(fd, level, optname, addr optval, sizeof(optval).SockLen) < 0:
+      raise newException(
+        PgConnectionError, "Failed to set " & name & ": " & $strerror(errno)
+      )
+
   proc configureTcpNoDelay*(fd: posix.SocketHandle) =
     ## Disable Nagle's algorithm for low-latency sends.
     var optval: cint = 1
@@ -759,73 +748,26 @@ when defined(posix):
     ## Set TCP keepalive options on the socket.
     if not config.keepAlive:
       return
-    var optval: cint = 1
-    if setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, addr optval, sizeof(optval).SockLen) < 0:
-      raise newException(
-        PgConnectionError, "Failed to set SO_KEEPALIVE: " & $strerror(errno)
-      )
-    when defined(linux):
+    setSockOptInt(fd, SOL_SOCKET, SO_KEEPALIVE, 1, "SO_KEEPALIVE")
+    when defined(linux) or defined(macosx):
+      let ipproto = cint(posix.IPPROTO_TCP)
       if config.keepAliveIdle > 0:
-        optval = cint(config.keepAliveIdle)
-        if setsockopt(
-          fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE, addr optval, sizeof(optval).SockLen
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPIDLE: " & $strerror(errno)
+        when defined(linux):
+          setSockOptInt(
+            fd, ipproto, TCP_KEEPIDLE, cint(config.keepAliveIdle), "TCP_KEEPIDLE"
+          )
+        else:
+          setSockOptInt(
+            fd, ipproto, TCP_KEEPALIVE, cint(config.keepAliveIdle), "TCP_KEEPALIVE"
           )
       if config.keepAliveInterval > 0:
-        optval = cint(config.keepAliveInterval)
-        if setsockopt(
-          fd,
-          cint(posix.IPPROTO_TCP),
-          TCP_KEEPINTVL,
-          addr optval,
-          sizeof(optval).SockLen,
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
-          )
+        setSockOptInt(
+          fd, ipproto, TCP_KEEPINTVL, cint(config.keepAliveInterval), "TCP_KEEPINTVL"
+        )
       if config.keepAliveCount > 0:
-        optval = cint(config.keepAliveCount)
-        if setsockopt(
-          fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
-          )
-    elif defined(macosx):
-      if config.keepAliveIdle > 0:
-        optval = cint(config.keepAliveIdle)
-        if setsockopt(
-          fd,
-          cint(posix.IPPROTO_TCP),
-          TCP_KEEPALIVE,
-          addr optval,
-          sizeof(optval).SockLen,
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPALIVE: " & $strerror(errno)
-          )
-      if config.keepAliveInterval > 0:
-        optval = cint(config.keepAliveInterval)
-        if setsockopt(
-          fd,
-          cint(posix.IPPROTO_TCP),
-          TCP_KEEPINTVL,
-          addr optval,
-          sizeof(optval).SockLen,
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
-          )
-      if config.keepAliveCount > 0:
-        optval = cint(config.keepAliveCount)
-        if setsockopt(
-          fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
-          )
+        setSockOptInt(
+          fd, ipproto, TCP_KEEPCNT, cint(config.keepAliveCount), "TCP_KEEPCNT"
+        )
     else:
       if config.keepAliveIdle > 0 or config.keepAliveInterval > 0 or
           config.keepAliveCount > 0:

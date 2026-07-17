@@ -21,12 +21,12 @@
 ## them with the same key unintentionally. Transaction-level locks are not
 ## stackable and are always released at transaction end.
 ##
-## **Pool integration:** Session-level lock acquires through this typed API
-## bump a per-connection counter, and the pool releases or discards the
-## connection on return so that locks never leak to subsequent borrowers.
-## Raw-SQL acquires (e.g. ``conn.exec("SELECT pg_advisory_lock(1)")``) bypass
-## this tracking — callers must release them explicitly or invoke
-## ``advisoryUnlockAll`` before returning the connection to the pool.
+## **Pool integration:** Typed acquires set a sticky ``sessionLockDirty``
+## flag; the pool runs ``pg_advisory_unlock_all`` on return based on the
+## flag (not the counter), so a typed ``advisoryUnlock`` of a raw-acquired
+## key cannot forge a lock-free state. Raw-SQL acquires still bypass
+## tracking — callers must release them explicitly or invoke
+## ``advisoryUnlockAll`` before returning the connection.
 ##
 ## Example
 ## =======
@@ -56,7 +56,7 @@
 
 import std/[macros, importutils]
 
-import async_backend, pg_types, pg_connection, pg_client
+import async_backend, pg_protocol, pg_types, pg_connection, pg_client
 
 privateAccess(PgConnection)
 
@@ -72,6 +72,7 @@ template acquireSessionLock(
 ) =
   discard await conn.queryValue(sql, params, timeout = t)
   inc conn.heldSessionLocks
+  conn.sessionLockDirty = true
 
 template trySessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
@@ -79,6 +80,7 @@ template trySessionLock(
   let acquired = await conn.queryValue(bool, sql, params, timeout = t)
   if acquired:
     inc conn.heldSessionLocks
+    conn.sessionLockDirty = true
   acquired
 
 template unlockSessionLock(
@@ -89,14 +91,26 @@ template unlockSessionLock(
     dec conn.heldSessionLocks
   released
 
+proc ensureXactScope(conn: PgConnection) {.inline.} =
+  # In tsIdle the acquire's implicit tx would commit and drop the lock before
+  # body runs, silently losing mutual exclusion.
+  if conn.txStatus != tsInTransaction:
+    raise newException(
+      PgStateError,
+      "transaction-level advisory lock requires an active transaction " & "(txStatus: " &
+        $conn.txStatus & "); wrap the call in withTransaction",
+    )
+
 template acquireXactLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ) =
+  ensureXactScope(conn)
   discard await conn.queryValue(sql, params, timeout = t)
 
 template tryXactLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ): bool =
+  ensureXactScope(conn)
   await conn.queryValue(bool, sql, params, timeout = t)
 
 # Session-level exclusive locks
@@ -157,6 +171,7 @@ proc advisoryUnlockAll*(
   ## Release all session-level advisory locks held by the current session.
   discard await conn.exec("SELECT pg_advisory_unlock_all()", timeout = timeout)
   conn.heldSessionLocks = 0
+  conn.sessionLockDirty = false
 
 # Transaction-level exclusive locks
 

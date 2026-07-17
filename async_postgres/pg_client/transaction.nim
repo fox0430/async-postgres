@@ -143,6 +143,36 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
           `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
         )
 
+proc buildSavepointRollbackCleanup*(
+    connSym, spNameSym, rollbackTimeout: NimNode
+): NimNode =
+  ## Build the shared `onCleanupSkipped`-wired ROLLBACK TO SAVEPOINT cleanup used
+  ## on a failed body by `withSavepoint` / `withSavepointDeadline`: skip on an
+  ## invalidated connection or when the surrounding transaction has already
+  ## ended (reporting both via `onCleanupSkipped`), otherwise ROLLBACK TO
+  ## SAVEPOINT with `rollbackTimeout` as the per-call timeout and report a
+  ## swallowed failure. The caller binds `spNameSym` (already quoted via
+  ## `quoteIdentifier`) in the surrounding scope.
+  let cleanupErrSym = genSym(nskLet, "cleanupErr")
+  let csReadySym = bindSym"csReady"
+  let tsInTxSym = bindSym"tsInTransaction"
+  let tsInFailedSym = bindSym"tsInFailedTransaction"
+  let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
+    bindCleanupSkippedSyms()
+  let ckSpRollbackSym = bindSym"ckSavepointRollback"
+  quote:
+    if `connSym`.state != `csReadySym`:
+      `fireCleanupSkippedSym`(`connSym`, `ckSpRollbackSym`, `csrConnInvalidatedSym`)
+    elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+      try:
+        discard await `connSym`.simpleExec(
+          "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `rollbackTimeout`
+        )
+      except CatchableError as `cleanupErrSym`:
+        `fireCleanupSkippedSym`(
+          `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
+        )
+
 proc buildRetryTxLoop*(
     connSym, retryOptsSym, beginSql, txTimeout, body: NimNode
 ): NimNode =
@@ -324,6 +354,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     try:
       discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
       `body`
@@ -399,6 +430,7 @@ macro withTransactionRetry*(
   let loop = buildRetryTxLoop(connSym, retryOptsSym, beginSql, txTimeout, body)
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     let `retryOptsSym` = `retryOpts`
     `loop`
 
@@ -473,20 +505,18 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let spNameSym = genSym(nskLet, "spName")
-  let tsInTxSym = bindSym"tsInTransaction"
-  let tsInFailedSym = bindSym"tsInFailedTransaction"
-  let csReadySym = bindSym"csReady"
-  let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
-    bindCleanupSkippedSyms()
-  let ckSpRollbackSym = bindSym"ckSavepointRollback"
+  let quoteIdentSym = bindSym"quoteIdentifier"
 
   let nameExpr = savepointNameExpr(connSym, spName)
+  # Skip ROLLBACK TO SAVEPOINT when the outer transaction has already ended or
+  # the connection is csClosed (stale txStatus after per-call timeout) — the
+  # state guard avoids a cleanup call that would fail at checkReady().
+  let spCleanup = buildSavepointRollbackCleanup(connSym, spNameSym, spTimeout)
 
   result = quote:
     let `connSym` = `connExpr`
-    let `spNameSym` = `nameExpr`
+    let `spNameSym` = `quoteIdentSym`(`nameExpr`)
     try:
       discard
         await `connSym`.simpleExec("SAVEPOINT " & `spNameSym`, timeout = `spTimeout`)
@@ -495,24 +525,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
       )
     except CatchableError as `eSym`:
-      # Only ROLLBACK TO SAVEPOINT if the outer transaction is still alive AND
-      # the connection is usable. If txStatus is tsIdle the surrounding
-      # transaction has already ended, so the savepoint no longer exists.
-      # On per-call timeout the connection is csClosed but txStatus is stale
-      # (no RFQ received) — the state guard avoids a cleanup call that would
-      # fail at checkReady(). Both the csClosed skip and any swallowed
-      # inner-ROLLBACK failure are reported via `onCleanupSkipped`.
-      if `connSym`.state != `csReadySym`:
-        `fireCleanupSkippedSym`(`connSym`, `ckSpRollbackSym`, `csrConnInvalidatedSym`)
-      elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
-        try:
-          discard await `connSym`.simpleExec(
-            "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
-          )
-        except CatchableError as `cleanupErrSym`:
-          `fireCleanupSkippedSym`(
-            `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
-          )
+      `spCleanup`
       raise `eSym`
 
 const rollbackGraceMs* {.intdefine: "asyncPgRollbackGraceMs".}: int = 5000
@@ -595,6 +608,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     proc `bodyFnSym`(): Future[void] {.async.} =
@@ -696,6 +710,7 @@ macro withTransactionRetryDeadline*(
   )
   result = quote:
     let `connSym` = `connExpr`
+    `connSym`.checkTxIdle()
     let `retryOptsSym` = `retryOpts`
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
@@ -760,28 +775,23 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let spNameSym = genSym(nskLet, "spName")
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "spBodyDeadline")
   let bodyFutSym = genSym(nskLet, "bodyFut")
-  let tsInTxSym = bindSym"tsInTransaction"
-  let tsInFailedSym = bindSym"tsInFailedTransaction"
-  let csReadySym = bindSym"csReady"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
-  let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
-    bindCleanupSkippedSyms()
-  let ckSpRollbackSym = bindSym"ckSavepointRollback"
+  let quoteIdentSym = bindSym"quoteIdentifier"
 
   let nameExpr = savepointNameExpr(connSym, spName)
+  let spCleanup = buildSavepointRollbackCleanup(connSym, spNameSym, graceSym)
 
   result = quote:
     let `connSym` = `connExpr`
-    let `spNameSym` = `nameExpr`
+    let `spNameSym` = `quoteIdentSym`(`nameExpr`)
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     proc `bodyFnSym`(): Future[void] {.async.} =
@@ -806,18 +816,5 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
         # PgTimeoutError — control does not return from this call.
         `connSym`.invalidateOnTimeout("withSavepointDeadline exceeded")
     except CatchableError as `eSym`:
-      # Skip ROLLBACK TO SAVEPOINT when the connection is already csClosed.
-      # Both the csClosed skip and any swallowed inner-ROLLBACK failure are
-      # reported via `onCleanupSkipped`.
-      if `connSym`.state != `csReadySym`:
-        `fireCleanupSkippedSym`(`connSym`, `ckSpRollbackSym`, `csrConnInvalidatedSym`)
-      elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
-        try:
-          discard await `connSym`.simpleExec(
-            "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `graceSym`
-          )
-        except CatchableError as `cleanupErrSym`:
-          `fireCleanupSkippedSym`(
-            `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
-          )
+      `spCleanup`
       raise `eSym`

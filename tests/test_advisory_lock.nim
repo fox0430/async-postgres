@@ -166,6 +166,30 @@ suite "Advisory Lock: transaction-level (int64)":
 
     waitFor t()
 
+  test "xact lock outside transaction raises PgStateError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXact(40010'i64)
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXactShared(40011'i64)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXact(40012'i64)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXactShared(40013'i64)
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXact(1'i32, 2'i32)
+      doAssertRaises(PgStateError):
+        waitFor conn.advisoryLockXactShared(3'i32, 4'i32)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXact(5'i32, 6'i32)
+      doAssertRaises(PgStateError):
+        discard waitFor conn.advisoryTryLockXactShared(7'i32, 8'i32)
+
+    waitFor t()
+
 suite "Advisory Lock: two-key (int32, int32)":
   test "lock and unlock":
     proc t() {.async.} =
@@ -228,8 +252,9 @@ suite "Advisory Lock: two-key (int32, int32)":
         await conn2.close()
       conn1.withTransaction:
         await conn1.advisoryLockXactShared(9'i32, 10'i32)
-        let acquired = await conn2.advisoryTryLockXactShared(9'i32, 10'i32)
+        let acquired = await conn2.advisoryTryLockShared(9'i32, 10'i32)
         doAssert acquired
+        discard await conn2.advisoryUnlockShared(9'i32, 10'i32)
 
     waitFor t()
 
@@ -392,8 +417,9 @@ suite "Advisory Lock: withAdvisoryLockXact template":
         await conn2.close()
       conn1.withTransaction:
         conn1.withAdvisoryLockXactShared(17'i32, 18'i32):
-          let acquired = await conn2.advisoryTryLockXactShared(17'i32, 18'i32)
+          let acquired = await conn2.advisoryTryLockShared(17'i32, 18'i32)
           doAssert acquired
+          discard await conn2.advisoryUnlockShared(17'i32, 18'i32)
 
     waitFor t()
 
@@ -521,7 +547,10 @@ suite "Advisory Lock: pool integration":
 
     waitFor t()
 
-  test "explicit unlock keeps connection in the pool":
+  test "explicit unlock alone does not spare direct release from discarding":
+    # advisoryUnlock decrements the counter but not the sticky dirty flag,
+    # so a direct release() (bypassing resetSession) still discards the
+    # connection. Use advisoryUnlockAll or withConnection to keep it.
     proc t() {.async.} =
       let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
       let pool = await newPool(cfg)
@@ -532,10 +561,11 @@ suite "Advisory Lock: pool integration":
       await conn.advisoryLock(71002'i64)
       discard await conn.advisoryUnlock(71002'i64)
       doAssert conn.heldSessionLocks == 0
+      doAssert conn.sessionLockDirty
       let closeBefore = pool.metrics.closeCount
       conn.release()
-      doAssert pool.idle.len == 1
-      doAssert pool.metrics.closeCount == closeBefore
+      doAssert pool.idle.len == 0
+      doAssert pool.metrics.closeCount - closeBefore == 1
 
     waitFor t()
 
@@ -597,6 +627,63 @@ suite "Advisory Lock: pool integration":
       let acquired = await probe.advisoryTryLock(71006'i64)
       doAssert acquired
       discard await probe.advisoryUnlock(71006'i64)
+
+    waitFor t()
+
+  test "typed unlock of raw-acquired key does not leak the tracked lock":
+    # Mixed-usage regression: raw pg_advisory_lock followed by typed
+    # advisoryUnlock decrements the counter but must not clear the sticky
+    # dirty flag, so the still-held tracked lock forces a pool-side cleanup
+    # rather than being handed to the next borrower.
+    proc t() {.async.} =
+      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      let conn = await pool.acquire()
+      await conn.advisoryLock(71007'i64) # tracked K1
+      discard await conn.exec("SELECT pg_advisory_lock(71008)") # raw K2
+      let released = await conn.advisoryUnlock(71008'i64) # typed unlock of raw K2
+      doAssert released
+      doAssert conn.heldSessionLocks == 0 # counter stolen, but…
+      doAssert conn.sessionLockDirty # …dirty flag survives.
+
+      let closeBefore = pool.metrics.closeCount
+      conn.release()
+      doAssert pool.idle.len == 0
+      doAssert pool.metrics.closeCount - closeBefore == 1
+
+      # K1 is released server-side by the close, so a fresh session can take it.
+      let probe = await connect(plainConfig())
+      defer:
+        await probe.close()
+      doAssert await probe.advisoryTryLock(71007'i64)
+      discard await probe.advisoryUnlock(71007'i64)
+
+    waitFor t()
+
+  test "typed unlock of raw-acquired key: resetSession path releases via unlock_all":
+    proc t() {.async.} =
+      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        await conn.advisoryLock(71009'i64) # tracked K1
+        discard await conn.exec("SELECT pg_advisory_lock(71010)") # raw K2
+        discard await conn.advisoryUnlock(71010'i64) # steals counter to 0
+      # resetSession keyed off dirty flag → unlock_all cleared K1 too.
+      doAssert pool.idle.len == 1
+      doAssert not pool.idle[0].conn.sessionLockDirty
+      doAssert pool.idle[0].conn.heldSessionLocks == 0
+
+      let probe = await connect(plainConfig())
+      defer:
+        await probe.close()
+      doAssert await probe.advisoryTryLock(71009'i64)
+      discard await probe.advisoryUnlock(71009'i64)
 
     waitFor t()
 
