@@ -220,23 +220,32 @@ proc fillRecvBuf*(
       raise newException(PgConnectionError, "Connection closed by server")
     conn.recvBuf.setLen(oldLen + n)
   elif hasAsyncDispatch:
-    let data =
-      try:
+    # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
+    # into `recvBuf[oldLen..]` after we truncate. Safe because `invalidateOnTimeout`
+    # marks csClosed (no further extender) and seq shrink keeps capacity.
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + RecvBufSize)
+    var n: int
+    try:
+      n =
         if timeout == ZeroDuration:
-          await conn.socket.recv(RecvBufSize)
+          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize)
         else:
-          await conn.socket.recv(RecvBufSize).wait(timeout)
-      except AsyncTimeoutError as e:
-        raise e
-      except CatchableError as e:
-        conn.state = csClosed
-        raise e
-    if data.len == 0:
+          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize).wait(
+            timeout
+          )
+    except AsyncTimeoutError as e:
+      conn.recvBuf.setLen(oldLen)
+      raise e
+    except CatchableError as e:
+      conn.recvBuf.setLen(oldLen)
+      conn.state = csClosed
+      raise e
+    if n == 0:
+      conn.recvBuf.setLen(oldLen)
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + data.len)
-    copyMem(addr conn.recvBuf[oldLen], addr data[0], data.len)
+    conn.recvBuf.setLen(oldLen + n)
 
 when hasChronos:
   proc fillRecvBufDetached*(conn: PgConnection): Future[void] {.async.} =
