@@ -719,6 +719,15 @@ proc isConnected*(conn: PgConnection): bool =
 # TCP socket options
 
 when defined(posix):
+  proc setSockOptInt(
+      fd: posix.SocketHandle, level, optname: cint, value: cint, name: string
+  ) =
+    var optval = value
+    if setsockopt(fd, level, optname, addr optval, sizeof(optval).SockLen) < 0:
+      raise newException(
+        PgConnectionError, "Failed to set " & name & ": " & $strerror(errno)
+      )
+
   proc configureTcpNoDelay*(fd: posix.SocketHandle) =
     ## Disable Nagle's algorithm for low-latency sends.
     var optval: cint = 1
@@ -730,73 +739,26 @@ when defined(posix):
     ## Set TCP keepalive options on the socket.
     if not config.keepAlive:
       return
-    var optval: cint = 1
-    if setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, addr optval, sizeof(optval).SockLen) < 0:
-      raise newException(
-        PgConnectionError, "Failed to set SO_KEEPALIVE: " & $strerror(errno)
-      )
-    when defined(linux):
+    setSockOptInt(fd, SOL_SOCKET, SO_KEEPALIVE, 1, "SO_KEEPALIVE")
+    when defined(linux) or defined(macosx):
+      let ipproto = cint(posix.IPPROTO_TCP)
       if config.keepAliveIdle > 0:
-        optval = cint(config.keepAliveIdle)
-        if setsockopt(
-          fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE, addr optval, sizeof(optval).SockLen
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPIDLE: " & $strerror(errno)
+        when defined(linux):
+          setSockOptInt(
+            fd, ipproto, TCP_KEEPIDLE, cint(config.keepAliveIdle), "TCP_KEEPIDLE"
+          )
+        else:
+          setSockOptInt(
+            fd, ipproto, TCP_KEEPALIVE, cint(config.keepAliveIdle), "TCP_KEEPALIVE"
           )
       if config.keepAliveInterval > 0:
-        optval = cint(config.keepAliveInterval)
-        if setsockopt(
-          fd,
-          cint(posix.IPPROTO_TCP),
-          TCP_KEEPINTVL,
-          addr optval,
-          sizeof(optval).SockLen,
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
-          )
+        setSockOptInt(
+          fd, ipproto, TCP_KEEPINTVL, cint(config.keepAliveInterval), "TCP_KEEPINTVL"
+        )
       if config.keepAliveCount > 0:
-        optval = cint(config.keepAliveCount)
-        if setsockopt(
-          fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
-          )
-    elif defined(macosx):
-      if config.keepAliveIdle > 0:
-        optval = cint(config.keepAliveIdle)
-        if setsockopt(
-          fd,
-          cint(posix.IPPROTO_TCP),
-          TCP_KEEPALIVE,
-          addr optval,
-          sizeof(optval).SockLen,
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPALIVE: " & $strerror(errno)
-          )
-      if config.keepAliveInterval > 0:
-        optval = cint(config.keepAliveInterval)
-        if setsockopt(
-          fd,
-          cint(posix.IPPROTO_TCP),
-          TCP_KEEPINTVL,
-          addr optval,
-          sizeof(optval).SockLen,
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPINTVL: " & $strerror(errno)
-          )
-      if config.keepAliveCount > 0:
-        optval = cint(config.keepAliveCount)
-        if setsockopt(
-          fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT, addr optval, sizeof(optval).SockLen
-        ) < 0:
-          raise newException(
-            PgConnectionError, "Failed to set TCP_KEEPCNT: " & $strerror(errno)
-          )
+        setSockOptInt(
+          fd, ipproto, TCP_KEEPCNT, cint(config.keepAliveCount), "TCP_KEEPCNT"
+        )
     else:
       if config.keepAliveIdle > 0 or config.keepAliveInterval > 0 or
           config.keepAliveCount > 0:
