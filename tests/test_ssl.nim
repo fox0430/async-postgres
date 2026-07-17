@@ -1214,3 +1214,83 @@ when hasAsyncDispatch and defined(ssl):
           enforceVerifyFullIdentity(ssl, "::1")
         finally:
           SSL_free(ssl)
+
+  suite "SSL driveTlsHandshake (OpenSSL backend)":
+    # `wrapConnectedSocket` defers the TLS handshake until the first
+    # send/recv on the AsyncSocket. `driveTlsHandshake` completes it up
+    # front so `SSL_get_peer_certificate` returns the leaf cert for SCRAM
+    # channel binding — without it, cbRequire always fails on asyncdispatch.
+
+    test "sslGetRbio / sslGetWbio resolve on this OpenSSL":
+      # Universally exported on OpenSSL and BoringSSL; a nil resolver would
+      # break the memory-BIO shuttle the handshake driver relies on.
+      check sslGetRbio() != nil
+      check sslGetWbio() != nil
+
+    test "wrapConnectedSocket installs both memory BIOs on the SSL handle":
+      let getRbio = sslGetRbio()
+      let getWbio = sslGetWbio()
+      if getRbio == nil or getWbio == nil:
+        skip()
+      else:
+        let sock = newAsyncSocket(buffered = false)
+        let ctx = newContext(verifyMode = CVerifyNone)
+        try:
+          wrapConnectedSocket(ctx, sock, handshakeAsClient)
+          check sock.sslHandle != nil
+          check getRbio(sock.sslHandle) != nil
+          check getWbio(sock.sslHandle) != nil
+        finally:
+          sock.close()
+
+    test "peer certificate is available on client after handshake":
+      let certDir = currentSourcePath().parentDir / "certs"
+      var peerCertOk = false
+      var serverGotAppByte = false
+
+      proc testBody() {.async.} =
+        let listener = newAsyncSocket(buffered = false)
+        listener.setSockOpt(OptReuseAddr, true)
+        listener.bindAddr(Port(0))
+        let port = listener.getLocalAddr()[1]
+        listener.listen()
+
+        proc serverSide() {.async.} =
+          let s = await listener.accept()
+          try:
+            let serverCtx = newContext(
+              verifyMode = CVerifyNone,
+              certFile = certDir / "server.crt",
+              keyFile = certDir / "server.key",
+            )
+            wrapConnectedSocket(serverCtx, s, handshakeAsServer)
+            # asyncnet's sslLoop drives the server-side handshake inside recv,
+            # then delivers the one application byte the client sends below.
+            let data = await s.recv(1)
+            serverGotAppByte = data.len == 1
+          finally:
+            s.close()
+
+        let serverFut = serverSide()
+
+        let c = newAsyncSocket(buffered = false)
+        await c.connect("127.0.0.1", port)
+        try:
+          let clientCtx = newContext(verifyMode = CVerifyNone)
+          wrapConnectedSocket(clientCtx, c, handshakeAsClient)
+          await driveTlsHandshake(c)
+          let peer = SSL_get_peer_certificate(c.sslHandle)
+          peerCertOk = peer != nil
+          if peer != nil:
+            X509_free(peer)
+          # Unblock the server's `recv(1)` so its future completes.
+          await c.send(" ")
+        finally:
+          c.close()
+
+        await serverFut
+        listener.close()
+
+      waitFor testBody()
+      check peerCertOk
+      check serverGotAppByte
