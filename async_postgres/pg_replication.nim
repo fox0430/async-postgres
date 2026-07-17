@@ -207,11 +207,6 @@ const
 proc `==`*(a, b: Lsn): bool {.borrow.}
 proc `<`*(a, b: Lsn): bool {.borrow.}
 proc `<=`*(a, b: Lsn): bool {.borrow.}
-proc `>`*(a, b: Lsn): bool {.inline.} =
-  b < a
-
-proc `>=`*(a, b: Lsn): bool {.inline.} =
-  b <= a
 
 proc hasOldTuple*(msg: UpdateMessage): bool {.inline.} =
   ## True if the update carries an old tuple (replica identity key or full row).
