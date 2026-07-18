@@ -387,8 +387,10 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
           try:
             ctx = newContext(
               verifyMode =
-                if config.sslMode in {sslVerifyCa, sslVerifyFull}: CVerifyPeer
-                else: CVerifyNone,
+                if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+                  CVerifyPeer
+                else:
+                  CVerifyNone,
               certFile = certPath,
               keyFile = keyPath,
               caFile = caPath,
