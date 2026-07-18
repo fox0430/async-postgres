@@ -779,15 +779,18 @@ suite "Direct SSL negotiation":
       let ms = startMockServer()
 
       proc serverHandler() {.async.} =
-        let st = await ms.accept()
+        # The client rejects the weak sslmode locally, so the accept may never
+        # complete. closeServer below cancels it — treat that as "no bytes".
         try:
-          # The client must reject the weak sslmode locally and never send the
-          # SSLRequest or a ClientHello; the read returns 0 once it closes.
-          let data = await readN(st, 1)
-          bytesFromClient = data.len
+          let st = await ms.accept()
+          try:
+            let data = await readN(st, 1)
+            bytesFromClient = data.len
+          except CatchableError:
+            bytesFromClient = 0
+          await closeClient(st)
         except CatchableError:
           bytesFromClient = 0
-        await closeClient(st)
 
       let serverFut = serverHandler()
 
@@ -807,8 +810,8 @@ suite "Direct SSL negotiation":
         raised = true
         errMentionsDirect = "sslnegotiation=direct" in e.msg
 
-      await serverFut
       await closeServer(ms)
+      await serverFut
 
     waitFor testBody()
     check raised
