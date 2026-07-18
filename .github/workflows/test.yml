@@ -32,9 +32,9 @@ jobs:
         os:
           - 'ubuntu-latest'
         nim-version:
-          #- '2.2.4'
+          - '2.2.4'
           - 'stable'
-          #- 'devel'
+          - 'devel'
 
     name: Tests on ${{ matrix.nim-version }} (${{ matrix.os }})
     steps:
@@ -74,7 +74,7 @@ jobs:
 
       - name: Install chronos
         id: install-chronos
-        run: nimble install -y chronos
+        run: nimble install chronos -y
         background: true
 
       - name: Wait setup

@@ -68,6 +68,8 @@ Async PostgreSQL client in Nim.
 
 - Nim >= 2.2.4
 
+- [chronos](https://github.com/status-im/nim-chronos) >= 4.4.0 (Only chronos backend)
+
 - [nim-bearssl](https://github.com/status-im/nim-bearssl) >= 0.2.11 (Only chronos backend; TLS 1.2 only due to BearSSL limitation)
 
 ## Installation
