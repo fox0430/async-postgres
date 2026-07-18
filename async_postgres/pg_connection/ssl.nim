@@ -50,9 +50,8 @@ when hasAsyncDispatch and defined(ssl):
     X509SetIpAscFn =
       proc(param: pointer, ipasc: cstring): cint {.cdecl, gcsafe, raises: [].}
     SslGetBioFn = proc(ssl: SslPtr): BIO {.cdecl, gcsafe, raises: [].}
-    SslGet0AlpnSelectedFn = proc(
-      ssl: SslPtr, data: ptr pointer, len: ptr cuint
-    ) {.cdecl, gcsafe, raises: [].}
+    SslGet0AlpnSelectedFn =
+      proc(ssl: SslPtr, data: ptr pointer, len: ptr cuint) {.cdecl, gcsafe, raises: [].}
 
   # Apple's system libssl/libcrypto omit these symbols; an eager `{.dynlib.}`
   # binding would abort the process at startup. Resolve lazily and let callers
@@ -337,9 +336,8 @@ proc establishTls(
 
       if direct:
         const alpnProto = char(PgAlpnProtocol.len) & PgAlpnProtocol
-        let rc = SSL_CTX_set_alpn_protos(
-          ctx.context, alpnProto.cstring, cuint(alpnProto.len)
-        )
+        let rc =
+          SSL_CTX_set_alpn_protos(ctx.context, alpnProto.cstring, cuint(alpnProto.len))
         if rc != 0:
           raise newException(
             PgConnectionError,
@@ -376,8 +374,8 @@ proc establishTls(
           if selected != PgAlpnProtocol:
             raise newException(
               PgConnectionError,
-              "direct SSL connection negotiated unexpected ALPN protocol '" &
-                selected & "' (expected '" & PgAlpnProtocol & "')",
+              "direct SSL connection negotiated unexpected ALPN protocol '" & selected &
+                "' (expected '" & PgAlpnProtocol & "')",
             )
         conn.sslEnabled = true
         # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
