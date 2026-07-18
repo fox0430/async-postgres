@@ -22,6 +22,7 @@ import types, buffer_io, cache, simple_query, lifecycle
 
 when hasChronos:
   import chronos/streams/tlsstream
+  import ../pg_bearssl
 
 const listenBackoffTickMs = 50
   ## Granularity of the listen pump's interruptible reconnect backoff: the pump
@@ -85,6 +86,14 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.txStatus = newConn.txStatus
   conn.state = csReady
   conn.createdAt = newConn.createdAt
+
+  when hasChronos:
+    # Value-copied x509Capture still holds pointers into newConn (soon freed).
+    # Repoint certDer and the shared engine's x509 slot at conn's own fields.
+    if conn.tlsStream != nil:
+      rebindX509Capture(
+        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+      )
 
   try:
     for ch in conn.listenChannels:

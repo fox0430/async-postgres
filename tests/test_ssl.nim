@@ -4,6 +4,10 @@ import ../async_postgres/[async_backend, pg_protocol]
 
 import ../async_postgres/pg_connection {.all.}
 
+when hasChronos:
+  import ../async_postgres/pg_bearssl
+  import bearssl/abi/bearssl_ssl as bssl
+
 proc testCaCert(): string =
   readFile(currentSourcePath().parentDir / "certs" / "ca.crt")
 
@@ -1294,3 +1298,43 @@ when hasAsyncDispatch and defined(ssl):
       waitFor testBody()
       check peerCertOk
       check serverGotAppByte
+
+when hasChronos:
+  suite "reconnectInPlace X509 capture rebind":
+    test "field-copy alone leaves x509Capture pointers targeting newConn":
+      # X509CertCaptureContext holds raw pointers into the connection that
+      # installed it. reconnectInPlace value-copies the struct from a transient
+      # newConn to conn: pre-fix, both certDer and the engine's x509 slot still
+      # reference newConn's memory. Once newConn is GC'd the next TLS I/O
+      # follows dangling pointers.
+      var conn = PgConnection(serverCertDer: newSeq[byte](0))
+      var newConn = PgConnection(serverCertDer: @[byte 0xAA, 0xBB])
+      var eng: bssl.SslEngineContext
+
+      installX509Capture(newConn.x509Capture, eng, addr newConn.serverCertDer)
+      let newVtableAddr = cast[uint](addr newConn.x509Capture.vtable)
+
+      conn.x509Capture = newConn.x509Capture
+      conn.serverCertDer = newConn.serverCertDer
+
+      check conn.x509Capture.certDer == addr newConn.serverCertDer
+      check conn.x509Capture.certDer != addr conn.serverCertDer
+      check cast[uint](eng.x509ctx) == newVtableAddr
+      check cast[uint](eng.x509ctx) != cast[uint](addr conn.x509Capture.vtable)
+
+    test "rebindX509Capture repoints certDer and engine slot at conn":
+      var conn = PgConnection(serverCertDer: newSeq[byte](0))
+      var newConn = PgConnection(serverCertDer: @[byte 0xAA, 0xBB])
+      var eng: bssl.SslEngineContext
+
+      installX509Capture(newConn.x509Capture, eng, addr newConn.serverCertDer)
+      conn.x509Capture = newConn.x509Capture
+      conn.serverCertDer = newConn.serverCertDer
+
+      rebindX509Capture(conn.x509Capture, eng, addr conn.serverCertDer)
+
+      check conn.x509Capture.certDer == addr conn.serverCertDer
+      check cast[uint](eng.x509ctx) == cast[uint](addr conn.x509Capture.vtable)
+      # `inner` still routes into the shared default validator (untouched by
+      # rebind), so cert-chain delegation keeps working.
+      check conn.x509Capture.inner == newConn.x509Capture.inner

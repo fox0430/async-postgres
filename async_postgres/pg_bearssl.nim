@@ -12,11 +12,11 @@ when hasChronos:
     X509CertCaptureContext* = object
       ## X509 callback wrapper that captures the leaf certificate DER bytes
       ## during TLS handshake for SCRAM-SHA-256-PLUS channel binding.
-      vtable: ptr X509Class
-      inner: X509ClassPointerConst ## Original X509 engine to delegate to
-      certDer: ptr seq[byte] ## Points to PgConnection.serverCertDer
-      depth: int ## Certificate depth in chain (0 = leaf)
-      capturing: bool ## True while capturing leaf cert bytes
+      vtable*: ptr X509Class
+      inner*: X509ClassPointerConst ## Original X509 engine to delegate to
+      certDer*: ptr seq[byte] ## Points to PgConnection.serverCertDer
+      depth*: int ## Certificate depth in chain (0 = leaf)
+      capturing*: bool ## True while capturing leaf cert bytes
 
     TrustAnchorResult* = object
       store*: TrustAnchorStore
@@ -104,6 +104,17 @@ when hasChronos:
     captureCtx.inner = eng.x509ctx
     captureCtx.certDer = serverCertDer
     captureCtx.vtable = addr x509CertCaptureVtable
+    sslEngineSetX509(eng, X509ClassPointerConst(addr captureCtx.vtable))
+
+  proc rebindX509Capture*(
+      captureCtx: var X509CertCaptureContext,
+      eng: var SslEngineContext,
+      serverCertDer: ptr seq[byte],
+  ) =
+    ## Rebind `captureCtx` and the engine's x509 slot to the caller's storage
+    ## after a struct-level copy (e.g. reconnectInPlace) so callback pointers
+    ## no longer target the transient source's fields. Preserves `inner`.
+    captureCtx.certDer = serverCertDer
     sslEngineSetX509(eng, X509ClassPointerConst(addr captureCtx.vtable))
 
   proc parseTrustAnchors*(pemData: string): TrustAnchorResult =
