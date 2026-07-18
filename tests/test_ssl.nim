@@ -838,23 +838,21 @@ suite "Direct SSL negotiation":
 
       proc serverHandler() {.async.} =
         let st = await ms.accept()
-        try:
-          let hdr = await readN(st, 1)
-          firstByte = int(hdr[0])
-        except CatchableError:
-          discard
-        # Independent read after the first byte so a short/split ClientHello
-        # never blocks the handler waiting for a length that may not match the
-        # bytes actually delivered. "postgresql" only appears inside the ALPN
-        # extension, so its presence in whatever we grab proves ALPN was wired.
+        # Single-shot read of whatever the client has already put on the wire;
+        # "postgresql" only lives inside the ALPN extension. Closing immediately
+        # afterwards mirrors the original mock's fast-abort behaviour.
         try:
           when hasChronos:
             var buf = newSeq[byte](4096)
             let n = await st.readOnce(addr buf[0], buf.len)
             buf.setLen(n)
+            if n >= 1:
+              firstByte = int(buf[0])
             alpnAdvertised = containsBytes(buf, "postgresql")
           elif hasAsyncDispatch:
             let s = await st.recv(4096)
+            if s.len >= 1:
+              firstByte = int(byte(s[0]))
             var buf = newSeq[byte](s.len)
             if s.len > 0:
               copyMem(addr buf[0], addr s[0], s.len)
