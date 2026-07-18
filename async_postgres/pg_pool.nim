@@ -1097,6 +1097,16 @@ proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
     if not op.queryFut.finished:
       op.queryFut.fail(e)
 
+proc completePendingOp(op: PendingPoolOp, r: CommandResult) =
+  # Caller may have cancelled via `.wait(dur)` before dispatch resolved;
+  # completing a finished future raises FutureDefect and crashes the process.
+  if not op.execFut.finished:
+    op.execFut.complete(r)
+
+proc completePendingOp(op: PendingPoolOp, r: QueryResult) =
+  if not op.queryFut.finished:
+    op.queryFut.complete(r)
+
 proc failAllPending(pool: PgPool, e: ref CatchableError) {.raises: [].} =
   ## Fail every queued op with `e`. Marked `raises: []` so the compiler
   ## proves the loop cannot leak into an `asyncSpawn`ed caller — any future
@@ -1155,17 +1165,13 @@ proc executeBatch(
     for i in 0 ..< batch.len:
       let op = batch[i]
       if ir.errors[i] != nil:
-        case op.kind
-        of popExec:
-          op.execFut.fail(ir.errors[i])
-        of popQuery:
-          op.queryFut.fail(ir.errors[i])
+        failPendingOp(op, ir.errors[i])
       else:
         case op.kind
         of popExec:
-          op.execFut.complete(ir.results[i].commandResult)
+          completePendingOp(op, ir.results[i].commandResult)
         of popQuery:
-          op.queryFut.complete(ir.results[i].queryResult)
+          completePendingOp(op, ir.results[i].queryResult)
   except CatchableError as e:
     for op in batch:
       failPendingOp(op, e)
@@ -1194,12 +1200,12 @@ proc dispatchHomogeneous(
         case op.kind
         of popExec:
           let r = await conn.exec(op.sql, op.params, timeout = op.timeout)
-          op.execFut.complete(r)
+          completePendingOp(op, r)
         of popQuery:
           let r = await conn.query(
             op.sql, op.params, resultFormat = op.resultFormat, timeout = op.timeout
           )
-          op.queryFut.complete(r)
+          completePendingOp(op, r)
       finally:
         await pool.resetSession(conn)
         conn.release()
