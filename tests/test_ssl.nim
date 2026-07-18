@@ -839,15 +839,26 @@ suite "Direct SSL negotiation":
       proc serverHandler() {.async.} =
         let st = await ms.accept()
         try:
-          # 5-byte TLS record header: type(1) + version(2) + length(2).
-          # "postgresql" only appears inside the ALPN extension, so finding it
-          # in the ClientHello body is the ALPN-wired signal.
-          let hdr = await readN(st, 5)
+          let hdr = await readN(st, 1)
           firstByte = int(hdr[0])
-          let recordLen = (int(hdr[3]) shl 8) or int(hdr[4])
-          if recordLen > 0:
-            let body = await readN(st, recordLen)
-            alpnAdvertised = containsBytes(body, "postgresql")
+        except CatchableError:
+          discard
+        # Independent read after the first byte so a short/split ClientHello
+        # never blocks the handler waiting for a length that may not match the
+        # bytes actually delivered. "postgresql" only appears inside the ALPN
+        # extension, so its presence in whatever we grab proves ALPN was wired.
+        try:
+          when hasChronos:
+            var buf = newSeq[byte](4096)
+            let n = await st.readOnce(addr buf[0], buf.len)
+            buf.setLen(n)
+            alpnAdvertised = containsBytes(buf, "postgresql")
+          elif hasAsyncDispatch:
+            let s = await st.recv(4096)
+            var buf = newSeq[byte](s.len)
+            if s.len > 0:
+              copyMem(addr buf[0], addr s[0], s.len)
+            alpnAdvertised = containsBytes(buf, "postgresql")
         except CatchableError:
           discard
         await closeClient(st)
