@@ -487,7 +487,6 @@ proc initConnConfig*(
     password = "",
     database = "",
     sslMode = sslPrefer,
-    sslNegotiation = sslnPostgres,
     sslRootCert = "",
     sslSni = true,
     channelBinding = cbPrefer,
@@ -504,6 +503,7 @@ proc initConnConfig*(
     extraParams: seq[(string, string)] = @[],
     maxMessageSize = 0,
     maxScramIterations = 0,
+    sslNegotiation = sslnPostgres,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.

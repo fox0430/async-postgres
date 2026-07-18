@@ -132,14 +132,11 @@ proc connectToHost*(
   ## Dials `entry.hostaddr` when given (bypassing name resolution), otherwise
   ## `entry.host`; SSL certificate verification always uses `entry.host`.
 
-  # Reject up front so the sslAllow rewrite below can't downgrade past
-  # negotiateSSL's own check.
-  if config.sslNegotiation == sslnDirect and
-      config.sslMode notin {sslRequire, sslVerifyCa, sslVerifyFull}:
-    raise newException(
-      PgConnectionError,
-      "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
-    )
+  # Preflight up front so the sslAllow rewrite below (which mutates sslMode to
+  # sslDisable) cannot mask the sslnDirect intent. `connect` also validates
+  # before the failover loop so this is a no-op there; direct callers of
+  # `connectToHost` still benefit.
+  validateDirectSslCompatible(config)
 
   if config.sslMode == sslAllow:
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
@@ -174,19 +171,14 @@ proc connectToHost*(
         e,
       )
 
-  var conn: PgConnection
-
   let hostAddr = entry.dialAddr
   let hostPort = entry.port
   let isUnix = isUnixSocket(hostAddr)
+  # sslnegotiation is ignored for Unix-domain sockets (libpq 17: AF_UNIX forces
+  # plaintext regardless). The `not isUnix` guard on `negotiateSSL` below
+  # implements that; no early hard-fail here.
 
-  # Unix sockets skip negotiateSSL; without this the caller's TLS request is
-  # silently dropped.
-  if isUnix and config.sslNegotiation == sslnDirect:
-    raise newException(
-      PgConnectionError,
-      "sslnegotiation=direct is not supported over Unix-domain sockets",
-    )
+  var conn: PgConnection
 
   when hasChronos:
     let transport =
@@ -601,6 +593,8 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     # `hosts` is already ordered by the caller (shuffled under lbhRandom), so
     # both the preferStandby two-pass loop and the single-pass loop below share
     # one order.
+    # Host-independent config errors are surfaced once, not aggregated per host.
+    validateDirectSslCompatible(config)
     var errors: seq[string]
     # With a single host there is no failover. Preserve the contract that its
     # `connectTimeout` surfaces as a raw `AsyncTimeoutError` (callers and the

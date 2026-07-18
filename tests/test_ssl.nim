@@ -1,6 +1,6 @@
 import std/[unittest, strutils, os]
 
-import ../async_postgres/[async_backend, pg_protocol]
+import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 
 import ../async_postgres/pg_connection {.all.}
 
@@ -773,24 +773,26 @@ suite "Direct SSL negotiation":
   test "sslnegotiation=direct rejects weak sslmode before any bytes are sent":
     var raised = false
     var errMentionsDirect = false
-    var bytesFromClient = -1
+    var bytesFromClient = 0
 
     proc testBody() {.async.} =
       let ms = startMockServer()
 
       proc serverHandler() {.async.} =
-        # The client rejects the weak sslmode locally, so the accept may never
-        # complete. closeServer below cancels it — treat that as "no bytes".
+        var st: MockClient
         try:
-          let st = await ms.accept()
-          try:
-            let data = await readN(st, 1)
-            bytesFromClient = data.len
-          except CatchableError:
-            bytesFromClient = 0
+          st = await ms.accept()
+        except CatchableError:
+          return
+        try:
+          let data = await readN(st, 1)
+          bytesFromClient = data.len
+        except CatchableError:
+          discard
+        try:
           await closeClient(st)
         except CatchableError:
-          bytesFromClient = 0
+          discard
 
       let serverFut = serverHandler()
 
@@ -823,43 +825,23 @@ suite "Direct SSL negotiation":
     var firstByte: int = -1
     var alpnAdvertised = false
 
-    proc containsBytes(hay: seq[byte], needle: string): bool =
-      if needle.len == 0 or hay.len < needle.len:
-        return false
-      for i in 0 .. hay.len - needle.len:
-        var m = true
-        for j in 0 ..< needle.len:
-          if hay[i + j] != byte(needle[j]):
-            m = false
-            break
-        if m:
-          return true
-      false
-
     proc testBody() {.async.} =
       let ms = startMockServer()
 
       proc serverHandler() {.async.} =
         let st = await ms.accept()
-        # Single-shot read of whatever the client has already put on the wire;
-        # "postgresql" only lives inside the ALPN extension. Closing immediately
-        # afterwards mirrors the original mock's fast-abort behaviour.
+        # 5-byte TLS record header: type(1) + version(2) + length(2). Reading
+        # the full record avoids racing packet boundaries under load/MTU splits.
         try:
-          when hasChronos:
-            var buf = newSeq[byte](4096)
-            let n = await st.readOnce(addr buf[0], buf.len)
-            buf.setLen(n)
-            if n >= 1:
-              firstByte = int(buf[0])
-            alpnAdvertised = containsBytes(buf, "postgresql")
-          elif hasAsyncDispatch:
-            let s = await st.recv(4096)
-            if s.len >= 1:
-              firstByte = int(byte(s[0]))
-            var buf = newSeq[byte](s.len)
-            if s.len > 0:
-              copyMem(addr buf[0], addr s[0], s.len)
-            alpnAdvertised = containsBytes(buf, "postgresql")
+          let header = await readN(st, 5)
+          firstByte = int(header[0])
+          let recordLen = (int(header[3]) shl 8) or int(header[4])
+          if recordLen > 0:
+            let body = await readN(st, recordLen)
+            # "postgresql" cannot straddle into the fixed 5-byte record header,
+            # so searching the body alone is equivalent to searching the whole
+            # record (the ALPN extension always lives inside the ClientHello).
+            alpnAdvertised = "postgresql" in readString(body, 0, body.len)
         except CatchableError:
           discard
         await closeClient(st)
@@ -890,6 +872,82 @@ suite "Direct SSL negotiation":
     check firstByte == 0x16
     check alpnAdvertised
     check raised
+
+  test "sslnegotiation=postgres advertises 'postgresql' ALPN in ClientHello (libpq 17 parity)":
+    var raised = false
+    var alpnAdvertised = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8) # SSLRequest
+          await sendBytes(st, @[byte('S')])
+          # TLS record: type(1) + version(2) + length(2)
+          let header = await readN(st, 5)
+          let recordLen = (int(header[3]) shl 8) or int(header[4])
+          if recordLen > 0:
+            let body = await readN(st, recordLen)
+            alpnAdvertised = "postgresql" in readString(body, 0, body.len)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslNegotiation: sslnPostgres,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        # Mock cannot complete TLS handshake; connect fails after ClientHello.
+        raised = true
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check alpnAdvertised
+    check raised
+
+  test "sslnegotiation=direct with weak sslmode fails once across a multi-host list":
+    var raised = false
+    var errMsg = ""
+
+    proc testBody() {.async.} =
+      # Three hosts on port 1 (guaranteed refused). A per-host validate would
+      # append the identical config error three times; the pre-loop validate
+      # surfaces it once as a raw PgConnectionError, not the "Could not connect
+      # to any host: h1: ...; h2: ...; h3: ..." aggregate.
+      let config = ConnConfig(
+        host: "127.0.0.1,127.0.0.1,127.0.0.1",
+        port: 1,
+        user: "test",
+        database: "test",
+        sslMode: sslPrefer,
+        sslNegotiation: sslnDirect,
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        errMsg = e.msg
+
+    waitFor testBody()
+    check raised
+    check "sslnegotiation=direct requires" in errMsg
+    check "Could not connect to any host" notin errMsg
 
 proc sendAuthSasl(client: MockClient, mechanisms: seq[string]): Future[void] {.async.} =
   var body: seq[byte] = @[]

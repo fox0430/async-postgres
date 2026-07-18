@@ -122,8 +122,8 @@ type
       ## `sslDisable`.
     sslNegotiation*: SslNegotiation
       ## SSL negotiation method (default: `sslnPostgres`). A raw zero-initialized
-      ## `ConnConfig` matches only because `sslnPostgres` is the enum's zero
-      ## value; reordering `SslNegotiation` would silently change that default.
+      ## `ConnConfig` matches because `sslnPostgres` is the enum's zero value,
+      ## which is locked in by a `static:` assertion on `SslNegotiation`.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
     sslSni*: bool
       ## Send TLS SNI extension during the handshake (libpq `sslsni`, default
@@ -674,6 +674,10 @@ type
       ## raises (``data.err`` non-nil) or returns ``false`` (``data.err``
       ## nil). Advisory only — the macro's behaviour is unchanged. Use this
       ## to observe unlock failures that would otherwise be invisible.
+
+static:
+  # Zero-initialized ConnConfig must default to sslnPostgres.
+  doAssert ord(sslnPostgres) == 0
 
 type RowCallback* = proc(row: Row) {.raises: [CatchableError], gcsafe.}
   ## Callback invoked once per row during `queryEach`. The `Row` is only valid

@@ -15,7 +15,7 @@
 ##
 ## Re-exported through `pg_connection.nim`.
 
-import std/net
+import std/[net, strutils]
 import ../[async_backend, pg_errors, pg_protocol]
 import types, buffer_io
 
@@ -30,8 +30,10 @@ elif hasAsyncDispatch:
 when hasChronos or (hasAsyncDispatch and defined(ssl)):
   const PgAlpnProtocol = "postgresql"
     ## ALPN protocol name required for `sslnegotiation=direct` (PostgreSQL 17+).
-  static:
-    doAssert PgAlpnProtocol.len < 256
+
+when hasAsyncDispatch and defined(ssl):
+  const PgAlpnWire = char(PgAlpnProtocol.len) & PgAlpnProtocol
+    ## Length-prefixed wire form for `SSL_CTX_set_alpn_protos` (RFC 7301 §3.1).
 
 when hasAsyncDispatch and defined(ssl):
   # On asyncdispatch `conn.socket` is an `AsyncSocket`, so `wrapConnectedSocket`
@@ -52,73 +54,41 @@ when hasAsyncDispatch and defined(ssl):
     SslGetBioFn = proc(ssl: SslPtr): BIO {.cdecl, gcsafe, raises: [].}
     SslGet0AlpnSelectedFn =
       proc(ssl: SslPtr, data: ptr pointer, len: ptr cuint) {.cdecl, gcsafe, raises: [].}
+    SslCtxSetAlpnProtosFn = proc(ctx: SslCtx, protos: cstring, protos_len: cuint): cint {.
+      cdecl, gcsafe, raises: []
+    .}
 
-  # Apple's system libssl/libcrypto omit these symbols; an eager `{.dynlib.}`
-  # binding would abort the process at startup. Resolve lazily and let callers
-  # handle nil.
-  var
-    sslSet1HostFn: SslSet1HostFn
-    sslSet1HostResolved: bool
-    sslGet0ParamFn: SslGet0ParamFn
-    sslGet0ParamResolved: bool
-    x509SetIpAscFn: X509SetIpAscFn
-    x509SetIpAscResolved: bool
-    sslGetRbioFn: SslGetBioFn
-    sslGetRbioResolved: bool
-    sslGetWbioFn: SslGetBioFn
-    sslGetWbioResolved: bool
-    sslGet0AlpnSelectedFn: SslGet0AlpnSelectedFn
-    sslGet0AlpnSelectedResolved: bool
+  # Apple's system libssl/libcrypto omit some of these symbols; an eager
+  # `{.dynlib.}` binding would abort the process at startup. Resolve lazily and
+  # let callers handle nil.
+  template defineLazySym(
+      procName: untyped, FnType: typedesc, libPattern: string, symbol: string
+  ) =
+    var
+      cachedFn {.global.}: FnType
+      resolved {.global.}: bool
+    proc procName*(): FnType =
+      if not resolved:
+        let lib = loadLibPattern(libPattern)
+        if lib != nil:
+          cachedFn = cast[FnType](symAddr(lib, symbol))
+        resolved = true
+      cachedFn
 
-  proc sslSet1Host*(): SslSet1HostFn =
-    if not sslSet1HostResolved:
-      let lib = loadLibPattern(DLLSSLName)
-      if lib != nil:
-        sslSet1HostFn = cast[SslSet1HostFn](symAddr(lib, "SSL_set1_host"))
-      sslSet1HostResolved = true
-    sslSet1HostFn
-
-  proc sslGet0Param*(): SslGet0ParamFn =
-    if not sslGet0ParamResolved:
-      let lib = loadLibPattern(DLLSSLName)
-      if lib != nil:
-        sslGet0ParamFn = cast[SslGet0ParamFn](symAddr(lib, "SSL_get0_param"))
-      sslGet0ParamResolved = true
-    sslGet0ParamFn
-
-  proc x509VerifyParamSet1IpAsc*(): X509SetIpAscFn =
-    if not x509SetIpAscResolved:
-      let lib = loadLibPattern(DLLUtilName)
-      if lib != nil:
-        x509SetIpAscFn =
-          cast[X509SetIpAscFn](symAddr(lib, "X509_VERIFY_PARAM_set1_ip_asc"))
-      x509SetIpAscResolved = true
-    x509SetIpAscFn
-
-  proc sslGetRbio*(): SslGetBioFn =
-    if not sslGetRbioResolved:
-      let lib = loadLibPattern(DLLSSLName)
-      if lib != nil:
-        sslGetRbioFn = cast[SslGetBioFn](symAddr(lib, "SSL_get_rbio"))
-      sslGetRbioResolved = true
-    sslGetRbioFn
-
-  proc sslGetWbio*(): SslGetBioFn =
-    if not sslGetWbioResolved:
-      let lib = loadLibPattern(DLLSSLName)
-      if lib != nil:
-        sslGetWbioFn = cast[SslGetBioFn](symAddr(lib, "SSL_get_wbio"))
-      sslGetWbioResolved = true
-    sslGetWbioFn
-
-  proc sslGet0AlpnSelected*(): SslGet0AlpnSelectedFn =
-    if not sslGet0AlpnSelectedResolved:
-      let lib = loadLibPattern(DLLSSLName)
-      if lib != nil:
-        sslGet0AlpnSelectedFn =
-          cast[SslGet0AlpnSelectedFn](symAddr(lib, "SSL_get0_alpn_selected"))
-      sslGet0AlpnSelectedResolved = true
-    sslGet0AlpnSelectedFn
+  defineLazySym(sslSet1Host, SslSet1HostFn, DLLSSLName, "SSL_set1_host")
+  defineLazySym(sslGet0Param, SslGet0ParamFn, DLLSSLName, "SSL_get0_param")
+  defineLazySym(
+    x509VerifyParamSet1IpAsc, X509SetIpAscFn, DLLUtilName,
+    "X509_VERIFY_PARAM_set1_ip_asc",
+  )
+  defineLazySym(sslGetRbio, SslGetBioFn, DLLSSLName, "SSL_get_rbio")
+  defineLazySym(sslGetWbio, SslGetBioFn, DLLSSLName, "SSL_get_wbio")
+  defineLazySym(
+    sslGet0AlpnSelected, SslGet0AlpnSelectedFn, DLLSSLName, "SSL_get0_alpn_selected"
+  )
+  defineLazySym(
+    sslCtxSetAlpnProtos, SslCtxSetAlpnProtosFn, DLLSSLName, "SSL_CTX_set_alpn_protos"
+  )
 
   proc formatSslError(prefix: string): string =
     result = prefix
@@ -190,6 +160,22 @@ when hasAsyncDispatch and defined(ssl):
           formatSslError("TLS handshake failed (SSL_get_error=" & $err & ")"),
         )
 
+  proc getSelectedAlpnOpenssl(ssl: SslPtr): string =
+    ## Return the peer-selected ALPN protocol, or "" if none was selected.
+    let getAlpn = sslGet0AlpnSelected()
+    if getAlpn == nil:
+      raise newException(
+        PgConnectionError,
+        "sslnegotiation=direct: libssl does not export SSL_get0_alpn_selected",
+      )
+    var protoPtr: pointer
+    var protoLen: cuint
+    getAlpn(ssl, addr protoPtr, addr protoLen)
+    if protoPtr.isNil or protoLen == 0:
+      return ""
+    result = newString(protoLen.int)
+    copyMem(addr result[0], protoPtr, protoLen.int)
+
   proc enforceVerifyFullIdentity(sslHandle: SslPtr, host: string) =
     ## Make OpenSSL match the peer certificate against `host` during the deferred
     ## handshake (iPAddress SANs for an IP literal, DNS name otherwise), so
@@ -228,6 +214,34 @@ when hasAsyncDispatch and defined(ssl):
           host,
       )
 
+proc validateDirectSslCompatible*(config: ConnConfig) {.raises: [PgConnectionError].} =
+  ## Reject `sslnegotiation=direct` under a weak `sslmode`. Direct SSL skips
+  ## the SSLRequest probe so it has no plaintext fall-back path (libpq parity).
+  ## Idempotent — safe to call from any layer.
+  if config.sslNegotiation == sslnDirect and
+      config.sslMode notin {sslRequire, sslVerifyCa, sslVerifyFull}:
+    raise newException(
+      PgConnectionError,
+      "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
+    )
+
+when hasChronos or (hasAsyncDispatch and defined(ssl)):
+  proc assertAlpnPostgres(selected: string) {.raises: [PgConnectionError].} =
+    if selected.len == 0:
+      raise newException(
+        PgConnectionError,
+        "direct SSL connection established without ALPN: the server does not " &
+          "support sslnegotiation=direct (requires PostgreSQL 17+)",
+      )
+    if selected != PgAlpnProtocol:
+      # Peer-controlled value: escape non-printable bytes so an embedded NUL
+      # can't truncate a C-string logger and hide the actual selection.
+      raise newException(
+        PgConnectionError,
+        "direct SSL connection negotiated unexpected ALPN protocol '" &
+          selected.escape("", "") & "' (expected '" & PgAlpnProtocol & "')",
+      )
+
 proc sniName*(sslHost: string, sslSni: bool): string =
   ## Value for the TLS SNI extension. Empty means "do not send SNI".
   ## Matches libpq: SNI is on by default and suppressed for IP literals
@@ -241,14 +255,14 @@ proc sniName*(sslHost: string, sslSni: bool): string =
     return ""
   sslHost
 
-proc establishTls(
-    conn: PgConnection, config: ConnConfig, sslHost: string, direct: bool
-) {.async.} =
-  ## Run the TLS handshake over `conn`'s transport and wire up the encrypted
-  ## reader/writer. Shared by traditional (post-`SSLRequest`) and Direct SSL
-  ## negotiation. When `direct` is true the client offers the "postgresql" ALPN
-  ## protocol and requires the server to select it, matching libpq's
-  ## `sslnegotiation=direct` behaviour (PostgreSQL 17+).
+proc establishTls(conn: PgConnection, sslHost: string, direct: bool) {.async.} =
+  ## Run the TLS handshake and wire up the encrypted reader/writer. `direct=true`
+  ## enforces the "postgresql" ALPN selection (libpq `sslnegotiation=direct`,
+  ## PostgreSQL 17+). Reads TLS parameters from `conn.config`.
+  # Alias, not a copy: an async closure would deep-copy a `let config = ...`.
+  template config(): ConnConfig =
+    conn.config
+
   when hasChronos:
     conn.baseReader = newAsyncStreamReader(conn.transport)
     conn.baseWriter = newAsyncStreamWriter(conn.transport)
@@ -262,18 +276,16 @@ proc establishTls(
       else:
         {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
 
-    # verify-full: sslHost drives BearSSL's X509 name check; else honor sslSni.
+    # BearSSL's serverName doubles as SNI wire value and X509 name check input.
+    # Under verify-full it must be sslHost for BearSSL to verify; other modes
+    # honor sslSni and RFC 6066 IP-literal suppression.
     let serverName =
       if config.sslMode == sslVerifyFull:
         sslHost
       else:
         sniName(sslHost, config.sslSni)
-    let alpn =
-      if direct:
-        @[PgAlpnProtocol]
-      else:
-        @[]
-
+    # Advertise ALPN on every TLS connection (libpq 17 parity: SSL_set_alpn_protos
+    # is called unconditionally); enforcement stays direct-only below.
     if config.sslMode in {sslVerifyCa, sslVerifyFull}:
       let parsed = parseTrustAnchors(config.sslRootCert)
       conn.trustAnchorBufs = parsed.backing
@@ -286,7 +298,7 @@ proc establishTls(
         minVersion = TLSVersion.TLS12,
         maxVersion = TLSVersion.TLS12,
         trustAnchors = parsed.store,
-        alpnProtocols = alpn,
+        alpnProtocols = [PgAlpnProtocol],
       )
     else:
       # NoVerifyHost is set, so trust anchors are ignored regardless.
@@ -297,91 +309,62 @@ proc establishTls(
         flags = flags,
         minVersion = TLSVersion.TLS12,
         maxVersion = TLSVersion.TLS12,
-        alpnProtocols = alpn,
+        alpnProtocols = [PgAlpnProtocol],
       )
     installX509Capture(
       conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
     )
     await conn.tlsStream.handshake()
-    if direct and conn.tlsStream.getSelectedAlpnProtocol() != PgAlpnProtocol:
-      raise newException(
-        PgConnectionError,
-        "direct SSL connection established without ALPN: the server does not " &
-          "support sslnegotiation=direct (requires PostgreSQL 17+)",
-      )
+    if direct:
+      assertAlpnPostgres(conn.tlsStream.getSelectedAlpnProtocol())
     conn.reader = conn.tlsStream.reader
     conn.writer = conn.tlsStream.writer
     conn.sslEnabled = true
   elif hasAsyncDispatch:
     when defined(ssl):
-      let verifyMode =
-        case config.sslMode
-        of sslVerifyCa, sslVerifyFull: SslCVerifyMode.CVerifyPeer
-        else: SslCVerifyMode.CVerifyNone
-
       var ctx: SslContext
       var tmpPath: string
-      if config.sslMode in {sslVerifyCa, sslVerifyFull}:
-        let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
-        tmpPath = tp
-        try:
+      try:
+        if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+          let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
+          tmpPath = tp
           tmpFile.write(config.sslRootCert)
           tmpFile.close()
-          ctx = newContext(verifyMode = verifyMode, caFile = tmpPath)
-        except:
-          removeFile(tmpPath)
-          raise
-      else:
-        ctx = newContext(verifyMode = verifyMode)
+          ctx = newContext(verifyMode = CVerifyPeer, caFile = tmpPath)
+        else:
+          ctx = newContext(verifyMode = CVerifyNone)
 
-      if direct:
-        const alpnProto = char(PgAlpnProtocol.len) & PgAlpnProtocol
-        let rc =
-          SSL_CTX_set_alpn_protos(ctx.context, alpnProto.cstring, cuint(alpnProto.len))
-        if rc != 0:
+        # Advertise ALPN unconditionally (libpq 17 parity). The missing-symbol
+        # path is only fatal for direct mode; traditional mode degrades to no-ALPN.
+        let setAlpn = sslCtxSetAlpnProtos()
+        if setAlpn != nil:
+          let rc = setAlpn(ctx.context, PgAlpnWire.cstring, cuint(PgAlpnWire.len))
+          if rc != 0:
+            raise newException(
+              PgConnectionError,
+              "failed to configure ALPN (SSL_CTX_set_alpn_protos returned " & $rc & ")",
+            )
+        elif direct:
           raise newException(
             PgConnectionError,
-            "failed to configure ALPN for sslnegotiation=direct " &
-              "(SSL_CTX_set_alpn_protos returned " & $rc & ")",
+            "sslnegotiation=direct: libssl does not export SSL_CTX_set_alpn_protos",
           )
 
-      try:
         let hostname = sniName(sslHost, config.sslSni)
         wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
         # asyncnet skips name matching; make OpenSSL enforce it during handshake.
         if config.sslMode == sslVerifyFull:
           enforceVerifyFullIdentity(conn.socket.sslHandle, sslHost)
-        # Drive handshake so peer cert is populated before SCRAM channel binding.
+        # Drive the handshake now so the peer cert is available before SCRAM
+        # decides channel binding (asyncnet defers it to the first send/recv).
         await driveTlsHandshake(conn.socket)
         if direct:
-          let getAlpn = sslGet0AlpnSelected()
-          if getAlpn == nil:
-            raise newException(
-              PgConnectionError,
-              "sslnegotiation=direct: libssl does not export SSL_get0_alpn_selected",
-            )
-          var protoPtr: pointer
-          var protoLen: cuint
-          getAlpn(conn.socket.sslHandle, addr protoPtr, addr protoLen)
-          if protoPtr.isNil or protoLen != cuint(PgAlpnProtocol.len):
-            raise newException(
-              PgConnectionError,
-              "direct SSL connection established without ALPN: the server does " &
-                "not support sslnegotiation=direct (requires PostgreSQL 17+)",
-            )
-          var selected = newString(protoLen.int)
-          copyMem(addr selected[0], protoPtr, protoLen.int)
-          if selected != PgAlpnProtocol:
-            raise newException(
-              PgConnectionError,
-              "direct SSL connection negotiated unexpected ALPN protocol '" & selected &
-                "' (expected '" & PgAlpnProtocol & "')",
-            )
+          assertAlpnPostgres(getSelectedAlpnOpenssl(conn.socket.sslHandle))
         conn.sslEnabled = true
         # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
-        # If unavailable, cbPrefer will silently fall back to SCRAM-SHA-256 —
-        # warn the operator so the loss of channel binding is observable.
-        # (cbRequire is enforced in selectScramMechanism.)
+        # If unavailable, cbPrefer silently falls back to SCRAM-SHA-256 — warn
+        # so the loss of channel binding is observable. (cbRequire is enforced
+        # in selectScramMechanism.)
         let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
         if peerCert != nil:
           try:
@@ -397,6 +380,12 @@ proc establishTls(
         else:
           stderr.writeLine "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
       finally:
+        # asyncnet doesn't free the SslContext (no =destroy on std/net's type).
+        # SSL_new inside wrapConnectedSocket takes its own ref, so destroying
+        # here on both success and failure balances newContext without freeing
+        # the SSL's copy — the socket's SSL_free drops that one on close.
+        if ctx != nil:
+          ctx.destroyContext()
         if tmpPath.len > 0:
           removeFile(tmpPath)
     else:
@@ -404,12 +393,11 @@ proc establishTls(
         newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
 
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
-  ## Negotiate TLS for the connection. With `sslnegotiation=postgres` (default)
-  ## this sends an `SSLRequest` and starts TLS only if the server accepts;
-  ## with `sslnegotiation=direct` it starts TLS immediately without the
-  ## round-trip (PostgreSQL 17+). `sslHost` is the host *name* the server
-  ## certificate is verified against (the entry's `host`, never its `hostaddr` —
-  ## libpq semantics).
+  ## Negotiate TLS. `sslnegotiation=postgres` (default) sends an SSLRequest first;
+  ## `sslnegotiation=direct` starts TLS immediately (PostgreSQL 17+). `sslHost`
+  ## is the name matched against the server certificate (libpq semantics: the
+  ## entry's `host`, never `hostaddr`).
+  validateDirectSslCompatible(config)
   if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:
     # Both backends silently fall back to a Web PKI store (chronos:
     # MozillaTrustAnchors, std/net: OS CA bundle) — for verify-ca that also
@@ -425,15 +413,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     )
 
   if config.sslNegotiation == sslnDirect:
-    # Direct SSL skips the SSLRequest probe, so there is no plaintext path to
-    # fall back to. libpq rejects weak sslmodes here for the same reason; SSL
-    # must actually be required.
-    if config.sslMode notin {sslRequire, sslVerifyCa, sslVerifyFull}:
-      raise newException(
-        PgConnectionError,
-        "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
-      )
-    await establishTls(conn, config, sslHost, direct = true)
+    await establishTls(conn, sslHost, direct = true)
     return
 
   let sslReq = encodeSSLRequest()
@@ -481,7 +461,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         PgConnectionError,
         "Received unencrypted data after SSL response (possible man-in-the-middle)",
       )
-    await establishTls(conn, config, sslHost, direct = false)
+    await establishTls(conn, sslHost, direct = false)
   of 'N':
     if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
       raise newException(PgConnectionError, "Server does not support SSL")
