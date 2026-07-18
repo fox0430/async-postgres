@@ -171,22 +171,31 @@ suite "Advisory Lock: transaction-level (int64)":
       let conn = await connect(plainConfig())
       defer:
         await conn.close()
-      doAssertRaises(PgStateError):
-        waitFor conn.advisoryLockXact(40010'i64)
-      doAssertRaises(PgStateError):
-        waitFor conn.advisoryLockXactShared(40011'i64)
-      doAssertRaises(PgStateError):
-        discard waitFor conn.advisoryTryLockXact(40012'i64)
-      doAssertRaises(PgStateError):
-        discard waitFor conn.advisoryTryLockXactShared(40013'i64)
-      doAssertRaises(PgStateError):
-        waitFor conn.advisoryLockXact(1'i32, 2'i32)
-      doAssertRaises(PgStateError):
-        waitFor conn.advisoryLockXactShared(3'i32, 4'i32)
-      doAssertRaises(PgStateError):
-        discard waitFor conn.advisoryTryLockXact(5'i32, 6'i32)
-      doAssertRaises(PgStateError):
-        discard waitFor conn.advisoryTryLockXactShared(7'i32, 8'i32)
+
+      template expectStateError(body: untyped) =
+        var raised = false
+        try:
+          body
+        except PgStateError:
+          raised = true
+        doAssert raised, "expected PgStateError"
+
+      expectStateError:
+        await conn.advisoryLockXact(40010'i64)
+      expectStateError:
+        await conn.advisoryLockXactShared(40011'i64)
+      expectStateError:
+        discard await conn.advisoryTryLockXact(40012'i64)
+      expectStateError:
+        discard await conn.advisoryTryLockXactShared(40013'i64)
+      expectStateError:
+        await conn.advisoryLockXact(1'i32, 2'i32)
+      expectStateError:
+        await conn.advisoryLockXactShared(3'i32, 4'i32)
+      expectStateError:
+        discard await conn.advisoryTryLockXact(5'i32, 6'i32)
+      expectStateError:
+        discard await conn.advisoryTryLockXactShared(7'i32, 8'i32)
 
     waitFor t()
 
