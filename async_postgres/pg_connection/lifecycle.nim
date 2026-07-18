@@ -132,6 +132,15 @@ proc connectToHost*(
   ## Dials `entry.hostaddr` when given (bypassing name resolution), otherwise
   ## `entry.host`; SSL certificate verification always uses `entry.host`.
 
+  # Reject up front so the sslAllow rewrite below can't downgrade past
+  # negotiateSSL's own check.
+  if config.sslNegotiation == sslnDirect and
+      config.sslMode notin {sslRequire, sslVerifyCa, sslVerifyFull}:
+    raise newException(
+      PgConnectionError,
+      "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
+    )
+
   if config.sslMode == sslAllow:
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
     # WARNING: This is vulnerable to MITM downgrade attacks. A network
@@ -170,6 +179,14 @@ proc connectToHost*(
   let hostAddr = entry.dialAddr
   let hostPort = entry.port
   let isUnix = isUnixSocket(hostAddr)
+
+  # Unix sockets skip negotiateSSL; without this the caller's TLS request is
+  # silently dropped.
+  if isUnix and config.sslNegotiation == sslnDirect:
+    raise newException(
+      PgConnectionError,
+      "sslnegotiation=direct is not supported over Unix-domain sockets",
+    )
 
   when hasChronos:
     let transport =
