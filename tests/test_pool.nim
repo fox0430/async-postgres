@@ -4,11 +4,10 @@ import ../async_postgres/async_backend
 when hasChronos:
   import pkg/chronos/streams/asyncstream
 
-import ../async_postgres/pg_protocol
-import ../async_postgres/pg_connection
+import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_pool {.all.}
 
-import ./mock_pg_server
+import mock_pg_server
 
 privateAccess(PgPool)
 privateAccess(PgConnection)
@@ -303,6 +302,55 @@ suite "splitBatchBudget":
       let (a, b) = splitBatchBudget(3, 5, cap)
       check a >= 1 and b >= 1
       check a + b == cap
+
+suite "PendingPoolOp finish guards":
+  # Dispatch paths must not complete/fail an already-finished future.
+  # Callers cancel via `.wait(dur)` which can leave execFut/queryFut
+  # finished before the pipeline batch resolves.
+
+  proc makeExecOp(): PendingPoolOp =
+    PendingPoolOp(kind: popExec, execFut: newFuture[CommandResult]("test.execFut"))
+
+  proc makeQueryOp(): PendingPoolOp =
+    PendingPoolOp(kind: popQuery, queryFut: newFuture[QueryResult]("test.queryFut"))
+
+  test "completePendingOp is a no-op when exec future already finished":
+    let op = makeExecOp()
+    op.execFut.fail(newException(PgPoolError, "pre-cancelled"))
+    check op.execFut.finished
+    completePendingOp(op, CommandResult(commandTag: "SELECT 0"))
+    check op.execFut.failed
+    expect(PgPoolError):
+      discard op.execFut.read()
+
+  test "completePendingOp is a no-op when query future already finished":
+    let op = makeQueryOp()
+    op.queryFut.fail(newException(PgPoolError, "pre-cancelled"))
+    check op.queryFut.finished
+    completePendingOp(op, QueryResult(commandTag: "SELECT 0"))
+    check op.queryFut.failed
+    expect(PgPoolError):
+      discard op.queryFut.read()
+
+  test "completePendingOp delivers result on unfinished exec future":
+    let op = makeExecOp()
+    completePendingOp(op, CommandResult(commandTag: "INSERT 0 1"))
+    check op.execFut.finished
+    check op.execFut.read().commandTag == "INSERT 0 1"
+
+  test "completePendingOp delivers result on unfinished query future":
+    let op = makeQueryOp()
+    completePendingOp(op, QueryResult(commandTag: "SELECT 1"))
+    check op.queryFut.finished
+    check op.queryFut.read().commandTag == "SELECT 1"
+
+  test "failPendingOp is a no-op when exec future already finished":
+    let first = newException(PgPoolError, "first")
+    let op = makeExecOp()
+    op.execFut.fail(first)
+    failPendingOp(op, newException(PgPoolError, "second"))
+    check op.execFut.failed
+    check op.execFut.readError() == first
 
 suite "checkReady error classification":
   # A-8: a connection that is alive but busy (a single connection used
