@@ -133,8 +133,7 @@ SSL backend differs by async backend:
 - chronos: BearSSL (via [nim-bearssl](https://github.com/status-im/nim-bearssl); TLS 1.2 only due to BearSSL limitation)
 
 Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
-stronger. On the chronos backend it needs chronos' ALPN support, currently only
-in the development HEAD (`nimble install "https://github.com/status-im/nim-chronos@#head"`).
+stronger. On the chronos backend it needs chronos >= 4.4.0 for ALPN support.
 
 ## Examples
 

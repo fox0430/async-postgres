@@ -818,6 +818,20 @@ suite "Direct SSL negotiation":
   test "sslnegotiation=direct starts TLS immediately without an SSLRequest":
     var raised = false
     var firstByte: int = -1
+    var alpnAdvertised = false
+
+    proc containsBytes(hay: seq[byte], needle: string): bool =
+      if needle.len == 0 or hay.len < needle.len:
+        return false
+      for i in 0 .. hay.len - needle.len:
+        var m = true
+        for j in 0 ..< needle.len:
+          if hay[i + j] != byte(needle[j]):
+            m = false
+            break
+        if m:
+          return true
+      false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -825,11 +839,15 @@ suite "Direct SSL negotiation":
       proc serverHandler() {.async.} =
         let st = await ms.accept()
         try:
-          # Direct SSL skips the 8-byte SSLRequest (whose first byte is 0x00) and
-          # opens with a TLS handshake record (content type 0x16). Capture the
-          # opening byte, then drop the connection so the handshake fails fast.
-          let data = await readN(st, 1)
-          firstByte = int(data[0])
+          # 5-byte TLS record header: type(1) + version(2) + length(2).
+          # "postgresql" only appears inside the ALPN extension, so finding it
+          # in the ClientHello body is the ALPN-wired signal.
+          let hdr = await readN(st, 5)
+          firstByte = int(hdr[0])
+          let recordLen = (int(hdr[3]) shl 8) or int(hdr[4])
+          if recordLen > 0:
+            let body = await readN(st, recordLen)
+            alpnAdvertised = containsBytes(body, "postgresql")
         except CatchableError:
           discard
         await closeClient(st)
@@ -858,6 +876,7 @@ suite "Direct SSL negotiation":
 
     waitFor testBody()
     check firstByte == 0x16
+    check alpnAdvertised
     check raised
 
 proc sendAuthSasl(client: MockClient, mechanisms: seq[string]): Future[void] {.async.} =

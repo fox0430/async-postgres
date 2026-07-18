@@ -120,7 +120,10 @@ type
       ## SSL/TLS negotiation mode. `parseDsn` and `initConnConfig` default this
       ## to `sslPrefer` (libpq parity); a raw zero-initialized `ConnConfig` has
       ## `sslDisable`.
-    sslNegotiation*: SslNegotiation ## SSL negotiation method (default: sslnPostgres)
+    sslNegotiation*: SslNegotiation
+      ## SSL negotiation method (default: `sslnPostgres`). A raw zero-initialized
+      ## `ConnConfig` matches only because `sslnPostgres` is the enum's zero
+      ## value; reordering `SslNegotiation` would silently change that default.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
     sslSni*: bool
       ## Send TLS SNI extension during the handshake (libpq `sslsni`, default

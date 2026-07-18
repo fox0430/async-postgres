@@ -27,9 +27,11 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[dynlib, openssl, tempfiles, os]
 
-const PgAlpnProtocol = "postgresql"
-  ## ALPN protocol name a Direct SSL connection must negotiate (PostgreSQL 17+).
-  ## libpq sends and requires the same name for `sslnegotiation=direct`.
+when hasChronos or (hasAsyncDispatch and defined(ssl)):
+  const PgAlpnProtocol = "postgresql"
+    ## ALPN protocol name required for `sslnegotiation=direct` (PostgreSQL 17+).
+  static:
+    doAssert PgAlpnProtocol.len < 256
 
 when hasAsyncDispatch and defined(ssl):
   # On asyncdispatch `conn.socket` is an `AsyncSocket`, so `wrapConnectedSocket`
@@ -334,8 +336,7 @@ proc establishTls(
         ctx = newContext(verifyMode = verifyMode)
 
       if direct:
-        # Advertise "postgresql" ALPN: 1-byte length prefix + protocol name.
-        const alpnProto = "\x0a" & PgAlpnProtocol
+        const alpnProto = char(PgAlpnProtocol.len) & PgAlpnProtocol
         let rc = SSL_CTX_set_alpn_protos(
           ctx.context, alpnProto.cstring, cuint(alpnProto.len)
         )
@@ -355,8 +356,6 @@ proc establishTls(
         # Drive handshake so peer cert is populated before SCRAM channel binding.
         await driveTlsHandshake(conn.socket)
         if direct:
-          # Mirror chronos: without this a non-Postgres/pre-17 TLS peer accepts
-          # our handshake and we proceed with whatever it speaks.
           let getAlpn = sslGet0AlpnSelected()
           if getAlpn == nil:
             raise newException(
