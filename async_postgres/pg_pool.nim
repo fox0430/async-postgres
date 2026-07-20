@@ -2073,11 +2073,20 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close the pool: stop the maintenance loop, cancel all waiters, and close
   ## all idle and active connections.
   ##
-  ## When `timeout > ZeroDuration`, waits up to `timeout` for active
-  ## connections to be released. Unreleased connections are closed when they
-  ## are eventually returned to the pool. Without a timeout (or
-  ## `ZeroDuration`), active connections are closed on release.
+  ## When `timeout > ZeroDuration`, `timeout` is a single deadline shared by
+  ## both the active-connection drain and the background-task drain. Pending
+  ## background spawns still in flight when the deadline elapses are
+  ## cancelled so close() returns promptly. Without a timeout (or
+  ## `ZeroDuration`), active connections are closed on release and the
+  ## background drain waits unbounded.
   pool.closed = true
+
+  let hasDeadline = timeout > ZeroDuration
+  let closeDeadline =
+    if hasDeadline:
+      Moment.now() + timeout
+    else:
+      Moment.now()
 
   # Stop maintenance loop
   if pool.maintenanceTask != nil and not pool.maintenanceTask.finished:
@@ -2101,10 +2110,9 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     let op = pool.pendingOps.popFirst()
     failPendingOp(op, closeErr)
 
-  # Wait for active connections to drain
-  if timeout > ZeroDuration and pool.active > 0:
-    let deadline = Moment.now() + timeout
-    while pool.active > 0 and Moment.now() < deadline:
+  # Wait for active connections to drain (bounded by closeDeadline)
+  if hasDeadline and pool.active > 0:
+    while pool.active > 0 and Moment.now() < closeDeadline:
       await sleepAsync(milliseconds(50))
 
   # Close all idle connections in parallel. `tracedClose` swallows its own
@@ -2133,11 +2141,22 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   if pool.active > 0:
     await sleepAsync(ZeroDuration)
 
-  # Wait for any fire-and-forget tasks (closeNoWait, spawnConnectForWaiter) so
-  # the server observes Terminate / connects unwind before this proc returns. A
-  # late release() from another task may push more entries while we await, so
-  # loop with snapshot-and-clear to avoid discarding unfinished futures.
+  # Drain fire-and-forget tasks (closeNoWait, spawnConnectForWaiter). Late
+  # release() may push more mid-await; snapshot-and-clear preserves them.
+  # Bounded by closeDeadline: without it, a stuck spawn's connect pins close()
+  # up to `maintenanceInterval` (30s default) past `timeout`.
   while pool.pendingBackgroundTasks.len > 0:
     let pending = pool.pendingBackgroundTasks
     pool.pendingBackgroundTasks.setLen(0)
-    await allFutures(pending)
+    if hasDeadline:
+      let remaining = closeDeadline - Moment.now()
+      if remaining > ZeroDuration:
+        try:
+          await allFutures(pending).wait(remaining)
+        except AsyncTimeoutError:
+          discard
+      for f in pending:
+        if not f.finished:
+          await cancelAndWait(f)
+    else:
+      await allFutures(pending)
