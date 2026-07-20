@@ -4272,6 +4272,75 @@ suite "User-defined composite":
     expect PgTypeError:
       discard getComposite[NullableRecord](row, 0)
 
+  test "getComposite binary int32 field with float4 wire OID raises":
+    # int4 and float4 share 4 bytes; only OID separates them. Without the
+    # OID check the raw bit pattern of 1.5f would decode as int32 garbage.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Kate"))),
+      (oid: OidFloat4, data: some(@(toBE32(cast[int32](1.5'f32))))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary int64 field with timestamp wire OID raises":
+    # int8 and timestamp share 8 bytes; only OID separates them.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Leo"))),
+      (oid: OidTimestamp, data: some(@(toBE64(1'i64)))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(0'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[WideIntRecord](row, 0)
+
+  test "getComposite binary float64 field with int8 wire OID raises":
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Mia"))),
+      (oid: OidInt4, data: some(@(toBE32(1'i32)))),
+      (oid: OidInt8, data: some(@(toBE64(42'i64)))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary extra wire fields raises":
+    # Wire has 3 fields but PointRecord has 2 — previously silent-truncated.
+    let fields_data = @[
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](2.0'f64))))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](3.0'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PointRecord](row, 0)
+
+  test "getComposite text extra wire fields raises":
+    let row: Row = @[some(toBytes("(1.0,2.0,3.0)"))]
+    expect PgTypeError:
+      discard getComposite[PointRecord](row, 0)
+
+  test "getComposite binary OID 0 accepts width-matching payload":
+    # OID 0 = server didn't disclose type; length guard still applies.
+    let fields_data = @[
+      (oid: 0'i32, data: some(@(toBE64(cast[int64](3.14'f64))))),
+      (oid: 0'i32, data: some(@(toBE64(cast[int64](2.72'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let pt = getComposite[PointRecord](row, 0)
+    check abs(pt.x - 3.14) < 1e-10
+    check abs(pt.y - 2.72) < 1e-10
+
 suite "User-defined domain":
   test "pgDomain generates toPgParam with base type OID":
     let p = toPgParam(UsPostalCode("12345"))

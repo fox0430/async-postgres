@@ -365,25 +365,42 @@ template checkFieldLen(actual, expected: int, typeName: string) =
         " (expected " & $expected & ")",
     )
 
-template decodeBinaryField(val, buf: untyped, fOff, fEnd, fLen: int) =
+template checkFieldOid(actual: int32, allowed: openArray[int32], typeName: string) =
+  # Same-width types (int4/float4, int8/float8/timestamp) share a length so
+  # checkFieldLen alone lets them silently misdecode. actual == 0 → unknown/
+  # polymorphic column; fall back to the length guard.
+  if actual != 0'i32 and actual notin allowed:
+    raise newException(
+      PgTypeError,
+      "Composite binary field OID " & $actual & " incompatible with Nim " & typeName,
+    )
+
+template decodeBinaryField(val, buf: untyped, fOid: int32, fOff, fEnd, fLen: int) =
   when typeof(val) is string:
+    checkFieldOid(fOid, [OidText, OidVarchar], "string")
     val = readString(buf, fOff, fLen)
   elif typeof(val) is int16:
+    checkFieldOid(fOid, [OidInt2], "int16")
     checkFieldLen(fLen, 2, "int16")
     val = fromBE16(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is int32:
+    checkFieldOid(fOid, [OidInt4], "int32")
     checkFieldLen(fLen, 4, "int32")
     val = fromBE32(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is (int64 or int):
+    checkFieldOid(fOid, [OidInt8], "int64")
     checkFieldLen(fLen, 8, "int64")
     val = typeof(val)(fromBE64(buf.toOpenArray(fOff, fEnd)))
   elif typeof(val) is float64:
+    checkFieldOid(fOid, [OidFloat8], "float64")
     checkFieldLen(fLen, 8, "float64")
     val = decodeFloat64BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is float32:
+    checkFieldOid(fOid, [OidFloat4], "float32")
     checkFieldLen(fLen, 4, "float32")
     val = decodeFloat32BE(buf.toOpenArray(fOff, fEnd))
   elif typeof(val) is bool:
+    checkFieldOid(fOid, [OidBool], "bool")
     checkFieldLen(fLen, 1, "bool")
     val = buf[fOff] != 0
   else:
@@ -408,14 +425,19 @@ proc getComposite*[T: object](row: Row, col: int): T =
           val = none(typeof(val.get))
         else:
           var inner: typeof(val.get)
-          decodeBinaryField(inner, row.data.buf, fOff, fEnd, f.len)
+          decodeBinaryField(inner, row.data.buf, f.oid, fOff, fEnd, f.len)
           val = some(inner)
       else:
         if f.len == -1:
           raise
             newException(PgTypeError, "NULL field in binary composite at index " & $idx)
-        decodeBinaryField(val, row.data.buf, fOff, fEnd, f.len)
+        decodeBinaryField(val, row.data.buf, f.oid, fOff, fEnd, f.len)
       idx += 1
+    if idx != decoded.len:
+      raise newException(
+        PgTypeError,
+        "Binary composite has " & $decoded.len & " fields but object has " & $idx,
+      )
     return
   let s = row.getStr(col)
   let parts = parseCompositeText(s)
@@ -433,6 +455,10 @@ proc getComposite*[T: object](row: Row, col: int): T =
         raise newException(PgTypeError, "NULL field in composite at index " & $idx)
       val = compositeFieldFromText[typeof(val)](parts[idx].get)
     idx += 1
+  if idx != parts.len:
+    raise newException(
+      PgTypeError, "Composite has " & $parts.len & " fields but object has " & $idx
+    )
 
 proc getCompositeOpt*[T: object](row: Row, col: int): Option[T] =
   ## NULL-safe version of ``getComposite``.
