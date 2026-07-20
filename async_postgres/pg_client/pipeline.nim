@@ -455,12 +455,10 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
                     results[activeOpIdx].queryResult.fields[j].formatCode = cf[j]
               else:
                 results[activeOpIdx].queryResult.fields = msg.fields
-                # scsShare: this op skipped Describe(Statement) but still
-                # emitted Describe(Portal), so msg.fields' formatCode/typeOid
-                # reflect this op's Bind. Mirror into RowData so binary
-                # decoders (isBinaryCol/colTypeOid) see the right metadata —
-                # otherwise binary results would be misread as text.
-                if p.ops[activeOpIdx].cache == scsShare:
+                # scsShare/scsUncached emit Describe(Portal), so msg.fields'
+                # formatCode/typeOid reflect this op's Bind — mirror into
+                # RowData or binary decoders read as text.
+                if p.ops[activeOpIdx].cache in {scsShare, scsUncached}:
                   cf = newSeq[int16](msg.fields.len)
                   co = newSeq[int32](msg.fields.len)
                   for j in 0 ..< msg.fields.len:
@@ -640,11 +638,11 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                   rowCount = addr results[opIdx].queryResult.rowCount
                 else:
                   results[opIdx].queryResult.fields = msg.fields
-                  # scsShare: mirror Describe(Portal)'s formatCode/typeOid
-                  # into RowData so binary decoders see the right metadata.
+                  # scsShare/scsUncached emit Describe(Portal); mirror
+                  # msg.fields into RowData or binary decoders read as text.
                   var cf: seq[int16]
                   var co: seq[int32]
-                  if p.ops[opIdx].cache == scsShare:
+                  if p.ops[opIdx].cache in {scsShare, scsUncached}:
                     cf = newSeq[int16](msg.fields.len)
                     co = newSeq[int32](msg.fields.len)
                     for j in 0 ..< msg.fields.len:
