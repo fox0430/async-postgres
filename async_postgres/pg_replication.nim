@@ -1217,13 +1217,16 @@ proc startReplication*(
   ## ``decodePgOutput``) supports protocol version 1 only. Passing a
   ## ``proto_version`` other than ``1`` in ``options`` raises ``ValueError``,
   ## because a v2/v3 stream reshapes and adds messages the decoder cannot parse.
-  # The bundled pgoutput decoder implements protocol version 1 only. A v2/v3
-  # stream adds messages and reshapes existing ones (e.g. an xid prefix on
-  # streamed tuples), which parsePgOutputMessage cannot decode. Reject an
-  # unsupported proto_version before touching connection state so the failure is
-  # a plain input error rather than a later mid-stream decode break.
+  ## When ``publication_names`` (a pgoutput-only option) is present without an
+  ## explicit ``proto_version``, this proc pins it to ``'1'`` so a future
+  ## server-side default bump cannot upgrade the stream past the bundled decoder.
+  # Reject unsupported proto_version pre-flight so the failure is a plain input
+  # error rather than a mid-stream decode break.
+  var hasProtoVersion = false
+  var hasPublicationNames = false
   for (k, v) in options:
     if k.cmpIgnoreCase("proto_version") == 0:
+      hasProtoVersion = true
       let pv = v.strip(chars = {'\'', '"', ' ', '\t'})
       if pv.len > 0 and pv != "1":
         raise newException(
@@ -1231,15 +1234,23 @@ proc startReplication*(
           "Unsupported pgoutput proto_version " & v &
             ": the bundled decoder supports proto_version 1 only",
         )
+    elif k.cmpIgnoreCase("publication_names") == 0:
+      hasPublicationNames = true
 
   conn.checkReady()
+
+  # publication_names => pgoutput; pin proto_version defensively against a
+  # future server-side default bump past 1.
+  var effectiveOptions = options
+  if hasPublicationNames and not hasProtoVersion:
+    effectiveOptions.add(("proto_version", "'1'"))
 
   # Build START_REPLICATION command
   var sql =
     "START_REPLICATION SLOT " & quoteIdentifier(slotName) & " LOGICAL " & $startLsn
-  if options.len > 0:
+  if effectiveOptions.len > 0:
     sql.add(" (")
-    for i, (k, v) in options:
+    for i, (k, v) in effectiveOptions:
       if i > 0:
         sql.add(", ")
       for j, c in k:

@@ -9,7 +9,7 @@
 ## `confirmFlushed` (so merely-received WAL does not advance
 ## `confirmed_flush_lsn`, preserving at-least-once delivery) and the opt-out path.
 
-import std/unittest
+import std/[strutils, unittest]
 
 import ../async_postgres/[async_backend, pg_replication]
 import ../async_postgres/pg_connection {.all.}
@@ -608,3 +608,63 @@ when hasChronos:
       # The core assertion: no bytes were committed into recvBuf after the
       # cancel. Pre-fix this would grow by the marker length.
       check cancelRecvBufLenAfterMarker == cancelRecvBufLenAfterCancel
+
+var observedStartQuery: string
+
+proc runStartReplicationCapture(slot: string, options: seq[(string, string)]): string =
+  ## Drive startReplication against a mock server that just observes the
+  ## START_REPLICATION query bytes, then cleanly ends the stream.
+  observedStartQuery = ""
+
+  proc testBody() {.async.} =
+    let ms = startMockServer()
+
+    proc serverHandler() {.async.} =
+      let st = await acceptAndReady(ms)
+      let m = await drainFrontendMessage(st)
+      # Query body is a NUL-terminated SQL string; strip the trailing NUL.
+      if m.msgType == 'Q' and m.body.len > 0:
+        var s = newString(m.body.len - 1)
+        for i in 0 ..< s.len:
+          s[i] = char(m.body[i])
+        {.cast(gcsafe).}:
+          observedStartQuery = s
+      var tail: seq[byte]
+      tail.add(buildCopyBothResponse())
+      tail.add(buildCopyDone())
+      tail.add(buildReadyForQuery('I'))
+      await sendBytes(st, tail)
+      discard await drainFrontendMessage(st) # client's CopyDone
+      await closeClient(st)
+
+    let serverFut = serverHandler()
+    let conn = await connect(mockConfig(ms.port))
+    let cb = makeReplicationCallback:
+      {.cast(gcsafe).}:
+        discard msg
+
+    await conn.startReplication(slot, options = options, callback = cb)
+    await conn.close()
+    await serverFut
+    await closeServer(ms)
+
+  waitFor testBody()
+  observedStartQuery
+
+suite "Replication: pgoutput proto_version defensive injection":
+  test "publication_names without proto_version pins proto_version '1'":
+    let q = runStartReplicationCapture("test_slot", @[("publication_names", "'p1'")])
+    check "publication_names 'p1'" in q
+    check "proto_version '1'" in q
+
+  test "explicit proto_version is preserved and not duplicated":
+    let q = runStartReplicationCapture(
+      "test_slot", @[("proto_version", "'1'"), ("publication_names", "'p1'")]
+    )
+    check q.count("proto_version") == 1
+
+  test "no publication_names => no proto_version injected":
+    # Guard for non-pgoutput plugins (test_decoding, wal2json, ...): they do
+    # not understand proto_version and would reject an injected value.
+    let q = runStartReplicationCapture("test_slot", @[])
+    check "proto_version" notin q
