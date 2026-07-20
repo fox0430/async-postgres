@@ -110,6 +110,10 @@ type
     kind: PendingOpKind
     sql: string
     params: seq[PgParam]
+    paramsInline: seq[PgParamInline]
+      ## Populated instead of `params` when `hasInline` is true — routes the
+      ## op through the pipeline's / connection's `PgParamInline` fast path.
+    hasInline: bool
     resultFormat: ResultFormat ## Only used for popQuery
     timeout: Duration
     execFut: Future[CommandResult] ## Non-nil for popExec
@@ -1172,9 +1176,15 @@ proc executeBatch(
     for op in batch:
       case op.kind
       of popExec:
-        pipeline.addExec(op.sql, op.params)
+        if op.hasInline:
+          pipeline.addExec(op.sql, op.paramsInline)
+        else:
+          pipeline.addExec(op.sql, op.params)
       of popQuery:
-        pipeline.addQuery(op.sql, op.params, op.resultFormat)
+        if op.hasInline:
+          pipeline.addQuery(op.sql, op.paramsInline, op.resultFormat)
+        else:
+          pipeline.addQuery(op.sql, op.params, op.resultFormat)
     let ir = await pipeline.executeIsolated(timeout)
     for i in 0 ..< batch.len:
       let op = batch[i]
@@ -1213,12 +1223,25 @@ proc dispatchHomogeneous(
       try:
         case op.kind
         of popExec:
-          let r = await conn.exec(op.sql, op.params, timeout = op.timeout)
+          var r: CommandResult
+          if op.hasInline:
+            r = await conn.exec(op.sql, op.paramsInline, timeout = op.timeout)
+          else:
+            r = await conn.exec(op.sql, op.params, timeout = op.timeout)
           completePendingOp(op, r)
         of popQuery:
-          let r = await conn.query(
-            op.sql, op.params, resultFormat = op.resultFormat, timeout = op.timeout
-          )
+          var r: QueryResult
+          if op.hasInline:
+            r = await conn.query(
+              op.sql,
+              op.paramsInline,
+              resultFormat = op.resultFormat,
+              timeout = op.timeout,
+            )
+          else:
+            r = await conn.query(
+              op.sql, op.params, resultFormat = op.resultFormat, timeout = op.timeout
+            )
           completePendingOp(op, r)
       finally:
         await pool.resetSession(conn)
@@ -1363,6 +1386,38 @@ proc exec*(
     await pool.resetSession(conn)
     conn.release()
 
+proc exec*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParamInline],
+    timeout: Duration = ZeroDuration,
+): Future[CommandResult] {.async.} =
+  ## Execute a statement with heap-alloc-free inline parameters using a pooled
+  ## connection. Batches through the pipelined path when `pipelined` is enabled;
+  ## see the `seq[PgParam]` overload for the batch timeout semantics.
+  if pool.config.pipelined:
+    if pool.closed:
+      raise newException(PgPoolError, "Pool is closed")
+    let fut = newFuture[CommandResult]("PgPool.exec.pipelined")
+    pool.pendingOps.addLast(
+      PendingPoolOp(
+        kind: popExec,
+        sql: sql,
+        paramsInline: params,
+        hasInline: true,
+        timeout: timeout,
+        execFut: fut,
+      )
+    )
+    pool.scheduleDispatch()
+    return await fut
+  let conn = await pool.acquire()
+  try:
+    return await conn.exec(sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
 proc query*(
     pool: PgPool,
     sql: string,
@@ -1387,6 +1442,40 @@ proc query*(
         kind: popQuery,
         sql: sql,
         params: params,
+        resultFormat: resultFormat,
+        timeout: timeout,
+        queryFut: fut,
+      )
+    )
+    pool.scheduleDispatch()
+    return await fut
+  let conn = await pool.acquire()
+  try:
+    return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
+proc query*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParamInline],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query with heap-alloc-free inline parameters using a pooled
+  ## connection. Batches through the pipelined path when `pipelined` is enabled;
+  ## see the `seq[PgParam]` overload for the batch timeout semantics.
+  if pool.config.pipelined:
+    if pool.closed:
+      raise newException(PgPoolError, "Pool is closed")
+    let fut = newFuture[QueryResult]("PgPool.query.pipelined")
+    pool.pendingOps.addLast(
+      PendingPoolOp(
+        kind: popQuery,
+        sql: sql,
+        paramsInline: params,
+        hasInline: true,
         resultFormat: resultFormat,
         timeout: timeout,
         queryFut: fut,
@@ -1633,6 +1722,22 @@ proc execInTransaction*(
     await pool.resetSession(conn)
     conn.release()
 
+proc execInTransaction*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    opts: TransactionOptions,
+    timeout: Duration = ZeroDuration,
+): Future[CommandResult] {.async.} =
+  ## Execute a statement inside a pipelined transaction with options
+  ## (isolation / access mode / deferrable) applied to the BEGIN.
+  let conn = await pool.acquire()
+  try:
+    return await conn.execInTransaction(sql, params, opts, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
 proc queryInTransaction*(
     pool: PgPool,
     sql: string,
@@ -1644,6 +1749,23 @@ proc queryInTransaction*(
   let conn = await pool.acquire()
   try:
     return await conn.queryInTransaction(sql, params, resultFormat, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
+proc queryInTransaction*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    opts: TransactionOptions,
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query inside a pipelined transaction with options
+  ## (isolation / access mode / deferrable) applied to the BEGIN.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryInTransaction(sql, params, opts, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
     conn.release()

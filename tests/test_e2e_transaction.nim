@@ -1905,6 +1905,44 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pool.execInTransaction with TransactionOptions":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_peit_opts")
+      discard
+        await pool.exec("CREATE TABLE test_peit_opts (id serial PRIMARY KEY, val text)")
+
+      let tag = await pool.execInTransaction(
+        "INSERT INTO test_peit_opts (val) VALUES ($1)",
+        @[toPgParam("serializable")],
+        TransactionOptions(isolation: ilSerializable),
+      )
+      doAssert tag == "INSERT 0 1"
+
+      let res = await pool.query("SELECT val FROM test_peit_opts")
+      doAssert res.rows[0].getStr(0) == "serializable"
+
+      discard await pool.exec("DROP TABLE test_peit_opts")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.queryInTransaction with TransactionOptions":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+
+      let qr = await pool.queryInTransaction(
+        "SELECT 7::int4", @[], TransactionOptions(isolation: ilRepeatableRead)
+      )
+      doAssert qr.rows.len == 1
+      doAssert qr.rows[0].getStr(0) == "7"
+
+      await pool.close()
+
+    waitFor t()
+
   test "pipeline: multiple exec":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

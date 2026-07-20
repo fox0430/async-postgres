@@ -526,6 +526,59 @@ suite "E2E: Pipelined Pool":
 
     waitFor t()
 
+  test "pool: PgParamInline overload (non-pipelined)":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_inline")
+      discard
+        await pool.exec("CREATE TABLE test_pool_inline (id serial PRIMARY KEY, n int4)")
+
+      discard await pool.exec(
+        "INSERT INTO test_pool_inline (n) VALUES ($1)", @[toPgParamInline(42'i32)]
+      )
+      let qr = await pool.query(
+        "SELECT n FROM test_pool_inline WHERE n = $1", @[toPgParamInline(42'i32)]
+      )
+      doAssert qr.rowCount == 1
+      doAssert qr.rows[0].getStr(0) == "42"
+
+      discard await pool.exec("DROP TABLE test_pool_inline")
+      await pool.close()
+
+    waitFor t()
+
+  test "pipelined pool: PgParamInline overload batched through pipeline":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3, pipelined: true)
+      )
+      discard await pool.exec("DROP TABLE IF EXISTS test_pp_inline")
+      discard
+        await pool.exec("CREATE TABLE test_pp_inline (id serial PRIMARY KEY, n int4)")
+
+      # Fire in the same tick so they land in one pipelined batch, exercising
+      # the PendingPoolOp inline path.
+      let f1 = pool.exec(
+        "INSERT INTO test_pp_inline (n) VALUES ($1)", @[toPgParamInline(1'i32)]
+      )
+      let f2 = pool.exec(
+        "INSERT INTO test_pp_inline (n) VALUES ($1)", @[toPgParamInline(2'i32)]
+      )
+      let f3 = pool.query(
+        "SELECT n FROM test_pp_inline WHERE n = $1", @[toPgParamInline(1'i32)]
+      )
+      discard await f1
+      discard await f2
+      let r3 = await f3
+      doAssert r3.rowCount == 1
+      doAssert r3.rows[0].getStr(0) == "1"
+
+      discard await pool.exec("DROP TABLE test_pp_inline")
+      await pool.close()
+
+    waitFor t()
+
   test "pipelined pool: concurrent ops are batched":
     proc t() {.async.} =
       let pool = await newPool(
