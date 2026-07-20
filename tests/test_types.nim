@@ -4870,6 +4870,55 @@ suite "Range binary decoding (roundtrip)":
     check decoded.lower.value.month == mDec
     check decoded.lower.value.monthday == 31
 
+suite "Range binary decoding rejects malformed bLen":
+  # Fixed-width range decoders must validate the per-bound length field
+  # matches the type's element size instead of blindly slicing a hardcoded
+  # window, which would spill into adjacent bytes on malicious/corrupt input.
+  test "int4range rejects short lower bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(2'i32)) # bogus: int4 must be 4 bytes
+    data.add([0'u8, 0])
+    data.add(toBE32(4'i32))
+    data.add(toBE32(10'i32))
+    expect PgTypeError:
+      discard decodeInt4RangeBinary(data)
+
+  test "int4range rejects oversized upper bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(4'i32))
+    data.add(toBE32(1'i32))
+    data.add(toBE32(8'i32)) # bogus: int4 must be 4 bytes
+    data.add(toBE64(10'i64))
+    expect PgTypeError:
+      discard decodeInt4RangeBinary(data)
+
+  test "int8range rejects wrong bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(4'i32)) # bogus: int8 must be 8 bytes
+    data.add(toBE32(1'i32))
+    data.add(toBE32(8'i32))
+    data.add(toBE64(10'i64))
+    expect PgTypeError:
+      discard decodeInt8RangeBinary(data)
+
+  test "tsrange rejects wrong bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(4'i32)) # bogus: timestamp must be 8 bytes
+    data.add(toBE32(0'i32))
+    data.add(toBE32(8'i32))
+    data.add(toBE64(0'i64))
+    expect PgTypeError:
+      discard decodeTsRangeBinary(data)
+
+  test "daterange rejects wrong bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(8'i32)) # bogus: date must be 4 bytes
+    data.add(toBE64(0'i64))
+    data.add(toBE32(4'i32))
+    data.add(toBE32(0'i32))
+    expect PgTypeError:
+      discard decodeDateRangeBinary(data)
+
 suite "Range row getters":
   test "getInt4Range text":
     let row: Row = @[some(toBytes("[1,10)"))]
