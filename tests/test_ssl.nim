@@ -922,7 +922,8 @@ suite "Direct SSL negotiation":
 
   test "sslnegotiation=direct with weak sslmode fails once across a multi-host list":
     var raised = false
-    var errMsg = ""
+    var errMentionsDirect = false
+    var noAggregateMsg = false
 
     proc testBody() {.async.} =
       # Three hosts on port 1 (guaranteed refused). A per-host validate would
@@ -942,12 +943,13 @@ suite "Direct SSL negotiation":
         await conn.close()
       except PgError as e:
         raised = true
-        errMsg = e.msg
+        errMentionsDirect = "sslnegotiation=direct requires" in e.msg
+        noAggregateMsg = "Could not connect to any host" notin e.msg
 
     waitFor testBody()
     check raised
-    check "sslnegotiation=direct requires" in errMsg
-    check "Could not connect to any host" notin errMsg
+    check errMentionsDirect
+    check noAggregateMsg
 
 proc sendAuthSasl(client: MockClient, mechanisms: seq[string]): Future[void] {.async.} =
   var body: seq[byte] = @[]
