@@ -53,6 +53,11 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
 
   conn.recvBuf.setLen(0)
   conn.recvBufStart = 0
+  conn.sendBuf.setLen(0)
+  # Fresh backend holds none of the old session-level advisory locks; stale
+  # state would fake an onLeakedSessionLocks on pool release.
+  conn.heldSessionLocks = 0
+  conn.sessionLockDirty = false
   conn.clearStmtCache()
   conn.state = csConnecting
 
