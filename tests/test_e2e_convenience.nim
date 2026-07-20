@@ -1003,6 +1003,46 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: pipeline execute with capacity=0 decodes binary results":
+    # scsUncached emits Describe(Portal); the recv loop must mirror
+    # msg.fields' formatCode/typeOid into RowData or binary results decode as
+    # text and return wrong values.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 0
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT 987654::int4 AS v", resultFormat = rfBinary)
+      let r = await p.execute()
+      doAssert conn.stmtCache.len == 0
+      doAssert r[0].queryResult.fields[0].formatCode == 1
+      doAssert r[0].queryResult.rows[0].getInt(0) == 987654
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: pipeline executeIsolated with capacity=0 decodes binary results":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 0
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT 12345::int4 AS a", resultFormat = rfBinary)
+      p.addQuery("SELECT 6789::int8 AS b", resultFormat = rfBinary)
+      let ir = await p.executeIsolated()
+      doAssert conn.stmtCache.len == 0
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] == nil
+      doAssert ir.results[0].queryResult.fields[0].formatCode == 1
+      doAssert ir.results[0].queryResult.rows[0].getInt(0) == 12345
+      doAssert ir.results[1].queryResult.fields[0].formatCode == 1
+      doAssert ir.results[1].queryResult.rows[0].getInt64(0) == 6789
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: exec then query on same SQL preserves cached decode metadata":
     # exec's addStmtCache path must populate decode metadata for a later query hit.
     proc t() {.async.} =
