@@ -3370,6 +3370,40 @@ suite "Pool spawn-connect close-race":
 
     waitFor t()
 
+  test "close(timeout) honors its budget when spawn-for-waiter connect stalls":
+    # Regression: close(timeout=100ms) blocked on pendingBackgroundTasks drain
+    # until the spawn's connectTimeout (=maintenanceInterval fallback, default
+    # 30s) elapsed. close() now bounds the drain by its own deadline and
+    # cancels remaining spawns.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = ZeroDuration
+      pool.config.maintenanceInterval = seconds(30) # default; must not gate close
+      pool.active = 1
+
+      let acqFut = pool.acquire()
+      pool.release(mockConn(csClosed))
+
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+      doAssert pool.pendingBackgroundTasks.len >= 1
+
+      let closeStart = Moment.now()
+      await pool.close(timeout = milliseconds(100)).wait(seconds(5))
+      let elapsed = Moment.now() - closeStart
+
+      # Must be bounded by timeout (100ms), not the 30s connectTimeout fallback.
+      doAssert elapsed < seconds(1), $elapsed
+      doAssert acqFut.finished
+
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "Pool warmup parallelization":
   test "newPool opens minSize connections in parallel":
     # `newPool` should open all `minSize` connections concurrently (via
