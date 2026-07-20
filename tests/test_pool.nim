@@ -145,6 +145,7 @@ suite "initPoolConfig":
     check cfg.pingTimeout == seconds(5)
     check cfg.acquireTimeout == seconds(30)
     check cfg.maxWaiters == -1
+    check cfg.resetQueryTimeout == seconds(5)
 
   test "custom overrides":
     let cfg = initPoolConfig(
@@ -186,6 +187,12 @@ suite "initPoolConfig":
       discard initPoolConfig(
         ConnConfig(host: "localhost", port: 5432),
         tlsHealthCheckTimeout = milliseconds(-1),
+      )
+
+  test "validation: resetQueryTimeout < 0":
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = milliseconds(-1)
       )
 
   test "tlsHealthCheckTimeout custom override":
@@ -606,6 +613,18 @@ suite "Pool resetSession":
   test "resetQuery defaults to empty":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
     check cfg.resetQuery == ""
+
+  test "resetQueryTimeout field in initPoolConfig":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = milliseconds(200)
+    )
+    check cfg.resetQueryTimeout == milliseconds(200)
+
+  test "resetQueryTimeout ZeroDuration disables the deadline":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = ZeroDuration
+    )
+    check cfg.resetQueryTimeout == ZeroDuration
 
 suite "Pool acquire":
   test "acquire from idle":

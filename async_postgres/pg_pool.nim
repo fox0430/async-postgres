@@ -40,6 +40,12 @@ type
       ## "DEALLOCATE ALL" (clear prepared statements only),
       ## "RESET ALL" (reset session parameters only).
       ## On failure, the connection is discarded.
+    resetQueryTimeout*: Duration
+      ## Deadline for each server round-trip in `resetSession` — covers both
+      ## `pg_advisory_unlock_all` (when session locks are dirty) and
+      ## `resetQuery` (default 5s, ZeroDuration=no timeout). A hung server
+      ## would otherwise stall the release path and starve the pool; on
+      ## timeout the connection is closed and the release proceeds.
     tracer*: PgTracer ## Optional tracer for pool-level hooks (acquire/release)
     pipelined*: bool
       ## Enable implicit query batching for pool.exec/query (default false).
@@ -156,6 +162,7 @@ proc initPoolConfig*(
     acquireTimeout = seconds(30),
     maxWaiters = -1,
     resetQuery = "",
+    resetQueryTimeout = seconds(5),
     pipelined = false,
     maxPipelineSize = 0,
     connectBackoffInitial = seconds(1),
@@ -189,6 +196,8 @@ proc initPoolConfig*(
     raise newException(ValueError, "healthCheckTimeout must be >= 0")
   if tlsHealthCheckTimeout < ZeroDuration:
     raise newException(ValueError, "tlsHealthCheckTimeout must be >= 0")
+  if resetQueryTimeout < ZeroDuration:
+    raise newException(ValueError, "resetQueryTimeout must be >= 0")
 
   PoolConfig(
     connConfig: connConfig,
@@ -203,6 +212,7 @@ proc initPoolConfig*(
     acquireTimeout: acquireTimeout,
     maxWaiters: maxWaiters,
     resetQuery: resetQuery,
+    resetQueryTimeout: resetQueryTimeout,
     pipelined: pipelined,
     maxPipelineSize: maxPipelineSize,
     connectBackoffInitial: connectBackoffInitial,
@@ -317,11 +327,15 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
         t.onLeakedSessionLocks(
           TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
         )
-      discard await conn.simpleExec("SELECT pg_advisory_unlock_all()")
+      discard await conn.simpleExec(
+        "SELECT pg_advisory_unlock_all()", timeout = pool.config.resetQueryTimeout
+      )
       conn.heldSessionLocks = 0
       conn.sessionLockDirty = false
     if pool.config.resetQuery.len > 0:
-      discard await conn.simpleExec(pool.config.resetQuery)
+      discard await conn.simpleExec(
+        pool.config.resetQuery, timeout = pool.config.resetQueryTimeout
+      )
       conn.clearStmtCache()
   except CatchableError:
     try:
