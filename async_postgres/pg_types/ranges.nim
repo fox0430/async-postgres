@@ -70,12 +70,20 @@ proc decodeInt4RangeBinary*(data: openArray[byte]): PgRange[int32] =
   if raw.isEmpty:
     return PgRange[int32](isEmpty: true)
   if raw.hasLower:
+    if raw.lowerLen != 4:
+      raise newException(
+        PgTypeError, "Binary int4range: invalid lower bound length " & $raw.lowerLen
+      )
     result.hasLower = true
     result.lower = PgRangeBound[int32](
       value: fromBE32(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
       inclusive: raw.lowerInc,
     )
   if raw.hasUpper:
+    if raw.upperLen != 4:
+      raise newException(
+        PgTypeError, "Binary int4range: invalid upper bound length " & $raw.upperLen
+      )
     result.hasUpper = true
     result.upper = PgRangeBound[int32](
       value: fromBE32(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
@@ -87,12 +95,20 @@ proc decodeInt8RangeBinary*(data: openArray[byte]): PgRange[int64] =
   if raw.isEmpty:
     return PgRange[int64](isEmpty: true)
   if raw.hasLower:
+    if raw.lowerLen != 8:
+      raise newException(
+        PgTypeError, "Binary int8range: invalid lower bound length " & $raw.lowerLen
+      )
     result.hasLower = true
     result.lower = PgRangeBound[int64](
       value: fromBE64(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
       inclusive: raw.lowerInc,
     )
   if raw.hasUpper:
+    if raw.upperLen != 8:
+      raise newException(
+        PgTypeError, "Binary int8range: invalid upper bound length " & $raw.upperLen
+      )
     result.hasUpper = true
     result.upper = PgRangeBound[int64](
       value: fromBE64(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
@@ -125,12 +141,20 @@ proc decodeTsRangeBinary*(data: openArray[byte]): PgRange[DateTime] =
   if raw.isEmpty:
     return PgRange[DateTime](isEmpty: true)
   if raw.hasLower:
+    if raw.lowerLen != 8:
+      raise newException(
+        PgTypeError, "Binary tsrange: invalid lower bound length " & $raw.lowerLen
+      )
     result.hasLower = true
     result.lower = PgRangeBound[DateTime](
       value: decodeBinaryTimestamp(data.toOpenArray(raw.lowerOff, raw.lowerOff + 7)),
       inclusive: raw.lowerInc,
     )
   if raw.hasUpper:
+    if raw.upperLen != 8:
+      raise newException(
+        PgTypeError, "Binary tsrange: invalid upper bound length " & $raw.upperLen
+      )
     result.hasUpper = true
     result.upper = PgRangeBound[DateTime](
       value: decodeBinaryTimestamp(data.toOpenArray(raw.upperOff, raw.upperOff + 7)),
@@ -142,12 +166,20 @@ proc decodeDateRangeBinary*(data: openArray[byte]): PgRange[DateTime] =
   if raw.isEmpty:
     return PgRange[DateTime](isEmpty: true)
   if raw.hasLower:
+    if raw.lowerLen != 4:
+      raise newException(
+        PgTypeError, "Binary daterange: invalid lower bound length " & $raw.lowerLen
+      )
     result.hasLower = true
     result.lower = PgRangeBound[DateTime](
       value: decodeBinaryDate(data.toOpenArray(raw.lowerOff, raw.lowerOff + 3)),
       inclusive: raw.lowerInc,
     )
   if raw.hasUpper:
+    if raw.upperLen != 4:
+      raise newException(
+        PgTypeError, "Binary daterange: invalid upper bound length " & $raw.upperLen
+      )
     result.hasUpper = true
     result.upper = PgRangeBound[DateTime](
       value: decodeBinaryDate(data.toOpenArray(raw.upperOff, raw.upperOff + 3)),
