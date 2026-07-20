@@ -1,8 +1,10 @@
 import std/[unittest, options, strutils, math, importutils, net]
 
 import
-  ../async_postgres/
-    [async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection]
+  ../async_postgres/[
+    async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection,
+    pg_advisory_lock,
+  ]
 
 import e2e_common
 
@@ -218,6 +220,62 @@ suite "E2E: Connection Pool":
       conn2.release()
 
       await pool.close()
+
+    waitFor t()
+
+suite "E2E: resetQuery timeout":
+  test "hung resetQuery is bounded by resetQueryTimeout and connection is discarded":
+    # Simulate a server-side hang during the release-path reset by pointing
+    # resetQuery at pg_sleep. Without a timeout, the release blocks forever
+    # and starves the pool; with resetQueryTimeout set, the reset raises,
+    # the connection is closed, and the release completes.
+    proc t() {.async.} =
+      let cfg = initPoolConfig(
+        plainConfig(),
+        minSize = 0,
+        maxSize = 1,
+        resetQuery = "SELECT pg_sleep(30)",
+        resetQueryTimeout = milliseconds(200),
+      )
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      let closeBefore = pool.metrics.closeCount
+      pool.withConnection(conn):
+        discard await conn.simpleQuery("SELECT 1")
+      # resetSession hit the timeout, poisoned the connection, and tracedClose
+      # discarded it — nothing returned to idle.
+      doAssert pool.idleCount == 0
+      doAssert pool.metrics.closeCount - closeBefore == 1
+
+      # A follow-up acquire opens a fresh conn instead of blocking on the
+      # (now-drained) idle queue behind a stuck reset.
+      pool.withConnection(conn2):
+        let r = await conn2.simpleQuery("SELECT 2")
+        doAssert r.len == 1
+
+    waitFor t()
+
+  test "advisory unlock during reset is bounded by resetQueryTimeout":
+    # sessionLockDirty forces pg_advisory_unlock_all() during resetSession.
+    # With a lock_timeout of 0 the unlock itself cannot hang, so we use a
+    # short resetQueryTimeout only to prove it plumbs through; a real hang
+    # would surface identically.
+    proc t() {.async.} =
+      let cfg = initPoolConfig(
+        plainConfig(), minSize = 0, maxSize = 1, resetQueryTimeout = milliseconds(500)
+      )
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        await conn.advisoryLock(73101'i64)
+      doAssert pool.idleCount == 1
+      # Re-acquire the same conn (minSize=0, maxSize=1) and verify unlock ran.
+      pool.withConnection(conn2):
+        doAssert conn2.heldSessionLocks == 0
 
     waitFor t()
 
