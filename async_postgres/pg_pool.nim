@@ -40,6 +40,12 @@ type
       ## "DEALLOCATE ALL" (clear prepared statements only),
       ## "RESET ALL" (reset session parameters only).
       ## On failure, the connection is discarded.
+    resetQueryTimeout*: Duration
+      ## Deadline for each server round-trip in `resetSession` — covers both
+      ## `pg_advisory_unlock_all` (when session locks are dirty) and
+      ## `resetQuery` (default 5s, ZeroDuration=no timeout). A hung server
+      ## would otherwise stall the release path and starve the pool; on
+      ## timeout the connection is closed and the release proceeds.
     tracer*: PgTracer ## Optional tracer for pool-level hooks (acquire/release)
     pipelined*: bool
       ## Enable implicit query batching for pool.exec/query (default false).
@@ -104,6 +110,10 @@ type
     kind: PendingOpKind
     sql: string
     params: seq[PgParam]
+    paramsInline: seq[PgParamInline]
+      ## Populated instead of `params` when `hasInline` is true — routes the
+      ## op through the pipeline's / connection's `PgParamInline` fast path.
+    hasInline: bool
     resultFormat: ResultFormat ## Only used for popQuery
     timeout: Duration
     execFut: Future[CommandResult] ## Non-nil for popExec
@@ -156,6 +166,7 @@ proc initPoolConfig*(
     acquireTimeout = seconds(30),
     maxWaiters = -1,
     resetQuery = "",
+    resetQueryTimeout = seconds(5),
     pipelined = false,
     maxPipelineSize = 0,
     connectBackoffInitial = seconds(1),
@@ -189,6 +200,8 @@ proc initPoolConfig*(
     raise newException(ValueError, "healthCheckTimeout must be >= 0")
   if tlsHealthCheckTimeout < ZeroDuration:
     raise newException(ValueError, "tlsHealthCheckTimeout must be >= 0")
+  if resetQueryTimeout < ZeroDuration:
+    raise newException(ValueError, "resetQueryTimeout must be >= 0")
 
   PoolConfig(
     connConfig: connConfig,
@@ -203,6 +216,7 @@ proc initPoolConfig*(
     acquireTimeout: acquireTimeout,
     maxWaiters: maxWaiters,
     resetQuery: resetQuery,
+    resetQueryTimeout: resetQueryTimeout,
     pipelined: pipelined,
     maxPipelineSize: maxPipelineSize,
     connectBackoffInitial: connectBackoffInitial,
@@ -317,11 +331,15 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
         t.onLeakedSessionLocks(
           TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
         )
-      discard await conn.simpleExec("SELECT pg_advisory_unlock_all()")
+      discard await conn.simpleExec(
+        "SELECT pg_advisory_unlock_all()", timeout = pool.config.resetQueryTimeout
+      )
       conn.heldSessionLocks = 0
       conn.sessionLockDirty = false
     if pool.config.resetQuery.len > 0:
-      discard await conn.simpleExec(pool.config.resetQuery)
+      discard await conn.simpleExec(
+        pool.config.resetQuery, timeout = pool.config.resetQueryTimeout
+      )
       conn.clearStmtCache()
   except CatchableError:
     try:
@@ -1097,6 +1115,16 @@ proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
     if not op.queryFut.finished:
       op.queryFut.fail(e)
 
+proc completePendingOp(op: PendingPoolOp, r: CommandResult) =
+  # Caller may have cancelled via `.wait(dur)` before dispatch resolved;
+  # completing a finished future raises FutureDefect and crashes the process.
+  if not op.execFut.finished:
+    op.execFut.complete(r)
+
+proc completePendingOp(op: PendingPoolOp, r: QueryResult) =
+  if not op.queryFut.finished:
+    op.queryFut.complete(r)
+
 proc failAllPending(pool: PgPool, e: ref CatchableError) {.raises: [].} =
   ## Fail every queued op with `e`. Marked `raises: []` so the compiler
   ## proves the loop cannot leak into an `asyncSpawn`ed caller — any future
@@ -1148,24 +1176,26 @@ proc executeBatch(
     for op in batch:
       case op.kind
       of popExec:
-        pipeline.addExec(op.sql, op.params)
+        if op.hasInline:
+          pipeline.addExec(op.sql, op.paramsInline)
+        else:
+          pipeline.addExec(op.sql, op.params)
       of popQuery:
-        pipeline.addQuery(op.sql, op.params, op.resultFormat)
+        if op.hasInline:
+          pipeline.addQuery(op.sql, op.paramsInline, op.resultFormat)
+        else:
+          pipeline.addQuery(op.sql, op.params, op.resultFormat)
     let ir = await pipeline.executeIsolated(timeout)
     for i in 0 ..< batch.len:
       let op = batch[i]
       if ir.errors[i] != nil:
-        case op.kind
-        of popExec:
-          op.execFut.fail(ir.errors[i])
-        of popQuery:
-          op.queryFut.fail(ir.errors[i])
+        failPendingOp(op, ir.errors[i])
       else:
         case op.kind
         of popExec:
-          op.execFut.complete(ir.results[i].commandResult)
+          completePendingOp(op, ir.results[i].commandResult)
         of popQuery:
-          op.queryFut.complete(ir.results[i].queryResult)
+          completePendingOp(op, ir.results[i].queryResult)
   except CatchableError as e:
     for op in batch:
       failPendingOp(op, e)
@@ -1193,13 +1223,26 @@ proc dispatchHomogeneous(
       try:
         case op.kind
         of popExec:
-          let r = await conn.exec(op.sql, op.params, timeout = op.timeout)
-          op.execFut.complete(r)
+          var r: CommandResult
+          if op.hasInline:
+            r = await conn.exec(op.sql, op.paramsInline, timeout = op.timeout)
+          else:
+            r = await conn.exec(op.sql, op.params, timeout = op.timeout)
+          completePendingOp(op, r)
         of popQuery:
-          let r = await conn.query(
-            op.sql, op.params, resultFormat = op.resultFormat, timeout = op.timeout
-          )
-          op.queryFut.complete(r)
+          var r: QueryResult
+          if op.hasInline:
+            r = await conn.query(
+              op.sql,
+              op.paramsInline,
+              resultFormat = op.resultFormat,
+              timeout = op.timeout,
+            )
+          else:
+            r = await conn.query(
+              op.sql, op.params, resultFormat = op.resultFormat, timeout = op.timeout
+            )
+          completePendingOp(op, r)
       finally:
         await pool.resetSession(conn)
         conn.release()
@@ -1343,6 +1386,38 @@ proc exec*(
     await pool.resetSession(conn)
     conn.release()
 
+proc exec*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParamInline],
+    timeout: Duration = ZeroDuration,
+): Future[CommandResult] {.async.} =
+  ## Execute a statement with heap-alloc-free inline parameters using a pooled
+  ## connection. Batches through the pipelined path when `pipelined` is enabled;
+  ## see the `seq[PgParam]` overload for the batch timeout semantics.
+  if pool.config.pipelined:
+    if pool.closed:
+      raise newException(PgPoolError, "Pool is closed")
+    let fut = newFuture[CommandResult]("PgPool.exec.pipelined")
+    pool.pendingOps.addLast(
+      PendingPoolOp(
+        kind: popExec,
+        sql: sql,
+        paramsInline: params,
+        hasInline: true,
+        timeout: timeout,
+        execFut: fut,
+      )
+    )
+    pool.scheduleDispatch()
+    return await fut
+  let conn = await pool.acquire()
+  try:
+    return await conn.exec(sql, params, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
 proc query*(
     pool: PgPool,
     sql: string,
@@ -1367,6 +1442,40 @@ proc query*(
         kind: popQuery,
         sql: sql,
         params: params,
+        resultFormat: resultFormat,
+        timeout: timeout,
+        queryFut: fut,
+      )
+    )
+    pool.scheduleDispatch()
+    return await fut
+  let conn = await pool.acquire()
+  try:
+    return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
+proc query*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParamInline],
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query with heap-alloc-free inline parameters using a pooled
+  ## connection. Batches through the pipelined path when `pipelined` is enabled;
+  ## see the `seq[PgParam]` overload for the batch timeout semantics.
+  if pool.config.pipelined:
+    if pool.closed:
+      raise newException(PgPoolError, "Pool is closed")
+    let fut = newFuture[QueryResult]("PgPool.query.pipelined")
+    pool.pendingOps.addLast(
+      PendingPoolOp(
+        kind: popQuery,
+        sql: sql,
+        paramsInline: params,
+        hasInline: true,
         resultFormat: resultFormat,
         timeout: timeout,
         queryFut: fut,
@@ -1613,6 +1722,22 @@ proc execInTransaction*(
     await pool.resetSession(conn)
     conn.release()
 
+proc execInTransaction*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    opts: TransactionOptions,
+    timeout: Duration = ZeroDuration,
+): Future[CommandResult] {.async.} =
+  ## Execute a statement inside a pipelined transaction with options
+  ## (isolation / access mode / deferrable) applied to the BEGIN.
+  let conn = await pool.acquire()
+  try:
+    return await conn.execInTransaction(sql, params, opts, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
 proc queryInTransaction*(
     pool: PgPool,
     sql: string,
@@ -1624,6 +1749,23 @@ proc queryInTransaction*(
   let conn = await pool.acquire()
   try:
     return await conn.queryInTransaction(sql, params, resultFormat, timeout)
+  finally:
+    await pool.resetSession(conn)
+    conn.release()
+
+proc queryInTransaction*(
+    pool: PgPool,
+    sql: string,
+    params: seq[PgParam] = @[],
+    opts: TransactionOptions,
+    resultFormat: ResultFormat = rfAuto,
+    timeout: Duration = ZeroDuration,
+): Future[QueryResult] {.async.} =
+  ## Execute a query inside a pipelined transaction with options
+  ## (isolation / access mode / deferrable) applied to the BEGIN.
+  let conn = await pool.acquire()
+  try:
+    return await conn.queryInTransaction(sql, params, opts, resultFormat, timeout)
   finally:
     await pool.resetSession(conn)
     conn.release()
@@ -2067,11 +2209,20 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close the pool: stop the maintenance loop, cancel all waiters, and close
   ## all idle and active connections.
   ##
-  ## When `timeout > ZeroDuration`, waits up to `timeout` for active
-  ## connections to be released. Unreleased connections are closed when they
-  ## are eventually returned to the pool. Without a timeout (or
-  ## `ZeroDuration`), active connections are closed on release.
+  ## When `timeout > ZeroDuration`, `timeout` is a single deadline shared by
+  ## both the active-connection drain and the background-task drain. Pending
+  ## background spawns still in flight when the deadline elapses are
+  ## cancelled so close() returns promptly. Without a timeout (or
+  ## `ZeroDuration`), active connections are closed on release and the
+  ## background drain waits unbounded.
   pool.closed = true
+
+  let hasDeadline = timeout > ZeroDuration
+  let closeDeadline =
+    if hasDeadline:
+      Moment.now() + timeout
+    else:
+      Moment.now()
 
   # Stop maintenance loop
   if pool.maintenanceTask != nil and not pool.maintenanceTask.finished:
@@ -2095,10 +2246,9 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     let op = pool.pendingOps.popFirst()
     failPendingOp(op, closeErr)
 
-  # Wait for active connections to drain
-  if timeout > ZeroDuration and pool.active > 0:
-    let deadline = Moment.now() + timeout
-    while pool.active > 0 and Moment.now() < deadline:
+  # Wait for active connections to drain (bounded by closeDeadline)
+  if hasDeadline and pool.active > 0:
+    while pool.active > 0 and Moment.now() < closeDeadline:
       await sleepAsync(milliseconds(50))
 
   # Close all idle connections in parallel. `tracedClose` swallows its own
@@ -2127,11 +2277,22 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   if pool.active > 0:
     await sleepAsync(ZeroDuration)
 
-  # Wait for any fire-and-forget tasks (closeNoWait, spawnConnectForWaiter) so
-  # the server observes Terminate / connects unwind before this proc returns. A
-  # late release() from another task may push more entries while we await, so
-  # loop with snapshot-and-clear to avoid discarding unfinished futures.
+  # Drain fire-and-forget tasks (closeNoWait, spawnConnectForWaiter). Late
+  # release() may push more mid-await; snapshot-and-clear preserves them.
+  # Bounded by closeDeadline: without it, a stuck spawn's connect pins close()
+  # up to `maintenanceInterval` (30s default) past `timeout`.
   while pool.pendingBackgroundTasks.len > 0:
     let pending = pool.pendingBackgroundTasks
     pool.pendingBackgroundTasks.setLen(0)
-    await allFutures(pending)
+    if hasDeadline:
+      let remaining = closeDeadline - Moment.now()
+      if remaining > ZeroDuration:
+        try:
+          await allFutures(pending).wait(remaining)
+        except AsyncTimeoutError:
+          discard
+      for f in pending:
+        if not f.finished:
+          await cancelAndWait(f)
+    else:
+      await allFutures(pending)

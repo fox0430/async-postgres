@@ -1905,6 +1905,44 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pool.execInTransaction with TransactionOptions":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_peit_opts")
+      discard
+        await pool.exec("CREATE TABLE test_peit_opts (id serial PRIMARY KEY, val text)")
+
+      let tag = await pool.execInTransaction(
+        "INSERT INTO test_peit_opts (val) VALUES ($1)",
+        @[toPgParam("serializable")],
+        TransactionOptions(isolation: ilSerializable),
+      )
+      doAssert tag == "INSERT 0 1"
+
+      let res = await pool.query("SELECT val FROM test_peit_opts")
+      doAssert res.rows[0].getStr(0) == "serializable"
+
+      discard await pool.exec("DROP TABLE test_peit_opts")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.queryInTransaction with TransactionOptions":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 3))
+
+      let qr = await pool.queryInTransaction(
+        "SELECT 7::int4", @[], TransactionOptions(isolation: ilRepeatableRead)
+      )
+      doAssert qr.rows.len == 1
+      doAssert qr.rows[0].getStr(0) == "7"
+
+      await pool.close()
+
+    waitFor t()
+
   test "pipeline: multiple exec":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -2147,6 +2185,65 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert conn.pendingStmtCloses.len >= 1
 
       discard await conn.query("DROP TABLE IF EXISTS t_iso_evict")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: execute evicts scsShare entry on 0A000":
+    # scsMiss + DDL + scsShare: DDL invalidates op0's fresh plan, op2's
+    # scsShare Execute fires 0A000. The stale entry op0 added via
+    # addCacheMissOp must be evicted (not just self-heal on next hit).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.query("DROP TABLE IF EXISTS t_share_evict")
+      discard await conn.query("CREATE TABLE t_share_evict(a int4)")
+      discard await conn.query("INSERT INTO t_share_evict VALUES (1)")
+      doAssert not conn.stmtCache.hasKey("SELECT * FROM t_share_evict")
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT * FROM t_share_evict") # scsMiss (op 0)
+      p.addExec("ALTER TABLE t_share_evict ADD COLUMN b int4") # DDL (op 1)
+      p.addQuery("SELECT * FROM t_share_evict") # scsShare, fails 0A000 (op 2)
+      var state = ""
+      try:
+        discard await p.execute()
+      except PgQueryError as e:
+        state = e.sqlState
+      doAssert state == "0A000"
+
+      doAssert not conn.stmtCache.hasKey("SELECT * FROM t_share_evict")
+      doAssert conn.pendingStmtCloses.len >= 1
+
+      discard await conn.query("DROP TABLE IF EXISTS t_share_evict")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated evicts scsShare entry on 0A000":
+    # executeIsolated counterpart: scsMiss adds at its own ReadyForQuery,
+    # DDL invalidates, scsShare Execute fires 0A000 → evict + queue Close.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.query("DROP TABLE IF EXISTS t_iso_share_evict")
+      discard await conn.query("CREATE TABLE t_iso_share_evict(a int4)")
+      discard await conn.query("INSERT INTO t_iso_share_evict VALUES (1)")
+      doAssert not conn.stmtCache.hasKey("SELECT * FROM t_iso_share_evict")
+
+      let p = newPipeline(conn)
+      p.addQuery("SELECT * FROM t_iso_share_evict") # scsMiss
+      p.addExec("ALTER TABLE t_iso_share_evict ADD COLUMN b int4") # DDL
+      p.addQuery("SELECT * FROM t_iso_share_evict") # scsShare, fails 0A000
+      let ir = await p.executeIsolated()
+
+      doAssert ir.errors[0] == nil
+      doAssert ir.errors[1] == nil
+      doAssert ir.errors[2] != nil
+      doAssert (ref PgQueryError)(ir.errors[2]).sqlState == "0A000"
+
+      doAssert not conn.stmtCache.hasKey("SELECT * FROM t_iso_share_evict")
+      doAssert conn.pendingStmtCloses.len >= 1
+
+      discard await conn.query("DROP TABLE IF EXISTS t_iso_share_evict")
       await conn.close()
 
     waitFor t()

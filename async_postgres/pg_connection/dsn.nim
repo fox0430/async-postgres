@@ -40,6 +40,15 @@ proc parseChannelBindingMode*(s: string): ChannelBindingMode =
   else:
     raise newException(PgError, "Invalid channel_binding: " & s)
 
+proc parseSslNegotiation*(s: string): SslNegotiation =
+  case s
+  of "postgres":
+    sslnPostgres
+  of "direct":
+    sslnDirect
+  else:
+    raise newException(PgError, "Invalid sslnegotiation: " & s)
+
 proc parseAuthMethod*(s: string): AuthMethod =
   case s
   of "none":
@@ -174,6 +183,8 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
     result.sslMode = parseSslMode(val)
   of "channel_binding":
     result.channelBinding = parseChannelBindingMode(val)
+  of "sslnegotiation":
+    result.sslNegotiation = parseSslNegotiation(val)
   of "require_auth":
     result.requireAuth = parseRequireAuth(val)
   of "application_name":
@@ -492,6 +503,7 @@ proc initConnConfig*(
     extraParams: seq[(string, string)] = @[],
     maxMessageSize = 0,
     maxScramIterations = 0,
+    sslNegotiation = sslnPostgres,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
@@ -503,6 +515,7 @@ proc initConnConfig*(
     password: password,
     database: database,
     sslMode: sslMode,
+    sslNegotiation: sslNegotiation,
     sslRootCert: sslRootCert,
     sslSni: sslSni,
     channelBinding: channelBinding,

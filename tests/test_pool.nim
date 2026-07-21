@@ -4,11 +4,10 @@ import ../async_postgres/async_backend
 when hasChronos:
   import pkg/chronos/streams/asyncstream
 
-import ../async_postgres/pg_protocol
-import ../async_postgres/pg_connection
+import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_pool {.all.}
 
-import ./mock_pg_server
+import mock_pg_server
 
 privateAccess(PgPool)
 privateAccess(PgConnection)
@@ -146,6 +145,7 @@ suite "initPoolConfig":
     check cfg.pingTimeout == seconds(5)
     check cfg.acquireTimeout == seconds(30)
     check cfg.maxWaiters == -1
+    check cfg.resetQueryTimeout == seconds(5)
 
   test "custom overrides":
     let cfg = initPoolConfig(
@@ -187,6 +187,12 @@ suite "initPoolConfig":
       discard initPoolConfig(
         ConnConfig(host: "localhost", port: 5432),
         tlsHealthCheckTimeout = milliseconds(-1),
+      )
+
+  test "validation: resetQueryTimeout < 0":
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = milliseconds(-1)
       )
 
   test "tlsHealthCheckTimeout custom override":
@@ -303,6 +309,55 @@ suite "splitBatchBudget":
       let (a, b) = splitBatchBudget(3, 5, cap)
       check a >= 1 and b >= 1
       check a + b == cap
+
+suite "PendingPoolOp finish guards":
+  # Dispatch paths must not complete/fail an already-finished future.
+  # Callers cancel via `.wait(dur)` which can leave execFut/queryFut
+  # finished before the pipeline batch resolves.
+
+  proc makeExecOp(): PendingPoolOp =
+    PendingPoolOp(kind: popExec, execFut: newFuture[CommandResult]("test.execFut"))
+
+  proc makeQueryOp(): PendingPoolOp =
+    PendingPoolOp(kind: popQuery, queryFut: newFuture[QueryResult]("test.queryFut"))
+
+  test "completePendingOp is a no-op when exec future already finished":
+    let op = makeExecOp()
+    op.execFut.fail(newException(PgPoolError, "pre-cancelled"))
+    check op.execFut.finished
+    completePendingOp(op, CommandResult(commandTag: "SELECT 0"))
+    check op.execFut.failed
+    expect(PgPoolError):
+      discard op.execFut.read()
+
+  test "completePendingOp is a no-op when query future already finished":
+    let op = makeQueryOp()
+    op.queryFut.fail(newException(PgPoolError, "pre-cancelled"))
+    check op.queryFut.finished
+    completePendingOp(op, QueryResult(commandTag: "SELECT 0"))
+    check op.queryFut.failed
+    expect(PgPoolError):
+      discard op.queryFut.read()
+
+  test "completePendingOp delivers result on unfinished exec future":
+    let op = makeExecOp()
+    completePendingOp(op, CommandResult(commandTag: "INSERT 0 1"))
+    check op.execFut.finished
+    check op.execFut.read().commandTag == "INSERT 0 1"
+
+  test "completePendingOp delivers result on unfinished query future":
+    let op = makeQueryOp()
+    completePendingOp(op, QueryResult(commandTag: "SELECT 1"))
+    check op.queryFut.finished
+    check op.queryFut.read().commandTag == "SELECT 1"
+
+  test "failPendingOp is a no-op when exec future already finished":
+    let first = newException(PgPoolError, "first")
+    let op = makeExecOp()
+    op.execFut.fail(first)
+    failPendingOp(op, newException(PgPoolError, "second"))
+    check op.execFut.failed
+    check op.execFut.readError() == first
 
 suite "checkReady error classification":
   # A-8: a connection that is alive but busy (a single connection used
@@ -558,6 +613,18 @@ suite "Pool resetSession":
   test "resetQuery defaults to empty":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
     check cfg.resetQuery == ""
+
+  test "resetQueryTimeout field in initPoolConfig":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = milliseconds(200)
+    )
+    check cfg.resetQueryTimeout == milliseconds(200)
+
+  test "resetQueryTimeout ZeroDuration disables the deadline":
+    let cfg = initPoolConfig(
+      ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = ZeroDuration
+    )
+    check cfg.resetQueryTimeout == ZeroDuration
 
 suite "Pool acquire":
   test "acquire from idle":
@@ -3297,6 +3364,40 @@ suite "Pool spawn-connect close-race":
       doAssert elapsed < seconds(2), $elapsed
       doAssert acqFut.finished
       doAssert pool.pendingBackgroundTasks.len == 0
+
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "close(timeout) honors its budget when spawn-for-waiter connect stalls":
+    # Regression: close(timeout=100ms) blocked on pendingBackgroundTasks drain
+    # until the spawn's connectTimeout (=maintenanceInterval fallback, default
+    # 30s) elapsed. close() now bounds the drain by its own deadline and
+    # cancels remaining spawns.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = ZeroDuration
+      pool.config.maintenanceInterval = seconds(30) # default; must not gate close
+      pool.active = 1
+
+      let acqFut = pool.acquire()
+      pool.release(mockConn(csClosed))
+
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+      doAssert pool.pendingBackgroundTasks.len >= 1
+
+      let closeStart = Moment.now()
+      await pool.close(timeout = milliseconds(100)).wait(seconds(5))
+      let elapsed = Moment.now() - closeStart
+
+      # Must be bounded by timeout (100ms), not the 30s connectTimeout fallback.
+      doAssert elapsed < seconds(1), $elapsed
+      doAssert acqFut.finished
 
       await closeClient(client)
       await closeServer(ms)

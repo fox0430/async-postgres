@@ -1,8 +1,12 @@
 import std/[unittest, strutils, os]
 
-import ../async_postgres/[async_backend, pg_protocol]
+import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 
 import ../async_postgres/pg_connection {.all.}
+
+when hasChronos:
+  import ../async_postgres/pg_bearssl
+  import bearssl/abi/bearssl_ssl as bssl
 
 proc testCaCert(): string =
   readFile(currentSourcePath().parentDir / "certs" / "ca.crt")
@@ -765,6 +769,186 @@ suite "SSL negotiation - sslDisable":
     check connState == csReady
     check connSslEnabled == false
 
+suite "Direct SSL negotiation":
+  test "sslnegotiation=direct rejects weak sslmode before any bytes are sent":
+    var raised = false
+    var errMentionsDirect = false
+    var bytesFromClient = 0
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        var st: MockClient
+        try:
+          st = await ms.accept()
+        except CatchableError:
+          return
+        try:
+          let data = await readN(st, 1)
+          bytesFromClient = data.len
+        except CatchableError:
+          discard
+        try:
+          await closeClient(st)
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslPrefer,
+        sslNegotiation: sslnDirect,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        errMentionsDirect = "sslnegotiation=direct" in e.msg
+
+      await closeServer(ms)
+      await serverFut
+
+    waitFor testBody()
+    check raised
+    check errMentionsDirect
+    check bytesFromClient == 0
+
+  test "sslnegotiation=direct starts TLS immediately without an SSLRequest":
+    var raised = false
+    var firstByte: int = -1
+    var alpnAdvertised = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        # 5-byte TLS record header: type(1) + version(2) + length(2). Reading
+        # the full record avoids racing packet boundaries under load/MTU splits.
+        try:
+          let header = await readN(st, 5)
+          firstByte = int(header[0])
+          let recordLen = int(fromBE16(header, 3))
+          if recordLen > 0:
+            let body = await readN(st, recordLen)
+            # "postgresql" cannot straddle into the fixed 5-byte record header,
+            # so searching the body alone is equivalent to searching the whole
+            # record (the ALPN extension always lives inside the ClientHello).
+            alpnAdvertised = "postgresql" in readString(body, 0, body.len)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslNegotiation: sslnDirect,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        # The dumb mock cannot complete the TLS handshake, so connect fails after
+        # the ClientHello is observed — exactly what this test inspects.
+        raised = true
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check firstByte == 0x16
+    check alpnAdvertised
+    check raised
+
+  test "sslnegotiation=postgres advertises 'postgresql' ALPN in ClientHello (libpq 17 parity)":
+    var raised = false
+    var alpnAdvertised = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8) # SSLRequest
+          await sendBytes(st, @[byte('S')])
+          # TLS record: type(1) + version(2) + length(2)
+          let header = await readN(st, 5)
+          let recordLen = int(fromBE16(header, 3))
+          if recordLen > 0:
+            let body = await readN(st, recordLen)
+            alpnAdvertised = "postgresql" in readString(body, 0, body.len)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslNegotiation: sslnPostgres,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError:
+        # Mock cannot complete TLS handshake; connect fails after ClientHello.
+        raised = true
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check alpnAdvertised
+    check raised
+
+  test "sslnegotiation=direct with weak sslmode fails once across a multi-host list":
+    var raised = false
+    var errMentionsDirect = false
+    var noAggregateMsg = false
+
+    proc testBody() {.async.} =
+      # Port 1: every dial is refused, so only the pre-loop validate can
+      # produce the error.
+      let config = ConnConfig(
+        host: "127.0.0.1,127.0.0.1,127.0.0.1",
+        port: 1,
+        user: "test",
+        database: "test",
+        sslMode: sslPrefer,
+        sslNegotiation: sslnDirect,
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        errMentionsDirect = "sslnegotiation=direct requires" in e.msg
+        noAggregateMsg = "Could not connect to any host" notin e.msg
+
+    waitFor testBody()
+    check raised
+    check errMentionsDirect
+    check noAggregateMsg
+
 proc sendAuthSasl(client: MockClient, mechanisms: seq[string]): Future[void] {.async.} =
   var body: seq[byte] = @[]
   body.addInt32(10) # AuthenticationSASL
@@ -1189,8 +1373,7 @@ when hasAsyncDispatch and defined(ssl):
   suite "SSL verify-full - enforceVerifyFullIdentity (OpenSSL backend)":
     test "installs the DNS host on the SSL handle":
       resolveX509TestSyms()
-      let getParam = sslGet0Param()
-      if x509GetHostFn == nil or getParam == nil or sslSet1Host() == nil:
+      if x509GetHostFn == nil or sslGet0Param == nil or sslSet1Host == nil:
         skip()
       else:
         let ctx = newContext(verifyMode = CVerifyNone)
@@ -1198,12 +1381,12 @@ when hasAsyncDispatch and defined(ssl):
         doAssert ssl != nil
         try:
           enforceVerifyFullIdentity(ssl, "db.example.com")
-          check $x509GetHostFn(getParam(ssl), 0.cint) == "db.example.com"
+          check $x509GetHostFn(sslGet0Param(ssl), 0.cint) == "db.example.com"
         finally:
           SSL_free(ssl)
 
     test "accepts IP literals without error":
-      if x509VerifyParamSet1IpAsc() == nil:
+      if x509VerifyParamSet1IpAsc == nil:
         skip()
       else:
         let ctx = newContext(verifyMode = CVerifyNone)
@@ -1224,13 +1407,11 @@ when hasAsyncDispatch and defined(ssl):
     test "sslGetRbio / sslGetWbio resolve on this OpenSSL":
       # Universally exported on OpenSSL and BoringSSL; a nil resolver would
       # break the memory-BIO shuttle the handshake driver relies on.
-      check sslGetRbio() != nil
-      check sslGetWbio() != nil
+      check sslGetRbio != nil
+      check sslGetWbio != nil
 
     test "wrapConnectedSocket installs both memory BIOs on the SSL handle":
-      let getRbio = sslGetRbio()
-      let getWbio = sslGetWbio()
-      if getRbio == nil or getWbio == nil:
+      if sslGetRbio == nil or sslGetWbio == nil:
         skip()
       else:
         let sock = newAsyncSocket(buffered = false)
@@ -1238,8 +1419,8 @@ when hasAsyncDispatch and defined(ssl):
         try:
           wrapConnectedSocket(ctx, sock, handshakeAsClient)
           check sock.sslHandle != nil
-          check getRbio(sock.sslHandle) != nil
-          check getWbio(sock.sslHandle) != nil
+          check sslGetRbio(sock.sslHandle) != nil
+          check sslGetWbio(sock.sslHandle) != nil
         finally:
           sock.close()
 
@@ -1294,3 +1475,43 @@ when hasAsyncDispatch and defined(ssl):
       waitFor testBody()
       check peerCertOk
       check serverGotAppByte
+
+when hasChronos:
+  suite "reconnectInPlace X509 capture rebind":
+    test "field-copy alone leaves x509Capture pointers targeting newConn":
+      # X509CertCaptureContext holds raw pointers into the connection that
+      # installed it. reconnectInPlace value-copies the struct from a transient
+      # newConn to conn: pre-fix, both certDer and the engine's x509 slot still
+      # reference newConn's memory. Once newConn is GC'd the next TLS I/O
+      # follows dangling pointers.
+      var conn = PgConnection(serverCertDer: newSeq[byte](0))
+      var newConn = PgConnection(serverCertDer: @[byte 0xAA, 0xBB])
+      var eng: bssl.SslEngineContext
+
+      installX509Capture(newConn.x509Capture, eng, addr newConn.serverCertDer)
+      let newVtableAddr = cast[uint](addr newConn.x509Capture.vtable)
+
+      conn.x509Capture = newConn.x509Capture
+      conn.serverCertDer = newConn.serverCertDer
+
+      check conn.x509Capture.certDer == addr newConn.serverCertDer
+      check conn.x509Capture.certDer != addr conn.serverCertDer
+      check cast[uint](eng.x509ctx) == newVtableAddr
+      check cast[uint](eng.x509ctx) != cast[uint](addr conn.x509Capture.vtable)
+
+    test "rebindX509Capture repoints certDer and engine slot at conn":
+      var conn = PgConnection(serverCertDer: newSeq[byte](0))
+      var newConn = PgConnection(serverCertDer: @[byte 0xAA, 0xBB])
+      var eng: bssl.SslEngineContext
+
+      installX509Capture(newConn.x509Capture, eng, addr newConn.serverCertDer)
+      conn.x509Capture = newConn.x509Capture
+      conn.serverCertDer = newConn.serverCertDer
+
+      rebindX509Capture(conn.x509Capture, eng, addr conn.serverCertDer)
+
+      check conn.x509Capture.certDer == addr conn.serverCertDer
+      check cast[uint](eng.x509ctx) == cast[uint](addr conn.x509Capture.vtable)
+      # `inner` still routes into the shared default validator (untouched by
+      # rebind), so cert-chain delegation keeps working.
+      check conn.x509Capture.inner == newConn.x509Capture.inner

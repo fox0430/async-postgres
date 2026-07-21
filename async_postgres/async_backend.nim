@@ -13,6 +13,11 @@ const hasAsyncDispatch* = asyncBackend == "asyncdispatch"
 const hasChronos* = asyncBackend == "chronos"
   ## `true` when the chronos backend is selected.
 
+const hasTls* = hasChronos or (hasAsyncDispatch and defined(ssl))
+  ## `true` when the selected backend can perform TLS. Gates every symbol
+  ## whose definition depends on backend TLS APIs; keeping this in one place
+  ## prevents drift between call sites and their `when` guards.
+
 when hasChronos:
   import chronos
   export chronos
@@ -113,11 +118,6 @@ elif hasAsyncDispatch:
   proc `==`*(a, b: Duration): bool {.borrow.}
   proc `<`*(a, b: Duration): bool {.borrow.}
   proc `<=`*(a, b: Duration): bool {.borrow.}
-  proc `>`*(a, b: Duration): bool =
-    int64(a) > int64(b)
-
-  proc `>=`*(a, b: Duration): bool =
-    int64(a) >= int64(b)
 
   proc `-`*(a, b: Duration): Duration {.borrow.}
   proc `+`*(a, b: Duration): Duration {.borrow.}
@@ -153,17 +153,11 @@ elif hasAsyncDispatch:
   proc `+`*(a: Moment, b: Duration): Moment =
     Moment(ticks: a.ticks + int64(b))
 
-  proc `>=`*(a, b: Moment): bool =
-    a.ticks >= b.ticks
-
   proc `<=`*(a, b: Moment): bool =
     a.ticks <= b.ticks
 
   proc `<`*(a, b: Moment): bool =
     a.ticks < b.ticks
-
-  proc `>`*(a, b: Moment): bool =
-    a.ticks > b.ticks
 
   proc wait*[T](
       fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.} = nil

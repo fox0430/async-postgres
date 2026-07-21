@@ -455,12 +455,10 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
                     results[activeOpIdx].queryResult.fields[j].formatCode = cf[j]
               else:
                 results[activeOpIdx].queryResult.fields = msg.fields
-                # scsShare: this op skipped Describe(Statement) but still
-                # emitted Describe(Portal), so msg.fields' formatCode/typeOid
-                # reflect this op's Bind. Mirror into RowData so binary
-                # decoders (isBinaryCol/colTypeOid) see the right metadata —
-                # otherwise binary results would be misread as text.
-                if p.ops[activeOpIdx].cache == scsShare:
+                # scsShare/scsUncached emit Describe(Portal), so msg.fields'
+                # formatCode/typeOid reflect this op's Bind — mirror into
+                # RowData or binary decoders read as text.
+                if p.ops[activeOpIdx].cache in {scsShare, scsUncached}:
                   cf = newSeq[int16](msg.fields.len)
                   co = newSeq[int32](msg.fields.len)
                   for j in 0 ..< msg.fields.len:
@@ -522,9 +520,11 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
               # Close along on the next operation so a still-live statement
               # (0A000) is reclaimed instead of leaked; Close of an already-gone
               # statement (26000) is a harmless no-op. See
-              # StmtCacheInvalidatingStates.
+              # StmtCacheInvalidatingStates. scsShare shares the sql/stmtName of
+              # an earlier scsMiss whose entry addCacheMissOp just added above.
               if queryError.sqlState in StmtCacheInvalidatingStates and
-                  activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsHit:
+                  activeOpIdx < p.ops.len and
+                  p.ops[activeOpIdx].cache in {scsHit, scsShare}:
                 conn.pendingStmtCloses.add(p.ops[activeOpIdx].stmtName)
                 conn.removeStmtCache(p.ops[activeOpIdx].sql)
               raise queryError
@@ -640,11 +640,11 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                   rowCount = addr results[opIdx].queryResult.rowCount
                 else:
                   results[opIdx].queryResult.fields = msg.fields
-                  # scsShare: mirror Describe(Portal)'s formatCode/typeOid
-                  # into RowData so binary decoders see the right metadata.
+                  # scsShare/scsUncached emit Describe(Portal); mirror
+                  # msg.fields into RowData or binary decoders read as text.
                   var cf: seq[int16]
                   var co: seq[int32]
-                  if p.ops[opIdx].cache == scsShare:
+                  if p.ops[opIdx].cache in {scsShare, scsUncached}:
                     cf = newSeq[int16](msg.fields.len)
                     co = newSeq[int32](msg.fields.len)
                     for j in 0 ..< msg.fields.len:
@@ -672,9 +672,11 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
               conn.txStatus = msg.txStatus
               if opError != nil:
                 if opError.sqlState in StmtCacheInvalidatingStates and
-                    p.ops[opIdx].cache == scsHit:
+                    p.ops[opIdx].cache in {scsHit, scsShare}:
                   # Mirror executeImpl: ride a Close along so 0A000 doesn't
-                  # leak the still-live server statement.
+                  # leak the still-live server statement. For scsShare, the
+                  # sharing scsMiss already added the entry at its own
+                  # ReadyForQuery.
                   conn.pendingStmtCloses.add(p.ops[opIdx].stmtName)
                   conn.removeStmtCache(p.ops[opIdx].sql)
                 errors[opIdx] = opError
