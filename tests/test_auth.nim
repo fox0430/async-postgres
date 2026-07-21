@@ -469,3 +469,21 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     let cert2 =
       syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C])
     check computeTlsServerEndpoint(cert1) != computeTlsServerEndpoint(cert2)
+
+  test "computeTlsServerEndpoint safely rejects 4-byte DER length with high bit set":
+    # Outer SEQUENCE with 4-byte length 0xFFFFFFFF. On 32-bit int platforms the
+    # naive `int` accumulator in derReadLen shifted into the sign bit (UB), and
+    # a length near 2**31 would wrap negative. Must fall back to SHA-256 with
+    # no crash and no out-of-bounds read regardless of int width.
+    let malformed = @[byte 0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF]
+    let binding = computeTlsServerEndpoint(malformed)
+    check binding.len == 32
+    check binding == @(sha256.digest(malformed).data)
+
+  test "computeTlsServerEndpoint safely rejects 4-byte DER length at 2**31":
+    # Length exactly 0x80000000 — the sign-bit boundary that previously turned
+    # negative via signed-shift UB on 32-bit int builds.
+    let malformed = @[byte 0x30, 0x84, 0x80, 0x00, 0x00, 0x00]
+    let binding = computeTlsServerEndpoint(malformed)
+    check binding.len == 32
+    check binding == @(sha256.digest(malformed).data)
