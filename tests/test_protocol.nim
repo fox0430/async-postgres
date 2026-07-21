@@ -1,6 +1,6 @@
 import std/[unittest, options, strutils, tables, importutils]
 
-import ../async_postgres/[async_backend, pg_protocol, pg_connection]
+import ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection]
 import ../async_postgres/pg_types/[core, encoding]
 
 privateAccess(PgConnection)
@@ -134,6 +134,63 @@ suite "Byte helpers":
     let buf = @[byte('h'), byte('i')]
     expect(PgProtocolError):
       discard decodeCString(buf, 0)
+
+  test "readString/readBytes copy the requested slice":
+    let src = @[byte('a'), byte('b'), byte('c'), byte('d')]
+    check readString(src, 1, 2) == "bc"
+    check readBytes(src, 0, 4) == src
+    check readString(src, 4, 0) == ""
+    check readBytes(src, 0, 0).len == 0
+
+  test "readString rejects negative len instead of newString(-1) Defect":
+    let src = @[byte('a')]
+    expect(PgProtocolError):
+      discard readString(src, 0, -1)
+
+  test "readBytes rejects negative len instead of newSeq(-1) Defect":
+    let src = @[byte('a')]
+    expect(PgProtocolError):
+      discard readBytes(src, 0, -1)
+
+  test "readString/readBytes reject out-of-range slice":
+    let src = @[byte('a'), byte('b'), byte('c')]
+    expect(PgProtocolError):
+      discard readString(src, 2, 2)
+    expect(PgProtocolError):
+      discard readBytes(src, 2, 2)
+    expect(PgProtocolError):
+      discard readString(src, -1, 1)
+    expect(PgProtocolError):
+      discard readBytes(src, -1, 1)
+
+  test "readString/readBytes handle len=0 with off at buffer end":
+    let src = @[byte('a'), byte('b')]
+    check readString(src, 2, 0) == ""
+    check readBytes(src, 2, 0).len == 0
+
+  test "writeBytesAt copies into dst":
+    var dst = newSeq[byte](4)
+    let src = @[byte('x'), byte('y')]
+    dst.writeBytesAt(1, src)
+    check dst == @[0'u8, byte('x'), byte('y'), 0'u8]
+
+  test "writeBytesAt no-op on empty src":
+    var dst = newSeq[byte](2)
+    let src: seq[byte] = @[]
+    dst.writeBytesAt(2, src)
+    check dst == @[0'u8, 0'u8]
+
+  test "writeBytesAt rejects out-of-range slice":
+    var dst = newSeq[byte](2)
+    let src3 = @[byte('x'), byte('y'), byte('z')]
+    let src2 = @[byte('x'), byte('y')]
+    let src1 = @[byte('x')]
+    expect(PgProtocolError):
+      dst.writeBytesAt(0, src3)
+    expect(PgProtocolError):
+      dst.writeBytesAt(1, src2)
+    expect(PgProtocolError):
+      dst.writeBytesAt(-1, src1)
 
 suite "Frontend encoding":
   test "encodeStartup - no type byte, version 3.0":
