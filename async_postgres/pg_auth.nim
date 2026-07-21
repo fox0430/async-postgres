@@ -217,11 +217,15 @@ proc derReadLen(data: openArray[byte], pos: var int): int =
   let n = int(first and 0x7F)
   if n == 0 or n > 4 or pos + n > data.len:
     return -1
-  var v = 0
+  # Accumulate as uint32 to avoid signed-shift UB and to represent full
+  # 4-byte DER lengths on 32-bit int platforms.
+  var v: uint32 = 0
   for i in 0 ..< n:
-    v = (v shl 8) or int(data[pos + i])
+    v = (v shl 8) or uint32(data[pos + i])
   pos += n
-  return v
+  if v > uint32(high(int)):
+    return -1
+  return int(v)
 
 proc certSignatureOid(certDer: openArray[byte]): seq[byte] =
   ## Extract signatureAlgorithm OID from an X.509 DER cert; @[] on parse failure.
