@@ -509,6 +509,12 @@ template writeTimeAt(buf: var openArray[byte], pos: int, val: PgTime) =
 template writeTimeTzAt(buf: var openArray[byte], pos: int, val: PgTimeTz) =
   block:
     let t = val
+    # Negating int32.low overflows int32 (uncatchable OverflowDefect). Mirrors
+    # the decoder's guard in decodeBinaryTimeTz.
+    if t.utcOffset == int32.low:
+      raise newException(
+        PgTypeError, "Invalid PgTimeTz: utcOffset out of range " & $t.utcOffset
+      )
     buf.writeBE64(pos, pgTimeFieldsMicros(t.hour, t.minute, t.second, t.microsecond))
     buf.writeBE32(pos + 8, int32(-t.utcOffset)) # PostgreSQL stores offset negated
 
@@ -816,6 +822,19 @@ proc toPgBinaryParam*(v: PgXml): PgParam =
 
 proc toPgBinaryParam*(v: PgBit): PgParam =
   ## Binary format: 4-byte bit count (big-endian) + packed bit data.
+  # Symmetric with the decoder guards in accessors.nim (getBit / bit array).
+  if v.nbits < 0:
+    raise newException(PgTypeError, "Invalid PgBit: negative nbits " & $v.nbits)
+  if v.nbits > PgBitMaxBits:
+    raise newException(
+      PgTypeError,
+      "Invalid PgBit: nbits " & $v.nbits & " exceeds limit (" & $PgBitMaxBits & ")",
+    )
+  if (int64(v.nbits) + 7) div 8 != int64(v.data.len):
+    raise newException(
+      PgTypeError,
+      "Invalid PgBit: nbits=" & $v.nbits & " inconsistent with data.len=" & $v.data.len,
+    )
   var data = newSeq[byte](4 + v.data.len)
   data.writeBE32(0, v.nbits)
   for i in 0 ..< v.data.len:
