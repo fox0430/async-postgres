@@ -847,6 +847,12 @@ suite "PgTimeTz":
     let row = @[none(seq[byte])]
     check row.getTimeTzOpt(0).isNone
 
+  test "toPgBinaryParam PgTimeTz rejects int32.low utcOffset":
+    # Negating int32.low would overflow int32 in the encoder.
+    let t = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: int32.low)
+    expect PgTypeError:
+      discard toPgBinaryParam(t)
+
 suite "date parameter encoding":
   test "toPgDateParam OID and format":
     let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
@@ -6342,6 +6348,26 @@ suite "PgBit":
     # nbits = 3 in big-endian
     check data[0 .. 3] == @[0'u8, 0, 0, 3]
     check data[4] == 0b10100000'u8
+
+  test "toPgBinaryParam PgBit rejects negative nbits":
+    let b = PgBit(nbits: -1, data: @[0'u8])
+    expect PgTypeError:
+      discard toPgBinaryParam(b)
+
+  test "toPgBinaryParam PgBit rejects nbits above limit":
+    let b = PgBit(nbits: PgBitMaxBits + 1, data: @[])
+    expect PgTypeError:
+      discard toPgBinaryParam(b)
+
+  test "toPgBinaryParam PgBit rejects nbits/data.len mismatch":
+    # nbits=8 requires exactly 1 packed byte; supplying 2 must be rejected.
+    let b = PgBit(nbits: 8, data: @[0'u8, 0'u8])
+    expect PgTypeError:
+      discard toPgBinaryParam(b)
+    # nbits=3 requires 1 byte; supplying 0 must also be rejected.
+    let b2 = PgBit(nbits: 3, data: @[])
+    expect PgTypeError:
+      discard toPgBinaryParam(b2)
 
   test "getBit text format":
     let data = toBytes("10110011")
