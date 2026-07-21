@@ -204,7 +204,8 @@ proc listenPump*(conn: PgConnection) {.async.} =
       # can leak it true and mislead the next `stopListening`.
       try:
         let maxAttempts = conn.listenReconnectMaxAttempts
-        let maxBackoff = max(1, conn.listenReconnectMaxBackoff)
+        # Cap so `backoff * 1000` and `backoff * 2` below cannot overflow int.
+        let maxBackoff = clamp(conn.listenReconnectMaxBackoff, 1, high(int) div 1000)
         let unlimited = maxAttempts <= 0
         var reconnected = false
         var backoff = 1
