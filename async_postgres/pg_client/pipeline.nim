@@ -520,9 +520,11 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
               # Close along on the next operation so a still-live statement
               # (0A000) is reclaimed instead of leaked; Close of an already-gone
               # statement (26000) is a harmless no-op. See
-              # StmtCacheInvalidatingStates.
+              # StmtCacheInvalidatingStates. scsShare shares the sql/stmtName of
+              # an earlier scsMiss whose entry addCacheMissOp just added above.
               if queryError.sqlState in StmtCacheInvalidatingStates and
-                  activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsHit:
+                  activeOpIdx < p.ops.len and
+                  p.ops[activeOpIdx].cache in {scsHit, scsShare}:
                 conn.pendingStmtCloses.add(p.ops[activeOpIdx].stmtName)
                 conn.removeStmtCache(p.ops[activeOpIdx].sql)
               raise queryError
@@ -670,9 +672,11 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
               conn.txStatus = msg.txStatus
               if opError != nil:
                 if opError.sqlState in StmtCacheInvalidatingStates and
-                    p.ops[opIdx].cache == scsHit:
+                    p.ops[opIdx].cache in {scsHit, scsShare}:
                   # Mirror executeImpl: ride a Close along so 0A000 doesn't
-                  # leak the still-live server statement.
+                  # leak the still-live server statement. For scsShare, the
+                  # sharing scsMiss already added the entry at its own
+                  # ReadyForQuery.
                   conn.pendingStmtCloses.add(p.ops[opIdx].stmtName)
                   conn.removeStmtCache(p.ops[opIdx].sql)
                 errors[opIdx] = opError
