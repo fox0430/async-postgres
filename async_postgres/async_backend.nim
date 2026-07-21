@@ -13,6 +13,11 @@ const hasAsyncDispatch* = asyncBackend == "asyncdispatch"
 const hasChronos* = asyncBackend == "chronos"
   ## `true` when the chronos backend is selected.
 
+const hasTls* = hasChronos or (hasAsyncDispatch and defined(ssl))
+  ## `true` when the selected backend can perform TLS. Gates every symbol
+  ## whose definition depends on backend TLS APIs; keeping this in one place
+  ## prevents drift between call sites and their `when` guards.
+
 when hasChronos:
   import chronos
   export chronos
