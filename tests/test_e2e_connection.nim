@@ -149,6 +149,45 @@ suite "E2E: SSL Connection":
 
     waitFor t()
 
+  test "sslnegotiation=direct connects, negotiates ALPN, and queries (PG17+)":
+    # Exercises the direct-SSL success path against a real server: no
+    # SSLRequest probe is sent, the ClientHello advertises the "postgresql"
+    # ALPN, and the server must both accept the immediate TLS start and
+    # select that ALPN — otherwise assertAlpnPostgres raises.
+    proc t() {.async.} =
+      var cfg = sslConfig(sslRequire)
+      cfg.sslNegotiation = sslnDirect
+      let conn = await connect(cfg)
+      doAssert conn.state == csReady
+      doAssert conn.sslEnabled == true
+      let results = await conn.simpleQuery("SELECT 42 AS answer")
+      doAssert results[0].rows[0][0].get().toString() == "42"
+      await conn.close()
+
+    waitFor t()
+
+  test "sslnegotiation=direct with sslVerifyFull succeeds against configured CA":
+    # Combines direct SSL with verify-full: SNI/host identity must be
+    # verified on the same TLS session that starts without an SSLRequest.
+    proc t() {.async.} =
+      let conn = await connect(
+        ConnConfig(
+          host: "localhost",
+          port: PgPort,
+          user: PgUser,
+          password: PgPassword,
+          database: PgDatabase,
+          sslMode: sslVerifyFull,
+          sslNegotiation: sslnDirect,
+          sslRootCert: loadCaCert(),
+        )
+      )
+      doAssert conn.state == csReady
+      doAssert conn.sslEnabled == true
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: SSL Verification":
   test "sslVerifyCa connects with CA verification":
     proc t() {.async.} =
