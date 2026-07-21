@@ -5,7 +5,7 @@ import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 
 when hasChronos:
-  import ../async_postgres/pg_bearssl
+  import ../async_postgres/pg_bearssl {.all.}
   import bearssl/abi/bearssl_ssl as bssl
 
 proc testCaCert(): string =
@@ -1515,3 +1515,63 @@ when hasChronos:
       # `inner` still routes into the shared default validator (untouched by
       # rebind), so cert-chain delegation keeps working.
       check conn.x509Capture.inner == newConn.x509Capture.inner
+
+when hasChronos:
+  suite "parseTrustAnchors - malformed PEM input":
+    test "empty CERTIFICATE block alone raises PgError, not IndexDefect":
+      const pem = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+      expect PgError:
+        discard parseTrustAnchors(pem)
+
+    test "empty CERTIFICATE block mixed with a valid CA yields the valid anchor":
+      const emptyBlock = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+      let mixed = emptyBlock & testCaCert()
+      let parsed = parseTrustAnchors(mixed)
+      check parsed.backing.len > 0
+
+    test "valid CA followed by empty CERTIFICATE block yields the valid anchor":
+      const emptyBlock = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+      let mixed = testCaCert() & emptyBlock
+      let parsed = parseTrustAnchors(mixed)
+      check parsed.backing.len > 0
+
+    test "PEM with only non-CERTIFICATE blocks raises PgError":
+      const pem =
+        "-----BEGIN PRIVATE KEY-----\n" &
+        "MC4CAQAwBQYDK2VwBCIEIN+NLDLNCHmoBpZm5oR0MpsHtL9tS1kYtL9x9wxTx9ZM\n" &
+        "-----END PRIVATE KEY-----\n"
+      expect PgError:
+        discard parseTrustAnchors(pem)
+
+    test "CERTIFICATE block with garbage body is skipped, not crashed":
+      # Garbage DER hits the decoder-error path (safe pre-fix); regression guard.
+      const pem =
+        "-----BEGIN CERTIFICATE-----\n" & "QUFBQQ==\n" & "-----END CERTIFICATE-----\n"
+      expect PgError:
+        discard parseTrustAnchors(pem)
+
+  suite "cdecl callback len guards":
+    test "appendDnCallback appends normal-size chunks":
+      var buf: seq[byte]
+      let src = @[byte 0xAA, 0xBB, 0xCC]
+      appendDnCallback(
+        cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), csize_t(src.len)
+      )
+      check buf == src
+
+    test "appendDnCallback ignores len > high(int) instead of RangeDefect":
+      var buf: seq[byte]
+      let src = @[byte 0x11]
+      let hugeLen = csize_t(high(int)) + csize_t(1)
+      appendDnCallback(
+        cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), hugeLen
+      )
+      check buf.len == 0
+
+    test "appendDnCallback handles csize_t.high":
+      var buf: seq[byte]
+      let src = @[byte 0x22]
+      appendDnCallback(
+        cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), csize_t.high
+      )
+      check buf.len == 0
