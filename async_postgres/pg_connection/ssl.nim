@@ -16,7 +16,7 @@
 ## Re-exported through `pg_connection.nim`.
 
 import std/[net, strutils]
-import ../[async_backend, pg_errors, pg_protocol]
+import ../[async_backend, pg_errors, pg_protocol, pg_types]
 import types, buffer_io
 
 when hasChronos:
@@ -27,7 +27,7 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[dynlib, openssl, tempfiles, os]
 
-when hasChronos or (hasAsyncDispatch and defined(ssl)):
+when hasTls:
   const PgAlpnProtocol = "postgresql"
     ## ALPN protocol name required for `sslnegotiation=direct` (PostgreSQL 17+).
 
@@ -35,7 +35,6 @@ when hasAsyncDispatch and defined(ssl):
   const PgAlpnWire = char(PgAlpnProtocol.len) & PgAlpnProtocol
     ## Length-prefixed wire form for `SSL_CTX_set_alpn_protos` (RFC 7301 §3.1).
 
-when hasAsyncDispatch and defined(ssl):
   # On asyncdispatch `conn.socket` is an `AsyncSocket`, so `wrapConnectedSocket`
   # resolves to `std/asyncnet`'s overload, which only sets SNI — it never matches
   # the certificate against the host (unlike `std/net`'s) and defers the
@@ -225,7 +224,7 @@ proc validateDirectSslCompatible*(config: ConnConfig) {.raises: [PgConnectionErr
       "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
     )
 
-when hasChronos or (hasAsyncDispatch and defined(ssl)):
+when hasTls:
   proc assertAlpnPostgres(selected: string) {.raises: [PgConnectionError].} =
     if selected.len == 0:
       raise newException(
@@ -255,13 +254,13 @@ proc sniName*(sslHost: string, sslSni: bool): string =
     return ""
   sslHost
 
-proc establishTls(conn: PgConnection, sslHost: string, direct: bool) {.async.} =
-  ## Run the TLS handshake and wire up the encrypted reader/writer. `direct=true`
-  ## enforces the "postgresql" ALPN selection (libpq `sslnegotiation=direct`,
-  ## PostgreSQL 17+). Reads TLS parameters from `conn.config`.
-  # Alias, not a copy: an async closure would deep-copy a `let config = ...`.
-  template config(): ConnConfig =
-    conn.config
+proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
+  ## Run the TLS handshake and wire up the encrypted reader/writer. Under
+  ## `sslnegotiation=direct` (PG17+) the "postgresql" ALPN selection is
+  ## enforced. `config` is the source of truth for every TLS parameter — do
+  ## not read `conn.config` here, so callers can rewrite it (e.g. sslAllow)
+  ## without silently downgrading the handshake.
+  let direct = config.sslNegotiation == sslnDirect
 
   when hasChronos:
     conn.baseReader = newAsyncStreamReader(conn.transport)
@@ -370,9 +369,7 @@ proc establishTls(conn: PgConnection, sslHost: string, direct: bool) {.async.} =
           try:
             let derStr = i2d_X509(peerCert)
             if derStr.len > 0:
-              conn.serverCertDer = newSeq[byte](derStr.len)
-              for i in 0 ..< derStr.len:
-                conn.serverCertDer[i] = byte(derStr[i])
+              conn.serverCertDer = toBytes(derStr)
             else:
               stderr.writeLine "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
           finally:
@@ -413,7 +410,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     )
 
   if config.sslNegotiation == sslnDirect:
-    await establishTls(conn, sslHost, direct = true)
+    await establishTls(conn, config, sslHost)
     return
 
   let sslReq = encodeSSLRequest()
@@ -461,7 +458,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         PgConnectionError,
         "Received unencrypted data after SSL response (possible man-in-the-middle)",
       )
-    await establishTls(conn, sslHost, direct = false)
+    await establishTls(conn, config, sslHost)
   of 'N':
     if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
       raise newException(PgConnectionError, "Server does not support SSL")

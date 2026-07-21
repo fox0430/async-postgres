@@ -835,7 +835,7 @@ suite "Direct SSL negotiation":
         try:
           let header = await readN(st, 5)
           firstByte = int(header[0])
-          let recordLen = (int(header[3]) shl 8) or int(header[4])
+          let recordLen = int(fromBE16(header, 3))
           if recordLen > 0:
             let body = await readN(st, recordLen)
             # "postgresql" cannot straddle into the fixed 5-byte record header,
@@ -887,7 +887,7 @@ suite "Direct SSL negotiation":
           await sendBytes(st, @[byte('S')])
           # TLS record: type(1) + version(2) + length(2)
           let header = await readN(st, 5)
-          let recordLen = (int(header[3]) shl 8) or int(header[4])
+          let recordLen = int(fromBE16(header, 3))
           if recordLen > 0:
             let body = await readN(st, recordLen)
             alpnAdvertised = "postgresql" in readString(body, 0, body.len)
@@ -926,10 +926,8 @@ suite "Direct SSL negotiation":
     var noAggregateMsg = false
 
     proc testBody() {.async.} =
-      # Three hosts on port 1 (guaranteed refused). A per-host validate would
-      # append the identical config error three times; the pre-loop validate
-      # surfaces it once as a raw PgConnectionError, not the "Could not connect
-      # to any host: h1: ...; h2: ...; h3: ..." aggregate.
+      # Port 1: every dial is refused, so only the pre-loop validate can
+      # produce the error.
       let config = ConnConfig(
         host: "127.0.0.1,127.0.0.1,127.0.0.1",
         port: 1,

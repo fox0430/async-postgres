@@ -132,10 +132,8 @@ proc connectToHost*(
   ## Dials `entry.hostaddr` when given (bypassing name resolution), otherwise
   ## `entry.host`; SSL certificate verification always uses `entry.host`.
 
-  # Preflight up front so the sslAllow rewrite below (which mutates sslMode to
-  # sslDisable) cannot mask the sslnDirect intent. `connect` also validates
-  # before the failover loop so this is a no-op there; direct callers of
-  # `connectToHost` still benefit.
+  # Validate before the sslAllow branch rewrites sslMode to sslDisable, which
+  # would mask an sslnDirect conflict.
   validateDirectSslCompatible(config)
 
   if config.sslMode == sslAllow:
@@ -174,9 +172,6 @@ proc connectToHost*(
   let hostAddr = entry.dialAddr
   let hostPort = entry.port
   let isUnix = isUnixSocket(hostAddr)
-  # sslnegotiation is ignored for Unix-domain sockets (libpq 17: AF_UNIX forces
-  # plaintext regardless). The `not isUnix` guard on `negotiateSSL` below
-  # implements that; no early hard-fail here.
 
   var conn: PgConnection
 
@@ -268,10 +263,10 @@ proc connectToHost*(
     )
 
   try:
-    # SSL negotiation (before StartupMessage) — skip for Unix sockets.
-    # Certificate verification must use the host *name*, never the dialed
-    # hostaddr, and must be per-entry: with multi-host failover config.host
-    # only reflects the first entry.
+    # SSL negotiation (before StartupMessage). Unix sockets skip it (libpq 17
+    # parity: sslnegotiation is ignored for AF_UNIX). Certificate verification
+    # must use the host *name*, never the dialed hostaddr, and must be per-entry:
+    # with multi-host failover config.host only reflects the first entry.
     if config.sslMode != sslDisable and not isUnix:
       await negotiateSSL(conn, config, entry.host)
 
@@ -593,7 +588,10 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     # `hosts` is already ordered by the caller (shuffled under lbhRandom), so
     # both the preferStandby two-pass loop and the single-pass loop below share
     # one order.
-    # Host-independent config errors are surfaced once, not aggregated per host.
+    # Reject sslnDirect + weak sslmode once — a per-host check would repeat the
+    # identical error across the aggregate. Other host-independent SSL errors
+    # (missing sslrootcert, verify-full without a host name) are still raised
+    # from negotiateSSL and folded per host.
     validateDirectSslCompatible(config)
     var errors: seq[string]
     # With a single host there is no failover. Preserve the contract that its
