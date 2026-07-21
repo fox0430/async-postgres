@@ -58,36 +58,28 @@ when hasAsyncDispatch and defined(ssl):
     .}
 
   # Apple's system libssl/libcrypto omit some of these symbols; an eager
-  # `{.dynlib.}` binding would abort the process at startup. Resolve lazily and
-  # let callers handle nil.
-  template defineLazySym(
-      procName: untyped, FnType: typedesc, libPattern: string, symbol: string
-  ) =
-    var
-      cachedFn {.global.}: FnType
-      resolved {.global.}: bool
-    proc procName*(): FnType =
-      if not resolved:
-        let lib = loadLibPattern(libPattern)
-        if lib != nil:
-          cachedFn = cast[FnType](symAddr(lib, symbol))
-        resolved = true
-      cachedFn
+  # `{.dynlib.}` binding would abort the process at startup. Resolve via
+  # `symAddr` (nil when missing) and let callers handle nil. Resolution runs at
+  # module init, before user threads can exist, so no synchronization is needed.
+  proc resolveSym(lib: LibHandle, symbol: string): pointer =
+    if lib == nil:
+      nil
+    else:
+      symAddr(lib, symbol)
 
-  defineLazySym(sslSet1Host, SslSet1HostFn, DLLSSLName, "SSL_set1_host")
-  defineLazySym(sslGet0Param, SslGet0ParamFn, DLLSSLName, "SSL_get0_param")
-  defineLazySym(
-    x509VerifyParamSet1IpAsc, X509SetIpAscFn, DLLUtilName,
-    "X509_VERIFY_PARAM_set1_ip_asc",
-  )
-  defineLazySym(sslGetRbio, SslGetBioFn, DLLSSLName, "SSL_get_rbio")
-  defineLazySym(sslGetWbio, SslGetBioFn, DLLSSLName, "SSL_get_wbio")
-  defineLazySym(
-    sslGet0AlpnSelected, SslGet0AlpnSelectedFn, DLLSSLName, "SSL_get0_alpn_selected"
-  )
-  defineLazySym(
-    sslCtxSetAlpnProtos, SslCtxSetAlpnProtosFn, DLLSSLName, "SSL_CTX_set_alpn_protos"
-  )
+  let
+    sslDynlib = loadLibPattern(DLLSSLName)
+    utilDynlib = loadLibPattern(DLLUtilName)
+    sslSet1Host* = cast[SslSet1HostFn](resolveSym(sslDynlib, "SSL_set1_host"))
+    sslGet0Param* = cast[SslGet0ParamFn](resolveSym(sslDynlib, "SSL_get0_param"))
+    x509VerifyParamSet1IpAsc* =
+      cast[X509SetIpAscFn](resolveSym(utilDynlib, "X509_VERIFY_PARAM_set1_ip_asc"))
+    sslGetRbio* = cast[SslGetBioFn](resolveSym(sslDynlib, "SSL_get_rbio"))
+    sslGetWbio* = cast[SslGetBioFn](resolveSym(sslDynlib, "SSL_get_wbio"))
+    sslGet0AlpnSelected* =
+      cast[SslGet0AlpnSelectedFn](resolveSym(sslDynlib, "SSL_get0_alpn_selected"))
+    sslCtxSetAlpnProtos* =
+      cast[SslCtxSetAlpnProtosFn](resolveSym(sslDynlib, "SSL_CTX_set_alpn_protos"))
 
   proc formatSslError(prefix: string): string =
     result = prefix
@@ -106,15 +98,13 @@ when hasAsyncDispatch and defined(ssl):
     if ssl == nil:
       raise
         newException(PgConnectionError, "TLS handshake: SSL handle is not initialised")
-    let getRbio = sslGetRbio()
-    let getWbio = sslGetWbio()
-    if getRbio == nil or getWbio == nil:
+    if sslGetRbio == nil or sslGetWbio == nil:
       raise newException(
         PgConnectionError,
         "TLS handshake: libssl does not export SSL_get_rbio / SSL_get_wbio",
       )
-    let rbio = getRbio(ssl)
-    let wbio = getWbio(ssl)
+    let rbio = sslGetRbio(ssl)
+    let wbio = sslGetWbio(ssl)
     if rbio == nil or wbio == nil:
       raise newException(PgConnectionError, "TLS handshake: memory BIOs unavailable")
     let fd = socket.getFd.AsyncFD
@@ -161,15 +151,14 @@ when hasAsyncDispatch and defined(ssl):
 
   proc getSelectedAlpnOpenssl(ssl: SslPtr): string =
     ## Return the peer-selected ALPN protocol, or "" if none was selected.
-    let getAlpn = sslGet0AlpnSelected()
-    if getAlpn == nil:
+    if sslGet0AlpnSelected == nil:
       raise newException(
         PgConnectionError,
         "sslnegotiation=direct: libssl does not export SSL_get0_alpn_selected",
       )
     var protoPtr: pointer
     var protoLen: cuint
-    getAlpn(ssl, addr protoPtr, addr protoLen)
+    sslGet0AlpnSelected(ssl, addr protoPtr, addr protoLen)
     if protoPtr.isNil or protoLen == 0:
       return ""
     result = newString(protoLen.int)
@@ -182,30 +171,27 @@ when hasAsyncDispatch and defined(ssl):
     ## identity cannot be installed, so it never silently degrades to chain-only.
     let ok =
       if isIpAddress(host):
-        let fn = x509VerifyParamSet1IpAsc()
-        if fn == nil:
+        if x509VerifyParamSet1IpAsc == nil:
           raise newException(
             PgConnectionError,
             "sslmode=verify-full: libcrypto does not export " &
               "X509_VERIFY_PARAM_set1_ip_asc; cannot verify " & host,
           )
-        let getParam = sslGet0Param()
-        if getParam == nil:
+        if sslGet0Param == nil:
           raise newException(
             PgConnectionError,
             "sslmode=verify-full: libssl does not export SSL_get0_param; " &
               "cannot verify " & host,
           )
-        fn(getParam(sslHandle), host.cstring)
+        x509VerifyParamSet1IpAsc(sslGet0Param(sslHandle), host.cstring)
       else:
-        let fn = sslSet1Host()
-        if fn == nil:
+        if sslSet1Host == nil:
           raise newException(
             PgConnectionError,
             "sslmode=verify-full: libssl does not export SSL_set1_host; " &
               "cannot verify " & host,
           )
-        fn(sslHandle, host.cstring)
+        sslSet1Host(sslHandle, host.cstring)
     if ok != 1:
       raise newException(
         PgConnectionError,
@@ -260,9 +246,9 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
   ## enforced. `config` is the source of truth for every TLS parameter — do
   ## not read `conn.config` here, so callers can rewrite it (e.g. sslAllow)
   ## without silently downgrading the handshake.
-  let direct = config.sslNegotiation == sslnDirect
 
   when hasChronos:
+    let direct = config.sslNegotiation == sslnDirect
     conn.baseReader = newAsyncStreamReader(conn.transport)
     conn.baseWriter = newAsyncStreamWriter(conn.transport)
 
@@ -321,6 +307,7 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     conn.sslEnabled = true
   elif hasAsyncDispatch:
     when defined(ssl):
+      let direct = config.sslNegotiation == sslnDirect
       var ctx: SslContext
       var tmpPath: string
       try:
@@ -335,9 +322,9 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
 
         # Advertise ALPN unconditionally (libpq 17 parity). The missing-symbol
         # path is only fatal for direct mode; traditional mode degrades to no-ALPN.
-        let setAlpn = sslCtxSetAlpnProtos()
-        if setAlpn != nil:
-          let rc = setAlpn(ctx.context, PgAlpnWire.cstring, cuint(PgAlpnWire.len))
+        if sslCtxSetAlpnProtos != nil:
+          let rc =
+            sslCtxSetAlpnProtos(ctx.context, PgAlpnWire.cstring, cuint(PgAlpnWire.len))
           if rc != 0:
             raise newException(
               PgConnectionError,
@@ -394,6 +381,9 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
   ## `sslnegotiation=direct` starts TLS immediately (PostgreSQL 17+). `sslHost`
   ## is the name matched against the server certificate (libpq semantics: the
   ## entry's `host`, never `hostaddr`).
+  # Defensive: connectToHost / perform already validate, but this proc is
+  # exported and may be called directly; the check is idempotent (no-op when
+  # sslnegotiation is not direct or sslmode is already strong enough).
   validateDirectSslCompatible(config)
   if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:
     # Both backends silently fall back to a Web PKI store (chronos:

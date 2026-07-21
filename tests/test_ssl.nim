@@ -1373,8 +1373,7 @@ when hasAsyncDispatch and defined(ssl):
   suite "SSL verify-full - enforceVerifyFullIdentity (OpenSSL backend)":
     test "installs the DNS host on the SSL handle":
       resolveX509TestSyms()
-      let getParam = sslGet0Param()
-      if x509GetHostFn == nil or getParam == nil or sslSet1Host() == nil:
+      if x509GetHostFn == nil or sslGet0Param == nil or sslSet1Host == nil:
         skip()
       else:
         let ctx = newContext(verifyMode = CVerifyNone)
@@ -1382,12 +1381,12 @@ when hasAsyncDispatch and defined(ssl):
         doAssert ssl != nil
         try:
           enforceVerifyFullIdentity(ssl, "db.example.com")
-          check $x509GetHostFn(getParam(ssl), 0.cint) == "db.example.com"
+          check $x509GetHostFn(sslGet0Param(ssl), 0.cint) == "db.example.com"
         finally:
           SSL_free(ssl)
 
     test "accepts IP literals without error":
-      if x509VerifyParamSet1IpAsc() == nil:
+      if x509VerifyParamSet1IpAsc == nil:
         skip()
       else:
         let ctx = newContext(verifyMode = CVerifyNone)
@@ -1408,13 +1407,11 @@ when hasAsyncDispatch and defined(ssl):
     test "sslGetRbio / sslGetWbio resolve on this OpenSSL":
       # Universally exported on OpenSSL and BoringSSL; a nil resolver would
       # break the memory-BIO shuttle the handshake driver relies on.
-      check sslGetRbio() != nil
-      check sslGetWbio() != nil
+      check sslGetRbio != nil
+      check sslGetWbio != nil
 
     test "wrapConnectedSocket installs both memory BIOs on the SSL handle":
-      let getRbio = sslGetRbio()
-      let getWbio = sslGetWbio()
-      if getRbio == nil or getWbio == nil:
+      if sslGetRbio == nil or sslGetWbio == nil:
         skip()
       else:
         let sock = newAsyncSocket(buffered = false)
@@ -1422,8 +1419,8 @@ when hasAsyncDispatch and defined(ssl):
         try:
           wrapConnectedSocket(ctx, sock, handshakeAsClient)
           check sock.sslHandle != nil
-          check getRbio(sock.sslHandle) != nil
-          check getWbio(sock.sslHandle) != nil
+          check sslGetRbio(sock.sslHandle) != nil
+          check sslGetWbio(sock.sslHandle) != nil
         finally:
           sock.close()
 
