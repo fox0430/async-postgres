@@ -851,11 +851,21 @@ proc getCircle*(row: Row, col: int): PgCircle =
 
 template optAccessor*(getProc, optProc: untyped, T: typedesc) =
   ## Generate ``optProc*(row, col): Option[T]`` that delegates to ``getProc``.
-  proc optProc*(row: Row, col: int): Option[T] =
-    if row.isNull(col):
-      none(T)
-    else:
-      some(row.getProc(col))
+  # Forward `scale` when getProc takes one; otherwise Opt would silently
+  # drop it and tag results with the default (wrong on non-`C` locales).
+  when compiles((var r: Row; discard r.getProc(0, scale = 2))):
+    proc optProc*(row: Row, col: int, scale: int = 2): Option[T] =
+      if row.isNull(col):
+        none(T)
+      else:
+        some(row.getProc(col, scale))
+
+  else:
+    proc optProc*(row: Row, col: int): Option[T] =
+      if row.isNull(col):
+        none(T)
+      else:
+        some(row.getProc(col))
 
 template nameAccessor*(getProc: untyped, T: typedesc) =
   ## Generate ``getProc*(row, name): T`` that delegates to the index-based overload.
