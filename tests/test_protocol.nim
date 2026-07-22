@@ -77,6 +77,15 @@ suite "Byte helpers":
     expect(ValueError):
       discard encodeStartup("alice", "db", [("app\0name", "value")])
 
+  test "encodeStartup rejects empty key in extra params":
+    # Empty key would encode as a lone NUL, matching the parameter-list
+    # terminator and silently truncating the remaining parameters.
+    expect(ValueError):
+      discard encodeStartup("alice", "db", [("", "value")])
+    expect(ValueError):
+      discard
+        encodeStartup("alice", "db", [("application_name", "app"), ("", "injected")])
+
   test "encodeQuery rejects NUL in sql":
     expect(ValueError):
       discard encodeQuery("SELECT 1\0; DROP TABLE users")
