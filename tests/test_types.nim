@@ -753,6 +753,17 @@ suite "PgTime":
     check opt.isSome
     check opt.get().hour == 10
 
+  test "getTime text trailing garbage raises":
+    # Anything after HH:MM:SS other than ".ffffff" must be rejected.
+    for bad in ["01:23:45X", "01:23:45XYZ garbage", "01:23:45.", "01:23:45.1234567"]:
+      let row = @[some(toBytes(bad))]
+      var raised = false
+      try:
+        discard row.getTime(0)
+      except PgTypeError:
+        raised = true
+      check raised
+
 suite "PgTimeTz":
   test "$PgTimeTz positive offset":
     let t = PgTimeTz(hour: 14, minute: 30, second: 0, microsecond: 0, utcOffset: 18000)
@@ -3150,6 +3161,17 @@ suite "PgInterval":
     let v = parseIntervalText("7 days 12:00:00")
     check v.days == 7
     check v.microseconds == 43_200_000_000'i64
+
+  test "parseIntervalText malformed raises":
+    # Bare garbage, unknown units, bare number, and non-alnum bytes must all
+    # raise. "!!" previously spun the parser in an infinite loop.
+    for bad in ["junk", "5 fortnights", "1", "!!", "-", "3 days garbage"]:
+      var raised = false
+      try:
+        discard parseIntervalText(bad)
+      except PgTypeError:
+        raised = true
+      check raised
 
   test "toPgParam PgInterval":
     let v = PgInterval(months: 14, days: 3, microseconds: 14706123456)
@@ -6035,6 +6057,60 @@ suite "tsvector / tsquery":
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
     check "'cat' <-> 'dog'" == $q
+
+  test "getTsQuery binary NOT wraps compound child":
+    # NOT(AND(a, b)) must round-trip as "!( 'a' & 'b' )", not "!'a' & 'b'"
+    # (which reparses as AND(NOT a, b)).
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(4'i32)))
+    data.add(@[byte 2, 1]) # NOT
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    check decodeBinaryTsQuery(data) == "!( 'a' & 'b' )"
+
+  test "getTsQuery binary AND(NOT a, b) does not collide with NOT(AND a b)":
+    # NOT binds tighter than AND, so this needs no wrap and stays "!'a' & 'b'".
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(4'i32)))
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 2, 1]) # NOT
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    check decodeBinaryTsQuery(data) == "!'a' & 'b'"
+
+  test "getTsQuery binary PHRASE wraps AND child":
+    # PHRASE binds tighter than AND, so AND under PHRASE needs parens.
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(5'i32)))
+    data.add(@[byte 2, 4, 0, 1]) # PHRASE dist=1
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    data.add(@[byte 1, 0, 0, byte('c'), 0])
+    check decodeBinaryTsQuery(data) == "'a' <-> ( 'b' & 'c' )"
+
+  test "getTsQuery binary AND wraps OR child":
+    # AND binds tighter than OR, so OR under AND needs parens.
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(5'i32)))
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 2, 3]) # OR
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    data.add(@[byte 1, 0, 0, byte('c'), 0])
+    check decodeBinaryTsQuery(data) == "( 'a' | 'b' ) & 'c'"
+
+  test "getTsQuery binary OR does not wrap AND child":
+    # AND binds tighter than OR; no parens needed.
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(5'i32)))
+    data.add(@[byte 2, 3]) # OR
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    data.add(@[byte 1, 0, 0, byte('c'), 0])
+    check decodeBinaryTsQuery(data) == "'a' & 'b' | 'c'"
 
   test "getTsQuery binary format with weight and prefix":
     # Binary tsquery for 'cat':AB* (single operand with weights A+B and prefix)

@@ -5,6 +5,14 @@ import core, array
 
 export pg_bytes, array
 
+type TsPrec = enum
+  # Order = ascending precedence; `!` binds tightest, `|` loosest.
+  tpOr
+  tpAnd
+  tpPhrase
+  tpNot
+  tpOperand
+
 proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
   ## Decode PostgreSQL binary hstore format.
   result = initTable[string, Option[string]]()
@@ -406,7 +414,11 @@ proc parseTimeText*(s: string): PgTime =
     sec = parseInt(s[6 .. 7])
   if h notin 0 .. 24 or m notin 0 .. 59 or sec notin 0 .. 59:
     raise newException(PgTypeError, "Invalid time: " & s)
-  if s.len > 8 and s[8] == '.':
+  if s.len > 8:
+    # Reject trailing garbage. Only "HH:MM:SS" or "HH:MM:SS.ffffff" are valid;
+    # anything else (e.g. "01:23:45X") must fail rather than silently return.
+    if s[8] != '.':
+      raise newException(PgTypeError, "Invalid time: " & s)
     let frac = s[9 .. ^1]
     if frac.len == 0 or frac.len > 6:
       raise newException(PgTypeError, "Invalid time: " & s)
@@ -590,9 +602,11 @@ proc parseIntervalText*(s: string): PgInterval =
     if s[i] == '-' or s[i] == '+':
       i += 1
     var val: int64 = 0
+    var sawDigit = false
     while i < n and s[i] in '0' .. '9':
       val = val * 10 + int64(ord(s[i]) - ord('0'))
       i += 1
+      sawDigit = true
     if neg:
       val = -val
     # Skip space
@@ -603,6 +617,9 @@ proc parseIntervalText*(s: string): PgInterval =
     while i < n and s[i] in 'a' .. 'z':
       unit.add(s[i])
       i += 1
+    # Guarantees forward progress: "!" would else leave i unchanged and spin.
+    if not sawDigit or unit.len == 0:
+      raise newException(PgTypeError, "Invalid interval: " & s)
     case unit
     of "year", "years":
       months += int32(val * 12)
@@ -611,7 +628,7 @@ proc parseIntervalText*(s: string): PgInterval =
     of "day", "days":
       days += int32(val)
     else:
-      discard
+      raise newException(PgTypeError, "Invalid interval unit '" & unit & "' in: " & s)
   PgInterval(months: months, days: days, microseconds: microseconds)
 
 proc parseInetText*(s: string): tuple[address: IpAddress, mask: uint8] =
@@ -689,7 +706,20 @@ proc decodeBinaryTsVector*(data: openArray[byte]): string =
     parts[i] = part
   parts.join(" ")
 
-proc parseTsQueryNode(data: openArray[byte], pos: var int, depth: int = 0): string =
+proc renderTsQueryChild(
+    child: tuple[text: string, prec: TsPrec], parent: TsPrec
+): string =
+  # Wrap a child that binds looser than its parent so the printed form
+  # reparses to the same tree (e.g. NOT(AND a b) must not collapse to
+  # "!a & b", which reparses as AND(NOT a, b)).
+  if ord(child.prec) < ord(parent):
+    "( " & child.text & " )"
+  else:
+    child.text
+
+proc parseTsQueryNode(
+    data: openArray[byte], pos: var int, depth: int = 0
+): tuple[text: string, prec: TsPrec] =
   const maxDepth = 1000
   if depth >= maxDepth:
     raise newException(
@@ -731,7 +761,7 @@ proc parseTsQueryNode(data: openArray[byte], pos: var int, depth: int = 0): stri
       s.add(suffix)
       if prefix:
         s.add('*')
-    s
+    (s, tpOperand)
   of 2: # operator
     if pos >= data.len:
       raise newException(PgTypeError, "tsquery operator truncated")
@@ -740,15 +770,18 @@ proc parseTsQueryNode(data: openArray[byte], pos: var int, depth: int = 0): stri
     case op
     of 1: # NOT
       let arg = parseTsQueryNode(data, pos, depth + 1)
-      "!" & arg
+      ("!" & renderTsQueryChild(arg, tpNot), tpNot)
     of 2: # AND
       let left = parseTsQueryNode(data, pos, depth + 1)
       let right = parseTsQueryNode(data, pos, depth + 1)
-      left & " & " & right
+      (
+        renderTsQueryChild(left, tpAnd) & " & " & renderTsQueryChild(right, tpAnd),
+        tpAnd,
+      )
     of 3: # OR
       let left = parseTsQueryNode(data, pos, depth + 1)
       let right = parseTsQueryNode(data, pos, depth + 1)
-      "( " & left & " | " & right & " )"
+      (renderTsQueryChild(left, tpOr) & " | " & renderTsQueryChild(right, tpOr), tpOr)
     of 4: # PHRASE
       if pos + 1 >= data.len:
         raise newException(PgTypeError, "tsquery PHRASE distance truncated")
@@ -756,10 +789,17 @@ proc parseTsQueryNode(data: openArray[byte], pos: var int, depth: int = 0): stri
       pos += 2
       let left = parseTsQueryNode(data, pos, depth + 1)
       let right = parseTsQueryNode(data, pos, depth + 1)
-      if distance == 1:
-        left & " <-> " & right
-      else:
-        left & " <" & $distance & "> " & right
+      let opText =
+        if distance == 1:
+          " <-> "
+        else:
+          " <" & $distance & "> "
+      (
+        renderTsQueryChild(left, tpPhrase) & opText & renderTsQueryChild(
+          right, tpPhrase
+        ),
+        tpPhrase,
+      )
     else:
       raise newException(PgTypeError, "Unknown tsquery operator: " & $op)
   else:
@@ -775,7 +815,7 @@ proc decodeBinaryTsQuery*(data: openArray[byte]): string =
   if ntokens == 0:
     return ""
   var pos = 4
-  parseTsQueryNode(data, pos)
+  parseTsQueryNode(data, pos).text
 
 # Geometry text format parsers
 
