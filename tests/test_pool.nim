@@ -359,6 +359,53 @@ suite "PendingPoolOp finish guards":
     check op.execFut.failed
     check op.execFut.readError() == first
 
+suite "failPendingAndUnschedule":
+  # When scheduleSoon/asyncSpawn can't arrange a dispatch, the caller has
+  # already enqueued its op; without this recovery the caller's future would
+  # hang forever waiting on a dispatch that never comes.
+
+  test "fails every queued op with the given error":
+    let pool = makePool()
+    pool.pendingOps = initDeque[PendingPoolOp]()
+    let execFut = newFuture[CommandResult]("test.execFut")
+    let queryFut = newFuture[QueryResult]("test.queryFut")
+    pool.pendingOps.addLast(PendingPoolOp(kind: popExec, execFut: execFut))
+    pool.pendingOps.addLast(PendingPoolOp(kind: popQuery, queryFut: queryFut))
+    pool.dispatchScheduled = true
+
+    let err = newException(PgError, "no dispatch")
+    pool.failPendingAndUnschedule(err)
+
+    check pool.pendingOps.len == 0
+    check pool.dispatchScheduled == false
+    check execFut.failed
+    check queryFut.failed
+    check execFut.readError() == err
+    check queryFut.readError() == err
+
+  test "no-op on an empty queue":
+    let pool = makePool()
+    pool.pendingOps = initDeque[PendingPoolOp]()
+    pool.dispatchScheduled = true
+    pool.failPendingAndUnschedule(newException(PgError, "no dispatch"))
+    check pool.pendingOps.len == 0
+    check pool.dispatchScheduled == false
+
+  test "leaves already-finished op futures untouched":
+    let pool = makePool()
+    pool.pendingOps = initDeque[PendingPoolOp]()
+    let prior = newException(PgPoolError, "prior cancel")
+    let execFut = newFuture[CommandResult]("test.execFut")
+    execFut.fail(prior)
+    pool.pendingOps.addLast(PendingPoolOp(kind: popExec, execFut: execFut))
+    pool.dispatchScheduled = true
+
+    pool.failPendingAndUnschedule(newException(PgError, "no dispatch"))
+
+    check pool.pendingOps.len == 0
+    check pool.dispatchScheduled == false
+    check execFut.readError() == prior
+
 suite "checkReady error classification":
   # A-8: a connection that is alive but busy (a single connection used
   # concurrently) is a programming error, not a network failure. checkReady
