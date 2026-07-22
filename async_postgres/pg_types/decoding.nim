@@ -190,9 +190,7 @@ proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: u
   let addrlen = data[3]
   if family == 2:
     if addrlen != 4:
-      raise newException(
-        PgTypeError, "Binary inet IPv4 addrlen mismatch: " & $addrlen
-      )
+      raise newException(PgTypeError, "Binary inet IPv4 addrlen mismatch: " & $addrlen)
     if data.len < 8:
       raise newException(PgTypeError, "Binary inet IPv4 data too short: " & $data.len)
     # Match the text path (parseInetText): reject a netmask wider than the
@@ -206,9 +204,7 @@ proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: u
     (ip, bits)
   elif family == 3:
     if addrlen != 16:
-      raise newException(
-        PgTypeError, "Binary inet IPv6 addrlen mismatch: " & $addrlen
-      )
+      raise newException(PgTypeError, "Binary inet IPv6 addrlen mismatch: " & $addrlen)
     if data.len < 20:
       raise newException(PgTypeError, "Binary inet IPv6 data too short: " & $data.len)
     if bits > 128:
