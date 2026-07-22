@@ -2848,6 +2848,23 @@ suite "PgMoney":
     # Parenthesized with extra minus
     expect(PgTypeError):
       discard parsePgMoney("(-$1.00)")
+    # Sign in the middle of digits must not be silently dropped.
+    expect(PgTypeError):
+      discard parsePgMoney("12-34", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("12-34.56")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00-")
+    # Two signs in the prefix are ambiguous, not "+ wins".
+    expect(PgTypeError):
+      discard parsePgMoney("+-1.00")
+    expect(PgTypeError):
+      discard parsePgMoney("-+1.00")
+    # scale=0 must not silently truncate fractional digits.
+    expect(PgTypeError):
+      discard parsePgMoney("1.23", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("1.5", scale = 0)
 
   test "parsePgMoney rejects overflow":
     expect(PgTypeError):
