@@ -2977,6 +2977,13 @@ suite "PgMoney":
     let rowNone = mkRow(@[none(seq[byte])], fields)
     check rowNone.getMoneyOpt(0) == none(PgMoney)
 
+  test "getMoneyOpt forwards scale kwarg":
+    # Non-default scales (e.g. ja_JP frac_digits=0) must survive the Opt wrapper.
+    let fields = @[mkField(OidMoney, 1)]
+    let rowSome = mkRow(@[some(@(toBE64(42'i64)))], fields)
+    check rowSome.getMoneyOpt(0, scale = 0) == some(initPgMoney(42, scale = 0))
+    check rowSome.getMoneyOpt(0, scale = 3) == some(initPgMoney(42, scale = 3))
+
   test "toPgParam seq[PgMoney] empty":
     let p = toPgParam(newSeq[PgMoney]())
     check p.oid == OidMoneyArray
@@ -3010,6 +3017,13 @@ suite "PgMoney":
     check rowSome.getMoneyArrayOpt(0) == some(values)
     let rowNone = mkRow(@[none(seq[byte])], fields)
     check rowNone.getMoneyArrayOpt(0) == none(seq[PgMoney])
+
+  test "getMoneyArrayOpt forwards scale kwarg":
+    let values0 = @[initPgMoney(1, scale = 0), initPgMoney(2, scale = 0)]
+    let p = toPgParam(@[initPgMoney(1), initPgMoney(2)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let rowSome = mkRow(@[p.value], fields)
+    check rowSome.getMoneyArrayOpt(0, scale = 0) == some(values0)
 
   test "getMoney rejects invalid scale":
     let fields = @[mkField(OidMoney, 1)]
