@@ -343,11 +343,10 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
       conn.clearStmtCache()
   except CancelledError as e:
     # Split from the generic handler so cancellation propagates. Flip state
-    # synchronously so a follow-up `release()` routes to `releaseCore`'s
-    # discard path; `closeNoWait` is fire-and-forget so no await re-fires the
-    # pending cancel.
+    # synchronously so the subsequent release() routes to releaseCore's discard
+    # path. The actual socket close is performed by releaseCore's closeNoWait;
+    # calling it here as well would double-count metrics.
     conn.state = csClosed
-    pool.closeNoWait(conn)
     raise e
   except CatchableError:
     try:
