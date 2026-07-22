@@ -83,9 +83,8 @@ suite "Byte helpers":
     expect(ValueError):
       discard encodeStartup("alice", "db", [("", "value")])
     expect(ValueError):
-      discard encodeStartup(
-        "alice", "db", [("application_name", "app"), ("", "injected")]
-      )
+      discard
+        encodeStartup("alice", "db", [("application_name", "app"), ("", "injected")])
 
   test "encodeQuery rejects NUL in sql":
     expect(ValueError):

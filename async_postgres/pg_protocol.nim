@@ -488,8 +488,9 @@ proc encodeStartup*(
     # end-of-parameters terminator — silently dropping subsequent pairs and
     # opening a startup-parameter injection vector through the K/V stream.
     if k.len == 0:
-      raise
-        newException(ValueError, "encodeStartup: empty key in extraParams is not allowed")
+      raise newException(
+        ValueError, "encodeStartup: empty key in extraParams is not allowed"
+      )
     result.addCString(k)
     result.addCString(v)
   result.add(0'u8) # terminator
