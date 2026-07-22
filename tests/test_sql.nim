@@ -101,6 +101,43 @@ suite "sqlParams":
   test "? immediately after single-quote ends":
     check sqlParams("SELECT 'val'WHERE id = ?") == "SELECT 'val'WHERE id = $1"
 
+  test "? inside line comment preserved":
+    check sqlParams("SELECT ? -- trailing ?") == "SELECT $1 -- trailing ?"
+
+  test "line comment ends at newline, ? after is bound":
+    check sqlParams("SELECT -- what?\ncol FROM t WHERE id = ?") ==
+      "SELECT -- what?\ncol FROM t WHERE id = $1"
+
+  test "? and ' inside block comment preserved":
+    check sqlParams("SELECT 1 /* it's here ? */ ? FROM t") ==
+      "SELECT 1 /* it's here ? */ $1 FROM t"
+
+  test "nested block comment preserves ?":
+    check sqlParams("SELECT /* outer /* inner ? */ still ? */ ? FROM t") ==
+      "SELECT /* outer /* inner ? */ still ? */ $1 FROM t"
+
+  test "single / not followed by * is not a comment":
+    check sqlParams("SELECT 1/? FROM t") == "SELECT 1/$1 FROM t"
+
+  test "single - not followed by - is not a comment":
+    check sqlParams("SELECT -? FROM t") == "SELECT -$1 FROM t"
+
+  test "unterminated block comment preserves body":
+    check sqlParams("SELECT 1 /* unterminated ? FROM t") ==
+      "SELECT 1 /* unterminated ? FROM t"
+
+  test "-- inside single-quoted string is not a line comment":
+    check sqlParams("SELECT '-- not a comment ?' WHERE id = ?") ==
+      "SELECT '-- not a comment ?' WHERE id = $1"
+
+  test "/* inside single-quoted string is not a block comment":
+    check sqlParams("SELECT '/* not a comment ?' WHERE id = ?") ==
+      "SELECT '/* not a comment ?' WHERE id = $1"
+
+  test "?| operator after block comment":
+    check sqlParams("SELECT /* c */ col ?| array[?]") ==
+      "SELECT /* c */ col ?| array[$1]"
+
 suite "sql macro":
   test "basic parameter extraction":
     let x = 42'i32
@@ -256,3 +293,21 @@ suite "sql macro":
     check sq.query == "SELECT $1"
     check sq.params.len == 1
     check sq.params[0].oid == OidInt4Array
+
+  test "placeholder inside line comment preserved":
+    let x = 1'i32
+    let sq = sql"SELECT {x} -- trailing {y}"
+    check sq.query == "SELECT $1 -- trailing {y}"
+    check sq.params.len == 1
+
+  test "placeholder inside block comment preserved":
+    let x = 1'i32
+    let sq = sql"SELECT /* {y} */ {x} FROM t"
+    check sq.query == "SELECT /* {y} */ $1 FROM t"
+    check sq.params.len == 1
+
+  test "placeholder inside nested block comment preserved":
+    let x = 1'i32
+    let sq = sql"SELECT /* /* {inner} */ {mid} */ {x}"
+    check sq.query == "SELECT /* /* {inner} */ {mid} */ $1"
+    check sq.params.len == 1
