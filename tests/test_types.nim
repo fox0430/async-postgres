@@ -4742,6 +4742,33 @@ suite "Range toPgParam":
     let decoded = row.getTsRange(0)
     check decoded.lower.value.nanosecond == 789_000
 
+  test "tsrange with non-UTC zone encodes the UTC instant":
+    # Regression: the tsrange text path used to serialize the local wall clock,
+    # diverging from scalar toPgParam(DateTime). utcOffset counts seconds WEST
+    # of UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt1 = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let dt2 = dateTime(2026, mJul, 16, 9, 0, 0, 0, jst)
+    let p = toPgParam(rangeOf(dt1, dt2))
+    check p.oid == OidTsRange
+    check p.value.get.toString ==
+      "[\"2026-07-15 12:00:00.000000\",\"2026-07-16 00:00:00.000000\")"
+    let ap = toPgParam(@[rangeOf(dt1, dt2)])
+    check ap.oid == OidTsRangeArray
+    check ap.value.get.toString ==
+      "{\"[\\\"2026-07-15 12:00:00.000000\\\",\\\"2026-07-16 00:00:00.000000\\\")\"}"
+
   test "tstzrange":
     let dt1 = dateTime(2023, mJan, 1, zone = utc())
     let dt2 = dateTime(2023, mDec, 31, zone = utc())
@@ -4749,6 +4776,14 @@ suite "Range toPgParam":
     check p.oid == OidTsTzRange
     check p.value.get.toString ==
       "[\"2023-01-01 00:00:00.000000Z\",\"2023-12-31 00:00:00.000000Z\")"
+
+  test "tstzmultirange":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgTsTzMultirangeParam(toMultirange(rangeOf(dt1, dt2)))
+    check p.oid == OidTsTzMultirange
+    check p.value.get.toString ==
+      "{[\"2023-01-01 00:00:00.000000Z\",\"2023-12-31 00:00:00.000000Z\")}"
 
   test "daterange":
     let dt1 = dateTime(2023, mJan, 1, zone = utc())
@@ -5067,6 +5102,29 @@ suite "PgMultirange":
     let p = toPgParam(mr)
     check p.oid == OidInt4Multirange
     check p.value.get.toString == "{}"
+
+  test "toPgParam tsmultirange with non-UTC zone encodes the UTC instant":
+    # Regression: the ts multirange text path used to serialize the local wall
+    # clock (via $), diverging from scalar toPgParam(DateTime). utcOffset counts
+    # seconds WEST of UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt1 = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let dt2 = dateTime(2026, mJul, 16, 9, 0, 0, 0, jst)
+    let p = toPgParam(toMultirange(rangeOf(dt1, dt2)))
+    check p.oid == OidTsMultirange
+    check p.value.get.toString ==
+      "{[\"2026-07-15 12:00:00.000000\",\"2026-07-16 00:00:00.000000\")}"
 
 suite "Multirange text parsing":
   test "parse int4multirange":
@@ -5528,6 +5586,23 @@ suite "Multirange array binary roundtrip":
     check decoded.len == 2
     check decoded[0] == toMultirange(rangeOf(1'i32, 10'i32))
     check decoded[1].len == 0
+
+suite "Multirange array text roundtrip":
+  test "tstzmultirange[] text roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let orig = @[toMultirange(rangeOf(dt1, dt2))]
+    let p = toPgTsTzMultirangeArrayParam(orig)
+    check p.oid == OidTsTzMultirangeArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    let decoded = row.getTsTzMultirangeArray(0)
+    check decoded.len == 1
+    check decoded[0].len == 1
+    check decoded[0][0].lower.value.year == 2023
+    check decoded[0][0].lower.value.month == mJan
+    check decoded[0][0].upper.value.year == 2023
+    check decoded[0][0].upper.value.month == mJun
 
 suite "Range array row getters":
   test "getInt4RangeArray text":
@@ -7120,6 +7195,28 @@ suite "Multirange array types":
     let row: Row = @[p.value]
     let arr = row.getNumMultirangeArray(0)
     check arr.len == 1
+
+  test "toPgTsMultirangeArrayParam with non-UTC zone encodes the UTC instant":
+    # Regression: the ts multirange array text path used $, which serializes the
+    # local wall clock rather than UTC.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt1 = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let dt2 = dateTime(2026, mJul, 16, 9, 0, 0, 0, jst)
+    let p = toPgTsMultirangeArrayParam(@[toMultirange(rangeOf(dt1, dt2))])
+    check p.oid == OidTsMultirangeArray
+    check p.value.get.toString ==
+      "{\"{[\\\"2026-07-15 12:00:00.000000\\\",\\\"2026-07-16 00:00:00.000000\\\")}\"}"
 
 proc inlinePayload(p: PgParamInline): seq[byte] =
   ## Reconstruct the binary payload a PgParamInline would emit on the wire,

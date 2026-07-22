@@ -401,15 +401,21 @@ proc toPgParam*(v: PgRange[int64]): PgParam =
 proc toPgParam*(v: PgRange[PgNumeric]): PgParam =
   PgParam(oid: OidNumRange, format: 0, value: some(toBytes($v)))
 
-proc formatDateTimeRangeText(v: PgRange[DateTime], fmt: string): string =
+proc formatDateTimeRangeText(v: PgRange[DateTime], fmt: string, utc = false): string =
+  ## `utc` formats the UTC wall clock so zoned DateTimes sent as tsrange
+  ## (no zone in `fmt`) match the scalar OidTimestamp path.
   if v.isEmpty:
     return "empty"
+
+  proc fmtBound(dt: DateTime): string =
+    (if utc: dt.utc else: dt).format(fmt)
+
   result = if v.hasLower and v.lower.inclusive: "[" else: "("
   if v.hasLower:
-    result.add(quoteRangeElem(v.lower.value.format(fmt)))
+    result.add(quoteRangeElem(fmtBound(v.lower.value)))
   result.add(',')
   if v.hasUpper:
-    result.add(quoteRangeElem(v.upper.value.format(fmt)))
+    result.add(quoteRangeElem(fmtBound(v.upper.value)))
   result.add(if v.hasUpper and v.upper.inclusive: "]" else: ")")
 
 const
@@ -421,7 +427,7 @@ proc toPgParam*(v: PgRange[DateTime]): PgParam =
   PgParam(
     oid: OidTsRange,
     format: 0,
-    value: some(toBytes(formatDateTimeRangeText(v, pgTsRangeFmt))),
+    value: some(toBytes(formatDateTimeRangeText(v, pgTsRangeFmt, utc = true))),
   )
 
 proc toPgTsTzRangeParam*(v: PgRange[DateTime]): PgParam =
@@ -599,12 +605,14 @@ proc toPgParam*(v: seq[PgRange[PgNumeric]]): PgParam =
     oid: OidNumRangeArray, format: 0, value: some(toBytes(encodeRangeArrayText(v)))
   )
 
-proc encodeDateTimeRangeArrayText(v: seq[PgRange[DateTime]], fmt: string): string =
+proc encodeDateTimeRangeArrayText(
+    v: seq[PgRange[DateTime]], fmt: string, utc = false
+): string =
   result = "{"
   for i, r in v:
     if i > 0:
       result.add(',')
-    appendQuotedArrayElem(result, formatDateTimeRangeText(r, fmt))
+    appendQuotedArrayElem(result, formatDateTimeRangeText(r, fmt, utc))
   result.add('}')
 
 proc toPgParam*(v: seq[PgRange[DateTime]]): PgParam =
@@ -614,7 +622,7 @@ proc toPgParam*(v: seq[PgRange[DateTime]]): PgParam =
   PgParam(
     oid: OidTsRangeArray,
     format: 0,
-    value: some(toBytes(encodeDateTimeRangeArrayText(v, pgTsRangeFmt))),
+    value: some(toBytes(encodeDateTimeRangeArrayText(v, pgTsRangeFmt, utc = true))),
   )
 
 proc toPgTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
@@ -815,10 +823,26 @@ proc toPgParam*(v: PgMultirange[PgNumeric]): PgParam =
   PgParam(oid: OidNumMultirange, format: 0, value: some(toBytes($v)))
 
 proc toPgParam*(v: PgMultirange[DateTime]): PgParam =
-  PgParam(oid: OidTsMultirange, format: 0, value: some(toBytes($v)))
+  ## Encode a ts multirange. DateTime bounds are formatted via UTC so that
+  ## zoned values match the scalar ``toPgParam(DateTime)`` path.
+  var s = "{"
+  let ranges = seq[PgRange[DateTime]](v)
+  for i, r in ranges:
+    if i > 0:
+      s.add(',')
+    s.add(formatDateTimeRangeText(r, pgTsRangeFmt, utc = true))
+  s.add('}')
+  PgParam(oid: OidTsMultirange, format: 0, value: some(toBytes(s)))
 
 proc toPgTsTzMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
-  PgParam(oid: OidTsTzMultirange, format: 0, value: some(toBytes($v)))
+  var s = "{"
+  let ranges = seq[PgRange[DateTime]](v)
+  for i, r in ranges:
+    if i > 0:
+      s.add(',')
+    s.add(formatDateTimeRangeText(r, pgTsTzRangeFmt))
+  s.add('}')
+  PgParam(oid: OidTsTzMultirange, format: 0, value: some(toBytes(s)))
 
 proc toPgDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
   ## Encode a date multirange. DateTime values are formatted as date-only.
@@ -979,18 +1003,42 @@ genMultirangeArrayEncoder(int32, OidInt4MultirangeArray)
 genMultirangeArrayEncoder(int64, OidInt8MultirangeArray)
 genMultirangeArrayEncoder(PgNumeric, OidNumMultirangeArray)
 
+proc encodeDateTimeMultirangeArrayText(
+    v: seq[PgMultirange[DateTime]], fmt: string, utc = false
+): string =
+  result = "{"
+  for i, x in v:
+    if i > 0:
+      result.add(',')
+    result.add('"')
+    var mrStr = "{"
+    let ranges = seq[PgRange[DateTime]](x)
+    for j, r in ranges:
+      if j > 0:
+        mrStr.add(',')
+      mrStr.add(formatDateTimeRangeText(r, fmt, utc))
+    mrStr.add('}')
+    for c in mrStr:
+      if c == '"' or c == '\\':
+        result.add('\\')
+      result.add(c)
+    result.add('"')
+  result.add('}')
+
 proc toPgTsMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
+  ## Encode a ``tsmultirange[]``. DateTime bounds are formatted via UTC so that
+  ## zoned values match the scalar ``toPgParam(DateTime)`` path.
   PgParam(
     oid: OidTsMultirangeArray,
     format: 0,
-    value: some(toBytes(encodeMultirangeArrayText(v))),
+    value: some(toBytes(encodeDateTimeMultirangeArrayText(v, pgTsRangeFmt, utc = true))),
   )
 
 proc toPgTsTzMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
   PgParam(
     oid: OidTsTzMultirangeArray,
     format: 0,
-    value: some(toBytes(encodeMultirangeArrayText(v))),
+    value: some(toBytes(encodeDateTimeMultirangeArrayText(v, pgTsTzRangeFmt))),
   )
 
 proc toPgDateMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
