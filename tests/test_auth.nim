@@ -458,6 +458,64 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     check binding.len == 32
     check binding == @(sha256.digest(cert).data)
 
+  # RSA-PSS shell: syntheticCert plus raw RSASSA-PSS-params after the OID.
+  proc syntheticPssCert(pssParams: openArray[byte]): seq[byte] =
+    let oidBlock = @[byte 0x06, byte(oidRsaPss.len)] & @oidRsaPss
+    let sigAlg =
+      @[byte 0x30, byte(oidBlock.len + pssParams.len)] & oidBlock & @pssParams
+    let tbs = @[byte 0x30, 0x00]
+    let inner = tbs & sigAlg
+    result = @[byte 0x30, byte(inner.len)] & inner
+
+  # RSASSA-PSS-params with only [0] hashAlgorithm { OID } present.
+  proc pssParamsWithHash(hashOid: openArray[byte]): seq[byte] =
+    let alg = @[byte 0x30, byte(hashOid.len + 2), 0x06, byte(hashOid.len)] & @hashOid
+    let ctx = @[byte 0xA0, byte(alg.len)] & alg
+    result = @[byte 0x30, byte(ctx.len)] & ctx
+
+  test "computeTlsServerEndpoint uses SHA-384 for RSA-PSS with SHA-384 params":
+    let cert = syntheticPssCert(
+      pssParamsWithHash([byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02])
+    )
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 48
+    check binding == @(sha384.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-512 for RSA-PSS with SHA-512 params":
+    let cert = syntheticPssCert(
+      pssParamsWithHash([byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03])
+    )
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 64
+    check binding == @(sha512.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-256 for RSA-PSS with SHA-256 params":
+    let cert = syntheticPssCert(
+      pssParamsWithHash([byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01])
+    )
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 32
+    check binding == @(sha256.digest(cert).data)
+
+  test "computeTlsServerEndpoint promotes RSA-PSS default SHA-1 to SHA-256":
+    # Empty RSASSA-PSS-params SEQUENCE: hashAlgorithm absent, DEFAULT sha1.
+    let cert = syntheticPssCert([byte 0x30, 0x00])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 32
+    check binding == @(sha256.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-256 for RSA-PSS with malformed params":
+    let cert = syntheticPssCert([byte 0xA0, 0x03, 0x02, 0x01])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 32
+    check binding == @(sha256.digest(cert).data)
+
+  test "computeTlsServerEndpoint uses SHA-256 for RSA-PSS with [0] tag not SEQUENCE":
+    let cert = syntheticPssCert([byte 0x30, 0x06, 0xA0, 0x04, 0x02, 0x01, 0x01])
+    let binding = computeTlsServerEndpoint(cert)
+    check binding.len == 32
+    check binding == @(sha256.digest(cert).data)
+
   test "computeTlsServerEndpoint is deterministic":
     let cert =
       syntheticCert([byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C])
