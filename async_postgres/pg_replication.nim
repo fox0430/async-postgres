@@ -1003,16 +1003,18 @@ proc invalidateAbandonedStream(conn: PgConnection) =
   ## connection cannot be reused; mark it ``csClosed`` so the next operation
   ## fails fast and a pool discards it.
   ##
-  ## Without this the connection would be stranded in ``csReplicating``: every
-  ## later call would raise a misleading ``PgStateError`` ("connection is in
-  ## use") for an apparently-live stream when the stream is in fact dead, and the
-  ## only recovery is to reconnect and resume (see ``examples/replication.nim``).
-  ## A clean stop (CopyDone -> ReadyForQuery) and a server-side error followed by
-  ## ReadyForQuery both return the connection to ``csReady`` first, and the I/O
-  ## helpers (``fillRecvBuf`` / ``sendMsg``) mark ``csClosed`` themselves on a
-  ## dead socket — so only a still-``csReplicating`` state, the stranded case, is
-  ## changed here.
-  if conn.state == csReplicating:
+  ## Without this the connection would be stranded in ``csBusy`` or
+  ## ``csReplicating``: every later call would raise a misleading ``PgStateError``
+  ## ("connection is in use") for an apparently-live stream when the stream is in
+  ## fact dead, and the only recovery is to reconnect and resume (see
+  ## ``examples/replication.nim``). A clean stop (CopyDone -> ReadyForQuery) and a
+  ## server-side error followed by ReadyForQuery both return the connection to
+  ## ``csReady`` first, and the I/O helpers (``fillRecvBuf`` / ``sendMsg``) mark
+  ## ``csClosed`` themselves on a dead socket — so only a still-``csBusy`` state
+  ## (START_REPLICATION issued but CopyBothResponse never arrived, sub-cases where
+  ## the raiser did not mark ``csClosed``) or ``csReplicating`` state (torn down
+  ## mid-stream), the stranded cases, are changed here.
+  if conn.state in {csBusy, csReplicating}:
     conn.state = csClosed
 
 proc runReplicationStream(
@@ -1027,6 +1029,12 @@ proc runReplicationStream(
   ## ``START_REPLICATION`` query. ``context`` appears in error messages
   ## (e.g. ``"replication"`` / ``"physical replication"``).
   var queryError: ref PgQueryError
+
+  # Register the poison-on-abandon defer BEFORE waitCopyBoth so a raise during
+  # the CopyBothResponse wait (state still csBusy) is also poisoned, not just a
+  # mid-stream failure once csReplicating.
+  defer:
+    conn.invalidateAbandonedStream()
 
   block waitCopyBoth:
     while true:
@@ -1052,9 +1060,6 @@ proc runReplicationStream(
       await conn.fillRecvBuf()
 
   conn.resetReplLsnTracking(startLsn)
-
-  defer:
-    conn.invalidateAbandonedStream()
 
   var lastStatusSent = Moment.now()
   var pendingRead: Future[void] = nil
