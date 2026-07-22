@@ -373,10 +373,16 @@ template withAdvisoryLockCore(
 
   try:
     var released: bool
-    when twoKey:
-      released = await c.unlockProc(k1, k2)
+    when hasTimeout:
+      when twoKey:
+        released = await c.unlockProc(k1, k2, timeout = t)
+      else:
+        released = await c.unlockProc(k, timeout = t)
     else:
-      released = await c.unlockProc(k)
+      when twoKey:
+        released = await c.unlockProc(k1, k2)
+      else:
+        released = await c.unlockProc(k)
     if not released:
       # The unlock query succeeded but the server reports the lock was not
       # held (``pg_advisory_unlock*`` returned ``false``). Report it with a
