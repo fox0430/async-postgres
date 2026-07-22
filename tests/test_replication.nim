@@ -1,6 +1,10 @@
-import std/unittest
+import std/[unittest, importutils, tables]
 
-import ../async_postgres/[pg_errors, pg_protocol, pg_replication]
+import ../async_postgres/[async_backend, pg_errors, pg_protocol]
+import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_replication {.all.}
+
+privateAccess(PgConnection)
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
   ## Helper to build a raw backend message from type char + body bytes
@@ -682,3 +686,39 @@ suite "parseTimelineId":
   test "out-of-int32-range raises PgTypeError (no RangeDefect)":
     expect(PgTypeError):
       discard parseTimelineId("2147483648")
+
+suite "invalidateAbandonedStream":
+  # Callers set csBusy before START_REPLICATION and the state only advances to
+  # csReplicating once CopyBothResponse is parsed. If the stream unwinds while
+  # still csBusy (e.g. a future refactor introduces a raiser inside the
+  # waitCopyBoth loop that does not itself mark csClosed), the connection must
+  # be poisoned so checkReady raises "Connection is closed" rather than the
+  # misleading "connection is in use" that would strand it forever.
+  proc mkConn(state: PgConnState): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: state,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "csBusy is poisoned to csClosed":
+    let conn = mkConn(csBusy)
+    conn.invalidateAbandonedStream()
+    check conn.state == csClosed
+
+  test "csReplicating is poisoned to csClosed":
+    let conn = mkConn(csReplicating)
+    conn.invalidateAbandonedStream()
+    check conn.state == csClosed
+
+  test "csReady is left untouched (clean stop / server error path)":
+    let conn = mkConn(csReady)
+    conn.invalidateAbandonedStream()
+    check conn.state == csReady
+
+  test "csClosed is left untouched (I/O helpers already poisoned)":
+    let conn = mkConn(csClosed)
+    conn.invalidateAbandonedStream()
+    check conn.state == csClosed
