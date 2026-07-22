@@ -855,6 +855,11 @@ proc parseDataRow(body: openArray[byte]): BackendMessage =
       offset += colLen
 
 proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
+  # Reject empty body: the '\0' field terminator is mandatory, and letting it
+  # through surfaces upstack as a diagnostically empty PgQueryError.
+  if body.len == 0:
+    let name = if isError: "ErrorResponse" else: "NoticeResponse"
+    raise newException(PgProtocolError, name & ": empty body")
   if isError:
     result = BackendMessage(kind: bmkErrorResponse)
     result.errorFields = @[]
