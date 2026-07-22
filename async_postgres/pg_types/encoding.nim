@@ -712,6 +712,43 @@ proc decodeHexPair*(buf: openArray[byte], i: int, errCtx: string): byte =
     raise newException(PgTypeError, errCtx & ": non-hex character at position " & $i)
   byte((hi shl 4) or lo)
 
+proc decodeByteaEscape*(s: openArray[char], errCtx: string): seq[byte] =
+  ## Decode bytea text in the legacy `bytea_output = escape` format.
+  ## Server output only ever produces `\\` and `\NNN` (3 octal digits);
+  ## other bytes pass through verbatim.
+  result = newSeqOfCap[byte](s.len)
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c != '\\':
+      result.add(byte(c))
+      inc i
+      continue
+    if i + 1 >= s.len:
+      raise
+        newException(PgTypeError, errCtx & ": trailing backslash in bytea escape text")
+    let n = s[i + 1]
+    if n == '\\':
+      result.add(byte('\\'))
+      i += 2
+      continue
+    if n < '0' or n > '3' or i + 3 >= s.len:
+      raise newException(
+        PgTypeError, errCtx & ": malformed octal escape in bytea escape text"
+      )
+    let d2 = s[i + 2]
+    let d3 = s[i + 3]
+    if d2 < '0' or d2 > '7' or d3 < '0' or d3 > '7':
+      raise newException(
+        PgTypeError, errCtx & ": malformed octal escape in bytea escape text"
+      )
+    let v =
+      ((ord(n) - ord('0')) shl 6) or ((ord(d2) - ord('0')) shl 3) or (
+        ord(d3) - ord('0')
+      )
+    result.add(byte(v))
+    i += 4
+
 proc writeUuidAt(buf: var openArray[byte], pos: int, v: PgUuid) =
   ## Write the 16 raw bytes of ``v`` at ``buf[pos ..< pos + 16]``. Dashes are
   ## stripped before validation, so dash positions are not enforced (dashless

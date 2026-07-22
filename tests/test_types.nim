@@ -480,11 +480,26 @@ suite "getBytes accessor":
     let b = row.getBytes(0)
     check b.len == 0
 
-  test "raw bytes (no hex prefix)":
-    let raw = @[0x01'u8, 0x02, 0x03]
-    let row = @[some(raw)]
-    let b = row.getBytes(0)
-    check b == raw
+  test "escape format passthrough (no backslash)":
+    let row = @[some(toBytes("Hello"))]
+    check row.getBytes(0) == toBytes("Hello")
+
+  test "escape format decodes \\NNN octal":
+    # bytea_output=escape encodes bytes <0x20 or >0x7E as three-digit octal
+    let row = @[some(toBytes("\\000A\\377"))]
+    check row.getBytes(0) == @[0x00'u8, 0x41'u8, 0xFF'u8]
+
+  test "escape format decodes \\\\ backslash":
+    let row = @[some(toBytes("a\\\\b"))]
+    check row.getBytes(0) == @[0x61'u8, 0x5C'u8, 0x62'u8]
+
+  test "escape format rejects trailing backslash":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("abc\\"))]).getBytes(0)
+
+  test "escape format rejects malformed octal":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("\\4ab"))]).getBytes(0)
 
   test "NULL raises":
     let row = @[none(seq[byte])]
@@ -8761,6 +8776,13 @@ suite "Text-path parse errors raise PgTypeError (not ValueError)":
   test "getBytesArray odd-length hex element":
     expect PgTypeError:
       discard (Row @[some(toBytes("{\\xABC}"))]).getBytesArray(0)
+
+  test "getBytesArray escape-format element":
+    # Text-format array element without \x prefix must go through the
+    # escape decoder, not raw passthrough.
+    let arr = (Row @[some(toBytes("{\"\\\\000A\"}"))]).getBytesArray(0)
+    check arr.len == 1
+    check arr[0] == @[0x00'u8, 0x41'u8]
 
   test "getInet invalid mask":
     expect PgTypeError:
