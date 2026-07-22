@@ -363,6 +363,26 @@ suite "Binary type decoders: malformed input":
         @[byte 3, 129, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
       )
 
+  test "decodeInetBinary rejects unknown family":
+    # Only PGSQL_AF_INET (2) and PGSQL_AF_INET6 (3) are valid; anything else
+    # must not silently fall through to the IPv6 path and read 16 bytes.
+    expectTypeError:
+      discard decodeInetBinary(
+        @[byte 99, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+      )
+    expectTypeError:
+      discard decodeInetBinary(@[byte 0, 0, 0, 4, 192, 168, 0, 1])
+
+  test "decodeInetBinary rejects addrlen mismatch":
+    # IPv4 with addrlen != 4 is malformed.
+    expectTypeError:
+      discard decodeInetBinary(@[byte 2, 32, 0, 16, 192, 168, 0, 1])
+    # IPv6 with addrlen != 16 is malformed.
+    expectTypeError:
+      discard decodeInetBinary(
+        @[byte 3, 128, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+      )
+
   test "decodeInetBinary accepts boundary masks":
     let v4 = decodeInetBinary(@[byte 2, 32, 0, 4, 192, 168, 0, 1])
     check v4.mask == 32'u8
