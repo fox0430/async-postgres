@@ -831,6 +831,26 @@ suite "newPgQueryError":
     )
     check malformed.position == 0
 
+  test "position rejects values that would overflow int (no OverflowDefect)":
+    # A hostile/buggy server sending a huge decimal must not crash the caller
+    # with the uncatchable OverflowDefect from `result * 10 + d`.
+    let huge = newPgQueryError(
+      @[
+        ErrorField(code: 'C', value: "42601"),
+        ErrorField(code: 'P', value: "99999999999999999999"),
+        ErrorField(code: 'p', value: "1" & repeat('0', 40)),
+      ]
+    )
+    check huge.position == 0
+    check huge.internalPosition == 0
+    # Boundary: a value that fits must still parse.
+    let ok = newPgQueryError(
+      @[
+        ErrorField(code: 'C', value: "42601"), ErrorField(code: 'P', value: "123456789")
+      ]
+    )
+    check ok.position == 123456789
+
   test "SQLSTATE predicates":
     proc errWithState(state: string): ref PgQueryError =
       newPgQueryError(
