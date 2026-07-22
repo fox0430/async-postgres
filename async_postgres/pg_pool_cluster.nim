@@ -279,8 +279,7 @@ template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
     try:
       body
     finally:
-      await connPool.resetSession(conn)
-      conn.release()
+      await connPool.resetSessionAndRelease(conn)
 
 template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
@@ -289,8 +288,7 @@ template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
     try:
       body
     finally:
-      await cluster.primary.resetSession(conn)
-      conn.release()
+      await cluster.primary.resetSessionAndRelease(conn)
 
 macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool.

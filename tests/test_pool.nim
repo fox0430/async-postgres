@@ -1308,6 +1308,76 @@ when hasChronos:
         discard waitFor pool.acquire()
       check pool.idle.len == 0
 
+  suite "Pool resetSession cancellation (chronos)":
+    # Regression: `resetSession`'s `except CatchableError` used to catch
+    # `CancelledError` too, so a chronos cancel of the outer future
+    # completed as if reset had succeeded — cancellation silently lost.
+    test "resetSession propagates CancelledError instead of swallowing":
+      proc t() {.async.} =
+        let pool = makePool()
+        pool.config.resetQuery = "DISCARD ALL"
+        pool.config.resetQueryTimeout = seconds(60)
+
+        let (conn, server, serverTransport) = await makeHangingConn()
+        conn.txStatus = tsIdle # PgConnection() defaults to tsInFailedTransaction ('E')
+        conn.ownerPool = pool
+        conn.borrowed = true
+        pool.active = 1
+
+        let resetFut = pool.resetSession(conn)
+        # Let simpleExec write its Query and suspend on the never-answered response.
+        await sleepAsync(milliseconds(50))
+        doAssert not resetFut.finished
+
+        resetFut.cancelSoon()
+        var raised = false
+        try:
+          await resetFut
+        except CancelledError:
+          raised = true
+        doAssert raised
+        # State flipped synchronously so a follow-up release() would discard.
+        doAssert conn.state == csClosed
+
+        await pool.close(seconds(1))
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
+    test "resetSessionAndRelease still releases the conn under cancel":
+      proc t() {.async.} =
+        let pool = makePool()
+        pool.config.resetQuery = "DISCARD ALL"
+        pool.config.resetQueryTimeout = seconds(60)
+
+        let (conn, server, serverTransport) = await makeHangingConn()
+        conn.txStatus = tsIdle # PgConnection() defaults to tsInFailedTransaction ('E')
+        conn.ownerPool = pool
+        conn.borrowed = true
+        pool.active = 1
+
+        let fut = pool.resetSessionAndRelease(conn)
+        await sleepAsync(milliseconds(50))
+        doAssert not fut.finished
+
+        fut.cancelSoon()
+        var raised = false
+        try:
+          await fut
+        except CancelledError:
+          raised = true
+        doAssert raised
+        # release() ran under the inner finally: borrow cleared and active
+        # decremented via releaseCore's discard path (state == csClosed).
+        doAssert not conn.borrowed
+        doAssert pool.active == 0
+        doAssert conn.state == csClosed
+
+        await pool.close(seconds(1))
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
 suite "Acquire deadline budget":
   ## Regression for acquire latency exceeding acquireTimeout: health-check
   ## pings and a caller-driven connect used to run on their own budgets
