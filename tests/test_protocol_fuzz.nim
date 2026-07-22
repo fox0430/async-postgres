@@ -581,6 +581,17 @@ suite "Binary type decoders: malformed input":
     expectTypeError:
       discard decodeHstoreBinary(data)
 
+  test "decodeHstoreBinary numPairs exceeds data":
+    # numPairs = int32.high with only the 4-byte header must be rejected
+    # up front rather than entering the pair loop.
+    var data = newSeq[byte](4)
+    data[0] = 0x7F
+    data[1] = 0xFF
+    data[2] = 0xFF
+    data[3] = 0xFF
+    expectTypeError:
+      discard decodeHstoreBinary(data)
+
   test "decodeBinaryTsVector short":
     expectTypeError:
       discard decodeBinaryTsVector(@[])

@@ -23,6 +23,11 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
   if numPairs < 0:
     raise
       newException(PgTypeError, "hstore binary: invalid number of pairs " & $numPairs)
+  # Each pair carries at least keyLen (4) + valLen (4) = 8 bytes after the
+  # 4-byte count, so numPairs cannot exceed (data.len - 4) div 8. Matches the
+  # upfront guard in decodeBinaryComposite / decodeBinaryTsVector.
+  if numPairs > (data.len - 4) div 8:
+    raise newException(PgTypeError, "hstore binary: pair count exceeds data")
 
   var pos = 4
   for _ in 0 ..< numPairs:
