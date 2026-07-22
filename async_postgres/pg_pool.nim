@@ -1322,6 +1322,12 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
       ]
     )
 
+proc failPendingAndUnschedule(pool: PgPool, err: ref CatchableError) {.raises: [].} =
+  ## Recovery for the "no dispatch is coming" case: fail every queued op
+  ## and clear the scheduled flag so a later caller can re-arm.
+  pool.failAllPending(err)
+  pool.dispatchScheduled = false
+
 proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
   ## Schedule a batch dispatch on the next event loop tick.
   if pool.dispatchScheduled:
@@ -1344,15 +1350,15 @@ proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
         asyncSpawn p.run()
       except Exception as e:
         # asyncSpawn should not raise in practice, but the compiler cannot
-        # prove it.  Fail any pending ops so their futures do not hang.
+        # prove it.
         let err = newException(PgError, "Pipeline dispatch failed: " & e.msg)
-        p.failAllPending(err)
-        p.dispatchScheduled = false
+        p.failPendingAndUnschedule(err)
 
   try:
     scheduleSoon(cb)
-  except CatchableError:
-    pool.dispatchScheduled = false
+  except CatchableError as e:
+    let err = newException(PgError, "Pipeline dispatch schedule failed: " & e.msg)
+    pool.failPendingAndUnschedule(err)
 
 proc exec*(
     pool: PgPool,
