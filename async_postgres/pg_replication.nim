@@ -1220,6 +1220,10 @@ proc startReplication*(
   ## When ``publication_names`` (a pgoutput-only option) is present without an
   ## explicit ``proto_version``, this proc pins it to ``'1'`` so a future
   ## server-side default bump cannot upgrade the stream past the bundled decoder.
+  ##
+  ## Option values are appended verbatim — the caller must supply a valid
+  ## SQL literal (``'my_pub'``, integer, boolean) and quote any untrusted
+  ## input, or a stray ``)`` / newline / ``'`` will inject SQL.
   # Reject unsupported proto_version pre-flight so the failure is a plain input
   # error rather than a mid-stream decode break.
   var hasProtoVersion = false
