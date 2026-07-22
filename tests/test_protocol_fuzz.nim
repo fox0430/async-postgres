@@ -201,6 +201,13 @@ suite "parseBackendMessage: per-kind malformed bodies":
       expectParseError:
         discard tryParse(wrap(kind, body))
 
+  test "ErrorResponse (E) / NoticeResponse (N) with empty body":
+    # The '\0' terminator is mandatory; empty body must not fall through as
+    # an empty PgQueryError.
+    for kind in ['E', 'N']:
+      expectParseError:
+        discard tryParse(wrap(kind, @[]))
+
   test "ParameterStatus (S) missing value terminator":
     # "key\0" but value has no null.
     let body = @[byte('k'), byte('e'), byte('y'), 0'u8, byte('v'), byte('a')]
