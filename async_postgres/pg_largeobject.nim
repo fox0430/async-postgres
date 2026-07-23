@@ -240,6 +240,8 @@ proc loReadAll*(
   ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
   ## reach `N × timeout` for N chunks. Use `loReadAllDeadline` for a single
   ## wall-clock deadline covering the whole read.
+  if chunkSize <= 0:
+    raise newException(ValueError, "loReadAll: chunkSize must be positive")
   result = @[]
   while true:
     let chunk = await lo.loRead(chunkSize, timeout)
@@ -258,8 +260,10 @@ proc loWriteAll*(
   ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
   ## reach `N × timeout` for N chunks. Use `loWriteAllDeadline` for a single
   ## wall-clock deadline covering the whole write.
-  if chunkSize <= 0:
-    raise newException(ValueError, "loWriteAll: chunkSize must be positive")
+  # Upper bound keeps `int32(chunk.len)` below RangeDefect and stays under the
+  # Postgres Bind-parameter int32 length ceiling.
+  if chunkSize <= 0 or chunkSize > high(int32):
+    raise newException(ValueError, "loWriteAll: chunkSize must be in (0, int32.high]")
   var offset = 0
   while offset < data.len:
     let endIdx = min(offset + chunkSize, data.len)
@@ -284,6 +288,13 @@ proc loSize*(
   ## **Implementation:** uses `loSeek(0, SEEK_END)`'s return value (the new
   ## absolute position) as the size directly, saving one round-trip over an
   ## equivalent `loSeek + loTell` pair.
+  ##
+  ## **Caveat:** if the final `loSeek(savedPos, SEEK_SET)` raises (timeout or
+  ## other server error), the Large Object's file position is left at the end
+  ## of the object (from the internal `SEEK_END`) and subsequent reads via the
+  ## same handle return no data until the caller reseeks. Most error paths
+  ## also invalidate the connection, so the handle is typically unusable
+  ## regardless.
   let savedPos = await lo.loTell(timeout)
   result = await lo.loSeek(0, SEEK_END, timeout)
   discard await lo.loSeek(savedPos, SEEK_SET, timeout)
@@ -323,6 +334,8 @@ proc loReadStream*(
   ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
   ## reach `N × timeout` plus the cumulative callback runtime. Use
   ## `loReadStreamDeadline` for a single wall-clock deadline.
+  if chunkSize <= 0:
+    raise newException(ValueError, "loReadStream: chunkSize must be positive")
   while true:
     let chunk = await lo.loRead(chunkSize, timeout)
     if chunk.len == 0:
@@ -341,6 +354,11 @@ proc loWriteStream*(
   ## **Timeout semantics:** `timeout` applies *per chunk* within each
   ## `loWriteAll` invocation. Total wall-clock is unbounded. Use
   ## `loWriteStreamDeadline` for a single wall-clock deadline.
+  # Validate here too: an early-empty callback would otherwise skip loWriteAll
+  # entirely and let a bad chunkSize slip through.
+  if chunkSize <= 0 or chunkSize > high(int32):
+    raise
+      newException(ValueError, "loWriteStream: chunkSize must be in (0, int32.high]")
   while true:
     let data = await callback()
     if data.len == 0:
@@ -377,6 +395,8 @@ proc loReadAllDeadline*(
 ): Future[seq[byte]] {.async.} =
   ## Like `loReadAll` but `deadline` bounds total wall-clock across all chunks.
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  if chunkSize <= 0:
+    raise newException(ValueError, "loReadAllDeadline: chunkSize must be positive")
   let deadlineMoment = Moment.now() + deadline
   result = @[]
   while true:
@@ -393,8 +413,10 @@ proc loWriteAllDeadline*(
 ): Future[void] {.async.} =
   ## Like `loWriteAll` but `deadline` bounds total wall-clock across all chunks.
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
-  if chunkSize <= 0:
-    raise newException(ValueError, "loWriteAllDeadline: chunkSize must be positive")
+  if chunkSize <= 0 or chunkSize > high(int32):
+    raise newException(
+      ValueError, "loWriteAllDeadline: chunkSize must be in (0, int32.high]"
+    )
   let deadlineMoment = Moment.now() + deadline
   var offset = 0
   while offset < data.len:
@@ -434,6 +456,8 @@ proc loReadStreamDeadline*(
   ## Like `loReadStream` but `deadline` bounds total wall-clock across all
   ## reads. Callback time is included in the deadline.
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  if chunkSize <= 0:
+    raise newException(ValueError, "loReadStreamDeadline: chunkSize must be positive")
   let deadlineMoment = Moment.now() + deadline
   while true:
     let chunk = await lo.loRead(chunkSize, remainingDeadlineDuration(deadlineMoment))
@@ -450,6 +474,10 @@ proc loWriteStreamDeadline*(
   ## Like `loWriteStream` but `deadline` bounds total wall-clock across all
   ## writes. Callback time is included in the deadline.
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
+  if chunkSize <= 0 or chunkSize > high(int32):
+    raise newException(
+      ValueError, "loWriteStreamDeadline: chunkSize must be in (0, int32.high]"
+    )
   let deadlineMoment = Moment.now() + deadline
   while true:
     let data = await callback()
