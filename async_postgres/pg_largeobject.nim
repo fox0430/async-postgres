@@ -71,9 +71,6 @@ template makeLoWriteCallback*(body: untyped): LoWriteCallback =
   ## Create a ``LoWriteCallback`` that works with both asyncdispatch and chronos.
   ## ``body`` must evaluate to ``seq[byte]``. Return an empty seq to signal completion.
   ##
-  ## With asyncdispatch, anonymous async procs cannot return non-void types,
-  ## so this template wraps the body in manual ``Future`` construction.
-  ##
   ## .. code-block:: nim
   ##   var idx = 0
   ##   let chunks = @[data1, data2]
@@ -84,7 +81,7 @@ template makeLoWriteCallback*(body: untyped): LoWriteCallback =
   ##       chunk
   ##     else:
   ##       newSeq[byte]()
-  makeAsyncSeqByteCallback(LoWriteCallback, "makeLoWriteCallback", body)
+  makeAsyncSeqByteCallback(LoWriteCallback, body)
 
 proc parseLoInt(s, fn: string): BiggestInt =
   ## Convert a numeric scalar returned by a Large Object server function to an

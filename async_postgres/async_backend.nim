@@ -318,26 +318,18 @@ template makeAsyncSinkByteCallback*(cbType: typedesc, body: untyped): untyped =
         body
       r
 
-template makeAsyncSeqByteCallback*(
-    cbType: typedesc, futName: static string, body: untyped
-): untyped =
+template makeAsyncSeqByteCallback*(cbType: typedesc, body: untyped): untyped =
   ## Build a `cbType` producer callback returning `Future[seq[byte]]`.
-  ## Under asyncdispatch `body` must be synchronous: `async` cannot annotate a
-  ## non-void anonymous proc, so the Future is constructed manually.
+  ## `{.async.}` handles both the final-expression form and early
+  ## `return <expr>` inside `body` symmetrically across backends.
   block:
     when hasChronos:
       let r: cbType = proc(): Future[seq[byte]] {.async: (raises: [CatchableError]).} =
         body
       r
     else:
-      let r: cbType = proc(): Future[seq[byte]] {.gcsafe.} =
-        let fut = newFuture[seq[byte]](futName)
-        try:
-          let res: seq[byte] = body
-          fut.complete(res)
-        except CatchableError as e:
-          fut.fail(e)
-        return fut
+      let r: cbType = proc(): Future[seq[byte]] {.async.} =
+        body
       r
 
 proc remainingDeadlineDuration*(deadline: Moment): Duration =
