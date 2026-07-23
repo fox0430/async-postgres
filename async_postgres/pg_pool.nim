@@ -315,11 +315,11 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   ## and no advisory locks held). Callers don't need to gate on the pool
   ## config.
   ##
-  ## Never propagates `CatchableError`: this is invoked from `finally` blocks
-  ## in the `with*` helpers (and the per-call cleanup path of `exec` / `query`
-  ## etc.), where a raised reset error would mask the body's original
-  ## exception. Cleanup errors — including any raised from the close path's
-  ## tracer hook — are swallowed.
+  ## Swallows `CatchableError` (invoked from `finally`, so a raised reset
+  ## error would mask the body's original exception) but re-raises
+  ## `CancelledError` — chronos requires cancellation to propagate.
+  ## Callers must chain `release()` under `try/finally` (or use
+  ## `resetSessionAndRelease`) to keep pool accounting balanced on cancel.
   if conn.state != csReady or conn.txStatus != tsIdle:
     return
   if pool.config.resetQuery.len == 0 and not conn.sessionLockDirty:
@@ -327,7 +327,10 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   try:
     if conn.sessionLockDirty:
       let t = pool.config.tracer
-      if t != nil and t.onLeakedSessionLocks != nil and conn.heldSessionLocks > 0:
+      if t != nil and t.onLeakedSessionLocks != nil:
+        # Fire on the sticky flag rather than the counter so a raw acquire
+        # released through the typed API — which decrements the counter for a
+        # lock it never tracked — cannot silence the leak hook.
         t.onLeakedSessionLocks(
           TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
         )
@@ -341,6 +344,13 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
         pool.config.resetQuery, timeout = pool.config.resetQueryTimeout
       )
       conn.clearStmtCache()
+  except CancelledError as e:
+    # Split from the generic handler so cancellation propagates. Flip state
+    # synchronously so the subsequent release() routes to releaseCore's discard
+    # path. The actual socket close is performed by releaseCore's closeNoWait;
+    # calling it here as well would double-count metrics.
+    conn.state = csClosed
+    raise e
   except CatchableError:
     try:
       await pool.tracedClose(conn)
@@ -725,8 +735,10 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
       tracer.onPoolDoubleRelease(TracePoolDoubleReleaseData(conn: conn))
     return
   conn.borrowed = false
-  if conn.sessionLockDirty and conn.heldSessionLocks > 0 and tracer != nil and
-      tracer.onLeakedSessionLocks != nil:
+  if conn.sessionLockDirty and tracer != nil and tracer.onLeakedSessionLocks != nil:
+    # Fire on the sticky flag rather than the counter so a raw acquire
+    # released through the typed API — which decrements the counter for a
+    # lock it never tracked — cannot silence the leak hook.
     tracer.onLeakedSessionLocks(
       TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
     )
@@ -779,6 +791,15 @@ proc release*(h: PooledConnHandle) =
   if not h.released and h.conn != nil:
     h.released = true
     h.conn.release()
+
+proc resetSessionAndRelease*(pool: PgPool, conn: PgConnection) {.async.} =
+  ## `resetSession` + `release`, wrapped so `release()` still runs when the
+  ## reset propagates `CancelledError` (chronos cancel would otherwise skip
+  ## the follow-up `release()` and leak a pool slot).
+  try:
+    await pool.resetSession(conn)
+  finally:
+    conn.release()
 
 proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
   ## Clean up a waiter whose acquire is being abandoned via timeout or external
@@ -1102,8 +1123,7 @@ template withConnection*(pool: PgPool, conn, body: untyped) =
   try:
     body
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
   ## Fail a pending op's future if not already finished.
@@ -1200,8 +1220,7 @@ proc executeBatch(
     for op in batch:
       failPendingOp(op, e)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc dispatchHomogeneous(
     pool: PgPool, ops: seq[PendingPoolOp], maxConns: int
@@ -1244,8 +1263,7 @@ proc dispatchHomogeneous(
             )
           completePendingOp(op, r)
       finally:
-        await pool.resetSession(conn)
-        conn.release()
+        await pool.resetSessionAndRelease(conn)
     except CatchableError as e:
       failPendingOp(op, e)
     return
@@ -1275,8 +1293,7 @@ proc dispatchHomogeneous(
   var batchFuts: seq[Future[void]]
   for ci in 0 ..< conns.len:
     if connOps[ci].len == 0:
-      await pool.resetSession(conns[ci])
-      conns[ci].release()
+      await pool.resetSessionAndRelease(conns[ci])
       continue
     batchFuts.add(executeBatch(pool, conns[ci], connOps[ci]))
 
@@ -1322,6 +1339,12 @@ proc dispatchBatchImpl(pool: PgPool) {.async.} =
       ]
     )
 
+proc failPendingAndUnschedule(pool: PgPool, err: ref CatchableError) {.raises: [].} =
+  ## Recovery for the "no dispatch is coming" case: fail every queued op
+  ## and clear the scheduled flag so a later caller can re-arm.
+  pool.failAllPending(err)
+  pool.dispatchScheduled = false
+
 proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
   ## Schedule a batch dispatch on the next event loop tick.
   if pool.dispatchScheduled:
@@ -1344,15 +1367,15 @@ proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
         asyncSpawn p.run()
       except Exception as e:
         # asyncSpawn should not raise in practice, but the compiler cannot
-        # prove it.  Fail any pending ops so their futures do not hang.
+        # prove it.
         let err = newException(PgError, "Pipeline dispatch failed: " & e.msg)
-        p.failAllPending(err)
-        p.dispatchScheduled = false
+        p.failPendingAndUnschedule(err)
 
   try:
     scheduleSoon(cb)
-  except CatchableError:
-    pool.dispatchScheduled = false
+  except CatchableError as e:
+    let err = newException(PgError, "Pipeline dispatch schedule failed: " & e.msg)
+    pool.failPendingAndUnschedule(err)
 
 proc exec*(
     pool: PgPool,
@@ -1383,8 +1406,7 @@ proc exec*(
   try:
     return await conn.exec(sql, params, timeout = timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc exec*(
     pool: PgPool,
@@ -1415,8 +1437,7 @@ proc exec*(
   try:
     return await conn.exec(sql, params, timeout = timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc query*(
     pool: PgPool,
@@ -1453,8 +1474,7 @@ proc query*(
   try:
     return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc query*(
     pool: PgPool,
@@ -1487,8 +1507,7 @@ proc query*(
   try:
     return await conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryEach*(
     pool: PgPool,
@@ -1507,8 +1526,7 @@ proc queryEach*(
   try:
     return await conn.queryEach(sql, params, callback, resultFormat, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryRowOpt*(
     pool: PgPool,
@@ -1522,8 +1540,7 @@ proc queryRowOpt*(
   try:
     return await conn.queryRowOpt(sql, params, resultFormat, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryRow*(
     pool: PgPool,
@@ -1538,8 +1555,7 @@ proc queryRow*(
   try:
     return await conn.queryRow(sql, params, resultFormat, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryValue*(
     pool: PgPool,
@@ -1553,8 +1569,7 @@ proc queryValue*(
   try:
     return await conn.queryValue(sql, params, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryValue*[T](
     pool: PgPool,
@@ -1569,8 +1584,7 @@ proc queryValue*[T](
   try:
     return await conn.queryValue(T, sql, params, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryValueOpt*(
     pool: PgPool,
@@ -1584,8 +1598,7 @@ proc queryValueOpt*(
   try:
     return await conn.queryValueOpt(sql, params, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryValueOpt*[T](
     pool: PgPool,
@@ -1600,8 +1613,7 @@ proc queryValueOpt*[T](
   try:
     return await conn.queryValueOpt(T, sql, params, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryValueOrDefault*(
     pool: PgPool,
@@ -1616,8 +1628,7 @@ proc queryValueOrDefault*(
   try:
     return await conn.queryValueOrDefault(sql, params, default, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryValueOrDefault*[T](
     pool: PgPool,
@@ -1633,8 +1644,7 @@ proc queryValueOrDefault*[T](
   try:
     return await conn.queryValueOrDefault(T, sql, params, default, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryValueOrDefault*[T](
     pool: PgPool,
@@ -1650,8 +1660,7 @@ proc queryValueOrDefault*[T](
   try:
     return await conn.queryValueOrDefault(sql, params, default, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryExists*(
     pool: PgPool,
@@ -1664,8 +1673,7 @@ proc queryExists*(
   try:
     return await conn.queryExists(sql, params, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryColumn*(
     pool: PgPool,
@@ -1679,8 +1687,7 @@ proc queryColumn*(
   try:
     return await conn.queryColumn(sql, params, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc simpleQuery*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
@@ -1692,8 +1699,7 @@ proc simpleQuery*(
   try:
     return await conn.simpleQuery(sql, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc simpleExec*(
     pool: PgPool, sql: string, timeout: Duration = ZeroDuration
@@ -1705,8 +1711,7 @@ proc simpleExec*(
   try:
     return await conn.simpleExec(sql, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc execInTransaction*(
     pool: PgPool,
@@ -1719,8 +1724,7 @@ proc execInTransaction*(
   try:
     return await conn.execInTransaction(sql, params, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc execInTransaction*(
     pool: PgPool,
@@ -1735,8 +1739,7 @@ proc execInTransaction*(
   try:
     return await conn.execInTransaction(sql, params, opts, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryInTransaction*(
     pool: PgPool,
@@ -1750,8 +1753,7 @@ proc queryInTransaction*(
   try:
     return await conn.queryInTransaction(sql, params, resultFormat, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc queryInTransaction*(
     pool: PgPool,
@@ -1767,8 +1769,7 @@ proc queryInTransaction*(
   try:
     return await conn.queryInTransaction(sql, params, opts, resultFormat, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc notify*(
     pool: PgPool,
@@ -1781,8 +1782,7 @@ proc notify*(
   try:
     await conn.notify(channel, payload, timeout)
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction using a pooled connection.
@@ -1839,7 +1839,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
-  let resetSessionSym = bindSym"resetSession"
+  let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
   result = quote:
     let `poolSym` = `poolExpr`
@@ -1853,8 +1853,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         `bodyCleanup`
         raise `eSym`
     finally:
-      await `resetSessionSym`(`poolSym`, `connIdent`)
-      `connIdent`.release()
+      await `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
 
 macro withTransactionRetry*(
     pool: PgPool, retryOpts: RetryOptions, args: varargs[untyped]
@@ -1910,7 +1909,7 @@ macro withTransactionRetry*(
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let retryOptsSym = genSym(nskLet, "retryOpts")
-  let resetSessionSym = bindSym"resetSession"
+  let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let loop = buildRetryTxLoop(connIdent, retryOptsSym, beginSql, txTimeout, body)
   # Evaluate retryOpts before acquire(): a raise from the expression would
   # otherwise leak the pooled connection past the try/finally.
@@ -1921,8 +1920,7 @@ macro withTransactionRetry*(
     try:
       `loop`
     finally:
-      await `resetSessionSym`(`poolSym`, `connIdent`)
-      `connIdent`.release()
+      await `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
 
 macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single
@@ -1997,7 +1995,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let connOptSym = genSym(nskVar, "connOpt")
   let releasedSym = genSym(nskVar, "released")
   let cancelledSym = genSym(nskLet, "cancelled")
-  let resetSessionSym = bindSym"resetSession"
+  let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let csReadySym = bindSym"csReady"
   let csClosedSym = bindSym"csClosed"
   let cancelNoWaitSym = bindSym"cancelNoWait"
@@ -2037,9 +2035,12 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
           `connIdent`.state = `csClosedSym`
         raise `cancelledSym`
       finally:
-        await `resetSessionSym`(`poolSym`, `connIdent`)
-        `connIdent`.release()
-        `releasedSym` = true
+        # Inner finally: helper releases even on cancel, so flag unconditionally
+        # — else the outer timeout handler double-invalidates an already-released conn.
+        try:
+          await `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
+        finally:
+          `releasedSym` = true
 
     let `bodyFutSym` = `bodyFnSym`()
     try:
@@ -2127,7 +2128,7 @@ macro withTransactionRetryDeadline*(
   let connOptSym = genSym(nskVar, "connOpt")
   let releasedSym = genSym(nskVar, "released")
   let cancelledSym = genSym(nskLet, "cancelled")
-  let resetSessionSym = bindSym"resetSession"
+  let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let csReadySym = bindSym"csReady"
   let csClosedSym = bindSym"csClosed"
   let cancelNoWaitSym = bindSym"cancelNoWait"
@@ -2188,9 +2189,11 @@ macro withTransactionRetryDeadline*(
           `connIdent`.state = `csClosedSym`
         raise `cancelledSym`
       finally:
-        await `resetSessionSym`(`poolSym`, `connIdent`)
-        `connIdent`.release()
-        `releasedSym` = true
+        # Nested finally: see withTransactionDeadline for the rationale.
+        try:
+          await `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
+        finally:
+          `releasedSym` = true
 
     `loop`
 
@@ -2202,8 +2205,7 @@ template withPipeline*(pool: PgPool, pipeline, body: untyped) =
     let pipeline = newPipeline(conn)
     body
   finally:
-    await pool.resetSession(conn)
-    conn.release()
+    await pool.resetSessionAndRelease(conn)
 
 proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close the pool: stop the maintenance loop, cancel all waiters, and close

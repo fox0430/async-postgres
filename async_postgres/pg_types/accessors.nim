@@ -431,31 +431,28 @@ proc getBool*(row: Row, col: int): bool =
     raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getBytes*(row: Row, col: int): seq[byte] =
-  ## Get a column value as raw bytes. Decodes hex-encoded bytea in text format.
-  ## Raises `PgTypeError` on NULL.
+  ## Get a column value as raw bytes. Decodes bytea text output in both
+  ## hex (`\xDEADBEEF`) and legacy escape formats. Raises `PgTypeError`
+  ## on NULL.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
-    # Binary format: raw bytes, no hex encoding
     result = readBytes(row.data.buf, off, clen)
     return
-  # Text format: bytea uses hex encoding \xDEADBEEF
+  let errCtx = "Column " & $col
   if clen >= 2 and row.data.buf[off] == byte('\\') and row.data.buf[off + 1] == byte(
     'x'
   ):
     let hexLen = clen - 2
     if hexLen mod 2 != 0:
-      raise newException(
-        PgTypeError, "Column " & $col & ": odd-length hex in bytea text value"
-      )
+      raise newException(PgTypeError, errCtx & ": odd-length hex in bytea text value")
     result = newSeq[byte](hexLen div 2)
     let hexOff = off + 2
-    let errCtx = "Column " & $col
     for i in 0 ..< result.len:
       result[i] = decodeHexPair(row.data.buf, hexOff + i * 2, errCtx)
   else:
-    result = readBytes(row.data.buf, off, clen)
+    result = decodeByteaEscape(bufView(row, off, clen), errCtx)
 
 proc getTimestamp*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime. Handles binary timestamp format.
@@ -851,11 +848,21 @@ proc getCircle*(row: Row, col: int): PgCircle =
 
 template optAccessor*(getProc, optProc: untyped, T: typedesc) =
   ## Generate ``optProc*(row, col): Option[T]`` that delegates to ``getProc``.
-  proc optProc*(row: Row, col: int): Option[T] =
-    if row.isNull(col):
-      none(T)
-    else:
-      some(row.getProc(col))
+  # Forward `scale` when getProc takes one; otherwise Opt would silently
+  # drop it and tag results with the default (wrong on non-`C` locales).
+  when compiles((var r: Row; discard r.getProc(0, scale = 2))):
+    proc optProc*(row: Row, col: int, scale: int = 2): Option[T] =
+      if row.isNull(col):
+        none(T)
+      else:
+        some(row.getProc(col, scale))
+
+  else:
+    proc optProc*(row: Row, col: int): Option[T] =
+      if row.isNull(col):
+        none(T)
+      else:
+        some(row.getProc(col))
 
 template nameAccessor*(getProc: untyped, T: typedesc) =
   ## Generate ``getProc*(row, name): T`` that delegates to the index-based overload.
@@ -1207,16 +1214,16 @@ genArrayDecoder(getMacAddr8Array, PgMacAddr8, "macaddr8", PgMacAddr8(e.get))
 genArrayDecoder(getNumericArray, PgNumeric, "numeric", parsePgNumeric(e.get))
 
 proc bytesElemFromText(s: string): seq[byte] =
+  const errCtx = "bytea array element"
   if s.len >= 2 and s[0] == '\\' and s[1] == 'x':
     let hexLen = s.len - 2
     if hexLen mod 2 != 0:
       raise newException(PgTypeError, "odd-length hex in bytea array element: " & s)
-    const errCtx = "bytea array element"
     result = newSeq[byte](hexLen div 2)
     for j in 0 ..< result.len:
       result[j] = decodeHexPair(s, 2 + j * 2, errCtx)
   else:
-    result = toBytes(s)
+    result = decodeByteaEscape(s.toOpenArray(0, s.high), errCtx)
 
 genArrayDecoder(getBytesArray, seq[byte], "bytea", bytesElemFromText(e.get))
 

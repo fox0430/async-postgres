@@ -228,6 +228,11 @@ type
     pid*: int32
     secretKey*: int32
     serverParams*: Table[string, string]
+    negotiatedMinorVersion*: int32
+      ## Highest minor version the server supports, from `NegotiateProtocolVersion`.
+      ## Zero when no such message was seen.
+    unrecognizedStartupOptions*: seq[string]
+      ## `_pq_.*` options the server rejected, from `NegotiateProtocolVersion`.
     txStatus*: TransactionStatus
     notifyCallback*: NotifyCallback
     noticeCallback*: NoticeCallback
@@ -286,13 +291,16 @@ type
       ## to the gap until the next operation.
     heldSessionLocks*: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
-      ## API, minus tracked releases. Reported by the `onLeakedSessionLocks`
-      ## tracer hook. Raw-SQL acquires
-      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass this counter,
-      ## so it is best-effort under mixed typed/raw usage — the pool's
-      ## reset/discard decision uses `sessionLockDirty` instead so a raw
-      ## acquire released through the typed API cannot forge a `== 0` count
-      ## and leak a tracked lock into the next borrower.
+      ## API, minus tracked releases. Reported (best-effort) by the
+      ## `onLeakedSessionLocks` tracer hook. Raw-SQL acquires
+      ## (`conn.exec("SELECT pg_advisory_lock(...)")`) bypass the increment,
+      ## but a typed `advisoryUnlock` of a raw-acquired key still decrements
+      ## the counter when the server reports the release — under mixed
+      ## typed/raw usage the counter therefore *under-reports* the true
+      ## number of tracked locks still held. The pool's reset/discard
+      ## decision and the leak-hook trigger both key off `sessionLockDirty`
+      ## instead, so a mis-decremented counter cannot leak a tracked lock
+      ## into the next borrower or silence the leak signal.
     sessionLockDirty*: bool
       ## Sticky flag: set on any tracked session-level acquire, cleared only
       ## by `advisoryUnlockAll` or connection reset. Drives the pool's
@@ -512,13 +520,15 @@ type
 
   TraceLeakedSessionLocksData* = object
     ## Advisory notification that a pool connection returned while still
-    ## holding session-level advisory locks acquired through the typed API.
-    ## The pool handles cleanup itself — either running
-    ## ``pg_advisory_unlock_all`` from ``resetSession`` and reusing the
-    ## connection, or discarding it on ``release`` when ``resetSession`` was
-    ## bypassed. Use this hook to detect missing ``advisoryUnlock`` /
-    ## ``advisoryUnlockAll`` calls at the borrow site, since silent cleanup
-    ## would otherwise mask the leak.
+    ## dirty from a tracked session-level advisory acquire. Fires on the
+    ## sticky ``sessionLockDirty`` flag, not on the counter, so a raw acquire
+    ## whose release ran through the typed API — decrementing the counter
+    ## for a lock the counter never tracked — cannot silence this hook. The
+    ## pool handles cleanup itself — either running ``pg_advisory_unlock_all``
+    ## from ``resetSession`` and reusing the connection, or discarding it on
+    ## ``release`` when ``resetSession`` was bypassed. Use this hook to
+    ## detect missing ``advisoryUnlock`` / ``advisoryUnlockAll`` calls at
+    ## the borrow site, since silent cleanup would otherwise mask the leak.
     ##
     ## A failed ``withAdvisoryLock*`` unlock (see ``onAdvisoryUnlockFailed``)
     ## does not decrement ``heldSessionLocks`` — the lock may still be held
@@ -528,7 +538,12 @@ type
     ## (unlock attempt vs. pool-return detection); de-duplicate per ``conn``
     ## if a single event is wanted.
     conn*: PgConnection
-    count*: int ## Value of ``heldSessionLocks`` at detection time
+    count*: int
+      ## Value of ``heldSessionLocks`` at detection time. May be ``0`` when
+      ## a typed unlock of a raw-acquired key drove the counter to zero
+      ## while a still-held tracked (or raw) lock kept ``sessionLockDirty``
+      ## set — treat non-zero as a lower bound on tracked-lock leaks and
+      ## zero as "the counter cannot vouch, but a leak is still possible".
 
   TraceInsecureAuthData* = object
     ## Advisory notification that a server-requested auth method is

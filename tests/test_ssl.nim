@@ -5,7 +5,7 @@ import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 
 when hasChronos:
-  import ../async_postgres/pg_bearssl
+  import ../async_postgres/pg_bearssl {.all.}
   import bearssl/abi/bearssl_ssl as bssl
 
 proc testCaCert(): string =
@@ -370,6 +370,53 @@ suite "SSL negotiation - pre-TLS byte injection":
           discard await readN(st, 8) # SSLRequest
           # 'S' plus injected plaintext, sent as a single segment.
           await sendBytes(st, @[byte('S'), byte('X'), byte('Y'), byte('Z')])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "unencrypted data" in e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+
+  test "split-write injection after 'S' response is rejected (CVE-2021-23214 family)":
+    # Same CVE family, but 'S' and the injected bytes are sent by two separate
+    # writes rather than a single segment. Depending on how the kernel schedules
+    # the two writes on loopback, either the pre-TLS-check window catches the
+    # injection via `socketHasPendingData` (bytes already in the kernel buffer)
+    # or the extra bytes coalesce with 'S' into chronos's read and are caught
+    # via the `n > 1` path — both are valid defenses and yield the same error.
+    var raised = false
+    var msgMatches = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8) # SSLRequest
+          await sendBytes(st, @[byte('S')])
+          await sendBytes(st, @[byte('X'), byte('Y'), byte('Z')])
         except CatchableError:
           discard
         await closeClient(st)
@@ -1515,3 +1562,63 @@ when hasChronos:
       # `inner` still routes into the shared default validator (untouched by
       # rebind), so cert-chain delegation keeps working.
       check conn.x509Capture.inner == newConn.x509Capture.inner
+
+when hasChronos:
+  suite "parseTrustAnchors - malformed PEM input":
+    test "empty CERTIFICATE block alone raises PgError, not IndexDefect":
+      const pem = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+      expect PgError:
+        discard parseTrustAnchors(pem)
+
+    test "empty CERTIFICATE block mixed with a valid CA yields the valid anchor":
+      const emptyBlock = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+      let mixed = emptyBlock & testCaCert()
+      let parsed = parseTrustAnchors(mixed)
+      check parsed.backing.len > 0
+
+    test "valid CA followed by empty CERTIFICATE block yields the valid anchor":
+      const emptyBlock = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+      let mixed = testCaCert() & emptyBlock
+      let parsed = parseTrustAnchors(mixed)
+      check parsed.backing.len > 0
+
+    test "PEM with only non-CERTIFICATE blocks raises PgError":
+      const pem =
+        "-----BEGIN PRIVATE KEY-----\n" &
+        "MC4CAQAwBQYDK2VwBCIEIN+NLDLNCHmoBpZm5oR0MpsHtL9tS1kYtL9x9wxTx9ZM\n" &
+        "-----END PRIVATE KEY-----\n"
+      expect PgError:
+        discard parseTrustAnchors(pem)
+
+    test "CERTIFICATE block with garbage body is skipped, not crashed":
+      # Garbage DER hits the decoder-error path (safe pre-fix); regression guard.
+      const pem =
+        "-----BEGIN CERTIFICATE-----\n" & "QUFBQQ==\n" & "-----END CERTIFICATE-----\n"
+      expect PgError:
+        discard parseTrustAnchors(pem)
+
+  suite "cdecl callback len guards":
+    test "appendDnCallback appends normal-size chunks":
+      var buf: seq[byte]
+      let src = @[byte 0xAA, 0xBB, 0xCC]
+      appendDnCallback(
+        cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), csize_t(src.len)
+      )
+      check buf == src
+
+    test "appendDnCallback ignores len > high(int) instead of RangeDefect":
+      var buf: seq[byte]
+      let src = @[byte 0x11]
+      let hugeLen = csize_t(high(int)) + csize_t(1)
+      appendDnCallback(
+        cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), hugeLen
+      )
+      check buf.len == 0
+
+    test "appendDnCallback handles csize_t.high":
+      var buf: seq[byte]
+      let src = @[byte 0x22]
+      appendDnCallback(
+        cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), csize_t.high
+      )
+      check buf.len == 0

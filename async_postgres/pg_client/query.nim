@@ -17,12 +17,6 @@ proc queryImpl*(
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
 
-  let formats =
-    if paramFormats.len > 0:
-      paramFormats
-    else:
-      newSeq[int16](params.len)
-
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
@@ -33,6 +27,8 @@ proc queryImpl*(
   var cachedColOids: seq[int32]
   var effectiveResultFormats: seq[int16]
 
+  # PG Bind treats 0 format codes as "all params text" — equivalent on the
+  # wire to N zeros, so pass paramFormats through even when empty.
   sendExtendedQuery(
     conn = conn,
     resultFormats = resultFormats,
@@ -46,7 +42,7 @@ proc queryImpl*(
     effectiveResultFormats = effectiveResultFormats,
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep =
-      conn.sendBuf.addBind("", stmtName, formats, params, effectiveResultFormats),
+      conn.sendBuf.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
   )
   conn.state = csBusy
   await conn.sendBufMsg()

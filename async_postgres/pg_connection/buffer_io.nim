@@ -95,9 +95,6 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
   ## Create a ``CopyInCallback`` that works with both asyncdispatch and chronos.
   ## ``body`` must evaluate to ``seq[byte]``. Return an empty seq to signal completion.
   ##
-  ## With asyncdispatch, anonymous async procs cannot return non-void types,
-  ## so this template wraps the body in manual ``Future`` construction.
-  ##
   ## .. code-block:: nim
   ##   var idx = 0
   ##   let rows = @["1\tAlice\n".toBytes(), "2\tBob\n".toBytes()]
@@ -108,7 +105,7 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
   ##       chunk
   ##     else:
   ##       newSeq[byte]()
-  makeAsyncSeqByteCallback(CopyInCallback, "makeCopyInCallback", body)
+  makeAsyncSeqByteCallback(CopyInCallback, body)
 
 # Notification / notice dispatch
 
@@ -350,6 +347,12 @@ proc nextMessage*(
       # after a standby promotion), like libpq's pqSaveParameterStatus.
       let m = res.message
       conn.serverParams[m.paramName] = m.paramValue
+      continue
+    if res.message.kind == bmkNegotiateProtocolVersion:
+      # Informational per libpq; record and drop so callers never see it.
+      let m = res.message
+      conn.negotiatedMinorVersion = m.newestMinorVersion
+      conn.unrecognizedStartupOptions = m.unrecognizedOptions
       continue
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1

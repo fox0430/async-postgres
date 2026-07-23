@@ -201,6 +201,13 @@ suite "parseBackendMessage: per-kind malformed bodies":
       expectParseError:
         discard tryParse(wrap(kind, body))
 
+  test "ErrorResponse (E) / NoticeResponse (N) with empty body":
+    # The '\0' terminator is mandatory; empty body must not fall through as
+    # an empty PgQueryError.
+    for kind in ['E', 'N']:
+      expectParseError:
+        discard tryParse(wrap(kind, @[]))
+
   test "ParameterStatus (S) missing value terminator":
     # "key\0" but value has no null.
     let body = @[byte('k'), byte('e'), byte('y'), 0'u8, byte('v'), byte('a')]
@@ -361,6 +368,26 @@ suite "Binary type decoders: malformed input":
     expectTypeError:
       discard decodeInetBinary(
         @[byte 3, 129, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+      )
+
+  test "decodeInetBinary rejects unknown family":
+    # Only PGSQL_AF_INET (2) and PGSQL_AF_INET6 (3) are valid; anything else
+    # must not silently fall through to the IPv6 path and read 16 bytes.
+    expectTypeError:
+      discard decodeInetBinary(
+        @[byte 99, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+      )
+    expectTypeError:
+      discard decodeInetBinary(@[byte 0, 0, 0, 4, 192, 168, 0, 1])
+
+  test "decodeInetBinary rejects addrlen mismatch":
+    # IPv4 with addrlen != 4 is malformed.
+    expectTypeError:
+      discard decodeInetBinary(@[byte 2, 32, 0, 16, 192, 168, 0, 1])
+    # IPv6 with addrlen != 16 is malformed.
+    expectTypeError:
+      discard decodeInetBinary(
+        @[byte 3, 128, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
       )
 
   test "decodeInetBinary accepts boundary masks":
@@ -551,6 +578,17 @@ suite "Binary type decoders: malformed input":
     var data = newSeq[byte](4)
     for i in 0 .. 3:
       data[i] = 0xFF
+    expectTypeError:
+      discard decodeHstoreBinary(data)
+
+  test "decodeHstoreBinary numPairs exceeds data":
+    # numPairs = int32.high with only the 4-byte header must be rejected
+    # up front rather than entering the pair loop.
+    var data = newSeq[byte](4)
+    data[0] = 0x7F
+    data[1] = 0xFF
+    data[2] = 0xFF
+    data[3] = 0xFF
     expectTypeError:
       discard decodeHstoreBinary(data)
 

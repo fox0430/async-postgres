@@ -7,7 +7,7 @@
 ## Re-exported through `pg_connection.nim`; depends only on `types.nim`
 ## (in particular, does not touch `PgConnection`).
 
-import std/[strutils, uri]
+import std/strutils
 
 import ../[async_backend, pg_errors]
 import types
@@ -103,52 +103,73 @@ proc parseLoadBalanceHosts*(s: string): LoadBalanceHosts =
     raise newException(PgError, "Invalid load_balance_hosts: " & s)
 
 proc parsePort*(s: string): int =
+  ## Follows libpq's strtol-based rules: surrounding whitespace and a leading
+  ## sign are accepted (libpq takes `+5432` too), digit-group underscores are
+  ## not, and the final value must be in 1–65535.
+  let t = s.strip()
+  if t.find('_') >= 0:
+    raise newException(PgError, "Invalid port in DSN: " & s)
   try:
-    result = parseInt(s)
+    result = parseInt(t)
   except ValueError:
     raise newException(PgError, "Invalid port in DSN: " & s)
   if result < 1 or result > 65535:
     raise newException(PgError, "Port out of range (1-65535): " & s)
 
-proc buildHosts(hostStr, hostaddrStr, portStr: string): seq[HostEntry] =
-  ## Expand comma-separated host/hostaddr/port lists into HostEntry values
-  ## following libpq multi-host rules: the number of entries is set by
-  ## `hostaddr` when given, else by `host`; when both are given their list
-  ## lengths must match exactly. The port list must contain either a single
-  ## entry (applied to every host) or exactly one entry per host. An empty
-  ## list entry selects the default (127.0.0.1 / 5432); an empty host with a
-  ## hostaddr stays empty, so SSL verification can require an explicit name.
-  let hostList = hostStr.split(',')
-  let addrList = hostaddrStr.split(',')
-  if hostStr.len > 0 and hostaddrStr.len > 0 and hostList.len != addrList.len:
+proc splitList(s: string): seq[string] =
+  ## Comma-split a multi-host parameter; an empty string means "not provided".
+  if s.len == 0:
+    @[]
+  else:
+    s.split(',')
+
+proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
+  ## Expand host/hostaddr/port lists into HostEntry values following libpq
+  ## multi-host rules: the number of entries is set by `hostaddr` when given,
+  ## else by `host` (an empty seq means the parameter was not provided; when
+  ## both are given their lengths must match exactly). The port list must
+  ## contain either a single entry (applied to every host) or exactly one
+  ## entry per host. An empty list entry selects the default (127.0.0.1 /
+  ## 5432); an empty host with a hostaddr stays empty, so SSL verification
+  ## can require an explicit name.
+  if hostList.len > 0 and addrList.len > 0 and hostList.len != addrList.len:
     raise newException(
       PgError,
       "Could not match " & $hostList.len & " host names to " & $addrList.len &
         " hostaddr values",
     )
-  let count = if hostaddrStr.len > 0: addrList.len else: hostList.len
-  let portList = portStr.split(',')
-  if portList.len != 1 and portList.len != count:
+  let count =
+    if addrList.len > 0:
+      addrList.len
+    elif hostList.len > 0:
+      hostList.len
+    else:
+      1
+  let ports =
+    if portList.len == 0:
+      @[""]
+    else:
+      portList
+  if ports.len != 1 and ports.len != count:
     raise newException(
-      PgError,
-      "Could not match " & $portList.len & " port numbers to " & $count & " hosts",
+      PgError, "Could not match " & $ports.len & " port numbers to " & $count & " hosts"
     )
   for i in 0 ..< count:
     let h =
-      if hostStr.len > 0:
+      if hostList.len > 0:
         hostList[i]
       else:
         ""
     let a =
-      if hostaddrStr.len > 0:
+      if addrList.len > 0:
         addrList[i]
       else:
         ""
     let p =
-      if portList.len == 1:
-        portList[0]
+      if ports.len == 1:
+        ports[0]
       else:
-        portList[i]
+        ports[i]
     result.add HostEntry(
       host: if h.len == 0 and a.len == 0: "127.0.0.1" else: h,
       hostaddr: a,
@@ -159,20 +180,72 @@ proc buildHosts(hostStr, hostaddrStr, portStr: string): seq[HostEntry] =
           parsePort(p),
     )
 
+proc rawHost(host, hostaddr: string): string =
+  ## Inverse of `buildHosts`' defaulting: 127.0.0.1 with no hostaddr can only
+  ## come from an entry where neither was provided, so fold it back to "".
+  ## An explicit `host=127.0.0.1` is structurally indistinguishable from the
+  ## implicit default, but re-defaults to the same value on rebuild —
+  ## functionally correct for the round-trip.
+  if host == "127.0.0.1" and hostaddr.len == 0: "" else: host
+
+proc rawHostLists(c: ConnConfig): tuple[hosts, addrs, ports: seq[string]] =
+  ## Re-derive raw multi-host lists from a config so `applyParam` can rebuild
+  ## `hosts` with one list replaced. Best-effort inverse of `buildHosts`:
+  ## all-empty lists collapse to "not provided" and an all-equal port list to
+  ## a single entry.
+  ##
+  ## The port collapsing is required for correctness: if the replacement list
+  ## in `applyParam` has a different length than the current hosts, a
+  ## collapsed single-entry port list "applies to all" via `buildHosts`,
+  ## whereas a length-specific list would be rejected as mismatched.
+  if c.hosts.len == 0:
+    result.hosts = splitList(rawHost(c.host, c.hostaddr))
+    result.addrs = splitList(c.hostaddr)
+    if c.port > 0:
+      result.ports = @[$c.port]
+    return
+  var anyHost, anyAddr = false
+  var samePorts = true
+  for e in c.hosts:
+    let h = rawHost(e.host, e.hostaddr)
+    result.hosts.add h
+    result.addrs.add e.hostaddr
+    result.ports.add $e.port
+    anyHost = anyHost or h.len > 0
+    anyAddr = anyAddr or e.hostaddr.len > 0
+    samePorts = samePorts and e.port == c.hosts[0].port
+  if not anyHost:
+    result.hosts = @[]
+  if not anyAddr:
+    result.addrs = @[]
+  if samePorts:
+    result.ports = @[result.ports[0]]
+
 proc applyParam*(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
   ##
-  ## Note: `host`/`hostaddr`/`port` are applied as scalars here; the DSN
-  ## parsers intercept these keys and expand their comma-separated
-  ## multi-host forms via `buildHosts` instead of routing them through
-  ## this proc.
+  ## `host`/`hostaddr`/`port` accept comma-separated multi-host lists and
+  ## rebuild `hosts` on each call. The DSN parsers still intercept these
+  ## keys: there all values are collected first and expanded once, so their
+  ## correlation is order-independent, while repeated `applyParam` calls
+  ## correlate each list against the already-expanded state.
   case key
-  of "host":
-    result.host = val
-  of "hostaddr":
-    result.hostaddr = val
-  of "port":
-    result.port = parsePort(val)
+  of "host", "hostaddr", "port":
+    # Rebuild `hosts` so it stays consistent with the scalar view
+    # (`getHosts` prefers `hosts` when non-empty); the two untouched
+    # lists are re-derived from the current config.
+    var (hostList, addrList, portList) = result.rawHostLists()
+    case key
+    of "host":
+      hostList = splitList(val)
+    of "hostaddr":
+      addrList = splitList(val)
+    else:
+      portList = splitList(val)
+    result.hosts = buildHosts(hostList, addrList, portList)
+    result.host = result.hosts[0].displayHost
+    result.hostaddr = result.hosts[0].hostaddr
+    result.port = result.hosts[0].port
   of "dbname":
     result.database = val
   of "user":
@@ -267,7 +340,8 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
   ## Format: ``host=localhost port=5432 dbname=test user=myuser``
   ##
   ## Values may be single-quoted: ``password='has spaces'``
-  ## Within quoted values, ``\'`` and ``\\`` are escape sequences.
+  ## As in libpq, a backslash escapes the following character both inside
+  ## and outside quotes (``\'``, ``\\``, ``host=foo\ bar``).
   ##
   ## `host`, `hostaddr`, and `port` accept comma-separated lists for
   ## multi-host failover (libpq compatible): ``host=h1,h2 port=5433,5434``.
@@ -325,10 +399,17 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
       if not closed:
         raise newException(PgError, "Unterminated quoted value for key '" & key & "'")
     else:
-      # Unquoted value
+      # Unquoted value; backslash escapes the next character, even
+      # whitespace (libpq drops a trailing lone backslash).
       while i < dsn.len and dsn[i] notin {' ', '\t', '\n', '\r'}:
-        val.add dsn[i]
-        inc i
+        if dsn[i] == '\\':
+          inc i
+          if i < dsn.len:
+            val.add dsn[i]
+            inc i
+        else:
+          val.add dsn[i]
+          inc i
 
     pairs.add((key, val))
 
@@ -347,12 +428,32 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
     else:
       result.applyParam(key, val)
 
-  result.hosts = buildHosts(hostStr, hostaddrStr, portStr)
+  result.hosts =
+    buildHosts(splitList(hostStr), splitList(hostaddrStr), splitList(portStr))
   # Back-compat: set scalar host/hostaddr/port from the first entry;
   # `host` falls back to `hostaddr` like libpq's PQhost().
   result.host = result.hosts[0].displayHost
   result.hostaddr = result.hosts[0].hostaddr
   result.port = result.hosts[0].port
+
+proc pctDecode(s: string): string =
+  ## Percent-decode a URI component following libpq rules: strict ``%XX``
+  ## (a malformed sequence or an encoded zero byte is an error) and no
+  ## ``+``-to-space translation.
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    if s[i] == '%':
+      if i + 2 >= s.len or s[i + 1] notin HexDigits or s[i + 2] notin HexDigits:
+        raise newException(PgError, "Invalid percent-encoded token in DSN: " & s)
+      let c = chr(parseHexInt(s[i + 1 .. i + 2]))
+      if c == '\0':
+        raise newException(PgError, "Forbidden zero byte in DSN: " & s)
+      result.add c
+      i += 3
+    else:
+      result.add s[i]
+      inc i
 
 proc parseUriDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL URI connection string into a ConnConfig.
@@ -395,10 +496,10 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   if userinfo.len > 0:
     let cpos = userinfo.find(':')
     if cpos >= 0:
-      result.user = decodeUrl(userinfo[0 ..< cpos])
-      result.password = decodeUrl(userinfo[cpos + 1 .. ^1])
+      result.user = pctDecode(userinfo[0 ..< cpos])
+      result.password = pctDecode(userinfo[cpos + 1 .. ^1])
     else:
-      result.user = decodeUrl(userinfo)
+      result.user = pctDecode(userinfo)
 
   # Parse host:port/database
   var hostport, dbpath: string
@@ -410,27 +511,27 @@ proc parseUriDsn*(dsn: string): ConnConfig =
     hostport = hostpath
 
   if dbpath.len > 0:
-    result.database = decodeUrl(dbpath)
+    result.database = pctDecode(dbpath)
 
   # Parse host(s) and port(s) — supports comma-separated multi-host syntax.
-  # Normalize the authority into comma-joined host/port lists (as libpq
-  # does internally) so host/hostaddr/port query parameters can override
-  # them before the final expansion.
-  var hostStr, hostaddrStr, portStr: string
+  # libpq order: the authority splits on commas *before* percent-decoding
+  # (an encoded comma stays inside one host), query parameters decode
+  # *before* splitting. Structural separators are matched on the raw text,
+  # so encoded ones never split.
+  var hostList, addrList, portList: seq[string]
   if hostport.len > 0:
-    var hostParts, portParts: seq[string]
     for part in hostport.split(','):
       if part.startsWith("["):
-        # IPv6: [::1]:5432
+        # IPv6: [::1]:5432; a zone id is encoded as %25: [fe80::1%25eth0]
         let bracket = part.find(']')
         if bracket < 0:
           raise newException(PgError, "Invalid IPv6 address in DSN")
-        hostParts.add part[1 ..< bracket]
+        hostList.add pctDecode(part[1 ..< bracket])
         let afterBracket = part[bracket + 1 .. ^1]
         if afterBracket.len == 0:
-          portParts.add ""
+          portList.add ""
         elif afterBracket.startsWith(":"):
-          portParts.add afterBracket[1 .. ^1]
+          portList.add pctDecode(afterBracket[1 .. ^1])
         else:
           raise newException(
             PgError, "Unexpected character after IPv6 address in DSN: " & part
@@ -446,13 +547,11 @@ proc parseUriDsn*(dsn: string): ConnConfig =
             raise newException(
               PgError, "IPv6 address in DSN must be bracketed, e.g. [::1]:5432: " & part
             )
-          hostParts.add part[0 ..< cpos]
-          portParts.add part[cpos + 1 .. ^1]
+          hostList.add pctDecode(part[0 ..< cpos])
+          portList.add pctDecode(part[cpos + 1 .. ^1])
         else:
-          hostParts.add part
-          portParts.add ""
-    hostStr = hostParts.join(",")
-    portStr = portParts.join(",")
+          hostList.add pctDecode(part)
+          portList.add ""
 
   # Parse query parameters
   if queryStr.len > 0:
@@ -460,19 +559,19 @@ proc parseUriDsn*(dsn: string): ConnConfig =
       let epos = pair.find('=')
       if epos < 0:
         continue
-      let key = decodeUrl(pair[0 ..< epos])
-      let val = decodeUrl(pair[epos + 1 .. ^1])
+      let key = pctDecode(pair[0 ..< epos])
+      let val = pctDecode(pair[epos + 1 .. ^1])
       case key
       of "host":
-        hostStr = val
+        hostList = splitList(val)
       of "hostaddr":
-        hostaddrStr = val
+        addrList = splitList(val)
       of "port":
-        portStr = val
+        portList = splitList(val)
       else:
         result.applyParam(key, val)
 
-  result.hosts = buildHosts(hostStr, hostaddrStr, portStr)
+  result.hosts = buildHosts(hostList, addrList, portList)
   # Back-compat: set scalar host/hostaddr/port from the first entry;
   # `host` falls back to `hostaddr` like libpq's PQhost().
   result.host = result.hosts[0].displayHost

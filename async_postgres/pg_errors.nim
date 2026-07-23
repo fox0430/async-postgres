@@ -167,10 +167,15 @@ func internalQuery*(e: ref PgQueryError): string =
 
 func parsePosition(v: string): int =
   # Server sends a 1-based decimal character index; 0 means "not present".
+  # Guard the accumulator against OverflowDefect (uncatchable) so a buggy or
+  # hostile server cannot crash a caller that simply reads `err.position`.
   for c in v:
     if c < '0' or c > '9':
       return 0
-    result = result * 10 + (ord(c) - ord('0'))
+    let d = ord(c) - ord('0')
+    if result > (high(int) - d) div 10:
+      return 0
+    result = result * 10 + d
 
 func position*(e: ref PgQueryError): int =
   ## 1-based character index into the original query where the error occurred,

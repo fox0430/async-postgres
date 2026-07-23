@@ -327,6 +327,121 @@ proc bindPositionalOnce(
     result.syms[i] = tmp
     result.bindings.add(newLetStmt(tmp, arg))
 
+proc makeBindDirectCall(
+    sendBufNode, portal, stmt, rfNode: NimNode, argList: NimNode
+): NimNode =
+  ## Emit an `addBindDirect` call. `rfNode` is the result-format list — for
+  ## execDirect callers pass an empty `nnkBracket` literal (rows discarded),
+  ## for queryDirect callers pass the `effectiveRf` variable node.
+  result = newCall(bindSym"addBindDirect", sendBufNode, portal, stmt, rfNode)
+  for i in 0 ..< argList.len:
+    result.add(argList[i])
+
+proc makeParseDirectCall(sendBufNode, stmt, sql: NimNode, argList: NimNode): NimNode =
+  ## Emit an `addParseDirect` call. Shared verbatim by queryDirect and execDirect.
+  result = newCall(bindSym"addParseDirect", sendBufNode, stmt, sql)
+  for i in 0 ..< argList.len:
+    result.add(argList[i])
+
+proc buildDirectSendDispatch(
+    isExec: bool,
+    connSym, sqlSym, cachedSym, cacheHitSym, cacheMissSym, stmtNameSym: NimNode,
+    argList: NimNode,
+    effectiveRfSym, cachedFieldsSym, colFmtsSym, colOidsSym: NimNode,
+): NimNode =
+  ## Build the shared `if cacheHit / elif capacity>0 / else` send-phase AST
+  ## for queryDirect / execDirect. The two macros differ only in three
+  ## details, all folded here:
+  ##   * queryDirect emits `addDescribe(dkPortal, "")` in the no-cache path
+  ##     (the receive loop needs RowDescription to decode columns);
+  ##     execDirect skips it (rows discarded).
+  ##   * queryDirect passes `effectiveRfSym` to `addBindDirect` as the
+  ##     result-format list; execDirect passes an empty `[]` (no rows).
+  ##   * queryDirect's cache-hit path copies `fields`, `colFmts`, `colOids`,
+  ##     `resultFormats` out of the CachedStmt for the receive loop.
+  ## For `isExec: true` the last four sym args are unused (pass any node).
+  let sendBufNode = newDotExpr(connSym, ident"sendBuf")
+
+  proc rfNode(): NimNode =
+    if isExec:
+      newNimNode(nnkBracket)
+    else:
+      effectiveRfSym
+
+  # Cache hit path
+  let hitBlock = newStmtList()
+  hitBlock.add quote do:
+    `stmtNameSym` = `cachedSym`.name
+    `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
+  if not isExec:
+    hitBlock.add quote do:
+      `cachedFieldsSym` = `cachedSym`.fields
+      `colFmtsSym` = `cachedSym`.colFmts
+      `colOidsSym` = `cachedSym`.colOids
+      `effectiveRfSym` = `cachedSym`.resultFormats
+  hitBlock.add makeBindDirectCall(
+    sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
+  )
+  hitBlock.add quote do:
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
+
+  # Cache miss path
+  let missBlock = newStmtList()
+  missBlock.add quote do:
+    `cacheMissSym` = true
+    `stmtNameSym` = `connSym`.nextStmtName()
+    `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
+    if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
+      let evicted = `connSym`.evictStmtCache()
+      `connSym`.sendBuf.addClose(dkStatement, evicted.name)
+  if not isExec:
+    missBlock.add quote do:
+      `effectiveRfSym` = @[]
+  missBlock.add makeParseDirectCall(sendBufNode, stmtNameSym, sqlSym, argList)
+  missBlock.add quote do:
+    `connSym`.sendBuf.addDescribe(dkStatement, `stmtNameSym`)
+  missBlock.add makeBindDirectCall(
+    sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
+  )
+  missBlock.add quote do:
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
+
+  # No-cache path
+  let elseBlock = newStmtList()
+  elseBlock.add quote do:
+    `connSym`.sendBuf.setLen(0)
+    `connSym`.flushPendingStmtCloses()
+  if not isExec:
+    elseBlock.add quote do:
+      `effectiveRfSym` = @[]
+  elseBlock.add makeParseDirectCall(sendBufNode, newStrLitNode(""), sqlSym, argList)
+  elseBlock.add makeBindDirectCall(
+    sendBufNode, newStrLitNode(""), newStrLitNode(""), rfNode(), argList
+  )
+  if not isExec:
+    elseBlock.add quote do:
+      `connSym`.sendBuf.addDescribe(dkPortal, "")
+  elseBlock.add quote do:
+    `connSym`.sendBuf.addExecute("", 0)
+    `connSym`.sendBuf.addSync()
+
+  result = newNimNode(nnkIfStmt)
+  result.add(
+    newNimNode(nnkElifBranch).add(
+      quote do:
+        `cacheHitSym`,
+      hitBlock,
+    )
+  )
+  let missCondition = quote:
+    `connSym`.stmtCacheCapacity > 0
+  result.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
+  result.add(newNimNode(nnkElse).add(elseBlock))
+
 proc extractTimeoutArg(
     args: NimNode
 ): tuple[positional: seq[NimNode], timeout: NimNode] =
@@ -396,92 +511,24 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
 
-  # Helper to build addBindDirect call with args
-  proc makeBindDirect(buf, portal, stmt, rf: NimNode, argList: NimNode): NimNode =
-    result = newCall(bindSym"addBindDirect", buf, portal, stmt, rf)
-    for i in 0 ..< argList.len:
-      result.add(argList[i])
-
-  proc makeParseDirect(buf, stmt, sql: NimNode, argList: NimNode): NimNode =
-    result = newCall(bindSym"addParseDirect", buf, stmt, sql)
-    for i in 0 ..< argList.len:
-      result.add(argList[i])
-
   let argList = newNimNode(nnkBracket)
   for sym in argSyms:
     argList.add(sym)
 
-  # Cache hit path
-  let hitBlock = newStmtList()
-  hitBlock.add quote do:
-    `stmtNameSym` = `cachedSym`.name
-    `cachedFieldsSym` = `cachedSym`.fields
-    `colFmtsSym` = `cachedSym`.colFmts
-    `colOidsSym` = `cachedSym`.colOids
-    `effectiveRfSym` = `cachedSym`.resultFormats
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-  let sendBufNode = newDotExpr(connSym, ident"sendBuf")
-  hitBlock.add(
-    makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
+  result.add buildDirectSendDispatch(
+    isExec = false,
+    connSym = connSym,
+    sqlSym = sqlSym,
+    cachedSym = cachedSym,
+    cacheHitSym = cacheHitSym,
+    cacheMissSym = cacheMissSym,
+    stmtNameSym = stmtNameSym,
+    argList = argList,
+    effectiveRfSym = effectiveRfSym,
+    cachedFieldsSym = cachedFieldsSym,
+    colFmtsSym = colFmtsSym,
+    colOidsSym = colOidsSym,
   )
-  hitBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
-
-  # Cache miss path
-  let missBlock = newStmtList()
-  missBlock.add quote do:
-    `cacheMissSym` = true
-    `stmtNameSym` = `connSym`.nextStmtName()
-    `effectiveRfSym` = @[]
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-    if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
-      let evicted = `connSym`.evictStmtCache()
-      `connSym`.sendBuf.addClose(dkStatement, evicted.name)
-  missBlock.add(makeParseDirect(sendBufNode, stmtNameSym, sqlSym, argList))
-  missBlock.add quote do:
-    `connSym`.sendBuf.addDescribe(dkStatement, `stmtNameSym`)
-  missBlock.add(
-    makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, effectiveRfSym, argList)
-  )
-  missBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
-
-  # No-cache path
-  let elseBlock = newStmtList()
-  elseBlock.add quote do:
-    `effectiveRfSym` = @[]
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-  elseBlock.add(makeParseDirect(sendBufNode, newStrLitNode(""), sqlSym, argList))
-  elseBlock.add(
-    makeBindDirect(
-      sendBufNode, newStrLitNode(""), newStrLitNode(""), effectiveRfSym, argList
-    )
-  )
-  elseBlock.add quote do:
-    `connSym`.sendBuf.addDescribe(dkPortal, "")
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
-
-  # Build if/elif/else
-  let ifNode = newNimNode(nnkIfStmt)
-  ifNode.add(
-    newNimNode(nnkElifBranch).add(
-      quote do:
-        `cacheHitSym`,
-      hitBlock,
-    )
-  )
-
-  let missCondition = quote:
-    `connSym`.stmtCacheCapacity > 0
-  ifNode.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
-  ifNode.add(newNimNode(nnkElse).add(elseBlock))
-  result.add(ifNode)
 
   result.add quote do:
     `connSym`.state = csBusy
@@ -573,80 +620,24 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
 
-  proc makeBindDirect(buf, portal, stmt: NimNode, argList: NimNode): NimNode =
-    let emptyRf = newNimNode(nnkBracket) # no result formats for exec
-    result = newCall(bindSym"addBindDirect", buf, portal, stmt, emptyRf)
-    for i in 0 ..< argList.len:
-      result.add(argList[i])
-
-  proc makeParseDirect(buf, stmt, sql: NimNode, argList: NimNode): NimNode =
-    result = newCall(bindSym"addParseDirect", buf, stmt, sql)
-    for i in 0 ..< argList.len:
-      result.add(argList[i])
-
   let argList = newNimNode(nnkBracket)
   for sym in argSyms:
     argList.add(sym)
 
-  let sendBufNode = newDotExpr(connSym, ident"sendBuf")
-
-  # Cache hit path
-  let hitBlock = newStmtList()
-  hitBlock.add quote do:
-    `stmtNameSym` = `cachedSym`.name
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-  hitBlock.add(makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, argList))
-  hitBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
-
-  # Cache miss path
-  let missBlock = newStmtList()
-  missBlock.add quote do:
-    `cacheMissSym` = true
-    `stmtNameSym` = `connSym`.nextStmtName()
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-    if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
-      let evicted = `connSym`.evictStmtCache()
-      `connSym`.sendBuf.addClose(dkStatement, evicted.name)
-  missBlock.add(makeParseDirect(sendBufNode, stmtNameSym, sqlSym, argList))
-  missBlock.add quote do:
-    `connSym`.sendBuf.addDescribe(dkStatement, `stmtNameSym`)
-  missBlock.add(makeBindDirect(sendBufNode, newStrLitNode(""), stmtNameSym, argList))
-  missBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
-
-  # No-cache path
-  let elseBlock = newStmtList()
-  elseBlock.add quote do:
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-  elseBlock.add(makeParseDirect(sendBufNode, newStrLitNode(""), sqlSym, argList))
-  elseBlock.add(
-    makeBindDirect(sendBufNode, newStrLitNode(""), newStrLitNode(""), argList)
+  result.add buildDirectSendDispatch(
+    isExec = true,
+    connSym = connSym,
+    sqlSym = sqlSym,
+    cachedSym = cachedSym,
+    cacheHitSym = cacheHitSym,
+    cacheMissSym = cacheMissSym,
+    stmtNameSym = stmtNameSym,
+    argList = argList,
+    effectiveRfSym = newEmptyNode(),
+    cachedFieldsSym = newEmptyNode(),
+    colFmtsSym = newEmptyNode(),
+    colOidsSym = newEmptyNode(),
   )
-  elseBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
-
-  # Build if/elif/else
-  let ifNode = newNimNode(nnkIfStmt)
-  ifNode.add(
-    newNimNode(nnkElifBranch).add(
-      quote do:
-        `cacheHitSym`,
-      hitBlock,
-    )
-  )
-
-  let missCondition = quote:
-    `connSym`.stmtCacheCapacity > 0
-  ifNode.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
-  ifNode.add(newNimNode(nnkElse).add(elseBlock))
-  result.add(ifNode)
 
   result.add quote do:
     `connSym`.state = csBusy

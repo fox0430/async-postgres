@@ -217,65 +217,122 @@ proc derReadLen(data: openArray[byte], pos: var int): int =
   let n = int(first and 0x7F)
   if n == 0 or n > 4 or pos + n > data.len:
     return -1
-  var v = 0
+  # Accumulate as uint32 to avoid signed-shift UB and to represent full
+  # 4-byte DER lengths on 32-bit int platforms.
+  var v: uint32 = 0
   for i in 0 ..< n:
-    v = (v shl 8) or int(data[pos + i])
+    v = (v shl 8) or uint32(data[pos + i])
   pos += n
-  return v
+  if v > uint32(high(int)):
+    return -1
+  return int(v)
 
-proc certSignatureOid(certDer: openArray[byte]): seq[byte] =
-  ## Extract signatureAlgorithm OID from an X.509 DER cert; @[] on parse failure.
+proc certSignatureAlgorithm(
+    certDer: openArray[byte]
+): tuple[oid: seq[byte], params: seq[byte]] =
+  ## Extract signatureAlgorithm OID and raw parameters bytes from an X.509 DER
+  ## cert; (@[], @[]) on parse failure.
   var pos = 0
   if pos >= certDer.len or certDer[pos] != 0x30:
-    return @[]
+    return (@[], @[])
   inc pos
   let outerLen = derReadLen(certDer, pos)
   if outerLen < 0 or pos + outerLen > certDer.len:
-    return @[]
+    return (@[], @[])
   let outerEnd = pos + outerLen
 
   if pos >= outerEnd or certDer[pos] != 0x30:
-    return @[]
+    return (@[], @[])
   inc pos
   let tbsLen = derReadLen(certDer, pos)
   if tbsLen < 0 or pos + tbsLen > outerEnd:
-    return @[]
+    return (@[], @[])
   pos += tbsLen
 
   if pos >= outerEnd or certDer[pos] != 0x30:
-    return @[]
+    return (@[], @[])
   inc pos
   let sigAlgLen = derReadLen(certDer, pos)
   if sigAlgLen < 0 or pos + sigAlgLen > outerEnd:
-    return @[]
+    return (@[], @[])
   let sigAlgEnd = pos + sigAlgLen
 
   if pos >= sigAlgEnd or certDer[pos] != 0x06:
-    return @[]
+    return (@[], @[])
   inc pos
   let oidLen = derReadLen(certDer, pos)
   if oidLen < 0 or pos + oidLen > sigAlgEnd:
+    return (@[], @[])
+  result.oid = newSeq[byte](oidLen)
+  for i in 0 ..< oidLen:
+    result.oid[i] = certDer[pos + i]
+  pos += oidLen
+  result.params = newSeq[byte](sigAlgEnd - pos)
+  for i in 0 ..< result.params.len:
+    result.params[i] = certDer[pos + i]
+
+proc pssHashOid(params: openArray[byte]): seq[byte] =
+  ## hashAlgorithm OID from RSASSA-PSS-params (RFC 4055 §3.1); @[] when absent or
+  ## malformed, which per the DEFAULT sha1 falls through to SHA-256
+  ## (RFC 5929 §4: MD5/SHA-1 channel-binding hash MUST be promoted to SHA-256).
+  var pos = 0
+  if pos >= params.len or params[pos] != 0x30:
+    return @[]
+  inc pos
+  let seqLen = derReadLen(params, pos)
+  if seqLen < 0 or pos + seqLen > params.len:
+    return @[]
+  let seqEnd = pos + seqLen
+  if pos >= seqEnd or params[pos] != 0xA0:
+    return @[]
+  inc pos
+  let ctxLen = derReadLen(params, pos)
+  if ctxLen < 0 or pos + ctxLen > seqEnd:
+    return @[]
+  let ctxEnd = pos + ctxLen
+  if pos >= ctxEnd or params[pos] != 0x30:
+    return @[]
+  inc pos
+  let algLen = derReadLen(params, pos)
+  if algLen < 0 or pos + algLen > ctxEnd:
+    return @[]
+  let algEnd = pos + algLen
+  if pos >= algEnd or params[pos] != 0x06:
+    return @[]
+  inc pos
+  let oidLen = derReadLen(params, pos)
+  if oidLen < 0 or pos + oidLen > algEnd:
     return @[]
   result = newSeq[byte](oidLen)
   for i in 0 ..< oidLen:
-    result[i] = certDer[pos + i]
+    result[i] = params[pos + i]
 
-# Signature-algorithm OID contents (no tag/length prefix).
+# Signature-algorithm and hash OID contents (no tag/length prefix).
 const
   oidSha384Rsa = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C]
   oidSha512Rsa = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D]
+  oidRsaPss* = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A]
   oidEcdsaSha384 = [byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]
   oidEcdsaSha512 = [byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]
   oidDsaSha384 = [byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x03]
   oidDsaSha512 = [byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x04]
+  oidHashSha384 = [byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02]
+  oidHashSha512 = [byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03]
 
 proc computeTlsServerEndpoint*(certDer: openArray[byte]): seq[byte] =
   ## RFC 5929 §4 tls-server-end-point: hash follows the cert's signatureAlgorithm.
   ## SHA-384/SHA-512 preserved; MD5/SHA-1/unknown/parse-failure → SHA-256 (libpq parity).
-  let oid = certSignatureOid(certDer)
-  if oid == oidSha384Rsa or oid == oidEcdsaSha384 or oid == oidDsaSha384:
+  ## RSA-PSS names its hash in the AlgorithmIdentifier parameters, not the OID.
+  let (oid, params) = certSignatureAlgorithm(certDer)
+  var use384 = oid == oidSha384Rsa or oid == oidEcdsaSha384 or oid == oidDsaSha384
+  var use512 = oid == oidSha512Rsa or oid == oidEcdsaSha512 or oid == oidDsaSha512
+  if oid == oidRsaPss:
+    let hashOid = pssHashOid(params)
+    use384 = hashOid == oidHashSha384
+    use512 = hashOid == oidHashSha512
+  if use384:
     result = @(sha384.digest(certDer).data)
-  elif oid == oidSha512Rsa or oid == oidEcdsaSha512 or oid == oidDsaSha512:
+  elif use512:
     result = @(sha512.digest(certDer).data)
   else:
     result = @(sha256.digest(certDer).data)

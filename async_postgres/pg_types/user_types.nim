@@ -258,12 +258,15 @@ proc encodeBinaryComposite*(
 ): seq[byte] =
   ## Encode a PostgreSQL binary composite value.
   ## Format: ``numFields(4) + [oid(4) + len(4) + data]...``
-  var size = 4
+  checkPgBinLen(fields.len, "Composite field count")
+  var size: int64 = 4
   for f in fields:
     size += 8 # oid + len
     if f.data.isSome:
-      size += f.data.get.len
-  result = newSeq[byte](size)
+      checkPgBinLen(f.data.get.len, "Composite field")
+      size += f.data.get.len.int64
+    checkPgBinPayload(size, "Composite")
+  result = newSeq[byte](size.int)
   result.writeBE32(0, int32(fields.len))
   var pos = 4
   for f in fields:
