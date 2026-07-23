@@ -267,6 +267,10 @@ proc connectToHost*(
     # parity: sslnegotiation is ignored for AF_UNIX). Certificate verification
     # must use the host *name*, never the dialed hostaddr, and must be per-entry:
     # with multi-host failover config.host only reflects the first entry.
+    if isUnix and config.sslCert.len > 0:
+      # Unix sockets skip TLS regardless of sslmode, so a configured client
+      # cert is silently dropped — warn like the sslPrefer 'N' fallback path.
+      warnStderr "pg_connection: client certificate will NOT be sent over Unix-socket connection (TLS is skipped for AF_UNIX)"
     if config.sslMode != sslDisable and not isUnix:
       await negotiateSSL(conn, config, entry.host)
 
@@ -645,22 +649,12 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     )
 
   proc wrapped(): Future[PgConnection] {.async.} =
-    # `ConnConfig` may be built directly or mutated after parseDsn/initConnConfig,
-    # bypassing their `validateClientCertConfig`. `negotiateSSL` re-checks the
-    # cert/key pairing for modes that negotiate TLS, but it is skipped entirely
-    # for `sslDisable` and runs only on the plaintext-first leg for `sslAllow`,
-    # so a cert/key paired with those modes would be silently dropped with no
-    # error — the exact footgun the validation exists to prevent. Close that gap
-    # at the connect chokepoint. (Other modes still go through negotiateSSL's
-    # own guard, so this stays a narrow top-up rather than duplicating the full
-    # check on the hot path.) The builders raise `PgError`; surface it as the
-    # connect-path `PgConnectionError` (a `PgError` subtype).
-    if config.sslMode in {sslDisable, sslAllow} and
-        (config.sslCert.len > 0 or config.sslKey.len > 0):
-      try:
-        validateClientCertConfig(config)
-      except PgError as e:
-        raise newException(PgConnectionError, e.msg, e)
+    # ConnConfig may be built or mutated without passing through the parsers'
+    # validation — re-check here so every connect path rejects bad cert config.
+    try:
+      validateClientCertConfig(config)
+    except PgError as e:
+      raise newException(PgConnectionError, e.msg, e)
     # Compute the ordered host list once so the trace and the actual connection
     # attempts see the same order under lbhRandom.
     let hosts = config.orderedHosts()

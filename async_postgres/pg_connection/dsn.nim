@@ -7,7 +7,7 @@
 ## Re-exported through `pg_connection.nim`; depends only on `types.nim`
 ## (in particular, does not touch `PgConnection`).
 
-import std/[strutils, uri]
+import std/strutils
 when defined(posix):
   import std/posix
 
@@ -182,60 +182,65 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
           parsePort(p),
     )
 
-proc validateClientCertConfig*(config: ConnConfig) =
-  ## Reject inconsistent client certificate configurations early (at config
-  ## build time, before any connection is opened). Both halves of an mTLS
-  ## credential must be present together, and the SSL mode must actually
-  ## negotiate TLS — otherwise the cert/key would be silently ignored.
-  if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
-    raise newException(PgError, ClientCertPairingErrorMsg)
-  if (config.sslCert.len > 0 or config.sslKey.len > 0) and
-      config.sslMode in {sslDisable, sslAllow}:
-    raise newException(
-      PgError,
-      "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
-        "); they would otherwise be silently unused",
-    )
+when defined(posix):
+  proc openRegularFile(path, label: string): tuple[f: File, st: Stat] =
+    ## Open `path` as a File, guaranteeing it is a regular file without
+    ## blocking on FIFO/device paths. Opens with `O_NONBLOCK` first (so the
+    ## kernel returns immediately even for a FIFO with no writer), fstats the
+    ## resulting fd to enforce `S_ISREG`, then clears `O_NONBLOCK` on the fd
+    ## before wrapping it in a `File`. Sharing the fd across the type check and
+    ## the read closes the TOCTOU window a separate `stat()`+`open()` would
+    ## leave open when the file lives in an attacker-writable directory.
+    ## Caller must `close(result.f)`.
+    let fd = posix.open(path, O_RDONLY or O_NONBLOCK or O_CLOEXEC)
+    if fd < 0:
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
+    if fstat(fd, result.st) != 0:
+      discard close(fd)
+      raise newException(PgError, "Cannot stat " & label & " file: " & path)
+    if not S_ISREG(result.st.st_mode):
+      discard close(fd)
+      raise newException(
+        PgError, label & " file is not a regular file, refusing to use: " & path
+      )
+    let flags = fcntl(fd, F_GETFL)
+    if flags == -1 or fcntl(fd, F_SETFL, flags and not O_NONBLOCK) == -1:
+      discard close(fd)
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
+    if not open(result.f, fd, fmRead):
+      discard close(fd)
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
 
-proc readPemFileParam(path, label: string): string =
-  ## Read a PEM parameter file (sslrootcert/sslcert), wrapping the stdlib
-  ## `IOError` into a `PgError` with the parameter name so the three sslX file
-  ## params share one read+error-wrap path.
-  try:
-    result = readFile(path)
-  except IOError:
-    raise newException(PgError, "Cannot read " & label & " file: " & path)
-
-proc readPrivateKeyFile(path: string): string =
-  ## Read an SSL private key file, rejecting it (libpq parity) when it is group-
-  ## or world-accessible. On POSIX the permission check and the read share one
-  ## file descriptor (`fstat` on the open handle, then read), so the bytes
-  ## returned are guaranteed to come from the inode that passed the check — this
-  ## closes the TOCTOU window a separate `stat()`+`readFile()` would leave open
-  ## when the key lives in an attacker-writable directory.
+proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
+  ## Read a PEM parameter file (sslrootcert/sslcert/sslkey), wrapping the
+  ## stdlib `IOError` into a `PgError` with the parameter name. An empty file
+  ## is rejected: it would silently fall through the callers' `.len > 0`
+  ## guards. With `checkKeyPerms` (sslkey), any group or world permission bit
+  ## is rejected — intentionally stricter than libpq, which permits `0o640`
+  ## for root-owned keys. No permission check off-POSIX (libpq also skips it
+  ## on Windows).
   when defined(posix):
-    var f: File
-    if not open(f, path, fmRead):
-      raise newException(PgError, "Cannot read sslkey file: " & path)
+    let opened = openRegularFile(path, label)
     try:
-      var st: Stat
-      if fstat(getFileHandle(f), st) != 0:
-        raise newException(PgError, "Cannot stat sslkey file: " & path)
-      if (st.st_mode.int and (S_IRWXG or S_IRWXO).int) != 0:
+      if checkKeyPerms and (opened.st.st_mode.int and (S_IRWXG or S_IRWXO).int) != 0:
         raise newException(
           PgError,
-          "sslkey file has group or world accessible permissions, refusing to use: " &
+          label & " file has group or world accessible permissions, refusing to use: " &
             path,
         )
-      result = readAll(f)
+      try:
+        result = readAll(opened.f)
+      except IOError:
+        raise newException(PgError, "Cannot read " & label & " file: " & path)
     finally:
-      close(f)
+      close(opened.f)
   else:
-    # No POSIX permission model to check (libpq also skips this on Windows).
     try:
       result = readFile(path)
     except IOError:
-      raise newException(PgError, "Cannot read sslkey file: " & path)
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
+  if result.len == 0:
+    raise newException(PgError, label & " file is empty: " & path)
 
 proc rawHost(host, hostaddr: string): string =
   ## Inverse of `buildHosts`' defaulting: 127.0.0.1 with no hostaddr can only
@@ -336,10 +341,13 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
         seconds(secs)
   of "sslrootcert":
     result.sslRootCert = readPemFileParam(val, "sslrootcert")
-  of "sslcert":
-    result.sslCert = readPemFileParam(val, "sslcert")
-  of "sslkey":
-    result.sslKey = readPrivateKeyFile(val)
+  of "sslcert", "sslkey":
+    # The sslmode-compatibility check is deferred to `validateClientCertConfig`:
+    # a field-by-field `applyParam` caller may set sslcert before sslmode.
+    if key == "sslcert":
+      result.sslCert = readPemFileParam(val, "sslcert")
+    else:
+      result.sslKey = readPemFileParam(val, "sslkey", checkKeyPerms = true)
   of "sslsni":
     try:
       result.sslSni = parseInt(val) != 0
@@ -493,6 +501,7 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
   result.host = result.hosts[0].displayHost
   result.hostaddr = result.hosts[0].hostaddr
   result.port = result.hosts[0].port
+  validateClientCertConfig(result)
 
 proc pctDecode(s: string): string =
   ## Percent-decode a URI component following libpq rules: strict ``%XX``
@@ -611,7 +620,6 @@ proc parseUriDsn*(dsn: string): ConnConfig =
           hostList.add pctDecode(part)
           portList.add ""
 
-  # Parse query parameters
   if queryStr.len > 0:
     for pair in queryStr.split('&'):
       let epos = pair.find('=')
@@ -635,6 +643,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   result.host = result.hosts[0].displayHost
   result.hostaddr = result.hosts[0].hostaddr
   result.port = result.hosts[0].port
+  validateClientCertConfig(result)
 
 proc initConnConfig*(
     host = "127.0.0.1",
@@ -708,4 +717,3 @@ proc parseDsn*(dsn: string): ConnConfig =
     result = parseUriDsn(dsn)
   else:
     result = parseKeyValueDsn(dsn)
-  validateClientCertConfig(result)

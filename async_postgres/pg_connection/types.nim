@@ -723,9 +723,31 @@ const
 
   ClientCertPairingErrorMsg* =
     "sslcert and sslkey must be provided together for client certificate auth"
-    ## Shared by the config-time validation (`validateClientCertConfig`, raised as
-    ## `PgError`) and the connect-time guard in `negotiateSSL` (raised as
-    ## `PgConnectionError`); kept here so the wording can't drift between them.
+    ## Shared so the wording can't drift between the config-time and
+    ## connect-time checks.
+
+proc warnStderr*(msg: string) =
+  ## Connection-path warnings must never fail the connection: stderr may be
+  ## closed or broken (e.g. daemonized process), so swallow the IOError.
+  try:
+    stderr.writeLine msg
+  except IOError:
+    discard
+
+proc validateClientCertConfig*(config: ConnConfig) =
+  ## Reject inconsistent client certificate configurations early (at config
+  ## build time, before any connection is opened). Both halves of an mTLS
+  ## credential must be present together, and the SSL mode must actually
+  ## negotiate TLS — otherwise the cert/key would be silently ignored.
+  if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
+    raise newException(PgError, ClientCertPairingErrorMsg)
+  if (config.sslCert.len > 0 or config.sslKey.len > 0) and
+      config.sslMode in {sslDisable, sslAllow}:
+    raise newException(
+      PgError,
+      "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
+        "); they would otherwise be silently unused",
+    )
 
 # HostEntry accessors
 

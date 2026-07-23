@@ -3173,6 +3173,26 @@ suite "PgInterval":
         raised = true
       check raised
 
+  test "parseIntervalText overflow raises PgTypeError (not Defect)":
+    # A malicious/broken server sending oversized numeric fields must fail
+    # with a catchable PgTypeError rather than crashing with OverflowDefect
+    # or RangeDefect (or silently wrapping in release builds).
+    let bads = [
+      "999999999999999999999 days", # digit accumulation overflows int64
+      "3000000000 years", # 3e9 * 12 overflows int32 months
+      "3000000000 mons", # overflows int32 months
+      "3000000000 days", # overflows int32 days
+      "99999999999999999999:00:00", # hours accumulation overflows int64
+      "3000000000000:00:00", # hours * 3_600_000_000 overflows int64
+    ]
+    for bad in bads:
+      var raised = false
+      try:
+        discard parseIntervalText(bad)
+      except PgTypeError:
+        raised = true
+      check raised
+
   test "toPgParam PgInterval":
     let v = PgInterval(months: 14, days: 3, microseconds: 14706123456)
     let p = toPgParam(v)

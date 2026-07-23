@@ -140,8 +140,10 @@ files from disk). Both must be provided together, and `sslMode` must be
 The private key must be **unencrypted** on both backends — neither chronos
 (BearSSL) nor asyncdispatch (OpenSSL) is wired to a passphrase callback. On
 chronos the key specifically must be PKCS#8 PEM (RSA or EC); PKCS#1 is not
-supported. When loaded via DSN on POSIX, the `sslkey` file must not be group-
-or world-accessible (libpq parity).
+supported. When loaded via DSN on POSIX, the `sslkey` file must not have any group
+or world permission bits set. This is intentionally stricter than libpq
+(which permits owner-group-read `0o640` for root-owned keys); tighten
+offending keys with `chmod 0600` (or `0400`).
 
 Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
 stronger. On the chronos backend it needs chronos >= 4.4.0 for ALPN support.

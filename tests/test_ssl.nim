@@ -626,27 +626,16 @@ suite "initConnConfig client certificate validation":
     check cfg.sslKey == "key"
 
 suite "Client certificate config validation":
+  # `connect()` now validates cert/key pairing before dialing, so these tests
+  # no longer need a mock server — the failure fires client-side.
   test "providing only sslCert raises PgConnectionError":
     var raised = false
     var msgMatches = false
 
     proc testBody() {.async.} =
-      let ms = startMockServer()
-
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          discard await readN(st, 8)
-          await sendBytes(st, @[byte('S')])
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-
       let config = ConnConfig(
         host: "127.0.0.1",
-        port: ms.port,
+        port: 1,
         user: "test",
         database: "test",
         sslMode: sslRequire,
@@ -660,9 +649,6 @@ suite "Client certificate config validation":
         raised = true
         msgMatches = "sslcert and sslkey must be provided together" in e.msg
 
-      await serverFut
-      await closeServer(ms)
-
     waitFor testBody()
     check raised
     check msgMatches
@@ -671,22 +657,9 @@ suite "Client certificate config validation":
     var raised = false
 
     proc testBody() {.async.} =
-      let ms = startMockServer()
-
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          discard await readN(st, 8)
-          await sendBytes(st, @[byte('S')])
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-
       let config = ConnConfig(
         host: "127.0.0.1",
-        port: ms.port,
+        port: 1,
         user: "test",
         database: "test",
         sslMode: sslRequire,
@@ -698,9 +671,6 @@ suite "Client certificate config validation":
         await conn.close()
       except PgConnectionError:
         raised = true
-
-      await serverFut
-      await closeServer(ms)
 
     waitFor testBody()
     check raised

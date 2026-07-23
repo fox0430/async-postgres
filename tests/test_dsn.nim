@@ -787,6 +787,28 @@ suite "parseDsn":
             keyPath
         )
 
+    test "error: sslkey/sslcert FIFO rejected without blocking":
+      # Regression: readPrivateKeyFile / readPemFileParam used to `open()` the
+      # path before stat-checking, so a FIFO with no writer would block parseDsn
+      # indefinitely. Now we open with O_NONBLOCK and fstat-verify S_ISREG.
+      let certPath = writePemFile(dummyPem)
+      let fifoPath = getTempDir() / "pg_test_sslkey_fifo_" & $rand(1_000_000_000)
+      discard unlink(fifoPath.cstring)
+      doAssert mkfifo(fifoPath.cstring, 0o600.Mode) == 0
+      defer:
+        removeFile(certPath)
+        discard unlink(fifoPath.cstring)
+      expect PgError:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" &
+            fifoPath
+        )
+      expect PgError:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=require&sslcert=" & fifoPath & "&sslkey=" &
+            certPath
+        )
+
 suite "parseDsn keyword=value":
   test "full connection string":
     let cfg = parseDsn("host=dbhost port=5433 dbname=mydb user=myuser password=mypass")
