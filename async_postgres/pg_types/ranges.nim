@@ -647,65 +647,22 @@ proc toPgDateRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
 
 # Range text format getters
 
-proc getInt4Range*(row: Row, col: int): PgRange[int32] =
-  ## Get a column value as an int4range. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    return decodeInt4RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  let s = row.getStr(col)
-  parseRangeText[int32](s, pgParseInt32)
+template genRangeGetter(name: untyped, T: typedesc, decodeBin, parseElem: untyped) =
+  proc name*(row: Row, col: int): PgRange[T] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      return decodeBin(row.data.buf.toOpenArray(off, off + clen - 1))
+    let s = row.getStr(col)
+    parseRangeText[T](s, parseElem)
 
-proc getInt8Range*(row: Row, col: int): PgRange[int64] =
-  ## Get a column value as an int8range. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    return decodeInt8RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  let s = row.getStr(col)
-  parseRangeText[int64](s, pgParseBiggestInt)
-
-proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
-  ## Get a column value as a numrange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    return decodeNumRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  let s = row.getStr(col)
-  parseRangeText[PgNumeric](s, parsePgNumeric)
-
-proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
-  ## Get a column value as a tsrange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    return decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  let s = row.getStr(col)
-  parseRangeText[DateTime](s, parseTimestampText)
-
-proc getTsTzRange*(row: Row, col: int): PgRange[DateTime] =
-  ## Get a column value as a tstzrange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    return decodeTsRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  let s = row.getStr(col)
-  parseRangeText[DateTime](s, parseTimestampText)
-
-proc getDateRange*(row: Row, col: int): PgRange[DateTime] =
-  ## Get a column value as a daterange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    return decodeDateRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
-  let s = row.getStr(col)
-  parseRangeText[DateTime](s, parseDateText)
+genRangeGetter(getInt4Range, int32, decodeInt4RangeBinary, pgParseInt32)
+genRangeGetter(getInt8Range, int64, decodeInt8RangeBinary, pgParseBiggestInt)
+genRangeGetter(getNumRange, PgNumeric, decodeNumRangeBinary, parsePgNumeric)
+genRangeGetter(getTsRange, DateTime, decodeTsRangeBinary, parseTimestampText)
+genRangeGetter(getTsTzRange, DateTime, decodeTsRangeBinary, parseTimestampText)
+genRangeGetter(getDateRange, DateTime, decodeDateRangeBinary, parseDateText)
 
 # Range Opt accessors (text format)
 
@@ -1068,101 +1025,32 @@ proc toPgDateMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
 
 # Multirange text format getters
 
-proc getInt4Multirange*(row: Row, col: int): PgMultirange[int32] =
-  ## Get a column value as an int4multirange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-    var ranges = newSeq[PgRange[int32]](parts.len)
-    for i, p in parts:
-      ranges[i] = decodeInt4RangeBinary(
-        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-      )
-    return PgMultirange[int32](ranges)
-  let s = row.getStr(col)
-  parseMultirangeText[int32](s, pgParseInt32)
+template genMultirangeGetter(
+    name: untyped, T: typedesc, decodeBin, parseElem: untyped
+) =
+  proc name*(row: Row, col: int): PgMultirange[T] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let parts =
+        decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+      var ranges = newSeq[PgRange[T]](parts.len)
+      for i, p in parts:
+        ranges[i] =
+          decodeBin(row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1))
+      return PgMultirange[T](ranges)
+    let s = row.getStr(col)
+    parseMultirangeText[T](s, parseElem)
 
-proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
-  ## Get a column value as an int8multirange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-    var ranges = newSeq[PgRange[int64]](parts.len)
-    for i, p in parts:
-      ranges[i] = decodeInt8RangeBinary(
-        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-      )
-    return PgMultirange[int64](ranges)
-  let s = row.getStr(col)
-  parseMultirangeText[int64](s, pgParseBiggestInt)
-
-proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
-  ## Get a column value as a nummultirange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-    var ranges = newSeq[PgRange[PgNumeric]](parts.len)
-    for i, p in parts:
-      ranges[i] = decodeNumRangeBinary(
-        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-      )
-    return PgMultirange[PgNumeric](ranges)
-  let s = row.getStr(col)
-  parseMultirangeText[PgNumeric](s, parsePgNumeric)
-
-proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
-  ## Get a column value as a tsmultirange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-    var ranges = newSeq[PgRange[DateTime]](parts.len)
-    for i, p in parts:
-      ranges[i] = decodeTsRangeBinary(
-        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-      )
-    return PgMultirange[DateTime](ranges)
-  let s = row.getStr(col)
-  parseMultirangeText[DateTime](s, parseTimestampText)
-
-proc getTsTzMultirange*(row: Row, col: int): PgMultirange[DateTime] =
-  ## Get a column value as a tstzmultirange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-    var ranges = newSeq[PgRange[DateTime]](parts.len)
-    for i, p in parts:
-      ranges[i] = decodeTsRangeBinary(
-        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-      )
-    return PgMultirange[DateTime](ranges)
-  let s = row.getStr(col)
-  parseMultirangeText[DateTime](s, parseTimestampText)
-
-proc getDateMultirange*(row: Row, col: int): PgMultirange[DateTime] =
-  ## Get a column value as a datemultirange. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let parts = decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
-    var ranges = newSeq[PgRange[DateTime]](parts.len)
-    for i, p in parts:
-      ranges[i] = decodeDateRangeBinary(
-        row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1)
-      )
-    return PgMultirange[DateTime](ranges)
-  let s = row.getStr(col)
-  parseMultirangeText[DateTime](s, parseDateText)
+genMultirangeGetter(getInt4Multirange, int32, decodeInt4RangeBinary, pgParseInt32)
+genMultirangeGetter(getInt8Multirange, int64, decodeInt8RangeBinary, pgParseBiggestInt)
+genMultirangeGetter(getNumMultirange, PgNumeric, decodeNumRangeBinary, parsePgNumeric)
+genMultirangeGetter(getTsMultirange, DateTime, decodeTsRangeBinary, parseTimestampText)
+genMultirangeGetter(
+  getTsTzMultirange, DateTime, decodeTsRangeBinary, parseTimestampText
+)
+genMultirangeGetter(getDateMultirange, DateTime, decodeDateRangeBinary, parseDateText)
 
 # Multirange Opt accessors (text format)
 
@@ -1175,173 +1063,57 @@ optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 
 # Multirange array type support
 
-proc getInt4MultirangeArray*(row: Row, col: int): seq[PgMultirange[int32]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgMultirange[int32]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in multirange array")
-      let parts = decodeMultirangeBinaryRaw(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-      var ranges = newSeq[PgRange[int32]](parts.len)
-      for j, p in parts:
-        ranges[j] = decodeInt4RangeBinary(
-          row.data.buf.toOpenArray(off + e.off + p.off, off + e.off + p.off + p.len - 1)
+template genMultirangeArrayGetter(
+    name: untyped, T: typedesc, decodeBin, parseElem: untyped
+) =
+  proc name*(row: Row, col: int): seq[PgMultirange[T]] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      rejectMultiDim(decoded)
+      result = newSeq[PgMultirange[T]](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in multirange array")
+        let parts = decodeMultirangeBinaryRaw(
+          row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
         )
-      result[i] = PgMultirange[int32](ranges)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(parseMultirangeText[int32](e.get, pgParseInt32))
+        var ranges = newSeq[PgRange[T]](parts.len)
+        for j, p in parts:
+          ranges[j] = decodeBin(
+            row.data.buf.toOpenArray(
+              off + e.off + p.off, off + e.off + p.off + p.len - 1
+            )
+          )
+        result[i] = PgMultirange[T](ranges)
+      return
+    let s = row.getStr(col)
+    let elems = parseTextArray(s)
+    for e in elems:
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in multirange array")
+      result.add(parseMultirangeText[T](e.get, parseElem))
 
-proc getInt8MultirangeArray*(row: Row, col: int): seq[PgMultirange[int64]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgMultirange[int64]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in multirange array")
-      let parts = decodeMultirangeBinaryRaw(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-      var ranges = newSeq[PgRange[int64]](parts.len)
-      for j, p in parts:
-        ranges[j] = decodeInt8RangeBinary(
-          row.data.buf.toOpenArray(off + e.off + p.off, off + e.off + p.off + p.len - 1)
-        )
-      result[i] = PgMultirange[int64](ranges)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(parseMultirangeText[int64](e.get, pgParseBiggestInt))
-
-proc getNumMultirangeArray*(row: Row, col: int): seq[PgMultirange[PgNumeric]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgMultirange[PgNumeric]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in multirange array")
-      let parts = decodeMultirangeBinaryRaw(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-      var ranges = newSeq[PgRange[PgNumeric]](parts.len)
-      for j, p in parts:
-        ranges[j] = decodeNumRangeBinary(
-          row.data.buf.toOpenArray(off + e.off + p.off, off + e.off + p.off + p.len - 1)
-        )
-      result[i] = PgMultirange[PgNumeric](ranges)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(parseMultirangeText[PgNumeric](e.get, parsePgNumeric))
-
-proc getTsMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgMultirange[DateTime]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in multirange array")
-      let parts = decodeMultirangeBinaryRaw(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-      var ranges = newSeq[PgRange[DateTime]](parts.len)
-      for j, p in parts:
-        ranges[j] = decodeTsRangeBinary(
-          row.data.buf.toOpenArray(off + e.off + p.off, off + e.off + p.off + p.len - 1)
-        )
-      result[i] = PgMultirange[DateTime](ranges)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(parseMultirangeText[DateTime](e.get, parseTimestampText))
-
-proc getTsTzMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgMultirange[DateTime]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in multirange array")
-      let parts = decodeMultirangeBinaryRaw(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-      var ranges = newSeq[PgRange[DateTime]](parts.len)
-      for j, p in parts:
-        ranges[j] = decodeTsRangeBinary(
-          row.data.buf.toOpenArray(off + e.off + p.off, off + e.off + p.off + p.len - 1)
-        )
-      result[i] = PgMultirange[DateTime](ranges)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(parseMultirangeText[DateTime](e.get, parseTimestampText))
-
-proc getDateMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgMultirange[DateTime]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in multirange array")
-      let parts = decodeMultirangeBinaryRaw(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-      var ranges = newSeq[PgRange[DateTime]](parts.len)
-      for j, p in parts:
-        ranges[j] = decodeDateRangeBinary(
-          row.data.buf.toOpenArray(off + e.off + p.off, off + e.off + p.off + p.len - 1)
-        )
-      result[i] = PgMultirange[DateTime](ranges)
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(parseMultirangeText[DateTime](e.get, parseDateText))
+genMultirangeArrayGetter(
+  getInt4MultirangeArray, int32, decodeInt4RangeBinary, pgParseInt32
+)
+genMultirangeArrayGetter(
+  getInt8MultirangeArray, int64, decodeInt8RangeBinary, pgParseBiggestInt
+)
+genMultirangeArrayGetter(
+  getNumMultirangeArray, PgNumeric, decodeNumRangeBinary, parsePgNumeric
+)
+genMultirangeArrayGetter(
+  getTsMultirangeArray, DateTime, decodeTsRangeBinary, parseTimestampText
+)
+genMultirangeArrayGetter(
+  getTsTzMultirangeArray, DateTime, decodeTsRangeBinary, parseTimestampText
+)
+genMultirangeArrayGetter(
+  getDateMultirangeArray, DateTime, decodeDateRangeBinary, parseDateText
+)
 
 optAccessor(getInt4MultirangeArray, getInt4MultirangeArrayOpt, seq[PgMultirange[int32]])
 optAccessor(getInt8MultirangeArray, getInt8MultirangeArrayOpt, seq[PgMultirange[int64]])
@@ -1358,143 +1130,38 @@ optAccessor(
 
 # Range array type support
 
-proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
-  ## Get a column value as an ``int4range[]``. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgRange[int32]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
+template genRangeArrayGetter(
+    name: untyped, T: typedesc, decodeBin, parseElem: untyped
+) =
+  proc name*(row: Row, col: int): seq[PgRange[T]] =
+    if row.isBinaryCol(col):
+      let (off, clen) = cellInfo(row, col)
+      if clen == -1:
+        raise newException(PgTypeError, "Column " & $col & " is NULL")
+      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      rejectMultiDim(decoded)
+      result = newSeq[PgRange[T]](decoded.elements.len)
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in range array")
+        result[i] =
+          decodeBin(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1))
+      return
+    let s = row.getStr(col)
+    let elems = parseTextArray(s)
+    for e in elems:
+      if e.isNone:
         raise newException(PgTypeError, "NULL element in range array")
-      result[i] = decodeInt4RangeBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in range array")
-    result.add(parseRangeText[int32](e.get, pgParseInt32))
+      result.add(parseRangeText[T](e.get, parseElem))
 
-proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
-  ## Get a column value as an ``int8range[]``. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgRange[int64]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in range array")
-      result[i] = decodeInt8RangeBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in range array")
-    result.add(parseRangeText[int64](e.get, pgParseBiggestInt))
-
-proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
-  ## Get a column value as a ``numrange[]``. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgRange[PgNumeric]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in range array")
-      result[i] = decodeNumRangeBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in range array")
-    result.add(parseRangeText[PgNumeric](e.get, parsePgNumeric))
-
-proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
-  ## Get a column value as a ``tsrange[]``. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgRange[DateTime]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in range array")
-      result[i] = decodeTsRangeBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in range array")
-    result.add(parseRangeText[DateTime](e.get, parseTimestampText))
-
-proc getTsTzRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
-  ## Get a column value as a ``tstzrange[]``. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgRange[DateTime]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in range array")
-      result[i] = decodeTsRangeBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in range array")
-    result.add(parseRangeText[DateTime](e.get, parseTimestampText))
-
-proc getDateRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
-  ## Get a column value as a ``daterange[]``. Handles binary format.
-  if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgRange[DateTime]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in range array")
-      result[i] = decodeDateRangeBinary(
-        row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in range array")
-    result.add(parseRangeText[DateTime](e.get, parseDateText))
+genRangeArrayGetter(getInt4RangeArray, int32, decodeInt4RangeBinary, pgParseInt32)
+genRangeArrayGetter(getInt8RangeArray, int64, decodeInt8RangeBinary, pgParseBiggestInt)
+genRangeArrayGetter(getNumRangeArray, PgNumeric, decodeNumRangeBinary, parsePgNumeric)
+genRangeArrayGetter(getTsRangeArray, DateTime, decodeTsRangeBinary, parseTimestampText)
+genRangeArrayGetter(
+  getTsTzRangeArray, DateTime, decodeTsRangeBinary, parseTimestampText
+)
+genRangeArrayGetter(getDateRangeArray, DateTime, decodeDateRangeBinary, parseDateText)
 
 # Range array Opt accessors
 
