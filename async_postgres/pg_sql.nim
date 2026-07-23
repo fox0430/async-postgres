@@ -41,6 +41,8 @@ type
     sEString
     sDoubleQuote
     sDollarQuote
+    sLineComment
+    sBlockComment
 
 template sqlParseLoop(
     sql: string,
@@ -50,10 +52,12 @@ template sqlParseLoop(
     dollarTag: var string,
     normalBody: untyped,
 ) =
-  ## Shared SQL parsing loop that handles quote-state transitions.
+  ## Shared SQL parsing loop that handles quote/comment-state transitions.
   ## ``normalBody`` is executed for characters in ``sNormal`` that are not
-  ## quote transitions (``'``, ``"``, ``$``-quote). Inside ``normalBody``,
-  ## ``c`` is the current character at ``sql[idx]``.
+  ## quote transitions (``'``, ``"``, ``$``-quote) or comment starts
+  ## (``--``, ``/*``). Inside ``normalBody``, ``c`` is the current character
+  ## at ``sql[idx]``.
+  var blockDepth = 0
   while idx < sql.len:
     let c {.inject.} = sql[idx]
     case state
@@ -91,6 +95,21 @@ template sqlParseLoop(
         if not matched:
           output.add(c)
           inc idx
+      of '-':
+        if idx + 1 < sql.len and sql[idx + 1] == '-':
+          state = sLineComment
+          output.add("--")
+          idx += 2
+        else:
+          normalBody
+      of '/':
+        if idx + 1 < sql.len and sql[idx + 1] == '*':
+          state = sBlockComment
+          blockDepth = 1
+          output.add("/*")
+          idx += 2
+        else:
+          normalBody
       else:
         normalBody
     of sSingleQuote:
@@ -133,17 +152,39 @@ template sqlParseLoop(
       else:
         output.add(c)
         inc idx
+    of sLineComment:
+      output.add(c)
+      if c == '\n':
+        state = sNormal
+      inc idx
+    of sBlockComment:
+      # PostgreSQL block comments nest — track depth.
+      if c == '/' and idx + 1 < sql.len and sql[idx + 1] == '*':
+        output.add("/*")
+        inc blockDepth
+        idx += 2
+      elif c == '*' and idx + 1 < sql.len and sql[idx + 1] == '/':
+        output.add("*/")
+        dec blockDepth
+        idx += 2
+        if blockDepth == 0:
+          state = sNormal
+      else:
+        output.add(c)
+        inc idx
 
 func sqlParams*(sql: string): string =
   ## Convert ``?``-style placeholders to PostgreSQL ``$1, $2, …`` positional
   ## placeholders.
   ##
   ## - ``??`` is an escape for a literal ``?``
-  ## - ``?|`` and ``?&`` (PostgreSQL JSONB operators) are preserved
+  ## - ``?|``, ``?&``, ``?-``, ``?#`` (PostgreSQL operators) are preserved
   ## - ``?`` inside single-quoted SQL strings is preserved
   ## - ``?`` inside ``E'…'`` C-style escape strings is preserved
   ## - ``?`` inside double-quoted identifiers is preserved
   ## - ``?`` inside dollar-quoted strings (``$$…$$``, ``$tag$…$tag$``) is preserved
+  ## - ``?`` inside ``-- …`` line comments is preserved
+  ## - ``?`` inside ``/* … */`` block comments (nestable) is preserved
   result = newStringOfCap(sql.len + 16)
   var i = 0
   var paramIdx = 0
@@ -156,7 +197,7 @@ func sqlParams*(sql: string): string =
       if i + 1 < sql.len and sql[i + 1] == '?':
         result.add('?')
         i += 2
-      elif i + 1 < sql.len and sql[i + 1] in {'|', '&'}:
+      elif i + 1 < sql.len and sql[i + 1] in {'|', '&', '-', '#'}:
         result.add(c)
         result.add(sql[i + 1])
         i += 2
@@ -176,7 +217,14 @@ macro sql*(queryStr: static[string]): untyped =
   ##
   ## Use ``{{`` and ``}}`` to produce literal braces.  Placeholders inside
   ## single-quoted SQL strings, ``E'…'`` strings, double-quoted identifiers,
-  ## and dollar-quoted strings are left as-is.
+  ## dollar-quoted strings, and SQL comments (``-- …`` and ``/* … */``,
+  ## nestable) are left as-is.
+  ##
+  ## Inside ``{expr}`` the following Nim syntax is recognised so ``{``/``}`` in
+  ## their content does not affect brace matching: ``"…"`` / ``r"…"`` (raw) /
+  ## ``"""…"""`` (triple) strings and ``# …`` / ``#[ … ]#`` (nestable) comments.
+  ## Char-literal scanning uses a fixed advance, which keeps type suffixes
+  ## like ``10'i32`` harmless.
   var resultSql = newStringOfCap(queryStr.len)
   var paramNodes = newNimNode(nnkBracket)
   var paramIdx = 0
@@ -196,8 +244,10 @@ macro sql*(queryStr: static[string]): untyped =
         var j = start
         while j < queryStr.len and depth > 0:
           let ch = queryStr[j]
-          if ch == '\'':
-            # Nim char literal: skip 'x' or '\x'
+          case ch
+          of '\'':
+            # Nim char literal: fixed-advance skip. Type suffixes like
+            # 10'i32 fall through harmlessly since we do not force-close.
             inc j
             if j < queryStr.len and queryStr[j] == '\\':
               j += min(2, queryStr.len - j)
@@ -205,21 +255,66 @@ macro sql*(queryStr: static[string]): untyped =
               inc j
             if j < queryStr.len and queryStr[j] == '\'':
               inc j
-          elif ch == '"':
-            # Nim string literal: skip until closing " (handle \" escape)
-            inc j
-            while j < queryStr.len:
-              if queryStr[j] == '\\':
-                j += min(2, queryStr.len - j)
-              elif queryStr[j] == '"':
+          of '"':
+            if j + 2 < queryStr.len and queryStr[j + 1] == '"' and queryStr[j + 2] == '"':
+              # Triple string """...""": no escapes; ends at the first
+              # """ with any trailing extra " counted as content.
+              j += 3
+              while j < queryStr.len:
+                if queryStr[j] == '"' and j + 2 < queryStr.len and queryStr[j + 1] == '"' and
+                    queryStr[j + 2] == '"':
+                  j += 3
+                  while j < queryStr.len and queryStr[j] == '"':
+                    inc j
+                  break
                 inc j
-                break
-              else:
+            else:
+              # Raw when prefixed by an identifier char (r"...", R"...",
+              # myLit"..."): no \ escape, "" is a literal ".
+              let isRaw =
+                j > start and
+                queryStr[j - 1] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}
+              inc j
+              while j < queryStr.len:
+                if isRaw:
+                  if queryStr[j] == '"':
+                    if j + 1 < queryStr.len and queryStr[j + 1] == '"':
+                      j += 2
+                    else:
+                      inc j
+                      break
+                  else:
+                    inc j
+                else:
+                  if queryStr[j] == '\\':
+                    j += min(2, queryStr.len - j)
+                  elif queryStr[j] == '"':
+                    inc j
+                    break
+                  else:
+                    inc j
+          of '#':
+            # Nim comment: # line, or #[ ... ]# block (nestable).
+            if j + 1 < queryStr.len and queryStr[j + 1] == '[':
+              j += 2
+              var commentDepth = 1
+              while j < queryStr.len and commentDepth > 0:
+                if queryStr[j] == '#' and j + 1 < queryStr.len and queryStr[j + 1] == '[':
+                  inc commentDepth
+                  j += 2
+                elif queryStr[j] == ']' and j + 1 < queryStr.len and
+                    queryStr[j + 1] == '#':
+                  dec commentDepth
+                  j += 2
+                else:
+                  inc j
+            else:
+              while j < queryStr.len and queryStr[j] != '\n':
                 inc j
-          elif ch == '{':
+          of '{':
             inc depth
             inc j
-          elif ch == '}':
+          of '}':
             dec depth
             if depth > 0:
               inc j

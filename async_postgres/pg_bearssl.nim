@@ -28,6 +28,9 @@ when hasChronos:
     ## DN accumulation callback
     let s = cast[ptr seq[byte]](ctx)
     let p = cast[ptr UncheckedArray[byte]](buf)
+    # int(len) traps RangeDefect > high(int); Defect leaks past raises: [] into C (UB).
+    if len > csize_t(high(int)):
+      return
     for i in 0 ..< int(len):
       s[].add(p[i])
 
@@ -54,12 +57,14 @@ when hasChronos:
 
   proc x509CaptureAppend(
       ctx: X509ClassPointerConst, buf: ConstPtrByte, len: csize_t
-  ) {.cdecl.} =
+  ) {.cdecl, raises: [].} =
     let self = cast[ptr X509CertCaptureContext](ctx)
-    if self.capturing:
+    # int(len) trap: Defect out of a cdecl frame into C is UB. Inner still gets raw csize_t.
+    if self.capturing and len <= csize_t(high(int)):
+      let n = int(len)
       let oldLen = self.certDer[].len
-      self.certDer[].setLen(oldLen + int(len))
-      copyMem(addr self.certDer[][oldLen], buf, int(len))
+      self.certDer[].setLen(oldLen + n)
+      copyMem(addr self.certDer[][oldLen], buf, n)
     let inner = cast[ptr ptr X509Class](self.inner)
     inner[].append(inner, buf, len)
 
@@ -132,6 +137,9 @@ when hasChronos:
     for item in items:
       if item.name != "CERTIFICATE":
         continue
+      # Empty CERTIFICATE block → data.len==0; addr data[0] would IndexDefect.
+      if item.data.len == 0:
+        continue
 
       var dnBuf: seq[byte]
       var decoder: X509DecoderContext
@@ -145,11 +153,30 @@ when hasChronos:
       if pkey.isNil:
         continue
 
-      # Deep-copy DN
+      # Stage all buffers first: `addr buf[0]` needs non-empty guards, and a
+      # mid-loop skip must not orphan a committed dnBuf in `backing`.
+      if dnBuf.len == 0:
+        continue
+
+      var nBuf, eBuf, qBuf: seq[byte]
+      if pkey.keyType == byte(KEYTYPE_RSA):
+        if pkey.key.rsa.nlen == 0 or pkey.key.rsa.elen == 0:
+          continue
+        nBuf = newSeq[byte](pkey.key.rsa.nlen)
+        copyMem(addr nBuf[0], pkey.key.rsa.n, nBuf.len)
+        eBuf = newSeq[byte](pkey.key.rsa.elen)
+        copyMem(addr eBuf[0], pkey.key.rsa.e, eBuf.len)
+      elif pkey.keyType == byte(KEYTYPE_EC):
+        if pkey.key.ec.qlen == 0:
+          continue
+        qBuf = newSeq[byte](pkey.key.ec.qlen)
+        copyMem(addr qBuf[0], pkey.key.ec.q, qBuf.len)
+      else:
+        continue
+
       backing.add(dnBuf)
       let dnData = addr backing[^1][0]
 
-      # Deep-copy public key and build anchor
       var anchor: X509TrustAnchor
       anchor.dn = X500Name(data: dnData, len: uint(dnBuf.len))
       anchor.flags =
@@ -160,11 +187,7 @@ when hasChronos:
       anchor.pkey.keyType = pkey.keyType
 
       if pkey.keyType == byte(KEYTYPE_RSA):
-        var nBuf = newSeq[byte](pkey.key.rsa.nlen)
-        copyMem(addr nBuf[0], pkey.key.rsa.n, nBuf.len)
         backing.add(nBuf)
-        var eBuf = newSeq[byte](pkey.key.rsa.elen)
-        copyMem(addr eBuf[0], pkey.key.rsa.e, eBuf.len)
         backing.add(eBuf)
         anchor.pkey.key.rsa = RsaPublicKey(
           n: addr backing[^2][0],
@@ -172,15 +195,11 @@ when hasChronos:
           e: addr backing[^1][0],
           elen: uint(eBuf.len),
         )
-      elif pkey.keyType == byte(KEYTYPE_EC):
-        var qBuf = newSeq[byte](pkey.key.ec.qlen)
-        copyMem(addr qBuf[0], pkey.key.ec.q, qBuf.len)
+      else: # KEYTYPE_EC
         backing.add(qBuf)
         anchor.pkey.key.ec = EcPublicKey(
           curve: pkey.key.ec.curve, q: addr backing[^1][0], qlen: uint(qBuf.len)
         )
-      else:
-        continue
 
       anchors.add(anchor)
 

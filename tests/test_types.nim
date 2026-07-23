@@ -480,11 +480,26 @@ suite "getBytes accessor":
     let b = row.getBytes(0)
     check b.len == 0
 
-  test "raw bytes (no hex prefix)":
-    let raw = @[0x01'u8, 0x02, 0x03]
-    let row = @[some(raw)]
-    let b = row.getBytes(0)
-    check b == raw
+  test "escape format passthrough (no backslash)":
+    let row = @[some(toBytes("Hello"))]
+    check row.getBytes(0) == toBytes("Hello")
+
+  test "escape format decodes \\NNN octal":
+    # bytea_output=escape encodes bytes <0x20 or >0x7E as three-digit octal
+    let row = @[some(toBytes("\\000A\\377"))]
+    check row.getBytes(0) == @[0x00'u8, 0x41'u8, 0xFF'u8]
+
+  test "escape format decodes \\\\ backslash":
+    let row = @[some(toBytes("a\\\\b"))]
+    check row.getBytes(0) == @[0x61'u8, 0x5C'u8, 0x62'u8]
+
+  test "escape format rejects trailing backslash":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("abc\\"))]).getBytes(0)
+
+  test "escape format rejects malformed octal":
+    expect PgTypeError:
+      discard (Row @[some(toBytes("\\4ab"))]).getBytes(0)
 
   test "NULL raises":
     let row = @[none(seq[byte])]
@@ -738,6 +753,17 @@ suite "PgTime":
     check opt.isSome
     check opt.get().hour == 10
 
+  test "getTime text trailing garbage raises":
+    # Anything after HH:MM:SS other than ".ffffff" must be rejected.
+    for bad in ["01:23:45X", "01:23:45XYZ garbage", "01:23:45.", "01:23:45.1234567"]:
+      let row = @[some(toBytes(bad))]
+      var raised = false
+      try:
+        discard row.getTime(0)
+      except PgTypeError:
+        raised = true
+      check raised
+
 suite "PgTimeTz":
   test "$PgTimeTz positive offset":
     let t = PgTimeTz(hour: 14, minute: 30, second: 0, microsecond: 0, utcOffset: 18000)
@@ -846,6 +872,12 @@ suite "PgTimeTz":
   test "getTimeTzOpt NULL returns none":
     let row = @[none(seq[byte])]
     check row.getTimeTzOpt(0).isNone
+
+  test "toPgBinaryParam PgTimeTz rejects int32.low utcOffset":
+    # Negating int32.low would overflow int32 in the encoder.
+    let t = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: int32.low)
+    expect PgTypeError:
+      discard toPgBinaryParam(t)
 
 suite "date parameter encoding":
   test "toPgDateParam OID and format":
@@ -2842,6 +2874,23 @@ suite "PgMoney":
     # Parenthesized with extra minus
     expect(PgTypeError):
       discard parsePgMoney("(-$1.00)")
+    # Sign in the middle of digits must not be silently dropped.
+    expect(PgTypeError):
+      discard parsePgMoney("12-34", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("12-34.56")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00-")
+    # Two signs in the prefix are ambiguous, not "+ wins".
+    expect(PgTypeError):
+      discard parsePgMoney("+-1.00")
+    expect(PgTypeError):
+      discard parsePgMoney("-+1.00")
+    # scale=0 must not silently truncate fractional digits.
+    expect(PgTypeError):
+      discard parsePgMoney("1.23", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("1.5", scale = 0)
 
   test "parsePgMoney rejects overflow":
     expect(PgTypeError):
@@ -2954,6 +3003,13 @@ suite "PgMoney":
     let rowNone = mkRow(@[none(seq[byte])], fields)
     check rowNone.getMoneyOpt(0) == none(PgMoney)
 
+  test "getMoneyOpt forwards scale kwarg":
+    # Non-default scales (e.g. ja_JP frac_digits=0) must survive the Opt wrapper.
+    let fields = @[mkField(OidMoney, 1)]
+    let rowSome = mkRow(@[some(@(toBE64(42'i64)))], fields)
+    check rowSome.getMoneyOpt(0, scale = 0) == some(initPgMoney(42, scale = 0))
+    check rowSome.getMoneyOpt(0, scale = 3) == some(initPgMoney(42, scale = 3))
+
   test "toPgParam seq[PgMoney] empty":
     let p = toPgParam(newSeq[PgMoney]())
     check p.oid == OidMoneyArray
@@ -2987,6 +3043,13 @@ suite "PgMoney":
     check rowSome.getMoneyArrayOpt(0) == some(values)
     let rowNone = mkRow(@[none(seq[byte])], fields)
     check rowNone.getMoneyArrayOpt(0) == none(seq[PgMoney])
+
+  test "getMoneyArrayOpt forwards scale kwarg":
+    let values0 = @[initPgMoney(1, scale = 0), initPgMoney(2, scale = 0)]
+    let p = toPgParam(@[initPgMoney(1), initPgMoney(2)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let rowSome = mkRow(@[p.value], fields)
+    check rowSome.getMoneyArrayOpt(0, scale = 0) == some(values0)
 
   test "getMoney rejects invalid scale":
     let fields = @[mkField(OidMoney, 1)]
@@ -3098,6 +3161,17 @@ suite "PgInterval":
     let v = parseIntervalText("7 days 12:00:00")
     check v.days == 7
     check v.microseconds == 43_200_000_000'i64
+
+  test "parseIntervalText malformed raises":
+    # Bare garbage, unknown units, bare number, and non-alnum bytes must all
+    # raise. "!!" previously spun the parser in an infinite loop.
+    for bad in ["junk", "5 fortnights", "1", "!!", "-", "3 days garbage"]:
+      var raised = false
+      try:
+        discard parseIntervalText(bad)
+      except PgTypeError:
+        raised = true
+      check raised
 
   test "toPgParam PgInterval":
     let v = PgInterval(months: 14, days: 3, microseconds: 14706123456)
@@ -4272,6 +4346,75 @@ suite "User-defined composite":
     expect PgTypeError:
       discard getComposite[NullableRecord](row, 0)
 
+  test "getComposite binary int32 field with float4 wire OID raises":
+    # int4 and float4 share 4 bytes; only OID separates them. Without the
+    # OID check the raw bit pattern of 1.5f would decode as int32 garbage.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Kate"))),
+      (oid: OidFloat4, data: some(@(toBE32(cast[int32](1.5'f32))))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary int64 field with timestamp wire OID raises":
+    # int8 and timestamp share 8 bytes; only OID separates them.
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Leo"))),
+      (oid: OidTimestamp, data: some(@(toBE64(1'i64)))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(0'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[WideIntRecord](row, 0)
+
+  test "getComposite binary float64 field with int8 wire OID raises":
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("Mia"))),
+      (oid: OidInt4, data: some(@(toBE32(1'i32)))),
+      (oid: OidInt8, data: some(@(toBE64(42'i64)))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PersonRecord](row, 0)
+
+  test "getComposite binary extra wire fields raises":
+    # Wire has 3 fields but PointRecord has 2 — previously silent-truncated.
+    let fields_data = @[
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](2.0'f64))))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](3.0'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    expect PgTypeError:
+      discard getComposite[PointRecord](row, 0)
+
+  test "getComposite text extra wire fields raises":
+    let row: Row = @[some(toBytes("(1.0,2.0,3.0)"))]
+    expect PgTypeError:
+      discard getComposite[PointRecord](row, 0)
+
+  test "getComposite binary OID 0 accepts width-matching payload":
+    # OID 0 = server didn't disclose type; length guard still applies.
+    let fields_data = @[
+      (oid: 0'i32, data: some(@(toBE64(cast[int64](3.14'f64))))),
+      (oid: 0'i32, data: some(@(toBE64(cast[int64](2.72'f64))))),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let pt = getComposite[PointRecord](row, 0)
+    check abs(pt.x - 3.14) < 1e-10
+    check abs(pt.y - 2.72) < 1e-10
+
 suite "User-defined domain":
   test "pgDomain generates toPgParam with base type OID":
     let p = toPgParam(UsPostalCode("12345"))
@@ -4636,6 +4779,33 @@ suite "Range toPgParam":
     let decoded = row.getTsRange(0)
     check decoded.lower.value.nanosecond == 789_000
 
+  test "tsrange with non-UTC zone encodes the UTC instant":
+    # Regression: the tsrange text path used to serialize the local wall clock,
+    # diverging from scalar toPgParam(DateTime). utcOffset counts seconds WEST
+    # of UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt1 = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let dt2 = dateTime(2026, mJul, 16, 9, 0, 0, 0, jst)
+    let p = toPgParam(rangeOf(dt1, dt2))
+    check p.oid == OidTsRange
+    check p.value.get.toString ==
+      "[\"2026-07-15 12:00:00.000000\",\"2026-07-16 00:00:00.000000\")"
+    let ap = toPgParam(@[rangeOf(dt1, dt2)])
+    check ap.oid == OidTsRangeArray
+    check ap.value.get.toString ==
+      "{\"[\\\"2026-07-15 12:00:00.000000\\\",\\\"2026-07-16 00:00:00.000000\\\")\"}"
+
   test "tstzrange":
     let dt1 = dateTime(2023, mJan, 1, zone = utc())
     let dt2 = dateTime(2023, mDec, 31, zone = utc())
@@ -4643,6 +4813,14 @@ suite "Range toPgParam":
     check p.oid == OidTsTzRange
     check p.value.get.toString ==
       "[\"2023-01-01 00:00:00.000000Z\",\"2023-12-31 00:00:00.000000Z\")"
+
+  test "tstzmultirange":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgTsTzMultirangeParam(toMultirange(rangeOf(dt1, dt2)))
+    check p.oid == OidTsTzMultirange
+    check p.value.get.toString ==
+      "{[\"2023-01-01 00:00:00.000000Z\",\"2023-12-31 00:00:00.000000Z\")}"
 
   test "daterange":
     let dt1 = dateTime(2023, mJan, 1, zone = utc())
@@ -4801,6 +4979,55 @@ suite "Range binary decoding (roundtrip)":
     check decoded.lower.value.month == mDec
     check decoded.lower.value.monthday == 31
 
+suite "Range binary decoding rejects malformed bLen":
+  # Fixed-width range decoders must validate the per-bound length field
+  # matches the type's element size instead of blindly slicing a hardcoded
+  # window, which would spill into adjacent bytes on malicious/corrupt input.
+  test "int4range rejects short lower bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(2'i32)) # bogus: int4 must be 4 bytes
+    data.add([0'u8, 0])
+    data.add(toBE32(4'i32))
+    data.add(toBE32(10'i32))
+    expect PgTypeError:
+      discard decodeInt4RangeBinary(data)
+
+  test "int4range rejects oversized upper bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(4'i32))
+    data.add(toBE32(1'i32))
+    data.add(toBE32(8'i32)) # bogus: int4 must be 4 bytes
+    data.add(toBE64(10'i64))
+    expect PgTypeError:
+      discard decodeInt4RangeBinary(data)
+
+  test "int8range rejects wrong bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(4'i32)) # bogus: int8 must be 8 bytes
+    data.add(toBE32(1'i32))
+    data.add(toBE32(8'i32))
+    data.add(toBE64(10'i64))
+    expect PgTypeError:
+      discard decodeInt8RangeBinary(data)
+
+  test "tsrange rejects wrong bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(4'i32)) # bogus: timestamp must be 8 bytes
+    data.add(toBE32(0'i32))
+    data.add(toBE32(8'i32))
+    data.add(toBE64(0'i64))
+    expect PgTypeError:
+      discard decodeTsRangeBinary(data)
+
+  test "daterange rejects wrong bLen":
+    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    data.add(toBE32(8'i32)) # bogus: date must be 4 bytes
+    data.add(toBE64(0'i64))
+    data.add(toBE32(4'i32))
+    data.add(toBE32(0'i32))
+    expect PgTypeError:
+      discard decodeDateRangeBinary(data)
+
 suite "Range row getters":
   test "getInt4Range text":
     let row: Row = @[some(toBytes("[1,10)"))]
@@ -4912,6 +5139,29 @@ suite "PgMultirange":
     let p = toPgParam(mr)
     check p.oid == OidInt4Multirange
     check p.value.get.toString == "{}"
+
+  test "toPgParam tsmultirange with non-UTC zone encodes the UTC instant":
+    # Regression: the ts multirange text path used to serialize the local wall
+    # clock (via $), diverging from scalar toPgParam(DateTime). utcOffset counts
+    # seconds WEST of UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt1 = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let dt2 = dateTime(2026, mJul, 16, 9, 0, 0, 0, jst)
+    let p = toPgParam(toMultirange(rangeOf(dt1, dt2)))
+    check p.oid == OidTsMultirange
+    check p.value.get.toString ==
+      "{[\"2026-07-15 12:00:00.000000\",\"2026-07-16 00:00:00.000000\")}"
 
 suite "Multirange text parsing":
   test "parse int4multirange":
@@ -5373,6 +5623,23 @@ suite "Multirange array binary roundtrip":
     check decoded.len == 2
     check decoded[0] == toMultirange(rangeOf(1'i32, 10'i32))
     check decoded[1].len == 0
+
+suite "Multirange array text roundtrip":
+  test "tstzmultirange[] text roundtrip":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let orig = @[toMultirange(rangeOf(dt1, dt2))]
+    let p = toPgTsTzMultirangeArrayParam(orig)
+    check p.oid == OidTsTzMultirangeArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    let decoded = row.getTsTzMultirangeArray(0)
+    check decoded.len == 1
+    check decoded[0].len == 1
+    check decoded[0][0].lower.value.year == 2023
+    check decoded[0][0].lower.value.month == mJan
+    check decoded[0][0].upper.value.year == 2023
+    check decoded[0][0].upper.value.month == mJun
 
 suite "Range array row getters":
   test "getInt4RangeArray text":
@@ -5866,6 +6133,60 @@ suite "tsvector / tsquery":
     let q = row.getTsQuery(0)
     check "'cat' <-> 'dog'" == $q
 
+  test "getTsQuery binary NOT wraps compound child":
+    # NOT(AND(a, b)) must round-trip as "!( 'a' & 'b' )", not "!'a' & 'b'"
+    # (which reparses as AND(NOT a, b)).
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(4'i32)))
+    data.add(@[byte 2, 1]) # NOT
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    check decodeBinaryTsQuery(data) == "!( 'a' & 'b' )"
+
+  test "getTsQuery binary AND(NOT a, b) does not collide with NOT(AND a b)":
+    # NOT binds tighter than AND, so this needs no wrap and stays "!'a' & 'b'".
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(4'i32)))
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 2, 1]) # NOT
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    check decodeBinaryTsQuery(data) == "!'a' & 'b'"
+
+  test "getTsQuery binary PHRASE wraps AND child":
+    # PHRASE binds tighter than AND, so AND under PHRASE needs parens.
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(5'i32)))
+    data.add(@[byte 2, 4, 0, 1]) # PHRASE dist=1
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    data.add(@[byte 1, 0, 0, byte('c'), 0])
+    check decodeBinaryTsQuery(data) == "'a' <-> ( 'b' & 'c' )"
+
+  test "getTsQuery binary AND wraps OR child":
+    # AND binds tighter than OR, so OR under AND needs parens.
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(5'i32)))
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 2, 3]) # OR
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    data.add(@[byte 1, 0, 0, byte('c'), 0])
+    check decodeBinaryTsQuery(data) == "( 'a' | 'b' ) & 'c'"
+
+  test "getTsQuery binary OR does not wrap AND child":
+    # AND binds tighter than OR; no parens needed.
+    var data: seq[byte] = @[]
+    data.add(@(toBE32(5'i32)))
+    data.add(@[byte 2, 3]) # OR
+    data.add(@[byte 2, 2]) # AND
+    data.add(@[byte 1, 0, 0, byte('a'), 0])
+    data.add(@[byte 1, 0, 0, byte('b'), 0])
+    data.add(@[byte 1, 0, 0, byte('c'), 0])
+    check decodeBinaryTsQuery(data) == "'a' & 'b' | 'c'"
+
   test "getTsQuery binary format with weight and prefix":
     # Binary tsquery for 'cat':AB* (single operand with weights A+B and prefix)
     var data: seq[byte] = @[]
@@ -6224,6 +6545,26 @@ suite "PgBit":
     # nbits = 3 in big-endian
     check data[0 .. 3] == @[0'u8, 0, 0, 3]
     check data[4] == 0b10100000'u8
+
+  test "toPgBinaryParam PgBit rejects negative nbits":
+    let b = PgBit(nbits: -1, data: @[0'u8])
+    expect PgTypeError:
+      discard toPgBinaryParam(b)
+
+  test "toPgBinaryParam PgBit rejects nbits above limit":
+    let b = PgBit(nbits: PgBitMaxBits + 1, data: @[])
+    expect PgTypeError:
+      discard toPgBinaryParam(b)
+
+  test "toPgBinaryParam PgBit rejects nbits/data.len mismatch":
+    # nbits=8 requires exactly 1 packed byte; supplying 2 must be rejected.
+    let b = PgBit(nbits: 8, data: @[0'u8, 0'u8])
+    expect PgTypeError:
+      discard toPgBinaryParam(b)
+    # nbits=3 requires 1 byte; supplying 0 must also be rejected.
+    let b2 = PgBit(nbits: 3, data: @[])
+    expect PgTypeError:
+      discard toPgBinaryParam(b2)
 
   test "getBit text format":
     let data = toBytes("10110011")
@@ -6945,6 +7286,28 @@ suite "Multirange array types":
     let row: Row = @[p.value]
     let arr = row.getNumMultirangeArray(0)
     check arr.len == 1
+
+  test "toPgTsMultirangeArrayParam with non-UTC zone encodes the UTC instant":
+    # Regression: the ts multirange array text path used $, which serializes the
+    # local wall clock rather than UTC.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    let dt1 = dateTime(2026, mJul, 15, 21, 0, 0, 0, jst)
+    let dt2 = dateTime(2026, mJul, 16, 9, 0, 0, 0, jst)
+    let p = toPgTsMultirangeArrayParam(@[toMultirange(rangeOf(dt1, dt2))])
+    check p.oid == OidTsMultirangeArray
+    check p.value.get.toString ==
+      "{\"{[\\\"2026-07-15 12:00:00.000000\\\",\\\"2026-07-16 00:00:00.000000\\\")}\"}"
 
 proc inlinePayload(p: PgParamInline): seq[byte] =
   ## Reconstruct the binary payload a PgParamInline would emit on the wire,
@@ -8586,6 +8949,13 @@ suite "Text-path parse errors raise PgTypeError (not ValueError)":
   test "getBytesArray odd-length hex element":
     expect PgTypeError:
       discard (Row @[some(toBytes("{\\xABC}"))]).getBytesArray(0)
+
+  test "getBytesArray escape-format element":
+    # Text-format array element without \x prefix must go through the
+    # escape decoder, not raw passthrough.
+    let arr = (Row @[some(toBytes("{\"\\\\000A\"}"))]).getBytesArray(0)
+    check arr.len == 1
+    check arr[0] == @[0x00'u8, 0x41'u8]
 
   test "getInet invalid mask":
     expect PgTypeError:

@@ -322,9 +322,10 @@ proc pgParseInt*(s: string): int =
   pgTypeErrorOnValueError("invalid integer value"):
     parseInt(s)
 
-proc pgParseInt32*(s: string): int32 =
+proc pgParseInt32*(s: string): int32 {.gcsafe, raises: [CatchableError].} =
   ## Parse a text integer into int32, rejecting non-numeric and out-of-range values.
   ## Plain ``int32(parseInt)`` would silently truncate (wrap) in release builds.
+  ## Effect signature lets ``parseRangeText``/``parseMultirangeText`` take it directly.
   let v = pgParseInt(s)
   if v < int(int32.low) or v > int(int32.high):
     raise newException(PgTypeError, "integer value out of int32 range: " & s)
@@ -338,8 +339,10 @@ proc pgParseInt16*(s: string): int16 =
     raise newException(PgTypeError, "integer value out of int16 range: " & s)
   int16(v)
 
-proc pgParseBiggestInt*(s: string): BiggestInt =
-  ## Parse a text integer into BiggestInt, converting `ValueError` to `PgTypeError`.
+proc pgParseBiggestInt*(s: string): int64 {.gcsafe, raises: [CatchableError].} =
+  ## Parse a text integer into int64, converting `ValueError` to `PgTypeError`.
+  ## Return type is spelled int64 (== BiggestInt) so procvar callers such as
+  ## ``parseRangeText[int64]`` get an exact match without alias-widening.
   pgTypeErrorOnValueError("invalid integer value"):
     parseBiggestInt(s)
 
@@ -578,33 +581,53 @@ proc parsePgMoney*(s: string, scale: int = 2): PgMoney =
     trimmed = trimmed[1 ..^ 2].strip()
     if trimmed.len == 0:
       raise newException(PgTypeError, "Invalid money format: " & s)
-  # Extract a single leading sign, skipping whitespace and currency prefix
-  # characters (anything that is not a digit, separator, or sign). This
-  # accepts both ``-$1.00`` and ``$-1.00`` forms. Scanning stops at the
-  # first digit/separator. The sign character itself is left in ``trimmed``
-  # since the cleaning pass below filters non-digit/separator bytes.
-  for ch in trimmed:
+  # Extract at most one leading sign in the prefix (before the first digit or
+  # separator), skipping currency/whitespace bytes. Accepts both ``-$1.00``
+  # and ``$-1.00``. Once scanning enters the digit/separator region, any
+  # further ``-``/``+`` is a hard error — silently dropping mid-string signs
+  # would let ``"12-34"`` decode as ``1234`` and ``"+-1.00"`` as ``1.00``.
+  var i = 0
+  var signSeen = neg # parentheses already consumed one sign
+  while i < trimmed.len:
+    let ch = trimmed[i]
     if (ch >= '0' and ch <= '9') or ch == '.' or ch == ',':
       break
     if ch == '-':
-      if neg:
+      if signSeen:
         raise newException(PgTypeError, "Invalid money format: " & s)
+      signSeen = true
       neg = true
-      break
-    if ch == '+':
-      break
-  # Keep only digits and separators (.,). Everything else (currency symbols,
-  # whitespace, letters, UTF-8 bytes, sign characters) is discarded.
-  var cleaned = newStringOfCap(trimmed.len)
-  for ch in trimmed:
+    elif ch == '+':
+      if signSeen:
+        raise newException(PgTypeError, "Invalid money format: " & s)
+      signSeen = true
+    # Any other prefix byte (currency symbol, whitespace, UTF-8) is skipped.
+    inc i
+  # Scan the remainder: keep digits and separators; a stray sign here means
+  # the input is malformed rather than a locale quirk we can normalize.
+  var cleaned = newStringOfCap(trimmed.len - i)
+  for j in i ..< trimmed.len:
+    let ch = trimmed[j]
     if (ch >= '0' and ch <= '9') or ch == '.' or ch == ',':
       cleaned.add(ch)
+    elif ch == '-' or ch == '+':
+      raise newException(PgTypeError, "Invalid money format: " & s)
   if cleaned.len == 0:
     raise newException(PgTypeError, "Invalid money format: " & s)
   # Separate integer and fractional parts based on expected scale.
   var wholePart: string
   var fracPart: string
   if scale == 0:
+    # With no fractional part every ``.``/``,`` must be a thousand separator.
+    # Silently stripping them would decode ``"1.23"`` as ``123`` — the digits
+    # after the last separator must form a full 3-digit group.
+    var lastSepIdx = -1
+    for i in countdown(cleaned.len - 1, 0):
+      if cleaned[i] == '.' or cleaned[i] == ',':
+        lastSepIdx = i
+        break
+    if lastSepIdx >= 0 and cleaned.len - 1 - lastSepIdx != 3:
+      raise newException(PgTypeError, "Invalid money format: " & s)
     fracPart = ""
     wholePart = newStringOfCap(cleaned.len)
     for ch in cleaned:
@@ -705,7 +728,7 @@ proc parseBitString*(s: string): PgBit =
       raise newException(PgTypeError, "Invalid bit character: " & $s[i])
   PgBit(nbits: nbits, data: data)
 
-proc parsePgNumeric*(s: string): PgNumeric =
+proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
   ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN") into PgNumeric.
   if s.len == 0:
     raise newException(PgTypeError, "Invalid numeric: empty string")

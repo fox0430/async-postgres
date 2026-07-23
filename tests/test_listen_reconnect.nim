@@ -218,6 +218,58 @@ suite "reconnectInPlace TLS field pairing":
     check preCertLen == 4
     check finalCertLen == 0
 
+suite "reconnectInPlace session state reset":
+  ## Regression: reconnectInPlace must clear heldSessionLocks / sessionLockDirty
+  ## (fresh backend never had them — else pool release fakes a lock leak) and
+  ## sendBuf (symmetry with recvBuf; stale bytes must not survive the swap).
+  test "heldSessionLocks / sessionLockDirty / sendBuf cleared across reconnect":
+    var preHeld = -1
+    var preDirty = false
+    var preSendLen = -1
+    var finalHeld = -1
+    var finalDirty = true
+    var finalSendLen = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        sc2 = await acceptAndReady(ms)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      # Seed the shape a typed advisoryLock + a partial send would leave.
+      conn.heldSessionLocks = 3
+      conn.sessionLockDirty = true
+      conn.sendBuf = @[byte 0xAA, 0xBB, 0xCC]
+      preHeld = conn.heldSessionLocks
+      preDirty = conn.sessionLockDirty
+      preSendLen = conn.sendBuf.len
+
+      await conn.reconnectInPlace()
+      finalHeld = conn.heldSessionLocks
+      finalDirty = conn.sessionLockDirty
+      finalSendLen = conn.sendBuf.len
+
+      await serverFut
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await closeClient(sc1)
+      await closeClient(sc2)
+      await closeServer(ms)
+
+    waitFor testBody()
+    # Sanity: seeding took effect (otherwise "reset to 0" proves nothing).
+    check preHeld == 3
+    check preDirty
+    check preSendLen == 3
+    check finalHeld == 0
+    check not finalDirty
+    check finalSendLen == 0
+
 ## Regression: `stopListening` must not hang when it races a successful in-place
 ## reconnect by the listen pump.
 ##

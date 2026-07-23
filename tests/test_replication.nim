@@ -1,6 +1,10 @@
-import std/unittest
+import std/[unittest, importutils, tables]
 
-import ../async_postgres/[pg_errors, pg_protocol, pg_replication]
+import ../async_postgres/[async_backend, pg_errors, pg_protocol]
+import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_replication {.all.}
+
+privateAccess(PgConnection)
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
   ## Helper to build a raw backend message from type char + body bytes
@@ -39,6 +43,16 @@ suite "LSN":
   test "parseLsn non-hex half":
     expect(PgTypeError):
       discard parseLsn("0/XYZ")
+
+  test "parseLsn empty half rejected":
+    # fromHex[uint64]("") returns 0 without raising, so a half left blank
+    # would silently produce a valid-looking LSN. Reject explicitly.
+    expect(PgTypeError):
+      discard parseLsn("/")
+    expect(PgTypeError):
+      discard parseLsn("/A")
+    expect(PgTypeError):
+      discard parseLsn("A/")
 
   test "parseLsn half wider than 32 bits":
     # A wider half must be rejected, not silently truncated to 32 bits.
@@ -682,3 +696,88 @@ suite "parseTimelineId":
   test "out-of-int32-range raises PgTypeError (no RangeDefect)":
     expect(PgTypeError):
       discard parseTimelineId("2147483648")
+
+suite "invalidateAbandonedStream":
+  # Callers set csBusy before START_REPLICATION and the state only advances to
+  # csReplicating once CopyBothResponse is parsed. If the stream unwinds while
+  # still csBusy (e.g. a future refactor introduces a raiser inside the
+  # waitCopyBoth loop that does not itself mark csClosed), the connection must
+  # be poisoned so checkReady raises "Connection is closed" rather than the
+  # misleading "connection is in use" that would strand it forever.
+  proc mkConn(state: PgConnState): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: state,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "csBusy is poisoned to csClosed":
+    let conn = mkConn(csBusy)
+    conn.invalidateAbandonedStream()
+    check conn.state == csClosed
+
+  test "csReplicating is poisoned to csClosed":
+    let conn = mkConn(csReplicating)
+    conn.invalidateAbandonedStream()
+    check conn.state == csClosed
+
+  test "csReady is left untouched (clean stop / server error path)":
+    let conn = mkConn(csReady)
+    conn.invalidateAbandonedStream()
+    check conn.state == csReady
+
+  test "csClosed is left untouched (I/O helpers already poisoned)":
+    let conn = mkConn(csClosed)
+    conn.invalidateAbandonedStream()
+    check conn.state == csClosed
+
+suite "decodeCreateSlotRow":
+  proc buildDataRowBody(values: openArray[string]): seq[byte] =
+    result.addInt16(int16(values.len))
+    for v in values:
+      if v == "\xFF":
+        result.addInt32(-1)
+      else:
+        result.addInt32(int32(v.len))
+        for c in v:
+          result.add(byte(c))
+
+  proc mkSlotQr(values: openArray[string], numFields: int): QueryResult =
+    let rd = newRowData(int16(values.len))
+    parseDataRowInto(buildDataRowBody(values), rd)
+    var fields = newSeq[FieldDescription](numFields)
+    for i in 0 ..< numFields:
+      fields[i] = FieldDescription(name: "col" & $i, typeOid: 25, formatCode: 0)
+    QueryResult(fields: fields, data: rd, rowCount: 1)
+
+  test "all columns present":
+    let qr = mkSlotQr(["my_slot", "0/16B3740", "00000001", "pgoutput"], 4)
+    let info = decodeCreateSlotRow(qr)
+    check info.slotName == "my_slot"
+    check info.consistentPoint == parseLsn("0/16B3740")
+    check info.snapshotName == "00000001"
+    check info.outputPlugin == "pgoutput"
+
+  test "NULL snapshot_name and output_plugin":
+    let qr = mkSlotQr(["my_slot", "0/16B3740", "\xFF", "\xFF"], 4)
+    let info = decodeCreateSlotRow(qr)
+    check info.slotName == "my_slot"
+    check info.consistentPoint == parseLsn("0/16B3740")
+    check info.snapshotName == ""
+    check info.outputPlugin == ""
+
+  test "NULL snapshot_name only":
+    let qr = mkSlotQr(["my_slot", "0/16B3740", "\xFF", "pgoutput"], 4)
+    let info = decodeCreateSlotRow(qr)
+    check info.snapshotName == ""
+    check info.outputPlugin == "pgoutput"
+
+  test "fewer fields skips optional columns":
+    let qr = mkSlotQr(["my_slot", "0/16B3740"], 2)
+    let info = decodeCreateSlotRow(qr)
+    check info.slotName == "my_slot"
+    check info.consistentPoint == parseLsn("0/16B3740")
+    check info.snapshotName == ""
+    check info.outputPlugin == ""

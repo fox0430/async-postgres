@@ -95,6 +95,52 @@ suite "parseDsn":
     let cfg = parseDsn("postgresql://host/my%2Fdb")
     check cfg.database == "my/db"
 
+  test "percent-encoded Unix socket dir as URI host (libpq parity)":
+    let cfg = parseDsn("postgresql://%2Fvar%2Frun%2Fpostgresql/db")
+    check cfg.host == "/var/run/postgresql"
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "/var/run/postgresql"
+
+  test "IPv6 zone id percent-encoded in URI host (libpq parity)":
+    let cfg = parseDsn("postgresql://[fe80::1%25eth0]:5433/db")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "fe80::1%eth0"
+    check cfg.hosts[0].port == 5433
+
+  test "encoded comma stays inside one authority host (libpq parity)":
+    # The authority splits on commas before percent-decoding.
+    let cfg = parseDsn("postgresql://a%2Cb/db")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "a,b"
+
+  test "query parameter host decodes before splitting (libpq parity)":
+    let cfg = parseDsn("postgresql:///db?host=a%2Cb")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].host == "a"
+    check cfg.hosts[1].host == "b"
+
+  test "percent-encoded port in URI authority":
+    let cfg = parseDsn("postgresql://h1:%35433/db")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].port == 5433
+
+  test "plus stays literal in URI components (libpq parity)":
+    let cfg = parseDsn("postgresql://a+b:p+w@host/d+b?application_name=x+y")
+    check cfg.user == "a+b"
+    check cfg.password == "p+w"
+    check cfg.database == "d+b"
+    check cfg.applicationName == "x+y"
+
+  test "error: malformed percent-encoding in URI":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?application_name=a%zz")
+    expect PgError:
+      discard parseDsn("postgresql://host/db%2")
+
+  test "error: encoded zero byte in URI":
+    expect PgError:
+      discard parseDsn("postgresql://host/d%00b")
+
   test "sslmode defaults to prefer when unspecified (libpq parity)":
     check parseDsn("postgresql://host/db").sslMode == sslPrefer
 
@@ -203,6 +249,22 @@ suite "parseDsn":
   test "error: invalid channel_binding":
     expect PgError:
       discard parseDsn("postgresql://host/db?channel_binding=bogus")
+
+  test "query param sslnegotiation":
+    check parseDsn("postgresql://host/db?sslnegotiation=postgres").sslNegotiation ==
+      sslnPostgres
+    check parseDsn("postgresql://host/db?sslnegotiation=direct").sslNegotiation ==
+      sslnDirect
+
+  test "sslnegotiation default is postgres":
+    check parseDsn("postgresql://host/db").sslNegotiation == sslnPostgres
+
+  test "ConnConfig zero init has sslnPostgres":
+    check ConnConfig().sslNegotiation == sslnPostgres
+
+  test "error: invalid sslnegotiation":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslnegotiation=bogus")
 
   test "require_auth default is empty set":
     let cfg = parseDsn("postgresql://host/db")
@@ -758,6 +820,20 @@ suite "parseDsn keyword=value":
     let cfg = parseDsn(r"password='back\\slash'")
     check cfg.password == "back\\slash"
 
+  test "backslash takes the next character literally (libpq parity)":
+    # libpq only documents \' and \\, but its parser accepts a backslash
+    # before any character and keeps that character as-is.
+    check parseDsn(r"password='a\nb'").password == "anb"
+
+  test "unquoted value backslash escapes (libpq parity)":
+    let cfg = parseDsn(r"password=a\'b host=foo\ bar")
+    check cfg.password == "a'b"
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "foo bar"
+
+  test "trailing lone backslash in unquoted value is dropped (libpq parity)":
+    check parseDsn(r"host=h password=secret\").password == "secret"
+
   test "hostaddr keyword":
     let cfg = parseDsn("hostaddr=192.168.1.1 dbname=test")
     # No host name given: entry host stays empty (no name to verify SSL
@@ -903,6 +979,16 @@ suite "parseDsn keyword=value":
     check cfg.port == 5432
     check cfg.database == "test"
 
+  test "port with surrounding whitespace (libpq strtol parity)":
+    check parseDsn("host=h port=' 5433 '").port == 5433
+
+  test "port with explicit plus sign (libpq strtol parity)":
+    check parseDsn("host=h port=+5433").port == 5433
+
+  test "error: digit-group underscore in port (libpq rejects)":
+    expect PgError:
+      discard parseDsn("host=h port=5_433")
+
   test "error: invalid port":
     expect PgError:
       discard parseDsn("host=h port=notaport")
@@ -934,6 +1020,13 @@ suite "parseDsn keyword=value":
   test "error: invalid channel_binding":
     expect PgError:
       discard parseDsn("host=h channel_binding=bogus")
+
+  test "sslnegotiation parameter":
+    check parseDsn("host=h sslnegotiation=direct").sslNegotiation == sslnDirect
+
+  test "error: invalid sslnegotiation":
+    expect PgError:
+      discard parseDsn("host=h sslnegotiation=bogus")
 
   test "error: invalid connect_timeout":
     expect PgError:
@@ -986,4 +1079,44 @@ suite "Unix socket":
     let cfg = parseDsn("postgresql:///mydb?host=/var/run/postgresql")
     check cfg.host == "/var/run/postgresql"
     check cfg.database == "mydb"
+
+suite "applyParam multi-host":
+  test "comma-separated host expands hosts":
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,h2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5432)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5432)
+    check cfg.host == "h1"
+
+  test "later port list correlates with existing hosts":
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,h2")
+    cfg.applyParam("port", "5433,5434")
+    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5434)
+    check cfg.port == 5433
+
+  test "single port applies to a later multi-host hostaddr":
+    var cfg = ConnConfig()
+    cfg.applyParam("port", "5433")
+    cfg.applyParam("hostaddr", "10.0.0.1,10.0.0.2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0].hostaddr == "10.0.0.1"
+    check cfg.hosts[0].port == 5433
+    check cfg.hosts[1].hostaddr == "10.0.0.2"
+    check cfg.hosts[1].port == 5433
+
+  test "host update refreshes hosts on a parsed config":
+    # `getHosts` prefers `hosts`, so the entry must follow the scalar update.
+    var cfg = parseDsn("postgresql://old:5433/db")
+    cfg.applyParam("host", "new")
+    check cfg.getHosts() == @[HostEntry(host: "new", port: 5433)]
+    check cfg.host == "new"
+
+  test "error: hostaddr count mismatch against existing hosts":
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,h2")
+    expect PgError:
+      cfg.applyParam("hostaddr", "10.0.0.1")
     check cfg.port == 5432

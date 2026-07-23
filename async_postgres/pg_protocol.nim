@@ -44,6 +44,7 @@ type
     bmkDataRow
     bmkEmptyQueryResponse
     bmkErrorResponse
+    bmkNegotiateProtocolVersion
     bmkNoData
     bmkNoticeResponse
     bmkNotificationResponse
@@ -109,6 +110,9 @@ type
       columns*: seq[Option[seq[byte]]]
     of bmkErrorResponse:
       errorFields*: seq[ErrorField]
+    of bmkNegotiateProtocolVersion:
+      newestMinorVersion*: int32
+      unrecognizedOptions*: seq[string]
     of bmkNoticeResponse:
       noticeFields*: seq[ErrorField]
     of bmkNotificationResponse:
@@ -484,6 +488,13 @@ proc encodeStartup*(
     result.addCString("database")
     result.addCString(database)
   for (k, v) in extraParams:
+    # Empty key would encode as a lone NUL byte, which the server treats as the
+    # end-of-parameters terminator — silently dropping subsequent pairs and
+    # opening a startup-parameter injection vector through the K/V stream.
+    if k.len == 0:
+      raise newException(
+        ValueError, "encodeStartup: empty key in extraParams is not allowed"
+      )
     result.addCString(k)
     result.addCString(v)
   result.add(0'u8) # terminator
@@ -848,6 +859,11 @@ proc parseDataRow(body: openArray[byte]): BackendMessage =
       offset += colLen
 
 proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
+  # Reject empty body: the '\0' field terminator is mandatory, and letting it
+  # through surfaces upstack as a diagnostically empty PgQueryError.
+  if body.len == 0:
+    let name = if isError: "ErrorResponse" else: "NoticeResponse"
+    raise newException(PgProtocolError, name & ": empty body")
   if isError:
     result = BackendMessage(kind: bmkErrorResponse)
     result.errorFields = @[]
@@ -943,6 +959,28 @@ proc parseParameterDescription(body: openArray[byte]): BackendMessage =
       raise newException(PgProtocolError, "ParameterDescription truncated")
     result.paramTypeOids[i] = decodeInt32(body, offset)
     offset += 4
+
+proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
+  if body.len < 8:
+    raise newException(PgProtocolError, "NegotiateProtocolVersion message too short")
+  result = BackendMessage(kind: bmkNegotiateProtocolVersion)
+  result.newestMinorVersion = decodeInt32(body, 0)
+  let n = decodeInt32(body, 4)
+  if n < 0:
+    raise newException(
+      PgProtocolError, "NegotiateProtocolVersion: invalid option count " & $n
+    )
+  # Cap allocation against a hostile `n` before the loop reads any bytes.
+  if int64(n) > int64(body.len - 8):
+    raise newException(
+      PgProtocolError, "NegotiateProtocolVersion: option count " & $n & " exceeds body"
+    )
+  result.unrecognizedOptions = newSeq[string](n)
+  var offset = 8
+  for i in 0 ..< n:
+    let (opt, consumed) = decodeCString(body, offset)
+    result.unrecognizedOptions[i] = opt
+    offset += consumed
 
 proc parseCopyResponse(
     body: openArray[byte], kind: BackendMessageKind
@@ -1208,6 +1246,8 @@ proc parseBackendMessage*(
     msg = parseReadyForQuery(body)
   of 't':
     msg = parseParameterDescription(body)
+  of 'v':
+    msg = parseNegotiateProtocolVersion(body)
   of '1':
     msg = BackendMessage(kind: bmkParseComplete)
   of '2':

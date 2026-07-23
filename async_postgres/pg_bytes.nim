@@ -1,9 +1,8 @@
 ## Low-level byte buffer helpers for big-endian encoding / bulk copy.
-##
-## This module is dependency-free (stdlib only) and intended to be imported
-## from both ``pg_protocol`` and ``pg_types/*`` without introducing circular
-## dependencies. Prefer these helpers over hand-written ``copyMem`` calls
-## for readability and to keep ``addr`` use localized.
+## Only depends on ``pg_errors`` (itself dependency-free) so it stays importable
+## from ``pg_protocol`` and ``pg_types/*`` without cycles.
+
+import pg_errors
 
 template writeBE16*(buf: var openArray[byte], pos: int, v: int16) =
   buf[pos] = byte((v shr 8) and 0xFF)
@@ -77,7 +76,15 @@ func decodeFloat64BE*(data: openArray[byte], offset = 0): float64 {.inline.} =
 
 template writeBytesAt*(dst: var openArray[byte], pos: int, src: openArray[byte]) =
   ## Copy src bytes into dst starting at pos. No-op when src is empty.
+  ## Raises ``PgProtocolError`` on out-of-range slice: under ``-d:danger``
+  ## ``addr dst[pos]`` skips bounds checks, so guard here.
   if src.len > 0:
+    if pos < 0 or src.len > dst.len - pos:
+      raise newException(
+        PgProtocolError,
+        "writeBytesAt: out-of-range slice (pos=" & $pos & ", src.len=" & $src.len &
+          ", dst.len=" & $dst.len & ")",
+      )
     copyMem(addr dst[pos], addr src[0], src.len)
 
 template appendBytes*(buf: var seq[byte], src: openArray[byte]) =
@@ -86,13 +93,28 @@ template appendBytes*(buf: var seq[byte], src: openArray[byte]) =
     buf.add(src)
 
 proc readString*(src: openArray[byte], off, len: int): string =
-  ## Copy `len` bytes from src starting at off into a new string.
+  ## Copy `len` bytes from src at `off` into a new string. Raises
+  ## `PgProtocolError` on out-of-range slice: `newString(-1)` is an uncatchable
+  ## `RangeDefect`, and `-d:danger` skips the `src[off]` bounds check.
+  if len < 0 or off < 0 or (len > 0 and len > src.len - off):
+    raise newException(
+      PgProtocolError,
+      "readString: out-of-range slice (off=" & $off & ", len=" & $len & ", src.len=" &
+        $src.len & ")",
+    )
   result = newString(len)
   if len > 0:
     copyMem(addr result[0], addr src[off], len)
 
 proc readBytes*(src: openArray[byte], off, len: int): seq[byte] =
-  ## Copy `len` bytes from src starting at off into a new `seq[byte]`.
+  ## Copy `len` bytes from src at `off` into a new `seq[byte]`. Same guards
+  ## as `readString`.
+  if len < 0 or off < 0 or (len > 0 and len > src.len - off):
+    raise newException(
+      PgProtocolError,
+      "readBytes: out-of-range slice (off=" & $off & ", len=" & $len & ", src.len=" &
+        $src.len & ")",
+    )
   result = newSeq[byte](len)
   if len > 0:
     copyMem(addr result[0], addr src[off], len)

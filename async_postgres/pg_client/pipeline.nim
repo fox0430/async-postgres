@@ -354,6 +354,38 @@ template initPipelineResults(
     else:
       results[i] = PipelineResult(kind: prkExec)
 
+proc applyRowDescriptionToQr(
+    qr: var QueryResult,
+    fields: sink seq[FieldDescription],
+    cache: StmtCacheStatus,
+    resultFormats: seq[int16],
+) =
+  ## Populate qr.fields / qr.data from a RowDescription. Cache-aware:
+  ## scsMiss with explicit resultFormats derives per-column formats and
+  ## patches fields[j].formatCode; scsShare / scsUncached mirror the
+  ## server-sent Describe(Portal) formats. Shared by both pipeline
+  ## receive paths (executeImpl and executeIsolatedImpl) so the two cannot
+  ## drift on cache handling. `fields` is sunk so the RowDescription seq is
+  ## moved into qr.fields without an intermediate copy.
+  var cf: seq[int16]
+  var co: seq[int32]
+  if cache == scsMiss:
+    if resultFormats.len > 0:
+      cf = deriveColFmts(resultFormats, fields.len)
+      co = newSeq[int32](fields.len)
+      for j in 0 ..< fields.len:
+        co[j] = fields[j].typeOid
+        fields[j].formatCode = cf[j]
+  elif cache in {scsShare, scsUncached}:
+    cf = newSeq[int16](fields.len)
+    co = newSeq[int32](fields.len)
+    for j in 0 ..< fields.len:
+      cf[j] = fields[j].formatCode
+      co[j] = fields[j].typeOid
+  qr.fields = fields
+  qr.data = newRowData(int16(qr.fields.len), cf, co)
+  qr.data.fields = qr.fields
+
 template settleSendFut(sendFut: untyped) =
   ## Cancel or drain sendFut so the Future never leaks on abnormal exit.
   ## Shared by executeImpl and executeIsolatedImpl.
@@ -439,37 +471,17 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
               cachedParamOidsPerOp[activeOpIdx] = msg.paramTypeOids
           of bmkRowDescription:
             if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
-              var cf: seq[int16]
-              var co: seq[int32]
-              if p.ops[activeOpIdx].cache == scsMiss:
-                if not p.ops[activeOpIdx].cacheSuperseded:
-                  if cachedFieldsPerOp.len == 0:
-                    cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
-                  cachedFieldsPerOp[activeOpIdx] = msg.fields
-                results[activeOpIdx].queryResult.fields = msg.fields
-                if p.ops[activeOpIdx].resultFormats.len > 0:
-                  cf = deriveColFmts(p.ops[activeOpIdx].resultFormats, msg.fields.len)
-                  co = newSeq[int32](msg.fields.len)
-                  for j in 0 ..< msg.fields.len:
-                    co[j] = msg.fields[j].typeOid
-                    results[activeOpIdx].queryResult.fields[j].formatCode = cf[j]
-              else:
-                results[activeOpIdx].queryResult.fields = msg.fields
-                # scsShare: this op skipped Describe(Statement) but still
-                # emitted Describe(Portal), so msg.fields' formatCode/typeOid
-                # reflect this op's Bind. Mirror into RowData so binary
-                # decoders (isBinaryCol/colTypeOid) see the right metadata —
-                # otherwise binary results would be misread as text.
-                if p.ops[activeOpIdx].cache == scsShare:
-                  cf = newSeq[int16](msg.fields.len)
-                  co = newSeq[int32](msg.fields.len)
-                  for j in 0 ..< msg.fields.len:
-                    cf[j] = msg.fields[j].formatCode
-                    co[j] = msg.fields[j].typeOid
-              results[activeOpIdx].queryResult.data =
-                newRowData(int16(msg.fields.len), cf, co)
-              results[activeOpIdx].queryResult.data.fields =
-                results[activeOpIdx].queryResult.fields
+              if p.ops[activeOpIdx].cache == scsMiss and
+                  not p.ops[activeOpIdx].cacheSuperseded:
+                if cachedFieldsPerOp.len == 0:
+                  cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
+                cachedFieldsPerOp[activeOpIdx] = msg.fields
+              applyRowDescriptionToQr(
+                results[activeOpIdx].queryResult,
+                msg.fields,
+                p.ops[activeOpIdx].cache,
+                p.ops[activeOpIdx].resultFormats,
+              )
               # Update pointers for nextMessage
               rowData = results[activeOpIdx].queryResult.data
               rowCount = addr results[activeOpIdx].queryResult.rowCount
@@ -522,9 +534,11 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
               # Close along on the next operation so a still-live statement
               # (0A000) is reclaimed instead of leaked; Close of an already-gone
               # statement (26000) is a harmless no-op. See
-              # StmtCacheInvalidatingStates.
+              # StmtCacheInvalidatingStates. scsShare shares the sql/stmtName of
+              # an earlier scsMiss whose entry addCacheMissOp just added above.
               if queryError.sqlState in StmtCacheInvalidatingStates and
-                  activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsHit:
+                  activeOpIdx < p.ops.len and
+                  p.ops[activeOpIdx].cache in {scsHit, scsShare}:
                 conn.pendingStmtCloses.add(p.ops[activeOpIdx].stmtName)
                 conn.removeStmtCache(p.ops[activeOpIdx].sql)
               raise queryError
@@ -620,42 +634,16 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                 cachedParamOids = msg.paramTypeOids
             of bmkRowDescription:
               if p.ops[opIdx].kind == pokQuery:
-                if p.ops[opIdx].cache == scsMiss:
-                  if not p.ops[opIdx].cacheSuperseded:
-                    cachedFields = msg.fields
-                  results[opIdx].queryResult.fields = msg.fields
-                  var cf: seq[int16]
-                  var co: seq[int32]
-                  if p.ops[opIdx].resultFormats.len > 0:
-                    cf = deriveColFmts(p.ops[opIdx].resultFormats, msg.fields.len)
-                    co = newSeq[int32](msg.fields.len)
-                    for j in 0 ..< msg.fields.len:
-                      co[j] = msg.fields[j].typeOid
-                      results[opIdx].queryResult.fields[j].formatCode = cf[j]
-                  results[opIdx].queryResult.data =
-                    newRowData(int16(msg.fields.len), cf, co)
-                  results[opIdx].queryResult.data.fields =
-                    results[opIdx].queryResult.fields
-                  rowData = results[opIdx].queryResult.data
-                  rowCount = addr results[opIdx].queryResult.rowCount
-                else:
-                  results[opIdx].queryResult.fields = msg.fields
-                  # scsShare: mirror Describe(Portal)'s formatCode/typeOid
-                  # into RowData so binary decoders see the right metadata.
-                  var cf: seq[int16]
-                  var co: seq[int32]
-                  if p.ops[opIdx].cache == scsShare:
-                    cf = newSeq[int16](msg.fields.len)
-                    co = newSeq[int32](msg.fields.len)
-                    for j in 0 ..< msg.fields.len:
-                      cf[j] = msg.fields[j].formatCode
-                      co[j] = msg.fields[j].typeOid
-                  results[opIdx].queryResult.data =
-                    newRowData(int16(msg.fields.len), cf, co)
-                  results[opIdx].queryResult.data.fields =
-                    results[opIdx].queryResult.fields
-                  rowData = results[opIdx].queryResult.data
-                  rowCount = addr results[opIdx].queryResult.rowCount
+                if p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
+                  cachedFields = msg.fields
+                applyRowDescriptionToQr(
+                  results[opIdx].queryResult,
+                  msg.fields,
+                  p.ops[opIdx].cache,
+                  p.ops[opIdx].resultFormats,
+                )
+                rowData = results[opIdx].queryResult.data
+                rowCount = addr results[opIdx].queryResult.rowCount
             of bmkNoData:
               discard
             of bmkCommandComplete:
@@ -672,9 +660,11 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
               conn.txStatus = msg.txStatus
               if opError != nil:
                 if opError.sqlState in StmtCacheInvalidatingStates and
-                    p.ops[opIdx].cache == scsHit:
+                    p.ops[opIdx].cache in {scsHit, scsShare}:
                   # Mirror executeImpl: ride a Close along so 0A000 doesn't
-                  # leak the still-live server statement.
+                  # leak the still-live server statement. For scsShare, the
+                  # sharing scsMiss already added the entry at its own
+                  # ReadyForQuery.
                   conn.pendingStmtCloses.add(p.ops[opIdx].stmtName)
                   conn.removeStmtCache(p.ops[opIdx].sql)
                 errors[opIdx] = opError

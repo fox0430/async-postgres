@@ -245,6 +245,10 @@ proc parseLsn*(s: string): Lsn =
   let parts = s.split('/')
   if parts.len != 2:
     raise newException(PgTypeError, "Invalid LSN format: " & s)
+  # fromHex[uint64] returns 0 for an empty string instead of raising, so an
+  # empty half would silently produce a zero LSN — reject explicitly.
+  if parts[0].len == 0 or parts[1].len == 0:
+    raise newException(PgTypeError, "Invalid LSN format: " & s)
   # fromHex[uint64] wraps silently past 16 significant hex digits instead of
   # raising; compare significant digits, not raw length, so a zero-padded but
   # in-range half isn't rejected.
@@ -593,6 +597,15 @@ proc identifySystem*(
     info.dbName = row.getStr(3)
   return info
 
+proc decodeCreateSlotRow*(qr: QueryResult): ReplicationSlotInfo =
+  let row = initRow(qr.data, 0)
+  result.slotName = row.getStr(0)
+  result.consistentPoint = parseLsn(row.getStr(1))
+  if qr.fields.len > 2 and not row.isNull(2):
+    result.snapshotName = row.getStr(2)
+  if qr.fields.len > 3 and not row.isNull(3):
+    result.outputPlugin = row.getStr(3)
+
 proc createReplicationSlot*(
     conn: PgConnection,
     slotName: string,
@@ -611,16 +624,7 @@ proc createReplicationSlot*(
   let results = await conn.simpleQuery(sql, timeout)
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "CREATE_REPLICATION_SLOT returned no results")
-  let qr = results[0]
-  let row = initRow(qr.data, 0)
-  var info = ReplicationSlotInfo()
-  info.slotName = row.getStr(0)
-  info.consistentPoint = parseLsn(row.getStr(1))
-  if qr.fields.len > 2:
-    info.snapshotName = row.getStr(2)
-  if qr.fields.len > 3:
-    info.outputPlugin = row.getStr(3)
-  return info
+  return decodeCreateSlotRow(results[0])
 
 proc dropReplicationSlot*(
     conn: PgConnection,
@@ -1003,16 +1007,18 @@ proc invalidateAbandonedStream(conn: PgConnection) =
   ## connection cannot be reused; mark it ``csClosed`` so the next operation
   ## fails fast and a pool discards it.
   ##
-  ## Without this the connection would be stranded in ``csReplicating``: every
-  ## later call would raise a misleading ``PgStateError`` ("connection is in
-  ## use") for an apparently-live stream when the stream is in fact dead, and the
-  ## only recovery is to reconnect and resume (see ``examples/replication.nim``).
-  ## A clean stop (CopyDone -> ReadyForQuery) and a server-side error followed by
-  ## ReadyForQuery both return the connection to ``csReady`` first, and the I/O
-  ## helpers (``fillRecvBuf`` / ``sendMsg``) mark ``csClosed`` themselves on a
-  ## dead socket — so only a still-``csReplicating`` state, the stranded case, is
-  ## changed here.
-  if conn.state == csReplicating:
+  ## Without this the connection would be stranded in ``csBusy`` or
+  ## ``csReplicating``: every later call would raise a misleading ``PgStateError``
+  ## ("connection is in use") for an apparently-live stream when the stream is in
+  ## fact dead, and the only recovery is to reconnect and resume (see
+  ## ``examples/replication.nim``). A clean stop (CopyDone -> ReadyForQuery) and a
+  ## server-side error followed by ReadyForQuery both return the connection to
+  ## ``csReady`` first, and the I/O helpers (``fillRecvBuf`` / ``sendMsg``) mark
+  ## ``csClosed`` themselves on a dead socket — so only a still-``csBusy`` state
+  ## (START_REPLICATION issued but CopyBothResponse never arrived, sub-cases where
+  ## the raiser did not mark ``csClosed``) or ``csReplicating`` state (torn down
+  ## mid-stream), the stranded cases, are changed here.
+  if conn.state in {csBusy, csReplicating}:
     conn.state = csClosed
 
 proc runReplicationStream(
@@ -1027,6 +1033,12 @@ proc runReplicationStream(
   ## ``START_REPLICATION`` query. ``context`` appears in error messages
   ## (e.g. ``"replication"`` / ``"physical replication"``).
   var queryError: ref PgQueryError
+
+  # Register the poison-on-abandon defer BEFORE waitCopyBoth so a raise during
+  # the CopyBothResponse wait (state still csBusy) is also poisoned, not just a
+  # mid-stream failure once csReplicating.
+  defer:
+    conn.invalidateAbandonedStream()
 
   block waitCopyBoth:
     while true:
@@ -1052,9 +1064,6 @@ proc runReplicationStream(
       await conn.fillRecvBuf()
 
   conn.resetReplLsnTracking(startLsn)
-
-  defer:
-    conn.invalidateAbandonedStream()
 
   var lastStatusSent = Moment.now()
   var pendingRead: Future[void] = nil
@@ -1217,13 +1226,20 @@ proc startReplication*(
   ## ``decodePgOutput``) supports protocol version 1 only. Passing a
   ## ``proto_version`` other than ``1`` in ``options`` raises ``ValueError``,
   ## because a v2/v3 stream reshapes and adds messages the decoder cannot parse.
-  # The bundled pgoutput decoder implements protocol version 1 only. A v2/v3
-  # stream adds messages and reshapes existing ones (e.g. an xid prefix on
-  # streamed tuples), which parsePgOutputMessage cannot decode. Reject an
-  # unsupported proto_version before touching connection state so the failure is
-  # a plain input error rather than a later mid-stream decode break.
+  ## When ``publication_names`` (a pgoutput-only option) is present without an
+  ## explicit ``proto_version``, this proc pins it to ``'1'`` so a future
+  ## server-side default bump cannot upgrade the stream past the bundled decoder.
+  ##
+  ## Option values are appended verbatim — the caller must supply a valid
+  ## SQL literal (``'my_pub'``, integer, boolean) and quote any untrusted
+  ## input, or a stray ``)`` / newline / ``'`` will inject SQL.
+  # Reject unsupported proto_version pre-flight so the failure is a plain input
+  # error rather than a mid-stream decode break.
+  var hasProtoVersion = false
+  var hasPublicationNames = false
   for (k, v) in options:
     if k.cmpIgnoreCase("proto_version") == 0:
+      hasProtoVersion = true
       let pv = v.strip(chars = {'\'', '"', ' ', '\t'})
       if pv.len > 0 and pv != "1":
         raise newException(
@@ -1231,15 +1247,23 @@ proc startReplication*(
           "Unsupported pgoutput proto_version " & v &
             ": the bundled decoder supports proto_version 1 only",
         )
+    elif k.cmpIgnoreCase("publication_names") == 0:
+      hasPublicationNames = true
 
   conn.checkReady()
+
+  # publication_names => pgoutput; pin proto_version defensively against a
+  # future server-side default bump past 1.
+  var effectiveOptions = options
+  if hasPublicationNames and not hasProtoVersion:
+    effectiveOptions.add(("proto_version", "'1'"))
 
   # Build START_REPLICATION command
   var sql =
     "START_REPLICATION SLOT " & quoteIdentifier(slotName) & " LOGICAL " & $startLsn
-  if options.len > 0:
+  if effectiveOptions.len > 0:
     sql.add(" (")
-    for i, (k, v) in options:
+    for i, (k, v) in effectiveOptions:
       if i > 0:
         sql.add(", ")
       for j, c in k:

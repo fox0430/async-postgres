@@ -11,6 +11,7 @@ Async PostgreSQL client in Nim.
 - Connection pooling with health checks and maintenance (broken connections discarded on acquire/release)
 - Pool cluster with read replica routing
 - SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full) with optional client certificate authentication (mTLS)
+- `sslnegotiation` mode (postgres, direct) for Direct SSL connections (PostgreSQL 17+)
 - MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
 - `channel_binding` policy (disable, prefer, require) to harden SCRAM against downgrade
 - DSN connection string parsing
@@ -66,6 +67,8 @@ Async PostgreSQL client in Nim.
 ## Requirements
 
 - Nim >= 2.2.4
+
+- [chronos](https://github.com/status-im/nim-chronos) >= 4.4.0 (Only chronos backend)
 
 - [nim-bearssl](https://github.com/status-im/nim-bearssl) >= 0.2.11 (Only chronos backend; TLS 1.2 only due to BearSSL limitation)
 
@@ -139,6 +142,9 @@ The private key must be **unencrypted** on both backends — neither chronos
 chronos the key specifically must be PKCS#8 PEM (RSA or EC); PKCS#1 is not
 supported. When loaded via DSN on POSIX, the `sslkey` file must not be group-
 or world-accessible (libpq parity).
+
+Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
+stronger. On the chronos backend it needs chronos >= 4.4.0 for ALPN support.
 
 ## Examples
 

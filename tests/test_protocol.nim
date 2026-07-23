@@ -1,6 +1,6 @@
 import std/[unittest, options, strutils, tables, importutils]
 
-import ../async_postgres/[async_backend, pg_protocol, pg_connection]
+import ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection]
 import ../async_postgres/pg_types/[core, encoding]
 
 privateAccess(PgConnection)
@@ -77,6 +77,15 @@ suite "Byte helpers":
     expect(ValueError):
       discard encodeStartup("alice", "db", [("app\0name", "value")])
 
+  test "encodeStartup rejects empty key in extra params":
+    # Empty key would encode as a lone NUL, matching the parameter-list
+    # terminator and silently truncating the remaining parameters.
+    expect(ValueError):
+      discard encodeStartup("alice", "db", [("", "value")])
+    expect(ValueError):
+      discard
+        encodeStartup("alice", "db", [("application_name", "app"), ("", "injected")])
+
   test "encodeQuery rejects NUL in sql":
     expect(ValueError):
       discard encodeQuery("SELECT 1\0; DROP TABLE users")
@@ -134,6 +143,63 @@ suite "Byte helpers":
     let buf = @[byte('h'), byte('i')]
     expect(PgProtocolError):
       discard decodeCString(buf, 0)
+
+  test "readString/readBytes copy the requested slice":
+    let src = @[byte('a'), byte('b'), byte('c'), byte('d')]
+    check readString(src, 1, 2) == "bc"
+    check readBytes(src, 0, 4) == src
+    check readString(src, 4, 0) == ""
+    check readBytes(src, 0, 0).len == 0
+
+  test "readString rejects negative len instead of newString(-1) Defect":
+    let src = @[byte('a')]
+    expect(PgProtocolError):
+      discard readString(src, 0, -1)
+
+  test "readBytes rejects negative len instead of newSeq(-1) Defect":
+    let src = @[byte('a')]
+    expect(PgProtocolError):
+      discard readBytes(src, 0, -1)
+
+  test "readString/readBytes reject out-of-range slice":
+    let src = @[byte('a'), byte('b'), byte('c')]
+    expect(PgProtocolError):
+      discard readString(src, 2, 2)
+    expect(PgProtocolError):
+      discard readBytes(src, 2, 2)
+    expect(PgProtocolError):
+      discard readString(src, -1, 1)
+    expect(PgProtocolError):
+      discard readBytes(src, -1, 1)
+
+  test "readString/readBytes handle len=0 with off at buffer end":
+    let src = @[byte('a'), byte('b')]
+    check readString(src, 2, 0) == ""
+    check readBytes(src, 2, 0).len == 0
+
+  test "writeBytesAt copies into dst":
+    var dst = newSeq[byte](4)
+    let src = @[byte('x'), byte('y')]
+    dst.writeBytesAt(1, src)
+    check dst == @[0'u8, byte('x'), byte('y'), 0'u8]
+
+  test "writeBytesAt no-op on empty src":
+    var dst = newSeq[byte](2)
+    let src: seq[byte] = @[]
+    dst.writeBytesAt(2, src)
+    check dst == @[0'u8, 0'u8]
+
+  test "writeBytesAt rejects out-of-range slice":
+    var dst = newSeq[byte](2)
+    let src3 = @[byte('x'), byte('y'), byte('z')]
+    let src2 = @[byte('x'), byte('y')]
+    let src1 = @[byte('x')]
+    expect(PgProtocolError):
+      dst.writeBytesAt(0, src3)
+    expect(PgProtocolError):
+      dst.writeBytesAt(1, src2)
+    expect(PgProtocolError):
+      dst.writeBytesAt(-1, src1)
 
 suite "Frontend encoding":
   test "encodeStartup - no type byte, version 3.0":
@@ -633,6 +699,62 @@ suite "Backend decoding":
     check res.state == psComplete
     check res.message.kind == bmkCopyDone
 
+  test "NegotiateProtocolVersion: no unrecognised options":
+    var body: seq[byte] = @[]
+    body.addInt32(0) # newest supported minor version
+    body.addInt32(0) # zero unrecognised options
+    var buf = buildMsg('v', body)
+    let res = parseBackendMessage(buf)
+    check res.state == psComplete
+    check res.message.kind == bmkNegotiateProtocolVersion
+    check res.message.newestMinorVersion == 0
+    check res.message.unrecognizedOptions.len == 0
+
+  test "NegotiateProtocolVersion: two unrecognised _pq_.* options":
+    var body: seq[byte] = @[]
+    body.addInt32(3) # server supports up to minor 3
+    body.addInt32(2)
+    body.addCString("_pq_.foo")
+    body.addCString("_pq_.bar")
+    var buf = buildMsg('v', body)
+    let res = parseBackendMessage(buf)
+    check res.state == psComplete
+    check res.message.kind == bmkNegotiateProtocolVersion
+    check res.message.newestMinorVersion == 3
+    check res.message.unrecognizedOptions == @["_pq_.foo", "_pq_.bar"]
+
+  test "NegotiateProtocolVersion: body too short raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0) # only 4 of the required 8 header bytes
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: negative option count raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(-1)
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: option count exceeds body raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(int32.high) # would need billions of trailing CStrings
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: truncated CString raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(1)
+    body.add(cast[seq[byte]]("_pq_.foo")) # missing NUL terminator
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
 suite "Incomplete data handling":
   test "empty buffer returns psIncomplete":
     var buf: seq[byte] = @[]
@@ -773,6 +895,26 @@ suite "newPgQueryError":
       @[ErrorField(code: 'C', value: "42601"), ErrorField(code: 'P', value: "abc")]
     )
     check malformed.position == 0
+
+  test "position rejects values that would overflow int (no OverflowDefect)":
+    # A hostile/buggy server sending a huge decimal must not crash the caller
+    # with the uncatchable OverflowDefect from `result * 10 + d`.
+    let huge = newPgQueryError(
+      @[
+        ErrorField(code: 'C', value: "42601"),
+        ErrorField(code: 'P', value: "99999999999999999999"),
+        ErrorField(code: 'p', value: "1" & repeat('0', 40)),
+      ]
+    )
+    check huge.position == 0
+    check huge.internalPosition == 0
+    # Boundary: a value that fits must still parse.
+    let ok = newPgQueryError(
+      @[
+        ErrorField(code: 'C', value: "42601"), ErrorField(code: 'P', value: "123456789")
+      ]
+    )
+    check ok.position == 123456789
 
   test "SQLSTATE predicates":
     proc errWithState(state: string): ref PgQueryError =

@@ -289,6 +289,133 @@ suite "Large Object: convenience API":
           raisedZeroDeadline = true
         doAssert raisedZeroDeadline
 
+        var raisedNegDeadline = false
+        try:
+          await lo.loWriteAllDeadline(payload, seconds(1), chunkSize = -1)
+        except ValueError:
+          raisedNegDeadline = true
+        doAssert raisedNegDeadline
+
+        await lo.loClose()
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
+  test "loWriteAll rejects chunkSize above int32.high":
+    # Prevents the RangeDefect from `int32(chunk.len)` when a caller passes an
+    # oversized chunkSize on 64-bit platforms.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      conn.withTransaction:
+        let oid = await conn.loCreate()
+        let lo = await conn.loOpen(oid, INV_READWRITE)
+
+        let payload = toBytes("nonempty")
+        let tooBig = int(high(int32)) + 1
+
+        var raised = false
+        try:
+          await lo.loWriteAll(payload, chunkSize = tooBig)
+        except ValueError:
+          raised = true
+        doAssert raised
+
+        var raisedDeadline = false
+        try:
+          await lo.loWriteAllDeadline(payload, seconds(1), chunkSize = tooBig)
+        except ValueError:
+          raisedDeadline = true
+        doAssert raisedDeadline
+
+        await lo.loClose()
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
+  test "loReadAll/loReadStream/deadline variants reject non-positive chunkSize":
+    # Without the guard, chunkSize=0 makes `loread` return empty on the first
+    # call and the helper silently returns @[] even for a non-empty LO.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      conn.withTransaction:
+        let oid = await conn.loCreate()
+        let lo = await conn.loOpen(oid, INV_READWRITE)
+
+        discard await lo.loWrite(toBytes("nonempty"))
+        discard await lo.loSeek(0, SEEK_SET)
+
+        let sink = makeLoReadCallback:
+          discard data
+
+        template expectValueError(body: untyped) =
+          var raised = false
+          try:
+            body
+          except ValueError:
+            raised = true
+          doAssert raised
+
+        expectValueError:
+          discard await lo.loReadAll(chunkSize = 0)
+        expectValueError:
+          discard await lo.loReadAll(chunkSize = -1)
+        expectValueError:
+          await lo.loReadStream(sink, chunkSize = 0)
+        expectValueError:
+          await lo.loReadStream(sink, chunkSize = -1)
+        expectValueError:
+          discard await lo.loReadAllDeadline(seconds(1), chunkSize = 0)
+        expectValueError:
+          discard await lo.loReadAllDeadline(seconds(1), chunkSize = -1)
+        expectValueError:
+          await lo.loReadStreamDeadline(sink, seconds(1), chunkSize = 0)
+        expectValueError:
+          await lo.loReadStreamDeadline(sink, seconds(1), chunkSize = -1)
+
+        await lo.loClose()
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
+  test "loWriteStream variants validate chunkSize before draining callback":
+    # An early-empty callback used to short-circuit the loop before any
+    # loWriteAll invocation, so a bad chunkSize would slip through unchecked.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      conn.withTransaction:
+        let oid = await conn.loCreate()
+        let lo = await conn.loOpen(oid, INV_READWRITE)
+
+        let emptyCb = makeLoWriteCallback:
+          newSeq[byte]()
+
+        template expectValueError(body: untyped) =
+          var raised = false
+          try:
+            body
+          except ValueError:
+            raised = true
+          doAssert raised
+
+        expectValueError:
+          await lo.loWriteStream(emptyCb, chunkSize = 0)
+        expectValueError:
+          await lo.loWriteStream(emptyCb, chunkSize = -1)
+        expectValueError:
+          await lo.loWriteStream(emptyCb, chunkSize = int(high(int32)) + 1)
+        expectValueError:
+          await lo.loWriteStreamDeadline(emptyCb, seconds(1), chunkSize = 0)
+        expectValueError:
+          await lo.loWriteStreamDeadline(
+            emptyCb, seconds(1), chunkSize = int(high(int32)) + 1
+          )
+
         await lo.loClose()
         await conn.loUnlink(oid)
 
