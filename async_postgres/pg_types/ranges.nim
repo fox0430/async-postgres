@@ -655,11 +655,7 @@ proc getInt4Range*(row: Row, col: int): PgRange[int32] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return decodeInt4RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseRangeText[int32](
-    s,
-    proc(e: string): int32 {.gcsafe, raises: [CatchableError].} =
-      pgParseInt32(e),
-  )
+  parseRangeText[int32](s, pgParseInt32)
 
 proc getInt8Range*(row: Row, col: int): PgRange[int64] =
   ## Get a column value as an int8range. Handles binary format.
@@ -669,11 +665,7 @@ proc getInt8Range*(row: Row, col: int): PgRange[int64] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return decodeInt8RangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseRangeText[int64](
-    s,
-    proc(e: string): int64 {.gcsafe, raises: [CatchableError].} =
-      pgParseBiggestInt(e),
-  )
+  parseRangeText[int64](s, pgParseBiggestInt)
 
 proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
   ## Get a column value as a numrange. Handles binary format.
@@ -683,11 +675,7 @@ proc getNumRange*(row: Row, col: int): PgRange[PgNumeric] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return decodeNumRangeBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseRangeText[PgNumeric](
-    s,
-    proc(e: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
-      parsePgNumeric(e),
-  )
+  parseRangeText[PgNumeric](s, parsePgNumeric)
 
 proc getTsRange*(row: Row, col: int): PgRange[DateTime] =
   ## Get a column value as a tsrange. Handles binary format.
@@ -1094,11 +1082,7 @@ proc getInt4Multirange*(row: Row, col: int): PgMultirange[int32] =
       )
     return PgMultirange[int32](ranges)
   let s = row.getStr(col)
-  parseMultirangeText[int32](
-    s,
-    proc(e: string): int32 {.gcsafe, raises: [CatchableError].} =
-      pgParseInt32(e),
-  )
+  parseMultirangeText[int32](s, pgParseInt32)
 
 proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
   ## Get a column value as an int8multirange. Handles binary format.
@@ -1114,11 +1098,7 @@ proc getInt8Multirange*(row: Row, col: int): PgMultirange[int64] =
       )
     return PgMultirange[int64](ranges)
   let s = row.getStr(col)
-  parseMultirangeText[int64](
-    s,
-    proc(e: string): int64 {.gcsafe, raises: [CatchableError].} =
-      pgParseBiggestInt(e),
-  )
+  parseMultirangeText[int64](s, pgParseBiggestInt)
 
 proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
   ## Get a column value as a nummultirange. Handles binary format.
@@ -1134,11 +1114,7 @@ proc getNumMultirange*(row: Row, col: int): PgMultirange[PgNumeric] =
       )
     return PgMultirange[PgNumeric](ranges)
   let s = row.getStr(col)
-  parseMultirangeText[PgNumeric](
-    s,
-    proc(e: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
-      parsePgNumeric(e),
-  )
+  parseMultirangeText[PgNumeric](s, parsePgNumeric)
 
 proc getTsMultirange*(row: Row, col: int): PgMultirange[DateTime] =
   ## Get a column value as a tsmultirange. Handles binary format.
@@ -1225,13 +1201,7 @@ proc getInt4MultirangeArray*(row: Row, col: int): seq[PgMultirange[int32]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(
-      parseMultirangeText[int32](
-        e.get,
-        proc(x: string): int32 {.gcsafe, raises: [CatchableError].} =
-          pgParseInt32(x),
-      )
-    )
+    result.add(parseMultirangeText[int32](e.get, pgParseInt32))
 
 proc getInt8MultirangeArray*(row: Row, col: int): seq[PgMultirange[int64]] =
   if row.isBinaryCol(col):
@@ -1259,13 +1229,7 @@ proc getInt8MultirangeArray*(row: Row, col: int): seq[PgMultirange[int64]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(
-      parseMultirangeText[int64](
-        e.get,
-        proc(x: string): int64 {.gcsafe, raises: [CatchableError].} =
-          pgParseBiggestInt(x),
-      )
-    )
+    result.add(parseMultirangeText[int64](e.get, pgParseBiggestInt))
 
 proc getNumMultirangeArray*(row: Row, col: int): seq[PgMultirange[PgNumeric]] =
   if row.isBinaryCol(col):
@@ -1293,13 +1257,7 @@ proc getNumMultirangeArray*(row: Row, col: int): seq[PgMultirange[PgNumeric]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in multirange array")
-    result.add(
-      parseMultirangeText[PgNumeric](
-        e.get,
-        proc(x: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
-          parsePgNumeric(x),
-      )
-    )
+    result.add(parseMultirangeText[PgNumeric](e.get, parsePgNumeric))
 
 proc getTsMultirangeArray*(row: Row, col: int): seq[PgMultirange[DateTime]] =
   if row.isBinaryCol(col):
@@ -1421,13 +1379,7 @@ proc getInt4RangeArray*(row: Row, col: int): seq[PgRange[int32]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in range array")
-    result.add(
-      parseRangeText[int32](
-        e.get,
-        proc(x: string): int32 {.gcsafe, raises: [CatchableError].} =
-          pgParseInt32(x),
-      )
-    )
+    result.add(parseRangeText[int32](e.get, pgParseInt32))
 
 proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
   ## Get a column value as an ``int8range[]``. Handles binary format.
@@ -1450,13 +1402,7 @@ proc getInt8RangeArray*(row: Row, col: int): seq[PgRange[int64]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in range array")
-    result.add(
-      parseRangeText[int64](
-        e.get,
-        proc(x: string): int64 {.gcsafe, raises: [CatchableError].} =
-          pgParseBiggestInt(x),
-      )
-    )
+    result.add(parseRangeText[int64](e.get, pgParseBiggestInt))
 
 proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
   ## Get a column value as a ``numrange[]``. Handles binary format.
@@ -1479,13 +1425,7 @@ proc getNumRangeArray*(row: Row, col: int): seq[PgRange[PgNumeric]] =
   for e in elems:
     if e.isNone:
       raise newException(PgTypeError, "NULL element in range array")
-    result.add(
-      parseRangeText[PgNumeric](
-        e.get,
-        proc(x: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
-          parsePgNumeric(x),
-      )
-    )
+    result.add(parseRangeText[PgNumeric](e.get, parsePgNumeric))
 
 proc getTsRangeArray*(row: Row, col: int): seq[PgRange[DateTime]] =
   ## Get a column value as a ``tsrange[]``. Handles binary format.
