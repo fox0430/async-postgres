@@ -354,6 +354,38 @@ template initPipelineResults(
     else:
       results[i] = PipelineResult(kind: prkExec)
 
+proc applyRowDescriptionToQr(
+    qr: var QueryResult,
+    fields: sink seq[FieldDescription],
+    cache: StmtCacheStatus,
+    resultFormats: seq[int16],
+) =
+  ## Populate qr.fields / qr.data from a RowDescription. Cache-aware:
+  ## scsMiss with explicit resultFormats derives per-column formats and
+  ## patches fields[j].formatCode; scsShare / scsUncached mirror the
+  ## server-sent Describe(Portal) formats. Shared by both pipeline
+  ## receive paths (executeImpl and executeIsolatedImpl) so the two cannot
+  ## drift on cache handling. `fields` is sunk so the RowDescription seq is
+  ## moved into qr.fields without an intermediate copy.
+  var cf: seq[int16]
+  var co: seq[int32]
+  if cache == scsMiss:
+    if resultFormats.len > 0:
+      cf = deriveColFmts(resultFormats, fields.len)
+      co = newSeq[int32](fields.len)
+      for j in 0 ..< fields.len:
+        co[j] = fields[j].typeOid
+        fields[j].formatCode = cf[j]
+  elif cache in {scsShare, scsUncached}:
+    cf = newSeq[int16](fields.len)
+    co = newSeq[int32](fields.len)
+    for j in 0 ..< fields.len:
+      cf[j] = fields[j].formatCode
+      co[j] = fields[j].typeOid
+  qr.fields = fields
+  qr.data = newRowData(int16(qr.fields.len), cf, co)
+  qr.data.fields = qr.fields
+
 template settleSendFut(sendFut: untyped) =
   ## Cancel or drain sendFut so the Future never leaks on abnormal exit.
   ## Shared by executeImpl and executeIsolatedImpl.
@@ -439,35 +471,17 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
               cachedParamOidsPerOp[activeOpIdx] = msg.paramTypeOids
           of bmkRowDescription:
             if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
-              var cf: seq[int16]
-              var co: seq[int32]
-              if p.ops[activeOpIdx].cache == scsMiss:
-                if not p.ops[activeOpIdx].cacheSuperseded:
-                  if cachedFieldsPerOp.len == 0:
-                    cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
-                  cachedFieldsPerOp[activeOpIdx] = msg.fields
-                results[activeOpIdx].queryResult.fields = msg.fields
-                if p.ops[activeOpIdx].resultFormats.len > 0:
-                  cf = deriveColFmts(p.ops[activeOpIdx].resultFormats, msg.fields.len)
-                  co = newSeq[int32](msg.fields.len)
-                  for j in 0 ..< msg.fields.len:
-                    co[j] = msg.fields[j].typeOid
-                    results[activeOpIdx].queryResult.fields[j].formatCode = cf[j]
-              else:
-                results[activeOpIdx].queryResult.fields = msg.fields
-                # scsShare/scsUncached emit Describe(Portal), so msg.fields'
-                # formatCode/typeOid reflect this op's Bind — mirror into
-                # RowData or binary decoders read as text.
-                if p.ops[activeOpIdx].cache in {scsShare, scsUncached}:
-                  cf = newSeq[int16](msg.fields.len)
-                  co = newSeq[int32](msg.fields.len)
-                  for j in 0 ..< msg.fields.len:
-                    cf[j] = msg.fields[j].formatCode
-                    co[j] = msg.fields[j].typeOid
-              results[activeOpIdx].queryResult.data =
-                newRowData(int16(msg.fields.len), cf, co)
-              results[activeOpIdx].queryResult.data.fields =
-                results[activeOpIdx].queryResult.fields
+              if p.ops[activeOpIdx].cache == scsMiss and
+                  not p.ops[activeOpIdx].cacheSuperseded:
+                if cachedFieldsPerOp.len == 0:
+                  cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
+                cachedFieldsPerOp[activeOpIdx] = msg.fields
+              applyRowDescriptionToQr(
+                results[activeOpIdx].queryResult,
+                msg.fields,
+                p.ops[activeOpIdx].cache,
+                p.ops[activeOpIdx].resultFormats,
+              )
               # Update pointers for nextMessage
               rowData = results[activeOpIdx].queryResult.data
               rowCount = addr results[activeOpIdx].queryResult.rowCount
@@ -620,42 +634,16 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                 cachedParamOids = msg.paramTypeOids
             of bmkRowDescription:
               if p.ops[opIdx].kind == pokQuery:
-                if p.ops[opIdx].cache == scsMiss:
-                  if not p.ops[opIdx].cacheSuperseded:
-                    cachedFields = msg.fields
-                  results[opIdx].queryResult.fields = msg.fields
-                  var cf: seq[int16]
-                  var co: seq[int32]
-                  if p.ops[opIdx].resultFormats.len > 0:
-                    cf = deriveColFmts(p.ops[opIdx].resultFormats, msg.fields.len)
-                    co = newSeq[int32](msg.fields.len)
-                    for j in 0 ..< msg.fields.len:
-                      co[j] = msg.fields[j].typeOid
-                      results[opIdx].queryResult.fields[j].formatCode = cf[j]
-                  results[opIdx].queryResult.data =
-                    newRowData(int16(msg.fields.len), cf, co)
-                  results[opIdx].queryResult.data.fields =
-                    results[opIdx].queryResult.fields
-                  rowData = results[opIdx].queryResult.data
-                  rowCount = addr results[opIdx].queryResult.rowCount
-                else:
-                  results[opIdx].queryResult.fields = msg.fields
-                  # scsShare/scsUncached emit Describe(Portal); mirror
-                  # msg.fields into RowData or binary decoders read as text.
-                  var cf: seq[int16]
-                  var co: seq[int32]
-                  if p.ops[opIdx].cache in {scsShare, scsUncached}:
-                    cf = newSeq[int16](msg.fields.len)
-                    co = newSeq[int32](msg.fields.len)
-                    for j in 0 ..< msg.fields.len:
-                      cf[j] = msg.fields[j].formatCode
-                      co[j] = msg.fields[j].typeOid
-                  results[opIdx].queryResult.data =
-                    newRowData(int16(msg.fields.len), cf, co)
-                  results[opIdx].queryResult.data.fields =
-                    results[opIdx].queryResult.fields
-                  rowData = results[opIdx].queryResult.data
-                  rowCount = addr results[opIdx].queryResult.rowCount
+                if p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
+                  cachedFields = msg.fields
+                applyRowDescriptionToQr(
+                  results[opIdx].queryResult,
+                  msg.fields,
+                  p.ops[opIdx].cache,
+                  p.ops[opIdx].resultFormats,
+                )
+                rowData = results[opIdx].queryResult.data
+                rowCount = addr results[opIdx].queryResult.rowCount
             of bmkNoData:
               discard
             of bmkCommandComplete:
