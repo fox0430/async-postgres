@@ -44,6 +44,7 @@ type
     bmkDataRow
     bmkEmptyQueryResponse
     bmkErrorResponse
+    bmkNegotiateProtocolVersion
     bmkNoData
     bmkNoticeResponse
     bmkNotificationResponse
@@ -109,6 +110,9 @@ type
       columns*: seq[Option[seq[byte]]]
     of bmkErrorResponse:
       errorFields*: seq[ErrorField]
+    of bmkNegotiateProtocolVersion:
+      newestMinorVersion*: int32
+      unrecognizedOptions*: seq[string]
     of bmkNoticeResponse:
       noticeFields*: seq[ErrorField]
     of bmkNotificationResponse:
@@ -956,6 +960,28 @@ proc parseParameterDescription(body: openArray[byte]): BackendMessage =
     result.paramTypeOids[i] = decodeInt32(body, offset)
     offset += 4
 
+proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
+  if body.len < 8:
+    raise newException(PgProtocolError, "NegotiateProtocolVersion message too short")
+  result = BackendMessage(kind: bmkNegotiateProtocolVersion)
+  result.newestMinorVersion = decodeInt32(body, 0)
+  let n = decodeInt32(body, 4)
+  if n < 0:
+    raise newException(
+      PgProtocolError, "NegotiateProtocolVersion: invalid option count " & $n
+    )
+  # Cap allocation against a hostile `n` before the loop reads any bytes.
+  if int64(n) > int64(body.len - 8):
+    raise newException(
+      PgProtocolError, "NegotiateProtocolVersion: option count " & $n & " exceeds body"
+    )
+  result.unrecognizedOptions = newSeq[string](n)
+  var offset = 8
+  for i in 0 ..< n:
+    let (opt, consumed) = decodeCString(body, offset)
+    result.unrecognizedOptions[i] = opt
+    offset += consumed
+
 proc parseCopyResponse(
     body: openArray[byte], kind: BackendMessageKind
 ): BackendMessage =
@@ -1220,6 +1246,8 @@ proc parseBackendMessage*(
     msg = parseReadyForQuery(body)
   of 't':
     msg = parseParameterDescription(body)
+  of 'v':
+    msg = parseNegotiateProtocolVersion(body)
   of '1':
     msg = BackendMessage(kind: bmkParseComplete)
   of '2':
