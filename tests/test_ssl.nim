@@ -398,6 +398,53 @@ suite "SSL negotiation - pre-TLS byte injection":
     check raised
     check msgMatches
 
+  test "split-write injection after 'S' response is rejected (CVE-2021-23214 family)":
+    # Same CVE family, but 'S' and the injected bytes are sent by two separate
+    # writes rather than a single segment. Depending on how the kernel schedules
+    # the two writes on loopback, either the pre-TLS-check window catches the
+    # injection via `socketHasPendingData` (bytes already in the kernel buffer)
+    # or the extra bytes coalesce with 'S' into chronos's read and are caught
+    # via the `n > 1` path — both are valid defenses and yield the same error.
+    var raised = false
+    var msgMatches = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8) # SSLRequest
+          await sendBytes(st, @[byte('S')])
+          await sendBytes(st, @[byte('X'), byte('Y'), byte('Z')])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        msgMatches = "unencrypted data" in e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+
 suite "SSL negotiation - sslVerifyCa":
   test "sslVerifyCa raises PgError when server responds N":
     var raised = false
