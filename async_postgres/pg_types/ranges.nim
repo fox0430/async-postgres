@@ -372,12 +372,15 @@ proc encodeRangeBinaryImpl(r: RangeBinaryInput): seq[byte] =
     flags = flags or rangeLowerInc
   if r.upperInc:
     flags = flags or rangeUpperInc
-  var size = 1
+  var size: int64 = 1
   if r.hasLower:
-    size += 4 + r.lowerData.len
+    checkPgBinLen(r.lowerData.len, "Range bound")
+    size += 4'i64 + r.lowerData.len.int64
   if r.hasUpper:
-    size += 4 + r.upperData.len
-  result = newSeq[byte](size)
+    checkPgBinLen(r.upperData.len, "Range bound")
+    size += 4'i64 + r.upperData.len.int64
+  checkPgBinPayload(size, "Range")
+  result = newSeq[byte](size.int)
   result[0] = flags
   var pos = 1
   if r.hasLower:
@@ -799,10 +802,13 @@ proc parseMultirangeText*[T](
   PgMultirange[T](ranges)
 
 proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =
-  var size = 4
+  checkPgBinLen(rangeData.len, "Multirange range count")
+  var size: int64 = 4
   for rd in rangeData:
-    size += 4 + rd.len
-  result = newSeq[byte](size)
+    checkPgBinLen(rd.len, "Multirange range")
+    size += 4'i64 + rd.len.int64
+    checkPgBinPayload(size, "Multirange")
+  result = newSeq[byte](size.int)
   result.writeBE32(0, int32(rangeData.len))
   var pos = 4
   for rd in rangeData:
