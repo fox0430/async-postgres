@@ -245,6 +245,10 @@ proc parseLsn*(s: string): Lsn =
   let parts = s.split('/')
   if parts.len != 2:
     raise newException(PgTypeError, "Invalid LSN format: " & s)
+  # fromHex[uint64] returns 0 for an empty string instead of raising, so an
+  # empty half would silently produce a zero LSN — reject explicitly.
+  if parts[0].len == 0 or parts[1].len == 0:
+    raise newException(PgTypeError, "Invalid LSN format: " & s)
   # fromHex[uint64] wraps silently past 16 significant hex digits instead of
   # raising; compare significant digits, not raw length, so a zero-padded but
   # in-range half isn't rejected.
@@ -593,6 +597,15 @@ proc identifySystem*(
     info.dbName = row.getStr(3)
   return info
 
+proc decodeCreateSlotRow*(qr: QueryResult): ReplicationSlotInfo =
+  let row = initRow(qr.data, 0)
+  result.slotName = row.getStr(0)
+  result.consistentPoint = parseLsn(row.getStr(1))
+  if qr.fields.len > 2 and not row.isNull(2):
+    result.snapshotName = row.getStr(2)
+  if qr.fields.len > 3 and not row.isNull(3):
+    result.outputPlugin = row.getStr(3)
+
 proc createReplicationSlot*(
     conn: PgConnection,
     slotName: string,
@@ -611,16 +624,7 @@ proc createReplicationSlot*(
   let results = await conn.simpleQuery(sql, timeout)
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "CREATE_REPLICATION_SLOT returned no results")
-  let qr = results[0]
-  let row = initRow(qr.data, 0)
-  var info = ReplicationSlotInfo()
-  info.slotName = row.getStr(0)
-  info.consistentPoint = parseLsn(row.getStr(1))
-  if qr.fields.len > 2:
-    info.snapshotName = row.getStr(2)
-  if qr.fields.len > 3:
-    info.outputPlugin = row.getStr(3)
-  return info
+  return decodeCreateSlotRow(results[0])
 
 proc dropReplicationSlot*(
     conn: PgConnection,

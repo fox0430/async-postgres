@@ -44,6 +44,16 @@ suite "LSN":
     expect(PgTypeError):
       discard parseLsn("0/XYZ")
 
+  test "parseLsn empty half rejected":
+    # fromHex[uint64]("") returns 0 without raising, so a half left blank
+    # would silently produce a valid-looking LSN. Reject explicitly.
+    expect(PgTypeError):
+      discard parseLsn("/")
+    expect(PgTypeError):
+      discard parseLsn("/A")
+    expect(PgTypeError):
+      discard parseLsn("A/")
+
   test "parseLsn half wider than 32 bits":
     # A wider half must be rejected, not silently truncated to 32 bits.
     expect(PgTypeError):
@@ -722,3 +732,52 @@ suite "invalidateAbandonedStream":
     let conn = mkConn(csClosed)
     conn.invalidateAbandonedStream()
     check conn.state == csClosed
+
+suite "decodeCreateSlotRow":
+  proc buildDataRowBody(values: openArray[string]): seq[byte] =
+    result.addInt16(int16(values.len))
+    for v in values:
+      if v == "\xFF":
+        result.addInt32(-1)
+      else:
+        result.addInt32(int32(v.len))
+        for c in v:
+          result.add(byte(c))
+
+  proc mkSlotQr(values: openArray[string], numFields: int): QueryResult =
+    let rd = newRowData(int16(values.len))
+    parseDataRowInto(buildDataRowBody(values), rd)
+    var fields = newSeq[FieldDescription](numFields)
+    for i in 0 ..< numFields:
+      fields[i] = FieldDescription(name: "col" & $i, typeOid: 25, formatCode: 0)
+    QueryResult(fields: fields, data: rd, rowCount: 1)
+
+  test "all columns present":
+    let qr = mkSlotQr(["my_slot", "0/16B3740", "00000001", "pgoutput"], 4)
+    let info = decodeCreateSlotRow(qr)
+    check info.slotName == "my_slot"
+    check info.consistentPoint == parseLsn("0/16B3740")
+    check info.snapshotName == "00000001"
+    check info.outputPlugin == "pgoutput"
+
+  test "NULL snapshot_name and output_plugin":
+    let qr = mkSlotQr(["my_slot", "0/16B3740", "\xFF", "\xFF"], 4)
+    let info = decodeCreateSlotRow(qr)
+    check info.slotName == "my_slot"
+    check info.consistentPoint == parseLsn("0/16B3740")
+    check info.snapshotName == ""
+    check info.outputPlugin == ""
+
+  test "NULL snapshot_name only":
+    let qr = mkSlotQr(["my_slot", "0/16B3740", "\xFF", "pgoutput"], 4)
+    let info = decodeCreateSlotRow(qr)
+    check info.snapshotName == ""
+    check info.outputPlugin == "pgoutput"
+
+  test "fewer fields skips optional columns":
+    let qr = mkSlotQr(["my_slot", "0/16B3740"], 2)
+    let info = decodeCreateSlotRow(qr)
+    check info.slotName == "my_slot"
+    check info.consistentPoint == parseLsn("0/16B3740")
+    check info.snapshotName == ""
+    check info.outputPlugin == ""
