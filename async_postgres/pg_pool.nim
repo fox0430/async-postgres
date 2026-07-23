@@ -327,7 +327,10 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   try:
     if conn.sessionLockDirty:
       let t = pool.config.tracer
-      if t != nil and t.onLeakedSessionLocks != nil and conn.heldSessionLocks > 0:
+      if t != nil and t.onLeakedSessionLocks != nil:
+        # Fire on the sticky flag rather than the counter so a raw acquire
+        # released through the typed API — which decrements the counter for a
+        # lock it never tracked — cannot silence the leak hook.
         t.onLeakedSessionLocks(
           TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
         )
@@ -732,8 +735,10 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
       tracer.onPoolDoubleRelease(TracePoolDoubleReleaseData(conn: conn))
     return
   conn.borrowed = false
-  if conn.sessionLockDirty and conn.heldSessionLocks > 0 and tracer != nil and
-      tracer.onLeakedSessionLocks != nil:
+  if conn.sessionLockDirty and tracer != nil and tracer.onLeakedSessionLocks != nil:
+    # Fire on the sticky flag rather than the counter so a raw acquire
+    # released through the typed API — which decrements the counter for a
+    # lock it never tracked — cannot silence the leak hook.
     tracer.onLeakedSessionLocks(
       TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
     )

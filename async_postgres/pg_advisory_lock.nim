@@ -21,12 +21,34 @@
 ## them with the same key unintentionally. Transaction-level locks are not
 ## stackable and are always released at transaction end.
 ##
+## **Key space:** PostgreSQL uses a single advisory-lock name space per
+## database that both session-level and transaction-level locks share — a
+## session-level ``advisoryLock(42)`` blocks a concurrent
+## ``advisoryLockXact(42)`` on another connection and vice versa. The
+## single-``int64`` and ``(int32, int32)`` overloads live in **separate**
+## sub-spaces (PostgreSQL treats the two signatures as distinct lock types),
+## so ``advisoryLock(1'i64)`` never blocks ``advisoryLock(0'i32, 1'i32)``
+## even though the numeric identifiers overlap. Shared and exclusive locks
+## on the same key follow standard reader/writer semantics — a shared lock
+## blocks concurrent exclusive acquires but not other shared acquires.
+##
 ## **Pool integration:** Typed acquires set a sticky ``sessionLockDirty``
 ## flag; the pool runs ``pg_advisory_unlock_all`` on return based on the
 ## flag (not the counter), so a typed ``advisoryUnlock`` of a raw-acquired
 ## key cannot forge a lock-free state. Raw-SQL acquires still bypass
 ## tracking — callers must release them explicitly or invoke
 ## ``advisoryUnlockAll`` before returning the connection.
+##
+## **Mixed raw + typed usage:** ``heldSessionLocks`` counts only typed
+## acquires, but ``advisoryUnlock*`` decrements it whenever the server
+## reports the lock was released — including when the released lock was
+## acquired via raw SQL. Under mixed usage the counter therefore
+## under-reports still-held tracked locks. The ``onLeakedSessionLocks``
+## hook fires on ``sessionLockDirty`` rather than the counter, so leak
+## detection stays accurate even when the counter has been driven to zero;
+## the delivered ``count`` field is an unreliable lower bound in that
+## regime. Prefer sticking to a single API (typed or raw) per connection
+## checkout.
 ##
 ## Example
 ## =======
