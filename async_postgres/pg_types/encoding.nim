@@ -250,6 +250,20 @@ proc toPgParam*(v: PgHstore): PgParam =
   ## the latter with 42804 because there is no text→hstore assignment cast.
   PgParam(oid: 0'i32, format: 0, value: some(toBytes(encodeHstoreText(v))))
 
+proc checkPgBinLen*(n: int, what: string) {.inline.} =
+  ## Guard an ``int32`` length prefix in a binary container encoder against
+  ## silent wrap on ``int32(seq.len)`` past 2 GiB.
+  if n > int32.high.int:
+    raise newException(PgError, what & " too large for PostgreSQL binary format: " & $n)
+
+proc checkPgBinPayload*(size: int64, what: string) {.inline.} =
+  ## Companion cumulative guard — many under-limit elements can still overflow
+  ## the outer length prefix. ``int64`` so accumulation stays safe on 32-bit
+  ## platforms where the ``int`` accumulator would wrap before this fires.
+  if size > int32.high.int64:
+    raise
+      newException(PgError, what & " payload too large for PostgreSQL binary format")
+
 proc encodeBinaryArray*(
     elemOid: int32,
     dims: openArray[int32],
@@ -269,7 +283,7 @@ proc encodeBinaryArray*(
   ## ``validatePgArrayShape`` in ``array.nim`` for the validation rules.
   validatePgArrayShape(dims, lowerBounds, elements.len)
   let headerSize = 12 + 8 * dims.len
-  var dataSize = 0
+  var dataSize: int64 = 0
   var anyNull = false
   for e in elements:
     if e.isNone:
@@ -277,18 +291,10 @@ proc encodeBinaryArray*(
       dataSize += 4
     else:
       let ev = e.get
-      if ev.len > int32.high.int:
-        raise
-          newException(PgError, "Array element too large for PostgreSQL binary format")
-      dataSize += 4 + ev.len
-    # Cap the cumulative payload at int32.high so a crafted input with many
-    # large elements cannot make ``headerSize + dataSize`` wrap negative
-    # before the ``newSeq`` allocation. Per-element ``ev.len`` is already
-    # bounded above; this guards the sum.
-    if dataSize > int32.high.int:
-      raise
-        newException(PgError, "Array payload too large for PostgreSQL binary format")
-  result = newSeq[byte](headerSize + dataSize)
+      checkPgBinLen(ev.len, "Array element")
+      dataSize += 4'i64 + ev.len.int64
+    checkPgBinPayload(dataSize, "Array")
+  result = newSeq[byte](headerSize + dataSize.int)
   result.writeBE32(0, int32(dims.len)) # ndim
   result.writeBE32(4, if anyNull: 1'i32 else: 0'i32) # has_null
   result.writeBE32(8, elemOid) # elem_oid
@@ -1151,12 +1157,16 @@ proc toPgBinaryParam*(v: Option[JsonNode]): PgParam =
 proc encodeHstoreBinary*(v: PgHstore): seq[byte] =
   ## Encode hstore as PostgreSQL binary format.
   ## Format: ``numPairs(int32) + [keyLen(int32) + keyData + valLen(int32) + valData]...``
-  var size = 4
+  checkPgBinLen(v.len, "hstore pair count")
+  var size: int64 = 4
   for k, val in v.pairs:
-    size += 4 + k.len + 4
+    checkPgBinLen(k.len, "hstore key")
+    size += 4'i64 + k.len.int64 + 4'i64
     if val.isSome:
-      size += val.get.len
-  result = newSeq[byte](size)
+      checkPgBinLen(val.get.len, "hstore value")
+      size += val.get.len.int64
+    checkPgBinPayload(size, "hstore")
+  result = newSeq[byte](size.int)
   result.writeBE32(0, int32(v.len))
   var pos = 4
   for k, val in v.pairs:
