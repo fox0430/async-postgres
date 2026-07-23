@@ -746,7 +746,12 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
 
     waitFor t()
 
-  test "no leak leaves hook silent":
+  test "clean typed release still fires hook because dirty flag is sticky":
+    # Post-fix semantics: the hook fires whenever the sticky sessionLockDirty
+    # flag was set — including a well-behaved typed acquire+release where the
+    # counter reaches zero. This is the trade-off for catching the
+    # raw-acquire + typed-release path where the counter gets misdecremented
+    # to zero while a tracked lock is still held.
     proc t() {.async.} =
       let log = LeakLog()
       var cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
@@ -759,8 +764,59 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
         await conn.advisoryLock(72004'i64)
         discard await conn.advisoryUnlock(72004'i64)
 
+      doAssert log.counts == @[0]
+      doAssert pool.idle.len == 1
+
+    waitFor t()
+
+  test "hook silent when no typed acquire ever ran":
+    proc t() {.async.} =
+      let log = LeakLog()
+      var cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      cfg.tracer = buildLeakTracer(log)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        discard await conn.exec("SELECT 1")
+
       doAssert log.counts.len == 0
       doAssert pool.idle.len == 1
+
+    waitFor t()
+
+  test "mixed raw+typed usage still fires hook when counter is misdecremented":
+    # Raw acquire + typed unlock drives heldSessionLocks below the true
+    # tracked-lock count. The hook must still fire on sessionLockDirty so
+    # the counter mismatch cannot silence leak detection.
+    proc t() {.async.} =
+      let log = LeakLog()
+      var cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      cfg.tracer = buildLeakTracer(log)
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        await conn.advisoryLock(72005'i64) # typed: counter=1, dirty=true
+        discard await conn.exec("SELECT pg_advisory_lock(72006)") # raw
+        discard await conn.advisoryUnlock(72006'i64)
+          # typed unlock of raw key: server returns true, counter → 0
+        doAssert conn.heldSessionLocks == 0
+        doAssert conn.sessionLockDirty
+        # tracked lock 72005 is still held on the server side.
+
+      doAssert log.counts == @[0] # dirty-based fire with under-reported count
+      doAssert pool.idle.len == 1
+      doAssert pool.idle[0].conn.heldSessionLocks == 0
+      doAssert not pool.idle[0].conn.sessionLockDirty
+      # Verify the still-held tracked lock was actually cleared by cleanup.
+      let probe = await connect(plainConfig())
+      defer:
+        await probe.close()
+      doAssert await probe.advisoryTryLock(72005'i64)
+      discard await probe.advisoryUnlock(72005'i64)
 
     waitFor t()
 
