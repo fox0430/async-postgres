@@ -699,6 +699,62 @@ suite "Backend decoding":
     check res.state == psComplete
     check res.message.kind == bmkCopyDone
 
+  test "NegotiateProtocolVersion: no unrecognised options":
+    var body: seq[byte] = @[]
+    body.addInt32(0) # newest supported minor version
+    body.addInt32(0) # zero unrecognised options
+    var buf = buildMsg('v', body)
+    let res = parseBackendMessage(buf)
+    check res.state == psComplete
+    check res.message.kind == bmkNegotiateProtocolVersion
+    check res.message.newestMinorVersion == 0
+    check res.message.unrecognizedOptions.len == 0
+
+  test "NegotiateProtocolVersion: two unrecognised _pq_.* options":
+    var body: seq[byte] = @[]
+    body.addInt32(3) # server supports up to minor 3
+    body.addInt32(2)
+    body.addCString("_pq_.foo")
+    body.addCString("_pq_.bar")
+    var buf = buildMsg('v', body)
+    let res = parseBackendMessage(buf)
+    check res.state == psComplete
+    check res.message.kind == bmkNegotiateProtocolVersion
+    check res.message.newestMinorVersion == 3
+    check res.message.unrecognizedOptions == @["_pq_.foo", "_pq_.bar"]
+
+  test "NegotiateProtocolVersion: body too short raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0) # only 4 of the required 8 header bytes
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: negative option count raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(-1)
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: option count exceeds body raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(int32.high) # would need billions of trailing CStrings
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: truncated CString raises":
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(1)
+    body.add(cast[seq[byte]]("_pq_.foo")) # missing NUL terminator
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
 suite "Incomplete data handling":
   test "empty buffer returns psIncomplete":
     var buf: seq[byte] = @[]

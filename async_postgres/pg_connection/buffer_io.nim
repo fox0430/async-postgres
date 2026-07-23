@@ -351,6 +351,12 @@ proc nextMessage*(
       let m = res.message
       conn.serverParams[m.paramName] = m.paramValue
       continue
+    if res.message.kind == bmkNegotiateProtocolVersion:
+      # Informational per libpq; record and drop so callers never see it.
+      let m = res.message
+      conn.negotiatedMinorVersion = m.newestMinorVersion
+      conn.unrecognizedStartupOptions = m.unrecognizedOptions
+      continue
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue

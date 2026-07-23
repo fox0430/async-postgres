@@ -228,6 +228,11 @@ type
     pid*: int32
     secretKey*: int32
     serverParams*: Table[string, string]
+    negotiatedMinorVersion*: int32
+      ## Highest minor version the server supports, from `NegotiateProtocolVersion`.
+      ## Zero when no such message was seen.
+    unrecognizedStartupOptions*: seq[string]
+      ## `_pq_.*` options the server rejected, from `NegotiateProtocolVersion`.
     txStatus*: TransactionStatus
     notifyCallback*: NotifyCallback
     noticeCallback*: NoticeCallback
