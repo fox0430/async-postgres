@@ -15,18 +15,14 @@ proc execImpl*(
 ): Future[string] {.async.} =
   conn.checkReady()
 
-  let formats =
-    if paramFormats.len > 0:
-      paramFormats
-    else:
-      newSeq[int16](params.len)
-
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
   var cacheMiss = false
   var stmtName = ""
 
+  # PG Bind treats 0 format codes as "all params text" — equivalent on the
+  # wire to N zeros, so pass paramFormats through even when empty.
   sendExtendedExec(
     conn = conn,
     cached = cached,
@@ -34,7 +30,7 @@ proc execImpl*(
     cacheMiss = cacheMiss,
     stmtName = stmtName,
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep = conn.sendBuf.addBind("", stmtName, formats, params),
+    bindStep = conn.sendBuf.addBind("", stmtName, paramFormats, params),
   )
   conn.state = csBusy
   await conn.sendBufMsg()
