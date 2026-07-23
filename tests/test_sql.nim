@@ -138,6 +138,24 @@ suite "sqlParams":
     check sqlParams("SELECT /* c */ col ?| array[?]") ==
       "SELECT /* c */ col ?| array[$1]"
 
+  test "?- operator preserved":
+    check sqlParams("SELECT p1 ?- p2 FROM lines WHERE id = ?") ==
+      "SELECT p1 ?- p2 FROM lines WHERE id = $1"
+
+  test "?# operator preserved":
+    check sqlParams("SELECT p1 ?# p2 FROM boxes WHERE id = ?") ==
+      "SELECT p1 ?# p2 FROM boxes WHERE id = $1"
+
+  test "?-| operator preserved":
+    check sqlParams("SELECT p1 ?-| p2 FROM lines WHERE id = ?") ==
+      "SELECT p1 ?-| p2 FROM lines WHERE id = $1"
+
+  test "?- at end of string":
+    check sqlParams("SELECT col ?-") == "SELECT col ?-"
+
+  test "?# at end of string":
+    check sqlParams("SELECT col ?#") == "SELECT col ?#"
+
 suite "sql macro":
   test "basic parameter extraction":
     let x = 42'i32
@@ -310,4 +328,29 @@ suite "sql macro":
     let x = 1'i32
     let sq = sql"SELECT /* /* {inner} */ {mid} */ {x}"
     check sq.query == "SELECT /* /* {inner} */ {mid} */ $1"
+    check sq.params.len == 1
+
+  test "expression containing raw string with closing brace":
+    let sq = sql"""SELECT {r"a}b".len.int32}"""
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
+
+  test "expression containing raw string with backslash before quote":
+    let sq = sql"""SELECT {r"a\".len.int32}"""
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
+
+  test "expression containing raw string with escaped quote":
+    let sq = sql"""SELECT {r"a""b".len.int32}"""
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
+
+  test "expression with block comment containing braces":
+    let sq = sql"""SELECT {5'i32 #[ } weird { ]# + 3'i32}"""
+    check sq.query == "SELECT $1"
+    check sq.params.len == 1
+
+  test "expression with nested block comment":
+    let sq = sql"""SELECT {5'i32 #[ outer #[ inner } ]# still } ]# + 3'i32}"""
+    check sq.query == "SELECT $1"
     check sq.params.len == 1
