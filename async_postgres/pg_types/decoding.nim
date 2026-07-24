@@ -542,6 +542,27 @@ proc parseIntervalText*(s: string): PgInterval =
   ##   "1 year 2 mons 3 days 04:05:06.123456"
   ##   "-1 year -2 mons +3 days -04:05:06"
   ##   "00:00:00"
+  ##
+  ## Numeric accumulation and unit scaling are bounds-checked so a malicious
+  ## or broken server sending oversized fields raises a catchable
+  ## ``PgTypeError`` rather than crashing with ``OverflowDefect`` /
+  ## ``RangeDefect`` (or silently wrapping in release builds).
+  proc accumDigit(acc: int64, ch: char, s: string): int64 =
+    let d = int64(ord(ch) - ord('0'))
+    if acc > (int64.high - d) div 10:
+      raise newException(PgTypeError, "interval numeric overflow: " & s)
+    acc * 10 + d
+
+  proc addI32(a, b: int32, s: string): int32 =
+    if (b > 0 and a > int32.high - b) or (b < 0 and a < int32.low - b):
+      raise newException(PgTypeError, "interval field overflows int32: " & s)
+    a + b
+
+  proc toI32(v: int64, s: string): int32 =
+    if v < int64(int32.low) or v > int64(int32.high):
+      raise newException(PgTypeError, "interval field out of int32 range: " & s)
+    int32(v)
+
   var months: int32 = 0
   var days: int32 = 0
   var microseconds: int64 = 0
@@ -567,19 +588,19 @@ proc parseIntervalText*(s: string): PgInterval =
           i += 1
         var hours: int64 = 0
         while i < n and s[i] in '0' .. '9':
-          hours = hours * 10 + int64(ord(s[i]) - ord('0'))
+          hours = accumDigit(hours, s[i], s)
           i += 1
         i += 1 # skip ':'
         var mins: int64 = 0
         while i < n and s[i] in '0' .. '9':
-          mins = mins * 10 + int64(ord(s[i]) - ord('0'))
+          mins = accumDigit(mins, s[i], s)
           i += 1
         var secs: int64 = 0
         var frac: int64 = 0
         if i < n and s[i] == ':':
           i += 1
           while i < n and s[i] in '0' .. '9':
-            secs = secs * 10 + int64(ord(s[i]) - ord('0'))
+            secs = accumDigit(secs, s[i], s)
             i += 1
           if i < n and s[i] == '.':
             i += 1
@@ -595,7 +616,19 @@ proc parseIntervalText*(s: string): PgInterval =
             # Skip remaining fractional digits
             while i < n and s[i] in '0' .. '9':
               i += 1
-        let us = hours * 3_600_000_000 + mins * 60_000_000 + secs * 1_000_000 + frac
+        # Reject fields large enough to overflow the microsecond total before
+        # multiplying, so ``us`` computation itself is safe.
+        if hours > int64.high div 3_600_000_000'i64 or
+            mins > int64.high div 60_000_000'i64 or secs > int64.high div 1_000_000'i64:
+          raise newException(PgTypeError, "interval time overflow: " & s)
+        let hUs = hours * 3_600_000_000'i64
+        let mUs = mins * 60_000_000'i64
+        let sUs = secs * 1_000_000'i64
+        if mUs > int64.high - hUs or sUs > int64.high - hUs - mUs or
+            frac > int64.high - hUs - mUs - sUs:
+          raise newException(PgTypeError, "interval time overflow: " & s)
+        let us = hUs + mUs + sUs + frac
+        # ``us`` is in [0, int64.high], so ``-us`` cannot overflow.
         microseconds =
           if neg:
             -us
@@ -609,7 +642,7 @@ proc parseIntervalText*(s: string): PgInterval =
     var val: int64 = 0
     var sawDigit = false
     while i < n and s[i] in '0' .. '9':
-      val = val * 10 + int64(ord(s[i]) - ord('0'))
+      val = accumDigit(val, s[i], s)
       i += 1
       sawDigit = true
     if neg:
@@ -627,11 +660,15 @@ proc parseIntervalText*(s: string): PgInterval =
       raise newException(PgTypeError, "Invalid interval: " & s)
     case unit
     of "year", "years":
-      months += int32(val * 12)
+      # Constrain ``val`` so ``val * 12`` fits in int32; that also keeps the
+      # int64 multiplication itself well below overflow.
+      if val < int64(int32.low) div 12 or val > int64(int32.high) div 12:
+        raise newException(PgTypeError, "interval years out of range: " & s)
+      months = addI32(months, int32(val * 12), s)
     of "mon", "mons":
-      months += int32(val)
+      months = addI32(months, toI32(val, s), s)
     of "day", "days":
-      days += int32(val)
+      days = addI32(days, toI32(val, s), s)
     else:
       raise newException(PgTypeError, "Invalid interval unit '" & unit & "' in: " & s)
   PgInterval(months: months, days: days, microseconds: microseconds)

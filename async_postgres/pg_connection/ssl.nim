@@ -56,6 +56,8 @@ when hasAsyncDispatch and defined(ssl):
     SslCtxSetAlpnProtosFn = proc(ctx: SslCtx, protos: cstring, protos_len: cuint): cint {.
       cdecl, gcsafe, raises: []
     .}
+    SslCtxSetDefaultPasswdCbFn =
+      proc(ctx: SslCtx, cb: pem_password_cb) {.cdecl, gcsafe, raises: [].}
 
   # Apple's system libssl/libcrypto omit some of these symbols; an eager
   # `{.dynlib.}` binding would abort the process at startup. Resolve via
@@ -80,6 +82,17 @@ when hasAsyncDispatch and defined(ssl):
       cast[SslGet0AlpnSelectedFn](resolveSym(sslDynlib, "SSL_get0_alpn_selected"))
     sslCtxSetAlpnProtos* =
       cast[SslCtxSetAlpnProtosFn](resolveSym(sslDynlib, "SSL_CTX_set_alpn_protos"))
+    sslCtxSetDefaultPasswdCb* = cast[SslCtxSetDefaultPasswdCbFn](resolveSym(
+      sslDynlib, "SSL_CTX_set_default_passwd_cb"
+    ))
+
+  proc failPemPassphrase(
+      buf: cstring, size, rwflag: cint, userdata: pointer
+  ): cint {.cdecl.} =
+    ## Passphrase callback that always fails. OpenSSL's default callback prompts
+    ## on the controlling TTY, which would block the async event loop when an
+    ## encrypted client key is loaded; failing turns that into a load error.
+    -1
 
   proc formatSslError(prefix: string): string =
     result = prefix
@@ -269,33 +282,58 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         sslHost
       else:
         sniName(sslHost, config.sslSni)
+    # newTLSClientAsyncStream stores these on TLSAsyncStream
+    # (clientCertificate/clientPrivateKey) so BearSSL keeps a valid reference
+    # for the lifetime of conn.tlsStream — no extra retention on PgConnection
+    # is needed (unlike trustAnchorBufs above).
+    var clientCert: TLSCertificate
+    var clientKey: TLSPrivateKey
+    if config.sslCert.len > 0 and config.sslKey.len > 0:
+      try:
+        clientCert = TLSCertificate.init(config.sslCert)
+        clientKey = TLSPrivateKey.init(config.sslKey)
+      except TLSStreamProtocolError as e:
+        raise newException(
+          PgConnectionError, "Failed to load client certificate/key: " & e.msg
+        )
+
     # Advertise ALPN on every TLS connection (libpq 17 parity: SSL_set_alpn_protos
     # is called unconditionally); enforcement stays direct-only below.
-    if config.sslMode in {sslVerifyCa, sslVerifyFull}:
-      let parsed = parseTrustAnchors(config.sslRootCert)
-      conn.trustAnchorBufs = parsed.backing
-        # Must outlive TLS session (see parseTrustAnchors doc)
-      conn.tlsStream = newTLSClientAsyncStream(
-        conn.baseReader,
-        conn.baseWriter,
-        serverName,
-        flags = flags,
-        minVersion = TLSVersion.TLS12,
-        maxVersion = TLSVersion.TLS12,
-        trustAnchors = parsed.store,
-        alpnProtocols = [PgAlpnProtocol],
-      )
-    else:
-      # NoVerifyHost is set, so trust anchors are ignored regardless.
-      conn.tlsStream = newTLSClientAsyncStream(
-        conn.baseReader,
-        conn.baseWriter,
-        serverName,
-        flags = flags,
-        minVersion = TLSVersion.TLS12,
-        maxVersion = TLSVersion.TLS12,
-        alpnProtocols = [PgAlpnProtocol],
-      )
+    try:
+      if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+        let parsed = parseTrustAnchors(config.sslRootCert)
+        conn.trustAnchorBufs = parsed.backing
+          # Must outlive TLS session (see parseTrustAnchors doc)
+        conn.tlsStream = newTLSClientAsyncStream(
+          conn.baseReader,
+          conn.baseWriter,
+          serverName,
+          flags = flags,
+          minVersion = TLSVersion.TLS12,
+          maxVersion = TLSVersion.TLS12,
+          trustAnchors = parsed.store,
+          alpnProtocols = [PgAlpnProtocol],
+          certificate = clientCert,
+          privateKey = clientKey,
+        )
+      else:
+        # NoVerifyHost is set, so trust anchors are ignored regardless.
+        conn.tlsStream = newTLSClientAsyncStream(
+          conn.baseReader,
+          conn.baseWriter,
+          serverName,
+          flags = flags,
+          minVersion = TLSVersion.TLS12,
+          maxVersion = TLSVersion.TLS12,
+          alpnProtocols = [PgAlpnProtocol],
+          certificate = clientCert,
+          privateKey = clientKey,
+        )
+    except TLSStreamInitError as e:
+      # Covers cert/key decode failures newTLSClientAsyncStream performs itself
+      # (e.g. getSignerAlgo), which the TLSCertificate.init wrapping above misses.
+      raise
+        newException(PgConnectionError, "Failed to initialise TLS stream: " & e.msg, e)
     installX509Capture(
       conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
     )
@@ -309,16 +347,113 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     when defined(ssl):
       let direct = config.sslNegotiation == sslnDirect
       var ctx: SslContext
-      var tmpPath: string
-      try:
-        if config.sslMode in {sslVerifyCa, sslVerifyFull}:
-          let (tmpFile, tp) = createTempFile("pg_ca_", ".pem")
-          tmpPath = tp
-          tmpFile.write(config.sslRootCert)
-          tmpFile.close()
-          ctx = newContext(verifyMode = CVerifyPeer, caFile = tmpPath)
+      var tmpPaths: seq[string]
+
+      proc removeTempPem(p: string) =
+        try:
+          removeFile(p)
+        except OSError as e:
+          warnStderr "pg_connection: failed to remove temp SSL file " & p & ": " & e.msg
+
+      # std/net's newContext accepts only file paths, so each PEM is staged as
+      # a private temp file (0600, O_EXCL; /dev/shm tmpfs when available) and
+      # removed as soon as newContext has loaded it.
+      proc writeTempPem(content, prefix: string): string =
+        if content.len == 0:
+          return ""
+        var f: File
+        var p: string
+        when defined(linux):
+          const shm = "/dev/shm"
+          if dirExists(shm):
+            try:
+              (f, p) = createTempFile(prefix, ".pem", dir = shm)
+            except CatchableError:
+              (f, p) = createTempFile(prefix, ".pem")
+          else:
+            (f, p) = createTempFile(prefix, ".pem")
         else:
+          (f, p) = createTempFile(prefix, ".pem")
+        tmpPaths.add(p)
+        try:
+          f.write(content)
+        finally:
+          f.close()
+        p
+
+      try:
+        let caPath =
+          if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+            writeTempPem(config.sslRootCert, "pg_ca_")
+          else:
+            ""
+        let certPath = writeTempPem(config.sslCert, "pg_cert_")
+        let keyPath = writeTempPem(config.sslKey, "pg_key_")
+
+        try:
+          # Always CVerifyNone: with CVerifyPeer, newContext preloads the OS CA
+          # bundle (and fails outright when none exists), and the later
+          # SSL_CTX_load_verify_locations *appends* sslrootcert instead of
+          # replacing that store — any Web-PKI-issued cert would then pass
+          # verify-ca/verify-full. Peer verification is enabled manually below
+          # so only the pinned CA is trusted.
           ctx = newContext(verifyMode = CVerifyNone)
+        except CatchableError as e:
+          raise
+            newException(PgConnectionError, "Failed to create SSL context: " & e.msg, e)
+        if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+          SSL_CTX_set_verify(ctx.context, SSL_VERIFY_PEER, nil)
+
+        # Load CA / cert / key ourselves rather than letting `newContext` do it
+        # via its `caFile`/`certFile`/`keyFile` parameters: std/net leaks the
+        # SSL_CTX it just allocated when a file load fails (raises before
+        # returning the SslContext, so no handle to `destroyContext`). Doing it
+        # here keeps `ctx` non-nil so the outer `finally` cleans up.
+        try:
+          if caPath.len > 0:
+            if SSL_CTX_load_verify_locations(ctx.context, caPath.cstring, nil) != 1:
+              raise newException(IOError, "Failed to load CA certificate: " & caPath)
+          if certPath.len > 0:
+            if SSL_CTX_use_certificate_chain_file(ctx.context, certPath.cstring) != 1:
+              raise
+                newException(IOError, "Failed to load client certificate: " & certPath)
+          if keyPath.len > 0:
+            if sslCtxSetDefaultPasswdCb != nil:
+              sslCtxSetDefaultPasswdCb(ctx.context, failPemPassphrase)
+            elif "ENCRYPTED" in config.sslKey:
+              # PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY" / PKCS#1 "Proc-Type:
+              # 4,ENCRYPTED". Without the callback an encrypted key would
+              # freeze the event loop on a TTY prompt (see failPemPassphrase).
+              raise newException(
+                IOError,
+                "client private key is passphrase-protected; " &
+                  "only unencrypted keys are supported",
+              )
+            if SSL_CTX_use_PrivateKey_file(
+              ctx.context, keyPath.cstring, SSL_FILETYPE_PEM
+            ) != 1:
+              raise newException(
+                IOError, formatSslError("Failed to load client private key")
+              )
+            if SSL_CTX_check_private_key(ctx.context) != 1:
+              raise
+                newException(IOError, "Client certificate and private key do not match")
+        except CatchableError as e:
+          raise newException(
+            PgConnectionError,
+            "Failed to load client certificate/key or CA: " & e.msg,
+            e,
+          )
+
+        # newContext has now copied the PEM bytes into the SslContext (OpenSSL
+        # decodes and stores them in memory). Drop the on-disk copies before
+        # the TLS handshake / connection attempt so a crash during negotiation
+        # cannot leave the client private key behind for another process on
+        # the same uid. The outer finally still runs for the newContext-failure
+        # path (tmpPaths retains entries only until this loop clears it).
+        for p in tmpPaths:
+          removeTempPem(p)
+        tmpPaths.setLen(0)
 
         # Advertise ALPN unconditionally (libpq 17 parity). The missing-symbol
         # path is only fatal for direct mode; traditional mode degrades to no-ALPN.
@@ -358,11 +493,11 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
             if derStr.len > 0:
               conn.serverCertDer = toBytes(derStr)
             else:
-              stderr.writeLine "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
+              warnStderr "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
           finally:
             X509_free(peerCert)
         else:
-          stderr.writeLine "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
+          warnStderr "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
       finally:
         # asyncnet doesn't free the SslContext (no =destroy on std/net's type).
         # SSL_new inside wrapConnectedSocket takes its own ref, so destroying
@@ -370,8 +505,12 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         # the SSL's copy — the socket's SSL_free drops that one on close.
         if ctx != nil:
           ctx.destroyContext()
-        if tmpPath.len > 0:
-          removeFile(tmpPath)
+        # Fallback cleanup for the newContext-failure path — on success we
+        # already removed the files above and cleared tmpPaths. Failures are
+        # surfaced (not silently dropped) because tmpPaths may contain the
+        # client private key PEM — leaving it around would be a footgun.
+        for p in tmpPaths:
+          removeTempPem(p)
     else:
       raise
         newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
@@ -382,8 +521,15 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
   ## is the name matched against the server certificate (libpq semantics: the
   ## entry's `host`, never `hostaddr`).
   # Defensive: connectToHost / perform already validate, but this proc is
-  # exported and may be called directly; the check is idempotent (no-op when
-  # sslnegotiation is not direct or sslmode is already strong enough).
+  # exported and may be called directly; the checks are idempotent.
+  # `validateClientCertConfig` also runs at the connect-time chokepoint in
+  # `wrapped()` (lifecycle.nim), but is re-invoked here so direct callers of
+  # `negotiateSSL` cannot bypass the mTLS pairing check — otherwise chronos
+  # would silently drop a lone `sslCert` while asyncdispatch errors out.
+  try:
+    validateClientCertConfig(config)
+  except PgError as e:
+    raise newException(PgConnectionError, e.msg, e)
   validateDirectSslCompatible(config)
   if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:
     # Both backends silently fall back to a Web PKI store (chronos:
@@ -398,6 +544,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     raise newException(
       PgConnectionError, "A host name must be specified for a verified SSL connection"
     )
+  # Pairing/sslmode compatibility is validated by `wrapped()` (connect-time
+  # chokepoint) and defensively again at the top of this proc.
 
   if config.sslNegotiation == sslnDirect:
     await establishTls(conn, config, sslHost)
@@ -456,6 +604,9 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     # WARNING: This is vulnerable to MITM downgrade attacks. A network
     # attacker can intercept the SSLRequest and reply 'N' to force
     # plaintext. Use sslRequire or stronger if security is needed.
-    stderr.writeLine "pg_connection: SSL refused by server, falling back to plaintext (sslmode=prefer)"
+    warnStderr "pg_connection: SSL refused by server, falling back to plaintext (sslmode=prefer)"
+    if config.sslCert.len > 0:
+      # Make the silent mTLS drop observable on the plaintext fallback.
+      warnStderr "pg_connection: client certificate will NOT be sent over the plaintext fallback connection"
   else:
     raise newException(PgConnectionError, "Unexpected SSL response: " & $respChar)
