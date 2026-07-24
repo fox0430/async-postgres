@@ -15,6 +15,11 @@ suite "configureKeepalive":
     doAssert fd != SocketHandle(-1), "socket() failed"
     fd
 
+  proc keepaliveEnabled(fd: SocketHandle): bool =
+    # macOS/BSD getsockopt returns the SO_KEEPALIVE flag bit (8), Linux returns 1,
+    # so treat any non-zero value as "enabled".
+    getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) != 0
+
   test "keepAlive=false does not set SO_KEEPALIVE":
     let fd = makeSocket()
     defer:
@@ -22,7 +27,7 @@ suite "configureKeepalive":
     var config = ConnConfig()
     config.keepAlive = false
     configureKeepalive(fd, config)
-    check getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) == 0
+    check not keepaliveEnabled(fd)
 
   test "keepAlive=true sets SO_KEEPALIVE":
     let fd = makeSocket()
@@ -31,7 +36,7 @@ suite "configureKeepalive":
     var config = ConnConfig()
     config.keepAlive = true
     configureKeepalive(fd, config)
-    check getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) == 1
+    check keepaliveEnabled(fd)
 
   test "keepAlive with idle/interval/count":
     let fd = makeSocket()
@@ -43,7 +48,7 @@ suite "configureKeepalive":
     config.keepAliveInterval = 7
     config.keepAliveCount = 3
     configureKeepalive(fd, config)
-    check getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) == 1
+    check keepaliveEnabled(fd)
     when defined(linux):
       check getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE) == 42
       check getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPINTVL) == 7
@@ -63,7 +68,7 @@ suite "configureKeepalive":
     config.keepAliveInterval = 0
     config.keepAliveCount = 0
     configureKeepalive(fd, config)
-    check getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) == 1
+    check keepaliveEnabled(fd)
 
   test "keepAlive=false with timing params does not set SO_KEEPALIVE":
     let fd = makeSocket()
@@ -75,7 +80,7 @@ suite "configureKeepalive":
     config.keepAliveInterval = 10
     config.keepAliveCount = 3
     configureKeepalive(fd, config)
-    check getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) == 0
+    check not keepaliveEnabled(fd)
 
   test "partial timing (idle only)":
     let fd = makeSocket()
@@ -85,7 +90,7 @@ suite "configureKeepalive":
     config.keepAlive = true
     config.keepAliveIdle = 99
     configureKeepalive(fd, config)
-    check getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) == 1
+    check keepaliveEnabled(fd)
     when defined(linux):
       check getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE) == 99
     elif defined(macosx):
