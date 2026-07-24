@@ -593,6 +593,88 @@ suite "SSL negotiation - sslVerifyCa":
     let config = ConnConfig()
     check config.sslRootCert == ""
 
+  test "ConnConfig sslCert and sslKey default to empty":
+    let config = ConnConfig()
+    check config.sslCert == ""
+    check config.sslKey == ""
+
+suite "initConnConfig client certificate validation":
+  test "sslCert without sslKey is rejected":
+    expect PgError:
+      discard initConnConfig(sslMode = sslRequire, sslCert = "dummy")
+
+  test "sslKey without sslCert is rejected":
+    expect PgError:
+      discard initConnConfig(sslMode = sslRequire, sslKey = "dummy")
+
+  test "sslCert/sslKey with sslDisable is rejected":
+    expect PgError:
+      discard initConnConfig(sslMode = sslDisable, sslCert = "cert", sslKey = "key")
+
+  test "sslCert/sslKey with sslAllow is rejected":
+    expect PgError:
+      discard initConnConfig(sslMode = sslAllow, sslCert = "cert", sslKey = "key")
+
+  test "sslCert/sslKey with sslPrefer is accepted":
+    let cfg = initConnConfig(sslMode = sslPrefer, sslCert = "cert", sslKey = "key")
+    check cfg.sslCert == "cert"
+    check cfg.sslKey == "key"
+
+  test "sslCert/sslKey with sslRequire is accepted":
+    let cfg = initConnConfig(sslMode = sslRequire, sslCert = "cert", sslKey = "key")
+    check cfg.sslCert == "cert"
+    check cfg.sslKey == "key"
+
+suite "Client certificate config validation":
+  # `connect()` now validates cert/key pairing before dialing, so these tests
+  # no longer need a mock server — the failure fires client-side.
+  test "providing only sslCert raises PgConnectionError":
+    var raised = false
+    var msgMatches = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 1,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslCert: "dummy",
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgConnectionError as e:
+        raised = true
+        msgMatches = "sslcert and sslkey must be provided together" in e.msg
+
+    waitFor testBody()
+    check raised
+    check msgMatches
+
+  test "providing only sslKey raises PgConnectionError":
+    var raised = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 1,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslKey: "dummy",
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgConnectionError:
+        raised = true
+
+    waitFor testBody()
+    check raised
+
 suite "SSL negotiation - sslAllow":
   test "sslAllow connects without SSL when server accepts plaintext":
     var connState: PgConnState

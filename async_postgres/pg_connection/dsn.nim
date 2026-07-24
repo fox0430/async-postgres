@@ -8,6 +8,8 @@
 ## (in particular, does not touch `PgConnection`).
 
 import std/strutils
+when defined(posix):
+  import std/posix
 
 import ../[async_backend, pg_errors]
 import types
@@ -180,6 +182,66 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
           parsePort(p),
     )
 
+when defined(posix):
+  proc openRegularFile(path, label: string): tuple[f: File, st: Stat] =
+    ## Open `path` as a File, guaranteeing it is a regular file without
+    ## blocking on FIFO/device paths. Opens with `O_NONBLOCK` first (so the
+    ## kernel returns immediately even for a FIFO with no writer), fstats the
+    ## resulting fd to enforce `S_ISREG`, then clears `O_NONBLOCK` on the fd
+    ## before wrapping it in a `File`. Sharing the fd across the type check and
+    ## the read closes the TOCTOU window a separate `stat()`+`open()` would
+    ## leave open when the file lives in an attacker-writable directory.
+    ## Caller must `close(result.f)`.
+    let fd = posix.open(path, O_RDONLY or O_NONBLOCK or O_CLOEXEC)
+    if fd < 0:
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
+    if fstat(fd, result.st) != 0:
+      discard close(fd)
+      raise newException(PgError, "Cannot stat " & label & " file: " & path)
+    if not S_ISREG(result.st.st_mode):
+      discard close(fd)
+      raise newException(
+        PgError, label & " file is not a regular file, refusing to use: " & path
+      )
+    let flags = fcntl(fd, F_GETFL)
+    if flags == -1 or fcntl(fd, F_SETFL, flags and not O_NONBLOCK) == -1:
+      discard close(fd)
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
+    if not open(result.f, fd, fmRead):
+      discard close(fd)
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
+
+proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
+  ## Read a PEM parameter file (sslrootcert/sslcert/sslkey), wrapping the
+  ## stdlib `IOError` into a `PgError` with the parameter name. An empty file
+  ## is rejected: it would silently fall through the callers' `.len > 0`
+  ## guards. With `checkKeyPerms` (sslkey), any group or world permission bit
+  ## is rejected — intentionally stricter than libpq, which permits `0o640`
+  ## for root-owned keys. No permission check off-POSIX (libpq also skips it
+  ## on Windows).
+  when defined(posix):
+    let opened = openRegularFile(path, label)
+    try:
+      if checkKeyPerms and (opened.st.st_mode.int and (S_IRWXG or S_IRWXO).int) != 0:
+        raise newException(
+          PgError,
+          label & " file has group or world accessible permissions, refusing to use: " &
+            path,
+        )
+      try:
+        result = readAll(opened.f)
+      except IOError:
+        raise newException(PgError, "Cannot read " & label & " file: " & path)
+    finally:
+      close(opened.f)
+  else:
+    try:
+      result = readFile(path)
+    except IOError:
+      raise newException(PgError, "Cannot read " & label & " file: " & path)
+  if result.len == 0:
+    raise newException(PgError, label & " file is empty: " & path)
+
 proc rawHost(host, hostaddr: string): string =
   ## Inverse of `buildHosts`' defaulting: 127.0.0.1 with no hostaddr can only
   ## come from an entry where neither was provided, so fold it back to "".
@@ -278,10 +340,14 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       else:
         seconds(secs)
   of "sslrootcert":
-    try:
-      result.sslRootCert = readFile(val)
-    except IOError:
-      raise newException(PgError, "Cannot read sslrootcert file: " & val)
+    result.sslRootCert = readPemFileParam(val, "sslrootcert")
+  of "sslcert", "sslkey":
+    # The sslmode-compatibility check is deferred to `validateClientCertConfig`:
+    # a field-by-field `applyParam` caller may set sslcert before sslmode.
+    if key == "sslcert":
+      result.sslCert = readPemFileParam(val, "sslcert")
+    else:
+      result.sslKey = readPemFileParam(val, "sslkey", checkKeyPerms = true)
   of "sslsni":
     try:
       result.sslSni = parseInt(val) != 0
@@ -435,6 +501,7 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
   result.host = result.hosts[0].displayHost
   result.hostaddr = result.hosts[0].hostaddr
   result.port = result.hosts[0].port
+  validateClientCertConfig(result)
 
 proc pctDecode(s: string): string =
   ## Percent-decode a URI component following libpq rules: strict ``%XX``
@@ -553,7 +620,6 @@ proc parseUriDsn*(dsn: string): ConnConfig =
           hostList.add pctDecode(part)
           portList.add ""
 
-  # Parse query parameters
   if queryStr.len > 0:
     for pair in queryStr.split('&'):
       let epos = pair.find('=')
@@ -577,6 +643,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   result.host = result.hosts[0].displayHost
   result.hostaddr = result.hosts[0].hostaddr
   result.port = result.hosts[0].port
+  validateClientCertConfig(result)
 
 proc initConnConfig*(
     host = "127.0.0.1",
@@ -587,6 +654,8 @@ proc initConnConfig*(
     database = "",
     sslMode = sslPrefer,
     sslRootCert = "",
+    sslCert = "",
+    sslKey = "",
     sslSni = true,
     channelBinding = cbPrefer,
     applicationName = "",
@@ -606,7 +675,7 @@ proc initConnConfig*(
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
-  ConnConfig(
+  result = ConnConfig(
     host: host,
     port: port,
     hostaddr: hostaddr,
@@ -616,6 +685,8 @@ proc initConnConfig*(
     sslMode: sslMode,
     sslNegotiation: sslNegotiation,
     sslRootCert: sslRootCert,
+    sslCert: sslCert,
+    sslKey: sslKey,
     sslSni: sslSni,
     channelBinding: channelBinding,
     applicationName: applicationName,
@@ -632,6 +703,7 @@ proc initConnConfig*(
     maxMessageSize: maxMessageSize,
     maxScramIterations: maxScramIterations,
   )
+  validateClientCertConfig(result)
 
 proc parseDsn*(dsn: string): ConnConfig =
   ## Parse a PostgreSQL connection string into a ConnConfig.
@@ -642,6 +714,6 @@ proc parseDsn*(dsn: string): ConnConfig =
   ##
   ## Both ``postgresql://`` and ``postgres://`` schemes are accepted for URI format.
   if dsn.startsWith("postgresql://") or dsn.startsWith("postgres://"):
-    parseUriDsn(dsn)
+    result = parseUriDsn(dsn)
   else:
-    parseKeyValueDsn(dsn)
+    result = parseKeyValueDsn(dsn)

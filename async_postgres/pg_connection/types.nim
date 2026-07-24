@@ -125,6 +125,16 @@ type
       ## `ConnConfig` matches because `sslnPostgres` is the enum's zero value,
       ## which is locked in by a `static:` assertion on `SslNegotiation`.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    sslCert*: string
+      ## PEM-encoded client certificate (and any intermediates) for mutual TLS.
+      ## Must be paired with ``sslKey``; ``sslMode`` must also be ``sslPrefer``
+      ## or stronger, otherwise TLS would not be negotiated and the credential
+      ## would be silently unused — config validation rejects that.
+    sslKey*: string
+      ## PEM-encoded client private key for mutual TLS. The key must be
+      ## **unencrypted** on both backends (no passphrase callback is wired up).
+      ## On chronos/BearSSL specifically it must be PKCS#8 (RSA or EC); PKCS#1
+      ## is not supported. Must be paired with ``sslCert``.
     sslSni*: bool
       ## Send TLS SNI extension during the handshake (libpq `sslsni`, default
       ## true). Applies to every mode that establishes TLS. Suppressed
@@ -708,7 +718,36 @@ declareAsyncCallback(
   "Callback supplying data chunks during streaming COPY IN. Return empty seq to finish.",
 )
 
-const RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
+const
+  RecvBufSize* = 131072 ## Size of the temporary read buffer for recv operations
+
+  ClientCertPairingErrorMsg* =
+    "sslcert and sslkey must be provided together for client certificate auth"
+    ## Shared so the wording can't drift between the config-time and
+    ## connect-time checks.
+
+proc warnStderr*(msg: string) =
+  ## Connection-path warnings must never fail the connection: stderr may be
+  ## closed or broken (e.g. daemonized process), so swallow the IOError.
+  try:
+    stderr.writeLine msg
+  except IOError:
+    discard
+
+proc validateClientCertConfig*(config: ConnConfig) =
+  ## Reject inconsistent client certificate configurations early (at config
+  ## build time, before any connection is opened). Both halves of an mTLS
+  ## credential must be present together, and the SSL mode must actually
+  ## negotiate TLS — otherwise the cert/key would be silently ignored.
+  if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
+    raise newException(PgError, ClientCertPairingErrorMsg)
+  if (config.sslCert.len > 0 or config.sslKey.len > 0) and
+      config.sslMode in {sslDisable, sslAllow}:
+    raise newException(
+      PgError,
+      "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
+        "); they would otherwise be silently unused",
+    )
 
 # HostEntry accessors
 

@@ -1,6 +1,26 @@
-import std/[random, unittest]
+import std/[random, unittest, os, tempfiles]
+when defined(posix):
+  import std/posix
 
 import ../async_postgres/[async_backend, pg_connection]
+
+const dummyPem = "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n"
+
+proc writeKeyFile(content: string, mode: int = 0o600): string =
+  ## Create a temp file holding ``content`` with the requested POSIX mode and
+  ## return its path. Caller is responsible for removing it.
+  let (f, p) = createTempFile("pg_test_key_", ".pem")
+  f.write(content)
+  f.close()
+  when defined(posix):
+    discard chmod(cstring(p), Mode(mode))
+  p
+
+proc writePemFile(content: string): string =
+  let (f, p) = createTempFile("pg_test_pem_", ".pem")
+  f.write(content)
+  f.close()
+  p
 
 suite "parseDsn":
   test "full DSN":
@@ -459,6 +479,14 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslsni=bogus")
 
+  test "error: sslcert file not found":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslcert=/nonexistent/file.pem")
+
+  test "error: sslkey file not found":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslkey=/nonexistent/file.pem")
+
   test "multi-host DSN":
     let cfg = parseDsn("postgresql://h1:5432,h2:5433/db")
     check cfg.hosts.len == 2
@@ -699,6 +727,87 @@ suite "parseDsn":
     check cfg.hosts[0] == HostEntry(host: "h1", port: 5432)
     check cfg.hosts[1] == HostEntry(host: "h2", port: 5433)
     check cfg.hosts[2] == HostEntry(host: "h3", port: 5432)
+
+  test "sslcert/sslkey loaded from valid files":
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    let dsn =
+      "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+    let cfg = parseDsn(dsn)
+    check cfg.sslCert == dummyPem
+    check cfg.sslKey == dummyPem
+
+  test "error: sslcert with sslmode=disable rejected":
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    expect PgError:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=disable&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+
+  test "error: sslcert with sslmode=allow rejected":
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    expect PgError:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=allow&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+
+  when defined(posix):
+    test "error: sslkey with group-readable permissions rejected":
+      let certPath = writePemFile(dummyPem)
+      let keyPath = writeKeyFile(dummyPem, 0o640)
+      defer:
+        removeFile(certPath)
+        removeFile(keyPath)
+      expect PgError:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" &
+            keyPath
+        )
+
+    test "error: sslkey with world-readable permissions rejected":
+      let certPath = writePemFile(dummyPem)
+      let keyPath = writeKeyFile(dummyPem, 0o604)
+      defer:
+        removeFile(certPath)
+        removeFile(keyPath)
+      expect PgError:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" &
+            keyPath
+        )
+
+    test "error: sslkey/sslcert FIFO rejected without blocking":
+      # Regression: readPrivateKeyFile / readPemFileParam used to `open()` the
+      # path before stat-checking, so a FIFO with no writer would block parseDsn
+      # indefinitely. Now we open with O_NONBLOCK and fstat-verify S_ISREG.
+      let certPath = writePemFile(dummyPem)
+      let fifoPath = getTempDir() / "pg_test_sslkey_fifo_" & $rand(1_000_000_000)
+      discard unlink(fifoPath.cstring)
+      doAssert mkfifo(fifoPath.cstring, 0o600.Mode) == 0
+      defer:
+        removeFile(certPath)
+        discard unlink(fifoPath.cstring)
+      expect PgError:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" &
+            fifoPath
+        )
+      expect PgError:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=require&sslcert=" & fifoPath & "&sslkey=" &
+            certPath
+        )
 
 suite "parseDsn keyword=value":
   test "full connection string":

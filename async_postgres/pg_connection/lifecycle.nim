@@ -267,6 +267,10 @@ proc connectToHost*(
     # parity: sslnegotiation is ignored for AF_UNIX). Certificate verification
     # must use the host *name*, never the dialed hostaddr, and must be per-entry:
     # with multi-host failover config.host only reflects the first entry.
+    if isUnix and config.sslCert.len > 0:
+      # Unix sockets skip TLS regardless of sslmode, so a configured client
+      # cert is silently dropped — warn like the sslPrefer 'N' fallback path.
+      warnStderr "pg_connection: client certificate will NOT be sent over Unix-socket connection (TLS is skipped for AF_UNIX)"
     if config.sslMode != sslDisable and not isUnix:
       await negotiateSSL(conn, config, entry.host)
 
@@ -645,6 +649,12 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     )
 
   proc wrapped(): Future[PgConnection] {.async.} =
+    # ConnConfig may be built or mutated without passing through the parsers'
+    # validation — re-check here so every connect path rejects bad cert config.
+    try:
+      validateClientCertConfig(config)
+    except PgError as e:
+      raise newException(PgConnectionError, e.msg, e)
     # Compute the ordered host list once so the trace and the actual connection
     # attempts see the same order under lbhRandom.
     let hosts = config.orderedHosts()
