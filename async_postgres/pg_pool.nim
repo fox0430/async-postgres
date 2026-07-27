@@ -352,10 +352,8 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
     conn.state = csClosed
     raise e
   except CatchableError:
-    try:
-      await pool.tracedClose(conn)
-    except CatchableError:
-      discard
+    # Defer close to releaseCore's closeNoWait to avoid double-counting metrics.
+    conn.state = csClosed
 
 proc computeConnectBackoff*(initial, maxDelay: Duration, failures: int): Duration =
   ## Exponential backoff for repeated connect failures: returns
