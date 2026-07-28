@@ -597,7 +597,7 @@ proc identifySystem*(
     info.dbName = row.getStr(3)
   return info
 
-proc decodeCreateSlotRow*(qr: QueryResult): ReplicationSlotInfo =
+proc decodeCreateSlotRow(qr: QueryResult): ReplicationSlotInfo =
   let row = initRow(qr.data, 0)
   result.slotName = row.getStr(0)
   result.consistentPoint = parseLsn(row.getStr(1))
