@@ -1758,7 +1758,7 @@ proc writeParamFormat*(buf: var seq[byte], v: string) =
   buf.addInt16(0'i16) # text
 
 proc writeParamFormat*(buf: var seq[byte], v: seq[byte]) =
-  buf.addInt16(0'i16)
+  buf.addInt16(1'i16) # binary — payload is raw bytes, not text-format bytea
 
 proc writeParamFormat*(buf: var seq[byte], v: PgNumeric) =
   buf.addInt16(0'i16)

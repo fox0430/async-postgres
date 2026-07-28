@@ -1664,6 +1664,26 @@ suite "E2E: queryDirect / execDirect":
 
     waitFor t()
 
+  test "queryDirect with seq[byte] bytea param roundtrip":
+    # Regression: writeParamFormat(seq[byte]) formerly declared format=0 (text)
+    # while writeParamValue wrote raw bytes, so PG rejected any payload that
+    # was not valid text-format bytea (0xFF, backslash-prefixed patterns, ...).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let cases: seq[seq[byte]] = @[
+        @[0x00'u8, 0xDE, 0xAD, 0xBE, 0xEF, 0xFF],
+        @[0x5C'u8, 0x5C], # backslash escapes
+        @[0x5C'u8, 0x78, 0x61, 0x62], # \xab pattern
+        @[], # empty
+      ]
+      for input in cases:
+        let qr = await conn.queryDirect("SELECT $1::bytea", input)
+        doAssert qr.rowCount == 1
+        doAssert qr.rows[0].getBytes(0) == input
+      await conn.close()
+
+    waitFor t()
+
   test "queryDirect with multiple params":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
