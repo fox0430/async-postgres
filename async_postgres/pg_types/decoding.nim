@@ -917,6 +917,8 @@ proc parseTextArray*(s: string): seq[Option[string]] =
         else:
           elem.add(inner[i])
         i += 1
+      if i >= inner.len:
+        raise newException(PgTypeError, "array: unterminated quoted element")
       i += 1 # skip closing quote
       result.add(some(elem))
     else:
