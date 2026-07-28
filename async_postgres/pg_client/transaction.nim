@@ -539,8 +539,9 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
     body = args[0]
     spTimeout = bindSym"ZeroDuration"
   of 2:
-    if args[0].kind == nnkStrLit:
+    if args[0].kind in {nnkStrLit, nnkTripleStrLit, nnkRStrLit}:
       # conn.withSavepoint("name"): body
+      # (also raw and triple-quoted string literals)
       spName = args[0]
       body = args[1]
       spTimeout = bindSym"ZeroDuration"
