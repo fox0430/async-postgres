@@ -871,6 +871,7 @@ proc resetReplLsnTracking(conn: PgConnection, startLsn: Lsn) =
   ## advances only via ``confirmFlushed``; the max-received position advances as
   ## ``XLogData`` arrives and bounds what ``confirmFlushed`` will accept.
   conn.initReplLsnTracking(startLsn.toUInt64)
+  conn.replCopyDoneSent = false
 
 proc replFillRecvBuf(
     conn: PgConnection,
@@ -1082,14 +1083,19 @@ proc runReplicationStream(
             move(msg.copyData), autoKeepaliveReply, callback, lastStatusSent
           )
         of bmkCopyDone:
-          # Mirror stopReplication: flush the latest confirmed position before
-          # returning CopyDone, so a server-initiated stop (walsender timeout,
-          # pg_terminate_backend, slot drop) still delivers the final ACK.
-          try:
-            await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
-          except CatchableError:
-            discard
-          await conn.sendMsg(@copyDoneMsg)
+          # Mirror only on server-initiated stop (walsender timeout,
+          # pg_terminate_backend, slot drop). If the client already sent
+          # CopyDone via stopReplication, a second one would land after the
+          # server left COPY mode -> "invalid frontend message type".
+          if not conn.replCopyDoneSent:
+            try:
+              await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+            except CancelledError as e:
+              raise e
+            except CatchableError:
+              discard
+            conn.replCopyDoneSent = true
+            await conn.sendMsg(@copyDoneMsg)
           break recvLoop
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
@@ -1313,6 +1319,7 @@ proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
         ")",
     )
   await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+  conn.replCopyDoneSent = true
   await conn.sendMsg(@copyDoneMsg)
 
 proc startPhysicalReplication*(

@@ -458,6 +458,67 @@ suite "Replication: callback exception invalidates the connection":
     check poisonRaised
     check poisonFinalState == csClosed
 
+var stopFrontendMsgs: seq[char]
+
+suite "Replication: client-initiated stop":
+  test "stopReplication does not double-send CopyDone":
+    # Regression: the recv-loop `bmkCopyDone` handler used to mirror the
+    # server's CopyDone unconditionally, so after stopReplication the client
+    # sent [status, CopyDone] twice. The second CopyDone arrives after the
+    # server has left COPY mode and would be `invalid frontend message type`.
+    stopFrontendMsgs.setLen(0)
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        await sendBytes(st, buildCopyBothResponse())
+        # stopReplication first flushes a Standby Status ('d'), then CopyDone ('c').
+        let m1 = await drainFrontendMessage(st)
+        let m2 = await drainFrontendMessage(st)
+        {.cast(gcsafe).}:
+          stopFrontendMsgs.add(m1.msgType)
+          stopFrontendMsgs.add(m2.msgType)
+        var tail: seq[byte]
+        tail.add(buildCopyDone())
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        # After ReadyForQuery only Terminate ('X') from conn.close is expected.
+        # A pre-fix client would send another 'd' then 'c' here.
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          {.cast(gcsafe).}:
+            stopFrontendMsgs.add(m.msgType)
+          if m.msgType == 'X':
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        discard msg
+
+      proc stopper() {.async.} =
+        while conn.state != csReplicating:
+          await sleepAsync(milliseconds(1))
+        await conn.stopReplication()
+
+      let stopFut = stopper()
+      await conn.startReplication("test_slot", callback = cb)
+      await stopFut
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check stopFrontendMsgs == @['d', 'c', 'X']
+
 when hasChronos:
   suite "Replication: idle wakeup rate":
     test "statusInterval + autoKeepaliveReply=false does not busy-spin while idle":
