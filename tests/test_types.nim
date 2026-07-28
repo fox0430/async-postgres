@@ -2100,6 +2100,31 @@ suite "parseTextArray":
       raised = true
     check raised
 
+  test "unterminated quoted element raises":
+    var raised = false
+    try:
+      discard parseTextArray("{\"abc}")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "unterminated quoted element after valid element raises":
+    var raised = false
+    try:
+      discard parseTextArray("{\"ok\",\"abc}")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "unterminated quoted element with trailing backslash raises":
+    var raised = false
+    try:
+      # trailing '\\' consumes final '"' as an escape, so quote is unterminated
+      discard parseTextArray("{\"abc\\\"}")
+    except PgTypeError:
+      raised = true
+    check raised
+
 suite "Array row accessors":
   test "getIntArray":
     let row: Row = @[some(toBytes("{1,2,3}"))]

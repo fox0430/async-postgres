@@ -797,6 +797,37 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  test "withSavepoint accepts raw and triple-quoted string literal names":
+    # Regression: the two-arg overload used to match only nnkStrLit, so raw
+    # and triple-quoted names fell into the (timeout, body) branch and failed
+    # to compile.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp_lit_kinds")
+      discard await conn.exec(
+        "CREATE TABLE test_sp_lit_kinds (id serial PRIMARY KEY, val text)"
+      )
+
+      conn.withTransaction:
+        conn.withSavepoint(r"sp_raw"):
+          discard await conn.exec(
+            "INSERT INTO test_sp_lit_kinds (val) VALUES ($1)", @[toPgParam("raw")]
+          )
+        conn.withSavepoint("""sp_triple"""):
+          discard await conn.exec(
+            "INSERT INTO test_sp_lit_kinds (val) VALUES ($1)", @[toPgParam("triple")]
+          )
+
+      let res = await conn.query("SELECT val FROM test_sp_lit_kinds ORDER BY id")
+      doAssert res.rows.len == 2
+      doAssert res.rows[0].getStr(0) == "raw"
+      doAssert res.rows[1].getStr(0) == "triple"
+
+      discard await conn.exec("DROP TABLE test_sp_lit_kinds")
+      await conn.close()
+
+    waitFor t()
+
   test "withTransaction rejects return at compile time":
     doAssert not compiles(
       block:

@@ -362,6 +362,11 @@ type
       ## timer wakes; reading into this private buffer (instead of growing
       ## `recvBuf` up front like `fillRecvBuf`) keeps `recvBuf` parseable while
       ## that read is still pending. Allocated lazily to `RecvBufSize` and reused.
+    replCopyDoneSent*: bool
+      ## Set by `stopReplication`; recv loop skips its mirroring CopyDone when
+      ## the client already sent one. A second 'c' arrives after the server left
+      ## COPY mode and would be `invalid frontend message type`. Reset per
+      ## stream by `resetReplLsnTracking`.
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
