@@ -1090,8 +1090,8 @@ proc runReplicationStream(
           if not conn.replCopyDoneSent:
             try:
               await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
-            except CancelledError:
-              raise
+            except CancelledError as e:
+              raise e
             except CatchableError:
               discard
             conn.replCopyDoneSent = true
