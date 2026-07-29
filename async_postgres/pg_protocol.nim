@@ -1020,7 +1020,8 @@ proc reuseRowData*(
     colTypeOids: sink seq[int32],
 ): RowData =
   ## Create a new RowData that takes over the old buffer's capacity via move.
-  ## The old RowData (and any QueryResult still referencing it) is left intact.
+  ## `rd` remains a valid ref but its `buf`/`cellIndex` are emptied — callers
+  ## still holding `rd` must not read row data through it after this call.
   result = RowData(
     buf: move rd.buf,
     cellIndex: move rd.cellIndex,
@@ -1033,7 +1034,9 @@ proc reuseRowData*(
 
 proc reuseRowData*(rd: RowData, numCols: int16): RowData =
   ## Create a new RowData that takes over the old buffer's capacity via move,
-  ## without format metadata.
+  ## without format metadata. `rd` remains a valid ref but its
+  ## `buf`/`cellIndex`/`colFormats`/`colTypeOids` are emptied — callers still
+  ## holding `rd` must not read row data or formats through it after this call.
   result = RowData(
     buf: move rd.buf,
     cellIndex: move rd.cellIndex,
