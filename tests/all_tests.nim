@@ -7,5 +7,6 @@ import
   test_keepalive, test_largeobject, test_listen_reconnect, test_network_failure,
   test_physical_replication, test_pool, test_protocol, test_protocol_fuzz,
   test_replication, test_replication_keepalive, test_rowdata, test_saslprep,
-  test_session_attrs, test_sql, test_ssl, test_tracing, test_types, test_pool_cluster
+  test_session_attrs, test_sql, test_ssl, test_tracing, test_transaction_cancel,
+  test_types, test_pool_cluster
 {.pop.}
