@@ -724,8 +724,6 @@ proc parseMultirangeText*[T](
   for i in 0 ..< inner.len:
     case inner[i]
     of '[', '(':
-      if depth == 0 and i > start:
-        discard
       depth += 1
     of ']', ')':
       depth -= 1
@@ -733,9 +731,11 @@ proc parseMultirangeText*[T](
         let rangeStr = inner[start .. i]
         ranges.add(parseRangeText[T](rangeStr, parseElem))
         start = i + 1
-        # Skip comma
+        # Skip comma and following whitespace
         if start < inner.len and inner[start] == ',':
           start += 1
+          while start < inner.len and inner[start] == ' ':
+            start += 1
     else:
       # Handle "empty" ranges inside multirange
       if depth == 0 and i == start and inner.len >= start + 5 and
@@ -744,6 +744,8 @@ proc parseMultirangeText*[T](
         start = start + 5
         if start < inner.len and inner[start] == ',':
           start += 1
+          while start < inner.len and inner[start] == ' ':
+            start += 1
   PgMultirange[T](ranges)
 
 proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =
