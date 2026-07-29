@@ -1082,7 +1082,9 @@ proc toPgBinaryParam*(v: PgBox): PgParam =
 
 proc toPgBinaryParam*(v: PgPath): PgParam =
   ## Binary format: closed(1) + npts(4) + points(npts \* 16).
-  var data = newSeq[byte](1 + 4 + v.points.len * 16)
+  let size = 1'i64 + 4'i64 + v.points.len.int64 * 16'i64
+  checkPgBinPayload(size, "path")
+  var data = newSeq[byte](size.int)
   data[0] = if v.closed: 1'u8 else: 0'u8
   data.writeBE32(1, int32(v.points.len))
   for i, p in v.points:
@@ -1091,7 +1093,9 @@ proc toPgBinaryParam*(v: PgPath): PgParam =
 
 proc toPgBinaryParam*(v: PgPolygon): PgParam =
   ## Binary format: npts(4) + points(npts \* 16).
-  var data = newSeq[byte](4 + v.points.len * 16)
+  let size = 4'i64 + v.points.len.int64 * 16'i64
+  checkPgBinPayload(size, "polygon")
+  var data = newSeq[byte](size.int)
   data.writeBE32(0, int32(v.points.len))
   for i, p in v.points:
     data.writePointAt(4 + i * 16, p)
