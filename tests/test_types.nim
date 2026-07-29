@@ -5245,6 +5245,26 @@ suite "Multirange text parsing":
     )
     check parsed == orig
 
+  test "parse multirange with spaces after comma":
+    let mr = parseMultirangeText[int32](
+      "{[1,2), [3,4)}",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check mr.len == 2
+    check mr[0] == rangeOf(1'i32, 2'i32)
+    check mr[1] == rangeOf(3'i32, 4'i32)
+
+  test "parse multirange with empty and spaces":
+    let mr = parseMultirangeText[int32](
+      "{empty, [3,4)}",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check mr.len == 2
+    check mr[0].isEmpty
+    check mr[1] == rangeOf(3'i32, 4'i32)
+
 suite "Multirange row getters":
   test "getInt4Multirange text":
     let row: Row = @[some(toBytes("{[1,3),[5,8)}"))]
