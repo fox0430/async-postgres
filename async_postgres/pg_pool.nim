@@ -1837,6 +1837,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
+  let cancelSym = genSym(nskLet, "cancel")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
   result = quote:
@@ -1847,6 +1848,9 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
       try:
         `body`
         discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
+      except CancelledError as `cancelSym`:
+        # Skip cleanup on cancel; a fresh await would just re-cancel.
+        raise `cancelSym`
       except CatchableError as `eSym`:
         `bodyCleanup`
         raise `eSym`
@@ -1986,6 +1990,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
   let eSym = genSym(nskLet, "e")
+  let cancelSym = genSym(nskLet, "cancel")
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "poolTxBodyDeadline")
@@ -2022,6 +2027,9 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
           discard await `connIdent`.simpleExec(
             "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
           )
+        except CancelledError as `cancelSym`:
+          # Skip ROLLBACK on body-cancel; the outer handler aborts server-side.
+          raise `cancelSym`
         except CatchableError as `eSym`:
           `bodyCleanup`
           raise `eSym`
@@ -2120,6 +2128,7 @@ macro withTransactionRetryDeadline*(
   let poolSym = genSym(nskLet, "pool")
   let retryOptsSym = genSym(nskLet, "retryOpts")
   let eSym = genSym(nskLet, "e")
+  let cancelSym = genSym(nskLet, "cancel")
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "poolTxBodyRetryDeadline")
@@ -2176,6 +2185,9 @@ macro withTransactionRetryDeadline*(
           discard await `connIdent`.simpleExec(
             "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
           )
+        except CancelledError as `cancelSym`:
+          # See withTransactionDeadline — skip ROLLBACK on body-cancel.
+          raise `cancelSym`
         except CatchableError as `eSym`:
           `bodyCleanup`
           raise `eSym`

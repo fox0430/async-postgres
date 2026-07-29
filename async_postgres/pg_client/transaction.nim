@@ -126,8 +126,9 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   ## (reporting both via `onCleanupSkipped`), otherwise ROLLBACK with
   ## `rollbackTimeout` as the per-call timeout and report a swallowed failure.
   ##
-  ## A cancelled ROLLBACK is reported *and* re-raised so cancellation isn't
-  ## swallowed by the generic handler.
+  ## Cancelled and plain-failure ROLLBACKs are both reported and swallowed so
+  ## the enclosing `except` can re-raise the original body error — re-raising
+  ## the cancel would surface a fresh chronos `CancelledError` and mask it.
   let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
   let csReadySym = bindSym"csReady"
@@ -146,7 +147,6 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
         `fireCleanupSkippedSym`(
           `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupCancelSym`
         )
-        raise `cleanupCancelSym`
       except CatchableError as `cleanupErrSym`:
         `fireCleanupSkippedSym`(
           `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
@@ -162,6 +162,8 @@ proc buildSavepointRollbackCleanup*(
   ## SAVEPOINT with `rollbackTimeout` as the per-call timeout and report a
   ## swallowed failure. The caller binds `spNameSym` (already quoted via
   ## `quoteIdentifier`) in the surrounding scope.
+  ##
+  ## Cancelled cleanup is swallowed as in `buildRollbackCleanup`.
   let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
   let csReadySym = bindSym"csReady"
@@ -182,7 +184,6 @@ proc buildSavepointRollbackCleanup*(
         `fireCleanupSkippedSym`(
           `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupCancelSym`
         )
-        raise `cleanupCancelSym`
       except CatchableError as `cleanupErrSym`:
         `fireCleanupSkippedSym`(
           `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
@@ -205,8 +206,11 @@ proc buildDeadlineAwaitAndTimeout*(
   ## state — `finished()` would treat that as "done" and skip the
   ## invalidate-and-raise path. See the matching note in pg_pool's
   ## withTransactionDeadline.
+  ##
+  ## Cancellation skips `catchableCleanup` — a fresh await would just re-cancel.
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let eSym = genSym(nskLet, "e")
+  let cancelSym = genSym(nskLet, "cancel")
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let reasonLit = newStrLitNode(reason)
@@ -219,6 +223,8 @@ proc buildDeadlineAwaitAndTimeout*(
         discard
       else:
         `connSym`.invalidateOnTimeout(`reasonLit`)
+    except CancelledError as `cancelSym`:
+      raise `cancelSym`
     except CatchableError as `eSym`:
       `catchableCleanup`
       raise `eSym`
@@ -410,6 +416,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
+  let cancelSym = genSym(nskLet, "cancel")
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   result = quote:
     let `connSym` = `connExpr`
@@ -418,6 +425,9 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
+    except CancelledError as `cancelSym`:
+      # Skip cleanup on cancel; a fresh await would just re-cancel.
+      raise `cancelSym`
     except CatchableError as `eSym`:
       `bodyCleanup`
       raise `eSym`
@@ -565,6 +575,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
+  let cancelSym = genSym(nskLet, "cancel")
   let spNameSym = genSym(nskLet, "spName")
   let quoteIdentSym = bindSym"quoteIdentifier"
 
@@ -584,6 +595,9 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
       discard await `connSym`.simpleExec(
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
       )
+    except CancelledError as `cancelSym`:
+      # See withTransaction — never run cleanup on cancellation.
+      raise `cancelSym`
     except CatchableError as `eSym`:
       `spCleanup`
       raise `eSym`
