@@ -20,10 +20,11 @@
 ## re-LISTEN loop is a no-op, isolating the buffer copy, and assert the pairing
 ## invariant directly — deterministic, no timing dependence on either backend.
 
-import std/[unittest, sets, strutils]
+import std/[monotimes, unittest, sets, strutils]
 
 import ../async_postgres/async_backend
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/types {.all.}
 
 import ./mock_pg_server
 
@@ -565,3 +566,452 @@ suite "listenPump async ErrorResponse":
     check errored
     check reconnectionAttempted
     check finalState == csClosed
+
+## Regression: with the listen pump parked inside a blocking `connect()`,
+## asyncdispatch `close()` must return bounded instead of hanging on `await
+## pump`, and `reconnectInPlace` must discard the freshly built transport rather
+## than grafting it onto an already-closed `conn`.
+
+suite "close during reconnect":
+  test "close returns bounded and reconnectInPlace discards newConn on stop":
+    var closeReturned = false
+    var closedInBounded = false
+    var stateAfterClose: PgConnState
+    var taskNilAfterClose = false
+    var pumpFinishedEventually = false
+    var stateAfterSettle: PgConnState
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+      let sc2Accepted = newFuture[void]("sc2Accepted")
+      let closeCompleted = newFuture[void]("closeCompleted")
+
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1) # LISTEN "x"
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        await pumpStarted
+        await closeClient(sc1)
+        # Accept the reconnect dial (TCP-level) but withhold the startup response
+        # so the pump is parked inside connect().
+        sc2 = await ms.accept()
+        sc2Accepted.complete()
+        # Release the handshake only after close() has finished, so the pump's
+        # connect() returns into reconnectInPlace's post-connect stop-check.
+        await closeCompleted
+        try:
+          await drainStartupMessage(sc2)
+          await sendFullHandshake(sc2)
+          # Answer the re-LISTEN too: if newConn were grafted, the pump reaches
+          # csListening instead of hanging, so the assertion below fails loudly.
+          discard await drainFrontendMessage(sc2) # re-LISTEN "x"
+          await sendBytes(sc2, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+
+      let saved = listenReconnectStopWaitMs
+      listenReconnectStopWaitMs = 300
+      defer:
+        listenReconnectStopWaitMs = saved
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.listenReconnectMaxAttempts = 0
+      conn.listenReconnectMaxBackoff = 1
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      await sc2Accepted.wait(seconds(10))
+
+      # Capture the pump future before close() nils listenTask; its `finished`
+      # is the direct signal of pump exit after the handshake is released.
+      let pumpFut = conn.listenTask
+
+      let t0 = getMonoTime()
+      let closeFut = conn.close()
+      try:
+        await closeFut.wait(seconds(5))
+        closeReturned = true
+      except CatchableError:
+        discard
+      let elapsedNs = getMonoTime().ticks - t0.ticks
+      closedInBounded = elapsedNs < 2_000_000_000
+      stateAfterClose = conn.state
+      taskNilAfterClose = conn.listenTask.isNil
+      closeCompleted.complete()
+
+      # Let the mock finish the handshake, then poll pumpFut.finished directly.
+      var spins = 0
+      while not pumpFut.finished and spins < 5000:
+        inc spins
+        await sleepAsync(milliseconds(2))
+      pumpFinishedEventually = pumpFut.finished
+
+      # Re-sample after settle: grafting newConn would move csClosed → csReady →
+      # csListening; the post-connect stop-check must leave it csClosed.
+      stateAfterSettle = conn.state
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await closeClient(sc2)
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check closeReturned
+    check closedInBounded
+    check stateAfterClose == csClosed
+    check taskNilAfterClose
+    check pumpFinishedEventually
+    # Core assertion: newConn was discarded, not grafted (else csListening).
+    check stateAfterSettle == csClosed
+
+  test "stopListening timeout raises PgTimeoutError, marks csClosed, preserves flag":
+    # Same mock shape as the close test above, but stopping via stopListening():
+    # the bounded wait must raise PgTimeoutError, mark csClosed, nil listenTask
+    # (so a follow-up close() does not re-wait the orphan), and keep
+    # listenStopRequested set so the orphan's post-connect check stays armed.
+    var raisedPgTimeout = false
+    # Only asyncdispatch has the bounded wait; chronos exits via cancellation.
+    when hasAsyncDispatch:
+      var msgHasStopListening = false
+      var flagPreserved = false
+      var taskNilAfterRaise = false
+      var stateAfterRaise: PgConnState
+
+    proc testBody() {.async.} =
+      var stopMsg = ""
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+      let sc2Accepted = newFuture[void]("sc2Accepted")
+      let stopReturned = newFuture[void]("stopReturned")
+
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1)
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        await pumpStarted
+        await closeClient(sc1)
+        sc2 = await ms.accept()
+        sc2Accepted.complete()
+        # Release the handshake only after stopListening returned, so the pump's
+        # connect() unwinds into the stop-check with the orphan already detached.
+        await stopReturned
+        try:
+          await drainStartupMessage(sc2)
+          await sendFullHandshake(sc2)
+          discard await drainFrontendMessage(sc2)
+          await sendBytes(sc2, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+
+      let saved = listenReconnectStopWaitMs
+      listenReconnectStopWaitMs = 300
+      defer:
+        listenReconnectStopWaitMs = saved
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.listenReconnectMaxAttempts = 0
+      conn.listenReconnectMaxBackoff = 1
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      await sc2Accepted.wait(seconds(10))
+
+      let pumpFut = conn.listenTask
+      try:
+        await conn.stopListening().wait(seconds(5))
+      except PgTimeoutError as e:
+        raisedPgTimeout = true
+        stopMsg = e.msg
+      except CatchableError:
+        discard
+      when hasAsyncDispatch:
+        flagPreserved = conn.listenStopRequested
+        taskNilAfterRaise = conn.listenTask.isNil
+        stateAfterRaise = conn.state
+        msgHasStopListening = "stopListening" in stopMsg
+      stopReturned.complete()
+
+      # Drain the orphan so tear-down doesn't leave a live future dangling.
+      var spins = 0
+      while not pumpFut.finished and spins < 5000:
+        inc spins
+        await sleepAsync(milliseconds(2))
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      try:
+        await closeClient(sc2)
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    when hasAsyncDispatch:
+      check raisedPgTimeout # PgTimeoutError is a PgConnectionError subtype
+      check msgHasStopListening
+      check flagPreserved
+      check taskNilAfterRaise
+      check stateAfterRaise == csClosed
+
+  test "stopListening orphan-raise releases pending waitNotification and refuses new ones":
+    # The orphan pump dispatches no notifications, so an in-flight waiter must be
+    # failed rather than left to deadlock, and a new one refused via csClosed.
+    var waiterFailed = false
+    var newWaiterRejected = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+      let sc2Accepted = newFuture[void]("sc2Accepted")
+      let stopDone = newFuture[void]("stopDone")
+
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1)
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        await pumpStarted
+        await closeClient(sc1)
+        sc2 = await ms.accept()
+        sc2Accepted.complete()
+        await stopDone
+        try:
+          await drainStartupMessage(sc2)
+          await sendFullHandshake(sc2)
+          discard await drainFrontendMessage(sc2)
+          await sendBytes(sc2, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+
+      let saved = listenReconnectStopWaitMs
+      listenReconnectStopWaitMs = 200
+      defer:
+        listenReconnectStopWaitMs = saved
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.listenReconnectMaxAttempts = 0
+      conn.listenReconnectMaxBackoff = 1
+      await conn.listen("x")
+      pumpStarted.complete()
+      await sc2Accepted.wait(seconds(10))
+
+      # Start the waiter before stopListening runs. It parks on notifyWaiter and
+      # must be failed the instant orphan-raise fires (state was not csClosed
+      # then — checkListenAlive gate passed already).
+      let waitFut = conn.waitNotification()
+
+      try:
+        await conn.stopListening().wait(seconds(5))
+      except CatchableError:
+        discard
+
+      try:
+        discard await waitFut.wait(seconds(2))
+      except PgError:
+        waiterFailed = true
+      except CatchableError:
+        discard
+
+      # A new waitNotification must be refused immediately (state=csClosed).
+      try:
+        discard await conn.waitNotification().wait(seconds(1))
+      except PgConnectionError:
+        newWaiterRejected = true
+      except CatchableError:
+        discard
+
+      stopDone.complete()
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      try:
+        await closeClient(sc2)
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    when hasAsyncDispatch:
+      check waiterFailed
+      check newWaiterRejected
+
+  test "stopListening after close() orphan does not clear the flag or resurrect":
+    # After close() orphans the pump, stopListening() takes the early-return path
+    # (listenTask already nil'd). Clearing listenStopRequested there would rearm
+    # the orphan's post-connect graft and resurrect the closed connection.
+    var stateAfterStopListening: PgConnState
+    var flagAfterStopListening = false
+    var stateAfterSettle: PgConnState
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+      let sc2Accepted = newFuture[void]("sc2Accepted")
+      let handshakeReleased = newFuture[void]("handshakeReleased")
+
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1)
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        await pumpStarted
+        await closeClient(sc1)
+        sc2 = await ms.accept()
+        sc2Accepted.complete()
+        await handshakeReleased
+        try:
+          await drainStartupMessage(sc2)
+          await sendFullHandshake(sc2)
+          discard await drainFrontendMessage(sc2)
+          await sendBytes(sc2, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+
+      let saved = listenReconnectStopWaitMs
+      listenReconnectStopWaitMs = 200
+      defer:
+        listenReconnectStopWaitMs = saved
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.listenReconnectMaxAttempts = 0
+      conn.listenReconnectMaxBackoff = 1
+      await conn.listen("x")
+      pumpStarted.complete()
+      await sc2Accepted.wait(seconds(10))
+
+      let pumpFut = conn.listenTask
+      # close() orphans the pump (asyncdispatch) — flag stays set, listenTask nil'd.
+      try:
+        await conn.close().wait(seconds(5))
+      except CatchableError:
+        discard
+
+      # stopListening on the closed connection: the early return must leave the
+      # flag alone, or the unwinding connect() grafts and resurrects conn.
+      try:
+        await conn.stopListening().wait(seconds(5))
+      except CatchableError:
+        discard
+      stateAfterStopListening = conn.state
+      flagAfterStopListening = conn.listenStopRequested
+
+      handshakeReleased.complete()
+      var spins = 0
+      while not pumpFut.finished and spins < 5000:
+        inc spins
+        await sleepAsync(milliseconds(2))
+      stateAfterSettle = conn.state
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await closeClient(sc2)
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    when hasAsyncDispatch:
+      check stateAfterStopListening == csClosed
+      # Core assertion: the flag survives while an orphan pump is still live.
+      check flagAfterStopListening
+      check stateAfterSettle == csClosed
+
+  test "stopListening racing a reconnect discards newConn on both backends":
+    # Backend-independent guard for reconnectInPlace's post-connect stop-check.
+    # The close()-based test above only reaches it on asyncdispatch — chronos
+    # cancels the pump inside connect() instead. Here connect() completes
+    # *normally* with the stop flag already set, so the check must discard
+    # newConn; without it the graft would leave the connection csReady.
+    var stateAfterStop: PgConnState
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      let pumpStarted = newFuture[void]("pumpStarted")
+      let sc2Accepted = newFuture[void]("sc2Accepted")
+      let releaseHandshake = newFuture[void]("releaseHandshake")
+
+      proc serverHandler() {.async.} =
+        sc1 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc1) # LISTEN "x"
+        await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        await pumpStarted
+        await closeClient(sc1)
+        # Accept the reconnect dial (TCP-level) but withhold the startup response
+        # so the pump parks inside connect() until releaseHandshake fires.
+        sc2 = await ms.accept()
+        sc2Accepted.complete()
+        await releaseHandshake
+        try:
+          await drainStartupMessage(sc2)
+          await sendFullHandshake(sc2)
+          # Answer a re-LISTEN too: if newConn were grafted the pump progresses
+          # and the assertion below fails loudly. With the stop-check intact
+          # newConn is already closed, so this read falls into the except.
+          discard await drainFrontendMessage(sc2) # re-LISTEN "x"
+          await sendBytes(sc2, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.listenReconnectMaxAttempts = 0
+      conn.listenReconnectMaxBackoff = 1
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      # Pump is now parked inside connect() (TCP accepted, handshake withheld),
+      # listenReconnecting = true.
+      await sc2Accepted.wait(seconds(10))
+
+      # stopListening() sets the flag synchronously before its first suspension,
+      # so by the time this future is returned the flag is guaranteed set — the
+      # handshake release below cannot beat it.
+      let stopFut = conn.stopListening()
+      releaseHandshake.complete()
+      try:
+        await stopFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      stateAfterStop = conn.state
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await closeClient(sc2)
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    # Unguarded on purpose: both backends end csClosed with the stop-check, and
+    # csReady without it — chronos included, unlike the close()-based test.
+    check stateAfterStop == csClosed

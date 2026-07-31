@@ -445,20 +445,29 @@ proc connectToHost*(
 
 proc close*(conn: PgConnection): Future[void] {.async.} =
   ## Close the connection. Idempotent: safe to call multiple times.
+  ## On asyncdispatch a listen pump stuck in a blocking `connect()` is orphaned
+  ## after a bounded wait; it self-cleans once `connect()` unwinds.
   # Stop background listen pump if running
   if conn.listenTask != nil and not conn.listenTask.finished:
     when hasAsyncDispatch:
-      # cancelAndWait is a no-op here: signal stop so the pump's reconnect loop
-      # bails instead of re-LISTENing into an orphan socket, close the transport
-      # to break its recv, then await the pump before dropping the handle.
+      # cancelAndWait is a no-op here: signal stop so the reconnect loop bails
+      # instead of re-LISTENing into an orphan socket, close the transport to
+      # break its recv, then await the pump. A pump inside connect() cannot be
+      # cancelled, so the wait is bounded and it is orphaned on timeout; the
+      # stop flag stays set to disarm reconnectInPlace's graft.
       conn.listenStopRequested = true
       let pump = conn.listenTask
       await conn.closeTransport()
+      var pumpStopped = false
       try:
-        await pump
-      except CatchableError:
+        await pump.wait(milliseconds(listenReconnectStopWaitMs))
+        pumpStopped = true
+      except AsyncTimeoutError:
         discard
-      conn.listenStopRequested = false
+      except CatchableError:
+        pumpStopped = true
+      if pumpStopped:
+        conn.listenStopRequested = false
     else:
       await cancelAndWait(conn.listenTask)
   conn.listenTask = nil
