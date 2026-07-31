@@ -132,7 +132,9 @@ template raiseIfBadNumericBinary(col, clen: int) =
 
 proc getStr*(row: Row, col: int): string =
   ## Get a column value as a string. Handles binary-to-text conversion for
-  ## common types (bool, int2/4/8, float4/8). Raises `PgTypeError` on NULL.
+  ## common types (bool, int2/4/8, float4/8, numeric). Raises `PgTypeError` on
+  ## NULL, or on a binary-safe OID this proc cannot stringify — use a typed
+  ## accessor or `resultFormat = rfText` in that case.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -185,8 +187,17 @@ proc getStr*(row: Row, col: int): string =
     of OidNumeric:
       raiseIfBadNumericBinary(col, clen)
       return $decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
+    of 17, 25, 1043:
+      discard # bytea/text/varchar: binary payload is already raw bytes
     else:
-      discard # text, varchar, bytea: fall through to raw copy
+      # Skip user-defined OIDs (enums, custom types): no binary form, payload
+      # is raw text — raw-copy is correct.
+      if isBinarySafeOid(oid):
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": cannot render binary OID " & $oid &
+            " as string; use a typed accessor or resultFormat = rfText",
+        )
   result = readString(row.data.buf, off, clen)
 
 proc getInt*(row: Row, col: int): int32 =

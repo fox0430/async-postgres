@@ -1672,6 +1672,31 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "getStr raises PgTypeError on binary-format column it cannot render":
+    # Loud-fail: unsupported binary-safe OID must not silently raw-copy.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT '2000-01-01 00:00:00'::timestamp"
+
+      # Seed cache in binary so the rfAuto follow-up hits and replays binary.
+      let rBin = await conn.query(sql, resultFormat = rfBinary)
+      doAssert rBin.rows[0].isBinaryCol(0)
+      doAssert conn.stmtCache.len == 1
+
+      let r = await conn.query(sql) # rfAuto cache hit -> binary
+      doAssert r.rows[0].isBinaryCol(0)
+
+      var raised = false
+      try:
+        discard r.rows[0].getStr(0)
+      except PgTypeError:
+        raised = true
+      doAssert raised, "getStr should reject unsupported binary OID"
+
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: simpleExec":
   test "simpleExec returns command tag":
     proc t() {.async.} =
