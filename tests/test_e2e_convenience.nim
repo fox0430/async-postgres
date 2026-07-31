@@ -1598,6 +1598,80 @@ suite "E2E: Convenience Query Methods":
     let emptyOids: seq[int32] = @[]
     doAssert paramOidsMatch(emptyOids, emptyParams)
 
+  test "queryValue force rfText: cache-hit timestamp stays textual":
+    # Regression: rfAuto cache-hit binary Bind + getStr = raw bytes for
+    # timestamp/date/uuid/... . rfText override keeps the string helpers safe.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT '2000-01-01 00:00:00'::timestamp"
+
+      let v1 = await conn.queryValue(sql)
+      doAssert v1 == "2000-01-01 00:00:00", "first call: " & v1
+      doAssert conn.stmtCache.len == 1
+
+      let v2 = await conn.queryValue(sql)
+      doAssert v2 == "2000-01-01 00:00:00", "cache-hit call: " & v2
+
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOpt / queryValueOrDefault / queryColumn force rfText on cache hit":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let uuidSql = "SELECT '00000000-0000-0000-0000-000000000001'::uuid"
+      discard await conn.queryValue(uuidSql)
+      let uOpt = await conn.queryValueOpt(uuidSql)
+      doAssert uOpt.isSome
+      doAssert uOpt.get == "00000000-0000-0000-0000-000000000001"
+
+      let dateSql = "SELECT '2020-06-15'::date"
+      discard await conn.queryValue(dateSql)
+      let d = await conn.queryValueOrDefault(dateSql, default = "fallback")
+      doAssert d == "2020-06-15"
+
+      let jsonSql = "SELECT * FROM (VALUES ('{\"a\":1}'::jsonb), ('[2,3]'::jsonb)) v"
+      discard await conn.queryColumn(jsonSql)
+      let col = await conn.queryColumn(jsonSql)
+      doAssert col == @["{\"a\": 1}", "[2, 3]"]
+
+      await conn.close()
+
+    waitFor t()
+
+  test "typed queryValue[string] / *Opt / *OrDefault force rfText on cache hit":
+    # T=string routes through row.get(0, string) = row.getStr — same gap.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let tsSql = "SELECT '2000-01-01 00:00:00'::timestamp"
+      discard await conn.queryValue(string, tsSql)
+      let v = await conn.queryValue(string, tsSql)
+      doAssert v == "2000-01-01 00:00:00"
+
+      let uuidSql = "SELECT '00000000-0000-0000-0000-000000000042'::uuid"
+      discard await conn.queryValueOpt(string, uuidSql)
+      let uo = await conn.queryValueOpt(string, uuidSql)
+      doAssert uo == some("00000000-0000-0000-0000-000000000042")
+
+      let dateSql = "SELECT '2021-12-31'::date"
+      discard await conn.queryValueOrDefault(string, dateSql, default = "x")
+      let d1 = await conn.queryValueOrDefault(string, dateSql, default = "x")
+      doAssert d1 == "2021-12-31"
+      # A plain string default binds the non-generic overload (query.nim:385).
+      let d2 = await conn.queryValueOrDefault(dateSql, default = "x")
+      doAssert d2 == "2021-12-31"
+      # Explicit [string] (function-call form; method syntax cannot take an
+      # explicit generic here) pins the inferred-T overload (query.nim:422),
+      # whose `when T is string` branch must force rfText on cache hit too.
+      let d3 = await queryValueOrDefault[string](conn, dateSql, default = "x")
+      doAssert d3 == "2021-12-31"
+
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: simpleExec":
   test "simpleExec returns command tag":
     proc t() {.async.} =
