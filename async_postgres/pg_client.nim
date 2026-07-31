@@ -13,8 +13,11 @@
 ##   text (bounded by ``stmtCacheCapacity``); the statement is parsed once
 ##   and rebound on subsequent calls.
 ## - Result rows may use the binary wire format when ``resultFormat =
-##   rfBinary`` is passed, or on paths that build per-column format codes
-##   via ``buildResultFormats``. The default ``rfAuto`` returns text rows.
+##   rfBinary`` is passed. The default ``rfAuto`` sends text on the first
+##   execution, then binary on every statement-cache hit for binary-safe
+##   OIDs (see ``ResultFormat.rfAuto``). Non-string typed accessors decode
+##   either wire format; the string helpers (untyped ``queryValue`` etc.
+##   and ``queryValue[string]``) force ``rfText`` internally.
 ##
 ## ``simpleExec`` / ``simpleQuery`` use the **simple query protocol** (a single
 ## ``Query`` message, text-only rows). Prefer them only when the extended

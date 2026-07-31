@@ -150,7 +150,11 @@ type
 
   ResultFormat* = enum
     ## How result columns should be encoded by the server.
-    rfAuto ## Per-column binary-safe detection via statement cache (default).
+    rfAuto
+      ## Default. Cache miss → text; cache hit → per-column binary for
+      ## ``BinarySafeOids`` (see ``buildResultFormats``). Format is thus
+      ## non-deterministic across calls; use typed accessors or force
+      ## ``rfText`` when reading via ``getStr`` / typed ``string``.
     rfText ## All columns in text format.
     rfBinary ## All columns in binary format.
 
