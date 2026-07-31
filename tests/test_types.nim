@@ -1415,11 +1415,21 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard row.getStr(0)
 
-  test "getStr binary unknown OID size mismatch is tolerated":
-    # text/varchar/bytea: else branch keeps raw-bytes fallback
+  test "getStr binary text/varchar/bytea raw-copy":
     let fields = @[mkField(OidText, 1)]
     let row = mkRow(@[some(toBytes("hello"))], fields)
     check row.getStr(0) == "hello"
+
+  test "getStr binary unsupported binary-safe OID raises":
+    let fields = @[mkField(OidTimestamp, 1)]
+    let row = mkRow(@[some(@[0'u8, 0, 0, 0, 0, 0, 0, 0])], fields)
+    expect PgTypeError:
+      discard row.getStr(0)
+
+  test "getStr binary user-defined OID raw-copy":
+    let fields = @[mkField(99999'i32, 1)]
+    let row = mkRow(@[some(toBytes("active"))], fields)
+    check row.getStr(0) == "active"
 
   test "getIntArray binary element length mismatch":
     let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 4)
