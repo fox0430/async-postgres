@@ -207,12 +207,18 @@ proc buildDeadlineAwaitAndTimeout*(
   ## invalidate-and-raise path. See the matching note in pg_pool's
   ## withTransactionDeadline.
   ##
-  ## Cancellation skips `catchableCleanup` — a fresh await would just re-cancel.
+  ## Cancellation skips `catchableCleanup` (a fresh await would just re-cancel)
+  ## but still dispatches a server-side CancelRequest via `cancelNoWait` and
+  ## marks the connection `csClosed`, so the server-side transaction does not
+  ## linger past the client-side cancel and the connection cannot be reused.
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let eSym = genSym(nskLet, "e")
   let cancelSym = genSym(nskLet, "cancel")
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
+  let csReadySym = bindSym"csReady"
+  let csClosedSym = bindSym"csClosed"
   let reasonLit = newStrLitNode(reason)
   quote:
     let `bodyFutSym` = `bodyFnSym`()
@@ -224,6 +230,9 @@ proc buildDeadlineAwaitAndTimeout*(
       else:
         `connSym`.invalidateOnTimeout(`reasonLit`)
     except CancelledError as `cancelSym`:
+      if `connSym`.state notin {`csReadySym`, `csClosedSym`}:
+        `cancelNoWaitSym`(`connSym`)
+        `connSym`.state = `csClosedSym`
       raise `cancelSym`
     except CatchableError as `eSym`:
       `catchableCleanup`
@@ -252,10 +261,12 @@ proc buildRetryTxLoop*(
   let eSym = genSym(nskLet, "e")
   let cancelSym = genSym(nskLet, "cancel")
   let csReadySym = bindSym"csReady"
+  let csClosedSym = bindSym"csClosed"
   let tsIdleSym = bindSym"tsIdle"
   let isRetryableSym = bindSym"isRetryableTxError"
   let backoffSym = bindSym"backoffDelayMs"
   let sleepSym = bindSym"sleepMsAsync"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
 
   let cleanup = buildRollbackCleanup(connSym, txTimeout)
 
@@ -270,7 +281,12 @@ proc buildRetryTxLoop*(
         break
       except CancelledError as `cancelSym`:
         # Never retry cancellation; skip the async cleanup (would just re-cancel).
-        # A dirty conn is discarded by the outer release/close path.
+        # Dispatch a server-side CancelRequest and mark csClosed so the server tx
+        # is aborted and the (now unusable) conn is discarded by the outer
+        # release/close path.
+        if `connSym`.state notin {`csReadySym`, `csClosedSym`}:
+          `cancelNoWaitSym`(`connSym`)
+          `connSym`.state = `csClosedSym`
         raise `cancelSym`
       except CatchableError as `eSym`:
         `cleanup`
@@ -310,6 +326,7 @@ proc buildRetryDeadlineLoop*(
   let cancelSym = genSym(nskLet, "cancel")
   let backoffMsSym = genSym(nskLet, "backoffMs")
   let csReadySym = bindSym"csReady"
+  let csClosedSym = bindSym"csClosed"
   let tsIdleSym = bindSym"tsIdle"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
@@ -318,6 +335,7 @@ proc buildRetryDeadlineLoop*(
   let isRetryableSym = bindSym"isRetryableTxError"
   let backoffSym = bindSym"backoffDelayMs"
   let sleepSym = bindSym"sleepMsAsync"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
   let stateCheck =
     if connForStateCheck == nil:
       newLit(true)
@@ -327,6 +345,17 @@ proc buildRetryDeadlineLoop*(
         "and",
         infix(newDotExpr(connForStateCheck, ident"txStatus"), "==", tsIdleSym),
       )
+  # Conn variant owns `connForStateCheck` and must abort server-side on cancel;
+  # pool variant handles cancel inside `bodyFn` (which owns the acquired conn),
+  # so the outer loop only re-raises.
+  let cancelHandler =
+    if connForStateCheck == nil:
+      newStmtList()
+    else:
+      quote:
+        if `connForStateCheck`.state notin {`csReadySym`, `csClosedSym`}:
+          `cancelNoWaitSym`(`connForStateCheck`)
+          `connForStateCheck`.state = `csClosedSym`
   quote:
     var `attemptSym` = 0
     while true:
@@ -346,6 +375,7 @@ proc buildRetryDeadlineLoop*(
           `timeoutElse`
       except CancelledError as `cancelSym`:
         # Never retry cancellation; skip the catchable cleanup (would re-cancel).
+        `cancelHandler`
         raise `cancelSym`
       except CatchableError as `eSym`:
         `catchableCleanup`
@@ -417,6 +447,9 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
   let cancelSym = genSym(nskLet, "cancel")
+  let csReadySym = bindSym"csReady"
+  let csClosedSym = bindSym"csClosed"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   result = quote:
     let `connSym` = `connExpr`
@@ -426,7 +459,12 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
     except CancelledError as `cancelSym`:
-      # Skip cleanup on cancel; a fresh await would just re-cancel.
+      # Skip ROLLBACK on cancel (a fresh await would just re-cancel), but abort
+      # server-side via CancelRequest and mark csClosed so the server tx does
+      # not linger holding locks and the conn is not silently reused.
+      if `connSym`.state notin {`csReadySym`, `csClosedSym`}:
+        `cancelNoWaitSym`(`connSym`)
+        `connSym`.state = `csClosedSym`
       raise `cancelSym`
     except CatchableError as `eSym`:
       `bodyCleanup`
@@ -578,6 +616,9 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let cancelSym = genSym(nskLet, "cancel")
   let spNameSym = genSym(nskLet, "spName")
   let quoteIdentSym = bindSym"quoteIdentifier"
+  let csReadySym = bindSym"csReady"
+  let csClosedSym = bindSym"csClosed"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
 
   let nameExpr = savepointNameExpr(connSym, spName)
   # Skip ROLLBACK TO SAVEPOINT when the outer transaction has already ended or
@@ -596,7 +637,12 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
       )
     except CancelledError as `cancelSym`:
-      # See withTransaction — never run cleanup on cancellation.
+      # See withTransaction: skip async cleanup but abort server-side so the
+      # outer transaction does not linger with an orphan savepoint frame, and
+      # mark csClosed so the conn is not silently reused.
+      if `connSym`.state notin {`csReadySym`, `csClosedSym`}:
+        `cancelNoWaitSym`(`connSym`)
+        `connSym`.state = `csClosedSym`
       raise `cancelSym`
     except CatchableError as `eSym`:
       `spCleanup`

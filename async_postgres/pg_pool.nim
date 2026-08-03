@@ -1839,6 +1839,9 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let eSym = genSym(nskLet, "e")
   let cancelSym = genSym(nskLet, "cancel")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
+  let csReadySym = bindSym"csReady"
+  let csClosedSym = bindSym"csClosed"
+  let cancelNoWaitSym = bindSym"cancelNoWait"
   let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
   result = quote:
     let `poolSym` = `poolExpr`
@@ -1849,7 +1852,13 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         `body`
         discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
       except CancelledError as `cancelSym`:
-        # Skip cleanup on cancel; a fresh await would just re-cancel.
+        # Skip ROLLBACK on cancel (a fresh await would just re-cancel), but
+        # abort server-side via CancelRequest and mark csClosed so the server
+        # tx does not linger holding locks and the conn is discarded by
+        # release() instead of silently reused.
+        if `connIdent`.state notin {`csReadySym`, `csClosedSym`}:
+          `cancelNoWaitSym`(`connIdent`)
+          `connIdent`.state = `csClosedSym`
         raise `cancelSym`
       except CatchableError as `eSym`:
         `bodyCleanup`
