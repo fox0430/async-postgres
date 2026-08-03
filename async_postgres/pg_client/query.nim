@@ -322,6 +322,8 @@ proc queryValue*(
   let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
   if qr.rowCount == 0:
     raise newException(PgNoRowsError, "Query returned no rows")
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     raise newException(PgNullError, "Query returned NULL")
@@ -342,6 +344,8 @@ proc queryValue*[T](
   let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     raise newException(PgNoRowsError, "Query returned no rows")
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     raise newException(PgNullError, "Query returned NULL")
@@ -358,6 +362,8 @@ proc queryValueOpt*(
   let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
   if qr.rowCount == 0:
     return none(string)
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(string)
@@ -377,6 +383,8 @@ proc queryValueOpt*[T](
   let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     return none(T)
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(T)
@@ -394,6 +402,8 @@ proc queryValueOrDefault*(
   let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
   if qr.rowCount == 0:
     return default
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
@@ -414,6 +424,8 @@ proc queryValueOrDefault*[T](
   let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     return default
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
@@ -434,6 +446,8 @@ proc queryValueOrDefault*[T](
   let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     return default
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
@@ -456,8 +470,11 @@ proc queryColumn*(
     timeout: Duration = ZeroDuration,
 ): Future[seq[string]] {.async.} =
   ## Execute a query and return the first column of all rows as strings.
-  ## Raises `PgNullError` if any value is NULL.
+  ## Raises `PgNullError` if any value is NULL, or `PgTypeError` when the
+  ## query yields rows with no columns.
   let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
+  if qr.rowCount > 0 and qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   for i in 0 ..< qr.rowCount:
     let row = initRow(qr.data, i)
     if row.isNull(0):

@@ -4,9 +4,13 @@ import ../pg_protocol
 import core, decoding, encoding
 
 proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
+  # `except PgError` would miss an out-of-range col and crash the process
+  # (UB in -d:release). Same family as the other accessor errors here so
+  # callers only need one `except PgTypeError` clause.
   if col < 0 or col >= int(row.data.numCols):
     raise newException(
-      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
     )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   result.off = int(row.data.cellIndex[idx])
@@ -101,10 +105,11 @@ proc contains*(cr: CommandResult, s: string): bool {.inline.} =
   s in cr.commandTag
 
 proc isNull*(row: Row, col: int): bool =
-  ## Check if the column value is NULL.
+  ## Check if the column value is NULL. Raises `PgTypeError` on out-of-range
+  ## column index (see cellInfo for why not IndexDefect).
   if col < 0 or col >= int(row.data.numCols):
     raise newException(
-      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
     )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   row.data.cellIndex[idx + 1] == -1'i32
