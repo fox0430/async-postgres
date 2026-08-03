@@ -1015,3 +1015,120 @@ suite "close during reconnect":
     # Unguarded on purpose: both backends end csClosed with the stop-check, and
     # csReady without it — chronos included, unlike the close()-based test.
     check stateAfterStop == csClosed
+
+when hasAsyncDispatch:
+  import std/asyncnet
+
+  suite "stopListening send failure":
+    ## Regression: `stopListening` whose stop-signal query fails must not leave the
+    ## pump running behind a nil'd `listenTask`.
+    ##
+    ## On asyncdispatch `abortListenTask`'s `cancelAndWait` is a no-op, and the
+    ## failed `sendMsg` only marks csClosed — the socket stays open, so the pump sits
+    ## in a recv nothing will break. `stopListening` then returned csClosed with
+    ## `listenTask = nil` and `listenStopRequested` cleared, leaving an untrackable
+    ## pump that reconnects the moment its recv finally fails and resurrects the
+    ## "closed" connection into csListening.
+    ##
+    ## The fix mirrors close(): close the transport to break the parked recv, wait
+    ## bounded, and keep the stop flag set if the pump did not stop.
+    test "failed stop query does not leave a resurrecting pump":
+      var stateAfterStop: PgConnState
+      var taskNilAfterStop = false
+      var pumpStoppedAfterStop = false
+      var flagAfterStop = false
+      var stateAfterSettle: PgConnState
+      var pumpFinishedAfterSettle = false
+      var secondDialSeen = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        var sc1, sc2: MockClient
+        let stopReturned = newFuture[void]("stopReturned")
+
+        proc serverHandler() {.async.} =
+          sc1 = await acceptAndReady(ms)
+          discard await drainFrontendMessage(sc1) # LISTEN "x"
+          await sendBytes(sc1, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+          # Stay silent so the pump parks in a healthy recv.
+          await stopReturned
+          await closeClient(sc1)
+          # A dial here means the pump outlived stopListening. Answer it fully so
+          # a surviving pump reaches csListening and the assertions fail loudly.
+          try:
+            sc2 = await ms.accept()
+            secondDialSeen = true
+            await drainStartupMessage(sc2)
+            await sendFullHandshake(sc2)
+            discard await drainFrontendMessage(sc2) # re-LISTEN "x"
+            await sendBytes(
+              sc2, buildCommandComplete("LISTEN") & buildReadyForQuery('I')
+            )
+          except CatchableError:
+            discard
+
+        let saved = listenReconnectStopWaitMs
+        listenReconnectStopWaitMs = 300
+        defer:
+          listenReconnectStopWaitMs = saved
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+        conn.listenReconnectMaxAttempts = 0
+        conn.listenReconnectMaxBackoff = 1
+        await conn.listen("x")
+        let pumpFut = conn.listenTask
+        let realSock = conn.socket
+
+        # Fail only the stop-signal query: a closed AsyncSocket rejects the write
+        # while the pump stays parked in its live recv on the real socket. That
+        # is the abort path — a send failure that does not stop the pump.
+        let deadSock = newAsyncSocket(buffered = false)
+        deadSock.close()
+        conn.socket = deadSock
+
+        try:
+          await conn.stopListening().wait(seconds(5))
+        except CatchableError:
+          discard
+        stateAfterStop = conn.state
+        taskNilAfterStop = conn.listenTask.isNil
+        pumpStoppedAfterStop = pumpFut.finished
+        flagAfterStop = conn.listenStopRequested
+        conn.socket = realSock
+        stopReturned.complete()
+
+        # Long enough for a surviving pump to fail its recv, serve one backoff
+        # tick (1 s) and dial again.
+        await sleepAsync(milliseconds(2500))
+        stateAfterSettle = conn.state
+        pumpFinishedAfterSettle = pumpFut.finished
+
+        try:
+          await serverFut.wait(seconds(2))
+        except CatchableError:
+          discard
+        try:
+          await conn.close()
+        except CatchableError:
+          discard
+        try:
+          await closeClient(sc1)
+        except CatchableError:
+          discard
+        try:
+          if sc2 != nil:
+            await closeClient(sc2)
+        except CatchableError:
+          discard
+        await closeServer(ms)
+
+      waitFor testBody()
+      check stateAfterStop == csClosed
+      check taskNilAfterStop
+      # Either the pump stopped, or the flag stays armed to disarm the orphan.
+      check (pumpStoppedAfterStop or flagAfterStop)
+      # Core assertions: no reconnect dial, no resurrection.
+      check not secondDialSeen
+      check stateAfterSettle == csClosed
+      check pumpFinishedAfterSettle
