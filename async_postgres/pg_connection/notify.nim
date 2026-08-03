@@ -285,14 +285,36 @@ proc startListening*(conn: PgConnection) =
   conn.state = csListening
   conn.listenTask = conn.listenPump()
 
-proc abortListenTask(conn: PgConnection) {.async.} =
+proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
   ## Shared `stopListening` failure cleanup: the pump's transport is dead, so
-  ## cancel the task if it is still running and mark the connection closed. The
-  ## caller nils `listenTask`; `stopListening`'s `finally` clears
-  ## `listenStopRequested`.
+  ## stop the task if it is still running and mark the connection closed. The
+  ## caller nils `listenTask`.
+  ##
+  ## Returns whether the pump stopped. On asyncdispatch it can survive as an
+  ## untrackable orphan; `stopListening` must then keep `listenStopRequested`
+  ## set, since the orphan's reconnect stop-checks are all that keeps it from
+  ## grafting a fresh transport onto the closed connection.
+  var stopped = true
   if conn.listenTask != nil and not conn.listenTask.finished:
-    await cancelAndWait(conn.listenTask)
+    when hasAsyncDispatch:
+      # cancelAndWait is a no-op here: close the transport to break the pump's
+      # parked recv (the failed sendMsg only marked csClosed, leaving the socket
+      # open), then wait bounded as close() does.
+      conn.listenStopRequested = true
+      let pump = conn.listenTask
+      await conn.closeTransport()
+      stopped = false
+      try:
+        await pump.wait(milliseconds(listenReconnectStopWaitMs))
+        stopped = true
+      except AsyncTimeoutError:
+        discard
+      except CatchableError:
+        stopped = true
+    else:
+      await cancelAndWait(conn.listenTask)
   conn.state = csClosed
+  return stopped
 
 proc failNotifyWaiter(conn: PgConnection) {.raises: [].} =
   ## Release the pull-API waiter when the pump has stopped so `waitNotification`
@@ -326,8 +348,8 @@ proc stopListening*(conn: PgConnection) {.async.} =
   # path below (a recv that fails the instant we signal) — it still observes the
   # request there and exits instead of looping back into csListening.
   conn.listenStopRequested = true
-  # Set only on the orphan-on-timeout path, where the still-running pump needs
-  # the flag; every other path clears it in the `finally`.
+  # Set on every path that leaves a still-running orphan pump, which needs the
+  # flag; the `finally` clears it once the pump is known to have stopped.
   var preserveStopFlag = false
   try:
     if conn.listenReconnecting:
@@ -358,7 +380,8 @@ proc stopListening*(conn: PgConnection) {.async.} =
             " ms while reconnecting",
         )
       except CatchableError:
-        await conn.abortListenTask()
+        if not (await conn.abortListenTask()):
+          preserveStopFlag = true
       conn.listenTask = nil
       conn.failNotifyWaiter()
       return
@@ -372,7 +395,8 @@ proc stopListening*(conn: PgConnection) {.async.} =
       raise e
     except CatchableError:
       # Send or pump failed: connection is dead
-      await conn.abortListenTask()
+      if not (await conn.abortListenTask()):
+        preserveStopFlag = true
     conn.listenTask = nil
     # Preserve csClosed if pump detected a connection error
     if conn.state != csClosed:
