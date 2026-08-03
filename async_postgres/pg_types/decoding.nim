@@ -404,7 +404,9 @@ proc parseDateText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
     raise
       newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
   try:
-    return parse(s, "yyyy-MM-dd")
+    # Zone is utc() so a date decodes to the same absolute instant as
+    # decodeBinaryDate; the local default would shift it by the UTC offset.
+    return parse(s, "yyyy-MM-dd", utc())
   except TimeParseError, IndexDefect:
     raise newException(PgTypeError, "Invalid date: " & s)
 
