@@ -331,12 +331,16 @@ suite "Row accessors":
     check not row.isNull(0)
     check row.isNull(1)
 
-  test "column index out of range raises IndexDefect":
+  test "column index out of range raises PgTypeError (catchable, not Defect)":
     let row = @[some(toBytes("hello"))]
-    expect IndexDefect:
+    expect PgTypeError:
       discard row.getStr(1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard row.getStr(-1)
+    # PgTypeError is a PgError, so a single `except PgError` clause covers
+    # both out-of-range column access and the accessor-level errors below.
+    expect PgError:
+      discard row.getStr(1)
 
   test "getInt16":
     let row = @[some(toBytes("123"))]
@@ -9197,7 +9201,8 @@ suite "Negative column index":
   # isBinaryCol/colTypeOid guard `col >= 0` themselves: many accessors call them
   # before their own cellInfo/isNull bounds check, so without the guard a
   # negative col reaches `colFormats[col]` (raw IndexDefect, or an out-of-bounds
-  # read once --checks:off elides the subscript check).
+  # read once --checks:off elides the subscript check). cellInfo/isNull now
+  # raise `PgTypeError` (catchable via `except PgError`) instead of IndexDefect.
   let binRow = mkRow(@[some(toBytes("x"))], @[mkField(OidText, 1'i16)])
   let textRow = mkRow(@[some(toBytes("x"))], @[mkField(OidText, 0'i16)])
   # colFormats/colTypeOids are empty here, so a negative subscript would hit a
@@ -9223,34 +9228,48 @@ suite "Negative column index":
   test "isBinaryCol-first accessors report the column index":
     # These call isBinaryCol before cellInfo; the guard lets them fall through
     # to the bounds check that produces the intended message.
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getUuid(-1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getDate(-1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getNumeric(-1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getPoint(-1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getIntArray(-1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getInt4Range(-1)
 
   test "cellInfo-first accessors are unchanged":
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getStr(-1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getInt(-1)
 
   test "getArrayND reports the index, not a format mismatch":
-    expect IndexDefect:
+    expect PgTypeError:
       discard getArrayND[int32](binRow, -1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard binRow.getMoneyArrayND(-1)
 
   test "negative index message names the column":
     try:
       discard binRow.getUuid(-1)
       check false
-    except IndexDefect as e:
+    except PgTypeError as e:
       check "column index -1" in e.msg
+
+  test "column index errors are catchable via `except PgError`":
+    # Contract: `except PgError` catches every accessor-layer failure,
+    # including out-of-range column access. This suppresses the whole
+    # `raises: []` × Defect mismatch in one place for library users.
+    for row in [binRow, textRow, bareRow]:
+      expect PgError:
+        discard row.getStr(-1)
+      expect PgError:
+        discard row.getStr(row.len + 5)
+      expect PgError:
+        discard row.isNull(-1)
+      expect PgError:
+        discard row.isNull(row.len + 5)
