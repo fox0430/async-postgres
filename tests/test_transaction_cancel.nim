@@ -154,6 +154,144 @@ when hasChronos:
 
       waitFor t()
 
+    test "withTransaction cancel of in-flight request marks conn csClosed":
+      # body issues a simpleExec that hangs; an external cancel aborts it.
+      # The cancel handler must mark csClosed (and best-effort CancelRequest)
+      # because the server has a pending query — reusing the conn would
+      # interleave a stale reply with the next borrower's request.
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        await preBufferBeginReply(sTx)
+
+        proc runTx() {.async.} =
+          conn.withTransaction:
+            discard await conn.simpleExec("SELECT 1")
+
+        let fut = runTx()
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished, "runTx should be blocked on the hung SELECT"
+        doAssert conn.state == csBusy,
+          "expected csBusy while awaiting SELECT reply; got " & $conn.state
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError
+        doAssert conn.state == csClosed,
+          "cancel path must csClose the conn; got " & $conn.state
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+    test "withSavepoint cancel of in-flight request marks conn csClosed":
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        # Pre-buffer SAVEPOINT reply so the savepoint frame is established.
+        discard
+          await sTx.write(buildCommandComplete("SAVEPOINT") & buildReadyForQuery('T'))
+        # Simulate we're already inside a transaction: mark tsInTransaction.
+        conn.txStatus = tsInTransaction
+
+        proc runSp() {.async.} =
+          conn.withSavepoint("sp1"):
+            discard await conn.simpleExec("SELECT 1")
+
+        let fut = runSp()
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished, "runSp should be blocked on the hung SELECT"
+        doAssert conn.state == csBusy
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError
+        doAssert conn.state == csClosed,
+          "withSavepoint cancel path must csClose the conn; got " & $conn.state
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+    test "withTransactionDeadline external cancel marks conn csClosed":
+      # External cancel of the outer wait (buildDeadlineAwaitAndTimeout path).
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        await preBufferBeginReply(sTx)
+
+        proc runTx() {.async.} =
+          conn.withTransactionDeadline(seconds(60)):
+            discard await conn.simpleExec("SELECT 1")
+
+        let fut = runTx()
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished
+        doAssert conn.state == csBusy
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError
+        doAssert conn.state == csClosed,
+          "withTransactionDeadline cancel path must csClose the conn; got " & $conn.state
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+    test "withTransactionRetry cancel of in-flight request marks conn csClosed":
+      # buildRetryTxLoop cancel path.
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        await preBufferBeginReply(sTx)
+
+        proc runTx() {.async.} =
+          conn.withTransactionRetry(RetryOptions(maxAttempts: 3)):
+            discard await conn.simpleExec("SELECT 1")
+
+        let fut = runTx()
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished
+        doAssert conn.state == csBusy
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError
+        doAssert conn.state == csClosed,
+          "withTransactionRetry cancel path must csClose the conn; got " & $conn.state
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+    test "withTransactionRetryDeadline external cancel marks conn csClosed":
+      # buildRetryDeadlineLoop cancel path (connForStateCheck != nil branch).
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        await preBufferBeginReply(sTx)
+
+        proc runTx() {.async.} =
+          conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), seconds(60)):
+            discard await conn.simpleExec("SELECT 1")
+
+        let fut = runTx()
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished
+        doAssert conn.state == csBusy
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError
+        doAssert conn.state == csClosed,
+          "withTransactionRetryDeadline cancel path must csClose the conn; got " &
+            $conn.state
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
     test "pool.withTransaction body-cancel skips ROLLBACK cleanup":
       # Same guarantee as the conn-side variant on pool.withTransaction's inner try.
       proc t() {.async.} =
