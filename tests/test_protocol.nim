@@ -746,6 +746,30 @@ suite "Backend decoding":
     expect PgProtocolError:
       discard parseBackendMessage(buf)
 
+  test "NegotiateProtocolVersion: option count over the cap raises before allocating":
+    # Bare NULs make the count match the body exactly, so only the cap rejects it.
+    let n = MaxNegotiateProtocolOptions + 1
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(int32(n))
+    for _ in 0 ..< n:
+      body.add(0'u8)
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: option count at the cap is accepted":
+    let n = MaxNegotiateProtocolOptions
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(int32(n))
+    for _ in 0 ..< n:
+      body.add(0'u8)
+    var buf = buildMsg('v', body)
+    let res = parseBackendMessage(buf)
+    check res.state == psComplete
+    check res.message.unrecognizedOptions.len == n
+
   test "NegotiateProtocolVersion: truncated CString raises":
     var body: seq[byte] = @[]
     body.addInt32(0)
