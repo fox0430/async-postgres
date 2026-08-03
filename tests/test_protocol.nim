@@ -1239,6 +1239,36 @@ suite "Backend decoding - edge cases":
     check res.state == psIncomplete
     check buf == original
 
+  test "ErrorResponse rejects excessive field count":
+    var body: seq[byte] = @[]
+    for _ in 0 .. MaxErrorOrNoticeFields:
+      body.add(byte('S'))
+      body.addCString("x")
+    body.add(0'u8)
+    var buf = buildMsg('E', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NoticeResponse rejects excessive field count":
+    var body: seq[byte] = @[]
+    for _ in 0 .. MaxErrorOrNoticeFields:
+      body.add(byte('S'))
+      body.addCString("x")
+    body.add(0'u8)
+    var buf = buildMsg('N', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "AuthenticationSASL rejects excessive mechanism count":
+    var body: seq[byte] = @[]
+    body.addInt32(10)
+    for i in 0 .. MaxSaslMechanisms:
+      body.addCString("MECH-" & $i)
+    body.add(0'u8)
+    var buf = buildMsg('R', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
 suite "Frontend encoding - edge cases":
   test "encodeBind with result formats":
     let msg = encodeBind("", "", @[0'i16], @[some(@[byte('1')])], @[1'i16])
