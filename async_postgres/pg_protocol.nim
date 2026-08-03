@@ -301,6 +301,12 @@ const
     ## bounds individual values by `MaxAllocSize` (~1 GiB - 1), so legitimate
     ## traffic stays well below this cap.
 
+  MaxNegotiateProtocolOptions* = 1024
+    ## Upper bound on the `_pq_.*` option count in `NegotiateProtocolVersion`.
+    ## The server only echoes back options the client sent, so real counts are
+    ## tiny. Bounding by message length alone still buys a 16-byte `string`
+    ## header per wire byte: 1 GiB in, 16 GiB preallocated, OutOfMemDefect.
+
 func makeBinarySafeLookup(): array[BinarySafeMaxOid + 1, bool] {.compileTime.} =
   for oid in BinarySafeOids:
     result[oid] = true
@@ -971,6 +977,12 @@ proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
       PgProtocolError, "NegotiateProtocolVersion: invalid option count " & $n
     )
   # Cap allocation against a hostile `n` before the loop reads any bytes.
+  if n > MaxNegotiateProtocolOptions:
+    raise newException(
+      PgProtocolError,
+      "NegotiateProtocolVersion: option count " & $n & " exceeds maximum of " &
+        $MaxNegotiateProtocolOptions,
+    )
   if int64(n) > int64(body.len - 8):
     raise newException(
       PgProtocolError, "NegotiateProtocolVersion: option count " & $n & " exceeds body"
