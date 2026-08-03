@@ -29,6 +29,8 @@ const listenBackoffTickMs = 50
   ## sleeps in ticks this size and re-checks `listenStopRequested` between them,
   ## bounding how long a `stopListening` issued mid-backoff waits to be observed.
 
+# listenReconnectStopWaitMs lives in types.nim to avoid a circular import.
+
 # Callback registration
 
 proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
@@ -49,6 +51,9 @@ proc onListenError*(
 proc reconnectInPlace*(conn: PgConnection) {.async.} =
   ## Reconnect using stored config, re-LISTENing on all channels. A re-LISTEN
   ## failure closes the freshly opened transport so the reconnect never leaks it.
+  ## A stop observed right after `connect()` returns discards `newConn`, so a
+  ## `close()` that already tore down the old transport cannot end up with a
+  ## live socket grafted on after it returned.
   await conn.closeTransport()
 
   conn.recvBuf.setLen(0)
@@ -67,6 +72,15 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   except CatchableError as e:
     conn.state = csClosed
     raise e
+  if conn.listenStopRequested:
+    # Stop landed while connect() blocked: discard newConn, the pump's own
+    # stop-check then sees csClosed and exits.
+    try:
+      await newConn.close()
+    except CatchableError:
+      discard
+    conn.state = csClosed
+    return
   when hasChronos:
     conn.transport = newConn.transport
     conn.baseReader = newConn.baseReader
@@ -291,15 +305,20 @@ proc failNotifyWaiter(conn: PgConnection) {.raises: [].} =
 
 proc stopListening*(conn: PgConnection) {.async.} =
   ## Stop the background listen pump and return the connection to `csReady`
-  ## (or leave it `csClosed` if the transport died with no live reconnect).
-  ## `listenStopRequested` is cleared on *every* exit — including when the caller
-  ## cancels this future mid-stop — so a later reconnect never trips over a stale
-  ## stop request and silently closes the pump.
+  ## (or `csClosed` if the transport died with no live reconnect).
+  ## `listenStopRequested` is cleared on every exit that observed the pump
+  ## stopping. If instead the pump is stuck in a blocking `connect()` on
+  ## asyncdispatch and does not stop within `listenReconnectStopWaitMs`, this
+  ## raises `PgTimeoutError` (a `PgConnectionError` subtype) and leaves the
+  ## connection `csClosed` with the flag set; it is then unusable and must be
+  ## closed and reopened.
   if conn.listenTask == nil or conn.listenTask.finished:
     conn.listenTask = nil
-    conn.listenStopRequested = false
     if conn.state == csListening:
       conn.state = csReady
+    # csClosed + flag set = orphan pump inside reconnectInPlace; keep the flag.
+    if conn.state != csClosed:
+      conn.listenStopRequested = false
     conn.failNotifyWaiter()
     return
   # Request the stop up front, before choosing how to deliver it: this also
@@ -307,23 +326,37 @@ proc stopListening*(conn: PgConnection) {.async.} =
   # path below (a recv that fails the instant we signal) — it still observes the
   # request there and exits instead of looping back into csListening.
   conn.listenStopRequested = true
+  # Set only on the orphan-on-timeout path, where the still-running pump needs
+  # the flag; every other path clears it in the `finally`.
+  var preserveStopFlag = false
   try:
     if conn.listenReconnecting:
-      # The pump is rebuilding a dead transport. The empty-query unblock the
-      # normal path uses would race the reconnect's LISTEN round trips and
-      # desync the stream, so just wait for the pump to observe
-      # `listenStopRequested` and exit. It leaves the connection `csReady` (a
-      # reconnect completed before the stop) or `csClosed` (none did) — either
-      # way a finished pump, never a hang. A pump parked in its backoff observes
-      # the stop within one short tick (see the reconnect loop); otherwise we
-      # wait only for the in-flight reconnect round trips to finish.
+      # Pump is rebuilding a dead transport. The empty-query unblock would race
+      # the reconnect's LISTEN round trips and desync, so just wait for the pump
+      # to observe the stop and exit. On asyncdispatch a pump inside connect()
+      # can only be bounded by listenReconnectStopWaitMs, not cancelled.
       try:
-        await conn.listenTask
+        when hasAsyncDispatch:
+          await conn.listenTask.wait(milliseconds(listenReconnectStopWaitMs))
+        else:
+          await conn.listenTask
       except CancelledError as e:
-        # The pump is still running and owns the live future; leave the handle
-        # intact (the `finally` only clears the stop flag) so close() can cancel
-        # it, then propagate the cancellation.
         raise e
+      except AsyncTimeoutError:
+        # Orphan the pump; reconnectInPlace's stop-check discards newConn once
+        # connect() unwinds. csClosed and the failed waiter make operations on
+        # the orphaned connection fail fast instead of hanging, and nilling the
+        # task keeps a follow-up close()/stopListening() from waiting another
+        # full window on the detached orphan.
+        preserveStopFlag = true
+        conn.state = csClosed
+        conn.listenTask = nil
+        conn.failNotifyWaiter()
+        raise newException(
+          PgTimeoutError,
+          "stopListening: listen pump did not stop within " & $listenReconnectStopWaitMs &
+            " ms while reconnecting",
+        )
       except CatchableError:
         await conn.abortListenTask()
       conn.listenTask = nil
@@ -334,7 +367,6 @@ proc stopListening*(conn: PgConnection) {.async.} =
     conn.state = csBusy
     try:
       await conn.sendMsg(encodeQuery(""))
-      # Wait for pump to drain and exit naturally
       await conn.listenTask
     except CancelledError as e:
       raise e
@@ -347,15 +379,15 @@ proc stopListening*(conn: PgConnection) {.async.} =
       conn.state = csReady
     conn.failNotifyWaiter()
   finally:
-    # Runs on the normal, failed, *and* cancelled paths: a stop request left set
-    # would later abort a legitimate reconnect (the pump's reconnect loop reads
-    # it at every yield point), so it must never outlive this call.
-    conn.listenStopRequested = false
+    if not preserveStopFlag:
+      conn.listenStopRequested = false
 
 # LISTEN / UNLISTEN entry points
 
 proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
   ## Subscribe to a LISTEN channel and start the background notification pump.
+  ## Propagates `PgTimeoutError` from `stopListening` if the previous pump is
+  ## stuck in a blocking `connect()`; the connection is then unusable.
   if conn.state == csListening:
     await conn.stopListening()
   conn.checkReady()
@@ -365,6 +397,7 @@ proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
 
 proc unlisten*(conn: PgConnection, channel: string): Future[void] {.async.} =
   ## Unsubscribe from a LISTEN channel. Stops the pump if no channels remain.
+  ## Propagates `PgTimeoutError` from `stopListening` (see `listen` for details).
   if conn.state == csListening:
     await conn.stopListening()
   conn.checkReady()

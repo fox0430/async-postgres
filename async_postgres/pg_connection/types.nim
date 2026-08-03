@@ -35,6 +35,11 @@ else:
       "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
   .}
 
+var listenReconnectStopWaitMs* = 10_000
+  ## Max wait (ms) for a listen pump stuck in a blocking `connect()`; it is
+  ## orphaned on timeout. Unexported so users cannot set it to 0 and disable
+  ## orphan safety — siblings and tests reach it via `import types {.all.}`.
+
 type
   PgConnState* = enum
     ## Connection lifecycle state.
@@ -249,10 +254,11 @@ type
     listenChannels*: HashSet[string]
     listenTask*: Future[void]
     listenStopRequested*: bool
-      ## Set by `stopListening` to ask the background pump to exit. The pump
-      ## checks it at every yield point of its auto-reconnect loop so a stop
-      ## requested while the transport is being rebuilt is honored instead of
-      ## being lost when a successful reconnect restores `csListening`.
+      ## Set by `stopListening` or `close()` to ask the background pump to exit.
+      ## The pump checks it at every yield point of its auto-reconnect loop, and
+      ## `reconnectInPlace` checks it right after `connect()` returns to discard
+      ## the fresh transport instead of grafting it. Left set deliberately when a
+      ## pump is orphaned on timeout — clearing it would rearm that graft.
     listenReconnecting*: bool
       ## True while the pump is inside its auto-reconnect loop. Tells
       ## `stopListening` that the empty-query unblock it normally uses would race
