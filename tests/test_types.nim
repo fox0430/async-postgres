@@ -9115,3 +9115,65 @@ suite "Float text path accepts PostgreSQL Infinity/-Infinity/NaN":
     let v = (Row @[some(toBytes("{Infinity,-Infinity}"))]).getFloat32Array(0)
     check v[0] == float32(Inf)
     check v[1] == float32(NegInf)
+
+suite "Negative column index":
+  # isBinaryCol/colTypeOid guard `col >= 0` themselves: many accessors call them
+  # before their own cellInfo/isNull bounds check, so without the guard a
+  # negative col reaches `colFormats[col]` (raw IndexDefect, or an out-of-bounds
+  # read once --checks:off elides the subscript check).
+  let binRow = mkRow(@[some(toBytes("x"))], @[mkField(OidText, 1'i16)])
+  let textRow = mkRow(@[some(toBytes("x"))], @[mkField(OidText, 0'i16)])
+  # colFormats/colTypeOids are empty here, so a negative subscript would hit a
+  # nil seq rather than merely reading before the start of a live allocation.
+  let bareRow = Row @[some(toBytes("x"))]
+
+  test "isBinaryCol returns false instead of subscripting":
+    for row in [binRow, textRow, bareRow]:
+      check not row.isBinaryCol(-1)
+      check not row.isBinaryCol(-8)
+      check not row.isBinaryCol(int.low)
+
+  test "colTypeOid returns 0 instead of subscripting":
+    for row in [binRow, textRow, bareRow]:
+      check row.colTypeOid(-1) == 0'i32
+      check row.colTypeOid(int.low) == 0'i32
+
+  test "isBinaryCol still reports the format for valid columns":
+    check binRow.isBinaryCol(0)
+    check not textRow.isBinaryCol(0)
+    check binRow.colTypeOid(0) == OidText
+
+  test "isBinaryCol-first accessors report the column index":
+    # These call isBinaryCol before cellInfo; the guard lets them fall through
+    # to the bounds check that produces the intended message.
+    expect IndexDefect:
+      discard binRow.getUuid(-1)
+    expect IndexDefect:
+      discard binRow.getDate(-1)
+    expect IndexDefect:
+      discard binRow.getNumeric(-1)
+    expect IndexDefect:
+      discard binRow.getPoint(-1)
+    expect IndexDefect:
+      discard binRow.getIntArray(-1)
+    expect IndexDefect:
+      discard binRow.getInt4Range(-1)
+
+  test "cellInfo-first accessors are unchanged":
+    expect IndexDefect:
+      discard binRow.getStr(-1)
+    expect IndexDefect:
+      discard binRow.getInt(-1)
+
+  test "getArrayND reports the index, not a format mismatch":
+    expect IndexDefect:
+      discard getArrayND[int32](binRow, -1)
+    expect IndexDefect:
+      discard binRow.getMoneyArrayND(-1)
+
+  test "negative index message names the column":
+    try:
+      discard binRow.getUuid(-1)
+      check false
+    except IndexDefect as e:
+      check "column index -1" in e.msg

@@ -111,11 +111,13 @@ proc isNull*(row: Row, col: int): bool =
 
 proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
   ## Check if column was received in binary format.
-  row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
+  # `col >= 0` first: many accessors call this before their `cellInfo`/`isNull`
+  # bounds check, so a negative col would reach `colFormats[col]` here.
+  col >= 0 and row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
 
 proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
   ## Get the type OID for a column, or 0 if not available.
-  if row.data.colTypeOids.len > col:
+  if col >= 0 and row.data.colTypeOids.len > col:
     row.data.colTypeOids[col]
   else:
     0'i32
@@ -1518,11 +1520,13 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
         "accessor (getTsVectorArray / getTsQueryArray) instead; " &
         "PgArray[T] currently has no multi-dim equivalent for these types."
     .}
+  # cellInfo first so an out-of-range col reports as an index error rather than
+  # the misleading "requires binary column format".
+  let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
       PgTypeError, "getArrayND requires binary column format (col " & $col & ")"
     )
-  let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
@@ -1580,11 +1584,12 @@ proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
   ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
   if scale < 0 or scale > 18:
     raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  # cellInfo first (see getArrayND).
+  let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
       PgTypeError, "getMoneyArrayND requires binary column format (col " & $col & ")"
     )
-  let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
