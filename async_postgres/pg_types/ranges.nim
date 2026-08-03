@@ -441,11 +441,12 @@ proc toPgTsTzRangeParam*(v: PgRange[DateTime]): PgParam =
   )
 
 proc toPgDateRangeParam*(v: PgRange[DateTime]): PgParam =
-  ## Encode a date range. DateTime values are formatted as date-only.
+  ## Encode a date range. DateTime values are formatted as date-only, taking the
+  ## UTC calendar day so zoned bounds match the binary ``pgDateDays`` path.
   PgParam(
     oid: OidDateRange,
     format: 0,
-    value: some(toBytes(formatDateTimeRangeText(v, pgDateRangeFmt))),
+    value: some(toBytes(formatDateTimeRangeText(v, pgDateRangeFmt, utc = true))),
   )
 
 proc toPgRangeParam*[T](v: PgRange[T], oid: int32): PgParam =
@@ -638,11 +639,12 @@ proc toPgTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
   )
 
 proc toPgDateRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
-  ## Encode a ``daterange[]``. DateTime values are formatted as date-only.
+  ## Encode a ``daterange[]``. DateTime values are formatted as date-only, taking
+  ## the UTC calendar day so zoned bounds match the binary ``pgDateDays`` path.
   PgParam(
     oid: OidDateRangeArray,
     format: 0,
-    value: some(toBytes(encodeDateTimeRangeArrayText(v, pgDateRangeFmt))),
+    value: some(toBytes(encodeDateTimeRangeArrayText(v, pgDateRangeFmt, utc = true))),
   )
 
 # Range text format getters
@@ -798,13 +800,14 @@ proc toPgTsTzMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
   PgParam(oid: OidTsTzMultirange, format: 0, value: some(toBytes(s)))
 
 proc toPgDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
-  ## Encode a date multirange. DateTime values are formatted as date-only.
+  ## Encode a date multirange. DateTime values are formatted as date-only, taking
+  ## the UTC calendar day so zoned bounds match the binary ``pgDateDays`` path.
   var s = "{"
   let ranges = seq[PgRange[DateTime]](v)
   for i, r in ranges:
     if i > 0:
       s.add(',')
-    s.add(formatDateTimeRangeText(r, pgDateRangeFmt))
+    s.add(formatDateTimeRangeText(r, pgDateRangeFmt, utc = true))
   s.add('}')
   PgParam(oid: OidDateMultirange, format: 0, value: some(toBytes(s)))
 
@@ -995,35 +998,15 @@ proc toPgTsTzMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
   )
 
 proc toPgDateMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
-  ## Encode date multirange array. DateTime values are formatted as date-only.
-  var s = "{"
-  for i, x in v:
-    if i > 0:
-      s.add(',')
-    s.add('"')
-    var mrStr = "{"
-    let ranges = seq[PgRange[DateTime]](x)
-    for j, r in ranges:
-      if j > 0:
-        mrStr.add(',')
-      if r.isEmpty:
-        mrStr.add("empty")
-      else:
-        mrStr.add(if r.hasLower and r.lower.inclusive: "[" else: "(")
-        if r.hasLower:
-          mrStr.add(r.lower.value.format("yyyy-MM-dd"))
-        mrStr.add(',')
-        if r.hasUpper:
-          mrStr.add(r.upper.value.format("yyyy-MM-dd"))
-        mrStr.add(if r.hasUpper and r.upper.inclusive: "]" else: ")")
-    mrStr.add('}')
-    for c in mrStr:
-      if c == '"' or c == '\\':
-        s.add('\\')
-      s.add(c)
-    s.add('"')
-  s.add('}')
-  PgParam(oid: OidDateMultirangeArray, format: 0, value: some(toBytes(s)))
+  ## Encode date multirange array. DateTime values are formatted as date-only,
+  ## taking the UTC calendar day so zoned bounds match the binary
+  ## ``pgDateDays`` path.
+  PgParam(
+    oid: OidDateMultirangeArray,
+    format: 0,
+    value:
+      some(toBytes(encodeDateTimeMultirangeArrayText(v, pgDateRangeFmt, utc = true))),
+  )
 
 # Multirange text format getters
 

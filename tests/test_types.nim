@@ -589,6 +589,15 @@ suite "getDate accessor":
     check dt.month == mJan
     check dt.monthday == 15
 
+  test "text date decodes in UTC, matching the binary path":
+    # Regression: the text path parsed with the local zone, so the same date
+    # decoded to a different absolute instant than decodeBinaryDate. DateTime
+    # equality compares instants, so the two paths compared unequal outside UTC.
+    let text = @[some(toBytes("2024-01-15"))].getDate(0)
+    check text.utcOffset == 0
+    let bin = toPgBinaryDateParam(dateTime(2024, mJan, 15, 0, 0, 0, 0, utc()))
+    check text == decodeBinaryDate(bin.value.get)
+
   test "invalid date raises":
     let row = @[some(toBytes("not-a-date"))]
     var raised = false
@@ -888,6 +897,36 @@ suite "date parameter encoding":
     check p.value.isSome
     let s = cast[string](p.value.get())
     check s == "2024-01-15"
+
+  test "toPgDateParam with non-UTC zone encodes the UTC calendar day":
+    # Regression: the text date path used to serialize the DateTime's own wall
+    # clock, so a zoned value landed on a different day than toPgBinaryDateParam
+    # derived from the same instant. utcOffset counts seconds WEST of UTC, so
+    # JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    # 05:00 JST is still the previous day in UTC.
+    let dt = dateTime(2024, mJan, 15, 5, 0, 0, 0, jst)
+    let p = toPgDateParam(dt)
+    check p.oid == OidDate
+    check toString(p.value.get) == "2024-01-14"
+    # The binary encoder already used the UTC day; both must now agree.
+    let bin = toPgBinaryDateParam(dt)
+    let row = mkRow(@[bin.value], @[mkField(OidDate, 1)])
+    let decoded = row.getDate(0)
+    check decoded.year == 2024
+    check decoded.month == mJan
+    check decoded.monthday == 14
 
   test "toPgBinaryDateParam roundtrip":
     let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
@@ -4883,6 +4922,44 @@ suite "Range toPgParam":
     let p = toPgDateRangeParam(rangeOf(dt1, dt2))
     check p.oid == OidDateRange
     check p.value.get.toString == "[2023-01-01,2023-12-31)"
+
+  test "date ranges with non-UTC zone encode the UTC calendar day":
+    # Regression: every daterange text encoder (range, array, multirange,
+    # multirange array) serialized the DateTime's own wall clock, landing on a
+    # different day than the binary pgDateDays path. utcOffset counts seconds
+    # WEST of UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    # Both bounds are at 05:00 JST, still the previous day in UTC.
+    let dt1 = dateTime(2024, mJan, 15, 5, 0, 0, 0, jst)
+    let dt2 = dateTime(2024, mJan, 20, 5, 0, 0, 0, jst)
+    let r = rangeOf(dt1, dt2)
+
+    let p = toPgDateRangeParam(r)
+    check p.oid == OidDateRange
+    check p.value.get.toString == "[2024-01-14,2024-01-19)"
+
+    let ap = toPgDateRangeArrayParam(@[r])
+    check ap.oid == OidDateRangeArray
+    check ap.value.get.toString == "{\"[2024-01-14,2024-01-19)\"}"
+
+    let mp = toPgDateMultirangeParam(toMultirange(r))
+    check mp.oid == OidDateMultirange
+    check mp.value.get.toString == "{[2024-01-14,2024-01-19)}"
+
+    let map = toPgDateMultirangeArrayParam(@[toMultirange(r)])
+    check map.oid == OidDateMultirangeArray
+    check map.value.get.toString == "{\"{[2024-01-14,2024-01-19)}\"}"
 
   test "empty range":
     let p = toPgParam(emptyRange[int32]())

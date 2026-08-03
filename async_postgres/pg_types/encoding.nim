@@ -143,7 +143,9 @@ proc toPgParam*(v: DateTime): PgParam =
 
 proc toPgDateParam*(v: DateTime): PgParam =
   ## Encode a DateTime as a date parameter (OID 1082).
-  let s = v.format("yyyy-MM-dd")
+  # Take the UTC calendar day so a zoned DateTime encodes the same day as
+  # toPgBinaryDateParam, whose pgDateDays goes through toTime().
+  let s = v.utc.format("yyyy-MM-dd")
   PgParam(oid: OidDate, format: 0, value: some(toBytes(s)))
 
 proc toPgTimestampTzParam*(v: DateTime): PgParam =
