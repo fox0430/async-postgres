@@ -4172,6 +4172,14 @@ suite "Composite text parser":
       raised = true
     check raised
 
+  test "parseCompositeText unterminated quoted field raises":
+    expect PgTypeError:
+      discard parseCompositeText("(\"abc)")
+
+  test "parseCompositeText garbage after closing quote raises":
+    expect PgTypeError:
+      discard parseCompositeText("(\"a\"b)")
+
   test "encodeCompositeText simple":
     let s = encodeCompositeText(@[some("1"), some("2")])
     check s == "(1,2)"
@@ -4884,6 +4892,51 @@ suite "Range text parsing":
     )
     check parsed == orig
 
+  test "reject missing lower boundary bracket":
+    # "[1,2" would previously silently drop the upper element.
+    expect PgTypeError:
+      discard parseRangeText[int32](
+        "[1,2",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject missing upper boundary bracket":
+    expect PgTypeError:
+      discard parseRangeText[int32](
+        "1,2]",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject non-bracket boundary chars":
+    expect PgTypeError:
+      discard parseRangeText[int32](
+        "X1,2Y",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject unterminated quoted lower element":
+    # `["abc,def)` — closing quote missing; previous code silently dropped
+    # trailing bytes and mis-parsed the upper bound.
+    expect PgTypeError:
+      discard parseRangeText[string](
+        "[\"abc,def)",
+        proc(s: string): string =
+          s,
+      )
+
+  test "reject trailing bytes after quoted element":
+    # `["abc"xyz,def)` — the caller previously discarded `pos` from
+    # parseRangeElem so `xyz` was silently dropped.
+    expect PgTypeError:
+      discard parseRangeText[string](
+        "[\"abc\"xyz,def)",
+        proc(s: string): string =
+          s,
+      )
+
 suite "Range toPgParam":
   test "int4range":
     let p = toPgParam(rangeOf(1'i32, 10'i32))
@@ -5395,6 +5448,59 @@ suite "Multirange text parsing":
     check mr.len == 2
     check mr[0].isEmpty
     check mr[1] == rangeOf(3'i32, 4'i32)
+
+  test "reject stray closing bracket":
+    # `{1,2)}` previously produced an empty multirange silently.
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{1,2)}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject trailing bytes after last range":
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{[1,2)garbage}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject trailing comma after empty":
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{empty,}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject 'empty' followed by non-comma":
+    # `{emptyx}` — prefix-matched "empty" then failed the delimiter check.
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{emptyx}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject unterminated range":
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{[1,2}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "quoted element containing closing bracket is not mis-split":
+    # `{["a]b",c)}` — bracket inside a quoted element must not affect nesting.
+    let mr = parseMultirangeText[string](
+      "{[\"a]b\",c)}",
+      proc(s: string): string =
+        s,
+    )
+    check mr.len == 1
+    check mr[0].lower.value == "a]b"
+    check mr[0].upper.value == "c"
 
 suite "Multirange row getters":
   test "getInt4Multirange text":
@@ -6887,6 +6993,40 @@ suite "Binary decoder validation":
       0x00, # dscale
       0x00,
       0x01, # only 1 digit (need 2)
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeNumericBinary rejects out-of-range base-10000 digit":
+    # ndigits = 1, digit = 10000 (> 9999) — violates PgNumeric.digits invariant.
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x01, # ndigits = 1
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+      0x27,
+      0x10, # digit = 10000
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeNumericBinary rejects negative base-10000 digit":
+    # digit high bit set -> parses as negative int16.
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x01, # ndigits = 1
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+      0xFF,
+      0xFF, # digit = -1
     ]
     expect PgTypeError:
       discard decodeNumericBinary(data)
