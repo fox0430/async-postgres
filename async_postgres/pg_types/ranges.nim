@@ -299,16 +299,20 @@ proc parseRangeElem(
     # Quoted element
     i += 1
     var elem = ""
+    var closed = false
     while i < s.len:
       if s[i] == '\\' and i + 1 < s.len:
         i += 1
         elem.add(s[i])
       elif s[i] == '"':
         i += 1
+        closed = true
         break
       else:
         elem.add(s[i])
       i += 1
+    if not closed:
+      raise newException(PgTypeError, "range: unterminated quoted element")
     (elem, i)
   else:
     var elem = ""
@@ -324,6 +328,10 @@ proc parseRangeText*[T](
     return PgRange[T](isEmpty: true)
   if s.len < 3:
     raise newException(PgTypeError, "Invalid range literal: " & s)
+  if s[0] notin {'[', '('}:
+    raise newException(PgTypeError, "range: invalid lower boundary: " & s)
+  if s[^1] notin {']', ')'}:
+    raise newException(PgTypeError, "range: invalid upper boundary: " & s)
   let lowerInc = s[0] == '['
   let upperInc = s[^1] == ']'
   let inner = s[1 ..^ 2]
@@ -351,12 +359,20 @@ proc parseRangeText*[T](
   let upperStr = inner[commaPos + 1 ..^ 1]
   # Parse lower bound
   if lowerStr.len > 0:
-    let (val, _) = parseRangeElem(lowerStr, 0, {','})
+    let (val, pos) = parseRangeElem(lowerStr, 0, {','})
+    if pos != lowerStr.len:
+      raise newException(
+        PgTypeError, "range: trailing bytes after lower element: " & lowerStr
+      )
     result.hasLower = true
     result.lower = PgRangeBound[T](value: parseElem(val), inclusive: lowerInc)
   # Parse upper bound
   if upperStr.len > 0:
-    let (val, _) = parseRangeElem(upperStr, 0, {','})
+    let (val, pos) = parseRangeElem(upperStr, 0, {','})
+    if pos != upperStr.len:
+      raise newException(
+        PgTypeError, "range: trailing bytes after upper element: " & upperStr
+      )
     result.hasUpper = true
     result.upper = PgRangeBound[T](value: parseElem(val), inclusive: upperInc)
 
@@ -719,35 +735,57 @@ proc parseMultirangeText*[T](
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     return PgMultirange[T](@[])
-  # Split on commas that are between ranges (at bracket depth 0)
   var ranges: seq[PgRange[T]]
-  var depth = 0
-  var start = 0
-  for i in 0 ..< inner.len:
-    case inner[i]
-    of '[', '(':
-      depth += 1
-    of ']', ')':
-      depth -= 1
-      if depth == 0:
-        let rangeStr = inner[start .. i]
-        ranges.add(parseRangeText[T](rangeStr, parseElem))
-        start = i + 1
-        # Skip comma and following whitespace
-        if start < inner.len and inner[start] == ',':
-          start += 1
-          while start < inner.len and inner[start] == ' ':
-            start += 1
+  var i = 0
+  while true:
+    # Parse one element: either the literal "empty" or a bracketed range.
+    if inner[i] == '[' or inner[i] == '(':
+      # Scan to the matching closing bracket, honoring quoted-string state so
+      # brackets inside "..." (a quoted element value) don't affect nesting.
+      var j = i + 1
+      var inQuote = false
+      var closed = false
+      while j < inner.len:
+        let c = inner[j]
+        if inQuote:
+          if c == '\\' and j + 1 < inner.len:
+            j += 2
+          elif c == '"':
+            inQuote = false
+            j += 1
+          else:
+            j += 1
+        else:
+          if c == '"':
+            inQuote = true
+            j += 1
+          elif c == ']' or c == ')':
+            j += 1
+            closed = true
+            break
+          else:
+            j += 1
+      if not closed:
+        raise newException(PgTypeError, "multirange: unterminated range in: " & s)
+      ranges.add(parseRangeText[T](inner[i ..< j], parseElem))
+      i = j
+    elif i + 5 <= inner.len and inner[i ..< i + 5] == "empty":
+      ranges.add(PgRange[T](isEmpty: true))
+      i += 5
     else:
-      # Handle "empty" ranges inside multirange
-      if depth == 0 and i == start and inner.len >= start + 5 and
-          inner[start ..< start + 5] == "empty":
-        ranges.add(PgRange[T](isEmpty: true))
-        start = start + 5
-        if start < inner.len and inner[start] == ',':
-          start += 1
-          while start < inner.len and inner[start] == ' ':
-            start += 1
+      raise newException(PgTypeError, "multirange: expected range or 'empty' in: " & s)
+    if i == inner.len:
+      break
+    if inner[i] != ',':
+      raise newException(
+        PgTypeError, "multirange: expected ',' or end after element in: " & s
+      )
+    i += 1
+    # `$` in this module emits ", " between ranges; tolerate the optional space.
+    while i < inner.len and inner[i] == ' ':
+      i += 1
+    if i == inner.len:
+      raise newException(PgTypeError, "multirange: trailing ',' in: " & s)
   PgMultirange[T](ranges)
 
 proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =

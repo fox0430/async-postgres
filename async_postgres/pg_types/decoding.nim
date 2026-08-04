@@ -88,7 +88,12 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric =
     )
   var digits = newSeq[int16](ndigits)
   for i in 0 ..< ndigits:
-    digits[i] = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
+    let d = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
+    # Enforce PgNumeric.digits invariant (each 0..9999). Out-of-range values
+    # would otherwise silently corrupt `$PgNumeric` and cmp results.
+    if d < 0 or d > 9999:
+      raise newException(PgTypeError, "Numeric binary: invalid digit " & $d)
+    digits[i] = d
   PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
 
 proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
