@@ -2178,6 +2178,46 @@ suite "parseTextArray":
       raised = true
     check raised
 
+  test "multi-dimensional unquoted raises":
+    var raised = false
+    var msg = ""
+    try:
+      discard parseTextArray("{{a,b},{c,d}}")
+    except PgTypeError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "PgArray[T]" in msg
+
+  test "multi-dimensional with quoted subelements raises":
+    var raised = false
+    try:
+      discard parseTextArray("{{\"a\",\"b\"},{\"c\",\"d\"}}")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "nested empty subarray raises":
+    var raised = false
+    try:
+      discard parseTextArray("{{}}")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "quoted element containing literal brace is preserved":
+    # Regression guard: '{' inside a quoted element must NOT trigger the
+    # multi-dim reject. Only '{' at element-start position marks nesting.
+    let elems = parseTextArray("{\"{a}\"}")
+    check elems.len == 1
+    check elems[0] == some("{a}")
+
+  test "mixed quoted brace and plain element":
+    let elems = parseTextArray("{\"a\",\"{b}\"}")
+    check elems.len == 2
+    check elems[0] == some("a")
+    check elems[1] == some("{b}")
+
 suite "Array row accessors":
   test "getIntArray":
     let row: Row = @[some(toBytes("{1,2,3}"))]

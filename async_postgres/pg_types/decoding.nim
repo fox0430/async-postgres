@@ -897,8 +897,10 @@ proc parsePointsText*(s: string): seq[PgPoint] =
 # Array text format parser
 
 proc parseTextArray*(s: string): seq[Option[string]] =
-  ## Parse PostgreSQL text-format array literal: {elem1,elem2,...}
+  ## Parse PostgreSQL 1-D text-format array literal: {elem1,elem2,...}
   ## Returns elements as ``Option[string]`` (none for NULL).
+  ## Raises ``PgTypeError`` for multi-dimensional literals; callers that need
+  ## multi-dim support should decode via the ``PgArray[T]`` accessors.
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
     raise newException(PgTypeError, "Invalid array literal: " & s)
   let inner = s[1 ..^ 2]
@@ -906,6 +908,16 @@ proc parseTextArray*(s: string): seq[Option[string]] =
     return @[]
   var i = 0
   while i < inner.len:
+    # A '{' at an element-start position marks a nested subarray. Silently
+    # splitting on ',' would yield garbage fragments (e.g. "{{a,b},{c,d}}"
+    # → ["{a","b}","{c","d}"]), so raise here to mirror the binary path's
+    # rejectMultiDim contract.
+    if inner[i] == '{':
+      raise newException(
+        PgTypeError,
+        "Multi-dimensional array text literal cannot be read as seq; " &
+          "use the PgArray[T] accessor instead",
+      )
     if inner[i] == '"':
       # Quoted element
       i += 1
