@@ -57,8 +57,10 @@ when hasChronos:
       buildCommandComplete("BEGIN") & buildReadyForQuery('T')
     )
 
-  proc makeMinimalPool(): PgPool =
+  proc makeMinimalPool(resetQuery = ""): PgPool =
     ## Minimal PgPool wiring for `pool.withTransaction`; no maintenance/waiters.
+    ## `resetQuery` (with its timeout left at the zero default = no timeout)
+    ## lets tests hang the release path on a scripted server.
     PgPool(
       config: PoolConfig(
         connConfig: ConnConfig(host: "127.0.0.1", port: 5432),
@@ -66,6 +68,7 @@ when hasChronos:
         maxSize: 1,
         maxWaiters: -1,
         maintenanceInterval: seconds(30),
+        resetQuery: resetQuery,
       ),
       idle: initDeque[PooledConn](),
       active: 0,
@@ -321,6 +324,112 @@ when hasChronos:
 
         doAssert sawCancel, "expected CancelledError to propagate immediately"
         doAssert not sawTimeout, "cleanup ran and hung on ROLLBACK"
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+  suite "pool with* macro external cancellation":
+    test "withConnection: cancel during release re-raises CancelledError":
+      # buildReleaseAndReraise's `except CancelledError` arm: a cancel landing
+      # on the release (resetQuery) await must propagate to the caller, and
+      # the half-reset conn must be retired (csClosed) instead of returning
+      # to the idle queue.
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        let pool = makeMinimalPool(resetQuery = "SELECT 1")
+        conn.ownerPool = pool
+        # Pre-seed so acquire() hands back the scripted conn instead of dialing.
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+
+        proc run() {.async.} =
+          pool.withConnection(conn):
+            discard
+
+        let fut = run()
+        # The body completes instantly; the release now awaits the resetQuery
+        # reply, which the scripted server never sends.
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished, "run should be blocked on the reset query"
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError,
+          "release-path cancel must propagate, not be swallowed; got " &
+            (if err.isNil: "nil" else: $err.name)
+        doAssert conn.state == csClosed,
+          "release-path cancel must retire the conn; got " & $conn.state
+        doAssert pool.active == 0, "pool slot must not leak"
+        doAssert pool.idle.len == 0, "half-reset conn must not return to idle"
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+    test "withConnection: cancel of in-flight body releases the conn":
+      # A cancel landing on the body's await is captured as the body error;
+      # the release still runs (discarding the busy conn) and CancelledError
+      # reaches the caller.
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        let pool = makeMinimalPool()
+        conn.ownerPool = pool
+        # Pre-seed so acquire() hands back the scripted conn instead of dialing.
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+
+        proc run() {.async.} =
+          pool.withConnection(conn):
+            discard await conn.simpleQuery("SELECT 1")
+
+        let fut = run()
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished, "run should be blocked on the hung SELECT"
+        doAssert conn.state == csBusy
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError
+        doAssert pool.active == 0, "pool slot must not leak"
+        doAssert pool.idle.len == 0, "busy conn must be discarded, not idle"
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+    test "runAndRelease: cancel during release re-raises CancelledError":
+      # runAndReleaseImpl's `except CancelledError` arm — the shared release
+      # path of the pooled exec/query family. A completed body plus a hung
+      # resetQuery pins the cancel to the release phase.
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        let pool = makeMinimalPool(resetQuery = "SELECT 1")
+        conn.ownerPool = pool
+        # Pre-seed so acquire() hands back the scripted conn instead of dialing.
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+
+        var bodyFut = newFuture[void]()
+        bodyFut.complete()
+
+        # runAndRelease does not acquire; the caller hands it a borrowed conn.
+        let acquired = await pool.acquire()
+        doAssert acquired == conn
+
+        let fut = pool.runAndRelease(acquired, bodyFut)
+        await sleepAsync(milliseconds(100))
+        doAssert not fut.finished, "runAndRelease should be blocked on the reset query"
+        await fut.cancelAndWait()
+
+        doAssert fut.finished
+        let err = fut.readError()
+        doAssert err != nil and err of CancelledError,
+          "release-path cancel must propagate; got " &
+            (if err.isNil: "nil" else: $err.name)
+        doAssert conn.state == csClosed,
+          "release-path cancel must retire the conn; got " & $conn.state
+        doAssert pool.active == 0, "pool slot must not leak"
+        doAssert pool.idle.len == 0, "half-reset conn must not return to idle"
 
         await cleanupScripted(server, sTx)
 

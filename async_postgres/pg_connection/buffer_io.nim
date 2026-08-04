@@ -169,6 +169,8 @@ when hasAsyncDispatch:
 proc compactRecvBuf*(conn: PgConnection) {.inline.} =
   ## Shift unconsumed data to the front of recvBuf, reclaiming space consumed
   ## by the read pointer.  Called only before reading new data from the socket.
+  ## csClosed is the callers' responsibility: `fillRecvBuf` /
+  ## `fillRecvBufDetached` check it in the same frame, so no assertion here.
   let start = conn.recvBufStart
   if start == 0:
     return
@@ -186,11 +188,15 @@ proc fillRecvBuf*(
   ## Read data from socket into buffer. The only await point for message reception.
   ##
   ## On `AsyncTimeoutError` the caller (typically `invalidateOnTimeout`) is
-  ## responsible for the state transition. On any other `CatchableError`
-  ## (transport failure, cancellation, etc.) the connection is marked
-  ## `csClosed` before re-raising, since the read may have consumed an
-  ## indeterminate number of bytes from the socket and the stream is no
-  ## longer parseable.
+  ## responsible for the state transition (the `recvMessage` wrapper does it
+  ## itself). On any other `CatchableError` the connection is marked `csClosed`
+  ## before re-raising: the read may have consumed an indeterminate number of
+  ## bytes from the socket and the stream is no longer parseable.
+  # An orphaned pump can revive here after `invalidateOnTimeout` set csClosed;
+  # refuse a socket read on a connection we've given up on.
+  if conn.state == csClosed:
+    raise
+      newException(PgConnectionError, "fillRecvBuf: connection is closed (csClosed)")
   conn.compactRecvBuf()
   when hasChronos:
     let oldLen = conn.recvBuf.len
@@ -215,6 +221,12 @@ proc fillRecvBuf*(
       conn.recvBuf.setLen(oldLen)
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
+    # An orphan read settling after csClosed must not re-extend the buffer.
+    if conn.state == csClosed:
+      conn.recvBuf.setLen(oldLen)
+      raise newException(
+        PgConnectionError, "fillRecvBuf: connection was closed during readOnce"
+      )
     conn.recvBuf.setLen(oldLen + n)
   elif hasAsyncDispatch:
     # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
@@ -242,6 +254,12 @@ proc fillRecvBuf*(
       conn.recvBuf.setLen(oldLen)
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
+    # An orphan `recvInto` settling after csClosed must not re-extend the buffer.
+    if conn.state == csClosed:
+      conn.recvBuf.setLen(oldLen)
+      raise newException(
+        PgConnectionError, "fillRecvBuf: connection was closed during recvInto"
+      )
     conn.recvBuf.setLen(oldLen + n)
 
 when hasChronos:
@@ -257,6 +275,11 @@ when hasChronos:
     ## timer wakes and parses between them, so it reads through here instead (see
     ## ``replFillRecvBuf``). On any read failure the connection is marked
     ## ``csClosed`` before re-raising, matching ``fillRecvBuf``.
+    # Entrance guard, as in ``fillRecvBuf``: no fresh read on csClosed.
+    if conn.state == csClosed:
+      raise newException(
+        PgConnectionError, "fillRecvBufDetached: connection is closed (csClosed)"
+      )
     if conn.replReadScratch.len < RecvBufSize:
       conn.replReadScratch.setLen(RecvBufSize)
     let n =
@@ -268,6 +291,12 @@ when hasChronos:
     if n == 0:
       conn.state = csClosed
       raise newException(PgConnectionError, "Connection closed by server")
+    # Exit guard: a read settling after the caller flipped csClosed must not
+    # re-extend recvBuf.
+    if conn.state == csClosed:
+      raise newException(
+        PgConnectionError, "fillRecvBufDetached: connection was closed during readOnce"
+      )
     conn.compactRecvBuf()
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + n)
@@ -367,11 +396,19 @@ proc recvMessage*(
 ): Future[BackendMessage] {.async.} =
   ## Receive a single backend message from the connection.
   ## Thin wrapper around nextMessage + fillRecvBuf for backward compatibility.
+  ##
+  ## On `AsyncTimeoutError` the connection is set `csClosed` before re-raising
+  ## (the partial read leaves the byte stream unparseable); no CancelRequest is
+  ## dispatched — callers needing that must invalidate explicitly.
   while true:
     let opt = conn.nextMessage(rowData, rowCount)
     if opt.isSome:
       return opt.get
-    await conn.fillRecvBuf(timeout)
+    try:
+      await conn.fillRecvBuf(timeout)
+    except AsyncTimeoutError as e:
+      conn.state = csClosed
+      raise e
 
 template pumpUntilReady*(
     conn: PgConnection,

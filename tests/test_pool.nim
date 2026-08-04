@@ -673,6 +673,202 @@ suite "Pool resetSession":
     )
     check cfg.resetQueryTimeout == ZeroDuration
 
+suite "Pool withConnection release-path Defect":
+  when hasChronos:
+    test "withConnection wraps a release-path Defect in PgPoolError":
+      # Regression: a Defect raised by the release path (resetSession's
+      # synchronous prelude — here the unlock_all exec) must surface as
+      # PgPoolError instead of escaping raw, since chronos re-raises Defects
+      # eagerly from continuations.
+      proc t() {.async.} =
+        let pool = makePool()
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.writer = defectWriter()
+        conn.sessionLockDirty = true # forces unlock_all through the writer
+        pool.idle.addLast(conn.toPooled())
+
+        var caught = false
+        try:
+          pool.withConnection(c):
+            doAssert c == conn
+            doAssert pool.active == 1
+        except PgPoolError:
+          caught = true
+
+        doAssert caught
+        # The conn was discarded (session reset failed), so it is not idle.
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 0
+
+      waitFor t()
+
+    test "withConnection does not shadow a body error with a release Defect":
+      # Regression: when both the body and the release path raise, the body's
+      # error must survive (the release Defect is dropped), matching the
+      # CatchableError arm's "Never shadow" guard.
+      proc t() {.async.} =
+        let pool = makePool()
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.writer = defectWriter()
+        conn.sessionLockDirty = true # forces unlock_all through the writer
+        pool.idle.addLast(conn.toPooled())
+
+        var caught: ref ValueError = nil
+        try:
+          pool.withConnection(c):
+            doAssert c == conn
+            raise newException(ValueError, "body error")
+        except ValueError as e:
+          caught = e
+
+        doAssert caught != nil,
+          "the body error must not be shadowed by the release Defect"
+        doAssert caught.msg == "body error"
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 0
+
+      waitFor t()
+
+    test "withConnection keeps the body Defect as the parent when release also raises":
+      # Regression: with a body Defect and a release-path Defect, the raised
+      # PgPoolError must wrap the body Defect (parent), not the release one.
+      proc t() {.async.} =
+        let pool = makePool()
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.writer = defectWriter()
+        conn.sessionLockDirty = true # forces unlock_all through the writer
+        pool.idle.addLast(conn.toPooled())
+
+        var caught: ref PgPoolError = nil
+        try:
+          pool.withConnection(c):
+            raise newException(AssertionDefect, "body defect")
+        except PgPoolError as e:
+          caught = e
+
+        doAssert caught != nil, "the body Defect must surface as PgPoolError"
+        doAssert caught.parent of AssertionDefect,
+          "the body Defect must be the parent, not the release Defect"
+        doAssert caught.parent.msg == "body defect",
+          "parent must be the body Defect, got: " & $caught.parent.msg
+        doAssert pool.active == 0
+
+      waitFor t()
+
+  when hasAsyncDispatch:
+    # asyncdispatch has no mock writer, so the release-path Defect is injected
+    # through the `onLeakedSessionLocks` tracer hook. The Defect arms are
+    # backend-shared and must match the chronos writer-based tests above.
+
+    test "withConnection wraps a release-path Defect in PgPoolError (tracer-raised)":
+      # Regression: a Defect raised by the release path (here via the tracer
+      # hook) must surface as PgPoolError instead of escaping raw, matching
+      # the chronos writer-based arm.
+      proc t() {.async.} =
+        let pool = makePool()
+        let tracer = PgTracer()
+        tracer.onLeakedSessionLocks = proc(
+            data: TraceLeakedSessionLocksData
+        ) {.gcsafe, raises: [].} =
+          raise newException(AssertionDefect, "boom")
+        pool.config.tracer = tracer
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.sessionLockDirty = true # forces the unlock_all path (and the hook)
+        pool.idle.addLast(conn.toPooled())
+
+        var caught: ref PgPoolError = nil
+        try:
+          pool.withConnection(c):
+            doAssert c == conn
+            doAssert pool.active == 1
+        except PgPoolError as e:
+          caught = e
+
+        doAssert caught != nil, "the release-path Defect must surface as PgPoolError"
+        doAssert caught.parent of AssertionDefect,
+          "the Defect must be preserved as parent"
+        # asyncdispatch appends an async traceback to the message.
+        doAssert caught.parent.msg.startsWith("boom"),
+          "the Defect must be preserved as parent, got: " & $caught.parent.msg
+        # The conn was discarded (session reset failed while dirty), so it is
+        # not idle.
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 0
+
+      waitFor t()
+
+    test "withConnection does not shadow a body error with a tracer-raised release Defect":
+      # Regression: when both the body and the release path raise, the body's
+      # error must survive (the release Defect is dropped), matching the
+      # CatchableError arm's "Never shadow" guard.
+      proc t() {.async.} =
+        let pool = makePool()
+        let tracer = PgTracer()
+        tracer.onLeakedSessionLocks = proc(
+            data: TraceLeakedSessionLocksData
+        ) {.gcsafe, raises: [].} =
+          raise newException(AssertionDefect, "boom")
+        pool.config.tracer = tracer
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.sessionLockDirty = true # forces the unlock_all path (and the hook)
+        pool.idle.addLast(conn.toPooled())
+
+        var caught: ref ValueError = nil
+        try:
+          pool.withConnection(c):
+            doAssert c == conn
+            raise newException(ValueError, "body error")
+        except ValueError as e:
+          caught = e
+
+        doAssert caught != nil,
+          "the body error must not be shadowed by the release Defect"
+        # asyncdispatch appends an async traceback to the message.
+        doAssert caught.msg.startsWith("body error"),
+          "the body error must survive, got: " & $caught.msg
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 0
+
+      waitFor t()
+
+    test "withConnection keeps the body Defect as the parent when the tracer also raises":
+      # Regression: with a body Defect and a release-path Defect, the raised
+      # PgPoolError must wrap the body Defect (parent), not the release one.
+      proc t() {.async.} =
+        let pool = makePool()
+        let tracer = PgTracer()
+        tracer.onLeakedSessionLocks = proc(
+            data: TraceLeakedSessionLocksData
+        ) {.gcsafe, raises: [].} =
+          raise newException(AssertionDefect, "boom")
+        pool.config.tracer = tracer
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.sessionLockDirty = true # forces the unlock_all path (and the hook)
+        pool.idle.addLast(conn.toPooled())
+
+        var caught: ref PgPoolError = nil
+        try:
+          pool.withConnection(c):
+            raise newException(AssertionDefect, "body defect")
+        except PgPoolError as e:
+          caught = e
+
+        doAssert caught != nil, "the body Defect must surface as PgPoolError"
+        doAssert caught.parent of AssertionDefect,
+          "the body Defect must be the parent, not the release Defect"
+        # asyncdispatch appends an async traceback to the message.
+        doAssert caught.parent.msg.startsWith("body defect"),
+          "parent must be the body Defect, got: " & $caught.parent.msg
+        doAssert pool.active == 0
+
+      waitFor t()
+
 suite "Pool acquire":
   test "acquire from idle":
     let pool = makePool()

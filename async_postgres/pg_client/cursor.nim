@@ -276,10 +276,10 @@ template withCursor*(
   ##
   ## A failure in the automatic `close` never masks an exception raised by
   ## `body`: the body error is captured and re-raised after the close attempt.
-  ## (A `finally` block cannot be used here because an `await` inside `finally`
-  ## clobbers the in-flight exception under asyncdispatch, silently discarding
-  ## the body's error.) If `body` succeeds, a close failure propagates to the
-  ## caller.
+  ## (A `finally` block cannot be used here — on asyncdispatch a failing
+  ## `await` in a `finally` replaces the in-flight exception, silently
+  ## discarding the body's error.) If `body` succeeds, a close failure
+  ## propagates to the caller.
   let cursorName =
     await conn.openCursor(sql, chunkSize = chunks, timeout = cursorTimeout)
   var bodyErr: ref CatchableError = nil
