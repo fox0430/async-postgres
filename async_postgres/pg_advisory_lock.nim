@@ -357,12 +357,14 @@ proc advisoryTryLockXactShared*(
 # evaluated exactly once via ``genSym``-bound ``let`` bindings.
 #
 # ``advisoryUnlock*`` failures are swallowed so they cannot mask the original
-# exception raised by ``body``: the body exception is captured and re-raised
-# after the unlock attempt. (A ``finally`` block cannot be used here — on
-# asyncdispatch a failing ``await`` in a ``finally`` replaces the in-flight
-# exception, silently discarding the body's error.) The unlock failure is
-# reported through the connection's tracer (``onAdvisoryUnlockFailed``). If
-# the connection is lost the session lock is released server-side anyway.
+# exception raised by ``body``. The body exception (including ``Defect``) is
+# captured and re-raised after the unlock attempt, so the session lock is
+# released even on a programming error in the body. A ``finally`` block is
+# unusable here: on asyncdispatch a failing ``await`` in a ``finally``
+# replaces the in-flight exception, discarding the body's error. Unlock
+# failures are reported via the connection's tracer
+# (``onAdvisoryUnlockFailed``); if the connection is lost the server releases
+# the session lock anyway.
 
 template withAdvisoryLockCore(
     c: PgConnection,
@@ -388,10 +390,15 @@ template withAdvisoryLockCore(
       await c.lockProc(k)
 
   var bodyErr: ref CatchableError = nil
+  var bodyDefect: ref Defect = nil
   try:
     body
   except CatchableError as e:
     bodyErr = e
+  except Defect as d:
+    # A ``Defect`` is not a ``CatchableError``: it would skip the unlock and
+    # leak the session lock, so capture and re-raise it raw.
+    bodyDefect = d
 
   try:
     var released: bool
@@ -414,9 +421,11 @@ template withAdvisoryLockCore(
     fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, e)
 
   if bodyErr != nil:
-    # Re-raise the original body exception (if any) now that the lock has been
-    # released, so a swallowed unlock failure can never mask it.
+    # Re-raise the original body exception now that the lock has been released,
+    # so a swallowed unlock failure can never mask it.
     raise bodyErr
+  if bodyDefect != nil:
+    raise bodyDefect
 
 macro withAdvisoryLock*(conn: PgConnection, key: int64, body: untyped): untyped =
   ## Acquire a session-level exclusive advisory lock, execute ``body``,
