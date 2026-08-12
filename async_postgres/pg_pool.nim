@@ -318,9 +318,10 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   ## Swallows `CatchableError` (invoked from `finally`, so a raised reset
   ## error would mask the body's original exception) but re-raises
   ## `CancelledError` — chronos requires cancellation to propagate. A `Defect`
-  ## is re-raised after marking `csClosed` (the reset did not complete).
-  ## Callers must chain `release()` under `try/finally` (or use
-  ## `resetSessionAndRelease`) to keep pool accounting balanced on cancel.
+  ## is re-raised as `PgPoolError` (the Defect as `parent`) after marking
+  ## `csClosed` (the reset did not complete). Callers must chain `release()`
+  ## under `try/finally` (or use `resetSessionAndRelease`) to keep pool
+  ## accounting balanced on cancel.
   if conn.state != csReady or conn.txStatus != tsIdle:
     return
   if pool.config.resetQuery.len == 0 and not conn.sessionLockDirty:
@@ -355,10 +356,11 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   except CatchableError:
     # Defer close to releaseCore's closeNoWait to avoid double-counting metrics.
     conn.state = csClosed
-  except Defect:
-    # Incomplete reset: mark csClosed so the conn is discarded, then re-raise.
+  except Defect as d:
+    # Incomplete reset: mark csClosed so the conn is discarded, then re-raise
+    # wrapped (a raw Defect cannot cross a chronos async boundary).
     conn.state = csClosed
-    raise
+    raise newException(PgPoolError, d.msg, d)
 
 proc computeConnectBackoff*(initial, maxDelay: Duration, failures: int): Duration =
   ## Exponential backoff for repeated connect failures: returns
