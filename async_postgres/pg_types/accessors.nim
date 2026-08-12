@@ -4,9 +4,13 @@ import ../pg_protocol
 import core, decoding, encoding
 
 proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
+  # `except PgError` would miss an out-of-range col and crash the process
+  # (UB in -d:release). Same family as the other accessor errors here so
+  # callers only need one `except PgTypeError` clause.
   if col < 0 or col >= int(row.data.numCols):
     raise newException(
-      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
     )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   result.off = int(row.data.cellIndex[idx])
@@ -101,21 +105,24 @@ proc contains*(cr: CommandResult, s: string): bool {.inline.} =
   s in cr.commandTag
 
 proc isNull*(row: Row, col: int): bool =
-  ## Check if the column value is NULL.
+  ## Check if the column value is NULL. Raises `PgTypeError` on out-of-range
+  ## column index (see cellInfo for why not IndexDefect).
   if col < 0 or col >= int(row.data.numCols):
     raise newException(
-      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
     )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   row.data.cellIndex[idx + 1] == -1'i32
 
 proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
   ## Check if column was received in binary format.
-  row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
+  # `col >= 0` first: many accessors call this before their `cellInfo`/`isNull`
+  # bounds check, so a negative col would reach `colFormats[col]` here.
+  col >= 0 and row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
 
 proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
   ## Get the type OID for a column, or 0 if not available.
-  if row.data.colTypeOids.len > col:
+  if col >= 0 and row.data.colTypeOids.len > col:
     row.data.colTypeOids[col]
   else:
     0'i32
@@ -132,7 +139,9 @@ template raiseIfBadNumericBinary(col, clen: int) =
 
 proc getStr*(row: Row, col: int): string =
   ## Get a column value as a string. Handles binary-to-text conversion for
-  ## common types (bool, int2/4/8, float4/8). Raises `PgTypeError` on NULL.
+  ## common types (bool, int2/4/8, float4/8, numeric). Raises `PgTypeError` on
+  ## NULL, or on a binary-safe OID this proc cannot stringify — use a typed
+  ## accessor or `resultFormat = rfText` in that case.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -185,8 +194,17 @@ proc getStr*(row: Row, col: int): string =
     of OidNumeric:
       raiseIfBadNumericBinary(col, clen)
       return $decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
+    of 17, 25, 1043:
+      discard # bytea/text/varchar: binary payload is already raw bytes
     else:
-      discard # text, varchar, bytea: fall through to raw copy
+      # Skip user-defined OIDs (enums, custom types): no binary form, payload
+      # is raw text — raw-copy is correct.
+      if isBinarySafeOid(oid):
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": cannot render binary OID " & $oid &
+            " as string; use a typed accessor or resultFormat = rfText",
+        )
   result = readString(row.data.buf, off, clen)
 
 proc getInt*(row: Row, col: int): int32 =
@@ -1507,11 +1525,13 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
         "accessor (getTsVectorArray / getTsQueryArray) instead; " &
         "PgArray[T] currently has no multi-dim equivalent for these types."
     .}
+  # cellInfo first so an out-of-range col reports as an index error rather than
+  # the misleading "requires binary column format".
+  let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
       PgTypeError, "getArrayND requires binary column format (col " & $col & ")"
     )
-  let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
@@ -1569,11 +1589,12 @@ proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
   ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
   if scale < 0 or scale > 18:
     raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  # cellInfo first (see getArrayND).
+  let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
       PgTypeError, "getMoneyArrayND requires binary column format (col " & $col & ")"
     )
-  let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))

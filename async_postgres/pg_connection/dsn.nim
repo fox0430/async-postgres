@@ -283,6 +283,10 @@ proc rawHostLists(c: ConnConfig): tuple[hosts, addrs, ports: seq[string]] =
   if samePorts:
     result.ports = @[result.ports[0]]
 
+const maxSockOptInt = int64(high(cint))
+  ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
+  ## into an uncatchable RangeDefect at connect time instead of a PgError here.
+
 proc applyParam*(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
   ##
@@ -330,6 +334,11 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       secs = parseInt(val)
     except ValueError:
       raise newException(PgError, "Invalid connect_timeout: " & val)
+    # `seconds` builds a nanosecond Duration, so anything past this multiplies
+    # past high(int64) and raises an uncatchable OverflowDefect.
+    const maxTimeoutSecs = high(int64) div 1_000_000_000
+    if int64(secs) > maxTimeoutSecs:
+      raise newException(PgError, "connect_timeout out of range: " & val)
     # libpq treats a zero or negative connect_timeout as "wait indefinitely";
     # ZeroDuration is this codebase's "no timeout" sentinel. Mapping <= 0 here
     # avoids building a negative Duration, which would make `wait` time out
@@ -365,6 +374,8 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "Invalid keepalives_idle: " & val)
     if result.keepAliveIdle < 0:
       raise newException(PgError, "keepalives_idle must be non-negative: " & val)
+    if int64(result.keepAliveIdle) > maxSockOptInt:
+      raise newException(PgError, "keepalives_idle out of range: " & val)
   of "keepalives_interval":
     try:
       result.keepAliveInterval = parseInt(val)
@@ -372,6 +383,8 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "Invalid keepalives_interval: " & val)
     if result.keepAliveInterval < 0:
       raise newException(PgError, "keepalives_interval must be non-negative: " & val)
+    if int64(result.keepAliveInterval) > maxSockOptInt:
+      raise newException(PgError, "keepalives_interval out of range: " & val)
   of "keepalives_count":
     try:
       result.keepAliveCount = parseInt(val)
@@ -379,6 +392,8 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
       raise newException(PgError, "Invalid keepalives_count: " & val)
     if result.keepAliveCount < 0:
       raise newException(PgError, "keepalives_count must be non-negative: " & val)
+    if int64(result.keepAliveCount) > maxSockOptInt:
+      raise newException(PgError, "keepalives_count out of range: " & val)
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
   of "load_balance_hosts":

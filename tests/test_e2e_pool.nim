@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, math, importutils, net]
+import std/[unittest, options, strutils, math, importutils, net, deques]
 
 import
   ../async_postgres/[
@@ -8,6 +8,7 @@ import
 
 import e2e_common
 
+privateAccess(PgPool)
 privateAccess(PgConnection)
 
 suite "E2E: Connection Pool":
@@ -828,5 +829,258 @@ suite "E2E: queryRowOpt via pool":
       let empty = await pool.queryRowOpt("SELECT 1 WHERE false")
       doAssert empty.isNone
       await pool.close()
+
+    waitFor t()
+
+suite "E2E: withConnection body-exception release":
+  test "withConnection releases the connection when the body raises a Defect":
+    # Regression: a Defect raised in the body must still release the
+    # connection (captured, released, re-raised wrapped in `PgPoolError`
+    # with the Defect as `parent`), not leak a pool slot.
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 3))
+      defer:
+        await pool.close()
+
+      for i in 0 ..< 2:
+        var caught: ref PgPoolError = nil
+        try:
+          pool.withConnection(conn):
+            raise newException(AssertionDefect, "boom")
+        except PgPoolError as e:
+          caught = e
+        doAssert caught != nil, "body Defect must surface as PgPoolError"
+        doAssert caught.parent of Defect,
+          "the original Defect must be preserved as parent"
+        doAssert pool.activeCount == 0
+
+    waitFor t()
+
+  test "withConnection re-raises a body error after a failed release":
+    # Regression: a body exception must survive a failing release (hung
+    # resetQuery bounded by resetQueryTimeout closes the connection instead),
+    # and the pool must not be left with the slot stuck active.
+    proc t() {.async.} =
+      let cfg = initPoolConfig(
+        plainConfig(),
+        minSize = 0,
+        maxSize = 1,
+        resetQuery = "SELECT pg_sleep(30)",
+        resetQueryTimeout = milliseconds(200),
+      )
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      var raised = false
+      try:
+        pool.withConnection(conn):
+          discard await conn.simpleQuery("SELECT 1")
+          raise newException(ValueError, "body error")
+      except ValueError:
+        raised = true
+
+      doAssert raised, "body error must propagate despite release failure"
+      doAssert pool.activeCount == 0
+
+    waitFor t()
+
+  test "withConnection re-raises a body Defect after a failed release":
+    # Regression: a body Defect must survive a failing release (hung resetQuery
+    # bounded by resetQueryTimeout closes the connection instead) and surface as
+    # `PgPoolError` (parent = Defect) — the release error must not shadow it.
+    proc t() {.async.} =
+      let cfg = initPoolConfig(
+        plainConfig(),
+        minSize = 0,
+        maxSize = 1,
+        resetQuery = "SELECT pg_sleep(30)",
+        resetQueryTimeout = milliseconds(200),
+      )
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      var caught: ref PgPoolError = nil
+      try:
+        pool.withConnection(conn):
+          discard await conn.simpleQuery("SELECT 1")
+          raise newException(AssertionDefect, "body defect")
+      except PgPoolError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must propagate despite release failure"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert pool.activeCount == 0
+
+    waitFor t()
+
+suite "E2E: withPipeline macro hygiene":
+  test "withPipeline conn binding is scoped to the macro":
+    # Regression: the macro-local `conn` (exposed to the body) must not collide
+    # with a caller-side `conn`, and must not leak past the macro expansion.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          let conn = "caller-side conn"
+          pool.withPipeline(pipe):
+            discard await conn.exec("SELECT 1")
+
+    )
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withPipeline(pipe):
+            discard conn
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withPipeline(pipe):
+            discard await conn.exec("SELECT 1")
+          # A PgConnection-specific access compiles only if the macro-local
+          # `conn` leaked into the caller's scope — `echo conn` would not,
+          # because PgConnection has no `$` even when the leak exists.
+          discard conn.state
+
+    )
+
+suite "E2E: pipelined dispatch Defect capture":
+  proc badInlineParam(): seq[PgParamInline] =
+    ## A `PgParamInline` with `len` beyond its `overflow` buffer — the inline
+    ## encoder raises a RangeDefect (Defect) mid-dispatch.
+    @[PgParamInline(oid: 0, format: 1, len: int32(PgInlineBufSize + 1), overflow: @[])]
+
+  test "single pipelined op Defect fails the op future, not the dispatch task":
+    # A Defect in the single-op dispatch path must fail the op's future and
+    # release the connection, not hang the op / kill the dispatch task.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, pipelined = true)
+      )
+      defer:
+        await pool.close()
+
+      var raised = false
+      try:
+        discard await pool.exec("SELECT $1", badInlineParam())
+      except PgPoolError:
+        raised = true
+      doAssert raised, "op future must fail with PgPoolError, not hang"
+      doAssert pool.activeCount == 0, "connection must be released after Defect"
+
+      let res = await pool.query("SELECT 1")
+      doAssert res.rows.len == 1, "pool must remain usable after Defect"
+
+    waitFor t()
+
+  test "non-pipelined inline-param Defect releases the connection":
+    # Regression: a Defect from the body's synchronous prelude (inline-param
+    # encoding) must release the connection and surface as `PgPoolError`
+    # (parent = Defect), not leak the borrowed conn or crash on chronos.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(
+          plainConfig(), minSize = 0, maxSize = 1, healthCheckTimeout = ZeroDuration
+        )
+      )
+      defer:
+        await pool.close()
+
+      var raised = false
+      try:
+        discard await pool.exec("SELECT $1", badInlineParam())
+      except PgPoolError:
+        raised = true
+      doAssert raised, "inline-param Defect must propagate to the caller as PgPoolError"
+      doAssert pool.activeCount == 0, "connection must be released after Defect"
+
+      let res = await pool.query("SELECT 1")
+      doAssert res.rows.len == 1, "pool must remain usable after Defect"
+
+    waitFor t()
+
+  test "batch op Defect fails every op in the batch":
+    # A Defect while building a pipeline batch must fail every op in it.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, pipelined = true)
+      )
+      defer:
+        await pool.close()
+
+      # Enqueue both ops synchronously: dispatch runs on the next loop tick,
+      # so both are queued before it drains, pinning the batch (executeBatch)
+      # path rather than the single-op arm of dispatchHomogeneous.
+      # The pendingOps assertions pin this on the scheduling order
+      # deliberately: only the batch path exercises the Defect-fails-every-op
+      # behavior. If dispatch ever became synchronous, the batch arm would
+      # stop being tested here and these asserts are meant to fail loudly so
+      # the test is re-aimed rather than silently drifting to the single-op
+      # arm.
+      let f1 = pool.exec("SELECT $1", badInlineParam())
+      doAssert pool.pendingOps.len == 1
+      let f2 = pool.exec("SELECT $1", badInlineParam())
+      doAssert pool.pendingOps.len == 2,
+        "both ops must be queued before dispatch drains them as a batch"
+      var raised = 0
+      for f in [f1, f2]:
+        try:
+          discard await f
+        except PgPoolError:
+          inc raised
+      doAssert raised == 2, "both op futures must fail, got " & $raised
+      doAssert pool.activeCount == 0, "connection must be released after Defect"
+
+    waitFor t()
+
+suite "E2E: pool withTransaction body-Defect handling":
+  test "body Defect rolls back, releases, and re-raises":
+    # Regression: a body Defect must still ROLLBACK server-side, release the
+    # pool slot, and surface as `PgPoolError` (parent = Defect).
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 2))
+      defer:
+        await pool.close()
+
+      discard await pool.simpleExec("DROP TABLE IF EXISTS test_pool_tx_defect")
+      discard await pool.simpleExec(
+        "CREATE TABLE test_pool_tx_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var caught: ref PgPoolError = nil
+      try:
+        pool.withTransaction(conn):
+          discard await conn.exec(
+            "INSERT INTO test_pool_tx_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "boom")
+      except PgPoolError as e:
+        caught = e
+      doAssert caught != nil, "body Defect must surface as PgPoolError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert pool.activeCount == 0, "connection must be released after Defect"
+
+      # ROLLBACK must have run: the insert must not survive the Defect.
+      let leaked =
+        await pool.simpleQuery("SELECT count(*) AS n FROM test_pool_tx_defect")
+      doAssert leaked.len == 1
+      doAssert leaked[0].rows.len == 1
+      doAssert leaked[0].rows[0].getStr(0) == "0", "ROLLBACK must have run"
+
+      # Connection is reusable after the ROLLBACK.
+      let res = await pool.query("SELECT 1")
+      doAssert res.rows.len == 1, "pool must remain usable after Defect"
+
+      discard await pool.simpleExec("DROP TABLE test_pool_tx_defect")
 
     waitFor t()

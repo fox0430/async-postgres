@@ -301,6 +301,22 @@ const
     ## bounds individual values by `MaxAllocSize` (~1 GiB - 1), so legitimate
     ## traffic stays well below this cap.
 
+  MaxNegotiateProtocolOptions* = 1024
+    ## Upper bound on the `_pq_.*` option count in `NegotiateProtocolVersion`.
+    ## The server only echoes back options the client sent, so real counts are
+    ## tiny. Bounding by message length alone still buys a 16-byte `string`
+    ## header per wire byte: 1 GiB in, 16 GiB preallocated, OutOfMemDefect.
+
+  MaxErrorOrNoticeFields* = 128
+    ## Upper bound on fields in a single ErrorResponse/NoticeResponse. Only
+    ## about 20 field codes exist in the protocol; 128 leaves ample room for
+    ## future codes while capping worst-case allocation.
+
+  MaxSaslMechanisms* = 64
+    ## Upper bound on advertised SASL mechanisms in AuthenticationSASL. Only
+    ## SCRAM-SHA-256 and SCRAM-SHA-256-PLUS are standardised; 64 leaves room
+    ## for future mechanisms while bounding pre-auth allocation.
+
 func makeBinarySafeLookup(): array[BinarySafeMaxOid + 1, bool] {.compileTime.} =
   for oid in BinarySafeOids:
     result[oid] = true
@@ -810,6 +826,12 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
       offset += consumed
       if mechanism.len == 0:
         break
+      # Bound advertised list before adding to survive a hostile pre-auth server.
+      if result.saslMechanisms.len >= MaxSaslMechanisms:
+        raise newException(
+          PgProtocolError,
+          "AuthenticationSASL: mechanism count exceeds maximum of " & $MaxSaslMechanisms,
+        )
       result.saslMechanisms.add(mechanism)
   of 11:
     # SASLContinue
@@ -871,6 +893,7 @@ proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
     result = BackendMessage(kind: bmkNoticeResponse)
     result.noticeFields = @[]
   var offset = 0
+  var fieldCount = 0
   while offset < body.len:
     let fieldType = char(body[offset])
     inc offset
@@ -878,6 +901,15 @@ proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
       break
     let (value, consumed) = decodeCString(body, offset)
     offset += consumed
+    # Bound field count before allocating: a hostile ~1 GiB body could otherwise
+    # produce hundreds of millions of two-byte fields, amplifying allocation.
+    if fieldCount >= MaxErrorOrNoticeFields:
+      let name = if isError: "ErrorResponse" else: "NoticeResponse"
+      raise newException(
+        PgProtocolError,
+        name & ": field count exceeds maximum of " & $MaxErrorOrNoticeFields,
+      )
+    inc fieldCount
     let field = ErrorField(code: fieldType, value: value)
     if isError:
       result.errorFields.add(field)
@@ -971,6 +1003,12 @@ proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
       PgProtocolError, "NegotiateProtocolVersion: invalid option count " & $n
     )
   # Cap allocation against a hostile `n` before the loop reads any bytes.
+  if n > MaxNegotiateProtocolOptions:
+    raise newException(
+      PgProtocolError,
+      "NegotiateProtocolVersion: option count " & $n & " exceeds maximum of " &
+        $MaxNegotiateProtocolOptions,
+    )
   if int64(n) > int64(body.len - 8):
     raise newException(
       PgProtocolError, "NegotiateProtocolVersion: option count " & $n & " exceeds body"
@@ -1020,7 +1058,8 @@ proc reuseRowData*(
     colTypeOids: sink seq[int32],
 ): RowData =
   ## Create a new RowData that takes over the old buffer's capacity via move.
-  ## The old RowData (and any QueryResult still referencing it) is left intact.
+  ## `rd` remains a valid ref but its `buf`/`cellIndex` are emptied — callers
+  ## still holding `rd` must not read row data through it after this call.
   result = RowData(
     buf: move rd.buf,
     cellIndex: move rd.cellIndex,
@@ -1033,7 +1072,9 @@ proc reuseRowData*(
 
 proc reuseRowData*(rd: RowData, numCols: int16): RowData =
   ## Create a new RowData that takes over the old buffer's capacity via move,
-  ## without format metadata.
+  ## without format metadata. `rd` remains a valid ref but its
+  ## `buf`/`cellIndex`/`colFormats`/`colTypeOids` are emptied — callers still
+  ## holding `rd` must not read row data or formats through it after this call.
   result = RowData(
     buf: move rd.buf,
     cellIndex: move rd.cellIndex,

@@ -318,9 +318,12 @@ proc queryValue*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  # rfText: rfAuto cache-hit binary Bind would defeat getStr for most OIDs.
+  let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
   if qr.rowCount == 0:
     raise newException(PgNoRowsError, "Query returned no rows")
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     raise newException(PgNullError, "Query returned NULL")
@@ -336,9 +339,13 @@ proc queryValue*[T](
   ## Execute a query and return the first column of the first row as `T`.
   ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
   ## Supported types: int32, int64, float64, bool, string.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  # T=string delegates to getStr, which cannot stringify most binary-safe OIDs.
+  const rf = when T is string: rfText else: rfAuto
+  let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     raise newException(PgNoRowsError, "Query returned no rows")
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     raise newException(PgNullError, "Query returned NULL")
@@ -352,9 +359,11 @@ proc queryValueOpt*(
 ): Future[Option[string]] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `none` if no rows are returned or the value is NULL.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
   if qr.rowCount == 0:
     return none(string)
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(string)
@@ -370,9 +379,12 @@ proc queryValueOpt*[T](
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `none` if no rows are returned or the value is NULL.
   ## Supported types: int32, int64, float64, bool, string.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  const rf = when T is string: rfText else: rfAuto
+  let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     return none(T)
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return none(T)
@@ -387,9 +399,11 @@ proc queryValueOrDefault*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `default` if no rows or the value is NULL.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
   if qr.rowCount == 0:
     return default
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
@@ -406,9 +420,12 @@ proc queryValueOrDefault*[T](
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `default` if no rows or the value is NULL.
   ## Supported types: int32, int64, float64, bool, string.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  const rf = when T is string: rfText else: rfAuto
+  let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     return default
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
@@ -425,9 +442,12 @@ proc queryValueOrDefault*[T](
   ## inferring `T` from `default`.
   ## Returns `default` if no rows or the value is NULL.
   ## Supported types: int32, int64, float64, bool, string.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  const rf = when T is string: rfText else: rfAuto
+  let qr = await conn.query(sql, params, resultFormat = rf, timeout = timeout)
   if qr.rowCount == 0:
     return default
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
     return default
@@ -450,8 +470,11 @@ proc queryColumn*(
     timeout: Duration = ZeroDuration,
 ): Future[seq[string]] {.async.} =
   ## Execute a query and return the first column of all rows as strings.
-  ## Raises `PgNullError` if any value is NULL.
-  let qr = await conn.query(sql, params, timeout = timeout)
+  ## Raises `PgNullError` if any value is NULL, or `PgTypeError` when the
+  ## query yields rows with no columns.
+  let qr = await conn.query(sql, params, resultFormat = rfText, timeout = timeout)
+  if qr.rowCount > 0 and qr.data.numCols == 0:
+    raise newException(PgTypeError, "Query returned no columns")
   for i in 0 ..< qr.rowCount:
     let row = initRow(qr.data, i)
     if row.isNull(0):

@@ -311,6 +311,14 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?connect_timeout=abc")
 
+  test "error: connect_timeout overflowing the nanosecond Duration":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?connect_timeout=9223372037")
+
+  test "connect_timeout at the largest representable value":
+    let cfg = parseDsn("postgresql://host/db?connect_timeout=9223372036")
+    check cfg.connectTimeout == seconds(9223372036)
+
   test "password with @ sign":
     let cfg = parseDsn("postgresql://user:p%40ssword@host/db")
     check cfg.password == "p@ssword"
@@ -421,6 +429,26 @@ suite "parseDsn":
   test "error: negative keepalives_count":
     expect PgError:
       discard parseDsn("postgresql://host/db?keepalives_count=-1")
+
+  test "error: keepalives_idle exceeding the setsockopt cint range":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_idle=2147483648")
+
+  test "error: keepalives_interval exceeding the setsockopt cint range":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_interval=2147483648")
+
+  test "error: keepalives_count exceeding the setsockopt cint range":
+    expect PgError:
+      discard parseDsn("postgresql://host/db?keepalives_count=2147483648")
+
+  test "keepalive timings at the largest representable value":
+    let cfg = parseDsn(
+      "postgresql://host/db?keepalives_idle=2147483647&keepalives_interval=2147483647&keepalives_count=2147483647"
+    )
+    check cfg.keepAliveIdle == 2147483647
+    check cfg.keepAliveInterval == 2147483647
+    check cfg.keepAliveCount == 2147483647
 
   test "max_message_size from URI DSN":
     let cfg = parseDsn("postgresql://host/db?max_message_size=1048576")
@@ -1054,9 +1082,21 @@ suite "parseDsn keyword=value":
     expect PgError:
       discard parseDsn("host=h connect_timeout=abc")
 
+  test "error: connect_timeout overflowing the nanosecond Duration":
+    expect PgError:
+      discard parseDsn("host=h connect_timeout=9223372036854775807")
+
+  test "error: connect_timeout exceeding int64":
+    expect PgError:
+      discard parseDsn("host=h connect_timeout=99999999999999999999")
+
   test "error: invalid keepalives value":
     expect PgError:
       discard parseDsn("host=h keepalives=abc")
+
+  test "error: keepalives_idle exceeding the setsockopt cint range":
+    expect PgError:
+      discard parseDsn("host=h keepalives_idle=9223372036854775807")
 
   test "error: unterminated quoted value":
     expect PgError:

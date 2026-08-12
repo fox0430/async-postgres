@@ -746,6 +746,30 @@ suite "Backend decoding":
     expect PgProtocolError:
       discard parseBackendMessage(buf)
 
+  test "NegotiateProtocolVersion: option count over the cap raises before allocating":
+    # Bare NULs make the count match the body exactly, so only the cap rejects it.
+    let n = MaxNegotiateProtocolOptions + 1
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(int32(n))
+    for _ in 0 ..< n:
+      body.add(0'u8)
+    var buf = buildMsg('v', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NegotiateProtocolVersion: option count at the cap is accepted":
+    let n = MaxNegotiateProtocolOptions
+    var body: seq[byte] = @[]
+    body.addInt32(0)
+    body.addInt32(int32(n))
+    for _ in 0 ..< n:
+      body.add(0'u8)
+    var buf = buildMsg('v', body)
+    let res = parseBackendMessage(buf)
+    check res.state == psComplete
+    check res.message.unrecognizedOptions.len == n
+
   test "NegotiateProtocolVersion: truncated CString raises":
     var body: seq[byte] = @[]
     body.addInt32(0)
@@ -1214,6 +1238,36 @@ suite "Backend decoding - edge cases":
     let res = parseBackendMessage(buf)
     check res.state == psIncomplete
     check buf == original
+
+  test "ErrorResponse rejects excessive field count":
+    var body: seq[byte] = @[]
+    for _ in 0 .. MaxErrorOrNoticeFields:
+      body.add(byte('S'))
+      body.addCString("x")
+    body.add(0'u8)
+    var buf = buildMsg('E', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "NoticeResponse rejects excessive field count":
+    var body: seq[byte] = @[]
+    for _ in 0 .. MaxErrorOrNoticeFields:
+      body.add(byte('S'))
+      body.addCString("x")
+    body.add(0'u8)
+    var buf = buildMsg('N', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "AuthenticationSASL rejects excessive mechanism count":
+    var body: seq[byte] = @[]
+    body.addInt32(10)
+    for i in 0 .. MaxSaslMechanisms:
+      body.addCString("MECH-" & $i)
+    body.add(0'u8)
+    var buf = buildMsg('R', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
 
 suite "Frontend encoding - edge cases":
   test "encodeBind with result formats":

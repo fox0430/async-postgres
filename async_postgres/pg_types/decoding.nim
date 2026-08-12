@@ -88,7 +88,12 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric =
     )
   var digits = newSeq[int16](ndigits)
   for i in 0 ..< ndigits:
-    digits[i] = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
+    let d = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
+    # Enforce PgNumeric.digits invariant (each 0..9999). Out-of-range values
+    # would otherwise silently corrupt `$PgNumeric` and cmp results.
+    if d < 0 or d > 9999:
+      raise newException(PgTypeError, "Numeric binary: invalid digit " & $d)
+    digits[i] = d
   PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
 
 proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
@@ -404,7 +409,9 @@ proc parseDateText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
     raise
       newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
   try:
-    return parse(s, "yyyy-MM-dd")
+    # Zone is utc() so a date decodes to the same absolute instant as
+    # decodeBinaryDate; the local default would shift it by the UTC offset.
+    return parse(s, "yyyy-MM-dd", utc())
   except TimeParseError, IndexDefect:
     raise newException(PgTypeError, "Invalid date: " & s)
 
@@ -895,8 +902,10 @@ proc parsePointsText*(s: string): seq[PgPoint] =
 # Array text format parser
 
 proc parseTextArray*(s: string): seq[Option[string]] =
-  ## Parse PostgreSQL text-format array literal: {elem1,elem2,...}
+  ## Parse PostgreSQL 1-D text-format array literal: {elem1,elem2,...}
   ## Returns elements as ``Option[string]`` (none for NULL).
+  ## Raises ``PgTypeError`` for multi-dimensional literals; callers that need
+  ## multi-dim support should decode via the ``PgArray[T]`` accessors.
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
     raise newException(PgTypeError, "Invalid array literal: " & s)
   let inner = s[1 ..^ 2]
@@ -904,6 +913,16 @@ proc parseTextArray*(s: string): seq[Option[string]] =
     return @[]
   var i = 0
   while i < inner.len:
+    # A '{' at an element-start position marks a nested subarray. Silently
+    # splitting on ',' would yield garbage fragments (e.g. "{{a,b},{c,d}}"
+    # → ["{a","b}","{c","d}"]), so raise here to mirror the binary path's
+    # rejectMultiDim contract.
+    if inner[i] == '{':
+      raise newException(
+        PgTypeError,
+        "Multi-dimensional array text literal cannot be read as seq; " &
+          "use the PgArray[T] accessor instead",
+      )
     if inner[i] == '"':
       # Quoted element
       i += 1

@@ -42,15 +42,19 @@ proc main() {.async.} =
   # Run concurrent queries using withConnection
   proc countExpensive(): Future[int64] {.async.} =
     let minPrice = 150'i32
+    var res: int64
     pool.withConnection(conn):
-      return await conn.queryValue(
+      res = await conn.queryValue(
         int64, sql"SELECT count(*) FROM products WHERE price > {minPrice}"
       )
+    return res
 
   proc cheapest(): Future[string] {.async.} =
+    var name: string
     pool.withConnection(conn):
       let row = await conn.queryRow("SELECT name FROM products ORDER BY price LIMIT 1")
-      return row.getStr("name")
+      name = row.getStr("name")
+    return name
 
   # Launch concurrently, then await each result
   let expCountFut = countExpensive()

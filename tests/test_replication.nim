@@ -781,3 +781,8 @@ suite "decodeCreateSlotRow":
     check info.consistentPoint == parseLsn("0/16B3740")
     check info.snapshotName == ""
     check info.outputPlugin == ""
+
+  test "missing required columns raises catchable PgConnectionError":
+    let qr = mkSlotQr(["my_slot"], 1)
+    expect(PgConnectionError):
+      discard decodeCreateSlotRow(qr)

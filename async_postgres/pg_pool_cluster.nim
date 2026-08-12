@@ -271,24 +271,72 @@ proc writeConnection*(cluster: PgPoolCluster): Future[PooledConnHandle] {.async.
   let conn = await cluster.primary.acquire()
   return PooledConnHandle(conn: conn, pool: cluster.primary)
 
-template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
+macro withReadConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped =
   ## Acquire a read connection (from replica, with optional primary fallback),
   ## execute `body`, then release.
-  block:
-    let (conn, connPool) = await acquireRead(cluster)
-    try:
-      body
-    finally:
-      await connPool.resetSessionAndRelease(conn)
+  ##
+  ## Release runs outside `finally` (a failing `await` in an asyncdispatch
+  ## `finally` masks the body error), so `return` / `break` / `continue`
+  ## escaping the body are rejected at compile time.
+  checkNoBodyEscape(body, "withReadConnection", "the connection release")
+  let clusterSym = genSym(nskLet, "cluster")
+  let connPoolSym = genSym(nskLet, "connPool")
+  let bodyErrSym = genSym(nskVar, "bodyErr")
+  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let releaseCall = quote:
+    `connPoolSym`.resetSessionAndRelease(`conn`)
+  let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
+  result = quote:
+    let `clusterSym` = `cluster`
+    block:
+      let (`conn`, `connPoolSym`) = await acquireRead(`clusterSym`)
+      var `bodyErrSym`: ref CatchableError = nil
+      var `bodyDefectSym`: ref Defect = nil
+      try:
+        `body`
+      except CatchableError as e:
+        `bodyErrSym` = e
+      except Defect as d:
+        `bodyDefectSym` = d
+      `releaseBlock`
+      checkNoBodyEscapePost(
+        block:
+          `body`,
+        "withReadConnection",
+        "the connection release",
+      )
 
-template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
+macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
-  block:
-    let conn = await cluster.primary.acquire()
-    try:
-      body
-    finally:
-      await cluster.primary.resetSessionAndRelease(conn)
+  ##
+  ## Body `return` / `break` / `continue` escaping to an enclosing loop are
+  ## rejected at compile time (see `withReadConnection`).
+  checkNoBodyEscape(body, "withWriteConnection", "the connection release")
+  let clusterSym = genSym(nskLet, "cluster")
+  let bodyErrSym = genSym(nskVar, "bodyErr")
+  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let releaseCall = quote:
+    `clusterSym`.primary.resetSessionAndRelease(`conn`)
+  let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
+  result = quote:
+    let `clusterSym` = `cluster`
+    block:
+      let `conn` = await `clusterSym`.primary.acquire()
+      var `bodyErrSym`: ref CatchableError = nil
+      var `bodyDefectSym`: ref Defect = nil
+      try:
+        `body`
+      except CatchableError as e:
+        `bodyErrSym` = e
+      except Defect as d:
+        `bodyDefectSym` = d
+      `releaseBlock`
+      checkNoBodyEscapePost(
+        block:
+          `body`,
+        "withWriteConnection",
+        "the connection release",
+      )
 
 macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool.

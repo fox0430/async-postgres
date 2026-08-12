@@ -331,12 +331,16 @@ suite "Row accessors":
     check not row.isNull(0)
     check row.isNull(1)
 
-  test "column index out of range raises IndexDefect":
+  test "column index out of range raises PgTypeError (catchable, not Defect)":
     let row = @[some(toBytes("hello"))]
-    expect IndexDefect:
+    expect PgTypeError:
       discard row.getStr(1)
-    expect IndexDefect:
+    expect PgTypeError:
       discard row.getStr(-1)
+    # PgTypeError is a PgError, so a single `except PgError` clause covers
+    # both out-of-range column access and the accessor-level errors below.
+    expect PgError:
+      discard row.getStr(1)
 
   test "getInt16":
     let row = @[some(toBytes("123"))]
@@ -588,6 +592,15 @@ suite "getDate accessor":
     check dt.year == 2024
     check dt.month == mJan
     check dt.monthday == 15
+
+  test "text date decodes in UTC, matching the binary path":
+    # Regression: the text path parsed with the local zone, so the same date
+    # decoded to a different absolute instant than decodeBinaryDate. DateTime
+    # equality compares instants, so the two paths compared unequal outside UTC.
+    let text = @[some(toBytes("2024-01-15"))].getDate(0)
+    check text.utcOffset == 0
+    let bin = toPgBinaryDateParam(dateTime(2024, mJan, 15, 0, 0, 0, 0, utc()))
+    check text == decodeBinaryDate(bin.value.get)
 
   test "invalid date raises":
     let row = @[some(toBytes("not-a-date"))]
@@ -888,6 +901,36 @@ suite "date parameter encoding":
     check p.value.isSome
     let s = cast[string](p.value.get())
     check s == "2024-01-15"
+
+  test "toPgDateParam with non-UTC zone encodes the UTC calendar day":
+    # Regression: the text date path used to serialize the DateTime's own wall
+    # clock, so a zoned value landed on a different day than toPgBinaryDateParam
+    # derived from the same instant. utcOffset counts seconds WEST of UTC, so
+    # JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    # 05:00 JST is still the previous day in UTC.
+    let dt = dateTime(2024, mJan, 15, 5, 0, 0, 0, jst)
+    let p = toPgDateParam(dt)
+    check p.oid == OidDate
+    check toString(p.value.get) == "2024-01-14"
+    # The binary encoder already used the UTC day; both must now agree.
+    let bin = toPgBinaryDateParam(dt)
+    let row = mkRow(@[bin.value], @[mkField(OidDate, 1)])
+    let decoded = row.getDate(0)
+    check decoded.year == 2024
+    check decoded.month == mJan
+    check decoded.monthday == 14
 
   test "toPgBinaryDateParam roundtrip":
     let dt = dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
@@ -1415,11 +1458,21 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard row.getStr(0)
 
-  test "getStr binary unknown OID size mismatch is tolerated":
-    # text/varchar/bytea: else branch keeps raw-bytes fallback
+  test "getStr binary text/varchar/bytea raw-copy":
     let fields = @[mkField(OidText, 1)]
     let row = mkRow(@[some(toBytes("hello"))], fields)
     check row.getStr(0) == "hello"
+
+  test "getStr binary unsupported binary-safe OID raises":
+    let fields = @[mkField(OidTimestamp, 1)]
+    let row = mkRow(@[some(@[0'u8, 0, 0, 0, 0, 0, 0, 0])], fields)
+    expect PgTypeError:
+      discard row.getStr(0)
+
+  test "getStr binary user-defined OID raw-copy":
+    let fields = @[mkField(99999'i32, 1)]
+    let row = mkRow(@[some(toBytes("active"))], fields)
+    check row.getStr(0) == "active"
 
   test "getIntArray binary element length mismatch":
     let elements = @[@[0'u8, 0, 0]] # 3 bytes (expected 4)
@@ -2124,6 +2177,46 @@ suite "parseTextArray":
     except PgTypeError:
       raised = true
     check raised
+
+  test "multi-dimensional unquoted raises":
+    var raised = false
+    var msg = ""
+    try:
+      discard parseTextArray("{{a,b},{c,d}}")
+    except PgTypeError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "PgArray[T]" in msg
+
+  test "multi-dimensional with quoted subelements raises":
+    var raised = false
+    try:
+      discard parseTextArray("{{\"a\",\"b\"},{\"c\",\"d\"}}")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "nested empty subarray raises":
+    var raised = false
+    try:
+      discard parseTextArray("{{}}")
+    except PgTypeError:
+      raised = true
+    check raised
+
+  test "quoted element containing literal brace is preserved":
+    # Regression guard: '{' inside a quoted element must NOT trigger the
+    # multi-dim reject. Only '{' at element-start position marks nesting.
+    let elems = parseTextArray("{\"{a}\"}")
+    check elems.len == 1
+    check elems[0] == some("{a}")
+
+  test "mixed quoted brace and plain element":
+    let elems = parseTextArray("{\"a\",\"{b}\"}")
+    check elems.len == 2
+    check elems[0] == some("a")
+    check elems[1] == some("{b}")
 
 suite "Array row accessors":
   test "getIntArray":
@@ -4079,6 +4172,14 @@ suite "Composite text parser":
       raised = true
     check raised
 
+  test "parseCompositeText unterminated quoted field raises":
+    expect PgTypeError:
+      discard parseCompositeText("(\"abc)")
+
+  test "parseCompositeText garbage after closing quote raises":
+    expect PgTypeError:
+      discard parseCompositeText("(\"a\"b)")
+
   test "encodeCompositeText simple":
     let s = encodeCompositeText(@[some("1"), some("2")])
     check s == "(1,2)"
@@ -4791,6 +4892,51 @@ suite "Range text parsing":
     )
     check parsed == orig
 
+  test "reject missing lower boundary bracket":
+    # "[1,2" would previously silently drop the upper element.
+    expect PgTypeError:
+      discard parseRangeText[int32](
+        "[1,2",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject missing upper boundary bracket":
+    expect PgTypeError:
+      discard parseRangeText[int32](
+        "1,2]",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject non-bracket boundary chars":
+    expect PgTypeError:
+      discard parseRangeText[int32](
+        "X1,2Y",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject unterminated quoted lower element":
+    # `["abc,def)` — closing quote missing; previous code silently dropped
+    # trailing bytes and mis-parsed the upper bound.
+    expect PgTypeError:
+      discard parseRangeText[string](
+        "[\"abc,def)",
+        proc(s: string): string =
+          s,
+      )
+
+  test "reject trailing bytes after quoted element":
+    # `["abc"xyz,def)` — the caller previously discarded `pos` from
+    # parseRangeElem so `xyz` was silently dropped.
+    expect PgTypeError:
+      discard parseRangeText[string](
+        "[\"abc\"xyz,def)",
+        proc(s: string): string =
+          s,
+      )
+
 suite "Range toPgParam":
   test "int4range":
     let p = toPgParam(rangeOf(1'i32, 10'i32))
@@ -4873,6 +5019,44 @@ suite "Range toPgParam":
     let p = toPgDateRangeParam(rangeOf(dt1, dt2))
     check p.oid == OidDateRange
     check p.value.get.toString == "[2023-01-01,2023-12-31)"
+
+  test "date ranges with non-UTC zone encode the UTC calendar day":
+    # Regression: every daterange text encoder (range, array, multirange,
+    # multirange array) serialized the DateTime's own wall clock, landing on a
+    # different day than the binary pgDateDays path. utcOffset counts seconds
+    # WEST of UTC, so JST (9h east) has offset -9*3600.
+    const jstWest = -9 * 3600
+    proc jstFromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: jstWest, time: time)
+
+    proc jstFromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false,
+        utcOffset: jstWest,
+        time: adjTime + initDuration(seconds = jstWest),
+      )
+
+    let jst = newTimezone("JST+09", jstFromTime, jstFromAdj)
+    # Both bounds are at 05:00 JST, still the previous day in UTC.
+    let dt1 = dateTime(2024, mJan, 15, 5, 0, 0, 0, jst)
+    let dt2 = dateTime(2024, mJan, 20, 5, 0, 0, 0, jst)
+    let r = rangeOf(dt1, dt2)
+
+    let p = toPgDateRangeParam(r)
+    check p.oid == OidDateRange
+    check p.value.get.toString == "[2024-01-14,2024-01-19)"
+
+    let ap = toPgDateRangeArrayParam(@[r])
+    check ap.oid == OidDateRangeArray
+    check ap.value.get.toString == "{\"[2024-01-14,2024-01-19)\"}"
+
+    let mp = toPgDateMultirangeParam(toMultirange(r))
+    check mp.oid == OidDateMultirange
+    check mp.value.get.toString == "{[2024-01-14,2024-01-19)}"
+
+    let map = toPgDateMultirangeArrayParam(@[toMultirange(r)])
+    check map.oid == OidDateMultirangeArray
+    check map.value.get.toString == "{\"{[2024-01-14,2024-01-19)}\"}"
 
   test "empty range":
     let p = toPgParam(emptyRange[int32]())
@@ -5244,6 +5428,79 @@ suite "Multirange text parsing":
         int32(parseInt(s)),
     )
     check parsed == orig
+
+  test "parse multirange with spaces after comma":
+    let mr = parseMultirangeText[int32](
+      "{[1,2), [3,4)}",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check mr.len == 2
+    check mr[0] == rangeOf(1'i32, 2'i32)
+    check mr[1] == rangeOf(3'i32, 4'i32)
+
+  test "parse multirange with empty and spaces":
+    let mr = parseMultirangeText[int32](
+      "{empty, [3,4)}",
+      proc(s: string): int32 =
+        int32(parseInt(s)),
+    )
+    check mr.len == 2
+    check mr[0].isEmpty
+    check mr[1] == rangeOf(3'i32, 4'i32)
+
+  test "reject stray closing bracket":
+    # `{1,2)}` previously produced an empty multirange silently.
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{1,2)}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject trailing bytes after last range":
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{[1,2)garbage}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject trailing comma after empty":
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{empty,}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject 'empty' followed by non-comma":
+    # `{emptyx}` — prefix-matched "empty" then failed the delimiter check.
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{emptyx}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "reject unterminated range":
+    expect PgTypeError:
+      discard parseMultirangeText[int32](
+        "{[1,2}",
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+
+  test "quoted element containing closing bracket is not mis-split":
+    # `{["a]b",c)}` — bracket inside a quoted element must not affect nesting.
+    let mr = parseMultirangeText[string](
+      "{[\"a]b\",c)}",
+      proc(s: string): string =
+        s,
+    )
+    check mr.len == 1
+    check mr[0].lower.value == "a]b"
+    check mr[0].upper.value == "c"
 
 suite "Multirange row getters":
   test "getInt4Multirange text":
@@ -6736,6 +6993,40 @@ suite "Binary decoder validation":
       0x00, # dscale
       0x00,
       0x01, # only 1 digit (need 2)
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeNumericBinary rejects out-of-range base-10000 digit":
+    # ndigits = 1, digit = 10000 (> 9999) — violates PgNumeric.digits invariant.
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x01, # ndigits = 1
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+      0x27,
+      0x10, # digit = 10000
+    ]
+    expect PgTypeError:
+      discard decodeNumericBinary(data)
+
+  test "decodeNumericBinary rejects negative base-10000 digit":
+    # digit high bit set -> parses as negative int16.
+    var data: seq[byte] = @[
+      0x00'u8,
+      0x01, # ndigits = 1
+      0x00,
+      0x00, # weight
+      0x00,
+      0x00, # sign = positive
+      0x00,
+      0x00, # dscale
+      0xFF,
+      0xFF, # digit = -1
     ]
     expect PgTypeError:
       discard decodeNumericBinary(data)
@@ -9085,3 +9376,80 @@ suite "Float text path accepts PostgreSQL Infinity/-Infinity/NaN":
     let v = (Row @[some(toBytes("{Infinity,-Infinity}"))]).getFloat32Array(0)
     check v[0] == float32(Inf)
     check v[1] == float32(NegInf)
+
+suite "Negative column index":
+  # isBinaryCol/colTypeOid guard `col >= 0` themselves: many accessors call them
+  # before their own cellInfo/isNull bounds check, so without the guard a
+  # negative col reaches `colFormats[col]` (raw IndexDefect, or an out-of-bounds
+  # read once --checks:off elides the subscript check). cellInfo/isNull now
+  # raise `PgTypeError` (catchable via `except PgError`) instead of IndexDefect.
+  let binRow = mkRow(@[some(toBytes("x"))], @[mkField(OidText, 1'i16)])
+  let textRow = mkRow(@[some(toBytes("x"))], @[mkField(OidText, 0'i16)])
+  # colFormats/colTypeOids are empty here, so a negative subscript would hit a
+  # nil seq rather than merely reading before the start of a live allocation.
+  let bareRow = Row @[some(toBytes("x"))]
+
+  test "isBinaryCol returns false instead of subscripting":
+    for row in [binRow, textRow, bareRow]:
+      check not row.isBinaryCol(-1)
+      check not row.isBinaryCol(-8)
+      check not row.isBinaryCol(int.low)
+
+  test "colTypeOid returns 0 instead of subscripting":
+    for row in [binRow, textRow, bareRow]:
+      check row.colTypeOid(-1) == 0'i32
+      check row.colTypeOid(int.low) == 0'i32
+
+  test "isBinaryCol still reports the format for valid columns":
+    check binRow.isBinaryCol(0)
+    check not textRow.isBinaryCol(0)
+    check binRow.colTypeOid(0) == OidText
+
+  test "isBinaryCol-first accessors report the column index":
+    # These call isBinaryCol before cellInfo; the guard lets them fall through
+    # to the bounds check that produces the intended message.
+    expect PgTypeError:
+      discard binRow.getUuid(-1)
+    expect PgTypeError:
+      discard binRow.getDate(-1)
+    expect PgTypeError:
+      discard binRow.getNumeric(-1)
+    expect PgTypeError:
+      discard binRow.getPoint(-1)
+    expect PgTypeError:
+      discard binRow.getIntArray(-1)
+    expect PgTypeError:
+      discard binRow.getInt4Range(-1)
+
+  test "cellInfo-first accessors are unchanged":
+    expect PgTypeError:
+      discard binRow.getStr(-1)
+    expect PgTypeError:
+      discard binRow.getInt(-1)
+
+  test "getArrayND reports the index, not a format mismatch":
+    expect PgTypeError:
+      discard getArrayND[int32](binRow, -1)
+    expect PgTypeError:
+      discard binRow.getMoneyArrayND(-1)
+
+  test "negative index message names the column":
+    try:
+      discard binRow.getUuid(-1)
+      check false
+    except PgTypeError as e:
+      check "column index -1" in e.msg
+
+  test "column index errors are catchable via `except PgError`":
+    # Contract: `except PgError` catches every accessor-layer failure,
+    # including out-of-range column access. This suppresses the whole
+    # `raises: []` × Defect mismatch in one place for library users.
+    for row in [binRow, textRow, bareRow]:
+      expect PgError:
+        discard row.getStr(-1)
+      expect PgError:
+        discard row.getStr(row.len + 5)
+      expect PgError:
+        discard row.isNull(-1)
+      expect PgError:
+        discard row.isNull(row.len + 5)

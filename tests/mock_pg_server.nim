@@ -21,6 +21,8 @@ type AutoKeepaliveResult* =
   tuple[msgType: char, receive: int64, flush: int64, apply: int64]
 
 when hasChronos:
+  import chronos/streams/asyncstream
+
   type
     MockServer* = object
       server: StreamServer
@@ -53,6 +55,64 @@ when hasChronos:
   proc sendBytes*(client: MockClient, data: seq[byte]) {.async.} =
     if data.len > 0:
       discard await client.write(data)
+
+  proc defectWriter*(): AsyncStreamWriter =
+    ## A writer whose write path raises a Defect from its synchronous prelude,
+    ## emulating a transport failure while dispatching SQL (e.g. the
+    ## release-path reset or a transaction ROLLBACK cleanup).
+    result = AsyncStreamWriter(
+      vtbl: AsyncStreamWriterVtbl(
+        atEof: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        stopped: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        running: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        failed: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        write: proc(
+            w: AsyncStreamWriter, pbytes: pointer, nbytes: int
+        ): Future[void] {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          raise newException(AssertionDefect, "boom"),
+        finish: proc(
+            w: AsyncStreamWriter
+        ) {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          discard,
+        close: proc(w: AsyncStreamWriter) {.async: (raises: []).} =
+          discard,
+      )
+    )
+
+  proc countingWriter*(defectAt: int): AsyncStreamWriter =
+    ## A writer that succeeds for the first `defectAt - 1` writes and raises a
+    ## Defect from the `defectAt`-th one on — used to let COMMIT succeed while
+    ## the release-path reset SQL (the next write) fails.
+    let count = new int
+    result = AsyncStreamWriter(
+      vtbl: AsyncStreamWriterVtbl(
+        atEof: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        stopped: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        running: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        failed: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        write: proc(
+            w: AsyncStreamWriter, pbytes: pointer, nbytes: int
+        ): Future[void] {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          inc count[]
+          if count[] >= defectAt:
+            raise newException(AssertionDefect, "boom")
+          discard,
+        finish: proc(
+            w: AsyncStreamWriter
+        ) {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          discard,
+        close: proc(w: AsyncStreamWriter) {.async: (raises: []).} =
+          discard,
+      )
+    )
 
 elif hasAsyncDispatch:
   type

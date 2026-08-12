@@ -586,6 +586,14 @@ proc identifySystem*(
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "IDENTIFY_SYSTEM returned no results")
   let qr = results[0]
+  # Guard fixed-column access so a malformed server response surfaces as a
+  # catchable PgConnectionError instead of an uncatchable IndexDefect from
+  # `cellInfo`.
+  if qr.fields.len < 3:
+    raise newException(
+      PgConnectionError,
+      "IDENTIFY_SYSTEM returned " & $qr.fields.len & " columns, expected >= 3",
+    )
   let row = initRow(qr.data, 0)
   var info = SystemInfo()
   info.systemId = row.getStr(0)
@@ -597,7 +605,12 @@ proc identifySystem*(
     info.dbName = row.getStr(3)
   return info
 
-proc decodeCreateSlotRow*(qr: QueryResult): ReplicationSlotInfo =
+proc decodeCreateSlotRow(qr: QueryResult): ReplicationSlotInfo =
+  if qr.fields.len < 2:
+    raise newException(
+      PgConnectionError,
+      "CREATE_REPLICATION_SLOT returned " & $qr.fields.len & " columns, expected >= 2",
+    )
   let row = initRow(qr.data, 0)
   result.slotName = row.getStr(0)
   result.consistentPoint = parseLsn(row.getStr(1))
@@ -652,6 +665,11 @@ proc readReplicationSlot*(
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "READ_REPLICATION_SLOT returned no results")
   let qr = results[0]
+  if qr.fields.len < 2:
+    raise newException(
+      PgConnectionError,
+      "READ_REPLICATION_SLOT returned " & $qr.fields.len & " columns, expected >= 2",
+    )
   let row = initRow(qr.data, 0)
   var info = ReplicationSlotInfo()
   # READ_REPLICATION_SLOT returns: slot_type, restart_lsn, restart_tli
@@ -675,6 +693,11 @@ proc timelineHistory*(
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "TIMELINE_HISTORY returned no results")
   let qr = results[0]
+  if qr.fields.len < 2:
+    raise newException(
+      PgConnectionError,
+      "TIMELINE_HISTORY returned " & $qr.fields.len & " columns, expected >= 2",
+    )
   let row = initRow(qr.data, 0)
   var info = TimelineHistory()
   if not row.isNull(0):

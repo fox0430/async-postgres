@@ -221,6 +221,7 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
       # Quoted field
       i += 1
       var elem = ""
+      var closed = false
       while i < inner.len:
         if inner[i] == '\\' and i + 1 < inner.len:
           i += 1
@@ -231,11 +232,18 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
             elem.add('"')
             i += 1
           else:
+            closed = true
             break
         else:
           elem.add(inner[i])
         i += 1
+      if not closed:
+        raise newException(PgTypeError, "composite: unterminated quoted field")
       i += 1 # skip closing quote
+      # Quoted field must be followed by ',' or end of composite; anything else
+      # (e.g. `("a"b)`) is malformed and would otherwise be silently split.
+      if i < inner.len and inner[i] != ',':
+        raise newException(PgTypeError, "composite: unexpected byte after quoted field")
       result.add(some(elem))
       if i < inner.len and inner[i] == ',':
         i += 1
