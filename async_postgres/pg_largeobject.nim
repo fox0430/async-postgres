@@ -315,6 +315,14 @@ template withLargeObject*(
     except CatchableError:
       discard
     raise loBodyErr
+  except Defect as loBodyDefect:
+    # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
+    # it raw so the handle is not leaked.
+    try:
+      await lo.loClose()
+    except CatchableError:
+      discard
+    raise loBodyDefect
   # Surface a genuine close failure to the caller.
   await lo.loClose()
 
