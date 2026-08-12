@@ -291,6 +291,12 @@ template appendInlineParam*(
   else:
     let dataOff = int32(data.len)
     let oldLen = data.len
+    if p.len > PgInlineBufSize and p.overflow.len < int(p.len):
+      raise newException(
+        RangeDefect,
+        "PgParamInline.len (" & $p.len & ") exceeds overflow capacity (" &
+          $p.overflow.len & ")",
+      )
     data.setLen(oldLen + int(p.len))
     if p.len <= PgInlineBufSize:
       data.writeBytesAt(oldLen, p.inlineBuf.toOpenArray(0, int(p.len) - 1))

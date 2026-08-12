@@ -358,11 +358,11 @@ proc advisoryTryLockXactShared*(
 #
 # ``advisoryUnlock*`` failures are swallowed so they cannot mask the original
 # exception raised by ``body``: the body exception is captured and re-raised
-# after the unlock attempt. (A ``finally`` block cannot be used here because an
-# ``await`` inside ``finally`` clobbers the in-flight exception under
-# asyncdispatch, silently discarding the body's error.) The unlock failure is
-# reported through the connection's tracer (``onAdvisoryUnlockFailed``). If the
-# connection is lost the session lock is released server-side anyway.
+# after the unlock attempt. (A ``finally`` block cannot be used here — on
+# asyncdispatch a failing ``await`` in a ``finally`` replaces the in-flight
+# exception, silently discarding the body's error.) The unlock failure is
+# reported through the connection's tracer (``onAdvisoryUnlockFailed``). If
+# the connection is lost the session lock is released server-side anyway.
 
 template withAdvisoryLockCore(
     c: PgConnection,

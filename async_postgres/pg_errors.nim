@@ -101,6 +101,9 @@ type
     ## Pool-level acquire failure: acquire timeout, pool closed, waiter queue
     ## full, or a failed connect attempt during acquire (the underlying error,
     ## e.g. ``PgConnectionError``, is preserved as ``parent``).
+    ##
+    ## Also raised by the pooled `with*` macros / `runAndRelease` when a body
+    ## `Defect` is wrapped (Defect as ``parent``).
 
   PgNotifyOverflowError* = object of PgError
     dropped*: int ## Number of notifications dropped due to queue overflow

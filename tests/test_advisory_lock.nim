@@ -624,7 +624,7 @@ suite "Advisory Lock: pool integration":
 
       pool.withConnection(conn):
         await conn.advisoryLock(71006'i64)
-      # resetSession ran (via withConnection finally) and cleared the counter.
+      # resetSession ran (via withConnection) and cleared the counter.
       doAssert pool.idle.len == 1
       let pooled = pool.idle[0]
       doAssert pooled.conn.heldSessionLocks == 0
@@ -720,7 +720,7 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
       pool.withConnection(conn):
         await conn.advisoryLock(72001'i64)
         await conn.advisoryLockShared(72002'i64)
-      # withConnection finally → resetSession → onLeakedSessionLocks fires once,
+      # withConnection release → resetSession → onLeakedSessionLocks fires once,
       # pg_advisory_unlock_all clears the counter, and the connection returns
       # to the idle queue (no resetQuery configured).
       doAssert log.counts == @[2]

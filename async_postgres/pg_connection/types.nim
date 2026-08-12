@@ -58,6 +58,13 @@ type
     ## `ConnConfig` has SSL disabled. The constructor helpers `parseDsn` and
     ## `initConnConfig`, however, default to `sslPrefer` to match libpq and
     ## avoid silently sending credentials in plaintext.
+    ##
+    ## Backend divergence (chronos/BearSSL vs asyncdispatch/OpenSSL):
+    ## - `sslRequire`: chronos rejects expired/not-yet-valid server certs;
+    ##   asyncdispatch and libpq accept them.
+    ## - `sslVerifyFull` + IP-literal host: chronos raises `PgConnectionError`
+    ##   (BearSSL matches only dNSName SAN); asyncdispatch verifies IP-SAN
+    ##   certs via `set1_ip_asc`.
     sslDisable ## Disable SSL
     sslAllow ## Try plaintext; fall back to SSL if refused
     sslPrefer ## Try SSL; fall back to plaintext if refused (libpq default)

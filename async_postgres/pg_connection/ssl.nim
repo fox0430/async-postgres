@@ -19,6 +19,22 @@ import std/[net, strutils]
 import ../[async_backend, pg_errors, pg_protocol, pg_types]
 import types, buffer_io
 
+proc normalizeIpLiteralHost(host: string): string =
+  ## Strip bracketing (`[::1]`) and zone suffixes (`fe80::1%eth0`) from an
+  ## IP-literal host, leaving the bare IP; non-IP hosts are unchanged.
+  result = host
+  if result.len >= 2 and result[0] == '[' and result[^1] == ']':
+    result = result[1 .. ^2]
+  let zone = result.find('%')
+  if zone >= 0:
+    let base = result[0 ..< zone]
+    if isIpAddress(base):
+      result = base
+
+proc isIpLiteralHost(host: string): bool =
+  ## IP-literal host? `std/net.isIpAddress` misses bracketed/zone-scoped IPv6.
+  isIpAddress(normalizeIpLiteralHost(host))
+
 when hasChronos:
   import chronos/streams/tlsstream
   import ../pg_bearssl
@@ -34,6 +50,37 @@ when hasTls:
 when hasAsyncDispatch and defined(ssl):
   const PgAlpnWire = char(PgAlpnProtocol.len) & PgAlpnProtocol
     ## Length-prefixed wire form for `SSL_CTX_set_alpn_protos` (RFC 7301 §3.1).
+
+  const
+    sslCtrlSetMinProtoVersion* = 123
+      ## OpenSSL `SSL_CTRL_SET_MIN_PROTO_VERSION` (1.1.0+); a 0 return means the
+      ## control is unsupported and the NO_* mask fallback applies.
+    sslTls12Version* = 0x0303
+      ## Wire value of TLS 1.2, the minimum version enforced by `establishTls`.
+    sslOpNoSslv2* = 0x01000000'i64
+      ## OpenSSL `SSL_OP_NO_SSLv2` (bit 24). 1.1.0+ removed SSLv2 (value 0);
+      ## 1.0.x still honors the mask, which is when this fallback runs.
+    sslOpNoTlsv11* = 0x10000000'i64
+      ## OpenSSL `SSL_OP_NO_TLSv1_1` (bit 28). std/openssl misdefines it as
+      ## bit 27 (`SSL_OP_NO_TLSv1_2`); shadow it so the fallback mask disables
+      ## TLS 1.1 and below.
+
+  proc enforceTls12Minimum*(ctx: SslCtx): bool =
+    ## Enforce TLS 1.2+ via `SSL_CTRL_SET_MIN_PROTO_VERSION` (1.1.0+); on 1.0.x
+    ## (control unknown, 0 return) apply the NO_* fallback mask instead.
+    ## Call before the handshake: the library build default may allow TLS 1.1.
+    ## Returns true when the min-version control ran.
+    let minVersionSet =
+      SSL_CTX_ctrl(ctx, sslCtrlSetMinProtoVersion, sslTls12Version, nil)
+    if minVersionSet == 0:
+      discard SSL_CTX_ctrl(
+        ctx,
+        SSL_CTRL_OPTIONS,
+        clong(sslOpNoSslv2 or SSL_OP_NO_SSLv3 or SSL_OP_NO_TLSv1 or sslOpNoTlsv11),
+        nil,
+      )
+      return false
+    return true
 
   # On asyncdispatch `conn.socket` is an `AsyncSocket`, so `wrapConnectedSocket`
   # resolves to `std/asyncnet`'s overload, which only sets SNI — it never matches
@@ -182,8 +229,10 @@ when hasAsyncDispatch and defined(ssl):
     ## handshake (iPAddress SANs for an IP literal, DNS name otherwise), so
     ## verify-full fails closed on a mismatched but CA-trusted cert. Raises if the
     ## identity cannot be installed, so it never silently degrades to chain-only.
+    ## IP literals are normalized first (`set1_ip_asc` only accepts bare IPs).
+    let ipHost = normalizeIpLiteralHost(host)
     let ok =
-      if isIpAddress(host):
+      if isIpAddress(ipHost):
         if x509VerifyParamSet1IpAsc == nil:
           raise newException(
             PgConnectionError,
@@ -196,7 +245,7 @@ when hasAsyncDispatch and defined(ssl):
             "sslmode=verify-full: libssl does not export SSL_get0_param; " &
               "cannot verify " & host,
           )
-        x509VerifyParamSet1IpAsc(sslGet0Param(sslHandle), host.cstring)
+        x509VerifyParamSet1IpAsc(sslGet0Param(sslHandle), ipHost.cstring)
       else:
         if sslSet1Host == nil:
           raise newException(
@@ -249,7 +298,7 @@ proc sniName*(sslHost: string, sslSni: bool): string =
     return ""
   if sslHost.len == 0:
     return ""
-  if isIpAddress(sslHost):
+  if isIpLiteralHost(sslHost):
     return ""
   sslHost
 
@@ -264,6 +313,17 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     let direct = config.sslNegotiation == sslnDirect
     conn.baseReader = newAsyncStreamReader(conn.transport)
     conn.baseWriter = newAsyncStreamWriter(conn.transport)
+
+    # BearSSL matches only dNSName SAN; reject IP-literal hosts up front
+    # (asyncdispatch handles them via set1_ip_asc).
+    if config.sslMode == sslVerifyFull and isIpLiteralHost(sslHost):
+      raise newException(
+        PgConnectionError,
+        "sslmode=verify-full with an IP-literal host (" & sslHost &
+          ") is not supported on the chronos/BearSSL backend " &
+          "(iPAddress SAN matching unavailable); " &
+          "use a hostname (dNSName SAN) or build with the asyncdispatch backend",
+      )
 
     let flags =
       case config.sslMode
@@ -401,6 +461,8 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         except CatchableError as e:
           raise
             newException(PgConnectionError, "Failed to create SSL context: " & e.msg, e)
+        # Enforce TLS 1.2+ (std/net leaves the min at the library default).
+        discard enforceTls12Minimum(ctx.context)
         if config.sslMode in {sslVerifyCa, sslVerifyFull}:
           SSL_CTX_set_verify(ctx.context, SSL_VERIFY_PEER, nil)
 
