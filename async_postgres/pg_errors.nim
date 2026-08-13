@@ -97,13 +97,35 @@ type
     ## ``PgTimeoutError`` before any ``PgConnectionError`` clause if you need to
     ## distinguish those.
 
+  PoolErrorKind* = enum
+    ## Machine-readable category of a `PgPoolError`.
+    pekUnknown
+      ## Default: a `PgPoolError` built without an explicit `kind`; do not
+      ## treat as `pekClosed`.
+    pekClosed ## The pool is permanently closed; retrying cannot succeed.
+    pekAcquireTimeout
+      ## An acquire deadline elapsed (`acquireTimeout` or cluster fallback);
+      ## retrying later may succeed.
+    pekQueueFull
+      ## The waiter queue is full (`maxWaiters` bound); retrying later may succeed.
+    pekConnectFailed
+      ## A connect attempt failed during acquire (underlying error in `parent`);
+      ## retrying may succeed.
+    pekBatchFailed
+      ## A pipelined batch was unservable; no connection was acquired.
+    pekDefectWrapped
+      ## A user-code `Defect` (body/release block or session reset) wrapped to
+      ## cross an async boundary; preserved as `parent`.
+
   PgPoolError* = object of PgError
-    ## Pool-level acquire failure: acquire timeout, pool closed, waiter queue
-    ## full, or a failed connect attempt during acquire (the underlying error,
-    ## e.g. ``PgConnectionError``, is preserved as ``parent``).
+    ## Pool-level acquire/operation failure (closed, acquire timeout, queue
+    ## full, connect failed, unservable batch, or wrapped user-code `Defect`;
+    ## the underlying error is preserved as ``parent``).
     ##
-    ## Also raised by the pooled `with*` macros / `runAndRelease` when a body
-    ## `Defect` is wrapped (Defect as ``parent``).
+    ## `kind` classifies the failure programmatically; the message string is
+    ## informational only. Errors built without `newPoolError` have
+    ## `kind == pekUnknown`.
+    kind*: PoolErrorKind ## Failure category (see `PoolErrorKind`).
 
   PgNotifyOverflowError* = object of PgError
     dropped*: int ## Number of notifications dropped due to queue overflow
@@ -113,6 +135,12 @@ type
     ## with no channels left to re-subscribe).
     reconnectionAttempted*: bool
       ## True if the pump attempted reconnection before giving up.
+
+template newPoolError*(
+    errKind: PoolErrorKind, message: string, parentErr: ref Exception = nil
+): untyped =
+  ## Create a `PgPoolError` with the given `errKind` (see `PoolErrorKind`).
+  (ref PgPoolError)(kind: errKind, msg: message, parent: parentErr)
 
 const
   # Commonly dispatched-on SQLSTATE codes

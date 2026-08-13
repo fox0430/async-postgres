@@ -379,7 +379,8 @@ suite "Fallback":
       raised = e
 
     check raised != nil
-    check "fallback acquire timeout" in raised.msg
+    check raised of PgPoolError
+    check (ref PgPoolError)(raised).kind == pekAcquireTimeout
     # The replica failure that triggered the fallback is preserved as the cause.
     check raised.parent != nil
     check "Pool is closed" in raised.parent.msg
