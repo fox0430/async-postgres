@@ -229,8 +229,8 @@ proc acquireRead(
       return (conn, cluster.primary)
     except AsyncTimeoutError:
       asyncSpawn drainAbandonedAcquire(primaryFut)
-      raise newException(
-        PgPoolError,
+      raise newPoolError(
+        pekAcquireTimeout,
         "Pool cluster fallback acquire timeout (replica error: " & replicaErr.msg & ")",
         replicaErr,
       )

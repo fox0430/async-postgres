@@ -150,13 +150,12 @@ proc buildTxBeginAndTimeout*(
 proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   ## Build the shared `onCleanupSkipped`-wired ROLLBACK cleanup used on a failed
   ## attempt by the conn/pool/cluster transaction macros: skip ROLLBACK on an
-  ## invalidated connection or when the server already ended the transaction
-  ## (reporting both via `onCleanupSkipped`), otherwise ROLLBACK with
-  ## `rollbackTimeout` as the per-call timeout and report a swallowed failure.
+  ## invalidated connection (reported as `csrConnInvalidated` via
+  ## `onCleanupSkipped`) or a server-ended transaction (`tsIdle`, silent),
+  ## otherwise ROLLBACK with `rollbackTimeout` and report a swallowed failure.
   ##
   ## Cancelled and plain-failure ROLLBACKs are both reported and swallowed so
-  ## the enclosing `except` can re-raise the original body error — re-raising
-  ## the cancel would surface a fresh chronos `CancelledError` and mask it.
+  ## the enclosing `except` can re-raise the original body error.
   let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
   let cleanupDefectSym = genSym(nskLet, "cleanupDefect")
@@ -195,9 +194,9 @@ proc buildSavepointRollbackCleanup*(
 ): NimNode =
   ## Build the shared `onCleanupSkipped`-wired ROLLBACK TO SAVEPOINT cleanup used
   ## on a failed body by `withSavepoint` / `withSavepointDeadline`: skip on an
-  ## invalidated connection or when the surrounding transaction has already
-  ## ended (reporting both via `onCleanupSkipped`), otherwise ROLLBACK TO
-  ## SAVEPOINT with `rollbackTimeout` as the per-call timeout and report a
+  ## invalidated connection (reported as `csrConnInvalidated` via
+  ## `onCleanupSkipped`) or an ended surrounding transaction (`tsIdle`, silent),
+  ## otherwise ROLLBACK TO SAVEPOINT with `rollbackTimeout` and report a
   ## swallowed failure. The caller binds `spNameSym` (already quoted via
   ## `quoteIdentifier`) in the surrounding scope.
   ##

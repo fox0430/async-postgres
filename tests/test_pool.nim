@@ -750,6 +750,7 @@ suite "Pool withConnection release-path Defect":
           caught = e
 
         doAssert caught != nil, "the body Defect must surface as PgPoolError"
+        doAssert caught.kind == pekDefectWrapped
         doAssert caught.parent of AssertionDefect,
           "the body Defect must be the parent, not the release Defect"
         doAssert caught.parent.msg == "body defect",
@@ -789,6 +790,7 @@ suite "Pool withConnection release-path Defect":
           caught = e
 
         doAssert caught != nil, "the release-path Defect must surface as PgPoolError"
+        doAssert caught.kind == pekDefectWrapped
         doAssert caught.parent of AssertionDefect,
           "the Defect must be preserved as parent"
         # asyncdispatch appends an async traceback to the message.
@@ -860,6 +862,7 @@ suite "Pool withConnection release-path Defect":
           caught = e
 
         doAssert caught != nil, "the body Defect must surface as PgPoolError"
+        doAssert caught.kind == pekDefectWrapped
         doAssert caught.parent of AssertionDefect,
           "the body Defect must be the parent, not the release Defect"
         # asyncdispatch appends an async traceback to the message.
@@ -1750,13 +1753,16 @@ suite "Max waiters":
     check pool.waiters.len == 2
 
     # Third should be rejected immediately
-    var msg = ""
+    var caught: ref PgPoolError
     try:
       discard waitFor pool.acquire()
-    except PgError as e:
-      msg = e.msg
+    except PgPoolError as e:
+      caught = e
+    except PgError:
+      discard
 
-    check "queue full" in msg.toLowerAscii()
+    check caught != nil
+    check caught.kind == pekQueueFull
     check pool.waiters.len == 2
 
     # Clean up
@@ -2886,25 +2892,27 @@ suite "FIFO fairness":
         doAssert pool.waiterCount == 1
         doAssert pool.active == 1
 
-        var errA = ""
+        var errA: ref PgPoolError = nil
         try:
           discard await futA
         except PgPoolError as e:
-          errA = e.msg
-        doAssert "Pool connect failed" in errA
+          errA = e
+        doAssert errA != nil
+        doAssert errA.kind == pekConnectFailed
 
         # With the fix, B is served by the spawn (which also fails against the
         # unresponsive mock) and returns fast; without it, B would time out on
-        # acquireTimeout with "Pool acquire timeout".
-        var errB = ""
+        # acquireTimeout with pekAcquireTimeout.
+        var errB: ref PgPoolError = nil
         let bStart = Moment.now()
         try:
           discard await futB
         except PgPoolError as e:
-          errB = e.msg
+          errB = e
         let bElapsed = Moment.now() - bStart
-        doAssert "Pool connect for waiter failed" in errB
-        doAssert "acquire timeout" notin errB
+        doAssert errB != nil
+        doAssert errB.kind == pekConnectFailed
+        doAssert errB.kind != pekAcquireTimeout
         doAssert bElapsed < seconds(2)
 
         await pool.close()
@@ -2932,14 +2940,15 @@ suite "Error type granularity":
 
     discard pool.acquire() # fills the waiter queue
 
-    var caught = false
+    var caught: ref PgPoolError
     try:
       discard waitFor pool.acquire()
-    except PgPoolError:
-      caught = true
+    except PgPoolError as e:
+      caught = e
     except PgError:
       discard
-    check caught
+    check caught != nil
+    check caught.kind == pekQueueFull
 
     # Clean up
     pool.release(mockConn())
@@ -2997,6 +3006,48 @@ suite "Error type granularity":
       await pool.close()
 
     waitFor t()
+
+  test "pipelined batch acquire failure fails every op with pekBatchFailed":
+    # Multi-op dispatch arm: every acquire fails (connection refused), so the
+    # batch cannot be served — each op's future must fail with pekBatchFailed
+    # (not hang, and not leak the underlying acquire error kind).
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let port = ms.port
+      await closeServer(ms) # guaranteed connection-refused port
+
+      let pool = makePool(maxSize = 1)
+      pool.config.pipelined = true
+      pool.config.connConfig.host = "127.0.0.1"
+      pool.config.connConfig.port = port
+      pool.config.connConfig.connectTimeout = milliseconds(500)
+
+      # Two ops queued in the same tick form one batch (multi-op dispatch arm).
+      let futA = pool.exec("SELECT 1")
+      let futB = pool.exec("SELECT 2")
+
+      for fut in [futA, futB]:
+        var caught: ref PgPoolError
+        try:
+          discard await fut
+        except PgPoolError as e:
+          caught = e
+        doAssert caught != nil, "batch op must fail with PgPoolError, not hang"
+        doAssert caught.kind == pekBatchFailed
+        doAssert caught.parent != nil,
+          "the failed acquire must be preserved as the parent"
+        doAssert caught.parent of PgPoolError
+        doAssert (ref PgPoolError)(caught.parent).kind == pekConnectFailed
+
+      await pool.close()
+
+    waitFor t()
+
+  test "PgPoolError without newPoolError has kind pekUnknown":
+    # Legacy construction (newException) leaves kind at its zero value, which
+    # must not be mistaken for pekClosed (see PoolErrorKind).
+    let err = newException(PgPoolError, "legacy construction")
+    check err.kind == pekUnknown
 
   test "spawn connect failure fails waiter with PgPoolError with parent":
     # Waiter path: a broken-conn release kicks off spawnConnectForWaiter;
@@ -3099,7 +3150,7 @@ suite "Error type granularity":
         doAssert pool.waiterCount == 1 # waiter still queued, not failed
         doAssert pool.active == 0 # reservation released by `finally`
 
-        # close() settles the still-queued waiter with "Pool closed".
+        # close() settles the still-queued waiter with pekClosed.
         await pool.close()
         var caught: ref PgPoolError
         try:
@@ -3107,6 +3158,7 @@ suite "Error type granularity":
         except PgPoolError as e:
           caught = e
         doAssert caught != nil
+        doAssert caught.kind == pekClosed
         await closeServer(ms)
 
       waitFor t()
@@ -3539,7 +3591,7 @@ suite "Pool acquire close-race":
       doAssert acquireFut.failed
       let err = acquireFut.readError()
       doAssert err of PgPoolError
-      doAssert "closed" in err.msg
+      doAssert (ref PgPoolError)(err).kind == pekClosed
       doAssert pool.active == 0
       doAssert pool.metrics.createCount == 1
       doAssert pool.metrics.closeCount == 1
@@ -3589,7 +3641,7 @@ suite "Pool acquire close-race":
       doAssert acquireFut.failed
       let err = acquireFut.readError()
       doAssert err of PgPoolError
-      doAssert "closed" in err.msg
+      doAssert (ref PgPoolError)(err).kind == pekClosed
       doAssert pool.active == 0
       doAssert pool.idle.len == 0
 
