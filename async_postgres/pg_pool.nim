@@ -997,7 +997,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
               rem,
               onOrphan = proc(fut: Future[PgConnection]) =
                 if fut.completed():
-                  asyncSpawn (
+                  # Track the orphan close so pool.close()'s drain awaits it.
+                  pool.pruneBackgroundTasks()
+                  let closeFut = (
                     proc() {.async.} =
                       try:
                         let orphan = fut.read()
@@ -1006,6 +1008,8 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
                       except CatchableError:
                         discard
                   )()
+                  pool.pendingBackgroundTasks.add(closeFut)
+                  asyncSpawn closeFut
               ,
             )
           else:
