@@ -1641,6 +1641,53 @@ suite "Acquire deadline budget":
 
     waitFor t()
 
+  when hasAsyncDispatch:
+    test "orphan connect close from timed-out acquire is tracked for close() drain":
+      proc t() {.async.} =
+        # A server that answers the startup message only after the acquire
+        # deadline: the caller-driven connect survives as an orphan (asyncdispatch
+        # has no cancellation), and its eventual close must be tracked in
+        # pendingBackgroundTasks so pool.close() drains it — an untracked spawn
+        # could leave the socket open past close().
+        let ms = startMockServer()
+        proc serve() {.async.} =
+          let client = await ms.accept()
+          discard await client.readN(4) # StartupMessage length prefix
+          await sleepAsync(milliseconds(150))
+          await client.sendBytes(buildAuthOk())
+          await client.sendBytes(buildBackendKeyData(1234, 5678))
+          await client.sendBytes(buildReadyForQuery())
+
+        let serveFut = serve()
+
+        let pool = makePool()
+        pool.config.connConfig.host = "127.0.0.1"
+        pool.config.connConfig.port = ms.port
+        pool.config.connConfig.sslMode = sslDisable
+        pool.config.acquireTimeout = milliseconds(50)
+
+        var msg = ""
+        try:
+          discard await pool.acquire()
+        except PgPoolError as e:
+          msg = e.msg
+        doAssert "timeout" in msg.toLowerAscii()
+
+        # Wait for the orphan connect to complete and enqueue its close.
+        var waited = 0
+        while pool.pendingBackgroundTasks.len == 0 and waited < 50:
+          await sleepAsync(milliseconds(10))
+          inc waited
+        doAssert pool.pendingBackgroundTasks.len == 1
+
+        await pool.close()
+        doAssert pool.pendingBackgroundTasks.len == 0
+
+        await ms.closeServer()
+        await serveFut
+
+      waitFor t()
+
   test "nearly exhausted deadline returns idle conn unpinged":
     proc t() {.async.} =
       # With less than pingBudgetFloor (10ms) of budget left, acquire must

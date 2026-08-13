@@ -541,6 +541,12 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
                   p.ops[activeOpIdx].cache in {scsHit, scsShare}:
                 conn.pendingStmtCloses.add(p.ops[activeOpIdx].stmtName)
                 conn.removeStmtCache(p.ops[activeOpIdx].sql)
+              elif activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsMiss and
+                  not p.ops[activeOpIdx].cacheSuperseded:
+                # Cache-miss stmts are cached only on success, so a failed
+                # op's stmt is orphaned unless Closed. Close of an unparsed
+                # or already-Closed stmt is a harmless no-op.
+                conn.pendingStmtCloses.add(p.ops[activeOpIdx].stmtName)
               raise queryError
             # Cache misses: add to cache (skip ops superseded by a later
             # same-SQL op in this same pipeline — those stmts were already
@@ -667,6 +673,9 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                   # ReadyForQuery.
                   conn.pendingStmtCloses.add(p.ops[opIdx].stmtName)
                   conn.removeStmtCache(p.ops[opIdx].sql)
+                elif p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
+                  # Mirror executeImpl: Close the orphaned cache-miss stmt.
+                  conn.pendingStmtCloses.add(p.ops[opIdx].stmtName)
                 errors[opIdx] = opError
               elif p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
                 conn.addStmtCache(

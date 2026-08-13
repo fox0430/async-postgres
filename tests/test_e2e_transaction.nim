@@ -2945,6 +2945,75 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: failing scsMiss op queues Close so no server statement leaks":
+    # A cache-miss op that fails at Execute time (Parse succeeded) leaves its
+    # freshly Parsed statement on the server. The cache-add happens only on
+    # success, so nothing reuses it — without a queued Close every repeat of
+    # the failing SQL would pile up a new server statement (each run is a fresh
+    # miss with a fresh name).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let failingSql = "SELECT $1::int / 0"
+
+      proc countLeaked(): Future[int] {.async.} =
+        (
+          await conn.simpleQuery(
+            "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
+              failingSql & "'"
+          )
+        )[0].rows[0].getInt(0)
+
+      doAssert (await countLeaked()) == 0
+
+      for i in 0 ..< 3:
+        let p = newPipeline(conn)
+        p.addQuery(failingSql, @[toPgParam(0)])
+        var raised = false
+        try:
+          discard await p.execute()
+        except PgQueryError:
+          raised = true
+        doAssert raised
+        # The queued Close rides along with the next extended-query op.
+        discard await conn.query("SELECT 1")
+        doAssert (await countLeaked()) == 0,
+          "failing scsMiss op leaked a server statement"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated failing scsMiss op queues Close so no leak":
+    # executeIsolated counterpart: per-op SYNC still leaves the failed op's
+    # freshly Parsed statement on the server, and the cache-add happens only
+    # on success.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let failingSql = "SELECT 1 / $1::int"
+
+      proc countLeaked(): Future[int] {.async.} =
+        (
+          await conn.simpleQuery(
+            "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
+              failingSql & "'"
+          )
+        )[0].rows[0].getInt(0)
+
+      doAssert (await countLeaked()) == 0
+
+      for i in 0 ..< 3:
+        let p = newPipeline(conn)
+        p.addQuery(failingSql, @[toPgParam(0)])
+        let ir = await p.executeIsolated()
+        doAssert ir.errors[0] != nil
+        # The queued Close rides along with the next extended-query op.
+        discard await conn.query("SELECT 1")
+        doAssert (await countLeaked()) == 0, "executeIsolated leaked a server statement"
+
+      await conn.close()
+
+    waitFor t()
+
   test "pipeline: PgParam raw overload":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
