@@ -111,8 +111,7 @@ type
     pekConnectFailed
       ## A connect attempt failed during acquire (underlying error in `parent`);
       ## retrying may succeed.
-    pekBatchFailed
-      ## A pipelined batch was unservable; no connection was acquired.
+    pekBatchFailed ## A pipelined batch was unservable; no connection was acquired.
     pekDefectWrapped
       ## A user-code `Defect` (body/release block or session reset) wrapped to
       ## cross an async boundary; preserved as `parent`.

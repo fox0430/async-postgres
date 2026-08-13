@@ -1480,9 +1480,8 @@ proc dispatchHomogeneous(
       break
 
   if conns.len == 0:
-    let err = newPoolError(
-      pekBatchFailed, "Failed to acquire connection for batch", acquireErr
-    )
+    let err =
+      newPoolError(pekBatchFailed, "Failed to acquire connection for batch", acquireErr)
     for op in ops:
       failPendingOp(op, err)
     return
