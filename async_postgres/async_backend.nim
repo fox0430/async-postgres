@@ -159,6 +159,20 @@ elif hasAsyncDispatch:
   proc `<`*(a, b: Moment): bool =
     a.ticks < b.ticks
 
+  proc drainOrphan[T](fut: Future[T]) {.gcsafe.} =
+    ## Default ``onOrphan``: drain the orphan's outcome so a late failure is
+    ## read and cleared, and cannot resurface. Callers that need resource
+    ## cleanup pass their own ``onOrphan``, which replaces this default.
+    if fut.failed:
+      discard fut.error
+      fut.error = nil
+      fut.errorStackTrace = ""
+    elif fut.finished:
+      when T is void:
+        fut.read()
+      else:
+        discard fut.read()
+
   proc wait*[T](
       fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.} = nil
   ): Future[T] {.async.} =
@@ -170,9 +184,10 @@ elif hasAsyncDispatch:
     ## future keeps running in the background until its I/O completes. This
     ## ``onOrphan`` callback is registered on the inner future and called once
     ## that orphan eventually completes. Use it to close a live connection or
-    ## release other resources the orphan holds. Without it the orphan produces
-    ## an unhandled ``FutureCompleted`` warning at best and a leaked socket /
-    ## server slot at worst.
+    ## release other resources the orphan holds. When ``onOrphan`` is omitted
+    ## the default handler drains the orphan's outcome (clears a late failure)
+    ## but does **not** release other resources. Pass an explicit ``onOrphan``
+    ## when the orphan owns a connection or other live resource.
     ##
     ## Under chronos the ``onOrphan`` argument is accepted but never called —
     ## futures are properly cancelled on timeout and no orphan remains.
@@ -183,6 +198,8 @@ elif hasAsyncDispatch:
         proc() =
           if not onOrphan.isNil:
             onOrphan(fut)
+          else:
+            drainOrphan(fut)
       )
       raise newException(AsyncTimeoutError, "Timeout")
     when T is void:

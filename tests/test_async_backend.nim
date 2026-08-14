@@ -129,6 +129,34 @@ suite "wait":
       )
       check not orphanCalled
 
+    test "default onOrphan drains a failing orphan":
+      # The default drain reads and clears the orphan's late error so it
+      # cannot resurface. This test fails without the drain.
+      proc boom(): Future[void] {.async.} =
+        await sleepMsAsync(20)
+        raise newException(ValueError, "boom")
+
+      let fut = boom()
+      expect AsyncTimeoutError:
+        waitFor wait(fut, milliseconds(1))
+      waitFor sleepMsAsync(50)
+      check fut.finished
+      check not fut.failed
+      check fut.error == nil
+
+    test "default onOrphan drains a completing orphan with a value":
+      # Exercises the non-void branch of the default drain.
+      proc delayed(): Future[int] {.async.} =
+        await sleepMsAsync(20)
+        return 42
+
+      let fut = delayed()
+      expect AsyncTimeoutError:
+        discard waitFor wait(fut, milliseconds(1))
+      waitFor sleepMsAsync(50)
+      check fut.finished
+      check not fut.failed
+
   when hasChronos:
     test "the inner future is cancelled on timeout":
       let fut = sleepAsync(milliseconds(30))
