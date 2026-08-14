@@ -3612,6 +3612,126 @@ suite "Pool replenish close-race":
 
     waitFor t()
 
+suite "Pool replenish capacity race":
+  test "in-flight replenish connects hold a reservation so concurrent acquires cannot overshoot maxSize":
+    # Regression: the maintenance loop once opened replenish connects without
+    # counting them in `pool.active` (the only violation of the reservation
+    # contract `spawnConnectForWaiter` documents). A burst of acquires
+    # arriving mid-replenish saw spare capacity (`active < maxSize`), dialed
+    # their own connections, and the replenish connections parked on top —
+    # pushing `idle + active` to 2x maxSize in a fixed pool (minSize ==
+    # maxSize) and breaching the DB's per-user connection limit. The
+    # in-flight connects must hold capacity reservations, queuing the burst
+    # as waiters until they settle.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 2, maxSize = 2)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.maintenanceInterval = milliseconds(10)
+      pool.maintenanceTask = maintenanceLoop(pool)
+
+      # The loop sleeps one interval, then opens the replenish connects. Gate
+      # the handshake server-side so both connects are provably in flight with
+      # their reservations held (with the OLD code active would be 0 here).
+      let client1 = await ms.accept()
+      await drainStartupMessage(client1)
+      let client2 = await ms.accept()
+      await drainStartupMessage(client2)
+      doAssert pool.active == 2 # the in-flight replenish reservations
+
+      # The burst must queue as waiters rather than dialing its own connects.
+      let futA = pool.acquire()
+      let futB = pool.acquire()
+      await sleepAsync(milliseconds(20))
+      doAssert pool.waiterCount == 2
+      doAssert pool.active == 2
+      doAssert pool.metrics.createCount == 0 # nothing has settled yet
+
+      # Complete the handshakes: the replenish conns hand off to the waiters.
+      await sendFullHandshake(client1)
+      await sendFullHandshake(client2)
+
+      let connA = await futA
+      let connB = await futB
+      doAssert pool.active == 2
+      doAssert pool.idle.len == 0
+      doAssert pool.active + pool.idle.len <= pool.config.maxSize
+      doAssert pool.metrics.createCount == 2 # exactly the replenish connects
+
+      pool.release(connA)
+      pool.release(connB)
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 2
+
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "replenish connect failures release their reservations":
+    # The replenish reservations must be released when the connects fail, or
+    # `active` would stay inflated and `acquire` would queue behind phantom
+    # capacity.
+    proc t() {.async.} =
+      let pool = makePool(minSize = 2, maxSize = 4)
+      pool.config.connConfig = mockConfig(1) # nothing listens on port 1
+      pool.config.maintenanceInterval = milliseconds(10)
+      pool.maintenanceTask = maintenanceLoop(pool)
+
+      await sleepAsync(milliseconds(60))
+
+      doAssert pool.active == 0 # reservations released despite 2 failed connects
+      doAssert pool.idle.len == 0
+      doAssert pool.metrics.createCount == 0
+
+      pool.closed = true
+      await cancelAndWait(pool.maintenanceTask)
+
+    waitFor t()
+
+  when hasChronos:
+    test "close cancelling in-flight replenish releases its reservations (landed and in-flight)":
+      # chronos-only: one replenish connect lands before close() cancels the
+      # loop (settled via the except path); the other stays in flight.
+      proc t() {.async.} =
+        let ms = startMockServer()
+
+        let pool = makePool(minSize = 2, maxSize = 2)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.connConfig.connectTimeout = seconds(5)
+        pool.config.maintenanceInterval = milliseconds(10)
+        pool.maintenanceTask = maintenanceLoop(pool)
+
+        let client1 = await ms.accept()
+        await drainStartupMessage(client1)
+        let client2 = await ms.accept()
+        await drainStartupMessage(client2)
+        doAssert pool.active == 2 # in-flight replenish reservations
+
+        await sendFullHandshake(client1)
+        await sleepAsync(milliseconds(100)) # let the client-side connect settle
+
+        await pool.close()
+        doAssert pool.active == 0
+        doAssert pool.metrics.closeCount == 1 # landed conn settled via closeNoWait
+
+        # Read the landed conn until EOF: the pool must have closed it.
+        var closedByPool = false
+        try:
+          while true:
+            discard await client1.readN(1)
+        except CatchableError:
+          closedByPool = true
+        doAssert closedByPool
+
+        await closeServer(ms)
+        await closeClient(client1)
+        await closeClient(client2)
+
+      waitFor t()
+
 suite "Pool acquire close-race":
   test "acquire discards a connection won after the pool is closed":
     # Regression: acquireImpl's `await connect()` in the new-conn branch could

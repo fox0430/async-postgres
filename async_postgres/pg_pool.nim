@@ -525,6 +525,24 @@ proc respawnForStrandedWaiter(pool: PgPool) =
     pool.active.inc
     pool.spawnConnectForWaiter()
 
+proc settleReplenishConnect(pool: PgPool, conn: PgConnection, now: Moment) =
+  ## Settle a fresh replenishment connection: the pre-reserved `pool.active`
+  ## slot is consumed on waiter handoff, released on park or close.
+  conn.ownerPool = pool
+  pool.metrics.createCount.inc
+  pool.consecutiveConnectFailures = 0
+  # The pool may have closed while awaiting connect — close instead of
+  # parking. closeNoWait (not `await`) so a pending cancellation can't
+  # interrupt the close.
+  if pool.closed:
+    pool.closeNoWait(conn)
+    pool.active.dec
+  elif pool.tryHandoffToWaiter(conn):
+    discard # reservation stays consumed: the conn is now the waiter's
+  else:
+    pool.active.dec
+    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
+
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
     await sleepAsync(pool.config.maintenanceInterval)
@@ -579,31 +597,33 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     if needed > 0:
       if pool.closed:
         break
+      # Reserve the in-flight capacity up front: uncounted replenish connects
+      # would let concurrent acquires overshoot maxSize once these park.
+      pool.active.inc(needed)
       var connectFuts: seq[Future[PgConnection]]
       for i in 0 ..< needed:
         var connCfg = pool.config.connConfig
         if connCfg.connectTimeout == ZeroDuration:
           connCfg.connectTimeout = pool.config.maintenanceInterval
         connectFuts.add(connect(connCfg))
-      await allFutures(connectFuts)
-      for f in connectFuts:
-        if not f.failed():
-          let conn = f.read()
-          conn.ownerPool = pool
-          pool.metrics.createCount.inc
-          pool.consecutiveConnectFailures = 0
-          # The pool may have been closed while we awaited connect. Parking a
-          # fresh conn in a closed pool leaks its socket — re-check and close.
-          # closeNoWait (not `await tracedClose`) because a pending cancellation
-          # would interrupt a fresh await before the close runs.
-          if pool.closed:
-            pool.closeNoWait(conn)
-          elif pool.tryHandoffToWaiter(conn):
-            pool.active.inc
+      try:
+        await allFutures(connectFuts)
+        for f in connectFuts:
+          if not f.failed():
+            pool.settleReplenishConnect(f.read(), now)
+      except CancelledError as e:
+        # close() cancels us mid-connect: settle the conns that already
+        # landed, release the rest, then re-raise so cancelAndWait
+        # observes completion.
+        for f in connectFuts:
+          if not f.finished or f.failed():
+            pool.active.dec
           else:
-            pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
+            pool.settleReplenishConnect(f.read(), now)
+        raise e
       for f in connectFuts:
         if f.failed():
+          pool.active.dec
           pool.consecutiveConnectFailures.inc
       if pool.consecutiveConnectFailures > 0:
         let delay = computeConnectBackoff(
