@@ -58,6 +58,25 @@ proc drainToReadyBestEffort(conn: PgConnection) {.async.} =
   except CatchableError:
     discard
 
+proc drainLeftoverToReady(conn: PgConnection) {.async.} =
+  ## Drain the protocol-violation ErrorResponse + ReadyForQuery that a
+  ## non-standard backend may send after a server-aborted COPY when our
+  ## CopyDone/CopyFail arrived after it left copy-in mode; leaving it buffered
+  ## would desync the stream. No-op against PostgreSQL. Only blocks when a
+  ## partial message is already buffered. Errors are swallowed so the original
+  ## COPY error stays surfaced; cancellation propagates.
+  try:
+    while (let opt = conn.nextMessage(); opt.isSome):
+      if opt.get.kind == bmkReadyForQuery:
+        conn.txStatus = opt.get.txStatus
+        return
+    if conn.recvBufStart < conn.recvBuf.len:
+      await conn.drainToReadyBestEffort()
+  except CancelledError as e:
+    raise e
+  except CatchableError:
+    discard
+
 proc abortCopyWatch(conn: PgConnection, watch: RecvWatch) =
   ## An unrecoverable transport failure (or a teardown) mid-COPY: abandon the
   ## in-flight watch read and mark the connection csClosed so the now
@@ -129,10 +148,14 @@ proc copyInRawImpl*(
           conn.sendBuf.setLen(0)
           break
     if abortError == nil:
-      # Flush remaining data + CopyDone in one send
-      conn.sendBuf.addCopyDone()
-      await conn.sendBufMsg()
-      conn.sendBuf.setLen(0)
+      # Final non-blocking abort check before CopyDone (mirrors the
+      # callback-error path's final poll), so CopyDone is never a stray message.
+      abortError = await conn.pollCopyInError(watch)
+      if abortError == nil:
+        # Flush remaining data + CopyDone in one send
+        conn.sendBuf.addCopyDone()
+        await conn.sendBufMsg()
+        conn.sendBuf.setLen(0)
   except CatchableError as e:
     # Transport failure mid-stream: the protocol is out of sync, so invalidate
     # the connection and surface the original error.
@@ -155,14 +178,20 @@ proc copyInRawImpl*(
     await watch.take()
 
   # Wait for CommandComplete + ReadyForQuery
-  conn.pumpUntilReady:
-    case pumpMsg.kind
-    of bmkCommandComplete:
-      commandTag = pumpMsg.commandTag
-    else:
+  try:
+    conn.pumpUntilReady:
+      case pumpMsg.kind
+      of bmkCommandComplete:
+        commandTag = pumpMsg.commandTag
+      else:
+        discard
+    do:
       discard
-  do:
-    discard
+  except PgQueryError as e:
+    # Drain the stray protocol-violation response trailing a late CopyDone
+    # after a server abort, so the connection stays usable.
+    await conn.drainLeftoverToReady()
+    raise e
 
   return commandTag
 
@@ -367,6 +396,9 @@ proc copyInStreamImpl*(
       if watch.pending:
         await watch.take()
       await conn.drainToReady()
+      # Drain any protocol-violation response trailing a stray CopyFail sent
+      # after the backend had already left copy-in mode.
+      await conn.drainLeftoverToReady()
     except CancelledError as e:
       # Cancellation tears the operation down: invalidate and propagate it rather
       # than masking it with the callback error.
@@ -377,7 +409,21 @@ proc copyInStreamImpl*(
       raise callbackError
     raise callbackError
   else:
-    # Normal completion: flush remaining data + CopyDone in one send
+    # Normal completion: final non-blocking abort check before CopyDone
+    # (mirrors the callback-error path's final poll).
+    try:
+      abortError = await conn.pollCopyInError(watch)
+    except CatchableError as e:
+      # Transport failure on the background watch read: the recv side is gone,
+      # so abandon the watch read, invalidate the connection and surface the
+      # transport failure.
+      conn.abortCopyWatch(watch)
+      raise e
+    if abortError != nil:
+      conn.sendBuf.setLen(0)
+      await conn.drainToReadyBestEffort()
+      raise abortError
+    # Flush remaining data + CopyDone in one send
     conn.sendBuf.addCopyDone()
     try:
       await conn.sendBufMsg()
@@ -394,14 +440,20 @@ proc copyInStreamImpl*(
     await watch.take()
 
   # Wait for CommandComplete + ReadyForQuery
-  conn.pumpUntilReady:
-    case pumpMsg.kind
-    of bmkCommandComplete:
-      info.commandTag = pumpMsg.commandTag
-    else:
+  try:
+    conn.pumpUntilReady:
+      case pumpMsg.kind
+      of bmkCommandComplete:
+        info.commandTag = pumpMsg.commandTag
+      else:
+        discard
+    do:
       discard
-  do:
-    discard
+  except PgQueryError as e:
+    # Drain the stray protocol-violation response trailing a late CopyDone
+    # after a server abort, so the connection stays usable.
+    await conn.drainLeftoverToReady()
+    raise e
 
   return info
 
