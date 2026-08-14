@@ -48,6 +48,14 @@ openssl req -new -x509 -nodes \
   -subj "/CN=Wrong CA" \
   2>/dev/null
 
+# --- Passphrase-protected client key (password: test) ---
+# Fixture for the "passphrase-protected key is rejected" TLS test. The
+# password is a fixed test value; the key is never validated against a CA.
+openssl genrsa -aes256 -passout pass:test \
+  -out "${CERT_DIR}/encrypted.key" 2048 \
+  2>/dev/null
+chmod 600 "${CERT_DIR}/encrypted.key"
+
 # Clean up intermediates
 rm -f "${CERT_DIR}/server.csr" "${CERT_DIR}/ca.srl"
 

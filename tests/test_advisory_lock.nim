@@ -348,6 +348,27 @@ suite "Advisory Lock: withAdvisoryLock template":
 
     waitFor t()
 
+  test "withAdvisoryLock releases on Defect":
+    # Regression: a ``Defect`` raised by ``body`` is not a ``CatchableError``,
+    # so it used to skip the unlock and leak the session lock.
+    proc t() {.async.} =
+      let conn1 = await connect(plainConfig())
+      let conn2 = await connect(plainConfig())
+      defer:
+        await conn1.close()
+        await conn2.close()
+      try:
+        conn1.withAdvisoryLock(50013'i64):
+          raise newException(IndexDefect, "test defect")
+      except Defect:
+        discard
+      # Lock should be released despite the Defect
+      let acquired = await conn2.advisoryTryLock(50013'i64)
+      doAssert acquired
+      discard await conn2.advisoryUnlock(50013'i64)
+
+    waitFor t()
+
   test "withAdvisoryLock preserves body exception when unlock fails":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -363,6 +384,24 @@ suite "Advisory Lock: withAdvisoryLock template":
       # The unlock attempt fails because the connection is closed, but the
       # original body exception must still propagate.
       doAssert bodyMsg == "original body error"
+
+    waitFor t()
+
+  test "withAdvisoryLock preserves body Defect when unlock fails":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(50014'i64):
+          await conn.close()
+          raise newException(IndexDefect, "original body defect")
+      except Defect as e:
+        bodyMsg = e.msg
+      # The unlock attempt fails because the connection is closed, but the
+      # original body Defect must still propagate raw.
+      doAssert bodyMsg == "original body defect"
 
     waitFor t()
 

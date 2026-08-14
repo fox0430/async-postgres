@@ -454,7 +454,8 @@ suite "E2E: Pool Stress":
         conn2.release()
       except PgError as e:
         raised = true
-        doAssert "timeout" in e.msg.toLowerAscii()
+        doAssert e of PgPoolError
+        doAssert (ref PgPoolError)(e).kind == pekAcquireTimeout
 
       doAssert raised
 

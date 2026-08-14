@@ -750,6 +750,7 @@ suite "Pool withConnection release-path Defect":
           caught = e
 
         doAssert caught != nil, "the body Defect must surface as PgPoolError"
+        doAssert caught.kind == pekDefectWrapped
         doAssert caught.parent of AssertionDefect,
           "the body Defect must be the parent, not the release Defect"
         doAssert caught.parent.msg == "body defect",
@@ -789,6 +790,7 @@ suite "Pool withConnection release-path Defect":
           caught = e
 
         doAssert caught != nil, "the release-path Defect must surface as PgPoolError"
+        doAssert caught.kind == pekDefectWrapped
         doAssert caught.parent of AssertionDefect,
           "the Defect must be preserved as parent"
         # asyncdispatch appends an async traceback to the message.
@@ -860,6 +862,7 @@ suite "Pool withConnection release-path Defect":
           caught = e
 
         doAssert caught != nil, "the body Defect must surface as PgPoolError"
+        doAssert caught.kind == pekDefectWrapped
         doAssert caught.parent of AssertionDefect,
           "the body Defect must be the parent, not the release Defect"
         # asyncdispatch appends an async traceback to the message.
@@ -1641,6 +1644,53 @@ suite "Acquire deadline budget":
 
     waitFor t()
 
+  when hasAsyncDispatch:
+    test "orphan connect close from timed-out acquire is tracked for close() drain":
+      proc t() {.async.} =
+        # A server that answers the startup message only after the acquire
+        # deadline: the caller-driven connect survives as an orphan (asyncdispatch
+        # has no cancellation), and its eventual close must be tracked in
+        # pendingBackgroundTasks so pool.close() drains it — an untracked spawn
+        # could leave the socket open past close().
+        let ms = startMockServer()
+        proc serve() {.async.} =
+          let client = await ms.accept()
+          discard await client.readN(4) # StartupMessage length prefix
+          await sleepAsync(milliseconds(150))
+          await client.sendBytes(buildAuthOk())
+          await client.sendBytes(buildBackendKeyData(1234, 5678))
+          await client.sendBytes(buildReadyForQuery())
+
+        let serveFut = serve()
+
+        let pool = makePool()
+        pool.config.connConfig.host = "127.0.0.1"
+        pool.config.connConfig.port = ms.port
+        pool.config.connConfig.sslMode = sslDisable
+        pool.config.acquireTimeout = milliseconds(50)
+
+        var msg = ""
+        try:
+          discard await pool.acquire()
+        except PgPoolError as e:
+          msg = e.msg
+        doAssert "timeout" in msg.toLowerAscii()
+
+        # Wait for the orphan connect to complete and enqueue its close.
+        var waited = 0
+        while pool.pendingBackgroundTasks.len == 0 and waited < 50:
+          await sleepAsync(milliseconds(10))
+          inc waited
+        doAssert pool.pendingBackgroundTasks.len == 1
+
+        await pool.close()
+        doAssert pool.pendingBackgroundTasks.len == 0
+
+        await ms.closeServer()
+        await serveFut
+
+      waitFor t()
+
   test "nearly exhausted deadline returns idle conn unpinged":
     proc t() {.async.} =
       # With less than pingBudgetFloor (10ms) of budget left, acquire must
@@ -1750,13 +1800,16 @@ suite "Max waiters":
     check pool.waiters.len == 2
 
     # Third should be rejected immediately
-    var msg = ""
+    var caught: ref PgPoolError
     try:
       discard waitFor pool.acquire()
-    except PgError as e:
-      msg = e.msg
+    except PgPoolError as e:
+      caught = e
+    except PgError:
+      discard
 
-    check "queue full" in msg.toLowerAscii()
+    check caught != nil
+    check caught.kind == pekQueueFull
     check pool.waiters.len == 2
 
     # Clean up
@@ -2886,25 +2939,27 @@ suite "FIFO fairness":
         doAssert pool.waiterCount == 1
         doAssert pool.active == 1
 
-        var errA = ""
+        var errA: ref PgPoolError = nil
         try:
           discard await futA
         except PgPoolError as e:
-          errA = e.msg
-        doAssert "Pool connect failed" in errA
+          errA = e
+        doAssert errA != nil
+        doAssert errA.kind == pekConnectFailed
 
         # With the fix, B is served by the spawn (which also fails against the
         # unresponsive mock) and returns fast; without it, B would time out on
-        # acquireTimeout with "Pool acquire timeout".
-        var errB = ""
+        # acquireTimeout with pekAcquireTimeout.
+        var errB: ref PgPoolError = nil
         let bStart = Moment.now()
         try:
           discard await futB
         except PgPoolError as e:
-          errB = e.msg
+          errB = e
         let bElapsed = Moment.now() - bStart
-        doAssert "Pool connect for waiter failed" in errB
-        doAssert "acquire timeout" notin errB
+        doAssert errB != nil
+        doAssert errB.kind == pekConnectFailed
+        doAssert errB.kind != pekAcquireTimeout
         doAssert bElapsed < seconds(2)
 
         await pool.close()
@@ -2932,14 +2987,15 @@ suite "Error type granularity":
 
     discard pool.acquire() # fills the waiter queue
 
-    var caught = false
+    var caught: ref PgPoolError
     try:
       discard waitFor pool.acquire()
-    except PgPoolError:
-      caught = true
+    except PgPoolError as e:
+      caught = e
     except PgError:
       discard
-    check caught
+    check caught != nil
+    check caught.kind == pekQueueFull
 
     # Clean up
     pool.release(mockConn())
@@ -2997,6 +3053,48 @@ suite "Error type granularity":
       await pool.close()
 
     waitFor t()
+
+  test "pipelined batch acquire failure fails every op with pekBatchFailed":
+    # Multi-op dispatch arm: every acquire fails (connection refused), so the
+    # batch cannot be served — each op's future must fail with pekBatchFailed
+    # (not hang, and not leak the underlying acquire error kind).
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let port = ms.port
+      await closeServer(ms) # guaranteed connection-refused port
+
+      let pool = makePool(maxSize = 1)
+      pool.config.pipelined = true
+      pool.config.connConfig.host = "127.0.0.1"
+      pool.config.connConfig.port = port
+      pool.config.connConfig.connectTimeout = milliseconds(500)
+
+      # Two ops queued in the same tick form one batch (multi-op dispatch arm).
+      let futA = pool.exec("SELECT 1")
+      let futB = pool.exec("SELECT 2")
+
+      for fut in [futA, futB]:
+        var caught: ref PgPoolError
+        try:
+          discard await fut
+        except PgPoolError as e:
+          caught = e
+        doAssert caught != nil, "batch op must fail with PgPoolError, not hang"
+        doAssert caught.kind == pekBatchFailed
+        doAssert caught.parent != nil,
+          "the failed acquire must be preserved as the parent"
+        doAssert caught.parent of PgPoolError
+        doAssert (ref PgPoolError)(caught.parent).kind == pekConnectFailed
+
+      await pool.close()
+
+    waitFor t()
+
+  test "PgPoolError without newPoolError has kind pekUnknown":
+    # Legacy construction (newException) leaves kind at its zero value, which
+    # must not be mistaken for pekClosed (see PoolErrorKind).
+    let err = newException(PgPoolError, "legacy construction")
+    check err.kind == pekUnknown
 
   test "spawn connect failure fails waiter with PgPoolError with parent":
     # Waiter path: a broken-conn release kicks off spawnConnectForWaiter;
@@ -3099,7 +3197,7 @@ suite "Error type granularity":
         doAssert pool.waiterCount == 1 # waiter still queued, not failed
         doAssert pool.active == 0 # reservation released by `finally`
 
-        # close() settles the still-queued waiter with "Pool closed".
+        # close() settles the still-queued waiter with pekClosed.
         await pool.close()
         var caught: ref PgPoolError
         try:
@@ -3107,6 +3205,7 @@ suite "Error type granularity":
         except PgPoolError as e:
           caught = e
         doAssert caught != nil
+        doAssert caught.kind == pekClosed
         await closeServer(ms)
 
       waitFor t()
@@ -3513,6 +3612,126 @@ suite "Pool replenish close-race":
 
     waitFor t()
 
+suite "Pool replenish capacity race":
+  test "in-flight replenish connects hold a reservation so concurrent acquires cannot overshoot maxSize":
+    # Regression: the maintenance loop once opened replenish connects without
+    # counting them in `pool.active` (the only violation of the reservation
+    # contract `spawnConnectForWaiter` documents). A burst of acquires
+    # arriving mid-replenish saw spare capacity (`active < maxSize`), dialed
+    # their own connections, and the replenish connections parked on top —
+    # pushing `idle + active` to 2x maxSize in a fixed pool (minSize ==
+    # maxSize) and breaching the DB's per-user connection limit. The
+    # in-flight connects must hold capacity reservations, queuing the burst
+    # as waiters until they settle.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 2, maxSize = 2)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.maintenanceInterval = milliseconds(10)
+      pool.maintenanceTask = maintenanceLoop(pool)
+
+      # The loop sleeps one interval, then opens the replenish connects. Gate
+      # the handshake server-side so both connects are provably in flight with
+      # their reservations held (with the OLD code active would be 0 here).
+      let client1 = await ms.accept()
+      await drainStartupMessage(client1)
+      let client2 = await ms.accept()
+      await drainStartupMessage(client2)
+      doAssert pool.active == 2 # the in-flight replenish reservations
+
+      # The burst must queue as waiters rather than dialing its own connects.
+      let futA = pool.acquire()
+      let futB = pool.acquire()
+      await sleepAsync(milliseconds(20))
+      doAssert pool.waiterCount == 2
+      doAssert pool.active == 2
+      doAssert pool.metrics.createCount == 0 # nothing has settled yet
+
+      # Complete the handshakes: the replenish conns hand off to the waiters.
+      await sendFullHandshake(client1)
+      await sendFullHandshake(client2)
+
+      let connA = await futA
+      let connB = await futB
+      doAssert pool.active == 2
+      doAssert pool.idle.len == 0
+      doAssert pool.active + pool.idle.len <= pool.config.maxSize
+      doAssert pool.metrics.createCount == 2 # exactly the replenish connects
+
+      pool.release(connA)
+      pool.release(connB)
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 2
+
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "replenish connect failures release their reservations":
+    # The replenish reservations must be released when the connects fail, or
+    # `active` would stay inflated and `acquire` would queue behind phantom
+    # capacity.
+    proc t() {.async.} =
+      let pool = makePool(minSize = 2, maxSize = 4)
+      pool.config.connConfig = mockConfig(1) # nothing listens on port 1
+      pool.config.maintenanceInterval = milliseconds(10)
+      pool.maintenanceTask = maintenanceLoop(pool)
+
+      await sleepAsync(milliseconds(60))
+
+      doAssert pool.active == 0 # reservations released despite 2 failed connects
+      doAssert pool.idle.len == 0
+      doAssert pool.metrics.createCount == 0
+
+      pool.closed = true
+      await cancelAndWait(pool.maintenanceTask)
+
+    waitFor t()
+
+  when hasChronos:
+    test "close cancelling in-flight replenish releases its reservations (landed and in-flight)":
+      # chronos-only: one replenish connect lands before close() cancels the
+      # loop (settled via the except path); the other stays in flight.
+      proc t() {.async.} =
+        let ms = startMockServer()
+
+        let pool = makePool(minSize = 2, maxSize = 2)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.connConfig.connectTimeout = seconds(5)
+        pool.config.maintenanceInterval = milliseconds(10)
+        pool.maintenanceTask = maintenanceLoop(pool)
+
+        let client1 = await ms.accept()
+        await drainStartupMessage(client1)
+        let client2 = await ms.accept()
+        await drainStartupMessage(client2)
+        doAssert pool.active == 2 # in-flight replenish reservations
+
+        await sendFullHandshake(client1)
+        await sleepAsync(milliseconds(100)) # let the client-side connect settle
+
+        await pool.close()
+        doAssert pool.active == 0
+        doAssert pool.metrics.closeCount == 1 # landed conn settled via closeNoWait
+
+        # Read the landed conn until EOF: the pool must have closed it.
+        var closedByPool = false
+        try:
+          while true:
+            discard await client1.readN(1)
+        except CatchableError:
+          closedByPool = true
+        doAssert closedByPool
+
+        await closeServer(ms)
+        await closeClient(client1)
+        await closeClient(client2)
+
+      waitFor t()
+
 suite "Pool acquire close-race":
   test "acquire discards a connection won after the pool is closed":
     # Regression: acquireImpl's `await connect()` in the new-conn branch could
@@ -3539,7 +3758,7 @@ suite "Pool acquire close-race":
       doAssert acquireFut.failed
       let err = acquireFut.readError()
       doAssert err of PgPoolError
-      doAssert "closed" in err.msg
+      doAssert (ref PgPoolError)(err).kind == pekClosed
       doAssert pool.active == 0
       doAssert pool.metrics.createCount == 1
       doAssert pool.metrics.closeCount == 1
@@ -3589,7 +3808,7 @@ suite "Pool acquire close-race":
       doAssert acquireFut.failed
       let err = acquireFut.readError()
       doAssert err of PgPoolError
-      doAssert "closed" in err.msg
+      doAssert (ref PgPoolError)(err).kind == pekClosed
       doAssert pool.active == 0
       doAssert pool.idle.len == 0
 

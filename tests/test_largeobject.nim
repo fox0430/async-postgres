@@ -682,6 +682,40 @@ suite "Large Object: withLargeObject template":
 
     waitFor t()
 
+  test "withLargeObject propagates a Defect raw":
+    # Regression: a ``Defect`` raised by ``body`` is not a ``CatchableError``,
+    # so it used to skip the cleanup ``loClose`` entirely.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+
+      # Create the object in its own committed transaction so it survives the
+      # rollback triggered by the Defect below.
+      var oid: Oid
+      conn.withTransaction:
+        oid = await conn.loCreate()
+
+      var caught = ""
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withTransaction:
+          conn.withLargeObject(lo, oid, INV_READWRITE):
+            raise newException(IndexDefect, "sentinel body defect")
+        {.pop.}
+      except Defect as e:
+        caught = e.msg
+
+      doAssert caught == "sentinel body defect",
+        "withLargeObject did not propagate the Defect raw: " & caught
+
+      # The connection must still be usable: the cleanup close and the
+      # rollback both completed before the Defect reached this frame.
+      conn.withTransaction:
+        await conn.loUnlink(oid)
+
+    waitFor t()
+
 suite "Large Object: streaming API":
   test "loReadStream":
     proc t() {.async.} =
