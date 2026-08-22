@@ -21,6 +21,7 @@
 import std/[strutils, options]
 
 import async_backend, pg_types, pg_protocol, pg_connection, pg_client
+import pg_connection/types
 
 const
   INV_READ* = 0x00040000'i32

@@ -2,6 +2,10 @@ import std/[unittest, options, strutils, math, deques, importutils, net]
 
 import
   ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
+import ../async_postgres/pg_connection/buffer_io
+import
+  ../async_postgres/pg_connection/
+    [types, dsn, buffer_io, ssl, cache, simple_query, lifecycle, notify, type_lookup]
 
 when hasChronos:
   import std/sets

@@ -4,8 +4,9 @@
 ## - keyword=value:  ``host=localhost port=5432 dbname=test``
 ## - URI:            ``postgresql://user:pass@host:port/db?param=value``
 ##
-## Re-exported through `pg_connection.nim`; depends only on `types.nim`
-## (in particular, does not touch `PgConnection`).
+## Only `initConnConfig` / `parseDsn` are re-exported through `pg_connection.nim`;
+## the intermediate parsers stay here. Depends only on `types.nim` (does not
+## touch `PgConnection`).
 
 import std/strutils
 when defined(posix):

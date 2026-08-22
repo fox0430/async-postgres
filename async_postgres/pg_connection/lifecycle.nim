@@ -30,7 +30,7 @@ when hasAsyncDispatch:
 
 # Authentication policy helpers
 
-proc enforceAuthAllowed*(
+proc enforceAuthAllowed(
     authMethod: AuthMethod, allowed: set[AuthMethod], offered: string = ""
 ) {.raises: [PgConnectionError].} =
   if allowed.len > 0 and authMethod notin allowed:

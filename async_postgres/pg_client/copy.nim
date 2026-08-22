@@ -4,6 +4,7 @@
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, simple_query]
 import ./core
 
 proc pollCopyInError(
@@ -88,7 +89,7 @@ proc abortCopyWatch(conn: PgConnection, watch: RecvWatch) =
   watch.cancel()
   conn.state = csClosed
 
-proc copyInRawImpl*(
+proc copyInRawImpl(
     conn: PgConnection, sql: string, data: seq[byte]
 ): Future[string] {.async.} =
   conn.checkReady()
@@ -263,7 +264,7 @@ proc copyIn*(
     offset += chunk.len
   copyIn(conn, sql, combined, timeout)
 
-proc copyInStreamImpl*(
+proc copyInStreamImpl(
     conn: PgConnection, sql: string, callback: CopyInCallback
 ): Future[CopyInInfo] {.async.} =
   conn.checkReady()
@@ -496,7 +497,7 @@ proc copyInStream*(
     )
   return info
 
-proc copyOutImpl*(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
+proc copyOutImpl(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
   conn.state = csBusy
@@ -569,7 +570,7 @@ proc copyOut*(
     awaitOrInvalidate(conn, cr, copyOutImpl(conn, sql), timeout, "COPY OUT timed out")
   return cr
 
-proc copyOutStreamImpl*(
+proc copyOutStreamImpl(
     conn: PgConnection, sql: string, callback: CopyOutCallback
 ): Future[CopyOutInfo] {.async.} =
   conn.checkReady()

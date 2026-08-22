@@ -3,6 +3,7 @@ when defined(posix):
   import std/posix
 
 import ../async_postgres/[async_backend, pg_connection]
+import ../async_postgres/pg_connection/dsn
 
 const dummyPem = "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n"
 

@@ -6,6 +6,9 @@ import
     pg_connection,
   ]
 
+import ../async_postgres/pg_client/transaction {.all.}
+import ../async_postgres/pg_connection/[simple_query, lifecycle, notify, buffer_io]
+
 import e2e_common
 
 privateAccess(PgConnection)

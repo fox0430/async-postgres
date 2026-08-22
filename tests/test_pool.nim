@@ -5,6 +5,9 @@ when hasChronos:
   import pkg/chronos/streams/asyncstream
 
 import ../async_postgres/[pg_protocol, pg_types, pg_connection]
+import ../async_postgres/pg_connection/buffer_io
+import ../async_postgres/pg_connection/simple_query
+import ../async_postgres/pg_connection/cache
 import ../async_postgres/pg_pool {.all.}
 
 import mock_pg_server

@@ -9,8 +9,10 @@
 ## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`)
 ## - `makeCopyOutCallback` / `makeCopyInCallback` cross-backend templates
 ##
-## Re-exported through `pg_connection.nim`; depends only on `types.nim` and
-## the protocol/error/backend abstraction modules.
+## The host helpers and `makeCopy*` templates are re-exported through
+## `pg_connection.nim`; the transport buffering machinery stays here for
+## sibling modules and tests. Depends only on `types.nim` and the
+## protocol/error/backend abstraction modules.
 
 import std/[deques, options, tables]
 when defined(posix):
@@ -26,8 +28,8 @@ elif hasAsyncDispatch:
 
 when defined(posix):
   # POSIX socket option constants (used by liveness probes and TCP keepalive)
-  var TCP_NODELAY* {.importc, header: "<netinet/tcp.h>".}: cint
-  var MSG_DONTWAIT* {.importc, header: "<sys/socket.h>".}: cint
+  var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
+  var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
 
 type
   RecvWatch* = ref object

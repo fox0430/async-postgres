@@ -3,6 +3,7 @@ import std/[unittest, options, tables, math, importutils, net]
 import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_replication, pg_client, pg_connection]
+import ../async_postgres/pg_connection/[simple_query, lifecycle, notify]
 
 import e2e_common
 

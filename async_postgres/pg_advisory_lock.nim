@@ -79,6 +79,7 @@
 import std/[macros, importutils]
 
 import async_backend, pg_protocol, pg_types, pg_connection, pg_client
+import pg_connection/types
 
 privateAccess(PgConnection)
 

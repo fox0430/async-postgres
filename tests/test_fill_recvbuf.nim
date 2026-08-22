@@ -22,6 +22,9 @@ import std/[unittest]
 
 import ../async_postgres/async_backend
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/buffer_io
+import ../async_postgres/pg_connection/simple_query
+import ../async_postgres/pg_connection/types
 
 import ./mock_pg_server
 
