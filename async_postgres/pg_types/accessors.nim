@@ -16,7 +16,7 @@ proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
   result.off = int(row.data.cellIndex[idx])
   result.len = int(row.data.cellIndex[idx + 1])
 
-template bufView*(row: Row, off, clen: int): openArray[char] =
+template bufView(row: Row, off, clen: int): openArray[char] =
   ## Zero-copy char view into row.data.buf for parseutils.
   ## clen <= 0 skips `addr buf[off]`: a trailing empty cell has off == buf.len,
   ## which would otherwise raise an uncatchable IndexDefect.
@@ -57,7 +57,7 @@ converter toRow*(cells: seq[Option[seq[byte]]]): Row =
       rd.buf.add(data)
   initRow(rd, 0)
 
-proc parseAffectedRowsRaw*(tag: openArray[char]): int64 =
+proc parseAffectedRowsRaw(tag: openArray[char]): int64 =
   ## Extract row count from the raw bytes of a command tag (e.g.
   ## "UPDATE 3" -> 3, "INSERT 0 1" -> 1). Unlike `parseAffectedRows(string)`
   ## this performs zero heap allocation — useful for pipelines that process
@@ -83,7 +83,7 @@ proc parseAffectedRowsRaw*(tag: openArray[char]): int64 =
     return 0
   parsed
 
-proc parseAffectedRows*(tag: string): int64 =
+proc parseAffectedRows(tag: string): int64 =
   ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).
   parseAffectedRowsRaw(tag.toOpenArray(0, tag.high))
 
@@ -120,7 +120,7 @@ proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
   # bounds check, so a negative col would reach `colFormats[col]` here.
   col >= 0 and row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
 
-proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
+proc colTypeOid(row: Row, col: int): int32 {.inline.} =
   ## Get the type OID for a column, or 0 if not available.
   if col >= 0 and row.data.colTypeOids.len > col:
     row.data.colTypeOids[col]
@@ -368,10 +368,10 @@ proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
 # Binary decoders for types whose scalar accessors reuse the same body as the
 # array-element decoders below. Defined here (above the scalars) so both call
 # sites route through a single implementation. The rest of the
-# `decodePgArrayElement*` overload set — plus text-only helpers — lives in the
+# `decodePgArrayElement` overload set — plus text-only helpers — lives in the
 # registry section further down.
 
-proc decodePgArrayElement*(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
+proc decodePgArrayElement(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
   if buf.len != 16:
     raise newException(PgTypeError, "uuid: bad length " & $buf.len)
   const hexChars = "0123456789abcdef"
@@ -387,14 +387,14 @@ proc decodePgArrayElement*(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
     pos += 2
   PgUuid(s)
 
-proc decodePgArrayElement*(_: typedesc[PgInterval], buf: openArray[byte]): PgInterval =
+proc decodePgArrayElement(_: typedesc[PgInterval], buf: openArray[byte]): PgInterval =
   if buf.len != 16:
     raise newException(PgTypeError, "interval: bad length " & $buf.len)
   result.microseconds = fromBE64(buf.toOpenArray(0, 7))
   result.days = fromBE32(buf.toOpenArray(8, 11))
   result.months = fromBE32(buf.toOpenArray(12, 15))
 
-proc decodePgArrayElement*(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacAddr =
+proc decodePgArrayElement(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacAddr =
   if buf.len != 6:
     raise newException(PgTypeError, "macaddr: bad length " & $buf.len)
   var parts = newSeq[string](6)
@@ -402,7 +402,7 @@ proc decodePgArrayElement*(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacA
     parts[j] = toHex(buf[j], 2).toLowerAscii()
   PgMacAddr(parts.join(":"))
 
-proc decodePgArrayElement*(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacAddr8 =
+proc decodePgArrayElement(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacAddr8 =
   if buf.len != 8:
     raise newException(PgTypeError, "macaddr8: bad length " & $buf.len)
   var parts = newSeq[string](8)
@@ -410,7 +410,7 @@ proc decodePgArrayElement*(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMac
     parts[j] = toHex(buf[j], 2).toLowerAscii()
   PgMacAddr8(parts.join(":"))
 
-proc decodeJsonArrayElem*(buf: openArray[byte], elemOid: int32): JsonNode =
+proc decodeJsonArrayElem(buf: openArray[byte], elemOid: int32): JsonNode =
   # Strip the leading jsonb version byte only when elemOid says jsonb.
   let jsonStr =
     if elemOid == OidJsonb and buf.len > 0 and buf[0] == 1:
@@ -932,48 +932,48 @@ optAccessor(getCircle, getCircleOpt, PgCircle)
 
 # Shared array element decoder registry — 1-D and N-D accessors route here.
 
-proc decodePgArrayElement*(_: typedesc[int16], buf: openArray[byte]): int16 =
+proc decodePgArrayElement(_: typedesc[int16], buf: openArray[byte]): int16 =
   if buf.len != 2:
     raise newException(PgTypeError, "int2 array element: bad length " & $buf.len)
   fromBE16(buf)
 
-proc decodePgArrayElement*(_: typedesc[int32], buf: openArray[byte]): int32 =
+proc decodePgArrayElement(_: typedesc[int32], buf: openArray[byte]): int32 =
   if buf.len != 4:
     raise newException(PgTypeError, "int4 array element: bad length " & $buf.len)
   fromBE32(buf)
 
-proc decodePgArrayElement*(_: typedesc[int64], buf: openArray[byte]): int64 =
+proc decodePgArrayElement(_: typedesc[int64], buf: openArray[byte]): int64 =
   if buf.len != 8:
     raise newException(PgTypeError, "int8 array element: bad length " & $buf.len)
   fromBE64(buf)
 
-proc decodePgArrayElement*(_: typedesc[float32], buf: openArray[byte]): float32 =
+proc decodePgArrayElement(_: typedesc[float32], buf: openArray[byte]): float32 =
   if buf.len != 4:
     raise newException(PgTypeError, "float4 array element: bad length " & $buf.len)
   decodeFloat32BE(buf)
 
-proc decodePgArrayElement*(_: typedesc[float64], buf: openArray[byte]): float64 =
+proc decodePgArrayElement(_: typedesc[float64], buf: openArray[byte]): float64 =
   if buf.len != 8:
     raise newException(PgTypeError, "float8 array element: bad length " & $buf.len)
   decodeFloat64BE(buf)
 
-proc decodePgArrayElement*(_: typedesc[bool], buf: openArray[byte]): bool =
+proc decodePgArrayElement(_: typedesc[bool], buf: openArray[byte]): bool =
   if buf.len != 1:
     raise newException(PgTypeError, "bool array element: bad length " & $buf.len)
   buf[0] != 0'u8
 
-proc decodePgArrayElement*(_: typedesc[string], buf: openArray[byte]): string =
+proc decodePgArrayElement(_: typedesc[string], buf: openArray[byte]): string =
   readString(buf, 0, buf.len)
 
-proc decodePgArrayElement*(_: typedesc[seq[byte]], buf: openArray[byte]): seq[byte] =
+proc decodePgArrayElement(_: typedesc[seq[byte]], buf: openArray[byte]): seq[byte] =
   readBytes(buf, 0, buf.len)
 
-proc decodePgArrayElement*(_: typedesc[PgNumeric], buf: openArray[byte]): PgNumeric =
+proc decodePgArrayElement(_: typedesc[PgNumeric], buf: openArray[byte]): PgNumeric =
   decodeNumericBinary(buf)
 
 # No PgMoney overload: binary money lacks scale; callers must supply it.
 
-proc decodePgArrayElement*(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
+proc decodePgArrayElement(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
   if buf.len < 4:
     raise newException(PgTypeError, "bit array element too short")
   let nbits = fromBE32(buf.toOpenArray(0, 3))
@@ -995,53 +995,51 @@ proc decodePgArrayElement*(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
     data[j] = buf[4 + j]
   PgBit(nbits: nbits, data: data)
 
-proc decodePgArrayElement*(_: typedesc[PgTime], buf: openArray[byte]): PgTime =
+proc decodePgArrayElement(_: typedesc[PgTime], buf: openArray[byte]): PgTime =
   if buf.len != 8:
     raise newException(PgTypeError, "time array element: bad length " & $buf.len)
   decodeBinaryTime(buf)
 
-proc decodePgArrayElement*(_: typedesc[PgTimeTz], buf: openArray[byte]): PgTimeTz =
+proc decodePgArrayElement(_: typedesc[PgTimeTz], buf: openArray[byte]): PgTimeTz =
   if buf.len != 12:
     raise newException(PgTypeError, "timetz array element: bad length " & $buf.len)
   decodeBinaryTimeTz(buf)
 
-proc decodePgArrayElement*[T: PgInet | PgCidr](
-    _: typedesc[T], buf: openArray[byte]
-): T =
+proc decodePgArrayElement[T: PgInet | PgCidr](_: typedesc[T], buf: openArray[byte]): T =
   let (ip, mask) = decodeInetBinary(buf)
   T(address: ip, mask: mask)
 
-proc decodePgArrayElement*[T: PgXml | PgTsVector | PgTsQuery](
+proc decodePgArrayElement[T: PgXml | PgTsVector | PgTsQuery](
     _: typedesc[T], buf: openArray[byte]
 ): T =
   T(readString(buf, 0, buf.len))
 
-proc decodePgArrayElement*(_: typedesc[PgHstore], buf: openArray[byte]): PgHstore =
+proc decodePgArrayElement(_: typedesc[PgHstore], buf: openArray[byte]): PgHstore =
   decodeHstoreBinary(buf)
 
-proc decodePgArrayElement*(_: typedesc[PgPoint], buf: openArray[byte]): PgPoint =
+proc decodePgArrayElement(_: typedesc[PgPoint], buf: openArray[byte]): PgPoint =
   if buf.len != 16:
     raise newException(PgTypeError, "point array element: bad length " & $buf.len)
   decodePointBinary(buf, 0)
 
-proc decodePgArrayElement*(_: typedesc[PgLine], buf: openArray[byte]): PgLine =
+proc decodePgArrayElement(_: typedesc[PgLine], buf: openArray[byte]): PgLine =
   if buf.len != 24:
     raise newException(PgTypeError, "line array element: bad length " & $buf.len)
   result.a = decodeFloat64BE(buf, 0)
   result.b = decodeFloat64BE(buf, 8)
   result.c = decodeFloat64BE(buf, 16)
 
-proc decodePgArrayElement*(_: typedesc[PgLseg], buf: openArray[byte]): PgLseg =
+proc decodePgArrayElement(_: typedesc[PgLseg], buf: openArray[byte]): PgLseg =
   if buf.len != 32:
     raise newException(PgTypeError, "lseg array element: bad length " & $buf.len)
   PgLseg(p1: decodePointBinary(buf, 0), p2: decodePointBinary(buf, 16))
 
-proc decodePgArrayElement*(_: typedesc[PgBox], buf: openArray[byte]): PgBox =
+proc decodePgArrayElement(_: typedesc[PgBox], buf: openArray[byte]): PgBox =
   if buf.len != 32:
     raise newException(PgTypeError, "box array element: bad length " & $buf.len)
   PgBox(high: decodePointBinary(buf, 0), low: decodePointBinary(buf, 16))
 
-proc decodePgArrayElement*(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
+proc decodePgArrayElement(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
   if buf.len < 5:
     raise newException(PgTypeError, "path array element too short: " & $buf.len)
   result.closed = buf[0] != 0
@@ -1055,7 +1053,7 @@ proc decodePgArrayElement*(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
   for j in 0 ..< npts:
     result.points[j] = decodePointBinary(buf, 5 + j * 16)
 
-proc decodePgArrayElement*(_: typedesc[PgPolygon], buf: openArray[byte]): PgPolygon =
+proc decodePgArrayElement(_: typedesc[PgPolygon], buf: openArray[byte]): PgPolygon =
   if buf.len < 4:
     raise newException(PgTypeError, "polygon array element too short: " & $buf.len)
   let npts = fromBE32(buf.toOpenArray(0, 3))
@@ -1068,7 +1066,7 @@ proc decodePgArrayElement*(_: typedesc[PgPolygon], buf: openArray[byte]): PgPoly
   for j in 0 ..< npts:
     result.points[j] = decodePointBinary(buf, 4 + j * 16)
 
-proc decodePgArrayElement*(_: typedesc[PgCircle], buf: openArray[byte]): PgCircle =
+proc decodePgArrayElement(_: typedesc[PgCircle], buf: openArray[byte]): PgCircle =
   if buf.len != 24:
     raise newException(PgTypeError, "circle array element: bad length " & $buf.len)
   result.center = decodePointBinary(buf, 0)
@@ -1077,16 +1075,14 @@ proc decodePgArrayElement*(_: typedesc[PgCircle], buf: openArray[byte]): PgCircl
 # Named helpers where typedesc dispatch can't distinguish: DateTime is shared
 # by timestamp/timestamptz/date; JsonNode needs runtime elemOid.
 
-proc decodeTimestampArrayElem*(
-    buf: openArray[byte], typeName: static string
-): DateTime =
+proc decodeTimestampArrayElem(buf: openArray[byte], typeName: static string): DateTime =
   if buf.len != 8:
     raise newException(
       PgTypeError, "Invalid binary " & typeName & " element length: " & $buf.len
     )
   decodeBinaryTimestamp(buf)
 
-proc decodeDateArrayElem*(buf: openArray[byte]): DateTime =
+proc decodeDateArrayElem(buf: openArray[byte]): DateTime =
   if buf.len != 4:
     raise newException(PgTypeError, "Invalid binary date element length: " & $buf.len)
   decodeBinaryDate(buf)

@@ -4,6 +4,7 @@
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, cache, simple_query, lifecycle]
 import ./core
 
 type Cursor* = ref object

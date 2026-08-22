@@ -5,6 +5,7 @@
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, simple_query]
 import ./core
 
 proc queryInTransactionImpl(

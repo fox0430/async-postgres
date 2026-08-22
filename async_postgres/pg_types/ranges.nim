@@ -18,7 +18,7 @@ type
       upperData: seq[byte],
     ]
 
-  RangeBinaryRaw* =
+  RangeBinaryRaw =
     tuple[
       isEmpty: bool,
       hasLower: bool,
@@ -31,7 +31,7 @@ type
       upperLen: int,
     ]
 
-proc decodeRangeBinaryRaw*(data: openArray[byte]): RangeBinaryRaw =
+proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
   if data.len < 1:
     raise newException(PgTypeError, "Binary range too short")
   let flags = data[0]
@@ -65,7 +65,7 @@ proc decodeRangeBinaryRaw*(data: openArray[byte]): RangeBinaryRaw =
     result.upperOff = pos
     result.upperLen = bLen
 
-proc decodeInt4RangeBinary*(data: openArray[byte]): PgRange[int32] =
+proc decodeInt4RangeBinary(data: openArray[byte]): PgRange[int32] =
   let raw = decodeRangeBinaryRaw(data)
   if raw.isEmpty:
     return PgRange[int32](isEmpty: true)
@@ -90,7 +90,7 @@ proc decodeInt4RangeBinary*(data: openArray[byte]): PgRange[int32] =
       inclusive: raw.upperInc,
     )
 
-proc decodeInt8RangeBinary*(data: openArray[byte]): PgRange[int64] =
+proc decodeInt8RangeBinary(data: openArray[byte]): PgRange[int64] =
   let raw = decodeRangeBinaryRaw(data)
   if raw.isEmpty:
     return PgRange[int64](isEmpty: true)
@@ -115,7 +115,7 @@ proc decodeInt8RangeBinary*(data: openArray[byte]): PgRange[int64] =
       inclusive: raw.upperInc,
     )
 
-proc decodeNumRangeBinary*(data: openArray[byte]): PgRange[PgNumeric] =
+proc decodeNumRangeBinary(data: openArray[byte]): PgRange[PgNumeric] =
   let raw = decodeRangeBinaryRaw(data)
   if raw.isEmpty:
     return PgRange[PgNumeric](isEmpty: true)
@@ -136,7 +136,7 @@ proc decodeNumRangeBinary*(data: openArray[byte]): PgRange[PgNumeric] =
       inclusive: raw.upperInc,
     )
 
-proc decodeTsRangeBinary*(data: openArray[byte]): PgRange[DateTime] =
+proc decodeTsRangeBinary(data: openArray[byte]): PgRange[DateTime] =
   let raw = decodeRangeBinaryRaw(data)
   if raw.isEmpty:
     return PgRange[DateTime](isEmpty: true)
@@ -161,7 +161,7 @@ proc decodeTsRangeBinary*(data: openArray[byte]): PgRange[DateTime] =
       inclusive: raw.upperInc,
     )
 
-proc decodeDateRangeBinary*(data: openArray[byte]): PgRange[DateTime] =
+proc decodeDateRangeBinary(data: openArray[byte]): PgRange[DateTime] =
   let raw = decodeRangeBinaryRaw(data)
   if raw.isEmpty:
     return PgRange[DateTime](isEmpty: true)
@@ -186,7 +186,7 @@ proc decodeDateRangeBinary*(data: openArray[byte]): PgRange[DateTime] =
       inclusive: raw.upperInc,
     )
 
-proc decodeMultirangeBinaryRaw*(
+proc decodeMultirangeBinaryRaw(
     data: openArray[byte]
 ): seq[tuple[off: RelOff, len: int]] =
   ## Decode the framing of a binary multirange into ``(off, len)`` pairs for

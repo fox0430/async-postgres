@@ -6,7 +6,8 @@
 ## adding via `addStmtCache`, and use `pendingStmtCloses` to bundle Close
 ## messages with the next operation's Sync.
 ##
-## Re-exported through `pg_connection.nim`.
+## Internal: not re-exported through `pg_connection.nim`; import this module
+## directly.
 
 import std/[tables, lists]
 

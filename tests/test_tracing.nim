@@ -6,6 +6,8 @@ import ../async_postgres/[pg_client, pg_types, pg_protocol]
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_pool_cluster {.all.}
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/[buffer_io, simple_query, lifecycle]
+import ../async_postgres/pg_connection/types
 
 const
   PgHost = "127.0.0.1"

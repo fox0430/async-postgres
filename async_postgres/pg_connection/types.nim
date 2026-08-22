@@ -37,8 +37,8 @@ else:
 
 var listenReconnectStopWaitMs* = 10_000
   ## Max wait (ms) for a listen pump stuck in a blocking `connect()`; it is
-  ## orphaned on timeout. Unexported so users cannot set it to 0 and disable
-  ## orphan safety — siblings and tests reach it via `import types {.all.}`.
+  ## orphaned on timeout. Not re-exported through `pg_connection`, so call
+  ## sites cannot set it to 0 via the aggregate import and disable orphan safety.
 
 type
   PgConnState* = enum

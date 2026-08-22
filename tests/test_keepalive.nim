@@ -1,6 +1,8 @@
 import std/[unittest, posix]
 
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/buffer_io
+import ../async_postgres/pg_connection/types {.all.}
 
 suite "configureKeepalive":
   proc getIntSockOpt(fd: SocketHandle, level: cint, optname: cint): cint =

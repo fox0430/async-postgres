@@ -99,7 +99,7 @@ proc quoteIdentifier*(s: string): string =
 
 # Simple Query Protocol entry points
 
-proc simpleQueryImpl*(
+proc simpleQueryImpl(
     conn: PgConnection, sql: string
 ): Future[seq[QueryResult]] {.async.} =
   conn.checkReady()
@@ -128,7 +128,7 @@ proc simpleQueryImpl*(
 
   return results
 
-proc simpleExecImpl*(conn: PgConnection, sql: string): Future[string] {.async.} =
+proc simpleExecImpl(conn: PgConnection, sql: string): Future[string] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
   conn.state = csBusy

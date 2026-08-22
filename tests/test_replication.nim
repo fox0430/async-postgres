@@ -2,6 +2,7 @@ import std/[unittest, importutils, tables]
 
 import ../async_postgres/[async_backend, pg_errors, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/[buffer_io, simple_query, types]
 import ../async_postgres/pg_replication {.all.}
 
 privateAccess(PgConnection)

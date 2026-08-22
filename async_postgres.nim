@@ -134,6 +134,134 @@ import
     pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication,
   ]
 
-export
-  async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
-  pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication
+# `pg_types`/`pg_connection`/`pg_client` whitelist themselves; the other
+# modules expose only their public API surface.
+export pg_types, pg_connection, pg_client
+export pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication
+export pg_auth
+
+# `pg_pool` — public pool API (internal gauges/helpers stay in the module).
+export pg_pool.PoolConfig
+export pg_pool.PoolMetrics
+export pg_pool.PooledConnHandle
+export pg_pool.PgPool
+export pg_pool.initPoolConfig
+export pg_pool.idleCount
+export pg_pool.activeCount
+export pg_pool.size
+export pg_pool.isClosed
+export pg_pool.metrics
+export pg_pool.resetSession
+export pg_pool.newPool
+export pg_pool.release
+export pg_pool.resetSessionAndRelease
+export pg_pool.acquire
+export pg_pool.runAndRelease
+export pg_pool.withConnection
+export pg_pool.exec
+export pg_pool.query
+export pg_pool.queryEach
+export pg_pool.queryRow
+export pg_pool.queryRowOpt
+export pg_pool.queryValue
+export pg_pool.queryValueOpt
+export pg_pool.queryValueOrDefault
+export pg_pool.queryExists
+export pg_pool.queryColumn
+export pg_pool.simpleQuery
+export pg_pool.simpleExec
+export pg_pool.execInTransaction
+export pg_pool.queryInTransaction
+export pg_pool.notify
+export pg_pool.withTransaction
+export pg_pool.withTransactionRetry
+export pg_pool.withTransactionDeadline
+export pg_pool.withTransactionRetryDeadline
+export pg_pool.withPipeline
+export pg_pool.close
+
+# `async_backend` is exported wholesale; it also re-exports the selected
+# backend (asyncdispatch / chronos), supplying `async`, `waitFor`, etc.
+export async_backend
+
+# `pg_protocol` — the wire protocol codec and entry points. The inbound
+# decoders and leaf encoders stay internal; the send-buffer helpers are
+# re-exported because the `addParseDirect`/`addBindDirect` macros and advanced
+# call sites resolve them in the caller's scope.
+export pg_protocol.FrontendMessageKind
+export pg_protocol.BackendMessageKind
+export pg_protocol.DescribeKind
+export pg_protocol.TransactionStatus
+export pg_protocol.FieldDescription
+export pg_protocol.CopyFormat
+export pg_protocol.BackendMessage
+export pg_protocol.ParseState
+export pg_protocol.ParseResult
+export pg_protocol.RowData
+export pg_protocol.Row
+export pg_protocol.syncMsg
+export pg_protocol.flushMsg
+export pg_protocol.copyDoneMsg
+export pg_protocol.BinarySafeOids
+export pg_protocol.maxInt32Len
+export pg_protocol.DefaultMaxBackendMessageLen
+export pg_protocol.MaxNegotiateProtocolOptions
+export pg_protocol.MaxErrorOrNoticeFields
+export pg_protocol.MaxSaslMechanisms
+export pg_protocol.initRow
+export pg_protocol.data
+export pg_protocol.rowIdx
+export pg_protocol.isBinarySafeOid
+export pg_protocol.addInt16
+export pg_protocol.addInt32
+export pg_protocol.addCount16
+export pg_protocol.addLen32
+export pg_protocol.addCString
+export pg_protocol.patchMsgLen
+export pg_protocol.encodeStartup
+export pg_protocol.encodeSSLRequest
+export pg_protocol.encodePassword
+export pg_protocol.encodeSASLInitialResponse
+export pg_protocol.encodeSASLResponse
+export pg_protocol.encodeQuery
+export pg_protocol.addParse
+export pg_protocol.addBind
+export pg_protocol.addBindRaw
+export pg_protocol.addDescribe
+export pg_protocol.addExecute
+export pg_protocol.addClose
+export pg_protocol.addSync
+export pg_protocol.addFlush
+export pg_protocol.addCopyDone
+export pg_protocol.encodeParse
+export pg_protocol.encodeBind
+export pg_protocol.encodeDescribe
+export pg_protocol.encodeExecute
+export pg_protocol.encodeClose
+export pg_protocol.encodeSync
+export pg_protocol.encodeFlush
+export pg_protocol.encodeTerminate
+export pg_protocol.encodeCancelRequest
+export pg_protocol.encodeCopyData
+export pg_protocol.encodeCopyDone
+export pg_protocol.encodeCopyFail
+export pg_protocol.newRowData
+export pg_protocol.reuseRowData
+export pg_protocol.clone
+export pg_protocol.buildResultFormats
+export pg_protocol.parseDataRowInto
+export pg_protocol.parseBackendMessage
+export pg_protocol.formatError
+export pg_protocol.addCopyBinaryHeader
+export pg_protocol.addCopyBinaryTrailer
+export pg_protocol.addCopyTupleStart
+export pg_protocol.addCopyFieldNull
+export pg_protocol.addCopyFieldInt16
+export pg_protocol.addCopyFieldInt32
+export pg_protocol.addCopyFieldInt64
+export pg_protocol.addCopyFieldFloat64
+export pg_protocol.addCopyFieldFloat32
+export pg_protocol.addCopyFieldBool
+export pg_protocol.addCopyFieldText
+export pg_protocol.addCopyFieldString
+export pg_protocol.encodeStandbyStatusUpdate

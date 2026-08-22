@@ -1,6 +1,8 @@
 import std/macros
 
 import async_backend, pg_protocol, pg_connection, pg_types, pg_pool, pg_client
+import pg_connection/types
+import pg_client/transaction
 
 type
   ReplicaFallback* = enum

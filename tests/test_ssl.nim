@@ -3,6 +3,7 @@ import std/[unittest, strutils, os]
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/[ssl, lifecycle, types]
 
 when hasChronos:
   import ../async_postgres/pg_bearssl {.all.}

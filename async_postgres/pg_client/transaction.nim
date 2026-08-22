@@ -4,9 +4,10 @@
 import std/[macros, options]
 
 import ../[async_backend, pg_protocol, pg_connection]
+import ../pg_connection/[types, simple_query]
 import ./core
 
-proc hasReturnStmt*(n: NimNode): bool =
+proc hasReturnStmt(n: NimNode): bool =
   ## Check whether an AST contains a `return` statement (excluding nested
   ## proc/func/method/iterator definitions where `return` is valid).
   if n.kind == nnkReturnStmt:
@@ -25,7 +26,7 @@ proc escapeLabelName(n: NimNode): string =
   ## Plain name of a `break`/`continue`/`block` label (`nnkIdent` or `nnkSym`).
   n.strVal
 
-proc hasLoopEscapeStmt*(n: NimNode): bool =
+proc hasLoopEscapeStmt(n: NimNode): bool =
   ## True if a `break`/`continue` in `n` would escape to a loop or `block:`
   ## outside the body, skipping the trailing COMMIT / RELEASE. Statements
   ## captured by a body-local loop/`block` are accepted.
@@ -189,7 +190,7 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
           newException(PgError, `cleanupDefectSym`.msg, `cleanupDefectSym`),
         )
 
-proc buildSavepointRollbackCleanup*(
+proc buildSavepointRollbackCleanup(
     connSym, spNameSym, rollbackTimeout: NimNode
 ): NimNode =
   ## Build the shared `onCleanupSkipped`-wired ROLLBACK TO SAVEPOINT cleanup used
@@ -237,7 +238,7 @@ proc buildSavepointRollbackCleanup*(
           newException(PgError, `cleanupDefectSym`.msg, `cleanupDefectSym`),
         )
 
-proc buildDeadlineAwaitAndTimeout*(
+proc buildDeadlineAwaitAndTimeout(
     connSym, bodyFnSym, totalDurSym: NimNode, reason: string, catchableCleanup: NimNode
 ): NimNode =
   ## Build the single-attempt deadline-bounded await + timeout handler shared

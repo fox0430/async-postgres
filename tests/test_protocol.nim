@@ -1,6 +1,8 @@
 import std/[unittest, options, strutils, tables, importutils]
 
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection]
+import ../async_postgres/pg_connection/buffer_io
+import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_types/[core, encoding]
 
 privateAccess(PgConnection)

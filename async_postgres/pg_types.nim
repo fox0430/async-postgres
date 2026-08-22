@@ -3,7 +3,61 @@ import std/[json, macros, options, times]
 import pg_protocol
 import pg_types/[core, array, encoding, decoding, accessors, user_types, ranges]
 
-export core, array, encoding, decoding, accessors, user_types, ranges
+# `core` — the stable type-conversion API; exported wholesale.
+export core
+# `array` (PgArray + shape validation) and `user_types` (enum/composite/domain
+# macros) likewise expose only public API.
+export array
+export user_types
+
+# `encoding` — typed-parameter encode/decode surface. The registry, bounds
+# guards and raw binary helpers stay in the module; `paramOidOf` and the
+# `addParseDirect`/`addBindDirect` writers are re-exported because the direct
+# macros resolve them in the caller's scope.
+export encoding.toPgParamInline
+export encoding.toPgParam
+export encoding.toPgDateParam
+export encoding.toPgTimestampTzParam
+export encoding.encodeHstoreText
+export encoding.encodeBinaryArray
+export encoding.pgParams
+export encoding.toPgBinaryParam
+export encoding.toPgBinaryDateParam
+export encoding.toPgBinaryTimestampTzParam
+export encoding.toPgTimestampArrayParam
+export encoding.toPgTimestampTzArrayParam
+export encoding.toPgDateArrayParam
+export encoding.toPgMoneyArrayParam
+export encoding.toPgMoneyArrayNDParam
+export encoding.toPgByteaArrayParam
+export encoding.coerceBinaryParam
+export encoding.addParseDirect
+export encoding.addBindDirect
+export encoding.paramOidOf
+export encoding.writeParamFormat
+export encoding.writeParamValue
+export encoding.writeParamOid
+
+# `decoding` — public text parsers; the raw binary decoders stay internal.
+export decoding.fromPgText
+export decoding.parseTimestampText
+export decoding.parseDateText
+export decoding.parseTimeText
+export decoding.parseTimeTzText
+export decoding.parseHstoreText
+export decoding.parseIntervalText
+export decoding.parseInetText
+export decoding.parsePointText
+export decoding.parsePointsText
+export decoding.parseTextArray
+
+# `accessors` — typed row accessors and query-result helpers; its internals
+# were privatised in the module itself.
+export accessors
+
+# `ranges` — range/multirange construction and typed parameters; the raw
+# binary decoders were privatised in the module itself.
+export ranges
 
 # Name-based accessors bound here so both accessors.nim (non-range getters)
 # and ranges.nim (Range/Multirange getters) are visible when `nameAccessor`

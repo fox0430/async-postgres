@@ -13,7 +13,8 @@
 ##   trust anchors written to a temp file and `SSL_get_peer_certificate` used
 ##   for channel binding.
 ##
-## Re-exported through `pg_connection.nim`.
+## Internal: not re-exported through `pg_connection.nim`; import this module
+## directly.
 
 import std/[net, strutils]
 import ../[async_backend, pg_errors, pg_protocol, pg_types]

@@ -77,6 +77,68 @@ export core.RetryOptions
 export core.isRetryableTxError
 export core.backoffDelayMs
 
-export
-  exec, query, prepared, copy, transaction, transaction_helpers, pipeline, cursor,
-  direct
+# `exec` — exec / notify entry points (the `*Impl` helpers stay internal).
+export exec.exec
+export exec.notify
+
+# `query` — query entry points and result accessors (`*Impl` stay internal).
+export query.query
+export query.queryEach
+export query.queryRow
+export query.queryRowOpt
+export query.queryValue
+export query.queryValueOpt
+export query.queryValueOrDefault
+export query.queryExists
+export query.queryColumn
+
+# `prepared` — prepared statements.
+export prepared.PreparedStatement
+export prepared.columnIndex
+export prepared.prepare
+export prepared.execute
+export prepared.close
+
+# `copy` — COPY IN / COPY OUT entry points (`*Impl` stay internal).
+export copy.copyIn
+export copy.copyInStream
+export copy.copyOut
+export copy.copyOutStream
+
+# `transaction` — transaction/savepoint scoping macros. `rollbackGrace` is
+# re-exported because pg_pool's deadline macros resolve it via `bindSym`.
+export transaction.withTransaction
+export transaction.withTransactionRetry
+export transaction.withSavepoint
+export transaction.withTransactionDeadline
+export transaction.withTransactionRetryDeadline
+export transaction.withSavepointDeadline
+export transaction.rollbackGrace
+
+# `transaction_helpers` — the two in-transaction convenience helpers.
+export transaction_helpers.execInTransaction
+export transaction_helpers.queryInTransaction
+
+# `pipeline` — batching.
+export pipeline.Pipeline
+export pipeline.PipelineResult
+export pipeline.PipelineResultKind
+export pipeline.IsolatedPipelineResults
+export pipeline.newPipeline
+export pipeline.reset
+export pipeline.addExec
+export pipeline.addQuery
+export pipeline.execute
+export pipeline.executeIsolated
+
+# `cursor` — result cursors.
+export cursor.Cursor
+export cursor.columnIndex
+export cursor.fetchNext
+export cursor.close
+export cursor.withCursor
+export cursor.openCursor
+
+# `direct` — zero-allocation macros.
+export direct.queryDirect
+export direct.execDirect

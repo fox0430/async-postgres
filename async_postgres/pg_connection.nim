@@ -37,18 +37,115 @@
 ##                                  `to_regtype` (extension types like
 ##                                  `hstore`, `citext`, etc.).
 ##
-## Every public symbol previously defined in this file is re-exported from
-## here, so existing `import async_postgres/pg_connection` (or the
-## bundled `import pkg/async_postgres`) call sites keep working without
-## changes. Test files that previously used `import pg_connection
-## {.all.}` to reach private helpers must now import the specific
-## submodule directly, e.g.
-## `import pg_connection/buffer_io {.all.}`.
+## Only the public API listed below is re-exported. Anything not listed stays
+## in its defining submodule (e.g. `pg_connection/buffer_io`) and must be
+## imported from there directly, not through `import pg_connection`.
 
 import pg_errors
 import
-  pg_connection/
-    [types, dsn, buffer_io, ssl, cache, simple_query, lifecycle, notify, type_lookup]
+  pg_connection/[types, dsn, buffer_io, simple_query, lifecycle, notify, type_lookup]
 
 export pg_errors
-export types, dsn, buffer_io, ssl, cache, simple_query, lifecycle, notify, type_lookup
+
+# `types` — public types, the tracer hook data types and the tracing helpers.
+export types.PgConnState
+export types.SslMode
+export types.SslNegotiation
+export types.ChannelBindingMode
+export types.AuthMethod
+export types.TargetSessionAttrs
+export types.LoadBalanceHosts
+export types.HostEntry
+export types.ConnConfig
+export types.PgTracer
+export types.Notification
+export types.NotifyCallback
+export types.Notice
+export types.NoticeCallback
+export types.CachedStmt
+export types.dialAddr
+export types.displayHost
+export types.QueryResult
+export types.CopyResult
+export types.CopyOutInfo
+export types.CopyInInfo
+export types.CopyOutCallback
+export types.CopyInCallback
+export types.PgPoolOwner
+export types.PgConnection
+export types.RowCallback
+export types.ClientCertPairingErrorMsg
+export types.TraceContext
+export types.TraceCopyDirection
+export types.TraceConnectStartData
+export types.TraceConnectEndData
+export types.TraceQueryStartData
+export types.TraceQueryEndData
+export types.TracePrepareStartData
+export types.TracePrepareEndData
+export types.TracePipelineStartData
+export types.TracePipelineEndData
+export types.TraceCopyStartData
+export types.TraceCopyEndData
+export types.TracePoolAcquireStartData
+export types.TracePoolAcquireEndData
+export types.TracePoolReleaseStartData
+export types.TracePoolReleaseEndData
+export types.TracePoolDoubleReleaseData
+export types.TracePoolCloseErrorData
+export types.TraceTransportCloseErrorData
+export types.TransportCloseStage
+export types.CleanupKind
+export types.CleanupSkipReason
+export types.TraceCleanupSkippedData
+export types.TraceLeakedSessionLocksData
+export types.TraceInsecureAuthData
+export types.TraceDeprecatedAuthData
+export types.TraceAdvisoryUnlockFailedData
+export types.withConnTracing
+export types.withTracing
+
+# `dsn` — the documented DSN entry points.
+export dsn.initConnConfig
+export dsn.parseDsn
+
+# `buffer_io` — public connection I/O and keepalive surface.
+export buffer_io.isUnixSocket
+export buffer_io.unixSocketPath
+export buffer_io.getHosts
+export buffer_io.makeCopyOutCallback
+export buffer_io.makeCopyInCallback
+export buffer_io.socketHasFin
+export buffer_io.socketHasPendingData
+export buffer_io.isConnected
+
+# `simple_query` — the simple-query protocol and query-result helpers.
+export simple_query.len
+export simple_query.columnIndex
+export simple_query.rows
+export simple_query.items
+export simple_query.quoteIdentifier
+export simple_query.cancel
+export simple_query.cancelNoWait
+export simple_query.invalidateOnTimeout
+export simple_query.simpleExec
+export simple_query.simpleQuery
+export simple_query.ping
+export simple_query.checkSessionAttrs
+
+# `lifecycle` — connect / close and host ordering.
+export lifecycle.close
+export lifecycle.orderedHosts
+export lifecycle.connect
+export lifecycle.connectToHost
+
+# `notify` — LISTEN / NOTIFY pump and waiters.
+export notify.onNotify
+export notify.onListenError
+export notify.listen
+export notify.unlisten
+export notify.waitNotification
+
+# `type_lookup` — extension type OID resolution.
+export type_lookup.TypeOidInfo
+export type_lookup.lookupTypeOids

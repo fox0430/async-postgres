@@ -18,6 +18,8 @@
 import std/[strutils, tables, times, options]
 
 import async_backend, pg_protocol, pg_connection, pg_types
+import pg_connection/[types, dsn, buffer_io, simple_query, lifecycle]
+import pg_types/encoding
 
 type
   Lsn* = distinct uint64

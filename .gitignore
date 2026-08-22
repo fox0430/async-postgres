@@ -32,3 +32,5 @@ htmldocs/
 htmdocs/
 
 *.out
+audit/
+.audit/
