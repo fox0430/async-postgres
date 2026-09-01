@@ -1,19 +1,4 @@
-## LISTEN / NOTIFY plumbing.
-##
-## - `onNotify` / `onListenError` / `listen` / `unlisten` — channel
-##   subscription API.
-## - `startListening` / `stopListening` / `listenPump` — background pump
-##   that converts incoming `NotificationResponse` messages into queue/
-##   callback dispatch, with auto-reconnect on transport failure.
-## - `reconnectInPlace` — replace the dead transport on the existing
-##   `PgConnection` object and re-`LISTEN` every subscribed channel so
-##   external references survive the reconnect.
-## - `waitNotification` — async pull entry point with timeout and overflow
-##   detection.
-##
-## Imports `lifecycle.connect` for `reconnectInPlace` and `simple_query`
-## for the `LISTEN`/`UNLISTEN` round trips. Re-exported through
-## `pg_connection.nim`.
+## LISTEN/NOTIFY: subscription API, pump with auto-reconnect, and pull API.
 
 import std/[deques, options, sets]
 
@@ -24,10 +9,7 @@ when hasChronos:
   import chronos/streams/tlsstream
   import ../pg_bearssl
 
-const listenBackoffTickMs = 50
-  ## Granularity of the listen pump's interruptible reconnect backoff: the pump
-  ## sleeps in ticks this size and re-checks `listenStopRequested` between them,
-  ## bounding how long a `stopListening` issued mid-backoff waits to be observed.
+const listenBackoffTickMs = 50 ## Backoff tick ms (stop check granularity).
 
 # listenReconnectStopWaitMs lives in types.nim to avoid a circular import.
 
@@ -40,20 +22,14 @@ proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
 proc onListenError*(
     conn: PgConnection, callback: proc(err: ref PgListenError) {.gcsafe, raises: [].}
 ) =
-  ## Set a callback invoked when the listen pump dies permanently (reconnection
-  ## failed, or the connection was lost with no channels left to re-subscribe).
-  ## Push API (`onNotify`) users have no other way to learn the pump is gone;
-  ## pull API users see the same failure raised from `waitNotification`.
+  ## Callback for permanent pump failure. ``err.transportAlive`` marks a death
+  ## the pull API reports as ``PgListenStoppedError``.
   conn.listenErrorCallback = callback
 
 # In-place reconnect (preserves PgConnection identity for listeners)
 
 proc reconnectInPlace*(conn: PgConnection) {.async.} =
-  ## Reconnect using stored config, re-LISTENing on all channels. A re-LISTEN
-  ## failure closes the freshly opened transport so the reconnect never leaks it.
-  ## A stop observed right after `connect()` returns discards `newConn`, so a
-  ## `close()` that already tore down the old transport cannot end up with a
-  ## live socket grafted on after it returned.
+  ## Reconnect and re-LISTEN all channels. Cleans up new transport on failure.
   await conn.closeTransport()
 
   conn.recvBuf.setLen(0)
@@ -76,7 +52,9 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
     # Stop landed while connect() blocked: discard newConn, the pump's own
     # stop-check then sees csClosed and exits.
     try:
-      await newConn.close()
+      # The reconnect dialled `newConn` and the stop discards it, so this is the
+      # library's own teardown — not the application's `close()`.
+      await newConn.closeImpl(byUser = false)
     except CatchableError:
       discard
     conn.state = csClosed
@@ -130,65 +108,56 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
 # Background pump and start/stop
 
 proc newListenError(
-    msg: string, reconnectionAttempted: bool
+    msg: string, reconnectionAttempted: bool, transportAlive: bool = false
 ): ref PgListenError {.raises: [].} =
-  (ref PgListenError)(msg: msg, reconnectionAttempted: reconnectionAttempted)
+  (ref PgListenError)(
+    msg: msg,
+    reconnectionAttempted: reconnectionAttempted,
+    transportAlive: transportAlive,
+  )
+
+proc newListenDeathError(
+    err: ref PgListenError, transportAlive: bool
+): ref PgError {.raises: [].} =
+  ## Pull-API view of a pump death recorded in ``err``.
+  # The type, not a field, carries the recovery, so a caller who never reads
+  # `transportAlive` still won't re-dial. Re-supplied because `err` latched it.
+  if transportAlive:
+    (ref PgListenStoppedError)(
+      msg: err.msg,
+      reconnectionAttempted: err.reconnectionAttempted,
+      transportAlive: true,
+    )
+  else:
+    newListenError(err.msg, err.reconnectionAttempted, transportAlive)
 
 proc notifyListenDeath(
-    conn: PgConnection, msg: string, reconnectionAttempted: bool
+    conn: PgConnection,
+    msg: string,
+    reconnectionAttempted: bool,
+    markClosed: bool = true,
 ) {.raises: [].} =
-  ## Mark the listen pump as permanently dead and notify both APIs: the pull
-  ## API via `notifyWaiter.fail` and the push API via `listenErrorCallback`.
-  conn.listenError = newListenError(msg, reconnectionAttempted)
-  conn.state = csClosed
-  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    # Fail the pull-API waiter with a *fresh* exception, never the stored
-    # `conn.listenError`: that object is re-raised by `checkListenAlive` on every
-    # later call, so sharing one ref would let its stack trace accumulate.
-    #
-    # asyncdispatch types `Future.fail`'s callback chain as raising the base
-    # `Exception`, so catching `Exception` (not `CatchableError`) is what keeps
-    # this proc `raises: []` — same idiom as `dispatchNotification`. `fail` runs
-    # no user callbacks synchronously here, so nothing real is masked, and
-    # swallowing it guarantees the push-API callback below still fires.
-    try:
-      conn.notifyWaiter.fail(newListenError(msg, reconnectionAttempted))
-    except Exception:
-      discard
+  ## Pump died permanently; notify pull/push APIs. ``markClosed=false`` = listen side only.
+  # `markClosed = false` is exactly the case where the transport survived, so
+  # it is what tells a reconnect loop this failure is not its to act on.
+  let transportAlive = not markClosed
+  conn.listenError = newListenError(msg, reconnectionAttempted, transportAlive)
+  if markClosed:
+    conn.state = csClosed
+  # Built fresh, never the stored ref: `checkListenAlive` re-raises that object
+  # on every later call, so sharing it would accumulate stack traces.
+  conn.failNotifyWaiter(newListenDeathError(conn.listenError, transportAlive))
   if conn.listenErrorCallback != nil:
     conn.listenErrorCallback(conn.listenError)
 
 proc listenPump*(conn: PgConnection) {.async.} =
-  ## Background loop: repeatedly receives messages, dispatching notifications.
-  ## NotificationResponse/NoticeResponse are dispatched inside `recvMessage`; an
-  ## asynchronous ErrorResponse (the server terminating this backend) is raised so
-  ## its diagnostic drives the failure path rather than being silently dropped.
-  ## Any other non-notification message is discarded.
-  ## On connection failure, attempts automatic reconnection with exponential
-  ## backoff (up to `listenReconnectMaxAttempts` attempts; 0 or negative =
-  ## unlimited) and re-subscribes to all channels.
-  ## Exits cleanly when state changes from csListening (via stopListening
-  ## sending an empty query), then drains until ReadyForQuery. A stop requested
-  ## while reconnecting (`listenStopRequested`) is honored at every yield point
-  ## of the reconnect loop, so stopListening never strands on a pump that would
-  ## otherwise loop back into csListening after a successful reconnect. The
-  ## inter-attempt backoff is slept in short ticks that re-check the stop flag,
-  ## so a stop mid-backoff is observed within a tick instead of after the full
-  ## interval.
+  ## Background loop: dispatch notifications, auto-reconnect on failure.
   while true:
     try:
       while conn.state == csListening:
         let msg = await conn.recvMessage()
         if msg.kind == bmkErrorResponse:
-          # An asynchronous ErrorResponse on an idle LISTEN connection is the
-          # server tearing down this backend (FATAL: administrator command,
-          # recovery conflict, idle-session timeout, …) — `recvMessage` already
-          # dispatched NotificationResponse/NoticeResponse internally, so this is
-          # the one server-initiated message left to handle. Don't discard it and
-          # fall through to the generic "Connection closed by server" the next
-          # recv would raise once the socket closes: raise the server's own
-          # diagnostic so the reconnect-failure death below reports the real
-          # reason instead of swallowing it.
+          # Server FATAL on idle LISTEN: surface diagnostic instead of generic close.
           raise newPgQueryError(msg.errorFields)
       # State changed: drain the stop-signal query response until ReadyForQuery
       block drainLoop:
@@ -206,16 +175,8 @@ proc listenPump*(conn: PgConnection) {.async.} =
       if conn.listenChannels.len == 0:
         conn.notifyListenDeath("Listen connection lost: " & e.msg, false)
         return
-      # Auto-reconnect with exponential backoff. `listenReconnecting` marks this
-      # window for a concurrent `stopListening`: while the transport is being
-      # rebuilt the empty-query unblock it normally uses would interleave with
-      # the reconnect's own LISTEN round trips and desync the stream, so it
-      # signals a stop via `listenStopRequested` instead — checked at every
-      # yield point below so the request is never lost.
+      # Auto-reconnect with exponential backoff. Flag guards concurrent stop.
       conn.listenReconnecting = true
-      # Cleared once for every exit from the reconnect window by the `finally`
-      # below, so no individual exit path (stop-wins, cancellation, post-loop)
-      # can leak it true and mislead the next `stopListening`.
       try:
         let maxAttempts = conn.listenReconnectMaxAttempts
         # Cap so `backoff * 1000` and `backoff * 2` below cannot overflow int.
@@ -226,11 +187,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
         var attempt = 0
         while (unlimited or attempt < maxAttempts) and not conn.listenStopRequested:
           try:
-            # Interruptible backoff: sleep in short ticks and re-check the stop
-            # flag each tick, so a concurrent `stopListening` is observed within
-            # a tick instead of after the full interval — a bare
-            # `sleepAsync(seconds(backoff))` would strand the stop for up to
-            # `listenReconnectMaxBackoff` seconds.
+            # Interruptible backoff: tick-based stop check.
             var remainingMs = backoff * 1000
             while remainingMs > 0 and not conn.listenStopRequested:
               let tickMs = min(remainingMs, listenBackoffTickMs)
@@ -240,15 +197,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
               break
             await conn.reconnectInPlace()
             if conn.listenStopRequested:
-              # Stop won the race with a successful reconnect. The new transport
-              # is live and already `csReady` (reconnectInPlace set it); do *not*
-              # restore csListening — that overwrite is exactly what used to
-              # strand the awaiting stopListening. Exit so it sees a finished pump
-              # and a reusable connection. `reconnectCallback` is intentionally
-              # skipped: the caller asked to stop, so the connection is handed
-              # back csReady and *not* listening — firing a "reconnected, still
-              # listening" notification would misrepresent that. The fresh backend
-              # identity (pid/secretKey) is already on `conn` regardless.
+              # Stop won race: keep csReady, skip reconnect callback.
               return
             conn.state = csListening
             reconnected = true
@@ -261,15 +210,9 @@ proc listenPump*(conn: PgConnection) {.async.} =
             backoff = min(backoff * 2, maxBackoff)
           inc attempt
         if conn.listenStopRequested:
-          # Asked to stop before any live transport was restored: the old one is
-          # already gone, so the connection is unusable. Mark it closed; the
-          # awaiting stopListening surfaces that state.
           conn.state = csClosed
           return
         if not reconnected:
-          # Carry the original loss reason (`e` — e.g. the FATAL ErrorResponse the
-          # recv loop surfaced) into the death message; it is the actual cause the
-          # caller wants, not just the count of failed retries.
           conn.notifyListenDeath(
             "Listen connection lost (" & e.msg & "): reconnection failed after " &
               $maxAttempts & " attempts",
@@ -280,26 +223,24 @@ proc listenPump*(conn: PgConnection) {.async.} =
         conn.listenReconnecting = false
 
 proc startListening*(conn: PgConnection) =
+  ## Start the notification pump. No-op if one is already running.
+  # `restartPumpOrFailWaiter` reaches here from an exception handler; overwriting
+  # a live task would put a second, unreachable pump on the same socket.
+  if conn.listenTask != nil and not conn.listenTask.finished:
+    return
+  # Clear stale ``listenError`` (e.g. ``markClosed=false`` death) now that pump is live.
+  conn.listenError = nil
   conn.listenStopRequested = false
   conn.listenReconnecting = false
   conn.state = csListening
   conn.listenTask = conn.listenPump()
 
 proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
-  ## Shared `stopListening` failure cleanup: the pump's transport is dead, so
-  ## stop the task if it is still running and mark the connection closed. The
-  ## caller nils `listenTask`.
-  ##
-  ## Returns whether the pump stopped. On asyncdispatch it can survive as an
-  ## untrackable orphan; `stopListening` must then keep `listenStopRequested`
-  ## set, since the orphan's reconnect stop-checks are all that keeps it from
-  ## grafting a fresh transport onto the closed connection.
+  ## Stop failed pump; false = orphan on asyncdispatch (keep ``listenStopRequested``).
   var stopped = true
   if conn.listenTask != nil and not conn.listenTask.finished:
     when hasAsyncDispatch:
-      # cancelAndWait is a no-op here: close the transport to break the pump's
-      # parked recv (the failed sendMsg only marked csClosed, leaving the socket
-      # open), then wait bounded as close() does.
+      # Close transport to break parked recv, then bounded wait.
       conn.listenStopRequested = true
       let pump = conn.listenTask
       await conn.closeTransport()
@@ -316,24 +257,32 @@ proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
   conn.state = csClosed
   return stopped
 
-proc failNotifyWaiter(conn: PgConnection) {.raises: [].} =
-  ## Release the pull-API waiter when the pump has stopped so `waitNotification`
-  ## does not hang: no future dispatch can complete it.
-  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    try:
-      conn.notifyWaiter.fail(newException(PgError, "Listener stopped"))
-    except Exception:
-      discard
+template releaseNotifyWaiter(conn: PgConnection, keepWaiter: bool) =
+  ## Fail waiter unless kept for pump restart on live connection.
+  if not keepWaiter or conn.state == csClosed:
+    conn.failNotifyWaiter()
 
-proc stopListening*(conn: PgConnection) {.async.} =
-  ## Stop the background listen pump and return the connection to `csReady`
-  ## (or `csClosed` if the transport died with no live reconnect).
-  ## `listenStopRequested` is cleared on every exit that observed the pump
-  ## stopping. If instead the pump is stuck in a blocking `connect()` on
-  ## asyncdispatch and does not stop within `listenReconnectStopWaitMs`, this
-  ## raises `PgTimeoutError` (a `PgConnectionError` subtype) and leaves the
-  ## connection `csClosed` with the flag set; it is then unusable and must be
-  ## closed and reopened.
+template abortAndFailWaiter(
+    conn: PgConnection, keepWaiter: bool, preserveStopFlag: var bool
+) =
+  ## Teardown shared by `stopListening`'s two cancellation paths.
+  # Abort rather than drop the reference: the pump still holds the transport and
+  # nilling `listenTask` disarms `close()`'s own teardown. `noCancel` because the
+  # cancellation in flight would abort a bare `await`.
+  when hasChronos:
+    if not (await noCancel conn.abortListenTask()):
+      preserveStopFlag = true
+  else:
+    if not (await conn.abortListenTask()):
+      preserveStopFlag = true
+  conn.state = csClosed
+  conn.listenTask = nil
+  conn.releaseNotifyWaiter(keepWaiter)
+
+proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.async.} =
+  ## Stop pump → ``csReady``/``csClosed``; may raise ``PgTimeoutError``.
+  ## ``keepWaiter`` preserves the parked waiter for a restart: internal only,
+  ## for `listen` / `unlisten`, which stop a live pump on the way in.
   if conn.listenTask == nil or conn.listenTask.finished:
     conn.listenTask = nil
     if conn.state == csListening:
@@ -341,7 +290,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
     # csClosed + flag set = orphan pump inside reconnectInPlace; keep the flag.
     if conn.state != csClosed:
       conn.listenStopRequested = false
-    conn.failNotifyWaiter()
+    conn.releaseNotifyWaiter(keepWaiter)
     return
   # Request the stop up front, before choosing how to deliver it: this also
   # covers the pump tripping into its reconnect loop *after* we pick the normal
@@ -363,6 +312,9 @@ proc stopListening*(conn: PgConnection) {.async.} =
         else:
           await conn.listenTask
       except CancelledError as e:
+        # Unwinding without this leaves the pump running while the `finally`
+        # clears `listenStopRequested`, so `listen` starts a second one.
+        conn.abortAndFailWaiter(keepWaiter, preserveStopFlag)
         raise e
       except AsyncTimeoutError:
         # Orphan the pump; reconnectInPlace's stop-check discards newConn once
@@ -373,7 +325,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
         preserveStopFlag = true
         conn.state = csClosed
         conn.listenTask = nil
-        conn.failNotifyWaiter()
+        conn.releaseNotifyWaiter(keepWaiter)
         raise newException(
           PgTimeoutError,
           "stopListening: listen pump did not stop within " & $listenReconnectStopWaitMs &
@@ -383,7 +335,7 @@ proc stopListening*(conn: PgConnection) {.async.} =
         if not (await conn.abortListenTask()):
           preserveStopFlag = true
       conn.listenTask = nil
-      conn.failNotifyWaiter()
+      conn.releaseNotifyWaiter(keepWaiter)
       return
     # Normal path: pump parked in the recv loop. Signal exit by changing state,
     # then send an empty query to unblock the read.
@@ -392,6 +344,9 @@ proc stopListening*(conn: PgConnection) {.async.} =
       await conn.sendMsg(encodeQuery(""))
       await conn.listenTask
     except CancelledError as e:
+      # The stop query went out but its `ReadyForQuery` was never drained, so the
+      # wire is desynchronised; without this the connection stays `csBusy`.
+      conn.abortAndFailWaiter(keepWaiter, preserveStopFlag)
       raise e
     except CatchableError:
       # Send or pump failed: connection is dead
@@ -401,34 +356,95 @@ proc stopListening*(conn: PgConnection) {.async.} =
     # Preserve csClosed if pump detected a connection error
     if conn.state != csClosed:
       conn.state = csReady
-    conn.failNotifyWaiter()
+    conn.releaseNotifyWaiter(keepWaiter)
   finally:
     if not preserveStopFlag:
       conn.listenStopRequested = false
 
+proc stopListening*(conn: PgConnection): Future[void] {.async.} =
+  ## Stop the notification pump, returning the connection to ``csReady``
+  ## (``csClosed`` if the pump died); may raise ``PgTimeoutError``.
+  ##
+  ## The channels stay subscribed server-side, so notifications queue there
+  ## and a later `listen` resumes without losing them — unlike `unlisten`,
+  ## which drops the subscription. Use this to run a query on a listening
+  ## connection, which `csListening` otherwise rejects.
+  await conn.stopListeningImpl(keepWaiter = false)
+
 # LISTEN / UNLISTEN entry points
 
+proc restartPumpOrFailWaiter(conn: PgConnection, restarted: bool) =
+  ## Recover from a failed LISTEN/UNLISTEN: restart the pump we stopped, or
+  ## report the death to the waiter and the push API when it cannot come back.
+  ## ``restarted`` = we stopped a live pump on the way in. A cancelled round trip
+  ## needs no special case: `awaitOrInvalidate` already marked it `csClosed`.
+  if conn.closedReason != crOpen:
+    if restarted and conn.closedReason != crClosedByUser:
+      # Permanent pump death with channels still subscribed: releasing only the
+      # waiter would leave an `onNotify` subscriber silently deaf.
+      conn.notifyListenDeath(
+        "Listen pump stopped: connection lost during LISTEN/UNLISTEN",
+        reconnectionAttempted = false,
+      )
+    elif restarted:
+      # A deliberate `close()`: a `PgListenError` here would make a reconnecting
+      # `onListenError` re-dial. The waiter still needs releasing.
+      conn.failNotifyWaiter()
+    return
+  if not restarted:
+    # Nothing of ours was torn down, so there is nothing to put back.
+    return
+  if conn.state == csReady:
+    conn.startListening()
+  else:
+    # `csBusy` with no round trip of ours in flight: the state is a concurrent
+    # operation's, so forcing `csClosed` would kill its live work. `markClosed =
+    # false` also marks the error `transportAlive` (see `newListenDeathError`).
+    conn.notifyListenDeath(
+      "Listen pump stopped: LISTEN/UNLISTEN left the connection busy",
+      reconnectionAttempted = false,
+      markClosed = false,
+    )
+
 proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
-  ## Subscribe to a LISTEN channel and start the background notification pump.
-  ## Propagates `PgTimeoutError` from `stopListening` if the previous pump is
-  ## stuck in a blocking `connect()`; the connection is then unusable.
-  if conn.state == csListening:
-    await conn.stopListening()
-  conn.checkReady()
-  discard await conn.simpleQuery("LISTEN " & quoteIdentifier(channel))
+  ## Subscribe to channel and start pump. Keeps parked ``waitNotification`` across restart; may raise ``PgTimeoutError``.
+  # Reconnecting pump is in ``csReady`` but still owns ``listenTask``; stop it first to keep waiter.
+  let restarted = conn.state == csListening or conn.listenReconnecting
+  try:
+    if restarted:
+      # Inside the `try`: a `CancelledError` escaping `stopListening` would
+      # otherwise strand the kept waiter with no pump left to complete it.
+      await conn.stopListeningImpl(keepWaiter = true)
+    conn.checkReady()
+    discard await conn.simpleQuery("LISTEN " & quoteIdentifier(channel))
+  except CatchableError as e:
+    # `CancelledError` included: cancelling *this* call does not unsubscribe the
+    # channels the pump carried, and leaving them pumpless is a silent deafness.
+    # `raise e`, not bare: the restarted pump can suspend in its own `except` arm
+    # and leave `getCurrentException` pointing at its error.
+    conn.restartPumpOrFailWaiter(restarted)
+    raise e
   conn.listenChannels.incl(channel)
   conn.startListening()
 
 proc unlisten*(conn: PgConnection, channel: string): Future[void] {.async.} =
-  ## Unsubscribe from a LISTEN channel. Stops the pump if no channels remain.
-  ## Propagates `PgTimeoutError` from `stopListening` (see `listen` for details).
-  if conn.state == csListening:
-    await conn.stopListening()
-  conn.checkReady()
-  discard await conn.simpleQuery("UNLISTEN " & quoteIdentifier(channel))
+  ## Unsubscribe; stops pump if no channels remain (keeps waiter across restart except last).
+  let restarted = conn.state == csListening or conn.listenReconnecting
+  try:
+    if restarted:
+      await conn.stopListeningImpl(keepWaiter = true) # see `listen` for why it is here
+    conn.checkReady()
+    discard await conn.simpleQuery("UNLISTEN " & quoteIdentifier(channel))
+  except CatchableError as e: # `CancelledError` included, see `listen`
+    conn.restartPumpOrFailWaiter(restarted)
+    raise e
   conn.listenChannels.excl(channel)
   if conn.listenChannels.len > 0:
     conn.startListening()
+  elif restarted:
+    # We stopped the pump and no channel is left to restart it, so the waiter we
+    # kept across the stop would never be woken.
+    conn.failNotifyWaiter()
 
 # Wait API
 
@@ -443,44 +459,82 @@ proc checkNotifyOverflow(conn: PgConnection) =
     )
     raise err
 
+proc reclaimStaleWaiter(conn: PgConnection) =
+  ## Drop a finished waiter's registration and put back its unclaimed handoff.
+  # A waiter that never resumes would otherwise strand the notification in
+  # ``notifyHandoff`` and block every later waiter.
+  if conn.notifyWaiter != nil and conn.notifyWaiter.finished:
+    conn.notifyWaiter = nil
+    conn.reclaimHandoff()
+
 proc checkListenAlive(conn: PgConnection) =
-  ## Raise if the listen pump has died permanently.
+  ## Raise if pump died or closed (``closedByUser`` > ``listenError`` >
+  ## ``csClosed``); see ``newListenDeathError`` for a death on a live connection.
+  let reason = conn.closedReason
+  if reason == crClosedByUser:
+    raise newException(PgStateError, closedByUserMsg)
   if conn.listenError != nil:
-    # Raise a fresh copy, not the stored object: re-raising one shared ref
-    # across repeated calls would let its stack trace grow unbounded.
-    raise newListenError(conn.listenError.msg, conn.listenError.reconnectionAttempted)
-  if conn.state == csClosed:
+    # `and reason == crOpen`: the flag was latched at pump death, and a
+    # connection that has died since is the reconnect loop's business after all.
+    raise newListenDeathError(
+      conn.listenError, conn.listenError.transportAlive and reason == crOpen
+    )
+  if reason == crClosed:
     raise newException(PgConnectionError, "Connection is closed")
 
 proc waitNotification*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[Notification] {.async.} =
-  ## Wait for the next notification from the buffer.
-  ## If the buffer is empty, blocks until a notification arrives or timeout expires.
-  ## Raises PgNotifyOverflowError if notifications were dropped due to queue overflow.
-  ## Raises PgListenError if the listen pump has died (e.g. reconnection failed).
+  ## Wait for next notification. Raises ``PgNotifyOverflowError``,
+  ## ``PgConnectionError`` (closed), ``PgListenError`` (pump died with the
+  ## transport), ``PgListenStoppedError`` (pump died, connection still up),
+  ## ``PgStateError`` (no pump / concurrent wait / closed by `close()`),
+  ## ``PgTimeoutError`` (timeout).
   conn.checkNotifyOverflow()
   conn.checkListenAlive()
+  # Ahead of the queue: the reclaimed handoff is older than anything queued, so
+  # serving the queue first would invert NOTIFY delivery order.
+  conn.reclaimStaleWaiter()
+  if conn.notifyWaiter != nil:
+    raise newException(PgStateError, "Another waitNotification is already active")
   if conn.notifyQueue.len > 0:
     return conn.notifyQueue.popFirst()
-  # No pump means nothing will ever complete the waiter, so refuse instead of
-  # blocking forever. During reconnect the task is still running.
   if conn.listenTask == nil or conn.listenTask.finished:
-    raise newException(PgError, "Listener stopped")
-  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    raise newException(PgError, "Another waitNotification is already active")
-  conn.notifyWaiter = newFuture[void]("waitNotification")
+    raise newException(PgStateError, "Listener stopped")
+  let myWaiter = newFuture[void]("waitNotification")
+  conn.notifyWaiter = myWaiter
+  var handoff: Notification
+  var hasHandoff = false
   try:
-    if timeout > ZeroDuration:
-      try:
-        await conn.notifyWaiter.wait(timeout)
-      except AsyncTimeoutError:
-        raise newException(PgTimeoutError, "Wait for notification timed out")
-    else:
-      await conn.notifyWaiter
+    try:
+      if timeout > ZeroDuration:
+        try:
+          await myWaiter.wait(timeout)
+        except AsyncTimeoutError:
+          raise newException(PgTimeoutError, "Wait for notification timed out")
+      else:
+        await myWaiter
+    finally:
+      # Only the registered waiter may claim the handoff: one failed by a pump
+      # restart can resume late and would steal a newer waiter's notification.
+      let mine = conn.notifyWaiter == myWaiter
+      if mine:
+        conn.notifyWaiter = nil
+        # Claim on every path so no other caller observes it half-delivered; it
+        # is returned directly and never re-enters the capped queue.
+        if conn.hasNotifyHandoff:
+          conn.hasNotifyHandoff = false
+          handoff = move conn.notifyHandoff
+          hasHandoff = true
+    conn.checkNotifyOverflow()
+    if hasHandoff:
+      hasHandoff = false
+      return handoff
+    if conn.notifyQueue.len > 0:
+      return conn.notifyQueue.popFirst()
+    raise newException(PgStateError, "No notification available")
   finally:
-    conn.notifyWaiter = nil
-  conn.checkNotifyOverflow()
-  if conn.notifyQueue.len > 0:
-    return conn.notifyQueue.popFirst()
-  raise newException(PgError, "No notification available")
+    # Unwound without returning it (timeout racing the complete, cancellation,
+    # a raised overflow): leave it queued for the next caller.
+    if hasHandoff:
+      conn.requeueHandoff(handoff)

@@ -851,6 +851,29 @@ suite "Tracing: pool acquire/release":
 
     waitFor t()
 
+  test "a pool convenience method is traced like acquire":
+    # The convenience methods take their connection through `acquireInternal`,
+    # which must carry the same acquire span as `acquire` itself.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 2)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      discard await pool.query("SELECT 1::int4")
+
+      doAssert log.poolAcquireStarts.len == 1
+      doAssert log.poolAcquireStarts[0].maxSize == 2
+      doAssert log.poolAcquireEnds.len == 1
+      doAssert log.poolAcquireEnds[0].hasConn
+      doAssert log.poolAcquireEnds[0].wasCreated == true
+      doAssert not log.poolAcquireEnds[0].hasErr
+
+      await pool.close()
+
+    waitFor t()
+
   test "release hands connection to waiter":
     proc t() {.async.} =
       let log = newTraceLog()

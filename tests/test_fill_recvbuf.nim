@@ -26,7 +26,10 @@ import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/simple_query
 import ../async_postgres/pg_connection/types
 
-import ./mock_pg_server
+import mock_pg_server
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
@@ -363,3 +366,66 @@ suite "fillRecvBuf invariants":
       waitFor testBody()
       check raised
       check finalState == csClosed
+
+suite "closed-connection contract on the transport paths":
+  test "a read parked across close() is not a connection failure":
+    ## Regression: an operation already suspended when `close()` ran used to
+    ## surface the transport failure verbatim, so an `except PgConnectionError`
+    ## reconnect loop resurrected the connection the application just shut down.
+    var outcome = "not run"
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var serverClient: MockClient
+      proc serverHandler() {.async.} =
+        serverClient = await acceptAndReady(ms) # then stay silent
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await serverFut
+      let fut = conn.fillRecvBuf()
+      await conn.close()
+      {.cast(gcsafe).}:
+        try:
+          await fut
+          outcome = "completed"
+        except CancelledError:
+          outcome = "cancelled"
+        except PgStateError:
+          outcome = "PgStateError"
+        except CatchableError as e:
+          outcome = "leaked " & $e.name & ": " & e.msg
+
+      await closeClient(serverClient)
+      await closeServer(ms)
+
+    waitFor testBody()
+    # Named positively: "not PgConnectionError" would also pass for a raw
+    # backend type escaping — the regression this test exists for.
+    check outcome == "PgStateError"
+
+  test "a read refused after close() reports PgStateError":
+    var isStateError = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var serverClient: MockClient
+      proc serverHandler() {.async.} =
+        serverClient = await acceptAndReady(ms)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await serverFut
+      await conn.close()
+      try:
+        await conn.fillRecvBuf()
+      except PgStateError:
+        isStateError = true
+      except CatchableError:
+        discard
+
+      await closeClient(serverClient)
+      await closeServer(ms)
+
+    waitFor testBody()
+    check isStateError

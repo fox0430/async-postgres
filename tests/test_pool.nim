@@ -6,7 +6,8 @@ when hasChronos:
 
 import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_types/encoding
-import ../async_postgres/pg_connection/[buffer_io, simple_query, cache]
+import
+  ../async_postgres/pg_connection/[buffer_io, types, simple_query, cache, lifecycle]
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_client/pipeline {.all.}
 import ../async_postgres/pg_client/[core, query, exec, direct]
@@ -4921,3 +4922,119 @@ suite "Array encoder guards are catchable and do not disturb valid input":
     expect PgMessageTooLargeError:
       checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
     check b == orig
+
+suite "Library-initiated close keeps the connection-failure contract":
+  ## Regression: `close()` set `closedByUser` unconditionally, so a pool
+  ## evicting a connection (failed health check, expired `maxLifetime`) made
+  ## every later operation on that handle raise `PgStateError` — deliberately
+  ## outside `except PgConnectionError`, so reconnect-on-failure paths skipped a
+  ## failure that warrants a reconnect. Only the application's own `close()`
+  ## may claim `crClosedByUser`.
+
+  test "pool-initiated close reports PgConnectionError":
+    let conn = mockConn(csClosed)
+    waitFor conn.closeImpl(byUser = false)
+    check not conn.closedByUser
+    check conn.closedReason == crClosed
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "application close still reports PgStateError":
+    let conn = mockConn(csClosed)
+    waitFor conn.close()
+    check conn.closedByUser
+    check conn.closedReason == crClosedByUser
+    expect PgStateError:
+      conn.checkNotClosed()
+
+suite "Pool-initiated closes stay a connection failure during shutdown":
+  ## Regression: `tracedClose` read `pool.closed` to decide the close was the
+  ## application's own, so an eviction or a discarded connection during the
+  ## shutdown drain reported `PgStateError` — not a `PgConnectionError` — and
+  ## the reconnect-on-failure recovery of anything still holding the handle
+  ## silently did not fire.
+
+  test "a broken conn released after close() stays a connection failure":
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(csClosed, pool = pool)
+    conn.borrowed = true
+    pool.release(conn)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check not conn.closedByUser
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "a healthy conn released after close() is the application's close":
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    conn.borrowedByUser = true # as `acquire` leaves it
+    pool.release(conn)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check conn.closedByUser
+    expect PgStateError:
+      conn.checkNotClosed()
+
+  test "a healthy conn reclaimed from an abandoned waiter is not the application's close":
+    # Through `settleAbandonedWaiter` itself, not `releaseImpl` directly: the
+    # wiring is the thing at risk, since `release()` here reads just as natural.
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    let waiter = Waiter(fut: newFuture[PgConnection]("abandoned"))
+    waiter.fut.complete(conn)
+    pool.settleAbandonedWaiter(waiter)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check not conn.closedByUser
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "a healthy conn released by a dispatch path is not the application's close":
+    # `pool.exec`/`pool.query` run on a connection the application never held, so
+    # the borrow's attribution must not stamp `closedByUser`.
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    conn.borrowedByUser = false # as `acquireInternal` leaves it
+    waitFor pool.resetSessionAndRelease(conn)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check not conn.closedByUser
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "a conn the pool dialled for its own convenience method is not the user's":
+    # `pool.exec`/`pool.query` acquire internally; the application never sees
+    # the connection, so a shutdown close on it stays a connection failure.
+    var closedByUser = true
+    var stateErr = false
+
+    proc testBody() {.async.} =
+      let pool = makePool()
+      pool.closed = true
+      pool.active = 1
+      let conn = mockConn(pool = pool)
+      conn.borrowed = true
+      conn.borrowedByUser = false # as `acquireInternal` leaves it
+      var bodyFut = newFuture[void]()
+      bodyFut.complete()
+      await pool.runAndRelease(conn, bodyFut)
+      await allFutures(pool.pendingBackgroundTasks)
+      closedByUser = conn.closedByUser
+      try:
+        conn.checkNotClosed()
+      except PgStateError:
+        stateErr = true
+      except PgConnectionError:
+        discard
+
+    waitFor testBody()
+    check not closedByUser
+    check not stateErr

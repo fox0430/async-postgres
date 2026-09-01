@@ -1089,7 +1089,7 @@ when hasChronos:
         raised = false
         try:
           discard await listener.waitNotification()
-        except PgError:
+        except PgStateError:
           raised = true
         doAssert raised
 
@@ -1109,7 +1109,7 @@ when hasChronos:
         var raised = false
         try:
           discard await listener.waitNotification()
-        except PgError:
+        except PgStateError:
           raised = true
         doAssert raised
 

@@ -1470,14 +1470,16 @@ suite "E2E: lookupTypeOids":
 
     waitFor t()
 
-  test "raises PgConnectionError when connection not ready":
+  test "raises PgStateError when the application closed the connection":
+    # A `close()` the application asked for is not a reconnectable failure, so
+    # it never reports `PgConnectionError` — see `checkNotClosed`.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       await conn.close()
       var raised = false
       try:
         discard await conn.lookupTypeOids(@["int4"])
-      except PgConnectionError:
+      except PgStateError:
         raised = true
       doAssert raised
 

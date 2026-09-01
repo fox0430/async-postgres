@@ -268,6 +268,23 @@ proc buildCommandComplete*(tag: string): seq[byte] =
   body.add(0'u8)
   buildBackendMsg('C', body)
 
+proc buildEmptyQueryResponse*(): seq[byte] =
+  ## EmptyQueryResponse: paired with a trailing ReadyForQuery, this is what a
+  ## real server answers `stopListening`'s empty stop query with.
+  buildBackendMsg('I', newSeq[byte]())
+
+proc buildNotificationResponse*(pid: int32, channel, payload: string): seq[byte] =
+  ## NotificationResponse: pid, channel cstring, payload cstring.
+  var body: seq[byte]
+  body.addInt32(pid)
+  for c in channel:
+    body.add(byte(c))
+  body.add(0'u8)
+  for c in payload:
+    body.add(byte(c))
+  body.add(0'u8)
+  buildBackendMsg('A', body)
+
 proc buildErrorResponse*(sqlState, message: string): seq[byte] =
   ## Minimal ErrorResponse with severity 'S', sqlstate 'C', message 'M'.
   var body: seq[byte]

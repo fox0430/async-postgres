@@ -35,6 +35,10 @@ else:
       "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
   .}
 
+const closedByUserMsg* = "Connection closed by the application"
+  ## Shared by `failNotifyWaiter` and `checkListenAlive` so a deliberate
+  ## `close()` reports the same thing whether a waiter was parked or not.
+
 var listenReconnectStopWaitMs* = 10_000
   ## Max wait (ms) for a listen pump stuck in a blocking `connect()`; it is
   ## orphaned on timeout. Not re-exported through `pg_connection`, so call
@@ -50,6 +54,12 @@ type
     csListening
     csReplicating
     csClosed
+
+  PgClosedReason* = enum
+    ## Why a connection is unusable (see `closedReason`).
+    crOpen ## Not closed.
+    crClosedByUser ## `close()` was called by the application.
+    crClosed ## The connection died on its own.
 
   SslMode* = enum
     ## SSL/TLS negotiation mode for the connection.
@@ -259,6 +269,8 @@ type
     notifyCallback*: NotifyCallback
     noticeCallback*: NoticeCallback
     listenChannels*: HashSet[string]
+    borrowedByUser*: bool
+      ## Handed to the application (not a pool-internal borrow); see ``release``.
     listenTask*: Future[void]
     listenStopRequested*: bool
       ## Set by `stopListening` or `close()` to ask the background pump to exit.
@@ -285,9 +297,15 @@ type
       ## `queue.Queue(maxsize<=0)`. The push API (`onNotify`) is unaffected by
       ## this setting and always fires.
     notifyWaiter*: Future[void]
+    notifyHandoff*: Notification
+      ## Reserved handoff for completed ``notifyWaiter`` (see ``hasNotifyHandoff``).
+    hasNotifyHandoff*: bool
     sendBuf*: seq[byte] ## Reusable send buffer for COPY IN batching
     notifyDropped*: int ## Count of notifications dropped due to queue overflow
     listenError*: ref PgListenError ## Set when listen pump fails permanently
+    closedByUser*: bool
+      ## Set by `close()`, one-way. Keeps a deliberate close out of
+      ## `PgConnectionError` reconnect loops (see `closedReason`).
     listenReconnectMaxAttempts*: int
       ## Max reconnect attempts on listen pump failure. Default 10.
       ## 0 or negative = unlimited retries (retry until close()).
@@ -974,3 +992,63 @@ template withTracing*(
     raise e
   if tracer != nil and tracer.endHook != nil:
     tracer.endHook(traceCtx, endDataExpr)
+
+func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
+  ## Why unusable (``crClosedByUser`` outranks ``crClosed``).
+  if conn.closedByUser:
+    crClosedByUser
+  elif conn.state == csClosed:
+    crClosed
+  else:
+    crOpen
+
+proc checkNotClosed*(conn: PgConnection) {.inline.} =
+  ## Reject if closed: ``PgStateError`` for deliberate ``close()``, else ``PgConnectionError``.
+  case conn.closedReason
+  of crOpen:
+    discard
+  of crClosedByUser:
+    raise newException(PgStateError, closedByUserMsg)
+  of crClosed:
+    raise newException(PgConnectionError, "Connection is closed")
+
+proc raiseClosedConnection*(conn: PgConnection, msg: string) {.noreturn.} =
+  ## Like ``checkNotClosed`` with a custom ``crClosed`` message.
+  # On ``crClosedByUser`` `msg` moves to `parent`: `closedByUserMsg` is public
+  # and matched exactly, so it cannot carry a custom message.
+  if conn.closedReason == crClosedByUser:
+    raise (ref PgStateError)(
+      msg: closedByUserMsg, parent: newException(PgConnectionError, msg)
+    )
+  raise newException(PgConnectionError, msg)
+
+proc raiseTransportFailure*(
+    conn: PgConnection, what: string, e: ref CatchableError
+) {.noreturn.} =
+  ## Fold backend transport error into ``PgError`` (``closedByUser`` wins).
+  if conn.closedReason == crClosedByUser:
+    raise (ref PgStateError)(msg: closedByUserMsg, parent: e)
+  if e of PgError:
+    raise e
+  raise newException(PgConnectionError, what & ": " & e.msg, e)
+
+proc failNotifyWaiter*(conn: PgConnection, err: ref PgError = nil) {.raises: [].} =
+  ## Fail parked waiter: ``closedByUser``→``PgStateError``, else ``err``/``csClosed``/stopped. Pass fresh ``err``.
+  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+    let e: ref PgError =
+      if conn.closedByUser:
+        # Ahead of ``err``, as ``checkNotClosed`` does: a pump death racing
+        # ``close()`` passes a ``PgListenError`` that would revive reconnect loops.
+        (ref PgStateError)(msg: closedByUserMsg)
+      elif err != nil:
+        err
+      elif conn.state == csClosed:
+        (ref PgConnectionError)(msg: "Connection is closed")
+      else:
+        (ref PgStateError)(msg: "Listener stopped")
+    # asyncdispatch types `Future.fail`'s callback chain as raising `Exception`,
+    # so catching it is what keeps this proc `raises: []`; nothing real is masked.
+    try:
+      conn.notifyWaiter.fail(e)
+    except Exception:
+      discard
