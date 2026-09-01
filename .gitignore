@@ -34,3 +34,6 @@ htmdocs/
 *.out
 audit/
 .audit/
+__pycache__/
+*.py[cod]
+*.pyo

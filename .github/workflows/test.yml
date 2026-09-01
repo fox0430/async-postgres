@@ -6,7 +6,9 @@ on:
       - '.github/workflows/test.yml'
       - 'docker-compose.yml'
       - 'async_postgres.nim*'
+      - 'async_postgres.nimble'
       - 'async_postgres/**'
+      - 'tools/**'
       - 'tests/**'
       - 'examples/**'
   push:
@@ -14,7 +16,9 @@ on:
       - '.github/workflows/test.yml'
       - 'docker-compose.yml'
       - 'async_postgres.nim*'
+      - 'async_postgres.nimble'
       - 'async_postgres/**'
+      - 'tools/**'
       - 'tests/**'
       - 'examples/**'
     branches:
@@ -95,6 +99,10 @@ jobs:
 
       - name: Compile examples (chronos)
         run: for f in examples/*.nim; do nim c -d:asyncBackend=chronos "$f"; done
+
+      - name: Check public symbol surface
+        if: matrix.nim-version == '2.2.4'
+        run: nimble apiSurface -y
 
       - name: Gen docs
         run: |
