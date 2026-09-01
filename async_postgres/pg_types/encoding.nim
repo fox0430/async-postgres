@@ -868,21 +868,10 @@ proc toPgBinaryParam*(v: PgXml): PgParam {.raises: [PgTypeError].} =
   checkPgBinLen(string(v).len, "xml")
   PgParam(oid: OidXml, format: 1, value: some(toBytes(string(v))))
 
-proc toPgBinaryParam*(v: PgBit): PgParam {.raises: [PgTypeError].} =
-  ## Bit → binary (4-byte count + data).
-  # Symmetric with the decoder guards in accessors.nim (getBit / bit array).
-  if v.nbits < 0:
-    raise newException(PgTypeError, "Invalid PgBit: negative nbits " & $v.nbits)
-  if v.nbits > PgBitMaxBits:
-    raise newException(
-      PgTypeError,
-      "Invalid PgBit: nbits " & $v.nbits & " exceeds limit (" & $PgBitMaxBits & ")",
-    )
-  if (int64(v.nbits) + 7) div 8 != int64(v.data.len):
-    raise newException(
-      PgTypeError,
-      "Invalid PgBit: nbits=" & $v.nbits & " inconsistent with data.len=" & $v.data.len,
-    )
+proc toPgBinaryParam*(v: PgBit): PgParam {.raises: [].} =
+  ## Bit → binary (4-byte count + data). Cannot fail: `initPgBit` bounds
+  ## ``nbits`` by `PgBitMaxBits` and ties ``data.len`` to it, so the payload
+  ## is within `checkPgBinLen` by construction.
   var data = newSeq[byte](4 + v.data.len)
   data.writeBE32(0, v.nbits)
   for i in 0 ..< v.data.len:
@@ -965,8 +954,7 @@ proc toPgMoneyArrayParam*(
 ): PgParam {.raises: [PgTypeError].} =
   ## Encode ``seq[PgMoney]`` as ``money[]``. ``scale`` must match every
   ## element's ``scale``. Raises ``PgTypeError`` on mismatch.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  checkMoneyScale(scale)
   for idx, m in v:
     if int(m.scale) != scale:
       raise newException(
@@ -1714,8 +1702,7 @@ proc toPgMoneyArrayNDParam*(
   ##
   ## Raises ``PgTypeError`` when ``scale`` is outside ``0..18`` or when any
   ## element's ``scale`` differs from the parameter.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  checkMoneyScale(scale)
   for idx, oe in v.elements:
     if oe.isSome and int(oe.get.scale) != scale:
       raise newException(

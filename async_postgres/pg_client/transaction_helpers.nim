@@ -1,12 +1,19 @@
 ## Pipelined single-statement transactions: `execInTransaction` and
 ## `queryInTransaction` issue BEGIN, the user SQL, and COMMIT with a single
 ## Sync round trip.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, cache, simple_query]
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc queryInTransactionImpl(
     conn: PgConnection,

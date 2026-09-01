@@ -8,13 +8,11 @@
 ## transitioned to `csClosed` as appropriate, so pools never recycle a
 ## broken connection.
 
-import std/[unittest, importutils, strutils]
+import std/[unittest, strutils]
 
 import ../async_postgres/[async_backend, pg_client, pg_types]
 import ../async_postgres/pg_connection {.all.}
 import ./e2e_common
-
-privateAccess(PgConnection)
 
 # Cursor abandonment
 

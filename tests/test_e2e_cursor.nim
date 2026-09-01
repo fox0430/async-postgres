@@ -1,12 +1,10 @@
-import std/[unittest, options, strutils, math, importutils, net]
+import std/[unittest, options, strutils, math, net]
 
 import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection]
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Cursor/Streaming":
   test "cursor fetches all rows in chunks":

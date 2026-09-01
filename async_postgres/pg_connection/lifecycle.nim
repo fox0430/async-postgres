@@ -1,4 +1,8 @@
 ## Connection lifecycle: auth, single/multi-host connect, and close.
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options, random, strutils, sysrand, tables]
 
@@ -12,6 +16,9 @@ when defined(posix):
 when hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, SockType, Protocol
+
+import std/importutils
+privateAccess(PgConnection)
 
 # Authentication policy helpers
 
@@ -556,15 +563,24 @@ proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
 
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Connect with multi-host failover, ``targetSessionAttrs``, per-host ``connectTimeout``.
+  ## Per-host failures fold into one ``PgConnectionError``; a ``PgConfigError`` escapes the fold.
   proc perform(hosts: seq[HostEntry]): Future[PgConnection] {.async.} =
     # `hosts` is already ordered by the caller (shuffled under lbhRandom), so
     # both the preferStandby two-pass loop and the single-pass loop below share
     # one order.
     # Reject sslnDirect + weak sslmode once — a per-host check would repeat the
-    # identical error across the aggregate. Other host-independent SSL errors
-    # (missing sslrootcert, verify-full without a host name) are still raised
-    # from negotiateSSL and folded per host.
+    # identical error across the aggregate.
     validateDirectSslCompatible(config)
+    # Faults of the shared config raised per host (missing sslrootcert, a PEM
+    # that will not load, ...) would repeat on every entry: folding them into
+    # the aggregate would hide them behind the very type that tells a
+    # reconnect loop to retry. Only `PgConfigError` escapes — a probe's
+    # `PgQueryError` or a fault of one entry (verify-full without a host name)
+    # is a per-host outcome and must still fail over.
+    template reraiseConfigFault(err: ref CatchableError) =
+      if err of PgConfigError:
+        raise err
+
     var errors: seq[string]
     # With a single host there is no failover. Preserve the contract that its
     # `connectTimeout` surfaces as a raw `AsyncTimeoutError` (callers and the
@@ -582,6 +598,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          reraiseConfigFault(e)
           lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
       # Second pass: accept any server
@@ -591,6 +608,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          reraiseConfigFault(e)
           lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
     else:
@@ -607,6 +625,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          reraiseConfigFault(e)
           lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
 
@@ -619,10 +638,14 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
   proc wrapped(): Future[PgConnection] {.async.} =
     # ConnConfig may be built or mutated without passing through the parsers'
     # validation — re-check here so every connect path rejects bad cert config.
-    try:
-      validateClientCertConfig(config)
-    except PgError as e:
-      raise newException(PgConnectionError, e.msg, e)
+    validateClientCertConfig(config)
+    if config.channelBinding == cbRequire and config.sslMode == sslDisable:
+      # Knowable before any dial; the per-host check in selectScramMechanism
+      # stays for sslmode=prefer, where the server decides whether TLS is used.
+      raise newException(
+        PgConfigError,
+        "channel_binding=require needs TLS, but sslmode=disable never negotiates it",
+      )
     # Compute the ordered host list once so the trace and the actual connection
     # attempts see the same order under lbhRandom.
     let hosts = config.orderedHosts()

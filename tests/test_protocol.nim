@@ -1685,7 +1685,7 @@ suite "enqueueNotification with an outstanding handoff":
     # still queued: they all go, in one overflow report, not one per arrival.
     let conn = handoffConn(queued = 2, maxQueue = 1)
     var reported = -1
-    conn.notifyOverflowCallback = proc(dropped: int) {.gcsafe, raises: [].} =
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
       reported = dropped
     conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
     check reported == 2

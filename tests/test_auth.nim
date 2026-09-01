@@ -3,7 +3,7 @@ import std/[unittest, strutils, base64]
 import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 
-import ../async_postgres/pg_auth
+import ../async_postgres/pg_auth {.all.}
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)

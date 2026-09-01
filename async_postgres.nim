@@ -156,6 +156,7 @@ export pg_pool.newPool
 export pg_pool.release
 export pg_pool.resetSessionAndRelease
 export pg_pool.acquire
+export pg_pool.acquireHandle
 export pg_pool.runAndRelease
 export pg_pool.withConnection
 export pg_pool.exec

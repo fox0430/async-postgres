@@ -7,6 +7,10 @@
 ## Only `initConnConfig` / `parseDsn` are re-exported through `pg_connection.nim`;
 ## the intermediate parsers stay here. Depends only on `types.nim` (does not
 ## touch `PgConnection`).
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/strutils
 when defined(posix):

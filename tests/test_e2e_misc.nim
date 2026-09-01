@@ -1,4 +1,4 @@
-import std/[unittest, options, tables, math, importutils, net]
+import std/[unittest, options, tables, math, net]
 
 import
   ../async_postgres/
@@ -6,8 +6,6 @@ import
 import ../async_postgres/pg_connection/[simple_query, lifecycle, notify]
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Error type granularity":
   test "invalid SQL via exec raises PgQueryError with SQLSTATE":

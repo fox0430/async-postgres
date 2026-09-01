@@ -37,9 +37,11 @@
 ##                                  `to_regtype` (extension types like
 ##                                  `hstore`, `citext`, etc.).
 ##
-## Only the public API listed below is re-exported. Anything not listed stays
-## in its defining submodule (e.g. `pg_connection/buffer_io`) and must be
-## imported from there directly, not through `import pg_connection`.
+## What this hub re-exports is the public API. The submodules are internal:
+## Nim needs a `*` on anything a sibling module uses, so their exported sets are
+## wider than what the package promises, and importing one directly reaches
+## symbols that carry no compatibility guarantee. `tests/api_surface.golden`
+## freezes the whole exported set so a widening has to be reviewed.
 
 import pg_errors
 import
@@ -49,6 +51,7 @@ export pg_errors
 
 # `types` — public types, the tracer hook data types and the tracing helpers.
 export types.PgConnState
+export types.state
 export types.SslMode
 export types.SslNegotiation
 export types.ChannelBindingMode
@@ -62,6 +65,9 @@ export types.Notification
 export types.NotifyCallback
 export types.Notice
 export types.NoticeCallback
+export types.ReconnectCallback
+export types.NotifyOverflowCallback
+export types.ListenErrorCallback
 export types.CachedStmt
 export types.dialAddr
 export types.displayHost
@@ -102,6 +108,25 @@ export types.TraceLeakedSessionLocksData
 export types.TraceInsecureAuthData
 export types.TraceDeprecatedAuthData
 export types.TraceAdvisoryUnlockFailedData
+export types.txStatus
+export types.pid
+export types.host
+export types.port
+export types.config
+export types.createdAt
+export types.sslEnabled
+export types.serverParams
+export types.serverParam
+export types.notifyDropped
+export types.listenError
+export types.notifyMaxQueue
+export types.`notifyMaxQueue=`
+export types.listenReconnectMaxAttempts
+export types.`listenReconnectMaxAttempts=`
+export types.listenReconnectMaxBackoff
+export types.`listenReconnectMaxBackoff=`
+export types.stmtCacheCapacity
+export types.`stmtCacheCapacity=`
 export types.withConnTracing
 export types.withTracing
 
@@ -142,8 +167,12 @@ export lifecycle.connectToHost
 # `notify` — LISTEN / NOTIFY pump and waiters.
 export notify.onNotify
 export notify.onListenError
+export notify.onNotice
+export notify.onReconnect
+export notify.onNotifyOverflow
 export notify.listen
 export notify.unlisten
+export notify.stopListening
 export notify.waitNotification
 
 # `type_lookup` — extension type OID resolution.

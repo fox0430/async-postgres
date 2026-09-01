@@ -1,4 +1,9 @@
-## LISTEN/NOTIFY: subscription API, pump with auto-reconnect, and pull API.
+## LISTEN/NOTIFY: subscription API, pump with auto-reconnect, pull API, and
+## the connection's callback registration (`onNotify`, `onNotice`, ...).
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[deques, options, sets]
 
@@ -8,6 +13,9 @@ import types, buffer_io, cache, simple_query, lifecycle
 when hasChronos:
   import chronos/streams/tlsstream
   import ../pg_bearssl
+
+import std/importutils
+privateAccess(PgConnection)
 
 const listenBackoffTickMs = 50 ## Backoff tick ms (stop check granularity).
 
@@ -19,12 +27,26 @@ proc onNotify*(conn: PgConnection, callback: NotifyCallback) =
   ## Set a callback invoked for each incoming NOTIFY message.
   conn.notifyCallback = callback
 
-proc onListenError*(
-    conn: PgConnection, callback: proc(err: ref PgListenError) {.gcsafe, raises: [].}
-) =
+proc onListenError*(conn: PgConnection, callback: ListenErrorCallback) =
   ## Callback for permanent pump failure. ``err.transportAlive`` marks a death
   ## the pull API reports as ``PgListenStoppedError``.
   conn.listenErrorCallback = callback
+
+proc onNotice*(conn: PgConnection, callback: NoticeCallback) =
+  ## Set a callback invoked for each notice/warning the server sends
+  ## (``RAISE NOTICE``, ``RAISE WARNING``, deprecation notices).
+  conn.noticeCallback = callback
+
+proc onReconnect*(conn: PgConnection, callback: ReconnectCallback) =
+  ## Set a callback invoked after the listen pump reconnects in place and
+  ## re-subscribes every channel.
+  conn.reconnectCallback = callback
+
+proc onNotifyOverflow*(conn: PgConnection, callback: NotifyOverflowCallback) =
+  ## Set a callback invoked when the pull-API queue overflows; the argument
+  ## counts what that one arrival discarded (`notifyDropped` accumulates until
+  ## the next overflow `waitNotification` reports).
+  conn.notifyOverflowCallback = callback
 
 # In-place reconnect (preserves PgConnection identity for listeners)
 

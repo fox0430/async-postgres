@@ -1,6 +1,10 @@
 ## Simple Query Protocol: ``simpleQuery``/``simpleExec``/``ping``, ``checkReady``,
 ## cancel helpers (``cancel``/``invalidateOnTimeout``), ``checkSessionAttrs``,
 ## and ``quoteIdentifier``. Layer between ``buffer_io`` and ``lifecycle``.
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options, strutils, tables]
 
@@ -10,6 +14,9 @@ import types, buffer_io
 when hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, SockType, Protocol
+
+import std/importutils
+privateAccess(PgConnection)
 
 # QueryResult helpers
 

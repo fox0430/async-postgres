@@ -1,4 +1,4 @@
-import std/[unittest, macros]
+import std/unittest
 
 import ../async_postgres
 
@@ -43,6 +43,7 @@ apiExists(TargetSessionAttrs)
 apiExists(LoadBalanceHosts)
 apiExists(HostEntry)
 apiExists(PgConnState)
+apiExists(state)
 apiExists(PgTracer)
 apiExists(Notification)
 apiExists(Notice)
@@ -57,6 +58,9 @@ apiExists(PgPoolOwner)
 apiExists(RowCallback)
 apiExists(ClientCertPairingErrorMsg)
 apiExists(TypeOidInfo)
+apiExists(ReconnectCallback)
+apiExists(NotifyOverflowCallback)
+apiExists(ListenErrorCallback)
 
 # -- protocol types
 apiExists(FrontendMessageKind)
@@ -102,6 +106,7 @@ apiExists(PgParamInline)
 apiExists(PgUuid)
 apiExists(PgInterval)
 apiExists(PgMoney)
+apiExists(initPgMoney)
 apiExists(PgNumeric)
 apiExists(PgInet)
 apiExists(PgCidr)
@@ -116,6 +121,7 @@ apiExists(PgCircle)
 apiExists(PgLseg)
 apiExists(PgLine)
 apiExists(PgBit)
+apiExists(initPgBit)
 apiExists(PgTime)
 apiExists(PgTimeTz)
 apiExists(PgXml)
@@ -145,8 +151,27 @@ apiExists(socketHasPendingData)
 # -- listen / notify
 apiExists(listen)
 apiExists(unlisten)
+apiExists(stopListening)
 apiExists(onNotify)
 apiExists(onListenError)
+apiExists(onNotice)
+apiExists(onReconnect)
+apiExists(onNotifyOverflow)
+apiExists(txStatus)
+apiExists(pid)
+apiExists(host)
+apiExists(port)
+apiExists(config)
+apiExists(createdAt)
+apiExists(sslEnabled)
+apiExists(serverParams)
+apiExists(serverParam)
+apiExists(notifyDropped)
+apiExists(listenError)
+apiExists(notifyMaxQueue)
+apiExists(listenReconnectMaxAttempts)
+apiExists(listenReconnectMaxBackoff)
+apiExists(stmtCacheCapacity)
 apiExists(waitNotification)
 
 # -- query / exec
@@ -183,6 +208,7 @@ apiExists(copyOutStream)
 # -- pool operations
 apiExists(newPool)
 apiExists(acquire)
+apiExists(acquireHandle)
 apiExists(release)
 apiExists(runAndRelease)
 apiExists(resetSession)
@@ -735,6 +761,158 @@ apiExists(getXml)
 apiExists(getXmlArray)
 apiExists(getXmlArrayOpt)
 apiExists(getXmlOpt)
+
+# -- macro expansion probes
+#
+# `apiExists` above is name visibility only: a macro's *symbol* re-exports
+# fine even when its generated code cannot compile in a scope that lacks
+# `privateAccess(PgConnection)`. These procs instantiate every scoping macro
+# from an ordinary user scope (this module deliberately never calls
+# `privateAccess`), so a macro that reaches a private field without unlocking
+# it fails the build here instead of only in `examples/`.
+#
+# The procs are compiled, never run — `conn` / `pool` are nil. `withTracing`
+# and `withConnTracing` are not probed: they take tracer hook expressions and
+# are internal plumbing rather than a user-facing scoping macro.
+
+proc probeConnTx(conn: PgConnection) {.async, used.} =
+  conn.withTransaction:
+    discard await conn.exec("SELECT 1")
+  conn.withTransaction(seconds(5)):
+    discard await conn.exec("SELECT 1")
+  conn.withTransaction(TransactionOptions(isolation: ilSerializable)):
+    discard await conn.exec("SELECT 1")
+  conn.withTransactionRetry(RetryOptions(maxAttempts: 3)):
+    discard await conn.exec("SELECT 1")
+  conn.withTransactionDeadline(seconds(5)):
+    discard await conn.exec("SELECT 1")
+  conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), seconds(5)):
+    discard await conn.exec("SELECT 1")
+
+proc probeConnSavepoint(conn: PgConnection) {.async, used.} =
+  conn.withSavepoint:
+    discard await conn.exec("SELECT 1")
+  conn.withSavepoint("named_sp"):
+    discard await conn.exec("SELECT 1")
+  conn.withSavepointDeadline(seconds(5)):
+    discard await conn.exec("SELECT 1")
+
+proc probeMacroScopeStaysSealed(conn: PgConnection) {.async, used.} =
+  ## The scoping macros' generated code drives the state machine and writes the
+  ## send buffer, but it lands here, in the caller's scope. Unlocking the record
+  ## for that made every private field of `PgConnection` writable for the rest
+  ## of the enclosing proc — silently, and only for callers who happened to use
+  ## a macro. Each of these must stay unreachable *after* an expansion.
+  conn.withTransaction:
+    discard await conn.exec("SELECT 1")
+  conn.withSavepoint:
+    discard await conn.exec("SELECT 1")
+  discard await conn.execDirect("SELECT $1::int", 1)
+  # `static:` because these probe procs are compiled and never run.
+  static:
+    doAssert not compiles(conn.sendBuf), "the send buffer must stay sealed"
+    doAssert not compiles(conn.stmtCache), "the statement cache must stay sealed"
+    doAssert not compiles(conn.portalCounter), "the portal counter must stay sealed"
+    doAssert not compiles(conn.state = csClosed),
+      "the state machine must stay read-only"
+
+proc probeConnAccessors(conn: PgConnection) {.used.} =
+  ## The record is private, so every documented read and every tunable has to
+  ## reach application code through an accessor. `declared()` alone would stay
+  ## green on a name that std or another module also defines, so use them.
+  discard conn.pid
+  discard conn.host
+  discard conn.port
+  discard conn.config
+  discard conn.createdAt
+  discard conn.sslEnabled
+  discard conn.serverParams
+  discard conn.serverParam("server_version")
+  discard conn.notifyDropped
+  discard conn.listenError
+  discard conn.state
+  discard conn.txStatus
+  conn.notifyMaxQueue = conn.notifyMaxQueue
+  conn.listenReconnectMaxAttempts = conn.listenReconnectMaxAttempts
+  conn.listenReconnectMaxBackoff = conn.listenReconnectMaxBackoff
+  conn.stmtCacheCapacity = conn.stmtCacheCapacity
+  conn.onNotify(
+    proc(n: Notification) {.gcsafe, raises: [].} =
+      discard
+  )
+  conn.onNotice(
+    proc(n: Notice) {.gcsafe, raises: [].} =
+      discard
+  )
+  conn.onReconnect(
+    proc() {.gcsafe, raises: [].} =
+      discard
+  )
+  conn.onNotifyOverflow(
+    proc(dropped: int) {.gcsafe, raises: [].} =
+      discard
+  )
+  conn.onListenError(
+    proc(err: ref PgListenError) {.gcsafe, raises: [].} =
+      discard
+  )
+
+proc probePrivatizedSurfaceStaysSealed() {.used.} =
+  ## Negative guards for the narrowed surface (affirmative `apiExists` alone
+  ## cannot catch re-expansion).
+  static:
+    doAssert not compiles(PgMoney(amount: 1'i64, scale: 2'i8)),
+      "PgMoney must stay constructible only via initPgMoney"
+    doAssert not compiles(PgBit(nbits: 1'i32, data: @[0b10000000'u8])),
+      "PgBit must stay constructible only via initPgBit"
+    doAssert not compiles(async_postgres.cellInfo),
+      "cellInfo must stay out of the public API"
+
+proc probeConnScoped(conn: PgConnection, oid: Oid) {.async, used.} =
+  conn.withAdvisoryLock(1'i64):
+    discard await conn.exec("SELECT 1")
+  conn.withAdvisoryLockShared(1'i64):
+    discard await conn.exec("SELECT 1")
+  conn.withLargeObject(lo, oid, INV_READ):
+    discard await lo.loSizeDeadline(seconds(5))
+  conn.withCursor("SELECT 1", 10'i32, cur):
+    discard await cur.fetchNext()
+  let qr = await conn.queryDirect("SELECT $1::int", 1)
+  discard qr
+  discard await conn.execDirect("SELECT $1::int", 1)
+
+proc probePoolTx(pool: PgPool) {.async, used.} =
+  # Each macro injects its connection identifier into this scope, so every
+  # probe needs its own name.
+  pool.withConnection(cConn):
+    discard await cConn.exec("SELECT 1")
+  pool.withPipeline(pl):
+    # `conn` is injected by the macro alongside the pipeline.
+    discard await conn.exec("SELECT 1")
+  pool.withTransaction(cTx):
+    discard await cTx.exec("SELECT 1")
+  pool.withTransactionRetry(RetryOptions(maxAttempts: 3), cRetry):
+    discard await cRetry.exec("SELECT 1")
+  pool.withTransactionDeadline(cDl, seconds(5)):
+    discard await cDl.exec("SELECT 1")
+  pool.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), cRetryDl, seconds(5)):
+    discard await cRetryDl.exec("SELECT 1")
+
+proc probeClusterTx(cluster: PgPoolCluster) {.async, used.} =
+  cluster.withReadConnection(cRead):
+    discard await cRead.exec("SELECT 1")
+  cluster.withWriteConnection(cWrite):
+    discard await cWrite.exec("SELECT 1")
+  cluster.withTransaction(cTx):
+    discard await cTx.exec("SELECT 1")
+  cluster.withTransactionRetry(RetryOptions(maxAttempts: 3), cRetry):
+    discard await cRetry.exec("SELECT 1")
+  cluster.withTransactionDeadline(cDl, seconds(5)):
+    discard await cDl.exec("SELECT 1")
+  cluster.withTransactionRetryDeadline(
+    RetryOptions(maxAttempts: 3), cRetryDl, seconds(5)
+  ):
+    discard await cRetryDl.exec("SELECT 1")
 
 suite "aggregate re-export":
   test "public API surface resolves through `import pkg/async_postgres`":

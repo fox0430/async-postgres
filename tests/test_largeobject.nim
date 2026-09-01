@@ -1,10 +1,8 @@
-import std/[unittest, importutils]
+import std/[unittest]
 
 import ../async_postgres/[async_backend, pg_client, pg_largeobject]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
-
-privateAccess(PgConnection)
 
 const
   PgHost = "127.0.0.1"

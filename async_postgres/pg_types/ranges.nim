@@ -4,7 +4,7 @@ import ../pg_protocol
 import ./core
 import ./encoding
 import ./decoding
-import ./accessors
+import ./accessors {.all.}
 
 type
   RangeBinaryInput =
@@ -38,10 +38,12 @@ proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
   if (flags and rangeEmpty) != 0:
     result.isEmpty = true
     return
-  result.hasLower = (flags and rangeHasLower) != 0
-  result.hasUpper = (flags and rangeHasUpper) != 0
-  result.lowerInc = (flags and rangeLowerInc) != 0
-  result.upperInc = (flags and rangeUpperInc) != 0
+  # An absent bound is `LB_INF`/`UB_INF` *set*; the bound's data is written only
+  # when the corresponding infinity bit is clear.
+  result.hasLower = (flags and rangeLbInf) == 0
+  result.hasUpper = (flags and rangeUbInf) == 0
+  result.lowerInc = (flags and rangeLbInc) != 0
+  result.upperInc = (flags and rangeUbInc) != 0
   var pos = 1
   if result.hasLower:
     if pos + 4 > data.len:
@@ -382,14 +384,14 @@ proc encodeRangeBinaryImpl(
   if r.isEmpty:
     return @[rangeEmpty]
   var flags: uint8 = 0
-  if r.hasLower:
-    flags = flags or rangeHasLower
-  if r.hasUpper:
-    flags = flags or rangeHasUpper
-  if r.lowerInc:
-    flags = flags or rangeLowerInc
-  if r.upperInc:
-    flags = flags or rangeUpperInc
+  if not r.hasLower:
+    flags = flags or rangeLbInf
+  elif r.lowerInc:
+    flags = flags or rangeLbInc
+  if not r.hasUpper:
+    flags = flags or rangeUbInf
+  elif r.upperInc:
+    flags = flags or rangeUbInc
   var size: int64 = 1
   if r.hasLower:
     checkPgBinLen(r.lowerData.len, "Range bound")
@@ -488,8 +490,12 @@ proc encodeBinaryDate(dt: DateTime): seq[byte] =
 proc encodeRangeBinary[T](
     v: PgRange[T],
     oid: int32,
-    encodeBound: proc(v: T): seq[byte] {.raises: [PgTypeError, PgProtocolError].},
+    encodeBound:
+      proc(v: T): seq[byte] {.gcsafe, raises: [PgTypeError, PgProtocolError].},
 ): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  # `gcsafe` on the callback type: without it the indirect call makes every
+  # `toPgBinaryParam` overload GC-unsafe, which under chronos means an `{.async.}`
+  # proc cannot call them at all.
   var ld, ud: seq[byte]
   if v.hasLower:
     ld = encodeBound(v.lower.value)
