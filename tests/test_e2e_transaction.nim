@@ -1493,6 +1493,45 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  test "withTransactionDeadline never hands back a reusable connection in a transaction":
+    # The deadline expiring between statements leaves a clean wire, so nothing
+    # about the connection says the scope failed — but the server is still in
+    # the transaction, holding its locks. Whoever the connection is handed to
+    # next must not inherit that, so the scope either rolls back and keeps the
+    # connection (the body unwound) or retires it (the body could not be
+    # cancelled and still owns it). Retirement does not roll back: on the
+    # retiring arm the server-side transaction ends with the close below.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txd_idle")
+      discard await conn.exec("CREATE TABLE test_txd_idle (val text)")
+
+      var raised = false
+      try:
+        conn.withTransactionDeadline(milliseconds(300)):
+          discard await conn.exec(
+            "INSERT INTO test_txd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          # The deadline expires here, with the wire idle and the server
+          # transaction open.
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      doAssert conn.state == csClosed or conn.txStatus == tsIdle,
+        "a reusable connection must not carry an open transaction; state=" & $conn.state &
+          " tx=" & $conn.txStatus
+
+      await conn.close()
+      let checker = await connect(plainConfig())
+      let res = await checker.query("SELECT val FROM test_txd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await checker.exec("DROP TABLE test_txd_idle")
+      await checker.close()
+
+    waitFor t()
+
   test "withTransactionDeadline with TransactionOptions commits":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -1852,6 +1891,44 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  test "withTransactionRetryDeadline never hands back a reusable connection in a transaction":
+    # The retry macro owes the same thing the single-attempt one does: a
+    # deadline that expires between statements leaves a clean wire, and a
+    # settled wire is not a reason to hand back a connection whose server-side
+    # transaction is still open holding its locks.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txrd_idle")
+      discard await conn.exec("CREATE TABLE test_txrd_idle (val text)")
+
+      var raised = false
+      try:
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 5), milliseconds(300)
+        ):
+          discard await conn.exec(
+            "INSERT INTO test_txrd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          # The deadline expires here, with the wire idle and the server
+          # transaction open.
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      doAssert conn.state == csClosed or conn.txStatus == tsIdle,
+        "a reusable connection must not carry an open transaction; state=" & $conn.state &
+          " tx=" & $conn.txStatus
+
+      await conn.close()
+      let checker = await connect(plainConfig())
+      let res = await checker.query("SELECT val FROM test_txrd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await checker.exec("DROP TABLE test_txrd_idle")
+      await checker.close()
+
+    waitFor t()
+
   test "withTransactionRetryDeadline exhausts retries and raises the last error":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -2169,6 +2246,73 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert res.rows[0].getInt(0) == 1'i32
 
       await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline never hands on a connection in a transaction":
+    # The pool counterpart of the conn invariant: a deadline that expires
+    # between statements leaves a clean wire and an open server-side
+    # transaction. `maxSize = 1` forces the next borrower onto whatever the
+    # scope left behind, so an inherited transaction shows up as the orphaned
+    # row being visible to it.
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+      defer:
+        await pool.close()
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_txd_idle")
+      discard await pool.exec("CREATE TABLE test_pool_txd_idle (val text)")
+
+      var raised = false
+      try:
+        pool.withTransactionDeadline(conn, milliseconds(300)):
+          discard await conn.exec(
+            "INSERT INTO test_pool_txd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+      doAssert raised
+
+      let next = await pool.acquire()
+      doAssert next.txStatus == tsIdle,
+        "the next borrower must not inherit an open transaction; tx=" & $next.txStatus
+      let res = await next.query("SELECT val FROM test_pool_txd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await next.exec("DROP TABLE test_pool_txd_idle")
+      next.release()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline never hands on a connection in a transaction":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+      defer:
+        await pool.close()
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_txrd_idle")
+      discard await pool.exec("CREATE TABLE test_pool_txrd_idle (val text)")
+
+      var raised = false
+      try:
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 5), conn, milliseconds(300)
+        ):
+          discard await conn.exec(
+            "INSERT INTO test_pool_txrd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+      doAssert raised
+
+      let next = await pool.acquire()
+      doAssert next.txStatus == tsIdle,
+        "the next borrower must not inherit an open transaction; tx=" & $next.txStatus
+      let res = await next.query("SELECT val FROM test_pool_txrd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await next.exec("DROP TABLE test_pool_txrd_idle")
+      next.release()
 
     waitFor t()
 

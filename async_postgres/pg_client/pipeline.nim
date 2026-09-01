@@ -231,12 +231,12 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   ## (lazy: empty unless at least one pokQuery cache-hit was seen). When
   ## `perOpSync` is true a Sync is appended after each op (executeIsolated);
   ## otherwise a single trailing Sync is appended (execute).
+  ##
+  ## Statements this build drops from the persistent cache go through
+  ## `stageEvictedClose`, so an aborted build leaves them owed rather than only
+  ## in a buffer nothing sends.
   let conn = p.conn
-  conn.sendBuf.setLen(0)
-  # A raise below discards `sendBuf` unsent, so every `Close` it held for a
-  # server-side statement must go back on the queue or that statement leaks.
-  var orphanedCloses = conn.pendingStmtCloses
-  conn.flushPendingStmtCloses()
+  conn.beginSendBuf()
   var hasCachedStmts = false
   var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
   var defaultFormats: seq[int16] # reused across ops when paramFormats is empty
@@ -300,12 +300,12 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
       let cached = conn.lookupStmtCache(p.ops[i].sql)
       var cacheHit = cached != nil
       if cacheHit:
-        # Stale parse-time OIDs would misread the bind bytes. Not
-        # ``invalidateIfOidMismatch``: its queue was already flushed above.
+        # Stale parse-time OIDs would have the server read the bind bytes
+        # under the wrong types. Not ``invalidateIfOidMismatch``: its Close
+        # would miss this build's own staging.
         if not currentOidsMatch(cached.paramOids):
-          conn.sendBuf.addClose(dkStatement, cached.name)
           conn.removeStmtCache(p.ops[i].sql)
-          orphanedCloses.add cached.name
+          conn.stageEvictedClose(conn.sendBuf, cached.name)
           cacheHit = false
       p.ops[i].cache = scsUncached
       p.ops[i].cacheSuperseded = false
@@ -356,8 +356,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
           if conn.stmtCache.len + pendingCacheAdds >= conn.stmtCacheCapacity and
               conn.stmtCache.len > 0:
             let evicted = conn.evictStmtCache()
-            conn.sendBuf.addClose(dkStatement, evicted.name)
-            orphanedCloses.add evicted.name
+            conn.stageEvictedClose(conn.sendBuf, evicted.name)
           inc pendingCacheAdds
           emitParse(p.ops[i].stmtName)
           conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
@@ -387,19 +386,11 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
     if not perOpSync:
       conn.sendBuf.addSync()
   except PgError as e:
-    conn.pendingStmtCloses = orphanedCloses
     # Only the encoders raise these two, so the interleaved cache bookkeeping
     # is not blamed on the in-flight op.
     if encodingOp >= 0 and (e of PgTypeError or e of PgProtocolError):
       e.msg =
         "pipeline op #" & $encodingOp & " (" & p.ops[encodingOp].sql & "): " & e.msg
-    raise e
-  except Defect as e:
-    # The encoders re-raise `Defect`s and buffer growth can raise
-    # `OutOfMemDefect`; the drained `Close` messages must survive either.
-    # Not a bare `raise`: Nim < 2.2.8 tracks that as `Exception`, which the
-    # chronos raises list rejects.
-    conn.pendingStmtCloses = orphanedCloses
     raise e
 
 template initPipelineResults(
@@ -477,15 +468,15 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
   conn.checkReady()
 
   let cachedStmts = buildSendPhase(p, perOpSync = false)
-  conn.state = csBusy
+  conn.markBusy()
   when hasChronos:
     # chronos drains the send Future in the background while we descend into
     # the receive loop. The outer try/except below owns sendFut's lifetime:
     # it drains sendFut on the normal path (propagating any stored write
     # error) and cancels it on any abnormal exit so the Future never leaks.
-    var sendFut = conn.sendBufMsg()
+    var sendFut = conn.sendStagedBufMsg()
   else:
-    await conn.sendBufMsg()
+    await conn.sendStagedBufMsg()
 
   # Receive Phase
   var results = newSeq[PipelineResult](p.ops.len)
@@ -587,7 +578,7 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
           of bmkReadyForQuery:
             conn.txStatus = msg.txStatus
             if conn.state != csClosed:
-              conn.state = csReady
+              conn.markReady()
             if queryError != nil:
               # The batch ran as one implicit transaction that aborted, but
               # prepared statements created by Parse survive the rollback (they
@@ -641,7 +632,8 @@ proc execute*(
     p: Pipeline, timeout: Duration = ZeroDuration
 ): Future[seq[PipelineResult]] {.async.} =
   ## Execute all queued pipeline operations in a single round trip.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## When `p.autoReset` is true, the pipeline is reset on exit (including on
   ## raise) so it can be safely reused.
   var results: seq[PipelineResult]
@@ -671,14 +663,14 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
   conn.checkReady()
 
   let cachedStmts = buildSendPhase(p, perOpSync = true)
-  conn.state = csBusy
+  conn.markBusy()
   when hasChronos:
     # Same concurrent-send pattern as executeImpl: the write drains while the
     # recv loop consumes per-op ReadyForQuery messages. Per-op SYNC still
     # provides error isolation; only the IO scheduling differs.
-    var sendFut = conn.sendBufMsg()
+    var sendFut = conn.sendStagedBufMsg()
   else:
-    await conn.sendBufMsg()
+    await conn.sendStagedBufMsg()
 
   # Receive Phase (per-op ReadyForQuery)
   var results = newSeq[PipelineResult](p.ops.len)
@@ -769,7 +761,7 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
     raise e
 
   if conn.state != csClosed:
-    conn.state = csReady
+    conn.markReady()
   return IsolatedPipelineResults(results: results, errors: errors)
 
 proc executeIsolated*(
@@ -778,7 +770,8 @@ proc executeIsolated*(
   ## Execute all queued pipeline operations with per-query error isolation.
   ## Each operation gets its own SYNC message, so a failed operation does not
   ## abort subsequent ones. Returns results and per-op errors.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## When `p.autoReset` is true, the pipeline is reset on exit (including on
   ## raise) so it can be safely reused.
   var ir: IsolatedPipelineResults

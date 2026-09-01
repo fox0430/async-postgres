@@ -968,6 +968,73 @@ proc encodeSync*(): seq[byte] {.raises: [].} =
   ## Encode a standalone Sync message.
   result = @[byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
 
+const
+  frontendMsgTags =
+    {'B', 'C', 'c', 'D', 'd', 'E', 'F', 'f', 'H', 'P', 'p', 'Q', 'S', 'X'}
+    ## Every message tag the frontend may write after startup.
+  syncPointTags = {'Q', 'S', 'F'}
+    ## The ones the backend answers with a `ReadyForQuery`: simple `Query`,
+    ## `Sync` for an extended-query round trip, and fast-path `FunctionCall`.
+    ## Nothing here writes `FunctionCall`, but the walk accepts the tag, so it
+    ## must be classified or a caller writing one would look unsynchronised.
+  inFlightExchangeTags = {'p', 'c', 'd', 'f'}
+    ## Written inside an exchange the backend is already running: the password
+    ## messages of the authentication it asked for, and the payload of a COPY
+    ## a `Query` opened. Neither starts anything of its own, so the reply that
+    ## ends the exchange ends these too.
+  replyElicitingTags = frontendMsgTags - syncPointTags - inFlightExchangeTags - {'X'}
+    ## Messages the backend answers without the answer ending anywhere: an
+    ## extended-query batch that stops at `Flush` (as a cursor's does) has
+    ## replies in flight and no synchronisation point to end them.
+
+func owedForUnreadable(
+    data: openArray[byte], i: int, walked: int
+): tuple[syncPoints: int, unsynced: bool] {.raises: [].} =
+  ## What to charge for the bytes `outstandingReplies` could not walk, from
+  ## `i` on, having already counted `walked` sync points.
+  ##
+  ## Unreadable from the very first byte, `data` is the untagged startup
+  ## packet, whose authentication exchange ends in exactly one `ReadyForQuery`
+  ## that closes everything sent.
+  ##
+  ## Stopping part-way, the tail may hold sync points of its own, so it is
+  ## charged the most it could hold: a frontend message is at least five bytes,
+  ## so `(data.len - i) div 5` bounds them from above. That keeps the count on
+  ## the overcounting side, where the cost is only a needless reconnect.
+  if i <= 0:
+    (1, false)
+  else:
+    (walked + max((data.len - i) div 5, 1), true)
+
+proc outstandingReplies*(
+    data: openArray[byte]
+): tuple[syncPoints: int, unsynced: bool] {.raises: [].} =
+  ## What `data` leaves the backend owing: `syncPoints` is the number of
+  ## `ReadyForQuery` replies it must send, and `unsynced` says whether replies
+  ## were asked for past the last of them, with nothing to close the stream.
+  ##
+  ## Read off the bytes rather than declared by whoever assembled them: no
+  ## build site has to remember to say so, and a batch carrying one `Sync` per
+  ## operation is counted as the several replies it is actually owed.
+  ##
+  ## Framing this cannot walk is charged conservatively (`owedForUnreadable`):
+  ## overcounting only retires a reusable connection, while undercounting hands
+  ## the next borrower a stream with someone else's reply still in it.
+  var i = 0
+  while i < data.len:
+    if i + 5 > data.len or char(data[i]) notin frontendMsgTags:
+      return owedForUnreadable(data, i, result.syncPoints)
+    let msgLen = int64(decodeInt32(data, i + 1))
+    if msgLen < 4 or int64(i) + 1 + msgLen > int64(data.len):
+      return owedForUnreadable(data, i, result.syncPoints)
+    let tag = char(data[i])
+    if tag in syncPointTags:
+      inc result.syncPoints
+      result.unsynced = false
+    elif tag in replyElicitingTags:
+      result.unsynced = true
+    i += 1 + int(msgLen)
+
 proc encodeFlush*(): seq[byte] {.raises: [].} =
   ## Encode a standalone Flush message.
   result = @[byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]

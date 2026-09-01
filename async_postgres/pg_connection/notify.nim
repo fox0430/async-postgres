@@ -32,21 +32,19 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   ## Reconnect and re-LISTEN all channels. Cleans up new transport on failure.
   await conn.closeTransport()
 
-  conn.recvBuf.setLen(0)
-  conn.recvBufStart = 0
-  conn.sendBuf.setLen(0)
+  conn.resetWireState()
   # Fresh backend holds none of the old session-level advisory locks; stale
   # state would fake an onLeakedSessionLocks on pool release.
   conn.heldSessionLocks = 0
   conn.sessionLockDirty = false
   conn.clearStmtCache()
-  conn.state = csConnecting
+  conn.markState(csConnecting)
 
   var newConn: PgConnection
   try:
     newConn = await connect(conn.config)
   except CatchableError as e:
-    conn.state = csClosed
+    conn.markClosed()
     raise e
   if conn.listenStopRequested:
     # Stop landed while connect() blocked: discard newConn, the pump's own
@@ -57,7 +55,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
       await newConn.closeImpl(byUser = false)
     except CatchableError:
       discard
-    conn.state = csClosed
+    conn.markClosed()
     return
   when hasChronos:
     conn.transport = newConn.transport
@@ -81,7 +79,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.secretKey = newConn.secretKey
   conn.serverParams = newConn.serverParams
   conn.txStatus = newConn.txStatus
-  conn.state = csReady
+  conn.markReady()
   conn.createdAt = newConn.createdAt
 
   when hasChronos:
@@ -102,7 +100,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
     # connect() succeeded but re-LISTEN failed: close the fresh transport so the
     # failed reconnect never leaks it (notifyListenDeath only sets csClosed).
     await conn.closeTransport()
-    conn.state = csClosed
+    conn.markClosed()
     raise e
 
 # Background pump and start/stop
@@ -132,18 +130,15 @@ proc newListenDeathError(
     newListenError(err.msg, err.reconnectionAttempted, transportAlive)
 
 proc notifyListenDeath(
-    conn: PgConnection,
-    msg: string,
-    reconnectionAttempted: bool,
-    markClosed: bool = true,
+    conn: PgConnection, msg: string, reconnectionAttempted: bool, retire: bool = true
 ) {.raises: [].} =
-  ## Pump died permanently; notify pull/push APIs. ``markClosed=false`` = listen side only.
-  # `markClosed = false` is exactly the case where the transport survived, so
+  ## Pump died permanently; notify pull/push APIs. ``retire=false`` = listen side only.
+  # `retire = false` is exactly the case where the transport survived, so
   # it is what tells a reconnect loop this failure is not its to act on.
-  let transportAlive = not markClosed
+  let transportAlive = not retire
   conn.listenError = newListenError(msg, reconnectionAttempted, transportAlive)
-  if markClosed:
-    conn.state = csClosed
+  if retire:
+    conn.markClosed()
   # Built fresh, never the stored ref: `checkListenAlive` re-raises that object
   # on every later call, so sharing it would accumulate stack traces.
   conn.failNotifyWaiter(newListenDeathError(conn.listenError, transportAlive))
@@ -199,7 +194,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
             if conn.listenStopRequested:
               # Stop won race: keep csReady, skip reconnect callback.
               return
-            conn.state = csListening
+            conn.markState(csListening)
             reconnected = true
             if conn.reconnectCallback != nil:
               conn.reconnectCallback()
@@ -210,7 +205,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
             backoff = min(backoff * 2, maxBackoff)
           inc attempt
         if conn.listenStopRequested:
-          conn.state = csClosed
+          conn.markClosed()
           return
         if not reconnected:
           conn.notifyListenDeath(
@@ -228,11 +223,11 @@ proc startListening*(conn: PgConnection) =
   # a live task would put a second, unreachable pump on the same socket.
   if conn.listenTask != nil and not conn.listenTask.finished:
     return
-  # Clear stale ``listenError`` (e.g. ``markClosed=false`` death) now that pump is live.
+  # Clear stale ``listenError`` (e.g. ``retire=false`` death) now that pump is live.
   conn.listenError = nil
   conn.listenStopRequested = false
   conn.listenReconnecting = false
-  conn.state = csListening
+  conn.markState(csListening)
   conn.listenTask = conn.listenPump()
 
 proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
@@ -254,7 +249,7 @@ proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
         stopped = true
     else:
       await cancelAndWait(conn.listenTask)
-  conn.state = csClosed
+  conn.markClosed()
   return stopped
 
 template releaseNotifyWaiter(conn: PgConnection, keepWaiter: bool) =
@@ -275,7 +270,7 @@ template abortAndFailWaiter(
   else:
     if not (await conn.abortListenTask()):
       preserveStopFlag = true
-  conn.state = csClosed
+  conn.markClosed()
   conn.listenTask = nil
   conn.releaseNotifyWaiter(keepWaiter)
 
@@ -286,7 +281,7 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
   if conn.listenTask == nil or conn.listenTask.finished:
     conn.listenTask = nil
     if conn.state == csListening:
-      conn.state = csReady
+      conn.markReady()
     # csClosed + flag set = orphan pump inside reconnectInPlace; keep the flag.
     if conn.state != csClosed:
       conn.listenStopRequested = false
@@ -323,7 +318,7 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
         # task keeps a follow-up close()/stopListening() from waiting another
         # full window on the detached orphan.
         preserveStopFlag = true
-        conn.state = csClosed
+        conn.markClosed()
         conn.listenTask = nil
         conn.releaseNotifyWaiter(keepWaiter)
         raise newException(
@@ -339,7 +334,7 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
       return
     # Normal path: pump parked in the recv loop. Signal exit by changing state,
     # then send an empty query to unblock the read.
-    conn.state = csBusy
+    conn.markBusy()
     try:
       await conn.sendMsg(encodeQuery(""))
       await conn.listenTask
@@ -355,7 +350,7 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
     conn.listenTask = nil
     # Preserve csClosed if pump detected a connection error
     if conn.state != csClosed:
-      conn.state = csReady
+      conn.markReady()
     conn.releaseNotifyWaiter(keepWaiter)
   finally:
     if not preserveStopFlag:
@@ -398,12 +393,12 @@ proc restartPumpOrFailWaiter(conn: PgConnection, restarted: bool) =
     conn.startListening()
   else:
     # `csBusy` with no round trip of ours in flight: the state is a concurrent
-    # operation's, so forcing `csClosed` would kill its live work. `markClosed =
+    # operation's, so forcing `csClosed` would kill its live work. `retire =
     # false` also marks the error `transportAlive` (see `newListenDeathError`).
     conn.notifyListenDeath(
       "Listen pump stopped: LISTEN/UNLISTEN left the connection busy",
       reconnectionAttempted = false,
-      markClosed = false,
+      retire = false,
     )
 
 proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =

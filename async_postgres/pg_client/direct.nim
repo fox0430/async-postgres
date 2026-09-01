@@ -24,7 +24,7 @@ proc queryDirectRunImpl*(
   ## a closure allocation (mirrors the ``queryImpl`` / ``query*`` split in
   ## ``query.nim``).
   result = QueryResult()
-  await conn.sendBufMsg()
+  await conn.sendStagedBufMsg()
   var cf = cachedFields
   queryRecvLoop(
     conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cf, colFmts, colOids,
@@ -331,9 +331,9 @@ proc makeDirectPreflight(
     sqlSym: NimNode, argSyms: seq[NimNode], rfLenNode: NimNode
 ): NimNode =
   ## Emit the Parse/Bind size pre-flight for a direct call, hoisted ahead of
-  ## the send dispatch: `addParseDirect`/`addBindDirect` only check once the
-  ## dispatch has drained `pendingStmtCloses` into the buffer a rejection
-  ## discards. Best-effort, and allocation-free via `paramValueLenBound`.
+  ## the send dispatch: `addParseDirect`/`addBindDirect` only check while they
+  ## encode, by which point the buffer is half built. Best-effort, and
+  ## allocation-free via `paramValueLenBound`.
   let payloadSym = genSym(nskVar, "preflightPayload")
   let nParams = newLit(argSyms.len)
   result = newStmtList()
@@ -402,8 +402,6 @@ proc buildDirectSendDispatch(
   let hitBlock = newStmtList()
   hitBlock.add quote do:
     `stmtNameSym` = `cachedSym`.name
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
   if not isExec:
     hitBlock.add quote do:
       `cachedFieldsSym` = `cachedSym`.fields
@@ -422,11 +420,7 @@ proc buildDirectSendDispatch(
   missBlock.add quote do:
     `cacheMissSym` = true
     `stmtNameSym` = `connSym`.nextStmtName()
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-    if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
-      let evicted = `connSym`.evictStmtCache()
-      `connSym`.sendBuf.addClose(dkStatement, evicted.name)
+    `connSym`.evictForInsert()
   if not isExec:
     missBlock.add quote do:
       `effectiveRfSym` = @[]
@@ -442,9 +436,6 @@ proc buildDirectSendDispatch(
 
   # No-cache path
   let elseBlock = newStmtList()
-  elseBlock.add quote do:
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
   if not isExec:
     elseBlock.add quote do:
       `effectiveRfSym` = @[]
@@ -459,8 +450,8 @@ proc buildDirectSendDispatch(
     `connSym`.sendBuf.addExecute("", 0)
     `connSym`.sendBuf.addSync()
 
-  result = newNimNode(nnkIfStmt)
-  result.add(
+  let dispatch = newNimNode(nnkIfStmt)
+  dispatch.add(
     newNimNode(nnkElifBranch).add(
       quote do:
         `cacheHitSym`,
@@ -468,9 +459,15 @@ proc buildDirectSendDispatch(
     )
   )
   let missCondition = quote:
-    `connSym`.stmtCacheCapacity > 0
-  result.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
-  result.add(newNimNode(nnkElse).add(elseBlock))
+    `connSym`.stmtCachingEnabled
+  dispatch.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
+  dispatch.add(newNimNode(nnkElse).add(elseBlock))
+  # One owner for the buffer reset: the three arms differ in what they emit,
+  # not in needing an emptied buffer with the queued Closes staged in.
+  result = newStmtList()
+  result.add quote do:
+    `connSym`.beginSendBuf()
+  result.add dispatch
 
 proc extractTimeoutArg(
     args: NimNode
@@ -570,8 +567,9 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     colOidsSym = colOidsSym,
   )
 
+  let markBusySym = bindSym"markBusy"
   result.add quote do:
-    `connSym`.state = csBusy
+    `markBusySym`(`connSym`)
     queryDirectImpl(
       `connSym`, `sqlSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`, `cacheHitSym`,
       `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, `timeoutSym`,
@@ -583,7 +581,7 @@ proc execDirectRunImpl*(
   ## Inner send + receive loop for execDirect. Returns the command tag and
   ## handles error reporting / cache bookkeeping. Split out so the outer
   ## Impl can apply ``.wait(timeout)`` without an extra closure alloc.
-  await conn.sendBufMsg()
+  await conn.sendStagedBufMsg()
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
   return commandTag
@@ -688,8 +686,9 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     colOidsSym = newEmptyNode(),
   )
 
+  let markBusySym = bindSym"markBusy"
   result.add quote do:
-    `connSym`.state = csBusy
+    `markBusySym`(`connSym`)
     execDirectImpl(
       `connSym`, `sqlSym`, `cacheHitSym`, `cacheMissSym`, `stmtNameSym`, `timeoutSym`
     )

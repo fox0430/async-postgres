@@ -54,8 +54,8 @@ proc queryImpl*(
     bindStep =
       conn.sendBuf.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -101,8 +101,8 @@ proc queryImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -149,8 +149,8 @@ proc queryEachImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var rowCount: int64 = 0
   queryEachRecvLoop(
@@ -267,8 +267,8 @@ proc queryInlineImpl*(
       "", stmtName, paramFormats, data, ranges, effectiveResultFormats
     ),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(

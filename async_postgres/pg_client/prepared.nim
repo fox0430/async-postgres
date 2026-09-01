@@ -40,7 +40,7 @@ proc prepareImpl*(
   batch.addParse(name, sql)
   batch.addDescribe(dkStatement, name)
   batch.addSync()
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(batch)
 
   var stmt = PreparedStatement(conn: conn, name: name, sql: sql)
@@ -66,7 +66,8 @@ proc prepare*(
     conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
 ): Future[PreparedStatement] {.async.} =
   ## Prepare a named statement, returning metadata.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var stmt: PreparedStatement
   withConnTracing(
     conn,
@@ -100,20 +101,18 @@ proc executeImpl*(
           needsCoercion = true
         coerced[i] = coerceBinaryParam(params[i], stmt.paramOids[i])
 
-  # After coercion, which can change a value's encoded length.
-  validateTypedParams(
-    if needsCoercion: coerced else: params, resultFormats.len, stmt.name.len
-  )
+  # After coercion, which can change a value's encoded length. A cursor, so the
+  # common path binds `params` rather than copying every parameter's payload:
+  # both operands outlive it, and its readers take `openArray`.
+  let effective {.cursor.} = if needsCoercion: coerced else: params
+  validateTypedParams(effective, resultFormats.len, stmt.name.len)
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  conn.sendBuf.addBind(
-    "", stmt.name, if needsCoercion: coerced else: params, resultFormats
-  )
+  conn.beginSendBuf()
+  conn.sendBuf.addBind("", stmt.name, effective, resultFormats)
   conn.sendBuf.addExecute("", 0)
   conn.sendBuf.addSync()
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult(fields: stmt.fields)
   if resultFormats.len > 0:
@@ -183,7 +182,7 @@ proc closeImpl*(stmt: PreparedStatement): Future[void] {.async.} =
   var batch = newSeqOfCap[byte](stmt.name.len + 16)
   batch.addClose(dkStatement, stmt.name)
   batch.addSync()
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(batch)
 
   conn.pumpUntilReady:
@@ -197,7 +196,8 @@ proc close*(
     stmt: PreparedStatement, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Close a prepared statement.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   awaitVoidOrInvalidate(
     stmt.conn, closeImpl(stmt), timeout, "Statement close timed out"
   )

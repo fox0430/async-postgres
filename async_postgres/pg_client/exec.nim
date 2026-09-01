@@ -36,8 +36,8 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBind("", stmtName, paramFormats, params),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
@@ -65,8 +65,8 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
@@ -128,8 +128,8 @@ proc execInlineImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)

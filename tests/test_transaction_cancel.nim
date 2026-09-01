@@ -10,6 +10,9 @@ when hasChronos:
 
   import ../async_postgres/[pg_protocol, pg_connection, pg_client]
   import ../async_postgres/pg_pool {.all.}
+  # Not on `pg_connection`'s re-export whitelist: the cancel-path invalidation
+  # is reached by the macros through `bindSym`, never by name from user code.
+  from ../async_postgres/pg_connection/simple_query import invalidateOnCancel
 
   import mock_pg_server
 
@@ -432,5 +435,93 @@ when hasChronos:
         doAssert pool.idle.len == 0, "half-reset conn must not return to idle"
 
         await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+  suite "invalidation is idempotent across nested cancel frames":
+    proc startCancelCounter(counter: ref int): Future[StreamServer] {.async.} =
+      ## Accepts CancelRequest dials and counts them. `cancel` opens one socket
+      ## per dispatch, so the socket count is the dispatch count.
+      let server = createStreamServer(initTAddress("127.0.0.1", 0))
+
+      proc acceptLoop() {.async.} =
+        while true:
+          try:
+            let t = await server.accept()
+            counter[].inc
+            await t.closeWait()
+          except CatchableError:
+            break
+
+      asyncSpawn acceptLoop()
+      return server
+
+    test "a cancel that never reached the wire keeps the connection":
+      # `awaitOrInvalidate` wraps the whole operation, so a cancellation can
+      # land after the connection was taken busy but before its first write.
+      # Nothing is outstanding on the server and the stream is untouched, so
+      # retiring the connection would throw away a healthy one -- which for a
+      # pooled conn under a cancelled `race` means throwing away the pool.
+      proc t() {.async.} =
+        var counter = new(int)
+        let cancelServer = await startCancelCounter(counter)
+        let (conn, server, sTx) = await makeScriptedConn()
+        conn.host = "127.0.0.1"
+        conn.port = int(cancelServer.localAddress().port)
+
+        conn.state = csBusy
+        conn.invalidateOnCancel()
+
+        doAssert conn.state == csReady,
+          "a cancel with nothing on the wire must hand the conn back; got " & $conn.state
+        await sleepAsync(milliseconds(200))
+        doAssert counter[] == 0,
+          "nothing was sent, so there is nothing to cancel; got " & $counter[]
+
+        await cleanupScripted(server, sTx)
+        cancelServer.stop()
+        cancelServer.close()
+        await cancelServer.join()
+
+      waitFor t()
+
+    test "an expired deadline dispatches exactly one CancelRequest":
+      # The deadline cancels the inner frame and times out the outer one, so
+      # both `invalidateOnCancel` and `invalidateOnTimeout` run for a single
+      # dead round trip. Without a shared guard each dialled its own socket.
+      proc t() {.async.} =
+        var counter = new(int)
+        let cancelServer = await startCancelCounter(counter)
+        let (conn, server, sTx) = await makeScriptedConn()
+        conn.host = "127.0.0.1"
+        conn.port = int(cancelServer.localAddress().port)
+        await preBufferBeginReply(sTx)
+
+        proc runTx() {.async.} =
+          conn.withTransactionDeadline(milliseconds(100)):
+            discard await conn.simpleExec("SELECT 1")
+
+        var errName = "<none>"
+        try:
+          await runTx()
+        except PgTimeoutError:
+          errName = "PgTimeoutError"
+        except CatchableError as e:
+          errName = $e.name
+
+        doAssert errName == "PgTimeoutError",
+          "expired deadline must surface as PgTimeoutError; got " & errName
+        doAssert conn.state == csClosed,
+          "the dead round trip must retire the conn; got " & $conn.state
+
+        # `cancelNoWait` is fire-and-forget: let every dispatch land before
+        # counting, so a regression shows up as 2 rather than a flake.
+        await sleepAsync(milliseconds(300))
+        doAssert counter[] == 1, "expected exactly one CancelRequest, got " & $counter[]
+
+        await cleanupScripted(server, sTx)
+        cancelServer.stop()
+        cancelServer.close()
+        await cancelServer.join()
 
       waitFor t()

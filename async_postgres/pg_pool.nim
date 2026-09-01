@@ -364,15 +364,15 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
     # synchronously so the subsequent release() routes to releaseCore's discard
     # path. The actual socket close is performed by releaseCore's closeNoWait;
     # calling it here as well would double-count metrics.
-    conn.state = csClosed
+    conn.markClosed()
     raise e
   except CatchableError:
     # Defer close to releaseCore's closeNoWait to avoid double-counting metrics.
-    conn.state = csClosed
+    conn.markClosed()
   except Defect as d:
     # Incomplete reset: mark csClosed so the conn is discarded, then re-raise
     # wrapped (a raw Defect cannot cross a chronos async boundary).
-    conn.state = csClosed
+    conn.markClosed()
     raise newPoolError(pekDefectWrapped, d.msg, d)
 
 proc computeConnectBackoff*(initial, maxDelay: Duration, failures: int): Duration =
@@ -741,10 +741,10 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## connection is handed directly to the next waiter.
   ##
   ## Discard criteria (`conn.state != csReady`):
-  ## - A timed-out request reaches us via `invalidateOnTimeout` with
-  ##   `state = csClosed`. Under asyncdispatch this is load-bearing: the
-  ##   inner future is still alive and may write to the socket, so the
-  ##   connection MUST be retired from the pool.
+  ## - A timed-out request reaches us via `invalidateOnTimeout`, normally with
+  ##   `state = csClosed`. Load-bearing under asyncdispatch: the inner future is
+  ##   still alive and may write to the socket. It stays `csReady` only when the
+  ##   wire had settled, which is exactly when reuse is safe.
   ## - Any listening/replication/COPY state is also not reusable.
   ## Transaction-in-progress (`txStatus != tsIdle`) is treated as failure
   ## to reset the session, so the connection is closed rather than leaking
@@ -1590,10 +1590,9 @@ proc dispatchHomogeneous(
 
   # Execute each connection's batch in parallel
   var batchFuts: seq[Future[void]]
+  # No empty-batch arm: `conns.len <= nConns <= ops.len`, so the round-robin
+  # above put at least one op in every residue class.
   for ci in 0 ..< conns.len:
-    if connOps[ci].len == 0:
-      await pool.resetSessionAndRelease(conns[ci])
-      continue
     batchFuts.add(executeBatch(pool, conns[ci], connOps[ci]))
 
   await allFutures(batchFuts)
@@ -2093,9 +2092,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let bodyErrSym = genSym(nskVar, "bodyErr")
   let bodyDefectSym = genSym(nskVar, "bodyDefect")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
-  let csReadySym = bindSym"csReady"
-  let csClosedSym = bindSym"csClosed"
-  let cancelNoWaitSym = bindSym"cancelNoWait"
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
   let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
   let releaseCall = quote:
     `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
@@ -2116,9 +2113,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         # abort server-side via CancelRequest and mark csClosed so the server
         # tx does not linger holding locks and the conn is discarded by
         # release() instead of silently reused.
-        if `connIdent`.state notin {`csReadySym`, `csClosedSym`}:
-          `cancelNoWaitSym`(`connIdent`)
-          `connIdent`.state = `csClosedSym`
+        `invalidateCancelSym`(`connIdent`, releaseTransport = false)
         raise `cancelSym`
       except CatchableError as `eSym`:
         `bodyCleanup`
@@ -2238,9 +2233,13 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## body future is cancelled: a connection with a request in flight is
   ## invalidated (server-side CancelRequest, dropped on release), while one
   ## that unwinds cleanly (grace ROLLBACK succeeded) returns to the pool
-  ## healthy. Under asyncdispatch the still-running body keeps the connection;
-  ## it is invalidated via `invalidateOnTimeout` and dropped on its eventual
-  ## release. If the timeout fires while still waiting for `acquire()`, the
+  ## healthy. The grace ROLLBACK only runs in that second shape — the deadline
+  ## expiring between statements; a cancellation inside a statement is caught
+  ## there and invalidates the connection, so the cleanup skips it. Under
+  ## asyncdispatch the still-running body keeps the connection, which is retired
+  ## `csClosed` without a ROLLBACK and dropped on its eventual release. Whenever
+  ## ROLLBACK is skipped, dropping the connection is what ends the server-side
+  ## transaction. If the timeout fires while still waiting for `acquire()`, the
   ## waiter remains queued (cancelled best-effort) until the underlying
   ## acquire future settles; this is unavoidable under asyncdispatch.
   ##
@@ -2302,14 +2301,12 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let bodyDefectSym = genSym(nskVar, "bodyDefect")
   let releaseErrSym = genSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
-  let csReadySym = bindSym"csReady"
-  let csClosedSym = bindSym"csClosed"
-  let cancelNoWaitSym = bindSym"cancelNoWait"
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
-  let invalidateSym = bindSym"invalidateOnTimeout"
+  let retireSym = bindSym"retireOnTimeout"
   let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
 
   # asyncdispatch-safe release (see `buildReleaseAndReraise`): `releasedSym`
@@ -2346,9 +2343,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
       except CancelledError as `cancelledSym`:
         # Cancelled mid-request (chronos deadline): abort it server-side and
         # mark csClosed so release() discards the conn instead of reusing it.
-        if `connIdent`.state notin {`csReadySym`, `csClosedSym`}:
-          `cancelNoWaitSym`(`connIdent`)
-          `connIdent`.state = `csClosedSym`
+        `invalidateCancelSym`(`connIdent`, releaseTransport = false)
         `bodyErrSym` = `cancelledSym`
       except CatchableError as `eSym`:
         `bodyErrSym` = `eSym`
@@ -2406,9 +2401,11 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
         # invalidated here.
         raise newException(PgTimeoutError, "withTransactionDeadline (pool) exceeded")
       else:
-        # asyncdispatch: bodyFn still owns the conn; invalidateOnTimeout marks
-        # it csClosed (and raises PgTimeoutError) so release() will discard it.
-        `connOptSym`.get.`invalidateSym`("withTransactionDeadline (pool) exceeded")
+        # asyncdispatch: bodyFn still owns the conn and cannot be cancelled, so
+        # retirement is owed to that ownership rather than to the wire.
+        # `retireOnTimeout` marks it csClosed unconditionally, so release()
+        # discards it and the orphan cannot commit a timed-out transaction.
+        `retireSym`(`connOptSym`.get, "withTransactionDeadline (pool) exceeded")
 
 macro withTransactionRetryDeadline*(
     pool: PgPool, retryOpts: RetryOptions, args: varargs[untyped]
@@ -2478,16 +2475,17 @@ macro withTransactionRetryDeadline*(
   let bodyDefectSym = genSym(nskVar, "bodyDefect")
   let releaseErrSym = genSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
-  let csReadySym = bindSym"csReady"
-  let csClosedSym = bindSym"csClosed"
-  let cancelNoWaitSym = bindSym"cancelNoWait"
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
-  let invalidateSym = bindSym"invalidateOnTimeout"
+  let retireSym = bindSym"retireOnTimeout"
   # The pool variant acquires a fresh connection per attempt, so its cleanup
   # (ROLLBACK + release) happens inside bodyFn; the outer loop adds no cleanup
   # and omits the conn-state retry gate (connForStateCheck = nil).
   # See withTransactionDeadline for the released/isNone branch rationale.
+  # Both timeout branches are the same here: `releasedSym` already says whether
+  # the body unwound and released, and a body that did not is retired whatever
+  # the wire looks like.
   let timeoutElse = quote:
     if `connOptSym`.isNone:
       raise newException(
@@ -2496,13 +2494,14 @@ macro withTransactionRetryDeadline*(
     elif `releasedSym`:
       raise newException(PgTimeoutError, "withTransactionRetryDeadline (pool) exceeded")
     else:
-      `connOptSym`.get.`invalidateSym`("withTransactionRetryDeadline (pool) exceeded")
+      `retireSym`(`connOptSym`.get, "withTransactionRetryDeadline (pool) exceeded")
   let loop = buildRetryDeadlineLoop(
     bodyFnSym,
     retryOptsSym,
     deadlineMomentSym,
     connForStateCheck = nil,
-    timeoutElse = timeoutElse,
+    timeoutStillRunning = timeoutElse,
+    timeoutUnwound = timeoutElse.copyNimTree(),
     catchableCleanup = newStmtList(),
   )
   let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
@@ -2542,9 +2541,7 @@ macro withTransactionRetryDeadline*(
       except CancelledError as `cancelledSym`:
         # Cancelled mid-request (chronos deadline): abort it server-side and
         # mark csClosed so release() discards the conn instead of reusing it.
-        if `connIdent`.state notin {`csReadySym`, `csClosedSym`}:
-          `cancelNoWaitSym`(`connIdent`)
-          `connIdent`.state = `csClosedSym`
+        `invalidateCancelSym`(`connIdent`, releaseTransport = false)
         `bodyErrSym` = `cancelledSym`
       except CatchableError as `eSym`:
         `bodyErrSym` = `eSym`

@@ -9,6 +9,9 @@ import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/[buffer_io, simple_query, lifecycle]
 import ../async_postgres/pg_connection/types
 
+import std/importutils
+privateAccess(PgConnection)
+
 const
   PgHost = "127.0.0.1"
   PgPort = 15432
@@ -1062,7 +1065,9 @@ suite "Tracing: transport close errors":
     # clause, new stage without a fire call, new closeWait without wiring).
     # This test reads the source and asserts the invariants mechanically.
     const src = staticRead("../async_postgres/pg_connection/buffer_io.nim")
-    let body = src.split("proc closeTransport*(")[1].split("\nproc ")[0]
+    # `closeTransportImpl`, not the re-entrant `closeTransport` wrapper that
+    # only joins an in-flight teardown.
+    let body = src.split("proc closeTransportImpl(")[1].split("\nproc ")[0]
 
     for stage in [
       "tcsTlsReader", "tcsTlsWriter", "tcsBaseReader", "tcsBaseWriter", "tcsTransport"

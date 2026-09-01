@@ -273,8 +273,8 @@ proc validateEncodedParams*(
     portalLen: int = 0,
 ) =
   ## `validateTypedParams` for the already-encoded `seq[Option[seq[byte]]]` path.
-  ## Runs before the send templates drain `pendingStmtCloses` into `sendBuf`,
-  ## which a later rejection would discard.
+  ## Runs before the send templates start filling `sendBuf`, so a call this
+  ## rejects fails without having touched the connection.
   if paramFormatsLen < 0 or paramFormatsLen > maxInt16Count:
     raise newException(
       PgTypeError,
@@ -445,9 +445,9 @@ template sendExtendedQuery*(
     parseStep, bindStep: untyped,
 ) =
   ## Emit Parse/Bind/Describe/Execute/Sync sequence (cache hit/miss/disabled).
-  ## Precondition: ``cached`` may be nil iff ``cacheHit == false``.
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
+  ## Precondition: ``cached`` may be nil iff ``cacheHit == false``; the
+  ## cache-miss and cache-disabled branches never read it.
+  conn.beginSendBuf()
   if cacheHit:
     stmtName = cached.name
     cachedFields = cached.fields
@@ -463,13 +463,11 @@ template sendExtendedQuery*(
     bindStep
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()
-  elif conn.stmtCacheCapacity > 0:
+  elif conn.stmtCachingEnabled:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     effectiveResultFormats = resultFormats
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.evictForInsert()
     parseStep
     conn.sendBuf.addDescribe(dkStatement, stmtName)
     bindStep
@@ -493,19 +491,16 @@ template sendExtendedExec*(
 ) =
   ## ``exec`` variant of ``sendExtendedQuery`` (no per-column format tracking).
   ## Precondition: ``cached`` may be nil iff ``cacheHit == false``.
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
+  conn.beginSendBuf()
   if cacheHit:
     stmtName = cached.name
     bindStep
     conn.sendBuf.addExecute("", 0)
     conn.sendBuf.addSync()
-  elif conn.stmtCacheCapacity > 0:
+  elif conn.stmtCachingEnabled:
     cacheMiss = true
     stmtName = conn.nextStmtName()
-    if conn.stmtCache.len >= conn.stmtCacheCapacity:
-      let evicted = conn.evictStmtCache()
-      conn.sendBuf.addClose(dkStatement, evicted.name)
+    conn.evictForInsert()
     parseStep
     conn.sendBuf.addDescribe(dkStatement, stmtName)
     bindStep

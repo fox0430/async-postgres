@@ -23,6 +23,7 @@
 import std/[deques, monotimes, unittest, sets, strutils]
 
 import ../async_postgres/async_backend
+import ../async_postgres/pg_protocol
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/simple_query
@@ -1967,6 +1968,166 @@ suite "LISTEN/UNLISTEN recovery on a connection that is alive but busy":
     check not latchedTransportAlive
     check waiterOutcome == 2
 
+  test "a cancelled round trip marks the connection closed at the source":
+    ## The state a cancellation leaves belongs to the frame that was driving the
+    ## wire, not to whoever notices later: `csBusy` with an undrained reply made
+    ## every later call fail `checkReady` with a `PgStateError` no reconnect
+    ## loop acts on.
+    let conn = PgConnection(
+      state: csBusy,
+      pendingSyncs: 1,
+      notifyQueue: initDeque[Notification](),
+      config: ConnConfig(),
+    )
+    conn.invalidateOnCancel()
+    check conn.state == csClosed
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "a cancelled round trip that never reached the wire keeps the connection":
+    ## The mirror of the case above, and the reason the two are told apart by
+    ## `pendingSyncs` rather than by `csBusy`: the backend owes nothing, so
+    ## there is no undrained reply and nothing for a later call to trip over.
+    ## Retiring here would discard a healthy connection every time a `race` or a
+    ## service shutdown cancels an operation before its first write.
+    let conn = PgConnection(
+      state: csBusy, notifyQueue: initDeque[Notification](), config: ConnConfig()
+    )
+    conn.invalidateOnCancel()
+    check conn.state == csReady
+    conn.checkReady()
+
+  test "a cancelled round trip releases the transport, not just the state":
+    ## The caller is told the connection is dead, and nothing else necessarily
+    ## closes it.
+    var connectedAfter = true
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc: MockClient
+
+      proc serverHandler() {.async.} =
+        sc = await acceptAndReady(ms)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      doAssert conn.isConnected(), "precondition: the transport must be live"
+      # As a cancel inside `simpleQuery` leaves it: taken busy, request sent,
+      # reply never drained.
+      conn.state = csBusy
+      conn.pendingSyncs = 1
+      conn.invalidateOnCancel()
+      # The close is fire-and-forget, but `closeTransport` is re-entrant by
+      # *awaiting* the in-flight teardown, so this is a join, not a poll.
+      await conn.closeTransport()
+      connectedAfter = conn.isConnected()
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      if not sc.isNil:
+        try:
+          await closeClient(sc)
+        except CatchableError:
+          discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check not connectedAfter
+
+  when hasChronos:
+    test "the base writer is closed even without a base reader beside it":
+      ## The two stream handles are independently nullable, and the teardown
+      ## closes each on its own: nesting the writer's close under the reader's
+      ## would leak the writer's fd and skip its `tcsBaseWriter` report.
+      var writerClosed = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        var sc: MockClient
+
+        proc serverHandler() {.async.} =
+          sc = await acceptAndReady(ms)
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+        let writer = conn.baseWriter
+        doAssert writer != nil and not writer.closed()
+        # A connection holding a writer with no reader beside it.
+        conn.baseReader = nil
+        conn.reader = nil
+        await conn.closeTransport()
+        writerClosed = writer.closed()
+
+        try:
+          await serverFut.wait(seconds(5))
+        except CatchableError:
+          discard
+        if not sc.isNil:
+          try:
+            await closeClient(sc)
+          except CatchableError:
+            discard
+        await closeServer(ms)
+
+      waitFor testBody()
+      check writerClosed
+
+  test "only a sync point of its own settles a Flush-terminated batch":
+    ## A cursor writes its Execute batch terminated by Flush, so no
+    ## ReadyForQuery is coming for it. A reply owed for an *earlier* sync point
+    ## must not be mistaken for one: it was sent for what came before the
+    ## batch, and clearing the wire on it hands the next borrower a connection
+    ## with the cursor's rows still in the stream. The Sync the cursor sends
+    ## when it is exhausted or closed is the one that does settle it.
+    var afterFlush = true
+    var afterEarlierReply = true
+    var afterOwnSync = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc: MockClient
+
+      proc serverHandler() {.async.} =
+        sc = await acceptAndReady(ms)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.state = csBusy
+      # An op whose reply is still owed, then the cursor's Flush batch behind it.
+      await conn.sendMsg(encodeSync())
+      var batch: seq[byte]
+      batch.addExecute("_cursor_1", 5)
+      batch.addFlush()
+      await conn.sendMsg(batch)
+      afterFlush = conn.wireSettled
+
+      await sendBytes(sc, buildReadyForQuery('I'))
+      discard await conn.recvMessage()
+      afterEarlierReply = conn.wireSettled
+
+      await conn.sendMsg(encodeSync())
+      await sendBytes(sc, buildReadyForQuery('I'))
+      discard await conn.recvMessage()
+      afterOwnSync = conn.wireSettled
+
+      try:
+        await closeClient(sc)
+      except CatchableError:
+        discard
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      await closeServer(ms)
+      await conn.closeTransport()
+
+    waitFor testBody()
+    check not afterFlush
+    check not afterEarlierReply
+    check afterOwnSync
+
   test "a connection that dies after the busy death reports it as a failure":
     # `transportAlive` is latched at pump death; once the transport is lost later,
     # reconnecting is the recovery again and PgConnectionError must come back.
@@ -2032,7 +2193,7 @@ suite "LISTEN/UNLISTEN recovery on a connection that is alive but busy":
     check not waiterTransportAlive
 
 suite "A restarted listen pump clears the recorded death":
-  ## Regression: `listenError` was latched forever. A `markClosed = false`
+  ## Regression: `listenError` was latched forever. A `retire = false`
   ## death leaves the transport alive, so a later `listen()` legitimately
   ## restarts the pump — but `checkListenAlive` kept re-raising the stale error,
   ## killing `waitNotification` for the rest of a connection whose push API was
@@ -2057,7 +2218,7 @@ suite "A restarted listen pump clears the recorded death":
       # A pump death on a connection that never lost its transport — exactly
       # what `restartPumpOrFailWaiter` records for a busy live connection.
       conn.notifyListenDeath(
-        "stale pump death", reconnectionAttempted = false, markClosed = false
+        "stale pump death", reconnectionAttempted = false, retire = false
       )
       doAssert conn.listenError != nil, "precondition: a death must be recorded"
 

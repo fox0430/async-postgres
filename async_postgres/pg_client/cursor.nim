@@ -55,14 +55,14 @@ proc openCursorImpl(
   let portalName = "_cursor_" & $conn.portalCounter
 
   var batch = newSeqOfCap[byte](sql.len + 128)
-  conn.flushPendingStmtCloses(batch)
+  conn.stagePendingStmtCloses(batch)
   batch.addParse("", sql, paramOids)
   batch.addBind(portalName, "", formats, params, resultFormats)
   batch.addDescribe(dkPortal, portalName)
   batch.addExecute(portalName, chunkSize)
   batch.addFlush()
-  conn.state = csBusy
-  await conn.sendMsg(batch)
+  conn.markBusy()
+  await conn.sendStagedMsg(batch)
 
   var cursor =
     Cursor(conn: conn, portalName: portalName, chunkSize: chunkSize, exhausted: false)
@@ -115,7 +115,7 @@ proc openCursorImpl(
                 of bmkReadyForQuery:
                   conn.txStatus = rmsg.txStatus
                   if conn.state != csClosed:
-                    conn.state = csReady
+                    conn.markReady()
                   break drainLoop
                 else:
                   discard
@@ -131,7 +131,7 @@ proc openCursorImpl(
                 if ropt.get.kind == bmkReadyForQuery:
                   conn.txStatus = ropt.get.txStatus
                   if conn.state != csClosed:
-                    conn.state = csReady
+                    conn.markReady()
                   break errDrain
               await conn.fillRecvBuf()
           raise queryError
@@ -148,11 +148,10 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   rd.fields = cursor.fields
   var rowCount: int32 = 0
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
+  conn.beginSendBuf()
   conn.sendBuf.addExecute(cursor.portalName, cursor.chunkSize)
   conn.sendBuf.addFlush()
-  await conn.sendBufMsg()
+  await conn.sendStagedBufMsg()
 
   block recvLoop:
     while true:
@@ -178,7 +177,7 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
                 of bmkReadyForQuery:
                   conn.txStatus = rmsg.txStatus
                   if conn.state != csClosed:
-                    conn.state = csReady
+                    conn.markReady()
                   break drainLoop
                 else:
                   discard
@@ -193,7 +192,7 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
                 if ropt.get.kind == bmkReadyForQuery:
                   conn.txStatus = ropt.get.txStatus
                   if conn.state != csClosed:
-                    conn.state = csReady
+                    conn.markReady()
                   break errDrain
               await conn.fillRecvBuf()
           # The Sync above aborts the (implicit) transaction holding the portal,
@@ -213,7 +212,8 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
 proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Fetch the next chunk of rows from the cursor.
   ## Returns an empty seq when the cursor is exhausted.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## A closed connection raises ``PgStateError`` after a deliberate ``close()``,
   ## ``PgConnectionError`` after a lost one.
   let conn = cursor.conn
@@ -257,10 +257,10 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
     return
 
   var batch = newSeqOfCap[byte](cursor.portalName.len + 16)
-  conn.flushPendingStmtCloses(batch)
+  conn.stagePendingStmtCloses(batch)
   batch.addClose(dkPortal, cursor.portalName)
   batch.addSync()
-  await conn.sendMsg(batch)
+  await conn.sendStagedMsg(batch)
 
   conn.pumpUntilReady:
     case pumpMsg.kind
@@ -273,7 +273,8 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
 
 proc close*(cursor: Cursor): Future[void] {.async.} =
   ## Close the cursor and return the connection to ready state.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   awaitVoidOrInvalidate(
     cursor.conn, closeCursorImpl(cursor), cursor.timeout, "Cursor close timed out"
   )
@@ -323,7 +324,8 @@ proc openCursor*(
     timeout: Duration = ZeroDuration,
 ): Future[Cursor] {.async.} =
   ## Open a server-side cursor for streaming rows in chunks.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## Raises ``PgStateError`` / ``PgConnectionError`` on a closed connection as
   ## `fetchNext` does.
   let (oids, formats, values) = extractParams(params)

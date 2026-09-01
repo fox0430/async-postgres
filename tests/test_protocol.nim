@@ -2350,3 +2350,236 @@ suite "transport failures fold into the PgError contract":
       isConnFailure = e of PgConnectionError
     check isState
     check not isConnFailure
+
+suite "What a send leaves the backend owing":
+  test "one sync point per simple Query and per Sync, none for the rest":
+    check outstandingReplies(encodeQuery("SELECT 1")) == (1, false)
+    check outstandingReplies(encodeSync()) == (1, false)
+    check outstandingReplies(encodeTerminate()) == (0, false)
+    check outstandingReplies(@[]) == (0, false)
+
+  test "a per-op Sync batch owes one reply per op":
+    ## The reason this is a count and not a flag: the first `ReadyForQuery`
+    ## coming back leaves the other two ops' replies still on the wire.
+    var buf: seq[byte]
+    for i in 0 .. 2:
+      buf.addParse("", "SELECT " & $i)
+      buf.addBind("", "", [], [])
+      buf.addExecute("")
+      buf.addSync()
+    check outstandingReplies(buf) == (3, false)
+
+  test "a single-Sync batch owes one":
+    var buf: seq[byte]
+    buf.addClose(dkStatement, "_sc_1")
+    buf.addParse("_sc_2", "SELECT 1")
+    buf.addBind("", "_sc_2", [], [])
+    buf.addExecute("")
+    buf.addSync()
+    check outstandingReplies(buf) == (1, false)
+
+  test "a batch that stops at Flush owes replies with nothing to end them":
+    ## The shape every cursor round trip writes: the server answers, but no
+    ## `ReadyForQuery` follows, so the stream stays off a boundary until a
+    ## later Sync.
+    var buf: seq[byte]
+    buf.addParse("", "SELECT 1")
+    buf.addBind("_cursor_1", "", [], [])
+    buf.addDescribe(dkPortal, "_cursor_1")
+    buf.addExecute("_cursor_1", 5)
+    buf.addFlush()
+    check outstandingReplies(buf) == (0, true)
+
+  test "requests written past the last Sync stay unsynchronised":
+    var buf: seq[byte]
+    buf.addParse("", "SELECT 1")
+    buf.addSync()
+    buf.addExecute("_cursor_1", 5)
+    buf.addFlush()
+    check outstandingReplies(buf) == (1, true)
+
+  test "a fast-path FunctionCall is a sync point of its own":
+    ## Nothing here writes one, but the walk accepts the tag, and the backend
+    ## answers it with a `ReadyForQuery` like any other round trip.
+    check outstandingReplies(@[byte('F'), 0, 0, 0, 4]) == (1, false)
+
+  test "an authentication reply and a COPY payload end with their exchange":
+    ## Neither opens a round trip of its own: the password messages answer an
+    ## authentication the backend asked for, and CopyData/CopyDone are the
+    ## payload of a COPY the preceding `Query` opened. Counting them as
+    ## unsynchronised would leave every COPY and every replication stream
+    ## looking desynchronised for the rest of the connection's life.
+    var buf = encodeQuery("COPY t FROM STDIN")
+    encodeCopyData(buf, [byte('x')])
+    buf.add(@[byte('c'), 0, 0, 0, 4])
+    check outstandingReplies(buf) == (1, false)
+
+  test "framing it cannot walk counts as one reply":
+    ## The startup packet is untagged and its authentication exchange ends in
+    ## exactly one `ReadyForQuery`, which closes everything it sent; a build
+    ## truncated from the first byte is counted the same way.
+    check outstandingReplies(encodeStartup("u", "d", @[])) == (1, false)
+    check outstandingReplies(@[byte('S'), 0, 0]) == (1, false)
+    var truncated = encodeQuery("SELECT 1")
+    truncated.setLen(truncated.len - 1)
+    check outstandingReplies(truncated) == (1, false)
+
+  test "framing that stops part-way is charged the most its tail could owe":
+    ## What could not be read follows a sync point that has been read, so no
+    ## reply already owed ends it — and it may hold sync points of its own, so
+    ## it is charged the most it could: one per five bytes, the smallest a
+    ## frontend message can be. Overcounting only retires a connection, while
+    ## undercounting leaves a reply on the wire for the next borrower.
+    var buf = encodeSync()
+    buf.add(@[byte('P'), 0, 0])
+    check outstandingReplies(buf) == (2, true)
+
+    ## A longer tail could hide more sync points, and is charged for them.
+    var wide = encodeSync()
+    wide.add(@[byte('P')])
+    wide.add(newSeq[byte](19))
+    check outstandingReplies(wide) == (5, true)
+
+suite "Retiring a connection on the replies it still owes":
+  proc pipelinedConn(pending: int, unsynced = false): PgConnection =
+    PgConnection(
+      state: csBusy,
+      pendingSyncs: pending,
+      unsyncedWrite: unsynced,
+      notifyQueue: initDeque[Notification](),
+      config: ConnConfig(),
+    )
+
+  const readyForQuery = @[byte('Z'), 0, 0, 0, 5, byte('I')]
+
+  test "the first ReadyForQuery of a batch does not release the rest":
+    ## A per-op Sync pipeline is `csBusy` for the whole run, so the reply that
+    ## comes back for op #1 must not make abandoning op #2 look safe: its
+    ## Parse/Bind replies are still on the wire for the next borrower to read
+    ## as its own.
+    let conn = pipelinedConn(2)
+    conn.recvBuf = readyForQuery
+    let msg = conn.nextMessage()
+    check msg.isSome
+    check msg.get.kind == bmkReadyForQuery
+    check conn.pendingSyncs == 1
+    check not conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csClosed
+
+  test "the last ReadyForQuery hands the connection back":
+    let conn = pipelinedConn(1)
+    conn.recvBuf = readyForQuery
+    discard conn.nextMessage()
+    check conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csReady
+
+  test "a settled wire only goes back when the timeout unwound its operation":
+    ## `wait` on asyncdispatch leaves the timed-out operation running against
+    ## the socket, still reading into the shared buffer, so the wire being
+    ## parked on a boundary says nothing about what the next borrower would
+    ## read. Chronos unwinds the operation, so there the settled wire holds.
+    let conn = pipelinedConn(1)
+    conn.recvBuf = readyForQuery
+    discard conn.nextMessage()
+    check conn.wireSettled
+    expect PgTimeoutError:
+      conn.invalidateOnTimeout("timed out")
+    when hasAsyncDispatch:
+      check conn.state == csClosed
+    else:
+      check conn.state == csReady
+
+  test "a Flush-terminated round trip is not settled by its replies":
+    ## An open cursor has no ReadyForQuery coming; only the Sync its `close`
+    ## sends puts the stream back on a boundary.
+    let conn = pipelinedConn(0, unsynced = true)
+    check not conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csClosed
+
+  test "a Sync's reply does not settle a batch written after it":
+    ## The reply comes back for the sync point that preceded the cursor's
+    ## Flush batch, so it cannot have ended that batch's replies. Clearing the
+    ## flag here would hand the next borrower a `csReady` connection with
+    ## someone else's DataRows still in the stream.
+    let conn = pipelinedConn(1, unsynced = true)
+    conn.recvBuf = readyForQuery
+    discard conn.nextMessage()
+    check conn.pendingSyncs == 0
+    check not conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csClosed
+
+  test "a reset forgets what the previous backend owed":
+    ## A round trip that dies after its write leaves replies booked against a
+    ## backend that is about to be replaced. Carried onto the new one they
+    ## would dial a CancelRequest at an unrelated PID and retire a healthy
+    ## connection.
+    let conn = pipelinedConn(2, unsynced = true)
+    conn.recvBuf = readyForQuery
+    conn.sendBuf = encodeSync()
+    conn.resetWireState()
+    check conn.wireSettled
+    check conn.recvBuf.len == 0
+    check conn.recvBufStart == 0
+    check conn.sendBuf.len == 0
+
+when defined(pgStateChecks):
+  suite "What a connection promises the borrower that finds it csReady":
+    proc readyConn(): PgConnection =
+      PgConnection(
+        state: csReady, notifyQueue: initDeque[Notification](), config: ConnConfig()
+      )
+
+    test "a reply still owed cannot be handed to the next borrower":
+      ## `csReady` is the one state that says nobody owns the wire, so the next
+      ## borrower writes to it without asking. Starting an operation with a
+      ## reply outstanding is what leaves that borrower reading someone else's
+      ## rows.
+      let conn = readyConn()
+      conn.pendingSyncs = 1
+      expect AssertionDefect:
+        conn.checkReady()
+
+    test "replies written past the last sync point are not settled either":
+      ## A `Flush`-terminated batch has replies in flight with nothing on the
+      ## wire to end them, so the count reaching zero is only half the question.
+      let conn = readyConn()
+      conn.unsyncedWrite = true
+      expect AssertionDefect:
+        conn.checkReady()
+
+    test "a settled wire starts an operation":
+      let conn = readyConn()
+      conn.checkReady()
+      check conn.wireSettled
+
+    test "handing the connection back is not itself the promise":
+      ## The check belongs to the borrower, not to the frame that let go: a
+      ## frame may leave the wire in a shape it is about to clean up itself,
+      ## and only what survives to the next borrower promises anyone anything.
+      let conn = readyConn()
+      conn.state = csBusy
+      conn.unsyncedWrite = true
+      conn.markReady()
+      check conn.state == csReady
+
+    test "a state with an owner still in scope promises nothing":
+      ## Only `csReady` is checked, and a non-ready connection is rejected for
+      ## being in use before the wire is ever asked about.
+      let conn = readyConn()
+      conn.state = csBusy
+      conn.pendingSyncs = 1
+      expect PgStateError:
+        conn.checkReady()
+
+    test "an aborted build's staged Closes do not stop the next operation":
+      ## A build that stages its queued `Close` messages and then fails leaves
+      ## them staged. They are still owed, and the next build stages them again,
+      ## so this is not something the next borrower has to find cleaned up.
+      let conn = readyConn()
+      conn.stagedStmtCloses = @["_sc_1"]
+      conn.checkReady()
+      check conn.stagedStmtCloses == @["_sc_1"]

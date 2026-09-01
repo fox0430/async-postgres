@@ -6,8 +6,8 @@ when hasChronos:
 
 import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_types/encoding
-import
-  ../async_postgres/pg_connection/[buffer_io, types, simple_query, cache, lifecycle]
+import ../async_postgres/pg_connection/[buffer_io, types, simple_query, lifecycle]
+import ../async_postgres/pg_connection/cache {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_client/pipeline {.all.}
 import ../async_postgres/pg_client/[core, query, exec, direct]
@@ -4384,6 +4384,41 @@ suite "Direct builders agree with their pre-flight length":
     check int64(buf.len - 1) ==
       calcBindMessageLength(0, "s".len, 1, 1, int64(paramValueLen(42'i64)), 0)
     check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "clearStmtCache abandons the staged Closes with the queued ones":
+    # The caller resets the session externally, so neither the queue nor what a
+    # build already took out of it is owed any more.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1", "_sc_2"]
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    check conn.stagedStmtCloses == @["_sc_1", "_sc_2"]
+    conn.clearStmtCache()
+    check conn.stagedStmtCloses.len == 0
+    conn.pendingStmtCloses = @["_sc_9"]
+    conn.dropStagedStmtCloses()
+    check conn.pendingStmtCloses == @["_sc_9"]
+
+  test "an aborted build's staged Closes are staged again by the next one":
+    # Staging moves the names out of the queue, so what makes a failed build
+    # safe is the next build taking them back rather than the queue being left
+    # alone.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    var aborted: seq[byte] = @[]
+    conn.stagePendingStmtCloses(aborted)
+    check conn.pendingStmtCloses.len == 0
+    conn.pendingStmtCloses.add "_sc_2" # queued while the build was in flight
+    var next: seq[byte] = @[]
+    conn.stagePendingStmtCloses(next)
+    check conn.stagedStmtCloses == @["_sc_1", "_sc_2"]
+    var expected = aborted
+    expected.addClose(dkStatement, "_sc_2")
+    check next == expected
+    conn.dropStagedStmtCloses()
+    check conn.stagedStmtCloses.len == 0
+    check conn.pendingStmtCloses.len == 0
+
 suite "An oversized message is an input error, not a connection failure":
   ## The pre-flight is not a second model of the layout: the contract is fixed
   ## in the encoder, where `patchMsgLen`/`patchLen` raise `PgMessageTooLargeError`.
@@ -4483,6 +4518,31 @@ suite "The non-pipelined exec/query path pre-flights like the pipeline does":
     except PgTypeError:
       caught = true
     check caught
+
+  test "an aborted send-phase build still owes the statement Closes":
+    # Only the send drops them, so an encoder raise needs no restore at all —
+    # the names are held staged and the next build takes them back.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1", "_sc_2"]
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    check buf.len > 0 # the Closes really were emitted
+    check conn.stagedStmtCloses == @["_sc_1", "_sc_2"]
+
+  test "an evicted statement outlives the build that staged it":
+    # The cache no longer remembers the name, so nothing else would hold it
+    # until the send goes through.
+    let conn = mockConn()
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    conn.stageEvictedClose(buf, "_sc_7")
+    check conn.stagedStmtCloses == @["_sc_7"]
+    var next: seq[byte] = @[]
+    conn.stagePendingStmtCloses(next) # the build aborted; the next one takes it
+    check conn.stagedStmtCloses == @["_sc_7"]
+    conn.dropStagedStmtCloses()
+    check conn.stagedStmtCloses.len == 0
+    check conn.pendingStmtCloses.len == 0
 
 suite "The Bind pre-flight runs before pendingStmtCloses is drained":
   ## Regression: with only the Parse envelope pre-flighted, a rejected Bind ran
