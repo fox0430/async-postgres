@@ -1775,15 +1775,28 @@ proc coerceBinaryParam*(param: PgParam, serverOid: int32): PgParam =
 proc addParse*(
     buf: var seq[byte], stmtName: string, sql: string, params: openArray[PgParam]
 ) {.raises: [PgTypeError, PgProtocolError].} =
-  let msgStart = buf.len
-  buf.add(byte('P'))
-  buf.addInt32(0) # length placeholder
-  buf.addCString(stmtName)
-  buf.addCString(sql)
-  buf.addCount16(params.len, "Parse parameter-type")
-  for p in params:
-    buf.addInt32(p.oid)
-  buf.patchMsgLen(msgStart)
+  ## PgParam-aware Parse builder, sharing `pg_protocol`'s pre-flight and atomicity.
+  # Reads the OIDs straight out of `params`: re-shaping them into a `seq[int32]`
+  # for `pg_protocol.addParse` would allocate on every statement-cache miss, and
+  # on every query at all when the cache is disabled. Indexed access:
+  # `for p in params` copies each `PgParam` with its whole payload.
+  if params.len > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Parse parameter-type count " & $params.len & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+  preflightParseDirect(stmtName, sql, params.len)
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('P'))
+    buf.addInt32(0) # length placeholder
+    buf.addCString(stmtName)
+    buf.addCString(sql)
+    buf.addCount16(params.len, "Parse parameter-type")
+    for i in 0 ..< params.len:
+      buf.addInt32(params[i].oid)
+    buf.patchMsgLen(msgStart)
 
 proc addBind*(
     buf: var seq[byte],
@@ -1792,29 +1805,43 @@ proc addBind*(
     params: openArray[PgParam],
     resultFormats: openArray[int16] = [],
 ) {.raises: [PgTypeError, PgProtocolError].} =
-  let msgStart = buf.len
-  buf.add(byte('B'))
-  buf.addInt32(0) # length placeholder
-  buf.addCString(portalName)
-  buf.addCString(stmtName)
-  # Parameter format codes
-  buf.addCount16(params.len, "Bind parameter-format")
-  for p in params:
-    buf.addInt16(p.format)
-  # Parameter values
-  buf.addCount16(params.len, "Bind parameter")
-  for p in params:
-    if p.value.isNone:
-      buf.addInt32(-1) # NULL
-    else:
-      let data = p.value.get
-      buf.addLen32(data.len, "Bind parameter value")
-      buf.appendBytes(data)
-  # Result format codes
-  buf.addCount16(resultFormats.len, "Bind result-format")
-  for f in resultFormats:
-    buf.addInt16(f)
-  buf.patchMsgLen(msgStart)
+  ## PgParam-aware Bind builder, sharing `pg_protocol`'s pre-flight and atomicity.
+  # Writes straight out of `params`: flattening to `seq[Option[seq[byte]]]`
+  # first would copy every payload.
+  preflightBindCounts(portalName, stmtName, params.len, params.len, resultFormats.len)
+  var payload: int64 = 0
+  for i in 0 ..< params.len:
+    if params[i].value.isSome:
+      addBindPayload(payload, params[i].value.get.len)
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      portalName.len, stmtName.len, params.len, params.len, payload, resultFormats.len
+    ),
+    "Bind message",
+  )
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('B'))
+    buf.addInt32(0) # length placeholder
+    buf.addCString(portalName)
+    buf.addCString(stmtName)
+    # Parameter format codes
+    buf.addCount16(params.len, "Bind parameter-format")
+    for i in 0 ..< params.len:
+      buf.addInt16(params[i].format)
+    # Parameter values
+    buf.addCount16(params.len, "Bind parameter")
+    for i in 0 ..< params.len:
+      if params[i].value.isNone:
+        buf.addInt32(-1) # NULL
+      else:
+        buf.addLen32(params[i].value.get.len, "Bind parameter value")
+        buf.appendBytes(params[i].value.get)
+    # Result format codes
+    buf.addCount16(resultFormats.len, "Bind result-format")
+    for f in resultFormats:
+      buf.addInt16(f)
+    buf.patchMsgLen(msgStart)
 
 # Zero-alloc parameter encoding — write directly to send buffer
 

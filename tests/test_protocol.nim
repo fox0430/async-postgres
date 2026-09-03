@@ -450,16 +450,72 @@ suite "Frontend encoding":
   test "encoding addParse rejects param count over Int16 maximum":
     # The PgParam overload in pg_types/encoding is the path used by the real
     # client; it must guard the Int16 parameter-type count just like the
-    # low-level encodeParse overload in pg_protocol. The message header is
-    # written before the count field, so the buffer is not empty on rejection.
+    # low-level encodeParse overload in pg_protocol.
     var buf: seq[byte] = @[]
     expect(PgTypeError):
       buf.addParse("s", "SELECT 1", newSeq[PgParam](maxCount + 1))
+    check buf.len == 0
 
   test "encoding addBind rejects param count over Int16 maximum":
     var buf: seq[byte] = @[]
     expect(PgTypeError):
       buf.addBind("", "s", newSeq[PgParam](maxCount + 1))
+    check buf.len == 0
+
+  test "encoding addParse emits what the int32 overload emits":
+    # The PgParam overload writes the message itself rather than re-shaping the
+    # OIDs into a `seq[int32]`; the two layouts must stay byte-identical.
+    let params = [PgParam(oid: OidInt4, format: 1), PgParam(oid: OidText, format: 0)]
+    var fromParams: seq[byte] = @[0xAA'u8]
+    var fromOids: seq[byte] = @[0xAA'u8]
+    fromParams.addParse("s", "SELECT $1, $2", params)
+    fromOids.addParse("s", "SELECT $1, $2", [OidInt4, OidText])
+    check fromParams == fromOids
+
+  test "encoding addParse leaves an earlier message untouched on rejection":
+    # The whole pre-flight runs before the first byte is written, so a rejected
+    # Parse cannot truncate or corrupt what the send buffer already holds.
+    var orig: seq[byte] = @[]
+    orig.addParse("prev", "SELECT 1", [PgParam(oid: OidInt4, format: 1)])
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addParse("s\0x", "SELECT 1", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addParse("s", "SELECT\0 1", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addParse("s", "SELECT 1", newSeq[PgParam](maxCount + 1))
+      check buf == orig
+
+  test "encoding addBind leaves an earlier message untouched on rejection":
+    var orig: seq[byte] = @[]
+    orig.addBind("", "prev", [PgParam(oid: OidInt4, format: 1)])
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("p\0x", "s", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("", "s\0x", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("", "s", newSeq[PgParam](maxCount + 1))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("", "s", newSeq[PgParam](0), newSeq[int16](maxCount + 1))
+      check buf == orig
 
   test "encoding addBind accepts exactly the Int16 maximum count":
     # Boundary: maxCount PgParam elements must encode cleanly.
