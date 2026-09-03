@@ -1,9 +1,25 @@
+## Nim → PostgreSQL parameter encoders. Caller-sized payloads raise
+## ``PgTypeError`` (not ``ValueError``) via ``checkPgBinLen``/``textParam``.
+
 import std/[options, json, macros, strutils, tables, times, net, math]
 
 import ../[pg_bytes, pg_protocol]
 import core, array
 
 export pg_bytes, array
+
+proc checkPgBinLen*(n: int, what: string) {.inline.} =
+  ## Guard payload against Int32 overflow. Raises ``PgTypeError``.
+  if n > maxInt32Len:
+    raise newException(
+      PgTypeError,
+      what & " length " & $n & " exceeds protocol maximum of " & $maxInt32Len,
+    )
+
+proc textParam(oid: int32, s: string, what: string): PgParam {.inline.} =
+  ## Build text-format param. Rejects oversized payload.
+  checkPgBinLen(s.len, what)
+  PgParam(oid: oid, format: 0, value: some(toBytes(s)))
 
 proc toPgParamInline*(v: int16): PgParamInline =
   result.oid = OidInt2
@@ -44,14 +60,13 @@ proc toPgParamInline*(v: bool): PgParamInline =
   result.len = 1
   result.inlineBuf[0] = if v: 1'u8 else: 0'u8
 
-proc toPgParamInline*(v: string): PgParamInline =
+proc toPgParamInline*(
+    v: string
+): PgParamInline {.raises: [PgTypeError, PgProtocolError].} =
+  ## Inline-encode text param. Raises ``PgTypeError`` if oversized.
   result.oid = OidText
   result.format = 0
-  if v.len > maxInt32Len:
-    raise newException(
-      ValueError,
-      "string length " & $v.len & " exceeds protocol maximum of " & $maxInt32Len,
-    )
+  checkPgBinLen(v.len, "string")
   result.len = int32(v.len)
   if v.len == 0:
     discard
@@ -61,14 +76,13 @@ proc toPgParamInline*(v: string): PgParamInline =
     result.overflow = newSeq[byte](v.len)
     result.overflow.writeBytesAt(0, v.toOpenArrayByte(0, v.high))
 
-proc toPgParamInline*(v: seq[byte]): PgParamInline =
+proc toPgParamInline*(
+    v: seq[byte]
+): PgParamInline {.raises: [PgTypeError, PgProtocolError].} =
+  ## Inline-encode bytea param. Raises ``PgTypeError`` if oversized.
   result.oid = OidBytea
   result.format = 1
-  if v.len > maxInt32Len:
-    raise newException(
-      ValueError,
-      "bytea length " & $v.len & " exceeds protocol maximum of " & $maxInt32Len,
-    )
+  checkPgBinLen(v.len, "bytea")
   result.len = int32(v.len)
   if v.len == 0:
     discard
@@ -77,10 +91,14 @@ proc toPgParamInline*(v: seq[byte]): PgParamInline =
   else:
     result.overflow = v
 
-proc toPgParamInline*(v: PgUuid): PgParamInline =
+proc toPgParamInline*(
+    v: PgUuid
+): PgParamInline {.raises: [PgTypeError, PgProtocolError].} =
+  ## Inline-encode uuid param. Raises ``PgTypeError`` if oversized.
   # Text format with OidUuid (matches toPgParam). UUID canonical string is
   # 36 bytes, so the payload always takes the overflow path.
   let s = string(v)
+  checkPgBinLen(s.len, "uuid")
   result.oid = OidUuid
   result.format = 0
   result.len = int32(s.len)
@@ -98,16 +116,18 @@ proc toPgParamInline*(v: PgMoney): PgParamInline =
   result.len = 8
   result.inlineBuf.writeBE64(0, v.amount)
 
-proc toPgParamInline*[T](v: Option[T]): PgParamInline =
+proc toPgParamInline*[T](
+    v: Option[T]
+): PgParamInline {.raises: [PgTypeError, PgProtocolError].} =
   if v.isSome:
     toPgParamInline(v.get)
   else:
     let tmpl = toPgParamInline(default(T))
     PgParamInline(oid: tmpl.oid, format: tmpl.format, len: -1)
 
-proc toPgParam*(v: string): PgParam =
-  ## Convert a Nim value to a PgParam for use as a query parameter.
-  ## Uses text format for strings, binary for numeric types.
+proc toPgParam*(v: string): PgParam {.raises: [PgTypeError].} =
+  ## String → text PgParam. Raises ``PgTypeError`` if oversized.
+  checkPgBinLen(v.len, "string")
   PgParam(oid: OidText, format: 0, value: some(toBytes(v)))
 
 proc toPgParam*(v: int16): PgParam =
@@ -131,158 +151,139 @@ proc toPgParam*(v: float64): PgParam =
 proc toPgParam*(v: bool): PgParam =
   PgParam(oid: OidBool, format: 1, value: some(@[if v: 1'u8 else: 0'u8]))
 
-proc toPgParam*(v: seq[byte]): PgParam =
+proc toPgParam*(v: seq[byte]): PgParam {.raises: [PgTypeError].} =
+  ## bytea → binary PgParam. Raises ``PgTypeError`` if oversized.
+  checkPgBinLen(v.len, "bytea")
   PgParam(oid: OidBytea, format: 1, value: some(v))
 
-proc toPgParam*(v: DateTime): PgParam =
+proc toPgParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
   # Format the UTC wall clock so a zoned DateTime encodes the same absolute
   # instant as toPgBinaryParam. Formatting v directly would emit local fields
   # that OidTimestamp (no zone) then stores verbatim, drifting by the offset.
-  let s = v.utc.format("yyyy-MM-dd HH:mm:ss'.'ffffff")
-  PgParam(oid: OidTimestamp, format: 0, value: some(toBytes(s)))
+  textParam(OidTimestamp, v.utc.format("yyyy-MM-dd HH:mm:ss'.'ffffff"), "timestamp")
 
-proc toPgDateParam*(v: DateTime): PgParam =
+proc toPgDateParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
   ## Encode a DateTime as a date parameter (OID 1082).
   # Take the UTC calendar day so a zoned DateTime encodes the same day as
   # toPgBinaryDateParam, whose pgDateDays goes through toTime().
-  let s = v.utc.format("yyyy-MM-dd")
-  PgParam(oid: OidDate, format: 0, value: some(toBytes(s)))
+  textParam(OidDate, v.utc.format("yyyy-MM-dd"), "date")
 
-proc toPgTimestampTzParam*(v: DateTime): PgParam =
+proc toPgTimestampTzParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
   ## Encode a DateTime as a timestamptz parameter (OID 1184).
-  let s = v.format("yyyy-MM-dd HH:mm:ss'.'ffffffzzz")
-  PgParam(oid: OidTimestampTz, format: 0, value: some(toBytes(s)))
+  textParam(OidTimestampTz, v.format("yyyy-MM-dd HH:mm:ss'.'ffffffzzz"), "timestamptz")
 
-proc toPgParam*(v: PgTime): PgParam =
-  PgParam(oid: OidTime, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgTime): PgParam {.raises: [PgTypeError].} =
+  textParam(OidTime, $v, "time")
 
-proc toPgParam*(v: PgTimeTz): PgParam =
-  PgParam(oid: OidTimeTz, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgTimeTz): PgParam {.raises: [PgTypeError].} =
+  textParam(OidTimeTz, $v, "timetz")
 
-proc toPgParam*(v: PgUuid): PgParam =
-  PgParam(oid: OidUuid, format: 0, value: some(toBytes(string(v))))
+proc toPgParam*(v: PgUuid): PgParam {.raises: [PgTypeError].} =
+  textParam(OidUuid, string(v), "uuid")
 
-proc toPgParam*(v: PgNumeric): PgParam =
-  PgParam(oid: OidNumeric, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgNumeric): PgParam {.raises: [PgTypeError].} =
+  textParam(OidNumeric, $v, "numeric")
 
 proc toPgParam*(v: PgMoney): PgParam =
-  ## Uses binary format: money's text representation is ``lc_monetary``-dependent,
-  ## so a text round-trip is not reliable. Binary sends the raw int64 amount.
+  ## Money → binary (raw int64). Text is locale-dependent.
   PgParam(oid: OidMoney, format: 1, value: some(@(toBE64(v.amount))))
 
-proc toPgParam*(v: PgInterval): PgParam =
-  PgParam(oid: OidInterval, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgInterval): PgParam {.raises: [PgTypeError].} =
+  textParam(OidInterval, $v, "interval")
 
-proc toPgParam*(v: PgInet): PgParam =
-  PgParam(oid: OidInet, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgInet): PgParam {.raises: [PgTypeError].} =
+  textParam(OidInet, $v, "inet")
 
-proc toPgParam*(v: PgCidr): PgParam =
-  PgParam(oid: OidCidr, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgCidr): PgParam {.raises: [PgTypeError].} =
+  textParam(OidCidr, $v, "cidr")
 
-proc toPgParam*(v: PgMacAddr): PgParam =
-  PgParam(oid: OidMacAddr, format: 0, value: some(toBytes(string(v))))
+proc toPgParam*(v: PgMacAddr): PgParam {.raises: [PgTypeError].} =
+  textParam(OidMacAddr, string(v), "macaddr")
 
-proc toPgParam*(v: PgMacAddr8): PgParam =
-  PgParam(oid: OidMacAddr8, format: 0, value: some(toBytes(string(v))))
+proc toPgParam*(v: PgMacAddr8): PgParam {.raises: [PgTypeError].} =
+  textParam(OidMacAddr8, string(v), "macaddr8")
 
-proc toPgParam*(v: PgTsVector): PgParam =
-  PgParam(oid: OidTsVector, format: 0, value: some(toBytes(string(v))))
+proc toPgParam*(v: PgTsVector): PgParam {.raises: [PgTypeError].} =
+  textParam(OidTsVector, string(v), "tsvector")
 
-proc toPgParam*(v: PgTsQuery): PgParam =
-  PgParam(oid: OidTsQuery, format: 0, value: some(toBytes(string(v))))
+proc toPgParam*(v: PgTsQuery): PgParam {.raises: [PgTypeError].} =
+  textParam(OidTsQuery, string(v), "tsquery")
 
-proc toPgParam*(v: PgXml): PgParam =
-  PgParam(oid: OidXml, format: 0, value: some(toBytes(string(v))))
+proc toPgParam*(v: PgXml): PgParam {.raises: [PgTypeError].} =
+  textParam(OidXml, string(v), "xml")
 
-proc toPgParam*(v: PgBit): PgParam =
-  PgParam(oid: OidVarbit, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgBit): PgParam {.raises: [PgTypeError].} =
+  textParam(OidVarbit, $v, "varbit")
 
-proc toPgParam*(v: PgPoint): PgParam =
-  PgParam(oid: OidPoint, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgPoint): PgParam {.raises: [PgTypeError].} =
+  textParam(OidPoint, $v, "point")
 
-proc toPgParam*(v: PgLine): PgParam =
-  PgParam(oid: OidLine, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgLine): PgParam {.raises: [PgTypeError].} =
+  textParam(OidLine, $v, "line")
 
-proc toPgParam*(v: PgLseg): PgParam =
-  PgParam(oid: OidLseg, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgLseg): PgParam {.raises: [PgTypeError].} =
+  textParam(OidLseg, $v, "lseg")
 
-proc toPgParam*(v: PgBox): PgParam =
-  PgParam(oid: OidBox, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgBox): PgParam {.raises: [PgTypeError].} =
+  textParam(OidBox, $v, "box")
 
-proc toPgParam*(v: PgPath): PgParam =
-  PgParam(oid: OidPath, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgPath): PgParam {.raises: [PgTypeError].} =
+  textParam(OidPath, $v, "path")
 
-proc toPgParam*(v: PgPolygon): PgParam =
-  PgParam(oid: OidPolygon, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgPolygon): PgParam {.raises: [PgTypeError].} =
+  textParam(OidPolygon, $v, "polygon")
 
-proc toPgParam*(v: PgCircle): PgParam =
-  PgParam(oid: OidCircle, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgCircle): PgParam {.raises: [PgTypeError].} =
+  textParam(OidCircle, $v, "circle")
 
-proc toPgParam*(v: JsonNode): PgParam =
-  PgParam(oid: OidJsonb, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: JsonNode): PgParam {.raises: [PgTypeError].} =
+  textParam(OidJsonb, $v, "json")
 
-proc encodeHstoreText*(v: PgHstore): string =
+proc encodeHstoreText*(v: PgHstore): string {.raises: [PgTypeError].} =
   ## Encode hstore as PostgreSQL text format: ``"key1"=>"val1", "key2"=>NULL``.
-  var parts: seq[string]
-  for k, v in v.pairs:
-    var keyEsc = newStringOfCap(k.len + 2)
-    keyEsc.add('"')
+  ## Appended straight into `result`: joining a `seq[string]` would hold the
+  ## whole literal twice, and the per-entry bound fails early on an oversized one.
+  var first = true
+  for k, val in v.pairs:
+    if not first:
+      result.add(", ")
+    first = false
+    result.add('"')
     for c in k:
       if c == '"' or c == '\\':
-        keyEsc.add('\\')
-      keyEsc.add(c)
-    keyEsc.add('"')
-    if v.isSome:
-      var valEsc = newStringOfCap(v.get.len + 2)
-      valEsc.add('"')
-      for c in v.get:
+        result.add('\\')
+      result.add(c)
+    result.add('"')
+    result.add("=>")
+    if val.isSome:
+      result.add('"')
+      for c in val.get:
         if c == '"' or c == '\\':
-          valEsc.add('\\')
-        valEsc.add(c)
-      valEsc.add('"')
-      parts.add(keyEsc & "=>" & valEsc)
+          result.add('\\')
+        result.add(c)
+      result.add('"')
     else:
-      parts.add(keyEsc & "=>NULL")
-  parts.join(", ")
+      result.add("NULL")
+    checkPgBinLen(result.len, "hstore")
 
-proc toPgParam*(v: PgHstore): PgParam =
-  ## Send hstore as text format with OID 0 (unknown) so PostgreSQL infers the
-  ## parameter type from context. Works with both ``SELECT $1::hstore`` and
-  ## ``INSERT INTO t(hstore_col) VALUES($1)``; declaring ``OidText`` would fail
-  ## the latter with 42804 because there is no text→hstore assignment cast.
-  PgParam(oid: 0'i32, format: 0, value: some(toBytes(encodeHstoreText(v))))
-
-proc checkPgBinLen*(n: int, what: string) {.inline.} =
-  ## Guard an ``int32`` length prefix in a binary container encoder against
-  ## silent wrap on ``int32(seq.len)`` past 2 GiB.
-  if n > int32.high.int:
-    raise newException(PgError, what & " too large for PostgreSQL binary format: " & $n)
+proc toPgParam*(v: PgHstore): PgParam {.raises: [PgTypeError].} =
+  ## Hstore → text with OID 0 (let server infer type).
+  textParam(0'i32, encodeHstoreText(v), "hstore")
 
 proc checkPgBinPayload*(size: int64, what: string) {.inline.} =
-  ## Companion cumulative guard — many under-limit elements can still overflow
-  ## the outer length prefix. ``int64`` so accumulation stays safe on 32-bit
-  ## platforms where the ``int`` accumulator would wrap before this fires.
+  ## Cumulative payload guard. Raises ``PgTypeError`` if too large.
   if size > int32.high.int64:
-    raise
-      newException(PgError, what & " payload too large for PostgreSQL binary format")
+    raise newException(
+      PgTypeError, what & " payload too large for PostgreSQL binary format"
+    )
 
 proc encodeBinaryArray*(
     elemOid: int32,
     dims: openArray[int32],
     lowerBounds: openArray[int32],
     elements: openArray[Option[seq[byte]]],
-): seq[byte] =
-  ## Encode an N-dimensional PostgreSQL binary array.
-  ##
-  ## Header: ``ndim(4) + has_null(4) + elem_oid(4) + per-dim (dim_len(4) +
-  ## lower_bound(4))``. Each element is encoded as ``len(4) + data`` in
-  ## row-major order; a NULL element is encoded with ``len = -1`` and no
-  ## payload. ``has_null`` is set to ``1`` iff any element is ``none``.
-  ##
-  ## When ``dims.len == 0`` an empty array is emitted (``ndim=0``, 12-byte
-  ## header, no elements); ``elements`` must be empty in that case.
-  ## Otherwise ``elements.len`` must equal ``product(dims)``. See
-  ## ``validatePgArrayShape`` in ``array.nim`` for the validation rules.
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
+  ## Encode N-dim binary array. ``dims.len==0`` means empty array.
   validatePgArrayShape(dims, lowerBounds, elements.len)
   let headerSize = 12 + 8 * dims.len
   var dataSize: int64 = 0
@@ -295,7 +296,8 @@ proc encodeBinaryArray*(
       let ev = e.get
       checkPgBinLen(ev.len, "Array element")
       dataSize += 4'i64 + ev.len.int64
-    checkPgBinPayload(dataSize, "Array")
+  # One guard on the total: dataSize is int64 and monotonic.
+  checkPgBinPayload(int64(headerSize) + dataSize, "Array")
   result = newSeq[byte](headerSize + dataSize.int)
   result.writeBE32(0, int32(dims.len)) # ndim
   result.writeBE32(4, if anyNull: 1'i32 else: 0'i32) # has_null
@@ -318,7 +320,7 @@ proc encodeBinaryArray*(
 
 proc encodeBinaryArray*(
     elemOid: int32, dims: openArray[int32], elements: openArray[Option[seq[byte]]]
-): seq[byte] =
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Convenience overload: ``lowerBounds`` defaults to ``1`` for each
   ## dimension (PostgreSQL's default).
   var lb = newSeq[int32](dims.len)
@@ -326,55 +328,38 @@ proc encodeBinaryArray*(
     lb[i] = 1
   encodeBinaryArray(elemOid, dims, lb, elements)
 
-proc dimsFor1D*(n: int): seq[int32] {.inline.} =
-  ## Helper used by 1D ``toPgParam`` wrappers: returns ``@[]`` when ``n == 0``
-  ## (so ``encodeBinaryArray`` emits the ``ndim=0`` wire form) and
-  ## ``@[int32(n)]`` otherwise. Exported because external array encoders
-  ## (``ranges.nim`` etc.) share the same single-dimension shortcut. Raises
-  ## ``PgTypeError`` when ``n`` exceeds ``int32.high`` — without this guard
-  ## the ``int32(n)`` cast on 64-bit platforms would silently wrap and the
-  ## resulting ``dims[0]`` would disagree with ``elements.len``.
+proc checkArrayLen*(n: int) {.inline, raises: [PgTypeError].} =
+  ## Validates a 1D array length without building the dimension seq, so callers
+  ## can fail before allocating their element buffers.
   if n < 0:
-    raise newException(PgTypeError, "dimsFor1D: negative length " & $n)
+    raise newException(PgTypeError, "Array has negative length: " & $n)
   if n > int32.high.int:
     raise newException(
       PgTypeError, "Array has too many elements for PostgreSQL binary format: " & $n
     )
+
+proc dimsFor1D*(n: int): seq[int32] {.inline, raises: [PgTypeError].} =
+  ## 1D helper: ``@[]`` if ``n==0`` else ``@[int32(n)]``. Raises ``PgTypeError``
+  ## if ``n`` exceeds ``int32.high``.
+  checkArrayLen(n)
   if n == 0:
     newSeq[int32]()
   else:
     @[int32(n)]
 
 proc lowerBoundsFor1D(n: int): seq[int32] {.inline.} =
-  ## Companion to ``dimsFor1D``: ``@[]`` for an empty array (``ndim = 0``),
-  ## otherwise ``@[1]`` (PostgreSQL's default lower bound).
+  ## 1D lower bounds: ``@[]`` if empty else ``@[1]``.
   if n == 0:
     newSeq[int32]()
   else:
     @[1'i32]
 
-#
-# Single-allocation encoders for fixed-width array elements.
-#
-# The generic ``encodeBinaryArray`` builds a ``seq[Option[seq[byte]]]`` and a
-# fresh ``seq[byte]`` per element, then copies every payload into the final
-# buffer. For elements whose width is a compile-time constant the total size is
-# ``12 + 8*ndim + count*(4 + elemSize)`` (minus the per-NULL ``elemSize`` for
-# the nullable variant), so the payload can be written straight into one buffer
-# with ``writeBE*`` — no per-element ``seq`` and no intermediate ``elements``
-# ``seq``. ``buildFixedArray`` / ``buildFixedArrayOpt`` declare ``buf`` (the
-# fully-encoded result), ``pos`` (offset of the current element payload, just
-# past its 4-byte length word) and ``i`` (element index) for the ``writeElem``
-# body, which writes exactly ``elemSize`` bytes at ``buf[pos]``. The wire output
-# is byte-for-byte identical to the ``encodeBinaryArray`` path.
+# Fast path for fixed-width array elements: single allocation, no per-element seq.
 
 template writeFixedArrayHeader(
     buf: var seq[byte], dms, lbs: seq[int32], eoid: int32, hasNull: bool
 ) =
-  ## Write the 12-byte array header (``ndim``, ``has_null``, ``elem_oid``)
-  ## followed by the per-dimension ``(dim_len, lower_bound)`` pairs. Shared by
-  ## ``buildFixedArray`` / ``buildFixedArrayOpt`` so the header layout has a
-  ## single source.
+  ## Write array header (ndim/has_null/elem_oid + per-dim pairs).
   buf.writeBE32(0, int32(dms.len)) # ndim
   buf.writeBE32(4, if hasNull: 1'i32 else: 0'i32) # has_null
   buf.writeBE32(8, eoid) # elem_oid
@@ -397,9 +382,8 @@ template buildFixedArray(
   let esz = elemSize
   validatePgArrayShape(dms, lbs, cnt)
   let payload = cnt.int64 * (4'i64 + esz.int64)
-  if payload > int32.high.int64:
-    raise newException(PgError, "Array payload too large for PostgreSQL binary format")
   let headerSize = 12 + 8 * dms.len
+  checkPgBinPayload(int64(headerSize) + payload, "Array")
   var buf {.inject.} = newSeq[byte](headerSize + int(payload))
   writeFixedArrayHeader(buf, dms, lbs, eoid, false) # no NULLs in a non-Option seq
   var pos {.inject.} = headerSize
@@ -417,9 +401,7 @@ template buildFixedArrayOpt(
     count, elemSize: int,
     isNullExpr, writeElem: untyped,
 ) =
-  ## Nullable counterpart to ``buildFixedArray``. ``isNullExpr`` (an expression
-  ## in terms of the injected ``i``) selects NULL elements, which are written as
-  ## ``len = -1`` with no payload; ``has_null`` is set iff any element is NULL.
+  ## Nullable variant of ``buildFixedArray``.
   let eoid = elemOid
   let dms = dims
   let lbs = lowerBounds
@@ -434,9 +416,8 @@ template buildFixedArrayOpt(
         inc nonNull
       inc i
   let payload = cnt.int64 * 4'i64 + nonNull.int64 * esz.int64
-  if payload > int32.high.int64:
-    raise newException(PgError, "Array payload too large for PostgreSQL binary format")
   let headerSize = 12 + 8 * dms.len
+  checkPgBinPayload(int64(headerSize) + payload, "Array")
   var buf {.inject.} = newSeq[byte](headerSize + int(payload))
   writeFixedArrayHeader(buf, dms, lbs, eoid, nonNull < cnt)
   var pos {.inject.} = headerSize
@@ -455,9 +436,10 @@ template buildFixedArrayOpt(
 template genFixedArrayEncoder(
     T: typedesc, arrayOid, elemOid: int32, elemSize: int, writeElem: untyped
 ) =
-  ## Define ``toPgParam(seq[T])`` for a fixed-width element type. ``writeElem``
-  ## writes element ``v[i]``'s ``elemSize`` payload bytes at ``buf[pos]``.
-  proc toPgParam*(v {.inject.}: seq[T]): PgParam =
+  ## Define ``toPgParam(seq[T])`` for fixed-width type.
+  proc toPgParam*(
+      v {.inject.}: seq[T]
+  ): PgParam {.raises: [PgTypeError, PgProtocolError].} =
     buildFixedArray(elemOid, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, elemSize):
       writeElem
     PgParam(oid: arrayOid, format: 1, value: some(buf))
@@ -465,17 +447,18 @@ template genFixedArrayEncoder(
 template genFixedArray1D(
     T: typedesc, arrayOid, elemOid: int32, elemSize: int, writeVal: untyped
 ) =
-  ## Define BOTH ``toPgParam(seq[T])`` and ``toPgParam(seq[Option[T]])`` for a
-  ## fixed-width element type from one ``elemSize`` + ``writeVal``. ``writeVal``
-  ## writes the injected element value ``val`` as ``elemSize`` payload bytes at
-  ## ``buf[pos]`` (reached only for non-NULL elements).
-  proc toPgParam*(v {.inject.}: seq[T]): PgParam =
+  ## Define ``toPgParam(seq[T])`` and ``toPgParam(seq[Option[T]])`` for fixed-width.
+  proc toPgParam*(
+      v {.inject.}: seq[T]
+  ): PgParam {.raises: [PgTypeError, PgProtocolError].} =
     buildFixedArray(elemOid, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, elemSize):
       let val {.inject.} = v[i]
       writeVal
     PgParam(oid: arrayOid, format: 1, value: some(buf))
 
-  proc toPgParam*(v {.inject.}: seq[Option[T]]): PgParam =
+  proc toPgParam*(
+      v {.inject.}: seq[Option[T]]
+  ): PgParam {.raises: [PgTypeError, PgProtocolError].} =
     buildFixedArrayOpt(
       elemOid, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, elemSize, v[i].isNone
     ):
@@ -551,7 +534,10 @@ genFixedArray1D(float64, OidFloat8Array, OidFloat8, 8):
 genFixedArray1D(bool, OidBoolArray, OidBool, 1):
   buf[pos] = (if val: 1'u8 else: 0'u8)
 
-proc toPgParam*(v: seq[string]): PgParam =
+proc toPgParam*(v: seq[string]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
+  for x in v:
+    checkPgBinLen(x.len, "string")
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, x in v:
     elements[i] = some(toBytes(x))
@@ -561,7 +547,9 @@ proc toPgParam*(v: seq[string]): PgParam =
     value: some(encodeBinaryArray(OidText, dimsFor1D(v.len), elements)),
   )
 
-proc toPgParam*(v: seq[Option[int]]): PgParam =
+proc toPgParam*(
+    v: seq[Option[int]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## ``int`` has no plain ``seq[int]`` encoder (callers use ``seq[int64]``), so
   ## it is the one Option numeric not generated by ``genFixedArray1D``. Encoded
   ## as 8-byte ``int8`` (OID 20), matching ``seq[int64]``.
@@ -571,7 +559,13 @@ proc toPgParam*(v: seq[Option[int]]): PgParam =
     buf.writeBE64(pos, int64(v[i].get))
   PgParam(oid: OidInt8Array, format: 1, value: some(buf))
 
-proc toPgParam*(v: seq[Option[string]]): PgParam =
+proc toPgParam*(
+    v: seq[Option[string]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
+  for x in v:
+    if x.isSome:
+      checkPgBinLen(x.get.len, "string")
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, x in v:
     elements[i] =
@@ -585,13 +579,13 @@ proc toPgParam*(v: seq[Option[string]]): PgParam =
     value: some(encodeBinaryArray(OidText, dimsFor1D(v.len), elements)),
   )
 
-proc toPgParam*(v: Option[JsonNode]): PgParam =
+proc toPgParam*(v: Option[JsonNode]): PgParam {.raises: [PgTypeError].} =
   if v.isSome:
     toPgParam(v.get)
   else:
     PgParam(oid: OidJsonb, format: 0, value: none(seq[byte]))
 
-proc toPgParam*[T](v: Option[T]): PgParam =
+proc toPgParam*[T](v: Option[T]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   if v.isSome:
     result = toPgParam(v.get)
   else:
@@ -613,9 +607,9 @@ macro pgParams*(args: varargs[typed]): untyped =
     bracket.add(newCall(bindSym"toPgParam", arg))
   result.add(bracket)
 
-proc toPgBinaryParam*(v: string): PgParam =
-  ## Convert a Nim value to a PgParam using binary format.
-  ## Prefer this over `toPgParam` when binary format is needed for all types.
+proc toPgBinaryParam*(v: string): PgParam {.raises: [PgTypeError].} =
+  ## String → binary PgParam. Raises ``PgTypeError`` if oversized.
+  checkPgBinLen(v.len, "string")
   PgParam(oid: OidText, format: 1, value: some(toBytes(v)))
 
 proc toPgBinaryParam*(v: int16): PgParam =
@@ -639,7 +633,9 @@ proc toPgBinaryParam*(v: float64): PgParam =
 proc toPgBinaryParam*(v: bool): PgParam =
   PgParam(oid: OidBool, format: 1, value: some(@[if v: 1'u8 else: 0'u8]))
 
-proc toPgBinaryParam*(v: seq[byte]): PgParam =
+proc toPgBinaryParam*(v: seq[byte]): PgParam {.raises: [PgTypeError].} =
+  ## bytea → binary PgParam. Raises ``PgTypeError`` if oversized.
+  checkPgBinLen(v.len, "bytea")
   PgParam(oid: OidBytea, format: 1, value: some(v))
 
 proc toPgBinaryParam*(v: DateTime): PgParam =
@@ -658,12 +654,14 @@ proc toPgBinaryParam*(v: PgTime): PgParam =
   data.writeTimeAt(0, v)
   PgParam(oid: OidTime, format: 1, value: some(data))
 
-proc toPgBinaryParam*(v: PgTimeTz): PgParam =
+proc toPgBinaryParam*(v: PgTimeTz): PgParam {.raises: [PgTypeError].} =
   var data = newSeq[byte](12)
   data.writeTimeTzAt(0, v)
   PgParam(oid: OidTimeTz, format: 1, value: some(data))
 
-proc encodeNumericBinary*(v: PgNumeric): seq[byte] =
+proc encodeNumericBinary*(
+    v: PgNumeric
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode PgNumeric as PostgreSQL binary numeric format.
   if v.digits.len > int(int16.high):
     raise newException(
@@ -685,7 +683,9 @@ proc encodeNumericBinary*(v: PgNumeric): seq[byte] =
       raise newException(PgTypeError, "Numeric binary: invalid digit " & $digit)
     result.writeBE16(8 + i * 2, digit)
 
-proc toPgBinaryParam*(v: PgNumeric): PgParam =
+proc toPgBinaryParam*(
+    v: PgNumeric
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
 
 proc toPgBinaryParam*(v: PgMoney): PgParam =
@@ -772,7 +772,7 @@ proc writeUuidAt(buf: var openArray[byte], pos: int, v: PgUuid) =
   for i in 0 ..< 16:
     buf[pos + i] = decodeHexPair(hex, i * 2, "Invalid PgUuid")
 
-proc toPgBinaryParam*(v: PgUuid): PgParam =
+proc toPgBinaryParam*(v: PgUuid): PgParam {.raises: [PgTypeError].} =
   var bytes = newSeq[byte](16)
   bytes.writeUuidAt(0, v)
   PgParam(oid: OidUuid, format: 1, value: some(bytes))
@@ -782,7 +782,9 @@ proc toPgBinaryParam*(v: PgInterval): PgParam =
   data.writeIntervalAt(0, v)
   PgParam(oid: OidInterval, format: 1, value: some(data))
 
-proc encodeInetBinary*(address: IpAddress, mask: uint8, isCidr: bool): seq[byte] =
+proc encodeInetBinary*(
+    address: IpAddress, mask: uint8, isCidr: bool
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode PostgreSQL binary inet/cidr format:
   ##   ``family(1) + bits(1) + is_cidr(1) + addrlen(1) + addr(4|16)``.
   ## Shared by ``inet`` and ``cidr`` (which differ only in the ``is_cidr``
@@ -839,13 +841,13 @@ proc encodeMacBinary(s: string, n: int, label: string): seq[byte] =
   result = newSeq[byte](n)
   result.writeMacAt(0, s, n, label)
 
-proc toPgBinaryParam*(v: PgMacAddr): PgParam =
+proc toPgBinaryParam*(v: PgMacAddr): PgParam {.raises: [PgTypeError].} =
   ## Binary format: 6 raw bytes
   PgParam(
     oid: OidMacAddr, format: 1, value: some(encodeMacBinary(string(v), 6, "PgMacAddr"))
   )
 
-proc toPgBinaryParam*(v: PgMacAddr8): PgParam =
+proc toPgBinaryParam*(v: PgMacAddr8): PgParam {.raises: [PgTypeError].} =
   ## Binary format: 8 raw bytes
   PgParam(
     oid: OidMacAddr8,
@@ -853,20 +855,21 @@ proc toPgBinaryParam*(v: PgMacAddr8): PgParam =
     value: some(encodeMacBinary(string(v), 8, "PgMacAddr8")),
   )
 
-proc toPgBinaryParam*(v: PgTsVector): PgParam =
+proc toPgBinaryParam*(v: PgTsVector): PgParam {.raises: [PgTypeError].} =
   ## Send as text format — PostgreSQL handles the parsing.
-  PgParam(oid: OidTsVector, format: 0, value: some(toBytes(string(v))))
+  textParam(OidTsVector, string(v), "tsvector")
 
-proc toPgBinaryParam*(v: PgTsQuery): PgParam =
+proc toPgBinaryParam*(v: PgTsQuery): PgParam {.raises: [PgTypeError].} =
   ## Send as text format — PostgreSQL handles the parsing.
-  PgParam(oid: OidTsQuery, format: 0, value: some(toBytes(string(v))))
+  textParam(OidTsQuery, string(v), "tsquery")
 
-proc toPgBinaryParam*(v: PgXml): PgParam =
-  ## Binary wire format for xml is the text representation itself.
+proc toPgBinaryParam*(v: PgXml): PgParam {.raises: [PgTypeError].} =
+  ## Xml binary is text representation.
+  checkPgBinLen(string(v).len, "xml")
   PgParam(oid: OidXml, format: 1, value: some(toBytes(string(v))))
 
-proc toPgBinaryParam*(v: PgBit): PgParam =
-  ## Binary format: 4-byte bit count (big-endian) + packed bit data.
+proc toPgBinaryParam*(v: PgBit): PgParam {.raises: [PgTypeError].} =
+  ## Bit → binary (4-byte count + data).
   # Symmetric with the decoder guards in accessors.nim (getBit / bit array).
   if v.nbits < 0:
     raise newException(PgTypeError, "Invalid PgBit: negative nbits " & $v.nbits)
@@ -886,7 +889,10 @@ proc toPgBinaryParam*(v: PgBit): PgParam =
     data[4 + i] = v.data[i]
   PgParam(oid: OidVarbit, format: 1, value: some(data))
 
-proc toPgBinaryParam*(v: seq[PgBit]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgBit]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, x in v:
     elements[i] = some(toPgBinaryParam(x).value.get)
@@ -896,28 +902,29 @@ proc toPgBinaryParam*(v: seq[PgBit]): PgParam =
     value: some(encodeBinaryArray(OidVarbit, dimsFor1D(v.len), elements)),
   )
 
-proc toPgParam*(v: seq[PgBit]): PgParam =
+proc toPgParam*(v: seq[PgBit]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v)
 
 # Temporal array encoders
 
-proc toPgTimestampArrayParam*(v: seq[DateTime]): PgParam =
+proc toPgTimestampArrayParam*(v: seq[DateTime]): PgParam {.raises: [PgTypeError].} =
   buildFixedArray(OidTimestamp, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, 8):
     buf.writeBE64(pos, pgTimestampMicros(v[i]))
   PgParam(oid: OidTimestampArray, format: 1, value: some(buf))
 
-proc toPgTimestampTzArrayParam*(v: seq[DateTime]): PgParam =
+proc toPgTimestampTzArrayParam*(v: seq[DateTime]): PgParam {.raises: [PgTypeError].} =
   buildFixedArray(OidTimestampTz, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, 8):
     buf.writeBE64(pos, pgTimestampMicros(v[i]))
   PgParam(oid: OidTimestampTzArray, format: 1, value: some(buf))
 
-proc toPgDateArrayParam*(v: seq[DateTime]): PgParam =
+proc toPgDateArrayParam*(v: seq[DateTime]): PgParam {.raises: [PgTypeError].} =
   buildFixedArray(OidDate, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, 4):
     buf.writeBE32(pos, pgDateDays(v[i]))
   PgParam(oid: OidDateArray, format: 1, value: some(buf))
 
 template genArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
-  proc toPgParam*(v: seq[T]): PgParam =
+  proc toPgParam*(v: seq[T]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+    checkArrayLen(v.len)
     var elements = newSeq[Option[seq[byte]]](v.len)
     for i, x in v:
       elements[i] = some(toPgBinaryParam(x).value.get)
@@ -952,29 +959,18 @@ genFixedArrayEncoder(PgMacAddr, OidMacAddrArray, OidMacAddr, 6):
 genFixedArrayEncoder(PgMacAddr8, OidMacAddr8Array, OidMacAddr8, 8):
   buf.writeMacAt(pos, string(v[i]), 8, "PgMacAddr8")
 
-# ``PgMoney`` is intentionally not routed through ``genArrayEncoder``: the
-# generated encoder would send each element's raw ``amount`` and silently drop
-# its ``scale``. ``money``'s binary wire format carries only the integer amount,
-# so the fractional-digit count (``frac_digits``) is fixed by the server's
-# ``lc_monetary``. A ``seq[PgMoney]`` with mixed scales — or a scale that
-# disagrees with the server — would otherwise be encoded into a silently wrong
-# ``money[]``. The dedicated encoders below validate ``scale`` instead, mirroring
-# ``toPgMoneyArrayNDParam`` (N-D) and ``getMoneyArray`` (decode).
-proc toPgMoneyArrayParam*(v: seq[PgMoney], scale: int = 2): PgParam =
-  ## 1-D counterpart to ``toPgMoneyArrayNDParam`` and encoder counterpart to
-  ## ``getMoneyArray``. ``scale`` declares the ``frac_digits`` the caller's
-  ## ``PgMoney.amount`` values are scaled for (the server's ``lc_monetary``),
-  ## and every element's ``scale`` field must match it — otherwise a silent
-  ## value mismatch on the server is likely.
-  ##
-  ## Raises ``PgError`` when ``scale`` is outside ``0..18`` or when any
-  ## element's ``scale`` differs from the parameter.
+# ``PgMoney`` needs manual scale validation (binary format lacks scale).
+proc toPgMoneyArrayParam*(
+    v: seq[PgMoney], scale: int = 2
+): PgParam {.raises: [PgTypeError].} =
+  ## Encode ``seq[PgMoney]`` as ``money[]``. ``scale`` must match every
+  ## element's ``scale``. Raises ``PgTypeError`` on mismatch.
   if scale < 0 or scale > 18:
-    raise newException(PgError, "PgMoney scale out of range: " & $scale)
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
   for idx, m in v:
     if int(m.scale) != scale:
       raise newException(
-        PgError,
+        PgTypeError,
         "PgMoney array element[" & $idx & "].scale=" & $m.scale &
           " does not match declared scale=" & $scale &
           " (server lc_monetary frac_digits)",
@@ -983,19 +979,21 @@ proc toPgMoneyArrayParam*(v: seq[PgMoney], scale: int = 2): PgParam =
     buf.writeMoneyAt(pos, v[i])
   PgParam(oid: OidMoneyArray, format: 1, value: some(buf))
 
-proc toPgParam*(v: seq[PgMoney]): PgParam =
-  ## Encode a ``seq[PgMoney]`` as a ``money[]`` binary parameter using the
-  ## default ``scale = 2`` (matching ``getMoneyArray``'s default). Every
-  ## element's ``scale`` must be ``2``; for other ``lc_monetary`` locales use
-  ## ``toPgMoneyArrayParam(v, scale = ...)`` to declare the server's
-  ## ``frac_digits`` explicitly.
+proc toPgParam*(v: seq[PgMoney]): PgParam {.raises: [PgTypeError].} =
+  ## ``seq[PgMoney]`` → ``money[]`` with ``scale=2``. Use ``toPgMoneyArrayParam``
+  ## for other scales.
   toPgMoneyArrayParam(v, scale = 2)
 
 # Numeric / binary / JSON array encoders
 
 genArrayEncoder(PgNumeric, OidNumericArray, OidNumeric)
 
-proc toPgByteaArrayParam*(v: seq[seq[byte]]): PgParam =
+proc toPgByteaArrayParam*(
+    v: seq[seq[byte]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
+  for x in v:
+    checkPgBinLen(x.len, "bytea")
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, x in v:
     elements[i] = some(x)
@@ -1005,17 +1003,21 @@ proc toPgByteaArrayParam*(v: seq[seq[byte]]): PgParam =
     value: some(encodeBinaryArray(OidBytea, dimsFor1D(v.len), elements)),
   )
 
-proc encodeJsonbBinary*(node: JsonNode): seq[byte] =
-  ## Encode a JsonNode as PostgreSQL jsonb binary format: a leading ``0x01``
-  ## version byte followed by the JSON text. Mirrors the decode side
-  ## (``getJson`` strips the version byte when ``elemOid == OidJsonb``).
-  let jsonBytes = toBytes($node)
-  result = newSeq[byte](1 + jsonBytes.len)
+proc encodeJsonbBinary*(
+    node: JsonNode
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
+  ## Encode JsonNode as jsonb binary (0x01 + JSON text). Raises ``PgTypeError``
+  ## if oversized.
+  let s = $node
+  # int64 so the version byte cannot overflow the sum on a 32-bit target.
+  checkPgBinPayload(int64(s.len) + 1, "json (with version byte)")
+  result = newSeq[byte](1 + s.len)
   result[0] = 1 # jsonb version byte
-  for j in 0 ..< jsonBytes.len:
-    result[j + 1] = jsonBytes[j]
+  if s.len > 0:
+    result.writeBytesAt(1, s.toOpenArrayByte(0, s.high))
 
-proc toPgParam*(v: seq[JsonNode]): PgParam =
+proc toPgParam*(v: seq[JsonNode]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, x in v:
     elements[i] = some(encodeJsonbBinary(x))
@@ -1055,12 +1057,12 @@ template writeCircleAt(buf: var openArray[byte], pos: int, val: PgCircle) =
     buf.writePointAt(pos, cr.center)
     buf.writeBE64(pos + 16, cast[int64](cr.radius))
 
-proc encodePointBinary*(p: PgPoint): seq[byte] =
+proc encodePointBinary*(p: PgPoint): seq[byte] {.raises: [PgProtocolError].} =
   ## Encode a point as 16 bytes (two float64 big-endian).
   result = newSeq[byte](16)
   result.writePointAt(0, p)
 
-proc toPgBinaryParam*(v: PgPoint): PgParam =
+proc toPgBinaryParam*(v: PgPoint): PgParam {.raises: [PgProtocolError].} =
   ## Binary format: 16 bytes (two float64 big-endian).
   PgParam(oid: OidPoint, format: 1, value: some(encodePointBinary(v)))
 
@@ -1082,7 +1084,7 @@ proc toPgBinaryParam*(v: PgBox): PgParam =
   data.writeBoxAt(0, v)
   PgParam(oid: OidBox, format: 1, value: some(data))
 
-proc toPgBinaryParam*(v: PgPath): PgParam =
+proc toPgBinaryParam*(v: PgPath): PgParam {.raises: [PgTypeError].} =
   ## Binary format: closed(1) + npts(4) + points(npts \* 16).
   let size = 1'i64 + 4'i64 + v.points.len.int64 * 16'i64
   checkPgBinPayload(size, "path")
@@ -1093,7 +1095,7 @@ proc toPgBinaryParam*(v: PgPath): PgParam =
     data.writePointAt(5 + i * 16, p)
   PgParam(oid: OidPath, format: 1, value: some(data))
 
-proc toPgBinaryParam*(v: PgPolygon): PgParam =
+proc toPgBinaryParam*(v: PgPolygon): PgParam {.raises: [PgTypeError].} =
   ## Binary format: npts(4) + points(npts \* 16).
   let size = 4'i64 + v.points.len.int64 * 16'i64
   checkPgBinPayload(size, "polygon")
@@ -1109,7 +1111,7 @@ proc toPgBinaryParam*(v: PgCircle): PgParam =
   data.writeCircleAt(0, v)
   PgParam(oid: OidCircle, format: 1, value: some(data))
 
-proc toPgBinaryParam*(v: JsonNode): PgParam =
+proc toPgBinaryParam*(v: JsonNode): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   PgParam(oid: OidJsonb, format: 1, value: some(encodeJsonbBinary(v)))
 
 # Geometric array encoders
@@ -1137,7 +1139,10 @@ genFixedArrayEncoder(PgCircle, OidCircleArray, OidCircle, 24):
 # Other array encoders
 
 template genStringArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
-  proc toPgParam*(v: seq[T]): PgParam =
+  proc toPgParam*(v: seq[T]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+    checkArrayLen(v.len)
+    for x in v:
+      checkPgBinLen(string(x).len, "string")
     var elements = newSeq[Option[seq[byte]]](v.len)
     for i, x in v:
       elements[i] = some(toBytes(string(x)))
@@ -1151,16 +1156,22 @@ genStringArrayEncoder(PgXml, OidXmlArray, OidXml)
 genStringArrayEncoder(PgTsVector, OidTsVectorArray, OidTsVector)
 genStringArrayEncoder(PgTsQuery, OidTsQueryArray, OidTsQuery)
 
-proc toPgBinaryParam*[T](v: seq[T]): PgParam =
+proc toPgBinaryParam*[T](
+    v: seq[T]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   toPgParam(v)
 
-proc toPgBinaryParam*(v: Option[JsonNode]): PgParam =
+proc toPgBinaryParam*(
+    v: Option[JsonNode]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   if v.isSome:
     toPgBinaryParam(v.get)
   else:
     PgParam(oid: OidJsonb, format: 1, value: none(seq[byte]))
 
-proc encodeHstoreBinary*(v: PgHstore): seq[byte] =
+proc encodeHstoreBinary*(
+    v: PgHstore
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode hstore as PostgreSQL binary format.
   ## Format: ``numPairs(int32) + [keyLen(int32) + keyData + valLen(int32) + valData]...``
   checkPgBinLen(v.len, "hstore pair count")
@@ -1192,17 +1203,20 @@ proc encodeHstoreBinary*(v: PgHstore): seq[byte] =
       result.writeBE32(pos, -1'i32)
       pos += 4
 
-proc toPgBinaryParam*(v: PgHstore, oid: int32): PgParam =
+proc toPgBinaryParam*(
+    v: PgHstore, oid: int32
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode hstore in binary format. Requires the dynamic hstore OID,
   ## obtained via ``lookupTypeOids(conn, @["hstore"])``.
   PgParam(oid: oid, format: 1, value: some(encodeHstoreBinary(v)))
 
-proc toPgParam*(v: seq[PgHstore]): PgParam =
+proc toPgParam*(v: seq[PgHstore]): PgParam {.raises: [PgTypeError].} =
   ## Send ``hstore[]`` in text format with OID 0 (unknown) so PostgreSQL infers
   ## the parameter type from context. Works with both ``SELECT $1::hstore[]``
   ## and ``INSERT INTO t(hstore_arr_col) VALUES($1)``. Prefer
   ## ``toPgBinaryParam`` when the hstore / ``hstore[]`` OIDs are available via
   ## ``lookupTypeOids`` (binary format, faster).
+  checkArrayLen(v.len)
   if v.len == 0:
     return PgParam(oid: 0'i32, format: 0, value: some(toBytes("{}")))
   var s = "{"
@@ -1215,14 +1229,18 @@ proc toPgParam*(v: seq[PgHstore]): PgParam =
         s.add('\\')
       s.add(c)
     s.add('"')
+    checkPgBinLen(s.len + 1, "hstore array")
   s.add('}')
-  PgParam(oid: 0'i32, format: 0, value: some(toBytes(s)))
+  textParam(0'i32, s, "hstore array")
 
-proc toPgBinaryParam*(v: seq[PgHstore], elemOid: int32, arrayOid: int32): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgHstore], elemOid: int32, arrayOid: int32
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode ``hstore[]`` in binary format. Requires the dynamic hstore and
   ## ``hstore[]`` OIDs, obtained in a single call via
   ## ``lookupTypeOids(conn, @["hstore"])`` (the result entry exposes
   ## ``oid`` and ``arrayOid``).
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, x in v:
     elements[i] = some(encodeHstoreBinary(x))
@@ -1232,7 +1250,9 @@ proc toPgBinaryParam*(v: seq[PgHstore], elemOid: int32, arrayOid: int32): PgPara
     value: some(encodeBinaryArray(elemOid, dimsFor1D(v.len), elements)),
   )
 
-proc toPgBinaryParam*[T](v: Option[T]): PgParam =
+proc toPgBinaryParam*[T](
+    v: Option[T]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   if v.isSome:
     result = toPgBinaryParam(v.get)
   else:
@@ -1249,7 +1269,9 @@ proc pgArrayElemOid*(_: typedesc[int16]): int32 =
 proc pgArrayArrayOid*(_: typedesc[int16]): int32 =
   OidInt2Array
 
-proc encodePgArrayElement*(v: int16): seq[byte] =
+proc encodePgArrayElement*(
+    v: int16
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   @(toBE16(v))
 
 proc pgArrayElemOid*(_: typedesc[int32]): int32 =
@@ -1258,7 +1280,9 @@ proc pgArrayElemOid*(_: typedesc[int32]): int32 =
 proc pgArrayArrayOid*(_: typedesc[int32]): int32 =
   OidInt4Array
 
-proc encodePgArrayElement*(v: int32): seq[byte] =
+proc encodePgArrayElement*(
+    v: int32
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   @(toBE32(v))
 
 proc pgArrayElemOid*(_: typedesc[int64]): int32 =
@@ -1267,7 +1291,9 @@ proc pgArrayElemOid*(_: typedesc[int64]): int32 =
 proc pgArrayArrayOid*(_: typedesc[int64]): int32 =
   OidInt8Array
 
-proc encodePgArrayElement*(v: int64): seq[byte] =
+proc encodePgArrayElement*(
+    v: int64
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   @(toBE64(v))
 
 proc pgArrayElemOid*(_: typedesc[float32]): int32 =
@@ -1276,7 +1302,9 @@ proc pgArrayElemOid*(_: typedesc[float32]): int32 =
 proc pgArrayArrayOid*(_: typedesc[float32]): int32 =
   OidFloat4Array
 
-proc encodePgArrayElement*(v: float32): seq[byte] =
+proc encodePgArrayElement*(
+    v: float32
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   @(toBE32(cast[int32](v)))
 
 proc pgArrayElemOid*(_: typedesc[float64]): int32 =
@@ -1285,7 +1313,9 @@ proc pgArrayElemOid*(_: typedesc[float64]): int32 =
 proc pgArrayArrayOid*(_: typedesc[float64]): int32 =
   OidFloat8Array
 
-proc encodePgArrayElement*(v: float64): seq[byte] =
+proc encodePgArrayElement*(
+    v: float64
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   @(toBE64(cast[int64](v)))
 
 proc pgArrayElemOid*(_: typedesc[bool]): int32 =
@@ -1294,7 +1324,9 @@ proc pgArrayElemOid*(_: typedesc[bool]): int32 =
 proc pgArrayArrayOid*(_: typedesc[bool]): int32 =
   OidBoolArray
 
-proc encodePgArrayElement*(v: bool): seq[byte] =
+proc encodePgArrayElement*(
+    v: bool
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   @[if v: 1'u8 else: 0'u8]
 
 proc pgArrayElemOid*(_: typedesc[string]): int32 =
@@ -1303,7 +1335,9 @@ proc pgArrayElemOid*(_: typedesc[string]): int32 =
 proc pgArrayArrayOid*(_: typedesc[string]): int32 =
   OidTextArray
 
-proc encodePgArrayElement*(v: string): seq[byte] =
+proc encodePgArrayElement*(
+    v: string
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toBytes(v)
 
 proc pgArrayElemOid*(_: typedesc[PgUuid]): int32 =
@@ -1312,7 +1346,9 @@ proc pgArrayElemOid*(_: typedesc[PgUuid]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgUuid]): int32 =
   OidUuidArray
 
-proc encodePgArrayElement*(v: PgUuid): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgUuid
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgNumeric]): int32 =
@@ -1321,7 +1357,9 @@ proc pgArrayElemOid*(_: typedesc[PgNumeric]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgNumeric]): int32 =
   OidNumericArray
 
-proc encodePgArrayElement*(v: PgNumeric): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgNumeric
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   encodeNumericBinary(v)
 
 proc pgArrayElemOid*(_: typedesc[PgMoney]): int32 =
@@ -1340,7 +1378,9 @@ proc pgArrayElemOid*(_: typedesc[PgBit]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgBit]): int32 =
   OidVarbitArray
 
-proc encodePgArrayElement*(v: PgBit): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgBit
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgInterval]): int32 =
@@ -1349,7 +1389,9 @@ proc pgArrayElemOid*(_: typedesc[PgInterval]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgInterval]): int32 =
   OidIntervalArray
 
-proc encodePgArrayElement*(v: PgInterval): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgInterval
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgTime]): int32 =
@@ -1358,7 +1400,9 @@ proc pgArrayElemOid*(_: typedesc[PgTime]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgTime]): int32 =
   OidTimeArray
 
-proc encodePgArrayElement*(v: PgTime): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgTime
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgTimeTz]): int32 =
@@ -1367,7 +1411,9 @@ proc pgArrayElemOid*(_: typedesc[PgTimeTz]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgTimeTz]): int32 =
   OidTimeTzArray
 
-proc encodePgArrayElement*(v: PgTimeTz): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgTimeTz
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgInet]): int32 =
@@ -1376,7 +1422,9 @@ proc pgArrayElemOid*(_: typedesc[PgInet]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgInet]): int32 =
   OidInetArray
 
-proc encodePgArrayElement*(v: PgInet): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgInet
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   encodeInetBinary(v.address, v.mask, false)
 
 proc pgArrayElemOid*(_: typedesc[PgCidr]): int32 =
@@ -1385,7 +1433,9 @@ proc pgArrayElemOid*(_: typedesc[PgCidr]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgCidr]): int32 =
   OidCidrArray
 
-proc encodePgArrayElement*(v: PgCidr): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgCidr
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   encodeInetBinary(v.address, v.mask, true)
 
 proc pgArrayElemOid*(_: typedesc[PgMacAddr]): int32 =
@@ -1394,7 +1444,9 @@ proc pgArrayElemOid*(_: typedesc[PgMacAddr]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgMacAddr]): int32 =
   OidMacAddrArray
 
-proc encodePgArrayElement*(v: PgMacAddr): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgMacAddr
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgMacAddr8]): int32 =
@@ -1403,7 +1455,9 @@ proc pgArrayElemOid*(_: typedesc[PgMacAddr8]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgMacAddr8]): int32 =
   OidMacAddr8Array
 
-proc encodePgArrayElement*(v: PgMacAddr8): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgMacAddr8
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgXml]): int32 =
@@ -1412,7 +1466,9 @@ proc pgArrayElemOid*(_: typedesc[PgXml]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgXml]): int32 =
   OidXmlArray
 
-proc encodePgArrayElement*(v: PgXml): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgXml
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toBytes(string(v))
 
 proc pgArrayElemOid*(_: typedesc[PgPoint]): int32 =
@@ -1421,7 +1477,9 @@ proc pgArrayElemOid*(_: typedesc[PgPoint]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgPoint]): int32 =
   OidPointArray
 
-proc encodePgArrayElement*(v: PgPoint): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgPoint
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   encodePointBinary(v)
 
 proc pgArrayElemOid*(_: typedesc[PgLine]): int32 =
@@ -1430,7 +1488,9 @@ proc pgArrayElemOid*(_: typedesc[PgLine]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgLine]): int32 =
   OidLineArray
 
-proc encodePgArrayElement*(v: PgLine): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgLine
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgLseg]): int32 =
@@ -1439,7 +1499,9 @@ proc pgArrayElemOid*(_: typedesc[PgLseg]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgLseg]): int32 =
   OidLsegArray
 
-proc encodePgArrayElement*(v: PgLseg): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgLseg
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgBox]): int32 =
@@ -1448,7 +1510,9 @@ proc pgArrayElemOid*(_: typedesc[PgBox]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgBox]): int32 =
   OidBoxArray
 
-proc encodePgArrayElement*(v: PgBox): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgBox
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgPath]): int32 =
@@ -1457,7 +1521,9 @@ proc pgArrayElemOid*(_: typedesc[PgPath]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgPath]): int32 =
   OidPathArray
 
-proc encodePgArrayElement*(v: PgPath): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgPath
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgPolygon]): int32 =
@@ -1466,7 +1532,9 @@ proc pgArrayElemOid*(_: typedesc[PgPolygon]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgPolygon]): int32 =
   OidPolygonArray
 
-proc encodePgArrayElement*(v: PgPolygon): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgPolygon
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgCircle]): int32 =
@@ -1475,7 +1543,9 @@ proc pgArrayElemOid*(_: typedesc[PgCircle]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgCircle]): int32 =
   OidCircleArray
 
-proc encodePgArrayElement*(v: PgCircle): seq[byte] =
+proc encodePgArrayElement*(
+    v: PgCircle
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[JsonNode]): int32 =
@@ -1484,7 +1554,9 @@ proc pgArrayElemOid*(_: typedesc[JsonNode]): int32 =
 proc pgArrayArrayOid*(_: typedesc[JsonNode]): int32 =
   OidJsonbArray
 
-proc encodePgArrayElement*(v: JsonNode): seq[byte] =
+proc encodePgArrayElement*(
+    v: JsonNode
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   encodeJsonbBinary(v)
 
 # Fixed-width registry: element byte width plus a write-in-place primitive for
@@ -1542,7 +1614,7 @@ fixedArrayElem(PgBox, 32):
 fixedArrayElem(PgCircle, 24):
   buf.writeCircleAt(pos, v)
 
-proc toPgParam*[T](v: PgArray[T]): PgParam =
+proc toPgParam*[T](v: PgArray[T]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode an N-dimensional ``PgArray[T]`` as a PostgreSQL binary array
   ## parameter. ``T`` must be a registered scalar type — see the
   ## ``pgArrayElemOid`` / ``encodePgArrayElement`` overloads above.
@@ -1613,6 +1685,11 @@ proc toPgParam*[T](v: PgArray[T]): PgParam =
       writePgArrayElementAt(buf, pos, v.elements[i].get)
     PgParam(oid: arrayOid, format: 1, value: some(buf))
   else:
+    if v.elements.len > int32.high.int:
+      raise newException(
+        PgTypeError,
+        "Array has too many elements for PostgreSQL binary format: " & $v.elements.len,
+      )
     var elements = newSeq[Option[seq[byte]]](v.elements.len)
     for i, oe in v.elements:
       if oe.isSome:
@@ -1625,7 +1702,9 @@ proc toPgParam*[T](v: PgArray[T]): PgParam =
       value: some(encodeBinaryArray(elemOid, v.dims, v.lowerBounds, elements)),
     )
 
-proc toPgMoneyArrayNDParam*(v: PgArray[PgMoney], scale: int = 2): PgParam =
+proc toPgMoneyArrayNDParam*(
+    v: PgArray[PgMoney], scale: int = 2
+): PgParam {.raises: [PgTypeError].} =
   ## Encoder counterpart to ``getMoneyArrayND``. PostgreSQL's binary ``money``
   ## wire format only carries the raw amount; the fractional-digit count is
   ## determined by the server's ``lc_monetary``. ``scale`` declares the
@@ -1633,14 +1712,14 @@ proc toPgMoneyArrayNDParam*(v: PgArray[PgMoney], scale: int = 2): PgParam =
   ## and every non-NULL element's ``scale`` field must match it — otherwise
   ## a silent value mismatch on the server is likely.
   ##
-  ## Raises ``PgError`` when ``scale`` is outside ``0..18`` or when any
+  ## Raises ``PgTypeError`` when ``scale`` is outside ``0..18`` or when any
   ## element's ``scale`` differs from the parameter.
   if scale < 0 or scale > 18:
-    raise newException(PgError, "PgMoney scale out of range: " & $scale)
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
   for idx, oe in v.elements:
     if oe.isSome and int(oe.get.scale) != scale:
       raise newException(
-        PgError,
+        PgTypeError,
         "PgMoney array element[" & $idx & "].scale=" & $oe.get.scale &
           " does not match declared scale=" & $scale &
           " (server lc_monetary frac_digits)",
@@ -1695,7 +1774,7 @@ proc coerceBinaryParam*(param: PgParam, serverOid: int32): PgParam =
 
 proc addParse*(
     buf: var seq[byte], stmtName: string, sql: string, params: openArray[PgParam]
-) =
+) {.raises: [PgTypeError, PgProtocolError].} =
   let msgStart = buf.len
   buf.add(byte('P'))
   buf.addInt32(0) # length placeholder
@@ -1712,7 +1791,7 @@ proc addBind*(
     stmtName: string,
     params: openArray[PgParam],
     resultFormats: openArray[int16] = [],
-) =
+) {.raises: [PgTypeError, PgProtocolError].} =
   let msgStart = buf.len
   buf.add(byte('B'))
   buf.addInt32(0) # length placeholder

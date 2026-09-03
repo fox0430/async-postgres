@@ -1,12 +1,16 @@
 import std/[unittest, options, strutils, tables, importutils]
 
-import ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection]
+import
+  ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection, pg_errors]
 import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_types/[core, encoding]
 
 privateAccess(PgConnection)
 
+# `checkCopyDataLen` comes from pg_protocol itself: it is exported for direct
+# importers but kept off the `async_postgres` whitelist, so these tests exercise
+# the production guard rather than a copy of it.
 proc parseBackendMessage(buf: var seq[byte]): ParseResult =
   ## Test-only wrapper that preserves the old var-buf interface.
   var consumed: int
@@ -46,72 +50,78 @@ suite "Byte helpers":
 
   test "addCString rejects embedded NUL":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("abc\0def")
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("\0")
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("trailing\0")
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("\0leading")
+
+  test "addCString NUL rejection is catchable as PgError":
+    # The direct exec/query path reaches addCString without a pre-flight
+    # validateParseMsg, so it has to satisfy the same `except PgError` contract.
+    var buf: seq[byte] = @[]
+    expect(PgError):
+      buf.addCString("a\0b")
 
   test "addCString leaves buffer unchanged on rejection":
     var buf: seq[byte] = @[byte('x')]
     try:
       buf.addCString("a\0b")
-    except ValueError:
+    except PgTypeError:
       discard
     check buf == @[byte('x')]
 
   test "encodeStartup rejects NUL in user":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice\0is_superuser", "db")
 
   test "encodeStartup rejects NUL in database":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice", "db\0options=-c")
 
   test "encodeStartup rejects NUL in extra params":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup(
         "alice", "db", [("application_name", "app\0options=-c log_statement=all")]
       )
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice", "db", [("app\0name", "value")])
 
   test "encodeStartup rejects empty key in extra params":
     # Empty key would encode as a lone NUL, matching the parameter-list
     # terminator and silently truncating the remaining parameters.
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice", "db", [("", "value")])
-    expect(ValueError):
+    expect(PgTypeError):
       discard
         encodeStartup("alice", "db", [("application_name", "app"), ("", "injected")])
-
   test "encodeQuery rejects NUL in sql":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeQuery("SELECT 1\0; DROP TABLE users")
 
   test "encodePassword rejects NUL":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodePassword("pass\0word")
 
   test "encodeParse rejects NUL in stmtName or sql":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeParse("stmt\0", "SELECT 1")
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeParse("stmt", "SELECT \x001")
 
   test "encodeDescribe / encodeExecute / encodeClose reject NUL in name":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeDescribe(dkPortal, "portal\0name")
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeExecute("portal\0name", 0)
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeClose(dkStatement, "stmt\0name")
 
   test "encodeCopyFail rejects NUL in errorMsg":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeCopyFail("bad\0msg")
 
   test "decodeCString":
@@ -272,27 +282,27 @@ suite "Frontend encoding":
 
   test "encodeParse rejects param-type count over the Int16 maximum":
     # int16(n) would raise an uncatchable RangeDefect (or wrap under -d:danger);
-    # the explicit guard turns it into a catchable ValueError before encoding.
-    expect(ValueError):
+    # the explicit guard turns it into a PgTypeError before encoding.
+    expect(PgTypeError):
       discard encodeParse("s", "SELECT 1", newSeq[int32](maxCount + 1))
 
   test "encodeBind rejects counts over the Int16 maximum":
     expect( # parameter-value count
-      ValueError
+      PgTypeError
     ):
       discard encodeBind("", "s", @[], newSeq[Option[seq[byte]]](maxCount + 1))
     expect( # parameter-format count
-      ValueError
+      PgTypeError
     ):
       discard encodeBind("", "s", newSeq[int16](maxCount + 1), @[])
     expect( # result-format count
-      ValueError
+      PgTypeError
     ):
       discard encodeBind("", "s", @[], @[], newSeq[int16](maxCount + 1))
 
   test "addBindRaw rejects param-range count over the Int16 maximum":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addBindRaw("", "s", @[], @[], newSeq[tuple[off, len: int32]](maxCount + 1))
 
   test "encodeBind accepts exactly the Int16 maximum count":
@@ -318,23 +328,34 @@ suite "Frontend encoding":
 
   test "addLen32 rejects a length over the Int32 maximum":
     # int32(n) would raise an uncatchable RangeDefect (or wrap under -d:danger);
-    # the guard turns it into a catchable ValueError before any payload is
-    # appended. Exceeding the limit requires a 64-bit `int`.
+    # the guard turns it into a PgTypeError before any payload is appended, so
+    # `except PgError` covers it. Exceeding the limit requires a 64-bit `int`.
     when sizeof(int) > 4:
       var buf: seq[byte] = @[]
-      expect(ValueError):
+      expect(PgTypeError):
         buf.addLen32(maxLen + 1, "test")
       check buf.len == 0 # nothing written on rejection
 
+  test "wire-length and count guards are catchable as PgError":
+    # Hand-built params reach these guards directly, bypassing toPgParam.
+    var buf: seq[byte] = @[]
+    expect(PgError):
+      buf.addCount16(maxCount + 1, "test")
+    when sizeof(int) > 4:
+      expect(PgError):
+        buf.addLen32(maxLen + 1, "test")
+    expect(PgError):
+      buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(0), len: int32(-2))], [])
+
   test "addCount16 rejects negative count":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCount16(-1, "test")
     check buf.len == 0 # nothing written on rejection
 
   test "addLen32 rejects negative length":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addLen32(-1, "test")
     check buf.len == 0 # nothing written on rejection
 
@@ -355,12 +376,12 @@ suite "Frontend encoding":
     # low-level encodeParse overload in pg_protocol. The message header is
     # written before the count field, so the buffer is not empty on rejection.
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addParse("s", "SELECT 1", newSeq[PgParam](maxCount + 1))
 
   test "encoding addBind rejects param count over Int16 maximum":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addBind("", "s", newSeq[PgParam](maxCount + 1))
 
   test "encoding addBind accepts exactly the Int16 maximum count":
@@ -421,6 +442,14 @@ suite "Frontend encoding":
     check msg[0] == byte('d')
     check decodeInt32(msg, 1) == 7'i32 # 4 + 3
 
+  test "encodeCopyData accepts a payload inside the Int32 budget":
+    # The oversized path is pinned by the "CopyData oversized chunk guard"
+    # suite below, without a 2 GiB allocation.
+    var sm: seq[byte]
+    encodeCopyData(sm, @[1'u8, 2, 3])
+    check sm.len == 8
+    check int64(int32.high) > int64(maxInt32Len - 4)
+
   test "encodeCopyDone":
     let msg = encodeCopyDone()
     check msg.len == 5
@@ -430,6 +459,39 @@ suite "Frontend encoding":
     let msg = encodeCopyFail("error")
     check msg[0] == byte('f')
     check decodeInt32(msg, 1) == int32(msg.len - 1)
+
+suite "CopyData oversized chunk guard":
+  test "checkCopyDataLen boundary values run the real raise path":
+    # pg_protocol's own guard, called by encodeCopyData, so the boundary is
+    # exercised without a huge allocation. copyInStreamImpl catches
+    # `CatchableError` to take the CopyFail path (csReady) rather than the
+    # transport-failure path, so the guard must raise one — a regression to a
+    # plain ValueError also escapes `except PgError` (pg_errors.nim conventions).
+    checkCopyDataLen(0)
+    checkCopyDataLen(maxInt32Len - 4) # Int32 length field covers itself + payload
+    var caught = false
+    try:
+      checkCopyDataLen(maxInt32Len - 3)
+    except CatchableError as e:
+      check e of PgTypeError
+      check e of PgError
+      caught = true
+    check caught
+
+  test "encodeCopyData delegates to checkCopyDataLen":
+    # Length-only view: the guard rejects before a byte is read, so the real
+    # encoder is reached without allocating ~2 GiB. The base is nil on purpose
+    # — a regression that drops the guard faults on the first byte instead of
+    # copying ~2 GiB out of whatever follows a live buffer.
+    var msg: seq[byte]
+    expect PgTypeError:
+      encodeCopyData(
+        msg, toOpenArray(cast[ptr UncheckedArray[byte]](nil), 0, maxInt32Len - 3)
+      )
+    check msg.len == 0
+    # Legal payload still encodes.
+    encodeCopyData(msg, @[1'u8])
+    check msg.len == 6
 
 suite "Backend decoding":
   # Helper to build a backend message byte buffer

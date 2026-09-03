@@ -1,10 +1,11 @@
-import std/[unittest, deques, tables, strutils, importutils]
+import std/[unittest, deques, tables, strutils, options, importutils, json]
 
 import ../async_postgres/async_backend
 when hasChronos:
   import pkg/chronos/streams/asyncstream
 
 import ../async_postgres/[pg_protocol, pg_types, pg_connection]
+import ../async_postgres/pg_types/encoding
 import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/simple_query
 import ../async_postgres/pg_connection/cache
@@ -4055,3 +4056,52 @@ suite "Pool warmup parallelization":
     waitFor t()
     check ok
     check idleAfter == 2
+
+suite "Array encoder guards are catchable and do not disturb valid input":
+  ## What these guards reject needs a 2 GiB allocation, which a unit test
+  ## cannot make. So: pin that the primitives raise a catchable `PgTypeError`
+  ## (not a `Defect`, not an OOM), and drive every encoder family with valid
+  ## input so a guard cannot quietly change what it emits.
+  ##
+  ## Deliberately *not* covered: the array encoders bound one element and the
+  ## element count, but the total payload is still summed inside
+  ## `encodeBinaryArray` — after every element has been built. An array whose
+  ## elements each pass but whose sum does not is allocated in full before it
+  ## is rejected.
+
+  test "guard primitives raise a catchable PgTypeError":
+    expect PgTypeError:
+      discard dimsFor1D(int32.high.int + 1)
+    expect PgTypeError:
+      checkPgBinLen(maxInt32Len + 1, "string")
+    expect PgTypeError:
+      checkPgBinLen(maxInt32Len + 1, "bytea")
+    expect PgTypeError:
+      checkPgBinPayload(int64(int32.high) + 1, "Array")
+
+  test "binary array encoders still emit what they emitted":
+    let strs = toPgParam(@["a", "b"])
+    check strs.oid == OidTextArray
+    check strs.format == 1'i16
+    check strs.value.get ==
+      encodeBinaryArray(OidText, @[2'i32], @[some(toBytes("a")), some(toBytes("b"))])
+    check toPgParam(@[some("x"), none(string)]).value.get ==
+      encodeBinaryArray(OidText, @[2'i32], @[some(toBytes("x")), none(seq[byte])])
+    check toPgParam(newSeq[string](0)).value.get == encodeBinaryArray(OidText, @[], @[])
+    check toPgByteaArrayParam(@[@[1'u8, 2], @[3'u8]]).value.isSome
+
+  test "every guarded encoder family still round-trips a small value":
+    check toPgParam(@[parsePgNumeric("123.45")]).value.isSome
+    check toPgParam(@[PgPath(closed: true, points: @[PgPoint(x: 1, y: 2)])]).value.isSome
+    check toPgBinaryParam(@[PgBit(nbits: 3, data: @[0b101'u8])]).value.isSome
+    check toPgParam(@[newJInt(1), newJInt(2)]).value.isSome
+    check toPgParam(@[PgXml("a"), PgXml("b")]).value.isSome
+
+  test "hstore text encoders emit the same literal with the per-entry bound":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["k"] = some("v")
+    check encodeHstoreText(h) == "\"k\"=>\"v\""
+    check toPgParam(h).value.get.toString == "\"k\"=>\"v\""
+    check toPgParam(newSeq[PgHstore](0)).value.get.toString == "{}"
+    check toPgParam(@[h]).value.get.toString == "{\"\\\"k\\\"=>\\\"v\\\"\"}"
+    check toPgBinaryParam(@[PgHstore()], 9999'i32, 9998'i32).value.isSome

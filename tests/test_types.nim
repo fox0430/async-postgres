@@ -1439,6 +1439,40 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard parseTimestampText("-infinity")
 
+  test "parseTimestampText invalid format raises PgTypeError (catchable via PgError)":
+    for bad in ["not-a-timestamp", "2026-13-99", "2026-02-30T25:61:61", ""]:
+      var raisedAsPgType = false
+      var raisedAsPgError = false
+      try:
+        discard parseTimestampText(bad)
+      except PgTypeError:
+        raisedAsPgType = true
+      except PgError:
+        discard
+      try:
+        discard parseTimestampText(bad)
+      except PgError:
+        raisedAsPgError = true
+      check raisedAsPgType
+      check raisedAsPgError
+
+  test "parseDateText invalid format raises PgTypeError (catchable via PgError)":
+    for bad in ["not-a-date", "2026-13-01", "2026-02-30", ""]:
+      var raisedAsPgType = false
+      var raisedAsPgError = false
+      try:
+        discard parseDateText(bad)
+      except PgTypeError:
+        raisedAsPgType = true
+      except PgError:
+        discard
+      try:
+        discard parseDateText(bad)
+      except PgError:
+        raisedAsPgError = true
+      check raisedAsPgType
+      check raisedAsPgError
+
   test "getDate binary unexpected length":
     let fields = @[mkField(OidDate, 1)]
     let row = mkRow(@[some(newSeq[byte](2))], fields) # 2 bytes (expected 4)
@@ -2107,6 +2141,34 @@ suite "Array toPgParam (binary)":
     let p = toPgParam(none(seq[int32]))
     check p.oid == OidInt4Array
     check p.value.isNone
+
+suite "Binary container overflow guards":
+  test "checkPgBinLen pins PgTypeError (catchable via PgError)":
+    # The pg_errors conventions route oversized wire values through PgTypeError
+    # so a single `except PgError` clause sees them; a bare ValueError would
+    # escape that recovery path.
+    when sizeof(int) >= 8:
+      expect PgTypeError:
+        checkPgBinLen(int(int32.high) + 1, "Array element")
+
+  test "checkPgBinPayload pins PgTypeError (catchable via PgError)":
+    expect PgTypeError:
+      checkPgBinPayload(int64(int32.high) + 1, "Array")
+
+  test "seq[int32] payload guard fires before the result buffer is allocated":
+    # Drive the real `buildFixedArray` template with the first count whose
+    # cumulative payload exceeds int32.high. Its `checkPgBinPayload` runs ahead
+    # of the ~2 GiB `newSeq`, so no large allocation happens: the guard raises
+    # first and the per-element writer never runs. Deleting the guard would
+    # either raise a different error or attempt the huge allocation, so this
+    # pins the wiring rather than just the arithmetic.
+    const elemSize = 4
+    const headerSize = 12 + 8 * 1
+    const cnt = (int32.high - headerSize) div (4 + elemSize) + 1
+    check int64(headerSize) + int64(cnt - 1) * int64(4 + elemSize) <= int64(int32.high)
+    expect PgTypeError:
+      buildFixedArray(1'i32, @[int32(cnt)], @[1'i32], cnt, elemSize):
+        discard
 
 suite "parseTextArray":
   test "empty array":
@@ -7781,7 +7843,7 @@ suite "toPgParamInline":
     check inlinePayload(p) == @(toBytes(string(u)))
 
   test "PgMoney encodes int64 amount only":
-    let m = PgMoney(amount: 12345'i64, scale: 2'i8)
+    let m = initPgMoney(12345'i64, 2'i8)
     let p = toPgParamInline(m)
     check p.oid == OidMoney
     check p.len == 8
@@ -7805,15 +7867,76 @@ suite "toPgParamInline":
     check p.format == 0
     check p.len == -1
 
-  test "string too large raises ValueError":
+  test "string length guard raises PgTypeError":
+    # PgTypeError is a PgError subtype, so `except PgError` covers this too.
+    check int64(maxInt32Len) == int64(int32.high)
     when sizeof(int) >= 8:
-      expect ValueError:
+      # maxInt32Len is high(int) on a 32-bit target, so `+ 1` would overflow.
+      expect PgTypeError:
+        checkPgBinLen(maxInt32Len + 1, "string")
+      # Through the encoder: a helper-only check stays green if the guard is
+      # dropped from toPgParamInline, leaving a RangeDefect on int32(v.len).
+      expect PgTypeError:
         discard toPgParamInline(newString(int(int32.high) + 1))
+    check toPgParamInline("a").len == 1
 
-  test "seq[byte] too large raises ValueError":
+  test "seq[byte] length guard raises PgTypeError":
     when sizeof(int) >= 8:
-      expect ValueError:
+      expect PgTypeError:
+        checkPgBinLen(maxInt32Len + 1, "bytea")
+      expect PgTypeError:
         discard toPgParamInline(newSeq[byte](int(int32.high) + 1))
+    check toPgParamInline(@[1'u8, 2]).len == 2
+
+  test "toPgParam string and seq[byte] share the inline length guard":
+    # The guard fires before addBind's own PgTypeError, with the value's label.
+    check toPgParam("a").value.get.len == 1
+    check toPgParam(@[1'u8, 2]).value.get.len == 2
+
+  test "unbounded text encoders reject oversized payloads with PgTypeError":
+    # One boundary pair pins the helper, which branches on the length alone.
+    # The shared funnels are then proven end to end with a single oversized
+    # value each (`textParam` via `toPgParam`, direct `checkPgBinLen` via
+    # `toPgBinaryParam`); every encoder below reaches one of those two funnels,
+    # so removing either guard fails here. The small-value paths pin that each
+    # encoder routes into its funnel.
+    checkPgBinLen(maxInt32Len, "xml")
+    when sizeof(int) >= 8:
+      expect PgTypeError:
+        checkPgBinLen(maxInt32Len + 1, "xml")
+      let huge = newString(maxInt32Len + 1)
+      expect PgTypeError:
+        discard toPgParam(PgXml(huge))
+      expect PgTypeError:
+        discard toPgBinaryParam(PgXml(huge))
+    check toPgParam(PgXml("<a/>")).value.get.len == 4
+    check toPgParam(PgTsVector("a")).value.get.len == 1
+    check toPgParam(PgTsQuery("a")).value.get.len == 1
+    check toPgParam(%*{"a": 1}).value.get.len > 0
+    check toPgBinaryParam("a").value.get.len == 1
+    check toPgBinaryParam(PgXml("a")).value.get.len == 1
+    check toPgBinaryParam(@[1'u8, 2'u8]).value.get.len == 2
+
+  test "hstore/json/varbit/path/polygon text encoders stay PgTypeError via textParam":
+    # Every encoder here reaches the shared `textParam` funnel, whose rejection
+    # is proven end to end in the sibling test above; the success paths below
+    # pin that each encoder routes into that funnel with its label.
+    check textParam(OidText, "a", "hstore").value.get.len == 1
+    check toPgParam(PgHstore(initTable[string, Option[string]]())).value.isSome
+    check toPgParam(PgBit(nbits: 1, data: @[0b10000000'u8])).value.get.len > 0
+    check toPgParam(PgPath(closed: false, points: @[PgPoint(x: 0, y: 0)])).value.get.len >
+      0
+    check toPgParam(PgPolygon(points: @[PgPoint(x: 0, y: 0)])).value.get.len > 0
+    check toPgParam(PgNumeric(weight: 0, sign: pgPositive, dscale: 0, digits: @[1'i16])).value.get.len >
+      0
+    check encodeJsonbBinary(%*{"a": 1}).len == 1 + ($(%*{"a": 1})).len
+
+  test "cumulative payload guard boundary":
+    # checkPgBinPayload backs json, arrays, ranges, hstore and the geometric
+    # encoders; int64 input keeps the boundary reachable without allocating.
+    checkPgBinPayload(int64(int32.high), "json (with version byte)")
+    expect PgTypeError:
+      checkPgBinPayload(int64(int32.high) + 1, "json (with version byte)")
 
 suite "addBindRaw wire-format parity":
   test "single int32 param matches addBind":
@@ -7869,21 +7992,21 @@ suite "addBindRaw wire-format parity":
     check legacyBuf == rawBuf
 
 suite "addBindRaw range validation":
-  test "range len below -1 raises ValueError":
+  test "range len below -1 raises PgTypeError":
     var buf: seq[byte] = @[]
-    expect ValueError:
+    expect PgTypeError:
       buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(0), len: int32(-2))], [])
 
-  test "negative off with non-zero len raises ValueError":
+  test "negative off with non-zero len raises PgTypeError":
     var buf: seq[byte] = @[]
     let data = @[byte 1, 2, 3, 4]
-    expect ValueError:
+    expect PgTypeError:
       buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(-1), len: int32(4))], [])
 
-  test "off + len past paramData.len raises ValueError":
+  test "off + len past paramData.len raises PgTypeError":
     var buf: seq[byte] = @[]
     let data = @[byte 1, 2, 3, 4]
-    expect ValueError:
+    expect PgTypeError:
       # off + len == 5, data.len == 4 — reads past end
       buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(1), len: int32(4))], [])
 
@@ -8040,7 +8163,6 @@ suite "flattenInline SoA layout":
       check o == OidInt4
     for f in formats:
       check f == 1'i16
-
 suite "Pipeline appendInline SoA layout":
   test "single op: inlineStart/Count correct, ranges point into p.inlineData":
     privateAccess(Pipeline)
@@ -8146,7 +8268,6 @@ suite "Pipeline appendInline SoA layout":
     check p.ops[1].inlineStart == 2 # resumes after the two params of op A
     check p.ops[1].inlineCount == 0
     check p.inlineRanges.len == 2 # unchanged by op B
-
 suite "encodeBinaryArray with Option elements":
   test "mixed null and non-null int32":
     let elements = @[some(@(toBE32(1'i32))), none(seq[byte]), some(@(toBE32(3'i32)))]
@@ -8726,13 +8847,12 @@ suite "PgArray[T] registry compile-time errors":
   test "encodePgArrayElement(PgMoney) is not exposed":
     # Removed to force callers through toPgMoneyArrayNDParam, which
     # validates the scale invariant against the server's frac_digits.
-    check not compiles(encodePgArrayElement(PgMoney(amount: 0, scale: 2)))
+    check not compiles(encodePgArrayElement(initPgMoney(0, 2)))
 
 suite "getMoneyArrayND scale":
   test "getMoneyArrayND default scale=2":
     # Build a money[] wire payload with two amounts: 12345 (= $123.45) and 100.
-    let src =
-      pgArray(@[PgMoney(amount: 12345, scale: 2), PgMoney(amount: 100, scale: 2)])
+    let src = pgArray(@[initPgMoney(12345, 2), initPgMoney(100, 2)])
     let bin = toPgMoneyArrayNDParam(src).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8742,7 +8862,7 @@ suite "getMoneyArrayND scale":
     check got.elements[0].get.scale == 2
 
   test "getMoneyArrayND honors explicit scale":
-    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let src = pgArray(@[initPgMoney(12345, 3)])
     let bin = toPgMoneyArrayNDParam(src, scale = 3).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8751,7 +8871,7 @@ suite "getMoneyArrayND scale":
     check got.elements[0].get.amount == 12345
 
   test "getMoneyArrayND rejects bad scale":
-    let src = pgArray(@[PgMoney(amount: 1, scale: 2)])
+    let src = pgArray(@[initPgMoney(1, 2)])
     let bin = toPgMoneyArrayNDParam(src).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8766,7 +8886,7 @@ suite "getMoneyArrayND scale":
     check getMoneyArrayNDOpt(row, 0) == none(PgArray[PgMoney])
 
   test "getMoneyArrayND by name forwards scale":
-    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let src = pgArray(@[initPgMoney(12345, 3)])
     let bin = toPgMoneyArrayNDParam(src, scale = 3).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8781,8 +8901,7 @@ suite "getMoneyArrayND scale":
 
 suite "toPgMoneyArrayNDParam":
   test "toPgMoneyArrayNDParam roundtrip with default scale":
-    let src =
-      pgArray(@[PgMoney(amount: 100, scale: 2), PgMoney(amount: -250, scale: 2)])
+    let src = pgArray(@[initPgMoney(100, 2), initPgMoney(-250, 2)])
     let p = toPgMoneyArrayNDParam(src)
     check p.oid == OidMoneyArray
     check p.format == 1
@@ -8795,7 +8914,7 @@ suite "toPgMoneyArrayNDParam":
     check got.elements[1].get.scale == 2
 
   test "toPgMoneyArrayNDParam roundtrip with explicit scale=3":
-    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let src = pgArray(@[initPgMoney(12345, 3)])
     let p = toPgMoneyArrayNDParam(src, scale = 3)
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(p.value.get)], fields)
@@ -8807,10 +8926,10 @@ suite "toPgMoneyArrayNDParam":
     let src = pgArray(
       @[2'i32, 2],
       @[
-        some(PgMoney(amount: 1, scale: 2)),
+        some(initPgMoney(1, 2)),
         none(PgMoney),
-        some(PgMoney(amount: 2, scale: 2)),
-        some(PgMoney(amount: 3, scale: 2)),
+        some(initPgMoney(2, 2)),
+        some(initPgMoney(3, 2)),
       ],
     )
     let p = toPgMoneyArrayNDParam(src)
@@ -8822,15 +8941,15 @@ suite "toPgMoneyArrayNDParam":
     check got.elements[2].get.amount == 2
 
   test "toPgMoneyArrayNDParam rejects element scale mismatch":
-    let src = pgArray(@[PgMoney(amount: 1, scale: 2), PgMoney(amount: 2, scale: 3)])
-    expect PgError:
+    let src = pgArray(@[initPgMoney(1, 2), initPgMoney(2, 3)])
+    expect PgTypeError:
       discard toPgMoneyArrayNDParam(src, scale = 2)
 
   test "toPgMoneyArrayNDParam rejects bad scale argument":
-    let src = pgArray(@[PgMoney(amount: 1, scale: 2)])
-    expect PgError:
+    let src = pgArray(@[initPgMoney(1, 2)])
+    expect PgTypeError:
       discard toPgMoneyArrayNDParam(src, scale = -1)
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayNDParam(src, scale = 19)
 
   test "toPgMoneyArrayNDParam empty array":
@@ -8854,7 +8973,7 @@ suite "toPgMoneyArrayParam":
   test "toPgParam seq[PgMoney] rejects non-default element scale":
     # The bare toPgParam path declares scale=2; a scale-0 element would be
     # silently encoded as the wrong money value, so it must be rejected.
-    expect PgError:
+    expect PgTypeError:
       discard toPgParam(@[initPgMoney(100), initPgMoney(50, scale = 0)])
 
   test "toPgMoneyArrayParam honors explicit scale=0 roundtrip":
@@ -8867,14 +8986,14 @@ suite "toPgMoneyArrayParam":
 
   test "toPgMoneyArrayParam rejects element scale mismatch":
     let values = @[initPgMoney(1, scale = 2), initPgMoney(2, scale = 3)]
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayParam(values, scale = 2)
 
   test "toPgMoneyArrayParam rejects bad scale argument":
     let values = @[initPgMoney(1)]
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayParam(values, scale = -1)
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayParam(values, scale = 19)
 
   test "toPgMoneyArrayParam empty array":
@@ -9458,3 +9577,29 @@ suite "Negative column index":
         discard row.isNull(-1)
       expect PgError:
         discard row.isNull(row.len + 5)
+
+suite "Text array encoders bound the literal they build":
+  # The guards are per element, so an oversized array is rejected while the
+  # literal is still bounded. These check the guard did not alter the output.
+  test "range array literal is unchanged":
+    let p = toPgParam(@[rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32)])
+    check p.oid == OidInt4RangeArray
+    check p.format == 0'i16
+    check p.value.get.toString == """{"[1,10)","[20,30)"}"""
+
+  test "multirange array literal is unchanged":
+    let p = toPgParam(@[toMultirange(rangeOf(1'i32, 10'i32))])
+    check p.value.get.toString == """{"{[1,10)}"}"""
+
+  test "multirange scalar literal is unchanged":
+    let p = toPgParam(toMultirange(rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32)))
+    check p.value.get.toString == "{[1,10),[20,30)}"
+
+  test "enum array literal is unchanged":
+    check encodeEnumTextArray(@[some("happy"), none(string), some("sad")]) ==
+      """{"happy",NULL,"sad"}"""
+
+  test "oversize is reported as a catchable PgError":
+    for what in ["range array", "multirange array", "enum array", "multirange"]:
+      expect PgError:
+        checkPgBinLen(maxInt32Len + 1, what)

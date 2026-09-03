@@ -21,7 +21,9 @@ import core, decoding, encoding, accessors
 #   let m = row.getEnum[Mood](0)
 #   let m = row.getEnumOpt[Mood](0)
 
-proc encodeEnumTextArray*(labels: seq[Option[string]]): string =
+proc encodeEnumTextArray*(
+    labels: seq[Option[string]]
+): string {.raises: [PgTypeError].} =
   ## Encode enum labels as a PostgreSQL text-format array literal.
   ## ``none`` labels become unquoted ``NULL``.
   result = "{"
@@ -37,6 +39,8 @@ proc encodeEnumTextArray*(labels: seq[Option[string]]): string =
       result.add('"')
     else:
       result.add("NULL")
+    # Per element, so an oversized array fails before the literal is built whole.
+    checkPgBinLen(result.len + 1, "enum array")
   result.add('}')
 
 macro pgEnum*(T: untyped): untyped =
@@ -48,7 +52,8 @@ macro pgEnum*(T: untyped): untyped =
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: 0'i32, format: 0'i16, value: some(toBytes($v)))
 
-    proc toPgParam*(v: seq[`T`]): PgParam =
+    proc toPgParam*(v: seq[`T`]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] = some($x)
@@ -56,7 +61,8 @@ macro pgEnum*(T: untyped): untyped =
         oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
       )
 
-    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] =
@@ -77,7 +83,8 @@ macro pgEnum*(T: untyped, oid: untyped): untyped =
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
 
-    proc toPgParam*(v: seq[`T`]): PgParam =
+    proc toPgParam*(v: seq[`T`]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] = some($x)
@@ -85,7 +92,8 @@ macro pgEnum*(T: untyped, oid: untyped): untyped =
         oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
       )
 
-    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] =
@@ -104,7 +112,8 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
 
-    proc toPgParam*(v: seq[`T`]): PgParam =
+    proc toPgParam*(v: seq[`T`]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] = some($x)
@@ -114,7 +123,8 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
         value: some(toBytes(encodeEnumTextArray(labels))),
       )
 
-    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] =
@@ -263,7 +273,7 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
 
 proc encodeBinaryComposite*(
     fields: seq[tuple[oid: int32, data: Option[seq[byte]]]]
-): seq[byte] =
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a PostgreSQL binary composite value.
   ## Format: ``numFields(4) + [oid(4) + len(4) + data]...``
   checkPgBinLen(fields.len, "Composite field count")
@@ -311,7 +321,7 @@ proc compositeFieldToText(val: string): string =
       result.add(c)
   result.add('"')
 
-proc encodeCompositeText*(fields: seq[Option[string]]): string =
+proc encodeCompositeText*(fields: seq[Option[string]]): string {.raises: [].} =
   ## Encode fields as PostgreSQL composite text format: (val1,val2,...)
   result = "("
   for i, f in fields:

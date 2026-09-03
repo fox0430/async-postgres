@@ -376,7 +376,9 @@ proc parseRangeText*[T](
     result.hasUpper = true
     result.upper = PgRangeBound[T](value: parseElem(val), inclusive: upperInc)
 
-proc encodeRangeBinaryImpl(r: RangeBinaryInput): seq[byte] =
+proc encodeRangeBinaryImpl(
+    r: RangeBinaryInput
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   if r.isEmpty:
     return @[rangeEmpty]
   var flags: uint8 = 0
@@ -420,7 +422,9 @@ proc toPgParam*(v: PgRange[int64]): PgParam =
 proc toPgParam*(v: PgRange[PgNumeric]): PgParam =
   PgParam(oid: OidNumRange, format: 0, value: some(toBytes($v)))
 
-proc formatDateTimeRangeText(v: PgRange[DateTime], fmt: string, utc = false): string =
+proc formatDateTimeRangeText(
+    v: PgRange[DateTime], fmt: TimeFormat, utc = false
+): string =
   ## `utc` formats the UTC wall clock so zoned DateTimes sent as tsrange
   ## (no zone in `fmt`) match the scalar OidTimestamp path.
   if v.isEmpty:
@@ -437,10 +441,12 @@ proc formatDateTimeRangeText(v: PgRange[DateTime], fmt: string, utc = false): st
     result.add(quoteRangeElem(fmtBound(v.upper.value)))
   result.add(if v.hasUpper and v.upper.inclusive: "]" else: ")")
 
+# Parsed once, so `format` cannot raise `TimeFormatParseError` and the text
+# encoders keep a `PgTypeError`-only contract.
 const
-  pgTsRangeFmt = "yyyy-MM-dd HH:mm:ss'.'ffffff"
-  pgTsTzRangeFmt = "yyyy-MM-dd HH:mm:ss'.'ffffffzzz"
-  pgDateRangeFmt = "yyyy-MM-dd"
+  pgTsRangeFmt = initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffff")
+  pgTsTzRangeFmt = initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffffzzz")
+  pgDateRangeFmt = initTimeFormat("yyyy-MM-dd")
 
 proc toPgParam*(v: PgRange[DateTime]): PgParam =
   PgParam(
@@ -480,8 +486,10 @@ proc encodeBinaryDate(dt: DateTime): seq[byte] =
   @(toBE32(pgDateDays(dt)))
 
 proc encodeRangeBinary[T](
-    v: PgRange[T], oid: int32, encodeBound: proc(v: T): seq[byte]
-): PgParam =
+    v: PgRange[T],
+    oid: int32,
+    encodeBound: proc(v: T): seq[byte] {.raises: [PgTypeError, PgProtocolError].},
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   var ld, ud: seq[byte]
   if v.hasLower:
     ld = encodeBound(v.lower.value)
@@ -502,7 +510,9 @@ proc encodeRangeBinary[T](
 
 # toPgBinaryParam for range types
 
-proc toPgBinaryParam*(v: PgRange[int32]): PgParam =
+proc toPgBinaryParam*(
+    v: PgRange[int32]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   encodeRangeBinary(
     v,
     OidInt4Range,
@@ -510,7 +520,9 @@ proc toPgBinaryParam*(v: PgRange[int32]): PgParam =
       @(toBE32(x)),
   )
 
-proc toPgBinaryParam*(v: PgRange[int64]): PgParam =
+proc toPgBinaryParam*(
+    v: PgRange[int64]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   encodeRangeBinary(
     v,
     OidInt8Range,
@@ -518,21 +530,32 @@ proc toPgBinaryParam*(v: PgRange[int64]): PgParam =
       @(toBE64(x)),
   )
 
-proc toPgBinaryParam*(v: PgRange[PgNumeric]): PgParam =
+proc toPgBinaryParam*(
+    v: PgRange[PgNumeric]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   encodeRangeBinary(v, OidNumRange, encodeNumericBinary)
 
-proc toPgBinaryParam*(v: PgRange[DateTime]): PgParam =
+proc toPgBinaryParam*(
+    v: PgRange[DateTime]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   encodeRangeBinary(v, OidTsRange, encodeBinaryTimestamp)
 
-proc toPgBinaryTsTzRangeParam*(v: PgRange[DateTime]): PgParam =
+proc toPgBinaryTsTzRangeParam*(
+    v: PgRange[DateTime]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   encodeRangeBinary(v, OidTsTzRange, encodeBinaryTimestamp)
 
-proc toPgBinaryDateRangeParam*(v: PgRange[DateTime]): PgParam =
+proc toPgBinaryDateRangeParam*(
+    v: PgRange[DateTime]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   encodeRangeBinary(v, OidDateRange, encodeBinaryDate)
 
 # toPgBinaryParam for range array types
 
-proc toPgBinaryParam*(v: seq[PgRange[int32]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgRange[int32]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
     elements[i] = some(toPgBinaryParam(r).value.get)
@@ -542,7 +565,10 @@ proc toPgBinaryParam*(v: seq[PgRange[int32]]): PgParam =
     value: some(encodeBinaryArray(OidInt4Range, dimsFor1D(v.len), elements)),
   )
 
-proc toPgBinaryParam*(v: seq[PgRange[int64]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgRange[int64]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
     elements[i] = some(toPgBinaryParam(r).value.get)
@@ -552,7 +578,10 @@ proc toPgBinaryParam*(v: seq[PgRange[int64]]): PgParam =
     value: some(encodeBinaryArray(OidInt8Range, dimsFor1D(v.len), elements)),
   )
 
-proc toPgBinaryParam*(v: seq[PgRange[PgNumeric]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgRange[PgNumeric]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
     elements[i] = some(toPgBinaryParam(r).value.get)
@@ -562,7 +591,10 @@ proc toPgBinaryParam*(v: seq[PgRange[PgNumeric]]): PgParam =
     value: some(encodeBinaryArray(OidNumRange, dimsFor1D(v.len), elements)),
   )
 
-proc toPgBinaryParam*(v: seq[PgRange[DateTime]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgRange[DateTime]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
     elements[i] = some(toPgBinaryParam(r).value.get)
@@ -572,7 +604,10 @@ proc toPgBinaryParam*(v: seq[PgRange[DateTime]]): PgParam =
     value: some(encodeBinaryArray(OidTsRange, dimsFor1D(v.len), elements)),
   )
 
-proc toPgBinaryTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
+proc toPgBinaryTsTzRangeArrayParam*(
+    v: seq[PgRange[DateTime]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
     elements[i] = some(toPgBinaryTsTzRangeParam(r).value.get)
@@ -582,7 +617,10 @@ proc toPgBinaryTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
     value: some(encodeBinaryArray(OidTsTzRange, dimsFor1D(v.len), elements)),
   )
 
-proc toPgBinaryDateRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
+proc toPgBinaryDateRangeArrayParam*(
+    v: seq[PgRange[DateTime]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[Option[seq[byte]]](v.len)
   for i, r in v:
     elements[i] = some(toPgBinaryDateRangeParam(r).value.get)
@@ -608,34 +646,38 @@ proc encodeRangeArrayText[T](v: seq[PgRange[T]]): string =
     if i > 0:
       result.add(',')
     appendQuotedArrayElem(result, $r)
+    # Per element, so an oversized array fails before the literal is built whole.
+    # `+ 1` reserves the closing brace appended after the loop.
+    checkPgBinLen(result.len + 1, "range array")
   result.add('}')
 
-proc toPgParam*(v: seq[PgRange[int32]]): PgParam =
+proc toPgParam*(v: seq[PgRange[int32]]): PgParam {.raises: [PgTypeError].} =
   PgParam(
     oid: OidInt4RangeArray, format: 0, value: some(toBytes(encodeRangeArrayText(v)))
   )
 
-proc toPgParam*(v: seq[PgRange[int64]]): PgParam =
+proc toPgParam*(v: seq[PgRange[int64]]): PgParam {.raises: [PgTypeError].} =
   PgParam(
     oid: OidInt8RangeArray, format: 0, value: some(toBytes(encodeRangeArrayText(v)))
   )
 
-proc toPgParam*(v: seq[PgRange[PgNumeric]]): PgParam =
+proc toPgParam*(v: seq[PgRange[PgNumeric]]): PgParam {.raises: [PgTypeError].} =
   PgParam(
     oid: OidNumRangeArray, format: 0, value: some(toBytes(encodeRangeArrayText(v)))
   )
 
 proc encodeDateTimeRangeArrayText(
-    v: seq[PgRange[DateTime]], fmt: string, utc = false
+    v: seq[PgRange[DateTime]], fmt: TimeFormat, utc = false
 ): string =
   result = "{"
   for i, r in v:
     if i > 0:
       result.add(',')
     appendQuotedArrayElem(result, formatDateTimeRangeText(r, fmt, utc))
+    checkPgBinLen(result.len + 1, "range array")
   result.add('}')
 
-proc toPgParam*(v: seq[PgRange[DateTime]]): PgParam =
+proc toPgParam*(v: seq[PgRange[DateTime]]): PgParam {.raises: [PgTypeError].} =
   ## Encode a ``tsrange[]`` (timestamp without time zone, array). For
   ## ``tstzrange[]`` use ``toPgTsTzRangeArrayParam``; for ``daterange[]`` use
   ## ``toPgDateRangeArrayParam``.
@@ -645,7 +687,9 @@ proc toPgParam*(v: seq[PgRange[DateTime]]): PgParam =
     value: some(toBytes(encodeDateTimeRangeArrayText(v, pgTsRangeFmt, utc = true))),
   )
 
-proc toPgTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
+proc toPgTsTzRangeArrayParam*(
+    v: seq[PgRange[DateTime]]
+): PgParam {.raises: [PgTypeError].} =
   ## Encode a ``tstzrange[]`` (timestamp with time zone, array). Disambiguates
   ## from ``toPgParam(seq[PgRange[DateTime]])`` which produces ``tsrange[]``.
   PgParam(
@@ -654,7 +698,9 @@ proc toPgTsTzRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
     value: some(toBytes(encodeDateTimeRangeArrayText(v, pgTsTzRangeFmt))),
   )
 
-proc toPgDateRangeArrayParam*(v: seq[PgRange[DateTime]]): PgParam =
+proc toPgDateRangeArrayParam*(
+    v: seq[PgRange[DateTime]]
+): PgParam {.raises: [PgTypeError].} =
   ## Encode a ``daterange[]``. DateTime values are formatted as date-only, taking
   ## the UTC calendar day so zoned bounds match the binary ``pgDateDays`` path.
   PgParam(
@@ -788,7 +834,9 @@ proc parseMultirangeText*[T](
       raise newException(PgTypeError, "multirange: trailing ',' in: " & s)
   PgMultirange[T](ranges)
 
-proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =
+proc encodeMultirangeBinaryImpl(
+    rangeData: seq[seq[byte]]
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   checkPgBinLen(rangeData.len, "Multirange range count")
   var size: int64 = 4
   for rd in rangeData:
@@ -806,16 +854,22 @@ proc encodeMultirangeBinaryImpl(rangeData: seq[seq[byte]]): seq[byte] =
 
 # Multirange toPgParam (text format)
 
-proc toPgParam*(v: PgMultirange[int32]): PgParam =
-  PgParam(oid: OidInt4Multirange, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgMultirange[int32]): PgParam {.raises: [PgTypeError].} =
+  let s = $v
+  checkPgBinLen(s.len, "multirange")
+  PgParam(oid: OidInt4Multirange, format: 0, value: some(toBytes(s)))
 
-proc toPgParam*(v: PgMultirange[int64]): PgParam =
-  PgParam(oid: OidInt8Multirange, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgMultirange[int64]): PgParam {.raises: [PgTypeError].} =
+  let s = $v
+  checkPgBinLen(s.len, "multirange")
+  PgParam(oid: OidInt8Multirange, format: 0, value: some(toBytes(s)))
 
-proc toPgParam*(v: PgMultirange[PgNumeric]): PgParam =
-  PgParam(oid: OidNumMultirange, format: 0, value: some(toBytes($v)))
+proc toPgParam*(v: PgMultirange[PgNumeric]): PgParam {.raises: [PgTypeError].} =
+  let s = $v
+  checkPgBinLen(s.len, "multirange")
+  PgParam(oid: OidNumMultirange, format: 0, value: some(toBytes(s)))
 
-proc toPgParam*(v: PgMultirange[DateTime]): PgParam =
+proc toPgParam*(v: PgMultirange[DateTime]): PgParam {.raises: [PgTypeError].} =
   ## Encode a ts multirange. DateTime bounds are formatted via UTC so that
   ## zoned values match the scalar ``toPgParam(DateTime)`` path.
   var s = "{"
@@ -824,20 +878,26 @@ proc toPgParam*(v: PgMultirange[DateTime]): PgParam =
     if i > 0:
       s.add(',')
     s.add(formatDateTimeRangeText(r, pgTsRangeFmt, utc = true))
+    checkPgBinLen(s.len + 1, "multirange")
   s.add('}')
   PgParam(oid: OidTsMultirange, format: 0, value: some(toBytes(s)))
 
-proc toPgTsTzMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
+proc toPgTsTzMultirangeParam*(
+    v: PgMultirange[DateTime]
+): PgParam {.raises: [PgTypeError].} =
   var s = "{"
   let ranges = seq[PgRange[DateTime]](v)
   for i, r in ranges:
     if i > 0:
       s.add(',')
     s.add(formatDateTimeRangeText(r, pgTsTzRangeFmt))
+    checkPgBinLen(s.len + 1, "multirange")
   s.add('}')
   PgParam(oid: OidTsTzMultirange, format: 0, value: some(toBytes(s)))
 
-proc toPgDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
+proc toPgDateMultirangeParam*(
+    v: PgMultirange[DateTime]
+): PgParam {.raises: [PgTypeError].} =
   ## Encode a date multirange. DateTime values are formatted as date-only, taking
   ## the UTC calendar day so zoned bounds match the binary ``pgDateDays`` path.
   var s = "{"
@@ -846,15 +906,22 @@ proc toPgDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
     if i > 0:
       s.add(',')
     s.add(formatDateTimeRangeText(r, pgDateRangeFmt, utc = true))
+    checkPgBinLen(s.len + 1, "multirange")
   s.add('}')
   PgParam(oid: OidDateMultirange, format: 0, value: some(toBytes(s)))
 
-proc toPgMultirangeParam*[T](v: PgMultirange[T], oid: int32): PgParam =
-  PgParam(oid: oid, format: 0, value: some(toBytes($v)))
+proc toPgMultirangeParam*[T](
+    v: PgMultirange[T], oid: int32
+): PgParam {.raises: [PgTypeError].} =
+  let s = $v
+  checkPgBinLen(s.len, "multirange")
+  PgParam(oid: oid, format: 0, value: some(toBytes(s)))
 
 # Multirange toPgBinaryParam
 
-proc toPgBinaryParam*(v: PgMultirange[int32]): PgParam =
+proc toPgBinaryParam*(
+    v: PgMultirange[int32]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   var rangeData: seq[seq[byte]]
   for r in seq[PgRange[int32]](v):
     rangeData.add(toPgBinaryParam(r).value.get)
@@ -864,7 +931,9 @@ proc toPgBinaryParam*(v: PgMultirange[int32]): PgParam =
     value: some(encodeMultirangeBinaryImpl(rangeData)),
   )
 
-proc toPgBinaryParam*(v: PgMultirange[int64]): PgParam =
+proc toPgBinaryParam*(
+    v: PgMultirange[int64]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   var rangeData: seq[seq[byte]]
   for r in seq[PgRange[int64]](v):
     rangeData.add(toPgBinaryParam(r).value.get)
@@ -874,7 +943,9 @@ proc toPgBinaryParam*(v: PgMultirange[int64]): PgParam =
     value: some(encodeMultirangeBinaryImpl(rangeData)),
   )
 
-proc toPgBinaryParam*(v: PgMultirange[PgNumeric]): PgParam =
+proc toPgBinaryParam*(
+    v: PgMultirange[PgNumeric]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   var rangeData: seq[seq[byte]]
   for r in seq[PgRange[PgNumeric]](v):
     rangeData.add(toPgBinaryParam(r).value.get)
@@ -882,7 +953,9 @@ proc toPgBinaryParam*(v: PgMultirange[PgNumeric]): PgParam =
     oid: OidNumMultirange, format: 1, value: some(encodeMultirangeBinaryImpl(rangeData))
   )
 
-proc toPgBinaryParam*(v: PgMultirange[DateTime]): PgParam =
+proc toPgBinaryParam*(
+    v: PgMultirange[DateTime]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   var rangeData: seq[seq[byte]]
   for r in seq[PgRange[DateTime]](v):
     rangeData.add(toPgBinaryParam(r).value.get)
@@ -890,7 +963,9 @@ proc toPgBinaryParam*(v: PgMultirange[DateTime]): PgParam =
     oid: OidTsMultirange, format: 1, value: some(encodeMultirangeBinaryImpl(rangeData))
   )
 
-proc toPgBinaryTsTzMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
+proc toPgBinaryTsTzMultirangeParam*(
+    v: PgMultirange[DateTime]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a ``tstzmultirange``. Disambiguates from
   ## ``toPgBinaryParam(PgMultirange[DateTime])`` which produces
   ## ``tsmultirange``.
@@ -903,7 +978,9 @@ proc toPgBinaryTsTzMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
     value: some(encodeMultirangeBinaryImpl(rangeData)),
   )
 
-proc toPgBinaryDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
+proc toPgBinaryDateMultirangeParam*(
+    v: PgMultirange[DateTime]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a ``datemultirange``. DateTime values are encoded as date-only.
   var rangeData: seq[seq[byte]]
   for r in seq[PgRange[DateTime]](v):
@@ -918,7 +995,8 @@ proc toPgBinaryDateMultirangeParam*(v: PgMultirange[DateTime]): PgParam =
 
 proc buildMultirangeArrayParam(
     arrayOid, elemOid: int32, elements: seq[seq[byte]]
-): PgParam =
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(elements.len)
   var optElements = newSeq[Option[seq[byte]]](elements.len)
   for i, e in elements:
     optElements[i] = some(e)
@@ -928,44 +1006,62 @@ proc buildMultirangeArrayParam(
     value: some(encodeBinaryArray(elemOid, dimsFor1D(elements.len), optElements)),
   )
 
-proc toPgBinaryParam*(v: seq[PgMultirange[int32]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgMultirange[int32]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[seq[byte]](v.len)
   for i, mr in v:
     elements[i] = toPgBinaryParam(mr).value.get
   buildMultirangeArrayParam(OidInt4MultirangeArray, OidInt4Multirange, elements)
 
-proc toPgBinaryParam*(v: seq[PgMultirange[int64]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgMultirange[int64]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[seq[byte]](v.len)
   for i, mr in v:
     elements[i] = toPgBinaryParam(mr).value.get
   buildMultirangeArrayParam(OidInt8MultirangeArray, OidInt8Multirange, elements)
 
-proc toPgBinaryParam*(v: seq[PgMultirange[PgNumeric]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgMultirange[PgNumeric]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+  checkArrayLen(v.len)
   var elements = newSeq[seq[byte]](v.len)
   for i, mr in v:
     elements[i] = toPgBinaryParam(mr).value.get
   buildMultirangeArrayParam(OidNumMultirangeArray, OidNumMultirange, elements)
 
-proc toPgBinaryParam*(v: seq[PgMultirange[DateTime]]): PgParam =
+proc toPgBinaryParam*(
+    v: seq[PgMultirange[DateTime]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a ``tsmultirange[]`` (timestamp without time zone). For
   ## ``tstzmultirange[]`` use ``toPgBinaryTsTzMultirangeArrayParam``; for
   ## ``datemultirange[]`` use ``toPgBinaryDateMultirangeArrayParam``.
+  checkArrayLen(v.len)
   var elements = newSeq[seq[byte]](v.len)
   for i, mr in v:
     elements[i] = toPgBinaryParam(mr).value.get
   buildMultirangeArrayParam(OidTsMultirangeArray, OidTsMultirange, elements)
 
-proc toPgBinaryTsTzMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
+proc toPgBinaryTsTzMultirangeArrayParam*(
+    v: seq[PgMultirange[DateTime]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a ``tstzmultirange[]``. Disambiguates from
   ## ``toPgBinaryParam(seq[PgMultirange[DateTime]])`` which produces
   ## ``tsmultirange[]``.
+  checkArrayLen(v.len)
   var elements = newSeq[seq[byte]](v.len)
   for i, mr in v:
     elements[i] = toPgBinaryTsTzMultirangeParam(mr).value.get
   buildMultirangeArrayParam(OidTsTzMultirangeArray, OidTsTzMultirange, elements)
 
-proc toPgBinaryDateMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
+proc toPgBinaryDateMultirangeArrayParam*(
+    v: seq[PgMultirange[DateTime]]
+): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a ``datemultirange[]``. DateTime values are encoded as date-only.
+  checkArrayLen(v.len)
   var elements = newSeq[seq[byte]](v.len)
   for i, mr in v:
     elements[i] = toPgBinaryDateMultirangeParam(mr).value.get
@@ -985,10 +1081,11 @@ proc encodeMultirangeArrayText[T](v: seq[PgMultirange[T]]): string =
         result.add('\\')
       result.add(c)
     result.add('"')
+    checkPgBinLen(result.len + 1, "multirange array")
   result.add('}')
 
 template genMultirangeArrayEncoder(T: typedesc, arrayOid: int32) =
-  proc toPgParam*(v: seq[PgMultirange[T]]): PgParam =
+  proc toPgParam*(v: seq[PgMultirange[T]]): PgParam {.raises: [PgTypeError].} =
     PgParam(
       oid: arrayOid, format: 0, value: some(toBytes(encodeMultirangeArrayText(v)))
     )
@@ -998,7 +1095,7 @@ genMultirangeArrayEncoder(int64, OidInt8MultirangeArray)
 genMultirangeArrayEncoder(PgNumeric, OidNumMultirangeArray)
 
 proc encodeDateTimeMultirangeArrayText(
-    v: seq[PgMultirange[DateTime]], fmt: string, utc = false
+    v: seq[PgMultirange[DateTime]], fmt: TimeFormat, utc = false
 ): string =
   result = "{"
   for i, x in v:
@@ -1017,9 +1114,12 @@ proc encodeDateTimeMultirangeArrayText(
         result.add('\\')
       result.add(c)
     result.add('"')
+    checkPgBinLen(result.len + 1, "multirange array")
   result.add('}')
 
-proc toPgTsMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
+proc toPgTsMultirangeArrayParam*(
+    v: seq[PgMultirange[DateTime]]
+): PgParam {.raises: [PgTypeError].} =
   ## Encode a ``tsmultirange[]``. DateTime bounds are formatted via UTC so that
   ## zoned values match the scalar ``toPgParam(DateTime)`` path.
   PgParam(
@@ -1028,14 +1128,18 @@ proc toPgTsMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
     value: some(toBytes(encodeDateTimeMultirangeArrayText(v, pgTsRangeFmt, utc = true))),
   )
 
-proc toPgTsTzMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
+proc toPgTsTzMultirangeArrayParam*(
+    v: seq[PgMultirange[DateTime]]
+): PgParam {.raises: [PgTypeError].} =
   PgParam(
     oid: OidTsTzMultirangeArray,
     format: 0,
     value: some(toBytes(encodeDateTimeMultirangeArrayText(v, pgTsTzRangeFmt))),
   )
 
-proc toPgDateMultirangeArrayParam*(v: seq[PgMultirange[DateTime]]): PgParam =
+proc toPgDateMultirangeArrayParam*(
+    v: seq[PgMultirange[DateTime]]
+): PgParam {.raises: [PgTypeError].} =
   ## Encode date multirange array. DateTime values are formatted as date-only,
   ## taking the UTC calendar day so zoned bounds match the binary
   ## ``pgDateDays`` path.

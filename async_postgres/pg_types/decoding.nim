@@ -13,7 +13,7 @@ type TsPrec = enum
   tpNot
   tpOperand
 
-proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
+proc decodeHstoreBinary*(data: openArray[byte]): PgHstore {.raises: [PgError].} =
   ## Decode PostgreSQL binary hstore format.
   result = initTable[string, Option[string]]()
   if data.len < 4:
@@ -52,7 +52,7 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore =
       pos += valLen
       result[key] = some(val)
 
-proc fromPgText*(data: seq[byte], oid: int32): string =
+proc fromPgText*(data: seq[byte], oid: int32): string {.raises: [].} =
   ## Convert text-format bytes from PostgreSQL to a Nim string.
   result = newString(data.len)
   for i in 0 ..< data.len:
@@ -60,7 +60,7 @@ proc fromPgText*(data: seq[byte], oid: int32): string =
 
 # Binary decoders needed by both basic and format-aware row accessors.
 
-proc decodeNumericBinary*(data: openArray[byte]): PgNumeric =
+proc decodeNumericBinary*(data: openArray[byte]): PgNumeric {.raises: [PgError].} =
   ## Decode PostgreSQL binary numeric format into PgNumeric.
   if data.len < 8:
     raise newException(PgTypeError, "Numeric binary data too short: " & $data.len)
@@ -96,7 +96,7 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric =
     digits[i] = d
   PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
 
-proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
+proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime {.raises: [PgError].} =
   if data.len < 8:
     raise newException(PgTypeError, "Binary timestamp data too short: " & $data.len)
   let pgUs = fromBE64(data)
@@ -129,7 +129,7 @@ proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime =
     fracUs += 1_000_000
   initTime(unixSec, int(fracUs * 1000)).utc()
 
-proc decodeBinaryDate*(data: openArray[byte]): DateTime =
+proc decodeBinaryDate*(data: openArray[byte]): DateTime {.raises: [PgError].} =
   if data.len < 4:
     raise newException(PgTypeError, "Binary date data too short: " & $data.len)
   let pgDays = fromBE32(data)
@@ -152,7 +152,7 @@ const pgTimeMaxUs = 86_400_000_000'i64
   ## time-of-day. Valid range is [0, pgTimeMaxUs]; '24:00:00' itself is allowed
   ## but nothing past it.
 
-proc decodeBinaryTime*(data: openArray[byte]): PgTime =
+proc decodeBinaryTime*(data: openArray[byte]): PgTime {.raises: [PgError].} =
   if data.len < 8:
     raise newException(PgTypeError, "Binary time data too short: " & $data.len)
   let us = fromBE64(data)
@@ -166,7 +166,7 @@ proc decodeBinaryTime*(data: openArray[byte]): PgTime =
   let microseconds = int32(rem2 mod 1_000_000)
   PgTime(hour: hours, minute: minutes, second: seconds, microsecond: microseconds)
 
-proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz =
+proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz {.raises: [PgError].} =
   if data.len < 12:
     raise newException(PgTypeError, "Binary timetz data too short: " & $data.len)
   let us = fromBE64(data)
@@ -193,7 +193,9 @@ proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz =
     utcOffset: -pgOffset, # un-negate PostgreSQL wire format
   )
 
-proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: uint8] =
+proc decodeInetBinary*(
+    data: openArray[byte]
+): tuple[address: IpAddress, mask: uint8] {.raises: [PgError].} =
   ## Decode PostgreSQL binary inet/cidr format:
   ##   1 byte: family (2=IPv4, 3=IPv6)
   ##   1 byte: bits (netmask length)
@@ -234,7 +236,9 @@ proc decodeInetBinary*(data: openArray[byte]): tuple[address: IpAddress, mask: u
   else:
     raise newException(PgTypeError, "Binary inet unknown family: " & $family)
 
-proc decodePointBinary*(data: openArray[byte], off: int): PgPoint =
+proc decodePointBinary*(
+    data: openArray[byte], off: int
+): PgPoint {.raises: [PgError].} =
   ## Decode a point from 16 bytes at offset.
   if off < 0 or off + 16 > data.len:
     raise newException(PgTypeError, "Binary point data truncated at offset " & $off)
@@ -248,16 +252,8 @@ proc decodeBinaryArray*(
   dims: seq[int32],
   lowerBounds: seq[int32],
   elements: seq[tuple[off: RelOff, len: int]],
-] =
-  ## Decode a PostgreSQL binary array header into element OID, per-dimension
-  ## length and lower bound, and ``(offset, length)`` pairs for each element
-  ## in row-major order. Offsets are relative to the start of ``data`` (typed
-  ## as ``RelOff``); recover the absolute parent-buffer offset via
-  ## ``parentOff + e.off``. An element ``len`` of ``-1`` represents NULL.
-  ##
-  ## ``ndim`` may be ``0..PgArrayMaxDim``; arrays with more dimensions than
-  ## PostgreSQL's ``MAXDIM`` are rejected. For an empty array
-  ## (``ndim=0``) ``dims``, ``lowerBounds`` and ``elements`` are all empty.
+] {.raises: [PgError].} =
+  ## Decode binary array header. ``-1`` len = NULL. Offsets relative to ``data``.
   if data.len < 12:
     raise newException(PgTypeError, "Binary array too short")
   let ndim = fromBE32(data.toOpenArray(0, 3))
@@ -317,11 +313,8 @@ proc rejectMultiDim*(
         lowerBounds: seq[int32],
         elements: seq[tuple[off: RelOff, len: int]],
       ]
-) =
-  ## Raise ``PgTypeError`` when ``decoded`` represents a multi-dimensional
-  ## array, since the 1-D ``getXxxArray`` accessors cannot flatten the result
-  ## without losing the shape. ``ndim=0`` (empty array) is allowed. Callers
-  ## that want multi-dim support should use the ``PgArray[T]`` accessors.
+) {.raises: [PgError].} =
+  ## Reject multi-dim array for 1-D accessors. Use ``PgArray[T]`` instead.
   if decoded.dims.len > 1:
     raise newException(
       PgTypeError,
@@ -331,11 +324,8 @@ proc rejectMultiDim*(
 
 proc decodeBinaryComposite*(
     data: openArray[byte]
-): seq[tuple[oid: int32, off: RelOff, len: int]] =
-  ## Decode a PostgreSQL binary composite value.
-  ## Returns (typeOid, offset, length) tuples. ``off`` is relative to ``data``
-  ## (typed as ``RelOff``); recover the absolute parent-buffer offset with
-  ## ``parentOff + f.off``. ``len`` of -1 indicates NULL.
+): seq[tuple[oid: int32, off: RelOff, len: int]] {.raises: [PgError].} =
+  ## Decode binary composite. ``len==-1`` is NULL; offsets relative.
   if data.len < 4:
     raise newException(PgTypeError, "Binary composite too short")
   let numFields = int(fromBE32(data.toOpenArray(0, 3)))
@@ -368,10 +358,8 @@ proc decodeBinaryComposite*(
       result[i].len = flen
       pos += flen
 
-proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
-  # Text-format 'infinity'/'-infinity' mirror the binary sentinels handled in
-  # decodeBinaryTimestamp: not representable as a DateTime, so raise a clear
-  # PgTypeError rather than the generic "Invalid timestamp" below.
+proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
+  # Raises ``PgTypeError`` for infinity/unparseable input (under ``PgError``).
   if s == "infinity" or s == "-infinity":
     raise newException(
       PgTypeError, "Timestamp is '" & s & "', not representable as a DateTime"
@@ -387,35 +375,38 @@ proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [CatchableError]
     let fracLen = e - dot - 1
     if fracLen in 1 .. 5:
       norm = s[0 ..< e] & repeat('0', 6 - fracLen) & s[e .. ^1]
+  # Pre-compiled: malformed pattern is a build error, not runtime.
   const formats = [
-    "yyyy-MM-dd HH:mm:ss'.'ffffffzzz", "yyyy-MM-dd HH:mm:ss'.'ffffffzz",
-    "yyyy-MM-dd HH:mm:ss'.'ffffff", "yyyy-MM-dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszz",
-    "yyyy-MM-dd HH:mm:ss",
+    initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffffzzz"),
+    initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffffzz"),
+    initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffff"),
+    initTimeFormat("yyyy-MM-dd HH:mm:sszzz"),
+    initTimeFormat("yyyy-MM-dd HH:mm:sszz"),
+    initTimeFormat("yyyy-MM-dd HH:mm:ss"),
   ]
-  # Fallback zone is utc() so zoneless input decodes to the same absolute instant
-  # as decodeBinaryTimestamp. Formats carrying zzz/zz still use their own zone.
-  for fmt in formats:
+  # Zoneless input uses utc(); indexing skips the per-iteration copy a `for fmt
+  # in formats` loop variable would take (`parse` itself takes it by reference).
+  for i in 0 ..< formats.len:
     try:
-      return parse(norm, fmt, utc())
+      return parse(norm, formats[i], utc())
     except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp: " & s)
 
-proc parseDateText*(s: string): DateTime {.gcsafe, raises: [CatchableError].} =
-  # Text-format 'infinity'/'-infinity' mirror the binary sentinels handled in
-  # decodeBinaryDate: not representable as a DateTime, so raise a clear
-  # PgTypeError rather than the generic "Invalid date" below.
+proc parseDateText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
+  # Raises ``PgTypeError`` for infinity/unparseable.
   if s == "infinity" or s == "-infinity":
     raise
       newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
+  const dateFormat = initTimeFormat("yyyy-MM-dd")
   try:
     # Zone is utc() so a date decodes to the same absolute instant as
     # decodeBinaryDate; the local default would shift it by the UTC offset.
-    return parse(s, "yyyy-MM-dd", utc())
+    return parse(s, dateFormat, utc())
   except TimeParseError, IndexDefect:
     raise newException(PgTypeError, "Invalid date: " & s)
 
-proc parseTimeText*(s: string): PgTime =
+proc parseTimeText*(s: string): PgTime {.raises: [PgError].} =
   ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".
   if s.len < 8 or s[2] != ':' or s[5] != ':':
     raise newException(PgTypeError, "Invalid time: " & s)
@@ -445,7 +436,7 @@ proc parseTimeText*(s: string): PgTime =
     raise newException(PgTypeError, "Invalid time: " & s)
   PgTime(hour: int32(h), minute: int32(m), second: int32(sec), microsecond: int32(us))
 
-proc parseTimeTzText*(s: string): PgTimeTz =
+proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
   var tzPos = -1
   for i in 8 ..< s.len:
     if s[i] == '+' or s[i] == '-':
@@ -479,7 +470,7 @@ proc parseTimeTzText*(s: string): PgTimeTz =
     utcOffset: int32(utcOff),
   )
 
-proc parseHstoreText*(s: string): PgHstore =
+proc parseHstoreText*(s: string): PgHstore {.raises: [PgError].} =
   ## Parse PostgreSQL hstore text format: ``"key1"=>"val1", "key2"=>NULL``.
   result = initTable[string, Option[string]]()
   if s.len == 0:
@@ -544,7 +535,7 @@ proc parseHstoreText*(s: string): PgHstore =
         PgTypeError, "hstore: expected NULL or quoted string at position " & $i
       )
 
-proc parseIntervalText*(s: string): PgInterval =
+proc parseIntervalText*(s: string): PgInterval {.raises: [PgError].} =
   ## Parse PostgreSQL default interval text format:
   ##   "1 year 2 mons 3 days 04:05:06.123456"
   ##   "-1 year -2 mons +3 days -04:05:06"
@@ -680,10 +671,10 @@ proc parseIntervalText*(s: string): PgInterval =
       raise newException(PgTypeError, "Invalid interval unit '" & unit & "' in: " & s)
   PgInterval(months: months, days: days, microseconds: microseconds)
 
-proc parseInetText*(s: string): tuple[address: IpAddress, mask: uint8] =
-  # ``parseIpAddress`` and ``parseInt`` both raise the standard ``ValueError`` on
-  # malformed input; convert to ``PgTypeError`` so callers can rely on the
-  # ``except PgError`` contract (see ``pg_errors``).
+proc parseInetText*(
+    s: string
+): tuple[address: IpAddress, mask: uint8] {.raises: [PgError].} =
+  # Converts ``ValueError`` to ``PgTypeError``.
   let slashIdx = s.find('/')
   pgTypeErrorOnValueError("invalid inet value: " & s):
     if slashIdx == -1:
@@ -703,7 +694,7 @@ proc parseInetText*(s: string): tuple[address: IpAddress, mask: uint8] =
       raise newException(PgTypeError, "inet mask out of range: " & s)
     result = (ip, uint8(mask))
 
-proc decodeBinaryTsVector*(data: openArray[byte]): string =
+proc decodeBinaryTsVector*(data: openArray[byte]): string {.raises: [PgError].} =
   ## Decode PostgreSQL binary tsvector to text representation.
   if data.len < 4:
     raise newException(PgTypeError, "tsvector binary data too short")
@@ -854,7 +845,7 @@ proc parseTsQueryNode(
   else:
     raise newException(PgTypeError, "Unknown tsquery token type: " & $tokenType)
 
-proc decodeBinaryTsQuery*(data: openArray[byte]): string =
+proc decodeBinaryTsQuery*(data: openArray[byte]): string {.raises: [PgError].} =
   ## Decode PostgreSQL binary tsquery (prefix/preorder) to text representation (infix).
   if data.len < 4:
     raise newException(PgTypeError, "tsquery binary data too short")
@@ -868,7 +859,7 @@ proc decodeBinaryTsQuery*(data: openArray[byte]): string =
 
 # Geometry text format parsers
 
-proc parsePointText*(s: string): PgPoint =
+proc parsePointText*(s: string): PgPoint {.raises: [PgError].} =
   ## Parse "(x,y)" text format.
   var inner = s.strip()
   if inner.len >= 2 and inner[0] == '(' and inner[^1] == ')':
@@ -878,7 +869,7 @@ proc parsePointText*(s: string): PgPoint =
     raise newException(PgTypeError, "Invalid point: " & s)
   PgPoint(x: pgParseFloat(inner[0 ..< comma]), y: pgParseFloat(inner[comma + 1 ..^ 1]))
 
-proc parsePointsText*(s: string): seq[PgPoint] =
+proc parsePointsText*(s: string): seq[PgPoint] {.raises: [PgError].} =
   ## Parse a comma-separated list of points like "(x1,y1),(x2,y2),...".
   var i = 0
   let n = s.len
@@ -901,7 +892,7 @@ proc parsePointsText*(s: string): seq[PgPoint] =
 
 # Array text format parser
 
-proc parseTextArray*(s: string): seq[Option[string]] =
+proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
   ## Parse PostgreSQL 1-D text-format array literal: {elem1,elem2,...}
   ## Returns elements as ``Option[string]`` (none for NULL).
   ## Raises ``PgTypeError`` for multi-dimensional literals; callers that need
