@@ -8,9 +8,8 @@ import ../async_postgres/pg_types/[core, encoding]
 
 privateAccess(PgConnection)
 
-# `checkCopyDataLen` comes from pg_protocol itself: it is exported for direct
-# importers but kept off the `async_postgres` whitelist, so these tests exercise
-# the production guard rather than a copy of it.
+# `calcStartupBudget` / `checkCopyDataLen` come from pg_protocol directly: they
+# are off the `async_postgres` whitelist.
 proc parseBackendMessage(buf: var seq[byte]): ParseResult =
   ## Test-only wrapper that preserves the old var-buf interface.
   var consumed: int
@@ -98,6 +97,84 @@ suite "Byte helpers":
     expect(PgTypeError):
       discard
         encodeStartup("alice", "db", [("application_name", "app"), ("", "injected")])
+
+  test "encodeStartup rejects oversized total payload up front":
+    # Cross-checked against the encoder's own output, so a term missing from
+    # the pre-flight shows up as a length mismatch.
+    check calcStartupBudget(int(int32.high) - 16, 2) > int64(maxInt32Len)
+    check calcStartupBudget(1, 2) < int64(maxInt32Len)
+    check calcStartupBudget(1, 2) == int64(encodeStartup("a", "db").len)
+    check encodeStartup("a", "db").len < maxInt32Len
+
+  test "encodeStartup rejects oversized database payload up front":
+    check calcStartupBudget(1, int(int32.high) - 16) > int64(maxInt32Len)
+    check calcStartupBudget(1, 1) < int64(maxInt32Len)
+    check encodeStartup("a", "b").len < maxInt32Len
+
+  test "encodeStartup rejects oversized extraParams payload up front":
+    check calcStartupBudget(1, 2) + startupParamBytes(1, int(int32.high) - 16) >
+      int64(maxInt32Len)
+    check calcStartupBudget(1, 2) + startupParamBytes(1, 1) < int64(maxInt32Len)
+    check calcStartupBudget(1, 2) + startupParamBytes(1, 1) ==
+      int64(encodeStartup("a", "db", [("k", "v")]).len)
+    check encodeStartup("a", "db", [("k", "v")]).len < maxInt32Len
+
+  test "checkStartupBudget boundary values run the real raise path":
+    # The guard the budget arithmetic feeds, reached without a 2 GiB allocation.
+    checkStartupBudget(int64(maxInt32Len))
+    var caught = false
+    try:
+      checkStartupBudget(int64(maxInt32Len) + 1)
+    except CatchableError as e:
+      check e of PgTypeError
+      check e of PgError
+      caught = true
+    check caught
+    expect PgTypeError:
+      checkStartupBudget(calcStartupBudget(int(int32.high) - 16, 2))
+    expect PgTypeError:
+      checkStartupBudget(
+        calcStartupBudget(1, 2) + startupParamBytes(1, int(int32.high) - 16)
+      )
+
+  test "encodeStartup length matches cumulative calculation (no huge alloc)":
+    # The encoded length must equal the sum of every term, computed here
+    # independently of the pre-flight's proc.
+    let baseLen = encodeStartup("a", "b").len
+      # 8 + "user\0" + "a\0" + "database\0" + "b\0" + "\0" = 27
+    check baseLen == 27
+    check calcStartupBudget(1, 1) == int64(baseLen)
+    let oneExtra = encodeStartup("a", "b", [("k", "v")]).len
+    check oneExtra == baseLen + 4 # "k\0" + "v\0" = 1+1 +1+1
+    check calcStartupBudget(1, 1) + startupParamBytes(1, 1) == int64(oneExtra)
+    let twoExtras = encodeStartup("a", "b", [("ab", "cd"), ("e", "f")]).len
+    check twoExtras == baseLen + (2 + 1 + 2 + 1) + (1 + 1 + 1 + 1)
+      # "ab\0"+"cd\0" (3+3) + "e\0"+"f\0" (2+2)
+    check calcStartupBudget(1, 1) + startupParamBytes(2, 2) + startupParamBytes(1, 1) ==
+      int64(twoExtras)
+    # Multi-entry cumulative: 10 extras of 3+3 each
+    var many: seq[(string, string)]
+    for i in 0 ..< 10:
+      many.add(("k" & $i, "v" & $i))
+    let manyLen = encodeStartup("a", "b", many).len
+    var expected = baseLen
+    for (k, v) in many:
+      expected += k.len + 1 + v.len + 1
+    check manyLen == expected
+    var manyBudget = calcStartupBudget(1, 1)
+    for (k, v) in many:
+      manyBudget += startupParamBytes(k.len, v.len)
+    check manyBudget == int64(manyLen)
+    check manyLen < maxInt32Len
+
+  test "encodeStartup pre-flight rejects via budget arithmetic":
+    check calcStartupBudget(maxInt32Len, 0) > int64(maxInt32Len)
+    check calcStartupBudget(0, maxInt32Len) > int64(maxInt32Len)
+    check calcStartupBudget(1, 1) + startupParamBytes(maxInt32Len, 0) >
+      int64(maxInt32Len)
+    check calcStartupBudget(1, 1) < int64(maxInt32Len)
+    check startupParamBytes(1, 1) == 4
+
   test "encodeQuery rejects NUL in sql":
     expect(PgTypeError):
       discard encodeQuery("SELECT 1\0; DROP TABLE users")

@@ -203,6 +203,7 @@ export pg_protocol.syncMsg
 export pg_protocol.flushMsg
 export pg_protocol.copyDoneMsg
 export pg_protocol.BinarySafeOids
+export pg_protocol.maxInt16Count
 export pg_protocol.maxInt32Len
 export pg_protocol.DefaultMaxBackendMessageLen
 export pg_protocol.MaxNegotiateProtocolOptions
@@ -218,6 +219,9 @@ export pg_protocol.addCount16
 export pg_protocol.addLen32
 export pg_protocol.addCString
 export pg_protocol.patchMsgLen
+export pg_protocol.patchMsgLenAtomic
+export pg_protocol.preflightParseDirect
+export pg_protocol.preflightBindDirect
 export pg_protocol.encodeStartup
 export pg_protocol.encodeSSLRequest
 export pg_protocol.encodePassword

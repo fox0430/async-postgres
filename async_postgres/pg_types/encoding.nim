@@ -1893,6 +1893,63 @@ proc writeParamValue*(buf: var seq[byte], v: seq[byte]) =
 proc writeParamValue*(buf: var seq[byte], v: PgNumeric) =
   writeParamValue(buf, $v)
 
+# Wire length of one parameter value, paired one-to-one with `writeParamValue`
+# above; `addBindDirect` sums these before its first write. No generic fallback
+# on purpose: a missing overload must fail to compile, not skip the pre-flight.
+
+func paramValueLen*(v: int16): int =
+  2
+
+func paramValueLen*(v: int32): int =
+  4
+
+func paramValueLen*(v: int64): int =
+  8
+
+func paramValueLen*(v: int): int =
+  8
+
+func paramValueLen*(v: float32): int =
+  4
+
+func paramValueLen*(v: float64): int =
+  8
+
+func paramValueLen*(v: bool): int =
+  1
+
+func paramValueLen*(v: string): int =
+  v.len
+
+func paramValueLen*(v: seq[byte]): int =
+  v.len
+
+func paramValueLen*(v: PgNumeric): int =
+  ($v).len
+
+proc foldBindParam*[T](
+    payload: var int64, v: T, rendered: var string
+) {.raises: [PgTypeError].} =
+  ## Fold one ``addBindDirect`` argument into the Bind payload total, bounding
+  ## it before anything is written. `rendered` is the write phase's scratch
+  ## slot, left untouched by types that need none.
+  addBindPayload(payload, paramValueLen(v))
+
+proc foldBindParam*(
+    payload: var int64, v: PgNumeric, rendered: var string
+) {.raises: [PgTypeError].} =
+  # Rendering costs as much as measuring, so do it once here; `writeBindParam`
+  # writes the scratch instead of formatting again.
+  rendered = $v
+  addBindPayload(payload, rendered.len)
+
+proc writeBindParam*[T](buf: var seq[byte], v: T, rendered: string) =
+  ## Write one pre-flighted ``addBindDirect`` parameter value.
+  buf.writeParamValue(v)
+
+proc writeBindParam*(buf: var seq[byte], v: PgNumeric, rendered: string) =
+  buf.writeParamValue(rendered)
+
 # Compile-time OID lookup for parameter scalar types. Source of truth for
 # the OID emitted by ``writeParamOid`` (Parse message) and consumed by
 # ``queryDirect`` / ``execDirect``'s cache-hit OID validation. Adding a new
@@ -1963,10 +2020,14 @@ macro addParseDirect*(
     buf: untyped, stmtName: string, sql: string, args: varargs[untyped]
 ): untyped =
   ## Compile-time macro: generates Parse message with OIDs from arg types.
+  ## Splices every operand more than once, so callers must pass side-effect-free
+  ## expressions (`queryDirect`/`execDirect` bind theirs to `let`s first).
   result = newStmtList()
   let msgStart = genSym(nskLet, "msgStart")
   let nParams = newLit(int16(args.len))
+  let nParamsInt = newLit(args.len)
   result.add quote do:
+    preflightParseDirect(`stmtName`, `sql`, `nParamsInt`)
     let `msgStart` = `buf`.len
     `buf`.add(byte('P'))
     `buf`.addInt32(0)
@@ -1977,7 +2038,7 @@ macro addParseDirect*(
     result.add quote do:
       `buf`.writeParamOid(`arg`)
   result.add quote do:
-    `buf`.patchMsgLen(`msgStart`)
+    `buf`.patchMsgLenAtomic(`msgStart`)
 
 macro addBindDirect*(
     buf: untyped,
@@ -1987,11 +2048,51 @@ macro addBindDirect*(
     args: varargs[untyped],
 ): untyped =
   ## Compile-time macro: generates Bind message writing params directly to buffer.
-  ## Zero intermediate PgParam/``seq[byte]`` allocations.
+  ## Zero intermediate PgParam/``seq[byte]`` allocations. Splices ``buf`` and the
+  ## name operands more than once, like ``addParseDirect``; parameters and the
+  ## result-format list are bound to temporaries and evaluated once.
   result = newStmtList()
   let msgStart = genSym(nskLet, "msgStart")
+  let payload = genSym(nskVar, "bindPayload")
   let nParamsLit = newLit(int16(args.len))
+  let nParamsInt = newLit(args.len)
+  let emptyRf = resultFormats.kind == nnkBracket and resultFormats.len == 0
+  # Bound once so the pre-flight length, the count and the loop share one
+  # evaluation. A plain ident/sym is spliced as-is to avoid copying the seq.
+  let rf =
+    if emptyRf or resultFormats.kind in {nnkIdent, nnkSym}:
+      resultFormats
+    else:
+      let tmp = genSym(nskLet, "bindRf")
+      result.add(newLetStmt(tmp, resultFormats))
+      tmp
+  let rfLen =
+    if emptyRf:
+      newLit(0)
+    else:
+      newDotExpr(rf, ident"len")
   result.add quote do:
+    var `payload`: int64 = 0
+  # Bind non-trivial arguments once: the fold, the format code and the value
+  # write all reference the temporary, never the source expression.
+  var params = newSeq[tuple[val, rendered: NimNode]](args.len)
+  for i, arg in args:
+    let val =
+      if arg.kind in {nnkIdent, nnkSym} or arg.kind in nnkLiterals:
+        arg
+      else:
+        let tmp = genSym(nskLet, "bindArg" & $i)
+        result.add(newLetStmt(tmp, arg))
+        tmp
+    let rendered = genSym(nskVar, "bindRendered" & $i)
+    result.add quote do:
+      var `rendered`: string
+    params[i] = (val, rendered)
+  for (val, rendered) in params:
+    result.add quote do:
+      foldBindParam(`payload`, `val`, `rendered`)
+  result.add quote do:
+    preflightBindDirect(`portalName`, `stmtName`, `nParamsInt`, `rfLen`, `payload`)
     let `msgStart` = `buf`.len
     `buf`.add(byte('B'))
     `buf`.addInt32(0)
@@ -1999,23 +2100,23 @@ macro addBindDirect*(
     `buf`.addCString(`stmtName`)
     # Parameter format codes
     `buf`.addInt16(`nParamsLit`)
-  for arg in args:
+  for (val, _) in params:
     result.add quote do:
-      `buf`.writeParamFormat(`arg`)
+      `buf`.writeParamFormat(`val`)
   result.add quote do:
     # Parameter values
     `buf`.addInt16(`nParamsLit`)
-  for arg in args:
+  for (val, rendered) in params:
     result.add quote do:
-      `buf`.writeParamValue(`arg`)
+      `buf`.writeBindParam(`val`, `rendered`)
   # Result format codes — handle at compile time to avoid empty-bracket inference issues
-  if resultFormats.kind == nnkBracket and resultFormats.len == 0:
+  if emptyRf:
     result.add quote do:
       `buf`.addInt16(0'i16)
-      `buf`.patchMsgLen(`msgStart`)
+      `buf`.patchMsgLenAtomic(`msgStart`)
   else:
     result.add quote do:
-      `buf`.addInt16(int16(`resultFormats`.len))
-      for f in `resultFormats`:
+      `buf`.addInt16(int16(`rf`.len))
+      for f in `rf`:
         `buf`.addInt16(f)
-      `buf`.patchMsgLen(`msgStart`)
+      `buf`.patchMsgLenAtomic(`msgStart`)

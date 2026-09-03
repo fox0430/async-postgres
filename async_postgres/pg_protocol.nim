@@ -283,7 +283,7 @@ const
   pgCopyBinaryTrailer*: array[2, byte] = [0xFF'u8, 0xFF'u8]
     ## PGCOPY binary format trailer (int16(-1) sentinel).
 
-  maxInt16Count = int(high(int16))
+  maxInt16Count* = int(high(int16))
     ## Maximum element count encodable in a wire Int16 count field (32767).
     ## Parameter-type, format-code, and parameter-value counts in Parse/Bind
     ## messages are all Int16, so they cannot represent more elements than this.
@@ -422,12 +422,92 @@ proc patchMsgLen*(buf: var seq[byte], msgStart: int) =
   let length = int32(buf.len - msgStart - 1)
   buf.writeBE32(msgStart + 1, length)
 
+proc patchMsgLenAtomic*(buf: var seq[byte], msgStart: int) =
+  ## ``patchMsgLen``, but truncates ``buf`` back to ``msgStart`` before raising.
+  ## For the direct macros: a ``try`` spliced into the caller's ``async`` body
+  ## trips ``orc``'s ``injectdestructors``, so they pre-flight instead and this
+  ## stays their only raise. A negative ``msgStart`` has no rollback point.
+  if msgStart < 0 or msgStart + 4 >= buf.len:
+    if msgStart >= 0 and msgStart <= buf.len:
+      buf.setLen(msgStart)
+    raise newException(
+      PgProtocolError,
+      "patchMsgLenAtomic: msgStart " & $msgStart & " out of range for buf.len " &
+        $buf.len,
+    )
+  let msgLen = buf.len - msgStart - 1
+  if msgLen > maxInt32Len:
+    buf.setLen(msgStart)
+    raise newException(
+      PgMessageTooLargeError,
+      "message length " & $msgLen & " exceeds protocol maximum of " & $maxInt32Len,
+    )
+  buf.patchMsgLen(msgStart)
+
+# Size arithmetic shared by the pre-flights and the encoders below. Public for
+# the tests that import this module directly; off the export whitelist.
+const
+  parseLengthOverhead* = 8
+    ## Beyond stmtName.len+sql.len+4*n: length field + 2 terminators + count
+  bindLengthOverhead* = 12
+    ## Beyond names+payload: length field + 2 terminators + 3 counts
+  describeLengthOverhead* = 6
+  executeLengthOverhead* = 9
+  closeLengthOverhead* = 6
+
+func calcParseMessageLength*(stmtNameLen, sqlLen, nParams: int): int64 =
+  ## Length value (wire Int32) of a Parse message, shared by pre-flight and
+  ## encoder so the two cannot drift.
+  int64(parseLengthOverhead) + int64(stmtNameLen) + int64(sqlLen) + int64(nParams) * 4
+
+func calcBindMessageLength*(
+    portalLen, stmtLen, pfLen, nParams: int, payload: int64, rfLen: int
+): int64 =
+  ## Length value of a Bind message. `payload` is the sum of parameter value bytes.
+  int64(bindLengthOverhead) + int64(portalLen) + int64(stmtLen) + int64(pfLen) * 2 +
+    int64(nParams) * 4 + payload + int64(rfLen) * 2
+
+when defined(pgTestObservability):
+  var checkMsgLenBoundCalls* {.threadvar.}: int
+    ## Lets tests prove a builder reaches the bound without a 2 GiB allocation.
+    ## Test-only; never branch on it.
+
+template checkMsgLenBound64*(lenVal: int64, what: untyped) =
+  ## Bound an assembled message length against the protocol's Int32 field.
+  ## Raises what ``patchMsgLen`` does, so both are one contract for the caller.
+  # `int64` so a total cannot wrap into an uncatchable `OverflowDefect` first;
+  # call sites must widen their own operands, evaluated before this template.
+  when defined(pgTestObservability):
+    inc checkMsgLenBoundCalls
+  if lenVal > int64(maxInt32Len):
+    raise newException(
+      PgMessageTooLargeError,
+      what & " (" & $lenVal & " bytes) exceeds protocol maximum of " & $maxInt32Len,
+    )
+
 func checkNoNul*(s: string, what: string) =
   ## Reject embedded NUL in protocol string: it would split fields or allow
   ## startup-parameter injection. Raises ``PgTypeError``.
   for c in s:
     if c == '\0':
       raise newException(PgTypeError, "embedded NUL byte in " & what)
+
+template withAtomicMessage*(buf: var seq[byte], body: untyped) =
+  ## Restore `buf.len` on `PgTypeError`, `PgProtocolError` or `Defect`, so a
+  ## failed builder leaves no half-written message. Narrow on purpose: any other
+  ## `CatchableError` belongs in the pre-flight, not in a rollback here.
+  let origLen = buf.len
+  try:
+    body
+  except PgTypeError as e:
+    buf.setLen(origLen)
+    raise e
+  except PgProtocolError as e:
+    buf.setLen(origLen)
+    raise e
+  except Defect as d:
+    buf.setLen(origLen)
+    raise d
 
 proc addCString*(buf: var seq[byte], s: string, what = "protocol string") =
   ## Append NUL-terminated C string. Raises ``PgTypeError`` on embedded NUL.
@@ -466,6 +546,33 @@ proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
 
 # Frontend message encoding
 
+# StartupMessage size arithmetic — test-visible internals, as above.
+const
+  startupFixedBytes* = int64(9)
+    ## Outside the key/value pairs: Int32 length + Int32 version + terminator.
+  startupUserKey* = "user"
+  startupDatabaseKey* = "database"
+
+func startupParamBytes*(keyLen: int, valueLen: int): int64 =
+  ## Wire size of one StartupMessage key/value pair (k+NUL + v+NUL).
+  int64(keyLen) + int64(valueLen) + 2
+
+proc calcStartupBudget*(userLen: int, databaseLen: int): int64 =
+  ## StartupMessage size with only the fixed `user`/`database` pairs.
+  ## `encodeStartup` seeds its budget from this so the two cannot drift.
+  result = startupFixedBytes + startupParamBytes(startupUserKey.len, userLen)
+  if databaseLen > 0:
+    result += startupParamBytes(startupDatabaseKey.len, databaseLen)
+
+proc checkStartupBudget*(budget: int64) =
+  ## Reject a StartupMessage too large for its Int32 length field. Split out so
+  ## tests can reach the raise without a 2 GiB allocation.
+  if budget > int64(maxInt32Len):
+    raise newException(
+      PgMessageTooLargeError,
+      "encodeStartup: total payload exceeds protocol maximum of " & $maxInt32Len,
+    )
+
 proc encodeStartup*(
     user: string, database: string, extraParams: openArray[(string, string)] = []
 ): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
@@ -474,30 +581,35 @@ proc encodeStartup*(
   ##
   ## The explicit ``raises`` on the ``encode*`` group machine-checks the contract:
   ## ``PgTypeError`` for caller input, ``PgProtocolError`` for an encoder bug.
-  result.addInt32(0) # length placeholder
-  result.addInt32(196608) # protocol version 3.0
-  # `what` names the field so a NUL message points at it.
-  result.addCString("user", "startup parameter key")
-  result.addCString(user, "user")
-  if database.len > 0:
-    result.addCString("database", "startup parameter key")
-    result.addCString(database, "database")
+  # Two passes rather than a temporary: values run up to the Int32 maximum, so
+  # a copy would double peak memory for the largest payloads.
+  var startupBudget = calcStartupBudget(user.len, database.len)
+  # NUL before the reserve, so a rejected value is not copied first.
+  checkNoNul(user, "user")
+  checkNoNul(database, "database")
   for (k, v) in extraParams:
     # Empty key would be a lone NUL terminator, silently dropping pairs.
     if k.len == 0:
       raise newException(
         PgTypeError, "encodeStartup: empty key in extraParams is not allowed"
       )
+    checkNoNul(k, "startup parameter key")
+    checkNoNul(v, "extraParams value")
+    startupBudget += startupParamBytes(k.len, v.len)
+  checkStartupBudget(startupBudget)
+  result = newSeqOfCap[byte](int(startupBudget))
+  result.addInt32(0) # length placeholder
+  result.addInt32(196608) # protocol version 3.0
+  result.addCString(startupUserKey, "startup parameter key")
+  result.addCString(user, "user")
+  if database.len > 0:
+    result.addCString(startupDatabaseKey, "startup parameter key")
+    result.addCString(database, "database")
+  for (k, v) in extraParams:
     result.addCString(k, "startup parameter key")
     # Constant `what`: interpolating `k` would allocate per pair on every connect.
     result.addCString(v, "extraParams value")
   result.add(0'u8) # terminator
-  if result.len > maxInt32Len:
-    raise newException(
-      PgMessageTooLargeError,
-      "encodeStartup: message length " & $result.len & " exceeds protocol maximum of " &
-        $maxInt32Len,
-    )
   let length = int32(result.len)
   let encoded = encodeInt32(length)
   result[0] = encoded[0]
@@ -566,15 +678,90 @@ proc addParse*(
     paramTypeOids: openArray[int32] = [],
 ) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Parse message to the buffer (extended query protocol).
-  let msgStart = buf.len
-  buf.add(byte('P'))
-  buf.addInt32(0) # length placeholder
-  buf.addCString(stmtName)
-  buf.addCString(sql)
-  buf.addCount16(paramTypeOids.len, "Parse parameter-type")
-  for oid in paramTypeOids:
-    buf.addInt32(oid)
-  buf.patchMsgLen(msgStart)
+  checkNoNul(stmtName, "statement name")
+  checkNoNul(sql, "SQL statement")
+  if paramTypeOids.len > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Parse parameter-type count " & $paramTypeOids.len &
+        " exceeds protocol maximum of " & $maxInt16Count,
+    )
+  checkMsgLenBound64(
+    calcParseMessageLength(stmtName.len, sql.len, paramTypeOids.len), "Parse message"
+  )
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('P'))
+    buf.addInt32(0) # length placeholder
+    buf.addCString(stmtName)
+    buf.addCString(sql)
+    buf.addCount16(paramTypeOids.len, "Parse parameter-type")
+    for oid in paramTypeOids:
+      buf.addInt32(oid)
+    buf.patchMsgLen(msgStart)
+
+proc preflightParseDirect*(
+    stmtName, sql: string, nParams: int
+) {.raises: [PgTypeError].} =
+  ## Whole pre-flight for ``addParseDirect``, so its write phase cannot raise.
+  ## No count guard: the macro already narrows ``nParams`` to ``int16``.
+  checkNoNul(stmtName, "statement name")
+  checkNoNul(sql, "SQL statement")
+  checkMsgLenBound64(
+    calcParseMessageLength(stmtName.len, sql.len, nParams), "Parse message"
+  )
+
+proc preflightBindCounts*(
+    portalName, stmtName: string, pfLen, nParams, rfLen: int
+) {.raises: [PgTypeError].} =
+  ## NUL and Int16-count pre-flight shared by every Bind builder.
+  checkNoNul(portalName, "portal name")
+  checkNoNul(stmtName, "statement name")
+  if pfLen > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind parameter-format count " & $pfLen & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+  if nParams > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind parameter count " & $nParams & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+  if rfLen > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind result-format count " & $rfLen & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+
+proc addBindPayload*(payload: var int64, vlen: int) {.raises: [PgTypeError].} =
+  ## Fold one parameter value's length into the Bind payload total, bounding
+  ## both the element and the running sum (``int64``, so it cannot wrap).
+  # Two error kinds on purpose: an oversized value matches `addLen32`, the
+  # running sum matches `patchMsgLen`.
+  if vlen > maxInt32Len:
+    raise newException(
+      PgTypeError,
+      "Bind parameter value length " & $vlen & " exceeds protocol maximum of " &
+        $maxInt32Len,
+    )
+  payload += int64(vlen)
+  checkMsgLenBound64(payload, "Bind parameter data")
+
+proc preflightBindDirect*(
+    portalName, stmtName: string, nParams, rfLen: int, payload: int64
+) {.raises: [PgTypeError].} =
+  ## Whole pre-flight for ``addBindDirect``. ``payload`` is what
+  ## ``foldBindParam`` summed; the macro writes one format code per argument.
+  preflightBindCounts(portalName, stmtName, nParams, nParams, rfLen)
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      portalName.len, stmtName.len, nParams, nParams, payload, rfLen
+    ),
+    "Bind message",
+  )
 
 proc addBind*(
     buf: var seq[byte],
@@ -585,29 +772,44 @@ proc addBind*(
     resultFormats: openArray[int16] = [],
 ) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Bind message to the buffer (extended query protocol).
-  let msgStart = buf.len
-  buf.add(byte('B'))
-  buf.addInt32(0) # length placeholder
-  buf.addCString(portalName)
-  buf.addCString(stmtName)
-  # Parameter format codes
-  buf.addCount16(paramFormats.len, "Bind parameter-format")
-  for f in paramFormats:
-    buf.addInt16(f)
-  # Parameter values
-  buf.addCount16(paramValues.len, "Bind parameter")
+  preflightBindCounts(
+    portalName, stmtName, paramFormats.len, paramValues.len, resultFormats.len
+  )
+  var payload: int64 = 0
   for v in paramValues:
-    if v.isNone:
-      buf.addInt32(-1) # NULL
-    else:
-      let data = v.get
-      buf.addLen32(data.len, "Bind parameter value")
-      buf.appendBytes(data)
-  # Result format codes
-  buf.addCount16(resultFormats.len, "Bind result-format")
-  for f in resultFormats:
-    buf.addInt16(f)
-  buf.patchMsgLen(msgStart)
+    if v.isSome:
+      addBindPayload(payload, v.get.len)
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      portalName.len, stmtName.len, paramFormats.len, paramValues.len, payload,
+      resultFormats.len,
+    ),
+    "Bind message",
+  )
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('B'))
+    buf.addInt32(0) # length placeholder
+    buf.addCString(portalName)
+    buf.addCString(stmtName)
+    # Parameter format codes
+    buf.addCount16(paramFormats.len, "Bind parameter-format")
+    for f in paramFormats:
+      buf.addInt16(f)
+    # Parameter values
+    buf.addCount16(paramValues.len, "Bind parameter")
+    for v in paramValues:
+      if v.isNone:
+        buf.addInt32(-1) # NULL
+      else:
+        let data = v.get
+        buf.addLen32(data.len, "Bind parameter value")
+        buf.appendBytes(data)
+    # Result format codes
+    buf.addCount16(resultFormats.len, "Bind result-format")
+    for f in resultFormats:
+      buf.addInt16(f)
+    buf.patchMsgLen(msgStart)
 
 proc addBindRaw*(
     buf: var seq[byte],
@@ -620,71 +822,99 @@ proc addBindRaw*(
 ) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append Bind from raw buffer and ranges. ``len==-1`` is NULL; else
   ## ``paramData[off..<off+len]``. Raises ``PgTypeError`` for invalid ranges.
-  let msgStart = buf.len
-  buf.add(byte('B'))
-  buf.addInt32(0) # length placeholder
-  buf.addCString(portalName)
-  buf.addCString(stmtName)
-  buf.addCount16(paramFormats.len, "Bind parameter-format")
-  for f in paramFormats:
-    buf.addInt16(f)
-  buf.addCount16(paramRanges.len, "Bind parameter")
+  preflightBindCounts(
+    portalName, stmtName, paramFormats.len, paramRanges.len, resultFormats.len
+  )
+  var payload: int64 = 0
   for r in paramRanges:
     if r.len < -1:
       raise newException(PgTypeError, "addBindRaw: invalid range len " & $r.len)
-    if r.len == -1:
-      buf.addInt32(-1)
-    else:
-      buf.addInt32(r.len)
-      if r.len > 0:
-        if r.off < 0:
-          raise newException(PgTypeError, "addBindRaw: negative range off " & $r.off)
-        if r.off.int64 + r.len.int64 > paramData.len.int64:
-          raise newException(
-            PgTypeError,
-            "addBindRaw: range out of bounds (off=" & $r.off & ", len=" & $r.len &
-              ", data.len=" & $paramData.len & ")",
-          )
-        let oldLen = buf.len
-        buf.setLen(oldLen + r.len)
-        buf.writeBytesAt(oldLen, paramData.toOpenArray(r.off, r.off + r.len - 1))
-  buf.addCount16(resultFormats.len, "Bind result-format")
-  for f in resultFormats:
-    buf.addInt16(f)
-  buf.patchMsgLen(msgStart)
+    if r.len > 0:
+      if r.off < 0:
+        raise newException(PgTypeError, "addBindRaw: negative range off " & $r.off)
+      if r.off.int64 + r.len.int64 > paramData.len.int64:
+        raise newException(
+          PgTypeError,
+          "addBindRaw: range out of bounds (off=" & $r.off & ", len=" & $r.len &
+            ", data.len=" & $paramData.len & ")",
+        )
+      addBindPayload(payload, r.len)
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      portalName.len, stmtName.len, paramFormats.len, paramRanges.len, payload,
+      resultFormats.len,
+    ),
+    "Bind message",
+  )
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('B'))
+    buf.addInt32(0) # length placeholder
+    buf.addCString(portalName)
+    buf.addCString(stmtName)
+    buf.addCount16(paramFormats.len, "Bind parameter-format")
+    for f in paramFormats:
+      buf.addInt16(f)
+    buf.addCount16(paramRanges.len, "Bind parameter")
+    for r in paramRanges:
+      if r.len == -1:
+        buf.addInt32(-1)
+      else:
+        buf.addInt32(r.len)
+        if r.len > 0:
+          let oldLen = buf.len
+          buf.setLen(oldLen + r.len)
+          buf.writeBytesAt(oldLen, paramData.toOpenArray(r.off, r.off + r.len - 1))
+    buf.addCount16(resultFormats.len, "Bind result-format")
+    for f in resultFormats:
+      buf.addInt16(f)
+    buf.patchMsgLen(msgStart)
 
 proc addDescribe*(
     buf: var seq[byte], kind: DescribeKind, name: string
 ) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Describe message to the buffer (portal or statement).
-  let msgStart = buf.len
-  buf.add(byte('D'))
-  buf.addInt32(0) # length placeholder
-  buf.add(byte(kind))
-  buf.addCString(name)
-  buf.patchMsgLen(msgStart)
+  checkNoNul(name, "describe name")
+  checkMsgLenBound64(
+    int64(describeLengthOverhead) + int64(name.len), "Describe message"
+  )
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('D'))
+    buf.addInt32(0) # length placeholder
+    buf.add(byte(kind))
+    buf.addCString(name)
+    buf.patchMsgLen(msgStart)
 
 proc addExecute*(
     buf: var seq[byte], portalName: string, maxRows: int32 = 0
 ) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append an Execute message to the buffer. `maxRows` of 0 means unlimited.
-  let msgStart = buf.len
-  buf.add(byte('E'))
-  buf.addInt32(0) # length placeholder
-  buf.addCString(portalName)
-  buf.addInt32(maxRows)
-  buf.patchMsgLen(msgStart)
+  checkNoNul(portalName, "portal name")
+  checkMsgLenBound64(
+    int64(executeLengthOverhead) + int64(portalName.len), "Execute message"
+  )
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('E'))
+    buf.addInt32(0) # length placeholder
+    buf.addCString(portalName)
+    buf.addInt32(maxRows)
+    buf.patchMsgLen(msgStart)
 
 proc addClose*(
     buf: var seq[byte], kind: DescribeKind, name: string
 ) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Close message to the buffer (portal or statement).
-  let msgStart = buf.len
-  buf.add(byte('C'))
-  buf.addInt32(0) # length placeholder
-  buf.add(byte(kind))
-  buf.addCString(name)
-  buf.patchMsgLen(msgStart)
+  checkNoNul(name, "close name")
+  checkMsgLenBound64(int64(closeLengthOverhead) + int64(name.len), "Close message")
+  withAtomicMessage(buf):
+    let msgStart = buf.len
+    buf.add(byte('C'))
+    buf.addInt32(0) # length placeholder
+    buf.add(byte(kind))
+    buf.addCString(name)
+    buf.patchMsgLen(msgStart)
 
 proc addSync*(buf: var seq[byte]) =
   ## Append a Sync message to the buffer.

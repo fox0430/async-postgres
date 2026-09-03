@@ -37,6 +37,8 @@ export encoding.paramOidOf
 export encoding.writeParamFormat
 export encoding.writeParamValue
 export encoding.writeParamOid
+export encoding.foldBindParam
+export encoding.writeBindParam
 
 # `decoding` — public text parsers; the raw binary decoders stay internal.
 export decoding.fromPgText
