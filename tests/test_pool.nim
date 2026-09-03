@@ -13,6 +13,8 @@ import ../async_postgres/pg_client/[core, query, exec, direct]
 
 import mock_pg_server
 
+var testTracerCloseCnt {.global.}: int
+
 privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
@@ -4591,6 +4593,266 @@ suite "The direct macros pre-flight before pendingStmtCloses is drained":
       expect Defect:
         discard waitFor conn.execDirect("SELECT $1", 1'i32)
       check checkMsgLenBoundCalls == 7
+
+suite "executeBatch releases connection when every op fails validation":
+  test "all ops rejected as PgTypeError still releases pool slot":
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    let fut1 = newFuture[CommandResult]("test1")
+    let fut2 = newFuture[CommandResult]("test2")
+    let batch = @[
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: fut1, timeout: ZeroDuration
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: fut2, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check fut1.failed
+    check fut2.failed
+    check fut1.readError of PgTypeError
+    check fut2.readError of PgTypeError
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.idle.len == 1
+
+  test "partial batch failure still releases pool slot":
+    # Both ops fail validation (NUL, over-count) before any pipeline is built,
+    # so no transport is needed. The mixed queued/rejected path needs a live
+    # transport and is covered under e2e.
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    let futOk = newFuture[CommandResult]("ok")
+    let futBad = newFuture[CommandResult]("bad")
+    let bigParams = newSeq[PgParam](maxInt16Count + 1)
+    let batch = @[
+      PendingPoolOp(
+        kind: popExec,
+        sql: "SELECT 1",
+        params: bigParams,
+        execFut: futOk,
+        timeout: ZeroDuration,
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: futBad, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check futBad.failed
+    check futBad.readError of PgTypeError
+    check futOk.failed
+    check futOk.readError of PgTypeError
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.idle.len == 1
+    check pool.size == 1
+
+  test "mixed popQuery and popExec all rejected still releases":
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    let futQ = newFuture[QueryResult]("q")
+    let futE = newFuture[CommandResult]("e")
+    let batch = @[
+      PendingPoolOp(
+        kind: popQuery, sql: "SELECT 1\0", queryFut: futQ, timeout: ZeroDuration
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: futE, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check futQ.failed
+    check futE.failed
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.idle.len == 1
+
+suite "executeBatch handles transport errors and still releases":
+  test "pipeline error still releases pool slot":
+    # A queued op reaches `sendBufMsg`, which a mock without a transport would
+    # segfault on under chronos — hence `defectWriter`. The write then raises a
+    # Defect (chronos) or a socket CatchableError (asyncdispatch); either way
+    # the `finally` must release the slot.
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    when hasChronos:
+      conn.writer = defectWriter()
+    let fut = newFuture[CommandResult]("transport")
+    let batch = @[
+      PendingPoolOp(kind: popExec, sql: "SELECT 1", execFut: fut, timeout: ZeroDuration)
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check fut.failed
+    check not (fut.readError of PgTypeError)
+    # The failure is either a wrapped Defect or a transport CatchableError;
+    # the important property is that the pool slot is not leaked.
+    check not conn.borrowed
+    check pool.active == 0
+    check fut.readError != nil
+    # resetSessionAndRelease may have closed the conn (transport failure) or
+    # returned it to idle; either way the pool must not retain a borrowed slot.
+    check pool.size == 0 or pool.idle.len == 1
+
+  test "mixed queued and rejected with transport failure isolates errors and releases":
+    # One op is queued, one is rejected at add time, and the queued op's
+    # pipeline then fails on transport: `ir` is indexed by `queued` while the
+    # error arms walk `batch`, and the `finally` must still release.
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    when hasChronos:
+      conn.writer = defectWriter()
+    let futOk = newFuture[CommandResult]("ok")
+    let futBad = newFuture[CommandResult]("bad")
+    let batch = @[
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1", execFut: futOk, timeout: ZeroDuration
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: futBad, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check futBad.failed
+    check futBad.readError of PgTypeError
+    check futOk.failed
+    check not (futOk.readError of PgTypeError)
+    check futOk.readError != nil
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.size == 0 or pool.idle.len == 1
+
+suite "executeBatch reports close errors to tracer":
+  test "resetSession failure is routed to onPoolCloseError and does not mask batch errors":
+    when hasChronos:
+      testTracerCloseCnt = 0
+      let tracer = PgTracer()
+      tracer.onPoolCloseError = proc(
+          data: TracePoolCloseErrorData
+      ) {.gcsafe, raises: [].} =
+        inc testTracerCloseCnt
+      let pool = makePool(maxSize = 2)
+      pool.config.tracer = tracer
+      pool.active = 1
+      let conn = mockConn(pool = pool)
+      conn.ownerPool = pool
+      conn.borrowed = true
+      conn.state = csReady
+      conn.txStatus = tsIdle
+      conn.sessionLockDirty = true
+      conn.writer = defectWriter()
+      pool.config.resetQuery = "SELECT 1"
+      let fut1 = newFuture[CommandResult]("c1")
+      let fut2 = newFuture[CommandResult]("c2")
+      let batch = @[
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut1, timeout: ZeroDuration
+        ),
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut2, timeout: ZeroDuration
+        ),
+      ]
+      waitFor pool.executeBatch(conn, batch)
+      check fut1.failed and (fut1.readError of PgTypeError)
+      check fut2.failed and (fut2.readError of PgTypeError)
+      check not conn.borrowed
+      check pool.active == 0
+      check testTracerCloseCnt == 1
+      # The batch's PgTypeError must not be masked by the close error
+      check fut1.readError of PgTypeError
+    else:
+      # asyncdispatch: resetSession swallows CatchableError, so no
+      # onPoolCloseError is expected; verify batch errors are preserved
+      # and pool slot is not leaked.
+      let pool = makePool(maxSize = 2)
+      pool.active = 1
+      let conn = mockConn(pool = pool)
+      conn.ownerPool = pool
+      conn.borrowed = true
+      conn.state = csReady
+      conn.txStatus = tsIdle
+      let fut1 = newFuture[CommandResult]("c1")
+      let fut2 = newFuture[CommandResult]("c2")
+      let batch = @[
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut1, timeout: ZeroDuration
+        ),
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut2, timeout: ZeroDuration
+        ),
+      ]
+      waitFor pool.executeBatch(conn, batch)
+      check fut1.failed and (fut1.readError of PgTypeError)
+      check not conn.borrowed
+      check pool.active == 0
+
+suite "A raising close-error tracer never shadows the operation's error":
+  when hasChronos:
+    test "single-op dispatch keeps the body error when the tracer raises a Defect":
+      # `onPoolCloseError` is `raises: []`, so only a Defect can escape it and
+      # replace the error the op is about to fail with.
+      proc t() {.async.} =
+        let tracer = PgTracer()
+        tracer.onPoolCloseError = proc(
+            data: TracePoolCloseErrorData
+        ) {.gcsafe, raises: [].} =
+          raise newException(AssertionDefect, "tracer defect")
+        let pool = makePool()
+        pool.config.tracer = tracer
+        pool.config.resetQuery = "SELECT 1"
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.writer = defectWriter()
+        conn.sessionLockDirty = true # forces unlock_all through the writer
+        pool.idle.addLast(conn.toPooled())
+
+        let fut = newFuture[CommandResult]("op")
+        let op = PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut, timeout: ZeroDuration
+        )
+        await pool.dispatchHomogeneous(@[op], 1)
+
+        doAssert fut.failed
+        doAssert fut.readError of PgTypeError,
+          "the tracer's Defect must not replace the op's own error"
+
+      waitFor t()
+
+  test "reportCloseError swallows a Defect from the hook":
+    let tracer = PgTracer()
+    tracer.onPoolCloseError = proc(
+        data: TracePoolCloseErrorData
+    ) {.gcsafe, raises: [].} =
+      raise newException(AssertionDefect, "tracer defect")
+    let pool = makePool()
+    pool.config.tracer = tracer
+    pool.reportCloseError(mockConn(), newException(PgError, "close failed"))
+
 suite "Array encoder guards are catchable and do not disturb valid input":
   ## What these guards reject needs a 2 GiB allocation, which a unit test
   ## cannot make. So: pin that the primitives raise a catchable `PgTypeError`
