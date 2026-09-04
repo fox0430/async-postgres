@@ -4230,6 +4230,60 @@ suite "Message builders are atomic on failure":
     expect PgMessageTooLargeError:
       checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
     check buf == orig
+
+suite "Direct message builders are atomic on failure":
+  ## Atomic for everything the pre-flight rejects. The write phase cannot roll
+  ## back (a `try` in the caller's `async` body trips `orc`), so a failed build
+  ## is kept off the wire by the send buffer's lifecycle, pinned below.
+
+  test "a failed build leaves nothing for the next operation to send":
+    # Every failure the macros can raise comes out of the pre-flight, before the
+    # first byte is written, so there is no residue for the caller's truncation
+    # to hide: the next build must produce clean bytes without one.
+    var sendBuf: seq[byte] = @[]
+    expect PgTypeError:
+      sendBuf.addBindDirect("", "stmt\0", [], 1'i32)
+    check sendBuf.len == 0
+    sendBuf.addBindDirect("", "stmt", [], 1'i32)
+    var expected: seq[byte] = @[]
+    expected.addBindDirect("", "stmt", [], 1'i32)
+    check sendBuf == expected
+
+  test "addBindDirect leaves buffer unchanged on resultFormat count overflow":
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    let bigRf = newSeq[int16](maxInt16Count + 1)
+    expect PgTypeError:
+      buf.addBindDirect("", "stmt", bigRf, 1'i32)
+    check buf == orig
+
+suite "Direct builders agree with their pre-flight length":
+  ## `patchMsgLenAtomic` is the only rollback left, so the pre-flight length
+  ## must match what is written; drift would truncate a message on the wire.
+
+  test "addParseDirect matches calcParseMessageLength":
+    var buf: seq[byte] = @[]
+    buf.addParseDirect("myStmt", "SELECT $1, $2", 1'i32, "x")
+    check int64(buf.len - 1) ==
+      calcParseMessageLength("myStmt".len, "SELECT $1, $2".len, 2)
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "addBindDirect matches calcBindMessageLength":
+    var buf: seq[byte] = @[]
+    let rf = @[0'i16]
+    buf.addBindDirect("p", "s", rf, 1'i32, "abc")
+    let payload = int64(paramValueLen(1'i32)) + int64(paramValueLen("abc"))
+    check int64(buf.len - 1) ==
+      calcBindMessageLength("p".len, "s".len, 2, 2, payload, rf.len)
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "addBindDirect with no resultFormats matches":
+    var buf: seq[byte] = @[]
+    buf.addBindDirect("", "s", [], 42'i64)
+    check int64(buf.len - 1) ==
+      calcBindMessageLength(0, "s".len, 1, 1, int64(paramValueLen(42'i64)), 0)
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
 suite "Array encoder guards are catchable and do not disturb valid input":
   ## What these guards reject needs a 2 GiB allocation, which a unit test
   ## cannot make. So: pin that the primitives raise a catchable `PgTypeError`
