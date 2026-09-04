@@ -253,13 +253,19 @@ proc metrics*(pool: PgPool): PoolMetrics =
   ## Cumulative pool metrics.
   pool.metrics
 
-proc reportCloseError(pool: PgPool, conn: PgConnection, err: ref CatchableError) =
+proc reportCloseError(
+    pool: PgPool, conn: PgConnection, err: ref CatchableError
+) {.raises: [].} =
   ## Route a swallowed pool-initiated close error to the tracer. The pool
   ## cannot propagate these errors to a caller (close runs from synchronous
   ## cleanup paths and fire-and-forget tasks), so tracing is the only signal
-  ## operators have for leak detection.
+  ## operators have for leak detection. Never raises: a Defect out of the hook
+  ## would replace the caller's own error.
   if pool.config.tracer != nil and pool.config.tracer.onPoolCloseError != nil:
-    pool.config.tracer.onPoolCloseError(TracePoolCloseErrorData(conn: conn, err: err))
+    try:
+      pool.config.tracer.onPoolCloseError(TracePoolCloseErrorData(conn: conn, err: err))
+    except Defect:
+      discard
 
 proc tracedClose(pool: PgPool, conn: PgConnection) {.async.} =
   ## Close `conn`, reporting any close error via `reportCloseError`.
@@ -1375,62 +1381,76 @@ proc executeBatch(
     pool: PgPool, conn: PgConnection, batch: seq[PendingPoolOp]
 ): Future[void] {.async.} =
   ## Execute a batch of pending operations on a single connection via pipeline.
-  let timeout = batchTimeout(batch)
-  # Ops the pipeline rejects at add time are resolved here and excluded from
-  # the run, so `ir` is indexed by `acceptedIdx`, not by batch position.
-  var acceptedIdx = newSeqOfCap[int](batch.len)
-  var addFailed = newSeq[bool](batch.len)
   # No re-raise: every op's outcome is reported via `failPendingOp` below.
+  # Ops the pipeline rejects at add time are resolved here and excluded from
+  # the run, so `ir` is indexed by `queued`, not by batch position.
+  var queued: seq[PendingPoolOp] = @[]
+  var addFailed = newSeq[bool](batch.len)
   try:
-    let pipeline = newPipeline(conn)
-    for i, op in batch:
-      try:
-        case op.kind
-        of popExec:
-          if op.hasInline:
-            pipeline.addExec(op.sql, op.paramsInline)
+    try:
+      let pipeline = newPipeline(conn)
+      for i, op in batch:
+        try:
+          case op.kind
+          of popExec:
+            if op.hasInline:
+              pipeline.addExec(op.sql, op.paramsInline)
+            else:
+              pipeline.addExec(op.sql, op.params)
+          of popQuery:
+            if op.hasInline:
+              pipeline.addQuery(op.sql, op.paramsInline, op.resultFormat)
+            else:
+              pipeline.addQuery(op.sql, op.params, op.resultFormat)
+        except CatchableError as e:
+          # `add*` appends all-or-nothing, so the pipeline is intact and the
+          # rejection stays this op's own error.
+          addFailed[i] = true
+          failPendingOp(op, e)
+          continue
+        queued.add(op)
+      if queued.len != 0:
+        let timeout = batchTimeout(queued)
+        let ir = await pipeline.executeIsolated(timeout)
+        for i in 0 ..< queued.len:
+          let op = queued[i]
+          if ir.errors[i] != nil:
+            failPendingOp(op, ir.errors[i])
           else:
-            pipeline.addExec(op.sql, op.params)
-        of popQuery:
-          if op.hasInline:
-            pipeline.addQuery(op.sql, op.paramsInline, op.resultFormat)
-          else:
-            pipeline.addQuery(op.sql, op.params, op.resultFormat)
-        acceptedIdx.add(i)
-      except CatchableError as e:
-        # Add-time validation is per-op, so the offending op fails on its own
-        # instead of taking batch-mates down with it.
-        addFailed[i] = true
-        failPendingOp(op, e)
-    let ir = await pipeline.executeIsolated(timeout)
-    for k, i in acceptedIdx:
-      let op = batch[i]
-      if ir.errors[k] != nil:
-        failPendingOp(op, ir.errors[k])
-      else:
-        case op.kind
-        of popExec:
-          completePendingOp(op, ir.results[k].commandResult)
-        of popQuery:
-          completePendingOp(op, ir.results[k].queryResult)
-  except CatchableError as e:
-    for i, op in batch:
-      if not addFailed[i]:
-        failPendingOp(op, e)
-  except Defect as d:
-    for i, op in batch:
-      if not addFailed[i]:
-        failPendingOp(op, newPoolError(pekDefectWrapped, d.msg, d))
-  try:
-    await pool.resetSessionAndRelease(conn)
-  except CancelledError as e:
-    raise e
-  except Defect:
-    # Swallowed like the arm below: ops are already settled and the raise
-    # would be dropped by the caller's allFutures anyway.
-    discard
-  except CatchableError:
-    discard
+            case op.kind
+            of popExec:
+              completePendingOp(op, ir.results[i].commandResult)
+            of popQuery:
+              completePendingOp(op, ir.results[i].queryResult)
+    # Every arm walks `batch`, not `queued`: an op the loop never reached has
+    # no future settled yet.
+    except CancelledError as e:
+      # Settle the ops before propagating: they have left `pendingOps`, so
+      # `failAllPending` cannot reach them.
+      for i, op in batch:
+        if not addFailed[i]:
+          failPendingOp(op, e)
+      raise e
+    except CatchableError as e:
+      for i, op in batch:
+        if not addFailed[i]:
+          failPendingOp(op, e)
+    except Defect as d:
+      for i, op in batch:
+        if not addFailed[i]:
+          failPendingOp(op, newPoolError(pekDefectWrapped, d.msg, d))
+  finally:
+    # `finally`: a raising `failPendingOp` would otherwise lose the pool slot.
+    # Masking the body error is harmless here — every op is already settled.
+    try:
+      await pool.resetSessionAndRelease(conn)
+    except CancelledError as e:
+      raise e
+    except Defect as d:
+      # Re-raising would only be dropped by the caller's `allFutures`.
+      pool.reportCloseError(conn, newException(PgError, d.msg, d))
+    except CatchableError as e:
+      pool.reportCloseError(conn, e)
 
 proc dispatchHomogeneous(
     pool: PgPool, ops: seq[PendingPoolOp], maxConns: int
@@ -1484,12 +1504,12 @@ proc dispatchHomogeneous(
         await pool.resetSessionAndRelease(conn)
       except CancelledError as e:
         raise e
-      except Defect:
-        # Same-frame Defect from the release path: swallowed like the arm
-        # below — never shadow the body error.
-        discard
-      except CatchableError:
-        discard
+      except Defect as d:
+        # Same-frame Defect from the release path: report, never shadow the
+        # body error.
+        pool.reportCloseError(conn, newException(PgError, d.msg, d))
+      except CatchableError as e:
+        pool.reportCloseError(conn, e)
       if bodyErr != nil:
         raise bodyErr
       if bodyDefect != nil:

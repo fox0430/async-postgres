@@ -1039,6 +1039,130 @@ suite "E2E: pipelined dispatch inline-param failure":
 
     waitFor t()
 
+  test "typed-param encode failure fails only the op that carries it":
+    # The Parse/Bind count guard used to fire in the send phase — too late to
+    # tell the ops apart.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, pipelined = true)
+      )
+      defer:
+        await pool.close()
+
+      var tooMany = newSeq[PgParam](32768) # one past the wire Int16 count max
+      for i in 0 ..< tooMany.len:
+        tooMany[i] = toPgParam(1'i32)
+      # see the inline twin above for why both ops are enqueued synchronously
+      let bad = pool.exec("SELECT $1", tooMany)
+      doAssert pool.pendingOps.len == 1
+      let good = pool.query("SELECT 1")
+      doAssert pool.pendingOps.len == 2,
+        "both ops must be queued before dispatch drains them as a batch"
+      var raised = false
+      try:
+        discard await bad
+      except PgTypeError:
+        raised = true
+      doAssert raised, "the op with the bad params must fail with PgTypeError"
+      let res = await good
+      doAssert res.rows.len == 1, "a batch-mate must not inherit the encode failure"
+      doAssert pool.activeCount == 0, "connection must be released after the raise"
+
+    waitFor t()
+
+suite "E2E: pool dispatch Defect arms":
+  ## Every dispatch path wraps a body `Defect` into
+  ## `PgPoolError(pekDefectWrapped)` so the op's future fails instead of
+  ## hanging. A tracer hook is the Defect source: it is the one injection point
+  ## both backends share.
+  const defectSql = "SELECT 1 /* pool defect probe */"
+
+  proc defectTracer(): PgTracer =
+    let tracer = PgTracer()
+    tracer.onQueryStart = proc(
+        conn: PgConnection, data: TraceQueryStartData
+    ): TraceContext {.gcsafe, raises: [].} =
+      if data.sql == defectSql:
+        raise newException(AssertionDefect, "tracer defect")
+    tracer.onPipelineStart = proc(
+        conn: PgConnection, data: TracePipelineStartData
+    ): TraceContext {.gcsafe, raises: [].} =
+      # Only a real batch: the single-op dispatch path skips the pipeline, and
+      # the pool's own bookkeeping never opens one.
+      if data.opCount > 1:
+        raise newException(AssertionDefect, "tracer defect")
+    tracer
+
+  proc defectPool(pipelined: bool): Future[PgPool] =
+    var cfg = plainConfig()
+    cfg.tracer = defectTracer()
+    newPool(
+      initPoolConfig(
+        cfg,
+        minSize = 1,
+        maxSize = 1,
+        healthCheckTimeout = ZeroDuration,
+        pipelined = pipelined,
+      )
+    )
+
+  test "non-pipelined dispatch wraps a body Defect as PgPoolError":
+    proc t() {.async.} =
+      let pool = await defectPool(pipelined = false)
+      defer:
+        await pool.close()
+
+      var kind = pekUnknown
+      try:
+        discard await pool.exec(defectSql)
+      except PgPoolError as e:
+        kind = e.kind
+      doAssert kind == pekDefectWrapped, "body Defect must surface as PgPoolError"
+      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+
+    waitFor t()
+
+  test "single pipelined op wraps a body Defect as PgPoolError":
+    proc t() {.async.} =
+      let pool = await defectPool(pipelined = true)
+      defer:
+        await pool.close()
+
+      var kind = pekUnknown
+      try:
+        discard await pool.exec(defectSql)
+      except PgPoolError as e:
+        kind = e.kind
+      doAssert kind == pekDefectWrapped, "op future must fail, not hang"
+      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+
+    waitFor t()
+
+  test "batch wraps a pipeline Defect as PgPoolError for every op":
+    proc t() {.async.} =
+      let pool = await defectPool(pipelined = true)
+      defer:
+        await pool.close()
+
+      # Both ops queued before dispatch drains them — see the encode-failure
+      # test above for why this pins the executeBatch path.
+      let f1 = pool.exec("SELECT 1")
+      doAssert pool.pendingOps.len == 1
+      let f2 = pool.exec("SELECT 1")
+      doAssert pool.pendingOps.len == 2,
+        "both ops must be queued before dispatch drains them as a batch"
+      var wrapped = 0
+      for f in [f1, f2]:
+        try:
+          discard await f
+        except PgPoolError as e:
+          if e.kind == pekDefectWrapped:
+            inc wrapped
+      doAssert wrapped == 2, "every op in the batch must fail, got " & $wrapped
+      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+
+    waitFor t()
+
 suite "E2E: pool withTransaction body-Defect handling":
   test "body Defect rolls back, releases, and re-raises":
     # Regression: a body Defect must still ROLLBACK server-side, release the
