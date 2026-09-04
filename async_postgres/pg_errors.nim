@@ -1,29 +1,13 @@
-## Exception hierarchy.
+## Exception hierarchy. Every library-raised exception derives from ``PgError``.
 ##
-## All library-raised exceptions derive from ``PgError`` so callers can catch
-## every pg-specific failure with a single ``except PgError`` clause. ``PgProtocolError``
-## is a subtype of ``PgConnectionError`` because a protocol-level violation
-## desynchronises the wire stream — the only viable recovery is to tear down
-## and re-establish the connection.
+## The hierarchy encodes *recovery*: ``PgProtocolError`` and ``PgTimeoutError``
+## are ``PgConnectionError`` because both leave the wire unusable, so reconnect
+## loops must see them; ``PgStateError`` is deliberately a sibling, being a
+## programming error that reconnecting cannot fix.
 ##
-## ``PgStateError`` is deliberately a *sibling* of ``PgConnectionError`` (both
-## under ``PgError``) rather than a subtype: it signals a programming error
-## (e.g. a single connection used concurrently), for which reconnecting is
-## pointless, so it must stay out of ``except PgConnectionError`` reconnect
-## loops.
-##
-## ``PgTimeoutError`` is a subtype of ``PgConnectionError`` for the opposite
-## reason. A timed-out query/exec/copy/prepare/transaction dispatches a
-## best-effort CancelRequest and marks the connection ``csClosed`` (the wire may
-## be mid-exchange and is no longer trustworthy), so reconnecting *is* the
-## correct recovery and the error must be visible to ``except PgConnectionError``
-## loops. The two timeouts that leave the connection usable —
-## ``waitNotification`` and an acquire timeout inside
-## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` — still raise
-## ``PgTimeoutError`` and are therefore also caught by ``except PgConnectionError``;
-## a caller that needs to tell a timeout apart from a hard connection failure
-## catches ``PgTimeoutError`` in a clause placed *before* the
-## ``PgConnectionError`` one.
+## ``PgTypeError`` = caller data the wire format cannot carry; ``PgQueryError`` =
+## an error the server reported; ``ValueError`` = a precondition, and the one kind
+## not under ``PgError`` (except DSN parsing).
 
 type
   ErrorField* = object
@@ -35,7 +19,14 @@ type
     ## General PostgreSQL error. Base type for all pg-specific errors.
 
   PgTypeError* = object of PgError
-    ## Raised when a PostgreSQL value cannot be converted to the requested Nim type.
+    ## Raised when the caller's data cannot be carried by the wire format: a
+    ## value that will not convert to or from the requested Nim type, or one the
+    ## protocol cannot encode (count past Int16, length past Int32, embedded NUL).
+
+  PgMessageTooLargeError* = object of PgTypeError
+    ## An assembled protocol message exceeds the wire format's Int32 length.
+    ## Caller data decides the size, so this is input, not connection health:
+    ## nothing was sent and a reconnect loop must not fire.
 
   PgNoRowsError* = object of PgError
     ## Raised by single-row/single-value queries when the result set is empty.
@@ -55,47 +46,39 @@ type
     ## Deprecated alias for `PgProtocolError`, kept for backwards compatibility.
 
   PgStateError* = object of PgError
-    ## Raised when an operation is attempted on a connection that is alive but
-    ## in the wrong state for that operation — most commonly a single connection
-    ## used concurrently: a second query started while the first is still in
-    ## flight finds the connection ``csBusy``.
+    ## An operation attempted on a connection that is alive but in the wrong
+    ## state for it — most commonly a single connection used concurrently: a
+    ## second query started while the first is still in flight finds the
+    ## connection ``csBusy``.
     ##
-    ## This is a programming error, not a connection failure. Reconnecting does
-    ## not fix it, so ``PgStateError`` is intentionally **not** a subtype of
-    ## ``PgConnectionError`` — code that recovers via ``except PgConnectionError``
-    ## will not spin on it. The fix is to give each concurrent caller its own
-    ## connection (e.g. via a ``PgPool``).
+    ## A programming error, not a connection failure: deliberately **not** a
+    ## ``PgConnectionError``, so reconnect loops will not spin on it. Give each
+    ## concurrent caller its own connection (e.g. via a ``PgPool``).
 
   PgQueryError* = object of PgError
-    ## SQL execution errors from the server (ErrorResponse).
+    ## SQL execution error reported by the server (ErrorResponse).
     ##
     ## The most common fields are stored directly; everything else the server
     ## sent (schema/table/column/constraint name, error position, …) is kept
-    ## verbatim in ``fields`` and exposed through accessors such as
+    ## verbatim in ``fields`` and exposed through the accessors below, such as
     ## ``constraintName`` and ``position``.
     sqlState*: string ## 5-char SQLSTATE code (e.g. "42P01"), empty if unavailable.
     severity*: string ## e.g. "ERROR", "FATAL"
     detail*: string ## DETAIL field, empty if not present.
     hint*: string ## HINT field, empty if not present.
     fields*: seq[ErrorField]
-      ## All raw ErrorResponse fields as sent by the server, including any
-      ## not covered by the named accessors below.
+      ## All raw ErrorResponse fields as sent by the server, including any not
+      ## covered by the named accessors below.
 
   PgTimeoutError* = object of PgConnectionError
     ## Raised when an operation times out.
     ##
-    ## A timeout on a query/exec/copy/prepare/transaction invalidates the
-    ## connection: a best-effort CancelRequest is dispatched and the connection
-    ## is marked ``csClosed`` because the protocol may be mid-exchange. The only
-    ## viable recovery is to reconnect, so ``PgTimeoutError`` is a subtype of
-    ## ``PgConnectionError`` — an ``except PgConnectionError`` reconnect loop
-    ## catches it instead of silently dropping the timeout-poisoned connection.
-    ##
+    ## A timeout on a query/exec/copy/prepare/transaction marks the connection
+    ## ``csClosed`` (the wire may be mid-exchange), hence ``PgConnectionError``.
     ## ``waitNotification`` and an acquire timeout inside
-    ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` also raise
-    ## ``PgTimeoutError`` but do **not** close the connection; catch
-    ## ``PgTimeoutError`` before any ``PgConnectionError`` clause if you need to
-    ## distinguish those.
+    ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` leave the
+    ## connection usable; catch ``PgTimeoutError`` before ``PgConnectionError``
+    ## to tell them apart.
 
   PoolErrorKind* = enum
     ## Machine-readable category of a `PgPoolError`.
@@ -118,12 +101,12 @@ type
 
   PgPoolError* = object of PgError
     ## Pool-level acquire/operation failure (closed, acquire timeout, queue
-    ## full, connect failed, unservable batch, or wrapped user-code `Defect`;
-    ## the underlying error is preserved as ``parent``).
+    ## full, connect failed, unservable batch, or a wrapped user-code
+    ## ``Defect``; the underlying error is preserved as ``parent``).
     ##
-    ## `kind` classifies the failure programmatically; the message string is
-    ## informational only. Errors built without `newPoolError` have
-    ## `kind == pekUnknown`.
+    ## ``kind`` classifies the failure programmatically; the message string is
+    ## informational only. Errors built without ``newPoolError`` have
+    ## ``kind == pekUnknown``.
     kind*: PoolErrorKind ## Failure category (see `PoolErrorKind`).
 
   PgNotifyOverflowError* = object of PgError

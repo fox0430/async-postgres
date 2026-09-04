@@ -354,20 +354,13 @@ proc addInt16*(buf: var seq[byte], val: int16) =
   buf.writeBE16(oldLen, val)
 
 proc addCount16*(buf: var seq[byte], n: int, what: string) =
-  ## Append an Int16 count field, rejecting counts that overflow the wire's
-  ## signed 16-bit range. Without this guard the `int16(n)` conversion raises an
-  ## uncatchable `RangeDefect` on default builds, or silently wraps to a bogus
-  ## (often negative) count that desyncs the protocol stream under `-d:danger`.
-  ## The check is always active so callers get a catchable `ValueError` instead.
-  ##
-  ## `ValueError` is used here (and in `addLen32`) because the count is supplied
-  ## directly by the caller; message-level length overflows detected after the
-  ## message has been assembled raise `PgProtocolError` instead.
+  ## Append Int16 count field. Rejects overflow with ``PgTypeError`` — catchable
+  ## under ``except PgError``, unlike ``RangeDefect`` from ``int16(n)``.
   if n < 0:
-    raise newException(ValueError, what & " count " & $n & " is negative")
+    raise newException(PgTypeError, what & " count " & $n & " is negative")
   if n > maxInt16Count:
     raise newException(
-      ValueError,
+      PgTypeError,
       what & " count " & $n & " exceeds protocol maximum of " & $maxInt16Count,
     )
   buf.addInt16(int16(n))
@@ -379,20 +372,13 @@ proc addInt32*(buf: var seq[byte], val: int32) =
   buf.writeBE32(oldLen, val)
 
 proc addLen32*(buf: var seq[byte], n: int, what: string) =
-  ## Append an Int32 length field, rejecting payloads that overflow the wire's
-  ## signed 32-bit length. Like `addCount16`, this turns the otherwise
-  ## uncatchable `RangeDefect` (or a wrapped, often-negative length that desyncs
-  ## the stream under `-d:danger`) into a catchable `ValueError` raised before
-  ## the oversized payload is appended.
-  ##
-  ## `ValueError` is used here (and in `addCount16`) because the length is
-  ## supplied directly by the caller; message-level length overflows detected
-  ## after the message has been assembled raise `PgProtocolError` instead.
+  ## Append Int32 length field. Rejects overflow with ``PgTypeError``, matching
+  ## ``checkPgBinLen`` so a hand-built ``PgParam`` fails like a ``toPgParam`` one.
   if n < 0:
-    raise newException(ValueError, what & " length " & $n & " is negative")
+    raise newException(PgTypeError, what & " length " & $n & " is negative")
   if n > maxInt32Len:
     raise newException(
-      ValueError,
+      PgTypeError,
       what & " length " & $n & " exceeds protocol maximum of " & $maxInt32Len,
     )
   buf.addInt32(int32(n))
@@ -404,11 +390,9 @@ proc addInt64*(buf: var seq[byte], val: int64) =
   buf.writeBE64(oldLen, val)
 
 proc patchLen*(buf: var seq[byte], offset: int = 1) =
-  ## Patch the length placeholder at `offset` with buf.len minus the tag byte.
-  ## Raises `PgProtocolError` when the assembled message exceeds the Int32
-  ## maximum; this is a protocol-level failure for an internally built message,
-  ## distinct from the `ValueError` raised by `addLen32`/`addCount16` for
-  ## caller-supplied field values.
+  ## Patch length at ``offset``. Int32 overflow raises ``PgMessageTooLargeError``
+  ## (caller data sized the message); a bad ``offset`` is an encoder bug and
+  ## stays a ``PgProtocolError``.
   if offset < 0 or offset + 3 >= buf.len:
     raise newException(
       PgProtocolError,
@@ -416,20 +400,14 @@ proc patchLen*(buf: var seq[byte], offset: int = 1) =
     )
   if buf.high > maxInt32Len:
     raise newException(
-      PgProtocolError,
-      "patchLen: message length " & $buf.high & " exceeds Int32 maximum of " &
-        $maxInt32Len,
+      PgMessageTooLargeError,
+      "message length " & $buf.high & " exceeds protocol maximum of " & $maxInt32Len,
     )
   let length = int32(buf.high)
   buf.writeBE32(offset, length)
 
 proc patchMsgLen*(buf: var seq[byte], msgStart: int) =
-  ## Patch the length field of a message starting at `msgStart`.
-  ## Length = total message size minus the type byte.
-  ## Raises `PgProtocolError` when the assembled message exceeds the Int32
-  ## maximum; this is a protocol-level failure for an internally built message,
-  ## distinct from the `ValueError` raised by `addLen32`/`addCount16` for
-  ## caller-supplied field values.
+  ## Patch length for message at ``msgStart``. Same error split as ``patchLen``.
   if msgStart < 0 or msgStart + 4 >= buf.len:
     raise newException(
       PgProtocolError,
@@ -437,24 +415,23 @@ proc patchMsgLen*(buf: var seq[byte], msgStart: int) =
     )
   if buf.len - msgStart - 1 > maxInt32Len:
     raise newException(
-      PgProtocolError,
-      "patchMsgLen: message length " & $(buf.len - msgStart - 1) &
-        " exceeds Int32 maximum of " & $maxInt32Len,
+      PgMessageTooLargeError,
+      "message length " & $(buf.len - msgStart - 1) & " exceeds protocol maximum of " &
+        $maxInt32Len,
     )
   let length = int32(buf.len - msgStart - 1)
   buf.writeBE32(msgStart + 1, length)
 
-proc addCString*(buf: var seq[byte], s: string) =
-  ## Append a null-terminated C string to the buffer.
-  ##
-  ## Raises ``ValueError`` if ``s`` contains an embedded NUL byte. PostgreSQL
-  ## protocol fields are NUL-terminated, so an embedded ``\0`` would split the
-  ## value into two fields on the server side — at best causing a desync
-  ## (`invalid message format`), at worst allowing startup-parameter injection
-  ## through the StartupMessage K/V stream.
+func checkNoNul*(s: string, what: string) =
+  ## Reject embedded NUL in protocol string: it would split fields or allow
+  ## startup-parameter injection. Raises ``PgTypeError``.
   for c in s:
     if c == '\0':
-      raise newException(ValueError, "addCString: embedded NUL byte in protocol string")
+      raise newException(PgTypeError, "embedded NUL byte in " & what)
+
+proc addCString*(buf: var seq[byte], s: string, what = "protocol string") =
+  ## Append NUL-terminated C string. Raises ``PgTypeError`` on embedded NUL.
+  checkNoNul(s, what)
   let oldLen = buf.len
   buf.setLen(oldLen + s.len + 1)
   if s.len > 0:
@@ -491,33 +468,34 @@ proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
 
 proc encodeStartup*(
     user: string, database: string, extraParams: openArray[(string, string)] = []
-): seq[byte] =
-  ## Encode a StartupMessage (protocol v3.0) with user, database, and extra parameters.
-  ## Raises `ValueError` for invalid caller-supplied values (e.g. embedded NUL
-  ## bytes) and `PgProtocolError` if the assembled message exceeds the Int32
-  ## maximum length.
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
+  ## Encode StartupMessage (v3.0). Raises ``PgTypeError`` for NUL, for an empty
+  ## key, and for Int32 overflow.
+  ##
+  ## The explicit ``raises`` on the ``encode*`` group machine-checks the contract:
+  ## ``PgTypeError`` for caller input, ``PgProtocolError`` for an encoder bug.
   result.addInt32(0) # length placeholder
   result.addInt32(196608) # protocol version 3.0
-  result.addCString("user")
-  result.addCString(user)
+  # `what` names the field so a NUL message points at it.
+  result.addCString("user", "startup parameter key")
+  result.addCString(user, "user")
   if database.len > 0:
-    result.addCString("database")
-    result.addCString(database)
+    result.addCString("database", "startup parameter key")
+    result.addCString(database, "database")
   for (k, v) in extraParams:
-    # Empty key would encode as a lone NUL byte, which the server treats as the
-    # end-of-parameters terminator — silently dropping subsequent pairs and
-    # opening a startup-parameter injection vector through the K/V stream.
+    # Empty key would be a lone NUL terminator, silently dropping pairs.
     if k.len == 0:
       raise newException(
-        ValueError, "encodeStartup: empty key in extraParams is not allowed"
+        PgTypeError, "encodeStartup: empty key in extraParams is not allowed"
       )
-    result.addCString(k)
-    result.addCString(v)
+    result.addCString(k, "startup parameter key")
+    # Constant `what`: interpolating `k` would allocate per pair on every connect.
+    result.addCString(v, "extraParams value")
   result.add(0'u8) # terminator
   if result.len > maxInt32Len:
     raise newException(
-      PgProtocolError,
-      "encodeStartup: message length " & $result.len & " exceeds Int32 maximum of " &
+      PgMessageTooLargeError,
+      "encodeStartup: message length " & $result.len & " exceeds protocol maximum of " &
         $maxInt32Len,
     )
   let length = int32(result.len)
@@ -527,7 +505,7 @@ proc encodeStartup*(
   result[2] = encoded[2]
   result[3] = encoded[3]
 
-proc encodeSSLRequest*(): seq[byte] =
+proc encodeSSLRequest*(): seq[byte] {.raises: [].} =
   ## Encode an SSLRequest message (magic number 80877103).
   result = newSeq[byte](8)
   let lenBytes = encodeInt32(8)
@@ -537,7 +515,9 @@ proc encodeSSLRequest*(): seq[byte] =
   for i, mb in magicBytes:
     result[i + 4] = mb
 
-proc encodePassword*(password: string): seq[byte] =
+proc encodePassword*(
+    password: string
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a PasswordMessage for cleartext or MD5 authentication.
   ## Pre-allocates the buffer so internal `add` calls do not realloc and
   ## leave residual copies of the password in freed heap memory.
@@ -547,7 +527,9 @@ proc encodePassword*(password: string): seq[byte] =
   result.addCString(password)
   result.patchLen()
 
-proc encodeSASLInitialResponse*(mechanism: string, data: seq[byte]): seq[byte] =
+proc encodeSASLInitialResponse*(
+    mechanism: string, data: seq[byte]
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a SASLInitialResponse message with the chosen mechanism and client-first data.
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
@@ -556,14 +538,16 @@ proc encodeSASLInitialResponse*(mechanism: string, data: seq[byte]): seq[byte] =
   result.add(data)
   result.patchLen()
 
-proc encodeSASLResponse*(data: seq[byte]): seq[byte] =
+proc encodeSASLResponse*(
+    data: seq[byte]
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a SASLResponse message with client-final data.
   result.add(byte('p'))
   result.addInt32(0) # length placeholder
   result.add(data)
   result.patchLen()
 
-proc encodeQuery*(sql: string): seq[byte] =
+proc encodeQuery*(sql: string): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a simple Query message.
   result.add(byte('Q'))
   result.addInt32(0) # length placeholder
@@ -580,7 +564,7 @@ proc addParse*(
     stmtName: string,
     sql: string,
     paramTypeOids: openArray[int32] = [],
-) =
+) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Parse message to the buffer (extended query protocol).
   let msgStart = buf.len
   buf.add(byte('P'))
@@ -599,7 +583,7 @@ proc addBind*(
     paramFormats: openArray[int16],
     paramValues: openArray[Option[seq[byte]]],
     resultFormats: openArray[int16] = [],
-) =
+) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Bind message to the buffer (extended query protocol).
   let msgStart = buf.len
   buf.add(byte('B'))
@@ -633,17 +617,9 @@ proc addBindRaw*(
     paramData: openArray[byte],
     paramRanges: openArray[tuple[off: int32, len: int32]],
     resultFormats: openArray[int16] = [],
-) =
-  ## Append a Bind message built from a raw byte buffer and offset/length
-  ## ranges. Each parameter is described by `(off, len)`: `len == -1` encodes
-  ## NULL; any other `len` reads `paramData[off ..< off + len]`. Lets callers
-  ## write payloads straight into a single owned buffer without constructing
-  ## `Option[seq[byte]]` per parameter.
-  ##
-  ## Each range must satisfy one of: `len == -1` (NULL), or
-  ## `len >= 0` with `0 <= off` and `off + len <= paramData.len`.
-  ## Invalid ranges raise `ValueError` — the check is always active so callers
-  ## cannot silently trigger an out-of-bounds `copyMem` in release builds.
+) {.raises: [PgTypeError, PgProtocolError].} =
+  ## Append Bind from raw buffer and ranges. ``len==-1`` is NULL; else
+  ## ``paramData[off..<off+len]``. Raises ``PgTypeError`` for invalid ranges.
   let msgStart = buf.len
   buf.add(byte('B'))
   buf.addInt32(0) # length placeholder
@@ -655,17 +631,17 @@ proc addBindRaw*(
   buf.addCount16(paramRanges.len, "Bind parameter")
   for r in paramRanges:
     if r.len < -1:
-      raise newException(ValueError, "addBindRaw: invalid range len " & $r.len)
+      raise newException(PgTypeError, "addBindRaw: invalid range len " & $r.len)
     if r.len == -1:
       buf.addInt32(-1)
     else:
       buf.addInt32(r.len)
       if r.len > 0:
         if r.off < 0:
-          raise newException(ValueError, "addBindRaw: negative range off " & $r.off)
+          raise newException(PgTypeError, "addBindRaw: negative range off " & $r.off)
         if r.off.int64 + r.len.int64 > paramData.len.int64:
           raise newException(
-            ValueError,
+            PgTypeError,
             "addBindRaw: range out of bounds (off=" & $r.off & ", len=" & $r.len &
               ", data.len=" & $paramData.len & ")",
           )
@@ -677,7 +653,9 @@ proc addBindRaw*(
     buf.addInt16(f)
   buf.patchMsgLen(msgStart)
 
-proc addDescribe*(buf: var seq[byte], kind: DescribeKind, name: string) =
+proc addDescribe*(
+    buf: var seq[byte], kind: DescribeKind, name: string
+) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Describe message to the buffer (portal or statement).
   let msgStart = buf.len
   buf.add(byte('D'))
@@ -686,7 +664,9 @@ proc addDescribe*(buf: var seq[byte], kind: DescribeKind, name: string) =
   buf.addCString(name)
   buf.patchMsgLen(msgStart)
 
-proc addExecute*(buf: var seq[byte], portalName: string, maxRows: int32 = 0) =
+proc addExecute*(
+    buf: var seq[byte], portalName: string, maxRows: int32 = 0
+) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append an Execute message to the buffer. `maxRows` of 0 means unlimited.
   let msgStart = buf.len
   buf.add(byte('E'))
@@ -695,7 +675,9 @@ proc addExecute*(buf: var seq[byte], portalName: string, maxRows: int32 = 0) =
   buf.addInt32(maxRows)
   buf.patchMsgLen(msgStart)
 
-proc addClose*(buf: var seq[byte], kind: DescribeKind, name: string) =
+proc addClose*(
+    buf: var seq[byte], kind: DescribeKind, name: string
+) {.raises: [PgTypeError, PgProtocolError].} =
   ## Append a Close message to the buffer (portal or statement).
   let msgStart = buf.len
   buf.add(byte('C'))
@@ -720,7 +702,7 @@ proc addCopyDone*(buf: var seq[byte]) =
 
 proc encodeParse*(
     stmtName: string, sql: string, paramTypeOids: openArray[int32] = []
-): seq[byte] =
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a standalone Parse message.
   result.addParse(stmtName, sql, paramTypeOids)
 
@@ -730,35 +712,41 @@ proc encodeBind*(
     paramFormats: openArray[int16],
     paramValues: openArray[Option[seq[byte]]],
     resultFormats: openArray[int16] = [],
-): seq[byte] =
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a standalone Bind message.
   result.addBind(portalName, stmtName, paramFormats, paramValues, resultFormats)
 
-proc encodeDescribe*(kind: DescribeKind, name: string): seq[byte] =
+proc encodeDescribe*(
+    kind: DescribeKind, name: string
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a standalone Describe message.
   result.addDescribe(kind, name)
 
-proc encodeExecute*(portalName: string, maxRows: int32 = 0): seq[byte] =
+proc encodeExecute*(
+    portalName: string, maxRows: int32 = 0
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a standalone Execute message.
   result.addExecute(portalName, maxRows)
 
-proc encodeClose*(kind: DescribeKind, name: string): seq[byte] =
+proc encodeClose*(
+    kind: DescribeKind, name: string
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a standalone Close message.
   result.addClose(kind, name)
 
-proc encodeSync*(): seq[byte] =
+proc encodeSync*(): seq[byte] {.raises: [].} =
   ## Encode a standalone Sync message.
   result = @[byte('S'), 0'u8, 0'u8, 0'u8, 4'u8]
 
-proc encodeFlush*(): seq[byte] =
+proc encodeFlush*(): seq[byte] {.raises: [].} =
   ## Encode a standalone Flush message.
   result = @[byte('H'), 0'u8, 0'u8, 0'u8, 4'u8]
 
-proc encodeTerminate*(): seq[byte] =
+proc encodeTerminate*(): seq[byte] {.raises: [].} =
   ## Encode a Terminate message to close the connection.
   result = @[byte('X'), 0'u8, 0'u8, 0'u8, 4'u8]
 
-proc encodeCancelRequest*(pid: int32, secretKey: int32): seq[byte] =
+proc encodeCancelRequest*(pid: int32, secretKey: int32): seq[byte] {.raises: [].} =
   ## Encode a CancelRequest message to abort a running query.
   result = newSeqOfCap[byte](16)
   result.addInt32(16)
@@ -766,20 +754,20 @@ proc encodeCancelRequest*(pid: int32, secretKey: int32): seq[byte] =
   result.addInt32(pid)
   result.addInt32(secretKey)
 
-proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
-  ## Encode a CopyData message, appending to `buf`.
-  ## Single setLen for header + payload to minimize bounds checks.
-  ## The Int32 length field covers itself plus the payload, so reject payloads
-  ## that would overflow it (a wrapped length desyncs the stream) before any
-  ## allocation, matching the `addLen32` guard used by the other encoders.
-  ## Like `addLen32`, the payload length comes from the caller, so an overflow
-  ## raises `ValueError` rather than `PgProtocolError`.
-  if data.len > maxInt32Len - 4:
+proc checkCopyDataLen*(dataLen: int) {.inline.} =
+  ## Guard CopyData Int32 length (payload+4). Exported for testing only.
+  if dataLen > maxInt32Len - 4:
     raise newException(
-      ValueError,
-      "CopyData payload length " & $data.len & " exceeds protocol maximum of " &
+      PgTypeError,
+      "CopyData payload length " & $dataLen & " exceeds protocol maximum of " &
         $(maxInt32Len - 4),
     )
+
+proc encodeCopyData*(
+    buf: var seq[byte], data: openArray[byte]
+) {.raises: [PgTypeError, PgProtocolError].} =
+  ## Encode CopyData message. Raises ``PgTypeError`` for oversized payload.
+  checkCopyDataLen(data.len)
   let msgLen = int32(4 + data.len)
   let oldLen = buf.len
   buf.setLen(oldLen + 5 + data.len)
@@ -787,11 +775,13 @@ proc encodeCopyData*(buf: var seq[byte], data: openArray[byte]) =
   buf.writeBE32(oldLen + 1, msgLen)
   buf.writeBytesAt(oldLen + 5, data)
 
-proc encodeCopyDone*(): seq[byte] =
+proc encodeCopyDone*(): seq[byte] {.raises: [].} =
   ## Encode a standalone CopyDone message.
   result = @[byte('c'), 0'u8, 0'u8, 0'u8, 4'u8]
 
-proc encodeCopyFail*(errorMsg: string): seq[byte] =
+proc encodeCopyFail*(
+    errorMsg: string
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a CopyFail message to abort a COPY operation with an error.
   result.add(byte('f'))
   result.addInt32(0) # length placeholder
@@ -1135,10 +1125,7 @@ proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
     result[i] = if isBinarySafeOid(f.typeOid): 1'i16 else: 0'i16
 
 proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
-  ## Parse a DataRow message body directly into a RowData flat buffer.
-  ## Column data is appended to rd.buf and (offset, length) pairs to rd.cellIndex.
-  ## Uses a single bulk copyMem for the entire row payload, then walks the
-  ## copied buffer to build cellIndex entries.
+  ## Parse DataRow directly into RowData flat buffer.
   if body.len < 2:
     raise newException(PgProtocolError, "DataRow message too short")
 
@@ -1208,19 +1195,9 @@ proc parseBackendMessage*(
     maxLen: int = DefaultMaxBackendMessageLen,
     skipDataRow: bool = false,
 ): ParseResult {.raises: [PgProtocolError].} =
-  ## Parse a single backend message from `buf`.
-  ## On success, sets `consumed` to the number of bytes used.
-  ## The caller is responsible for discarding those bytes from the buffer.
-  ## A message whose declared length exceeds `maxLen` is rejected with
-  ## `PgProtocolError` before any allocation, capping recv-buffer growth.
-  ## ``maxLen <= 0`` disables the cap (intended for tests); production
-  ## callers should resolve the default via ``ConnConfig.maxMessageSize``
-  ## and ``effectiveMaxMessageSize``.
-  ## When ``rowData == nil`` and ``skipDataRow`` is true, a ``DataRow`` message
-  ## is only framed and consumed — the columns are NOT decoded, avoiding the
-  ## per-row ``seq[Option[seq[byte]]]`` + per-cell ``seq`` allocation that the
-  ## caller would immediately discard. Result state is ``psDataRow`` in that
-  ## case, with ``message`` left default-initialised.
+  ## Parse one backend message. Sets ``consumed`` bytes. Rejects messages over
+  ## ``maxLen`` (``<= 0`` disables the cap, for tests; production resolves it via
+  ## ``effectiveMaxMessageSize``). With ``skipDataRow`` DataRow is framed only.
   consumed = 0
 
   # Need at least 5 bytes: 1 type + 4 length
@@ -1399,7 +1376,7 @@ proc addCopyFieldString*(buf: var seq[byte], val: string) =
 
 proc encodeStandbyStatusUpdate*(
     receiveLsn, flushLsn, applyLsn, sendTime: int64, reply: byte
-): seq[byte] =
+): seq[byte] {.raises: [].} =
   ## Encode a Standby Status Update as a CopyData message.
   ## The inner format is: byte 'r' + receiveLsn(8) + flushLsn(8) + applyLsn(8) + sendTime(8) + reply(1) = 34 bytes payload.
   result.add(byte('d')) # CopyData message type
