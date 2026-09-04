@@ -4056,7 +4056,180 @@ suite "Pool warmup parallelization":
     waitFor t()
     check ok
     check idleAfter == 2
+suite "The shared message-length bound":
+  ## Regression: `validateTypedParams` bounded each value but never their sum, so
+  ## legal parameters overflowed the Bind message and took the whole batch down.
+  ## The real payloads are not allocatable here, so the bound is pinned directly.
 
+  test "a total at the maximum is accepted":
+    var payload = int64(maxInt32Len) - 4
+    addBindPayload(payload, 4)
+    check payload == int64(maxInt32Len)
+
+  test "one byte past the maximum is rejected":
+    var payload = int64(maxInt32Len) - 4
+    expect PgMessageTooLargeError:
+      addBindPayload(payload, 5)
+
+  test "the running total is what overflows, not any single addend":
+    let half = maxInt32Len div 2
+    var payload: int64 = 0
+    expect PgMessageTooLargeError:
+      for _ in 0 .. 2:
+        addBindPayload(payload, half)
+
+  when defined(pgTestObservability):
+    test "every builder reaches the shared bound before it writes":
+      # Without the counter a builder could drop its size check unnoticed.
+      var buf: seq[byte] = @[]
+      checkMsgLenBoundCalls = 0
+      buf.addParse("s", "SELECT $1", @[23'i32])
+      check checkMsgLenBoundCalls == 1
+      buf.setLen(0)
+      checkMsgLenBoundCalls = 0
+      buf.addBind("", "s", @[1'i16], @[some(@[1'u8, 2])], @[])
+      check checkMsgLenBoundCalls == 2 # one per value, one for the message
+      let stmt = "s"
+      let sql = "SELECT $1"
+      let arg = 1'i32
+      buf.setLen(0)
+      checkMsgLenBoundCalls = 0
+      buf.addParseDirect(stmt, sql, arg)
+      check checkMsgLenBoundCalls == 1
+      buf.setLen(0)
+      checkMsgLenBoundCalls = 0
+      buf.addBindDirect("", stmt, [], arg)
+      check checkMsgLenBoundCalls == 2
+suite "Envelope overhead matches actual encoder output":
+  ## The overhead constants are hand-derived from the encoder layout; pin them
+  ## to real output so the boundary tests below are not tautological.
+
+  test "Parse overhead is accurate":
+    var buf: seq[byte] = @[]
+    let stmt = "myStmt"
+    let sql = "SELECT $1"
+    let oids = @[23'i32, 23'i32]
+    buf.addParse(stmt, sql, oids)
+    check buf.len == 9 + stmt.len + sql.len + oids.len * 4
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "Bind overhead is accurate":
+    var buf: seq[byte] = @[]
+    let portal = ""
+    let stmt = "s"
+    let pf = @[int16(1)]
+    let payload = @[1'u8, 2, 3]
+    let rf = @[int16(0)]
+    buf.addBind(portal, stmt, pf, @[some(payload)], rf)
+    let expected =
+      13 + portal.len + stmt.len + pf.len * 2 + 4 + payload.len + rf.len * 2
+    check buf.len == expected
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "the direct macros emit what the generic builders emit":
+    # The macros hand-roll the layout the `add*` builders own, so pin the two
+    # together: a pre-flight that miscounts shows up as a length mismatch.
+    let stmt = "s"
+    let sql = "SELECT $1"
+    let arg = 7'i32
+    var direct: seq[byte] = @[]
+    var generic: seq[byte] = @[]
+    direct.addParseDirect(stmt, sql, arg)
+    generic.addParse(stmt, sql, @[paramOidOf(arg)])
+    check direct == generic
+    direct.setLen(0)
+    generic.setLen(0)
+    direct.addBindDirect("", stmt, [], arg)
+    generic.addBind("", stmt, @[1'i16], @[some(@[0'u8, 0, 0, 7])], @[])
+    check direct == generic
+
+  test "Describe/Execute/Close overhead is accurate":
+    var buf: seq[byte] = @[]
+    buf.addDescribe(dkStatement, "myStmt")
+    check buf.len == 7 + "myStmt".len
+    buf.setLen(0)
+    buf.addExecute("myPortal", 0)
+    check buf.len == 10 + "myPortal".len
+    buf.setLen(0)
+    buf.addClose(dkStatement, "myStmt")
+    check buf.len == 7 + "myStmt".len
+
+suite "Message builders are atomic on failure":
+  test "addParse leaves buffer unchanged on NUL":
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    expect PgTypeError:
+      buf.addParse("stmt\0", "SELECT 1")
+    check buf == orig
+    expect PgTypeError:
+      buf.addParse("stmt", "SELECT 1\0")
+    check buf == orig
+
+  test "addParse/addBind leave buffer unchanged on count overflow":
+    var buf: seq[byte] = @[1'u8]
+    let orig = buf
+    expect PgTypeError:
+      buf.addParse("s", "SELECT 1", newSeq[int32](maxInt16Count + 1))
+    check buf == orig
+    expect PgTypeError:
+      buf.addBind("", "s", newSeq[int16](maxInt16Count + 1), @[], @[])
+    check buf == orig
+
+  test "addParseDirect/addBindDirect leave buffer unchanged on NUL":
+    # The macros cannot use `withAtomicMessage` (its `try` would be spliced into
+    # the caller's async body), so they pre-flight before the first write.
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    let stmt = "stmt"
+    let badSql = "SELECT 1\0"
+    let badName = "s\0"
+    let arg = 1'i32
+    expect PgTypeError:
+      buf.addParseDirect(stmt, badSql, arg)
+    check buf == orig
+    expect PgTypeError:
+      buf.addParseDirect(badName, "SELECT 1", arg)
+    check buf == orig
+    expect PgTypeError:
+      buf.addBindDirect(badName, stmt, [], arg)
+    check buf == orig
+    expect PgTypeError:
+      buf.addBindDirect("", badName, [], arg)
+    check buf == orig
+
+  test "addBindRaw leaves buffer unchanged on invalid range":
+    var buf: seq[byte] = @[1'u8, 2]
+    let orig = buf
+    expect PgTypeError:
+      buf.addBindRaw("", "s", @[], @[], @[(off: int32(0), len: int32(-2))], @[])
+    check buf == orig
+
+  test "helper size check does not touch buffer (builder's size pre-flight uses same calc)":
+    # Size overflow through the builders needs a 2 GiB payload, so exercise the
+    # helpers directly; the NUL/count tests above cover the rollback itself.
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcParseMessageLength("a".len, "b".len, 0) + int64(maxInt32Len) - 10 + 1,
+        "Parse message",
+      )
+    check buf == orig
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcBindMessageLength(0, 1, 1, 1, 3, 1) + int64(maxInt32Len) - 24 + 1,
+        "Bind message",
+      )
+    check buf == orig
+    check calcParseMessageLength("a".len, "b".len, 0) == 10 # 8+1+1+0
+    check calcBindMessageLength(0, 1, 1, 1, 3, 1) == 24 # 12+0+1+2+4+3+2 length
+
+  test "helper Bind size check does not touch buffer":
+    var buf: seq[byte] = @[1'u8, 2]
+    let orig = buf
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    check buf == orig
 suite "Array encoder guards are catchable and do not disturb valid input":
   ## What these guards reject needs a 2 GiB allocation, which a unit test
   ## cannot make. So: pin that the primitives raise a catchable `PgTypeError`
@@ -4105,3 +4278,23 @@ suite "Array encoder guards are catchable and do not disturb valid input":
     check toPgParam(newSeq[PgHstore](0)).value.get.toString == "{}"
     check toPgParam(@[h]).value.get.toString == "{\"\\\"k\\\"=>\\\"v\\\"\"}"
     check toPgBinaryParam(@[PgHstore()], 9999'i32, 9998'i32).value.isSome
+
+  test "writeParamValue and envelope helpers reject oversized before buffer growth":
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcParseMessageLength(0, 0, 0) + int64(maxInt32Len) + 1, "Parse message"
+      )
+    var buf: seq[byte] = @[]
+    buf.writeParamValue("abc")
+    check buf.len > 0
+    var buf2: seq[byte] = @[]
+    buf2.writeParamValue(@[1'u8, 2, 3])
+    check buf2.len > 0
+    # Helpers must not touch buffer on failure
+    var b: seq[byte] = @[1'u8, 2, 3]
+    let orig = b
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    check b == orig

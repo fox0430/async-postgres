@@ -316,12 +316,10 @@ proc validatePlaceholderArity(
 proc bindPositionalOnce(
     positional: seq[NimNode]
 ): tuple[bindings: NimNode, syms: seq[NimNode]] =
-  ## Emit ``let tmp = <arg>`` for each positional argument so downstream
-  ## fan-out (``paramOidOf`` in the invalidate call plus ``writeParamOid`` /
-  ## ``writeParamFormat`` / ``writeParamValue`` in the Bind/Parse macros)
-  ## substitutes the temporary, not the source expression. Without this a
-  ## side-effecting argument such as ``getNextId()`` would fire 3–4 times per
-  ## direct call.
+  ## Emit ``let tmp = <arg>`` for each positional argument so the downstream
+  ## fan-out (``paramOidOf``, ``addParseDirect``, ``addBindDirect``) substitutes
+  ## the temporary. Without this a side-effecting argument such as
+  ## ``getNextId()`` would fire three times per direct call.
   result.bindings = newStmtList()
   result.syms = newSeq[NimNode](positional.len)
   for i, arg in positional:
