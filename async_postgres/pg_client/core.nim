@@ -1,9 +1,4 @@
-## Internal building blocks shared by every `pg_client/` submodule.
-##
-## Contains types/constants for transaction options, the inline-parameter
-## encoder, and the receive-loop templates that the extended-query path
-## (`exec`, `query`, `queryEach`, `queryDirect`, …) reuses. Re-exported through
-## `pg_client.nim`; submodules import this module directly via `./core`.
+## Shared building blocks for ``pg_client`` submodules (transaction opts, inline params, recv loops).
 
 import std/[options, tables, math, random]
 
@@ -39,29 +34,27 @@ type
     deferrable*: DeferrableMode
 
   RetryOptions* = object
-    ## Controls how `withTransactionRetry` re-runs a transaction after a
-    ## retryable failure. Relies on Nim object field defaults, so partial
-    ## construction (e.g. ``RetryOptions(maxAttempts: 5)``) leaves the unset
-    ## fields at their defaults below.
-    maxAttempts*: int = 3
-      ## Total attempts including the first. Values ``<= 1`` run the body exactly
-      ## once with no retry (the body always runs at least once).
-    baseDelayMs*: int = 20 ## Backoff before the first retry, in milliseconds.
-    maxDelayMs*: int = 1000 ## Upper bound on the backoff delay, in milliseconds.
-    multiplier*: float = 2.0 ## Exponential growth factor between attempts.
+    ## Retry config for ``withTransactionRetry``; unset fields keep the
+    ## defaults below.
+    maxAttempts*: int = 3 ## Total attempts (``<=1`` = no retry).
+    baseDelayMs*: int = 20 ## Initial backoff ms.
+    maxDelayMs*: int = 1000 ## Max backoff ms.
+    multiplier*: float = 2.0 ## Backoff multiplier.
     jitter*: bool = true
-      ## Full jitter: pick a random delay in ``0 .. computed``. Uses the
-      ## `std/random` global RNG; to de-correlate retries *across processes*
-      ## the application must call ``randomize()`` once at startup — otherwise
-      ## every process replays the same (default-seeded) jitter sequence.
+      ## Full jitter via ``std/random``; call ``randomize()`` for cross-process de-correlation.
     retryableStates*: seq[string] = @[
       SqlStateSerializationFailure, SqlStateDeadlockDetected
-    ]
-      ## SQLSTATE codes that trigger a retry. Defaults to serialization_failure
-      ## (40001) and deadlock_detected (40P01) — the transaction-level conflicts
-      ## PostgreSQL recommends resolving by re-running the whole transaction.
+    ] ## SQLSTATEs that trigger retry.
 
 const copyBatchSize* = 262144 ## 256KB batch threshold for COPY IN buffering
+
+const
+  generatedStmtNameLen* = "_sc_".len + len($int.high)
+    ## Longest name `nextStmtName` can produce. Size pre-flights charge it
+    ## because the real name is only picked at send time.
+
+  generatedPortalNameLen* = "_cursor_".len + len($int.high)
+    ## Same, for the portal name `openCursorImpl` generates.
 
 func toFormatCodes*(rf: ResultFormat): seq[int16] =
   ## Convert a high-level ResultFormat to wire-protocol format codes.
@@ -74,12 +67,8 @@ func toFormatCodes*(rf: ResultFormat): seq[int16] =
     @[1'i16]
 
 func deriveColFmts*(resultFormats: openArray[int16], numCols: int): seq[int16] =
-  ## Expand wire-level Bind result-format codes to one code per column.
-  ## A single code broadcasts to every column (Bind's "apply to all" form);
-  ## a per-column array is applied positionally; any column past the end of a
-  ## multi-element array defaults to text (0). Shared by every Extended Query
-  ## path that has to decode rows under the formats this Bind actually
-  ## requested (cache hit and cache miss alike).
+  ## Expand Bind result-format codes to per-column: one code broadcasts,
+  ## an array applies positionally, columns past its end default to text (0).
   result = newSeq[int16](numCols)
   for i in 0 ..< numCols:
     result[i] =
@@ -93,16 +82,9 @@ func deriveColFmts*(resultFormats: openArray[int16], numCols: int): seq[int16] =
 func cacheHitColFmts*(
     resultFormats: openArray[int16], cachedColFmts: seq[int16], numCols: int
 ): seq[int16] =
-  ## Per-column decode formats for a statement-cache HIT. Use the formats this
-  ## Bind actually requested (`deriveColFmts` of `resultFormats`, which on a
-  ## cache hit is `effectiveResultFormats`), not the formats negotiated when the
-  ## statement was first cached: the same SQL can be re-issued with a different
-  ## `resultFormat` (e.g. cached as rfAuto/rfBinary, now rfText) and the server
-  ## returns rows in the format this Bind asked for; reusing the stale cached
-  ## format would reinterpret the bytes and silently corrupt values (text "42"
-  ## decoded as a big-endian int, etc.). The `cachedColFmts` fallback covers the
-  ## caller-didn't-override / zero-column cases, where `resultFormats` is empty.
-  ## Shared by all four cache-hit Extended Query paths so they cannot drift.
+  ## Per-column formats for a cache hit. Prefers the formats this Bind
+  ## requested: the same SQL may be re-issued with a different ``resultFormat``,
+  ## and the stale cached one would reinterpret the bytes.
   if resultFormats.len > 0 and numCols > 0:
     deriveColFmts(resultFormats, numCols)
   else:
@@ -148,30 +130,12 @@ proc isRetryableTxError*(e: ref CatchableError, states: openArray[string]): bool
     false
 
 const StmtCacheInvalidatingStates* = ["26000", "0A000"]
-  ## SQLSTATEs that mean a cache-*hit* prepared statement can no longer be
-  ## reused as cached and must be evicted so the next call re-parses it:
-  ##
-  ## * ``26000`` invalid_sql_statement_name — the server no longer has the
-  ##   prepared statement (e.g. ``DISCARD ALL`` / ``DEALLOCATE`` ran on the
-  ##   session, or a pooled backend was reset). Re-parse recreates it.
-  ## * ``0A000`` feature_not_supported — chiefly "cached plan must not change
-  ##   result type": DDL altered the statement's result columns, so the server
-  ##   rejects the cached (fixed-result) plan on Execute. Because the cache-hit
-  ##   path skips Describe, only a re-parse picks up the new schema; without
-  ##   eviction every subsequent hit would re-raise ``0A000`` forever. Other
-  ##   ``0A000`` causes simply re-parse once more (the error still propagates).
-  ##
-  ## ``42P18`` (indeterminate_datatype) is intentionally absent: it is a
-  ## Parse-phase error and cannot arise on a cache hit (no Parse is sent), and
-  ## a cache *miss* that fails to Parse never reaches ``addStmtCache``.
+  ## SQLSTATEs that invalidate cached prepared statements (requires re-parse).
+  ## ``42P18`` is absent on purpose: it is Parse-phase, so no cached statement
+  ## can hit it.
 
 proc backoffDelayMs*(opts: RetryOptions, attempt: int): int =
-  ## Backoff (milliseconds) to wait after the `attempt`-th failure (1-based).
-  ## Exponential ``baseDelayMs * multiplier^(attempt-1)`` capped at `maxDelayMs`;
-  ## with `jitter` the result is randomized within ``0 .. computed`` to spread
-  ## out retries from many contending clients. Jitter draws from the
-  ## `std/random` global RNG — see `RetryOptions.jitter` on calling
-  ## ``randomize()`` for cross-process de-correlation.
+  ## Backoff ms for attempt (1-based). Exponential with jitter.
   let raw = opts.baseDelayMs.float * pow(opts.multiplier, float(attempt - 1))
   var ms = int(min(raw, opts.maxDelayMs.float))
   if ms < 0:
@@ -181,20 +145,7 @@ proc backoffDelayMs*(opts: RetryOptions, attempt: int): int =
   ms
 
 proc paramOidsMatch*(cachedOids, currentOids: openArray[int32]): bool =
-  ## Whether a cached prepared statement's parse-time parameter OIDs are
-  ## compatible with the OIDs a caller wants to bind now.
-  ##
-  ## OID ``0`` (unknown) on either side is treated as a wildcard: the server
-  ## inferred or will infer the type, so we cannot pre-judge a mismatch.
-  ## A length mismatch is treated as incompatible.
-  ##
-  ## Empty-vs-empty (parameter-less SQL) matches trivially: the loop body does
-  ## not execute and the length check passes.
-  ##
-  ## Callers use a ``false`` result to invalidate the cache entry and re-parse
-  ## the statement with the new OIDs, preventing the server from interpreting
-  ## bind payloads under the statement's original (and now wrong) parse-time
-  ## type assumptions.
+  ## Whether cached param OIDs match current (0 = wildcard).
   if cachedOids.len != currentOids.len:
     return false
   for i in 0 ..< cachedOids.len:
@@ -206,9 +157,7 @@ proc paramOidsMatch*(cachedOids, currentOids: openArray[int32]): bool =
   return true
 
 proc paramOidsMatch*(cachedOids: openArray[int32], params: openArray[PgParam]): bool =
-  ## ``PgParam`` overload that reads each parameter's ``oid`` field directly,
-  ## avoiding a temporary ``seq[int32]`` projection on the ``query``/``exec``
-  ## cache-hit path. Semantics match the ``openArray[int32]`` overload.
+  ## ``PgParam`` overload (avoids ``seq[int32]`` alloc).
   if cachedOids.len != params.len:
     return false
   for i in 0 ..< cachedOids.len:
@@ -226,15 +175,8 @@ proc invalidateIfOidMismatch*(
     currentOids: openArray[int32],
     cacheHit: var bool,
 ) =
-  ## If the caller is about to bind ``currentOids`` to a cached prepared
-  ## statement whose parse-time OIDs do not match, evict the cache entry
-  ## (queue the server-side ``Close`` via ``pendingStmtCloses``, remove the
-  ## local entry) and set ``cacheHit`` to ``false`` so the caller's
-  ## cache-miss path runs and re-parses under the new OIDs.
-  ##
-  ## No-op when ``cacheHit`` is already ``false`` — ``cached`` is only
-  ## dereferenced under the ``cacheHit`` guard, so passing ``nil`` is safe
-  ## as long as ``cacheHit`` is ``false``.
+  ## Evict cached statement if OIDs mismatch; sets ``cacheHit=false``.
+  ## ``cached`` may be nil iff ``cacheHit == false`` (only deref'd under it).
   if not cacheHit:
     return
   if paramOidsMatch(cached.paramOids, currentOids):
@@ -250,9 +192,8 @@ proc invalidateIfOidMismatch*(
     params: openArray[PgParam],
     cacheHit: var bool,
 ) =
-  ## ``PgParam`` overload for the ``query``/``exec`` call paths. Avoids the
-  ## ``seq[int32]`` allocation a separate OID-projection step would require —
-  ## the per-parameter ``.oid`` reads happen inside ``paramOidsMatch``.
+  ## ``PgParam`` overload (no ``seq[int32]`` alloc). Same nil precondition on
+  ## ``cached``.
   if not cacheHit:
     return
   if paramOidsMatch(cached.paramOids, params):
@@ -260,6 +201,14 @@ proc invalidateIfOidMismatch*(
   conn.pendingStmtCloses.add(cached.name)
   conn.removeStmtCache(sql)
   cacheHit = false
+
+proc preflightResultFormatsLen*(
+    cached: CachedStmt, cacheHit: bool, resultFormatsLen: int = 0
+): int =
+  ## Result-format count the send path will really emit: a cache hit replays
+  ## ``cached.resultFormats`` when the caller passed none.
+  ## Call after ``invalidateIfOidMismatch``; ``cached`` may be nil iff not ``cacheHit``.
+  if cacheHit and resultFormatsLen == 0: cached.resultFormats.len else: resultFormatsLen
 
 proc extractParams*(
     params: openArray[PgParam]
@@ -272,60 +221,216 @@ proc extractParams*(
     result.formats[i] = p.format
     result.values[i] = p.value
 
-template appendInlineParam*(
+proc validateParamCount*(n: int, what: string) =
+  ## Reject a count the encoder would reject later: a send-phase failure
+  ## would take the whole pipelined batch down.
+  if n > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      what & " count " & $n & " exceeds protocol maximum of " & $maxInt16Count,
+    )
+
+proc validateParseMsg*(sql: string, nParams: int, stmtNameLen = generatedStmtNameLen) =
+  ## Reject a Parse the encoder would reject later, so a pipelined op fails on
+  ## its own instead of in `buildSendPhase`. Best-effort; `patchMsgLen` stays
+  ## the authority on message size.
+  checkNoNul(sql, "SQL statement")
+  checkMsgLenBound64(
+    calcParseMessageLength(stmtNameLen, sql.len, nParams), "Parse message"
+  )
+
+proc validateTypedParams*(
+    params: openArray[PgParam],
+    resultFormatsLen: int = 0,
+    stmtNameLen: int = generatedStmtNameLen,
+) =
+  ## `validateInlineParam`'s counterpart for the `seq[PgParam]` path: checks the
+  ## Int16 count, the payload total and the Bind envelope at add time.
+  ## `resultFormatsLen` 0 means unknown, making the check a lower bound.
+  if resultFormatsLen < 0 or resultFormatsLen > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind result-format count " & $resultFormatsLen & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+  validateParamCount(params.len, "Bind parameter")
+  var payload: int64 = 0
+  for p in params:
+    if p.value.isSome:
+      addBindPayload(payload, p.value.get.len)
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      0, stmtNameLen, params.len, params.len, payload, resultFormatsLen
+    ),
+    "Bind message",
+  )
+
+proc validateEncodedParams*(
+    params: openArray[Option[seq[byte]]],
+    paramFormatsLen: int,
+    resultFormatsLen: int = 0,
+    stmtNameLen: int = generatedStmtNameLen,
+    portalLen: int = 0,
+) =
+  ## `validateTypedParams` for the already-encoded `seq[Option[seq[byte]]]` path.
+  ## Runs before the send templates drain `pendingStmtCloses` into `sendBuf`,
+  ## which a later rejection would discard.
+  if paramFormatsLen < 0 or paramFormatsLen > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind parameter-format count " & $paramFormatsLen & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+  if resultFormatsLen < 0 or resultFormatsLen > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind result-format count " & $resultFormatsLen & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+  validateParamCount(params.len, "Bind parameter")
+  var payload: int64 = 0
+  for p in params:
+    if p.isSome:
+      addBindPayload(payload, p.get.len)
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      portalLen, stmtNameLen, paramFormatsLen, params.len, payload, resultFormatsLen
+    ),
+    "Bind message",
+  )
+
+proc validateRawBind*(
+    data: openArray[byte],
+    ranges: openArray[tuple[off: int32, len: int32]],
+    paramFormats: openArray[int16],
+    resultFormatsLen: int = 0,
+    stmtNameLen: int = generatedStmtNameLen,
+) =
+  ## `validateEncodedParams` for the raw buffer/ranges path (`addBindRaw`).
+  ## The `*Impl` procs are public, so `data`/`ranges` may never have gone
+  ## through `flattenInline`.
+  preflightBindCounts("", "", paramFormats.len, ranges.len, resultFormatsLen)
+  var payload: int64 = 0
+  for r in ranges:
+    if r.len < -1:
+      raise newException(PgTypeError, "Bind range len " & $r.len & " is invalid")
+    if r.len > 0:
+      if r.off < 0:
+        raise newException(PgTypeError, "Bind range off " & $r.off & " is negative")
+      if r.off.int64 + r.len.int64 > data.len.int64:
+        raise newException(
+          PgTypeError,
+          "Bind range out of bounds (off=" & $r.off & ", len=" & $r.len & ", data.len=" &
+            $data.len & ")",
+        )
+      addBindPayload(payload, r.len)
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      0, stmtNameLen, paramFormats.len, ranges.len, payload, resultFormatsLen
+    ),
+    "Bind message",
+  )
+
+proc validateExtendedQuery*(
+    sql: string,
+    nParams: int,
+    nParamOids: int = nParams,
+    stmtNameLen: int = generatedStmtNameLen,
+) =
+  ## Add-time validation shared by every extended-query entry point.
+  ## `nParamOids` sizes the Parse, which the `*Impl` procs take separately from
+  ## the values. Pass `stmtNameLen` 0 for an unnamed statement.
+  validateParamCount(nParams, "Bind parameter")
+  validateParamCount(nParamOids, "Parse parameter-type")
+  validateParseMsg(sql, nParamOids, stmtNameLen)
+
+template validateInlineParam*(p: PgParamInline) =
+  ## Reject a bad ``PgParamInline`` with ``PgTypeError``, so a hand-built one
+  ## stays catchable under ``PgError`` instead of a fatal ``RangeDefect``.
+  if p.len < -1:
+    # Only -1 encodes NULL; any other negative would shrink `data` below.
+    raise newException(
+      PgTypeError, "PgParamInline.len (" & $p.len & ") is negative but not NULL (-1)"
+    )
+  if p.len > PgInlineBufSize and p.overflow.len < int(p.len):
+    raise newException(
+      PgTypeError,
+      "PgParamInline.len (" & $p.len & ") exceeds overflow capacity (" & $p.overflow.len &
+        ")",
+    )
+
+template appendInlineParamUnchecked*(
     data: var seq[byte],
     ranges: var seq[tuple[off: int32, len: int32]],
     oids: var seq[int32],
     formats: var seq[int16],
     p: PgParamInline,
 ) =
-  ## Shared encoder for a single `PgParamInline` into SoA buffers. Used by
-  ## both `flattenInline` (per-call temporaries) and `Pipeline.appendInline`
-  ## (pipeline-wide SoA). Keeping the NULL / empty / inline / overflow
-  ## branching in one place means wire-format semantics cannot drift between
-  ## the two code paths.
+  ## Encode one ``PgParamInline`` into SoA buffers. Raises ``PgTypeError``.
+  ## The caller must have run ``validateInlineParam`` on ``p``: its bounds keep
+  ## the ``overflow`` read in range.
+  var rng: typeof(ranges[0])
+  if p.len == -1:
+    rng = (int32(0), int32(-1))
+  else:
+    checkMsgLenBound64(int64(data.len) + int64(p.len), "inline parameter data")
+    let dataOff = int32(data.len)
+    if p.len == 0:
+      rng = (dataOff, int32(0))
+    else:
+      let oldLen = data.len
+      data.setLen(oldLen + int(p.len))
+      if p.len <= PgInlineBufSize:
+        data.writeBytesAt(oldLen, p.inlineBuf.toOpenArray(0, int(p.len) - 1))
+      else:
+        data.writeBytesAt(oldLen, p.overflow.toOpenArray(0, int(p.len) - 1))
+      rng = (dataOff, p.len)
   oids.add p.oid
   formats.add p.format
-  if p.len == -1:
-    ranges.add((int32(0), int32(-1)))
-  elif p.len == 0:
-    ranges.add((int32(data.len), int32(0)))
-  else:
-    let dataOff = int32(data.len)
-    let oldLen = data.len
-    if p.len > PgInlineBufSize and p.overflow.len < int(p.len):
-      raise newException(
-        RangeDefect,
-        "PgParamInline.len (" & $p.len & ") exceeds overflow capacity (" &
-          $p.overflow.len & ")",
-      )
-    data.setLen(oldLen + int(p.len))
-    if p.len <= PgInlineBufSize:
-      data.writeBytesAt(oldLen, p.inlineBuf.toOpenArray(0, int(p.len) - 1))
-    else:
-      data.writeBytesAt(oldLen, p.overflow.toOpenArray(0, int(p.len) - 1))
-    ranges.add((dataOff, p.len))
+  ranges.add rng
 
 proc flattenInline*(
-    params: openArray[PgParamInline]
+    params: openArray[PgParamInline], resultFormatsLen: int = 0
 ): tuple[
   data: seq[byte],
   ranges: seq[tuple[off: int32, len: int32]],
   oids: seq[int32],
   formats: seq[int16],
 ] =
+  # Ahead of the empty-params early return: the result-format count is a Bind
+  # field of its own, so it must be rejected even with no parameters.
+  if resultFormatsLen < 0 or resultFormatsLen > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind result-format count " & $resultFormatsLen & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
   if params.len == 0:
     return
+  validateParamCount(params.len, "Bind parameter")
+  # Bounds the buffer, not a message: `data.len` becomes an `int32` range
+  # offset. Summed first so the reservation below stays sane.
+  var estBytes: int64 = 0
+  for p in params:
+    validateInlineParam(p)
+    if p.len > 0:
+      let plen = int64(p.len)
+      checkMsgLenBound64(estBytes + plen, "inline parameter data")
+      estBytes += plen
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      0, generatedStmtNameLen, params.len, params.len, estBytes, resultFormatsLen
+    ),
+    "Bind message",
+  )
   result.oids = newSeqOfCap[int32](params.len)
   result.formats = newSeqOfCap[int16](params.len)
   result.ranges = newSeqOfCap[tuple[off: int32, len: int32]](params.len)
-  var estBytes = 0
+  result.data = newSeqOfCap[byte](int(estBytes))
   for p in params:
-    if p.len > 0:
-      estBytes += int(p.len)
-  result.data = newSeqOfCap[byte](estBytes)
-  for p in params:
-    appendInlineParam(result.data, result.ranges, result.oids, result.formats, p)
+    appendInlineParamUnchecked(
+      result.data, result.ranges, result.oids, result.formats, p
+    )
 
 template sendExtendedQuery*(
     conn: PgConnection,
@@ -339,29 +444,8 @@ template sendExtendedQuery*(
     effectiveResultFormats: var seq[int16],
     parseStep, bindStep: untyped,
 ) =
-  ## Emit the extended-query wire sequence (Parse/Bind/Describe/Execute/Sync)
-  ## for a `query`-shaped round-trip into `conn.sendBuf`, branching on the
-  ## prepared-statement cache state:
-  ##
-  ## * cache hit  → Bind, Execute, Sync. Pulls `fields`/`colFmts`/`colOids`/
-  ##   `resultFormats` out of `cached` so the recv loop can reuse them.
-  ## * cache miss → optional Close (eviction), Parse, Describe(Statement),
-  ##   Bind, Execute, Sync. `cachedFields`/`cachedColFmts`/`cachedColOids` are
-  ##   left for the recv loop to populate on RowDescription.
-  ## * cache disabled (`stmtCacheCapacity == 0`) → Parse, Bind,
-  ##   Describe(Portal), Execute, Sync. Describe(Portal) is required so the
-  ##   recv loop sees a RowDescription for `QueryResult.fields`.
-  ##
-  ## `parseStep` and `bindStep` are untyped blocks expanded inline so each
-  ## caller can pick the right `addParse` / `addBind` / `addBindRaw` overload
-  ## (PgParam, raw `Option[seq[byte]]` + OIDs, or inline raw data + ranges)
-  ## without going through a proc-pointer indirection. Both blocks reference
-  ## `stmtName` from the outer scope; the template sets it before expansion
-  ## ("" on the cache-disabled path, the cache-named or freshly-generated
-  ## name otherwise).
-  ##
-  ## Precondition: `cached` may be nil iff `cacheHit == false`; the cache-miss
-  ## and cache-disabled branches never read `cached`.
+  ## Emit Parse/Bind/Describe/Execute/Sync sequence (cache hit/miss/disabled).
+  ## Precondition: ``cached`` may be nil iff ``cacheHit == false``.
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:
@@ -407,13 +491,8 @@ template sendExtendedExec*(
     stmtName: var string,
     parseStep, bindStep: untyped,
 ) =
-  ## `exec`-shaped counterpart of `sendExtendedQuery`: same 3-branch send
-  ## sequence, but no Describe(Portal) on the cache-disabled path and no
-  ## result-format / cached-column bookkeeping (exec callers discard rows).
-  ## The cache-miss path still issues Describe(Statement) so the recv loop
-  ## can stash parameter OIDs and field info for future cache hits.
-  ##
-  ## Precondition: `cached` may be nil iff `cacheHit == false`.
+  ## ``exec`` variant of ``sendExtendedQuery`` (no per-column format tracking).
+  ## Precondition: ``cached`` may be nil iff ``cacheHit == false``.
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()
   if cacheHit:

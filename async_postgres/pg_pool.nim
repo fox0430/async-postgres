@@ -1376,38 +1376,51 @@ proc executeBatch(
 ): Future[void] {.async.} =
   ## Execute a batch of pending operations on a single connection via pipeline.
   let timeout = batchTimeout(batch)
+  # Ops the pipeline rejects at add time are resolved here and excluded from
+  # the run, so `ir` is indexed by `acceptedIdx`, not by batch position.
+  var acceptedIdx = newSeqOfCap[int](batch.len)
+  var addFailed = newSeq[bool](batch.len)
   # No re-raise: every op's outcome is reported via `failPendingOp` below.
   try:
     let pipeline = newPipeline(conn)
-    for op in batch:
-      case op.kind
-      of popExec:
-        if op.hasInline:
-          pipeline.addExec(op.sql, op.paramsInline)
-        else:
-          pipeline.addExec(op.sql, op.params)
-      of popQuery:
-        if op.hasInline:
-          pipeline.addQuery(op.sql, op.paramsInline, op.resultFormat)
-        else:
-          pipeline.addQuery(op.sql, op.params, op.resultFormat)
+    for i, op in batch:
+      try:
+        case op.kind
+        of popExec:
+          if op.hasInline:
+            pipeline.addExec(op.sql, op.paramsInline)
+          else:
+            pipeline.addExec(op.sql, op.params)
+        of popQuery:
+          if op.hasInline:
+            pipeline.addQuery(op.sql, op.paramsInline, op.resultFormat)
+          else:
+            pipeline.addQuery(op.sql, op.params, op.resultFormat)
+        acceptedIdx.add(i)
+      except CatchableError as e:
+        # Add-time validation is per-op, so the offending op fails on its own
+        # instead of taking batch-mates down with it.
+        addFailed[i] = true
+        failPendingOp(op, e)
     let ir = await pipeline.executeIsolated(timeout)
-    for i in 0 ..< batch.len:
+    for k, i in acceptedIdx:
       let op = batch[i]
-      if ir.errors[i] != nil:
-        failPendingOp(op, ir.errors[i])
+      if ir.errors[k] != nil:
+        failPendingOp(op, ir.errors[k])
       else:
         case op.kind
         of popExec:
-          completePendingOp(op, ir.results[i].commandResult)
+          completePendingOp(op, ir.results[k].commandResult)
         of popQuery:
-          completePendingOp(op, ir.results[i].queryResult)
+          completePendingOp(op, ir.results[k].queryResult)
   except CatchableError as e:
-    for op in batch:
-      failPendingOp(op, e)
+    for i, op in batch:
+      if not addFailed[i]:
+        failPendingOp(op, e)
   except Defect as d:
-    for op in batch:
-      failPendingOp(op, newPoolError(pekDefectWrapped, d.msg, d))
+    for i, op in batch:
+      if not addFailed[i]:
+        failPendingOp(op, newPoolError(pekDefectWrapped, d.msg, d))
   try:
     await pool.resetSessionAndRelease(conn)
   except CancelledError as e:

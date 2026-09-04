@@ -31,6 +31,10 @@ proc prepareImpl*(
     conn: PgConnection, name: string, sql: string
 ): Future[PreparedStatement] {.async.} =
   conn.checkReady()
+  # The name is the application's, not a generated `nextStmtName()`, so it is
+  # both checked for NUL and charged against the Parse envelope.
+  checkNoNul(name, "prepared statement name")
+  validateParseMsg(sql, nParams = 0, stmtNameLen = name.len)
 
   var batch = newSeqOfCap[byte](sql.len + name.len + 32)
   batch.addParse(name, sql)
@@ -95,6 +99,11 @@ proc executeImpl*(
           coerced = params
           needsCoercion = true
         coerced[i] = coerceBinaryParam(params[i], stmt.paramOids[i])
+
+  # After coercion, which can change a value's encoded length.
+  validateTypedParams(
+    if needsCoercion: coerced else: params, resultFormats.len, stmt.name.len
+  )
 
   conn.sendBuf.setLen(0)
   conn.flushPendingStmtCloses()

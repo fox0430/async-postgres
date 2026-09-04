@@ -108,17 +108,62 @@ proc reset*(p: Pipeline) =
   p.inlineFormats.setLen(0)
 
 proc appendInline(
-    p: Pipeline, params: openArray[PgParamInline]
+    p: Pipeline, params: openArray[PgParamInline], resultFormatsLen: int = 0
 ): tuple[start, count: int32] =
-  ## Append inline params to the Pipeline-level SoA buffers. Returns
-  ## `(start, count)` identifying the appended slice.
+  ## Append inline params. All-or-nothing: fully validated before any append.
+  # Ahead of the `int32` conversions below, whose `RangeDefect` is uncatchable.
+  # `inlineRanges.len` accumulates over every add since `reset`, so no per-add
+  # bound covers it.
+  if resultFormatsLen < 0 or resultFormatsLen > maxInt16Count:
+    raise newException(
+      PgTypeError,
+      "Bind result-format count " & $resultFormatsLen & " exceeds protocol maximum of " &
+        $maxInt16Count,
+    )
+  validateParamCount(params.len, "Bind parameter")
+  if p.inlineRanges.len > maxInt32Len - params.len:
+    raise newException(
+      PgTypeError,
+      "pipeline inline parameter count (" &
+        $(int64(p.inlineRanges.len) + int64(params.len)) &
+        ") exceeds protocol maximum of " & $maxInt32Len,
+    )
   result.start = int32(p.inlineRanges.len)
   result.count = int32(params.len)
+  # Run up front: raising partway through the loop would orphan bytes in
+  # `inlineData` that no `PipelineOp` references. Bounds the shared buffer, not
+  # the Bind message: `inlineData.len` becomes an `int32` range offset.
+  var bufTotal: int64 = int64(p.inlineData.len)
+  var opPayload: int64 = 0
   for pi in params:
-    appendInlineParam(p.inlineData, p.inlineRanges, p.inlineOids, p.inlineFormats, pi)
+    validateInlineParam(pi)
+    if pi.len > 0:
+      let plen = int64(pi.len)
+      # Not `checkMsgLenBound64`: this is the shared buffer, not one assembled
+      # message, so it must not surface as `PgMessageTooLargeError`.
+      if bufTotal + plen > int64(maxInt32Len):
+        raise newException(
+          PgTypeError,
+          "pipeline inline parameter data (" & $(bufTotal + plen) &
+            " bytes) exceeds protocol maximum of " & $maxInt32Len,
+        )
+      bufTotal += plen
+      addBindPayload(opPayload, int(pi.len))
+  checkMsgLenBound64(
+    calcBindMessageLength(
+      0, generatedStmtNameLen, params.len, params.len, opPayload, resultFormatsLen
+    ),
+    "Bind message",
+  )
+  for pi in params:
+    appendInlineParamUnchecked(
+      p.inlineData, p.inlineRanges, p.inlineOids, p.inlineFormats, pi
+    )
 
 proc addExec*(p: Pipeline, sql: string, params: seq[PgParam] = @[]) =
   ## Add an exec operation to the pipeline with typed parameters.
+  validateExtendedQuery(sql, params.len)
+  validateTypedParams(params)
   var op = PipelineOp(kind: pokExec, sql: sql)
   if params.len > 0:
     op.paramOids = newSeqOfCap[int32](params.len)
@@ -137,6 +182,11 @@ proc addQuery*(
     resultFormat: ResultFormat = rfAuto,
 ) =
   ## Add a query operation to the pipeline with typed parameters.
+  ## The Bind pre-flight under-charges a cache hit's replayed result formats:
+  ## the cache is only consulted in `buildSendPhase`, long after this add.
+  validateExtendedQuery(sql, params.len)
+  let rf = resultFormat.toFormatCodes()
+  validateTypedParams(params, rf.len)
   let (oids, formats, values) = extractParams(params)
   p.ops.add PipelineOp(
     kind: pokQuery,
@@ -144,11 +194,12 @@ proc addQuery*(
     params: values,
     paramOids: oids,
     paramFormats: formats,
-    resultFormats: resultFormat.toFormatCodes(),
+    resultFormats: rf,
   )
 
 proc addExec*(p: Pipeline, sql: string, params: openArray[PgParamInline]) =
   ## Add an exec operation using the heap-alloc-free `PgParamInline` path.
+  validateExtendedQuery(sql, params.len)
   let (start, count) = p.appendInline(params)
   p.ops.add PipelineOp(
     kind: pokExec, sql: sql, hasInline: true, inlineStart: start, inlineCount: count
@@ -161,14 +212,17 @@ proc addQuery*(
     resultFormat: ResultFormat = rfAuto,
 ) =
   ## Add a query operation using the heap-alloc-free `PgParamInline` path.
-  let (start, count) = p.appendInline(params)
+  ## Under-charges a cache hit's result formats as the typed overload does.
+  validateExtendedQuery(sql, params.len)
+  let rf = resultFormat.toFormatCodes()
+  let (start, count) = p.appendInline(params, rf.len)
   p.ops.add PipelineOp(
     kind: pokQuery,
     sql: sql,
     hasInline: true,
     inlineStart: start,
     inlineCount: count,
-    resultFormats: resultFormat.toFormatCodes(),
+    resultFormats: rf,
   )
 
 proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
@@ -179,6 +233,9 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   ## otherwise a single trailing Sync is appended (execute).
   let conn = p.conn
   conn.sendBuf.setLen(0)
+  # A raise below discards `sendBuf` unsent, so every `Close` it held for a
+  # server-side statement must go back on the queue or that statement leaks.
+  var orphanedCloses = conn.pendingStmtCloses
   conn.flushPendingStmtCloses()
   var hasCachedStmts = false
   var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
@@ -191,147 +248,159 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   var inFlight:
     Table[string, tuple[stmtName: string, paramOids: seq[int32], opIdx: int]]
 
-  for i in 0 ..< p.ops.len:
-    let hasInline = p.ops[i].hasInline
-    let startIdx = int(p.ops[i].inlineStart)
-    let endIdx = startIdx + int(p.ops[i].inlineCount) - 1
-    if not hasInline and p.ops[i].paramFormats.len == 0:
-      let needed = p.ops[i].params.len
-      if defaultFormats.len != needed:
-        defaultFormats = newSeq[int16](needed)
+  # Names the op an encode failure came from. The batch still fails whole (the
+  # ops are positional on the wire), but the message says who caused it.
+  var encodingOp = -1
+  try:
+    for i in 0 ..< p.ops.len:
+      encodingOp = i
+      let hasInline = p.ops[i].hasInline
+      let startIdx = int(p.ops[i].inlineStart)
+      let endIdx = startIdx + int(p.ops[i].inlineCount) - 1
+      if not hasInline and p.ops[i].paramFormats.len == 0:
+        let needed = p.ops[i].params.len
+        if defaultFormats.len != needed:
+          defaultFormats = newSeq[int16](needed)
 
-    template currentFormats(): openArray[int16] =
-      if hasInline:
-        p.inlineFormats.toOpenArray(startIdx, endIdx)
-      elif p.ops[i].paramFormats.len > 0:
-        p.ops[i].paramFormats.toOpenArray(0, p.ops[i].paramFormats.high)
-      else:
-        defaultFormats.toOpenArray(0, defaultFormats.high)
-
-    template emitBind(stmt: string, resultFmts: openArray[int16]) =
-      if hasInline:
-        conn.sendBuf.addBindRaw(
-          "",
-          stmt,
-          currentFormats(),
-          p.inlineData,
-          p.inlineRanges.toOpenArray(startIdx, endIdx),
-          resultFmts,
-        )
-      else:
-        conn.sendBuf.addBind("", stmt, currentFormats(), p.ops[i].params, resultFmts)
-
-    template emitParse(stmt: string) =
-      if hasInline:
-        conn.sendBuf.addParse(
-          stmt, p.ops[i].sql, p.inlineOids.toOpenArray(startIdx, endIdx)
-        )
-      else:
-        conn.sendBuf.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
-
-    template currentOidsMatch(cachedOids: seq[int32]): bool =
-      if hasInline:
-        paramOidsMatch(cachedOids, p.inlineOids.toOpenArray(startIdx, endIdx))
-      else:
-        paramOidsMatch(cachedOids, p.ops[i].paramOids)
-
-    let cached = conn.lookupStmtCache(p.ops[i].sql)
-    var cacheHit = cached != nil
-    if cacheHit:
-      # Reject the cache entry if its parse-time OIDs no longer match what
-      # this op wants to bind — otherwise the server would interpret bind
-      # bytes under stale parse-time types. Pipeline can't reuse
-      # ``invalidateIfOidMismatch`` because that routes Close through
-      # ``pendingStmtCloses``, which was already flushed at the top of
-      # ``buildSendPhase`` — so emit the Close directly into sendBuf.
-      if not currentOidsMatch(cached.paramOids):
-        conn.sendBuf.addClose(dkStatement, cached.name)
-        conn.removeStmtCache(p.ops[i].sql)
-        cacheHit = false
-    p.ops[i].cache = scsUncached
-    p.ops[i].cacheSuperseded = false
-
-    if cacheHit:
-      p.ops[i].cache = scsHit
-      p.ops[i].stmtName = cached.name
-      if p.ops[i].kind == pokQuery:
-        if not hasCachedStmts:
-          result = newSeq[CachedStmt](p.ops.len)
-          hasCachedStmts = true
-        result[i] = cached
-      var effectiveResultFormats: seq[int16]
-      if p.ops[i].kind == pokQuery:
-        # Replay the cached result formats when the caller didn't override, so a
-        # no-override cache hit re-Binds the format negotiated at first Parse.
-        # Leave `p.ops[i].resultFormats` untouched (don't freeze an rfAuto op
-        # into resolved formats across re-executes): the receive phase derives
-        # the same decode formats via `cacheHitColFmts(p.ops[i].resultFormats,
-        # c.colFmts, ...)`, whose empty branch returns `c.colFmts` — equal to
-        # these `cached.resultFormats` (both are `buildResultFormats` output).
-        effectiveResultFormats =
-          if p.ops[i].resultFormats.len == 0:
-            cached.resultFormats
-          else:
-            p.ops[i].resultFormats
-      emitBind(cached.name, effectiveResultFormats)
-      conn.sendBuf.addExecute("", 0)
-    elif conn.stmtCacheCapacity > 0:
-      var shared = false
-      if inFlight.hasKey(p.ops[i].sql):
-        let entry = inFlight[p.ops[i].sql]
-        if currentOidsMatch(entry.paramOids):
-          # Same SQL, compatible OIDs — reuse the earlier op's stmt. No new
-          # Parse/Describe(Statement); we still send Describe(Portal) for
-          # queries so the recv loop gets a RowDescription for this op.
-          shared = true
-          p.ops[i].cache = scsShare
-          p.ops[i].stmtName = entry.stmtName
-          emitBind(entry.stmtName, p.ops[i].resultFormats)
-          if p.ops[i].kind == pokQuery:
-            conn.sendBuf.addDescribe(dkPortal, "")
-          conn.sendBuf.addExecute("", 0)
+      template currentFormats(): openArray[int16] =
+        if hasInline:
+          p.inlineFormats.toOpenArray(startIdx, endIdx)
+        elif p.ops[i].paramFormats.len > 0:
+          p.ops[i].paramFormats.toOpenArray(0, p.ops[i].paramFormats.high)
         else:
-          # Same SQL, different OIDs — close the in-flight stmt and demote
-          # its creator so it isn't added to the persistent cache. The
-          # fall-through emits a fresh Parse with the new OIDs.
-          conn.sendBuf.addClose(dkStatement, entry.stmtName)
-          p.ops[entry.opIdx].cacheSuperseded = true
-          dec pendingCacheAdds
-          inFlight.del(p.ops[i].sql)
-      if not shared:
-        p.ops[i].cache = scsMiss
-        p.ops[i].stmtName = conn.nextStmtName()
-        if conn.stmtCache.len + pendingCacheAdds >= conn.stmtCacheCapacity and
-            conn.stmtCache.len > 0:
-          let evicted = conn.evictStmtCache()
-          conn.sendBuf.addClose(dkStatement, evicted.name)
-        inc pendingCacheAdds
-        emitParse(p.ops[i].stmtName)
-        conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
-        emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
+          defaultFormats.toOpenArray(0, defaultFormats.high)
+
+      template emitBind(stmt: string, resultFmts: openArray[int16]) =
+        if hasInline:
+          conn.sendBuf.addBindRaw(
+            "",
+            stmt,
+            currentFormats(),
+            p.inlineData,
+            p.inlineRanges.toOpenArray(startIdx, endIdx),
+            resultFmts,
+          )
+        else:
+          conn.sendBuf.addBind("", stmt, currentFormats(), p.ops[i].params, resultFmts)
+
+      template emitParse(stmt: string) =
+        if hasInline:
+          conn.sendBuf.addParse(
+            stmt, p.ops[i].sql, p.inlineOids.toOpenArray(startIdx, endIdx)
+          )
+        else:
+          conn.sendBuf.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
+
+      template currentOidsMatch(cachedOids: seq[int32]): bool =
+        if hasInline:
+          paramOidsMatch(cachedOids, p.inlineOids.toOpenArray(startIdx, endIdx))
+        else:
+          paramOidsMatch(cachedOids, p.ops[i].paramOids)
+
+      let cached = conn.lookupStmtCache(p.ops[i].sql)
+      var cacheHit = cached != nil
+      if cacheHit:
+        # Stale parse-time OIDs would misread the bind bytes. Not
+        # ``invalidateIfOidMismatch``: its queue was already flushed above.
+        if not currentOidsMatch(cached.paramOids):
+          conn.sendBuf.addClose(dkStatement, cached.name)
+          conn.removeStmtCache(p.ops[i].sql)
+          orphanedCloses.add cached.name
+          cacheHit = false
+      p.ops[i].cache = scsUncached
+      p.ops[i].cacheSuperseded = false
+
+      if cacheHit:
+        p.ops[i].cache = scsHit
+        p.ops[i].stmtName = cached.name
+        if p.ops[i].kind == pokQuery:
+          if not hasCachedStmts:
+            result = newSeq[CachedStmt](p.ops.len)
+            hasCachedStmts = true
+          result[i] = cached
+        var effectiveResultFormats: seq[int16]
+        if p.ops[i].kind == pokQuery:
+          # Replay the format negotiated at first Parse when the caller didn't
+          # override, without freezing an rfAuto op across re-executes.
+          effectiveResultFormats =
+            if p.ops[i].resultFormats.len == 0:
+              cached.resultFormats
+            else:
+              p.ops[i].resultFormats
+        emitBind(cached.name, effectiveResultFormats)
         conn.sendBuf.addExecute("", 0)
-        # Deep-copy the OIDs so the inFlight entry is independent of the op's
-        # storage. Symmetric across inline (slice of pipeline-level SoA) and
-        # legacy (op-owned seq) paths — no shared aliasing surprises.
-        let recordedOids =
-          if hasInline:
-            @(p.inlineOids.toOpenArray(startIdx, endIdx))
+      elif conn.stmtCacheCapacity > 0:
+        var shared = false
+        if inFlight.hasKey(p.ops[i].sql):
+          let entry = inFlight[p.ops[i].sql]
+          if currentOidsMatch(entry.paramOids):
+            # Same SQL, compatible OIDs — reuse the earlier op's stmt. Queries
+            # still need Describe(Portal) for their own RowDescription.
+            shared = true
+            p.ops[i].cache = scsShare
+            p.ops[i].stmtName = entry.stmtName
+            emitBind(entry.stmtName, p.ops[i].resultFormats)
+            if p.ops[i].kind == pokQuery:
+              conn.sendBuf.addDescribe(dkPortal, "")
+            conn.sendBuf.addExecute("", 0)
           else:
-            @(p.ops[i].paramOids)
-        inFlight[p.ops[i].sql] =
-          (stmtName: p.ops[i].stmtName, paramOids: recordedOids, opIdx: i)
-    else:
-      emitParse("")
-      emitBind("", p.ops[i].resultFormats)
-      if p.ops[i].kind == pokQuery:
-        conn.sendBuf.addDescribe(dkPortal, "")
-      conn.sendBuf.addExecute("", 0)
+            # Same SQL, different OIDs — close the in-flight stmt and demote its
+            # creator; the fall-through Parses again with the new OIDs.
+            conn.sendBuf.addClose(dkStatement, entry.stmtName)
+            p.ops[entry.opIdx].cacheSuperseded = true
+            dec pendingCacheAdds
+            inFlight.del(p.ops[i].sql)
+        if not shared:
+          p.ops[i].cache = scsMiss
+          p.ops[i].stmtName = conn.nextStmtName()
+          if conn.stmtCache.len + pendingCacheAdds >= conn.stmtCacheCapacity and
+              conn.stmtCache.len > 0:
+            let evicted = conn.evictStmtCache()
+            conn.sendBuf.addClose(dkStatement, evicted.name)
+            orphanedCloses.add evicted.name
+          inc pendingCacheAdds
+          emitParse(p.ops[i].stmtName)
+          conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
+          emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
+          conn.sendBuf.addExecute("", 0)
+          # Deep-copy so the inFlight entry does not alias the op's storage,
+          # which is a slice of the pipeline-level SoA on the inline path.
+          let recordedOids =
+            if hasInline:
+              @(p.inlineOids.toOpenArray(startIdx, endIdx))
+            else:
+              @(p.ops[i].paramOids)
+          inFlight[p.ops[i].sql] =
+            (stmtName: p.ops[i].stmtName, paramOids: recordedOids, opIdx: i)
+      else:
+        emitParse("")
+        emitBind("", p.ops[i].resultFormats)
+        if p.ops[i].kind == pokQuery:
+          conn.sendBuf.addDescribe(dkPortal, "")
+        conn.sendBuf.addExecute("", 0)
 
-    if perOpSync:
+      if perOpSync:
+        conn.sendBuf.addSync()
+
+    # The trailing Sync belongs to the batch, not to the last op.
+    encodingOp = -1
+    if not perOpSync:
       conn.sendBuf.addSync()
-
-  if not perOpSync:
-    conn.sendBuf.addSync()
+  except PgError as e:
+    conn.pendingStmtCloses = orphanedCloses
+    # Only the encoders raise these two, so the interleaved cache bookkeeping
+    # is not blamed on the in-flight op.
+    if encodingOp >= 0 and (e of PgTypeError or e of PgProtocolError):
+      e.msg =
+        "pipeline op #" & $encodingOp & " (" & p.ops[encodingOp].sql & "): " & e.msg
+    raise e
+  except Defect as e:
+    # The encoders re-raise `Defect`s and buffer growth can raise
+    # `OutOfMemDefect`; the drained `Close` messages must survive either.
+    # Not a bare `raise`: Nim < 2.2.8 tracks that as `Exception`, which the
+    # chronos raises list rejects.
+    conn.pendingStmtCloses = orphanedCloses
+    raise e
 
 template initPipelineResults(
     results: var seq[PipelineResult], p: Pipeline, cachedStmts: seq[CachedStmt]

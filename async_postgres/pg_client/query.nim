@@ -18,10 +18,18 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len, paramOids.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+  # After the lookup: a cache hit replays the cached result formats, so the
+  # pre-flight has to charge the Bind that will actually go out.
+  validateEncodedParams(
+    params,
+    paramFormats.len,
+    preflightResultFormatsLen(cached, cacheHit, resultFormats.len),
+  )
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -63,10 +71,15 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
+  # Charge the result formats a cache hit replays, not the caller's empty list.
+  validateTypedParams(
+    params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+  )
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -106,10 +119,15 @@ proc queryEachImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[int64] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
+  # Charge the result formats a cache hit replays, not the caller's empty list.
+  validateTypedParams(
+    params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+  )
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -216,10 +234,16 @@ proc queryInlineImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
+  # Not redundant with the `query` overload's `flattenInline`: internal callers
+  # may hand this proc `data`/`ranges` that never went through it.
+  validateExtendedQuery(sql, ranges.len, paramOids.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+  # A cache hit replays the cached result formats, not the caller's.
+  let sendRfLen = preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+  validateRawBind(data, ranges, paramFormats, sendRfLen)
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -263,7 +287,6 @@ proc query*(
   ## Execute a query with heap-alloc-free inline parameters.
   ## Prefer this overload for scalar-heavy workloads where `seq[PgParam]`
   ## would heap-allocate per parameter.
-  let (data, ranges, oids, formats) = flattenInline(params)
   var qr: QueryResult
   withConnTracing(
     conn,
@@ -273,7 +296,11 @@ proc query*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
   ):
+    # Inside the tracing body so a rejected call still reports start/end, and
+    # after `checkReady` so a `PgTypeError` cannot pre-empt a health error.
+    conn.checkReady()
     let resultFormats = resultFormat.toFormatCodes()
+    let (data, ranges, oids, formats) = flattenInline(params, resultFormats.len)
     awaitOrInvalidate(
       conn,
       qr,

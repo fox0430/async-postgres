@@ -6,10 +6,10 @@ when hasChronos:
 
 import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_types/encoding
-import ../async_postgres/pg_connection/buffer_io
-import ../async_postgres/pg_connection/simple_query
-import ../async_postgres/pg_connection/cache
+import ../async_postgres/pg_connection/[buffer_io, simple_query, cache]
 import ../async_postgres/pg_pool {.all.}
+import ../async_postgres/pg_client/pipeline {.all.}
+import ../async_postgres/pg_client/[core, query, exec, direct]
 
 import mock_pg_server
 
@@ -18,6 +18,8 @@ privateAccess(PgConnection)
 privateAccess(PooledConn)
 privateAccess(Waiter)
 privateAccess(PendingPoolOp)
+privateAccess(Pipeline)
+privateAccess(PipelineOp)
 
 proc mockConn(state: PgConnState = csReady, pool: PgPool = nil): PgConnection =
   result = PgConnection(
@@ -4056,6 +4058,29 @@ suite "Pool warmup parallelization":
     waitFor t()
     check ok
     check idleAfter == 2
+
+suite "Pipeline rejects unencodable SQL at add time":
+  ## Regression: SQL was only checked in `buildSendPhase`, long after the op
+  ## joined a batch, so an innocent batch-mate inherited the error.
+
+  test "addExec rejects an embedded NUL":
+    let p = newPipeline(mockConn())
+    expect PgTypeError:
+      p.addExec("SELECT 1\0", @[])
+    check p.ops.len == 0
+
+  test "addQuery rejects an embedded NUL":
+    let p = newPipeline(mockConn())
+    expect PgTypeError:
+      p.addQuery("SELECT 1\0", @[])
+    check p.ops.len == 0
+
+  test "addExec rejects an embedded NUL on the inline path":
+    let p = newPipeline(mockConn())
+    expect PgTypeError:
+      p.addExec("SELECT 1\0", [])
+    check p.ops.len == 0
+
 suite "The shared message-length bound":
   ## Regression: `validateTypedParams` bounded each value but never their sum, so
   ## legal parameters overflowed the Bind message and took the whole batch down.
@@ -4100,6 +4125,79 @@ suite "The shared message-length bound":
       checkMsgLenBoundCalls = 0
       buf.addBindDirect("", stmt, [], arg)
       check checkMsgLenBoundCalls == 2
+suite "Bind/Parse envelope is included in pre-flight":
+  ## The pre-flight charges the envelope, not only the payload. A real 2 GiB
+  ## payload is out of reach, so the first tests anchor the calc procs against
+  ## the encoder and the rest pin where `checkMsgLenBound64` fires.
+
+  test "calcBindMessageLength equals the length the encoder writes":
+    var buf: seq[byte] = @[]
+    let payload = @[1'u8, 2, 3]
+    buf.addBind("", "s", @[1'i16], @[some(payload)], @[0'i16])
+    check int64(decodeInt32(buf, 1)) ==
+      calcBindMessageLength(0, "s".len, 1, 1, int64(payload.len), 1)
+
+  test "calcParseMessageLength equals the length the encoder writes":
+    var buf: seq[byte] = @[]
+    let sql = "SELECT $1"
+    buf.addParse("st", sql, @[23'i32])
+    check int64(decodeInt32(buf, 1)) == calcParseMessageLength("st".len, sql.len, 1)
+
+  test "Bind envelope: payload at limit is accepted":
+    let payload =
+      int64(maxInt32Len) - calcBindMessageLength(0, generatedStmtNameLen, 1, 1, 0, 1)
+    checkMsgLenBound64(
+      calcBindMessageLength(0, generatedStmtNameLen, 1, 1, payload, 1), "Bind message"
+    )
+
+  test "Bind envelope: one byte past limit is rejected as PgMessageTooLargeError":
+    let payload =
+      int64(maxInt32Len) - calcBindMessageLength(0, generatedStmtNameLen, 1, 1, 0, 1)
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcBindMessageLength(0, generatedStmtNameLen, 1, 1, payload + 1, 1),
+        "Bind message",
+      )
+
+  test "Bind envelope: multi-param overhead scales with n":
+    let payload =
+      int64(maxInt32Len) - calcBindMessageLength(0, generatedStmtNameLen, 10, 10, 0, 1)
+    checkMsgLenBound64(
+      calcBindMessageLength(0, generatedStmtNameLen, 10, 10, payload, 1), "Bind message"
+    )
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcBindMessageLength(0, generatedStmtNameLen, 10, 10, payload + 1, 1),
+        "Bind message",
+      )
+
+  test "Parse envelope: sql at limit is accepted":
+    let sqlLen = maxInt32Len - int(calcParseMessageLength(generatedStmtNameLen, 0, 1))
+    checkMsgLenBound64(
+      calcParseMessageLength(generatedStmtNameLen, sqlLen, 1), "Parse message"
+    )
+
+  test "Parse envelope: sql one byte past limit is rejected":
+    let sqlLen = maxInt32Len - int(calcParseMessageLength(generatedStmtNameLen, 0, 1))
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcParseMessageLength(generatedStmtNameLen, sqlLen + 1, 1), "Parse message"
+      )
+
+  when defined(pgTestObservability):
+    test "the pre-flight callers reach that formula":
+      # Ties the entry points to the formula pinned above. Small inputs cannot
+      # trip the bound, so reachability is observed through the call counter.
+      let typedOne = @[toPgParam(1'i32)]
+      let inlineOne = @[toPgParamInline(1'i32)]
+      checkMsgLenBoundCalls = 0
+      validateParseMsg("SELECT $1", 1)
+      check checkMsgLenBoundCalls == 1
+      validateTypedParams(typedOne, 1)
+      check checkMsgLenBoundCalls == 3
+      discard flattenInline(inlineOne, 1)
+      check checkMsgLenBoundCalls == 6
+
 suite "Envelope overhead matches actual encoder output":
   ## The overhead constants are hand-derived from the encoder layout; pin them
   ## to real output so the boundary tests below are not tautological.
@@ -4283,7 +4381,216 @@ suite "Direct builders agree with their pre-flight length":
     check int64(buf.len - 1) ==
       calcBindMessageLength(0, "s".len, 1, 1, int64(paramValueLen(42'i64)), 0)
     check decodeInt32(buf, 1) == int32(buf.len - 1)
+suite "An oversized message is an input error, not a connection failure":
+  ## The pre-flight is not a second model of the layout: the contract is fixed
+  ## in the encoder, where `patchMsgLen`/`patchLen` raise `PgMessageTooLargeError`.
 
+  test "PgMessageTooLargeError is an input error":
+    check PgMessageTooLargeError is PgTypeError
+    check PgMessageTooLargeError is PgError
+
+  test "the pre-flight raises the same type the encoder does":
+    # `patchMsgLen`'s own branch needs a >2 GiB buffer, so pin the two the
+    # ordinary path goes through instead — the pre-flight bound:
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    # And the running payload accumulator both Bind builders share:
+    var payload = int64(maxInt32Len)
+    expect PgMessageTooLargeError:
+      addBindPayload(payload, 1)
+
+  test "it is deliberately not a connection failure":
+    # A reconnect-on-failure loop must not re-dial a live connection over a
+    # caller-sized argument.
+    var caught = false
+    try:
+      raise newException(PgMessageTooLargeError, "too large")
+    except PgConnectionError:
+      check false
+    except PgTypeError:
+      caught = true
+    check caught
+
+  test "an over-count parameter list still reports the count":
+    # Exact and model-free, so this stays an add-time check.
+    try:
+      validateExtendedQuery("SELECT 1", maxInt16Count + 1)
+      check false
+    except PgTypeError as e:
+      check "count" in e.msg
+
+  test "an ordinary statement is accepted":
+    validateExtendedQuery("SELECT $1, $2", 2)
+
+  test "the Parse is sized from the OIDs, not from the bind values":
+    # The encoded-params entry points take values and OIDs as separate seqs, so
+    # a longer OID list must not slip past a pre-flight sized from the values.
+    try:
+      validateExtendedQuery("SELECT 1", 1, maxInt16Count + 1)
+      check false
+    except PgTypeError as e:
+      check "Parse parameter-type" in e.msg
+
+suite "The non-pipelined exec/query path pre-flights like the pipeline does":
+  ## Regression: without add-time validation an input-size error left the
+  ## encoder as a `PgProtocolError`, sending reconnect loops after a live conn.
+
+  test "an over-count parameter list is a PgTypeError, not a connection error":
+    let conn = mockConn()
+    let params = newSeq[PgParam](maxInt16Count + 1)
+    expect PgTypeError:
+      discard waitFor conn.query("SELECT 1", params)
+    # Rejected before anything reached the wire.
+    check conn.state == csReady
+
+  test "exec rejects an embedded NUL the same way":
+    let conn = mockConn()
+    expect PgTypeError:
+      discard waitFor conn.exec("SELECT 1\0", newSeq[PgParam]())
+    check conn.state == csReady
+
+  test "oversized payload pre-flight is PgTypeError and not a connection failure":
+    var payload = int64(maxInt32Len) - 4
+    expect PgMessageTooLargeError:
+      addBindPayload(payload, 5)
+    var caught = false
+    try:
+      payload = int64(maxInt32Len) - 4
+      addBindPayload(payload, 5)
+    except PgConnectionError:
+      check false
+    except PgTypeError:
+      caught = true
+    check caught
+    # Verify a fresh connection remains usable after the helper failure
+    let conn = mockConn()
+    check conn.state == csReady
+    expect PgTypeError:
+      discard waitFor conn.query("SELECT 1", newSeq[PgParam](maxInt16Count + 1))
+    check conn.state == csReady
+
+  test "CopyData oversized is PgTypeError and not a connection failure":
+    expect PgTypeError:
+      checkCopyDataLen(maxInt32Len - 3)
+    var caught = false
+    try:
+      checkCopyDataLen(maxInt32Len - 3)
+    except PgConnectionError:
+      check false
+    except PgTypeError:
+      caught = true
+    check caught
+
+suite "The Bind pre-flight runs before pendingStmtCloses is drained":
+  ## Regression: with only the Parse envelope pre-flighted, a rejected Bind ran
+  ## after the queued `Close` messages were drained into a discarded buffer.
+
+  test "an over-count parameter-format list is rejected before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.queryImpl(
+        "SELECT 1",
+        newSeq[Option[seq[byte]]](0),
+        newSeq[int32](0),
+        newSeq[int16](maxInt16Count + 1),
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "exec is rejected before the drain the same way":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.execImpl(
+        "SELECT 1",
+        newSeq[Option[seq[byte]]](0),
+        newSeq[int32](0),
+        newSeq[int16](maxInt16Count + 1),
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "an over-count result-format list is rejected before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.queryImpl(
+        "SELECT 1", newSeq[PgParam](0), newSeq[int16](maxInt16Count + 1)
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "a caller-built inline Bind is rejected before the drain":
+    # The `exec`/`query` overloads flatten and check first, but the `*Impl`
+    # procs are public and take ranges that never went through `flattenInline`.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    let data = @[1'u8, 2, 3]
+    let badRanges = @[(off: 0'i32, len: 8'i32)] # past the end of `data`
+    expect PgTypeError:
+      discard
+        waitFor conn.execInlineImpl("SELECT $1", data, badRanges, @[OidInt4], @[1'i16])
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+    expect PgTypeError:
+      discard
+        waitFor conn.queryInlineImpl("SELECT $1", data, badRanges, @[OidInt4], @[1'i16])
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "a caller-built inline Parse over-counts its OIDs before the drain":
+    # The OID seq sizes the Parse independently of the Bind ranges, so a count
+    # the Parse encoder rejects can hide behind a small, valid Bind.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    let badOids = newSeq[int32](maxInt16Count + 1)
+    expect PgTypeError:
+      discard waitFor conn.execInlineImpl(
+        "SELECT 1", newSeq[byte](0), @[], badOids, newSeq[int16](0)
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+    expect PgTypeError:
+      discard waitFor conn.queryInlineImpl(
+        "SELECT 1", newSeq[byte](0), @[], badOids, newSeq[int16](0)
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+suite "The direct macros pre-flight before pendingStmtCloses is drained":
+  ## Same regression as the suite above, on the zero-alloc path: the checks in
+  ## `addParseDirect`/`addBindDirect` run after the dispatch drained the queue.
+
+  test "execDirect rejects a NUL in SQL before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.execDirect("SELECT 1\0")
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "queryDirect rejects a NUL in SQL before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.queryDirect("SELECT $1\0", 1'i32)
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  when hasChronos and defined(pgTestObservability):
+    test "the hoisted pre-flight reaches both envelope bounds":
+      # Small inputs cannot trip a bound, so reachability is observed through
+      # the counter: 3 hoisted checks, the same 3 inside
+      # `addParseDirect`/`addBindDirect`, plus `addExecute`'s own.
+      let conn = mockConn()
+      conn.writer = defectWriter()
+      checkMsgLenBoundCalls = 0
+      expect Defect:
+        discard waitFor conn.execDirect("SELECT $1", 1'i32)
+      check checkMsgLenBoundCalls == 7
 suite "Array encoder guards are catchable and do not disturb valid input":
   ## What these guards reject needs a 2 GiB allocation, which a unit test
   ## cannot make. So: pin that the primitives raise a catchable `PgTypeError`

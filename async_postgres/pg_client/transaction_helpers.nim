@@ -19,12 +19,14 @@ proc queryInTransactionImpl(
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.checkTxIdle()
+  validateExtendedQuery(sql, params.len, paramOids.len, stmtNameLen = 0)
 
   let formats =
     if paramFormats.len > 0:
       paramFormats
     else:
       newSeq[int16](params.len)
+  validateEncodedParams(params, formats.len, resultFormats.len, stmtNameLen = 0)
 
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
   conn.sendBuf.setLen(0)

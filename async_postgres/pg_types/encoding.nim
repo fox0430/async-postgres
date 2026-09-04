@@ -1954,6 +1954,21 @@ func paramValueLen*(v: seq[byte]): int =
 func paramValueLen*(v: PgNumeric): int =
   ($v).len
 
+func paramValueLenBound*[T](v: T): int =
+  ## Upper bound on ``paramValueLen``, for the direct macros' size pre-flight:
+  ## measuring a ``PgNumeric`` exactly would render it a second time.
+  paramValueLen(v)
+
+func paramValueLenBound*(v: PgNumeric): int =
+  # Mirrors `$`: sign, `weight + 1` base-10000 groups, point, `dscale` digits.
+  if v.sign == pgNaN:
+    return 3
+  if v.digits.len == 0:
+    return 2 + max(v.dscale.int, 0)
+  result = 1 + max((v.weight.int + 1) * 4, 1)
+  if v.dscale > 0:
+    result += 1 + v.dscale.int
+
 proc foldBindParam*[T](
     payload: var int64, v: T, rendered: var string
 ) {.raises: [PgTypeError].} =

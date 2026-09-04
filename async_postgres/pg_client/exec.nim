@@ -16,6 +16,8 @@ proc execImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len, paramOids.len)
+  validateEncodedParams(params, paramFormats.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -45,6 +47,8 @@ proc execImpl*(
     conn: PgConnection, sql: string, params: seq[PgParam] = @[]
 ): Future[string] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len)
+  validateTypedParams(params)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -104,6 +108,10 @@ proc execInlineImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
+  # Not redundant with the `exec` overload's `flattenInline`: internal callers
+  # may hand this proc `data`/`ranges` that never went through it.
+  validateExtendedQuery(sql, ranges.len, paramOids.len)
+  validateRawBind(data, ranges, paramFormats)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -136,7 +144,6 @@ proc exec*(
   ## Execute a statement with heap-alloc-free inline parameters.
   ## Prefer this overload for scalar-heavy workloads (e.g. bulk INSERT of
   ## numeric columns) where `seq[PgParam]` would heap-allocate per parameter.
-  let (data, ranges, oids, formats) = flattenInline(params)
   var tag: string
   withConnTracing(
     conn,
@@ -146,6 +153,10 @@ proc exec*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
+    # Inside the tracing body so a rejected call still reports start/end, and
+    # after `checkReady` so a `PgTypeError` cannot pre-empt a health error.
+    conn.checkReady()
+    let (data, ranges, oids, formats) = flattenInline(params)
     awaitOrInvalidate(
       conn,
       tag,

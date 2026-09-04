@@ -327,6 +327,36 @@ proc bindPositionalOnce(
     result.syms[i] = tmp
     result.bindings.add(newLetStmt(tmp, arg))
 
+proc makeDirectPreflight(
+    sqlSym: NimNode, argSyms: seq[NimNode], rfLenNode: NimNode
+): NimNode =
+  ## Emit the Parse/Bind size pre-flight for a direct call, hoisted ahead of
+  ## the send dispatch: `addParseDirect`/`addBindDirect` only check once the
+  ## dispatch has drained `pendingStmtCloses` into the buffer a rejection
+  ## discards. Best-effort, and allocation-free via `paramValueLenBound`.
+  let payloadSym = genSym(nskVar, "preflightPayload")
+  let nParams = newLit(argSyms.len)
+  result = newStmtList()
+  result.add newCall(bindSym"validateParseMsg", sqlSym, nParams)
+  result.add newVarStmt(payloadSym, newLit(0'i64))
+  for sym in argSyms:
+    result.add newCall(
+      bindSym"addBindPayload", payloadSym, newCall(bindSym"paramValueLenBound", sym)
+    )
+  result.add newCall(
+    bindSym"checkMsgLenBound64",
+    newCall(
+      bindSym"calcBindMessageLength",
+      newLit(0),
+      bindSym"generatedStmtNameLen",
+      nParams,
+      nParams,
+      payloadSym,
+      rfLenNode,
+    ),
+    newLit("Bind message"),
+  )
+
 proc makeBindDirectCall(
     sendBufNode, portal, stmt, rfNode: NimNode, argList: NimNode
 ): NimNode =
@@ -489,6 +519,14 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   let colFmtsSym = genSym(nskVar, "colFmts")
   let colOidsSym = genSym(nskVar, "colOids")
 
+  # The count is a literal, so the zero-overhead path pays no runtime branch.
+  if positional.len > maxInt16Count:
+    error(
+      "queryDirect/execDirect parameter count " & $positional.len &
+        " exceeds protocol maximum of " & $maxInt16Count,
+      sql,
+    )
+
   result.add quote do:
     let `connSym` = `conn`
     let `sqlSym` = `sql`
@@ -506,9 +544,11 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
 
   let (argBindings, argSyms) = bindPositionalOnce(positional)
   result.add argBindings
-
   result.add buildInvalidateOnOidMismatchStmt(
     connSym, sqlSym, cachedSym, cacheHitSym, argSyms
+  )
+  result.add makeDirectPreflight(
+    sqlSym, argSyms, newCall(bindSym"preflightResultFormatsLen", cachedSym, cacheHitSym)
   )
 
   let argList = newNimNode(nnkBracket)
@@ -602,6 +642,14 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   let cacheMissSym = genSym(nskVar, "cacheMiss")
   let stmtNameSym = genSym(nskVar, "stmtName")
 
+  # The count is a literal, so the zero-overhead path pays no runtime branch.
+  if positional.len > maxInt16Count:
+    error(
+      "queryDirect/execDirect parameter count " & $positional.len &
+        " exceeds protocol maximum of " & $maxInt16Count,
+      sql,
+    )
+
   result.add quote do:
     let `connSym` = `conn`
     let `sqlSym` = `sql`
@@ -615,10 +663,11 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
 
   let (argBindings, argSyms) = bindPositionalOnce(positional)
   result.add argBindings
-
   result.add buildInvalidateOnOidMismatchStmt(
     connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
+  # execDirect discards rows, so its Bind always carries zero result formats.
+  result.add makeDirectPreflight(sqlSym, argSyms, newLit(0))
 
   let argList = newNimNode(nnkBracket)
   for sym in argSyms:

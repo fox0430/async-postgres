@@ -35,17 +35,28 @@ proc openCursorImpl(
 ): Future[Cursor] {.async.} =
   conn.checkReady()
 
+  validateExtendedQuery(sql, params.len, paramOids.len, stmtNameLen = 0)
+  let formats =
+    if paramFormats.len > 0:
+      paramFormats
+    else:
+      newSeq[int16](params.len)
+  # A cursor Binds an unnamed statement to a generated portal, the mirror of
+  # the named-statement/unnamed-portal shape the defaults assume.
+  validateEncodedParams(
+    params,
+    formats.len,
+    resultFormats.len,
+    stmtNameLen = 0,
+    portalLen = generatedPortalNameLen,
+  )
+  # The counter is only consumed once the call is known to be encodable.
   inc conn.portalCounter
   let portalName = "_cursor_" & $conn.portalCounter
 
   var batch = newSeqOfCap[byte](sql.len + 128)
   conn.flushPendingStmtCloses(batch)
   batch.addParse("", sql, paramOids)
-  let formats =
-    if paramFormats.len > 0:
-      paramFormats
-    else:
-      newSeq[int16](params.len)
   batch.addBind(portalName, "", formats, params, resultFormats)
   batch.addDescribe(dkPortal, portalName)
   batch.addExecute(portalName, chunkSize)

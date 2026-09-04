@@ -2550,6 +2550,16 @@ suite "Binary array encode/decode roundtrip":
     check fromBE32(data[o2 ..< o2 + 4]) == 300'i32
 
 suite "PgNumeric":
+  test "paramValueLenBound never under-charges the rendered length":
+    # The pre-flight uses the bound so it does not render; under-charging would
+    # let an oversized Bind reach the encoder after the Close drain.
+    for s in [
+      "0", "-1", "NaN", "0.00", "12345.6789", "-0.001", "100000000", "0.00001",
+      "999.999", "-123456789012345678901234567890.123456789",
+    ]:
+      let n = parsePgNumeric(s)
+      check paramValueLenBound(n) >= paramValueLen(n)
+
   test "toPgParam PgNumeric":
     let p = toPgParam(parsePgNumeric("123.456"))
     check p.oid == OidNumeric
@@ -8069,6 +8079,15 @@ suite "flattenInline SoA layout":
     check oids.len == 0
     check formats.len == 0
 
+  test "an out-of-range result-format count is rejected with no params":
+    # The empty-params early return must not skip the result-format check: the
+    # count is a Bind field of its own.
+    let params: seq[PgParamInline] = @[]
+    expect PgTypeError:
+      discard flattenInline(params, maxInt16Count + 1)
+    expect PgTypeError:
+      discard flattenInline(params, -1)
+
   test "single short int32 param":
     let params = @[toPgParamInline(42'i32)]
     let (data, ranges, oids, formats) = flattenInline(params)
@@ -8163,6 +8182,26 @@ suite "flattenInline SoA layout":
       check o == OidInt4
     for f in formats:
       check f == 1'i16
+
+  test "oversized inline param is rejected before the data buffer is sized":
+    # `estBytes` is summed from caller-supplied lengths, so validating late
+    # turns the reservation into an OutOfMemDefect instead of a PgError.
+    let params = @[
+      toPgParamInline(1'i32),
+      PgParamInline(oid: OidText, format: 0, len: int32.high, overflow: @[]),
+    ]
+    expect PgTypeError:
+      discard flattenInline(params)
+    # Catchable through the public base type, like every other param error.
+    expect PgError:
+      discard flattenInline(params)
+
+  test "an inline param count past the protocol maximum is rejected":
+    # Without this the count only surfaced from `addCount16` mid-send.
+    let params = newSeq[PgParamInline](maxInt16Count + 1)
+    expect PgTypeError:
+      discard flattenInline(params)
+
 suite "Pipeline appendInline SoA layout":
   test "single op: inlineStart/Count correct, ranges point into p.inlineData":
     privateAccess(Pipeline)
@@ -8268,6 +8307,180 @@ suite "Pipeline appendInline SoA layout":
     check p.ops[1].inlineStart == 2 # resumes after the two params of op A
     check p.ops[1].inlineCount == 0
     check p.inlineRanges.len == 2 # unchanged by op B
+
+suite "appendInlineParam validation and SoA atomicity":
+  ## The batch appenders validate up front and then call the unchecked form,
+  ## so the combined validate-and-append shape exists only here.
+  template appendInlineParam(
+      data: var seq[byte],
+      ranges: var seq[tuple[off: int32, len: int32]],
+      oids: var seq[int32],
+      formats: var seq[int16],
+      p: PgParamInline,
+  ) =
+    validateInlineParam(p)
+    appendInlineParamUnchecked(data, ranges, oids, formats, p)
+
+  test "len < -1 raises PgTypeError and leaves SoA unchanged":
+    var data: seq[byte] = @[1'u8, 2, 3]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[(0'i32, 3'i32)]
+    var oids: seq[int32] = @[OidInt4]
+    var formats: seq[int16] = @[1'i16]
+    var bad = PgParamInline(oid: OidInt4, format: 1, len: -2)
+    expect PgTypeError:
+      appendInlineParam(data, ranges, oids, formats, bad)
+    check data == @[1'u8, 2, 3]
+    check ranges.len == 1
+    check oids.len == 1
+    check formats.len == 1
+    check ranges[0] == (0'i32, 3'i32)
+
+  test "overflow capacity mismatch raises PgTypeError and leaves SoA unchanged":
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    var bad = PgParamInline(oid: OidText, format: 0, len: 20, overflow: @[1'u8, 2, 3])
+    expect PgTypeError:
+      appendInlineParam(data, ranges, oids, formats, bad)
+    check data.len == 0
+    check ranges.len == 0
+    check oids.len == 0
+    check formats.len == 0
+
+  test "overflow exact capacity succeeds (len == overflow.len)":
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    var ok = PgParamInline(oid: OidText, format: 0, len: 20, overflow: newSeq[byte](20))
+    for i in 0 ..< 20:
+      ok.overflow[i] = byte(i)
+    appendInlineParam(data, ranges, oids, formats, ok)
+    check ranges.len == 1
+    check oids.len == 1
+    check formats.len == 1
+    check data.len == 20
+    check data[0] == 0 and data[19] == 19
+
+  test "cumulative SoA size past int32 raises PgTypeError, not RangeDefect":
+    # The per-param offset is an int32, so the guard is on the running `data`
+    # total. Probed unchecked to reach the bound without allocating 2 GiB.
+    var data: seq[byte] = @[1'u8, 2, 3, 4]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    let huge = PgParamInline(oid: OidText, format: 0, len: int32.high - 1)
+    expect PgTypeError:
+      appendInlineParamUnchecked(data, ranges, oids, formats, huge)
+    check data.len == 4
+    check ranges.len == 0 and oids.len == 0 and formats.len == 0
+    # An empty param at the same offset takes the same guard.
+    let empty = PgParamInline(oid: OidText, format: 0, len: 0)
+    appendInlineParamUnchecked(data, ranges, oids, formats, empty)
+    check ranges[0] == (4'i32, 0'i32)
+
+  test "valid appends keep SoA lengths synced":
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    var p1 = toPgParamInline(1'i32)
+    appendInlineParam(data, ranges, oids, formats, p1)
+    check oids.len == 1 and formats.len == 1 and ranges.len == 1
+    var p2 = none(int32).toPgParamInline
+    appendInlineParam(data, ranges, oids, formats, p2)
+    check oids.len == 2 and formats.len == 2 and ranges.len == 2
+    check ranges[1].len == -1
+    var p3 = toPgParamInline("hello")
+    appendInlineParam(data, ranges, oids, formats, p3)
+    check oids.len == 3 and formats.len == 3 and ranges.len == 3
+    check oids.len == formats.len and formats.len == ranges.len
+    check data.len == 4 + 5
+
+  test "Pipeline stays consistent and usable after PgTypeError":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("A", [toPgParamInline(1'i32)])
+    check p.inlineRanges.len == 1
+    check p.inlineOids.len == 1
+    check p.inlineData.len == 4
+    var bad = PgParamInline(oid: OidInt4, format: 1, len: -2)
+    expect PgTypeError:
+      appendInlineParam(
+        p.inlineData, p.inlineRanges, p.inlineOids, p.inlineFormats, bad
+      )
+    check p.inlineRanges.len == 1
+    check p.inlineOids.len == 1
+    check p.inlineFormats.len == 1
+    check p.inlineData.len == 4
+    # Next successful append must resume at correct offset
+    p.addExec("B", [toPgParamInline(2'i32)])
+    check p.inlineRanges.len == 2
+    check p.inlineRanges[1].off == 4
+    check p.inlineRanges[1].len == 4
+    check p.inlineData[4 ..< 8] == @(toBE32(2'i32))
+    check p.ops.len == 2
+    check p.ops[1].inlineStart == 1
+    check p.ops[1].inlineCount == 1
+
+  test "addExec rolls back the whole param batch when one param is bad":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("A", [toPgParamInline(1'i32)])
+    let bad = PgParamInline(oid: OidInt4, format: 1, len: -2)
+    expect PgTypeError:
+      p.addExec("B", [toPgParamInline(2'i32), toPgParamInline(3'i32), bad])
+    # The two params appended before `bad` would be orphaned in the SoA
+    # buffers forever: no op references them.
+    check p.inlineRanges.len == 1
+    check p.inlineOids.len == 1
+    check p.inlineFormats.len == 1
+    check p.inlineData.len == 4
+    check p.ops.len == 1
+    p.addExec("C", [toPgParamInline(4'i32)])
+    check p.inlineRanges.len == 2
+    check p.inlineRanges[1].off == 4
+    check p.ops[1].inlineStart == 1
+
+  test "typed params over the Int16 count limit are rejected at add time":
+    # A send-phase raise would be attributed to the whole batch.
+    privateAccess(Pipeline)
+    let p = newPipeline(nil)
+    p.addExec("A", @[toPgParam(1'i32)])
+    var tooMany = newSeq[PgParam](maxInt16Count + 1)
+    for i in 0 ..< tooMany.len:
+      tooMany[i] = toPgParam(1'i32)
+    expect PgTypeError:
+      p.addExec("B", tooMany)
+    expect PgTypeError:
+      p.addQuery("C", tooMany)
+    check p.ops.len == 1
+
+  test "inline params over the Int16 count limit are rejected at add time":
+    privateAccess(Pipeline)
+    let p = newPipeline(nil)
+    var tooMany = newSeq[PgParamInline](maxInt16Count + 1)
+    for i in 0 ..< tooMany.len:
+      tooMany[i] = toPgParamInline(1'i32)
+    expect PgTypeError:
+      p.addExec("A", tooMany)
+    check p.ops.len == 0
+    check p.inlineRanges.len == 0
+    check p.inlineData.len == 0
+
+  test "flattenInline propagates PgTypeError without desync":
+    var bad = PgParamInline(oid: OidInt4, format: 1, len: -5)
+    expect PgTypeError:
+      discard flattenInline(@[toPgParamInline(1'i32), bad, toPgParamInline(2'i32)])
+    # flattenInline uses temporaries, so only the raise itself is observable:
+    # it must not be swallowed and must be PgTypeError, not ValueError.
+    var ok = flattenInline(@[toPgParamInline(1'i32), toPgParamInline(2'i32)])
+    check ok.ranges.len == 2
+    check ok.oids.len == 2
+
 suite "encodeBinaryArray with Option elements":
   test "mixed null and non-null int32":
     let elements = @[some(@(toBE32(1'i32))), none(seq[byte]), some(@(toBE32(3'i32)))]
