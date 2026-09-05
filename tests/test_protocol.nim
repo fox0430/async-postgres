@@ -1,8 +1,10 @@
-import std/[unittest, options, strutils, tables, importutils]
+import std/[unittest, options, strutils, tables, deques, importutils]
 
 import
   ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection, pg_errors]
 import ../async_postgres/pg_connection/buffer_io
+import ../async_postgres/pg_connection/notify
+import ../async_postgres/pg_connection/simple_query
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_types/[core, encoding]
 
@@ -1649,3 +1651,702 @@ suite "nextMessage skipDataRow":
     check rd.cellIndex.len == 2 # 1 column * (offset, length)
     check rd.cellIndex[1] == 2'i32 # "hi" length
     check conn.recvBufStart == row.len
+
+suite "enqueueNotification with an outstanding handoff":
+  ## Regression: the handoff was charged against `notifyMaxQueue`, shrinking the
+  ## configured depth by one — a cap of 1 dropped every arrival while the queue
+  ## sat empty. The cap counts queued notifications only; the handoff belongs to
+  ## a waiter that is about to consume it.
+  proc handoffConn(queued: int, maxQueue: int): PgConnection =
+    result = PgConnection(
+      recvBuf: @[],
+      state: csListening,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      notifyQueue: initDeque[Notification](),
+      config: ConnConfig(),
+    )
+    for i in 1 .. queued:
+      result.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: $i))
+    # The state between completing a waiter and that waiter resuming.
+    result.hasNotifyHandoff = true
+    result.notifyMaxQueue = maxQueue
+
+  test "a cap of one still admits an arrival while a handoff is outstanding":
+    let conn = handoffConn(queued = 0, maxQueue = 1)
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "new"
+    check conn.notifyDropped == 0
+
+  test "a backlog above a lowered cap is trimmed down to it in one report":
+    # `notifyMaxQueue` lowered while entries admitted under the old cap are
+    # still queued: they all go, in one overflow report, not one per arrival.
+    let conn = handoffConn(queued = 2, maxQueue = 1)
+    var reported = -1
+    conn.notifyOverflowCallback = proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check reported == 2
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "new"
+
+  test "requeueHandoff drops nothing and the next arrival trims the overshoot":
+    # The handoff predates the queue, so it goes back to the front intact; the
+    # cap is restored by the next arrival, still drop-oldest.
+    let conn = handoffConn(queued = 2, maxQueue = 2)
+    conn.requeueHandoff(Notification(pid: 1, channel: "ch", payload: "handoff"))
+    check conn.notifyQueue.len == 3
+    check conn.notifyQueue[0].payload == "handoff"
+    check conn.notifyDropped == 0
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "2"
+    check conn.notifyQueue[1].payload == "new"
+    check conn.notifyDropped == 2
+
+  test "drop-oldest applies at the cap regardless of the handoff":
+    let conn = handoffConn(queued = 2, maxQueue = 2)
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "2" # oldest went, arrival stayed
+    check conn.notifyQueue[1].payload == "new"
+    check conn.notifyDropped == 1
+
+suite "waitNotification defensive branch":
+  proc mockNotifyConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      notifyQueue: initDeque[Notification](),
+      notifyDropped: 0,
+      listenError: nil,
+      listenTask: newFuture[void]("listenTask"),
+      notifyWaiter: nil,
+      config: ConnConfig(),
+    )
+
+  proc notifyMsg(pid: int32, channel, payload: string): BackendMessage =
+    BackendMessage(
+      kind: bmkNotificationResponse,
+      notifPid: pid,
+      notifChannel: channel,
+      notifPayload: payload,
+    )
+
+  test "waitNotification raises PgStateError when waiter completes with empty queue":
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      doAssert not conn.listenTask.finished
+      let fut = conn.waitNotification()
+      doAssert not fut.finished
+      doAssert conn.notifyWaiter != nil
+      doAssert not conn.notifyWaiter.finished
+      # Simulate pump completing waiter without enqueueing (defensive branch)
+      conn.notifyWaiter.complete()
+      var raised = false
+      try:
+        discard await fut
+      except PgStateError as e:
+        doAssert "No notification available" in e.msg
+        raised = true
+      except CatchableError as e:
+        echo "unexpected error: ", e.msg, " type:", e.name
+        doAssert false
+      doAssert raised
+
+    waitFor t()
+
+  test "waitNotification early return when queue already has notification":
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.notifyQueue.addLast(Notification(pid: 42, channel: "ch", payload: "p"))
+      doAssert conn.notifyQueue.len == 1
+      let n = await conn.waitNotification()
+      doAssert n.channel == "ch"
+      doAssert n.payload == "p"
+      doAssert conn.notifyQueue.len == 0
+      # Subsequent wait with empty queue and no pump should still park;
+      # verify the defensive branch via empty complete still works
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      let waiter = conn.notifyWaiter
+      doAssert waiter != nil
+      waiter.complete()
+      var raised = false
+      try:
+        discard await fut1
+      except PgStateError as e:
+        doAssert "No notification available" in e.msg
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "waitNotification concurrent guard rejects a second caller":
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      doAssert conn.notifyWaiter != nil
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        doAssert "Another waitNotification is already active" in e.msg
+        raised = true
+      doAssert raised
+      # The parked waiter is served through the handoff, so nothing it owns is
+      # ever in the queue for a second caller to steal.
+      conn.dispatchNotification(notifyMsg(1, "ch", "p"))
+      doAssert conn.notifyQueue.len == 0
+      let n = await fut1
+      doAssert n.payload == "p"
+      doAssert conn.notifyQueue.len == 0
+      doAssert not conn.hasNotifyHandoff
+      doAssert conn.notifyWaiter == nil
+
+    waitFor t()
+
+  test "a waiter's notification survives a queue overflow":
+    # Regression: parking the waiter's notification at the head of the shared
+    # queue made it the first thing the overflow drop discarded.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.notifyMaxQueue = 2
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      let waiter = conn.notifyWaiter
+      conn.dispatchNotification(notifyMsg(1, "ch", "mine"))
+      doAssert waiter.finished
+      # Overflow the queue several times over. Whether the waiter resumed by now is
+      # backend-dependent; either way its notification was never a queue slot.
+      var maxPending = 0
+      for i in 1 .. 5:
+        conn.dispatchNotification(notifyMsg(2, "ch", "later" & $i))
+        maxPending = max(maxPending, conn.notifyQueue.len + ord(conn.hasNotifyHandoff))
+      var first: string
+      try:
+        first = (await fut1).payload
+      except PgNotifyOverflowError:
+        # Overflow is reported ahead of the notification, which stays queued.
+        first = (await conn.waitNotification()).payload
+      doAssert first == "mine", "the waiter's notification was dropped, got " & first
+      # The cap bounds arrivals into the queue; the handoff is the waiter's, and
+      # requeuing it may leave the queue one over until the next arrival trims.
+      doAssert maxPending <= 3, "cap exceeded, pending peaked at " & $maxPending
+      doAssert conn.notifyQueue.len <= 3
+
+    waitFor t()
+
+  when hasChronos:
+    test "an abandoned waiter's handoff is reclaimed, not delivered twice":
+      # The waiter is completed with its notification reserved and its frame never
+      # resumes, since nothing yields between the dispatch and the next call. The
+      # reserved notification must stay reachable to exactly one caller. Only
+      # chronos defers the continuation; asyncdispatch has no such window.
+      proc t() {.async.} =
+        var conn = mockNotifyConn()
+        let abandoned = conn.waitNotification()
+        conn.dispatchNotification(notifyMsg(1, "ch", "reserved"))
+        doAssert conn.hasNotifyHandoff
+        doAssert conn.notifyQueue.len == 0
+
+        doAssert (await conn.waitNotification()).payload == "reserved"
+        doAssert not conn.hasNotifyHandoff
+        doAssert conn.notifyQueue.len == 0
+        # The abandoned frame resumes to find the registration gone and must
+        # not hand out the same notification a second time.
+        var secondDelivery = ""
+        try:
+          secondDelivery = (await abandoned).payload
+        except PgStateError:
+          discard
+        doAssert secondDelivery == "", "delivered twice, got " & secondDelivery
+
+      waitFor t()
+
+  test "reclaiming a handoff keeps one drop-oldest policy at the cap":
+    # `requeueHandoff` deliberately does not trim, so a reclaim inherits the
+    # documented `notifyMaxQueue + 1` ceiling; the next arrival trims, oldest first.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.notifyMaxQueue = 1
+      let waiter = newFuture[void]("parkedWaiter")
+      waiter.complete()
+      conn.notifyWaiter = waiter
+      conn.notifyHandoff = Notification(pid: 1, channel: "ch", payload: "reserved")
+      conn.hasNotifyHandoff = true
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "queued"))
+
+      doAssert (await conn.waitNotification()).payload == "reserved"
+      doAssert conn.notifyQueue.len == 1
+      conn.dispatchNotification(notifyMsg(1, "ch", "next"))
+      doAssert conn.notifyQueue.len == 1
+      doAssert conn.notifyQueue[0].payload == "next"
+      doAssert conn.notifyDropped == 1
+
+    waitFor t()
+
+  test "a finished waiter's handoff is served in order, not stranded":
+    # Two regressions in one state: serving the queue before the concurrency guard
+    # returned a later notification first, and guarding on the finished waiter
+    # alone refused every later caller once its frame was abandoned.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      # The state `dispatchNotification` leaves behind between completing a
+      # waiter and that waiter's frame resuming — or never resuming.
+      let waiter = newFuture[void]("parkedWaiter")
+      waiter.complete()
+      conn.notifyWaiter = waiter
+      conn.notifyHandoff = Notification(pid: 1, channel: "ch", payload: "first")
+      conn.hasNotifyHandoff = true
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "second"))
+
+      # Reclaimed to the front of the queue, so delivery order is preserved.
+      doAssert (await conn.waitNotification()).payload == "first"
+      doAssert not conn.hasNotifyHandoff
+      doAssert conn.notifyWaiter == nil
+      doAssert (await conn.waitNotification()).payload == "second"
+      doAssert conn.notifyQueue.len == 0
+
+    waitFor t()
+
+  test "a handed notification the waiter never consumed goes back to the queue":
+    # The waiter is completed but unwinds on the overflow check, so its
+    # notification must be queued for the next caller instead of dropped.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      conn.notifyDropped = 1 # makes the post-resume overflow check raise
+      conn.dispatchNotification(notifyMsg(1, "ch", "p"))
+      var raised = false
+      try:
+        discard await fut1
+      except PgNotifyOverflowError:
+        raised = true
+      doAssert raised
+      doAssert not conn.hasNotifyHandoff
+      doAssert conn.notifyQueue.len == 1
+      doAssert (await conn.waitNotification()).payload == "p"
+
+    waitFor t()
+
+  test "listen/unlisten failing on a live pump does not fail the parked waiter":
+    # reconnectInPlace parks the pump in csConnecting, so listen() skips
+    # stopListening and checkReady() raises — but the pump's waiter must survive.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let fut = conn.waitNotification()
+      doAssert not fut.finished
+      conn.state = csConnecting # pump is mid-reconnectInPlace
+      for call in ["listen", "unlisten"]:
+        var raised = false
+        try:
+          if call == "listen":
+            await conn.listen("ch2")
+          else:
+            await conn.unlisten("ch2")
+        except PgStateError:
+          raised = true
+        doAssert raised, call & " must still reject a non-ready connection"
+        doAssert not fut.finished,
+          call & "() failing must not fail a waiter owned by a live pump"
+      # The pump comes back and the waiter is still serviceable.
+      conn.state = csListening
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p"))
+      conn.notifyWaiter.complete()
+      doAssert (await fut).payload == "p"
+
+    waitFor t()
+
+  test "stale waiter after clean stop reports Listener stopped":
+    # A cleanly released waiter keeps notifyWaiter non-nil until its own task
+    # resumes, and a caller in that window must not see a phantom concurrent use.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgStateError, "Listener stopped"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = nil # pump already gone after stopListening/close
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        doAssert "Listener stopped" in e.msg
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "stale waiter does not reject a re-listening connection":
+    # If listen() restarts the pump while a failed waiter is still registered, the
+    # connection is healthy, so a new caller must park rather than be turned away.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgStateError, "Listener stopped"))
+      conn.notifyWaiter = staleFut
+      # Fresh pump from a re-listen; mockNotifyConn's listenTask is unfinished.
+      let fut = conn.waitNotification()
+      doAssert not fut.finished
+      doAssert conn.notifyWaiter != staleFut
+      conn.notifyQueue.addLast(Notification(pid: 7, channel: "ch", payload: "p"))
+      conn.notifyWaiter.complete()
+      doAssert (await fut).payload == "p"
+      doAssert conn.notifyWaiter == nil
+
+    waitFor t()
+
+  test "backlog stays drainable after a clean stop releases the waiter":
+    # A failed waiter leaves notifyQueue unowned, so a caller draining in that
+    # window must still get the buffered notifications.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgStateError, "Listener stopped"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = nil
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p1"))
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p2"))
+      doAssert (await conn.waitNotification()).payload == "p1"
+      doAssert (await conn.waitNotification()).payload == "p2"
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        doAssert "Listener stopped" in e.msg
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "stale waiter after transport closed reports Connection is closed":
+    # Counterpart to the PgStateError stale case: with the transport gone, a fresh
+    # wait must report PgConnectionError too so reconnect loops fire.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.state = csClosed
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgConnectionError, "Connection is closed"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = newFuture[void]("listenTask")
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgConnectionError as e:
+        doAssert "Connection is closed" in e.msg
+        raised = true
+      except CatchableError as e:
+        echo "unexpected ", e.msg, " ", e.name
+        doAssert false
+      doAssert raised
+
+    waitFor t()
+
+  test "backlog not drainable after transport closed":
+    # With the transport gone, checkListenAlive fires before the queue fast path,
+    # so nothing is drained — the counterpart to the clean-stop case above.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.state = csClosed
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgConnectionError, "Connection is closed"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = newFuture[void]("listenTask")
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p1"))
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgConnectionError as e:
+        doAssert "Connection is closed" in e.msg
+        raised = true
+      doAssert raised
+      doAssert conn.notifyQueue.len == 1
+      doAssert conn.notifyQueue.peekFirst.payload == "p1"
+
+    waitFor t()
+
+suite "failNotifyWaiter state branching":
+  test "csClosed fails waiter with PgConnectionError":
+    var conn = PgConnection(
+      state: csClosed,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter()
+    check w.failed
+    var msg = ""
+    var isConnErr = false
+    try:
+      waitFor w
+    except PgConnectionError as e:
+      isConnErr = true
+      msg = e.msg
+    except CatchableError:
+      discard
+    check isConnErr
+    check "Connection is closed" in msg
+    # second call is idempotent (already failed)
+    conn.failNotifyWaiter()
+    check w.failed
+
+  test "non-closed fails waiter with PgStateError":
+    var conn = PgConnection(
+      state: csReady,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter()
+    check w.failed
+    var isStateErr = false
+    try:
+      waitFor w
+    except PgStateError as e:
+      isStateErr = true
+      check "Listener stopped" in e.msg
+    except CatchableError:
+      discard
+    check isStateErr
+    # csListening also yields PgStateError (clean stop)
+    var conn2 = PgConnection(
+      state: csListening,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w2"),
+      listenError: nil,
+    )
+    let w2 = conn2.notifyWaiter
+    conn2.failNotifyWaiter()
+    check w2.failed
+    var isStateErr2 = false
+    try:
+      waitFor w2
+    except PgStateError:
+      isStateErr2 = true
+    except CatchableError:
+      discard
+    check isStateErr2
+
+  test "closedByUser fails waiter with PgStateError, not PgConnectionError":
+    # A deliberate close() must stay out of `except PgConnectionError` reconnect
+    # loops even though the connection is already csClosed.
+    var conn = PgConnection(
+      state: csClosed,
+      closedByUser: true,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter()
+    check w.failed
+    var isStateErr = false
+    var isConnErr = false
+    try:
+      waitFor w
+    except PgStateError as e:
+      isStateErr = true
+      check "Connection closed by the application" in e.msg
+    except PgConnectionError:
+      isConnErr = true
+    except CatchableError:
+      discard
+    check isStateErr
+    check not isConnErr
+
+  test "closedByUser outranks an explicit error passed to failNotifyWaiter":
+    # `notifyListenDeath` always passes a fresh `PgListenError`; honouring it when
+    # the pump dies during `close()` would revive the reconnect loops.
+    var conn = PgConnection(
+      state: csClosed,
+      closedByUser: true,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter(
+      (ref PgListenError)(msg: "listen pump died", reconnectionAttempted: true)
+    )
+    check w.failed
+    var isStateErr = false
+    var isConnErr = false
+    try:
+      waitFor w
+    except PgStateError as e:
+      isStateErr = true
+      check "Connection closed by the application" in e.msg
+    except PgConnectionError:
+      isConnErr = true
+    except CatchableError:
+      discard
+    check isStateErr
+    check not isConnErr
+
+  test "waitNotification after close keeps reporting PgStateError":
+    # The parked-waiter relabel alone is not enough: a caller that was between
+    # iterations when close() ran asks again, and must not be told to reconnect.
+    proc t() {.async.} =
+      var conn = PgConnection(
+        state: csClosed,
+        closedByUser: true,
+        notifyQueue: initDeque[Notification](),
+        notifyDropped: 0,
+        notifyWaiter: nil,
+        listenError: nil,
+      )
+      var isStateErr = false
+      var isConnErr = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        isStateErr = true
+        doAssert "Connection closed by the application" in e.msg
+      except PgConnectionError:
+        isConnErr = true
+      except CatchableError:
+        discard
+      doAssert isStateErr
+      doAssert not isConnErr
+
+    waitFor t()
+
+  test "explicit err overrides the state mapping":
+    # `notifyListenDeath` hands the waiter a fresh PgListenError this way.
+    var conn = PgConnection(
+      state: csClosed,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter(
+      (ref PgListenError)(msg: "pump died", reconnectionAttempted: true)
+    )
+    check w.failed
+    var isListenErr = false
+    try:
+      waitFor w
+    except PgListenError as e:
+      isListenErr = true
+      check e.reconnectionAttempted
+      check "pump died" in e.msg
+    except CatchableError:
+      discard
+    check isListenErr
+
+  test "nil waiter does not raise":
+    var conn = PgConnection(state: csClosed, notifyWaiter: nil)
+    conn.failNotifyWaiter()
+    check conn.notifyWaiter == nil
+
+  test "already completed waiter is not failed":
+    var conn = PgConnection(state: csClosed, notifyWaiter: newFuture[void]("w"))
+    let w = conn.notifyWaiter
+    w.complete()
+    check w.finished and not w.failed
+    conn.failNotifyWaiter()
+    check w.finished and not w.failed
+    check not w.failed
+
+  test "already failed waiter is not failed again":
+    var conn = PgConnection(state: csReady, notifyWaiter: newFuture[void]("w"))
+    let w = conn.notifyWaiter
+    w.fail(newException(PgStateError, "already"))
+    check w.failed
+    conn.state = csClosed
+    conn.failNotifyWaiter()
+    var msg = ""
+    try:
+      waitFor w
+    except PgStateError as e:
+      msg = e.msg
+    except CatchableError:
+      discard
+    # original failure must survive, not overwritten with PgConnectionError
+    check "already" in msg
+
+suite "checkReady during the close window":
+  ## Regression: `checkReady` returned early on `csReady` and so never reached
+  ## `checkNotClosed`. `close()` sets `closedByUser` before its first suspension
+  ## while the state is still `csReady`, so for the whole close window a query
+  ## was admitted, interleaved with Terminate on the wire and failed as a raw
+  ## transport error — feeding the very reconnect loop the flag keeps it out of.
+
+  test "closedByUser is rejected while the state is still csReady":
+    var conn = PgConnection(state: csReady, closedByUser: true)
+    var isStateErr = false
+    var msg = ""
+    try:
+      conn.checkReady()
+    except PgStateError as e:
+      isStateErr = true
+      msg = e.msg
+    except CatchableError:
+      discard
+    check isStateErr
+    check msg == closedByUserMsg
+
+  test "a connection the application did not close still passes":
+    var conn = PgConnection(state: csReady)
+    var passed = false
+    try:
+      conn.checkReady()
+      passed = true
+    except CatchableError:
+      discard
+    check passed
+
+suite "transport failures fold into the PgError contract":
+  ## Backend transport exceptions (chronos `AsyncStreamError`, asyncdispatch
+  ## `OSError`/`SslError`) are not under `PgError`, so every read/write path
+  ## routes its failure through `raiseTransportFailure`.
+  proc foldingConn(closedByUser: bool): PgConnection =
+    result = PgConnection(state: csClosed, config: ConnConfig())
+    result.closedByUser = closedByUser
+
+  test "a raw backend error becomes PgConnectionError with the original parent":
+    let conn = foldingConn(false)
+    let raw = newException(OSError, "connection reset by peer")
+    var caught: ref PgConnectionError
+    try:
+      conn.raiseTransportFailure("fillRecvBuf", raw)
+    except PgConnectionError as e:
+      caught = e
+    check caught != nil
+    check "fillRecvBuf" in caught.msg
+    check "connection reset by peer" in caught.msg
+    check caught.parent == raw
+
+  test "an error already on contract is re-raised unchanged":
+    let conn = foldingConn(false)
+    let onContract = newException(PgProtocolError, "desynchronised")
+    var caught: ref CatchableError
+    try:
+      conn.raiseTransportFailure("nextMessage", onContract)
+    except CatchableError as e:
+      caught = e
+    check caught == onContract
+
+  test "closedByUser reports PgStateError, not a connection failure":
+    let conn = foldingConn(true)
+    let raw = newException(OSError, "broken pipe")
+    var isState = false
+    var isConnFailure = true
+    try:
+      conn.raiseTransportFailure("sendMsg", raw)
+    except CatchableError as e:
+      isState = e of PgStateError
+      isConnFailure = e of PgConnectionError
+    check isState
+    check not isConnFailure

@@ -436,7 +436,7 @@ suite "E2E: Physical Replication":
       var raised = false
       try:
         await conn.sendCopyData(@[byte('x')])
-      except PgConnectionError:
+      except PgStateError:
         raised = true
       doAssert raised
       await conn.close()

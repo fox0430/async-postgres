@@ -187,18 +187,27 @@ suite "TLS handshake failure path":
       let ms = startMockServer()
       startSslProbe(ms, closeAfterReply = true)
       var msg = ""
+      # Catch broadly and assert the type: a raw AsyncStreamError must fail the
+      # assertion, not skip closeServer and leak the mock server.
       try:
-        let conn = await connect(testConfig(ms.port, sslRequire))
-        await conn.close()
-      except CatchableError as e:
-        msg = e.msg
-      await closeServer(ms)
+        try:
+          let conn = await connect(testConfig(ms.port, sslRequire))
+          await conn.close()
+        except CatchableError as e:
+          doAssert e of PgConnectionError
+          msg = e.msg
+      finally:
+        await closeServer(ms)
       msg
 
     let msg = waitFor runTest()
     check msg.len > 0
+    # `connect` folds every per-host failure into PgConnectionError, so the type
+    # says nothing here; only the wording checked below rules out a leak.
     when hasAsyncDispatch:
       check "closed by peer" in msg
+    elif hasChronos:
+      check "TLS handshake failed" in msg
 
 suite "direct SSL: ALPN enforcement":
   proc ephemeralPort(): int =

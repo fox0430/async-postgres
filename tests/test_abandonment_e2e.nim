@@ -8,7 +8,7 @@
 ## transitioned to `csClosed` as appropriate, so pools never recycle a
 ## broken connection.
 
-import std/[unittest, importutils]
+import std/[unittest, importutils, strutils]
 
 import ../async_postgres/[async_backend, pg_client, pg_types]
 import ../async_postgres/pg_connection {.all.}
@@ -65,18 +65,57 @@ suite "E2E: Cursor lifecycle invariants":
 
     waitFor t()
 
-  test "fetchNext after conn.close() raises PgConnectionError, not SIGSEGV":
+  test "fetchNext after conn.close() raises PgStateError, not SIGSEGV":
+    # The application closed this connection itself, so `PgStateError` keeps the
+    # fetch out of `except PgConnectionError` reconnect loops.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let cursor =
         await conn.openCursor("SELECT i FROM generate_series(1, 100) i", chunkSize = 10)
       await conn.close()
       var raised = false
+      var isConnErr = false
       try:
         discard await cursor.fetchNext()
-      except PgConnectionError:
+      except PgStateError:
         raised = true
-      doAssert raised, "fetchNext after close must raise PgConnectionError"
+      except PgConnectionError:
+        isConnErr = true
+      doAssert raised, "fetchNext after close must raise PgStateError"
+      doAssert not isConnErr,
+        "a deliberate close must not look like a connection failure"
+
+    waitFor t()
+
+  test "query / exec / simpleQuery / listen after close() raise PgStateError":
+    # Regression: every entry point but `waitNotification` went through
+    # `checkReady`, which knew nothing of the close and raised `PgConnectionError`.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      await conn.close()
+
+      var stateErrors = 0
+      var connErrors = 0
+      template expectDeliberateClose(body: untyped) =
+        try:
+          body
+          doAssert false, "an operation on a closed connection must raise"
+        except PgStateError as e:
+          doAssert "closed by the application" in e.msg, "unexpected message: " & e.msg
+          inc stateErrors
+        except PgConnectionError:
+          inc connErrors
+
+      expectDeliberateClose:
+        discard await conn.query("SELECT 1")
+      expectDeliberateClose:
+        discard await conn.exec("SELECT 1")
+      expectDeliberateClose:
+        discard await conn.simpleQuery("SELECT 1")
+      expectDeliberateClose:
+        await conn.listen("abandonment_closed_ch")
+      doAssert stateErrors == 4, "expected 4 PgStateError, got " & $stateErrors
+      doAssert connErrors == 0, "no entry point may report a reconnectable failure"
 
     waitFor t()
 

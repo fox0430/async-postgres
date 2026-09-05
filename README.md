@@ -110,7 +110,11 @@ waitFor main()
 
 - **Connection pool (`PgPool` / `PgPoolCluster`)** — broken connections are detected and discarded automatically. On `acquire`, entries whose state is not `csReady` (or that fail the optional `ping` health check) are retired and replaced. On `release`, connections left in a non-ready or in-transaction state are also closed rather than returned to the idle queue. Configure `healthCheckTimeout` / `pingTimeout` to tune idle-connection probing.
 - **Direct `PgConnection`** — no automatic reconnection for regular queries. Per-query retry would be unsafe for non-idempotent statements and in-flight transactions, so a closed connection must be replaced by calling `connect(...)` again (or by using the pool). Inspect `conn.isConnected()` or `conn.state` to decide whether a handle is still usable.
-- **LISTEN/NOTIFY** — this is the one exception. The listen pump reconnects with exponential backoff (up to 10 attempts, 30 s cap) and re-subscribes to all channels. Register a `reconnectCallback` if you need to resynchronise application state after a reconnect. If reconnection is ultimately exhausted the pump gives up permanently: pull-API callers see the failure raised from `waitNotification`, and push-API callers (`onNotify`) should register `onListenError` to be told the pump is gone.
+- **LISTEN/NOTIFY** — this is the one exception. The listen pump reconnects with exponential backoff (up to 10 attempts, 30 s cap) and re-subscribes to all channels. Register a `reconnectCallback` if you need to resynchronise application state after a reconnect. If reconnection is ultimately exhausted the pump gives up permanently. The failure surfaces as one of two types, chosen by what the recovery is:
+  - `PgListenError` (a `PgConnectionError`) — the connection itself is gone; recover by re-dialling with `connect(...)`.
+  - `PgListenStoppedError` (a `PgStateError`, deliberately *not* a `PgConnectionError`) — the pump died but the transport is still usable; recover by calling `listen` again. A reconnect-on-`PgConnectionError` loop must not re-dial here, which is why this type sits outside that hierarchy.
+
+  Pull-API callers see either type raised from `waitNotification`, so catch both (or `PgError`) rather than `PgListenError` alone. Push-API callers (`onNotify`) should register `onListenError`, which always reports a `PgListenError`; its `transportAlive` field is true for the death the pull API reports as `PgListenStoppedError`.
 
 ## Async Backend
 

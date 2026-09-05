@@ -734,6 +734,32 @@ suite "invalidateAbandonedStream":
     conn.invalidateAbandonedStream()
     check conn.state == csClosed
 
+suite "checkReplicating during the close window":
+  # close() sets closedByUser and only reaches csClosed after its first
+  # suspension, so a mid-stream op in that window still sees csReplicating.
+  proc mkReplConn(closedByUser: bool): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: csReplicating,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      closedByUser: closedByUser,
+    )
+
+  test "closedByUser is rejected while the state is still csReplicating":
+    let conn = mkReplConn(closedByUser = true)
+    expect(PgStateError):
+      discard conn.confirmFlushed(parseLsn("0/1"))
+
+  test "a stream the application did not close still passes":
+    let conn = mkReplConn(closedByUser = false)
+    # Reaches the clamp instead of raising; nothing was received, so no advance.
+    check not conn.confirmFlushed(parseLsn("0/1"))
+
+  test "confirmedFlushLsn reports InvalidLsn inside the close window":
+    check mkReplConn(closedByUser = true).confirmedFlushLsn == InvalidLsn
+
 suite "decodeCreateSlotRow":
   proc buildDataRowBody(values: openArray[string]): seq[byte] =
     result.addInt16(int16(values.len))

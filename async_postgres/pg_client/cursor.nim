@@ -143,8 +143,7 @@ proc openCursorImpl(
 
 proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   let conn = cursor.conn
-  if conn.state == csClosed:
-    raise newException(PgConnectionError, "Connection is closed")
+  conn.checkNotClosed()
   let rd = newRowData(int16(cursor.fields.len), cursor.colFormats, cursor.colTypeOids)
   rd.fields = cursor.fields
   var rowCount: int32 = 0
@@ -215,9 +214,10 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Fetch the next chunk of rows from the cursor.
   ## Returns an empty seq when the cursor is exhausted.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## A closed connection raises ``PgStateError`` after a deliberate ``close()``,
+  ## ``PgConnectionError`` after a lost one.
   let conn = cursor.conn
-  if conn.state == csClosed:
-    raise newException(PgConnectionError, "Connection is closed")
+  conn.checkNotClosed()
   if cursor.bufferedCount > 0:
     result = newSeq[Row](cursor.bufferedCount)
     for i in 0 ..< cursor.bufferedCount:
@@ -246,11 +246,13 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
   # left the protocol out of sync) is `csClosed`. Sending Close/Sync on it would
   # write to a corrupted stream, and promoting it back to `csReady` on
   # ReadyForQuery below would let `releaseCore` hand the broken socket to the next
-  # borrower. Leave the connection retired. (`csClosed` only: a `fetchNext` query
+  # borrower. Leave the connection retired. (Closed only: a `fetchNext` query
   # error drains cleanly to `csReady`, where the portal still needs closing.)
+  # `closedReason` covers `close()` too, which latches `closedByUser` before its
+  # first suspension and only reaches `csClosed` after it.
   # Still mark the cursor exhausted so a stray `fetchNext` after `close` short-
   # circuits to `@[]` instead of writing to the corrupted socket.
-  if conn.state == csClosed:
+  if conn.closedReason != crOpen:
     cursor.exhausted = true
     return
 
@@ -322,6 +324,8 @@ proc openCursor*(
 ): Future[Cursor] {.async.} =
   ## Open a server-side cursor for streaming rows in chunks.
   ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## Raises ``PgStateError`` / ``PgConnectionError`` on a closed connection as
+  ## `fetchNext` does.
   let (oids, formats, values) = extractParams(params)
   let resultFormats = resultFormat.toFormatCodes()
   awaitOrInvalidate(

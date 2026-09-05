@@ -322,7 +322,7 @@ suite "sendCopyData public API":
       let conn = await connect(mockConfig(ms.port))
       try:
         await conn.sendCopyData(@[byte('x')])
-      except PgConnectionError:
+      except PgStateError:
         {.cast(gcsafe).}:
           capturedRaised = true
       await conn.close()

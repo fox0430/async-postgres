@@ -117,6 +117,21 @@ type
     ## with no channels left to re-subscribe).
     reconnectionAttempted*: bool
       ## True if the pump attempted reconnection before giving up.
+    transportAlive*: bool
+      ## True when the pump died but the transport is still up. The pull API
+      ## raises ``PgListenStoppedError`` for that case instead.
+
+  PgListenStoppedError* = object of PgStateError
+    ## Listen pump gone from a connection that is still usable: call ``listen``
+    ## again to recover. Deliberately **not** a ``PgConnectionError``, so a
+    ## reconnect loop will not re-dial a live connection. Raised by
+    ## ``waitNotification``; the push API reports the same death as a
+    ## ``PgListenError`` with ``transportAlive``.
+    reconnectionAttempted*: bool
+      ## True if the pump attempted reconnection before giving up.
+    transportAlive*: bool
+      ## Always true here — the type is only raised for a live transport. Kept
+      ## so a caller reading the field need not special-case which error it got.
 
 template newPoolError*(
     errKind: PoolErrorKind, message: string, parentErr: ref Exception = nil

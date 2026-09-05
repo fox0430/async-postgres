@@ -267,10 +267,15 @@ proc reportCloseError(
     except Defect:
       discard
 
-proc tracedClose(pool: PgPool, conn: PgConnection) {.async.} =
+proc tracedClose(pool: PgPool, conn: PgConnection, byUser: bool = false) {.async.} =
   ## Close `conn`, reporting any close error via `reportCloseError`.
+  ##
+  ## `byUser` says *why* the pool closes it, not whether a shutdown is running:
+  ## only `pool.close()` tearing down its own idle connections is the
+  ## application's close. Evictions and discards stay the pool's decision, so a
+  ## holder of the handle still gets a `PgConnectionError` and reconnects.
   try:
-    await conn.close()
+    await conn.closeImpl(byUser)
   except CatchableError as e:
     pool.reportCloseError(conn, e)
 
@@ -291,11 +296,11 @@ proc pruneBackgroundTasks(pool: PgPool) =
       inc i
   pool.pendingBackgroundTasks.setLen(n)
 
-proc closeNoWait(pool: PgPool, conn: PgConnection) =
+proc closeNoWait(pool: PgPool, conn: PgConnection, byUser: bool = false) =
   ## Schedule connection close without waiting. For use in non-async contexts
   ## (e.g. `release()` is synchronous). The spawned task is tracked in
   ## `pool.pendingBackgroundTasks` so `pool.close()` can await its completion
-  ## for graceful shutdown.
+  ## for graceful shutdown. `byUser` as in `tracedClose`.
   ##
   ## Note on asyncdispatch: a close scheduled here may race with an inflight
   ## request future that the previous timeout could not cancel (see
@@ -305,7 +310,7 @@ proc closeNoWait(pool: PgPool, conn: PgConnection) =
   ## is not reused either way.
   pool.metrics.closeCount.inc
   proc doClose() {.async.} =
-    await pool.tracedClose(conn)
+    await pool.tracedClose(conn, byUser)
 
   pool.pruneBackgroundTasks()
   let fut = doClose()
@@ -703,11 +708,14 @@ proc releaseCore(
   ## Core release logic shared by the traced and non-traced paths of
   ## `releaseImpl`. Returns flags describing the disposition of `conn` so
   ## the caller can report them to the tracer.
-  if pool.closed or conn.state != csReady or conn.txStatus != tsIdle or
-      conn.sessionLockDirty:
+  # Only a healthy borrow the *application* hands back counts as its own
+  # `pool.close()`; a discard or internal release stays a `PgConnectionError`.
+  let discarded =
+    conn.state != csReady or conn.txStatus != tsIdle or conn.sessionLockDirty
+  if pool.closed or discarded:
     if pool.active > 0:
       pool.active.dec
-    pool.closeNoWait(conn)
+    pool.closeNoWait(conn, byUser = conn.borrowedByUser and not discarded)
     # A discarded conn frees an `active` slot without serving a waiter;
     # spawn a replacement so the head waiter is not stranded.
     pool.respawnForStrandedWaiter()
@@ -726,6 +734,8 @@ proc releaseCore(
 
 proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## Implementation of `release(conn)`; called once the owning pool is known.
+  ## `conn.borrowedByUser` decides whether a close during shutdown counts as the
+  ## application's (see `releaseCore`), so no call site can get it wrong.
   ## Returns the connection to the pool. If the connection is broken or in
   ## a transaction, it is closed instead. If waiters are queued, the
   ## connection is handed directly to the next waiter.
@@ -833,6 +843,17 @@ proc release*(conn: PgConnection) =
     )
   PgPool(conn.ownerPool).releaseImpl(conn)
 
+proc releaseReclaimed*(conn: PgConnection) =
+  ## Internal (exported for `pg_pool_cluster`): return a connection the *pool*
+  ## reclaimed — an acquire abandoned by a timeout whose late future still
+  ## delivered one. The application never took delivery, so the borrow is
+  ## demoted before the release and a close taken during shutdown stays a
+  ## `PgConnectionError`.
+  if conn.ownerPool == nil:
+    raise newException(PgError, "releaseReclaimed() called on a standalone connection")
+  conn.borrowedByUser = false
+  PgPool(conn.ownerPool).releaseImpl(conn)
+
 proc release*(h: PooledConnHandle) =
   ## Return the borrowed connection to its pool. Idempotent — safe to call
   ## twice (e.g. once explicitly and once via `defer`).
@@ -880,7 +901,9 @@ proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
   ## 0 after failing waiters, and a chronos waiter whose inner future was already
   ## cancelled before close() ran may still reach this cleanup afterwards.
   if waiter.fut.completed():
-    waiter.fut.read().release()
+    # Not `release()`: the pool is returning its own handoff, not the
+    # application giving the connection back.
+    waiter.fut.read().releaseReclaimed()
   elif waiter.fut.failed():
     discard # failLastWaiter/close already decremented; no conn was delivered
   else:
@@ -1032,7 +1055,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
                       try:
                         let orphan = fut.read()
                         if orphan != nil:
-                          await orphan.close()
+                          await orphan.closeImpl(byUser = false)
                       except CatchableError:
                         discard
                   )()
@@ -1135,16 +1158,14 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       pool.settleAbandonedWaiter(waiter)
       raise e
 
-proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
-  ## Acquire a connection from the pool. Tries idle connections first (with
-  ## health checks), creates a new one if under `maxSize`, or waits for a
-  ## release. Raises `PgPoolError` on every failure mode: acquire timeout,
-  ## pool closed, waiter queue full, or a failed connect attempt — for
-  ## connect failures the underlying error (e.g. `PgConnectionError`) is
-  ## preserved as the `parent` of the raised `PgPoolError`. Use the `kind`
-  ## field (`PoolErrorKind`) to distinguish the failure mode programmatically.
+proc acquireCommon(pool: PgPool, byUser: bool): Future[PgConnection] {.async.} =
+  ## Shared body of `acquire` and `acquireInternal`: run `acquireImpl` under
+  ## the pool-acquire tracing span and stamp the borrower on the connection.
   if pool.config.tracer == nil:
     let ar = await pool.acquireImpl()
+    # Assigned, not merely left alone: a reused connection still carries the
+    # flag from whoever borrowed it last.
+    ar.conn.borrowedByUser = byUser
     return ar.conn
 
   var ar: AcquireResult
@@ -1159,7 +1180,24 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
     TracePoolAcquireEndData(conn: ar.conn, wasCreated: ar.wasCreated),
   ):
     ar = await pool.acquireImpl()
+  ar.conn.borrowedByUser = byUser
   return ar.conn
+
+proc acquireInternal(pool: PgPool): Future[PgConnection] {.async.} =
+  ## `acquire` for the pool's own convenience methods. The application never
+  ## sees this connection, so a close taken on it during shutdown stays a
+  ## `PgConnectionError` (see `releaseCore`).
+  return await pool.acquireCommon(byUser = false)
+
+proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
+  ## Acquire a connection from the pool. Tries idle connections first (with
+  ## health checks), creates a new one if under `maxSize`, or waits for a
+  ## release. Raises `PgPoolError` on every failure mode: acquire timeout,
+  ## pool closed, waiter queue full, or a failed connect attempt — for
+  ## connect failures the underlying error (e.g. `PgConnectionError`) is
+  ## preserved as the `parent` of the raised `PgPoolError`. Use the `kind`
+  ## field (`PoolErrorKind`) to distinguish the failure mode programmatically.
+  return await pool.acquireCommon(byUser = true)
 
 proc acquireHandle*(pool: PgPool): Future[PooledConnHandle] {.async.} =
   ## Acquire a connection wrapped in a `PooledConnHandle`. Equivalent to
@@ -1468,7 +1506,7 @@ proc dispatchHomogeneous(
   if ops.len == 1:
     let op = ops[0]
     try:
-      let conn = await pool.acquire()
+      let conn = await pool.acquireInternal()
       # asyncdispatch-safe release: capture the body error and release outside
       # `finally`, so a failing release can't mask it.
       var bodyErr: ref CatchableError = nil
@@ -1532,7 +1570,7 @@ proc dispatchHomogeneous(
   let nConns = min(ops.len, max(1, maxConns))
   for i in 0 ..< nConns:
     try:
-      let conn = await pool.acquire()
+      let conn = await pool.acquireInternal()
       conns.add(conn)
     except CatchableError as e:
       acquireErr = e
@@ -1663,7 +1701,7 @@ proc exec*(
     )
     pool.scheduleDispatch()
     return await fut
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.exec(sql, params, timeout = timeout))
 
 proc exec*(
@@ -1691,7 +1729,7 @@ proc exec*(
     )
     pool.scheduleDispatch()
     return await fut
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.exec(sql, params, timeout = timeout))
 
 proc query*(
@@ -1725,7 +1763,7 @@ proc query*(
     )
     pool.scheduleDispatch()
     return await fut
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   )
@@ -1757,7 +1795,7 @@ proc query*(
     )
     pool.scheduleDispatch()
     return await fut
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
   )
@@ -1775,7 +1813,7 @@ proc queryEach*(
   ## Row lifetime: the `Row` passed to `callback` is only valid for the
   ## duration of that single invocation. To retain a row beyond the callback,
   ## call `row.clone()` to get a detached copy.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.queryEach(sql, params, callback, resultFormat, timeout)
   )
@@ -1788,7 +1826,7 @@ proc queryRowOpt*(
     timeout: Duration = ZeroDuration,
 ): Future[Option[Row]] {.async.} =
   ## Execute a query and return the first row, or `none` if no rows.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return
     await pool.runAndRelease(conn, conn.queryRowOpt(sql, params, resultFormat, timeout))
 
@@ -1801,7 +1839,7 @@ proc queryRow*(
 ): Future[Row] {.async.} =
   ## Execute a query and return the first row.
   ## Raises `PgNoRowsError` if no rows are returned.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return
     await pool.runAndRelease(conn, conn.queryRow(sql, params, resultFormat, timeout))
 
@@ -1813,7 +1851,7 @@ proc queryValue*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.queryValue(sql, params, timeout))
 
 proc queryValue*[T](
@@ -1825,7 +1863,7 @@ proc queryValue*[T](
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Raises `PgNoRowsError` if no rows are returned, or `PgNullError` if the value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.queryValue(T, sql, params, timeout))
 
 proc queryValueOpt*(
@@ -1836,7 +1874,7 @@ proc queryValueOpt*(
 ): Future[Option[string]] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `none` if no rows or the value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.queryValueOpt(sql, params, timeout))
 
 proc queryValueOpt*[T](
@@ -1848,7 +1886,7 @@ proc queryValueOpt*[T](
 ): Future[Option[T]] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `none` if no rows or the value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.queryValueOpt(T, sql, params, timeout))
 
 proc queryValueOrDefault*(
@@ -1860,7 +1898,7 @@ proc queryValueOrDefault*(
 ): Future[string] {.async.} =
   ## Execute a query and return the first column of the first row as a string.
   ## Returns `default` if no rows or the value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.queryValueOrDefault(sql, params, default, timeout)
   )
@@ -1875,7 +1913,7 @@ proc queryValueOrDefault*[T](
 ): Future[T] {.async.} =
   ## Execute a query and return the first column of the first row as `T`.
   ## Returns `default` if no rows or the value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.queryValueOrDefault(T, sql, params, default, timeout)
   )
@@ -1890,7 +1928,7 @@ proc queryValueOrDefault*[T](
   ## Execute a query and return the first column of the first row as `T`,
   ## inferring `T` from `default`.
   ## Returns `default` if no rows or the value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.queryValueOrDefault(sql, params, default, timeout)
   )
@@ -1902,7 +1940,7 @@ proc queryExists*(
     timeout: Duration = ZeroDuration,
 ): Future[bool] {.async.} =
   ## Execute a query and return whether any rows exist.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.queryExists(sql, params, timeout))
 
 proc queryColumn*(
@@ -1913,7 +1951,7 @@ proc queryColumn*(
 ): Future[seq[string]] {.async.} =
   ## Execute a query and return the first column of all rows as strings.
   ## Raises `PgNullError` if any value is NULL.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.queryColumn(sql, params, timeout))
 
 proc simpleQuery*(
@@ -1922,7 +1960,7 @@ proc simpleQuery*(
   ## Execute one or more SQL statements via the simple query protocol using a
   ## pooled connection. See ``PgConnection.simpleQuery`` for semantics —
   ## multi-statement, no parameters, no plan cache.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.simpleQuery(sql, timeout))
 
 proc simpleExec*(
@@ -1931,7 +1969,7 @@ proc simpleExec*(
   ## Execute a side-effect SQL command via the simple query protocol using a
   ## pooled connection. See ``PgConnection.simpleExec`` for semantics — no
   ## parameters, no plan cache, last command tag returned.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.simpleExec(sql, timeout))
 
 proc execInTransaction*(
@@ -1941,7 +1979,7 @@ proc execInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with typed parameters.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.execInTransaction(sql, params, timeout))
 
 proc execInTransaction*(
@@ -1953,7 +1991,7 @@ proc execInTransaction*(
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with options
   ## (isolation / access mode / deferrable) applied to the BEGIN.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return
     await pool.runAndRelease(conn, conn.execInTransaction(sql, params, opts, timeout))
 
@@ -1965,7 +2003,7 @@ proc queryInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined transaction with typed parameters.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.queryInTransaction(sql, params, resultFormat, timeout)
   )
@@ -1980,7 +2018,7 @@ proc queryInTransaction*(
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined transaction with options
   ## (isolation / access mode / deferrable) applied to the BEGIN.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.queryInTransaction(sql, params, opts, resultFormat, timeout)
   )
@@ -1992,7 +2030,7 @@ proc notify*(
     timeout: Duration = ZeroDuration,
 ): Future[void] {.async.} =
   ## Send a NOTIFY on `channel` with optional `payload` using a pooled connection.
-  let conn = await pool.acquire()
+  let conn = await pool.acquireInternal()
   await pool.runAndRelease(conn, conn.notify(channel, payload, timeout))
 
 macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
@@ -2632,14 +2670,14 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   while pool.idle.len > 0:
     let pc = pool.idle.popFirst()
     pool.metrics.closeCount.inc
-    closeFuts.add(pool.tracedClose(pc.conn))
+    closeFuts.add(pool.tracedClose(pc.conn, byUser = true))
   await allFutures(closeFuts)
 
   # Yield once after closing idle connections and before draining background
   # tasks, but only when a borrow is still outstanding. A conn handed off to a
   # waiter on the same tick its acquire was abandoned leaves that acquire's
   # continuation scheduled but not yet resumed, so the loops above can't see it;
-  # when it runs it does settleAbandonedWaiter -> release() -> closeNoWait,
+  # when it runs it does settleAbandonedWaiter -> releaseReclaimed() -> closeNoWait,
   # pushing a fresh Terminate task. A yield lets that continuation enqueue the
   # task before the drain below rather than after close() returns.
   #
