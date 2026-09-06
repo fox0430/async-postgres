@@ -578,7 +578,8 @@ proc identifySystem*(
 ): Future[SystemInfo] {.async.} =
   ## Execute ``IDENTIFY_SYSTEM`` and return system identification info.
   ##
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   let results = await conn.simpleQuery("IDENTIFY_SYSTEM", timeout)
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "IDENTIFY_SYSTEM returned no results")
@@ -625,7 +626,8 @@ proc createReplicationSlot*(
 ): Future[ReplicationSlotInfo] {.async.} =
   ## Create a logical replication slot. Returns slot info including the consistent point LSN.
   ##
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var sql = "CREATE_REPLICATION_SLOT " & quoteIdentifier(slotName)
   if temporary:
     sql.add(" TEMPORARY")
@@ -644,7 +646,8 @@ proc dropReplicationSlot*(
 ): Future[void] {.async.} =
   ## Drop a replication slot.
   ##
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var sql = "DROP_REPLICATION_SLOT " & quoteIdentifier(slotName)
   if wait:
     sql.add(" WAIT")
@@ -655,7 +658,8 @@ proc readReplicationSlot*(
 ): Future[ReplicationSlotInfo] {.async.} =
   ## Read information about an existing replication slot.
   ##
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   let results = await conn.simpleQuery(
     "READ_REPLICATION_SLOT " & quoteIdentifier(slotName), timeout
   )
@@ -993,7 +997,7 @@ proc invalidateAbandonedStream(conn: PgConnection) =
   ## the raiser did not mark ``csClosed``) or ``csReplicating`` state (torn down
   ## mid-stream), the stranded cases, are changed here.
   if conn.state in {csBusy, csReplicating}:
-    conn.state = csClosed
+    conn.markClosed()
 
 proc runReplicationStream(
     conn: PgConnection,
@@ -1020,13 +1024,13 @@ proc runReplicationStream(
         let msg = opt.get
         case msg.kind
         of bmkCopyBothResponse:
-          conn.state = csReplicating
+          conn.markState(csReplicating)
           break waitCopyBoth
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          conn.markReady()
           if queryError != nil:
             raise queryError
           raise newException(
@@ -1074,7 +1078,7 @@ proc runReplicationStream(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          conn.markReady()
           if queryError != nil:
             raise queryError
           return
@@ -1103,7 +1107,7 @@ proc runReplicationStream(
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
           conn.txStatus = msg.txStatus
-          conn.state = csReady
+          conn.markReady()
           if queryError != nil:
             raise queryError
           break drainLoop
@@ -1194,7 +1198,7 @@ proc startReplication*(
     sql.add(")")
 
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
   await runReplicationStream(
     conn, startLsn, autoKeepaliveReply, statusInterval, callback, "replication"
@@ -1246,7 +1250,7 @@ proc startPhysicalReplication*(
     sql.add(" TIMELINE " & $timeline)
 
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
   await runReplicationStream(
     conn, startLsn, autoKeepaliveReply, statusInterval, callback, "physical replication"

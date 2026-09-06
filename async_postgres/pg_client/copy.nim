@@ -43,7 +43,7 @@ proc drainToReady(conn: PgConnection) {.async.} =
         if pumpMsg.kind == bmkReadyForQuery:
           conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
-            conn.state = csReady
+            conn.markReady()
           break drainLoop
       await conn.fillRecvBuf()
 
@@ -87,14 +87,14 @@ proc abortCopyWatch(conn: PgConnection, watch: RecvWatch) =
   ## await / recvBuf access may run before unwinding. `cancel` is a no-op when the
   ## watch read has already been consumed.
   watch.cancel()
-  conn.state = csClosed
+  conn.markClosed()
 
 proc copyInRawImpl(
     conn: PgConnection, sql: string, data: seq[byte]
 ): Future[string] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
 
   var commandTag = ""
@@ -269,7 +269,7 @@ proc copyInStreamImpl(
 ): Future[CopyInInfo] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
 
   var info = CopyInInfo()
@@ -403,10 +403,10 @@ proc copyInStreamImpl(
     except CancelledError as e:
       # Cancellation tears the operation down: invalidate and propagate it rather
       # than masking it with the callback error.
-      conn.state = csClosed
+      conn.markClosed()
       raise e
     except CatchableError:
-      conn.state = csClosed
+      conn.markClosed()
       raise callbackError
     raise callbackError
   else:
@@ -475,7 +475,8 @@ proc copyInStream*(
   ## the server's ``PgQueryError`` is then raised. Detection is best-effort —
   ## an error arriving mid-batch only surfaces after the current batch — so a
   ## doomed COPY is bounded by one batch of extra streaming, not the whole input.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ##
   ## A statement that is not ``COPY ... FROM STDIN`` raises ``PgQueryError``
   ## instead of silently succeeding without pulling from ``callback``.
@@ -500,7 +501,7 @@ proc copyInStream*(
 proc copyOutImpl(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
 
   var cr = CopyResult()
@@ -523,7 +524,7 @@ proc copyOutImpl(conn: PgConnection, sql: string): Future[CopyResult] {.async.} 
         await conn.sendMsg(encodeCopyFail("COPY OUT got a COPY FROM STDIN statement"))
       except CatchableError as e:
         # CopyFail undelivered: protocol out of sync, invalidate.
-        conn.state = csClosed
+        conn.markClosed()
         raise e
     of bmkCopyData:
       cr.data.add(move(pumpMsg.copyData))
@@ -553,7 +554,8 @@ proc copyOut*(
 ): Future[CopyResult] {.async.} =
   ## Execute COPY ... TO STDOUT via simple query protocol.
   ## Collects all CopyData messages and returns them in a CopyResult.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ##
   ## A statement that is not ``COPY ... TO STDOUT`` raises ``PgQueryError``;
   ## a ``COPY ... FROM STDIN`` statement is aborted with CopyFail instead of
@@ -575,7 +577,7 @@ proc copyOutStreamImpl(
 ): Future[CopyOutInfo] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
 
   var info = CopyOutInfo()
@@ -598,7 +600,7 @@ proc copyOutStreamImpl(
         await conn.sendMsg(encodeCopyFail("COPY OUT got a COPY FROM STDIN statement"))
       except CatchableError as e:
         # CopyFail undelivered: protocol out of sync, invalidate.
-        conn.state = csClosed
+        conn.markClosed()
         raise e
     of bmkCopyData:
       if queryError != nil:
@@ -612,7 +614,7 @@ proc copyOutStreamImpl(
         # mid-stream so the protocol is out of sync — invalidate the
         # connection (the next caller must reconnect rather than see a
         # misleading busy state) and propagate the cancellation as-is.
-        conn.state = csClosed
+        conn.markClosed()
         raise e
       except CatchableError as e:
         # The callback raised. Drain remaining messages until ReadyForQuery
@@ -661,7 +663,8 @@ proc copyOutStream*(
   ## an early chunk of a large COPY can mean draining a substantial amount of
   ## data before the error surfaces — cancel the query out-of-band (`cancel`)
   ## if you need to abort a large COPY OUT promptly. On timeout the connection
-  ## is instead marked csClosed (protocol out of sync).
+  ## is retired (csClosed) unless the wire had settled (asyncdispatch always
+  ## retires: the timed-out op stays on the socket).
   ##
   ## A statement that is not ``COPY ... TO STDOUT`` raises ``PgQueryError``
   ## without invoking ``callback``; ``COPY ... FROM STDIN`` is aborted with

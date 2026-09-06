@@ -263,7 +263,7 @@ proc connectToHost*(
     if config.applicationName.len > 0:
       startupParams.add(("application_name", config.applicationName))
     await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))
-    conn.state = csAuthentication
+    conn.markState(csAuthentication)
 
     # Authentication loop
     var
@@ -403,7 +403,7 @@ proc connectToHost*(
             conn.secretKey = msg.backendSecretKey
           of bmkReadyForQuery:
             conn.txStatus = msg.txStatus
-            conn.state = csReady
+            conn.markReady()
             break readyLoop
           of bmkErrorResponse:
             raise newException(PgConnectionError, formatError(msg.errorFields))
@@ -454,7 +454,8 @@ proc closeImpl*(conn: PgConnection, byUser: bool): Future[void] {.async.} =
       await conn.sendMsg(encodeTerminate())
     except CatchableError:
       discard
-  conn.state = csClosed
+  conn.markClosed()
+  conn.resetWireState()
   conn.heldSessionLocks = 0
   conn.sessionLockDirty = false
   conn.failNotifyWaiter() # `closedByUser` maps it to PgStateError

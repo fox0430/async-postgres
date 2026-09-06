@@ -257,6 +257,20 @@ type
     recvBuf*: seq[byte]
     recvBufStart*: int ## Read pointer into recvBuf; bytes before this are consumed
     state*: PgConnState
+    pendingSyncs*: int
+      ## ``ReadyForQuery`` replies the backend still owes: one per simple
+      ## ``Query`` and per ``Sync`` written, less one per reply read. A count,
+      ## not a flag: a pipelined batch owes several. Read via ``wireSettled``.
+    unsyncedWrite*: bool
+      ## Replies were asked for past the last sync point, so nothing on the
+      ## wire will end them (an extended-query batch stopping at ``Flush``, as
+      ## every cursor round trip does). Only a later write carrying a sync
+      ## point clears it — a reply owed for an earlier one says nothing about
+      ## requests written after it.
+      ##
+      ## Both are separate from ``state``: the read path marks ``csClosed`` as
+      ## soon as a read dies, while the requests it was reading for are still
+      ## running server-side and are what a ``CancelRequest`` must abort.
     pid*: int32
     secretKey*: int32
     serverParams*: Table[string, string]
@@ -271,6 +285,16 @@ type
     listenChannels*: HashSet[string]
     borrowedByUser*: bool
       ## Handed to the application (not a pool-internal borrow); see ``release``.
+    stagedStmtCloses*: seq[string]
+      ## Names taken out of ``pendingStmtCloses`` by a build that wrote their
+      ## ``Close`` into its buffer. Held until that send succeeds, so an
+      ## aborted build leaves them owed rather than lost.
+    when defined(pgStateChecks):
+      sendBufStaged*: bool
+        ## Debug-only: a build has staged its ``Close`` messages and the send
+        ## that clears them has not run yet. See ``requireStaged``.
+    transportCloseFut*: Future[void]
+      ## In-flight ``closeTransport``; a second teardown awaits it.
     listenTask*: Future[void]
     listenStopRequested*: bool
       ## Set by `stopListening` or `close()` to ask the background pump to exit.
@@ -327,9 +351,10 @@ type
       ## with the operation that evicted them. Populated when the defensive
       ## eviction loop in ``addStmtCache`` fires (caller skipped the
       ## pre-eviction step, or ``stmtCacheCapacity`` was shrunk below the
-      ## current cache size). Flushed by ``flushPendingStmtCloses`` at the
+      ## current cache size). Staged by ``stagePendingStmtCloses`` at the
       ## start of the next Extended Query send phase so the leak is bounded
-      ## to the gap until the next operation.
+      ## to the gap until the next operation, which moves them to
+      ## ``stagedStmtCloses``.
     heldSessionLocks*: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
       ## API, minus tracked releases. Reported (best-effort) by the
@@ -992,6 +1017,83 @@ template withTracing*(
     raise e
   if tracer != nil and tracer.endHook != nil:
     tracer.endHook(traceCtx, endDataExpr)
+
+# Connection state transitions
+
+func wireSettled*(conn: PgConnection): bool {.inline.} =
+  ## True when the backend owes nothing: every request written has been
+  ## answered to its ``ReadyForQuery``, so the stream is parked on a message
+  ## boundary and the connection is safe to hand to someone else.
+  ##
+  ## Sole reader of the two fields behind it, so no caller can settle for the
+  ## half of the question that suits it.
+  conn.pendingSyncs == 0 and not conn.unsyncedWrite
+
+when defined(pgStateChecks):
+  proc checkBorrowable*(conn: PgConnection) {.raises: [].} =
+    ## Debug-only guard on what a borrower finding ``csReady`` assumes, compiled
+    ## in with ``-d:pgStateChecks`` (the test suite; see ``tests/config.nims``).
+    ##
+    ## Checked at ``checkReady`` — where the assumption is used — not where the
+    ## connection was handed back: a frame may leave the wire in a shape it
+    ## cleans up itself, and only ``csReady`` promises anything to the next
+    ## borrower. ``invalidateWire`` asks ``wireSettled`` before handing a
+    ## connection back; this asserts it on the path that never asks — an
+    ## operation that finished normally.
+    doAssert conn.wireSettled,
+      "csReady with " & $conn.pendingSyncs & " reply(s) owed and unsyncedWrite=" &
+        $conn.unsyncedWrite & ": the next read would land mid-reply"
+
+proc markState*(conn: PgConnection, next: PgConnState) {.inline, raises: [].} =
+  ## Sole writer of ``state``, the field every reuse decision reads. Use
+  ## ``markReady`` / ``markBusy`` / ``markClosed`` for the query path; this one
+  ## is for the states a single owner drives (``csConnecting``,
+  ## ``csAuthentication``, ``csListening``, ``csReplicating``).
+  conn.state = next
+
+proc markReady*(conn: PgConnection) {.inline, raises: [].} =
+  ## Give the connection back: no operation owns the wire any more. See
+  ## ``checkBorrowable`` for what the next borrower assumes.
+  conn.markState(csReady)
+
+proc markBusy*(conn: PgConnection) {.inline, raises: [].} =
+  ## Take the wire for one operation. Held until that operation reads its last
+  ## reply (``markReady``) or dies on the wire (``markClosed``).
+  conn.markState(csBusy)
+
+proc markClosed*(conn: PgConnection) {.inline, raises: [].} =
+  ## Retire the connection: the wire is unusable, whether the transport is torn
+  ## down yet or not.
+  conn.markState(csClosed)
+
+# Staged statement-close bookkeeping
+#
+# Only a completed send licenses forgetting the staged names. Staging and
+# sending sit in different procs (different files for the direct macros), so
+# the pairing cannot be a lexical scope; these three make it checkable.
+
+proc markStaged*(conn: PgConnection) {.inline, raises: [].} =
+  ## A build staged its queued ``Close`` messages into the bytes about to go out.
+  when defined(pgStateChecks):
+    conn.sendBufStaged = true
+
+proc requireStaged*(conn: PgConnection, what: string) {.inline, raises: [].} =
+  ## Reject `what` when nothing was staged for it: dropping names whose
+  ## ``Close`` was never written leaks those statements for the session, and
+  ## does so silently.
+  when defined(pgStateChecks):
+    doAssert conn.sendBufStaged,
+      what & " with no staging behind it: " &
+        "the queued statement Closes were never written"
+
+proc clearStaged*(conn: PgConnection) {.inline, raises: [].} =
+  ## The staged bytes went out and their names have been forgotten.
+  ##
+  ## Only the drop disarms; abandoning the queue (``clearStmtCache``) leaves it
+  ## armed, so a later drop still finds an empty staged list rather than
+  ## tripping this guard.
+  when defined(pgStateChecks):
+    conn.sendBufStaged = false
 
 func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
   ## Why unusable (``crClosedByUser`` outranks ``crClosed``).

@@ -218,6 +218,28 @@ suite "E2E: Pipeline error recovery":
 
     waitFor t()
 
+  test "executeIsolated: a timeout mid-batch retires the connection":
+    # Per-op SYNC means the batch owes one ReadyForQuery per op, and op 1's
+    # reply arriving does not make op 2's abandonable: its replies are still
+    # on the wire. Handing the connection back here would let the next
+    # borrower read op 2's ParseComplete/RowDescription as its own.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p = conn.newPipeline()
+      p.addQuery("SELECT 1")
+      p.addQuery("SELECT pg_sleep(5)")
+      p.addQuery("SELECT 2")
+      var timedOut = false
+      try:
+        discard await p.executeIsolated(timeout = milliseconds(300))
+      except PgConnectionError as e:
+        timedOut = e of ref PgTimeoutError
+      doAssert timedOut, "the batch must time out as a PgConnectionError"
+      doAssert conn.state == csClosed, $conn.state
+      await conn.close()
+
+    waitFor t()
+
 # COPY OUT timeout
 
 suite "E2E: COPY OUT timeout / stall":

@@ -200,8 +200,8 @@ proc fillRecvBuf*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Read into recvBuf. ``AsyncTimeoutError``: caller handles state; other errors → ``csClosed`` + ``raiseTransportFailure``.
-  # An orphaned pump can revive here after `invalidateOnTimeout` set csClosed;
-  # refuse a socket read on a connection we've given up on.
+  # An orphaned pump can revive here after a timeout or cancellation handler
+  # retired the connection; refuse a socket read on one we've given up on.
   if conn.state == csClosed:
     conn.raiseClosedConnection("fillRecvBuf: connection is closed (csClosed)")
   conn.compactRecvBuf()
@@ -224,15 +224,15 @@ proc fillRecvBuf*(
       # csClosed as for any other failure: the read may have consumed bytes, so
       # the stream is no longer parseable. Only the exception type is preserved.
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
+      conn.markClosed()
       raise e
     except CatchableError as e:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
+      conn.markClosed()
       conn.raiseTransportFailure("fillRecvBuf", e)
     if n == 0:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
+      conn.markClosed()
       conn.raiseClosedConnection("Connection closed by server")
     # An orphan read settling after csClosed must not re-extend the buffer.
     if conn.state == csClosed:
@@ -241,8 +241,9 @@ proc fillRecvBuf*(
     conn.recvBuf.setLen(oldLen + n)
   elif hasAsyncDispatch:
     # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
-    # into `recvBuf[oldLen..]` after we truncate. Safe because `invalidateOnTimeout`
-    # marks csClosed (no further extender) and seq shrink keeps capacity.
+    # into `recvBuf[oldLen..]` after we truncate. Safe because `recvMessage`, the
+    # only caller that passes a timeout, marks csClosed itself before any later
+    # read can be issued, and seq shrink keeps capacity.
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + RecvBufSize)
     var n: int
@@ -261,15 +262,15 @@ proc fillRecvBuf*(
       # csClosed as for any other failure: the read may have consumed bytes, so
       # the stream is no longer parseable. Only the exception type is preserved.
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
+      conn.markClosed()
       raise e
     except CatchableError as e:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
+      conn.markClosed()
       conn.raiseTransportFailure("fillRecvBuf", e)
     if n == 0:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
+      conn.markClosed()
       conn.raiseClosedConnection("Connection closed by server")
     # An orphan `recvInto` settling after csClosed must not re-extend the buffer.
     if conn.state == csClosed:
@@ -289,13 +290,13 @@ when hasChronos:
       try:
         await conn.reader.readOnce(addr conn.replReadScratch[0], RecvBufSize)
       except CancelledError as e:
-        conn.state = csClosed
+        conn.markClosed()
         raise e
       except CatchableError as e:
-        conn.state = csClosed
+        conn.markClosed()
         conn.raiseTransportFailure("fillRecvBufDetached", e)
     if n == 0:
-      conn.state = csClosed
+      conn.markClosed()
       conn.raiseClosedConnection("Connection closed by server")
     # Exit guard: a read settling after the caller flipped csClosed must not
     # re-extend recvBuf.
@@ -332,7 +333,7 @@ proc nextMessage*(
           skipDataRow = skipDataRow and rowData == nil and onRow == nil,
         )
       except PgProtocolError as e:
-        conn.state = csClosed
+        conn.markClosed()
         raise e
     if res.state == psIncomplete:
       return none(BackendMessage)
@@ -373,6 +374,13 @@ proc nextMessage*(
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
+    if res.message.kind == bmkReadyForQuery:
+      # Counts down rather than clearing: a batch of per-op `Sync`s owes one
+      # reply each. `unsyncedWrite` is untouched — this reply belongs to a sync
+      # point that preceded those writes, so only a later one (in `noteWrite`)
+      # can end them.
+      if conn.pendingSyncs > 0:
+        dec conn.pendingSyncs
     return some(res.message)
 
 proc recvMessage*(
@@ -389,7 +397,9 @@ proc recvMessage*(
     try:
       await conn.fillRecvBuf(timeout)
     except AsyncTimeoutError as e:
-      conn.state = csClosed
+      # Load-bearing: on asyncdispatch the timed-out read stays orphaned in
+      # `recvBuf`, and csClosed is what stops a later read re-extending it.
+      conn.markClosed()
       raise e
 
 template pumpUntilReady*(
@@ -417,7 +427,7 @@ template pumpUntilReady*(
         elif pumpMsg.kind == bmkReadyForQuery:
           conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
-            conn.state = csReady
+            conn.markReady()
           readyBody
           if queryError != nil:
             raise queryError
@@ -447,7 +457,7 @@ template pumpUntilReady*(
         elif pumpMsg.kind == bmkReadyForQuery:
           conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
-            conn.state = csReady
+            conn.markReady()
           readyBody
           if queryError != nil:
             raise queryError
@@ -472,7 +482,7 @@ template pumpUntilReady*(
         elif pumpMsg.kind == bmkReadyForQuery:
           conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
-            conn.state = csReady
+            conn.markReady()
           readyBody
           if queryError != nil:
             raise queryError
@@ -525,92 +535,165 @@ proc cancel*(w: RecvWatch) =
       )
   w.fut = nil
 
+proc noteWrite(conn: PgConnection, data: openArray[byte]) {.inline.} =
+  ## Book what these bytes leave the backend owing. Before the write, not
+  ## after: a failed or cancelled write may still have reached the wire, and a
+  ## ``CancelRequest`` at an idle backend is a harmless no-op.
+  let owed = outstandingReplies(data)
+  conn.pendingSyncs += owed.syncPoints
+  if owed.syncPoints > 0:
+    # A sync point ends every request written before it, so only what follows
+    # the last one stays unended.
+    conn.unsyncedWrite = owed.unsynced
+  elif owed.unsynced:
+    conn.unsyncedWrite = true
+
+proc resetWireState*(conn: PgConnection) =
+  ## Forget what the wire's previous life left behind: the buffered bytes on
+  ## both sides and the replies the old backend owed.
+  ##
+  ## Sole owner of that reset: a stale count carried onto a fresh backend would
+  ## dial a ``CancelRequest`` at an unrelated PID and retire a healthy
+  ## connection.
+  conn.recvBuf.setLen(0)
+  conn.recvBufStart = 0
+  conn.sendBuf.setLen(0)
+  conn.pendingSyncs = 0
+  conn.unsyncedWrite = false
+
 # Send helpers
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
-  ## Send raw bytes; failure → ``csClosed``.
+  ## Send raw bytes; failure → ``csClosed``. Books what they leave owed first;
+  ## see ``noteWrite``.
+  conn.noteWrite(data)
   when hasChronos:
     try:
       await conn.writer.write(data)
     except CancelledError as e:
-      conn.state = csClosed
+      conn.markClosed()
       raise e
     except CatchableError as e:
-      conn.state = csClosed
+      conn.markClosed()
       conn.raiseTransportFailure("sendMsg", e)
   elif hasAsyncDispatch:
     if data.len > 0:
       try:
         await conn.socket.sendRawBytes(data)
       except CancelledError as e:
-        conn.state = csClosed
+        conn.markClosed()
         raise e
       except CatchableError as e:
-        conn.state = csClosed
+        conn.markClosed()
         conn.raiseTransportFailure("sendMsg", e)
 
 proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
   ## Send ``sendBuf`` (copied; safe to mutate after call); failure → ``csClosed``.
+  ## Books what the buffer leaves owed; see ``sendMsg``.
+  conn.noteWrite(conn.sendBuf)
   when hasChronos:
     if conn.sendBuf.len > 0:
       try:
         await conn.writer.write(conn.sendBuf)
       except CancelledError as e:
-        conn.state = csClosed
+        conn.markClosed()
         raise e
       except CatchableError as e:
-        conn.state = csClosed
+        conn.markClosed()
         conn.raiseTransportFailure("sendBufMsg", e)
   elif hasAsyncDispatch:
     if conn.sendBuf.len > 0:
       try:
         await conn.socket.sendRawBytes(conn.sendBuf)
       except CancelledError as e:
-        conn.state = csClosed
+        conn.markClosed()
         raise e
       except CatchableError as e:
-        conn.state = csClosed
+        conn.markClosed()
         conn.raiseTransportFailure("sendBufMsg", e)
 
 # Transport teardown
 
-proc closeTransport*(conn: PgConnection) {.async.} =
-  ## Close transport resources without sending Terminate.
+proc closeTransportImpl(conn: PgConnection) {.async.} =
+  ## One teardown pass. Entered once per connection at a time; see
+  ## `closeTransport`.
   when hasChronos:
-    if conn.tlsStream != nil:
+    # Every handle is detached before the first suspension: layer-by-layer
+    # detaching let a racing teardown close the base transport under this
+    # frame's still-running TLS close. `reader`/`writer` go with them, or
+    # `isConnected()` reports healthy while `peekSocket` sees no transport.
+    let tls = conn.tlsStream
+    let baseReader = conn.baseReader
+    let baseWriter = conn.baseWriter
+    let transport = conn.transport
+    conn.tlsStream = nil
+    conn.baseReader = nil
+    conn.baseWriter = nil
+    conn.transport = nil
+    conn.reader = nil
+    conn.writer = nil
+    if tls != nil:
       try:
-        await conn.tlsStream.reader.closeWait()
+        await tls.reader.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTlsReader, e)
       try:
-        await conn.tlsStream.writer.closeWait()
+        await tls.writer.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTlsWriter, e)
-      conn.tlsStream = nil
-    if conn.baseReader != nil:
+    if baseReader != nil:
       try:
-        await conn.baseReader.closeWait()
+        await baseReader.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsBaseReader, e)
+    if baseWriter != nil:
       try:
-        await conn.baseWriter.closeWait()
+        await baseWriter.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsBaseWriter, e)
-      conn.baseReader = nil
-      conn.baseWriter = nil
-    if conn.transport != nil:
+    if transport != nil:
       try:
-        await conn.transport.closeWait()
+        await transport.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTransport, e)
-      conn.transport = nil
-    # Drop the cached reader/writer aliases so isConnected() reports false.
-    conn.reader = nil
-    conn.writer = nil
   elif hasAsyncDispatch:
     if not conn.socket.isNil:
-      conn.socket.close()
+      let socket = conn.socket
       conn.socket = nil
+      socket.close()
+
+proc closeTransport*(conn: PgConnection) {.async.} =
+  ## Close transport resources without sending Terminate.
+  ##
+  ## Re-entrant: a racing second teardown awaits the first rather than
+  ## returning early on the already-detached handles, so a resolved `close()`
+  ## still means the fd and the backend session are released.
+  let inFlight = conn.transportCloseFut
+  if inFlight != nil and not inFlight.finished:
+    # `noCancel` and swallowed: this caller neither started nor cancelled the
+    # teardown, so it must not inherit its outcome.
+    try:
+      when hasChronos:
+        await noCancel inFlight
+      else:
+        await inFlight
+    except CatchableError:
+      discard
+    return
+  let fut = conn.closeTransportImpl()
+  conn.transportCloseFut = fut
+  # `noCancel` on the owner too: the handles are detached before the first
+  # suspension, so a cancelled teardown would strand the only references to
+  # them and leak the fd for the process lifetime.
+  when hasChronos:
+    await noCancel fut
+  else:
+    await fut
+  # Released once finished: the guard above only cares about a running
+  # teardown, and a connection that reconnects in place must not carry the
+  # finished frame of the transport before last.
+  if conn.transportCloseFut == fut:
+    conn.transportCloseFut = nil
 
 # Liveness probes
 

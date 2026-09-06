@@ -5,7 +5,7 @@
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, simple_query]
+import ../pg_connection/[types, buffer_io, cache, simple_query]
 import ./core
 
 proc queryInTransactionImpl(
@@ -29,7 +29,7 @@ proc queryInTransactionImpl(
   validateEncodedParams(params, formats.len, resultFormats.len, stmtNameLen = 0)
 
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
-  conn.sendBuf.setLen(0)
+  conn.beginSendBuf()
   # BEGIN
   conn.sendBuf.addParse("", beginSql)
   conn.sendBuf.addBind("", "", @[], @[])
@@ -45,8 +45,8 @@ proc queryInTransactionImpl(
   conn.sendBuf.addExecute("", 0)
   # Single Sync
   conn.sendBuf.addSync()
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   var phase = 0
@@ -118,7 +118,8 @@ proc execInTransaction*(
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined BEGIN/COMMIT transaction (1 round trip).
   ## On error, ROLLBACK is issued automatically.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var tag: string
   withConnTracing(
     conn,
@@ -175,7 +176,8 @@ proc queryInTransaction*(
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined BEGIN/COMMIT transaction (1 round trip).
   ## Returns rows. On error, ROLLBACK is issued automatically.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var qr: QueryResult
   withConnTracing(
     conn,
