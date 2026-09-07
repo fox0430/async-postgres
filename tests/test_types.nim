@@ -419,6 +419,43 @@ suite "Row accessors":
     expect PgTypeError:
       discard row.getInt16(0)
 
+  # The negative tests above are all text; the binary integer tests are all
+  # positive. Binary is what the server sends once a statement is cached.
+
+  test "getInt16 binary int2 negative":
+    for v in [-1'i16, -12345'i16, low(int16), high(int16), 0'i16]:
+      let row = mkRow(@[some(@(toBE16(v)))], @[mkField(OidInt2, 1'i16)])
+      check row.getInt16(0) == v
+
+  test "getInt binary int4 negative":
+    for v in [-1'i32, -70000'i32, low(int32), high(int32), 0'i32]:
+      let row = mkRow(@[some(@(toBE32(v)))], @[mkField(OidInt4, 1'i16)])
+      check row.getInt(0) == v
+
+  test "getInt binary int2 negative promotion":
+    for v in [-1'i16, low(int16)]:
+      let row = mkRow(@[some(@(toBE16(v)))], @[mkField(OidInt2, 1'i16)])
+      check row.getInt(0) == int32(v)
+
+  test "getInt64 binary int8 negative":
+    for v in [-1'i64, -5_000_000_000'i64, low(int64), high(int64), 0'i64]:
+      let row = mkRow(@[some(@(toBE64(v)))], @[mkField(OidInt8, 1'i16)])
+      check row.getInt64(0) == v
+
+  test "getInt64 binary int4/int2 negative promotion":
+    let i4 = mkRow(@[some(@(toBE32(-7'i32)))], @[mkField(OidInt4, 1'i16)])
+    check i4.getInt64(0) == -7'i64
+    let i2 = mkRow(@[some(@(toBE16(-7'i16)))], @[mkField(OidInt2, 1'i16)])
+    check i2.getInt64(0) == -7'i64
+
+  test "getStr binary integers negative":
+    let i2 = mkRow(@[some(@(toBE16(-1'i16)))], @[mkField(OidInt2, 1'i16)])
+    check i2.getStr(0) == "-1"
+    let i4 = mkRow(@[some(@(toBE32(low(int32))))], @[mkField(OidInt4, 1'i16)])
+    check i4.getStr(0) == $low(int32)
+    let i8 = mkRow(@[some(@(toBE64(-1'i64)))], @[mkField(OidInt8, 1'i16)])
+    check i8.getStr(0) == "-1"
+
   test "getFloat32":
     let row = @[some(toBytes("2.5"))]
     check abs(row.getFloat32(0) - 2.5'f32) < 1e-6
