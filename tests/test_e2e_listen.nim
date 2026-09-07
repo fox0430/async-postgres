@@ -52,7 +52,7 @@ suite "E2E: Notice Callback":
       let conn = await connect(plainConfig())
 
       var received: seq[Notice]
-      conn.noticeCallback = proc(n: Notice) {.gcsafe, raises: [].} =
+      conn.onNotice proc(n: Notice) {.gcsafe, raises: [].} =
         received.add(n)
 
       discard await conn.exec("DO $$ BEGIN RAISE NOTICE 'hello from notice'; END $$")
@@ -649,7 +649,7 @@ suite "E2E: Notification Buffering":
 
       listener.notifyMaxQueue = 2
       var cbDropped = 0
-      listener.notifyOverflowCallback = proc(dropped: int) {.gcsafe, raises: [].} =
+      listener.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
         cbDropped += dropped
 
       await listener.listen("buf_cb")
@@ -805,7 +805,7 @@ when hasChronos:
         let listener = await connect(plainConfig())
 
         var reconnected = false
-        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+        listener.onReconnect proc() {.gcsafe, raises: [].} =
           reconnected = true
 
         await listener.listen("reconn_cb")
@@ -898,7 +898,7 @@ when hasChronos:
         listener.listenReconnectMaxBackoff = 1
 
         var reconnected = false
-        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+        listener.onReconnect proc() {.gcsafe, raises: [].} =
           reconnected = true
 
         await listener.listen("reconn_custom")
@@ -928,7 +928,7 @@ when hasChronos:
         listener.listenReconnectMaxBackoff = 1
 
         var reconnected = false
-        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+        listener.onReconnect proc() {.gcsafe, raises: [].} =
           reconnected = true
 
         await listener.listen("reconn_unlimited")

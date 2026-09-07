@@ -16,6 +16,9 @@ import ../async_postgres/pg_connection {.all.}
 
 import mock_pg_server
 
+import std/importutils
+privateAccess(PgConnection)
+
 when hasChronos:
   from std/times import cpuTime
 

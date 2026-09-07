@@ -13,8 +13,9 @@
 ##   trust anchors written to a temp file and `SSL_get_peer_certificate` used
 ##   for channel binding.
 ##
-## Internal: not re-exported through `pg_connection.nim`; import this module
-## directly.
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[net, strutils]
 import ../[async_backend, pg_errors, pg_protocol, pg_types]
@@ -43,6 +44,9 @@ elif hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
     import std/[dynlib, openssl, tempfiles, os]
+
+import std/importutils
+privateAccess(PgConnection)
 
 when hasTls:
   const PgAlpnProtocol = "postgresql"
@@ -286,12 +290,12 @@ when hasAsyncDispatch and defined(ssl):
           host,
       )
 
-proc validateDirectSslCompatible*(config: ConnConfig) {.raises: [PgConnectionError].} =
+proc validateDirectSslCompatible*(config: ConnConfig) {.raises: [PgConfigError].} =
   ## Reject ``sslnegotiation=direct`` with weak ``sslmode``.
   if config.sslNegotiation == sslnDirect and
       config.sslMode notin {sslRequire, sslVerifyCa, sslVerifyFull}:
     raise newException(
-      PgConnectionError,
+      PgConfigError,
       "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
     )
 
@@ -331,7 +335,8 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     conn.baseWriter = newAsyncStreamWriter(conn.transport)
 
     # BearSSL matches only dNSName SAN; reject IP-literal hosts up front
-    # (asyncdispatch handles them via set1_ip_asc).
+    # (asyncdispatch handles them via set1_ip_asc). Per host entry, not the
+    # shared config: another entry may verify fine, so it folds per host.
     if config.sslMode == sslVerifyFull and isIpLiteralHost(sslHost):
       raise newException(
         PgConnectionError,
@@ -358,6 +363,16 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         sslHost
       else:
         sniName(sslHost, config.sslSni)
+    # BearSSL copies serverName into a fixed 256-byte buffer, so a longer name
+    # fails br_ssl_client_reset. Per host entry, not the shared config: it folds
+    # like the IP-literal rejection above.
+    if TLSFlags.NoVerifyServerName notin flags and serverName.len >= 256:
+      raise newException(
+        PgConnectionError,
+        "host name (" & $serverName.len &
+          " bytes) exceeds the 255-byte limit of the chronos/BearSSL backend",
+      )
+
     # newTLSClientAsyncStream stores these on TLSAsyncStream
     # (clientCertificate/clientPrivateKey) so BearSSL keeps a valid reference
     # for the lifetime of conn.tlsStream — no extra retention on PgConnection
@@ -369,9 +384,10 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         clientCert = TLSCertificate.init(config.sslCert)
         clientKey = TLSPrivateKey.init(config.sslKey)
       except TLSStreamProtocolError as e:
-        raise newException(
-          PgConnectionError, "Failed to load client certificate/key: " & e.msg
-        )
+        # Config-supplied PEM that will not decode is a config fault, same call
+        # as `parseTrustAnchors`.
+        raise
+          newException(PgConfigError, "Failed to load client certificate/key: " & e.msg)
 
     # Advertise ALPN on every TLS connection (libpq 17 parity: SSL_set_alpn_protos
     # is called unconditionally); enforcement stays direct-only below.
@@ -408,8 +424,13 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     except TLSStreamInitError as e:
       # Covers cert/key decode failures newTLSClientAsyncStream performs itself
       # (e.g. getSignerAlgo), which the TLSCertificate.init wrapping above misses.
-      raise
-        newException(PgConnectionError, "Failed to initialise TLS stream: " & e.msg, e)
+      # With no client cert in play there is no config-supplied input left to
+      # blame, so it stays a per-connection fault instead of latching the pool.
+      if clientCert.isNil:
+        raise newException(
+          PgConnectionError, "Failed to initialise TLS stream: " & e.msg, e
+        )
+      raise newException(PgConfigError, "Failed to initialise TLS stream: " & e.msg, e)
     installX509Capture(
       conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
     )
@@ -522,10 +543,10 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
               raise
                 newException(IOError, "Client certificate and private key do not match")
         except CatchableError as e:
+          # Every input here comes from the config, so a load failure is a
+          # config fault, matching the chronos backend.
           raise newException(
-            PgConnectionError,
-            "Failed to load client certificate/key or CA: " & e.msg,
-            e,
+            PgConfigError, "Failed to load client certificate/key or CA: " & e.msg, e
           )
 
         # newContext has now copied the PEM bytes into the SslContext (OpenSSL
@@ -605,22 +626,22 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
   # `validateClientCertConfig` also runs at the connect-time chokepoint in
   # `wrapped()` (lifecycle.nim), but is re-invoked here so direct callers of
   # `negotiateSSL` cannot bypass the mTLS pairing check — otherwise chronos
-  # would silently drop a lone `sslCert` while asyncdispatch errors out.
-  try:
-    validateClientCertConfig(config)
-  except PgError as e:
-    raise newException(PgConnectionError, e.msg, e)
+  # would silently drop a lone `sslCert` while asyncdispatch errors out. Its
+  # `PgConfigError` is left as is, so a direct caller sees the type `connect`
+  # raises.
+  validateClientCertConfig(config)
   validateDirectSslCompatible(config)
   if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:
     # Both backends silently fall back to a Web PKI store (chronos:
     # MozillaTrustAnchors, std/net: OS CA bundle) — for verify-ca that also
     # skips hostname checks, so any publicly-issued cert MITMs. Fail closed.
     raise newException(
-      PgConnectionError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
+      PgConfigError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
     )
   if config.sslMode == sslVerifyFull and sslHost.len == 0:
     # hostaddr without host: there is no name to match the certificate
-    # against (libpq raises the same way).
+    # against (libpq raises the same way). Per host entry, not the shared
+    # config, so it folds into the per-host aggregate.
     raise newException(
       PgConnectionError, "A host name must be specified for a verified SSL connection"
     )

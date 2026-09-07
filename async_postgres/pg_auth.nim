@@ -90,7 +90,7 @@ proc scramClientFirstMessage*(
   state.channelBindingData = cbData
   result = toBytes(state.gs2Header & state.clientFirstBare)
 
-proc scramClientFirstMessage*(
+proc scramClientFirstMessage(
     user: string,
     nonce: string,
     state: var ScramState,

@@ -21,6 +21,9 @@ import async_backend, pg_protocol, pg_connection, pg_types
 import pg_connection/[types, dsn, buffer_io, simple_query, lifecycle]
 import pg_types/encoding
 
+import std/importutils
+privateAccess(PgConnection)
+
 type
   Lsn* = distinct uint64
     ## LSN (Log Sequence Number)

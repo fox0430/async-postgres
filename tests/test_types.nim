@@ -5169,10 +5169,10 @@ suite "Range toPgBinaryParam":
     check p.format == 1'i16
     let data = p.value.get
     # flags byte
-    check (data[0] and rangeHasLower) != 0
-    check (data[0] and rangeHasUpper) != 0
-    check (data[0] and rangeLowerInc) != 0
-    check (data[0] and rangeUpperInc) == 0
+    check (data[0] and rangeLbInf) == 0
+    check (data[0] and rangeUbInf) == 0
+    check (data[0] and rangeLbInc) != 0
+    check (data[0] and rangeUbInc) == 0
     # lower: len(4) + int32(4)
     check fromBE32(data.toOpenArray(1, 4)) == 4'i32 # length
     check fromBE32(data.toOpenArray(5, 8)) == 1'i32 # value
@@ -5188,14 +5188,55 @@ suite "Range toPgBinaryParam":
   test "unbounded lower int4range binary":
     let p = toPgBinaryParam(rangeTo[int32](10'i32))
     let data = p.value.get
-    check (data[0] and rangeHasLower) == 0
-    check (data[0] and rangeHasUpper) != 0
+    check (data[0] and rangeLbInf) != 0
+    check (data[0] and rangeUbInf) == 0
 
   test "unbounded upper int4range binary":
     let p = toPgBinaryParam(rangeFrom[int32](5'i32))
     let data = p.value.get
-    check (data[0] and rangeHasLower) != 0
-    check (data[0] and rangeHasUpper) == 0
+    check (data[0] and rangeLbInf) == 0
+    check (data[0] and rangeUbInf) != 0
+
+suite "Range flag bits match PostgreSQL's rangetypes.h":
+  ## A round trip through our own encoder and decoder stays green for any
+  ## self-consistent bit assignment, which is how an incompatible one survived:
+  ## the bits only matter against a real server. Pin the literal values.
+
+  test "the constants are the values PostgreSQL defines":
+    check rangeEmpty == 0x01'u8
+    check rangeLbInc == 0x02'u8
+    check rangeUbInc == 0x04'u8
+    check rangeLbInf == 0x08'u8
+    check rangeUbInf == 0x10'u8
+    check rangeContainEmpty == 0x80'u8
+
+  test "`[1,10)` sends LB_INC alone":
+    let data = toPgBinaryParam(rangeOf(1'i32, 10'i32)).value.get
+    check data[0] == 0x02'u8
+
+  test "`[1,10]` sends LB_INC and UB_INC":
+    let data = toPgBinaryParam(rangeOf(1'i32, 10'i32, upperInc = true)).value.get
+    check data[0] == 0x06'u8
+
+  test "an absent bound is spelled as its infinity bit, not as a missing one":
+    check toPgBinaryParam(rangeTo[int32](10'i32)).value.get[0] == 0x08'u8
+    check toPgBinaryParam(rangeFrom[int32](5'i32)).value.get[0] == 0x12'u8
+    check toPgBinaryParam(unboundedRange[int32]()).value.get[0] == 0x18'u8
+
+  test "an infinite bound carries no inclusivity bit":
+    # PostgreSQL clears LB_INC/UB_INC for an infinite bound; setting both would
+    # make the server read a bound that was never written.
+    check (
+      toPgBinaryParam(rangeFrom[int32](5'i32, inclusive = true)).value.get[0] and
+      rangeUbInc
+    ) == 0
+    check (
+      toPgBinaryParam(rangeTo[int32](10'i32, inclusive = true)).value.get[0] and
+      rangeLbInc
+    ) == 0
+
+  test "an empty range sends the EMPTY bit alone":
+    check toPgBinaryParam(emptyRange[int32]()).value.get == @[0x01'u8]
 
 suite "Range binary decoding (roundtrip)":
   test "int4range roundtrip":
@@ -5290,7 +5331,7 @@ suite "Range binary decoding rejects malformed bLen":
   # matches the type's element size instead of blindly slicing a hardcoded
   # window, which would spill into adjacent bytes on malicious/corrupt input.
   test "int4range rejects short lower bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(2'i32)) # bogus: int4 must be 4 bytes
     data.add([0'u8, 0])
     data.add(toBE32(4'i32))
@@ -5299,7 +5340,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeInt4RangeBinary(data)
 
   test "int4range rejects oversized upper bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(4'i32))
     data.add(toBE32(1'i32))
     data.add(toBE32(8'i32)) # bogus: int4 must be 4 bytes
@@ -5308,7 +5349,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeInt4RangeBinary(data)
 
   test "int8range rejects wrong bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(4'i32)) # bogus: int8 must be 8 bytes
     data.add(toBE32(1'i32))
     data.add(toBE32(8'i32))
@@ -5317,7 +5358,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeInt8RangeBinary(data)
 
   test "tsrange rejects wrong bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(4'i32)) # bogus: timestamp must be 8 bytes
     data.add(toBE32(0'i32))
     data.add(toBE32(8'i32))
@@ -5326,7 +5367,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeTsRangeBinary(data)
 
   test "daterange rejects wrong bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(8'i32)) # bogus: date must be 4 bytes
     data.add(toBE64(0'i64))
     data.add(toBE32(4'i32))
@@ -6925,25 +6966,23 @@ suite "PgBit":
     check data[0 .. 3] == @[0'u8, 0, 0, 3]
     check data[4] == 0b10100000'u8
 
-  test "toPgBinaryParam PgBit rejects negative nbits":
-    let b = PgBit(nbits: -1, data: @[0'u8])
+  # The invariant holds by construction: `initPgBit` is the only way to build a
+  # PgBit, so it is rejected before a value exists rather than at encode time.
+  test "initPgBit rejects negative nbits":
     expect PgTypeError:
-      discard toPgBinaryParam(b)
+      discard initPgBit(-1, @[0'u8])
 
-  test "toPgBinaryParam PgBit rejects nbits above limit":
-    let b = PgBit(nbits: PgBitMaxBits + 1, data: @[])
+  test "initPgBit rejects nbits above limit":
     expect PgTypeError:
-      discard toPgBinaryParam(b)
+      discard initPgBit(PgBitMaxBits + 1, @[])
 
-  test "toPgBinaryParam PgBit rejects nbits/data.len mismatch":
+  test "initPgBit rejects nbits/data.len mismatch":
     # nbits=8 requires exactly 1 packed byte; supplying 2 must be rejected.
-    let b = PgBit(nbits: 8, data: @[0'u8, 0'u8])
     expect PgTypeError:
-      discard toPgBinaryParam(b)
+      discard initPgBit(8, @[0'u8, 0'u8])
     # nbits=3 requires 1 byte; supplying 0 must also be rejected.
-    let b2 = PgBit(nbits: 3, data: @[])
     expect PgTypeError:
-      discard toPgBinaryParam(b2)
+      discard initPgBit(3, @[])
 
   test "getBit text format":
     let data = toBytes("10110011")
@@ -7933,7 +7972,7 @@ suite "toPgParamInline":
     # pin that each encoder routes into that funnel with its label.
     check textParam(OidText, "a", "hstore").value.get.len == 1
     check toPgParam(PgHstore(initTable[string, Option[string]]())).value.isSome
-    check toPgParam(PgBit(nbits: 1, data: @[0b10000000'u8])).value.get.len > 0
+    check toPgParam(initPgBit(1, @[0b10000000'u8])).value.get.len > 0
     check toPgParam(PgPath(closed: false, points: @[PgPoint(x: 0, y: 0)])).value.get.len >
       0
     check toPgParam(PgPolygon(points: @[PgPoint(x: 0, y: 0)])).value.get.len > 0
@@ -8480,6 +8519,24 @@ suite "appendInlineParam validation and SoA atomicity":
     var ok = flattenInline(@[toPgParamInline(1'i32), toPgParamInline(2'i32)])
     check ok.ranges.len == 2
     check ok.oids.len == 2
+
+suite "PgBit construction validation":
+  ## Was encoder-side: an invalid `PgBit` could be built and only failed at
+  ## `toPgParam`. It cannot be built now.
+  test "inconsistent nbits/data raises PgTypeError, not IndexDefect":
+    expect PgTypeError:
+      discard initPgBit(16, @[0xFF'u8])
+
+  test "negative nbits raises PgTypeError instead of encoding an empty varbit":
+    expect PgTypeError:
+      discard initPgBit(-1, @[])
+
+  test "nbits above the limit raises PgTypeError":
+    expect PgTypeError:
+      discard initPgBit(PgBitMaxBits + 1, @[])
+
+  test "consistent PgBit still encodes":
+    check toPgParam(initPgBit(4, @[0xA0'u8])).value.get == toBytes("1010")
 
 suite "encodeBinaryArray with Option elements":
   test "mixed null and non-null int32":

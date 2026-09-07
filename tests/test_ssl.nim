@@ -5,6 +5,18 @@ import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/[ssl, lifecycle, types]
 
+import std/importutils
+privateAccess(PgConnection)
+
+when hasAsyncDispatch and not defined(ssl):
+  # `tests/config.nims` defines `ssl` for the asyncdispatch backend. Without it
+  # the OpenSSL implementation is not compiled and this file's OpenSSL suites
+  # vanish from the run silently, leaving a green build over untested code.
+  {.
+    error:
+      "the asyncdispatch test build must define `ssl` (see tests/config.nims); without it the OpenSSL path is never compiled"
+  .}
+
 when hasChronos:
   import ../async_postgres/pg_bearssl {.all.}
   import bearssl/abi/bearssl_ssl as bssl
@@ -678,9 +690,10 @@ suite "initConnConfig client certificate validation":
 suite "Client certificate config validation":
   # `connect()` now validates cert/key pairing before dialing, so these tests
   # no longer need a mock server — the failure fires client-side.
-  test "providing only sslCert raises PgConnectionError":
+  test "providing only sslCert is a config fault, not a connection failure":
     var raised = false
     var msgMatches = false
+    var configFault = false
 
     proc testBody() {.async.} =
       let config = ConnConfig(
@@ -695,16 +708,21 @@ suite "Client certificate config validation":
       try:
         let conn = await connect(config)
         await conn.close()
-      except PgConnectionError as e:
+      except PgError as e:
         raised = true
         msgMatches = "sslcert and sslkey must be provided together" in e.msg
+        # A pairing mistake no reconnect can fix must stay out of the
+        # `PgConnectionError` family a retry loop watches.
+        configFault = e of PgConfigError
 
     waitFor testBody()
     check raised
     check msgMatches
+    check configFault
 
-  test "providing only sslKey raises PgConnectionError":
+  test "providing only sslKey is a config fault, not a connection failure":
     var raised = false
+    var configFault = false
 
     proc testBody() {.async.} =
       let config = ConnConfig(
@@ -719,11 +737,13 @@ suite "Client certificate config validation":
       try:
         let conn = await connect(config)
         await conn.close()
-      except PgConnectionError:
+      except PgError as e:
         raised = true
+        configFault = e of PgConfigError
 
     waitFor testBody()
     check raised
+    check configFault
 
 suite "SSL negotiation - sslAllow":
   test "sslAllow connects without SSL when server accepts plaintext":
@@ -1149,27 +1169,16 @@ proc readSaslInitialResponseMechanism(client: MockClient): Future[string] {.asyn
     inc i
 
 suite "SCRAM channel binding enforcement":
-  test "cbRequire without SSL raises PgError":
-    var raised = false
+  test "cbRequire with sslmode=disable is a config fault, rejected before any dial":
+    # Port 1 refuses every connection, so only the pre-flight check in
+    # `connect` can produce a `PgConfigError` here.
+    var configFault = false
     var msgMatches = false
 
     proc testBody() {.async.} =
-      let ms = startMockServer()
-
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          await sendAuthSasl(st, @["SCRAM-SHA-256"])
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-
       let config = ConnConfig(
         host: "127.0.0.1",
-        port: ms.port,
+        port: 1,
         user: "test",
         password: "test",
         database: "test",
@@ -1180,57 +1189,12 @@ suite "SCRAM channel binding enforcement":
       try:
         let conn = await connect(config)
         await conn.close()
-      except PgError as e:
-        raised = true
-        msgMatches = "SSL is not in use" in e.msg
-
-      await serverFut
-      await closeServer(ms)
+      except PgConfigError as e:
+        configFault = true
+        msgMatches = "sslmode=disable" in e.msg
 
     waitFor testBody()
-    check raised
-    check msgMatches
-
-  test "cbRequire errors when server offers only SCRAM-SHA-256":
-    var raised = false
-    var msgMatches = false
-
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          await sendAuthSasl(st, @["SCRAM-SHA-256"])
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-
-      let config = ConnConfig(
-        host: "127.0.0.1",
-        port: ms.port,
-        user: "test",
-        password: "test",
-        database: "test",
-        sslMode: sslDisable,
-        channelBinding: cbRequire,
-      )
-
-      try:
-        let conn = await connect(config)
-        await conn.close()
-      except PgError as e:
-        raised = true
-        msgMatches = "channel binding" in e.msg
-
-      await serverFut
-      await closeServer(ms)
-
-    waitFor testBody()
-    check raised
+    check configFault
     check msgMatches
 
   test "cbDisable picks SCRAM-SHA-256 even when PLUS is offered":
@@ -1440,6 +1404,36 @@ suite "selectScramMechanism":
         saslMechanisms = bothMechs,
         mode = cbRequire,
       )
+
+  test "cbRequire raises when the server offers only SCRAM-SHA-256":
+    # The mock server cannot speak TLS, so the offered-mechanism check is only
+    # reachable here as a unit test.
+    var msg = ""
+    try:
+      discard selectScramMechanism(
+        sslEnabled = true,
+        serverCertDer = fakeCert,
+        saslMechanisms = @["SCRAM-SHA-256"],
+        mode = cbRequire,
+      )
+    except PgConnectionError as e:
+      msg = e.msg
+    check "did not offer SCRAM-SHA-256-PLUS" in msg
+
+  test "cbRequire raises when the server declined TLS":
+    # Reached under sslmode=prefer once the server answers 'N': a per-host
+    # outcome, so it stays a `PgConnectionError` the failover loop folds.
+    var msg = ""
+    try:
+      discard selectScramMechanism(
+        sslEnabled = false,
+        serverCertDer = @[],
+        saslMechanisms = bothMechs,
+        mode = cbRequire,
+      )
+    except PgConnectionError as e:
+      msg = e.msg
+    check "SSL is not in use" in msg
 
   test "cbPrefer raises when no SCRAM mechanism is offered":
     expect PgConnectionError:
@@ -1745,6 +1739,29 @@ when hasChronos:
       let mixed = testCaCert() & emptyBlock
       let parsed = parseTrustAnchors(mixed)
       check parsed.backing.len > 0
+
+    test "a PEM with no anchor is a config fault, not a connection failure":
+      # `PgConnectionError` is the reconnect-worthy family; a PEM that can never
+      # parse must not land an application in a retry loop.
+      const pem = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+      var raised: ref PgError
+      try:
+        discard parseTrustAnchors(pem)
+      except PgError as e:
+        raised = e
+      check raised != nil
+      check raised of PgConfigError
+
+    test "PEM that does not decode at all is a config fault too":
+      # `pemDecode` rejects garbage before the anchor loop runs, so its own
+      # chronos error type must be folded into the same `PgConfigError`.
+      var raised: ref PgError
+      try:
+        discard parseTrustAnchors("not a PEM certificate")
+      except PgError as e:
+        raised = e
+      check raised != nil
+      check raised of PgConfigError
 
     test "PEM with only non-CERTIFICATE blocks raises PgError":
       const pem =

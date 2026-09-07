@@ -143,6 +143,11 @@ type
     nextConnectRetryAt: Moment
       ## Monotonic deadline before the maintenance loop is allowed to retry
       ## opening a new connection. Zero means "no pending backoff".
+    configFault: ref PgConfigError
+      ## The `PgConfigError` the first failing connect raised, if any. The
+      ## config never changes for the life of the pool, so no later connect can
+      ## succeed: replenish and out-of-band spawns stop, stranded waiters are
+      ## failed, and an acquire that needs a new connection fails fast.
 
 const bgTaskPruneThreshold = 16
   ## Sweep `pool.pendingBackgroundTasks` for finished futures only once its
@@ -375,7 +380,7 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
     conn.markClosed()
     raise newPoolError(pekDefectWrapped, d.msg, d)
 
-proc computeConnectBackoff*(initial, maxDelay: Duration, failures: int): Duration =
+proc computeConnectBackoff(initial, maxDelay: Duration, failures: int): Duration =
   ## Exponential backoff for repeated connect failures: returns
   ## `initial * 2^(failures-1)` capped at `maxDelay`. Returns `ZeroDuration`
   ## when backoff is disabled (`initial == ZeroDuration`) or `failures <= 0`.
@@ -436,10 +441,39 @@ proc failLastWaiter(pool: PgPool, err: ref CatchableError): bool =
     return true
   return false
 
+proc noteConfigFault(pool: PgPool, err: ref CatchableError): bool =
+  ## Record a connect failure that is a `PgConfigError`. Returns whether it was
+  ## one, so the caller skips the backoff bookkeeping meant for transient
+  ## failures.
+  if not (err of PgConfigError):
+    return false
+  if pool.configFault == nil:
+    pool.configFault = (ref PgConfigError)(err)
+  true
+
+proc configFaultError(pool: PgPool): ref PgPoolError =
+  newPoolError(
+    pekConfigFault, "Pool connect failed: " & pool.configFault.msg, pool.configFault
+  )
+
+proc failStrandedWaiters(pool: PgPool) =
+  ## After a config fault, fail every live waiter once nothing is left that
+  ## could serve one: no borrower to release and no idle connection.
+  if pool.configFault == nil or pool.active > 0 or pool.idle.len > 0:
+    return
+  let err = pool.configFaultError()
+  while pool.waiters.len > 0:
+    let waiter = pool.waiters.popFirst()
+    if not waiter.isAbandoned:
+      waiter.fut.fail(err)
+  pool.waiterCount = 0
+
 proc canAttemptConnect(pool: PgPool): bool =
-  ## Whether a new connection may be opened right now. Respects the
-  ## exponential backoff window driven by `consecutiveConnectFailures` /
-  ## `nextConnectRetryAt`.
+  ## Whether a new connection may be opened right now. False for good once a
+  ## config fault is recorded; otherwise respects the exponential backoff
+  ## window driven by `consecutiveConnectFailures` / `nextConnectRetryAt`.
+  if pool.configFault != nil:
+    return false
   pool.consecutiveConnectFailures == 0 or Moment.now() >= pool.nextConnectRetryAt
 
 proc spawnConnectForWaiter(pool: PgPool) =
@@ -494,33 +528,39 @@ proc spawnConnectForWaiter(pool: PgPool) =
       # or failed by close().
       discard
     except CatchableError as e:
-      pool.consecutiveConnectFailures.inc
-      let delay = computeConnectBackoff(
-        pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
-        pool.consecutiveConnectFailures,
-      )
-      if delay > ZeroDuration:
-        pool.nextConnectRetryAt = Moment.now() + delay
-      # Only one waiter is failed here: this spawn reserved capacity for a
-      # single queue slot, and other waiters may still be served by existing
-      # borrowers' releases. We don't blanket-fail the queue or re-spawn for
-      # siblings — `canAttemptConnect()` is now false during the backoff window,
-      # so further spawns are deferred until backoff expires (then triggered by
-      # the next acquire or release). The tail waiter is failed (see
-      # `failLastWaiter`) to keep the head's FIFO claim on the next connection.
-      #
-      # Wrap in PgPoolError before failing the waiter: acquire() documents
-      # PgPoolError for every failure mode, and a raw AsyncTimeoutError from
-      # `connConfig.connectTimeout` would otherwise be indistinguishable from
-      # the waiter's own wait-budget timeout in acquireImpl — whose handler
-      # decrements `waiterCount` a second time (failLastWaiter below already
-      # did) and permanently corrupts the FIFO fast-path guard.
-      discard pool.failLastWaiter(
-        newPoolError(pekConnectFailed, "Pool connect for waiter failed", e)
-      )
+      if pool.noteConfigFault(e):
+        # Not transient, so no backoff; `finally` sweeps the rest of the
+        # queue once this reservation is released.
+        discard pool.failLastWaiter(pool.configFaultError())
+      else:
+        pool.consecutiveConnectFailures.inc
+        let delay = computeConnectBackoff(
+          pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
+          pool.consecutiveConnectFailures,
+        )
+        if delay > ZeroDuration:
+          pool.nextConnectRetryAt = Moment.now() + delay
+        # Only one waiter is failed here: this spawn reserved capacity for a
+        # single queue slot, and other waiters may still be served by existing
+        # borrowers' releases. We don't blanket-fail the queue or re-spawn for
+        # siblings — `canAttemptConnect()` is now false during the backoff window,
+        # so further spawns are deferred until backoff expires (then triggered by
+        # the next acquire or release). The tail waiter is failed (see
+        # `failLastWaiter`) to keep the head's FIFO claim on the next connection.
+        #
+        # Wrap in PgPoolError before failing the waiter: acquire() documents
+        # PgPoolError for every failure mode, and a raw AsyncTimeoutError from
+        # `connConfig.connectTimeout` would otherwise be indistinguishable from
+        # the waiter's own wait-budget timeout in acquireImpl — whose handler
+        # decrements `waiterCount` a second time (failLastWaiter below already
+        # did) and permanently corrupts the FIFO fast-path guard.
+        discard pool.failLastWaiter(
+          newPoolError(pekConnectFailed, "Pool connect for waiter failed", e)
+        )
     finally:
       if not consumed and pool.active > 0:
         pool.active.dec
+      pool.failStrandedWaiters()
 
   pool.pruneBackgroundTasks()
   let fut = run()
@@ -533,8 +573,13 @@ proc respawnForStrandedWaiter(pool: PgPool) =
   ## waiter that queued while the failed caller held the slot has no spawn
   ## attached (queue-time spawn was skipped because `active == maxSize`) and
   ## no borrower to release, so it would sit until its own wait budget elapses.
-  if not pool.closed and pool.waiterCount > 0 and pool.active < pool.config.maxSize and
-      pool.canAttemptConnect():
+  if pool.closed or pool.waiterCount == 0:
+    return
+  if pool.configFault != nil:
+    # No spawn can succeed; fail the queue if nothing else can serve it.
+    pool.failStrandedWaiters()
+    return
+  if pool.active < pool.config.maxSize and pool.canAttemptConnect():
     pool.active.inc
     pool.spawnConnectForWaiter()
 
@@ -594,6 +639,14 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
 
     pool.idle = remaining
 
+    # A config fault never clears (see `configFault`): keep sweeping idle
+    # entries, never replenish. Checked before the backoff window below so a
+    # fault recorded after transient failures still fails stranded waiters
+    # promptly instead of waiting out the backoff.
+    if pool.configFault != nil:
+      pool.failStrandedWaiters()
+      continue
+
     # Skip the replenish phase while we are inside a backoff window from a
     # recent failure. Idle pruning above still runs every interval — only the
     # connect attempts are throttled, so a backed-off pool keeps closing dead
@@ -637,7 +690,10 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       for f in connectFuts:
         if f.failed():
           pool.active.dec
-          pool.consecutiveConnectFailures.inc
+          # Same downcast as `newPool`: `connect` only raises `CatchableError`.
+          if not pool.noteConfigFault(cast[ref CatchableError](f.error)):
+            pool.consecutiveConnectFailures.inc
+      pool.failStrandedWaiters()
       if pool.consecutiveConnectFailures > 0:
         let delay = computeConnectBackoff(
           pool.config.connectBackoffInitial, pool.config.connectBackoffMax,
@@ -870,8 +926,9 @@ proc release*(h: PooledConnHandle) =
 
 proc resetSessionAndRelease*(pool: PgPool, conn: PgConnection) {.async.} =
   ## `resetSession` + `release`, wrapped so `release()` still runs when the
-  ## reset propagates `CancelledError` (chronos cancel would otherwise skip
-  ## the follow-up `release()` and leak a pool slot).
+  ## reset propagates `CancelledError` (else a pool slot leaks).
+  ##
+  ## Correct for both application-held and pool-internal borrows.
   try:
     await pool.resetSession(conn)
   finally:
@@ -1026,8 +1083,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       recordAcquire()
       return (pc.conn, false)
 
-    # No idle connections; create new if under limit
-    if pool.active < pool.config.maxSize:
+    # No idle connections; create new if under limit. A recorded config fault
+    # skips the doomed dial: only a borrower's release could serve us now.
+    if pool.configFault == nil and pool.active < pool.config.maxSize:
       let connCfg = pool.config.connConfig
       var rem = ZeroDuration
       if hasDeadline:
@@ -1075,7 +1133,10 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         raise e
       except CatchableError as e:
         pool.active.dec
+        let configFault = pool.noteConfigFault(e)
         pool.respawnForStrandedWaiter()
+        if configFault:
+          raise pool.configFaultError()
         # `perform()` aggregates per-host errors into `PgConnectionError`, so
         # the exception type alone can't tell an acquire timeout from a run of
         # connect failures — the deadline is authoritative. The 1ms slack
@@ -1100,6 +1161,10 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
 
   # Either max connections are reached or waiters are queued ahead of us;
   # queue up and wait for delivery.
+  if pool.configFault != nil and pool.active == 0 and pool.idle.len == 0:
+    # No borrower will release and no connect can succeed (see `configFault`):
+    # fail now instead of waiting out the acquire budget.
+    raise pool.configFaultError()
   if pool.config.maxWaiters >= 0 and pool.waiterCount >= pool.config.maxWaiters:
     raise newPoolError(
       pekQueueFull,
@@ -1197,6 +1262,8 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## connect failures the underlying error (e.g. `PgConnectionError`) is
   ## preserved as the `parent` of the raised `PgPoolError`. Use the `kind`
   ## field (`PoolErrorKind`) to distinguish the failure mode programmatically.
+  ## A connect that raises `PgConfigError` is reported as `pekConfigFault`,
+  ## after which the pool never dials again (the config cannot change).
   return await pool.acquireCommon(byUser = true)
 
 proc acquireHandle*(pool: PgPool): Future[PooledConnHandle] {.async.} =
@@ -1235,7 +1302,8 @@ proc runAndReleaseImpl[T](
   ## since chronos re-raises raw Defects from continuations eagerly.
   ##
   ## `runAndRelease` releases exactly the passed `conn`; `T = void` bodies
-  ## (e.g. `notify`) work via `when` guards.
+  ## (e.g. `notify`) work via `when` guards. Serves both application-held
+  ## and pool-internal borrows.
   var bodyErr: ref CatchableError = nil
   var bodyDefect: ref Defect = nil
   var bodyFut: Future[T]
@@ -1271,10 +1339,10 @@ proc runAndReleaseImpl[T](
 template runAndRelease*[T](
     pool: PgPool, conn: PgConnection, body: Future[T]
 ): Future[T] =
-  ## `acquire → body → resetSessionAndRelease` for pooled operations. `body`
-  ## is evaluated lazily inside a try so a synchronous raise from its async
-  ## prelude (parameter encoding, guards, …) still releases `conn`; see
-  ## `runAndReleaseImpl` for the error-handling semantics.
+  ## `acquire → body → resetSessionAndRelease`. `body` is evaluated lazily
+  ## inside a try so a synchronous raise from its async prelude (parameter
+  ## encoding, guards, …) still releases `conn`; see `runAndReleaseImpl` for the
+  ## error-handling semantics.
   runAndReleaseImpl(
     pool,
     conn,
@@ -2109,10 +2177,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         `body`
         discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
       except CancelledError as `cancelSym`:
-        # Skip ROLLBACK on cancel (a fresh await would just re-cancel), but
-        # abort server-side via CancelRequest and mark csClosed so the server
-        # tx does not linger holding locks and the conn is discarded by
-        # release() instead of silently reused.
+        # Skip ROLLBACK on cancel; invalidate so release() discards.
         `invalidateCancelSym`(`connIdent`, releaseTransport = false)
         raise `cancelSym`
       except CatchableError as `eSym`:
@@ -2341,8 +2406,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
           `bodyCleanup`
           `bodyDefectSym` = `dSym`
       except CancelledError as `cancelledSym`:
-        # Cancelled mid-request (chronos deadline): abort it server-side and
-        # mark csClosed so release() discards the conn instead of reusing it.
+        # Chronos deadline cancel: invalidate so release() discards.
         `invalidateCancelSym`(`connIdent`, releaseTransport = false)
         `bodyErrSym` = `cancelledSym`
       except CatchableError as `eSym`:
@@ -2539,8 +2603,7 @@ macro withTransactionRetryDeadline*(
           `bodyCleanup`
           `bodyDefectSym` = `dSym`
       except CancelledError as `cancelledSym`:
-        # Cancelled mid-request (chronos deadline): abort it server-side and
-        # mark csClosed so release() discards the conn instead of reusing it.
+        # Chronos deadline cancel: invalidate so release() discards.
         `invalidateCancelSym`(`connIdent`, releaseTransport = false)
         `bodyErrSym` = `cancelledSym`
       except CatchableError as `eSym`:

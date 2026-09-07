@@ -8,6 +8,7 @@ import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_types/encoding
 import ../async_postgres/pg_connection/[buffer_io, types, simple_query, lifecycle]
 import ../async_postgres/pg_connection/cache {.all.}
+import ../async_postgres/pg_connection/types {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_client/pipeline {.all.}
 import ../async_postgres/pg_client/[core, query, exec, direct]
@@ -1072,7 +1073,7 @@ suite "Pool close":
   test "close awaits a conn abandoned by a handed-off waiter":
     # Regression: a handed-off waiter's acquire continuation is scheduled but
     # not yet resumed, so close()'s waiter loop can't see it. Abandoning it on a
-    # closed pool runs settleAbandonedWaiter -> release() -> closeNoWait, which
+    # closed pool runs settleAbandonedWaiter -> releaseReclaimed -> closeNoWait, which
     # used to push a Terminate task after close() had already drained. close()
     # now yields once before draining so that task is enqueued in time to await.
     proc t() {.async.} =
@@ -2976,6 +2977,121 @@ suite "FIFO fairness":
 
       waitFor t()
 
+suite "Config faults":
+  proc slowSslProbe(ms: MockServer) =
+    ## Accept one connection, answer the SSLRequest with 'S' after a delay long
+    ## enough for a second acquire to queue behind the first, then hold the
+    ## socket; the client fails while loading its CA and closes.
+    proc handler() {.async.} =
+      try:
+        let st = await ms.accept()
+        discard await readN(st, 8)
+        await sleepAsync(milliseconds(200))
+        await sendBytes(st, @[byte('S')])
+        try:
+          discard await readN(st, 8).wait(seconds(3))
+        except CatchableError:
+          discard
+        await closeClient(st)
+      except CatchableError:
+        discard
+
+    discard handler()
+
+  test "a config fault reports pekConfigFault and stops the pool dialing":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 2)
+      # sslcert without sslkey: rejected before any dial.
+      pool.config.connConfig.sslCert = "dummy"
+      var err: ref PgPoolError
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekConfigFault
+      doAssert err.parent of PgConfigError
+      doAssert pool.configFault != nil
+      doAssert pool.active == 0
+      doAssert not pool.canAttemptConnect()
+      doAssert pool.consecutiveConnectFailures == 0
+      # Even a config that now works is never dialed again: port 1 would
+      # refuse and report pekConnectFailed if it were.
+      pool.config.connConfig.sslCert = ""
+      pool.config.connConfig.port = 1
+      err = nil
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekConfigFault
+      await pool.close()
+
+    waitFor t()
+
+  test "a config fault mid-connect fails the queued waiter too":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      slowSslProbe(ms)
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig.host = "127.0.0.1"
+      pool.config.connConfig.port = ms.port
+      pool.config.connConfig.sslMode = sslVerifyCa
+      pool.config.connConfig.sslRootCert = "not a PEM certificate"
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.acquireTimeout = seconds(10)
+
+      let futA = pool.acquire()
+      # A is suspended on the delayed SSLRequest reply; B queues behind the
+      # single slot with nothing spawned for it (active == maxSize).
+      await sleepAsync(milliseconds(20))
+      doAssert not futA.finished
+      let futB = pool.acquire()
+      doAssert pool.waiterCount == 1
+
+      var errA, errB: ref PgPoolError
+      try:
+        discard await futA
+      except PgPoolError as e:
+        errA = e
+      let bStart = Moment.now()
+      try:
+        discard await futB
+      except PgPoolError as e:
+        errB = e
+      doAssert errA != nil
+      doAssert errA.kind == pekConfigFault
+      doAssert errB != nil
+      doAssert errB.kind == pekConfigFault
+      doAssert Moment.now() - bStart < seconds(2)
+      doAssert pool.waiterCount == 0
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "the maintenance loop stops replenishing after a config fault":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 2, minSize = 1)
+      pool.config.connConfig.sslCert = "dummy"
+      pool.config.maintenanceInterval = milliseconds(20)
+      pool.maintenanceTask = maintenanceLoop(pool)
+      await sleepAsync(milliseconds(100))
+      doAssert pool.configFault != nil
+      doAssert pool.consecutiveConnectFailures == 0
+      doAssert pool.active == 0
+      # A config that now works is never retried: port 1 would refuse and
+      # bump the backoff counter if the loop dialed it.
+      pool.config.connConfig.sslCert = ""
+      pool.config.connConfig.port = 1
+      await sleepAsync(milliseconds(100))
+      doAssert pool.consecutiveConnectFailures == 0
+      doAssert pool.active == 0
+      await pool.close()
+
+    waitFor t()
+
 suite "Error type granularity":
   test "closed pool raises PgPoolError":
     let pool = makePool()
@@ -4468,6 +4584,79 @@ suite "An oversized message is an input error, not a connection failure":
       check false
     except PgTypeError as e:
       check "Parse parameter-type" in e.msg
+suite "queryDirect stages its queued statement Closes onto the wire":
+  ## Regression: the stage ran *before* the dispatch's own `sendBuf.setLen(0)`,
+  ## so the Close bytes were truncated back out and the queue was then cleared
+  ## after the send — the named statements leaked in the backend for good.
+
+  test "a queued Close reaches the server and only then leaves the queue":
+    var sawClose = false
+    var queueDrained = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc: MockClient
+
+      proc serverHandler() {.async.} =
+        sc = await acceptAndReady(ms)
+        # Close, Parse, Describe, Bind, Execute, Sync — read until Sync.
+        while true:
+          let (msgType, body) = await drainFrontendMessage(sc)
+          if msgType == 'C' and body.len > 1 and char(body[0]) == 'S':
+            sawClose = true
+          if msgType == 'S':
+            break
+        await sendBytes(
+          sc,
+          buildBackendMsg('1', []) & buildBackendMsg('n', []) & buildBackendMsg('2', []) &
+            buildCommandComplete("SELECT 0") & buildReadyForQuery('I'),
+        )
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.pendingStmtCloses = @["_sc_9"]
+      discard await conn.queryDirect("SELECT $1", 1'i32)
+      queueDrained = conn.pendingStmtCloses.len == 0
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      if not sc.isNil:
+        try:
+          await closeClient(sc)
+        except CatchableError:
+          discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check sawClose
+    check queueDrained
+
+  test "a queued Close staged after the send survives the drop":
+    # `dropStagedStmtCloses` clears only the prefix whose Close is on the wire.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    conn.pendingStmtCloses.add "_sc_2" # queued after staging, no Close emitted
+    conn.dropStagedStmtCloses()
+    check conn.pendingStmtCloses == @["_sc_2"]
+
+suite "A pipeline's message bounds are charged per op, not per batch":
+  test "a per-op Bind bound does not charge the whole pipeline's inline buffer":
+    # Each op emits its own Bind referencing only its slice, so a batch in which
+    # every single Bind is legal must be accepted.
+    privateAccess(Pipeline)
+    let p = newPipeline(nil)
+    p.addExec("INSERT", [toPgParamInline("abc")])
+    p.addExec("INSERT", [toPgParamInline("def")])
+    check p.ops.len == 2
+    check p.inlineData.len == 6
 
 suite "The non-pipelined exec/query path pre-flights like the pipeline does":
   ## Regression: without add-time validation an input-size error left the
@@ -4950,7 +5139,7 @@ suite "Array encoder guards are catchable and do not disturb valid input":
   test "every guarded encoder family still round-trips a small value":
     check toPgParam(@[parsePgNumeric("123.45")]).value.isSome
     check toPgParam(@[PgPath(closed: true, points: @[PgPoint(x: 1, y: 2)])]).value.isSome
-    check toPgBinaryParam(@[PgBit(nbits: 3, data: @[0b101'u8])]).value.isSome
+    check toPgBinaryParam(@[initPgBit(3, @[0b101'u8])]).value.isSome
     check toPgParam(@[newJInt(1), newJInt(2)]).value.isSome
     check toPgParam(@[PgXml("a"), PgXml("b")]).value.isSome
 
@@ -5098,3 +5287,26 @@ suite "Pool-initiated closes stay a connection failure during shutdown":
     waitFor testBody()
     check not closedByUser
     check not stateErr
+
+suite "Aborted pipeline send phase keeps evicted statements closable":
+  ## Regression: an aborted build dropped a statement from the cache and wrote
+  ## its Close into the discarded buffer only. A statement the build evicted was
+  ## gone from the cache *and* owed by nothing, with its Close sitting in the
+  ## `sendBuf` the abort discards — so the backend kept it allocated until
+  ## session end.
+
+  test "a statement evicted by a failed build stays queued for Close":
+    let conn = mockConn()
+    conn.stmtCacheCapacity = 1
+    conn.addStmtCache("SELECT old", CachedStmt(name: "_sc_1"))
+    let p = newPipeline(conn)
+    # Straight into `ops`: the add-time SQL guard exists to keep an unencodable
+    # statement out of the send phase, so this state has to be built behind it.
+    p.ops.add PipelineOp(kind: pokExec, sql: "SELECT 1\0")
+
+    expect PgTypeError:
+      discard p.buildSendPhase(perOpSync = true)
+
+    check "SELECT old" notin conn.stmtCache
+    # Staged, not queued: the next build takes staged names back onto the queue.
+    check conn.stagedStmtCloses == @["_sc_1"]

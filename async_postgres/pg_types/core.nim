@@ -28,7 +28,8 @@ type
     ## ``getMoneyArray``. Use ``formatPgMoney`` to render with a currency
     ## symbol and thousand separators; ``$`` emits a plain decimal number.
     amount*: int64 ## raw value in the minor currency unit
-    scale*: int8 ## number of fractional digits (``frac_digits``)
+    scaleRaw: int8
+      ## Fractional digits (``frac_digits``); private, ``0..18`` via `initPgMoney`.
 
   PgNumericSign* = enum
     pgPositive = 0x0000
@@ -81,8 +82,9 @@ type
   PgXml* = distinct string ## PostgreSQL xml type.
 
   PgBit* = object ## PostgreSQL bit / bit varying type.
-    nbits*: int32 ## number of bits
-    data*: seq[byte] ## packed bit data (MSB first)
+    nbitsRaw: int32
+    dataRaw: seq[byte]
+      ## Private coupled pair; build via `initPgBit` / `parseBitString`, read via `nbits` / `data`.
 
   PgPoint* = object ## PostgreSQL point type: (x, y).
     x*: float64
@@ -286,11 +288,17 @@ const
   OidBitArray* = 1561'i32
   OidVarbitArray* = 1563'i32
 
-  rangeEmpty* = 0x01'u8 ## Range flag: range is empty.
-  rangeHasLower* = 0x02'u8 ## Range flag: lower bound present.
-  rangeHasUpper* = 0x04'u8 ## Range flag: upper bound present.
-  rangeLowerInc* = 0x08'u8 ## Range flag: lower bound is inclusive.
-  rangeUpperInc* = 0x10'u8 ## Range flag: upper bound is inclusive.
+  # Range flag bits, as PostgreSQL defines them in `utils/rangetypes.h`. Note
+  # the sense of the infinity bits: an absent bound is spelled *positively* on
+  # the wire (`LB_INF` set), so "has a lower bound" is the absence of
+  # `rangeLbInf`, not the presence of a flag of its own.
+  rangeEmpty* = 0x01'u8 ## ``RANGE_EMPTY``: the range is empty.
+  rangeLbInc* = 0x02'u8 ## ``RANGE_LB_INC``: lower bound is inclusive.
+  rangeUbInc* = 0x04'u8 ## ``RANGE_UB_INC``: upper bound is inclusive.
+  rangeLbInf* = 0x08'u8 ## ``RANGE_LB_INF``: lower bound is infinite (absent).
+  rangeUbInf* = 0x10'u8 ## ``RANGE_UB_INF``: upper bound is infinite (absent).
+  rangeContainEmpty* = 0x80'u8
+    ## ``RANGE_CONTAIN_EMPTY``: GiST-internal, never set on a stored value.
 
   PgInlineBufSize* = 16
     ## Maximum payload size that fits in `PgParamInline.inlineBuf` without a
@@ -425,12 +433,28 @@ proc `$`*(v: PgUuid): string {.borrow.}
 proc `==`*(a, b: PgUuid): bool {.borrow.}
 proc hash*(v: PgUuid): Hash {.borrow.}
 
+const MaxMoneyScale* = 18
+  ## Largest fractional-digit count a `PgMoney` can carry: `$` scales by
+  ## ``10^scale`` in a ``uint64``, which overflows past 19 digits.
+
+proc checkMoneyScale*(scale: int) {.raises: [PgTypeError].} =
+  ## Owner of the ``0..MaxMoneyScale`` bound. Every entry point that takes a
+  ## money ``scale`` pre-flights it through here, so the bound and its message
+  ## are stated once rather than at each call site.
+  if scale < 0 or scale > MaxMoneyScale:
+    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+
 proc initPgMoney*(amount: int64, scale: int = 2): PgMoney =
   ## Construct a PgMoney. ``amount`` is the raw integer in the minor currency
-  ## unit; ``scale`` is the number of fractional digits (default 2).
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
-  PgMoney(amount: amount, scale: int8(scale))
+  ## unit; ``scale`` is the number of fractional digits (default 2). The only
+  ## constructor: the record's fields are private so this bound cannot be
+  ## sidestepped.
+  checkMoneyScale(scale)
+  PgMoney(amount: amount, scaleRaw: int8(scale))
+
+func scale*(m: PgMoney): int8 {.inline.} =
+  ## Fractional digits (``0..18`` via `initPgMoney`).
+  m.scaleRaw
 
 proc `<`*(a, b: PgMoney): bool =
   ## Order by ``amount``. Raises ``PgTypeError`` when ``a.scale != b.scale``
@@ -466,10 +490,10 @@ proc pow10u64(n: int): uint64 =
 proc `$`*(v: PgMoney): string =
   ## Format PgMoney as a plain decimal number with ``scale`` fractional
   ## digits. No currency symbol or thousand separator is emitted:
-  ##   * ``PgMoney(amount: 123456, scale: 2)`` -> ``"1234.56"``
-  ##   * ``PgMoney(amount: -1, scale: 2)`` -> ``"-0.01"``
-  ##   * ``PgMoney(amount: 1234, scale: 0)`` -> ``"1234"``
-  ##   * ``PgMoney(amount: 1234567, scale: 3)`` -> ``"1234.567"``
+  ##   * ``initPgMoney(123456, 2)`` -> ``"1234.56"``
+  ##   * ``initPgMoney(-1, 2)`` -> ``"-0.01"``
+  ##   * ``initPgMoney(1234, 0)`` -> ``"1234"``
+  ##   * ``initPgMoney(1234567, 3)`` -> ``"1234.567"``
   ## Use ``formatPgMoney`` for currency symbols and thousand separators.
   let c = v.amount
   let scale = int(v.scale)
@@ -573,8 +597,7 @@ proc parsePgMoney*(s: string, scale: int = 2): PgMoney =
   ## Raises ``PgTypeError`` on malformed input. The server's actual
   ## ``frac_digits`` cannot be inferred from the text — pass ``scale``
   ## explicitly when the server uses a non-default ``lc_monetary``.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  checkMoneyScale(scale)
   var trimmed = s.strip()
   if trimmed.len == 0:
     raise newException(PgTypeError, "Empty money string")
@@ -680,14 +703,14 @@ proc parsePgMoney*(s: string, scale: int = 2): PgMoney =
     mag = mag * 10 + d
   if neg:
     if mag == magMax + 1'u64:
-      return PgMoney(amount: low(int64), scale: int8(scale))
+      return initPgMoney(low(int64), scale)
     if mag > magMax:
       raise newException(PgTypeError, "Money value out of range: " & s)
-    return PgMoney(amount: -int64(mag), scale: int8(scale))
+    return initPgMoney(-int64(mag), scale)
   else:
     if mag > magMax:
       raise newException(PgTypeError, "Money value out of range: " & s)
-    return PgMoney(amount: int64(mag), scale: int8(scale))
+    return initPgMoney(int64(mag), scale)
 
 proc `$`*(v: PgMacAddr): string {.borrow.}
 proc `==`*(a, b: PgMacAddr): bool {.borrow.}
@@ -703,6 +726,32 @@ proc `==`*(a, b: PgTsQuery): bool {.borrow.}
 
 proc `$`*(v: PgXml): string {.borrow.}
 proc `==`*(a, b: PgXml): bool {.borrow.}
+
+func nbits*(v: PgBit): int32 {.inline.} =
+  ## Number of bits. Set only through `initPgBit` / `parseBitString`.
+  v.nbitsRaw
+
+func data*(v: PgBit): lent seq[byte] {.inline.} =
+  ## Packed bit data (MSB first), ``ceil(nbits/8)`` bytes.
+  v.dataRaw
+
+proc initPgBit*(nbits: int32, data: sink seq[byte]): PgBit =
+  ## Construct a PgBit. Raises ``PgTypeError`` unless ``data`` holds exactly
+  ## ``ceil(nbits/8)`` bytes for an ``nbits`` in ``0..PgBitMaxBits`` — the bound
+  ## the encoder applies, applied here so an invalid value cannot be built.
+  if nbits < 0:
+    raise newException(PgTypeError, "Invalid PgBit: negative nbits " & $nbits)
+  if nbits > PgBitMaxBits:
+    raise newException(
+      PgTypeError,
+      "Invalid PgBit: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits & ")",
+    )
+  if (int64(nbits) + 7) div 8 != int64(data.len):
+    raise newException(
+      PgTypeError,
+      "Invalid PgBit: nbits=" & $nbits & " inconsistent with data.len=" & $data.len,
+    )
+  PgBit(nbitsRaw: nbits, dataRaw: data)
 
 proc `$`*(v: PgBit): string =
   ## Convert PgBit to a bit string like "10110011".
@@ -720,6 +769,13 @@ proc `==`*(a, b: PgBit): bool =
 
 proc parseBitString*(s: string): PgBit =
   ## Parse a bit string like "10110011" into PgBit.
+  # Bound before narrowing to int32, then hand the result to `initPgBit` so the
+  # invariant has exactly one owner.
+  if s.len > PgBitMaxBits:
+    raise newException(
+      PgTypeError,
+      "Invalid PgBit: nbits " & $s.len & " exceeds limit (" & $PgBitMaxBits & ")",
+    )
   let nbits = int32(s.len)
   let nBytes = (nbits + 7) div 8
   var data = newSeq[byte](nBytes)
@@ -730,7 +786,7 @@ proc parseBitString*(s: string): PgBit =
       data[byteIdx] = data[byteIdx] or byte(1 shl bitIdx)
     elif s[i] != '0':
       raise newException(PgTypeError, "Invalid bit character: " & $s[i])
-  PgBit(nbits: nbits, data: data)
+  initPgBit(nbits, data)
 
 proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
   ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN") into PgNumeric.

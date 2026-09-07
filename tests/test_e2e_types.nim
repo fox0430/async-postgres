@@ -1,4 +1,4 @@
-import std/[unittest, options, math, importutils, net, times]
+import std/[unittest, options, math, net, times]
 
 import ../async_postgres/[async_backend, pg_types]
 
@@ -10,8 +10,6 @@ import ../async_postgres/pg_pool
 import ../async_postgres/pg_connection
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":

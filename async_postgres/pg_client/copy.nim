@@ -1,11 +1,18 @@
 ## COPY IN / COPY OUT via the simple-query protocol, including the streaming
 ## `copyInStream` / `copyOutStream` variants that move data through callbacks.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc pollCopyInError(
     conn: PgConnection, watch: RecvWatch
@@ -468,6 +475,8 @@ proc copyInStream*(
   ## from ``callback``. The callback is called repeatedly; returning an empty
   ## ``seq[byte]`` signals EOF. If the callback raises, CopyFail is sent and
   ## the connection returns to csReady.
+  ##
+  ## Oversized chunk raises ``PgTypeError`` via CopyFail.
   ##
   ## If the server aborts the COPY (constraint violation, disk full, …) while
   ## the client is still streaming, the error is detected between batches and

@@ -13,6 +13,10 @@
 ## `pg_connection.nim`; the transport buffering machinery stays here for
 ## sibling modules and tests. Depends only on `types.nim` and the
 ## protocol/error/backend abstraction modules.
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[deques, options, tables]
 when defined(posix):
@@ -25,6 +29,9 @@ when hasChronos:
   import chronos/streams/tlsstream
 elif hasAsyncDispatch:
   import std/asyncnet
+
+import std/importutils
+privateAccess(PgConnection)
 
 when defined(posix):
   # POSIX socket option constants (used by liveness probes and TCP keepalive)
@@ -111,7 +118,7 @@ proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].
   if conn.notifyMaxQueue > 0:
     while conn.notifyQueue.len >= conn.notifyMaxQueue:
       discard conn.notifyQueue.popFirst()
-      if conn.notifyDropped < high(int): # saturating lifetime counter
+      if conn.notifyDropped < high(int): # saturating; reset once reported
         conn.notifyDropped.inc
       droppedNow.inc
   conn.notifyQueue.addLast(notif)

@@ -3,7 +3,8 @@ import std/[options, json, macros, parseutils, strutils, tables, times, net]
 import ../pg_protocol
 import core, decoding, encoding
 
-proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+proc cellInfo(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  ## Raw cell offset/len; private (wholesale export would leak it).
   # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
   # `except PgError` would miss an out-of-range col and crash the process
   # (UB in -d:release). Same family as the other accessor errors here so
@@ -349,16 +350,13 @@ proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
   ## ``en_US``; pass 0 for ``ja_JP`` etc.). The wire protocol does not expose
   ## this, so callers must specify it when it differs from the default.
   ## Raises ``PgTypeError`` on NULL or when ``scale`` is outside ``0..18``.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  checkMoneyScale(scale)
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     if clen == 8:
-      return PgMoney(
-        amount: fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale: int8(scale)
-      )
+      return initPgMoney(fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale)
     raise newException(
       PgTypeError,
       "Column " & $col & ": unexpected binary length " & $clen & " for money",
@@ -624,27 +622,13 @@ proc getBit*(row: Row, col: int): PgBit =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     if clen < 4:
       raise newException(PgTypeError, "Invalid binary bit data: too short")
+    # `initPgBit` validates nbits.
     let nbits = fromBE32(row.data.buf.toOpenArray(off, off + 3))
-    if nbits < 0:
-      raise
-        newException(PgTypeError, "Invalid binary bit data: negative nbits " & $nbits)
-    if nbits > PgBitMaxBits:
-      raise newException(
-        PgTypeError,
-        "Invalid binary bit data: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits &
-          ")",
-      )
     let dataLen = clen - 4
-    if (int64(nbits) + 7) div 8 != int64(dataLen):
-      raise newException(
-        PgTypeError,
-        "Invalid binary bit data: nbits=" & $nbits & " inconsistent with dataLen=" &
-          $dataLen,
-      )
     var data = newSeq[byte](dataLen)
     for i in 0 ..< dataLen:
       data[i] = row.data.buf[off + 4 + i]
-    return PgBit(nbits: nbits, data: data)
+    return initPgBit(nbits, data)
   parseBitString(row.getStr(col))
 
 proc getTsVector*(row: Row, col: int): PgTsVector =
@@ -976,24 +960,13 @@ proc decodePgArrayElement(_: typedesc[PgNumeric], buf: openArray[byte]): PgNumer
 proc decodePgArrayElement(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
   if buf.len < 4:
     raise newException(PgTypeError, "bit array element too short")
+  # `initPgBit` validates nbits.
   let nbits = fromBE32(buf.toOpenArray(0, 3))
-  if nbits < 0:
-    raise newException(PgTypeError, "bit array element: negative nbits " & $nbits)
-  if nbits > PgBitMaxBits:
-    raise newException(
-      PgTypeError,
-      "bit array element: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits & ")",
-    )
   let dataLen = buf.len - 4
-  if (int64(nbits) + 7) div 8 != int64(dataLen):
-    raise newException(
-      PgTypeError,
-      "bit array element: nbits=" & $nbits & " inconsistent with dataLen=" & $dataLen,
-    )
   var data = newSeq[byte](dataLen)
   for j in 0 ..< dataLen:
     data[j] = buf[4 + j]
-  PgBit(nbits: nbits, data: data)
+  initPgBit(nbits, data)
 
 proc decodePgArrayElement(_: typedesc[PgTime], buf: openArray[byte]): PgTime =
   if buf.len != 8:
@@ -1140,8 +1113,7 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## locale-formatted text arrays (see ``parsePgMoney``). ``scale`` tags each
   ## element's ``frac_digits`` and is also used for text parsing.
   ## Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  checkMoneyScale(scale)
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -1156,9 +1128,8 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
         raise newException(
           PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
         )
-      result[i] = PgMoney(
-        amount: fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
-        scale: int8(scale),
+      result[i] = initPgMoney(
+        fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)), scale
       )
     return
   let s = row.getStr(col)
@@ -1583,8 +1554,7 @@ proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
   ## ``lc_monetary`` ``frac_digits``) — this accessor is the only way to
   ## read a ``money[]`` column. Defaults to ``scale = 2`` for the common
   ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  checkMoneyScale(scale)
   # cellInfo first (see getArrayND).
   let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
@@ -1612,10 +1582,9 @@ proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
           PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
         )
       result.elements[i] = some(
-        PgMoney(
-          amount:
-            fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
-          scale: int8(scale),
+        initPgMoney(
+          fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
+          scale,
         )
       )
 

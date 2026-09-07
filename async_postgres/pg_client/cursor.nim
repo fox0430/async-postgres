@@ -1,11 +1,18 @@
 ## Server-side portal-based cursors: `openCursor`, `fetchNext`, `close`, and
 ## the scoped `withCursor` template.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, cache, simple_query, lifecycle]
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 type Cursor* = ref object
   ## A server-side portal for incremental row fetching via `declareCursor`/`fetch`.
@@ -51,8 +58,7 @@ proc openCursorImpl(
     portalLen = generatedPortalNameLen,
   )
   # The counter is only consumed once the call is known to be encodable.
-  inc conn.portalCounter
-  let portalName = "_cursor_" & $conn.portalCounter
+  let portalName = conn.nextPortalName("_cursor_")
 
   var batch = newSeqOfCap[byte](sql.len + 128)
   conn.stagePendingStmtCloses(batch)

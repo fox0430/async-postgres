@@ -1,5 +1,9 @@
 ## Zero-allocation `queryDirect` / `execDirect` compile-time macros that
 ## encode parameters directly into the connection send buffer.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[algorithm, macros, options, sets, tables]
 
@@ -7,6 +11,9 @@ import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, cache, simple_query]
 import ../pg_types/encoding
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc queryDirectRunImpl*(
     conn: PgConnection,
@@ -390,7 +397,11 @@ proc buildDirectSendDispatch(
   ##   * queryDirect's cache-hit path copies `fields`, `colFmts`, `colOids`,
   ##     `resultFormats` out of the CachedStmt for the receive loop.
   ## For `isExec: true` the last four sym args are unused (pass any node).
-  let sendBufNode = newDotExpr(connSym, ident"sendBuf")
+  let sendBufSym = bindSym"sendBuf"
+  let evictForInsertSym = bindSym"evictForInsert"
+  let beginSendBufSym = bindSym"beginSendBuf"
+  let stmtCachingEnabledSym = bindSym"stmtCachingEnabled"
+  let sendBufNode = newCall(sendBufSym, connSym)
 
   proc rfNode(): NimNode =
     if isExec:
@@ -412,27 +423,27 @@ proc buildDirectSendDispatch(
     sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
   )
   hitBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
+    `sendBufSym`(`connSym`).addExecute("", 0)
+    `sendBufSym`(`connSym`).addSync()
 
   # Cache miss path
   let missBlock = newStmtList()
   missBlock.add quote do:
     `cacheMissSym` = true
     `stmtNameSym` = `connSym`.nextStmtName()
-    `connSym`.evictForInsert()
+    `evictForInsertSym`(`connSym`)
   if not isExec:
     missBlock.add quote do:
       `effectiveRfSym` = @[]
   missBlock.add makeParseDirectCall(sendBufNode, stmtNameSym, sqlSym, argList)
   missBlock.add quote do:
-    `connSym`.sendBuf.addDescribe(dkStatement, `stmtNameSym`)
+    `sendBufSym`(`connSym`).addDescribe(dkStatement, `stmtNameSym`)
   missBlock.add makeBindDirectCall(
     sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
   )
   missBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
+    `sendBufSym`(`connSym`).addExecute("", 0)
+    `sendBufSym`(`connSym`).addSync()
 
   # No-cache path
   let elseBlock = newStmtList()
@@ -445,10 +456,10 @@ proc buildDirectSendDispatch(
   )
   if not isExec:
     elseBlock.add quote do:
-      `connSym`.sendBuf.addDescribe(dkPortal, "")
+      `sendBufSym`(`connSym`).addDescribe(dkPortal, "")
   elseBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
+    `sendBufSym`(`connSym`).addExecute("", 0)
+    `sendBufSym`(`connSym`).addSync()
 
   let dispatch = newNimNode(nnkIfStmt)
   dispatch.add(
@@ -459,14 +470,14 @@ proc buildDirectSendDispatch(
     )
   )
   let missCondition = quote:
-    `connSym`.stmtCachingEnabled
+    `stmtCachingEnabledSym`(`connSym`)
   dispatch.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
   dispatch.add(newNimNode(nnkElse).add(elseBlock))
   # One owner for the buffer reset: the three arms differ in what they emit,
   # not in needing an emptied buffer with the queued Closes staged in.
   result = newStmtList()
   result.add quote do:
-    `connSym`.beginSendBuf()
+    `beginSendBufSym`(`connSym`)
   result.add dispatch
 
 proc extractTimeoutArg(
@@ -500,6 +511,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   ## ``sql`` populated — ``params`` is left empty to preserve the zero-alloc
   ## guarantee.
   result = newStmtList()
+  # Emitted into caller scope; `bindSym` keeps privates reachable w/o imports.
 
   let (positional, timeoutExpr) = extractTimeoutArg(args)
   validatePlaceholderArity(sql, positional.len, "queryDirect")
@@ -628,6 +640,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   ## ``sql`` populated — ``params`` is left empty to preserve the zero-alloc
   ## guarantee.
   result = newStmtList()
+  # Emitted into caller scope; `bindSym` keeps privates reachable w/o imports.
 
   let (positional, timeoutExpr) = extractTimeoutArg(args)
   validatePlaceholderArity(sql, positional.len, "execDirect")

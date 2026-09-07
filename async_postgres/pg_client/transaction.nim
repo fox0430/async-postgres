@@ -1,11 +1,18 @@
 ## Transaction- and savepoint-scoping macros: `withTransaction`,
 ## `withSavepoint`, and their deadline-bounded variants.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[macros, options]
 
 import ../[async_backend, pg_protocol, pg_connection]
 import ../pg_connection/[types, simple_query]
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc hasReturnStmt(n: NimNode): bool =
   ## Check whether an AST contains a `return` statement (excluding nested
@@ -161,15 +168,17 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
   let cleanupDefectSym = genSym(nskLet, "cleanupDefect")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
   let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
     bindCleanupSkippedSyms()
   let ckTxRollbackSym = bindSym"ckTxRollback"
   quote:
-    if `connSym`.state != `csReadySym`:
+    if `stateSym`(`connSym`) != `csReadySym`:
       `fireCleanupSkippedSym`(`connSym`, `ckTxRollbackSym`, `csrConnInvalidatedSym`)
-    elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+    elif `txStatusSym`(`connSym`) in {`tsInTxSym`, `tsInFailedSym`}:
       try:
         discard await `connSym`.simpleExec("ROLLBACK", timeout = `rollbackTimeout`)
       except CancelledError as `cleanupCancelSym`:
@@ -206,15 +215,17 @@ proc buildSavepointRollbackCleanup(
   let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
   let cleanupDefectSym = genSym(nskLet, "cleanupDefect")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
   let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
     bindCleanupSkippedSyms()
   let ckSpRollbackSym = bindSym"ckSavepointRollback"
   quote:
-    if `connSym`.state != `csReadySym`:
+    if `stateSym`(`connSym`) != `csReadySym`:
       `fireCleanupSkippedSym`(`connSym`, `ckSpRollbackSym`, `csrConnInvalidatedSym`)
-    elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+    elif `txStatusSym`(`connSym`) in {`tsInTxSym`, `tsInFailedSym`}:
       try:
         discard await `connSym`.simpleExec(
           "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `rollbackTimeout`
@@ -261,10 +272,8 @@ proc buildDeadlineAwaitAndTimeout(
   ## invalidate-and-raise path. See the matching note in pg_pool's
   ## withTransactionDeadline.
   ##
-  ## Cancellation skips `catchableCleanup` (a fresh await would just re-cancel)
-  ## but still dispatches a server-side CancelRequest via `cancelNoWait` and
-  ## marks the connection `csClosed`, so the server-side transaction does not
-  ## linger past the client-side cancel and the connection cannot be reused.
+  ## Cancel skips cleanup and invalidates (idempotent; chronos can run both
+  ## timeout arms for one deadline).
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let eSym = genSym(nskLet, "e")
   let cancelSym = genSym(nskLet, "cancel")
@@ -317,6 +326,8 @@ proc buildRetryTxLoop*(
   let dSym = genSym(nskLet, "d")
   let cancelSym = genSym(nskLet, "cancel")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsIdleSym = bindSym"tsIdle"
   let isRetryableSym = bindSym"isRetryableTxError"
   let backoffSym = bindSym"backoffDelayMs"
@@ -335,22 +346,21 @@ proc buildRetryTxLoop*(
         discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
         break
       except CancelledError as `cancelSym`:
-        # Never retry cancellation; skip the async cleanup (would just re-cancel).
-        # Dispatch a server-side CancelRequest and mark csClosed so the server tx
-        # is aborted and the (now unusable) conn is discarded by the outer
-        # release/close path.
+        # Never retry cancel; invalidate and let outer release tear down transport.
         `invalidateCancelSym`(`connSym`, releaseTransport = false)
         raise `cancelSym`
       except CatchableError as `eSym`:
         `cleanup`
         if `attemptSym` < `retryOptsSym`.maxAttempts and
             `isRetryableSym`(`eSym`, `retryOptsSym`.retryableStates) and
-            `connSym`.state == `csReadySym` and `connSym`.txStatus == `tsIdleSym`:
+            `stateSym`(`connSym`) == `csReadySym` and
+            `txStatusSym`(`connSym`) == `tsIdleSym`:
           await `sleepSym`(`backoffSym`(`retryOptsSym`, `attemptSym`))
           continue
         raise `eSym`
       except Defect as `dSym`:
         `cleanup`
+        # Re-raise; deadline variants wrap.
         raise `dSym`
 
 proc buildRetryDeadlineLoop*(
@@ -384,6 +394,8 @@ proc buildRetryDeadlineLoop*(
   let cancelSym = genSym(nskLet, "cancel")
   let backoffMsSym = genSym(nskLet, "backoffMs")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsIdleSym = bindSym"tsIdle"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
@@ -398,9 +410,9 @@ proc buildRetryDeadlineLoop*(
       newLit(true)
     else:
       infix(
-        infix(newDotExpr(connForStateCheck, ident"state"), "==", csReadySym),
+        infix(newCall(stateSym, connForStateCheck), "==", csReadySym),
         "and",
-        infix(newDotExpr(connForStateCheck, ident"txStatus"), "==", tsIdleSym),
+        infix(newCall(txStatusSym, connForStateCheck), "==", tsIdleSym),
       )
   # Conn variant owns `connForStateCheck` and must abort server-side on cancel;
   # pool variant handles cancel inside `bodyFn` (which owns the acquired conn),
@@ -518,9 +530,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
     except CancelledError as `cancelSym`:
-      # Skip ROLLBACK on cancel (a fresh await would just re-cancel), but abort
-      # server-side via CancelRequest and mark csClosed so the server tx does
-      # not linger holding locks and the conn is not silently reused.
+      # Skip ROLLBACK on cancel; invalidate instead.
       `invalidateCancelSym`(`connSym`, releaseTransport = false)
       raise `cancelSym`
     except CatchableError as `eSym`:
@@ -528,6 +538,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       raise `eSym`
     except Defect as `dSym`:
       `bodyCleanup`
+      # Re-raise; deadline variants wrap.
       raise `dSym`
     checkNoBodyEscapePost(
       block:
@@ -614,18 +625,13 @@ macro withTransactionRetry*(
     )
 
 proc savepointNameExpr(connSym, spName: NimNode): NimNode {.compileTime.} =
-  ## Build the NimNode that produces the savepoint name at runtime.
-  ## When `spName` is non-nil (caller passed an explicit name) it is used as-is.
-  ## Otherwise emits `block: inc conn.portalCounter; "_sp_" & $conn.portalCounter`,
-  ## which guarantees distinct names for unnamed savepoints on the same connection.
+  ## Savepoint name expr: explicit name as-is, else `nextPortalName` for uniqueness.
   if spName != nil:
     spName
   else:
-    let portalCounterSym = ident"portalCounter"
+    let nextPortalNameSym = bindSym"nextPortalName"
     quote:
-      block:
-        inc `connSym`.`portalCounterSym`
-        "_sp_" & $`connSym`.`portalCounterSym`
+      `nextPortalNameSym`(`connSym`, "_sp_")
 
 macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a SAVEPOINT.
@@ -708,9 +714,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
       )
     except CancelledError as `cancelSym`:
-      # See withTransaction: skip async cleanup but abort server-side so the
-      # outer transaction does not linger with an orphan savepoint frame, and
-      # mark csClosed so the conn is not silently reused.
+      # As withTransaction: skip cleanup, invalidate instead.
       `invalidateCancelSym`(`connSym`, releaseTransport = false)
       raise `cancelSym`
     except CatchableError as `eSym`:
@@ -718,6 +722,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
       raise `eSym`
     except Defect as `dSym`:
       `spCleanup`
+      # Re-raise; deadline sibling wraps.
       raise `dSym`
     checkNoBodyEscapePost(
       block:

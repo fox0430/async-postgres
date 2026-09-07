@@ -2,8 +2,9 @@
 ##
 ## The hierarchy encodes *recovery*: ``PgProtocolError`` and ``PgTimeoutError``
 ## are ``PgConnectionError`` because both leave the wire unusable, so reconnect
-## loops must see them; ``PgStateError`` is deliberately a sibling, being a
-## programming error that reconnecting cannot fix.
+## loops must see them; ``PgStateError`` and ``PgConfigError`` are deliberately
+## siblings, being a programming error and a configuration fault that
+## reconnecting cannot fix.
 ##
 ## ``PgTypeError`` = caller data the wire format cannot carry; ``PgQueryError`` =
 ## an error the server reported; ``ValueError`` = a precondition, and the one kind
@@ -36,7 +37,9 @@ type
     ## caller requested a non-nullable result.
 
   PgConnectionError* = object of PgError
-    ## Connection failures, disconnections, SSL/auth errors.
+    ## Connection failures, disconnections, TLS handshake and auth errors. A TLS
+    ## fault that stems from the config itself (a cert, key or CA that will not
+    ## load) is a ``PgConfigError`` instead.
 
   PgProtocolError* = object of PgConnectionError
     ## Raised on PostgreSQL wire protocol violations. The connection stream is
@@ -54,6 +57,17 @@ type
     ## A programming error, not a connection failure: deliberately **not** a
     ## ``PgConnectionError``, so reconnect loops will not spin on it. Give each
     ## concurrent caller its own connection (e.g. via a ``PgPool``).
+
+  PgConfigError* = object of PgError
+    ## A ``ConnConfig`` fault no retry can fix: a cert/key/CA that will not
+    ## load, a cert without its key, an sslmode that contradicts another option.
+    ## Every host shares one config, so ``connect`` raises it in place of the
+    ## per-host ``PgConnectionError`` aggregate. A fault of a single host entry
+    ## (a verify-full entry without a host name) is per host, not config-wide,
+    ## and stays a ``PgConnectionError``.
+    ##
+    ## Deliberately **not** a ``PgConnectionError``, so reconnect loops will not
+    ## spin on it; a ``PgPool`` that sees one stops dialing (``pekConfigFault``).
 
   PgQueryError* = object of PgError
     ## SQL execution error reported by the server (ErrorResponse).
@@ -94,6 +108,11 @@ type
     pekConnectFailed
       ## A connect attempt failed during acquire (underlying error in `parent`);
       ## retrying may succeed.
+    pekConfigFault
+      ## The pool's `connConfig` can never connect: a connect raised
+      ## `PgConfigError` (preserved as `parent`). Retrying cannot succeed, so
+      ## the pool stops opening connections and every later acquire that needs
+      ## one fails with this kind without dialing.
     pekBatchFailed ## A pipelined batch was unservable; no connection was acquired.
     pekDefectWrapped
       ## A user-code `Defect` (body/release block or session reset) wrapped to
@@ -101,8 +120,8 @@ type
 
   PgPoolError* = object of PgError
     ## Pool-level acquire/operation failure (closed, acquire timeout, queue
-    ## full, connect failed, unservable batch, or a wrapped user-code
-    ## ``Defect``; the underlying error is preserved as ``parent``).
+    ## full, connect failed, config fault, unservable batch, or a wrapped
+    ## user-code ``Defect``; the underlying error is preserved as ``parent``).
     ##
     ## ``kind`` classifies the failure programmatically; the message string is
     ## informational only. Errors built without ``newPoolError`` have

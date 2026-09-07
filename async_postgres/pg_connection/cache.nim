@@ -6,13 +6,17 @@
 ## adding via `addStmtCache`, and use `pendingStmtCloses` to bundle Close
 ## messages with the next operation's Sync.
 ##
-## Internal: not re-exported through `pg_connection.nim`; import this module
-## directly.
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[tables, lists]
 
 import ../[async_backend, pg_protocol]
 import types, buffer_io
+
+import std/importutils
+privateAccess(PgConnection)
 
 const stmtNamePrefix* = "_sc_"
 

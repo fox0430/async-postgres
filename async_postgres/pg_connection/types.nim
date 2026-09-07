@@ -1,10 +1,8 @@
-## Internal building blocks shared by every `pg_connection/` submodule.
-## Contains the `PgConnection` ref type, `ConnConfig`, tracing data types,
-## public read-only/read-write accessors, internal accessors for cross-module
-## use within the library, and the tracing helper templates.
+## Shared building blocks for ``pg_connection`` submodules (``PgConnection``, ``ConnConfig``, tracing).
 ##
-## Re-exported through `pg_connection.nim`; submodules import this module
-## directly.
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[tables, sets, deques, lists]
 when defined(posix):
@@ -62,19 +60,10 @@ type
     crClosed ## The connection died on its own.
 
   SslMode* = enum
-    ## SSL/TLS negotiation mode for the connection.
-    ##
-    ## Note: `sslDisable` is the enum's zero value, so a zero-initialized
-    ## `ConnConfig` has SSL disabled. The constructor helpers `parseDsn` and
-    ## `initConnConfig`, however, default to `sslPrefer` to match libpq and
-    ## avoid silently sending credentials in plaintext.
-    ##
-    ## Backend divergence (chronos/BearSSL vs asyncdispatch/OpenSSL):
-    ## - `sslRequire`: chronos rejects expired/not-yet-valid server certs;
-    ##   asyncdispatch and libpq accept them.
-    ## - `sslVerifyFull` + IP-literal host: chronos raises `PgConnectionError`
-    ##   (BearSSL matches only dNSName SAN); asyncdispatch verifies IP-SAN
-    ##   certs via `set1_ip_asc`.
+    ## SSL mode. Zero value is ``sslDisable`` (raw ``ConnConfig``); ``parseDsn``/
+    ## ``initConnConfig`` default to ``sslPrefer`` (libpq parity).
+    ## Backend divergence: chronos/BearSSL rejects expired certs and lacks IP SAN
+    ## for ``sslVerifyFull``; asyncdispatch matches libpq.
     sslDisable ## Disable SSL
     sslAllow ## Try plaintext; fall back to SSL if refused
     sslPrefer ## Try SSL; fall back to plaintext if refused (libpq default)
@@ -112,14 +101,9 @@ type
     tsaPreferStandby ## Prefer standby, fall back to any
 
   LoadBalanceHosts* = enum
-    ## Host connection ordering for a multi-host connection (libpq compatible).
-    lbhDisable ## Try hosts in the configured order (default)
-    lbhRandom
-      ## Shuffle the configured host list once per connection so a pool of
-      ## connections spreads across hosts (e.g. read replicas). Only the
-      ## multi-host list is reordered — multiple addresses behind a single host
-      ## name are not shuffled. See `orderedHosts` for the seeding and
-      ## thread-safety details.
+    ## Host ordering (libpq ``load_balance_hosts``).
+    lbhDisable ## Configured order (default)
+    lbhRandom ## Shuffle host list per connection (replica spread)
 
   HostEntry* = object ## A single host:port entry for multi-host connection.
     host*: string ## Host name (or Unix socket dir); used for SSL verification
@@ -157,26 +141,12 @@ type
       ## **unencrypted** on both backends (no passphrase callback is wired up).
       ## On chronos/BearSSL specifically it must be PKCS#8 (RSA or EC); PKCS#1
       ## is not supported. Must be paired with ``sslCert``.
-    sslSni*: bool
-      ## Send TLS SNI extension during the handshake (libpq `sslsni`, default
-      ## true). Applies to every mode that establishes TLS. Suppressed
-      ## automatically when the host is an IP literal (RFC 6066 §3) or empty
-      ## (hostaddr-only). Set false only for backends that reject or misroute
-      ## on SNI (a raw zero-initialized `ConnConfig` therefore has SNI off —
-      ## use `parseDsn` or `initConnConfig` for the libpq-parity default).
+    sslSni*: bool ## Send TLS SNI (default true; suppressed for IP/empty host).
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
     requireAuth*: set[AuthMethod]
-      ## Allowlist of auth methods the client will accept. An empty set
-      ## (default) means "allow any" — matching libpq when `require_auth` is
-      ## unset. If the server requests a method outside this set, connect
-      ## fails with `PgConnectionError`. For SASL, advertised mechanisms are
-      ## filtered and the selected mechanism is validated.
-      ##
-      ## Note: libpq's `!`-prefix negation syntax (e.g. `!password`) is not
-      ## yet supported by `parseRequireAuth` — specify the allowed methods
-      ## positively instead.
+      ## Allowed auth methods; empty = any (libpq ``require_auth`` parity).
     applicationName*: string
     connectTimeout*: Duration ## TCP connect timeout (default: no timeout)
     keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
@@ -191,12 +161,7 @@ type
       ## order.
     extraParams*: seq[(string, string)] ## Additional startup parameters
     maxMessageSize*: int
-      ## Upper bound (in bytes) on a single backend message including
-      ## its 1-byte type and 4-byte length header. A server claiming a
-      ## larger message is rejected with `PgProtocolError` before any
-      ## further recv-buffer growth, capping memory exposure to a
-      ## misbehaving or malicious peer. ``0`` (default) selects
-      ## `DefaultMaxBackendMessageLen` (1 GiB).
+      ## Max backend message size (0 = 1 GiB default); larger → ``PgProtocolError``.
     maxScramIterations*: int
       ## Upper bound on the server-requested SCRAM iteration count
       ## (PostgreSQL 16+ `scram_iterations`), capping CPU spent in PBKDF2.
@@ -217,18 +182,22 @@ type
   NoticeCallback* = proc(notice: Notice) {.gcsafe, raises: [].}
     ## Callback invoked when a notice/warning message arrives.
 
-  CachedStmt* = ref object ## A cached prepared statement in the LRU statement cache.
-    name*: string ## Server-side statement name ("_sc_1", "_sc_2", ...)
-    fields*: seq[FieldDescription] ## From Describe(Statement), formatCode=0
+  ReconnectCallback* = proc() {.gcsafe, raises: [].}
+    ## Callback invoked after the listen pump reconnects and re-subscribes.
+
+  NotifyOverflowCallback* = proc(dropped: int) {.gcsafe, raises: [].}
+    ## Callback invoked when the pull-API queue overflows. ``dropped`` counts
+    ## what this one arrival discarded; ``notifyDropped`` is the running count
+    ## since the last overflow ``waitNotification`` reported.
+
+  ListenErrorCallback* = proc(err: ref PgListenError) {.gcsafe, raises: [].}
+    ## Callback invoked when the listen pump dies permanently.
+
+  CachedStmt* = ref object ## Cached prepared statement (LRU).
+    name*: string ## Server-side name (``_sc_*``)
+    fields*: seq[FieldDescription] ## Describe result
     paramOids*: seq[int32]
-      ## Input parameter type OIDs from ParameterDescription. Used to detect
-      ## type-mismatch on cache hit: if a later call binds the same SQL with
-      ## different parameter OIDs, the server would interpret the bytes using
-      ## the original parse-time types, silently corrupting results. The
-      ## cache-hit path checks these against the caller's OIDs and falls back
-      ## to a re-parse when they diverge. Empty for parameter-less SQL —
-      ## an empty-vs-empty comparison matches trivially and the cache entry
-      ## is reused.
+      ## Parse-time param OIDs; mismatch → re-parse (empty = no params)
     resultFormats*: seq[int16] ## Cached buildResultFormats() output
     colFmts*: seq[int16] ## Per-column format codes for RowData
     colOids*: seq[int32] ## Per-column type OIDs for RowData
@@ -242,26 +211,26 @@ type
   PgConnection* = ref object
     ## A single PostgreSQL connection with buffered I/O and statement caching.
     when hasChronos:
-      transport*: StreamTransport
-      baseReader*: AsyncStreamReader
-      baseWriter*: AsyncStreamWriter
-      reader*: AsyncStreamReader
-      writer*: AsyncStreamWriter
-      tlsStream*: TLSAsyncStream
-      trustAnchorBufs*: seq[seq[byte]] ## Backing memory for custom trust anchor pointers
-      x509Capture*: X509CertCaptureContext ## X509 wrapper for cert capture
+      transport: StreamTransport
+      baseReader: AsyncStreamReader
+      baseWriter: AsyncStreamWriter
+      reader: AsyncStreamReader
+      writer: AsyncStreamWriter
+      tlsStream: TLSAsyncStream
+      trustAnchorBufs: seq[seq[byte]] ## Backing memory for custom trust anchor pointers
+      x509Capture: X509CertCaptureContext ## X509 wrapper for cert capture
     elif hasAsyncDispatch:
-      socket*: AsyncSocket
-    serverCertDer*: seq[byte] ## DER-encoded server certificate for SCRAM channel binding
-    sslEnabled*: bool
-    recvBuf*: seq[byte]
-    recvBufStart*: int ## Read pointer into recvBuf; bytes before this are consumed
-    state*: PgConnState
-    pendingSyncs*: int
+      socket: AsyncSocket
+    serverCertDer: seq[byte] ## DER-encoded server certificate for SCRAM channel binding
+    sslEnabled: bool
+    recvBuf: seq[byte]
+    recvBufStart: int ## Read pointer into recvBuf; bytes before this are consumed
+    state: PgConnState
+    pendingSyncs: int
       ## ``ReadyForQuery`` replies the backend still owes: one per simple
       ## ``Query`` and per ``Sync`` written, less one per reply read. A count,
       ## not a flag: a pipelined batch owes several. Read via ``wireSettled``.
-    unsyncedWrite*: bool
+    unsyncedWrite: bool
       ## Replies were asked for past the last sync point, so nothing on the
       ## wire will end them (an extended-query batch stopping at ``Flush``, as
       ## every cursor round trip does). Only a later write carrying a sync
@@ -271,82 +240,79 @@ type
       ## Both are separate from ``state``: the read path marks ``csClosed`` as
       ## soon as a read dies, while the requests it was reading for are still
       ## running server-side and are what a ``CancelRequest`` must abort.
-    pid*: int32
-    secretKey*: int32
-    serverParams*: Table[string, string]
-    negotiatedMinorVersion*: int32
+    pid: int32
+    secretKey: int32
+    serverParams: Table[string, string]
+    negotiatedMinorVersion: int32
       ## Highest minor version the server supports, from `NegotiateProtocolVersion`.
       ## Zero when no such message was seen.
-    unrecognizedStartupOptions*: seq[string]
+    unrecognizedStartupOptions: seq[string]
       ## `_pq_.*` options the server rejected, from `NegotiateProtocolVersion`.
-    txStatus*: TransactionStatus
-    notifyCallback*: NotifyCallback
-    noticeCallback*: NoticeCallback
-    listenChannels*: HashSet[string]
-    borrowedByUser*: bool
+    txStatus: TransactionStatus
+    notifyCallback: NotifyCallback
+    noticeCallback: NoticeCallback
+    listenChannels: HashSet[string]
+    borrowedByUser: bool
       ## Handed to the application (not a pool-internal borrow); see ``release``.
-    stagedStmtCloses*: seq[string]
+    stagedStmtCloses: seq[string]
       ## Names taken out of ``pendingStmtCloses`` by a build that wrote their
       ## ``Close`` into its buffer. Held until that send succeeds, so an
       ## aborted build leaves them owed rather than lost.
     when defined(pgStateChecks):
-      sendBufStaged*: bool
+      sendBufStaged: bool
         ## Debug-only: a build has staged its ``Close`` messages and the send
         ## that clears them has not run yet. See ``requireStaged``.
-    transportCloseFut*: Future[void]
+    transportCloseFut: Future[void]
       ## In-flight ``closeTransport``; a second teardown awaits it.
-    listenTask*: Future[void]
-    listenStopRequested*: bool
+    listenTask: Future[void]
+    listenStopRequested: bool
       ## Set by `stopListening` or `close()` to ask the background pump to exit.
       ## The pump checks it at every yield point of its auto-reconnect loop, and
       ## `reconnectInPlace` checks it right after `connect()` returns to discard
       ## the fresh transport instead of grafting it. Left set deliberately when a
       ## pump is orphaned on timeout — clearing it would rearm that graft.
-    listenReconnecting*: bool
+    listenReconnecting: bool
       ## True while the pump is inside its auto-reconnect loop. Tells
       ## `stopListening` that the empty-query unblock it normally uses would race
       ## the reconnect's own LISTEN round trips, so it must wait for the pump to
       ## observe `listenStopRequested` instead of sending the query.
-    host*: string
-    port*: int
-    createdAt*: Moment
-    portalCounter*: int
-    config*: ConnConfig
-    notifyQueue*: Deque[Notification]
-    notifyMaxQueue*: int
-      ## Pull-API (`waitNotification`) queue cap. Default 1024. A positive value
-      ## bounds the queue and drops the oldest notifications on overflow
-      ## (tracked via `notifyDropped`). `0` or negative means unbounded — the
-      ## queue grows until drained, matching libpq/psycopg and Python's
-      ## `queue.Queue(maxsize<=0)`. The push API (`onNotify`) is unaffected by
-      ## this setting and always fires.
-    notifyWaiter*: Future[void]
-    notifyHandoff*: Notification
+    host: string
+    port: int
+    createdAt: Moment
+    portalCounter: int
+    config: ConnConfig
+    notifyQueue: Deque[Notification]
+    notifyMaxQueue: int
+      ## Pull-API queue cap (1024 default; <=0 = unbounded). A handoff and a
+      ## requeue of it sit outside the queue, so at most ``notifyMaxQueue + 1``
+      ## notifications are retained.
+    notifyWaiter: Future[void]
+    notifyHandoff: Notification
       ## Reserved handoff for completed ``notifyWaiter`` (see ``hasNotifyHandoff``).
-    hasNotifyHandoff*: bool
-    sendBuf*: seq[byte] ## Reusable send buffer for COPY IN batching
-    notifyDropped*: int ## Count of notifications dropped due to queue overflow
-    listenError*: ref PgListenError ## Set when listen pump fails permanently
-    closedByUser*: bool
+    hasNotifyHandoff: bool
+    sendBuf: seq[byte] ## Reusable send buffer for COPY IN batching
+    notifyDropped: int ## Count of notifications dropped due to queue overflow
+    listenError: ref PgListenError ## Set when listen pump fails permanently
+    closedByUser: bool
       ## Set by `close()`, one-way. Keeps a deliberate close out of
       ## `PgConnectionError` reconnect loops (see `closedReason`).
-    listenReconnectMaxAttempts*: int
+    listenReconnectMaxAttempts: int
       ## Max reconnect attempts on listen pump failure. Default 10.
       ## 0 or negative = unlimited retries (retry until close()).
-    listenReconnectMaxBackoff*: int
+    listenReconnectMaxBackoff: int
       ## Max seconds between reconnect attempts (backoff cap). Default 30.
-    reconnectCallback*: proc() {.gcsafe, raises: [].}
-    notifyOverflowCallback*: proc(dropped: int) {.gcsafe, raises: [].}
-    listenErrorCallback*: proc(err: ref PgListenError) {.gcsafe, raises: [].}
+    reconnectCallback: ReconnectCallback
+    notifyOverflowCallback: NotifyOverflowCallback
+    listenErrorCallback: ListenErrorCallback
       ## Invoked when the listen pump dies permanently (reconnection failed or
       ## the connection was lost with nothing left to re-subscribe). Lets push
       ## API (`onNotify`) users learn the pump is gone — the pull API surfaces
       ## the same failure through `waitNotification`.
-    stmtCache*: Table[string, CachedStmt]
-    stmtCacheLru*: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
-    stmtCounter*: int
-    stmtCacheCapacity*: int ## 0=disabled, default 256
-    pendingStmtCloses*: seq[string]
+    stmtCache: Table[string, CachedStmt]
+    stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
+    stmtCounter: int
+    stmtCacheCapacity: int ## 0=disabled, default 256
+    pendingStmtCloses: seq[string]
       ## Server-side prepared statement names whose ``Close`` was not bundled
       ## with the operation that evicted them. Populated when the defensive
       ## eviction loop in ``addStmtCache`` fires (caller skipped the
@@ -355,7 +321,7 @@ type
       ## start of the next Extended Query send phase so the leak is bounded
       ## to the gap until the next operation, which moves them to
       ## ``stagedStmtCloses``.
-    heldSessionLocks*: int
+    heldSessionLocks: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
       ## API, minus tracked releases. Reported (best-effort) by the
       ## `onLeakedSessionLocks` tracer hook. Raw-SQL acquires
@@ -367,62 +333,25 @@ type
       ## decision and the leak-hook trigger both key off `sessionLockDirty`
       ## instead, so a mis-decremented counter cannot leak a tracked lock
       ## into the next borrower or silence the leak signal.
-    sessionLockDirty*: bool
+    sessionLockDirty: bool
       ## Sticky flag: set on any tracked session-level acquire, cleared only
       ## by `advisoryUnlockAll` or connection reset. Drives the pool's
       ## reset/discard decision so `pg_advisory_unlock_all` runs whenever a
       ## tracked acquire ever happened, even if the tracked counter was
       ## decremented back to zero by a typed unlock of a raw-acquired key.
-    tracer*: PgTracer ## Inherited from ConnConfig on connect
-    ownerPool*: PgPoolOwner
+    tracer: PgTracer ## Inherited from ConnConfig on connect
+    ownerPool: PgPoolOwner
       ## Owning pool back-reference. Set when this connection is managed by
       ## a `PgPool` (or a pool inside `PgPoolCluster`); `nil` for standalone
       ## connections created via `connect`. Used by `release(conn)` to route
       ## the connection back to the correct pool.
-    borrowed*: bool
-      ## Whether this connection is currently checked out from its owning pool.
-      ## Set when `acquire` hands it to a caller (or directly to a queued
-      ## waiter) and cleared when it returns to the pool's idle set or is
-      ## discarded. `release(conn)` uses it to turn a duplicate release of an
-      ## already-returned connection into a no-op (reported via the tracer's
-      ## `onPoolDoubleRelease`) instead of registering the same connection in
-      ## the idle deque twice — which would otherwise hand one connection to
-      ## two borrowers and corrupt their wire protocol. Always false for
-      ## standalone connections created via `connect`.
-      ##
-      ## This guards the common double release — a connection that is already
-      ## sitting idle. It does NOT catch a back-to-back double release whose
-      ## first release served a queued waiter: the handoff re-marks the
-      ## connection `borrowed` for the waiter, so an erroneous second release
-      ## passes the guard and can hand the in-use connection to yet another
-      ## borrower. Raw `acquire` / `release(conn)` callers carry that risk;
-      ## `PooledConnHandle` (its own `released` flag) and the `with*` templates
-      ## are the fully safe paths.
+    borrowed: bool
+      ## Checked-out from pool? Guards idle double-release (not waiter-handoff double-release; use ``PooledConnHandle``).
     replConfirmedFlushLsnRaw: uint64
-      ## Internal replication state: raw LSN value up to which the application
-      ## has confirmed received WAL is durably flushed during a replication
-      ## stream. Public API users go through `confirmFlushed` /
-      ## `confirmedFlushLsn` in `pg_replication`, which add the `Lsn` typing,
-      ## the monotonic guard, and the received-WAL bound check. Manipulated
-      ## via the exported helpers in this module (see below).
-    replMaxReceivedLsnRaw: uint64
-      ## Internal replication state: highest WAL position actually received
-      ## from the wire during the current stream (`XLogData` end LSN, not the
-      ## server's `walEnd`). Initialised to the stream's `startLsn` and updated
-      ## by `startReplication` / `startPhysicalReplication`. Used by
-      ## `confirmFlushed` to reject confirmations beyond received WAL.
-      ## Manipulated via the exported helpers in this module (see below).
-    replReadScratch*: seq[byte]
-      ## Reusable scratch buffer for `fillRecvBufDetached` (chronos only). The
-      ## proactive status-interval path keeps a single read in flight across
-      ## timer wakes; reading into this private buffer (instead of growing
-      ## `recvBuf` up front like `fillRecvBuf`) keeps `recvBuf` parseable while
-      ## that read is still pending. Allocated lazily to `RecvBufSize` and reused.
-    replCopyDoneSent*: bool
-      ## Set by `stopReplication`; recv loop skips its mirroring CopyDone when
-      ## the client already sent one. A second 'c' arrives after the server left
-      ## COPY mode and would be `invalid frontend message type`. Reset per
-      ## stream by `resetReplLsnTracking`.
+      ## Replication: confirmed flush LSN (raw; see ``pg_replication``).
+    replMaxReceivedLsnRaw: uint64 ## Replication: max received LSN (raw).
+    replReadScratch: seq[byte] ## Chronos scratch for ``fillRecvBufDetached``.
+    replCopyDoneSent: bool ## Client already sent CopyDone (skip mirror).
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -520,13 +449,7 @@ type
     wasClosed*: bool ## true if connection was closed instead of returned to pool
     handedToWaiter*: bool ## true if connection was given directly to a waiting acquirer
 
-  TracePoolDoubleReleaseData* = object
-    ## Data passed to the pool double-release hook. Fired when `release(conn)`
-    ## is called on a connection that is not currently checked out — a
-    ## duplicate release, or a connection that never came from this pool's
-    ## `acquire`. The release is a no-op (the connection is left untouched), so
-    ## this hook is the only signal that a borrow-site bug double-returned a
-    ## connection.
+  TracePoolDoubleReleaseData* = object ## Double-release hook data (no-op release).
     conn*: PgConnection
 
   TracePoolCloseErrorData* = object
@@ -545,76 +468,29 @@ type
     tcsBaseWriter
     tcsTransport
 
-  TraceTransportCloseErrorData* = object
-    ## Data passed to the transport close-error hook. Fired when a chronos
-    ## ``closeWait()`` call raises while ``closeTransport`` is releasing
-    ## connection resources. These errors are otherwise swallowed because
-    ## teardown must release every transport resource regardless of
-    ## individual failures, leaving operators with no signal for half-closed
-    ## TLS sessions, BearSSL ``close_notify`` mismatches, or peer RSTs.
+  TraceTransportCloseErrorData* = object ## Transport close-error hook data.
     conn*: PgConnection
     stage*: TransportCloseStage
     err*: ref CatchableError
 
-  CleanupKind* = enum
-    ## Which automatic cleanup operation was skipped or whose failure was
-    ## swallowed. Reported through `onCleanupSkipped` so operators can
-    ## distinguish outer-transaction cleanup from savepoint cleanup.
-    ckTxRollback ## Outer `ROLLBACK` (withTransaction / withTransactionDeadline)
-    ckSavepointRollback
-      ## `ROLLBACK TO SAVEPOINT` (withSavepoint / withSavepointDeadline)
+  CleanupKind* = enum ## Cleanup operation kind.
+    ckTxRollback ## Outer ``ROLLBACK``
+    ckSavepointRollback ## ``ROLLBACK TO SAVEPOINT``
 
-  CleanupSkipReason* = enum
-    ## Why an automatic cleanup operation did not run to completion.
-    csrConnInvalidated
-      ## The connection was already `csClosed` (typically because a per-call
-      ## timeout invalidated it via `invalidateOnTimeout`). The cleanup SQL
-      ## was *never dispatched* — `err` on the event is nil.
-    csrCleanupFailed
-      ## The cleanup SQL was dispatched but raised. The failure was
-      ## swallowed so it cannot mask the original body/COMMIT error;
-      ## `err` carries the cleanup failure.
+  CleanupSkipReason* = enum ## Why cleanup didn't complete.
+    csrConnInvalidated ## Already ``csClosed`` — not dispatched (``err=nil``)
+    csrCleanupFailed ## Dispatched but raised (``err`` carries failure)
 
-  TraceCleanupSkippedData* = object
-    ## Advisory notification fired from `withTransaction*` / `withSavepoint*`
-    ## error-cleanup paths when ROLLBACK is either skipped (connection
-    ## already invalidated) or attempted but failed (failure swallowed to
-    ## preserve the original error). Useful for surfacing the diagnostic
-    ## asymmetry between the timeout path (silent skip) and the body-error
-    ## path (visible ROLLBACK simpleExec event).
+  TraceCleanupSkippedData* = object ## ROLLBACK skipped/failed advisory (advisory only).
     conn*: PgConnection
     kind*: CleanupKind
     reason*: CleanupSkipReason
     err*: ref CatchableError
-      ## Cleanup-SQL failure when `reason == csrCleanupFailed`; nil when
-      ## `reason == csrConnInvalidated` (nothing was dispatched).
 
   TraceLeakedSessionLocksData* = object
-    ## Advisory notification that a pool connection returned while still
-    ## dirty from a tracked session-level advisory acquire. Fires on the
-    ## sticky ``sessionLockDirty`` flag, not on the counter, so a raw acquire
-    ## whose release ran through the typed API — decrementing the counter
-    ## for a lock the counter never tracked — cannot silence this hook. The
-    ## pool handles cleanup itself — either running ``pg_advisory_unlock_all``
-    ## from ``resetSession`` and reusing the connection, or discarding it on
-    ## ``release`` when ``resetSession`` was bypassed. Use this hook to
-    ## detect missing ``advisoryUnlock`` / ``advisoryUnlockAll`` calls at
-    ## the borrow site, since silent cleanup would otherwise mask the leak.
-    ##
-    ## A failed ``withAdvisoryLock*`` unlock (see ``onAdvisoryUnlockFailed``)
-    ## does not decrement ``heldSessionLocks`` — the lock may still be held
-    ## server-side — so the same lock is reported again here when its
-    ## connection is returned to the pool, where ``pg_advisory_unlock_all``
-    ## finally clears it. The two hooks are distinct observation points
-    ## (unlock attempt vs. pool-return detection); de-duplicate per ``conn``
-    ## if a single event is wanted.
+    ## Leaked advisory-lock advisory (fires on ``sessionLockDirty``).
     conn*: PgConnection
-    count*: int
-      ## Value of ``heldSessionLocks`` at detection time. May be ``0`` when
-      ## a typed unlock of a raw-acquired key drove the counter to zero
-      ## while a still-held tracked (or raw) lock kept ``sessionLockDirty``
-      ## set — treat non-zero as a lower bound on tracked-lock leaks and
-      ## zero as "the counter cannot vouch, but a leak is still possible".
+    count*: int ## ``heldSessionLocks`` at detection (0 = counter unreliable).
 
   TraceInsecureAuthData* = object
     ## Advisory notification that a server-requested auth method is
@@ -634,40 +510,17 @@ type
     conn*: PgConnection
     authMethod*: AuthMethod ## The method the server requested
 
-  TraceAdvisoryUnlockFailedData* = object
-    ## Advisory notification that an explicit advisory unlock initiated by a
-    ## ``withAdvisoryLock*`` macro failed. The failure is swallowed so the
-    ## original exception raised by ``body`` is not masked. Session-level
-    ## advisory locks are released server-side when the connection closes,
-    ## so the macro's behaviour is unchanged. Use this hook to observe
-    ## unlock failures that would otherwise be invisible.
-    ##
-    ## A failed unlock does not decrement ``heldSessionLocks``, so the same
-    ## lock is also reported through ``onLeakedSessionLocks`` when its
-    ## connection is later returned to the pool (where it is finally cleared).
+  TraceAdvisoryUnlockFailedData* = object ## Swallowed unlock-failure advisory.
     conn*: PgConnection
-    key*: int64
-      ## Lock identifier for single-key variants. Zero when ``twoKey`` is
-      ## ``true``.
-    key1*: int32 ## First key for two-key variants. Zero for single-key variants.
-    key2*: int32 ## Second key for two-key variants. Zero for single-key variants.
-    shared*: bool
-      ## ``true`` for ``withAdvisoryLockShared*``, ``false`` for
-      ## ``withAdvisoryLock*``.
-    twoKey*: bool ## ``true`` for two-key variants, ``false`` for single-key variants.
-    err*: ref CatchableError
-      ## The exception raised by ``advisoryUnlock*`` /
-      ## ``advisoryUnlockShared*``. ``nil`` when the unlock query itself
-      ## succeeded but the server reported the lock was not held
-      ## (``pg_advisory_unlock*`` returned ``false``).
+    key*: int64 ## Single-key id (0 if ``twoKey``)
+    key1*: int32 ## First key (two-key only)
+    key2*: int32 ## Second key (two-key only)
+    shared*: bool ## Shared lock?
+    twoKey*: bool ## Two-key variant?
+    err*: ref CatchableError ## Nil = unlock returned false (not held)
 
   PgTracer* = ref object
-    ## Tracing hooks for async-postgres operations.
-    ## Set only the callbacks you need; nil callbacks are skipped with zero overhead.
-    ##
-    ## Start hooks return a ``TraceContext`` (opaque pointer) that is passed to the
-    ## corresponding End hook for correlation (e.g. timing, span linking).
-    ## Return nil from Start if you don't need correlation.
+    ## Tracing hooks (nil = skipped; Start → ``TraceContext`` → End).
     onConnectStart*:
       proc(data: TraceConnectStartData): TraceContext {.gcsafe, raises: [].}
     onConnectEnd*:
@@ -705,61 +558,23 @@ type
     onPoolReleaseEnd*:
       proc(ctx: TraceContext, data: TracePoolReleaseEndData) {.gcsafe, raises: [].}
     onPoolDoubleRelease*: proc(data: TracePoolDoubleReleaseData) {.gcsafe, raises: [].}
-      ## Fires when `release(conn)` is called on a connection that is not
-      ## currently checked out (a duplicate release, or a connection not
-      ## borrowed from this pool). Advisory only — the duplicate release is a
-      ## no-op, which is what keeps the same connection from being handed to
-      ## two borrowers. Use this to surface double-`release` bugs at the
-      ## borrow site.
+      ## Duplicate release (no-op).
     onPoolCloseError*: proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].}
     onTransportCloseError*:
       proc(data: TraceTransportCloseErrorData) {.gcsafe, raises: [].}
-      ## Fires when a transport ``closeWait()`` raises during teardown.
-      ## Advisory only — ``closeTransport`` continues releasing the remaining
-      ## resources regardless. Use this to surface half-closed TLS sessions
-      ## or peer RSTs that would otherwise be invisible.
+      ## Swallowed ``closeWait`` error.
     onLeakedSessionLocks*:
       proc(data: TraceLeakedSessionLocksData) {.gcsafe, raises: [].}
-      ## Fires when a pool connection returns holding session-level advisory
-      ## locks acquired through the typed API. Advisory only — the pool
-      ## handles cleanup as described in `TraceLeakedSessionLocksData`. Use
-      ## this to surface missing ``advisoryUnlock`` calls at the borrow site.
-      ## May also fire for a lock whose ``withAdvisoryLock*`` unlock already
-      ## failed via `onAdvisoryUnlockFailed`; see that type for details.
+      ## Leaked advisory locks on pool return.
     onCleanupSkipped*: proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].}
-      ## Fires from `withTransaction*` / `withSavepoint*` error paths when
-      ## an automatic ROLLBACK is either skipped (connection already
-      ## `csClosed`, e.g. after a per-call timeout) or attempted but failed
-      ## (failure swallowed to keep the original error). Advisory only —
-      ## the macro's behaviour is unchanged. Use this to close the
-      ## diagnostic gap between the timeout path (silent) and the body-
-      ## error path (visible ROLLBACK simpleExec event).
-      ##
-      ## **Nested macros may fire this hook more than once per failure.**
-      ## When `withSavepoint*` is nested inside `withTransaction*` and the
-      ## connection becomes `csClosed`, the savepoint's error handler
-      ## fires `ckSavepointRollback` first, then the original exception
-      ## propagates to the outer transaction's handler which sees the same
-      ## `csClosed` state and fires `ckTxRollback`. Both events refer to
-      ## the same underlying cause; observers that aggregate by failure
-      ## (not by cleanup attempt) should dedupe.
+      ## Skipped/failed ROLLBACK (may fire twice when nested).
     onInsecureAuth*: proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].}
-      ## Fires when an auth method is used over an insecure transport
-      ## (currently: cleartext password without SSL). Advisory only; does
-      ## not abort the connection. Use `ConnConfig.requireAuth` to enforce.
+      ## Insecure auth over plaintext.
     onDeprecatedAuth*: proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].}
-      ## Fires when a server-requested auth method is cryptographically
-      ## weak / deprecated regardless of transport (currently: MD5).
-      ## Advisory only; does not abort the connection. Use
-      ## `ConnConfig.requireAuth` to enforce.
+      ## Weak auth (MD5).
     onAdvisoryUnlockFailed*:
       proc(data: TraceAdvisoryUnlockFailedData) {.gcsafe, raises: [].}
-      ## Fires when ``withAdvisoryLock*`` / ``withAdvisoryLockShared*``
-      ## swallows an ``advisoryUnlock*`` failure to preserve the original
-      ## exception from ``body``. The unlock is considered failed when it
-      ## raises (``data.err`` non-nil) or returns ``false`` (``data.err``
-      ## nil). Advisory only — the macro's behaviour is unchanged. Use this
-      ## to observe unlock failures that would otherwise be invisible.
+      ## Swallowed unlock failure.
 
 static:
   # Zero-initialized ConnConfig must default to sslnPostgres.
@@ -801,11 +616,11 @@ proc validateClientCertConfig*(config: ConnConfig) =
   ## credential must be present together, and the SSL mode must actually
   ## negotiate TLS — otherwise the cert/key would be silently ignored.
   if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
-    raise newException(PgError, ClientCertPairingErrorMsg)
+    raise newException(PgConfigError, ClientCertPairingErrorMsg)
   if (config.sslCert.len > 0 or config.sslKey.len > 0) and
       config.sslMode in {sslDisable, sslAllow}:
     raise newException(
-      PgError,
+      PgConfigError,
       "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
         "); they would otherwise be silently unused",
     )
@@ -840,25 +655,15 @@ func effectiveMaxScramIterations*(config: ConnConfig): int {.inline.} =
   else:
     DefaultMaxScramIterations
 
-# Internal replication LSN plumbing (cross-module use within the library)
-#
-# `pg_replication` owns the typed `Lsn` API (`confirmFlushed`,
-# `confirmedFlushLsn`); `types` stores raw `uint64` values to avoid a dependency
-# cycle. The procedures below are exported so `pg_replication` can use them
-# without `{.all.}`, but they are intentionally low-level: the public way to
-# advance the confirmed-flush position remains `confirmFlushed` in
-# `pg_replication`, which adds the `Lsn` typing and the received-WAL bound check.
+# Replication LSN plumbing (low-level; public API is ``pg_replication.confirmFlushed``).
 
 proc initReplLsnTracking*(conn: PgConnection, startLsn: uint64) =
-  ## Reset the per-stream confirmed-flush and max-received positions to
-  ## `startLsn`. Called at the beginning of each replication stream so a reused
-  ## connection never inherits stale values from a previous stream.
+  ## Reset per-stream LSN tracking to ``startLsn``.
   conn.replConfirmedFlushLsnRaw = startLsn
   conn.replMaxReceivedLsnRaw = startLsn
 
 proc updateReplMaxReceivedLsn*(conn: PgConnection, received: uint64): bool =
-  ## Advance the highest-received WAL position if `received` is greater than
-  ## the current value. Returns `true` if the value was updated.
+  ## Advance max-received LSN if ``received`` is greater; return if updated.
   if received > conn.replMaxReceivedLsnRaw:
     conn.replMaxReceivedLsnRaw = received
     true
@@ -866,20 +671,13 @@ proc updateReplMaxReceivedLsn*(conn: PgConnection, received: uint64): bool =
     false
 
 func replConfirmedFlushLsn*(conn: PgConnection): uint64 =
-  ## Raw confirmed-flush LSN. Public API users should use `confirmedFlushLsn`
-  ## in `pg_replication`.
+  ## Raw flush LSN (use typed API).
   conn.replConfirmedFlushLsnRaw
-
-func replMaxReceivedLsn*(conn: PgConnection): uint64 =
-  ## Raw max-received LSN. Public API users should use the `confirmFlushed`
-  ## bounds via the typed API in `pg_replication`.
+func replMaxReceivedLsn*(conn: PgConnection): uint64 = ## Raw max-received LSN.
   conn.replMaxReceivedLsnRaw
 
 proc confirmReplFlushed*(conn: PgConnection, lsn: uint64): bool =
-  ## Clamp `lsn` to the max-received WAL position and advance the
-  ## confirmed-flush LSN only monotonically. Returns `true` if the position
-  ## moved forward. This is the raw, untyped helper used by `confirmFlushed`
-  ## in `pg_replication`; public callers should use that typed API.
+  ## Clamp to max-received and advance flush monotonically (raw helper).
   let bounded =
     if lsn > conn.replMaxReceivedLsnRaw: conn.replMaxReceivedLsnRaw else: lsn
   if bounded > conn.replConfirmedFlushLsnRaw:
@@ -1094,6 +892,108 @@ proc clearStaged*(conn: PgConnection) {.inline, raises: [].} =
   ## tripping this guard.
   when defined(pgStateChecks):
     conn.sendBufStaged = false
+
+# Public accessors
+#
+# The record's fields are private; everything an application is meant to read
+# or tune goes through this section, so the supported surface is one list
+# rather than "whatever happens to be exported".
+
+func pid*(conn: PgConnection): int32 {.inline.} =
+  ## Backend process id from ``BackendKeyData``; 0 until startup completes.
+  conn.pid
+
+func host*(conn: PgConnection): lent string {.inline.} =
+  ## Host this connection actually reached (a multi-host DSN picks one).
+  conn.host
+
+func port*(conn: PgConnection): int {.inline.} =
+  ## Port this connection actually reached.
+  conn.port
+
+func config*(conn: PgConnection): lent ConnConfig {.inline.} =
+  ## Configuration this connection was opened with.
+  conn.config
+
+func createdAt*(conn: PgConnection): Moment {.inline.} =
+  ## When the connection was established.
+  conn.createdAt
+
+func sslEnabled*(conn: PgConnection): bool {.inline.} =
+  ## Whether the transport is TLS-wrapped.
+  conn.sslEnabled
+
+func serverParams*(conn: PgConnection): lent Table[string, string] {.inline.} =
+  ## ``ParameterStatus`` values reported by the server (``server_version``,
+  ## ``client_encoding``, ...), kept current as the server re-sends them.
+  conn.serverParams
+
+func serverParam*(conn: PgConnection, name: string): string =
+  ## One ``ParameterStatus`` value, or ``""`` when the server never sent it.
+  conn.serverParams.getOrDefault(name, "")
+
+func notifyDropped*(conn: PgConnection): int {.inline.} =
+  ## Notifications dropped by pull-API queue overflow since the last
+  ## ``PgNotifyOverflowError``. Not a lifetime total: ``waitNotification``
+  ## reports the count in that error and resets it to zero.
+  conn.notifyDropped
+
+func listenError*(conn: PgConnection): ref PgListenError {.inline.} =
+  ## Why the listen pump died permanently, or ``nil`` while it is alive.
+  conn.listenError
+
+func notifyMaxQueue*(conn: PgConnection): int {.inline.} =
+  ## Pull-API queue cap; see `notifyMaxQueue=`.
+  conn.notifyMaxQueue
+
+proc `notifyMaxQueue=`*(conn: PgConnection, value: int) {.inline.} =
+  ## Cap the pull-API queue (1024 default; <=0 = unbounded). Overflow drops
+  ## the oldest entry and fires `onNotifyOverflow`.
+  conn.notifyMaxQueue = value
+
+func listenReconnectMaxAttempts*(conn: PgConnection): int {.inline.} =
+  ## Reconnect attempt budget; see `listenReconnectMaxAttempts=`.
+  conn.listenReconnectMaxAttempts
+
+proc `listenReconnectMaxAttempts=`*(conn: PgConnection, value: int) {.inline.} =
+  ## Max reconnect attempts on listen-pump failure (10 default; <=0 = retry
+  ## until `close`).
+  conn.listenReconnectMaxAttempts = value
+
+func listenReconnectMaxBackoff*(conn: PgConnection): int {.inline.} =
+  ## Backoff cap in seconds; see `listenReconnectMaxBackoff=`.
+  conn.listenReconnectMaxBackoff
+
+proc `listenReconnectMaxBackoff=`*(conn: PgConnection, value: int) {.inline.} =
+  ## Cap the seconds between listen-pump reconnect attempts (30 default).
+  conn.listenReconnectMaxBackoff = value
+
+func stmtCacheCapacity*(conn: PgConnection): int {.inline.} =
+  ## Statement-cache capacity; see `stmtCacheCapacity=`.
+  conn.stmtCacheCapacity
+
+proc `stmtCacheCapacity=`*(conn: PgConnection, value: int) {.inline.} =
+  ## Resize the client-side prepared-statement cache (256 default; 0 disables
+  ## it). Shrinking below the current size leaves the excess to the next
+  ## operation's eviction pass, which bundles the server-side ``Close``.
+  conn.stmtCacheCapacity = value
+
+func state*(conn: PgConnection): PgConnState {.inline.} =
+  ## Current state (read-only; see `isConnected` / `closedReason`).
+  conn.state
+
+func txStatus*(conn: PgConnection): TransactionStatus {.inline.} =
+  ## Tx status from last ``ReadyForQuery`` (read-only, via `bindSym`).
+  conn.txStatus
+
+proc sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
+  ## Send buffer for `queryDirect` / `execDirect` (via `bindSym`).
+  conn.sendBuf
+
+proc nextPortalName*(conn: PgConnection, prefix: string): string =
+  ## Fresh portal/savepoint name; owns counter so macro scope stays sealed.
+  inc conn.portalCounter
+  prefix & $conn.portalCounter
 
 func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
   ## Why unusable (``crClosedByUser`` outranks ``crClosed``).

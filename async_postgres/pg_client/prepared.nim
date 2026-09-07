@@ -1,4 +1,8 @@
 ## Named server-side prepared statements: `prepare`, `execute`, and `close`.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options]
 
@@ -6,6 +10,9 @@ import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, cache, simple_query]
 import ../pg_types/encoding
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 type PreparedStatement* = object
   ## A server-side prepared statement returned by `prepare`.
