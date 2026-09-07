@@ -1063,13 +1063,39 @@ proc decodeDateArrayElem(buf: openArray[byte]): DateTime =
 # ``decodeJsonArrayElem`` is defined above (near the scalar accessors) so
 # ``getJson`` can delegate to it without a forward declaration.
 
+# Sentinel for accessors whose element OID is not fixed by the catalog, so
+# there is nothing to match against: ``hstore`` is an extension type and gets
+# its OID assigned at CREATE EXTENSION time.
+const anyArrayElemOid: array[0, int32] = []
+
+proc checkArrayElemOid(accessor: string, actual: int32, expected: openArray[int32]) =
+  ## Reject a binary array whose wire element OID is not one this accessor
+  ## decodes. Without it an ``int8[]`` read through ``getIntArray`` decodes as
+  ## int32 and silently yields wrong values.
+  if expected.len == 0 or actual in expected:
+    return
+  var want = ""
+  for i, oid in expected:
+    if i > 0:
+      want.add(" or ")
+    want.add($oid)
+  raise newException(
+    PgTypeError, accessor & ": wire elemOid=" & $actual & " expected " & want
+  )
+
 # Array decoder skeletons. ``genArrayDecoder`` hardcodes the binary body to
 # ``decodePgArrayElement(T, slice)``; ``genArrayDecoderCustom`` takes an
 # explicit ``binBody`` for types that need extra context (json/timestamps).
 # In both, ``textBody`` decodes one text element with ``e: Option[string]``
 # in scope; ``binBody`` has ``row``/``off``/``e``/``decoded`` in scope.
+# ``elemOids`` lists the wire element OIDs the accessor accepts in binary
+# format (``anyArrayElemOid`` to skip the check).
 template genArrayDecoderCustom(
-    getProc: untyped, T: typedesc, typeName: static string, binBody, textBody: untyped
+    getProc: untyped,
+    T: typedesc,
+    typeName: static string,
+    elemOids: untyped,
+    binBody, textBody: untyped,
 ) {.dirty.} =
   proc getProc*(row: Row, col: int): seq[T] =
     if row.isBinaryCol(col):
@@ -1078,6 +1104,7 @@ template genArrayDecoderCustom(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
+      checkArrayElemOid(astToStr(getProc), decoded.elemOid, elemOids)
       result = newSeq[T](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1090,12 +1117,17 @@ template genArrayDecoderCustom(
       result.add(textBody)
 
 template genArrayDecoder(
-    getProc: untyped, T: typedesc, typeName: static string, textBody: untyped
+    getProc: untyped,
+    T: typedesc,
+    typeName: static string,
+    elemOids: untyped,
+    textBody: untyped,
 ) {.dirty.} =
   genArrayDecoderCustom(
     getProc,
     T,
     typeName,
+    elemOids,
     decodePgArrayElement(
       T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
     ),
@@ -1104,9 +1136,9 @@ template genArrayDecoder(
 
 # Scalar array decoders.
 
-genArrayDecoder(getIntArray, int32, "int", pgParseInt32(e.get))
-genArrayDecoder(getInt16Array, int16, "int16", pgParseInt16(e.get))
-genArrayDecoder(getInt64Array, int64, "int64", pgParseBiggestInt(e.get))
+genArrayDecoder(getIntArray, int32, "int", [OidInt4], pgParseInt32(e.get))
+genArrayDecoder(getInt16Array, int16, "int16", [OidInt2], pgParseInt16(e.get))
+genArrayDecoder(getInt64Array, int64, "int64", [OidInt8], pgParseBiggestInt(e.get))
 
 proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## Get a column value as a seq of PgMoney. Handles binary array format and
@@ -1120,6 +1152,7 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
     rejectMultiDim(decoded)
+    checkArrayElemOid("getMoneyArray", decoded.elemOid, [OidMoney])
     result = newSeq[PgMoney](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1140,12 +1173,18 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
     result.add(parsePgMoney(e.get, scale))
 
 # ``getFloatArray`` decodes ``float8[]`` only; ``float4[]`` raises PgTypeError.
-genArrayDecoder(getFloatArray, float64, "float", pgParseFloat(e.get))
-genArrayDecoder(getFloat32Array, float32, "float32", pgParseFloat32(e.get))
+genArrayDecoder(getFloatArray, float64, "float", [OidFloat8], pgParseFloat(e.get))
+genArrayDecoder(getFloat32Array, float32, "float32", [OidFloat4], pgParseFloat32(e.get))
 
-genArrayDecoder(getBoolArray, bool, "bool", parsePgBoolText(e.get))
-genArrayDecoder(getStrArray, string, "string", e.get)
-genArrayDecoder(getBitArray, PgBit, "bit", parseBitString(e.get))
+genArrayDecoder(getBoolArray, bool, "bool", [OidBool], parsePgBoolText(e.get))
+genArrayDecoder(
+  getStrArray,
+  string,
+  "string",
+  [OidText, OidVarchar, OidBpchar, OidName, OidChar],
+  e.get,
+)
+genArrayDecoder(getBitArray, PgBit, "bit", [OidBit, OidVarbit], parseBitString(e.get))
 
 # Temporal array decoders
 
@@ -1153,6 +1192,7 @@ genArrayDecoderCustom(
   getTimestampArray,
   DateTime,
   "timestamp",
+  [OidTimestamp],
   decodeTimestampArrayElem(
     row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1), "timestamp"
   ),
@@ -1162,6 +1202,7 @@ genArrayDecoderCustom(
   getTimestampTzArray,
   DateTime,
   "timestamptz",
+  [OidTimestampTz],
   decodeTimestampArrayElem(
     row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1), "timestamptz"
   ),
@@ -1172,31 +1213,42 @@ genArrayDecoderCustom(
   getDateArray,
   DateTime,
   "date",
+  [OidDate],
   decodeDateArrayElem(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
   parseDateText(e.get),
 )
 
-genArrayDecoder(getTimeArray, PgTime, "time", parseTimeText(e.get))
-genArrayDecoder(getTimeTzArray, PgTimeTz, "timetz", parseTimeTzText(e.get))
-genArrayDecoder(getIntervalArray, PgInterval, "interval", parseIntervalText(e.get))
+genArrayDecoder(getTimeArray, PgTime, "time", [OidTime], parseTimeText(e.get))
+genArrayDecoder(getTimeTzArray, PgTimeTz, "timetz", [OidTimeTz], parseTimeTzText(e.get))
+genArrayDecoder(
+  getIntervalArray, PgInterval, "interval", [OidInterval], parseIntervalText(e.get)
+)
 
 # Identifier / network array decoders
 
-genArrayDecoder(getUuidArray, PgUuid, "uuid", PgUuid(e.get))
+genArrayDecoder(getUuidArray, PgUuid, "uuid", [OidUuid], PgUuid(e.get))
 
 proc inetElemFromText[T](s: string): T =
   let (ip, mask) = parseInetText(s)
   result.address = ip
   result.mask = mask
 
-genArrayDecoder(getInetArray, PgInet, "inet", inetElemFromText[PgInet](e.get))
-genArrayDecoder(getCidrArray, PgCidr, "cidr", inetElemFromText[PgCidr](e.get))
-genArrayDecoder(getMacAddrArray, PgMacAddr, "macaddr", PgMacAddr(e.get))
-genArrayDecoder(getMacAddr8Array, PgMacAddr8, "macaddr8", PgMacAddr8(e.get))
+genArrayDecoder(
+  getInetArray, PgInet, "inet", [OidInet], inetElemFromText[PgInet](e.get)
+)
+genArrayDecoder(
+  getCidrArray, PgCidr, "cidr", [OidCidr], inetElemFromText[PgCidr](e.get)
+)
+genArrayDecoder(getMacAddrArray, PgMacAddr, "macaddr", [OidMacAddr], PgMacAddr(e.get))
+genArrayDecoder(
+  getMacAddr8Array, PgMacAddr8, "macaddr8", [OidMacAddr8], PgMacAddr8(e.get)
+)
 
 # Numeric / binary / JSON array decoders
 
-genArrayDecoder(getNumericArray, PgNumeric, "numeric", parsePgNumeric(e.get))
+genArrayDecoder(
+  getNumericArray, PgNumeric, "numeric", [OidNumeric], parsePgNumeric(e.get)
+)
 
 proc bytesElemFromText(s: string): seq[byte] =
   const errCtx = "bytea array element"
@@ -1210,7 +1262,7 @@ proc bytesElemFromText(s: string): seq[byte] =
   else:
     result = decodeByteaEscape(s.toOpenArray(0, s.high), errCtx)
 
-genArrayDecoder(getBytesArray, seq[byte], "bytea", bytesElemFromText(e.get))
+genArrayDecoder(getBytesArray, seq[byte], "bytea", [OidBytea], bytesElemFromText(e.get))
 
 proc jsonElemFromText(s: string): JsonNode =
   try:
@@ -1222,6 +1274,7 @@ genArrayDecoderCustom(
   getJsonArray,
   JsonNode,
   "json",
+  [OidJson, OidJsonb],
   decodeJsonArrayElem(
     row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1), decoded.elemOid
   ),
@@ -1230,7 +1283,7 @@ genArrayDecoderCustom(
 
 # Geometric array decoders
 
-genArrayDecoder(getPointArray, PgPoint, "point", parsePointText(e.get))
+genArrayDecoder(getPointArray, PgPoint, "point", [OidPoint], parsePointText(e.get))
 
 proc lineElemFromText(s: string): PgLine =
   let v = s.strip()
@@ -1246,7 +1299,7 @@ proc lineElemFromText(s: string): PgLine =
     a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
   )
 
-genArrayDecoder(getLineArray, PgLine, "line", lineElemFromText(e.get))
+genArrayDecoder(getLineArray, PgLine, "line", [OidLine], lineElemFromText(e.get))
 
 proc lsegElemFromText(s: string): PgLseg =
   let v = s.strip()
@@ -1258,7 +1311,7 @@ proc lsegElemFromText(s: string): PgLseg =
     raise newException(PgTypeError, "Invalid lseg: " & v)
   PgLseg(p1: points[0], p2: points[1])
 
-genArrayDecoder(getLsegArray, PgLseg, "lseg", lsegElemFromText(e.get))
+genArrayDecoder(getLsegArray, PgLseg, "lseg", [OidLseg], lsegElemFromText(e.get))
 
 proc getBoxArray*(row: Row, col: int): seq[PgBox] =
   if row.isBinaryCol(col):
@@ -1267,6 +1320,7 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
     rejectMultiDim(decoded)
+    checkArrayElemOid("getBoxArray", decoded.elemOid, [OidBox])
     result = newSeq[PgBox](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1300,7 +1354,7 @@ proc pathElemFromText(s: string): PgPath =
   let inner = v[1 ..^ 2]
   PgPath(closed: closed, points: parsePointsText(inner))
 
-genArrayDecoder(getPathArray, PgPath, "path", pathElemFromText(e.get))
+genArrayDecoder(getPathArray, PgPath, "path", [OidPath], pathElemFromText(e.get))
 
 proc polygonElemFromText(s: string): PgPolygon =
   let v = s.strip()
@@ -1308,7 +1362,9 @@ proc polygonElemFromText(s: string): PgPolygon =
     raise newException(PgTypeError, "Invalid polygon: " & v)
   PgPolygon(points: parsePointsText(v[1 ..^ 2]))
 
-genArrayDecoder(getPolygonArray, PgPolygon, "polygon", polygonElemFromText(e.get))
+genArrayDecoder(
+  getPolygonArray, PgPolygon, "polygon", [OidPolygon], polygonElemFromText(e.get)
+)
 
 proc circleElemFromText(s: string): PgCircle =
   let v = s.strip()
@@ -1331,14 +1387,20 @@ proc circleElemFromText(s: string): PgCircle =
     radius: pgParseFloat(inner[lastComma + 1 ..^ 1]),
   )
 
-genArrayDecoder(getCircleArray, PgCircle, "circle", circleElemFromText(e.get))
+genArrayDecoder(
+  getCircleArray, PgCircle, "circle", [OidCircle], circleElemFromText(e.get)
+)
 
 # Other array decoders
 
-genArrayDecoder(getXmlArray, PgXml, "xml", PgXml(e.get))
-genArrayDecoder(getTsVectorArray, PgTsVector, "tsvector", PgTsVector(e.get))
-genArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery", PgTsQuery(e.get))
-genArrayDecoder(getHstoreArray, PgHstore, "hstore", parseHstoreText(e.get))
+genArrayDecoder(getXmlArray, PgXml, "xml", [OidXml], PgXml(e.get))
+genArrayDecoder(
+  getTsVectorArray, PgTsVector, "tsvector", [OidTsVector], PgTsVector(e.get)
+)
+genArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery", [OidTsQuery], PgTsQuery(e.get))
+genArrayDecoder(
+  getHstoreArray, PgHstore, "hstore", anyArrayElemOid, parseHstoreText(e.get)
+)
 
 # Element-level NULL-safe array getters
 
@@ -1346,7 +1408,7 @@ genArrayDecoder(getHstoreArray, PgHstore, "hstore", parseHstoreText(e.get))
 # to ``none(T)`` instead of raising. Short form uses ``decodePgArrayElement``;
 # ``…Custom`` takes an explicit ``binBody``.
 template genArrayDecoderElemOptCustom(
-    getProc: untyped, T: typedesc, binBody, textBody: untyped
+    getProc: untyped, T: typedesc, elemOids: untyped, binBody, textBody: untyped
 ) {.dirty.} =
   proc getProc*(row: Row, col: int): seq[Option[T]] =
     if row.isBinaryCol(col):
@@ -1355,6 +1417,7 @@ template genArrayDecoderElemOptCustom(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
+      checkArrayElemOid(astToStr(getProc), decoded.elemOid, elemOids)
       result = newSeq[Option[T]](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1369,24 +1432,29 @@ template genArrayDecoderElemOptCustom(
         result.add(some(textBody))
 
 template genArrayDecoderElemOpt(
-    getProc: untyped, T: typedesc, textBody: untyped
+    getProc: untyped, T: typedesc, elemOids: untyped, textBody: untyped
 ) {.dirty.} =
   genArrayDecoderElemOptCustom(
     getProc,
     T,
+    elemOids,
     decodePgArrayElement(
       T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
     ),
     textBody,
   )
 
-genArrayDecoderElemOpt(getIntArrayElemOpt, int32, pgParseInt32(e.get))
-genArrayDecoderElemOpt(getInt16ArrayElemOpt, int16, pgParseInt16(e.get))
-genArrayDecoderElemOpt(getInt64ArrayElemOpt, int64, pgParseBiggestInt(e.get))
-genArrayDecoderElemOpt(getFloatArrayElemOpt, float64, pgParseFloat(e.get))
-genArrayDecoderElemOpt(getFloat32ArrayElemOpt, float32, pgParseFloat32(e.get))
-genArrayDecoderElemOpt(getBoolArrayElemOpt, bool, parsePgBoolText(e.get))
-genArrayDecoderElemOpt(getStrArrayElemOpt, string, e.get)
+genArrayDecoderElemOpt(getIntArrayElemOpt, int32, [OidInt4], pgParseInt32(e.get))
+genArrayDecoderElemOpt(getInt16ArrayElemOpt, int16, [OidInt2], pgParseInt16(e.get))
+genArrayDecoderElemOpt(getInt64ArrayElemOpt, int64, [OidInt8], pgParseBiggestInt(e.get))
+genArrayDecoderElemOpt(getFloatArrayElemOpt, float64, [OidFloat8], pgParseFloat(e.get))
+genArrayDecoderElemOpt(
+  getFloat32ArrayElemOpt, float32, [OidFloat4], pgParseFloat32(e.get)
+)
+genArrayDecoderElemOpt(getBoolArrayElemOpt, bool, [OidBool], parsePgBoolText(e.get))
+genArrayDecoderElemOpt(
+  getStrArrayElemOpt, string, [OidText, OidVarchar, OidBpchar, OidName, OidChar], e.get
+)
 
 # Array Opt accessors (text format)
 
@@ -1442,7 +1510,8 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
   ## Requires binary column format; text-format multi-dimensional arrays are
   ## not supported. Raises ``PgTypeError`` when the column is NULL, or when
   ## the wire ``elemOid`` does not match the registered OID for ``T``
-  ## (``JsonNode`` accepts both ``json`` and ``jsonb``).
+  ## (``JsonNode``: json/jsonb; ``string``: all character types;
+  ## ``PgBit``: bit/varbit).
   ##
   ## Validation looks only at the wire ``elemOid`` carried in the array
   ## payload, not at the column's field OID from ``RowDescription``. A bind
@@ -1509,6 +1578,14 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
         "getArrayND[JsonNode]: wire elemOid=" & $decoded.elemOid &
           " is neither json nor jsonb",
       )
+  elif T is string:
+    checkArrayElemOid(
+      "getArrayND[string]",
+      decoded.elemOid,
+      [OidText, OidVarchar, OidBpchar, OidName, OidChar],
+    )
+  elif T is PgBit:
+    checkArrayElemOid("getArrayND[PgBit]", decoded.elemOid, [OidBit, OidVarbit])
   else:
     if decoded.elemOid != pgArrayElemOid(T):
       raise newException(

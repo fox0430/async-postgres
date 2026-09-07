@@ -1196,8 +1196,15 @@ optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 
 # Multirange array type support
 
+proc checkRangeArrayElemOid(accessor: string, actual: int32, expected: int32) =
+  ## Same contract as ``accessors.checkArrayElemOid`` for one expected OID.
+  if actual != expected:
+    raise newException(
+      PgTypeError, accessor & ": wire elemOid=" & $actual & " expected " & $expected
+    )
+
 template genMultirangeArrayGetter(
-    name: untyped, T: typedesc, decodeBin, parseElem: untyped
+    name: untyped, T: typedesc, expectedOid: int32, decodeBin, parseElem: untyped
 ) =
   proc name*(row: Row, col: int): seq[PgMultirange[T]] =
     if row.isBinaryCol(col):
@@ -1206,6 +1213,7 @@ template genMultirangeArrayGetter(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
+      checkRangeArrayElemOid(astToStr(name), decoded.elemOid, expectedOid)
       result = newSeq[PgMultirange[T]](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1230,22 +1238,34 @@ template genMultirangeArrayGetter(
       result.add(parseMultirangeText[T](e.get, parseElem))
 
 genMultirangeArrayGetter(
-  getInt4MultirangeArray, int32, decodeInt4RangeBinary, pgParseInt32
+  getInt4MultirangeArray, int32, OidInt4Multirange, decodeInt4RangeBinary, pgParseInt32
 )
 genMultirangeArrayGetter(
-  getInt8MultirangeArray, int64, decodeInt8RangeBinary, pgParseBiggestInt
+  getInt8MultirangeArray,
+  int64,
+  OidInt8Multirange,
+  decodeInt8RangeBinary,
+  pgParseBiggestInt,
 )
 genMultirangeArrayGetter(
-  getNumMultirangeArray, PgNumeric, decodeNumRangeBinary, parsePgNumeric
+  getNumMultirangeArray, PgNumeric, OidNumMultirange, decodeNumRangeBinary, parsePgNumeric
 )
 genMultirangeArrayGetter(
-  getTsMultirangeArray, DateTime, decodeTsRangeBinary, parseTimestampText
+  getTsMultirangeArray, DateTime, OidTsMultirange, decodeTsRangeBinary, parseTimestampText
 )
 genMultirangeArrayGetter(
-  getTsTzMultirangeArray, DateTime, decodeTsRangeBinary, parseTimestampText
+  getTsTzMultirangeArray,
+  DateTime,
+  OidTsTzMultirange,
+  decodeTsRangeBinary,
+  parseTimestampText,
 )
 genMultirangeArrayGetter(
-  getDateMultirangeArray, DateTime, decodeDateRangeBinary, parseDateText
+  getDateMultirangeArray,
+  DateTime,
+  OidDateMultirange,
+  decodeDateRangeBinary,
+  parseDateText,
 )
 
 optAccessor(getInt4MultirangeArray, getInt4MultirangeArrayOpt, seq[PgMultirange[int32]])
@@ -1264,7 +1284,7 @@ optAccessor(
 # Range array type support
 
 template genRangeArrayGetter(
-    name: untyped, T: typedesc, decodeBin, parseElem: untyped
+    name: untyped, T: typedesc, expectedOid: int32, decodeBin, parseElem: untyped
 ) =
   proc name*(row: Row, col: int): seq[PgRange[T]] =
     if row.isBinaryCol(col):
@@ -1273,6 +1293,7 @@ template genRangeArrayGetter(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
+      checkRangeArrayElemOid(astToStr(name), decoded.elemOid, expectedOid)
       result = newSeq[PgRange[T]](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1287,14 +1308,24 @@ template genRangeArrayGetter(
         raise newException(PgTypeError, "NULL element in range array")
       result.add(parseRangeText[T](e.get, parseElem))
 
-genRangeArrayGetter(getInt4RangeArray, int32, decodeInt4RangeBinary, pgParseInt32)
-genRangeArrayGetter(getInt8RangeArray, int64, decodeInt8RangeBinary, pgParseBiggestInt)
-genRangeArrayGetter(getNumRangeArray, PgNumeric, decodeNumRangeBinary, parsePgNumeric)
-genRangeArrayGetter(getTsRangeArray, DateTime, decodeTsRangeBinary, parseTimestampText)
 genRangeArrayGetter(
-  getTsTzRangeArray, DateTime, decodeTsRangeBinary, parseTimestampText
+  getInt4RangeArray, int32, OidInt4Range, decodeInt4RangeBinary, pgParseInt32
 )
-genRangeArrayGetter(getDateRangeArray, DateTime, decodeDateRangeBinary, parseDateText)
+genRangeArrayGetter(
+  getInt8RangeArray, int64, OidInt8Range, decodeInt8RangeBinary, pgParseBiggestInt
+)
+genRangeArrayGetter(
+  getNumRangeArray, PgNumeric, OidNumRange, decodeNumRangeBinary, parsePgNumeric
+)
+genRangeArrayGetter(
+  getTsRangeArray, DateTime, OidTsRange, decodeTsRangeBinary, parseTimestampText
+)
+genRangeArrayGetter(
+  getTsTzRangeArray, DateTime, OidTsTzRange, decodeTsRangeBinary, parseTimestampText
+)
+genRangeArrayGetter(
+  getDateRangeArray, DateTime, OidDateRange, decodeDateRangeBinary, parseDateText
+)
 
 # Range array Opt accessors
 
