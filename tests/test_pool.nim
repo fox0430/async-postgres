@@ -4733,6 +4733,24 @@ suite "The non-pipelined exec/query path pre-flights like the pipeline does":
     check conn.stagedStmtCloses.len == 0
     check conn.pendingStmtCloses.len == 0
 
+  test "evictForInsert stages the eviction Close into the caller's buffer":
+    # evictForInsert once hardcoded conn.sendBuf while its siblings take the
+    # build buffer: a caller assembling a local batch would have landed the
+    # Close bytes in the unsent conn.sendBuf while the staged accounting
+    # advanced — leaking the evicted statement server-side.
+    let conn = mockConn()
+    conn.stmtCacheCapacity = 1
+    conn.addStmtCache("SELECT 1", CachedStmt(name: "_sc_1"))
+    var batch: seq[byte] = @[]
+    conn.stagePendingStmtCloses(batch)
+    conn.sendBuf.setLen(0)
+    conn.evictForInsert(batch)
+    check conn.stagedStmtCloses == @["_sc_1"]
+    var expected: seq[byte] = @[]
+    expected.addClose(dkStatement, "_sc_1")
+    check batch == expected
+    check conn.sendBuf.len == 0
+
 suite "The Bind pre-flight runs before pendingStmtCloses is drained":
   ## Regression: with only the Parse envelope pre-flighted, a rejected Bind ran
   ## after the queued `Close` messages were drained into a discarded buffer.

@@ -121,15 +121,17 @@ proc stmtCachingEnabled*(conn: PgConnection): bool {.inline.} =
   ## Whether prepared statements are cached on this connection.
   conn.stmtCacheCapacity > 0
 
-proc evictForInsert*(conn: PgConnection) =
+proc evictForInsert*(conn: PgConnection, buf: var seq[byte]) =
   ## Make room for one more cache entry, staging the ``Close`` of whatever was
-  ## evicted. Keeping the capacity comparison here also lets the `queryDirect` /
-  ## `execDirect` writers reach it without unlocking `PgConnection` in the
-  ## caller's scope.
+  ## evicted into ``buf`` — the buffer this operation assembles, like
+  ## `stagePendingStmtCloses` / `stageEvictedClose`. Keeping the capacity
+  ## comparison here also lets the `queryDirect` / `execDirect` writers reach
+  ## it without unlocking `PgConnection` in the caller's scope: they pass
+  ## `sendBuf(conn)`.
   if conn.stmtCacheCapacity <= 0 or conn.stmtCache.len < conn.stmtCacheCapacity:
     return
   let evicted = conn.evictStmtCache()
-  conn.stageEvictedClose(conn.sendBuf, evicted.name)
+  conn.stageEvictedClose(buf, evicted.name)
 
 proc beginSendBuf*(conn: PgConnection) =
   ## Start a new operation's send buffer: empty it, then stage the queued
