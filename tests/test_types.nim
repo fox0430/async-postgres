@@ -9910,3 +9910,139 @@ suite "Text array encoders bound the literal they build":
     for what in ["range array", "multirange array", "enum array", "multirange"]:
       expect PgError:
         checkPgBinLen(maxInt32Len + 1, what)
+
+suite "1-D array accessors reject a mismatched wire elemOid":
+  test "getIntArray rejects int8[] instead of decoding it as int32":
+    # The silent-corruption case: 8-byte elements fed to the int32 decoder.
+    let bin = encodeBinaryArray(OidInt8, @[@[0'u8, 0, 0, 0, 0, 0, 0, 42]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt8Array, 1)])
+    expect PgTypeError:
+      discard row.getIntArray(0)
+
+  test "rejection names the accessor and both OIDs":
+    let bin = encodeBinaryArray(OidInt4, @[@[0'u8, 0, 0, 7]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt4Array, 1)])
+    var msg = ""
+    try:
+      discard row.getInt64Array(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "getInt64Array: wire elemOid=23 expected 20"
+
+  test "getTimestampArray rejects timestamptz[]":
+    let bin = encodeBinaryArray(OidTimestampTz, @[@[0'u8, 0, 0, 0, 0, 0, 0, 0]])
+    let row = mkRow(@[some(bin)], @[mkField(OidTimestampTzArray, 1)])
+    expect PgTypeError:
+      discard row.getTimestampArray(0)
+
+  test "getMoneyArray rejects int8[]":
+    let bin = encodeBinaryArray(OidInt8, @[@[0'u8, 0, 0, 0, 0, 0, 0, 1]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt8Array, 1)])
+    expect PgTypeError:
+      discard row.getMoneyArray(0)
+
+  test "getBoxArray rejects polygon[]":
+    let bin = encodeBinaryArray(OidPolygon, @[newSeq[byte](32)])
+    let row = mkRow(@[some(bin)], @[mkField(OidPolygonArray, 1)])
+    expect PgTypeError:
+      discard row.getBoxArray(0)
+
+  test "the ElemOpt variants check too":
+    let bin = encodeBinaryArray(OidInt8, @[@[0'u8, 0, 0, 0, 0, 0, 0, 3]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt8Array, 1)])
+    expect PgTypeError:
+      discard row.getIntArrayElemOpt(0)
+
+  test "getStrArray accepts every character type PostgreSQL may send":
+    for oid in [OidText, OidVarchar, OidBpchar, OidName, OidChar]:
+      let bin = encodeBinaryArray(oid, @[toBytes("hi")])
+      let row = mkRow(@[some(bin)], @[mkField(OidTextArray, 1)])
+      check row.getStrArray(0) == @["hi"]
+
+  test "getBitArray accepts both bit and varbit":
+    for oid in [OidBit, OidVarbit]:
+      let bin = encodeBinaryArray(oid, @[@[0'u8, 0, 0, 1, 0x80]])
+      let row = mkRow(@[some(bin)], @[mkField(OidBitArray, 1)])
+      check row.getBitArray(0).len == 1
+
+  test "getHstoreArray is exempt: hstore's OID is assigned by the extension":
+    # Binary hstore: int32 pair count, then int32-prefixed key/value pairs.
+    let payload = @[0'u8, 0, 0, 1, 0, 0, 0, 1, byte('k'), 0, 0, 0, 1, byte('v')]
+    let bin = encodeBinaryArray(90123'i32, @[payload])
+    let row = mkRow(@[some(bin)], @[mkField(90124'i32, 1)])
+    check row.getHstoreArray(0).len == 1
+
+  test "the text format path is unaffected":
+    let row = mkRow(@[some(toBytes("{1,2,3}"))], @[mkField(OidInt4Array, 0)])
+    check row.getIntArray(0) == @[1'i32, 2, 3]
+
+suite "range array accessors reject a mismatched wire elemOid":
+  test "getDateRangeArray rejects int4range[]":
+    let p = toPgBinaryParam(@[rangeOf(1'i32, 10'i32)])
+    let row = mkRow(@[p.value], @[mkField(OidInt4RangeArray, 1)])
+    var msg = ""
+    try:
+      discard row.getDateRangeArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "getDateRangeArray: wire elemOid=3904 expected 3912"
+
+  test "getInt4RangeArray rejects daterange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgBinaryDateRangeArrayParam(@[rangeOf(dt1, dt2)])
+    let row = mkRow(@[p.value], @[mkField(OidDateRangeArray, 1)])
+    expect PgTypeError:
+      discard row.getInt4RangeArray(0)
+
+  test "getTsRangeArray rejects int8range[]":
+    let p = toPgBinaryParam(@[rangeOf(100'i64, 200'i64)])
+    let row = mkRow(@[p.value], @[mkField(OidInt8RangeArray, 1)])
+    expect PgTypeError:
+      discard row.getTsRangeArray(0)
+
+  test "getTsTzRangeArray rejects tsrange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let p = toPgBinaryParam(@[rangeOf(dt1, dt2)])
+    let row = mkRow(@[p.value], @[mkField(OidTsRangeArray, 1)])
+    expect PgTypeError:
+      discard row.getTsTzRangeArray(0)
+
+  test "the text format path is unaffected":
+    let row = mkRow(@[some(toBytes("{\"[1,10)\"}"))], @[mkField(OidInt4RangeArray, 0)])
+    check row.getInt4RangeArray(0) == @[rangeOf(1'i32, 10'i32)]
+
+suite "multirange array accessors reject a mismatched wire elemOid":
+  test "getDateMultirangeArray rejects int4multirange[]":
+    let p = toPgBinaryParam(@[toMultirange(rangeOf(1'i32, 3'i32))])
+    let row = mkRow(@[p.value], @[mkField(OidInt4MultirangeArray, 1)])
+    expect PgTypeError:
+      discard row.getDateMultirangeArray(0)
+
+  test "getInt4MultirangeArray rejects datemultirange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgBinaryDateMultirangeArrayParam(@[toMultirange(rangeOf(dt1, dt2))])
+    let row = mkRow(@[p.value], @[mkField(OidDateMultirangeArray, 1)])
+    expect PgTypeError:
+      discard row.getInt4MultirangeArray(0)
+
+  test "getTsTzMultirangeArray rejects tsmultirange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let p = toPgBinaryParam(@[toMultirange(rangeOf(dt1, dt2))])
+    let row = mkRow(@[p.value], @[mkField(OidTsMultirangeArray, 1)])
+    expect PgTypeError:
+      discard row.getTsTzMultirangeArray(0)
+
+suite "getArrayND accepts the 1-D character and bit OIDs":
+  test "getArrayND[string] accepts varchar[]":
+    let bin = encodeBinaryArray(OidVarchar, @[toBytes("hi")])
+    let row = mkRow(@[some(bin)], @[mkField(OidVarcharArray, 1)])
+    check getArrayND[string](row, 0).elements == @[some("hi")]
+
+  test "getArrayND[PgBit] accepts bit[]":
+    let bin = encodeBinaryArray(OidBit, @[@[0'u8, 0, 0, 1, 0x80]])
+    let row = mkRow(@[some(bin)], @[mkField(OidBitArray, 1)])
+    check getArrayND[PgBit](row, 0).elements.len == 1

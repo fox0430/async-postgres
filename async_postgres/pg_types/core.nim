@@ -183,6 +183,9 @@ const
   OidFloat8* = 701'i32
   OidText* = 25'i32
   OidVarchar* = 1043'i32
+  OidChar* = 18'i32
+  OidName* = 19'i32
+  OidBpchar* = 1042'i32
   OidBytea* = 17'i32
   OidTimestamp* = 1114'i32
   OidDate* = 1082'i32

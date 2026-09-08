@@ -1518,8 +1518,10 @@ async_postgres/pg_types/core.nim	OidBool
 async_postgres/pg_types/core.nim	OidBoolArray
 async_postgres/pg_types/core.nim	OidBox
 async_postgres/pg_types/core.nim	OidBoxArray
+async_postgres/pg_types/core.nim	OidBpchar
 async_postgres/pg_types/core.nim	OidBytea
 async_postgres/pg_types/core.nim	OidByteaArray
+async_postgres/pg_types/core.nim	OidChar
 async_postgres/pg_types/core.nim	OidCidr
 async_postgres/pg_types/core.nim	OidCidrArray
 async_postgres/pg_types/core.nim	OidCircle
@@ -1565,6 +1567,7 @@ async_postgres/pg_types/core.nim	OidMacAddr8Array
 async_postgres/pg_types/core.nim	OidMacAddrArray
 async_postgres/pg_types/core.nim	OidMoney
 async_postgres/pg_types/core.nim	OidMoneyArray
+async_postgres/pg_types/core.nim	OidName
 async_postgres/pg_types/core.nim	OidNumMultirange
 async_postgres/pg_types/core.nim	OidNumMultirangeArray
 async_postgres/pg_types/core.nim	OidNumRange
