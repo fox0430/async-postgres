@@ -1241,30 +1241,23 @@ genMultirangeArrayGetter(
   getInt4MultirangeArray, int32, OidInt4Multirange, decodeInt4RangeBinary, pgParseInt32
 )
 genMultirangeArrayGetter(
-  getInt8MultirangeArray,
-  int64,
-  OidInt8Multirange,
-  decodeInt8RangeBinary,
+  getInt8MultirangeArray, int64, OidInt8Multirange, decodeInt8RangeBinary,
   pgParseBiggestInt,
 )
 genMultirangeArrayGetter(
-  getNumMultirangeArray, PgNumeric, OidNumMultirange, decodeNumRangeBinary, parsePgNumeric
+  getNumMultirangeArray, PgNumeric, OidNumMultirange, decodeNumRangeBinary,
+  parsePgNumeric,
 )
 genMultirangeArrayGetter(
-  getTsMultirangeArray, DateTime, OidTsMultirange, decodeTsRangeBinary, parseTimestampText
-)
-genMultirangeArrayGetter(
-  getTsTzMultirangeArray,
-  DateTime,
-  OidTsTzMultirange,
-  decodeTsRangeBinary,
+  getTsMultirangeArray, DateTime, OidTsMultirange, decodeTsRangeBinary,
   parseTimestampText,
 )
 genMultirangeArrayGetter(
-  getDateMultirangeArray,
-  DateTime,
-  OidDateMultirange,
-  decodeDateRangeBinary,
+  getTsTzMultirangeArray, DateTime, OidTsTzMultirange, decodeTsRangeBinary,
+  parseTimestampText,
+)
+genMultirangeArrayGetter(
+  getDateMultirangeArray, DateTime, OidDateMultirange, decodeDateRangeBinary,
   parseDateText,
 )
 
