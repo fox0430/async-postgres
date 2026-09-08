@@ -226,6 +226,31 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?sslmode=bogus")
 
+  test "error: query item without '=' is rejected, not silently ignored":
+    # `?sslmode` must not fall back to the default unnoticed.
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslmode")
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslmode&connect_timeout=10")
+    expect PgError:
+      discard parseDsn("postgresql://host/db?application_name")
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslmode=")
+
+  test "error: query item with empty key is rejected":
+    # `?=value` has a separator but no name; it must not become an
+    # empty-named extra parameter unnoticed.
+    expect PgError:
+      discard parseDsn("postgresql://host/db?=value")
+    expect PgError:
+      discard parseDsn("postgresql://host/db?=")
+    expect PgError:
+      discard parseDsn("postgresql://host/db?sslmode=require&=")
+
+  test "trailing '&' in query string is tolerated":
+    let cfg = parseDsn("postgresql://host/db?sslmode=require&")
+    check cfg.sslMode == sslRequire
+
   test "query param channel_binding":
     for mode in ["disable", "prefer", "require"]:
       let cfg = parseDsn("postgresql://host/db?channel_binding=" & mode)
