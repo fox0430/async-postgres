@@ -42,9 +42,25 @@ proc main() {.async.} =
         await conn.createReplicationSlot(slotName, "pgoutput")
       except PgQueryError as e:
         # 42710 = duplicate_object: the slot already exists from a prior run.
+        # NOTE: READ_REPLICATION_SLOT only supports physical slots, so a
+        # logical slot's position is read from the catalog view instead.
         if e.sqlState == "42710":
           echo "Slot already exists, reusing it"
-          await conn.readReplicationSlot(slotName)
+          let results = await conn.simpleQuery(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots " &
+              "WHERE slot_name = '" & slotName & "'"
+          )
+          var lsn = InvalidLsn
+          if results.len > 0:
+            for row in results[0]:
+              if not row.isNull(0):
+                lsn = parseLsn(row.getStr(0))
+          ReplicationSlotInfo(
+            slotName: slotName,
+            consistentPoint: lsn,
+            outputPlugin: "pgoutput",
+            slotType: "logical",
+          )
         else:
           raise e
     echo "Using slot: ", slot.slotName, " at ", slot.consistentPoint
