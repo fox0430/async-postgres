@@ -162,8 +162,13 @@ async_postgres/pg_client.nim	export pipeline.reset
 async_postgres/pg_client.nim	export prepared.PreparedStatement
 async_postgres/pg_client.nim	export prepared.close
 async_postgres/pg_client.nim	export prepared.columnIndex
+async_postgres/pg_client.nim	export prepared.conn
 async_postgres/pg_client.nim	export prepared.execute
+async_postgres/pg_client.nim	export prepared.fields
+async_postgres/pg_client.nim	export prepared.name
+async_postgres/pg_client.nim	export prepared.paramOids
 async_postgres/pg_client.nim	export prepared.prepare
+async_postgres/pg_client.nim	export prepared.sql
 async_postgres/pg_client.nim	export query.query
 async_postgres/pg_client.nim	export query.queryColumn
 async_postgres/pg_client.nim	export query.queryEach

@@ -98,6 +98,12 @@ export prepared.columnIndex
 export prepared.prepare
 export prepared.execute
 export prepared.close
+# Read-only `PreparedStatement` field accessors (fields are private).
+export prepared.conn
+export prepared.name
+export prepared.sql
+export prepared.fields
+export prepared.paramOids
 
 # `copy` — COPY IN / COPY OUT entry points (`*Impl` stay internal).
 export copy.copyIn
