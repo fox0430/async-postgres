@@ -3805,9 +3805,17 @@ suite "Pool replenish capacity race":
       pool.config.maintenanceInterval = milliseconds(10)
       pool.maintenanceTask = maintenanceLoop(pool)
 
-      await sleepAsync(milliseconds(60))
+      # Sample between replenish rounds instead of at a fixed deadline: a
+      # single sleep can land inside an in-flight round, where the
+      # reservations are still legitimately held.
+      var released = false
+      for _ in 0 ..< 200:
+        await sleepAsync(milliseconds(1))
+        if pool.consecutiveConnectFailures >= 2 and pool.active == 0:
+          released = true
+          break
 
-      doAssert pool.active == 0 # reservations released despite 2 failed connects
+      doAssert released # reservations released despite the failed connects
       doAssert pool.idle.len == 0
       doAssert pool.metrics.createCount == 0
 
