@@ -474,7 +474,7 @@ template sendExtendedQuery*(
     cacheMiss = true
     stmtName = conn.nextStmtName()
     effectiveResultFormats = resultFormats
-    conn.evictForInsert()
+    conn.evictForInsert(conn.sendBuf)
     parseStep
     conn.sendBuf.addDescribe(dkStatement, stmtName)
     bindStep
@@ -507,7 +507,7 @@ template sendExtendedExec*(
   elif conn.stmtCachingEnabled:
     cacheMiss = true
     stmtName = conn.nextStmtName()
-    conn.evictForInsert()
+    conn.evictForInsert(conn.sendBuf)
     parseStep
     conn.sendBuf.addDescribe(dkStatement, stmtName)
     bindStep

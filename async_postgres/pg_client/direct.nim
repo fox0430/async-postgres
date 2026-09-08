@@ -431,7 +431,7 @@ proc buildDirectSendDispatch(
   missBlock.add quote do:
     `cacheMissSym` = true
     `stmtNameSym` = `connSym`.nextStmtName()
-    `evictForInsertSym`(`connSym`)
+    `evictForInsertSym`(`connSym`, `sendBufSym`(`connSym`))
   if not isExec:
     missBlock.add quote do:
       `effectiveRfSym` = @[]
