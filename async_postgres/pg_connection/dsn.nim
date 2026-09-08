@@ -642,11 +642,25 @@ proc parseUriDsn*(dsn: string): ConnConfig =
 
   if queryStr.len > 0:
     for pair in queryStr.split('&'):
+      if pair.len == 0:
+        # A trailing '&' leaves an empty item carrying no value; skip it.
+        continue
       let epos = pair.find('=')
       if epos < 0:
-        continue
+        # A nameless item cannot set anything. Ignoring it would silently
+        # drop a security-relevant parameter (e.g. `?sslmode` falling back
+        # to the default), so reject it instead.
+        raise newException(
+          PgError, "Missing key/value separator '=' in URI query parameter: " & pair
+        )
       let key = pctDecode(pair[0 ..< epos])
       let val = pctDecode(pair[epos + 1 .. ^1])
+      if key.len == 0:
+        # A `=value` item has a separator but no name. Like a missing '='
+        # it cannot set anything, so reject it instead of storing an
+        # empty-named extra parameter. This mirrors `parseKeyValueDsn`,
+        # which rejects empty keys as well.
+        raise newException(PgError, "Empty key in URI query parameter: " & pair)
       case key
       of "host":
         hostList = splitList(val)
