@@ -479,6 +479,77 @@ suite "E2E: Physical Replication":
 
     waitFor t()
 
+  test "readReplicationSlot returns physical slot info":
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_read_e2e') " &
+          "FROM pg_replication_slots WHERE slot_name = 'test_phys_read_e2e'"
+      )
+      # Without immediately_reserve the slot never reserves WAL: restart_lsn /
+      # restart_tli stay NULL (verified against live PG18). Cover that branch
+      # first, then recreate with reserve=true for the populated branch.
+      discard await writer.simpleQuery(
+        "SELECT pg_create_physical_replication_slot('test_phys_read_e2e')"
+      )
+
+      let replConn = await connectReplication(plainConfig(), rmPhysical)
+      block unreserved:
+        let info = await replConn.readReplicationSlot("test_phys_read_e2e")
+        doAssert info.slotName == "test_phys_read_e2e"
+        doAssert info.slotType == "physical"
+        doAssert info.consistentPoint == InvalidLsn
+        doAssert info.restartTli == 0
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_read_e2e')"
+      )
+      discard await writer.simpleQuery(
+        "SELECT pg_create_physical_replication_slot('test_phys_read_e2e', true)"
+      )
+      block reserved:
+        let info = await replConn.readReplicationSlot("test_phys_read_e2e")
+        doAssert info.slotName == "test_phys_read_e2e"
+        doAssert info.slotType == "physical"
+        doAssert info.consistentPoint != InvalidLsn
+        doAssert info.restartTli >= 1
+      await replConn.close()
+
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_read_e2e')"
+      )
+      await writer.close()
+
+    waitFor t()
+
+  test "readReplicationSlot rejects missing and logical slots":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig(), rmPhysical)
+
+      var missingRaised = false
+      try:
+        discard await replConn.readReplicationSlot("no_such_phys_slot_xyz")
+      except PgConnectionError:
+        missingRaised = true
+      doAssert missingRaised, "nonexistent slot should raise PgConnectionError"
+
+      # A logical slot exists only while its connection lives; hold it open
+      # and prove the physical-only command rejects it as PgQueryError.
+      let logicalConn = await connectReplication(plainConfig())
+      let logicalSlot = await logicalConn.createReplicationSlot(
+        "test_logical_read_e2e", "pgoutput", temporary = true
+      )
+      var logicalRaised = false
+      try:
+        discard await replConn.readReplicationSlot(logicalSlot.slotName)
+      except PgQueryError:
+        logicalRaised = true
+      doAssert logicalRaised, "logical slot should raise PgQueryError"
+
+      await logicalConn.close()
+      await replConn.close()
+
+    waitFor t()
+
 # User-defined type definitions for e2e tests (macros must be at top level)
 type
   TestPoint = object

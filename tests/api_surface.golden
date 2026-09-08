@@ -1256,11 +1256,13 @@ async_postgres/pg_replication.nim	relationId#4
 async_postgres/pg_replication.nim	relationIds
 async_postgres/pg_replication.nim	replicaIdentity
 async_postgres/pg_replication.nim	replyRequested
+async_postgres/pg_replication.nim	restartTli
 async_postgres/pg_replication.nim	sendCopyData
 async_postgres/pg_replication.nim	sendStandbyStatus
 async_postgres/pg_replication.nim	sendTime
 async_postgres/pg_replication.nim	sendTime#2
 async_postgres/pg_replication.nim	slotName
+async_postgres/pg_replication.nim	slotType
 async_postgres/pg_replication.nim	snapshotName
 async_postgres/pg_replication.nim	startLsn
 async_postgres/pg_replication.nim	startPhysicalReplication

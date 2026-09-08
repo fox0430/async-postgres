@@ -64,7 +64,13 @@ type
     slotName*: string
     consistentPoint*: Lsn ## confirmed_flush_lsn (logical) or restart_lsn (physical)
     snapshotName*: string ## Snapshot name (only available at CREATE time)
-    outputPlugin*: string
+    outputPlugin*: string ## Output plugin (only available at CREATE time)
+    slotType*: string
+      ## Slot type as reported by READ_REPLICATION_SLOT ("physical").
+      ## Empty for CREATE_REPLICATION_SLOT results, which do not return it.
+    restartTli*: int64
+      ## Timeline ID associated with restart_lsn.
+      ## Only populated by READ_REPLICATION_SLOT; 0 when NULL or not applicable.
 
   SystemInfo* = object ## Result of IDENTIFY_SYSTEM command.
     systemId*: string
@@ -656,10 +662,43 @@ proc dropReplicationSlot*(
     sql.add(" WAIT")
   discard await conn.simpleQuery(sql, timeout)
 
+proc decodeReadSlotRow(qr: QueryResult, slotName: string): ReplicationSlotInfo =
+  ## Decode one READ_REPLICATION_SLOT result row.
+  ##
+  ## The server returns exactly 3 columns: slot_type (text, "physical" or NULL
+  ## when the slot does not exist), restart_lsn (text LSN or NULL when never
+  ## reserved), restart_tli (int8 as text or NULL). Only physical slots are
+  ## supported server-side; a logical slot raises PgQueryError before any row
+  ## is returned.
+  if qr.fields.len < 3:
+    raise newException(
+      PgConnectionError,
+      "READ_REPLICATION_SLOT returned " & $qr.fields.len & " columns, expected >= 3",
+    )
+  let row = initRow(qr.data, 0)
+  # A nonexistent slot yields one row with all NULLs, not zero rows.
+  if row.isNull(0):
+    raise newException(
+      PgConnectionError,
+      "READ_REPLICATION_SLOT: replication slot \"" & slotName & "\" does not exist",
+    )
+  result.slotName = slotName
+  result.slotType = row.getStr(0)
+  if not row.isNull(1):
+    result.consistentPoint = parseLsn(row.getStr(1))
+  if not row.isNull(2):
+    result.restartTli = pgParseBiggestInt(row.getStr(2))
+
 proc readReplicationSlot*(
     conn: PgConnection, slotName: string, timeout: async_backend.Duration = ZeroDuration
 ): Future[ReplicationSlotInfo] {.async.} =
-  ## Read information about an existing replication slot.
+  ## Read information about an existing physical replication slot.
+  ##
+  ## Only physical slots are supported: the server rejects a logical slot with
+  ## ``PgQueryError`` ("cannot use READ_REPLICATION_SLOT with logical
+  ## replication slot") and reports a nonexistent slot as ``PgConnectionError``.
+  ## ``consistentPoint`` carries restart_lsn (``InvalidLsn`` when the slot never
+  ## reserved WAL) and ``restartTli`` its timeline (0 when NULL).
   ##
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
@@ -668,20 +707,7 @@ proc readReplicationSlot*(
   )
   if results.len == 0 or results[0].rowCount == 0:
     raise newException(PgConnectionError, "READ_REPLICATION_SLOT returned no results")
-  let qr = results[0]
-  if qr.fields.len < 2:
-    raise newException(
-      PgConnectionError,
-      "READ_REPLICATION_SLOT returned " & $qr.fields.len & " columns, expected >= 2",
-    )
-  let row = initRow(qr.data, 0)
-  var info = ReplicationSlotInfo()
-  # READ_REPLICATION_SLOT returns: slot_type, restart_lsn, restart_tli
-  # But the column layout depends on PG version. We handle common case.
-  info.slotName = slotName
-  if not row.isNull(1):
-    info.consistentPoint = parseLsn(row.getStr(1))
-  return info
+  return decodeReadSlotRow(results[0], slotName)
 
 proc timelineHistory*(
     conn: PgConnection, timeline: int32, timeout: async_backend.Duration = ZeroDuration
