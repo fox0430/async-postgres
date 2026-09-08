@@ -1294,10 +1294,11 @@ proc runAndReleaseImpl[T](
   ## asyncdispatch-safe `acquire → body → resetSessionAndRelease`: the body
   ## error is captured and the connection released outside `finally`, so a
   ## failing release can't replace the body's in-flight exception. Release
-  ## failures are swallowed (the op's result is already valid, and a reset-path
-  ## Defect leaves the connection unusable — the reset's send leaves `csBusy`,
-  ## so `releaseCore` discards it), except a release-path `CancelledError`,
-  ## which is always re-raised: the caller is cancelling the whole operation.
+  ## failures are reported via `reportCloseError` (the op's result is already
+  ## valid, and a reset-path Defect leaves the connection unusable — the
+  ## reset's send leaves `csBusy`, so `releaseCore` discards it), except a
+  ## release-path `CancelledError`, which is always re-raised: the caller is
+  ## cancelling the whole operation.
   ## A body Defect is re-raised wrapped in `PgPoolError` (Defect as `parent`),
   ## since chronos re-raises raw Defects from continuations eagerly.
   ##
@@ -1323,12 +1324,12 @@ proc runAndReleaseImpl[T](
     await pool.resetSessionAndRelease(conn)
   except CancelledError as e:
     raise e
-  except Defect:
-    # Same-frame Defect from the release path: swallowed like the arm below —
-    # never shadow the body error (see the doc comment).
-    discard
-  except CatchableError:
-    discard
+  except Defect as d:
+    # Same-frame Defect from the release path: report, never shadow the
+    # body error (see the doc comment).
+    pool.reportCloseError(conn, newException(PgError, d.msg, d))
+  except CatchableError as e:
+    pool.reportCloseError(conn, e)
   if bodyErr != nil:
     raise bodyErr
   if bodyDefect != nil:

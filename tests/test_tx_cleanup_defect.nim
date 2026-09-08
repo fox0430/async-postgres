@@ -399,11 +399,12 @@ when hasChronos:
 
       waitFor t()
 
-    test "runAndRelease swallows a release-path Defect (non-pipelined)":
-      # Regression: a release-path reset Defect must not surface as PgPoolError
-      # for a successful op — matching the pipelined dispatch paths' swallow.
-      # The op's result is valid and the conn is discarded (the reset send
-      # leaves csBusy), so nothing broken is reused.
+    test "runAndRelease reports a release-path Defect to the tracer (non-pipelined)":
+      # A release-path reset Defect must not surface as PgPoolError
+      # for a successful op — the op's result is valid and the conn is
+      # discarded (the reset send leaves csBusy), so nothing broken is
+      # reused. The failure is reported via `onPoolCloseError`, matching
+      # the pipelined dispatch paths.
       proc t() {.async.} =
         let ms = startMockServer()
         var serverClient: MockClient
@@ -420,7 +421,14 @@ when hasChronos:
         # write #2 (raises a Defect).
         conn.writer = countingWriter(2)
 
+        let closeErrCount = new(int)
+        let tracer = PgTracer()
+        tracer.onPoolCloseError = proc(
+            data: TracePoolCloseErrorData
+        ) {.gcsafe, raises: [].} =
+          closeErrCount[] += 1
         let pool = makePool(resetQuery = "SELECT 1")
+        pool.config.tracer = tracer
         conn.ownerPool = pool
         pool.idle.addLast(conn.toPooled())
 
@@ -433,6 +441,9 @@ when hasChronos:
 
         doAssert not raised,
           "a release-path Defect must not fail a successful op (raised=" & $raised & ")"
+        doAssert closeErrCount[] == 1,
+          "the release failure must be reported exactly once (was " & $closeErrCount[] &
+            ")"
         # The conn was discarded (reset send left csBusy), not parked.
         doAssert pool.active == 0
         doAssert pool.idle.len == 0
