@@ -36,9 +36,23 @@ type
   Oid* = uint32
 
   LargeObject* = object
-    conn*: PgConnection
-    fd*: int32
-    oid*: Oid
+    ## A handle to an open server-side Large Object. Fields are private;
+    ## use the `conn` / `fd` / `oid` accessors for read-only access.
+    conn: PgConnection
+    fd: int32
+    oid: Oid
+
+func conn*(lo: LargeObject): PgConnection {.inline.} =
+  ## The connection this handle was opened on.
+  lo.conn
+
+func fd*(lo: LargeObject): int32 {.inline.} =
+  ## The server-side file descriptor returned by `lo_open`.
+  lo.fd
+
+func oid*(lo: LargeObject): Oid {.inline.} =
+  ## The OID of the underlying Large Object.
+  lo.oid
 
 # Streaming callback types (share the CopyOut/CopyIn shape).
 declareAsyncCallback(LoReadCallback, proc(data: seq[byte]): Future[void])

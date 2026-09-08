@@ -24,11 +24,34 @@ type PreparedStatement* = object
   ## `prepare` it again. There is no transparent re-prepare here — that is
   ## reserved for the auto-prepare statement cache (see the cache path's
   ## ``StmtCacheInvalidatingStates`` handling in `pg_client/core`).
-  conn*: PgConnection
-  name*: string
-  sql*: string
-  fields*: seq[FieldDescription]
-  paramOids*: seq[int32]
+  ##
+  ## Fields are private; use the `conn` / `name` / `sql` / `fields` /
+  ## `paramOids` accessors for read-only access.
+  conn: PgConnection
+  name: string
+  sql: string
+  fields: seq[FieldDescription]
+  paramOids: seq[int32]
+
+func conn*(stmt: PreparedStatement): PgConnection {.inline.} =
+  ## The connection (server session) this statement was prepared on.
+  stmt.conn
+
+func name*(stmt: PreparedStatement): string {.inline.} =
+  ## The server-side statement name given to `prepare`.
+  stmt.name
+
+func sql*(stmt: PreparedStatement): string {.inline.} =
+  ## The SQL text this statement was prepared from.
+  stmt.sql
+
+func fields*(stmt: PreparedStatement): seq[FieldDescription] {.inline.} =
+  ## Column descriptions of the statement's result rows.
+  stmt.fields
+
+func paramOids*(stmt: PreparedStatement): seq[int32] {.inline.} =
+  ## Parameter type OIDs reported by the server at prepare time.
+  stmt.paramOids
 
 proc columnIndex*(stmt: PreparedStatement, name: string): int =
   ## Find the index of a column by name in a prepared statement.
