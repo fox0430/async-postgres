@@ -19,7 +19,11 @@ task apiSurface, "check the exported surface against tests/api_surface.golden":
 task apiSurfaceWrite, "regenerate tests/api_surface.golden after a reviewed change":
   exec "nim c -r --hints:off tools/api_surface.nim write tests/api_surface.golden"
 
-task test, "test":
+task test, "run the full suite (requires a live PostgreSQL on 127.0.0.1:15432)":
   apiSurfaceTask()
   exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
   exec "nim c -d:asyncBackend=chronos -r tests/all_tests.nim"
+
+task test_unit, "run unit and mock-server tests only (no PostgreSQL required)":
+  exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests_unit.nim"
+  exec "nim c -d:asyncBackend=chronos -r tests/all_tests_unit.nim"
