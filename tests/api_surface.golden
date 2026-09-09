@@ -1445,6 +1445,8 @@ async_postgres/pg_types/accessors.nim	get#68
 async_postgres/pg_types/accessors.nim	get#69
 async_postgres/pg_types/accessors.nim	get#7
 async_postgres/pg_types/accessors.nim	get#70
+async_postgres/pg_types/accessors.nim	get#71
+async_postgres/pg_types/accessors.nim	get#72
 async_postgres/pg_types/accessors.nim	get#8
 async_postgres/pg_types/accessors.nim	get#9
 async_postgres/pg_types/accessors.nim	getArrayND
@@ -1972,6 +1974,7 @@ async_postgres/pg_types/encoding.nim	toPgBinaryParam#35
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#36
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#37
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#38
+async_postgres/pg_types/encoding.nim	toPgBinaryParam#39
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#4
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#5
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#6
@@ -2027,7 +2030,10 @@ async_postgres/pg_types/encoding.nim	toPgParam#45
 async_postgres/pg_types/encoding.nim	toPgParam#46
 async_postgres/pg_types/encoding.nim	toPgParam#47
 async_postgres/pg_types/encoding.nim	toPgParam#48
+async_postgres/pg_types/encoding.nim	toPgParam#49
 async_postgres/pg_types/encoding.nim	toPgParam#5
+async_postgres/pg_types/encoding.nim	toPgParam#50
+async_postgres/pg_types/encoding.nim	toPgParam#51
 async_postgres/pg_types/encoding.nim	toPgParam#6
 async_postgres/pg_types/encoding.nim	toPgParam#7
 async_postgres/pg_types/encoding.nim	toPgParam#8
@@ -2036,6 +2042,7 @@ async_postgres/pg_types/encoding.nim	toPgParamInline
 async_postgres/pg_types/encoding.nim	toPgParamInline#10
 async_postgres/pg_types/encoding.nim	toPgParamInline#11
 async_postgres/pg_types/encoding.nim	toPgParamInline#12
+async_postgres/pg_types/encoding.nim	toPgParamInline#13
 async_postgres/pg_types/encoding.nim	toPgParamInline#2
 async_postgres/pg_types/encoding.nim	toPgParamInline#3
 async_postgres/pg_types/encoding.nim	toPgParamInline#4

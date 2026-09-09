@@ -110,7 +110,17 @@ proc toPgParamInline*(
     result.overflow = newSeq[byte](s.len)
     result.overflow.writeBytesAt(0, s.toOpenArrayByte(0, s.high))
 
-proc toPgParamInline*(v: PgMoney): PgParamInline =
+proc toPgParamInline*(v: PgMoney, scale: int = 2): PgParamInline =
+  ## Money → binary with scale validation. The wire carries only the raw
+  ## amount, so ``v.scale`` must match the declared ``scale`` (server
+  ## ``lc_monetary`` frac_digits). Defaults to 2 for the common locale.
+  checkMoneyScale(scale)
+  if int(v.scale) != scale:
+    raise newException(
+      PgTypeError,
+      "PgMoney.scale=" & $v.scale & " does not match declared scale=" & $scale &
+        " (server lc_monetary frac_digits)",
+    )
   result.oid = OidMoney
   result.format = 1
   result.len = 8
@@ -124,6 +134,25 @@ proc toPgParamInline*[T](
   else:
     let tmpl = toPgParamInline(default(T))
     PgParamInline(oid: tmpl.oid, format: tmpl.format, len: -1)
+
+proc toPgParamInline*(v: Option[PgMoney], scale: int = 2): PgParamInline =
+  ## Money Option → binary with scale validation. ``none`` encodes as NULL
+  ## without touching ``scale``; ``some`` requires ``v.get.scale == scale``.
+  checkMoneyScale(scale)
+  if v.isSome:
+    let m = v.get
+    if int(m.scale) != scale:
+      raise newException(
+        PgTypeError,
+        "PgMoney.scale=" & $m.scale & " does not match declared scale=" & $scale &
+          " (server lc_monetary frac_digits)",
+      )
+    result.oid = OidMoney
+    result.format = 1
+    result.len = 8
+    result.inlineBuf.writeBE64(0, m.amount)
+  else:
+    result = PgParamInline(oid: OidMoney, format: 1, len: -1)
 
 proc toPgParam*(v: string): PgParam {.raises: [PgTypeError].} =
   ## String → text PgParam. Raises ``PgTypeError`` if oversized.
@@ -184,8 +213,17 @@ proc toPgParam*(v: PgUuid): PgParam {.raises: [PgTypeError].} =
 proc toPgParam*(v: PgNumeric): PgParam {.raises: [PgTypeError].} =
   textParam(OidNumeric, $v, "numeric")
 
-proc toPgParam*(v: PgMoney): PgParam =
-  ## Money → binary (raw int64). Text is locale-dependent.
+proc toPgParam*(v: PgMoney, scale: int = 2): PgParam =
+  ## Money → binary (raw int64). Text is locale-dependent. The wire carries
+  ## only the raw amount, so ``v.scale`` must match the declared ``scale``
+  ## (server ``lc_monetary`` frac_digits). Defaults to 2 for the common locale.
+  checkMoneyScale(scale)
+  if int(v.scale) != scale:
+    raise newException(
+      PgTypeError,
+      "PgMoney.scale=" & $v.scale & " does not match declared scale=" & $scale &
+        " (server lc_monetary frac_digits)",
+    )
   PgParam(oid: OidMoney, format: 1, value: some(@(toBE64(v.amount))))
 
 proc toPgParam*(v: PgInterval): PgParam {.raises: [PgTypeError].} =
@@ -585,6 +623,22 @@ proc toPgParam*(v: Option[JsonNode]): PgParam {.raises: [PgTypeError].} =
   else:
     PgParam(oid: OidJsonb, format: 0, value: none(seq[byte]))
 
+proc toPgParam*(v: Option[PgMoney], scale: int = 2): PgParam =
+  ## Money Option → binary with scale validation. ``none`` encodes as NULL
+  ## without touching ``scale``; ``some`` requires ``v.get.scale == scale``.
+  checkMoneyScale(scale)
+  if v.isSome:
+    let m = v.get
+    if int(m.scale) != scale:
+      raise newException(
+        PgTypeError,
+        "PgMoney.scale=" & $m.scale & " does not match declared scale=" & $scale &
+          " (server lc_monetary frac_digits)",
+      )
+    PgParam(oid: OidMoney, format: 1, value: some(@(toBE64(m.amount))))
+  else:
+    PgParam(oid: OidMoney, format: 1, value: none(seq[byte]))
+
 proc toPgParam*[T](v: Option[T]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   if v.isSome:
     result = toPgParam(v.get)
@@ -688,7 +742,15 @@ proc toPgBinaryParam*(
 ): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
 
-proc toPgBinaryParam*(v: PgMoney): PgParam =
+proc toPgBinaryParam*(v: PgMoney, scale: int = 2): PgParam =
+  ## Money → binary with scale validation, like ``toPgParam``.
+  checkMoneyScale(scale)
+  if int(v.scale) != scale:
+    raise newException(
+      PgTypeError,
+      "PgMoney.scale=" & $v.scale & " does not match declared scale=" & $scale &
+        " (server lc_monetary frac_digits)",
+    )
   var data = newSeq[byte](8)
   data.writeMoneyAt(0, v)
   PgParam(oid: OidMoney, format: 1, value: some(data))
@@ -1141,8 +1203,48 @@ template genStringArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
     )
 
 genStringArrayEncoder(PgXml, OidXmlArray, OidXml)
-genStringArrayEncoder(PgTsVector, OidTsVectorArray, OidTsVector)
-genStringArrayEncoder(PgTsQuery, OidTsQueryArray, OidTsQuery)
+
+proc encodeTsArrayText(elems: openArray[string], what: string): string =
+  ## Build a text-format array literal from tsvector/tsquery text elements.
+  ## Each element is double-quoted with ``"`` and ``\`` escaped so values
+  ## containing spaces, commas, quotes, or braces round-trip through both
+  ## ``parseTextArray`` and the server parser.
+  result = "{"
+  for i, e in elems:
+    if i > 0:
+      result.add(',')
+    result.add('"')
+    for c in e:
+      if c == '"' or c == '\\':
+        result.add('\\')
+      result.add(c)
+    result.add('"')
+    checkPgBinLen(result.len + 1, what)
+  result.add('}')
+
+proc toPgParam*(v: seq[PgTsVector]): PgParam {.raises: [PgTypeError].} =
+  ## Send ``tsvector[]`` in text format. The binary wire format for tsvector
+  ## is structured (not the text representation), so binary framing of text
+  ## bytes would be rejected or misread by the server.
+  checkArrayLen(v.len)
+  if v.len == 0:
+    return textParam(OidTsVectorArray, "{}", "tsvector array")
+  var elems = newSeq[string](v.len)
+  for i, x in v:
+    elems[i] = string(x)
+  textParam(
+    OidTsVectorArray, encodeTsArrayText(elems, "tsvector array"), "tsvector array"
+  )
+
+proc toPgParam*(v: seq[PgTsQuery]): PgParam {.raises: [PgTypeError].} =
+  ## Send ``tsquery[]`` in text format, for the same reason as ``seq[PgTsVector]``.
+  checkArrayLen(v.len)
+  if v.len == 0:
+    return textParam(OidTsQueryArray, "{}", "tsquery array")
+  var elems = newSeq[string](v.len)
+  for i, x in v:
+    elems[i] = string(x)
+  textParam(OidTsQueryArray, encodeTsArrayText(elems, "tsquery array"), "tsquery array")
 
 proc toPgBinaryParam*[T](
     v: seq[T]
@@ -1246,6 +1348,23 @@ proc toPgBinaryParam*[T](
   else:
     let proto = toPgBinaryParam(default(T))
     result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: Option[PgMoney], scale: int = 2): PgParam =
+  ## Money Option → binary with scale validation, like ``toPgParam``.
+  checkMoneyScale(scale)
+  if v.isSome:
+    let m = v.get
+    if int(m.scale) != scale:
+      raise newException(
+        PgTypeError,
+        "PgMoney.scale=" & $m.scale & " does not match declared scale=" & $scale &
+          " (server lc_monetary frac_digits)",
+      )
+    var data = newSeq[byte](8)
+    data.writeMoneyAt(0, m)
+    PgParam(oid: OidMoney, format: 1, value: some(data))
+  else:
+    PgParam(oid: OidMoney, format: 1, value: none(seq[byte]))
 
 # PgArray[T] element registry: per-type element and array OIDs plus
 # element-to-bytes encoders, consumed by the generic ``toPgParam(PgArray[T])``.

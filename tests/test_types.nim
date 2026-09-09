@@ -3313,6 +3313,56 @@ suite "PgMoney":
     let row = mkRow(@[p.value], fields)
     check row.getMoneyArray("test", scale = 0) == values
 
+  test "toPgParam PgMoney rejects scale mismatch":
+    expect PgTypeError:
+      discard toPgParam(initPgMoney(100, scale = 0))
+    expect PgTypeError:
+      discard toPgBinaryParam(initPgMoney(100, scale = 0))
+    expect PgTypeError:
+      discard toPgParamInline(initPgMoney(100, scale = 0))
+
+  test "toPgParam PgMoney with explicit scale":
+    let p = toPgParam(initPgMoney(100, scale = 0), scale = 0)
+    check p.oid == OidMoney
+    check p.value.get == @(toBE64(100'i64))
+    let pb = toPgBinaryParam(initPgMoney(100, scale = 3), scale = 3)
+    check pb.value.get == @(toBE64(100'i64))
+
+  test "generic get forwards money scale":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(42'i64)))], fields)
+    check row.get(0, PgMoney) == initPgMoney(42)
+    check row.get(0, PgMoney, scale = 0) == initPgMoney(42, scale = 0)
+    let arrFields = @[mkField(OidMoneyArray, 1)]
+    let arrRow = mkRow(@[toPgParam(@[initPgMoney(42)]).value], arrFields)
+    check arrRow.get(0, seq[PgMoney]) == @[initPgMoney(42)]
+    check arrRow.get(0, seq[PgMoney], scale = 0) == @[initPgMoney(42, scale = 0)]
+
+  test "Option[PgMoney] none encodes as NULL without scale check":
+    let p = toPgParam(none(PgMoney))
+    check p.oid == OidMoney
+    check p.format == 1'i16
+    check p.value.isNone
+    let pb = toPgBinaryParam(none(PgMoney))
+    check pb.oid == OidMoney
+    check pb.value.isNone
+    let pi = toPgParamInline(none(PgMoney))
+    check pi.oid == OidMoney
+    check pi.len == -1'i32
+
+  test "Option[PgMoney] some validates scale":
+    let m0 = initPgMoney(100, scale = 0)
+    expect PgTypeError:
+      discard toPgParam(some(m0))
+    expect PgTypeError:
+      discard toPgBinaryParam(some(m0))
+    expect PgTypeError:
+      discard toPgParamInline(some(m0))
+    check toPgParam(some(m0), scale = 0).value.get == @(toBE64(100'i64))
+    check toPgBinaryParam(some(m0), scale = 0).value.get == @(toBE64(100'i64))
+    let m2 = initPgMoney(100)
+    check toPgParam(some(m2)).value.get == @(toBE64(100'i64))
+
 suite "PgInterval":
   test "$ zero interval":
     let v = PgInterval(months: 0, days: 0, microseconds: 0)
@@ -7719,21 +7769,84 @@ suite "Other array types":
 
   test "toPgParam seq[PgTsVector] roundtrip":
     let tv1 = PgTsVector("'hello':1 'world':2")
-    let p = toPgParam(@[tv1])
+    let tv2 = PgTsVector("'foo':3")
+    let p = toPgParam(@[tv1, tv2])
     check p.oid == OidTsVectorArray
-    let fields = @[mkField(OidTsVectorArray, 1'i16)]
-    let row = mkRow(@[p.value], fields)
+    check p.format == 0'i16
+    # Text format roundtrip (binary tsvector is structured, so the
+    # parameter is text and decodes via the text path).
+    let row: Row = @[p.value]
     let arr = row.getTsVectorArray(0)
-    check arr.len == 1
+    check arr.len == 2
+    check string(arr[0]) == string(tv1)
+    check string(arr[1]) == string(tv2)
 
   test "toPgParam seq[PgTsQuery] roundtrip":
     let tq1 = PgTsQuery("hello & world")
-    let p = toPgParam(@[tq1])
+    let tq2 = PgTsQuery("foo | bar")
+    let p = toPgParam(@[tq1, tq2])
     check p.oid == OidTsQueryArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    let arr = row.getTsQueryArray(0)
+    check arr.len == 2
+    check string(arr[0]) == string(tq1)
+    check string(arr[1]) == string(tq2)
+
+  test "toPgParam seq[PgTsVector] empty":
+    let p = toPgParam(newSeq[PgTsVector]())
+    check p.oid == OidTsVectorArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    check row.getTsVectorArray(0).len == 0
+
+  test "toPgParam seq[PgTsQuery] empty":
+    let p = toPgParam(newSeq[PgTsQuery]())
+    check p.oid == OidTsQueryArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    check row.getTsQueryArray(0).len == 0
+
+  test "getTsVectorArray binary decodes structured elements":
+    # Same binary body as "getTsVector binary format" ('cat':1A).
+    var elem: seq[byte] = @[]
+    elem.add(@(toBE32(1'i32)))
+    for c in "cat":
+      elem.add(byte(c))
+    elem.add(0'u8)
+    elem.add(@(toBE16(1'i16)))
+    elem.add(@(toBE16(cast[int16](0xC001'u16))))
+    let payload = encodeBinaryArray(OidTsVector, @[some(elem)])
+    let fields = @[mkField(OidTsVectorArray, 1'i16)]
+    let row = mkRow(@[some(payload)], fields)
+    let arr = row.getTsVectorArray(0)
+    check arr.len == 1
+    check $arr[0] == "'cat':1A"
+
+  test "getTsQueryArray binary decodes structured elements":
+    # Same binary body as "getTsQuery binary format simple AND".
+    var elem: seq[byte] = @[]
+    elem.add(@(toBE32(3'i32)))
+    elem.add(2'u8)
+    elem.add(2'u8)
+    elem.add(1'u8)
+    elem.add(0'u8)
+    elem.add(0'u8)
+    for c in "cat":
+      elem.add(byte(c))
+    elem.add(0'u8)
+    elem.add(1'u8)
+    elem.add(0'u8)
+    elem.add(0'u8)
+    for c in "dog":
+      elem.add(byte(c))
+    elem.add(0'u8)
+    let payload = encodeBinaryArray(OidTsQuery, @[some(elem)])
     let fields = @[mkField(OidTsQueryArray, 1'i16)]
-    let row = mkRow(@[p.value], fields)
+    let row = mkRow(@[some(payload)], fields)
     let arr = row.getTsQueryArray(0)
     check arr.len == 1
+    check $arr[0] == "'cat' & 'dog'"
 
 suite "Multirange array types":
   test "toPgParam seq[PgMultirange[int32]] text roundtrip":
@@ -9975,6 +10088,89 @@ suite "1-D array accessors reject a mismatched wire elemOid":
   test "the text format path is unaffected":
     let row = mkRow(@[some(toBytes("{1,2,3}"))], @[mkField(OidInt4Array, 0)])
     check row.getIntArray(0) == @[1'i32, 2, 3]
+
+suite "scalar accessors reject a mismatched binary column OID":
+  test "getFloat32 rejects int4 instead of decoding it as 1e-45":
+    let row = mkRow(@[some(@(toBE32(1'i32)))], @[mkField(OidInt4, 1)])
+    expect PgTypeError:
+      discard row.getFloat32(0)
+
+  test "rejection names the accessor and both OIDs":
+    let row = mkRow(@[some(@(toBE32(1'i32)))], @[mkField(OidInt4, 1)])
+    var msg = ""
+    try:
+      discard row.getFloat32(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg ==
+      "getFloat32: wire colOid=23 expected 700 (binary column type mismatch; use the matching accessor or resultFormat = rfText)"
+
+  test "getInt accepts int2 and int4 widening":
+    check mkRow(@[some(@(toBE16(7'i16)))], @[mkField(OidInt2, 1)]).getInt(0) == 7'i32
+    check mkRow(@[some(@(toBE32(7'i32)))], @[mkField(OidInt4, 1)]).getInt(0) == 7'i32
+
+  test "getInt64 accepts int2, int4, and int8":
+    check mkRow(@[some(@(toBE16(7'i16)))], @[mkField(OidInt2, 1)]).getInt64(0) == 7'i64
+    check mkRow(@[some(@(toBE32(7'i32)))], @[mkField(OidInt4, 1)]).getInt64(0) == 7'i64
+    check mkRow(@[some(@(toBE64(7'i64)))], @[mkField(OidInt8, 1)]).getInt64(0) == 7'i64
+
+  test "getFloat accepts float4 and float8":
+    let row4 = mkRow(@[some(@(toBE32(cast[int32](1.5'f32))))], @[mkField(OidFloat4, 1)])
+    check row4.getFloat(0) == 1.5'f64
+    let row8 = mkRow(@[some(@(toBE64(cast[int64](1.5'f64))))], @[mkField(OidFloat8, 1)])
+    check row8.getFloat(0) == 1.5'f64
+
+  test "getTimestamp rejects timestamptz":
+    let row = mkRow(@[some(newSeq[byte](8))], @[mkField(OidTimestampTz, 1)])
+    expect PgTypeError:
+      discard row.getTimestamp(0)
+
+  test "getInet rejects cidr and vice versa":
+    var payload = newSeq[byte](8)
+    payload[0] = 2
+    payload[1] = 32
+    payload[2] = 0
+    payload[3] = 4
+    let rowInet = mkRow(@[some(payload)], @[mkField(OidInet, 1)])
+    expect PgTypeError:
+      discard rowInet.getCidr(0)
+    let rowCidr = mkRow(@[some(payload)], @[mkField(OidCidr, 1)])
+    expect PgTypeError:
+      discard rowCidr.getInet(0)
+
+  test "getJson accepts json and jsonb":
+    let rowJson = mkRow(@[some(toBytes("{}"))], @[mkField(OidJson, 1)])
+    check $rowJson.getJson(0) == "{}"
+    var jbin: seq[byte] = @[1'u8]
+    for c in "{}":
+      jbin.add(byte(c))
+    let rowJsonb = mkRow(@[some(jbin)], @[mkField(OidJsonb, 1)])
+    check $rowJsonb.getJson(0) == "{}"
+
+  test "getJson rejects non-json binary":
+    let row = mkRow(@[some(@(toBE32(1'i32)))], @[mkField(OidInt4, 1)])
+    expect PgTypeError:
+      discard row.getJson(0)
+
+  test "getBit accepts bit and varbit":
+    for oid in [OidBit, OidVarbit]:
+      let row = mkRow(@[some(@[0'u8, 0, 0, 1, 0x80])], @[mkField(oid, 1)])
+      check $row.getBit(0) == "1"
+
+  test "unknown OID 0 skips the check (manual Row)":
+    let rd = RowData(
+      numCols: 1'i16,
+      buf: @(toBE32(1'i32)),
+      cellIndex: @[0'i32, 4'i32],
+      colFormats: @[1'i16],
+      colTypeOids: @[0'i32],
+    )
+    # Fail-open for metadata-less rows: no OID to validate against.
+    discard initRow(rd, 0).getFloat32(0)
+
+  test "the text format path is unaffected":
+    let row = mkRow(@[some(toBytes("1"))], @[mkField(OidInt4, 0)])
+    check row.getFloat32(0) == 1'f32
 
 suite "range array accessors reject a mismatched wire elemOid":
   test "getDateRangeArray rejects int4range[]":
