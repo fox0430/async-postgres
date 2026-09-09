@@ -122,9 +122,11 @@ when hasChronos:
 
         var caught: ref ValueError = nil
         try:
+          {.push warning[UnreachableCode]: off.} # body always raises
           conn.withTransaction:
             conn.writer = defectWriter()
             raise newException(ValueError, "body boom")
+          {.pop.}
         except ValueError as e:
           caught = e
         await serverFut
@@ -165,9 +167,11 @@ when hasChronos:
 
         var caught: ref ValueError = nil
         try:
+          {.push warning[UnreachableCode]: off.} # body always raises
           conn.withSavepoint("sp"):
             conn.writer = defectWriter()
             raise newException(ValueError, "sp body boom")
+          {.pop.}
         except ValueError as e:
           caught = e
         await serverFut

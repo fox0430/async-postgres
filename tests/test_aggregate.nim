@@ -888,6 +888,7 @@ proc probePoolTx(pool: PgPool) {.async, used.} =
     discard await cConn.exec("SELECT 1")
   pool.withPipeline(pl):
     # `conn` is injected by the macro alongside the pipeline.
+    discard pl
     discard await conn.exec("SELECT 1")
   pool.withTransaction(cTx):
     discard await cTx.exec("SELECT 1")

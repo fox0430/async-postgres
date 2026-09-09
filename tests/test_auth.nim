@@ -3,12 +3,34 @@ import std/[unittest, strutils, base64]
 import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 
-import ../async_postgres/pg_auth {.all.}
+import ../async_postgres/pg_auth
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
   for i in 0 ..< s.len:
     result[i] = byte(s[i])
+
+proc scramClientFirstMessage(
+    user: string,
+    nonce: string,
+    state: var ScramState,
+    cbType: string = "",
+    cbData: seq[byte] = @[],
+    cbSupportedButUnused: bool = false,
+): seq[byte] =
+  ## Test helper with fixed nonce. Mirrors the state setup of the production
+  ## random-nonce overload so RFC vectors stay deterministic.
+  state.clientNonce = nonce
+  state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & nonce
+  state.gs2Header =
+    if cbType.len > 0:
+      "p=" & cbType & ",,"
+    elif cbSupportedButUnused:
+      "y,,"
+    else:
+      "n,,"
+  state.channelBindingData = cbData
+  result = toBytes(state.gs2Header & state.clientFirstBare)
 
 proc toString(data: seq[byte]): string =
   result = newString(data.len)
