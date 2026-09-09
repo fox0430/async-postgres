@@ -5,8 +5,13 @@ import
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
+import ../async_postgres/pg_types/encoding {.all.}
+import ../async_postgres/pg_types/accessors {.all.}
+import ../async_postgres/pg_types/decoding {.all.}
+import ../async_postgres/pg_types/ranges {.all.}
 import ../async_postgres/pg_client
 import ../async_postgres/pg_client/core {.all.}
+import ../async_postgres/pg_client/pipeline {.all.}
 
 type
   UsPostalCode = distinct string
@@ -413,6 +418,43 @@ suite "Row accessors":
     let row = @[some(toBytes("99999999999999999999999999"))]
     expect PgTypeError:
       discard row.getInt16(0)
+
+  # The negative tests above are all text; the binary integer tests are all
+  # positive. Binary is what the server sends once a statement is cached.
+
+  test "getInt16 binary int2 negative":
+    for v in [-1'i16, -12345'i16, low(int16), high(int16), 0'i16]:
+      let row = mkRow(@[some(@(toBE16(v)))], @[mkField(OidInt2, 1'i16)])
+      check row.getInt16(0) == v
+
+  test "getInt binary int4 negative":
+    for v in [-1'i32, -70000'i32, low(int32), high(int32), 0'i32]:
+      let row = mkRow(@[some(@(toBE32(v)))], @[mkField(OidInt4, 1'i16)])
+      check row.getInt(0) == v
+
+  test "getInt binary int2 negative promotion":
+    for v in [-1'i16, low(int16)]:
+      let row = mkRow(@[some(@(toBE16(v)))], @[mkField(OidInt2, 1'i16)])
+      check row.getInt(0) == int32(v)
+
+  test "getInt64 binary int8 negative":
+    for v in [-1'i64, -5_000_000_000'i64, low(int64), high(int64), 0'i64]:
+      let row = mkRow(@[some(@(toBE64(v)))], @[mkField(OidInt8, 1'i16)])
+      check row.getInt64(0) == v
+
+  test "getInt64 binary int4/int2 negative promotion":
+    let i4 = mkRow(@[some(@(toBE32(-7'i32)))], @[mkField(OidInt4, 1'i16)])
+    check i4.getInt64(0) == -7'i64
+    let i2 = mkRow(@[some(@(toBE16(-7'i16)))], @[mkField(OidInt2, 1'i16)])
+    check i2.getInt64(0) == -7'i64
+
+  test "getStr binary integers negative":
+    let i2 = mkRow(@[some(@(toBE16(-1'i16)))], @[mkField(OidInt2, 1'i16)])
+    check i2.getStr(0) == "-1"
+    let i4 = mkRow(@[some(@(toBE32(low(int32))))], @[mkField(OidInt4, 1'i16)])
+    check i4.getStr(0) == $low(int32)
+    let i8 = mkRow(@[some(@(toBE64(-1'i64)))], @[mkField(OidInt8, 1'i16)])
+    check i8.getStr(0) == "-1"
 
   test "getFloat32":
     let row = @[some(toBytes("2.5"))]
@@ -1434,6 +1476,40 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard parseTimestampText("-infinity")
 
+  test "parseTimestampText invalid format raises PgTypeError (catchable via PgError)":
+    for bad in ["not-a-timestamp", "2026-13-99", "2026-02-30T25:61:61", ""]:
+      var raisedAsPgType = false
+      var raisedAsPgError = false
+      try:
+        discard parseTimestampText(bad)
+      except PgTypeError:
+        raisedAsPgType = true
+      except PgError:
+        discard
+      try:
+        discard parseTimestampText(bad)
+      except PgError:
+        raisedAsPgError = true
+      check raisedAsPgType
+      check raisedAsPgError
+
+  test "parseDateText invalid format raises PgTypeError (catchable via PgError)":
+    for bad in ["not-a-date", "2026-13-01", "2026-02-30", ""]:
+      var raisedAsPgType = false
+      var raisedAsPgError = false
+      try:
+        discard parseDateText(bad)
+      except PgTypeError:
+        raisedAsPgType = true
+      except PgError:
+        discard
+      try:
+        discard parseDateText(bad)
+      except PgError:
+        raisedAsPgError = true
+      check raisedAsPgType
+      check raisedAsPgError
+
   test "getDate binary unexpected length":
     let fields = @[mkField(OidDate, 1)]
     let row = mkRow(@[some(newSeq[byte](2))], fields) # 2 bytes (expected 4)
@@ -2103,6 +2179,34 @@ suite "Array toPgParam (binary)":
     check p.oid == OidInt4Array
     check p.value.isNone
 
+suite "Binary container overflow guards":
+  test "checkPgBinLen pins PgTypeError (catchable via PgError)":
+    # The pg_errors conventions route oversized wire values through PgTypeError
+    # so a single `except PgError` clause sees them; a bare ValueError would
+    # escape that recovery path.
+    when sizeof(int) >= 8:
+      expect PgTypeError:
+        checkPgBinLen(int(int32.high) + 1, "Array element")
+
+  test "checkPgBinPayload pins PgTypeError (catchable via PgError)":
+    expect PgTypeError:
+      checkPgBinPayload(int64(int32.high) + 1, "Array")
+
+  test "seq[int32] payload guard fires before the result buffer is allocated":
+    # Drive the real `buildFixedArray` template with the first count whose
+    # cumulative payload exceeds int32.high. Its `checkPgBinPayload` runs ahead
+    # of the ~2 GiB `newSeq`, so no large allocation happens: the guard raises
+    # first and the per-element writer never runs. Deleting the guard would
+    # either raise a different error or attempt the huge allocation, so this
+    # pins the wiring rather than just the arithmetic.
+    const elemSize = 4
+    const headerSize = 12 + 8 * 1
+    const cnt = (int32.high - headerSize) div (4 + elemSize) + 1
+    check int64(headerSize) + int64(cnt - 1) * int64(4 + elemSize) <= int64(int32.high)
+    expect PgTypeError:
+      buildFixedArray(1'i32, @[int32(cnt)], @[1'i32], cnt, elemSize):
+        discard
+
 suite "parseTextArray":
   test "empty array":
     let elems = parseTextArray("{}")
@@ -2483,6 +2587,16 @@ suite "Binary array encode/decode roundtrip":
     check fromBE32(data[o2 ..< o2 + 4]) == 300'i32
 
 suite "PgNumeric":
+  test "paramValueLenBound never under-charges the rendered length":
+    # The pre-flight uses the bound so it does not render; under-charging would
+    # let an oversized Bind reach the encoder after the Close drain.
+    for s in [
+      "0", "-1", "NaN", "0.00", "12345.6789", "-0.001", "100000000", "0.00001",
+      "999.999", "-123456789012345678901234567890.123456789",
+    ]:
+      let n = parsePgNumeric(s)
+      check paramValueLenBound(n) >= paramValueLen(n)
+
   test "toPgParam PgNumeric":
     let p = toPgParam(parsePgNumeric("123.456"))
     check p.oid == OidNumeric
@@ -5092,10 +5206,10 @@ suite "Range toPgBinaryParam":
     check p.format == 1'i16
     let data = p.value.get
     # flags byte
-    check (data[0] and rangeHasLower) != 0
-    check (data[0] and rangeHasUpper) != 0
-    check (data[0] and rangeLowerInc) != 0
-    check (data[0] and rangeUpperInc) == 0
+    check (data[0] and rangeLbInf) == 0
+    check (data[0] and rangeUbInf) == 0
+    check (data[0] and rangeLbInc) != 0
+    check (data[0] and rangeUbInc) == 0
     # lower: len(4) + int32(4)
     check fromBE32(data.toOpenArray(1, 4)) == 4'i32 # length
     check fromBE32(data.toOpenArray(5, 8)) == 1'i32 # value
@@ -5111,14 +5225,55 @@ suite "Range toPgBinaryParam":
   test "unbounded lower int4range binary":
     let p = toPgBinaryParam(rangeTo[int32](10'i32))
     let data = p.value.get
-    check (data[0] and rangeHasLower) == 0
-    check (data[0] and rangeHasUpper) != 0
+    check (data[0] and rangeLbInf) != 0
+    check (data[0] and rangeUbInf) == 0
 
   test "unbounded upper int4range binary":
     let p = toPgBinaryParam(rangeFrom[int32](5'i32))
     let data = p.value.get
-    check (data[0] and rangeHasLower) != 0
-    check (data[0] and rangeHasUpper) == 0
+    check (data[0] and rangeLbInf) == 0
+    check (data[0] and rangeUbInf) != 0
+
+suite "Range flag bits match PostgreSQL's rangetypes.h":
+  ## A round trip through our own encoder and decoder stays green for any
+  ## self-consistent bit assignment, which is how an incompatible one survived:
+  ## the bits only matter against a real server. Pin the literal values.
+
+  test "the constants are the values PostgreSQL defines":
+    check rangeEmpty == 0x01'u8
+    check rangeLbInc == 0x02'u8
+    check rangeUbInc == 0x04'u8
+    check rangeLbInf == 0x08'u8
+    check rangeUbInf == 0x10'u8
+    check rangeContainEmpty == 0x80'u8
+
+  test "`[1,10)` sends LB_INC alone":
+    let data = toPgBinaryParam(rangeOf(1'i32, 10'i32)).value.get
+    check data[0] == 0x02'u8
+
+  test "`[1,10]` sends LB_INC and UB_INC":
+    let data = toPgBinaryParam(rangeOf(1'i32, 10'i32, upperInc = true)).value.get
+    check data[0] == 0x06'u8
+
+  test "an absent bound is spelled as its infinity bit, not as a missing one":
+    check toPgBinaryParam(rangeTo[int32](10'i32)).value.get[0] == 0x08'u8
+    check toPgBinaryParam(rangeFrom[int32](5'i32)).value.get[0] == 0x12'u8
+    check toPgBinaryParam(unboundedRange[int32]()).value.get[0] == 0x18'u8
+
+  test "an infinite bound carries no inclusivity bit":
+    # PostgreSQL clears LB_INC/UB_INC for an infinite bound; setting both would
+    # make the server read a bound that was never written.
+    check (
+      toPgBinaryParam(rangeFrom[int32](5'i32, inclusive = true)).value.get[0] and
+      rangeUbInc
+    ) == 0
+    check (
+      toPgBinaryParam(rangeTo[int32](10'i32, inclusive = true)).value.get[0] and
+      rangeLbInc
+    ) == 0
+
+  test "an empty range sends the EMPTY bit alone":
+    check toPgBinaryParam(emptyRange[int32]()).value.get == @[0x01'u8]
 
 suite "Range binary decoding (roundtrip)":
   test "int4range roundtrip":
@@ -5213,7 +5368,7 @@ suite "Range binary decoding rejects malformed bLen":
   # matches the type's element size instead of blindly slicing a hardcoded
   # window, which would spill into adjacent bytes on malicious/corrupt input.
   test "int4range rejects short lower bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(2'i32)) # bogus: int4 must be 4 bytes
     data.add([0'u8, 0])
     data.add(toBE32(4'i32))
@@ -5222,7 +5377,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeInt4RangeBinary(data)
 
   test "int4range rejects oversized upper bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(4'i32))
     data.add(toBE32(1'i32))
     data.add(toBE32(8'i32)) # bogus: int4 must be 4 bytes
@@ -5231,7 +5386,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeInt4RangeBinary(data)
 
   test "int8range rejects wrong bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(4'i32)) # bogus: int8 must be 8 bytes
     data.add(toBE32(1'i32))
     data.add(toBE32(8'i32))
@@ -5240,7 +5395,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeInt8RangeBinary(data)
 
   test "tsrange rejects wrong bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(4'i32)) # bogus: timestamp must be 8 bytes
     data.add(toBE32(0'i32))
     data.add(toBE32(8'i32))
@@ -5249,7 +5404,7 @@ suite "Range binary decoding rejects malformed bLen":
       discard decodeTsRangeBinary(data)
 
   test "daterange rejects wrong bLen":
-    var data = @[rangeHasLower or rangeHasUpper or rangeLowerInc]
+    var data = @[rangeLbInc]
     data.add(toBE32(8'i32)) # bogus: date must be 4 bytes
     data.add(toBE64(0'i64))
     data.add(toBE32(4'i32))
@@ -6848,25 +7003,23 @@ suite "PgBit":
     check data[0 .. 3] == @[0'u8, 0, 0, 3]
     check data[4] == 0b10100000'u8
 
-  test "toPgBinaryParam PgBit rejects negative nbits":
-    let b = PgBit(nbits: -1, data: @[0'u8])
+  # The invariant holds by construction: `initPgBit` is the only way to build a
+  # PgBit, so it is rejected before a value exists rather than at encode time.
+  test "initPgBit rejects negative nbits":
     expect PgTypeError:
-      discard toPgBinaryParam(b)
+      discard initPgBit(-1, @[0'u8])
 
-  test "toPgBinaryParam PgBit rejects nbits above limit":
-    let b = PgBit(nbits: PgBitMaxBits + 1, data: @[])
+  test "initPgBit rejects nbits above limit":
     expect PgTypeError:
-      discard toPgBinaryParam(b)
+      discard initPgBit(PgBitMaxBits + 1, @[])
 
-  test "toPgBinaryParam PgBit rejects nbits/data.len mismatch":
+  test "initPgBit rejects nbits/data.len mismatch":
     # nbits=8 requires exactly 1 packed byte; supplying 2 must be rejected.
-    let b = PgBit(nbits: 8, data: @[0'u8, 0'u8])
     expect PgTypeError:
-      discard toPgBinaryParam(b)
+      discard initPgBit(8, @[0'u8, 0'u8])
     # nbits=3 requires 1 byte; supplying 0 must also be rejected.
-    let b2 = PgBit(nbits: 3, data: @[])
     expect PgTypeError:
-      discard toPgBinaryParam(b2)
+      discard initPgBit(3, @[])
 
   test "getBit text format":
     let data = toBytes("10110011")
@@ -7776,7 +7929,7 @@ suite "toPgParamInline":
     check inlinePayload(p) == @(toBytes(string(u)))
 
   test "PgMoney encodes int64 amount only":
-    let m = PgMoney(amount: 12345'i64, scale: 2'i8)
+    let m = initPgMoney(12345'i64, 2'i8)
     let p = toPgParamInline(m)
     check p.oid == OidMoney
     check p.len == 8
@@ -7800,15 +7953,76 @@ suite "toPgParamInline":
     check p.format == 0
     check p.len == -1
 
-  test "string too large raises ValueError":
+  test "string length guard raises PgTypeError":
+    # PgTypeError is a PgError subtype, so `except PgError` covers this too.
+    check int64(maxInt32Len) == int64(int32.high)
     when sizeof(int) >= 8:
-      expect ValueError:
+      # maxInt32Len is high(int) on a 32-bit target, so `+ 1` would overflow.
+      expect PgTypeError:
+        checkPgBinLen(maxInt32Len + 1, "string")
+      # Through the encoder: a helper-only check stays green if the guard is
+      # dropped from toPgParamInline, leaving a RangeDefect on int32(v.len).
+      expect PgTypeError:
         discard toPgParamInline(newString(int(int32.high) + 1))
+    check toPgParamInline("a").len == 1
 
-  test "seq[byte] too large raises ValueError":
+  test "seq[byte] length guard raises PgTypeError":
     when sizeof(int) >= 8:
-      expect ValueError:
+      expect PgTypeError:
+        checkPgBinLen(maxInt32Len + 1, "bytea")
+      expect PgTypeError:
         discard toPgParamInline(newSeq[byte](int(int32.high) + 1))
+    check toPgParamInline(@[1'u8, 2]).len == 2
+
+  test "toPgParam string and seq[byte] share the inline length guard":
+    # The guard fires before addBind's own PgTypeError, with the value's label.
+    check toPgParam("a").value.get.len == 1
+    check toPgParam(@[1'u8, 2]).value.get.len == 2
+
+  test "unbounded text encoders reject oversized payloads with PgTypeError":
+    # One boundary pair pins the helper, which branches on the length alone.
+    # The shared funnels are then proven end to end with a single oversized
+    # value each (`textParam` via `toPgParam`, direct `checkPgBinLen` via
+    # `toPgBinaryParam`); every encoder below reaches one of those two funnels,
+    # so removing either guard fails here. The small-value paths pin that each
+    # encoder routes into its funnel.
+    checkPgBinLen(maxInt32Len, "xml")
+    when sizeof(int) >= 8:
+      expect PgTypeError:
+        checkPgBinLen(maxInt32Len + 1, "xml")
+      let huge = newString(maxInt32Len + 1)
+      expect PgTypeError:
+        discard toPgParam(PgXml(huge))
+      expect PgTypeError:
+        discard toPgBinaryParam(PgXml(huge))
+    check toPgParam(PgXml("<a/>")).value.get.len == 4
+    check toPgParam(PgTsVector("a")).value.get.len == 1
+    check toPgParam(PgTsQuery("a")).value.get.len == 1
+    check toPgParam(%*{"a": 1}).value.get.len > 0
+    check toPgBinaryParam("a").value.get.len == 1
+    check toPgBinaryParam(PgXml("a")).value.get.len == 1
+    check toPgBinaryParam(@[1'u8, 2'u8]).value.get.len == 2
+
+  test "hstore/json/varbit/path/polygon text encoders stay PgTypeError via textParam":
+    # Every encoder here reaches the shared `textParam` funnel, whose rejection
+    # is proven end to end in the sibling test above; the success paths below
+    # pin that each encoder routes into that funnel with its label.
+    check textParam(OidText, "a", "hstore").value.get.len == 1
+    check toPgParam(PgHstore(initTable[string, Option[string]]())).value.isSome
+    check toPgParam(initPgBit(1, @[0b10000000'u8])).value.get.len > 0
+    check toPgParam(PgPath(closed: false, points: @[PgPoint(x: 0, y: 0)])).value.get.len >
+      0
+    check toPgParam(PgPolygon(points: @[PgPoint(x: 0, y: 0)])).value.get.len > 0
+    check toPgParam(PgNumeric(weight: 0, sign: pgPositive, dscale: 0, digits: @[1'i16])).value.get.len >
+      0
+    check encodeJsonbBinary(%*{"a": 1}).len == 1 + ($(%*{"a": 1})).len
+
+  test "cumulative payload guard boundary":
+    # checkPgBinPayload backs json, arrays, ranges, hstore and the geometric
+    # encoders; int64 input keeps the boundary reachable without allocating.
+    checkPgBinPayload(int64(int32.high), "json (with version byte)")
+    expect PgTypeError:
+      checkPgBinPayload(int64(int32.high) + 1, "json (with version byte)")
 
 suite "addBindRaw wire-format parity":
   test "single int32 param matches addBind":
@@ -7864,21 +8078,21 @@ suite "addBindRaw wire-format parity":
     check legacyBuf == rawBuf
 
 suite "addBindRaw range validation":
-  test "range len below -1 raises ValueError":
+  test "range len below -1 raises PgTypeError":
     var buf: seq[byte] = @[]
-    expect ValueError:
+    expect PgTypeError:
       buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(0), len: int32(-2))], [])
 
-  test "negative off with non-zero len raises ValueError":
+  test "negative off with non-zero len raises PgTypeError":
     var buf: seq[byte] = @[]
     let data = @[byte 1, 2, 3, 4]
-    expect ValueError:
+    expect PgTypeError:
       buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(-1), len: int32(4))], [])
 
-  test "off + len past paramData.len raises ValueError":
+  test "off + len past paramData.len raises PgTypeError":
     var buf: seq[byte] = @[]
     let data = @[byte 1, 2, 3, 4]
-    expect ValueError:
+    expect PgTypeError:
       # off + len == 5, data.len == 4 — reads past end
       buf.addBindRaw("", "", [int16(1)], data, @[(off: int32(1), len: int32(4))], [])
 
@@ -7940,6 +8154,15 @@ suite "flattenInline SoA layout":
     check ranges.len == 0
     check oids.len == 0
     check formats.len == 0
+
+  test "an out-of-range result-format count is rejected with no params":
+    # The empty-params early return must not skip the result-format check: the
+    # count is a Bind field of its own.
+    let params: seq[PgParamInline] = @[]
+    expect PgTypeError:
+      discard flattenInline(params, maxInt16Count + 1)
+    expect PgTypeError:
+      discard flattenInline(params, -1)
 
   test "single short int32 param":
     let params = @[toPgParamInline(42'i32)]
@@ -8035,6 +8258,25 @@ suite "flattenInline SoA layout":
       check o == OidInt4
     for f in formats:
       check f == 1'i16
+
+  test "oversized inline param is rejected before the data buffer is sized":
+    # `estBytes` is summed from caller-supplied lengths, so validating late
+    # turns the reservation into an OutOfMemDefect instead of a PgError.
+    let params = @[
+      toPgParamInline(1'i32),
+      PgParamInline(oid: OidText, format: 0, len: int32.high, overflow: @[]),
+    ]
+    expect PgTypeError:
+      discard flattenInline(params)
+    # Catchable through the public base type, like every other param error.
+    expect PgError:
+      discard flattenInline(params)
+
+  test "an inline param count past the protocol maximum is rejected":
+    # Without this the count only surfaced from `addCount16` mid-send.
+    let params = newSeq[PgParamInline](maxInt16Count + 1)
+    expect PgTypeError:
+      discard flattenInline(params)
 
 suite "Pipeline appendInline SoA layout":
   test "single op: inlineStart/Count correct, ranges point into p.inlineData":
@@ -8141,6 +8383,197 @@ suite "Pipeline appendInline SoA layout":
     check p.ops[1].inlineStart == 2 # resumes after the two params of op A
     check p.ops[1].inlineCount == 0
     check p.inlineRanges.len == 2 # unchanged by op B
+
+suite "appendInlineParam validation and SoA atomicity":
+  ## The batch appenders validate up front and then call the unchecked form,
+  ## so the combined validate-and-append shape exists only here.
+  template appendInlineParam(
+      data: var seq[byte],
+      ranges: var seq[tuple[off: int32, len: int32]],
+      oids: var seq[int32],
+      formats: var seq[int16],
+      p: PgParamInline,
+  ) =
+    validateInlineParam(p)
+    appendInlineParamUnchecked(data, ranges, oids, formats, p)
+
+  test "len < -1 raises PgTypeError and leaves SoA unchanged":
+    var data: seq[byte] = @[1'u8, 2, 3]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[(0'i32, 3'i32)]
+    var oids: seq[int32] = @[OidInt4]
+    var formats: seq[int16] = @[1'i16]
+    var bad = PgParamInline(oid: OidInt4, format: 1, len: -2)
+    expect PgTypeError:
+      appendInlineParam(data, ranges, oids, formats, bad)
+    check data == @[1'u8, 2, 3]
+    check ranges.len == 1
+    check oids.len == 1
+    check formats.len == 1
+    check ranges[0] == (0'i32, 3'i32)
+
+  test "overflow capacity mismatch raises PgTypeError and leaves SoA unchanged":
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    var bad = PgParamInline(oid: OidText, format: 0, len: 20, overflow: @[1'u8, 2, 3])
+    expect PgTypeError:
+      appendInlineParam(data, ranges, oids, formats, bad)
+    check data.len == 0
+    check ranges.len == 0
+    check oids.len == 0
+    check formats.len == 0
+
+  test "overflow exact capacity succeeds (len == overflow.len)":
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    var ok = PgParamInline(oid: OidText, format: 0, len: 20, overflow: newSeq[byte](20))
+    for i in 0 ..< 20:
+      ok.overflow[i] = byte(i)
+    appendInlineParam(data, ranges, oids, formats, ok)
+    check ranges.len == 1
+    check oids.len == 1
+    check formats.len == 1
+    check data.len == 20
+    check data[0] == 0 and data[19] == 19
+
+  test "cumulative SoA size past int32 raises PgTypeError, not RangeDefect":
+    # The per-param offset is an int32, so the guard is on the running `data`
+    # total. Probed unchecked to reach the bound without allocating 2 GiB.
+    var data: seq[byte] = @[1'u8, 2, 3, 4]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    let huge = PgParamInline(oid: OidText, format: 0, len: int32.high - 1)
+    expect PgTypeError:
+      appendInlineParamUnchecked(data, ranges, oids, formats, huge)
+    check data.len == 4
+    check ranges.len == 0 and oids.len == 0 and formats.len == 0
+    # An empty param at the same offset takes the same guard.
+    let empty = PgParamInline(oid: OidText, format: 0, len: 0)
+    appendInlineParamUnchecked(data, ranges, oids, formats, empty)
+    check ranges[0] == (4'i32, 0'i32)
+
+  test "valid appends keep SoA lengths synced":
+    var data: seq[byte] = @[]
+    var ranges: seq[tuple[off: int32, len: int32]] = @[]
+    var oids: seq[int32] = @[]
+    var formats: seq[int16] = @[]
+    var p1 = toPgParamInline(1'i32)
+    appendInlineParam(data, ranges, oids, formats, p1)
+    check oids.len == 1 and formats.len == 1 and ranges.len == 1
+    var p2 = none(int32).toPgParamInline
+    appendInlineParam(data, ranges, oids, formats, p2)
+    check oids.len == 2 and formats.len == 2 and ranges.len == 2
+    check ranges[1].len == -1
+    var p3 = toPgParamInline("hello")
+    appendInlineParam(data, ranges, oids, formats, p3)
+    check oids.len == 3 and formats.len == 3 and ranges.len == 3
+    check oids.len == formats.len and formats.len == ranges.len
+    check data.len == 4 + 5
+
+  test "Pipeline stays consistent and usable after PgTypeError":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("A", [toPgParamInline(1'i32)])
+    check p.inlineRanges.len == 1
+    check p.inlineOids.len == 1
+    check p.inlineData.len == 4
+    var bad = PgParamInline(oid: OidInt4, format: 1, len: -2)
+    expect PgTypeError:
+      appendInlineParam(
+        p.inlineData, p.inlineRanges, p.inlineOids, p.inlineFormats, bad
+      )
+    check p.inlineRanges.len == 1
+    check p.inlineOids.len == 1
+    check p.inlineFormats.len == 1
+    check p.inlineData.len == 4
+    # Next successful append must resume at correct offset
+    p.addExec("B", [toPgParamInline(2'i32)])
+    check p.inlineRanges.len == 2
+    check p.inlineRanges[1].off == 4
+    check p.inlineRanges[1].len == 4
+    check p.inlineData[4 ..< 8] == @(toBE32(2'i32))
+    check p.ops.len == 2
+    check p.ops[1].inlineStart == 1
+    check p.ops[1].inlineCount == 1
+
+  test "addExec rolls back the whole param batch when one param is bad":
+    privateAccess(Pipeline)
+    privateAccess(PipelineOp)
+    let p = newPipeline(nil)
+    p.addExec("A", [toPgParamInline(1'i32)])
+    let bad = PgParamInline(oid: OidInt4, format: 1, len: -2)
+    expect PgTypeError:
+      p.addExec("B", [toPgParamInline(2'i32), toPgParamInline(3'i32), bad])
+    # The two params appended before `bad` would be orphaned in the SoA
+    # buffers forever: no op references them.
+    check p.inlineRanges.len == 1
+    check p.inlineOids.len == 1
+    check p.inlineFormats.len == 1
+    check p.inlineData.len == 4
+    check p.ops.len == 1
+    p.addExec("C", [toPgParamInline(4'i32)])
+    check p.inlineRanges.len == 2
+    check p.inlineRanges[1].off == 4
+    check p.ops[1].inlineStart == 1
+
+  test "typed params over the Int16 count limit are rejected at add time":
+    # A send-phase raise would be attributed to the whole batch.
+    privateAccess(Pipeline)
+    let p = newPipeline(nil)
+    p.addExec("A", @[toPgParam(1'i32)])
+    var tooMany = newSeq[PgParam](maxInt16Count + 1)
+    for i in 0 ..< tooMany.len:
+      tooMany[i] = toPgParam(1'i32)
+    expect PgTypeError:
+      p.addExec("B", tooMany)
+    expect PgTypeError:
+      p.addQuery("C", tooMany)
+    check p.ops.len == 1
+
+  test "inline params over the Int16 count limit are rejected at add time":
+    privateAccess(Pipeline)
+    let p = newPipeline(nil)
+    var tooMany = newSeq[PgParamInline](maxInt16Count + 1)
+    for i in 0 ..< tooMany.len:
+      tooMany[i] = toPgParamInline(1'i32)
+    expect PgTypeError:
+      p.addExec("A", tooMany)
+    check p.ops.len == 0
+    check p.inlineRanges.len == 0
+    check p.inlineData.len == 0
+
+  test "flattenInline propagates PgTypeError without desync":
+    var bad = PgParamInline(oid: OidInt4, format: 1, len: -5)
+    expect PgTypeError:
+      discard flattenInline(@[toPgParamInline(1'i32), bad, toPgParamInline(2'i32)])
+    # flattenInline uses temporaries, so only the raise itself is observable:
+    # it must not be swallowed and must be PgTypeError, not ValueError.
+    var ok = flattenInline(@[toPgParamInline(1'i32), toPgParamInline(2'i32)])
+    check ok.ranges.len == 2
+    check ok.oids.len == 2
+
+suite "PgBit construction validation":
+  ## Was encoder-side: an invalid `PgBit` could be built and only failed at
+  ## `toPgParam`. It cannot be built now.
+  test "inconsistent nbits/data raises PgTypeError, not IndexDefect":
+    expect PgTypeError:
+      discard initPgBit(16, @[0xFF'u8])
+
+  test "negative nbits raises PgTypeError instead of encoding an empty varbit":
+    expect PgTypeError:
+      discard initPgBit(-1, @[])
+
+  test "nbits above the limit raises PgTypeError":
+    expect PgTypeError:
+      discard initPgBit(PgBitMaxBits + 1, @[])
+
+  test "consistent PgBit still encodes":
+    check toPgParam(initPgBit(4, @[0xA0'u8])).value.get == toBytes("1010")
 
 suite "encodeBinaryArray with Option elements":
   test "mixed null and non-null int32":
@@ -8721,13 +9154,12 @@ suite "PgArray[T] registry compile-time errors":
   test "encodePgArrayElement(PgMoney) is not exposed":
     # Removed to force callers through toPgMoneyArrayNDParam, which
     # validates the scale invariant against the server's frac_digits.
-    check not compiles(encodePgArrayElement(PgMoney(amount: 0, scale: 2)))
+    check not compiles(encodePgArrayElement(initPgMoney(0, 2)))
 
 suite "getMoneyArrayND scale":
   test "getMoneyArrayND default scale=2":
     # Build a money[] wire payload with two amounts: 12345 (= $123.45) and 100.
-    let src =
-      pgArray(@[PgMoney(amount: 12345, scale: 2), PgMoney(amount: 100, scale: 2)])
+    let src = pgArray(@[initPgMoney(12345, 2), initPgMoney(100, 2)])
     let bin = toPgMoneyArrayNDParam(src).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8737,7 +9169,7 @@ suite "getMoneyArrayND scale":
     check got.elements[0].get.scale == 2
 
   test "getMoneyArrayND honors explicit scale":
-    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let src = pgArray(@[initPgMoney(12345, 3)])
     let bin = toPgMoneyArrayNDParam(src, scale = 3).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8746,7 +9178,7 @@ suite "getMoneyArrayND scale":
     check got.elements[0].get.amount == 12345
 
   test "getMoneyArrayND rejects bad scale":
-    let src = pgArray(@[PgMoney(amount: 1, scale: 2)])
+    let src = pgArray(@[initPgMoney(1, 2)])
     let bin = toPgMoneyArrayNDParam(src).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8761,7 +9193,7 @@ suite "getMoneyArrayND scale":
     check getMoneyArrayNDOpt(row, 0) == none(PgArray[PgMoney])
 
   test "getMoneyArrayND by name forwards scale":
-    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let src = pgArray(@[initPgMoney(12345, 3)])
     let bin = toPgMoneyArrayNDParam(src, scale = 3).value.get
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(bin)], fields)
@@ -8776,8 +9208,7 @@ suite "getMoneyArrayND scale":
 
 suite "toPgMoneyArrayNDParam":
   test "toPgMoneyArrayNDParam roundtrip with default scale":
-    let src =
-      pgArray(@[PgMoney(amount: 100, scale: 2), PgMoney(amount: -250, scale: 2)])
+    let src = pgArray(@[initPgMoney(100, 2), initPgMoney(-250, 2)])
     let p = toPgMoneyArrayNDParam(src)
     check p.oid == OidMoneyArray
     check p.format == 1
@@ -8790,7 +9221,7 @@ suite "toPgMoneyArrayNDParam":
     check got.elements[1].get.scale == 2
 
   test "toPgMoneyArrayNDParam roundtrip with explicit scale=3":
-    let src = pgArray(@[PgMoney(amount: 12345, scale: 3)])
+    let src = pgArray(@[initPgMoney(12345, 3)])
     let p = toPgMoneyArrayNDParam(src, scale = 3)
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[some(p.value.get)], fields)
@@ -8802,10 +9233,10 @@ suite "toPgMoneyArrayNDParam":
     let src = pgArray(
       @[2'i32, 2],
       @[
-        some(PgMoney(amount: 1, scale: 2)),
+        some(initPgMoney(1, 2)),
         none(PgMoney),
-        some(PgMoney(amount: 2, scale: 2)),
-        some(PgMoney(amount: 3, scale: 2)),
+        some(initPgMoney(2, 2)),
+        some(initPgMoney(3, 2)),
       ],
     )
     let p = toPgMoneyArrayNDParam(src)
@@ -8817,15 +9248,15 @@ suite "toPgMoneyArrayNDParam":
     check got.elements[2].get.amount == 2
 
   test "toPgMoneyArrayNDParam rejects element scale mismatch":
-    let src = pgArray(@[PgMoney(amount: 1, scale: 2), PgMoney(amount: 2, scale: 3)])
-    expect PgError:
+    let src = pgArray(@[initPgMoney(1, 2), initPgMoney(2, 3)])
+    expect PgTypeError:
       discard toPgMoneyArrayNDParam(src, scale = 2)
 
   test "toPgMoneyArrayNDParam rejects bad scale argument":
-    let src = pgArray(@[PgMoney(amount: 1, scale: 2)])
-    expect PgError:
+    let src = pgArray(@[initPgMoney(1, 2)])
+    expect PgTypeError:
       discard toPgMoneyArrayNDParam(src, scale = -1)
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayNDParam(src, scale = 19)
 
   test "toPgMoneyArrayNDParam empty array":
@@ -8849,7 +9280,7 @@ suite "toPgMoneyArrayParam":
   test "toPgParam seq[PgMoney] rejects non-default element scale":
     # The bare toPgParam path declares scale=2; a scale-0 element would be
     # silently encoded as the wrong money value, so it must be rejected.
-    expect PgError:
+    expect PgTypeError:
       discard toPgParam(@[initPgMoney(100), initPgMoney(50, scale = 0)])
 
   test "toPgMoneyArrayParam honors explicit scale=0 roundtrip":
@@ -8862,14 +9293,14 @@ suite "toPgMoneyArrayParam":
 
   test "toPgMoneyArrayParam rejects element scale mismatch":
     let values = @[initPgMoney(1, scale = 2), initPgMoney(2, scale = 3)]
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayParam(values, scale = 2)
 
   test "toPgMoneyArrayParam rejects bad scale argument":
     let values = @[initPgMoney(1)]
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayParam(values, scale = -1)
-    expect PgError:
+    expect PgTypeError:
       discard toPgMoneyArrayParam(values, scale = 19)
 
   test "toPgMoneyArrayParam empty array":
@@ -9453,3 +9884,165 @@ suite "Negative column index":
         discard row.isNull(-1)
       expect PgError:
         discard row.isNull(row.len + 5)
+
+suite "Text array encoders bound the literal they build":
+  # The guards are per element, so an oversized array is rejected while the
+  # literal is still bounded. These check the guard did not alter the output.
+  test "range array literal is unchanged":
+    let p = toPgParam(@[rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32)])
+    check p.oid == OidInt4RangeArray
+    check p.format == 0'i16
+    check p.value.get.toString == """{"[1,10)","[20,30)"}"""
+
+  test "multirange array literal is unchanged":
+    let p = toPgParam(@[toMultirange(rangeOf(1'i32, 10'i32))])
+    check p.value.get.toString == """{"{[1,10)}"}"""
+
+  test "multirange scalar literal is unchanged":
+    let p = toPgParam(toMultirange(rangeOf(1'i32, 10'i32), rangeOf(20'i32, 30'i32)))
+    check p.value.get.toString == "{[1,10),[20,30)}"
+
+  test "enum array literal is unchanged":
+    check encodeEnumTextArray(@[some("happy"), none(string), some("sad")]) ==
+      """{"happy",NULL,"sad"}"""
+
+  test "oversize is reported as a catchable PgError":
+    for what in ["range array", "multirange array", "enum array", "multirange"]:
+      expect PgError:
+        checkPgBinLen(maxInt32Len + 1, what)
+
+suite "1-D array accessors reject a mismatched wire elemOid":
+  test "getIntArray rejects int8[] instead of decoding it as int32":
+    # The silent-corruption case: 8-byte elements fed to the int32 decoder.
+    let bin = encodeBinaryArray(OidInt8, @[@[0'u8, 0, 0, 0, 0, 0, 0, 42]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt8Array, 1)])
+    expect PgTypeError:
+      discard row.getIntArray(0)
+
+  test "rejection names the accessor and both OIDs":
+    let bin = encodeBinaryArray(OidInt4, @[@[0'u8, 0, 0, 7]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt4Array, 1)])
+    var msg = ""
+    try:
+      discard row.getInt64Array(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "getInt64Array: wire elemOid=23 expected 20"
+
+  test "getTimestampArray rejects timestamptz[]":
+    let bin = encodeBinaryArray(OidTimestampTz, @[@[0'u8, 0, 0, 0, 0, 0, 0, 0]])
+    let row = mkRow(@[some(bin)], @[mkField(OidTimestampTzArray, 1)])
+    expect PgTypeError:
+      discard row.getTimestampArray(0)
+
+  test "getMoneyArray rejects int8[]":
+    let bin = encodeBinaryArray(OidInt8, @[@[0'u8, 0, 0, 0, 0, 0, 0, 1]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt8Array, 1)])
+    expect PgTypeError:
+      discard row.getMoneyArray(0)
+
+  test "getBoxArray rejects polygon[]":
+    let bin = encodeBinaryArray(OidPolygon, @[newSeq[byte](32)])
+    let row = mkRow(@[some(bin)], @[mkField(OidPolygonArray, 1)])
+    expect PgTypeError:
+      discard row.getBoxArray(0)
+
+  test "the ElemOpt variants check too":
+    let bin = encodeBinaryArray(OidInt8, @[@[0'u8, 0, 0, 0, 0, 0, 0, 3]])
+    let row = mkRow(@[some(bin)], @[mkField(OidInt8Array, 1)])
+    expect PgTypeError:
+      discard row.getIntArrayElemOpt(0)
+
+  test "getStrArray accepts every character type PostgreSQL may send":
+    for oid in [OidText, OidVarchar, OidBpchar, OidName, OidChar]:
+      let bin = encodeBinaryArray(oid, @[toBytes("hi")])
+      let row = mkRow(@[some(bin)], @[mkField(OidTextArray, 1)])
+      check row.getStrArray(0) == @["hi"]
+
+  test "getBitArray accepts both bit and varbit":
+    for oid in [OidBit, OidVarbit]:
+      let bin = encodeBinaryArray(oid, @[@[0'u8, 0, 0, 1, 0x80]])
+      let row = mkRow(@[some(bin)], @[mkField(OidBitArray, 1)])
+      check row.getBitArray(0).len == 1
+
+  test "getHstoreArray is exempt: hstore's OID is assigned by the extension":
+    # Binary hstore: int32 pair count, then int32-prefixed key/value pairs.
+    let payload = @[0'u8, 0, 0, 1, 0, 0, 0, 1, byte('k'), 0, 0, 0, 1, byte('v')]
+    let bin = encodeBinaryArray(90123'i32, @[payload])
+    let row = mkRow(@[some(bin)], @[mkField(90124'i32, 1)])
+    check row.getHstoreArray(0).len == 1
+
+  test "the text format path is unaffected":
+    let row = mkRow(@[some(toBytes("{1,2,3}"))], @[mkField(OidInt4Array, 0)])
+    check row.getIntArray(0) == @[1'i32, 2, 3]
+
+suite "range array accessors reject a mismatched wire elemOid":
+  test "getDateRangeArray rejects int4range[]":
+    let p = toPgBinaryParam(@[rangeOf(1'i32, 10'i32)])
+    let row = mkRow(@[p.value], @[mkField(OidInt4RangeArray, 1)])
+    var msg = ""
+    try:
+      discard row.getDateRangeArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "getDateRangeArray: wire elemOid=3904 expected 3912"
+
+  test "getInt4RangeArray rejects daterange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgBinaryDateRangeArrayParam(@[rangeOf(dt1, dt2)])
+    let row = mkRow(@[p.value], @[mkField(OidDateRangeArray, 1)])
+    expect PgTypeError:
+      discard row.getInt4RangeArray(0)
+
+  test "getTsRangeArray rejects int8range[]":
+    let p = toPgBinaryParam(@[rangeOf(100'i64, 200'i64)])
+    let row = mkRow(@[p.value], @[mkField(OidInt8RangeArray, 1)])
+    expect PgTypeError:
+      discard row.getTsRangeArray(0)
+
+  test "getTsTzRangeArray rejects tsrange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let p = toPgBinaryParam(@[rangeOf(dt1, dt2)])
+    let row = mkRow(@[p.value], @[mkField(OidTsRangeArray, 1)])
+    expect PgTypeError:
+      discard row.getTsTzRangeArray(0)
+
+  test "the text format path is unaffected":
+    let row = mkRow(@[some(toBytes("{\"[1,10)\"}"))], @[mkField(OidInt4RangeArray, 0)])
+    check row.getInt4RangeArray(0) == @[rangeOf(1'i32, 10'i32)]
+
+suite "multirange array accessors reject a mismatched wire elemOid":
+  test "getDateMultirangeArray rejects int4multirange[]":
+    let p = toPgBinaryParam(@[toMultirange(rangeOf(1'i32, 3'i32))])
+    let row = mkRow(@[p.value], @[mkField(OidInt4MultirangeArray, 1)])
+    expect PgTypeError:
+      discard row.getDateMultirangeArray(0)
+
+  test "getInt4MultirangeArray rejects datemultirange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgBinaryDateMultirangeArrayParam(@[toMultirange(rangeOf(dt1, dt2))])
+    let row = mkRow(@[p.value], @[mkField(OidDateMultirangeArray, 1)])
+    expect PgTypeError:
+      discard row.getInt4MultirangeArray(0)
+
+  test "getTsTzMultirangeArray rejects tsmultirange[]":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mJun, 1, zone = utc())
+    let p = toPgBinaryParam(@[toMultirange(rangeOf(dt1, dt2))])
+    let row = mkRow(@[p.value], @[mkField(OidTsMultirangeArray, 1)])
+    expect PgTypeError:
+      discard row.getTsTzMultirangeArray(0)
+
+suite "getArrayND accepts the 1-D character and bit OIDs":
+  test "getArrayND[string] accepts varchar[]":
+    let bin = encodeBinaryArray(OidVarchar, @[toBytes("hi")])
+    let row = mkRow(@[some(bin)], @[mkField(OidVarcharArray, 1)])
+    check getArrayND[string](row, 0).elements == @[some("hi")]
+
+  test "getArrayND[PgBit] accepts bit[]":
+    let bin = encodeBinaryArray(OidBit, @[@[0'u8, 0, 0, 1, 0x80]])
+    let row = mkRow(@[some(bin)], @[mkField(OidBitArray, 1)])
+    check getArrayND[PgBit](row, 0).elements.len == 1

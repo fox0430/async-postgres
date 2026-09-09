@@ -250,6 +250,56 @@ suite "target_session_attrs: recovery-state checks":
     waitFor testBody()
     check connPid == pass2Pid
 
+  test "a probe that errors on one host fails over to the next":
+    # An ErrorResponse to the probe is a per-host outcome (`PgQueryError`), not
+    # a config fault: it must fold into the aggregate and let the next host be
+    # tried, not escape `connect`.
+    const errPid = 111'i32
+    const okPid = 222'i32
+    var connPid: int32 = 0
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        # Host 1: no in_hot_standby, so the recovery probe runs — and fails.
+        let st1 = await acceptAndReady(ms, pid = errPid)
+        try:
+          discard await drainFrontendMessage(st1) # the probe Query
+          await sendBytes(
+            st1,
+            buildErrorResponse("57P01", "terminating connection") &
+              buildReadyForQuery('I'),
+          )
+          discard await drainFrontendMessage(st1) # Terminate
+        except CatchableError:
+          discard
+        await closeClient(st1)
+        # Host 2: reports its role, so no probe is needed.
+        let st2 = await acceptAndReady(
+          ms, pid = okPid, params = @[("in_hot_standby", "off")]
+        )
+          .wait(seconds(5))
+        try:
+          discard await drainFrontendMessage(st2) # Terminate
+        except CatchableError:
+          discard
+        await closeClient(st2)
+
+      let serverFut = serverHandler()
+      var cfg = mockConfig(ms.port, tsaPrimary)
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: ms.port),
+        HostEntry(host: "127.0.0.1", port: ms.port),
+      ]
+      let conn = await connect(cfg)
+      connPid = conn.pid
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check connPid == okPid
+
 suite "target_session_attrs: read-only-state checks":
   test "tsaReadWrite still probes SHOW transaction_read_only":
     var probeOk = false

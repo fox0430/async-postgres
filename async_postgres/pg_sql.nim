@@ -29,6 +29,7 @@
 import std/macros
 
 import async_backend, pg_types, pg_connection, pg_client, pg_pool
+import pg_connection/[types, simple_query]
 
 type
   SqlQuery* = object ## A parameterised SQL query with its bound parameters.

@@ -6,6 +6,11 @@ import ../async_postgres/[pg_client, pg_types, pg_protocol]
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_pool_cluster {.all.}
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/[buffer_io, simple_query, lifecycle]
+import ../async_postgres/pg_connection/types
+
+import std/importutils
+privateAccess(PgConnection)
 
 const
   PgHost = "127.0.0.1"
@@ -849,6 +854,29 @@ suite "Tracing: pool acquire/release":
 
     waitFor t()
 
+  test "a pool convenience method is traced like acquire":
+    # The convenience methods take their connection through `acquireInternal`,
+    # which must carry the same acquire span as `acquire` itself.
+    proc t() {.async.} =
+      let log = newTraceLog()
+      let tracer = buildTracer(log)
+      var poolCfg = initPoolConfig(tracedConfig(tracer), minSize = 0, maxSize = 2)
+      poolCfg.tracer = tracer
+      let pool = await newPool(poolCfg)
+
+      discard await pool.query("SELECT 1::int4")
+
+      doAssert log.poolAcquireStarts.len == 1
+      doAssert log.poolAcquireStarts[0].maxSize == 2
+      doAssert log.poolAcquireEnds.len == 1
+      doAssert log.poolAcquireEnds[0].hasConn
+      doAssert log.poolAcquireEnds[0].wasCreated == true
+      doAssert not log.poolAcquireEnds[0].hasErr
+
+      await pool.close()
+
+    waitFor t()
+
   test "release hands connection to waiter":
     proc t() {.async.} =
       let log = newTraceLog()
@@ -1037,7 +1065,9 @@ suite "Tracing: transport close errors":
     # clause, new stage without a fire call, new closeWait without wiring).
     # This test reads the source and asserts the invariants mechanically.
     const src = staticRead("../async_postgres/pg_connection/buffer_io.nim")
-    let body = src.split("proc closeTransport*(")[1].split("\nproc ")[0]
+    # `closeTransportImpl`, not the re-entrant `closeTransport` wrapper that
+    # only joins an in-flight teardown.
+    let body = src.split("proc closeTransportImpl(")[1].split("\nproc ")[0]
 
     for stage in [
       "tcsTlsReader", "tcsTlsWriter", "tcsBaseReader", "tcsBaseWriter", "tcsTransport"

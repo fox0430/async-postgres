@@ -31,4 +31,9 @@ examples/*
 htmldocs/
 htmdocs/
 
+tools/*
+!tools/*.*
+
 *.out
+audit/
+.audit/

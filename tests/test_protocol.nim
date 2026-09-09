@@ -1,10 +1,17 @@
-import std/[unittest, options, strutils, tables, importutils]
+import std/[unittest, options, strutils, tables, deques, importutils]
 
-import ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection]
+import
+  ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection, pg_errors]
+import ../async_postgres/pg_connection/buffer_io
+import ../async_postgres/pg_connection/notify
+import ../async_postgres/pg_connection/simple_query
+import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_types/[core, encoding]
 
 privateAccess(PgConnection)
 
+# `calcStartupBudget` / `checkCopyDataLen` come from pg_protocol directly: they
+# are off the `async_postgres` whitelist.
 proc parseBackendMessage(buf: var seq[byte]): ParseResult =
   ## Test-only wrapper that preserves the old var-buf interface.
   var consumed: int
@@ -44,72 +51,156 @@ suite "Byte helpers":
 
   test "addCString rejects embedded NUL":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("abc\0def")
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("\0")
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("trailing\0")
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCString("\0leading")
+
+  test "addCString NUL rejection is catchable as PgError":
+    # The direct exec/query path reaches addCString without a pre-flight
+    # validateParseMsg, so it has to satisfy the same `except PgError` contract.
+    var buf: seq[byte] = @[]
+    expect(PgError):
+      buf.addCString("a\0b")
 
   test "addCString leaves buffer unchanged on rejection":
     var buf: seq[byte] = @[byte('x')]
     try:
       buf.addCString("a\0b")
-    except ValueError:
+    except PgTypeError:
       discard
     check buf == @[byte('x')]
 
   test "encodeStartup rejects NUL in user":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice\0is_superuser", "db")
 
   test "encodeStartup rejects NUL in database":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice", "db\0options=-c")
 
   test "encodeStartup rejects NUL in extra params":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup(
         "alice", "db", [("application_name", "app\0options=-c log_statement=all")]
       )
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice", "db", [("app\0name", "value")])
 
   test "encodeStartup rejects empty key in extra params":
     # Empty key would encode as a lone NUL, matching the parameter-list
     # terminator and silently truncating the remaining parameters.
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeStartup("alice", "db", [("", "value")])
-    expect(ValueError):
+    expect(PgTypeError):
       discard
         encodeStartup("alice", "db", [("application_name", "app"), ("", "injected")])
 
+  test "encodeStartup rejects oversized total payload up front":
+    # Cross-checked against the encoder's own output, so a term missing from
+    # the pre-flight shows up as a length mismatch.
+    check calcStartupBudget(int(int32.high) - 16, 2) > int64(maxInt32Len)
+    check calcStartupBudget(1, 2) < int64(maxInt32Len)
+    check calcStartupBudget(1, 2) == int64(encodeStartup("a", "db").len)
+    check encodeStartup("a", "db").len < maxInt32Len
+
+  test "encodeStartup rejects oversized database payload up front":
+    check calcStartupBudget(1, int(int32.high) - 16) > int64(maxInt32Len)
+    check calcStartupBudget(1, 1) < int64(maxInt32Len)
+    check encodeStartup("a", "b").len < maxInt32Len
+
+  test "encodeStartup rejects oversized extraParams payload up front":
+    check calcStartupBudget(1, 2) + startupParamBytes(1, int(int32.high) - 16) >
+      int64(maxInt32Len)
+    check calcStartupBudget(1, 2) + startupParamBytes(1, 1) < int64(maxInt32Len)
+    check calcStartupBudget(1, 2) + startupParamBytes(1, 1) ==
+      int64(encodeStartup("a", "db", [("k", "v")]).len)
+    check encodeStartup("a", "db", [("k", "v")]).len < maxInt32Len
+
+  test "checkStartupBudget boundary values run the real raise path":
+    # The guard the budget arithmetic feeds, reached without a 2 GiB allocation.
+    checkStartupBudget(int64(maxInt32Len))
+    var caught = false
+    try:
+      checkStartupBudget(int64(maxInt32Len) + 1)
+    except CatchableError as e:
+      check e of PgTypeError
+      check e of PgError
+      caught = true
+    check caught
+    expect PgTypeError:
+      checkStartupBudget(calcStartupBudget(int(int32.high) - 16, 2))
+    expect PgTypeError:
+      checkStartupBudget(
+        calcStartupBudget(1, 2) + startupParamBytes(1, int(int32.high) - 16)
+      )
+
+  test "encodeStartup length matches cumulative calculation (no huge alloc)":
+    # The encoded length must equal the sum of every term, computed here
+    # independently of the pre-flight's proc.
+    let baseLen = encodeStartup("a", "b").len
+      # 8 + "user\0" + "a\0" + "database\0" + "b\0" + "\0" = 27
+    check baseLen == 27
+    check calcStartupBudget(1, 1) == int64(baseLen)
+    let oneExtra = encodeStartup("a", "b", [("k", "v")]).len
+    check oneExtra == baseLen + 4 # "k\0" + "v\0" = 1+1 +1+1
+    check calcStartupBudget(1, 1) + startupParamBytes(1, 1) == int64(oneExtra)
+    let twoExtras = encodeStartup("a", "b", [("ab", "cd"), ("e", "f")]).len
+    check twoExtras == baseLen + (2 + 1 + 2 + 1) + (1 + 1 + 1 + 1)
+      # "ab\0"+"cd\0" (3+3) + "e\0"+"f\0" (2+2)
+    check calcStartupBudget(1, 1) + startupParamBytes(2, 2) + startupParamBytes(1, 1) ==
+      int64(twoExtras)
+    # Multi-entry cumulative: 10 extras of 3+3 each
+    var many: seq[(string, string)]
+    for i in 0 ..< 10:
+      many.add(("k" & $i, "v" & $i))
+    let manyLen = encodeStartup("a", "b", many).len
+    var expected = baseLen
+    for (k, v) in many:
+      expected += k.len + 1 + v.len + 1
+    check manyLen == expected
+    var manyBudget = calcStartupBudget(1, 1)
+    for (k, v) in many:
+      manyBudget += startupParamBytes(k.len, v.len)
+    check manyBudget == int64(manyLen)
+    check manyLen < maxInt32Len
+
+  test "encodeStartup pre-flight rejects via budget arithmetic":
+    check calcStartupBudget(maxInt32Len, 0) > int64(maxInt32Len)
+    check calcStartupBudget(0, maxInt32Len) > int64(maxInt32Len)
+    check calcStartupBudget(1, 1) + startupParamBytes(maxInt32Len, 0) >
+      int64(maxInt32Len)
+    check calcStartupBudget(1, 1) < int64(maxInt32Len)
+    check startupParamBytes(1, 1) == 4
+
   test "encodeQuery rejects NUL in sql":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeQuery("SELECT 1\0; DROP TABLE users")
 
   test "encodePassword rejects NUL":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodePassword("pass\0word")
 
   test "encodeParse rejects NUL in stmtName or sql":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeParse("stmt\0", "SELECT 1")
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeParse("stmt", "SELECT \x001")
 
   test "encodeDescribe / encodeExecute / encodeClose reject NUL in name":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeDescribe(dkPortal, "portal\0name")
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeExecute("portal\0name", 0)
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeClose(dkStatement, "stmt\0name")
 
   test "encodeCopyFail rejects NUL in errorMsg":
-    expect(ValueError):
+    expect(PgTypeError):
       discard encodeCopyFail("bad\0msg")
 
   test "decodeCString":
@@ -270,27 +361,27 @@ suite "Frontend encoding":
 
   test "encodeParse rejects param-type count over the Int16 maximum":
     # int16(n) would raise an uncatchable RangeDefect (or wrap under -d:danger);
-    # the explicit guard turns it into a catchable ValueError before encoding.
-    expect(ValueError):
+    # the explicit guard turns it into a PgTypeError before encoding.
+    expect(PgTypeError):
       discard encodeParse("s", "SELECT 1", newSeq[int32](maxCount + 1))
 
   test "encodeBind rejects counts over the Int16 maximum":
     expect( # parameter-value count
-      ValueError
+      PgTypeError
     ):
       discard encodeBind("", "s", @[], newSeq[Option[seq[byte]]](maxCount + 1))
     expect( # parameter-format count
-      ValueError
+      PgTypeError
     ):
       discard encodeBind("", "s", newSeq[int16](maxCount + 1), @[])
     expect( # result-format count
-      ValueError
+      PgTypeError
     ):
       discard encodeBind("", "s", @[], @[], newSeq[int16](maxCount + 1))
 
   test "addBindRaw rejects param-range count over the Int16 maximum":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addBindRaw("", "s", @[], @[], newSeq[tuple[off, len: int32]](maxCount + 1))
 
   test "encodeBind accepts exactly the Int16 maximum count":
@@ -316,23 +407,34 @@ suite "Frontend encoding":
 
   test "addLen32 rejects a length over the Int32 maximum":
     # int32(n) would raise an uncatchable RangeDefect (or wrap under -d:danger);
-    # the guard turns it into a catchable ValueError before any payload is
-    # appended. Exceeding the limit requires a 64-bit `int`.
+    # the guard turns it into a PgTypeError before any payload is appended, so
+    # `except PgError` covers it. Exceeding the limit requires a 64-bit `int`.
     when sizeof(int) > 4:
       var buf: seq[byte] = @[]
-      expect(ValueError):
+      expect(PgTypeError):
         buf.addLen32(maxLen + 1, "test")
       check buf.len == 0 # nothing written on rejection
 
+  test "wire-length and count guards are catchable as PgError":
+    # Hand-built params reach these guards directly, bypassing toPgParam.
+    var buf: seq[byte] = @[]
+    expect(PgError):
+      buf.addCount16(maxCount + 1, "test")
+    when sizeof(int) > 4:
+      expect(PgError):
+        buf.addLen32(maxLen + 1, "test")
+    expect(PgError):
+      buf.addBindRaw("", "", [int16(1)], @[], @[(off: int32(0), len: int32(-2))], [])
+
   test "addCount16 rejects negative count":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addCount16(-1, "test")
     check buf.len == 0 # nothing written on rejection
 
   test "addLen32 rejects negative length":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addLen32(-1, "test")
     check buf.len == 0 # nothing written on rejection
 
@@ -350,16 +452,72 @@ suite "Frontend encoding":
   test "encoding addParse rejects param count over Int16 maximum":
     # The PgParam overload in pg_types/encoding is the path used by the real
     # client; it must guard the Int16 parameter-type count just like the
-    # low-level encodeParse overload in pg_protocol. The message header is
-    # written before the count field, so the buffer is not empty on rejection.
+    # low-level encodeParse overload in pg_protocol.
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addParse("s", "SELECT 1", newSeq[PgParam](maxCount + 1))
+    check buf.len == 0
 
   test "encoding addBind rejects param count over Int16 maximum":
     var buf: seq[byte] = @[]
-    expect(ValueError):
+    expect(PgTypeError):
       buf.addBind("", "s", newSeq[PgParam](maxCount + 1))
+    check buf.len == 0
+
+  test "encoding addParse emits what the int32 overload emits":
+    # The PgParam overload writes the message itself rather than re-shaping the
+    # OIDs into a `seq[int32]`; the two layouts must stay byte-identical.
+    let params = [PgParam(oid: OidInt4, format: 1), PgParam(oid: OidText, format: 0)]
+    var fromParams: seq[byte] = @[0xAA'u8]
+    var fromOids: seq[byte] = @[0xAA'u8]
+    fromParams.addParse("s", "SELECT $1, $2", params)
+    fromOids.addParse("s", "SELECT $1, $2", [OidInt4, OidText])
+    check fromParams == fromOids
+
+  test "encoding addParse leaves an earlier message untouched on rejection":
+    # The whole pre-flight runs before the first byte is written, so a rejected
+    # Parse cannot truncate or corrupt what the send buffer already holds.
+    var orig: seq[byte] = @[]
+    orig.addParse("prev", "SELECT 1", [PgParam(oid: OidInt4, format: 1)])
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addParse("s\0x", "SELECT 1", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addParse("s", "SELECT\0 1", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addParse("s", "SELECT 1", newSeq[PgParam](maxCount + 1))
+      check buf == orig
+
+  test "encoding addBind leaves an earlier message untouched on rejection":
+    var orig: seq[byte] = @[]
+    orig.addBind("", "prev", [PgParam(oid: OidInt4, format: 1)])
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("p\0x", "s", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("", "s\0x", newSeq[PgParam](0))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("", "s", newSeq[PgParam](maxCount + 1))
+      check buf == orig
+    block:
+      var buf = orig
+      expect(PgTypeError):
+        buf.addBind("", "s", newSeq[PgParam](0), newSeq[int16](maxCount + 1))
+      check buf == orig
 
   test "encoding addBind accepts exactly the Int16 maximum count":
     # Boundary: maxCount PgParam elements must encode cleanly.
@@ -419,6 +577,14 @@ suite "Frontend encoding":
     check msg[0] == byte('d')
     check decodeInt32(msg, 1) == 7'i32 # 4 + 3
 
+  test "encodeCopyData accepts a payload inside the Int32 budget":
+    # The oversized path is pinned by the "CopyData oversized chunk guard"
+    # suite below, without a 2 GiB allocation.
+    var sm: seq[byte]
+    encodeCopyData(sm, @[1'u8, 2, 3])
+    check sm.len == 8
+    check int64(int32.high) > int64(maxInt32Len - 4)
+
   test "encodeCopyDone":
     let msg = encodeCopyDone()
     check msg.len == 5
@@ -428,6 +594,39 @@ suite "Frontend encoding":
     let msg = encodeCopyFail("error")
     check msg[0] == byte('f')
     check decodeInt32(msg, 1) == int32(msg.len - 1)
+
+suite "CopyData oversized chunk guard":
+  test "checkCopyDataLen boundary values run the real raise path":
+    # pg_protocol's own guard, called by encodeCopyData, so the boundary is
+    # exercised without a huge allocation. copyInStreamImpl catches
+    # `CatchableError` to take the CopyFail path (csReady) rather than the
+    # transport-failure path, so the guard must raise one — a regression to a
+    # plain ValueError also escapes `except PgError` (pg_errors.nim conventions).
+    checkCopyDataLen(0)
+    checkCopyDataLen(maxInt32Len - 4) # Int32 length field covers itself + payload
+    var caught = false
+    try:
+      checkCopyDataLen(maxInt32Len - 3)
+    except CatchableError as e:
+      check e of PgTypeError
+      check e of PgError
+      caught = true
+    check caught
+
+  test "encodeCopyData delegates to checkCopyDataLen":
+    # Length-only view: the guard rejects before a byte is read, so the real
+    # encoder is reached without allocating ~2 GiB. The base is nil on purpose
+    # — a regression that drops the guard faults on the first byte instead of
+    # copying ~2 GiB out of whatever follows a live buffer.
+    var msg: seq[byte]
+    expect PgTypeError:
+      encodeCopyData(
+        msg, toOpenArray(cast[ptr UncheckedArray[byte]](nil), 0, maxInt32Len - 3)
+      )
+    check msg.len == 0
+    # Legal payload still encodes.
+    encodeCopyData(msg, @[1'u8])
+    check msg.len == 6
 
 suite "Backend decoding":
   # Helper to build a backend message byte buffer
@@ -1452,3 +1651,935 @@ suite "nextMessage skipDataRow":
     check rd.cellIndex.len == 2 # 1 column * (offset, length)
     check rd.cellIndex[1] == 2'i32 # "hi" length
     check conn.recvBufStart == row.len
+
+suite "enqueueNotification with an outstanding handoff":
+  ## Regression: the handoff was charged against `notifyMaxQueue`, shrinking the
+  ## configured depth by one — a cap of 1 dropped every arrival while the queue
+  ## sat empty. The cap counts queued notifications only; the handoff belongs to
+  ## a waiter that is about to consume it.
+  proc handoffConn(queued: int, maxQueue: int): PgConnection =
+    result = PgConnection(
+      recvBuf: @[],
+      state: csListening,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      notifyQueue: initDeque[Notification](),
+      config: ConnConfig(),
+    )
+    for i in 1 .. queued:
+      result.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: $i))
+    # The state between completing a waiter and that waiter resuming.
+    result.hasNotifyHandoff = true
+    result.notifyMaxQueue = maxQueue
+
+  test "a cap of one still admits an arrival while a handoff is outstanding":
+    let conn = handoffConn(queued = 0, maxQueue = 1)
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "new"
+    check conn.notifyDropped == 0
+
+  test "a backlog above a lowered cap is trimmed down to it in one report":
+    # `notifyMaxQueue` lowered while entries admitted under the old cap are
+    # still queued: they all go, in one overflow report, not one per arrival.
+    let conn = handoffConn(queued = 2, maxQueue = 1)
+    var reported = -1
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check reported == 2
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "new"
+
+  test "requeueHandoff drops nothing and the next arrival trims the overshoot":
+    # The handoff predates the queue, so it goes back to the front intact; the
+    # cap is restored by the next arrival, still drop-oldest.
+    let conn = handoffConn(queued = 2, maxQueue = 2)
+    conn.requeueHandoff(Notification(pid: 1, channel: "ch", payload: "handoff"))
+    check conn.notifyQueue.len == 3
+    check conn.notifyQueue[0].payload == "handoff"
+    check conn.notifyDropped == 0
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "2"
+    check conn.notifyQueue[1].payload == "new"
+    check conn.notifyDropped == 2
+
+  test "drop-oldest applies at the cap regardless of the handoff":
+    let conn = handoffConn(queued = 2, maxQueue = 2)
+    conn.enqueueNotification(Notification(pid: 1, channel: "ch", payload: "new"))
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "2" # oldest went, arrival stayed
+    check conn.notifyQueue[1].payload == "new"
+    check conn.notifyDropped == 1
+
+suite "waitNotification defensive branch":
+  proc mockNotifyConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      notifyQueue: initDeque[Notification](),
+      notifyDropped: 0,
+      listenError: nil,
+      listenTask: newFuture[void]("listenTask"),
+      notifyWaiter: nil,
+      config: ConnConfig(),
+    )
+
+  proc notifyMsg(pid: int32, channel, payload: string): BackendMessage =
+    BackendMessage(
+      kind: bmkNotificationResponse,
+      notifPid: pid,
+      notifChannel: channel,
+      notifPayload: payload,
+    )
+
+  test "waitNotification raises PgStateError when waiter completes with empty queue":
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      doAssert not conn.listenTask.finished
+      let fut = conn.waitNotification()
+      doAssert not fut.finished
+      doAssert conn.notifyWaiter != nil
+      doAssert not conn.notifyWaiter.finished
+      # Simulate pump completing waiter without enqueueing (defensive branch)
+      conn.notifyWaiter.complete()
+      var raised = false
+      try:
+        discard await fut
+      except PgStateError as e:
+        doAssert "No notification available" in e.msg
+        raised = true
+      except CatchableError as e:
+        echo "unexpected error: ", e.msg, " type:", e.name
+        doAssert false
+      doAssert raised
+
+    waitFor t()
+
+  test "waitNotification early return when queue already has notification":
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.notifyQueue.addLast(Notification(pid: 42, channel: "ch", payload: "p"))
+      doAssert conn.notifyQueue.len == 1
+      let n = await conn.waitNotification()
+      doAssert n.channel == "ch"
+      doAssert n.payload == "p"
+      doAssert conn.notifyQueue.len == 0
+      # Subsequent wait with empty queue and no pump should still park;
+      # verify the defensive branch via empty complete still works
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      let waiter = conn.notifyWaiter
+      doAssert waiter != nil
+      waiter.complete()
+      var raised = false
+      try:
+        discard await fut1
+      except PgStateError as e:
+        doAssert "No notification available" in e.msg
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "waitNotification concurrent guard rejects a second caller":
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      doAssert conn.notifyWaiter != nil
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        doAssert "Another waitNotification is already active" in e.msg
+        raised = true
+      doAssert raised
+      # The parked waiter is served through the handoff, so nothing it owns is
+      # ever in the queue for a second caller to steal.
+      conn.dispatchNotification(notifyMsg(1, "ch", "p"))
+      doAssert conn.notifyQueue.len == 0
+      let n = await fut1
+      doAssert n.payload == "p"
+      doAssert conn.notifyQueue.len == 0
+      doAssert not conn.hasNotifyHandoff
+      doAssert conn.notifyWaiter == nil
+
+    waitFor t()
+
+  test "a waiter's notification survives a queue overflow":
+    # Regression: parking the waiter's notification at the head of the shared
+    # queue made it the first thing the overflow drop discarded.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.notifyMaxQueue = 2
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      let waiter = conn.notifyWaiter
+      conn.dispatchNotification(notifyMsg(1, "ch", "mine"))
+      doAssert waiter.finished
+      # Overflow the queue several times over. Whether the waiter resumed by now is
+      # backend-dependent; either way its notification was never a queue slot.
+      var maxPending = 0
+      for i in 1 .. 5:
+        conn.dispatchNotification(notifyMsg(2, "ch", "later" & $i))
+        maxPending = max(maxPending, conn.notifyQueue.len + ord(conn.hasNotifyHandoff))
+      var first: string
+      try:
+        first = (await fut1).payload
+      except PgNotifyOverflowError:
+        # Overflow is reported ahead of the notification, which stays queued.
+        first = (await conn.waitNotification()).payload
+      doAssert first == "mine", "the waiter's notification was dropped, got " & first
+      # The cap bounds arrivals into the queue; the handoff is the waiter's, and
+      # requeuing it may leave the queue one over until the next arrival trims.
+      doAssert maxPending <= 3, "cap exceeded, pending peaked at " & $maxPending
+      doAssert conn.notifyQueue.len <= 3
+
+    waitFor t()
+
+  when hasChronos:
+    test "an abandoned waiter's handoff is reclaimed, not delivered twice":
+      # The waiter is completed with its notification reserved and its frame never
+      # resumes, since nothing yields between the dispatch and the next call. The
+      # reserved notification must stay reachable to exactly one caller. Only
+      # chronos defers the continuation; asyncdispatch has no such window.
+      proc t() {.async.} =
+        var conn = mockNotifyConn()
+        let abandoned = conn.waitNotification()
+        conn.dispatchNotification(notifyMsg(1, "ch", "reserved"))
+        doAssert conn.hasNotifyHandoff
+        doAssert conn.notifyQueue.len == 0
+
+        doAssert (await conn.waitNotification()).payload == "reserved"
+        doAssert not conn.hasNotifyHandoff
+        doAssert conn.notifyQueue.len == 0
+        # The abandoned frame resumes to find the registration gone and must
+        # not hand out the same notification a second time.
+        var secondDelivery = ""
+        try:
+          secondDelivery = (await abandoned).payload
+        except PgStateError:
+          discard
+        doAssert secondDelivery == "", "delivered twice, got " & secondDelivery
+
+      waitFor t()
+
+  test "reclaiming a handoff keeps one drop-oldest policy at the cap":
+    # `requeueHandoff` deliberately does not trim, so a reclaim inherits the
+    # documented `notifyMaxQueue + 1` ceiling; the next arrival trims, oldest first.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.notifyMaxQueue = 1
+      let waiter = newFuture[void]("parkedWaiter")
+      waiter.complete()
+      conn.notifyWaiter = waiter
+      conn.notifyHandoff = Notification(pid: 1, channel: "ch", payload: "reserved")
+      conn.hasNotifyHandoff = true
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "queued"))
+
+      doAssert (await conn.waitNotification()).payload == "reserved"
+      doAssert conn.notifyQueue.len == 1
+      conn.dispatchNotification(notifyMsg(1, "ch", "next"))
+      doAssert conn.notifyQueue.len == 1
+      doAssert conn.notifyQueue[0].payload == "next"
+      doAssert conn.notifyDropped == 1
+
+    waitFor t()
+
+  test "a finished waiter's handoff is served in order, not stranded":
+    # Two regressions in one state: serving the queue before the concurrency guard
+    # returned a later notification first, and guarding on the finished waiter
+    # alone refused every later caller once its frame was abandoned.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      # The state `dispatchNotification` leaves behind between completing a
+      # waiter and that waiter's frame resuming — or never resuming.
+      let waiter = newFuture[void]("parkedWaiter")
+      waiter.complete()
+      conn.notifyWaiter = waiter
+      conn.notifyHandoff = Notification(pid: 1, channel: "ch", payload: "first")
+      conn.hasNotifyHandoff = true
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "second"))
+
+      # Reclaimed to the front of the queue, so delivery order is preserved.
+      doAssert (await conn.waitNotification()).payload == "first"
+      doAssert not conn.hasNotifyHandoff
+      doAssert conn.notifyWaiter == nil
+      doAssert (await conn.waitNotification()).payload == "second"
+      doAssert conn.notifyQueue.len == 0
+
+    waitFor t()
+
+  test "a handed notification the waiter never consumed goes back to the queue":
+    # The waiter is completed but unwinds on the overflow check, so its
+    # notification must be queued for the next caller instead of dropped.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let fut1 = conn.waitNotification()
+      doAssert not fut1.finished
+      conn.notifyDropped = 1 # makes the post-resume overflow check raise
+      conn.dispatchNotification(notifyMsg(1, "ch", "p"))
+      var raised = false
+      try:
+        discard await fut1
+      except PgNotifyOverflowError:
+        raised = true
+      doAssert raised
+      doAssert not conn.hasNotifyHandoff
+      doAssert conn.notifyQueue.len == 1
+      doAssert (await conn.waitNotification()).payload == "p"
+
+    waitFor t()
+
+  test "listen/unlisten failing on a live pump does not fail the parked waiter":
+    # reconnectInPlace parks the pump in csConnecting, so listen() skips
+    # stopListening and checkReady() raises — but the pump's waiter must survive.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let fut = conn.waitNotification()
+      doAssert not fut.finished
+      conn.state = csConnecting # pump is mid-reconnectInPlace
+      for call in ["listen", "unlisten"]:
+        var raised = false
+        try:
+          if call == "listen":
+            await conn.listen("ch2")
+          else:
+            await conn.unlisten("ch2")
+        except PgStateError:
+          raised = true
+        doAssert raised, call & " must still reject a non-ready connection"
+        doAssert not fut.finished,
+          call & "() failing must not fail a waiter owned by a live pump"
+      # The pump comes back and the waiter is still serviceable.
+      conn.state = csListening
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p"))
+      conn.notifyWaiter.complete()
+      doAssert (await fut).payload == "p"
+
+    waitFor t()
+
+  test "stale waiter after clean stop reports Listener stopped":
+    # A cleanly released waiter keeps notifyWaiter non-nil until its own task
+    # resumes, and a caller in that window must not see a phantom concurrent use.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgStateError, "Listener stopped"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = nil # pump already gone after stopListening/close
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        doAssert "Listener stopped" in e.msg
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "stale waiter does not reject a re-listening connection":
+    # If listen() restarts the pump while a failed waiter is still registered, the
+    # connection is healthy, so a new caller must park rather than be turned away.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgStateError, "Listener stopped"))
+      conn.notifyWaiter = staleFut
+      # Fresh pump from a re-listen; mockNotifyConn's listenTask is unfinished.
+      let fut = conn.waitNotification()
+      doAssert not fut.finished
+      doAssert conn.notifyWaiter != staleFut
+      conn.notifyQueue.addLast(Notification(pid: 7, channel: "ch", payload: "p"))
+      conn.notifyWaiter.complete()
+      doAssert (await fut).payload == "p"
+      doAssert conn.notifyWaiter == nil
+
+    waitFor t()
+
+  test "backlog stays drainable after a clean stop releases the waiter":
+    # A failed waiter leaves notifyQueue unowned, so a caller draining in that
+    # window must still get the buffered notifications.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgStateError, "Listener stopped"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = nil
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p1"))
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p2"))
+      doAssert (await conn.waitNotification()).payload == "p1"
+      doAssert (await conn.waitNotification()).payload == "p2"
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        doAssert "Listener stopped" in e.msg
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "stale waiter after transport closed reports Connection is closed":
+    # Counterpart to the PgStateError stale case: with the transport gone, a fresh
+    # wait must report PgConnectionError too so reconnect loops fire.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.state = csClosed
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgConnectionError, "Connection is closed"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = newFuture[void]("listenTask")
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgConnectionError as e:
+        doAssert "Connection is closed" in e.msg
+        raised = true
+      except CatchableError as e:
+        echo "unexpected ", e.msg, " ", e.name
+        doAssert false
+      doAssert raised
+
+    waitFor t()
+
+  test "backlog not drainable after transport closed":
+    # With the transport gone, checkListenAlive fires before the queue fast path,
+    # so nothing is drained — the counterpart to the clean-stop case above.
+    proc t() {.async.} =
+      var conn = mockNotifyConn()
+      conn.state = csClosed
+      let staleFut = newFuture[void]("stale")
+      staleFut.fail(newException(PgConnectionError, "Connection is closed"))
+      conn.notifyWaiter = staleFut
+      conn.listenTask = newFuture[void]("listenTask")
+      conn.notifyQueue.addLast(Notification(pid: 1, channel: "ch", payload: "p1"))
+      var raised = false
+      try:
+        discard await conn.waitNotification()
+      except PgConnectionError as e:
+        doAssert "Connection is closed" in e.msg
+        raised = true
+      doAssert raised
+      doAssert conn.notifyQueue.len == 1
+      doAssert conn.notifyQueue.peekFirst.payload == "p1"
+
+    waitFor t()
+
+suite "failNotifyWaiter state branching":
+  test "csClosed fails waiter with PgConnectionError":
+    var conn = PgConnection(
+      state: csClosed,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter()
+    check w.failed
+    var msg = ""
+    var isConnErr = false
+    try:
+      waitFor w
+    except PgConnectionError as e:
+      isConnErr = true
+      msg = e.msg
+    except CatchableError:
+      discard
+    check isConnErr
+    check "Connection is closed" in msg
+    # second call is idempotent (already failed)
+    conn.failNotifyWaiter()
+    check w.failed
+
+  test "non-closed fails waiter with PgStateError":
+    var conn = PgConnection(
+      state: csReady,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter()
+    check w.failed
+    var isStateErr = false
+    try:
+      waitFor w
+    except PgStateError as e:
+      isStateErr = true
+      check "Listener stopped" in e.msg
+    except CatchableError:
+      discard
+    check isStateErr
+    # csListening also yields PgStateError (clean stop)
+    var conn2 = PgConnection(
+      state: csListening,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w2"),
+      listenError: nil,
+    )
+    let w2 = conn2.notifyWaiter
+    conn2.failNotifyWaiter()
+    check w2.failed
+    var isStateErr2 = false
+    try:
+      waitFor w2
+    except PgStateError:
+      isStateErr2 = true
+    except CatchableError:
+      discard
+    check isStateErr2
+
+  test "closedByUser fails waiter with PgStateError, not PgConnectionError":
+    # A deliberate close() must stay out of `except PgConnectionError` reconnect
+    # loops even though the connection is already csClosed.
+    var conn = PgConnection(
+      state: csClosed,
+      closedByUser: true,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter()
+    check w.failed
+    var isStateErr = false
+    var isConnErr = false
+    try:
+      waitFor w
+    except PgStateError as e:
+      isStateErr = true
+      check "Connection closed by the application" in e.msg
+    except PgConnectionError:
+      isConnErr = true
+    except CatchableError:
+      discard
+    check isStateErr
+    check not isConnErr
+
+  test "closedByUser outranks an explicit error passed to failNotifyWaiter":
+    # `notifyListenDeath` always passes a fresh `PgListenError`; honouring it when
+    # the pump dies during `close()` would revive the reconnect loops.
+    var conn = PgConnection(
+      state: csClosed,
+      closedByUser: true,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter(
+      (ref PgListenError)(msg: "listen pump died", reconnectionAttempted: true)
+    )
+    check w.failed
+    var isStateErr = false
+    var isConnErr = false
+    try:
+      waitFor w
+    except PgStateError as e:
+      isStateErr = true
+      check "Connection closed by the application" in e.msg
+    except PgConnectionError:
+      isConnErr = true
+    except CatchableError:
+      discard
+    check isStateErr
+    check not isConnErr
+
+  test "waitNotification after close keeps reporting PgStateError":
+    # The parked-waiter relabel alone is not enough: a caller that was between
+    # iterations when close() ran asks again, and must not be told to reconnect.
+    proc t() {.async.} =
+      var conn = PgConnection(
+        state: csClosed,
+        closedByUser: true,
+        notifyQueue: initDeque[Notification](),
+        notifyDropped: 0,
+        notifyWaiter: nil,
+        listenError: nil,
+      )
+      var isStateErr = false
+      var isConnErr = false
+      try:
+        discard await conn.waitNotification()
+      except PgStateError as e:
+        isStateErr = true
+        doAssert "Connection closed by the application" in e.msg
+      except PgConnectionError:
+        isConnErr = true
+      except CatchableError:
+        discard
+      doAssert isStateErr
+      doAssert not isConnErr
+
+    waitFor t()
+
+  test "explicit err overrides the state mapping":
+    # `notifyListenDeath` hands the waiter a fresh PgListenError this way.
+    var conn = PgConnection(
+      state: csClosed,
+      notifyQueue: initDeque[Notification](),
+      notifyWaiter: newFuture[void]("w"),
+      listenError: nil,
+    )
+    let w = conn.notifyWaiter
+    conn.failNotifyWaiter(
+      (ref PgListenError)(msg: "pump died", reconnectionAttempted: true)
+    )
+    check w.failed
+    var isListenErr = false
+    try:
+      waitFor w
+    except PgListenError as e:
+      isListenErr = true
+      check e.reconnectionAttempted
+      check "pump died" in e.msg
+    except CatchableError:
+      discard
+    check isListenErr
+
+  test "nil waiter does not raise":
+    var conn = PgConnection(state: csClosed, notifyWaiter: nil)
+    conn.failNotifyWaiter()
+    check conn.notifyWaiter == nil
+
+  test "already completed waiter is not failed":
+    var conn = PgConnection(state: csClosed, notifyWaiter: newFuture[void]("w"))
+    let w = conn.notifyWaiter
+    w.complete()
+    check w.finished and not w.failed
+    conn.failNotifyWaiter()
+    check w.finished and not w.failed
+    check not w.failed
+
+  test "already failed waiter is not failed again":
+    var conn = PgConnection(state: csReady, notifyWaiter: newFuture[void]("w"))
+    let w = conn.notifyWaiter
+    w.fail(newException(PgStateError, "already"))
+    check w.failed
+    conn.state = csClosed
+    conn.failNotifyWaiter()
+    var msg = ""
+    try:
+      waitFor w
+    except PgStateError as e:
+      msg = e.msg
+    except CatchableError:
+      discard
+    # original failure must survive, not overwritten with PgConnectionError
+    check "already" in msg
+
+suite "checkReady during the close window":
+  ## Regression: `checkReady` returned early on `csReady` and so never reached
+  ## `checkNotClosed`. `close()` sets `closedByUser` before its first suspension
+  ## while the state is still `csReady`, so for the whole close window a query
+  ## was admitted, interleaved with Terminate on the wire and failed as a raw
+  ## transport error — feeding the very reconnect loop the flag keeps it out of.
+
+  test "closedByUser is rejected while the state is still csReady":
+    var conn = PgConnection(state: csReady, closedByUser: true)
+    var isStateErr = false
+    var msg = ""
+    try:
+      conn.checkReady()
+    except PgStateError as e:
+      isStateErr = true
+      msg = e.msg
+    except CatchableError:
+      discard
+    check isStateErr
+    check msg == closedByUserMsg
+
+  test "a connection the application did not close still passes":
+    var conn = PgConnection(state: csReady)
+    var passed = false
+    try:
+      conn.checkReady()
+      passed = true
+    except CatchableError:
+      discard
+    check passed
+
+suite "transport failures fold into the PgError contract":
+  ## Backend transport exceptions (chronos `AsyncStreamError`, asyncdispatch
+  ## `OSError`/`SslError`) are not under `PgError`, so every read/write path
+  ## routes its failure through `raiseTransportFailure`.
+  proc foldingConn(closedByUser: bool): PgConnection =
+    result = PgConnection(state: csClosed, config: ConnConfig())
+    result.closedByUser = closedByUser
+
+  test "a raw backend error becomes PgConnectionError with the original parent":
+    let conn = foldingConn(false)
+    let raw = newException(OSError, "connection reset by peer")
+    var caught: ref PgConnectionError
+    try:
+      conn.raiseTransportFailure("fillRecvBuf", raw)
+    except PgConnectionError as e:
+      caught = e
+    check caught != nil
+    check "fillRecvBuf" in caught.msg
+    check "connection reset by peer" in caught.msg
+    check caught.parent == raw
+
+  test "an error already on contract is re-raised unchanged":
+    let conn = foldingConn(false)
+    let onContract = newException(PgProtocolError, "desynchronised")
+    var caught: ref CatchableError
+    try:
+      conn.raiseTransportFailure("nextMessage", onContract)
+    except CatchableError as e:
+      caught = e
+    check caught == onContract
+
+  test "closedByUser reports PgStateError, not a connection failure":
+    let conn = foldingConn(true)
+    let raw = newException(OSError, "broken pipe")
+    var isState = false
+    var isConnFailure = true
+    try:
+      conn.raiseTransportFailure("sendMsg", raw)
+    except CatchableError as e:
+      isState = e of PgStateError
+      isConnFailure = e of PgConnectionError
+    check isState
+    check not isConnFailure
+
+suite "What a send leaves the backend owing":
+  test "one sync point per simple Query and per Sync, none for the rest":
+    check outstandingReplies(encodeQuery("SELECT 1")) == (1, false)
+    check outstandingReplies(encodeSync()) == (1, false)
+    check outstandingReplies(encodeTerminate()) == (0, false)
+    check outstandingReplies(@[]) == (0, false)
+
+  test "a per-op Sync batch owes one reply per op":
+    ## The reason this is a count and not a flag: the first `ReadyForQuery`
+    ## coming back leaves the other two ops' replies still on the wire.
+    var buf: seq[byte]
+    for i in 0 .. 2:
+      buf.addParse("", "SELECT " & $i)
+      buf.addBind("", "", [], [])
+      buf.addExecute("")
+      buf.addSync()
+    check outstandingReplies(buf) == (3, false)
+
+  test "a single-Sync batch owes one":
+    var buf: seq[byte]
+    buf.addClose(dkStatement, "_sc_1")
+    buf.addParse("_sc_2", "SELECT 1")
+    buf.addBind("", "_sc_2", [], [])
+    buf.addExecute("")
+    buf.addSync()
+    check outstandingReplies(buf) == (1, false)
+
+  test "a batch that stops at Flush owes replies with nothing to end them":
+    ## The shape every cursor round trip writes: the server answers, but no
+    ## `ReadyForQuery` follows, so the stream stays off a boundary until a
+    ## later Sync.
+    var buf: seq[byte]
+    buf.addParse("", "SELECT 1")
+    buf.addBind("_cursor_1", "", [], [])
+    buf.addDescribe(dkPortal, "_cursor_1")
+    buf.addExecute("_cursor_1", 5)
+    buf.addFlush()
+    check outstandingReplies(buf) == (0, true)
+
+  test "requests written past the last Sync stay unsynchronised":
+    var buf: seq[byte]
+    buf.addParse("", "SELECT 1")
+    buf.addSync()
+    buf.addExecute("_cursor_1", 5)
+    buf.addFlush()
+    check outstandingReplies(buf) == (1, true)
+
+  test "a fast-path FunctionCall is a sync point of its own":
+    ## Nothing here writes one, but the walk accepts the tag, and the backend
+    ## answers it with a `ReadyForQuery` like any other round trip.
+    check outstandingReplies(@[byte('F'), 0, 0, 0, 4]) == (1, false)
+
+  test "an authentication reply and a COPY payload end with their exchange":
+    ## Neither opens a round trip of its own: the password messages answer an
+    ## authentication the backend asked for, and CopyData/CopyDone are the
+    ## payload of a COPY the preceding `Query` opened. Counting them as
+    ## unsynchronised would leave every COPY and every replication stream
+    ## looking desynchronised for the rest of the connection's life.
+    var buf = encodeQuery("COPY t FROM STDIN")
+    encodeCopyData(buf, [byte('x')])
+    buf.add(@[byte('c'), 0, 0, 0, 4])
+    check outstandingReplies(buf) == (1, false)
+
+  test "framing it cannot walk counts as one reply":
+    ## The startup packet is untagged and its authentication exchange ends in
+    ## exactly one `ReadyForQuery`, which closes everything it sent; a build
+    ## truncated from the first byte is counted the same way.
+    check outstandingReplies(encodeStartup("u", "d", @[])) == (1, false)
+    check outstandingReplies(@[byte('S'), 0, 0]) == (1, false)
+    var truncated = encodeQuery("SELECT 1")
+    truncated.setLen(truncated.len - 1)
+    check outstandingReplies(truncated) == (1, false)
+
+  test "framing that stops part-way is charged the most its tail could owe":
+    ## What could not be read follows a sync point that has been read, so no
+    ## reply already owed ends it — and it may hold sync points of its own, so
+    ## it is charged the most it could: one per five bytes, the smallest a
+    ## frontend message can be. Overcounting only retires a connection, while
+    ## undercounting leaves a reply on the wire for the next borrower.
+    var buf = encodeSync()
+    buf.add(@[byte('P'), 0, 0])
+    check outstandingReplies(buf) == (2, true)
+
+    ## A longer tail could hide more sync points, and is charged for them.
+    var wide = encodeSync()
+    wide.add(@[byte('P')])
+    wide.add(newSeq[byte](19))
+    check outstandingReplies(wide) == (5, true)
+
+suite "Retiring a connection on the replies it still owes":
+  proc pipelinedConn(pending: int, unsynced = false): PgConnection =
+    PgConnection(
+      state: csBusy,
+      pendingSyncs: pending,
+      unsyncedWrite: unsynced,
+      notifyQueue: initDeque[Notification](),
+      config: ConnConfig(),
+    )
+
+  const readyForQuery = @[byte('Z'), 0, 0, 0, 5, byte('I')]
+
+  test "the first ReadyForQuery of a batch does not release the rest":
+    ## A per-op Sync pipeline is `csBusy` for the whole run, so the reply that
+    ## comes back for op #1 must not make abandoning op #2 look safe: its
+    ## Parse/Bind replies are still on the wire for the next borrower to read
+    ## as its own.
+    let conn = pipelinedConn(2)
+    conn.recvBuf = readyForQuery
+    let msg = conn.nextMessage()
+    check msg.isSome
+    check msg.get.kind == bmkReadyForQuery
+    check conn.pendingSyncs == 1
+    check not conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csClosed
+
+  test "the last ReadyForQuery hands the connection back":
+    let conn = pipelinedConn(1)
+    conn.recvBuf = readyForQuery
+    discard conn.nextMessage()
+    check conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csReady
+
+  test "a settled wire only goes back when the timeout unwound its operation":
+    ## `wait` on asyncdispatch leaves the timed-out operation running against
+    ## the socket, still reading into the shared buffer, so the wire being
+    ## parked on a boundary says nothing about what the next borrower would
+    ## read. Chronos unwinds the operation, so there the settled wire holds.
+    let conn = pipelinedConn(1)
+    conn.recvBuf = readyForQuery
+    discard conn.nextMessage()
+    check conn.wireSettled
+    expect PgTimeoutError:
+      conn.invalidateOnTimeout("timed out")
+    when hasAsyncDispatch:
+      check conn.state == csClosed
+    else:
+      check conn.state == csReady
+
+  test "a Flush-terminated round trip is not settled by its replies":
+    ## An open cursor has no ReadyForQuery coming; only the Sync its `close`
+    ## sends puts the stream back on a boundary.
+    let conn = pipelinedConn(0, unsynced = true)
+    check not conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csClosed
+
+  test "a Sync's reply does not settle a batch written after it":
+    ## The reply comes back for the sync point that preceded the cursor's
+    ## Flush batch, so it cannot have ended that batch's replies. Clearing the
+    ## flag here would hand the next borrower a `csReady` connection with
+    ## someone else's DataRows still in the stream.
+    let conn = pipelinedConn(1, unsynced = true)
+    conn.recvBuf = readyForQuery
+    discard conn.nextMessage()
+    check conn.pendingSyncs == 0
+    check not conn.wireSettled
+    conn.invalidateOnCancel(releaseTransport = false)
+    check conn.state == csClosed
+
+  test "a reset forgets what the previous backend owed":
+    ## A round trip that dies after its write leaves replies booked against a
+    ## backend that is about to be replaced. Carried onto the new one they
+    ## would dial a CancelRequest at an unrelated PID and retire a healthy
+    ## connection.
+    let conn = pipelinedConn(2, unsynced = true)
+    conn.recvBuf = readyForQuery
+    conn.sendBuf = encodeSync()
+    conn.resetWireState()
+    check conn.wireSettled
+    check conn.recvBuf.len == 0
+    check conn.recvBufStart == 0
+    check conn.sendBuf.len == 0
+
+when defined(pgStateChecks):
+  suite "What a connection promises the borrower that finds it csReady":
+    proc readyConn(): PgConnection =
+      PgConnection(
+        state: csReady, notifyQueue: initDeque[Notification](), config: ConnConfig()
+      )
+
+    test "a reply still owed cannot be handed to the next borrower":
+      ## `csReady` is the one state that says nobody owns the wire, so the next
+      ## borrower writes to it without asking. Starting an operation with a
+      ## reply outstanding is what leaves that borrower reading someone else's
+      ## rows.
+      let conn = readyConn()
+      conn.pendingSyncs = 1
+      expect AssertionDefect:
+        conn.checkReady()
+
+    test "replies written past the last sync point are not settled either":
+      ## A `Flush`-terminated batch has replies in flight with nothing on the
+      ## wire to end them, so the count reaching zero is only half the question.
+      let conn = readyConn()
+      conn.unsyncedWrite = true
+      expect AssertionDefect:
+        conn.checkReady()
+
+    test "a settled wire starts an operation":
+      let conn = readyConn()
+      conn.checkReady()
+      check conn.wireSettled
+
+    test "handing the connection back is not itself the promise":
+      ## The check belongs to the borrower, not to the frame that let go: a
+      ## frame may leave the wire in a shape it is about to clean up itself,
+      ## and only what survives to the next borrower promises anyone anything.
+      let conn = readyConn()
+      conn.state = csBusy
+      conn.unsyncedWrite = true
+      conn.markReady()
+      check conn.state == csReady
+
+    test "a state with an owner still in scope promises nothing":
+      ## Only `csReady` is checked, and a non-ready connection is rejected for
+      ## being in use before the wire is ever asked about.
+      let conn = readyConn()
+      conn.state = csBusy
+      conn.pendingSyncs = 1
+      expect PgStateError:
+        conn.checkReady()
+
+    test "an aborted build's staged Closes do not stop the next operation":
+      ## A build that stages its queued `Close` messages and then fails leaves
+      ## them staged. They are still owed, and the next build stages them again,
+      ## so this is not something the next borrower has to find cleaned up.
+      let conn = readyConn()
+      conn.stagedStmtCloses = @["_sc_1"]
+      conn.checkReady()
+      check conn.stagedStmtCloses == @["_sc_1"]

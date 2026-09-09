@@ -1,11 +1,20 @@
 ## `query` overloads and result-shape convenience wrappers (`queryRow`,
 ## `queryValue`, `queryExists`, `queryColumn`) on top of the extended-query
 ## protocol. Also hosts the row-streaming `queryEach` entry point.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options, tables]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, cache, simple_query]
+import ../pg_types/encoding
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc queryImpl*(
     conn: PgConnection,
@@ -16,10 +25,18 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len, paramOids.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+  # After the lookup: a cache hit replays the cached result formats, so the
+  # pre-flight has to charge the Bind that will actually go out.
+  validateEncodedParams(
+    params,
+    paramFormats.len,
+    preflightResultFormatsLen(cached, cacheHit, resultFormats.len),
+  )
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -44,8 +61,8 @@ proc queryImpl*(
     bindStep =
       conn.sendBuf.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -61,10 +78,15 @@ proc queryImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
+  # Charge the result formats a cache hit replays, not the caller's empty list.
+  validateTypedParams(
+    params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+  )
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -86,8 +108,8 @@ proc queryImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -104,10 +126,15 @@ proc queryEachImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[int64] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
+  # Charge the result formats a cache hit replays, not the caller's empty list.
+  validateTypedParams(
+    params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+  )
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -129,8 +156,8 @@ proc queryEachImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var rowCount: int64 = 0
   queryEachRecvLoop(
@@ -214,10 +241,16 @@ proc queryInlineImpl*(
     resultFormats: seq[int16] = @[],
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
+  # Not redundant with the `query` overload's `flattenInline`: internal callers
+  # may hand this proc `data`/`ranges` that never went through it.
+  validateExtendedQuery(sql, ranges.len, paramOids.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
   conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+  # A cache hit replays the cached result formats, not the caller's.
+  let sendRfLen = preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+  validateRawBind(data, ranges, paramFormats, sendRfLen)
   var cacheMiss = false
   var stmtName = ""
   var cachedFields: seq[FieldDescription]
@@ -241,8 +274,8 @@ proc queryInlineImpl*(
       "", stmtName, paramFormats, data, ranges, effectiveResultFormats
     ),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   queryRecvLoop(
@@ -261,7 +294,6 @@ proc query*(
   ## Execute a query with heap-alloc-free inline parameters.
   ## Prefer this overload for scalar-heavy workloads where `seq[PgParam]`
   ## would heap-allocate per parameter.
-  let (data, ranges, oids, formats) = flattenInline(params)
   var qr: QueryResult
   withConnTracing(
     conn,
@@ -271,7 +303,11 @@ proc query*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: qr.commandTag, rowCount: qr.rowCount),
   ):
+    # Inside the tracing body so a rejected call still reports start/end, and
+    # after `checkReady` so a `PgTypeError` cannot pre-empt a health error.
+    conn.checkReady()
     let resultFormats = resultFormat.toFormatCodes()
+    let (data, ranges, oids, formats) = flattenInline(params, resultFormats.len)
     awaitOrInvalidate(
       conn,
       qr,

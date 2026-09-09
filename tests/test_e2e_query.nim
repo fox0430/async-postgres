@@ -1,11 +1,9 @@
-import std/[unittest, options, strutils, math, importutils, net]
+import std/[unittest, options, strutils, math, net]
 
 import
   ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Simple Query Protocol":
   test "SELECT 1":
@@ -238,13 +236,16 @@ suite "E2E: Prepared Statement Edge Cases":
     waitFor t()
 
 suite "E2E: encode-time exception leaves connection usable":
+  ## The NUL rejection is a `PgError` on every path, direct and pipelined
+  ## alike: the encoder's own check is what both reach, so the caller has one
+  ## `except PgError` contract regardless of which one ran.
   test "simpleQuery with NUL in SQL keeps conn csReady":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       var raised = false
       try:
         discard await conn.simpleQuery("SELECT 1\0extra")
-      except ValueError:
+      except PgError:
         raised = true
       doAssert raised
       doAssert conn.state == csReady
@@ -260,7 +261,7 @@ suite "E2E: encode-time exception leaves connection usable":
       var raised = false
       try:
         discard await conn.simpleExec("SELECT 1\0extra")
-      except ValueError:
+      except PgError:
         raised = true
       doAssert raised
       doAssert conn.state == csReady
@@ -276,7 +277,7 @@ suite "E2E: encode-time exception leaves connection usable":
       var raised = false
       try:
         discard await conn.query("SELECT $1\0::text", @[toPgParam("x")])
-      except ValueError:
+      except PgError:
         raised = true
       doAssert raised
       doAssert conn.state == csReady
@@ -292,7 +293,7 @@ suite "E2E: encode-time exception leaves connection usable":
       var raised = false
       try:
         discard await conn.exec("SELECT $1\0::text", @[toPgParam("x")])
-      except ValueError:
+      except PgError:
         raised = true
       doAssert raised
       doAssert conn.state == csReady
@@ -310,7 +311,7 @@ suite "E2E: encode-time exception leaves connection usable":
       var raised = false
       try:
         discard await conn.queryDirect(badSql, 1)
-      except ValueError:
+      except PgError:
         raised = true
       doAssert raised
       doAssert conn.state == csReady
@@ -327,7 +328,7 @@ suite "E2E: encode-time exception leaves connection usable":
       var raised = false
       try:
         discard await conn.execDirect(badSql, 1)
-      except ValueError:
+      except PgError:
         raised = true
       doAssert raised
       doAssert conn.state == csReady

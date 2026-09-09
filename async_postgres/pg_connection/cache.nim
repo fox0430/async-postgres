@@ -6,17 +6,24 @@
 ## adding via `addStmtCache`, and use `pendingStmtCloses` to bundle Close
 ## messages with the next operation's Sync.
 ##
-## Re-exported through `pg_connection.nim`.
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[tables, lists]
 
-import ../pg_protocol
-import types
+import ../[async_backend, pg_protocol]
+import types, buffer_io
+
+import std/importutils
+privateAccess(PgConnection)
+
+const stmtNamePrefix* = "_sc_"
 
 proc nextStmtName*(conn: PgConnection): string =
   ## Generate the next unique prepared statement name for the statement cache.
   inc conn.stmtCounter
-  "_sc_" & $conn.stmtCounter
+  stmtNamePrefix & $conn.stmtCounter
 
 proc clearStmtCache*(conn: PgConnection) =
   ## Clear the client-side statement cache. Does not close server-side
@@ -27,6 +34,7 @@ proc clearStmtCache*(conn: PgConnection) =
   conn.stmtCache.clear()
   conn.stmtCacheLru = initDoublyLinkedList[string]()
   conn.pendingStmtCloses.setLen(0)
+  conn.stagedStmtCloses.setLen(0)
 
 proc lookupStmtCache*(conn: PgConnection, sql: string): CachedStmt =
   ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
@@ -81,20 +89,75 @@ proc removeStmtCache*(conn: PgConnection, sql: string) =
     conn.stmtCacheLru.remove(entry.lruNode)
   conn.stmtCache.del(sql)
 
-proc flushPendingStmtCloses*(conn: PgConnection, buf: var seq[byte]) =
-  ## Append ``Close`` messages for any prepared statement names queued by the
-  ## defensive eviction path in ``addStmtCache`` to ``buf`` and clear the
-  ## queue. Called by Extended Query send paths after the outgoing buffer is
-  ## emptied (or freshly allocated) so the closes ride along with the next
-  ## operation's ``Sync``. The corresponding ``CloseComplete`` replies are
-  ## absorbed by the receive loops (every Extended Query recv loop handles
-  ## ``bmkCloseComplete`` or falls through ``else: discard``).
-  if conn.pendingStmtCloses.len == 0:
-    return
+proc stagePendingStmtCloses*(conn: PgConnection, buf: var seq[byte]) =
+  ## Append a ``Close`` for every owed statement name to ``buf`` so they ride
+  ## along with this operation's ``Sync``, moving them from the queue to
+  ## ``stagedStmtCloses``.
+  ##
+  ## Only `sendStagedBufMsg` / `sendStagedMsg` drop them, once the bytes are on
+  ## the wire: an aborted build leaves them staged, the next one takes them back
+  ## here, and a re-sent ``Close`` is a backend no-op.
+  ##
+  ## ``buf`` must already be emptied, or the build truncates the Closes away.
+  if conn.stagedStmtCloses.len > 0:
+    # A previous build staged these and never sent them. Owed again, ahead of
+    # anything queued since.
+    conn.pendingStmtCloses = conn.stagedStmtCloses & conn.pendingStmtCloses
+    conn.stagedStmtCloses.setLen(0)
   for name in conn.pendingStmtCloses:
     buf.addClose(dkStatement, name)
-  conn.pendingStmtCloses.setLen(0)
+  conn.stagedStmtCloses = move(conn.pendingStmtCloses)
+  conn.markStaged()
 
-proc flushPendingStmtCloses*(conn: PgConnection) =
-  ## Convenience overload that writes to ``conn.sendBuf``.
-  conn.flushPendingStmtCloses(conn.sendBuf)
+proc stageEvictedClose*(conn: PgConnection, buf: var seq[byte], name: string) =
+  ## Stage the ``Close`` for a statement the build itself evicted. Staged, not
+  ## queued: the cache no longer remembers the name, and an aborted build
+  ## leaves staged names owed just as the queue would.
+  conn.requireStaged("staging an eviction Close")
+  conn.stagedStmtCloses.add name
+  buf.addClose(dkStatement, name)
+
+proc stmtCachingEnabled*(conn: PgConnection): bool {.inline.} =
+  ## Whether prepared statements are cached on this connection.
+  conn.stmtCacheCapacity > 0
+
+proc evictForInsert*(conn: PgConnection, buf: var seq[byte]) =
+  ## Make room for one more cache entry, staging the ``Close`` of whatever was
+  ## evicted into ``buf`` — the buffer this operation assembles, like
+  ## `stagePendingStmtCloses` / `stageEvictedClose`. Keeping the capacity
+  ## comparison here also lets the `queryDirect` / `execDirect` writers reach
+  ## it without unlocking `PgConnection` in the caller's scope: they pass
+  ## `sendBuf(conn)`.
+  if conn.stmtCacheCapacity <= 0 or conn.stmtCache.len < conn.stmtCacheCapacity:
+    return
+  let evicted = conn.evictStmtCache()
+  conn.stageEvictedClose(buf, evicted.name)
+
+proc beginSendBuf*(conn: PgConnection) =
+  ## Start a new operation's send buffer: empty it, then stage the queued
+  ## ``Close`` messages into it.
+  ##
+  ## One call because the order is an invariant: staging first and emptying
+  ## after would truncate the Closes back out. Emptying loses nothing —
+  ## whatever the previous operation left was either sent or still staged, and
+  ## the staging below takes it back.
+  conn.sendBuf.setLen(0)
+  conn.stagePendingStmtCloses(conn.sendBuf)
+
+proc dropStagedStmtCloses(conn: PgConnection) =
+  ## Forget the names whose ``Close`` is now on the wire. Names queued since the
+  ## staging are in ``pendingStmtCloses`` and untouched by this.
+  conn.requireStaged("dropping the staged statement Closes")
+  conn.clearStaged()
+  conn.stagedStmtCloses.setLen(0)
+
+proc sendStagedBufMsg*(conn: PgConnection) {.async.} =
+  ## `sendBufMsg` paired with `stagePendingStmtCloses`: drop the staged
+  ## statement Closes only once the buffer is on the wire.
+  await conn.sendBufMsg()
+  conn.dropStagedStmtCloses()
+
+proc sendStagedMsg*(conn: PgConnection, data: seq[byte]) {.async.} =
+  ## `sendMsg` counterpart, for builds that assemble their own buffer.
+  await conn.sendMsg(data)
+  conn.dropStagedStmtCloses()

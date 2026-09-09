@@ -2,6 +2,7 @@ import std/[unittest, importutils, tables]
 
 import ../async_postgres/[async_backend, pg_errors, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/[buffer_io, simple_query, types]
 import ../async_postgres/pg_replication {.all.}
 
 privateAccess(PgConnection)
@@ -733,6 +734,32 @@ suite "invalidateAbandonedStream":
     conn.invalidateAbandonedStream()
     check conn.state == csClosed
 
+suite "checkReplicating during the close window":
+  # close() sets closedByUser and only reaches csClosed after its first
+  # suspension, so a mid-stream op in that window still sees csReplicating.
+  proc mkReplConn(closedByUser: bool): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: csReplicating,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      closedByUser: closedByUser,
+    )
+
+  test "closedByUser is rejected while the state is still csReplicating":
+    let conn = mkReplConn(closedByUser = true)
+    expect(PgStateError):
+      discard conn.confirmFlushed(parseLsn("0/1"))
+
+  test "a stream the application did not close still passes":
+    let conn = mkReplConn(closedByUser = false)
+    # Reaches the clamp instead of raising; nothing was received, so no advance.
+    check not conn.confirmFlushed(parseLsn("0/1"))
+
+  test "confirmedFlushLsn reports InvalidLsn inside the close window":
+    check mkReplConn(closedByUser = true).confirmedFlushLsn == InvalidLsn
+
 suite "decodeCreateSlotRow":
   proc buildDataRowBody(values: openArray[string]): seq[byte] =
     result.addInt16(int16(values.len))
@@ -786,3 +813,65 @@ suite "decodeCreateSlotRow":
     let qr = mkSlotQr(["my_slot"], 1)
     expect(PgConnectionError):
       discard decodeCreateSlotRow(qr)
+
+suite "decodeReadSlotRow":
+  # READ_REPLICATION_SLOT returns exactly 3 columns: slot_type (text,
+  # "physical" or NULL when the slot does not exist), restart_lsn (text LSN or
+  # NULL when never reserved), restart_tli (int8 as text or NULL). Only
+  # physical slots are supported server-side; a logical slot raises PgQueryError
+  # before any row is returned, so no decode path exists for it.
+  proc buildDataRowBody(values: openArray[string]): seq[byte] =
+    result.addInt16(int16(values.len))
+    for v in values:
+      if v == "\xFF":
+        result.addInt32(-1)
+      else:
+        result.addInt32(int32(v.len))
+        for c in v:
+          result.add(byte(c))
+
+  proc mkReadQr(values: openArray[string], numFields: int): QueryResult =
+    let rd = newRowData(int16(values.len))
+    parseDataRowInto(buildDataRowBody(values), rd)
+    var fields = newSeq[FieldDescription](numFields)
+    for i in 0 ..< numFields:
+      fields[i] = FieldDescription(name: "col" & $i, typeOid: 25, formatCode: 0)
+    QueryResult(fields: fields, data: rd, rowCount: 1)
+
+  test "physical slot with reserved WAL":
+    let qr = mkReadQr(["physical", "0/16B3740", "1"], 3)
+    let info = decodeReadSlotRow(qr, "my_phys")
+    check info.slotName == "my_phys"
+    check info.slotType == "physical"
+    check info.consistentPoint == parseLsn("0/16B3740")
+    check info.restartTli == 1'i64
+    check info.snapshotName == ""
+    check info.outputPlugin == ""
+
+  test "NULL restart_lsn and restart_tli (never reserved)":
+    let qr = mkReadQr(["physical", "\xFF", "\xFF"], 3)
+    let info = decodeReadSlotRow(qr, "my_phys")
+    check info.slotName == "my_phys"
+    check info.slotType == "physical"
+    check info.consistentPoint == InvalidLsn
+    check info.restartTli == 0'i64
+
+  test "nonexistent slot (all NULLs) raises catchable PgConnectionError":
+    let qr = mkReadQr(["\xFF", "\xFF", "\xFF"], 3)
+    expect(PgConnectionError):
+      discard decodeReadSlotRow(qr, "no_such_slot")
+
+  test "fewer than 3 columns raises catchable PgConnectionError":
+    let qr = mkReadQr(["physical", "0/16B3740"], 2)
+    expect(PgConnectionError):
+      discard decodeReadSlotRow(qr, "my_phys")
+
+  test "malformed restart_lsn raises PgTypeError":
+    let qr = mkReadQr(["physical", "not-an-lsn", "1"], 3)
+    expect(PgTypeError):
+      discard decodeReadSlotRow(qr, "my_phys")
+
+  test "malformed restart_tli raises PgTypeError":
+    let qr = mkReadQr(["physical", "0/16B3740", "not-an-int"], 3)
+    expect(PgTypeError):
+      discard decodeReadSlotRow(qr, "my_phys")

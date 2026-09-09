@@ -1,6 +1,7 @@
 import std/[unittest, deques, tables, importutils, strutils]
 
 import ../async_postgres/[async_backend, pg_protocol, pg_connection]
+import ../async_postgres/pg_connection/types {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_pool_cluster {.all.}
 
@@ -473,6 +474,35 @@ suite "Fallback":
       check cluster.replica.active == cluster.replica.config.maxSize - 1
       check cluster.replica.idle.len == 1
       check cluster.replica.idle.peekFirst().conn == lateConn
+
+    test "a drained late connection is closed by the pool, not by the application":
+      # The replica pool shuts down mid-acquire. `drainAbandonedAcquire` must
+      # reclaim through the pool's own path: a plain `release()` would stamp
+      # `closedByUser` on a connection the application never held.
+      let cluster =
+        makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(50))
+      cluster.replica.active = cluster.replica.config.maxSize
+      cluster.replica.config.acquireTimeout = seconds(30)
+
+      let primaryConn = mockConn()
+      cluster.primary.idle.addLast(
+        PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+      )
+      discard waitFor acquireRead(cluster)
+
+      # Hand off while the pool is open (a release into a closed pool never reaches
+      # the waiter), then shut it down before the drain runs.
+      let lateConn = mockConn(pool = cluster.replica)
+      lateConn.borrowed = true
+      lateConn.release()
+      cluster.replica.closed = true
+
+      waitFor sleepMsAsync(100)
+      waitFor allFutures(cluster.replica.pendingBackgroundTasks)
+
+      check not lateConn.closedByUser
+      expect PgConnectionError:
+        lateConn.checkNotClosed()
 
   test "onReadFallback fires with rfrReplicaClosed when replica is closed":
     var fired = 0

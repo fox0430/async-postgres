@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, tables, math, importutils, net, json]
+import std/[unittest, options, strutils, tables, math, net, json]
 from std/times import
   DateTime, dateTime, mMar, mJun, mJan, mDec, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
@@ -7,8 +7,6 @@ import
   ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 # User-defined type definitions for e2e tests (macros must be at top level)
 type
@@ -630,6 +628,126 @@ suite "E2E: Geometric Types":
       doAssert res.rows.len == 1
       let dist = parseFloat(res.rows[0].getStr(0))
       doAssert abs(dist - 5.0) < 1e-10
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Range binary wire format":
+  ## The text path and a self-consistent binary round trip both stay green when
+  ## the flag bits disagree with the server's, so these ask PostgreSQL itself:
+  ## once by making it read our bytes, once by reading the bytes it sends.
+
+  test "the server reads our binary flags the way we meant them":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # `lower_inc`/`upper_inc` report how the server parsed the flag byte, so a
+      # bit assignment that disagrees with `rangetypes.h` shows up as an
+      # inclusivity flip rather than as an error. `numrange` is continuous, so
+      # the server hands the bounds back exactly as sent — no canonicalisation
+      # to hide a flipped bit behind.
+      for (lowerInc, upperInc) in [(true, false), (false, true), (true, true)]:
+        let v = rangeOf(
+          parsePgNumeric("1.5"),
+          parsePgNumeric("9.5"),
+          lowerInc = lowerInc,
+          upperInc = upperInc,
+        )
+        let res = await conn.query(
+          "SELECT lower($1::numrange)::text, upper($1::numrange)::text, " &
+            "lower_inc($1::numrange), upper_inc($1::numrange)",
+          @[toPgBinaryParam(v)],
+        )
+        doAssert res.rows.len == 1
+        let row = res.rows[0]
+        doAssert row.getStr(0) == "1.5"
+        doAssert row.getStr(1) == "9.5"
+        doAssert row.getBool(2) == lowerInc
+        doAssert row.getBool(3) == upperInc
+
+      # A discrete type canonicalises: `(1,10]` becomes `[2,11)`. Landing on the
+      # right canonical form is itself evidence the server read the bits we sent.
+      let disc = await conn.query(
+        "SELECT lower($1::int4range), upper($1::int4range), " &
+          "lower_inc($1::int4range), upper_inc($1::int4range)",
+        @[toPgBinaryParam(rangeOf(1'i32, 10'i32, lowerInc = false, upperInc = true))],
+      )
+      doAssert disc.rows[0].getInt(0) == 2
+      doAssert disc.rows[0].getInt(1) == 11
+      doAssert disc.rows[0].getBool(2)
+      doAssert not disc.rows[0].getBool(3)
+      await conn.close()
+
+    waitFor t()
+
+  test "an absent bound stays absent through the server":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query(
+        "SELECT lower_inf($1::int4range), upper_inf($1::int4range)",
+        @[toPgBinaryParam(rangeTo[int32](10'i32))],
+      )
+      doAssert res.rows[0].getBool(0) # lower is infinite
+      doAssert not res.rows[0].getBool(1)
+      let res2 = await conn.query(
+        "SELECT lower_inf($1::int4range), upper_inf($1::int4range)",
+        @[toPgBinaryParam(rangeFrom[int32](5'i32))],
+      )
+      doAssert not res2.rows[0].getBool(0)
+      doAssert res2.rows[0].getBool(1) # upper is infinite
+      await conn.close()
+
+    waitFor t()
+
+  test "an empty binary range survives the server":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query(
+        "SELECT isempty($1::int4range)", @[toPgBinaryParam(emptyRange[int32]())]
+      )
+      doAssert res.rows[0].getBool(0)
+      await conn.close()
+
+    waitFor t()
+
+  test "a cached statement's binary result decodes to the same range as its text one":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # `int4range` is in `BinarySafeOids`, so the second execution of the same
+      # SQL runs off the statement cache and the server answers in binary. The
+      # first execution is the text baseline to compare against.
+      var sawBinary = false
+      for attempt in 0 .. 1:
+        let res = await conn.query("SELECT $1::text::int4range", @[toPgParam("[1,10)")])
+        let row = res.rows[0]
+        if row.isBinaryCol(0):
+          sawBinary = true
+        let got = row.getInt4Range(0)
+        doAssert got.hasLower
+        doAssert got.hasUpper
+        doAssert got.lower.value == 1'i32
+        doAssert got.upper.value == 10'i32
+        doAssert got.lower.inclusive
+        doAssert not got.upper.inclusive
+      doAssert sawBinary, "the statement cache never returned a binary range"
+      await conn.close()
+
+    waitFor t()
+
+  test "an unbounded range decodes the same from a binary result":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sawBinary = false
+      for attempt in 0 .. 1:
+        let res = await conn.query("SELECT $1::text::int4range", @[toPgParam("(,10]")])
+        let row = res.rows[0]
+        if row.isBinaryCol(0):
+          sawBinary = true
+        let got = row.getInt4Range(0)
+        doAssert not got.hasLower
+        doAssert got.hasUpper
+        doAssert got.upper.value == 11'i32 # int4range is discrete: (,10] -> (,11)
+        doAssert not got.upper.inclusive
+      doAssert sawBinary, "the statement cache never returned a binary range"
       await conn.close()
 
     waitFor t()
@@ -1470,14 +1588,16 @@ suite "E2E: lookupTypeOids":
 
     waitFor t()
 
-  test "raises PgConnectionError when connection not ready":
+  test "raises PgStateError when the application closed the connection":
+    # A `close()` the application asked for is not a reconnectable failure, so
+    # it never reports `PgConnectionError` — see `checkNotClosed`.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       await conn.close()
       var raised = false
       try:
         discard await conn.lookupTypeOids(@["int4"])
-      except PgConnectionError:
+      except PgStateError:
         raised = true
       doAssert raised
 

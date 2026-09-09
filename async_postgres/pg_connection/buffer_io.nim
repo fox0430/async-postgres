@@ -9,8 +9,14 @@
 ## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`)
 ## - `makeCopyOutCallback` / `makeCopyInCallback` cross-backend templates
 ##
-## Re-exported through `pg_connection.nim`; depends only on `types.nim` and
-## the protocol/error/backend abstraction modules.
+## The host helpers and `makeCopy*` templates are re-exported through
+## `pg_connection.nim`; the transport buffering machinery stays here for
+## sibling modules and tests. Depends only on `types.nim` and the
+## protocol/error/backend abstraction modules.
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[deques, options, tables]
 when defined(posix):
@@ -24,25 +30,20 @@ when hasChronos:
 elif hasAsyncDispatch:
   import std/asyncnet
 
+import std/importutils
+privateAccess(PgConnection)
+
 when defined(posix):
   # POSIX socket option constants (used by liveness probes and TCP keepalive)
-  var TCP_NODELAY* {.importc, header: "<netinet/tcp.h>".}: cint
-  var MSG_DONTWAIT* {.importc, header: "<sys/socket.h>".}: cint
+  var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
+  var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
 
 type
   RecvWatch* = ref object
-    ## A single in-flight background socket read used to watch for an unsolicited
-    ## backend message while the client is busy sending.
+    ## Background read watch for unsolicited messages during send (at most one).
     ##
-    ## A `ref` so it can be passed into and mutated by `async` helpers (a `var` of
-    ## a value type cannot be captured across an `await`).
-    ##
-    ## Contract: at most one background read per connection is in flight at a
-    ## time. The read carries no per-read timeout — bound the whole operation with
-    ## an outer `wait`. Before reusing the normal recv path (`fillRecvBuf` /
-    ## `nextMessage` on freshly read bytes) the watch must be settled: either
-    ## consume it via `take` + `await`, or drop it with `cancel` immediately
-    ## before raising.
+    ## Settle it (``take`` + ``await``, or ``cancel``) before reusing the normal
+    ## recv path: an unsettled read shares ``recvBuf`` with whatever runs next.
     fut: Future[void]
 
   SocketPeek = enum
@@ -109,33 +110,55 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
 
 # Notification / notice dispatch
 
-proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
-  let notif = Notification(
-    pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
-  )
-  # A positive `notifyMaxQueue` caps the pull-API queue and drops the oldest
-  # notifications on overflow. `<= 0` means an unbounded queue (libpq/psycopg
-  # convention, mirroring Python's `queue.Queue(maxsize<=0)`): never drop, just
-  # accumulate until `waitNotification` drains it. The queue is enqueued and the
-  # pull-API waiter completed unconditionally, so `waitNotification` works for
-  # every `notifyMaxQueue`; only the overflow bookkeeping is gated on a cap.
+proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].} =
+  ## Enqueue under ``notifyMaxQueue`` (<=0 = unbounded); drop oldest on overflow.
+  # The cap counts queued notifications only: an outstanding handoff belongs to a
+  # waiter about to consume it, and charging it here would shrink the depth by one.
   var droppedNow = 0
   if conn.notifyMaxQueue > 0:
     while conn.notifyQueue.len >= conn.notifyMaxQueue:
       discard conn.notifyQueue.popFirst()
-      if conn.notifyDropped < high(int):
+      if conn.notifyDropped < high(int): # saturating; reset once reported
         conn.notifyDropped.inc
       droppedNow.inc
   conn.notifyQueue.addLast(notif)
   if droppedNow > 0 and conn.notifyOverflowCallback != nil:
     conn.notifyOverflowCallback(droppedNow)
+
+proc requeueHandoff*(conn: PgConnection, notif: Notification) {.raises: [].} =
+  ## Requeue an unconsumed handoff at the front.
+  # Trims nothing, keeping the drop policy in one place: the queue may sit one
+  # over the cap until the next arrival's drop-oldest reaches this entry.
+  conn.notifyQueue.addFirst(notif)
+
+proc reclaimHandoff*(conn: PgConnection) {.raises: [].} =
+  ## Requeue a handoff whose waiter will never claim it, so an abandoned frame
+  ## cannot make the notification unreachable.
+  if conn.hasNotifyHandoff:
+    conn.hasNotifyHandoff = false
+    conn.requeueHandoff(move conn.notifyHandoff)
+
+proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
+  let notif = Notification(
+    pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
+  )
+  # Handed directly to an unresumed waiter: parking it in the shared queue
+  # instead would make it the first thing the overflow drop discards.
   if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+    conn.notifyHandoff = notif
+    conn.hasNotifyHandoff = true
     # asyncdispatch's `Future.complete` has inferred effect `Exception`
     # via the callback chain; swallow it to keep this proc `raises: []`.
     try:
       conn.notifyWaiter.complete()
     except Exception:
-      discard
+      # The waiter will never resume, so nothing would ever move the handoff
+      # back: queue it here instead of losing it.
+      conn.hasNotifyHandoff = false
+      conn.notifyHandoff = Notification()
+      conn.enqueueNotification(notif)
+  else:
+    conn.enqueueNotification(notif)
   if conn.notifyCallback != nil:
     conn.notifyCallback(notif)
 
@@ -167,10 +190,8 @@ when hasAsyncDispatch:
 # Receive buffer management
 
 proc compactRecvBuf*(conn: PgConnection) {.inline.} =
-  ## Shift unconsumed data to the front of recvBuf, reclaiming space consumed
-  ## by the read pointer.  Called only before reading new data from the socket.
-  ## csClosed is the callers' responsibility: `fillRecvBuf` /
-  ## `fillRecvBufDetached` check it in the same frame, so no assertion here.
+  ## Compact recvBuf (caller checks ``csClosed``). Only safe before reading new
+  ## data from the socket: it moves bytes an in-flight read still points at.
   let start = conn.recvBufStart
   if start == 0:
     return
@@ -185,18 +206,11 @@ proc compactRecvBuf*(conn: PgConnection) {.inline.} =
 proc fillRecvBuf*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
-  ## Read data from socket into buffer. The only await point for message reception.
-  ##
-  ## On `AsyncTimeoutError` the caller (typically `invalidateOnTimeout`) is
-  ## responsible for the state transition (the `recvMessage` wrapper does it
-  ## itself). On any other `CatchableError` the connection is marked `csClosed`
-  ## before re-raising: the read may have consumed an indeterminate number of
-  ## bytes from the socket and the stream is no longer parseable.
-  # An orphaned pump can revive here after `invalidateOnTimeout` set csClosed;
-  # refuse a socket read on a connection we've given up on.
+  ## Read into recvBuf. ``AsyncTimeoutError``: caller handles state; other errors → ``csClosed`` + ``raiseTransportFailure``.
+  # An orphaned pump can revive here after a timeout or cancellation handler
+  # retired the connection; refuse a socket read on one we've given up on.
   if conn.state == csClosed:
-    raise
-      newException(PgConnectionError, "fillRecvBuf: connection is closed (csClosed)")
+    conn.raiseClosedConnection("fillRecvBuf: connection is closed (csClosed)")
   conn.compactRecvBuf()
   when hasChronos:
     let oldLen = conn.recvBuf.len
@@ -213,25 +227,30 @@ proc fillRecvBuf*(
     except AsyncTimeoutError as e:
       conn.recvBuf.setLen(oldLen)
       raise e
+    except CancelledError as e:
+      # csClosed as for any other failure: the read may have consumed bytes, so
+      # the stream is no longer parseable. Only the exception type is preserved.
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      raise e
     except CatchableError as e:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
-      raise e
+      conn.markClosed()
+      conn.raiseTransportFailure("fillRecvBuf", e)
     if n == 0:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
-      raise newException(PgConnectionError, "Connection closed by server")
+      conn.markClosed()
+      conn.raiseClosedConnection("Connection closed by server")
     # An orphan read settling after csClosed must not re-extend the buffer.
     if conn.state == csClosed:
       conn.recvBuf.setLen(oldLen)
-      raise newException(
-        PgConnectionError, "fillRecvBuf: connection was closed during readOnce"
-      )
+      conn.raiseClosedConnection("fillRecvBuf: connection was closed during readOnce")
     conn.recvBuf.setLen(oldLen + n)
   elif hasAsyncDispatch:
     # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
-    # into `recvBuf[oldLen..]` after we truncate. Safe because `invalidateOnTimeout`
-    # marks csClosed (no further extender) and seq shrink keeps capacity.
+    # into `recvBuf[oldLen..]` after we truncate. Safe because `recvMessage`, the
+    # only caller that passes a timeout, marks csClosed itself before any later
+    # read can be issued, and seq shrink keeps capacity.
     let oldLen = conn.recvBuf.len
     conn.recvBuf.setLen(oldLen + RecvBufSize)
     var n: int
@@ -246,56 +265,51 @@ proc fillRecvBuf*(
     except AsyncTimeoutError as e:
       conn.recvBuf.setLen(oldLen)
       raise e
+    except CancelledError as e:
+      # csClosed as for any other failure: the read may have consumed bytes, so
+      # the stream is no longer parseable. Only the exception type is preserved.
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      raise e
     except CatchableError as e:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
-      raise e
+      conn.markClosed()
+      conn.raiseTransportFailure("fillRecvBuf", e)
     if n == 0:
       conn.recvBuf.setLen(oldLen)
-      conn.state = csClosed
-      raise newException(PgConnectionError, "Connection closed by server")
+      conn.markClosed()
+      conn.raiseClosedConnection("Connection closed by server")
     # An orphan `recvInto` settling after csClosed must not re-extend the buffer.
     if conn.state == csClosed:
       conn.recvBuf.setLen(oldLen)
-      raise newException(
-        PgConnectionError, "fillRecvBuf: connection was closed during recvInto"
-      )
+      conn.raiseClosedConnection("fillRecvBuf: connection was closed during recvInto")
     conn.recvBuf.setLen(oldLen + n)
 
 when hasChronos:
   proc fillRecvBufDetached*(conn: PgConnection): Future[void] {.async.} =
-    ## Read one chunk into a private scratch buffer and append it to ``recvBuf``
-    ## only once the read settles, leaving ``recvBuf`` parseable while the read is
-    ## still in flight.
-    ##
-    ## ``fillRecvBuf`` grows ``recvBuf`` by ``RecvBufSize`` up front to hand the
-    ## chronos ``readOnce`` a destination pointer, so a caller that parses
-    ## ``recvBuf`` before the read completes would see uninitialised tail bytes.
-    ## The replication status-interval path keeps a single read pending across
-    ## timer wakes and parses between them, so it reads through here instead (see
-    ## ``replFillRecvBuf``). On any read failure the connection is marked
-    ## ``csClosed`` before re-raising, matching ``fillRecvBuf``.
+    ## Read into scratch then append to ``recvBuf`` (keeps ``recvBuf`` parseable while pending); errors → ``csClosed``.
     # Entrance guard, as in ``fillRecvBuf``: no fresh read on csClosed.
     if conn.state == csClosed:
-      raise newException(
-        PgConnectionError, "fillRecvBufDetached: connection is closed (csClosed)"
-      )
+      conn.raiseClosedConnection("fillRecvBufDetached: connection is closed (csClosed)")
     if conn.replReadScratch.len < RecvBufSize:
       conn.replReadScratch.setLen(RecvBufSize)
     let n =
       try:
         await conn.reader.readOnce(addr conn.replReadScratch[0], RecvBufSize)
-      except CatchableError as e:
-        conn.state = csClosed
+      except CancelledError as e:
+        conn.markClosed()
         raise e
+      except CatchableError as e:
+        conn.markClosed()
+        conn.raiseTransportFailure("fillRecvBufDetached", e)
     if n == 0:
-      conn.state = csClosed
-      raise newException(PgConnectionError, "Connection closed by server")
+      conn.markClosed()
+      conn.raiseClosedConnection("Connection closed by server")
     # Exit guard: a read settling after the caller flipped csClosed must not
     # re-extend recvBuf.
     if conn.state == csClosed:
-      raise newException(
-        PgConnectionError, "fillRecvBufDetached: connection was closed during readOnce"
+      conn.raiseClosedConnection(
+        "fillRecvBufDetached: connection was closed during readOnce"
       )
     conn.compactRecvBuf()
     let oldLen = conn.recvBuf.len
@@ -310,27 +324,8 @@ proc nextMessage*(
     onRowError: ptr ref CatchableError = nil,
     skipDataRow: bool = false,
 ): Option[BackendMessage] {.raises: [PgProtocolError].} =
-  ## Synchronously parse the next message from the receive buffer.
-  ## Returns none if the buffer doesn't contain a complete message.
-  ## Notification/Notice messages are dispatched internally.
-  ## ParameterStatus messages are recorded into `conn.serverParams` and
-  ## consumed, so callers never see them.
-  ## DataRow messages are consumed: when `onRow` is nil, they are counted
-  ## (if `rowCount != nil`) and left decoded in `rowData` for the caller;
-  ## when `onRow` is set, it is invoked once per row and `rowData.buf` /
-  ## `rowData.cellIndex` are reset before the next row, giving streaming
-  ## callers (e.g. ``queryEach``) constant memory. When `onRow` raises,
-  ## the error is captured into ``onRowError[]`` (required to be non-nil
-  ## when `onRow` is set) and subsequent rows are drained without
-  ## re-invoking the callback.
-  ## When ``rowData == nil`` and ``onRow == nil`` and ``skipDataRow`` is true,
-  ## DataRow messages are also skipped without decoding their columns — used
-  ## by discard-only consumers (exec paths, simple-protocol exec) to avoid a
-  ## per-row ``seq[Option[seq[byte]]]`` + per-cell ``seq`` allocation.
-  ##
-  ## On `PgProtocolError` the protocol stream is desynchronised — the connection
-  ## is transitioned to `csClosed` before re-raising so that it is never
-  ## reused (in particular, by the connection pool).
+  ## Parse next message from recvBuf (none = incomplete). Dispatches notify/notice,
+  ## consumes ParameterStatus/DataRow (streaming via ``onRow``); ``skipDataRow`` avoids decode. Error → ``csClosed``.
   var pos = conn.recvBufStart
   let maxLen = conn.effectiveMaxMessageSize()
   while true:
@@ -345,7 +340,7 @@ proc nextMessage*(
           skipDataRow = skipDataRow and rowData == nil and onRow == nil,
         )
       except PgProtocolError as e:
-        conn.state = csClosed
+        conn.markClosed()
         raise e
     if res.state == psIncomplete:
       return none(BackendMessage)
@@ -386,6 +381,13 @@ proc nextMessage*(
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
+    if res.message.kind == bmkReadyForQuery:
+      # Counts down rather than clearing: a batch of per-op `Sync`s owes one
+      # reply each. `unsyncedWrite` is untouched — this reply belongs to a sync
+      # point that preceded those writes, so only a later one (in `noteWrite`)
+      # can end them.
+      if conn.pendingSyncs > 0:
+        dec conn.pendingSyncs
     return some(res.message)
 
 proc recvMessage*(
@@ -394,12 +396,7 @@ proc recvMessage*(
     rowData: RowData = nil,
     rowCount: ptr int32 = nil,
 ): Future[BackendMessage] {.async.} =
-  ## Receive a single backend message from the connection.
-  ## Thin wrapper around nextMessage + fillRecvBuf for backward compatibility.
-  ##
-  ## On `AsyncTimeoutError` the connection is set `csClosed` before re-raising
-  ## (the partial read leaves the byte stream unparseable); no CancelRequest is
-  ## dispatched — callers needing that must invalidate explicitly.
+  ## Receive one message (``nextMessage`` + ``fillRecvBuf``); timeout → ``csClosed``.
   while true:
     let opt = conn.nextMessage(rowData, rowCount)
     if opt.isSome:
@@ -407,7 +404,9 @@ proc recvMessage*(
     try:
       await conn.fillRecvBuf(timeout)
     except AsyncTimeoutError as e:
-      conn.state = csClosed
+      # Load-bearing: on asyncdispatch the timed-out read stays orphaned in
+      # `recvBuf`, and csClosed is what stops a later read re-extending it.
+      conn.markClosed()
       raise e
 
 template pumpUntilReady*(
@@ -417,17 +416,10 @@ template pumpUntilReady*(
     body: untyped,
     readyBody: untyped,
 ) {.dirty.} =
-  ## Generic protocol pump loop.  `pumpMsg` and `queryError` are accessible
-  ## in `body` and `readyBody`.  `DataRow` messages are decoded in-place into
-  ## `resultData` and counted through `rowCountPtr` by `nextMessage`, so they
-  ## never surface in `body`.
-  ##
-  ## The loop is spelled out in both overloads rather than one forwarding to
-  ## the other: `{.dirty.}` injection only reaches `body`/`readyBody` across a
-  ## single template boundary, so forwarding would leave their references to
-  ## `pumpMsg`/`queryError` undeclared.  A single template with defaulted
-  ## `resultData`/`rowCountPtr` fails the same way — typed params ahead of the
-  ## untyped bodies suppress the injection (Nim 2.2.x).
+  ## Pump until ``ReadyForQuery``; ``pumpMsg``/``queryError`` injected into ``body``/``readyBody``.
+  # Spelled out per overload, not forwarded: ``{.dirty.}`` injection crosses only
+  # one template boundary, and typed params ahead of the untyped bodies suppress
+  # it, so neither forwarding nor defaulted params declare the names (Nim 2.2.x).
   block pumpLoop:
     # Declared inside the block so two pumps in one proc scope (e.g. copy.nim's
     # main loop plus its recvLoop2) don't collide on these dirty-injected names.
@@ -442,7 +434,7 @@ template pumpUntilReady*(
         elif pumpMsg.kind == bmkReadyForQuery:
           conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
-            conn.state = csReady
+            conn.markReady()
           readyBody
           if queryError != nil:
             raise queryError
@@ -459,10 +451,7 @@ template pumpUntilReady*(
     body: untyped,
     readyBody: untyped,
 ) {.dirty.} =
-  ## Streaming overload: `resultData` is a `RowData` for in-place DataRow
-  ## decoding, `onRow` a `RowCallback` invoked per row, `onRowErr` a
-  ## `ptr ref CatchableError` capturing the first callback failure so
-  ## remaining rows drain without re-invoking `onRow`.
+  ## Streaming pump (``onRow`` per row; first error in ``onRowErr``).
   block pumpLoop:
     var queryError: ref PgQueryError
     var pumpMsg: BackendMessage
@@ -475,7 +464,7 @@ template pumpUntilReady*(
         elif pumpMsg.kind == bmkReadyForQuery:
           conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
-            conn.state = csReady
+            conn.markReady()
           readyBody
           if queryError != nil:
             raise queryError
@@ -487,16 +476,7 @@ template pumpUntilReady*(
 template pumpUntilReady*(
     conn: PgConnection, body: untyped, readyBody: untyped
 ) {.dirty.} =
-  ## Bare overload for callers that do not accumulate into a `RowData`.
-  ## Body mirrors the data overload above with `nextMessage()` in place of
-  ## the accumulating call.
-  ##
-  ## `DataRow` is skipped in the parser here — no current caller inspects
-  ## rows inside `body`: exec paths (extended-query, simple-protocol)
-  ## discard them, and the remaining callers (prepare, close, cursor
-  ## close, COPY setup, ping) never receive `DataRow` in a well-formed
-  ## reply. If a future caller needs the row bytes, drop
-  ## `skipDataRow = true` here.
+  ## Bare pump (``skipDataRow=true``; for callers that discard rows).
   block pumpLoop:
     var queryError: ref PgQueryError
     var pumpMsg: BackendMessage
@@ -509,7 +489,7 @@ template pumpUntilReady*(
         elif pumpMsg.kind == bmkReadyForQuery:
           conn.txStatus = pumpMsg.txStatus
           if conn.state != csClosed:
-            conn.state = csReady
+            conn.markReady()
           readyBody
           if queryError != nil:
             raise queryError
@@ -518,16 +498,7 @@ template pumpUntilReady*(
           body
       await conn.fillRecvBuf()
 
-# Non-blocking receive watch
-#
-# During an otherwise send-only phase (COPY IN) the client must keep streaming
-# while still noticing an unsolicited backend message — typically an
-# ErrorResponse aborting the COPY (constraint violation, disk full, …). The
-# blocking-only read path (`fillRecvBuf`) cannot be polled, and there is no
-# portable non-blocking socket read that also works over TLS and the two async
-# backends. `RecvWatch` provides one: it keeps a single background read in
-# flight whose completion is observed cheaply with `Future.finished`, adding no
-# latency to the common (no early error) path.
+# Background read watch for COPY IN early-error detection.
 
 proc startRecvWatch*(conn: PgConnection): RecvWatch =
   ## Begin watching for an unsolicited backend message. The bytes are committed
@@ -557,12 +528,7 @@ proc rearm*(w: RecvWatch, conn: PgConnection) =
   w.fut = conn.fillRecvBuf(ZeroDuration)
 
 proc cancel*(w: RecvWatch) =
-  ## Abandon any in-flight read. Must be followed immediately by raising/exit:
-  ## on chronos the read is cancelled asynchronously (`cancelSoon`), so starting
-  ## a new read before unwinding would race the cancellation against the shared
-  ## `recvBuf`. On asyncdispatch (no cancellation) the read keeps running; its
-  ## eventual result is swallowed so it never surfaces as an unhandled future
-  ## error.
+  ## Abandon in-flight read (must raise/exit immediately after).
   if w.fut != nil and not w.fut.finished:
     when hasChronos:
       w.fut.cancelSoon()
@@ -576,86 +542,165 @@ proc cancel*(w: RecvWatch) =
       )
   w.fut = nil
 
+proc noteWrite(conn: PgConnection, data: openArray[byte]) {.inline.} =
+  ## Book what these bytes leave the backend owing. Before the write, not
+  ## after: a failed or cancelled write may still have reached the wire, and a
+  ## ``CancelRequest`` at an idle backend is a harmless no-op.
+  let owed = outstandingReplies(data)
+  conn.pendingSyncs += owed.syncPoints
+  if owed.syncPoints > 0:
+    # A sync point ends every request written before it, so only what follows
+    # the last one stays unended.
+    conn.unsyncedWrite = owed.unsynced
+  elif owed.unsynced:
+    conn.unsyncedWrite = true
+
+proc resetWireState*(conn: PgConnection) =
+  ## Forget what the wire's previous life left behind: the buffered bytes on
+  ## both sides and the replies the old backend owed.
+  ##
+  ## Sole owner of that reset: a stale count carried onto a fresh backend would
+  ## dial a ``CancelRequest`` at an unrelated PID and retire a healthy
+  ## connection.
+  conn.recvBuf.setLen(0)
+  conn.recvBufStart = 0
+  conn.sendBuf.setLen(0)
+  conn.pendingSyncs = 0
+  conn.unsyncedWrite = false
+
 # Send helpers
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
-  ## Send raw bytes to the PostgreSQL server over the connection.
-  ## On failure the connection is marked ``csClosed`` (the stream may be
-  ## partially written), symmetric with ``fillRecvBuf``.
+  ## Send raw bytes; failure → ``csClosed``. Books what they leave owed first;
+  ## see ``noteWrite``.
+  conn.noteWrite(data)
   when hasChronos:
     try:
       await conn.writer.write(data)
-    except CatchableError as e:
-      conn.state = csClosed
+    except CancelledError as e:
+      conn.markClosed()
       raise e
+    except CatchableError as e:
+      conn.markClosed()
+      conn.raiseTransportFailure("sendMsg", e)
   elif hasAsyncDispatch:
     if data.len > 0:
       try:
         await conn.socket.sendRawBytes(data)
-      except CatchableError as e:
-        conn.state = csClosed
+      except CancelledError as e:
+        conn.markClosed()
         raise e
+      except CatchableError as e:
+        conn.markClosed()
+        conn.raiseTransportFailure("sendMsg", e)
 
 proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
-  ## Send conn.sendBuf to the server.
-  ## The transport receives its own copy of the buffer, so conn.sendBuf is safe
-  ## to mutate while the returned Future is still pending.
-  ## On failure the connection is marked ``csClosed`` (the stream may be
-  ## partially written), symmetric with ``sendMsg``.
+  ## Send ``sendBuf`` (copied; safe to mutate after call); failure → ``csClosed``.
+  ## Books what the buffer leaves owed; see ``sendMsg``.
+  conn.noteWrite(conn.sendBuf)
   when hasChronos:
     if conn.sendBuf.len > 0:
       try:
         await conn.writer.write(conn.sendBuf)
-      except CatchableError as e:
-        conn.state = csClosed
+      except CancelledError as e:
+        conn.markClosed()
         raise e
+      except CatchableError as e:
+        conn.markClosed()
+        conn.raiseTransportFailure("sendBufMsg", e)
   elif hasAsyncDispatch:
     if conn.sendBuf.len > 0:
       try:
         await conn.socket.sendRawBytes(conn.sendBuf)
-      except CatchableError as e:
-        conn.state = csClosed
+      except CancelledError as e:
+        conn.markClosed()
         raise e
+      except CatchableError as e:
+        conn.markClosed()
+        conn.raiseTransportFailure("sendBufMsg", e)
 
 # Transport teardown
 
-proc closeTransport*(conn: PgConnection) {.async.} =
-  ## Close transport resources without sending Terminate.
+proc closeTransportImpl(conn: PgConnection) {.async.} =
+  ## One teardown pass. Entered once per connection at a time; see
+  ## `closeTransport`.
   when hasChronos:
-    if conn.tlsStream != nil:
+    # Every handle is detached before the first suspension: layer-by-layer
+    # detaching let a racing teardown close the base transport under this
+    # frame's still-running TLS close. `reader`/`writer` go with them, or
+    # `isConnected()` reports healthy while `peekSocket` sees no transport.
+    let tls = conn.tlsStream
+    let baseReader = conn.baseReader
+    let baseWriter = conn.baseWriter
+    let transport = conn.transport
+    conn.tlsStream = nil
+    conn.baseReader = nil
+    conn.baseWriter = nil
+    conn.transport = nil
+    conn.reader = nil
+    conn.writer = nil
+    if tls != nil:
       try:
-        await conn.tlsStream.reader.closeWait()
+        await tls.reader.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTlsReader, e)
       try:
-        await conn.tlsStream.writer.closeWait()
+        await tls.writer.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTlsWriter, e)
-      conn.tlsStream = nil
-    if conn.baseReader != nil:
+    if baseReader != nil:
       try:
-        await conn.baseReader.closeWait()
+        await baseReader.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsBaseReader, e)
+    if baseWriter != nil:
       try:
-        await conn.baseWriter.closeWait()
+        await baseWriter.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsBaseWriter, e)
-      conn.baseReader = nil
-      conn.baseWriter = nil
-    if conn.transport != nil:
+    if transport != nil:
       try:
-        await conn.transport.closeWait()
+        await transport.closeWait()
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTransport, e)
-      conn.transport = nil
-    # Drop the cached reader/writer aliases so isConnected() reports false.
-    conn.reader = nil
-    conn.writer = nil
   elif hasAsyncDispatch:
     if not conn.socket.isNil:
-      conn.socket.close()
+      let socket = conn.socket
       conn.socket = nil
+      socket.close()
+
+proc closeTransport*(conn: PgConnection) {.async.} =
+  ## Close transport resources without sending Terminate.
+  ##
+  ## Re-entrant: a racing second teardown awaits the first rather than
+  ## returning early on the already-detached handles, so a resolved `close()`
+  ## still means the fd and the backend session are released.
+  let inFlight = conn.transportCloseFut
+  if inFlight != nil and not inFlight.finished:
+    # `noCancel` and swallowed: this caller neither started nor cancelled the
+    # teardown, so it must not inherit its outcome.
+    try:
+      when hasChronos:
+        await noCancel inFlight
+      else:
+        await inFlight
+    except CatchableError:
+      discard
+    return
+  let fut = conn.closeTransportImpl()
+  conn.transportCloseFut = fut
+  # `noCancel` on the owner too: the handles are detached before the first
+  # suspension, so a cancelled teardown would strand the only references to
+  # them and leak the fd for the process lifetime.
+  when hasChronos:
+    await noCancel fut
+  else:
+    await fut
+  # Released once finished: the guard above only cares about a running
+  # teardown, and a connection that reconnects in place must not carry the
+  # finished frame of the transport before last.
+  if conn.transportCloseFut == fut:
+    conn.transportCloseFut = nil
 
 # Liveness probes
 
@@ -693,20 +738,7 @@ proc peekSocket(conn: PgConnection): SocketPeek =
     spUnavailable
 
 proc socketHasFin*(conn: PgConnection): bool =
-  ## Non-blocking OS-level half-open probe (POSIX only).
-  ##
-  ## Returns `true` when the kernel has already observed a peer-side FIN/RST
-  ## on this connection's underlying socket. Returns `false` when the socket
-  ## is alive and idle, when there is pending data (which the next operation
-  ## will handle), when the probe hits transient kernel resource exhaustion
-  ## (`ENOMEM`/`ENOBUFS`, which says nothing about peer state), or when there
-  ## is no transport handle to probe (e.g. mock connections, or after `close`).
-  ##
-  ## A single `recv(MSG_PEEK | MSG_DONTWAIT)` syscall — no round trip. For
-  ## TLS connections this still detects TCP-level FIN/RST, but not TLS-layer
-  ## errors that haven't been read yet; use `ping` for that.
-  ##
-  ## On non-POSIX platforms this always returns `false` (no probe available).
+  ## POSIX half-open probe (``MSG_PEEK``): true if FIN/RST observed; false otherwise or unavailable.
   case conn.peekSocket()
   of spClosed, spError:
     # FIN/RST observed, or an unclassified error we conservatively read as a
@@ -719,44 +751,11 @@ proc socketHasFin*(conn: PgConnection): bool =
     false
 
 proc socketHasPendingData*(conn: PgConnection): bool =
-  ## Non-blocking OS-level check: does the kernel currently hold readable
-  ## bytes on this connection's socket? (POSIX only.)
-  ##
-  ## Used by SSL negotiation to detect pre-TLS plaintext injection
-  ## (CVE-2021-23214 / CVE-2021-23222 family): after a server answers the
-  ## SSLRequest with `'S'` it must stay silent until the client sends the TLS
-  ## ClientHello, so any byte already readable was injected by a
-  ## man-in-the-middle to be smuggled ahead of the encrypted stream.
-  ##
-  ## A single `recv(MSG_PEEK | MSG_DONTWAIT)` syscall — no round trip. Only a
-  ## positive read of buffered bytes yields `true`. Returns `false` when the
-  ## socket is idle (`EAGAIN`), when the peer has closed (`FIN`: nothing was
-  ## injected), on `EINTR`/other transient errors, and where the probe is
-  ## unavailable (non-POSIX, or no transport handle).
-  ##
-  ## Note: this sees only bytes still in the *kernel* buffer. Data the
-  ## higher-level transport has already drained into its own buffer (the
-  ## chronos `StreamTransport` may do this) is invisible here and must be
-  ## detected by the caller reading more than the single response byte.
-  ##
-  ## Fail open: any non-data outcome (idle, FIN, transient or other error)
-  ## yields `false` so a probe error never rejects a legitimate connection.
+  ## True if kernel has readable bytes (pre-TLS injection check; kernel buffer only).
   conn.peekSocket() == spData
 
 proc isConnected*(conn: PgConnection): bool =
-  ## Whether the underlying transport is present and the OS has not yet
-  ## observed a peer-side close.
-  ##
-  ## Cheap, non-blocking (no round trip): checks that the connection object
-  ## holds a transport handle, and on POSIX also issues a single
-  ## `recv(MSG_PEEK | MSG_DONTWAIT)` via `socketHasFin` to catch FIN/RST
-  ## already sitting in the kernel buffer (half-open detection). On
-  ## non-POSIX platforms the check falls back to handle presence only.
-  ##
-  ## Pair with `state == csReady` to decide whether a connection is usable
-  ## before issuing a query. Use `ping` for a full server round trip when
-  ## the OS-level probe is insufficient (e.g. TLS-layer state, application
-  ## liveness rather than transport liveness).
+  ## Transport present and no kernel FIN/RST observed (cheap, non-blocking; use ``ping`` for full check).
   when hasChronos:
     if conn.writer.isNil:
       return false

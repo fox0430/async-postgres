@@ -253,6 +253,23 @@ proc buildDataRowText*(cols: openArray[string]): seq[byte] =
       body.add(byte(ch))
   buildBackendMsg('D', body)
 
+proc buildDataRowOpt*(cols: openArray[string], isNull: openArray[bool]): seq[byte] =
+  ## DataRow ('D') with text-format columns where ``isNull[i]`` emits SQL NULL
+  ## (int32 -1) for column ``i`` instead of ``cols[i]``. Lengths must match.
+  ## Used for commands like READ_REPLICATION_SLOT that report nonexistent or
+  ## unreserved state as NULL columns rather than zero rows.
+  doAssert cols.len == isNull.len, "cols/isNull length mismatch"
+  var body: seq[byte]
+  body.addInt16(int16(cols.len)) # column count
+  for i, c in cols:
+    if isNull[i]:
+      body.addInt32(-1)
+    else:
+      body.addInt32(int32(c.len))
+      for ch in c:
+        body.add(byte(ch))
+  buildBackendMsg('D', body)
+
 proc buildDataRow*(value: string): seq[byte] =
   ## DataRow with a single text-format column.
   buildDataRowText([value])
@@ -267,6 +284,23 @@ proc buildCommandComplete*(tag: string): seq[byte] =
     body.add(byte(c))
   body.add(0'u8)
   buildBackendMsg('C', body)
+
+proc buildEmptyQueryResponse*(): seq[byte] =
+  ## EmptyQueryResponse: paired with a trailing ReadyForQuery, this is what a
+  ## real server answers `stopListening`'s empty stop query with.
+  buildBackendMsg('I', newSeq[byte]())
+
+proc buildNotificationResponse*(pid: int32, channel, payload: string): seq[byte] =
+  ## NotificationResponse: pid, channel cstring, payload cstring.
+  var body: seq[byte]
+  body.addInt32(pid)
+  for c in channel:
+    body.add(byte(c))
+  body.add(0'u8)
+  for c in payload:
+    body.add(byte(c))
+  body.add(0'u8)
+  buildBackendMsg('A', body)
 
 proc buildErrorResponse*(sqlState, message: string): seq[byte] =
   ## Minimal ErrorResponse with severity 'S', sqlstate 'C', message 'M'.

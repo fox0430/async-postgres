@@ -1,11 +1,19 @@
 ## Pipelined single-statement transactions: `execInTransaction` and
 ## `queryInTransaction` issue BEGIN, the user SQL, and COMMIT with a single
 ## Sync round trip.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, cache, simple_query]
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc queryInTransactionImpl(
     conn: PgConnection,
@@ -18,15 +26,17 @@ proc queryInTransactionImpl(
 ): Future[QueryResult] {.async.} =
   conn.checkReady()
   conn.checkTxIdle()
+  validateExtendedQuery(sql, params.len, paramOids.len, stmtNameLen = 0)
 
   let formats =
     if paramFormats.len > 0:
       paramFormats
     else:
       newSeq[int16](params.len)
+  validateEncodedParams(params, formats.len, resultFormats.len, stmtNameLen = 0)
 
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
-  conn.sendBuf.setLen(0)
+  conn.beginSendBuf()
   # BEGIN
   conn.sendBuf.addParse("", beginSql)
   conn.sendBuf.addBind("", "", @[], @[])
@@ -42,8 +52,8 @@ proc queryInTransactionImpl(
   conn.sendBuf.addExecute("", 0)
   # Single Sync
   conn.sendBuf.addSync()
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
   var phase = 0
@@ -115,7 +125,8 @@ proc execInTransaction*(
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined BEGIN/COMMIT transaction (1 round trip).
   ## On error, ROLLBACK is issued automatically.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var tag: string
   withConnTracing(
     conn,
@@ -172,7 +183,8 @@ proc queryInTransaction*(
 ): Future[QueryResult] {.async.} =
   ## Execute a query inside a pipelined BEGIN/COMMIT transaction (1 round trip).
   ## Returns rows. On error, ROLLBACK is issued automatically.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var qr: QueryResult
   withConnTracing(
     conn,

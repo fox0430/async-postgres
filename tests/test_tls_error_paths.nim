@@ -70,6 +70,77 @@ suite "TLS error paths: client cert/key/CA loading":
     check raised
     check msg.len > 0
 
+  test "a malformed CA reaches the caller as a config fault":
+    # `connect` folds per-host failures into a `PgConnectionError` aggregate; a
+    # PEM that can never parse has to escape that fold, or a reconnect loop
+    # spins on a fault no retry can fix.
+    proc runTest(): Future[bool] {.async.} =
+      let ms = startMockServer()
+      startSslProbe(ms, closeAfterReply = false)
+      var cfg = testConfig(ms.port, sslVerifyCa)
+      cfg.sslRootCert = "not a PEM certificate"
+      var configFault = false
+      try:
+        try:
+          let conn = await connect(cfg)
+          await conn.close()
+        except PgError as e:
+          configFault = e of PgConfigError
+      finally:
+        await closeServer(ms)
+      configFault
+
+    check waitFor(runTest())
+
+  test "verify-ca without sslrootcert escapes the per-host fold":
+    # Two entries share the one broken config: the first host's check must
+    # raise `PgConfigError` out of `connect` instead of folding it into the
+    # aggregate and dialing the second.
+    proc runTest(): Future[string] {.async.} =
+      let ms = startMockServer()
+      startSslProbe(ms, closeAfterReply = false)
+      var cfg = testConfig(ms.port, sslVerifyCa)
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: ms.port),
+        HostEntry(host: "127.0.0.1", port: ms.port),
+      ]
+      var msg = ""
+      try:
+        try:
+          let conn = await connect(cfg)
+          await conn.close()
+        except PgConfigError as e:
+          msg = e.msg
+      finally:
+        await closeServer(ms)
+      msg
+
+    let msg = waitFor runTest()
+    check "requires sslrootcert" in msg
+    check "Could not connect to any host" notin msg
+
+  test "a lone sslcert through connectToHost is a config fault":
+    # `connectToHost` skips the connect-time chokepoint, so `negotiateSSL`'s
+    # own re-check is what a direct caller sees; it must raise the same type.
+    proc runTest(): Future[bool] {.async.} =
+      let ms = startMockServer()
+      startSslProbe(ms, closeAfterReply = false)
+      var cfg = testConfig(ms.port, sslRequire)
+      cfg.sslCert = readCert("server.crt")
+      var configFault = false
+      try:
+        try:
+          let conn =
+            await connectToHost(cfg, HostEntry(host: "127.0.0.1", port: ms.port))
+          await conn.close()
+        except PgConfigError:
+          configFault = true
+      finally:
+        await closeServer(ms)
+      configFault
+
+    check waitFor(runTest())
+
   test "garbage client certificate content fails":
     proc runTest(): Future[ProbeResult] {.async.} =
       let ms = startMockServer()
@@ -187,18 +258,27 @@ suite "TLS handshake failure path":
       let ms = startMockServer()
       startSslProbe(ms, closeAfterReply = true)
       var msg = ""
+      # Catch broadly and assert the type: a raw AsyncStreamError must fail the
+      # assertion, not skip closeServer and leak the mock server.
       try:
-        let conn = await connect(testConfig(ms.port, sslRequire))
-        await conn.close()
-      except CatchableError as e:
-        msg = e.msg
-      await closeServer(ms)
+        try:
+          let conn = await connect(testConfig(ms.port, sslRequire))
+          await conn.close()
+        except CatchableError as e:
+          doAssert e of PgConnectionError
+          msg = e.msg
+      finally:
+        await closeServer(ms)
       msg
 
     let msg = waitFor runTest()
     check msg.len > 0
+    # `connect` folds every per-host failure into PgConnectionError, so the type
+    # says nothing here; only the wording checked below rules out a leak.
     when hasAsyncDispatch:
       check "closed by peer" in msg
+    elif hasChronos:
+      check "TLS handshake failed" in msg
 
 suite "direct SSL: ALPN enforcement":
   proc ephemeralPort(): int =

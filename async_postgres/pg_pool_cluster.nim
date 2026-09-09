@@ -1,6 +1,8 @@
 import std/macros
 
 import async_backend, pg_protocol, pg_connection, pg_types, pg_pool, pg_client
+import pg_connection/types
+import pg_client/transaction
 
 type
   ReplicaFallback* = enum
@@ -168,7 +170,9 @@ proc drainAbandonedAcquire(acquireFut: Future[PgConnection]) {.async.} =
   ## resolves immediately without a connection.
   try:
     let conn = await acquireFut
-    conn.release()
+    # Not `release()`: the pool is taking its own abandoned acquire back, not the
+    # application returning a borrow.
+    conn.releaseReclaimed()
   except CatchableError:
     discard # a failed/cancelled acquire cleans up its own pool accounting
 

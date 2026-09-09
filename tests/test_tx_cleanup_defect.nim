@@ -12,20 +12,19 @@
 ## query so the cleanup guard admits the ROLLBACK attempt; the failing
 ## writer stops the cleanup SQL before it reaches the wire.
 
-import std/[unittest, importutils]
-
 import ../async_postgres/async_backend
 
-import ../async_postgres/[pg_client, pg_connection]
-import ../async_postgres/pg_pool {.all.}
-
-import mock_pg_server
-
-privateAccess(PgConnection)
-privateAccess(PgPool)
-privateAccess(PooledConn)
-
 when hasChronos:
+  import std/[unittest, importutils]
+  import ../async_postgres/[pg_client, pg_connection]
+  import ../async_postgres/pg_pool {.all.}
+
+  import mock_pg_server
+
+  privateAccess(PgConnection)
+  privateAccess(PgPool)
+  privateAccess(PooledConn)
+
   type CleanupSkippedRec = object
     kind: CleanupKind
     reason: CleanupSkipReason
@@ -400,11 +399,12 @@ when hasChronos:
 
       waitFor t()
 
-    test "runAndRelease swallows a release-path Defect (non-pipelined)":
-      # Regression: a release-path reset Defect must not surface as PgPoolError
-      # for a successful op — matching the pipelined dispatch paths' swallow.
-      # The op's result is valid and the conn is discarded (the reset send
-      # leaves csBusy), so nothing broken is reused.
+    test "runAndRelease reports a release-path Defect to the tracer (non-pipelined)":
+      # A release-path reset Defect must not surface as PgPoolError
+      # for a successful op — the op's result is valid and the conn is
+      # discarded (the reset send leaves csBusy), so nothing broken is
+      # reused. The failure is reported via `onPoolCloseError`, matching
+      # the pipelined dispatch paths.
       proc t() {.async.} =
         let ms = startMockServer()
         var serverClient: MockClient
@@ -421,7 +421,14 @@ when hasChronos:
         # write #2 (raises a Defect).
         conn.writer = countingWriter(2)
 
+        let closeErrCount = new(int)
+        let tracer = PgTracer()
+        tracer.onPoolCloseError = proc(
+            data: TracePoolCloseErrorData
+        ) {.gcsafe, raises: [].} =
+          closeErrCount[] += 1
         let pool = makePool(resetQuery = "SELECT 1")
+        pool.config.tracer = tracer
         conn.ownerPool = pool
         pool.idle.addLast(conn.toPooled())
 
@@ -434,9 +441,60 @@ when hasChronos:
 
         doAssert not raised,
           "a release-path Defect must not fail a successful op (raised=" & $raised & ")"
+        doAssert closeErrCount[] == 1,
+          "the release failure must be reported exactly once (was " & $closeErrCount[] &
+            ")"
         # The conn was discarded (reset send left csBusy), not parked.
         doAssert pool.active == 0
         doAssert pool.idle.len == 0
+
+        conn.writer = origWriter
+        await pool.close()
+        await closeClient(serverClient)
+        await closeServer(ms)
+
+      waitFor t()
+
+  suite "Pipelined dispatch body Defect":
+    test "single-op body Defect fails the op as PgPoolError (dispatchHomogeneous)":
+      # The dispatch body's Defect arm must wrap into `PgPoolError` so the op's
+      # future fails instead of hanging. Inline-param validation used to be the
+      # Defect source here; it now raises `PgTypeError`, so the Defect comes
+      # from the writer instead.
+      proc t() {.async.} =
+        let ms = startMockServer()
+        var serverClient: MockClient
+        proc serverHandler() {.async.} =
+          serverClient = await acceptAndReady(ms)
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port, nil))
+        let origWriter = conn.writer
+        # The op send is write #1: the Defect lands inside the dispatch body,
+        # before any reply is consumed.
+        conn.writer = countingWriter(1)
+
+        let pool = makePool(resetQuery = "SELECT 1", pipelined = true)
+        conn.ownerPool = pool
+        pool.idle.addLast(conn.toPooled())
+
+        var caught: ref PgPoolError = nil
+        try:
+          discard await pool.exec("SELECT 1")
+        except PgPoolError as e:
+          caught = e
+        await serverFut
+
+        doAssert caught != nil, "a dispatch-body Defect must fail the op as PgPoolError"
+        doAssert caught.parent != nil and caught.parent of Defect,
+          "the Defect must be preserved as parent"
+        var released = false
+        for _ in 0 ..< 200:
+          if pool.active == 0:
+            released = true
+            break
+          await sleepAsync(milliseconds(10))
+        doAssert released, "connection must be released after the Defect"
 
         conn.writer = origWriter
         await pool.close()

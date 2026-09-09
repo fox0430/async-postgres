@@ -4,8 +4,13 @@
 ## - keyword=value:  ``host=localhost port=5432 dbname=test``
 ## - URI:            ``postgresql://user:pass@host:port/db?param=value``
 ##
-## Re-exported through `pg_connection.nim`; depends only on `types.nim`
-## (in particular, does not touch `PgConnection`).
+## Only `initConnConfig` / `parseDsn` are re-exported through `pg_connection.nim`;
+## the intermediate parsers stay here. Depends only on `types.nim` (does not
+## touch `PgConnection`).
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/strutils
 when defined(posix):
@@ -637,11 +642,25 @@ proc parseUriDsn*(dsn: string): ConnConfig =
 
   if queryStr.len > 0:
     for pair in queryStr.split('&'):
+      if pair.len == 0:
+        # A trailing '&' leaves an empty item carrying no value; skip it.
+        continue
       let epos = pair.find('=')
       if epos < 0:
-        continue
+        # A nameless item cannot set anything. Ignoring it would silently
+        # drop a security-relevant parameter (e.g. `?sslmode` falling back
+        # to the default), so reject it instead.
+        raise newException(
+          PgError, "Missing key/value separator '=' in URI query parameter: " & pair
+        )
       let key = pctDecode(pair[0 ..< epos])
       let val = pctDecode(pair[epos + 1 .. ^1])
+      if key.len == 0:
+        # A `=value` item has a separator but no name. Like a missing '='
+        # it cannot set anything, so reject it instead of storing an
+        # empty-named extra parameter. This mirrors `parseKeyValueDsn`,
+        # which rejects empty keys as well.
+        raise newException(PgError, "Empty key in URI query parameter: " & pair)
       case key
       of "host":
         hostList = splitList(val)

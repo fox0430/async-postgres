@@ -13,6 +13,7 @@ import pkg/nimcrypto/pbkdf2
 
 import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/buffer_io
 
 import ./mock_pg_server
 

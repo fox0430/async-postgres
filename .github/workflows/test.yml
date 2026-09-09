@@ -9,6 +9,7 @@ on:
       - 'async_postgres/**'
       - 'tests/**'
       - 'examples/**'
+      - 'tools/**'
   push:
     paths:
       - '.github/workflows/test.yml'
@@ -17,6 +18,7 @@ on:
       - 'async_postgres/**'
       - 'tests/**'
       - 'examples/**'
+      - 'tools/**'
     branches:
       - main
 
@@ -64,6 +66,9 @@ jobs:
           use-nightlies: true
           repo-token: ${{ secrets.GITHUB_TOKEN }}
         if: matrix.nim-version == 'devel'
+
+      - name: Check public API surface
+        run: nimble apiSurface -y
 
       - name: Generate test certificates
         run: bash tests/gen_certs.sh

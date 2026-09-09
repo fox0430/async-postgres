@@ -1,10 +1,19 @@
 ## `exec` overloads: extended-query single-statement execution that ignores
 ## result rows and returns just the command tag (`CommandResult`).
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options, tables]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, cache, simple_query]
+import ../pg_types/encoding
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc execImpl*(
     conn: PgConnection,
@@ -14,6 +23,8 @@ proc execImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len, paramOids.len)
+  validateEncodedParams(params, paramFormats.len)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -32,8 +43,8 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBind("", stmtName, paramFormats, params),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
@@ -43,6 +54,8 @@ proc execImpl*(
     conn: PgConnection, sql: string, params: seq[PgParam] = @[]
 ): Future[string] {.async.} =
   conn.checkReady()
+  validateExtendedQuery(sql, params.len)
+  validateTypedParams(params)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -59,8 +72,8 @@ proc execImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, params),
     bindStep = conn.sendBuf.addBind("", stmtName, params),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
@@ -102,6 +115,10 @@ proc execInlineImpl*(
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
   conn.checkReady()
+  # Not redundant with the `exec` overload's `flattenInline`: internal callers
+  # may hand this proc `data`/`ranges` that never went through it.
+  validateExtendedQuery(sql, ranges.len, paramOids.len)
+  validateRawBind(data, ranges, paramFormats)
 
   let cached = conn.lookupStmtCache(sql)
   var cacheHit = cached != nil
@@ -118,8 +135,8 @@ proc execInlineImpl*(
     parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
     bindStep = conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges),
   )
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
@@ -134,7 +151,6 @@ proc exec*(
   ## Execute a statement with heap-alloc-free inline parameters.
   ## Prefer this overload for scalar-heavy workloads (e.g. bulk INSERT of
   ## numeric columns) where `seq[PgParam]` would heap-allocate per parameter.
-  let (data, ranges, oids, formats) = flattenInline(params)
   var tag: string
   withConnTracing(
     conn,
@@ -144,6 +160,10 @@ proc exec*(
     TraceQueryEndData,
     TraceQueryEndData(commandTag: tag),
   ):
+    # Inside the tracing body so a rejected call still reports start/end, and
+    # after `checkReady` so a `PgTypeError` cannot pre-empt a health error.
+    conn.checkReady()
+    let (data, ranges, oids, formats) = flattenInline(params)
     awaitOrInvalidate(
       conn,
       tag,

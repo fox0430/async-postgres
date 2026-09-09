@@ -4,6 +4,7 @@ import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection]
 import ../async_postgres/pg_client/core
+import ../async_postgres/pg_connection/cache
 
 when hasAsyncDispatch:
   import std/strutils

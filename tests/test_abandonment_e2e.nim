@@ -8,13 +8,11 @@
 ## transitioned to `csClosed` as appropriate, so pools never recycle a
 ## broken connection.
 
-import std/[unittest, importutils]
+import std/[unittest, strutils]
 
 import ../async_postgres/[async_backend, pg_client, pg_types]
 import ../async_postgres/pg_connection {.all.}
 import ./e2e_common
-
-privateAccess(PgConnection)
 
 # Cursor abandonment
 
@@ -65,18 +63,57 @@ suite "E2E: Cursor lifecycle invariants":
 
     waitFor t()
 
-  test "fetchNext after conn.close() raises PgConnectionError, not SIGSEGV":
+  test "fetchNext after conn.close() raises PgStateError, not SIGSEGV":
+    # The application closed this connection itself, so `PgStateError` keeps the
+    # fetch out of `except PgConnectionError` reconnect loops.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let cursor =
         await conn.openCursor("SELECT i FROM generate_series(1, 100) i", chunkSize = 10)
       await conn.close()
       var raised = false
+      var isConnErr = false
       try:
         discard await cursor.fetchNext()
-      except PgConnectionError:
+      except PgStateError:
         raised = true
-      doAssert raised, "fetchNext after close must raise PgConnectionError"
+      except PgConnectionError:
+        isConnErr = true
+      doAssert raised, "fetchNext after close must raise PgStateError"
+      doAssert not isConnErr,
+        "a deliberate close must not look like a connection failure"
+
+    waitFor t()
+
+  test "query / exec / simpleQuery / listen after close() raise PgStateError":
+    # Regression: every entry point but `waitNotification` went through
+    # `checkReady`, which knew nothing of the close and raised `PgConnectionError`.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      await conn.close()
+
+      var stateErrors = 0
+      var connErrors = 0
+      template expectDeliberateClose(body: untyped) =
+        try:
+          body
+          doAssert false, "an operation on a closed connection must raise"
+        except PgStateError as e:
+          doAssert "closed by the application" in e.msg, "unexpected message: " & e.msg
+          inc stateErrors
+        except PgConnectionError:
+          inc connErrors
+
+      expectDeliberateClose:
+        discard await conn.query("SELECT 1")
+      expectDeliberateClose:
+        discard await conn.exec("SELECT 1")
+      expectDeliberateClose:
+        discard await conn.simpleQuery("SELECT 1")
+      expectDeliberateClose:
+        await conn.listen("abandonment_closed_ch")
+      doAssert stateErrors == 4, "expected 4 PgStateError, got " & $stateErrors
+      doAssert connErrors == 0, "no entry point may report a reconnectable failure"
 
     waitFor t()
 
@@ -175,6 +212,28 @@ suite "E2E: Pipeline error recovery":
       doAssert conn.state == csReady, $conn.state
       let qr = await conn.query("SELECT 'post-batch'::text")
       doAssert qr.rowCount == 1
+      await conn.close()
+
+    waitFor t()
+
+  test "executeIsolated: a timeout mid-batch retires the connection":
+    # Per-op SYNC means the batch owes one ReadyForQuery per op, and op 1's
+    # reply arriving does not make op 2's abandonable: its replies are still
+    # on the wire. Handing the connection back here would let the next
+    # borrower read op 2's ParseComplete/RowDescription as its own.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let p = conn.newPipeline()
+      p.addQuery("SELECT 1")
+      p.addQuery("SELECT pg_sleep(5)")
+      p.addQuery("SELECT 2")
+      var timedOut = false
+      try:
+        discard await p.executeIsolated(timeout = milliseconds(300))
+      except PgConnectionError as e:
+        timedOut = e of ref PgTimeoutError
+      doAssert timedOut, "the batch must time out as a PgConnectionError"
+      doAssert conn.state == csClosed, $conn.state
       await conn.close()
 
     waitFor t()

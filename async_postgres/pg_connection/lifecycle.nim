@@ -1,19 +1,8 @@
-## Connection lifecycle: open, authenticate, fail over across hosts, close.
+## Connection lifecycle: auth, single/multi-host connect, and close.
 ##
-## Contains:
-## - Authentication helpers (`enforceAuthAllowed`, `filterSaslByRequireAuth`,
-##   `selectScramMechanism`) that the auth loop in `connectToHost` consumes.
-## - `connectToHost` — the single-host bootstrap: socket → SSL → startup →
-##   auth loop → ParameterStatus/BackendKeyData → extension OID discovery.
-## - `connect` — the public entry: multi-host failover, `targetSessionAttrs`
-##   handling, optional `connectTimeout`, top-level connect tracing.
-## - `orderedHosts` — the host list to try, reordered per `loadBalanceHosts`
-##   (`lbhRandom` shuffles it once per connection).
-## - `close` — idempotent teardown: stop background listen pump, send
-##   `Terminate`, drop transport handles.
-##
-## Imports `simple_query` for `checkSessionAttrs` (failover probe).
-## Re-exported through `pg_connection.nim`.
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options, random, strutils, sysrand, tables]
 
@@ -28,9 +17,12 @@ when hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, SockType, Protocol
 
+import std/importutils
+privateAccess(PgConnection)
+
 # Authentication policy helpers
 
-proc enforceAuthAllowed*(
+proc enforceAuthAllowed(
     authMethod: AuthMethod, allowed: set[AuthMethod], offered: string = ""
 ) {.raises: [PgConnectionError].} =
   if allowed.len > 0 and authMethod notin allowed:
@@ -65,14 +57,7 @@ proc selectScramMechanism*(
 ): tuple[
   mechanism: string, cbType: string, cbData: seq[byte], cbSupportedButUnused: bool
 ] =
-  ## Pick the SCRAM mechanism and channel-binding material for a SASL
-  ## authentication attempt. Raises `PgConnectionError` when the server-offered
-  ## mechanisms cannot satisfy `mode`. `cbSupportedButUnused` is true only when
-  ## TLS is in use, plain SCRAM-SHA-256 was selected, and the server did *not*
-  ## offer SCRAM-SHA-256-PLUS; the caller then emits a "y,," gs2 header so the
-  ## server can detect a SCRAM-SHA-256-PLUS downgrade (libpq parity). When the
-  ## server offered -PLUS but it could not be used (e.g. the certificate was
-  ## unavailable), or for `cbDisable`, it stays false so a "n,," header is sent.
+  ## Pick SCRAM mechanism/binding (raises if ``mode`` unsatisfied; ``cbSupportedButUnused`` → ``y,,`` else ``n,,``).
   let serverHasPlus = "SCRAM-SHA-256-PLUS" in saslMechanisms
   let serverHasScram = "SCRAM-SHA-256" in saslMechanisms
   let canUsePlus = sslEnabled and serverCertDer.len > 0 and serverHasPlus
@@ -128,9 +113,7 @@ proc selectScramMechanism*(
 proc connectToHost*(
     config: ConnConfig, entry: HostEntry
 ): Future[PgConnection] {.async.} =
-  ## Connect to a single PostgreSQL host. Internal helper for multi-host connect.
-  ## Dials `entry.hostaddr` when given (bypassing name resolution), otherwise
-  ## `entry.host`; SSL certificate verification always uses `entry.host`.
+  ## Connect to single host (dial ``hostaddr`` else ``host``; verify via ``host``).
 
   # Validate before the sslAllow branch rewrites sslMode to sslDisable, which
   # would mask an sslnDirect conflict.
@@ -287,7 +270,7 @@ proc connectToHost*(
     if config.applicationName.len > 0:
       startupParams.add(("application_name", config.applicationName))
     await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))
-    conn.state = csAuthentication
+    conn.markState(csAuthentication)
 
     # Authentication loop
     var
@@ -427,7 +410,7 @@ proc connectToHost*(
             conn.secretKey = msg.backendSecretKey
           of bmkReadyForQuery:
             conn.txStatus = msg.txStatus
-            conn.state = csReady
+            conn.markReady()
             break readyLoop
           of bmkErrorResponse:
             raise newException(PgConnectionError, formatError(msg.errorFields))
@@ -443,10 +426,11 @@ proc connectToHost*(
 
 # Close
 
-proc close*(conn: PgConnection): Future[void] {.async.} =
-  ## Close the connection. Idempotent: safe to call multiple times.
-  ## On asyncdispatch a listen pump stuck in a blocking `connect()` is orphaned
-  ## after a bounded wait; it self-cleans once `connect()` unwinds.
+proc closeImpl*(conn: PgConnection, byUser: bool): Future[void] {.async.} =
+  ## Close with ownership flag: ``byUser=false`` keeps ``PgConnectionError`` for pool evictions.
+  # Set ``closedByUser`` before first suspension so racing ``waitNotification`` sees it.
+  if byUser:
+    conn.closedByUser = true
   # Stop background listen pump if running
   if conn.listenTask != nil and not conn.listenTask.finished:
     when hasAsyncDispatch:
@@ -477,23 +461,25 @@ proc close*(conn: PgConnection): Future[void] {.async.} =
       await conn.sendMsg(encodeTerminate())
     except CatchableError:
       discard
-  conn.state = csClosed
+  conn.markClosed()
+  conn.resetWireState()
   conn.heldSessionLocks = 0
   conn.sessionLockDirty = false
-  # Fail any pending notification waiter
-  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    conn.notifyWaiter.fail(newException(PgError, "Connection closed"))
+  conn.failNotifyWaiter() # `closedByUser` maps it to PgStateError
   await conn.closeTransport()
+
+proc close*(conn: PgConnection): Future[void] =
+  ## Idempotent close; asyncdispatch may orphan blocking pump until it unwinds. Waiter → ``PgStateError``.
+  conn.closeImpl(byUser = true)
 
 # Multi-host connect
 
 proc matchesOrClose(
     conn: PgConnection, attrs: TargetSessionAttrs
 ): Future[bool] {.async.} =
-  ## Probe `conn` against `attrs`. On a match leave it open and return true.
-  ## On a non-match, or any failure (including cancellation), close `conn`
-  ## first — so a raising probe never leaks the connection — then return
-  ## false or re-raise. Failover callers must not close `conn` themselves.
+  ## Probe against ``attrs``; non-match/failure closes ``conn`` (no leak).
+  # `byUser = false` throughout: the application never saw a handle for this
+  # probe, so discarding it must not stamp `closedByUser`.
   try:
     if await conn.checkSessionAttrs(attrs):
       return true
@@ -501,24 +487,20 @@ proc matchesOrClose(
     # A cancelled connection's bare awaits re-raise immediately, so force the
     # teardown to run under chronos; close() swallows its own errors.
     when hasChronos:
-      await noCancel conn.close()
+      await noCancel conn.closeImpl(byUser = false)
     else:
-      await conn.close()
+      await conn.closeImpl(byUser = false)
     # Re-raise the captured exception rather than a bare `raise`: if close()
     # suspended, the resumed coroutine has no "current exception" and a bare
     # raise dies with ReraiseDefect ("no exception to reraise").
     raise e
-  await conn.close()
+  await conn.closeImpl(byUser = false)
   return false
 
 proc attemptHost(
     config: ConnConfig, entry: HostEntry, attrs: TargetSessionAttrs
 ): Future[PgConnection] {.async.} =
-  ## One per-host connection attempt: dial the host, then (unless `attrs` is
-  ## `tsaAny`) verify the server matches the requested role via `matchesOrClose`.
-  ## Returns the live connection on success, or `nil` if the host connected but
-  ## did not match (`matchesOrClose` has already closed it). Raises on dial,
-  ## handshake, or probe failure.
+  ## Dial host and verify ``attrs``; nil = wrong role (already closed).
   let conn = await connectToHost(config, entry)
   if attrs == tsaAny or await conn.matchesOrClose(attrs):
     return conn
@@ -527,10 +509,7 @@ proc attemptHost(
 proc attemptHostTimed(
     config: ConnConfig, entry: HostEntry, attrs: TargetSessionAttrs
 ): Future[PgConnection] {.async.} =
-  ## `attemptHost` bounded by a *per-host* `connectTimeout`. libpq applies
-  ## connect_timeout to each host separately, so a slow or unreachable host
-  ## consumes at most one timeout before failover moves on — the budget is not
-  ## shared across the whole host list.
+  ## ``attemptHost`` with per-host ``connectTimeout`` (libpq semantics).
   if config.connectTimeout == default(Duration):
     return await attemptHost(config, entry, attrs)
   when hasAsyncDispatch:
@@ -551,7 +530,9 @@ proc attemptHostTimed(
               try:
                 let orphan = fut.read()
                 if orphan != nil:
-                  await orphan.close()
+                  # Nobody ever held this one: the library dialled it and the
+                  # library discards it (see `matchesOrClose`).
+                  await orphan.closeImpl(byUser = false)
               except CatchableError:
                 discard
           )()
@@ -561,17 +542,7 @@ proc attemptHostTimed(
     return await attemptHost(config, entry, attrs).wait(config.connectTimeout)
 
 proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
-  ## `getHosts`, reordered per `config.loadBalanceHosts`. With `lbhRandom`
-  ## (libpq `load_balance_hosts=random`) the configured host list is shuffled
-  ## once per call, so a pool of connections spreads across hosts. With
-  ## `lbhDisable` (default) the configured order is preserved. Only the
-  ## multi-host list is reordered — multiple addresses behind a single host
-  ## name are not shuffled (`attemptHost` dials the first resolved address).
-  ##
-  ## The shuffle is seeded from the OS secure random source (`std/sysrand`)
-  ## into a local `std/random` RNG, so it is safe under `--threads:on`, does
-  ## not require the application to call `randomize()`, and keeps no
-  ## module-level state.
+  ## Hosts per ``loadBalanceHosts`` (``lbhRandom`` shuffles via ``urandom``; no global state).
   result = config.getHosts()
   if config.loadBalanceHosts == lbhRandom and result.len > 1:
     let bytes =
@@ -591,21 +562,25 @@ proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
     rng.shuffle(result)
 
 proc connect*(config: ConnConfig): Future[PgConnection] =
-  ## Establish a new connection to a PostgreSQL server.
-  ## Supports multi-host failover: tries each host in order, or in a random
-  ## order when `loadBalanceHosts == lbhRandom` (libpq `load_balance_hosts`).
-  ## Respects `targetSessionAttrs` to select the appropriate server type.
-  ## `connectTimeout` is applied per host (libpq semantics): each host attempt
-  ## gets its own budget, so the total wait may reach `connectTimeout * hosts`.
+  ## Connect with multi-host failover, ``targetSessionAttrs``, per-host ``connectTimeout``.
+  ## Per-host failures fold into one ``PgConnectionError``; a ``PgConfigError`` escapes the fold.
   proc perform(hosts: seq[HostEntry]): Future[PgConnection] {.async.} =
     # `hosts` is already ordered by the caller (shuffled under lbhRandom), so
     # both the preferStandby two-pass loop and the single-pass loop below share
     # one order.
     # Reject sslnDirect + weak sslmode once — a per-host check would repeat the
-    # identical error across the aggregate. Other host-independent SSL errors
-    # (missing sslrootcert, verify-full without a host name) are still raised
-    # from negotiateSSL and folded per host.
+    # identical error across the aggregate.
     validateDirectSslCompatible(config)
+    # Faults of the shared config raised per host (missing sslrootcert, a PEM
+    # that will not load, ...) would repeat on every entry: folding them into
+    # the aggregate would hide them behind the very type that tells a
+    # reconnect loop to retry. Only `PgConfigError` escapes — a probe's
+    # `PgQueryError` or a fault of one entry (verify-full without a host name)
+    # is a per-host outcome and must still fail over.
+    template reraiseConfigFault(err: ref CatchableError) =
+      if err of PgConfigError:
+        raise err
+
     var errors: seq[string]
     # With a single host there is no failover. Preserve the contract that its
     # `connectTimeout` surfaces as a raw `AsyncTimeoutError` (callers and the
@@ -623,6 +598,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          reraiseConfigFault(e)
           lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
       # Second pass: accept any server
@@ -632,6 +608,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          reraiseConfigFault(e)
           lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
     else:
@@ -648,6 +625,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         except CancelledError as e:
           raise e
         except CatchableError as e:
+          reraiseConfigFault(e)
           lastFailure = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
 
@@ -660,10 +638,14 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
   proc wrapped(): Future[PgConnection] {.async.} =
     # ConnConfig may be built or mutated without passing through the parsers'
     # validation — re-check here so every connect path rejects bad cert config.
-    try:
-      validateClientCertConfig(config)
-    except PgError as e:
-      raise newException(PgConnectionError, e.msg, e)
+    validateClientCertConfig(config)
+    if config.channelBinding == cbRequire and config.sslMode == sslDisable:
+      # Knowable before any dial; the per-host check in selectScramMechanism
+      # stays for sslmode=prefer, where the server decides whether TLS is used.
+      raise newException(
+        PgConfigError,
+        "channel_binding=require needs TLS, but sslmode=disable never negotiates it",
+      )
     # Compute the ordered host list once so the trace and the actual connection
     # attempts see the same order under lbhRandom.
     let hosts = config.orderedHosts()

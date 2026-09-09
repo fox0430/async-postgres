@@ -1,4 +1,4 @@
-import std/[unittest, options, tables, math, importutils, net]
+import std/[unittest, options, tables, math, net]
 
 import
   ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
@@ -7,8 +7,6 @@ when hasAsyncDispatch:
   import std/strutils
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Basic Connection":
   test "plain connection and close":

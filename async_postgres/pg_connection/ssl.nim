@@ -13,7 +13,9 @@
 ##   trust anchors written to a temp file and `SSL_get_peer_certificate` used
 ##   for channel binding.
 ##
-## Re-exported through `pg_connection.nim`.
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[net, strutils]
 import ../[async_backend, pg_errors, pg_protocol, pg_types]
@@ -43,6 +45,9 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[dynlib, openssl, tempfiles, os]
 
+import std/importutils
+privateAccess(PgConnection)
+
 when hasTls:
   const PgAlpnProtocol = "postgresql"
     ## ALPN protocol name required for `sslnegotiation=direct` (PostgreSQL 17+).
@@ -66,10 +71,7 @@ when hasAsyncDispatch and defined(ssl):
       ## TLS 1.1 and below.
 
   proc enforceTls12Minimum*(ctx: SslCtx): bool =
-    ## Enforce TLS 1.2+ via `SSL_CTRL_SET_MIN_PROTO_VERSION` (1.1.0+); on 1.0.x
-    ## (control unknown, 0 return) apply the NO_* fallback mask instead.
-    ## Call before the handshake: the library build default may allow TLS 1.1.
-    ## Returns true when the min-version control ran.
+    ## Enforce TLS 1.2+. Returns true if min-version control ran.
     let minVersionSet =
       SSL_CTX_ctrl(ctx, sslCtrlSetMinProtoVersion, sslTls12Version, nil)
     if minVersionSet == 0:
@@ -141,18 +143,20 @@ when hasAsyncDispatch and defined(ssl):
     ## encrypted client key is loaded; failing turns that into a load error.
     -1
 
-  proc formatSslError(prefix: string): string =
-    result = prefix
-    let code = ERR_peek_last_error()
+  proc sslErrorText(code: culong): string =
+    ## Text for an OpenSSL error-queue code, "" for 0.
     if code != 0:
-      result &= ": " & $ERR_error_string(code, nil)
+      result = ": " & $ERR_error_string(code, nil)
+
+  proc lastSslErrorText(): string =
+    ## Last entry of the thread-global OpenSSL error queue, "" when empty.
+    sslErrorText(ERR_peek_last_error())
+
+  proc formatSslError(prefix: string): string =
+    prefix & lastSslErrorText()
 
   proc driveTlsHandshake(socket: AsyncSocket) {.async.} =
-    ## Drive `wrapConnectedSocket`'s deferred client handshake to completion,
-    ## shuttling bytes between OpenSSL's memory BIOs and the raw AsyncFD.
-    ## Required so `SSL_get_peer_certificate` returns the leaf cert for SCRAM
-    ## channel binding (asyncnet only performs the handshake on the first
-    ## application send/recv, and its `sslLoop`/BIO plumbing is not exported).
+    ## Drive deferred handshake to completion via BIO shuttling.
     const HandshakeBufSize = 4096
     let ssl = socket.sslHandle
     if ssl == nil:
@@ -171,12 +175,20 @@ when hasAsyncDispatch and defined(ssl):
     while true:
       ErrClearError()
       let ret = sslDoHandshake(ssl)
+      # `SSL_get_error` and the error queue are thread-global: capture this
+      # handshake's outcome before the flush below suspends, or a concurrent
+      # handshake on the same loop is reported as our failure.
+      let err = SSL_get_error(ssl, ret)
+      let errCode = ERR_peek_last_error()
       # Flush anything OpenSSL wrote to the outgoing memory BIO (ClientHello,
       # key exchange, Finished, …) regardless of `ret`, so a WANT_READ still
       # sends its handshake record before we block on the peer's reply.
       let pending = bioCtrlPending(wbio)
       if pending > 0:
         var outBuf = newString(pending)
+        # `errCode` is already captured, so clearing here lets a BIO_read
+        # failure report its own error, not the handshake's leftover entry.
+        ErrClearError()
         let read = bioRead(wbio, cast[cstring](addr outBuf[0]), pending)
         if read <= 0:
           raise newException(
@@ -184,29 +196,50 @@ when hasAsyncDispatch and defined(ssl):
           )
         outBuf.setLen(read)
         # Qualified to force asyncdispatch's raw AsyncFD overload — asyncnet's
-        # `send` would recurse into the very handshake loop we drive.
-        await asyncdispatch.send(fd, outBuf, flags = {})
+        # `send` would recurse into the handshake loop we drive. A mid-handshake
+        # ECONNRESET surfaces as a raw OSError; fold it into the PgError contract.
+        try:
+          await asyncdispatch.send(fd, outBuf, flags = {})
+        except CancelledError as e:
+          raise e
+        except CatchableError as e:
+          raise
+            newException(PgConnectionError, "TLS handshake: send failed: " & e.msg, e)
       if ret == 1:
         return
-      let err = SSL_get_error(ssl, ret)
       case err
       of SSL_ERROR_WANT_READ:
-        let data = await asyncdispatch.recv(fd, HandshakeBufSize, flags = {})
+        var data: string
+        try:
+          data = await asyncdispatch.recv(fd, HandshakeBufSize, flags = {})
+        except CancelledError as e:
+          raise e
+        except CatchableError as e:
+          raise
+            newException(PgConnectionError, "TLS handshake: recv failed: " & e.msg, e)
         if data.len == 0:
           raise
             newException(PgConnectionError, "TLS handshake: connection closed by peer")
+        # The recv above suspended, so anything on the queue now may be another
+        # connection's; drop it so a BIO_write failure reports its own error.
+        ErrClearError()
         let wrote = bioWrite(rbio, cast[cstring](unsafeAddr data[0]), data.len.cint)
         if wrote <= 0:
           raise newException(
             PgConnectionError, formatSslError("TLS handshake: BIO_write failed")
           )
       of SSL_ERROR_WANT_WRITE:
-        # Nothing to do: pending output was flushed above. Loop and retry.
-        discard
+        # With nothing flushed above, the next call sees identical state: fail
+        # instead of spinning the loop with no suspension point.
+        if pending <= 0:
+          raise newException(
+            PgConnectionError,
+            "TLS handshake: SSL_ERROR_WANT_WRITE with no output" & sslErrorText(errCode),
+          )
       else:
         raise newException(
           PgConnectionError,
-          formatSslError("TLS handshake failed (SSL_get_error=" & $err & ")"),
+          "TLS handshake failed (SSL_get_error=" & $err & ")" & sslErrorText(errCode),
         )
 
   proc getSelectedAlpnOpenssl(ssl: SslPtr): string =
@@ -225,11 +258,7 @@ when hasAsyncDispatch and defined(ssl):
     copyMem(addr result[0], protoPtr, protoLen.int)
 
   proc enforceVerifyFullIdentity(sslHandle: SslPtr, host: string) =
-    ## Make OpenSSL match the peer certificate against `host` during the deferred
-    ## handshake (iPAddress SANs for an IP literal, DNS name otherwise), so
-    ## verify-full fails closed on a mismatched but CA-trusted cert. Raises if the
-    ## identity cannot be installed, so it never silently degrades to chain-only.
-    ## IP literals are normalized first (`set1_ip_asc` only accepts bare IPs).
+    ## Enforce cert identity check for verify-full. Raises if not installable.
     let ipHost = normalizeIpLiteralHost(host)
     let ok =
       if isIpAddress(ipHost):
@@ -261,14 +290,12 @@ when hasAsyncDispatch and defined(ssl):
           host,
       )
 
-proc validateDirectSslCompatible*(config: ConnConfig) {.raises: [PgConnectionError].} =
-  ## Reject `sslnegotiation=direct` under a weak `sslmode`. Direct SSL skips
-  ## the SSLRequest probe so it has no plaintext fall-back path (libpq parity).
-  ## Idempotent — safe to call from any layer.
+proc validateDirectSslCompatible*(config: ConnConfig) {.raises: [PgConfigError].} =
+  ## Reject ``sslnegotiation=direct`` with weak ``sslmode``.
   if config.sslNegotiation == sslnDirect and
       config.sslMode notin {sslRequire, sslVerifyCa, sslVerifyFull}:
     raise newException(
-      PgConnectionError,
+      PgConfigError,
       "sslnegotiation=direct requires sslmode=require, verify-ca, or verify-full",
     )
 
@@ -290,10 +317,7 @@ when hasTls:
       )
 
 proc sniName*(sslHost: string, sslSni: bool): string =
-  ## Value for the TLS SNI extension. Empty means "do not send SNI".
-  ## Matches libpq: SNI is on by default and suppressed for IP literals
-  ## (RFC 6066 §3 forbids IPs in server_name) and when the host name is
-  ## unknown (hostaddr-only).
+  ## SNI value. Empty = no SNI (IP literal or no host).
   if not sslSni:
     return ""
   if sslHost.len == 0:
@@ -303,11 +327,7 @@ proc sniName*(sslHost: string, sslSni: bool): string =
   sslHost
 
 proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
-  ## Run the TLS handshake and wire up the encrypted reader/writer. Under
-  ## `sslnegotiation=direct` (PG17+) the "postgresql" ALPN selection is
-  ## enforced. `config` is the source of truth for every TLS parameter — do
-  ## not read `conn.config` here, so callers can rewrite it (e.g. sslAllow)
-  ## without silently downgrading the handshake.
+  ## TLS handshake and reader/writer wiring. ``config`` is TLS source of truth.
 
   when hasChronos:
     let direct = config.sslNegotiation == sslnDirect
@@ -315,7 +335,8 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     conn.baseWriter = newAsyncStreamWriter(conn.transport)
 
     # BearSSL matches only dNSName SAN; reject IP-literal hosts up front
-    # (asyncdispatch handles them via set1_ip_asc).
+    # (asyncdispatch handles them via set1_ip_asc). Per host entry, not the
+    # shared config: another entry may verify fine, so it folds per host.
     if config.sslMode == sslVerifyFull and isIpLiteralHost(sslHost):
       raise newException(
         PgConnectionError,
@@ -342,6 +363,16 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         sslHost
       else:
         sniName(sslHost, config.sslSni)
+    # BearSSL copies serverName into a fixed 256-byte buffer, so a longer name
+    # fails br_ssl_client_reset. Per host entry, not the shared config: it folds
+    # like the IP-literal rejection above.
+    if TLSFlags.NoVerifyServerName notin flags and serverName.len >= 256:
+      raise newException(
+        PgConnectionError,
+        "host name (" & $serverName.len &
+          " bytes) exceeds the 255-byte limit of the chronos/BearSSL backend",
+      )
+
     # newTLSClientAsyncStream stores these on TLSAsyncStream
     # (clientCertificate/clientPrivateKey) so BearSSL keeps a valid reference
     # for the lifetime of conn.tlsStream — no extra retention on PgConnection
@@ -353,9 +384,10 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         clientCert = TLSCertificate.init(config.sslCert)
         clientKey = TLSPrivateKey.init(config.sslKey)
       except TLSStreamProtocolError as e:
-        raise newException(
-          PgConnectionError, "Failed to load client certificate/key: " & e.msg
-        )
+        # Config-supplied PEM that will not decode is a config fault, same call
+        # as `parseTrustAnchors`.
+        raise
+          newException(PgConfigError, "Failed to load client certificate/key: " & e.msg)
 
     # Advertise ALPN on every TLS connection (libpq 17 parity: SSL_set_alpn_protos
     # is called unconditionally); enforcement stays direct-only below.
@@ -392,12 +424,22 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     except TLSStreamInitError as e:
       # Covers cert/key decode failures newTLSClientAsyncStream performs itself
       # (e.g. getSignerAlgo), which the TLSCertificate.init wrapping above misses.
-      raise
-        newException(PgConnectionError, "Failed to initialise TLS stream: " & e.msg, e)
+      # With no client cert in play there is no config-supplied input left to
+      # blame, so it stays a per-connection fault instead of latching the pool.
+      if clientCert.isNil:
+        raise newException(
+          PgConnectionError, "Failed to initialise TLS stream: " & e.msg, e
+        )
+      raise newException(PgConfigError, "Failed to initialise TLS stream: " & e.msg, e)
     installX509Capture(
       conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
     )
-    await conn.tlsStream.handshake()
+    try:
+      await conn.tlsStream.handshake()
+    except AsyncStreamError as e:
+      # Folded like the asyncdispatch backend's transport errors, so no
+      # backend-specific exception leaks out of the PgError contract.
+      raise newException(PgConnectionError, "TLS handshake failed: " & e.msg, e)
     if direct:
       assertAlpnPostgres(conn.tlsStream.getSelectedAlpnProtocol())
     conn.reader = conn.tlsStream.reader
@@ -501,10 +543,10 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
               raise
                 newException(IOError, "Client certificate and private key do not match")
         except CatchableError as e:
+          # Every input here comes from the config, so a load failure is a
+          # config fault, matching the chronos backend.
           raise newException(
-            PgConnectionError,
-            "Failed to load client certificate/key or CA: " & e.msg,
-            e,
+            PgConfigError, "Failed to load client certificate/key or CA: " & e.msg, e
           )
 
         # newContext has now copied the PEM bytes into the SslContext (OpenSSL
@@ -578,31 +620,28 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         newException(PgConnectionError, "SSL support requires compiling with -d:ssl")
 
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
-  ## Negotiate TLS. `sslnegotiation=postgres` (default) sends an SSLRequest first;
-  ## `sslnegotiation=direct` starts TLS immediately (PostgreSQL 17+). `sslHost`
-  ## is the name matched against the server certificate (libpq semantics: the
-  ## entry's `host`, never `hostaddr`).
+  ## Negotiate TLS (SSLRequest or Direct). ``sslHost`` is cert verification name.
   # Defensive: connectToHost / perform already validate, but this proc is
   # exported and may be called directly; the checks are idempotent.
   # `validateClientCertConfig` also runs at the connect-time chokepoint in
   # `wrapped()` (lifecycle.nim), but is re-invoked here so direct callers of
   # `negotiateSSL` cannot bypass the mTLS pairing check — otherwise chronos
-  # would silently drop a lone `sslCert` while asyncdispatch errors out.
-  try:
-    validateClientCertConfig(config)
-  except PgError as e:
-    raise newException(PgConnectionError, e.msg, e)
+  # would silently drop a lone `sslCert` while asyncdispatch errors out. Its
+  # `PgConfigError` is left as is, so a direct caller sees the type `connect`
+  # raises.
+  validateClientCertConfig(config)
   validateDirectSslCompatible(config)
   if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:
     # Both backends silently fall back to a Web PKI store (chronos:
     # MozillaTrustAnchors, std/net: OS CA bundle) — for verify-ca that also
     # skips hostname checks, so any publicly-issued cert MITMs. Fail closed.
     raise newException(
-      PgConnectionError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
+      PgConfigError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
     )
   if config.sslMode == sslVerifyFull and sslHost.len == 0:
     # hostaddr without host: there is no name to match the certificate
-    # against (libpq raises the same way).
+    # against (libpq raises the same way). Per host entry, not the shared
+    # config, so it folds into the per-host aggregate.
     raise newException(
       PgConnectionError, "A host name must be specified for a verified SSL connection"
     )
@@ -621,7 +660,14 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     ## should not have sent before the TLS handshake (pre-TLS injection).
 
   when hasChronos:
-    discard await conn.transport.write(sslReq)
+    # Folded like every other read/write: `negotiateSSL` is exported, so a raw
+    # backend transport type must not escape the `PgError` contract here.
+    try:
+      discard await conn.transport.write(sslReq)
+    except CancelledError as e:
+      raise e
+    except CatchableError as e:
+      conn.raiseTransportFailure("negotiateSSL: SSLRequest", e)
     # Read up to two bytes so a man-in-the-middle who appended plaintext to the
     # 'S' reply (CVE-2021-23214 family) is caught even when chronos drains the
     # whole TCP segment into its own transport buffer (where a kernel-level
@@ -629,17 +675,35 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     # and then waits for our ClientHello, and `readOnce` returns as soon as any
     # data is available, so this never blocks on a second byte that will not come.
     var response: array[2, byte]
-    let n = await conn.transport.readOnce(addr response[0], 2)
+    var n: int
+    try:
+      n = await conn.transport.readOnce(addr response[0], 2)
+    except CancelledError as e:
+      raise e
+    except CatchableError as e:
+      conn.raiseTransportFailure("negotiateSSL: SSL response", e)
     if n == 0:
       raise newException(PgConnectionError, "Connection closed during SSL negotiation")
     respChar = char(response[0])
     extraBytesBuffered = n > 1
   elif hasAsyncDispatch:
-    await conn.socket.sendRawBytes(sslReq)
+    # see the chronos arm for why the exchange is folded
+    try:
+      await conn.socket.sendRawBytes(sslReq)
+    except CancelledError as e:
+      raise e
+    except CatchableError as e:
+      conn.raiseTransportFailure("negotiateSSL: SSLRequest", e)
     # The socket is unbuffered (`newAsyncSocket(buffered = false)`), so `recv(1)`
     # issues a single recv syscall for at most one byte; any injected bytes stay
     # in the kernel buffer and are caught by `socketHasPendingData` below.
-    let respStr = await conn.socket.recv(1)
+    var respStr: string
+    try:
+      respStr = await conn.socket.recv(1)
+    except CancelledError as e:
+      raise e
+    except CatchableError as e:
+      conn.raiseTransportFailure("negotiateSSL: SSL response", e)
     if respStr.len == 0:
       raise newException(PgConnectionError, "Connection closed during SSL negotiation")
     respChar = respStr[0]

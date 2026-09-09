@@ -1,19 +1,29 @@
-import std/[unittest, deques, tables, strutils, importutils]
+import std/[unittest, deques, tables, strutils, options, importutils, json]
 
 import ../async_postgres/async_backend
 when hasChronos:
   import pkg/chronos/streams/asyncstream
 
 import ../async_postgres/[pg_protocol, pg_types, pg_connection]
+import ../async_postgres/pg_types/encoding
+import ../async_postgres/pg_connection/[buffer_io, types, simple_query, lifecycle]
+import ../async_postgres/pg_connection/cache {.all.}
+import ../async_postgres/pg_connection/types {.all.}
 import ../async_postgres/pg_pool {.all.}
+import ../async_postgres/pg_client/pipeline {.all.}
+import ../async_postgres/pg_client/[core, query, exec, direct]
 
 import mock_pg_server
+
+var testTracerCloseCnt {.global.}: int
 
 privateAccess(PgPool)
 privateAccess(PgConnection)
 privateAccess(PooledConn)
 privateAccess(Waiter)
 privateAccess(PendingPoolOp)
+privateAccess(Pipeline)
+privateAccess(PipelineOp)
 
 proc mockConn(state: PgConnState = csReady, pool: PgPool = nil): PgConnection =
   result = PgConnection(
@@ -1063,7 +1073,7 @@ suite "Pool close":
   test "close awaits a conn abandoned by a handed-off waiter":
     # Regression: a handed-off waiter's acquire continuation is scheduled but
     # not yet resumed, so close()'s waiter loop can't see it. Abandoning it on a
-    # closed pool runs settleAbandonedWaiter -> release() -> closeNoWait, which
+    # closed pool runs settleAbandonedWaiter -> releaseReclaimed -> closeNoWait, which
     # used to push a Terminate task after close() had already drained. close()
     # now yields once before draining so that task is enqueued in time to await.
     proc t() {.async.} =
@@ -2967,6 +2977,121 @@ suite "FIFO fairness":
 
       waitFor t()
 
+suite "Config faults":
+  proc slowSslProbe(ms: MockServer) =
+    ## Accept one connection, answer the SSLRequest with 'S' after a delay long
+    ## enough for a second acquire to queue behind the first, then hold the
+    ## socket; the client fails while loading its CA and closes.
+    proc handler() {.async.} =
+      try:
+        let st = await ms.accept()
+        discard await readN(st, 8)
+        await sleepAsync(milliseconds(200))
+        await sendBytes(st, @[byte('S')])
+        try:
+          discard await readN(st, 8).wait(seconds(3))
+        except CatchableError:
+          discard
+        await closeClient(st)
+      except CatchableError:
+        discard
+
+    discard handler()
+
+  test "a config fault reports pekConfigFault and stops the pool dialing":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 2)
+      # sslcert without sslkey: rejected before any dial.
+      pool.config.connConfig.sslCert = "dummy"
+      var err: ref PgPoolError
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekConfigFault
+      doAssert err.parent of PgConfigError
+      doAssert pool.configFault != nil
+      doAssert pool.active == 0
+      doAssert not pool.canAttemptConnect()
+      doAssert pool.consecutiveConnectFailures == 0
+      # Even a config that now works is never dialed again: port 1 would
+      # refuse and report pekConnectFailed if it were.
+      pool.config.connConfig.sslCert = ""
+      pool.config.connConfig.port = 1
+      err = nil
+      try:
+        discard await pool.acquire()
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekConfigFault
+      await pool.close()
+
+    waitFor t()
+
+  test "a config fault mid-connect fails the queued waiter too":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      slowSslProbe(ms)
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig.host = "127.0.0.1"
+      pool.config.connConfig.port = ms.port
+      pool.config.connConfig.sslMode = sslVerifyCa
+      pool.config.connConfig.sslRootCert = "not a PEM certificate"
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.acquireTimeout = seconds(10)
+
+      let futA = pool.acquire()
+      # A is suspended on the delayed SSLRequest reply; B queues behind the
+      # single slot with nothing spawned for it (active == maxSize).
+      await sleepAsync(milliseconds(20))
+      doAssert not futA.finished
+      let futB = pool.acquire()
+      doAssert pool.waiterCount == 1
+
+      var errA, errB: ref PgPoolError
+      try:
+        discard await futA
+      except PgPoolError as e:
+        errA = e
+      let bStart = Moment.now()
+      try:
+        discard await futB
+      except PgPoolError as e:
+        errB = e
+      doAssert errA != nil
+      doAssert errA.kind == pekConfigFault
+      doAssert errB != nil
+      doAssert errB.kind == pekConfigFault
+      doAssert Moment.now() - bStart < seconds(2)
+      doAssert pool.waiterCount == 0
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "the maintenance loop stops replenishing after a config fault":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 2, minSize = 1)
+      pool.config.connConfig.sslCert = "dummy"
+      pool.config.maintenanceInterval = milliseconds(20)
+      pool.maintenanceTask = maintenanceLoop(pool)
+      await sleepAsync(milliseconds(100))
+      doAssert pool.configFault != nil
+      doAssert pool.consecutiveConnectFailures == 0
+      doAssert pool.active == 0
+      # A config that now works is never retried: port 1 would refuse and
+      # bump the backoff counter if the loop dialed it.
+      pool.config.connConfig.sslCert = ""
+      pool.config.connConfig.port = 1
+      await sleepAsync(milliseconds(100))
+      doAssert pool.consecutiveConnectFailures == 0
+      doAssert pool.active == 0
+      await pool.close()
+
+    waitFor t()
+
 suite "Error type granularity":
   test "closed pool raises PgPoolError":
     let pool = makePool()
@@ -3680,9 +3805,17 @@ suite "Pool replenish capacity race":
       pool.config.maintenanceInterval = milliseconds(10)
       pool.maintenanceTask = maintenanceLoop(pool)
 
-      await sleepAsync(milliseconds(60))
+      # Sample between replenish rounds instead of at a fixed deadline: a
+      # single sleep can land inside an in-flight round, where the
+      # reservations are still legitimately held.
+      var released = false
+      for _ in 0 ..< 200:
+        await sleepAsync(milliseconds(1))
+        if pool.consecutiveConnectFailures >= 2 and pool.active == 0:
+          released = true
+          break
 
-      doAssert pool.active == 0 # reservations released despite 2 failed connects
+      doAssert released # reservations released despite the failed connects
       doAssert pool.idle.len == 0
       doAssert pool.metrics.createCount == 0
 
@@ -4052,3 +4185,1154 @@ suite "Pool warmup parallelization":
     waitFor t()
     check ok
     check idleAfter == 2
+
+suite "Pipeline rejects unencodable SQL at add time":
+  ## Regression: SQL was only checked in `buildSendPhase`, long after the op
+  ## joined a batch, so an innocent batch-mate inherited the error.
+
+  test "addExec rejects an embedded NUL":
+    let p = newPipeline(mockConn())
+    expect PgTypeError:
+      p.addExec("SELECT 1\0", @[])
+    check p.ops.len == 0
+
+  test "addQuery rejects an embedded NUL":
+    let p = newPipeline(mockConn())
+    expect PgTypeError:
+      p.addQuery("SELECT 1\0", @[])
+    check p.ops.len == 0
+
+  test "addExec rejects an embedded NUL on the inline path":
+    let p = newPipeline(mockConn())
+    expect PgTypeError:
+      p.addExec("SELECT 1\0", [])
+    check p.ops.len == 0
+
+suite "The shared message-length bound":
+  ## Regression: `validateTypedParams` bounded each value but never their sum, so
+  ## legal parameters overflowed the Bind message and took the whole batch down.
+  ## The real payloads are not allocatable here, so the bound is pinned directly.
+
+  test "a total at the maximum is accepted":
+    var payload = int64(maxInt32Len) - 4
+    addBindPayload(payload, 4)
+    check payload == int64(maxInt32Len)
+
+  test "one byte past the maximum is rejected":
+    var payload = int64(maxInt32Len) - 4
+    expect PgMessageTooLargeError:
+      addBindPayload(payload, 5)
+
+  test "the running total is what overflows, not any single addend":
+    let half = maxInt32Len div 2
+    var payload: int64 = 0
+    expect PgMessageTooLargeError:
+      for _ in 0 .. 2:
+        addBindPayload(payload, half)
+
+  when defined(pgTestObservability):
+    test "every builder reaches the shared bound before it writes":
+      # Without the counter a builder could drop its size check unnoticed.
+      var buf: seq[byte] = @[]
+      checkMsgLenBoundCalls = 0
+      buf.addParse("s", "SELECT $1", @[23'i32])
+      check checkMsgLenBoundCalls == 1
+      buf.setLen(0)
+      checkMsgLenBoundCalls = 0
+      buf.addBind("", "s", @[1'i16], @[some(@[1'u8, 2])], @[])
+      check checkMsgLenBoundCalls == 2 # one per value, one for the message
+      let stmt = "s"
+      let sql = "SELECT $1"
+      let arg = 1'i32
+      buf.setLen(0)
+      checkMsgLenBoundCalls = 0
+      buf.addParseDirect(stmt, sql, arg)
+      check checkMsgLenBoundCalls == 1
+      buf.setLen(0)
+      checkMsgLenBoundCalls = 0
+      buf.addBindDirect("", stmt, [], arg)
+      check checkMsgLenBoundCalls == 2
+suite "Bind/Parse envelope is included in pre-flight":
+  ## The pre-flight charges the envelope, not only the payload. A real 2 GiB
+  ## payload is out of reach, so the first tests anchor the calc procs against
+  ## the encoder and the rest pin where `checkMsgLenBound64` fires.
+
+  test "calcBindMessageLength equals the length the encoder writes":
+    var buf: seq[byte] = @[]
+    let payload = @[1'u8, 2, 3]
+    buf.addBind("", "s", @[1'i16], @[some(payload)], @[0'i16])
+    check int64(decodeInt32(buf, 1)) ==
+      calcBindMessageLength(0, "s".len, 1, 1, int64(payload.len), 1)
+
+  test "calcParseMessageLength equals the length the encoder writes":
+    var buf: seq[byte] = @[]
+    let sql = "SELECT $1"
+    buf.addParse("st", sql, @[23'i32])
+    check int64(decodeInt32(buf, 1)) == calcParseMessageLength("st".len, sql.len, 1)
+
+  test "Bind envelope: payload at limit is accepted":
+    let payload =
+      int64(maxInt32Len) - calcBindMessageLength(0, generatedStmtNameLen, 1, 1, 0, 1)
+    checkMsgLenBound64(
+      calcBindMessageLength(0, generatedStmtNameLen, 1, 1, payload, 1), "Bind message"
+    )
+
+  test "Bind envelope: one byte past limit is rejected as PgMessageTooLargeError":
+    let payload =
+      int64(maxInt32Len) - calcBindMessageLength(0, generatedStmtNameLen, 1, 1, 0, 1)
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcBindMessageLength(0, generatedStmtNameLen, 1, 1, payload + 1, 1),
+        "Bind message",
+      )
+
+  test "Bind envelope: multi-param overhead scales with n":
+    let payload =
+      int64(maxInt32Len) - calcBindMessageLength(0, generatedStmtNameLen, 10, 10, 0, 1)
+    checkMsgLenBound64(
+      calcBindMessageLength(0, generatedStmtNameLen, 10, 10, payload, 1), "Bind message"
+    )
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcBindMessageLength(0, generatedStmtNameLen, 10, 10, payload + 1, 1),
+        "Bind message",
+      )
+
+  test "Parse envelope: sql at limit is accepted":
+    let sqlLen = maxInt32Len - int(calcParseMessageLength(generatedStmtNameLen, 0, 1))
+    checkMsgLenBound64(
+      calcParseMessageLength(generatedStmtNameLen, sqlLen, 1), "Parse message"
+    )
+
+  test "Parse envelope: sql one byte past limit is rejected":
+    let sqlLen = maxInt32Len - int(calcParseMessageLength(generatedStmtNameLen, 0, 1))
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcParseMessageLength(generatedStmtNameLen, sqlLen + 1, 1), "Parse message"
+      )
+
+  when defined(pgTestObservability):
+    test "the pre-flight callers reach that formula":
+      # Ties the entry points to the formula pinned above. Small inputs cannot
+      # trip the bound, so reachability is observed through the call counter.
+      let typedOne = @[toPgParam(1'i32)]
+      let inlineOne = @[toPgParamInline(1'i32)]
+      checkMsgLenBoundCalls = 0
+      validateParseMsg("SELECT $1", 1)
+      check checkMsgLenBoundCalls == 1
+      validateTypedParams(typedOne, 1)
+      check checkMsgLenBoundCalls == 3
+      discard flattenInline(inlineOne, 1)
+      check checkMsgLenBoundCalls == 6
+
+suite "Envelope overhead matches actual encoder output":
+  ## The overhead constants are hand-derived from the encoder layout; pin them
+  ## to real output so the boundary tests below are not tautological.
+
+  test "Parse overhead is accurate":
+    var buf: seq[byte] = @[]
+    let stmt = "myStmt"
+    let sql = "SELECT $1"
+    let oids = @[23'i32, 23'i32]
+    buf.addParse(stmt, sql, oids)
+    check buf.len == 9 + stmt.len + sql.len + oids.len * 4
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "Bind overhead is accurate":
+    var buf: seq[byte] = @[]
+    let portal = ""
+    let stmt = "s"
+    let pf = @[int16(1)]
+    let payload = @[1'u8, 2, 3]
+    let rf = @[int16(0)]
+    buf.addBind(portal, stmt, pf, @[some(payload)], rf)
+    let expected =
+      13 + portal.len + stmt.len + pf.len * 2 + 4 + payload.len + rf.len * 2
+    check buf.len == expected
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "the direct macros emit what the generic builders emit":
+    # The macros hand-roll the layout the `add*` builders own, so pin the two
+    # together: a pre-flight that miscounts shows up as a length mismatch.
+    let stmt = "s"
+    let sql = "SELECT $1"
+    let arg = 7'i32
+    var direct: seq[byte] = @[]
+    var generic: seq[byte] = @[]
+    direct.addParseDirect(stmt, sql, arg)
+    generic.addParse(stmt, sql, @[paramOidOf(arg)])
+    check direct == generic
+    direct.setLen(0)
+    generic.setLen(0)
+    direct.addBindDirect("", stmt, [], arg)
+    generic.addBind("", stmt, @[1'i16], @[some(@[0'u8, 0, 0, 7])], @[])
+    check direct == generic
+
+  test "Describe/Execute/Close overhead is accurate":
+    var buf: seq[byte] = @[]
+    buf.addDescribe(dkStatement, "myStmt")
+    check buf.len == 7 + "myStmt".len
+    buf.setLen(0)
+    buf.addExecute("myPortal", 0)
+    check buf.len == 10 + "myPortal".len
+    buf.setLen(0)
+    buf.addClose(dkStatement, "myStmt")
+    check buf.len == 7 + "myStmt".len
+
+suite "Message builders are atomic on failure":
+  test "addParse leaves buffer unchanged on NUL":
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    expect PgTypeError:
+      buf.addParse("stmt\0", "SELECT 1")
+    check buf == orig
+    expect PgTypeError:
+      buf.addParse("stmt", "SELECT 1\0")
+    check buf == orig
+
+  test "addParse/addBind leave buffer unchanged on count overflow":
+    var buf: seq[byte] = @[1'u8]
+    let orig = buf
+    expect PgTypeError:
+      buf.addParse("s", "SELECT 1", newSeq[int32](maxInt16Count + 1))
+    check buf == orig
+    expect PgTypeError:
+      buf.addBind("", "s", newSeq[int16](maxInt16Count + 1), @[], @[])
+    check buf == orig
+
+  test "addParseDirect/addBindDirect leave buffer unchanged on NUL":
+    # The macros cannot use `withAtomicMessage` (its `try` would be spliced into
+    # the caller's async body), so they pre-flight before the first write.
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    let stmt = "stmt"
+    let badSql = "SELECT 1\0"
+    let badName = "s\0"
+    let arg = 1'i32
+    expect PgTypeError:
+      buf.addParseDirect(stmt, badSql, arg)
+    check buf == orig
+    expect PgTypeError:
+      buf.addParseDirect(badName, "SELECT 1", arg)
+    check buf == orig
+    expect PgTypeError:
+      buf.addBindDirect(badName, stmt, [], arg)
+    check buf == orig
+    expect PgTypeError:
+      buf.addBindDirect("", badName, [], arg)
+    check buf == orig
+
+  test "addBindRaw leaves buffer unchanged on invalid range":
+    var buf: seq[byte] = @[1'u8, 2]
+    let orig = buf
+    expect PgTypeError:
+      buf.addBindRaw("", "s", @[], @[], @[(off: int32(0), len: int32(-2))], @[])
+    check buf == orig
+
+  test "helper size check does not touch buffer (builder's size pre-flight uses same calc)":
+    # Size overflow through the builders needs a 2 GiB payload, so exercise the
+    # helpers directly; the NUL/count tests above cover the rollback itself.
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcParseMessageLength("a".len, "b".len, 0) + int64(maxInt32Len) - 10 + 1,
+        "Parse message",
+      )
+    check buf == orig
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcBindMessageLength(0, 1, 1, 1, 3, 1) + int64(maxInt32Len) - 24 + 1,
+        "Bind message",
+      )
+    check buf == orig
+    check calcParseMessageLength("a".len, "b".len, 0) == 10 # 8+1+1+0
+    check calcBindMessageLength(0, 1, 1, 1, 3, 1) == 24 # 12+0+1+2+4+3+2 length
+
+  test "helper Bind size check does not touch buffer":
+    var buf: seq[byte] = @[1'u8, 2]
+    let orig = buf
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    check buf == orig
+
+suite "Direct message builders are atomic on failure":
+  ## Atomic for everything the pre-flight rejects. The write phase cannot roll
+  ## back (a `try` in the caller's `async` body trips `orc`), so a failed build
+  ## is kept off the wire by the send buffer's lifecycle, pinned below.
+
+  test "a failed build leaves nothing for the next operation to send":
+    # Every failure the macros can raise comes out of the pre-flight, before the
+    # first byte is written, so there is no residue for the caller's truncation
+    # to hide: the next build must produce clean bytes without one.
+    var sendBuf: seq[byte] = @[]
+    expect PgTypeError:
+      sendBuf.addBindDirect("", "stmt\0", [], 1'i32)
+    check sendBuf.len == 0
+    sendBuf.addBindDirect("", "stmt", [], 1'i32)
+    var expected: seq[byte] = @[]
+    expected.addBindDirect("", "stmt", [], 1'i32)
+    check sendBuf == expected
+
+  test "addBindDirect leaves buffer unchanged on resultFormat count overflow":
+    var buf: seq[byte] = @[1'u8, 2, 3]
+    let orig = buf
+    let bigRf = newSeq[int16](maxInt16Count + 1)
+    expect PgTypeError:
+      buf.addBindDirect("", "stmt", bigRf, 1'i32)
+    check buf == orig
+
+suite "Direct builders agree with their pre-flight length":
+  ## `patchMsgLenAtomic` is the only rollback left, so the pre-flight length
+  ## must match what is written; drift would truncate a message on the wire.
+
+  test "addParseDirect matches calcParseMessageLength":
+    var buf: seq[byte] = @[]
+    buf.addParseDirect("myStmt", "SELECT $1, $2", 1'i32, "x")
+    check int64(buf.len - 1) ==
+      calcParseMessageLength("myStmt".len, "SELECT $1, $2".len, 2)
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "addBindDirect matches calcBindMessageLength":
+    var buf: seq[byte] = @[]
+    let rf = @[0'i16]
+    buf.addBindDirect("p", "s", rf, 1'i32, "abc")
+    let payload = int64(paramValueLen(1'i32)) + int64(paramValueLen("abc"))
+    check int64(buf.len - 1) ==
+      calcBindMessageLength("p".len, "s".len, 2, 2, payload, rf.len)
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "addBindDirect with no resultFormats matches":
+    var buf: seq[byte] = @[]
+    buf.addBindDirect("", "s", [], 42'i64)
+    check int64(buf.len - 1) ==
+      calcBindMessageLength(0, "s".len, 1, 1, int64(paramValueLen(42'i64)), 0)
+    check decodeInt32(buf, 1) == int32(buf.len - 1)
+
+  test "clearStmtCache abandons the staged Closes with the queued ones":
+    # The caller resets the session externally, so neither the queue nor what a
+    # build already took out of it is owed any more.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1", "_sc_2"]
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    check conn.stagedStmtCloses == @["_sc_1", "_sc_2"]
+    conn.clearStmtCache()
+    check conn.stagedStmtCloses.len == 0
+    conn.pendingStmtCloses = @["_sc_9"]
+    conn.dropStagedStmtCloses()
+    check conn.pendingStmtCloses == @["_sc_9"]
+
+  test "an aborted build's staged Closes are staged again by the next one":
+    # Staging moves the names out of the queue, so what makes a failed build
+    # safe is the next build taking them back rather than the queue being left
+    # alone.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    var aborted: seq[byte] = @[]
+    conn.stagePendingStmtCloses(aborted)
+    check conn.pendingStmtCloses.len == 0
+    conn.pendingStmtCloses.add "_sc_2" # queued while the build was in flight
+    var next: seq[byte] = @[]
+    conn.stagePendingStmtCloses(next)
+    check conn.stagedStmtCloses == @["_sc_1", "_sc_2"]
+    var expected = aborted
+    expected.addClose(dkStatement, "_sc_2")
+    check next == expected
+    conn.dropStagedStmtCloses()
+    check conn.stagedStmtCloses.len == 0
+    check conn.pendingStmtCloses.len == 0
+
+suite "An oversized message is an input error, not a connection failure":
+  ## The pre-flight is not a second model of the layout: the contract is fixed
+  ## in the encoder, where `patchMsgLen`/`patchLen` raise `PgMessageTooLargeError`.
+
+  test "PgMessageTooLargeError is an input error":
+    check PgMessageTooLargeError is PgTypeError
+    check PgMessageTooLargeError is PgError
+
+  test "the pre-flight raises the same type the encoder does":
+    # `patchMsgLen`'s own branch needs a >2 GiB buffer, so pin the two the
+    # ordinary path goes through instead — the pre-flight bound:
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    # And the running payload accumulator both Bind builders share:
+    var payload = int64(maxInt32Len)
+    expect PgMessageTooLargeError:
+      addBindPayload(payload, 1)
+
+  test "it is deliberately not a connection failure":
+    # A reconnect-on-failure loop must not re-dial a live connection over a
+    # caller-sized argument.
+    var caught = false
+    try:
+      raise newException(PgMessageTooLargeError, "too large")
+    except PgConnectionError:
+      check false
+    except PgTypeError:
+      caught = true
+    check caught
+
+  test "an over-count parameter list still reports the count":
+    # Exact and model-free, so this stays an add-time check.
+    try:
+      validateExtendedQuery("SELECT 1", maxInt16Count + 1)
+      check false
+    except PgTypeError as e:
+      check "count" in e.msg
+
+  test "an ordinary statement is accepted":
+    validateExtendedQuery("SELECT $1, $2", 2)
+
+  test "the Parse is sized from the OIDs, not from the bind values":
+    # The encoded-params entry points take values and OIDs as separate seqs, so
+    # a longer OID list must not slip past a pre-flight sized from the values.
+    try:
+      validateExtendedQuery("SELECT 1", 1, maxInt16Count + 1)
+      check false
+    except PgTypeError as e:
+      check "Parse parameter-type" in e.msg
+suite "queryDirect stages its queued statement Closes onto the wire":
+  ## Regression: the stage ran *before* the dispatch's own `sendBuf.setLen(0)`,
+  ## so the Close bytes were truncated back out and the queue was then cleared
+  ## after the send — the named statements leaked in the backend for good.
+
+  test "a queued Close reaches the server and only then leaves the queue":
+    var sawClose = false
+    var queueDrained = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc: MockClient
+
+      proc serverHandler() {.async.} =
+        sc = await acceptAndReady(ms)
+        # Close, Parse, Describe, Bind, Execute, Sync — read until Sync.
+        while true:
+          let (msgType, body) = await drainFrontendMessage(sc)
+          if msgType == 'C' and body.len > 1 and char(body[0]) == 'S':
+            sawClose = true
+          if msgType == 'S':
+            break
+        await sendBytes(
+          sc,
+          buildBackendMsg('1', []) & buildBackendMsg('n', []) & buildBackendMsg('2', []) &
+            buildCommandComplete("SELECT 0") & buildReadyForQuery('I'),
+        )
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.pendingStmtCloses = @["_sc_9"]
+      discard await conn.queryDirect("SELECT $1", 1'i32)
+      queueDrained = conn.pendingStmtCloses.len == 0
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      if not sc.isNil:
+        try:
+          await closeClient(sc)
+        except CatchableError:
+          discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check sawClose
+    check queueDrained
+
+  test "a queued Close staged after the send survives the drop":
+    # `dropStagedStmtCloses` clears only the prefix whose Close is on the wire.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    conn.pendingStmtCloses.add "_sc_2" # queued after staging, no Close emitted
+    conn.dropStagedStmtCloses()
+    check conn.pendingStmtCloses == @["_sc_2"]
+
+suite "A pipeline's message bounds are charged per op, not per batch":
+  test "a per-op Bind bound does not charge the whole pipeline's inline buffer":
+    # Each op emits its own Bind referencing only its slice, so a batch in which
+    # every single Bind is legal must be accepted.
+    privateAccess(Pipeline)
+    let p = newPipeline(nil)
+    p.addExec("INSERT", [toPgParamInline("abc")])
+    p.addExec("INSERT", [toPgParamInline("def")])
+    check p.ops.len == 2
+    check p.inlineData.len == 6
+
+suite "The non-pipelined exec/query path pre-flights like the pipeline does":
+  ## Regression: without add-time validation an input-size error left the
+  ## encoder as a `PgProtocolError`, sending reconnect loops after a live conn.
+
+  test "an over-count parameter list is a PgTypeError, not a connection error":
+    let conn = mockConn()
+    let params = newSeq[PgParam](maxInt16Count + 1)
+    expect PgTypeError:
+      discard waitFor conn.query("SELECT 1", params)
+    # Rejected before anything reached the wire.
+    check conn.state == csReady
+
+  test "exec rejects an embedded NUL the same way":
+    let conn = mockConn()
+    expect PgTypeError:
+      discard waitFor conn.exec("SELECT 1\0", newSeq[PgParam]())
+    check conn.state == csReady
+
+  test "oversized payload pre-flight is PgTypeError and not a connection failure":
+    var payload = int64(maxInt32Len) - 4
+    expect PgMessageTooLargeError:
+      addBindPayload(payload, 5)
+    var caught = false
+    try:
+      payload = int64(maxInt32Len) - 4
+      addBindPayload(payload, 5)
+    except PgConnectionError:
+      check false
+    except PgTypeError:
+      caught = true
+    check caught
+    # Verify a fresh connection remains usable after the helper failure
+    let conn = mockConn()
+    check conn.state == csReady
+    expect PgTypeError:
+      discard waitFor conn.query("SELECT 1", newSeq[PgParam](maxInt16Count + 1))
+    check conn.state == csReady
+
+  test "CopyData oversized is PgTypeError and not a connection failure":
+    expect PgTypeError:
+      checkCopyDataLen(maxInt32Len - 3)
+    var caught = false
+    try:
+      checkCopyDataLen(maxInt32Len - 3)
+    except PgConnectionError:
+      check false
+    except PgTypeError:
+      caught = true
+    check caught
+
+  test "an aborted send-phase build still owes the statement Closes":
+    # Only the send drops them, so an encoder raise needs no restore at all —
+    # the names are held staged and the next build takes them back.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1", "_sc_2"]
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    check buf.len > 0 # the Closes really were emitted
+    check conn.stagedStmtCloses == @["_sc_1", "_sc_2"]
+
+  test "an evicted statement outlives the build that staged it":
+    # The cache no longer remembers the name, so nothing else would hold it
+    # until the send goes through.
+    let conn = mockConn()
+    var buf: seq[byte] = @[]
+    conn.stagePendingStmtCloses(buf)
+    conn.stageEvictedClose(buf, "_sc_7")
+    check conn.stagedStmtCloses == @["_sc_7"]
+    var next: seq[byte] = @[]
+    conn.stagePendingStmtCloses(next) # the build aborted; the next one takes it
+    check conn.stagedStmtCloses == @["_sc_7"]
+    conn.dropStagedStmtCloses()
+    check conn.stagedStmtCloses.len == 0
+    check conn.pendingStmtCloses.len == 0
+
+  test "evictForInsert stages the eviction Close into the caller's buffer":
+    # evictForInsert once hardcoded conn.sendBuf while its siblings take the
+    # build buffer: a caller assembling a local batch would have landed the
+    # Close bytes in the unsent conn.sendBuf while the staged accounting
+    # advanced — leaking the evicted statement server-side.
+    let conn = mockConn()
+    conn.stmtCacheCapacity = 1
+    conn.addStmtCache("SELECT 1", CachedStmt(name: "_sc_1"))
+    var batch: seq[byte] = @[]
+    conn.stagePendingStmtCloses(batch)
+    conn.sendBuf.setLen(0)
+    conn.evictForInsert(batch)
+    check conn.stagedStmtCloses == @["_sc_1"]
+    var expected: seq[byte] = @[]
+    expected.addClose(dkStatement, "_sc_1")
+    check batch == expected
+    check conn.sendBuf.len == 0
+
+suite "The Bind pre-flight runs before pendingStmtCloses is drained":
+  ## Regression: with only the Parse envelope pre-flighted, a rejected Bind ran
+  ## after the queued `Close` messages were drained into a discarded buffer.
+
+  test "an over-count parameter-format list is rejected before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.queryImpl(
+        "SELECT 1",
+        newSeq[Option[seq[byte]]](0),
+        newSeq[int32](0),
+        newSeq[int16](maxInt16Count + 1),
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "exec is rejected before the drain the same way":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.execImpl(
+        "SELECT 1",
+        newSeq[Option[seq[byte]]](0),
+        newSeq[int32](0),
+        newSeq[int16](maxInt16Count + 1),
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "an over-count result-format list is rejected before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.queryImpl(
+        "SELECT 1", newSeq[PgParam](0), newSeq[int16](maxInt16Count + 1)
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "a caller-built inline Bind is rejected before the drain":
+    # The `exec`/`query` overloads flatten and check first, but the `*Impl`
+    # procs are public and take ranges that never went through `flattenInline`.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    let data = @[1'u8, 2, 3]
+    let badRanges = @[(off: 0'i32, len: 8'i32)] # past the end of `data`
+    expect PgTypeError:
+      discard
+        waitFor conn.execInlineImpl("SELECT $1", data, badRanges, @[OidInt4], @[1'i16])
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+    expect PgTypeError:
+      discard
+        waitFor conn.queryInlineImpl("SELECT $1", data, badRanges, @[OidInt4], @[1'i16])
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "a caller-built inline Parse over-counts its OIDs before the drain":
+    # The OID seq sizes the Parse independently of the Bind ranges, so a count
+    # the Parse encoder rejects can hide behind a small, valid Bind.
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    let badOids = newSeq[int32](maxInt16Count + 1)
+    expect PgTypeError:
+      discard waitFor conn.execInlineImpl(
+        "SELECT 1", newSeq[byte](0), @[], badOids, newSeq[int16](0)
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+    expect PgTypeError:
+      discard waitFor conn.queryInlineImpl(
+        "SELECT 1", newSeq[byte](0), @[], badOids, newSeq[int16](0)
+      )
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+suite "The direct macros pre-flight before pendingStmtCloses is drained":
+  ## Same regression as the suite above, on the zero-alloc path: the checks in
+  ## `addParseDirect`/`addBindDirect` run after the dispatch drained the queue.
+
+  test "execDirect rejects a NUL in SQL before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.execDirect("SELECT 1\0")
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  test "queryDirect rejects a NUL in SQL before the drain":
+    let conn = mockConn()
+    conn.pendingStmtCloses = @["_sc_1"]
+    expect PgTypeError:
+      discard waitFor conn.queryDirect("SELECT $1\0", 1'i32)
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.state == csReady
+
+  when hasChronos and defined(pgTestObservability):
+    test "the hoisted pre-flight reaches both envelope bounds":
+      # Small inputs cannot trip a bound, so reachability is observed through
+      # the counter: 3 hoisted checks, the same 3 inside
+      # `addParseDirect`/`addBindDirect`, plus `addExecute`'s own.
+      let conn = mockConn()
+      conn.writer = defectWriter()
+      checkMsgLenBoundCalls = 0
+      expect Defect:
+        discard waitFor conn.execDirect("SELECT $1", 1'i32)
+      check checkMsgLenBoundCalls == 7
+
+suite "executeBatch releases connection when every op fails validation":
+  test "all ops rejected as PgTypeError still releases pool slot":
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    let fut1 = newFuture[CommandResult]("test1")
+    let fut2 = newFuture[CommandResult]("test2")
+    let batch = @[
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: fut1, timeout: ZeroDuration
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: fut2, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check fut1.failed
+    check fut2.failed
+    check fut1.readError of PgTypeError
+    check fut2.readError of PgTypeError
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.idle.len == 1
+
+  test "partial batch failure still releases pool slot":
+    # Both ops fail validation (NUL, over-count) before any pipeline is built,
+    # so no transport is needed. The mixed queued/rejected path needs a live
+    # transport and is covered under e2e.
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    let futOk = newFuture[CommandResult]("ok")
+    let futBad = newFuture[CommandResult]("bad")
+    let bigParams = newSeq[PgParam](maxInt16Count + 1)
+    let batch = @[
+      PendingPoolOp(
+        kind: popExec,
+        sql: "SELECT 1",
+        params: bigParams,
+        execFut: futOk,
+        timeout: ZeroDuration,
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: futBad, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check futBad.failed
+    check futBad.readError of PgTypeError
+    check futOk.failed
+    check futOk.readError of PgTypeError
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.idle.len == 1
+    check pool.size == 1
+
+  test "mixed popQuery and popExec all rejected still releases":
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    let futQ = newFuture[QueryResult]("q")
+    let futE = newFuture[CommandResult]("e")
+    let batch = @[
+      PendingPoolOp(
+        kind: popQuery, sql: "SELECT 1\0", queryFut: futQ, timeout: ZeroDuration
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: futE, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check futQ.failed
+    check futE.failed
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.idle.len == 1
+
+suite "executeBatch handles transport errors and still releases":
+  test "pipeline error still releases pool slot":
+    # A queued op reaches `sendBufMsg`, which a mock without a transport would
+    # segfault on under chronos — hence `defectWriter`. The write then raises a
+    # Defect (chronos) or a socket CatchableError (asyncdispatch); either way
+    # the `finally` must release the slot.
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    when hasChronos:
+      conn.writer = defectWriter()
+    let fut = newFuture[CommandResult]("transport")
+    let batch = @[
+      PendingPoolOp(kind: popExec, sql: "SELECT 1", execFut: fut, timeout: ZeroDuration)
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check fut.failed
+    check not (fut.readError of PgTypeError)
+    # The failure is either a wrapped Defect or a transport CatchableError;
+    # the important property is that the pool slot is not leaked.
+    check not conn.borrowed
+    check pool.active == 0
+    check fut.readError != nil
+    # resetSessionAndRelease may have closed the conn (transport failure) or
+    # returned it to idle; either way the pool must not retain a borrowed slot.
+    check pool.size == 0 or pool.idle.len == 1
+
+  test "mixed queued and rejected with transport failure isolates errors and releases":
+    # One op is queued, one is rejected at add time, and the queued op's
+    # pipeline then fails on transport: `ir` is indexed by `queued` while the
+    # error arms walk `batch`, and the `finally` must still release.
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.ownerPool = pool
+    conn.borrowed = true
+    conn.state = csReady
+    conn.txStatus = tsIdle
+    when hasChronos:
+      conn.writer = defectWriter()
+    let futOk = newFuture[CommandResult]("ok")
+    let futBad = newFuture[CommandResult]("bad")
+    let batch = @[
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1", execFut: futOk, timeout: ZeroDuration
+      ),
+      PendingPoolOp(
+        kind: popExec, sql: "SELECT 1\0", execFut: futBad, timeout: ZeroDuration
+      ),
+    ]
+    waitFor pool.executeBatch(conn, batch)
+    check futBad.failed
+    check futBad.readError of PgTypeError
+    check futOk.failed
+    check not (futOk.readError of PgTypeError)
+    check futOk.readError != nil
+    check not conn.borrowed
+    check pool.active == 0
+    check pool.size == 0 or pool.idle.len == 1
+
+suite "executeBatch reports close errors to tracer":
+  test "resetSession failure is routed to onPoolCloseError and does not mask batch errors":
+    when hasChronos:
+      testTracerCloseCnt = 0
+      let tracer = PgTracer()
+      tracer.onPoolCloseError = proc(
+          data: TracePoolCloseErrorData
+      ) {.gcsafe, raises: [].} =
+        inc testTracerCloseCnt
+      let pool = makePool(maxSize = 2)
+      pool.config.tracer = tracer
+      pool.active = 1
+      let conn = mockConn(pool = pool)
+      conn.ownerPool = pool
+      conn.borrowed = true
+      conn.state = csReady
+      conn.txStatus = tsIdle
+      conn.sessionLockDirty = true
+      conn.writer = defectWriter()
+      pool.config.resetQuery = "SELECT 1"
+      let fut1 = newFuture[CommandResult]("c1")
+      let fut2 = newFuture[CommandResult]("c2")
+      let batch = @[
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut1, timeout: ZeroDuration
+        ),
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut2, timeout: ZeroDuration
+        ),
+      ]
+      waitFor pool.executeBatch(conn, batch)
+      check fut1.failed and (fut1.readError of PgTypeError)
+      check fut2.failed and (fut2.readError of PgTypeError)
+      check not conn.borrowed
+      check pool.active == 0
+      check testTracerCloseCnt == 1
+      # The batch's PgTypeError must not be masked by the close error
+      check fut1.readError of PgTypeError
+    else:
+      # asyncdispatch: resetSession swallows CatchableError, so no
+      # onPoolCloseError is expected; verify batch errors are preserved
+      # and pool slot is not leaked.
+      let pool = makePool(maxSize = 2)
+      pool.active = 1
+      let conn = mockConn(pool = pool)
+      conn.ownerPool = pool
+      conn.borrowed = true
+      conn.state = csReady
+      conn.txStatus = tsIdle
+      let fut1 = newFuture[CommandResult]("c1")
+      let fut2 = newFuture[CommandResult]("c2")
+      let batch = @[
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut1, timeout: ZeroDuration
+        ),
+        PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut2, timeout: ZeroDuration
+        ),
+      ]
+      waitFor pool.executeBatch(conn, batch)
+      check fut1.failed and (fut1.readError of PgTypeError)
+      check not conn.borrowed
+      check pool.active == 0
+
+suite "A raising close-error tracer never shadows the operation's error":
+  when hasChronos:
+    test "single-op dispatch keeps the body error when the tracer raises a Defect":
+      # `onPoolCloseError` is `raises: []`, so only a Defect can escape it and
+      # replace the error the op is about to fail with.
+      proc t() {.async.} =
+        let tracer = PgTracer()
+        tracer.onPoolCloseError = proc(
+            data: TracePoolCloseErrorData
+        ) {.gcsafe, raises: [].} =
+          raise newException(AssertionDefect, "tracer defect")
+        let pool = makePool()
+        pool.config.tracer = tracer
+        pool.config.resetQuery = "SELECT 1"
+        let conn = mockConn()
+        conn.ownerPool = pool
+        conn.writer = defectWriter()
+        conn.sessionLockDirty = true # forces unlock_all through the writer
+        pool.idle.addLast(conn.toPooled())
+
+        let fut = newFuture[CommandResult]("op")
+        let op = PendingPoolOp(
+          kind: popExec, sql: "SELECT 1\0", execFut: fut, timeout: ZeroDuration
+        )
+        await pool.dispatchHomogeneous(@[op], 1)
+
+        doAssert fut.failed
+        doAssert fut.readError of PgTypeError,
+          "the tracer's Defect must not replace the op's own error"
+
+      waitFor t()
+
+  test "reportCloseError swallows a Defect from the hook":
+    let tracer = PgTracer()
+    tracer.onPoolCloseError = proc(
+        data: TracePoolCloseErrorData
+    ) {.gcsafe, raises: [].} =
+      raise newException(AssertionDefect, "tracer defect")
+    let pool = makePool()
+    pool.config.tracer = tracer
+    pool.reportCloseError(mockConn(), newException(PgError, "close failed"))
+
+suite "Array encoder guards are catchable and do not disturb valid input":
+  ## What these guards reject needs a 2 GiB allocation, which a unit test
+  ## cannot make. So: pin that the primitives raise a catchable `PgTypeError`
+  ## (not a `Defect`, not an OOM), and drive every encoder family with valid
+  ## input so a guard cannot quietly change what it emits.
+  ##
+  ## Deliberately *not* covered: the array encoders bound one element and the
+  ## element count, but the total payload is still summed inside
+  ## `encodeBinaryArray` — after every element has been built. An array whose
+  ## elements each pass but whose sum does not is allocated in full before it
+  ## is rejected.
+
+  test "guard primitives raise a catchable PgTypeError":
+    expect PgTypeError:
+      discard dimsFor1D(int32.high.int + 1)
+    expect PgTypeError:
+      checkPgBinLen(maxInt32Len + 1, "string")
+    expect PgTypeError:
+      checkPgBinLen(maxInt32Len + 1, "bytea")
+    expect PgTypeError:
+      checkPgBinPayload(int64(int32.high) + 1, "Array")
+
+  test "binary array encoders still emit what they emitted":
+    let strs = toPgParam(@["a", "b"])
+    check strs.oid == OidTextArray
+    check strs.format == 1'i16
+    check strs.value.get ==
+      encodeBinaryArray(OidText, @[2'i32], @[some(toBytes("a")), some(toBytes("b"))])
+    check toPgParam(@[some("x"), none(string)]).value.get ==
+      encodeBinaryArray(OidText, @[2'i32], @[some(toBytes("x")), none(seq[byte])])
+    check toPgParam(newSeq[string](0)).value.get == encodeBinaryArray(OidText, @[], @[])
+    check toPgByteaArrayParam(@[@[1'u8, 2], @[3'u8]]).value.isSome
+
+  test "every guarded encoder family still round-trips a small value":
+    check toPgParam(@[parsePgNumeric("123.45")]).value.isSome
+    check toPgParam(@[PgPath(closed: true, points: @[PgPoint(x: 1, y: 2)])]).value.isSome
+    check toPgBinaryParam(@[initPgBit(3, @[0b101'u8])]).value.isSome
+    check toPgParam(@[newJInt(1), newJInt(2)]).value.isSome
+    check toPgParam(@[PgXml("a"), PgXml("b")]).value.isSome
+
+  test "hstore text encoders emit the same literal with the per-entry bound":
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["k"] = some("v")
+    check encodeHstoreText(h) == "\"k\"=>\"v\""
+    check toPgParam(h).value.get.toString == "\"k\"=>\"v\""
+    check toPgParam(newSeq[PgHstore](0)).value.get.toString == "{}"
+    check toPgParam(@[h]).value.get.toString == "{\"\\\"k\\\"=>\\\"v\\\"\"}"
+    check toPgBinaryParam(@[PgHstore()], 9999'i32, 9998'i32).value.isSome
+
+  test "writeParamValue and envelope helpers reject oversized before buffer growth":
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(
+        calcParseMessageLength(0, 0, 0) + int64(maxInt32Len) + 1, "Parse message"
+      )
+    var buf: seq[byte] = @[]
+    buf.writeParamValue("abc")
+    check buf.len > 0
+    var buf2: seq[byte] = @[]
+    buf2.writeParamValue(@[1'u8, 2, 3])
+    check buf2.len > 0
+    # Helpers must not touch buffer on failure
+    var b: seq[byte] = @[1'u8, 2, 3]
+    let orig = b
+    expect PgMessageTooLargeError:
+      checkMsgLenBound64(int64(maxInt32Len) + 1, "Bind message")
+    check b == orig
+
+suite "Library-initiated close keeps the connection-failure contract":
+  ## Regression: `close()` set `closedByUser` unconditionally, so a pool
+  ## evicting a connection (failed health check, expired `maxLifetime`) made
+  ## every later operation on that handle raise `PgStateError` — deliberately
+  ## outside `except PgConnectionError`, so reconnect-on-failure paths skipped a
+  ## failure that warrants a reconnect. Only the application's own `close()`
+  ## may claim `crClosedByUser`.
+
+  test "pool-initiated close reports PgConnectionError":
+    let conn = mockConn(csClosed)
+    waitFor conn.closeImpl(byUser = false)
+    check not conn.closedByUser
+    check conn.closedReason == crClosed
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "application close still reports PgStateError":
+    let conn = mockConn(csClosed)
+    waitFor conn.close()
+    check conn.closedByUser
+    check conn.closedReason == crClosedByUser
+    expect PgStateError:
+      conn.checkNotClosed()
+
+suite "Pool-initiated closes stay a connection failure during shutdown":
+  ## Regression: `tracedClose` read `pool.closed` to decide the close was the
+  ## application's own, so an eviction or a discarded connection during the
+  ## shutdown drain reported `PgStateError` — not a `PgConnectionError` — and
+  ## the reconnect-on-failure recovery of anything still holding the handle
+  ## silently did not fire.
+
+  test "a broken conn released after close() stays a connection failure":
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(csClosed, pool = pool)
+    conn.borrowed = true
+    pool.release(conn)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check not conn.closedByUser
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "a healthy conn released after close() is the application's close":
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    conn.borrowedByUser = true # as `acquire` leaves it
+    pool.release(conn)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check conn.closedByUser
+    expect PgStateError:
+      conn.checkNotClosed()
+
+  test "a healthy conn reclaimed from an abandoned waiter is not the application's close":
+    # Through `settleAbandonedWaiter` itself, not `releaseImpl` directly: the
+    # wiring is the thing at risk, since `release()` here reads just as natural.
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    let waiter = Waiter(fut: newFuture[PgConnection]("abandoned"))
+    waiter.fut.complete(conn)
+    pool.settleAbandonedWaiter(waiter)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check not conn.closedByUser
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "a healthy conn released by a dispatch path is not the application's close":
+    # `pool.exec`/`pool.query` run on a connection the application never held, so
+    # the borrow's attribution must not stamp `closedByUser`.
+    let pool = makePool()
+    pool.closed = true
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    conn.borrowedByUser = false # as `acquireInternal` leaves it
+    waitFor pool.resetSessionAndRelease(conn)
+    waitFor allFutures(pool.pendingBackgroundTasks)
+    check not conn.closedByUser
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "a conn the pool dialled for its own convenience method is not the user's":
+    # `pool.exec`/`pool.query` acquire internally; the application never sees
+    # the connection, so a shutdown close on it stays a connection failure.
+    var closedByUser = true
+    var stateErr = false
+
+    proc testBody() {.async.} =
+      let pool = makePool()
+      pool.closed = true
+      pool.active = 1
+      let conn = mockConn(pool = pool)
+      conn.borrowed = true
+      conn.borrowedByUser = false # as `acquireInternal` leaves it
+      var bodyFut = newFuture[void]()
+      bodyFut.complete()
+      await pool.runAndRelease(conn, bodyFut)
+      await allFutures(pool.pendingBackgroundTasks)
+      closedByUser = conn.closedByUser
+      try:
+        conn.checkNotClosed()
+      except PgStateError:
+        stateErr = true
+      except PgConnectionError:
+        discard
+
+    waitFor testBody()
+    check not closedByUser
+    check not stateErr
+
+suite "Aborted pipeline send phase keeps evicted statements closable":
+  ## Regression: an aborted build dropped a statement from the cache and wrote
+  ## its Close into the discarded buffer only. A statement the build evicted was
+  ## gone from the cache *and* owed by nothing, with its Close sitting in the
+  ## `sendBuf` the abort discards — so the backend kept it allocated until
+  ## session end.
+
+  test "a statement evicted by a failed build stays queued for Close":
+    let conn = mockConn()
+    conn.stmtCacheCapacity = 1
+    conn.addStmtCache("SELECT old", CachedStmt(name: "_sc_1"))
+    let p = newPipeline(conn)
+    # Straight into `ops`: the add-time SQL guard exists to keep an unencodable
+    # statement out of the send phase, so this state has to be built behind it.
+    p.ops.add PipelineOp(kind: pokExec, sql: "SELECT 1\0")
+
+    expect PgTypeError:
+      discard p.buildSendPhase(perOpSync = true)
+
+    check "SELECT old" notin conn.stmtCache
+    # Staged, not queued: the next build takes staged names back onto the queue.
+    check conn.stagedStmtCloses == @["_sc_1"]

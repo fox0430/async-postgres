@@ -322,7 +322,7 @@ suite "sendCopyData public API":
       let conn = await connect(mockConfig(ms.port))
       try:
         await conn.sendCopyData(@[byte('x')])
-      except PgConnectionError:
+      except PgStateError:
         {.cast(gcsafe).}:
           capturedRaised = true
       await conn.close()
@@ -577,3 +577,215 @@ suite "timelineHistory":
 
     waitFor testBody()
     check capturedRaised
+
+var capturedSlotType: string = ""
+var capturedSlotName: string = ""
+var capturedConsistentPoint: Lsn = InvalidLsn
+var capturedRestartTli: int64 = -1
+
+suite "readReplicationSlot":
+  test "parses slot_type / restart_lsn / restart_tli":
+    capturedSlotType = ""
+    capturedSlotName = ""
+    capturedConsistentPoint = InvalidLsn
+    capturedRestartTli = -1
+    capturedSql = ""
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        let q = await drainFrontendMessage(st) # READ_REPLICATION_SLOT "..."
+        if q.msgType == 'Q':
+          {.cast(gcsafe).}:
+            capturedSql = queryText(q.body)
+        var burst: seq[byte]
+        burst.add(
+          buildRowDescriptionFields(
+            @[
+              ("slot_type", 25'i32, -1'i16),
+              ("restart_lsn", 25'i32, -1'i16),
+              ("restart_tli", 20'i32, -1'i16),
+            ]
+          )
+        )
+        burst.add(buildDataRowText(["physical", "0/16B3740", "1"]))
+        burst.add(buildCommandComplete("READ_REPLICATION_SLOT"))
+        burst.add(buildReadyForQuery('I'))
+        await sendBytes(st, burst)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let info = await conn.readReplicationSlot("my_phys")
+      {.cast(gcsafe).}:
+        capturedSlotType = info.slotType
+        capturedSlotName = info.slotName
+        capturedConsistentPoint = info.consistentPoint
+        capturedRestartTli = info.restartTli
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check capturedSql == "READ_REPLICATION_SLOT \"my_phys\""
+    check capturedSlotName == "my_phys"
+    check capturedSlotType == "physical"
+    check capturedConsistentPoint == parseLsn("0/16B3740")
+    check capturedRestartTli == 1'i64
+
+  test "NULL restart_lsn / restart_tli yields InvalidLsn and 0":
+    capturedConsistentPoint = parseLsn("1/1")
+    capturedRestartTli = -1
+    capturedSlotType = ""
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st)
+        var burst: seq[byte]
+        burst.add(
+          buildRowDescriptionFields(
+            @[
+              ("slot_type", 25'i32, -1'i16),
+              ("restart_lsn", 25'i32, -1'i16),
+              ("restart_tli", 20'i32, -1'i16),
+            ]
+          )
+        )
+        burst.add(buildDataRowOpt(["physical", "", ""], [false, true, true]))
+        burst.add(buildCommandComplete("READ_REPLICATION_SLOT"))
+        burst.add(buildReadyForQuery('I'))
+        await sendBytes(st, burst)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let info = await conn.readReplicationSlot("my_phys")
+      {.cast(gcsafe).}:
+        capturedSlotType = info.slotType
+        capturedConsistentPoint = info.consistentPoint
+        capturedRestartTli = info.restartTli
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check capturedSlotType == "physical"
+    check capturedConsistentPoint == InvalidLsn
+    check capturedRestartTli == 0'i64
+
+  test "nonexistent slot (all NULLs) raises PgConnectionError":
+    capturedRaised = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st)
+        var burst: seq[byte]
+        burst.add(
+          buildRowDescriptionFields(
+            @[
+              ("slot_type", 25'i32, -1'i16),
+              ("restart_lsn", 25'i32, -1'i16),
+              ("restart_tli", 20'i32, -1'i16),
+            ]
+          )
+        )
+        burst.add(buildDataRowOpt(["", "", ""], [true, true, true]))
+        burst.add(buildCommandComplete("READ_REPLICATION_SLOT"))
+        burst.add(buildReadyForQuery('I'))
+        await sendBytes(st, burst)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      try:
+        discard await conn.readReplicationSlot("no_such_slot")
+      except PgConnectionError:
+        {.cast(gcsafe).}:
+          capturedRaised = true
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check capturedRaised
+
+  test "logical slot error propagates as PgQueryError":
+    capturedRaised = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st)
+        var burst: seq[byte]
+        burst.add(
+          buildErrorResponse(
+            "0A000",
+            "cannot use \"READ_REPLICATION_SLOT\" " &
+              "with logical replication slot \"my_logical\"",
+          )
+        )
+        burst.add(buildReadyForQuery('I'))
+        await sendBytes(st, burst)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      try:
+        discard await conn.readReplicationSlot("my_logical")
+      except PgQueryError:
+        {.cast(gcsafe).}:
+          capturedRaised = true
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check capturedRaised
+
+  test "slot name with double-quote is escaped":
+    capturedSql = ""
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        let q = await drainFrontendMessage(st)
+        if q.msgType == 'Q':
+          {.cast(gcsafe).}:
+            capturedSql = queryText(q.body)
+        var burst: seq[byte]
+        burst.add(
+          buildRowDescriptionFields(
+            @[
+              ("slot_type", 25'i32, -1'i16),
+              ("restart_lsn", 25'i32, -1'i16),
+              ("restart_tli", 20'i32, -1'i16),
+            ]
+          )
+        )
+        burst.add(buildDataRowText(["physical", "0/1", "1"]))
+        burst.add(buildCommandComplete("READ_REPLICATION_SLOT"))
+        burst.add(buildReadyForQuery('I'))
+        await sendBytes(st, burst)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      discard await conn.readReplicationSlot("a\"b")
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check capturedSql == "READ_REPLICATION_SLOT \"a\"\"b\""

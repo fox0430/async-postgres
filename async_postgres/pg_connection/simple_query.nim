@@ -1,25 +1,10 @@
-## Simple Query Protocol entry points and the cancellation helpers built
-## on top of them.
+## Simple Query Protocol: ``simpleQuery``/``simpleExec``/``ping``, ``checkReady``,
+## cancel helpers (``cancel``/``invalidateOnTimeout``), ``checkSessionAttrs``,
+## and ``quoteIdentifier``. Layer between ``buffer_io`` and ``lifecycle``.
 ##
-## Contains:
-## - `checkReady` — assertion used by every operation that requires `csReady`.
-## - `simpleQuery` / `simpleExec` / `ping` — text-mode multi-statement and
-##   single-statement query/exec via the simple query protocol.
-## - `cancel` / `cancelNoWait` / `invalidateOnTimeout` — out-of-band cancel
-##   request over a separate socket plus the standard "the wait timed out,
-##   poison this connection" recovery path used by every timeout wrapper.
-## - `checkSessionAttrs` — server-role probe (`SHOW transaction_read_only` /
-##   `in_hot_standby` / `SELECT pg_catalog.pg_is_in_recovery()`) used by the
-##   multi-host failover logic in `lifecycle.connect`.
-## - `quoteIdentifier` — SQL identifier escaping used by `LISTEN`/`UNLISTEN`
-##   and other identifier-bearing simple-query call sites.
-## - `QueryResult` helpers (`len`, `columnIndex`, `rows`, `items`).
-##
-## Sits between `buffer_io`/`cache` (which it consumes) and `lifecycle`
-## (which depends on `checkSessionAttrs` and the cancel helpers), so it
-## avoids circular imports.
-##
-## Re-exported through `pg_connection.nim`.
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options, strutils, tables]
 
@@ -29,6 +14,9 @@ import types, buffer_io
 when hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, SockType, Protocol
+
+import std/importutils
+privateAccess(PgConnection)
 
 # QueryResult helpers
 
@@ -63,16 +51,16 @@ iterator items*(qr: QueryResult): Row =
 proc checkReady*(conn: PgConnection) =
   ## Assert that the connection is in `csReady` before starting an operation.
   ##
-  ## A `csClosed` connection is genuinely gone, so this raises
-  ## `PgConnectionError` — reconnecting is the correct recovery. Any other
-  ## non-ready state (`csBusy`, `csReplicating`, …) means the connection is
-  ## alive but already in use, almost always a single connection driven
-  ## concurrently; that raises `PgStateError` (a programming error), which is
-  ## *not* a `PgConnectionError` and so never feeds a reconnect-on-failure loop.
+  ## Closed: `PgStateError` for a deliberate `close()`, `PgConnectionError` for
+  ## a lost connection — only the second is worth reconnecting. Any other
+  ## non-ready state (`csBusy`, …) is a live connection already in use, almost
+  ## always driven concurrently, and raises `PgStateError`.
+  # Check ``closedByUser`` first: ``close()`` sets it while still ``csReady``.
+  conn.checkNotClosed()
   if conn.state == csReady:
+    when defined(pgStateChecks):
+      conn.checkBorrowable()
     return
-  if conn.state == csClosed:
-    raise newException(PgConnectionError, "Connection is closed")
   raise newException(
     PgStateError,
     "Connection is not ready (state: " & $conn.state &
@@ -99,12 +87,12 @@ proc quoteIdentifier*(s: string): string =
 
 # Simple Query Protocol entry points
 
-proc simpleQueryImpl*(
+proc simpleQueryImpl(
     conn: PgConnection, sql: string
 ): Future[seq[QueryResult]] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
 
   var results: seq[QueryResult]
@@ -128,10 +116,10 @@ proc simpleQueryImpl*(
 
   return results
 
-proc simpleExecImpl*(conn: PgConnection, sql: string): Future[string] {.async.} =
+proc simpleExecImpl(conn: PgConnection, sql: string): Future[string] {.async.} =
   conn.checkReady()
   let msg = encodeQuery(sql)
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(msg)
   var commandTag = ""
   conn.pumpUntilReady:
@@ -208,22 +196,107 @@ proc cancelNoWait*(conn: PgConnection) =
 
   asyncSpawn doCancel()
 
-proc invalidateOnTimeout*(conn: PgConnection, reason: string) =
-  ## Timeout recovery for a connection whose last request may have left the
-  ## protocol out of sync. Schedules a best-effort CancelRequest via
-  ## `cancelNoWait`, marks the connection `csClosed` so it cannot be reused,
-  ## and raises `PgTimeoutError` with `reason`.
+proc closeTransportNoWait(conn: PgConnection) =
+  ## Best-effort transport teardown without waiting. Not fire-and-forget:
+  ## ``closeTransport`` publishes the in-flight teardown on the connection, so
+  ## a later ``close`` joins this one instead of racing it, and a test can
+  ## await the same future rather than sleeping.
+  proc doClose() {.async.} =
+    try:
+      await conn.closeTransport()
+    except CatchableError:
+      discard
+
+  asyncSpawn doClose()
+
+proc invalidateWire(conn: PgConnection, releaseTransport: bool, reuseIfSettled = true) =
+  ## Sole owner of "a round trip died mid-flight, so this connection can no
+  ## longer be reused". Every timeout and cancellation handler comes here, so
+  ## the policy lives once and must be idempotent: one expired deadline reaches
+  ## it once per nested frame the cancellation passes through.
   ##
-  ## Under asyncdispatch the inner future keeps running in the background after
-  ## ``wait()`` times out (see ``wait()``'s ``onOrphan`` hook in
-  ## ``async_backend``). Reusing the connection would interleave its stale
-  ## write with a new request and corrupt the protocol stream, so we mark
-  ## ``csClosed`` unconditionally — the server may have processed the request
-  ## partially and the cached session state (prepared statements, portals,
-  ## transaction status) is no longer reliable.
-  conn.cancelNoWait()
-  conn.state = csClosed
+  ## ``wireSettled`` decides both effects, since both answer one question: is
+  ## the backend owed a reply this frame will never read? If so the server may
+  ## still be working (abort it) and the next read would land mid-reply (retire
+  ## it). Only a settled wire is provably on a message boundary, and only then
+  ## may a ``csBusy`` connection be handed back. The ambiguous case retires on
+  ## purpose: a needless reconnect is cheaper than silently corrupting an
+  ## unrelated borrower's results.
+  ##
+  ## ``reuseIfSettled = false`` says the wire is not the whole story — the
+  ## frame that timed out is still live on the socket, so a settled wire proves
+  ## nothing about what it does next.
+  if conn.wireSettled:
+    if reuseIfSettled:
+      if conn.state == csBusy:
+        # Taken busy and drained since: every op books its writes before its
+        # first await, so a settled wire means the last `ReadyForQuery` was
+        # read and the frame died before the op reset the state. Hand a healthy
+        # connection back rather than retiring it.
+        conn.markReady()
+      elif conn.state == csClosed and releaseTransport:
+        # The read path can flip `csClosed` while leaving the socket up.
+        conn.closeTransportNoWait()
+      return
+    # Retiring a settled wire: the backend is parked on a message boundary, so
+    # there is nothing for a CancelRequest to abort and no counters to clear.
+  else:
+    # Only the first frame to claim the outstanding replies may dial, or every
+    # frame the cancellation passes through opens its own socket for one query.
+    conn.pendingSyncs = 0
+    conn.unsyncedWrite = false
+    conn.cancelNoWait()
+  conn.markClosed()
+  if releaseTransport:
+    # `closeTransport` awaits an in-flight teardown, so a repeat from an outer
+    # frame joins that one rather than starting a second.
+    conn.closeTransportNoWait()
+
+proc invalidateOnTimeout*(conn: PgConnection, reason: string) =
+  ## Invalidate a timed-out round trip and raise ``PgTimeoutError``.
+  ##
+  ## For the frame that was driving the wire, so what the wire owes decides
+  ## what it leaves behind. The transport is left alone: the caller is still in
+  ## scope, so the pool's ``release`` or the user's ``close`` tears it down.
+  ##
+  ## On asyncdispatch ``wait`` cannot cancel the future it gave on, so the
+  ## timed-out operation stays live on the socket, still reading into the
+  ## shared receive buffer. A settled wire says nothing about that orphan: the
+  ## connection is retired regardless, and the read path's ``csClosed`` check
+  ## ends it.
+  conn.invalidateWire(releaseTransport = false, reuseIfSettled = not hasAsyncDispatch)
   raise newException(PgTimeoutError, reason)
+
+proc retireOnTimeout*(conn: PgConnection, reason: string) =
+  ## Invalidate a timed-out scope whose body is still running, and raise
+  ## ``PgTimeoutError``.
+  ##
+  ## Retirement is owed to ownership, not to the wire: a `wait` that cannot
+  ## cancel what it gave on (asyncdispatch) leaves the body holding the
+  ## connection, free to ``COMMIT`` a transaction the caller was told had timed
+  ## out. So this one never hands the connection back.
+  conn.invalidateWire(releaseTransport = false, reuseIfSettled = false)
+  raise newException(PgTimeoutError, reason)
+
+proc invalidateOnCancel*(conn: PgConnection, releaseTransport = true) =
+  ## Invalidate a cancelled round trip.
+  ##
+  ## The request went out and its ``ReadyForQuery`` was never drained, so the
+  ## stream is desynchronised and no later operation recovers it. Leaving
+  ## ``csBusy`` instead made every subsequent call fail ``checkReady`` with a
+  ## ``PgStateError`` no reconnect loop acts on.
+  ##
+  ## ``releaseTransport`` says whether this frame is the last one that knows
+  ## about the connection: true for the operation wrappers, which cancellation
+  ## unwinds past, false for the transaction and savepoint macros, whose own
+  ## scope still hands the connection back.
+  ##
+  ## Whoever runs first decides, not the nesting: a cancellation inside an
+  ## awaited operation is claimed by that operation's wrapper, so an enclosing
+  ## macro's call finds the counters zeroed and is a no-op — and its ROLLBACK
+  ## cleanup is then skipped as ``csrConnInvalidated``. The macro's ``false``
+  ## only covers a cancellation landing between operations.
+  conn.invalidateWire(releaseTransport)
 
 template awaitOrInvalidate*(
     connExpr: PgConnection,
@@ -232,22 +305,23 @@ template awaitOrInvalidate*(
     timeout: Duration,
     reason: static string,
 ) =
-  ## Await `fut` with optional `timeout`, assigning the result to `dest`.
-  ## On timeout, invalidates `connExpr` via `invalidateOnTimeout` (marks
-  ## csClosed, dispatches CancelRequest, raises PgTimeoutError).
-  ##
-  ## Consolidates the repeated `if timeout > ZeroDuration / try / except
-  ## AsyncTimeoutError / else` pattern so a single-site omission cannot leave
-  ## the connection poisoned for the next borrower — see the
-  ## `invalidateOnTimeout` doc-comment for why in-flight timeouts must always
-  ## retire the connection under asyncdispatch.
+  ## Await ``fut`` with optional timeout. ``AsyncTimeoutError`` invalidates via
+  ## ``invalidateOnTimeout``; a cancellation via ``invalidateOnCancel`` and is
+  ## re-raised.
   if timeout > ZeroDuration:
     try:
       dest = await fut.wait(timeout)
     except AsyncTimeoutError:
       connExpr.invalidateOnTimeout(reason)
+    except CancelledError as e:
+      connExpr.invalidateOnCancel()
+      raise e
   else:
-    dest = await fut
+    try:
+      dest = await fut
+    except CancelledError as e:
+      connExpr.invalidateOnCancel()
+      raise e
 
 template awaitVoidOrInvalidate*(
     connExpr: PgConnection, fut: untyped, timeout: Duration, reason: static string
@@ -259,28 +333,23 @@ template awaitVoidOrInvalidate*(
       await fut.wait(timeout)
     except AsyncTimeoutError:
       connExpr.invalidateOnTimeout(reason)
+    except CancelledError as e:
+      connExpr.invalidateOnCancel()
+      raise e
   else:
-    await fut
+    try:
+      await fut
+    except CancelledError as e:
+      connExpr.invalidateOnCancel()
+      raise e
 
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
-  ## Execute a side-effect SQL command via the **simple query protocol**,
-  ## returning the final command tag.
-  ##
-  ## Lighter than ``exec`` for parameter-less commands — one ``Query`` message,
-  ## no Parse/Bind/Describe round trip and no plan cache entry. Intended for
-  ## session-level commands such as ``BEGIN``, ``SET``, ``VACUUM``,
-  ## ``LISTEN``, ``NOTIFY``.
-  ##
-  ## The SQL string is sent verbatim (no parameters) — only use trusted input,
-  ## or quote interpolated identifiers yourself via ``quoteIdentifier``.
-  ##
-  ## Multiple ``;``-separated statements are accepted, but only the **last**
-  ## command tag is returned; use ``simpleQuery`` if you need per-statement
-  ## results. For parameterised writes, prefer ``exec``.
-  ##
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## Simple-query exec (one ``Query`` msg, no Parse/Bind). Parameter-less only;
+  ## verbatim SQL — quote via ``quoteIdentifier``. Returns last tag.
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var tag: string
   withConnTracing(
     conn,
@@ -298,20 +367,11 @@ proc simpleExec*(
 proc simpleQuery*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[seq[QueryResult]] {.async.} =
-  ## Execute one or more SQL statements via the **simple query protocol**.
-  ##
-  ## Returns one ``QueryResult`` per statement; supports multiple statements
-  ## separated by ``;`` in a single round trip — this is the main reason to
-  ## choose ``simpleQuery`` over ``query``.
-  ##
-  ## No parameters are supported (the SQL string is sent verbatim — only use
-  ## trusted input) and rows are always in the text wire format. No
-  ## server-side plan cache entry is created.
-  ##
-  ## For single-statement parameterised reads, prefer ``query``; for
-  ## parameter-less commands without rows, prefer ``simpleExec``.
-  ##
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## Simple-query multi-statement exec. One ``QueryResult`` per ``;``-separated stmt,
+  ## text rows, no params/cache. Verbatim SQL — only trusted input; quote via
+  ## ``quoteIdentifier``.
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var results: seq[QueryResult]
   var totalRows: int32
   var lastTag: string
@@ -341,13 +401,14 @@ proc simpleQuery*(
 proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
   ## Lightweight health check using an empty simple query.
   ## Sends Query("") -> expects EmptyQueryResponse + ReadyForQuery.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   proc perform(): Future[void] {.async.} =
     conn.checkReady()
     if not conn.isConnected():
-      conn.state = csClosed
+      conn.markClosed()
       raise newException(PgConnectionError, "Connection is not established")
-    conn.state = csBusy
+    conn.markBusy()
     await conn.sendMsg(encodeQuery(""))
 
     conn.pumpUntilReady:
@@ -376,10 +437,7 @@ proc bytesToString*(data: seq[byte]): string =
     result[i] = char(data[i])
 
 proc probeBool(conn: PgConnection, sql, trueLiteral: string): Future[bool] {.async.} =
-  ## Run a single-row, single-column probe and compare its text value against
-  ## `trueLiteral`. Raise if the result carries no usable value (empty / zero
-  ## rows / NULL) so an indeterminate probe fails the host rather than silently
-  ## defaulting to a match — matching libpq, which advances to the next host.
+  ## Probe single value against ``trueLiteral``; raise if empty/NULL (fail host, don't default).
   let results = await conn.simpleQuery(sql)
   if results.len > 0 and results[0].rowCount > 0:
     let val = results[0].rows[0][0]
@@ -389,23 +447,15 @@ proc probeBool(conn: PgConnection, sql, trueLiteral: string): Future[bool] {.asy
     newException(PgConnectionError, "probe \"" & sql & "\" returned no usable result")
 
 proc isPhysicalReplicationConn(conn: PgConnection): bool =
-  ## Physical replication connections cannot execute arbitrary SQL, so a
-  ## recovery probe must avoid `SELECT`. `connectReplication` always sets
-  ## `replication=true`, but the server also accepts the other boolean
-  ## spellings, which can reach `extraParams` verbatim via a user DSN
-  ## (`replication=database` is logical replication and *can* run SQL).
+  ## True for physical replication (``replication`` in {true,on,yes,1}); cannot run ``SELECT``.
   for (k, v) in conn.config.extraParams:
     if k == "replication" and v in ["true", "on", "yes", "1"]:
       return true
   false
 
 proc inRecovery(conn: PgConnection): Future[bool] {.async.} =
-  ## Recovery state. PostgreSQL 14+ reports `in_hot_standby`, so no query is
-  ## needed; older servers are probed with `SELECT pg_catalog.pg_is_in_recovery()`.
-  ## Physical replication connections reject `SELECT`, so they fall back to the
-  ## walsender-accepted `SHOW transaction_read_only`. Note: on a pre-14 physical
-  ## replication connection that is a recovery-state approximation, not the
-  ## exact recovery state — unavoidable when `in_hot_standby` is absent.
+  ## Recovery state: ``in_hot_standby`` (PG14+) else ``pg_is_in_recovery()``;
+  ## physical replication falls back to ``SHOW transaction_read_only`` (approximation).
   let ihs = conn.serverParams.getOrDefault("in_hot_standby", "")
   if ihs.len > 0:
     return ihs == "on"
@@ -414,9 +464,7 @@ proc inRecovery(conn: PgConnection): Future[bool] {.async.} =
   return await conn.probeBool("SELECT pg_catalog.pg_is_in_recovery()", "t")
 
 proc isReadOnly(conn: PgConnection): Future[bool] {.async.} =
-  ## Read-only state. PostgreSQL 14+ reports both `default_transaction_read_only`
-  ## and `in_hot_standby`, so the answer needs no round-trip (libpq parity);
-  ## otherwise fall back to `SHOW transaction_read_only`.
+  ## Read-only state: ``default_transaction_read_only``/``in_hot_standby`` (PG14+, no query) else ``SHOW``.
   let dtro = conn.serverParams.getOrDefault("default_transaction_read_only", "")
   let ihs = conn.serverParams.getOrDefault("in_hot_standby", "")
   if dtro.len > 0 and ihs.len > 0:
@@ -426,14 +474,8 @@ proc isReadOnly(conn: PgConnection): Future[bool] {.async.} =
 proc checkSessionAttrs*(
     conn: PgConnection, attrs: TargetSessionAttrs
 ): Future[bool] {.async.} =
-  ## Check whether a connection matches the desired target_session_attrs.
-  ## Follows libpq: `tsaReadWrite`/`tsaReadOnly` are judged on the session's
-  ## read-only state, while `tsaPrimary`/`tsaStandby` are judged on the recovery
-  ## state — the `in_hot_standby` ParameterStatus reported by PostgreSQL 14+,
-  ## with a `SELECT pg_catalog.pg_is_in_recovery()` probe as fallback for older
-  ## servers. `tsaPreferStandby` is permissive: as a standalone predicate any
-  ## server matches (the multi-host failover in `lifecycle.connect` handles the
-  ## standby preference with a two-pass scan). Raises on an indeterminate probe.
+  ## Check ``target_session_attrs`` (libpq semantics). ``tsaPreferStandby`` always
+  ## matches standalone; failover handles preference. Raises on indeterminate probe.
   case attrs
   of tsaAny, tsaPreferStandby:
     return true

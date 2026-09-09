@@ -1,9 +1,18 @@
 ## Named server-side prepared statements: `prepare`, `execute`, and `close`.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[options]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, cache, simple_query]
+import ../pg_types/encoding
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 type PreparedStatement* = object
   ## A server-side prepared statement returned by `prepare`.
@@ -15,11 +24,34 @@ type PreparedStatement* = object
   ## `prepare` it again. There is no transparent re-prepare here — that is
   ## reserved for the auto-prepare statement cache (see the cache path's
   ## ``StmtCacheInvalidatingStates`` handling in `pg_client/core`).
-  conn*: PgConnection
-  name*: string
-  sql*: string
-  fields*: seq[FieldDescription]
-  paramOids*: seq[int32]
+  ##
+  ## Fields are private; use the `conn` / `name` / `sql` / `fields` /
+  ## `paramOids` accessors for read-only access.
+  conn: PgConnection
+  name: string
+  sql: string
+  fields: seq[FieldDescription]
+  paramOids: seq[int32]
+
+func conn*(stmt: PreparedStatement): PgConnection {.inline.} =
+  ## The connection (server session) this statement was prepared on.
+  stmt.conn
+
+func name*(stmt: PreparedStatement): string {.inline.} =
+  ## The server-side statement name given to `prepare`.
+  stmt.name
+
+func sql*(stmt: PreparedStatement): string {.inline.} =
+  ## The SQL text this statement was prepared from.
+  stmt.sql
+
+func fields*(stmt: PreparedStatement): seq[FieldDescription] {.inline.} =
+  ## Column descriptions of the statement's result rows.
+  stmt.fields
+
+func paramOids*(stmt: PreparedStatement): seq[int32] {.inline.} =
+  ## Parameter type OIDs reported by the server at prepare time.
+  stmt.paramOids
 
 proc columnIndex*(stmt: PreparedStatement, name: string): int =
   ## Find the index of a column by name in a prepared statement.
@@ -29,12 +61,16 @@ proc prepareImpl*(
     conn: PgConnection, name: string, sql: string
 ): Future[PreparedStatement] {.async.} =
   conn.checkReady()
+  # The name is the application's, not a generated `nextStmtName()`, so it is
+  # both checked for NUL and charged against the Parse envelope.
+  checkNoNul(name, "prepared statement name")
+  validateParseMsg(sql, nParams = 0, stmtNameLen = name.len)
 
   var batch = newSeqOfCap[byte](sql.len + name.len + 32)
   batch.addParse(name, sql)
   batch.addDescribe(dkStatement, name)
   batch.addSync()
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(batch)
 
   var stmt = PreparedStatement(conn: conn, name: name, sql: sql)
@@ -60,7 +96,8 @@ proc prepare*(
     conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
 ): Future[PreparedStatement] {.async.} =
   ## Prepare a named statement, returning metadata.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var stmt: PreparedStatement
   withConnTracing(
     conn,
@@ -94,15 +131,18 @@ proc executeImpl*(
           needsCoercion = true
         coerced[i] = coerceBinaryParam(params[i], stmt.paramOids[i])
 
-  conn.sendBuf.setLen(0)
-  conn.flushPendingStmtCloses()
-  conn.sendBuf.addBind(
-    "", stmt.name, if needsCoercion: coerced else: params, resultFormats
-  )
+  # After coercion, which can change a value's encoded length. A cursor, so the
+  # common path binds `params` rather than copying every parameter's payload:
+  # both operands outlive it, and its readers take `openArray`.
+  let effective {.cursor.} = if needsCoercion: coerced else: params
+  validateTypedParams(effective, resultFormats.len, stmt.name.len)
+
+  conn.beginSendBuf()
+  conn.sendBuf.addBind("", stmt.name, effective, resultFormats)
   conn.sendBuf.addExecute("", 0)
   conn.sendBuf.addSync()
-  conn.state = csBusy
-  await conn.sendBufMsg()
+  conn.markBusy()
+  await conn.sendStagedBufMsg()
 
   var qr = QueryResult(fields: stmt.fields)
   if resultFormats.len > 0:
@@ -172,7 +212,7 @@ proc closeImpl*(stmt: PreparedStatement): Future[void] {.async.} =
   var batch = newSeqOfCap[byte](stmt.name.len + 16)
   batch.addClose(dkStatement, stmt.name)
   batch.addSync()
-  conn.state = csBusy
+  conn.markBusy()
   await conn.sendMsg(batch)
 
   conn.pumpUntilReady:
@@ -186,7 +226,8 @@ proc close*(
     stmt: PreparedStatement, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Close a prepared statement.
-  ## On timeout, the connection is marked csClosed (protocol out of sync).
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   awaitVoidOrInvalidate(
     stmt.conn, closeImpl(stmt), timeout, "Statement close timed out"
   )
