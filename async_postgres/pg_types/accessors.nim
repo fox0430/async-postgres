@@ -128,6 +128,31 @@ proc colTypeOid(row: Row, col: int): int32 {.inline.} =
   else:
     0'i32
 
+proc checkScalarColOid(
+    accessor: string, row: Row, col: int, expected: openArray[int32]
+) =
+  ## Reject a binary column whose RowDescription OID is not decoded by this
+  ## accessor. Mirrors ``checkArrayElemOid`` for scalar columns: without it a
+  ## same-length type (int4/float4, int8/float8/timestamp, uuid/point, line/circle,
+  ## lseg/box) decodes silently to a wrong value.
+  ## Unknown OID 0 (manual Row without metadata) skips the check.
+  let actual = row.colTypeOid(col)
+  if actual == 0'i32:
+    return
+  for e in expected:
+    if actual == e:
+      return
+  var want = ""
+  for i, oid in expected:
+    if i > 0:
+      want.add(" or ")
+    want.add($oid)
+  raise newException(
+    PgTypeError,
+    accessor & ": wire colOid=" & $actual & " expected " & want &
+      " (binary column type mismatch; use the matching accessor or resultFormat = rfText)",
+  )
+
 const NumericBinaryHeaderLen = 8
   ## Minimum byte length of a binary numeric value (4 x int16: ndigits, weight, sign, dscale).
 
@@ -210,10 +235,13 @@ proc getStr*(row: Row, col: int): string =
 
 proc getInt*(row: Row, col: int): int32 =
   ## Get a column value as int32. Handles binary int2/int4 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be int2 or int4; other same-length
+  ## types (e.g. float4, date) raise `PgTypeError` instead of decoding silently.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getInt", row, col, [OidInt4, OidInt2])
     if clen == 4:
       return fromBE32(row.data.buf, off)
     elif clen == 2:
@@ -241,10 +269,12 @@ proc getInt*(row: Row, col: int): int32 =
 
 proc getInt16*(row: Row, col: int): int16 =
   ## Get a column value as int16. Handles binary int2 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be int2.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getInt16", row, col, [OidInt2])
     if clen == 2:
       return fromBE16(row.data.buf, off)
     else:
@@ -267,10 +297,12 @@ proc getInt16*(row: Row, col: int): int16 =
 
 proc getInt64*(row: Row, col: int): int64 =
   ## Get a column value as int64. Handles binary int2/4/8 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be int8, int4, or int2.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getInt64", row, col, [OidInt8, OidInt4, OidInt2])
     if clen == 8:
       return fromBE64(row.data.buf, off)
     elif clen == 4:
@@ -293,10 +325,12 @@ proc getInt64*(row: Row, col: int): int64 =
 
 proc getFloat*(row: Row, col: int): float64 =
   ## Get a column value as float64. Handles binary float4/8 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be float8 or float4.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getFloat", row, col, [OidFloat8, OidFloat4])
     if clen == 8:
       return decodeFloat64BE(row.data.buf, off)
     elif clen == 4:
@@ -315,10 +349,12 @@ proc getFloat*(row: Row, col: int): float64 =
 
 proc getFloat32*(row: Row, col: int): float32 =
   ## Get a column value as float32. Handles binary float4 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be float4.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getFloat32", row, col, [OidFloat4])
     if clen == 4:
       return decodeFloat32BE(row.data.buf, off)
     else:
@@ -335,7 +371,9 @@ proc getFloat32*(row: Row, col: int): float32 =
 
 proc getNumeric*(row: Row, col: int): PgNumeric =
   ## Get a column value as PgNumeric. Handles binary numeric format.
+  ## In binary format the column OID must be numeric.
   if row.isBinaryCol(col):
+    checkScalarColOid("getNumeric", row, col, [OidNumeric])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -350,11 +388,13 @@ proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
   ## ``en_US``; pass 0 for ``ja_JP`` etc.). The wire protocol does not expose
   ## this, so callers must specify it when it differs from the default.
   ## Raises ``PgTypeError`` on NULL or when ``scale`` is outside ``0..18``.
+  ## In binary format the column OID must be money.
   checkMoneyScale(scale)
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getMoney", row, col, [OidMoney])
     if clen == 8:
       return initPgMoney(fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale)
     raise newException(
@@ -422,7 +462,9 @@ proc decodeJsonArrayElem(buf: openArray[byte], elemOid: int32): JsonNode =
 
 proc getUuid*(row: Row, col: int): PgUuid =
   ## Get a column value as PgUuid. Handles binary format (16 bytes).
+  ## In binary format the column OID must be uuid.
   if row.isBinaryCol(col):
+    checkScalarColOid("getUuid", row, col, [OidUuid])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -431,10 +473,12 @@ proc getUuid*(row: Row, col: int): PgUuid =
 
 proc getBool*(row: Row, col: int): bool =
   ## Get a column value as bool. Handles binary format directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be bool.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getBool", row, col, [OidBool])
     if clen != 1:
       raise newException(
         PgTypeError,
@@ -449,11 +493,12 @@ proc getBool*(row: Row, col: int): bool =
 proc getBytes*(row: Row, col: int): seq[byte] =
   ## Get a column value as raw bytes. Decodes bytea text output in both
   ## hex (`\xDEADBEEF`) and legacy escape formats. Raises `PgTypeError`
-  ## on NULL.
+  ## on NULL. In binary format the column OID must be bytea.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getBytes", row, col, [OidBytea])
     result = readBytes(row.data.buf, off, clen)
     return
   let errCtx = "Column " & $col
@@ -472,7 +517,9 @@ proc getBytes*(row: Row, col: int): seq[byte] =
 
 proc getTimestamp*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime. Handles binary timestamp format.
+  ## In binary format the column OID must be timestamp.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTimestamp", row, col, [OidTimestamp])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -487,7 +534,9 @@ proc getTimestamp*(row: Row, col: int): DateTime =
 
 proc getDate*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime. Handles binary date format.
+  ## In binary format the column OID must be date.
   if row.isBinaryCol(col):
+    checkScalarColOid("getDate", row, col, [OidDate])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -501,7 +550,9 @@ proc getDate*(row: Row, col: int): DateTime =
 
 proc getTimestampTz*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime from a timestamptz column.
+  ## In binary format the column OID must be timestamptz.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTimestampTz", row, col, [OidTimestampTz])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -516,7 +567,9 @@ proc getTimestampTz*(row: Row, col: int): DateTime =
 
 proc getTime*(row: Row, col: int): PgTime =
   ## Get a column value as PgTime. Handles binary time format.
+  ## In binary format the column OID must be time.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTime", row, col, [OidTime])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -531,7 +584,9 @@ proc getTime*(row: Row, col: int): PgTime =
 
 proc getTimeTz*(row: Row, col: int): PgTimeTz =
   ## Get a column value as PgTimeTz. Handles binary timetz format.
+  ## In binary format the column OID must be timetz.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTimeTz", row, col, [OidTimeTz])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -546,7 +601,9 @@ proc getTimeTz*(row: Row, col: int): PgTimeTz =
 
 proc getJson*(row: Row, col: int): JsonNode =
   ## Get a column value as a parsed JsonNode. Handles binary json/jsonb format.
+  ## In binary format the column OID must be json or jsonb.
   if row.isBinaryCol(col):
+    checkScalarColOid("getJson", row, col, [OidJson, OidJsonb])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -561,7 +618,9 @@ proc getJson*(row: Row, col: int): JsonNode =
 
 proc getInterval*(row: Row, col: int): PgInterval =
   ## Get a column value as PgInterval. Handles binary interval format.
+  ## In binary format the column OID must be interval.
   if row.isBinaryCol(col):
+    checkScalarColOid("getInterval", row, col, [OidInterval])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -572,7 +631,9 @@ proc getInterval*(row: Row, col: int): PgInterval =
 
 proc getInet*(row: Row, col: int): PgInet =
   ## Get a column value as PgInet (IP address with mask). Handles binary format.
+  ## In binary format the column OID must be inet.
   if row.isBinaryCol(col):
+    checkScalarColOid("getInet", row, col, [OidInet])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -584,7 +645,9 @@ proc getInet*(row: Row, col: int): PgInet =
 
 proc getCidr*(row: Row, col: int): PgCidr =
   ## Get a column value as PgCidr (CIDR network address). Handles binary format.
+  ## In binary format the column OID must be cidr.
   if row.isBinaryCol(col):
+    checkScalarColOid("getCidr", row, col, [OidCidr])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -596,7 +659,9 @@ proc getCidr*(row: Row, col: int): PgCidr =
 
 proc getMacAddr*(row: Row, col: int): PgMacAddr =
   ## Get a column value as PgMacAddr. Handles binary format.
+  ## In binary format the column OID must be macaddr.
   if row.isBinaryCol(col):
+    checkScalarColOid("getMacAddr", row, col, [OidMacAddr])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -606,7 +671,9 @@ proc getMacAddr*(row: Row, col: int): PgMacAddr =
 
 proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
   ## Get a column value as PgMacAddr8 (EUI-64). Handles binary format.
+  ## In binary format the column OID must be macaddr8.
   if row.isBinaryCol(col):
+    checkScalarColOid("getMacAddr8", row, col, [OidMacAddr8])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -616,7 +683,9 @@ proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
 
 proc getBit*(row: Row, col: int): PgBit =
   ## Get a column value as PgBit. Handles both text and binary format.
+  ## In binary format the column OID must be bit or varbit.
   if row.isBinaryCol(col):
+    checkScalarColOid("getBit", row, col, [OidBit, OidVarbit])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -633,7 +702,9 @@ proc getBit*(row: Row, col: int): PgBit =
 
 proc getTsVector*(row: Row, col: int): PgTsVector =
   ## Get a column value as PgTsVector. Handles both text and binary format.
+  ## In binary format the column OID must be tsvector.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTsVector", row, col, [OidTsVector])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -643,7 +714,9 @@ proc getTsVector*(row: Row, col: int): PgTsVector =
 
 proc getTsQuery*(row: Row, col: int): PgTsQuery =
   ## Get a column value as PgTsQuery. Handles both text and binary format.
+  ## In binary format the column OID must be tsquery.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTsQuery", row, col, [OidTsQuery])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -652,7 +725,9 @@ proc getTsQuery*(row: Row, col: int): PgTsQuery =
 
 proc getXml*(row: Row, col: int): PgXml =
   ## Get a column value as PgXml. Handles both text and binary format.
+  ## In binary format the column OID must be xml.
   if row.isBinaryCol(col):
+    checkScalarColOid("getXml", row, col, [OidXml])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -662,6 +737,8 @@ proc getXml*(row: Row, col: int): PgXml =
 
 proc getHstore*(row: Row, col: int): PgHstore =
   ## Get a column value as PgHstore. Handles both text and binary format.
+  ## hstore uses a dynamic OID assigned at CREATE EXTENSION time, so no
+  ## column OID check applies here (mirrors anyArrayElemOid on the array path).
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -671,7 +748,9 @@ proc getHstore*(row: Row, col: int): PgHstore =
 
 proc getPoint*(row: Row, col: int): PgPoint =
   ## Get a column value as PgPoint. Handles binary format.
+  ## In binary format the column OID must be point.
   if row.isBinaryCol(col):
+    checkScalarColOid("getPoint", row, col, [OidPoint])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -682,7 +761,9 @@ proc getPoint*(row: Row, col: int): PgPoint =
 
 proc getLine*(row: Row, col: int): PgLine =
   ## Get a column value as PgLine. Handles binary format.
+  ## In binary format the column OID must be line.
   if row.isBinaryCol(col):
+    checkScalarColOid("getLine", row, col, [OidLine])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -707,7 +788,9 @@ proc getLine*(row: Row, col: int): PgLine =
 
 proc getLseg*(row: Row, col: int): PgLseg =
   ## Get a column value as PgLseg. Handles binary format.
+  ## In binary format the column OID must be lseg.
   if row.isBinaryCol(col):
+    checkScalarColOid("getLseg", row, col, [OidLseg])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -728,7 +811,9 @@ proc getLseg*(row: Row, col: int): PgLseg =
 
 proc getBox*(row: Row, col: int): PgBox =
   ## Get a column value as PgBox. Handles binary format.
+  ## In binary format the column OID must be box.
   if row.isBinaryCol(col):
+    checkScalarColOid("getBox", row, col, [OidBox])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -746,7 +831,9 @@ proc getBox*(row: Row, col: int): PgBox =
 
 proc getPath*(row: Row, col: int): PgPath =
   ## Get a column value as PgPath. Handles binary format.
+  ## In binary format the column OID must be path.
   if row.isBinaryCol(col):
+    checkScalarColOid("getPath", row, col, [OidPath])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -783,7 +870,9 @@ proc getPath*(row: Row, col: int): PgPath =
 
 proc getPolygon*(row: Row, col: int): PgPolygon =
   ## Get a column value as PgPolygon. Handles binary format.
+  ## In binary format the column OID must be polygon.
   if row.isBinaryCol(col):
+    checkScalarColOid("getPolygon", row, col, [OidPolygon])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -817,7 +906,9 @@ proc getPolygon*(row: Row, col: int): PgPolygon =
 
 proc getCircle*(row: Row, col: int): PgCircle =
   ## Get a column value as PgCircle. Handles binary format.
+  ## In binary format the column OID must be circle.
   if row.isBinaryCol(col):
+    checkScalarColOid("getCircle", row, col, [OidCircle])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -982,10 +1073,17 @@ proc decodePgArrayElement[T: PgInet | PgCidr](_: typedesc[T], buf: openArray[byt
   let (ip, mask) = decodeInetBinary(buf)
   T(address: ip, mask: mask)
 
-proc decodePgArrayElement[T: PgXml | PgTsVector | PgTsQuery](
-    _: typedesc[T], buf: openArray[byte]
-): T =
-  T(readString(buf, 0, buf.len))
+proc decodePgArrayElement(_: typedesc[PgXml], buf: openArray[byte]): PgXml =
+  ## Xml binary is the text representation, so raw copy is correct.
+  PgXml(readString(buf, 0, buf.len))
+
+proc decodePgArrayElement(_: typedesc[PgTsVector], buf: openArray[byte]): PgTsVector =
+  ## Binary tsvector is structured; decode to text like the scalar accessor.
+  PgTsVector(decodeBinaryTsVector(buf))
+
+proc decodePgArrayElement(_: typedesc[PgTsQuery], buf: openArray[byte]): PgTsQuery =
+  ## Binary tsquery is structured; decode to text like the scalar accessor.
+  PgTsQuery(decodeBinaryTsQuery(buf))
 
 proc decodePgArrayElement(_: typedesc[PgHstore], buf: openArray[byte]): PgHstore =
   decodeHstoreBinary(buf)
@@ -1672,7 +1770,9 @@ proc getMoneyArrayNDOpt*(row: Row, col: int, scale: int = 2): Option[PgArray[PgM
   else:
     some(getMoneyArrayND(row, col, scale))
 
-# Generic accessors — static dispatch by type, no OID branching.
+# Generic accessors — static dispatch by type. Each overload delegates to its
+# typed accessor, so binary columns carry the same OID validation; there is
+# no runtime OID-to-type dispatch beyond the static type parameter.
 
 proc get*(row: Row, col: int, T: typedesc[int16]): int16 =
   ## Generic typed accessor. Usage: ``row.get(0, int16)``
@@ -1703,8 +1803,10 @@ proc get*(row: Row, col: int, T: typedesc[seq[byte]]): seq[byte] =
 proc get*(row: Row, col: int, T: typedesc[PgNumeric]): PgNumeric =
   row.getNumeric(col)
 
-proc get*(row: Row, col: int, T: typedesc[PgMoney]): PgMoney =
-  row.getMoney(col)
+proc get*(row: Row, col: int, T: typedesc[PgMoney], scale: int = 2): PgMoney =
+  ## Generic money accessor with scale forwarding. Defaults to 2; pass the
+  ## server ``lc_monetary`` frac_digits when it differs.
+  row.getMoney(col, scale)
 
 proc get*(row: Row, col: int, T: typedesc[JsonNode]): JsonNode =
   row.getJson(col)
@@ -1825,8 +1927,9 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgMacAddr8]]): seq[PgMacAddr8] =
 proc get*(row: Row, col: int, T: typedesc[seq[PgNumeric]]): seq[PgNumeric] =
   row.getNumericArray(col)
 
-proc get*(row: Row, col: int, T: typedesc[seq[PgMoney]]): seq[PgMoney] =
-  row.getMoneyArray(col)
+proc get*(row: Row, col: int, T: typedesc[seq[PgMoney]], scale: int = 2): seq[PgMoney] =
+  ## Generic money array accessor with scale forwarding.
+  row.getMoneyArray(col, scale)
 
 proc get*(row: Row, col: int, T: typedesc[seq[JsonNode]]): seq[JsonNode] =
   row.getJsonArray(col)
@@ -1921,3 +2024,13 @@ proc columnIndex*(row: Row, name: string): int =
 proc get*[T](row: Row, name: string, _: typedesc[T]): T =
   ## Generic typed accessor by column name. Usage: ``row.get("id", int32)``
   row.get(row.columnIndex(name), T)
+
+proc get*(row: Row, name: string, T: typedesc[PgMoney], scale: int = 2): PgMoney =
+  ## Generic money accessor by column name with scale forwarding.
+  row.getMoney(row.columnIndex(name), scale)
+
+proc get*(
+    row: Row, name: string, T: typedesc[seq[PgMoney]], scale: int = 2
+): seq[PgMoney] =
+  ## Generic money array accessor by column name with scale forwarding.
+  row.getMoneyArray(row.columnIndex(name), scale)
