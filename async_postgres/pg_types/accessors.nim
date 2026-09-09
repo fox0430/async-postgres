@@ -259,7 +259,7 @@ proc getInt*(row: Row, col: int): int32 =
   # escaping the ``except PgError`` contract.
   pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
     n = parseInt(row.bufView(off, clen), v)
-  if n == 0:
+  if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
   if v < int(int32.low) or v > int(int32.high):
     raise newException(
@@ -287,7 +287,7 @@ proc getInt16*(row: Row, col: int): int16 =
   # Convert ``parseInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
   pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
     n = parseInt(row.bufView(off, clen), v)
-  if n == 0:
+  if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
   if v < int(int16.low) or v > int(int16.high):
     raise newException(
@@ -319,7 +319,7 @@ proc getInt64*(row: Row, col: int): int64 =
   # Convert ``parseBiggestInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
   pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
     n = parseBiggestInt(row.bufView(off, clen), v)
-  if n == 0:
+  if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid int64 value")
   result = v
 

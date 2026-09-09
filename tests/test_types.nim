@@ -419,6 +419,24 @@ suite "Row accessors":
     expect PgTypeError:
       discard row.getInt16(0)
 
+  test "getInt rejects trailing garbage (full-consumption check)":
+    for s in ["123abc", "42 ", "12.5", "1e3"]:
+      let row = @[some(toBytes(s))]
+      expect PgTypeError:
+        discard row.getInt(0)
+
+  test "getInt16 rejects trailing garbage (full-consumption check)":
+    for s in ["123abc", "42 ", "12.5"]:
+      let row = @[some(toBytes(s))]
+      expect PgTypeError:
+        discard row.getInt16(0)
+
+  test "getInt64 rejects trailing garbage (full-consumption check)":
+    for s in ["123abc", "42 ", "12.5"]:
+      let row = @[some(toBytes(s))]
+      expect PgTypeError:
+        discard row.getInt64(0)
+
   # The negative tests above are all text; the binary integer tests are all
   # positive. Binary is what the server sends once a statement is cached.
 
@@ -2321,6 +2339,26 @@ suite "parseTextArray":
     check elems.len == 2
     check elems[0] == some("a")
     check elems[1] == some("{b}")
+
+  test "garbage after quoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{\"ab\"cd}")
+
+  test "trailing comma raises":
+    expect PgTypeError:
+      discard parseTextArray("{a,b,}")
+
+  test "quote inside unquoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{a\"b,c}")
+
+  test "backslash inside unquoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{a\\b,c}")
+
+  test "brace inside unquoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{a{b},c}")
 
 suite "Array row accessors":
   test "getIntArray":
@@ -4343,6 +4381,20 @@ suite "Composite text parser":
   test "parseCompositeText garbage after closing quote raises":
     expect PgTypeError:
       discard parseCompositeText("(\"a\"b)")
+
+  test "parseCompositeText quote in unquoted field raises":
+    expect PgTypeError:
+      discard parseCompositeText("(a\"b,c)")
+
+  test "parseCompositeText backslash in unquoted field raises":
+    expect PgTypeError:
+      discard parseCompositeText("(a\\b,c)")
+
+  test "parseCompositeText paren in unquoted field raises":
+    expect PgTypeError:
+      discard parseCompositeText("(a(b,c)")
+    expect PgTypeError:
+      discard parseCompositeText("(a)b,c)")
 
   test "encodeCompositeText simple":
     let s = encodeCompositeText(@[some("1"), some("2")])
