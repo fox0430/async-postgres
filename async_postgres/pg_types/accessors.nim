@@ -130,7 +130,7 @@ proc colTypeOid(row: Row, col: int): int32 {.inline.} =
 
 proc checkScalarColOid(
     accessor: string, row: Row, col: int, expected: openArray[int32]
-) {.inline.} =
+) =
   ## Reject a binary column whose RowDescription OID is not decoded by this
   ## accessor. Mirrors ``checkArrayElemOid`` for scalar columns: without it a
   ## same-length type (int4/float4, int8/float8/timestamp, uuid/point, line/circle,
