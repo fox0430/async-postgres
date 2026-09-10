@@ -34,7 +34,7 @@ proc parseSslMode*(s: string): SslMode =
   of "verify-full":
     sslVerifyFull
   else:
-    raise newException(PgError, "Invalid sslmode: " & s)
+    raise newException(PgConfigError, "Invalid sslmode: " & s)
 
 proc parseChannelBindingMode*(s: string): ChannelBindingMode =
   case s
@@ -45,7 +45,7 @@ proc parseChannelBindingMode*(s: string): ChannelBindingMode =
   of "require":
     cbRequire
   else:
-    raise newException(PgError, "Invalid channel_binding: " & s)
+    raise newException(PgConfigError, "Invalid channel_binding: " & s)
 
 proc parseSslNegotiation*(s: string): SslNegotiation =
   case s
@@ -54,7 +54,7 @@ proc parseSslNegotiation*(s: string): SslNegotiation =
   of "direct":
     sslnDirect
   else:
-    raise newException(PgError, "Invalid sslnegotiation: " & s)
+    raise newException(PgConfigError, "Invalid sslnegotiation: " & s)
 
 proc parseAuthMethod*(s: string): AuthMethod =
   case s
@@ -69,7 +69,7 @@ proc parseAuthMethod*(s: string): AuthMethod =
   of "scram-sha-256-plus":
     amScramSha256Plus
   else:
-    raise newException(PgError, "Invalid require_auth method: " & s)
+    raise newException(PgConfigError, "Invalid require_auth method: " & s)
 
 proc parseRequireAuth*(s: string): set[AuthMethod] =
   ## Parse a comma-separated list of auth method names into a set
@@ -80,7 +80,7 @@ proc parseRequireAuth*(s: string): set[AuthMethod] =
   for raw in s.split(','):
     let tok = raw.strip()
     if tok.len == 0:
-      raise newException(PgError, "Empty entry in require_auth list: " & s)
+      raise newException(PgConfigError, "Empty entry in require_auth list: " & s)
     result.incl(parseAuthMethod(tok))
 
 proc parseTargetSessionAttrs*(s: string): TargetSessionAttrs =
@@ -98,7 +98,7 @@ proc parseTargetSessionAttrs*(s: string): TargetSessionAttrs =
   of "prefer-standby":
     tsaPreferStandby
   else:
-    raise newException(PgError, "Invalid target_session_attrs: " & s)
+    raise newException(PgConfigError, "Invalid target_session_attrs: " & s)
 
 proc parseLoadBalanceHosts*(s: string): LoadBalanceHosts =
   case s
@@ -107,7 +107,7 @@ proc parseLoadBalanceHosts*(s: string): LoadBalanceHosts =
   of "random":
     lbhRandom
   else:
-    raise newException(PgError, "Invalid load_balance_hosts: " & s)
+    raise newException(PgConfigError, "Invalid load_balance_hosts: " & s)
 
 proc parsePort*(s: string): int =
   ## Follows libpq's strtol-based rules: surrounding whitespace and a leading
@@ -115,13 +115,13 @@ proc parsePort*(s: string): int =
   ## not, and the final value must be in 1–65535.
   let t = s.strip()
   if t.find('_') >= 0:
-    raise newException(PgError, "Invalid port in DSN: " & s)
+    raise newException(PgConfigError, "Invalid port in DSN: " & s)
   try:
     result = parseInt(t)
   except ValueError:
-    raise newException(PgError, "Invalid port in DSN: " & s)
+    raise newException(PgConfigError, "Invalid port in DSN: " & s)
   if result < 1 or result > 65535:
-    raise newException(PgError, "Port out of range (1-65535): " & s)
+    raise newException(PgConfigError, "Port out of range (1-65535): " & s)
 
 proc splitList(s: string): seq[string] =
   ## Comma-split a multi-host parameter; an empty string means "not provided".
@@ -141,7 +141,7 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
   ## can require an explicit name.
   if hostList.len > 0 and addrList.len > 0 and hostList.len != addrList.len:
     raise newException(
-      PgError,
+      PgConfigError,
       "Could not match " & $hostList.len & " host names to " & $addrList.len &
         " hostaddr values",
     )
@@ -159,7 +159,7 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
       portList
   if ports.len != 1 and ports.len != count:
     raise newException(
-      PgError, "Could not match " & $ports.len & " port numbers to " & $count & " hosts"
+      PgConfigError, "Could not match " & $ports.len & " port numbers to " & $count & " hosts"
     )
   for i in 0 ..< count:
     let h =
@@ -199,26 +199,26 @@ when defined(posix):
     ## Caller must `close(result.f)`.
     let fd = posix.open(path, O_RDONLY or O_NONBLOCK or O_CLOEXEC)
     if fd < 0:
-      raise newException(PgError, "Cannot read " & label & " file: " & path)
+      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
     if fstat(fd, result.st) != 0:
       discard close(fd)
-      raise newException(PgError, "Cannot stat " & label & " file: " & path)
+      raise newException(PgConfigError, "Cannot stat " & label & " file: " & path)
     if not S_ISREG(result.st.st_mode):
       discard close(fd)
       raise newException(
-        PgError, label & " file is not a regular file, refusing to use: " & path
+        PgConfigError, label & " file is not a regular file, refusing to use: " & path
       )
     let flags = fcntl(fd, F_GETFL)
     if flags == -1 or fcntl(fd, F_SETFL, flags and not O_NONBLOCK) == -1:
       discard close(fd)
-      raise newException(PgError, "Cannot read " & label & " file: " & path)
+      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
     if not open(result.f, fd, fmRead):
       discard close(fd)
-      raise newException(PgError, "Cannot read " & label & " file: " & path)
+      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
 
 proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
   ## Read a PEM parameter file (sslrootcert/sslcert/sslkey), wrapping the
-  ## stdlib `IOError` into a `PgError` with the parameter name. An empty file
+  ## stdlib `IOError` into a `PgConfigError` with the parameter name. An empty file
   ## is rejected: it would silently fall through the callers' `.len > 0`
   ## guards. With `checkKeyPerms` (sslkey), any group or world permission bit
   ## is rejected — intentionally stricter than libpq, which permits `0o640`
@@ -229,23 +229,23 @@ proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
     try:
       if checkKeyPerms and (opened.st.st_mode.int and (S_IRWXG or S_IRWXO).int) != 0:
         raise newException(
-          PgError,
+          PgConfigError,
           label & " file has group or world accessible permissions, refusing to use: " &
             path,
         )
       try:
         result = readAll(opened.f)
       except IOError:
-        raise newException(PgError, "Cannot read " & label & " file: " & path)
+        raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
     finally:
       close(opened.f)
   else:
     try:
       result = readFile(path)
     except IOError:
-      raise newException(PgError, "Cannot read " & label & " file: " & path)
+      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
   if result.len == 0:
-    raise newException(PgError, label & " file is empty: " & path)
+    raise newException(PgConfigError, label & " file is empty: " & path)
 
 proc rawHost(host, hostaddr: string): string =
   ## Inverse of `buildHosts`' defaulting: 127.0.0.1 with no hostaddr can only
@@ -290,7 +290,7 @@ proc rawHostLists(c: ConnConfig): tuple[hosts, addrs, ports: seq[string]] =
 
 const maxSockOptInt = int64(high(cint))
   ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
-  ## into an uncatchable RangeDefect at connect time instead of a PgError here.
+  ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
 
 proc applyParam*(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
@@ -338,12 +338,12 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
     try:
       secs = parseInt(val)
     except ValueError:
-      raise newException(PgError, "Invalid connect_timeout: " & val)
+      raise newException(PgConfigError, "Invalid connect_timeout: " & val)
     # `seconds` builds a nanosecond Duration, so anything past this multiplies
     # past high(int64) and raises an uncatchable OverflowDefect.
     const maxTimeoutSecs = high(int64) div 1_000_000_000
     if int64(secs) > maxTimeoutSecs:
-      raise newException(PgError, "connect_timeout out of range: " & val)
+      raise newException(PgConfigError, "connect_timeout out of range: " & val)
     # libpq treats a zero or negative connect_timeout as "wait indefinitely";
     # ZeroDuration is this codebase's "no timeout" sentinel. Mapping <= 0 here
     # avoids building a negative Duration, which would make `wait` time out
@@ -366,39 +366,39 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
     try:
       result.sslSni = parseInt(val) != 0
     except ValueError:
-      raise newException(PgError, "Invalid sslsni: " & val)
+      raise newException(PgConfigError, "Invalid sslsni: " & val)
   of "keepalives":
     try:
       result.keepAlive = parseInt(val) != 0
     except ValueError:
-      raise newException(PgError, "Invalid keepalives: " & val)
+      raise newException(PgConfigError, "Invalid keepalives: " & val)
   of "keepalives_idle":
     try:
       result.keepAliveIdle = parseInt(val)
     except ValueError:
-      raise newException(PgError, "Invalid keepalives_idle: " & val)
+      raise newException(PgConfigError, "Invalid keepalives_idle: " & val)
     if result.keepAliveIdle < 0:
-      raise newException(PgError, "keepalives_idle must be non-negative: " & val)
+      raise newException(PgConfigError, "keepalives_idle must be non-negative: " & val)
     if int64(result.keepAliveIdle) > maxSockOptInt:
-      raise newException(PgError, "keepalives_idle out of range: " & val)
+      raise newException(PgConfigError, "keepalives_idle out of range: " & val)
   of "keepalives_interval":
     try:
       result.keepAliveInterval = parseInt(val)
     except ValueError:
-      raise newException(PgError, "Invalid keepalives_interval: " & val)
+      raise newException(PgConfigError, "Invalid keepalives_interval: " & val)
     if result.keepAliveInterval < 0:
-      raise newException(PgError, "keepalives_interval must be non-negative: " & val)
+      raise newException(PgConfigError, "keepalives_interval must be non-negative: " & val)
     if int64(result.keepAliveInterval) > maxSockOptInt:
-      raise newException(PgError, "keepalives_interval out of range: " & val)
+      raise newException(PgConfigError, "keepalives_interval out of range: " & val)
   of "keepalives_count":
     try:
       result.keepAliveCount = parseInt(val)
     except ValueError:
-      raise newException(PgError, "Invalid keepalives_count: " & val)
+      raise newException(PgConfigError, "Invalid keepalives_count: " & val)
     if result.keepAliveCount < 0:
-      raise newException(PgError, "keepalives_count must be non-negative: " & val)
+      raise newException(PgConfigError, "keepalives_count must be non-negative: " & val)
     if int64(result.keepAliveCount) > maxSockOptInt:
-      raise newException(PgError, "keepalives_count out of range: " & val)
+      raise newException(PgConfigError, "keepalives_count out of range: " & val)
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
   of "load_balance_hosts":
@@ -407,16 +407,16 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
     try:
       result.maxMessageSize = parseInt(val)
     except ValueError:
-      raise newException(PgError, "Invalid max_message_size: " & val)
+      raise newException(PgConfigError, "Invalid max_message_size: " & val)
     if result.maxMessageSize < 0:
-      raise newException(PgError, "max_message_size must be non-negative: " & val)
+      raise newException(PgConfigError, "max_message_size must be non-negative: " & val)
   of "max_scram_iterations":
     try:
       result.maxScramIterations = parseInt(val)
     except ValueError:
-      raise newException(PgError, "Invalid max_scram_iterations: " & val)
+      raise newException(PgConfigError, "Invalid max_scram_iterations: " & val)
     if result.maxScramIterations < 0:
-      raise newException(PgError, "max_scram_iterations must be non-negative: " & val)
+      raise newException(PgConfigError, "max_scram_iterations must be non-negative: " & val)
   else:
     result.extraParams.add((key, val))
 
@@ -451,14 +451,14 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
       key.add dsn[i]
       inc i
     if key.len == 0:
-      raise newException(PgError, "Empty key in connection string")
+      raise newException(PgConfigError, "Empty key in connection string")
 
     # Skip whitespace around '='
     while i < dsn.len and dsn[i] in {' ', '\t'}:
       inc i
     if i >= dsn.len or dsn[i] != '=':
       raise newException(
-        PgError, "Expected '=' after key '" & key & "' in connection string"
+        PgConfigError, "Expected '=' after key '" & key & "' in connection string"
       )
     inc i # skip '='
     while i < dsn.len and dsn[i] in {' ', '\t'}:
@@ -483,7 +483,7 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
           val.add dsn[i]
           inc i
       if not closed:
-        raise newException(PgError, "Unterminated quoted value for key '" & key & "'")
+        raise newException(PgConfigError, "Unterminated quoted value for key '" & key & "'")
     else:
       # Unquoted value; backslash escapes the next character, even
       # whitespace (libpq drops a trailing lone backslash).
@@ -532,10 +532,10 @@ proc pctDecode(s: string): string =
   while i < s.len:
     if s[i] == '%':
       if i + 2 >= s.len or s[i + 1] notin HexDigits or s[i + 2] notin HexDigits:
-        raise newException(PgError, "Invalid percent-encoded token in DSN: " & s)
+        raise newException(PgConfigError, "Invalid percent-encoded token in DSN: " & s)
       let c = chr(parseHexInt(s[i + 1 .. i + 2]))
       if c == '\0':
-        raise newException(PgError, "Forbidden zero byte in DSN: " & s)
+        raise newException(PgConfigError, "Forbidden zero byte in DSN: " & s)
       result.add c
       i += 3
     else:
@@ -554,7 +554,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
       "postgres"
     else:
       raise newException(
-        PgError, "Invalid DSN scheme: expected postgresql:// or postgres://"
+        PgConfigError, "Invalid DSN scheme: expected postgresql:// or postgres://"
       )
 
   # Strip scheme prefix
@@ -612,7 +612,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
         # IPv6: [::1]:5432; a zone id is encoded as %25: [fe80::1%25eth0]
         let bracket = part.find(']')
         if bracket < 0:
-          raise newException(PgError, "Invalid IPv6 address in DSN")
+          raise newException(PgConfigError, "Invalid IPv6 address in DSN")
         hostList.add pctDecode(part[1 ..< bracket])
         let afterBracket = part[bracket + 1 .. ^1]
         if afterBracket.len == 0:
@@ -621,7 +621,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
           portList.add pctDecode(afterBracket[1 .. ^1])
         else:
           raise newException(
-            PgError, "Unexpected character after IPv6 address in DSN: " & part
+            PgConfigError, "Unexpected character after IPv6 address in DSN: " & part
           )
       else:
         let cpos = part.rfind(':')
@@ -632,7 +632,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
           # Reject it instead of silently splitting host=":" port="1".
           if part.find(':') != cpos:
             raise newException(
-              PgError, "IPv6 address in DSN must be bracketed, e.g. [::1]:5432: " & part
+              PgConfigError, "IPv6 address in DSN must be bracketed, e.g. [::1]:5432: " & part
             )
           hostList.add pctDecode(part[0 ..< cpos])
           portList.add pctDecode(part[cpos + 1 .. ^1])
@@ -651,7 +651,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
         # drop a security-relevant parameter (e.g. `?sslmode` falling back
         # to the default), so reject it instead.
         raise newException(
-          PgError, "Missing key/value separator '=' in URI query parameter: " & pair
+          PgConfigError, "Missing key/value separator '=' in URI query parameter: " & pair
         )
       let key = pctDecode(pair[0 ..< epos])
       let val = pctDecode(pair[epos + 1 .. ^1])
@@ -660,7 +660,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
         # it cannot set anything, so reject it instead of storing an
         # empty-named extra parameter. This mirrors `parseKeyValueDsn`,
         # which rejects empty keys as well.
-        raise newException(PgError, "Empty key in URI query parameter: " & pair)
+        raise newException(PgConfigError, "Empty key in URI query parameter: " & pair)
       case key
       of "host":
         hostList = splitList(val)
