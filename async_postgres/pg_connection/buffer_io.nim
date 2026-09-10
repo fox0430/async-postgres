@@ -326,6 +326,14 @@ proc nextMessage*(
 ): Option[BackendMessage] {.raises: [PgProtocolError].} =
   ## Parse next message from recvBuf (none = incomplete). Dispatches notify/notice,
   ## consumes ParameterStatus/DataRow (streaming via ``onRow``); ``skipDataRow`` avoids decode. Error → ``csClosed``.
+  ##
+  ## ``onRow`` requires ``onRowError``: callback failures are deferred into that
+  ## slot so the pump can drain to ReadyForQuery. Without a slot the first
+  ## DataRow would dereference nil, so the missing slot is rejected up front
+  ## with ``PgProtocolError`` (the connection is left open — unlike wire
+  ## corruption, this is a caller bug, not a broken peer).
+  if onRow != nil and onRowError == nil:
+    raise newException(PgProtocolError, "nextMessage: onRow requires onRowError")
   var pos = conn.recvBufStart
   let maxLen = conn.effectiveMaxMessageSize()
   while true:
