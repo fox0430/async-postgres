@@ -16,6 +16,10 @@ suite "sqlParams":
   test "mixed escape and placeholder":
     check sqlParams("SELECT ?? WHERE id = ?") == "SELECT ? WHERE id = $1"
 
+  test "JSON existence operator via ?? with placeholder":
+    check sqlParams("SELECT * FROM t WHERE data ?? 'key' AND id = ?") ==
+      "SELECT * FROM t WHERE data ? 'key' AND id = $1"
+
   test "? inside single-quoted string preserved":
     check sqlParams("SELECT 'what?' WHERE id = ?") == "SELECT 'what?' WHERE id = $1"
 
