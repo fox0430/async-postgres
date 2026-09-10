@@ -26,10 +26,34 @@ type Cursor* = ref object
   exhausted*: bool
   bufferedData: RowData
   bufferedCount: int32
+  inFlight: bool
+    ## True while a `fetchNext`/`close` await owns the wire. Open cursors keep
+    ## the connection ``csBusy`` across chunks (``PortalSuspended`` does not
+    ## ``markReady``), so ``checkReady`` cannot guard re-entrant cursor ops.
 
 proc columnIndex*(cursor: Cursor, name: string): int =
   ## Find the index of a column by name in a cursor.
   cursor.fields.columnIndex(name)
+
+proc raiseConcurrentCursorOp(conn: PgConnection) {.noreturn.} =
+  ## Same contract text as ``checkReady``: concurrent use → ``PgStateError``.
+  raise newException(
+    PgStateError,
+    "Connection is not ready (state: " & $conn.state &
+      "); a single connection cannot be used concurrently",
+  )
+
+proc beginCursorOp(cursor: Cursor) =
+  ## Serialize fetch/close on this cursor. Other connection entry points already
+  ## fail ``checkReady`` while the open portal holds ``csBusy``.
+  ## Does not call ``checkNotClosed``: ``close`` must still short-circuit on a
+  ## connection retired by timeout (see ``closeCursorImpl``).
+  if cursor.inFlight:
+    raiseConcurrentCursorOp(cursor.conn)
+  cursor.inFlight = true
+
+proc endCursorOp(cursor: Cursor) {.inline, raises: [].} =
+  cursor.inFlight = false
 
 proc openCursorImpl(
     conn: PgConnection,
@@ -222,8 +246,13 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## A closed connection raises ``PgStateError`` after a deliberate ``close()``,
   ## ``PgConnectionError`` after a lost one.
+  ## Concurrent ``fetchNext``/``close`` on the same cursor raises ``PgStateError``.
   let conn = cursor.conn
   conn.checkNotClosed()
+  # Reject while a wire op is in flight (including ``close``), so the buffered
+  # short-circuit cannot race a concurrent Close/Execute.
+  if cursor.inFlight:
+    raiseConcurrentCursorOp(conn)
   if cursor.bufferedCount > 0:
     result = newSeq[Row](cursor.bufferedCount)
     for i in 0 ..< cursor.bufferedCount:
@@ -235,9 +264,20 @@ proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   if cursor.exhausted:
     return @[]
 
-  awaitOrInvalidate(
-    cursor.conn, result, fetchNextImpl(cursor), cursor.timeout, "Cursor fetch timed out"
-  )
+  # Hold ``inFlight`` around ``awaitOrInvalidate`` (not inside the Impl) so a
+  # timed-out/cancelled Impl on asyncdispatch still clears the flag in this
+  # frame's ``finally`` — otherwise a later ``close`` would see a stuck latch.
+  beginCursorOp(cursor)
+  try:
+    awaitOrInvalidate(
+      cursor.conn,
+      result,
+      fetchNextImpl(cursor),
+      cursor.timeout,
+      "Cursor fetch timed out",
+    )
+  finally:
+    endCursorOp(cursor)
 
 proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
   # `fetchNext` checks bufferedCount before exhausted, so clear it before any
@@ -281,9 +321,16 @@ proc close*(cursor: Cursor): Future[void] {.async.} =
   ## Close the cursor and return the connection to ready state.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
-  awaitVoidOrInvalidate(
-    cursor.conn, closeCursorImpl(cursor), cursor.timeout, "Cursor close timed out"
-  )
+  ## Concurrent ``fetchNext``/``close`` on the same cursor raises ``PgStateError``.
+  if cursor.inFlight:
+    raiseConcurrentCursorOp(cursor.conn)
+  beginCursorOp(cursor)
+  try:
+    awaitVoidOrInvalidate(
+      cursor.conn, closeCursorImpl(cursor), cursor.timeout, "Cursor close timed out"
+    )
+  finally:
+    endCursorOp(cursor)
 
 template withCursor*(
     conn: PgConnection,
