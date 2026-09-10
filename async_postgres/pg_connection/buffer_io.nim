@@ -166,6 +166,43 @@ proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
   if conn.noticeCallback != nil:
     conn.noticeCallback(Notice(fields: msg.noticeFields))
 
+proc recordParameterStatus(
+    conn: PgConnection, name, value: string
+) {.raises: [PgProtocolError].} =
+  ## Store one ``ParameterStatus`` under ``MaxServerParams`` /
+  ## ``MaxServerParamsBytes``. Exceeding either cap is treated as a broken
+  ## peer: the connection is closed and ``PgProtocolError`` is raised. Updates
+  ## to an existing key are always admitted when the resulting byte total fits.
+  let newEntryBytes = name.len + value.len
+  if conn.serverParams.hasKey(name):
+    let oldLen = conn.serverParams.getOrDefault(name).len
+    let delta = value.len - oldLen
+    if delta > 0 and conn.serverParamsBytes > MaxServerParamsBytes - delta:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams byte total would exceed maximum of " &
+          $MaxServerParamsBytes,
+      )
+    conn.serverParamsBytes += delta
+    conn.serverParams[name] = value
+  else:
+    if conn.serverParams.len >= MaxServerParams:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams key count exceeds maximum of " & $MaxServerParams,
+      )
+    if newEntryBytes > MaxServerParamsBytes - conn.serverParamsBytes:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams byte total would exceed maximum of " &
+          $MaxServerParamsBytes,
+      )
+    conn.serverParams[name] = value
+    conn.serverParamsBytes += newEntryBytes
+
 # Raw send helpers (asyncdispatch only)
 
 when hasAsyncDispatch:
@@ -377,8 +414,9 @@ proc nextMessage*(
     if res.message.kind == bmkParameterStatus:
       # Keep serverParams current for the whole session (e.g. in_hot_standby
       # after a standby promotion), like libpq's pqSaveParameterStatus.
+      # Distinct-key and total-byte caps reject hostile flooding (fail-closed).
       let m = res.message
-      conn.serverParams[m.paramName] = m.paramValue
+      conn.recordParameterStatus(m.paramName, m.paramValue)
       continue
     if res.message.kind == bmkNegotiateProtocolVersion:
       # Informational per libpq; record and drop so callers never see it.

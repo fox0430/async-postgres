@@ -1018,6 +1018,8 @@ async_postgres/pg_protocol.nim	FrontendMessageKind
 async_postgres/pg_protocol.nim	MaxErrorOrNoticeFields
 async_postgres/pg_protocol.nim	MaxNegotiateProtocolOptions
 async_postgres/pg_protocol.nim	MaxSaslMechanisms
+async_postgres/pg_protocol.nim	MaxServerParams
+async_postgres/pg_protocol.nim	MaxServerParamsBytes
 async_postgres/pg_protocol.nim	ParseResult
 async_postgres/pg_protocol.nim	ParseState
 async_postgres/pg_protocol.nim	Row

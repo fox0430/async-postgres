@@ -1702,6 +1702,137 @@ suite "nextMessage onRow requires onRowError":
     check slot != nil
     check slot.msg == "boom"
 
+suite "nextMessage ParameterStatus bounds":
+  ## hostile distinct-key / byte flooding of ParameterStatus must fail-closed
+  ## under MaxServerParams / MaxServerParamsBytes (updates to existing keys stay OK).
+  proc buildMsg(msgType: char, body: seq[byte]): seq[byte] =
+    result = @[byte(msgType)]
+    result.addInt32(int32(4 + body.len))
+    result.add(body)
+
+  proc buildParameterStatusMsg(name, value: string): seq[byte] =
+    var body: seq[byte] = @[]
+    body.addCString(name)
+    body.addCString(value)
+    buildMsg('S', body)
+
+  proc buildReadyForQuery(): seq[byte] =
+    buildMsg('Z', @[byte('I')])
+
+  proc mockConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      serverParamsBytes: 0,
+      createdAt: Moment.now(),
+    )
+
+  test "records ParameterStatus under the caps":
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("server_version", "15.2") & buildReadyForQuery()
+    let opt = conn.nextMessage()
+    check opt.isSome
+    check opt.get.kind == bmkReadyForQuery
+    check conn.serverParams["server_version"] == "15.2"
+    check conn.serverParamsBytes == "server_version".len + "15.2".len
+    check conn.state == csReady
+
+  test "updates an existing key without counting a new entry":
+    var conn = mockConn()
+    # Fill to the key cap, then rewrite one existing key — must not raise.
+    var buf: seq[byte] = @[]
+    var expectedBytes = 0
+    for i in 0 ..< MaxServerParams:
+      let name = "k" & $i
+      buf.add(buildParameterStatusMsg(name, "v"))
+      expectedBytes += name.len + "v".len
+    buf.add(buildParameterStatusMsg("k0", "vv")) # overwrite: +1 byte delta
+    buf.add(buildReadyForQuery())
+    conn.recvBuf = buf
+    let opt = conn.nextMessage()
+    check opt.isSome
+    check opt.get.kind == bmkReadyForQuery
+    check conn.serverParams.len == MaxServerParams
+    check conn.serverParams["k0"] == "vv"
+    check conn.serverParamsBytes == expectedBytes + 1
+    check conn.state == csReady
+
+  test "value updates account for the delta (grow and shrink)":
+    var conn = mockConn()
+    # Insert "k" -> "vvvv": name 1 + value 4 = 5 bytes.
+    conn.recvBuf = buildParameterStatusMsg("k", "vvvv") & buildReadyForQuery()
+    let first = conn.nextMessage()
+    check first.isSome
+    check conn.serverParamsBytes == "k".len + "vvvv".len
+
+    # Shrink "vvvv" -> "v": delta -3 must decrement the running total.
+    conn.recvBufStart = 0
+    conn.recvBuf = buildParameterStatusMsg("k", "v") & buildReadyForQuery()
+    let second = conn.nextMessage()
+    check second.isSome
+    check conn.serverParams["k"] == "v"
+    check conn.serverParamsBytes == "k".len + "v".len
+
+    # Grow "v" -> "vvvvvv": delta +5 must increment it.
+    conn.recvBufStart = 0
+    conn.recvBuf = buildParameterStatusMsg("k", "vvvvvv") & buildReadyForQuery()
+    let third = conn.nextMessage()
+    check third.isSome
+    check conn.serverParams["k"] == "vvvvvv"
+    check conn.serverParamsBytes == "k".len + "vvvvvv".len
+
+  test "new key past MaxServerParams closes the connection":
+    var conn = mockConn()
+    var buf: seq[byte] = @[]
+    for i in 0 ..< MaxServerParams:
+      buf.add(buildParameterStatusMsg("k" & $i, "v"))
+    buf.add(buildParameterStatusMsg("overflow", "x"))
+    conn.recvBuf = buf
+    expect PgProtocolError:
+      discard conn.nextMessage()
+    check conn.state == csClosed
+    check conn.serverParams.len == MaxServerParams
+    check not conn.serverParams.hasKey("overflow")
+
+  test "byte total past MaxServerParamsBytes closes the connection":
+    var conn = mockConn()
+    # Seed just under the cap via private fields, then one more distinct key.
+    conn.serverParams["seed"] = "x"
+    conn.serverParamsBytes = MaxServerParamsBytes - 1
+    conn.recvBuf = buildParameterStatusMsg("n", "yy") # +3 bytes → over
+    expect PgProtocolError:
+      discard conn.nextMessage()
+    check conn.state == csClosed
+    check not conn.serverParams.hasKey("n")
+    check conn.serverParamsBytes == MaxServerParamsBytes - 1
+
+  test "value at the byte cap is accepted":
+    var conn = mockConn()
+    # Leave exactly 3 bytes of room, then store name "ab" + value "c".
+    conn.serverParamsBytes = MaxServerParamsBytes - 3
+    conn.recvBuf = buildParameterStatusMsg("ab", "c") & buildReadyForQuery()
+    let opt = conn.nextMessage()
+    check opt.isSome
+    check conn.serverParamsBytes == MaxServerParamsBytes
+    check conn.serverParams["ab"] == "c"
+    check conn.state == csReady
+
+  test "value growth past the byte cap closes the connection":
+    var conn = mockConn()
+    conn.serverParams["k"] = "v"
+    conn.serverParamsBytes = MaxServerParamsBytes - 5
+    # Grow "v"(1) → 8-byte value: delta +7 pushes past the remaining 5.
+    conn.recvBuf = buildParameterStatusMsg("k", "12345678")
+    expect PgProtocolError:
+      discard conn.nextMessage()
+    check conn.state == csClosed
+    check conn.serverParams["k"] == "v"
+    check conn.serverParamsBytes == MaxServerParamsBytes - 5
+
 suite "enqueueNotification with an outstanding handoff":
   ## Regression: the handoff was charged against `notifyMaxQueue`, shrinking the
   ## configured depth by one — a cap of 1 dropped every arrival while the queue
