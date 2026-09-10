@@ -401,6 +401,67 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "concurrent fetchNext raises PgStateError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # Drain the openCursor-buffered first row, then start a slow second fetch
+      # so a concurrent fetchNext can race the in-flight Execute.
+      let cursor = await conn.openCursor(
+        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
+          "FROM generate_series(1, 5) AS v",
+        chunkSize = 1,
+      )
+      let chunk1 = await cursor.fetchNext()
+      doAssert chunk1.len == 1
+      doAssert conn.state == csBusy
+
+      let fetchFut = cursor.fetchNext()
+      await sleepAsync(milliseconds(50))
+      doAssert not fetchFut.finished
+
+      var raised = false
+      try:
+        discard await cursor.fetchNext()
+      except PgStateError:
+        raised = true
+      doAssert raised
+
+      let chunk2 = await fetchFut
+      doAssert chunk2.len == 1
+      await cursor.close()
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "concurrent close during fetchNext raises PgStateError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let cursor = await conn.openCursor(
+        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
+          "FROM generate_series(1, 5) AS v",
+        chunkSize = 1,
+      )
+      discard await cursor.fetchNext()
+
+      let fetchFut = cursor.fetchNext()
+      await sleepAsync(milliseconds(50))
+      doAssert not fetchFut.finished
+
+      var raised = false
+      try:
+        await cursor.close()
+      except PgStateError:
+        raised = true
+      doAssert raised
+
+      discard await fetchFut
+      await cursor.close()
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
   test "cursor with chunkSize 1 fetches one row at a time":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
