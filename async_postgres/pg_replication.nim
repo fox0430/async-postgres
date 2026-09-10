@@ -12,7 +12,7 @@
 ##   defer: await conn.close()
 ##   let slot = await conn.createReplicationSlot("my_slot", "pgoutput", temporary = true)
 ##   await conn.startReplication("my_slot", slot.consistentPoint,
-##       options = {"proto_version": "'1'", "publication_names": "'my_pub'"},
+##       options = {"proto_version": "1", "publication_names": "my_pub"},
 ##       callback = myCallback)
 
 import std/[strutils, tables, times, options]
@@ -626,6 +626,17 @@ proc decodeCreateSlotRow(qr: QueryResult): ReplicationSlotInfo =
   if qr.fields.len > 3 and not row.isNull(3):
     result.outputPlugin = row.getStr(3)
 
+proc quoteReplLiteral(s: string): string =
+  ## Single-quote a walsender option value. Unlike `quoteLiteral` this never
+  ## emits the ``E'...'`` form: the replication scanner has no such rule and
+  ## treats ``\`` literally, so doubling ``'`` is the whole escape.
+  ##
+  ## Raises ``ValueError`` for an embedded NUL byte, like `quoteLiteral`: the
+  ## wire protocol terminates the query string there.
+  if '\0' in s:
+    raise newException(ValueError, "Replication option value contains a NUL byte")
+  "'" & s.replace("'", "''") & "'"
+
 proc createReplicationSlot*(
     conn: PgConnection,
     slotName: string,
@@ -1162,13 +1173,21 @@ proc startReplication*(
   ##
   ## Errors poison connection. Track LSN for resume. A failing auto-reply
   ## propagates too, and the callback is *not* invoked for that keepalive.
-  ## Options appended verbatim —
-  ## quote untrusted input. Raises ``PgConnectionError`` (closed) /
-  ## ``PgStateError`` (busy) unless ``csReady``, and ``ValueError`` for a
-  ## ``proto_version`` other than ``1`` in ``options``: the bundled pgoutput
-  ## decoder supports v1 only. ``publication_names`` without an explicit
-  ## ``proto_version`` adds ``proto_version = '1'`` to the generated command, so
-  ## a server-side default bump cannot outrun that decoder.
+  ## Option values are passed unquoted and single-quoted when building the
+  ## command (keys stay identifier-validated). An empty value means a
+  ## flag-only option (``binary`` rather than ``binary ''``). Raises
+  ## ``PgConnectionError`` (closed) / ``PgStateError`` (busy) unless
+  ## ``csReady``, and ``ValueError`` for a ``proto_version`` other than ``1``
+  ## in ``options`` (the value must be the unquoted string ``"1"``, an empty
+  ## one included): the bundled pgoutput decoder supports v1 only. Any value already wrapped in
+  ## quotes raises ``ValueError`` too, whatever its key, so the verbatim-options
+  ## spelling cannot silently name a publication ``'my_pub'`` or send a
+  ## thrice-quoted ``binary`` flag the plugin rejects mid-stream. An empty
+  ## ``publication_names`` and a value containing a NUL byte are rejected the
+  ## same way.
+  ## ``publication_names`` without an explicit ``proto_version`` adds
+  ## ``proto_version '1'`` to the generated command, so a server-side default
+  ## bump cannot outrun that decoder.
   ##
   ## ``statusInterval`` (``ZeroDuration`` = off) sends a proactive Standby Status
   ## Update at least that often — receive = highest received, flush/apply =
@@ -1186,17 +1205,40 @@ proc startReplication*(
   var hasProtoVersion = false
   var hasPublicationNames = false
   for (k, v) in options:
+    # Values are quoted below, so one that already arrives wrapped in quotes
+    # would reach the server including them. Reject the pre-quoting spelling
+    # rather than sending a value the plugin rejects mid-stream.
+    if v.len >= 2 and v[0] in {'\'', '"'} and v[^1] == v[0]:
+      raise newException(
+        ValueError,
+        "Quoted value " & v & " for replication option " & k &
+          ": the value would be quoted again and reach the server including" &
+          " the quotes (pass option values unquoted, e.g. \"my_pub\")",
+      )
     if k.cmpIgnoreCase("proto_version") == 0:
       hasProtoVersion = true
-      let pv = v.strip(chars = {'\'', '"', ' ', '\t'})
-      if pv.len > 0 and pv != "1":
+      if v.len == 0:
+        raise newException(
+          ValueError,
+          "Empty proto_version: an empty value is sent as a flag-only option," &
+            " which pgoutput rejects (pass the unquoted value \"1\")",
+        )
+      if v != "1":
         raise newException(
           ValueError,
           "Unsupported pgoutput proto_version " & v &
-            ": the bundled decoder supports proto_version 1 only",
+            ": the bundled decoder supports proto_version 1 only" &
+            " (pass option values unquoted, e.g. \"1\")",
         )
     elif k.cmpIgnoreCase("publication_names") == 0:
       hasPublicationNames = true
+      if v.len == 0:
+        raise newException(
+          ValueError,
+          "Empty publication_names: an empty value is sent as a flag-only" &
+            " option, which pgoutput rejects (pass one or more publication" &
+            " names, e.g. \"my_pub\")",
+        )
 
   conn.checkReady()
 
@@ -1204,9 +1246,10 @@ proc startReplication*(
   # future server-side default bump past 1.
   var effectiveOptions = options
   if hasPublicationNames and not hasProtoVersion:
-    effectiveOptions.add(("proto_version", "'1'"))
+    effectiveOptions.add(("proto_version", "1"))
 
-  # Build START_REPLICATION command
+  # Build START_REPLICATION command. Values are single-quoted so untrusted
+  # input cannot break out of the option list via the simple-query protocol.
   var sql =
     "START_REPLICATION SLOT " & quoteIdentifier(slotName) & " LOGICAL " & $startLsn
   if effectiveOptions.len > 0:
@@ -1223,7 +1266,7 @@ proc startReplication*(
             raise newException(ValueError, "Invalid replication option key: " & k)
       sql.add(k)
       if v.len > 0:
-        sql.add(" " & v)
+        sql.add(" " & quoteReplLiteral(v))
     sql.add(")")
 
   let msg = encodeQuery(sql)

@@ -278,6 +278,7 @@ apiExists(parseRangeText)
 
 # -- query-result helpers
 apiExists(quoteIdentifier)
+apiExists(quoteLiteral)
 apiExists(dialAddr)
 apiExists(displayHost)
 apiExists(lookupTypeOids)
