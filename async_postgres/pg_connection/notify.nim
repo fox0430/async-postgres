@@ -100,6 +100,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.pid = newConn.pid
   conn.secretKey = newConn.secretKey
   conn.serverParams = newConn.serverParams
+  conn.serverParamsBytes = newConn.serverParamsBytes
   conn.txStatus = newConn.txStatus
   conn.markReady()
   conn.createdAt = newConn.createdAt

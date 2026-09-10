@@ -243,6 +243,9 @@ type
     pid: int32
     secretKey: int32
     serverParams: Table[string, string]
+    serverParamsBytes: int
+      ## Running sum of ``name.len + value.len`` over ``serverParams`` entries.
+      ## Enforced against ``MaxServerParamsBytes`` on every ``ParameterStatus``.
     negotiatedMinorVersion: int32
       ## Highest minor version the server supports, from `NegotiateProtocolVersion`.
       ## Zero when no such message was seen.
@@ -926,6 +929,8 @@ func sslEnabled*(conn: PgConnection): bool {.inline.} =
 func serverParams*(conn: PgConnection): lent Table[string, string] {.inline.} =
   ## ``ParameterStatus`` values reported by the server (``server_version``,
   ## ``client_encoding``, ...), kept current as the server re-sends them.
+  ## Bounded by ``MaxServerParams`` distinct keys and ``MaxServerParamsBytes``
+  ## total name+value bytes; exceeding either closes the connection.
   conn.serverParams
 
 func serverParam*(conn: PgConnection, name: string): string =

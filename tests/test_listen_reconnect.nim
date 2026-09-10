@@ -20,7 +20,7 @@
 ## re-LISTEN loop is a no-op, isolating the buffer copy, and assert the pairing
 ## invariant directly — deterministic, no timing dependence on either backend.
 
-import std/[deques, monotimes, unittest, sets, strutils]
+import std/[deques, monotimes, unittest, sets, strutils, tables]
 
 import ../async_postgres/async_backend
 import ../async_postgres/pg_protocol
@@ -90,6 +90,76 @@ suite "reconnectInPlace buffer pairing":
     # finalLen > 0, so the next read would re-parse stale auth bytes and desync.
     check finalLen > 0
     check finalStart == finalLen
+
+suite "reconnectInPlace serverParams pairing":
+  test "serverParams and serverParamsBytes follow the fresh connection together":
+    ## Regression: `reconnectInPlace` must copy `serverParams` and its byte
+    ## counter `serverParamsBytes` as a pair. Dropping the counter copy leaves
+    ## the table swapped but the running total at its pre-reconnect value, so
+    ## the byte cap is silently wrong for the rest of the connection's life.
+    ## We give the two handshakes different ParameterStatus sets and seed a
+    ## stale entry before reconnecting, so a table copy that appends, or a
+    ## counter left untouched, fails the checks below.
+    var preAppMatches = false
+    var preBytes = -1
+    var finalState: PgConnState
+    var finalAppMatches = false
+    var finalVersionMatches = false
+    var finalStaleGone = false
+    var finalBytesExact = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      proc serverHandler() {.async.} =
+        # Connection 1: the original transport, with a distinct parameter value.
+        sc1 = await acceptAndReady(ms, params = @[("application_name", "old")])
+        # Connection 2: the reconnect target. Two parameters make the expected
+        # byte total differ from connection 1's, so a stale counter is visible.
+        sc2 = await acceptAndReady(
+          ms, params = @[("application_name", "new"), ("server_version", "16.1")]
+        )
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      preAppMatches = conn.serverParams.getOrDefault("application_name", "") == "old"
+      preBytes = conn.serverParamsBytes
+      # Seed a stale entry: a swap that appends to (rather than replaces) the
+      # table, or that leaves the counter untouched, fails the checks below.
+      conn.serverParams["stale"] = "entry"
+      conn.serverParamsBytes += "stale".len + "entry".len
+
+      # No subscribed channels => the re-LISTEN loop does nothing, isolating the
+      # state copy.
+      await conn.reconnectInPlace()
+      finalState = conn.state
+      finalAppMatches = conn.serverParams.getOrDefault("application_name", "") == "new"
+      finalVersionMatches =
+        conn.serverParams.getOrDefault("server_version", "") == "16.1"
+      finalStaleGone = not conn.serverParams.hasKey("stale")
+      finalBytesExact =
+        conn.serverParamsBytes ==
+        "application_name".len + "new".len + "server_version".len + "16.1".len
+
+      await serverFut
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await closeClient(sc1)
+      await closeClient(sc2)
+      await closeServer(ms)
+
+    waitFor testBody()
+    # Sanity: the initial connect really recorded connection 1's parameter set.
+    check preAppMatches
+    check preBytes == "application_name".len + "old".len
+    check finalState == csReady
+    # The fix: the table is replaced and the counter is copied from newConn.
+    check finalAppMatches
+    check finalVersionMatches
+    check finalStaleGone
+    check finalBytesExact
 
 ## Regression target (M-7): when multi-host failover reconnects to a *different*
 ## host, `reconnectInPlace` must copy `newConn.host`/`newConn.port` too — not just

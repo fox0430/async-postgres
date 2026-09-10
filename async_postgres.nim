@@ -210,6 +210,8 @@ export pg_protocol.DefaultMaxBackendMessageLen
 export pg_protocol.MaxNegotiateProtocolOptions
 export pg_protocol.MaxErrorOrNoticeFields
 export pg_protocol.MaxSaslMechanisms
+export pg_protocol.MaxServerParams
+export pg_protocol.MaxServerParamsBytes
 export pg_protocol.initRow
 export pg_protocol.data
 export pg_protocol.rowIdx

@@ -369,6 +369,8 @@ apiExists(DefaultMaxBackendMessageLen)
 apiExists(MaxNegotiateProtocolOptions)
 apiExists(MaxErrorOrNoticeFields)
 apiExists(MaxSaslMechanisms)
+apiExists(MaxServerParams)
+apiExists(MaxServerParamsBytes)
 
 # -- row / QueryResult helpers (pg_protocol, simple_query)
 apiExists(initRow)
