@@ -1208,3 +1208,29 @@ suite "applyParam multi-host":
     expect PgError:
       cfg.applyParam("hostaddr", "10.0.0.1")
     check cfg.port == 5432
+
+  test "config faults raise PgConfigError (except PgError still catches)":
+    # S6: every DSN fault path must be discriminable as PgConfigError, while
+    # remaining catchable as the PgError base type.
+    for dsn in [
+      "postgresql://host/db?sslmode=bogus", "postgresql://host/db?connect_timeout=abc",
+      "postgresql://host/db?sslmode", "postgresql://host:99999/db",
+      "postgresql://host/db?application_name=a%zz", "http://host/db",
+      "postgresql://[::1/db",
+    ]:
+      var caughtBase = false
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError:
+        caughtBase = true
+      except PgError:
+        fail()
+      check caughtBase
+    block:
+      var caught: ref PgConfigError = nil
+      try:
+        discard parseDsn("postgresql://host/db?sslmode=bogus")
+      except PgConfigError as e:
+        caught = e
+      check caught != nil
+      check (caught of PgError)
