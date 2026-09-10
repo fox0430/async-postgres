@@ -1213,12 +1213,9 @@ suite "applyParam multi-host":
     # S6: every DSN fault path must be discriminable as PgConfigError, while
     # remaining catchable as the PgError base type.
     for dsn in [
-      "postgresql://host/db?sslmode=bogus",
-      "postgresql://host/db?connect_timeout=abc",
-      "postgresql://host/db?sslmode",
-      "postgresql://host:99999/db",
-      "postgresql://host/db?application_name=a%zz",
-      "http://host/db",
+      "postgresql://host/db?sslmode=bogus", "postgresql://host/db?connect_timeout=abc",
+      "postgresql://host/db?sslmode", "postgresql://host:99999/db",
+      "postgresql://host/db?application_name=a%zz", "http://host/db",
       "postgresql://[::1/db",
     ]:
       var caughtBase = false

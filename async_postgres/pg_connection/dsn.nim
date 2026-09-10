@@ -159,7 +159,8 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
       portList
   if ports.len != 1 and ports.len != count:
     raise newException(
-      PgConfigError, "Could not match " & $ports.len & " port numbers to " & $count & " hosts"
+      PgConfigError,
+      "Could not match " & $ports.len & " port numbers to " & $count & " hosts",
     )
   for i in 0 ..< count:
     let h =
@@ -387,7 +388,8 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
     except ValueError:
       raise newException(PgConfigError, "Invalid keepalives_interval: " & val)
     if result.keepAliveInterval < 0:
-      raise newException(PgConfigError, "keepalives_interval must be non-negative: " & val)
+      raise
+        newException(PgConfigError, "keepalives_interval must be non-negative: " & val)
     if int64(result.keepAliveInterval) > maxSockOptInt:
       raise newException(PgConfigError, "keepalives_interval out of range: " & val)
   of "keepalives_count":
@@ -416,7 +418,8 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
     except ValueError:
       raise newException(PgConfigError, "Invalid max_scram_iterations: " & val)
     if result.maxScramIterations < 0:
-      raise newException(PgConfigError, "max_scram_iterations must be non-negative: " & val)
+      raise
+        newException(PgConfigError, "max_scram_iterations must be non-negative: " & val)
   else:
     result.extraParams.add((key, val))
 
@@ -483,7 +486,8 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
           val.add dsn[i]
           inc i
       if not closed:
-        raise newException(PgConfigError, "Unterminated quoted value for key '" & key & "'")
+        raise
+          newException(PgConfigError, "Unterminated quoted value for key '" & key & "'")
     else:
       # Unquoted value; backslash escapes the next character, even
       # whitespace (libpq drops a trailing lone backslash).
@@ -632,7 +636,8 @@ proc parseUriDsn*(dsn: string): ConnConfig =
           # Reject it instead of silently splitting host=":" port="1".
           if part.find(':') != cpos:
             raise newException(
-              PgConfigError, "IPv6 address in DSN must be bracketed, e.g. [::1]:5432: " & part
+              PgConfigError,
+              "IPv6 address in DSN must be bracketed, e.g. [::1]:5432: " & part,
             )
           hostList.add pctDecode(part[0 ..< cpos])
           portList.add pctDecode(part[cpos + 1 .. ^1])
@@ -651,7 +656,8 @@ proc parseUriDsn*(dsn: string): ConnConfig =
         # drop a security-relevant parameter (e.g. `?sslmode` falling back
         # to the default), so reject it instead.
         raise newException(
-          PgConfigError, "Missing key/value separator '=' in URI query parameter: " & pair
+          PgConfigError,
+          "Missing key/value separator '=' in URI query parameter: " & pair,
         )
       let key = pctDecode(pair[0 ..< epos])
       let val = pctDecode(pair[epos + 1 .. ^1])
