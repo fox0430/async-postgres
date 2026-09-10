@@ -930,11 +930,19 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
       if i >= inner.len:
         raise newException(PgTypeError, "array: unterminated quoted element")
       i += 1 # skip closing quote
+      # A quoted element must be followed by ',' or the end of the array;
+      # anything else (e.g. `{"ab"cd}`) would otherwise split silently.
+      if i < inner.len and inner[i] != ',':
+        raise newException(PgTypeError, "array: unexpected byte after quoted element")
       result.add(some(elem))
     else:
       # Unquoted element
       var elem = ""
       while i < inner.len and inner[i] != ',':
+        # Server-side output quotes elements containing these structural
+        # bytes, so an unquoted occurrence is malformed input.
+        if inner[i] in {'"', '\\', '{', '}'}:
+          raise newException(PgTypeError, "array: unexpected byte in unquoted element")
         elem.add(inner[i])
         i += 1
       if elem == "NULL":
@@ -943,3 +951,5 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
         result.add(some(elem))
     if i < inner.len and inner[i] == ',':
       i += 1
+      if i == inner.len:
+        raise newException(PgTypeError, "array: trailing comma")

@@ -264,6 +264,12 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
       # Unquoted field
       var elem = ""
       while i < inner.len and inner[i] != ',':
+        # Server-side output quotes fields containing these structural
+        # bytes (see compositeFieldToText), so an unquoted occurrence is
+        # malformed input that would otherwise decode silently.
+        if inner[i] in {'"', '\\', '(', ')'}:
+          raise
+            newException(PgTypeError, "composite: unexpected byte in unquoted field")
         elem.add(inner[i])
         i += 1
       result.add(some(elem))
