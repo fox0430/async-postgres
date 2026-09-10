@@ -1652,6 +1652,56 @@ suite "nextMessage skipDataRow":
     check rd.cellIndex[1] == 2'i32 # "hi" length
     check conn.recvBufStart == row.len
 
+suite "nextMessage onRow requires onRowError":
+  proc buildMsg(msgType: char, body: seq[byte]): seq[byte] =
+    result = @[byte(msgType)]
+    result.addInt32(int32(4 + body.len))
+    result.add(body)
+
+  proc buildDataRowMsg(values: openArray[string]): seq[byte] =
+    var body: seq[byte] = @[]
+    body.addInt16(int16(values.len))
+    for v in values:
+      body.addInt32(int32(v.len))
+      for c in v:
+        body.add(byte(c))
+    buildMsg('D', body)
+
+  proc mockConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "onRow without onRowError raises PgProtocolError, connection stays open":
+    var conn = mockConn()
+    conn.recvBuf = buildDataRowMsg(["hello"])
+    conn.recvBufStart = 0
+    var rd = newRowData(1)
+    let cb: RowCallback = proc(row: Row) {.gcsafe, raises: [CatchableError].} =
+      discard
+    expect PgProtocolError:
+      discard conn.nextMessage(rd, onRow = cb)
+    # Caller bug, not a broken peer: the guard must not close the connection.
+    check conn.state == csReady
+
+  test "onRow with onRowError defers the first callback failure":
+    var conn = mockConn()
+    conn.recvBuf = buildDataRowMsg(["hello"])
+    conn.recvBufStart = 0
+    var rd = newRowData(1)
+    let cb: RowCallback = proc(row: Row) {.gcsafe, raises: [CatchableError].} =
+      raise newException(CatchableError, "boom")
+    var slot: ref CatchableError = nil
+    let opt = conn.nextMessage(rd, onRow = cb, onRowError = addr slot)
+    check opt.isNone # row consumed, then psIncomplete on the empty tail
+    check slot != nil
+    check slot.msg == "boom"
+
 suite "enqueueNotification with an outstanding handoff":
   ## Regression: the handoff was charged against `notifyMaxQueue`, shrinking the
   ## configured depth by one — a cap of 1 dropped every arrival while the queue
