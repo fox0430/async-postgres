@@ -186,6 +186,34 @@ suite "E2E: quoteIdentifier":
   test "identifier with spaces":
     doAssert quoteIdentifier("my table") == "\"my table\""
 
+suite "E2E: quoteLiteral":
+  test "simple literal":
+    doAssert quoteLiteral("foo") == "'foo'"
+
+  test "literal with single quotes":
+    doAssert quoteLiteral("foo'bar") == "'foo''bar'"
+
+  test "empty string":
+    doAssert quoteLiteral("") == "''"
+
+  test "injection-shaped payload":
+    doAssert quoteLiteral("x'); DROP TABLE t; --") == "'x''); DROP TABLE t; --'"
+
+  test "backslash switches to E'' form with the backslash doubled":
+    # Plain quoting would let this escape the literal under
+    # standard_conforming_strings = off. The leading space keeps the E from
+    # merging into a preceding identifier or numeric constant.
+    doAssert quoteLiteral("a\\b") == " E'a\\\\b'"
+    doAssert quoteLiteral("\\'; DROP TABLE t; --") == " E'\\\\''; DROP TABLE t; --'"
+
+  test "NUL byte raises ValueError":
+    var raised = false
+    try:
+      discard quoteLiteral("a\0b")
+    except ValueError:
+      raised = true
+    doAssert raised, "NUL byte should raise ValueError"
+
 suite "E2E: Logical Replication":
   test "identifySystem returns valid info":
     proc t() {.async.} =
@@ -276,7 +304,7 @@ suite "E2E: Logical Replication":
       await replConn.startReplication(
         "test_stream_slot",
         slot.consistentPoint,
-        options = @{"proto_version": "'1'", "publication_names": "'test_repl_pub'"},
+        options = @{"proto_version": "1", "publication_names": "test_repl_pub"},
         callback = cb,
       )
 
@@ -320,7 +348,7 @@ suite "E2E: Logical Replication":
       await replConn.startReplication(
         "test_state_slot",
         slot.consistentPoint,
-        options = @{"proto_version": "'1'", "publication_names": "'test_state_pub'"},
+        options = @{"proto_version": "1", "publication_names": "test_state_pub"},
         callback = cb,
       )
 
@@ -344,14 +372,16 @@ suite "E2E: Logical Replication":
       let cb = makeReplicationCallback:
         discard
 
-      var raised = false
-      try:
-        await replConn.startReplication(
-          "no_such_slot", InvalidLsn, options = @{"proto_version": "'2'"}, callback = cb
-        )
-      except ValueError:
-        raised = true
-      doAssert raised, "proto_version other than 1 should raise ValueError"
+      # The empty value would reach the server as a flag-only option.
+      for bad in ["2", ""]:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot", InvalidLsn, options = @{"proto_version": bad}, callback = cb
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "proto_version other than 1 should raise ValueError: " & bad
 
       # Validation runs before checkReady / state change / wire I/O, so the
       # connection stays usable and the nonexistent slot is never referenced.
@@ -359,6 +389,93 @@ suite "E2E: Logical Replication":
       let info = await replConn.identifySystem()
       doAssert info.systemId.len > 0
 
+      await replConn.close()
+
+    waitFor t()
+
+  test "quoted proto_version raises ValueError (values must be unquoted)":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig())
+
+      let cb = makeReplicationCallback:
+        discard
+
+      # Legacy spellings from the verbatim-options era must fail fast instead
+      # of reaching the server as a doubly-quoted value.
+      for legacy in ["'1'", "\"1\"", " 1 "]:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot",
+            InvalidLsn,
+            options = @{"proto_version": legacy},
+            callback = cb,
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "quoted proto_version should raise ValueError: " & legacy
+
+      doAssert replConn.state == csReady
+      await replConn.close()
+
+    waitFor t()
+
+  test "quoted or empty publication_names raises ValueError":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig())
+
+      let cb = makeReplicationCallback:
+        discard
+
+      # Same verbatim-options legacy spellings as proto_version, plus the
+      # empty value that would reach the server as a flag-only option.
+      for bad in ["'my_pub'", "\"my_pub\"", ""]:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot",
+            InvalidLsn,
+            options = @{"publication_names": bad},
+            callback = cb,
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "bad publication_names should raise ValueError: " & bad
+
+      doAssert replConn.state == csReady
+      await replConn.close()
+
+    waitFor t()
+
+  test "quoted value or NUL on any option key raises ValueError":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig())
+
+      let cb = makeReplicationCallback:
+        discard
+
+      # Keys other than proto_version/publication_names take the same guard:
+      # re-quoting would reach the plugin as a literal including the quotes.
+      let bad = @[
+        ("binary", "'true'"),
+        ("origin", "'none'"),
+        ("streaming", "\"on\""),
+        ("messages", "on\0tail"),
+      ]
+      for (key, value) in bad:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot",
+            InvalidLsn,
+            options = @{"publication_names": "my_pub", key: value},
+            callback = cb,
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "bad " & key & " should raise ValueError: " & value
+
+      doAssert replConn.state == csReady
       await replConn.close()
 
     waitFor t()

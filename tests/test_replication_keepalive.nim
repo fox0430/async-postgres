@@ -717,13 +717,13 @@ proc runStartReplicationCapture(slot: string, options: seq[(string, string)]): s
 
 suite "Replication: pgoutput proto_version defensive injection":
   test "publication_names without proto_version pins proto_version '1'":
-    let q = runStartReplicationCapture("test_slot", @[("publication_names", "'p1'")])
+    let q = runStartReplicationCapture("test_slot", @[("publication_names", "p1")])
     check "publication_names 'p1'" in q
     check "proto_version '1'" in q
 
   test "explicit proto_version is preserved and not duplicated":
     let q = runStartReplicationCapture(
-      "test_slot", @[("proto_version", "'1'"), ("publication_names", "'p1'")]
+      "test_slot", @[("proto_version", "1"), ("publication_names", "p1")]
     )
     check q.count("proto_version") == 1
 
@@ -732,3 +732,23 @@ suite "Replication: pgoutput proto_version defensive injection":
     # not understand proto_version and would reject an injected value.
     let q = runStartReplicationCapture("test_slot", @[])
     check "proto_version" notin q
+
+  test "option values are single-quoted against injection":
+    let q = runStartReplicationCapture(
+      "test_slot", @[("publication_names", "p1'); DROP TABLE t; --")]
+    )
+    # Single-quoted with embedded quotes doubled — no unquoted breakout.
+    check "publication_names 'p1''); DROP TABLE t; --'" in q
+    check "publication_names 'p1'); DROP" notin q
+
+  test "empty option value stays flag-only (no quoted empty string)":
+    let q = runStartReplicationCapture("test_slot", @[("binary", "")])
+    check "(binary)" in q
+    check "binary ''" notin q
+
+  test "backslash in an option value stays literal (no E'' form)":
+    # The walsender scanner has no E'' rule, so the value must keep its plain
+    # single-quoted spelling even though `quoteLiteral` would switch forms.
+    let q = runStartReplicationCapture("test_slot", @[("publication_names", "a\\b")])
+    check "publication_names 'a\\b'" in q
+    check "E'" notin q

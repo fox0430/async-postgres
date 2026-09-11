@@ -360,6 +360,7 @@ async_postgres/pg_connection.nim	export simple_query.items
 async_postgres/pg_connection.nim	export simple_query.len
 async_postgres/pg_connection.nim	export simple_query.ping
 async_postgres/pg_connection.nim	export simple_query.quoteIdentifier
+async_postgres/pg_connection.nim	export simple_query.quoteLiteral
 async_postgres/pg_connection.nim	export simple_query.rows
 async_postgres/pg_connection.nim	export simple_query.simpleExec
 async_postgres/pg_connection.nim	export simple_query.simpleQuery
@@ -542,6 +543,7 @@ async_postgres/pg_connection/simple_query.nim	items
 async_postgres/pg_connection/simple_query.nim	len
 async_postgres/pg_connection/simple_query.nim	ping
 async_postgres/pg_connection/simple_query.nim	quoteIdentifier
+async_postgres/pg_connection/simple_query.nim	quoteLiteral
 async_postgres/pg_connection/simple_query.nim	retireOnTimeout
 async_postgres/pg_connection/simple_query.nim	rows
 async_postgres/pg_connection/simple_query.nim	simpleExec
