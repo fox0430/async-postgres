@@ -3081,6 +3081,7 @@ suite "PgMoney":
   test "parsePgMoney accepts optional $ and +":
     check parsePgMoney("1234.56") == initPgMoney(123456)
     check parsePgMoney("$1234.56") == initPgMoney(123456)
+    check parsePgMoney("1.00$") == initPgMoney(100)
     check parsePgMoney("+$1.00") == initPgMoney(100)
 
   test "parsePgMoney accepts sign after currency symbol":
@@ -3102,6 +3103,54 @@ suite "PgMoney":
   test "parsePgMoney strips non-ASCII currency symbols":
     check parsePgMoney("¥12.34") == initPgMoney(1234)
     check parsePgMoney("£1,234.56") == initPgMoney(123456)
+
+  test "parsePgMoney accepts ASCII locale currency symbols":
+    # sv_SE / hu_HU / pl_PL emit letter symbols, so letters cannot be banned
+    # in the symbol region.
+    check parsePgMoney("1234,56 kr") == initPgMoney(123456)
+    check parsePgMoney("1234,56 Ft") == initPgMoney(123456)
+    check parsePgMoney("zł1234,56") == initPgMoney(123456)
+    check parsePgMoney("R$1234,56") == initPgMoney(123456)
+
+  test "parsePgMoney accepts the Unicode space and quote separators":
+    # Real mon_thousands_sep values: U+202F (fr_FR / ru_RU / sv_SE),
+    # U+2019 and ' (de_CH), U+00A0 and a plain space in older locale data.
+    check parsePgMoney("1 234.56") == initPgMoney(123456)
+    check parsePgMoney("1 234,56 €") == initPgMoney(123456)
+    check parsePgMoney("1 234 567,89") == initPgMoney(123456789)
+    check parsePgMoney("-1 234,56 kr") == initPgMoney(-123456)
+    check parsePgMoney("1 234", scale = 0) == initPgMoney(1234, scale = 0)
+    check parsePgMoney("1\u202F234,56 \u20AC") == initPgMoney(123456)
+    check parsePgMoney("1\u2019234.56") == initPgMoney(123456)
+    check parsePgMoney("1'234.56") == initPgMoney(123456)
+    check parsePgMoney("1\u2009234,56") == initPgMoney(123456)
+    check parsePgMoney("1\u202F234\u202F567", scale = 0) ==
+      initPgMoney(1234567, scale = 0)
+
+  test "parsePgMoney rejects a short group after a space separator":
+    # scale=0 has no fractional part, so a space separator is grouping and the
+    # last group must be full; otherwise "1 23" would decode as 123.
+    expect(PgTypeError):
+      discard parsePgMoney("1 23", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("1\u00A023", scale = 0)
+
+  test "parsePgMoney rejects 4-wide groups without a fractional part":
+    # With scale=0 every separator is grouping, and no locale pairs frac_digits
+    # = 0 with 4-wide groups -- accepting them would read a 4-decimal "1.2345"
+    # from a mismatched lc_monetary as 12345.
+    expect(PgTypeError):
+      discard parsePgMoney("1.2345", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("12.3456", scale = 0)
+    # 4-wide grouping stays valid where a locale really uses it (zh_TW).
+    check parsePgMoney("1,2345.67") == initPgMoney(1234567)
+
+  test "parsePgMoney rejects a separator inside the fractional part":
+    expect(PgTypeError):
+      discard parsePgMoney("1.2 3")
+    expect(PgTypeError):
+      discard parsePgMoney("1,2\u00A03")
 
   test "parsePgMoney strips surrounding whitespace":
     check parsePgMoney("  $100.00  ") == initPgMoney(10000)
@@ -3161,6 +3210,15 @@ suite "PgMoney":
       discard parsePgMoney("1.23", scale = 0)
     expect(PgTypeError):
       discard parsePgMoney("1.5", scale = 0)
+    # Junk interrupting the digits must not be dropped.
+    expect(PgTypeError):
+      discard parsePgMoney("12a34.56")
+    expect(PgTypeError):
+      discard parsePgMoney("12€34.56")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00 2")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00 kr 2.00")
 
   test "parsePgMoney rejects overflow":
     expect(PgTypeError):
@@ -3175,60 +3233,407 @@ suite "PgMoney":
     check hash(initPgMoney(42)) == hash(initPgMoney(42))
     check hash(initPgMoney(42, scale = 0)) != hash(initPgMoney(42, scale = 2))
 
-  test "ordering rejects mismatched scale":
-    expect(PgTypeError):
-      discard initPgMoney(100, scale = 0) < initPgMoney(100, scale = 2)
-    expect(PgTypeError):
-      discard initPgMoney(100, scale = 0) <= initPgMoney(100, scale = 2)
+  test "comparison is by decimal value across scales":
+    # 1.00 and 1.000 are the same amount written at two scales.
+    check initPgMoney(100, scale = 2) == initPgMoney(1000, scale = 3)
+    check hash(initPgMoney(100, scale = 2)) == hash(initPgMoney(1000, scale = 3))
+    # 1.00 < 100 and 100 > 1.00 both hold, instead of raising.
+    check initPgMoney(100, scale = 2) < initPgMoney(100, scale = 0)
+    check initPgMoney(100, scale = 0) > initPgMoney(100, scale = 2)
+    check not (initPgMoney(100, scale = 0) <= initPgMoney(100, scale = 2))
+    check initPgMoney(-1, scale = 2) < initPgMoney(0, scale = 0)
+    # int64.low must not wrap while being rescaled for comparison.
+    check initPgMoney(low(int64), scale = 2) < initPgMoney(0, scale = 0)
+    check initPgMoney(low(int64), scale = 2) == initPgMoney(low(int64), scale = 2)
+    check initPgMoney(high(int64), scale = 18) > initPgMoney(9, scale = 0)
+
+  test "PgMoney cannot be built without its scale":
+    # A partial literal would tag the amount with scale 0, shifting it by two
+    # digits; private fields make it fail to compile.
+    check not compiles(PgMoney(amountRaw: 123456'i64))
+    check not compiles((var m = initPgMoney(1); m.amount = 2))
 
   test "formatPgMoney default = $":
     check formatPgMoney(initPgMoney(123456)) == "1234.56"
     check formatPgMoney(initPgMoney(-123456)) == "-1234.56"
 
   test "formatPgMoney en_US style":
-    check formatPgMoney(initPgMoney(123456), symbol = "$", thousandsSep = ',') ==
+    check formatPgMoney(initPgMoney(123456), symbol = "$", thousandsSep = ",") ==
       "$1,234.56"
-    check formatPgMoney(initPgMoney(123456789), symbol = "$", thousandsSep = ',') ==
+    check formatPgMoney(initPgMoney(123456789), symbol = "$", thousandsSep = ",") ==
       "$1,234,567.89"
-    check formatPgMoney(initPgMoney(-123456), symbol = "$", thousandsSep = ',') ==
+    check formatPgMoney(initPgMoney(-123456), symbol = "$", thousandsSep = ",") ==
       "-$1,234.56"
-    check formatPgMoney(initPgMoney(1), symbol = "$", thousandsSep = ',') == "$0.01"
+    check formatPgMoney(initPgMoney(1), symbol = "$", thousandsSep = ",") == "$0.01"
 
   test "formatPgMoney EU style":
     check formatPgMoney(
       initPgMoney(123456),
-      symbol = " €",
+      symbol = "€",
       decimalSep = ',',
-      thousandsSep = '.',
+      thousandsSep = ".",
       symbolBefore = false,
+      sepBySpace = true,
     ) == "1.234,56 €"
 
   test "formatPgMoney scale=0":
     check formatPgMoney(
-      initPgMoney(1234567, scale = 0), symbol = "¥", thousandsSep = ','
+      initPgMoney(1234567, scale = 0), symbol = "¥", thousandsSep = ","
     ) == "¥1,234,567"
 
   test "formatPgMoney accounting parens for negatives":
     check formatPgMoney(
-      initPgMoney(-123456), symbol = "$", thousandsSep = ',', accountingParens = true
+      initPgMoney(-123456), symbol = "$", thousandsSep = ",", accountingParens = true
     ) == "($1,234.56)"
     # Positive values unaffected
     check formatPgMoney(
-      initPgMoney(123456), symbol = "$", thousandsSep = ',', accountingParens = true
+      initPgMoney(123456), symbol = "$", thousandsSep = ",", accountingParens = true
     ) == "$1,234.56"
     # EU style, symbol after
     check formatPgMoney(
       initPgMoney(-123456),
-      symbol = " €",
+      symbol = "€",
       decimalSep = ',',
-      thousandsSep = '.',
+      thousandsSep = ".",
       symbolBefore = false,
       accountingParens = true,
+      sepBySpace = true,
     ) == "(1.234,56 €)"
     # Roundtrip through parsePgMoney
     let v = initPgMoney(-123456)
-    let s = formatPgMoney(v, symbol = "$", thousandsSep = ',', accountingParens = true)
+    let s = formatPgMoney(v, symbol = "$", thousandsSep = ",", accountingParens = true)
     check parsePgMoney(s) == v
+
+  test "initPgMoneyConventions rejects ambiguous conventions":
+    expect(PgTypeError):
+      discard initPgMoneyConventions(decimalSep = '.', thousandsSep = ".")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(decimalSep = '1')
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = "1$")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(thousandsSep = "-")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(fracDigits = 19)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(fracDigits = -1)
+
+  test "initPgMoneyConventions keeps the symbol separate from its space":
+    # A space folded into the symbol would be eaten by whitespace trimming
+    # while parsing, so the round-trip would not hold.
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = " \u20AC")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = "\u20AC ")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = "\u00A0\u20AC")
+    # Parsing strips every whitespace character, not just sepBySpace ones.
+    for ws in ["\t", "\n", "\r", "\v", "\f"]:
+      expect(PgTypeError):
+        discard initPgMoneyConventions(symbol = ws & "$")
+      expect(PgTypeError):
+        discard initPgMoneyConventions(symbol = "$" & ws, symbolBefore = false)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(sepBySpace = true)
+    # Interior space is a symbol, not a separator, and stays.
+    check initPgMoneyConventions(symbol = "R $").symbol == "R $"
+
+  test "formatPgMoney unfolds a space folded into the symbol":
+    # The pre-sepBySpace API had no other way to ask for the space.
+    let v = initPgMoney(123456)
+    check formatPgMoney(v, symbol = " \u20AC", symbolBefore = false) ==
+      formatPgMoney(v, symbol = "\u20AC", symbolBefore = false, sepBySpace = true)
+    check formatPgMoney(v, symbol = "$ ") == "$ 1234.56"
+    # On the outer edge the space faces nothing; parsing strips it either way.
+    check formatPgMoney(v, symbol = "\u00A0$") == "$1234.56"
+    check parsePgMoney(formatPgMoney(v, symbol = " \u20AC", symbolBefore = false)) == v
+    # Interior space still belongs to the symbol.
+    check formatPgMoney(v, symbol = "R $") == "R $1234.56"
+
+  test "PgMoneyConventions exposes the locale it was built from":
+    let c = initPgMoneyConventions(
+      symbol = "\u20AC",
+      decimalSep = ',',
+      thousandsSep = "\u202F",
+      symbolBefore = false,
+      accountingParens = true,
+      sepBySpace = true,
+      fracDigits = 3,
+    )
+    check c.symbol == "\u20AC"
+    check c.decimalSep == ','
+    check c.thousandsSep == "\u202F"
+    check not c.symbolBefore
+    check c.accountingParens
+    check c.sepBySpace
+    check c.fracDigits == 3
+    # Fields are read-only: the constructor is the only way in.
+    check not compiles((var v = initPgMoneyConventions(); v.symbol = "$"))
+    check not compiles(PgMoneyConventions(symbolRaw: "$"))
+
+  test "formatPgMoney rejects a value whose scale is not the locale's":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    expect(PgTypeError):
+      discard formatPgMoney(initPgMoney(1234, scale = 0), enUS)
+    expect(PgTypeError):
+      discard formatPgMoney(initPgMoney(1234, scale = 3), enUS)
+    # A conventions value that skipped the constructor must not pass for a
+    # fracDigits-0 locale: that would read 12.34 as 1234.
+    var zero: PgMoneyConventions
+    expect(PgTypeError):
+      discard formatPgMoney(initPgMoney(1234, scale = 0), zero)
+    expect(PgTypeError):
+      discard parsePgMoney("1234", zero)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(decimalSep = '\0')
+
+  test "inferPgMoneyConventions reads the locale back out of a string":
+    let enUS = inferPgMoneyConventions("$1,234.56")
+    check enUS.symbol == "$"
+    check enUS.symbolBefore
+    check not enUS.sepBySpace
+    check enUS.thousandsSep == ","
+    check enUS.decimalSep == '.'
+    check enUS.fracDigits == 2
+    let frFR = inferPgMoneyConventions("1\u202F234,56 \u20AC")
+    check frFR.symbol == "\u20AC"
+    check not frFR.symbolBefore
+    check frFR.sepBySpace
+    check frFR.thousandsSep == "\u202F"
+    check frFR.decimalSep == ','
+    let jaJP = inferPgMoneyConventions("\u00A51,234", fracDigits = 0)
+    check jaJP.symbol == "\u00A5"
+    check jaJP.thousandsSep == ","
+    check jaJP.fracDigits == 0
+    check inferPgMoneyConventions("($1.00)").accountingParens
+    # Inference feeds the same parser the strict overload uses.
+    for str in ["$1,234.56", "1\u202F234,56 \u20AC", "($1.00)", "-1.234,56 \u20AC"]:
+      check parsePgMoney(str, inferPgMoneyConventions(str)) == parsePgMoney(str)
+
+  test "inferPgMoneyConventions describes only the sign of its sample":
+    # A positive sample says nothing about n_sign_posn, so conventions inferred
+    # from one need not accept the locale's negatives: infer from a negative
+    # sample when reusing the result across a result set.
+    let fromPositive = inferPgMoneyConventions("$1,234.56")
+    check not fromPositive.accountingParens
+    expect(PgTypeError):
+      discard parsePgMoney("($1,234.56)", fromPositive)
+    let fromNegative = inferPgMoneyConventions("($1,234.56)")
+    check fromNegative.accountingParens
+    check parsePgMoney("($1,234.56)", fromNegative) == initPgMoney(-123456)
+    check parsePgMoney("$1,234.56", fromNegative) == initPgMoney(123456)
+
+  test "inferPgMoneyConventions reports the input, not the conventions":
+    for bad in ["1.000.00", "1..00", "(1.00", "1.00)"]:
+      try:
+        discard parsePgMoney(bad)
+        check false
+      except PgTypeError as e:
+        check e.msg == "Invalid money format: " & bad
+
+  test "inferPgMoneyConventions rejects what no single locale explains":
+    # Two different group separators.
+    expect(PgTypeError):
+      discard inferPgMoneyConventions("1.234 567,89")
+    # Symbol runs on both sides.
+    expect(PgTypeError):
+      discard inferPgMoneyConventions("$1.00 kr")
+    # Unbalanced accounting parens are junk, not a symbol.
+    expect(PgTypeError):
+      discard parsePgMoney("(1.00")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00)")
+    expect(PgTypeError):
+      discard parsePgMoney(")1.00(")
+
+  test "getMoney with conventions validates instead of inferring":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    let good: Row = @[some(toBytes("$1,234.56"))]
+    check good.getMoney(0, enUS) == initPgMoney(123456)
+    check good.get(0, PgMoney, enUS) == initPgMoney(123456)
+    check good.getMoneyOpt(0, enUS) == some(initPgMoney(123456))
+    let bad: Row = @[some(toBytes("1.234,56 \u20AC"))]
+    check bad.getMoney(0) == initPgMoney(123456) # inference accepts it
+    expect(PgTypeError):
+      discard bad.getMoney(0, enUS)
+    # Binary cells take their scale from the conventions.
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    let fields = @[mkField(OidMoney, 1)]
+    let binRow = mkRow(@[some(@(toBE64(987654'i64)))], fields)
+    check binRow.getMoney(0, jaJP) == initPgMoney(987654, scale = 0)
+    check binRow.getMoney("test", jaJP) == initPgMoney(987654, scale = 0)
+    check binRow.getMoneyOpt("test", jaJP) == some(initPgMoney(987654, scale = 0))
+
+  test "getMoneyArray with conventions":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    let row: Row = @[some(toBytes("{\"$1,234.56\",\"$2.00\"}"))]
+    check row.getMoneyArray(0, enUS) == @[initPgMoney(123456), initPgMoney(200)]
+    check row.getMoneyArrayOpt(0, enUS) == some(
+      @[initPgMoney(123456), initPgMoney(200)]
+    )
+    let eu: Row = @[some(toBytes("{\"1.234,56\"}"))]
+    expect(PgTypeError):
+      discard eu.getMoneyArray(0, enUS)
+
+  test "getMoneyArrayND with conventions takes its scale from fracDigits":
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    let p = toPgParam(@[initPgMoney(100), initPgMoney(-50)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    let nd = row.getMoneyArrayND(0, jaJP)
+    check nd.elements ==
+      @[some(initPgMoney(100, scale = 0)), some(initPgMoney(-50, scale = 0))]
+    check row.getMoneyArrayNDOpt(0, jaJP).get.elements == nd.elements
+
+  test "binary accessors reject uninitialized conventions":
+    # fracDigits = 0; the binary paths never reach the text parser, so nothing
+    # else would catch it.
+    var zero: PgMoneyConventions
+    let fields = @[mkField(OidMoney, 1)]
+    let binRow = mkRow(@[some(@(toBE64(12345'i64)))], fields)
+    expect(PgTypeError):
+      discard binRow.getMoney(0, zero)
+    expect(PgTypeError):
+      discard binRow.getMoney("test", zero)
+    expect(PgTypeError):
+      discard binRow.getMoneyOpt(0, zero)
+    expect(PgTypeError):
+      discard binRow.get(0, PgMoney, zero)
+    let arrFields = @[mkField(OidMoneyArray, 1)]
+    let p = toPgParam(@[initPgMoney(100)])
+    let arrRow = mkRow(@[p.value], arrFields)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArray(0, zero)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArrayOpt(0, zero)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArrayND(0, zero)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArrayNDOpt(0, zero)
+
+  test "Opt accessors validate before the NULL test":
+    # A bad scale or zero-initialized conventions must surface on row one, not
+    # after the leading NULL rows.
+    var zero: PgMoneyConventions
+    let nullRow = mkRow(@[none(seq[byte])], @[mkField(OidMoney, 1)])
+    expect(PgTypeError):
+      discard nullRow.getMoneyOpt(0, zero)
+    expect(PgTypeError):
+      discard nullRow.getMoneyOpt(0, scale = MaxMoneyScale + 1)
+    let nullArrRow = mkRow(@[none(seq[byte])], @[mkField(OidMoneyArray, 1)])
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayOpt(0, zero)
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayOpt(0, scale = MaxMoneyScale + 1)
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayNDOpt(0, zero)
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayNDOpt(0, scale = MaxMoneyScale + 1)
+    # NULL still reads as `none` once the arguments are sound.
+    check nullRow.getMoneyOpt(0, initPgMoneyConventions(symbol = "$")) ==
+      none(PgMoney)
+
+  test "money with a non-default mon_grouping":
+    # PostgreSQL groups by mon_grouping[0]; cmn_TW and friends use 4.
+    let twConv =
+      initPgMoneyConventions(symbol = "NT$", thousandsSep = ",", groupDigits = 4)
+    check twConv.groupDigits == 4
+    let v = initPgMoney(1234567890'i64)
+    check formatPgMoney(v, twConv) == "NT$1234,5678.90"
+    check parsePgMoney("NT$1,2345,6789.00", twConv) == initPgMoney(12345678900'i64)
+    check parsePgMoney("NT$1,2345,6789.00") == initPgMoney(12345678900'i64)
+    check inferPgMoneyConventions("NT$1,2345,6789.00").groupDigits == 4
+    check formatPgMoney(v, symbol = "NT$", thousandsSep = ",", groupDigits = 4) ==
+      "NT$1234,5678.90"
+    # Groups still have to agree with each other.
+    expect(PgTypeError):
+      discard parsePgMoney("NT$1,234,5678.00", twConv)
+    expect(PgTypeError):
+      discard parsePgMoney("1,23,456.00")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(groupDigits = 0)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(groupDigits = 7)
+
+  test "formatPgMoney with multi-byte thousands separator":
+    let frFR = initPgMoneyConventions(
+      symbol = "\u20AC",
+      decimalSep = ',',
+      thousandsSep = "\u202F",
+      symbolBefore = false,
+      sepBySpace = true,
+    )
+    check formatPgMoney(initPgMoney(123456789), frFR) == "1\u202F234\u202F567,89 \u20AC"
+
+  test "parsePgMoney with conventions roundtrips formatPgMoney":
+    let convs = [
+      initPgMoneyConventions(symbol = "$", thousandsSep = ","),
+      initPgMoneyConventions(
+        symbol = "\u20AC",
+        decimalSep = ',',
+        thousandsSep = "\u202F",
+        symbolBefore = false,
+        sepBySpace = true,
+      ),
+      initPgMoneyConventions(symbol = "$", thousandsSep = ",", accountingParens = true),
+      initPgMoneyConventions(),
+    ]
+    for c in convs:
+      for amount in [123456'i64, -123456, 1, 0, -1, high(int64), low(int64)]:
+        let v = initPgMoney(amount)
+        check parsePgMoney(formatPgMoney(v, c), c) == v
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    for amount in [1234567'i64, -1234567, 0]:
+      let v = initPgMoney(amount, scale = 0)
+      check parsePgMoney(formatPgMoney(v, jaJP), jaJP) == v
+
+  test "parsePgMoney with conventions accepts sign on either side of symbol":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    check parsePgMoney("-$1,234.56", enUS) == initPgMoney(-123456)
+    check parsePgMoney("$-1,234.56", enUS) == initPgMoney(-123456)
+    check parsePgMoney("$1234.56", enUS) == initPgMoney(123456)
+
+  test "parsePgMoney with conventions rejects what the lenient overload allows":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    # A run on one side is an unknown symbol; runs on both sides are no locale.
+    check parsePgMoney("1,234.56 junk") == initPgMoney(123456)
+    expect(PgTypeError):
+      discard parsePgMoney("$1,234.56 junk")
+    expect(PgTypeError):
+      discard parsePgMoney("$1,234.56 junk", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("$1,23,456.78", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("$1,2345.67", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("1,234.56", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("1,234.56$", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("$1.234,56", enUS)
+    # Parens only when the conventions declare them.
+    expect(PgTypeError):
+      discard parsePgMoney("($1,234.56)", enUS)
+    check parsePgMoney(
+      "($1,234.56)",
+      initPgMoneyConventions(symbol = "$", thousandsSep = ",", accountingParens = true),
+    ) == initPgMoney(-123456)
+
+  test "parsePgMoney with conventions enforces scale exactly":
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    check parsePgMoney("\u00A51,234", jaJP) == initPgMoney(1234, scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("\u00A51,234.00", jaJP)
+    expect(PgTypeError):
+      discard parsePgMoney("\u00A51,23", jaJP)
+    expect(PgTypeError):
+      discard parsePgMoney("$1.5", initPgMoneyConventions(symbol = "$"))
+    expect(PgTypeError):
+      discard parsePgMoney("$1.234", initPgMoneyConventions(symbol = "$"))
 
   test "toPgParam PgMoney":
     let p = toPgParam(initPgMoney(123456))
