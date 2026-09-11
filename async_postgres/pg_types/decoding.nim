@@ -173,12 +173,10 @@ proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz {.raises: [PgError].} 
   if us < 0 or us > pgTimeMaxUs:
     raise newException(PgTypeError, "Binary timetz: microseconds out of range " & $us)
   let pgOffset = fromBE32(data.toOpenArray(8, 11))
-  # ``utcOffset`` un-negates the wire value, but negating ``int32.low`` overflows
-  # int32 (raising an uncatchable OverflowDefect), so reject it. Real timezone
-  # offsets are tiny; only a crafted/corrupt value reaches this bound.
-  if pgOffset == int32.low:
-    raise
-      newException(PgTypeError, "Binary timetz: UTC offset out of range " & $pgOffset)
+  # PostgreSQL ``timetz_recv`` rejects ``zone`` outside ``(-TZDISP_LIMIT,
+  # TZDISP_LIMIT)``. That also covers ``int32.low``, whose negation would
+  # OverflowDefect when un-negating the wire value.
+  checkPgTimeTzOffset(pgOffset)
   let hours = int32(us div 3_600_000_000)
   let rem1 = us mod 3_600_000_000
   let minutes = int32(rem1 div 60_000_000)
@@ -448,6 +446,11 @@ proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
   let t = parseTimeText(timePart)
   let sign = if s[tzPos] == '+': 1 else: -1
   let offStr = s[tzPos + 1 .. ^1]
+  # PostgreSQL DecodeTimezone takes no sign inside the components; ``parseInt``
+  # would accept ``++5`` or ``+05:+3``.
+  for c in offStr:
+    if c notin {'0' .. '9', ':'}:
+      raise newException(PgTypeError, "Invalid timetz offset: " & s)
   var offH, offM, offS: int
   pgTypeErrorOnValueError("Invalid timetz offset: " & s):
     if offStr.len == 2:
@@ -461,6 +464,13 @@ proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
       offS = parseInt(offStr[6 .. 7])
     else:
       raise newException(PgTypeError, "Invalid timetz offset: " & s)
+  # PostgreSQL DecodeTimezone: hour 0..MAX_TZDISP_HOUR, minute 0..59,
+  # second 0..59. ``+00:99`` must not be accepted as 99 minutes (which is
+  # inside TZDISP_LIMIT). Derive the hour bound from ``pgTzDispLimit`` so the
+  # displacement bound stays single-sourced.
+  const maxTzHour = pgTzDispLimit div 3600 - 1
+  if offH notin 0 .. maxTzHour or offM notin 0 .. 59 or offS notin 0 .. 59:
+    raise newException(PgTypeError, "Invalid timetz offset: " & s)
   let utcOff = sign * (offH * 3600 + offM * 60 + offS)
   PgTimeTz(
     hour: t.hour,

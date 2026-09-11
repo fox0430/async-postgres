@@ -1724,6 +1724,7 @@ async_postgres/pg_types/core.nim	c
 async_postgres/pg_types/core.nim	center
 async_postgres/pg_types/core.nim	checkMoneyScale
 async_postgres/pg_types/core.nim	checkPgMoneyConventions
+async_postgres/pg_types/core.nim	checkPgTimeTzOffset
 async_postgres/pg_types/core.nim	closed
 async_postgres/pg_types/core.nim	cmp
 async_postgres/pg_types/core.nim	commandTag
@@ -1788,6 +1789,7 @@ async_postgres/pg_types/core.nim	pgParseInt
 async_postgres/pg_types/core.nim	pgParseInt16
 async_postgres/pg_types/core.nim	pgParseInt32
 async_postgres/pg_types/core.nim	pgTypeErrorOnValueError
+async_postgres/pg_types/core.nim	pgTzDispLimit
 async_postgres/pg_types/core.nim	points
 async_postgres/pg_types/core.nim	points#2
 async_postgres/pg_types/core.nim	radius

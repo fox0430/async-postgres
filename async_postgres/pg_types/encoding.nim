@@ -206,6 +206,7 @@ proc toPgParam*(v: PgTime): PgParam {.raises: [PgTypeError].} =
   textParam(OidTime, $v, "time")
 
 proc toPgParam*(v: PgTimeTz): PgParam {.raises: [PgTypeError].} =
+  checkPgTimeTzOffset(v.utcOffset)
   textParam(OidTimeTz, $v, "timetz")
 
 proc toPgParam*(v: PgUuid): PgParam {.raises: [PgTypeError].} =
@@ -533,12 +534,8 @@ template writeTimeAt(buf: var openArray[byte], pos: int, val: PgTime) =
 template writeTimeTzAt(buf: var openArray[byte], pos: int, val: PgTimeTz) =
   block:
     let t = val
-    # Negating int32.low overflows int32 (uncatchable OverflowDefect). Mirrors
-    # the decoder's guard in decodeBinaryTimeTz.
-    if t.utcOffset == int32.low:
-      raise newException(
-        PgTypeError, "Invalid PgTimeTz: utcOffset out of range " & $t.utcOffset
-      )
+    # Same TZDISP_LIMIT as decodeBinaryTimeTz; also prevents negating int32.low.
+    checkPgTimeTzOffset(t.utcOffset)
     buf.writeBE64(pos, pgTimeFieldsMicros(t.hour, t.minute, t.second, t.microsecond))
     buf.writeBE32(pos + 8, int32(-t.utcOffset)) # PostgreSQL stores offset negated
 

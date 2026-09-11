@@ -74,7 +74,9 @@ type
     minute*: int32 ## 0..59
     second*: int32 ## 0..59
     microsecond*: int32 ## 0..999999
-    utcOffset*: int32 ## UTC offset in seconds (positive = east of UTC)
+    utcOffset*: int32
+      ## UTC offset in seconds (positive = east of UTC). PostgreSQL accepts
+      ## ±15:59:59; see `checkPgTimeTzOffset`.
 
   PgInet* = object ## PostgreSQL inet type: an IP address with a subnet mask.
     address*: IpAddress
@@ -447,6 +449,21 @@ proc `$`*(v: RelOff): string {.borrow.}
 proc `$`*(v: PgUuid): string {.borrow.}
 proc `==`*(a, b: PgUuid): bool {.borrow.}
 proc hash*(v: PgUuid): Hash {.borrow.}
+
+const pgTzDispLimit* = 16 * 3600
+  ## PostgreSQL ``TZDISP_LIMIT`` (``src/include/datatype/timestamp.h``).
+  ## Numeric timezone offsets must be strictly inside ±16 hours, so the
+  ## inclusive maximum is ±15:59:59.
+
+proc checkPgTimeTzOffset*(utcOffset: int32) {.raises: [PgTypeError].} =
+  ## Owner of the PostgreSQL ``timetz`` displacement bound. Encode entry
+  ## points and the binary decoder pre-flight through here, and the text
+  ## parser derives its hour bound from ``pgTzDispLimit``. The range is
+  ## symmetric, so the same check applies to the wire seconds-west value and
+  ## this library's seconds-east ``utcOffset``.
+  if utcOffset <= -pgTzDispLimit or utcOffset >= pgTzDispLimit:
+    raise
+      newException(PgTypeError, "timetz zone displacement out of range: " & $utcOffset)
 
 const MaxMoneyScale* = 18
   ## Largest fractional-digit count a `PgMoney` can carry: `$` scales by
@@ -1506,7 +1523,8 @@ proc `$`*(v: PgTimeTz): string =
     result.add("+")
   else:
     result.add("-")
-  let absOff = abs(off)
+  # int64 so ``abs(int32.low)`` cannot OverflowDefect on a garbage offset.
+  let absOff = abs(int64(off))
   let offH = absOff div 3600
   let offM = (absOff mod 3600) div 60
   let offS = absOff mod 60
