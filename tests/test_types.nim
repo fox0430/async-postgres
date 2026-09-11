@@ -3532,8 +3532,7 @@ suite "PgMoney":
     expect(PgTypeError):
       discard nullArrRow.getMoneyArrayNDOpt(0, scale = MaxMoneyScale + 1)
     # NULL still reads as `none` once the arguments are sound.
-    check nullRow.getMoneyOpt(0, initPgMoneyConventions(symbol = "$")) ==
-      none(PgMoney)
+    check nullRow.getMoneyOpt(0, initPgMoneyConventions(symbol = "$")) == none(PgMoney)
 
   test "money with a non-default mon_grouping":
     # PostgreSQL groups by mon_grouping[0]; cmn_TW and friends use 4.
