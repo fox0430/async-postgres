@@ -988,6 +988,25 @@ suite "parseDsn keyword=value":
     expect PgError:
       discard parseDsn("host=h1,h2 hostaddr=10.0.0.1")
 
+  test "error: slash hostaddr is rejected (use host for Unix sockets)":
+    # `hostaddr` is a numeric IP (libpq forces TCP/IP whenever it is
+    # non-empty). A '/' value would otherwise select AF_UNIX via `dialAddr`
+    # and skip TLS entirely.
+    for dsn in [
+      "host=db.example.com hostaddr=/var/run/postgresql",
+      "postgresql://db.example.com/db?hostaddr=/var/run/postgresql",
+    ]:
+      var caught = false
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError:
+        caught = true
+      check caught
+    # Unix sockets stay available via `host`.
+    let cfg = parseDsn("host=/var/run/postgresql dbname=test")
+    check cfg.hosts[0].host == "/var/run/postgresql"
+    check cfg.hosts[0].hostaddr == ""
+
   test "error: port count mismatch with hosts":
     expect PgError:
       discard parseDsn("host=h1,h2,h3 port=5433,5434")

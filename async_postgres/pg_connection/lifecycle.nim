@@ -119,6 +119,18 @@ proc connectToHost*(
   # would mask an sslnDirect conflict.
   validateDirectSslCompatible(config)
 
+  if entry.hostaddr.len > 0 and entry.hostaddr[0] == '/':
+    # `hostaddr` is a numeric IP (libpq forces TCP/IP whenever it is
+    # non-empty). A '/' value would otherwise select AF_UNIX via `dialAddr`
+    # and skip TLS entirely. Unix sockets stay available via `host`.
+    # Checked here (not just in `buildHosts`) so a directly constructed
+    # `HostEntry`/`ConnConfig` cannot bypass the DSN parsers.
+    raise newException(
+      PgConfigError,
+      "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets): " &
+        entry.hostaddr,
+    )
+
   if config.sslMode == sslAllow:
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
     # WARNING: This is vulnerable to MITM downgrade attacks. A network
