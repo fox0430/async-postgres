@@ -864,9 +864,11 @@ proc probePrivatizedSurfaceStaysSealed() {.used.} =
   ## Negative guards for the narrowed surface (affirmative `apiExists` alone
   ## cannot catch re-expansion).
   static:
-    doAssert not compiles(PgMoney(amount: 1'i64, scale: 2'i8)),
+    # Private field names, not accessor names: the accessor spelling would pass
+    # even if the fields were re-exported.
+    doAssert not compiles(PgMoney(amountRaw: 1'i64, scaleRaw: 2'i8)),
       "PgMoney must stay constructible only via initPgMoney"
-    doAssert not compiles(PgBit(nbits: 1'i32, data: @[0b10000000'u8])),
+    doAssert not compiles(PgBit(nbitsRaw: 1'i32, dataRaw: @[0b10000000'u8])),
       "PgBit must stay constructible only via initPgBit"
     doAssert not compiles(async_postgres.cellInfo),
       "cellInfo must stay out of the public API"

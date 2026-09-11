@@ -381,6 +381,16 @@ proc getNumeric*(row: Row, col: int): PgNumeric =
     return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   parsePgNumeric(row.getStr(col))
 
+proc moneyFromBinaryCell(row: Row, col, off, clen, scale: int): PgMoney =
+  ## Shared binary-money cell decode for both `getMoney` overloads.
+  checkScalarColOid("getMoney", row, col, [OidMoney])
+  if clen != 8:
+    raise newException(
+      PgTypeError,
+      "Column " & $col & ": unexpected binary length " & $clen & " for money",
+    )
+  initPgMoney(fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale)
+
 proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
   ## Get a column value as PgMoney. Handles binary money (8-byte int64) and
   ## locale-formatted text (see ``parsePgMoney`` for accepted forms).
@@ -388,20 +398,29 @@ proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
   ## ``en_US``; pass 0 for ``ja_JP`` etc.). The wire protocol does not expose
   ## this, so callers must specify it when it differs from the default.
   ## Raises ``PgTypeError`` on NULL or when ``scale`` is outside ``0..18``.
-  ## In binary format the column OID must be money.
+  ## In binary format the column OID must be money. The text path infers the
+  ## locale conventions; prefer the `PgMoneyConventions` overload when they
+  ## are known.
   checkMoneyScale(scale)
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
-    checkScalarColOid("getMoney", row, col, [OidMoney])
-    if clen == 8:
-      return initPgMoney(fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale)
-    raise newException(
-      PgTypeError,
-      "Column " & $col & ": unexpected binary length " & $clen & " for money",
-    )
+    return moneyFromBinaryCell(row, col, off, clen, scale)
   parsePgMoney(row.getStr(col), scale)
+
+proc getMoney*(row: Row, col: int, conv: PgMoneyConventions): PgMoney =
+  ## Get a column value as PgMoney under known ``lc_monetary`` conventions.
+  ## ``conv.fracDigits`` is the scale the wire format does not carry, and a
+  ## text cell is parsed strictly against ``conv`` instead of inferring a
+  ## locale, so a malformed string is rejected.
+  checkPgMoneyConventions(conv)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if row.isBinaryCol(col):
+    return moneyFromBinaryCell(row, col, off, clen, conv.fracDigits)
+  parsePgMoney(row.getStr(col), conv)
 
 # Binary decoders for types whose scalar accessors reuse the same body as the
 # array-element decoders below. Defined here (above the scalars) so both call
@@ -945,6 +964,9 @@ template optAccessor*(getProc, optProc: untyped, T: typedesc) =
   # drop it and tag results with the default (wrong on non-`C` locales).
   when compiles((var r: Row; discard r.getProc(0, scale = 2))):
     proc optProc*(row: Row, col: int, scale: int = 2): Option[T] =
+      # Before the NULL test: a bad scale would otherwise surface only on the
+      # first non-NULL row.
+      checkMoneyScale(scale)
       if row.isNull(col):
         none(T)
       else:
@@ -956,6 +978,16 @@ template optAccessor*(getProc, optProc: untyped, T: typedesc) =
         none(T)
       else:
         some(row.getProc(col))
+
+  # Same for a `PgMoneyConventions` overload, or the Opt form silently falls
+  # back to inference.
+  when compiles((var r: Row; var c: PgMoneyConventions; discard r.getProc(0, c))):
+    proc optProc*(row: Row, col: int, conv: PgMoneyConventions): Option[T] =
+      checkPgMoneyConventions(conv)
+      if row.isNull(col):
+        none(T)
+      else:
+        some(row.getProc(col, conv))
 
 template nameAccessor*(getProc: untyped, T: typedesc) =
   ## Generate ``getProc*(row, name): T`` that delegates to the index-based overload.
@@ -969,6 +1001,10 @@ template nameAccessor*(getProc: untyped, T: typedesc) =
   else:
     proc getProc*(row: Row, name: string): T =
       row.getProc(row.columnIndex(name))
+
+  when compiles((var r: Row; var c: PgMoneyConventions; discard r.getProc(0, c))):
+    proc getProc*(row: Row, name: string, conv: PgMoneyConventions): T =
+      row.getProc(row.columnIndex(name), conv)
 
 optAccessor(getStr, getStrOpt, string)
 optAccessor(getInt, getIntOpt, int32)
@@ -1238,6 +1274,33 @@ genArrayDecoder(getIntArray, int32, "int", [OidInt4], pgParseInt32(e.get))
 genArrayDecoder(getInt16Array, int16, "int16", [OidInt2], pgParseInt16(e.get))
 genArrayDecoder(getInt64Array, int64, "int64", [OidInt8], pgParseBiggestInt(e.get))
 
+proc moneyArrayFromBinary(row: Row, col: int, scale: int): seq[PgMoney] =
+  ## Shared binary ``money[]`` decode for both `getMoneyArray` overloads.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  rejectMultiDim(decoded)
+  checkArrayElemOid("getMoneyArray", decoded.elemOid, [OidMoney])
+  result = newSeq[PgMoney](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in money array")
+    if e.len != 8:
+      raise newException(
+        PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
+      )
+    result[i] = initPgMoney(
+      fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)), scale
+    )
+
+proc moneyTextElements(row: Row, col: int): seq[string] =
+  ## Elements of a text ``money[]`` cell; ``seq[PgMoney]`` cannot hold a NULL.
+  for e in parseTextArray(row.getStr(col)):
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in money array")
+    result.add(e.get)
+
 proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## Get a column value as a seq of PgMoney. Handles binary array format and
   ## locale-formatted text arrays (see ``parsePgMoney``). ``scale`` tags each
@@ -1245,30 +1308,18 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
   checkMoneyScale(scale)
   if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    checkArrayElemOid("getMoneyArray", decoded.elemOid, [OidMoney])
-    result = newSeq[PgMoney](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in money array")
-      if e.len != 8:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
-        )
-      result[i] = initPgMoney(
-        fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)), scale
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in money array")
-    result.add(parsePgMoney(e.get, scale))
+    return moneyArrayFromBinary(row, col, scale)
+  for e in moneyTextElements(row, col):
+    result.add(parsePgMoney(e, scale))
+
+proc getMoneyArray*(row: Row, col: int, conv: PgMoneyConventions): seq[PgMoney] =
+  ## ``money[]`` under known ``lc_monetary`` conventions. See the
+  ## `PgMoneyConventions` overload of `getMoney`.
+  checkPgMoneyConventions(conv)
+  if row.isBinaryCol(col):
+    return moneyArrayFromBinary(row, col, conv.fracDigits)
+  for e in moneyTextElements(row, col):
+    result.add(parsePgMoney(e, conv))
 
 # ``getFloatArray`` decodes ``float8[]`` only; ``float4[]`` raises PgTypeError.
 genArrayDecoder(getFloatArray, float64, "float", [OidFloat8], pgParseFloat(e.get))
@@ -1646,7 +1697,8 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
       error:
         "getArrayND[PgMoney] would silently hardcode scale=2 and produce " &
         "wrong values on servers whose lc_monetary frac_digits differ from " &
-        "2. Use getMoneyArrayND(row, col, scale = ...) instead " &
+        "2. Use getMoneyArrayND(row, col, scale = ...) or " &
+        "getMoneyArrayND(row, col, conv) instead " &
         "(getMoneyArrayNDOpt for the NULL-safe variant)."
     .}
   elif T is PgTsVector or T is PgTsQuery:
@@ -1721,15 +1773,8 @@ proc getArrayNDOpt*[T](row: Row, col: int): Option[PgArray[T]] =
   else:
     some(getArrayND[T](row, col))
 
-proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
-  ## ``getArrayND``-style accessor for ``money[]`` (any dimensionality).
-  ## ``getArrayND[PgMoney]`` is intentionally ``{.error.}``-gated because the
-  ## binary ``money`` wire format does not carry the fractional-digit count,
-  ## so the caller must supply ``scale`` (matching the server's
-  ## ``lc_monetary`` ``frac_digits``) — this accessor is the only way to
-  ## read a ``money[]`` column. Defaults to ``scale = 2`` for the common
-  ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
-  checkMoneyScale(scale)
+proc moneyArrayNDImpl(row: Row, col: int, scale: int): PgArray[PgMoney] =
+  ## Shared body of the ``scale`` and ``conv`` overloads of `getMoneyArrayND`.
   # cellInfo first (see getArrayND).
   let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
@@ -1763,12 +1808,43 @@ proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
         )
       )
 
+proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
+  ## ``getArrayND``-style accessor for ``money[]`` (any dimensionality).
+  ## ``getArrayND[PgMoney]`` is intentionally ``{.error.}``-gated because the
+  ## binary ``money`` wire format does not carry the fractional-digit count,
+  ## so the caller must supply ``scale`` (matching the server's
+  ## ``lc_monetary`` ``frac_digits``) — this accessor is the only way to
+  ## read a ``money[]`` column. Defaults to ``scale = 2`` for the common
+  ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
+  checkMoneyScale(scale)
+  moneyArrayNDImpl(row, col, scale)
+
+proc getMoneyArrayND*(row: Row, col: int, conv: PgMoneyConventions): PgArray[PgMoney] =
+  ## ``money[]`` of any dimensionality under known ``lc_monetary``
+  ## conventions; ``conv.fracDigits`` supplies the scale. Binary format only,
+  ## so the conventions add nothing beyond that — they are accepted so a
+  ## caller holding one need not unpack it, and validated because this path
+  ## never reaches the text parser.
+  checkPgMoneyConventions(conv)
+  moneyArrayNDImpl(row, col, conv.fracDigits)
+
 proc getMoneyArrayNDOpt*(row: Row, col: int, scale: int = 2): Option[PgArray[PgMoney]] =
   ## NULL-safe column-level variant of ``getMoneyArrayND``.
+  checkMoneyScale(scale)
   if row.isNull(col):
     none(PgArray[PgMoney])
   else:
     some(getMoneyArrayND(row, col, scale))
+
+proc getMoneyArrayNDOpt*(
+    row: Row, col: int, conv: PgMoneyConventions
+): Option[PgArray[PgMoney]] =
+  ## NULL-safe column-level variant of the conventions overload.
+  checkPgMoneyConventions(conv)
+  if row.isNull(col):
+    none(PgArray[PgMoney])
+  else:
+    some(getMoneyArrayND(row, col, conv))
 
 # Generic accessors — static dispatch by type. Each overload delegates to its
 # typed accessor, so binary columns carry the same OID validation; there is
@@ -1807,6 +1883,10 @@ proc get*(row: Row, col: int, T: typedesc[PgMoney], scale: int = 2): PgMoney =
   ## Generic money accessor with scale forwarding. Defaults to 2; pass the
   ## server ``lc_monetary`` frac_digits when it differs.
   row.getMoney(col, scale)
+
+proc get*(row: Row, col: int, T: typedesc[PgMoney], conv: PgMoneyConventions): PgMoney =
+  ## Generic money accessor under known ``lc_monetary`` conventions.
+  row.getMoney(col, conv)
 
 proc get*(row: Row, col: int, T: typedesc[JsonNode]): JsonNode =
   row.getJson(col)
@@ -1931,6 +2011,12 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgMoney]], scale: int = 2): seq[Pg
   ## Generic money array accessor with scale forwarding.
   row.getMoneyArray(col, scale)
 
+proc get*(
+    row: Row, col: int, T: typedesc[seq[PgMoney]], conv: PgMoneyConventions
+): seq[PgMoney] =
+  ## Generic money array accessor under known ``lc_monetary`` conventions.
+  row.getMoneyArray(col, conv)
+
 proc get*(row: Row, col: int, T: typedesc[seq[JsonNode]]): seq[JsonNode] =
   row.getJsonArray(col)
 
@@ -2030,7 +2116,19 @@ proc get*(row: Row, name: string, T: typedesc[PgMoney], scale: int = 2): PgMoney
   row.getMoney(row.columnIndex(name), scale)
 
 proc get*(
+    row: Row, name: string, T: typedesc[PgMoney], conv: PgMoneyConventions
+): PgMoney =
+  ## Generic money accessor by column name under known conventions.
+  row.getMoney(row.columnIndex(name), conv)
+
+proc get*(
     row: Row, name: string, T: typedesc[seq[PgMoney]], scale: int = 2
 ): seq[PgMoney] =
   ## Generic money array accessor by column name with scale forwarding.
   row.getMoneyArray(row.columnIndex(name), scale)
+
+proc get*(
+    row: Row, name: string, T: typedesc[seq[PgMoney]], conv: PgMoneyConventions
+): seq[PgMoney] =
+  ## Generic money array accessor by column name under known conventions.
+  row.getMoneyArray(row.columnIndex(name), conv)

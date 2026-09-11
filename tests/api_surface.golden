@@ -1451,6 +1451,10 @@ async_postgres/pg_types/accessors.nim	get#7
 async_postgres/pg_types/accessors.nim	get#70
 async_postgres/pg_types/accessors.nim	get#71
 async_postgres/pg_types/accessors.nim	get#72
+async_postgres/pg_types/accessors.nim	get#73
+async_postgres/pg_types/accessors.nim	get#74
+async_postgres/pg_types/accessors.nim	get#75
+async_postgres/pg_types/accessors.nim	get#76
 async_postgres/pg_types/accessors.nim	get#8
 async_postgres/pg_types/accessors.nim	get#9
 async_postgres/pg_types/accessors.nim	getArrayND
@@ -1477,9 +1481,13 @@ async_postgres/pg_types/accessors.nim	getLseg
 async_postgres/pg_types/accessors.nim	getMacAddr
 async_postgres/pg_types/accessors.nim	getMacAddr8
 async_postgres/pg_types/accessors.nim	getMoney
+async_postgres/pg_types/accessors.nim	getMoney#2
 async_postgres/pg_types/accessors.nim	getMoneyArray
+async_postgres/pg_types/accessors.nim	getMoneyArray#2
 async_postgres/pg_types/accessors.nim	getMoneyArrayND
+async_postgres/pg_types/accessors.nim	getMoneyArrayND#2
 async_postgres/pg_types/accessors.nim	getMoneyArrayNDOpt
+async_postgres/pg_types/accessors.nim	getMoneyArrayNDOpt#2
 async_postgres/pg_types/accessors.nim	getNumeric
 async_postgres/pg_types/accessors.nim	getPath
 async_postgres/pg_types/accessors.nim	getPoint
@@ -1488,6 +1496,7 @@ async_postgres/pg_types/accessors.nim	getProc
 async_postgres/pg_types/accessors.nim	getProc#2
 async_postgres/pg_types/accessors.nim	getProc#3
 async_postgres/pg_types/accessors.nim	getProc#4
+async_postgres/pg_types/accessors.nim	getProc#5
 async_postgres/pg_types/accessors.nim	getStr
 async_postgres/pg_types/accessors.nim	getTime
 async_postgres/pg_types/accessors.nim	getTimeTz
@@ -1505,6 +1514,7 @@ async_postgres/pg_types/accessors.nim	nameAccessor
 async_postgres/pg_types/accessors.nim	optAccessor
 async_postgres/pg_types/accessors.nim	optProc
 async_postgres/pg_types/accessors.nim	optProc#2
+async_postgres/pg_types/accessors.nim	optProc#3
 async_postgres/pg_types/accessors.nim	toRow
 async_postgres/pg_types/array.nim	PgArray
 async_postgres/pg_types/array.nim	PgArrayMaxDim
@@ -1638,6 +1648,7 @@ async_postgres/pg_types/core.nim	PgLseg
 async_postgres/pg_types/core.nim	PgMacAddr
 async_postgres/pg_types/core.nim	PgMacAddr8
 async_postgres/pg_types/core.nim	PgMoney
+async_postgres/pg_types/core.nim	PgMoneyConventions
 async_postgres/pg_types/core.nim	PgMultirange
 async_postgres/pg_types/core.nim	PgNumeric
 async_postgres/pg_types/core.nim	PgNumericSign
@@ -1695,6 +1706,7 @@ async_postgres/pg_types/core.nim	`==`#17
 async_postgres/pg_types/core.nim	`==`#18
 async_postgres/pg_types/core.nim	`==`#19
 async_postgres/pg_types/core.nim	`==`#2
+async_postgres/pg_types/core.nim	`==`#20
 async_postgres/pg_types/core.nim	`==`#3
 async_postgres/pg_types/core.nim	`==`#4
 async_postgres/pg_types/core.nim	`==`#5
@@ -1703,6 +1715,7 @@ async_postgres/pg_types/core.nim	`==`#7
 async_postgres/pg_types/core.nim	`==`#8
 async_postgres/pg_types/core.nim	`==`#9
 async_postgres/pg_types/core.nim	a
+async_postgres/pg_types/core.nim	accountingParens
 async_postgres/pg_types/core.nim	address
 async_postgres/pg_types/core.nim	address#2
 async_postgres/pg_types/core.nim	amount
@@ -1710,11 +1723,13 @@ async_postgres/pg_types/core.nim	b
 async_postgres/pg_types/core.nim	c
 async_postgres/pg_types/core.nim	center
 async_postgres/pg_types/core.nim	checkMoneyScale
+async_postgres/pg_types/core.nim	checkPgMoneyConventions
 async_postgres/pg_types/core.nim	closed
 async_postgres/pg_types/core.nim	cmp
 async_postgres/pg_types/core.nim	commandTag
 async_postgres/pg_types/core.nim	data
 async_postgres/pg_types/core.nim	days
+async_postgres/pg_types/core.nim	decimalSep
 async_postgres/pg_types/core.nim	digits
 async_postgres/pg_types/core.nim	dscale
 async_postgres/pg_types/core.nim	export pg_bytes
@@ -1722,6 +1737,9 @@ async_postgres/pg_types/core.nim	export pg_errors
 async_postgres/pg_types/core.nim	format
 async_postgres/pg_types/core.nim	format#2
 async_postgres/pg_types/core.nim	formatPgMoney
+async_postgres/pg_types/core.nim	formatPgMoney#2
+async_postgres/pg_types/core.nim	fracDigits
+async_postgres/pg_types/core.nim	groupDigits
 async_postgres/pg_types/core.nim	hasLower
 async_postgres/pg_types/core.nim	hasUpper
 async_postgres/pg_types/core.nim	hash
@@ -1731,8 +1749,10 @@ async_postgres/pg_types/core.nim	high
 async_postgres/pg_types/core.nim	hour
 async_postgres/pg_types/core.nim	hour#2
 async_postgres/pg_types/core.nim	inclusive
+async_postgres/pg_types/core.nim	inferPgMoneyConventions
 async_postgres/pg_types/core.nim	initPgBit
 async_postgres/pg_types/core.nim	initPgMoney
+async_postgres/pg_types/core.nim	initPgMoneyConventions
 async_postgres/pg_types/core.nim	inlineBuf
 async_postgres/pg_types/core.nim	isEmpty
 async_postgres/pg_types/core.nim	isZero
@@ -1756,6 +1776,7 @@ async_postgres/pg_types/core.nim	p2
 async_postgres/pg_types/core.nim	parseBitString
 async_postgres/pg_types/core.nim	parsePgBoolText
 async_postgres/pg_types/core.nim	parsePgMoney
+async_postgres/pg_types/core.nim	parsePgMoney#2
 async_postgres/pg_types/core.nim	parsePgNumeric
 async_postgres/pg_types/core.nim	pgEpochDaysOffset
 async_postgres/pg_types/core.nim	pgEpochUnix
@@ -1779,7 +1800,11 @@ async_postgres/pg_types/core.nim	rangeUbInf
 async_postgres/pg_types/core.nim	scale
 async_postgres/pg_types/core.nim	second
 async_postgres/pg_types/core.nim	second#2
+async_postgres/pg_types/core.nim	sepBySpace
 async_postgres/pg_types/core.nim	sign
+async_postgres/pg_types/core.nim	symbol
+async_postgres/pg_types/core.nim	symbolBefore
+async_postgres/pg_types/core.nim	thousandsSep
 async_postgres/pg_types/core.nim	toBytes
 async_postgres/pg_types/core.nim	toString
 async_postgres/pg_types/core.nim	upper
