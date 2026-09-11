@@ -141,6 +141,26 @@ suite "TLS error paths: client cert/key/CA loading":
 
     check waitFor(runTest())
 
+  test "slash hostaddr through connectToHost is a config fault":
+    # `hostaddr` is a numeric IP. A '/' value would otherwise select
+    # AF_UNIX via `dialAddr` and skip TLS entirely. The check runs before
+    # any dial, so no server is needed; a directly constructed `HostEntry`
+    # must fail the same way as a parsed DSN.
+    proc runTest(): Future[bool] {.async.} =
+      var cfg = testConfig(5432, sslRequire)
+      var configFault = false
+      try:
+        let conn = await connectToHost(
+          cfg,
+          HostEntry(host: "db.example.com", hostaddr: "/var/run/postgresql", port: 5432),
+        )
+        await conn.close()
+      except PgConfigError:
+        configFault = true
+      configFault
+
+    check waitFor(runTest())
+
   test "garbage client certificate content fails":
     proc runTest(): Future[ProbeResult] {.async.} =
       let ms = startMockServer()

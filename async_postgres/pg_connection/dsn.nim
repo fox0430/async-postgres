@@ -173,6 +173,15 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
         addrList[i]
       else:
         ""
+    if a.len > 0 and a[0] == '/':
+      # `hostaddr` is a numeric IP (libpq forces TCP/IP whenever it is
+      # non-empty). A '/' value would otherwise select AF_UNIX via `dialAddr`
+      # and skip TLS entirely. Unix sockets stay available via `host`.
+      raise newException(
+        PgConfigError,
+        "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets): " &
+          a,
+      )
     let p =
       if ports.len == 1:
         ports[0]
