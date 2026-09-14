@@ -880,6 +880,46 @@ suite "PgTimeTz":
     let t = row.getTimeTz(0)
     check t.utcOffset == 19815
 
+  test "getTimeTz text ±15:59:59 TZDISP_LIMIT inclusive max":
+    # PostgreSQL TZDISP_LIMIT is exclusive of ±16h; ±15:59:59 is the last valid.
+    let pos = @[some(toBytes("00:00:00+15:59:59"))].getTimeTz(0)
+    check pos.utcOffset == 15 * 3600 + 59 * 60 + 59
+    let neg = @[some(toBytes("00:00:00-15:59:59"))].getTimeTz(0)
+    check neg.utcOffset == -(15 * 3600 + 59 * 60 + 59)
+
+  test "getTimeTz text +16 and +16:00 raise":
+    for bad in ["00:00:00+16", "00:00:00+16:00", "00:00:00-16", "00:00:00-16:00:00"]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
+  test "getTimeTz text minutes/seconds out of 0..59 raise":
+    # Total seconds of +00:99 is still inside TZDISP_LIMIT; DecodeTimezone
+    # rejects the component anyway.
+    for bad in ["00:00:00+00:99", "00:00:00+00:00:60", "00:00:00-01:60"]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
+  test "getTimeTz text signed offset hour raises":
+    # parseInt accepts a leading '-' inside the hour field, so "+-5" would
+    # otherwise decode as -5h and "--5" would silently flip the sign to +5h.
+    for bad in ["00:00:00+-5", "00:00:00+-5:30", "00:00:00--5", "00:00:00--5:00:00"]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
+  test "getTimeTz text plus-signed offset components raise":
+    # parseInt also accepts a leading '+', so "++5" would decode as +5h and
+    # "+05:+3" as 5h03m.
+    for bad in [
+      "00:00:00++5", "00:00:00++5:30", "00:00:00+-0", "00:00:00+05:+3",
+      "00:00:00+05:00:+1",
+    ]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
   test "getTimeTz invalid raises":
     let row = @[some(toBytes("not-a-time"))]
     var raised = false
@@ -947,10 +987,41 @@ suite "PgTimeTz":
     check row.getTimeTzOpt(0).isNone
 
   test "toPgBinaryParam PgTimeTz rejects int32.low utcOffset":
-    # Negating int32.low would overflow int32 in the encoder.
+    # Negating int32.low would overflow int32 in the encoder; also outside TZDISP_LIMIT.
     let t = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: int32.low)
     expect PgTypeError:
       discard toPgBinaryParam(t)
+
+  test "toPgParam/toPgBinaryParam PgTimeTz reject ±16h utcOffset":
+    # Literal boundary, not pgTzDispLimit, so a wrong constant cannot make
+    # this rejection test tautological.
+    check pgTzDispLimit == 16 * 3600
+    let over = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: 16 * 3600)
+    let under = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: -16 * 3600)
+    expect PgTypeError:
+      discard toPgParam(over)
+    expect PgTypeError:
+      discard toPgParam(under)
+    expect PgTypeError:
+      discard toPgBinaryParam(over)
+    expect PgTypeError:
+      discard toPgBinaryParam(under)
+
+  test "toPgParam/toPgBinaryParam PgTimeTz accept ±15:59:59":
+    const maxOff = 15 * 3600 + 59 * 60 + 59
+    let pos = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: maxOff)
+    let neg = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: -maxOff)
+    check $pos == "10:00:00+15:59:59"
+    check $neg == "10:00:00-15:59:59"
+    check toPgParam(pos).oid == OidTimeTz
+    check toPgBinaryParam(neg).format == 1
+    let fields = @[mkField(OidTimeTz, 1)]
+    check mkRow(@[toPgBinaryParam(pos).value], fields).getTimeTz(0) == pos
+    check mkRow(@[toPgBinaryParam(neg).value], fields).getTimeTz(0) == neg
+
+  test "$PgTimeTz int32.low offset does not OverflowDefect":
+    let t = PgTimeTz(hour: 0, minute: 0, second: 0, utcOffset: int32.low)
+    discard $t
 
 suite "date parameter encoding":
   test "toPgDateParam OID and format":
@@ -1459,6 +1530,20 @@ suite "Timestamp/date infinity sentinels":
     const tt = @[0'u8, 0, 0, 0, 0, 0, 0, 0, 0x80'u8, 0, 0, 0] # 8 bytes us=0 + int32.low
     expect PgTypeError:
       discard decodeBinaryTimeTz(tt)
+
+  test "decodeBinaryTimeTz TZDISP_LIMIT exclusive ±16h raises":
+    # Wire zone is seconds west of UTC; the bound is symmetric.
+    proc timetzBin(zone: int32): seq[byte] =
+      result = @(toBE64(0'i64))
+      result.add @(toBE32(zone))
+
+    expect PgTypeError:
+      discard decodeBinaryTimeTz(timetzBin(16 * 3600))
+    expect PgTypeError:
+      discard decodeBinaryTimeTz(timetzBin(-16 * 3600))
+    let maxOff = int32(15 * 3600 + 59 * 60 + 59)
+    check decodeBinaryTimeTz(timetzBin(-maxOff)).utcOffset == maxOff
+    check decodeBinaryTimeTz(timetzBin(maxOff)).utcOffset == -maxOff
 
   test "decodeBinaryDate infinity raises":
     expect PgTypeError:
