@@ -4837,6 +4837,27 @@ suite "Composite text parser":
     check parts[0] == some("say \"hi\"")
     check parts[1] == some("done")
 
+  test "parseCompositeText quoted with backslash escapes":
+    # Canonical record_out doubles ``"`` and ``\\``; record_in (and this
+    # parser) also accept backslash-escaped bytes inside quotes.
+    let doubled = parseCompositeText("(\"a\\\\b\",c)")
+    check doubled.len == 2
+    check doubled[0] == some("a\\b")
+    check doubled[1] == some("c")
+    let escaped = parseCompositeText("(\"a\\\"b\",c)")
+    check escaped.len == 2
+    check escaped[0] == some("a\"b")
+    check escaped[1] == some("c")
+    let trailing = parseCompositeText("(\"a\\\\\",c)")
+    check trailing.len == 2
+    check trailing[0] == some("a\\")
+    check trailing[1] == some("c")
+
+  test "parseCompositeText backslash escaping closing quote raises":
+    # record_in fails with "Unexpected end of input" for the same input.
+    expect PgTypeError:
+      discard parseCompositeText("(\"a\\\")")
+
   test "parseCompositeText empty string quoted":
     let parts = parseCompositeText("(\"\",42)")
     check parts.len == 2
@@ -4876,6 +4897,9 @@ suite "Composite text parser":
       discard parseCompositeText("(a\"b,c)")
 
   test "parseCompositeText backslash in unquoted field raises":
+    # record_in treats ``\x`` in an unquoted field as an escape, but record_out
+    # never emits it (such bytes are quoted), so non-canonical input is
+    # rejected instead of decoded.
     expect PgTypeError:
       discard parseCompositeText("(a\\b,c)")
 
@@ -4907,6 +4931,16 @@ suite "Composite text parser":
     check encodeCompositeText(@[some("NULL"), some("42")]) == "(\"NULL\",42)"
     check encodeCompositeText(@[some("null")]) == "(\"null\")"
     check encodeCompositeText(@[some("Null")]) == "(\"Null\")"
+
+  test "encodeCompositeText doubles backslash and quote like record_out":
+    # Canonical record_out output doubles both bytes; the server's record_in
+    # (and parseCompositeText) decode this form back to the original value.
+    check encodeCompositeText(@[some("a\\b")]) == "(\"a\\\\b\")"
+    check encodeCompositeText(@[some("q\"w")]) == "(\"q\"\"w\")"
+
+  test "roundtrip text encode/parse with backslash and quote":
+    let fields = @[some("a\\b"), some("q\"w"), some("a\\"), some("\\\"")]
+    check parseCompositeText(encodeCompositeText(fields)) == fields
 
   test "roundtrip text encode/parse":
     let fields = @[some("hello world"), some("42"), none(string), some("with,comma")]

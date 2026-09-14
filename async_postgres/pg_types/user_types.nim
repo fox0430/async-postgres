@@ -213,6 +213,13 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
 proc parseCompositeText*(s: string): seq[Option[string]] =
   ## Parse PostgreSQL composite text format: (val1,val2,...)
   ## Returns fields as ``Option[string]`` (none for NULL).
+  ##
+  ## Expects canonical ``record_out`` output. Inside a double-quoted field both
+  ## doubled bytes (``""`` / ``\\``) and backslash escapes (as accepted by the
+  ## server's ``record_in``) are decoded; a quoted field must be followed by
+  ## ``','`` or the end. Unquoted fields reject ``"`` / ``\\`` / ``(`` / ``)``
+  ## with ``PgTypeError``: ``record_out`` always quotes such bytes, so accepting
+  ## them would decode non-canonical input silently.
   if s.len < 2 or s[0] != '(' or s[^1] != ')':
     raise newException(PgTypeError, "Invalid composite literal: " & s)
   let inner = s[1 ..^ 2]
