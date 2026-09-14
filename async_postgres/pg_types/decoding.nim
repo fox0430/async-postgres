@@ -359,6 +359,7 @@ proc decodeBinaryComposite*(
 proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
   # Raises ``PgTypeError`` for infinity/unparseable input (under ``PgError``).
   if s == "infinity" or s == "-infinity":
+    # Known literal, safe to name (mirrors the binary decoder's message).
     raise newException(
       PgTypeError, "Timestamp is '" & s & "', not representable as a DateTime"
     )
@@ -389,11 +390,12 @@ proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
       return parse(norm, formats[i], utc())
     except TimeParseError, IndexDefect:
       discard
-  raise newException(PgTypeError, "Invalid timestamp: " & s)
+  raise newException(PgTypeError, "Invalid timestamp (len=" & $s.len & ")")
 
 proc parseDateText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
   # Raises ``PgTypeError`` for infinity/unparseable.
   if s == "infinity" or s == "-infinity":
+    # Known literal, safe to name (mirrors the binary decoder's message).
     raise
       newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
   const dateFormat = initTimeFormat("yyyy-MM-dd")
@@ -402,28 +404,28 @@ proc parseDateText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
     # decodeBinaryDate; the local default would shift it by the UTC offset.
     return parse(s, dateFormat, utc())
   except TimeParseError, IndexDefect:
-    raise newException(PgTypeError, "Invalid date: " & s)
+    raise newException(PgTypeError, "Invalid date (len=" & $s.len & ")")
 
 proc parseTimeText*(s: string): PgTime {.raises: [PgError].} =
   ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".
   if s.len < 8 or s[2] != ':' or s[5] != ':':
-    raise newException(PgTypeError, "Invalid time: " & s)
+    raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
   var h, m, sec, us: int
-  pgTypeErrorOnValueError("Invalid time: " & s):
+  pgTypeErrorOnValueError("Invalid time (len=" & $s.len & ")"):
     h = parseInt(s[0 .. 1])
     m = parseInt(s[3 .. 4])
     sec = parseInt(s[6 .. 7])
   if h notin 0 .. 24 or m notin 0 .. 59 or sec notin 0 .. 59:
-    raise newException(PgTypeError, "Invalid time: " & s)
+    raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
   if s.len > 8:
     # Reject trailing garbage. Only "HH:MM:SS" or "HH:MM:SS.ffffff" are valid;
     # anything else (e.g. "01:23:45X") must fail rather than silently return.
     if s[8] != '.':
-      raise newException(PgTypeError, "Invalid time: " & s)
+      raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
     let frac = s[9 .. ^1]
     if frac.len == 0 or frac.len > 6:
-      raise newException(PgTypeError, "Invalid time: " & s)
-    pgTypeErrorOnValueError("Invalid time: " & s):
+      raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
+    pgTypeErrorOnValueError("Invalid time (len=" & $s.len & ")"):
       us = parseInt(frac)
     # Pad to 6 digits
     for _ in 0 ..< (6 - frac.len):
@@ -431,7 +433,7 @@ proc parseTimeText*(s: string): PgTime {.raises: [PgError].} =
   # PostgreSQL accepts '24:00:00' as the inclusive end-of-day bound, but nothing
   # past it (no '24:00:01', no '24:00:00.000001').
   if h == 24 and (m != 0 or sec != 0 or us != 0):
-    raise newException(PgTypeError, "Invalid time: " & s)
+    raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
   PgTime(hour: int32(h), minute: int32(m), second: int32(sec), microsecond: int32(us))
 
 proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
@@ -441,7 +443,7 @@ proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
       tzPos = i
       break
   if tzPos < 0:
-    raise newException(PgTypeError, "Invalid timetz (no offset): " & s)
+    raise newException(PgTypeError, "Invalid timetz (no offset) (len=" & $s.len & ")")
   let timePart = s[0 ..< tzPos]
   let t = parseTimeText(timePart)
   let sign = if s[tzPos] == '+': 1 else: -1
@@ -450,9 +452,9 @@ proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
   # would accept ``++5`` or ``+05:+3``.
   for c in offStr:
     if c notin {'0' .. '9', ':'}:
-      raise newException(PgTypeError, "Invalid timetz offset: " & s)
+      raise newException(PgTypeError, "Invalid timetz offset (len=" & $s.len & ")")
   var offH, offM, offS: int
-  pgTypeErrorOnValueError("Invalid timetz offset: " & s):
+  pgTypeErrorOnValueError("Invalid timetz offset (len=" & $s.len & ")"):
     if offStr.len == 2:
       offH = parseInt(offStr)
     elif offStr.len == 5 and offStr[2] == ':':
@@ -463,14 +465,14 @@ proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
       offM = parseInt(offStr[3 .. 4])
       offS = parseInt(offStr[6 .. 7])
     else:
-      raise newException(PgTypeError, "Invalid timetz offset: " & s)
+      raise newException(PgTypeError, "Invalid timetz offset (len=" & $s.len & ")")
   # PostgreSQL DecodeTimezone: hour 0..MAX_TZDISP_HOUR, minute 0..59,
   # second 0..59. ``+00:99`` must not be accepted as 99 minutes (which is
   # inside TZDISP_LIMIT). Derive the hour bound from ``pgTzDispLimit`` so the
   # displacement bound stays single-sourced.
   const maxTzHour = pgTzDispLimit div 3600 - 1
   if offH notin 0 .. maxTzHour or offM notin 0 .. 59 or offS notin 0 .. 59:
-    raise newException(PgTypeError, "Invalid timetz offset: " & s)
+    raise newException(PgTypeError, "Invalid timetz offset (len=" & $s.len & ")")
   let utcOff = sign * (offH * 3600 + offM * 60 + offS)
   PgTimeTz(
     hour: t.hour,
@@ -558,17 +560,20 @@ proc parseIntervalText*(s: string): PgInterval {.raises: [PgError].} =
   proc accumDigit(acc: int64, ch: char, s: string): int64 =
     let d = int64(ord(ch) - ord('0'))
     if acc > (int64.high - d) div 10:
-      raise newException(PgTypeError, "interval numeric overflow: " & s)
+      raise newException(PgTypeError, "interval numeric overflow (len=" & $s.len & ")")
     acc * 10 + d
 
   proc addI32(a, b: int32, s: string): int32 =
     if (b > 0 and a > int32.high - b) or (b < 0 and a < int32.low - b):
-      raise newException(PgTypeError, "interval field overflows int32: " & s)
+      raise
+        newException(PgTypeError, "interval field overflows int32 (len=" & $s.len & ")")
     a + b
 
   proc toI32(v: int64, s: string): int32 =
     if v < int64(int32.low) or v > int64(int32.high):
-      raise newException(PgTypeError, "interval field out of int32 range: " & s)
+      raise newException(
+        PgTypeError, "interval field out of int32 range (len=" & $s.len & ")"
+      )
     int32(v)
 
   var months: int32 = 0
@@ -628,13 +633,13 @@ proc parseIntervalText*(s: string): PgInterval {.raises: [PgError].} =
         # multiplying, so ``us`` computation itself is safe.
         if hours > int64.high div 3_600_000_000'i64 or
             mins > int64.high div 60_000_000'i64 or secs > int64.high div 1_000_000'i64:
-          raise newException(PgTypeError, "interval time overflow: " & s)
+          raise newException(PgTypeError, "interval time overflow (len=" & $s.len & ")")
         let hUs = hours * 3_600_000_000'i64
         let mUs = mins * 60_000_000'i64
         let sUs = secs * 1_000_000'i64
         if mUs > int64.high - hUs or sUs > int64.high - hUs - mUs or
             frac > int64.high - hUs - mUs - sUs:
-          raise newException(PgTypeError, "interval time overflow: " & s)
+          raise newException(PgTypeError, "interval time overflow (len=" & $s.len & ")")
         let us = hUs + mUs + sUs + frac
         # ``us`` is in [0, int64.high], so ``-us`` cannot overflow.
         microseconds =
@@ -665,20 +670,21 @@ proc parseIntervalText*(s: string): PgInterval {.raises: [PgError].} =
       i += 1
     # Guarantees forward progress: "!" would else leave i unchanged and spin.
     if not sawDigit or unit.len == 0:
-      raise newException(PgTypeError, "Invalid interval: " & s)
+      raise newException(PgTypeError, "Invalid interval (len=" & $s.len & ")")
     case unit
     of "year", "years":
       # Constrain ``val`` so ``val * 12`` fits in int32; that also keeps the
       # int64 multiplication itself well below overflow.
       if val < int64(int32.low) div 12 or val > int64(int32.high) div 12:
-        raise newException(PgTypeError, "interval years out of range: " & s)
+        raise
+          newException(PgTypeError, "interval years out of range (len=" & $s.len & ")")
       months = addI32(months, int32(val * 12), s)
     of "mon", "mons":
       months = addI32(months, toI32(val, s), s)
     of "day", "days":
       days = addI32(days, toI32(val, s), s)
     else:
-      raise newException(PgTypeError, "Invalid interval unit '" & unit & "' in: " & s)
+      raise newException(PgTypeError, "Invalid interval unit (len=" & $s.len & ")")
   PgInterval(months: months, days: days, microseconds: microseconds)
 
 proc parseInetText*(
@@ -686,7 +692,7 @@ proc parseInetText*(
 ): tuple[address: IpAddress, mask: uint8] {.raises: [PgError].} =
   # Converts ``ValueError`` to ``PgTypeError``.
   let slashIdx = s.find('/')
-  pgTypeErrorOnValueError("invalid inet value: " & s):
+  pgTypeErrorOnValueError("invalid inet value (len=" & $s.len & ")"):
     if slashIdx == -1:
       let ip = parseIpAddress(s)
       let defaultMask = if ip.family == IpAddressFamily.IPv4: 32'u8 else: 128'u8
@@ -701,7 +707,7 @@ proc parseInetText*(
     let maxMask = if ip.family == IpAddressFamily.IPv4: 32 else: 128
     let mask = parseInt(maskStr)
     if mask < 0 or mask > maxMask:
-      raise newException(PgTypeError, "inet mask out of range: " & s)
+      raise newException(PgTypeError, "inet mask out of range (len=" & $s.len & ")")
     result = (ip, uint8(mask))
 
 proc decodeBinaryTsVector*(data: openArray[byte]): string {.raises: [PgError].} =
@@ -876,7 +882,7 @@ proc parsePointText*(s: string): PgPoint {.raises: [PgError].} =
     inner = inner[1 ..^ 2]
   let comma = inner.find(',')
   if comma < 0:
-    raise newException(PgTypeError, "Invalid point: " & s)
+    raise newException(PgTypeError, "Invalid point (len=" & $s.len & ")")
   PgPoint(x: pgParseFloat(inner[0 ..< comma]), y: pgParseFloat(inner[comma + 1 ..^ 1]))
 
 proc parsePointsText*(s: string): seq[PgPoint] {.raises: [PgError].} =
@@ -889,14 +895,17 @@ proc parsePointsText*(s: string): seq[PgPoint] {.raises: [PgError].} =
     if i >= n:
       break
     if s[i] != '(':
-      raise newException(PgTypeError, "Expected '(' in point list at pos " & $i)
+      raise newException(
+        PgTypeError, "Expected '(' in point list at pos " & $i & " (len=" & $s.len & ")"
+      )
     let start = i
     i += 1
     # Find matching ')'
     while i < n and s[i] != ')':
       i += 1
     if i >= n:
-      raise newException(PgTypeError, "Unmatched '(' in point list")
+      raise
+        newException(PgTypeError, "Unmatched '(' in point list (len=" & $s.len & ")")
     i += 1 # skip ')'
     result.add(parsePointText(s[start ..< i]))
 
@@ -908,7 +917,7 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
   ## Raises ``PgTypeError`` for multi-dimensional literals; callers that need
   ## multi-dim support should decode via the ``PgArray[T]`` accessors.
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
-    raise newException(PgTypeError, "Invalid array literal: " & s)
+    raise newException(PgTypeError, "Invalid array literal (len=" & $s.len & ")")
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     return @[]

@@ -142,13 +142,17 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
 proc pgParseEnum[T: enum](s: string): T =
   ## Parse an enum label, converting `ValueError` (unknown label) to `PgTypeError`
   ## so callers can rely on the ``except PgError`` contract (see ``pg_errors``).
-  pgTypeErrorOnValueError("invalid enum value for " & name(T) & ": " & s):
+  pgTypeErrorOnValueError("invalid enum value for " & name(T) & " (len=" & $s.len & ")"):
     parseEnum[T](s)
 
 proc getEnum*[T: enum](row: Row, col: int): T =
   ## Read a PostgreSQL enum column (text format) as a Nim enum.
   ## The column value must exactly match one of ``T``'s string representations.
-  pgParseEnum[T](row.getStr(col))
+  let s = row.getStr(col)
+  try:
+    pgParseEnum[T](s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
   ## Read a PostgreSQL enum column as ``Option[T]``. Returns none if NULL.
@@ -221,7 +225,7 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
   ## with ``PgTypeError``: ``record_out`` always quotes such bytes, so accepting
   ## them would decode non-canonical input silently.
   if s.len < 2 or s[0] != '(' or s[^1] != ')':
-    raise newException(PgTypeError, "Invalid composite literal: " & s)
+    raise newException(PgTypeError, "Invalid composite literal (len=" & $s.len & ")")
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     # PostgreSQL emits `()` for a 1-field composite whose sole field is NULL;

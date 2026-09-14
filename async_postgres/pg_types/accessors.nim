@@ -254,16 +254,18 @@ proc getInt*(row: Row, col: int): int32 =
   var v: int
   var n: int
   # ``parseInt(s, v)`` returns 0 for "no digits" but raises a raw ``ValueError``
-  # when the value overflows ``int``; route that through ``pgTypeErrorOnValueError``
-  # so an oversized text value surfaces as a catchable ``PgTypeError`` instead of
-  # escaping the ``except PgError`` contract.
-  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+  # when the value overflows ``int``; route it through ``pgTypeErrorOnValueError``
+  # so it surfaces as a catchable ``PgTypeError``.
+  pgTypeErrorOnValueError(
+    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
+  ):
     n = parseInt(row.bufView(off, clen), v)
   if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
   if v < int(int32.low) or v > int(int32.high):
     raise newException(
-      PgTypeError, "Column " & $col & ": integer value out of int32 range: " & $v
+      PgTypeError,
+      "Column " & $col & ": integer value out of int32 range (len=" & $clen & ")",
     )
   result = int32(v)
 
@@ -285,13 +287,16 @@ proc getInt16*(row: Row, col: int): int16 =
   var v: int
   var n: int
   # Convert ``parseInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
-  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+  pgTypeErrorOnValueError(
+    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
+  ):
     n = parseInt(row.bufView(off, clen), v)
   if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
   if v < int(int16.low) or v > int(int16.high):
     raise newException(
-      PgTypeError, "Column " & $col & ": integer value out of int16 range: " & $v
+      PgTypeError,
+      "Column " & $col & ": integer value out of int16 range (len=" & $clen & ")",
     )
   result = int16(v)
 
@@ -316,8 +321,11 @@ proc getInt64*(row: Row, col: int): int64 =
       )
   var v: BiggestInt
   var n: int
-  # Convert ``parseBiggestInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
-  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+  # Convert ``parseBiggestInt``'s overflow ``ValueError`` to ``PgTypeError``
+  # (see getInt).
+  pgTypeErrorOnValueError(
+    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
+  ):
     n = parseBiggestInt(row.bufView(off, clen), v)
   if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid int64 value")
@@ -477,7 +485,7 @@ proc decodeJsonArrayElem(buf: openArray[byte], elemOid: int32): JsonNode =
   try:
     parseJson(jsonStr)
   except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
+    raise newException(PgTypeError, "Invalid JSON (len=" & $jsonStr.len & ")")
 
 proc getUuid*(row: Row, col: int): PgUuid =
   ## Get a column value as PgUuid. Handles binary format (16 bytes).
@@ -549,7 +557,10 @@ proc getTimestamp*(row: Row, col: int): DateTime =
       )
     return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
-  return parseTimestampText(s)
+  try:
+    parseTimestampText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getDate*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime. Handles binary date format.
@@ -565,7 +576,11 @@ proc getDate*(row: Row, col: int): DateTime =
         "Column " & $col & ": unexpected binary length " & $clen & " for date",
       )
     return decodeBinaryDate(row.data.buf.toOpenArray(off, off + 3))
-  parseDateText(row.getStr(col))
+  let s = row.getStr(col)
+  try:
+    parseDateText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getTimestampTz*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime from a timestamptz column.
@@ -582,7 +597,10 @@ proc getTimestampTz*(row: Row, col: int): DateTime =
       )
     return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
-  return parseTimestampText(s)
+  try:
+    parseTimestampText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getTime*(row: Row, col: int): PgTime =
   ## Get a column value as PgTime. Handles binary time format.
@@ -599,7 +617,10 @@ proc getTime*(row: Row, col: int): PgTime =
       )
     return decodeBinaryTime(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
-  return parseTimeText(s)
+  try:
+    parseTimeText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getTimeTz*(row: Row, col: int): PgTimeTz =
   ## Get a column value as PgTimeTz. Handles binary timetz format.
@@ -616,7 +637,10 @@ proc getTimeTz*(row: Row, col: int): PgTimeTz =
       )
     return decodeBinaryTimeTz(row.data.buf.toOpenArray(off, off + 11))
   let s = row.getStr(col)
-  return parseTimeTzText(s)
+  try:
+    parseTimeTzText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getJson*(row: Row, col: int): JsonNode =
   ## Get a column value as a parsed JsonNode. Handles binary json/jsonb format.
@@ -633,7 +657,9 @@ proc getJson*(row: Row, col: int): JsonNode =
   try:
     return parseJson(s)
   except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid JSON (len=" & $s.len & ")"
+    )
 
 proc getInterval*(row: Row, col: int): PgInterval =
   ## Get a column value as PgInterval. Handles binary interval format.
@@ -646,7 +672,10 @@ proc getInterval*(row: Row, col: int): PgInterval =
     return
       decodePgArrayElement(PgInterval, row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseIntervalText(s)
+  try:
+    parseIntervalText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getInet*(row: Row, col: int): PgInet =
   ## Get a column value as PgInet (IP address with mask). Handles binary format.
@@ -659,8 +688,11 @@ proc getInet*(row: Row, col: int): PgInet =
     let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
     return PgInet(address: ip, mask: mask)
   let s = row.getStr(col)
-  let (ip, mask) = parseInetText(s)
-  PgInet(address: ip, mask: mask)
+  try:
+    let (ip, mask) = parseInetText(s)
+    PgInet(address: ip, mask: mask)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getCidr*(row: Row, col: int): PgCidr =
   ## Get a column value as PgCidr (CIDR network address). Handles binary format.
@@ -673,8 +705,11 @@ proc getCidr*(row: Row, col: int): PgCidr =
     let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
     return PgCidr(address: ip, mask: mask)
   let s = row.getStr(col)
-  let (ip, mask) = parseInetText(s)
-  PgCidr(address: ip, mask: mask)
+  try:
+    let (ip, mask) = parseInetText(s)
+    PgCidr(address: ip, mask: mask)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getMacAddr*(row: Row, col: int): PgMacAddr =
   ## Get a column value as PgMacAddr. Handles binary format.
@@ -776,7 +811,11 @@ proc getPoint*(row: Row, col: int): PgPoint =
     if clen != 16:
       raise newException(PgTypeError, "Invalid binary point length: " & $clen)
     return decodePointBinary(row.data.buf, off)
-  parsePointText(row.getStr(col))
+  let s = row.getStr(col)
+  try:
+    parsePointText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getLine*(row: Row, col: int): PgLine =
   ## Get a column value as PgLine. Handles binary format.
@@ -797,10 +836,14 @@ proc getLine*(row: Row, col: int): PgLine =
   if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
     inner = inner[1 ..^ 2]
   else:
-    raise newException(PgTypeError, "Invalid line: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid line (len=" & $s.len & ")"
+    )
   let parts = inner.split(',')
   if parts.len != 3:
-    raise newException(PgTypeError, "Invalid line: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid line (len=" & $s.len & ")"
+    )
   PgLine(
     a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
   )
@@ -823,9 +866,15 @@ proc getLseg*(row: Row, col: int): PgLseg =
   var inner = s
   if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
     inner = inner[1 ..^ 2]
-  let points = parsePointsText(inner)
+  let points =
+    try:
+      parsePointsText(inner)
+    except PgTypeError as e:
+      raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
   if points.len != 2:
-    raise newException(PgTypeError, "Invalid lseg: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid lseg (len=" & $s.len & ")"
+    )
   PgLseg(p1: points[0], p2: points[1])
 
 proc getBox*(row: Row, col: int): PgBox =
@@ -843,9 +892,14 @@ proc getBox*(row: Row, col: int): PgBox =
       low: decodePointBinary(row.data.buf, off + 16),
     )
   let s = row.getStr(col).strip()
-  let points = parsePointsText(s)
+  let points =
+    try:
+      parsePointsText(s)
+    except PgTypeError as e:
+      raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
   if points.len != 2:
-    raise newException(PgTypeError, "Invalid box: " & s)
+    raise
+      newException(PgTypeError, "Column " & $col & ": Invalid box (len=" & $s.len & ")")
   PgBox(high: points[0], low: points[1])
 
 proc getPath*(row: Row, col: int): PgPath =
@@ -881,10 +935,16 @@ proc getPath*(row: Row, col: int): PgPath =
     return
   let s = row.getStr(col).strip()
   if s.len < 2:
-    raise newException(PgTypeError, "Invalid path: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid path (len=" & $s.len & ")"
+    )
   let closed = s[0] == '('
   let inner = s[1 ..^ 2]
-  let points = parsePointsText(inner)
+  let points =
+    try:
+      parsePointsText(inner)
+    except PgTypeError as e:
+      raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
   PgPath(closed: closed, points: points)
 
 proc getPolygon*(row: Row, col: int): PgPolygon =
@@ -919,9 +979,14 @@ proc getPolygon*(row: Row, col: int): PgPolygon =
     return
   let s = row.getStr(col).strip()
   if s.len < 2 or s[0] != '(' or s[^1] != ')':
-    raise newException(PgTypeError, "Invalid polygon: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid polygon (len=" & $s.len & ")"
+    )
   let inner = s[1 ..^ 2]
-  PgPolygon(points: parsePointsText(inner))
+  try:
+    PgPolygon(points: parsePointsText(inner))
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getCircle*(row: Row, col: int): PgCircle =
   ## Get a column value as PgCircle. Handles binary format.
@@ -938,7 +1003,9 @@ proc getCircle*(row: Row, col: int): PgCircle =
     return
   let s = row.getStr(col).strip()
   if s.len < 2 or s[0] != '<' or s[^1] != '>':
-    raise newException(PgTypeError, "Invalid circle: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid circle (len=" & $s.len & ")"
+    )
   let inner = s[1 ..^ 2]
   # Find the last comma that's outside parens
   var depth = 0
@@ -951,10 +1018,15 @@ proc getCircle*(row: Row, col: int): PgCircle =
     elif inner[i] == ',' and depth == 0:
       lastComma = i
   if lastComma < 0:
-    raise newException(PgTypeError, "Invalid circle: " & s)
-  let center = parsePointText(inner[0 ..< lastComma])
-  let radius = pgParseFloat(inner[lastComma + 1 ..^ 1])
-  PgCircle(center: center, radius: radius)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid circle (len=" & $s.len & ")"
+    )
+  try:
+    let center = parsePointText(inner[0 ..< lastComma])
+    let radius = pgParseFloat(inner[lastComma + 1 ..^ 1])
+    PgCircle(center: center, radius: radius)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 # NULL-safe Option accessors — return `none` for NULL instead of raising.
 
@@ -1404,7 +1476,9 @@ proc bytesElemFromText(s: string): seq[byte] =
   if s.len >= 2 and s[0] == '\\' and s[1] == 'x':
     let hexLen = s.len - 2
     if hexLen mod 2 != 0:
-      raise newException(PgTypeError, "odd-length hex in bytea array element: " & s)
+      raise newException(
+        PgTypeError, "odd-length hex in bytea array element (len=" & $s.len & ")"
+      )
     result = newSeq[byte](hexLen div 2)
     for j in 0 ..< result.len:
       result[j] = decodeHexPair(s, 2 + j * 2, errCtx)
@@ -1417,7 +1491,7 @@ proc jsonElemFromText(s: string): JsonNode =
   try:
     parseJson(s)
   except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON element: " & s)
+    raise newException(PgTypeError, "Invalid JSON element (len=" & $s.len & ")")
 
 genArrayDecoderCustom(
   getJsonArray,
@@ -1440,10 +1514,10 @@ proc lineElemFromText(s: string): PgLine =
   if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
     inner = inner[1 ..^ 2]
   else:
-    raise newException(PgTypeError, "Invalid line: " & v)
+    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
   let parts = inner.split(',')
   if parts.len != 3:
-    raise newException(PgTypeError, "Invalid line: " & v)
+    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
   PgLine(
     a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
   )
@@ -1457,7 +1531,7 @@ proc lsegElemFromText(s: string): PgLseg =
     inner = inner[1 ..^ 2]
   let points = parsePointsText(inner)
   if points.len != 2:
-    raise newException(PgTypeError, "Invalid lseg: " & v)
+    raise newException(PgTypeError, "Invalid lseg (len=" & $v.len & ")")
   PgLseg(p1: points[0], p2: points[1])
 
 genArrayDecoder(getLsegArray, PgLseg, "lseg", [OidLseg], lsegElemFromText(e.get))
@@ -1481,7 +1555,9 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
   # PostgreSQL uses ';' as array element delimiter for box type
   let s = row.getStr(col)
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
-    raise newException(PgTypeError, "Invalid box array literal: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid box array literal (len=" & $s.len & ")"
+    )
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     return
@@ -1492,13 +1568,15 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
       raise newException(PgTypeError, "NULL element in box array")
     let points = parsePointsText(v)
     if points.len != 2:
-      raise newException(PgTypeError, "Invalid box: " & v)
+      raise newException(
+        PgTypeError, "Column " & $col & ": Invalid box (len=" & $v.len & ")"
+      )
     result.add(PgBox(high: points[0], low: points[1]))
 
 proc pathElemFromText(s: string): PgPath =
   let v = s.strip()
   if v.len < 2:
-    raise newException(PgTypeError, "Invalid path: " & v)
+    raise newException(PgTypeError, "Invalid path (len=" & $v.len & ")")
   let closed = v[0] == '('
   let inner = v[1 ..^ 2]
   PgPath(closed: closed, points: parsePointsText(inner))
@@ -1508,7 +1586,7 @@ genArrayDecoder(getPathArray, PgPath, "path", [OidPath], pathElemFromText(e.get)
 proc polygonElemFromText(s: string): PgPolygon =
   let v = s.strip()
   if v.len < 2 or v[0] != '(' or v[^1] != ')':
-    raise newException(PgTypeError, "Invalid polygon: " & v)
+    raise newException(PgTypeError, "Invalid polygon (len=" & $v.len & ")")
   PgPolygon(points: parsePointsText(v[1 ..^ 2]))
 
 genArrayDecoder(
@@ -1518,7 +1596,7 @@ genArrayDecoder(
 proc circleElemFromText(s: string): PgCircle =
   let v = s.strip()
   if v.len < 2 or v[0] != '<' or v[^1] != '>':
-    raise newException(PgTypeError, "Invalid circle: " & v)
+    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
   let inner = v[1 ..^ 2]
   var depth = 0
   var lastComma = -1
@@ -1530,7 +1608,7 @@ proc circleElemFromText(s: string): PgCircle =
     elif inner[j] == ',' and depth == 0:
       lastComma = j
   if lastComma < 0:
-    raise newException(PgTypeError, "Invalid circle: " & v)
+    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
   PgCircle(
     center: parsePointText(inner[0 ..< lastComma]),
     radius: pgParseFloat(inner[lastComma + 1 ..^ 1]),

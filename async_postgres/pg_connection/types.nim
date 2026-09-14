@@ -121,6 +121,9 @@ type
       ## `host` is still the name used for SSL certificate verification.
     user*: string
     password*: string
+      ## Cleartext password (libpq ``password``), held in plaintext in memory.
+      ## DSN parse/validation errors never echo parameter values, but callers
+      ## must not log it either.
     database*: string
     sslMode*: SslMode
       ## SSL/TLS negotiation mode. `parseDsn` and `initConnConfig` default this

@@ -329,11 +329,13 @@ proc parseRangeText*[T](
   if s == "empty":
     return PgRange[T](isEmpty: true)
   if s.len < 3:
-    raise newException(PgTypeError, "Invalid range literal: " & s)
+    raise newException(PgTypeError, "Invalid range literal (len=" & $s.len & ")")
   if s[0] notin {'[', '('}:
-    raise newException(PgTypeError, "range: invalid lower boundary: " & s)
+    raise
+      newException(PgTypeError, "range: invalid lower boundary (len=" & $s.len & ")")
   if s[^1] notin {']', ')'}:
-    raise newException(PgTypeError, "range: invalid upper boundary: " & s)
+    raise
+      newException(PgTypeError, "range: invalid upper boundary (len=" & $s.len & ")")
   let lowerInc = s[0] == '['
   let upperInc = s[^1] == ']'
   let inner = s[1 ..^ 2]
@@ -356,7 +358,8 @@ proc parseRangeText*[T](
         break
     i += 1
   if commaPos == -1:
-    raise newException(PgTypeError, "Invalid range literal (no comma): " & s)
+    raise
+      newException(PgTypeError, "Invalid range literal (no comma) (len=" & $s.len & ")")
   let lowerStr = inner[0 ..< commaPos]
   let upperStr = inner[commaPos + 1 ..^ 1]
   # Parse lower bound
@@ -364,7 +367,8 @@ proc parseRangeText*[T](
     let (val, pos) = parseRangeElem(lowerStr, 0, {','})
     if pos != lowerStr.len:
       raise newException(
-        PgTypeError, "range: trailing bytes after lower element: " & lowerStr
+        PgTypeError,
+        "range: trailing bytes after lower element (len=" & $lowerStr.len & ")",
       )
     result.hasLower = true
     result.lower = PgRangeBound[T](value: parseElem(val), inclusive: lowerInc)
@@ -373,7 +377,8 @@ proc parseRangeText*[T](
     let (val, pos) = parseRangeElem(upperStr, 0, {','})
     if pos != upperStr.len:
       raise newException(
-        PgTypeError, "range: trailing bytes after upper element: " & upperStr
+        PgTypeError,
+        "range: trailing bytes after upper element (len=" & $upperStr.len & ")",
       )
     result.hasUpper = true
     result.upper = PgRangeBound[T](value: parseElem(val), inclusive: upperInc)
@@ -783,7 +788,7 @@ proc parseMultirangeText*[T](
     s: string, parseElem: proc(s: string): T {.gcsafe, raises: [CatchableError].}
 ): PgMultirange[T] =
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
-    raise newException(PgTypeError, "Invalid multirange literal: " & s)
+    raise newException(PgTypeError, "Invalid multirange literal (len=" & $s.len & ")")
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     return PgMultirange[T](@[])
@@ -818,26 +823,31 @@ proc parseMultirangeText*[T](
           else:
             j += 1
       if not closed:
-        raise newException(PgTypeError, "multirange: unterminated range in: " & s)
+        raise newException(
+          PgTypeError, "multirange: unterminated range (len=" & $s.len & ")"
+        )
       ranges.add(parseRangeText[T](inner[i ..< j], parseElem))
       i = j
     elif i + 5 <= inner.len and inner[i ..< i + 5] == "empty":
       ranges.add(PgRange[T](isEmpty: true))
       i += 5
     else:
-      raise newException(PgTypeError, "multirange: expected range or 'empty' in: " & s)
+      raise newException(
+        PgTypeError, "multirange: expected range or 'empty' (len=" & $s.len & ")"
+      )
     if i == inner.len:
       break
     if inner[i] != ',':
       raise newException(
-        PgTypeError, "multirange: expected ',' or end after element in: " & s
+        PgTypeError,
+        "multirange: expected ',' or end after element (len=" & $s.len & ")",
       )
     i += 1
     # `$` in this module emits ", " between ranges; tolerate the optional space.
     while i < inner.len and inner[i] == ' ':
       i += 1
     if i == inner.len:
-      raise newException(PgTypeError, "multirange: trailing ',' in: " & s)
+      raise newException(PgTypeError, "multirange: trailing ',' (len=" & $s.len & ")")
   PgMultirange[T](ranges)
 
 proc encodeMultirangeBinaryImpl(
