@@ -1251,6 +1251,28 @@ proc toPgBinaryParam*(
   else:
     PgParam(oid: OidJsonb, format: 1, value: none(seq[byte]))
 
+# Distinct-string types whose ``default(T)`` is empty and fails binary
+# validation. The generic Option dispatcher prototypes via
+# ``toPgBinaryParam(default(T))``, so these must resolve OID/format statically
+# (same pattern as Option[JsonNode] / Option[PgMoney] above/below).
+proc toPgBinaryParam*(v: Option[PgUuid]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidUuid, format: 1, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: Option[PgMacAddr]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidMacAddr, format: 1, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: Option[PgMacAddr8]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidMacAddr8, format: 1, value: none(seq[byte]))
+
 proc encodeHstoreBinary*(
     v: PgHstore
 ): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
