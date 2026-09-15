@@ -160,6 +160,51 @@ const pingBudgetFloor = milliseconds(10)
   ## with less than a realistic round trip's worth of budget would just burn
   ## a healthy connection on an acquire that is about to time out anyway.
 
+proc validatePoolConfig(config: PoolConfig) {.raises: [ValueError].} =
+  ## Reject invalid pool parameters. Shared by `initPoolConfig` and `newPool`
+  ## so a directly constructed `PoolConfig` cannot skip the same checks.
+  ##
+  ## Durations are rejected when negative rather than silently treated as
+  ## "disabled": `ZeroDuration` is the documented opt-out spelling, and a
+  ## negative `maintenanceInterval` would otherwise turn the maintenance loop
+  ## into a hot spin.
+  if config.minSize < 0:
+    raise newException(ValueError, "minSize must be >= 0, got " & $config.minSize)
+  if config.maxSize < 1:
+    raise newException(ValueError, "maxSize must be >= 1, got " & $config.maxSize)
+  if config.minSize > config.maxSize:
+    raise newException(
+      ValueError,
+      "minSize (" & $config.minSize & ") must be <= maxSize (" & $config.maxSize & ")",
+    )
+  if config.maxWaiters < -1:
+    raise
+      newException(ValueError, "maxWaiters must be >= -1, got " & $config.maxWaiters)
+  if config.maxPipelineSize < 0:
+    raise newException(
+      ValueError, "maxPipelineSize must be >= 0, got " & $config.maxPipelineSize
+    )
+  if config.idleTimeout < ZeroDuration:
+    raise newException(ValueError, "idleTimeout must be >= 0")
+  if config.maxLifetime < ZeroDuration:
+    raise newException(ValueError, "maxLifetime must be >= 0")
+  if config.maintenanceInterval < ZeroDuration:
+    raise newException(ValueError, "maintenanceInterval must be >= 0")
+  if config.pingTimeout < ZeroDuration:
+    raise newException(ValueError, "pingTimeout must be >= 0")
+  if config.acquireTimeout < ZeroDuration:
+    raise newException(ValueError, "acquireTimeout must be >= 0")
+  if config.connectBackoffInitial < ZeroDuration:
+    raise newException(ValueError, "connectBackoffInitial must be >= 0")
+  if config.connectBackoffMax < config.connectBackoffInitial:
+    raise newException(ValueError, "connectBackoffMax must be >= connectBackoffInitial")
+  if config.healthCheckTimeout < ZeroDuration:
+    raise newException(ValueError, "healthCheckTimeout must be >= 0")
+  if config.tlsHealthCheckTimeout < ZeroDuration:
+    raise newException(ValueError, "tlsHealthCheckTimeout must be >= 0")
+  if config.resetQueryTimeout < ZeroDuration:
+    raise newException(ValueError, "resetQueryTimeout must be >= 0")
+
 proc initPoolConfig*(
     connConfig: ConnConfig,
     minSize = 1,
@@ -189,28 +234,7 @@ proc initPoolConfig*(
   ## backoff and fall back to fixed-interval retries.
   ##
   ## Raises `ValueError` if parameters are invalid.
-  if minSize < 0:
-    raise newException(ValueError, "minSize must be >= 0, got " & $minSize)
-  if maxSize < 1:
-    raise newException(ValueError, "maxSize must be >= 1, got " & $maxSize)
-  if minSize > maxSize:
-    raise newException(
-      ValueError, "minSize (" & $minSize & ") must be <= maxSize (" & $maxSize & ")"
-    )
-  if maxWaiters < -1:
-    raise newException(ValueError, "maxWaiters must be >= -1, got " & $maxWaiters)
-  if connectBackoffInitial < ZeroDuration:
-    raise newException(ValueError, "connectBackoffInitial must be >= 0")
-  if connectBackoffMax < connectBackoffInitial:
-    raise newException(ValueError, "connectBackoffMax must be >= connectBackoffInitial")
-  if healthCheckTimeout < ZeroDuration:
-    raise newException(ValueError, "healthCheckTimeout must be >= 0")
-  if tlsHealthCheckTimeout < ZeroDuration:
-    raise newException(ValueError, "tlsHealthCheckTimeout must be >= 0")
-  if resetQueryTimeout < ZeroDuration:
-    raise newException(ValueError, "resetQueryTimeout must be >= 0")
-
-  PoolConfig(
+  let cfg = PoolConfig(
     connConfig: connConfig,
     minSize: minSize,
     maxSize: maxSize,
@@ -229,6 +253,8 @@ proc initPoolConfig*(
     connectBackoffInitial: connectBackoffInitial,
     connectBackoffMax: connectBackoffMax,
   )
+  validatePoolConfig(cfg)
+  cfg
 
 proc poolConfig*(pool: PgPool): PoolConfig =
   ## The pool configuration.
@@ -705,6 +731,9 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   ## Create a new connection pool and establish `minSize` initial connections.
   ## Raises if any initial connection fails (all opened connections are closed on error).
+  ## Raises `ValueError` if `config` is invalid; re-checked here so a directly
+  ## constructed `PoolConfig` cannot bypass `initPoolConfig`'s validation.
+  validatePoolConfig(config)
   var cfg = config
   if cfg.maintenanceInterval == ZeroDuration:
     cfg.maintenanceInterval = seconds(30)
