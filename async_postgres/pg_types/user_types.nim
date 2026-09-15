@@ -1,7 +1,8 @@
 import std/[options, macros, strutils, typetraits]
 
 import ../pg_protocol
-import core, decoding, encoding, accessors
+import core, decoding, encoding
+import accessors {.all.}
 
 # User-defined enum type support
 #
@@ -21,7 +22,9 @@ import core, decoding, encoding, accessors
 #   let m = row.getEnum[Mood](0)
 #   let m = row.getEnumOpt[Mood](0)
 
-proc encodeEnumTextArray*(labels: seq[Option[string]]): string =
+proc encodeEnumTextArray*(
+    labels: seq[Option[string]]
+): string {.raises: [PgTypeError].} =
   ## Encode enum labels as a PostgreSQL text-format array literal.
   ## ``none`` labels become unquoted ``NULL``.
   result = "{"
@@ -37,6 +40,8 @@ proc encodeEnumTextArray*(labels: seq[Option[string]]): string =
       result.add('"')
     else:
       result.add("NULL")
+    # Per element, so an oversized array fails before the literal is built whole.
+    checkPgBinLen(result.len + 1, "enum array")
   result.add('}')
 
 macro pgEnum*(T: untyped): untyped =
@@ -48,7 +53,8 @@ macro pgEnum*(T: untyped): untyped =
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: 0'i32, format: 0'i16, value: some(toBytes($v)))
 
-    proc toPgParam*(v: seq[`T`]): PgParam =
+    proc toPgParam*(v: seq[`T`]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] = some($x)
@@ -56,7 +62,8 @@ macro pgEnum*(T: untyped): untyped =
         oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
       )
 
-    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] =
@@ -77,7 +84,8 @@ macro pgEnum*(T: untyped, oid: untyped): untyped =
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
 
-    proc toPgParam*(v: seq[`T`]): PgParam =
+    proc toPgParam*(v: seq[`T`]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] = some($x)
@@ -85,7 +93,8 @@ macro pgEnum*(T: untyped, oid: untyped): untyped =
         oid: 0'i32, format: 0'i16, value: some(toBytes(encodeEnumTextArray(labels)))
       )
 
-    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] =
@@ -104,7 +113,8 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
 
-    proc toPgParam*(v: seq[`T`]): PgParam =
+    proc toPgParam*(v: seq[`T`]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] = some($x)
@@ -114,7 +124,8 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
         value: some(toBytes(encodeEnumTextArray(labels))),
       )
 
-    proc toPgParam*(v: seq[Option[`T`]]): PgParam =
+    proc toPgParam*(v: seq[Option[`T`]]): PgParam {.raises: [PgTypeError].} =
+      checkArrayLen(v.len)
       var labels = newSeq[Option[string]](v.len)
       for i, x in v:
         labels[i] =
@@ -131,13 +142,17 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
 proc pgParseEnum[T: enum](s: string): T =
   ## Parse an enum label, converting `ValueError` (unknown label) to `PgTypeError`
   ## so callers can rely on the ``except PgError`` contract (see ``pg_errors``).
-  pgTypeErrorOnValueError("invalid enum value for " & name(T) & ": " & s):
+  pgTypeErrorOnValueError("invalid enum value for " & name(T) & " (len=" & $s.len & ")"):
     parseEnum[T](s)
 
 proc getEnum*[T: enum](row: Row, col: int): T =
   ## Read a PostgreSQL enum column (text format) as a Nim enum.
   ## The column value must exactly match one of ``T``'s string representations.
-  pgParseEnum[T](row.getStr(col))
+  let s = row.getStr(col)
+  try:
+    pgParseEnum[T](s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
   ## Read a PostgreSQL enum column as ``Option[T]``. Returns none if NULL.
@@ -202,8 +217,15 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
 proc parseCompositeText*(s: string): seq[Option[string]] =
   ## Parse PostgreSQL composite text format: (val1,val2,...)
   ## Returns fields as ``Option[string]`` (none for NULL).
+  ##
+  ## Expects canonical ``record_out`` output. Inside a double-quoted field both
+  ## doubled bytes (``""`` / ``\\``) and backslash escapes (as accepted by the
+  ## server's ``record_in``) are decoded; a quoted field must be followed by
+  ## ``','`` or the end. Unquoted fields reject ``"`` / ``\\`` / ``(`` / ``)``
+  ## with ``PgTypeError``: ``record_out`` always quotes such bytes, so accepting
+  ## them would decode non-canonical input silently.
   if s.len < 2 or s[0] != '(' or s[^1] != ')':
-    raise newException(PgTypeError, "Invalid composite literal: " & s)
+    raise newException(PgTypeError, "Invalid composite literal (len=" & $s.len & ")")
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     # PostgreSQL emits `()` for a 1-field composite whose sole field is NULL;
@@ -221,6 +243,7 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
       # Quoted field
       i += 1
       var elem = ""
+      var closed = false
       while i < inner.len:
         if inner[i] == '\\' and i + 1 < inner.len:
           i += 1
@@ -231,11 +254,18 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
             elem.add('"')
             i += 1
           else:
+            closed = true
             break
         else:
           elem.add(inner[i])
         i += 1
+      if not closed:
+        raise newException(PgTypeError, "composite: unterminated quoted field")
       i += 1 # skip closing quote
+      # Quoted field must be followed by ',' or end of composite; anything else
+      # (e.g. `("a"b)`) is malformed and would otherwise be silently split.
+      if i < inner.len and inner[i] != ',':
+        raise newException(PgTypeError, "composite: unexpected byte after quoted field")
       result.add(some(elem))
       if i < inner.len and inner[i] == ',':
         i += 1
@@ -245,6 +275,12 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
       # Unquoted field
       var elem = ""
       while i < inner.len and inner[i] != ',':
+        # Server-side output quotes fields containing these structural
+        # bytes (see compositeFieldToText), so an unquoted occurrence is
+        # malformed input that would otherwise decode silently.
+        if inner[i] in {'"', '\\', '(', ')'}:
+          raise
+            newException(PgTypeError, "composite: unexpected byte in unquoted field")
         elem.add(inner[i])
         i += 1
       result.add(some(elem))
@@ -255,7 +291,7 @@ proc parseCompositeText*(s: string): seq[Option[string]] =
 
 proc encodeBinaryComposite*(
     fields: seq[tuple[oid: int32, data: Option[seq[byte]]]]
-): seq[byte] =
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
   ## Encode a PostgreSQL binary composite value.
   ## Format: ``numFields(4) + [oid(4) + len(4) + data]...``
   checkPgBinLen(fields.len, "Composite field count")
@@ -303,7 +339,7 @@ proc compositeFieldToText(val: string): string =
       result.add(c)
   result.add('"')
 
-proc encodeCompositeText*(fields: seq[Option[string]]): string =
+proc encodeCompositeText*(fields: seq[Option[string]]): string {.raises: [].} =
   ## Encode fields as PostgreSQL composite text format: (val1,val2,...)
   result = "("
   for i, f in fields:

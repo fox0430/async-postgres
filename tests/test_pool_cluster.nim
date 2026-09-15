@@ -1,6 +1,7 @@
 import std/[unittest, deques, tables, importutils, strutils]
 
 import ../async_postgres/[async_backend, pg_protocol, pg_connection]
+import ../async_postgres/pg_connection/types {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_pool_cluster {.all.}
 
@@ -207,6 +208,97 @@ suite "Exception safety":
 
     waitFor t()
 
+  test "withReadConnection releases on Defect":
+    # Regression: a body Defect must still release the slot, not leak it.
+    proc t() {.async.} =
+      let cluster = makeCluster()
+      let conn = mockConn()
+      cluster.replica.mockIdle(conn)
+
+      var caught = false
+      try:
+        cluster.withReadConnection(c):
+          doAssert cluster.replica.active == 1
+          raise newException(AssertionDefect, "boom")
+      except PgPoolError:
+        caught = true
+
+      doAssert caught
+      doAssert cluster.replica.active == 0
+      doAssert cluster.replica.idle.len == 1
+
+    waitFor t()
+
+  test "withWriteConnection releases on Defect":
+    # Regression: a body Defect must still release the slot, not leak it.
+    proc t() {.async.} =
+      let cluster = makeCluster()
+      let conn = mockConn()
+      cluster.primary.mockIdle(conn)
+
+      var caught = false
+      try:
+        cluster.withWriteConnection(c):
+          doAssert cluster.primary.active == 1
+          raise newException(AssertionDefect, "boom")
+      except PgPoolError:
+        caught = true
+
+      doAssert caught
+      doAssert cluster.primary.active == 0
+      doAssert cluster.primary.idle.len == 1
+
+    waitFor t()
+
+  when hasChronos:
+    test "withReadConnection wraps a release-path Defect in PgPoolError":
+      # Regression: a Defect raised by the release path (resetSession's
+      # synchronous prelude — here the unlock_all exec) must surface as
+      # PgPoolError instead of escaping raw, since chronos re-raises Defects
+      # eagerly from continuations.
+      proc t() {.async.} =
+        let cluster = makeCluster()
+        let conn = mockConn()
+        conn.writer = defectWriter()
+        conn.sessionLockDirty = true # forces unlock_all through the writer
+        cluster.replica.mockIdle(conn)
+
+        var caught = false
+        try:
+          cluster.withReadConnection(c):
+            doAssert cluster.replica.active == 1
+        except PgPoolError:
+          caught = true
+
+        doAssert caught
+        # The conn was discarded (session reset failed), so it is not idle.
+        doAssert cluster.replica.active == 0
+        doAssert cluster.replica.idle.len == 0
+
+      waitFor t()
+
+    test "withWriteConnection wraps a release-path Defect in PgPoolError":
+      # Regression: same as the withReadConnection case, on the primary pool.
+      proc t() {.async.} =
+        let cluster = makeCluster()
+        let conn = mockConn()
+        conn.writer = defectWriter()
+        conn.sessionLockDirty = true # forces unlock_all through the writer
+        cluster.primary.mockIdle(conn)
+
+        var caught = false
+        try:
+          cluster.withWriteConnection(c):
+            doAssert cluster.primary.active == 1
+        except PgPoolError:
+          caught = true
+
+        doAssert caught
+        doAssert cluster.primary.active == 0
+        doAssert cluster.primary.idle.len == 0
+
+      waitFor t()
+
 suite "Fallback":
   test "fallbackPrimary falls back to primary when replica unavailable":
     let cluster = makeCluster(fallback = fallbackPrimary)
@@ -288,7 +380,8 @@ suite "Fallback":
       raised = e
 
     check raised != nil
-    check "fallback acquire timeout" in raised.msg
+    check raised of PgPoolError
+    check (ref PgPoolError)(raised).kind == pekAcquireTimeout
     # The replica failure that triggered the fallback is preserved as the cause.
     check raised.parent != nil
     check "Pool is closed" in raised.parent.msg
@@ -381,6 +474,35 @@ suite "Fallback":
       check cluster.replica.active == cluster.replica.config.maxSize - 1
       check cluster.replica.idle.len == 1
       check cluster.replica.idle.peekFirst().conn == lateConn
+
+    test "a drained late connection is closed by the pool, not by the application":
+      # The replica pool shuts down mid-acquire. `drainAbandonedAcquire` must
+      # reclaim through the pool's own path: a plain `release()` would stamp
+      # `closedByUser` on a connection the application never held.
+      let cluster =
+        makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(50))
+      cluster.replica.active = cluster.replica.config.maxSize
+      cluster.replica.config.acquireTimeout = seconds(30)
+
+      let primaryConn = mockConn()
+      cluster.primary.idle.addLast(
+        PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+      )
+      discard waitFor acquireRead(cluster)
+
+      # Hand off while the pool is open (a release into a closed pool never reaches
+      # the waiter), then shut it down before the drain runs.
+      let lateConn = mockConn(pool = cluster.replica)
+      lateConn.borrowed = true
+      lateConn.release()
+      cluster.replica.closed = true
+
+      waitFor sleepMsAsync(100)
+      waitFor allFutures(cluster.replica.pendingBackgroundTasks)
+
+      check not lateConn.closedByUser
+      expect PgConnectionError:
+        lateConn.checkNotClosed()
 
   test "onReadFallback fires with rfrReplicaClosed when replica is closed":
     var fired = 0

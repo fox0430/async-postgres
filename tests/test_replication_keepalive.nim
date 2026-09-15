@@ -16,6 +16,9 @@ import ../async_postgres/pg_connection {.all.}
 
 import mock_pg_server
 
+import std/importutils
+privateAccess(PgConnection)
+
 when hasChronos:
   from std/times import cpuTime
 
@@ -458,6 +461,67 @@ suite "Replication: callback exception invalidates the connection":
     check poisonRaised
     check poisonFinalState == csClosed
 
+var stopFrontendMsgs: seq[char]
+
+suite "Replication: client-initiated stop":
+  test "stopReplication does not double-send CopyDone":
+    # Regression: the recv-loop `bmkCopyDone` handler used to mirror the
+    # server's CopyDone unconditionally, so after stopReplication the client
+    # sent [status, CopyDone] twice. The second CopyDone arrives after the
+    # server has left COPY mode and would be `invalid frontend message type`.
+    stopFrontendMsgs.setLen(0)
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        await sendBytes(st, buildCopyBothResponse())
+        # stopReplication first flushes a Standby Status ('d'), then CopyDone ('c').
+        let m1 = await drainFrontendMessage(st)
+        let m2 = await drainFrontendMessage(st)
+        {.cast(gcsafe).}:
+          stopFrontendMsgs.add(m1.msgType)
+          stopFrontendMsgs.add(m2.msgType)
+        var tail: seq[byte]
+        tail.add(buildCopyDone())
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        # After ReadyForQuery only Terminate ('X') from conn.close is expected.
+        # A pre-fix client would send another 'd' then 'c' here.
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          {.cast(gcsafe).}:
+            stopFrontendMsgs.add(m.msgType)
+          if m.msgType == 'X':
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        discard msg
+
+      proc stopper() {.async.} =
+        while conn.state != csReplicating:
+          await sleepAsync(milliseconds(1))
+        await conn.stopReplication()
+
+      let stopFut = stopper()
+      await conn.startReplication("test_slot", callback = cb)
+      await stopFut
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check stopFrontendMsgs == @['d', 'c', 'X']
+
 when hasChronos:
   suite "Replication: idle wakeup rate":
     test "statusInterval + autoKeepaliveReply=false does not busy-spin while idle":
@@ -653,13 +717,13 @@ proc runStartReplicationCapture(slot: string, options: seq[(string, string)]): s
 
 suite "Replication: pgoutput proto_version defensive injection":
   test "publication_names without proto_version pins proto_version '1'":
-    let q = runStartReplicationCapture("test_slot", @[("publication_names", "'p1'")])
+    let q = runStartReplicationCapture("test_slot", @[("publication_names", "p1")])
     check "publication_names 'p1'" in q
     check "proto_version '1'" in q
 
   test "explicit proto_version is preserved and not duplicated":
     let q = runStartReplicationCapture(
-      "test_slot", @[("proto_version", "'1'"), ("publication_names", "'p1'")]
+      "test_slot", @[("proto_version", "1"), ("publication_names", "p1")]
     )
     check q.count("proto_version") == 1
 
@@ -668,3 +732,23 @@ suite "Replication: pgoutput proto_version defensive injection":
     # not understand proto_version and would reject an injected value.
     let q = runStartReplicationCapture("test_slot", @[])
     check "proto_version" notin q
+
+  test "option values are single-quoted against injection":
+    let q = runStartReplicationCapture(
+      "test_slot", @[("publication_names", "p1'); DROP TABLE t; --")]
+    )
+    # Single-quoted with embedded quotes doubled — no unquoted breakout.
+    check "publication_names 'p1''); DROP TABLE t; --'" in q
+    check "publication_names 'p1'); DROP" notin q
+
+  test "empty option value stays flag-only (no quoted empty string)":
+    let q = runStartReplicationCapture("test_slot", @[("binary", "")])
+    check "(binary)" in q
+    check "binary ''" notin q
+
+  test "backslash in an option value stays literal (no E'' form)":
+    # The walsender scanner has no E'' rule, so the value must keep its plain
+    # single-quoted spelling even though `quoteLiteral` would switch forms.
+    let q = runStartReplicationCapture("test_slot", @[("publication_names", "a\\b")])
+    check "publication_names 'a\\b'" in q
+    check "E'" notin q

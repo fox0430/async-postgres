@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, tables, math, importutils, net]
+import std/[unittest, options, strutils, tables, math, importutils, net, macros]
 
 import
   ../async_postgres/[
@@ -6,9 +6,58 @@ import
     pg_connection,
   ]
 
+import ../async_postgres/pg_client/transaction {.all.}
+import ../async_postgres/pg_connection/[simple_query, lifecycle]
+
 import e2e_common
 
 privateAccess(PgConnection)
+
+type CleanupSkippedRec = object
+  kind: CleanupKind
+  reason: CleanupSkipReason
+
+proc cleanupSkippedTracer(): (PgTracer, ref seq[CleanupSkippedRec]) =
+  ## Build a tracer that records `onCleanupSkipped` events (kind + reason)
+  ## for the cleanup-exactly-once regression tests. Wire the tracer into the
+  ## `ConnConfig` passed to `connect`; read the recorded events from the
+  ## returned log afterwards.
+  let log = new seq[CleanupSkippedRec]
+  let tracer = PgTracer()
+  tracer.onCleanupSkipped = proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].} =
+    log[].add(CleanupSkippedRec(kind: data.kind, reason: data.reason))
+  (tracer, log)
+
+proc rollbackTracer(): (PgTracer, ref seq[string]) =
+  ## Build a tracer recording `onQueryStart` events for the ROLLBACK issued by
+  ## the transaction macros' cleanup, to observe ROLLBACK execution directly
+  ## in the pool Defect tests. Wire it into the `ConnConfig` passed to
+  ## `newPool`; read the recorded SQL from the returned log.
+  let log = new seq[string]
+  let tracer = PgTracer()
+  tracer.onQueryStart = proc(
+      conn: PgConnection, data: TraceQueryStartData
+  ): TraceContext {.gcsafe, raises: [].} =
+    if data.sql == "ROLLBACK":
+      log[].add(data.sql)
+    return nil
+  (tracer, log)
+
+proc resetStartTracer(): (PgTracer, ref Moment, ref bool) =
+  ## Records when the pool's resetQuery ("SELECT pg_sleep(2)") starts — the
+  ## release is the only path that runs it, so a deadline fired during the
+  ## release is distinguishable from one fired during the body.
+  let startedAt = new Moment
+  let started = new bool
+  let tracer = PgTracer()
+  tracer.onQueryStart = proc(
+      conn: PgConnection, data: TraceQueryStartData
+  ): TraceContext {.gcsafe, raises: [].} =
+    if data.sql == "SELECT pg_sleep(2)":
+      started[] = true
+      startedAt[] = Moment.now()
+    return nil
+  (tracer, startedAt, started)
 
 suite "E2E: Transaction":
   test "withTransaction commits on success":
@@ -27,6 +76,35 @@ suite "E2E: Transaction":
       doAssert res.rows[0].getStr(0) == "committed"
 
       discard await conn.exec("DROP TABLE test_tx")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction runs COMMIT after an unlabeled break inside a body block":
+    # Regression: a body-local `block:` binds the unlabeled break (UnnamedBreak
+    # in Nim >= 2.2), so the COMMIT must still run and the row be committed.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_blockbreak")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_blockbreak (id serial PRIMARY KEY, val text)"
+      )
+
+      {.push warning[UnnamedBreak]: off.}
+      conn.withTransaction:
+        block:
+          if true:
+            break
+        discard await conn.exec(
+          "INSERT INTO test_tx_blockbreak (val) VALUES ($1)", @[toPgParam("bb")]
+        )
+      {.pop.}
+
+      let res = await conn.query("SELECT val FROM test_tx_blockbreak")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "bb"
+
+      discard await conn.exec("DROP TABLE test_tx_blockbreak")
       await conn.close()
 
     waitFor t()
@@ -55,6 +133,37 @@ suite "E2E: Transaction":
       doAssert res.rows.len == 0
 
       discard await conn.exec("DROP TABLE test_tx_rb")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction rolls back on body Defect":
+    # Regression: a Defect raised in the body must still ROLLBACK server-side
+    # and re-raise, not leave the transaction open holding locks.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_rb_defect")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_rb_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var caught = false
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withTransaction:
+          discard await conn.exec(
+            "INSERT INTO test_tx_rb_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "boom")
+        {.pop.}
+      except Defect:
+        caught = true
+
+      doAssert caught, "body Defect must propagate"
+      let res = await conn.query("SELECT val FROM test_tx_rb_defect")
+      doAssert res.rows.len == 0, "ROLLBACK must have run"
+
+      discard await conn.exec("DROP TABLE test_tx_rb_defect")
       await conn.close()
 
     waitFor t()
@@ -135,6 +244,44 @@ suite "E2E: Transaction":
       doAssert raised
       doAssert attempts == 3
 
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry does not retry a body Defect":
+    # A Defect must ROLLBACK the attempt, re-raise (never retry), and leave
+    # the connection usable. The retry loop is spliced inline into the
+    # caller's frame, so the Defect propagates as-is on both backends.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_tx_retry_defect")
+      discard await conn.exec(
+        "CREATE TABLE test_tx_retry_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var attempts = 0
+      var caught = false
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withTransactionRetry(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false)
+        ):
+          inc attempts
+          discard await conn.exec(
+            "INSERT INTO test_tx_retry_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "retry boom")
+        {.pop.}
+      except Defect:
+        caught = true
+
+      doAssert caught, "body Defect must propagate"
+      doAssert attempts == 1, "a Defect must not be retried"
+      let res = await conn.query("SELECT val FROM test_tx_retry_defect")
+      doAssert res.rows.len == 0, "ROLLBACK must have run"
+      doAssert conn.txStatus == tsIdle
+
+      discard await conn.exec("DROP TABLE test_tx_retry_defect")
       await conn.close()
 
     waitFor t()
@@ -719,6 +866,42 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  test "withSavepoint rolls back on body Defect":
+    # A Defect raised in the savepoint body must still ROLLBACK TO SAVEPOINT
+    # and re-raise, leaving the outer transaction's work intact. The
+    # savepoint block is spliced inline, so the Defect propagates as-is.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp_defect")
+      discard
+        await conn.exec("CREATE TABLE test_sp_defect (id serial PRIMARY KEY, val text)")
+
+      var caught = false
+      conn.withTransaction:
+        discard await conn.exec(
+          "INSERT INTO test_sp_defect (val) VALUES ($1)", @[toPgParam("outer")]
+        )
+        try:
+          {.push warning[UnreachableCode]: off.} # body always raises
+          conn.withSavepoint:
+            discard await conn.exec(
+              "INSERT INTO test_sp_defect (val) VALUES ($1)", @[toPgParam("inner")]
+            )
+            raise newException(AssertionDefect, "sp boom")
+          {.pop.}
+        except Defect:
+          caught = true
+
+      doAssert caught, "body Defect must propagate"
+      let res = await conn.query("SELECT val FROM test_sp_defect ORDER BY id")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "outer", "savepoint work must be rolled back"
+
+      discard await conn.exec("DROP TABLE test_sp_defect")
+      await conn.close()
+
+    waitFor t()
+
   test "nested withSavepoint":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -797,6 +980,48 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  test "withSavepoint accepts raw and triple-quoted string literal names":
+    # Regression: the two-arg overload used to match only nnkStrLit, so raw
+    # and triple-quoted names fell into the (timeout, body) branch and failed
+    # to compile.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_sp_lit_kinds")
+      discard await conn.exec(
+        "CREATE TABLE test_sp_lit_kinds (id serial PRIMARY KEY, val text)"
+      )
+
+      conn.withTransaction:
+        conn.withSavepoint(r"sp_raw"):
+          discard await conn.exec(
+            "INSERT INTO test_sp_lit_kinds (val) VALUES ($1)", @[toPgParam("raw")]
+          )
+        conn.withSavepoint("""sp_triple"""):
+          discard await conn.exec(
+            "INSERT INTO test_sp_lit_kinds (val) VALUES ($1)", @[toPgParam("triple")]
+          )
+
+      let res = await conn.query("SELECT val FROM test_sp_lit_kinds ORDER BY id")
+      doAssert res.rows.len == 2
+      doAssert res.rows[0].getStr(0) == "raw"
+      doAssert res.rows[1].getStr(0) == "triple"
+
+      discard await conn.exec("DROP TABLE test_sp_lit_kinds")
+      await conn.close()
+
+    waitFor t()
+
+  template txBailOutTemplate(): untyped =
+    ## `return` inside a template: invisible to the unexpanded escape walk,
+    ## must be caught by the post-expansion re-check.
+    if true:
+      return
+
+  template txBailOutBreak(): untyped =
+    ## `break` inside a template: invisible to the unexpanded escape walk,
+    ## must be caught by the post-expansion re-check.
+    break
+
   test "withTransaction rejects return at compile time":
     doAssert not compiles(
       block:
@@ -804,6 +1029,59 @@ suite "E2E: Transaction":
           let conn = await connect(plainConfig())
           conn.withTransaction:
             return
+
+    )
+
+  test "withTransaction rejects return hidden inside a template":
+    # A `return` inside a template called from the body would skip
+    # COMMIT/ROLLBACK; the typed re-check (checkNoBodyEscapePost) must reject it.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            txBailOutTemplate()
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionDeadline(seconds(5)):
+            txBailOutTemplate()
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withConnection(conn):
+            txBailOutTemplate()
+
+    )
+
+  test "withTransaction rejects break hidden inside a template":
+    # A `break` escaping to a caller-side loop via a template would skip
+    # COMMIT/ROLLBACK (or the connection release); the post-expansion
+    # re-check must reject it.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withTransaction:
+              txBailOutBreak()
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withConnection(conn):
+              txBailOutBreak()
 
     )
 
@@ -859,6 +1137,23 @@ suite "E2E: Transaction":
           for i in 0 ..< 3:
             conn.withTransaction:
               break
+
+    )
+
+  test "withTransaction allows unlabeled break inside a local block":
+    # An unlabeled `break` binds to the innermost enclosing loop or `block:`
+    # (UnnamedBreak in Nim >= 2.2), so a body-local `block:` captures it and
+    # the COMMIT still runs. Only a `break` with no body-local loop/`block`
+    # (line 884 above) can reach a caller-side breakable and is rejected.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withTransaction:
+              block:
+                if i == 2:
+                  break
 
     )
 
@@ -1119,6 +1414,75 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  test "withTransactionDeadline rolls back on body Defect":
+    # A Defect raised in the body runs ROLLBACK but surfaces as `PgError`
+    # (the Defect is the `parent`): the body runs in a separate async frame,
+    # where chronos's async macro re-raises a raw Defect eagerly and crashes
+    # the process instead of delivering it to the caller's await.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txd_defect")
+      discard await conn.exec(
+        "CREATE TABLE test_txd_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var caught: ref PgError = nil
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withTransactionDeadline(seconds(5)):
+          discard await conn.exec(
+            "INSERT INTO test_txd_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "deadline boom")
+        {.pop.}
+      except PgError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must surface as PgError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      let res = await conn.query("SELECT val FROM test_txd_defect")
+      doAssert res.rows.len == 0, "ROLLBACK must have run"
+      doAssert conn.txStatus == tsIdle
+
+      discard await conn.exec("DROP TABLE test_txd_defect")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline Defect runs the ROLLBACK cleanup exactly once":
+    # Regression: the Defect arm must not run the ROLLBACK cleanup a second
+    # time (a `csClosed` conn makes each run observable as one
+    # `csrConnInvalidated` event).
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      let (tracer, skipped) = cleanupSkippedTracer()
+      cfg.tracer = tracer
+      let conn = await connect(cfg)
+
+      var caught: ref PgError = nil
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withTransactionDeadline(seconds(5)):
+          conn.state = csClosed
+          raise newException(AssertionDefect, "txd cleanup once boom")
+        {.pop.}
+      except PgError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must surface as PgError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert skipped[].len == 1,
+        "the ROLLBACK cleanup must run exactly once, not once per frame (was " &
+          $skipped[].len & ")"
+      doAssert skipped[][0].kind == ckTxRollback
+      doAssert skipped[][0].reason == csrConnInvalidated
+
+      await conn.close()
+
+    waitFor t()
+
   test "withTransactionDeadline raises PgTimeoutError when body exceeds deadline":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -1136,6 +1500,45 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert conn.state == csClosed
 
       await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline never hands back a reusable connection in a transaction":
+    # The deadline expiring between statements leaves a clean wire, so nothing
+    # about the connection says the scope failed — but the server is still in
+    # the transaction, holding its locks. Whoever the connection is handed to
+    # next must not inherit that, so the scope either rolls back and keeps the
+    # connection (the body unwound) or retires it (the body could not be
+    # cancelled and still owns it). Retirement does not roll back: on the
+    # retiring arm the server-side transaction ends with the close below.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txd_idle")
+      discard await conn.exec("CREATE TABLE test_txd_idle (val text)")
+
+      var raised = false
+      try:
+        conn.withTransactionDeadline(milliseconds(300)):
+          discard await conn.exec(
+            "INSERT INTO test_txd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          # The deadline expires here, with the wire idle and the server
+          # transaction open.
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      doAssert conn.state == csClosed or conn.txStatus == tsIdle,
+        "a reusable connection must not carry an open transaction; state=" & $conn.state &
+          " tx=" & $conn.txStatus
+
+      await conn.close()
+      let checker = await connect(plainConfig())
+      let res = await checker.query("SELECT val FROM test_txd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await checker.exec("DROP TABLE test_txd_idle")
+      await checker.close()
 
     waitFor t()
 
@@ -1206,6 +1609,86 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  test "withSavepointDeadline rolls back on body Defect":
+    # Like the non-deadline variant, but the body runs in a separate async
+    # frame, so the Defect surfaces as `PgError` (parent = Defect) instead of
+    # crashing the process on chronos.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_spd_defect")
+      discard await conn.exec(
+        "CREATE TABLE test_spd_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var caught: ref PgError = nil
+      conn.withTransaction:
+        discard await conn.exec(
+          "INSERT INTO test_spd_defect (val) VALUES ($1)", @[toPgParam("outer")]
+        )
+        try:
+          {.push warning[UnreachableCode]: off.} # body always raises
+          conn.withSavepointDeadline("sp1", seconds(5)):
+            discard await conn.exec(
+              "INSERT INTO test_spd_defect (val) VALUES ($1)", @[toPgParam("inner")]
+            )
+            raise newException(AssertionDefect, "spd boom")
+          {.pop.}
+        except PgError as e:
+          caught = e
+
+      doAssert caught != nil, "body Defect must surface as PgError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      let res = await conn.query("SELECT val FROM test_spd_defect ORDER BY id")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getStr(0) == "outer", "savepoint work must be rolled back"
+
+      discard await conn.exec("DROP TABLE test_spd_defect")
+      await conn.close()
+
+    waitFor t()
+
+  test "withSavepointDeadline Defect runs the ROLLBACK TO SAVEPOINT cleanup exactly once":
+    # Regression: the Defect arm must not run the ROLLBACK TO SAVEPOINT
+    # cleanup a second time (a duplicate would be issued instead of skipped).
+    # Only `ckSavepointRollback` events are counted — the outer
+    # withTransaction fires its own `ckTxRollback` skip on the same
+    # `csClosed` conn.
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      let (tracer, skipped) = cleanupSkippedTracer()
+      cfg.tracer = tracer
+      let conn = await connect(cfg)
+
+      var caught: ref PgError = nil
+      try:
+        conn.withTransaction:
+          try:
+            {.push warning[UnreachableCode]: off.} # body always raises
+            conn.withSavepointDeadline("sp1", seconds(5)):
+              conn.state = csClosed
+              raise newException(AssertionDefect, "spd cleanup once boom")
+            {.pop.}
+          except PgError as e:
+            caught = e
+      except PgError:
+        discard
+
+      doAssert caught != nil, "body Defect must surface as PgError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      var spSkips = 0
+      for rec in skipped[]:
+        if rec.kind == ckSavepointRollback:
+          inc spSkips
+      doAssert spSkips == 1,
+        "the ROLLBACK TO SAVEPOINT cleanup must run exactly once, not once per " &
+          "frame (was " & $spSkips & ")"
+
+      await conn.close()
+
+    waitFor t()
+
   test "pool.withTransactionDeadline commits on success":
     proc t() {.async.} =
       let pool =
@@ -1225,6 +1708,158 @@ suite "E2E: Deadline-bounded Transaction":
 
       discard await pool.exec("DROP TABLE test_ptxd")
       await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline rolls back on body Defect":
+    # The pool variant's bodyFn is a separate async frame; the Defect must
+    # ROLLBACK, release the connection, and surface as `PgPoolError` (parent =
+    # Defect) instead of crashing the process on chronos.
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      let (tracer, rollbacks) = rollbackTracer()
+      cfg.tracer = tracer
+      let pool = await newPool(PoolConfig(connConfig: cfg, minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptxd_defect")
+      discard await pool.exec(
+        "CREATE TABLE test_ptxd_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var caught: ref PgPoolError = nil
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        pool.withTransactionDeadline(conn, seconds(5)):
+          discard await conn.exec(
+            "INSERT INTO test_ptxd_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "pool deadline boom")
+        {.pop.}
+      except PgPoolError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must surface as PgPoolError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert pool.activeCount == 0, "connection must be released"
+      # The tracer records the ROLLBACK the Defect arm's cleanup issues, so
+      # ROLLBACK execution is observed directly. `idleCount` alone would be
+      # indirect: a skipped ROLLBACK discards the conn, but the maintenance
+      # loop could replenish to minSize and fake the idle slot.
+      doAssert rollbacks[].len == 1,
+        "the ROLLBACK cleanup must have run exactly once (was " & $rollbacks[].len & ")"
+      doAssert pool.idleCount == 1, "connection must be reusable after ROLLBACK"
+      let res = await pool.query("SELECT val FROM test_ptxd_defect")
+      doAssert res.rows.len == 0, "ROLLBACK must have run"
+
+      discard await pool.exec("DROP TABLE test_ptxd_defect")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline reports timeout when deadline expires during release":
+    # Regression: the deadline must not be swallowed when it fires while
+    # `resetSessionAndRelease` is still running: the outer handler must
+    # report PgTimeoutError, not success.
+    #
+    # Deterministic construction: a fast body plus a pg_sleep(2) resetQuery
+    # puts the 1s deadline inside the release window with a ~980ms margin.
+    # `pg_sleep(2)` blocks the server for at least 2s, so the 1s deadline is
+    # guaranteed to fire while `resetSessionAndRelease` is still running —
+    # the only way this could regress to "no timeout" is the event loop
+    # itself stalling for >1s, which would break any timing-based test.
+    # The `resetStartedAt` discriminator below pins the firing point so the
+    # test cannot silently drift to the body-phase.
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      let (tracer, resetStartedAt, resetStarted) = resetStartTracer()
+      cfg.tracer = tracer
+      let pool = await newPool(
+        initPoolConfig(cfg, minSize = 1, maxSize = 3, resetQuery = "SELECT pg_sleep(2)")
+      )
+      defer:
+        await pool.close()
+
+      var raised = false
+      var deadlineFiredAt = Moment.now()
+      try:
+        pool.withTransactionDeadline(conn, seconds(1)):
+          discard await conn.query("SELECT 1")
+      except PgTimeoutError:
+        deadlineFiredAt = Moment.now()
+        raised = true
+
+      doAssert raised, "deadline during release must raise PgTimeoutError"
+      doAssert resetStarted[],
+        "the deadline must fire after the body completed and the release " &
+          "(reset) started"
+      doAssert resetStartedAt[] < deadlineFiredAt,
+        "the deadline must fire while the release (reset) is in flight"
+      when hasChronos:
+        # chronos: cancellation settles bodyFn (release included) before the
+        # timeout surfaces, so the slot is already free. asyncdispatch leaves
+        # the orphaned bodyFn running; its release completes asynchronously.
+        doAssert pool.activeCount == 0
+      else:
+        # asyncdispatch: the orphaned release takes ~2s (pg_sleep); 20s poll
+        # bound so slow CI does not flake.
+        var released = false
+        for _ in 0 ..< 2000:
+          if pool.activeCount == 0:
+            released = true
+            break
+          await sleepAsync(milliseconds(10))
+        doAssert released, "release must complete within the poll window"
+        doAssert pool.activeCount == 0
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline reports timeout when deadline expires during release":
+    # Regression: same class as the withTransactionDeadline variant above —
+    # the shared deadline must not be swallowed when it fires during release.
+    # Deterministic construction as in that test (fast body + pg_sleep(2)
+    # resetQuery, ~980ms margin); pg_sleep(2) guarantees the 1s deadline
+    # fires inside the release window (see the sibling test). The same
+    # `resetStartedAt` discriminator pins the firing point.
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      let (tracer, resetStartedAt, resetStarted) = resetStartTracer()
+      cfg.tracer = tracer
+      let pool = await newPool(
+        initPoolConfig(cfg, minSize = 1, maxSize = 3, resetQuery = "SELECT pg_sleep(2)")
+      )
+      defer:
+        await pool.close()
+
+      var raised = false
+      var deadlineFiredAt = Moment.now()
+      try:
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3), conn, seconds(1)
+        ):
+          discard await conn.query("SELECT 1")
+      except PgTimeoutError:
+        deadlineFiredAt = Moment.now()
+        raised = true
+
+      doAssert raised, "deadline during release must raise PgTimeoutError"
+      doAssert resetStarted[],
+        "the deadline must fire after the body completed and the release " &
+          "(reset) started"
+      doAssert resetStartedAt[] < deadlineFiredAt,
+        "the deadline must fire while the release (reset) is in flight"
+      when hasChronos:
+        doAssert pool.activeCount == 0
+      else:
+        # asyncdispatch: orphaned release takes ~2s; 20s poll bound (see the
+        # sibling test).
+        var released = false
+        for _ in 0 ..< 2000:
+          if pool.activeCount == 0:
+            released = true
+            break
+          await sleepAsync(milliseconds(10))
+        doAssert released, "release must complete within the poll window"
+        doAssert pool.activeCount == 0
 
     waitFor t()
 
@@ -1272,6 +1907,44 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  test "withTransactionRetryDeadline never hands back a reusable connection in a transaction":
+    # The retry macro owes the same thing the single-attempt one does: a
+    # deadline that expires between statements leaves a clean wire, and a
+    # settled wire is not a reason to hand back a connection whose server-side
+    # transaction is still open holding its locks.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_txrd_idle")
+      discard await conn.exec("CREATE TABLE test_txrd_idle (val text)")
+
+      var raised = false
+      try:
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 5), milliseconds(300)
+        ):
+          discard await conn.exec(
+            "INSERT INTO test_txrd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          # The deadline expires here, with the wire idle and the server
+          # transaction open.
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+
+      doAssert raised
+      doAssert conn.state == csClosed or conn.txStatus == tsIdle,
+        "a reusable connection must not carry an open transaction; state=" & $conn.state &
+          " tx=" & $conn.txStatus
+
+      await conn.close()
+      let checker = await connect(plainConfig())
+      let res = await checker.query("SELECT val FROM test_txrd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await checker.exec("DROP TABLE test_txrd_idle")
+      await checker.close()
+
+    waitFor t()
+
   test "withTransactionRetryDeadline exhausts retries and raises the last error":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -1294,6 +1967,83 @@ suite "E2E: Deadline-bounded Transaction":
 
       doAssert raised
       doAssert attempts == 3
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline rolls back on body Defect without retrying":
+    # The body's Defect runs ROLLBACK and surfaces as `PgError` (parent =
+    # Defect); it is never retried.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_trd_defect")
+      discard await conn.exec(
+        "CREATE TABLE test_trd_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var attempts = 0
+      var caught: ref PgError = nil
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), seconds(10)
+        ):
+          inc attempts
+          discard await conn.exec(
+            "INSERT INTO test_trd_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "trd boom")
+        {.pop.}
+      except PgError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must surface as PgError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert attempts == 1, "a Defect must not be retried"
+      let res = await conn.query("SELECT val FROM test_trd_defect")
+      doAssert res.rows.len == 0, "ROLLBACK must have run"
+      doAssert conn.txStatus == tsIdle
+
+      discard await conn.exec("DROP TABLE test_trd_defect")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline Defect runs the ROLLBACK cleanup exactly once":
+    # Regression: the Defect arm must not run the ROLLBACK cleanup a second
+    # time in the retry loop (a `csClosed` conn makes each run observable as
+    # one `csrConnInvalidated` event).
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      let (tracer, skipped) = cleanupSkippedTracer()
+      cfg.tracer = tracer
+      let conn = await connect(cfg)
+
+      var attempts = 0
+      var caught: ref PgError = nil
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), seconds(10)
+        ):
+          inc attempts
+          conn.state = csClosed
+          raise newException(AssertionDefect, "trd cleanup once boom")
+        {.pop.}
+      except PgError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must surface as PgError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert attempts == 1, "a Defect must not be retried"
+      doAssert skipped[].len == 1,
+        "the ROLLBACK cleanup must run exactly once, not once per frame (was " &
+          $skipped[].len & ")"
+      doAssert skipped[][0].kind == ckTxRollback
+      doAssert skipped[][0].reason == csrConnInvalidated
 
       await conn.close()
 
@@ -1366,6 +2116,55 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert res.rows.len == 1
       doAssert res.rows[0].getInt(0) == 1'i32
 
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline rolls back on body Defect without retrying":
+    # The pool variant's bodyFn is a separate async frame; the Defect must
+    # ROLLBACK, release, surface as `PgPoolError` (parent = Defect), and never
+    # be retried.
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      let (tracer, rollbacks) = rollbackTracer()
+      cfg.tracer = tracer
+      let pool = await newPool(PoolConfig(connConfig: cfg, minSize: 1, maxSize: 3))
+      discard await pool.exec("DROP TABLE IF EXISTS test_ptrd_defect")
+      discard await pool.exec(
+        "CREATE TABLE test_ptrd_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var attempts = 0
+      var caught: ref PgPoolError = nil
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn, seconds(10)
+        ):
+          inc attempts
+          discard await conn.exec(
+            "INSERT INTO test_ptrd_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "pool trd boom")
+        {.pop.}
+      except PgPoolError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must surface as PgPoolError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert attempts == 1, "a Defect must not be retried"
+      doAssert pool.activeCount == 0, "connection must be released"
+      # See the pool.withTransactionDeadline Defect test: the tracer observes
+      # the ROLLBACK the Defect arm's cleanup issues directly, while
+      # `idleCount` alone could be faked by a maintenance-loop replenishment.
+      doAssert rollbacks[].len == 1,
+        "the ROLLBACK cleanup must have run exactly once (was " & $rollbacks[].len & ")"
+      doAssert pool.idleCount == 1, "connection must be reusable after ROLLBACK"
+      let res = await pool.query("SELECT val FROM test_ptrd_defect")
+      doAssert res.rows.len == 0, "ROLLBACK must have run"
+
+      discard await pool.exec("DROP TABLE test_ptrd_defect")
       await pool.close()
 
     waitFor t()
@@ -1469,6 +2268,73 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert res.rows[0].getInt(0) == 1'i32
 
       await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline never hands on a connection in a transaction":
+    # The pool counterpart of the conn invariant: a deadline that expires
+    # between statements leaves a clean wire and an open server-side
+    # transaction. `maxSize = 1` forces the next borrower onto whatever the
+    # scope left behind, so an inherited transaction shows up as the orphaned
+    # row being visible to it.
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+      defer:
+        await pool.close()
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_txd_idle")
+      discard await pool.exec("CREATE TABLE test_pool_txd_idle (val text)")
+
+      var raised = false
+      try:
+        pool.withTransactionDeadline(conn, milliseconds(300)):
+          discard await conn.exec(
+            "INSERT INTO test_pool_txd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+      doAssert raised
+
+      let next = await pool.acquire()
+      doAssert next.txStatus == tsIdle,
+        "the next borrower must not inherit an open transaction; tx=" & $next.txStatus
+      let res = await next.query("SELECT val FROM test_pool_txd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await next.exec("DROP TABLE test_pool_txd_idle")
+      next.release()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline never hands on a connection in a transaction":
+    proc t() {.async.} =
+      let pool =
+        await newPool(PoolConfig(connConfig: plainConfig(), minSize: 1, maxSize: 1))
+      defer:
+        await pool.close()
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_txrd_idle")
+      discard await pool.exec("CREATE TABLE test_pool_txrd_idle (val text)")
+
+      var raised = false
+      try:
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 5), conn, milliseconds(300)
+        ):
+          discard await conn.exec(
+            "INSERT INTO test_pool_txrd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
+          )
+          await sleepAsync(seconds(3))
+      except PgTimeoutError:
+        raised = true
+      doAssert raised
+
+      let next = await pool.acquire()
+      doAssert next.txStatus == tsIdle,
+        "the next borrower must not inherit an open transaction; tx=" & $next.txStatus
+      let res = await next.query("SELECT val FROM test_pool_txrd_idle")
+      doAssert res.rows.len == 0, "the timed-out transaction must not have committed"
+      discard await next.exec("DROP TABLE test_pool_txrd_idle")
+      next.release()
 
     waitFor t()
 
@@ -2244,6 +3110,75 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert conn.pendingStmtCloses.len >= 1
 
       discard await conn.query("DROP TABLE IF EXISTS t_iso_share_evict")
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: failing scsMiss op queues Close so no server statement leaks":
+    # A cache-miss op that fails at Execute time (Parse succeeded) leaves its
+    # freshly Parsed statement on the server. The cache-add happens only on
+    # success, so nothing reuses it — without a queued Close every repeat of
+    # the failing SQL would pile up a new server statement (each run is a fresh
+    # miss with a fresh name).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let failingSql = "SELECT $1::int / 0"
+
+      proc countLeaked(): Future[int] {.async.} =
+        (
+          await conn.simpleQuery(
+            "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
+              failingSql & "'"
+          )
+        )[0].rows[0].getInt(0)
+
+      doAssert (await countLeaked()) == 0
+
+      for i in 0 ..< 3:
+        let p = newPipeline(conn)
+        p.addQuery(failingSql, @[toPgParam(0)])
+        var raised = false
+        try:
+          discard await p.execute()
+        except PgQueryError:
+          raised = true
+        doAssert raised
+        # The queued Close rides along with the next extended-query op.
+        discard await conn.query("SELECT 1")
+        doAssert (await countLeaked()) == 0,
+          "failing scsMiss op leaked a server statement"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: executeIsolated failing scsMiss op queues Close so no leak":
+    # executeIsolated counterpart: per-op SYNC still leaves the failed op's
+    # freshly Parsed statement on the server, and the cache-add happens only
+    # on success.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let failingSql = "SELECT 1 / $1::int"
+
+      proc countLeaked(): Future[int] {.async.} =
+        (
+          await conn.simpleQuery(
+            "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
+              failingSql & "'"
+          )
+        )[0].rows[0].getInt(0)
+
+      doAssert (await countLeaked()) == 0
+
+      for i in 0 ..< 3:
+        let p = newPipeline(conn)
+        p.addQuery(failingSql, @[toPgParam(0)])
+        let ir = await p.executeIsolated()
+        doAssert ir.errors[0] != nil
+        # The queued Close rides along with the next extended-query op.
+        discard await conn.query("SELECT 1")
+        doAssert (await countLeaked()) == 0, "executeIsolated leaked a server statement"
+
       await conn.close()
 
     waitFor t()
@@ -3504,3 +4439,16 @@ suite "E2E: Nested BEGIN rejection":
       await conn.close()
 
     waitFor t()
+
+static:
+  # An unlabeled `break` binds to the innermost enclosing loop or `block:`
+  # (UnnamedBreak in Nim >= 2.2), so a body-local `block:` captures it and
+  # the COMMIT/RELEASE still runs. Only a `break` with no loop/`block` in
+  # scope inside the body can skip the COMMIT/RELEASE.
+  doAssert(not hasLoopEscapeStmt(parseStmt("block:\n  break")))
+  doAssert(not hasLoopEscapeStmt(parseStmt("block:\n  if x:\n    break")))
+  doAssert hasLoopEscapeStmt(parseStmt("break"))
+  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  block:\n    break")))
+  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  break")))
+  doAssert(not hasLoopEscapeStmt(parseStmt("block lbl:\n  break lbl")))
+  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  continue")))

@@ -8,8 +8,12 @@
 ## ``toPgBinaryParam(v: PgHstore, oid: int32)``.
 ##
 ## Re-exported through ``pg_connection.nim``.
+##
+## Internal module: not part of the public API. Import the `pg_connection` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
-import std/[options, strutils, tables]
+import std/[options, tables]
 
 import ../[async_backend, pg_errors, pg_types]
 import types, simple_query
@@ -32,12 +36,13 @@ proc isSafeTypeName(name: string): bool =
   true
 
 proc parseOidText(s: string): int32 =
-  ## Parse the text form of a ``::int4``-cast OID column. The query casts
-  ## ``t.oid``/``t.typarray`` to ``int4``, so the value is always within
-  ## ``int32`` range (large OIDs come back as negative ``int4``). Callers wrap
-  ## this in ``except ValueError`` to skip malformed catalog rows, so this keeps
-  ## the standard ``ValueError`` contract rather than raising ``PgTypeError``.
-  int32(parseInt(s))
+  ## Parse the text form of a ``::int4``-cast OID column. A well-behaved server
+  ## returns a value within ``int32`` range (large OIDs come back as negative
+  ## ``int4``), but the response is untrusted input: ``int32(parseInt(s))``
+  ## would raise an uncatchable ``RangeDefect`` on an out-of-range value. Route
+  ## through the range-checked parser and let callers skip malformed rows with
+  ## ``except PgTypeError``.
+  pgParseInt32(s)
 
 proc lookupTypeOids*(
     conn: PgConnection, names: seq[string]
@@ -95,13 +100,13 @@ proc lookupTypeOids*(
     var oid: int32
     try:
       oid = parseOidText(bytesToString(oidOpt.get))
-    except ValueError:
+    except PgTypeError:
       continue
     var arrOid: int32 = 0
     let arrOpt = row[2]
     if arrOpt.isSome:
       try:
         arrOid = parseOidText(bytesToString(arrOpt.get))
-      except ValueError:
+      except PgTypeError:
         arrOid = 0
     result[name] = (oid: oid, arrayOid: arrOid)

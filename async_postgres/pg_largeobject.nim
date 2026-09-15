@@ -21,6 +21,7 @@
 import std/[strutils, options]
 
 import async_backend, pg_types, pg_protocol, pg_connection, pg_client
+import pg_connection/types
 
 const
   INV_READ* = 0x00040000'i32
@@ -35,9 +36,23 @@ type
   Oid* = uint32
 
   LargeObject* = object
-    conn*: PgConnection
-    fd*: int32
-    oid*: Oid
+    ## A handle to an open server-side Large Object. Fields are private;
+    ## use the `conn` / `fd` / `oid` accessors for read-only access.
+    conn: PgConnection
+    fd: int32
+    oid: Oid
+
+func conn*(lo: LargeObject): PgConnection {.inline.} =
+  ## The connection this handle was opened on.
+  lo.conn
+
+func fd*(lo: LargeObject): int32 {.inline.} =
+  ## The server-side file descriptor returned by `lo_open`.
+  lo.fd
+
+func oid*(lo: LargeObject): Oid {.inline.} =
+  ## The OID of the underlying Large Object.
+  lo.oid
 
 # Streaming callback types (share the CopyOut/CopyIn shape).
 declareAsyncCallback(LoReadCallback, proc(data: seq[byte]): Future[void])
@@ -87,14 +102,35 @@ proc parseLoInt(s, fn: string): BiggestInt =
   ## Convert a numeric scalar returned by a Large Object server function to an
   ## integer, surfacing a malformed response as `PgTypeError` (keeps the
   ## ``except PgError`` contract) instead of leaking a raw `ValueError`.
-  pgTypeErrorOnValueError(fn & " returned a non-numeric result: " & s):
+  pgTypeErrorOnValueError(fn & " returned a non-numeric result (len=" & $s.len & ")"):
     parseBiggestInt(s)
+
+proc parseLoInt32(s, fn: string): int32 =
+  ## Convert a numeric scalar returned by a Large Object server function to
+  ## int32, surfacing an out-of-range value as `PgTypeError`. A raw
+  ## ``int32(parseLoInt(...))`` would raise an uncatchable ``RangeDefect``.
+  let v = parseLoInt(s, fn)
+  if v < BiggestInt(int32.low) or v > BiggestInt(int32.high):
+    raise newException(
+      PgTypeError, fn & " returned a value outside int32 range (len=" & $s.len & ")"
+    )
+  int32(v)
 
 proc parseLoOid(s, fn: string): Oid =
   ## Convert an OID returned by a Large Object server function, surfacing a
-  ## malformed response as `PgTypeError` instead of a raw `ValueError`.
-  pgTypeErrorOnValueError(fn & " returned a non-numeric OID: " & s):
-    Oid(parseUInt(s))
+  ## malformed or out-of-range response as `PgTypeError` instead of a raw
+  ## `ValueError` or an uncatchable ``RangeDefect``.
+  var v: uint64
+  try:
+    v = parseUInt(s)
+  except ValueError:
+    raise
+      newException(PgTypeError, fn & " returned a non-numeric OID (len=" & $s.len & ")")
+  if v > uint64(high(Oid)):
+    raise newException(
+      PgTypeError, fn & " returned an OID outside uint32 range (len=" & $s.len & ")"
+    )
+  Oid(v)
 
 proc oidToInt32(oid: Oid): int32 =
   ## Cast a uint32 OID to int32 preserving the bit pattern.
@@ -134,7 +170,7 @@ proc loOpen*(
     @[toPgParam(oidToInt32(oid)), toPgParam(mode)],
     timeout = timeout,
   )
-  return LargeObject(conn: conn, fd: int32(parseLoInt(s, "lo_open")), oid: oid)
+  return LargeObject(conn: conn, fd: parseLoInt32(s, "lo_open"), oid: oid)
 
 proc loClose*(
     lo: LargeObject, timeout: Duration = ZeroDuration
@@ -171,7 +207,7 @@ proc loWrite*(
     @[toPgParam(lo.fd), PgParam(oid: OidBytea, format: 1, value: some(data))],
     timeout = timeout,
   )
-  return int32(parseLoInt(s, "lowrite"))
+  return parseLoInt32(s, "lowrite")
 
 proc loSeek*(
     lo: LargeObject,
@@ -315,6 +351,14 @@ template withLargeObject*(
     except CatchableError:
       discard
     raise loBodyErr
+  except Defect as loBodyDefect:
+    # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
+    # it raw so the handle is not leaked.
+    try:
+      await lo.loClose()
+    except CatchableError:
+      discard
+    raise loBodyDefect
   # Surface a genuine close failure to the caller.
   await lo.loClose()
 

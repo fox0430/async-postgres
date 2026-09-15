@@ -3,16 +3,21 @@ import std/[options, json, macros, parseutils, strutils, tables, times, net]
 import ../pg_protocol
 import core, decoding, encoding
 
-proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+proc cellInfo(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  ## Raw cell offset/len; private (wholesale export would leak it).
+  # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
+  # `except PgError` would miss an out-of-range col and crash the process
+  # (UB in -d:release). Same family as the other accessor errors here so
+  # callers only need one `except PgTypeError` clause.
   if col < 0 or col >= int(row.data.numCols):
     raise newException(
-      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
     )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   result.off = int(row.data.cellIndex[idx])
   result.len = int(row.data.cellIndex[idx + 1])
 
-template bufView*(row: Row, off, clen: int): openArray[char] =
+template bufView(row: Row, off, clen: int): openArray[char] =
   ## Zero-copy char view into row.data.buf for parseutils.
   ## clen <= 0 skips `addr buf[off]`: a trailing empty cell has off == buf.len,
   ## which would otherwise raise an uncatchable IndexDefect.
@@ -53,7 +58,7 @@ converter toRow*(cells: seq[Option[seq[byte]]]): Row =
       rd.buf.add(data)
   initRow(rd, 0)
 
-proc parseAffectedRowsRaw*(tag: openArray[char]): int64 =
+proc parseAffectedRowsRaw(tag: openArray[char]): int64 =
   ## Extract row count from the raw bytes of a command tag (e.g.
   ## "UPDATE 3" -> 3, "INSERT 0 1" -> 1). Unlike `parseAffectedRows(string)`
   ## this performs zero heap allocation — useful for pipelines that process
@@ -79,7 +84,7 @@ proc parseAffectedRowsRaw*(tag: openArray[char]): int64 =
     return 0
   parsed
 
-proc parseAffectedRows*(tag: string): int64 =
+proc parseAffectedRows(tag: string): int64 =
   ## Extract row count from command tag (e.g. "UPDATE 3" -> 3, "INSERT 0 1" -> 1).
   parseAffectedRowsRaw(tag.toOpenArray(0, tag.high))
 
@@ -101,24 +106,52 @@ proc contains*(cr: CommandResult, s: string): bool {.inline.} =
   s in cr.commandTag
 
 proc isNull*(row: Row, col: int): bool =
-  ## Check if the column value is NULL.
+  ## Check if the column value is NULL. Raises `PgTypeError` on out-of-range
+  ## column index (see cellInfo for why not IndexDefect).
   if col < 0 or col >= int(row.data.numCols):
     raise newException(
-      IndexDefect, "column index " & $col & " out of range 0..<" & $row.data.numCols
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
     )
   let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
   row.data.cellIndex[idx + 1] == -1'i32
 
 proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
   ## Check if column was received in binary format.
-  row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
+  # `col >= 0` first: many accessors call this before their `cellInfo`/`isNull`
+  # bounds check, so a negative col would reach `colFormats[col]` here.
+  col >= 0 and row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
 
-proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
+proc colTypeOid(row: Row, col: int): int32 {.inline.} =
   ## Get the type OID for a column, or 0 if not available.
-  if row.data.colTypeOids.len > col:
+  if col >= 0 and row.data.colTypeOids.len > col:
     row.data.colTypeOids[col]
   else:
     0'i32
+
+proc checkScalarColOid(
+    accessor: string, row: Row, col: int, expected: openArray[int32]
+) =
+  ## Reject a binary column whose RowDescription OID is not decoded by this
+  ## accessor. Mirrors ``checkArrayElemOid`` for scalar columns: without it a
+  ## same-length type (int4/float4, int8/float8/timestamp, uuid/point, line/circle,
+  ## lseg/box) decodes silently to a wrong value.
+  ## Unknown OID 0 (manual Row without metadata) skips the check.
+  let actual = row.colTypeOid(col)
+  if actual == 0'i32:
+    return
+  for e in expected:
+    if actual == e:
+      return
+  var want = ""
+  for i, oid in expected:
+    if i > 0:
+      want.add(" or ")
+    want.add($oid)
+  raise newException(
+    PgTypeError,
+    accessor & ": wire colOid=" & $actual & " expected " & want &
+      " (binary column type mismatch; use the matching accessor or resultFormat = rfText)",
+  )
 
 const NumericBinaryHeaderLen = 8
   ## Minimum byte length of a binary numeric value (4 x int16: ndigits, weight, sign, dscale).
@@ -132,7 +165,9 @@ template raiseIfBadNumericBinary(col, clen: int) =
 
 proc getStr*(row: Row, col: int): string =
   ## Get a column value as a string. Handles binary-to-text conversion for
-  ## common types (bool, int2/4/8, float4/8). Raises `PgTypeError` on NULL.
+  ## common types (bool, int2/4/8, float4/8, numeric). Raises `PgTypeError` on
+  ## NULL, or on a binary-safe OID this proc cannot stringify — use a typed
+  ## accessor or `resultFormat = rfText` in that case.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -185,16 +220,28 @@ proc getStr*(row: Row, col: int): string =
     of OidNumeric:
       raiseIfBadNumericBinary(col, clen)
       return $decodeNumericBinary(b.toOpenArray(off, off + clen - 1))
+    of 17, 25, 1043:
+      discard # bytea/text/varchar: binary payload is already raw bytes
     else:
-      discard # text, varchar, bytea: fall through to raw copy
+      # Skip user-defined OIDs (enums, custom types): no binary form, payload
+      # is raw text — raw-copy is correct.
+      if isBinarySafeOid(oid):
+        raise newException(
+          PgTypeError,
+          "Column " & $col & ": cannot render binary OID " & $oid &
+            " as string; use a typed accessor or resultFormat = rfText",
+        )
   result = readString(row.data.buf, off, clen)
 
 proc getInt*(row: Row, col: int): int32 =
   ## Get a column value as int32. Handles binary int2/int4 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be int2 or int4; other same-length
+  ## types (e.g. float4, date) raise `PgTypeError` instead of decoding silently.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getInt", row, col, [OidInt4, OidInt2])
     if clen == 4:
       return fromBE32(row.data.buf, off)
     elif clen == 2:
@@ -207,25 +254,29 @@ proc getInt*(row: Row, col: int): int32 =
   var v: int
   var n: int
   # ``parseInt(s, v)`` returns 0 for "no digits" but raises a raw ``ValueError``
-  # when the value overflows ``int``; route that through ``pgTypeErrorOnValueError``
-  # so an oversized text value surfaces as a catchable ``PgTypeError`` instead of
-  # escaping the ``except PgError`` contract.
-  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+  # when the value overflows ``int``; route it through ``pgTypeErrorOnValueError``
+  # so it surfaces as a catchable ``PgTypeError``.
+  pgTypeErrorOnValueError(
+    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
+  ):
     n = parseInt(row.bufView(off, clen), v)
-  if n == 0:
+  if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
   if v < int(int32.low) or v > int(int32.high):
     raise newException(
-      PgTypeError, "Column " & $col & ": integer value out of int32 range: " & $v
+      PgTypeError,
+      "Column " & $col & ": integer value out of int32 range (len=" & $clen & ")",
     )
   result = int32(v)
 
 proc getInt16*(row: Row, col: int): int16 =
   ## Get a column value as int16. Handles binary int2 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be int2.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getInt16", row, col, [OidInt2])
     if clen == 2:
       return fromBE16(row.data.buf, off)
     else:
@@ -236,22 +287,27 @@ proc getInt16*(row: Row, col: int): int16 =
   var v: int
   var n: int
   # Convert ``parseInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
-  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+  pgTypeErrorOnValueError(
+    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
+  ):
     n = parseInt(row.bufView(off, clen), v)
-  if n == 0:
+  if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
   if v < int(int16.low) or v > int(int16.high):
     raise newException(
-      PgTypeError, "Column " & $col & ": integer value out of int16 range: " & $v
+      PgTypeError,
+      "Column " & $col & ": integer value out of int16 range (len=" & $clen & ")",
     )
   result = int16(v)
 
 proc getInt64*(row: Row, col: int): int64 =
   ## Get a column value as int64. Handles binary int2/4/8 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be int8, int4, or int2.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getInt64", row, col, [OidInt8, OidInt4, OidInt2])
     if clen == 8:
       return fromBE64(row.data.buf, off)
     elif clen == 4:
@@ -265,19 +321,24 @@ proc getInt64*(row: Row, col: int): int64 =
       )
   var v: BiggestInt
   var n: int
-  # Convert ``parseBiggestInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
-  pgTypeErrorOnValueError("Column " & $col & ": integer value out of range"):
+  # Convert ``parseBiggestInt``'s overflow ``ValueError`` to ``PgTypeError``
+  # (see getInt).
+  pgTypeErrorOnValueError(
+    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
+  ):
     n = parseBiggestInt(row.bufView(off, clen), v)
-  if n == 0:
+  if n == 0 or n != clen:
     raise newException(PgTypeError, "Column " & $col & ": invalid int64 value")
   result = v
 
 proc getFloat*(row: Row, col: int): float64 =
   ## Get a column value as float64. Handles binary float4/8 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be float8 or float4.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getFloat", row, col, [OidFloat8, OidFloat4])
     if clen == 8:
       return decodeFloat64BE(row.data.buf, off)
     elif clen == 4:
@@ -296,10 +357,12 @@ proc getFloat*(row: Row, col: int): float64 =
 
 proc getFloat32*(row: Row, col: int): float32 =
   ## Get a column value as float32. Handles binary float4 directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be float4.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getFloat32", row, col, [OidFloat4])
     if clen == 4:
       return decodeFloat32BE(row.data.buf, off)
     else:
@@ -316,13 +379,25 @@ proc getFloat32*(row: Row, col: int): float32 =
 
 proc getNumeric*(row: Row, col: int): PgNumeric =
   ## Get a column value as PgNumeric. Handles binary numeric format.
+  ## In binary format the column OID must be numeric.
   if row.isBinaryCol(col):
+    checkScalarColOid("getNumeric", row, col, [OidNumeric])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     raiseIfBadNumericBinary(col, clen)
     return decodeNumericBinary(row.data.buf.toOpenArray(off, off + clen - 1))
   parsePgNumeric(row.getStr(col))
+
+proc moneyFromBinaryCell(row: Row, col, off, clen, scale: int): PgMoney =
+  ## Shared binary-money cell decode for both `getMoney` overloads.
+  checkScalarColOid("getMoney", row, col, [OidMoney])
+  if clen != 8:
+    raise newException(
+      PgTypeError,
+      "Column " & $col & ": unexpected binary length " & $clen & " for money",
+    )
+  initPgMoney(fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale)
 
 proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
   ## Get a column value as PgMoney. Handles binary money (8-byte int64) and
@@ -331,29 +406,37 @@ proc getMoney*(row: Row, col: int, scale: int = 2): PgMoney =
   ## ``en_US``; pass 0 for ``ja_JP`` etc.). The wire protocol does not expose
   ## this, so callers must specify it when it differs from the default.
   ## Raises ``PgTypeError`` on NULL or when ``scale`` is outside ``0..18``.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  ## In binary format the column OID must be money. The text path infers the
+  ## locale conventions; prefer the `PgMoneyConventions` overload when they
+  ## are known.
+  checkMoneyScale(scale)
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
-    if clen == 8:
-      return PgMoney(
-        amount: fromBE64(row.data.buf.toOpenArray(off, off + 7)), scale: int8(scale)
-      )
-    raise newException(
-      PgTypeError,
-      "Column " & $col & ": unexpected binary length " & $clen & " for money",
-    )
+    return moneyFromBinaryCell(row, col, off, clen, scale)
   parsePgMoney(row.getStr(col), scale)
+
+proc getMoney*(row: Row, col: int, conv: PgMoneyConventions): PgMoney =
+  ## Get a column value as PgMoney under known ``lc_monetary`` conventions.
+  ## ``conv.fracDigits`` is the scale the wire format does not carry, and a
+  ## text cell is parsed strictly against ``conv`` instead of inferring a
+  ## locale, so a malformed string is rejected.
+  checkPgMoneyConventions(conv)
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  if row.isBinaryCol(col):
+    return moneyFromBinaryCell(row, col, off, clen, conv.fracDigits)
+  parsePgMoney(row.getStr(col), conv)
 
 # Binary decoders for types whose scalar accessors reuse the same body as the
 # array-element decoders below. Defined here (above the scalars) so both call
 # sites route through a single implementation. The rest of the
-# `decodePgArrayElement*` overload set — plus text-only helpers — lives in the
+# `decodePgArrayElement` overload set — plus text-only helpers — lives in the
 # registry section further down.
 
-proc decodePgArrayElement*(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
+proc decodePgArrayElement(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
   if buf.len != 16:
     raise newException(PgTypeError, "uuid: bad length " & $buf.len)
   const hexChars = "0123456789abcdef"
@@ -369,14 +452,14 @@ proc decodePgArrayElement*(_: typedesc[PgUuid], buf: openArray[byte]): PgUuid =
     pos += 2
   PgUuid(s)
 
-proc decodePgArrayElement*(_: typedesc[PgInterval], buf: openArray[byte]): PgInterval =
+proc decodePgArrayElement(_: typedesc[PgInterval], buf: openArray[byte]): PgInterval =
   if buf.len != 16:
     raise newException(PgTypeError, "interval: bad length " & $buf.len)
   result.microseconds = fromBE64(buf.toOpenArray(0, 7))
   result.days = fromBE32(buf.toOpenArray(8, 11))
   result.months = fromBE32(buf.toOpenArray(12, 15))
 
-proc decodePgArrayElement*(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacAddr =
+proc decodePgArrayElement(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacAddr =
   if buf.len != 6:
     raise newException(PgTypeError, "macaddr: bad length " & $buf.len)
   var parts = newSeq[string](6)
@@ -384,7 +467,7 @@ proc decodePgArrayElement*(_: typedesc[PgMacAddr], buf: openArray[byte]): PgMacA
     parts[j] = toHex(buf[j], 2).toLowerAscii()
   PgMacAddr(parts.join(":"))
 
-proc decodePgArrayElement*(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacAddr8 =
+proc decodePgArrayElement(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacAddr8 =
   if buf.len != 8:
     raise newException(PgTypeError, "macaddr8: bad length " & $buf.len)
   var parts = newSeq[string](8)
@@ -392,7 +475,7 @@ proc decodePgArrayElement*(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMac
     parts[j] = toHex(buf[j], 2).toLowerAscii()
   PgMacAddr8(parts.join(":"))
 
-proc decodeJsonArrayElem*(buf: openArray[byte], elemOid: int32): JsonNode =
+proc decodeJsonArrayElem(buf: openArray[byte], elemOid: int32): JsonNode =
   # Strip the leading jsonb version byte only when elemOid says jsonb.
   let jsonStr =
     if elemOid == OidJsonb and buf.len > 0 and buf[0] == 1:
@@ -402,11 +485,13 @@ proc decodeJsonArrayElem*(buf: openArray[byte], elemOid: int32): JsonNode =
   try:
     parseJson(jsonStr)
   except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON: " & jsonStr)
+    raise newException(PgTypeError, "Invalid JSON (len=" & $jsonStr.len & ")")
 
 proc getUuid*(row: Row, col: int): PgUuid =
   ## Get a column value as PgUuid. Handles binary format (16 bytes).
+  ## In binary format the column OID must be uuid.
   if row.isBinaryCol(col):
+    checkScalarColOid("getUuid", row, col, [OidUuid])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -415,10 +500,12 @@ proc getUuid*(row: Row, col: int): PgUuid =
 
 proc getBool*(row: Row, col: int): bool =
   ## Get a column value as bool. Handles binary format directly. Raises `PgTypeError` on NULL.
+  ## In binary format the column OID must be bool.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getBool", row, col, [OidBool])
     if clen != 1:
       raise newException(
         PgTypeError,
@@ -433,11 +520,12 @@ proc getBool*(row: Row, col: int): bool =
 proc getBytes*(row: Row, col: int): seq[byte] =
   ## Get a column value as raw bytes. Decodes bytea text output in both
   ## hex (`\xDEADBEEF`) and legacy escape formats. Raises `PgTypeError`
-  ## on NULL.
+  ## on NULL. In binary format the column OID must be bytea.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
+    checkScalarColOid("getBytes", row, col, [OidBytea])
     result = readBytes(row.data.buf, off, clen)
     return
   let errCtx = "Column " & $col
@@ -456,7 +544,9 @@ proc getBytes*(row: Row, col: int): seq[byte] =
 
 proc getTimestamp*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime. Handles binary timestamp format.
+  ## In binary format the column OID must be timestamp.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTimestamp", row, col, [OidTimestamp])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -467,11 +557,16 @@ proc getTimestamp*(row: Row, col: int): DateTime =
       )
     return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
-  return parseTimestampText(s)
+  try:
+    parseTimestampText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getDate*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime. Handles binary date format.
+  ## In binary format the column OID must be date.
   if row.isBinaryCol(col):
+    checkScalarColOid("getDate", row, col, [OidDate])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -481,11 +576,17 @@ proc getDate*(row: Row, col: int): DateTime =
         "Column " & $col & ": unexpected binary length " & $clen & " for date",
       )
     return decodeBinaryDate(row.data.buf.toOpenArray(off, off + 3))
-  parseDateText(row.getStr(col))
+  let s = row.getStr(col)
+  try:
+    parseDateText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getTimestampTz*(row: Row, col: int): DateTime =
   ## Get a column value as DateTime from a timestamptz column.
+  ## In binary format the column OID must be timestamptz.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTimestampTz", row, col, [OidTimestampTz])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -496,11 +597,16 @@ proc getTimestampTz*(row: Row, col: int): DateTime =
       )
     return decodeBinaryTimestamp(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
-  return parseTimestampText(s)
+  try:
+    parseTimestampText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getTime*(row: Row, col: int): PgTime =
   ## Get a column value as PgTime. Handles binary time format.
+  ## In binary format the column OID must be time.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTime", row, col, [OidTime])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -511,11 +617,16 @@ proc getTime*(row: Row, col: int): PgTime =
       )
     return decodeBinaryTime(row.data.buf.toOpenArray(off, off + 7))
   let s = row.getStr(col)
-  return parseTimeText(s)
+  try:
+    parseTimeText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getTimeTz*(row: Row, col: int): PgTimeTz =
   ## Get a column value as PgTimeTz. Handles binary timetz format.
+  ## In binary format the column OID must be timetz.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTimeTz", row, col, [OidTimeTz])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -526,11 +637,16 @@ proc getTimeTz*(row: Row, col: int): PgTimeTz =
       )
     return decodeBinaryTimeTz(row.data.buf.toOpenArray(off, off + 11))
   let s = row.getStr(col)
-  return parseTimeTzText(s)
+  try:
+    parseTimeTzText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getJson*(row: Row, col: int): JsonNode =
   ## Get a column value as a parsed JsonNode. Handles binary json/jsonb format.
+  ## In binary format the column OID must be json or jsonb.
   if row.isBinaryCol(col):
+    checkScalarColOid("getJson", row, col, [OidJson, OidJsonb])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -541,46 +657,65 @@ proc getJson*(row: Row, col: int): JsonNode =
   try:
     return parseJson(s)
   except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid JSON (len=" & $s.len & ")"
+    )
 
 proc getInterval*(row: Row, col: int): PgInterval =
   ## Get a column value as PgInterval. Handles binary interval format.
+  ## In binary format the column OID must be interval.
   if row.isBinaryCol(col):
+    checkScalarColOid("getInterval", row, col, [OidInterval])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     return
       decodePgArrayElement(PgInterval, row.data.buf.toOpenArray(off, off + clen - 1))
   let s = row.getStr(col)
-  parseIntervalText(s)
+  try:
+    parseIntervalText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getInet*(row: Row, col: int): PgInet =
   ## Get a column value as PgInet (IP address with mask). Handles binary format.
+  ## In binary format the column OID must be inet.
   if row.isBinaryCol(col):
+    checkScalarColOid("getInet", row, col, [OidInet])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
     return PgInet(address: ip, mask: mask)
   let s = row.getStr(col)
-  let (ip, mask) = parseInetText(s)
-  PgInet(address: ip, mask: mask)
+  try:
+    let (ip, mask) = parseInetText(s)
+    PgInet(address: ip, mask: mask)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getCidr*(row: Row, col: int): PgCidr =
   ## Get a column value as PgCidr (CIDR network address). Handles binary format.
+  ## In binary format the column OID must be cidr.
   if row.isBinaryCol(col):
+    checkScalarColOid("getCidr", row, col, [OidCidr])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let (ip, mask) = decodeInetBinary(row.data.buf.toOpenArray(off, off + clen - 1))
     return PgCidr(address: ip, mask: mask)
   let s = row.getStr(col)
-  let (ip, mask) = parseInetText(s)
-  PgCidr(address: ip, mask: mask)
+  try:
+    let (ip, mask) = parseInetText(s)
+    PgCidr(address: ip, mask: mask)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getMacAddr*(row: Row, col: int): PgMacAddr =
   ## Get a column value as PgMacAddr. Handles binary format.
+  ## In binary format the column OID must be macaddr.
   if row.isBinaryCol(col):
+    checkScalarColOid("getMacAddr", row, col, [OidMacAddr])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -590,7 +725,9 @@ proc getMacAddr*(row: Row, col: int): PgMacAddr =
 
 proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
   ## Get a column value as PgMacAddr8 (EUI-64). Handles binary format.
+  ## In binary format the column OID must be macaddr8.
   if row.isBinaryCol(col):
+    checkScalarColOid("getMacAddr8", row, col, [OidMacAddr8])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -600,38 +737,28 @@ proc getMacAddr8*(row: Row, col: int): PgMacAddr8 =
 
 proc getBit*(row: Row, col: int): PgBit =
   ## Get a column value as PgBit. Handles both text and binary format.
+  ## In binary format the column OID must be bit or varbit.
   if row.isBinaryCol(col):
+    checkScalarColOid("getBit", row, col, [OidBit, OidVarbit])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     if clen < 4:
       raise newException(PgTypeError, "Invalid binary bit data: too short")
+    # `initPgBit` validates nbits.
     let nbits = fromBE32(row.data.buf.toOpenArray(off, off + 3))
-    if nbits < 0:
-      raise
-        newException(PgTypeError, "Invalid binary bit data: negative nbits " & $nbits)
-    if nbits > PgBitMaxBits:
-      raise newException(
-        PgTypeError,
-        "Invalid binary bit data: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits &
-          ")",
-      )
     let dataLen = clen - 4
-    if (int64(nbits) + 7) div 8 != int64(dataLen):
-      raise newException(
-        PgTypeError,
-        "Invalid binary bit data: nbits=" & $nbits & " inconsistent with dataLen=" &
-          $dataLen,
-      )
     var data = newSeq[byte](dataLen)
     for i in 0 ..< dataLen:
       data[i] = row.data.buf[off + 4 + i]
-    return PgBit(nbits: nbits, data: data)
+    return initPgBit(nbits, data)
   parseBitString(row.getStr(col))
 
 proc getTsVector*(row: Row, col: int): PgTsVector =
   ## Get a column value as PgTsVector. Handles both text and binary format.
+  ## In binary format the column OID must be tsvector.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTsVector", row, col, [OidTsVector])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -641,7 +768,9 @@ proc getTsVector*(row: Row, col: int): PgTsVector =
 
 proc getTsQuery*(row: Row, col: int): PgTsQuery =
   ## Get a column value as PgTsQuery. Handles both text and binary format.
+  ## In binary format the column OID must be tsquery.
   if row.isBinaryCol(col):
+    checkScalarColOid("getTsQuery", row, col, [OidTsQuery])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -650,7 +779,9 @@ proc getTsQuery*(row: Row, col: int): PgTsQuery =
 
 proc getXml*(row: Row, col: int): PgXml =
   ## Get a column value as PgXml. Handles both text and binary format.
+  ## In binary format the column OID must be xml.
   if row.isBinaryCol(col):
+    checkScalarColOid("getXml", row, col, [OidXml])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -660,6 +791,8 @@ proc getXml*(row: Row, col: int): PgXml =
 
 proc getHstore*(row: Row, col: int): PgHstore =
   ## Get a column value as PgHstore. Handles both text and binary format.
+  ## hstore uses a dynamic OID assigned at CREATE EXTENSION time, so no
+  ## column OID check applies here (mirrors anyArrayElemOid on the array path).
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
@@ -669,18 +802,26 @@ proc getHstore*(row: Row, col: int): PgHstore =
 
 proc getPoint*(row: Row, col: int): PgPoint =
   ## Get a column value as PgPoint. Handles binary format.
+  ## In binary format the column OID must be point.
   if row.isBinaryCol(col):
+    checkScalarColOid("getPoint", row, col, [OidPoint])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     if clen != 16:
       raise newException(PgTypeError, "Invalid binary point length: " & $clen)
     return decodePointBinary(row.data.buf, off)
-  parsePointText(row.getStr(col))
+  let s = row.getStr(col)
+  try:
+    parsePointText(s)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getLine*(row: Row, col: int): PgLine =
   ## Get a column value as PgLine. Handles binary format.
+  ## In binary format the column OID must be line.
   if row.isBinaryCol(col):
+    checkScalarColOid("getLine", row, col, [OidLine])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -695,17 +836,23 @@ proc getLine*(row: Row, col: int): PgLine =
   if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
     inner = inner[1 ..^ 2]
   else:
-    raise newException(PgTypeError, "Invalid line: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid line (len=" & $s.len & ")"
+    )
   let parts = inner.split(',')
   if parts.len != 3:
-    raise newException(PgTypeError, "Invalid line: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid line (len=" & $s.len & ")"
+    )
   PgLine(
     a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
   )
 
 proc getLseg*(row: Row, col: int): PgLseg =
   ## Get a column value as PgLseg. Handles binary format.
+  ## In binary format the column OID must be lseg.
   if row.isBinaryCol(col):
+    checkScalarColOid("getLseg", row, col, [OidLseg])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -719,14 +866,22 @@ proc getLseg*(row: Row, col: int): PgLseg =
   var inner = s
   if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
     inner = inner[1 ..^ 2]
-  let points = parsePointsText(inner)
+  let points =
+    try:
+      parsePointsText(inner)
+    except PgTypeError as e:
+      raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
   if points.len != 2:
-    raise newException(PgTypeError, "Invalid lseg: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid lseg (len=" & $s.len & ")"
+    )
   PgLseg(p1: points[0], p2: points[1])
 
 proc getBox*(row: Row, col: int): PgBox =
   ## Get a column value as PgBox. Handles binary format.
+  ## In binary format the column OID must be box.
   if row.isBinaryCol(col):
+    checkScalarColOid("getBox", row, col, [OidBox])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -737,14 +892,21 @@ proc getBox*(row: Row, col: int): PgBox =
       low: decodePointBinary(row.data.buf, off + 16),
     )
   let s = row.getStr(col).strip()
-  let points = parsePointsText(s)
+  let points =
+    try:
+      parsePointsText(s)
+    except PgTypeError as e:
+      raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
   if points.len != 2:
-    raise newException(PgTypeError, "Invalid box: " & s)
+    raise
+      newException(PgTypeError, "Column " & $col & ": Invalid box (len=" & $s.len & ")")
   PgBox(high: points[0], low: points[1])
 
 proc getPath*(row: Row, col: int): PgPath =
   ## Get a column value as PgPath. Handles binary format.
+  ## In binary format the column OID must be path.
   if row.isBinaryCol(col):
+    checkScalarColOid("getPath", row, col, [OidPath])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -773,15 +935,23 @@ proc getPath*(row: Row, col: int): PgPath =
     return
   let s = row.getStr(col).strip()
   if s.len < 2:
-    raise newException(PgTypeError, "Invalid path: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid path (len=" & $s.len & ")"
+    )
   let closed = s[0] == '('
   let inner = s[1 ..^ 2]
-  let points = parsePointsText(inner)
+  let points =
+    try:
+      parsePointsText(inner)
+    except PgTypeError as e:
+      raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
   PgPath(closed: closed, points: points)
 
 proc getPolygon*(row: Row, col: int): PgPolygon =
   ## Get a column value as PgPolygon. Handles binary format.
+  ## In binary format the column OID must be polygon.
   if row.isBinaryCol(col):
+    checkScalarColOid("getPolygon", row, col, [OidPolygon])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -809,13 +979,20 @@ proc getPolygon*(row: Row, col: int): PgPolygon =
     return
   let s = row.getStr(col).strip()
   if s.len < 2 or s[0] != '(' or s[^1] != ')':
-    raise newException(PgTypeError, "Invalid polygon: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid polygon (len=" & $s.len & ")"
+    )
   let inner = s[1 ..^ 2]
-  PgPolygon(points: parsePointsText(inner))
+  try:
+    PgPolygon(points: parsePointsText(inner))
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 proc getCircle*(row: Row, col: int): PgCircle =
   ## Get a column value as PgCircle. Handles binary format.
+  ## In binary format the column OID must be circle.
   if row.isBinaryCol(col):
+    checkScalarColOid("getCircle", row, col, [OidCircle])
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -826,7 +1003,9 @@ proc getCircle*(row: Row, col: int): PgCircle =
     return
   let s = row.getStr(col).strip()
   if s.len < 2 or s[0] != '<' or s[^1] != '>':
-    raise newException(PgTypeError, "Invalid circle: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid circle (len=" & $s.len & ")"
+    )
   let inner = s[1 ..^ 2]
   # Find the last comma that's outside parens
   var depth = 0
@@ -839,10 +1018,15 @@ proc getCircle*(row: Row, col: int): PgCircle =
     elif inner[i] == ',' and depth == 0:
       lastComma = i
   if lastComma < 0:
-    raise newException(PgTypeError, "Invalid circle: " & s)
-  let center = parsePointText(inner[0 ..< lastComma])
-  let radius = pgParseFloat(inner[lastComma + 1 ..^ 1])
-  PgCircle(center: center, radius: radius)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid circle (len=" & $s.len & ")"
+    )
+  try:
+    let center = parsePointText(inner[0 ..< lastComma])
+    let radius = pgParseFloat(inner[lastComma + 1 ..^ 1])
+    PgCircle(center: center, radius: radius)
+  except PgTypeError as e:
+    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
 
 # NULL-safe Option accessors — return `none` for NULL instead of raising.
 
@@ -852,6 +1036,9 @@ template optAccessor*(getProc, optProc: untyped, T: typedesc) =
   # drop it and tag results with the default (wrong on non-`C` locales).
   when compiles((var r: Row; discard r.getProc(0, scale = 2))):
     proc optProc*(row: Row, col: int, scale: int = 2): Option[T] =
+      # Before the NULL test: a bad scale would otherwise surface only on the
+      # first non-NULL row.
+      checkMoneyScale(scale)
       if row.isNull(col):
         none(T)
       else:
@@ -863,6 +1050,16 @@ template optAccessor*(getProc, optProc: untyped, T: typedesc) =
         none(T)
       else:
         some(row.getProc(col))
+
+  # Same for a `PgMoneyConventions` overload, or the Opt form silently falls
+  # back to inference.
+  when compiles((var r: Row; var c: PgMoneyConventions; discard r.getProc(0, c))):
+    proc optProc*(row: Row, col: int, conv: PgMoneyConventions): Option[T] =
+      checkPgMoneyConventions(conv)
+      if row.isNull(col):
+        none(T)
+      else:
+        some(row.getProc(col, conv))
 
 template nameAccessor*(getProc: untyped, T: typedesc) =
   ## Generate ``getProc*(row, name): T`` that delegates to the index-based overload.
@@ -876,6 +1073,10 @@ template nameAccessor*(getProc: untyped, T: typedesc) =
   else:
     proc getProc*(row: Row, name: string): T =
       row.getProc(row.columnIndex(name))
+
+  when compiles((var r: Row; var c: PgMoneyConventions; discard r.getProc(0, c))):
+    proc getProc*(row: Row, name: string, conv: PgMoneyConventions): T =
+      row.getProc(row.columnIndex(name), conv)
 
 optAccessor(getStr, getStrOpt, string)
 optAccessor(getInt, getIntOpt, int32)
@@ -914,116 +1115,110 @@ optAccessor(getCircle, getCircleOpt, PgCircle)
 
 # Shared array element decoder registry — 1-D and N-D accessors route here.
 
-proc decodePgArrayElement*(_: typedesc[int16], buf: openArray[byte]): int16 =
+proc decodePgArrayElement(_: typedesc[int16], buf: openArray[byte]): int16 =
   if buf.len != 2:
     raise newException(PgTypeError, "int2 array element: bad length " & $buf.len)
   fromBE16(buf)
 
-proc decodePgArrayElement*(_: typedesc[int32], buf: openArray[byte]): int32 =
+proc decodePgArrayElement(_: typedesc[int32], buf: openArray[byte]): int32 =
   if buf.len != 4:
     raise newException(PgTypeError, "int4 array element: bad length " & $buf.len)
   fromBE32(buf)
 
-proc decodePgArrayElement*(_: typedesc[int64], buf: openArray[byte]): int64 =
+proc decodePgArrayElement(_: typedesc[int64], buf: openArray[byte]): int64 =
   if buf.len != 8:
     raise newException(PgTypeError, "int8 array element: bad length " & $buf.len)
   fromBE64(buf)
 
-proc decodePgArrayElement*(_: typedesc[float32], buf: openArray[byte]): float32 =
+proc decodePgArrayElement(_: typedesc[float32], buf: openArray[byte]): float32 =
   if buf.len != 4:
     raise newException(PgTypeError, "float4 array element: bad length " & $buf.len)
   decodeFloat32BE(buf)
 
-proc decodePgArrayElement*(_: typedesc[float64], buf: openArray[byte]): float64 =
+proc decodePgArrayElement(_: typedesc[float64], buf: openArray[byte]): float64 =
   if buf.len != 8:
     raise newException(PgTypeError, "float8 array element: bad length " & $buf.len)
   decodeFloat64BE(buf)
 
-proc decodePgArrayElement*(_: typedesc[bool], buf: openArray[byte]): bool =
+proc decodePgArrayElement(_: typedesc[bool], buf: openArray[byte]): bool =
   if buf.len != 1:
     raise newException(PgTypeError, "bool array element: bad length " & $buf.len)
   buf[0] != 0'u8
 
-proc decodePgArrayElement*(_: typedesc[string], buf: openArray[byte]): string =
+proc decodePgArrayElement(_: typedesc[string], buf: openArray[byte]): string =
   readString(buf, 0, buf.len)
 
-proc decodePgArrayElement*(_: typedesc[seq[byte]], buf: openArray[byte]): seq[byte] =
+proc decodePgArrayElement(_: typedesc[seq[byte]], buf: openArray[byte]): seq[byte] =
   readBytes(buf, 0, buf.len)
 
-proc decodePgArrayElement*(_: typedesc[PgNumeric], buf: openArray[byte]): PgNumeric =
+proc decodePgArrayElement(_: typedesc[PgNumeric], buf: openArray[byte]): PgNumeric =
   decodeNumericBinary(buf)
 
 # No PgMoney overload: binary money lacks scale; callers must supply it.
 
-proc decodePgArrayElement*(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
+proc decodePgArrayElement(_: typedesc[PgBit], buf: openArray[byte]): PgBit =
   if buf.len < 4:
     raise newException(PgTypeError, "bit array element too short")
+  # `initPgBit` validates nbits.
   let nbits = fromBE32(buf.toOpenArray(0, 3))
-  if nbits < 0:
-    raise newException(PgTypeError, "bit array element: negative nbits " & $nbits)
-  if nbits > PgBitMaxBits:
-    raise newException(
-      PgTypeError,
-      "bit array element: nbits " & $nbits & " exceeds limit (" & $PgBitMaxBits & ")",
-    )
   let dataLen = buf.len - 4
-  if (int64(nbits) + 7) div 8 != int64(dataLen):
-    raise newException(
-      PgTypeError,
-      "bit array element: nbits=" & $nbits & " inconsistent with dataLen=" & $dataLen,
-    )
   var data = newSeq[byte](dataLen)
   for j in 0 ..< dataLen:
     data[j] = buf[4 + j]
-  PgBit(nbits: nbits, data: data)
+  initPgBit(nbits, data)
 
-proc decodePgArrayElement*(_: typedesc[PgTime], buf: openArray[byte]): PgTime =
+proc decodePgArrayElement(_: typedesc[PgTime], buf: openArray[byte]): PgTime =
   if buf.len != 8:
     raise newException(PgTypeError, "time array element: bad length " & $buf.len)
   decodeBinaryTime(buf)
 
-proc decodePgArrayElement*(_: typedesc[PgTimeTz], buf: openArray[byte]): PgTimeTz =
+proc decodePgArrayElement(_: typedesc[PgTimeTz], buf: openArray[byte]): PgTimeTz =
   if buf.len != 12:
     raise newException(PgTypeError, "timetz array element: bad length " & $buf.len)
   decodeBinaryTimeTz(buf)
 
-proc decodePgArrayElement*[T: PgInet | PgCidr](
-    _: typedesc[T], buf: openArray[byte]
-): T =
+proc decodePgArrayElement[T: PgInet | PgCidr](_: typedesc[T], buf: openArray[byte]): T =
   let (ip, mask) = decodeInetBinary(buf)
   T(address: ip, mask: mask)
 
-proc decodePgArrayElement*[T: PgXml | PgTsVector | PgTsQuery](
-    _: typedesc[T], buf: openArray[byte]
-): T =
-  T(readString(buf, 0, buf.len))
+proc decodePgArrayElement(_: typedesc[PgXml], buf: openArray[byte]): PgXml =
+  ## Xml binary is the text representation, so raw copy is correct.
+  PgXml(readString(buf, 0, buf.len))
 
-proc decodePgArrayElement*(_: typedesc[PgHstore], buf: openArray[byte]): PgHstore =
+proc decodePgArrayElement(_: typedesc[PgTsVector], buf: openArray[byte]): PgTsVector =
+  ## Binary tsvector is structured; decode to text like the scalar accessor.
+  PgTsVector(decodeBinaryTsVector(buf))
+
+proc decodePgArrayElement(_: typedesc[PgTsQuery], buf: openArray[byte]): PgTsQuery =
+  ## Binary tsquery is structured; decode to text like the scalar accessor.
+  PgTsQuery(decodeBinaryTsQuery(buf))
+
+proc decodePgArrayElement(_: typedesc[PgHstore], buf: openArray[byte]): PgHstore =
   decodeHstoreBinary(buf)
 
-proc decodePgArrayElement*(_: typedesc[PgPoint], buf: openArray[byte]): PgPoint =
+proc decodePgArrayElement(_: typedesc[PgPoint], buf: openArray[byte]): PgPoint =
   if buf.len != 16:
     raise newException(PgTypeError, "point array element: bad length " & $buf.len)
   decodePointBinary(buf, 0)
 
-proc decodePgArrayElement*(_: typedesc[PgLine], buf: openArray[byte]): PgLine =
+proc decodePgArrayElement(_: typedesc[PgLine], buf: openArray[byte]): PgLine =
   if buf.len != 24:
     raise newException(PgTypeError, "line array element: bad length " & $buf.len)
   result.a = decodeFloat64BE(buf, 0)
   result.b = decodeFloat64BE(buf, 8)
   result.c = decodeFloat64BE(buf, 16)
 
-proc decodePgArrayElement*(_: typedesc[PgLseg], buf: openArray[byte]): PgLseg =
+proc decodePgArrayElement(_: typedesc[PgLseg], buf: openArray[byte]): PgLseg =
   if buf.len != 32:
     raise newException(PgTypeError, "lseg array element: bad length " & $buf.len)
   PgLseg(p1: decodePointBinary(buf, 0), p2: decodePointBinary(buf, 16))
 
-proc decodePgArrayElement*(_: typedesc[PgBox], buf: openArray[byte]): PgBox =
+proc decodePgArrayElement(_: typedesc[PgBox], buf: openArray[byte]): PgBox =
   if buf.len != 32:
     raise newException(PgTypeError, "box array element: bad length " & $buf.len)
   PgBox(high: decodePointBinary(buf, 0), low: decodePointBinary(buf, 16))
 
-proc decodePgArrayElement*(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
+proc decodePgArrayElement(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
   if buf.len < 5:
     raise newException(PgTypeError, "path array element too short: " & $buf.len)
   result.closed = buf[0] != 0
@@ -1037,7 +1232,7 @@ proc decodePgArrayElement*(_: typedesc[PgPath], buf: openArray[byte]): PgPath =
   for j in 0 ..< npts:
     result.points[j] = decodePointBinary(buf, 5 + j * 16)
 
-proc decodePgArrayElement*(_: typedesc[PgPolygon], buf: openArray[byte]): PgPolygon =
+proc decodePgArrayElement(_: typedesc[PgPolygon], buf: openArray[byte]): PgPolygon =
   if buf.len < 4:
     raise newException(PgTypeError, "polygon array element too short: " & $buf.len)
   let npts = fromBE32(buf.toOpenArray(0, 3))
@@ -1050,7 +1245,7 @@ proc decodePgArrayElement*(_: typedesc[PgPolygon], buf: openArray[byte]): PgPoly
   for j in 0 ..< npts:
     result.points[j] = decodePointBinary(buf, 4 + j * 16)
 
-proc decodePgArrayElement*(_: typedesc[PgCircle], buf: openArray[byte]): PgCircle =
+proc decodePgArrayElement(_: typedesc[PgCircle], buf: openArray[byte]): PgCircle =
   if buf.len != 24:
     raise newException(PgTypeError, "circle array element: bad length " & $buf.len)
   result.center = decodePointBinary(buf, 0)
@@ -1059,16 +1254,14 @@ proc decodePgArrayElement*(_: typedesc[PgCircle], buf: openArray[byte]): PgCircl
 # Named helpers where typedesc dispatch can't distinguish: DateTime is shared
 # by timestamp/timestamptz/date; JsonNode needs runtime elemOid.
 
-proc decodeTimestampArrayElem*(
-    buf: openArray[byte], typeName: static string
-): DateTime =
+proc decodeTimestampArrayElem(buf: openArray[byte], typeName: static string): DateTime =
   if buf.len != 8:
     raise newException(
       PgTypeError, "Invalid binary " & typeName & " element length: " & $buf.len
     )
   decodeBinaryTimestamp(buf)
 
-proc decodeDateArrayElem*(buf: openArray[byte]): DateTime =
+proc decodeDateArrayElem(buf: openArray[byte]): DateTime =
   if buf.len != 4:
     raise newException(PgTypeError, "Invalid binary date element length: " & $buf.len)
   decodeBinaryDate(buf)
@@ -1076,13 +1269,39 @@ proc decodeDateArrayElem*(buf: openArray[byte]): DateTime =
 # ``decodeJsonArrayElem`` is defined above (near the scalar accessors) so
 # ``getJson`` can delegate to it without a forward declaration.
 
+# Sentinel for accessors whose element OID is not fixed by the catalog, so
+# there is nothing to match against: ``hstore`` is an extension type and gets
+# its OID assigned at CREATE EXTENSION time.
+const anyArrayElemOid: array[0, int32] = []
+
+proc checkArrayElemOid(accessor: string, actual: int32, expected: openArray[int32]) =
+  ## Reject a binary array whose wire element OID is not one this accessor
+  ## decodes. Without it an ``int8[]`` read through ``getIntArray`` decodes as
+  ## int32 and silently yields wrong values.
+  if expected.len == 0 or actual in expected:
+    return
+  var want = ""
+  for i, oid in expected:
+    if i > 0:
+      want.add(" or ")
+    want.add($oid)
+  raise newException(
+    PgTypeError, accessor & ": wire elemOid=" & $actual & " expected " & want
+  )
+
 # Array decoder skeletons. ``genArrayDecoder`` hardcodes the binary body to
 # ``decodePgArrayElement(T, slice)``; ``genArrayDecoderCustom`` takes an
 # explicit ``binBody`` for types that need extra context (json/timestamps).
 # In both, ``textBody`` decodes one text element with ``e: Option[string]``
 # in scope; ``binBody`` has ``row``/``off``/``e``/``decoded`` in scope.
+# ``elemOids`` lists the wire element OIDs the accessor accepts in binary
+# format (``anyArrayElemOid`` to skip the check).
 template genArrayDecoderCustom(
-    getProc: untyped, T: typedesc, typeName: static string, binBody, textBody: untyped
+    getProc: untyped,
+    T: typedesc,
+    typeName: static string,
+    elemOids: untyped,
+    binBody, textBody: untyped,
 ) {.dirty.} =
   proc getProc*(row: Row, col: int): seq[T] =
     if row.isBinaryCol(col):
@@ -1091,6 +1310,7 @@ template genArrayDecoderCustom(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
+      checkArrayElemOid(astToStr(getProc), decoded.elemOid, elemOids)
       result = newSeq[T](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1103,12 +1323,17 @@ template genArrayDecoderCustom(
       result.add(textBody)
 
 template genArrayDecoder(
-    getProc: untyped, T: typedesc, typeName: static string, textBody: untyped
+    getProc: untyped,
+    T: typedesc,
+    typeName: static string,
+    elemOids: untyped,
+    textBody: untyped,
 ) {.dirty.} =
   genArrayDecoderCustom(
     getProc,
     T,
     typeName,
+    elemOids,
     decodePgArrayElement(
       T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
     ),
@@ -1117,50 +1342,70 @@ template genArrayDecoder(
 
 # Scalar array decoders.
 
-genArrayDecoder(getIntArray, int32, "int", pgParseInt32(e.get))
-genArrayDecoder(getInt16Array, int16, "int16", pgParseInt16(e.get))
-genArrayDecoder(getInt64Array, int64, "int64", pgParseBiggestInt(e.get))
+genArrayDecoder(getIntArray, int32, "int", [OidInt4], pgParseInt32(e.get))
+genArrayDecoder(getInt16Array, int16, "int16", [OidInt2], pgParseInt16(e.get))
+genArrayDecoder(getInt64Array, int64, "int64", [OidInt8], pgParseBiggestInt(e.get))
+
+proc moneyArrayFromBinary(row: Row, col: int, scale: int): seq[PgMoney] =
+  ## Shared binary ``money[]`` decode for both `getMoneyArray` overloads.
+  let (off, clen) = cellInfo(row, col)
+  if clen == -1:
+    raise newException(PgTypeError, "Column " & $col & " is NULL")
+  let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+  rejectMultiDim(decoded)
+  checkArrayElemOid("getMoneyArray", decoded.elemOid, [OidMoney])
+  result = newSeq[PgMoney](decoded.elements.len)
+  for i, e in decoded.elements:
+    if e.len == -1:
+      raise newException(PgTypeError, "NULL element in money array")
+    if e.len != 8:
+      raise newException(
+        PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
+      )
+    result[i] = initPgMoney(
+      fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)), scale
+    )
+
+proc moneyTextElements(row: Row, col: int): seq[string] =
+  ## Elements of a text ``money[]`` cell; ``seq[PgMoney]`` cannot hold a NULL.
+  for e in parseTextArray(row.getStr(col)):
+    if e.isNone:
+      raise newException(PgTypeError, "NULL element in money array")
+    result.add(e.get)
 
 proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## Get a column value as a seq of PgMoney. Handles binary array format and
   ## locale-formatted text arrays (see ``parsePgMoney``). ``scale`` tags each
   ## element's ``frac_digits`` and is also used for text parsing.
   ## Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+  checkMoneyScale(scale)
   if row.isBinaryCol(col):
-    let (off, clen) = cellInfo(row, col)
-    if clen == -1:
-      raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    result = newSeq[PgMoney](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in money array")
-      if e.len != 8:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
-        )
-      result[i] = PgMoney(
-        amount: fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
-        scale: int8(scale),
-      )
-    return
-  let s = row.getStr(col)
-  let elems = parseTextArray(s)
-  for e in elems:
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in money array")
-    result.add(parsePgMoney(e.get, scale))
+    return moneyArrayFromBinary(row, col, scale)
+  for e in moneyTextElements(row, col):
+    result.add(parsePgMoney(e, scale))
+
+proc getMoneyArray*(row: Row, col: int, conv: PgMoneyConventions): seq[PgMoney] =
+  ## ``money[]`` under known ``lc_monetary`` conventions. See the
+  ## `PgMoneyConventions` overload of `getMoney`.
+  checkPgMoneyConventions(conv)
+  if row.isBinaryCol(col):
+    return moneyArrayFromBinary(row, col, conv.fracDigits)
+  for e in moneyTextElements(row, col):
+    result.add(parsePgMoney(e, conv))
 
 # ``getFloatArray`` decodes ``float8[]`` only; ``float4[]`` raises PgTypeError.
-genArrayDecoder(getFloatArray, float64, "float", pgParseFloat(e.get))
-genArrayDecoder(getFloat32Array, float32, "float32", pgParseFloat32(e.get))
+genArrayDecoder(getFloatArray, float64, "float", [OidFloat8], pgParseFloat(e.get))
+genArrayDecoder(getFloat32Array, float32, "float32", [OidFloat4], pgParseFloat32(e.get))
 
-genArrayDecoder(getBoolArray, bool, "bool", parsePgBoolText(e.get))
-genArrayDecoder(getStrArray, string, "string", e.get)
-genArrayDecoder(getBitArray, PgBit, "bit", parseBitString(e.get))
+genArrayDecoder(getBoolArray, bool, "bool", [OidBool], parsePgBoolText(e.get))
+genArrayDecoder(
+  getStrArray,
+  string,
+  "string",
+  [OidText, OidVarchar, OidBpchar, OidName, OidChar],
+  e.get,
+)
+genArrayDecoder(getBitArray, PgBit, "bit", [OidBit, OidVarbit], parseBitString(e.get))
 
 # Temporal array decoders
 
@@ -1168,6 +1413,7 @@ genArrayDecoderCustom(
   getTimestampArray,
   DateTime,
   "timestamp",
+  [OidTimestamp],
   decodeTimestampArrayElem(
     row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1), "timestamp"
   ),
@@ -1177,6 +1423,7 @@ genArrayDecoderCustom(
   getTimestampTzArray,
   DateTime,
   "timestamptz",
+  [OidTimestampTz],
   decodeTimestampArrayElem(
     row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1), "timestamptz"
   ),
@@ -1187,56 +1434,70 @@ genArrayDecoderCustom(
   getDateArray,
   DateTime,
   "date",
+  [OidDate],
   decodeDateArrayElem(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
   parseDateText(e.get),
 )
 
-genArrayDecoder(getTimeArray, PgTime, "time", parseTimeText(e.get))
-genArrayDecoder(getTimeTzArray, PgTimeTz, "timetz", parseTimeTzText(e.get))
-genArrayDecoder(getIntervalArray, PgInterval, "interval", parseIntervalText(e.get))
+genArrayDecoder(getTimeArray, PgTime, "time", [OidTime], parseTimeText(e.get))
+genArrayDecoder(getTimeTzArray, PgTimeTz, "timetz", [OidTimeTz], parseTimeTzText(e.get))
+genArrayDecoder(
+  getIntervalArray, PgInterval, "interval", [OidInterval], parseIntervalText(e.get)
+)
 
 # Identifier / network array decoders
 
-genArrayDecoder(getUuidArray, PgUuid, "uuid", PgUuid(e.get))
+genArrayDecoder(getUuidArray, PgUuid, "uuid", [OidUuid], PgUuid(e.get))
 
 proc inetElemFromText[T](s: string): T =
   let (ip, mask) = parseInetText(s)
   result.address = ip
   result.mask = mask
 
-genArrayDecoder(getInetArray, PgInet, "inet", inetElemFromText[PgInet](e.get))
-genArrayDecoder(getCidrArray, PgCidr, "cidr", inetElemFromText[PgCidr](e.get))
-genArrayDecoder(getMacAddrArray, PgMacAddr, "macaddr", PgMacAddr(e.get))
-genArrayDecoder(getMacAddr8Array, PgMacAddr8, "macaddr8", PgMacAddr8(e.get))
+genArrayDecoder(
+  getInetArray, PgInet, "inet", [OidInet], inetElemFromText[PgInet](e.get)
+)
+genArrayDecoder(
+  getCidrArray, PgCidr, "cidr", [OidCidr], inetElemFromText[PgCidr](e.get)
+)
+genArrayDecoder(getMacAddrArray, PgMacAddr, "macaddr", [OidMacAddr], PgMacAddr(e.get))
+genArrayDecoder(
+  getMacAddr8Array, PgMacAddr8, "macaddr8", [OidMacAddr8], PgMacAddr8(e.get)
+)
 
 # Numeric / binary / JSON array decoders
 
-genArrayDecoder(getNumericArray, PgNumeric, "numeric", parsePgNumeric(e.get))
+genArrayDecoder(
+  getNumericArray, PgNumeric, "numeric", [OidNumeric], parsePgNumeric(e.get)
+)
 
 proc bytesElemFromText(s: string): seq[byte] =
   const errCtx = "bytea array element"
   if s.len >= 2 and s[0] == '\\' and s[1] == 'x':
     let hexLen = s.len - 2
     if hexLen mod 2 != 0:
-      raise newException(PgTypeError, "odd-length hex in bytea array element: " & s)
+      raise newException(
+        PgTypeError, "odd-length hex in bytea array element (len=" & $s.len & ")"
+      )
     result = newSeq[byte](hexLen div 2)
     for j in 0 ..< result.len:
       result[j] = decodeHexPair(s, 2 + j * 2, errCtx)
   else:
     result = decodeByteaEscape(s.toOpenArray(0, s.high), errCtx)
 
-genArrayDecoder(getBytesArray, seq[byte], "bytea", bytesElemFromText(e.get))
+genArrayDecoder(getBytesArray, seq[byte], "bytea", [OidBytea], bytesElemFromText(e.get))
 
 proc jsonElemFromText(s: string): JsonNode =
   try:
     parseJson(s)
   except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON element: " & s)
+    raise newException(PgTypeError, "Invalid JSON element (len=" & $s.len & ")")
 
 genArrayDecoderCustom(
   getJsonArray,
   JsonNode,
   "json",
+  [OidJson, OidJsonb],
   decodeJsonArrayElem(
     row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1), decoded.elemOid
   ),
@@ -1245,7 +1506,7 @@ genArrayDecoderCustom(
 
 # Geometric array decoders
 
-genArrayDecoder(getPointArray, PgPoint, "point", parsePointText(e.get))
+genArrayDecoder(getPointArray, PgPoint, "point", [OidPoint], parsePointText(e.get))
 
 proc lineElemFromText(s: string): PgLine =
   let v = s.strip()
@@ -1253,15 +1514,15 @@ proc lineElemFromText(s: string): PgLine =
   if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
     inner = inner[1 ..^ 2]
   else:
-    raise newException(PgTypeError, "Invalid line: " & v)
+    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
   let parts = inner.split(',')
   if parts.len != 3:
-    raise newException(PgTypeError, "Invalid line: " & v)
+    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
   PgLine(
     a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
   )
 
-genArrayDecoder(getLineArray, PgLine, "line", lineElemFromText(e.get))
+genArrayDecoder(getLineArray, PgLine, "line", [OidLine], lineElemFromText(e.get))
 
 proc lsegElemFromText(s: string): PgLseg =
   let v = s.strip()
@@ -1270,10 +1531,10 @@ proc lsegElemFromText(s: string): PgLseg =
     inner = inner[1 ..^ 2]
   let points = parsePointsText(inner)
   if points.len != 2:
-    raise newException(PgTypeError, "Invalid lseg: " & v)
+    raise newException(PgTypeError, "Invalid lseg (len=" & $v.len & ")")
   PgLseg(p1: points[0], p2: points[1])
 
-genArrayDecoder(getLsegArray, PgLseg, "lseg", lsegElemFromText(e.get))
+genArrayDecoder(getLsegArray, PgLseg, "lseg", [OidLseg], lsegElemFromText(e.get))
 
 proc getBoxArray*(row: Row, col: int): seq[PgBox] =
   if row.isBinaryCol(col):
@@ -1282,6 +1543,7 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
     rejectMultiDim(decoded)
+    checkArrayElemOid("getBoxArray", decoded.elemOid, [OidBox])
     result = newSeq[PgBox](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -1293,7 +1555,9 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
   # PostgreSQL uses ';' as array element delimiter for box type
   let s = row.getStr(col)
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
-    raise newException(PgTypeError, "Invalid box array literal: " & s)
+    raise newException(
+      PgTypeError, "Column " & $col & ": Invalid box array literal (len=" & $s.len & ")"
+    )
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     return
@@ -1304,31 +1568,35 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
       raise newException(PgTypeError, "NULL element in box array")
     let points = parsePointsText(v)
     if points.len != 2:
-      raise newException(PgTypeError, "Invalid box: " & v)
+      raise newException(
+        PgTypeError, "Column " & $col & ": Invalid box (len=" & $v.len & ")"
+      )
     result.add(PgBox(high: points[0], low: points[1]))
 
 proc pathElemFromText(s: string): PgPath =
   let v = s.strip()
   if v.len < 2:
-    raise newException(PgTypeError, "Invalid path: " & v)
+    raise newException(PgTypeError, "Invalid path (len=" & $v.len & ")")
   let closed = v[0] == '('
   let inner = v[1 ..^ 2]
   PgPath(closed: closed, points: parsePointsText(inner))
 
-genArrayDecoder(getPathArray, PgPath, "path", pathElemFromText(e.get))
+genArrayDecoder(getPathArray, PgPath, "path", [OidPath], pathElemFromText(e.get))
 
 proc polygonElemFromText(s: string): PgPolygon =
   let v = s.strip()
   if v.len < 2 or v[0] != '(' or v[^1] != ')':
-    raise newException(PgTypeError, "Invalid polygon: " & v)
+    raise newException(PgTypeError, "Invalid polygon (len=" & $v.len & ")")
   PgPolygon(points: parsePointsText(v[1 ..^ 2]))
 
-genArrayDecoder(getPolygonArray, PgPolygon, "polygon", polygonElemFromText(e.get))
+genArrayDecoder(
+  getPolygonArray, PgPolygon, "polygon", [OidPolygon], polygonElemFromText(e.get)
+)
 
 proc circleElemFromText(s: string): PgCircle =
   let v = s.strip()
   if v.len < 2 or v[0] != '<' or v[^1] != '>':
-    raise newException(PgTypeError, "Invalid circle: " & v)
+    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
   let inner = v[1 ..^ 2]
   var depth = 0
   var lastComma = -1
@@ -1340,20 +1608,26 @@ proc circleElemFromText(s: string): PgCircle =
     elif inner[j] == ',' and depth == 0:
       lastComma = j
   if lastComma < 0:
-    raise newException(PgTypeError, "Invalid circle: " & v)
+    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
   PgCircle(
     center: parsePointText(inner[0 ..< lastComma]),
     radius: pgParseFloat(inner[lastComma + 1 ..^ 1]),
   )
 
-genArrayDecoder(getCircleArray, PgCircle, "circle", circleElemFromText(e.get))
+genArrayDecoder(
+  getCircleArray, PgCircle, "circle", [OidCircle], circleElemFromText(e.get)
+)
 
 # Other array decoders
 
-genArrayDecoder(getXmlArray, PgXml, "xml", PgXml(e.get))
-genArrayDecoder(getTsVectorArray, PgTsVector, "tsvector", PgTsVector(e.get))
-genArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery", PgTsQuery(e.get))
-genArrayDecoder(getHstoreArray, PgHstore, "hstore", parseHstoreText(e.get))
+genArrayDecoder(getXmlArray, PgXml, "xml", [OidXml], PgXml(e.get))
+genArrayDecoder(
+  getTsVectorArray, PgTsVector, "tsvector", [OidTsVector], PgTsVector(e.get)
+)
+genArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery", [OidTsQuery], PgTsQuery(e.get))
+genArrayDecoder(
+  getHstoreArray, PgHstore, "hstore", anyArrayElemOid, parseHstoreText(e.get)
+)
 
 # Element-level NULL-safe array getters
 
@@ -1361,7 +1635,7 @@ genArrayDecoder(getHstoreArray, PgHstore, "hstore", parseHstoreText(e.get))
 # to ``none(T)`` instead of raising. Short form uses ``decodePgArrayElement``;
 # ``…Custom`` takes an explicit ``binBody``.
 template genArrayDecoderElemOptCustom(
-    getProc: untyped, T: typedesc, binBody, textBody: untyped
+    getProc: untyped, T: typedesc, elemOids: untyped, binBody, textBody: untyped
 ) {.dirty.} =
   proc getProc*(row: Row, col: int): seq[Option[T]] =
     if row.isBinaryCol(col):
@@ -1370,6 +1644,7 @@ template genArrayDecoderElemOptCustom(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
+      checkArrayElemOid(astToStr(getProc), decoded.elemOid, elemOids)
       result = newSeq[Option[T]](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1384,24 +1659,29 @@ template genArrayDecoderElemOptCustom(
         result.add(some(textBody))
 
 template genArrayDecoderElemOpt(
-    getProc: untyped, T: typedesc, textBody: untyped
+    getProc: untyped, T: typedesc, elemOids: untyped, textBody: untyped
 ) {.dirty.} =
   genArrayDecoderElemOptCustom(
     getProc,
     T,
+    elemOids,
     decodePgArrayElement(
       T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
     ),
     textBody,
   )
 
-genArrayDecoderElemOpt(getIntArrayElemOpt, int32, pgParseInt32(e.get))
-genArrayDecoderElemOpt(getInt16ArrayElemOpt, int16, pgParseInt16(e.get))
-genArrayDecoderElemOpt(getInt64ArrayElemOpt, int64, pgParseBiggestInt(e.get))
-genArrayDecoderElemOpt(getFloatArrayElemOpt, float64, pgParseFloat(e.get))
-genArrayDecoderElemOpt(getFloat32ArrayElemOpt, float32, pgParseFloat32(e.get))
-genArrayDecoderElemOpt(getBoolArrayElemOpt, bool, parsePgBoolText(e.get))
-genArrayDecoderElemOpt(getStrArrayElemOpt, string, e.get)
+genArrayDecoderElemOpt(getIntArrayElemOpt, int32, [OidInt4], pgParseInt32(e.get))
+genArrayDecoderElemOpt(getInt16ArrayElemOpt, int16, [OidInt2], pgParseInt16(e.get))
+genArrayDecoderElemOpt(getInt64ArrayElemOpt, int64, [OidInt8], pgParseBiggestInt(e.get))
+genArrayDecoderElemOpt(getFloatArrayElemOpt, float64, [OidFloat8], pgParseFloat(e.get))
+genArrayDecoderElemOpt(
+  getFloat32ArrayElemOpt, float32, [OidFloat4], pgParseFloat32(e.get)
+)
+genArrayDecoderElemOpt(getBoolArrayElemOpt, bool, [OidBool], parsePgBoolText(e.get))
+genArrayDecoderElemOpt(
+  getStrArrayElemOpt, string, [OidText, OidVarchar, OidBpchar, OidName, OidChar], e.get
+)
 
 # Array Opt accessors (text format)
 
@@ -1457,7 +1737,8 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
   ## Requires binary column format; text-format multi-dimensional arrays are
   ## not supported. Raises ``PgTypeError`` when the column is NULL, or when
   ## the wire ``elemOid`` does not match the registered OID for ``T``
-  ## (``JsonNode`` accepts both ``json`` and ``jsonb``).
+  ## (``JsonNode``: json/jsonb; ``string``: all character types;
+  ## ``PgBit``: bit/varbit).
   ##
   ## Validation looks only at the wire ``elemOid`` carried in the array
   ## payload, not at the column's field OID from ``RowDescription``. A bind
@@ -1494,7 +1775,8 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
       error:
         "getArrayND[PgMoney] would silently hardcode scale=2 and produce " &
         "wrong values on servers whose lc_monetary frac_digits differ from " &
-        "2. Use getMoneyArrayND(row, col, scale = ...) instead " &
+        "2. Use getMoneyArrayND(row, col, scale = ...) or " &
+        "getMoneyArrayND(row, col, conv) instead " &
         "(getMoneyArrayNDOpt for the NULL-safe variant)."
     .}
   elif T is PgTsVector or T is PgTsQuery:
@@ -1507,11 +1789,13 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
         "accessor (getTsVectorArray / getTsQueryArray) instead; " &
         "PgArray[T] currently has no multi-dim equivalent for these types."
     .}
+  # cellInfo first so an out-of-range col reports as an index error rather than
+  # the misleading "requires binary column format".
+  let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
       PgTypeError, "getArrayND requires binary column format (col " & $col & ")"
     )
-  let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
@@ -1522,6 +1806,14 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
         "getArrayND[JsonNode]: wire elemOid=" & $decoded.elemOid &
           " is neither json nor jsonb",
       )
+  elif T is string:
+    checkArrayElemOid(
+      "getArrayND[string]",
+      decoded.elemOid,
+      [OidText, OidVarchar, OidBpchar, OidName, OidChar],
+    )
+  elif T is PgBit:
+    checkArrayElemOid("getArrayND[PgBit]", decoded.elemOid, [OidBit, OidVarbit])
   else:
     if decoded.elemOid != pgArrayElemOid(T):
       raise newException(
@@ -1559,21 +1851,14 @@ proc getArrayNDOpt*[T](row: Row, col: int): Option[PgArray[T]] =
   else:
     some(getArrayND[T](row, col))
 
-proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
-  ## ``getArrayND``-style accessor for ``money[]`` (any dimensionality).
-  ## ``getArrayND[PgMoney]`` is intentionally ``{.error.}``-gated because the
-  ## binary ``money`` wire format does not carry the fractional-digit count,
-  ## so the caller must supply ``scale`` (matching the server's
-  ## ``lc_monetary`` ``frac_digits``) — this accessor is the only way to
-  ## read a ``money[]`` column. Defaults to ``scale = 2`` for the common
-  ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
-  if scale < 0 or scale > 18:
-    raise newException(PgTypeError, "PgMoney scale out of range: " & $scale)
+proc moneyArrayNDImpl(row: Row, col: int, scale: int): PgArray[PgMoney] =
+  ## Shared body of the ``scale`` and ``conv`` overloads of `getMoneyArrayND`.
+  # cellInfo first (see getArrayND).
+  let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
       PgTypeError, "getMoneyArrayND requires binary column format (col " & $col & ")"
     )
-  let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
@@ -1595,21 +1880,53 @@ proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
           PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
         )
       result.elements[i] = some(
-        PgMoney(
-          amount:
-            fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
-          scale: int8(scale),
+        initPgMoney(
+          fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
+          scale,
         )
       )
 
+proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
+  ## ``getArrayND``-style accessor for ``money[]`` (any dimensionality).
+  ## ``getArrayND[PgMoney]`` is intentionally ``{.error.}``-gated because the
+  ## binary ``money`` wire format does not carry the fractional-digit count,
+  ## so the caller must supply ``scale`` (matching the server's
+  ## ``lc_monetary`` ``frac_digits``) — this accessor is the only way to
+  ## read a ``money[]`` column. Defaults to ``scale = 2`` for the common
+  ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
+  checkMoneyScale(scale)
+  moneyArrayNDImpl(row, col, scale)
+
+proc getMoneyArrayND*(row: Row, col: int, conv: PgMoneyConventions): PgArray[PgMoney] =
+  ## ``money[]`` of any dimensionality under known ``lc_monetary``
+  ## conventions; ``conv.fracDigits`` supplies the scale. Binary format only,
+  ## so the conventions add nothing beyond that — they are accepted so a
+  ## caller holding one need not unpack it, and validated because this path
+  ## never reaches the text parser.
+  checkPgMoneyConventions(conv)
+  moneyArrayNDImpl(row, col, conv.fracDigits)
+
 proc getMoneyArrayNDOpt*(row: Row, col: int, scale: int = 2): Option[PgArray[PgMoney]] =
   ## NULL-safe column-level variant of ``getMoneyArrayND``.
+  checkMoneyScale(scale)
   if row.isNull(col):
     none(PgArray[PgMoney])
   else:
     some(getMoneyArrayND(row, col, scale))
 
-# Generic accessors — static dispatch by type, no OID branching.
+proc getMoneyArrayNDOpt*(
+    row: Row, col: int, conv: PgMoneyConventions
+): Option[PgArray[PgMoney]] =
+  ## NULL-safe column-level variant of the conventions overload.
+  checkPgMoneyConventions(conv)
+  if row.isNull(col):
+    none(PgArray[PgMoney])
+  else:
+    some(getMoneyArrayND(row, col, conv))
+
+# Generic accessors — static dispatch by type. Each overload delegates to its
+# typed accessor, so binary columns carry the same OID validation; there is
+# no runtime OID-to-type dispatch beyond the static type parameter.
 
 proc get*(row: Row, col: int, T: typedesc[int16]): int16 =
   ## Generic typed accessor. Usage: ``row.get(0, int16)``
@@ -1640,8 +1957,14 @@ proc get*(row: Row, col: int, T: typedesc[seq[byte]]): seq[byte] =
 proc get*(row: Row, col: int, T: typedesc[PgNumeric]): PgNumeric =
   row.getNumeric(col)
 
-proc get*(row: Row, col: int, T: typedesc[PgMoney]): PgMoney =
-  row.getMoney(col)
+proc get*(row: Row, col: int, T: typedesc[PgMoney], scale: int = 2): PgMoney =
+  ## Generic money accessor with scale forwarding. Defaults to 2; pass the
+  ## server ``lc_monetary`` frac_digits when it differs.
+  row.getMoney(col, scale)
+
+proc get*(row: Row, col: int, T: typedesc[PgMoney], conv: PgMoneyConventions): PgMoney =
+  ## Generic money accessor under known ``lc_monetary`` conventions.
+  row.getMoney(col, conv)
 
 proc get*(row: Row, col: int, T: typedesc[JsonNode]): JsonNode =
   row.getJson(col)
@@ -1762,8 +2085,15 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgMacAddr8]]): seq[PgMacAddr8] =
 proc get*(row: Row, col: int, T: typedesc[seq[PgNumeric]]): seq[PgNumeric] =
   row.getNumericArray(col)
 
-proc get*(row: Row, col: int, T: typedesc[seq[PgMoney]]): seq[PgMoney] =
-  row.getMoneyArray(col)
+proc get*(row: Row, col: int, T: typedesc[seq[PgMoney]], scale: int = 2): seq[PgMoney] =
+  ## Generic money array accessor with scale forwarding.
+  row.getMoneyArray(col, scale)
+
+proc get*(
+    row: Row, col: int, T: typedesc[seq[PgMoney]], conv: PgMoneyConventions
+): seq[PgMoney] =
+  ## Generic money array accessor under known ``lc_monetary`` conventions.
+  row.getMoneyArray(col, conv)
 
 proc get*(row: Row, col: int, T: typedesc[seq[JsonNode]]): seq[JsonNode] =
   row.getJsonArray(col)
@@ -1858,3 +2188,25 @@ proc columnIndex*(row: Row, name: string): int =
 proc get*[T](row: Row, name: string, _: typedesc[T]): T =
   ## Generic typed accessor by column name. Usage: ``row.get("id", int32)``
   row.get(row.columnIndex(name), T)
+
+proc get*(row: Row, name: string, T: typedesc[PgMoney], scale: int = 2): PgMoney =
+  ## Generic money accessor by column name with scale forwarding.
+  row.getMoney(row.columnIndex(name), scale)
+
+proc get*(
+    row: Row, name: string, T: typedesc[PgMoney], conv: PgMoneyConventions
+): PgMoney =
+  ## Generic money accessor by column name under known conventions.
+  row.getMoney(row.columnIndex(name), conv)
+
+proc get*(
+    row: Row, name: string, T: typedesc[seq[PgMoney]], scale: int = 2
+): seq[PgMoney] =
+  ## Generic money array accessor by column name with scale forwarding.
+  row.getMoneyArray(row.columnIndex(name), scale)
+
+proc get*(
+    row: Row, name: string, T: typedesc[seq[PgMoney]], conv: PgMoneyConventions
+): seq[PgMoney] =
+  ## Generic money array accessor by column name under known conventions.
+  row.getMoneyArray(row.columnIndex(name), conv)

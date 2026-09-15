@@ -1,6 +1,8 @@
 import std/macros
 
 import async_backend, pg_protocol, pg_connection, pg_types, pg_pool, pg_client
+import pg_connection/types
+import pg_client/transaction
 
 type
   ReplicaFallback* = enum
@@ -168,7 +170,9 @@ proc drainAbandonedAcquire(acquireFut: Future[PgConnection]) {.async.} =
   ## resolves immediately without a connection.
   try:
     let conn = await acquireFut
-    conn.release()
+    # Not `release()`: the pool is taking its own abandoned acquire back, not the
+    # application returning a borrow.
+    conn.releaseReclaimed()
   except CatchableError:
     discard # a failed/cancelled acquire cleans up its own pool accounting
 
@@ -229,8 +233,8 @@ proc acquireRead(
       return (conn, cluster.primary)
     except AsyncTimeoutError:
       asyncSpawn drainAbandonedAcquire(primaryFut)
-      raise newException(
-        PgPoolError,
+      raise newPoolError(
+        pekAcquireTimeout,
         "Pool cluster fallback acquire timeout (replica error: " & replicaErr.msg & ")",
         replicaErr,
       )
@@ -271,24 +275,72 @@ proc writeConnection*(cluster: PgPoolCluster): Future[PooledConnHandle] {.async.
   let conn = await cluster.primary.acquire()
   return PooledConnHandle(conn: conn, pool: cluster.primary)
 
-template withReadConnection*(cluster: PgPoolCluster, conn, body: untyped) =
+macro withReadConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped =
   ## Acquire a read connection (from replica, with optional primary fallback),
   ## execute `body`, then release.
-  block:
-    let (conn, connPool) = await acquireRead(cluster)
-    try:
-      body
-    finally:
-      await connPool.resetSessionAndRelease(conn)
+  ##
+  ## Release runs outside `finally` (a failing `await` in an asyncdispatch
+  ## `finally` masks the body error), so `return` / `break` / `continue`
+  ## escaping the body are rejected at compile time.
+  checkNoBodyEscape(body, "withReadConnection", "the connection release")
+  let clusterSym = genSym(nskLet, "cluster")
+  let connPoolSym = genSym(nskLet, "connPool")
+  let bodyErrSym = genSym(nskVar, "bodyErr")
+  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let releaseCall = quote:
+    `connPoolSym`.resetSessionAndRelease(`conn`)
+  let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
+  result = quote:
+    let `clusterSym` = `cluster`
+    block:
+      let (`conn`, `connPoolSym`) = await acquireRead(`clusterSym`)
+      var `bodyErrSym`: ref CatchableError = nil
+      var `bodyDefectSym`: ref Defect = nil
+      try:
+        `body`
+      except CatchableError as e:
+        `bodyErrSym` = e
+      except Defect as d:
+        `bodyDefectSym` = d
+      `releaseBlock`
+      checkNoBodyEscapePost(
+        block:
+          `body`,
+        "withReadConnection",
+        "the connection release",
+      )
 
-template withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped) =
+macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
-  block:
-    let conn = await cluster.primary.acquire()
-    try:
-      body
-    finally:
-      await cluster.primary.resetSessionAndRelease(conn)
+  ##
+  ## Body `return` / `break` / `continue` escaping to an enclosing loop are
+  ## rejected at compile time (see `withReadConnection`).
+  checkNoBodyEscape(body, "withWriteConnection", "the connection release")
+  let clusterSym = genSym(nskLet, "cluster")
+  let bodyErrSym = genSym(nskVar, "bodyErr")
+  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let releaseCall = quote:
+    `clusterSym`.primary.resetSessionAndRelease(`conn`)
+  let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
+  result = quote:
+    let `clusterSym` = `cluster`
+    block:
+      let `conn` = await `clusterSym`.primary.acquire()
+      var `bodyErrSym`: ref CatchableError = nil
+      var `bodyDefectSym`: ref Defect = nil
+      try:
+        `body`
+      except CatchableError as e:
+        `bodyErrSym` = e
+      except Defect as d:
+        `bodyDefectSym` = d
+      `releaseBlock`
+      checkNoBodyEscapePost(
+        block:
+          `body`,
+        "withWriteConnection",
+        "the connection release",
+      )
 
 macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool.

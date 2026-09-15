@@ -1,12 +1,11 @@
-import std/[unittest, options, tables, math, importutils, net]
+import std/[unittest, options, tables, math, net]
 
 import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_replication, pg_client, pg_connection]
+import ../async_postgres/pg_connection/[simple_query, lifecycle]
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Error type granularity":
   test "invalid SQL via exec raises PgQueryError with SQLSTATE":
@@ -187,6 +186,34 @@ suite "E2E: quoteIdentifier":
   test "identifier with spaces":
     doAssert quoteIdentifier("my table") == "\"my table\""
 
+suite "E2E: quoteLiteral":
+  test "simple literal":
+    doAssert quoteLiteral("foo") == "'foo'"
+
+  test "literal with single quotes":
+    doAssert quoteLiteral("foo'bar") == "'foo''bar'"
+
+  test "empty string":
+    doAssert quoteLiteral("") == "''"
+
+  test "injection-shaped payload":
+    doAssert quoteLiteral("x'); DROP TABLE t; --") == "'x''); DROP TABLE t; --'"
+
+  test "backslash switches to E'' form with the backslash doubled":
+    # Plain quoting would let this escape the literal under
+    # standard_conforming_strings = off. The leading space keeps the E from
+    # merging into a preceding identifier or numeric constant.
+    doAssert quoteLiteral("a\\b") == " E'a\\\\b'"
+    doAssert quoteLiteral("\\'; DROP TABLE t; --") == " E'\\\\''; DROP TABLE t; --'"
+
+  test "NUL byte raises ValueError":
+    var raised = false
+    try:
+      discard quoteLiteral("a\0b")
+    except ValueError:
+      raised = true
+    doAssert raised, "NUL byte should raise ValueError"
+
 suite "E2E: Logical Replication":
   test "identifySystem returns valid info":
     proc t() {.async.} =
@@ -277,7 +304,7 @@ suite "E2E: Logical Replication":
       await replConn.startReplication(
         "test_stream_slot",
         slot.consistentPoint,
-        options = @{"proto_version": "'1'", "publication_names": "'test_repl_pub'"},
+        options = @{"proto_version": "1", "publication_names": "test_repl_pub"},
         callback = cb,
       )
 
@@ -321,7 +348,7 @@ suite "E2E: Logical Replication":
       await replConn.startReplication(
         "test_state_slot",
         slot.consistentPoint,
-        options = @{"proto_version": "'1'", "publication_names": "'test_state_pub'"},
+        options = @{"proto_version": "1", "publication_names": "test_state_pub"},
         callback = cb,
       )
 
@@ -345,14 +372,16 @@ suite "E2E: Logical Replication":
       let cb = makeReplicationCallback:
         discard
 
-      var raised = false
-      try:
-        await replConn.startReplication(
-          "no_such_slot", InvalidLsn, options = @{"proto_version": "'2'"}, callback = cb
-        )
-      except ValueError:
-        raised = true
-      doAssert raised, "proto_version other than 1 should raise ValueError"
+      # The empty value would reach the server as a flag-only option.
+      for bad in ["2", ""]:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot", InvalidLsn, options = @{"proto_version": bad}, callback = cb
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "proto_version other than 1 should raise ValueError: " & bad
 
       # Validation runs before checkReady / state change / wire I/O, so the
       # connection stays usable and the nonexistent slot is never referenced.
@@ -360,6 +389,93 @@ suite "E2E: Logical Replication":
       let info = await replConn.identifySystem()
       doAssert info.systemId.len > 0
 
+      await replConn.close()
+
+    waitFor t()
+
+  test "quoted proto_version raises ValueError (values must be unquoted)":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig())
+
+      let cb = makeReplicationCallback:
+        discard
+
+      # Legacy spellings from the verbatim-options era must fail fast instead
+      # of reaching the server as a doubly-quoted value.
+      for legacy in ["'1'", "\"1\"", " 1 "]:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot",
+            InvalidLsn,
+            options = @{"proto_version": legacy},
+            callback = cb,
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "quoted proto_version should raise ValueError: " & legacy
+
+      doAssert replConn.state == csReady
+      await replConn.close()
+
+    waitFor t()
+
+  test "quoted or empty publication_names raises ValueError":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig())
+
+      let cb = makeReplicationCallback:
+        discard
+
+      # Same verbatim-options legacy spellings as proto_version, plus the
+      # empty value that would reach the server as a flag-only option.
+      for bad in ["'my_pub'", "\"my_pub\"", ""]:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot",
+            InvalidLsn,
+            options = @{"publication_names": bad},
+            callback = cb,
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "bad publication_names should raise ValueError: " & bad
+
+      doAssert replConn.state == csReady
+      await replConn.close()
+
+    waitFor t()
+
+  test "quoted value or NUL on any option key raises ValueError":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig())
+
+      let cb = makeReplicationCallback:
+        discard
+
+      # Keys other than proto_version/publication_names take the same guard:
+      # re-quoting would reach the plugin as a literal including the quotes.
+      let bad = @[
+        ("binary", "'true'"),
+        ("origin", "'none'"),
+        ("streaming", "\"on\""),
+        ("messages", "on\0tail"),
+      ]
+      for (key, value) in bad:
+        var raised = false
+        try:
+          await replConn.startReplication(
+            "no_such_slot",
+            InvalidLsn,
+            options = @{"publication_names": "my_pub", key: value},
+            callback = cb,
+          )
+        except ValueError:
+          raised = true
+        doAssert raised, "bad " & key & " should raise ValueError: " & value
+
+      doAssert replConn.state == csReady
       await replConn.close()
 
     waitFor t()
@@ -435,7 +551,7 @@ suite "E2E: Physical Replication":
       var raised = false
       try:
         await conn.sendCopyData(@[byte('x')])
-      except PgConnectionError:
+      except PgStateError:
         raised = true
       doAssert raised
       await conn.close()
@@ -477,6 +593,77 @@ suite "E2E: Physical Replication":
       discard
         await writer.simpleQuery("SELECT pg_drop_replication_slot('test_phys_e2e')")
       await writer.close()
+
+    waitFor t()
+
+  test "readReplicationSlot returns physical slot info":
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_read_e2e') " &
+          "FROM pg_replication_slots WHERE slot_name = 'test_phys_read_e2e'"
+      )
+      # Without immediately_reserve the slot never reserves WAL: restart_lsn /
+      # restart_tli stay NULL (verified against live PG18). Cover that branch
+      # first, then recreate with reserve=true for the populated branch.
+      discard await writer.simpleQuery(
+        "SELECT pg_create_physical_replication_slot('test_phys_read_e2e')"
+      )
+
+      let replConn = await connectReplication(plainConfig(), rmPhysical)
+      block unreserved:
+        let info = await replConn.readReplicationSlot("test_phys_read_e2e")
+        doAssert info.slotName == "test_phys_read_e2e"
+        doAssert info.slotType == "physical"
+        doAssert info.consistentPoint == InvalidLsn
+        doAssert info.restartTli == 0
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_read_e2e')"
+      )
+      discard await writer.simpleQuery(
+        "SELECT pg_create_physical_replication_slot('test_phys_read_e2e', true)"
+      )
+      block reserved:
+        let info = await replConn.readReplicationSlot("test_phys_read_e2e")
+        doAssert info.slotName == "test_phys_read_e2e"
+        doAssert info.slotType == "physical"
+        doAssert info.consistentPoint != InvalidLsn
+        doAssert info.restartTli >= 1
+      await replConn.close()
+
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_read_e2e')"
+      )
+      await writer.close()
+
+    waitFor t()
+
+  test "readReplicationSlot rejects missing and logical slots":
+    proc t() {.async.} =
+      let replConn = await connectReplication(plainConfig(), rmPhysical)
+
+      var missingRaised = false
+      try:
+        discard await replConn.readReplicationSlot("no_such_phys_slot_xyz")
+      except PgConnectionError:
+        missingRaised = true
+      doAssert missingRaised, "nonexistent slot should raise PgConnectionError"
+
+      # A logical slot exists only while its connection lives; hold it open
+      # and prove the physical-only command rejects it as PgQueryError.
+      let logicalConn = await connectReplication(plainConfig())
+      let logicalSlot = await logicalConn.createReplicationSlot(
+        "test_logical_read_e2e", "pgoutput", temporary = true
+      )
+      var logicalRaised = false
+      try:
+        discard await replConn.readReplicationSlot(logicalSlot.slotName)
+      except PgQueryError:
+        logicalRaised = true
+      doAssert logicalRaised, "logical slot should raise PgQueryError"
+
+      await logicalConn.close()
+      await replConn.close()
 
     waitFor t()
 

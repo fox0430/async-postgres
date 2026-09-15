@@ -130,7 +130,13 @@ when hasChronos:
     ## pkey.key.rsa.n/e, pkey.key.ec.q). TrustAnchorStore.new() only shallow-copies
     ## these structs, and BearSSL only stores a pointer to the anchor array.
     ## The caller MUST keep `result.backing` alive for the lifetime of the TLS session.
-    let items = pemDecode(pemData)
+    let items =
+      try:
+        pemDecode(pemData)
+      except TLSStreamProtocolError as e:
+        # Same config fault as the anchorless case below, and `pemDecode`'s
+        # chronos-specific type must not escape the `PgError` contract.
+        raise newException(PgConfigError, "Invalid PEM encoding in CA data: " & e.msg)
     var anchors: seq[X509TrustAnchor]
     var backing: seq[seq[byte]]
 
@@ -204,6 +210,8 @@ when hasChronos:
       anchors.add(anchor)
 
     if anchors.len == 0:
-      raise newException(PgError, "No valid CA certificates found in PEM data")
+      # An `sslrootcert` PEM with no parsable anchor is a config fault a
+      # reconnect loop can only spin on (see `pg_errors`).
+      raise newException(PgConfigError, "No valid CA certificates found in PEM data")
 
     result = TrustAnchorResult(store: TrustAnchorStore.new(anchors), backing: backing)

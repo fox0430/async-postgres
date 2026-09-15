@@ -1,10 +1,19 @@
 ## Zero-allocation `queryDirect` / `execDirect` compile-time macros that
 ## encode parameters directly into the connection send buffer.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[algorithm, macros, options, sets, tables]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../pg_connection/[types, buffer_io, cache, simple_query]
+import ../pg_types/encoding
 import ./core
+
+import std/importutils
+privateAccess(PgConnection)
 
 proc queryDirectRunImpl*(
     conn: PgConnection,
@@ -22,7 +31,7 @@ proc queryDirectRunImpl*(
   ## a closure allocation (mirrors the ``queryImpl`` / ``query*`` split in
   ## ``query.nim``).
   result = QueryResult()
-  await conn.sendBufMsg()
+  await conn.sendStagedBufMsg()
   var cf = cachedFields
   queryRecvLoop(
     conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cf, colFmts, colOids,
@@ -314,18 +323,46 @@ proc validatePlaceholderArity(
 proc bindPositionalOnce(
     positional: seq[NimNode]
 ): tuple[bindings: NimNode, syms: seq[NimNode]] =
-  ## Emit ``let tmp = <arg>`` for each positional argument so downstream
-  ## fan-out (``paramOidOf`` in the invalidate call plus ``writeParamOid`` /
-  ## ``writeParamFormat`` / ``writeParamValue`` in the Bind/Parse macros)
-  ## substitutes the temporary, not the source expression. Without this a
-  ## side-effecting argument such as ``getNextId()`` would fire 3–4 times per
-  ## direct call.
+  ## Emit ``let tmp = <arg>`` for each positional argument so the downstream
+  ## fan-out (``paramOidOf``, ``addParseDirect``, ``addBindDirect``) substitutes
+  ## the temporary. Without this a side-effecting argument such as
+  ## ``getNextId()`` would fire three times per direct call.
   result.bindings = newStmtList()
   result.syms = newSeq[NimNode](positional.len)
   for i, arg in positional:
     let tmp = genSym(nskLet, "directArg" & $i)
     result.syms[i] = tmp
     result.bindings.add(newLetStmt(tmp, arg))
+
+proc makeDirectPreflight(
+    sqlSym: NimNode, argSyms: seq[NimNode], rfLenNode: NimNode
+): NimNode =
+  ## Emit the Parse/Bind size pre-flight for a direct call, hoisted ahead of
+  ## the send dispatch: `addParseDirect`/`addBindDirect` only check while they
+  ## encode, by which point the buffer is half built. Best-effort, and
+  ## allocation-free via `paramValueLenBound`.
+  let payloadSym = genSym(nskVar, "preflightPayload")
+  let nParams = newLit(argSyms.len)
+  result = newStmtList()
+  result.add newCall(bindSym"validateParseMsg", sqlSym, nParams)
+  result.add newVarStmt(payloadSym, newLit(0'i64))
+  for sym in argSyms:
+    result.add newCall(
+      bindSym"addBindPayload", payloadSym, newCall(bindSym"paramValueLenBound", sym)
+    )
+  result.add newCall(
+    bindSym"checkMsgLenBound64",
+    newCall(
+      bindSym"calcBindMessageLength",
+      newLit(0),
+      bindSym"generatedStmtNameLen",
+      nParams,
+      nParams,
+      payloadSym,
+      rfLenNode,
+    ),
+    newLit("Bind message"),
+  )
 
 proc makeBindDirectCall(
     sendBufNode, portal, stmt, rfNode: NimNode, argList: NimNode
@@ -360,7 +397,11 @@ proc buildDirectSendDispatch(
   ##   * queryDirect's cache-hit path copies `fields`, `colFmts`, `colOids`,
   ##     `resultFormats` out of the CachedStmt for the receive loop.
   ## For `isExec: true` the last four sym args are unused (pass any node).
-  let sendBufNode = newDotExpr(connSym, ident"sendBuf")
+  let sendBufSym = bindSym"sendBuf"
+  let evictForInsertSym = bindSym"evictForInsert"
+  let beginSendBufSym = bindSym"beginSendBuf"
+  let stmtCachingEnabledSym = bindSym"stmtCachingEnabled"
+  let sendBufNode = newCall(sendBufSym, connSym)
 
   proc rfNode(): NimNode =
     if isExec:
@@ -372,8 +413,6 @@ proc buildDirectSendDispatch(
   let hitBlock = newStmtList()
   hitBlock.add quote do:
     `stmtNameSym` = `cachedSym`.name
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
   if not isExec:
     hitBlock.add quote do:
       `cachedFieldsSym` = `cachedSym`.fields
@@ -384,37 +423,30 @@ proc buildDirectSendDispatch(
     sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
   )
   hitBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
+    `sendBufSym`(`connSym`).addExecute("", 0)
+    `sendBufSym`(`connSym`).addSync()
 
   # Cache miss path
   let missBlock = newStmtList()
   missBlock.add quote do:
     `cacheMissSym` = true
     `stmtNameSym` = `connSym`.nextStmtName()
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
-    if `connSym`.stmtCache.len >= `connSym`.stmtCacheCapacity:
-      let evicted = `connSym`.evictStmtCache()
-      `connSym`.sendBuf.addClose(dkStatement, evicted.name)
+    `evictForInsertSym`(`connSym`, `sendBufSym`(`connSym`))
   if not isExec:
     missBlock.add quote do:
       `effectiveRfSym` = @[]
   missBlock.add makeParseDirectCall(sendBufNode, stmtNameSym, sqlSym, argList)
   missBlock.add quote do:
-    `connSym`.sendBuf.addDescribe(dkStatement, `stmtNameSym`)
+    `sendBufSym`(`connSym`).addDescribe(dkStatement, `stmtNameSym`)
   missBlock.add makeBindDirectCall(
     sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
   )
   missBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
+    `sendBufSym`(`connSym`).addExecute("", 0)
+    `sendBufSym`(`connSym`).addSync()
 
   # No-cache path
   let elseBlock = newStmtList()
-  elseBlock.add quote do:
-    `connSym`.sendBuf.setLen(0)
-    `connSym`.flushPendingStmtCloses()
   if not isExec:
     elseBlock.add quote do:
       `effectiveRfSym` = @[]
@@ -424,13 +456,13 @@ proc buildDirectSendDispatch(
   )
   if not isExec:
     elseBlock.add quote do:
-      `connSym`.sendBuf.addDescribe(dkPortal, "")
+      `sendBufSym`(`connSym`).addDescribe(dkPortal, "")
   elseBlock.add quote do:
-    `connSym`.sendBuf.addExecute("", 0)
-    `connSym`.sendBuf.addSync()
+    `sendBufSym`(`connSym`).addExecute("", 0)
+    `sendBufSym`(`connSym`).addSync()
 
-  result = newNimNode(nnkIfStmt)
-  result.add(
+  let dispatch = newNimNode(nnkIfStmt)
+  dispatch.add(
     newNimNode(nnkElifBranch).add(
       quote do:
         `cacheHitSym`,
@@ -438,9 +470,15 @@ proc buildDirectSendDispatch(
     )
   )
   let missCondition = quote:
-    `connSym`.stmtCacheCapacity > 0
-  result.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
-  result.add(newNimNode(nnkElse).add(elseBlock))
+    `stmtCachingEnabledSym`(`connSym`)
+  dispatch.add(newNimNode(nnkElifBranch).add(missCondition, missBlock))
+  dispatch.add(newNimNode(nnkElse).add(elseBlock))
+  # One owner for the buffer reset: the three arms differ in what they emit,
+  # not in needing an emptied buffer with the queued Closes staged in.
+  result = newStmtList()
+  result.add quote do:
+    `beginSendBufSym`(`connSym`)
+  result.add dispatch
 
 proc extractTimeoutArg(
     args: NimNode
@@ -473,6 +511,7 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   ## ``sql`` populated — ``params`` is left empty to preserve the zero-alloc
   ## guarantee.
   result = newStmtList()
+  # Emitted into caller scope; `bindSym` keeps privates reachable w/o imports.
 
   let (positional, timeoutExpr) = extractTimeoutArg(args)
   validatePlaceholderArity(sql, positional.len, "queryDirect")
@@ -488,6 +527,14 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   let effectiveRfSym = genSym(nskVar, "effectiveRf")
   let colFmtsSym = genSym(nskVar, "colFmts")
   let colOidsSym = genSym(nskVar, "colOids")
+
+  # The count is a literal, so the zero-overhead path pays no runtime branch.
+  if positional.len > maxInt16Count:
+    error(
+      "queryDirect/execDirect parameter count " & $positional.len &
+        " exceeds protocol maximum of " & $maxInt16Count,
+      sql,
+    )
 
   result.add quote do:
     let `connSym` = `conn`
@@ -506,9 +553,11 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
 
   let (argBindings, argSyms) = bindPositionalOnce(positional)
   result.add argBindings
-
   result.add buildInvalidateOnOidMismatchStmt(
     connSym, sqlSym, cachedSym, cacheHitSym, argSyms
+  )
+  result.add makeDirectPreflight(
+    sqlSym, argSyms, newCall(bindSym"preflightResultFormatsLen", cachedSym, cacheHitSym)
   )
 
   let argList = newNimNode(nnkBracket)
@@ -530,8 +579,9 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     colOidsSym = colOidsSym,
   )
 
+  let markBusySym = bindSym"markBusy"
   result.add quote do:
-    `connSym`.state = csBusy
+    `markBusySym`(`connSym`)
     queryDirectImpl(
       `connSym`, `sqlSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`, `cacheHitSym`,
       `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, `timeoutSym`,
@@ -543,7 +593,7 @@ proc execDirectRunImpl*(
   ## Inner send + receive loop for execDirect. Returns the command tag and
   ## handles error reporting / cache bookkeeping. Split out so the outer
   ## Impl can apply ``.wait(timeout)`` without an extra closure alloc.
-  await conn.sendBufMsg()
+  await conn.sendStagedBufMsg()
   var commandTag = ""
   execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
   return commandTag
@@ -590,6 +640,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   ## ``sql`` populated — ``params`` is left empty to preserve the zero-alloc
   ## guarantee.
   result = newStmtList()
+  # Emitted into caller scope; `bindSym` keeps privates reachable w/o imports.
 
   let (positional, timeoutExpr) = extractTimeoutArg(args)
   validatePlaceholderArity(sql, positional.len, "execDirect")
@@ -601,6 +652,14 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   let cacheHitSym = genSym(nskVar, "cacheHit")
   let cacheMissSym = genSym(nskVar, "cacheMiss")
   let stmtNameSym = genSym(nskVar, "stmtName")
+
+  # The count is a literal, so the zero-overhead path pays no runtime branch.
+  if positional.len > maxInt16Count:
+    error(
+      "queryDirect/execDirect parameter count " & $positional.len &
+        " exceeds protocol maximum of " & $maxInt16Count,
+      sql,
+    )
 
   result.add quote do:
     let `connSym` = `conn`
@@ -615,10 +674,11 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
 
   let (argBindings, argSyms) = bindPositionalOnce(positional)
   result.add argBindings
-
   result.add buildInvalidateOnOidMismatchStmt(
     connSym, sqlSym, cachedSym, cacheHitSym, argSyms
   )
+  # execDirect discards rows, so its Bind always carries zero result formats.
+  result.add makeDirectPreflight(sqlSym, argSyms, newLit(0))
 
   let argList = newNimNode(nnkBracket)
   for sym in argSyms:
@@ -639,8 +699,9 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     colOidsSym = newEmptyNode(),
   )
 
+  let markBusySym = bindSym"markBusy"
   result.add quote do:
-    `connSym`.state = csBusy
+    `markBusySym`(`connSym`)
     execDirectImpl(
       `connSym`, `sqlSym`, `cacheHitSym`, `cacheMissSym`, `stmtNameSym`, `timeoutSym`
     )

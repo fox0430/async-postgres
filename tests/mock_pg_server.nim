@@ -21,6 +21,8 @@ type AutoKeepaliveResult* =
   tuple[msgType: char, receive: int64, flush: int64, apply: int64]
 
 when hasChronos:
+  import chronos/streams/asyncstream
+
   type
     MockServer* = object
       server: StreamServer
@@ -53,6 +55,64 @@ when hasChronos:
   proc sendBytes*(client: MockClient, data: seq[byte]) {.async.} =
     if data.len > 0:
       discard await client.write(data)
+
+  proc defectWriter*(): AsyncStreamWriter =
+    ## A writer whose write path raises a Defect from its synchronous prelude,
+    ## emulating a transport failure while dispatching SQL (e.g. the
+    ## release-path reset or a transaction ROLLBACK cleanup).
+    result = AsyncStreamWriter(
+      vtbl: AsyncStreamWriterVtbl(
+        atEof: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        stopped: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        running: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        failed: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        write: proc(
+            w: AsyncStreamWriter, pbytes: pointer, nbytes: int
+        ): Future[void] {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          raise newException(AssertionDefect, "boom"),
+        finish: proc(
+            w: AsyncStreamWriter
+        ) {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          discard,
+        close: proc(w: AsyncStreamWriter) {.async: (raises: []).} =
+          discard,
+      )
+    )
+
+  proc countingWriter*(defectAt: int): AsyncStreamWriter =
+    ## A writer that succeeds for the first `defectAt - 1` writes and raises a
+    ## Defect from the `defectAt`-th one on — used to let COMMIT succeed while
+    ## the release-path reset SQL (the next write) fails.
+    let count = new int
+    result = AsyncStreamWriter(
+      vtbl: AsyncStreamWriterVtbl(
+        atEof: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        stopped: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        running: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        failed: proc(w: AsyncStreamWriter): bool {.gcsafe, raises: [].} =
+          false,
+        write: proc(
+            w: AsyncStreamWriter, pbytes: pointer, nbytes: int
+        ): Future[void] {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          inc count[]
+          if count[] >= defectAt:
+            raise newException(AssertionDefect, "boom")
+          discard,
+        finish: proc(
+            w: AsyncStreamWriter
+        ) {.async: (raises: [CancelledError, AsyncStreamError]).} =
+          discard,
+        close: proc(w: AsyncStreamWriter) {.async: (raises: []).} =
+          discard,
+      )
+    )
 
 elif hasAsyncDispatch:
   type
@@ -193,6 +253,23 @@ proc buildDataRowText*(cols: openArray[string]): seq[byte] =
       body.add(byte(ch))
   buildBackendMsg('D', body)
 
+proc buildDataRowOpt*(cols: openArray[string], isNull: openArray[bool]): seq[byte] =
+  ## DataRow ('D') with text-format columns where ``isNull[i]`` emits SQL NULL
+  ## (int32 -1) for column ``i`` instead of ``cols[i]``. Lengths must match.
+  ## Used for commands like READ_REPLICATION_SLOT that report nonexistent or
+  ## unreserved state as NULL columns rather than zero rows.
+  doAssert cols.len == isNull.len, "cols/isNull length mismatch"
+  var body: seq[byte]
+  body.addInt16(int16(cols.len)) # column count
+  for i, c in cols:
+    if isNull[i]:
+      body.addInt32(-1)
+    else:
+      body.addInt32(int32(c.len))
+      for ch in c:
+        body.add(byte(ch))
+  buildBackendMsg('D', body)
+
 proc buildDataRow*(value: string): seq[byte] =
   ## DataRow with a single text-format column.
   buildDataRowText([value])
@@ -207,6 +284,23 @@ proc buildCommandComplete*(tag: string): seq[byte] =
     body.add(byte(c))
   body.add(0'u8)
   buildBackendMsg('C', body)
+
+proc buildEmptyQueryResponse*(): seq[byte] =
+  ## EmptyQueryResponse: paired with a trailing ReadyForQuery, this is what a
+  ## real server answers `stopListening`'s empty stop query with.
+  buildBackendMsg('I', newSeq[byte]())
+
+proc buildNotificationResponse*(pid: int32, channel, payload: string): seq[byte] =
+  ## NotificationResponse: pid, channel cstring, payload cstring.
+  var body: seq[byte]
+  body.addInt32(pid)
+  for c in channel:
+    body.add(byte(c))
+  body.add(0'u8)
+  for c in payload:
+    body.add(byte(c))
+  body.add(0'u8)
+  buildBackendMsg('A', body)
 
 proc buildErrorResponse*(sqlState, message: string): seq[byte] =
   ## Minimal ErrorResponse with severity 'S', sqlstate 'C', message 'M'.

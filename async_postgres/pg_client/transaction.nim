@@ -1,12 +1,20 @@
 ## Transaction- and savepoint-scoping macros: `withTransaction`,
 ## `withSavepoint`, and their deadline-bounded variants.
+##
+## Internal module: not part of the public API. Import the `pg_client` hub
+## instead; what it re-exports is the supported surface (see
+## `tests/api_surface.golden`).
 
 import std/[macros, options]
 
 import ../[async_backend, pg_protocol, pg_connection]
+import ../pg_connection/[types, simple_query]
 import ./core
 
-proc hasReturnStmt*(n: NimNode): bool =
+import std/importutils
+privateAccess(PgConnection)
+
+proc hasReturnStmt(n: NimNode): bool =
   ## Check whether an AST contains a `return` statement (excluding nested
   ## proc/func/method/iterator definitions where `return` is valid).
   if n.kind == nnkReturnStmt:
@@ -21,49 +29,50 @@ proc hasReturnStmt*(n: NimNode): bool =
       return true
   return false
 
-proc hasLoopEscapeStmt*(n: NimNode): bool =
-  ## Check whether an AST contains a `break`/`continue` that would escape the
-  ## body: one not captured by a loop (for `continue`) or by a loop / `block`
-  ## (for `break`) declared *within* the body. Such a statement binds to an
-  ## enclosing loop outside the macro expansion — a caller's `for`/`while`, or
-  ## the macro's own retry `while` — and would silently skip the COMMIT / RELEASE
-  ## that the macro appends after the body. Nested loops, `block`s and proc-like
-  ## definitions capture their own `break`/`continue` and are not flagged.
-  ##
-  ## Note: any `break`/`continue` sitting inside a local `block:` is
-  ## conservatively treated as captured by that block, regardless of whether
-  ## it carries a label. This means an *unlabeled* `break` inside a local
-  ## `block:` will be silently accepted even though it would in fact escape
-  ## to an enclosing loop (Nim binds it to the innermost enclosing loop, not
-  ## to a `block:`). In practice this is rare and the miss goes in the safe
-  ## direction (no spurious compile error), and the `UnnamedBreak` deprecation
-  ## warning from the compiler already flags the construct.
-  proc walk(n: NimNode, inLoop, inBlock: bool): bool =
+proc escapeLabelName(n: NimNode): string =
+  ## Plain name of a `break`/`continue`/`block` label (`nnkIdent` or `nnkSym`).
+  n.strVal
+
+proc hasLoopEscapeStmt(n: NimNode): bool =
+  ## True if a `break`/`continue` in `n` would escape to a loop or `block:`
+  ## outside the body, skipping the trailing COMMIT / RELEASE. Statements
+  ## captured by a body-local loop/`block` are accepted.
+  proc walk(n: NimNode, inLoop, inBlock: bool, labels: var seq[string]): bool =
     case n.kind
     of nnkContinueStmt:
+      # Nim rejects labeled `continue` at compile time; unlabeled ones are
+      # captured by any body-local loop.
       return not inLoop
     of nnkBreakStmt:
+      if n.len > 0 and n[0].kind in {nnkIdent, nnkSym}:
+        return not labels.contains(escapeLabelName(n[0]))
       return not (inLoop or inBlock)
     of nnkProcDef, nnkFuncDef, nnkMethodDef, nnkIteratorDef, nnkLambda, nnkDo,
         nnkConverterDef, nnkTemplateDef, nnkMacroDef:
       return false
     of nnkForStmt, nnkWhileStmt:
       for child in n:
-        if walk(child, inLoop = true, inBlock = inBlock):
+        if walk(child, inLoop = true, inBlock, labels):
           return true
       return false
     of nnkBlockStmt, nnkBlockExpr:
+      let hasLabel = n.len > 0 and n[0].kind in {nnkIdent, nnkSym}
+      if hasLabel:
+        labels.add(escapeLabelName(n[0]))
       for child in n:
-        if walk(child, inLoop = inLoop, inBlock = true):
+        if walk(child, inLoop, inBlock = true, labels):
           return true
+      if hasLabel:
+        labels.setLen(labels.len - 1)
       return false
     else:
       for child in n:
-        if walk(child, inLoop, inBlock):
+        if walk(child, inLoop, inBlock, labels):
           return true
       return false
 
-  return walk(n, inLoop = false, inBlock = false)
+  var labels: seq[string]
+  return walk(n, inLoop = false, inBlock = false, labels)
 
 proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string) =
   ## Reject control flow inside a transaction/savepoint macro `body` that would
@@ -72,6 +81,8 @@ proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string) =
   ## loop. Either would skip the COMMIT/RELEASE the macro appends after `body`,
   ## silently discarding the transaction's work. Shared by every `withTransaction`
   ## / `withSavepoint` variant (conn / pool / cluster).
+  ## A `return` hidden in a template called from the body is invisible to the
+  ## unexpanded walk; `checkNoBodyEscapePost` re-checks after expansion.
   if hasReturnStmt(body):
     error(
       "'return' inside " & macroName & " is not allowed: " & cleanup &
@@ -84,6 +95,31 @@ proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string) =
         " would be skipped",
       body,
     )
+
+macro checkNoBodyEscapePost*(body: typed, macroName, cleanup: string): untyped =
+  ## Static re-check after template expansion: control flow hidden in a
+  ## template is invisible to the unexpanded walk. The caller's wrapping
+  ## `block:` (which would capture unlabeled `break`s) is unwrapped first.
+  let inner =
+    if body.kind == nnkBlockStmt and body.len > 0:
+      body[^1]
+    else:
+      body
+  if hasReturnStmt(inner):
+    error(
+      "'return' inside " & macroName.strVal &
+        " (possibly hidden inside a template) is not allowed: " & cleanup.strVal &
+        " would be skipped",
+      body,
+    )
+  if hasLoopEscapeStmt(inner):
+    error(
+      "'break'/'continue' escaping " & macroName.strVal &
+        " (possibly hidden inside a template) is not allowed: " & cleanup.strVal &
+        " would be skipped",
+      body,
+    )
+  result = newStmtList()
 
 proc bindCleanupSkippedSyms(): tuple[fire, invalidated, failed: NimNode] {.compileTime.} =
   ## Common `bindSym` set for the `onCleanupSkipped` wiring shared by
@@ -122,58 +158,74 @@ proc buildTxBeginAndTimeout*(
 proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   ## Build the shared `onCleanupSkipped`-wired ROLLBACK cleanup used on a failed
   ## attempt by the conn/pool/cluster transaction macros: skip ROLLBACK on an
-  ## invalidated connection or when the server already ended the transaction
-  ## (reporting both via `onCleanupSkipped`), otherwise ROLLBACK with
-  ## `rollbackTimeout` as the per-call timeout and report a swallowed failure.
+  ## invalidated connection (reported as `csrConnInvalidated` via
+  ## `onCleanupSkipped`) or a server-ended transaction (`tsIdle`, silent),
+  ## otherwise ROLLBACK with `rollbackTimeout` and report a swallowed failure.
   ##
-  ## A cancelled ROLLBACK is reported *and* re-raised so cancellation isn't
-  ## swallowed by the generic handler.
+  ## Cancelled and plain-failure ROLLBACKs are both reported and swallowed so
+  ## the enclosing `except` can re-raise the original body error.
   let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
+  let cleanupDefectSym = genSym(nskLet, "cleanupDefect")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
   let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
     bindCleanupSkippedSyms()
   let ckTxRollbackSym = bindSym"ckTxRollback"
   quote:
-    if `connSym`.state != `csReadySym`:
+    if `stateSym`(`connSym`) != `csReadySym`:
       `fireCleanupSkippedSym`(`connSym`, `ckTxRollbackSym`, `csrConnInvalidatedSym`)
-    elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+    elif `txStatusSym`(`connSym`) in {`tsInTxSym`, `tsInFailedSym`}:
       try:
         discard await `connSym`.simpleExec("ROLLBACK", timeout = `rollbackTimeout`)
       except CancelledError as `cleanupCancelSym`:
         `fireCleanupSkippedSym`(
           `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupCancelSym`
         )
-        raise `cleanupCancelSym`
       except CatchableError as `cleanupErrSym`:
         `fireCleanupSkippedSym`(
           `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
         )
+      except Defect as `cleanupDefectSym`:
+        # Same-frame Defect from the ROLLBACK: report and swallow like any
+        # cleanup failure, so it can't replace the body error being re-raised.
+        `fireCleanupSkippedSym`(
+          `connSym`,
+          `ckTxRollbackSym`,
+          `csrCleanupFailedSym`,
+          newException(PgError, `cleanupDefectSym`.msg, `cleanupDefectSym`),
+        )
 
-proc buildSavepointRollbackCleanup*(
+proc buildSavepointRollbackCleanup(
     connSym, spNameSym, rollbackTimeout: NimNode
 ): NimNode =
   ## Build the shared `onCleanupSkipped`-wired ROLLBACK TO SAVEPOINT cleanup used
   ## on a failed body by `withSavepoint` / `withSavepointDeadline`: skip on an
-  ## invalidated connection or when the surrounding transaction has already
-  ## ended (reporting both via `onCleanupSkipped`), otherwise ROLLBACK TO
-  ## SAVEPOINT with `rollbackTimeout` as the per-call timeout and report a
+  ## invalidated connection (reported as `csrConnInvalidated` via
+  ## `onCleanupSkipped`) or an ended surrounding transaction (`tsIdle`, silent),
+  ## otherwise ROLLBACK TO SAVEPOINT with `rollbackTimeout` and report a
   ## swallowed failure. The caller binds `spNameSym` (already quoted via
   ## `quoteIdentifier`) in the surrounding scope.
+  ##
+  ## Cancelled cleanup is swallowed as in `buildRollbackCleanup`.
   let cleanupErrSym = genSym(nskLet, "cleanupErr")
   let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
+  let cleanupDefectSym = genSym(nskLet, "cleanupDefect")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsInTxSym = bindSym"tsInTransaction"
   let tsInFailedSym = bindSym"tsInFailedTransaction"
   let (fireCleanupSkippedSym, csrConnInvalidatedSym, csrCleanupFailedSym) =
     bindCleanupSkippedSyms()
   let ckSpRollbackSym = bindSym"ckSavepointRollback"
   quote:
-    if `connSym`.state != `csReadySym`:
+    if `stateSym`(`connSym`) != `csReadySym`:
       `fireCleanupSkippedSym`(`connSym`, `ckSpRollbackSym`, `csrConnInvalidatedSym`)
-    elif `connSym`.txStatus in {`tsInTxSym`, `tsInFailedSym`}:
+    elif `txStatusSym`(`connSym`) in {`tsInTxSym`, `tsInFailedSym`}:
       try:
         discard await `connSym`.simpleExec(
           "ROLLBACK TO SAVEPOINT " & `spNameSym`, timeout = `rollbackTimeout`
@@ -182,22 +234,36 @@ proc buildSavepointRollbackCleanup*(
         `fireCleanupSkippedSym`(
           `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupCancelSym`
         )
-        raise `cleanupCancelSym`
       except CatchableError as `cleanupErrSym`:
         `fireCleanupSkippedSym`(
           `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
         )
+      except Defect as `cleanupDefectSym`:
+        # Same-frame Defect from the ROLLBACK TO SAVEPOINT: report and swallow
+        # like any cleanup failure, so it can't replace the body error being
+        # re-raised.
+        `fireCleanupSkippedSym`(
+          `connSym`,
+          `ckSpRollbackSym`,
+          `csrCleanupFailedSym`,
+          newException(PgError, `cleanupDefectSym`.msg, `cleanupDefectSym`),
+        )
 
-proc buildDeadlineAwaitAndTimeout*(
+proc buildDeadlineAwaitAndTimeout(
     connSym, bodyFnSym, totalDurSym: NimNode, reason: string, catchableCleanup: NimNode
 ): NimNode =
   ## Build the single-attempt deadline-bounded await + timeout handler shared
   ## by `withTransactionDeadline` and `withSavepointDeadline`. Kicks off
   ## `bodyFnSym()` under `wait(totalDur)`; on `AsyncTimeoutError`, suppresses
-  ## the report if the body completed on the same tick the timer fired,
-  ## otherwise calls `invalidateOnTimeout(reason)` (marks the connection
-  ## `csClosed` and raises `PgTimeoutError`, so control does not return).
+  ## the report if the body completed on the same tick the timer fired.
   ## On any other error, runs `catchableCleanup` then rethrows.
+  ##
+  ## An expired deadline splits on whether the body is still running, because
+  ## the cleanup is owed to whoever holds the connection. A body that could not
+  ## be cancelled (asyncdispatch) still owns it, so the connection is retired
+  ## and the orphan cannot commit a timed-out transaction. A body that unwound
+  ## hands its obligation back to the scope, so `catchableCleanup` runs before
+  ## the timeout is reported.
   ##
   ## `completed()` (finished and *not* failed) is required in the timeout
   ## branch: under chronos, `wait` cancels the inner future before raising
@@ -205,10 +271,17 @@ proc buildDeadlineAwaitAndTimeout*(
   ## state — `finished()` would treat that as "done" and skip the
   ## invalidate-and-raise path. See the matching note in pg_pool's
   ## withTransactionDeadline.
+  ##
+  ## Cancel skips cleanup and invalidates (idempotent; chronos can run both
+  ## timeout arms for one deadline).
   let bodyFutSym = genSym(nskLet, "bodyFut")
   let eSym = genSym(nskLet, "e")
+  let cancelSym = genSym(nskLet, "cancel")
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let retireSym = bindSym"retireOnTimeout"
+  let timeoutCleanup = catchableCleanup.copyNimTree()
   let reasonLit = newStrLitNode(reason)
   quote:
     let `bodyFutSym` = `bodyFnSym`()
@@ -217,8 +290,14 @@ proc buildDeadlineAwaitAndTimeout*(
     except `timeoutErrSym`:
       if `bodyFutSym`.completed():
         discard
+      elif not `bodyFutSym`.finished():
+        `retireSym`(`connSym`, `reasonLit`)
       else:
+        `timeoutCleanup`
         `connSym`.invalidateOnTimeout(`reasonLit`)
+    except CancelledError as `cancelSym`:
+      `invalidateCancelSym`(`connSym`, releaseTransport = false)
+      raise `cancelSym`
     except CatchableError as `eSym`:
       `catchableCleanup`
       raise `eSym`
@@ -244,12 +323,16 @@ proc buildRetryTxLoop*(
   ## attempts it sleeps for `backoffDelayMs`.
   let attemptSym = genSym(nskVar, "attempt")
   let eSym = genSym(nskLet, "e")
+  let dSym = genSym(nskLet, "d")
   let cancelSym = genSym(nskLet, "cancel")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsIdleSym = bindSym"tsIdle"
   let isRetryableSym = bindSym"isRetryableTxError"
   let backoffSym = bindSym"backoffDelayMs"
   let sleepSym = bindSym"sleepMsAsync"
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
 
   let cleanup = buildRollbackCleanup(connSym, txTimeout)
 
@@ -263,21 +346,26 @@ proc buildRetryTxLoop*(
         discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
         break
       except CancelledError as `cancelSym`:
-        # Never retry cancellation; skip the async cleanup (would just re-cancel).
-        # A dirty conn is discarded by the outer release/close path.
+        # Never retry cancel; invalidate and let outer release tear down transport.
+        `invalidateCancelSym`(`connSym`, releaseTransport = false)
         raise `cancelSym`
       except CatchableError as `eSym`:
         `cleanup`
         if `attemptSym` < `retryOptsSym`.maxAttempts and
             `isRetryableSym`(`eSym`, `retryOptsSym`.retryableStates) and
-            `connSym`.state == `csReadySym` and `connSym`.txStatus == `tsIdleSym`:
+            `stateSym`(`connSym`) == `csReadySym` and
+            `txStatusSym`(`connSym`) == `tsIdleSym`:
           await `sleepSym`(`backoffSym`(`retryOptsSym`, `attemptSym`))
           continue
         raise `eSym`
+      except Defect as `dSym`:
+        `cleanup`
+        # Re-raise; deadline variants wrap.
+        raise `dSym`
 
 proc buildRetryDeadlineLoop*(
     bodyFnSym, retryOptsSym, deadlineMomentSym, connForStateCheck: NimNode,
-    timeoutElse, catchableCleanup: NimNode,
+    timeoutStillRunning, timeoutUnwound, catchableCleanup: NimNode,
 ): NimNode =
   ## Build the shared retry loop for the deadline-bounded retry macros
   ## (`withTransactionRetryDeadline`, conn and pool). The caller defines
@@ -285,10 +373,12 @@ proc buildRetryDeadlineLoop*(
   ## one attempt) and binds `retryOptsSym` / `deadlineMomentSym` in scope.
   ##
   ## Per-variant hooks:
-  ## * `timeoutElse`: statements run when `wait` times out and the body future
-  ##   did *not* complete (conn invalidates its connection; pool invalidates the
-  ##   in-flight handle or raises an acquire-timeout). A timeout exhausts the
-  ##   shared budget, so it is never retried.
+  ## * `timeoutStillRunning` / `timeoutUnwound`: statements run when `wait` times
+  ##   out and the body future did *not* complete, split the way
+  ##   `buildDeadlineAwaitAndTimeout` splits it — a body that could not be
+  ##   cancelled still owns the connection, while one that unwound leaves the
+  ##   scope its own ROLLBACK. Never retried either way: a timeout exhausts the
+  ##   shared budget.
   ## * `catchableCleanup`: statements run on a non-timeout error before the retry
   ##   decision (conn rolls back here; pool already did so inside `bodyFn`, so it
   ##   passes an empty list).
@@ -304,6 +394,8 @@ proc buildRetryDeadlineLoop*(
   let cancelSym = genSym(nskLet, "cancel")
   let backoffMsSym = genSym(nskLet, "backoffMs")
   let csReadySym = bindSym"csReady"
+  let stateSym = bindSym"state"
+  let txStatusSym = bindSym"txStatus"
   let tsIdleSym = bindSym"tsIdle"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
@@ -312,15 +404,25 @@ proc buildRetryDeadlineLoop*(
   let isRetryableSym = bindSym"isRetryableTxError"
   let backoffSym = bindSym"backoffDelayMs"
   let sleepSym = bindSym"sleepMsAsync"
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
   let stateCheck =
     if connForStateCheck == nil:
       newLit(true)
     else:
       infix(
-        infix(newDotExpr(connForStateCheck, ident"state"), "==", csReadySym),
+        infix(newCall(stateSym, connForStateCheck), "==", csReadySym),
         "and",
-        infix(newDotExpr(connForStateCheck, ident"txStatus"), "==", tsIdleSym),
+        infix(newCall(txStatusSym, connForStateCheck), "==", tsIdleSym),
       )
+  # Conn variant owns `connForStateCheck` and must abort server-side on cancel;
+  # pool variant handles cancel inside `bodyFn` (which owns the acquired conn),
+  # so the outer loop only re-raises.
+  let cancelHandler =
+    if connForStateCheck == nil:
+      newStmtList()
+    else:
+      quote:
+        `invalidateCancelSym`(`connForStateCheck`, releaseTransport = false)
   quote:
     var `attemptSym` = 0
     while true:
@@ -332,14 +434,18 @@ proc buildRetryDeadlineLoop*(
         await `waitSym`(`bodyFutSym`, `remainingSym`(`deadlineMomentSym`))
         break
       except `timeoutErrSym`:
-        # See withTransactionDeadline for the `completed()` rationale. A timeout
-        # means the shared budget is exhausted: invalidate and raise, never retry.
+        # See withTransactionDeadline for the `completed()` and `finished()`
+        # rationale. A timeout means the shared budget is exhausted: invalidate
+        # and raise, never retry.
         if `bodyFutSym`.completed():
           break
+        elif not `bodyFutSym`.finished():
+          `timeoutStillRunning`
         else:
-          `timeoutElse`
+          `timeoutUnwound`
       except CancelledError as `cancelSym`:
         # Never retry cancellation; skip the catchable cleanup (would re-cancel).
+        `cancelHandler`
         raise `cancelSym`
       except CatchableError as `eSym`:
         `catchableCleanup`
@@ -376,13 +482,15 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## BEGIN, body, and COMMIT together.
   ##
   ## **On per-call timeout** (BEGIN/COMMIT/in-body): `simpleExec` invalidates
-  ## the connection via `invalidateOnTimeout` (marked `csClosed`, server-side
-  ## CancelRequest dispatched) and raises `PgTimeoutError`. ROLLBACK is *not*
-  ## attempted on an already-closed connection — `txStatus` may still read
-  ## `tsInTransaction` (stale, because no `ReadyForQuery` was received), but
-  ## the `csReady` guard prevents a futile cleanup call. Standalone callers
-  ## must `await conn.close()` after this error; pooled connections are
-  ## dropped on release.
+  ## the connection via `invalidateOnTimeout` and raises `PgTimeoutError`.
+  ## Normally that means `csClosed` plus a server-side CancelRequest, since a
+  ## round trip cut short still owes a reply; only a deadline firing after the
+  ## reply was read leaves the wire settled and the connection reusable.
+  ## ROLLBACK is *not* attempted on a retired connection — `txStatus` may still
+  ## read `tsInTransaction` (stale, no `ReadyForQuery` was received), but the
+  ## `csReady` guard prevents a futile cleanup call. Standalone callers must
+  ## `await conn.close()` after this error; pooled connections are dropped on
+  ## release.
   var body: NimNode
   var beginSql: NimNode
   var txTimeout: NimNode
@@ -410,6 +518,9 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
+  let dSym = genSym(nskLet, "d")
+  let cancelSym = genSym(nskLet, "cancel")
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   result = quote:
     let `connSym` = `connExpr`
@@ -418,9 +529,23 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
       `body`
       discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
+    except CancelledError as `cancelSym`:
+      # Skip ROLLBACK on cancel; invalidate instead.
+      `invalidateCancelSym`(`connSym`, releaseTransport = false)
+      raise `cancelSym`
     except CatchableError as `eSym`:
       `bodyCleanup`
       raise `eSym`
+    except Defect as `dSym`:
+      `bodyCleanup`
+      # Re-raise; deadline variants wrap.
+      raise `dSym`
+    checkNoBodyEscapePost(
+      block:
+        `body`,
+      "withTransaction",
+      "COMMIT/ROLLBACK",
+    )
 
 macro withTransactionRetry*(
     conn: PgConnection, retryOpts: RetryOptions, args: varargs[untyped]
@@ -492,20 +617,21 @@ macro withTransactionRetry*(
     `connSym`.checkTxIdle()
     let `retryOptsSym` = `retryOpts`
     `loop`
+    checkNoBodyEscapePost(
+      block:
+        `body`,
+      "withTransactionRetry",
+      "COMMIT/ROLLBACK",
+    )
 
 proc savepointNameExpr(connSym, spName: NimNode): NimNode {.compileTime.} =
-  ## Build the NimNode that produces the savepoint name at runtime.
-  ## When `spName` is non-nil (caller passed an explicit name) it is used as-is.
-  ## Otherwise emits `block: inc conn.portalCounter; "_sp_" & $conn.portalCounter`,
-  ## which guarantees distinct names for unnamed savepoints on the same connection.
+  ## Savepoint name expr: explicit name as-is, else `nextPortalName` for uniqueness.
   if spName != nil:
     spName
   else:
-    let portalCounterSym = ident"portalCounter"
+    let nextPortalNameSym = bindSym"nextPortalName"
     quote:
-      block:
-        inc `connSym`.`portalCounterSym`
-        "_sp_" & $`connSym`.`portalCounterSym`
+      `nextPortalNameSym`(`connSym`, "_sp_")
 
 macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a SAVEPOINT.
@@ -539,8 +665,9 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
     body = args[0]
     spTimeout = bindSym"ZeroDuration"
   of 2:
-    if args[0].kind == nnkStrLit:
+    if args[0].kind in {nnkStrLit, nnkTripleStrLit, nnkRStrLit}:
       # conn.withSavepoint("name"): body
+      # (also raw and triple-quoted string literals)
       spName = args[0]
       body = args[1]
       spTimeout = bindSym"ZeroDuration"
@@ -564,8 +691,11 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
   let eSym = genSym(nskLet, "e")
+  let dSym = genSym(nskLet, "d")
+  let cancelSym = genSym(nskLet, "cancel")
   let spNameSym = genSym(nskLet, "spName")
   let quoteIdentSym = bindSym"quoteIdentifier"
+  let invalidateCancelSym = bindSym"invalidateOnCancel"
 
   let nameExpr = savepointNameExpr(connSym, spName)
   # Skip ROLLBACK TO SAVEPOINT when the outer transaction has already ended or
@@ -583,9 +713,23 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
       discard await `connSym`.simpleExec(
         "RELEASE SAVEPOINT " & `spNameSym`, timeout = `spTimeout`
       )
+    except CancelledError as `cancelSym`:
+      # As withTransaction: skip cleanup, invalidate instead.
+      `invalidateCancelSym`(`connSym`, releaseTransport = false)
+      raise `cancelSym`
     except CatchableError as `eSym`:
       `spCleanup`
       raise `eSym`
+    except Defect as `dSym`:
+      `spCleanup`
+      # Re-raise; deadline sibling wraps.
+      raise `dSym`
+    checkNoBodyEscapePost(
+      block:
+        `body`,
+      "withSavepoint",
+      "RELEASE/ROLLBACK",
+    )
 
 const rollbackGraceMs* {.intdefine: "asyncPgRollbackGraceMs".}: int = 5000
   ## Compile-time override (milliseconds) for the per-call ROLLBACK / RELEASE
@@ -616,11 +760,16 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   ##     await conn.exec(...)
   ##
   ## **On deadline exceeded** (`AsyncTimeoutError` from the outer `wait`):
-  ## the connection is invalidated via `invalidateOnTimeout` (marked `csClosed`
-  ## and a server-side CancelRequest is dispatched), then `PgTimeoutError` is
-  ## raised. ROLLBACK is *not* attempted — the in-flight body operation may
-  ## still own the socket under asyncdispatch, so reusing it would corrupt the
-  ## protocol stream. The closed connection is dropped by the pool on release.
+  ## `PgTimeoutError` is raised and the connection is invalidated. A body that
+  ## unwound (chronos cancellation) is offered a ROLLBACK first, then
+  ## `invalidateOnTimeout`. That ROLLBACK only goes out when the deadline
+  ## expired *between* statements: a cancellation landing inside one is caught
+  ## by that statement, which invalidates the connection itself, so the cleanup
+  ## skips ROLLBACK on a no-longer-`csReady` connection (reported as
+  ## `csrConnInvalidated`). A body that could not be cancelled (asyncdispatch)
+  ## still owns the socket, so `retireOnTimeout` marks `csClosed` with no
+  ## ROLLBACK attempt. Whenever ROLLBACK is skipped the server-side transaction
+  ## lives until the connection closes; the pool drops it on release.
   ##
   ## **Standalone connections (not pooled):** callers using `PgConnection`
   ## directly must `await conn.close()` after this error. Otherwise the
@@ -630,7 +779,10 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   ##
   ## **On other exceptions** from the body: ROLLBACK is issued with
   ## `rollbackGrace` (5s) as a per-call timeout so cleanup runs even
-  ## past the main deadline. A failed ROLLBACK is swallowed.
+  ## past the main deadline. A failed ROLLBACK is swallowed. A `Defect`
+  ## raised by the body is re-raised wrapped in `PgError` (the Defect is
+  ## `parent`): the body runs in a separate async frame, where chronos
+  ## re-raises raw Defects eagerly — only a same-frame Defect is captured.
   ##
   ## Using `return` inside the body is a compile-time error.
   var body: NimNode
@@ -658,6 +810,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "txBodyDeadline")
+  let dSym = genSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
@@ -670,15 +823,26 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     proc `bodyFnSym`(): Future[void] {.async.} =
-      discard await `connSym`.simpleExec(
-        `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
-      )
-      `body`
-      discard await `connSym`.simpleExec(
-        "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
-      )
+      try:
+        discard await `connSym`.simpleExec(
+          `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
+        )
+        `body`
+        discard await `connSym`.simpleExec(
+          "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
+        )
+      except Defect as `dSym`:
+        # Wrap in `PgError` (parent = Defect) so chronos doesn't re-raise the
+        # raw Defect eagerly and the ROLLBACK cleanup runs exactly once.
+        raise newException(PgError, `dSym`.msg, `dSym`)
 
     `awaitAndTimeout`
+    checkNoBodyEscapePost(
+      block:
+        `body`,
+      "withTransactionDeadline",
+      "COMMIT/ROLLBACK",
+    )
 
 macro withTransactionRetryDeadline*(
     conn: PgConnection, retryOpts: RetryOptions, args: varargs[untyped]
@@ -700,15 +864,19 @@ macro withTransactionRetryDeadline*(
   ## deadline. Worst-case wall-clock is therefore `deadline`, not
   ## `maxAttempts * deadline`.
   ##
-  ## **On deadline exceeded** (`AsyncTimeoutError`): the connection is invalidated
-  ## via `invalidateOnTimeout` (`csClosed`) and `PgTimeoutError` is raised — a
-  ## timeout is never retried (the connection is no longer reusable). Standalone
-  ## callers must `await conn.close()` afterwards; see `withTransactionDeadline`.
+  ## **On deadline exceeded** (`AsyncTimeoutError`): `PgTimeoutError` is raised
+  ## and never retried — the attempt that expired owns the shared budget. As in
+  ## `withTransactionDeadline`, a body that unwound gets its ROLLBACK before the
+  ## timeout is reported, and one that could not be cancelled retires the
+  ## connection instead. Standalone callers must `await conn.close()` afterwards.
   ##
   ## **On a retryable body/COMMIT error:** ROLLBACK runs with `rollbackGrace`,
   ## and the transaction is retried if the connection is back to `csReady`/`tsIdle`
   ## and budget remains. **Idempotency:** `body` runs once per attempt; non-database
   ## side effects repeat. Using `return` inside the body is a compile-time error.
+  ##
+  ## **On a `Defect` raised by the body:** re-raised wrapped in `PgError`
+  ## (`parent` = Defect), never retried; see `withTransactionDeadline`.
   var body: NimNode
   var beginSql: NimNode
   var deadline: NimNode
@@ -735,17 +903,29 @@ macro withTransactionRetryDeadline*(
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "txBodyRetryDeadline")
+  let dSym = genSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
-  let timeoutElse = quote:
+  let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
+  let retireSym = bindSym"retireOnTimeout"
+  let timeoutCleanup = bodyCleanup.copyNimTree()
+  # A body that could not be cancelled still holds the connection, so retire it
+  # whatever the wire looks like; one that unwound leaves this scope a ROLLBACK
+  # to run first. Without the split, `invalidateOnTimeout` on a settled wire
+  # hands back a `csReady` connection with the server transaction still open.
+  let timeoutStillRunning = quote:
+    `retireSym`(`connSym`, "withTransactionRetryDeadline exceeded")
+  let timeoutUnwound = quote:
+    `timeoutCleanup`
     `connSym`.invalidateOnTimeout("withTransactionRetryDeadline exceeded")
   let loop = buildRetryDeadlineLoop(
     bodyFnSym,
     retryOptsSym,
     deadlineMomentSym,
     connForStateCheck = connSym,
-    timeoutElse = timeoutElse,
-    catchableCleanup = buildRollbackCleanup(connSym, graceSym),
+    timeoutStillRunning = timeoutStillRunning,
+    timeoutUnwound = timeoutUnwound,
+    catchableCleanup = bodyCleanup,
   )
   result = quote:
     let `connSym` = `connExpr`
@@ -754,15 +934,26 @@ macro withTransactionRetryDeadline*(
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     proc `bodyFnSym`(): Future[void] {.async.} =
-      discard await `connSym`.simpleExec(
-        `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
-      )
-      `body`
-      discard await `connSym`.simpleExec(
-        "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
-      )
+      try:
+        discard await `connSym`.simpleExec(
+          `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
+        )
+        `body`
+        discard await `connSym`.simpleExec(
+          "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
+        )
+      except Defect as `dSym`:
+        # See withTransactionDeadline: wrap the Defect so the ROLLBACK cleanup
+        # runs exactly once.
+        raise newException(PgError, `dSym`.msg, `dSym`)
 
     `loop`
+    checkNoBodyEscapePost(
+      block:
+        `body`,
+      "withTransactionRetryDeadline",
+      "COMMIT/ROLLBACK",
+    )
 
 macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a SAVEPOINT bounded by a single wall-clock deadline
@@ -783,7 +974,9 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   ## timeout) instead of this deadline-bounded variant.
   ##
   ## **On other body exceptions:** ROLLBACK TO SAVEPOINT runs with
-  ## `rollbackGrace` per-call timeout.
+  ## `rollbackGrace` per-call timeout. A `Defect` raised by the body is
+  ## re-raised wrapped in `PgError` (`parent` = Defect); see
+  ## `withTransactionDeadline`.
   ##
   ## **Note:** Unlike `withSavepoint`, the savepoint name is positional and
   ## may be any `string` expression (literal or variable) — disambiguation by
@@ -817,6 +1010,7 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   let totalDurSym = genSym(nskLet, "totalDur")
   let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
   let bodyFnSym = genSym(nskProc, "spBodyDeadline")
+  let dSym = genSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let quoteIdentSym = bindSym"quoteIdentifier"
@@ -833,13 +1027,24 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
     proc `bodyFnSym`(): Future[void] {.async.} =
-      discard await `connSym`.simpleExec(
-        "SAVEPOINT " & `spNameSym`, timeout = `remainingSym`(`deadlineMomentSym`)
-      )
-      `body`
-      discard await `connSym`.simpleExec(
-        "RELEASE SAVEPOINT " & `spNameSym`,
-        timeout = `remainingSym`(`deadlineMomentSym`),
-      )
+      try:
+        discard await `connSym`.simpleExec(
+          "SAVEPOINT " & `spNameSym`, timeout = `remainingSym`(`deadlineMomentSym`)
+        )
+        `body`
+        discard await `connSym`.simpleExec(
+          "RELEASE SAVEPOINT " & `spNameSym`,
+          timeout = `remainingSym`(`deadlineMomentSym`),
+        )
+      except Defect as `dSym`:
+        # See withTransactionDeadline: wrap the Defect so the ROLLBACK TO
+        # SAVEPOINT cleanup runs exactly once.
+        raise newException(PgError, `dSym`.msg, `dSym`)
 
     `awaitAndTimeout`
+    checkNoBodyEscapePost(
+      block:
+        `body`,
+      "withSavepointDeadline",
+      "RELEASE/ROLLBACK",
+    )

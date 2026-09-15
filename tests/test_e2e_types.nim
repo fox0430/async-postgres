@@ -1,4 +1,4 @@
-import std/[unittest, options, math, importutils, net, times]
+import std/[unittest, options, math, net, times]
 
 import ../async_postgres/[async_backend, pg_types]
 
@@ -10,8 +10,6 @@ import ../async_postgres/pg_pool
 import ../async_postgres/pg_connection
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":
@@ -656,10 +654,7 @@ suite "E2E: Binary Format":
         "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid", resultFormat = rfBinary
       )
       doAssert qr.rows.len == 1
-      let data = qr.rows[0].getBytes(0)
-      doAssert data.len == 16
-      doAssert data[0] == 0x55'u8
-      doAssert data[1] == 0x0e'u8
+      doAssert $qr.rows[0].getUuid(0) == "550e8400-e29b-41d4-a716-446655440000"
       await conn.close()
 
     waitFor t()

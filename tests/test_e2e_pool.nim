@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, math, importutils, net]
+import std/[unittest, options, math, importutils, net, deques]
 
 import
   ../async_postgres/[
@@ -8,6 +8,7 @@ import
 
 import e2e_common
 
+privateAccess(PgPool)
 privateAccess(PgConnection)
 
 suite "E2E: Connection Pool":
@@ -453,7 +454,8 @@ suite "E2E: Pool Stress":
         conn2.release()
       except PgError as e:
         raised = true
-        doAssert "timeout" in e.msg.toLowerAscii()
+        doAssert e of PgPoolError
+        doAssert (ref PgPoolError)(e).kind == pekAcquireTimeout
 
       doAssert raised
 
@@ -828,5 +830,380 @@ suite "E2E: queryRowOpt via pool":
       let empty = await pool.queryRowOpt("SELECT 1 WHERE false")
       doAssert empty.isNone
       await pool.close()
+
+    waitFor t()
+
+suite "E2E: withConnection body-exception release":
+  test "withConnection releases the connection when the body raises a Defect":
+    # Regression: a Defect raised in the body must still release the
+    # connection (captured, released, re-raised wrapped in `PgPoolError`
+    # with the Defect as `parent`), not leak a pool slot.
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 3))
+      defer:
+        await pool.close()
+
+      for i in 0 ..< 2:
+        var caught: ref PgPoolError = nil
+        try:
+          pool.withConnection(conn):
+            raise newException(AssertionDefect, "boom")
+        except PgPoolError as e:
+          caught = e
+        doAssert caught != nil, "body Defect must surface as PgPoolError"
+        doAssert caught.parent of Defect,
+          "the original Defect must be preserved as parent"
+        doAssert pool.activeCount == 0
+
+    waitFor t()
+
+  test "withConnection re-raises a body error after a failed release":
+    # Regression: a body exception must survive a failing release (hung
+    # resetQuery bounded by resetQueryTimeout closes the connection instead),
+    # and the pool must not be left with the slot stuck active.
+    proc t() {.async.} =
+      let cfg = initPoolConfig(
+        plainConfig(),
+        minSize = 0,
+        maxSize = 1,
+        resetQuery = "SELECT pg_sleep(30)",
+        resetQueryTimeout = milliseconds(200),
+      )
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      var raised = false
+      try:
+        pool.withConnection(conn):
+          discard await conn.simpleQuery("SELECT 1")
+          raise newException(ValueError, "body error")
+      except ValueError:
+        raised = true
+
+      doAssert raised, "body error must propagate despite release failure"
+      doAssert pool.activeCount == 0
+
+    waitFor t()
+
+  test "withConnection re-raises a body Defect after a failed release":
+    # Regression: a body Defect must survive a failing release (hung resetQuery
+    # bounded by resetQueryTimeout closes the connection instead) and surface as
+    # `PgPoolError` (parent = Defect) — the release error must not shadow it.
+    proc t() {.async.} =
+      let cfg = initPoolConfig(
+        plainConfig(),
+        minSize = 0,
+        maxSize = 1,
+        resetQuery = "SELECT pg_sleep(30)",
+        resetQueryTimeout = milliseconds(200),
+      )
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      var caught: ref PgPoolError = nil
+      try:
+        pool.withConnection(conn):
+          discard await conn.simpleQuery("SELECT 1")
+          raise newException(AssertionDefect, "body defect")
+      except PgPoolError as e:
+        caught = e
+
+      doAssert caught != nil, "body Defect must propagate despite release failure"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert pool.activeCount == 0
+
+    waitFor t()
+
+suite "E2E: withPipeline macro hygiene":
+  test "withPipeline conn binding is scoped to the macro":
+    # Regression: the macro-local `conn` (exposed to the body) must not collide
+    # with a caller-side `conn`, and must not leak past the macro expansion.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          let conn = "caller-side conn"
+          pool.withPipeline(pipe):
+            discard await conn.exec("SELECT 1")
+
+    )
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withPipeline(pipe):
+            discard conn
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withPipeline(pipe):
+            discard await conn.exec("SELECT 1")
+          # A PgConnection-specific access compiles only if the macro-local
+          # `conn` leaked into the caller's scope — `echo conn` would not,
+          # because PgConnection has no `$` even when the leak exists.
+          discard conn.state
+
+    )
+
+suite "E2E: pipelined dispatch inline-param failure":
+  proc badInlineParam(): seq[PgParamInline] =
+    ## A `PgParamInline` with `len` beyond its `overflow` buffer — the inline
+    ## encoder raises a `PgTypeError` mid-dispatch. The Defect arms of the same
+    ## dispatch paths are covered by `test_tx_cleanup_defect`.
+    @[PgParamInline(oid: 0, format: 1, len: int32(PgInlineBufSize + 1), overflow: @[])]
+
+  test "single pipelined op encode failure fails the op future, not the dispatch task":
+    # An encode failure in the single-op dispatch path must fail the op's
+    # future and release the connection, not hang the op / kill the task.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, pipelined = true)
+      )
+      defer:
+        await pool.close()
+
+      var raised = false
+      try:
+        discard await pool.exec("SELECT $1", badInlineParam())
+      except PgTypeError:
+        raised = true
+      doAssert raised, "op future must fail with PgTypeError, not hang"
+      doAssert pool.activeCount == 0, "connection must be released after the raise"
+
+      let res = await pool.query("SELECT 1")
+      doAssert res.rows.len == 1, "pool must remain usable after the raise"
+
+    waitFor t()
+
+  test "non-pipelined inline-param failure releases the connection":
+    # Regression: a raise from the body's synchronous prelude (inline-param
+    # encoding) must release the connection and reach the caller verbatim.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(
+          plainConfig(), minSize = 0, maxSize = 1, healthCheckTimeout = ZeroDuration
+        )
+      )
+      defer:
+        await pool.close()
+
+      var raised = false
+      try:
+        discard await pool.exec("SELECT $1", badInlineParam())
+      except PgTypeError:
+        raised = true
+      doAssert raised, "inline-param failure must propagate to the caller"
+      doAssert pool.activeCount == 0, "connection must be released after the raise"
+
+      let res = await pool.query("SELECT 1")
+      doAssert res.rows.len == 1, "pool must remain usable after the raise"
+
+    waitFor t()
+
+  test "batch op encode failure fails only the offending op":
+    # An encode failure while building a pipeline batch must fail just that op:
+    # its batch-mates never issued the bad statement.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, pipelined = true)
+      )
+      defer:
+        await pool.close()
+
+      # Enqueue both ops synchronously: dispatch runs on the next loop tick, so
+      # both are queued before it drains, pinning the batch (executeBatch) path.
+      # Only that path exercises the per-op isolation, so the pendingOps asserts
+      # are meant to fail loudly if dispatch ever becomes synchronous.
+      let f1 = pool.exec("SELECT $1", badInlineParam())
+      doAssert pool.pendingOps.len == 1
+      let f2 = pool.exec("SELECT $1", @[toPgParamInline(1'i32)])
+      doAssert pool.pendingOps.len == 2,
+        "both ops must be queued before dispatch drains them as a batch"
+      var raised = false
+      try:
+        discard await f1
+      except PgTypeError:
+        raised = true
+      doAssert raised, "the offending op must fail with PgTypeError"
+      discard await f2
+      doAssert pool.activeCount == 0, "connection must be released after the raise"
+
+    waitFor t()
+
+  test "typed-param encode failure fails only the op that carries it":
+    # The Parse/Bind count guard used to fire in the send phase — too late to
+    # tell the ops apart.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, pipelined = true)
+      )
+      defer:
+        await pool.close()
+
+      var tooMany = newSeq[PgParam](32768) # one past the wire Int16 count max
+      for i in 0 ..< tooMany.len:
+        tooMany[i] = toPgParam(1'i32)
+      # see the inline twin above for why both ops are enqueued synchronously
+      let bad = pool.exec("SELECT $1", tooMany)
+      doAssert pool.pendingOps.len == 1
+      let good = pool.query("SELECT 1")
+      doAssert pool.pendingOps.len == 2,
+        "both ops must be queued before dispatch drains them as a batch"
+      var raised = false
+      try:
+        discard await bad
+      except PgTypeError:
+        raised = true
+      doAssert raised, "the op with the bad params must fail with PgTypeError"
+      let res = await good
+      doAssert res.rows.len == 1, "a batch-mate must not inherit the encode failure"
+      doAssert pool.activeCount == 0, "connection must be released after the raise"
+
+    waitFor t()
+
+suite "E2E: pool dispatch Defect arms":
+  ## Every dispatch path wraps a body `Defect` into
+  ## `PgPoolError(pekDefectWrapped)` so the op's future fails instead of
+  ## hanging. A tracer hook is the Defect source: it is the one injection point
+  ## both backends share.
+  const defectSql = "SELECT 1 /* pool defect probe */"
+
+  proc defectTracer(): PgTracer =
+    let tracer = PgTracer()
+    tracer.onQueryStart = proc(
+        conn: PgConnection, data: TraceQueryStartData
+    ): TraceContext {.gcsafe, raises: [].} =
+      if data.sql == defectSql:
+        raise newException(AssertionDefect, "tracer defect")
+    tracer.onPipelineStart = proc(
+        conn: PgConnection, data: TracePipelineStartData
+    ): TraceContext {.gcsafe, raises: [].} =
+      # Only a real batch: the single-op dispatch path skips the pipeline, and
+      # the pool's own bookkeeping never opens one.
+      if data.opCount > 1:
+        raise newException(AssertionDefect, "tracer defect")
+    tracer
+
+  proc defectPool(pipelined: bool): Future[PgPool] =
+    var cfg = plainConfig()
+    cfg.tracer = defectTracer()
+    newPool(
+      initPoolConfig(
+        cfg,
+        minSize = 1,
+        maxSize = 1,
+        healthCheckTimeout = ZeroDuration,
+        pipelined = pipelined,
+      )
+    )
+
+  test "non-pipelined dispatch wraps a body Defect as PgPoolError":
+    proc t() {.async.} =
+      let pool = await defectPool(pipelined = false)
+      defer:
+        await pool.close()
+
+      var kind = pekUnknown
+      try:
+        discard await pool.exec(defectSql)
+      except PgPoolError as e:
+        kind = e.kind
+      doAssert kind == pekDefectWrapped, "body Defect must surface as PgPoolError"
+      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+
+    waitFor t()
+
+  test "single pipelined op wraps a body Defect as PgPoolError":
+    proc t() {.async.} =
+      let pool = await defectPool(pipelined = true)
+      defer:
+        await pool.close()
+
+      var kind = pekUnknown
+      try:
+        discard await pool.exec(defectSql)
+      except PgPoolError as e:
+        kind = e.kind
+      doAssert kind == pekDefectWrapped, "op future must fail, not hang"
+      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+
+    waitFor t()
+
+  test "batch wraps a pipeline Defect as PgPoolError for every op":
+    proc t() {.async.} =
+      let pool = await defectPool(pipelined = true)
+      defer:
+        await pool.close()
+
+      # Both ops queued before dispatch drains them — see the encode-failure
+      # test above for why this pins the executeBatch path.
+      let f1 = pool.exec("SELECT 1")
+      doAssert pool.pendingOps.len == 1
+      let f2 = pool.exec("SELECT 1")
+      doAssert pool.pendingOps.len == 2,
+        "both ops must be queued before dispatch drains them as a batch"
+      var wrapped = 0
+      for f in [f1, f2]:
+        try:
+          discard await f
+        except PgPoolError as e:
+          if e.kind == pekDefectWrapped:
+            inc wrapped
+      doAssert wrapped == 2, "every op in the batch must fail, got " & $wrapped
+      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+
+    waitFor t()
+
+suite "E2E: pool withTransaction body-Defect handling":
+  test "body Defect rolls back, releases, and re-raises":
+    # Regression: a body Defect must still ROLLBACK server-side, release the
+    # pool slot, and surface as `PgPoolError` (parent = Defect).
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 2))
+      defer:
+        await pool.close()
+
+      discard await pool.simpleExec("DROP TABLE IF EXISTS test_pool_tx_defect")
+      discard await pool.simpleExec(
+        "CREATE TABLE test_pool_tx_defect (id serial PRIMARY KEY, val text)"
+      )
+
+      var caught: ref PgPoolError = nil
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        pool.withTransaction(conn):
+          discard await conn.exec(
+            "INSERT INTO test_pool_tx_defect (val) VALUES ($1)", @[toPgParam("leak")]
+          )
+          raise newException(AssertionDefect, "boom")
+        {.pop.}
+      except PgPoolError as e:
+        caught = e
+      doAssert caught != nil, "body Defect must surface as PgPoolError"
+      doAssert caught.parent of Defect,
+        "the original Defect must be preserved as parent"
+      doAssert pool.activeCount == 0, "connection must be released after Defect"
+
+      # ROLLBACK must have run: the insert must not survive the Defect.
+      let leaked =
+        await pool.simpleQuery("SELECT count(*) AS n FROM test_pool_tx_defect")
+      doAssert leaked.len == 1
+      doAssert leaked[0].rows.len == 1
+      doAssert leaked[0].rows[0].getStr(0) == "0", "ROLLBACK must have run"
+
+      # Connection is reusable after the ROLLBACK.
+      let res = await pool.query("SELECT 1")
+      doAssert res.rows.len == 1, "pool must remain usable after Defect"
+
+      discard await pool.simpleExec("DROP TABLE test_pool_tx_defect")
 
     waitFor t()

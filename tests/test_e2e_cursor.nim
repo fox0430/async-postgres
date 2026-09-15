@@ -1,12 +1,10 @@
-import std/[unittest, options, strutils, math, importutils, net]
+import std/[unittest, options, strutils, math, net]
 
 import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection]
 
 import e2e_common
-
-privateAccess(PgConnection)
 
 suite "E2E: Cursor/Streaming":
   test "cursor fetches all rows in chunks":
@@ -21,7 +19,7 @@ suite "E2E: Cursor/Streaming":
 
       let cursor =
         await conn.openCursor("SELECT id FROM test_cursor ORDER BY id", chunkSize = 10)
-      doAssert cursor.fields.len == 1
+      doAssert cursor.fields().len == 1
 
       var allRows: seq[Row]
       while true:
@@ -33,7 +31,7 @@ suite "E2E: Cursor/Streaming":
       doAssert allRows.len == 100
       doAssert allRows[0].getStr(0) == "1"
       doAssert allRows[99].getStr(0) == "100"
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
       doAssert conn.state == csReady
 
       discard await conn.exec("DROP TABLE test_cursor")
@@ -103,7 +101,7 @@ suite "E2E: Cursor/Streaming":
 
       let cursor =
         await conn.openCursor("SELECT id FROM test_cursor_empty", chunkSize = 10)
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
       let chunk = await cursor.fetchNext()
       doAssert chunk.len == 0
       doAssert conn.state == csReady
@@ -127,7 +125,7 @@ suite "E2E: Cursor/Streaming":
       # First fetch gets all rows + marks exhausted
       let chunk1 = await cursor.fetchNext()
       doAssert chunk1.len == 3
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
 
       let chunk2 = await cursor.fetchNext()
       doAssert chunk2.len == 0
@@ -302,7 +300,7 @@ suite "E2E: Cursor/Streaming":
         chunkSize = 5,
         timeout = seconds(5),
       )
-      doAssert cursor.fields.len == 1
+      doAssert cursor.fields().len == 1
 
       var allRows: seq[Row]
       while true:
@@ -312,7 +310,7 @@ suite "E2E: Cursor/Streaming":
         allRows.add(chunk)
 
       doAssert allRows.len == 10
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
       doAssert conn.state == csReady
 
       discard await conn.exec("DROP TABLE test_cursor_timeout")
@@ -397,8 +395,69 @@ suite "E2E: Cursor/Streaming":
       doAssert conn.state == csClosed
       # close() must still mark the cursor exhausted so a stray fetchNext
       # short-circuits instead of writing to the corrupted socket.
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
 
+      await conn.close()
+
+    waitFor t()
+
+  test "concurrent fetchNext raises PgStateError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # Drain the openCursor-buffered first row, then start a slow second fetch
+      # so a concurrent fetchNext can race the in-flight Execute.
+      let cursor = await conn.openCursor(
+        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
+          "FROM generate_series(1, 5) AS v",
+        chunkSize = 1,
+      )
+      let chunk1 = await cursor.fetchNext()
+      doAssert chunk1.len == 1
+      doAssert conn.state == csBusy
+
+      let fetchFut = cursor.fetchNext()
+      await sleepAsync(milliseconds(50))
+      doAssert not fetchFut.finished
+
+      var raised = false
+      try:
+        discard await cursor.fetchNext()
+      except PgStateError:
+        raised = true
+      doAssert raised
+
+      let chunk2 = await fetchFut
+      doAssert chunk2.len == 1
+      await cursor.close()
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "concurrent close during fetchNext raises PgStateError":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let cursor = await conn.openCursor(
+        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
+          "FROM generate_series(1, 5) AS v",
+        chunkSize = 1,
+      )
+      discard await cursor.fetchNext()
+
+      let fetchFut = cursor.fetchNext()
+      await sleepAsync(milliseconds(50))
+      doAssert not fetchFut.finished
+
+      var raised = false
+      try:
+        await cursor.close()
+      except PgStateError:
+        raised = true
+      doAssert raised
+
+      discard await fetchFut
+      await cursor.close()
+      doAssert conn.state == csReady
       await conn.close()
 
     waitFor t()
@@ -416,7 +475,7 @@ suite "E2E: Cursor/Streaming":
 
       let empty = await cursor.fetchNext()
       doAssert empty.len == 0
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
       doAssert conn.state == csReady
       await conn.close()
 
@@ -439,7 +498,7 @@ suite "E2E: Cursor/Streaming":
       # Next fetch should discover exhaustion
       let chunk3 = await cursor.fetchNext()
       doAssert chunk3.len == 0
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
       doAssert conn.state == csReady
       await conn.close()
 
@@ -507,7 +566,7 @@ suite "E2E: Cursor/Streaming":
 
       let empty = await cursor.fetchNext()
       doAssert empty.len == 0
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
 
       discard await conn.exec("DROP TABLE test_cursor_nulls")
       await conn.close()
@@ -520,7 +579,7 @@ suite "E2E: Cursor/Streaming":
       let cursor = await conn.openCursor("SELECT 1 AS x", chunkSize = 10)
       let chunk = await cursor.fetchNext()
       doAssert chunk.len == 1
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
 
       # close on exhausted cursor should be safe no-op
       await cursor.close()
@@ -550,7 +609,7 @@ suite "E2E: Cursor/Streaming":
         resultFormat = rfBinary,
         chunkSize = 10,
       )
-      doAssert cursor.fields.len == 2
+      doAssert cursor.fields().len == 2
 
       var allRows: seq[Row]
       while true:
@@ -563,7 +622,7 @@ suite "E2E: Cursor/Streaming":
       for i in 0 ..< 25:
         doAssert allRows[i].getInt(0) == int32(i + 1)
         doAssert allRows[i].getInt64(1) == (i + 1).int64 * 1000000000'i64
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
       doAssert conn.state == csReady
 
       discard await conn.exec("DROP TABLE test_cursor_bin")

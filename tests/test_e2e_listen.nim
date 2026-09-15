@@ -2,6 +2,8 @@ import std/[unittest, options, strutils, math, deques, importutils, net]
 
 import
   ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
+import
+  ../async_postgres/pg_connection/[types, buffer_io, simple_query, lifecycle, notify]
 
 when hasChronos:
   import std/sets
@@ -48,7 +50,7 @@ suite "E2E: Notice Callback":
       let conn = await connect(plainConfig())
 
       var received: seq[Notice]
-      conn.noticeCallback = proc(n: Notice) {.gcsafe, raises: [].} =
+      conn.onNotice proc(n: Notice) {.gcsafe, raises: [].} =
         received.add(n)
 
       discard await conn.exec("DO $$ BEGIN RAISE NOTICE 'hello from notice'; END $$")
@@ -645,7 +647,7 @@ suite "E2E: Notification Buffering":
 
       listener.notifyMaxQueue = 2
       var cbDropped = 0
-      listener.notifyOverflowCallback = proc(dropped: int) {.gcsafe, raises: [].} =
+      listener.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
         cbDropped += dropped
 
       await listener.listen("buf_cb")
@@ -801,7 +803,7 @@ when hasChronos:
         let listener = await connect(plainConfig())
 
         var reconnected = false
-        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+        listener.onReconnect proc() {.gcsafe, raises: [].} =
           reconnected = true
 
         await listener.listen("reconn_cb")
@@ -894,7 +896,7 @@ when hasChronos:
         listener.listenReconnectMaxBackoff = 1
 
         var reconnected = false
-        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+        listener.onReconnect proc() {.gcsafe, raises: [].} =
           reconnected = true
 
         await listener.listen("reconn_custom")
@@ -924,7 +926,7 @@ when hasChronos:
         listener.listenReconnectMaxBackoff = 1
 
         var reconnected = false
-        listener.reconnectCallback = proc() {.gcsafe, raises: [].} =
+        listener.onReconnect proc() {.gcsafe, raises: [].} =
           reconnected = true
 
         await listener.listen("reconn_unlimited")
@@ -1085,7 +1087,7 @@ when hasChronos:
         raised = false
         try:
           discard await listener.waitNotification()
-        except PgError:
+        except PgStateError:
           raised = true
         doAssert raised
 
@@ -1105,7 +1107,7 @@ when hasChronos:
         var raised = false
         try:
           discard await listener.waitNotification()
-        except PgError:
+        except PgStateError:
           raised = true
         doAssert raised
 

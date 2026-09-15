@@ -4,6 +4,7 @@ import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection]
 import ../async_postgres/pg_client/core
+import ../async_postgres/pg_connection/cache
 
 when hasAsyncDispatch:
   import std/strutils
@@ -1598,6 +1599,105 @@ suite "E2E: Convenience Query Methods":
     let emptyOids: seq[int32] = @[]
     doAssert paramOidsMatch(emptyOids, emptyParams)
 
+  test "queryValue force rfText: cache-hit timestamp stays textual":
+    # Regression: rfAuto cache-hit binary Bind + getStr = raw bytes for
+    # timestamp/date/uuid/... . rfText override keeps the string helpers safe.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT '2000-01-01 00:00:00'::timestamp"
+
+      let v1 = await conn.queryValue(sql)
+      doAssert v1 == "2000-01-01 00:00:00", "first call: " & v1
+      doAssert conn.stmtCache.len == 1
+
+      let v2 = await conn.queryValue(sql)
+      doAssert v2 == "2000-01-01 00:00:00", "cache-hit call: " & v2
+
+      await conn.close()
+
+    waitFor t()
+
+  test "queryValueOpt / queryValueOrDefault / queryColumn force rfText on cache hit":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let uuidSql = "SELECT '00000000-0000-0000-0000-000000000001'::uuid"
+      discard await conn.queryValue(uuidSql)
+      let uOpt = await conn.queryValueOpt(uuidSql)
+      doAssert uOpt.isSome
+      doAssert uOpt.get == "00000000-0000-0000-0000-000000000001"
+
+      let dateSql = "SELECT '2020-06-15'::date"
+      discard await conn.queryValue(dateSql)
+      let d = await conn.queryValueOrDefault(dateSql, default = "fallback")
+      doAssert d == "2020-06-15"
+
+      let jsonSql = "SELECT * FROM (VALUES ('{\"a\":1}'::jsonb), ('[2,3]'::jsonb)) v"
+      discard await conn.queryColumn(jsonSql)
+      let col = await conn.queryColumn(jsonSql)
+      doAssert col == @["{\"a\": 1}", "[2, 3]"]
+
+      await conn.close()
+
+    waitFor t()
+
+  test "typed queryValue[string] / *Opt / *OrDefault force rfText on cache hit":
+    # T=string routes through row.get(0, string) = row.getStr — same gap.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      let tsSql = "SELECT '2000-01-01 00:00:00'::timestamp"
+      discard await conn.queryValue(string, tsSql)
+      let v = await conn.queryValue(string, tsSql)
+      doAssert v == "2000-01-01 00:00:00"
+
+      let uuidSql = "SELECT '00000000-0000-0000-0000-000000000042'::uuid"
+      discard await conn.queryValueOpt(string, uuidSql)
+      let uo = await conn.queryValueOpt(string, uuidSql)
+      doAssert uo == some("00000000-0000-0000-0000-000000000042")
+
+      let dateSql = "SELECT '2021-12-31'::date"
+      discard await conn.queryValueOrDefault(string, dateSql, default = "x")
+      let d1 = await conn.queryValueOrDefault(string, dateSql, default = "x")
+      doAssert d1 == "2021-12-31"
+      # A plain string default binds the non-generic overload (query.nim:385).
+      let d2 = await conn.queryValueOrDefault(dateSql, default = "x")
+      doAssert d2 == "2021-12-31"
+      # Explicit [string] (function-call form; method syntax cannot take an
+      # explicit generic here) pins the inferred-T overload (query.nim:422),
+      # whose `when T is string` branch must force rfText on cache hit too.
+      let d3 = await queryValueOrDefault[string](conn, dateSql, default = "x")
+      doAssert d3 == "2021-12-31"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "getStr raises PgTypeError on binary-format column it cannot render":
+    # Loud-fail: unsupported binary-safe OID must not silently raw-copy.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT '2000-01-01 00:00:00'::timestamp"
+
+      # Seed cache in binary so the rfAuto follow-up hits and replays binary.
+      let rBin = await conn.query(sql, resultFormat = rfBinary)
+      doAssert rBin.rows[0].isBinaryCol(0)
+      doAssert conn.stmtCache.len == 1
+
+      let r = await conn.query(sql) # rfAuto cache hit -> binary
+      doAssert r.rows[0].isBinaryCol(0)
+
+      var raised = false
+      try:
+        discard r.rows[0].getStr(0)
+      except PgTypeError:
+        raised = true
+      doAssert raised, "getStr should reject unsupported binary OID"
+
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: simpleExec":
   test "simpleExec returns command tag":
     proc t() {.async.} =
@@ -1660,6 +1760,26 @@ suite "E2E: queryDirect / execDirect":
       let qr = await conn.queryDirect("SELECT $1::text || ' world'", "hello")
       doAssert qr.rowCount == 1
       doAssert qr.rows[0].getStr(0) == "hello world"
+      await conn.close()
+
+    waitFor t()
+
+  test "queryDirect with seq[byte] bytea param roundtrip":
+    # Regression: writeParamFormat(seq[byte]) formerly declared format=0 (text)
+    # while writeParamValue wrote raw bytes, so PG rejected any payload that
+    # was not valid text-format bytea (0xFF, backslash-prefixed patterns, ...).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let cases: seq[seq[byte]] = @[
+        @[0x00'u8, 0xDE, 0xAD, 0xBE, 0xEF, 0xFF],
+        @[0x5C'u8, 0x5C], # backslash escapes
+        @[0x5C'u8, 0x78, 0x61, 0x62], # \xab pattern
+        @[], # empty
+      ]
+      for input in cases:
+        let qr = await conn.queryDirect("SELECT $1::bytea", input)
+        doAssert qr.rowCount == 1
+        doAssert qr.rows[0].getBytes(0) == input
       await conn.close()
 
     waitFor t()
