@@ -10,7 +10,7 @@ import ../async_postgres/pg_connection/[buffer_io, types, simple_query, lifecycl
 import ../async_postgres/pg_connection/cache {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_client/pipeline {.all.}
-import ../async_postgres/pg_client/[core, query, exec, direct]
+import ../async_postgres/pg_client/[core, query, exec, direct, cursor]
 
 import mock_pg_server
 
@@ -5380,3 +5380,13 @@ suite "Aborted pipeline send phase keeps evicted statements closable":
     check "SELECT old" notin conn.stmtCache
     # Staged, not queued: the next build takes staged names back onto the queue.
     check conn.stagedStmtCloses == @["_sc_1"]
+
+suite "Cursor handle fields are read-only":
+  test "external writes to handle fields do not compile":
+    # Flipping `exhausted` would skip the portal Close (server-side leak) and
+    # swapping `conn` would desynchronise the wire; reads keep working
+    # through the accessors, so only writes are rejected.
+    var c: Cursor
+    check not compiles(c.exhausted = true)
+    check not compiles(c.conn = nil)
+    check not compiles(c.fields = newSeq[FieldDescription](0))

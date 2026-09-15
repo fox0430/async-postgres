@@ -16,14 +16,16 @@ privateAccess(PgConnection)
 
 type Cursor* = ref object
   ## A server-side portal for incremental row fetching via `declareCursor`/`fetch`.
-  conn*: PgConnection
+  ## Handle fields are private; use the `conn` / `fields` / `exhausted`
+  ## accessors for read-only access.
+  conn: PgConnection
   portalName: string
   chunkSize: int32
   timeout: Duration
-  fields*: seq[FieldDescription]
+  fields: seq[FieldDescription]
   colFormats: seq[int16]
   colTypeOids: seq[int32]
-  exhausted*: bool
+  exhausted: bool
   bufferedData: RowData
   bufferedCount: int32
   inFlight: bool
@@ -34,6 +36,18 @@ type Cursor* = ref object
 proc columnIndex*(cursor: Cursor, name: string): int =
   ## Find the index of a column by name in a cursor.
   cursor.fields.columnIndex(name)
+
+func conn*(cursor: Cursor): PgConnection {.inline.} =
+  ## The connection this cursor was opened on.
+  cursor.conn
+
+func fields*(cursor: Cursor): seq[FieldDescription] {.inline.} =
+  ## Column metadata from the cursor's RowDescription (a snapshot copy).
+  cursor.fields
+
+func exhausted*(cursor: Cursor): bool {.inline.} =
+  ## True once the portal reported completion and no rows remain.
+  cursor.exhausted
 
 proc raiseConcurrentCursorOp(conn: PgConnection) {.noreturn.} =
   ## Same contract text as ``checkReady``: concurrent use → ``PgStateError``.
