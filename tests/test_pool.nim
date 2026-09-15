@@ -205,6 +205,50 @@ suite "initPoolConfig":
         ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = milliseconds(-1)
       )
 
+  test "validation: negative durations are rejected":
+    # Negative durations previously slipped through and silently changed
+    # behavior (e.g. a negative acquireTimeout disabled the deadline, and a
+    # negative maintenanceInterval turned the loop into a hot spin).
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), idleTimeout = milliseconds(-1)
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), maxLifetime = milliseconds(-1)
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432),
+        maintenanceInterval = milliseconds(-1),
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), pingTimeout = milliseconds(-1)
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), acquireTimeout = milliseconds(-1)
+      )
+
+  test "validation: maxPipelineSize < 0":
+    expect(ValueError):
+      discard
+        initPoolConfig(ConnConfig(host: "localhost", port: 5432), maxPipelineSize = -1)
+
+  test "newPool re-validates a directly constructed PoolConfig":
+    # Direct construction skips `initPoolConfig`; the shared validator runs
+    # again in `newPool`, before any connect attempt.
+    expect(ValueError):
+      discard waitFor newPool(
+        PoolConfig(
+          connConfig: ConnConfig(host: "127.0.0.1", port: 1),
+          minSize: 0,
+          maxSize: 1,
+          pingTimeout: milliseconds(-1),
+        )
+      )
+
   test "tlsHealthCheckTimeout custom override":
     let cfg = initPoolConfig(
       ConnConfig(host: "localhost", port: 5432),
