@@ -12,7 +12,7 @@
 ##   defer: await conn.close()
 ##   let slot = await conn.createReplicationSlot("my_slot", "pgoutput", temporary = true)
 ##   await conn.startReplication("my_slot", slot.consistentPoint,
-##       options = {"proto_version": "'1'", "publication_names": "'my_pub'"},
+##       options = {"proto_version": "1", "publication_names": "my_pub"},
 ##       callback = myCallback)
 
 import std/[strutils, tables, times, options]
@@ -255,22 +255,22 @@ proc parseLsn*(s: string): Lsn =
   ## `parseTimelineId`.
   let parts = s.split('/')
   if parts.len != 2:
-    raise newException(PgTypeError, "Invalid LSN format: " & s)
+    raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
   # fromHex[uint64] returns 0 for an empty string instead of raising, so an
   # empty half would silently produce a zero LSN — reject explicitly.
   if parts[0].len == 0 or parts[1].len == 0:
-    raise newException(PgTypeError, "Invalid LSN format: " & s)
+    raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
   # fromHex[uint64] wraps silently past 16 significant hex digits instead of
   # raising; compare significant digits, not raw length, so a zero-padded but
   # in-range half isn't rejected.
   if stripLeadingZeros(parts[0]).len > 16 or stripLeadingZeros(parts[1]).len > 16:
-    raise newException(PgTypeError, "Invalid LSN format: " & s)
-  pgTypeErrorOnValueError("Invalid LSN format: " & s):
+    raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
+  pgTypeErrorOnValueError("Invalid LSN format (len=" & $s.len & ")"):
     let hi = fromHex[uint64](parts[0])
     let lo = fromHex[uint64](parts[1])
     # A half > 32 bits would have its excess bits silently dropped by `hi shl 32` below.
     if hi > 0xFFFF_FFFF'u64 or lo > 0xFFFF_FFFF'u64:
-      raise newException(PgTypeError, "Invalid LSN format: " & s)
+      raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
     Lsn((hi shl 32) or lo)
 
 # PostgreSQL timestamp helpers
@@ -572,11 +572,14 @@ proc parseTimelineId*(s: string): int32 =
   ## `PgTypeError` so callers stay under the ``except PgError`` contract.
   ## Range-check before narrowing: a bare ``parseInt(...).int32`` would raise
   ## ``RangeDefect`` (a Defect, outside ``PgError``) on an out-of-range value.
-  pgTypeErrorOnValueError("IDENTIFY_SYSTEM returned a non-numeric timeline: " & s):
+  pgTypeErrorOnValueError(
+    "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $s.len & ")"
+  ):
     let t = parseInt(s)
     if t < int(int32.low) or t > int(int32.high):
       raise newException(
-        PgTypeError, "IDENTIFY_SYSTEM returned a timeline out of int32 range: " & s
+        PgTypeError,
+        "IDENTIFY_SYSTEM returned a timeline out of int32 range (len=" & $s.len & ")",
       )
     t.int32
 
@@ -625,6 +628,17 @@ proc decodeCreateSlotRow(qr: QueryResult): ReplicationSlotInfo =
     result.snapshotName = row.getStr(2)
   if qr.fields.len > 3 and not row.isNull(3):
     result.outputPlugin = row.getStr(3)
+
+proc quoteReplLiteral(s: string): string =
+  ## Single-quote a walsender option value. Unlike `quoteLiteral` this never
+  ## emits the ``E'...'`` form: the replication scanner has no such rule and
+  ## treats ``\`` literally, so doubling ``'`` is the whole escape.
+  ##
+  ## Raises ``ValueError`` for an embedded NUL byte, like `quoteLiteral`: the
+  ## wire protocol terminates the query string there.
+  if '\0' in s:
+    raise newException(ValueError, "Replication option value contains a NUL byte")
+  "'" & s.replace("'", "''") & "'"
 
 proc createReplicationSlot*(
     conn: PgConnection,
@@ -1162,13 +1176,21 @@ proc startReplication*(
   ##
   ## Errors poison connection. Track LSN for resume. A failing auto-reply
   ## propagates too, and the callback is *not* invoked for that keepalive.
-  ## Options appended verbatim —
-  ## quote untrusted input. Raises ``PgConnectionError`` (closed) /
-  ## ``PgStateError`` (busy) unless ``csReady``, and ``ValueError`` for a
-  ## ``proto_version`` other than ``1`` in ``options``: the bundled pgoutput
-  ## decoder supports v1 only. ``publication_names`` without an explicit
-  ## ``proto_version`` adds ``proto_version = '1'`` to the generated command, so
-  ## a server-side default bump cannot outrun that decoder.
+  ## Option values are passed unquoted and single-quoted when building the
+  ## command (keys stay identifier-validated). An empty value means a
+  ## flag-only option (``binary`` rather than ``binary ''``). Raises
+  ## ``PgConnectionError`` (closed) / ``PgStateError`` (busy) unless
+  ## ``csReady``, and ``ValueError`` for a ``proto_version`` other than ``1``
+  ## in ``options`` (the value must be the unquoted string ``"1"``, an empty
+  ## one included): the bundled pgoutput decoder supports v1 only. Any value already wrapped in
+  ## quotes raises ``ValueError`` too, whatever its key, so the verbatim-options
+  ## spelling cannot silently name a publication ``'my_pub'`` or send a
+  ## thrice-quoted ``binary`` flag the plugin rejects mid-stream. An empty
+  ## ``publication_names`` and a value containing a NUL byte are rejected the
+  ## same way.
+  ## ``publication_names`` without an explicit ``proto_version`` adds
+  ## ``proto_version '1'`` to the generated command, so a server-side default
+  ## bump cannot outrun that decoder.
   ##
   ## ``statusInterval`` (``ZeroDuration`` = off) sends a proactive Standby Status
   ## Update at least that often — receive = highest received, flush/apply =
@@ -1186,17 +1208,40 @@ proc startReplication*(
   var hasProtoVersion = false
   var hasPublicationNames = false
   for (k, v) in options:
+    # Values are quoted below, so one that already arrives wrapped in quotes
+    # would reach the server including them. Reject the pre-quoting spelling
+    # rather than sending a value the plugin rejects mid-stream.
+    if v.len >= 2 and v[0] in {'\'', '"'} and v[^1] == v[0]:
+      raise newException(
+        ValueError,
+        "Quoted value " & v & " for replication option " & k &
+          ": the value would be quoted again and reach the server including" &
+          " the quotes (pass option values unquoted, e.g. \"my_pub\")",
+      )
     if k.cmpIgnoreCase("proto_version") == 0:
       hasProtoVersion = true
-      let pv = v.strip(chars = {'\'', '"', ' ', '\t'})
-      if pv.len > 0 and pv != "1":
+      if v.len == 0:
+        raise newException(
+          ValueError,
+          "Empty proto_version: an empty value is sent as a flag-only option," &
+            " which pgoutput rejects (pass the unquoted value \"1\")",
+        )
+      if v != "1":
         raise newException(
           ValueError,
           "Unsupported pgoutput proto_version " & v &
-            ": the bundled decoder supports proto_version 1 only",
+            ": the bundled decoder supports proto_version 1 only" &
+            " (pass option values unquoted, e.g. \"1\")",
         )
     elif k.cmpIgnoreCase("publication_names") == 0:
       hasPublicationNames = true
+      if v.len == 0:
+        raise newException(
+          ValueError,
+          "Empty publication_names: an empty value is sent as a flag-only" &
+            " option, which pgoutput rejects (pass one or more publication" &
+            " names, e.g. \"my_pub\")",
+        )
 
   conn.checkReady()
 
@@ -1204,9 +1249,10 @@ proc startReplication*(
   # future server-side default bump past 1.
   var effectiveOptions = options
   if hasPublicationNames and not hasProtoVersion:
-    effectiveOptions.add(("proto_version", "'1'"))
+    effectiveOptions.add(("proto_version", "1"))
 
-  # Build START_REPLICATION command
+  # Build START_REPLICATION command. Values are single-quoted so untrusted
+  # input cannot break out of the option list via the simple-query protocol.
   var sql =
     "START_REPLICATION SLOT " & quoteIdentifier(slotName) & " LOGICAL " & $startLsn
   if effectiveOptions.len > 0:
@@ -1223,7 +1269,7 @@ proc startReplication*(
             raise newException(ValueError, "Invalid replication option key: " & k)
       sql.add(k)
       if v.len > 0:
-        sql.add(" " & v)
+        sql.add(" " & quoteReplLiteral(v))
     sql.add(")")
 
   let msg = encodeQuery(sql)

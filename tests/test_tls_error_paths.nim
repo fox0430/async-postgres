@@ -120,8 +120,9 @@ suite "TLS error paths: client cert/key/CA loading":
     check "Could not connect to any host" notin msg
 
   test "a lone sslcert through connectToHost is a config fault":
-    # `connectToHost` skips the connect-time chokepoint, so `negotiateSSL`'s
-    # own re-check is what a direct caller sees; it must raise the same type.
+    # `connectToHost` validates the pairing at entry, so a direct caller sees
+    # the same `PgConfigError` as `connect`; `negotiateSSL`'s defensive
+    # re-check stays for direct callers of that proc.
     proc runTest(): Future[bool] {.async.} =
       let ms = startMockServer()
       startSslProbe(ms, closeAfterReply = false)
@@ -137,6 +138,44 @@ suite "TLS error paths: client cert/key/CA loading":
           configFault = true
       finally:
         await closeServer(ms)
+      configFault
+
+    check waitFor(runTest())
+
+  test "sslAllow with client certs is rejected by connectToHost":
+    # The pairing check runs before the sslAllow branch rewrites sslMode to
+    # sslDisable; without it a successful plaintext attempt would silently
+    # drop the certs. No server is needed: the check precedes any dial.
+    proc runTest(): Future[bool] {.async.} =
+      var cfg = testConfig(5432, sslAllow)
+      cfg.sslCert = readCert("server.crt")
+      cfg.sslKey = readCert("server.key")
+      var configFault = false
+      try:
+        let conn = await connectToHost(cfg, HostEntry(host: "127.0.0.1", port: 5432))
+        await conn.close()
+      except PgConfigError:
+        configFault = true
+      configFault
+
+    check waitFor(runTest())
+
+  test "slash hostaddr through connectToHost is a config fault":
+    # `hostaddr` is a numeric IP. A '/' value would otherwise select
+    # AF_UNIX via `dialAddr` and skip TLS entirely. The check runs before
+    # any dial, so no server is needed; a directly constructed `HostEntry`
+    # must fail the same way as a parsed DSN.
+    proc runTest(): Future[bool] {.async.} =
+      var cfg = testConfig(5432, sslRequire)
+      var configFault = false
+      try:
+        let conn = await connectToHost(
+          cfg,
+          HostEntry(host: "db.example.com", hostaddr: "/var/run/postgresql", port: 5432),
+        )
+        await conn.close()
+      except PgConfigError:
+        configFault = true
       configFault
 
     check waitFor(runTest())

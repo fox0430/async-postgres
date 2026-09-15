@@ -144,7 +144,7 @@ proc main() {.async.} =
       await replConn.startReplication(
         slotName,
         resumeLsn,
-        options = @{"proto_version": "'1'", "publication_names": "'test_pub'"},
+        options = @{"proto_version": "1", "publication_names": "test_pub"},
         callback = cb,
       )
     except CatchableError as e:

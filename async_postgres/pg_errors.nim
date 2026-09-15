@@ -23,6 +23,9 @@ type
     ## Raised when the caller's data cannot be carried by the wire format: a
     ## value that will not convert to or from the requested Nim type, or one the
     ## protocol cannot encode (count past Int16, length past Int32, embedded NUL).
+    ##
+    ## Decode-failure messages report input lengths/offsets only, never the
+    ## content (cells may hold PII or secrets).
 
   PgMessageTooLargeError* = object of PgTypeError
     ## An assembled protocol message exceeds the wire format's Int32 length.

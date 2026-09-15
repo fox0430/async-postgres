@@ -8,14 +8,14 @@ import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_types/encoding
 import ../async_postgres/pg_connection/[buffer_io, types, simple_query, lifecycle]
 import ../async_postgres/pg_connection/cache {.all.}
-import ../async_postgres/pg_connection/types {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_client/pipeline {.all.}
-import ../async_postgres/pg_client/[core, query, exec, direct]
+import ../async_postgres/pg_client/[core, query, exec, direct, cursor]
 
 import mock_pg_server
 
-var testTracerCloseCnt {.global.}: int
+when hasChronos:
+  var testTracerCloseCnt {.global.}: int
 
 privateAccess(PgPool)
 privateAccess(PgConnection)
@@ -203,6 +203,50 @@ suite "initPoolConfig":
     expect(ValueError):
       discard initPoolConfig(
         ConnConfig(host: "localhost", port: 5432), resetQueryTimeout = milliseconds(-1)
+      )
+
+  test "validation: negative durations are rejected":
+    # Negative durations previously slipped through and silently changed
+    # behavior (e.g. a negative acquireTimeout disabled the deadline, and a
+    # negative maintenanceInterval turned the loop into a hot spin).
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), idleTimeout = milliseconds(-1)
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), maxLifetime = milliseconds(-1)
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432),
+        maintenanceInterval = milliseconds(-1),
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), pingTimeout = milliseconds(-1)
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), acquireTimeout = milliseconds(-1)
+      )
+
+  test "validation: maxPipelineSize < 0":
+    expect(ValueError):
+      discard
+        initPoolConfig(ConnConfig(host: "localhost", port: 5432), maxPipelineSize = -1)
+
+  test "newPool re-validates a directly constructed PoolConfig":
+    # Direct construction skips `initPoolConfig`; the shared validator runs
+    # again in `newPool`, before any connect attempt.
+    expect(ValueError):
+      discard waitFor newPool(
+        PoolConfig(
+          connConfig: ConnConfig(host: "127.0.0.1", port: 1),
+          minSize: 0,
+          maxSize: 1,
+          pingTimeout: milliseconds(-1),
+        )
       )
 
   test "tlsHealthCheckTimeout custom override":
@@ -5336,3 +5380,13 @@ suite "Aborted pipeline send phase keeps evicted statements closable":
     check "SELECT old" notin conn.stmtCache
     # Staged, not queued: the next build takes staged names back onto the queue.
     check conn.stagedStmtCloses == @["_sc_1"]
+
+suite "Cursor handle fields are read-only":
+  test "external writes to handle fields do not compile":
+    # Flipping `exhausted` would skip the portal Close (server-side leak) and
+    # swapping `conn` would desynchronise the wire; reads keep working
+    # through the accessors, so only writes are rejected.
+    var c: Cursor
+    check not compiles(c.exhausted = true)
+    check not compiles(c.conn = nil)
+    check not compiles(c.fields = newSeq[FieldDescription](0))

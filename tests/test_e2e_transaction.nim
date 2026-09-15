@@ -7,7 +7,7 @@ import
   ]
 
 import ../async_postgres/pg_client/transaction {.all.}
-import ../async_postgres/pg_connection/[simple_query, lifecycle, notify, buffer_io]
+import ../async_postgres/pg_connection/[simple_query, lifecycle]
 
 import e2e_common
 
@@ -149,11 +149,13 @@ suite "E2E: Transaction":
 
       var caught = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransaction:
           discard await conn.exec(
             "INSERT INTO test_tx_rb_defect (val) VALUES ($1)", @[toPgParam("leak")]
           )
           raise newException(AssertionDefect, "boom")
+        {.pop.}
       except Defect:
         caught = true
 
@@ -260,6 +262,7 @@ suite "E2E: Transaction":
       var attempts = 0
       var caught = false
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionRetry(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false)
         ):
@@ -268,6 +271,7 @@ suite "E2E: Transaction":
             "INSERT INTO test_tx_retry_defect (val) VALUES ($1)", @[toPgParam("leak")]
           )
           raise newException(AssertionDefect, "retry boom")
+        {.pop.}
       except Defect:
         caught = true
 
@@ -878,11 +882,13 @@ suite "E2E: Transaction":
           "INSERT INTO test_sp_defect (val) VALUES ($1)", @[toPgParam("outer")]
         )
         try:
+          {.push warning[UnreachableCode]: off.} # body always raises
           conn.withSavepoint:
             discard await conn.exec(
               "INSERT INTO test_sp_defect (val) VALUES ($1)", @[toPgParam("inner")]
             )
             raise newException(AssertionDefect, "sp boom")
+          {.pop.}
         except Defect:
           caught = true
 
@@ -1422,11 +1428,13 @@ suite "E2E: Deadline-bounded Transaction":
 
       var caught: ref PgError = nil
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionDeadline(seconds(5)):
           discard await conn.exec(
             "INSERT INTO test_txd_defect (val) VALUES ($1)", @[toPgParam("leak")]
           )
           raise newException(AssertionDefect, "deadline boom")
+        {.pop.}
       except PgError as e:
         caught = e
 
@@ -1454,9 +1462,11 @@ suite "E2E: Deadline-bounded Transaction":
 
       var caught: ref PgError = nil
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionDeadline(seconds(5)):
           conn.state = csClosed
           raise newException(AssertionDefect, "txd cleanup once boom")
+        {.pop.}
       except PgError as e:
         caught = e
 
@@ -1616,11 +1626,13 @@ suite "E2E: Deadline-bounded Transaction":
           "INSERT INTO test_spd_defect (val) VALUES ($1)", @[toPgParam("outer")]
         )
         try:
+          {.push warning[UnreachableCode]: off.} # body always raises
           conn.withSavepointDeadline("sp1", seconds(5)):
             discard await conn.exec(
               "INSERT INTO test_spd_defect (val) VALUES ($1)", @[toPgParam("inner")]
             )
             raise newException(AssertionDefect, "spd boom")
+          {.pop.}
         except PgError as e:
           caught = e
 
@@ -1652,9 +1664,11 @@ suite "E2E: Deadline-bounded Transaction":
       try:
         conn.withTransaction:
           try:
+            {.push warning[UnreachableCode]: off.} # body always raises
             conn.withSavepointDeadline("sp1", seconds(5)):
               conn.state = csClosed
               raise newException(AssertionDefect, "spd cleanup once boom")
+            {.pop.}
           except PgError as e:
             caught = e
       except PgError:
@@ -1713,11 +1727,13 @@ suite "E2E: Deadline-bounded Transaction":
 
       var caught: ref PgPoolError = nil
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransactionDeadline(conn, seconds(5)):
           discard await conn.exec(
             "INSERT INTO test_ptxd_defect (val) VALUES ($1)", @[toPgParam("leak")]
           )
           raise newException(AssertionDefect, "pool deadline boom")
+        {.pop.}
       except PgPoolError as e:
         caught = e
 
@@ -1969,6 +1985,7 @@ suite "E2E: Deadline-bounded Transaction":
       var attempts = 0
       var caught: ref PgError = nil
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionRetryDeadline(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), seconds(10)
         ):
@@ -1977,6 +1994,7 @@ suite "E2E: Deadline-bounded Transaction":
             "INSERT INTO test_trd_defect (val) VALUES ($1)", @[toPgParam("leak")]
           )
           raise newException(AssertionDefect, "trd boom")
+        {.pop.}
       except PgError as e:
         caught = e
 
@@ -2006,12 +2024,14 @@ suite "E2E: Deadline-bounded Transaction":
       var attempts = 0
       var caught: ref PgError = nil
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         conn.withTransactionRetryDeadline(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), seconds(10)
         ):
           inc attempts
           conn.state = csClosed
           raise newException(AssertionDefect, "trd cleanup once boom")
+        {.pop.}
       except PgError as e:
         caught = e
 
@@ -2117,6 +2137,7 @@ suite "E2E: Deadline-bounded Transaction":
       var attempts = 0
       var caught: ref PgPoolError = nil
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransactionRetryDeadline(
           RetryOptions(maxAttempts: 3, baseDelayMs: 1, jitter: false), conn, seconds(10)
         ):
@@ -2125,6 +2146,7 @@ suite "E2E: Deadline-bounded Transaction":
             "INSERT INTO test_ptrd_defect (val) VALUES ($1)", @[toPgParam("leak")]
           )
           raise newException(AssertionDefect, "pool trd boom")
+        {.pop.}
       except PgPoolError as e:
         caught = e
 

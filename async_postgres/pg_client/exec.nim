@@ -5,12 +5,12 @@
 ## instead; what it re-exports is the supported surface (see
 ## `tests/api_surface.golden`).
 
-import std/[options, tables]
+import std/options
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, cache, simple_query]
 import ../pg_types/encoding
-import ./core
+import core
 
 import std/importutils
 privateAccess(PgConnection)

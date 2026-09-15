@@ -317,6 +317,17 @@ const
     ## SCRAM-SHA-256 and SCRAM-SHA-256-PLUS are standardised; 64 leaves room
     ## for future mechanisms while bounding pre-auth allocation.
 
+  MaxServerParams* = 256
+    ## Upper bound on distinct ``ParameterStatus`` keys kept in ``serverParams``.
+    ## A real server sends about 50 GUCs; 256 leaves room for custom settings
+    ## while capping hostile distinct-key flooding across many small messages
+    ## (each already under ``DefaultMaxBackendMessageLen``).
+
+  MaxServerParamsBytes* = 1024 * 1024
+    ## Upper bound on the total name+value byte size of ``serverParams`` (1 MiB).
+    ## Legitimate GUC values are tiny; this caps amplification when many
+    ## medium-sized keys arrive under the per-message length limit.
+
 func makeBinarySafeLookup(): array[BinarySafeMaxOid + 1, bool] {.compileTime.} =
   for oid in BinarySafeOids:
     result[oid] = true

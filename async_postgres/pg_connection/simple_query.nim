@@ -1,6 +1,7 @@
 ## Simple Query Protocol: ``simpleQuery``/``simpleExec``/``ping``, ``checkReady``,
 ## cancel helpers (``cancel``/``invalidateOnTimeout``), ``checkSessionAttrs``,
-## and ``quoteIdentifier``. Layer between ``buffer_io`` and ``lifecycle``.
+## ``quoteIdentifier``, and ``quoteLiteral``. Layer between ``buffer_io`` and
+## ``lifecycle``.
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub
 ## instead; what it re-exports is the supported surface (see
@@ -79,11 +80,43 @@ proc checkTxIdle*(conn: PgConnection) =
       "); use withSavepoint for nested scopes",
   )
 
-# Identifier escaping
+# Identifier / literal escaping
 
 proc quoteIdentifier*(s: string): string =
   ## Quote a SQL identifier (e.g. table/channel name) with double quotes, escaping embedded quotes.
   "\"" & s.replace("\"", "\"\"") & "\""
+
+proc quoteLiteral*(s: string): string =
+  ## Quote a SQL string literal for simple-query SQL, escaping embedded quotes
+  ## as ``''``. Backslash-bearing input is emitted in `` E'...'`` form with the
+  ## backslashes doubled, so the result parses identically under either
+  ## ``standard_conforming_strings`` setting (with ``off`` the standard parser
+  ## treats ``\`` as an escape, which plain quoting cannot contain). That form
+  ## carries a leading space, as libpq's ``PQescapeLiteral`` does, so a result
+  ## concatenated directly after an identifier or numeric constant cannot merge
+  ## into it (``LIKE`` & ``E'a\\b'`` would otherwise lex as ``likee``).
+  ##
+  ## Assumes an ASCII-compatible ``client_encoding``: bytes are scanned
+  ## individually, so under a client encoding whose multi-byte trail bytes may
+  ## be ``0x5C`` (SJIS, BIG5, GBK, UHC) an embedded character can be mistaken
+  ## for a backslash.
+  ##
+  ## Raises ``ValueError`` for an embedded NUL byte: the wire protocol
+  ## terminates the query string there, so it cannot be represented.
+  if '\0' in s:
+    raise newException(ValueError, "SQL literal contains a NUL byte")
+  if '\\' notin s:
+    return "'" & s.replace("'", "''") & "'"
+  result = " E'"
+  for c in s:
+    case c
+    of '\'':
+      result.add("''")
+    of '\\':
+      result.add("\\\\")
+    else:
+      result.add(c)
+  result.add('\'')
 
 # Simple Query Protocol entry points
 

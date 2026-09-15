@@ -1,8 +1,8 @@
-import std/[unittest, importutils, tables]
+import std/[unittest, importutils, strutils, tables]
 
 import ../async_postgres/[async_backend, pg_errors, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
-import ../async_postgres/pg_connection/[buffer_io, simple_query, types]
+import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_replication {.all.}
 
 privateAccess(PgConnection)
@@ -697,6 +697,27 @@ suite "parseTimelineId":
   test "out-of-int32-range raises PgTypeError (no RangeDefect)":
     expect(PgTypeError):
       discard parseTimelineId("2147483648")
+
+  test "failures omit the input, reporting length only":
+    # Failure messages report lengths only, never the content, matching the
+    # `PgTypeError` contract (see `pg_errors`).
+    const badTimeline = "abcSECRET_TLI_XYZ"
+    var msg = ""
+    try:
+      discard parseTimelineId(badTimeline)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg ==
+      "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $badTimeline.len & ")"
+    check "SECRET_TLI_XYZ" notin msg
+    const badLsn = "0/XYZSECRET_LSN"
+    msg = ""
+    try:
+      discard parseLsn(badLsn)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid LSN format (len=" & $badLsn.len & ")"
+    check "SECRET_LSN" notin msg
 
 suite "invalidateAbandonedStream":
   # Callers set csBusy before START_REPLICATION and the state only advances to

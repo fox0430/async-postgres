@@ -115,9 +115,26 @@ proc connectToHost*(
 ): Future[PgConnection] {.async.} =
   ## Connect to single host (dial ``hostaddr`` else ``host``; verify via ``host``).
 
+  # Re-check the mTLS pairing here as well: `connect` validates it in `wrapped`,
+  # but this proc is public and a direct caller would otherwise have the certs
+  # silently dropped by a successful sslAllow plaintext attempt.
+  validateClientCertConfig(config)
+
   # Validate before the sslAllow branch rewrites sslMode to sslDisable, which
   # would mask an sslnDirect conflict.
   validateDirectSslCompatible(config)
+
+  if entry.hostaddr.len > 0 and entry.hostaddr[0] == '/':
+    # `hostaddr` is a numeric IP (libpq forces TCP/IP whenever it is
+    # non-empty). A '/' value would otherwise select AF_UNIX via `dialAddr`
+    # and skip TLS entirely. Unix sockets stay available via `host`.
+    # Checked here (not just in `buildHosts`) so a directly constructed
+    # `HostEntry`/`ConnConfig` cannot bypass the DSN parsers.
+    raise newException(
+      PgConfigError,
+      "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets): " &
+        entry.hostaddr,
+    )
 
   if config.sslMode == sslAllow:
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).

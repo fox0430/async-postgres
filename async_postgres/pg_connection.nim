@@ -25,7 +25,7 @@
 ## - `pg_connection/simple_query` — simple-query / simple-exec / ping,
 ##                                  `cancel` / `invalidateOnTimeout`,
 ##                                  `checkSessionAttrs`, `quoteIdentifier`,
-##                                  `QueryResult` helpers.
+##                                  `quoteLiteral`, `QueryResult` helpers.
 ## - `pg_connection/lifecycle`    — `connect` / `connectToHost` / `close`,
 ##                                  `orderedHosts` (load-balanced host
 ##                                  ordering) and the SCRAM/require_auth
@@ -150,6 +150,7 @@ export simple_query.columnIndex
 export simple_query.rows
 export simple_query.items
 export simple_query.quoteIdentifier
+export simple_query.quoteLiteral
 export simple_query.cancel
 export simple_query.cancelNoWait
 export simple_query.invalidateOnTimeout

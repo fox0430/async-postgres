@@ -654,10 +654,7 @@ suite "E2E: Binary Format":
         "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid", resultFormat = rfBinary
       )
       doAssert qr.rows.len == 1
-      let data = qr.rows[0].getBytes(0)
-      doAssert data.len == 16
-      doAssert data[0] == 0x55'u8
-      doAssert data[1] == 0x0e'u8
+      doAssert $qr.rows[0].getUuid(0) == "550e8400-e29b-41d4-a716-446655440000"
       await conn.close()
 
     waitFor t()

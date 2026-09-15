@@ -90,27 +90,6 @@ proc scramClientFirstMessage*(
   state.channelBindingData = cbData
   result = toBytes(state.gs2Header & state.clientFirstBare)
 
-proc scramClientFirstMessage(
-    user: string,
-    nonce: string,
-    state: var ScramState,
-    cbType: string = "",
-    cbData: seq[byte] = @[],
-    cbSupportedButUnused: bool = false,
-): seq[byte] =
-  ## Overload with explicit nonce for testing.
-  state.clientNonce = nonce
-  state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & nonce
-  state.gs2Header =
-    if cbType.len > 0:
-      "p=" & cbType & ",,"
-    elif cbSupportedButUnused:
-      "y,,"
-    else:
-      "n,,"
-  state.channelBindingData = cbData
-  result = toBytes(state.gs2Header & state.clientFirstBare)
-
 proc scramClientFinalMessage*(
     password: string,
     serverFirstData: openArray[byte],

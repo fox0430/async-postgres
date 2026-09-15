@@ -419,6 +419,24 @@ suite "Row accessors":
     expect PgTypeError:
       discard row.getInt16(0)
 
+  test "getInt rejects trailing garbage (full-consumption check)":
+    for s in ["123abc", "42 ", "12.5", "1e3"]:
+      let row = @[some(toBytes(s))]
+      expect PgTypeError:
+        discard row.getInt(0)
+
+  test "getInt16 rejects trailing garbage (full-consumption check)":
+    for s in ["123abc", "42 ", "12.5"]:
+      let row = @[some(toBytes(s))]
+      expect PgTypeError:
+        discard row.getInt16(0)
+
+  test "getInt64 rejects trailing garbage (full-consumption check)":
+    for s in ["123abc", "42 ", "12.5"]:
+      let row = @[some(toBytes(s))]
+      expect PgTypeError:
+        discard row.getInt64(0)
+
   # The negative tests above are all text; the binary integer tests are all
   # positive. Binary is what the server sends once a statement is cached.
 
@@ -862,6 +880,46 @@ suite "PgTimeTz":
     let t = row.getTimeTz(0)
     check t.utcOffset == 19815
 
+  test "getTimeTz text ±15:59:59 TZDISP_LIMIT inclusive max":
+    # PostgreSQL TZDISP_LIMIT is exclusive of ±16h; ±15:59:59 is the last valid.
+    let pos = @[some(toBytes("00:00:00+15:59:59"))].getTimeTz(0)
+    check pos.utcOffset == 15 * 3600 + 59 * 60 + 59
+    let neg = @[some(toBytes("00:00:00-15:59:59"))].getTimeTz(0)
+    check neg.utcOffset == -(15 * 3600 + 59 * 60 + 59)
+
+  test "getTimeTz text +16 and +16:00 raise":
+    for bad in ["00:00:00+16", "00:00:00+16:00", "00:00:00-16", "00:00:00-16:00:00"]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
+  test "getTimeTz text minutes/seconds out of 0..59 raise":
+    # Total seconds of +00:99 is still inside TZDISP_LIMIT; DecodeTimezone
+    # rejects the component anyway.
+    for bad in ["00:00:00+00:99", "00:00:00+00:00:60", "00:00:00-01:60"]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
+  test "getTimeTz text signed offset hour raises":
+    # parseInt accepts a leading '-' inside the hour field, so "+-5" would
+    # otherwise decode as -5h and "--5" would silently flip the sign to +5h.
+    for bad in ["00:00:00+-5", "00:00:00+-5:30", "00:00:00--5", "00:00:00--5:00:00"]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
+  test "getTimeTz text plus-signed offset components raise":
+    # parseInt also accepts a leading '+', so "++5" would decode as +5h and
+    # "+05:+3" as 5h03m.
+    for bad in [
+      "00:00:00++5", "00:00:00++5:30", "00:00:00+-0", "00:00:00+05:+3",
+      "00:00:00+05:00:+1",
+    ]:
+      let row = @[some(toBytes(bad))]
+      expect PgTypeError:
+        discard row.getTimeTz(0)
+
   test "getTimeTz invalid raises":
     let row = @[some(toBytes("not-a-time"))]
     var raised = false
@@ -929,10 +987,41 @@ suite "PgTimeTz":
     check row.getTimeTzOpt(0).isNone
 
   test "toPgBinaryParam PgTimeTz rejects int32.low utcOffset":
-    # Negating int32.low would overflow int32 in the encoder.
+    # Negating int32.low would overflow int32 in the encoder; also outside TZDISP_LIMIT.
     let t = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: int32.low)
     expect PgTypeError:
       discard toPgBinaryParam(t)
+
+  test "toPgParam/toPgBinaryParam PgTimeTz reject ±16h utcOffset":
+    # Literal boundary, not pgTzDispLimit, so a wrong constant cannot make
+    # this rejection test tautological.
+    check pgTzDispLimit == 16 * 3600
+    let over = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: 16 * 3600)
+    let under = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: -16 * 3600)
+    expect PgTypeError:
+      discard toPgParam(over)
+    expect PgTypeError:
+      discard toPgParam(under)
+    expect PgTypeError:
+      discard toPgBinaryParam(over)
+    expect PgTypeError:
+      discard toPgBinaryParam(under)
+
+  test "toPgParam/toPgBinaryParam PgTimeTz accept ±15:59:59":
+    const maxOff = 15 * 3600 + 59 * 60 + 59
+    let pos = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: maxOff)
+    let neg = PgTimeTz(hour: 10, minute: 0, second: 0, utcOffset: -maxOff)
+    check $pos == "10:00:00+15:59:59"
+    check $neg == "10:00:00-15:59:59"
+    check toPgParam(pos).oid == OidTimeTz
+    check toPgBinaryParam(neg).format == 1
+    let fields = @[mkField(OidTimeTz, 1)]
+    check mkRow(@[toPgBinaryParam(pos).value], fields).getTimeTz(0) == pos
+    check mkRow(@[toPgBinaryParam(neg).value], fields).getTimeTz(0) == neg
+
+  test "$PgTimeTz int32.low offset does not OverflowDefect":
+    let t = PgTimeTz(hour: 0, minute: 0, second: 0, utcOffset: int32.low)
+    discard $t
 
 suite "date parameter encoding":
   test "toPgDateParam OID and format":
@@ -1441,6 +1530,20 @@ suite "Timestamp/date infinity sentinels":
     const tt = @[0'u8, 0, 0, 0, 0, 0, 0, 0, 0x80'u8, 0, 0, 0] # 8 bytes us=0 + int32.low
     expect PgTypeError:
       discard decodeBinaryTimeTz(tt)
+
+  test "decodeBinaryTimeTz TZDISP_LIMIT exclusive ±16h raises":
+    # Wire zone is seconds west of UTC; the bound is symmetric.
+    proc timetzBin(zone: int32): seq[byte] =
+      result = @(toBE64(0'i64))
+      result.add @(toBE32(zone))
+
+    expect PgTypeError:
+      discard decodeBinaryTimeTz(timetzBin(16 * 3600))
+    expect PgTypeError:
+      discard decodeBinaryTimeTz(timetzBin(-16 * 3600))
+    let maxOff = int32(15 * 3600 + 59 * 60 + 59)
+    check decodeBinaryTimeTz(timetzBin(-maxOff)).utcOffset == maxOff
+    check decodeBinaryTimeTz(timetzBin(maxOff)).utcOffset == -maxOff
 
   test "decodeBinaryDate infinity raises":
     expect PgTypeError:
@@ -2322,6 +2425,26 @@ suite "parseTextArray":
     check elems[0] == some("a")
     check elems[1] == some("{b}")
 
+  test "garbage after quoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{\"ab\"cd}")
+
+  test "trailing comma raises":
+    expect PgTypeError:
+      discard parseTextArray("{a,b,}")
+
+  test "quote inside unquoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{a\"b,c}")
+
+  test "backslash inside unquoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{a\\b,c}")
+
+  test "brace inside unquoted element raises":
+    expect PgTypeError:
+      discard parseTextArray("{a{b},c}")
+
 suite "Array row accessors":
   test "getIntArray":
     let row: Row = @[some(toBytes("{1,2,3}"))]
@@ -3043,6 +3166,7 @@ suite "PgMoney":
   test "parsePgMoney accepts optional $ and +":
     check parsePgMoney("1234.56") == initPgMoney(123456)
     check parsePgMoney("$1234.56") == initPgMoney(123456)
+    check parsePgMoney("1.00$") == initPgMoney(100)
     check parsePgMoney("+$1.00") == initPgMoney(100)
 
   test "parsePgMoney accepts sign after currency symbol":
@@ -3064,6 +3188,54 @@ suite "PgMoney":
   test "parsePgMoney strips non-ASCII currency symbols":
     check parsePgMoney("¥12.34") == initPgMoney(1234)
     check parsePgMoney("£1,234.56") == initPgMoney(123456)
+
+  test "parsePgMoney accepts ASCII locale currency symbols":
+    # sv_SE / hu_HU / pl_PL emit letter symbols, so letters cannot be banned
+    # in the symbol region.
+    check parsePgMoney("1234,56 kr") == initPgMoney(123456)
+    check parsePgMoney("1234,56 Ft") == initPgMoney(123456)
+    check parsePgMoney("zł1234,56") == initPgMoney(123456)
+    check parsePgMoney("R$1234,56") == initPgMoney(123456)
+
+  test "parsePgMoney accepts the Unicode space and quote separators":
+    # Real mon_thousands_sep values: U+202F (fr_FR / ru_RU / sv_SE),
+    # U+2019 and ' (de_CH), U+00A0 and a plain space in older locale data.
+    check parsePgMoney("1 234.56") == initPgMoney(123456)
+    check parsePgMoney("1 234,56 €") == initPgMoney(123456)
+    check parsePgMoney("1 234 567,89") == initPgMoney(123456789)
+    check parsePgMoney("-1 234,56 kr") == initPgMoney(-123456)
+    check parsePgMoney("1 234", scale = 0) == initPgMoney(1234, scale = 0)
+    check parsePgMoney("1\u202F234,56 \u20AC") == initPgMoney(123456)
+    check parsePgMoney("1\u2019234.56") == initPgMoney(123456)
+    check parsePgMoney("1'234.56") == initPgMoney(123456)
+    check parsePgMoney("1\u2009234,56") == initPgMoney(123456)
+    check parsePgMoney("1\u202F234\u202F567", scale = 0) ==
+      initPgMoney(1234567, scale = 0)
+
+  test "parsePgMoney rejects a short group after a space separator":
+    # scale=0 has no fractional part, so a space separator is grouping and the
+    # last group must be full; otherwise "1 23" would decode as 123.
+    expect(PgTypeError):
+      discard parsePgMoney("1 23", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("1\u00A023", scale = 0)
+
+  test "parsePgMoney rejects 4-wide groups without a fractional part":
+    # With scale=0 every separator is grouping, and no locale pairs frac_digits
+    # = 0 with 4-wide groups -- accepting them would read a 4-decimal "1.2345"
+    # from a mismatched lc_monetary as 12345.
+    expect(PgTypeError):
+      discard parsePgMoney("1.2345", scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("12.3456", scale = 0)
+    # 4-wide grouping stays valid where a locale really uses it (zh_TW).
+    check parsePgMoney("1,2345.67") == initPgMoney(1234567)
+
+  test "parsePgMoney rejects a separator inside the fractional part":
+    expect(PgTypeError):
+      discard parsePgMoney("1.2 3")
+    expect(PgTypeError):
+      discard parsePgMoney("1,2\u00A03")
 
   test "parsePgMoney strips surrounding whitespace":
     check parsePgMoney("  $100.00  ") == initPgMoney(10000)
@@ -3123,6 +3295,15 @@ suite "PgMoney":
       discard parsePgMoney("1.23", scale = 0)
     expect(PgTypeError):
       discard parsePgMoney("1.5", scale = 0)
+    # Junk interrupting the digits must not be dropped.
+    expect(PgTypeError):
+      discard parsePgMoney("12a34.56")
+    expect(PgTypeError):
+      discard parsePgMoney("12€34.56")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00 2")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00 kr 2.00")
 
   test "parsePgMoney rejects overflow":
     expect(PgTypeError):
@@ -3137,60 +3318,409 @@ suite "PgMoney":
     check hash(initPgMoney(42)) == hash(initPgMoney(42))
     check hash(initPgMoney(42, scale = 0)) != hash(initPgMoney(42, scale = 2))
 
-  test "ordering rejects mismatched scale":
-    expect(PgTypeError):
-      discard initPgMoney(100, scale = 0) < initPgMoney(100, scale = 2)
-    expect(PgTypeError):
-      discard initPgMoney(100, scale = 0) <= initPgMoney(100, scale = 2)
+  test "comparison is by decimal value across scales":
+    # 1.00 and 1.000 are the same amount written at two scales.
+    check initPgMoney(100, scale = 2) == initPgMoney(1000, scale = 3)
+    check hash(initPgMoney(100, scale = 2)) == hash(initPgMoney(1000, scale = 3))
+    # 1.00 < 100 and 100 > 1.00 both hold, instead of raising.
+    check initPgMoney(100, scale = 2) < initPgMoney(100, scale = 0)
+    check initPgMoney(100, scale = 0) > initPgMoney(100, scale = 2)
+    check not (initPgMoney(100, scale = 0) <= initPgMoney(100, scale = 2))
+    check initPgMoney(-1, scale = 2) < initPgMoney(0, scale = 0)
+    # int64.low must not wrap while being rescaled for comparison.
+    check initPgMoney(low(int64), scale = 2) < initPgMoney(0, scale = 0)
+    check initPgMoney(low(int64), scale = 2) == initPgMoney(low(int64), scale = 2)
+    check initPgMoney(high(int64), scale = 18) > initPgMoney(9, scale = 0)
+
+  test "PgMoney cannot be built without its scale":
+    # A partial literal would tag the amount with scale 0, shifting it by two
+    # digits; private fields make it fail to compile.
+    check not compiles(PgMoney(amountRaw: 123456'i64))
+    check not compiles((var m = initPgMoney(1); m.amount = 2))
 
   test "formatPgMoney default = $":
     check formatPgMoney(initPgMoney(123456)) == "1234.56"
     check formatPgMoney(initPgMoney(-123456)) == "-1234.56"
 
   test "formatPgMoney en_US style":
-    check formatPgMoney(initPgMoney(123456), symbol = "$", thousandsSep = ',') ==
+    check formatPgMoney(initPgMoney(123456), symbol = "$", thousandsSep = ",") ==
       "$1,234.56"
-    check formatPgMoney(initPgMoney(123456789), symbol = "$", thousandsSep = ',') ==
+    check formatPgMoney(initPgMoney(123456789), symbol = "$", thousandsSep = ",") ==
       "$1,234,567.89"
-    check formatPgMoney(initPgMoney(-123456), symbol = "$", thousandsSep = ',') ==
+    check formatPgMoney(initPgMoney(-123456), symbol = "$", thousandsSep = ",") ==
       "-$1,234.56"
-    check formatPgMoney(initPgMoney(1), symbol = "$", thousandsSep = ',') == "$0.01"
+    check formatPgMoney(initPgMoney(1), symbol = "$", thousandsSep = ",") == "$0.01"
 
   test "formatPgMoney EU style":
     check formatPgMoney(
       initPgMoney(123456),
-      symbol = " €",
+      symbol = "€",
       decimalSep = ',',
-      thousandsSep = '.',
+      thousandsSep = ".",
       symbolBefore = false,
+      sepBySpace = true,
     ) == "1.234,56 €"
 
   test "formatPgMoney scale=0":
     check formatPgMoney(
-      initPgMoney(1234567, scale = 0), symbol = "¥", thousandsSep = ','
+      initPgMoney(1234567, scale = 0), symbol = "¥", thousandsSep = ","
     ) == "¥1,234,567"
 
   test "formatPgMoney accounting parens for negatives":
     check formatPgMoney(
-      initPgMoney(-123456), symbol = "$", thousandsSep = ',', accountingParens = true
+      initPgMoney(-123456), symbol = "$", thousandsSep = ",", accountingParens = true
     ) == "($1,234.56)"
     # Positive values unaffected
     check formatPgMoney(
-      initPgMoney(123456), symbol = "$", thousandsSep = ',', accountingParens = true
+      initPgMoney(123456), symbol = "$", thousandsSep = ",", accountingParens = true
     ) == "$1,234.56"
     # EU style, symbol after
     check formatPgMoney(
       initPgMoney(-123456),
-      symbol = " €",
+      symbol = "€",
       decimalSep = ',',
-      thousandsSep = '.',
+      thousandsSep = ".",
       symbolBefore = false,
       accountingParens = true,
+      sepBySpace = true,
     ) == "(1.234,56 €)"
     # Roundtrip through parsePgMoney
     let v = initPgMoney(-123456)
-    let s = formatPgMoney(v, symbol = "$", thousandsSep = ',', accountingParens = true)
+    let s = formatPgMoney(v, symbol = "$", thousandsSep = ",", accountingParens = true)
     check parsePgMoney(s) == v
+
+  test "initPgMoneyConventions rejects ambiguous conventions":
+    expect(PgTypeError):
+      discard initPgMoneyConventions(decimalSep = '.', thousandsSep = ".")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(decimalSep = '1')
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = "1$")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(thousandsSep = "-")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(fracDigits = 19)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(fracDigits = -1)
+
+  test "initPgMoneyConventions keeps the symbol separate from its space":
+    # A space folded into the symbol would be eaten by whitespace trimming
+    # while parsing, so the round-trip would not hold.
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = " \u20AC")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = "\u20AC ")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(symbol = "\u00A0\u20AC")
+    # Parsing strips every whitespace character, not just sepBySpace ones.
+    for ws in ["\t", "\n", "\r", "\v", "\f"]:
+      expect(PgTypeError):
+        discard initPgMoneyConventions(symbol = ws & "$")
+      expect(PgTypeError):
+        discard initPgMoneyConventions(symbol = "$" & ws, symbolBefore = false)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(sepBySpace = true)
+    # Interior space is a symbol, not a separator, and stays.
+    check initPgMoneyConventions(symbol = "R $").symbol == "R $"
+
+  test "formatPgMoney unfolds a space folded into the symbol":
+    # The pre-sepBySpace API had no other way to ask for the space.
+    let v = initPgMoney(123456)
+    check formatPgMoney(v, symbol = " \u20AC", symbolBefore = false) ==
+      formatPgMoney(v, symbol = "\u20AC", symbolBefore = false, sepBySpace = true)
+    check formatPgMoney(v, symbol = "$ ") == "$ 1234.56"
+    # On the outer edge the space faces nothing; parsing strips it either way.
+    check formatPgMoney(v, symbol = "\u00A0$") == "$1234.56"
+    check parsePgMoney(formatPgMoney(v, symbol = " \u20AC", symbolBefore = false)) == v
+    # Interior space still belongs to the symbol.
+    check formatPgMoney(v, symbol = "R $") == "R $1234.56"
+
+  test "PgMoneyConventions exposes the locale it was built from":
+    let c = initPgMoneyConventions(
+      symbol = "\u20AC",
+      decimalSep = ',',
+      thousandsSep = "\u202F",
+      symbolBefore = false,
+      accountingParens = true,
+      sepBySpace = true,
+      fracDigits = 3,
+    )
+    check c.symbol == "\u20AC"
+    check c.decimalSep == ','
+    check c.thousandsSep == "\u202F"
+    check not c.symbolBefore
+    check c.accountingParens
+    check c.sepBySpace
+    check c.fracDigits == 3
+    # Fields are read-only: the constructor is the only way in.
+    check not compiles((var v = initPgMoneyConventions(); v.symbol = "$"))
+    check not compiles(PgMoneyConventions(symbolRaw: "$"))
+
+  test "formatPgMoney rejects a value whose scale is not the locale's":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    expect(PgTypeError):
+      discard formatPgMoney(initPgMoney(1234, scale = 0), enUS)
+    expect(PgTypeError):
+      discard formatPgMoney(initPgMoney(1234, scale = 3), enUS)
+    # A conventions value that skipped the constructor must not pass for a
+    # fracDigits-0 locale: that would read 12.34 as 1234.
+    var zero: PgMoneyConventions
+    expect(PgTypeError):
+      discard formatPgMoney(initPgMoney(1234, scale = 0), zero)
+    expect(PgTypeError):
+      discard parsePgMoney("1234", zero)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(decimalSep = '\0')
+
+  test "inferPgMoneyConventions reads the locale back out of a string":
+    let enUS = inferPgMoneyConventions("$1,234.56")
+    check enUS.symbol == "$"
+    check enUS.symbolBefore
+    check not enUS.sepBySpace
+    check enUS.thousandsSep == ","
+    check enUS.decimalSep == '.'
+    check enUS.fracDigits == 2
+    let frFR = inferPgMoneyConventions("1\u202F234,56 \u20AC")
+    check frFR.symbol == "\u20AC"
+    check not frFR.symbolBefore
+    check frFR.sepBySpace
+    check frFR.thousandsSep == "\u202F"
+    check frFR.decimalSep == ','
+    let jaJP = inferPgMoneyConventions("\u00A51,234", fracDigits = 0)
+    check jaJP.symbol == "\u00A5"
+    check jaJP.thousandsSep == ","
+    check jaJP.fracDigits == 0
+    check inferPgMoneyConventions("($1.00)").accountingParens
+    # Inference feeds the same parser the strict overload uses.
+    for str in ["$1,234.56", "1\u202F234,56 \u20AC", "($1.00)", "-1.234,56 \u20AC"]:
+      check parsePgMoney(str, inferPgMoneyConventions(str)) == parsePgMoney(str)
+
+  test "inferPgMoneyConventions describes only the sign of its sample":
+    # A positive sample says nothing about n_sign_posn, so conventions inferred
+    # from one need not accept the locale's negatives: infer from a negative
+    # sample when reusing the result across a result set.
+    let fromPositive = inferPgMoneyConventions("$1,234.56")
+    check not fromPositive.accountingParens
+    expect(PgTypeError):
+      discard parsePgMoney("($1,234.56)", fromPositive)
+    let fromNegative = inferPgMoneyConventions("($1,234.56)")
+    check fromNegative.accountingParens
+    check parsePgMoney("($1,234.56)", fromNegative) == initPgMoney(-123456)
+    check parsePgMoney("$1,234.56", fromNegative) == initPgMoney(123456)
+
+  test "inferPgMoneyConventions reports the input length, not the input":
+    # Decode failures must not echo cell content (PII/secrets land in
+    # logs via exception text). The message carries the length instead.
+    for bad in ["1.000.00", "1..00", "(1.00", "1.00)"]:
+      try:
+        discard parsePgMoney(bad)
+        check false
+      except PgTypeError as e:
+        check e.msg == "Invalid money format (len=" & $bad.len & ")"
+        check bad notin e.msg
+
+  test "inferPgMoneyConventions rejects what no single locale explains":
+    # Two different group separators.
+    expect(PgTypeError):
+      discard inferPgMoneyConventions("1.234 567,89")
+    # Symbol runs on both sides.
+    expect(PgTypeError):
+      discard inferPgMoneyConventions("$1.00 kr")
+    # Unbalanced accounting parens are junk, not a symbol.
+    expect(PgTypeError):
+      discard parsePgMoney("(1.00")
+    expect(PgTypeError):
+      discard parsePgMoney("1.00)")
+    expect(PgTypeError):
+      discard parsePgMoney(")1.00(")
+
+  test "getMoney with conventions validates instead of inferring":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    let good: Row = @[some(toBytes("$1,234.56"))]
+    check good.getMoney(0, enUS) == initPgMoney(123456)
+    check good.get(0, PgMoney, enUS) == initPgMoney(123456)
+    check good.getMoneyOpt(0, enUS) == some(initPgMoney(123456))
+    let bad: Row = @[some(toBytes("1.234,56 \u20AC"))]
+    check bad.getMoney(0) == initPgMoney(123456) # inference accepts it
+    expect(PgTypeError):
+      discard bad.getMoney(0, enUS)
+    # Binary cells take their scale from the conventions.
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    let fields = @[mkField(OidMoney, 1)]
+    let binRow = mkRow(@[some(@(toBE64(987654'i64)))], fields)
+    check binRow.getMoney(0, jaJP) == initPgMoney(987654, scale = 0)
+    check binRow.getMoney("test", jaJP) == initPgMoney(987654, scale = 0)
+    check binRow.getMoneyOpt("test", jaJP) == some(initPgMoney(987654, scale = 0))
+
+  test "getMoneyArray with conventions":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    let row: Row = @[some(toBytes("{\"$1,234.56\",\"$2.00\"}"))]
+    check row.getMoneyArray(0, enUS) == @[initPgMoney(123456), initPgMoney(200)]
+    check row.getMoneyArrayOpt(0, enUS) == some(
+      @[initPgMoney(123456), initPgMoney(200)]
+    )
+    let eu: Row = @[some(toBytes("{\"1.234,56\"}"))]
+    expect(PgTypeError):
+      discard eu.getMoneyArray(0, enUS)
+
+  test "getMoneyArrayND with conventions takes its scale from fracDigits":
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    let p = toPgParam(@[initPgMoney(100), initPgMoney(-50)])
+    let fields = @[mkField(OidMoneyArray, 1)]
+    let row = mkRow(@[p.value], fields)
+    let nd = row.getMoneyArrayND(0, jaJP)
+    check nd.elements ==
+      @[some(initPgMoney(100, scale = 0)), some(initPgMoney(-50, scale = 0))]
+    check row.getMoneyArrayNDOpt(0, jaJP).get.elements == nd.elements
+
+  test "binary accessors reject uninitialized conventions":
+    # fracDigits = 0; the binary paths never reach the text parser, so nothing
+    # else would catch it.
+    var zero: PgMoneyConventions
+    let fields = @[mkField(OidMoney, 1)]
+    let binRow = mkRow(@[some(@(toBE64(12345'i64)))], fields)
+    expect(PgTypeError):
+      discard binRow.getMoney(0, zero)
+    expect(PgTypeError):
+      discard binRow.getMoney("test", zero)
+    expect(PgTypeError):
+      discard binRow.getMoneyOpt(0, zero)
+    expect(PgTypeError):
+      discard binRow.get(0, PgMoney, zero)
+    let arrFields = @[mkField(OidMoneyArray, 1)]
+    let p = toPgParam(@[initPgMoney(100)])
+    let arrRow = mkRow(@[p.value], arrFields)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArray(0, zero)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArrayOpt(0, zero)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArrayND(0, zero)
+    expect(PgTypeError):
+      discard arrRow.getMoneyArrayNDOpt(0, zero)
+
+  test "Opt accessors validate before the NULL test":
+    # A bad scale or zero-initialized conventions must surface on row one, not
+    # after the leading NULL rows.
+    var zero: PgMoneyConventions
+    let nullRow = mkRow(@[none(seq[byte])], @[mkField(OidMoney, 1)])
+    expect(PgTypeError):
+      discard nullRow.getMoneyOpt(0, zero)
+    expect(PgTypeError):
+      discard nullRow.getMoneyOpt(0, scale = MaxMoneyScale + 1)
+    let nullArrRow = mkRow(@[none(seq[byte])], @[mkField(OidMoneyArray, 1)])
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayOpt(0, zero)
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayOpt(0, scale = MaxMoneyScale + 1)
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayNDOpt(0, zero)
+    expect(PgTypeError):
+      discard nullArrRow.getMoneyArrayNDOpt(0, scale = MaxMoneyScale + 1)
+    # NULL still reads as `none` once the arguments are sound.
+    check nullRow.getMoneyOpt(0, initPgMoneyConventions(symbol = "$")) == none(PgMoney)
+
+  test "money with a non-default mon_grouping":
+    # PostgreSQL groups by mon_grouping[0]; cmn_TW and friends use 4.
+    let twConv =
+      initPgMoneyConventions(symbol = "NT$", thousandsSep = ",", groupDigits = 4)
+    check twConv.groupDigits == 4
+    let v = initPgMoney(1234567890'i64)
+    check formatPgMoney(v, twConv) == "NT$1234,5678.90"
+    check parsePgMoney("NT$1,2345,6789.00", twConv) == initPgMoney(12345678900'i64)
+    check parsePgMoney("NT$1,2345,6789.00") == initPgMoney(12345678900'i64)
+    check inferPgMoneyConventions("NT$1,2345,6789.00").groupDigits == 4
+    check formatPgMoney(v, symbol = "NT$", thousandsSep = ",", groupDigits = 4) ==
+      "NT$1234,5678.90"
+    # Groups still have to agree with each other.
+    expect(PgTypeError):
+      discard parsePgMoney("NT$1,234,5678.00", twConv)
+    expect(PgTypeError):
+      discard parsePgMoney("1,23,456.00")
+    expect(PgTypeError):
+      discard initPgMoneyConventions(groupDigits = 0)
+    expect(PgTypeError):
+      discard initPgMoneyConventions(groupDigits = 7)
+
+  test "formatPgMoney with multi-byte thousands separator":
+    let frFR = initPgMoneyConventions(
+      symbol = "\u20AC",
+      decimalSep = ',',
+      thousandsSep = "\u202F",
+      symbolBefore = false,
+      sepBySpace = true,
+    )
+    check formatPgMoney(initPgMoney(123456789), frFR) == "1\u202F234\u202F567,89 \u20AC"
+
+  test "parsePgMoney with conventions roundtrips formatPgMoney":
+    let convs = [
+      initPgMoneyConventions(symbol = "$", thousandsSep = ","),
+      initPgMoneyConventions(
+        symbol = "\u20AC",
+        decimalSep = ',',
+        thousandsSep = "\u202F",
+        symbolBefore = false,
+        sepBySpace = true,
+      ),
+      initPgMoneyConventions(symbol = "$", thousandsSep = ",", accountingParens = true),
+      initPgMoneyConventions(),
+    ]
+    for c in convs:
+      for amount in [123456'i64, -123456, 1, 0, -1, high(int64), low(int64)]:
+        let v = initPgMoney(amount)
+        check parsePgMoney(formatPgMoney(v, c), c) == v
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    for amount in [1234567'i64, -1234567, 0]:
+      let v = initPgMoney(amount, scale = 0)
+      check parsePgMoney(formatPgMoney(v, jaJP), jaJP) == v
+
+  test "parsePgMoney with conventions accepts sign on either side of symbol":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    check parsePgMoney("-$1,234.56", enUS) == initPgMoney(-123456)
+    check parsePgMoney("$-1,234.56", enUS) == initPgMoney(-123456)
+    check parsePgMoney("$1234.56", enUS) == initPgMoney(123456)
+
+  test "parsePgMoney with conventions rejects what the lenient overload allows":
+    let enUS = initPgMoneyConventions(symbol = "$", thousandsSep = ",")
+    # A run on one side is an unknown symbol; runs on both sides are no locale.
+    check parsePgMoney("1,234.56 junk") == initPgMoney(123456)
+    expect(PgTypeError):
+      discard parsePgMoney("$1,234.56 junk")
+    expect(PgTypeError):
+      discard parsePgMoney("$1,234.56 junk", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("$1,23,456.78", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("$1,2345.67", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("1,234.56", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("1,234.56$", enUS)
+    expect(PgTypeError):
+      discard parsePgMoney("$1.234,56", enUS)
+    # Parens only when the conventions declare them.
+    expect(PgTypeError):
+      discard parsePgMoney("($1,234.56)", enUS)
+    check parsePgMoney(
+      "($1,234.56)",
+      initPgMoneyConventions(symbol = "$", thousandsSep = ",", accountingParens = true),
+    ) == initPgMoney(-123456)
+
+  test "parsePgMoney with conventions enforces scale exactly":
+    let jaJP =
+      initPgMoneyConventions(symbol = "\u00A5", thousandsSep = ",", fracDigits = 0)
+    check parsePgMoney("\u00A51,234", jaJP) == initPgMoney(1234, scale = 0)
+    expect(PgTypeError):
+      discard parsePgMoney("\u00A51,234.00", jaJP)
+    expect(PgTypeError):
+      discard parsePgMoney("\u00A51,23", jaJP)
+    expect(PgTypeError):
+      discard parsePgMoney("$1.5", initPgMoneyConventions(symbol = "$"))
+    expect(PgTypeError):
+      discard parsePgMoney("$1.234", initPgMoneyConventions(symbol = "$"))
 
   test "toPgParam PgMoney":
     let p = toPgParam(initPgMoney(123456))
@@ -3312,6 +3842,56 @@ suite "PgMoney":
     let fields = @[mkField(OidMoneyArray, 1)]
     let row = mkRow(@[p.value], fields)
     check row.getMoneyArray("test", scale = 0) == values
+
+  test "toPgParam PgMoney rejects scale mismatch":
+    expect PgTypeError:
+      discard toPgParam(initPgMoney(100, scale = 0))
+    expect PgTypeError:
+      discard toPgBinaryParam(initPgMoney(100, scale = 0))
+    expect PgTypeError:
+      discard toPgParamInline(initPgMoney(100, scale = 0))
+
+  test "toPgParam PgMoney with explicit scale":
+    let p = toPgParam(initPgMoney(100, scale = 0), scale = 0)
+    check p.oid == OidMoney
+    check p.value.get == @(toBE64(100'i64))
+    let pb = toPgBinaryParam(initPgMoney(100, scale = 3), scale = 3)
+    check pb.value.get == @(toBE64(100'i64))
+
+  test "generic get forwards money scale":
+    let fields = @[mkField(OidMoney, 1)]
+    let row = mkRow(@[some(@(toBE64(42'i64)))], fields)
+    check row.get(0, PgMoney) == initPgMoney(42)
+    check row.get(0, PgMoney, scale = 0) == initPgMoney(42, scale = 0)
+    let arrFields = @[mkField(OidMoneyArray, 1)]
+    let arrRow = mkRow(@[toPgParam(@[initPgMoney(42)]).value], arrFields)
+    check arrRow.get(0, seq[PgMoney]) == @[initPgMoney(42)]
+    check arrRow.get(0, seq[PgMoney], scale = 0) == @[initPgMoney(42, scale = 0)]
+
+  test "Option[PgMoney] none encodes as NULL without scale check":
+    let p = toPgParam(none(PgMoney))
+    check p.oid == OidMoney
+    check p.format == 1'i16
+    check p.value.isNone
+    let pb = toPgBinaryParam(none(PgMoney))
+    check pb.oid == OidMoney
+    check pb.value.isNone
+    let pi = toPgParamInline(none(PgMoney))
+    check pi.oid == OidMoney
+    check pi.len == -1'i32
+
+  test "Option[PgMoney] some validates scale":
+    let m0 = initPgMoney(100, scale = 0)
+    expect PgTypeError:
+      discard toPgParam(some(m0))
+    expect PgTypeError:
+      discard toPgBinaryParam(some(m0))
+    expect PgTypeError:
+      discard toPgParamInline(some(m0))
+    check toPgParam(some(m0), scale = 0).value.get == @(toBE64(100'i64))
+    check toPgBinaryParam(some(m0), scale = 0).value.get == @(toBE64(100'i64))
+    let m2 = initPgMoney(100)
+    check toPgParam(some(m2)).value.get == @(toBE64(100'i64))
 
 suite "PgInterval":
   test "$ zero interval":
@@ -4260,6 +4840,27 @@ suite "Composite text parser":
     check parts[0] == some("say \"hi\"")
     check parts[1] == some("done")
 
+  test "parseCompositeText quoted with backslash escapes":
+    # Canonical record_out doubles ``"`` and ``\\``; record_in (and this
+    # parser) also accept backslash-escaped bytes inside quotes.
+    let doubled = parseCompositeText("(\"a\\\\b\",c)")
+    check doubled.len == 2
+    check doubled[0] == some("a\\b")
+    check doubled[1] == some("c")
+    let escaped = parseCompositeText("(\"a\\\"b\",c)")
+    check escaped.len == 2
+    check escaped[0] == some("a\"b")
+    check escaped[1] == some("c")
+    let trailing = parseCompositeText("(\"a\\\\\",c)")
+    check trailing.len == 2
+    check trailing[0] == some("a\\")
+    check trailing[1] == some("c")
+
+  test "parseCompositeText backslash escaping closing quote raises":
+    # record_in fails with "Unexpected end of input" for the same input.
+    expect PgTypeError:
+      discard parseCompositeText("(\"a\\\")")
+
   test "parseCompositeText empty string quoted":
     let parts = parseCompositeText("(\"\",42)")
     check parts.len == 2
@@ -4294,6 +4895,23 @@ suite "Composite text parser":
     expect PgTypeError:
       discard parseCompositeText("(\"a\"b)")
 
+  test "parseCompositeText quote in unquoted field raises":
+    expect PgTypeError:
+      discard parseCompositeText("(a\"b,c)")
+
+  test "parseCompositeText backslash in unquoted field raises":
+    # record_in treats ``\x`` in an unquoted field as an escape, but record_out
+    # never emits it (such bytes are quoted), so non-canonical input is
+    # rejected instead of decoded.
+    expect PgTypeError:
+      discard parseCompositeText("(a\\b,c)")
+
+  test "parseCompositeText paren in unquoted field raises":
+    expect PgTypeError:
+      discard parseCompositeText("(a(b,c)")
+    expect PgTypeError:
+      discard parseCompositeText("(a)b,c)")
+
   test "encodeCompositeText simple":
     let s = encodeCompositeText(@[some("1"), some("2")])
     check s == "(1,2)"
@@ -4316,6 +4934,16 @@ suite "Composite text parser":
     check encodeCompositeText(@[some("NULL"), some("42")]) == "(\"NULL\",42)"
     check encodeCompositeText(@[some("null")]) == "(\"null\")"
     check encodeCompositeText(@[some("Null")]) == "(\"Null\")"
+
+  test "encodeCompositeText doubles backslash and quote like record_out":
+    # Canonical record_out output doubles both bytes; the server's record_in
+    # (and parseCompositeText) decode this form back to the original value.
+    check encodeCompositeText(@[some("a\\b")]) == "(\"a\\\\b\")"
+    check encodeCompositeText(@[some("q\"w")]) == "(\"q\"\"w\")"
+
+  test "roundtrip text encode/parse with backslash and quote":
+    let fields = @[some("a\\b"), some("q\"w"), some("a\\"), some("\\\"")]
+    check parseCompositeText(encodeCompositeText(fields)) == fields
 
   test "roundtrip text encode/parse":
     let fields = @[some("hello world"), some("42"), none(string), some("with,comma")]
@@ -7719,21 +8347,84 @@ suite "Other array types":
 
   test "toPgParam seq[PgTsVector] roundtrip":
     let tv1 = PgTsVector("'hello':1 'world':2")
-    let p = toPgParam(@[tv1])
+    let tv2 = PgTsVector("'foo':3")
+    let p = toPgParam(@[tv1, tv2])
     check p.oid == OidTsVectorArray
-    let fields = @[mkField(OidTsVectorArray, 1'i16)]
-    let row = mkRow(@[p.value], fields)
+    check p.format == 0'i16
+    # Text format roundtrip (binary tsvector is structured, so the
+    # parameter is text and decodes via the text path).
+    let row: Row = @[p.value]
     let arr = row.getTsVectorArray(0)
-    check arr.len == 1
+    check arr.len == 2
+    check string(arr[0]) == string(tv1)
+    check string(arr[1]) == string(tv2)
 
   test "toPgParam seq[PgTsQuery] roundtrip":
     let tq1 = PgTsQuery("hello & world")
-    let p = toPgParam(@[tq1])
+    let tq2 = PgTsQuery("foo | bar")
+    let p = toPgParam(@[tq1, tq2])
     check p.oid == OidTsQueryArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    let arr = row.getTsQueryArray(0)
+    check arr.len == 2
+    check string(arr[0]) == string(tq1)
+    check string(arr[1]) == string(tq2)
+
+  test "toPgParam seq[PgTsVector] empty":
+    let p = toPgParam(newSeq[PgTsVector]())
+    check p.oid == OidTsVectorArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    check row.getTsVectorArray(0).len == 0
+
+  test "toPgParam seq[PgTsQuery] empty":
+    let p = toPgParam(newSeq[PgTsQuery]())
+    check p.oid == OidTsQueryArray
+    check p.format == 0'i16
+    let row: Row = @[p.value]
+    check row.getTsQueryArray(0).len == 0
+
+  test "getTsVectorArray binary decodes structured elements":
+    # Same binary body as "getTsVector binary format" ('cat':1A).
+    var elem: seq[byte] = @[]
+    elem.add(@(toBE32(1'i32)))
+    for c in "cat":
+      elem.add(byte(c))
+    elem.add(0'u8)
+    elem.add(@(toBE16(1'i16)))
+    elem.add(@(toBE16(cast[int16](0xC001'u16))))
+    let payload = encodeBinaryArray(OidTsVector, @[some(elem)])
+    let fields = @[mkField(OidTsVectorArray, 1'i16)]
+    let row = mkRow(@[some(payload)], fields)
+    let arr = row.getTsVectorArray(0)
+    check arr.len == 1
+    check $arr[0] == "'cat':1A"
+
+  test "getTsQueryArray binary decodes structured elements":
+    # Same binary body as "getTsQuery binary format simple AND".
+    var elem: seq[byte] = @[]
+    elem.add(@(toBE32(3'i32)))
+    elem.add(2'u8)
+    elem.add(2'u8)
+    elem.add(1'u8)
+    elem.add(0'u8)
+    elem.add(0'u8)
+    for c in "cat":
+      elem.add(byte(c))
+    elem.add(0'u8)
+    elem.add(1'u8)
+    elem.add(0'u8)
+    elem.add(0'u8)
+    for c in "dog":
+      elem.add(byte(c))
+    elem.add(0'u8)
+    let payload = encodeBinaryArray(OidTsQuery, @[some(elem)])
     let fields = @[mkField(OidTsQueryArray, 1'i16)]
-    let row = mkRow(@[p.value], fields)
+    let row = mkRow(@[some(payload)], fields)
     let arr = row.getTsQueryArray(0)
     check arr.len == 1
+    check $arr[0] == "'cat' & 'dog'"
 
 suite "Multirange array types":
   test "toPgParam seq[PgMultirange[int32]] text roundtrip":
@@ -9976,6 +10667,89 @@ suite "1-D array accessors reject a mismatched wire elemOid":
     let row = mkRow(@[some(toBytes("{1,2,3}"))], @[mkField(OidInt4Array, 0)])
     check row.getIntArray(0) == @[1'i32, 2, 3]
 
+suite "scalar accessors reject a mismatched binary column OID":
+  test "getFloat32 rejects int4 instead of decoding it as 1e-45":
+    let row = mkRow(@[some(@(toBE32(1'i32)))], @[mkField(OidInt4, 1)])
+    expect PgTypeError:
+      discard row.getFloat32(0)
+
+  test "rejection names the accessor and both OIDs":
+    let row = mkRow(@[some(@(toBE32(1'i32)))], @[mkField(OidInt4, 1)])
+    var msg = ""
+    try:
+      discard row.getFloat32(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg ==
+      "getFloat32: wire colOid=23 expected 700 (binary column type mismatch; use the matching accessor or resultFormat = rfText)"
+
+  test "getInt accepts int2 and int4 widening":
+    check mkRow(@[some(@(toBE16(7'i16)))], @[mkField(OidInt2, 1)]).getInt(0) == 7'i32
+    check mkRow(@[some(@(toBE32(7'i32)))], @[mkField(OidInt4, 1)]).getInt(0) == 7'i32
+
+  test "getInt64 accepts int2, int4, and int8":
+    check mkRow(@[some(@(toBE16(7'i16)))], @[mkField(OidInt2, 1)]).getInt64(0) == 7'i64
+    check mkRow(@[some(@(toBE32(7'i32)))], @[mkField(OidInt4, 1)]).getInt64(0) == 7'i64
+    check mkRow(@[some(@(toBE64(7'i64)))], @[mkField(OidInt8, 1)]).getInt64(0) == 7'i64
+
+  test "getFloat accepts float4 and float8":
+    let row4 = mkRow(@[some(@(toBE32(cast[int32](1.5'f32))))], @[mkField(OidFloat4, 1)])
+    check row4.getFloat(0) == 1.5'f64
+    let row8 = mkRow(@[some(@(toBE64(cast[int64](1.5'f64))))], @[mkField(OidFloat8, 1)])
+    check row8.getFloat(0) == 1.5'f64
+
+  test "getTimestamp rejects timestamptz":
+    let row = mkRow(@[some(newSeq[byte](8))], @[mkField(OidTimestampTz, 1)])
+    expect PgTypeError:
+      discard row.getTimestamp(0)
+
+  test "getInet rejects cidr and vice versa":
+    var payload = newSeq[byte](8)
+    payload[0] = 2
+    payload[1] = 32
+    payload[2] = 0
+    payload[3] = 4
+    let rowInet = mkRow(@[some(payload)], @[mkField(OidInet, 1)])
+    expect PgTypeError:
+      discard rowInet.getCidr(0)
+    let rowCidr = mkRow(@[some(payload)], @[mkField(OidCidr, 1)])
+    expect PgTypeError:
+      discard rowCidr.getInet(0)
+
+  test "getJson accepts json and jsonb":
+    let rowJson = mkRow(@[some(toBytes("{}"))], @[mkField(OidJson, 1)])
+    check $rowJson.getJson(0) == "{}"
+    var jbin: seq[byte] = @[1'u8]
+    for c in "{}":
+      jbin.add(byte(c))
+    let rowJsonb = mkRow(@[some(jbin)], @[mkField(OidJsonb, 1)])
+    check $rowJsonb.getJson(0) == "{}"
+
+  test "getJson rejects non-json binary":
+    let row = mkRow(@[some(@(toBE32(1'i32)))], @[mkField(OidInt4, 1)])
+    expect PgTypeError:
+      discard row.getJson(0)
+
+  test "getBit accepts bit and varbit":
+    for oid in [OidBit, OidVarbit]:
+      let row = mkRow(@[some(@[0'u8, 0, 0, 1, 0x80])], @[mkField(oid, 1)])
+      check $row.getBit(0) == "1"
+
+  test "unknown OID 0 skips the check (manual Row)":
+    let rd = RowData(
+      numCols: 1'i16,
+      buf: @(toBE32(1'i32)),
+      cellIndex: @[0'i32, 4'i32],
+      colFormats: @[1'i16],
+      colTypeOids: @[0'i32],
+    )
+    # Fail-open for metadata-less rows: no OID to validate against.
+    discard initRow(rd, 0).getFloat32(0)
+
+  test "the text format path is unaffected":
+    let row = mkRow(@[some(toBytes("1"))], @[mkField(OidInt4, 0)])
+    check row.getFloat32(0) == 1'f32
+
 suite "range array accessors reject a mismatched wire elemOid":
   test "getDateRangeArray rejects int4range[]":
     let p = toPgBinaryParam(@[rangeOf(1'i32, 10'i32)])
@@ -10046,3 +10820,538 @@ suite "getArrayND accepts the 1-D character and bit OIDs":
     let bin = encodeBinaryArray(OidBit, @[@[0'u8, 0, 0, 1, 0x80]])
     let row = mkRow(@[some(bin)], @[mkField(OidBitArray, 1)])
     check getArrayND[PgBit](row, 0).elements.len == 1
+
+suite "type-decode failures omit cell content":
+  test "getJson failure reports length, not content":
+    # Cell values may hold PII/secrets and exception text lands in
+    # logs, so decode failures must not echo the cell.
+    const secret = "SECRET_JSON_PAYLOAD_XYZ"
+    let row =
+      mkRow(@[some(toBytes("{not json " & secret & "}"))], @[mkField(OidJson, 0)])
+    var msg = ""
+    try:
+      discard row.getJson(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getBytesArray failure omits the cell":
+    # A malformed hex element is rejected by decodeHexPair, which must report
+    # position/len only: bytea cells may hold PII or secrets.
+    const secret = "PII_SECRET_XYZ"
+    let row = Row @[some(toBytes("{\"\\\\x4142ZZ" & secret & "\"}"))]
+    var msg = ""
+    try:
+      discard row.getBytesArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "at position" in msg
+    check "len=" in msg
+
+  test "getJsonArray failure omits the element":
+    const secret = "oops-SECRET-JSONARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getJsonArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getLineArray failure omits the element":
+    const secret = "oops-SECRET-LINEARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getLineArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getLsegArray failure omits the element":
+    const secret = "oops-SECRET-LSEGARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getLsegArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getBoxArray failure omits the element":
+    const secret = "oops-SECRET-BOXARR-XYZ"
+    let row = mkRow(@[some(toBytes("{" & secret & "}"))], @[mkField(OidBox, 0)])
+    var msg = ""
+    try:
+      discard row.getBoxArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getPathArray failure omits the element":
+    const secret = "oops-SECRET-PATHARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getPathArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getPolygonArray failure omits the element":
+    const secret = "oops-SECRET-POLYARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getPolygonArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getCircleArray failure omits the element":
+    const secret = "oops-SECRET-CIRCARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getCircleArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "parsePgNumeric failure omits input":
+    const bad = "12a34SECRET_NUM_XYZ"
+    var msg = ""
+    try:
+      discard parsePgNumeric(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid numeric (len=" & $bad.len & ")"
+    check "SECRET_NUM_XYZ" notin msg
+
+  test "parsePgBoolText failure omits input":
+    const bad = "maybeSECRET_BOOL_XYZ"
+    var msg = ""
+    try:
+      discard parsePgBoolText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid boolean value (len=" & $bad.len & ")"
+    check "SECRET_BOOL_XYZ" notin msg
+
+  test "getPoint failure omits input":
+    const secret = "SECRET_GEO_XYZ"
+    let row = mkRow(@[some(toBytes("(oops " & secret & ")"))], @[mkField(OidPoint, 0)])
+    var msg = ""
+    try:
+      discard row.getPoint(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getEnum failure omits the label, including the ValueError detail":
+    # The stdlib parseEnum error echoes the label; pgParseEnum must drop that
+    # detail instead of appending it.
+    const secret = "bogus-SECRET-ENUM-XYZ"
+    let row: Row = @[some(toBytes(secret))]
+    var msg = ""
+    try:
+      discard getEnum[Mood](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Mood" in msg
+    check "Invalid enum value: " notin msg
+
+  test "getInt out-of-range failure omits the value":
+    let row = mkRow(@[some(toBytes("5000000000"))], @[mkField(OidInt4, 0)])
+    var msg = ""
+    try:
+      discard row.getInt(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of int32 range (len=10)"
+
+  test "getInt16 out-of-range failure omits the value":
+    let row = mkRow(@[some(toBytes("40000"))], @[mkField(OidInt2, 0)])
+    var msg = ""
+    try:
+      discard row.getInt16(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of int16 range (len=5)"
+
+  test "getInt overflow failure omits the cell":
+    # Beyond int64: parseInt itself raises, and its message echoes the cell,
+    # so the overflow path must not append it either.
+    const big = "1234567890123456789012345"
+    let row = mkRow(@[some(toBytes(big))], @[mkField(OidInt4, 0)])
+    var msg = ""
+    try:
+      discard row.getInt(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of range (len=" & $big.len & ")"
+    check big notin msg
+
+  test "getInt64 overflow failure omits the cell":
+    const big = "1234567890123456789012345"
+    let row = mkRow(@[some(toBytes(big))], @[mkField(OidInt8, 0)])
+    var msg = ""
+    try:
+      discard row.getInt64(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of range (len=" & $big.len & ")"
+    check big notin msg
+
+  test "getLine failure omits input and names the column":
+    const secret = "oops-SECRET-LINE-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidLine, 0)])
+    var msg = ""
+    try:
+      discard row.getLine(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "parseIntervalText failure omits input":
+    const bad = "nonsense-SECRET-INTV-XYZ"
+    var msg = ""
+    try:
+      discard parseIntervalText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid interval (len=" & $bad.len & ")"
+    check "SECRET-INTV-XYZ" notin msg
+
+  test "parseRangeText failure omits input":
+    const bad = "SECRET-RANGE-XYZ"
+    var msg = ""
+    try:
+      discard parseRangeText[int32](
+        bad,
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "range: invalid lower boundary (len=" & $bad.len & ")"
+    check bad notin msg
+
+  test "parseMultirangeText failure omits input":
+    const bad = "SECRET-MR-XYZ"
+    var msg = ""
+    try:
+      discard parseMultirangeText[int32](
+        bad,
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid multirange literal (len=" & $bad.len & ")"
+    check bad notin msg
+
+  test "parseCompositeText failure omits input":
+    const bad = "SECRET-COMP-XYZ"
+    var msg = ""
+    try:
+      discard parseCompositeText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid composite literal (len=" & $bad.len & ")"
+    check bad notin msg
+
+  test "getBox failure omits input and names the column":
+    const secret = "oops-SECRET-BOX-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidBox, 0)])
+    var msg = ""
+    try:
+      discard row.getBox(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getPath failure omits input and names the column":
+    const secret = "oops-SECRET-PATH-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidPath, 0)])
+    var msg = ""
+    try:
+      discard row.getPath(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getPolygon failure omits input and names the column":
+    const secret = "oops-SECRET-POLY-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidPolygon, 0)])
+    var msg = ""
+    try:
+      discard row.getPolygon(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getCircle failure omits input and names the column":
+    const secret = "oops-SECRET-CIRCLE-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidCircle, 0)])
+    var msg = ""
+    try:
+      discard row.getCircle(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getInterval failure omits input and names the column":
+    const secret = "nonsense-SECRET-INTV-ROW-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidInterval, 0)])
+    var msg = ""
+    try:
+      discard row.getInterval(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getLseg failure omits input and names the column":
+    const secret = "oops-SECRET-LSEG-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidLseg, 0)])
+    var msg = ""
+    try:
+      discard row.getLseg(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTimestamp failure omits input and names the column":
+    const secret = "not-a-time-SECRET-TS-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTimestamp, 0)])
+    var msg = ""
+    try:
+      discard row.getTimestamp(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getDate failure omits input and names the column":
+    const secret = "not-a-date-SECRET-DATE-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidDate, 0)])
+    var msg = ""
+    try:
+      discard row.getDate(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTime failure omits input and names the column":
+    const secret = "not-a-time-SECRET-TIME-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTime, 0)])
+    var msg = ""
+    try:
+      discard row.getTime(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTimeTz failure omits input and names the column":
+    const secret = "not-a-timetz-SECRET-TIMETZ-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTimeTz, 0)])
+    var msg = ""
+    try:
+      discard row.getTimeTz(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTimestampTz failure omits input and names the column":
+    const secret = "not-a-timestamptz-SECRET-TSTZ-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTimestampTz, 0)])
+    var msg = ""
+    try:
+      discard row.getTimestampTz(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getEnum on NULL names the column once":
+    let row: Row = @[none(seq[byte])]
+    var msg = ""
+    try:
+      discard getEnum[Mood](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0 is NULL"
+
+suite "ValueError-detail paths omit cell content":
+  # `pgTypeErrorOnValueError` drops the stdlib `ValueError` detail instead of
+  # appending it, so these branches report the context only. Exception text
+  # lands in logs while cell values may hold PII/secrets.
+  test "pgParseInt failure omits input":
+    const bad = "12x34SECRET_INT_XYZ"
+    var msg = ""
+    try:
+      discard pgParseInt(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid integer value"
+    check "SECRET_INT_XYZ" notin msg
+
+  test "pgParseBiggestInt failure omits input":
+    const bad = "99y99SECRET_BIG_XYZ"
+    var msg = ""
+    try:
+      discard pgParseBiggestInt(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid integer value"
+    check "SECRET_BIG_XYZ" notin msg
+
+  test "pgParseHexInt failure omits input":
+    const bad = "ZZSECRET_HEX_XYZ"
+    var msg = ""
+    try:
+      discard pgParseHexInt(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid hex value"
+    check "SECRET_HEX_XYZ" notin msg
+
+  test "parseTimeText frac failure omits the fraction":
+    const bad = "01:02:03.SECRET"
+    var msg = ""
+    try:
+      discard parseTimeText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid time (len=" & $bad.len & ")"
+    check "SECRET" notin msg
+
+  test "parseTimeText hour failure omits the slice":
+    const bad = "AB:CD:EF"
+    var msg = ""
+    try:
+      discard parseTimeText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid time (len=" & $bad.len & ")"
+    check "AB" notin msg
+
+  test "parseTimeTzText bad offset omits the offset":
+    const bad = "01:02:03+99999999999999999999"
+    var msg = ""
+    try:
+      discard parseTimeTzText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid timetz offset (len=" & $bad.len & ")"
+    check "99999999999999999999" notin msg
+
+  test "parseInetText bad mask omits the mask":
+    const bad = "1.2.3.4/SECRET_MASK_XYZ"
+    var msg = ""
+    try:
+      discard parseInetText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid inet value (len=" & $bad.len & ")"
+    check "SECRET_MASK_XYZ" notin msg
+
+  test "getInet bad mask omits the mask and names the column":
+    const secret = "1.2.3.4/SECRET_INET_XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidInet, 0)])
+    var msg = ""
+    try:
+      discard row.getInet(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: invalid inet value (len=" & $secret.len & ")"
+    check "SECRET_INET_XYZ" notin msg
+
+  test "getCidr bad mask omits the mask and names the column":
+    const secret = "1.2.3.4/SECRET_CIDR_XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidCidr, 0)])
+    var msg = ""
+    try:
+      discard row.getCidr(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: invalid inet value (len=" & $secret.len & ")"
+    check "SECRET_CIDR_XYZ" notin msg
+
+  test "parseRangeText element failure omits the bound":
+    const secret = "SECRET_RANGE_ELEM_XYZ"
+    var msg = ""
+    try:
+      discard parseRangeText[int32]("[" & secret & ",10)", pgParseInt32)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+
+  test "getPoint on NULL names the column once":
+    let row = mkRow(@[none(seq[byte])], @[mkField(OidPoint, 0)])
+    var msg = ""
+    try:
+      discard row.getPoint(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0 is NULL"

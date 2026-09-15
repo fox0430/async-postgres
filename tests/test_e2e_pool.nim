@@ -1179,11 +1179,13 @@ suite "E2E: pool withTransaction body-Defect handling":
 
       var caught: ref PgPoolError = nil
       try:
+        {.push warning[UnreachableCode]: off.} # body always raises
         pool.withTransaction(conn):
           discard await conn.exec(
             "INSERT INTO test_pool_tx_defect (val) VALUES ($1)", @[toPgParam("leak")]
           )
           raise newException(AssertionDefect, "boom")
+        {.pop.}
       except PgPoolError as e:
         caught = e
       doAssert caught != nil, "body Defect must surface as PgPoolError"

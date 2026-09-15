@@ -100,6 +100,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.pid = newConn.pid
   conn.secretKey = newConn.secretKey
   conn.serverParams = newConn.serverParams
+  conn.serverParamsBytes = newConn.serverParamsBytes
   conn.txStatus = newConn.txStatus
   conn.markReady()
   conn.createdAt = newConn.createdAt
@@ -297,7 +298,9 @@ template abortAndFailWaiter(
   conn.releaseNotifyWaiter(keepWaiter)
 
 proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.async.} =
-  ## Stop pump → ``csReady``/``csClosed``; may raise ``PgTimeoutError``.
+  ## Stop pump → ``csReady``/``csClosed``; may raise ``PgTimeoutError``
+  ## (reconnecting pump did not stop in time) or ``CancelledError``
+  ## (the caller cancelled the stop).
   ## ``keepWaiter`` preserves the parked waiter for a restart: internal only,
   ## for `listen` / `unlisten`, which stop a live pump on the way in.
   if conn.listenTask == nil or conn.listenTask.finished:
@@ -380,7 +383,9 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
 
 proc stopListening*(conn: PgConnection): Future[void] {.async.} =
   ## Stop the notification pump, returning the connection to ``csReady``
-  ## (``csClosed`` if the pump died); may raise ``PgTimeoutError``.
+  ## (``csClosed`` if the pump died); may raise ``PgTimeoutError``
+  ## (pump did not stop in time) or ``CancelledError``
+  ## (the caller cancelled the stop).
   ##
   ## The channels stay subscribed server-side, so notifications queue there
   ## and a later `listen` resumes without losing them — unlike `unlisten`,
@@ -424,7 +429,11 @@ proc restartPumpOrFailWaiter(conn: PgConnection, restarted: bool) =
     )
 
 proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
-  ## Subscribe to channel and start pump. Keeps parked ``waitNotification`` across restart; may raise ``PgTimeoutError``.
+  ## Subscribe to channel and start pump. Keeps parked ``waitNotification`` across restart;
+  ## may raise ``PgTimeoutError`` (pump stop did not complete in time),
+  ## ``PgStateError``/``PgConnectionError`` (connection not ready or lost),
+  ## ``PgQueryError``/``PgProtocolError`` (LISTEN round trip failed),
+  ## or ``CancelledError`` (the caller cancelled the call).
   # Reconnecting pump is in ``csReady`` but still owns ``listenTask``; stop it first to keep waiter.
   let restarted = conn.state == csListening or conn.listenReconnecting
   try:
@@ -446,6 +455,9 @@ proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
 
 proc unlisten*(conn: PgConnection, channel: string): Future[void] {.async.} =
   ## Unsubscribe; stops pump if no channels remain (keeps waiter across restart except last).
+  ## May raise the same errors as ``listen`` (``PgTimeoutError`` from the pump stop,
+  ## ``PgStateError``/``PgConnectionError``, ``PgQueryError``/``PgProtocolError``
+  ## from the UNLISTEN round trip, or ``CancelledError``).
   let restarted = conn.state == csListening or conn.listenReconnecting
   try:
     if restarted:
