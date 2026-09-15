@@ -34,7 +34,7 @@ proc main() {.async.} =
 
   # Fetch rows in chunks until exhausted
   var total = 0
-  while not cursor.exhausted:
+  while not cursor.exhausted():
     let rows = await cursor.fetchNext()
     echo "Fetched ", rows.len, " rows:"
     for row in rows:

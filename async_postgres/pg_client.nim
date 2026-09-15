@@ -144,6 +144,10 @@ export cursor.fetchNext
 export cursor.close
 export cursor.withCursor
 export cursor.openCursor
+# Read-only `Cursor` field accessors (fields are private).
+export cursor.conn
+export cursor.fields
+export cursor.exhausted
 
 # `direct` — zero-allocation macros.
 export direct.queryDirect

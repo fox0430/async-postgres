@@ -142,7 +142,10 @@ async_postgres/pg_client.nim	export core.isRetryableTxError
 async_postgres/pg_client.nim	export cursor.Cursor
 async_postgres/pg_client.nim	export cursor.close
 async_postgres/pg_client.nim	export cursor.columnIndex
+async_postgres/pg_client.nim	export cursor.conn
+async_postgres/pg_client.nim	export cursor.exhausted
 async_postgres/pg_client.nim	export cursor.fetchNext
+async_postgres/pg_client.nim	export cursor.fields
 async_postgres/pg_client.nim	export cursor.openCursor
 async_postgres/pg_client.nim	export cursor.withCursor
 async_postgres/pg_client.nim	export direct.execDirect

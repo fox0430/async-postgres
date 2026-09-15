@@ -189,7 +189,7 @@ suite "E2E: Multi-Statement and Large Results":
         totalRows += chunk.len
 
       doAssert totalRows == 10000
-      doAssert cursor.exhausted
+      doAssert cursor.exhausted()
       doAssert conn.state == csReady
       await conn.close()
 
