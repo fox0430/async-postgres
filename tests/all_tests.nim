@@ -5,9 +5,10 @@ import
   test_e2e_connection, test_e2e_convenience, test_e2e_copy, test_e2e_cursor,
   test_e2e_listen, test_e2e_misc, test_e2e_pool, test_e2e_query, test_e2e_transaction,
   test_e2e_types, test_fill_recvbuf, test_keepalive, test_largeobject,
-  test_listen_reconnect, test_network_failure, test_physical_replication, test_pool,
-  test_protocol, test_protocol_fuzz, test_replication, test_replication_keepalive,
-  test_rowdata, test_saslprep, test_session_attrs, test_sql, test_ssl,
-  test_tls_error_paths, test_tracing, test_transaction_cancel, test_tx_cleanup_defect,
-  test_types, test_pool_cluster
+  test_largeobject_parse, test_listen_reconnect, test_network_failure,
+  test_physical_replication, test_pool, test_protocol, test_protocol_fuzz,
+  test_replication, test_replication_keepalive, test_rowdata, test_saslprep,
+  test_session_attrs, test_sql, test_ssl, test_tls_error_paths, test_tracing,
+  test_transaction_cancel, test_tx_cleanup_defect, test_type_lookup, test_types,
+  test_pool_cluster
 {.pop.}
