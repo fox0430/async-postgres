@@ -756,11 +756,13 @@ proc hexNibble*(c: char): int =
     -1
 
 proc decodeHexPair*(s: string, i: int, errCtx: string): byte =
+  ## Failures report the position and input length only (see `PgTypeError`).
   let hi = hexNibble(s[i])
   let lo = hexNibble(s[i + 1])
   if hi < 0 or lo < 0:
     raise newException(
-      PgTypeError, errCtx & ": non-hex character at position " & $i & " in " & s.escape
+      PgTypeError,
+      errCtx & ": non-hex character at position " & $i & " (len=" & $s.len & ")",
     )
   byte((hi shl 4) or lo)
 
@@ -818,7 +820,7 @@ proc writeUuidAt(buf: var openArray[byte], pos: int, v: PgUuid) =
     raise newException(
       PgTypeError,
       "Invalid PgUuid: expected 32 hex digits (dashes optional), got " & $hex.len &
-        " in " & string(v).escape,
+        " (len=" & $(string(v)).len & ")",
     )
   for i in 0 ..< 16:
     buf[pos + i] = decodeHexPair(hex, i * 2, "Invalid PgUuid")
@@ -878,13 +880,14 @@ proc writeMacAt(buf: var openArray[byte], pos: int, s: string, n: int, label: st
   if parts.len != n:
     raise newException(
       PgTypeError,
-      prefix & ": expected " & $n & " colon-separated octets, got " & $parts.len & " in " &
-        s.escape,
+      prefix & ": expected " & $n & " colon-separated octets, got " & $parts.len &
+        " (len=" & $s.len & ")",
     )
   for i in 0 ..< n:
     if parts[i].len != 2:
       raise newException(
-        PgTypeError, prefix & ": octet " & $i & " is not 2 hex digits in " & s.escape
+        PgTypeError,
+        prefix & ": octet " & $i & " is not 2 hex digits (len=" & $s.len & ")",
       )
     buf[pos + i] = decodeHexPair(parts[i], 0, prefix)
 

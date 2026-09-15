@@ -3508,13 +3508,16 @@ suite "PgMoney":
     check parsePgMoney("($1,234.56)", fromNegative) == initPgMoney(-123456)
     check parsePgMoney("$1,234.56", fromNegative) == initPgMoney(123456)
 
-  test "inferPgMoneyConventions reports the input, not the conventions":
+  test "inferPgMoneyConventions reports the input length, not the input":
+    # Decode failures must not echo cell content (PII/secrets land in
+    # logs via exception text). The message carries the length instead.
     for bad in ["1.000.00", "1..00", "(1.00", "1.00)"]:
       try:
         discard parsePgMoney(bad)
         check false
       except PgTypeError as e:
-        check e.msg == "Invalid money format: " & bad
+        check e.msg == "Invalid money format (len=" & $bad.len & ")"
+        check bad notin e.msg
 
   test "inferPgMoneyConventions rejects what no single locale explains":
     # Two different group separators.
@@ -10817,3 +10820,538 @@ suite "getArrayND accepts the 1-D character and bit OIDs":
     let bin = encodeBinaryArray(OidBit, @[@[0'u8, 0, 0, 1, 0x80]])
     let row = mkRow(@[some(bin)], @[mkField(OidBitArray, 1)])
     check getArrayND[PgBit](row, 0).elements.len == 1
+
+suite "type-decode failures omit cell content":
+  test "getJson failure reports length, not content":
+    # Cell values may hold PII/secrets and exception text lands in
+    # logs, so decode failures must not echo the cell.
+    const secret = "SECRET_JSON_PAYLOAD_XYZ"
+    let row =
+      mkRow(@[some(toBytes("{not json " & secret & "}"))], @[mkField(OidJson, 0)])
+    var msg = ""
+    try:
+      discard row.getJson(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getBytesArray failure omits the cell":
+    # A malformed hex element is rejected by decodeHexPair, which must report
+    # position/len only: bytea cells may hold PII or secrets.
+    const secret = "PII_SECRET_XYZ"
+    let row = Row @[some(toBytes("{\"\\\\x4142ZZ" & secret & "\"}"))]
+    var msg = ""
+    try:
+      discard row.getBytesArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "at position" in msg
+    check "len=" in msg
+
+  test "getJsonArray failure omits the element":
+    const secret = "oops-SECRET-JSONARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getJsonArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getLineArray failure omits the element":
+    const secret = "oops-SECRET-LINEARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getLineArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getLsegArray failure omits the element":
+    const secret = "oops-SECRET-LSEGARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getLsegArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getBoxArray failure omits the element":
+    const secret = "oops-SECRET-BOXARR-XYZ"
+    let row = mkRow(@[some(toBytes("{" & secret & "}"))], @[mkField(OidBox, 0)])
+    var msg = ""
+    try:
+      discard row.getBoxArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getPathArray failure omits the element":
+    const secret = "oops-SECRET-PATHARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getPathArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getPolygonArray failure omits the element":
+    const secret = "oops-SECRET-POLYARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getPolygonArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "getCircleArray failure omits the element":
+    const secret = "oops-SECRET-CIRCARR-XYZ"
+    let row: Row = @[some(toBytes("{" & secret & "}"))]
+    var msg = ""
+    try:
+      discard row.getCircleArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+
+  test "parsePgNumeric failure omits input":
+    const bad = "12a34SECRET_NUM_XYZ"
+    var msg = ""
+    try:
+      discard parsePgNumeric(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid numeric (len=" & $bad.len & ")"
+    check "SECRET_NUM_XYZ" notin msg
+
+  test "parsePgBoolText failure omits input":
+    const bad = "maybeSECRET_BOOL_XYZ"
+    var msg = ""
+    try:
+      discard parsePgBoolText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid boolean value (len=" & $bad.len & ")"
+    check "SECRET_BOOL_XYZ" notin msg
+
+  test "getPoint failure omits input":
+    const secret = "SECRET_GEO_XYZ"
+    let row = mkRow(@[some(toBytes("(oops " & secret & ")"))], @[mkField(OidPoint, 0)])
+    var msg = ""
+    try:
+      discard row.getPoint(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getEnum failure omits the label, including the ValueError detail":
+    # The stdlib parseEnum error echoes the label; pgParseEnum must drop that
+    # detail instead of appending it.
+    const secret = "bogus-SECRET-ENUM-XYZ"
+    let row: Row = @[some(toBytes(secret))]
+    var msg = ""
+    try:
+      discard getEnum[Mood](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Mood" in msg
+    check "Invalid enum value: " notin msg
+
+  test "getInt out-of-range failure omits the value":
+    let row = mkRow(@[some(toBytes("5000000000"))], @[mkField(OidInt4, 0)])
+    var msg = ""
+    try:
+      discard row.getInt(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of int32 range (len=10)"
+
+  test "getInt16 out-of-range failure omits the value":
+    let row = mkRow(@[some(toBytes("40000"))], @[mkField(OidInt2, 0)])
+    var msg = ""
+    try:
+      discard row.getInt16(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of int16 range (len=5)"
+
+  test "getInt overflow failure omits the cell":
+    # Beyond int64: parseInt itself raises, and its message echoes the cell,
+    # so the overflow path must not append it either.
+    const big = "1234567890123456789012345"
+    let row = mkRow(@[some(toBytes(big))], @[mkField(OidInt4, 0)])
+    var msg = ""
+    try:
+      discard row.getInt(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of range (len=" & $big.len & ")"
+    check big notin msg
+
+  test "getInt64 overflow failure omits the cell":
+    const big = "1234567890123456789012345"
+    let row = mkRow(@[some(toBytes(big))], @[mkField(OidInt8, 0)])
+    var msg = ""
+    try:
+      discard row.getInt64(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: integer value out of range (len=" & $big.len & ")"
+    check big notin msg
+
+  test "getLine failure omits input and names the column":
+    const secret = "oops-SECRET-LINE-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidLine, 0)])
+    var msg = ""
+    try:
+      discard row.getLine(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "parseIntervalText failure omits input":
+    const bad = "nonsense-SECRET-INTV-XYZ"
+    var msg = ""
+    try:
+      discard parseIntervalText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid interval (len=" & $bad.len & ")"
+    check "SECRET-INTV-XYZ" notin msg
+
+  test "parseRangeText failure omits input":
+    const bad = "SECRET-RANGE-XYZ"
+    var msg = ""
+    try:
+      discard parseRangeText[int32](
+        bad,
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "range: invalid lower boundary (len=" & $bad.len & ")"
+    check bad notin msg
+
+  test "parseMultirangeText failure omits input":
+    const bad = "SECRET-MR-XYZ"
+    var msg = ""
+    try:
+      discard parseMultirangeText[int32](
+        bad,
+        proc(s: string): int32 =
+          int32(parseInt(s)),
+      )
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid multirange literal (len=" & $bad.len & ")"
+    check bad notin msg
+
+  test "parseCompositeText failure omits input":
+    const bad = "SECRET-COMP-XYZ"
+    var msg = ""
+    try:
+      discard parseCompositeText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid composite literal (len=" & $bad.len & ")"
+    check bad notin msg
+
+  test "getBox failure omits input and names the column":
+    const secret = "oops-SECRET-BOX-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidBox, 0)])
+    var msg = ""
+    try:
+      discard row.getBox(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getPath failure omits input and names the column":
+    const secret = "oops-SECRET-PATH-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidPath, 0)])
+    var msg = ""
+    try:
+      discard row.getPath(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getPolygon failure omits input and names the column":
+    const secret = "oops-SECRET-POLY-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidPolygon, 0)])
+    var msg = ""
+    try:
+      discard row.getPolygon(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getCircle failure omits input and names the column":
+    const secret = "oops-SECRET-CIRCLE-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidCircle, 0)])
+    var msg = ""
+    try:
+      discard row.getCircle(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getInterval failure omits input and names the column":
+    const secret = "nonsense-SECRET-INTV-ROW-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidInterval, 0)])
+    var msg = ""
+    try:
+      discard row.getInterval(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getLseg failure omits input and names the column":
+    const secret = "oops-SECRET-LSEG-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidLseg, 0)])
+    var msg = ""
+    try:
+      discard row.getLseg(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTimestamp failure omits input and names the column":
+    const secret = "not-a-time-SECRET-TS-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTimestamp, 0)])
+    var msg = ""
+    try:
+      discard row.getTimestamp(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getDate failure omits input and names the column":
+    const secret = "not-a-date-SECRET-DATE-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidDate, 0)])
+    var msg = ""
+    try:
+      discard row.getDate(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTime failure omits input and names the column":
+    const secret = "not-a-time-SECRET-TIME-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTime, 0)])
+    var msg = ""
+    try:
+      discard row.getTime(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTimeTz failure omits input and names the column":
+    const secret = "not-a-timetz-SECRET-TIMETZ-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTimeTz, 0)])
+    var msg = ""
+    try:
+      discard row.getTimeTz(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getTimestampTz failure omits input and names the column":
+    const secret = "not-a-timestamptz-SECRET-TSTZ-XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidTimestampTz, 0)])
+    var msg = ""
+    try:
+      discard row.getTimestampTz(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "len=" in msg
+    check "Column 0" in msg
+
+  test "getEnum on NULL names the column once":
+    let row: Row = @[none(seq[byte])]
+    var msg = ""
+    try:
+      discard getEnum[Mood](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0 is NULL"
+
+suite "ValueError-detail paths omit cell content":
+  # `pgTypeErrorOnValueError` drops the stdlib `ValueError` detail instead of
+  # appending it, so these branches report the context only. Exception text
+  # lands in logs while cell values may hold PII/secrets.
+  test "pgParseInt failure omits input":
+    const bad = "12x34SECRET_INT_XYZ"
+    var msg = ""
+    try:
+      discard pgParseInt(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid integer value"
+    check "SECRET_INT_XYZ" notin msg
+
+  test "pgParseBiggestInt failure omits input":
+    const bad = "99y99SECRET_BIG_XYZ"
+    var msg = ""
+    try:
+      discard pgParseBiggestInt(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid integer value"
+    check "SECRET_BIG_XYZ" notin msg
+
+  test "pgParseHexInt failure omits input":
+    const bad = "ZZSECRET_HEX_XYZ"
+    var msg = ""
+    try:
+      discard pgParseHexInt(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid hex value"
+    check "SECRET_HEX_XYZ" notin msg
+
+  test "parseTimeText frac failure omits the fraction":
+    const bad = "01:02:03.SECRET"
+    var msg = ""
+    try:
+      discard parseTimeText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid time (len=" & $bad.len & ")"
+    check "SECRET" notin msg
+
+  test "parseTimeText hour failure omits the slice":
+    const bad = "AB:CD:EF"
+    var msg = ""
+    try:
+      discard parseTimeText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid time (len=" & $bad.len & ")"
+    check "AB" notin msg
+
+  test "parseTimeTzText bad offset omits the offset":
+    const bad = "01:02:03+99999999999999999999"
+    var msg = ""
+    try:
+      discard parseTimeTzText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Invalid timetz offset (len=" & $bad.len & ")"
+    check "99999999999999999999" notin msg
+
+  test "parseInetText bad mask omits the mask":
+    const bad = "1.2.3.4/SECRET_MASK_XYZ"
+    var msg = ""
+    try:
+      discard parseInetText(bad)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "invalid inet value (len=" & $bad.len & ")"
+    check "SECRET_MASK_XYZ" notin msg
+
+  test "getInet bad mask omits the mask and names the column":
+    const secret = "1.2.3.4/SECRET_INET_XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidInet, 0)])
+    var msg = ""
+    try:
+      discard row.getInet(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: invalid inet value (len=" & $secret.len & ")"
+    check "SECRET_INET_XYZ" notin msg
+
+  test "getCidr bad mask omits the mask and names the column":
+    const secret = "1.2.3.4/SECRET_CIDR_XYZ"
+    let row = mkRow(@[some(toBytes(secret))], @[mkField(OidCidr, 0)])
+    var msg = ""
+    try:
+      discard row.getCidr(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0: invalid inet value (len=" & $secret.len & ")"
+    check "SECRET_CIDR_XYZ" notin msg
+
+  test "parseRangeText element failure omits the bound":
+    const secret = "SECRET_RANGE_ELEM_XYZ"
+    var msg = ""
+    try:
+      discard parseRangeText[int32]("[" & secret & ",10)", pgParseInt32)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+
+  test "getPoint on NULL names the column once":
+    let row = mkRow(@[none(seq[byte])], @[mkField(OidPoint, 0)])
+    var msg = ""
+    try:
+      discard row.getPoint(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg == "Column 0 is NULL"

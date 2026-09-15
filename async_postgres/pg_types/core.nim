@@ -330,21 +330,21 @@ const
 # `PgTypeError` instead of a raw `ValueError`. This applies to the scalar
 # accessors too: the non-throwing `parseInt(s, v)` overload returns 0 only for
 # the "no digits" case but still raises a raw `ValueError` on overflow, so
-# `getInt`/`getInt16`/`getInt64` wrap the parse in `pgTypeErrorOnValueError`
+# `getInt`/`getInt16`/`getInt64` route the parse through this helper as well
 # (and `getFloat`/`getFloat32` route through `pgParseFloat`). These helpers
 # carry the same guarantee to the array/range/bytea/geometric/composite paths.
 
 template pgTypeErrorOnValueError*(context: string, body: untyped): untyped =
-  ## Evaluate ``body`` and convert any standard ``ValueError`` it raises into a
-  ## `PgTypeError` whose message is ``context`` plus the original detail. Use at
-  ## call sites that parse a server text value but need a context-specific
-  ## message the generic ``pgParse*`` helpers can't carry (function name,
-  ## protocol field, enum type, …). Keeps the ``except PgError`` contract (see
-  ## ``pg_errors``) without re-spelling the same try/except at every site.
+  ## Evaluate ``body``, converting any standard ``ValueError`` into a
+  ## `PgTypeError` that carries ``context`` only — the original detail would
+  ## echo the parsed input (see ``PgTypeError``). Use where the generic
+  ## ``pgParse*`` helpers can't carry a context-specific message (function
+  ## name, protocol field, enum type, …). Keeps the ``except PgError`` contract
+  ## (see ``pg_errors``) without re-spelling the try/except at every site.
   try:
     body
   except ValueError:
-    raise newException(PgTypeError, context & " (" & getCurrentExceptionMsg() & ")")
+    raise newException(PgTypeError, context)
 
 proc pgParseInt*(s: string): int =
   ## Parse a text integer, converting `ValueError` (invalid or overflowing) to `PgTypeError`.
@@ -357,7 +357,8 @@ proc pgParseInt32*(s: string): int32 {.gcsafe, raises: [CatchableError].} =
   ## Effect signature lets ``parseRangeText``/``parseMultirangeText`` take it directly.
   let v = pgParseInt(s)
   if v < int(int32.low) or v > int(int32.high):
-    raise newException(PgTypeError, "integer value out of int32 range: " & s)
+    raise
+      newException(PgTypeError, "integer value out of int32 range (len=" & $s.len & ")")
   int32(v)
 
 proc pgParseInt16*(s: string): int16 =
@@ -365,7 +366,8 @@ proc pgParseInt16*(s: string): int16 =
   ## Plain ``int16(parseInt)`` would silently truncate (wrap) in release builds.
   let v = pgParseInt(s)
   if v < int(int16.low) or v > int(int16.high):
-    raise newException(PgTypeError, "integer value out of int16 range: " & s)
+    raise
+      newException(PgTypeError, "integer value out of int16 range (len=" & $s.len & ")")
   int16(v)
 
 proc pgParseBiggestInt*(s: string): int64 {.gcsafe, raises: [CatchableError].} =
@@ -374,15 +376,6 @@ proc pgParseBiggestInt*(s: string): int64 {.gcsafe, raises: [CatchableError].} =
   ## ``parseRangeText[int64]`` get an exact match without alias-widening.
   pgTypeErrorOnValueError("invalid integer value"):
     parseBiggestInt(s)
-
-proc oaToString(s: openArray[char]): string =
-  ## Materialise an ``openArray[char]`` view into a ``string``. Only used on the
-  ## error path of the float parsers, which take a zero-copy view so the scalar
-  ## ``getFloat``/``getFloat32`` accessors can parse straight out of the row
-  ## buffer without an allocation.
-  result = newString(s.len)
-  for i in 0 ..< s.len:
-    result[i] = s[i]
 
 proc pgParseFloat*(s: openArray[char]): float =
   ## Parse a text float, raising `PgTypeError` on malformed input. Also accepts
@@ -400,7 +393,7 @@ proc pgParseFloat*(s: openArray[char]): float =
   # view, without its throwing `string` overload's allocation/`ValueError`.
   let n = parseutils.parseFloat(s, result)
   if n == 0 or n != s.len:
-    raise newException(PgTypeError, "invalid float value: " & oaToString(s))
+    raise newException(PgTypeError, "invalid float value (len=" & $s.len & ")")
 
 proc pgParseFloat32*(s: openArray[char]): float32 =
   ## Parse a text float into float32, raising `PgTypeError` on malformed input and
@@ -412,7 +405,7 @@ proc pgParseFloat32*(s: openArray[char]): float32 =
   result = float32(v)
   if result.classify in {fcInf, fcNegInf} and v.classify notin {fcInf, fcNegInf}:
     raise
-      newException(PgTypeError, "float value out of float32 range: " & oaToString(s))
+      newException(PgTypeError, "float value out of float32 range (len=" & $s.len & ")")
 
 proc pgParseHexInt*(s: string): int =
   ## Parse a hex string, converting `ValueError` to `PgTypeError`.
@@ -435,7 +428,7 @@ proc parsePgBoolText*(s: string): bool =
   of "f", "false", "0":
     false
   else:
-    raise newException(PgTypeError, "Invalid boolean value: " & s)
+    raise newException(PgTypeError, "Invalid boolean value (len=" & $s.len & ")")
 
 proc `+`*(a: int, b: RelOff): int {.inline.} =
   ## Combine an absolute parent-buffer origin with a relative decoder offset.
@@ -843,16 +836,16 @@ proc pgMoneyFromDigits(
   for ch in whole & frac:
     let d = uint64(ord(ch) - ord('0'))
     if mag > (high(uint64) - d) div 10'u64:
-      raise newException(PgTypeError, "Money value out of range: " & src)
+      raise newException(PgTypeError, "Money value out of range (len=" & $src.len & ")")
     mag = mag * 10 + d
   if neg:
     if mag == magMax + 1'u64:
       return initPgMoney(low(int64), scale)
     if mag > magMax:
-      raise newException(PgTypeError, "Money value out of range: " & src)
+      raise newException(PgTypeError, "Money value out of range (len=" & $src.len & ")")
     return initPgMoney(-int64(mag), scale)
   if mag > magMax:
-    raise newException(PgTypeError, "Money value out of range: " & src)
+    raise newException(PgTypeError, "Money value out of range (len=" & $src.len & ")")
   initPgMoney(int64(mag), scale)
 
 proc parsePgMoney*(s: string, conv: PgMoneyConventions): PgMoney =
@@ -875,7 +868,7 @@ proc parsePgMoney*(s: string, conv: PgMoneyConventions): PgMoney =
   template takeSign() =
     if i < t.len and (t[i] == '-' or t[i] == '+'):
       if signSeen:
-        raise newException(PgTypeError, "Invalid money format: " & s)
+        raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
       signSeen = true
       if t[i] == '-':
         neg = true
@@ -888,13 +881,13 @@ proc parsePgMoney*(s: string, conv: PgMoneyConventions): PgMoney =
       else:
         0
     if n == 0:
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     i += n
 
   takeSign()
   if conv.symbolRaw.len > 0 and conv.symbolBeforeRaw:
     if not t.continuesWith(conv.symbolRaw, i):
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     i += conv.symbolRaw.len
     if conv.sepBySpaceRaw:
       takeSpace()
@@ -917,33 +910,33 @@ proc parsePgMoney*(s: string, conv: PgMoneyConventions): PgMoney =
         i + conv.thousandsSepRaw.len < t.len and
         isPgMoneyDigit(t[i + conv.thousandsSepRaw.len]):
       if groupLen == 0 or groupLen > groupSize or (seenSep and groupLen != groupSize):
-        raise newException(PgTypeError, "Invalid money format: " & s)
+        raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
       seenSep = true
       groupLen = 0
       i += conv.thousandsSepRaw.len
     else:
       break
   if digits.len == 0 or (seenSep and groupLen != groupSize):
-    raise newException(PgTypeError, "Invalid money format: " & s)
+    raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
   var fracPart = ""
   let fracDigits = int(conv.fracDigitsRaw)
   if fracDigits > 0:
     if i >= t.len or t[i] != conv.decimalSepRaw:
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     inc i
     for _ in 0 ..< fracDigits:
       if i >= t.len or not isPgMoneyDigit(t[i]):
-        raise newException(PgTypeError, "Invalid money format: " & s)
+        raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
       fracPart.add(t[i])
       inc i
   if conv.symbolRaw.len > 0 and not conv.symbolBeforeRaw:
     if conv.sepBySpaceRaw:
       takeSpace()
     if not t.continuesWith(conv.symbolRaw, i):
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     i += conv.symbolRaw.len
   if i != t.len:
-    raise newException(PgTypeError, "Invalid money format: " & s)
+    raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
   pgMoneyFromDigits(digits, fracPart, neg, fracDigits, s)
 
 proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConventions =
@@ -981,7 +974,7 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
         first = k
       last = k
   if first < 0:
-    raise newException(PgTypeError, "Invalid money format: " & s)
+    raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
   # Prefix: at most one sign, anywhere among the symbol bytes.
   var pre = ""
   var signCount = 0
@@ -991,11 +984,11 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
     else:
       pre.add(ch)
   if signCount > 1 or (parens and signCount > 0):
-    raise newException(PgTypeError, "Invalid money format: " & s)
+    raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
   let suf = t[last + 1 ..^ 1]
   for ch in suf:
     if ch == '-' or ch == '+':
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
   # The space adjacent to the digits is ``sepBySpace``; the rest is the symbol,
   # which may sit on one side only.
   let (preInner, preSpace) = pgMoneyTrimTrailingSpace(pre)
@@ -1003,7 +996,7 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
   let preSym = pgMoneyTrimLeadingSpace(preInner)[0]
   let sufSym = pgMoneyTrimTrailingSpace(sufInner)[0]
   if preSym.len > 0 and sufSym.len > 0:
-    raise newException(PgTypeError, "Invalid money format: " & s)
+    raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
   var symbol = ""
   var symbolBefore = true
   var sepBySpace = false
@@ -1032,7 +1025,7 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
       continue
     let n = pgMoneyGroupSepLen(t, k)
     if n == 0 or k + n > last:
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     seps.add(t[k ..< k + n])
     runs.add(run)
     run = 0
@@ -1049,7 +1042,7 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
     # no locale carries 4, so accepting it there would silently read a 4-decimal
     # "1.2345" as 12345.
     if n != 3 and not (allowFour and n == 4):
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     groupDigits = n
 
   if fracDigits > 0:
@@ -1060,13 +1053,13 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
         break
     # The decimal separator must come last: "1.2 3" is not a number.
     if di < 0 or di != seps.high:
-      raise newException(PgTypeError, "Invalid money format: " & s)
+      raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     decimalSep = seps[di][0]
     for idx in 0 ..< di:
       if thousandsSep.len == 0:
         thousandsSep = seps[idx]
       elif thousandsSep != seps[idx]:
-        raise newException(PgTypeError, "Invalid money format: " & s)
+        raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     if di >= 1:
       inferGroupDigits(runs[1], allowFour = true)
   else:
@@ -1074,7 +1067,7 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
       if thousandsSep.len == 0:
         thousandsSep = sp
       elif thousandsSep != sp:
-        raise newException(PgTypeError, "Invalid money format: " & s)
+        raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
     if seps.len >= 1:
       inferGroupDigits(runs[1], allowFour = false)
     if thousandsSep == ".":
@@ -1092,7 +1085,7 @@ proc inferPgMoneyConventions*(s: string, fracDigits: int = 2): PgMoneyConvention
     )
   except PgTypeError:
     # Construction messages name conventions the caller never supplied.
-    raise newException(PgTypeError, "Invalid money format: " & s)
+    raise newException(PgTypeError, "Invalid money format (len=" & $s.len & ")")
 
 proc parsePgMoney*(s: string, scale: int = 2): PgMoney =
   ## Parse a money string whose locale conventions are unknown: infer them
@@ -1178,7 +1171,9 @@ proc parseBitString*(s: string): PgBit =
       let bitIdx = 7 - (i mod 8)
       data[byteIdx] = data[byteIdx] or byte(1 shl bitIdx)
     elif s[i] != '0':
-      raise newException(PgTypeError, "Invalid bit character: " & $s[i])
+      raise newException(
+        PgTypeError, "Invalid bit character at offset=" & $i & " (len=" & $s.len & ")"
+      )
   initPgBit(nbits, data)
 
 proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
@@ -1193,14 +1188,14 @@ proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} 
     sign = pgNegative
     src = src[1 .. ^1]
   if src.len == 0:
-    raise newException(PgTypeError, "Invalid numeric: " & s)
+    raise newException(PgTypeError, "Invalid numeric (len=" & $s.len & ")")
   for c in src:
     if c notin {'0' .. '9', '.'}:
-      raise newException(PgTypeError, "Invalid numeric: " & s)
+      raise newException(PgTypeError, "Invalid numeric (len=" & $s.len & ")")
   if src.count('.') > 1:
-    raise newException(PgTypeError, "Invalid numeric: " & s)
+    raise newException(PgTypeError, "Invalid numeric (len=" & $s.len & ")")
   if src == ".":
-    raise newException(PgTypeError, "Invalid numeric: " & s)
+    raise newException(PgTypeError, "Invalid numeric (len=" & $s.len & ")")
   # Split integer and fractional parts
   let dotPos = src.find('.')
   var intPart, fracPart: string

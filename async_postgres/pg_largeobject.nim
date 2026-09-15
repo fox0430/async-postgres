@@ -102,13 +102,13 @@ proc parseLoInt(s, fn: string): BiggestInt =
   ## Convert a numeric scalar returned by a Large Object server function to an
   ## integer, surfacing a malformed response as `PgTypeError` (keeps the
   ## ``except PgError`` contract) instead of leaking a raw `ValueError`.
-  pgTypeErrorOnValueError(fn & " returned a non-numeric result: " & s):
+  pgTypeErrorOnValueError(fn & " returned a non-numeric result (len=" & $s.len & ")"):
     parseBiggestInt(s)
 
 proc parseLoOid(s, fn: string): Oid =
   ## Convert an OID returned by a Large Object server function, surfacing a
   ## malformed response as `PgTypeError` instead of a raw `ValueError`.
-  pgTypeErrorOnValueError(fn & " returned a non-numeric OID: " & s):
+  pgTypeErrorOnValueError(fn & " returned a non-numeric OID (len=" & $s.len & ")"):
     Oid(parseUInt(s))
 
 proc oidToInt32(oid: Oid): int32 =

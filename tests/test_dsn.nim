@@ -1,4 +1,4 @@
-import std/[random, unittest, os, tempfiles]
+import std/[random, unittest, os, tempfiles, strutils]
 when defined(posix):
   import std/posix
 
@@ -1253,3 +1253,257 @@ suite "applyParam multi-host":
         caught = e
       check caught != nil
       check (caught of PgError)
+
+suite "DSN parse failures omit secret content":
+  test "malformed percent-encoding in password reports offset/len, not content":
+    # pctDecode also decodes userinfo, which may hold the password.
+    # Exception text routinely lands in logs, so the fragment must not echo.
+    const secret = "s3cr3t-pw-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://user:" & secret & "%zz@host/db")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "offset=" in msg
+    check "len=" in msg
+    check "userinfo" in msg
+
+  test "encoded zero byte in password omits content":
+    const secret = "Sup3rS3cretPW-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://user:" & secret & "%00trailer@host/db")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "offset=" in msg
+    check "len=" in msg
+    check "userinfo" in msg
+
+  test "malformed percent-encoding in query value names the component":
+    const secret = "qsecret-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://host/db?password=" & secret & "%zz")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "query value" in msg
+    check "item #0" in msg
+
+  test "query pctDecode failure locates the faulty item":
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://host/db?a=1&password=BAD%zz&c=3")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check "BAD%zz" notin msg
+    check "item #1" in msg
+    check "query value" in msg
+
+  test "host pctDecode failure locates the faulty element":
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://okhost,ba%zzd/db")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check "ba%zzd" notin msg
+    check "element #1" in msg
+
+  test "malformed percent-encoding in database omits content":
+    const secret = "SECRET-DB-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://host/" & secret & "%zz")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "database" in msg
+    check "offset=" in msg
+    check "len=" in msg
+
+  test "malformed percent-encoding in query key omits content":
+    const secret = "SECRETKEY-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://host/db?" & secret & "%zz=1")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "query key" in msg
+    check "item #0" in msg
+
+  test "malformed percent-encoding in port omits content":
+    const secret = "SECRET-PORT-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://myhost:12" & secret & "%zz/db")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "port" in msg
+    check "element #0" in msg
+
+  test "query item without '=' omits the item text":
+    # Query values may hold secrets (e.g. `password=...`), so the raw item
+    # must not echo.
+    const item = "topsecretparam-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://host/db?" & item)
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check item notin msg
+    check "item #" in msg
+
+  test "query item index locates the faulty item":
+    var first, second: string
+    try:
+      discard parseDsn("postgresql://host/db?a=1&baditem&c=3")
+    except PgConfigError as e:
+      first = e.msg
+    try:
+      discard parseDsn("postgresql://host/db?a=1&b=2&baditem")
+    except PgConfigError as e:
+      second = e.msg
+    check first.len > 0
+    check second.len > 0
+    check first != second
+    check "item #1" in first
+    check "item #2" in second
+
+  test "empty query key omits the value":
+    const val = "topsecretvalue-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://host/db?=" & val)
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check val notin msg
+    check "item #" in msg
+
+  test "keyword=value stray token omits the fragment":
+    # An unquoted value with whitespace leaves a secret fragment parsed as a
+    # key; the error must locate it by offset/len, not echo it.
+    const secret = "sup3rSECRET-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("host=localhost password=my " & secret & " tail")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "offset=" in msg
+    check "len=" in msg
+
+  test "keyword=value unterminated quote omits the key":
+    # Unknown keys are collected as extra parameters, so the key text can
+    # carry a secret too.
+    const secretKey = "SECRETKEY-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn(secretKey & "='unterminated")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secretKey notin msg
+    check "offset=" in msg
+
+  test "port validation omits the value":
+    # A URI missing its '@' drops the password into the port position, so the
+    # port validators must not echo the value either.
+    const secret = "hunter2SECRET-PORT-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://user:" & secret & "/host:5432")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "Invalid port" in msg
+    msg = ""
+    try:
+      discard parseDsn("port=" & secret)
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "Invalid port" in msg
+    msg = ""
+    try:
+      discard parseDsn("postgresql://user:123456/host/db")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check "Port out of range" in msg
+    check "123456" notin msg
+
+  test "option validation omits the value":
+    const secret = "s3cret-OPTION-XYZ"
+    for dsn in [
+      "postgresql://host/db?sslmode=" & secret,
+      "postgresql://host/db?target_session_attrs=" & secret,
+      "postgresql://host/db?connect_timeout=" & secret,
+      "postgresql://host/db?keepalives_idle=" & secret,
+      "postgresql://host/db?max_message_size=" & secret,
+      "sslmode=" & secret,
+    ]:
+      var msg = ""
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError as e:
+        msg = e.msg
+      check msg.len > 0
+      check secret notin msg
+
+  test "require_auth empty entry omits the list":
+    const secret = "SECRET-AUTH-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("require_auth=scram-sha-256,," & secret)
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "require_auth" in msg
+
+  test "IPv6 authority errors omit the fragment":
+    const secret = "SECRET-IPV6-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://[::1]" & secret & "/db")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "IPv6" in msg
+    msg = ""
+    try:
+      discard parseDsn("postgresql://::1:" & secret & "/db")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "bracketed" in msg
+
+  test "hostaddr validation omits the value":
+    const secret = "SECRET-HOSTADDR-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("hostaddr=/" & secret)
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "hostaddr" in msg
