@@ -1322,6 +1322,26 @@ suite "Binary encode/decode helpers":
     let row: Row = @[none(seq[byte])]
     check row.getUuidOpt(0) == none(PgUuid)
 
+  test "toPgParam Option[PgUuid] none":
+    let p = toPgParam(none(PgUuid))
+    check p.oid == OidUuid
+    check p.format == 0
+    check p.value.isNone
+
+  test "toPgBinaryParam Option[PgUuid] none":
+    # Must not prototype via default(PgUuid) (empty string → PgTypeError).
+    let p = toPgBinaryParam(none(PgUuid))
+    check p.oid == OidUuid
+    check p.format == 1
+    check p.value.isNone
+
+  test "toPgBinaryParam Option[PgUuid] some":
+    let uuid = PgUuid("550e8400-e29b-41d4-a716-446655440000")
+    let p = toPgBinaryParam(some(uuid))
+    check p.oid == OidUuid
+    check p.format == 1
+    check p.value.get.len == 16
+
   test "Option some":
     let p = toPgBinaryParam(some(42'i32))
     check p.oid == OidInt4
@@ -4587,6 +4607,25 @@ suite "PgMacAddr":
     let row: Row = @[none(seq[byte])]
     check row.getMacAddrOpt(0) == none(PgMacAddr)
 
+  test "toPgParam Option[PgMacAddr] none":
+    let p = toPgParam(none(PgMacAddr))
+    check p.oid == OidMacAddr
+    check p.format == 0
+    check p.value.isNone
+
+  test "toPgBinaryParam Option[PgMacAddr] none":
+    # Must not prototype via default(PgMacAddr) (empty string → PgTypeError).
+    let p = toPgBinaryParam(none(PgMacAddr))
+    check p.oid == OidMacAddr
+    check p.format == 1
+    check p.value.isNone
+
+  test "toPgBinaryParam Option[PgMacAddr] some":
+    let p = toPgBinaryParam(some(PgMacAddr("08:00:2b:01:02:03")))
+    check p.oid == OidMacAddr
+    check p.format == 1
+    check p.value.get.len == 6
+
   test "roundtrip binary":
     let orig = PgMacAddr("aa:bb:cc:dd:ee:ff")
     let p = toPgBinaryParam(orig)
@@ -4658,6 +4697,25 @@ suite "PgMacAddr8":
   test "getMacAddr8Opt text none":
     let row: Row = @[none(seq[byte])]
     check row.getMacAddr8Opt(0) == none(PgMacAddr8)
+
+  test "toPgParam Option[PgMacAddr8] none":
+    let p = toPgParam(none(PgMacAddr8))
+    check p.oid == OidMacAddr8
+    check p.format == 0
+    check p.value.isNone
+
+  test "toPgBinaryParam Option[PgMacAddr8] none":
+    # Must not prototype via default(PgMacAddr8) (empty string → PgTypeError).
+    let p = toPgBinaryParam(none(PgMacAddr8))
+    check p.oid == OidMacAddr8
+    check p.format == 1
+    check p.value.isNone
+
+  test "toPgBinaryParam Option[PgMacAddr8] some":
+    let p = toPgBinaryParam(some(PgMacAddr8("08:00:2b:01:02:03:04:05")))
+    check p.oid == OidMacAddr8
+    check p.format == 1
+    check p.value.get.len == 8
 
   test "roundtrip binary":
     let orig = PgMacAddr8("aa:bb:cc:dd:ee:ff:00:11")
