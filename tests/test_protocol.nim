@@ -885,6 +885,44 @@ suite "Backend decoding":
     check res.message.kind == bmkCopyOutResponse
     check res.message.copyFormat == cfBinary
 
+  test "CopyInResponse rejects unknown overall format":
+    var body: seq[byte] = @[]
+    body.add(2'u8) # neither text(0) nor binary(1)
+    body.addInt16(1)
+    body.addInt16(0)
+    var buf = buildMsg('G', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "CopyInResponse rejects an unknown per-column format":
+    var body: seq[byte] = @[]
+    body.add(1'u8) # binary
+    body.addInt16(1)
+    body.addInt16(2) # neither text(0) nor binary(1)
+    var buf = buildMsg('G', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "CopyInResponse rejects a binary column inside a text-format copy":
+    var body: seq[byte] = @[]
+    body.add(0'u8) # text
+    body.addInt16(2)
+    body.addInt16(0)
+    body.addInt16(1)
+    var buf = buildMsg('G', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "CopyOutResponse rejects trailing bytes after the format array":
+    var body: seq[byte] = @[]
+    body.add(1'u8) # binary
+    body.addInt16(1)
+    body.addInt16(1)
+    body.add(0'u8) # one byte past the declared column count
+    var buf = buildMsg('H', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
   test "CopyData":
     var buf = buildMsg('d', @[1'u8, 2, 3])
     let res = parseBackendMessage(buf)

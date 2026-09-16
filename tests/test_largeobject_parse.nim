@@ -9,7 +9,7 @@
 ## `loCreate`) against a scripted mock server, so the call sites that consume
 ## these parsers are covered too — not just the private helpers.
 
-import std/[unittest]
+import std/[unittest, strutils]
 
 import ../async_postgres/[async_backend, pg_connection]
 import ../async_postgres/pg_errors
@@ -73,6 +73,21 @@ suite "Large Object result parsers":
       discard parseLoOid("-1", "lo_create")
     expect PgTypeError:
       discard parseLoOid("abc", "lo_create")
+
+  test "parseLoOid separates a range error from a syntax error":
+    # Also the observable half of parsing into int64: on a 32-bit build an int
+    # would fold every OID above 2^31 into the syntax-error branch.
+    var msg = ""
+    try:
+      discard parseLoOid("99999999999999999999", "lo_create")
+    except PgTypeError as e:
+      msg = e.msg
+    check "outside uint32 range" in msg
+    try:
+      discard parseLoOid("abc", "lo_create")
+    except PgTypeError as e:
+      msg = e.msg
+    check "non-numeric OID" in msg
 
   test "hostile values never escape as RangeDefect":
     var defect: ref Defect = nil

@@ -1645,6 +1645,7 @@ async_postgres/pg_types/core.nim	PgCircle
 async_postgres/pg_types/core.nim	PgHstore
 async_postgres/pg_types/core.nim	PgInet
 async_postgres/pg_types/core.nim	PgInlineBufSize
+async_postgres/pg_types/core.nim	PgIntParse
 async_postgres/pg_types/core.nim	PgInterval
 async_postgres/pg_types/core.nim	PgLine
 async_postgres/pg_types/core.nim	PgLseg
@@ -1727,6 +1728,7 @@ async_postgres/pg_types/core.nim	c
 async_postgres/pg_types/core.nim	center
 async_postgres/pg_types/core.nim	checkMoneyScale
 async_postgres/pg_types/core.nim	checkPgMoneyConventions
+async_postgres/pg_types/core.nim	checkPgTimeFields
 async_postgres/pg_types/core.nim	checkPgTimeTzOffset
 async_postgres/pg_types/core.nim	closed
 async_postgres/pg_types/core.nim	cmp
@@ -1759,6 +1761,9 @@ async_postgres/pg_types/core.nim	initPgMoney
 async_postgres/pg_types/core.nim	initPgMoneyConventions
 async_postgres/pg_types/core.nim	inlineBuf
 async_postgres/pg_types/core.nim	isEmpty
+async_postgres/pg_types/core.nim	isPgHexText
+async_postgres/pg_types/core.nim	isPgIntText
+async_postgres/pg_types/core.nim	isPgUIntText
 async_postgres/pg_types/core.nim	isZero
 async_postgres/pg_types/core.nim	len
 async_postgres/pg_types/core.nim	low
@@ -1785,12 +1790,16 @@ async_postgres/pg_types/core.nim	parsePgNumeric
 async_postgres/pg_types/core.nim	pgEpochDaysOffset
 async_postgres/pg_types/core.nim	pgEpochUnix
 async_postgres/pg_types/core.nim	pgParseBiggestInt
+async_postgres/pg_types/core.nim	pgParseBiggestIntView
 async_postgres/pg_types/core.nim	pgParseFloat
 async_postgres/pg_types/core.nim	pgParseFloat32
 async_postgres/pg_types/core.nim	pgParseHexInt
+async_postgres/pg_types/core.nim	pgParseHexUInt32
 async_postgres/pg_types/core.nim	pgParseInt
 async_postgres/pg_types/core.nim	pgParseInt16
 async_postgres/pg_types/core.nim	pgParseInt32
+async_postgres/pg_types/core.nim	pgParseIntView
+async_postgres/pg_types/core.nim	pgParseUIntField
 async_postgres/pg_types/core.nim	pgTypeErrorOnValueError
 async_postgres/pg_types/core.nim	pgTzDispLimit
 async_postgres/pg_types/core.nim	points

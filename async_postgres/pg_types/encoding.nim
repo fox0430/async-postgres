@@ -203,9 +203,11 @@ proc toPgTimestampTzParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
   textParam(OidTimestampTz, v.format("yyyy-MM-dd HH:mm:ss'.'ffffffzzz"), "timestamptz")
 
 proc toPgParam*(v: PgTime): PgParam {.raises: [PgTypeError].} =
+  checkPgTimeFields(v.hour, v.minute, v.second, v.microsecond)
   textParam(OidTime, $v, "time")
 
 proc toPgParam*(v: PgTimeTz): PgParam {.raises: [PgTypeError].} =
+  checkPgTimeFields(v.hour, v.minute, v.second, v.microsecond)
   checkPgTimeTzOffset(v.utcOffset)
   textParam(OidTimeTz, $v, "timetz")
 
@@ -500,8 +502,11 @@ template genFixedArray1D(
       writeVal
     PgParam(oid: arrayOid, format: 1, value: some(buf))
 
-proc pgTimeFieldsMicros(hour, minute, second, microsecond: int32): int64 {.inline.} =
+proc pgTimeFieldsMicros(
+    hour, minute, second, microsecond: int32
+): int64 {.inline, raises: [PgTypeError].} =
   ## Microseconds since midnight for PostgreSQL ``time`` / ``timetz`` binary.
+  checkPgTimeFields(hour, minute, second, microsecond)
   int64(hour) * 3_600_000_000'i64 + int64(minute) * 60_000_000'i64 +
     int64(second) * 1_000_000'i64 + int64(microsecond)
 
@@ -696,7 +701,7 @@ proc toPgBinaryTimestampTzParam*(v: DateTime): PgParam =
   ## Encode a DateTime as a binary timestamptz parameter (OID 1184).
   PgParam(oid: OidTimestampTz, format: 1, value: some(@(toBE64(pgTimestampMicros(v)))))
 
-proc toPgBinaryParam*(v: PgTime): PgParam =
+proc toPgBinaryParam*(v: PgTime): PgParam {.raises: [PgTypeError].} =
   var data = newSeq[byte](8)
   data.writeTimeAt(0, v)
   PgParam(oid: OidTime, format: 1, value: some(data))
@@ -1499,7 +1504,7 @@ proc pgArrayElemOid*(_: typedesc[PgTime]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgTime]): int32 =
   OidTimeArray
 
-proc encodePgArrayElement*(v: PgTime): seq[byte] {.raises: [].} =
+proc encodePgArrayElement*(v: PgTime): seq[byte] {.raises: [PgTypeError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgTimeTz]): int32 =

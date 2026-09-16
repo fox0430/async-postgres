@@ -13,6 +13,12 @@ type TsPrec = enum
   tpNot
   tpOperand
 
+proc ensureNoTrailing(pos, total: int, what: string) {.inline.} =
+  ## Reject trailing bytes after a binary value.
+  if pos != total:
+    raise
+      newException(PgTypeError, what & ": trailing data (" & $(total - pos) & " bytes)")
+
 proc decodeHstoreBinary*(data: openArray[byte]): PgHstore {.raises: [PgError].} =
   ## Decode PostgreSQL binary hstore format.
   result = initTable[string, Option[string]]()
@@ -51,6 +57,7 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore {.raises: [PgError].} 
       let val = readString(data, pos, valLen)
       pos += valLen
       result[key] = some(val)
+  ensureNoTrailing(pos, data.len, "hstore binary")
 
 proc fromPgText*(data: seq[byte], oid: int32): string {.raises: [].} =
   ## Convert text-format bytes from PostgreSQL to a Nim string.
@@ -80,12 +87,14 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric {.raises: [PgError].
       pgNaN
     else:
       raise newException(PgTypeError, "Invalid numeric sign: " & $signRaw)
+  let expectedLen = 8 + ndigits * 2
+  if data.len != expectedLen:
+    raise newException(
+      PgTypeError,
+      "Numeric binary: expected length " & $expectedLen & " got " & $data.len,
+    )
   if sign == pgNaN:
     return PgNumeric(sign: pgNaN)
-  if 8 + ndigits * 2 > data.len:
-    raise newException(
-      PgTypeError, "Numeric binary: data truncated for " & $ndigits & " digits"
-    )
   var digits = newSeq[int16](ndigits)
   for i in 0 ..< ndigits:
     let d = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))
@@ -97,8 +106,9 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric {.raises: [PgError].
   PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
 
 proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime {.raises: [PgError].} =
-  if data.len < 8:
-    raise newException(PgTypeError, "Binary timestamp data too short: " & $data.len)
+  if data.len != 8:
+    raise
+      newException(PgTypeError, "Binary timestamp: expected 8 bytes, got " & $data.len)
   let pgUs = fromBE64(data)
   # PostgreSQL encodes timestamp/timestamptz 'infinity'/'-infinity' as
   # int64.high/int64.low microseconds since 2000-01-01. Nim's DateTime cannot
@@ -130,8 +140,8 @@ proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime {.raises: [PgError]
   initTime(unixSec, int(fracUs * 1000)).utc()
 
 proc decodeBinaryDate*(data: openArray[byte]): DateTime {.raises: [PgError].} =
-  if data.len < 4:
-    raise newException(PgTypeError, "Binary date data too short: " & $data.len)
+  if data.len != 4:
+    raise newException(PgTypeError, "Binary date: expected 4 bytes, got " & $data.len)
   let pgDays = fromBE32(data)
   # PostgreSQL encodes date 'infinity'/'-infinity' as int32.high/int32.low days
   # since 2000-01-01. DateTime cannot represent these (they would otherwise
@@ -153,8 +163,8 @@ const pgTimeMaxUs = 86_400_000_000'i64
   ## but nothing past it.
 
 proc decodeBinaryTime*(data: openArray[byte]): PgTime {.raises: [PgError].} =
-  if data.len < 8:
-    raise newException(PgTypeError, "Binary time data too short: " & $data.len)
+  if data.len != 8:
+    raise newException(PgTypeError, "Binary time: expected 8 bytes, got " & $data.len)
   let us = fromBE64(data)
   if us < 0 or us > pgTimeMaxUs:
     raise newException(PgTypeError, "Binary time: microseconds out of range " & $us)
@@ -167,8 +177,9 @@ proc decodeBinaryTime*(data: openArray[byte]): PgTime {.raises: [PgError].} =
   PgTime(hour: hours, minute: minutes, second: seconds, microsecond: microseconds)
 
 proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz {.raises: [PgError].} =
-  if data.len < 12:
-    raise newException(PgTypeError, "Binary timetz data too short: " & $data.len)
+  if data.len != 12:
+    raise
+      newException(PgTypeError, "Binary timetz: expected 12 bytes, got " & $data.len)
   let us = fromBE64(data)
   if us < 0 or us > pgTimeMaxUs:
     raise newException(PgTypeError, "Binary timetz: microseconds out of range " & $us)
@@ -219,6 +230,7 @@ proc decodeInetBinary*(
     var ip = IpAddress(family: IpAddressFamily.IPv4)
     for i in 0 ..< 4:
       ip.address_v4[i] = data[4 + i]
+    ensureNoTrailing(8, data.len, "Binary inet IPv4")
     (ip, bits)
   elif family == 3:
     if addrlen != 16:
@@ -230,6 +242,7 @@ proc decodeInetBinary*(
     var ip = IpAddress(family: IpAddressFamily.IPv6)
     for i in 0 ..< 16:
       ip.address_v6[i] = data[4 + i]
+    ensureNoTrailing(20, data.len, "Binary inet IPv6")
     (ip, bits)
   else:
     raise newException(PgTypeError, "Binary inet unknown family: " & $family)
@@ -268,6 +281,7 @@ proc decodeBinaryArray*(
     result.dims = @[]
     result.lowerBounds = @[]
     result.elements = @[]
+    ensureNoTrailing(12, data.len, "Binary array")
     return
   let headerSize = 12 + 8 * int(ndim)
   if data.len < headerSize:
@@ -302,6 +316,7 @@ proc decodeBinaryArray*(
         raise newException(PgTypeError, "Binary array: element data truncated at " & $i)
       result.elements[i] = (off: RelOff(pos), len: eLen)
       pos += eLen
+  ensureNoTrailing(pos, data.len, "Binary array")
 
 proc rejectMultiDim*(
     decoded:
@@ -355,6 +370,7 @@ proc decodeBinaryComposite*(
       result[i].off = RelOff(pos)
       result[i].len = flen
       pos += flen
+  ensureNoTrailing(pos, data.len, "Binary composite")
 
 proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
   # Raises ``PgTypeError`` for infinity/unparseable input (under ``PgError``).
@@ -411,10 +427,10 @@ proc parseTimeText*(s: string): PgTime {.raises: [PgError].} =
   if s.len < 8 or s[2] != ':' or s[5] != ':':
     raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
   var h, m, sec, us: int
-  pgTypeErrorOnValueError("Invalid time (len=" & $s.len & ")"):
-    h = parseInt(s[0 .. 1])
-    m = parseInt(s[3 .. 4])
-    sec = parseInt(s[6 .. 7])
+  let timeCtx = "Invalid time (len=" & $s.len & ")"
+  h = pgParseUIntField(s.toOpenArray(0, 1), timeCtx)
+  m = pgParseUIntField(s.toOpenArray(3, 4), timeCtx)
+  sec = pgParseUIntField(s.toOpenArray(6, 7), timeCtx)
   if h notin 0 .. 24 or m notin 0 .. 59 or sec notin 0 .. 59:
     raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
   if s.len > 8:
@@ -425,8 +441,7 @@ proc parseTimeText*(s: string): PgTime {.raises: [PgError].} =
     let frac = s[9 .. ^1]
     if frac.len == 0 or frac.len > 6:
       raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
-    pgTypeErrorOnValueError("Invalid time (len=" & $s.len & ")"):
-      us = parseInt(frac)
+    us = pgParseUIntField(frac, timeCtx)
     # Pad to 6 digits
     for _ in 0 ..< (6 - frac.len):
       us *= 10
@@ -454,18 +469,18 @@ proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
     if c notin {'0' .. '9', ':'}:
       raise newException(PgTypeError, "Invalid timetz offset (len=" & $s.len & ")")
   var offH, offM, offS: int
-  pgTypeErrorOnValueError("Invalid timetz offset (len=" & $s.len & ")"):
-    if offStr.len == 2:
-      offH = parseInt(offStr)
-    elif offStr.len == 5 and offStr[2] == ':':
-      offH = parseInt(offStr[0 .. 1])
-      offM = parseInt(offStr[3 .. 4])
-    elif offStr.len == 8 and offStr[2] == ':' and offStr[5] == ':':
-      offH = parseInt(offStr[0 .. 1])
-      offM = parseInt(offStr[3 .. 4])
-      offS = parseInt(offStr[6 .. 7])
-    else:
-      raise newException(PgTypeError, "Invalid timetz offset (len=" & $s.len & ")")
+  let offCtx = "Invalid timetz offset (len=" & $s.len & ")"
+  if offStr.len == 2:
+    offH = pgParseUIntField(offStr, offCtx)
+  elif offStr.len == 5 and offStr[2] == ':':
+    offH = pgParseUIntField(offStr.toOpenArray(0, 1), offCtx)
+    offM = pgParseUIntField(offStr.toOpenArray(3, 4), offCtx)
+  elif offStr.len == 8 and offStr[2] == ':' and offStr[5] == ':':
+    offH = pgParseUIntField(offStr.toOpenArray(0, 1), offCtx)
+    offM = pgParseUIntField(offStr.toOpenArray(3, 4), offCtx)
+    offS = pgParseUIntField(offStr.toOpenArray(6, 7), offCtx)
+  else:
+    raise newException(PgTypeError, offCtx)
   # PostgreSQL DecodeTimezone: hour 0..MAX_TZDISP_HOUR, minute 0..59,
   # second 0..59. ``+00:99`` must not be accepted as 99 minutes (which is
   # inside TZDISP_LIMIT). Derive the hour bound from ``pgTzDispLimit`` so the
@@ -705,8 +720,8 @@ proc parseInetText*(
     # before narrowing; otherwise a malformed mask escapes the ``PgTypeError``
     # contract as a plausible-but-wrong value instead of an error.
     let maxMask = if ip.family == IpAddressFamily.IPv4: 32 else: 128
-    let mask = parseInt(maskStr)
-    if mask < 0 or mask > maxMask:
+    let mask = pgParseUIntField(maskStr, "invalid inet value (len=" & $s.len & ")")
+    if mask > maxMask:
       raise newException(PgTypeError, "inet mask out of range (len=" & $s.len & ")")
     result = (ip, uint8(mask))
 
@@ -760,6 +775,7 @@ proc decodeBinaryTsVector*(data: openArray[byte]): string {.raises: [PgError].} 
         if weight > 0:
           part.add(weightChars[weight])
     parts[i] = part
+  ensureNoTrailing(pos, data.len, "tsvector binary")
   parts.join(" ")
 
 proc renderTsQueryChild(
@@ -869,9 +885,12 @@ proc decodeBinaryTsQuery*(data: openArray[byte]): string {.raises: [PgError].} =
   if ntokens < 0:
     raise newException(PgTypeError, "tsquery binary: invalid token count " & $ntokens)
   if ntokens == 0:
+    ensureNoTrailing(4, data.len, "tsquery binary")
     return ""
   var pos = 4
-  parseTsQueryNode(data, pos).text
+  let text = parseTsQueryNode(data, pos).text
+  ensureNoTrailing(pos, data.len, "tsquery binary")
+  text
 
 # Geometry text format parsers
 

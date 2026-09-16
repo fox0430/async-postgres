@@ -3,7 +3,7 @@ import std/[options, strutils, times]
 import ../pg_protocol
 import ./core
 import ./encoding
-import ./decoding
+import ./decoding {.all.}
 import ./accessors {.all.}
 
 type
@@ -37,6 +37,7 @@ proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
   let flags = data[0]
   if (flags and rangeEmpty) != 0:
     result.isEmpty = true
+    ensureNoTrailing(1, data.len, "Binary range")
     return
   # An absent bound is `LB_INF`/`UB_INF` *set*; the bound's data is written only
   # when the corresponding infinity bit is clear.
@@ -66,6 +67,8 @@ proc decodeRangeBinaryRaw(data: openArray[byte]): RangeBinaryRaw =
         newException(PgTypeError, "Binary range: invalid upper bound length " & $bLen)
     result.upperOff = pos
     result.upperLen = bLen
+    pos += bLen
+  ensureNoTrailing(pos, data.len, "Binary range")
 
 proc decodeInt4RangeBinary(data: openArray[byte]): PgRange[int32] =
   let raw = decodeRangeBinaryRaw(data)
@@ -217,6 +220,7 @@ proc decodeMultirangeBinaryRaw(
         newException(PgTypeError, "Binary multirange: invalid range length " & $rLen)
     result[i] = (off: RelOff(pos), len: rLen)
     pos += rLen
+  ensureNoTrailing(pos, data.len, "Binary multirange")
 
 # Range type support
 
@@ -722,9 +726,12 @@ proc toPgDateRangeArrayParam*(
 
 # Range text format getters
 
-template genRangeGetter(name: untyped, T: typedesc, decodeBin, parseElem: untyped) =
+template genRangeGetter(
+    name: untyped, T: typedesc, expectedOid: int32, decodeBin, parseElem: untyped
+) =
   proc name*(row: Row, col: int): PgRange[T] =
     if row.isBinaryCol(col):
+      checkScalarColOid(astToStr(name), row, col, [expectedOid])
       let (off, clen) = cellInfo(row, col)
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -732,12 +739,22 @@ template genRangeGetter(name: untyped, T: typedesc, decodeBin, parseElem: untype
     let s = row.getStr(col)
     parseRangeText[T](s, parseElem)
 
-genRangeGetter(getInt4Range, int32, decodeInt4RangeBinary, pgParseInt32)
-genRangeGetter(getInt8Range, int64, decodeInt8RangeBinary, pgParseBiggestInt)
-genRangeGetter(getNumRange, PgNumeric, decodeNumRangeBinary, parsePgNumeric)
-genRangeGetter(getTsRange, DateTime, decodeTsRangeBinary, parseTimestampText)
-genRangeGetter(getTsTzRange, DateTime, decodeTsRangeBinary, parseTimestampText)
-genRangeGetter(getDateRange, DateTime, decodeDateRangeBinary, parseDateText)
+genRangeGetter(getInt4Range, int32, OidInt4Range, decodeInt4RangeBinary, pgParseInt32)
+genRangeGetter(
+  getInt8Range, int64, OidInt8Range, decodeInt8RangeBinary, pgParseBiggestInt
+)
+genRangeGetter(
+  getNumRange, PgNumeric, OidNumRange, decodeNumRangeBinary, parsePgNumeric
+)
+genRangeGetter(
+  getTsRange, DateTime, OidTsRange, decodeTsRangeBinary, parseTimestampText
+)
+genRangeGetter(
+  getTsTzRange, DateTime, OidTsTzRange, decodeTsRangeBinary, parseTimestampText
+)
+genRangeGetter(
+  getDateRange, DateTime, OidDateRange, decodeDateRangeBinary, parseDateText
+)
 
 # Range Opt accessors (text format)
 
@@ -1169,10 +1186,11 @@ proc toPgDateMultirangeArrayParam*(
 # Multirange text format getters
 
 template genMultirangeGetter(
-    name: untyped, T: typedesc, decodeBin, parseElem: untyped
+    name: untyped, T: typedesc, expectedOid: int32, decodeBin, parseElem: untyped
 ) =
   proc name*(row: Row, col: int): PgMultirange[T] =
     if row.isBinaryCol(col):
+      checkScalarColOid(astToStr(name), row, col, [expectedOid])
       let (off, clen) = cellInfo(row, col)
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -1186,14 +1204,25 @@ template genMultirangeGetter(
     let s = row.getStr(col)
     parseMultirangeText[T](s, parseElem)
 
-genMultirangeGetter(getInt4Multirange, int32, decodeInt4RangeBinary, pgParseInt32)
-genMultirangeGetter(getInt8Multirange, int64, decodeInt8RangeBinary, pgParseBiggestInt)
-genMultirangeGetter(getNumMultirange, PgNumeric, decodeNumRangeBinary, parsePgNumeric)
-genMultirangeGetter(getTsMultirange, DateTime, decodeTsRangeBinary, parseTimestampText)
 genMultirangeGetter(
-  getTsTzMultirange, DateTime, decodeTsRangeBinary, parseTimestampText
+  getInt4Multirange, int32, OidInt4Multirange, decodeInt4RangeBinary, pgParseInt32
 )
-genMultirangeGetter(getDateMultirange, DateTime, decodeDateRangeBinary, parseDateText)
+genMultirangeGetter(
+  getInt8Multirange, int64, OidInt8Multirange, decodeInt8RangeBinary, pgParseBiggestInt
+)
+genMultirangeGetter(
+  getNumMultirange, PgNumeric, OidNumMultirange, decodeNumRangeBinary, parsePgNumeric
+)
+genMultirangeGetter(
+  getTsMultirange, DateTime, OidTsMultirange, decodeTsRangeBinary, parseTimestampText
+)
+genMultirangeGetter(
+  getTsTzMultirange, DateTime, OidTsTzMultirange, decodeTsRangeBinary,
+  parseTimestampText,
+)
+genMultirangeGetter(
+  getDateMultirange, DateTime, OidDateMultirange, decodeDateRangeBinary, parseDateText
+)
 
 # Multirange Opt accessors (text format)
 
@@ -1206,13 +1235,6 @@ optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 
 # Multirange array type support
 
-proc checkRangeArrayElemOid(accessor: string, actual: int32, expected: int32) =
-  ## Same contract as ``accessors.checkArrayElemOid`` for one expected OID.
-  if actual != expected:
-    raise newException(
-      PgTypeError, accessor & ": wire elemOid=" & $actual & " expected " & $expected
-    )
-
 template genMultirangeArrayGetter(
     name: untyped, T: typedesc, expectedOid: int32, decodeBin, parseElem: untyped
 ) =
@@ -1223,7 +1245,7 @@ template genMultirangeArrayGetter(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
-      checkRangeArrayElemOid(astToStr(name), decoded.elemOid, expectedOid)
+      checkArrayElemOid(astToStr(name), decoded.elemOid, [expectedOid])
       result = newSeq[PgMultirange[T]](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:
@@ -1296,7 +1318,7 @@ template genRangeArrayGetter(
         raise newException(PgTypeError, "Column " & $col & " is NULL")
       let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
       rejectMultiDim(decoded)
-      checkRangeArrayElemOid(astToStr(name), decoded.elemOid, expectedOid)
+      checkArrayElemOid(astToStr(name), decoded.elemOid, [expectedOid])
       result = newSeq[PgRange[T]](decoded.elements.len)
       for i, e in decoded.elements:
         if e.len == -1:

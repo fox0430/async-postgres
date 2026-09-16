@@ -425,6 +425,16 @@ suite "Row accessors":
       expect PgTypeError:
         discard row.getInt(0)
 
+  test "getInt/getInt16/getInt64 reject digit-group underscore":
+    for s in ["1_0", "12_345", "_1", "1_"]:
+      let row = @[some(toBytes(s))]
+      expect PgTypeError:
+        discard row.getInt(0)
+      expect PgTypeError:
+        discard row.getInt16(0)
+      expect PgTypeError:
+        discard row.getInt64(0)
+
   test "getInt16 rejects trailing garbage (full-consumption check)":
     for s in ["123abc", "42 ", "12.5"]:
       let row = @[some(toBytes(s))]
@@ -754,6 +764,14 @@ suite "PgTime":
     except PgTypeError:
       raised = true
     check raised
+
+  test "toPgParam rejects out-of-range PgTime fields":
+    expect PgTypeError:
+      discard toPgParam(PgTime(hour: 99, minute: 0, second: 0))
+    expect PgTypeError:
+      discard toPgBinaryParam(PgTime(hour: 24, minute: 0, second: 1))
+    expect PgTypeError:
+      discard toPgParam(PgTimeTz(hour: 25, minute: 0, second: 0, utcOffset: 0))
 
   test "getTime NULL raises":
     let row = @[none(seq[byte])]
@@ -1543,6 +1561,18 @@ suite "Timestamp/date infinity sentinels":
     const tsNearHigh = @[0x7F'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
     expect PgTypeError:
       discard decodeBinaryTimestamp(tsNearHigh)
+
+  test "decodeBinaryTimestamp rejects trailing bytes":
+    var buf = @(toBE64(0'i64))
+    buf.add(0'u8)
+    expect PgTypeError:
+      discard decodeBinaryTimestamp(buf)
+
+  test "decodeBinaryArray rejects trailing bytes after empty header":
+    # Valid 0-dim header is 12 bytes; an extra byte must not be silent.
+    var buf = newSeq[byte](13)
+    expect PgTypeError:
+      discard decodeBinaryArray(buf)
 
   test "decodeBinaryTimeTz int32.low offset raises (no OverflowDefect)":
     # us = 0 (00:00:00), offset = int32.low. Un-negating int32.low overflows
@@ -4738,6 +4768,10 @@ type
     green
     blue
 
+  YesNo = enum
+    t = "t"
+    f = "f"
+
 pgEnum(Mood)
 pgEnum(Color, 99999)
 
@@ -4820,6 +4854,49 @@ suite "User-defined enum":
     except PgTypeError:
       raised = true
     check raised
+
+  test "getEnum binary with unknown OID reads the label":
+    # Dynamic enum OIDs must keep passing the guard; only well-known
+    # built-in OIDs are rejected.
+    let row = mkRow(@[some(toBytes("sad"))], @[mkField(99999'i32, 1'i16)])
+    check getEnum[Mood](row, 0) == sad
+
+  test "getEnum binary rejects bool colOid (label collision)":
+    # Binary true (0x01) stringifies to "t" via getStr; without the OID guard
+    # it would silently return YesNo.t instead of raising.
+    let row = mkRow(@[some(@[1'u8])], @[mkField(OidBool, 1)])
+    expect PgTypeError:
+      discard getEnum[YesNo](row, 0)
+
+  test "getEnum matches a label exactly, not case- or underscore-folded":
+    # parseEnum normalizes, which would fold these three distinct PostgreSQL
+    # labels onto one Nim value.
+    type Step = enum
+      inProgress = "inProgress"
+
+    for label in ["in_progress", "INPROGRESS", "inprogress"]:
+      let row = mkRow(@[some(toBytes(label))], @[mkField(OidText, 0)])
+      expect PgTypeError:
+        discard getEnum[Step](row, 0)
+    let ok = mkRow(@[some(toBytes("inProgress"))], @[mkField(OidText, 0)])
+    check getEnum[Step](ok, 0) == inProgress
+
+  test "getEnum binary reads a character colOid":
+    # A binary character payload is byte-identical to an enum label and getStr
+    # raw-copies it, so `SELECT status::text` reads back as the enum.
+    for oid in [OidText, OidVarchar, OidBpchar]:
+      let row = mkRow(@[some(toBytes("happy"))], @[mkField(oid, 1)])
+      check getEnum[Mood](row, 0) == happy
+
+  test "getEnum binary rejects explicit OID 0":
+    let row = mkRow(@[some(toBytes("happy"))], @[mkField(0'i32, 1'i16)])
+    var msg = ""
+    try:
+      discard getEnum[Mood](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check "unknown" in msg
+    check "colOid=0" in msg
 
   test "Option[Enum] toPgParam some":
     let p = toPgParam(some(happy))
@@ -9491,6 +9568,34 @@ suite "enum arrays":
     let row: Row = @[some(toBytes("{happy,sad,ok}"))]
     check getEnumArray[Mood](row, 0) == @[happy, sad, ok]
 
+  test "getEnumArray binary rejects int4 elemOid":
+    let p = toPgBinaryParam(@[1'i32, 2'i32])
+    let row = mkRow(@[p.value], @[mkField(OidInt4Array, 1)])
+    expect PgTypeError:
+      discard getEnumArray[Mood](row, 0)
+
+  test "getEnumArray binary with unknown elemOid reads labels":
+    # Dynamic enum-array element OIDs must keep passing the guard.
+    let payload = encodeBinaryArray(99999'i32, @[toBytes("happy"), toBytes("sad")])
+    let row = mkRow(@[some(payload)], @[mkField(99999'i32, 1'i16)])
+    check getEnumArray[Mood](row, 0) == @[happy, sad]
+
+  test "getEnumArray binary reads a text elemOid":
+    let p = toPgBinaryParam(@["happy", "sad"])
+    let row = mkRow(@[p.value], @[mkField(OidTextArray, 1)])
+    check getEnumArray[Mood](row, 0) == @[happy, sad]
+
+  test "getEnumArrayElemOpt binary reads a text elemOid":
+    let p = toPgBinaryParam(@["happy", "sad"])
+    let row = mkRow(@[p.value], @[mkField(OidTextArray, 1)])
+    check getEnumArrayElemOpt[Mood](row, 0) == @[some(happy), some(sad)]
+
+  test "getEnumArray binary rejects an int elemOid":
+    let p = toPgBinaryParam(@[1'i32, 2'i32])
+    let row = mkRow(@[p.value], @[mkField(OidInt4Array, 1)])
+    expect PgTypeError:
+      discard getEnumArray[Mood](row, 0)
+
   test "getEnumArray raises on NULL element":
     let row: Row = @[some(toBytes("{happy,NULL,ok}"))]
     var raised = false
@@ -10793,7 +10898,18 @@ suite "scalar accessors reject a mismatched binary column OID":
       let row = mkRow(@[some(@[0'u8, 0, 0, 1, 0x80])], @[mkField(oid, 1)])
       check $row.getBit(0) == "1"
 
-  test "unknown OID 0 skips the check (manual Row)":
+  test "missing colTypeOids skips the check (manual Row)":
+    let rd = RowData(
+      numCols: 1'i16,
+      buf: @(toBE32(1'i32)),
+      cellIndex: @[0'i32, 4'i32],
+      colFormats: @[1'i16],
+      colTypeOids: @[],
+    )
+    # Fail-open only when OID metadata is absent, not for an explicit wire 0.
+    discard initRow(rd, 0).getFloat32(0)
+
+  test "explicit OID 0 is rejected (hostile/unknown type)":
     let rd = RowData(
       numCols: 1'i16,
       buf: @(toBE32(1'i32)),
@@ -10801,8 +10917,13 @@ suite "scalar accessors reject a mismatched binary column OID":
       colFormats: @[1'i16],
       colTypeOids: @[0'i32],
     )
-    # Fail-open for metadata-less rows: no OID to validate against.
-    discard initRow(rd, 0).getFloat32(0)
+    var msg = ""
+    try:
+      discard initRow(rd, 0).getFloat32(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check "unknown" in msg
+    check "colOid=0" in msg
 
   test "the text format path is unaffected":
     let row = mkRow(@[some(toBytes("1"))], @[mkField(OidInt4, 0)])
@@ -10844,6 +10965,33 @@ suite "range array accessors reject a mismatched wire elemOid":
   test "the text format path is unaffected":
     let row = mkRow(@[some(toBytes("{\"[1,10)\"}"))], @[mkField(OidInt4RangeArray, 0)])
     check row.getInt4RangeArray(0) == @[rangeOf(1'i32, 10'i32)]
+
+suite "scalar range accessors reject a mismatched wire colOid":
+  test "getDateRange rejects int4range binary":
+    let p = toPgBinaryParam(rangeOf(1'i32, 10'i32))
+    let row = mkRow(@[p.value], @[mkField(OidInt4Range, 1)])
+    var msg = ""
+    try:
+      discard row.getDateRange(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check "getDateRange: wire colOid=3904 expected 3912" in msg
+
+  test "getInt4Range rejects daterange binary":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgBinaryDateRangeParam(rangeOf(dt1, dt2))
+    let row = mkRow(@[p.value], @[mkField(OidDateRange, 1)])
+    expect PgTypeError:
+      discard row.getInt4Range(0)
+
+  test "getInt4Multirange rejects datemultirange binary":
+    let dt1 = dateTime(2023, mJan, 1, zone = utc())
+    let dt2 = dateTime(2023, mDec, 31, zone = utc())
+    let p = toPgBinaryDateMultirangeParam(toMultirange(rangeOf(dt1, dt2)))
+    let row = mkRow(@[p.value], @[mkField(OidDateMultirange, 1)])
+    expect PgTypeError:
+      discard row.getInt4Multirange(0)
 
 suite "multirange array accessors reject a mismatched wire elemOid":
   test "getDateMultirangeArray rejects int4multirange[]":
@@ -11413,3 +11561,150 @@ suite "ValueError-detail paths omit cell content":
     except PgTypeError as e:
       msg = e.msg
     check msg == "Column 0 is NULL"
+
+suite "wire OID policy: a binary read needs an exact built-in match":
+  const
+    userRangeOid = 20001'i32
+      ## A range type from ``CREATE TYPE ... AS RANGE``: the catalog hands it a
+      ## dynamic OID, so no built-in constant can name it.
+    userDomainOid = 20002'i32
+    userEnumOid = 20003'i32
+
+  test "a range getter rejects a user-defined range type in binary":
+    let p = toPgBinaryParam(rangeOf(1'i32, 10'i32))
+    let row = mkRow(@[p.value], @[mkField(userRangeOid, 1)])
+    var msg = ""
+    try:
+      discard row.getInt4Range(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.startsWith("getInt4Range: wire colOid=20001 is a user-defined type")
+    check "resultFormat = rfText" in msg
+
+  test "a range getter still rejects a mismatched built-in range":
+    let p = toPgBinaryParam(rangeOf(1'i32, 10'i32))
+    let row = mkRow(@[p.value], @[mkField(OidInt4Range, 1)])
+    expect PgTypeError:
+      discard row.getDateRange(0)
+
+  test "a scalar getter rejects a domain it cannot distinguish from an enum":
+    # int4 and a 4-byte enum label share a length, so a dynamic OID carries no
+    # evidence either way; text format stays the escape hatch.
+    let p = toPgBinaryParam(42'i32)
+    let row = mkRow(@[p.value], @[mkField(userDomainOid, 1)])
+    expect PgTypeError:
+      discard row.getInt(0)
+    let textRow = mkRow(@[some(toBytes("42"))], @[mkField(userDomainOid, 0)])
+    check textRow.getInt(0) == 42'i32
+
+  test "a scalar getter does not misread a binary enum label":
+    let row = mkRow(@[some(toBytes("warm"))], @[mkField(userEnumOid, 1)])
+    expect PgTypeError:
+      discard row.getInt(0)
+    expect PgTypeError:
+      discard row.getFloat32(0)
+
+  test "rfAuto never requests binary for a dynamic OID":
+    # Why the strict guard leaves the default path alone: only a forced
+    # rfBinary can deliver a catalog-assigned OID in binary format.
+    for oid in [userRangeOid, userDomainOid, userEnumOid]:
+      check not isBinarySafeOid(oid)
+
+  test "an array getter rejects a dynamic elemOid":
+    # Binary array header: ndim, hasnull, elemOid — retarget the element OID.
+    var raw = toPgBinaryParam(@[1'i32, 2'i32]).value.get
+    for i in 0 .. 3:
+      raw[8 + i] = byte((userEnumOid shr (8 * (3 - i))) and 0xff)
+    let row = mkRow(@[some(raw)], @[mkField(OidInt4Array, 1)])
+    var msg = ""
+    try:
+      discard row.getIntArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.startsWith("getIntArray: wire elemOid=20003 is a user-defined type")
+
+  test "getEnum accepts a dynamic colOid and rejects a stringified built-in":
+    let cell = some(toBytes("happy"))
+    check getEnum[Mood](mkRow(@[cell], @[mkField(20003'i32, 1)]), 0) == happy
+    for oid in [OidInt4, OidBool, OidNumeric, OidInt4Range, OidRecord]:
+      var msg = ""
+      try:
+        discard getEnum[Mood](mkRow(@[cell], @[mkField(oid, 1)]), 0)
+      except PgTypeError as e:
+        msg = e.msg
+      check msg ==
+        "getEnum: wire colOid=" & $oid & " is not an enum (binary column type mismatch)"
+
+  test "getEnum rejects an explicit colOid of 0":
+    let row = mkRow(@[some(toBytes("happy"))], @[mkField(0'i32, 1)])
+    expect PgTypeError:
+      discard getEnum[Mood](row, 0)
+
+  test "getEnumArray rejects a built-in elemOid the scalar path also rejects":
+    let p = toPgBinaryParam(@[1'i32, 2'i32])
+    let row = mkRow(@[p.value], @[mkField(OidInt4Array, 1)])
+    var msg = ""
+    try:
+      discard getEnumArray[Mood](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg ==
+      "getEnumArray: wire elemOid=" & $OidInt4 &
+      " is not an enum (binary column type mismatch)"
+
+  test "getHstore rejects a built-in colOid but takes a dynamic one":
+    let p = toPgBinaryParam(42'i32)
+    let row = mkRow(@[p.value], @[mkField(OidInt4, 1)])
+    expect PgTypeError:
+      discard row.getHstore(0)
+    # hstore's OID is assigned at CREATE EXTENSION time, so a dynamic
+    # (non-built-in) column OID must be accepted on the binary path.
+    var h: PgHstore = initTable[string, Option[string]]()
+    h["k"] = some("v")
+    let dynRow = mkRow(@[some(encodeHstoreBinary(h))], @[mkField(90123'i32, 1)])
+    check dynRow.getHstore(0) == h
+
+suite "text parsers follow PostgreSQL's grammar, not Nim's":
+  test "getInt rejects digit-group underscores and a leading plus":
+    for text in ["1_0", "+5", " 5", "5 "]:
+      let row = mkRow(@[some(toBytes(text))], @[mkField(OidInt4, 0)])
+      expect PgTypeError:
+        discard row.getInt(0)
+
+  test "getFloat rejects digit-group underscores":
+    let row = mkRow(@[some(toBytes("1_0.5"))], @[mkField(OidFloat8, 0)])
+    expect PgTypeError:
+      discard row.getFloat(0)
+
+  test "pgParseHexInt rejects underscores and an 0x prefix":
+    for text in ["1_", "0x1f", "g0"]:
+      expect PgTypeError:
+        discard pgParseHexInt(text)
+
+  test "pgParseHexUInt32 follows the hex grammar, not fromHex":
+    check pgParseHexUInt32("0", "ctx") == 0'u32
+    check pgParseHexUInt32("FFFFFFFF", "ctx") == 0xFFFF_FFFF'u32
+    check pgParseHexUInt32("000000000000000001", "ctx") == 1'u32
+    for text in ["", "1_0", "0x10", "#10", "0X10", "g0", "100000000"]:
+      expect PgTypeError:
+        discard pgParseHexUInt32(text, "ctx")
+
+  test "parseTimeText rejects an underscored component":
+    expect PgTypeError:
+      discard parseTimeText("1_:30:00")
+
+  test "parseInetText rejects an underscored prefix length":
+    expect PgTypeError:
+      discard parseInetText("192.168.0.1/1_0")
+
+  test "parseTimeTzText rejects an underscored offset":
+    expect PgTypeError:
+      discard parseTimeTzText("01:30:00+1_")
+
+  test "pgParseUIntField accepts the full int range without false overflow":
+    check pgParseUIntField($int.high, "ctx") == int.high
+    check pgParseUIntField("9223372036854775800", "ctx") == 9223372036854775800
+    expect PgTypeError:
+      discard pgParseUIntField("9223372036854775808", "ctx")
+    expect PgTypeError:
+      discard pgParseUIntField("99999999999999999999", "ctx")

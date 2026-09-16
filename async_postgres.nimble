@@ -19,7 +19,11 @@ task apiSurface, "check the exported surface against tests/api_surface.golden":
 task apiSurfaceWrite, "regenerate tests/api_surface.golden after a reviewed change":
   exec "nim c -r --hints:off tools/api_surface.nim write tests/api_surface.golden"
 
+task parseGuard, "check that stdlib text parsers are only called from the grammar layer":
+  exec "nim c -r --hints:off tools/parse_guard.nim"
+
 task test, "test":
   apiSurfaceTask()
+  parseGuardTask()
   exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
   exec "nim c -d:asyncBackend=chronos -r tests/all_tests.nim"

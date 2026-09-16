@@ -256,22 +256,10 @@ proc parseLsn*(s: string): Lsn =
   let parts = s.split('/')
   if parts.len != 2:
     raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-  # fromHex[uint64] returns 0 for an empty string instead of raising, so an
-  # empty half would silently produce a zero LSN — reject explicitly.
-  if parts[0].len == 0 or parts[1].len == 0:
-    raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-  # fromHex[uint64] wraps silently past 16 significant hex digits instead of
-  # raising; compare significant digits, not raw length, so a zero-padded but
-  # in-range half isn't rejected.
-  if stripLeadingZeros(parts[0]).len > 16 or stripLeadingZeros(parts[1]).len > 16:
-    raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-  pgTypeErrorOnValueError("Invalid LSN format (len=" & $s.len & ")"):
-    let hi = fromHex[uint64](parts[0])
-    let lo = fromHex[uint64](parts[1])
-    # A half > 32 bits would have its excess bits silently dropped by `hi shl 32` below.
-    if hi > 0xFFFF_FFFF'u64 or lo > 0xFFFF_FFFF'u64:
-      raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-    Lsn((hi shl 32) or lo)
+  let context = "Invalid LSN format (len=" & $s.len & ")"
+  let hi = pgParseHexUInt32(parts[0], context)
+  let lo = pgParseHexUInt32(parts[1], context)
+  Lsn((uint64(hi) shl 32) or uint64(lo))
 
 # PostgreSQL timestamp helpers
 
@@ -572,16 +560,24 @@ proc parseTimelineId*(s: string): int32 =
   ## `PgTypeError` so callers stay under the ``except PgError`` contract.
   ## Range-check before narrowing: a bare ``parseInt(...).int32`` would raise
   ## ``RangeDefect`` (a Defect, outside ``PgError``) on an out-of-range value.
-  pgTypeErrorOnValueError(
-    "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $s.len & ")"
-  ):
-    let t = parseInt(s)
-    if t < int(int32.low) or t > int(int32.high):
-      raise newException(
-        PgTypeError,
-        "IDENTIFY_SYSTEM returned a timeline out of int32 range (len=" & $s.len & ")",
-      )
-    t.int32
+  ## Timeline ids are unsigned decimal.
+  if not isPgUIntText(s):
+    raise newException(
+      PgTypeError,
+      "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $s.len & ")",
+    )
+  var t: int
+  if pgParseIntView(s, t) != pipOk:
+    raise newException(
+      PgTypeError,
+      "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $s.len & ")",
+    )
+  if t < int(int32.low) or t > int(int32.high):
+    raise newException(
+      PgTypeError,
+      "IDENTIFY_SYSTEM returned a timeline out of int32 range (len=" & $s.len & ")",
+    )
+  t.int32
 
 # Replication commands (via simple query protocol)
 

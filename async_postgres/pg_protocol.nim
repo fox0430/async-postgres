@@ -1325,7 +1325,13 @@ proc parseCopyResponse(
   if body.len < 3:
     raise newException(PgProtocolError, label & " message too short")
   result = BackendMessage(kind: kind)
-  result.copyFormat = if body[0] == 0: cfText else: cfBinary
+  case body[0]
+  of 0:
+    result.copyFormat = cfText
+  of 1:
+    result.copyFormat = cfBinary
+  else:
+    raise newException(PgProtocolError, label & ": unknown overall format " & $body[0])
   let numCols = decodeInt16(body, 1)
   if numCols < 0:
     raise newException(PgProtocolError, label & ": invalid column count " & $numCols)
@@ -1334,8 +1340,23 @@ proc parseCopyResponse(
   for i in 0 ..< numCols:
     if offset + 2 > body.len:
       raise newException(PgProtocolError, label & " truncated")
-    result.copyColumnFormats[i] = decodeInt16(body, offset)
+    let fmt = decodeInt16(body, offset)
+    # Column codes are 0/1; text-format copies require all zeros.
+    if fmt != 0 and fmt != 1:
+      raise newException(
+        PgProtocolError, label & ": unknown column format " & $fmt & " at column " & $i
+      )
+    if result.copyFormat == cfText and fmt != 0:
+      raise newException(
+        PgProtocolError,
+        label & ": column " & $i & " format " & $fmt & " in a text-format copy",
+      )
+    result.copyColumnFormats[i] = fmt
     offset += 2
+  if offset != body.len:
+    raise newException(
+      PgProtocolError, label & ": trailing data (" & $(body.len - offset) & " bytes)"
+    )
 
 proc newRowData*(
     numCols: int16, colFormats: seq[int16] = @[], colTypeOids: seq[int32] = @[]
