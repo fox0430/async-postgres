@@ -504,6 +504,40 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "openCursor rejects chunkSize 0":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # 0 would mean Execute maxRows 0 (unlimited) and silently fetch all rows
+      # instead of streaming, so it must fail fast with PgTypeError.
+      var raised = false
+      try:
+        discard await conn.openCursor(
+          "SELECT g FROM generate_series(1, 5) AS g", chunkSize = 0
+        )
+      except PgTypeError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
+  test "openCursor rejects negative chunkSize":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var raised = false
+      try:
+        discard await conn.openCursor(
+          "SELECT g FROM generate_series(1, 5) AS g", chunkSize = -1
+        )
+      except PgTypeError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+      await conn.close()
+
+    waitFor t()
+
   test "multiple sequential cursors on same connection":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
