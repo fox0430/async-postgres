@@ -107,7 +107,8 @@ type
       ## An acquire deadline elapsed (`acquireTimeout` or cluster fallback);
       ## retrying later may succeed.
     pekQueueFull
-      ## The waiter queue is full (`maxWaiters` bound); retrying later may succeed.
+      ## The acquire waiter queue — or, when `pipelined`, the `pendingOps`
+      ## queue — is full (`maxWaiters` bound); retrying later may succeed.
     pekConnectFailed
       ## A connect attempt failed during acquire (underlying error in `parent`);
       ## retrying may succeed.

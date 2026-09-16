@@ -1196,6 +1196,48 @@ suite "Pool close":
       discard waitFor pool.query("SELECT 1")
     check pool.pendingOps.len == 0
 
+  test "pipelined pendingOps respects maxWaiters":
+    # Regression: the pipelined enqueue path used to bypass maxWaiters, so a
+    # configured bound only protected acquire waiters.
+    let pool = makePool()
+    pool.config.pipelined = true
+    pool.config.maxWaiters = 1
+    pool.pendingOps.addLast(
+      PendingPoolOp(kind: popExec, execFut: newFuture[CommandResult]("occupant"))
+    )
+    var caught: ref PgPoolError
+    try:
+      discard waitFor pool.exec("SELECT 1")
+    except PgPoolError as e:
+      caught = e
+    check caught != nil
+    check caught.kind == pekQueueFull
+    check pool.pendingOps.len == 1
+
+  test "pipelined finite timeout covers queue dwell":
+    # Hold dispatchScheduled so scheduleDispatch is a no-op and the op sits
+    # in pendingOps until the caller's timeout fires from enqueue.
+    let pool = makePool()
+    pool.config.pipelined = true
+    pool.dispatchScheduled = true
+    expect(PgTimeoutError):
+      discard waitFor pool.exec("SELECT 1", timeout = milliseconds(30))
+    check pool.pendingOps.len == 0
+    pool.dispatchScheduled = false
+
+  test "settleAbandonedPendingOp removes only the abandoned op":
+    let pool = makePool()
+    let keep = PendingPoolOp(kind: popExec, execFut: newFuture[CommandResult]("keep"))
+    let drop = PendingPoolOp(kind: popQuery, queryFut: newFuture[QueryResult]("drop"))
+    pool.pendingOps.addLast(keep)
+    pool.pendingOps.addLast(drop)
+    let err = newException(PgTimeoutError, "abandoned")
+    pool.settleAbandonedPendingOp(drop, err)
+    check pool.pendingOps.len == 1
+    check pool.pendingOps.peekFirst() == keep
+    check drop.queryFut.failed
+    check not keep.execFut.finished
+
 suite "Pool active count tracking":
   test "release then acquire roundtrip":
     let pool = makePool()
