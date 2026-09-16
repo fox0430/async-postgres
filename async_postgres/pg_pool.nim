@@ -35,7 +35,10 @@ type
       ## acquire latency is bounded by ~`acquireTimeout` rather than
       ## `pingTimeout*N + connectTimeout + acquireTimeout`.
     maxWaiters*: int = -1
-      ## Max queued acquire waiters (default -1=unlimited, 0=no waiting). Rejects with PgPoolError when full.
+      ## Max queued acquire waiters, and when `pipelined` is true also the max
+      ## depth of `pendingOps` before `pool.exec`/`pool.query` enqueue
+      ## (default -1=unlimited, 0=reject immediately). Rejects with
+      ## `PgPoolError(pekQueueFull)` when full.
     resetQuery*: string
       ## SQL to execute when returning a connection to the pool (default ""=disabled).
       ## Common values: "DISCARD ALL" (full reset, recommended for PgBouncer),
@@ -1741,6 +1744,25 @@ proc failPendingAndUnschedule(pool: PgPool, err: ref CatchableError) {.raises: [
   pool.failAllPending(err)
   pool.dispatchScheduled = false
 
+proc settleAbandonedPendingOp(
+    pool: PgPool, op: PendingPoolOp, err: ref CatchableError
+) =
+  ## Caller abandoned the wait (timeout or cancel) before the op settled.
+  ## Remove it from `pendingOps` when still queued so `maxWaiters` accounting
+  ## stays exact; `failPendingOp` is a no-op once the future is already
+  ## finished (chronos cancel, or a racing batch settle).
+  var kept = initDeque[PendingPoolOp]()
+  var found = false
+  while pool.pendingOps.len > 0:
+    let cur = pool.pendingOps.popFirst()
+    if cur == op:
+      found = true
+    else:
+      kept.addLast(cur)
+  pool.pendingOps = move(kept)
+  if found:
+    failPendingOp(op, err)
+
 proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
   ## Schedule a batch dispatch on the next event loop tick.
   if pool.dispatchScheduled:
@@ -1773,6 +1795,43 @@ proc scheduleDispatch(pool: PgPool) {.gcsafe, raises: [].} =
     let err = newException(PgError, "Pipeline dispatch schedule failed: " & e.msg)
     pool.failPendingAndUnschedule(err)
 
+proc enqueuePendingOp(pool: PgPool, op: PendingPoolOp) =
+  ## Closed / capacity checks shared by the four pipelined `exec`/`query`
+  ## entry points. `maxWaiters` caps `pendingOps` the same way it caps the
+  ## acquire waiter queue on the non-pipelined path.
+  if pool.closed:
+    raise newPoolError(pekClosed, "Pool is closed")
+  if pool.config.maxWaiters >= 0 and pool.pendingOps.len >= pool.config.maxWaiters:
+    raise newPoolError(
+      pekQueueFull,
+      "Pool pending ops queue full (maxWaiters=" & $pool.config.maxWaiters & ")",
+    )
+  pool.pendingOps.addLast(op)
+  pool.scheduleDispatch()
+
+proc awaitPendingOp[T](
+    pool: PgPool, op: PendingPoolOp, fut: Future[T]
+): Future[T] {.async.} =
+  ## Wait for a pipelined op future. A finite `op.timeout` is a wall-clock
+  ## deadline from enqueue through batch completion — queue dwell is not free.
+  ## `ZeroDuration` stays unlimited (bounded only by `maxWaiters` when set).
+  if op.timeout > ZeroDuration:
+    try:
+      return await fut.wait(op.timeout)
+    except AsyncTimeoutError:
+      let err = newException(PgTimeoutError, "Pool pipelined operation timed out")
+      pool.settleAbandonedPendingOp(op, err)
+      raise err
+    except CancelledError as e:
+      pool.settleAbandonedPendingOp(op, e)
+      raise e
+  else:
+    try:
+      return await fut
+    except CancelledError as e:
+      pool.settleAbandonedPendingOp(op, e)
+      raise e
+
 proc exec*(
     pool: PgPool,
     sql: string,
@@ -1786,18 +1845,16 @@ proc exec*(
   ## In pipelined mode a batch runs under a single timeout, so a finite
   ## `timeout` may be widened to the largest finite timeout among the ops it is
   ## batched with. An op with no timeout (`ZeroDuration`) is batched separately
-  ## and stays unlimited.
+  ## and stays unlimited. A finite `timeout` is measured from enqueue (queue
+  ## dwell included); when `maxWaiters >= 0`, enqueue itself rejects with
+  ## `pekQueueFull` once `pendingOps` reaches that depth.
   if pool.config.pipelined:
-    if pool.closed:
-      raise newPoolError(pekClosed, "Pool is closed")
     let fut = newFuture[CommandResult]("PgPool.exec.pipelined")
-    pool.pendingOps.addLast(
-      PendingPoolOp(
-        kind: popExec, sql: sql, params: params, timeout: timeout, execFut: fut
-      )
+    let op = PendingPoolOp(
+      kind: popExec, sql: sql, params: params, timeout: timeout, execFut: fut
     )
-    pool.scheduleDispatch()
-    return await fut
+    pool.enqueuePendingOp(op)
+    return await pool.awaitPendingOp(op, fut)
   let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.exec(sql, params, timeout = timeout))
 
@@ -1809,23 +1866,20 @@ proc exec*(
 ): Future[CommandResult] {.async.} =
   ## Execute a statement with heap-alloc-free inline parameters using a pooled
   ## connection. Batches through the pipelined path when `pipelined` is enabled;
-  ## see the `seq[PgParam]` overload for the batch timeout semantics.
+  ## see the `seq[PgParam]` overload for the batch timeout and `maxWaiters`
+  ## semantics.
   if pool.config.pipelined:
-    if pool.closed:
-      raise newPoolError(pekClosed, "Pool is closed")
     let fut = newFuture[CommandResult]("PgPool.exec.pipelined")
-    pool.pendingOps.addLast(
-      PendingPoolOp(
-        kind: popExec,
-        sql: sql,
-        paramsInline: params,
-        hasInline: true,
-        timeout: timeout,
-        execFut: fut,
-      )
+    let op = PendingPoolOp(
+      kind: popExec,
+      sql: sql,
+      paramsInline: params,
+      hasInline: true,
+      timeout: timeout,
+      execFut: fut,
     )
-    pool.scheduleDispatch()
-    return await fut
+    pool.enqueuePendingOp(op)
+    return await pool.awaitPendingOp(op, fut)
   let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.exec(sql, params, timeout = timeout))
 
@@ -1843,23 +1897,21 @@ proc query*(
   ## In pipelined mode a batch runs under a single timeout, so a finite
   ## `timeout` may be widened to the largest finite timeout among the ops it is
   ## batched with. An op with no timeout (`ZeroDuration`) is batched separately
-  ## and stays unlimited.
+  ## and stays unlimited. A finite `timeout` is measured from enqueue (queue
+  ## dwell included); when `maxWaiters >= 0`, enqueue itself rejects with
+  ## `pekQueueFull` once `pendingOps` reaches that depth.
   if pool.config.pipelined:
-    if pool.closed:
-      raise newPoolError(pekClosed, "Pool is closed")
     let fut = newFuture[QueryResult]("PgPool.query.pipelined")
-    pool.pendingOps.addLast(
-      PendingPoolOp(
-        kind: popQuery,
-        sql: sql,
-        params: params,
-        resultFormat: resultFormat,
-        timeout: timeout,
-        queryFut: fut,
-      )
+    let op = PendingPoolOp(
+      kind: popQuery,
+      sql: sql,
+      params: params,
+      resultFormat: resultFormat,
+      timeout: timeout,
+      queryFut: fut,
     )
-    pool.scheduleDispatch()
-    return await fut
+    pool.enqueuePendingOp(op)
+    return await pool.awaitPendingOp(op, fut)
   let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
@@ -1874,24 +1926,21 @@ proc query*(
 ): Future[QueryResult] {.async.} =
   ## Execute a query with heap-alloc-free inline parameters using a pooled
   ## connection. Batches through the pipelined path when `pipelined` is enabled;
-  ## see the `seq[PgParam]` overload for the batch timeout semantics.
+  ## see the `seq[PgParam]` overload for the batch timeout and `maxWaiters`
+  ## semantics.
   if pool.config.pipelined:
-    if pool.closed:
-      raise newPoolError(pekClosed, "Pool is closed")
     let fut = newFuture[QueryResult]("PgPool.query.pipelined")
-    pool.pendingOps.addLast(
-      PendingPoolOp(
-        kind: popQuery,
-        sql: sql,
-        paramsInline: params,
-        hasInline: true,
-        resultFormat: resultFormat,
-        timeout: timeout,
-        queryFut: fut,
-      )
+    let op = PendingPoolOp(
+      kind: popQuery,
+      sql: sql,
+      paramsInline: params,
+      hasInline: true,
+      resultFormat: resultFormat,
+      timeout: timeout,
+      queryFut: fut,
     )
-    pool.scheduleDispatch()
-    return await fut
+    pool.enqueuePendingOp(op)
+    return await pool.awaitPendingOp(op, fut)
   let conn = await pool.acquireInternal()
   return await pool.runAndRelease(
     conn, conn.query(sql, params, resultFormat = resultFormat, timeout = timeout)
