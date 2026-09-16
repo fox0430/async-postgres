@@ -80,6 +80,10 @@ proc openCursorImpl(
 ): Future[Cursor] {.async.} =
   conn.checkReady()
 
+  if chunkSize <= 0:
+    raise newException(
+      PgTypeError, "openCursor: chunkSize must be positive (got " & $chunkSize & ")"
+    )
   validateExtendedQuery(sql, params.len, paramOids.len, stmtNameLen = 0)
   let formats =
     if paramFormats.len > 0:
@@ -354,6 +358,7 @@ template withCursor*(
     cursorTimeout: Duration = ZeroDuration,
 ) =
   ## Open a cursor, execute `body`, then close the cursor automatically.
+  ## `chunks` must be positive (see `openCursor`).
   ## The cursor is available as `cursorName` inside the body.
   ##
   ## A failure in the automatic `close` never masks an exception raised by
@@ -391,9 +396,12 @@ proc openCursor*(
     timeout: Duration = ZeroDuration,
 ): Future[Cursor] {.async.} =
   ## Open a server-side cursor for streaming rows in chunks.
+  ## `chunkSize` must be positive: `0` would mean `Execute` maxRows `0`
+  ## (unlimited) and silently fetch all rows at once instead of streaming.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
-  ## Raises ``PgStateError`` / ``PgConnectionError`` on a closed connection as
+  ## Raises ``PgTypeError`` for a non-positive `chunkSize`,
+  ## ``PgStateError`` / ``PgConnectionError`` on a closed connection as
   ## `fetchNext` does.
   let (oids, formats, values) = extractParams(params)
   let resultFormats = resultFormat.toFormatCodes()
