@@ -151,7 +151,9 @@ type
     requireAuth*: set[AuthMethod]
       ## Allowed auth methods; empty = any (libpq ``require_auth`` parity).
     applicationName*: string
-    connectTimeout*: Duration ## TCP connect timeout (default: no timeout)
+    connectTimeout*: Duration
+      ## TCP connect timeout (default ``ZeroDuration`` = no timeout).
+      ## Negative values become ``ZeroDuration``.
     keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
     keepAliveIdle*: int ## Seconds before first probe (0 = OS default)
     keepAliveInterval*: int ## Seconds between probes (0 = OS default)

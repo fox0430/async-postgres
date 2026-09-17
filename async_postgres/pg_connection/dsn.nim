@@ -752,6 +752,47 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   result.port = result.hosts[0].port
   validateClientCertConfig(result)
 
+proc validateConnConfig(config: var ConnConfig) =
+  ## Mirror DSN guards for ``initConnConfig`` (DSN parsers validate inline).
+  ## Negative ``connectTimeout`` becomes ``ZeroDuration``.
+  if config.connectTimeout < ZeroDuration:
+    config.connectTimeout = ZeroDuration
+
+  template checkPort(port: int) =
+    if port < 1 or port > 65535:
+      raise newException(PgConfigError, "Port out of range (1-65535)")
+
+  template checkHostaddr(a: string) =
+    if a.len > 0 and a[0] == '/':
+      raise newException(
+        PgConfigError,
+        "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets)",
+      )
+
+  checkPort(config.port)
+  checkHostaddr(config.hostaddr)
+  for entry in config.hosts:
+    checkPort(entry.port)
+    checkHostaddr(entry.hostaddr)
+
+  if config.keepAliveIdle < 0:
+    raise newException(PgConfigError, "keepalives_idle must be non-negative")
+  if int64(config.keepAliveIdle) > maxSockOptInt:
+    raise newException(PgConfigError, "keepalives_idle out of range")
+  if config.keepAliveInterval < 0:
+    raise newException(PgConfigError, "keepalives_interval must be non-negative")
+  if int64(config.keepAliveInterval) > maxSockOptInt:
+    raise newException(PgConfigError, "keepalives_interval out of range")
+  if config.keepAliveCount < 0:
+    raise newException(PgConfigError, "keepalives_count must be non-negative")
+  if int64(config.keepAliveCount) > maxSockOptInt:
+    raise newException(PgConfigError, "keepalives_count out of range")
+
+  if config.maxMessageSize < 0:
+    raise newException(PgConfigError, "max_message_size must be non-negative")
+  if config.maxScramIterations < 0:
+    raise newException(PgConfigError, "max_scram_iterations must be non-negative")
+
 proc initConnConfig*(
     host = "127.0.0.1",
     port = 5432,
@@ -782,6 +823,9 @@ proc initConnConfig*(
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead.
+  ##
+  ## Validates like DSN parsing; negative ``connectTimeout`` becomes
+  ## ``ZeroDuration`` (no timeout).
   result = ConnConfig(
     host: host,
     port: port,
@@ -810,6 +854,7 @@ proc initConnConfig*(
     maxMessageSize: maxMessageSize,
     maxScramIterations: maxScramIterations,
   )
+  validateConnConfig(result)
   validateClientCertConfig(result)
 
 proc parseDsn*(dsn: string): ConnConfig =
