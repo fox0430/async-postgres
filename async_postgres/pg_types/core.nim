@@ -346,8 +346,74 @@ template pgTypeErrorOnValueError*(context: string, body: untyped): untyped =
   except ValueError:
     raise newException(PgTypeError, context)
 
+func isPgIntText*(s: openArray[char]): bool =
+  ## PostgreSQL integer spelling: optional ``-`` plus ASCII digits only.
+  ## Rejects Nim's ``+``/``1_0`` leniency, which would misread as a wrong value.
+  var i = 0
+  if s.len > 0 and s[0] == '-':
+    i = 1
+  if i >= s.len:
+    return false
+  for j in i ..< s.len:
+    if s[j] notin {'0' .. '9'}:
+      return false
+  true
+
+func isPgUIntText*(s: openArray[char]): bool =
+  ## Same as ``isPgIntText`` for fields PostgreSQL emits unsigned: no sign.
+  if s.len == 0:
+    return false
+  for c in s:
+    if c notin {'0' .. '9'}:
+      return false
+  true
+
+proc pgParseUIntField*(s: openArray[char], context: string): int =
+  ## Parse an unsigned wire field under ``isPgUIntText``. Raises `PgTypeError`
+  ## with ``context`` (never the input) on malformed/overflowing input.
+  if not isPgUIntText(s):
+    raise newException(PgTypeError, context)
+  for c in s:
+    let d = int(ord(c) - ord('0'))
+    if result > (int.high - d) div 10:
+      raise newException(PgTypeError, context)
+    result = result * 10 + d
+
+type PgIntParse* = enum
+  ## View-parser outcome: ok, malformed, or well-formed but overflowing.
+  pipOk
+  pipInvalid
+  pipOverflow
+
+proc pgParseIntView*(s: openArray[char], v: var int): PgIntParse =
+  ## Parse an integer from a zero-copy view. Enforces `isPgIntText` first.
+  if not isPgIntText(s):
+    return pipInvalid
+  try:
+    if parseutils.parseInt(s, v) != s.len:
+      return pipInvalid
+  except ValueError:
+    return pipOverflow
+  pipOk
+
+proc pgParseBiggestIntView*(s: openArray[char], v: var int64): PgIntParse =
+  ## `pgParseIntView` widened to int64.
+  if not isPgIntText(s):
+    return pipInvalid
+  var parsed: BiggestInt
+  try:
+    if parseutils.parseBiggestInt(s, parsed) != s.len:
+      return pipInvalid
+  except ValueError, OverflowDefect:
+    return pipOverflow
+  v = int64(parsed)
+  pipOk
+
 proc pgParseInt*(s: string): int =
   ## Parse a text integer, converting `ValueError` (invalid or overflowing) to `PgTypeError`.
+  ## Rejects non-PostgreSQL spellings (see ``isPgIntText``).
+  if not isPgIntText(s):
+    raise newException(PgTypeError, "invalid integer value")
   pgTypeErrorOnValueError("invalid integer value"):
     parseInt(s)
 
@@ -374,6 +440,9 @@ proc pgParseBiggestInt*(s: string): int64 {.gcsafe, raises: [CatchableError].} =
   ## Parse a text integer into int64, converting `ValueError` to `PgTypeError`.
   ## Return type is spelled int64 (== BiggestInt) so procvar callers such as
   ## ``parseRangeText[int64]`` get an exact match without alias-widening.
+  ## Rejects non-PostgreSQL spellings (see ``isPgIntText``).
+  if not isPgIntText(s):
+    raise newException(PgTypeError, "invalid integer value")
   pgTypeErrorOnValueError("invalid integer value"):
     parseBiggestInt(s)
 
@@ -389,6 +458,14 @@ proc pgParseFloat*(s: openArray[char]): float =
     return Inf
   if s == "-Infinity":
     return NegInf
+  # Reject a leading `+` (`parseFloat` accepts it); first byte only so
+  # `1e+10` exponents keep working.
+  if s.len > 0 and s[0] == '+':
+    raise newException(PgTypeError, "invalid float value (len=" & $s.len & ")")
+  # Reject digit-group underscores (`1_0.5` would parse as 10.5).
+  for c in s:
+    if c == '_':
+      raise newException(PgTypeError, "invalid float value (len=" & $s.len & ")")
   # Mirror ``strutils.parseFloat``'s strictness (entire input must parse) but on a
   # view, without its throwing `string` overload's allocation/`ValueError`.
   let n = parseutils.parseFloat(s, result)
@@ -410,8 +487,45 @@ proc pgParseFloat32*(s: openArray[char]): float32 =
 proc pgParseHexInt*(s: string): int =
   ## Parse a hex string, converting `ValueError` to `PgTypeError`.
   ## Used to decode hex-encoded bytea (``\xDEADBEEF``) text pairs.
+  ## Rejects underscores and ``0x``/``#`` prefixes: a pair is hex digits only.
+  if s.len == 0:
+    raise newException(PgTypeError, "invalid hex value")
+  for c in s:
+    if c notin {'0' .. '9', 'a' .. 'f', 'A' .. 'F'}:
+      raise newException(PgTypeError, "invalid hex value")
   pgTypeErrorOnValueError("invalid hex value"):
     parseHexInt(s)
+
+func isPgHexText*(s: openArray[char]): bool =
+  ## PostgreSQL hex spelling: ASCII hex digits only.
+  ## Rejects Nim's ``0x``/``#`` prefixes, underscores, and silent overflow wrap.
+  if s.len == 0:
+    return false
+  for c in s:
+    if c notin {'0' .. '9', 'a' .. 'f', 'A' .. 'F'}:
+      return false
+  true
+
+proc pgParseHexUInt32*(s: openArray[char], context: string): uint32 =
+  ## Parse a hex wire field into uint32 under ``isPgHexText``. Accumulates in
+  ## uint64 so overflow fails with ``context`` instead of wrapping. Leading
+  ## zeros are accepted.
+  if not isPgHexText(s):
+    raise newException(PgTypeError, context)
+  var acc: uint64 = 0
+  for c in s:
+    let d =
+      case c
+      of '0' .. '9':
+        uint64(ord(c) - ord('0'))
+      of 'a' .. 'f':
+        uint64(ord(c) - ord('a') + 10)
+      else:
+        uint64(ord(c) - ord('A') + 10)
+    acc = acc * 16 + d
+    if acc > 0xFFFF_FFFF'u64:
+      raise newException(PgTypeError, context)
+  uint32(acc)
 
 proc parsePgBoolText*(s: string): bool =
   ## Parse a PostgreSQL text-format bool value. PostgreSQL itself always emits
@@ -457,6 +571,25 @@ proc checkPgTimeTzOffset*(utcOffset: int32) {.raises: [PgTypeError].} =
   if utcOffset <= -pgTzDispLimit or utcOffset >= pgTzDispLimit:
     raise
       newException(PgTypeError, "timetz zone displacement out of range: " & $utcOffset)
+
+proc checkPgTimeFields*(
+    hour, minute, second, microsecond: int32
+) {.raises: [PgTypeError].} =
+  ## Encode-side ``time``/``timetz`` domain: 0..24h, 0..59m/s, 0..999999us;
+  ## ``24:00:00`` only with zero sub-fields.
+  if hour < 0 or hour > 24 or minute < 0 or minute > 59 or second < 0 or second > 59 or
+      microsecond < 0 or microsecond > 999_999:
+    raise newException(
+      PgTypeError,
+      "time fields out of range: " & $hour & ':' & $minute & ':' & $second & '.' &
+        $microsecond,
+    )
+  if hour == 24 and (minute != 0 or second != 0 or microsecond != 0):
+    raise newException(
+      PgTypeError,
+      "time fields out of range: " & $hour & ':' & $minute & ':' & $second & '.' &
+        $microsecond,
+    )
 
 const MaxMoneyScale* = 18
   ## Largest fractional-digit count a `PgMoney` can carry: `$` scales by
@@ -1205,7 +1338,13 @@ proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} 
   else:
     intPart = src
     fracPart = ""
-  let dscale = int16(fracPart.len)
+  let dscale =
+    if fracPart.len > int(high(int16)):
+      raise newException(
+        PgTypeError, "Invalid numeric: dscale out of range (len=" & $s.len & ")"
+      )
+    else:
+      int16(fracPart.len)
   # Strip leading zeros from integer part (keep at least "")
   var intStripped = intPart.strip(leading = true, trailing = false, chars = {'0'})
   # Pad to multiples of 4 for base-10000 grouping
@@ -1217,13 +1356,17 @@ proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} 
     intPadded = repeat('0', 4 - intPadded.len mod 4) & intPadded
   # Parse base-10000 digit groups: integer part then fractional part
   var digits: seq[int16]
-  # ``intPadded``/``fracPadded`` contain only digits (validated above and zero-padded),
-  # so each 4-char group is always in 0..9999. Plain ``parseInt`` cannot raise here —
-  # there is no ``ValueError`` to convert — so skip ``pgParseInt``'s redundant guard.
+  # Groups are known-good digits, so accumulate directly without a text parser.
+  template digitGroup(src: string, at: int): int16 =
+    int16(
+      (ord(src[at]) - ord('0')) * 1000 + (ord(src[at + 1]) - ord('0')) * 100 +
+        (ord(src[at + 2]) - ord('0')) * 10 + (ord(src[at + 3]) - ord('0'))
+    )
+
   for i in countup(0, intPadded.len - 1, 4):
-    digits.add(int16(parseInt(intPadded[i ..< i + 4])))
+    digits.add(digitGroup(intPadded, i))
   for i in countup(0, fracPadded.len - 1, 4):
-    digits.add(int16(parseInt(fracPadded[i ..< i + 4])))
+    digits.add(digitGroup(fracPadded, i))
   let intGroups = intPadded.len div 4
   # Strip trailing zero groups, keeping enough for dscale
   let minDigits = intGroups + (if dscale > 0: (dscale.int + 3) div 4 else: 0)
@@ -1239,9 +1382,18 @@ proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} 
   # Compute weight (exponent of first digit group)
   let weight =
     if intGroups > 0:
+      if intGroups - 1 > int(high(int16)):
+        raise newException(
+          PgTypeError, "Invalid numeric: weight out of range (len=" & $s.len & ")"
+        )
       int16(intGroups - 1)
     elif digits.len > 0:
-      int16(-leadingZeroGroups - 1)
+      let w = -leadingZeroGroups - 1
+      if w < int(low(int16)) or w > int(high(int16)):
+        raise newException(
+          PgTypeError, "Invalid numeric: weight out of range (len=" & $s.len & ")"
+        )
+      int16(w)
     else:
       0'i16
   if digits.len == 0:

@@ -22,6 +22,37 @@ import accessors {.all.}
 #   let m = row.getEnum[Mood](0)
 #   let m = row.getEnumOpt[Mood](0)
 
+const LabelBearingOids = [OidText, OidVarchar, OidBpchar, OidName, OidChar]
+  ## Character types whose binary payload is the label itself, so
+  ## ``SELECT status::text`` reads back as an enum.
+
+proc checkEnumOid(accessor: string, actual: int32, kind: string) =
+  ## Wire-OID guard for enum reads. Accepts dynamic OIDs and character types;
+  ## rejects explicit 0 and other built-ins. ``kind`` is ``"colOid"``/``"elemOid"``.
+  if wireOidIsDynamic(actual) or actual in LabelBearingOids:
+    return
+  if actual == 0'i32:
+    raise newException(
+      PgTypeError,
+      accessor & ": wire " & kind & "=0 is unknown (no type info from RowDescription);" &
+        " not readable as an enum in binary (drop the OID metadata or use resultFormat = rfText)",
+    )
+  raise newException(
+    PgTypeError,
+    accessor & ": wire " & kind & "=" & $actual &
+      " is not an enum (binary column type mismatch)",
+  )
+
+proc checkEnumArrayElemOid(accessor: string, actual: int32) =
+  ## Binary ``enum[]`` element guard.
+  checkEnumOid(accessor, actual, "elemOid")
+
+proc checkEnumColOid(accessor: string, row: Row, col: int) =
+  ## Scalar-enum column guard. Missing metadata skips the check; explicit OIDs judged.
+  if col < 0 or row.data.colTypeOids.len <= col:
+    return
+  checkEnumOid(accessor, row.data.colTypeOids[col], "colOid")
+
 proc encodeEnumTextArray*(
     labels: seq[Option[string]]
 ): string {.raises: [PgTypeError].} =
@@ -140,14 +171,22 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
       )
 
 proc pgParseEnum[T: enum](s: string): T =
-  ## Parse an enum label, converting `ValueError` (unknown label) to `PgTypeError`
-  ## so callers can rely on the ``except PgError`` contract (see ``pg_errors``).
-  pgTypeErrorOnValueError("invalid enum value for " & name(T) & " (len=" & $s.len & ")"):
-    parseEnum[T](s)
+  ## Parse an enum label by exact match, raising `PgTypeError` for unknown ones.
+  ## Unlike ``parseEnum``, no case/underscore folding: server labels stay distinct.
+  for v in T:
+    if $v == s:
+      return v
+  raise newException(
+    PgTypeError, "invalid enum value for " & name(T) & " (len=" & $s.len & ")"
+  )
 
 proc getEnum*[T: enum](row: Row, col: int): T =
   ## Read a PostgreSQL enum column (text format) as a Nim enum.
   ## The column value must exactly match one of ``T``'s string representations.
+  ## In binary, built-in OIDs are rejected (stringified scalars would collide
+  ## with labels).
+  if row.isBinaryCol(col) and not row.isNull(col):
+    checkEnumColOid("getEnum", row, col)
   let s = row.getStr(col)
   try:
     pgParseEnum[T](s)
@@ -171,6 +210,7 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
     rejectMultiDim(decoded)
+    checkEnumArrayElemOid("getEnumArray", decoded.elemOid)
     result = newSeq[T](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -198,6 +238,7 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
     rejectMultiDim(decoded)
+    checkEnumArrayElemOid("getEnumArrayElemOpt", decoded.elemOid)
     result = newSeq[Option[T]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:

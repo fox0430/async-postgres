@@ -102,8 +102,12 @@ proc parseLoInt(s, fn: string): BiggestInt =
   ## Convert a numeric scalar returned by a Large Object server function to an
   ## integer, surfacing a malformed response as `PgTypeError` (keeps the
   ## ``except PgError`` contract) instead of leaking a raw `ValueError`.
-  pgTypeErrorOnValueError(fn & " returned a non-numeric result (len=" & $s.len & ")"):
-    parseBiggestInt(s)
+  var v: int64
+  if pgParseBiggestIntView(s, v) != pipOk:
+    raise newException(
+      PgTypeError, fn & " returned a non-numeric result (len=" & $s.len & ")"
+    )
+  BiggestInt(v)
 
 proc parseLoInt32(s, fn: string): int32 =
   ## Convert a numeric scalar returned by a Large Object server function to
@@ -120,12 +124,23 @@ proc parseLoOid(s, fn: string): Oid =
   ## Convert an OID returned by a Large Object server function, surfacing a
   ## malformed or out-of-range response as `PgTypeError` instead of a raw
   ## `ValueError` or an uncatchable ``RangeDefect``.
-  var v: uint64
-  try:
-    v = parseUInt(s)
-  except ValueError:
+  # int64 holds the full uint32 OID range; int may be 32-bit.
+  var parsed: int64
+  if not isPgUIntText(s):
     raise
       newException(PgTypeError, fn & " returned a non-numeric OID (len=" & $s.len & ")")
+  case pgParseBiggestIntView(s, parsed)
+  of pipOk:
+    discard
+  of pipInvalid:
+    raise
+      newException(PgTypeError, fn & " returned a non-numeric OID (len=" & $s.len & ")")
+  of pipOverflow:
+    # Valid digits but out of range.
+    raise newException(
+      PgTypeError, fn & " returned an OID outside uint32 range (len=" & $s.len & ")"
+    )
+  let v = uint64(parsed)
   if v > uint64(high(Oid)):
     raise newException(
       PgTypeError, fn & " returned an OID outside uint32 range (len=" & $s.len & ")"

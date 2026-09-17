@@ -113,6 +113,16 @@ proc parseLoadBalanceHosts*(s: string): LoadBalanceHosts =
   else:
     raise newException(PgConfigError, "Invalid load_balance_hosts (len=" & $s.len & ")")
 
+proc parseDsnInt(val, label: string): int =
+  ## Parse a DSN integer. Rejects digit-group underscores (``1_0``); unlike
+  ## ``parsePort``, whitespace is not stripped.
+  if val.find('_') >= 0:
+    raise newException(PgConfigError, "Invalid " & label & " (len=" & $val.len & ")")
+  try:
+    result = parseInt(val)
+  except ValueError:
+    raise newException(PgConfigError, "Invalid " & label & " (len=" & $val.len & ")")
+
 proc parsePort*(s: string): int =
   ## Follows libpq's strtol-based rules: surrounding whitespace and a leading
   ## sign are accepted (libpq takes `+5432` too), digit-group underscores are
@@ -349,12 +359,7 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
   of "application_name":
     result.applicationName = val
   of "connect_timeout":
-    var secs: int
-    try:
-      secs = parseInt(val)
-    except ValueError:
-      raise
-        newException(PgConfigError, "Invalid connect_timeout (len=" & $val.len & ")")
+    let secs = parseDsnInt(val, "connect_timeout")
     # `seconds` builds a nanosecond Duration, so anything past this multiplies
     # past high(int64) and raises an uncatchable OverflowDefect.
     const maxTimeoutSecs = high(int64) div 1_000_000_000
@@ -381,21 +386,11 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
     else:
       result.sslKey = readPemFileParam(val, "sslkey", checkKeyPerms = true)
   of "sslsni":
-    try:
-      result.sslSni = parseInt(val) != 0
-    except ValueError:
-      raise newException(PgConfigError, "Invalid sslsni (len=" & $val.len & ")")
+    result.sslSni = parseDsnInt(val, "sslsni") != 0
   of "keepalives":
-    try:
-      result.keepAlive = parseInt(val) != 0
-    except ValueError:
-      raise newException(PgConfigError, "Invalid keepalives (len=" & $val.len & ")")
+    result.keepAlive = parseDsnInt(val, "keepalives") != 0
   of "keepalives_idle":
-    try:
-      result.keepAliveIdle = parseInt(val)
-    except ValueError:
-      raise
-        newException(PgConfigError, "Invalid keepalives_idle (len=" & $val.len & ")")
+    result.keepAliveIdle = parseDsnInt(val, "keepalives_idle")
     if result.keepAliveIdle < 0:
       raise newException(
         PgConfigError, "keepalives_idle must be non-negative (len=" & $val.len & ")"
@@ -405,12 +400,7 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
         PgConfigError, "keepalives_idle out of range (len=" & $val.len & ")"
       )
   of "keepalives_interval":
-    try:
-      result.keepAliveInterval = parseInt(val)
-    except ValueError:
-      raise newException(
-        PgConfigError, "Invalid keepalives_interval (len=" & $val.len & ")"
-      )
+    result.keepAliveInterval = parseDsnInt(val, "keepalives_interval")
     if result.keepAliveInterval < 0:
       raise newException(
         PgConfigError, "keepalives_interval must be non-negative (len=" & $val.len & ")"
@@ -420,11 +410,7 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
         PgConfigError, "keepalives_interval out of range (len=" & $val.len & ")"
       )
   of "keepalives_count":
-    try:
-      result.keepAliveCount = parseInt(val)
-    except ValueError:
-      raise
-        newException(PgConfigError, "Invalid keepalives_count (len=" & $val.len & ")")
+    result.keepAliveCount = parseDsnInt(val, "keepalives_count")
     if result.keepAliveCount < 0:
       raise newException(
         PgConfigError, "keepalives_count must be non-negative (len=" & $val.len & ")"
@@ -438,22 +424,13 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
   of "load_balance_hosts":
     result.loadBalanceHosts = parseLoadBalanceHosts(val)
   of "max_message_size":
-    try:
-      result.maxMessageSize = parseInt(val)
-    except ValueError:
-      raise
-        newException(PgConfigError, "Invalid max_message_size (len=" & $val.len & ")")
+    result.maxMessageSize = parseDsnInt(val, "max_message_size")
     if result.maxMessageSize < 0:
       raise newException(
         PgConfigError, "max_message_size must be non-negative (len=" & $val.len & ")"
       )
   of "max_scram_iterations":
-    try:
-      result.maxScramIterations = parseInt(val)
-    except ValueError:
-      raise newException(
-        PgConfigError, "Invalid max_scram_iterations (len=" & $val.len & ")"
-      )
+    result.maxScramIterations = parseDsnInt(val, "max_scram_iterations")
     if result.maxScramIterations < 0:
       raise newException(
         PgConfigError,

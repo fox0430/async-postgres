@@ -1,4 +1,4 @@
-import std/[options, json, macros, parseutils, strutils, tables, times, net]
+import std/[options, json, macros, strutils, tables, times, net]
 
 import ../pg_protocol
 import core, decoding, encoding
@@ -27,6 +27,18 @@ template bufView(row: Row, off, clen: int): openArray[char] =
     else:
       cast[ptr UncheckedArray[char]](nil).toOpenArray(0, -1)
   )
+
+proc raiseIntParse(outcome: PgIntParse, col, clen: int) {.inline.} =
+  ## Map a `pgParseIntView` failure to the accessor error.
+  case outcome
+  of pipOk:
+    discard
+  of pipInvalid:
+    raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
+  of pipOverflow:
+    raise newException(
+      PgTypeError, "Column " & $col & ": integer value out of range (len=" & $clen & ")"
+    )
 
 proc len*(row: Row): int {.inline.} =
   ## Return the number of columns in this row.
@@ -75,12 +87,11 @@ proc parseAffectedRowsRaw(tag: openArray[char]): int64 =
   inc lo
   if lo > tag.high:
     return 0
-  var parsed: BiggestInt = 0
-  try:
-    let consumed = parseutils.parseBiggestInt(tag.toOpenArray(lo, tag.high), parsed)
-    if consumed == 0 or consumed != tag.high - lo + 1:
-      return 0
-  except ValueError, OverflowDefect:
+  # Row count is unsigned decimal; malformed tags yield 0.
+  if not isPgUIntText(tag.toOpenArray(lo, tag.high)):
+    return 0
+  var parsed: int64 = 0
+  if pgParseBiggestIntView(tag.toOpenArray(lo, tag.high), parsed) != pipOk:
     return 0
   parsed
 
@@ -128,25 +139,66 @@ proc colTypeOid(row: Row, col: int): int32 {.inline.} =
   else:
     0'i32
 
+const FirstNormalObjectId = 16384'i32
+  ## Built-in OIDs are below this bound (``access/transam.h``); dynamic types
+  ## are at or above it.
+
+func wireOidIsDynamic(actual: int32): bool {.inline.} =
+  ## Whether ``actual`` is catalog-assigned (dynamic), regardless of layout.
+  actual >= FirstNormalObjectId
+
+func wireOidAcceptable(actual: int32, expected: openArray[int32]): bool =
+  ## Whether a binary payload declared as ``actual`` may be decoded as
+  ## ``expected``. Non-empty ``expected`` needs an exact match (dynamic OIDs
+  ## rejected); empty ``expected`` (hstore, enum) accepts dynamic OIDs only.
+  if expected.len == 0:
+    return wireOidIsDynamic(actual)
+  for e in expected:
+    if actual == e:
+      return true
+  false
+
+func describeExpectedOids(expected: openArray[int32]): string =
+  ## Format ``expected`` OIDs for error messages.
+  if expected.len == 0:
+    return "a user-defined type OID"
+  for i, oid in expected:
+    if i > 0:
+      result.add(" or ")
+    result.add($oid)
+
+const dynamicElemOidOnly: array[0, int32] = []
+  ## For types without a built-in OID: accepts dynamic OIDs only.
+
+func describeDynamicOid(accessor, kind: string, actual: int32): string =
+  ## Error for a catalog-assigned OID, whose layout is server-side only.
+  accessor & ": wire " & kind & "=" & $actual &
+    " is a user-defined type (domain, enum, composite, range or extension);" &
+    " its layout lives only in the server catalog, so a binary read cannot be" &
+    " verified — use resultFormat = rfText"
+
+func describeUnknownOid(accessor, kind: string, expected: openArray[int32]): string =
+  ## Error for an explicit wire OID 0: drop the OID metadata or use rfText.
+  accessor & ": wire " & kind & "=0 is unknown (no type info from RowDescription);" &
+    " expected " & describeExpectedOids(expected) &
+    " (binary column type mismatch; drop the OID metadata or use resultFormat = rfText)"
+
 proc checkScalarColOid(
     accessor: string, row: Row, col: int, expected: openArray[int32]
 ) =
-  ## Reject a binary column whose RowDescription OID is not decoded by this
-  ## accessor. Mirrors ``checkArrayElemOid`` for scalar columns: without it a
-  ## same-length type (int4/float4, int8/float8/timestamp, uuid/point, line/circle,
-  ## lseg/box) decodes silently to a wrong value.
-  ## Unknown OID 0 (manual Row without metadata) skips the check.
-  let actual = row.colTypeOid(col)
-  if actual == 0'i32:
+  ## Reject a binary column this accessor cannot decode. Same-length types
+  ## would otherwise misdecode silently. Missing OID metadata skips the check;
+  ## an explicit wire OID is always judged.
+  if col < 0 or row.data.colTypeOids.len <= col:
     return
-  for e in expected:
-    if actual == e:
-      return
-  var want = ""
-  for i, oid in expected:
-    if i > 0:
-      want.add(" or ")
-    want.add($oid)
+  let actual = row.data.colTypeOids[col]
+  if wireOidAcceptable(actual, expected):
+    return
+  if actual == 0'i32:
+    raise newException(PgTypeError, describeUnknownOid(accessor, "colOid", expected))
+  if wireOidIsDynamic(actual):
+    raise newException(PgTypeError, describeDynamicOid(accessor, "colOid", actual))
+  let want = describeExpectedOids(expected)
   raise newException(
     PgTypeError,
     accessor & ": wire colOid=" & $actual & " expected " & want &
@@ -252,16 +304,7 @@ proc getInt*(row: Row, col: int): int32 =
         "Column " & $col & ": unexpected binary length " & $clen & " for int32",
       )
   var v: int
-  var n: int
-  # ``parseInt(s, v)`` returns 0 for "no digits" but raises a raw ``ValueError``
-  # when the value overflows ``int``; route it through ``pgTypeErrorOnValueError``
-  # so it surfaces as a catchable ``PgTypeError``.
-  pgTypeErrorOnValueError(
-    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
-  ):
-    n = parseInt(row.bufView(off, clen), v)
-  if n == 0 or n != clen:
-    raise newException(PgTypeError, "Column " & $col & ": invalid integer value")
+  raiseIntParse(pgParseIntView(row.bufView(off, clen), v), col, clen)
   if v < int(int32.low) or v > int(int32.high):
     raise newException(
       PgTypeError,
@@ -285,14 +328,7 @@ proc getInt16*(row: Row, col: int): int16 =
         "Column " & $col & ": unexpected binary length " & $clen & " for int16",
       )
   var v: int
-  var n: int
-  # Convert ``parseInt``'s overflow ``ValueError`` to ``PgTypeError`` (see getInt).
-  pgTypeErrorOnValueError(
-    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
-  ):
-    n = parseInt(row.bufView(off, clen), v)
-  if n == 0 or n != clen:
-    raise newException(PgTypeError, "Column " & $col & ": invalid int16 value")
+  raiseIntParse(pgParseIntView(row.bufView(off, clen), v), col, clen)
   if v < int(int16.low) or v > int(int16.high):
     raise newException(
       PgTypeError,
@@ -319,16 +355,8 @@ proc getInt64*(row: Row, col: int): int64 =
         PgTypeError,
         "Column " & $col & ": unexpected binary length " & $clen & " for int64",
       )
-  var v: BiggestInt
-  var n: int
-  # Convert ``parseBiggestInt``'s overflow ``ValueError`` to ``PgTypeError``
-  # (see getInt).
-  pgTypeErrorOnValueError(
-    "Column " & $col & ": integer value out of range (len=" & $clen & ")"
-  ):
-    n = parseBiggestInt(row.bufView(off, clen), v)
-  if n == 0 or n != clen:
-    raise newException(PgTypeError, "Column " & $col & ": invalid int64 value")
+  var v: int64
+  raiseIntParse(pgParseBiggestIntView(row.bufView(off, clen), v), col, clen)
   result = v
 
 proc getFloat*(row: Row, col: int): float64 =
@@ -791,9 +819,9 @@ proc getXml*(row: Row, col: int): PgXml =
 
 proc getHstore*(row: Row, col: int): PgHstore =
   ## Get a column value as PgHstore. Handles both text and binary format.
-  ## hstore uses a dynamic OID assigned at CREATE EXTENSION time, so no
-  ## column OID check applies here (mirrors anyArrayElemOid on the array path).
+  ## hstore has no built-in OID, so only dynamic OIDs are accepted in binary.
   if row.isBinaryCol(col):
+    checkScalarColOid("getHstore", row, col, dynamicElemOidOnly)
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -1269,33 +1297,22 @@ proc decodeDateArrayElem(buf: openArray[byte]): DateTime =
 # ``decodeJsonArrayElem`` is defined above (near the scalar accessors) so
 # ``getJson`` can delegate to it without a forward declaration.
 
-# Sentinel for accessors whose element OID is not fixed by the catalog, so
-# there is nothing to match against: ``hstore`` is an extension type and gets
-# its OID assigned at CREATE EXTENSION time.
-const anyArrayElemOid: array[0, int32] = []
-
 proc checkArrayElemOid(accessor: string, actual: int32, expected: openArray[int32]) =
-  ## Reject a binary array whose wire element OID is not one this accessor
-  ## decodes. Without it an ``int8[]`` read through ``getIntArray`` decodes as
-  ## int32 and silently yields wrong values.
-  if expected.len == 0 or actual in expected:
+  ## Reject a binary array this accessor cannot decode (same policy as scalars).
+  if wireOidAcceptable(actual, expected):
     return
-  var want = ""
-  for i, oid in expected:
-    if i > 0:
-      want.add(" or ")
-    want.add($oid)
+  if actual == 0'i32:
+    raise newException(PgTypeError, describeUnknownOid(accessor, "elemOid", expected))
+  if wireOidIsDynamic(actual):
+    raise newException(PgTypeError, describeDynamicOid(accessor, "elemOid", actual))
   raise newException(
-    PgTypeError, accessor & ": wire elemOid=" & $actual & " expected " & want
+    PgTypeError,
+    accessor & ": wire elemOid=" & $actual & " expected " &
+      describeExpectedOids(expected),
   )
 
-# Array decoder skeletons. ``genArrayDecoder`` hardcodes the binary body to
-# ``decodePgArrayElement(T, slice)``; ``genArrayDecoderCustom`` takes an
-# explicit ``binBody`` for types that need extra context (json/timestamps).
-# In both, ``textBody`` decodes one text element with ``e: Option[string]``
-# in scope; ``binBody`` has ``row``/``off``/``e``/``decoded`` in scope.
-# ``elemOids`` lists the wire element OIDs the accessor accepts in binary
-# format (``anyArrayElemOid`` to skip the check).
+# Array decoder skeletons. ``elemOids`` lists accepted binary element OIDs
+# (``dynamicElemOidOnly`` for types without a built-in OID).
 template genArrayDecoderCustom(
     getProc: untyped,
     T: typedesc,
@@ -1626,7 +1643,7 @@ genArrayDecoder(
 )
 genArrayDecoder(getTsQueryArray, PgTsQuery, "tsquery", [OidTsQuery], PgTsQuery(e.get))
 genArrayDecoder(
-  getHstoreArray, PgHstore, "hstore", anyArrayElemOid, parseHstoreText(e.get)
+  getHstoreArray, PgHstore, "hstore", dynamicElemOidOnly, parseHstoreText(e.get)
 )
 
 # Element-level NULL-safe array getters

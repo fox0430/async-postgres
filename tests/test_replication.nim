@@ -31,8 +31,7 @@ suite "LSN":
 
   # IDENTIFY_SYSTEM / CREATE_REPLICATION_SLOT return the LSN as text. Like
   # parseTimelineId, parseLsn must convert a malformed value into PgTypeError
-  # (not leak a raw ValueError, including the one fromHex throws on non-hex
-  # halves) so callers stay under the single `except PgError` contract.
+  # so callers stay under the single `except PgError` contract.
   test "parseLsn invalid format":
     expect(PgTypeError):
       discard parseLsn("invalid")
@@ -46,8 +45,7 @@ suite "LSN":
       discard parseLsn("0/XYZ")
 
   test "parseLsn empty half rejected":
-    # fromHex[uint64]("") returns 0 without raising, so a half left blank
-    # would silently produce a valid-looking LSN. Reject explicitly.
+    # An empty half must not silently produce a zero LSN.
     expect(PgTypeError):
       discard parseLsn("/")
     expect(PgTypeError):
@@ -61,9 +59,17 @@ suite "LSN":
       discard parseLsn("100000000/0")
 
   test "parseLsn half wider than 64 bits":
-    # fromHex wraps modulo 2^64 past 16 hex digits instead of raising.
+    # An over-long half must fail instead of wrapping modulo 2^64.
     expect(PgTypeError):
       discard parseLsn("10000000000000000/0")
+
+  test "parseLsn rejects stdlib hex leniency":
+    # fromHex accepts underscores and 0x/#/0X prefixes, none of which the
+    # server emits. Each must raise instead of decoding to a wrong LSN.
+    for bad in ["1_0/0", "0/1_0", "0x10/0", "0/0x10", "#10/0", "0X10/0", "_/0", "0/_"]:
+      expect(PgTypeError):
+        discard parseLsn(bad)
+    check parseLsn("10/0").toUInt64 == 0x10_00000000'u64
 
   test "parseLsn zero-padded half longer than 16 characters still parses":
     # Leading zeros pad past 16 characters but the value is still in-range.
@@ -116,14 +122,27 @@ suite "CopyBothResponse parsing":
     body.add(0'u8) # text format
     body.addInt16(2'i16) # 2 columns
     body.addInt16(0'i16) # col 0: text
-    body.addInt16(1'i16) # col 1: binary
+    body.addInt16(0'i16) # col 1: text
     let raw = buildBackendMsg('W', body)
     var consumed: int
     let res = parseBackendMessage(raw, consumed)
     check res.state == psComplete
     check res.message.kind == bmkCopyBothResponse
     check res.message.copyFormat == cfText
-    check res.message.copyColumnFormats == @[0'i16, 1'i16]
+    check res.message.copyColumnFormats == @[0'i16, 0'i16]
+
+  test "a binary column inside a text-format CopyBothResponse is rejected":
+    # The protocol pins every per-column code to 0 when the overall format is
+    # text; accepting one would let a stream be read in the wrong format.
+    var body: seq[byte]
+    body.add(0'u8) # text format
+    body.addInt16(2'i16)
+    body.addInt16(0'i16)
+    body.addInt16(1'i16) # binary column in a text copy
+    let raw = buildBackendMsg('W', body)
+    var consumed: int
+    expect PgProtocolError:
+      discard parseBackendMessage(raw, consumed)
 
   test "parse CopyBothResponse binary format no columns":
     var body: seq[byte]

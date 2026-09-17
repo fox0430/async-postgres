@@ -6,6 +6,7 @@ import pkg/nimcrypto/pbkdf2
 import pkg/nimcrypto/utils as ncutils
 
 import pg_errors, pg_saslprep
+from pg_types/core import isPgUIntText, pgParseIntView, PgIntParse, pipOk
 
 template burnStr*(s: var string) =
   ## Wipe a string's heap buffer. Compiler is prevented from eliding the
@@ -110,9 +111,8 @@ proc scramClientFinalMessage*(
       saltB64 = part[2 .. ^1]
       hasSalt = true
     elif part.startsWith("i="):
-      try:
-        iterations = parseInt(part[2 .. ^1])
-      except ValueError:
+      if not isPgUIntText(part.toOpenArray(2, part.high)) or
+          pgParseIntView(part.toOpenArray(2, part.high), iterations) != pipOk:
         raise newException(PgConnectionError, "SCRAM: invalid iteration count")
       hasIterations = true
 

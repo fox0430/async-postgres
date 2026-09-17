@@ -1084,6 +1084,16 @@ suite "parseDsn keyword=value":
     expect PgError:
       discard parseDsn("host=h port=5_433")
 
+  test "error: digit-group underscore in non-port integers":
+    for dsn in [
+      "host=h connect_timeout=1_0", "host=h sslsni=1_0", "host=h keepalives=1_0",
+      "host=h keepalives_idle=1_0", "host=h keepalives_interval=1_0",
+      "host=h keepalives_count=1_0", "host=h max_message_size=1_0",
+      "host=h max_scram_iterations=1_0",
+    ]:
+      expect PgError:
+        discard parseDsn(dsn)
+
   test "error: invalid port":
     expect PgError:
       discard parseDsn("host=h port=notaport")
