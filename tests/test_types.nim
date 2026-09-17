@@ -235,6 +235,20 @@ suite "toPgParam":
     let s = toString(p.value.get)
     check s.startsWith("2024-01-15 10:30:00")
 
+  test "toPgParam Option[DateTime] none":
+    # Must not prototype via default(DateTime) (uninitialized → AssertionDefect).
+    let p = toPgParam(none(DateTime))
+    check p.oid == OidTimestamp
+    check p.format == 0
+    check p.value.isNone
+
+  test "toPgParam Option[DateTime] some":
+    let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+    let p = toPgParam(some(dt))
+    check p.oid == OidTimestamp
+    check p.format == 0
+    check toString(p.value.get).startsWith("2024-01-15 10:30:00")
+
   test "DateTime with non-UTC zone encodes the UTC instant":
     # Regression: text OidTimestamp used to serialize the DateTime's local wall
     # clock, so a zoned value stored a different absolute time than the binary
@@ -1264,6 +1278,20 @@ suite "Binary encode/decode helpers":
   test "DateTime":
     let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
     let p = toPgBinaryParam(dt)
+    check p.oid == OidTimestamp
+    check p.format == 1
+    check p.value.get.len == 8
+
+  test "toPgBinaryParam Option[DateTime] none":
+    # Must not prototype via default(DateTime) (uninitialized → AssertionDefect).
+    let p = toPgBinaryParam(none(DateTime))
+    check p.oid == OidTimestamp
+    check p.format == 1
+    check p.value.isNone
+
+  test "toPgBinaryParam Option[DateTime] some":
+    let dt = dateTime(2024, mJan, 15, 10, 30, 0, 0, utc())
+    let p = toPgBinaryParam(some(dt))
     check p.oid == OidTimestamp
     check p.format == 1
     check p.value.get.len == 8

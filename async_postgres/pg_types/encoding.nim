@@ -638,6 +638,15 @@ proc toPgParam*(v: Option[PgMoney], scale: int = 2): PgParam {.raises: [PgTypeEr
   else:
     PgParam(oid: OidMoney, format: 1, value: none(seq[byte]))
 
+# ``default(DateTime)`` is uninitialized; formatting it asserts in stdlib times.
+# The generic Option dispatcher prototypes via ``toPgParam(default(T))``, so
+# resolve OID/format statically (same pattern as Option[JsonNode] / Option[PgMoney]).
+proc toPgParam*(v: Option[DateTime]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgParam(v.get)
+  else:
+    PgParam(oid: OidTimestamp, format: 0, value: none(seq[byte]))
+
 # No raises pragma: the effect is T's encoder effects, inferred per
 # instantiation. A union annotation would over-declare for T whose encoder
 # raises less (e.g. Option[int32] raises neither, Option[string] only PgTypeError).
@@ -1260,8 +1269,9 @@ proc toPgBinaryParam*(
   else:
     PgParam(oid: OidJsonb, format: 1, value: none(seq[byte]))
 
-# Distinct-string types whose ``default(T)`` is empty and fails binary
-# validation. The generic Option dispatcher prototypes via
+# Types whose ``default(T)`` cannot safely prototype OID/format: distinct-string
+# empties fail binary validation, and uninitialized DateTime asserts in stdlib
+# times. The generic Option dispatcher prototypes via
 # ``toPgBinaryParam(default(T))``, so these must resolve OID/format statically
 # (same pattern as Option[JsonNode] / Option[PgMoney] above/below).
 proc toPgBinaryParam*(v: Option[PgUuid]): PgParam {.raises: [PgTypeError].} =
@@ -1281,6 +1291,12 @@ proc toPgBinaryParam*(v: Option[PgMacAddr8]): PgParam {.raises: [PgTypeError].} 
     toPgBinaryParam(v.get)
   else:
     PgParam(oid: OidMacAddr8, format: 1, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: Option[DateTime]): PgParam =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidTimestamp, format: 1, value: none(seq[byte]))
 
 proc encodeHstoreBinary*(
     v: PgHstore

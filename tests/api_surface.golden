@@ -2022,6 +2022,7 @@ async_postgres/pg_types/encoding.nim	toPgBinaryParam#4
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#40
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#41
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#42
+async_postgres/pg_types/encoding.nim	toPgBinaryParam#43
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#5
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#6
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#7
@@ -2080,6 +2081,7 @@ async_postgres/pg_types/encoding.nim	toPgParam#49
 async_postgres/pg_types/encoding.nim	toPgParam#5
 async_postgres/pg_types/encoding.nim	toPgParam#50
 async_postgres/pg_types/encoding.nim	toPgParam#51
+async_postgres/pg_types/encoding.nim	toPgParam#52
 async_postgres/pg_types/encoding.nim	toPgParam#6
 async_postgres/pg_types/encoding.nim	toPgParam#7
 async_postgres/pg_types/encoding.nim	toPgParam#8
