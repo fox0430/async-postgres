@@ -687,6 +687,75 @@ suite "initConnConfig client certificate validation":
     check cfg.sslCert == "cert"
     check cfg.sslKey == "key"
 
+suite "initConnConfig numeric and hostaddr validation":
+  # Mirrors DSN guards so initConnConfig cannot bypass them.
+  test "port 0 is rejected":
+    expect PgError:
+      discard initConnConfig(port = 0)
+
+  test "port above 65535 is rejected":
+    expect PgError:
+      discard initConnConfig(port = 65536)
+
+  test "hosts entry port out of range is rejected":
+    expect PgError:
+      discard initConnConfig(
+        hosts = @[HostEntry(host: "a", port: 0), HostEntry(host: "b", port: 5432)]
+      )
+
+  test "slash hostaddr is rejected":
+    expect PgError:
+      discard initConnConfig(hostaddr = "/tmp")
+
+  test "slash hostaddr on hosts entry is rejected":
+    expect PgError:
+      discard initConnConfig(
+        hosts = @[HostEntry(host: "db", hostaddr: "/var/run/postgresql", port: 5432)]
+      )
+
+  test "negative keepAliveIdle is rejected":
+    expect PgError:
+      discard initConnConfig(keepAliveIdle = -1)
+
+  test "keepAliveIdle exceeding cint is rejected":
+    when sizeof(cint) < sizeof(int):
+      expect PgError:
+        discard initConnConfig(keepAliveIdle = int(high(cint)) + 1)
+
+  test "negative keepAliveInterval is rejected":
+    expect PgError:
+      discard initConnConfig(keepAliveInterval = -1)
+
+  test "keepAliveInterval exceeding cint is rejected":
+    when sizeof(cint) < sizeof(int):
+      expect PgError:
+        discard initConnConfig(keepAliveInterval = int(high(cint)) + 1)
+
+  test "negative keepAliveCount is rejected":
+    expect PgError:
+      discard initConnConfig(keepAliveCount = -1)
+
+  test "keepAliveCount exceeding cint is rejected":
+    when sizeof(cint) < sizeof(int):
+      expect PgError:
+        discard initConnConfig(keepAliveCount = int(high(cint)) + 1)
+
+  test "negative maxMessageSize is rejected":
+    expect PgError:
+      discard initConnConfig(maxMessageSize = -1)
+
+  test "negative maxScramIterations is rejected":
+    expect PgError:
+      discard initConnConfig(maxScramIterations = -1)
+
+  test "negative connectTimeout normalizes to ZeroDuration":
+    let cfg = initConnConfig(connectTimeout = seconds(-5))
+    check cfg.connectTimeout == ZeroDuration
+
+  test "valid boundary port 1 and 65535 are accepted":
+    check initConnConfig(port = 1).port == 1
+    check initConnConfig(port = 65535).port == 65535
+
 suite "Client certificate config validation":
   # `connect()` now validates cert/key pairing before dialing, so these tests
   # no longer need a mock server — the failure fires client-side.

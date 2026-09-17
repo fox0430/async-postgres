@@ -110,7 +110,9 @@ proc toPgParamInline*(
     result.overflow = newSeq[byte](s.len)
     result.overflow.writeBytesAt(0, s.toOpenArrayByte(0, s.high))
 
-proc toPgParamInline*(v: PgMoney, scale: int = 2): PgParamInline =
+proc toPgParamInline*(
+    v: PgMoney, scale: int = 2
+): PgParamInline {.raises: [PgTypeError].} =
   ## Money → binary with scale validation. The wire carries only the raw
   ## amount, so ``v.scale`` must match the declared ``scale`` (server
   ## ``lc_monetary`` frac_digits). Defaults to 2 for the common locale.
@@ -136,7 +138,9 @@ proc toPgParamInline*[T](v: Option[T]): PgParamInline =
     let tmpl = toPgParamInline(default(T))
     PgParamInline(oid: tmpl.oid, format: tmpl.format, len: -1)
 
-proc toPgParamInline*(v: Option[PgMoney], scale: int = 2): PgParamInline =
+proc toPgParamInline*(
+    v: Option[PgMoney], scale: int = 2
+): PgParamInline {.raises: [PgTypeError].} =
   ## Money Option → binary with scale validation. ``none`` encodes as NULL
   ## without touching ``scale``; ``some`` requires ``v.get.scale == scale``.
   checkMoneyScale(scale)
@@ -217,7 +221,7 @@ proc toPgParam*(v: PgUuid): PgParam {.raises: [PgTypeError].} =
 proc toPgParam*(v: PgNumeric): PgParam {.raises: [PgTypeError].} =
   textParam(OidNumeric, $v, "numeric")
 
-proc toPgParam*(v: PgMoney, scale: int = 2): PgParam =
+proc toPgParam*(v: PgMoney, scale: int = 2): PgParam {.raises: [PgTypeError].} =
   ## Money → binary (raw int64). Text is locale-dependent. The wire carries
   ## only the raw amount, so ``v.scale`` must match the declared ``scale``
   ## (server ``lc_monetary`` frac_digits). Defaults to 2 for the common locale.
@@ -618,7 +622,7 @@ proc toPgParam*(v: Option[JsonNode]): PgParam {.raises: [PgTypeError].} =
   else:
     PgParam(oid: OidJsonb, format: 0, value: none(seq[byte]))
 
-proc toPgParam*(v: Option[PgMoney], scale: int = 2): PgParam =
+proc toPgParam*(v: Option[PgMoney], scale: int = 2): PgParam {.raises: [PgTypeError].} =
   ## Money Option → binary with scale validation. ``none`` encodes as NULL
   ## without touching ``scale``; ``some`` requires ``v.get.scale == scale``.
   checkMoneyScale(scale)
@@ -736,7 +740,7 @@ proc encodeNumericBinary*(v: PgNumeric): seq[byte] {.raises: [PgTypeError].} =
 proc toPgBinaryParam*(v: PgNumeric): PgParam {.raises: [PgTypeError].} =
   PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
 
-proc toPgBinaryParam*(v: PgMoney, scale: int = 2): PgParam =
+proc toPgBinaryParam*(v: PgMoney, scale: int = 2): PgParam {.raises: [PgTypeError].} =
   ## Money → binary with scale validation, like ``toPgParam``.
   checkMoneyScale(scale)
   if int(v.scale) != scale:
@@ -1368,7 +1372,9 @@ proc toPgBinaryParam*[T](v: Option[T]): PgParam =
     let proto = toPgBinaryParam(default(T))
     result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
 
-proc toPgBinaryParam*(v: Option[PgMoney], scale: int = 2): PgParam =
+proc toPgBinaryParam*(
+    v: Option[PgMoney], scale: int = 2
+): PgParam {.raises: [PgTypeError].} =
   ## Money Option → binary with scale validation, like ``toPgParam``.
   checkMoneyScale(scale)
   if v.isSome:
