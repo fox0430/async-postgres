@@ -127,6 +127,12 @@
 ## - `pg_advisory_lock <async_postgres/pg_advisory_lock.html>`_ — Advisory lock API (session/transaction, exclusive/shared)
 ## - `pg_replication <async_postgres/pg_replication.html>`_ — Logical replication streaming with pgoutput decoder
 ## - `async_backend <async_postgres/async_backend.html>`_ — Async framework abstraction (asyncdispatch / chronos)
+##
+## Supported imports are ``pkg/async_postgres`` and the hub modules listed
+## above. Importing a submodule directly (e.g.
+## ``async_postgres/pg_connection/types``) is unsupported and carries no
+## compatibility guarantee; only the re-exported surface is covered by
+## semantic versioning.
 
 import
   async_postgres/[
