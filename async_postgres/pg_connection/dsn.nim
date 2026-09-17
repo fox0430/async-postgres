@@ -752,8 +752,10 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   result.port = result.hosts[0].port
   validateClientCertConfig(result)
 
-proc validateConnConfig(config: var ConnConfig) =
-  ## Mirror DSN guards for ``initConnConfig`` (DSN parsers validate inline).
+proc validateConnConfig*(config: var ConnConfig) =
+  ## Mirror DSN guards for ``initConnConfig`` and the ``connect`` chokepoint
+  ## (DSN parsers validate inline; hand-built ``ConnConfig`` is re-checked at
+  ## connect time so numeric / hostaddr faults become ``PgConfigError``).
   ## Negative ``connectTimeout`` becomes ``ZeroDuration``.
   if config.connectTimeout < ZeroDuration:
     config.connectTimeout = ZeroDuration

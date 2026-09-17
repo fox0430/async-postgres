@@ -115,9 +115,15 @@ proc connectToHost*(
 ): Future[PgConnection] {.async.} =
   ## Connect to single host (dial ``hostaddr`` else ``host``; verify via ``host``).
 
-  # Re-check the mTLS pairing here as well: `connect` validates it in `wrapped`,
-  # but this proc is public and a direct caller would otherwise have the certs
-  # silently dropped by a successful sslAllow plaintext attempt.
+  # Local mutable copy: ``validateConnConfig`` may normalize ``connectTimeout``.
+  var config = config
+
+  # Re-check numeric / hostaddr / mTLS pairing here as well: `connect` validates
+  # them in `wrapped`, but this proc is public and a direct caller would
+  # otherwise bypass the parsers (port wrap, keepalive ``cint`` RangeDefect,
+  # negative timeout footgun) or have certs silently dropped by a successful
+  # sslAllow plaintext attempt.
+  validateConnConfig(config)
   validateClientCertConfig(config)
 
   # Validate before the sslAllow branch rewrites sslMode to sslDisable, which
@@ -581,6 +587,8 @@ proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Connect with multi-host failover, ``targetSessionAttrs``, per-host ``connectTimeout``.
   ## Per-host failures fold into one ``PgConnectionError``; a ``PgConfigError`` escapes the fold.
+  # Local mutable copy: ``validateConnConfig`` may normalize ``connectTimeout``.
+  var config = config
   proc perform(hosts: seq[HostEntry]): Future[PgConnection] {.async.} =
     # `hosts` is already ordered by the caller (shuffled under lbhRandom), so
     # both the preferStandby two-pass loop and the single-pass loop below share
@@ -654,7 +662,9 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
 
   proc wrapped(): Future[PgConnection] {.async.} =
     # ConnConfig may be built or mutated without passing through the parsers'
-    # validation — re-check here so every connect path rejects bad cert config.
+    # validation — re-check here so every connect path rejects bad numeric /
+    # hostaddr / cert config (``initConnConfig`` alone is not enough).
+    validateConnConfig(config)
     validateClientCertConfig(config)
     if config.channelBinding == cbRequire and config.sslMode == sslDisable:
       # Knowable before any dial; the per-host check in selectScramMechanism
