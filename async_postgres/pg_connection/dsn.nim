@@ -4,6 +4,11 @@
 ## - keyword=value:  ``host=localhost port=5432 dbname=test``
 ## - URI:            ``postgresql://user:pass@host:port/db?param=value``
 ##
+## Treat the DSN as trusted operator config, not end-user input: unknown keys
+## become StartupMessage parameters and values such as ``options`` are
+## forwarded verbatim. Sanitize before ``parseDsn`` if it is not under your
+## control.
+##
 ## Only `initConnConfig` / `parseDsn` are re-exported through `pg_connection.nim`;
 ## the intermediate parsers stay here. Depends only on `types.nim` (does not
 ## touch `PgConnection`).
@@ -18,6 +23,10 @@ when defined(posix):
 
 import ../[async_backend, pg_errors]
 import types
+
+const MaxPemFileBytes = 4 * 1024 * 1024
+  ## Cap for sslrootcert / sslcert / sslkey file reads (DoS bound; cert chains
+  ## fit comfortably under this).
 
 proc parseSslMode*(s: string): SslMode =
   case s
@@ -145,7 +154,9 @@ proc splitList(s: string): seq[string] =
   else:
     s.split(',')
 
-proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
+proc buildHosts(
+    hostList, addrList, portList: seq[string], hostGiven = false
+): seq[HostEntry] =
   ## Expand host/hostaddr/port lists into HostEntry values following libpq
   ## multi-host rules: the number of entries is set by `hostaddr` when given,
   ## else by `host` (an empty seq means the parameter was not provided; when
@@ -154,12 +165,18 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
   ## entry per host. An empty list entry selects the default (127.0.0.1 /
   ## 5432); an empty host with a hostaddr stays empty, so SSL verification
   ## can require an explicit name.
+  ##
+  ## `hostGiven` (and any given `addrList`) suppresses the 127.0.0.1 default:
+  ## a spelled-out empty host must not silently become a localhost target.
+  ## `applyParam` cannot yet know whether a later `hostaddr` will pair with
+  ## it, so the fault is carried to `validateConnConfig` instead.
   if hostList.len > 0 and addrList.len > 0 and hostList.len != addrList.len:
     raise newException(
       PgConfigError,
       "Could not match " & $hostList.len & " host names to " & $addrList.len &
         " hostaddr values",
     )
+  let explicit = hostGiven or addrList.len > 0
   let count =
     if addrList.len > 0:
       addrList.len
@@ -203,7 +220,7 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
       else:
         ports[i]
     result.add HostEntry(
-      host: if h.len == 0 and a.len == 0: "127.0.0.1" else: h,
+      host: if h.len == 0 and a.len == 0 and not explicit: "127.0.0.1" else: h,
       hostaddr: a,
       port:
         if p.len == 0:
@@ -211,6 +228,43 @@ proc buildHosts(hostList, addrList, portList: seq[string]): seq[HostEntry] =
         else:
           parsePort(p),
     )
+
+proc checkExplicitHosts(
+    hostList, addrList: seq[string], hostGiven: bool, addrGiven = false
+) =
+  ## Reject a spelled-out target with neither name nor address: a
+  ## mis-templated DSN would otherwise default to 127.0.0.1. An omitted
+  ## `host`/`hostaddr` still defaults; an empty element paired with the other
+  ## stays valid. `hostaddr=` alone collapses to an empty list rather than an
+  ## empty element, hence `addrGiven` alongside `addrList.len`.
+  if not hostGiven and not addrGiven and addrList.len == 0:
+    return
+  if hostList.len > 0 and addrList.len > 0 and hostList.len != addrList.len:
+    # Let `buildHosts` report the mismatch; its message names both counts.
+    return
+  let count =
+    if addrList.len > 0:
+      addrList.len
+    elif hostList.len > 0:
+      hostList.len
+    else:
+      0
+  if count == 0:
+    raise newException(PgConfigError, "Empty host in DSN")
+  for i in 0 ..< count:
+    let h =
+      if hostList.len > 0:
+        hostList[i]
+      else:
+        ""
+    let a =
+      if addrList.len > 0:
+        addrList[i]
+      else:
+        ""
+    if h.len == 0 and a.len == 0:
+      raise
+        newException(PgConfigError, "Empty host in DSN host list (element #" & $i & ")")
 
 when defined(posix):
   proc openRegularFile(path, label: string): tuple[f: File, st: Stat] =
@@ -241,6 +295,39 @@ when defined(posix):
       discard close(fd)
       raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
 
+proc c_ferror(f: File): cint {.importc: "ferror", header: "<stdio.h>".}
+  ## `readBuffer` shorts on both EOF and read error; only this tells them apart.
+
+proc readCapped(f: File, sizeHint: int64): string =
+  ## Read at most `MaxPemFileBytes + 1` bytes: a regular file may report
+  ## `st_size == 0` and still stream content (procfs/sysfs), so `readAll`
+  ## would grow unbounded. The extra byte makes oversize detectable.
+  ##
+  ## Grows from `sizeHint` rather than starting at the cap: `setLen` shrinks
+  ## the length but not the payload, which would stay resident.
+  const limit = MaxPemFileBytes + 1
+  var cap =
+    if sizeHint <= 0:
+      4096
+    else:
+      int(min(sizeHint + 1, int64(limit)))
+  result = newString(cap)
+  var total = 0
+  while true:
+    if total == cap:
+      if cap == limit:
+        break
+      cap = min(cap * 2, limit)
+      result.setLen(cap)
+    let n = readBuffer(f, addr result[total], cap - total)
+    if n <= 0:
+      if c_ferror(f) != 0:
+        # Truncating would hand the caller a short trust store.
+        raise newException(IOError, "read failed")
+      break
+    total += n
+  result.setLen(total)
+
 proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
   ## Read a PEM parameter file (sslrootcert/sslcert/sslkey), wrapping the
   ## stdlib `IOError` into a `PgConfigError` with the parameter name. An empty file
@@ -249,6 +336,15 @@ proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
   ## is rejected — intentionally stricter than libpq, which permits `0o640`
   ## for root-owned keys. No permission check off-POSIX (libpq also skips it
   ## on Windows).
+  template failRead() =
+    raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
+
+  template failOversize() =
+    raise newException(
+      PgConfigError,
+      label & " file exceeds size limit (" & $MaxPemFileBytes & " bytes): " & path,
+    )
+
   when defined(posix):
     let opened = openRegularFile(path, label)
     try:
@@ -258,19 +354,34 @@ proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
           label & " file has group or world accessible permissions, refusing to use: " &
             path,
         )
+      if opened.st.st_size > Off(MaxPemFileBytes):
+        failOversize()
       try:
-        result = readAll(opened.f)
+        result = readCapped(opened.f, int64(opened.st.st_size))
       except IOError:
-        raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
+        failRead()
     finally:
       close(opened.f)
   else:
+    # Capped as well as pre-checked, in case the reported size understates it.
+    var f: File
+    if not open(f, path, fmRead):
+      failRead()
     try:
-      result = readFile(path)
-    except IOError:
-      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
+      try:
+        let size = getFileSize(f)
+        if size > MaxPemFileBytes:
+          failOversize()
+        result = readCapped(f, size)
+      except IOError:
+        failRead()
+    finally:
+      close(f)
   if result.len == 0:
     raise newException(PgConfigError, label & " file is empty: " & path)
+  if result.len > MaxPemFileBytes:
+    # Growth after the pre-check (TOCTOU).
+    failOversize()
 
 proc rawHost(host, hostaddr: string): string =
   ## Inverse of `buildHosts`' defaulting: 127.0.0.1 with no hostaddr can only
@@ -280,7 +391,9 @@ proc rawHost(host, hostaddr: string): string =
   ## functionally correct for the round-trip.
   if host == "127.0.0.1" and hostaddr.len == 0: "" else: host
 
-proc rawHostLists(c: ConnConfig): tuple[hosts, addrs, ports: seq[string]] =
+proc rawHostLists(
+    c: ConnConfig
+): tuple[hosts, addrs, ports: seq[string], hostGiven: bool] =
   ## Re-derive raw multi-host lists from a config so `applyParam` can rebuild
   ## `hosts` with one list replaced. Best-effort inverse of `buildHosts`:
   ## all-empty lists collapse to "not provided" and an all-equal port list to
@@ -290,22 +403,36 @@ proc rawHostLists(c: ConnConfig): tuple[hosts, addrs, ports: seq[string]] =
   ## in `applyParam` has a different length than the current hosts, a
   ## collapsed single-entry port list "applies to all" via `buildHosts`,
   ## whereas a length-specific list would be rejected as mismatched.
+  ##
+  ## `hostGiven` flags a literally empty host in `hosts`, which `buildHosts`
+  ## only produces for an explicitly empty one, so rebuilding must not default
+  ## it away. The scalar branch cannot tell that apart from the zero value, so
+  ## it leaves `hostGiven` false.
   if c.hosts.len == 0:
     result.hosts = splitList(rawHost(c.host, c.hostaddr))
     result.addrs = splitList(c.hostaddr)
     if c.port > 0:
       result.ports = @[$c.port]
     return
+  # `buildHosts` only defaults to 127.0.0.1 for a single target; folding it
+  # away in a multi-entry list would erase an explicit `host=127.0.0.1`.
+  let foldDefault = c.hosts.len == 1
   var anyHost, anyAddr = false
   var samePorts = true
   for e in c.hosts:
-    let h = rawHost(e.host, e.hostaddr)
+    let h =
+      if foldDefault:
+        rawHost(e.host, e.hostaddr)
+      else:
+        e.host
     result.hosts.add h
     result.addrs.add e.hostaddr
     result.ports.add $e.port
     anyHost = anyHost or h.len > 0
     anyAddr = anyAddr or e.hostaddr.len > 0
     samePorts = samePorts and e.port == c.hosts[0].port
+    if e.host.len == 0:
+      result.hostGiven = true
   if not anyHost:
     result.hosts = @[]
   if not anyAddr:
@@ -325,20 +452,25 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
   ## keys: there all values are collected first and expanded once, so their
   ## correlation is order-independent, while repeated `applyParam` calls
   ## correlate each list against the already-expanded state.
+  ##
+  ## An explicitly empty host is kept empty so `host` and `hostaddr` may be
+  ## applied in either order; still unpaired ones are rejected by
+  ## `validateConnConfig`.
   case key
   of "host", "hostaddr", "port":
     # Rebuild `hosts` so it stays consistent with the scalar view
     # (`getHosts` prefers `hosts` when non-empty); the two untouched
     # lists are re-derived from the current config.
-    var (hostList, addrList, portList) = result.rawHostLists()
+    var (hostList, addrList, portList, hostGiven) = result.rawHostLists()
     case key
     of "host":
       hostList = splitList(val)
+      hostGiven = true
     of "hostaddr":
       addrList = splitList(val)
     else:
       portList = splitList(val)
-    result.hosts = buildHosts(hostList, addrList, portList)
+    result.hosts = buildHosts(hostList, addrList, portList, hostGiven)
     result.host = result.hosts[0].displayHost
     result.hostaddr = result.hosts[0].hostaddr
     result.port = result.hosts[0].port
@@ -534,19 +666,24 @@ proc parseKeyValueDsn*(dsn: string): ConnConfig =
   # only be correlated once all parameters are seen — collect them raw and
   # expand at the end (last occurrence wins, as in libpq).
   var hostStr, hostaddrStr, portStr: string
+  var hostGiven, addrGiven = false
   for (key, val) in pairs:
     case key
     of "host":
       hostStr = val
+      hostGiven = true
     of "hostaddr":
       hostaddrStr = val
+      addrGiven = true
     of "port":
       portStr = val
     else:
       result.applyParam(key, val)
 
-  result.hosts =
-    buildHosts(splitList(hostStr), splitList(hostaddrStr), splitList(portStr))
+  let hostList = splitList(hostStr)
+  let addrList = splitList(hostaddrStr)
+  checkExplicitHosts(hostList, addrList, hostGiven, addrGiven)
+  result.hosts = buildHosts(hostList, addrList, splitList(portStr), hostGiven)
   # Back-compat: set scalar host/hostaddr/port from the first entry;
   # `host` falls back to `hostaddr` like libpq's PQhost().
   result.host = result.hosts[0].displayHost
@@ -649,6 +786,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   # *before* splitting. Structural separators are matched on the raw text,
   # so encoded ones never split.
   var hostList, addrList, portList: seq[string]
+  var hostGiven, addrGiven = false
   template decodeHostElem(s, kind: string, elementIdx: int): string =
     ## Like ``pctDecode``, locating failures by 0-based authority element.
     try:
@@ -667,7 +805,12 @@ proc parseUriDsn*(dsn: string): ConnConfig =
         let bracket = part.find(']')
         if bracket < 0:
           raise newException(PgConfigError, "Invalid IPv6 address in DSN")
-        hostList.add decodeHostElem(part[1 ..< bracket], "host", hidx)
+        let inside = part[1 ..< bracket]
+        # Rejected here rather than by ``checkExplicitHosts`` so the message
+        # names the malformed IPv6 literal.
+        if inside.len == 0:
+          raise newException(PgConfigError, "Empty IPv6 address in DSN")
+        hostList.add decodeHostElem(inside, "host", hidx)
         let afterBracket = part[bracket + 1 .. ^1]
         if afterBracket.len == 0:
           portList.add ""
@@ -696,6 +839,7 @@ proc parseUriDsn*(dsn: string): ConnConfig =
         else:
           hostList.add decodeHostElem(part, "host", hidx)
           portList.add ""
+    hostGiven = true
 
   if queryStr.len > 0:
     let items = queryStr.split('&')
@@ -737,14 +881,17 @@ proc parseUriDsn*(dsn: string): ConnConfig =
       case key
       of "host":
         hostList = splitList(val)
+        hostGiven = true
       of "hostaddr":
         addrList = splitList(val)
+        addrGiven = true
       of "port":
         portList = splitList(val)
       else:
         result.applyParam(key, val)
 
-  result.hosts = buildHosts(hostList, addrList, portList)
+  checkExplicitHosts(hostList, addrList, hostGiven, addrGiven)
+  result.hosts = buildHosts(hostList, addrList, portList, hostGiven)
   # Back-compat: set scalar host/hostaddr/port from the first entry;
   # `host` falls back to `hostaddr` like libpq's PQhost().
   result.host = result.hosts[0].displayHost
@@ -756,7 +903,13 @@ proc validateConnConfig*(config: var ConnConfig) =
   ## Mirror DSN guards for ``initConnConfig`` and the ``connect`` chokepoint
   ## (DSN parsers validate inline; hand-built ``ConnConfig`` is re-checked at
   ## connect time so numeric / hostaddr faults become ``PgConfigError``).
-  ## Negative ``connectTimeout`` becomes ``ZeroDuration``.
+  ##
+  ## An empty ``host`` with no ``hostaddr`` is rejected rather than defaulted
+  ## (matching the DSN parsers), so an unset template variable cannot hand the
+  ## credentials to whatever listens on localhost. The scalar
+  ## ``host``/``hostaddr``/``port`` are mirrored from ``hosts[0]``, which is
+  ## what ``getHosts`` dials. Negative ``connectTimeout`` becomes
+  ## ``ZeroDuration``.
   if config.connectTimeout < ZeroDuration:
     config.connectTimeout = ZeroDuration
 
@@ -771,13 +924,25 @@ proc validateConnConfig*(config: var ConnConfig) =
         "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets)",
       )
 
-  # Once `hosts` is populated the scalar host/port pair is an unused back-compat
-  # mirror, left zeroed by hand-built configs.
+  template checkEmptyHost(h, a: string, where: string) =
+    if h.len == 0 and a.len == 0:
+      raise newException(PgConfigError, "Empty host in config" & where)
+
   if config.hosts.len > 0:
-    for entry in config.hosts:
-      checkPort(entry.port)
-      checkHostaddr(entry.hostaddr)
+    for i in 0 ..< config.hosts.len:
+      checkEmptyHost(
+        config.hosts[i].host,
+        config.hosts[i].hostaddr,
+        " host list (element #" & $i & ")",
+      )
+      checkPort(config.hosts[i].port)
+      checkHostaddr(config.hosts[i].hostaddr)
+    # Keep scalar back-compat fields aligned with what ``getHosts`` will dial.
+    config.host = config.hosts[0].displayHost
+    config.hostaddr = config.hosts[0].hostaddr
+    config.port = config.hosts[0].port
   else:
+    checkEmptyHost(config.host, config.hostaddr, "")
     checkPort(config.port)
     checkHostaddr(config.hostaddr)
 
@@ -831,7 +996,10 @@ proc initConnConfig*(
   ## For DSN-based configuration, use `parseDsn` instead.
   ##
   ## Validates like DSN parsing; negative ``connectTimeout`` becomes
-  ## ``ZeroDuration`` (no timeout).
+  ## ``ZeroDuration`` (no timeout). When ``hosts`` is non-empty, scalar
+  ## ``host``/``hostaddr``/``port`` are overwritten from ``hosts[0]`` (same as
+  ## DSN parsers). An empty ``host`` with no ``hostaddr`` is rejected, like an
+  ## explicitly empty ``host`` in a DSN.
   result = ConnConfig(
     host: host,
     port: port,
@@ -872,10 +1040,14 @@ proc parseDsn*(dsn: string): ConnConfig =
   ##
   ## Both ``postgresql://`` and ``postgres://`` schemes are accepted for URI format.
   ##
-  ## Security: parse and validation failures report lengths and offsets only,
-  ## never parameter values (a malformed DSN may place the password in any
-  ## field); certificate file I/O errors name the path for diagnosis. See
-  ## ``ConnConfig`` for plaintext password handling.
+  ## Security: the DSN is trusted configuration — unknown keys are forwarded
+  ## as StartupMessage parameters, so a typo in a security-sensitive key (e.g.
+  ## ``sslmde``) is not detected. Do not pass end-user-controlled strings
+  ## without sanitizing. Parse and validation
+  ## failures report lengths and offsets only, never parameter values (a
+  ## malformed DSN may place the password in any field); certificate file I/O
+  ## errors name the path for diagnosis. See ``ConnConfig`` for plaintext
+  ## password handling.
   if dsn.startsWith("postgresql://") or dsn.startsWith("postgres://"):
     result = parseUriDsn(dsn)
   else:

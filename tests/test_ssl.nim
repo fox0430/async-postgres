@@ -756,6 +756,41 @@ suite "initConnConfig numeric and hostaddr validation":
     check initConnConfig(port = 1).port == 1
     check initConnConfig(port = 65535).port == 65535
 
+  test "hosts syncs scalar host/port from hosts[0]":
+    let cfg = initConnConfig(
+      host = "scalar-ignored",
+      port = 1111,
+      hosts = @[HostEntry(host: "hosts-b", port: 2222)],
+    )
+    check cfg.host == "hosts-b"
+    check cfg.port == 2222
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "hosts-b"
+    check getHosts(cfg)[0].host == "hosts-b"
+    check getHosts(cfg)[0].port == 2222
+
+  test "explicitly empty host is rejected, not defaulted to localhost":
+    # An unset template variable must fail loudly instead of sending the
+    # credentials to whatever listens on localhost.
+    expect PgConfigError:
+      discard initConnConfig(host = "")
+
+  test "empty hosts entry host is rejected":
+    expect PgConfigError:
+      discard initConnConfig(hosts = @[HostEntry(host: "", hostaddr: "", port: 5432)])
+
+  test "one empty entry in a multi-host list is rejected":
+    expect PgConfigError:
+      discard initConnConfig(
+        hosts =
+          @[HostEntry(host: "primary", port: 5432), HostEntry(host: "", port: 5432)]
+      )
+
+  test "empty host paired with a hostaddr stays valid":
+    let cfg = initConnConfig(host = "", hostaddr = "10.0.0.1")
+    check cfg.hosts.len == 0
+    check getHosts(cfg)[0].dialAddr == "10.0.0.1"
+
 suite "Client certificate config validation":
   # `connect()` now validates cert/key pairing before dialing, so these tests
   # no longer need a mock server — the failure fires client-side.

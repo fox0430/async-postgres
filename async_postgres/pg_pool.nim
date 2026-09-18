@@ -45,6 +45,8 @@ type
       ## "DEALLOCATE ALL" (clear prepared statements only),
       ## "RESET ALL" (reset session parameters only).
       ## On failure, the connection is discarded.
+      ## Treat as trusted operator config — do not build from untrusted input
+      ## (executed via the simple query protocol, which allows multi-statement).
     resetQueryTimeout*: Duration
       ## Deadline for each server round-trip in `resetSession` — covers both
       ## `pg_advisory_unlock_all` (when session locks are dirty) and
@@ -921,6 +923,11 @@ proc release*(conn: PgConnection) =
   ## `PgPoolCluster`). For standalone connections created with `connect`
   ## this field is `nil` and calling `release` raises `PgError` — use
   ## `conn.close()` instead.
+  ##
+  ## **Double-release:** releasing an already-idle connection is a no-op
+  ## (tracer `onPoolDoubleRelease`), but after a FIFO handoff a second raw
+  ## `release(conn)` can still re-route the waiter's connection — this API
+  ## carries no per-borrow token. Prefer `PooledConnHandle` / `with*`.
   ##
   ## `withConnection`, `withReadConnection`, `withWriteConnection`,
   ## `withPipeline`, and `withTransaction` call this automatically; direct

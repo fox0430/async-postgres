@@ -113,10 +113,24 @@ proc selectScramMechanism*(
 proc connectToHost*(
     config: ConnConfig, entry: HostEntry
 ): Future[PgConnection] {.async.} =
-  ## Connect to single host (dial ``hostaddr`` else ``host``; verify via ``host``).
+  ## Connect to a single host (dial ``hostaddr`` else ``host``; verify via ``host``).
+  ##
+  ## Low-level dial primitive. Unlike ``connect`` it does **not** apply
+  ## ``targetSessionAttrs``, per-host ``connectTimeout`` or connect tracing.
+  ##
+  ## On Unix sockets TLS is skipped (libpq parity); if ``sslCert`` is set a
+  ## stderr warning is emitted because the client certificate is not sent.
 
   # Local mutable copy: ``validateConnConfig`` may normalize ``connectTimeout``.
   var config = config
+
+  # Validation below checks the scalars, but this proc dials ``entry``; a bare
+  # config plus an explicit entry would otherwise trip the empty-host guard.
+  # With a ``hosts`` list the scalars are re-derived there instead.
+  if config.hosts.len == 0:
+    config.host = entry.host
+    config.hostaddr = entry.hostaddr
+    config.port = entry.port
 
   # Re-check numeric / hostaddr / mTLS pairing here as well: `connect` validates
   # them in `wrapped`, but this proc is public and a direct caller would

@@ -578,13 +578,76 @@ suite "parseDsn":
     check cfg.hosts[1].host == "h2"
     check cfg.hosts[1].port == 5433
 
-  test "multi-host empty entry selects default (libpq parity)":
-    let cfg = parseDsn("postgresql://h1,,h3/db")
-    check cfg.hosts.len == 3
-    check cfg.hosts[0].host == "h1"
-    check cfg.hosts[1].host == "127.0.0.1"
-    check cfg.hosts[1].port == 5432
-    check cfg.hosts[2].host == "h3"
+  test "error: empty entry in a URI multi-host list":
+    expect PgConfigError:
+      discard parseDsn("postgresql://h1,,h3/db")
+
+  test "error: trailing comma in a URI multi-host list":
+    expect PgConfigError:
+      discard parseDsn("postgresql://h1,h3,/db")
+
+  test "error: empty host query parameter overriding the authority":
+    expect PgConfigError:
+      discard parseDsn("postgresql://h1/db?host=")
+
+  test "error: empty host with an empty hostaddr element":
+    for dsn in [
+      "postgresql:///db?host=&hostaddr=10.0.0.1,", "postgresql:///db?host=&hostaddr=,",
+      "host='' hostaddr=10.0.0.1,",
+    ]:
+      expect PgConfigError:
+        discard parseDsn(dsn)
+
+  test "error: empty hostaddr element with no host parameter":
+    # The mis-templating hazard is the same when only `hostaddr` is spelled
+    # out: an unset variable must not leave a localhost failover target.
+    for dsn in [
+      "postgresql:///db?hostaddr=10.0.0.1,", "postgresql:///db?hostaddr=,10.0.0.1",
+      "hostaddr=10.0.0.1,", "hostaddr=,10.0.0.1",
+    ]:
+      expect PgConfigError:
+        discard parseDsn(dsn)
+
+  test "error: an all-empty hostaddr parameter":
+    # An unset `hostaddr=$VAR` names no target, and defaulting it to
+    # localhost would hand the credentials to whatever listens there — the
+    # same hazard `host=` is rejected for. Intentionally stricter than libpq.
+    for dsn in ["postgresql:///db?hostaddr=", "dbname=db hostaddr=", "hostaddr=''"]:
+      expect PgConfigError:
+        discard parseDsn(dsn)
+
+  test "empty host paired with a hostaddr stays valid":
+    let cfg = parseDsn("postgresql:///db?host=&hostaddr=10.0.0.1")
+    check cfg.hosts == @[HostEntry(host: "", hostaddr: "10.0.0.1", port: 5432)]
+
+  test "error: empty entry in a host query parameter list":
+    expect PgConfigError:
+      discard parseDsn("postgresql:///db?host=h1,,h3")
+
+  test "error: authority with a port but no host":
+    expect PgConfigError:
+      discard parseDsn("postgresql://:5433/db")
+
+  test "host/hostaddr count mismatch is reported as a count mismatch":
+    # The empty element is a symptom here; the message must name both counts.
+    var msg = ""
+    try:
+      discard parseDsn("postgresql:///db?host=h1,&hostaddr=10.0.0.1")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.contains("Could not match")
+
+  test "empty host entry backed by a hostaddr stays valid":
+    let cfg = parseDsn("postgresql:///db?host=h1,&hostaddr=10.0.0.1,10.0.0.2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[1].host == ""
+    check cfg.hosts[1].hostaddr == "10.0.0.2"
+
+  test "omitted host still defaults":
+    let cfg = parseDsn("postgresql:///db?port=5433")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "127.0.0.1"
+    check cfg.hosts[0].port == 5433
 
   test "host and port as query parameters (libpq documented form)":
     let cfg = parseDsn("postgresql:///mydb?host=localhost&port=5433")
@@ -642,6 +705,20 @@ suite "parseDsn":
   test "error: unbracketed IPv6 literal with trailing port in DSN":
     expect PgError:
       discard parseDsn("postgresql://user:pass@2001:db8::1:5432/db")
+
+  test "error: empty IPv6 brackets do not default to localhost":
+    # ``[]`` must not fall through buildHosts empty-host → 127.0.0.1.
+    var raised = false
+    try:
+      discard parseDsn("postgresql://[]/db")
+    except PgConfigError as e:
+      raised = true
+      check "Empty IPv6" in e.msg or "IPv6" in e.msg
+    check raised
+
+  test "error: empty IPv6 brackets with port":
+    expect PgConfigError:
+      discard parseDsn("postgresql://[]:5432/db")
 
   test "target_session_attrs all values":
     check parseDsn("postgresql://h/db?target_session_attrs=any").targetSessionAttrs ==
@@ -826,6 +903,62 @@ suite "parseDsn":
       check "file is empty" in e.msg
     check raised
 
+  test "error: oversized sslcert PEM file rejected":
+    # Cap is 4 MiB; write just over the limit without holding it all in a Nim string
+    # twice longer than needed for the assert.
+    const overLimit = 4 * 1024 * 1024 + 1
+    let certPath = writePemFile(newString(overLimit))
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    var raised = false
+    try:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+    except PgConfigError as e:
+      raised = true
+      check "size limit" in e.msg
+    check raised
+
+  test "a small PEM file does not retain a cap-sized buffer":
+    # `setLen` shrinks the length but not the payload, so reading into a
+    # cap-sized buffer would keep 4 MiB resident per file for the lifetime of
+    # the config.
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    let dsn =
+      "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+    const copies = 8
+    var configs: seq[ConnConfig]
+    GC_fullCollect()
+    let before = getOccupiedMem()
+    for _ in 0 ..< copies:
+      configs.add parseDsn(dsn)
+    check configs.len == copies
+    for cfg in configs:
+      check cfg.sslCert == dummyPem
+      check cfg.sslKey == dummyPem
+    # A retained cap-sized buffer costs 2 * copies * 4 MiB; the slack keeps the
+    # bound clear of GC/allocator noise, which varies with --mm.
+    GC_fullCollect()
+    check getOccupiedMem() - before < 4 * 1024 * 1024
+
+  when defined(linux):
+    test "a file reporting st_size == 0 is still read in full":
+      # procfs/sysfs stream their content; the size hint must only seed the
+      # buffer, not bound the read.
+      const streamed = "/proc/self/status"
+      if fileExists(streamed):
+        let cfg =
+          parseDsn("postgresql://host/db?sslmode=verify-ca&sslrootcert=" & streamed)
+        check cfg.sslRootCert.len > 0
+        check "Name:" in cfg.sslRootCert
+
   test "error: sslcert with sslmode=disable rejected":
     let certPath = writePemFile(dummyPem)
     let keyPath = writeKeyFile(dummyPem)
@@ -995,12 +1128,17 @@ suite "parseDsn keyword=value":
     check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
     check cfg.hosts[1] == HostEntry(host: "h2", port: 5434)
 
-  test "multi-host empty entry selects default":
-    let cfg = parseDsn("host=h1,,h3 port=5433,,5435")
-    check cfg.hosts.len == 3
-    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
-    check cfg.hosts[1] == HostEntry(host: "127.0.0.1", port: 5432)
-    check cfg.hosts[2] == HostEntry(host: "h3", port: 5435)
+  test "error: multi-host empty entry":
+    expect PgConfigError:
+      discard parseDsn("host=h1,,h3 port=5433,,5435")
+
+  test "error: empty host keyword":
+    expect PgConfigError:
+      discard parseDsn("dbname=db host=''")
+
+  test "empty port entry still selects the default port":
+    let cfg = parseDsn("host=h1,h2,h3 port=5433,,5435")
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5432)
 
   test "multi-host hostaddr comma-separated":
     let cfg = parseDsn("hostaddr=10.0.0.1,10.0.0.2")
@@ -1262,6 +1400,79 @@ suite "applyParam multi-host":
     cfg.applyParam("host", "new")
     check cfg.getHosts() == @[HostEntry(host: "new", port: 5433)]
     check cfg.host == "new"
+
+  test "empty host element may be paired by a later hostaddr":
+    # `host` and `hostaddr` must be applicable in either order; an unpaired
+    # empty host is left for `validateConnConfig` to reject.
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,")
+    cfg.applyParam("hostaddr", "10.0.0.1,10.0.0.2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", hostaddr: "10.0.0.1", port: 5432)
+    check cfg.hosts[1] == HostEntry(host: "", hostaddr: "10.0.0.2", port: 5432)
+
+  test "an unpaired empty host element never becomes localhost":
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,")
+    cfg.applyParam("port", "5433")
+    check cfg.hosts[1].host == ""
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "dropping the hostaddr of an empty host does not default it":
+    # The empty host stays explicit, so the rebuilt entry must not silently
+    # become localhost once its pairing address is cleared.
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,")
+    cfg.applyParam("hostaddr", "10.0.0.1,10.0.0.2")
+    cfg.applyParam("hostaddr", "")
+    check cfg.hosts[1].host == ""
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "an empty hostaddr element never becomes localhost":
+    # `applyParam` does not run `checkExplicitHosts` (the lists may arrive in
+    # any order), so the empty entry must survive to `validateConnConfig`.
+    var cfg = ConnConfig()
+    cfg.applyParam("hostaddr", "10.0.0.1,")
+    check cfg.hosts.len == 2
+    check cfg.hosts[1] == HostEntry(host: "", hostaddr: "", port: 5432)
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "clearing hostaddr leaves a host name dialable":
+    # An all-empty `hostaddr` is "not provided", so it must not turn the
+    # surviving host name into an explicitly empty target.
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "db.example.com")
+    cfg.applyParam("hostaddr", "10.0.0.1")
+    cfg.applyParam("hostaddr", "")
+    check cfg.hosts == @[HostEntry(host: "db.example.com", port: 5432)]
+    validateConnConfig(cfg)
+
+  test "a never-set host still defaults to localhost":
+    # An all-empty scalar config is the zero value, not an explicitly empty
+    # host, so rebuilding `hosts` must keep the 127.0.0.1 default.
+    var cfg = ConnConfig()
+    cfg.applyParam("port", "5433")
+    check cfg.hosts == @[HostEntry(host: "127.0.0.1", port: 5433)]
+    validateConnConfig(cfg)
+
+  test "an explicit 127.0.0.1 element survives a rebuild beside a hostaddr":
+    # The localhost fold is only valid for a single implicit target: with a
+    # sibling carrying a `hostaddr` the entry was spelled out, so rebuilding
+    # must keep the name instead of blanking it.
+    var cfg = parseDsn("host=127.0.0.1,db2 hostaddr=,10.0.0.2")
+    cfg.applyParam("port", "5433")
+    check cfg.hosts[0] == HostEntry(host: "127.0.0.1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "db2", hostaddr: "10.0.0.2", port: 5433)
+    validateConnConfig(cfg)
+
+  test "an explicit 127.0.0.1 element survives a rebuild beside a plain host":
+    var cfg = parseDsn("host=127.0.0.1,db2")
+    cfg.applyParam("port", "5433")
+    check cfg.hosts[0] == HostEntry(host: "127.0.0.1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "db2", port: 5433)
 
   test "error: hostaddr count mismatch against existing hosts":
     var cfg = ConnConfig()
