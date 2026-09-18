@@ -201,6 +201,8 @@ proc loRead*(
 ): Future[seq[byte]] {.async.} =
   ## Read up to ``length`` bytes from the current position.
   ## Returns the bytes read (may be fewer than ``length`` at EOF).
+  if length < 0:
+    raise newException(ValueError, "loRead: length must be non-negative")
   let qr = await lo.conn.query(
     "SELECT loread($1, $2)",
     @[toPgParam(lo.fd), toPgParam(length)],
@@ -232,6 +234,9 @@ proc loSeek*(
     timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
   ## Seek to a position. Returns the new absolute position.
+  if whence != SEEK_SET and whence != SEEK_CUR and whence != SEEK_END:
+    raise
+      newException(ValueError, "loSeek: whence must be SEEK_SET, SEEK_CUR, or SEEK_END")
   let s = await lo.conn.queryValue(
     "SELECT lo_lseek64($1, $2, $3)",
     @[toPgParam(lo.fd), toPgParam(offset), toPgParam(whence)],

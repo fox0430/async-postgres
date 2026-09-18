@@ -587,6 +587,7 @@ proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Connect with multi-host failover, ``targetSessionAttrs``, per-host ``connectTimeout``.
   ## Per-host failures fold into one ``PgConnectionError``; a ``PgConfigError`` escapes the fold.
+  ## Single-host ``connectTimeout`` raises ``AsyncTimeoutError`` (not folded).
   # Local mutable copy: ``validateConnConfig`` may normalize ``connectTimeout``.
   var config = config
   proc perform(hosts: seq[HostEntry]): Future[PgConnection] {.async.} =

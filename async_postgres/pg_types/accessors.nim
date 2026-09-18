@@ -54,8 +54,10 @@ proc `[]`*(row: Row, col: int): Option[seq[byte]] =
   else:
     some(@(row.data.buf.toOpenArray(off, off + clen - 1)))
 
-converter toRow*(cells: seq[Option[seq[byte]]]): Row =
+converter toRow*(cells: seq[Option[seq[byte]]]): Row {.raises: [PgTypeError].} =
   ## Backward-compatible converter: build a Row from ``seq[Option[seq[byte]]]``.
+  if cells.len > high(int16):
+    raise newException(PgTypeError, "toRow: too many columns (" & $cells.len & ")")
   let rd = RowData(
     numCols: int16(cells.len), buf: @[], cellIndex: newSeq[int32](cells.len * 2)
   )
@@ -65,6 +67,15 @@ converter toRow*(cells: seq[Option[seq[byte]]]): Row =
       rd.cellIndex[i * 2 + 1] = -1'i32
     else:
       let data = cell.get
+      if data.len > high(int32):
+        raise newException(
+          PgTypeError, "toRow: cell value too large (len=" & $data.len & ")"
+        )
+      if rd.buf.len > high(int32) - data.len:
+        raise newException(
+          PgTypeError,
+          "toRow: accumulated cell bytes exceed int32 (len=" & $rd.buf.len & ")",
+        )
       rd.cellIndex[i * 2] = int32(rd.buf.len)
       rd.cellIndex[i * 2 + 1] = int32(data.len)
       rd.buf.add(data)

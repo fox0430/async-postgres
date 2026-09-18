@@ -186,6 +186,14 @@ suite "E2E: quoteIdentifier":
   test "identifier with spaces":
     doAssert quoteIdentifier("my table") == "\"my table\""
 
+  test "NUL byte raises ValueError":
+    var raised = false
+    try:
+      discard quoteIdentifier("a\0b")
+    except ValueError:
+      raised = true
+    doAssert raised, "NUL byte should raise ValueError"
+
 suite "E2E: quoteLiteral":
   test "simple literal":
     doAssert quoteLiteral("foo") == "'foo'"

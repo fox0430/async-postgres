@@ -84,6 +84,9 @@ proc checkTxIdle*(conn: PgConnection) =
 
 proc quoteIdentifier*(s: string): string =
   ## Quote a SQL identifier (e.g. table/channel name) with double quotes, escaping embedded quotes.
+  ## Raises ``ValueError`` for an embedded NUL byte (same as ``quoteLiteral``).
+  if '\0' in s:
+    raise newException(ValueError, "SQL identifier contains a NUL byte")
   "\"" & s.replace("\"", "\"\"") & "\""
 
 proc quoteLiteral*(s: string): string =

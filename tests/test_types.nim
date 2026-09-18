@@ -20,6 +20,8 @@ type
   ProbabilityF = distinct float64
   BigCount = distinct int64
   IsActive = distinct bool
+  RatioF32 = distinct float32
+  EventAt = distinct DateTime
 
 # Test-local shims for the legacy 1-D ``encodeBinaryArray`` and
 # ``encodeBinaryArrayEmpty`` shapes that were removed when the encoder was
@@ -42,6 +44,8 @@ proc `==`(a, b: SmallCount): bool {.borrow.}
 proc `==`(a, b: PositiveInt): bool {.borrow.}
 proc `==`(a, b: BigCount): bool {.borrow.}
 proc `==`(a, b: IsActive): bool {.borrow.}
+proc `==`(a, b: RatioF32): bool {.borrow.}
+proc `==`(a, b: EventAt): bool {.borrow.}
 proc `$`(v: UsPostalCode): string {.borrow.}
 proc `$`(v: SmallCount): string {.borrow.}
 proc `$`(v: PositiveInt): string {.borrow.}
@@ -52,6 +56,8 @@ pgDomain(PositiveInt, int32)
 pgDomain(ProbabilityF, float64, 90001)
 pgDomain(BigCount, int64)
 pgDomain(IsActive, bool)
+pgDomain(RatioF32, float32)
+pgDomain(EventAt, DateTime)
 
 proc toString(data: seq[byte]): string =
   result = newString(data.len)
@@ -1940,6 +1946,13 @@ suite "Row type alias":
     let row: Row = @[some(toBytes("hello")), none(seq[byte])]
     check row.getStr(0) == "hello"
     check row.isNull(1)
+
+  test "toRow raises PgTypeError for too many columns":
+    var cells = newSeq[Option[seq[byte]]](int(high(int16)) + 1)
+    for i in 0 ..< cells.len:
+      cells[i] = none(seq[byte])
+    expect PgTypeError:
+      discard toRow(cells)
 
 suite "parseAffectedRows":
   test "UPDATE tag":
@@ -4374,6 +4387,30 @@ suite "coerceBinaryParam":
       raised = true
     check raised
 
+suite "decodeHexPair / decodeByteaEscape error contract":
+  test "decodeHexPair string rejects out-of-range index with PgTypeError":
+    expect PgTypeError:
+      discard decodeHexPair("ab", 1, "hex")
+    expect PgTypeError:
+      discard decodeHexPair("ab", -1, "hex")
+    expect PgTypeError:
+      discard decodeHexPair("", 0, "hex")
+
+  test "decodeHexPair openArray rejects out-of-range index with PgTypeError":
+    let buf = @[byte('a'), byte('b')]
+    expect PgTypeError:
+      discard decodeHexPair(buf, 1, "hex")
+    expect PgTypeError:
+      discard decodeHexPair(buf, -1, "hex")
+
+  test "decodeHexPair accepts valid pair":
+    check decodeHexPair("ff", 0, "hex") == 255'u8
+    check decodeHexPair(@[byte('0'), byte('a')], 0, "hex") == 10'u8
+
+  test "decodeByteaEscape trailing backslash raises PgTypeError":
+    expect PgTypeError:
+      discard decodeByteaEscape(['a', '\\'], "bytea")
+
 suite "PgInet":
   test "$ IPv4":
     let v = PgInet(address: parseIpAddress("192.168.1.1"), mask: 24)
@@ -4971,10 +5008,19 @@ type
     name: string
     n: int64
 
+  TimestampRecord = object
+    label: string
+    at: DateTime
+
+  NameFieldRecord = object
+    name: string
+
 pgComposite(PointRecord)
 pgComposite(PersonRecord, 50000'i32)
 pgComposite(NullableRecord)
 pgComposite(WideIntRecord)
+pgComposite(TimestampRecord)
+pgComposite(NameFieldRecord)
 
 suite "Composite text parser":
   test "parseCompositeText simple":
@@ -5466,6 +5512,45 @@ suite "User-defined composite":
     check abs(pt.x - 3.14) < 1e-10
     check abs(pt.y - 2.72) < 1e-10
 
+  test "pgComposite DateTime text round-trip":
+    let dt = dateTime(2024, mMar, 15, 10, 30, 0, 123456000, utc())
+    let p = toPgParam(TimestampRecord(label: "evt", at: dt))
+    check p.format == 0'i16
+    let encoded = toString(p.value.get)
+    # The offset must be kept: a zoneless literal would be reinterpreted in the
+    # session TimeZone when the server-side field is timestamptz.
+    check "2024-03-15 10:30:00.123456Z" in encoded
+    let row: Row = @[some(p.value.get)]
+    let got = getComposite[TimestampRecord](row, 0)
+    check got.label == "evt"
+    check got.at == dt
+
+  test "pgComposite rejects an uninitialized DateTime field":
+    expect PgTypeError:
+      discard toPgParam(TimestampRecord(label: "evt"))
+
+  test "getComposite DateTime binary format":
+    let dt = dateTime(2024, mMar, 15, 10, 30, 0, 0, utc())
+    let tsBytes = toPgBinaryParam(dt).value.get
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("evt"))),
+      (oid: OidTimestamp, data: some(tsBytes)),
+    ]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let got = getComposite[TimestampRecord](row, 0)
+    check got.label == "evt"
+    check got.at == dt
+
+  test "getComposite binary name OID accepted for string field":
+    let fields_data = @[(oid: OidName, data: some(toBytes("alice")))]
+    let data = encodeBinaryComposite(fields_data)
+    let fields = @[mkField(50000'i32, 1'i16)]
+    let row = mkRow(@[some(data)], fields)
+    let got = getComposite[NameFieldRecord](row, 0)
+    check got.name == "alice"
+
 suite "User-defined domain":
   test "pgDomain generates toPgParam with base type OID":
     let p = toPgParam(UsPostalCode("12345"))
@@ -5524,6 +5609,17 @@ suite "User-defined domain":
     check getDomain[IsActive](rowT, 0) == IsActive(true)
     let rowF: Row = @[some(toBytes("f"))]
     check getDomain[IsActive](rowF, 0) == IsActive(false)
+
+  test "getDomain text format float32":
+    let row: Row = @[some(toBytes("0.5"))]
+    check getDomain[RatioF32](row, 0) == RatioF32(0.5'f32)
+
+  test "getDomain text format DateTime":
+    let row: Row = @[some(toBytes("2024-01-15 10:30:00.000000"))]
+    let got = getDomain[EventAt](row, 0)
+    check DateTime(got).year == 2024
+    check DateTime(got).month == mJan
+    check DateTime(got).monthday == 15
 
   test "getDomain binary format int16":
     let fields = @[mkField(OidInt2, 1'i16)]
