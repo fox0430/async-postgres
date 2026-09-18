@@ -1137,6 +1137,23 @@ suite "SSL negotiation - sslAllow":
     check raised
 
 suite "SSL negotiation - sslDisable":
+  test "negotiateSSL with sslDisable raises PgConfigError":
+    var raised = false
+
+    proc t() {.async.} =
+      var conn = PgConnection()
+      conn.state = csReady
+      let config = ConnConfig(
+        host: "127.0.0.1", port: 1, user: "test", database: "test", sslMode: sslDisable
+      )
+      try:
+        await negotiateSSL(conn, config, "localhost")
+      except PgConfigError:
+        raised = true
+
+    waitFor t()
+    check raised
+
   test "sslDisable sends StartupMessage directly without SSLRequest":
     var firstMsgVersion: int32 = 0
     var connState: PgConnState

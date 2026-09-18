@@ -773,8 +773,13 @@ proc hexNibble*(c: char): int =
   else:
     -1
 
-proc decodeHexPair*(s: string, i: int, errCtx: string): byte =
+proc decodeHexPair*(s: string, i: int, errCtx: string): byte {.raises: [PgTypeError].} =
   ## Failures report the position and input length only (see `PgTypeError`).
+  if i < 0 or i + 1 >= s.len:
+    raise newException(
+      PgTypeError,
+      errCtx & ": hex pair out of range at position " & $i & " (len=" & $s.len & ")",
+    )
   let hi = hexNibble(s[i])
   let lo = hexNibble(s[i + 1])
   if hi < 0 or lo < 0:
@@ -784,14 +789,27 @@ proc decodeHexPair*(s: string, i: int, errCtx: string): byte =
     )
   byte((hi shl 4) or lo)
 
-proc decodeHexPair*(buf: openArray[byte], i: int, errCtx: string): byte =
+proc decodeHexPair*(
+    buf: openArray[byte], i: int, errCtx: string
+): byte {.raises: [PgTypeError].} =
+  ## Failures report the position and input length only (see `PgTypeError`).
+  if i < 0 or i + 1 >= buf.len:
+    raise newException(
+      PgTypeError,
+      errCtx & ": hex pair out of range at position " & $i & " (len=" & $buf.len & ")",
+    )
   let hi = hexNibble(char(buf[i]))
   let lo = hexNibble(char(buf[i + 1]))
   if hi < 0 or lo < 0:
-    raise newException(PgTypeError, errCtx & ": non-hex character at position " & $i)
+    raise newException(
+      PgTypeError,
+      errCtx & ": non-hex character at position " & $i & " (len=" & $buf.len & ")",
+    )
   byte((hi shl 4) or lo)
 
-proc decodeByteaEscape*(s: openArray[char], errCtx: string): seq[byte] =
+proc decodeByteaEscape*(
+    s: openArray[char], errCtx: string
+): seq[byte] {.raises: [PgTypeError].} =
   ## Decode bytea text in the legacy `bytea_output = escape` format.
   ## Server output only ever produces `\\` and `\NNN` (3 octal digits);
   ## other bytes pass through verbatim.
@@ -1832,7 +1850,9 @@ proc toPgMoneyArrayNDParam*(
     buf.writeMoneyAt(pos, v.elements[i].get)
   PgParam(oid: OidMoneyArray, format: 1, value: some(buf))
 
-proc coerceBinaryParam*(param: PgParam, serverOid: int32): PgParam =
+proc coerceBinaryParam*(
+    param: PgParam, serverOid: int32
+): PgParam {.raises: [PgTypeError].} =
   ## Return a copy of `param` whose binary payload matches `serverOid`.
   ## Text-format parameters (format == 0) and matching OIDs are returned
   ## unchanged.  For binary-format parameters with a type mismatch, safe

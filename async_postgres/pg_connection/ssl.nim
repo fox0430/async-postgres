@@ -621,6 +621,7 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
 
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
   ## Negotiate TLS (SSLRequest or Direct). ``sslHost`` is cert verification name.
+  ## Raises ``PgConfigError`` when ``sslMode == sslDisable``.
   # Defensive: connectToHost / perform already validate, but this proc is
   # exported and may be called directly; the checks are idempotent.
   # `validateClientCertConfig` also runs at the connect-time chokepoint in
@@ -629,6 +630,9 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
   # would silently drop a lone `sslCert` while asyncdispatch errors out. Its
   # `PgConfigError` is left as is, so a direct caller sees the type `connect`
   # raises.
+  if config.sslMode == sslDisable:
+    raise
+      newException(PgConfigError, "negotiateSSL requires sslmode other than disable")
   validateClientCertConfig(config)
   validateDirectSslCompatible(config)
   if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:

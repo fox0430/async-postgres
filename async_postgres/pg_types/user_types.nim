@@ -1,4 +1,4 @@
-import std/[options, macros, strutils, typetraits]
+import std/[options, macros, strutils, typetraits, times]
 
 import ../pg_protocol
 import core, decoding, encoding
@@ -390,6 +390,13 @@ proc encodeCompositeText*(fields: seq[Option[string]]): string {.raises: [].} =
       result.add(compositeFieldToText(f.get))
   result.add(')')
 
+proc compositeDateTimeToText(dt: DateTime): string =
+  ## Text form of a composite DateTime field. The UTC offset is mandatory:
+  ## without it a timestamptz field is reinterpreted in the session TimeZone.
+  if not dt.isInitialized:
+    raise newException(PgTypeError, "Uninitialized DateTime in composite field")
+  dt.utc.format("yyyy-MM-dd HH:mm:ss'.'ffffffzzz")
+
 macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
   ## Generate ``toPgParam`` for a Nim object as a PostgreSQL composite type.
   ## Each field is sent as text inside the composite text format.
@@ -403,9 +410,14 @@ macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
       for _, val in v.fieldPairs:
         when typeof(val) is Option:
           if val.isSome:
-            fields.add(some($val.get))
+            when typeof(val.get) is DateTime:
+              fields.add(some(compositeDateTimeToText(val.get)))
+            else:
+              fields.add(some($val.get))
           else:
             fields.add(none(string))
+        elif typeof(val) is DateTime:
+          fields.add(some(compositeDateTimeToText(val)))
         else:
           fields.add(some($val))
       PgParam(
@@ -432,6 +444,8 @@ proc compositeFieldFromText[T](s: string): T =
     parsePgBoolText(s)
   elif T is PgNumeric:
     parsePgNumeric(s)
+  elif T is DateTime:
+    parseTimestampText(s)
   else:
     raise newException(PgTypeError, "Unsupported composite field type")
 
@@ -457,7 +471,7 @@ template checkFieldOid(actual: int32, allowed: openArray[int32], typeName: strin
 
 template decodeBinaryField(val, buf: untyped, fOid: int32, fOff, fEnd, fLen: int) =
   when typeof(val) is string:
-    checkFieldOid(fOid, [OidText, OidVarchar], "string")
+    checkFieldOid(fOid, LabelBearingOids, "string")
     val = readString(buf, fOff, fLen)
   elif typeof(val) is int16:
     checkFieldOid(fOid, [OidInt2], "int16")
@@ -483,6 +497,10 @@ template decodeBinaryField(val, buf: untyped, fOid: int32, fOff, fEnd, fLen: int
     checkFieldOid(fOid, [OidBool], "bool")
     checkFieldLen(fLen, 1, "bool")
     val = buf[fOff] != 0
+  elif typeof(val) is DateTime:
+    checkFieldOid(fOid, [OidTimestamp, OidTimestampTz], "DateTime")
+    checkFieldLen(fLen, 8, "DateTime")
+    val = decodeBinaryTimestamp(buf.toOpenArray(fOff, fEnd))
   else:
     val = compositeFieldFromText[typeof(val)](readString(buf, fOff, fLen))
 
@@ -575,12 +593,16 @@ proc getDomain*[T: distinct](row: Row, col: int): T =
     T(row.getInt64(col))
   elif distinctBase(T) is float64:
     T(row.getFloat(col))
+  elif distinctBase(T) is float32:
+    T(row.getFloat32(col))
   elif distinctBase(T) is bool:
     T(row.getBool(col))
+  elif distinctBase(T) is DateTime:
+    T(row.getTimestamp(col))
   else:
     {.
       error:
-        "Unsupported domain base type: use string, int16, int32, int64, float64, or bool"
+        "Unsupported domain base type: use string, int16, int32, int64, float32, float64, bool, or DateTime"
     .}
 
 proc getDomainOpt*[T: distinct](row: Row, col: int): Option[T] =
