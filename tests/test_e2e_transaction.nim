@@ -3530,6 +3530,33 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "pipeline: default autoReset=false re-sends queued ops on second execute":
+    # Pins the documented hazard: without autoReset/reset, a second execute()
+    # replays the same ops (non-idempotent INSERT would duplicate rows).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+
+      discard await conn.exec(
+        "CREATE TEMP TABLE pipe_resend(id serial PRIMARY KEY, v int NOT NULL)"
+      )
+
+      let p = newPipeline(conn) # autoReset=false by default
+      p.addExec("INSERT INTO pipe_resend (v) VALUES ($1)", @[toPgParam(1'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 1
+
+      let r2 = await p.execute()
+      doAssert r2.len == 1
+
+      let count =
+        (await conn.query("SELECT count(*)::int4 FROM pipe_resend")).rows[0].getInt(0)
+      doAssert count == 2,
+        "second execute without reset must re-send the INSERT (got count=" & $count & ")"
+
+    waitFor t()
+
   test "pipeline: reset on empty pipeline is a no-op":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

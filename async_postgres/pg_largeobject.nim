@@ -18,10 +18,11 @@
 ##       await lo.loSeek(0, SEEK_SET)
 ##       let readBack = await lo.loReadAll()
 
-import std/[strutils, options]
+import std/[macros, strutils, options]
 
 import async_backend, pg_types, pg_protocol, pg_connection, pg_client
 import pg_connection/types
+import pg_client/transaction
 
 const
   INV_READ* = 0x00040000'i32
@@ -347,35 +348,54 @@ proc loSize*(
   result = await lo.loSeek(0, SEEK_END, timeout)
   discard await lo.loSeek(savedPos, SEEK_SET, timeout)
 
-# Template
+# Macro
 
-template withLargeObject*(
+macro withLargeObject*(
     conn: PgConnection, lo: untyped, oidVal: Oid, mode: int32, body: untyped
-) =
+): untyped =
   ## Open a Large Object, execute ``body``, then close it.
   ## Must be used inside ``withTransaction``.
-  let lo = await conn.loOpen(oidVal, mode)
-  try:
-    body
-  except CatchableError as loBodyErr:
-    # ``body`` failed and the surrounding transaction may now be in a failed
-    # state, so ``loClose`` would raise "current transaction is aborted" and
-    # mask the real error. Close best-effort and re-raise the original.
+  ##
+  ## Body ``return`` / ``break`` / ``continue`` that would escape the body
+  ## are rejected at compile time so ``loClose`` is not skipped (which would
+  ## leak the server-side Large Object file descriptor until the transaction
+  ## ends).
+  checkNoBodyEscape(body, "withLargeObject", "loClose")
+  let connSym = genSym(nskLet, "conn")
+  let oidSym = genSym(nskLet, "oid")
+  let modeSym = genSym(nskLet, "mode")
+  result = quote:
+    let `connSym` = `conn`
+    let `oidSym` = `oidVal`
+    let `modeSym` = `mode`
+    let `lo` = await `connSym`.loOpen(`oidSym`, `modeSym`)
     try:
-      await lo.loClose()
-    except CatchableError:
-      discard
-    raise loBodyErr
-  except Defect as loBodyDefect:
-    # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
-    # it raw so the handle is not leaked.
-    try:
-      await lo.loClose()
-    except CatchableError:
-      discard
-    raise loBodyDefect
-  # Surface a genuine close failure to the caller.
-  await lo.loClose()
+      `body`
+    except CatchableError as loBodyErr:
+      # ``body`` failed and the surrounding transaction may now be in a failed
+      # state, so ``loClose`` would raise "current transaction is aborted" and
+      # mask the real error. Close best-effort and re-raise the original.
+      try:
+        await `lo`.loClose()
+      except CatchableError:
+        discard
+      raise loBodyErr
+    except Defect as loBodyDefect:
+      # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
+      # it raw so the handle is not leaked.
+      try:
+        await `lo`.loClose()
+      except CatchableError:
+        discard
+      raise loBodyDefect
+    # Surface a genuine close failure to the caller.
+    await `lo`.loClose()
+    checkNoBodyEscapePost(
+      block:
+        `body`,
+      "withLargeObject",
+      "loClose",
+    )
 
 # Streaming API
 

@@ -26,7 +26,10 @@ proc main() {.async.} =
   """
   )
 
-  # Build a pipeline: multiple operations sent in a single round trip
+  # Build a pipeline: multiple operations sent in a single round trip.
+  # Prefer autoReset=true when reusing the same Pipeline — without it (the
+  # default), a second execute() re-sends the queued ops and can duplicate
+  # non-idempotent side effects such as these INSERTs.
   let p = conn.newPipeline()
 
   p.addExec("INSERT INTO tasks (title) VALUES ($1)", @[toPgParam("Write docs")])
@@ -38,7 +41,7 @@ proc main() {.async.} =
   p.addQuery("SELECT id, title, done FROM tasks ORDER BY id")
   p.addQuery("SELECT count(*) FROM tasks WHERE done = true")
 
-  # Execute all operations at once
+  # Execute all operations at once (single-shot; no second execute without reset)
   let results = await p.execute()
 
   for i, r in results:
