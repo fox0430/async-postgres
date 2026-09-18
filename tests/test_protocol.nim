@@ -923,6 +923,156 @@ suite "Backend decoding":
     expect PgProtocolError:
       discard parseBackendMessage(buf)
 
+  test "zero-payload responses reject trailing bytes":
+    for (msgType, _) in [
+      ('1', "ParseComplete"),
+      ('2', "BindComplete"),
+      ('3', "CloseComplete"),
+      ('I', "EmptyQueryResponse"),
+      ('n', "NoData"),
+      ('s', "PortalSuspended"),
+      ('c', "CopyDone"),
+    ]:
+      var buf = buildMsg(msgType, @[0x99'u8])
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+
+  test "shaped parsers reject trailing bytes":
+    # AuthenticationOk (int32 0) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationCleartextPassword (int32 3) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(3)
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationMD5Password (int32 5 + 4-byte salt) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(5)
+      body.add(@[0xDE'u8, 0xAD, 0xBE, 0xEF])
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationSASL (single mechanism) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(10)
+      body.addCString("SCRAM-SHA-256")
+      body.add(0'u8) # terminator
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationSASL (multiple mechanisms) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(10)
+      body.addCString("SCRAM-SHA-256")
+      body.addCString("SCRAM-SHA-512")
+      body.add(0'u8) # terminator
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # BackendKeyData (8 bytes) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(1)
+      body.addInt32(2)
+      body.add(0x99'u8)
+      var buf = buildMsg('K', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # CommandComplete + junk after the tag NUL
+    block:
+      var body: seq[byte] = @[]
+      body.addCString("SELECT 1")
+      body.add(0x99'u8)
+      var buf = buildMsg('C', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ReadyForQuery + junk
+    block:
+      var buf = buildMsg('Z', @[byte('I'), 0x99'u8])
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ParameterStatus + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addCString("client_encoding")
+      body.addCString("UTF8")
+      body.add(0x99'u8)
+      var buf = buildMsg('S', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # RowDescription (0 fields) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt16(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('T', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # DataRow (0 cols) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt16(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('D', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ParameterDescription (0 params) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt16(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('t', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ErrorResponse after terminator + junk
+    block:
+      var body: seq[byte] = @[]
+      body.add(byte('S'))
+      body.addCString("ERROR")
+      body.add(byte('C'))
+      body.addCString("XX000")
+      body.add(byte('M'))
+      body.addCString("boom")
+      body.add(0'u8) # field terminator
+      body.add(0x99'u8)
+      var buf = buildMsg('E', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # NotificationResponse + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(42)
+      body.addCString("chan")
+      body.addCString("payload")
+      body.add(0x99'u8)
+      var buf = buildMsg('A', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # NegotiateProtocolVersion (0 options) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(0)
+      body.addInt32(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('v', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+
   test "CopyData":
     var buf = buildMsg('d', @[1'u8, 2, 3])
     let res = parseBackendMessage(buf)

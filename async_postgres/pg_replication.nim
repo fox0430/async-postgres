@@ -554,30 +554,27 @@ proc connectReplication*(
   cfg.extraParams.add(("replication", replicationParamValue(mode)))
   connect(cfg)
 
-proc parseTimelineId*(s: string): int32 =
-  ## Parse the timeline id from an ``IDENTIFY_SYSTEM`` result row (text format).
-  ## Converts a non-numeric value and an out-of-``int32``-range value into
-  ## `PgTypeError` so callers stay under the ``except PgError`` contract.
-  ## Range-check before narrowing: a bare ``parseInt(...).int32`` would raise
-  ## ``RangeDefect`` (a Defect, outside ``PgError``) on an out-of-range value.
-  ## Timeline ids are unsigned decimal.
+proc parseTimelineIdText(s: string, what: string): int32 =
+  ## Parse unsigned-decimal timeline id with int32-range check (`what` for errors).
   if not isPgUIntText(s):
     raise newException(
-      PgTypeError,
-      "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $s.len & ")",
+      PgTypeError, what & " returned a non-numeric timeline (len=" & $s.len & ")"
     )
   var t: int
   if pgParseIntView(s, t) != pipOk:
     raise newException(
-      PgTypeError,
-      "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $s.len & ")",
+      PgTypeError, what & " returned a non-numeric timeline (len=" & $s.len & ")"
     )
   if t < int(int32.low) or t > int(int32.high):
     raise newException(
-      PgTypeError,
-      "IDENTIFY_SYSTEM returned a timeline out of int32 range (len=" & $s.len & ")",
+      PgTypeError, what & " returned a timeline out of int32 range (len=" & $s.len & ")"
     )
   t.int32
+
+proc parseTimelineId*(s: string): int32 =
+  ## Parse timeline id from an ``IDENTIFY_SYSTEM`` row (text format).
+  ## Non-numeric/out-of-range values raise `PgTypeError`, not `RangeDefect`.
+  parseTimelineIdText(s, "IDENTIFY_SYSTEM")
 
 # Replication commands (via simple query protocol)
 
@@ -697,7 +694,9 @@ proc decodeReadSlotRow(qr: QueryResult, slotName: string): ReplicationSlotInfo =
   if not row.isNull(1):
     result.consistentPoint = parseLsn(row.getStr(1))
   if not row.isNull(2):
-    result.restartTli = pgParseBiggestInt(row.getStr(2))
+    # Same range check as IDENTIFY_SYSTEM.
+    result.restartTli =
+      parseTimelineIdText(row.getStr(2), "READ_REPLICATION_SLOT").int64
 
 proc readReplicationSlot*(
     conn: PgConnection, slotName: string, timeout: async_backend.Duration = ZeroDuration
@@ -1204,6 +1203,8 @@ proc startReplication*(
   var hasProtoVersion = false
   var hasPublicationNames = false
   for (k, v) in options:
+    if k.len == 0:
+      raise newException(ValueError, "Empty replication option key")
     # Values are quoted below, so one that already arrives wrapped in quotes
     # would reach the server including them. Reject the pre-quoting spelling
     # rather than sending a value the plugin rejects mid-stream.
@@ -1299,9 +1300,9 @@ proc startPhysicalReplication*(
   ## exception or any other mid-stream failure poisons the connection (marked
   ## closed) and propagates, so reconnect and resume from the last LSN tracked.
   ##
-  ## ``slotName = ""`` streams without a slot. A non-zero ``timeline`` is appended
-  ## as ``TIMELINE n``, so the server aborts the stream if it advanced past that
-  ## timeline. ``statusInterval`` behaves as on ``startReplication``.
+  ## ``slotName = ""`` streams without a slot. Non-zero ``timeline`` is sent as
+  ## ``TIMELINE n`` (negative raises ``ValueError``). ``statusInterval`` behaves
+  ## as on ``startReplication``.
   ##
   ## On a timeline switch the server may send a result set describing the next
   ## timeline between ``CopyDone`` and ``ReadyForQuery``; this proc drains and
@@ -1311,6 +1312,8 @@ proc startPhysicalReplication*(
   ## recycle, so a standby in ``synchronous_standby_names`` that relies on the
   ## auto-reply must call ``confirmFlushed`` (or reply manually) or the primary's
   ## ``COMMIT``s block waiting on a flush position that never advances.
+  if timeline < 0:
+    raise newException(ValueError, "timeline must be >= 0, got " & $timeline)
   conn.checkReady()
 
   var sql = "START_REPLICATION"

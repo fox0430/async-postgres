@@ -337,3 +337,32 @@ suite "parseDataRowInto numCols mismatch":
     parseDataRowInto(buildDataRowBody(["a", "b", "c"]), rd)
     check getCell(rd, 0, 0) == "a"
     check getCell(rd, 0, 2) == "c"
+
+suite "parseDataRowInto trailing data":
+  test "rejects trailing byte after a valid row":
+    var rd = newRowData(2)
+    var body = buildDataRowBody(["a", "b"])
+    body.add(0x99'u8)
+    expect PgProtocolError:
+      parseDataRowInto(body, rd)
+
+  test "same body without junk is accepted":
+    var rd = newRowData(2)
+    parseDataRowInto(buildDataRowBody(["a", "b"]), rd)
+    check getCell(rd, 0, 0) == "a"
+    check getCell(rd, 0, 1) == "b"
+
+  test "state unchanged on trailing data":
+    var rd = newRowData(2)
+    parseDataRowInto(buildDataRowBody(["a", "b"]), rd)
+    let bufSnap = rd.buf
+    let cellSnap = rd.cellIndex
+    var body = buildDataRowBody(["x", "y"])
+    body.add(0x99'u8)
+    expect PgProtocolError:
+      parseDataRowInto(body, rd)
+    check rd.buf == bufSnap
+    check rd.cellIndex == cellSnap
+    # Prior rows stay readable after the failed append
+    check getCell(rd, 0, 0) == "a"
+    check getCell(rd, 0, 1) == "b"
