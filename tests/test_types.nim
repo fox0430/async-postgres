@@ -11736,3 +11736,66 @@ suite "text parsers follow PostgreSQL's grammar, not Nim's":
       discard pgParseUIntField("9223372036854775808", "ctx")
     expect PgTypeError:
       discard pgParseUIntField("99999999999999999999", "ctx")
+
+suite "getBoxArray text format":
+  test "parses semicolon-delimited box literals":
+    # PostgreSQL's box[] text form uses ';' between elements (not ',') because
+    # each box already contains commas. Exercise the dedicated text path.
+    let row =
+      mkRow(@[some(toBytes("{(3,4),(1,2);(7,8),(5,6)}"))], @[mkField(OidBoxArray, 0)])
+    let arr = row.getBoxArray(0)
+    check arr.len == 2
+    check arr[0].high == PgPoint(x: 3.0, y: 4.0)
+    check arr[0].low == PgPoint(x: 1.0, y: 2.0)
+    check arr[1].high == PgPoint(x: 7.0, y: 8.0)
+    check arr[1].low == PgPoint(x: 5.0, y: 6.0)
+
+  test "empty box array literal":
+    let row = mkRow(@[some(toBytes("{}"))], @[mkField(OidBoxArray, 0)])
+    check row.getBoxArray(0).len == 0
+
+  test "rejects NULL elements in text form":
+    let row = mkRow(@[some(toBytes("{(1,2),(3,4);NULL}"))], @[mkField(OidBoxArray, 0)])
+    expect PgTypeError:
+      discard row.getBoxArray(0)
+
+suite "row columnIndex by name":
+  test "resolves names from row field metadata":
+    let fields = @[
+      FieldDescription(
+        name: "id", typeOid: OidInt4, typeSize: 4, typeMod: -1, formatCode: 0
+      ),
+      FieldDescription(
+        name: "name", typeOid: OidText, typeSize: -1, typeMod: -1, formatCode: 0
+      ),
+    ]
+    let row = mkRow(@[some(toBytes("1")), some(toBytes("alice"))], fields)
+    check row.columnIndex("id") == 0
+    check row.columnIndex("name") == 1
+    check row.getStr("name") == "alice"
+
+  test "raises when field metadata is missing":
+    # Manual Row without FieldDescription metadata (converter path).
+    let row: Row = @[some(toBytes("x"))]
+    var raised = false
+    try:
+      discard row.columnIndex("x")
+    except PgTypeError as e:
+      raised = true
+      check "field metadata" in e.msg
+    check raised
+
+  test "raises when the column name is absent":
+    let fields = @[
+      FieldDescription(
+        name: "id", typeOid: OidInt4, typeSize: 4, typeMod: -1, formatCode: 0
+      )
+    ]
+    let row = mkRow(@[some(toBytes("1"))], fields)
+    var raised = false
+    try:
+      discard row.columnIndex("missing")
+    except PgTypeError as e:
+      raised = true
+      check "Column not found" in e.msg
+    check raised

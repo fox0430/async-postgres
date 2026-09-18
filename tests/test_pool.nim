@@ -3442,8 +3442,14 @@ suite "Pool metrics":
     let pool = makePool()
     let conn = mockConn()
     pool.idle.addLast(conn.toPooled())
+    let before = pool.metrics.acquireDuration
     discard waitFor pool.acquire()
-    check pool.metrics.acquireDuration >= ZeroDuration
+    # Idle handoff is near-instant, so this only pins monotonicity (no clock
+    # regression). It cannot tell a missing duration write (`== before`) from
+    # a real one; measurable accumulation is pinned by
+    # "waiter transfer tracks acquireDuration" below.
+    check pool.metrics.acquireDuration >= before
+    check pool.metrics.acquireCount == 1
 
   test "acquire skipping broken connections increments closeCount":
     let pool = makePool()
@@ -3530,28 +3536,39 @@ suite "Pool metrics":
     check pool.metrics.closeCount == 1
     check pool.metrics.acquireCount == 1
 
-  test "acquireDuration accumulates across multiple acquires":
+  test "acquireDuration is monotonic across multiple acquires":
     let pool = makePool()
+    var previous = ZeroDuration
     for i in 0 ..< 3:
       let conn = mockConn()
       pool.idle.addLast(conn.toPooled())
       discard waitFor pool.acquire()
+      # Same limitation as above: idle handoffs add near-zero time, so this
+      # pins monotonicity only. Measurable accumulation is pinned by
+      # "waiter transfer tracks acquireDuration" below.
+      check pool.metrics.acquireDuration >= previous
+      previous = pool.metrics.acquireDuration
       pool.active.dec
     check pool.metrics.acquireCount == 3
-    check pool.metrics.acquireDuration >= ZeroDuration
 
   test "waiter transfer tracks acquireDuration":
-    let pool = makePool(maxSize = 1)
-    pool.active = 1
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.active = 1
 
-    let acquireFut = pool.acquire()
-    check not acquireFut.finished
+      let acquireFut = pool.acquire()
+      doAssert not acquireFut.finished
 
-    let conn = mockConn()
-    pool.release(conn)
-    discard waitFor acquireFut
-    check pool.metrics.acquireCount == 1
-    check pool.metrics.acquireDuration >= ZeroDuration
+      # Sleep so the waiter path must accumulate a measurable wait time;
+      # `>= ZeroDuration` alone is a tautology for Duration.
+      await sleepAsync(milliseconds(20))
+      let conn = mockConn()
+      pool.release(conn)
+      discard await acquireFut
+      doAssert pool.metrics.acquireCount == 1
+      doAssert pool.metrics.acquireDuration >= milliseconds(1)
+
+    waitFor t()
 
   test "acquire timeout does not increment createCount":
     proc t() {.async.} =
