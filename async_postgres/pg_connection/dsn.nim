@@ -771,11 +771,15 @@ proc validateConnConfig*(config: var ConnConfig) =
         "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets)",
       )
 
-  checkPort(config.port)
-  checkHostaddr(config.hostaddr)
-  for entry in config.hosts:
-    checkPort(entry.port)
-    checkHostaddr(entry.hostaddr)
+  # Once `hosts` is populated the scalar host/port pair is an unused back-compat
+  # mirror, left zeroed by hand-built configs.
+  if config.hosts.len > 0:
+    for entry in config.hosts:
+      checkPort(entry.port)
+      checkHostaddr(entry.hostaddr)
+  else:
+    checkPort(config.port)
+    checkHostaddr(config.hostaddr)
 
   if config.keepAliveIdle < 0:
     raise newException(PgConfigError, "keepalives_idle must be non-negative")
