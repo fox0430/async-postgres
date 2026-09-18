@@ -794,6 +794,38 @@ suite "parseDsn":
     check cfg.sslCert == dummyPem
     check cfg.sslKey == dummyPem
 
+  test "error: empty sslcert PEM file rejected":
+    let certPath = writePemFile("")
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    var raised = false
+    try:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+    except PgConfigError as e:
+      raised = true
+      check "file is empty" in e.msg
+    check raised
+
+  test "error: empty sslkey PEM file rejected":
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile("")
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    var raised = false
+    try:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+    except PgConfigError as e:
+      raised = true
+      check "file is empty" in e.msg
+    check raised
+
   test "error: sslcert with sslmode=disable rejected":
     let certPath = writePemFile(dummyPem)
     let keyPath = writeKeyFile(dummyPem)
