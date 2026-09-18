@@ -952,39 +952,30 @@ suite "startReplication / startPhysicalReplication preflight":
     )
 
   test "empty replication option key raises ValueError":
-    proc t() {.async.} =
-      let conn = mkStubConn()
-      let cb = makeReplicationCallback:
-        discard
-      expect ValueError:
-        await conn.startReplication(
-          "slot", InvalidLsn, options = @[("", "1")], callback = cb
-        )
-
-    waitFor t()
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect ValueError:
+      waitFor conn.startReplication(
+        "slot", InvalidLsn, options = @[("", "1")], callback = cb
+      )
 
   test "negative physical timeline raises ValueError":
-    proc t() {.async.} =
-      let conn = mkStubConn()
-      let cb = makeReplicationCallback:
-        discard
-      expect ValueError:
-        await conn.startPhysicalReplication(
-          startLsn = Lsn(0x1000'u64), timeline = -1'i32, callback = cb
-        )
-
-    waitFor t()
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect ValueError:
+      waitFor conn.startPhysicalReplication(
+        startLsn = Lsn(0x1000'u64), timeline = -1'i32, callback = cb
+      )
 
   test "timeline 0 is allowed (omits TIMELINE clause; fails later on closed conn)":
     # 0 means "omit TIMELINE"; validation must not raise ValueError for it.
     # The stub is csClosed, so checkReady raises PgConnectionError next.
-    proc t() {.async.} =
-      let conn = mkStubConn()
-      let cb = makeReplicationCallback:
-        discard
-      expect PgConnectionError:
-        await conn.startPhysicalReplication(
-          startLsn = Lsn(0x1000'u64), timeline = 0'i32, callback = cb
-        )
-
-    waitFor t()
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect PgConnectionError:
+      waitFor conn.startPhysicalReplication(
+        startLsn = Lsn(0x1000'u64), timeline = 0'i32, callback = cb
+      )
