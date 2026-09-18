@@ -2952,3 +2952,45 @@ when defined(pgStateChecks):
       conn.stagedStmtCloses = @["_sc_1"]
       conn.checkReady()
       check conn.stagedStmtCloses == @["_sc_1"]
+
+suite "buildResultFormats":
+  test "marks binary-safe OIDs as format 1 and others as 0":
+    let fields = @[
+      FieldDescription(name: "i", typeOid: OidInt4, formatCode: 0),
+      FieldDescription(name: "t", typeOid: OidText, formatCode: 0),
+      FieldDescription(name: "b", typeOid: OidBool, formatCode: 0),
+      FieldDescription(name: "u", typeOid: 999999'i32, formatCode: 0),
+    ]
+    let fmts = buildResultFormats(fields)
+    check fmts == @[1'i16, 1'i16, 1'i16, 0'i16]
+    check isBinarySafeOid(OidInt4)
+    check isBinarySafeOid(OidText)
+    check isBinarySafeOid(OidBool)
+    check not isBinarySafeOid(-1)
+    check not isBinarySafeOid(999999'i32)
+
+  test "empty fields yields empty formats":
+    check buildResultFormats(@[]).len == 0
+
+suite "patchMsgLenAtomic":
+  test "patches length and leaves a valid frontend frame":
+    var buf: seq[byte]
+    let start = buf.len
+    buf.add(byte('Q'))
+    buf.addInt32(0) # placeholder length
+    buf.add(@[byte('S'), byte('E'), byte('L'), 0'u8])
+    buf.patchMsgLenAtomic(start)
+    check buf[0] == byte('Q')
+    check fromBE32(buf, 1) == int32(buf.len - 1)
+
+  test "out-of-range msgStart truncates back to msgStart before raising":
+    var buf = @[1'u8, 2, 3, 4, 5]
+    expect PgProtocolError:
+      buf.patchMsgLenAtomic(3) # 3+4 >= 5
+    check buf == @[1'u8, 2, 3]
+
+  test "negative msgStart raises without truncating":
+    var buf = @[1'u8, 2, 3, 4, 5]
+    expect PgProtocolError:
+      buf.patchMsgLenAtomic(-1)
+    check buf == @[1'u8, 2, 3, 4, 5]

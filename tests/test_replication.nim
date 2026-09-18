@@ -979,3 +979,27 @@ suite "startReplication / startPhysicalReplication preflight":
       waitFor conn.startPhysicalReplication(
         startLsn = Lsn(0x1000'u64), timeline = 0'i32, callback = cb
       )
+
+suite "parseReplicationMessage defense branches":
+  test "empty CopyData is rejected":
+    expect PgProtocolError:
+      discard parseReplicationMessage(@[])
+
+  test "truncated XLogData is rejected":
+    var payload: seq[byte]
+    payload.add(byte('w'))
+    payload.addInt64(1'i64)
+    # Fewer than the required 25 bytes (type + 3×int64).
+    expect PgProtocolError:
+      discard parseReplicationMessage(payload)
+
+  test "truncated PrimaryKeepalive is rejected":
+    var payload: seq[byte]
+    payload.add(byte('k'))
+    payload.addInt64(1'i64)
+    expect PgProtocolError:
+      discard parseReplicationMessage(payload)
+
+  test "unknown replication message type is rejected":
+    expect PgProtocolError:
+      discard parseReplicationMessage(@[byte('Z')])
