@@ -511,6 +511,7 @@ async_postgres/pg_connection/dsn.nim	parseSslMode
 async_postgres/pg_connection/dsn.nim	parseSslNegotiation
 async_postgres/pg_connection/dsn.nim	parseTargetSessionAttrs
 async_postgres/pg_connection/dsn.nim	parseUriDsn
+async_postgres/pg_connection/dsn.nim	validateConnConfig
 async_postgres/pg_connection/lifecycle.nim	close
 async_postgres/pg_connection/lifecycle.nim	closeImpl
 async_postgres/pg_connection/lifecycle.nim	connect

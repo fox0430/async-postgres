@@ -814,6 +814,153 @@ suite "Client certificate config validation":
     check raised
     check configFault
 
+suite "connect hand-built ConnConfig numeric validation":
+  # #631 gap: `validateConnConfig` used to run only in `initConnConfig`.
+  # Hand-built `ConnConfig` must hit the same guards at the `connect` chokepoint
+  # (no mock server — failure is client-side before dial).
+  test "out-of-range port is a config fault, not a connection failure":
+    var raised = false
+    var configFault = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 99999,
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        configFault = e of PgConfigError
+
+    waitFor testBody()
+    check raised
+    check configFault
+
+  test "port 0 is a config fault":
+    var raised = false
+    var configFault = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1", port: 0, user: "test", database: "test", sslMode: sslDisable
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        configFault = e of PgConfigError
+
+    waitFor testBody()
+    check raised
+    check configFault
+
+  test "slash hostaddr is a config fault":
+    var raised = false
+    var configFault = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "db",
+        hostaddr: "/tmp",
+        port: 5432,
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        configFault = e of PgConfigError
+
+    waitFor testBody()
+    check raised
+    check configFault
+
+  test "negative keepAliveIdle is a config fault":
+    var raised = false
+    var configFault = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 1,
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+        keepAliveIdle: -1,
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        raised = true
+        configFault = e of PgConfigError
+
+    waitFor testBody()
+    check raised
+    check configFault
+
+  test "keepAliveIdle exceeding cint is a config fault":
+    when sizeof(cint) < sizeof(int):
+      var raised = false
+      var configFault = false
+
+      proc testBody() {.async.} =
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: 1,
+          user: "test",
+          database: "test",
+          sslMode: sslDisable,
+          keepAliveIdle: int(high(cint)) + 1,
+        )
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except PgError as e:
+          raised = true
+          configFault = e of PgConfigError
+
+      waitFor testBody()
+      check raised
+      check configFault
+
+  test "negative connectTimeout normalizes and does not raise PgConfigError":
+    # Normalization must happen before dial; use an immediately-refused port so
+    # the attempt finishes without hanging (ZeroDuration = no timeout).
+    var configFault = false
+    var connected = false
+
+    proc testBody() {.async.} =
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: 1,
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+        connectTimeout: seconds(-5),
+      )
+      try:
+        let conn = await connect(config)
+        connected = true
+        await conn.close()
+      except PgConfigError:
+        configFault = true
+      except PgError:
+        discard
+
+    waitFor testBody()
+    check not configFault
+    check not connected
+
 suite "SSL negotiation - sslAllow":
   test "sslAllow connects without SSL when server accepts plaintext":
     var connState: PgConnState

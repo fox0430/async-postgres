@@ -752,8 +752,10 @@ proc parseUriDsn*(dsn: string): ConnConfig =
   result.port = result.hosts[0].port
   validateClientCertConfig(result)
 
-proc validateConnConfig(config: var ConnConfig) =
-  ## Mirror DSN guards for ``initConnConfig`` (DSN parsers validate inline).
+proc validateConnConfig*(config: var ConnConfig) =
+  ## Mirror DSN guards for ``initConnConfig`` and the ``connect`` chokepoint
+  ## (DSN parsers validate inline; hand-built ``ConnConfig`` is re-checked at
+  ## connect time so numeric / hostaddr faults become ``PgConfigError``).
   ## Negative ``connectTimeout`` becomes ``ZeroDuration``.
   if config.connectTimeout < ZeroDuration:
     config.connectTimeout = ZeroDuration
@@ -769,11 +771,15 @@ proc validateConnConfig(config: var ConnConfig) =
         "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets)",
       )
 
-  checkPort(config.port)
-  checkHostaddr(config.hostaddr)
-  for entry in config.hosts:
-    checkPort(entry.port)
-    checkHostaddr(entry.hostaddr)
+  # Once `hosts` is populated the scalar host/port pair is an unused back-compat
+  # mirror, left zeroed by hand-built configs.
+  if config.hosts.len > 0:
+    for entry in config.hosts:
+      checkPort(entry.port)
+      checkHostaddr(entry.hostaddr)
+  else:
+    checkPort(config.port)
+    checkHostaddr(config.hostaddr)
 
   if config.keepAliveIdle < 0:
     raise newException(PgConfigError, "keepalives_idle must be non-negative")
