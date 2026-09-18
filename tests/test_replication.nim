@@ -916,6 +916,70 @@ suite "decodeReadSlotRow":
     expect(PgTypeError):
       discard decodeReadSlotRow(qr, "my_phys")
 
+  test "negative restart_tli raises PgTypeError":
+    # Timeline ids are unsigned; the signed BiggestInt path used to accept "-5".
+    let qr = mkReadQr(["physical", "0/16B3740", "-5"], 3)
+    expect(PgTypeError):
+      discard decodeReadSlotRow(qr, "my_phys")
+
+  test "restart_tli out of int32 range raises PgTypeError":
+    let qr = mkReadQr(["physical", "0/16B3740", "2147483648"], 3)
+    expect(PgTypeError):
+      discard decodeReadSlotRow(qr, "my_phys")
+
+  test "restart_tli failures omit the input, reporting length only":
+    const badTli = "abcSECRET_RESTART_TLI"
+    let qr = mkReadQr(["physical", "0/16B3740", badTli], 3)
+    var msg = ""
+    try:
+      discard decodeReadSlotRow(qr, "my_phys")
+    except PgTypeError as e:
+      msg = e.msg
+    check msg ==
+      "READ_REPLICATION_SLOT returned a non-numeric timeline (len=" & $badTli.len & ")"
+    check "SECRET_RESTART_TLI" notin msg
+
+suite "startReplication / startPhysicalReplication preflight":
+  # These guards run before checkReady / wire I/O, so a closed stub connection
+  # is enough to exercise the ValueError paths without a mock server.
+  proc mkStubConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: csClosed,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "empty replication option key raises ValueError":
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect ValueError:
+      waitFor conn.startReplication(
+        "slot", InvalidLsn, options = @[("", "1")], callback = cb
+      )
+
+  test "negative physical timeline raises ValueError":
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect ValueError:
+      waitFor conn.startPhysicalReplication(
+        startLsn = Lsn(0x1000'u64), timeline = -1'i32, callback = cb
+      )
+
+  test "timeline 0 is allowed (omits TIMELINE clause; fails later on closed conn)":
+    # 0 means "omit TIMELINE"; validation must not raise ValueError for it.
+    # The stub is csClosed, so checkReady raises PgConnectionError next.
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect PgConnectionError:
+      waitFor conn.startPhysicalReplication(
+        startLsn = Lsn(0x1000'u64), timeline = 0'i32, callback = cb
+      )
+
 suite "parseReplicationMessage defense branches":
   test "empty CopyData is rejected":
     expect PgProtocolError:

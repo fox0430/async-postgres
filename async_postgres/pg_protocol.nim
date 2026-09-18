@@ -1098,6 +1098,13 @@ proc encodeCopyFail*(
 
 # Backend message parsing (internal helpers)
 
+proc rejectTrailing(body: openArray[byte], offset: int, label: string) {.inline.} =
+  ## Reject trailing bytes past the last consumed field.
+  if offset != body.len:
+    raise newException(
+      PgProtocolError, label & ": trailing data (" & $(body.len - offset) & " bytes)"
+    )
+
 proc parseAuthentication(body: openArray[byte]): BackendMessage =
   if body.len < 4:
     raise newException(PgProtocolError, "Authentication message too short")
@@ -1106,14 +1113,17 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
   case authType
   of 0:
     result = BackendMessage(kind: bmkAuthenticationOk)
+    rejectTrailing(body, 4, "AuthenticationOk")
   of 3:
     result = BackendMessage(kind: bmkAuthenticationCleartextPassword)
+    rejectTrailing(body, 4, "AuthenticationCleartextPassword")
   of 5:
     if body.len < 8:
       raise newException(PgProtocolError, "MD5 auth message too short")
     result = BackendMessage(kind: bmkAuthenticationMD5Password)
     for i, b in body[4 .. 7]:
       result.md5Salt[i] = b
+    rejectTrailing(body, 8, "AuthenticationMD5Password")
   of 10:
     # SASL
     result = BackendMessage(kind: bmkAuthenticationSASL)
@@ -1131,12 +1141,13 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
           "AuthenticationSASL: mechanism count exceeds maximum of " & $MaxSaslMechanisms,
         )
       result.saslMechanisms.add(mechanism)
+    rejectTrailing(body, offset, "AuthenticationSASL")
   of 11:
-    # SASLContinue
+    # Rest is challenge payload.
     result = BackendMessage(kind: bmkAuthenticationSASLContinue)
     result.saslData = @(body.toOpenArray(4, body.len - 1))
   of 12:
-    # SASLFinal
+    # Rest is server-final payload.
     result = BackendMessage(kind: bmkAuthenticationSASLFinal)
     result.saslFinalData = @(body.toOpenArray(4, body.len - 1))
   else:
@@ -1148,11 +1159,13 @@ proc parseBackendKeyData(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkBackendKeyData)
   result.backendPid = decodeInt32(body, 0)
   result.backendSecretKey = decodeInt32(body, 4)
+  rejectTrailing(body, 8, "BackendKeyData")
 
 proc parseCommandComplete(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkCommandComplete)
-  let (tag, _) = decodeCString(body, 0)
+  let (tag, consumed) = decodeCString(body, 0)
   result.commandTag = tag
+  rejectTrailing(body, consumed, "CommandComplete")
 
 proc parseDataRow(body: openArray[byte]): BackendMessage =
   if body.len < 2:
@@ -1177,12 +1190,12 @@ proc parseDataRow(body: openArray[byte]): BackendMessage =
         raise newException(PgProtocolError, "DataRow: column data truncated")
       result.columns[i] = some(@(body.toOpenArray(offset, offset + colLen - 1)))
       offset += colLen
+  rejectTrailing(body, offset, "DataRow")
 
 proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
-  # Reject empty body: the '\0' field terminator is mandatory, and letting it
-  # through surfaces upstack as a diagnostically empty PgQueryError.
+  # Empty body would surface as an empty PgQueryError.
+  let name = if isError: "ErrorResponse" else: "NoticeResponse"
   if body.len == 0:
-    let name = if isError: "ErrorResponse" else: "NoticeResponse"
     raise newException(PgProtocolError, name & ": empty body")
   if isError:
     result = BackendMessage(kind: bmkErrorResponse)
@@ -1196,13 +1209,13 @@ proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
     let fieldType = char(body[offset])
     inc offset
     if fieldType == '\0':
+      rejectTrailing(body, offset, name)
       break
     let (value, consumed) = decodeCString(body, offset)
     offset += consumed
     # Bound field count before allocating: a hostile ~1 GiB body could otherwise
     # produce hundreds of millions of two-byte fields, amplifying allocation.
     if fieldCount >= MaxErrorOrNoticeFields:
-      let name = if isError: "ErrorResponse" else: "NoticeResponse"
       raise newException(
         PgProtocolError,
         name & ": field count exceeds maximum of " & $MaxErrorOrNoticeFields,
@@ -1223,15 +1236,18 @@ proc parseNotification(body: openArray[byte]): BackendMessage =
   let (channel, consumed1) = decodeCString(body, offset)
   result.notifChannel = channel
   offset += consumed1
-  let (payload, _) = decodeCString(body, offset)
+  let (payload, consumed2) = decodeCString(body, offset)
   result.notifPayload = payload
+  offset += consumed2
+  rejectTrailing(body, offset, "NotificationResponse")
 
 proc parseParameterStatus(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkParameterStatus)
   let (name, consumed) = decodeCString(body, 0)
   result.paramName = name
-  let (value, _) = decodeCString(body, consumed)
+  let (value, consumed2) = decodeCString(body, consumed)
   result.paramValue = value
+  rejectTrailing(body, consumed + consumed2, "ParameterStatus")
 
 proc parseRowDescription(body: openArray[byte]): BackendMessage =
   if body.len < 2:
@@ -1258,6 +1274,7 @@ proc parseRowDescription(body: openArray[byte]): BackendMessage =
       formatCode: decodeInt16(body, offset + 16),
     )
     offset += 18
+  rejectTrailing(body, offset, "RowDescription")
 
 proc parseReadyForQuery(body: openArray[byte]): BackendMessage =
   if body.len < 1:
@@ -1272,6 +1289,7 @@ proc parseReadyForQuery(body: openArray[byte]): BackendMessage =
     result.txStatus = tsInFailedTransaction
   else:
     raise newException(PgProtocolError, "Unknown transaction status: " & $char(body[0]))
+  rejectTrailing(body, 1, "ReadyForQuery")
 
 proc parseParameterDescription(body: openArray[byte]): BackendMessage =
   if body.len < 2:
@@ -1289,6 +1307,7 @@ proc parseParameterDescription(body: openArray[byte]): BackendMessage =
       raise newException(PgProtocolError, "ParameterDescription truncated")
     result.paramTypeOids[i] = decodeInt32(body, offset)
     offset += 4
+  rejectTrailing(body, offset, "ParameterDescription")
 
 proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
   if body.len < 8:
@@ -1317,6 +1336,7 @@ proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
     let (opt, consumed) = decodeCString(body, offset)
     result.unrecognizedOptions[i] = opt
     offset += consumed
+  rejectTrailing(body, offset, "NegotiateProtocolVersion")
 
 proc parseCopyResponse(
     body: openArray[byte], kind: BackendMessageKind
@@ -1353,10 +1373,7 @@ proc parseCopyResponse(
       )
     result.copyColumnFormats[i] = fmt
     offset += 2
-  if offset != body.len:
-    raise newException(
-      PgProtocolError, label & ": trailing data (" & $(body.len - offset) & " bytes)"
-    )
+  rejectTrailing(body, offset, label)
 
 proc newRowData*(
     numCols: int16, colFormats: seq[int16] = @[], colTypeOids: seq[int32] = @[]
@@ -1514,6 +1531,12 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
       rd.cellIndex[ci] = int32(pos)
       rd.cellIndex[ci + 1] = colLen
       pos += int(colLen)
+  if pos != bufEnd:
+    rd.cellIndex.setLen(cellBase)
+    rd.buf.setLen(bufBase)
+    raise newException(
+      PgProtocolError, "DataRow: trailing data (" & $(bufEnd - pos) & " bytes)"
+    )
 
 # Streaming backend message parser
 
@@ -1596,16 +1619,22 @@ proc parseBackendMessage*(
   of 'v':
     msg = parseNegotiateProtocolVersion(body)
   of '1':
+    rejectTrailing(body, 0, "ParseComplete")
     msg = BackendMessage(kind: bmkParseComplete)
   of '2':
+    rejectTrailing(body, 0, "BindComplete")
     msg = BackendMessage(kind: bmkBindComplete)
   of '3':
+    rejectTrailing(body, 0, "CloseComplete")
     msg = BackendMessage(kind: bmkCloseComplete)
   of 'I':
+    rejectTrailing(body, 0, "EmptyQueryResponse")
     msg = BackendMessage(kind: bmkEmptyQueryResponse)
   of 'n':
+    rejectTrailing(body, 0, "NoData")
     msg = BackendMessage(kind: bmkNoData)
   of 's':
+    rejectTrailing(body, 0, "PortalSuspended")
     msg = BackendMessage(kind: bmkPortalSuspended)
   of 'G':
     msg = parseCopyResponse(body, bmkCopyInResponse)
@@ -1617,6 +1646,7 @@ proc parseBackendMessage*(
     msg = BackendMessage(kind: bmkCopyData)
     msg.copyData = @(body)
   of 'c':
+    rejectTrailing(body, 0, "CopyDone")
     msg = BackendMessage(kind: bmkCopyDone)
   else:
     raise newException(PgProtocolError, "Unknown backend message type: " & msgType)
