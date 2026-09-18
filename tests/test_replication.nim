@@ -960,6 +960,7 @@ suite "startReplication / startPhysicalReplication preflight":
         await conn.startReplication(
           "slot", InvalidLsn, options = @[("", "1")], callback = cb
         )
+
     waitFor t()
 
   test "negative physical timeline raises ValueError":
@@ -971,6 +972,7 @@ suite "startReplication / startPhysicalReplication preflight":
         await conn.startPhysicalReplication(
           startLsn = Lsn(0x1000'u64), timeline = -1'i32, callback = cb
         )
+
     waitFor t()
 
   test "timeline 0 is allowed (omits TIMELINE clause; fails later on closed conn)":
@@ -984,4 +986,5 @@ suite "startReplication / startPhysicalReplication preflight":
         await conn.startPhysicalReplication(
           startLsn = Lsn(0x1000'u64), timeline = 0'i32, callback = cb
         )
+
     waitFor t()
