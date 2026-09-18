@@ -89,6 +89,11 @@ type
       ## When true, `execute`/`executeIsolated` call `reset()` in a `finally`
       ## block so the Pipeline can be safely reused without leaking state from
       ## the previous run. Default: false (backward-compatible).
+      ##
+      ## **Warning:** when false, a second `execute`/`executeIsolated` without
+      ## an intervening `reset()` re-sends the same queued ops. Non-idempotent
+      ## commands (INSERT, UPDATE, …) then run twice. Prefer `true` for
+      ## reusable pipelines, or call `reset()` before building a new batch.
 
   IsolatedPipelineResults* = object
     ## Results from `executeIsolated`: per-op error isolation via per-query SYNC.
@@ -100,6 +105,11 @@ proc newPipeline*(conn: PgConnection, autoReset: bool = false): Pipeline =
   ## When `autoReset` is true, the pipeline's queued ops and inline buffers are
   ## cleared automatically after each `execute`/`executeIsolated` call, making
   ## it safe to reuse the same Pipeline instance.
+  ##
+  ## When `autoReset` is false (the default), queued ops remain after
+  ## `execute`/`executeIsolated`. Calling either again without `reset()`
+  ## re-sends those ops and can duplicate non-idempotent side effects.
+  ## Prefer `autoReset = true` when the same Pipeline will be reused.
   Pipeline(conn: conn, ops: @[], autoReset: autoReset)
 
 proc reset*(p: Pipeline) =
@@ -108,6 +118,10 @@ proc reset*(p: Pipeline) =
   ## connection or its statement cache. When `p.autoReset` is true,
   ## `execute`/`executeIsolated` call this automatically (including on raise),
   ## so manual calls are only needed when `autoReset` is false.
+  ##
+  ## Without `autoReset`, call this before building a new batch: a second
+  ## `execute`/`executeIsolated` on uncleared ops re-sends them and can
+  ## duplicate non-idempotent side effects.
   p.ops.setLen(0)
   p.inlineData.setLen(0)
   p.inlineRanges.setLen(0)
@@ -643,6 +657,10 @@ proc execute*(
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## When `p.autoReset` is true, the pipeline is reset on exit (including on
   ## raise) so it can be safely reused.
+  ##
+  ## When `p.autoReset` is false (the default), queued ops are left in place.
+  ## A second call without `reset()` re-sends them and can duplicate
+  ## non-idempotent side effects — prefer `autoReset = true` for reuse.
   var results: seq[PipelineResult]
   try:
     if p.ops.len == 0:
@@ -781,6 +799,10 @@ proc executeIsolated*(
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## When `p.autoReset` is true, the pipeline is reset on exit (including on
   ## raise) so it can be safely reused.
+  ##
+  ## When `p.autoReset` is false (the default), queued ops are left in place.
+  ## A second call without `reset()` re-sends them and can duplicate
+  ## non-idempotent side effects — prefer `autoReset = true` for reuse.
   var ir: IsolatedPipelineResults
   try:
     if p.ops.len == 0:

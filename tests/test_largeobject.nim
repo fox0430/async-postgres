@@ -622,7 +622,7 @@ suite "Large Object: convenience API":
 
     waitFor t()
 
-suite "Large Object: withLargeObject template":
+suite "Large Object: withLargeObject macro":
   test "withLargeObject opens and closes":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -638,6 +638,43 @@ suite "Large Object: withLargeObject template":
         await conn.loUnlink(oid)
 
     waitFor t()
+
+  test "withLargeObject rejects return at compile time":
+    # Body `return` would skip loClose and leak the server-side fd.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withLargeObject(lo, 0.Oid, INV_READWRITE):
+            return
+
+    )
+
+  test "withLargeObject rejects break escaping at compile time":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withLargeObject(lo, 0.Oid, INV_READWRITE):
+              break
+
+    )
+
+  test "withLargeObject rejects return hidden inside a template":
+    # A `return` inside a template called from the body is invisible to the
+    # unexpanded walk; the typed re-check must still reject it.
+    template loBailOutTemplate(): untyped =
+      return
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withLargeObject(lo, 0.Oid, INV_READWRITE):
+            loBailOutTemplate()
+
+    )
 
   test "withLargeObject preserves the original error when the tx is aborted":
     # Regression: when `body` poisons the transaction, the cleanup `loClose`
