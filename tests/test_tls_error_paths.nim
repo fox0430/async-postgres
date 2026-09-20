@@ -180,6 +180,44 @@ suite "TLS error paths: client cert/key/CA loading":
 
     check waitFor(runTest())
 
+  test "connectToHost dials the entry, not the config scalars":
+    # `connectToHost` is a low-level dial primitive: the target is `entry`, so
+    # a config carrying no host of its own must still reach the wire instead
+    # of tripping the empty-host / port-range guards on its unset scalars.
+    proc runTest(): Future[string] {.async.} =
+      let ms = startMockServer()
+
+      proc handler() {.async.} =
+        try:
+          let st = await ms.accept()
+          await closeClient(st)
+        except CatchableError:
+          discard
+
+      discard handler()
+      var cfg = ConnConfig(
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+        connectTimeout: milliseconds(5000),
+      )
+      var outcome = ""
+      try:
+        try:
+          let conn =
+            await connectToHost(cfg, HostEntry(host: "127.0.0.1", port: ms.port))
+          await conn.close()
+          outcome = "connected"
+        except PgConfigError as e:
+          outcome = "config fault: " & e.msg
+        except CatchableError:
+          outcome = "dialed"
+      finally:
+        await closeServer(ms)
+      outcome
+
+    check waitFor(runTest()) == "dialed"
+
   test "garbage client certificate content fails":
     proc runTest(): Future[ProbeResult] {.async.} =
       let ms = startMockServer()

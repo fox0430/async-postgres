@@ -150,6 +150,8 @@ type
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
     requireAuth*: set[AuthMethod]
       ## Allowed auth methods; empty = any (libpq ``require_auth`` parity).
+      ## Cleartext password and MD5 are allowed by default; set this (e.g. to
+      ## ``{amScramSha256, amScramSha256Plus}``) to reject them.
     applicationName*: string
     connectTimeout*: Duration
       ## TCP connect timeout (default ``ZeroDuration`` = no timeout).
@@ -164,7 +166,9 @@ type
       ## Host ordering for multi-host connections (libpq `load_balance_hosts`);
       ## see `LoadBalanceHosts`. `lbhDisable` (default) preserves the configured
       ## order.
-    extraParams*: seq[(string, string)] ## Additional startup parameters
+    extraParams*: seq[(string, string)]
+      ## Additional StartupMessage parameters (unknown DSN keys land here).
+      ## Forwarded verbatim; treat as trusted config — typos are not rejected.
     maxMessageSize*: int
       ## Max backend message size (0 = 1 GiB default); larger → ``PgProtocolError``.
     maxScramIterations*: int
