@@ -591,7 +591,8 @@ suite "E2E: Notification Buffering":
       let listener = await connect(plainConfig())
       let sender = await connect(plainConfig())
 
-      listener.notifyMaxQueue = 0 # unbounded
+      listener.notifyMaxQueue = 0 # unbounded count
+      listener.notifyMaxQueueBytes = 0 # unbounded bytes
       await listener.listen("buf_unbounded")
 
       for i in 1 .. 20:
@@ -618,7 +619,8 @@ suite "E2E: Notification Buffering":
       let listener = await connect(plainConfig())
       let sender = await connect(plainConfig())
 
-      listener.notifyMaxQueue = 0 # unbounded
+      listener.notifyMaxQueue = 0 # unbounded count
+      listener.notifyMaxQueueBytes = 0 # unbounded bytes
       await listener.listen("buf_unbounded_wait")
 
       # Start waiting before any notification exists: exercises the

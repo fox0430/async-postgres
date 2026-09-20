@@ -119,6 +119,8 @@ export types.notifyDropped
 export types.listenError
 export types.notifyMaxQueue
 export types.`notifyMaxQueue=`
+export types.notifyMaxQueueBytes
+export types.`notifyMaxQueueBytes=`
 export types.listenReconnectMaxAttempts
 export types.`listenReconnectMaxAttempts=`
 export types.listenReconnectMaxBackoff

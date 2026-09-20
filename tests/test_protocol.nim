@@ -2083,6 +2083,112 @@ suite "enqueueNotification with an outstanding handoff":
     check conn.notifyQueue[1].payload == "new"
     check conn.notifyDropped == 1
 
+suite "enqueueNotification byte cap":
+  ## Dual of the count cap: drop-oldest on ``channel.len + payload.len``;
+  ## oversize is refused rather than wiping the backlog.
+  proc byteConn(maxBytes: int, maxQueue = 1024): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: csListening,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      notifyQueue: initDeque[Notification](),
+      notifyMaxQueue: maxQueue,
+      notifyMaxQueueBytes: maxBytes,
+      config: ConnConfig(),
+    )
+
+  proc n(payload: string, channel = "ch"): Notification =
+    Notification(pid: 1, channel: channel, payload: payload)
+
+  test "drop-oldest when queued channel+payload exceeds the byte cap":
+    let conn = byteConn(maxBytes = 10, maxQueue = 100)
+    conn.enqueueNotification(n("12345")) # "ch"+5 = 7
+    conn.enqueueNotification(n("67890")) # 7+7 > 10, drop first
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "67890"
+    check conn.notifyDropped == 1
+
+  test "a single notification larger than the byte cap is not queued":
+    let conn = byteConn(maxBytes = 10)
+    conn.enqueueNotification(n("tiny")) # 2+4 = 6, kept
+    var reported = -1
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(n("1234567890")) # 2+10 = 12 > 10, drop incoming
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "tiny"
+    check conn.notifyDropped == 1
+    check reported == 1
+
+  test "an oversized requeue is trimmed on the next arrival":
+    let conn = byteConn(maxBytes = 10)
+    conn.enqueueNotification(n("ok")) # 2+2 = 4
+    conn.requeueHandoff(n("1234567890")) # 12, no trim
+    check conn.notifyQueue.len == 2
+    check conn.notifyDropped == 0
+    conn.enqueueNotification(n("x")) # 3; overshoot 12 is dropped first
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "ok"
+    check conn.notifyQueue[1].payload == "x"
+    check conn.notifyDropped == 1
+
+  test "an oversized arrival still trims an overshot backlog and reports both":
+    let conn = byteConn(maxBytes = 10)
+    conn.enqueueNotification(n("tiny")) # 2+4 = 6
+    conn.requeueHandoff(n("1234567890")) # 2+10 = 12, no trim; at the front
+    check conn.notifyQueue.len == 2
+    var reported = -1
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(n("1234567890")) # 12 > 10, refused; overshoot trimmed first
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "tiny"
+    check conn.notifyDropped == 2
+    check reported == 2
+
+  test "byte cap <= 0 is unbounded while the count cap still binds":
+    let conn = byteConn(maxBytes = 0, maxQueue = 2)
+    conn.enqueueNotification(n("1"))
+    conn.enqueueNotification(n("2"))
+    conn.enqueueNotification(n("3"))
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "2"
+    check conn.notifyQueue[1].payload == "3"
+    check conn.notifyDropped == 1
+
+  test "count cap <= 0 is unbounded while the byte cap still binds":
+    let conn = byteConn(maxBytes = 10, maxQueue = 0)
+    conn.enqueueNotification(n("12345"))
+    conn.enqueueNotification(n("67890"))
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "67890"
+    check conn.notifyDropped == 1
+
+  test "a lowered byte cap is trimmed down on the next arrival":
+    let conn = byteConn(maxBytes = 100, maxQueue = 100)
+    conn.enqueueNotification(n("12345"))
+    conn.enqueueNotification(n("67890"))
+    check conn.notifyQueue.len == 2
+    conn.notifyMaxQueueBytes = 10
+    var reported = -1
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(n("12345")) # 7; both 7-byte entries must go
+    check reported == 2
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "12345"
+    check conn.notifyDropped == 2
+
+  test "an outstanding handoff is not charged against the byte cap":
+    let conn = byteConn(maxBytes = 7, maxQueue = 100)
+    conn.hasNotifyHandoff = true
+    conn.notifyHandoff = n("ABCDE") # 2+5 = 7 outstanding, must not count
+    conn.enqueueNotification(n("12345")) # 7, fills the cap by itself
+    check conn.notifyQueue.len == 1
+    check conn.notifyDropped == 0
+
 suite "waitNotification defensive branch":
   proc mockNotifyConn(): PgConnection =
     PgConnection(
