@@ -1518,13 +1518,15 @@ suite "applyParam multi-host":
         fail()
       check caughtBase
     block:
-      var caught: ref PgConfigError = nil
+      # Widen to `ref Exception` so `of PgError` is a runtime check (not CondTrue).
+      var caught: ref Exception = nil
       try:
         discard parseDsn("postgresql://host/db?sslmode=bogus")
       except PgConfigError as e:
         caught = e
       check caught != nil
       check (caught of PgError)
+      check (caught of PgConfigError)
 
 suite "DSN parse failures omit secret content":
   test "malformed percent-encoding in password reports offset/len, not content":

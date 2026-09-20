@@ -5445,7 +5445,12 @@ suite "Cursor handle fields are read-only":
     # Flipping `exhausted` would skip the portal Close (server-side leak) and
     # swapping `conn` would desynchronise the wire; reads keep working
     # through the accessors, so only writes are rejected.
-    var c: Cursor
+    # A live handle, not a nil ref: the accessor reads below dereference it.
+    var c = Cursor()
+    # Reads via the accessors must still compile and run; only writes are rejected.
+    discard c.exhausted
+    discard c.conn
+    discard c.fields
     check not compiles(c.exhausted = true)
     check not compiles(c.conn = nil)
     check not compiles(c.fields = newSeq[FieldDescription](0))

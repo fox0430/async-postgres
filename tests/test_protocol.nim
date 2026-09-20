@@ -1870,7 +1870,7 @@ suite "nextMessage onRow requires onRowError":
     conn.recvBuf = buildDataRowMsg(["hello"])
     conn.recvBufStart = 0
     var rd = newRowData(1)
-    let cb: RowCallback = proc(row: Row) {.gcsafe, raises: [CatchableError].} =
+    let cb: RowCallback = proc(row: Row) {.gcsafe, raises: [].} =
       discard
     expect PgProtocolError:
       discard conn.nextMessage(rd, onRow = cb)

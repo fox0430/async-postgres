@@ -7,27 +7,31 @@ import std/unittest
 import ../async_postgres/pg_errors
 
 suite "pg_errors hierarchy":
+  # Widen through `ref Exception` so `of` is a runtime check (not CondTrue/CondFalse).
+  template asExc(e: ref CatchableError): ref Exception =
+    e
+
   test "protocol and timeout errors are connection errors":
-    check (ref PgProtocolError)() of PgConnectionError
-    check (ref PgTimeoutError)() of PgConnectionError
-    check (ref PgListenError)() of PgConnectionError
+    check asExc((ref PgProtocolError)()) of PgConnectionError
+    check asExc((ref PgTimeoutError)()) of PgConnectionError
+    check asExc((ref PgListenError)()) of PgConnectionError
 
   test "state and config errors are siblings, not connection errors":
-    check (ref PgStateError)() of PgError
-    check (ref PgConfigError)() of PgError
-    check not ((ref PgStateError)() of PgConnectionError)
-    check not ((ref PgConfigError)() of PgConnectionError)
-    check (ref PgListenStoppedError)() of PgStateError
-    check not ((ref PgListenStoppedError)() of PgConnectionError)
+    check asExc((ref PgStateError)()) of PgError
+    check asExc((ref PgConfigError)()) of PgError
+    check not (asExc((ref PgStateError)()) of PgConnectionError)
+    check not (asExc((ref PgConfigError)()) of PgConnectionError)
+    check asExc((ref PgListenStoppedError)()) of PgStateError
+    check not (asExc((ref PgListenStoppedError)()) of PgConnectionError)
 
   test "type / message-size / query / pool sit under PgError":
-    check (ref PgTypeError)() of PgError
-    check (ref PgMessageTooLargeError)() of PgTypeError
-    check (ref PgQueryError)() of PgError
-    check (ref PgPoolError)() of PgError
-    check (ref PgNoRowsError)() of PgError
-    check (ref PgNullError)() of PgError
-    check (ref PgNotifyOverflowError)() of PgError
+    check asExc((ref PgTypeError)()) of PgError
+    check asExc((ref PgMessageTooLargeError)()) of PgTypeError
+    check asExc((ref PgQueryError)()) of PgError
+    check asExc((ref PgPoolError)()) of PgError
+    check asExc((ref PgNoRowsError)()) of PgError
+    check asExc((ref PgNullError)()) of PgError
+    check asExc((ref PgNotifyOverflowError)()) of PgError
 
   test "newPoolError records kind and optional parent":
     let parent = (ref ValueError)(msg: "boom")

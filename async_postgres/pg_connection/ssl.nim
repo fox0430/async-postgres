@@ -39,6 +39,8 @@ proc isIpLiteralHost(host: string): bool =
 
 when hasChronos:
   import chronos/streams/tlsstream
+  when not declared(getSelectedAlpnProtocol):
+    {.error: "the chronos backend requires chronos >= 4.4.0".}
   import ../pg_bearssl
 elif hasAsyncDispatch:
   import std/asyncnet
