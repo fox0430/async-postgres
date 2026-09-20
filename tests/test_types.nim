@@ -45,7 +45,6 @@ proc `==`(a, b: PositiveInt): bool {.borrow.}
 proc `==`(a, b: BigCount): bool {.borrow.}
 proc `==`(a, b: IsActive): bool {.borrow.}
 proc `==`(a, b: RatioF32): bool {.borrow.}
-proc `==`(a, b: EventAt): bool {.borrow.}
 proc `$`(v: UsPostalCode): string {.borrow.}
 proc `$`(v: SmallCount): string {.borrow.}
 proc `$`(v: PositiveInt): string {.borrow.}

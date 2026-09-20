@@ -1274,9 +1274,7 @@ proc toPgParam*(v: seq[PgTsQuery]): PgParam {.raises: [PgTypeError].} =
     elems[i] = string(x)
   textParam(OidTsQueryArray, encodeTsArrayText(elems, "tsquery array"), "tsquery array")
 
-proc toPgBinaryParam*[T](
-    v: seq[T]
-): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+proc toPgBinaryParam*[T](v: seq[T]): PgParam =
   toPgParam(v)
 
 proc toPgBinaryParam*(

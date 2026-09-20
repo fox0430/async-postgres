@@ -2,9 +2,9 @@ import std/[unittest, strutils, os]
 
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 
+import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_connection {.all.}
-import ../async_postgres/pg_connection/[ssl, types]
-# `{.all.}` for `oneLine`, the private helper behind the sslAllow error summary.
+import ../async_postgres/pg_connection/ssl {.all.}
 import ../async_postgres/pg_connection/lifecycle {.all.}
 
 import std/importutils
@@ -30,7 +30,6 @@ when hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
     import std/[dynlib, net, openssl, base64]
-    import ../async_postgres/pg_connection/ssl {.all.}
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
   result = @[byte(msgType)]

@@ -18,7 +18,7 @@
 ##       await lo.loSeek(0, SEEK_SET)
 ##       let readBack = await lo.loReadAll()
 
-import std/[macros, strutils, options]
+import std/[macros, options]
 
 import async_backend, pg_types, pg_protocol, pg_connection, pg_client
 import pg_connection/types
