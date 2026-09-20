@@ -3,31 +3,16 @@ import std/unittest
 import ../async_postgres
 
 # Compile-time probe: the aggregate `import ../async_postgres` must re-export
-# the documented public API surface. Every symbol individually re-exported by
-# `async_postgres.nim` / `pg_connection.nim` / `pg_client.nim` / `pg_types.nim`
-# is probed here, plus a representative subset of the modules that are still
-# re-exported wholesale (`pg_pool_cluster` / `pg_largeobject` /
-# `pg_advisory_lock` / `pg_sql` / `pg_replication` / `pg_auth` / `async_backend`
-# and the `pg_types` submodules `core` / `array` / `user_types` / `accessors` /
-# `ranges`). A forgotten whitelist entry fails the build instead of surfacing
-# downstream. The wholesale-module subset is not exhaustive: a symbol dropped
-# from a wholesale module outside this list stays undetected — extend the
-# probes when narrowing those modules.
+# the documented public API. Every individually re-exported hub symbol is
+# listed, plus a representative subset of wholesale modules. A forgotten
+# whitelist entry fails the build. The wholesale subset is not exhaustive.
 #
-# The existence check is scoped to the aggregate module
-# (`async_postgres.<name>`) rather than the bare `declared(name)`. A bare name
-# also resolves to std/system symbols (`close`, `items`, `len`, `reset`, ...),
-# so it would stay green even if the aggregate stopped re-exporting them.
-# Qualified lookup only sees the aggregate's own exported surface, so these
-# std-collision names are guarded just like everything else.
+# Lookup is `declared(async_postgres.<name>)`, not bare `declared(name)`, so
+# std collisions (`close`, `items`, …) cannot hide a missing re-export.
 #
-# The check is name visibility only: a whitelist entry re-exports every
-# overload of a symbol at once, so dropping a *single* overload inside a
-# submodule (rather than the whole name) is not caught by this probe. The same
-# caveat applies to the `nameAccessor`-generated getter families below: an
-# index-based overload under the same name keeps the probe green even if the
-# name-based overload is removed. The probes still catch a family row that
-# disappears entirely (macro table edit or module narrowing).
+# Name visibility only: dropping one overload of a shared name is not caught.
+# `nameAccessor` families share names with index getters, so `apiNameAccessor`
+# probes those by call shape.
 template apiExists(name: untyped) =
   when not declared(async_postgres.`name`):
     {.error: "aggregate import does not expose `" & astToStr(name) & "`".}
@@ -224,6 +209,7 @@ apiExists(close)
 # -- DSN
 apiExists(initConnConfig)
 apiExists(parseDsn)
+apiExists(validateConnConfig)
 
 # -- pipeline
 apiExists(newPipeline)
@@ -437,9 +423,6 @@ apiExists(TransportCloseStage)
 apiExists(NoticeCallback)
 apiExists(NotifyCallback)
 
-# -- symbol bound into user scope by the transaction macros (pg_client/transaction)
-apiExists(rollbackGrace)
-
 # -- large object API (pg_largeobject, wholesale export)
 apiExists(loCreate)
 apiExists(loOpen)
@@ -519,15 +502,41 @@ apiExists(writeConnection)
 apiExists(fallbackTimeout)
 apiExists(onReadFallback)
 
-# -- auth helpers (pg_auth, wholesale export)
-apiExists(md5AuthHash)
-apiExists(scramClientFirstMessage)
-apiExists(scramClientFinalMessage)
-apiExists(scramVerifyServerFinal)
-apiExists(scramEscapeUsername)
-apiExists(computeTlsServerEndpoint)
-apiExists(ScramState)
-apiExists(DefaultMaxScramIterations)
+# -- internals must not leak through the aggregate import.
+# Write `when declared(async_postgres.X)` out: a template that splices `X`
+# into `declared` always treats the parameter as declared.
+static:
+  when declared(async_postgres.markState):
+    {.error: "aggregate import must not expose internal `markState`".}
+  when declared(async_postgres.sendBuf):
+    {.error: "aggregate import must not expose internal `sendBuf`".}
+  when declared(async_postgres.queryDirectImpl):
+    {.error: "aggregate import must not expose internal `queryDirectImpl`".}
+  when declared(async_postgres.nameAccessor):
+    {.error: "aggregate import must not expose internal `nameAccessor`".}
+  when declared(async_postgres.optAccessor):
+    {.error: "aggregate import must not expose internal `optAccessor`".}
+  when declared(async_postgres.md5AuthHash):
+    {.error: "aggregate import must not expose internal `md5AuthHash`".}
+  when declared(async_postgres.ScramState):
+    {.error: "aggregate import must not expose internal `ScramState`".}
+  when declared(async_postgres.checkPgTimeFields):
+    {.error: "aggregate import must not expose internal `checkPgTimeFields`".}
+  when declared(async_postgres.parseSslMode):
+    {.error: "aggregate import must not expose internal `parseSslMode`".}
+  when declared(async_postgres.rollbackGrace):
+    {.error: "aggregate import must not expose internal `rollbackGrace`".}
+  when declared(async_postgres.PipelineOp):
+    {.error: "aggregate import must not expose internal `PipelineOp`".}
+  when declared(async_postgres.closeImpl):
+    {.error: "aggregate import must not expose internal `closeImpl`".}
+  # An `except`-ed enum type does not take its values with it.
+  when declared(async_postgres.pipOk):
+    {.error: "aggregate import must not expose internal `pipOk`".}
+  when declared(async_postgres.pipInvalid):
+    {.error: "aggregate import must not expose internal `pipInvalid`".}
+  when declared(async_postgres.pipOverflow):
+    {.error: "aggregate import must not expose internal `pipOverflow`".}
 
 # -- backend switches and helpers (async_backend, wholesale export)
 apiExists(hasChronos)
@@ -579,9 +588,7 @@ apiExists(encodeCompositeText)
 apiExists(encodeEnumTextArray)
 apiExists(encodeBinaryComposite)
 
-# -- name-based row accessors / range&multirange getters generated by `nameAccessor*`
-# -- (pg_types.nim): a removed family row here fails the build.
-# -- See the header comment for the index-overload caveat.
+# -- name-based row accessors generated by `nameAccessor*` (pg_types.nim).
 apiExists(getBit)
 apiExists(getBitArray)
 apiExists(getBitArrayOpt)
@@ -764,6 +771,35 @@ apiExists(getXml)
 apiExists(getXmlArray)
 apiExists(getXmlArrayOpt)
 apiExists(getXmlOpt)
+
+# -- name-based overload probes
+# Pins the `(Row, string)` overloads `nameAccessor` expands into `pg_types.nim`
+# (invisible to `tools/api_surface.nim`). One call per generator shape.
+var probeRow: Row ## Unused at runtime; needed to typecheck the probes.
+
+template apiNameAccessor(call: untyped) =
+  when not compiles((discard call)):
+    {.error: "aggregate import does not expose name-based `" & astToStr(call) & "`".}
+
+apiNameAccessor(probeRow.getInt("c"))
+apiNameAccessor(probeRow.getIntOpt("c"))
+apiNameAccessor(probeRow.getStrArray("c"))
+apiNameAccessor(probeRow.getStrArrayOpt("c"))
+apiNameAccessor(probeRow.getBoolArrayElemOpt("c"))
+apiNameAccessor(probeRow.getBoolArrayElemOptOpt("c"))
+apiNameAccessor(probeRow.getInt4Range("c"))
+apiNameAccessor(probeRow.getInt4Multirange("c"))
+apiNameAccessor(probeRow.getInt4RangeOpt("c"))
+apiNameAccessor(probeRow.getInt4MultirangeOpt("c"))
+apiNameAccessor(probeRow.getInt4RangeArray("c"))
+apiNameAccessor(probeRow.getInt4RangeArrayOpt("c"))
+apiNameAccessor(probeRow.getInt4MultirangeArray("c"))
+apiNameAccessor(probeRow.getInt4MultirangeArrayOpt("c"))
+apiNameAccessor(probeRow.getMoney("c", scale = 2))
+apiNameAccessor(probeRow.getMoney("c", PgMoneyConventions()))
+apiNameAccessor(probeRow.isNull("c"))
+apiNameAccessor(probeRow.getMoneyArrayND("c"))
+apiNameAccessor(probeRow.getMoneyArrayNDOpt("c"))
 
 # -- macro expansion probes
 #

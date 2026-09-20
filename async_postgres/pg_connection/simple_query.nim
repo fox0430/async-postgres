@@ -3,9 +3,7 @@
 ## ``quoteIdentifier``, and ``quoteLiteral``. Layer between ``buffer_io`` and
 ## ``lifecycle``.
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[options, strutils, tables]
 

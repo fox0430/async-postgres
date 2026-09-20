@@ -37,11 +37,9 @@
 ##                                  `to_regtype` (extension types like
 ##                                  `hstore`, `citext`, etc.).
 ##
-## What this hub re-exports is the public API. The submodules are internal:
-## Nim needs a `*` on anything a sibling module uses, so their exported sets are
-## wider than what the package promises, and importing one directly reaches
-## symbols that carry no compatibility guarantee. `tests/api_surface.golden`
-## freezes the whole exported set so a widening has to be reviewed.
+## What this hub re-exports is the public API. Submodules are internal: Nim
+## needs `*` for sibling use, so their exports are wider than the promised
+## surface (`tests/api_surface.public.golden` vs `.internal.golden`).
 
 import pg_errors
 import
@@ -133,6 +131,7 @@ export types.withTracing
 # `dsn` — the documented DSN entry points.
 export dsn.initConnConfig
 export dsn.parseDsn
+export dsn.validateConnConfig
 
 # `buffer_io` — public connection I/O and keepalive surface.
 export buffer_io.isUnixSocket

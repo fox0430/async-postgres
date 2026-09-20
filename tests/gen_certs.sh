@@ -4,12 +4,37 @@
 #
 # The server certificate has SAN entries for DNS:localhost and IP:127.0.0.1,
 # enabling both sslVerifyCa (IP) and sslVerifyFull (hostname) testing.
+# Existing files are reused unless REGENERATE=1.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CERT_DIR="${SCRIPT_DIR}/certs"
 mkdir -p "${CERT_DIR}"
+
+REQUIRED=(
+  ca.crt
+  server.crt
+  server.key
+  wrong_ca.crt
+  wrong_ca.key
+  encrypted.key
+)
+
+certs_present() {
+  local name
+  for name in "${REQUIRED[@]}"; do
+    if [[ ! -f "${CERT_DIR}/${name}" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+if [[ "${REGENERATE:-}" != "1" ]] && certs_present; then
+  echo "Using existing certificates in ${CERT_DIR}."
+  exit 0
+fi
 
 # --- CA ---
 openssl req -new -x509 -nodes \

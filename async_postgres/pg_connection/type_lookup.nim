@@ -9,13 +9,12 @@
 ##
 ## Re-exported through ``pg_connection.nim``.
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[options, tables]
 
 import ../[async_backend, pg_errors, pg_types]
+from ../pg_types/core import pgParseInt32
 import types, simple_query
 
 type TypeOidInfo* = tuple[oid: int32, arrayOid: int32]

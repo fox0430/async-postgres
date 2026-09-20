@@ -1,9 +1,7 @@
 ## Zero-allocation `queryDirect` / `execDirect` compile-time macros that
 ## encode parameters directly into the connection send buffer.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
 import std/[algorithm, macros, options, sets, tables]
 

@@ -1,9 +1,7 @@
 ## Transaction- and savepoint-scoping macros: `withTransaction`,
 ## `withSavepoint`, and their deadline-bounded variants.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
 import std/[macros, options]
 
@@ -745,8 +743,7 @@ const rollbackGrace* =
   ## Per-call timeout for ROLLBACK / RELEASE cleanup in `*Deadline` macros
   ## when the main deadline has expired. Bounds how long a failed-body
   ## cleanup can hold a connection. Derived from `rollbackGraceMs`.
-  ## Exported (with `*`) because `pg_pool`'s `withTransactionDeadline` macro
-  ## binds it via `bindSym` — treat as an internal knob, not user API.
+  ## Exported for `pg_pool`'s `bindSym` from a direct import — not user API.
 
 macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single

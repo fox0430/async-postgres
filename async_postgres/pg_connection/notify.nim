@@ -1,9 +1,7 @@
 ## LISTEN/NOTIFY: subscription API, pump with auto-reconnect, pull API, and
 ## the connection's callback registration (`onNotify`, `onNotice`, ...).
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[deques, options, sets]
 

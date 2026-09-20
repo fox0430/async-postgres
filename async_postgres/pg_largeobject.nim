@@ -21,6 +21,8 @@
 import std/[macros, options]
 
 import async_backend, pg_types, pg_protocol, pg_connection, pg_client
+from pg_types/core import
+  isPgUIntText, pgParseBiggestIntView, pipOk, pipInvalid, pipOverflow
 import pg_connection/types
 import pg_client/transaction
 
