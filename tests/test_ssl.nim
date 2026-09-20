@@ -3,7 +3,9 @@ import std/[unittest, strutils, os]
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 
 import ../async_postgres/pg_connection {.all.}
-import ../async_postgres/pg_connection/[ssl, lifecycle, types]
+import ../async_postgres/pg_connection/[ssl, types]
+# `{.all.}` for `oneLine`, the private helper behind the sslAllow error summary.
+import ../async_postgres/pg_connection/lifecycle {.all.}
 
 import std/importutils
 privateAccess(PgConnection)
@@ -996,6 +998,38 @@ suite "connect hand-built ConnConfig numeric validation":
     check not configFault
     check not connected
 
+suite "connect error aggregation":
+  # `oneLine` decides what survives into the combined sslAllow error. It has to
+  # flatten each failure onto one line — the next async traceback injection
+  # truncates the combined message at the first embedded one — but without
+  # throwing away the DETAIL/HINT lines `formatError` appends to every
+  # server-sourced error.
+
+  test "oneLine keeps DETAIL and HINT":
+    let msg =
+      "FATAL: password authentication failed for user \"x\" (SQLSTATE 28P01)\n" &
+      "DETAIL: Connection matched pg_hba.conf line 100\nHINT: check sslcert"
+    check oneLine(msg) ==
+      "FATAL: password authentication failed for user \"x\" (SQLSTATE 28P01) | " &
+      "DETAIL: Connection matched pg_hba.conf line 100 | HINT: check sslcert"
+
+  test "oneLine drops the async traceback asyncdispatch injects":
+    # Shape of `asyncfutures.injectStacktrace`: the original message, the
+    # header, the frame list, then an "Exception message:" echo of the same
+    # text. Everything from the header on has to go — including that echo,
+    # which would otherwise duplicate the message into the summary.
+    let original = "boom\nDETAIL: why"
+    let injected =
+      original & "\nAsync traceback:\n  lifecycle.nim(1) connect\n" &
+      "Exception message: " & original & "\nException type:"
+    check oneLine(injected) == "boom | DETAIL: why"
+
+  test "oneLine collapses blank lines and trailing whitespace":
+    check oneLine("a\n\n  b  \n") == "a | b"
+
+  test "oneLine leaves a single-line message alone":
+    check oneLine("connection refused") == "connection refused"
+
 suite "SSL negotiation - sslAllow":
   test "sslAllow connects without SSL when server accepts plaintext":
     var connState: PgConnState
@@ -1042,6 +1076,7 @@ suite "SSL negotiation - sslAllow":
     var msgHasSslMode = false
     var msgHasPlaintext = false
     var msgHasPgHba = false
+    var msgHasDetail = false
     var msgHasSslFallback = false
     var msgHasNoSslSupport = false
 
@@ -1062,6 +1097,12 @@ suite "SSL negotiation - sslAllow":
             body.add(0)
             body.add(byte('M'))
             for c in "no pg_hba.conf entry":
+              body.add(byte(c))
+            body.add(0)
+            # DETAIL lands on its own line in `formatError`; the summary below
+            # must not truncate the failure at the first newline.
+            body.add(byte('D'))
+            for c in "Connection matched pg_hba.conf line 100":
               body.add(byte(c))
             body.add(0)
             body.add(0) # terminator
@@ -1103,6 +1144,7 @@ suite "SSL negotiation - sslAllow":
         msgHasSslMode = "sslmode=allow" in e.msg
         msgHasPlaintext = "plaintext attempt failed" in e.msg
         msgHasPgHba = "no pg_hba.conf entry" in e.msg
+        msgHasDetail = "Connection matched pg_hba.conf line 100" in e.msg
         msgHasSslFallback = "SSL fallback failed" in e.msg
         msgHasNoSslSupport = "Server does not support SSL" in e.msg
 
@@ -1116,6 +1158,7 @@ suite "SSL negotiation - sslAllow":
     check msgHasSslMode
     check msgHasPlaintext
     check msgHasPgHba
+    check msgHasDetail
     check msgHasSslFallback
     check msgHasNoSslSupport
 

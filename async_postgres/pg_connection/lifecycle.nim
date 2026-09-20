@@ -20,6 +20,28 @@ when hasAsyncDispatch:
 import std/importutils
 privateAccess(PgConnection)
 
+# Error message helpers
+
+const AsyncTracebackMarker = "\nAsync traceback:"
+  ## Header asyncdispatch prepends to its injected traceback.
+
+proc oneLine(msg: string): string =
+  ## Collapse `msg` to one line, dropping the asyncdispatch traceback.
+  ## Cuts at the traceback marker so server DETAIL/HINT lines survive,
+  ## joined with " | ".
+  let cut = msg.find(AsyncTracebackMarker)
+  let body =
+    if cut >= 0:
+      msg[0 ..< cut]
+    else:
+      msg
+  var parts: seq[string]
+  for line in body.splitLines():
+    let stripped = line.strip()
+    if stripped.len > 0:
+      parts.add(stripped)
+  parts.join(" | ")
+
 # Authentication policy helpers
 
 proc enforceAuthAllowed(
@@ -169,10 +191,7 @@ proc connectToHost*(
     except CancelledError as e:
       raise e
     except CatchableError as e:
-      # Keep only the first line: asyncdispatch appends an async traceback and
-      # "Exception message:" prefix to e.msg, which would make the combined
-      # error below unreadable. Assumes PgConnectionError messages are single-line.
-      plainErrMsg = e.msg.split('\n')[0]
+      plainErrMsg = oneLine(e.msg)
 
     var sslConfig = config
     sslConfig.sslMode = sslRequire
@@ -181,7 +200,7 @@ proc connectToHost*(
     except CancelledError as e:
       raise e
     except CatchableError as e:
-      let sslErrMsg = e.msg.split('\n')[0]
+      let sslErrMsg = oneLine(e.msg)
       raise newException(
         PgConnectionError,
         "sslmode=allow: plaintext attempt failed (" & plainErrMsg &

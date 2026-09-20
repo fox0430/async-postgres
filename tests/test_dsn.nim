@@ -981,6 +981,25 @@ suite "parseDsn":
         "postgresql://host/db?sslmode=allow&sslcert=" & certPath & "&sslkey=" & keyPath
       )
 
+  test "the sslmode rejection names the libpq spelling, not the enum identifier":
+    # `$sslDisable` is "sslDisable", which is not a value anyone can write in a
+    # connection string: the message has to name something the user can act on.
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    for mode in ["disable", "allow"]:
+      try:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=" & mode & "&sslcert=" & certPath & "&sslkey=" &
+            keyPath
+        )
+        check false
+      except PgError as e:
+        check "(got " & mode & ")" in e.msg
+        check "ssl" & mode.capitalizeAscii notin e.msg
+
   when defined(posix):
     test "error: sslkey with group-readable permissions rejected":
       let certPath = writePemFile(dummyPem)
