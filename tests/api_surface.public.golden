@@ -494,6 +494,7 @@ async_postgres/pg_connection.nim	export types.TransportCloseStage
 async_postgres/pg_connection.nim	export types.`listenReconnectMaxAttempts=`
 async_postgres/pg_connection.nim	export types.`listenReconnectMaxBackoff=`
 async_postgres/pg_connection.nim	export types.`notifyMaxQueue=`
+async_postgres/pg_connection.nim	export types.`notifyMaxQueueBytes=`
 async_postgres/pg_connection.nim	export types.`stmtCacheCapacity=`
 async_postgres/pg_connection.nim	export types.config
 async_postgres/pg_connection.nim	export types.createdAt
@@ -505,6 +506,7 @@ async_postgres/pg_connection.nim	export types.listenReconnectMaxAttempts
 async_postgres/pg_connection.nim	export types.listenReconnectMaxBackoff
 async_postgres/pg_connection.nim	export types.notifyDropped
 async_postgres/pg_connection.nim	export types.notifyMaxQueue
+async_postgres/pg_connection.nim	export types.notifyMaxQueueBytes
 async_postgres/pg_connection.nim	export types.pid
 async_postgres/pg_connection.nim	export types.port
 async_postgres/pg_connection.nim	export types.serverParam
@@ -782,6 +784,7 @@ async_postgres/pg_connection/types.nim	TransportCloseStage.tcsTransport
 async_postgres/pg_connection/types.nim	`listenReconnectMaxAttempts=`
 async_postgres/pg_connection/types.nim	`listenReconnectMaxBackoff=`
 async_postgres/pg_connection/types.nim	`notifyMaxQueue=`
+async_postgres/pg_connection/types.nim	`notifyMaxQueueBytes=`
 async_postgres/pg_connection/types.nim	`stmtCacheCapacity=`
 async_postgres/pg_connection/types.nim	config
 async_postgres/pg_connection/types.nim	createdAt
@@ -793,6 +796,7 @@ async_postgres/pg_connection/types.nim	listenReconnectMaxAttempts
 async_postgres/pg_connection/types.nim	listenReconnectMaxBackoff
 async_postgres/pg_connection/types.nim	notifyDropped
 async_postgres/pg_connection/types.nim	notifyMaxQueue
+async_postgres/pg_connection/types.nim	notifyMaxQueueBytes
 async_postgres/pg_connection/types.nim	pid
 async_postgres/pg_connection/types.nim	port
 async_postgres/pg_connection/types.nim	serverParam

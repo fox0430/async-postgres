@@ -136,6 +136,8 @@ async_postgres/pg_connection/simple_query.nim	retireOnTimeout
 async_postgres/pg_connection/ssl.nim	negotiateSSL
 async_postgres/pg_connection/ssl.nim	sniName
 async_postgres/pg_connection/ssl.nim	validateDirectSslCompatible
+async_postgres/pg_connection/types.nim	DefaultNotifyMaxQueue
+async_postgres/pg_connection/types.nim	DefaultNotifyMaxQueueBytes
 async_postgres/pg_connection/types.nim	PgClosedReason
 async_postgres/pg_connection/types.nim	PgClosedReason.crClosed
 async_postgres/pg_connection/types.nim	PgClosedReason.crClosedByUser

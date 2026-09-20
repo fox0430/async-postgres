@@ -154,6 +154,7 @@ apiExists(serverParam)
 apiExists(notifyDropped)
 apiExists(listenError)
 apiExists(notifyMaxQueue)
+apiExists(notifyMaxQueueBytes)
 apiExists(listenReconnectMaxAttempts)
 apiExists(listenReconnectMaxBackoff)
 apiExists(stmtCacheCapacity)
@@ -872,6 +873,7 @@ proc probeConnAccessors(conn: PgConnection) {.used.} =
   discard conn.state
   discard conn.txStatus
   conn.notifyMaxQueue = conn.notifyMaxQueue
+  conn.notifyMaxQueueBytes = conn.notifyMaxQueueBytes
   conn.listenReconnectMaxAttempts = conn.listenReconnectMaxAttempts
   conn.listenReconnectMaxBackoff = conn.listenReconnectMaxBackoff
   conn.stmtCacheCapacity = conn.stmtCacheCapacity

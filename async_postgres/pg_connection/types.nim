@@ -31,9 +31,14 @@ else:
       "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
   .}
 
-const closedByUserMsg* = "Connection closed by the application"
-  ## Shared by `failNotifyWaiter` and `checkListenAlive` so a deliberate
-  ## `close()` reports the same thing whether a waiter was parked or not.
+const
+  closedByUserMsg* = "Connection closed by the application"
+    ## Shared by `failNotifyWaiter` and `checkListenAlive` so a deliberate
+    ## `close()` reports the same thing whether a waiter was parked or not.
+  DefaultNotifyMaxQueue* = 1024 ## Connect-time pull-API count cap.
+  DefaultNotifyMaxQueueBytes* = 16 * 1024 * 1024
+    ## Connect-time pull-API byte cap. 1024 × (channel + ≤8000-byte payload)
+    ## fits with headroom.
 
 var listenReconnectStopWaitMs* = 10_000
   ## Max wait (ms) for a listen pump stuck in a blocking `connect()`; it is
@@ -293,9 +298,12 @@ type
     config: ConnConfig
     notifyQueue: Deque[Notification]
     notifyMaxQueue: int
-      ## Pull-API queue cap (1024 default; <=0 = unbounded). A handoff and a
-      ## requeue of it sit outside the queue, so at most ``notifyMaxQueue + 1``
-      ## notifications are retained.
+      ## Pull-API count cap (`DefaultNotifyMaxQueue`; <=0 = unbounded). A
+      ## handoff and a requeue of it sit outside the queue, so at most
+      ## ``notifyMaxQueue + 1`` until the next arrival trims.
+    notifyMaxQueueBytes: int
+      ## Pull-API byte cap (`DefaultNotifyMaxQueueBytes`; <=0 = unbounded).
+      ## Queued ``channel.len + payload.len`` only; same overshoot as count.
     notifyWaiter: Future[void]
     notifyHandoff: Notification
       ## Reserved handoff for completed ``notifyWaiter`` (see ``hasNotifyHandoff``).
@@ -965,13 +973,22 @@ func listenError*(conn: PgConnection): ref PgListenError {.inline.} =
   conn.listenError
 
 func notifyMaxQueue*(conn: PgConnection): int {.inline.} =
-  ## Pull-API queue cap; see `notifyMaxQueue=`.
+  ## Pull-API count cap; see `notifyMaxQueue=`.
   conn.notifyMaxQueue
 
 proc `notifyMaxQueue=`*(conn: PgConnection, value: int) {.inline.} =
-  ## Cap the pull-API queue (1024 default; <=0 = unbounded). Overflow drops
-  ## the oldest entry and fires `onNotifyOverflow`.
+  ## Cap the pull-API queue by count (1024 default; <=0 = unbounded count).
+  ## Overflow drops the oldest entry and fires `onNotifyOverflow`.
   conn.notifyMaxQueue = value
+
+func notifyMaxQueueBytes*(conn: PgConnection): int {.inline.} =
+  ## Pull-API byte cap; see `notifyMaxQueueBytes=`.
+  conn.notifyMaxQueueBytes
+
+proc `notifyMaxQueueBytes=`*(conn: PgConnection, value: int) {.inline.} =
+  ## Cap queued ``channel.len + payload.len`` (16 MiB default; <=0 = unbounded).
+  ## Overflow drops oldest; a notification larger than the cap is not queued.
+  conn.notifyMaxQueueBytes = value
 
 func listenReconnectMaxAttempts*(conn: PgConnection): int {.inline.} =
   ## Reconnect attempt budget; see `listenReconnectMaxAttempts=`.

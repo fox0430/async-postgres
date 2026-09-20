@@ -108,17 +108,59 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
 
 # Notification / notice dispatch
 
+func notifyEntryBytes(n: Notification): int64 {.inline.} =
+  n.channel.len.int64 + n.payload.len.int64
+
+proc noteNotifyDrop(conn: PgConnection, droppedNow: var int) {.inline, raises: [].} =
+  if conn.notifyDropped < high(int): # saturating; reset once reported
+    conn.notifyDropped.inc
+  droppedNow.inc
+
+proc dropOldestNotification(
+    conn: PgConnection, queuedBytes: var int64, droppedNow: var int
+) {.inline, raises: [].} =
+  let oldest = conn.notifyQueue.popFirst()
+  queuedBytes -= notifyEntryBytes(oldest)
+  if queuedBytes < 0:
+    queuedBytes = 0
+  conn.noteNotifyDrop(droppedNow)
+
 proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].} =
-  ## Enqueue under ``notifyMaxQueue`` (<=0 = unbounded); drop oldest on overflow.
-  # The cap counts queued notifications only: an outstanding handoff belongs to a
-  # waiter about to consume it, and charging it here would shrink the depth by one.
+  ## Enqueue under ``notifyMaxQueue`` and ``notifyMaxQueueBytes`` (either
+  ## ``<=0`` = unbounded). Overflow drops oldest; oversize is not queued.
+  ## Push ``onNotify`` still sees every arrival.
+  # Caps queued entries only: an outstanding handoff is already claimed.
   var droppedNow = 0
-  if conn.notifyMaxQueue > 0:
-    while conn.notifyQueue.len >= conn.notifyMaxQueue:
-      discard conn.notifyQueue.popFirst()
-      if conn.notifyDropped < high(int): # saturating; reset once reported
-        conn.notifyDropped.inc
-      droppedNow.inc
+  let incoming = notifyEntryBytes(notif)
+  let maxN = conn.notifyMaxQueue
+  let maxB = conn.notifyMaxQueueBytes
+  var queuedBytes: int64 = 0
+  if maxB > 0:
+    for n in conn.notifyQueue:
+      queuedBytes += notifyEntryBytes(n)
+
+  # Trim a requeued overshoot before considering the arrival.
+  if maxN > 0 or maxB > 0:
+    while conn.notifyQueue.len > 0:
+      let countOver = maxN > 0 and conn.notifyQueue.len > maxN
+      let bytesOver = maxB > 0 and queuedBytes > maxB.int64
+      if not countOver and not bytesOver:
+        break
+      conn.dropOldestNotification(queuedBytes, droppedNow)
+
+  if maxB > 0 and incoming > maxB.int64:
+    conn.noteNotifyDrop(droppedNow)
+    if droppedNow > 0 and conn.notifyOverflowCallback != nil:
+      conn.notifyOverflowCallback(droppedNow)
+    return
+
+  while conn.notifyQueue.len > 0:
+    let countFull = maxN > 0 and conn.notifyQueue.len >= maxN
+    let bytesFull = maxB > 0 and queuedBytes + incoming > maxB.int64
+    if not countFull and not bytesFull:
+      break
+    conn.dropOldestNotification(queuedBytes, droppedNow)
+
   conn.notifyQueue.addLast(notif)
   if droppedNow > 0 and conn.notifyOverflowCallback != nil:
     conn.notifyOverflowCallback(droppedNow)
