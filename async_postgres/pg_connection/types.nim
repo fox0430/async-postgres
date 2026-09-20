@@ -622,6 +622,16 @@ proc warnStderr*(msg: string) =
   except IOError:
     discard
 
+func dsnName(mode: SslMode): string {.inline.} =
+  ## libpq `sslmode=` spelling of `mode` for error messages.
+  case mode
+  of sslDisable: "disable"
+  of sslAllow: "allow"
+  of sslPrefer: "prefer"
+  of sslRequire: "require"
+  of sslVerifyCa: "verify-ca"
+  of sslVerifyFull: "verify-full"
+
 proc validateClientCertConfig*(config: ConnConfig) =
   ## Reject inconsistent client certificate configurations early (at config
   ## build time, before any connection is opened). Both halves of an mTLS
@@ -633,8 +643,8 @@ proc validateClientCertConfig*(config: ConnConfig) =
       config.sslMode in {sslDisable, sslAllow}:
     raise newException(
       PgConfigError,
-      "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
-        "); they would otherwise be silently unused",
+      "sslcert/sslkey require sslmode of prefer or stronger (got " &
+        config.sslMode.dsnName & "); they would otherwise be silently unused",
     )
 
 # HostEntry accessors
