@@ -1,8 +1,6 @@
 ## Named server-side prepared statements: `prepare`, `execute`, and `close`.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
 import std/[options]
 

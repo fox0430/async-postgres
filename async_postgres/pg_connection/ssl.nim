@@ -13,9 +13,7 @@
 ##   trust anchors written to a temp file and `SSL_get_peer_certificate` used
 ##   for channel binding.
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[net, strutils]
 import ../[async_backend, pg_errors, pg_protocol, pg_types]
@@ -57,20 +55,20 @@ when hasAsyncDispatch and defined(ssl):
     ## Length-prefixed wire form for `SSL_CTX_set_alpn_protos` (RFC 7301 §3.1).
 
   const
-    sslCtrlSetMinProtoVersion* = 123
+    sslCtrlSetMinProtoVersion = 123
       ## OpenSSL `SSL_CTRL_SET_MIN_PROTO_VERSION` (1.1.0+); a 0 return means the
       ## control is unsupported and the NO_* mask fallback applies.
-    sslTls12Version* = 0x0303
+    sslTls12Version = 0x0303
       ## Wire value of TLS 1.2, the minimum version enforced by `establishTls`.
-    sslOpNoSslv2* = 0x01000000'i64
+    sslOpNoSslv2 = 0x01000000'i64
       ## OpenSSL `SSL_OP_NO_SSLv2` (bit 24). 1.1.0+ removed SSLv2 (value 0);
       ## 1.0.x still honors the mask, which is when this fallback runs.
-    sslOpNoTlsv11* = 0x10000000'i64
+    sslOpNoTlsv11 = 0x10000000'i64
       ## OpenSSL `SSL_OP_NO_TLSv1_1` (bit 28). std/openssl misdefines it as
       ## bit 27 (`SSL_OP_NO_TLSv1_2`); shadow it so the fallback mask disables
       ## TLS 1.1 and below.
 
-  proc enforceTls12Minimum*(ctx: SslCtx): bool =
+  proc enforceTls12Minimum(ctx: SslCtx): bool =
     ## Enforce TLS 1.2+. Returns true if min-version control ran.
     let minVersionSet =
       SSL_CTX_ctrl(ctx, sslCtrlSetMinProtoVersion, sslTls12Version, nil)
@@ -121,17 +119,17 @@ when hasAsyncDispatch and defined(ssl):
   let
     sslDynlib = loadLibPattern(DLLSSLName)
     utilDynlib = loadLibPattern(DLLUtilName)
-    sslSet1Host* = cast[SslSet1HostFn](resolveSym(sslDynlib, "SSL_set1_host"))
-    sslGet0Param* = cast[SslGet0ParamFn](resolveSym(sslDynlib, "SSL_get0_param"))
-    x509VerifyParamSet1IpAsc* =
+    sslSet1Host = cast[SslSet1HostFn](resolveSym(sslDynlib, "SSL_set1_host"))
+    sslGet0Param = cast[SslGet0ParamFn](resolveSym(sslDynlib, "SSL_get0_param"))
+    x509VerifyParamSet1IpAsc =
       cast[X509SetIpAscFn](resolveSym(utilDynlib, "X509_VERIFY_PARAM_set1_ip_asc"))
-    sslGetRbio* = cast[SslGetBioFn](resolveSym(sslDynlib, "SSL_get_rbio"))
-    sslGetWbio* = cast[SslGetBioFn](resolveSym(sslDynlib, "SSL_get_wbio"))
-    sslGet0AlpnSelected* =
+    sslGetRbio = cast[SslGetBioFn](resolveSym(sslDynlib, "SSL_get_rbio"))
+    sslGetWbio = cast[SslGetBioFn](resolveSym(sslDynlib, "SSL_get_wbio"))
+    sslGet0AlpnSelected =
       cast[SslGet0AlpnSelectedFn](resolveSym(sslDynlib, "SSL_get0_alpn_selected"))
-    sslCtxSetAlpnProtos* =
+    sslCtxSetAlpnProtos =
       cast[SslCtxSetAlpnProtosFn](resolveSym(sslDynlib, "SSL_CTX_set_alpn_protos"))
-    sslCtxSetDefaultPasswdCb* = cast[SslCtxSetDefaultPasswdCbFn](resolveSym(
+    sslCtxSetDefaultPasswdCb = cast[SslCtxSetDefaultPasswdCbFn](resolveSym(
       sslDynlib, "SSL_CTX_set_default_passwd_cb"
     ))
 

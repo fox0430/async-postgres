@@ -3,8 +3,14 @@ import std/[json, macros, options, times]
 import pg_protocol
 import pg_types/[core, array, encoding, decoding, accessors, user_types, ranges]
 
-# `core` — the stable type-conversion API; exported wholesale.
-export core
+# `core` — promised type-conversion API. Grammar helpers stay `*` for sibling
+# decoders; list enum values too (`except PgIntParse` still leaves `pipOk`).
+export core except
+  PgIntParse, pipOk, pipInvalid, pipOverflow, checkPgTimeFields, checkPgTimeTzOffset,
+  isPgHexText, isPgIntText, isPgUIntText, pgParseBiggestInt, pgParseBiggestIntView,
+  pgParseFloat, pgParseFloat32, pgParseHexInt, pgParseHexUInt32, pgParseInt,
+  pgParseInt16, pgParseInt32, pgParseIntView, pgParseUIntField, parsePgBoolText,
+  pgTypeErrorOnValueError
 # `array` (PgArray + shape validation) and `user_types` (enum/composite/domain
 # macros) likewise expose only public API.
 export array
@@ -53,9 +59,9 @@ export decoding.parsePointText
 export decoding.parsePointsText
 export decoding.parseTextArray
 
-# `accessors` — typed row accessors and query-result helpers; its internals
-# were privatised in the module itself.
-export accessors
+# `accessors` — typed row accessors and query-result helpers. The codegen
+# templates are sibling-only (expanded from this file and `ranges.nim`).
+export accessors except nameAccessor, optAccessor
 
 # `ranges` — range/multirange construction and typed parameters; the raw
 # binary decoders were privatised in the module itself.

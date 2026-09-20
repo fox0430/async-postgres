@@ -111,15 +111,14 @@ export copy.copyInStream
 export copy.copyOut
 export copy.copyOutStream
 
-# `transaction` — transaction/savepoint scoping macros. `rollbackGrace` is
-# re-exported because pg_pool's deadline macros resolve it via `bindSym`.
+# `transaction` — scoping macros. `rollbackGrace` stays in the submodule
+# for `pg_pool`'s `bindSym`.
 export transaction.withTransaction
 export transaction.withTransactionRetry
 export transaction.withSavepoint
 export transaction.withTransactionDeadline
 export transaction.withTransactionRetryDeadline
 export transaction.withSavepointDeadline
-export transaction.rollbackGrace
 
 # `transaction_helpers` — the two in-transaction convenience helpers.
 export transaction_helpers.execInTransaction

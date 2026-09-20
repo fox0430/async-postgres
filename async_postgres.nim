@@ -122,7 +122,6 @@
 ## - `pg_pool_cluster <async_postgres/pg_pool_cluster.html>`_ — Read replica pool cluster with automatic query routing
 ## - `pg_types <async_postgres/pg_types.html>`_ — Type conversions (``toPgParam``, row accessors, arrays, ranges, composites, enums)
 ## - `pg_protocol <async_postgres/pg_protocol.html>`_ — Wire protocol encoding/decoding
-## - `pg_auth <async_postgres/pg_auth.html>`_ — MD5 and SCRAM-SHA-256 authentication
 ## - `pg_largeobject <async_postgres/pg_largeobject.html>`_ — Large Object API for streaming binary data
 ## - `pg_advisory_lock <async_postgres/pg_advisory_lock.html>`_ — Advisory lock API (session/transaction, exclusive/shared)
 ## - `pg_replication <async_postgres/pg_replication.html>`_ — Logical replication streaming with pgoutput decoder
@@ -132,19 +131,20 @@
 ## above. Importing a submodule directly (e.g.
 ## ``async_postgres/pg_connection/types``) is unsupported and carries no
 ## compatibility guarantee; only the re-exported surface is covered by
-## semantic versioning.
+## semantic versioning. Promised vs sibling ``*`` exports are frozen in
+## ``tests/api_surface.{public,internal}.golden``.
 
 import
   async_postgres/[
-    async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
+    async_backend, pg_protocol, pg_types, pg_connection, pg_client, pg_pool,
     pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication,
   ]
 
 # `pg_types`/`pg_connection`/`pg_client` whitelist themselves; the other
-# modules expose only their public API surface.
+# modules expose only their public API surface. `pg_auth` is sibling plumbing
+# (SCRAM/MD5) and is not re-exported.
 export pg_types, pg_connection, pg_client
 export pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication
-export pg_auth
 
 # `pg_pool` — public pool API (internal gauges/helpers stay in the module).
 export pg_pool.PoolConfig

@@ -1,5 +1,6 @@
 import std/[unittest, strutils, os]
 
+import cert_fixtures
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 
 import ../async_postgres/pg_connection {.all.}
@@ -24,6 +25,8 @@ when hasChronos:
   import bearssl/abi/bearssl_ssl as bssl
 
 proc testCaCert(): string =
+  doAssert ensureTestCerts(),
+    "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
   readFile(currentSourcePath().parentDir / "certs" / "ca.crt")
 
 when hasAsyncDispatch:
@@ -1941,56 +1944,59 @@ when hasAsyncDispatch and defined(ssl):
           sock.close()
 
     test "peer certificate is available on client after handshake":
-      let certDir = currentSourcePath().parentDir / "certs"
-      var peerCertOk = false
-      var serverGotAppByte = false
+      if not ensureTestCerts():
+        skip()
+      else:
+        let certDir = currentSourcePath().parentDir / "certs"
+        var peerCertOk = false
+        var serverGotAppByte = false
 
-      proc testBody() {.async.} =
-        let listener = newAsyncSocket(buffered = false)
-        listener.setSockOpt(OptReuseAddr, true)
-        listener.bindAddr(Port(0))
-        let port = listener.getLocalAddr()[1]
-        listener.listen()
+        proc testBody() {.async.} =
+          let listener = newAsyncSocket(buffered = false)
+          listener.setSockOpt(OptReuseAddr, true)
+          listener.bindAddr(Port(0))
+          let port = listener.getLocalAddr()[1]
+          listener.listen()
 
-        proc serverSide() {.async.} =
-          let s = await listener.accept()
+          proc serverSide() {.async.} =
+            let s = await listener.accept()
+            try:
+              let serverCtx = newContext(
+                verifyMode = CVerifyNone,
+                certFile = certDir / "server.crt",
+                keyFile = certDir / "server.key",
+              )
+              wrapConnectedSocket(serverCtx, s, handshakeAsServer)
+              # asyncnet's sslLoop drives the server-side handshake inside recv,
+              # then delivers the one application byte the client sends below.
+              let data = await s.recv(1)
+              serverGotAppByte = data.len == 1
+            finally:
+              s.close()
+
+          let serverFut = serverSide()
+
+          let c = newAsyncSocket(buffered = false)
+          await c.connect("127.0.0.1", port)
           try:
-            let serverCtx = newContext(
-              verifyMode = CVerifyNone,
-              certFile = certDir / "server.crt",
-              keyFile = certDir / "server.key",
-            )
-            wrapConnectedSocket(serverCtx, s, handshakeAsServer)
-            # asyncnet's sslLoop drives the server-side handshake inside recv,
-            # then delivers the one application byte the client sends below.
-            let data = await s.recv(1)
-            serverGotAppByte = data.len == 1
+            let clientCtx = newContext(verifyMode = CVerifyNone)
+            wrapConnectedSocket(clientCtx, c, handshakeAsClient)
+            await driveTlsHandshake(c)
+            let peer = SSL_get_peer_certificate(c.sslHandle)
+            peerCertOk = peer != nil
+            if peer != nil:
+              X509_free(peer)
+            # Unblock the server's `recv(1)` so its future completes.
+            await c.send(" ")
           finally:
-            s.close()
+            c.close()
 
-        let serverFut = serverSide()
+          await serverFut
+          listener.close()
 
-        let c = newAsyncSocket(buffered = false)
-        await c.connect("127.0.0.1", port)
-        try:
-          let clientCtx = newContext(verifyMode = CVerifyNone)
-          wrapConnectedSocket(clientCtx, c, handshakeAsClient)
-          await driveTlsHandshake(c)
-          let peer = SSL_get_peer_certificate(c.sslHandle)
-          peerCertOk = peer != nil
-          if peer != nil:
-            X509_free(peer)
-          # Unblock the server's `recv(1)` so its future completes.
-          await c.send(" ")
-        finally:
-          c.close()
-
-        await serverFut
-        listener.close()
-
-      waitFor testBody()
-      check peerCertOk
-      check serverGotAppByte
+        waitFor testBody()
+        check peerCertOk
+        check serverGotAppByte
 
 when hasChronos:
   suite "reconnectInPlace X509 capture rebind":

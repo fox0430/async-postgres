@@ -1,8 +1,6 @@
 ## Shared building blocks for ``pg_connection`` submodules (``PgConnection``, ``ConnConfig``, tracing).
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[tables, sets, deques, lists]
 when defined(posix):

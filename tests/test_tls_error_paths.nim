@@ -1,5 +1,6 @@
-import std/[net, os, osproc, strutils, unittest]
+import std/[net, os, osproc, streams, strutils, unittest]
 
+import cert_fixtures
 import ../async_postgres/[async_backend, pg_connection, pg_errors]
 import mock_pg_server
 
@@ -19,6 +20,8 @@ proc testConfig(port: int, mode: SslMode, sslNegotiation = sslnPostgres): ConnCo
   )
 
 proc readCert(name: string): string =
+  doAssert ensureTestCerts(),
+    "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
   readFile(CertDir / name)
 
 proc startSslProbe(ms: MockServer, closeAfterReply: bool) =
@@ -373,6 +376,9 @@ suite "direct SSL: ALPN enforcement":
     ## Returns the client's error message, or a descriptive message when the
     ## server exits early (e.g. bind failure) so the caller's check fails
     ## loudly instead of after the full retry window.
+    if not ensureTestCerts():
+      return
+        "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
     let port = ephemeralPort()
     let p = startProcess(
       opensslPath,
@@ -399,9 +405,16 @@ suite "direct SSL: ALPN enforcement":
       for attempt in 0 ..< 30:
         let exitCode = p.peekExitCode()
         if exitCode != -1:
+          var extra = ""
+          try:
+            extra = p.outputStream.readAll().strip()
+          except CatchableError:
+            discard
           msg =
             "openssl s_server exited before accepting connections (port " & $port &
             ", exit code " & $exitCode & ")"
+          if extra.len > 0:
+            msg.add(": " & extra)
           break
         try:
           let conn = await connect(testConfig(port, sslRequire, sslnDirect))

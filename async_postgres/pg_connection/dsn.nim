@@ -9,13 +9,11 @@
 ## forwarded verbatim. Sanitize before ``parseDsn`` if it is not under your
 ## control.
 ##
-## Only `initConnConfig` / `parseDsn` are re-exported through `pg_connection.nim`;
-## the intermediate parsers stay here. Depends only on `types.nim` (does not
-## touch `PgConnection`).
+## Only `initConnConfig` / `parseDsn` / `validateConnConfig` are re-exported
+## through `pg_connection.nim`; the intermediate parsers stay here. Depends
+## only on `types.nim` (does not touch `PgConnection`).
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/strutils
 when defined(posix):
@@ -28,7 +26,7 @@ const MaxPemFileBytes = 4 * 1024 * 1024
   ## Cap for sslrootcert / sslcert / sslkey file reads (DoS bound; cert chains
   ## fit comfortably under this).
 
-proc parseSslMode*(s: string): SslMode =
+proc parseSslMode(s: string): SslMode =
   case s
   of "disable":
     sslDisable
@@ -45,7 +43,7 @@ proc parseSslMode*(s: string): SslMode =
   else:
     raise newException(PgConfigError, "Invalid sslmode (len=" & $s.len & ")")
 
-proc parseChannelBindingMode*(s: string): ChannelBindingMode =
+proc parseChannelBindingMode(s: string): ChannelBindingMode =
   case s
   of "disable":
     cbDisable
@@ -56,7 +54,7 @@ proc parseChannelBindingMode*(s: string): ChannelBindingMode =
   else:
     raise newException(PgConfigError, "Invalid channel_binding (len=" & $s.len & ")")
 
-proc parseSslNegotiation*(s: string): SslNegotiation =
+proc parseSslNegotiation(s: string): SslNegotiation =
   case s
   of "postgres":
     sslnPostgres
@@ -65,7 +63,7 @@ proc parseSslNegotiation*(s: string): SslNegotiation =
   else:
     raise newException(PgConfigError, "Invalid sslnegotiation (len=" & $s.len & ")")
 
-proc parseAuthMethod*(s: string): AuthMethod =
+proc parseAuthMethod(s: string): AuthMethod =
   case s
   of "none":
     amNone
@@ -81,7 +79,7 @@ proc parseAuthMethod*(s: string): AuthMethod =
     raise
       newException(PgConfigError, "Invalid require_auth method (len=" & $s.len & ")")
 
-proc parseRequireAuth*(s: string): set[AuthMethod] =
+proc parseRequireAuth(s: string): set[AuthMethod] =
   ## Parse a comma-separated list of auth method names into a set
   ## (libpq `require_auth` syntax; negation prefix `!` is not yet supported).
   ## Empty input returns the empty set (allow any).
@@ -95,7 +93,7 @@ proc parseRequireAuth*(s: string): set[AuthMethod] =
       )
     result.incl(parseAuthMethod(tok))
 
-proc parseTargetSessionAttrs*(s: string): TargetSessionAttrs =
+proc parseTargetSessionAttrs(s: string): TargetSessionAttrs =
   case s
   of "any":
     tsaAny
@@ -113,7 +111,7 @@ proc parseTargetSessionAttrs*(s: string): TargetSessionAttrs =
     raise
       newException(PgConfigError, "Invalid target_session_attrs (len=" & $s.len & ")")
 
-proc parseLoadBalanceHosts*(s: string): LoadBalanceHosts =
+proc parseLoadBalanceHosts(s: string): LoadBalanceHosts =
   case s
   of "disable":
     lbhDisable
@@ -132,7 +130,7 @@ proc parseDsnInt(val, label: string): int =
   except ValueError:
     raise newException(PgConfigError, "Invalid " & label & " (len=" & $val.len & ")")
 
-proc parsePort*(s: string): int =
+proc parsePort(s: string): int =
   ## Follows libpq's strtol-based rules: surrounding whitespace and a leading
   ## sign are accepted (libpq takes `+5432` too), digit-group underscores are
   ## not, and the final value must be in 1–65535.
@@ -444,7 +442,7 @@ const maxSockOptInt = int64(high(cint))
   ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
   ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
 
-proc applyParam*(result: var ConnConfig, key, val: string) =
+proc applyParam(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
   ##
   ## `host`/`hostaddr`/`port` accept comma-separated multi-host lists and
@@ -571,7 +569,7 @@ proc applyParam*(result: var ConnConfig, key, val: string) =
   else:
     result.extraParams.add((key, val))
 
-proc parseKeyValueDsn*(dsn: string): ConnConfig =
+proc parseKeyValueDsn(dsn: string): ConnConfig =
   ## Parse a libpq keyword=value connection string into a ConnConfig.
   ##
   ## Format: ``host=localhost port=5432 dbname=test user=myuser``
@@ -722,7 +720,7 @@ proc pctDecode(s: string, field: string): string =
       result.add s[i]
       inc i
 
-proc parseUriDsn*(dsn: string): ConnConfig =
+proc parseUriDsn(dsn: string): ConnConfig =
   ## Parse a PostgreSQL URI connection string into a ConnConfig.
   result.keepAlive = true
   result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
