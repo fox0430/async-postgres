@@ -201,6 +201,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
         var reconnected = false
         var backoff = 1
         var attempt = 0
+        var lastRetryErr = ""
         while (unlimited or attempt < maxAttempts) and not conn.listenStopRequested:
           try:
             # Interruptible backoff: tick-based stop check.
@@ -222,18 +223,20 @@ proc listenPump*(conn: PgConnection) {.async.} =
             break
           except CancelledError:
             return
-          except CatchableError:
+          except CatchableError as retryErr:
+            lastRetryErr = retryErr.msg
             backoff = min(backoff * 2, maxBackoff)
           inc attempt
         if conn.listenStopRequested:
           conn.markClosed()
           return
         if not reconnected:
-          conn.notifyListenDeath(
+          var deathMsg =
             "Listen connection lost (" & e.msg & "): reconnection failed after " &
-              $maxAttempts & " attempts",
-            true,
-          )
+            $maxAttempts & " attempts"
+          if lastRetryErr.len > 0:
+            deathMsg.add("; last attempt: " & lastRetryErr)
+          conn.notifyListenDeath(deathMsg, true)
           return
       finally:
         conn.listenReconnecting = false

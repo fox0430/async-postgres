@@ -88,8 +88,7 @@ proc queryInTransactionImpl(
       discard
   do:
     if queryError != nil:
-      # ROLLBACK a failed transaction, swallowing any failure so it cannot
-      # mask the query error; the outer wait(timeout) bounds the cleanup.
+      # ROLLBACK without masking the query error; report failure via onCleanupSkipped.
       if conn.txStatus == tsInFailedTransaction:
         try:
           discard await conn.simpleExec("ROLLBACK")
@@ -97,8 +96,8 @@ proc queryInTransactionImpl(
           # Don't swallow cancellation (e.g. the outer wait(timeout)
           # cancelling this future under chronos) — propagate it.
           raise e
-        except CatchableError:
-          discard
+        except CatchableError as rollbackErr:
+          conn.fireCleanupSkipped(ckTxRollback, csrCleanupFailed, rollbackErr)
 
   return qr
 
