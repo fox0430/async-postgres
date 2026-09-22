@@ -107,6 +107,8 @@ when hasAsyncDispatch and defined(ssl):
     .}
     SslCtxSetDefaultPasswdCbFn =
       proc(ctx: SslCtx, cb: pem_password_cb) {.cdecl, gcsafe, raises: [].}
+    SslGetPeerCertificateFn = proc(ssl: SslPtr): PX509 {.cdecl, gcsafe, raises: [].}
+    X509FreeFn = proc(cert: PX509) {.cdecl, gcsafe, raises: [].}
 
   # Apple's system libssl/libcrypto omit some of these symbols; an eager
   # `{.dynlib.}` binding would abort the process at startup. Resolve via
@@ -117,6 +119,13 @@ when hasAsyncDispatch and defined(ssl):
       nil
     else:
       symAddr(lib, symbol)
+
+  proc resolveFirstSym(lib: LibHandle, primary, fallback: string): pointer =
+    ## OpenSSL 3 renamed `SSL_get_peer_certificate` to
+    ## `SSL_get1_peer_certificate`.
+    result = resolveSym(lib, primary)
+    if result == nil:
+      result = resolveSym(lib, fallback)
 
   let
     sslDynlib = loadLibPattern(DLLSSLName)
@@ -134,6 +143,12 @@ when hasAsyncDispatch and defined(ssl):
     sslCtxSetDefaultPasswdCb = cast[SslCtxSetDefaultPasswdCbFn](resolveSym(
       sslDynlib, "SSL_CTX_set_default_passwd_cb"
     ))
+    # std/openssl intentionally omits these declarations on Windows. Resolve
+    # them ourselves so Windows keeps SCRAM-SHA-256-PLUS channel binding.
+    sslGetPeerCertificate = cast[SslGetPeerCertificateFn](resolveFirstSym(
+      sslDynlib, "SSL_get1_peer_certificate", "SSL_get_peer_certificate"
+    ))
+    x509Free = cast[X509FreeFn](resolveSym(utilDynlib, "X509_free"))
 
   proc failPemPassphrase(
       buf: cstring, size, rwflag: cint, userdata: pointer
@@ -590,18 +605,21 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         # If unavailable, cbPrefer silently falls back to SCRAM-SHA-256 — warn
         # so the loss of channel binding is observable. (cbRequire is enforced
         # in selectScramMechanism.)
-        let peerCert = SSL_get_peer_certificate(conn.socket.sslHandle)
-        if peerCert != nil:
-          try:
-            let derStr = i2d_X509(peerCert)
-            if derStr.len > 0:
-              conn.serverCertDer = toBytes(derStr)
-            else:
-              warnStderr "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
-          finally:
-            X509_free(peerCert)
+        if sslGetPeerCertificate == nil or x509Free == nil:
+          warnStderr "pg_connection: OpenSSL does not expose peer-certificate functions; SCRAM-SHA-256-PLUS channel binding unavailable"
         else:
-          warnStderr "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
+          let peerCert = sslGetPeerCertificate(conn.socket.sslHandle)
+          if peerCert != nil:
+            try:
+              let derStr = i2d_X509(peerCert)
+              if derStr.len > 0:
+                conn.serverCertDer = toBytes(derStr)
+              else:
+                warnStderr "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
+            finally:
+              x509Free(peerCert)
+          else:
+            warnStderr "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
       finally:
         # asyncnet doesn't free the SslContext (no =destroy on std/net's type).
         # SSL_new inside wrapConnectedSocket takes its own ref, so destroying

@@ -1801,7 +1801,7 @@ when hasAsyncDispatch and defined(ssl):
     try:
       body
     finally:
-      X509_free(certVar)
+      x509Free(certVar)
 
   # Lazy-load these too: Apple's system libcrypto omits some LibreSSL exports
   # and an eager `{.dynlib.}` binding would abort the test binary at startup.
@@ -1809,11 +1809,15 @@ when hasAsyncDispatch and defined(ssl):
     X509CheckIpAscFn = proc(cert: PX509, ipasc: cstring, flags: cuint): cint {.
       cdecl, gcsafe, raises: []
     .}
+    X509CheckHostFn = proc(
+      cert: PX509, name: cstring, nameLen: cint, flags: cuint, peerName: ptr cstring
+    ): cint {.cdecl, gcsafe, raises: [].}
     X509GetHostFn =
       proc(param: pointer, idx: cint): cstring {.cdecl, gcsafe, raises: [].}
 
   var
     x509CheckIpAscFn: X509CheckIpAscFn
+    x509CheckHostFn: X509CheckHostFn
     x509GetHostFn: X509GetHostFn
     x509TestSymsResolved: bool
 
@@ -1823,11 +1827,13 @@ when hasAsyncDispatch and defined(ssl):
     let lib = loadLibPattern(DLLUtilName)
     if lib != nil:
       x509CheckIpAscFn = cast[X509CheckIpAscFn](symAddr(lib, "X509_check_ip_asc"))
+      x509CheckHostFn = cast[X509CheckHostFn](symAddr(lib, "X509_check_host"))
       x509GetHostFn = cast[X509GetHostFn](symAddr(lib, "X509_VERIFY_PARAM_get0_host"))
     x509TestSymsResolved = true
 
   proc dnsMatches(cert: PX509, name: string): bool =
-    X509_check_host(cert, name.cstring, name.len.cint, 0.cuint, nil) == 1
+    doAssert x509CheckHostFn != nil, "X509_check_host unavailable"
+    x509CheckHostFn(cert, name.cstring, name.len.cint, 0.cuint, nil) == 1
 
   proc ipMatches(cert: PX509, ip: string): bool =
     resolveX509TestSyms()
@@ -1837,7 +1843,7 @@ when hasAsyncDispatch and defined(ssl):
   suite "SSL verify-full - certificate identity contract (OpenSSL backend)":
     test "IP-SAN cert matches its IP and rejects others":
       resolveX509TestSyms()
-      if x509CheckIpAscFn == nil:
+      if x509CheckIpAscFn == nil or x509CheckHostFn == nil or x509Free == nil:
         skip()
       else:
         withCert(ipSanCertDerB64, cert):
@@ -1847,7 +1853,7 @@ when hasAsyncDispatch and defined(ssl):
 
     test "DNS-SAN cert matches its hostname and rejects others":
       resolveX509TestSyms()
-      if x509CheckIpAscFn == nil:
+      if x509CheckIpAscFn == nil or x509CheckHostFn == nil or x509Free == nil:
         skip()
       else:
         withCert(dnsOnlyCertDerB64, cert):
@@ -1943,7 +1949,7 @@ when hasAsyncDispatch and defined(ssl):
           sock.close()
 
     test "peer certificate is available on client after handshake":
-      if not ensureTestCerts():
+      if not ensureTestCerts() or sslGetPeerCertificate == nil or x509Free == nil:
         skip()
       else:
         let certDir = currentSourcePath().parentDir / "certs"
@@ -1981,10 +1987,10 @@ when hasAsyncDispatch and defined(ssl):
             let clientCtx = newContext(verifyMode = CVerifyNone)
             wrapConnectedSocket(clientCtx, c, handshakeAsClient)
             await driveTlsHandshake(c)
-            let peer = SSL_get_peer_certificate(c.sslHandle)
+            let peer = sslGetPeerCertificate(c.sslHandle)
             peerCertOk = peer != nil
             if peer != nil:
-              X509_free(peer)
+              x509Free(peer)
             # Unblock the server's `recv(1)` so its future completes.
             await c.send(" ")
           finally:
