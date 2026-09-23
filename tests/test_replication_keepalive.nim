@@ -1,10 +1,10 @@
 ## Replication keepalive auto-reply E2E tests using the in-process mock server.
 ##
-## Verifies that when `startReplication` is invoked with `autoKeepaliveReply = true`
-## (the default), the library responds to `PrimaryKeepalive(replyRequested=true)`
-## messages automatically, reporting the highest `receivedEndLsn`
-## (`XLogData.startLsn + data.len`) observed so far in the *receive* field —
-## never the server's `walEnd` (neither the keepalive's nor the XLogData's).
+## Verifies that with `autoKeepaliveReply = true` (the default) the library
+## responds to `PrimaryKeepalive(replyRequested=true)` messages automatically,
+## reporting the highest received position in the *receive* field:
+## `receivedEndLsn` on a physical stream (never a `walEnd`), and on a logical
+## stream `XLogData.startLsn` or the keepalive's `walEnd` (the sent position).
 ## Also verifies that flush/apply only reflect the LSN confirmed durable via
 ## `confirmFlushed` (so merely-received WAL does not advance
 ## `confirmed_flush_lsn`, preserving at-least-once delivery) and the opt-out path.
@@ -30,13 +30,13 @@ proc mockConfig(port: int): ConnConfig =
 const
   # startLsn of the XLogData burst the mock server sends.
   testStartLsn = 0x0000_0000_0000_1000'i64
-  # WAL bytes carried by the XLogData. The receivedEndLsn the client should
-  # acknowledge is testStartLsn + testWalData.len.
+  # WAL bytes carried by the XLogData. On a physical stream the client should
+  # acknowledge receivedEndLsn = testStartLsn + testWalData.len.
   testWalData: seq[byte] = @[1'u8, 2, 3]
   testReceivedEndLsn = testStartLsn + testWalData.len
-  # XLogData.walEnd and PrimaryKeepalive.walEnd are both the server's current
-  # WAL end; they may be far ahead of what the message actually contains.
-  # The client must NOT acknowledge these.
+  # Physical walEnd values, which may be far ahead of what the message
+  # contains; a physical client must NOT acknowledge these. A logical XLogData
+  # carries walEnd == startLsn, so logical tests pass testStartLsn instead.
   testXLogWalEnd = 0x0000_0000_0000_5000'i64
   testKeepaliveWalEnd = 0x0000_0000_0000_9999'i64
 
@@ -81,7 +81,7 @@ suite "Replication: auto keepalive reply":
         {.cast(gcsafe).}:
           callbackKinds.add(msg.kind)
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -99,6 +99,80 @@ suite "Replication: auto keepalive reply":
     check observedFlushLsn == 0
     check observedApplyLsn == 0
     check callbackKinds == @[rmkXLogData, rmkPrimaryKeepalive]
+
+  test "logical: keepalive walEnd is received; confirmFlushed clamps to startLsn":
+    observedReceiveLsn = -1
+    observedFlushLsn = -1
+    observedApplyLsn = -1
+    observedReplyMsgType = '\0'
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        let ssu = await runAutoKeepaliveServer(
+          st, testStartLsn, testStartLsn, testKeepaliveWalEnd, testWalData
+        )
+        observedReplyMsgType = ssu.msgType
+        observedReceiveLsn = ssu.receive
+        observedFlushLsn = ssu.flush
+        observedApplyLsn = ssu.apply
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          if msg.kind == rmkXLogData:
+            discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
+
+      await conn.startReplication("test_slot", callback = cb)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check observedReplyMsgType == 'd'
+    check observedReceiveLsn == testKeepaliveWalEnd
+    check observedFlushLsn == testStartLsn
+    check observedApplyLsn == testStartLsn
+
+  test "logical: XLogData counts startLsn, not startLsn + data.len":
+    observedReceiveLsn = -1
+    observedFlushLsn = -1
+    observedReplyMsgType = '\0'
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        # Keepalive walEnd at startLsn so it cannot mask the XLogData bound.
+        let ssu = await runAutoKeepaliveServer(
+          st, testStartLsn, testStartLsn, testStartLsn, testWalData
+        )
+        observedReplyMsgType = ssu.msgType
+        observedReceiveLsn = ssu.receive
+        observedFlushLsn = ssu.flush
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          if msg.kind == rmkXLogData:
+            discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
+
+      await conn.startReplication("test_slot", callback = cb)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check observedReplyMsgType == 'd'
+    check observedReceiveLsn == testStartLsn
+    check observedFlushLsn == testStartLsn
 
   test "auto-reply disabled: library does not send Standby Status":
     keepaliveSeen = false
@@ -183,7 +257,7 @@ suite "Replication: auto keepalive reply":
             # receive field and we prove they track confirmFlushed, not receipt.
             discard conn.confirmFlushed(msg.xlogData.startLsn)
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -234,7 +308,7 @@ suite "Replication: auto keepalive reply":
             discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
             discard conn.confirmFlushed(msg.xlogData.startLsn)
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -281,7 +355,7 @@ suite "Replication: auto keepalive reply":
             discard
               conn.confirmFlushed(Lsn(uint64(msg.xlogData.receivedEndLsn) + 1'u64))
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -338,13 +412,14 @@ suite "Replication: auto keepalive reply":
     check not thirdAdvanced
 
 suite "Replication: proactive status interval":
-  test "statusInterval sends a Standby Status without a reply-requested keepalive":
+  test "logical: statusInterval sends a Standby Status without a reply-requested keepalive":
     # A server with wal_sender_timeout = 0 never requests a reply, so the slot
     # only advances if the standby sends status updates on its own. With a
     # positive statusInterval the library must emit a Standby Status Update
     # (receive = received LSN, flush/apply = confirmFlushed) even though the
     # server set replyRequested only never. Works on both backends: chronos via a
     # timed idle wake, asyncdispatch via the post-message path nudged below.
+    # The physical variant lives in test_physical_replication.
     observedReceiveLsn = -1
     observedFlushLsn = -1
     observedApplyLsn = -1
@@ -359,15 +434,14 @@ suite "Replication: proactive status interval":
         var burst: seq[byte]
         burst.add(buildCopyBothResponse())
         # XLogData only — crucially, no PrimaryKeepalive(replyRequested=true).
-        burst.add(buildXLogData(testStartLsn, testXLogWalEnd, 0, testWalData))
+        burst.add(buildXLogData(testStartLsn, testStartLsn, 0, testWalData))
         await sendBytes(st, burst)
         # Let the status interval (50ms) elapse, then send a non-reply keepalive
         # to unblock the asyncdispatch read (which cannot wake on a timer);
-        # chronos has already emitted updates on its own by now.
+        # chronos has already emitted updates on its own by now. Its walEnd is
+        # startLsn so the received LSN is the same whichever backend replies.
         await sleepAsync(milliseconds(150))
-        await sendBytes(
-          st, buildKeepalive(testKeepaliveWalEnd, 0, replyRequested = false)
-        )
+        await sendBytes(st, buildKeepalive(testStartLsn, 0, replyRequested = false))
         let reply = await drainFrontendMessage(st)
         observedReplyMsgType = reply.msgType
         if reply.msgType == 'd':
@@ -407,12 +481,12 @@ suite "Replication: proactive status interval":
 
     waitFor testBody()
     # A proactive Standby Status Update arrived even though the server never set
-    # replyRequested: receive carries the received LSN, flush/apply the confirmed
-    # position (here equal, since the callback confirmed the full received range).
+    # replyRequested: receive carries the received LSN (startLsn on a logical
+    # stream), flush/apply the confirmed position clamped to it.
     check observedReplyMsgType == 'd'
-    check observedReceiveLsn == testReceivedEndLsn
-    check observedFlushLsn == testReceivedEndLsn
-    check observedApplyLsn == testReceivedEndLsn
+    check observedReceiveLsn == testStartLsn
+    check observedFlushLsn == testStartLsn
+    check observedApplyLsn == testStartLsn
 
 var poisonRaised: bool
 var poisonFinalState: PgConnState

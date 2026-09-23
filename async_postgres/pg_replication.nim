@@ -37,19 +37,28 @@ type
     rmkPrimaryKeepalive
 
   XLogData* = object ## WAL data payload from the server.
-    startLsn*: Lsn ## Start LSN of the WAL data in this message
+    startLsn*: Lsn
+      ## Start LSN of the WAL data in this message. On a logical stream it is
+      ## the decoded record's LSN, or ``InvalidLsn`` for a write that is not the
+      ## last for its change (e.g. pgoutput Relation and Type messages).
     walEnd*: Lsn
-      ## Current end of WAL on the server at the time this message was sent.
-      ## This is *not* the end of the WAL data contained in this message; it
-      ## reflects how far WAL has advanced on the server and is informational.
-      ## To acknowledge what was actually received, use ``receivedEndLsn``
-      ## (``startLsn + data.len``), never ``walEnd`` — ``walEnd`` may be ahead
-      ## of what this message contains.
+      ## Informational. On a physical stream it is the end of WAL the server
+      ## can send, which may be ahead of this message's data: acknowledge
+      ## ``receivedEndLsn`` (``startLsn + data.len``), never ``walEnd``. On a
+      ## logical stream it equals ``startLsn``; confirm ``CommitMessage.endLsn``
+      ## or ``PrimaryKeepalive.walEnd`` instead. With any output plugin, the
+      ## ``startLsn`` of a transaction's commit message is its end LSN.
     sendTime*: int64 ## Server send time (microseconds since PG epoch)
     data*: seq[byte] ## Raw WAL data (plugin-dependent format)
 
   PrimaryKeepalive* = object ## Keepalive message from the server.
-    walEnd*: Lsn ## Current end of WAL on the server
+    walEnd*: Lsn
+      ## The walsender's sent position. On a logical stream it counts as
+      ## received, so once every earlier message is processed it may be passed
+      ## to ``confirmFlushed``. The auto-reply to this keepalive is sent before
+      ## the callback runs, so that confirmation goes out with the next status
+      ## update (the next requested reply, ``statusInterval``, or
+      ## ``stopReplication``).
     sendTime*: int64 ## Server send time (microseconds since PG epoch)
     replyRequested*: bool ## Whether the server wants an immediate status reply
 
@@ -489,9 +498,13 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
 
 proc receivedEndLsn*(msg: XLogData): Lsn =
   ## End LSN of the WAL data actually contained in this message
-  ## (``startLsn + len(data)``). Use this when acknowledging received data via
-  ## ``sendStandbyStatus``; do not use ``walEnd``, which is the server's
-  ## current WAL position and may point past data this message does not carry.
+  ## (``startLsn + len(data)``). On a physical stream, use this when
+  ## acknowledging received data via ``sendStandbyStatus``; do not use
+  ## ``walEnd``, which may point past data this message does not carry.
+  ##
+  ## Physical replication only: logical ``data`` is plugin output, not WAL
+  ## bytes, so this may point past commits not yet sent. Confirm logical
+  ## progress with ``CommitMessage.endLsn`` or ``PrimaryKeepalive.walEnd``.
   let startLsn = uint64(msg.startLsn)
   let dataLen = uint64(msg.data.len)
   # Unsigned addition wraps silently instead of raising; check before adding.
@@ -835,6 +848,12 @@ proc sendStandbyStatus*(
   ## Send Standby Status Update. ``InvalidLsn`` defaults up to ``receiveLsn``.
   ## Raises ``PgStateError`` unless the connection is ``csReplicating``, or
   ## ``PgConnectionError`` when the connection was lost.
+  ##
+  ## Values are sent verbatim, unlike ``confirmFlushed``. On a logical stream
+  ## pass ``CommitMessage.endLsn`` or ``PrimaryKeepalive.walEnd``, never
+  ## ``receivedEndLsn``: a flush past an unsent commit makes the server skip it.
+  ## The auto-reply and ``stopReplication`` send the ``confirmFlushed``
+  ## position, so confirm the same LSN first or they may move flush backwards.
   conn.checkReplicating("sendStandbyStatus")
   let flushVal = if flushLsn == InvalidLsn: receiveLsn else: flushLsn
   let applyVal = if applyLsn == InvalidLsn: receiveLsn else: applyLsn
@@ -850,7 +869,9 @@ proc confirmedFlushLsn*(conn: PgConnection): Lsn {.inline.} =
 
 proc confirmFlushed*(conn: PgConnection, lsn: Lsn): bool =
   ## Confirm WAL up to ``lsn`` as durable. Clamped to received WAL, monotonic.
-  ## Returns true if advanced. Must be in ``csReplicating``.
+  ## Returns true if advanced. Must be in ``csReplicating``. Received WAL is the
+  ## highest ``receivedEndLsn`` (physical) or ``XLogData.startLsn`` /
+  ## ``PrimaryKeepalive.walEnd`` (logical).
   conn.checkReplicating("confirmFlushed")
   # Clamp to received WAL: durably-persisted WAL can never exceed what was
   # received. Clamping (rather than raising) keeps automatic replies from
@@ -885,7 +906,8 @@ proc resetReplLsnTracking(conn: PgConnection, startLsn: Lsn) =
   ## resume point at the start of a stream, so a reused connection never inherits
   ## a stale value from a previous stream. The confirmed-flush position then
   ## advances only via ``confirmFlushed``; the max-received position advances as
-  ## ``XLogData`` arrives and bounds what ``confirmFlushed`` will accept.
+  ## ``XLogData`` (and, on a logical stream, ``PrimaryKeepalive``) arrives and
+  ## bounds what ``confirmFlushed`` will accept.
   conn.initReplLsnTracking(startLsn.toUInt64)
   conn.replCopyDoneSent = false
 
@@ -983,15 +1005,25 @@ proc maybeSendPeriodicStatus(
   await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
   return Moment.now()
 
+type ReplStreamKind = enum
+  rskLogical
+  rskPhysical
+
+func label(kind: ReplStreamKind): string =
+  case kind
+  of rskLogical: "replication"
+  of rskPhysical: "physical replication"
+
 proc handleReplicationData(
     conn: PgConnection,
     copyData: sink seq[byte],
     autoKeepaliveReply: bool,
+    kind: ReplStreamKind,
     callback: ReplicationCallback,
     lastStatusSent: Moment,
 ): Future[Moment] {.async.} =
   ## Process one CopyData frame from a replication stream: parse it, advance the
-  ## received-WAL position on ``XLogData`` (the single source of truth read by
+  ## received-WAL position (the single source of truth read by
   ## ``confirmFlushed`` and the auto-reply), emit an automatic keepalive reply on
   ## a ``PrimaryKeepalive`` with ``replyRequested`` when ``autoKeepaliveReply`` is
   ## set, then invoke the user ``callback``. Shared by ``startReplication`` and
@@ -1006,9 +1038,17 @@ proc handleReplicationData(
   let replMsg = parseReplicationMessage(move(copyData))
   case replMsg.kind
   of rmkXLogData:
-    let received = replMsg.xlogData.receivedEndLsn
+    # Logical data isn't WAL bytes; a Commit's startLsn equals its endLsn.
+    let received =
+      case kind
+      of rskLogical: replMsg.xlogData.startLsn
+      of rskPhysical: replMsg.xlogData.receivedEndLsn
     discard conn.updateReplMaxReceivedLsn(received.toUInt64)
   of rmkPrimaryKeepalive:
+    # walEnd is the walsender's sent position; on a logical stream every commit
+    # before it was already streamed. Physical keeps the byte-exact XLogData bound.
+    if kind == rskLogical:
+      discard conn.updateReplMaxReceivedLsn(replMsg.keepalive.walEnd.toUInt64)
     if autoKeepaliveReply and replMsg.keepalive.replyRequested:
       await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
       newLastStatusSent = Moment.now()
@@ -1043,12 +1083,12 @@ proc runReplicationStream(
     startLsn: Lsn,
     autoKeepaliveReply: bool,
     statusInterval: async_backend.Duration,
+    kind: ReplStreamKind,
     callback: ReplicationCallback,
-    context: string,
 ): Future[void] {.async.} =
   ## Shared replication stream body. Caller must have already sent the
-  ## ``START_REPLICATION`` query. ``context`` appears in error messages
-  ## (e.g. ``"replication"`` / ``"physical replication"``).
+  ## ``START_REPLICATION`` query. ``kind`` selects the received-LSN rule and
+  ## labels error messages.
   var queryError: ref PgQueryError
 
   # Register the poison-on-abandon defer BEFORE waitCopyBoth so a raise during
@@ -1074,7 +1114,7 @@ proc runReplicationStream(
             raise queryError
           raise newException(
             PgConnectionError,
-            "START_REPLICATION " & context & " ended without CopyBothResponse",
+            "START_REPLICATION " & kind.label & " ended without CopyBothResponse",
           )
         else:
           discard
@@ -1096,7 +1136,7 @@ proc runReplicationStream(
         case msg.kind
         of bmkCopyData:
           lastStatusSent = await conn.handleReplicationData(
-            move(msg.copyData), autoKeepaliveReply, callback, lastStatusSent
+            move(msg.copyData), autoKeepaliveReply, kind, callback, lastStatusSent
           )
         of bmkCopyDone:
           # Mirror only on server-initiated stop (walsender timeout,
@@ -1127,7 +1167,7 @@ proc runReplicationStream(
         autoKeepaliveReply, statusInterval, lastStatusSent
       )
       if conn.state == csClosed:
-        conn.raiseClosedConnection("Connection closed during " & context)
+        conn.raiseClosedConnection("Connection closed during " & kind.label)
       # Without autoKeepaliveReply, lastStatusSent never advances, so a timer
       # race here would rearm every ~1 ms.
       let effectiveInterval = if autoKeepaliveReply: statusInterval else: ZeroDuration
@@ -1274,7 +1314,7 @@ proc startReplication*(
   conn.markBusy()
   await conn.sendMsg(msg)
   await runReplicationStream(
-    conn, startLsn, autoKeepaliveReply, statusInterval, callback, "replication"
+    conn, startLsn, autoKeepaliveReply, statusInterval, rskLogical, callback
   )
 
 proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
@@ -1328,5 +1368,5 @@ proc startPhysicalReplication*(
   conn.markBusy()
   await conn.sendMsg(msg)
   await runReplicationStream(
-    conn, startLsn, autoKeepaliveReply, statusInterval, callback, "physical replication"
+    conn, startLsn, autoKeepaliveReply, statusInterval, rskPhysical, callback
   )
