@@ -852,6 +852,7 @@ async_postgres/pg_errors.nim	PoolErrorKind.pekUnknown
 async_postgres/pg_errors.nim	ProtocolError
 async_postgres/pg_errors.nim	SqlStateCheckViolation
 async_postgres/pg_errors.nim	SqlStateDeadlockDetected
+async_postgres/pg_errors.nim	SqlStateDuplicateObject
 async_postgres/pg_errors.nim	SqlStateExclusionViolation
 async_postgres/pg_errors.nim	SqlStateForeignKeyViolation
 async_postgres/pg_errors.nim	SqlStateNotNullViolation
@@ -869,6 +870,7 @@ async_postgres/pg_errors.nim	internalPosition
 async_postgres/pg_errors.nim	internalQuery
 async_postgres/pg_errors.nim	isCheckViolation
 async_postgres/pg_errors.nim	isDeadlockDetected
+async_postgres/pg_errors.nim	isDuplicateObject
 async_postgres/pg_errors.nim	isExclusionViolation
 async_postgres/pg_errors.nim	isForeignKeyViolation
 async_postgres/pg_errors.nim	isIntegrityConstraintViolation

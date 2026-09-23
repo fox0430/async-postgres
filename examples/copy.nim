@@ -29,10 +29,10 @@ proc main() {.async.} =
   echo "copyIn result: ", tag.commandTag
 
   # copyOut: bulk export
-  let result = await conn.copyOut("COPY items TO STDOUT")
+  let outResult = await conn.copyOut("COPY items TO STDOUT")
   echo "\ncopyOut rows:"
-  for chunk in result.data:
-    echo "  ", chunk.toString()
+  for chunk in outResult.data:
+    stdout.write "  ", chunk.toString()
 
   # copyInStream: streaming bulk insert
   discard await conn.exec("TRUNCATE items")
@@ -58,6 +58,6 @@ proc main() {.async.} =
   let outInfo = await conn.copyOutStream("COPY items TO STDOUT", outCb)
   echo "\ncopyOutStream rows (", outInfo.commandTag, "):"
   for chunk in chunks:
-    echo "  ", chunk.toString()
+    stdout.write "  ", chunk.toString()
 
 waitFor main()

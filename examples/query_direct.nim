@@ -1,4 +1,4 @@
-## Zero-allocation query macros.
+## Low-allocation query macros.
 ##
 ## Demonstrates `queryDirect` and `execDirect`, which encode parameters into
 ## the connection's send buffer at compile time. They avoid the intermediate
@@ -36,9 +36,9 @@ proc main() {.async.} =
   """
   )
 
-  # execDirect: zero-alloc INSERT in a tight loop. The SQL literal is parsed
-  # once (server-side plan cached), and each call re-binds scalars directly
-  # into the send buffer without heap allocations for the parameter list.
+  # execDirect: INSERT in a tight loop. The SQL literal is parsed once, and
+  # each call encodes scalars directly into the send buffer without allocating
+  # a parameter list.
   let host = "worker-1"
   for i in 0 ..< 5:
     let cpu = 0.1 * float64(i)
@@ -47,7 +47,8 @@ proc main() {.async.} =
       "INSERT INTO metrics (host, cpu, ts) VALUES ($1, $2, $3)", host, cpu, ts
     )
 
-  # queryDirect: zero-alloc read. Returns the same QueryResult shape as `query`.
+  # queryDirect: allocation-free parameter encoding. Returns the same
+  # QueryResult shape as `query`.
   let threshold = 0.2'f64
   let qr = await conn.queryDirect(
     "SELECT host, cpu, ts FROM metrics WHERE cpu >= $1 ORDER BY ts", threshold
@@ -55,15 +56,14 @@ proc main() {.async.} =
   echo "Rows above ", threshold, ":"
   for row in qr.rows:
     echo "  host=",
-      row.getStr("host"), " cpu=", row.getStr("cpu"), " ts=", row.getInt("ts")
+      row.getStr("host"), " cpu=", row.getFloat("cpu"), " ts=", row.getInt("ts")
 
-  # queryDirect drives `queryValue` the same way: wrap it manually since
-  # `queryValue[T]` takes a regular `seq[PgParam]`. For a single scalar,
-  # `queryDirect` + `rows[0].get(0, T)` is zero-alloc end-to-end.
+  # `queryValue[T]` takes a `seq[PgParam]`, so a single scalar goes through
+  # `queryDirect` + `rows[0].get(0, T)`. Only parameter encoding is
+  # allocation-free; building the QueryResult still allocates.
   let targetHost = "worker-1"
-  let count = await conn.queryDirect(
-    "SELECT count(*)::int8 FROM metrics WHERE host = $1", targetHost
-  )
+  let count =
+    await conn.queryDirect("SELECT count(*) FROM metrics WHERE host = $1", targetHost)
   echo "Rows for ", targetHost, ": ", count.rows[0].get(0, int64)
 
 waitFor main()
