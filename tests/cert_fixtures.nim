@@ -3,7 +3,8 @@
 import std/[os, osproc]
 
 const RequiredCertFiles = [
-  "ca.crt", "server.crt", "server.key", "wrong_ca.crt", "wrong_ca.key", "encrypted.key"
+  "ca.crt", "server.crt", "server.key", "wrong_ca.crt", "wrong_ca.key", "encrypted.key",
+  "ca.trusted.crt", "wrong_ca.rsa.key", "ec.key",
 ]
 
 proc certDir(): string =

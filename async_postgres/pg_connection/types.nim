@@ -145,8 +145,8 @@ type
     sslKey*: string
       ## PEM-encoded client private key for mutual TLS. The key must be
       ## **unencrypted** on both backends (no passphrase callback is wired up).
-      ## On chronos/BearSSL specifically it must be PKCS#8 (RSA or EC); PKCS#1
-      ## is not supported. Must be paired with ``sslCert``.
+      ## PKCS#8, PKCS#1 (``RSA PRIVATE KEY``) and SEC1 (``EC PRIVATE KEY``) PEM
+      ## are accepted. Must be paired with ``sslCert``.
     sslSni*: bool ## Send TLS SNI (default true; suppressed for IP/empty host).
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the

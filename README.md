@@ -140,15 +140,13 @@ SSL backend differs by async backend:
 Client certificate authentication (mTLS) is enabled by setting `sslCert` and
 `sslKey` on `ConnConfig` (or `sslcert=` / `sslkey=` in a DSN, which load the
 files from disk). Both must be provided together, and `sslMode` must be
-`sslPrefer` or stronger (`sslcert`/`sslkey` paired with `sslDisable` or
-`sslAllow` is rejected at config time because TLS would not be negotiated).
-The private key must be **unencrypted** on both backends — neither chronos
-(BearSSL) nor asyncdispatch (OpenSSL) is wired to a passphrase callback. On
-chronos the key specifically must be PKCS#8 PEM (RSA or EC); PKCS#1 is not
-supported. When loaded via DSN on POSIX, the `sslkey` file must not have any group
-or world permission bits set. This is intentionally stricter than libpq
-(which permits owner-group-read `0o640` for root-owned keys); tighten
-offending keys with `chmod 0600` (or `0400`).
+`sslPrefer` or stronger (otherwise it is rejected at config time). The key
+must be an **unencrypted** PKCS#8, PKCS#1 or SEC1 PEM; no passphrase callback
+is wired up on either backend. On chronos, `TRUSTED CERTIFICATE` blocks
+(`openssl x509 -trustout`) are ignored in `sslrootcert` because BearSSL cannot
+honour their trust settings; export CAs as plain `CERTIFICATE`. When loaded
+via DSN on POSIX, the `sslkey` file must have no group or world permission
+bits (stricter than libpq's `0o640` for root-owned keys); use `chmod 0600`.
 
 Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
 stronger. On the chronos backend it needs chronos >= 4.4.0 for ALPN support.

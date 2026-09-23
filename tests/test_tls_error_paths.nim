@@ -244,10 +244,7 @@ suite "TLS error paths: client cert/key/CA loading":
     when hasAsyncDispatch:
       check "Failed to load client certificate" in msg
     elif hasChronos:
-      # BearSSL reports the same PEM-decode error for cert and key loading,
-      # so only the load-stage failure is observable, not which of the two
-      # inputs was malformed.
-      check "Invalid PEM encoding" in msg
+      check "Could not find any certificates" in msg
 
   test "garbage client key content fails":
     proc runTest(): Future[ProbeResult] {.async.} =
@@ -272,8 +269,7 @@ suite "TLS error paths: client cert/key/CA loading":
     when hasAsyncDispatch:
       check "Failed to load client private key" in msg
     elif hasChronos:
-      # Same BearSSL PEM-decode error as the certificate case above.
-      check "Invalid PEM encoding" in msg
+      check "Could not find private key" in msg
 
   test "passphrase-protected client key is rejected":
     proc runTest(): Future[ProbeResult] {.async.} =
@@ -302,7 +298,7 @@ suite "TLS error paths: client cert/key/CA loading":
       # wrapper prefix does not.
       check "client private key" in msg
     elif hasChronos:
-      check "Could not find private key" in msg
+      check "passphrase-protected" in msg
 
   when hasAsyncDispatch:
     test "mismatched client cert/key pair is rejected (key values mismatch)":
