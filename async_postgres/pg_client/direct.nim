@@ -1,5 +1,6 @@
-## Zero-allocation `queryDirect` / `execDirect` compile-time macros that
-## encode parameters directly into the connection send buffer.
+## Low-allocation `queryDirect` / `execDirect` compile-time macros that
+## encode parameters directly into the connection send buffer without
+## allocating a parameter list (building the `QueryResult` still allocates).
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
@@ -494,8 +495,9 @@ proc extractTimeoutArg(
     result.timeout = bindSym"ZeroDuration"
 
 macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =
-  ## Zero-allocation query: encodes parameters directly into the send buffer
-  ## at compile time, avoiding ``seq[PgParam]`` and intermediate ``seq[byte]`` allocs.
+  ## Low-allocation query: encodes parameters directly into the send buffer
+  ## at compile time, avoiding ``seq[PgParam]`` and intermediate ``seq[byte]``
+  ## allocs for the parameter path (building the `QueryResult` still allocates).
   ##
   ## Usage:
   ##   let qr = await conn.queryDirect("SELECT ... WHERE id = $1", myId)
@@ -623,8 +625,9 @@ proc execDirectImpl*(
   return initCommandResult(tag)
 
 macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): untyped =
-  ## Zero-allocation exec: encodes parameters directly into the send buffer
-  ## at compile time, avoiding ``seq[PgParam]`` and intermediate ``seq[byte]`` allocs.
+  ## Low-allocation exec: encodes parameters directly into the send buffer
+  ## at compile time, avoiding ``seq[PgParam]`` and intermediate ``seq[byte]``
+  ## allocs for the parameter path (building the result still allocates).
   ##
   ## Usage:
   ##   discard await conn.execDirect("UPDATE ... WHERE id = $1", myId)
