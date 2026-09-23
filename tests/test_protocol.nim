@@ -1343,6 +1343,7 @@ suite "newPgQueryError":
     check errWithState(SqlStateSerializationFailure).isSerializationFailure
     check errWithState(SqlStateDeadlockDetected).isDeadlockDetected
     check errWithState(SqlStateQueryCanceled).isQueryCanceled
+    check errWithState(SqlStateDuplicateObject).isDuplicateObject
     check not errWithState("42P01").isUniqueViolation
     check not errWithState("42P01").isIntegrityConstraintViolation
     check not errWithState("").isIntegrityConstraintViolation

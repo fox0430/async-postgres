@@ -216,6 +216,7 @@ const
   SqlStateDeadlockDetected* = "40P01"
   SqlStateSyntaxError* = "42601"
   SqlStateUndefinedTable* = "42P01"
+  SqlStateDuplicateObject* = "42710"
   SqlStateQueryCanceled* = "57014"
 
 func getErrorField*(fields: seq[ErrorField], code: char): string =
@@ -430,3 +431,6 @@ func isDeadlockDetected*(e: ref PgQueryError): bool =
 
 func isQueryCanceled*(e: ref PgQueryError): bool =
   e.sqlState == SqlStateQueryCanceled
+
+func isDuplicateObject*(e: ref PgQueryError): bool =
+  e.sqlState == SqlStateDuplicateObject
