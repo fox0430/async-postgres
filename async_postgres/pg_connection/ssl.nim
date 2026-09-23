@@ -396,8 +396,8 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
     var clientKey: TLSPrivateKey
     if config.sslCert.len > 0 and config.sslKey.len > 0:
       try:
-        clientCert = TLSCertificate.init(config.sslCert)
-        clientKey = TLSPrivateKey.init(config.sslKey)
+        clientCert = loadCertificate(config.sslCert)
+        clientKey = loadPrivateKey(config.sslKey)
       except TLSStreamProtocolError as e:
         # Config-supplied PEM that will not decode is a config fault, same call
         # as `parseTrustAnchors`.
@@ -438,7 +438,8 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
         )
     except TLSStreamInitError as e:
       # Covers cert/key decode failures newTLSClientAsyncStream performs itself
-      # (e.g. getSignerAlgo), which the TLSCertificate.init wrapping above misses.
+      # (e.g. getSignerAlgo), which the loadCertificate/loadPrivateKey wrapping
+      # above misses.
       # With no client cert in play there is no config-supplied input left to
       # blame, so it stays a per-connection fault instead of latching the pool.
       if clientCert.isNil:

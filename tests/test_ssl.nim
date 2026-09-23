@@ -22,6 +22,7 @@ when hasAsyncDispatch and not defined(ssl):
 
 when hasChronos:
   import ../async_postgres/pg_bearssl {.all.}
+  import chronos/streams/tlsstream
   import bearssl/abi/bearssl_ssl as bssl
 
 proc testCaCert(): string =
@@ -2044,6 +2045,58 @@ when hasChronos:
       check conn.x509Capture.inner == newConn.x509Capture.inner
 
 when hasChronos:
+  proc readCertFile(name: string): string =
+    doAssert ensureTestCerts(),
+      "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
+    readFile(currentSourcePath().parentDir / "certs" / name)
+
+  proc legacyX509Cert(pem = testCaCert()): string =
+    ## `pem` under OpenSSL's legacy "X509 CERTIFICATE" banner.
+    pem.replace("BEGIN CERTIFICATE", "BEGIN X509 CERTIFICATE").replace(
+      "END CERTIFICATE", "END X509 CERTIFICATE"
+    )
+
+  proc connectWithIdentity(cert, key: string): tuple[raised, configFault: bool] =
+    ## A load failure is PgConfigError; a loaded identity instead fails as a
+    ## connection error when the mock server hangs up.
+    var r: tuple[raised, configFault: bool]
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8)
+          await sendBytes(st, @[byte('S')])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslCert: cert,
+        sslKey: key,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        r.raised = true
+        r.configFault = e of PgConfigError
+
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    r
+
   suite "parseTrustAnchors - malformed PEM input":
     test "empty CERTIFICATE block alone raises PgError, not IndexDefect":
       const pem = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
@@ -2062,6 +2115,183 @@ when hasChronos:
       let parsed = parseTrustAnchors(mixed)
       check parsed.backing.len > 0
 
+    test "legacy X509 CERTIFICATE label is parsed as an anchor":
+      let legacy = legacyX509Cert()
+      let parsed = parseTrustAnchors(legacy)
+      check parsed.backing.len > 0
+
+    test "loadCertificate accepts the legacy X509 CERTIFICATE label":
+      let legacy = legacyX509Cert()
+      check loadCertificate(legacy) != nil
+      check loadCertificate(testCaCert()) != nil
+
+    test "loadCertificate rejects a PEM with no certificate block":
+      expect TLSStreamProtocolError:
+        discard loadCertificate(readCertFile("wrong_ca.key"))
+
+    test "legacy-labelled sslcert passes client identity loading in connect":
+      let legacy = legacyX509Cert(readCertFile("wrong_ca.crt"))
+      let r = connectWithIdentity(legacy, readCertFile("wrong_ca.key"))
+      check r.raised
+      check not r.configFault
+
+    test "PKCS#1 sslkey passes client identity loading in connect":
+      let r = connectWithIdentity(
+        readCertFile("wrong_ca.crt"), readCertFile("wrong_ca.rsa.key")
+      )
+      check r.raised
+      check not r.configFault
+
+    test "TRUSTED CERTIFICATE is skipped as an anchor, not trusted without its settings":
+      let trusted = readCertFile("ca.trusted.crt")
+      var msg = ""
+      try:
+        discard parseTrustAnchors(trusted)
+      except PgConfigError as e:
+        msg = e.msg
+      check "TRUSTED CERTIFICATE" in msg
+      # Plain anchors next to it still load.
+      privateAccess(TrustAnchorStore)
+      let mixed = parseTrustAnchors(testCaCert() & trusted)
+      check mixed.store.anchors.len == 1
+
+    test "TRUSTED CERTIFICATE sslcert is loaded without its trust settings":
+      let trusted = readCertFile("ca.trusted.crt")
+      privateAccess(TLSCertificate)
+      let cert = loadCertificate(trusted)
+      let plain = loadCertificate(testCaCert())
+      check cert.certs.len == 1
+      check cert.certs[0].dataLen == plain.certs[0].dataLen
+
+    test "TRUSTED CERTIFICATE sslcert with a truncated DER body is rejected":
+      const pem =
+        "-----BEGIN TRUSTED CERTIFICATE-----\n" & "MIIE\n" &
+        "-----END TRUSTED CERTIFICATE-----\n"
+      expect TLSStreamProtocolError:
+        discard loadCertificate(pem)
+
+    test "loadPrivateKey accepts PKCS#8, PKCS#1 and SEC1 banners":
+      check loadPrivateKey(readCertFile("wrong_ca.key")) != nil
+      check loadPrivateKey(readCertFile("wrong_ca.rsa.key")) != nil
+      check loadPrivateKey(readCertFile("ec.key")) != nil
+
+    test "loadPrivateKey skips a leading EC PARAMETERS block":
+      const params =
+        "-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----\n"
+      check loadPrivateKey(params & readCertFile("ec.key")) != nil
+
+    test "loadCertificate re-encodes legacy blocks mixed with canonical ones":
+      privateAccess(TLSCertificate)
+      let ca = loadCertificate(testCaCert())
+      let wrongCa = loadCertificate(readCertFile("wrong_ca.crt"))
+      let mixed =
+        loadCertificate(testCaCert() & legacyX509Cert(readCertFile("wrong_ca.crt")))
+      check mixed.certs.len == 2
+      check mixed.certs[0].dataLen == ca.certs[0].dataLen
+      check mixed.certs[1].dataLen == wrongCa.certs[0].dataLen
+
+    test "loadPrivateKey skips an empty key block":
+      const empty = "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n"
+      check loadPrivateKey(empty & readCertFile("wrong_ca.rsa.key")) != nil
+
+    const legacyEncryptedKey =
+      "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n" &
+      "DEK-Info: AES-256-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n"
+    const pkcs8EncryptedKey =
+      "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n"
+
+    proc loadKeyError(pem: string): string =
+      try:
+        discard loadPrivateKey(pem)
+      except TLSStreamProtocolError as e:
+        return e.msg
+
+    test "loadPrivateKey reports passphrase-protected keys":
+      let plain = readCertFile("wrong_ca.rsa.key")
+      check EncryptedKeyMsg == loadKeyError(readCertFile("encrypted.key"))
+      check EncryptedKeyMsg == loadKeyError(pkcs8EncryptedKey)
+      check EncryptedKeyMsg == loadKeyError(legacyEncryptedKey)
+      # An encrypted block before any usable key aborts the load.
+      check EncryptedKeyMsg == loadKeyError(legacyEncryptedKey & plain)
+      check EncryptedKeyMsg == loadKeyError(pkcs8EncryptedKey & plain)
+      # Blank lines around the RFC 1421 headers are not body text.
+      check EncryptedKeyMsg ==
+        loadKeyError(
+          legacyEncryptedKey.replace("-----\nProc-Type", "-----\n\nProc-Type")
+        )
+
+    test "loadPrivateKey loads a plain key before encrypted blocks":
+      let plain = readCertFile("wrong_ca.rsa.key")
+      check loadPrivateKey(plain & legacyEncryptedKey) != nil
+      check loadPrivateKey(plain & pkcs8EncryptedKey) != nil
+
+    test "key blocks BearSSL cannot read are skipped unless encrypted":
+      let plain = readCertFile("wrong_ca.rsa.key")
+      const brokenDsa = "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n"
+      const dsa =
+        "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n-----END DSA PRIVATE KEY-----\n"
+      const openssh =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+      check loadPrivateKey(dsa & plain) != nil
+      check loadPrivateKey(openssh & plain) != nil
+      check loadPrivateKey(brokenDsa & plain) != nil
+      check EncryptedKeyMsg ==
+        loadKeyError(legacyEncryptedKey.replace("RSA PRIVATE", "DSA PRIVATE") & plain)
+
+    test "truncated key blocks are reported as malformed":
+      for key in [pkcs8EncryptedKey, legacyEncryptedKey]:
+        let truncated = key[0 ..< key.find("-----END")]
+        check "Invalid PEM encoding" in loadKeyError(truncated)
+
+    test "a malformed key block is reported as such, not as encrypted":
+      const corrupt = "-----BEGIN PRIVATE KEY-----\nAA*A\n-----END PRIVATE KEY-----\n"
+      let msg = loadKeyError(corrupt & legacyEncryptedKey)
+      check "Invalid PEM encoding" in msg
+
+    test "structurally broken blocks are reported, not skipped":
+      let cert = testCaCert()
+      let truncated = cert[0 ..< cert.find("-----END")]
+      let mismatched =
+        cert.replace("-----END CERTIFICATE-----", "-----END PRIVATE KEY-----")
+      let lines = cert.splitLines
+      let colonInBody = (lines[0 .. 2] & @["AAAA:AAAA"] & lines[3 .. ^1]).join("\n")
+      for pem in [cert & truncated, mismatched, colonInBody]:
+        expect TLSStreamProtocolError:
+          discard loadCertificate(pem)
+        expect PgConfigError:
+          discard parseTrustAnchors(pem)
+
+    test "base64 that BearSSL would reject is not decoded leniently":
+      let lines = testCaCert().splitLines
+      var mangled = lines
+      mangled[1] = mangled[1][0 ..< ^2] & "-_"
+      var truncated = lines
+      truncated[1] = truncated[1][0 ..< ^1]
+      for pem in [mangled.join("\n"), truncated.join("\n")]:
+        expect PgConfigError:
+          discard parseTrustAnchors(pem)
+
+    test "folded RFC 1421 headers are not body text":
+      check EncryptedKeyMsg ==
+        loadKeyError(
+          legacyEncryptedKey.replace("DEK-Info", "Comment: a\n  b\nDEK-Info")
+        )
+
+    test "banners are matched case-sensitively, as by OpenSSL":
+      expect TLSStreamProtocolError:
+        discard loadCertificate(testCaCert().replace("CERTIFICATE", "certificate"))
+
+    test "text around PEM blocks is ignored":
+      let key = readCertFile("wrong_ca.rsa.key")
+      check loadPrivateKey(key & "\n") != nil
+      check loadPrivateKey("# comment\n" & key & "# trailing note\n") != nil
+      check loadCertificate(testCaCert() & "\n# note\n") != nil
+      check parseTrustAnchors(testCaCert() & "\n# note\n").backing.len > 0
+
+    test "loadPrivateKey rejects a PEM with no key block":
+      expect TLSStreamProtocolError:
+        discard loadPrivateKey(testCaCert())
+
     test "a PEM with no anchor is a config fault, not a connection failure":
       # `PgConnectionError` is the reconnect-worthy family; a PEM that can never
       # parse must not land an application in a retry loop.
@@ -2075,8 +2305,7 @@ when hasChronos:
       check raised of PgConfigError
 
     test "PEM that does not decode at all is a config fault too":
-      # `pemDecode` rejects garbage before the anchor loop runs, so its own
-      # chronos error type must be folded into the same `PgConfigError`.
+      # Garbage yields no block at all, the anchorless case.
       var raised: ref PgError
       try:
         discard parseTrustAnchors("not a PEM certificate")

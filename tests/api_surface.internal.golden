@@ -13,6 +13,7 @@ async_postgres/pg_auth.nim	scramClientFinalMessage
 async_postgres/pg_auth.nim	scramClientFirstMessage
 async_postgres/pg_auth.nim	scramEscapeUsername
 async_postgres/pg_auth.nim	scramVerifyServerFinal
+async_postgres/pg_bearssl.nim	EncryptedKeyMsg
 async_postgres/pg_bearssl.nim	TrustAnchorResult
 async_postgres/pg_bearssl.nim	TrustAnchorResult.backing
 async_postgres/pg_bearssl.nim	TrustAnchorResult.store
@@ -23,6 +24,8 @@ async_postgres/pg_bearssl.nim	X509CertCaptureContext.depth
 async_postgres/pg_bearssl.nim	X509CertCaptureContext.inner
 async_postgres/pg_bearssl.nim	X509CertCaptureContext.vtable
 async_postgres/pg_bearssl.nim	installX509Capture
+async_postgres/pg_bearssl.nim	loadCertificate
+async_postgres/pg_bearssl.nim	loadPrivateKey
 async_postgres/pg_bearssl.nim	parseTrustAnchors
 async_postgres/pg_bearssl.nim	rebindX509Capture
 async_postgres/pg_client/core.nim	StmtCacheInvalidatingStates
