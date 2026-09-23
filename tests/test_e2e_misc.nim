@@ -273,6 +273,8 @@ suite "E2E: Logical Replication":
       var gotInsert = false
       var insertRelName = ""
       var insertVal = ""
+      var commitEnd = InvalidLsn
+      var confirmedAtCommit = InvalidLsn
 
       let cb = makeReplicationCallback:
         case msg.kind
@@ -288,16 +290,17 @@ suite "E2E: Logical Replication":
             if pgMsg.insert.newTuple.len >= 2 and
                 pgMsg.insert.newTuple[1].kind == tdkText:
               insertVal = pgMsg.insert.newTuple[1].toString()
-            await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
-            await replConn.stopReplication()
           of pomkCommit:
-            discard
+            if gotInsert:
+              # Unclamped only if the Commit's XLogData.startLsn is its endLsn.
+              commitEnd = pgMsg.commit.endLsn
+              discard replConn.confirmFlushed(commitEnd)
+              confirmedAtCommit = replConn.confirmedFlushLsn
+              await replConn.stopReplication()
           else:
             discard
         of rmkPrimaryKeepalive:
-          # autoKeepaliveReply (default) already replied: receivedEndLsn in the
-          # receive field (resets wal_sender_timeout); flush/apply track the
-          # confirmFlushed position. No manual reply needed.
+          # autoKeepaliveReply (default) already replied.
           discard
 
       # Insert a row from the writer connection after a short delay
@@ -321,7 +324,16 @@ suite "E2E: Logical Replication":
       doAssert gotInsert, "Should have received an INSERT message"
       doAssert insertRelName == "test_repl_tbl"
       doAssert insertVal == "hello_repl"
+      doAssert commitEnd != InvalidLsn
+      doAssert confirmedAtCommit == commitEnd
       doAssert replConn.state == csReady
+
+      # stopReplication reported the confirmed position as flush.
+      let slotRes = await writer.simpleQuery(
+        "SELECT confirmed_flush_lsn FROM pg_replication_slots " &
+          "WHERE slot_name = 'test_stream_slot'"
+      )
+      doAssert parseLsn(slotRes[0].rows[0].getStr(0)) == commitEnd
 
       await replConn.close()
 
@@ -346,11 +358,11 @@ suite "E2E: Logical Replication":
       let cb = makeReplicationCallback:
         case msg.kind
         of rmkXLogData:
-          await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
+          discard
         of rmkPrimaryKeepalive:
-          # Stop immediately on first keepalive. autoKeepaliveReply (default)
-          # already replied (receive = receivedEndLsn); flush/apply track the
-          # confirmFlushed position.
+          # Confirm first so stopReplication's status doesn't move flush back.
+          discard replConn.confirmFlushed(msg.keepalive.walEnd)
+          await replConn.sendStandbyStatus(replConn.confirmedFlushLsn)
           await replConn.stopReplication()
 
       await replConn.startReplication(
