@@ -810,33 +810,48 @@ proc checkReplicating(conn: PgConnection, op: string) =
     op & ": connection is not in replicating state (state: " & $conn.state & ")",
   )
 
+const StandbyStatusLen = 1 + 8 + 8 + 8 + 8 + 1
+  ## 'r' + receive + flush + apply + clock + replyRequested.
+
+proc sendReported(
+    conn: PgConnection, msg: seq[byte], positions: tuple[receive, flush, apply: uint64]
+) {.async.} =
+  ## Send a caller's Standby Status Update and, once it is written, record its
+  ## positions: the library's own status never reports below them (see
+  ## ``sendConfirmedStatus``). A cancelled or failed send records nothing.
+  await conn.sendMsg(msg)
+  conn.noteReplReported(positions.receive, positions.flush, positions.apply)
+
 proc sendCopyData*(conn: PgConnection, data: openArray[byte]): Future[void] =
   ## Send CopyData during ``csReplicating``. Raises ``PgStateError`` (not
   ## replicating) / ``PgConnectionError`` (connection lost) / ``PgTypeError``
   ## synchronously before first suspension. ``data`` is encoded into the frame
   ## there too, so the caller's buffer need not outlive the returned ``Future``.
+  ## A hand-built Standby Status Update is recorded like ``sendStandbyStatus``.
   conn.checkReplicating("sendCopyData")
   var buf: seq[byte]
   encodeCopyData(buf, data)
+  if data.len == StandbyStatusLen and data[0] == byte('r'):
+    let positions = (
+      cast[uint64](decodeInt64(data, 1)),
+      cast[uint64](decodeInt64(data, 9)),
+      cast[uint64](decodeInt64(data, 17)),
+    )
+    return conn.sendReported(buf, positions)
   conn.sendMsg(buf)
 
-proc sendStandbyStatusRaw(
-    conn: PgConnection, receiveLsn, flushLsn, applyLsn: Lsn, replyRequested: bool
-): Future[void] {.async.} =
-  ## Encode and send a Standby Status Update with the given receive/flush/apply
-  ## LSNs verbatim — no ``InvalidLsn`` defaulting. This is the single place the
-  ## wire encoding lives; the public ``sendStandbyStatus`` (which applies the
-  ## up-to-receive defaulting) and ``sendConfirmedStatus`` (which sends the
-  ## confirmed position verbatim) both route through it. Callers are responsible
-  ## for the ``csReplicating`` guard.
-  let msg = encodeStandbyStatusUpdate(
+proc encodeStatus(
+    receiveLsn, flushLsn, applyLsn: Lsn, replyRequested: bool
+): seq[byte] =
+  ## Standby Status Update with the given LSNs verbatim — no ``InvalidLsn``
+  ## defaulting. The single place the wire encoding lives.
+  encodeStandbyStatusUpdate(
     receiveLsn.toInt64,
     flushLsn.toInt64,
     applyLsn.toInt64,
     currentPgTimestamp(),
     if replyRequested: 1'u8 else: 0'u8,
   )
-  await conn.sendMsg(msg)
 
 proc sendStandbyStatus*(
     conn: PgConnection,
@@ -852,12 +867,16 @@ proc sendStandbyStatus*(
   ## Values are sent verbatim, unlike ``confirmFlushed``. On a logical stream
   ## pass ``CommitMessage.endLsn`` or ``PrimaryKeepalive.walEnd``, never
   ## ``receivedEndLsn``: a flush past an unsent commit makes the server skip it.
-  ## The auto-reply and ``stopReplication`` send the ``confirmFlushed``
-  ## position, so confirm the same LSN first or they may move flush backwards.
+  ## The auto-reply, periodic status and ``stopReplication`` never report less
+  ## than the last update sent here: they send the ``confirmFlushed`` position
+  ## or these, whichever is higher.
   conn.checkReplicating("sendStandbyStatus")
   let flushVal = if flushLsn == InvalidLsn: receiveLsn else: flushLsn
   let applyVal = if applyLsn == InvalidLsn: receiveLsn else: applyLsn
-  await conn.sendStandbyStatusRaw(receiveLsn, flushVal, applyVal, replyRequested)
+  await conn.sendReported(
+    encodeStatus(receiveLsn, flushVal, applyVal, replyRequested),
+    (receiveLsn.toUInt64, flushVal.toUInt64, applyVal.toUInt64),
+  )
 
 proc confirmedFlushLsn*(conn: PgConnection): Lsn {.inline.} =
   ## Confirmed flush LSN for current stream, or ``InvalidLsn`` outside stream.
@@ -884,22 +903,27 @@ proc confirmFlushed*(conn: PgConnection, lsn: Lsn): bool =
 proc sendConfirmedStatus(conn: PgConnection, receiveLsn: Lsn): Future[void] {.async.} =
   ## Send a Standby Status Update carrying ``receiveLsn`` in the *receive* field
   ## (which resets ``wal_sender_timeout`` on the server) and the
-  ## ``confirmFlushed`` position in flush/apply. The confirmed position is sent
-  ## verbatim — it is the stream's ``startLsn`` until ``confirmFlushed`` advances
-  ## it, so when nothing has been confirmed and ``startLsn`` was left at its
-  ## default ``InvalidLsn`` it is ``0/0``, which PostgreSQL reads as "position
-  ## unknown" and will not move the slot backwards. Either way flush never
-  ## advances past WAL the callback has not yet confirmed durable. Used by the
-  ## automatic keepalive reply and by ``stopReplication``.
+  ## ``confirmFlushed`` position in flush/apply. The confirmed position is the
+  ## stream's ``startLsn`` until ``confirmFlushed`` advances it, so when nothing
+  ## has been confirmed and ``startLsn`` was left at its default ``InvalidLsn``
+  ## it is ``0/0``, which PostgreSQL reads as "position unknown" and will not
+  ## move the slot backwards. Used by the automatic keepalive reply, the
+  ## periodic status and ``stopReplication``.
   ##
-  ## Only valid while ``csReplicating``, where ``confirmedFlushLsn`` is bounded
-  ## by received WAL (see ``confirmFlushed``), so flush never exceeds receive.
+  ## Each field is raised to the caller's last Standby Status Update
+  ## (``sendStandbyStatus``, or one sent via ``sendCopyData``): the server holds
+  ## those, and a lower flush moves a physical slot's ``restart_lsn`` backwards.
+  ## Flush thus never passes both what the callback confirmed durable and what
+  ## the caller reported. Receive is kept at or above flush and apply.
+  ##
   ## Calling this outside an active replication stream raises ``PgStateError``.
   conn.checkReplicating("sendConfirmedStatus")
-  let flushLsn = conn.confirmedFlushLsn
-  await conn.sendStandbyStatusRaw(
-    receiveLsn, flushLsn, flushLsn, replyRequested = false
-  )
+  let confirmed = conn.confirmedFlushLsn.toUInt64
+  let reported = conn.replReported
+  let flushLsn = max(confirmed, reported.flush)
+  let applyLsn = max(confirmed, reported.apply)
+  let receive = max(max(receiveLsn.toUInt64, reported.receive), max(flushLsn, applyLsn))
+  await conn.sendMsg(encodeStatus(Lsn(receive), Lsn(flushLsn), Lsn(applyLsn), false))
 
 proc resetReplLsnTracking(conn: PgConnection, startLsn: Lsn) =
   ## Reset the per-stream confirmed-flush and max-received positions to the
@@ -987,10 +1011,10 @@ proc maybeSendPeriodicStatus(
   ## Emit a proactive Standby Status Update if ``statusInterval`` has elapsed
   ## since the last one, so ``confirmed_flush_lsn`` advances (and
   ## ``wal_sender_timeout`` resets) even when the server never requests a reply —
-  ## e.g. a server configured with ``wal_sender_timeout = 0``. The update reports
-  ## the highest received LSN as receive and the ``confirmFlushed`` position as
-  ## flush/apply, identical to the automatic keepalive reply, so it never advances
-  ## flush past WAL the callback has confirmed durable. Returns the timestamp to
+  ## e.g. a server configured with ``wal_sender_timeout = 0``. The update is the
+  ## automatic keepalive reply's (see ``sendConfirmedStatus``): receive = highest
+  ## received, flush/apply = the ``confirmFlushed`` position, never below the
+  ## caller's last reported status. Returns the timestamp to
   ## record as the new ``lastStatusSent`` (unchanged when nothing was sent).
   ##
   ## Only active together with ``autoKeepaliveReply``: under manual reply
@@ -1230,7 +1254,8 @@ proc startReplication*(
   ##
   ## ``statusInterval`` (``ZeroDuration`` = off) sends a proactive Standby Status
   ## Update at least that often — receive = highest received, flush/apply =
-  ## ``confirmFlushed`` — so the slot advances on a server that never requests a
+  ## ``confirmFlushed`` (never below a position the caller itself reported via
+  ## ``sendStandbyStatus``) — so the slot advances on a server that never requests a
   ## reply (``wal_sender_timeout = 0``). Honoured only with
   ## ``autoKeepaliveReply``; under asyncdispatch it fires only while messages are
   ## flowing, so a fully idle stream sends nothing until the next message.
@@ -1318,7 +1343,8 @@ proc startReplication*(
   )
 
 proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
-  ## Terminate replication. Flushes confirmed position before CopyDone.
+  ## Terminate replication. Flushes confirmed position before CopyDone, never
+  ## below the caller's last reported status (``sendStandbyStatus``).
   ## Raises ``PgStateError`` unless the connection is ``csReplicating``, or
   ## ``PgConnectionError`` when the connection was lost.
   conn.checkReplicating("stopReplication")

@@ -370,6 +370,8 @@ type
     replMaxReceivedLsnRaw: uint64 ## Replication: max received LSN (raw).
     replReadScratch: seq[byte] ## Chronos scratch for ``fillRecvBufDetached``.
     replCopyDoneSent: bool ## Client already sent CopyDone (skip mirror).
+    replReportedRaw: tuple[receive, flush, apply: uint64]
+      ## Replication: positions of the caller's last Standby Status Update (raw).
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -689,6 +691,7 @@ proc initReplLsnTracking*(conn: PgConnection, startLsn: uint64) =
   ## Reset per-stream LSN tracking to ``startLsn``.
   conn.replConfirmedFlushLsnRaw = startLsn
   conn.replMaxReceivedLsnRaw = startLsn
+  conn.replReportedRaw = (0'u64, 0'u64, 0'u64)
 
 proc updateReplMaxReceivedLsn*(conn: PgConnection, received: uint64): bool =
   ## Advance max-received LSN if ``received`` is greater; return if updated.
@@ -697,6 +700,15 @@ proc updateReplMaxReceivedLsn*(conn: PgConnection, received: uint64): bool =
     true
   else:
     false
+
+proc noteReplReported*(conn: PgConnection, receive, flush, apply: uint64) =
+  ## Record the positions a caller's Standby Status Update just sent. The
+  ## latest report wins, so a caller may deliberately report lower.
+  conn.replReportedRaw = (receive, flush, apply)
+
+func replReported*(conn: PgConnection): tuple[receive, flush, apply: uint64] =
+  ## Raw reported positions (see ``noteReplReported``).
+  conn.replReportedRaw
 
 func replConfirmedFlushLsn*(conn: PgConnection): uint64 =
   ## Raw flush LSN (use typed API).

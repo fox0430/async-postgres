@@ -616,6 +616,64 @@ suite "E2E: Physical Replication":
 
     waitFor t()
 
+  test "manual mode stop does not move the slot's restart_lsn back":
+    # The caller reported its flush; the stop's own status must not report the
+    # lower resume point, which would move restart_lsn backwards.
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_manual') " &
+          "FROM pg_replication_slots WHERE slot_name = 'test_phys_manual'"
+      )
+      discard await writer.simpleQuery(
+        "SELECT pg_create_physical_replication_slot('test_phys_manual', true)"
+      )
+      discard await writer.simpleQuery("DROP TABLE IF EXISTS test_phys_manual_tbl")
+      discard await writer.simpleQuery("CREATE TABLE test_phys_manual_tbl (v int)")
+      # The slot reserves WAL: drop it even when an assertion fails.
+      try:
+        let replConn = await connectReplication(plainConfig(), rmPhysical)
+        let info = await replConn.identifySystem()
+
+        var reported = InvalidLsn
+        let cb = makeReplicationCallback:
+          if msg.kind == rmkXLogData and msg.xlogData.data.len > 0 and
+              reported == InvalidLsn:
+            reported = msg.xlogData.receivedEndLsn
+            await replConn.sendStandbyStatus(reported)
+            await replConn.stopReplication()
+
+        proc insertRows() {.async.} =
+          await sleepAsync(milliseconds(200))
+          discard
+            await writer.simpleQuery("INSERT INTO test_phys_manual_tbl VALUES (1)")
+
+        let insertFut = insertRows()
+        await replConn.startPhysicalReplication(
+          startLsn = info.xLogPos,
+          slotName = "test_phys_manual",
+          autoKeepaliveReply = false,
+          callback = cb,
+        )
+        await insertFut
+        await replConn.close()
+
+        doAssert reported != InvalidLsn
+        let slotRes = await writer.simpleQuery(
+          "SELECT restart_lsn FROM pg_replication_slots " &
+            "WHERE slot_name = 'test_phys_manual'"
+        )
+        doAssert parseLsn(slotRes[0].rows[0].getStr(0)) == reported
+      finally:
+        discard await writer.simpleQuery(
+          "SELECT pg_drop_replication_slot('test_phys_manual') " &
+            "FROM pg_replication_slots WHERE slot_name = 'test_phys_manual'"
+        )
+        discard await writer.simpleQuery("DROP TABLE IF EXISTS test_phys_manual_tbl")
+        await writer.close()
+
+    waitFor t()
+
   test "readReplicationSlot returns physical slot info":
     proc t() {.async.} =
       let writer = await connect(plainConfig())

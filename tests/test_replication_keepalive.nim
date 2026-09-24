@@ -596,6 +596,159 @@ suite "Replication: client-initiated stop":
     waitFor testBody()
     check stopFrontendMsgs == @['d', 'c', 'X']
 
+  proc statusFrame(lsn: int64): seq[byte] =
+    ## A hand-built Standby Status Update reporting ``lsn`` in every field.
+    var f = @[byte('r')]
+    for _ in 0 ..< 3:
+      for i in countdown(7, 0):
+        f.add(byte((lsn shr (i * 8)) and 0xff))
+    for _ in 0 ..< 8:
+      f.add(0'u8)
+    f.add(0'u8)
+    f
+
+  type ReportVia = enum
+    rvStatus # sendStandbyStatus
+    rvCopyData # a hand-built status via sendCopyData
+
+  proc runReportThenStop(
+      reports: seq[int64], confirm: bool, autoReply: bool, via = rvStatus
+  ): tuple[msgs: seq[char], last: tuple[receive, flush, apply: int64]] =
+    ## On the XLogData the callback sends each of ``reports`` as a status
+    ## (after a lower confirmFlushed when ``confirm``) and stops. Records
+    ## frontend messages up to CopyDone and the positions of the last status.
+    var res: tuple[msgs: seq[char], last: tuple[receive, flush, apply: int64]] =
+      (@[], (-1'i64, -1'i64, -1'i64))
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        var burst = buildCopyBothResponse()
+        burst.add(buildXLogData(testStartLsn, testStartLsn, 0, testWalData))
+        await sendBytes(st, burst)
+        while true:
+          let m = await drainFrontendMessage(st)
+          {.cast(gcsafe).}:
+            res.msgs.add(m.msgType)
+            if m.msgType == 'd':
+              res.last = decodeStandbyStatus(m.body)
+          if m.msgType == 'c':
+            break
+        var tail = buildCopyDone()
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        discard await drainFrontendMessage(st) # Terminate
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        if msg.kind == rmkXLogData:
+          if confirm:
+            discard conn.confirmFlushed(msg.xlogData.startLsn)
+          for lsn in reports:
+            case via
+            of rvStatus:
+              await conn.sendStandbyStatus(Lsn(lsn))
+            of rvCopyData:
+              await conn.sendCopyData(statusFrame(lsn))
+          await conn.stopReplication()
+
+      await conn.startReplication(
+        "test_slot", autoKeepaliveReply = autoReply, callback = cb
+      )
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    res
+
+  # The library's own status must not report below the caller's last report:
+  # on a physical slot PostgreSQL takes flush as the new restart_lsn.
+  test "manual mode: the stop's status keeps the reported flush":
+    let r =
+      runReportThenStop(@[testKeepaliveWalEnd], confirm = false, autoReply = false)
+    check r.msgs == @['d', 'd', 'c']
+    check r.last == (testKeepaliveWalEnd, testKeepaliveWalEnd, testKeepaliveWalEnd)
+
+  test "manual mode with a lower confirmFlushed: the reported flush still wins":
+    let r = runReportThenStop(@[testKeepaliveWalEnd], confirm = true, autoReply = false)
+    check r.msgs == @['d', 'd', 'c']
+    check r.last.flush == testKeepaliveWalEnd
+
+  test "auto-reply mode: a manual report is not undercut by the stop":
+    let r = runReportThenStop(@[testKeepaliveWalEnd], confirm = true, autoReply = true)
+    check r.msgs == @['d', 'd', 'c']
+    check r.last.flush == testKeepaliveWalEnd
+
+  test "a status sent via sendCopyData is kept too":
+    let r = runReportThenStop(
+      @[testKeepaliveWalEnd], confirm = false, autoReply = false, via = rvCopyData
+    )
+    check r.msgs == @['d', 'd', 'c']
+    check r.last.flush == testKeepaliveWalEnd
+
+  test "a deliberately lower report is kept, not the earlier higher one":
+    let lower = testStartLsn + 0x100
+    let r = runReportThenStop(
+      @[testKeepaliveWalEnd, lower], confirm = false, autoReply = false
+    )
+    check r.msgs == @['d', 'd', 'd', 'c']
+    check r.last.flush == lower
+
+  test "the keepalive reply and the server-stop mirror keep the reported position":
+    # Receive, flush and apply of each library status stay at or above the
+    # caller's report.
+    var replies: seq[tuple[receive, flush, apply: int64]]
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        var burst = buildCopyBothResponse()
+        burst.add(buildXLogData(testStartLsn, testStartLsn, 0, testWalData))
+        await sendBytes(st, burst)
+        discard await drainFrontendMessage(st) # the caller's report
+        await sendBytes(st, buildKeepalive(testStartLsn, 0, replyRequested = true))
+        let reply = await drainFrontendMessage(st)
+        {.cast(gcsafe).}:
+          replies.add(decodeStandbyStatus(reply.body))
+        var tail = buildCopyDone() # server-initiated stop
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        let mirror = await drainFrontendMessage(st) # status before its CopyDone
+        {.cast(gcsafe).}:
+          replies.add(decodeStandbyStatus(mirror.body))
+        discard await drainFrontendMessage(st) # CopyDone
+        discard await drainFrontendMessage(st) # Terminate
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        if msg.kind == rmkXLogData:
+          await conn.sendStandbyStatus(
+            Lsn(testKeepaliveWalEnd), applyLsn = Lsn(testStartLsn)
+          )
+
+      await conn.startReplication("test_slot", callback = cb)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check replies.len == 2
+    for r in replies:
+      check r.receive == testKeepaliveWalEnd
+      check r.flush == testKeepaliveWalEnd
+      check r.apply == testStartLsn
+
 when hasChronos:
   suite "Replication: idle wakeup rate":
     test "statusInterval + autoKeepaliveReply=false does not busy-spin while idle":
