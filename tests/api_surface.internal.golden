@@ -175,10 +175,12 @@ async_postgres/pg_connection/types.nim	markStaged
 async_postgres/pg_connection/types.nim	markState
 async_postgres/pg_connection/types.nim	newPgQueryError
 async_postgres/pg_connection/types.nim	nextPortalName
+async_postgres/pg_connection/types.nim	noteReplReported
 async_postgres/pg_connection/types.nim	raiseClosedConnection
 async_postgres/pg_connection/types.nim	raiseTransportFailure
 async_postgres/pg_connection/types.nim	replConfirmedFlushLsn
 async_postgres/pg_connection/types.nim	replMaxReceivedLsn
+async_postgres/pg_connection/types.nim	replReported
 async_postgres/pg_connection/types.nim	requireStaged
 async_postgres/pg_connection/types.nim	sendBuf
 async_postgres/pg_connection/types.nim	updateReplMaxReceivedLsn
