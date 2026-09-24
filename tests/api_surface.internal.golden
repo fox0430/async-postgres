@@ -146,6 +146,12 @@ async_postgres/pg_connection/types.nim	PgClosedReason.crClosed
 async_postgres/pg_connection/types.nim	PgClosedReason.crClosedByUser
 async_postgres/pg_connection/types.nim	PgClosedReason.crOpen
 async_postgres/pg_connection/types.nim	RecvBufSize
+async_postgres/pg_connection/types.nim	ReplWrite
+async_postgres/pg_connection/types.nim	ReplWriteState
+async_postgres/pg_connection/types.nim	ReplWriteState.rwFailed
+async_postgres/pg_connection/types.nim	ReplWriteState.rwQueued
+async_postgres/pg_connection/types.nim	ReplWriteState.rwWriting
+async_postgres/pg_connection/types.nim	ReplWriteState.rwWritten
 async_postgres/pg_connection/types.nim	TCP_KEEPALIVE
 async_postgres/pg_connection/types.nim	TCP_KEEPCNT
 async_postgres/pg_connection/types.nim	TCP_KEEPCNT#2

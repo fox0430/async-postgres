@@ -797,6 +797,12 @@ suite "checkReplicating during the close window":
     # Reaches the clamp instead of raising; nothing was received, so no advance.
     check not conn.confirmFlushed(parseLsn("0/1"))
 
+  test "confirmFlushed raises only PgError":
+    proc confirm(conn: PgConnection): bool {.raises: [PgError].} =
+      conn.confirmFlushed(parseLsn("0/1"))
+
+    check not confirm(mkReplConn(closedByUser = false))
+
   test "confirmedFlushLsn reports InvalidLsn inside the close window":
     check mkReplConn(closedByUser = true).confirmedFlushLsn == InvalidLsn
 
@@ -959,6 +965,16 @@ suite "startReplication / startPhysicalReplication preflight":
       waitFor conn.startReplication(
         "slot", InvalidLsn, options = @[("", "1")], callback = cb
       )
+
+  test "non-ASCII replication option key raises ValueError":
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    for k in ["k\xff", "\xe9t\xe9"]:
+      expect ValueError:
+        waitFor conn.startReplication(
+          "slot", InvalidLsn, options = @[(k, "1")], callback = cb
+        )
 
   test "negative physical timeline raises ValueError":
     let conn = mkStubConn()
