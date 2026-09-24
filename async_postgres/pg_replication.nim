@@ -1165,8 +1165,8 @@ proc runReplicationStream(
         of bmkCopyDone:
           # Mirror only on server-initiated stop (walsender timeout,
           # pg_terminate_backend, slot drop). If the client already sent
-          # CopyDone via stopReplication, a second one would land after the
-          # server left COPY mode -> "invalid frontend message type".
+          # CopyDone via stopReplication, the protocol allows no second one
+          # (PostgreSQL 18 ignores it once out of COPY mode).
           if not conn.replCopyDoneSent:
             try:
               await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
