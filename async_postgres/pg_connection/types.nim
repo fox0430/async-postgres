@@ -369,9 +369,38 @@ type
       ## Replication: confirmed flush LSN (raw; see ``pg_replication``).
     replMaxReceivedLsnRaw: uint64 ## Replication: max received LSN (raw).
     replReadScratch: seq[byte] ## Chronos scratch for ``fillRecvBufDetached``.
-    replCopyDoneSent: bool ## Client already sent CopyDone (skip mirror).
+    replWrites: Deque[ReplWrite]
+      ## Replication writes not yet started, in wire order (see ``pg_replication``).
+    replFlusher: Future[void] ## The task draining ``replWrites``; nil when idle.
+    replFinalStatus: ReplWrite
+      ## The stop's last status, written once ``replWrites`` is drained.
+    replWriteFailure: ref CatchableError
+      ## The write failure that ended the stream, kept as the cause of later errors.
+    replPendingStatus: ReplWrite ## The library's status queued and not yet encoded.
+    replWritesOpen: bool ## The stream accepts writes; cleared as it ends.
+    replCopyDone: ReplWrite
+      ## The client's CopyDone once requested, written after ``replFinalStatus``.
+    replAutoConfirm: bool ## Logical stream confirms progress itself (``autoConfirm``).
+    replInTxn: bool ## ``autoConfirm``: between a pgoutput Begin and Commit.
+    replInCallback: bool
+      ## The stream's callback is running; the stop's final status waits for it.
     replReportedRaw: tuple[receive, flush, apply: uint64]
       ## Replication: positions of the caller's last Standby Status Update (raw).
+    replSentFlushRaw: uint64
+      ## Replication: flush of the library's last Standby Status Update (raw).
+
+  ReplWriteState* = enum
+    ## Lifecycle of a queued replication write (internal).
+    rwQueued ## Waiting in the queue.
+    rwWriting ## Taken off the queue; a library status is encoded by then.
+    rwWritten
+    rwFailed ## Not written, whether it had started or not.
+
+  ReplWrite* = ref object
+    ## A queued replication write (internal; see ``pg_replication``).
+    frame: seq[byte] ## Encoded frame; empty for the library's status.
+    waiters: seq[Future[void]] ## Completed once written, failed if not.
+    state: ReplWriteState
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
