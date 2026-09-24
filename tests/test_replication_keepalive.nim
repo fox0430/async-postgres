@@ -541,8 +541,8 @@ suite "Replication: client-initiated stop":
   test "stopReplication does not double-send CopyDone":
     # Regression: the recv-loop `bmkCopyDone` handler used to mirror the
     # server's CopyDone unconditionally, so after stopReplication the client
-    # sent [status, CopyDone] twice. The second CopyDone arrives after the
-    # server has left COPY mode and would be `invalid frontend message type`.
+    # sent [status, CopyDone] twice. The protocol allows nothing after the
+    # client's CopyDone (PostgreSQL 18 ignores it once out of COPY mode).
     stopFrontendMsgs.setLen(0)
 
     proc testBody() {.async.} =
