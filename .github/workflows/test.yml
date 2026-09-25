@@ -95,6 +95,10 @@ jobs:
         run: nimble test -y
         background: true
 
+      # tests/config.nims always adds -d:ssl, so no test build covers this.
+      - name: Check build without TLS (asyncdispatch, no -d:ssl)
+        run: nim check --hints:off --warningAsError:UnreachableCode --warningAsError:UnusedImport async_postgres.nim
+
       - name: Compile examples (asyncdispatch)
         run: for f in examples/*.nim; do nim c "$f"; done
 
