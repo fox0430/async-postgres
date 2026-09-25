@@ -302,11 +302,11 @@ proc buildNotificationResponse*(pid: int32, channel, payload: string): seq[byte]
   body.add(0'u8)
   buildBackendMsg('A', body)
 
-proc buildErrorResponse*(sqlState, message: string): seq[byte] =
+proc buildErrorResponse*(sqlState, message: string, severity = "ERROR"): seq[byte] =
   ## Minimal ErrorResponse with severity 'S', sqlstate 'C', message 'M'.
   var body: seq[byte]
   body.add(byte('S'))
-  for c in "ERROR":
+  for c in severity:
     body.add(byte(c))
   body.add(0'u8)
   body.add(byte('C'))

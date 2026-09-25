@@ -40,6 +40,24 @@ proc oneLine(msg: string): string =
       parts.add(stripped)
   parts.join(" | ")
 
+proc startupError(fields: seq[ErrorField]): ref PgConnectionError =
+  ## The server refused the session; keep its fields so callers can tell a
+  ## bad password from a server that is still starting up.
+  (ref PgConnectionError)(
+    msg: formatError(fields), serverError: newPgQueryError(fields)
+  )
+
+proc foldFailures(
+    msg: string, attempts: seq[ref CatchableError]
+): ref PgConnectionError =
+  ## One error summing up ``attempts``, the last one as ``parent``.
+  let parent =
+    if attempts.len > 0:
+      attempts[^1]
+    else:
+      nil
+  (ref PgConnectionError)(msg: msg, parent: parent, attempts: attempts)
+
 # Authentication policy helpers
 
 proc enforceAuthAllowed(
@@ -183,13 +201,14 @@ proc connectToHost*(
     # the SSL connection. Use sslRequire or stronger if security is needed.
     var plainConfig = config
     plainConfig.sslMode = sslDisable
-    var plainErrMsg = ""
+    var plainErr: ref CatchableError
     try:
       return await connectToHost(plainConfig, entry)
     except CancelledError as e:
       raise e
     except CatchableError as e:
-      plainErrMsg = oneLine(e.msg)
+      plainErr = e
+    let plainErrMsg = oneLine(plainErr.msg)
 
     var sslConfig = config
     sslConfig.sslMode = sslRequire
@@ -197,13 +216,16 @@ proc connectToHost*(
       return await connectToHost(sslConfig, entry)
     except CancelledError as e:
       raise e
+    except PgConfigError as e:
+      # A cert or key that will not load is the shared config's fault, never
+      # hidden behind the plaintext leg's outcome.
+      raise e
     except CatchableError as e:
-      let sslErrMsg = oneLine(e.msg)
-      raise newException(
-        PgConnectionError,
+      # Both legs, so neither failure is hidden behind the other.
+      raise foldFailures(
         "sslmode=allow: plaintext attempt failed (" & plainErrMsg &
-          ") and SSL fallback failed (" & sslErrMsg & ")",
-        e,
+          ") and SSL fallback failed (" & oneLine(e.msg) & ")",
+        @[plainErr, e],
       )
 
   let hostAddr = entry.dialAddr
@@ -448,7 +470,7 @@ proc connectToHost*(
               )
             scramFinalVerified = true
           of bmkErrorResponse:
-            raise newException(PgConnectionError, formatError(msg.errorFields))
+            raise startupError(msg.errorFields)
           else:
             discard
         await conn.fillRecvBuf()
@@ -469,7 +491,7 @@ proc connectToHost*(
             conn.markReady()
             break readyLoop
           of bmkErrorResponse:
-            raise newException(PgConnectionError, formatError(msg.errorFields))
+            raise startupError(msg.errorFields)
           else:
             discard
         await conn.fillRecvBuf()
@@ -620,6 +642,8 @@ proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Connect with multi-host failover, ``targetSessionAttrs``, per-host ``connectTimeout``.
   ## Per-host failures fold into one ``PgConnectionError``; a ``PgConfigError`` escapes the fold.
+  ## Its ``attempts`` hold each host's latest failure, a mismatch included
+  ## (``serverErrors`` collects their refusals), its ``parent`` the last one.
   ## Single-host ``connectTimeout`` raises ``AsyncTimeoutError`` (not folded).
   # Local mutable copy: ``validateConnConfig`` may normalize ``connectTimeout``.
   var config = config
@@ -641,15 +665,13 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
         raise err
 
     var errors: seq[string]
-    # With a single host there is no failover. Preserve the contract that its
-    # `connectTimeout` surfaces as a raw `AsyncTimeoutError` (callers and the
-    # pool branch on the type) instead of being folded into the aggregate
-    # `PgConnectionError` below — which only makes sense across multiple hosts.
-    var lastFailure: ref CatchableError
+    # Each host's latest failure (a preferStandby second pass overwrites the
+    # first), so every host that failed reports its last attempt.
+    var failures = newSeq[ref CatchableError](hosts.len)
 
     if config.targetSessionAttrs == tsaPreferStandby:
       # First pass: look for a standby
-      for entry in hosts:
+      for i, entry in hosts:
         try:
           let conn = await attemptHostTimed(config, entry, tsaStandby)
           if conn != nil:
@@ -658,41 +680,50 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
           raise e
         except CatchableError as e:
           reraiseConfigFault(e)
-          lastFailure = e
+          failures[i] = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
       # Second pass: accept any server
-      for entry in hosts:
+      for i, entry in hosts:
         try:
           return await attemptHostTimed(config, entry, tsaAny)
         except CancelledError as e:
           raise e
         except CatchableError as e:
           reraiseConfigFault(e)
-          lastFailure = e
+          failures[i] = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
     else:
-      for entry in hosts:
+      for i, entry in hosts:
         try:
           let conn = await attemptHostTimed(config, entry, config.targetSessionAttrs)
           if conn != nil:
             return conn
-          errors.add(
-            entry.displayHost & ":" & $entry.port &
-              ": server does not match target_session_attrs " &
-              $config.targetSessionAttrs
+          # Kept like any other failure: a failover may promote a standby or
+          # demote a primary, so this host may yet match.
+          let mismatch = newException(
+            PgConnectionError,
+            "server does not match target_session_attrs " & $config.targetSessionAttrs,
           )
+          failures[i] = mismatch
+          errors.add(entry.displayHost & ":" & $entry.port & ": " & mismatch.msg)
         except CancelledError as e:
           raise e
         except CatchableError as e:
           reraiseConfigFault(e)
-          lastFailure = e
+          failures[i] = e
           errors.add(entry.displayHost & ":" & $entry.port & ": " & e.msg)
 
-    if hosts.len == 1 and lastFailure != nil and lastFailure of AsyncTimeoutError:
-      raise lastFailure
-    raise newException(
-      PgConnectionError, "Could not connect to any host: " & errors.join("; ")
-    )
+    # With a single host there is no failover. Preserve the contract that its
+    # `connectTimeout` surfaces as a raw `AsyncTimeoutError` (callers and the
+    # pool branch on the type) instead of being folded into the aggregate
+    # `PgConnectionError` below — which only makes sense across multiple hosts.
+    if hosts.len == 1 and failures[0] of AsyncTimeoutError:
+      raise failures[0]
+    var attempts: seq[ref CatchableError]
+    for f in failures:
+      if f != nil:
+        attempts.add(f)
+    raise foldFailures("Could not connect to any host: " & errors.join("; "), attempts)
 
   proc wrapped(): Future[PgConnection] {.async.} =
     # ConnConfig may be built or mutated without passing through the parsers'

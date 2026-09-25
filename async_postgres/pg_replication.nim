@@ -810,7 +810,7 @@ proc replClosedError(conn: PgConnection, msg = "Connection is closed"): ref PgEr
       parent: newException(PgConnectionError, msg, conn.replWriteFailure),
     )
   of crClosed:
-    newException(PgConnectionError, msg, conn.replWriteFailure)
+    conn.newClosedError(msg, conn.replWriteFailure)
 
 proc checkReplicating(conn: PgConnection, op: string) =
   ## ``csReplicating`` guard for a mid-stream operation. A connection the

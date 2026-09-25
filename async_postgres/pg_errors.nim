@@ -43,6 +43,18 @@ type
     ## Connection failures, disconnections, TLS handshake and auth errors. A TLS
     ## fault that stems from the config itself (a cert, key or CA that will not
     ## load) is a ``PgConfigError`` instead.
+    serverError*: ref PgQueryError
+      ## The ErrorResponse behind the failure, nil if the server sent none: the
+      ## one that rejected the session during startup, or the FATAL that ended
+      ## it before the connection closed (e.g. ``57P01`` on shutdown). A
+      ## statement's ERROR is never kept here, nor on ``connect``'s aggregate
+      ## or ``sslmode=allow``'s pair: ``serverErrors`` collects their attempts'.
+    attempts*: seq[ref CatchableError]
+      ## The failed attempts this error sums up, in order: each host's latest
+      ## failure for ``connect`` (a host that answered but did not match
+      ## ``target_session_attrs`` included), the plaintext and SSL legs of
+      ## ``sslmode=allow``, or a listen pump's last redial. Empty when it sums
+      ## up nothing; ``connect``'s aggregate has one even for a single host.
 
   PgProtocolError* = object of PgConnectionError
     ## Raised on PostgreSQL wire protocol violations. The connection stream is
@@ -80,7 +92,9 @@ type
     ## verbatim in ``fields`` and exposed through the accessors below, such as
     ## ``constraintName`` and ``position``.
     sqlState*: string ## 5-char SQLSTATE code (e.g. "42P01"), empty if unavailable.
-    severity*: string ## e.g. "ERROR", "FATAL"
+    severity*: string
+      ## e.g. "ERROR", "FATAL"; the non-localized 'V' field when the server
+      ## sends it (PG 9.6+), else the possibly localized 'S'.
     detail*: string ## DETAIL field, empty if not present.
     hint*: string ## HINT field, empty if not present.
     fields*: seq[ErrorField]
@@ -180,6 +194,33 @@ func getErrorField*(fields: seq[ErrorField], code: char): string =
   for f in fields:
     if f.code == code:
       return f.value
+
+func isSessionFatal*(severity: string): bool =
+  ## Whether an ErrorResponse of ``severity`` ends the session: a FATAL or
+  ## PANIC, never a statement's ERROR.
+  severity in ["FATAL", "PANIC"]
+
+func serverErrors*(e: ref Exception): seq[ref PgQueryError] =
+  ## Every ErrorResponse behind ``e``, depth-first: a ``PgConnectionError``'s
+  ## ``serverError``, then its ``attempts``'; a ``PgQueryError`` that is a FATAL
+  ## or PANIC; any other error's ``parent``'s (e.g. a ``PgPoolError`` wrapping
+  ## ``connect``'s failure). A statement's ERROR is left out, as
+  ## ``serverError`` leaves it.
+  if e == nil:
+    return
+  if e of PgConnectionError:
+    # Not its `parent`: that repeats the last attempt, or a listen death's cause.
+    let ce = (ref PgConnectionError)(e)
+    if ce.serverError != nil:
+      result.add(ce.serverError)
+    for a in ce.attempts:
+      result.add(serverErrors(a))
+  elif e of PgQueryError:
+    let qe = (ref PgQueryError)(e)
+    if isSessionFatal(qe.severity):
+      result.add(qe)
+  else:
+    result = serverErrors(e.parent)
 
 # PgQueryError field accessors. Field codes are defined by the wire protocol
 # All return "" (or 0 for positions) when the server did not send the field.

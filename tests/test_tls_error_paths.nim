@@ -163,6 +163,31 @@ suite "TLS error paths: client cert/key/CA loading":
 
     check waitFor(runTest())
 
+  test "sslAllow with client certs escapes the connect fold as a config fault":
+    # Companion to the connectToHost-level rejection above: through connect()
+    # the shared-config fault must surface as PgConfigError instead of being
+    # folded into the per-host aggregate, even with multiple hosts. Multiple
+    # entries prove the escape: a per-host outcome would report
+    # "Could not connect to any host". No server is needed: wrapped()
+    # validates before any dial. Content is irrelevant, only presence.
+    proc runTest(): Future[bool] {.async.} =
+      var cfg = testConfig(5432, sslAllow)
+      cfg.sslCert = "cert"
+      cfg.sslKey = "key"
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: 5432),
+        HostEntry(host: "127.0.0.1", port: 5433),
+      ]
+      var configFault = false
+      try:
+        let conn = await connect(cfg)
+        await conn.close()
+      except PgConfigError:
+        configFault = true
+      configFault
+
+    check waitFor(runTest())
+
   test "slash hostaddr through connectToHost is a config fault":
     # `hostaddr` is a numeric IP. A '/' value would otherwise select
     # AF_UNIX via `dialAddr` and skip TLS entirely. The check runs before
