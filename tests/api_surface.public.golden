@@ -839,6 +839,7 @@ async_postgres/pg_errors.nim	PgSecurityError
 async_postgres/pg_errors.nim	PgStateError
 async_postgres/pg_errors.nim	PgTimeoutError
 async_postgres/pg_errors.nim	PgTypeError
+async_postgres/pg_errors.nim	PgUnavailableError
 async_postgres/pg_errors.nim	PoolErrorKind
 async_postgres/pg_errors.nim	PoolErrorKind.pekAcquireTimeout
 async_postgres/pg_errors.nim	PoolErrorKind.pekBatchFailed
@@ -875,6 +876,7 @@ async_postgres/pg_errors.nim	isNotNullViolation
 async_postgres/pg_errors.nim	isQueryCanceled
 async_postgres/pg_errors.nim	isSerializationFailure
 async_postgres/pg_errors.nim	isSessionFatal
+async_postgres/pg_errors.nim	isTransientError
 async_postgres/pg_errors.nim	isUniqueViolation
 async_postgres/pg_errors.nim	newPoolError
 async_postgres/pg_errors.nim	position

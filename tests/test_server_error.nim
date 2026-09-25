@@ -1,17 +1,23 @@
-## `PgConnectionError.serverError` and `attempts`, using the in-process mock
-## server: the server's ErrorResponse must survive a refused startup and a
-## connection the server closes after a FATAL, so a caller can tell a bad
-## password from a server shutdown.
+## `PgConnectionError.serverError`, `attempts` and `isTransientError`, using the
+## in-process mock server: the server's ErrorResponse must survive a refused
+## startup and a connection the server closes after a FATAL, and each failure is
+## classified from what it records, so a reconnect loop can tell a bad password
+## from a server shutdown.
 
-import std/[sequtils, sets, strutils, unittest]
+import std/[os, sequtils, sets, strutils, unittest]
+when defined(posix):
+  import std/posix
 
 import ../async_postgres/[async_backend, pg_replication]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_connection/notify {.all.}
+from ../async_postgres/pg_connection/buffer_io {.all.} import isTransientDial
+from ../async_postgres/pg_errors {.all.} import isTransientServerError
 
 import std/importutils
 privateAccess(PgConnection)
+privateAccess(PgConnectionError)
 
 import mock_pg_server
 
@@ -94,6 +100,22 @@ suite "serverError on startup":
     check err.refusal == "28P01"
     check err.attempt(0).serverError.severity == "FATAL"
     check err.sqlStates == @["28P01"]
+    check not isTransientError(err.attempt(0))
+    check not isTransientError(err)
+
+  test "a server still starting up is transient":
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
+      let ms = startMockServer()
+      let serverFut = refuseStartup(ms, "57P03")
+      result = await connectError(mockConfig(ms.port))
+      await serverFut
+      await closeServer(ms)
+
+    let err = waitFor testBody()
+    check err != nil
+    check err.refusal == "57P03"
+    check isTransientError(err.attempt(0))
+    check isTransientError(err)
 
   test "the aggregate keeps every host's failure":
     proc testBody(): Future[(ref PgConnectionError, ref PgConnectionError)] {.async.} =
@@ -127,10 +149,64 @@ suite "serverError on startup":
     check allRefused.refusal(1) == "28P01"
     check allRefused.parent == allRefused.attempts[1]
     check allRefused.sqlStates == @["57P03", "28P01"]
+    # The first host is only starting up, but the second's bad password awaits
+    # it too once it is up.
+    check not isTransientError(allRefused)
     check oneUnreachable != nil
     check oneUnreachable.attempts.len == 2
     check oneUnreachable.refusal(0) == "28P01"
     check oneUnreachable.sqlStates == @["28P01"]
+    # The refused dial is raised as unavailable, the backend's error kept as cause.
+    check oneUnreachable.attempts[1] of PgUnavailableError
+    check oneUnreachable.attempts[1].parent != nil
+    check not (oneUnreachable.attempts[1].parent of PgError)
+    check isTransientError(oneUnreachable.attempts[1])
+    # The refused dial does not hide the bad password.
+    check not isTransientError(oneUnreachable)
+
+  test "a host starting up and one refusing the dial keep the aggregate retryable":
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
+      let ms1 = startMockServer()
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      await closeServer(gone)
+      var cfg = mockConfig(ms1.port)
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: ms1.port),
+        HostEntry(host: "127.0.0.1", port: refusedPort),
+      ]
+      let serverFut = refuseStartup(ms1, "57P03")
+      result = await connectError(cfg)
+      await serverFut
+      await closeServer(ms1)
+
+    let err = waitFor testBody()
+    check err != nil
+    check err.attempts.len == 2
+    check isTransientError(err)
+
+  test "the aggregate is permanent when every host refused permanently":
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
+      let ms1 = startMockServer()
+      let ms2 = startMockServer()
+      var cfg = mockConfig(ms1.port)
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: ms1.port),
+        HostEntry(host: "127.0.0.1", port: ms2.port),
+      ]
+      let serverFut = refuseStartup(ms1, "28P01")
+      let serverFut2 = refuseStartup(ms2, "3D000")
+      result = await connectError(cfg)
+      await serverFut
+      await serverFut2
+      await closeServer(ms1)
+      await closeServer(ms2)
+
+    let err = waitFor testBody()
+    check err != nil
+    check err.refusal(0) == "28P01"
+    check err.refusal(1) == "3D000"
+    check not isTransientError(err)
 
   test "a failed session-attrs probe is not taken for a refusal":
     proc testBody(): Future[ref PgConnectionError] {.async.} =
@@ -161,8 +237,10 @@ suite "serverError on startup":
     check err.attempts.len == 1
     check err.attempts[0] of PgQueryError
     check err.sqlStates.len == 0
+    check not isTransientError(err)
 
-  test "a host that answers but does not match is kept among the attempts":
+  test "a host that answers but does not match keeps the aggregate retryable":
+    # A failover may promote it.
     proc testBody(): Future[ref PgConnectionError] {.async.} =
       let ms = startMockServer()
       proc serverHandler() {.async.} =
@@ -190,8 +268,9 @@ suite "serverError on startup":
     check err != nil
     check err.attempts.len == 1
     check "target_session_attrs" in err.attempt(0).msg
+    check isTransientError(err)
 
-  test "a fork failure in the pre-3.0 format keeps its text":
+  test "a fork failure in the pre-3.0 format is retried":
     let err = waitFor connectErrorOn(
       @[buildPreV3Error("could not fork new process for connection: out of memory\n")]
     )
@@ -200,6 +279,7 @@ suite "serverError on startup":
     let text = err.msg.split("\nAsync traceback:")[0]
     check text.endsWith("could not fork new process for connection: out of memory")
     check not (err.parent of PgProtocolError)
+    check isTransientError(err)
 
   test "a pre-3.0 error shorter than a v3 header keeps its text":
     # 'E' + "no" + NUL: the server closes short of the 5 bytes of a v3 header.
@@ -207,6 +287,8 @@ suite "serverError on startup":
     check err != nil
     let text = err.msg.split("\nAsync traceback:")[0]
     check text.endsWith(": no")
+    # Not a failed fork: a server before protocol 3.0, or not PostgreSQL.
+    check not isTransientError(err)
 
   test "an empty pre-3.0 error text gets a fallback message":
     let err = waitFor connectErrorOn(@[buildPreV3Error("")])
@@ -221,6 +303,8 @@ suite "serverError on startup":
     let err = waitFor connectErrorOn(@[reply[0 ..< 6], reply[6 .. ^1]])
     check err != nil
     check text in err.msg
+    # Only the untranslated text is known for a failed fork.
+    check not isTransientError(err)
 
   test "a pre-3.0 error text is capped at MAX_ERRLEN":
     let err = waitFor connectErrorOn(@[buildPreV3Error('x'.repeat(40000))])
@@ -268,9 +352,9 @@ suite "serverError on startup":
     check err != nil
     check err.refusal == "28P01"
 
-  test "prefer-standby keeps each host's second attempt":
+  test "prefer-standby judges each host by its second attempt":
     # Both hosts are starting up during the standby pass and reject the
-    # password by the second: the stale 57P03 is not what they failed with.
+    # password by the second: that stale 57P03 must not keep the loop going.
     proc testBody(): Future[ref PgConnectionError] {.async.} =
       let ms1 = startMockServer()
       let ms2 = startMockServer()
@@ -296,6 +380,7 @@ suite "serverError on startup":
     check err != nil
     check err.refusal(0) == "28P01"
     check err.refusal(1) == "28P01"
+    check not isTransientError(err)
 
 suite "serverError when the server closes the connection":
   test "a FATAL during a query":
@@ -326,9 +411,11 @@ suite "serverError when the server closes the connection":
     check err != nil
     check err.serverError != nil
     check err.serverError.sqlState == "57P01"
+    check isTransientError(err)
 
   test "a statement ERROR before the connection drops is not kept":
-    # The ERROR belongs to the statement; the failure is the lost connection.
+    # The ERROR belongs to the statement; the failure is the lost connection,
+    # which a reconnect loop must still retry.
     proc testBody(): Future[ref PgConnectionError] {.async.} =
       var err: ref PgConnectionError
       let ms = startMockServer()
@@ -355,6 +442,7 @@ suite "serverError when the server closes the connection":
     let err = waitFor testBody()
     check err != nil
     check err.serverError == nil
+    check isTransientError(err)
 
   test "a FATAL the session answers after is not kept":
     # Only a proxy does this; the server closes after its own FATAL.
@@ -475,12 +563,21 @@ suite "serverError when the server closes the connection":
     check raised.serverError.sqlState == "57P01"
     check raised.serverError != stored
 
+  test "a closed connection is transient unless its FATAL recurs":
+    let conn = PgConnection()
+    check isTransientError(conn.newClosedError("lost"))
+    conn.fatalServerError = fatalError("57P01")
+    check isTransientError(conn.newClosedError("lost"))
+    conn.fatalServerError = fatalError("57P04")
+    check not isTransientError(conn.newClosedError("lost"))
+
   test "a listen death carries the FATAL that ended the session":
     let conn = PgConnection()
     conn.fatalServerError = (ref PgQueryError)(msg: "bye", sqlState: "57P01")
     conn.notifyListenDeath("Listen connection lost", false)
     check conn.listenError.serverError != nil
     check conn.listenError.serverError.sqlState == "57P01"
+    check isTransientError(conn.listenError)
 
   test "a late FATAL explains a listen death latched on a live transport":
     let conn = PgConnection()
@@ -495,6 +592,7 @@ suite "serverError when the server closes the connection":
     check raised != nil
     check raised.serverError != nil
     check raised.serverError.sqlState == "57P01"
+    check isTransientError(raised)
 
   test "a LISTEN that loses the connection keeps the cause":
     let conn = PgConnection()
@@ -504,7 +602,10 @@ suite "serverError when the server closes the connection":
     conn.restartPumpOrFailWaiter(restarted = true, cause = cause)
     check conn.listenError != nil
     check conn.listenError.parent == cause
+    check conn.listenError.serverError != nil
     check conn.listenError.serverError.sqlState == "57P04"
+    # The database is gone: a redial cannot get past that.
+    check not isTransientError(conn.listenError)
 
   test "a cancelled LISTEN is not the listen death's cause":
     let conn = PgConnection()
@@ -513,7 +614,9 @@ suite "serverError when the server closes the connection":
       restarted = true, cause = newException(CancelledError, "cancelled")
     )
     check conn.listenError != nil
-    check conn.listenError.parent == nil
+    check conn.listenError.parent of PgUnavailableError
+    # The connection it retired is lost all the same: a reconnect loop redials.
+    check isTransientError(conn.listenError)
 
   test "a LISTEN that leaves the connection busy keeps the cause":
     let conn = PgConnection()
@@ -587,12 +690,15 @@ suite "serverError when the server closes the connection":
     return death
 
   test "a listen death after an unreachable redial keeps the session's FATAL":
-    check waitFor(listenDeathAfterRedial(rdGone)).sqlStates == @["57P01"]
+    let err = waitFor listenDeathAfterRedial(rdGone)
+    check err.sqlStates == @["57P01"]
+    check isTransientError(err)
 
-  test "a listen death keeps its last redial beside the session's FATAL":
-    # The server came back with a rotated password.
+  test "a listen death is judged by its last redial, not the session's FATAL":
+    # The server came back with a rotated password: 57P01 alone would retry.
     let err = waitFor listenDeathAfterRedial(rdPasswordRotated)
     check err.sqlStates == @["57P01", "28P01"]
+    check not isTransientError(err)
 
   test "a listen death keeps the session's FATAL past a redial that got in":
     # The redial connects but its re-LISTEN is refused.
@@ -640,11 +746,14 @@ suite "serverError when the server closes the connection":
     check err != nil
     check err.serverError != nil
     check err.serverError.sqlState == "57P01"
+    check isTransientError(err)
 
 suite "client-side refusals":
   proc refusal(
-      cfg: ConnConfig, reply: seq[byte]
+      cfg: ConnConfig, reply: seq[byte], thenRefusedDial = false
   ): Future[ref PgConnectionError] {.async.} =
+    ## `connect`'s error when the server answers the startup with `reply`;
+    ## `thenRefusedDial` adds a second host whose dial is refused.
     let ms = startMockServer()
     proc serverHandler() {.async.} =
       let st = await ms.accept()
@@ -658,12 +767,20 @@ suite "client-side refusals":
 
     var cfg = cfg
     cfg.port = ms.port
+    if thenRefusedDial:
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      await closeServer(gone)
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: ms.port),
+        HostEntry(host: "127.0.0.1", port: refusedPort),
+      ]
     let serverFut = serverHandler()
     result = await connectError(cfg)
     await serverFut
     await closeServer(ms)
 
-  test "an auth method outside require_auth is a PgSecurityError":
+  test "an auth method outside require_auth is not retried":
     var cfg = mockConfig(0)
     cfg.requireAuth = {amScramSha256}
     let cleartext = buildBackendMsg('R', @[byte 0, 0, 0, 3])
@@ -671,6 +788,53 @@ suite "client-side refusals":
     check err != nil
     check err.serverError == nil
     check (ref Exception)(err) of PgSecurityError
+    check not isTransientError(err)
+
+  test "a refusal is not hidden behind another host's refused dial":
+    var cfg = mockConfig(0)
+    cfg.requireAuth = {amScramSha256}
+    let cleartext = buildBackendMsg('R', @[byte 0, 0, 0, 3])
+    let err = waitFor refusal(cfg, cleartext, thenRefusedDial = true)
+    check err != nil
+    check err.attempts.len == 2
+    check err.attempts[0] of PgSecurityError
+    check err.attempt(0).serverError == nil
+    check isTransientError(err.attempts[1])
+    check not isTransientError(err)
+
+  test "sslmode=allow stays retryable while plaintext is only starting up":
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        # Plaintext leg: the server is still starting up.
+        let st1 = await ms.accept()
+        try:
+          await drainStartupMessage(st1)
+          await sendBytes(st1, buildErrorResponse("57P03", "starting up", "FATAL"))
+        except CatchableError:
+          discard
+        await closeClient(st1)
+        # SSL leg: the server has no SSL.
+        let st2 = await ms.accept()
+        try:
+          await drainStartupMessage(st2)
+          await sendBytes(st2, @[byte('N')])
+          discard await readN(st2, 1)
+        except CatchableError:
+          discard
+        await closeClient(st2)
+
+      let serverFut = serverHandler()
+      var cfg = mockConfig(ms.port)
+      cfg.sslMode = sslAllow
+      result = await connectError(cfg)
+      await serverFut
+      await closeServer(ms)
+
+    let err = waitFor testBody()
+    check err != nil
+    check err.attempt(0).attempts.len == 2
+    check isTransientError(err)
 
   proc allowError(
       cfg: ConnConfig, plainReply, sslReply: seq[byte]
@@ -711,6 +875,8 @@ suite "client-side refusals":
     check not (allow.attempts[1] of PgSecurityError)
     check allow.parent == allow.attempts[1]
     check err.sqlStates == @["28P01"]
+    # The server answers 'N' again as surely as it refuses the password again.
+    check not isTransientError(err)
 
   test "sslmode=allow reports data trailing 'N' as a protocol violation":
     # One segment so chronos's `readOnce` pulls the extra byte in.
@@ -735,6 +901,7 @@ suite "client-side refusals":
     )
     check err != nil
     check (ref Exception)(err) of PgSecurityError
+    check not isTransientError(err)
 
   test "sslmode=allow with only one security refusal is no PgSecurityError":
     var cfg = mockConfig(0)
@@ -745,12 +912,13 @@ suite "client-side refusals":
     check err.attempt(0).attempts[0] of PgSecurityError
     check not ((ref Exception)(err) of PgSecurityError)
 
-  test "sslmode=require against a server without SSL is a PgSecurityError":
+  test "sslmode=require against a server without SSL is not retried":
     var cfg = mockConfig(0)
     cfg.sslMode = sslRequire
     let err = waitFor refusal(cfg, @[byte('N')])
     check err != nil
     check (ref Exception)(err) of PgSecurityError
+    check not isTransientError(err)
 
 suite "serverErrors":
   proc refused(sqlState: string): ref CatchableError =
@@ -811,3 +979,220 @@ suite "severity":
     check isSessionFatal("FATAL")
     check isSessionFatal("PANIC")
     check not isSessionFatal("ERROR")
+
+suite "isTransientError":
+  proc queryError(sqlState: string, severity = "ERROR"): ref PgQueryError =
+    (ref PgQueryError)(msg: sqlState, sqlState: sqlState, severity: severity)
+
+  proc summing(attempts: varargs[ref CatchableError]): ref PgConnectionError =
+    (ref PgConnectionError)(msg: "sum", attempts: @attempts)
+
+  proc hosts(attempts: varargs[ref CatchableError]): ref PgConnectionError =
+    (ref PgConnectionError)(msg: "hosts", attempts: @attempts, perHost: true)
+
+  test "a connection error is judged by what it records":
+    check isTransientError((ref PgUnavailableError)(msg: "lost"))
+    # A failure nobody classified is not retried.
+    check not isTransientError((ref PgConnectionError)(msg: "unsupported"))
+    check isTransientError(
+      (ref PgConnectionError)(msg: "gone", serverError: queryError("57P01", "FATAL"))
+    )
+    check not isTransientError(
+      (ref PgConnectionError)(msg: "dropped", serverError: queryError("3D000", "FATAL"))
+    )
+    # The FATAL behind a lost connection outranks its type.
+    check not isTransientError(
+      (ref PgUnavailableError)(
+        msg: "dropped", serverError: queryError("57P04", "FATAL")
+      )
+    )
+    check not isTransientError((ref PgSecurityError)(msg: "refused"))
+    check not isTransientError((ref PgProtocolError)(msg: "garbled"))
+    check not isTransientError(
+      (ref PgListenError)(msg: "stopped", transportAlive: true)
+    )
+
+  test "an error summing up attempts is transient when any of them is":
+    let lost = (ref PgUnavailableError)(msg: "lost")
+    let refused = (ref PgSecurityError)(msg: "refused")
+    check isTransientError(summing(refused, lost))
+    check not isTransientError(summing(refused, refused))
+    # The attempts, not a stale FATAL of the session they tried to replace.
+    let redialed = summing(refused)
+    redialed.serverError = queryError("57P01", "FATAL")
+    check not isTransientError(redialed)
+
+  test "a server's lasting refusal in any attempt outranks the rest":
+    # The same config meets it again once the other hosts are back.
+    let lost = (ref PgUnavailableError)(msg: "lost")
+    let badPassword =
+      (ref PgConnectionError)(msg: "refused", serverError: queryError("28P01", "FATAL"))
+    let startingUp = (ref PgConnectionError)(
+      msg: "starting", serverError: queryError("57P03", "FATAL")
+    )
+    let noTls = (ref PgConnectionError)(msg: "Server does not support SSL")
+    check not isTransientError(summing(lost, badPassword))
+    # Nested, as sslmode=allow's pair sits in connect's aggregate.
+    check not isTransientError(summing(lost, summing(badPassword, lost)))
+    # A refusal that clears hides nothing; a failure without one is no verdict.
+    check isTransientError(summing(startingUp, noTls))
+    check isTransientError(summing(lost, noTls))
+
+  test "connect's aggregate is transient only when every host's failure is":
+    let lost = (ref PgUnavailableError)(msg: "lost")
+    let tlsAlert = (ref PgConnectionError)(msg: "certificate required")
+    let refused = (ref PgSecurityError)(msg: "refused")
+    let startingUp = (ref PgConnectionError)(
+      msg: "starting", serverError: queryError("57P03", "FATAL")
+    )
+    let noTls = (ref PgConnectionError)(msg: "Server does not support SSL")
+    check isTransientError(hosts(lost, startingUp))
+    # The same config meets them again once the other host is back.
+    check not isTransientError(hosts(tlsAlert, lost))
+    check not isTransientError(hosts(lost, refused))
+    # A host's sslmode=allow legs still clear when either does.
+    check isTransientError(hosts(summing(startingUp, noTls), lost))
+
+  test "timeouts are transient, other raw errors unclassified":
+    check isTransientError((ref PgTimeoutError)(msg: "timeout"))
+    # `connect` surfaces a host's connectTimeout as is.
+    check isTransientError((ref AsyncTimeoutError)(msg: "timeout"))
+    # A lost transport is raised as PgUnavailableError, never raw.
+    check not isTransientError((ref OSError)(msg: "refused"))
+    when hasChronos:
+      check not isTransientError((ref TransportOsError)(msg: "refused"))
+
+  test "a cancel whose dial is refused is transient":
+    proc testBody(): Future[ref CatchableError] {.async.} =
+      let ms = startMockServer()
+      let port = ms.port
+      await closeServer(ms)
+      let conn = PgConnection(host: "127.0.0.1", port: port)
+      try:
+        await conn.cancel()
+      except CatchableError as e:
+        result = e
+
+    let err = waitFor testBody()
+    check err of PgUnavailableError
+    check err.parent != nil
+    check not (err.parent of PgError)
+    check isTransientError(err)
+
+  when defined(posix):
+    proc cancelVia(dir: string): ref CatchableError =
+      proc testBody(): Future[ref CatchableError] {.async.} =
+        try:
+          await PgConnection(host: dir, port: 5432).cancel()
+        except CatchableError as e:
+          result = e
+
+      waitFor testBody()
+
+    test "a Unix socket not created yet is transient, a forbidden one is not":
+      let dir = getTempDir() / "async_postgres_dial_" & $getCurrentProcessId()
+      createDir(dir)
+      defer:
+        setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
+        removeDir(dir)
+      # No server started: the socket file is not there (ENOENT).
+      let missing = cancelVia(dir)
+      check missing of PgUnavailableError
+      check isTransientError(missing)
+      # Root bypasses the permission check.
+      if posix.geteuid() != 0:
+        setFilePermissions(dir, {})
+        let forbidden = cancelVia(dir) # EACCES
+        check forbidden of PgConnectionError
+        check not (forbidden of PgUnavailableError)
+        check not isTransientError(forbidden)
+
+    test "a dial out of descriptors, buffers or memory is transient":
+      for code in [posix.EMFILE, posix.ENFILE, posix.ENOBUFS, posix.ENOMEM]:
+        when hasChronos:
+          check isTransientDial((ref TransportOsError)(code: OSErrorCode(code)))
+        else:
+          check isTransientDial((ref OSError)(errorCode: code))
+      when hasChronos:
+        # chronos raises EMFILE on socket creation without its code.
+        check isTransientDial((ref TransportTooManyError)(msg: "too many"))
+        check not isTransientDial(
+          (ref TransportOsError)(code: OSErrorCode(posix.EACCES))
+        )
+        check not isTransientDial((ref TransportAddressError)(msg: "bad"))
+      else:
+        check not isTransientDial((ref OSError)(errorCode: posix.EACCES))
+      check not isTransientDial((ref ValueError)(msg: "bad"))
+
+  test "a connection error is judged by its type, not the cause it wraps":
+    proc wrapping(cause: ref Exception): ref PgConnectionError =
+      (ref PgConnectionError)(msg: "wrapped", parent: cause)
+
+    check not isTransientError(wrapping((ref OSError)(msg: "reset")))
+    check not isTransientError(wrapping((ref PgUnavailableError)(msg: "lost")))
+    check isTransientError(
+      (ref PgUnavailableError)(msg: "lost", parent: (ref ValueError)(msg: "bad"))
+    )
+
+  test "a listen death whose transport is gone follows what ended the pump":
+    proc death(cause: ref Exception): ref PgListenError =
+      (ref PgListenError)(msg: "died", parent: cause)
+
+    check isTransientError(death((ref PgUnavailableError)(msg: "lost")))
+    check not isTransientError(death((ref PgProtocolError)(msg: "garbled")))
+    check not isTransientError(death(nil))
+
+  test "server errors are classified by SQLSTATE":
+    for s in [
+      "53100", "53200", "53300", "25P03", "25P04", "40001", "40P01", "57P01", "57P02",
+      "57P03", "57P05", "55006", "55P03",
+    ]:
+      check isTransientError(queryError(s))
+      check isTransientError(queryError(s, "FATAL"))
+    for s in ["28P01", "28000", "3D000", "42501", "42704", "08P01", "53400"]:
+      check not isTransientError(queryError(s))
+      check not isTransientError(queryError(s, "FATAL"))
+    # A FATAL 08xxx ends this session; a statement's is a dblink or
+    # postgres_fdw link, which may fail for good (e.g. on a wrong password).
+    for s in ["08000", "08001", "08003", "08006"]:
+      check isTransientError(queryError(s, "FATAL"))
+      check not isTransientError(queryError(s))
+    # A statement's 57014 is a cancel; FATAL, it is the server's
+    # authentication_timeout, which a reconnect clears.
+    check not isTransientError(queryError("57014"))
+    check isTransientError(queryError("57014", "FATAL"))
+    # A PANIC means crash recovery, whatever its SQLSTATE.
+    check isTransientError(queryError("XX000", "PANIC"))
+    check not isTransientError(queryError("XX000", "FATAL"))
+    # A missing ErrorResponse is not transient.
+    check not isTransientServerError(nil)
+
+  test "config, state and cancellation are not transient":
+    check not isTransientError(nil)
+    check not isTransientError((ref PgConfigError)(msg: "cfg"))
+    check not isTransientError((ref PgStateError)(msg: "busy"))
+    # The pull API's live-transport listen death: re-`listen`, do not re-dial.
+    check not isTransientError((ref PgListenStoppedError)(msg: "stopped"))
+    check not isTransientError((ref CancelledError)(msg: "cancelled"))
+    check not isTransientError((ref ValueError)(msg: "bad"))
+
+  test "pool errors follow their kind and the failure they wrap":
+    let lost = (ref PgUnavailableError)(msg: "lost")
+    let refused = (ref PgSecurityError)(msg: "refused")
+    check isTransientError(newPoolError(pekAcquireTimeout, "t"))
+    # Capacity may free up: the parent (a connect failure that used up the
+    # deadline, a cluster's replica failure) only explains the wait.
+    check isTransientError(newPoolError(pekAcquireTimeout, "t", refused))
+    check isTransientError(newPoolError(pekQueueFull, "q"))
+    check not isTransientError(newPoolError(pekClosed, "c"))
+    check not isTransientError(newPoolError(pekConfigFault, "f"))
+    check isTransientError(newPoolError(pekConnectFailed, "c", lost))
+    # A per-host `connectTimeout` a spawned connect surfaced is retried.
+    check isTransientError(
+      newPoolError(pekConnectFailed, "c", (ref AsyncTimeoutError)(msg: "timeout"))
+    )
+    check not isTransientError(newPoolError(pekConnectFailed, "c", refused))
+    check isTransientError(
+      newPoolError(pekBatchFailed, "b", newPoolError(pekAcquireTimeout, "t"))
+    )
+    check not isTransientError(newPoolError(pekBatchFailed, "b", refused))

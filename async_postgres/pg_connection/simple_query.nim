@@ -12,7 +12,6 @@ import types, buffer_io
 
 when hasAsyncDispatch:
   import std/asyncnet
-  from std/nativesockets import Domain, SockType, Protocol
 
 import std/importutils
 privateAccess(PgConnection)
@@ -172,51 +171,35 @@ proc simpleExecImpl(conn: PgConnection, sql: string): Future[string] {.async.} =
 
 proc cancel*(conn: PgConnection): Future[void] {.async.} =
   ## Send a CancelRequest over a separate connection to abort the running query.
-  let isUnix = isUnixSocket(conn.host)
+  let msg = encodeCancelRequest(conn.pid, conn.secretKey)
+  # The session's own address: another the host resolves to may be another
+  # server, which would ignore the request.
+  let targets =
+    if conn.cancelTarget.len > 0:
+      conn.cancelTarget
+    else:
+      resolveTargets(conn.host, conn.port)
   when hasChronos:
-    let transport =
-      if isUnix:
-        when defined(posix):
-          await connect(initTAddress(unixSocketPath(conn.host, conn.port)))
-        else:
-          raise newException(
-            PgConnectionError, "Unix sockets are not supported on this platform"
-          )
-      else:
-        let addresses = resolveTAddress(conn.host, Port(conn.port))
-        if addresses.len == 0:
-          raise newException(PgConnectionError, "Could not resolve host: " & conn.host)
-        await connect(addresses[0])
+    let transport = (await dialTargets(targets)).stream
     try:
-      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
-      discard await transport.write(msg)
+      var sent = 0
+      try:
+        sent = await transport.write(msg)
+      except TransportError as e:
+        raise socketError(e)
+      if sent < msg.len:
+        # chronos reports a peer's reset as a short write, not an error.
+        raise newException(
+          PgUnavailableError, "CancelRequest not sent: connection reset by peer"
+        )
     finally:
       await transport.closeWait()
   elif hasAsyncDispatch:
-    let sock =
-      if isUnix:
-        when defined(posix):
-          newAsyncSocket(
-            Domain.AF_UNIX, SockType.SOCK_STREAM, Protocol.IPPROTO_IP, buffered = false
-          )
-        else:
-          raise newException(
-            PgConnectionError, "Unix sockets are not supported on this platform"
-          )
-      else:
-        newAsyncSocket(buffered = false)
+    let sock = (await dialTargets(targets)).stream
     try:
-      if isUnix:
-        when defined(posix):
-          await sock.connectUnix(unixSocketPath(conn.host, conn.port))
-        else:
-          raise newException(
-            PgConnectionError, "Unix sockets are not supported on this platform"
-          )
-      else:
-        await sock.connect(conn.host, Port(conn.port))
-      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
       await sock.sendRawBytes(msg)
+    except OSError as e:
+      raise socketError(e)
     finally:
       sock.close()
 
@@ -441,7 +424,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
     conn.checkReady()
     if not conn.isConnected():
       conn.markClosed()
-      raise newException(PgConnectionError, "Connection is not established")
+      raise newException(PgUnavailableError, "Connection is not established")
     conn.markBusy()
     await conn.sendMsg(encodeQuery(""))
 

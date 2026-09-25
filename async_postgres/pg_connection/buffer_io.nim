@@ -6,7 +6,8 @@
 ## - Notification/Notice dispatch (called from `nextMessage`)
 ## - Transport teardown (`closeTransport`)
 ## - TCP keepalive / TCP_NODELAY socket options
-## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`)
+## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`) and dialing
+##   (`resolveTargets`, `dialTargets`, `dialServer`, `socketError`, `oneLine`)
 ## - `makeCopyOutCallback` / `makeCopyInCallback` cross-backend templates
 ##
 ## The host helpers and `makeCopy*` templates are re-exported through
@@ -16,7 +17,7 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[deques, options, tables]
+import std/[deques, options, strutils, tables]
 when defined(posix):
   import std/posix
 
@@ -27,6 +28,11 @@ when hasChronos:
   import chronos/streams/tlsstream
 elif hasAsyncDispatch:
   import std/asyncnet
+  from std/nativesockets import
+    Domain, SockType, Protocol, `==`, getAddrInfo, freeAddrInfo, toKnownDomain,
+    getAddrString, getSockOptInt
+  when defined(posix):
+    from std/oserrors import OSErrorCode, newOSError, osLastError
 
 import std/importutils
 privateAccess(PgConnection)
@@ -77,6 +83,337 @@ proc getHosts*(config: ConnConfig): seq[HostEntry] =
         port: if config.port == 0: 5432 else: config.port,
       )
     ]
+
+# Dialing
+
+const AsyncTracebackMarker = "\nAsync traceback:"
+  ## Header asyncdispatch prepends to its injected traceback.
+
+proc oneLine*(msg: string): string =
+  ## Collapse `msg` to one line, dropping the asyncdispatch traceback.
+  ## Cuts at the traceback marker so server DETAIL/HINT lines survive,
+  ## joined with " | ".
+  let cut = msg.find(AsyncTracebackMarker)
+  let body =
+    if cut >= 0:
+      msg[0 ..< cut]
+    else:
+      msg
+  var parts: seq[string]
+  for line in body.splitLines():
+    let stripped = line.strip()
+    if stripped.len > 0:
+      parts.add(stripped)
+  parts.join(" | ")
+
+type DialFailure = tuple[target: string, err: ref CatchableError]
+
+when defined(posix):
+  func isTransientErrno(code: int32): bool =
+    ## Whether an OS error may clear (``ENOENT``: a Unix socket not created yet).
+    # Qualified: chronos exports same-named OSErrorCode constants.
+    code in [
+      posix.ECONNREFUSED, posix.ECONNRESET, posix.ECONNABORTED, posix.ETIMEDOUT,
+      posix.EHOSTUNREACH, posix.ENETUNREACH, posix.ENETDOWN, posix.EADDRNOTAVAIL,
+      posix.EPIPE, posix.EAGAIN, posix.ENOENT, posix.EMFILE, posix.ENFILE,
+      posix.ENOBUFS, posix.ENOMEM,
+    ]
+
+proc isTransientDial(e: ref CatchableError): bool {.raises: [].} =
+  ## Whether a failed connect or send may succeed later.
+  var code: int32
+  when hasChronos:
+    if e of TransportTooManyError: # EMFILE and the like, its code not kept
+      return true
+    if not (e of TransportOsError):
+      return false
+    code = int32((ref TransportOsError)(e).code)
+  else:
+    if not (e of OSError):
+      return false
+    code = (ref OSError)(e).errorCode
+  when defined(posix):
+    isTransientErrno(code)
+  else:
+    discard code # Windows' connect error codes are not mapped.
+    true
+
+proc dialError(failures: openArray[DialFailure]): ref PgConnectionError {.raises: [].} =
+  ## One error for every address that failed, the last as ``parent``: a
+  ## ``PgUnavailableError`` when any of them may clear.
+  var msg = ""
+  var transient = false
+  for i, f in failures:
+    transient = transient or isTransientDial(f.err)
+    if failures.len == 1:
+      msg = oneLine(f.err.msg)
+    else:
+      if i > 0:
+        msg.add("; ")
+      msg.add(f.target & ": " & oneLine(f.err.msg))
+  if transient:
+    (ref PgUnavailableError)(msg: msg, parent: failures[^1].err)
+  else:
+    (ref PgConnectionError)(msg: msg, parent: failures[^1].err)
+
+proc unresolved(host: string): ref PgConnectionError =
+  newException(PgUnavailableError, "Could not resolve host: " & host)
+
+when defined(posix):
+  proc lookup(host: string, port: int): ptr posix.AddrInfo =
+    ## ``host``'s TCP addresses, to free with ``freeAddrInfo``. An unknown name
+    ## is transient: it may be a container not registered yet.
+    var hints: posix.AddrInfo
+    hints.ai_family = posix.AF_UNSPEC
+    hints.ai_socktype = posix.SOCK_STREAM
+    hints.ai_protocol = posix.IPPROTO_TCP
+    let rc = posix.getaddrinfo(cstring(host), cstring($port), addr hints, result)
+    if rc != 0:
+      let sysErr = posix.errno
+      let reason =
+        if rc == posix.EAI_SYSTEM:
+          $posix.strerror(sysErr)
+        else:
+          $posix.gai_strerror(rc)
+      let msg = "Could not resolve host " & host & ": " & reason
+      if rc in [
+        posix.EAI_FAIL, posix.EAI_FAMILY, posix.EAI_SOCKTYPE, posix.EAI_SERVICE,
+        posix.EAI_BADFLAGS,
+      ] or (rc == posix.EAI_SYSTEM and not isTransientErrno(sysErr)):
+        raise newException(PgConnectionError, msg)
+      raise newException(PgUnavailableError, msg)
+
+when hasChronos:
+  type
+    DialStream* = StreamTransport
+    Dialed* = tuple[stream: DialStream, target: DialTarget]
+      ## A connected stream and the address it reached.
+
+  func shown*(t: DialTarget): string =
+    ## ``t`` as error messages name it.
+    if t.family == AddressFamily.Unix:
+      $t
+    else:
+      t.host
+
+  proc resolveTargets*(host: string, port: int): seq[DialTarget] =
+    ## What ``host`` names: its Unix socket, or each address it resolves to in
+    ## the resolver's order.
+    if isUnixSocket(host):
+      when defined(posix):
+        try:
+          return @[initTAddress(unixSocketPath(host, port))]
+        except TransportAddressError as e:
+          raise (ref PgConnectionError)(msg: e.msg, parent: e)
+      else:
+        raise newException(
+          PgConnectionError, "Unix sockets are not supported on this platform"
+        )
+    when defined(posix):
+      let aiList = lookup(host, port)
+      try:
+        var it = aiList
+        while it != nil:
+          var ta: TransportAddress
+          fromSAddr(cast[ptr Sockaddr_storage](it.ai_addr), SockLen(it.ai_addrlen), ta)
+          if ta.family in {AddressFamily.IPv4, AddressFamily.IPv6} and ta notin result:
+            result.add(ta)
+          it = it.ai_next
+      finally:
+        posix.freeAddrInfo(aiList)
+    else:
+      try:
+        result = resolveTAddress(host, Port(port))
+      except TransportAddressError as e:
+        # Its resolver code is lost here: judged as a name not known yet.
+        raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+    if result.len == 0:
+      raise unresolved(host)
+
+  proc dialTargets*(targets: seq[DialTarget]): Future[Dialed] {.async.} =
+    ## Connect to the first of ``targets`` that accepts, as libpq does.
+    if targets.len == 0:
+      raise newException(ValueError, "dialTargets: no address to dial")
+    var failures: seq[DialFailure]
+    for t in targets:
+      try:
+        return (stream: await connect(t), target: t)
+      except TransportError as e:
+        failures.add((t.shown, (ref CatchableError)(e)))
+    raise dialError(failures)
+
+elif hasAsyncDispatch:
+  type
+    DialStream* = AsyncSocket
+    Dialed* = tuple[stream: DialStream, target: DialTarget]
+      ## A connected stream and the address it reached.
+
+  func shown*(t: DialTarget): string =
+    ## ``t`` as error messages name it.
+    if t.domain == Domain.AF_INET6:
+      "[" & t.address & "]"
+    else:
+      t.address
+
+  func `==`(a, b: DialTarget): bool =
+    # Not `sa`: the text names the address, zone included.
+    a.domain == b.domain and a.address == b.address and a.port == b.port
+
+  proc resolveTargets*(host: string, port: int): seq[DialTarget] =
+    ## What ``host`` names: its Unix socket, or each address it resolves to in
+    ## the resolver's order.
+    if isUnixSocket(host):
+      when defined(posix):
+        var t: DialTarget
+        t.domain = Domain.AF_UNIX
+        t.address = unixSocketPath(host, port)
+        t.port = Port(port)
+        return @[t]
+      else:
+        raise newException(
+          PgConnectionError, "Unix sockets are not supported on this platform"
+        )
+    when defined(posix):
+      let aiList = lookup(host, port)
+      try:
+        var it = aiList
+        while it != nil:
+          var t: DialTarget
+          t.port = Port(port)
+          if it.ai_family == posix.AF_INET:
+            t.domain = Domain.AF_INET
+            copyMem(addr t.sa, it.ai_addr, it.ai_addrlen)
+            t.saLen = it.ai_addrlen
+          elif it.ai_family == posix.AF_INET6:
+            let sa6 = cast[ptr Sockaddr_in6](it.ai_addr)
+            if posix.IN6_IS_ADDR_V4MAPPED(addr sa6.sin6_addr) != 0:
+              # Dial the IPv4 it names: an AF_INET6 socket may be v6-only.
+              var sa4: Sockaddr_in
+              sa4.sin_family = typeof(sa4.sin_family)(posix.AF_INET)
+              sa4.sin_port = sa6.sin6_port
+              copyMem(addr sa4.sin_addr, addr sa6.sin6_addr.s6_addr[12], 4)
+              t.domain = Domain.AF_INET
+              copyMem(addr t.sa, addr sa4, sizeof(sa4))
+              t.saLen = SockLen(sizeof(sa4))
+            else:
+              t.domain = Domain.AF_INET6
+              copyMem(addr t.sa, it.ai_addr, it.ai_addrlen)
+              t.saLen = it.ai_addrlen
+          else:
+            it = it.ai_next
+            continue
+          t.address = getAddrString(cast[ptr SockAddr](addr t.sa))
+          if t.domain == Domain.AF_INET6:
+            # The text form drops a link-local address's zone; keep it.
+            let scope = cast[ptr Sockaddr_in6](addr t.sa).sin6_scope_id
+            if scope != 0:
+              t.address.add("%" & $scope)
+          if t notin result:
+            result.add(t)
+          it = it.ai_next
+      finally:
+        posix.freeAddrInfo(aiList)
+    else:
+      # Resolved here rather than by std `dial`: its lookup failure carries a
+      # stale errno, so only this split tells it from a refused connect.
+      let aiList =
+        try:
+          getAddrInfo(host, Port(port), Domain.AF_UNSPEC)
+        except OSError as e:
+          const WSANO_RECOVERY = 11003 # as EAI_FAIL
+          if e.errorCode == WSANO_RECOVERY:
+            raise (ref PgConnectionError)(msg: e.msg, parent: e)
+          raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+      try:
+        var it = aiList
+        while it != nil:
+          let known = toKnownDomain(it.ai_family)
+          if known.isSome and known.get in {Domain.AF_INET, Domain.AF_INET6}:
+            var domain = known.get
+            let ip = getAddrString(it.ai_addr)
+            if domain == Domain.AF_INET6 and ':' notin ip:
+              # getAddrString unmaps ::ffff:a.b.c.d; dial the IPv4 it names.
+              domain = Domain.AF_INET
+            let t: DialTarget = (domain: domain, address: ip, port: Port(port))
+            if t notin result:
+              result.add(t)
+          it = it.ai_next
+      finally:
+        freeAddrInfo(aiList)
+    if result.len == 0:
+      raise unresolved(host)
+
+  when defined(posix):
+    proc connectResolved(sock: AsyncSocket, t: DialTarget): Future[void] =
+      ## Connect ``sock`` to ``t``'s resolved address, with no second lookup.
+      let fut = newFuture[void]("connectResolved")
+      result = fut
+
+      proc onWritable(fd: AsyncFD): bool =
+        let err = SocketHandle(fd).getSockOptInt(cint(SOL_SOCKET), cint(SO_ERROR))
+        if err == 0:
+          fut.complete()
+        elif err == EINTR:
+          return false
+        else:
+          fut.fail(newOSError(OSErrorCode(err)))
+        true
+
+      var sa = t.sa
+      if posix.connect(sock.getFd, cast[ptr SockAddr](addr sa), t.saLen) == 0:
+        fut.complete()
+      else:
+        let err = osLastError()
+        if err.int32 in [EINTR, EINPROGRESS]:
+          addWrite(AsyncFD(sock.getFd), onWritable)
+        else:
+          fut.fail(newOSError(err))
+
+  proc dialTargets*(targets: seq[DialTarget]): Future[Dialed] {.async.} =
+    ## Connect to the first of ``targets`` that accepts, as libpq does.
+    if targets.len == 0:
+      raise newException(ValueError, "dialTargets: no address to dial")
+    var failures: seq[DialFailure]
+    for t in targets:
+      var sock: AsyncSocket
+      try:
+        if t.domain == Domain.AF_UNIX:
+          when defined(posix):
+            sock = newAsyncSocket(
+              Domain.AF_UNIX,
+              SockType.SOCK_STREAM,
+              Protocol.IPPROTO_IP,
+              buffered = false,
+            )
+            await sock.connectUnix(t.address)
+          else:
+            raiseAssert "resolveTargets yields AF_UNIX on POSIX only"
+        else:
+          sock = newAsyncSocket(
+            t.domain, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP, buffered = false
+          )
+          when defined(posix):
+            await sock.connectResolved(t)
+          else:
+            await sock.connect(t.address, t.port)
+        return (stream: sock, target: t)
+      except CatchableError as e:
+        if sock != nil:
+          sock.close()
+        if not (e of OSError):
+          raise e
+        failures.add((t.shown, e))
+    raise dialError(failures)
+
+proc dialServer*(host: string, port: int): Future[Dialed] =
+  ## Connect to the first address ``host`` resolves to that accepts.
+  # No future of its own: each extra layer delays a pump's cancellation by a
+  # tick, which chronos (4.4) may run only at the next I/O or timer event.
+  dialTargets(resolveTargets(host, port))
+
+proc socketError*(e: ref CatchableError): ref PgConnectionError =
+  ## A failed connect or send, classified as a dial is.
+  dialError([("", e)])
 
 # COPY callback factories (cross-backend)
 

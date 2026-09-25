@@ -9,6 +9,7 @@ import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/ssl {.all.}
 import ../async_postgres/pg_connection/lifecycle {.all.}
+from ../async_postgres/pg_connection/buffer_io import oneLine
 
 import std/importutils
 privateAccess(PgConnection)
@@ -347,6 +348,7 @@ suite "SSL negotiation - server rejects SSL":
 suite "SSL negotiation - error handling":
   test "connection closed during SSL negotiation raises PgError":
     var raised = false
+    var transient = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -372,14 +374,17 @@ suite "SSL negotiation - error handling":
       try:
         let conn = await connect(config)
         await conn.close()
-      except PgError:
+      except PgError as e:
         raised = true
+        transient = isTransientError(e)
 
       await serverFut
       await closeServer(ms)
 
     waitFor testBody()
     check raised
+    # Also how a proxy with nothing behind it yet answers.
+    check transient
 
   test "an unexpected SSL response byte is a protocol violation":
     var raised = false
@@ -427,50 +432,147 @@ suite "SSL negotiation - error handling":
     check not msgHasRawByte
     check protocolViolation
 
-  test "a fork failure in reply to the SSLRequest is reported without its text":
-    proc testBody(): Future[ref PgConnectionError] {.async.} =
-      let ms = startMockServer()
+  proc sslRequestErrorReply(text: string): Future[ref PgConnectionError] {.async.} =
+    ## The error `connect` raises when the server answers the SSLRequest with
+    ## a pre-3.0 error carrying `text`.
+    let ms = startMockServer()
 
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          discard await readN(st, 8)
-          await sendBytes(
-            st,
-            buildPreV3Error(
-              "could not fork new process for connection: out of memory\n"
-            ),
-          )
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-
-      let config = ConnConfig(
-        host: "127.0.0.1",
-        port: ms.port,
-        user: "test",
-        database: "test",
-        sslMode: sslPrefer,
-      )
-
+    proc serverHandler() {.async.} =
+      let st = await ms.accept()
       try:
-        let conn = await connect(config)
-        await conn.close()
-      except PgConnectionError as e:
-        result = e
+        discard await readN(st, 8)
+        await sendBytes(st, buildPreV3Error(text))
+      except CatchableError:
+        discard
+      await closeClient(st)
 
-      await serverFut
-      await closeServer(ms)
+    let serverFut = serverHandler()
 
-    let err = waitFor testBody()
+    let config = ConnConfig(
+      host: "127.0.0.1",
+      port: ms.port,
+      user: "test",
+      database: "test",
+      sslMode: sslPrefer,
+    )
+
+    try:
+      let conn = await connect(config)
+      await conn.close()
+    except PgConnectionError as e:
+      result = e
+
+    await serverFut
+    await closeServer(ms)
+
+  test "a fork failure in reply to the SSLRequest is reported without its text":
+    let err = waitFor sslRequestErrorReply(
+      "could not fork new process for connection: out of memory\n"
+    )
     require err != nil
     check "error response during SSL exchange" in err.msg
     check "could not fork" notin err.msg
     # Not a protocol violation: the server just could not serve the request.
     check err.parent != nil
     check not (err.parent of PgProtocolError)
+    check isTransientError(err)
+
+  test "an error reply to the SSLRequest other than a failed fork is not transient":
+    # A server that predates SSL support, or not PostgreSQL.
+    let err = waitFor sslRequestErrorReply("unsupported frontend protocol\n")
+    require err != nil
+    check "error response during SSL exchange" in err.msg
+    check "unsupported" notin err.msg
+    check not isTransientError(err)
+
+  proc handshakeError(ending: seq[byte]): Future[ref PgConnectionError] {.async.} =
+    ## The error `connect` raises when the server accepts the SSLRequest, reads
+    ## the ClientHello, then sends `ending` and closes.
+    let ms = startMockServer()
+
+    proc serverHandler() {.async.} =
+      let st = await ms.accept()
+      try:
+        discard await readN(st, 8)
+        await sendBytes(st, @[byte('S')])
+        let header = await readN(st, 5)
+        discard await readN(st, (int(header[3]) shl 8) or int(header[4]))
+        if ending.len > 0:
+          await sendBytes(st, ending)
+          # Close only once the client has read it: an early close could reset it.
+          discard await readN(st, 1)
+      except CatchableError:
+        discard
+      await closeClient(st)
+
+    let serverFut = serverHandler()
+    let config = ConnConfig(
+      host: "127.0.0.1",
+      port: ms.port,
+      user: "test",
+      database: "test",
+      sslMode: sslRequire,
+    )
+    try:
+      let conn = await connect(config)
+      await conn.close()
+    except PgConnectionError as e:
+      result = e
+    await serverFut
+    await closeServer(ms)
+
+  test "a TLS handshake the server cuts short is transient":
+    # A server going down mid-handshake: a bare close, or a close_notify alert.
+    for ending in [newSeq[byte](), @[0x15'u8, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00]]:
+      let err = waitFor handshakeError(ending)
+      require err != nil
+      check err.attempts[0] of PgUnavailableError
+      check isTransientError(err)
+
+  test "a TLS handshake the server ends with a fatal alert is not transient":
+    let handshakeFailure = @[0x15'u8, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]
+    let err = waitFor handshakeError(handshakeFailure)
+    require err != nil
+    check not (err.attempts[0] of PgUnavailableError)
+    check not isTransientError(err)
+
+  test "a direct TLS handshake the server breaks off is not transient":
+    # How a server before PostgreSQL 17 answers the ClientHello: it reads it as
+    # a startup packet of a bad length and closes.
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          let header = await readN(st, 5)
+          discard await readN(st, (int(header[3]) shl 8) or int(header[4]))
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslRequire,
+        sslNegotiation: sslnDirect,
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgConnectionError as e:
+        result = e
+      await serverFut
+      await closeServer(ms)
+
+    let err = waitFor testBody()
+    require err != nil
+    check not (err.attempts[0] of PgUnavailableError)
+    check "PostgreSQL 17" in err.attempts[0].msg
+    check not isTransientError(err)
 
 suite "SSL negotiation - pre-TLS byte injection":
   test "residual bytes after 'S' response are rejected (CVE-2021-23214 family)":
@@ -2294,7 +2396,7 @@ when hasAsyncDispatch and defined(ssl):
           try:
             let clientCtx = newContext(verifyMode = CVerifyNone)
             wrapConnectedSocket(clientCtx, c, handshakeAsClient)
-            await driveTlsHandshake(c, verifyingPeer = false)
+            await driveTlsHandshake(c, verifyingPeer = false, direct = false)
             let peer = sslGetPeerCertificate(c.sslHandle)
             peerCertOk = peer != nil
             if peer != nil:
@@ -2367,7 +2469,7 @@ when hasAsyncDispatch and defined(ssl):
       await c.connect("127.0.0.1", port)
       try:
         wrapConnectedSocket(clientCtx, c, handshakeAsClient)
-        await driveTlsHandshake(c, verifyingPeer = true)
+        await driveTlsHandshake(c, verifyingPeer = true, direct = false)
       except CatchableError as e:
         result = e
       finally:
