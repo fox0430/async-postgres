@@ -380,9 +380,11 @@ suite "SSL negotiation - error handling":
     waitFor testBody()
     check raised
 
-  test "unexpected SSL response byte raises PgError":
+  test "an unexpected SSL response byte is a protocol violation":
     var raised = false
     var msgHasUnexpected = false
+    var msgHasRawByte = false
+    var protocolViolation = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -391,7 +393,7 @@ suite "SSL negotiation - error handling":
         let st = await ms.accept()
         try:
           discard await readN(st, 8)
-          await sendBytes(st, @[byte('X')])
+          await sendBytes(st, @[0x1B'u8]) # ESC: must not reach the message raw
         except CatchableError:
           discard
         await closeClient(st)
@@ -411,7 +413,9 @@ suite "SSL negotiation - error handling":
         await conn.close()
       except PgError as e:
         raised = true
-        msgHasUnexpected = "Unexpected" in e.msg
+        msgHasUnexpected = "Unexpected" in e.msg and "\\x1B" in e.msg
+        msgHasRawByte = '\x1B' in e.msg
+        protocolViolation = e.parent of PgProtocolError
 
       await serverFut
       await closeServer(ms)
@@ -419,9 +423,11 @@ suite "SSL negotiation - error handling":
     waitFor testBody()
     check raised
     check msgHasUnexpected
+    check not msgHasRawByte
+    check protocolViolation
 
   test "a fork failure in reply to the SSLRequest is reported without its text":
-    proc testBody(): Future[string] {.async.} =
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
       let ms = startMockServer()
 
       proc serverHandler() {.async.} =
@@ -452,23 +458,26 @@ suite "SSL negotiation - error handling":
         let conn = await connect(config)
         await conn.close()
       except PgConnectionError as e:
-        result = e.msg
+        result = e
 
       await serverFut
       await closeServer(ms)
 
-    let errMsg = waitFor testBody()
-    check "error response during SSL exchange" in errMsg
-    check "could not fork" notin errMsg
+    let err = waitFor testBody()
+    require err != nil
+    check "error response during SSL exchange" in err.msg
+    check "could not fork" notin err.msg
+    # Not a protocol violation: the server just could not serve the request.
+    check err.parent != nil
+    check not (err.parent of PgProtocolError)
 
 suite "SSL negotiation - pre-TLS byte injection":
   test "residual bytes after 'S' response are rejected (CVE-2021-23214 family)":
-    # A man-in-the-middle appends plaintext to the server's 'S' reply to smuggle
-    # it ahead of the encrypted stream. A compliant server sends only 'S' and
-    # then waits for the client's ClientHello, so any byte already readable here
-    # is injected and the connection must be refused before the TLS handshake.
+    # A MITM appends plaintext to 'S' to smuggle it ahead of the encrypted
+    # stream; it must be refused before the TLS handshake.
     var raised = false
     var msgMatches = false
+    var protocolViolation = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -499,6 +508,7 @@ suite "SSL negotiation - pre-TLS byte injection":
       except PgError as e:
         raised = true
         msgMatches = "unencrypted data" in e.msg
+        protocolViolation = e.parent of PgProtocolError
 
       await serverFut
       await closeServer(ms)
@@ -506,16 +516,14 @@ suite "SSL negotiation - pre-TLS byte injection":
     waitFor testBody()
     check raised
     check msgMatches
+    check protocolViolation
 
   test "split-write injection after 'S' response is rejected (CVE-2021-23214 family)":
-    # Same CVE family, but 'S' and the injected bytes are sent by two separate
-    # writes rather than a single segment. Depending on how the kernel schedules
-    # the two writes on loopback, either the pre-TLS-check window catches the
-    # injection via `socketHasPendingData` (bytes already in the kernel buffer)
-    # or the extra bytes coalesce with 'S' into chronos's read and are caught
-    # via the `n > 1` path — both are valid defenses and yield the same error.
+    # Two writes: caught by `socketHasPendingData` or, if they coalesce into
+    # chronos's read, by the `n > 1` path.
     var raised = false
     var msgMatches = false
+    var protocolViolation = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -546,6 +554,7 @@ suite "SSL negotiation - pre-TLS byte injection":
       except PgError as e:
         raised = true
         msgMatches = "unencrypted data" in e.msg
+        protocolViolation = e.parent of PgProtocolError
 
       await serverFut
       await closeServer(ms)
@@ -553,6 +562,53 @@ suite "SSL negotiation - pre-TLS byte injection":
     waitFor testBody()
     check raised
     check msgMatches
+    check protocolViolation
+
+  test "data trailing an 'N' reply is rejected in every sslmode":
+    # One segment so chronos's `readOnce` pulls the extra bytes in; SSL-only
+    # modes must report the violation, not "Server does not support SSL".
+    proc testBody(mode: SslMode): Future[ref PgError] {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8) # SSLRequest
+          await sendBytes(st, @[byte('N'), byte('X'), byte('Y'), byte('Z')])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: mode,
+        sslRootCert:
+          if mode in {sslVerifyCa, sslVerifyFull}:
+            testCaCert()
+          else:
+            "",
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        result = e
+
+      await serverFut
+      await closeServer(ms)
+
+    for mode in [sslPrefer, sslRequire, sslVerifyCa, sslVerifyFull]:
+      checkpoint $mode
+      let err = waitFor testBody(mode)
+      require err != nil
+      check "after SSL refusal" in err.msg
+      check err.parent of PgProtocolError
 
 suite "SSL negotiation - sslVerifyCa":
   test "sslVerifyCa raises PgError when server responds N":
