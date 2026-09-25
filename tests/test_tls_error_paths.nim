@@ -96,9 +96,7 @@ suite "TLS error paths: client cert/key/CA loading":
     check waitFor(runTest())
 
   test "verify-ca without sslrootcert escapes the per-host fold":
-    # Two entries share the one broken config: the first host's check must
-    # raise `PgConfigError` out of `connect` instead of folding it into the
-    # aggregate and dialing the second.
+    # Two entries share the broken config: raise before dialing the second.
     proc runTest(): Future[string] {.async.} =
       let ms = startMockServer()
       startSslProbe(ms, closeAfterReply = false)
@@ -121,6 +119,36 @@ suite "TLS error paths: client cert/key/CA loading":
     let msg = waitFor runTest()
     check "requires sslrootcert" in msg
     check "Could not connect to any host" notin msg
+
+  test "a verified sslmode without sslrootcert still dials a Unix socket":
+    # TLS is skipped over AF_UNIX, so no root cert is missing (as in libpq): the
+    # attempt must fail at the dial of the absent socket, not before it.
+    proc runTest(mode: SslMode, direct: bool): Future[ref CatchableError] {.async.} =
+      let cfg = ConnConfig(
+        host: "/nonexistent-async-postgres-socket-dir",
+        port: 5432,
+        user: "test",
+        database: "test",
+        sslMode: mode,
+        connectTimeout: milliseconds(5000),
+      )
+      try:
+        let conn =
+          if direct:
+            await connectToHost(cfg, HostEntry(host: cfg.host, port: cfg.port))
+          else:
+            await connect(cfg)
+        await conn.close()
+      except CatchableError as e:
+        result = e
+
+    for mode in [sslVerifyCa, sslVerifyFull]:
+      for direct in [false, true]:
+        checkpoint $mode & " direct=" & $direct
+        let err = waitFor runTest(mode, direct)
+        require err != nil
+        check not (err of PgConfigError)
+        check "sslrootcert" notin err.msg
 
   test "a lone sslcert through connectToHost is a config fault":
     # `connectToHost` validates the pairing at entry, so a direct caller sees

@@ -687,6 +687,33 @@ proc validateClientCertConfig*(config: ConnConfig) =
         config.sslMode.dsnName & "); they would otherwise be silently unused",
     )
 
+proc validateTlsConfig*(
+    config: ConnConfig, overTcp = true
+) {.raises: [PgConfigError].} =
+  ## Reject TLS settings no server can satisfy (as libpq): a TLS requirement in a
+  ## build without TLS (asyncdispatch without ``-d:ssl``), or, when ``overTcp``,
+  ## a verified sslmode without ``sslrootcert`` (a Unix socket skips TLS).
+  when not hasTls:
+    const hint = ", which this build lacks (compile with -d:ssl)"
+    if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
+      raise newException(
+        PgConfigError, "sslmode=" & config.sslMode.dsnName & " needs TLS" & hint
+      )
+    if config.channelBinding == cbRequire:
+      raise newException(PgConfigError, "channel_binding=require needs TLS" & hint)
+    if config.requireAuth == {amScramSha256Plus}:
+      raise newException(
+        PgConfigError,
+        "require_auth allows only SCRAM-SHA-256-PLUS, which needs TLS" & hint,
+      )
+  if overTcp and config.sslMode in {sslVerifyCa, sslVerifyFull} and
+      config.sslRootCert.len == 0:
+    # Both backends would fall back to a Web PKI store, and verify-ca skips the
+    # hostname check, so any publicly issued cert could MITM. Fail closed.
+    raise newException(
+      PgConfigError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
+    )
+
 # HostEntry accessors
 
 func dialAddr*(entry: HostEntry): string {.inline.} =

@@ -477,7 +477,7 @@ suite "SSL negotiation - pre-TLS byte injection":
     # stream; it must be refused before the TLS handshake.
     var raised = false
     var msgMatches = false
-    var protocolViolation = false
+    var securityRefusal = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -508,7 +508,7 @@ suite "SSL negotiation - pre-TLS byte injection":
       except PgError as e:
         raised = true
         msgMatches = "unencrypted data" in e.msg
-        protocolViolation = e.parent of PgProtocolError
+        securityRefusal = e.parent of PgSecurityError
 
       await serverFut
       await closeServer(ms)
@@ -516,14 +516,14 @@ suite "SSL negotiation - pre-TLS byte injection":
     waitFor testBody()
     check raised
     check msgMatches
-    check protocolViolation
+    check securityRefusal
 
   test "split-write injection after 'S' response is rejected (CVE-2021-23214 family)":
     # Two writes: caught by `socketHasPendingData` or, if they coalesce into
     # chronos's read, by the `n > 1` path.
     var raised = false
     var msgMatches = false
-    var protocolViolation = false
+    var securityRefusal = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -554,7 +554,7 @@ suite "SSL negotiation - pre-TLS byte injection":
       except PgError as e:
         raised = true
         msgMatches = "unencrypted data" in e.msg
-        protocolViolation = e.parent of PgProtocolError
+        securityRefusal = e.parent of PgSecurityError
 
       await serverFut
       await closeServer(ms)
@@ -562,11 +562,10 @@ suite "SSL negotiation - pre-TLS byte injection":
     waitFor testBody()
     check raised
     check msgMatches
-    check protocolViolation
+    check securityRefusal
 
   test "data trailing an 'N' reply is rejected in every sslmode":
-    # One segment so chronos's `readOnce` pulls the extra bytes in; SSL-only
-    # modes must report the violation, not "Server does not support SSL".
+    # One segment so chronos's `readOnce` pulls the extra bytes in.
     proc testBody(mode: SslMode): Future[ref PgError] {.async.} =
       let ms = startMockServer()
 
@@ -608,7 +607,12 @@ suite "SSL negotiation - pre-TLS byte injection":
       let err = waitFor testBody(mode)
       require err != nil
       check "after SSL refusal" in err.msg
-      check err.parent of PgProtocolError
+      if mode == sslPrefer:
+        check err.parent of PgProtocolError
+        check not (err of PgSecurityError)
+      else:
+        check err.parent of PgSecurityError
+        check err of PgSecurityError
 
 suite "SSL negotiation - sslVerifyCa":
   test "sslVerifyCa raises PgError when server responds N":
@@ -1265,8 +1269,8 @@ suite "SSL negotiation - sslAllow":
 
   test "sslAllow connects via SSL fallback when SSL handshake refused fails cleanly":
     # Verifies that sslAllow does NOT fall back to plaintext a second time
-    # if the server refuses SSL — i.e. fallback uses sslRequire semantics,
-    # not sslPrefer.
+    # if the server refuses SSL — i.e. its TLS attempt fails on 'N' instead of
+    # falling back like sslPrefer.
     var attemptCount: int = 0
     var raised = false
 
@@ -1314,6 +1318,69 @@ suite "SSL negotiation - sslAllow":
     # Exactly two attempts: one plaintext, one SSL — no third plaintext retry.
     check attemptCount == 2
     check raised
+
+  proc allowNeedingTls(
+      channelBinding: ChannelBindingMode, requireAuth: set[AuthMethod]
+  ): tuple[firstIsSslRequest: bool, err: ref PgConnectionError] =
+    ## `connect` under sslmode=allow against a server that answers 'N'.
+    var firstIsSslRequest = false
+
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          let req = await readN(st, 8)
+          firstIsSslRequest = decodeInt32(req, 4) == 80877103'i32
+          await sendBytes(st, @[byte('N')])
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslAllow,
+        channelBinding: channelBinding,
+        requireAuth: requireAuth,
+        # A plaintext leg would leave a second dial with no one to answer it.
+        connectTimeout: milliseconds(5000),
+      )
+
+      var err: ref PgConnectionError
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgConnectionError as e:
+        err = e
+
+      await serverFut
+      await closeServer(ms)
+      err
+
+    let err = waitFor testBody()
+    (firstIsSslRequest, err)
+
+  test "sslAllow skips the plaintext leg when authentication needs TLS":
+    # The one attempt opens with SSLRequest; its 'N' is a security refusal.
+    let cases = [
+      (cbRequire, set[AuthMethod]({}), "channel binding is required"),
+      (cbPrefer, {amScramSha256Plus}, "require_auth allows only SCRAM-SHA-256-PLUS"),
+    ]
+    for (channelBinding, requireAuth, needle) in cases:
+      checkpoint $channelBinding & " " & $requireAuth
+      let r = allowNeedingTls(channelBinding, requireAuth)
+      check r.firstIsSslRequest
+      require r.err != nil
+      check r.err of PgSecurityError
+      check needle in r.err.msg
+      check "plaintext attempt" notin r.err.msg
 
 suite "SSL negotiation - sslDisable":
   test "negotiateSSL with sslDisable raises PgConfigError":
@@ -1581,12 +1648,16 @@ proc readSaslInitialResponseMechanism(client: MockClient): Future[string] {.asyn
     inc i
 
 suite "SCRAM channel binding enforcement":
-  test "cbRequire with sslmode=disable is a config fault, rejected before any dial":
-    # Port 1 refuses every connection, so only the pre-flight check in
-    # `connect` can produce a `PgConfigError` here.
-    var configFault = false
-    var msgMatches = false
-
+  proc connectPort1(
+      sslMode: SslMode,
+      channelBinding: ChannelBindingMode,
+      requireAuth: set[AuthMethod],
+      direct: bool,
+  ): ref PgError =
+    ## The error `connect` (or `connectToHost` when `direct`) raises for a host
+    ## that refuses every connection: only a pre-dial check yields a
+    ## `PgConfigError`.
+    var err: ref PgError
     proc testBody() {.async.} =
       let config = ConnConfig(
         host: "127.0.0.1",
@@ -1594,23 +1665,49 @@ suite "SCRAM channel binding enforcement":
         user: "test",
         password: "test",
         database: "test",
-        sslMode: sslDisable,
-        channelBinding: cbRequire,
+        sslMode: sslMode,
+        channelBinding: channelBinding,
+        requireAuth: requireAuth,
       )
-
       try:
-        let conn = await connect(config)
+        let conn =
+          if direct:
+            await connectToHost(config, HostEntry(host: "127.0.0.1", port: 1))
+          else:
+            await connect(config)
         await conn.close()
-      except PgConfigError as e:
-        configFault = true
-        msgMatches = "sslmode=disable" in e.msg
+      except PgError as e:
+        err = e
 
     waitFor testBody()
-    check configFault
-    check msgMatches
+    err
 
-  test "cbDisable picks SCRAM-SHA-256 even when PLUS is offered":
-    var pickedNonPlus = false
+  test "security settings contradicting each other are rejected before any dial":
+    let cases = [
+      (sslDisable, cbRequire, set[AuthMethod]({}), "sslmode=disable"),
+      (sslPrefer, cbRequire, {amMd5}, "require_auth"),
+      (sslPrefer, cbDisable, {amScramSha256Plus}, "channel_binding=disable"),
+      (sslDisable, cbPrefer, {amScramSha256Plus}, "sslmode=disable"),
+    ]
+    for (sslMode, channelBinding, requireAuth, needle) in cases:
+      for direct in [false, true]:
+        checkpoint $sslMode & " " & $channelBinding & " " & $requireAuth & " direct=" &
+          $direct
+        let err = connectPort1(sslMode, channelBinding, requireAuth, direct)
+        require err != nil
+        check err of PgConfigError
+        check needle in err.msg
+
+  test "channel_binding=require with SCRAM-SHA-256-PLUS allowed reaches the dial":
+    let err = connectPort1(sslPrefer, cbRequire, {amScramSha256Plus}, false)
+    require err != nil
+    check err of PgConnectionError
+
+  proc saslRefusal(
+      mode: ChannelBindingMode, offer: seq[string]
+  ): tuple[err: ref PgError, clientReplied: bool] =
+    ## `connect` without TLS against a server offering `offer`.
+    var r: tuple[err: ref PgError, clientReplied: bool]
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -1619,15 +1716,14 @@ suite "SCRAM channel binding enforcement":
         let st = await ms.accept()
         try:
           await drainStartupMessage(st)
-          await sendAuthSasl(st, @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"])
-          let mech = await readSaslInitialResponseMechanism(st)
-          pickedNonPlus = mech == "SCRAM-SHA-256"
+          await sendAuthSasl(st, offer)
+          discard await readN(st, 1)
+          r.clientReplied = true
         except CatchableError:
           discard
         await closeClient(st)
 
       let serverFut = serverHandler()
-
       let config = ConnConfig(
         host: "127.0.0.1",
         port: ms.port,
@@ -1635,62 +1731,95 @@ suite "SCRAM channel binding enforcement":
         password: "test",
         database: "test",
         sslMode: sslDisable,
-        channelBinding: cbDisable,
+        channelBinding: mode,
       )
-
-      try:
-        let conn = await connect(config)
-        await conn.close()
-      except PgError:
-        discard
-
-      await serverFut
-      await closeServer(ms)
-
-    waitFor testBody()
-    check pickedNonPlus
-
-  test "cbDisable errors when server offers only PLUS":
-    var raised = false
-    var msgMatches = false
-
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          await sendAuthSasl(st, @["SCRAM-SHA-256-PLUS"])
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-
-      let config = ConnConfig(
-        host: "127.0.0.1",
-        port: ms.port,
-        user: "test",
-        password: "test",
-        database: "test",
-        sslMode: sslDisable,
-        channelBinding: cbDisable,
-      )
-
       try:
         let conn = await connect(config)
         await conn.close()
       except PgError as e:
-        raised = true
-        msgMatches = "channel binding" in e.msg
-
+        r.err = e
       await serverFut
       await closeServer(ms)
 
     waitFor testBody()
-    check raised
-    check msgMatches
+    r
+
+  test "SCRAM-SHA-256-PLUS offered without TLS is refused before answering":
+    # A server offers -PLUS only over TLS, so TLS was stripped on the way.
+    for mode in [cbPrefer, cbDisable]:
+      for offer in [@["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"], @["SCRAM-SHA-256-PLUS"]]:
+        checkpoint $mode & " " & $offer
+        let r = saslRefusal(mode, offer)
+        require r.err != nil
+        check r.err of PgSecurityError
+        check "over a non-SSL connection" in r.err.msg
+        check not r.clientReplied
+
+  proc cbRequireRefusal(
+      authReq: seq[byte]
+  ): tuple[err: ref PgError, clientReplied: bool] =
+    ## `connect` under channel_binding=require against a server that declines
+    ## TLS, then answers the startup with `authReq`.
+    var r: tuple[err: ref PgError, clientReplied: bool]
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st) # SSLRequest
+          await sendBytes(st, @[byte('N')])
+          await drainStartupMessage(st)
+          await sendBytes(st, authReq)
+          discard await readN(st, 1)
+          r.clientReplied = true
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        password: "test",
+        database: "test",
+        sslMode: sslPrefer,
+        channelBinding: cbRequire,
+      )
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgError as e:
+        r.err = e
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    r
+
+  test "cbRequire refuses a password request before sending the password":
+    let requests = [
+      ("cleartext", buildBackendMsg('R', @[byte 0, 0, 0, 3])),
+      ("md5", buildBackendMsg('R', @[byte 0, 0, 0, 5, 1, 2, 3, 4])),
+    ]
+    for (name, req) in requests:
+      checkpoint name
+      let r = cbRequireRefusal(req)
+      require r.err != nil
+      check r.err of PgSecurityError
+      check "channel binding is required, but server requested" in r.err.msg
+      check not r.clientReplied
+
+  test "cbRequire refuses AuthenticationOk without channel binding":
+    # ReadyForQuery follows so a missing check connects instead of hanging.
+    let r = cbRequireRefusal(
+      buildBackendMsg('R', @[byte 0, 0, 0, 0]) & buildBackendMsg('Z', @[byte('I')])
+    )
+    require r.err != nil
+    check r.err of PgSecurityError
+    check "without channel binding" in r.err.msg
 
   test "cbPrefer without SSL accepts SCRAM-SHA-256":
     var pickedScram = false
@@ -1847,14 +1976,70 @@ suite "selectScramMechanism":
       msg = e.msg
     check "SSL is not in use" in msg
 
-  test "cbPrefer raises when no SCRAM mechanism is offered":
-    expect PgConnectionError:
-      discard selectScramMechanism(
-        sslEnabled = false,
-        serverCertDer = @[],
-        saslMechanisms = @["SOMETHING-ELSE"],
-        mode = cbPrefer,
-      )
+  test "no SCRAM mechanism offered is no PgSecurityError":
+    # An unsupported mechanism, not a refusal of anything the config requires.
+    for mode in [cbPrefer, cbDisable]:
+      checkpoint $mode
+      var err: ref PgConnectionError
+      try:
+        discard selectScramMechanism(
+          sslEnabled = false,
+          serverCertDer = @[],
+          saslMechanisms = @["OAUTHBEARER"],
+          mode = mode,
+        )
+      except PgConnectionError as e:
+        err = e
+      require err != nil
+      check not (err of PgSecurityError)
+
+  test "a lone SCRAM-SHA-256-PLUS the server offered is no PgSecurityError":
+    # Unusable (binding off, or no certificate), but nothing refused.
+    for (mode, cert) in [(cbDisable, fakeCert), (cbPrefer, newSeq[byte]())]:
+      checkpoint $mode
+      var err: ref PgConnectionError
+      try:
+        discard selectScramMechanism(
+          sslEnabled = true,
+          serverCertDer = cert,
+          saslMechanisms = @["SCRAM-SHA-256-PLUS"],
+          mode = mode,
+        )
+      except PgConnectionError as e:
+        err = e
+      require err != nil
+      check not (err of PgSecurityError)
+      check "server only offered SCRAM-SHA-256-PLUS" in err.msg
+
+  test "require_auth leaving only SCRAM-SHA-256-PLUS it cannot bind is refused":
+    for (mode, cert) in [(cbDisable, fakeCert), (cbPrefer, newSeq[byte]())]:
+      checkpoint $mode
+      var err: ref PgConnectionError
+      try:
+        discard selectScramMechanism(
+          sslEnabled = true,
+          serverCertDer = cert,
+          saslMechanisms = bothMechs,
+          mode = mode,
+          allowed = {amScramSha256Plus},
+        )
+      except PgConnectionError as e:
+        err = e
+      require err != nil
+      check err of PgSecurityError
+      check "require_auth allows only SCRAM-SHA-256-PLUS" in err.msg
+
+  test "require_auth dropping SCRAM-SHA-256-PLUS over TLS sends n,,":
+    # The server knows it offered -PLUS, so "y,," would make it abort.
+    let choice = selectScramMechanism(
+      sslEnabled = true,
+      serverCertDer = fakeCert,
+      saslMechanisms = bothMechs,
+      mode = cbPrefer,
+      allowed = {amScramSha256},
+    )
+    check choice.mechanism == "SCRAM-SHA-256"
+    check choice.cbSupportedButUnused == false
 
 when hasAsyncDispatch and defined(ssl):
   # Self-signed test certificates (DER, base64). Regenerate with:
@@ -2085,7 +2270,7 @@ when hasAsyncDispatch and defined(ssl):
           try:
             let clientCtx = newContext(verifyMode = CVerifyNone)
             wrapConnectedSocket(clientCtx, c, handshakeAsClient)
-            await driveTlsHandshake(c)
+            await driveTlsHandshake(c, verifyingPeer = false)
             let peer = sslGetPeerCertificate(c.sslHandle)
             peerCertOk = peer != nil
             if peer != nil:
@@ -2101,6 +2286,94 @@ when hasAsyncDispatch and defined(ssl):
         waitFor testBody()
         check peerCertOk
         check serverGotAppByte
+
+    type TestServer = enum
+      tsTls ## completes the handshake
+      tsTls12NeedsClientCert ## fails it with an alert: we send no certificate
+      tsGarbage ## answers the ClientHello with no TLS at all
+
+    proc handshakeError(
+        caFile: string, server: TestServer
+    ): Future[ref CatchableError] {.async.} =
+      ## What `driveTlsHandshake` raises, verifying the server against `caFile`.
+      const
+        SslVerifyFailIfNoPeerCert = 0x02
+        SslCtrlSetMaxProtoVersion = 124
+        Tls12Version = 0x0303
+      let certDir = currentSourcePath().parentDir / "certs"
+      let listener = newAsyncSocket(buffered = false)
+      listener.setSockOpt(OptReuseAddr, true)
+      listener.bindAddr(Port(0))
+      let port = listener.getLocalAddr()[1]
+      listener.listen()
+
+      proc serverSide() {.async.} =
+        let s = await listener.accept()
+        try:
+          if server == tsGarbage:
+            discard await s.recv(1)
+            await s.send("not a TLS record")
+          else:
+            let serverCtx = newContext(
+              verifyMode = CVerifyNone,
+              certFile = certDir / "server.crt",
+              keyFile = certDir / "server.key",
+            )
+            if server == tsTls12NeedsClientCert:
+              SSL_CTX_set_verify(
+                serverCtx.context, SSL_VERIFY_PEER or SslVerifyFailIfNoPeerCert, nil
+              )
+              discard SSL_CTX_ctrl(
+                serverCtx.context, SslCtrlSetMaxProtoVersion, Tls12Version, nil
+              )
+            wrapConnectedSocket(serverCtx, s, handshakeAsServer)
+            discard await s.recv(1)
+        except CatchableError:
+          discard
+        finally:
+          s.close()
+
+      let serverFut = serverSide()
+      let clientCtx = newContext(verifyMode = CVerifyNone)
+      SSL_CTX_set_verify(clientCtx.context, SSL_VERIFY_PEER, nil)
+      doAssert SSL_CTX_load_verify_locations(
+        clientCtx.context, cstring(certDir / caFile), nil
+      ) == 1
+      let c = newAsyncSocket(buffered = false)
+      await c.connect("127.0.0.1", port)
+      try:
+        wrapConnectedSocket(clientCtx, c, handshakeAsClient)
+        await driveTlsHandshake(c, verifyingPeer = true)
+      except CatchableError as e:
+        result = e
+      finally:
+        c.close()
+      await serverFut
+      listener.close()
+
+    test "a server certificate our check rejects is a PgSecurityError":
+      if not ensureTestCerts():
+        skip()
+      else:
+        let err = waitFor handshakeError("wrong_ca.crt", tsTls)
+        check err of PgSecurityError
+
+    test "the server's alert stays a plain PgConnectionError":
+      # Our check passed; the server then refuses us for lacking a certificate.
+      if not ensureTestCerts():
+        skip()
+      else:
+        let err = waitFor handshakeError("ca.crt", tsTls12NeedsClientCert)
+        check err of PgConnectionError
+        check not (err of PgSecurityError)
+
+    test "a handshake failing before the certificate is no PgSecurityError":
+      if not ensureTestCerts():
+        skip()
+      else:
+        let err = waitFor handshakeError("ca.crt", tsGarbage)
+        check err of PgConnectionError
+        check not (err of PgSecurityError)
 
 when hasChronos:
   suite "reconnectInPlace X509 capture rebind":
@@ -2452,3 +2725,124 @@ when hasChronos:
         cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), csize_t.high
       )
       check buf.len == 0
+
+when hasChronos:
+  import chronos/streams/asyncstream
+
+  suite "chronos TLS handshake classification":
+    # Self-signed RSA for localhost, valid only 2020-01-01..02. Regenerate:
+    #   openssl req -x509 -newkey rsa:2048 -nodes \
+    #     -keyout k.pem -out c.pem -subj "/CN=localhost" \
+    #     -addext "subjectAltName=DNS:localhost" \
+    #     -not_before 20200101000000Z -not_after 20200102000000Z
+    const expiredCert = """-----BEGIN CERTIFICATE-----
+MIIDHzCCAgegAwIBAgIUKXkWe/HrCbKSDlCqZoFrqXwtN+UwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTIwMDEwMTAwMDAwMFoXDTIwMDEw
+MjAwMDAwMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEA9w24nF7eFappWaptKD9SVQ66cNZJtl2iry8TzpIEdc6x
+JSl6U2wnLnmCSPMz1airphykgvX1xfgejtbdy0X0ikbVbhlMxMFDRYR3laaSvMGx
+KuPAedY4GOjri+M5CZ0k0PZ0JTTGWkmoUNkxtaRkgbHDLdPUzmag0sBbcFyynmkI
+bWSbjqptDMGls+gwwGixks8L0B4s8rNNJYGPHvurk+wYkxrKOLX18INBlJ5qfyLs
+rH875vVerr6//judsnKHEtaKCnKRhG2pt2mk/NHuhqnZRGWqVnLGOQa+LrUcVI5+
+9XtLloNMu98Mn/cqROxN68FEMIv7ZZcyIpAHO+MNPwIDAQABo2kwZzAdBgNVHQ4E
+FgQUoiI06AcVVlkxlpNrmqa4UPbfrREwHwYDVR0jBBgwFoAUoiI06AcVVlkxlpNr
+mqa4UPbfrREwDwYDVR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3Qw
+DQYJKoZIhvcNAQELBQADggEBAOlcov2NXiabaZf+WhLggDfs6k1HhS2wSiMMgqJs
+HiRIUZqqh5KrlhTMEeFOlVkadYs2JLNnXmiJ6fvO04eB9fuZidrrGgD3a2MBtJ7p
+kMMENuhdRx9aN5bl37TLxZOKW6CZPDMlsHe7kn6D5Ag90LAeEVSrzV4xROQJAvxG
+eM0r6Aweo7myN3bPBMzkD5oOLBoGo/Q6mn5PmuY5qGEX/R1Nfj6WfVwOKJwHOx58
+rdyah4R2cjwIASd81W6i4vxUZH6sBFYVrPCDpUmHimxabTw6uXS8tpKKC3vZfcZS
+Ifzbx3fAolwkb+N86Rs1+O3E18zk69+7krfxx0EkXPc1kX4=
+-----END CERTIFICATE-----
+"""
+    const expiredKey = """-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQD3DbicXt4VqmlZ
+qm0oP1JVDrpw1km2XaKvLxPOkgR1zrElKXpTbCcueYJI8zPVqKumHKSC9fXF+B6O
+1t3LRfSKRtVuGUzEwUNFhHeVppK8wbEq48B51jgY6OuL4zkJnSTQ9nQlNMZaSahQ
+2TG1pGSBscMt09TOZqDSwFtwXLKeaQhtZJuOqm0MwaWz6DDAaLGSzwvQHizys00l
+gY8e+6uT7BiTGso4tfXwg0GUnmp/Iuysfzvm9V6uvr/+O52ycocS1ooKcpGEbam3
+aaT80e6GqdlEZapWcsY5Br4utRxUjn71e0uWg0y73wyf9ypE7E3rwUQwi/tllzIi
+kAc74w0/AgMBAAECggEAOpr4KKv+feA7dohNtabzxnakdqD2wnqK3YjK541O3o1m
+C11ABesZjlZHuDttF+mXsmOICQMExu4ZfaPt4Esbe/ParG/2/JOl/Cc04PyvQXSn
+LPfzEFPnYc1bFweTX7r14VYdbjgLN57SfT9Qofi52ORM2yGtkTraOrRj3I841ge4
+IpKbJjkcxDVHFtQedTYSso3XLYBEnlj7xi/4LSttKLv5LzGlCzEh9YL81iianXYt
+62ZySTUZ50Z2o8yTtpv/CO+w4XFC6TmrpnZg1bQuesJM8wKLUyqhTdNLBHeQJirA
+mtv3xXYAS8jnEsO8u28KW0j+IZmHlm2xbySUM054wQKBgQD/G2oZ+35AxTMQu2jE
+gNU/dMaK6FJgtZlCljjrBtkBKAClJlzdafGAXN4TIY06mPEUrQxCdEQM2AXUpvBl
+vqWaGOCSa8dSJl+CyaFJv2TDRq8Q3EwEdTwAcOxmQLry8hWKHRi9vgv3/go9p+FX
+qmzQblWdTlNif0QHfQu05e3ffwKBgQD36xcnlCw23MLiMqm81MF64j3tD8DlFccJ
+6A1H2oYBCsneSoTD3aieqsYNMUiVvJH4YNw6ByqxsZE+fl/Am04J95ozgdEfmFaC
+SLg9Iy2e7f7SbgUkMUrar9iHTu6VaS0SwVat7qJUZBnOcHwfTX6+kb4xV7d+uf3n
+dO58NmmyQQKBgQD68Smuw1BPQGxaEjAd1Clw0VsYey3Fif1nncQBlWvTklkIG7OP
+7c4tGa0uHnwBXz8Ouqbrm9jw1XLu2wRw4VefPMdz4Odh7PNZASRSGh5xZM+DA2EX
+pYbPXEV+1D/SCcacZMDYrOCzIsdKHSEyjieZ5F79bXXi1xPBVgU0/lS+2wKBgQDI
+lzxa17aWhTRhlKBlmrcZWCjGwHJQaLhsuYbVVmgKO9Jtu1mEqLof9wjb775M+RAa
+KTTG9rmCoKtmJxYOXxpbUi0/849iwv1r2K7JOMdWyjXdyQr7564rFxBZGnJMDZdc
+j3Y0sNpC8eM3dyfWo/si8gUzI0fij1ZyidfURKpsgQKBgQDP0gF3ONn+OGwCgUEj
+Q4+esbU1u048dEtivYu0yMEdaRXOYYooXT/B5vR91LaSy1B1EbeSAXAYaXHQ8qFu
+LQ0pnbWDcbpdJRYVH24gp9f/RbLT2q7ETXH3bMtqfWToXyvMIFOCl5kEu7YRdWBQ
+JeOmWtVZvOCrgXRtH9DmA+/cbA==
+-----END PRIVATE KEY-----
+"""
+
+    proc expiredCertError(mode: SslMode): ref PgConnectionError =
+      ## `connect`'s error against a server presenting `expiredCert`.
+      var err: ref PgConnectionError
+
+      proc testBody(key: TLSPrivateKey, cert: TLSCertificate) {.async.} =
+        let ms = startMockServer()
+
+        # The server stream keeps no reference to `key` and `cert`, so they
+        # arrive as parameters that outlive the handshake.
+        proc serverHandler(key: TLSPrivateKey, cert: TLSCertificate) {.async.} =
+          let st = await ms.accept()
+          let reader = newAsyncStreamReader(st)
+          let writer = newAsyncStreamWriter(st)
+          var tls: TLSAsyncStream
+          try:
+            discard await readN(st, 8) # SSLRequest
+            await sendBytes(st, @[byte('S')])
+            tls = newTLSServerAsyncStream(
+              reader, writer, key, cert, minVersion = TLSVersion.TLS12
+            )
+            await tls.handshake()
+          except CatchableError:
+            discard
+          if tls != nil:
+            await tls.reader.closeWait()
+            await tls.writer.closeWait()
+          await reader.closeWait()
+          await writer.closeWait()
+          await closeClient(st)
+
+        let serverFut = serverHandler(key, cert)
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: mode,
+          sslRootCert: expiredCert,
+        )
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except PgConnectionError as e:
+          err = e
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody(TLSPrivateKey.init(expiredKey), TLSCertificate.init(expiredCert))
+      err
+
+    test "an expired certificate sslmode asked to verify is a PgSecurityError":
+      let err = expiredCertError(sslVerifyCa)
+      require err != nil
+      check err of PgSecurityError
+      check "TLS handshake failed" in err.msg
+
+    test "BearSSL rejecting a certificate nothing asked to verify is no PgSecurityError":
+      let err = expiredCertError(sslRequire)
+      require err != nil
+      check "TLS handshake failed" in err.msg
+      check not (err of PgSecurityError)

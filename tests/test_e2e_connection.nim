@@ -111,6 +111,18 @@ suite "E2E: SSL Connection":
 
     waitFor t()
 
+  test "require_auth=scram-sha-256 connects over SSL":
+    # The server also offers -PLUS; the client must not answer "y,," for the
+    # binding require_auth dropped, which the server rejects.
+    proc t() {.async.} =
+      var cfg = sslConfig(sslRequire)
+      cfg.requireAuth = {amScramSha256}
+      let conn = await connect(cfg)
+      doAssert conn.sslEnabled == true
+      await conn.close()
+
+    waitFor t()
+
   test "sslPrefer connects with SSL when server supports it":
     proc t() {.async.} =
       let conn = await connect(sslConfig(sslPrefer))
@@ -242,7 +254,7 @@ suite "E2E: SSL Verification":
           )
         )
         await conn.close()
-      except CatchableError:
+      except PgSecurityError:
         raised = true
       doAssert raised
 
@@ -264,7 +276,7 @@ suite "E2E: SSL Verification":
           )
         )
         await conn.close()
-      except CatchableError:
+      except PgSecurityError:
         raised = true
       doAssert raised
 

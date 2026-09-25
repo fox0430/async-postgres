@@ -835,6 +835,7 @@ async_postgres/pg_errors.nim	PgQueryError.fields
 async_postgres/pg_errors.nim	PgQueryError.hint
 async_postgres/pg_errors.nim	PgQueryError.severity
 async_postgres/pg_errors.nim	PgQueryError.sqlState
+async_postgres/pg_errors.nim	PgSecurityError
 async_postgres/pg_errors.nim	PgStateError
 async_postgres/pg_errors.nim	PgTimeoutError
 async_postgres/pg_errors.nim	PgTypeError

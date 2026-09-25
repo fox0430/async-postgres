@@ -3,7 +3,7 @@ import std/[unittest, strutils, base64]
 import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 
-import ../async_postgres/pg_auth
+import ../async_postgres/[pg_auth, pg_errors]
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -136,35 +136,35 @@ suite "SCRAM-SHA-256":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=differentNonce,s=c2FsdA==,i=4096"
-    expect CatchableError:
+    expect PgSecurityError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramClientFinalMessage rejects missing salt":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=myNonceServerPart,i=4096"
-    expect CatchableError:
+    expect PgProtocolError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramClientFinalMessage rejects missing iteration count":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=myNonceServerPart,s=c2FsdA=="
-    expect CatchableError:
+    expect PgProtocolError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramClientFinalMessage rejects invalid iteration count":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=abc"
-    expect CatchableError:
+    expect PgProtocolError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramClientFinalMessage rejects iteration count below 4096":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=4095"
-    expect CatchableError:
+    expect PgSecurityError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramClientFinalMessage accepts minimum iteration count 4096":
@@ -174,11 +174,17 @@ suite "SCRAM-SHA-256":
     discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramClientFinalMessage rejects excessive iteration count":
+    # Our own cost cap, not a failure to verify the server.
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=myNonceServerPart,s=c2FsdA==,i=10000001"
-    expect CatchableError:
+    var err: ref PgConnectionError
+    try:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
+    except PgConnectionError as e:
+      err = e
+    require err != nil
+    check not (err of PgSecurityError)
 
   test "scramClientFinalMessage accepts iteration count above 600000":
     # PG16+ scram_iterations may legitimately exceed the OWASP-recommended 600k
@@ -191,7 +197,7 @@ suite "SCRAM-SHA-256":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=5001"
-    expect CatchableError:
+    expect PgConnectionError:
       discard scramClientFinalMessage(
         "password", toBytes(serverFirst), state, maxIterations = 5000
       )
@@ -204,7 +210,7 @@ suite "SCRAM-SHA-256":
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
     let serverFirst = "r=myNonceServerPart,s=!!!invalid!!!,i=4096"
-    expect CatchableError:
+    expect PgProtocolError:
       discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramVerifyServerFinal rejects invalid base64 signature":

@@ -194,6 +194,7 @@ async_postgres/pg_connection/types.nim	requireStaged
 async_postgres/pg_connection/types.nim	sendBuf
 async_postgres/pg_connection/types.nim	updateReplMaxReceivedLsn
 async_postgres/pg_connection/types.nim	validateClientCertConfig
+async_postgres/pg_connection/types.nim	validateTlsConfig
 async_postgres/pg_connection/types.nim	warnStderr
 async_postgres/pg_connection/types.nim	wireSettled
 async_postgres/pg_pool.nim	buildReleaseAndReraise

@@ -134,7 +134,8 @@ nim c -d:asyncBackend=chronos your_app.nim
 **chronos is recommended.** chronos supports proper future cancellation, which enables reliable timeout handling and clean connection teardown. asyncdispatch lacks real cancellation — timed-out futures continue running in the background, and `cancelAndWait` is a no-op.
 
 SSL backend differs by async backend:
-- asyncdispatch: OpenSSL (requires `-d:ssl`)
+- asyncdispatch: OpenSSL (requires `-d:ssl`; without it `sslmode=prefer`/`allow`
+  connect in plaintext, and settings that need TLS raise `PgConfigError`)
 - chronos: BearSSL (via [nim-bearssl](https://github.com/status-im/nim-bearssl); TLS 1.2 only due to BearSSL limitation)
 
 Client certificate authentication (mTLS) is enabled by setting `sslCert` and

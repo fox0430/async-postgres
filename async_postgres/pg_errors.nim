@@ -1,10 +1,11 @@
 ## Exception hierarchy. Every library-raised exception derives from ``PgError``.
 ##
-## The hierarchy encodes *recovery*: ``PgProtocolError`` and ``PgTimeoutError``
-## are ``PgConnectionError`` because both leave the wire unusable, so reconnect
-## loops must see them; ``PgStateError`` and ``PgConfigError`` are deliberately
-## siblings, being a programming error and a configuration fault that
-## reconnecting cannot fix.
+## The hierarchy encodes *scope*, not retryability: a ``PgConnectionError``
+## (``PgProtocolError``, ``PgTimeoutError`` and ``PgSecurityError`` included)
+## ends one connection, so ``connect`` fails over past it and reconnect loops
+## must see it; ``PgStateError`` and ``PgConfigError`` are deliberately
+## siblings, being a programming error and a configuration fault that no
+## reconnect fixes.
 ##
 ## ``PgTypeError`` = caller data the wire format cannot carry; ``PgQueryError`` =
 ## an error the server reported; ``ValueError`` = a precondition, and the one kind
@@ -60,6 +61,19 @@ type
     ## Raised on PostgreSQL wire protocol violations. The connection stream is
     ## desynchronised after this error and must be torn down.
 
+  PgSecurityError* = object of PgConnectionError
+    ## The client refused the connection to uphold a config requirement
+    ## (``sslmode=require`` or stronger, failing closed where the backend cannot
+    ## verify; ``channel_binding=require``; ``require_auth``; direct-SSL ALPN) or
+    ## a tampering check a genuine server always passes (SCRAM signature, nonce,
+    ## message order and iteration floor; data injected after 'S';
+    ## SCRAM-SHA-256-PLUS offered without TLS).
+    ##
+    ## It names the requirement that failed, not whether a misconfiguration or
+    ## a MITM caused it. The server's own refusals (a TLS alert, a wrong
+    ## password) stay plain ``PgConnectionError``. Per host: ``connect`` fails
+    ## over past it, where libpq stops.
+
   ProtocolError* {.deprecated: "use PgProtocolError".} = PgProtocolError
     ## Deprecated alias for `PgProtocolError`, kept for backwards compatibility.
 
@@ -75,7 +89,8 @@ type
 
   PgConfigError* = object of PgError
     ## A ``ConnConfig`` fault no retry can fix: a cert/key/CA that will not
-    ## load, a cert without its key, an sslmode that contradicts another option.
+    ## load, a cert without its key, an sslmode or channel_binding that
+    ## contradicts another option.
     ## Every host shares one config, so ``connect`` raises it in place of the
     ## per-host ``PgConnectionError`` aggregate. A fault of a single host entry
     ## (a verify-full entry without a host name) is per host, not config-wide,
