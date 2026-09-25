@@ -91,8 +91,11 @@ type
     amNone ## AuthenticationOk with no challenge (trust/peer/ident)
     amPassword ## cleartext password (libpq: "password")
     amMd5 ## MD5 challenge (libpq: "md5")
-    amScramSha256 ## SASL SCRAM-SHA-256 (libpq: "scram-sha-256")
-    amScramSha256Plus ## SASL SCRAM-SHA-256-PLUS (libpq: "scram-sha-256-plus")
+    amScramSha256
+      ## SASL SCRAM-SHA-256, with or without channel binding (libpq:
+      ## "scram-sha-256")
+    amScramSha256Plus
+      ## SASL SCRAM-SHA-256-PLUS alone ("scram-sha-256-plus", not in libpq)
 
   TargetSessionAttrs* = enum
     ## Target server type for multi-host failover (libpq compatible).
@@ -154,7 +157,7 @@ type
     requireAuth*: set[AuthMethod]
       ## Allowed auth methods; empty = any (libpq ``require_auth`` parity).
       ## Cleartext password and MD5 are allowed by default; set this (e.g. to
-      ## ``{amScramSha256, amScramSha256Plus}``) to reject them.
+      ## ``{amScramSha256}``) to reject them.
     applicationName*: string
     connectTimeout*: Duration
       ## TCP connect timeout (default ``ZeroDuration`` = no timeout).

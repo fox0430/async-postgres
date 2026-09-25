@@ -3,6 +3,7 @@ import std/[unittest, strutils, os]
 import cert_fixtures
 from mock_pg_server import buildPreV3Error
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
+from ../async_postgres/pg_auth import computeTlsServerEndpoint
 
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_connection {.all.}
@@ -1699,9 +1700,12 @@ suite "SCRAM channel binding enforcement":
         check needle in err.msg
 
   test "channel_binding=require with SCRAM-SHA-256-PLUS allowed reaches the dial":
-    let err = connectPort1(sslPrefer, cbRequire, {amScramSha256Plus}, false)
-    require err != nil
-    check err of PgConnectionError
+    # scram-sha-256 covers -PLUS, as in libpq.
+    for requireAuth in [{amScramSha256Plus}, {amScramSha256}]:
+      checkpoint $requireAuth
+      let err = connectPort1(sslPrefer, cbRequire, requireAuth, false)
+      require err != nil
+      check err of PgConnectionError
 
   proc saslRefusal(
       mode: ChannelBindingMode, offer: seq[string]
@@ -2029,17 +2033,37 @@ suite "selectScramMechanism":
       check err of PgSecurityError
       check "require_auth allows only SCRAM-SHA-256-PLUS" in err.msg
 
-  test "require_auth dropping SCRAM-SHA-256-PLUS over TLS sends n,,":
-    # The server knows it offered -PLUS, so "y,," would make it abort.
-    let choice = selectScramMechanism(
-      sslEnabled = true,
-      serverCertDer = fakeCert,
-      saslMechanisms = bothMechs,
-      mode = cbPrefer,
-      allowed = {amScramSha256},
-    )
-    check choice.mechanism == "SCRAM-SHA-256"
-    check choice.cbSupportedButUnused == false
+  test "require_auth=scram-sha-256 admits SCRAM-SHA-256-PLUS":
+    for mode in [cbPrefer, cbRequire]:
+      checkpoint $mode
+      let choice = selectScramMechanism(
+        sslEnabled = true,
+        serverCertDer = fakeCert,
+        saslMechanisms = bothMechs,
+        mode = mode,
+        allowed = {amScramSha256},
+      )
+      check choice.mechanism == "SCRAM-SHA-256-PLUS"
+      check choice.cbType == "tls-server-end-point"
+      check choice.cbData == computeTlsServerEndpoint(fakeCert)
+      check choice.cbSupportedButUnused == false
+
+  test "require_auth=scram-sha-256 still takes SCRAM-SHA-256 with n,,":
+    # Binding disabled, or no certificate to bind to: the server offered -PLUS,
+    # so "y,," would make it abort.
+    for (mode, cert) in [(cbDisable, fakeCert), (cbPrefer, newSeq[byte]())]:
+      checkpoint $mode
+      let choice = selectScramMechanism(
+        sslEnabled = true,
+        serverCertDer = cert,
+        saslMechanisms = bothMechs,
+        mode = mode,
+        allowed = {amScramSha256},
+      )
+      check choice.mechanism == "SCRAM-SHA-256"
+      check choice.cbType == ""
+      check choice.cbData.len == 0
+      check choice.cbSupportedButUnused == false
 
 when hasAsyncDispatch and defined(ssl):
   # Self-signed test certificates (DER, base64). Regenerate with:

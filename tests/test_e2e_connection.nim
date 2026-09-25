@@ -111,17 +111,20 @@ suite "E2E: SSL Connection":
 
     waitFor t()
 
-  test "require_auth=scram-sha-256 connects over SSL":
-    # The server also offers -PLUS; the client must not answer "y,," for the
-    # binding require_auth dropped, which the server rejects.
-    proc t() {.async.} =
+  test "require_auth=scram-sha-256 connects over SSL, channel binding or not":
+    # libpq's scram-sha-256 covers SCRAM-SHA-256-PLUS, which the server offers.
+    # Only cbRequire proves that here; test_ssl pins each mode's choice.
+    proc t(cb: ChannelBindingMode) {.async.} =
       var cfg = sslConfig(sslRequire)
       cfg.requireAuth = {amScramSha256}
+      cfg.channelBinding = cb
       let conn = await connect(cfg)
       doAssert conn.sslEnabled == true
       await conn.close()
 
-    waitFor t()
+    for cb in [cbPrefer, cbRequire, cbDisable]:
+      checkpoint "channelBinding=" & $cb
+      waitFor t(cb)
 
   test "sslPrefer connects with SSL when server supports it":
     proc t() {.async.} =
