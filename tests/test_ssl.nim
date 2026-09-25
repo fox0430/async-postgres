@@ -1,6 +1,7 @@
 import std/[unittest, strutils, os]
 
 import cert_fixtures
+from mock_pg_server import buildPreV3Error
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 
 import ../async_postgres/pg_connection/types
@@ -418,6 +419,47 @@ suite "SSL negotiation - error handling":
     waitFor testBody()
     check raised
     check msgHasUnexpected
+
+  test "a fork failure in reply to the SSLRequest is reported without its text":
+    proc testBody(): Future[string] {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8)
+          await sendBytes(
+            st,
+            buildPreV3Error(
+              "could not fork new process for connection: out of memory\n"
+            ),
+          )
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+
+      let config = ConnConfig(
+        host: "127.0.0.1",
+        port: ms.port,
+        user: "test",
+        database: "test",
+        sslMode: sslPrefer,
+      )
+
+      try:
+        let conn = await connect(config)
+        await conn.close()
+      except PgConnectionError as e:
+        result = e.msg
+
+      await serverFut
+      await closeServer(ms)
+
+    let errMsg = waitFor testBody()
+    check "error response during SSL exchange" in errMsg
+    check "could not fork" notin errMsg
 
 suite "SSL negotiation - pre-TLS byte injection":
   test "residual bytes after 'S' response are rejected (CVE-2021-23214 family)":

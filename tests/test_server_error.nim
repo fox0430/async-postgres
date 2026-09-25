@@ -45,6 +45,27 @@ proc connectError(cfg: ConnConfig): Future[ref PgConnectionError] {.async.} =
   except PgConnectionError as e:
     return e
 
+proc replyToStartup(ms: MockServer, chunks: seq[seq[byte]]) {.async.} =
+  ## Answer the StartupMessage with `chunks`, 50 ms apart, then close.
+  let st = await ms.accept()
+  try:
+    await drainStartupMessage(st)
+    for i, chunk in chunks:
+      if i > 0:
+        await sleepAsync(milliseconds(50))
+      await sendBytes(st, chunk)
+  except CatchableError:
+    discard
+  await closeClient(st)
+
+proc connectErrorOn(chunks: seq[seq[byte]]): Future[ref PgConnectionError] {.async.} =
+  ## The error `connect` raises when the server answers the startup with `chunks`.
+  let ms = startMockServer()
+  let serverFut = replyToStartup(ms, chunks)
+  result = await connectError(mockConfig(ms.port))
+  await serverFut
+  await closeServer(ms)
+
 proc attempt(e: ref PgConnectionError, i: int): ref PgConnectionError =
   (ref PgConnectionError)(e.attempts[i])
 
@@ -169,6 +190,83 @@ suite "serverError on startup":
     check err != nil
     check err.attempts.len == 1
     check "target_session_attrs" in err.attempt(0).msg
+
+  test "a fork failure in the pre-3.0 format keeps its text":
+    let err = waitFor connectErrorOn(
+      @[buildPreV3Error("could not fork new process for connection: out of memory\n")]
+    )
+    check err != nil
+    # asyncdispatch appends an async traceback to the message.
+    let text = err.msg.split("\nAsync traceback:")[0]
+    check text.endsWith("could not fork new process for connection: out of memory")
+    check not (err.parent of PgProtocolError)
+
+  test "a pre-3.0 error shorter than a v3 header keeps its text":
+    # 'E' + "no" + NUL: the server closes short of the 5 bytes of a v3 header.
+    let err = waitFor connectErrorOn(@[buildPreV3Error("no")])
+    check err != nil
+    let text = err.msg.split("\nAsync traceback:")[0]
+    check text.endsWith(": no")
+
+  test "an empty pre-3.0 error text gets a fallback message":
+    let err = waitFor connectErrorOn(@[buildPreV3Error("")])
+    check err != nil
+    check "rejected the connection" in err.msg
+
+  test "a localized fork failure split across reads is read to its end":
+    # A UTF-8 first byte decodes as a negative length; the text arrives in
+    # pieces and the postmaster closes right after it.
+    const text = "\xE6\x96\xB0 could not fork new process: out of memory"
+    let reply = buildPreV3Error(text)
+    let err = waitFor connectErrorOn(@[reply[0 ..< 6], reply[6 .. ^1]])
+    check err != nil
+    check text in err.msg
+
+  test "a pre-3.0 error text is capped at MAX_ERRLEN":
+    let err = waitFor connectErrorOn(@[buildPreV3Error('x'.repeat(40000))])
+    check err != nil
+    let text = err.msg.split("\nAsync traceback:")[0]
+    check text.endsWith('x'.repeat(30000))
+    check not text.endsWith('x'.repeat(30001))
+
+  test "a long ErrorResponse after the first reply is not taken for pre-3.0":
+    # Only the first reply can be pre-3.0: past it, a v3 error above
+    # MAX_ERRLEN keeps its fields.
+    proc testBody(): Future[ref PgConnectionError] {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendBytes(st, buildAuthSASL())
+          discard await drainFrontendMessage(st)
+          await sendBytes(st, buildErrorResponse("28P01", 'x'.repeat(40000), "FATAL"))
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      var cfg = mockConfig(ms.port)
+      cfg.password = "pw"
+      let serverFut = serverHandler()
+      result = await connectError(cfg)
+      await serverFut
+      await closeServer(ms)
+
+    let err = waitFor testBody()
+    check err != nil
+    check err.refusal == "28P01"
+
+  test "a message consumed internally still counts as the first reply":
+    # nextMessage never returns ParameterStatus, yet it ends the window for
+    # a pre-3.0 reply as any other message does.
+    let err = waitFor connectErrorOn(
+      @[
+        buildParameterStatus("server_version", "18.0"),
+        buildErrorResponse("28P01", 'x'.repeat(40000), "FATAL"),
+      ]
+    )
+    check err != nil
+    check err.refusal == "28P01"
 
   test "prefer-standby keeps each host's second attempt":
     # Both hosts are starting up during the standby pass and reject the

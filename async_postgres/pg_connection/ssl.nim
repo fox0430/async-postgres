@@ -757,5 +757,11 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     if config.sslCert.len > 0:
       # Make the silent mTLS drop observable on the plaintext fallback.
       warnStderr "pg_connection: client certificate will NOT be sent over the plaintext fallback connection"
+  of 'E':
+    # A failed fork: the postmaster replies before reading the SSLRequest. As
+    # in libpq, its text is not read: the server is not authenticated yet.
+    raise newException(
+      PgConnectionError, "server sent an error response during SSL exchange"
+    )
   else:
     raise newException(PgConnectionError, "Unexpected SSL response: " & $respChar)

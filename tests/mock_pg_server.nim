@@ -320,6 +320,14 @@ proc buildErrorResponse*(sqlState, message: string, severity = "ERROR"): seq[byt
   body.add(0'u8) # field list terminator
   buildBackendMsg('E', body)
 
+proc buildPreV3Error*(text: string): seq[byte] =
+  ## Pre-3.0 error, as the postmaster reports a failed fork: 'E' and
+  ## NUL-terminated text, no length.
+  result = @[byte('E')]
+  for c in text:
+    result.add(byte(c))
+  result.add(0'u8)
+
 # Replication (CopyBothResponse / CopyData) builders and decoders, shared by the
 # replication test suites.
 

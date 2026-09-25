@@ -5,6 +5,7 @@
 import std/[options, random, strutils, sysrand, tables]
 
 import ../[async_backend, pg_errors, pg_protocol, pg_auth]
+from ../pg_bytes import readString
 import pkg/nimcrypto/utils as ncutils
 import types, buffer_io, ssl, simple_query, dsn
 
@@ -57,6 +58,59 @@ proc foldFailures(
     else:
       nil
   (ref PgConnectionError)(msg: msg, parent: parent, attempts: attempts)
+
+const PreV3MaxErrLen = 30000 # libpq's MAX_ERRLEN
+
+proc readPreV3Error(conn: PgConnection): Future[string] {.async.} =
+  ## The pre-3.0 error text, read up to its NUL (or the server's close), at
+  ## most ``PreV3MaxErrLen`` bytes.
+  # Offsets are relative to the text start: fillRecvBuf compacts the buffer.
+  template start(): int =
+    conn.recvBufStart + 1
+
+  var scanned = 0 # text bytes already searched for the NUL
+  while true:
+    let avail = min(conn.recvBuf.len - start, PreV3MaxErrLen)
+    let i = conn.recvBuf.toOpenArray(start + scanned, start + avail - 1).find(0'u8)
+    if i >= 0:
+      return readString(conn.recvBuf, start, scanned + i)
+    scanned = avail
+    if avail == PreV3MaxErrLen:
+      break
+    try:
+      await conn.fillRecvBuf()
+    except PgConnectionError:
+      break # the postmaster closes right after the text
+  return readString(conn.recvBuf, start, scanned)
+
+proc checkPreV3Error(conn: PgConnection) {.async.} =
+  ## Raise the first reply as ``PgConnectionError`` if it is a pre-3.0 error
+  ## ('E' + NUL-terminated text): as in libpq, a length below 8 or above
+  ## MAX_ERRLEN marks the old format.
+  # Only the first reply: past it, a long v3 ErrorResponse keeps its fields.
+  # Every v3 message has these 5 bytes: an 'E' the server closes short of them
+  # can only be a pre-3.0 text.
+  while conn.recvBuf.len - conn.recvBufStart < 5:
+    try:
+      await conn.fillRecvBuf()
+    except PgConnectionError as e:
+      if conn.recvBuf.len == conn.recvBufStart or
+          conn.recvBuf[conn.recvBufStart] != byte('E'):
+        raise e
+      break
+  let start = conn.recvBufStart
+  if conn.recvBuf[start] != byte('E') or (
+    conn.recvBuf.len - start >= 5 and
+    decodeInt32(conn.recvBuf, start + 1) in 8 .. PreV3MaxErrLen
+  ):
+    return
+  # The postmaster reports a failed fork (process or memory limit) this way;
+  # libpq accepts it too, and it clears with load.
+  var text = await conn.readPreV3Error()
+  text.stripLineEnd() # the postmaster ends it with '\n'
+  if text.len == 0:
+    text = "server rejected the connection during startup"
+  raise newException(PgConnectionError, text)
 
 # Authentication policy helpers
 
@@ -349,6 +403,7 @@ proc connectToHost*(
       startupParams.add(("application_name", config.applicationName))
     await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))
     conn.markState(csAuthentication)
+    await conn.checkPreV3Error()
 
     # Authentication loop
     var
