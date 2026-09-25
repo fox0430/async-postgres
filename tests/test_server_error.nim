@@ -641,43 +641,116 @@ suite "serverError when the server closes the connection":
     check err.serverError != nil
     check err.serverError.sqlState == "57P01"
 
-suite "SSL request":
+suite "client-side refusals":
+  proc refusal(
+      cfg: ConnConfig, reply: seq[byte]
+  ): Future[ref PgConnectionError] {.async.} =
+    let ms = startMockServer()
+    proc serverHandler() {.async.} =
+      let st = await ms.accept()
+      try:
+        await drainStartupMessage(st)
+        await sendBytes(st, reply)
+        discard await readN(st, 1)
+      except CatchableError:
+        discard
+      await closeClient(st)
+
+    var cfg = cfg
+    cfg.port = ms.port
+    let serverFut = serverHandler()
+    result = await connectError(cfg)
+    await serverFut
+    await closeServer(ms)
+
+  test "an auth method outside require_auth is a PgSecurityError":
+    var cfg = mockConfig(0)
+    cfg.requireAuth = {amScramSha256}
+    let cleartext = buildBackendMsg('R', @[byte 0, 0, 0, 3])
+    let err = waitFor refusal(cfg, cleartext)
+    check err != nil
+    check err.serverError == nil
+    check (ref Exception)(err) of PgSecurityError
+
+  proc allowError(
+      cfg: ConnConfig, plainReply, sslReply: seq[byte]
+  ): Future[ref PgConnectionError] {.async.} =
+    ## `connect`'s error under sslmode=allow: the plaintext attempt's startup
+    ## answered with `plainReply`, the TLS attempt's SSLRequest with `sslReply`.
+    let ms = startMockServer()
+    proc serverHandler() {.async.} =
+      for reply in [plainReply, sslReply]:
+        let st = await ms.accept()
+        try:
+          await drainStartupMessage(st)
+          await sendBytes(st, reply)
+          discard await readN(st, 1)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+    var cfg = cfg
+    cfg.port = ms.port
+    cfg.sslMode = sslAllow
+    let serverFut = serverHandler()
+    result = await connectError(cfg)
+    await serverFut
+    await closeServer(ms)
+
   test "sslmode=allow keeps both attempts":
-    proc testBody(): Future[ref PgConnectionError] {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st1 = await ms.accept()
-        try:
-          await drainStartupMessage(st1)
-          await sendBytes(st1, buildErrorResponse("28P01", "bad password", "FATAL"))
-        except CatchableError:
-          discard
-        await closeClient(st1)
-        let st2 = await ms.accept()
-        try:
-          await drainStartupMessage(st2)
-          await sendBytes(st2, @[byte('N')])
-          discard await readN(st2, 1)
-        except CatchableError:
-          discard
-        await closeClient(st2)
-
-      let serverFut = serverHandler()
-      var cfg = mockConfig(ms.port)
-      cfg.sslMode = sslAllow
-      result = await connectError(cfg)
-      await serverFut
-      await closeServer(ms)
-
-    let err = waitFor testBody()
+    let err = waitFor allowError(
+      mockConfig(0), buildErrorResponse("28P01", "bad password", "FATAL"), @[byte('N')]
+    )
     check err != nil
     let allow = err.attempt(0)
     check allow.serverError == nil
     check allow.attempts.len == 2
     check allow.refusal(0) == "28P01"
     check "does not support SSL" in allow.attempts[1].msg
+    # allow never required TLS, so an 'N' is no security refusal.
+    check not (allow.attempts[1] of PgSecurityError)
     check allow.parent == allow.attempts[1]
     check err.sqlStates == @["28P01"]
+
+  test "sslmode=allow reports data trailing 'N' as a protocol violation":
+    # One segment so chronos's `readOnce` pulls the extra byte in.
+    let err = waitFor allowError(
+      mockConfig(0),
+      buildErrorResponse("28P01", "bad password", "FATAL"),
+      @[byte('N'), byte('X')],
+    )
+    check err != nil
+    let tlsAttempt = err.attempt(0).attempts[1]
+    check "after SSL refusal" in tlsAttempt.msg
+    check tlsAttempt of PgProtocolError
+    check not (tlsAttempt of PgSecurityError)
+
+  test "sslmode=allow refused on security grounds both ways stays a PgSecurityError":
+    var cfg = mockConfig(0)
+    cfg.requireAuth = {amScramSha256}
+    # Plaintext: cleartext auth, outside require_auth. TLS: bytes injected
+    # after 'S', in one segment for chronos's `readOnce`.
+    let err = waitFor allowError(
+      cfg, buildBackendMsg('R', @[byte 0, 0, 0, 3]), @[byte('S'), byte('X')]
+    )
+    check err != nil
+    check (ref Exception)(err) of PgSecurityError
+
+  test "sslmode=allow with only one security refusal is no PgSecurityError":
+    var cfg = mockConfig(0)
+    cfg.requireAuth = {amScramSha256}
+    let err =
+      waitFor allowError(cfg, buildBackendMsg('R', @[byte 0, 0, 0, 3]), @[byte('N')])
+    check err != nil
+    check err.attempt(0).attempts[0] of PgSecurityError
+    check not ((ref Exception)(err) of PgSecurityError)
+
+  test "sslmode=require against a server without SSL is a PgSecurityError":
+    var cfg = mockConfig(0)
+    cfg.sslMode = sslRequire
+    let err = waitFor refusal(cfg, @[byte('N')])
+    check err != nil
+    check (ref Exception)(err) of PgSecurityError
 
 suite "serverErrors":
   proc refused(sqlState: string): ref CatchableError =

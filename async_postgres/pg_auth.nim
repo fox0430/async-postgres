@@ -113,16 +113,16 @@ proc scramClientFinalMessage*(
     elif part.startsWith("i="):
       if not isPgUIntText(part.toOpenArray(2, part.high)) or
           pgParseIntView(part.toOpenArray(2, part.high), iterations) != pipOk:
-        raise newException(PgConnectionError, "SCRAM: invalid iteration count")
+        raise newException(PgProtocolError, "SCRAM: invalid iteration count")
       hasIterations = true
 
   if not hasNonce:
-    raise newException(PgConnectionError, "SCRAM: server response missing nonce (r=)")
+    raise newException(PgProtocolError, "SCRAM: server response missing nonce (r=)")
   if not hasSalt:
-    raise newException(PgConnectionError, "SCRAM: server response missing salt (s=)")
+    raise newException(PgProtocolError, "SCRAM: server response missing salt (s=)")
   if not hasIterations:
     raise newException(
-      PgConnectionError, "SCRAM: server response missing iteration count (i=)"
+      PgProtocolError, "SCRAM: server response missing iteration count (i=)"
     )
   if iterations < 4096:
     # RFC 5802 sets no floor, but PostgreSQL's default (and the hardcoded
@@ -130,24 +130,24 @@ proc scramClientFinalMessage*(
     # A malicious server returning a low count would make an offline brute-force
     # of the password from the ClientProof dramatically cheaper, so reject it.
     # Stricter than libpq, which accepts any count the server sends.
-    raise newException(
-      PgConnectionError, "SCRAM: iteration count too small: " & $iterations
-    )
+    raise
+      newException(PgSecurityError, "SCRAM: iteration count too small: " & $iterations)
   if iterations > maxIterations:
+    # Our own cost cap, not a failure to verify the server.
     raise newException(
       PgConnectionError, "SCRAM: iteration count too large: " & $iterations
     )
 
   if not combinedNonce.startsWith(state.clientNonce):
     raise newException(
-      PgConnectionError, "SCRAM: server nonce doesn't start with client nonce"
+      PgSecurityError, "SCRAM: server nonce doesn't start with client nonce"
     )
 
   let salt =
     try:
       base64.decode(saltB64)
     except ValueError:
-      raise newException(PgConnectionError, "SCRAM: invalid base64 in salt")
+      raise newException(PgProtocolError, "SCRAM: invalid base64 in salt")
 
   var saltedPassword: seq[byte]
   var clientKey, storedKey, clientSignature, serverKey: array[32, byte]
