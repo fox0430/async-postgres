@@ -1587,9 +1587,9 @@ suite "filterSaslByRequireAuth":
     let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
     check filterSaslByRequireAuth(mechs, {}) == mechs
 
-  test "drops PLUS when only SCRAM allowed":
+  test "scram-sha-256 keeps PLUS too, as libpq's does":
     let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
-    check filterSaslByRequireAuth(mechs, {amScramSha256}) == @["SCRAM-SHA-256"]
+    check filterSaslByRequireAuth(mechs, {amScramSha256}) == mechs
 
   test "drops SCRAM when only PLUS allowed":
     let mechs = @["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]
@@ -1608,7 +1608,7 @@ suite "Tracing: requireAuth happy path":
   test "accepts SCRAM when explicitly allowed":
     proc t() {.async.} =
       var cfg = plainConfig()
-      cfg.requireAuth = {amScramSha256, amScramSha256Plus}
+      cfg.requireAuth = {amScramSha256}
       let conn = await connect(cfg)
       doAssert conn != nil
       discard await conn.exec("SELECT 1")

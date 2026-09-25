@@ -124,10 +124,26 @@ proc checkPreV3Error(conn: PgConnection) {.async.} =
 
 # Authentication policy helpers
 
+func saslAuthMethod(mech: string): Option[AuthMethod] =
+  ## The require_auth method a SASL mechanism name maps to.
+  case mech
+  of "SCRAM-SHA-256":
+    some(amScramSha256)
+  of "SCRAM-SHA-256-PLUS":
+    some(amScramSha256Plus)
+  else:
+    none(AuthMethod)
+
+func permits(allowed: set[AuthMethod], authMethod: AuthMethod): bool =
+  ## Whether require_auth ``allowed`` admits ``authMethod``: libpq's
+  ## scram-sha-256 covers SCRAM-SHA-256-PLUS too.
+  allowed.len == 0 or authMethod in allowed or
+    (authMethod == amScramSha256Plus and amScramSha256 in allowed)
+
 proc enforceAuthAllowed(
     authMethod: AuthMethod, allowed: set[AuthMethod], offered: string = ""
 ) {.raises: [PgSecurityError].} =
-  if allowed.len > 0 and authMethod notin allowed:
+  if not allowed.permits(authMethod):
     var msg =
       "server requested auth method '" & $authMethod &
       "' which is not in require_auth allowlist " & $allowed
@@ -196,9 +212,8 @@ proc filterSaslByRequireAuth*(
   if allowed.len == 0:
     return mechs
   for m in mechs:
-    if m == "SCRAM-SHA-256-PLUS" and amScramSha256Plus in allowed:
-      result.add(m)
-    elif m == "SCRAM-SHA-256" and amScramSha256 in allowed:
+    let authMethod = saslAuthMethod(m)
+    if authMethod.isSome and allowed.permits(authMethod.get):
       result.add(m)
 
 proc plusOnlyError(offered: seq[string], why: string): ref PgConnectionError =
@@ -307,7 +322,7 @@ proc validateSecurityConfig(
         PgConfigError,
         "channel_binding=require needs TLS, but sslmode=disable never negotiates it",
       )
-    if config.requireAuth.len > 0 and amScramSha256Plus notin config.requireAuth:
+    if not config.requireAuth.permits(amScramSha256Plus):
       raise newException(
         PgConfigError,
         "channel_binding=require needs SCRAM-SHA-256-PLUS, but require_auth " &
@@ -567,8 +582,8 @@ proc connectToHostImpl(
               conn.sslEnabled, conn.serverCertDer, msg.saslMechanisms,
               config.channelBinding, config.requireAuth,
             )
-            auth.channelBound = choice.mechanism == "SCRAM-SHA-256-PLUS"
-            let chosen = if auth.channelBound: amScramSha256Plus else: amScramSha256
+            let chosen = saslAuthMethod(choice.mechanism).get
+            auth.channelBound = chosen == amScramSha256Plus
             # Defensive: selectScramMechanism only picks from the require_auth
             # filtered offer; this guards against a future fallback past it.
             enforceAuthAllowed(chosen, config.requireAuth, $msg.saslMechanisms)
