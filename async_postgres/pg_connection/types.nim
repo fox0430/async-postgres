@@ -314,6 +314,9 @@ type
     closedByUser: bool
       ## Set by `close()`, one-way. Keeps a deliberate close out of
       ## `PgConnectionError` reconnect loops (see `closedReason`).
+    fatalServerError: ref PgQueryError
+      ## The FATAL/PANIC ErrorResponse that ended the session; attached to
+      ## closed-connection errors as ``serverError``.
     listenReconnectMaxAttempts: int
       ## Max reconnect attempts on listen pump failure. Default 10.
       ## 0 or negative = unlimited retries (retry until close()).
@@ -755,10 +758,16 @@ proc confirmReplFlushed*(conn: PgConnection, lsn: uint64): bool =
   else:
     false
 
+func errorSeverity*(fields: seq[ErrorField]): string =
+  ## Severity of an ErrorResponse: 'V' (PG 9.6+) is never localized; 'S' may be.
+  result = getErrorField(fields, 'V')
+  if result.len == 0:
+    result = getErrorField(fields, 'S')
+
 proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
   ## Create a PgQueryError from server ErrorResponse fields.
   let sqlState = getErrorField(fields, 'C')
-  let severity = getErrorField(fields, 'S')
+  let severity = errorSeverity(fields)
   let detail = getErrorField(fields, 'D')
   let hint = getErrorField(fields, 'H')
   result = (ref PgQueryError)(
@@ -769,6 +778,19 @@ proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
     hint: hint,
     fields: fields,
   )
+
+proc copyServerError*(se: ref PgQueryError): ref PgQueryError {.raises: [].} =
+  ## ``se``'s own copy for one error, nil for nil. A ref shared between errors
+  ## would pile every raise's stack trace onto each of them.
+  if se != nil:
+    result = (ref PgQueryError)(
+      msg: se.msg,
+      sqlState: se.sqlState,
+      severity: se.severity,
+      detail: se.detail,
+      hint: se.hint,
+      fields: se.fields,
+    )
 
 # Tracer fire helpers (cross-module use)
 
@@ -1084,6 +1106,15 @@ func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
   else:
     crOpen
 
+proc newClosedError*(
+    conn: PgConnection, msg: string, parent: ref Exception = nil
+): ref PgConnectionError =
+  ## ``PgConnectionError`` for a connection that died, carrying the server's
+  ## FATAL ErrorResponse (if any) as ``serverError``.
+  (ref PgConnectionError)(
+    msg: msg, parent: parent, serverError: copyServerError(conn.fatalServerError)
+  )
+
 proc checkNotClosed*(conn: PgConnection) {.inline.} =
   ## Reject if closed: ``PgStateError`` for deliberate ``close()``, else ``PgConnectionError``.
   case conn.closedReason
@@ -1092,7 +1123,7 @@ proc checkNotClosed*(conn: PgConnection) {.inline.} =
   of crClosedByUser:
     raise newException(PgStateError, closedByUserMsg)
   of crClosed:
-    raise newException(PgConnectionError, "Connection is closed")
+    raise conn.newClosedError("Connection is closed")
 
 proc raiseClosedConnection*(conn: PgConnection, msg: string) {.noreturn.} =
   ## Like ``checkNotClosed`` with a custom ``crClosed`` message.
@@ -1102,7 +1133,7 @@ proc raiseClosedConnection*(conn: PgConnection, msg: string) {.noreturn.} =
     raise (ref PgStateError)(
       msg: closedByUserMsg, parent: newException(PgConnectionError, msg)
     )
-  raise newException(PgConnectionError, msg)
+  raise conn.newClosedError(msg)
 
 proc raiseTransportFailure*(
     conn: PgConnection, what: string, e: ref CatchableError
@@ -1112,7 +1143,7 @@ proc raiseTransportFailure*(
     raise (ref PgStateError)(msg: closedByUserMsg, parent: e)
   if e of PgError:
     raise e
-  raise newException(PgConnectionError, what & ": " & e.msg, e)
+  raise conn.newClosedError(what & ": " & e.msg, e)
 
 proc failNotifyWaiter*(conn: PgConnection, err: ref PgError = nil) {.raises: [].} =
   ## Fail parked waiter: ``closedByUser``→``PgStateError``, else ``err``/``csClosed``/stopped. Pass fresh ``err``.
@@ -1125,7 +1156,7 @@ proc failNotifyWaiter*(conn: PgConnection, err: ref PgError = nil) {.raises: [].
       elif err != nil:
         err
       elif conn.state == csClosed:
-        (ref PgConnectionError)(msg: "Connection is closed")
+        conn.newClosedError("Connection is closed")
       else:
         (ref PgStateError)(msg: "Listener stopped")
     # asyncdispatch types `Future.fail`'s callback chain as raising `Exception`,

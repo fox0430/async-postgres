@@ -100,6 +100,9 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.serverParams = newConn.serverParams
   conn.serverParamsBytes = newConn.serverParamsBytes
   conn.txStatus = newConn.txStatus
+  # Kept until now: a failed dial leaves `conn` dead of the old session's FATAL.
+  let oldFatal = conn.fatalServerError
+  conn.fatalServerError = nil
   conn.markReady()
   conn.createdAt = newConn.createdAt
 
@@ -121,22 +124,36 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
     # connect() succeeded but re-LISTEN failed: close the fresh transport so the
     # failed reconnect never leaks it (notifyListenDeath only sets csClosed).
     await conn.closeTransport()
+    # Not in place after all: dead of the old session's FATAL as after a failed
+    # dial, unless the new session ended with its own.
+    if conn.fatalServerError == nil:
+      conn.fatalServerError = oldFatal
     conn.markClosed()
     raise e
 
 # Background pump and start/stop
 
 proc newListenError(
-    msg: string, reconnectionAttempted: bool, transportAlive: bool = false
+    msg: string,
+    reconnectionAttempted: bool,
+    transportAlive: bool = false,
+    cause: ref Exception = nil,
+    serverError: ref PgQueryError = nil,
+    attempts: seq[ref CatchableError] = @[],
 ): ref PgListenError {.raises: [].} =
   (ref PgListenError)(
     msg: msg,
+    parent: cause,
+    serverError: serverError,
+    attempts: attempts,
     reconnectionAttempted: reconnectionAttempted,
     transportAlive: transportAlive,
   )
 
 proc newListenDeathError(
-    err: ref PgListenError, transportAlive: bool
+    err: ref PgListenError,
+    transportAlive: bool,
+    serverError: ref PgQueryError = err.serverError,
 ): ref PgError {.raises: [].} =
   ## Pull-API view of a pump death recorded in ``err``.
   # The type, not a field, carries the recovery, so a caller who never reads
@@ -148,16 +165,41 @@ proc newListenDeathError(
       transportAlive: true,
     )
   else:
-    newListenError(err.msg, err.reconnectionAttempted, transportAlive)
+    newListenError(
+      err.msg,
+      err.reconnectionAttempted,
+      transportAlive,
+      err.parent,
+      copyServerError(serverError),
+      err.attempts,
+    )
 
 proc notifyListenDeath(
-    conn: PgConnection, msg: string, reconnectionAttempted: bool, retire: bool = true
+    conn: PgConnection,
+    msg: string,
+    reconnectionAttempted: bool,
+    retire: bool = true,
+    cause: ref CatchableError = nil,
+    sessionFatal: ref PgQueryError = conn.fatalServerError,
 ) {.raises: [].} =
   ## Pump died permanently; notify pull/push APIs. ``retire=false`` = listen side only.
+  ## After failed redials ``cause`` is the last one, kept as the sole attempt:
+  ## what a new session now runs into, beside ``sessionFatal``, the FATAL that
+  ## ended the session the pump listened on.
   # `retire = false` is exactly the case where the transport survived, so
   # it is what tells a reconnect loop this failure is not its to act on.
   let transportAlive = not retire
-  conn.listenError = newListenError(msg, reconnectionAttempted, transportAlive)
+  var attempts: seq[ref CatchableError]
+  if reconnectionAttempted and cause != nil:
+    attempts.add(cause)
+  conn.listenError = newListenError(
+    msg,
+    reconnectionAttempted,
+    transportAlive,
+    cause,
+    (if transportAlive: nil else: copyServerError(sessionFatal)),
+    attempts,
+  )
   if retire:
     conn.markClosed()
   # Built fresh, never the stored ref: `checkListenAlive` re-raises that object
@@ -189,10 +231,12 @@ proc listenPump*(conn: PgConnection) {.async.} =
       return # Cancelled from close()
     except CatchableError as e:
       if conn.listenChannels.len == 0:
-        conn.notifyListenDeath("Listen connection lost: " & e.msg, false)
+        conn.notifyListenDeath("Listen connection lost: " & e.msg, false, cause = e)
         return
       # Auto-reconnect with exponential backoff. Flag guards concurrent stop.
       conn.listenReconnecting = true
+      # Taken now: a redial's session may yet record a FATAL of its own.
+      let sessionFatal = conn.fatalServerError
       try:
         let maxAttempts = conn.listenReconnectMaxAttempts
         # Cap so `backoff * 1000` and `backoff * 2` below cannot overflow int.
@@ -201,7 +245,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
         var reconnected = false
         var backoff = 1
         var attempt = 0
-        var lastRetryErr = ""
+        var lastRetryErr: ref CatchableError
         while (unlimited or attempt < maxAttempts) and not conn.listenStopRequested:
           try:
             # Interruptible backoff: tick-based stop check.
@@ -224,7 +268,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
           except CancelledError:
             return
           except CatchableError as retryErr:
-            lastRetryErr = retryErr.msg
+            lastRetryErr = retryErr
             backoff = min(backoff * 2, maxBackoff)
           inc attempt
         if conn.listenStopRequested:
@@ -234,9 +278,14 @@ proc listenPump*(conn: PgConnection) {.async.} =
           var deathMsg =
             "Listen connection lost (" & e.msg & "): reconnection failed after " &
             $maxAttempts & " attempts"
-          if lastRetryErr.len > 0:
-            deathMsg.add("; last attempt: " & lastRetryErr)
-          conn.notifyListenDeath(deathMsg, true)
+          if lastRetryErr != nil:
+            deathMsg.add("; last attempt: " & lastRetryErr.msg)
+          conn.notifyListenDeath(
+            deathMsg,
+            true,
+            cause = (if lastRetryErr != nil: lastRetryErr else: e),
+            sessionFatal = sessionFatal,
+          )
           return
       finally:
         conn.listenReconnecting = false
@@ -396,11 +445,15 @@ proc stopListening*(conn: PgConnection): Future[void] {.async.} =
 
 # LISTEN / UNLISTEN entry points
 
-proc restartPumpOrFailWaiter(conn: PgConnection, restarted: bool) =
+proc restartPumpOrFailWaiter(
+    conn: PgConnection, restarted: bool, cause: ref CatchableError = nil
+) =
   ## Recover from a failed LISTEN/UNLISTEN: restart the pump we stopped, or
   ## report the death to the waiter and the push API when it cannot come back.
   ## ``restarted`` = we stopped a live pump on the way in. A cancelled round trip
   ## needs no special case: `awaitOrInvalidate` already marked it `csClosed`.
+  # The caller's cancellation is theirs alone, never the pump death's cause.
+  let cause = if cause of CancelledError: nil else: cause
   if conn.closedReason != crOpen:
     if restarted and conn.closedReason != crClosedByUser:
       # Permanent pump death with channels still subscribed: releasing only the
@@ -408,6 +461,7 @@ proc restartPumpOrFailWaiter(conn: PgConnection, restarted: bool) =
       conn.notifyListenDeath(
         "Listen pump stopped: connection lost during LISTEN/UNLISTEN",
         reconnectionAttempted = false,
+        cause = cause,
       )
     elif restarted:
       # A deliberate `close()`: a `PgListenError` here would make a reconnecting
@@ -427,6 +481,7 @@ proc restartPumpOrFailWaiter(conn: PgConnection, restarted: bool) =
       "Listen pump stopped: LISTEN/UNLISTEN left the connection busy",
       reconnectionAttempted = false,
       retire = false,
+      cause = cause,
     )
 
 proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
@@ -449,7 +504,7 @@ proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
     # channels the pump carried, and leaving them pumpless is a silent deafness.
     # `raise e`, not bare: the restarted pump can suspend in its own `except` arm
     # and leave `getCurrentException` pointing at its error.
-    conn.restartPumpOrFailWaiter(restarted)
+    conn.restartPumpOrFailWaiter(restarted, e)
     raise e
   conn.listenChannels.incl(channel)
   conn.startListening()
@@ -466,7 +521,7 @@ proc unlisten*(conn: PgConnection, channel: string): Future[void] {.async.} =
     conn.checkReady()
     discard await conn.simpleQuery("UNLISTEN " & quoteIdentifier(channel))
   except CatchableError as e: # `CancelledError` included, see `listen`
-    conn.restartPumpOrFailWaiter(restarted)
+    conn.restartPumpOrFailWaiter(restarted, e)
     raise e
   conn.listenChannels.excl(channel)
   if conn.listenChannels.len > 0:
@@ -506,11 +561,12 @@ proc checkListenAlive(conn: PgConnection) =
   if conn.listenError != nil:
     # `and reason == crOpen`: the flag was latched at pump death, and a
     # connection that has died since is the reconnect loop's business after all.
-    raise newListenDeathError(
-      conn.listenError, conn.listenError.transportAlive and reason == crOpen
-    )
+    let err = conn.listenError
+    if err.transportAlive and reason != crOpen:
+      raise newListenDeathError(err, false, conn.fatalServerError)
+    raise newListenDeathError(err, err.transportAlive)
   if reason == crClosed:
-    raise newException(PgConnectionError, "Connection is closed")
+    raise conn.newClosedError("Connection is closed")
 
 proc waitNotification*(
     conn: PgConnection, timeout: Duration = ZeroDuration

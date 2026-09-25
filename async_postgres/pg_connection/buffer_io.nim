@@ -467,7 +467,13 @@ proc nextMessage*(
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
+    if res.message.kind == bmkErrorResponse and
+        isSessionFatal(errorSeverity(res.message.errorFields)):
+      conn.fatalServerError = newPgQueryError(res.message.errorFields)
     if res.message.kind == bmkReadyForQuery:
+      # The session answered after all, so that FATAL did not end it (a
+      # proxy's; the server closes after its own).
+      conn.fatalServerError = nil
       # Counts down rather than clearing: a batch of per-op `Sync`s owes one
       # reply each. `unsyncedWrite` is untouched — this reply belongs to a sync
       # point that preceded those writes, so only a later one (in `noteWrite`)

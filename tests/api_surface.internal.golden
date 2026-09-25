@@ -164,8 +164,10 @@ async_postgres/pg_connection/types.nim	clearStaged
 async_postgres/pg_connection/types.nim	closedByUserMsg
 async_postgres/pg_connection/types.nim	closedReason
 async_postgres/pg_connection/types.nim	confirmReplFlushed
+async_postgres/pg_connection/types.nim	copyServerError
 async_postgres/pg_connection/types.nim	effectiveMaxMessageSize
 async_postgres/pg_connection/types.nim	effectiveMaxScramIterations
+async_postgres/pg_connection/types.nim	errorSeverity
 async_postgres/pg_connection/types.nim	failNotifyWaiter
 async_postgres/pg_connection/types.nim	fireAdvisoryUnlockFailed
 async_postgres/pg_connection/types.nim	fireCleanupSkipped
@@ -179,6 +181,7 @@ async_postgres/pg_connection/types.nim	markClosed
 async_postgres/pg_connection/types.nim	markReady
 async_postgres/pg_connection/types.nim	markStaged
 async_postgres/pg_connection/types.nim	markState
+async_postgres/pg_connection/types.nim	newClosedError
 async_postgres/pg_connection/types.nim	newPgQueryError
 async_postgres/pg_connection/types.nim	nextPortalName
 async_postgres/pg_connection/types.nim	noteReplReported

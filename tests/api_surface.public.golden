@@ -812,6 +812,8 @@ async_postgres/pg_errors.nim	ErrorField.code
 async_postgres/pg_errors.nim	ErrorField.value
 async_postgres/pg_errors.nim	PgConfigError
 async_postgres/pg_errors.nim	PgConnectionError
+async_postgres/pg_errors.nim	PgConnectionError.attempts
+async_postgres/pg_errors.nim	PgConnectionError.serverError
 async_postgres/pg_errors.nim	PgError
 async_postgres/pg_errors.nim	PgListenError
 async_postgres/pg_errors.nim	PgListenError.reconnectionAttempted
@@ -871,10 +873,12 @@ async_postgres/pg_errors.nim	isIntegrityConstraintViolation
 async_postgres/pg_errors.nim	isNotNullViolation
 async_postgres/pg_errors.nim	isQueryCanceled
 async_postgres/pg_errors.nim	isSerializationFailure
+async_postgres/pg_errors.nim	isSessionFatal
 async_postgres/pg_errors.nim	isUniqueViolation
 async_postgres/pg_errors.nim	newPoolError
 async_postgres/pg_errors.nim	position
 async_postgres/pg_errors.nim	schemaName
+async_postgres/pg_errors.nim	serverErrors
 async_postgres/pg_errors.nim	tableName
 async_postgres/pg_errors.nim	where
 async_postgres/pg_largeobject.nim	INV_READ
