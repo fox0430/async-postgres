@@ -640,36 +640,28 @@ proc establishTls(conn: PgConnection, config: ConnConfig, sslHost: string) {.asy
 
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
   ## Negotiate TLS (SSLRequest or Direct). ``sslHost`` is cert verification name.
-  ## Raises ``PgConfigError`` when ``sslMode == sslDisable``.
-  # Defensive: connectToHost / perform already validate, but this proc is
-  # exported and may be called directly; the checks are idempotent.
-  # `validateClientCertConfig` also runs at the connect-time chokepoint in
-  # `wrapped()` (lifecycle.nim), but is re-invoked here so direct callers of
-  # `negotiateSSL` cannot bypass the mTLS pairing check — otherwise chronos
-  # would silently drop a lone `sslCert` while asyncdispatch errors out. Its
-  # `PgConfigError` is left as is, so a direct caller sees the type `connect`
-  # raises.
+  ## Raises ``PgConfigError`` on an invalid config (e.g. ``sslMode == sslDisable``),
+  ## ``PgProtocolError`` on an SSLRequest reply the server must not send (an
+  ## unknown byte, or data trailing 'S'/'N'), and ``PgConnectionError`` otherwise.
+  # `connect` already validates; repeated because this proc is exported and a
+  # direct caller must not bypass the checks (e.g. chronos drops a lone `sslCert`).
   if config.sslMode == sslDisable:
     raise
       newException(PgConfigError, "negotiateSSL requires sslmode other than disable")
   validateClientCertConfig(config)
   validateDirectSslCompatible(config)
   if config.sslMode in {sslVerifyCa, sslVerifyFull} and config.sslRootCert.len == 0:
-    # Both backends silently fall back to a Web PKI store (chronos:
-    # MozillaTrustAnchors, std/net: OS CA bundle) — for verify-ca that also
-    # skips hostname checks, so any publicly-issued cert MITMs. Fail closed.
+    # Both backends would fall back to a Web PKI store, and verify-ca skips the
+    # hostname check, so any publicly issued cert could MITM. Fail closed.
     raise newException(
       PgConfigError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
     )
   if config.sslMode == sslVerifyFull and sslHost.len == 0:
-    # hostaddr without host: there is no name to match the certificate
-    # against (libpq raises the same way). Per host entry, not the shared
-    # config, so it folds into the per-host aggregate.
+    # hostaddr without host leaves no name to match (as in libpq). A per-host
+    # error, not PgConfigError, so it folds into the per-host aggregate.
     raise newException(
       PgConnectionError, "A host name must be specified for a verified SSL connection"
     )
-  # Pairing/sslmode compatibility is validated by `wrapped()` (connect-time
-  # chokepoint) and defensively again at the top of this proc.
 
   if config.sslNegotiation == sslnDirect:
     await establishTls(conn, config, sslHost)
@@ -678,9 +670,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
   let sslReq = encodeSSLRequest()
   var respChar: char
   var extraBytesBuffered = false
-    ## True when the SSLRequest-reply read pulled in more than the single
-    ## response byte, i.e. the transport had already buffered bytes the server
-    ## should not have sent before the TLS handshake (pre-TLS injection).
+    ## The reply read pulled in bytes past the reply byte, which the server
+    ## must not send.
 
   when hasChronos:
     # Folded like every other read/write: `negotiateSSL` is exported, so a raw
@@ -691,12 +682,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
       raise e
     except CatchableError as e:
       conn.raiseTransportFailure("negotiateSSL: SSLRequest", e)
-    # Read up to two bytes so a man-in-the-middle who appended plaintext to the
-    # 'S' reply (CVE-2021-23214 family) is caught even when chronos drains the
-    # whole TCP segment into its own transport buffer (where a kernel-level
-    # MSG_PEEK can no longer see it). A compliant server sends exactly one byte
-    # and then waits for our ClientHello, and `readOnce` returns as soon as any
-    # data is available, so this never blocks on a second byte that will not come.
+    # Two bytes: chronos drains the whole segment beyond MSG_PEEK's reach, so a
+    # trailing byte must show up here. `readOnce` never waits for the second.
     var response: array[2, byte]
     var n: int
     try:
@@ -717,9 +704,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
       raise e
     except CatchableError as e:
       conn.raiseTransportFailure("negotiateSSL: SSLRequest", e)
-    # The socket is unbuffered (`newAsyncSocket(buffered = false)`), so `recv(1)`
-    # issues a single recv syscall for at most one byte; any injected bytes stay
-    # in the kernel buffer and are caught by `socketHasPendingData` below.
+    # Unbuffered socket: trailing bytes stay in the kernel for
+    # `socketHasPendingData`.
     var respStr: string
     try:
       respStr = await conn.socket.recv(1)
@@ -733,26 +719,20 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
 
   case respChar
   of 'S':
-    # Reject pre-TLS byte injection before starting the handshake. A server
-    # that accepts SSL must not send anything between the 'S' reply and the TLS
-    # ClientHello, so bytes already readable here were injected by a
-    # man-in-the-middle to be smuggled ahead of (and possibly mistaken for part
-    # of) the encrypted stream. libpq performs the same check. `extraBytesBuffered`
-    # catches bytes the transport already drained; `socketHasPendingData` catches
-    # bytes still sitting in the kernel buffer.
+    # Pre-TLS bytes are a MITM injection (CVE-2021-23214 family); libpq rejects too.
     if extraBytesBuffered or conn.socketHasPendingData():
       raise newException(
-        PgConnectionError,
+        PgProtocolError,
         "Received unencrypted data after SSL response (possible man-in-the-middle)",
       )
     await establishTls(conn, config, sslHost)
   of 'N':
+    # Checked before sslMode so every mode reports the violation.
+    if extraBytesBuffered or conn.socketHasPendingData():
+      raise newException(PgProtocolError, "Received data after SSL refusal")
     if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
       raise newException(PgConnectionError, "Server does not support SSL")
-    # sslPrefer: server refused SSL – connection will proceed unencrypted.
-    # WARNING: This is vulnerable to MITM downgrade attacks. A network
-    # attacker can intercept the SSLRequest and reply 'N' to force
-    # plaintext. Use sslRequire or stronger if security is needed.
+    # sslPrefer: a forged 'N' downgrades to plaintext; sslRequire+ prevents it.
     warnStderr "pg_connection: SSL refused by server, falling back to plaintext (sslmode=prefer)"
     if config.sslCert.len > 0:
       # Make the silent mTLS drop observable on the plaintext fallback.
@@ -764,4 +744,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
       PgConnectionError, "server sent an error response during SSL exchange"
     )
   else:
-    raise newException(PgConnectionError, "Unexpected SSL response: " & $respChar)
+    # Peer-controlled byte: escape it like the ALPN errors above.
+    raise newException(
+      PgProtocolError, "Unexpected SSL response '" & ($respChar).escape("", "") & "'"
+    )
