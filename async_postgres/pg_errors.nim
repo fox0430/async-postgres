@@ -1,15 +1,17 @@
 ## Exception hierarchy. Every library-raised exception derives from ``PgError``.
 ##
-## The hierarchy encodes *scope*, not retryability: a ``PgConnectionError``
-## (``PgProtocolError``, ``PgTimeoutError`` and ``PgSecurityError`` included)
-## ends one connection, so ``connect`` fails over past it and reconnect loops
-## must see it; ``PgStateError`` and ``PgConfigError`` are deliberately
-## siblings, being a programming error and a configuration fault that no
-## reconnect fixes.
+## The hierarchy encodes *scope*, not retryability (ask ``isTransientError``):
+## a ``PgConnectionError`` (``PgProtocolError``, ``PgTimeoutError``,
+## ``PgSecurityError`` and ``PgUnavailableError`` included) ends one connection,
+## so ``connect`` fails over past it and reconnect loops must see it;
+## ``PgStateError`` and ``PgConfigError`` are deliberately siblings, being a
+## programming error and a configuration fault that no reconnect fixes.
 ##
 ## ``PgTypeError`` = caller data the wire format cannot carry; ``PgQueryError`` =
 ## an error the server reported; ``ValueError`` = a precondition, and the one kind
 ## not under ``PgError`` (except DSN parsing).
+
+from async_backend import AsyncTimeoutError
 
 type
   ErrorField* = object
@@ -56,6 +58,9 @@ type
       ## ``target_session_attrs`` included), the plaintext and SSL legs of
       ## ``sslmode=allow``, or a listen pump's last redial. Empty when it sums
       ## up nothing; ``connect``'s aggregate has one even for a single host.
+    perHost: bool
+      ## ``attempts`` are ``connect``'s hosts (all must clear), not one host's
+      ## alternatives.
 
   PgProtocolError* = object of PgConnectionError
     ## Raised on PostgreSQL wire protocol violations. The connection stream is
@@ -73,6 +78,11 @@ type
     ## a MITM caused it. The server's own refusals (a TLS alert, a wrong
     ## password) stay plain ``PgConnectionError``. Per host: ``connect`` fails
     ## over past it, where libpq stops.
+
+  PgUnavailableError* = object of PgConnectionError
+    ## The server could not take the session now or went away (a lost
+    ## connection, a failed lookup, a refused dial, ...). Transient unless its
+    ## ``serverError`` says otherwise.
 
   ProtocolError* {.deprecated: "use PgProtocolError".} = PgProtocolError
     ## Deprecated alias for `PgProtocolError`, kept for backwards compatibility.
@@ -236,6 +246,100 @@ func serverErrors*(e: ref Exception): seq[ref PgQueryError] =
       result.add(qe)
   else:
     result = serverErrors(e.parent)
+
+# Retry classification
+
+func isTransientServerError(se: ref PgQueryError): bool =
+  ## Whether a later attempt may get past ``se``; false for nil.
+  if se == nil:
+    return false
+  # A PANIC is crash recovery. Excluded: 08P01 (a malformed startup packet), a
+  # statement's 08xxx (a dblink/postgres_fdw link), 53400 (a configured limit)
+  # and an ERROR 57014 (a cancel; FATAL is authentication_timeout).
+  let s = se.sqlState
+  template inClass(c: string): bool =
+    s.len == 5 and s[0] == c[0] and s[1] == c[1]
+
+  const listed = [
+    "25P03", "25P04", SqlStateSerializationFailure, SqlStateDeadlockDetected, "55006",
+    "55P03", "57P01", "57P02", "57P03", "57P05",
+  ]
+  let fatal = se.severity == "FATAL"
+  se.severity == "PANIC" or (fatal and inClass("08") and s != "08P01") or
+    (inClass("53") and s != "53400") or s in listed or
+    (fatal and s == SqlStateQueryCanceled)
+
+func catchableParent(e: ref Exception): ref CatchableError =
+  if e.parent of CatchableError:
+    (ref CatchableError)(e.parent)
+  else:
+    nil
+
+func hasLastingRefusal(e: ref CatchableError): bool =
+  ## Whether a server behind ``e`` refused the session for a cause that recurs.
+  if e of PgConnectionError:
+    let ce = (ref PgConnectionError)(e)
+    if ce.attempts.len > 0:
+      for a in ce.attempts:
+        if hasLastingRefusal(a):
+          return true
+      false
+    else:
+      ce.serverError != nil and not isTransientServerError(ce.serverError)
+  else:
+    false
+
+func isTransientError*(e: ref CatchableError): bool {.raises: [], gcsafe.} =
+  ## Whether retrying what failed with `e` may succeed later with the same
+  ## config: a ``PgUnavailableError`` or ``PgTimeoutError``, a single host's
+  ## ``connectTimeout``, a pool's full queue or acquire timeout, or a server
+  ## error whose SQLSTATE may clear (``40001``, ``57P03``, a FATAL ``08xxx``,
+  ## ...). Errors with ``attempts`` are judged by them (for ``connect``, every
+  ## host must clear); anything unclassified is not transient.
+  ##
+  ## True does not mean the connection is gone (check ``conn.state``) or that
+  ## replaying is safe (a lost ``COMMIT`` may have committed). Cap retries.
+  if e == nil:
+    false
+  elif e of PgPoolError:
+    case (ref PgPoolError)(e).kind
+    of pekQueueFull, pekAcquireTimeout:
+      # An acquire timeout's `parent` only explains the wait.
+      true
+    of pekConnectFailed, pekBatchFailed:
+      isTransientError(e.catchableParent)
+    else:
+      false
+  elif e of PgQueryError:
+    isTransientServerError((ref PgQueryError)(e))
+  elif e of PgConnectionError:
+    let ce = (ref PgConnectionError)(e)
+    if ce.attempts.len > 0 and ce.perHost:
+      # A host failing for good most likely fails on a config every host shares.
+      var every = true
+      for a in ce.attempts:
+        every = every and isTransientError(a)
+      every
+    elif ce.attempts.len > 0:
+      var any = false
+      for a in ce.attempts:
+        any = any or isTransientError(a)
+      any and not hasLastingRefusal(e)
+    elif e of PgSecurityError or e of PgProtocolError:
+      false
+    elif e of PgListenError and (ref PgListenError)(e).transportAlive:
+      # Not the reconnect loop's to act on: the connection is still up.
+      false
+    elif ce.serverError != nil:
+      isTransientServerError(ce.serverError)
+    elif e of PgListenError:
+      # `parent` is the failure that ended the pump.
+      isTransientError(e.catchableParent)
+    else:
+      e of PgUnavailableError or e of PgTimeoutError
+  else:
+    # `connect` surfaces a single host's `connectTimeout` as is.
+    e of AsyncTimeoutError
 
 # PgQueryError field accessors. Field codes are defined by the wire protocol
 # All return "" (or 0 for positions) when the server did not send the field.

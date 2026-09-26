@@ -1,10 +1,10 @@
 ## In-process PostgreSQL wire-protocol mock server.
 ##
-## Starts a TCP listener on 127.0.0.1 with an ephemeral port and lets test code
-## script arbitrary byte sequences back to a real `PgConnection`. Used to
-## exercise code paths that a real PostgreSQL server would never reproduce on
-## demand: mid-message disconnects, malformed responses, truncated frames,
-## stalled senders, etc.
+## Starts a TCP listener on 127.0.0.1 (or a given host, e.g. ``::1``) with an
+## ephemeral port and lets test code script arbitrary byte sequences back to a
+## real `PgConnection`. Used to exercise code paths that a real PostgreSQL
+## server would never reproduce on demand: mid-message disconnects, malformed
+## responses, truncated frames, stalled senders, etc.
 ##
 ## Works with both `chronos` and `asyncdispatch` via the same unified API.
 ## The chronos and asyncdispatch branches expose identical `MockServer` /
@@ -14,6 +14,7 @@ import ../async_postgres/[async_backend, pg_protocol]
 
 when hasAsyncDispatch:
   import std/asyncnet
+  from std/nativesockets import Domain
 
 # Types and low-level transport
 
@@ -30,8 +31,8 @@ when hasChronos:
 
     MockClient* = StreamTransport
 
-  proc startMockServer*(): MockServer =
-    let server = createStreamServer(initTAddress("127.0.0.1", 0))
+  proc startMockServer*(host = "127.0.0.1"): MockServer =
+    let server = createStreamServer(initTAddress(host, 0))
     MockServer(server: server, port: int(server.localAddress().port))
 
   proc accept*(ms: MockServer): Future[MockClient] =
@@ -122,10 +123,11 @@ elif hasAsyncDispatch:
 
     MockClient* = AsyncSocket
 
-  proc startMockServer*(): MockServer =
-    let sock = newAsyncSocket(buffered = false)
+  proc startMockServer*(host = "127.0.0.1"): MockServer =
+    let domain = if ':' in host: Domain.AF_INET6 else: Domain.AF_INET
+    let sock = newAsyncSocket(domain, buffered = false)
     sock.setSockOpt(OptReuseAddr, true)
-    sock.bindAddr(Port(0))
+    sock.bindAddr(Port(0), host)
     let port = int(sock.getLocalAddr()[1])
     sock.listen()
     MockServer(socket: sock, port: port)

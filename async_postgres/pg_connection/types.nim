@@ -13,6 +13,7 @@ when hasChronos:
   import ../pg_bearssl
 elif hasAsyncDispatch:
   import std/asyncnet
+  from std/nativesockets import Domain, Port
 
 # TCP keepalive socket options (not exported by posix module)
 when defined(linux):
@@ -40,10 +41,34 @@ const
     ## Connect-time pull-API byte cap. 1024 × (channel + ≤8000-byte payload)
     ## fits with headroom.
 
+const ForkFailureText* = "could not fork new process for connection: "
+  ## Start of the postmaster's error when it cannot fork a backend (untranslated).
+
 var listenReconnectStopWaitMs* = 10_000
   ## Max wait (ms) for a listen pump stuck in a blocking `connect()`; it is
   ## orphaned on timeout. Not re-exported through `pg_connection`, so call
   ## sites cannot set it to 0 via the aggregate import and disable orphan safety.
+
+when hasChronos:
+  type DialTarget* = TransportAddress
+    ## One address to dial: an IP and port, or a Unix socket path.
+
+elif hasAsyncDispatch:
+  when defined(posix):
+    type DialTarget* =
+      tuple[
+        domain: Domain,
+        address: string,
+        port: Port,
+        sa: Sockaddr_storage,
+        saLen: SockLen,
+      ]
+      ## One address to dial: an IP and port, or for ``AF_UNIX`` a socket path.
+      ## ``address`` is for display (zone kept); ``sa`` is what is dialed.
+
+  else:
+    type DialTarget* = tuple[domain: Domain, address: string, port: Port]
+      ## One address to dial: an IP (its zone kept) and port.
 
 type
   PgConnState* = enum
@@ -160,8 +185,8 @@ type
       ## ``{amScramSha256}``) to reject them.
     applicationName*: string
     connectTimeout*: Duration
-      ## TCP connect timeout (default ``ZeroDuration`` = no timeout).
-      ## Negative values become ``ZeroDuration``.
+      ## Timeout per address a host resolves to, dial to ready (libpq
+      ## ``connect_timeout``); ``ZeroDuration`` (default, or negative) = none.
     keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
     keepAliveIdle*: int ## Seconds before first probe (0 = OS default)
     keepAliveInterval*: int ## Seconds between probes (0 = OS default)
@@ -296,6 +321,9 @@ type
       ## observe `listenStopRequested` instead of sending the query.
     host: string
     port: int
+    cancelTarget: seq[DialTarget]
+      ## The address dialed, where ``cancel`` sends its request; empty if never
+      ## dialed.
     createdAt: Moment
     portalCounter: int
     config: ConnConfig
@@ -1139,9 +1167,9 @@ func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
 proc newClosedError*(
     conn: PgConnection, msg: string, parent: ref Exception = nil
 ): ref PgConnectionError =
-  ## ``PgConnectionError`` for a connection that died, carrying the server's
+  ## ``PgUnavailableError`` for a connection that died, carrying the server's
   ## FATAL ErrorResponse (if any) as ``serverError``.
-  (ref PgConnectionError)(
+  (ref PgUnavailableError)(
     msg: msg, parent: parent, serverError: copyServerError(conn.fatalServerError)
   )
 

@@ -1136,8 +1136,8 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       try:
         if hasDeadline:
           # Bound the whole connect (across multi-host failover) by the acquire
-          # budget: per-host `connectTimeout` alone lets total wait reach
-          # `connectTimeout * hosts`. Under asyncdispatch the orphan close
+          # budget: per-address `connectTimeout` alone lets total wait reach
+          # `connectTimeout * addresses`. Under asyncdispatch the orphan close
           # mirrors `attemptHostTimed`'s handling.
           let attempt = connect(connCfg)
           when hasAsyncDispatch:

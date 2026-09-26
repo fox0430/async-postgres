@@ -37,6 +37,20 @@ proc isIpLiteralHost(host: string): bool =
   ## IP-literal host? `std/net.isIpAddress` misses bracketed/zone-scoped IPv6.
   isIpAddress(normalizeIpLiteralHost(host))
 
+when hasTls:
+  proc handshakeCutShort(
+      direct: bool, msg: string, parent: ref Exception = nil
+  ): ref PgConnectionError =
+    ## The peer broke off the TLS handshake: a server going down, but not
+    ## transient under direct SSL, where a pre-17 server does so too.
+    if direct:
+      (ref PgConnectionError)(
+        msg: msg & " (sslnegotiation=direct needs PostgreSQL 17 or later)",
+        parent: parent,
+      )
+    else:
+      (ref PgUnavailableError)(msg: msg, parent: parent)
+
 when hasChronos:
   import chronos/streams/tlsstream
   when not declared(getSelectedAlpnProtocol):
@@ -172,9 +186,10 @@ when hasAsyncDispatch and defined(ssl):
   proc formatSslError(prefix: string): string =
     prefix & lastSslErrorText()
 
-  proc driveTlsHandshake(socket: AsyncSocket, verifyingPeer: bool) {.async.} =
+  proc driveTlsHandshake(socket: AsyncSocket, verifyingPeer, direct: bool) {.async.} =
     ## Drive deferred handshake to completion via BIO shuttling.
-    ## ``verifyingPeer``: the context checks the server's certificate.
+    ## ``verifyingPeer``: the context checks the server's certificate;
+    ## ``direct``: no SSLRequest came first.
     const HandshakeBufSize = 4096
     let ssl = socket.sslHandle
     if ssl == nil:
@@ -208,6 +223,9 @@ when hasAsyncDispatch and defined(ssl):
             "TLS handshake failed (SSL_get_error=" & $err & ")" & sslErrorText(errCode)
           if verifyingPeer and SSL_get_verify_result(ssl) != X509_V_OK:
             newException(PgSecurityError, msg)
+          elif err == SSL_ERROR_ZERO_RETURN:
+            # The peer's close_notify: a server going down, not refusing.
+            newException(PgUnavailableError, msg)
           else:
             newException(PgConnectionError, msg)
       # Flush anything OpenSSL wrote to the outgoing memory BIO (ClientHello,
@@ -238,8 +256,7 @@ when hasAsyncDispatch and defined(ssl):
         except CatchableError as e:
           if failure != nil:
             raise failure
-          raise
-            newException(PgConnectionError, "TLS handshake: send failed: " & e.msg, e)
+          raise handshakeCutShort(direct, "TLS handshake: send failed: " & e.msg, e)
       if ret == 1:
         return
       case err
@@ -250,11 +267,9 @@ when hasAsyncDispatch and defined(ssl):
         except CancelledError as e:
           raise e
         except CatchableError as e:
-          raise
-            newException(PgConnectionError, "TLS handshake: recv failed: " & e.msg, e)
+          raise handshakeCutShort(direct, "TLS handshake: recv failed: " & e.msg, e)
         if data.len == 0:
-          raise
-            newException(PgConnectionError, "TLS handshake: connection closed by peer")
+          raise handshakeCutShort(direct, "TLS handshake: connection closed by peer")
         # The recv above suspended, so anything on the queue now may be another
         # connection's; drop it so a BIO_write failure reports its own error.
         ErrClearError()
@@ -479,6 +494,12 @@ when hasTls:
             (ref TLSStreamProtocolError)(e).errCode in
             ERR_X509_OK + 1 .. ERR_X509_NOT_TRUSTED:
           raise newException(PgSecurityError, "TLS handshake failed: " & e.msg, e)
+        # A broken stream (EOF or reset) is a handshake cut short; error code 0
+        # is the engine closing with no TLS error, at the peer's close_notify.
+        if not (e of TLSStreamProtocolError):
+          raise handshakeCutShort(direct, "TLS handshake failed: " & e.msg, e)
+        if (ref TLSStreamProtocolError)(e).errCode == 0:
+          raise newException(PgUnavailableError, "TLS handshake failed: " & e.msg, e)
         raise newException(PgConnectionError, "TLS handshake failed: " & e.msg, e)
       if direct:
         assertAlpnPostgres(conn.tlsStream.getSelectedAlpnProtocol())
@@ -624,7 +645,7 @@ when hasTls:
         # Drive the handshake now so the peer cert is available before SCRAM
         # decides channel binding (asyncnet defers it to the first send/recv).
         await driveTlsHandshake(
-          conn.socket, config.sslMode in {sslVerifyCa, sslVerifyFull}
+          conn.socket, config.sslMode in {sslVerifyCa, sslVerifyFull}, direct
         )
         if direct:
           assertAlpnPostgres(getSelectedAlpnOpenssl(conn.socket.sslHandle))
@@ -661,6 +682,29 @@ when hasTls:
         # client private key PEM — leaving it around would be a footgun.
         for p in tmpPaths:
           removeTempPem(p)
+
+when hasTls:
+  proc readsForkFailure(conn: PgConnection, first: string): Future[bool] {.async.} =
+    ## Whether the pre-3.0 error text after an 'E' reply, ``first`` of it
+    ## already read, is a failed fork's. Reads only while it still matches.
+    var text = first
+    while text.len < ForkFailureText.len and ForkFailureText.startsWith(text):
+      let want = ForkFailureText.len - text.len
+      var chunk: string
+      try:
+        when hasChronos:
+          chunk = newString(want)
+          chunk.setLen(await conn.transport.readOnce(addr chunk[0], want))
+        else:
+          chunk = await conn.socket.recv(want)
+      except CancelledError as e:
+        raise e
+      except CatchableError:
+        return false
+      if chunk.len == 0:
+        return false
+      text.add(chunk)
+    text.startsWith(ForkFailureText)
 
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
   ## Negotiate TLS (SSLRequest or Direct). ``sslHost`` is cert verification name.
@@ -699,6 +743,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     var extraBytesBuffered = false
       ## The reply read pulled in bytes past the reply byte, which the server
       ## must not send.
+    var afterReply = ""
+      ## What the reply read took past the reply byte: an 'E' text's start.
 
     when hasChronos:
       # Folded like every other read/write: `negotiateSSL` is exported, so a raw
@@ -721,9 +767,11 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         conn.raiseTransportFailure("negotiateSSL: SSL response", e)
       if n == 0:
         raise
-          newException(PgConnectionError, "Connection closed during SSL negotiation")
+          newException(PgUnavailableError, "Connection closed during SSL negotiation")
       respChar = char(response[0])
       extraBytesBuffered = n > 1
+      if n > 1:
+        afterReply.add(char(response[1]))
     elif hasAsyncDispatch:
       # see the chronos arm for why the exchange is folded
       try:
@@ -743,7 +791,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         conn.raiseTransportFailure("negotiateSSL: SSL response", e)
       if respStr.len == 0:
         raise
-          newException(PgConnectionError, "Connection closed during SSL negotiation")
+          newException(PgUnavailableError, "Connection closed during SSL negotiation")
       respChar = respStr[0]
 
     case respChar
@@ -785,11 +833,12 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         # Make the silent mTLS drop observable on the plaintext fallback.
         warnStderr "pg_connection: client certificate will NOT be sent over the plaintext fallback connection"
     of 'E':
-      # A failed fork: the postmaster replies before reading the SSLRequest. As
-      # in libpq, its text is not read: the server is not authenticated yet.
-      raise newException(
-        PgConnectionError, "server sent an error response during SSL exchange"
-      )
+      # A failed fork or a server predating SSL. As in libpq, the text is not
+      # shown: the server is not authenticated yet.
+      const msg = "server sent an error response during SSL exchange"
+      if await conn.readsForkFailure(afterReply):
+        raise newException(PgUnavailableError, msg)
+      raise newException(PgConnectionError, msg)
     else:
       # Peer-controlled byte: escape it like the ALPN errors above.
       raise newException(

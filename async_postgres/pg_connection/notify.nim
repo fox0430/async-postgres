@@ -95,6 +95,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.recvBufStart = newConn.recvBufStart
   conn.host = newConn.host
   conn.port = newConn.port
+  conn.cancelTarget = newConn.cancelTarget
   conn.pid = newConn.pid
   conn.secretKey = newConn.secretKey
   conn.serverParams = newConn.serverParams
@@ -183,9 +184,8 @@ proc notifyListenDeath(
     sessionFatal: ref PgQueryError = conn.fatalServerError,
 ) {.raises: [].} =
   ## Pump died permanently; notify pull/push APIs. ``retire=false`` = listen side only.
-  ## After failed redials ``cause`` is the last one, kept as the sole attempt:
-  ## what a new session now runs into, beside ``sessionFatal``, the FATAL that
-  ## ended the session the pump listened on.
+  ## After failed redials ``cause`` is the last one, kept as the sole attempt;
+  ## it, not ``sessionFatal``, decides whether to retry.
   # `retire = false` is exactly the case where the transport survived, so
   # it is what tells a reconnect loop this failure is not its to act on.
   let transportAlive = not retire
@@ -457,11 +457,17 @@ proc restartPumpOrFailWaiter(
   if conn.closedReason != crOpen:
     if restarted and conn.closedReason != crClosedByUser:
       # Permanent pump death with channels still subscribed: releasing only the
-      # waiter would leave an `onNotify` subscriber silently deaf.
+      # waiter would leave an `onNotify` subscriber silently deaf. A cancelled
+      # round trip has no `cause`: report the lost connection.
+      let lost =
+        if cause != nil:
+          cause
+        else:
+          conn.newClosedError("Connection is closed")
       conn.notifyListenDeath(
         "Listen pump stopped: connection lost during LISTEN/UNLISTEN",
         reconnectionAttempted = false,
-        cause = cause,
+        cause = lost,
       )
     elif restarted:
       # A deliberate `close()`: a `PgListenError` here would make a reconnecting

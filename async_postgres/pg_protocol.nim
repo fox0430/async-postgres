@@ -459,7 +459,7 @@ proc patchMsgLenAtomic*(buf: var seq[byte], msgStart: int) =
 # the tests that import this module directly; off the export whitelist.
 const
   parseLengthOverhead* = 8
-    ## Beyond stmtName.len+sql.len+4*n: length field + 2 terminators + count
+    ## Beyond ``stmtName.len+sql.len+4*n``: length field + 2 terminators + count
   bindLengthOverhead* = 12
     ## Beyond names+payload: length field + 2 terminators + 3 counts
   describeLengthOverhead* = 6
