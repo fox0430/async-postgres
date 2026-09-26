@@ -34,9 +34,6 @@ elif hasAsyncDispatch:
   when defined(posix):
     from std/oserrors import OSErrorCode, newOSError, osLastError
 
-import std/importutils
-privateAccess(PgConnection)
-
 when defined(posix):
   # POSIX socket option constants (used by liveness probes and TCP keepalive)
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
@@ -454,7 +451,7 @@ func notifyEntryBytes(n: Notification): int64 {.inline.} =
 
 proc noteNotifyDrop(conn: PgConnection, droppedNow: var int) {.inline, raises: [].} =
   if conn.notifyDropped < high(int): # saturating; reset once reported
-    conn.notifyDropped.inc
+    conn.notifyDropped = conn.notifyDropped + 1
   droppedNow.inc
 
 proc dropOldestNotification(
@@ -491,8 +488,11 @@ proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].
 
   if maxB > 0 and incoming > maxB.int64:
     conn.noteNotifyDrop(droppedNow)
-    if droppedNow > 0 and conn.notifyOverflowCallback != nil:
-      conn.notifyOverflowCallback(droppedNow)
+    # noteNotifyDrop always increments, so `droppedNow > 0` holds here.
+    if droppedNow > 0:
+      let overflow = conn.notifyOverflowCallback
+      if overflow != nil:
+        overflow(droppedNow)
     return
 
   while conn.notifyQueue.len > 0:
@@ -503,8 +503,11 @@ proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].
     conn.dropOldestNotification(queuedBytes, droppedNow)
 
   conn.notifyQueue.addLast(notif)
-  if droppedNow > 0 and conn.notifyOverflowCallback != nil:
-    conn.notifyOverflowCallback(droppedNow)
+  if droppedNow > 0:
+    # Read once: the accessor is a call, and this path runs per NOTIFY.
+    let overflow = conn.notifyOverflowCallback
+    if overflow != nil:
+      overflow(droppedNow)
 
 proc requeueHandoff*(conn: PgConnection, notif: Notification) {.raises: [].} =
   ## Requeue an unconsumed handoff at the front.
@@ -540,12 +543,14 @@ proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: []
       conn.enqueueNotification(notif)
   else:
     conn.enqueueNotification(notif)
-  if conn.notifyCallback != nil:
-    conn.notifyCallback(notif)
+  let notifyCb = conn.notifyCallback
+  if notifyCb != nil:
+    notifyCb(notif)
 
 proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
-  if conn.noticeCallback != nil:
-    conn.noticeCallback(Notice(fields: msg.noticeFields))
+  let noticeCb = conn.noticeCallback
+  if noticeCb != nil:
+    noticeCb(Notice(fields: msg.noticeFields))
 
 proc recordParameterStatus(
     conn: PgConnection, name, value: string
@@ -566,7 +571,7 @@ proc recordParameterStatus(
           $MaxServerParamsBytes,
       )
     conn.serverParamsBytes += delta
-    conn.serverParams[name] = value
+    conn.setServerParam(name, value)
   else:
     if conn.serverParams.len >= MaxServerParams:
       conn.markClosed()
@@ -581,7 +586,7 @@ proc recordParameterStatus(
         "ParameterStatus: serverParams byte total would exceed maximum of " &
           $MaxServerParamsBytes,
       )
-    conn.serverParams[name] = value
+    conn.setServerParam(name, value)
     conn.serverParamsBytes += newEntryBytes
 
 # Raw send helpers (asyncdispatch only)

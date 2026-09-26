@@ -1,7 +1,7 @@
 import std/[hashes, math, options, parseutils, sequtils, strutils, tables, net]
 
 import ../pg_errors
-export pg_errors
+export pg_errors except setPerHost
 
 import ../pg_bytes
 export pg_bytes

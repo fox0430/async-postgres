@@ -27,9 +27,9 @@
 ## the caller, not this module's export. Wrapped signatures keep the skip
 ## until the depth-0 `=`.
 ##
-## `Type.field` reachability is approximated: the classifier accepts either
-## name, which over-reports only when an object type is named in `except`
-## (no current instance).
+## `Type.field` is promised only when `Type` is: a hub export of a proc that
+## shares the field's name does not reach the field. `Enum.value` is promised
+## when either name is, since `except Enum` hides the type, not the values.
 ##
 ## Usage:
 ##   api_surface                    print both surfaces
@@ -58,6 +58,10 @@ type
   SurfaceEntry = object
     path, label: string
     kind: SurfaceKind
+
+  StarName = object
+    label: string ## `name`, `Enum.value` or `Type.field`, numbered on repeats.
+    isField: bool ## `Type.field`, as opposed to `Enum.value` or a plain name.
 
   ExportClause = object
     module: string ## Imported identifier (`types`, `core`, `pg_auth`).
@@ -339,19 +343,21 @@ proc headerHasBodyEquals(text: string): bool =
     inc i
   false
 
-proc collectStarNames(path: string): seq[string] =
+proc collectStarNames(path: string): seq[StarName] =
   ## Exported `*` names in `path`. Skips `template` / `macro` bodies.
   var occurrences: CountTable[string]
   let all = toSeq(lines(path))
-  template emit(label: string) =
-    let l = label
+  template emit(name: string, fieldOfType = false) =
+    let l = name
     occurrences.inc l
     let k = occurrences[l]
-    result.add(
-      if k == 1:
-        l
-      else:
-        l & "#" & $k
+    result.add StarName(
+      label:
+        if k == 1:
+          l
+        else:
+          l & "#" & $k,
+      isField: fieldOfType,
     )
 
   var objectType = ""
@@ -381,7 +387,7 @@ proc collectStarNames(path: string): seq[string] =
     if objectType.len > 0:
       let field = fieldExportName(line)
       if field.len > 0:
-        emit objectType & "." & field
+        emit(objectType & "." & field, fieldOfType = true)
       continue
     let stripped = body.strip()
     if stripped.startsWith("template ") or stripped.startsWith("macro "):
@@ -435,7 +441,7 @@ proc resolveExportModule(
 
 proc classify(files: seq[string]): seq[SurfaceEntry] =
   var imports: Table[string, Table[string, string]]
-  var stars: Table[string, seq[string]]
+  var stars: Table[string, seq[StarName]]
   var exportLabels: Table[string, seq[string]]
   var exportClauses: Table[string, seq[ExportClause]]
   for path in files:
@@ -469,18 +475,21 @@ proc classify(files: seq[string]): seq[SurfaceEntry] =
       seenHub.incl hub
       walk(hub)
 
-  proc starKind(path, labeled: string): SurfaceKind =
-    var base = labeled
-    let hash = labeled.find('#')
+  proc starKind(path: string, star: StarName): SurfaceKind =
+    var base = star.label
+    let hash = base.find('#')
     if hash >= 0:
-      base = labeled[0 ..< hash]
+      base = base[0 ..< hash]
     if path in hubFiles:
       return skPublic
-    # `Enum.member` / `Type.field`: public if either side is promised.
+    # `Enum.value`: public if either side is promised. `Type.field`: only
+    # through the type.
     var names = @[base]
     let dot = base.find('.')
     if dot >= 0:
-      names = @[base[0 ..< dot], base[dot + 1 ..^ 1]]
+      names = @[base[0 ..< dot]]
+      if not star.isField:
+        names.add base[dot + 1 ..^ 1]
     for n in names:
       if path in wholesale and n notin wholesale[path]:
         return skPublic
@@ -493,8 +502,8 @@ proc classify(files: seq[string]): seq[SurfaceEntry] =
     if path in hubFiles or path in wholesale: skPublic else: skInternal
 
   for path in files:
-    for name in stars[path]:
-      result.add SurfaceEntry(path: path, label: name, kind: starKind(path, name))
+    for star in stars[path]:
+      result.add SurfaceEntry(path: path, label: star.label, kind: starKind(path, star))
     for label in exportLabels[path]:
       result.add SurfaceEntry(path: path, label: label, kind: exportKind(path))
 

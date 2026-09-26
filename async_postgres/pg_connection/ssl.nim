@@ -61,9 +61,6 @@ elif hasAsyncDispatch:
   when defined(ssl):
     import std/[asyncnet, dynlib, openssl, tempfiles, os]
 
-import std/importutils
-privateAccess(PgConnection)
-
 when hasTls:
   const PgAlpnProtocol = "postgresql"
     ## ALPN protocol name required for `sslnegotiation=direct` (PostgreSQL 17+).

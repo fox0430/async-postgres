@@ -22,10 +22,6 @@ from pg_types/core import isPgUIntText, pgParseHexUInt32, pgParseIntView, pipOk
 import pg_connection/[types, dsn, buffer_io, simple_query, lifecycle]
 import pg_types/encoding
 
-import std/importutils
-privateAccess(PgConnection)
-privateAccess(ReplWrite)
-
 type
   Lsn* = distinct uint64
     ## LSN (Log Sequence Number)

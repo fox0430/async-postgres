@@ -432,9 +432,9 @@ type
 
   ReplWrite* = ref object
     ## A queued replication write (internal; see ``pg_replication``).
-    frame: seq[byte] ## Encoded frame; empty for the library's status.
-    waiters: seq[Future[void]] ## Completed once written, failed if not.
-    state: ReplWriteState
+    frame*: seq[byte] ## Encoded frame; empty for the library's status.
+    waiters*: seq[Future[void]] ## Completed once written, failed if not.
+    state*: ReplWriteState
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -757,7 +757,250 @@ func displayHost*(entry: HostEntry): string {.inline.} =
   ## `hostaddr` (mirrors libpq's PQhost()).
   if entry.host.len > 0: entry.host else: entry.hostaddr
 
-# Internal accessor for cross-module use within the library
+# Internal accessors
+#
+# Sibling modules reach the private record through these rather than
+# `privateAccess`, which is reserved for tests. The hub re-exports none of
+# them; the promised ones are the "Public accessors" section below. A field
+# with a public getter gets a setter here instead: a `var` overload cannot
+# share the getter's name. `state` and `config` are the two exceptions: the
+# former is written only through ``markState``, the latter is an immutable
+# `lent` view.
+
+proc newPgConnection*(host: string, port: int, config: ConnConfig): PgConnection =
+  ## A ``csConnecting`` record with the default tunables, before the caller
+  ## attaches its transport.
+  PgConnection(
+    state: csConnecting,
+    serverParams: initTable[string, string](),
+    host: host,
+    port: port,
+    config: config,
+    notifyMaxQueue: DefaultNotifyMaxQueue,
+    notifyMaxQueueBytes: DefaultNotifyMaxQueueBytes,
+    stmtCacheCapacity: 256,
+    listenReconnectMaxAttempts: 10,
+    listenReconnectMaxBackoff: 30,
+  )
+
+when hasChronos:
+  proc transport*(conn: PgConnection): var StreamTransport {.inline.} =
+    conn.transport
+
+  proc baseReader*(conn: PgConnection): var AsyncStreamReader {.inline.} =
+    conn.baseReader
+
+  proc baseWriter*(conn: PgConnection): var AsyncStreamWriter {.inline.} =
+    conn.baseWriter
+
+  proc reader*(conn: PgConnection): var AsyncStreamReader {.inline.} =
+    conn.reader
+
+  proc writer*(conn: PgConnection): var AsyncStreamWriter {.inline.} =
+    conn.writer
+
+  proc tlsStream*(conn: PgConnection): var TLSAsyncStream {.inline.} =
+    conn.tlsStream
+
+  proc trustAnchorBufs*(conn: PgConnection): var seq[seq[byte]] {.inline.} =
+    conn.trustAnchorBufs
+
+  proc x509Capture*(conn: PgConnection): var X509CertCaptureContext {.inline.} =
+    conn.x509Capture
+
+elif hasAsyncDispatch:
+  proc socket*(conn: PgConnection): var AsyncSocket {.inline.} =
+    conn.socket
+
+proc serverCertDer*(conn: PgConnection): var seq[byte] {.inline.} =
+  conn.serverCertDer
+
+proc recvBuf*(conn: PgConnection): var seq[byte] {.inline.} =
+  conn.recvBuf
+
+proc recvBufStart*(conn: PgConnection): var int {.inline.} =
+  conn.recvBufStart
+
+proc pendingSyncs*(conn: PgConnection): var int {.inline.} =
+  conn.pendingSyncs
+
+proc unsyncedWrite*(conn: PgConnection): var bool {.inline.} =
+  conn.unsyncedWrite
+
+proc secretKey*(conn: PgConnection): var int32 {.inline.} =
+  conn.secretKey
+
+proc serverParamsBytes*(conn: PgConnection): var int {.inline.} =
+  conn.serverParamsBytes
+
+proc negotiatedMinorVersion*(conn: PgConnection): var int32 {.inline.} =
+  conn.negotiatedMinorVersion
+
+proc unrecognizedStartupOptions*(conn: PgConnection): var seq[string] {.inline.} =
+  conn.unrecognizedStartupOptions
+
+proc notifyCallback*(conn: PgConnection): var NotifyCallback {.inline.} =
+  conn.notifyCallback
+
+proc noticeCallback*(conn: PgConnection): var NoticeCallback {.inline.} =
+  conn.noticeCallback
+
+proc listenChannels*(conn: PgConnection): var HashSet[string] {.inline.} =
+  conn.listenChannels
+
+proc borrowedByUser*(conn: PgConnection): var bool {.inline.} =
+  conn.borrowedByUser
+
+proc stagedStmtCloses*(conn: PgConnection): var seq[string] {.inline.} =
+  conn.stagedStmtCloses
+
+proc transportCloseFut*(conn: PgConnection): var Future[void] {.inline.} =
+  conn.transportCloseFut
+
+proc listenTask*(conn: PgConnection): var Future[void] {.inline.} =
+  conn.listenTask
+
+proc listenStopRequested*(conn: PgConnection): var bool {.inline.} =
+  conn.listenStopRequested
+
+proc listenReconnecting*(conn: PgConnection): var bool {.inline.} =
+  conn.listenReconnecting
+
+proc cancelTarget*(conn: PgConnection): var seq[DialTarget] {.inline.} =
+  conn.cancelTarget
+
+proc notifyQueue*(conn: PgConnection): var Deque[Notification] {.inline.} =
+  conn.notifyQueue
+
+proc notifyWaiter*(conn: PgConnection): var Future[void] {.inline.} =
+  conn.notifyWaiter
+
+proc notifyHandoff*(conn: PgConnection): var Notification {.inline.} =
+  conn.notifyHandoff
+
+proc hasNotifyHandoff*(conn: PgConnection): var bool {.inline.} =
+  conn.hasNotifyHandoff
+
+proc closedByUser*(conn: PgConnection): var bool {.inline.} =
+  conn.closedByUser
+
+proc fatalServerError*(conn: PgConnection): var ref PgQueryError {.inline.} =
+  conn.fatalServerError
+
+proc reconnectCallback*(conn: PgConnection): var ReconnectCallback {.inline.} =
+  conn.reconnectCallback
+
+proc notifyOverflowCallback*(
+    conn: PgConnection
+): var NotifyOverflowCallback {.inline.} =
+  conn.notifyOverflowCallback
+
+proc listenErrorCallback*(conn: PgConnection): var ListenErrorCallback {.inline.} =
+  conn.listenErrorCallback
+
+proc stmtCache*(conn: PgConnection): var Table[string, CachedStmt] {.inline.} =
+  conn.stmtCache
+
+proc stmtCacheLru*(conn: PgConnection): var DoublyLinkedList[string] {.inline.} =
+  conn.stmtCacheLru
+
+proc stmtCounter*(conn: PgConnection): var int {.inline.} =
+  conn.stmtCounter
+
+proc pendingStmtCloses*(conn: PgConnection): var seq[string] {.inline.} =
+  conn.pendingStmtCloses
+
+proc heldSessionLocks*(conn: PgConnection): var int {.inline.} =
+  conn.heldSessionLocks
+
+proc sessionLockDirty*(conn: PgConnection): var bool {.inline.} =
+  conn.sessionLockDirty
+
+proc tracer*(conn: PgConnection): var PgTracer {.inline.} =
+  conn.tracer
+
+proc ownerPool*(conn: PgConnection): var PgPoolOwner {.inline.} =
+  conn.ownerPool
+
+proc borrowed*(conn: PgConnection): var bool {.inline.} =
+  conn.borrowed
+
+proc replReadScratch*(conn: PgConnection): var seq[byte] {.inline.} =
+  conn.replReadScratch
+
+proc replWrites*(conn: PgConnection): var Deque[ReplWrite] {.inline.} =
+  conn.replWrites
+
+proc replFlusher*(conn: PgConnection): var Future[void] {.inline.} =
+  conn.replFlusher
+
+proc replFinalStatus*(conn: PgConnection): var ReplWrite {.inline.} =
+  conn.replFinalStatus
+
+proc replWriteFailure*(conn: PgConnection): var ref CatchableError {.inline.} =
+  conn.replWriteFailure
+
+proc replPendingStatus*(conn: PgConnection): var ReplWrite {.inline.} =
+  conn.replPendingStatus
+
+proc replWritesOpen*(conn: PgConnection): var bool {.inline.} =
+  conn.replWritesOpen
+
+proc replCopyDone*(conn: PgConnection): var ReplWrite {.inline.} =
+  conn.replCopyDone
+
+proc replAutoConfirm*(conn: PgConnection): var bool {.inline.} =
+  conn.replAutoConfirm
+
+proc replInTxn*(conn: PgConnection): var bool {.inline.} =
+  conn.replInTxn
+
+proc replInCallback*(conn: PgConnection): var bool {.inline.} =
+  conn.replInCallback
+
+proc replSentFlushRaw*(conn: PgConnection): var uint64 {.inline.} =
+  conn.replSentFlushRaw
+
+proc `pid=`*(conn: PgConnection, value: int32) {.inline.} =
+  conn.pid = value
+
+proc `host=`*(conn: PgConnection, value: string) {.inline.} =
+  conn.host = value
+
+proc `port=`*(conn: PgConnection, value: int) {.inline.} =
+  conn.port = value
+
+proc `createdAt=`*(conn: PgConnection, value: Moment) {.inline.} =
+  conn.createdAt = value
+
+proc `sslEnabled=`*(conn: PgConnection, value: bool) {.inline.} =
+  conn.sslEnabled = value
+
+proc `serverParams=`*(conn: PgConnection, value: Table[string, string]) {.inline.} =
+  conn.serverParams = value
+
+proc setServerParam*(conn: PgConnection, name, value: string) {.inline.} =
+  ## Store one ``ParameterStatus`` value. Bounds and ``serverParamsBytes`` are
+  ## the caller's to maintain.
+  conn.serverParams[name] = value
+
+proc `notifyDropped=`*(conn: PgConnection, value: int) {.inline.} =
+  conn.notifyDropped = value
+
+proc `listenError=`*(conn: PgConnection, value: ref PgListenError) {.inline.} =
+  conn.listenError = value
+
+proc `txStatus=`*(conn: PgConnection, value: TransactionStatus) {.inline.} =
+  conn.txStatus = value
+
+proc sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
+  ## Send buffer for `queryDirect` / `execDirect` (via `bindSym`).
+  conn.sendBuf
+
+proc nextPortalName*(conn: PgConnection, prefix: string): string =
+  ## Fresh portal/savepoint name; owns counter so macro scope stays sealed.
+  inc conn.portalCounter
+  prefix & $conn.portalCounter
 
 func effectiveMaxMessageSize*(conn: PgConnection): int {.inline.} =
   ## Effective per-message recv cap for this connection. Resolves the
@@ -1139,21 +1382,15 @@ proc `stmtCacheCapacity=`*(conn: PgConnection, value: int) {.inline.} =
   conn.stmtCacheCapacity = value
 
 func state*(conn: PgConnection): PgConnState {.inline.} =
-  ## Current state (read-only; see `isConnected` / `closedReason`).
+  ## Current state (read-only; see `isConnected`).
   conn.state
 
 func txStatus*(conn: PgConnection): TransactionStatus {.inline.} =
-  ## Tx status from last ``ReadyForQuery`` (read-only, via `bindSym`).
+  ## Tx status from last ``ReadyForQuery`` (via `bindSym`). Read-only to
+  ## applications; library modules update it through the internal `txStatus=`.
   conn.txStatus
 
-proc sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
-  ## Send buffer for `queryDirect` / `execDirect` (via `bindSym`).
-  conn.sendBuf
-
-proc nextPortalName*(conn: PgConnection, prefix: string): string =
-  ## Fresh portal/savepoint name; owns counter so macro scope stays sealed.
-  inc conn.portalCounter
-  prefix & $conn.portalCounter
+# Closed-connection checks (internal)
 
 func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
   ## Why unusable (``crClosedByUser`` outranks ``crClosed``).

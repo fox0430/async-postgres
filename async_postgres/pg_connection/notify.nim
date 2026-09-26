@@ -12,9 +12,6 @@ when hasChronos:
   import chronos/streams/tlsstream
   import ../pg_bearssl
 
-import std/importutils
-privateAccess(PgConnection)
-
 const listenBackoffTickMs = 50 ## Backoff tick ms (stop check granularity).
 
 # listenReconnectStopWaitMs lives in types.nim to avoid a circular import.
@@ -205,8 +202,9 @@ proc notifyListenDeath(
   # Built fresh, never the stored ref: `checkListenAlive` re-raises that object
   # on every later call, so sharing it would accumulate stack traces.
   conn.failNotifyWaiter(newListenDeathError(conn.listenError, transportAlive))
-  if conn.listenErrorCallback != nil:
-    conn.listenErrorCallback(conn.listenError)
+  let listenErrCb = conn.listenErrorCallback
+  if listenErrCb != nil:
+    listenErrCb(conn.listenError)
 
 proc listenPump*(conn: PgConnection) {.async.} =
   ## Background loop: dispatch notifications, auto-reconnect on failure.
@@ -262,8 +260,9 @@ proc listenPump*(conn: PgConnection) {.async.} =
               return
             conn.markState(csListening)
             reconnected = true
-            if conn.reconnectCallback != nil:
-              conn.reconnectCallback()
+            let reconnectCb = conn.reconnectCallback
+            if reconnectCb != nil:
+              reconnectCb()
             break
           except CancelledError:
             return

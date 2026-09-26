@@ -195,6 +195,10 @@ type
       ## Always true here — the type is only raised for a live transport. Kept
       ## so a caller reading the field need not special-case which error it got.
 
+proc setPerHost*(e: ref PgConnectionError, value: bool) {.inline.} =
+  ## Set ``perHost``. Sibling-only: the hub does not re-export it.
+  e.perHost = value
+
 template newPoolError*(
     errKind: PoolErrorKind, message: string, parentErr: ref Exception = nil
 ): untyped =

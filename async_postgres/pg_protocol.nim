@@ -1,7 +1,9 @@
 import std/[options, tables]
 
 import pg_bytes, pg_errors
-export pg_errors
+# Third re-export path of `pg_errors`; `setPerHost` stays sibling-only, as in
+# the `pg_connection` / `pg_types/core` hubs.
+export pg_errors except setPerHost
 
 type
   FrontendMessageKind* = enum

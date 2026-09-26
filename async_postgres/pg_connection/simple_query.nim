@@ -13,9 +13,6 @@ import types, buffer_io
 when hasAsyncDispatch:
   import std/asyncnet
 
-import std/importutils
-privateAccess(PgConnection)
-
 # QueryResult helpers
 
 proc len*(qr: QueryResult): int {.inline.} =

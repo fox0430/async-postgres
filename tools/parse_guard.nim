@@ -10,6 +10,7 @@
 ##   parse_guard   scan async_postgres/, exit 1 on a call outside the allowlist
 
 import std/[os, strutils]
+import source_scan
 
 const
   srcDir = "async_postgres"
@@ -19,52 +20,12 @@ const
     "parseEnum", "parseSaturatedNatural", "fromHex", "fromOct", "fromBin", "parseHex",
     "parseOct", "parseBin", "parseHexStr",
   ]
-  identChars = {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_'}
   allowed = [
     # Grammar wrappers live here.
     "async_postgres/pg_types/core.nim",
     # DSN follows libpq's strtol grammar (accepts `+5432`) with own guards.
     "async_postgres/pg_connection/dsn.nim",
   ]
-
-proc isIdent(line: string, at, width: int): bool =
-  ## Whether the match at ``at`` is a whole identifier (catches ``s.parseInt``
-  ## and parser values, not just ``name(``).
-  (at == 0 or line[at - 1] notin identChars) and
-    (at + width >= line.len or line[at + width] notin identChars)
-
-proc stripLiteralsAndComment(line: string): string =
-  ## Blank string/char literals, then drop the trailing comment. Prevents a
-  ## ``'#'`` literal or a quoted parser name from confusing the scan.
-  result = newStringOfCap(line.len)
-  var
-    i = 0
-    inStr = false
-    inChar = false
-  while i < line.len:
-    let c = line[i]
-    if inStr or inChar:
-      if c == '\\' and i + 1 < line.len:
-        result.add("  ")
-        i += 2
-        continue
-      if (inStr and c == '"') or (inChar and c == '\''):
-        inStr = false
-        inChar = false
-        result.add(c)
-      else:
-        result.add(' ')
-    elif c == '"':
-      inStr = true
-      result.add(c)
-    elif c == '\'':
-      inChar = true
-      result.add(c)
-    elif c == '#':
-      break
-    else:
-      result.add(c)
-    inc i
 
 proc main() =
   var violations: seq[string]
@@ -74,8 +35,9 @@ proc main() =
     let rel = path.replace('\\', '/')
     if rel in allowed:
       continue
+    var sc: LineScanner
     for lineNo, line in pairs(readFile(path).splitLines()):
-      let code = stripLiteralsAndComment(line)
+      let code = stripLiteralsAndComment(line, sc)
       for p in parsers:
         var at = code.find(p)
         while at >= 0:
