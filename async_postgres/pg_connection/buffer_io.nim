@@ -302,7 +302,8 @@ elif hasAsyncDispatch:
           else:
             it = it.ai_next
             continue
-          t.address = getAddrString(cast[ptr SockAddr](addr t.sa))
+          # nim doc builds nativesockets on winlean: name its types.
+          t.address = getAddrString(cast[ptr nativesockets.SockAddr](addr t.sa))
           if t.domain == Domain.AF_INET6:
             # The text form drops a link-local address's zone; keep it.
             let scope = cast[ptr Sockaddr_in6](addr t.sa).sin6_scope_id
@@ -350,7 +351,8 @@ elif hasAsyncDispatch:
       result = fut
 
       proc onWritable(fd: AsyncFD): bool =
-        let err = SocketHandle(fd).getSockOptInt(cint(SOL_SOCKET), cint(SO_ERROR))
+        let err =
+          nativesockets.SocketHandle(fd).getSockOptInt(cint(SOL_SOCKET), cint(SO_ERROR))
         if err == 0:
           fut.complete()
         elif err == EINTR:
@@ -360,7 +362,9 @@ elif hasAsyncDispatch:
         true
 
       var sa = t.sa
-      if posix.connect(sock.getFd, cast[ptr SockAddr](addr sa), t.saLen) == 0:
+      if posix.connect(
+        posix.SocketHandle(sock.getFd), cast[ptr SockAddr](addr sa), t.saLen
+      ) == 0:
         fut.complete()
       else:
         let err = osLastError()
