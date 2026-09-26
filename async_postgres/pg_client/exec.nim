@@ -10,9 +10,6 @@ import ../pg_connection/[types, buffer_io, cache, simple_query]
 import ../pg_types/encoding
 import core
 
-import std/importutils
-privateAccess(PgConnection)
-
 proc execImpl*(
     conn: PgConnection,
     sql: string,

@@ -420,7 +420,7 @@ async_postgres/pg_connection.nim	export notify.onReconnect
 async_postgres/pg_connection.nim	export notify.stopListening
 async_postgres/pg_connection.nim	export notify.unlisten
 async_postgres/pg_connection.nim	export notify.waitNotification
-async_postgres/pg_connection.nim	export pg_errors
+async_postgres/pg_connection.nim	export pg_errors except setPerHost
 async_postgres/pg_connection.nim	export simple_query.cancel
 async_postgres/pg_connection.nim	export simple_query.cancelNoWait
 async_postgres/pg_connection.nim	export simple_query.checkSessionAttrs
@@ -1821,7 +1821,7 @@ async_postgres/pg_types/core.nim	cmp
 async_postgres/pg_types/core.nim	data
 async_postgres/pg_types/core.nim	decimalSep
 async_postgres/pg_types/core.nim	export pg_bytes
-async_postgres/pg_types/core.nim	export pg_errors
+async_postgres/pg_types/core.nim	export pg_errors except setPerHost
 async_postgres/pg_types/core.nim	formatPgMoney
 async_postgres/pg_types/core.nim	formatPgMoney#2
 async_postgres/pg_types/core.nim	fracDigits

@@ -2,7 +2,7 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[options, random, sequtils, strutils, sysrand, tables]
+import std/[options, random, sequtils, strutils, sysrand]
 
 import ../[async_backend, pg_errors, pg_protocol, pg_auth]
 from ../pg_bytes import readString
@@ -14,10 +14,6 @@ when defined(posix):
 
 when hasAsyncDispatch:
   import std/asyncnet
-
-import std/importutils
-privateAccess(PgConnection)
-privateAccess(PgConnectionError)
 
 type AuthProgress = object ## What the authentication exchange has established so far.
   sawRequest: bool ## the server asked for credentials
@@ -46,13 +42,10 @@ proc foldFailures(
     else:
       nil
   if attempts.len > 0 and attempts.allIt(it of PgSecurityError):
-    (ref PgSecurityError)(
-      msg: msg, parent: parent, attempts: attempts, perHost: perHost
-    )
+    result = (ref PgSecurityError)(msg: msg, parent: parent, attempts: attempts)
   else:
-    (ref PgConnectionError)(
-      msg: msg, parent: parent, attempts: attempts, perHost: perHost
-    )
+    result = (ref PgConnectionError)(msg: msg, parent: parent, attempts: attempts)
+  result.setPerHost(perHost)
 
 const PreV3MaxErrLen = 30000 # libpq's MAX_ERRLEN
 
@@ -451,21 +444,9 @@ proc connectToHostImpl(
           except CatchableError:
             discard
           raise newException(PgConnectionError, e.msg, e)
-    conn = PgConnection(
-      transport: transport,
-      recvBuf: @[],
-      state: csConnecting,
-      serverParams: initTable[string, string](),
-      host: hostAddr,
-      port: hostPort,
-      cancelTarget: @[dialed.target],
-      config: config,
-      notifyMaxQueue: DefaultNotifyMaxQueue,
-      notifyMaxQueueBytes: DefaultNotifyMaxQueueBytes,
-      stmtCacheCapacity: 256,
-      listenReconnectMaxAttempts: 10,
-      listenReconnectMaxBackoff: 30,
-    )
+    conn = newPgConnection(hostAddr, hostPort, config)
+    conn.transport = transport
+    conn.cancelTarget = @[dialed.target]
   elif hasAsyncDispatch:
     let dialed = await dialing
     if reached != nil:
@@ -485,21 +466,9 @@ proc connectToHostImpl(
         except CatchableError as e:
           sock.close()
           raise e
-    conn = PgConnection(
-      socket: sock,
-      recvBuf: @[],
-      state: csConnecting,
-      serverParams: initTable[string, string](),
-      host: hostAddr,
-      port: hostPort,
-      cancelTarget: @[dialed.target],
-      config: config,
-      notifyMaxQueue: DefaultNotifyMaxQueue,
-      notifyMaxQueueBytes: DefaultNotifyMaxQueueBytes,
-      stmtCacheCapacity: 256,
-      listenReconnectMaxAttempts: 10,
-      listenReconnectMaxBackoff: 30,
-    )
+    conn = newPgConnection(hostAddr, hostPort, config)
+    conn.socket = sock
+    conn.cancelTarget = @[dialed.target]
 
   try:
     # SSL negotiation (before StartupMessage). Unix sockets skip it (libpq 17

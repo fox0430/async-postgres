@@ -24,9 +24,13 @@ task apiSurfaceWrite,
 task parseGuard, "check that stdlib text parsers are only called from the grammar layer":
   exec "nim c -r --hints:off tools/parse_guard.nim"
 
+task privateAccessGuard, "check that privateAccess is only used from tests":
+  exec "nim c -r --hints:off tools/private_access_guard.nim"
+
 task test, "test":
   apiSurfaceTask()
   parseGuardTask()
+  privateAccessGuardTask()
   exec "bash tests/gen_certs.sh"
   exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
   exec "nim c -d:asyncBackend=chronos -r tests/all_tests.nim"

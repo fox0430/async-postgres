@@ -13,11 +13,12 @@ import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_connection/notify {.all.}
 from ../async_postgres/pg_connection/buffer_io {.all.} import isTransientDial
-from ../async_postgres/pg_errors {.all.} import isTransientServerError
+from ../async_postgres/pg_errors {.all.} import isTransientServerError, setPerHost
 
 import std/importutils
 privateAccess(PgConnection)
-privateAccess(PgConnectionError)
+
+from ../async_postgres/pg_connection/lifecycle {.all.} import foldFailures
 
 import mock_pg_server
 
@@ -988,7 +989,10 @@ suite "isTransientError":
     (ref PgConnectionError)(msg: "sum", attempts: @attempts)
 
   proc hosts(attempts: varargs[ref CatchableError]): ref PgConnectionError =
-    (ref PgConnectionError)(msg: "hosts", attempts: @attempts, perHost: true)
+    # Through the setter, as `foldFailures` builds it: a direct `perHost: true`
+    # would bypass `setPerHost`, the only writer of the field.
+    result = (ref PgConnectionError)(msg: "hosts", attempts: @attempts)
+    result.setPerHost(true)
 
   test "a connection error is judged by what it records":
     check isTransientError((ref PgUnavailableError)(msg: "lost"))
@@ -1052,6 +1056,18 @@ suite "isTransientError":
     check not isTransientError(hosts(lost, refused))
     # A host's sslmode=allow legs still clear when either does.
     check isTransientError(hosts(summing(startingUp, noTls), lost))
+
+  test "connect's aggregate marks per-host failures through foldFailures":
+    # `foldFailures` is the only production writer of `perHost` (via
+    # `setPerHost`). The mix below separates its branches: `every` says no (the
+    # plain failure is unclassified), `any` would say yes (nothing refuses for
+    # good). Dropping the `setPerHost` call or breaking the setter flips this.
+    let lost = (ref PgUnavailableError)(msg: "lost")
+    let plain = (ref PgConnectionError)(msg: "Server does not support SSL")
+    let attempts: seq[ref CatchableError] =
+      @[(ref CatchableError)(lost), (ref CatchableError)(plain)]
+    let agg = foldFailures("hosts", attempts, perHost = true)
+    check not isTransientError(agg)
 
   test "timeouts are transient, other raw errors unclassified":
     check isTransientError((ref PgTimeoutError)(msg: "timeout"))

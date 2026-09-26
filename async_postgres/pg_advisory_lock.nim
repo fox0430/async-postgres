@@ -76,12 +76,10 @@
 ##   conn.withAdvisoryLock(42'i64):
 ##     echo "lock held here"
 
-import std/[macros, importutils]
+import std/macros
 
 import async_backend, pg_protocol, pg_types, pg_connection, pg_client
 import pg_connection/types
-
-privateAccess(PgConnection)
 
 # Internal body templates
 #

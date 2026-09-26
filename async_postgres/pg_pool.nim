@@ -1,10 +1,8 @@
-import std/[deques, macros, options, importutils]
+import std/[deques, macros, options]
 
 import async_backend, pg_protocol, pg_connection, pg_types, pg_client
 import pg_connection/[types, buffer_io, cache, simple_query, lifecycle]
 import pg_client/[transaction, pipeline]
-
-privateAccess(PgConnection)
 
 type
   PoolConfig* = object

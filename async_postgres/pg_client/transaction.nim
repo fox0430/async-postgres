@@ -9,9 +9,6 @@ import ../[async_backend, pg_protocol, pg_connection]
 import ../pg_connection/[types, simple_query]
 import ./core
 
-import std/importutils
-privateAccess(PgConnection)
-
 proc hasReturnStmt(n: NimNode): bool =
   ## Check whether an AST contains a `return` statement (excluding nested
   ## proc/func/method/iterator definitions where `return` is valid).

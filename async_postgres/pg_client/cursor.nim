@@ -9,9 +9,6 @@ import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, cache, simple_query, lifecycle]
 import ./core
 
-import std/importutils
-privateAccess(PgConnection)
-
 type Cursor* = ref object
   ## A server-side portal for incremental row fetching via `declareCursor`/`fetch`.
   ## Handle fields are private; use the `conn` / `fields` / `exhausted`

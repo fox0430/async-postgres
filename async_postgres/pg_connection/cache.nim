@@ -13,9 +13,6 @@ import std/[tables, lists]
 import ../[async_backend, pg_protocol]
 import types, buffer_io
 
-import std/importutils
-privateAccess(PgConnection)
-
 const stmtNamePrefix* = "_sc_"
 
 proc nextStmtName*(conn: PgConnection): string =

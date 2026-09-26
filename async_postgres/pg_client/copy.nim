@@ -9,9 +9,6 @@ import ../[async_backend, pg_protocol, pg_connection, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import ./core
 
-import std/importutils
-privateAccess(PgConnection)
-
 proc pollCopyInError(
     conn: PgConnection, watch: RecvWatch
 ): Future[ref PgQueryError] {.async.} =
