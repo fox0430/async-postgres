@@ -16,7 +16,7 @@ when defined(posix):
 
 import ../async_postgres/[async_backend, pg_replication]
 import ../async_postgres/pg_connection {.all.}
-import ../async_postgres/pg_connection/[buffer_io, types]
+import ../async_postgres/pg_connection/types
 
 import mock_pg_server
 
@@ -25,6 +25,7 @@ privateAccess(PgConnection)
 
 when hasChronos:
   from std/times import cpuTime
+  import ../async_postgres/pg_connection/buffer_io
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(

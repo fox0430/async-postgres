@@ -8,13 +8,16 @@ import std/[strutils, unittest]
 
 import ../async_postgres/[async_backend, pg_protocol, pg_replication]
 import ../async_postgres/pg_connection {.all.}
-import ../async_postgres/pg_connection/[types, simple_query]
-import ../async_postgres/pg_errors
+import ../async_postgres/pg_connection/[types]
 
 import mock_pg_server
 
 import std/importutils
 privateAccess(PgConnection)
+
+when hasChronos:
+  import ../async_postgres/pg_connection/simple_query
+  import ../async_postgres/pg_errors
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
