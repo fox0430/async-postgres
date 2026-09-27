@@ -1242,6 +1242,7 @@ suite "SSL negotiation - sslAllow":
   test "sslAllow connects without SSL when server accepts plaintext":
     var connState: PgConnState
     var connSslEnabled: bool
+    var connConfiguredSslMode: SslMode
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -1269,6 +1270,7 @@ suite "SSL negotiation - sslAllow":
       let conn = await connect(config)
       connState = conn.state
       connSslEnabled = conn.sslEnabled
+      connConfiguredSslMode = conn.config.sslMode
       await conn.close()
 
       await serverFut
@@ -1277,6 +1279,9 @@ suite "SSL negotiation - sslAllow":
     waitFor testBody()
     check connState == csReady
     check connSslEnabled == false
+    # A LISTEN reconnect dials `conn.config`: keep sslmode=allow so it still
+    # tries TLS (libpq `PQreset` parity).
+    check connConfiguredSslMode == sslAllow
 
   test "sslAllow attempts SSL after plaintext failure and reports both errors":
     var attemptCount: int = 0
