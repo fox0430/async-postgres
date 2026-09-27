@@ -1295,7 +1295,8 @@ proc finishStream(
       of rskLogical:
         "; PostgreSQL cannot restart logical replication on a connection that" &
           " already streamed (BUG #18754)"
-      of rskPhysical: "; no error explains it"
+      of rskPhysical:
+        "; no error explains it"
     raise newException(
       PgUnavailableError,
       kind.label & ": the server ended the stream without CopyDone" & cause &
