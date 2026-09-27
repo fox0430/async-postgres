@@ -1276,19 +1276,30 @@ proc finishStream(
   ## back unless a write that failed meanwhile left it dead.
   ##
   ## ``copyDoneSeen`` is false when ReadyForQuery arrives in the receive loop:
-  ## no server CopyDone and no error, i.e. a reused logical connection's end
-  ## (BUG #18754, the walsender does not reset its streaming flags). The
-  ## connection cannot stream logical replication again, so it is retired
-  ## (``csClosed``) and ``PgUnavailableError`` raised.
+  ## no server CopyDone and no error. On a logical stream that is a reused
+  ## connection's end (BUG #18754, the walsender does not reset its streaming
+  ## flags), so the connection cannot stream logical replication again. A
+  ## physical one does reset them, so no ordinary stream ends that way. Either
+  ## way the connection is retired (``csClosed``) and ``PgUnavailableError``
+  ## raised.
   await conn.awaitReplWritesIdle()
   conn.raiseIfStreamClosed(kind, queryError)
   if not copyDoneSeen and queryError == nil:
     conn.markClosed()
+    # Only a reused logical connection ends here: the logical walsender keeps
+    # its streaming flags across START_REPLICATION (BUG #18754). A physical
+    # walsender resets them, so no ordinary stream ends that way and there is
+    # no cause to name for it.
+    let cause =
+      case kind
+      of rskLogical:
+        "; PostgreSQL cannot restart logical replication on a connection that" &
+          " already streamed (BUG #18754)"
+      of rskPhysical: "; no error explains it"
     raise newException(
       PgUnavailableError,
-      kind.label & ": the server ended the stream without CopyDone; PostgreSQL cannot" &
-        " restart logical replication on a connection that already streamed" &
-        " (BUG #18754), reconnect to resume",
+      kind.label & ": the server ended the stream without CopyDone" & cause &
+        ", reconnect to resume",
     )
   conn.txStatus = txStatus
   conn.markReady()
@@ -1665,7 +1676,8 @@ proc startPhysicalReplication*(
   ## exception or any other mid-stream failure poisons the connection (marked
   ## closed) and propagates, so reconnect and resume from the last LSN tracked.
   ## A ReadyForQuery without ``CopyDone`` retires the connection and raises
-  ## ``PgUnavailableError`` too.
+  ## ``PgUnavailableError`` too, with no cause named: a physical walsender does
+  ## reset its streaming flags, so no ordinary stream ends that way.
   ##
   ## ``slotName = ""`` streams without a slot. Non-zero ``timeline`` is sent as
   ## ``TIMELINE n`` (negative raises ``ValueError``). ``statusInterval`` behaves

@@ -182,3 +182,4 @@ suite "Replication: end without CopyDone":
     check not callbackRan
     check restartMessage.startsWith("physical replication: ")
     check "without CopyDone" in restartMessage
+    check "logical" notin restartMessage
