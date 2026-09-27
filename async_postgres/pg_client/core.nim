@@ -461,26 +461,26 @@ template sendExtendedQuery*(
     effectiveResultFormats =
       if resultFormats.len == 0: cached.resultFormats else: resultFormats
     bindStep
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
+    conn.addExecute("", 0)
+    conn.addSync()
   elif conn.stmtCachingEnabled:
     cacheMiss = true
     stmtName = conn.nextStmtName()
     effectiveResultFormats = resultFormats
-    conn.evictForInsert(conn.sendBuf)
+    conn.evictForInsert()
     parseStep
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.addDescribe(dkStatement, stmtName)
     bindStep
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
+    conn.addExecute("", 0)
+    conn.addSync()
   else:
     stmtName = ""
     effectiveResultFormats = resultFormats
     parseStep
     bindStep
-    conn.sendBuf.addDescribe(dkPortal, "")
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
+    conn.addDescribe(dkPortal, "")
+    conn.addExecute("", 0)
+    conn.addSync()
 
 template sendExtendedExec*(
     conn: PgConnection,
@@ -495,23 +495,23 @@ template sendExtendedExec*(
   if cacheHit:
     stmtName = cached.name
     bindStep
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
+    conn.addExecute("", 0)
+    conn.addSync()
   elif conn.stmtCachingEnabled:
     cacheMiss = true
     stmtName = conn.nextStmtName()
-    conn.evictForInsert(conn.sendBuf)
+    conn.evictForInsert()
     parseStep
-    conn.sendBuf.addDescribe(dkStatement, stmtName)
+    conn.addDescribe(dkStatement, stmtName)
     bindStep
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
+    conn.addExecute("", 0)
+    conn.addSync()
   else:
     stmtName = ""
     parseStep
     bindStep
-    conn.sendBuf.addExecute("", 0)
-    conn.sendBuf.addSync()
+    conn.addExecute("", 0)
+    conn.addSync()
 
 template queryRecvLoop*(
     conn: PgConnection,

@@ -35,8 +35,8 @@ proc execImpl*(
     cacheHit = cacheHit,
     cacheMiss = cacheMiss,
     stmtName = stmtName,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep = conn.sendBuf.addBind("", stmtName, paramFormats, params),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep = conn.addBind("", stmtName, paramFormats, params),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -64,8 +64,8 @@ proc execImpl*(
     cacheHit = cacheHit,
     cacheMiss = cacheMiss,
     stmtName = stmtName,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
-    bindStep = conn.sendBuf.addBind("", stmtName, params),
+    parseStep = conn.addParse(stmtName, sql, params),
+    bindStep = conn.addBind("", stmtName, params),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -127,8 +127,8 @@ proc execInlineImpl*(
     cacheHit = cacheHit,
     cacheMiss = cacheMiss,
     stmtName = stmtName,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep = conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep = conn.addBindRaw("", stmtName, paramFormats, data, ranges),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()

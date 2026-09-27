@@ -166,7 +166,19 @@ async_postgres/pg_connection/types.nim	`port=`
 async_postgres/pg_connection/types.nim	`serverParams=`
 async_postgres/pg_connection/types.nim	`sslEnabled=`
 async_postgres/pg_connection/types.nim	`txStatus=`
+async_postgres/pg_connection/types.nim	addBind
+async_postgres/pg_connection/types.nim	addBind#2
+async_postgres/pg_connection/types.nim	addBindDirect
+async_postgres/pg_connection/types.nim	addBindRaw
+async_postgres/pg_connection/types.nim	addClose
+async_postgres/pg_connection/types.nim	addDescribe
+async_postgres/pg_connection/types.nim	addExecute
+async_postgres/pg_connection/types.nim	addFlush
+async_postgres/pg_connection/types.nim	addParse
+async_postgres/pg_connection/types.nim	addParse#2
+async_postgres/pg_connection/types.nim	addParseDirect
 async_postgres/pg_connection/types.nim	addStmtCache
+async_postgres/pg_connection/types.nim	addSync
 async_postgres/pg_connection/types.nim	adoptRecvBuf
 async_postgres/pg_connection/types.nim	appendCopyData
 async_postgres/pg_connection/types.nim	appendCopyDone
@@ -207,6 +219,7 @@ async_postgres/pg_connection/types.nim	effectiveMaxScramIterations
 async_postgres/pg_connection/types.nim	enqueueNotification
 async_postgres/pg_connection/types.nim	errorSeverity
 async_postgres/pg_connection/types.nim	evictForInsert
+async_postgres/pg_connection/types.nim	evictForInsert#2
 async_postgres/pg_connection/types.nim	evictStmtCache
 async_postgres/pg_connection/types.nim	failNotifyWaiter
 async_postgres/pg_connection/types.nim	failQueuedReplWrites
@@ -316,7 +329,9 @@ async_postgres/pg_connection/types.nim	settlePendingSync
 async_postgres/pg_connection/types.nim	settleReplWrite
 async_postgres/pg_connection/types.nim	socket
 async_postgres/pg_connection/types.nim	stageEvictedClose
+async_postgres/pg_connection/types.nim	stageEvictedClose#2
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses
+async_postgres/pg_connection/types.nim	stagePendingStmtCloses#2
 async_postgres/pg_connection/types.nim	stmtCacheSize
 async_postgres/pg_connection/types.nim	stmtCachingEnabled
 async_postgres/pg_connection/types.nim	stmtNamePrefix

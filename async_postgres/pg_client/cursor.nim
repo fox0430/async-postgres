@@ -192,8 +192,8 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   var rowCount: int32 = 0
 
   conn.beginSendBuf()
-  conn.sendBuf.addExecute(cursor.portalName, cursor.chunkSize)
-  conn.sendBuf.addFlush()
+  conn.addExecute(cursor.portalName, cursor.chunkSize)
+  conn.addFlush()
   await conn.sendStagedBufMsg()
 
   block recvLoop:

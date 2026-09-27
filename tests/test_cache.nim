@@ -116,10 +116,74 @@ suite "stmt cache LRU":
 
   test "beginSendBuf clears then stages owed Closes":
     let conn = mockConn(1)
-    conn.sendBuf = @[1'u8, 2, 3]
+    conn.addSync() # stale bytes from an aborted build
     conn.pendingStmtCloses = @["_sc_owed"]
     conn.beginSendBuf()
     check conn.sendBuf.len > 0
     check conn.sendBuf[0] == byte('C')
     check conn.stagedStmtCloses == @["_sc_owed"]
     check conn.pendingStmtCloses.len == 0
+
+suite "conn-level staging equals the two-argument form":
+  ## The single-argument staging helpers must write the same bytes and move
+  ## the same names as the two-argument forms they delegate to. Each test runs
+  ## both forms from identical state and compares bytes and bookkeeping.
+
+  test "stagePendingStmtCloses writes the same Closes and moves the same names":
+    var oneArg = mockConn(1)
+    oneArg.pendingStmtCloses = @["_sc_1", "_sc_2"]
+    oneArg.stagePendingStmtCloses()
+
+    var twoArg = mockConn(1)
+    twoArg.pendingStmtCloses = @["_sc_1", "_sc_2"]
+    var buf: seq[byte]
+    twoArg.stagePendingStmtCloses(buf)
+
+    var expected: seq[byte]
+    expected.addClose(dkStatement, "_sc_1")
+    expected.addClose(dkStatement, "_sc_2")
+    check twoArg.sendBuf.len == 0
+    check buf == expected
+    check oneArg.sendBuf == buf
+    check oneArg.stagedStmtCloses == twoArg.stagedStmtCloses
+    check oneArg.stagedStmtCloses == @["_sc_1", "_sc_2"]
+    check oneArg.pendingStmtCloses == twoArg.pendingStmtCloses
+    check oneArg.pendingStmtCloses.len == 0
+
+  test "stageEvictedClose writes the same Close and stages the same name":
+    var oneArg = mockConn(1)
+    oneArg.beginSendBuf()
+    oneArg.stageEvictedClose("_sc_evict")
+
+    var twoArg = mockConn(1)
+    twoArg.beginSendBuf()
+    var buf: seq[byte]
+    twoArg.stageEvictedClose(buf, "_sc_evict")
+
+    var expected: seq[byte]
+    expected.addClose(dkStatement, "_sc_evict")
+    check buf == expected
+    check oneArg.sendBuf == buf
+    check oneArg.stagedStmtCloses == twoArg.stagedStmtCloses
+    check oneArg.stagedStmtCloses == @["_sc_evict"]
+
+  test "evictForInsert evicts the same entry and stages the same Close":
+    var oneArg = mockConn(1)
+    oneArg.addStmtCache("a", cached("_sc_a"))
+    oneArg.beginSendBuf()
+    oneArg.evictForInsert()
+
+    var twoArg = mockConn(1)
+    twoArg.addStmtCache("a", cached("_sc_a"))
+    twoArg.beginSendBuf()
+    var buf: seq[byte]
+    twoArg.evictForInsert(buf)
+
+    var expected: seq[byte]
+    expected.addClose(dkStatement, "_sc_a")
+    check buf == expected
+    check oneArg.sendBuf == buf
+    check oneArg.stagedStmtCloses == twoArg.stagedStmtCloses
+    check oneArg.stagedStmtCloses == @["_sc_a"]
+    check oneArg.lookupStmtCache("a").isNil
+    check twoArg.lookupStmtCache("a").isNil

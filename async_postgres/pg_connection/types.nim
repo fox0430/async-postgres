@@ -4,11 +4,12 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[tables, sets, deques, lists, options]
+import std/[tables, sets, deques, lists, macros, options]
 when defined(posix):
   import std/posix
 
 import ../[async_backend, pg_auth, pg_errors, pg_protocol, pg_types]
+import ../pg_types/encoding
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -1136,8 +1137,15 @@ proc `listenError=`*(conn: PgConnection, value: ref PgListenError) {.inline.} =
 proc `txStatus=`*(conn: PgConnection, value: TransactionStatus) {.inline.} =
   conn.txStatus = value
 
-proc sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
-  ## Send buffer for `queryDirect` / `execDirect` (via `bindSym`).
+func sendBuf*(conn: PgConnection): lent seq[byte] {.inline.} =
+  ## Read-only view of the send buffer: raw sends read it, and the message
+  ## builders below append to it. Nothing outside this module gets a mutable
+  ## view, so no caller can splice bytes in behind the staging bookkeeping.
+  conn.sendBuf
+
+proc sendBufVar(conn: PgConnection): var seq[byte] {.inline.} =
+  ## Mutable view for this module's direct-encoding macros (``sendBuf`` is
+  ## read-only, and a macro cannot emit a field access into caller scope).
   conn.sendBuf
 
 proc clearSendBuf*(conn: PgConnection) {.inline.} =
@@ -1153,6 +1161,115 @@ proc appendCopyData*(conn: PgConnection, data: openArray[byte]) {.inline.} =
 
 proc appendCopyDone*(conn: PgConnection) {.inline.} =
   conn.sendBuf.addCopyDone()
+
+# Extended Query assembly
+#
+# The builders append to the connection's own send buffer, so no caller needs
+# a mutable view of it. The buffer moves as one unit with the staged-Close
+# bookkeeping: `beginSendBuf` empties and stages, the builders append, and the
+# staged names drop only once the bytes are on the wire.
+
+proc addParse*(
+    conn: PgConnection,
+    stmtName: string,
+    sql: string,
+    paramTypeOids: openArray[int32] = [],
+) {.inline.} =
+  ## Append a Parse message to the send buffer.
+  conn.sendBuf.addParse(stmtName, sql, paramTypeOids)
+
+proc addParse*(
+    conn: PgConnection, stmtName: string, sql: string, params: openArray[PgParam]
+) {.inline.} =
+  ## Append a Parse message to the send buffer, taking the parameter OIDs from
+  ## ``params`` without reshaping them into a ``seq[int32]``.
+  conn.sendBuf.addParse(stmtName, sql, params)
+
+proc addBind*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    paramFormats: openArray[int16],
+    paramValues: openArray[Option[seq[byte]]],
+    resultFormats: openArray[int16] = [],
+) {.inline.} =
+  ## Append a Bind message to the send buffer.
+  conn.sendBuf.addBind(portalName, stmtName, paramFormats, paramValues, resultFormats)
+
+proc addBind*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    params: openArray[PgParam],
+    resultFormats: openArray[int16] = [],
+) {.inline.} =
+  ## Append a Bind message to the send buffer, writing straight out of
+  ## ``params`` instead of flattening them into values and formats.
+  conn.sendBuf.addBind(portalName, stmtName, params, resultFormats)
+
+proc addBindRaw*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    paramFormats: openArray[int16],
+    paramData: openArray[byte],
+    paramRanges: openArray[tuple[off: int32, len: int32]],
+    resultFormats: openArray[int16] = [],
+) {.inline.} =
+  ## Append a Bind message built from raw parameter bytes and ranges.
+  conn.sendBuf.addBindRaw(
+    portalName, stmtName, paramFormats, paramData, paramRanges, resultFormats
+  )
+
+proc addDescribe*(conn: PgConnection, kind: DescribeKind, name: string) {.inline.} =
+  ## Append a Describe message to the send buffer.
+  conn.sendBuf.addDescribe(kind, name)
+
+proc addExecute*(
+    conn: PgConnection, portalName: string, maxRows: int32 = 0
+) {.inline.} =
+  ## Append an Execute message to the send buffer.
+  conn.sendBuf.addExecute(portalName, maxRows)
+
+proc addClose*(conn: PgConnection, kind: DescribeKind, name: string) {.inline.} =
+  ## Append a Close message to the send buffer.
+  conn.sendBuf.addClose(kind, name)
+
+proc addSync*(conn: PgConnection) {.inline.} =
+  ## Append a Sync message to the send buffer.
+  conn.sendBuf.addSync()
+
+proc addFlush*(conn: PgConnection) {.inline.} =
+  ## Append a Flush message to the send buffer.
+  conn.sendBuf.addFlush()
+
+macro addParseDirect*(
+    conn: PgConnection, stmtName: string, sql: string, args: varargs[untyped]
+): untyped =
+  ## Connection-level form of ``pg_types/encoding.addParseDirect``: encodes the
+  ## Parse straight into the send buffer, with parameter OIDs taken from the
+  ## argument types. The operand rules are the encoding macro's.
+  let inner = bindSym"addParseDirect"
+  result = newCall(inner, newCall(bindSym"sendBufVar", conn), stmtName, sql)
+  for arg in args:
+    result.add(arg)
+
+macro addBindDirect*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    resultFormats: untyped,
+    args: varargs[untyped],
+): untyped =
+  ## Connection-level form of ``pg_types/encoding.addBindDirect``: encodes the
+  ## Bind straight into the send buffer with per-argument format codes and no
+  ## intermediate ``seq[byte]``. The operand rules are the encoding macro's.
+  let inner = bindSym"addBindDirect"
+  result = newCall(
+    inner, newCall(bindSym"sendBufVar", conn), portalName, stmtName, resultFormats
+  )
+  for arg in args:
+    result.add(arg)
 
 proc nextPortalName*(conn: PgConnection, prefix: string): string =
   ## Fresh portal/savepoint name; owns counter so macro scope stays sealed.
@@ -1590,6 +1707,12 @@ proc stagePendingStmtCloses*(conn: PgConnection, buf: var seq[byte]) =
   conn.stagedStmtCloses = move(conn.pendingStmtCloses)
   conn.markStaged()
 
+proc stagePendingStmtCloses*(conn: PgConnection) {.inline.} =
+  ## Stage every owed statement ``Close`` into the connection's own send
+  ## buffer (the assembly path; the two-argument form serves callers building
+  ## a separate batch).
+  conn.stagePendingStmtCloses(conn.sendBuf)
+
 proc stageEvictedClose*(conn: PgConnection, buf: var seq[byte], name: string) =
   ## Stage the ``Close`` for a statement the build itself evicted. Staged, not
   ## queued: the cache no longer remembers the name, and an aborted build
@@ -1597,6 +1720,12 @@ proc stageEvictedClose*(conn: PgConnection, buf: var seq[byte], name: string) =
   conn.requireStaged("staging an eviction Close")
   conn.stagedStmtCloses.add name
   buf.addClose(dkStatement, name)
+
+proc stageEvictedClose*(conn: PgConnection, name: string) {.inline.} =
+  ## Stage the ``Close`` for one evicted statement into the connection's own
+  ## send buffer. Staged, not queued: the cache no longer remembers the name,
+  ## and an aborted build leaves staged names owed just as the queue would.
+  conn.stageEvictedClose(conn.sendBuf, name)
 
 proc dropStagedStmtCloses*(conn: PgConnection) =
   ## Forget the names whose ``Close`` is now on the wire. Names queued since the
@@ -1619,6 +1748,11 @@ proc evictForInsert*(conn: PgConnection, buf: var seq[byte]) =
     return
   let evicted = conn.evictStmtCache()
   conn.stageEvictedClose(buf, evicted.name)
+
+proc evictForInsert*(conn: PgConnection) {.inline.} =
+  ## Make room for one more cache entry, staging the evicted ``Close`` into the
+  ## connection's own send buffer.
+  conn.evictForInsert(conn.sendBuf)
 
 proc stmtCachingEnabled*(conn: PgConnection): bool {.inline.} =
   ## Whether prepared statements are cached on this connection.

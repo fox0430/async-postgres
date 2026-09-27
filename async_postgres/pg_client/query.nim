@@ -52,9 +52,8 @@ proc queryImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep =
-      conn.sendBuf.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep = conn.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -100,8 +99,8 @@ proc queryImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
-    bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
+    parseStep = conn.addParse(stmtName, sql, params),
+    bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -148,8 +147,8 @@ proc queryEachImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
-    bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
+    parseStep = conn.addParse(stmtName, sql, params),
+    bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -264,10 +263,9 @@ proc queryInlineImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep = conn.sendBuf.addBindRaw(
-      "", stmtName, paramFormats, data, ranges, effectiveResultFormats
-    ),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep =
+      conn.addBindRaw("", stmtName, paramFormats, data, ranges, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
