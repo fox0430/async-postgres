@@ -15,7 +15,7 @@
 ##       options = {"proto_version": "1", "publication_names": "my_pub"},
 ##       callback = myCallback)
 
-import std/[deques, strutils, tables, times, options]
+import std/[strutils, tables, times, options]
 
 import async_backend, pg_protocol, pg_connection, pg_types
 from pg_types/core import isPgUIntText, pgParseHexUInt32, pgParseIntView, pipOk
@@ -794,20 +794,6 @@ proc parseReplicationMessage*(copyData: sink seq[byte]): ReplicationMessage =
   else:
     raise newException(PgProtocolError, "Unknown replication message type: " & kind)
 
-proc replClosedError(conn: PgConnection, msg = "Connection is closed"): ref PgError =
-  ## ``raiseClosedConnection``'s error, or nil while open, keeping the
-  ## replication write that killed the connection as the cause.
-  case conn.closedReason
-  of crOpen:
-    nil
-  of crClosedByUser:
-    (ref PgStateError)(
-      msg: closedByUserMsg,
-      parent: newException(PgConnectionError, msg, conn.replWriteFailure),
-    )
-  of crClosed:
-    conn.newClosedError(msg, conn.replWriteFailure)
-
 proc checkReplicating(conn: PgConnection, op: string) =
   ## ``csReplicating`` guard for a mid-stream operation. A connection the
   ## application closed itself, or one simply never put into a stream, is a
@@ -834,53 +820,9 @@ const StandbyStatusLen = 1 + 8 + 8 + 8 + 8 + 1
 # Whether the client's CopyDone is out and which positions a caller reported are
 # settled when queued, so concurrent callers cannot interleave or undercut each
 # other. Cancelling a caller only ends its wait; its frame still goes out whole.
-
-proc replWriteError(conn: PgConnection): ref CatchableError =
-  ## A fresh error per waiter of a write that did not make it: one raised
-  ## exception cannot be shared between futures.
-  result = conn.replClosedError()
-  if result == nil:
-    result = newException(
-      PgStateError, "the replication stream ended before this write",
-      conn.replWriteFailure,
-    )
-
-proc settle(conn: PgConnection, w: ReplWrite, ok: bool) =
-  w.state = if ok: rwWritten else: rwFailed
-  for fut in w.waiters:
-    if fut.finished: # the caller cancelled its wait
-      continue
-    if ok:
-      fut.complete()
-    else:
-      fut.fail(conn.replWriteError())
-  w.waiters.setLen(0)
-
-proc failQueuedReplWrites(conn: PgConnection) =
-  ## Fail every write not yet started. The one being written settles itself.
-  conn.replPendingStatus = nil
-  while conn.replWrites.len > 0:
-    conn.settle(conn.replWrites.popFirst(), ok = false)
-  for w in [conn.replFinalStatus, conn.replCopyDone]:
-    if w != nil and w.state == rwQueued:
-      conn.settle(w, ok = false)
-
-proc closeReplWrites(conn: PgConnection) =
-  ## The stream is ending: accept no more writes and fail those not started.
-  conn.replWritesOpen = false
-  conn.failQueuedReplWrites()
-
-proc nextReplWrite(conn: PgConnection): ReplWrite =
-  ## The queue in order, then the stop's final status and CopyDone, so nothing
-  ## queued before the final status is encoded can land after CopyDone.
-  if conn.replWrites.len > 0:
-    return conn.replWrites.popFirst()
-  for w in [conn.replFinalStatus, conn.replCopyDone]:
-    if w != nil and w.state == rwQueued:
-      if w == conn.replFinalStatus and conn.replInCallback:
-        # The running callback may still confirm a position for it.
-        return nil
-      return w
+#
+# The queue bookkeeping lives in `pg_connection/types` with the private fields
+# it owns; this module keeps the drain loop and the stream loop.
 
 proc encodeStatus(
     receiveLsn, flushLsn, applyLsn: Lsn, replyRequested: bool
@@ -920,12 +862,10 @@ proc flushReplWrites(conn: PgConnection) {.async.} =
       w = conn.nextReplWrite()
       if w == nil:
         break
-      if w == conn.replPendingStatus:
-        conn.replPendingStatus = nil
       w.state = rwWriting
       if conn.state != csReplicating or conn.closedReason != crOpen:
         # Nothing was written, so the transport is left alone.
-        conn.settle(w, ok = false)
+        conn.settleReplWrite(w, ok = false)
         conn.failQueuedReplWrites()
         return
       if w.frame.len > 0:
@@ -934,16 +874,16 @@ proc flushReplWrites(conn: PgConnection) {.async.} =
         # The library's status carries the positions current when it goes
         # out. Counted as sent from here: a failed write ends the stream.
         let (msg, flush) = conn.encodeConfirmedStatus()
-        conn.replSentFlushRaw = flush
+        conn.noteReplSentFlush(flush)
         await conn.sendMsg(msg)
-      conn.settle(w, ok = true)
+      conn.settleReplWrite(w, ok = true)
   except CatchableError as e:
     # A failed write (sendMsg has marked the connection closed, possibly
     # mid-frame) or anything unexpected: the wire can no longer be trusted.
     # Retire the connection and settle every waiter. chronos: drop the socket
     # so the recv loop ends too. asyncdispatch: closing would unregister the
     # pending read and strand the recv loop.
-    conn.replWriteFailure = e
+    conn.noteReplWriteFailure(e)
     conn.markClosed()
     when hasChronos:
       try:
@@ -951,51 +891,20 @@ proc flushReplWrites(conn: PgConnection) {.async.} =
       except CatchableError:
         discard
     if w != nil and w.state == rwWriting:
-      conn.settle(w, ok = false)
+      conn.settleReplWrite(w, ok = false)
     conn.closeReplWrites()
-
-proc waitReplWrite(w: ReplWrite): Future[void] =
-  result = newFuture[void]("replWrite")
-  w.waiters.add(result)
 
 proc startFlush(conn: PgConnection) =
   ## Drain ``replWrites`` unless a task already does. Waiters go on before
   ## this: the flush may finish an entry without suspending.
-  if conn.replFlusher == nil or conn.replFlusher.finished:
-    conn.replFlusher = conn.flushReplWrites()
-
-proc tailPendingStatus(conn: PgConnection): ReplWrite =
-  ## The library's status still queued at the tail, or nil. It is encoded when
-  ## written, so it already carries anything newer and can stand for another.
-  let pending = conn.replPendingStatus
-  if pending != nil and conn.replWrites.peekLast == pending:
-    return pending
-
-proc queueConfirmedStatus(conn: PgConnection): ReplWrite =
-  ## Queue the library's status, or share the one at the tail.
-  result = conn.tailPendingStatus()
-  if result != nil:
-    return
-  result = ReplWrite()
-  conn.replWrites.addLast(result)
-  conn.replPendingStatus = result
-
-proc canStillReport(conn: PgConnection): bool =
-  ## Whether a position recorded now still reaches the server: always before
-  ## the client's stop, then only until the stop's final status is encoded,
-  ## which waits for a running callback to return.
-  conn.replWritesOpen and
-    (conn.replCopyDone == nil or conn.replFinalStatus.state == rwQueued)
-
-proc confirmReportable(conn: PgConnection, lsn: uint64): bool =
-  ## ``confirmReplFlushed`` while the position can still reach the server.
-  conn.canStillReport() and conn.confirmReplFlushed(lsn)
+  if conn.replFlusherIdle():
+    conn.setReplFlusher(conn.flushReplWrites())
 
 proc awaitReplWritesIdle(conn: PgConnection) {.async.} =
   ## Close the stream to writes and wait out the one being written, so no
   ## replication frame is still going out once the connection is handed back.
   conn.closeReplWrites()
-  while (let flusher = conn.replFlusher; flusher != nil and not flusher.finished):
+  while (let flusher = conn.replFlusher(); flusher != nil and not flusher.finished):
     # chronos: a cancel of this wait must not cancel the write mid-frame.
     when hasChronos:
       await flusher.join()
@@ -1012,9 +921,9 @@ proc queueCallerCopyData(
   ## now so later library statuses never go below it. Dropped rather than
   ## raised once the stop's final status is encoded: raising would end the
   ## stream for a callback acking a message from before the stop.
-  if not conn.replWritesOpen:
+  if not conn.replWritesOpen():
     raise newException(PgStateError, op & ": the replication stream has ended")
-  if not conn.canStillReport():
+  if not conn.replCanStillReport():
     result = newFuture[void]("replWriteDropped")
     result.complete()
     return
@@ -1023,7 +932,7 @@ proc queueCallerCopyData(
     conn.noteReplReported(r.receive, r.flush, r.apply)
   let w = ReplWrite(frame: frame)
   result = w.waitReplWrite()
-  conn.replWrites.addLast(w)
+  conn.replQueueWrite(w)
   conn.startFlush()
 
 proc sendCopyData*(conn: PgConnection, data: openArray[byte]): Future[void] =
@@ -1108,16 +1017,16 @@ proc confirmFlushed*(conn: PgConnection, lsn: Lsn): bool =
   # the readily-available ``walEnd`` — throw out of the callback and strand the
   # connection in ``csReplicating``. The raw helper in pg_connection/types
   # performs the clamp and the monotonic advance in one place.
-  return conn.confirmReportable(lsn.toUInt64)
+  return conn.confirmReplReportable(lsn.toUInt64)
 
 proc sendConfirmedStatus(conn: PgConnection): Future[bool] {.async.} =
   ## Queue the library's status and wait for it. False, sending nothing, once
   ## the client's CopyDone is queued. Raises ``PgStateError`` outside an active
   ## replication stream.
   conn.checkReplicating("sendConfirmedStatus")
-  if conn.replCopyDone != nil or not conn.replWritesOpen:
+  if conn.replCopyDoneQueued() or not conn.replWritesOpen():
     return false
-  let fut = conn.queueConfirmedStatus().waitReplWrite()
+  let fut = conn.queueReplStatus().waitReplWrite()
   conn.startFlush()
   await fut
   return true
@@ -1126,22 +1035,13 @@ proc stopStream(conn: PgConnection): Future[void] =
   ## Queue the client's end of the stream: a last status, then CopyDone. Once
   ## it is queued, a later stop waits on that same CopyDone and shares its
   ## outcome.
-  let copyDone = conn.replCopyDone
+  let copyDone = conn.replCopyDone()
   if copyDone == nil:
-    if not conn.replWritesOpen:
+    if not conn.replWritesOpen():
       result = newFuture[void]("replStopEnded")
       result.fail(newException(PgStateError, "the replication stream has ended"))
       return
-    # A library status still queued at the tail becomes the final one.
-    let pending = conn.tailPendingStatus()
-    if pending != nil:
-      discard conn.replWrites.popLast()
-      conn.replPendingStatus = nil
-      conn.replFinalStatus = pending
-    else:
-      conn.replFinalStatus = ReplWrite()
-    let copyDone = ReplWrite(frame: @copyDoneMsg)
-    conn.replCopyDone = copyDone
+    let copyDone = conn.replQueueStop()
     # A failed status fails the CopyDone behind it, which reports it.
     result = copyDone.waitReplWrite()
     conn.startFlush()
@@ -1166,17 +1066,7 @@ proc resetReplLsnTracking(
   ## ``XLogData`` (and, on a logical stream, ``PrimaryKeepalive``) arrives and
   ## bounds what ``confirmFlushed`` will accept.
   conn.initReplLsnTracking(startLsn.toUInt64)
-  conn.replFinalStatus = nil
-  conn.replWriteFailure = nil
-  conn.replPendingStatus = nil
-  conn.replCopyDone = nil
-  conn.replWritesOpen = true
-  conn.replAutoConfirm = autoConfirm
-  conn.replInTxn = false
-  conn.replInCallback = false
-  # What the server already holds, not startLsn: autoConfirm reports anything
-  # above it, a start ahead of the slot included.
-  conn.replSentFlushRaw = serverFlush.toUInt64
+  conn.replResetStream(autoConfirm, serverFlush.toUInt64)
 
 proc replFillRecvBuf(
     conn: PgConnection,
@@ -1318,10 +1208,10 @@ proc handleReplicationData(
       of rskLogical: replMsg.xlogData.startLsn
       of rskPhysical: replMsg.xlogData.receivedEndLsn
     discard conn.updateReplMaxReceivedLsn(received.toUInt64)
-    if conn.replAutoConfirm and replMsg.xlogData.data.len > 0:
+    if conn.replAutoConfirm() and replMsg.xlogData.data.len > 0:
       case char(replMsg.xlogData.data[0])
       of 'B':
-        conn.replInTxn = true
+        conn.replEnterTxn()
       of 'C':
         # A short frame is left for the callback's own parse to reject.
         sawCommit = true
@@ -1334,30 +1224,31 @@ proc handleReplicationData(
     # before it was already streamed. Physical keeps the byte-exact XLogData bound.
     if kind == rskLogical:
       discard conn.updateReplMaxReceivedLsn(replMsg.keepalive.walEnd.toUInt64)
-    if conn.replAutoConfirm and not conn.replInTxn:
+    if conn.replAutoConfirm() and not conn.replInTxn():
       # Everything before it is processed; pgoutput reports skipped
       # transactions only through walEnd.
-      discard conn.confirmReportable(replMsg.keepalive.walEnd.toUInt64)
+      discard conn.confirmReplReportable(replMsg.keepalive.walEnd.toUInt64)
     if autoKeepaliveReply and replMsg.keepalive.replyRequested:
       if await sendConfirmedStatus(conn):
         newLastStatusSent = Moment.now()
-    elif conn.replAutoConfirm and not conn.replInTxn and conn.replPendingStatus == nil and
-        conn.replConfirmedFlushLsn() >
-        max(conn.replSentFlushRaw, conn.replReported.flush):
+    elif conn.replAutoConfirm() and not conn.replInTxn() and
+        not conn.replPendingStatusQueued() and
+        conn.replConfirmedFlushLsn() > max(
+          conn.replSentFlush(), conn.replReported.flush
+        ):
       # Report a confirmation the server has not heard yet. Awaited so a failed
       # write surfaces here; asyncdispatch's recv loop would miss it until more data.
       if await sendConfirmedStatus(conn):
         newLastStatusSent = Moment.now()
-  conn.replInCallback = true
+  conn.setReplInCallback(true)
   try:
     await callback(replMsg)
     if sawCommit:
-      conn.replInTxn = false
-      discard conn.confirmReportable(commitEnd.toUInt64)
+      conn.replExitTxn()
+      discard conn.confirmReplReportable(commitEnd.toUInt64)
   finally:
-    conn.replInCallback = false
-  if conn.replFinalStatus != nil and conn.replFinalStatus.state == rwQueued and
-      conn.replWritesOpen:
+    conn.setReplInCallback(false)
+  if conn.replStopStatusQueued():
     # A stop held back while the callback ran goes out now.
     conn.startFlush()
   return newLastStatusSent
@@ -1508,7 +1399,7 @@ proc runReplicationStream(
         # chronos: a failed write drops the socket, so the read fails next;
         # name the write as the cause.
         if e.parent == nil:
-          e.parent = conn.replWriteFailure
+          e.parent = conn.replWriteFailure()
         raise e
       lastStatusSent = await conn.maybeSendPeriodicStatus(
         autoKeepaliveReply, statusInterval, lastStatusSent
@@ -1732,7 +1623,7 @@ proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
   ## rather than calling ``close()`` right after, or the stop may never go out.
   conn.checkReplicating("stopReplication")
   let stopped = conn.stopStream()
-  if conn.replInCallback and not stopped.finished:
+  if conn.replInCallback() and not stopped.finished:
     # Waiting would deadlock when the caller is the callback itself.
     return
   await stopped

@@ -257,8 +257,7 @@ proc invalidateWire(conn: PgConnection, releaseTransport: bool, reuseIfSettled =
   else:
     # Only the first frame to claim the outstanding replies may dial, or every
     # frame the cancellation passes through opens its own socket for one query.
-    conn.pendingSyncs = 0
-    conn.unsyncedWrite = false
+    conn.clearWireDebt()
     conn.cancelNoWait()
   conn.markClosed()
   if releaseTransport:

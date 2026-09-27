@@ -3,10 +3,10 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[deques, options, sets]
+import std/[options, sets]
 
 import ../[async_backend, pg_errors, pg_protocol]
-import types, buffer_io, cache, simple_query, lifecycle
+import types, buffer_io, simple_query, lifecycle
 
 when hasChronos:
   import chronos/streams/tlsstream
@@ -88,8 +88,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
 
   conn.sslEnabled = newConn.sslEnabled
   conn.serverCertDer = newConn.serverCertDer
-  conn.recvBuf = newConn.recvBuf
-  conn.recvBufStart = newConn.recvBufStart
+  conn.adoptRecvBuf(newConn)
   conn.host = newConn.host
   conn.port = newConn.port
   conn.cancelTarget = newConn.cancelTarget
@@ -553,9 +552,7 @@ proc reclaimStaleWaiter(conn: PgConnection) =
   ## Drop a finished waiter's registration and put back its unclaimed handoff.
   # A waiter that never resumes would otherwise strand the notification in
   # ``notifyHandoff`` and block every later waiter.
-  if conn.notifyWaiter != nil and conn.notifyWaiter.finished:
-    conn.notifyWaiter = nil
-    conn.reclaimHandoff()
+  conn.reclaimStaleNotifyWaiter()
 
 proc checkListenAlive(conn: PgConnection) =
   ## Raise if pump died or closed (``closedByUser`` > ``listenError`` >
@@ -586,14 +583,14 @@ proc waitNotification*(
   # Ahead of the queue: the reclaimed handoff is older than anything queued, so
   # serving the queue first would invert NOTIFY delivery order.
   conn.reclaimStaleWaiter()
-  if conn.notifyWaiter != nil:
+  if conn.hasNotifyWaiter():
     raise newException(PgStateError, "Another waitNotification is already active")
-  if conn.notifyQueue.len > 0:
-    return conn.notifyQueue.popFirst()
+  if conn.hasNotification():
+    return conn.popNotification()
   if conn.listenTask == nil or conn.listenTask.finished:
     raise newException(PgStateError, "Listener stopped")
   let myWaiter = newFuture[void]("waitNotification")
-  conn.notifyWaiter = myWaiter
+  conn.registerNotifyWaiter(myWaiter)
   var handoff: Notification
   var hasHandoff = false
   try:
@@ -608,21 +605,19 @@ proc waitNotification*(
     finally:
       # Only the registered waiter may claim the handoff: one failed by a pump
       # restart can resume late and would steal a newer waiter's notification.
-      let mine = conn.notifyWaiter == myWaiter
-      if mine:
-        conn.notifyWaiter = nil
+      if conn.unregisterNotifyWaiter(myWaiter):
         # Claim on every path so no other caller observes it half-delivered; it
         # is returned directly and never re-enters the capped queue.
-        if conn.hasNotifyHandoff:
-          conn.hasNotifyHandoff = false
-          handoff = move conn.notifyHandoff
+        let claimed = conn.takeNotifyHandoff()
+        if claimed.isSome:
+          handoff = claimed.get
           hasHandoff = true
     conn.checkNotifyOverflow()
     if hasHandoff:
       hasHandoff = false
       return handoff
-    if conn.notifyQueue.len > 0:
-      return conn.notifyQueue.popFirst()
+    if conn.hasNotification():
+      return conn.popNotification()
     raise newException(PgStateError, "No notification available")
   finally:
     # Unwound without returning it (timeout racing the complete, cancellation,

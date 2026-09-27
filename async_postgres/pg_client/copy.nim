@@ -73,7 +73,7 @@ proc drainLeftoverToReady(conn: PgConnection) {.async.} =
       if opt.get.kind == bmkReadyForQuery:
         conn.txStatus = opt.get.txStatus
         return
-    if conn.recvBufStart < conn.recvBuf.len:
+    if conn.recvBufLen() > 0:
       await conn.drainToReadyBestEffort()
   except CancelledError as e:
     raise e

@@ -7,7 +7,6 @@ when hasChronos:
 import ../async_postgres/[pg_protocol, pg_types, pg_connection]
 import ../async_postgres/pg_types/encoding
 import ../async_postgres/pg_connection/[buffer_io, types, simple_query, lifecycle]
-import ../async_postgres/pg_connection/cache {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_client/pipeline {.all.}
 import ../async_postgres/pg_client/[core, query, exec, direct, cursor]

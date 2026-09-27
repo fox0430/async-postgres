@@ -1684,6 +1684,16 @@ suite "Frontend encoding - edge cases":
     check msg[0] == byte('f')
     check decodeInt32(msg, 1) == int32(msg.len - 1)
 
+suite "receive buffer accessors":
+  test "consumeRecv advances the read pointer by exactly its count":
+    let conn = PgConnection(recvBuf: @[1'u8, 2, 3, 4], recvBufStart: 1)
+    check conn.recvBufLen() == 3
+    conn.consumeRecv(2)
+    check conn.recvBufStart == 3
+    check conn.recvBufLen() == 1
+    conn.consumeRecv(1)
+    check conn.recvBufLen() == 0
+
 suite "nextMessage recvBufStart update":
   proc buildMsg(msgType: char, body: seq[byte]): seq[byte] =
     result = @[byte(msgType)]

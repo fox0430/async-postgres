@@ -1,11 +1,10 @@
-## Dedicated unit tests for ``pg_connection/cache`` — LRU order, capacity-0
+## Dedicated unit tests for the statement cache in ``pg_connection/types`` — LRU order, capacity-0
 ## disable, defensive eviction into ``pendingStmtCloses``, and Close staging.
 
 import std/[unittest, tables, strutils, importutils]
 
 import ../async_postgres/[async_backend, pg_protocol, pg_types]
 import ../async_postgres/pg_connection/types {.all.}
-import ../async_postgres/pg_connection/cache {.all.}
 
 privateAccess(PgConnection)
 
@@ -68,6 +67,21 @@ suite "stmt cache LRU":
     conn.removeStmtCache("a")
     check conn.lookupStmtCache("a").isNil
     check conn.lookupStmtCache("b").name == "_sc_b"
+
+  test "invalidateStmtCache drops the entry and queues its Close":
+    let conn = mockConn(2)
+    conn.addStmtCache("a", cached("_sc_a"))
+    conn.addStmtCache("b", cached("_sc_b"))
+    conn.invalidateStmtCache("a", "_sc_a")
+    check conn.stmtCacheSize() == 1
+    check conn.lookupStmtCache("a").isNil
+    check conn.lookupStmtCache("b").name == "_sc_b"
+    check conn.pendingStmtCloses == @["_sc_a"]
+
+  test "queueStmtClose queues a name the cache never held":
+    let conn = mockConn(2)
+    conn.queueStmtClose("_sc_orphan")
+    check conn.pendingStmtCloses == @["_sc_orphan"]
 
   test "addStmtCache fills resultFormats from field OIDs":
     let conn = mockConn(2)
