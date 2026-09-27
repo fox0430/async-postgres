@@ -2972,3 +2972,68 @@ JeOmWtVZvOCrgXRtH9DmA+/cbA==
       require err != nil
       check "TLS handshake failed" in err.msg
       check not (err of PgSecurityError)
+
+  suite "chronos TLS trust anchors":
+    test "sslVerifyCa completes the handshake against the configured CA":
+      # BearSSL's anchors point into `trustAnchorBufs`; had the buffers been
+      # copied on their way into the connection, the originals would be freed
+      # before the handshake reads them, and the chain would not verify.
+      var sslEnabled = false
+      var certDerLen = 0
+
+      proc testBody(key: TLSPrivateKey, cert: TLSCertificate) {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler(key: TLSPrivateKey, cert: TLSCertificate) {.async.} =
+          let st = await ms.accept()
+          let reader = newAsyncStreamReader(st)
+          let writer = newAsyncStreamWriter(st)
+          var tls: TLSAsyncStream
+          try:
+            discard await readN(st, 8) # SSLRequest
+            await sendBytes(st, @[byte('S')])
+            tls = newTLSServerAsyncStream(
+              reader, writer, key, cert, minVersion = TLSVersion.TLS12
+            )
+            await tls.handshake()
+            var lenBuf = newSeq[byte](4)
+            await tls.reader.readExactly(addr lenBuf[0], 4)
+            discard await tls.reader.read(decodeInt32(lenBuf, 0) - 4) # StartupMessage
+            var resp: seq[byte]
+            resp.add(buildBackendMsg('R', @[0'u8, 0, 0, 0]))
+            resp.add(buildBackendMsg('Z', @[byte('I')]))
+            await tls.writer.write(resp)
+            discard await tls.reader.read() # Terminate, then EOF
+          except CatchableError:
+            discard
+          if tls != nil:
+            await tls.reader.closeWait()
+            await tls.writer.closeWait()
+          await reader.closeWait()
+          await writer.closeWait()
+          await closeClient(st)
+
+        let serverFut = serverHandler(key, cert)
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslVerifyCa,
+          sslRootCert: testCaCert(),
+        )
+        try:
+          let conn = await connect(config)
+          sslEnabled = conn.sslEnabled
+          certDerLen = conn.serverCertDer.len
+          await conn.close()
+        finally:
+          await serverFut
+          await closeServer(ms)
+
+      waitFor testBody(
+        TLSPrivateKey.init(readCertFile("server.key")),
+        TLSCertificate.init(readCertFile("server.crt")),
+      )
+      check sslEnabled
+      check certDerLen > 0

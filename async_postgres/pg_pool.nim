@@ -386,8 +386,7 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
       discard await conn.simpleExec(
         "SELECT pg_advisory_unlock_all()", timeout = pool.config.resetQueryTimeout
       )
-      conn.heldSessionLocks = 0
-      conn.sessionLockDirty = false
+      conn.clearSessionLocks()
     if pool.config.resetQuery.len > 0:
       discard await conn.simpleExec(
         pool.config.resetQuery, timeout = pool.config.resetQueryTimeout

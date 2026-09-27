@@ -801,36 +801,153 @@ proc newPgConnection*(host: string, port: int, config: ConnConfig): PgConnection
   )
 
 when hasChronos:
-  proc transport*(conn: PgConnection): var StreamTransport {.inline.} =
+  func transport*(conn: PgConnection): StreamTransport {.inline.} =
     conn.transport
 
-  proc baseReader*(conn: PgConnection): var AsyncStreamReader {.inline.} =
+  func baseReader*(conn: PgConnection): AsyncStreamReader {.inline.} =
     conn.baseReader
 
-  proc baseWriter*(conn: PgConnection): var AsyncStreamWriter {.inline.} =
+  func baseWriter*(conn: PgConnection): AsyncStreamWriter {.inline.} =
     conn.baseWriter
 
-  proc reader*(conn: PgConnection): var AsyncStreamReader {.inline.} =
+  func reader*(conn: PgConnection): AsyncStreamReader {.inline.} =
     conn.reader
 
-  proc writer*(conn: PgConnection): var AsyncStreamWriter {.inline.} =
+  func writer*(conn: PgConnection): AsyncStreamWriter {.inline.} =
     conn.writer
 
-  proc tlsStream*(conn: PgConnection): var TLSAsyncStream {.inline.} =
+  func tlsStream*(conn: PgConnection): TLSAsyncStream {.inline.} =
     conn.tlsStream
 
-  proc trustAnchorBufs*(conn: PgConnection): var seq[seq[byte]] {.inline.} =
-    conn.trustAnchorBufs
+  proc attachTransport*(
+      conn: PgConnection, t: StreamTransport, target: DialTarget
+  ) {.inline.} =
+    ## Attach a freshly dialled transport and its cancel target.
+    conn.transport = t
+    conn.cancelTarget = @[target]
 
-  proc x509Capture*(conn: PgConnection): var X509CertCaptureContext {.inline.} =
-    conn.x509Capture
+  proc initPlainStreams*(conn: PgConnection) {.inline.} =
+    ## Wire plaintext ``reader``/``writer`` from the transport when none exist.
+    if conn.reader.isNil:
+      conn.baseReader = newAsyncStreamReader(conn.transport)
+      conn.baseWriter = newAsyncStreamWriter(conn.transport)
+      conn.reader = conn.baseReader
+      conn.writer = conn.baseWriter
+
+  proc beginTlsBase*(conn: PgConnection) {.inline.} =
+    ## Create the base streams a TLS handshake wraps.
+    conn.baseReader = newAsyncStreamReader(conn.transport)
+    conn.baseWriter = newAsyncStreamWriter(conn.transport)
+
+  proc installTlsStream*(
+      conn: PgConnection, stream: TLSAsyncStream, backing: sink seq[seq[byte]]
+  ) =
+    ## Adopt ``stream`` with its trust-anchor backing and point the X509
+    ## capture at this record's own ``serverCertDer`` storage. ``backing`` must
+    ## be moved in: the anchors point into its inner buffers, which a copy
+    ## would not preserve.
+    conn.trustAnchorBufs = backing
+    conn.tlsStream = stream
+    installX509Capture(
+      conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+    )
+
+  proc finishTls*(conn: PgConnection) {.inline.} =
+    ## Switch ``reader``/``writer`` to the established TLS stream.
+    conn.reader = conn.tlsStream.reader
+    conn.writer = conn.tlsStream.writer
+    conn.sslEnabled = true
+
+  proc graftTransportFrom*(conn, src: PgConnection) =
+    ## Move the transport cluster from ``src`` and rebind the X509 capture.
+    conn.transport = src.transport
+    conn.baseReader = src.baseReader
+    conn.baseWriter = src.baseWriter
+    conn.reader = src.reader
+    conn.writer = src.writer
+    conn.tlsStream = src.tlsStream
+    conn.trustAnchorBufs = move(src.trustAnchorBufs)
+    conn.x509Capture = src.x509Capture
+    conn.sslEnabled = src.sslEnabled
+    conn.serverCertDer = src.serverCertDer
+    if conn.tlsStream != nil:
+      rebindX509Capture(
+        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+      )
+
+  proc detachTransport*(
+      conn: PgConnection
+  ): tuple[
+    tls: TLSAsyncStream,
+    baseReader: AsyncStreamReader,
+    baseWriter: AsyncStreamWriter,
+    transport: StreamTransport,
+  ] =
+    ## Detach all transport handles for the caller to close.
+    result = (conn.tlsStream, conn.baseReader, conn.baseWriter, conn.transport)
+    conn.tlsStream = nil
+    conn.baseReader = nil
+    conn.baseWriter = nil
+    conn.transport = nil
+    conn.reader = nil
+    conn.writer = nil
 
 elif hasAsyncDispatch:
-  proc socket*(conn: PgConnection): var AsyncSocket {.inline.} =
+  func socket*(conn: PgConnection): AsyncSocket {.inline.} =
     conn.socket
 
-proc serverCertDer*(conn: PgConnection): var seq[byte] {.inline.} =
+  proc attachTransport*(
+      conn: PgConnection, s: AsyncSocket, target: DialTarget
+  ) {.inline.} =
+    ## Attach a freshly dialled socket and its cancel target.
+    conn.socket = s
+    conn.cancelTarget = @[target]
+
+  proc graftTransportFrom*(conn, src: PgConnection) {.inline.} =
+    ## Move the socket and its channel-binding certificate.
+    conn.socket = src.socket
+    conn.sslEnabled = src.sslEnabled
+    conn.serverCertDer = src.serverCertDer
+
+  proc detachTransport*(conn: PgConnection): AsyncSocket {.inline.} =
+    ## Detach the socket for the caller to close.
+    result = conn.socket
+    conn.socket = nil
+
+func serverCertDer*(conn: PgConnection): lent seq[byte] {.inline.} =
   conn.serverCertDer
+
+proc setServerCertDer*(conn: PgConnection, der: seq[byte]) {.inline.} =
+  ## Store the server certificate DER for SCRAM channel binding.
+  conn.serverCertDer = der
+
+func cancelTarget*(conn: PgConnection): lent seq[DialTarget] {.inline.} =
+  conn.cancelTarget
+
+func secretKey*(conn: PgConnection): int32 {.inline.} =
+  conn.secretKey
+
+proc noteBackendKeyData*(conn: PgConnection, pid, secret: int32) {.inline.} =
+  ## Record ``BackendKeyData``: the pid and secret move together for ``cancel``.
+  conn.pid = pid
+  conn.secretKey = secret
+
+proc graftReconnectedSession*(conn, src: PgConnection) =
+  ## Move a fresh connection's wire and session identity onto ``conn`` for an
+  ## in-place reconnect. The caller owns state, the statement cache, session
+  ## locks and the fatal error around it.
+  conn.graftTransportFrom(src)
+  conn.host = src.host
+  conn.port = src.port
+  conn.cancelTarget = src.cancelTarget
+  conn.pid = src.pid
+  conn.secretKey = src.secretKey
+  conn.serverParams = src.serverParams
+  conn.serverParamsBytes = src.serverParamsBytes
+  conn.txStatus = src.txStatus
+  conn.createdAt = src.createdAt
+  conn.recvBuf = src.recvBuf
+  conn.recvBufStart = src.recvBufStart
 
 func recvBuf*(conn: PgConnection): lent seq[byte] {.inline.} =
   ## The receive buffer, parsed prefix included: everything before
@@ -890,17 +1007,12 @@ proc resetWireState*(conn: PgConnection) =
   conn.pendingSyncs = 0
   conn.unsyncedWrite = false
 
-proc secretKey*(conn: PgConnection): var int32 {.inline.} =
-  conn.secretKey
-
-proc serverParamsBytes*(conn: PgConnection): var int {.inline.} =
-  conn.serverParamsBytes
-
-proc negotiatedMinorVersion*(conn: PgConnection): var int32 {.inline.} =
-  conn.negotiatedMinorVersion
-
-proc unrecognizedStartupOptions*(conn: PgConnection): var seq[string] {.inline.} =
-  conn.unrecognizedStartupOptions
+proc noteNegotiatedProtocol*(
+    conn: PgConnection, minor: int32, opts: seq[string]
+) {.inline.} =
+  ## Record a ``NegotiateProtocolVersion`` reply; the two fields arrive together.
+  conn.negotiatedMinorVersion = minor
+  conn.unrecognizedStartupOptions = opts
 
 proc notifyCallback*(conn: PgConnection): var NotifyCallback {.inline.} =
   conn.notifyCallback
@@ -917,17 +1029,33 @@ proc borrowedByUser*(conn: PgConnection): var bool {.inline.} =
 proc transportCloseFut*(conn: PgConnection): var Future[void] {.inline.} =
   conn.transportCloseFut
 
-proc listenTask*(conn: PgConnection): var Future[void] {.inline.} =
+func listenTask*(conn: PgConnection): Future[void] {.inline.} =
   conn.listenTask
 
-proc listenStopRequested*(conn: PgConnection): var bool {.inline.} =
+func listenStopRequested*(conn: PgConnection): bool {.inline.} =
   conn.listenStopRequested
 
-proc listenReconnecting*(conn: PgConnection): var bool {.inline.} =
+func listenReconnecting*(conn: PgConnection): bool {.inline.} =
   conn.listenReconnecting
 
-proc cancelTarget*(conn: PgConnection): var seq[DialTarget] {.inline.} =
-  conn.cancelTarget
+proc noteListenPumpStarted*(conn: PgConnection, task: Future[void]) {.inline.} =
+  ## Adopt ``task`` as the pump and clear any previous stop/reconnect state.
+  conn.listenStopRequested = false
+  conn.listenReconnecting = false
+  conn.listenTask = task
+
+proc clearListenTask*(conn: PgConnection) {.inline.} =
+  ## Forget the pump task without touching the stop flag.
+  conn.listenTask = nil
+
+proc requestListenStop*(conn: PgConnection) {.inline.} =
+  conn.listenStopRequested = true
+
+proc clearListenStop*(conn: PgConnection) {.inline.} =
+  conn.listenStopRequested = false
+
+proc setListenReconnecting*(conn: PgConnection, value: bool) {.inline.} =
+  conn.listenReconnecting = value
 
 proc closedByUser*(conn: PgConnection): var bool {.inline.} =
   conn.closedByUser
@@ -946,11 +1074,26 @@ proc notifyOverflowCallback*(
 proc listenErrorCallback*(conn: PgConnection): var ListenErrorCallback {.inline.} =
   conn.listenErrorCallback
 
-proc heldSessionLocks*(conn: PgConnection): var int {.inline.} =
+func heldSessionLocks*(conn: PgConnection): int {.inline.} =
   conn.heldSessionLocks
 
-proc sessionLockDirty*(conn: PgConnection): var bool {.inline.} =
+func sessionLockDirty*(conn: PgConnection): bool {.inline.} =
   conn.sessionLockDirty
+
+proc noteSessionLockAcquired*(conn: PgConnection) {.inline.} =
+  ## Track one session-level acquire; the sticky flag outlives the counter.
+  inc conn.heldSessionLocks
+  conn.sessionLockDirty = true
+
+proc noteSessionLockReleased*(conn: PgConnection, released: bool) {.inline.} =
+  ## Track a server-confirmed release, clamping at zero for mixed raw/typed use.
+  if released and conn.heldSessionLocks > 0:
+    dec conn.heldSessionLocks
+
+proc clearSessionLocks*(conn: PgConnection) {.inline.} =
+  ## Forget session-lock tracking for a fresh or reset session.
+  conn.heldSessionLocks = 0
+  conn.sessionLockDirty = false
 
 proc tracer*(conn: PgConnection): var PgTracer {.inline.} =
   conn.tracer
@@ -980,8 +1123,8 @@ proc `serverParams=`*(conn: PgConnection, value: Table[string, string]) {.inline
   conn.serverParams = value
 
 proc setServerParam*(conn: PgConnection, name, value: string) {.inline.} =
-  ## Store one ``ParameterStatus`` value. Bounds and ``serverParamsBytes`` are
-  ## the caller's to maintain.
+  ## Store one ``ParameterStatus`` value. Prefer ``recordParameterStatus``,
+  ## which also maintains the bounds and ``serverParamsBytes``.
   conn.serverParams[name] = value
 
 proc `notifyDropped=`*(conn: PgConnection, value: int) {.inline.} =
@@ -996,6 +1139,20 @@ proc `txStatus=`*(conn: PgConnection, value: TransactionStatus) {.inline.} =
 proc sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
   ## Send buffer for `queryDirect` / `execDirect` (via `bindSym`).
   conn.sendBuf
+
+proc clearSendBuf*(conn: PgConnection) {.inline.} =
+  ## Empty the send buffer without touching staged statement Closes.
+  conn.sendBuf.setLen(0)
+
+func sendBufLen*(conn: PgConnection): int {.inline.} =
+  conn.sendBuf.len
+
+proc appendCopyData*(conn: PgConnection, data: openArray[byte]) {.inline.} =
+  ## Append one ``CopyData`` frame to the send buffer.
+  encodeCopyData(conn.sendBuf, data)
+
+proc appendCopyDone*(conn: PgConnection) {.inline.} =
+  conn.sendBuf.addCopyDone()
 
 proc nextPortalName*(conn: PgConnection, prefix: string): string =
   ## Fresh portal/savepoint name; owns counter so macro scope stays sealed.
@@ -1255,6 +1412,43 @@ proc markClosed*(conn: PgConnection) {.inline, raises: [].} =
   ## Retire the connection: the wire is unusable, whether the transport is torn
   ## down yet or not.
   conn.markState(csClosed)
+
+proc recordParameterStatus*(
+    conn: PgConnection, name, value: string
+) {.raises: [PgProtocolError].} =
+  ## Store one ``ParameterStatus`` under ``MaxServerParams`` /
+  ## ``MaxServerParamsBytes``. Exceeding either cap is treated as a broken
+  ## peer: the connection is closed and ``PgProtocolError`` is raised. Updates
+  ## to an existing key are always admitted when the resulting byte total fits.
+  let newEntryBytes = name.len + value.len
+  if conn.serverParams.hasKey(name):
+    let oldLen = conn.serverParams.getOrDefault(name).len
+    let delta = value.len - oldLen
+    if delta > 0 and conn.serverParamsBytes > MaxServerParamsBytes - delta:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams byte total would exceed maximum of " &
+          $MaxServerParamsBytes,
+      )
+    conn.serverParamsBytes += delta
+    conn.setServerParam(name, value)
+  else:
+    if conn.serverParams.len >= MaxServerParams:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams key count exceeds maximum of " & $MaxServerParams,
+      )
+    if newEntryBytes > MaxServerParamsBytes - conn.serverParamsBytes:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams byte total would exceed maximum of " &
+          $MaxServerParamsBytes,
+      )
+    conn.setServerParam(name, value)
+    conn.serverParamsBytes += newEntryBytes
 
 # Staged statement-close bookkeeping
 #
