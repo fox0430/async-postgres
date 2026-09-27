@@ -583,3 +583,50 @@ when defined(posix):
       check (ref PgConnectionError)(err).attempts.len == 0
       # The refusal itself is kept, as `startupError` promises.
       check (ref PgConnectionError)(err).serverError != nil
+
+    test "a successful plaintext connection keeps sslmode=allow for reconnects":
+      # The test above pins the AF_UNIX failure shape; this pins the success
+      # shape. The plaintext leg must not rewrite sslMode, or a reconnect that
+      # dials `conn.config` would come back with sslDisable on this path too.
+      let dir = createTempDir("async_pg_allow_ok_", "")
+      let port = 5432
+      let socketPath = dir / ".s.PGSQL." & $port
+      defer:
+        try:
+          removeFile(socketPath)
+        except OSError:
+          discard
+        try:
+          removeDir(dir)
+        except OSError:
+          discard
+
+      var connState: PgConnState
+      var connSslEnabled: bool
+      var connConfiguredSslMode: SslMode
+
+      proc testBody(dir, socketPath: string) {.async.} =
+        let ms = startMockServerUnix(socketPath)
+        # AuthOk right after the startup message: an SSLRequest here would be
+        # consumed as the startup message and the handshake would never finish.
+        let serverFut = ms.acceptAndReady()
+
+        var config = testConfig(port, sslAllow)
+        config.host = dir
+        config.password = "test"
+        # Same entry form as the test above: the AF_UNIX branch keys off
+        # `entry.dialAddr`.
+        let conn = await connectToHost(config, HostEntry(host: dir, port: port))
+        connState = conn.state
+        connSslEnabled = conn.sslEnabled
+        connConfiguredSslMode = conn.config.sslMode
+        await conn.close()
+
+        let st = await serverFut
+        await closeClient(st)
+        await closeServer(ms)
+
+      waitFor testBody(dir, socketPath)
+      check connState == csReady
+      check connSslEnabled == false
+      check connConfiguredSslMode == sslAllow
