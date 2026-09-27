@@ -840,10 +840,12 @@ when hasChronos:
     conn.baseWriter = newAsyncStreamWriter(conn.transport)
 
   proc installTlsStream*(
-      conn: PgConnection, stream: TLSAsyncStream, backing: seq[seq[byte]]
+      conn: PgConnection, stream: TLSAsyncStream, backing: sink seq[seq[byte]]
   ) =
     ## Adopt ``stream`` with its trust-anchor backing and point the X509
-    ## capture at this record's own ``serverCertDer`` storage.
+    ## capture at this record's own ``serverCertDer`` storage. ``backing`` must
+    ## be moved in: the anchors point into its inner buffers, which a copy
+    ## would not preserve.
     conn.trustAnchorBufs = backing
     conn.tlsStream = stream
     installX509Capture(
@@ -864,7 +866,7 @@ when hasChronos:
     conn.reader = src.reader
     conn.writer = src.writer
     conn.tlsStream = src.tlsStream
-    conn.trustAnchorBufs = src.trustAnchorBufs
+    conn.trustAnchorBufs = move(src.trustAnchorBufs)
     conn.x509Capture = src.x509Capture
     conn.sslEnabled = src.sslEnabled
     conn.serverCertDer = src.serverCertDer

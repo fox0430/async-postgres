@@ -438,7 +438,7 @@ when hasTls:
       # is called unconditionally); enforcement stays direct-only below.
       try:
         if config.sslMode in {sslVerifyCa, sslVerifyFull}:
-          let parsed = parseTrustAnchors(config.sslRootCert)
+          var parsed = parseTrustAnchors(config.sslRootCert)
           conn.installTlsStream(
             newTLSClientAsyncStream(
               conn.baseReader,
@@ -452,7 +452,7 @@ when hasTls:
               certificate = clientCert,
               privateKey = clientKey,
             ),
-            parsed.backing,
+            move(parsed.backing),
           )
         else:
           # NoVerifyHost is set, so trust anchors are ignored regardless.
