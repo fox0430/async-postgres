@@ -5,7 +5,7 @@
 import std/[options, tables, math, random]
 
 import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, cache, simple_query]
+import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
 
 type
@@ -183,8 +183,7 @@ proc invalidateIfOidMismatch*(
     return
   if paramOidsMatch(cached.paramOids, currentOids):
     return
-  conn.pendingStmtCloses.add(cached.name)
-  conn.removeStmtCache(sql)
+  conn.invalidateStmtCache(sql, cached.name)
   cacheHit = false
 
 proc invalidateIfOidMismatch*(
@@ -200,8 +199,7 @@ proc invalidateIfOidMismatch*(
     return
   if paramOidsMatch(cached.paramOids, params):
     return
-  conn.pendingStmtCloses.add(cached.name)
-  conn.removeStmtCache(sql)
+  conn.invalidateStmtCache(sql, cached.name)
   cacheHit = false
 
 proc preflightResultFormatsLen*(
@@ -576,8 +574,7 @@ template queryRecvLoop*(
   do:
     if queryError != nil:
       if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-        conn.pendingStmtCloses.add(stmtName)
-        conn.removeStmtCache(sql)
+        conn.invalidateStmtCache(sql, stmtName)
     elif cacheMiss:
       conn.addStmtCache(
         sql,
@@ -653,8 +650,7 @@ template queryEachRecvLoop*(
       raise callbackError
     if queryError != nil:
       if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-        conn.pendingStmtCloses.add(stmtName)
-        conn.removeStmtCache(sql)
+        conn.invalidateStmtCache(sql, stmtName)
     elif cacheMiss:
       conn.addStmtCache(
         sql,
@@ -697,8 +693,7 @@ template execRecvLoop*(
   do:
     if queryError != nil:
       if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-        conn.pendingStmtCloses.add(stmtName)
-        conn.removeStmtCache(sql)
+        conn.invalidateStmtCache(sql, stmtName)
     elif cacheMiss:
       conn.addStmtCache(
         sql,

@@ -1,23 +1,26 @@
-## Transport-layer buffering and message I/O.
+## Transport-layer message I/O.
 ##
-## - recvBuf/sendBuf management (compact, fill, send)
+## - sendBuf management and raw sends
 ## - Synchronous backend-message parsing (`nextMessage`) and the async wrapper
 ##   `recvMessage`
-## - Notification/Notice dispatch (called from `nextMessage`)
+## - Background read watch for COPY IN early-error detection (`RecvWatch`)
 ## - Transport teardown (`closeTransport`)
 ## - TCP keepalive / TCP_NODELAY socket options
 ## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`) and dialing
 ##   (`resolveTargets`, `dialTargets`, `dialServer`, `socketError`, `oneLine`)
 ## - `makeCopyOutCallback` / `makeCopyInCallback` cross-backend templates
 ##
+## The receive buffer and its fills live in `types` with the private
+## `recvBuf` / `recvBufStart` pair they move.
+##
 ## The host helpers and `makeCopy*` templates are re-exported through
-## `pg_connection.nim`; the transport buffering machinery stays here for
+## `pg_connection.nim`; the message-parsing and send machinery stays here for
 ## sibling modules and tests. Depends only on `types.nim` and the
 ## protocol/error/backend abstraction modules.
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[deques, options, strutils, tables]
+import std/[options, strutils, tables]
 when defined(posix):
   import std/posix
 
@@ -444,113 +447,7 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
   ##       newSeq[byte]()
   makeAsyncSeqByteCallback(CopyInCallback, body)
 
-# Notification / notice dispatch
-
-func notifyEntryBytes(n: Notification): int64 {.inline.} =
-  n.channel.len.int64 + n.payload.len.int64
-
-proc noteNotifyDrop(conn: PgConnection, droppedNow: var int) {.inline, raises: [].} =
-  if conn.notifyDropped < high(int): # saturating; reset once reported
-    conn.notifyDropped = conn.notifyDropped + 1
-  droppedNow.inc
-
-proc dropOldestNotification(
-    conn: PgConnection, queuedBytes: var int64, droppedNow: var int
-) {.inline, raises: [].} =
-  let oldest = conn.notifyQueue.popFirst()
-  queuedBytes -= notifyEntryBytes(oldest)
-  if queuedBytes < 0:
-    queuedBytes = 0
-  conn.noteNotifyDrop(droppedNow)
-
-proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].} =
-  ## Enqueue under ``notifyMaxQueue`` and ``notifyMaxQueueBytes`` (either
-  ## ``<=0`` = unbounded). Overflow drops oldest; oversize is not queued.
-  ## Push ``onNotify`` still sees every arrival.
-  # Caps queued entries only: an outstanding handoff is already claimed.
-  var droppedNow = 0
-  let incoming = notifyEntryBytes(notif)
-  let maxN = conn.notifyMaxQueue
-  let maxB = conn.notifyMaxQueueBytes
-  var queuedBytes: int64 = 0
-  if maxB > 0:
-    for n in conn.notifyQueue:
-      queuedBytes += notifyEntryBytes(n)
-
-  # Trim a requeued overshoot before considering the arrival.
-  if maxN > 0 or maxB > 0:
-    while conn.notifyQueue.len > 0:
-      let countOver = maxN > 0 and conn.notifyQueue.len > maxN
-      let bytesOver = maxB > 0 and queuedBytes > maxB.int64
-      if not countOver and not bytesOver:
-        break
-      conn.dropOldestNotification(queuedBytes, droppedNow)
-
-  if maxB > 0 and incoming > maxB.int64:
-    conn.noteNotifyDrop(droppedNow)
-    # noteNotifyDrop always increments, so `droppedNow > 0` holds here.
-    if droppedNow > 0:
-      let overflow = conn.notifyOverflowCallback
-      if overflow != nil:
-        overflow(droppedNow)
-    return
-
-  while conn.notifyQueue.len > 0:
-    let countFull = maxN > 0 and conn.notifyQueue.len >= maxN
-    let bytesFull = maxB > 0 and queuedBytes + incoming > maxB.int64
-    if not countFull and not bytesFull:
-      break
-    conn.dropOldestNotification(queuedBytes, droppedNow)
-
-  conn.notifyQueue.addLast(notif)
-  if droppedNow > 0:
-    # Read once: the accessor is a call, and this path runs per NOTIFY.
-    let overflow = conn.notifyOverflowCallback
-    if overflow != nil:
-      overflow(droppedNow)
-
-proc requeueHandoff*(conn: PgConnection, notif: Notification) {.raises: [].} =
-  ## Requeue an unconsumed handoff at the front.
-  # Trims nothing, keeping the drop policy in one place: the queue may sit one
-  # over the cap until the next arrival's drop-oldest reaches this entry.
-  conn.notifyQueue.addFirst(notif)
-
-proc reclaimHandoff*(conn: PgConnection) {.raises: [].} =
-  ## Requeue a handoff whose waiter will never claim it, so an abandoned frame
-  ## cannot make the notification unreachable.
-  if conn.hasNotifyHandoff:
-    conn.hasNotifyHandoff = false
-    conn.requeueHandoff(move conn.notifyHandoff)
-
-proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
-  let notif = Notification(
-    pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
-  )
-  # Handed directly to an unresumed waiter: parking it in the shared queue
-  # instead would make it the first thing the overflow drop discards.
-  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    conn.notifyHandoff = notif
-    conn.hasNotifyHandoff = true
-    # asyncdispatch's `Future.complete` has inferred effect `Exception`
-    # via the callback chain; swallow it to keep this proc `raises: []`.
-    try:
-      conn.notifyWaiter.complete()
-    except Exception:
-      # The waiter will never resume, so nothing would ever move the handoff
-      # back: queue it here instead of losing it.
-      conn.hasNotifyHandoff = false
-      conn.notifyHandoff = Notification()
-      conn.enqueueNotification(notif)
-  else:
-    conn.enqueueNotification(notif)
-  let notifyCb = conn.notifyCallback
-  if notifyCb != nil:
-    notifyCb(notif)
-
-proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
-  let noticeCb = conn.noticeCallback
-  if noticeCb != nil:
-    noticeCb(Notice(fields: msg.noticeFields))
+# Notification / notice dispatch lives in ``types`` with the queue fields.
 
 proc recordParameterStatus(
     conn: PgConnection, name, value: string
@@ -611,133 +508,9 @@ when hasAsyncDispatch:
     sendRawData(socket, addr data[0], data.len)
 
 # Receive buffer management
-
-proc compactRecvBuf*(conn: PgConnection) {.inline.} =
-  ## Compact recvBuf (caller checks ``csClosed``). Only safe before reading new
-  ## data from the socket: it moves bytes an in-flight read still points at.
-  let start = conn.recvBufStart
-  if start == 0:
-    return
-  let remaining = conn.recvBuf.len - start
-  if remaining == 0:
-    conn.recvBuf.setLen(0)
-  else:
-    moveMem(addr conn.recvBuf[0], addr conn.recvBuf[start], remaining)
-    conn.recvBuf.setLen(remaining)
-  conn.recvBufStart = 0
-
-proc fillRecvBuf*(
-    conn: PgConnection, timeout: Duration = ZeroDuration
-): Future[void] {.async.} =
-  ## Read into recvBuf. ``AsyncTimeoutError``: caller handles state; other errors → ``csClosed`` + ``raiseTransportFailure``.
-  # An orphaned pump can revive here after a timeout or cancellation handler
-  # retired the connection; refuse a socket read on one we've given up on.
-  if conn.state == csClosed:
-    conn.raiseClosedConnection("fillRecvBuf: connection is closed (csClosed)")
-  conn.compactRecvBuf()
-  when hasChronos:
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + RecvBufSize)
-    var n: int
-    try:
-      n =
-        if timeout == ZeroDuration:
-          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
-        else:
-          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
-            timeout
-          )
-    except AsyncTimeoutError as e:
-      conn.recvBuf.setLen(oldLen)
-      raise e
-    except CancelledError as e:
-      # csClosed as for any other failure: the read may have consumed bytes, so
-      # the stream is no longer parseable. Only the exception type is preserved.
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      raise e
-    except CatchableError as e:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseTransportFailure("fillRecvBuf", e)
-    if n == 0:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseClosedConnection("Connection closed by server")
-    # An orphan read settling after csClosed must not re-extend the buffer.
-    if conn.state == csClosed:
-      conn.recvBuf.setLen(oldLen)
-      conn.raiseClosedConnection("fillRecvBuf: connection was closed during readOnce")
-    conn.recvBuf.setLen(oldLen + n)
-  elif hasAsyncDispatch:
-    # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
-    # into `recvBuf[oldLen..]` after we truncate. Safe because `recvMessage`, the
-    # only caller that passes a timeout, marks csClosed itself before any later
-    # read can be issued, and seq shrink keeps capacity.
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + RecvBufSize)
-    var n: int
-    try:
-      n =
-        if timeout == ZeroDuration:
-          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize)
-        else:
-          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize).wait(
-            timeout
-          )
-    except AsyncTimeoutError as e:
-      conn.recvBuf.setLen(oldLen)
-      raise e
-    except CancelledError as e:
-      # csClosed as for any other failure: the read may have consumed bytes, so
-      # the stream is no longer parseable. Only the exception type is preserved.
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      raise e
-    except CatchableError as e:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseTransportFailure("fillRecvBuf", e)
-    if n == 0:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseClosedConnection("Connection closed by server")
-    # An orphan `recvInto` settling after csClosed must not re-extend the buffer.
-    if conn.state == csClosed:
-      conn.recvBuf.setLen(oldLen)
-      conn.raiseClosedConnection("fillRecvBuf: connection was closed during recvInto")
-    conn.recvBuf.setLen(oldLen + n)
-
-when hasChronos:
-  proc fillRecvBufDetached*(conn: PgConnection): Future[void] {.async.} =
-    ## Read into scratch then append to ``recvBuf`` (keeps ``recvBuf`` parseable while pending); errors → ``csClosed``.
-    # Entrance guard, as in ``fillRecvBuf``: no fresh read on csClosed.
-    if conn.state == csClosed:
-      conn.raiseClosedConnection("fillRecvBufDetached: connection is closed (csClosed)")
-    if conn.replReadScratch.len < RecvBufSize:
-      conn.replReadScratch.setLen(RecvBufSize)
-    let n =
-      try:
-        await conn.reader.readOnce(addr conn.replReadScratch[0], RecvBufSize)
-      except CancelledError as e:
-        conn.markClosed()
-        raise e
-      except CatchableError as e:
-        conn.markClosed()
-        conn.raiseTransportFailure("fillRecvBufDetached", e)
-    if n == 0:
-      conn.markClosed()
-      conn.raiseClosedConnection("Connection closed by server")
-    # Exit guard: a read settling after the caller flipped csClosed must not
-    # re-extend recvBuf.
-    if conn.state == csClosed:
-      conn.raiseClosedConnection(
-        "fillRecvBufDetached: connection was closed during readOnce"
-      )
-    conn.compactRecvBuf()
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + n)
-    copyMem(addr conn.recvBuf[oldLen], addr conn.replReadScratch[0], n)
+#
+# ``compactRecvBuf`` / ``fillRecvBuf`` / ``fillRecvBufDetached`` live in
+# ``types`` with the private fields they move as a pair.
 
 proc nextMessage*(
     conn: PgConnection,
@@ -757,14 +530,13 @@ proc nextMessage*(
   ## corruption, this is a caller bug, not a broken peer).
   if onRow != nil and onRowError == nil:
     raise newException(PgProtocolError, "nextMessage: onRow requires onRowError")
-  var pos = conn.recvBufStart
   let maxLen = conn.effectiveMaxMessageSize()
   while true:
     var consumed: int
     let res =
       try:
         parseBackendMessage(
-          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1),
+          conn.recvBuf.toOpenArray(conn.recvBufStart, conn.recvBuf.len - 1),
           consumed,
           rowData,
           maxLen,
@@ -775,8 +547,7 @@ proc nextMessage*(
         raise e
     if res.state == psIncomplete:
       return none(BackendMessage)
-    pos += consumed
-    conn.recvBufStart = pos
+    conn.consumeRecv(consumed)
     if res.state == psDataRow:
       if onRow != nil:
         if onRowError[] == nil:
@@ -820,12 +591,9 @@ proc nextMessage*(
       # The session answered after all, so that FATAL did not end it (a
       # proxy's; the server closes after its own).
       conn.fatalServerError = nil
-      # Counts down rather than clearing: a batch of per-op `Sync`s owes one
-      # reply each. `unsyncedWrite` is untouched — this reply belongs to a sync
-      # point that preceded those writes, so only a later one (in `noteWrite`)
-      # can end them.
-      if conn.pendingSyncs > 0:
-        dec conn.pendingSyncs
+      # `unsyncedWrite` is untouched — this reply belongs to a sync point that
+      # preceded those writes, so only a later one (in `noteWrite`) can end them.
+      conn.settlePendingSync()
     return some(res.message)
 
 proc recvMessage*(
@@ -980,32 +748,6 @@ proc cancel*(w: RecvWatch) =
       )
   w.fut = nil
 
-proc noteWrite(conn: PgConnection, data: openArray[byte]) {.inline.} =
-  ## Book what these bytes leave the backend owing. Before the write, not
-  ## after: a failed or cancelled write may still have reached the wire, and a
-  ## ``CancelRequest`` at an idle backend is a harmless no-op.
-  let owed = outstandingReplies(data)
-  conn.pendingSyncs += owed.syncPoints
-  if owed.syncPoints > 0:
-    # A sync point ends every request written before it, so only what follows
-    # the last one stays unended.
-    conn.unsyncedWrite = owed.unsynced
-  elif owed.unsynced:
-    conn.unsyncedWrite = true
-
-proc resetWireState*(conn: PgConnection) =
-  ## Forget what the wire's previous life left behind: the buffered bytes on
-  ## both sides and the replies the old backend owed.
-  ##
-  ## Sole owner of that reset: a stale count carried onto a fresh backend would
-  ## dial a ``CancelRequest`` at an unrelated PID and retire a healthy
-  ## connection.
-  conn.recvBuf.setLen(0)
-  conn.recvBufStart = 0
-  conn.sendBuf.setLen(0)
-  conn.pendingSyncs = 0
-  conn.unsyncedWrite = false
-
 # Send helpers
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
@@ -1056,6 +798,17 @@ proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
       except CatchableError as e:
         conn.markClosed()
         conn.raiseTransportFailure("sendBufMsg", e)
+
+proc sendStagedBufMsg*(conn: PgConnection) {.async.} =
+  ## `sendBufMsg` paired with `stagePendingStmtCloses`: drop the staged
+  ## statement Closes only once the buffer is on the wire.
+  await conn.sendBufMsg()
+  conn.dropStagedStmtCloses()
+
+proc sendStagedMsg*(conn: PgConnection, data: seq[byte]) {.async.} =
+  ## `sendMsg` counterpart, for builds that assemble their own buffer.
+  await conn.sendMsg(data)
+  conn.dropStagedStmtCloses()
 
 # Transport teardown
 

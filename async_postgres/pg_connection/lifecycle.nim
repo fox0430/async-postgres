@@ -58,7 +58,7 @@ proc readPreV3Error(conn: PgConnection): Future[string] {.async.} =
 
   var scanned = 0 # text bytes already searched for the NUL
   while true:
-    let avail = min(conn.recvBuf.len - start, PreV3MaxErrLen)
+    let avail = min(conn.recvBufLen() - 1, PreV3MaxErrLen)
     let i = conn.recvBuf.toOpenArray(start + scanned, start + avail - 1).find(0'u8)
     if i >= 0:
       return readString(conn.recvBuf, start, scanned + i)
@@ -78,17 +78,16 @@ proc checkPreV3Error(conn: PgConnection) {.async.} =
   # Only the first reply: past it, a long v3 ErrorResponse keeps its fields.
   # Every v3 message has these 5 bytes: an 'E' the server closes short of them
   # can only be a pre-3.0 text.
-  while conn.recvBuf.len - conn.recvBufStart < 5:
+  while conn.recvBufLen() < 5:
     try:
       await conn.fillRecvBuf()
     except PgConnectionError as e:
-      if conn.recvBuf.len == conn.recvBufStart or
-          conn.recvBuf[conn.recvBufStart] != byte('E'):
+      if conn.recvBufLen() == 0 or conn.recvBuf[conn.recvBufStart] != byte('E'):
         raise e
       break
   let start = conn.recvBufStart
   if conn.recvBuf[start] != byte('E') or (
-    conn.recvBuf.len - start >= 5 and
+    conn.recvBufLen() >= 5 and
     decodeInt32(conn.recvBuf, start + 1) in 8 .. PreV3MaxErrLen
   ):
     return

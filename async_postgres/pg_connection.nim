@@ -8,20 +8,24 @@
 ##                                  tracing data types, the `PgTracer`
 ##                                  hook record, and the tracing helper
 ##                                  templates (`withConnTracing`,
-##                                  `withTracing`).
+##                                  `withTracing`). Also the operations
+##                                  that keep `PgConnection`'s private
+##                                  fields consistent: receive buffering,
+##                                  wire-debt counters, the statement
+##                                  cache with its Close queues, the
+##                                  notification queue, and the replication
+##                                  write queue.
 ## - `pg_connection/dsn`          — DSN parsing (URI and libpq
 ##                                  keyword=value formats) plus
 ##                                  `initConnConfig` and `parseDsn`.
-## - `pg_connection/buffer_io`    — recv/send buffering (`fillRecvBuf`,
-##                                  `nextMessage`, `recvMessage`,
+## - `pg_connection/buffer_io`    — send buffering and message parsing
+##                                  (`nextMessage`, `recvMessage`,
 ##                                  `sendMsg`), TCP keepalive,
-##                                  `closeTransport`, notification/notice
-##                                  dispatch, `isConnected` /
+##                                  `closeTransport`, `isConnected` /
 ##                                  `socketHasFin`, and the `getHosts`
 ##                                  host helper.
 ## - `pg_connection/ssl`          — SSL negotiation (`negotiateSSL`) for
 ##                                  chronos+BearSSL and asyncdispatch+OpenSSL.
-## - `pg_connection/cache`        — client-side prepared-statement LRU.
 ## - `pg_connection/simple_query` — simple-query / simple-exec / ping,
 ##                                  `cancel` / `invalidateOnTimeout`,
 ##                                  `checkSessionAttrs`, `quoteIdentifier`,
