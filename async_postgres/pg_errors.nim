@@ -1,6 +1,6 @@
 ## Exception hierarchy. Every library-raised exception derives from ``PgError``.
 ##
-## The hierarchy encodes *scope*, not retryability (ask ``isTransientError``):
+## The hierarchy encodes *scope*, not retryability (ask ``retryAdvice``):
 ## a ``PgConnectionError`` (``PgProtocolError``, ``PgTimeoutError``,
 ## ``PgSecurityError`` and ``PgUnavailableError`` included) ends one connection,
 ## so ``connect`` fails over past it and reconnect loops must see it;
@@ -10,6 +10,25 @@
 ## ``PgTypeError`` = caller data the wire format cannot carry; ``PgQueryError`` =
 ## an error the server reported; ``ValueError`` = a precondition, and the one kind
 ## not under ``PgError`` (except DSN parsing).
+##
+## Retry classification
+## ====================
+## ``retryAdvice`` returns one verdict per failure:
+##
+## - ``raRetry``: a later attempt with the same config may succeed (a lost
+##   connection, a timeout, a transient SQLSTATE such as ``40001``).
+##   ``isTransientError`` is this case alone.
+## - ``raStop``: no attempt can succeed until something outside the process
+##   changes: a ``PgConfigError``, a closed pool, or a refusal
+##   (``isLastingRefusal``: a startup answered with ``28P01``, ``3D000`` or
+##   ``42501``).
+## - ``raUnclear``: neither established (a ``PgProtocolError``, a
+##   ``PgSecurityError``, ...): retry within a budget.
+##
+## ``raRetry`` does not make replaying safe (a connection lost during ``COMMIT``
+## may have committed), nor does it mean the connection is gone (check
+## ``conn.state``). Cap retries regardless: a mistyped host name or a server
+## that stays down is transient too.
 
 from async_backend import AsyncTimeoutError
 
@@ -61,6 +80,9 @@ type
     perHost: bool
       ## ``attempts`` are ``connect``'s hosts (all must clear), not one host's
       ## alternatives.
+    atStartup: bool
+      ## ``serverError`` answered the startup: the server's verdict on the
+      ## session, not a FATAL that ended one.
 
   PgProtocolError* = object of PgConnectionError
     ## Raised on PostgreSQL wire protocol violations. The connection stream is
@@ -150,7 +172,11 @@ type
       ## queue — is full (`maxWaiters` bound); retrying later may succeed.
     pekConnectFailed
       ## A connect attempt failed during acquire (underlying error in `parent`);
-      ## retrying may succeed.
+      ## retrying may succeed. A refusal surfaces as `pekRefused` instead.
+    pekRefused
+      ## A server refused the session for a cause that recurs for the same
+      ## config (preserved as `parent`): a wrong password, a database that does
+      ## not exist. See `PgPool.connectRefusal`.
     pekConfigFault
       ## The pool's `connConfig` can never connect: a connect raised
       ## `PgConfigError` (preserved as `parent`). Retrying cannot succeed, so
@@ -163,8 +189,9 @@ type
 
   PgPoolError* = object of PgError
     ## Pool-level acquire/operation failure (closed, acquire timeout, queue
-    ## full, connect failed, config fault, unservable batch, or a wrapped
-    ## user-code ``Defect``; the underlying error is preserved as ``parent``).
+    ## full, connect failed, refused, config fault, unservable batch, or a
+    ## wrapped user-code ``Defect``; the underlying error is preserved as
+    ## ``parent``).
     ##
     ## ``kind`` classifies the failure programmatically; the message string is
     ## informational only. Errors built without ``newPoolError`` have
@@ -198,6 +225,13 @@ type
 proc setPerHost*(e: ref PgConnectionError, value: bool) {.inline.} =
   ## Set ``perHost``. Sibling-only: the hub does not re-export it.
   e.perHost = value
+
+proc newStartupError*(
+    msg: string, serverError: ref PgQueryError
+): ref PgConnectionError {.inline.} =
+  ## The ErrorResponse that answered the startup. Sibling-only, like
+  ## ``setPerHost``.
+  (ref PgConnectionError)(msg: msg, serverError: serverError, atStartup: true)
 
 template newPoolError*(
     errKind: PoolErrorKind, message: string, parentErr: ref Exception = nil
@@ -254,6 +288,9 @@ func serverErrors*(e: ref Exception): seq[ref PgQueryError] =
 
 # Retry classification
 
+func inClass(sqlState, class: string): bool =
+  sqlState.len == 5 and sqlState[0] == class[0] and sqlState[1] == class[1]
+
 func isTransientServerError(se: ref PgQueryError): bool =
   ## Whether a later attempt may get past ``se``; false for nil.
   if se == nil:
@@ -262,17 +299,24 @@ func isTransientServerError(se: ref PgQueryError): bool =
   # statement's 08xxx (a dblink/postgres_fdw link), 53400 (a configured limit)
   # and an ERROR 57014 (a cancel; FATAL is authentication_timeout).
   let s = se.sqlState
-  template inClass(c: string): bool =
-    s.len == 5 and s[0] == c[0] and s[1] == c[1]
-
   const listed = [
     "25P03", "25P04", SqlStateSerializationFailure, SqlStateDeadlockDetected, "55006",
     "55P03", "57P01", "57P02", "57P03", "57P05",
   ]
   let fatal = se.severity == "FATAL"
-  se.severity == "PANIC" or (fatal and inClass("08") and s != "08P01") or
-    (inClass("53") and s != "53400") or s in listed or
+  se.severity == "PANIC" or (fatal and s.inClass("08") and s != "08P01") or
+    (s.inClass("53") and s != "53400") or s in listed or
     (fatal and s == SqlStateQueryCanceled)
+
+func isStatedRefusal(se: ref PgQueryError): bool =
+  ## Whether a startup's ErrorResponse names the config's own fault: 28P01 (a
+  ## wrong password), 3D000 (no such database) or 42501 (no CONNECT privilege);
+  ## false for nil. Listed, not inferred: a proxy or a waking server may answer
+  ## with anything else, and a fresh dial may get past it. Not 28000: an LDAP,
+  ## RADIUS or PAM check answers with it when its own server is down too.
+  if se == nil:
+    return false
+  se.sqlState in ["28P01", "3D000", "42501"]
 
 func catchableParent(e: ref Exception): ref CatchableError =
   if e.parent of CatchableError:
@@ -280,19 +324,124 @@ func catchableParent(e: ref Exception): ref CatchableError =
   else:
     nil
 
-func hasLastingRefusal(e: ref CatchableError): bool =
-  ## Whether a server behind ``e`` refused the session for a cause that recurs.
-  if e of PgConnectionError:
+type RetryAdvice* = enum
+  ## What a retry loop should do about a failure, as one verdict.
+  raRetry ## A later attempt with the same config may succeed.
+  raUnclear ## Neither known to clear nor known to be permanent: retry within a budget.
+  raStop
+    ## Retrying cannot succeed until something outside the process changes: a
+    ## config fault, a closed pool, or a refusal (see `isLastingRefusal`).
+
+type Verdict = enum
+  ## `RetryAdvice` with `raStop` split by cause.
+  vRetry
+  vUnclear
+  vStated
+    ## A server's answer that is not transient: unclear, but a transient
+    ## failure of another leg to the same server does not outweigh it.
+  vRefused ## A server refused the session.
+  vHopeless ## A config fault or a closed pool: no server-side change clears it.
+
+func verdict(e: ref CatchableError): Verdict {.raises: [], gcsafe.} =
+  if e == nil:
+    return vUnclear
+  if e of PgPoolError:
+    case (ref PgPoolError)(e).kind
+    of pekConfigFault, pekClosed:
+      vHopeless
+    of pekRefused:
+      vRefused
+    of pekQueueFull, pekAcquireTimeout:
+      # An acquire timeout's `parent` only explains the wait.
+      vRetry
+    of pekConnectFailed, pekBatchFailed:
+      verdict(e.catchableParent)
+    else:
+      # `pekUnknown`, `pekDefectWrapped`: nothing established either way.
+      vUnclear
+  elif e of PgConfigError:
+    # A cert that will not load, contradicting sslmode options: permanent.
+    vHopeless
+  elif e of PgQueryError:
+    if isTransientServerError((ref PgQueryError)(e)): vRetry else: vUnclear
+  elif e of PgConnectionError:
     let ce = (ref PgConnectionError)(e)
     if ce.attempts.len > 0:
+      var refused, stated, retry = 0
       for a in ce.attempts:
-        if hasLastingRefusal(a):
-          return true
-      false
+        case verdict(a)
+        of vHopeless:
+          # The config every attempt shares is at fault.
+          return vHopeless
+        of vRefused:
+          inc refused
+        of vStated:
+          inc stated
+        of vRetry:
+          inc retry
+        of vUnclear:
+          discard
+      # Each attempt is an alternative: a host, or one host's addresses or
+      # sslmode=allow legs. A refusal speaks only for the server that stated it.
+      if refused == ce.attempts.len:
+        vRefused
+      elif ce.perHost:
+        # `connect`'s hosts must all clear.
+        if retry == ce.attempts.len: vRetry else: vUnclear
+      elif refused + stated > 0:
+        vStated
+      elif retry > 0:
+        vRetry
+      else:
+        vUnclear
+    elif ce.atStartup and isStatedRefusal(ce.serverError):
+      vRefused
+    elif e of PgSecurityError or e of PgProtocolError:
+      # Client-side: says nothing about whether the server will take us next.
+      vUnclear
+    elif e of PgListenError and (ref PgListenError)(e).transportAlive:
+      # Not the reconnect loop's to act on: the connection is still up.
+      vUnclear
+    elif ce.serverError != nil:
+      if isTransientServerError(ce.serverError): vRetry else: vStated
+    elif e of PgListenError:
+      # `parent` is the failure that ended the pump.
+      verdict(e.catchableParent)
     else:
-      ce.serverError != nil and not isTransientServerError(ce.serverError)
+      if e of PgUnavailableError or e of PgTimeoutError: vRetry else: vUnclear
   else:
-    false
+    # `connect` surfaces a single host's `connectTimeout` as is.
+    if e of AsyncTimeoutError: vRetry else: vUnclear
+
+func isLastingRefusal*(e: ref CatchableError): bool {.raises: [], gcsafe.} =
+  ## Whether ``e`` reports a server refusing the session for a cause that
+  ## recurs for the same config (a wrong password, a database that does not
+  ## exist). One is enough: the server has stated it.
+  ##
+  ## Only the ErrorResponse that answered a startup counts, and only a
+  ## ``28P01``, ``3D000`` or ``42501`` one; a FATAL that ended an established
+  ## session never does. Narrower than ``not isTransientError(e)``: an
+  ## unclassified failure such as ``PgProtocolError``, ``08P01``, a proxy's
+  ## ``XX000`` or a ``28000`` (an LDAP server that is down answers with it too)
+  ## is not a refusal, and a fresh dial may get past it. An error
+  ## summing up ``attempts`` is one only when every attempt is: another host or
+  ## ``sslmode=allow`` leg may still take the session, so a mix is ``raUnclear``.
+  verdict(e) == vRefused
+
+func retryAdvice*(e: ref CatchableError): RetryAdvice {.raises: [], gcsafe.} =
+  ## The three-valued verdict for one failure: what a retry loop should call to
+  ## decide whether to keep going.
+  ##
+  ## A ``PgSecurityError`` is ``raUnclear`` even where it recurs for the same
+  ## config: ``require_auth`` or ``channel_binding=require`` the server does
+  ## not meet, a verified SSL connection without a host name. Some clear on a
+  ## server-side change (SSL or SCRAM turned on) and the error does not say
+  ## which, so a loop meets the rest on every attempt: bound it. A requirement
+  ## no server can meet is a ``PgConfigError`` before any dial, so ``raStop``.
+  case verdict(e)
+  of vRetry: raRetry
+  of vUnclear, vStated: raUnclear
+  of vRefused, vHopeless: raStop
 
 func isTransientError*(e: ref CatchableError): bool {.raises: [], gcsafe.} =
   ## Whether retrying what failed with `e` may succeed later with the same
@@ -304,47 +453,10 @@ func isTransientError*(e: ref CatchableError): bool {.raises: [], gcsafe.} =
   ##
   ## True does not mean the connection is gone (check ``conn.state``) or that
   ## replaying is safe (a lost ``COMMIT`` may have committed). Cap retries.
-  if e == nil:
-    false
-  elif e of PgPoolError:
-    case (ref PgPoolError)(e).kind
-    of pekQueueFull, pekAcquireTimeout:
-      # An acquire timeout's `parent` only explains the wait.
-      true
-    of pekConnectFailed, pekBatchFailed:
-      isTransientError(e.catchableParent)
-    else:
-      false
-  elif e of PgQueryError:
-    isTransientServerError((ref PgQueryError)(e))
-  elif e of PgConnectionError:
-    let ce = (ref PgConnectionError)(e)
-    if ce.attempts.len > 0 and ce.perHost:
-      # A host failing for good most likely fails on a config every host shares.
-      var every = true
-      for a in ce.attempts:
-        every = every and isTransientError(a)
-      every
-    elif ce.attempts.len > 0:
-      var any = false
-      for a in ce.attempts:
-        any = any or isTransientError(a)
-      any and not hasLastingRefusal(e)
-    elif e of PgSecurityError or e of PgProtocolError:
-      false
-    elif e of PgListenError and (ref PgListenError)(e).transportAlive:
-      # Not the reconnect loop's to act on: the connection is still up.
-      false
-    elif ce.serverError != nil:
-      isTransientServerError(ce.serverError)
-    elif e of PgListenError:
-      # `parent` is the failure that ended the pump.
-      isTransientError(e.catchableParent)
-    else:
-      e of PgUnavailableError or e of PgTimeoutError
-  else:
-    # `connect` surfaces a single host's `connectTimeout` as is.
-    e of AsyncTimeoutError
+  ##
+  ## A loop deciding when to give up wants ``retryAdvice``: false here does not
+  ## separate ``raStop`` from ``raUnclear``.
+  retryAdvice(e) == raRetry
 
 # PgQueryError field accessors. Field codes are defined by the wire protocol
 # All return "" (or 0 for positions) when the server did not send the field.

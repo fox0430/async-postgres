@@ -349,6 +349,7 @@ async_postgres/pg_connection/types.nim	waitReplWrite
 async_postgres/pg_connection/types.nim	warnStderr
 async_postgres/pg_connection/types.nim	wireSettled
 async_postgres/pg_connection/types.nim	writer
+async_postgres/pg_errors.nim	newStartupError
 async_postgres/pg_errors.nim	setPerHost
 async_postgres/pg_pool.nim	buildReleaseAndReraise
 async_postgres/pg_pool.nim	pendingAcquires
@@ -374,7 +375,7 @@ async_postgres/pg_protocol.nim	describeLengthOverhead
 async_postgres/pg_protocol.nim	encodeInt16
 async_postgres/pg_protocol.nim	encodeInt32
 async_postgres/pg_protocol.nim	executeLengthOverhead
-async_postgres/pg_protocol.nim	export pg_errors except setPerHost
+async_postgres/pg_protocol.nim	export pg_errors except setPerHost, newStartupError
 async_postgres/pg_protocol.nim	outstandingReplies
 async_postgres/pg_protocol.nim	parseLengthOverhead
 async_postgres/pg_protocol.nim	patchLen

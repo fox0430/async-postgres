@@ -51,8 +51,9 @@ import pg_errors
 import
   pg_connection/[types, dsn, buffer_io, simple_query, lifecycle, notify, type_lookup]
 
-# `setPerHost` is sibling-only (`connect` builds its aggregate with it).
-export pg_errors except setPerHost
+# `setPerHost` and `newStartupError` are sibling-only (`connect` builds its
+# errors with them).
+export pg_errors except setPerHost, newStartupError
 
 # `types` — public types, the tracer hook data types and the tracing helpers.
 export types.PgConnState

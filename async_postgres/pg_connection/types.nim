@@ -1833,7 +1833,8 @@ func listenReconnectMaxAttempts*(conn: PgConnection): int {.inline.} =
 
 proc `listenReconnectMaxAttempts=`*(conn: PgConnection, value: int) {.inline.} =
   ## Max reconnect attempts on listen-pump failure (10 default; <=0 = retry
-  ## until `close`).
+  ## until `close`). A refusal — a wrong password, say — or a config fault
+  ## ends the pump at once, whatever the budget left.
   conn.listenReconnectMaxAttempts = value
 
 func listenReconnectMaxBackoff*(conn: PgConnection): int {.inline.} =
