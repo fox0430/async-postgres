@@ -2781,7 +2781,7 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
 
   # Stop maintenance loop
   if pool.maintenanceTask != nil and not pool.maintenanceTask.finished:
-    await cancelAndWait(pool.maintenanceTask)
+    await cancelAndWaitPumped(pool.maintenanceTask)
 
   # Cancel all waiters. PgPoolError (not bare PgError) so a waiter failed
   # by close() matches acquire()'s documented error contract. Skip waiters whose
@@ -2848,6 +2848,6 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
           discard
       for f in pending:
         if not f.finished:
-          await cancelAndWait(f)
+          await cancelAndWaitPumped(f)
     else:
       await allFutures(pending)

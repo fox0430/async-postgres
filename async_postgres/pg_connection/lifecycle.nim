@@ -635,7 +635,7 @@ proc closeImpl*(conn: PgConnection, byUser: bool): Future[void] {.async.} =
       if pumpStopped:
         conn.clearListenStop()
     else:
-      await cancelAndWait(conn.listenTask)
+      await cancelAndWaitPumped(conn.listenTask)
   conn.clearListenTask()
   # Only send Terminate if we haven't already detected the connection is dead
   if conn.state != csClosed and conn.isConnected():
