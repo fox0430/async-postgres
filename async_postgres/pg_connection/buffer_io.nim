@@ -20,7 +20,7 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[options, strutils, tables]
+import std/[options, strutils]
 when defined(posix):
   import std/posix
 
@@ -449,43 +449,6 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
 
 # Notification / notice dispatch lives in ``types`` with the queue fields.
 
-proc recordParameterStatus(
-    conn: PgConnection, name, value: string
-) {.raises: [PgProtocolError].} =
-  ## Store one ``ParameterStatus`` under ``MaxServerParams`` /
-  ## ``MaxServerParamsBytes``. Exceeding either cap is treated as a broken
-  ## peer: the connection is closed and ``PgProtocolError`` is raised. Updates
-  ## to an existing key are always admitted when the resulting byte total fits.
-  let newEntryBytes = name.len + value.len
-  if conn.serverParams.hasKey(name):
-    let oldLen = conn.serverParams.getOrDefault(name).len
-    let delta = value.len - oldLen
-    if delta > 0 and conn.serverParamsBytes > MaxServerParamsBytes - delta:
-      conn.markClosed()
-      raise newException(
-        PgProtocolError,
-        "ParameterStatus: serverParams byte total would exceed maximum of " &
-          $MaxServerParamsBytes,
-      )
-    conn.serverParamsBytes += delta
-    conn.setServerParam(name, value)
-  else:
-    if conn.serverParams.len >= MaxServerParams:
-      conn.markClosed()
-      raise newException(
-        PgProtocolError,
-        "ParameterStatus: serverParams key count exceeds maximum of " & $MaxServerParams,
-      )
-    if newEntryBytes > MaxServerParamsBytes - conn.serverParamsBytes:
-      conn.markClosed()
-      raise newException(
-        PgProtocolError,
-        "ParameterStatus: serverParams byte total would exceed maximum of " &
-          $MaxServerParamsBytes,
-      )
-    conn.setServerParam(name, value)
-    conn.serverParamsBytes += newEntryBytes
-
 # Raw send helpers (asyncdispatch only)
 
 when hasAsyncDispatch:
@@ -578,8 +541,7 @@ proc nextMessage*(
     if res.message.kind == bmkNegotiateProtocolVersion:
       # Informational per libpq; record and drop so callers never see it.
       let m = res.message
-      conn.negotiatedMinorVersion = m.newestMinorVersion
-      conn.unrecognizedStartupOptions = m.unrecognizedOptions
+      conn.noteNegotiatedProtocol(m.newestMinorVersion, m.unrecognizedOptions)
       continue
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
@@ -820,16 +782,11 @@ proc closeTransportImpl(conn: PgConnection) {.async.} =
     # detaching let a racing teardown close the base transport under this
     # frame's still-running TLS close. `reader`/`writer` go with them, or
     # `isConnected()` reports healthy while `peekSocket` sees no transport.
-    let tls = conn.tlsStream
-    let baseReader = conn.baseReader
-    let baseWriter = conn.baseWriter
-    let transport = conn.transport
-    conn.tlsStream = nil
-    conn.baseReader = nil
-    conn.baseWriter = nil
-    conn.transport = nil
-    conn.reader = nil
-    conn.writer = nil
+    let detached = conn.detachTransport()
+    let tls = detached.tls
+    let baseReader = detached.baseReader
+    let baseWriter = detached.baseWriter
+    let transport = detached.transport
     if tls != nil:
       try:
         await tls.reader.closeWait()
@@ -855,9 +812,8 @@ proc closeTransportImpl(conn: PgConnection) {.async.} =
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTransport, e)
   elif hasAsyncDispatch:
-    if not conn.socket.isNil:
-      let socket = conn.socket
-      conn.socket = nil
+    let socket = conn.detachTransport()
+    if not socket.isNil:
       socket.close()
 
 proc closeTransport*(conn: PgConnection) {.async.} =

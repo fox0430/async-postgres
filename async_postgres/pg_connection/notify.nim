@@ -8,10 +8,6 @@ import std/[options, sets]
 import ../[async_backend, pg_errors, pg_protocol]
 import types, buffer_io, simple_query, lifecycle
 
-when hasChronos:
-  import chronos/streams/tlsstream
-  import ../pg_bearssl
-
 const listenBackoffTickMs = 50 ## Backoff tick ms (stop check granularity).
 
 # listenReconnectStopWaitMs lives in types.nim to avoid a circular import.
@@ -52,8 +48,7 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
   conn.resetWireState()
   # Fresh backend holds none of the old session-level advisory locks; stale
   # state would fake an onLeakedSessionLocks on pool release.
-  conn.heldSessionLocks = 0
-  conn.sessionLockDirty = false
+  conn.clearSessionLocks()
   conn.clearStmtCache()
   conn.markState(csConnecting)
 
@@ -74,42 +69,11 @@ proc reconnectInPlace*(conn: PgConnection) {.async.} =
       discard
     conn.markClosed()
     return
-  when hasChronos:
-    conn.transport = newConn.transport
-    conn.baseReader = newConn.baseReader
-    conn.baseWriter = newConn.baseWriter
-    conn.reader = newConn.reader
-    conn.writer = newConn.writer
-    conn.tlsStream = newConn.tlsStream
-    conn.trustAnchorBufs = newConn.trustAnchorBufs
-    conn.x509Capture = newConn.x509Capture
-  elif hasAsyncDispatch:
-    conn.socket = newConn.socket
-
-  conn.sslEnabled = newConn.sslEnabled
-  conn.serverCertDer = newConn.serverCertDer
-  conn.adoptRecvBuf(newConn)
-  conn.host = newConn.host
-  conn.port = newConn.port
-  conn.cancelTarget = newConn.cancelTarget
-  conn.pid = newConn.pid
-  conn.secretKey = newConn.secretKey
-  conn.serverParams = newConn.serverParams
-  conn.serverParamsBytes = newConn.serverParamsBytes
-  conn.txStatus = newConn.txStatus
+  conn.graftReconnectedSession(newConn)
   # Kept until now: a failed dial leaves `conn` dead of the old session's FATAL.
   let oldFatal = conn.fatalServerError
   conn.fatalServerError = nil
   conn.markReady()
-  conn.createdAt = newConn.createdAt
-
-  when hasChronos:
-    # Value-copied x509Capture still holds pointers into newConn (soon freed).
-    # Repoint certDer and the shared engine's x509 slot at conn's own fields.
-    if conn.tlsStream != nil:
-      rebindX509Capture(
-        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
-      )
 
   try:
     for ch in conn.listenChannels:
@@ -231,7 +195,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
         conn.notifyListenDeath("Listen connection lost: " & e.msg, false, cause = e)
         return
       # Auto-reconnect with exponential backoff. Flag guards concurrent stop.
-      conn.listenReconnecting = true
+      conn.setListenReconnecting(true)
       # Taken now: a redial's session may yet record a FATAL of its own.
       let sessionFatal = conn.fatalServerError
       try:
@@ -286,7 +250,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
           )
           return
       finally:
-        conn.listenReconnecting = false
+        conn.setListenReconnecting(false)
 
 proc startListening*(conn: PgConnection) =
   ## Start the notification pump. No-op if one is already running.
@@ -296,10 +260,8 @@ proc startListening*(conn: PgConnection) =
     return
   # Clear stale ``listenError`` (e.g. ``retire=false`` death) now that pump is live.
   conn.listenError = nil
-  conn.listenStopRequested = false
-  conn.listenReconnecting = false
   conn.markState(csListening)
-  conn.listenTask = conn.listenPump()
+  conn.noteListenPumpStarted(conn.listenPump())
 
 proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
   ## Stop failed pump; false = orphan on asyncdispatch (keep ``listenStopRequested``).
@@ -307,7 +269,7 @@ proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
   if conn.listenTask != nil and not conn.listenTask.finished:
     when hasAsyncDispatch:
       # Close transport to break parked recv, then bounded wait.
-      conn.listenStopRequested = true
+      conn.requestListenStop()
       let pump = conn.listenTask
       await conn.closeTransport()
       stopped = false
@@ -342,7 +304,7 @@ template abortAndFailWaiter(
     if not (await conn.abortListenTask()):
       preserveStopFlag = true
   conn.markClosed()
-  conn.listenTask = nil
+  conn.clearListenTask()
   conn.releaseNotifyWaiter(keepWaiter)
 
 proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.async.} =
@@ -352,19 +314,19 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
   ## ``keepWaiter`` preserves the parked waiter for a restart: internal only,
   ## for `listen` / `unlisten`, which stop a live pump on the way in.
   if conn.listenTask == nil or conn.listenTask.finished:
-    conn.listenTask = nil
+    conn.clearListenTask()
     if conn.state == csListening:
       conn.markReady()
     # csClosed + flag set = orphan pump inside reconnectInPlace; keep the flag.
     if conn.state != csClosed:
-      conn.listenStopRequested = false
+      conn.clearListenStop()
     conn.releaseNotifyWaiter(keepWaiter)
     return
   # Request the stop up front, before choosing how to deliver it: this also
   # covers the pump tripping into its reconnect loop *after* we pick the normal
   # path below (a recv that fails the instant we signal) — it still observes the
   # request there and exits instead of looping back into csListening.
-  conn.listenStopRequested = true
+  conn.requestListenStop()
   # Set on every path that leaves a still-running orphan pump, which needs the
   # flag; the `finally` clears it once the pump is known to have stopped.
   var preserveStopFlag = false
@@ -392,7 +354,7 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
         # full window on the detached orphan.
         preserveStopFlag = true
         conn.markClosed()
-        conn.listenTask = nil
+        conn.clearListenTask()
         conn.releaseNotifyWaiter(keepWaiter)
         raise newException(
           PgTimeoutError,
@@ -402,7 +364,7 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
       except CatchableError:
         if not (await conn.abortListenTask()):
           preserveStopFlag = true
-      conn.listenTask = nil
+      conn.clearListenTask()
       conn.releaseNotifyWaiter(keepWaiter)
       return
     # Normal path: pump parked in the recv loop. Signal exit by changing state,
@@ -420,14 +382,14 @@ proc stopListeningImpl(conn: PgConnection, keepWaiter: bool): Future[void] {.asy
       # Send or pump failed: connection is dead
       if not (await conn.abortListenTask()):
         preserveStopFlag = true
-    conn.listenTask = nil
+    conn.clearListenTask()
     # Preserve csClosed if pump detected a connection error
     if conn.state != csClosed:
       conn.markReady()
     conn.releaseNotifyWaiter(keepWaiter)
   finally:
     if not preserveStopFlag:
-      conn.listenStopRequested = false
+      conn.clearListenStop()
 
 proc stopListening*(conn: PgConnection): Future[void] {.async.} =
   ## Stop the notification pump, returning the connection to ``csReady``

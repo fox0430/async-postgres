@@ -444,8 +444,7 @@ proc connectToHostImpl(
             discard
           raise newException(PgConnectionError, e.msg, e)
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.transport = transport
-    conn.cancelTarget = @[dialed.target]
+    conn.attachTransport(transport, dialed.target)
   elif hasAsyncDispatch:
     let dialed = await dialing
     if reached != nil:
@@ -466,8 +465,7 @@ proc connectToHostImpl(
           sock.close()
           raise e
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.socket = sock
-    conn.cancelTarget = @[dialed.target]
+    conn.attachTransport(sock, dialed.target)
 
   try:
     # SSL negotiation (before StartupMessage). Unix sockets skip it (libpq 17
@@ -483,11 +481,7 @@ proc connectToHostImpl(
 
     when hasChronos:
       # If SSL was not established, create plain streams
-      if conn.reader.isNil:
-        conn.baseReader = newAsyncStreamReader(conn.transport)
-        conn.baseWriter = newAsyncStreamWriter(conn.transport)
-        conn.reader = conn.baseReader
-        conn.writer = conn.baseWriter
+      conn.initPlainStreams()
 
     # Send StartupMessage
     var startupParams = config.extraParams
@@ -584,8 +578,7 @@ proc connectToHostImpl(
           # nextMessage, so it is never returned here.
           case msg.kind
           of bmkBackendKeyData:
-            conn.pid = msg.backendPid
-            conn.secretKey = msg.backendSecretKey
+            conn.noteBackendKeyData(msg.backendPid, msg.backendSecretKey)
           of bmkReadyForQuery:
             conn.txStatus = msg.txStatus
             conn.markReady()
@@ -628,7 +621,7 @@ proc closeImpl*(conn: PgConnection, byUser: bool): Future[void] {.async.} =
       # break its recv, then await the pump. A pump inside connect() cannot be
       # cancelled, so the wait is bounded and it is orphaned on timeout; the
       # stop flag stays set to disarm reconnectInPlace's graft.
-      conn.listenStopRequested = true
+      conn.requestListenStop()
       let pump = conn.listenTask
       await conn.closeTransport()
       var pumpStopped = false
@@ -640,10 +633,10 @@ proc closeImpl*(conn: PgConnection, byUser: bool): Future[void] {.async.} =
       except CatchableError:
         pumpStopped = true
       if pumpStopped:
-        conn.listenStopRequested = false
+        conn.clearListenStop()
     else:
       await cancelAndWait(conn.listenTask)
-  conn.listenTask = nil
+  conn.clearListenTask()
   # Only send Terminate if we haven't already detected the connection is dead
   if conn.state != csClosed and conn.isConnected():
     try:
@@ -652,8 +645,7 @@ proc closeImpl*(conn: PgConnection, byUser: bool): Future[void] {.async.} =
       discard
   conn.markClosed()
   conn.resetWireState()
-  conn.heldSessionLocks = 0
-  conn.sessionLockDirty = false
+  conn.clearSessionLocks()
   conn.failNotifyWaiter() # `closedByUser` maps it to PgStateError
   await conn.closeTransport()
 

@@ -92,24 +92,21 @@ template acquireSessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ) =
   discard await conn.queryValue(sql, params, timeout = t)
-  inc conn.heldSessionLocks
-  conn.sessionLockDirty = true
+  conn.noteSessionLockAcquired()
 
 template trySessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ): bool =
   let acquired = await conn.queryValue(bool, sql, params, timeout = t)
   if acquired:
-    inc conn.heldSessionLocks
-    conn.sessionLockDirty = true
+    conn.noteSessionLockAcquired()
   acquired
 
 template unlockSessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ): bool =
   let released = await conn.queryValue(bool, sql, params, timeout = t)
-  if released and conn.heldSessionLocks > 0:
-    dec conn.heldSessionLocks
+  conn.noteSessionLockReleased(released)
   released
 
 proc ensureXactScope(conn: PgConnection) {.inline.} =
@@ -191,8 +188,7 @@ proc advisoryUnlockAll*(
 ): Future[void] {.async.} =
   ## Release all session-level advisory locks held by the current session.
   discard await conn.exec("SELECT pg_advisory_unlock_all()", timeout = timeout)
-  conn.heldSessionLocks = 0
-  conn.sessionLockDirty = false
+  conn.clearSessionLocks()
 
 # Transaction-level exclusive locks
 

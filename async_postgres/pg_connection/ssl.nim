@@ -376,8 +376,7 @@ when hasTls:
 
     when hasChronos:
       let direct = config.sslNegotiation == sslnDirect
-      conn.baseReader = newAsyncStreamReader(conn.transport)
-      conn.baseWriter = newAsyncStreamWriter(conn.transport)
+      conn.beginTlsBase()
 
       # BearSSL matches only dNSName SAN; reject IP-literal hosts up front
       # (asyncdispatch handles them via set1_ip_asc). Per host entry, not the
@@ -440,32 +439,36 @@ when hasTls:
       try:
         if config.sslMode in {sslVerifyCa, sslVerifyFull}:
           let parsed = parseTrustAnchors(config.sslRootCert)
-          conn.trustAnchorBufs = parsed.backing
-            # Must outlive TLS session (see parseTrustAnchors doc)
-          conn.tlsStream = newTLSClientAsyncStream(
-            conn.baseReader,
-            conn.baseWriter,
-            serverName,
-            flags = flags,
-            minVersion = TLSVersion.TLS12,
-            maxVersion = TLSVersion.TLS12,
-            trustAnchors = parsed.store,
-            alpnProtocols = [PgAlpnProtocol],
-            certificate = clientCert,
-            privateKey = clientKey,
+          conn.installTlsStream(
+            newTLSClientAsyncStream(
+              conn.baseReader,
+              conn.baseWriter,
+              serverName,
+              flags = flags,
+              minVersion = TLSVersion.TLS12,
+              maxVersion = TLSVersion.TLS12,
+              trustAnchors = parsed.store,
+              alpnProtocols = [PgAlpnProtocol],
+              certificate = clientCert,
+              privateKey = clientKey,
+            ),
+            parsed.backing,
           )
         else:
           # NoVerifyHost is set, so trust anchors are ignored regardless.
-          conn.tlsStream = newTLSClientAsyncStream(
-            conn.baseReader,
-            conn.baseWriter,
-            serverName,
-            flags = flags,
-            minVersion = TLSVersion.TLS12,
-            maxVersion = TLSVersion.TLS12,
-            alpnProtocols = [PgAlpnProtocol],
-            certificate = clientCert,
-            privateKey = clientKey,
+          conn.installTlsStream(
+            newTLSClientAsyncStream(
+              conn.baseReader,
+              conn.baseWriter,
+              serverName,
+              flags = flags,
+              minVersion = TLSVersion.TLS12,
+              maxVersion = TLSVersion.TLS12,
+              alpnProtocols = [PgAlpnProtocol],
+              certificate = clientCert,
+              privateKey = clientKey,
+            ),
+            @[],
           )
       except TLSStreamInitError as e:
         # Covers cert/key decode failures newTLSClientAsyncStream performs itself
@@ -479,9 +482,6 @@ when hasTls:
           )
         raise
           newException(PgConfigError, "Failed to initialise TLS stream: " & e.msg, e)
-      installX509Capture(
-        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
-      )
       try:
         await conn.tlsStream.handshake()
       except AsyncStreamError as e:
@@ -500,9 +500,7 @@ when hasTls:
         raise newException(PgConnectionError, "TLS handshake failed: " & e.msg, e)
       if direct:
         assertAlpnPostgres(conn.tlsStream.getSelectedAlpnProtocol())
-      conn.reader = conn.tlsStream.reader
-      conn.writer = conn.tlsStream.writer
-      conn.sslEnabled = true
+      conn.finishTls()
     else:
       let direct = config.sslNegotiation == sslnDirect
       var ctx: SslContext
@@ -659,7 +657,7 @@ when hasTls:
             try:
               let derStr = i2d_X509(peerCert)
               if derStr.len > 0:
-                conn.serverCertDer = toBytes(derStr)
+                conn.setServerCertDer(toBytes(derStr))
               else:
                 warnStderr "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
             finally:
