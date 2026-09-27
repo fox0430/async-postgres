@@ -1,4 +1,4 @@
-import std/[net, os, osproc, streams, strutils, unittest]
+import std/[net, os, osproc, streams, strutils, tempfiles, unittest]
 
 import cert_fixtures
 import ../async_postgres/[async_backend, pg_connection, pg_errors]
@@ -174,9 +174,9 @@ suite "TLS error paths: client cert/key/CA loading":
     check waitFor(runTest())
 
   test "sslAllow with client certs is rejected by connectToHost":
-    # The pairing check runs before the sslAllow branch rewrites sslMode to
-    # sslDisable; without it a successful plaintext attempt would silently
-    # drop the certs. No server is needed: the check precedes any dial.
+    # The pairing check rejects sslcert/sslkey with sslmode=allow outright;
+    # without it a successful plaintext attempt would silently drop the certs.
+    # No server is needed: the check precedes any dial.
     proc runTest(): Future[bool] {.async.} =
       var cfg = testConfig(5432, sslAllow)
       cfg.sslCert = readCert("server.crt")
@@ -506,3 +506,80 @@ suite "direct SSL: ALPN enforcement":
         let msg = runAlpnProbe(opensslPath)
         check "ALPN" in msg
         check "without ALPN" in msg
+
+when defined(posix):
+  suite "sslmode=allow over Unix sockets":
+    test "one plaintext attempt; the refusal is not folded with a TLS leg":
+      # libpq never sends SSLRequest over AF_UNIX: allow makes one plaintext
+      # attempt and surfaces its error as-is. A second connection is answered
+      # too, so a regression fails the count instead of hanging the suite.
+      let dir = createTempDir("async_pg_allow_", "")
+      let port = 5432
+      let socketPath = dir / ".s.PGSQL." & $port
+      defer:
+        try:
+          removeFile(socketPath)
+        except OSError:
+          discard
+        try:
+          removeDir(dir)
+        except OSError:
+          discard
+
+      proc rejectStartup(st: MockClient) {.async.} =
+        ## Refuse the startup as a server with its own hba rules would.
+        try:
+          await drainStartupMessage(st)
+          await sendBytes(
+            st,
+            buildErrorResponse(
+              "28P01", "password authentication failed for user \"test\"", "FATAL"
+            ),
+          )
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      var attemptCount = 0
+
+      proc serverHandler(ms: MockServer) {.async.} =
+        for _ in 0 ..< 2:
+          try:
+            # Bounded so a regression cannot hang the suite.
+            let st = await ms.accept().wait(milliseconds(1000))
+            attemptCount.inc
+            await rejectStartup(st)
+          except CatchableError:
+            discard
+
+      proc testBody(dir, socketPath: string): Future[ref CatchableError] {.async.} =
+        let ms = startMockServerUnix(socketPath)
+        let serverFut = serverHandler(ms)
+
+        let config = ConnConfig(
+          host: dir,
+          port: port,
+          user: "test",
+          password: "test",
+          database: "test",
+          sslMode: sslAllow,
+        )
+        try:
+          let conn = await connectToHost(config, HostEntry(host: dir, port: port))
+          await conn.close()
+        except CatchableError as e:
+          result = e
+
+        await closeServer(ms)
+        await serverFut
+
+      let err = waitFor testBody(dir, socketPath)
+      check attemptCount == 1
+      require err != nil
+      require err of PgConnectionError
+      check "password authentication failed" in err.msg
+      # The TCP form folds both legs; over AF_UNIX there is no second leg.
+      check "sslmode=allow" notin err.msg
+      check (ref PgConnectionError)(err).attempts.len == 0
+      # The refusal itself is kept, as `startupError` promises.
+      check (ref PgConnectionError)(err).serverError != nil

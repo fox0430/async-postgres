@@ -341,8 +341,8 @@ proc hostConfig(config: ConnConfig, entry: HostEntry, validated = false): ConnCo
   if not validated:
     validateConnConfig(result)
     validateClientCertConfig(result)
-    # Validate before the sslAllow branch rewrites sslMode to sslDisable, which
-    # would mask an sslnDirect conflict.
+    # The sslAllow plaintext leg skips `negotiateSSL`: a direct/weak-sslmode
+    # conflict has to fail here, before any dial.
     validateDirectSslCompatible(result)
   validateSecurityConfig(result, overTcp = not isUnixSocket(entry.dialAddr))
 
@@ -358,15 +358,22 @@ proc hostConfig(config: ConnConfig, entry: HostEntry, validated = false): ConnCo
         entry.hostaddr,
     )
 
+type AllowLeg = enum
+  ## Which leg of sslmode=allow's plaintext-then-TLS sequence a call runs.
+  ## The plaintext leg keeps sslmode=allow, so only this value marks it.
+  alNone ## Not inside the sequence: the allow branch may run.
+  alPlaintext ## The plaintext leg: TLS negotiation is skipped for it.
+  alTls ## The TLS leg.
+
 proc connectToHostImpl(
     config: ConnConfig,
     entry: HostEntry,
-    allowTlsLeg: bool,
+    allowLeg: AllowLeg,
     targets: seq[DialTarget],
     reached: ref bool = nil,
     checked = false,
 ): Future[PgConnection] {.async.} =
-  ## ``connectToHost``; ``allowTlsLeg`` marks sslmode=allow's TLS attempt,
+  ## ``connectToHost``; ``allowLeg`` which sslmode=allow leg this call is,
   ## ``targets`` what to dial (empty: what ``entry`` resolves to). Sets
   ## ``reached`` once a dial succeeds. ``checked``: ``config`` is already
   ## ``hostConfig``'s.
@@ -377,20 +384,23 @@ proc connectToHostImpl(
       hostConfig(config, entry)
 
   # Without TLS there is no second leg: `negotiateSSL` leaves allow plaintext.
-  if hasTls and config.sslMode == sslAllow and not allowTlsLeg:
+  if hasTls and config.sslMode == sslAllow and allowLeg == alNone:
+    if isUnixSocket(entry.dialAddr):
+      # libpq never sends SSLRequest over AF_UNIX, so allow has no TLS leg
+      # there: one plaintext attempt, its error returned as-is (not folded
+      # with a second, identical one).
+      return await connectToHostImpl(config, entry, alPlaintext, targets, reached, true)
     if config.channelBinding == cbRequire or config.requireAuth == {amScramSha256Plus}:
       # Channel binding and SCRAM-SHA-256-PLUS need TLS, so the plaintext leg
       # could only fail.
-      return await connectToHostImpl(config, entry, true, targets, reached, true)
+      return await connectToHostImpl(config, entry, alTls, targets, reached, true)
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
     # WARNING: This is vulnerable to MITM downgrade attacks. A network
     # attacker can force the first attempt to fail and then intercept
     # the SSL connection. Use sslRequire or stronger if security is needed.
-    var plainConfig = config
-    plainConfig.sslMode = sslDisable
     var plainErr: ref CatchableError
     try:
-      return await connectToHostImpl(plainConfig, entry, false, targets, reached, true)
+      return await connectToHostImpl(config, entry, alPlaintext, targets, reached, true)
     except CancelledError as e:
       raise e
     except CatchableError as e:
@@ -399,7 +409,7 @@ proc connectToHostImpl(
 
     # Still allow, not require: an 'N' here is no refusal of required TLS.
     try:
-      return await connectToHostImpl(config, entry, true, targets, reached, true)
+      return await connectToHostImpl(config, entry, alTls, targets, reached, true)
     except CancelledError as e:
       raise e
     except PgConfigError as e:
@@ -469,14 +479,15 @@ proc connectToHostImpl(
 
   try:
     # SSL negotiation (before StartupMessage). Unix sockets skip it (libpq 17
-    # parity: sslnegotiation is ignored for AF_UNIX). Certificate verification
-    # must use the host *name*, never the dialed hostaddr, and must be per-entry:
-    # with multi-host failover config.host only reflects the first entry.
+    # parity: sslnegotiation is ignored for AF_UNIX), and allow's plaintext leg
+    # (allowLeg) too. Certificate verification must use the host *name*, never
+    # the dialed hostaddr, and must be per-entry: with multi-host failover
+    # config.host only reflects the first entry.
     if isUnix and config.sslCert.len > 0:
       # Unix sockets skip TLS regardless of sslmode, so a configured client
       # cert is silently dropped — warn like the sslPrefer 'N' fallback path.
       warnStderr "pg_connection: client certificate will NOT be sent over Unix-socket connection (TLS is skipped for AF_UNIX)"
-    if config.sslMode != sslDisable and not isUnix:
+    if config.sslMode != sslDisable and not isUnix and allowLeg != alPlaintext:
       await negotiateSSL(conn, config, entry.host)
 
     when hasChronos:
@@ -604,7 +615,7 @@ proc connectToHost*(config: ConnConfig, entry: HostEntry): Future[PgConnection] 
   ##
   ## On Unix sockets TLS is skipped (libpq parity); if ``sslCert`` is set a
   ## stderr warning is emitted because the client certificate is not sent.
-  connectToHostImpl(config, entry, false, @[])
+  connectToHostImpl(config, entry, alNone, @[])
 
 # Close
 
@@ -686,7 +697,7 @@ proc attemptHost(
     reached: ref bool,
 ): Future[PgConnection] {.async.} =
   ## Dial ``target`` and verify ``attrs``; nil = wrong role (already closed).
-  let conn = await connectToHostImpl(config, entry, false, @[target], reached, true)
+  let conn = await connectToHostImpl(config, entry, alNone, @[target], reached, true)
   if attrs == tsaAny or await conn.matchesOrClose(attrs):
     return conn
   return nil

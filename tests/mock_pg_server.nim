@@ -14,7 +14,9 @@ import ../async_postgres/[async_backend, pg_protocol]
 
 when hasAsyncDispatch:
   import std/asyncnet
-  from std/nativesockets import Domain
+  from std/nativesockets import Domain, SockType, Protocol
+  when defined(posix):
+    import std/os
 
 # Types and low-level transport
 
@@ -34,6 +36,13 @@ when hasChronos:
   proc startMockServer*(host = "127.0.0.1"): MockServer =
     let server = createStreamServer(initTAddress(host, 0))
     MockServer(server: server, port: int(server.localAddress().port))
+
+  when defined(posix):
+    proc startMockServerUnix*(socketPath: string): MockServer =
+      ## Listen on the Unix-domain socket ``socketPath`` (AF_UNIX). The caller
+      ## creates the directory and removes the socket file afterwards.
+      let server = createStreamServer(initTAddress(socketPath))
+      MockServer(server: server, port: 0)
 
   proc accept*(ms: MockServer): Future[MockClient] =
     ms.server.accept()
@@ -131,6 +140,22 @@ elif hasAsyncDispatch:
     let port = int(sock.getLocalAddr()[1])
     sock.listen()
     MockServer(socket: sock, port: port)
+
+  when defined(posix):
+    proc startMockServerUnix*(socketPath: string): MockServer =
+      ## Listen on the Unix-domain socket ``socketPath`` (AF_UNIX). The caller
+      ## creates the directory and removes the socket file afterwards.
+      # bindUnix fails on a stale file left by an earlier run.
+      try:
+        removeFile(socketPath)
+      except OSError:
+        discard
+      let sock = newAsyncSocket(
+        Domain.AF_UNIX, SockType.SOCK_STREAM, Protocol.IPPROTO_IP, buffered = false
+      )
+      sock.bindUnix(socketPath)
+      sock.listen()
+      MockServer(socket: sock, port: 0)
 
   proc accept*(ms: MockServer): Future[MockClient] =
     ms.socket.accept()

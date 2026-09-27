@@ -149,6 +149,9 @@ suite "E2E: SSL Connection":
       let conn = await connect(sslConfig(sslAllow))
       doAssert conn.state == csReady
       doAssert conn.sslEnabled == false
+      # The plaintext leg keeps sslmode=allow, so a reconnect still tries TLS
+      # (libpq `PQreset` parity).
+      doAssert conn.config.sslMode == sslAllow
       await conn.close()
 
     waitFor t()
