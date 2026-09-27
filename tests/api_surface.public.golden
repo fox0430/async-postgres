@@ -148,6 +148,8 @@ async_postgres/async_backend.nim	`==`
 async_postgres/async_backend.nim	allFutures
 async_postgres/async_backend.nim	asyncSpawn
 async_postgres/async_backend.nim	cancelAndWait
+async_postgres/async_backend.nim	cancelAndWaitPumped
+async_postgres/async_backend.nim	cancelAndWaitPumped#2
 async_postgres/async_backend.nim	cancelTimer
 async_postgres/async_backend.nim	cancelTimer#2
 async_postgres/async_backend.nim	completed

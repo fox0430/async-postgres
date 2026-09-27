@@ -43,6 +43,29 @@ when hasChronos:
     if not fut.finished():
       fut.cancelSoon()
 
+  proc cancelAndWaitPumped*(fut: Future[void]): Future[void] {.async.} =
+    ## Cancel `fut` and wait until it settles, keeping the event loop awake.
+    ##
+    ## chronos 4.4.x may park a cancellation retry until the next I/O or timer
+    ## event, so a bare `cancelAndWait` can stall with no other timer around.
+    ## A 1ms timer raced against `fut` keeps the loop awake. Never raises:
+    ## `fut`'s outcome is left unread, and its own cancellation is ignored so
+    ## close paths always observe completion.
+    if fut == nil or fut.finished():
+      return
+    fut.cancelSoon()
+    while not fut.finished():
+      var timer = sleepAsync(milliseconds(1))
+      try:
+        discard await race(FutureBase(fut), FutureBase(timer))
+      except CatchableError:
+        # Keep pumping through our own cancellation.
+        discard
+      if not timer.finished():
+        # Fire-and-forget: awaiting the timer would let our own cancellation
+        # escape, breaking "Never raises". `cancelTimer` cannot suspend.
+        cancelTimer(timer)
+
   proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
     ## Register a file descriptor for read-readiness notifications on the event loop.
     ## `cb` is called whenever the fd becomes readable.
@@ -218,6 +241,11 @@ elif hasAsyncDispatch:
     ##   still complete. Do not reuse the affected resource (socket, buffer)
     ##   after calling this under asyncdispatch. chronos cancels the future
     ##   properly.
+    discard
+
+  proc cancelAndWaitPumped*(fut: Future[void]): Future[void] {.async.} =
+    ## No-op like `cancelAndWait`: asyncdispatch has no cancellation primitive
+    ## and nothing to pump. Exists so close paths call one name on both backends.
     discard
 
   proc asyncSpawn*(fut: Future[void]) =

@@ -281,7 +281,7 @@ proc abortListenTask(conn: PgConnection): Future[bool] {.async.} =
       except CatchableError:
         stopped = true
     else:
-      await cancelAndWait(conn.listenTask)
+      await cancelAndWaitPumped(conn.listenTask)
   conn.markClosed()
   return stopped
 

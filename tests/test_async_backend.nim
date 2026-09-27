@@ -175,6 +175,84 @@ suite "cancelAndWait":
     else:
       waitFor fut
 
+suite "cancelAndWaitPumped":
+  test "returns immediately for nil and finished futures":
+    let empty: Future[void] = nil
+    waitFor cancelAndWaitPumped(empty)
+    let done = sleepMsAsync(1)
+    waitFor done
+    waitFor cancelAndWaitPumped(done)
+    check done.finished
+
+  test "cancels a pending sleep without raising":
+    let fut = sleepAsync(milliseconds(30))
+    let start = Moment.now()
+    waitFor cancelAndWaitPumped(fut)
+    check Moment.now() - start < seconds(2)
+    when hasChronos:
+      waitFor sleepMsAsync(1)
+      check fut.cancelled
+    else:
+      waitFor fut
+
+  test "leaves a failed future's outcome for the caller":
+    proc boom(): Future[void] {.async.} =
+      raise newException(ValueError, "boom")
+
+    let fut = boom()
+    try:
+      waitFor fut
+    except ValueError:
+      discard
+    check fut.failed
+    waitFor cancelAndWaitPumped(fut)
+    check fut.failed
+    check fut.error != nil
+
+  test "settles through extra async layers within bounds":
+    proc level3(): Future[void] {.async.} =
+      await sleepAsync(milliseconds(30))
+
+    proc level2(): Future[void] {.async.} =
+      await level3()
+
+    proc level1(): Future[void] {.async.} =
+      await level2()
+
+    let fut = level1()
+    let start = Moment.now()
+    waitFor cancelAndWaitPumped(fut)
+    check Moment.now() - start < seconds(2)
+    when hasChronos:
+      waitFor sleepMsAsync(1)
+      check fut.finished
+
+  test "settles a target that only advances on ticks (no timer around)":
+    # The target absorbs the initial cancel, then settles purely via ticks
+    # with no timer/callback/idler to wake the loop. chronos 4.4.x ignores
+    # ticks when computing the poll timeout, so a bare `cancelAndWait`
+    # wedges here: reverting the pump hangs this test instead of failing it.
+    when hasChronos:
+      proc tickBoundTarget(): Future[void] {.async.} =
+        try:
+          await stepsAsync(5)
+        except CancelledError:
+          await stepsAsync(5)
+
+      let fut = tickBoundTarget()
+      let start = Moment.now()
+      waitFor cancelAndWaitPumped(fut)
+      check Moment.now() - start < seconds(2)
+      check fut.finished
+      check fut.completed()
+    else:
+      # No tick starvation on asyncdispatch (`cancelAndWait` is a no-op),
+      # so only smoke-test the shared call shape.
+      let done = sleepMsAsync(1)
+      waitFor done
+      waitFor cancelAndWaitPumped(done)
+      check done.finished
+
 suite "asyncSpawn":
   test "runs the future to completion":
     var ran = false

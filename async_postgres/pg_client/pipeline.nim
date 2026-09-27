@@ -470,7 +470,7 @@ template settleSendFut(sendFut: untyped) =
   when hasChronos:
     if not sendFut.finished:
       try:
-        await cancelAndWait(sendFut)
+        await cancelAndWaitPumped(sendFut)
       except CatchableError:
         discard
     else:
