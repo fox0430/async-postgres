@@ -73,7 +73,7 @@
 ## ``@[toPgParamInline(a), toPgParamInline(b)]`` — which avoids per-parameter
 ## heap allocations for scalar types.
 ##
-## 3. `queryDirect`/`execDirect` — zero-allocation macros
+## 3. `queryDirect`/`execDirect` — low-allocation macros
 ## ----------------------------------------------------------------------
 ## Encodes parameters directly into the connection's send buffer at compile
 ## time; no intermediate ``seq[PgParam]`` or ``seq[byte]`` is built.
@@ -81,8 +81,8 @@
 ## .. code-block:: nim
 ##   let qr = await conn.queryDirect("SELECT name FROM users WHERE id = $1", myId)
 ##
-## - Pros: no per-call allocations for the parameter path; same statement
-##   cache semantics as `query`.
+## - Pros: no per-call allocations for the parameter path (building the
+##   `QueryResult` still allocates); same statement cache semantics as `query`.
 ## - Cons: SQL must be a string literal/compile-time constant; arguments are
 ##   positional (``$1, $2, …``), no ``{expr}`` sugar.
 ## - Use when: the call site is on a hot path and params are scalars.
@@ -117,7 +117,7 @@
 ## Modules
 ## =======
 ## - `pg_connection <async_postgres/pg_connection.html>`_ — Connection management, DSN parsing, SSL, LISTEN/NOTIFY
-## - `pg_client <async_postgres/pg_client.html>`_ — Query execution, prepared statements, cursors, pipelines, transactions, COPY, zero-alloc macros (``queryDirect``/``execDirect``)
+## - `pg_client <async_postgres/pg_client.html>`_ — Query execution, prepared statements, cursors, pipelines, transactions, COPY, low-alloc macros (``queryDirect``/``execDirect``)
 ## - `pg_pool <async_postgres/pg_pool.html>`_ — Connection pooling with health checks and maintenance
 ## - `pg_pool_cluster <async_postgres/pg_pool_cluster.html>`_ — Read replica pool cluster with automatic query routing
 ## - `pg_types <async_postgres/pg_types.html>`_ — Type conversions (``toPgParam``, row accessors, arrays, ranges, composites, enums)

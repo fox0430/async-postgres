@@ -148,6 +148,6 @@ export cursor.conn
 export cursor.fields
 export cursor.exhausted
 
-# `direct` — zero-allocation macros.
+# `direct` — low-allocation macros (allocation-free parameter encoding).
 export direct.queryDirect
 export direct.execDirect
