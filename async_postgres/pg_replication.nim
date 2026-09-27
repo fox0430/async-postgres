@@ -1270,11 +1270,38 @@ proc finishStream(
     kind: ReplStreamKind,
     txStatus: TransactionStatus,
     queryError: ref PgQueryError,
+    copyDoneSeen = true,
 ) {.async.} =
   ## ReadyForQuery ends the stream: settle our writes, then hand the connection
   ## back unless a write that failed meanwhile left it dead.
+  ##
+  ## ``copyDoneSeen`` is false when ReadyForQuery arrives in the receive loop:
+  ## no server CopyDone and no error. On a logical stream that is a reused
+  ## connection's end (BUG #18754, the walsender does not reset its streaming
+  ## flags), so the connection cannot stream logical replication again. A
+  ## physical one does reset them, so no ordinary stream ends that way. Either
+  ## way the connection is retired (``csClosed``) and ``PgUnavailableError``
+  ## raised.
   await conn.awaitReplWritesIdle()
   conn.raiseIfStreamClosed(kind, queryError)
+  if not copyDoneSeen and queryError == nil:
+    conn.markClosed()
+    # Only a reused logical connection ends here: the logical walsender keeps
+    # its streaming flags across START_REPLICATION (BUG #18754). A physical
+    # walsender resets them, so no ordinary stream ends that way and there is
+    # no cause to name for it.
+    let cause =
+      case kind
+      of rskLogical:
+        "; PostgreSQL cannot restart logical replication on a connection that" &
+          " already streamed (BUG #18754)"
+      of rskPhysical:
+        "; no error explains it"
+    raise newException(
+      PgUnavailableError,
+      kind.label & ": the server ended the stream without CopyDone" & cause &
+        ", reconnect to resume",
+    )
   conn.txStatus = txStatus
   conn.markReady()
   if queryError != nil:
@@ -1379,9 +1406,9 @@ proc runReplicationStream(
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
-          # The server left COPY on an error: settle our writes before the
-          # connection is handed back.
-          await conn.finishStream(kind, msg.txStatus, queryError)
+          # No server CopyDone: either the server left COPY on an error, or it
+          # ended the stream without CopyDone. finishStream tells the two apart.
+          await conn.finishStream(kind, msg.txStatus, queryError, copyDoneSeen = false)
           return
         else:
           discard
@@ -1457,11 +1484,18 @@ proc startReplication*(
   ## ``statusInterval`` on a stream that may stay busy for long, as its
   ## walsender sends no idle keepalive meanwhile.
   ##
+  ## A connection can stream logical replication only once: its walsender does
+  ## not reset the streaming flags, so the next ``START_REPLICATION ...
+  ## LOGICAL`` on it ends at once (BUG #18754). The library retires the
+  ## connection (``csClosed``) and raises ``PgUnavailableError`` — accepted by
+  ## ``isTransientError`` — so reconnect and resume with ``InvalidLsn``.
+  ##
   ## Requires ``publication_names`` in ``options`` and ``autoKeepaliveReply``
   ## (``ValueError`` otherwise).
   ##
-  ## Returns on server ``CopyDone`` or connection close. To stop from the client
-  ## side, call ``stopReplication`` from the callback (or a concurrent task).
+  ## Returns on server ``CopyDone`` or connection close, or raises
+  ## ``PgUnavailableError`` as above. To stop from the client side, call
+  ## ``stopReplication`` from the callback (or a concurrent task).
   ##
   ## Errors poison connection. Track LSN for resume. A failing auto-reply
   ## propagates too, and the callback is *not* invoked for that keepalive.
@@ -1642,6 +1676,9 @@ proc startPhysicalReplication*(
   ## ``csReady``. Error handling matches ``startReplication``: a callback
   ## exception or any other mid-stream failure poisons the connection (marked
   ## closed) and propagates, so reconnect and resume from the last LSN tracked.
+  ## A ReadyForQuery without ``CopyDone`` retires the connection and raises
+  ## ``PgUnavailableError`` too, with no cause named: a physical walsender does
+  ## reset its streaming flags, so no ordinary stream ends that way.
   ##
   ## ``slotName = ""`` streams without a slot. Non-zero ``timeline`` is sent as
   ## ``TIMELINE n`` (negative raises ``ValueError``). ``statusInterval`` behaves
