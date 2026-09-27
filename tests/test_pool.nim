@@ -4853,7 +4853,7 @@ suite "The non-pipelined exec/query path pre-flights like the pipeline does":
     conn.addStmtCache("SELECT 1", CachedStmt(name: "_sc_1"))
     var batch: seq[byte] = @[]
     conn.stagePendingStmtCloses(batch)
-    conn.sendBuf.setLen(0)
+    conn.clearSendBuf()
     conn.evictForInsert(batch)
     check conn.stagedStmtCloses == @["_sc_1"]
     var expected: seq[byte] = @[]

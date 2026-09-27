@@ -288,7 +288,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
 
       template emitBind(stmt: string, resultFmts: openArray[int16]) =
         if hasInline:
-          conn.sendBuf.addBindRaw(
+          conn.addBindRaw(
             "",
             stmt,
             currentFormats(),
@@ -297,15 +297,13 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
             resultFmts,
           )
         else:
-          conn.sendBuf.addBind("", stmt, currentFormats(), p.ops[i].params, resultFmts)
+          conn.addBind("", stmt, currentFormats(), p.ops[i].params, resultFmts)
 
       template emitParse(stmt: string) =
         if hasInline:
-          conn.sendBuf.addParse(
-            stmt, p.ops[i].sql, p.inlineOids.toOpenArray(startIdx, endIdx)
-          )
+          conn.addParse(stmt, p.ops[i].sql, p.inlineOids.toOpenArray(startIdx, endIdx))
         else:
-          conn.sendBuf.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
+          conn.addParse(stmt, p.ops[i].sql, p.ops[i].paramOids)
 
       template currentOidsMatch(cachedOids: seq[int32]): bool =
         if hasInline:
@@ -321,7 +319,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
         # would miss this build's own staging.
         if not currentOidsMatch(cached.paramOids):
           conn.removeStmtCache(p.ops[i].sql)
-          conn.stageEvictedClose(conn.sendBuf, cached.name)
+          conn.stageEvictedClose(cached.name)
           cacheHit = false
       p.ops[i].cache = scsUncached
       p.ops[i].cacheSuperseded = false
@@ -344,7 +342,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
             else:
               p.ops[i].resultFormats
         emitBind(cached.name, effectiveResultFormats)
-        conn.sendBuf.addExecute("", 0)
+        conn.addExecute("", 0)
       elif conn.stmtCacheCapacity > 0:
         var shared = false
         if inFlight.hasKey(p.ops[i].sql):
@@ -357,12 +355,12 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
             p.ops[i].stmtName = entry.stmtName
             emitBind(entry.stmtName, p.ops[i].resultFormats)
             if p.ops[i].kind == pokQuery:
-              conn.sendBuf.addDescribe(dkPortal, "")
-            conn.sendBuf.addExecute("", 0)
+              conn.addDescribe(dkPortal, "")
+            conn.addExecute("", 0)
           else:
             # Same SQL, different OIDs — close the in-flight stmt and demote its
             # creator; the fall-through Parses again with the new OIDs.
-            conn.sendBuf.addClose(dkStatement, entry.stmtName)
+            conn.addClose(dkStatement, entry.stmtName)
             p.ops[entry.opIdx].cacheSuperseded = true
             dec pendingCacheAdds
             inFlight.del(p.ops[i].sql)
@@ -372,12 +370,12 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
           if conn.stmtCacheSize() + pendingCacheAdds >= conn.stmtCacheCapacity and
               conn.stmtCacheSize() > 0:
             let evicted = conn.evictStmtCache()
-            conn.stageEvictedClose(conn.sendBuf, evicted.name)
+            conn.stageEvictedClose(evicted.name)
           inc pendingCacheAdds
           emitParse(p.ops[i].stmtName)
-          conn.sendBuf.addDescribe(dkStatement, p.ops[i].stmtName)
+          conn.addDescribe(dkStatement, p.ops[i].stmtName)
           emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
-          conn.sendBuf.addExecute("", 0)
+          conn.addExecute("", 0)
           # Deep-copy so the inFlight entry does not alias the op's storage,
           # which is a slice of the pipeline-level SoA on the inline path.
           let recordedOids =
@@ -391,16 +389,16 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
         emitParse("")
         emitBind("", p.ops[i].resultFormats)
         if p.ops[i].kind == pokQuery:
-          conn.sendBuf.addDescribe(dkPortal, "")
-        conn.sendBuf.addExecute("", 0)
+          conn.addDescribe(dkPortal, "")
+        conn.addExecute("", 0)
 
       if perOpSync:
-        conn.sendBuf.addSync()
+        conn.addSync()
 
     # The trailing Sync belongs to the batch, not to the last op.
     encodingOp = -1
     if not perOpSync:
-      conn.sendBuf.addSync()
+      conn.addSync()
   except PgError as e:
     # Only the encoders raise these two, so the interleaved cache bookkeeping
     # is not blamed on the in-flight op.

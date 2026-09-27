@@ -10,7 +10,9 @@
 ##                                  templates (`withConnTracing`,
 ##                                  `withTracing`). Also the operations
 ##                                  that keep `PgConnection`'s private
-##                                  fields consistent: receive buffering,
+##                                  fields consistent and assemble the
+##                                  outgoing messages: send-buffer
+##                                  builders, receive buffering,
 ##                                  wire-debt counters, the statement
 ##                                  cache with its Close queues, the
 ##                                  notification queue, and the replication

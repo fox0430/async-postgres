@@ -318,7 +318,7 @@ suite "reconnectInPlace session state reset":
       # Seed the shape a typed advisoryLock + a partial send would leave.
       conn.heldSessionLocks = 3
       conn.sessionLockDirty = true
-      conn.sendBuf = @[byte 0xAA, 0xBB, 0xCC]
+      conn.addSync() # stale bytes from a partial send
       preHeld = conn.heldSessionLocks
       preDirty = conn.sessionLockDirty
       preSendLen = conn.sendBuf.len
@@ -341,7 +341,7 @@ suite "reconnectInPlace session state reset":
     # Sanity: seeding took effect (otherwise "reset to 0" proves nothing).
     check preHeld == 3
     check preDirty
-    check preSendLen == 3
+    check preSendLen > 0
     check finalHeld == 0
     check not finalDirty
     check finalSendLen == 0

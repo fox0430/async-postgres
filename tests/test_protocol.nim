@@ -2926,6 +2926,74 @@ suite "What a send leaves the backend owing":
     wide.add(newSeq[byte](19))
     check outstandingReplies(wide) == (5, true)
 
+suite "Connection-level send-buffer builders equal the buffer-level builders":
+  ## The `conn.addX` overloads must forward every argument to the buffer-level
+  ## builders: a dropped default or a swapped overload would only surface on a
+  ## live connection. Each test builds the same bytes both ways and compares.
+  proc mockConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "addParse/addBind/addDescribe/addExecute/addClose/addSync/addFlush forward":
+    var buf: seq[byte]
+    buf.addParse("s1", "SELECT $1, $2", [OidInt4, OidText])
+    buf.addBind("", "s1", [1'i16, 0'i16], [some(@[1'u8]), none(seq[byte])], [1'i16])
+    buf.addDescribe(dkStatement, "s1")
+    buf.addExecute("", 5)
+    buf.addClose(dkPortal, "")
+    buf.addSync()
+    buf.addFlush()
+
+    var conn = mockConn()
+    conn.addParse("s1", "SELECT $1, $2", [OidInt4, OidText])
+    conn.addBind("", "s1", [1'i16, 0'i16], [some(@[1'u8]), none(seq[byte])], [1'i16])
+    conn.addDescribe(dkStatement, "s1")
+    conn.addExecute("", 5)
+    conn.addClose(dkPortal, "")
+    conn.addSync()
+    conn.addFlush()
+    check conn.sendBuf == buf
+
+  test "the PgParam overloads forward OIDs, formats, and values":
+    let params = [
+      PgParam(oid: OidInt4, format: 1, value: some(@[0'u8, 0, 0, 7])),
+      PgParam(oid: OidText, format: 0, value: none(seq[byte])),
+    ]
+    var buf: seq[byte]
+    buf.addParse("s2", "SELECT $1, $2", params)
+    buf.addBind("", "s2", params, [1'i16])
+
+    var conn = mockConn()
+    conn.addParse("s2", "SELECT $1, $2", params)
+    conn.addBind("", "s2", params, [1'i16])
+    check conn.sendBuf == buf
+
+  test "addBindRaw forwards bytes, ranges, and formats":
+    let data = @[1'u8, 2, 3, 4]
+    let ranges = @[(off: int32(0), len: int32(2)), (off: int32(2), len: int32(2))]
+    var buf: seq[byte]
+    buf.addBindRaw("", "s3", [1'i16, 1'i16], data, ranges, [])
+
+    var conn = mockConn()
+    conn.addBindRaw("", "s3", [1'i16, 1'i16], data, ranges, [])
+    check conn.sendBuf == buf
+
+  test "addParseDirect/addBindDirect forward the argument list":
+    var buf: seq[byte]
+    buf.addParseDirect("myStmt", "SELECT $1, $2", 1'i32, "x")
+    buf.addBindDirect("p", "myStmt", @[0'i16], 1'i32, "abc")
+
+    var conn = mockConn()
+    conn.addParseDirect("myStmt", "SELECT $1, $2", 1'i32, "x")
+    conn.addBindDirect("p", "myStmt", @[0'i16], 1'i32, "abc")
+    check conn.sendBuf == buf
+
 suite "Retiring a connection on the replies it still owes":
   proc pipelinedConn(pending: int, unsynced = false): PgConnection =
     PgConnection(
@@ -3005,7 +3073,7 @@ suite "Retiring a connection on the replies it still owes":
     ## connection.
     let conn = pipelinedConn(2, unsynced = true)
     conn.recvBuf = readyForQuery
-    conn.sendBuf = encodeSync()
+    conn.addSync()
     conn.resetWireState()
     check conn.wireSettled
     check conn.recvBuf.len == 0

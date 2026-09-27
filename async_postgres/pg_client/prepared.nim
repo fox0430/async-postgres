@@ -133,9 +133,9 @@ proc executeImpl*(
   validateTypedParams(effective, resultFormats.len, stmt.name.len)
 
   conn.beginSendBuf()
-  conn.sendBuf.addBind("", stmt.name, effective, resultFormats)
-  conn.sendBuf.addExecute("", 0)
-  conn.sendBuf.addSync()
+  conn.addBind("", stmt.name, effective, resultFormats)
+  conn.addExecute("", 0)
+  conn.addSync()
   conn.markBusy()
   await conn.sendStagedBufMsg()
 

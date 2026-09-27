@@ -33,20 +33,20 @@ proc queryInTransactionImpl(
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
   conn.beginSendBuf()
   # BEGIN
-  conn.sendBuf.addParse("", beginSql)
-  conn.sendBuf.addBind("", "", @[], @[])
-  conn.sendBuf.addExecute("", 0)
+  conn.addParse("", beginSql)
+  conn.addBind("", "", @[], @[])
+  conn.addExecute("", 0)
   # User SQL
-  conn.sendBuf.addParse("", sql, paramOids)
-  conn.sendBuf.addBind("", "", formats, params, resultFormats)
-  conn.sendBuf.addDescribe(dkPortal, "")
-  conn.sendBuf.addExecute("", 0)
+  conn.addParse("", sql, paramOids)
+  conn.addBind("", "", formats, params, resultFormats)
+  conn.addDescribe(dkPortal, "")
+  conn.addExecute("", 0)
   # COMMIT
-  conn.sendBuf.addParse("", "COMMIT")
-  conn.sendBuf.addBind("", "", @[], @[])
-  conn.sendBuf.addExecute("", 0)
+  conn.addParse("", "COMMIT")
+  conn.addBind("", "", @[], @[])
+  conn.addExecute("", 0)
   # Single Sync
-  conn.sendBuf.addSync()
+  conn.addSync()
   conn.markBusy()
   await conn.sendStagedBufMsg()
 

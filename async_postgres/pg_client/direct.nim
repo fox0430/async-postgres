@@ -361,18 +361,20 @@ proc makeDirectPreflight(
   )
 
 proc makeBindDirectCall(
-    sendBufNode, portal, stmt, rfNode: NimNode, argList: NimNode
+    connNode, portal, stmt, rfNode: NimNode, argList: NimNode
 ): NimNode =
-  ## Emit an `addBindDirect` call. `rfNode` is the result-format list — for
-  ## execDirect callers pass an empty `nnkBracket` literal (rows discarded),
-  ## for queryDirect callers pass the `effectiveRf` variable node.
-  result = newCall(bindSym"addBindDirect", sendBufNode, portal, stmt, rfNode)
+  ## Emit an `addBindDirect` call targeting the connection's send buffer.
+  ## `rfNode` is the result-format list — for execDirect callers pass an empty
+  ## `nnkBracket` literal (rows discarded), for queryDirect callers pass the
+  ## `effectiveRf` variable node.
+  result = newCall(bindSym"addBindDirect", connNode, portal, stmt, rfNode)
   for i in 0 ..< argList.len:
     result.add(argList[i])
 
-proc makeParseDirectCall(sendBufNode, stmt, sql: NimNode, argList: NimNode): NimNode =
-  ## Emit an `addParseDirect` call. Shared verbatim by queryDirect and execDirect.
-  result = newCall(bindSym"addParseDirect", sendBufNode, stmt, sql)
+proc makeParseDirectCall(connNode, stmt, sql: NimNode, argList: NimNode): NimNode =
+  ## Emit an `addParseDirect` call targeting the connection's send buffer.
+  ## Shared verbatim by queryDirect and execDirect.
+  result = newCall(bindSym"addParseDirect", connNode, stmt, sql)
   for i in 0 ..< argList.len:
     result.add(argList[i])
 
@@ -393,11 +395,9 @@ proc buildDirectSendDispatch(
   ##   * queryDirect's cache-hit path copies `fields`, `colFmts`, `colOids`,
   ##     `resultFormats` out of the CachedStmt for the receive loop.
   ## For `isExec: true` the last four sym args are unused (pass any node).
-  let sendBufSym = bindSym"sendBuf"
   let evictForInsertSym = bindSym"evictForInsert"
   let beginSendBufSym = bindSym"beginSendBuf"
   let stmtCachingEnabledSym = bindSym"stmtCachingEnabled"
-  let sendBufNode = newCall(sendBufSym, connSym)
 
   proc rfNode(): NimNode =
     if isExec:
@@ -416,46 +416,46 @@ proc buildDirectSendDispatch(
       `colOidsSym` = `cachedSym`.colOids
       `effectiveRfSym` = `cachedSym`.resultFormats
   hitBlock.add makeBindDirectCall(
-    sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
+    connSym, newStrLitNode(""), stmtNameSym, rfNode(), argList
   )
   hitBlock.add quote do:
-    `sendBufSym`(`connSym`).addExecute("", 0)
-    `sendBufSym`(`connSym`).addSync()
+    `connSym`.addExecute("", 0)
+    `connSym`.addSync()
 
   # Cache miss path
   let missBlock = newStmtList()
   missBlock.add quote do:
     `cacheMissSym` = true
     `stmtNameSym` = `connSym`.nextStmtName()
-    `evictForInsertSym`(`connSym`, `sendBufSym`(`connSym`))
+    `evictForInsertSym`(`connSym`)
   if not isExec:
     missBlock.add quote do:
       `effectiveRfSym` = @[]
-  missBlock.add makeParseDirectCall(sendBufNode, stmtNameSym, sqlSym, argList)
+  missBlock.add makeParseDirectCall(connSym, stmtNameSym, sqlSym, argList)
   missBlock.add quote do:
-    `sendBufSym`(`connSym`).addDescribe(dkStatement, `stmtNameSym`)
+    `connSym`.addDescribe(dkStatement, `stmtNameSym`)
   missBlock.add makeBindDirectCall(
-    sendBufNode, newStrLitNode(""), stmtNameSym, rfNode(), argList
+    connSym, newStrLitNode(""), stmtNameSym, rfNode(), argList
   )
   missBlock.add quote do:
-    `sendBufSym`(`connSym`).addExecute("", 0)
-    `sendBufSym`(`connSym`).addSync()
+    `connSym`.addExecute("", 0)
+    `connSym`.addSync()
 
   # No-cache path
   let elseBlock = newStmtList()
   if not isExec:
     elseBlock.add quote do:
       `effectiveRfSym` = @[]
-  elseBlock.add makeParseDirectCall(sendBufNode, newStrLitNode(""), sqlSym, argList)
+  elseBlock.add makeParseDirectCall(connSym, newStrLitNode(""), sqlSym, argList)
   elseBlock.add makeBindDirectCall(
-    sendBufNode, newStrLitNode(""), newStrLitNode(""), rfNode(), argList
+    connSym, newStrLitNode(""), newStrLitNode(""), rfNode(), argList
   )
   if not isExec:
     elseBlock.add quote do:
-      `sendBufSym`(`connSym`).addDescribe(dkPortal, "")
+      `connSym`.addDescribe(dkPortal, "")
   elseBlock.add quote do:
-    `sendBufSym`(`connSym`).addExecute("", 0)
-    `sendBufSym`(`connSym`).addSync()
+    `connSym`.addExecute("", 0)
+    `connSym`.addSync()
 
   let dispatch = newNimNode(nnkIfStmt)
   dispatch.add(
