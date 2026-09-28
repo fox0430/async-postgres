@@ -44,7 +44,7 @@ proc usesBanned*(code: string): bool =
         return true
   false
 
-proc main() =
+proc main() {.used.} =
   var files = @[packageRoot]
   for path in walkDirRec(srcDir):
     if path.endsWith(".nim"):
