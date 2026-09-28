@@ -11,6 +11,7 @@ async_postgres.nim	export pg_pool.acquire
 async_postgres.nim	export pg_pool.acquireHandle
 async_postgres.nim	export pg_pool.activeCount
 async_postgres.nim	export pg_pool.close
+async_postgres.nim	export pg_pool.connectRefusal
 async_postgres.nim	export pg_pool.exec
 async_postgres.nim	export pg_pool.execInTransaction
 async_postgres.nim	export pg_pool.idleCount
@@ -422,7 +423,7 @@ async_postgres/pg_connection.nim	export notify.onReconnect
 async_postgres/pg_connection.nim	export notify.stopListening
 async_postgres/pg_connection.nim	export notify.unlisten
 async_postgres/pg_connection.nim	export notify.waitNotification
-async_postgres/pg_connection.nim	export pg_errors except setPerHost
+async_postgres/pg_connection.nim	export pg_errors except setPerHost, newStartupError
 async_postgres/pg_connection.nim	export simple_query.cancel
 async_postgres/pg_connection.nim	export simple_query.cancelNoWait
 async_postgres/pg_connection.nim	export simple_query.checkSessionAttrs
@@ -850,8 +851,13 @@ async_postgres/pg_errors.nim	PoolErrorKind.pekConfigFault
 async_postgres/pg_errors.nim	PoolErrorKind.pekConnectFailed
 async_postgres/pg_errors.nim	PoolErrorKind.pekDefectWrapped
 async_postgres/pg_errors.nim	PoolErrorKind.pekQueueFull
+async_postgres/pg_errors.nim	PoolErrorKind.pekRefused
 async_postgres/pg_errors.nim	PoolErrorKind.pekUnknown
 async_postgres/pg_errors.nim	ProtocolError
+async_postgres/pg_errors.nim	RetryAdvice
+async_postgres/pg_errors.nim	RetryAdvice.raRetry
+async_postgres/pg_errors.nim	RetryAdvice.raStop
+async_postgres/pg_errors.nim	RetryAdvice.raUnclear
 async_postgres/pg_errors.nim	SqlStateCheckViolation
 async_postgres/pg_errors.nim	SqlStateDeadlockDetected
 async_postgres/pg_errors.nim	SqlStateDuplicateObject
@@ -876,6 +882,7 @@ async_postgres/pg_errors.nim	isDuplicateObject
 async_postgres/pg_errors.nim	isExclusionViolation
 async_postgres/pg_errors.nim	isForeignKeyViolation
 async_postgres/pg_errors.nim	isIntegrityConstraintViolation
+async_postgres/pg_errors.nim	isLastingRefusal
 async_postgres/pg_errors.nim	isNotNullViolation
 async_postgres/pg_errors.nim	isQueryCanceled
 async_postgres/pg_errors.nim	isSerializationFailure
@@ -884,6 +891,7 @@ async_postgres/pg_errors.nim	isTransientError
 async_postgres/pg_errors.nim	isUniqueViolation
 async_postgres/pg_errors.nim	newPoolError
 async_postgres/pg_errors.nim	position
+async_postgres/pg_errors.nim	retryAdvice
 async_postgres/pg_errors.nim	schemaName
 async_postgres/pg_errors.nim	serverErrors
 async_postgres/pg_errors.nim	tableName
@@ -948,7 +956,9 @@ async_postgres/pg_pool.nim	PoolMetrics
 async_postgres/pg_pool.nim	PoolMetrics.acquireCount
 async_postgres/pg_pool.nim	PoolMetrics.acquireDuration
 async_postgres/pg_pool.nim	PoolMetrics.closeCount
+async_postgres/pg_pool.nim	PoolMetrics.connectFailureCount
 async_postgres/pg_pool.nim	PoolMetrics.createCount
+async_postgres/pg_pool.nim	PoolMetrics.refusalCount
 async_postgres/pg_pool.nim	PoolMetrics.timeoutCount
 async_postgres/pg_pool.nim	PooledConnHandle
 async_postgres/pg_pool.nim	PooledConnHandle.conn
@@ -957,6 +967,7 @@ async_postgres/pg_pool.nim	acquire
 async_postgres/pg_pool.nim	acquireHandle
 async_postgres/pg_pool.nim	activeCount
 async_postgres/pg_pool.nim	close
+async_postgres/pg_pool.nim	connectRefusal
 async_postgres/pg_pool.nim	exec
 async_postgres/pg_pool.nim	exec#2
 async_postgres/pg_pool.nim	execInTransaction
@@ -1825,7 +1836,7 @@ async_postgres/pg_types/core.nim	cmp
 async_postgres/pg_types/core.nim	data
 async_postgres/pg_types/core.nim	decimalSep
 async_postgres/pg_types/core.nim	export pg_bytes
-async_postgres/pg_types/core.nim	export pg_errors except setPerHost
+async_postgres/pg_types/core.nim	export pg_errors except setPerHost, newStartupError
 async_postgres/pg_types/core.nim	formatPgMoney
 async_postgres/pg_types/core.nim	formatPgMoney#2
 async_postgres/pg_types/core.nim	fracDigits

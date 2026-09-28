@@ -172,6 +172,7 @@ proc notifyListenDeath(
 proc listenPump*(conn: PgConnection) {.async.} =
   ## Background loop: dispatch notifications, auto-reconnect on failure.
   while true:
+    var lost: ref CatchableError
     try:
       while conn.state == csListening:
         let msg = await conn.recvMessage()
@@ -191,66 +192,83 @@ proc listenPump*(conn: PgConnection) {.async.} =
     except CancelledError:
       return # Cancelled from close()
     except CatchableError as e:
-      if conn.listenChannels.len == 0:
-        conn.notifyListenDeath("Listen connection lost: " & e.msg, false, cause = e)
-        return
-      # Auto-reconnect with exponential backoff. Flag guards concurrent stop.
-      conn.setListenReconnecting(true)
-      # Taken now: a redial's session may yet record a FATAL of its own.
-      let sessionFatal = conn.fatalServerError
-      try:
-        let maxAttempts = conn.listenReconnectMaxAttempts
-        # Cap so `backoff * 1000` and `backoff * 2` below cannot overflow int.
-        let maxBackoff = clamp(conn.listenReconnectMaxBackoff, 1, high(int) div 1000)
-        let unlimited = maxAttempts <= 0
-        var reconnected = false
-        var backoff = 1
-        var attempt = 0
-        var lastRetryErr: ref CatchableError
-        while (unlimited or attempt < maxAttempts) and not conn.listenStopRequested:
-          try:
-            # Interruptible backoff: tick-based stop check.
-            var remainingMs = backoff * 1000
-            while remainingMs > 0 and not conn.listenStopRequested:
-              let tickMs = min(remainingMs, listenBackoffTickMs)
-              await sleepAsync(milliseconds(tickMs))
-              remainingMs -= tickMs
-            if conn.listenStopRequested:
-              break
-            await conn.reconnectInPlace()
-            if conn.listenStopRequested:
-              # Stop won race: keep csReady, skip reconnect callback.
-              return
-            conn.markState(csListening)
-            reconnected = true
-            let reconnectCb = conn.reconnectCallback
-            if reconnectCb != nil:
-              reconnectCb()
+      # Handled below, not in here: an await in this handler after the retry
+      # loop's own `except` ran leaves the exception stack nil (Nim >= 2.2.6).
+      lost = e
+    if conn.listenChannels.len == 0:
+      conn.notifyListenDeath("Listen connection lost: " & lost.msg, false, cause = lost)
+      return
+    # Auto-reconnect with exponential backoff. Flag guards concurrent stop.
+    conn.setListenReconnecting(true)
+    # Taken now: a redial's session may yet record a FATAL of its own.
+    let sessionFatal = conn.fatalServerError
+    try:
+      let maxAttempts = conn.listenReconnectMaxAttempts
+      # Cap so `backoff * 1000` and `backoff * 2` below cannot overflow int.
+      let maxBackoff = clamp(conn.listenReconnectMaxBackoff, 1, high(int) div 1000)
+      let unlimited = maxAttempts <= 0
+      var reconnected = false
+      var giveUp = false
+      var backoff = 1
+      var attempt = 0
+      var lastRetryErr: ref CatchableError
+      while (unlimited or attempt < maxAttempts) and not conn.listenStopRequested:
+        try:
+          # Interruptible backoff: tick-based stop check.
+          var remainingMs = backoff * 1000
+          while remainingMs > 0 and not conn.listenStopRequested:
+            let tickMs = min(remainingMs, listenBackoffTickMs)
+            await sleepAsync(milliseconds(tickMs))
+            remainingMs -= tickMs
+          if conn.listenStopRequested:
             break
-          except CancelledError:
+          await conn.reconnectInPlace()
+          if conn.listenStopRequested:
+            # Stop won race: keep csReady, skip reconnect callback.
             return
-          except CatchableError as retryErr:
-            lastRetryErr = retryErr
-            backoff = min(backoff * 2, maxBackoff)
-          inc attempt
-        if conn.listenStopRequested:
-          conn.markClosed()
+          conn.markState(csListening)
+          reconnected = true
+          let reconnectCb = conn.reconnectCallback
+          if reconnectCb != nil:
+            reconnectCb()
+          break
+        except CancelledError:
           return
-        if not reconnected:
-          var deathMsg =
-            "Listen connection lost (" & e.msg & "): reconnection failed after " &
-            $maxAttempts & " attempts"
-          if lastRetryErr != nil:
-            deathMsg.add("; last attempt: " & lastRetryErr.msg)
-          conn.notifyListenDeath(
-            deathMsg,
-            true,
-            cause = (if lastRetryErr != nil: lastRetryErr else: e),
-            sessionFatal = sessionFatal,
+        except CatchableError as retryErr:
+          lastRetryErr = retryErr
+          # A refusal or a config fault would meet every redial alike.
+          giveUp = retryAdvice(retryErr) == raStop
+          backoff = min(backoff * 2, maxBackoff)
+        inc attempt
+        if giveUp:
+          break
+      if conn.listenStopRequested:
+        conn.markClosed()
+        return
+      if not reconnected:
+        var deathMsg =
+          "Listen connection lost (" & lost.msg & "): reconnection failed after "
+        if giveUp and isLastingRefusal(lastRetryErr):
+          deathMsg.add(
+            $attempt & " attempts, stopped on the server refusing this config"
           )
-          return
-      finally:
-        conn.setListenReconnecting(false)
+        elif giveUp:
+          deathMsg.add(
+            $attempt & " attempts, stopped on a fault that no retry can clear"
+          )
+        else:
+          deathMsg.add($maxAttempts & " attempts")
+        if lastRetryErr != nil:
+          deathMsg.add("; last attempt: " & lastRetryErr.msg)
+        conn.notifyListenDeath(
+          deathMsg,
+          true,
+          cause = (if lastRetryErr != nil: lastRetryErr else: lost),
+          sessionFatal = sessionFatal,
+        )
+        return
+    finally:
+      conn.setListenReconnecting(false)
 
 proc startListening*(conn: PgConnection) =
   ## Start the notification pump. No-op if one is already running.

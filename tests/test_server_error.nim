@@ -13,7 +13,8 @@ import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_connection/notify {.all.}
 from ../async_postgres/pg_connection/buffer_io {.all.} import isTransientDial
-from ../async_postgres/pg_errors {.all.} import isTransientServerError, setPerHost
+from ../async_postgres/pg_errors {.all.} import
+  isTransientServerError, setPerHost, newStartupError
 
 import std/importutils
 privateAccess(PgConnection)
@@ -988,6 +989,10 @@ suite "isTransientError":
   proc summing(attempts: varargs[ref CatchableError]): ref PgConnectionError =
     (ref PgConnectionError)(msg: "sum", attempts: @attempts)
 
+  proc startupAnswer(sqlState: string): ref PgConnectionError =
+    # As `connect` raises the ErrorResponse that answered its startup.
+    newStartupError(sqlState, queryError(sqlState, "FATAL"))
+
   proc hosts(attempts: varargs[ref CatchableError]): ref PgConnectionError =
     # Through the setter, as `foldFailures` builds it: a direct `perHost: true`
     # would bypass `setPerHost`, the only writer of the field.
@@ -1026,21 +1031,125 @@ suite "isTransientError":
     redialed.serverError = queryError("57P01", "FATAL")
     check not isTransientError(redialed)
 
-  test "a server's lasting refusal in any attempt outranks the rest":
-    # The same config meets it again once the other hosts are back.
+  test "a refusal stops an aggregate only when every attempt refuses":
+    # Another host or sslmode=allow leg may still take the session.
     let lost = (ref PgUnavailableError)(msg: "lost")
-    let badPassword =
-      (ref PgConnectionError)(msg: "refused", serverError: queryError("28P01", "FATAL"))
-    let startingUp = (ref PgConnectionError)(
-      msg: "starting", serverError: queryError("57P03", "FATAL")
-    )
+    let badPassword = startupAnswer("28P01")
+    let startingUp = startupAnswer("57P03")
     let noTls = (ref PgConnectionError)(msg: "Server does not support SSL")
     check not isTransientError(summing(lost, badPassword))
+    check retryAdvice(summing(lost, badPassword)) == raUnclear
+    check retryAdvice(hosts(lost, badPassword)) == raUnclear
     # Nested, as sslmode=allow's pair sits in connect's aggregate.
-    check not isTransientError(summing(lost, summing(badPassword, lost)))
+    check retryAdvice(hosts(lost, summing(badPassword, badPassword))) == raUnclear
+    check retryAdvice(hosts(badPassword, summing(badPassword, badPassword))) == raStop
+    check isLastingRefusal(hosts(badPassword, summing(badPassword, badPassword)))
+    # A config fault is the config every attempt shares.
+    let badCert = (ref PgConfigError)(msg: "sslcert will not load")
+    check retryAdvice(hosts(lost, badCert)) == raStop
+    check not isLastingRefusal(hosts(badPassword, badCert))
     # A refusal that clears hides nothing; a failure without one is no verdict.
     check isTransientError(summing(startingUp, noTls))
     check isTransientError(summing(lost, noTls))
+
+  test "a transient leg does not outweigh the other sslmode=allow leg's answer":
+    # Both legs reach one server: a database that takes no connections says so
+    # on one leg whatever became of the other.
+    let lost = (ref PgUnavailableError)(msg: "lost")
+    let notAccepting = startupAnswer("55000")
+    check not isTransientError(summing(notAccepting, lost))
+    check retryAdvice(summing(notAccepting, lost)) == raUnclear
+    check retryAdvice(hosts(summing(lost, notAccepting))) == raUnclear
+    check retryAdvice(summing(startupAnswer("28000"), startupAnswer("57P03"))) ==
+      raUnclear
+    # A client-side failure is no answer from the server.
+    let noTls = (ref PgConnectionError)(msg: "Server does not support SSL")
+    check retryAdvice(summing(startupAnswer("57P03"), noTls)) == raRetry
+
+  test "isLastingRefusal is narrower than not isTransientError":
+    # The pool and the listen pump stop on this, so a merely unclassified
+    # failure must stay out.
+    let badPassword = startupAnswer("28P01")
+    let noSuchDb = startupAnswer("3D000")
+    let startingUp = startupAnswer("57P03")
+    let garbled = (ref PgProtocolError)(msg: "garbled")
+
+    check isLastingRefusal(badPassword)
+    check isLastingRefusal(noSuchDb)
+    check isLastingRefusal(startupAnswer("42501"))
+    # "Not transient" alone is not a verdict: these clear on a later dial.
+    check not isTransientError(garbled)
+    check not isLastingRefusal(garbled)
+    check not isLastingRefusal(startingUp)
+    # An aggregate only when every attempt refused.
+    check isLastingRefusal(summing(badPassword, noSuchDb))
+    check not isLastingRefusal(
+      summing((ref PgUnavailableError)(msg: "lost"), badPassword)
+    )
+    # A `PgSecurityError` whose attempts were all lost says nothing either.
+    check not isLastingRefusal((ref PgSecurityError)(msg: "refused"))
+    check not isLastingRefusal(nil)
+    # A `PgPoolError` by its kind, or by the connect error in `parent`.
+    check isLastingRefusal(newPoolError(pekRefused, "refused", badPassword))
+    check isLastingRefusal(newPoolError(pekConnectFailed, "failed", badPassword))
+    check not isLastingRefusal(
+      newPoolError(pekConnectFailed, "failed", (ref PgUnavailableError)(msg: "lost"))
+    )
+    check not isLastingRefusal(newPoolError(pekQueueFull, "full"))
+    check not isLastingRefusal(newPoolError(pekBatchFailed, "batch"))
+
+  test "a protocol violation is not a refusal of the config":
+    # 08P01: the server could not parse the startup packet; a fresh dial
+    # resends it.
+    let mangled = startupAnswer("08P01")
+    check not isLastingRefusal(mangled)
+    check not isTransientError(mangled)
+    # Unclassified, like a client-side `PgProtocolError`.
+    check retryAdvice(mangled) == raUnclear
+    # A config fault is the other end: a stop, though not a refusal.
+    let badCert = (ref PgConfigError)(msg: "sslcert will not load")
+    check retryAdvice(badCert) == raStop
+    check not isTransientError(badCert)
+    check not isLastingRefusal(badCert)
+
+  test "only a listed answer to the startup is a refusal":
+    # A proxy's XX000 while a serverless compute wakes up, a system error, or
+    # an ErrorResponse without a SQLSTATE: a loop keeps its budget for them.
+    # 28000 too: an LDAP, RADIUS or PAM server that is down answers with it.
+    for sqlState in ["XX000", "58P01", "0A000", "", "28000"]:
+      let answer = startupAnswer(sqlState)
+      check not isLastingRefusal(answer)
+      check retryAdvice(answer) == raUnclear
+    # A listed SQLSTATE on the FATAL that ended an established session.
+    let ended =
+      (ref PgUnavailableError)(msg: "lost", serverError: queryError("42501", "FATAL"))
+    check not isLastingRefusal(ended)
+    check retryAdvice(ended) == raUnclear
+    let conn = PgConnection()
+    conn.fatalServerError = fatalError("28P01")
+    check not isLastingRefusal(conn.newClosedError("lost"))
+
+  test "one refusal is a stop for retryAdvice":
+    # The server has stated it: nothing to wait for.
+    let badPassword = startupAnswer("28P01")
+    let lost = (ref PgUnavailableError)(msg: "lost")
+    check retryAdvice(badPassword) == raStop
+    check not isTransientError(badPassword)
+    # As `acquire` wraps it, and in either kind of aggregate.
+    check retryAdvice(newPoolError(pekRefused, "refused", badPassword)) == raStop
+    check retryAdvice(newPoolError(pekConnectFailed, "failed", badPassword)) == raStop
+    check retryAdvice(hosts(badPassword)) == raStop
+    check retryAdvice(summing(badPassword, badPassword)) == raStop
+    check retryAdvice(hosts(lost, badPassword)) == raUnclear
+    check retryAdvice((ref PgConfigError)(msg: "cert")) == raStop
+
+  test "25006 is not transient":
+    # A standby in recovery returns it, but so does a read-only transaction,
+    # which no retry gets past.
+    let readOnly = queryError("25006")
+    check not isTransientError(readOnly)
+    check not isLastingRefusal(readOnly)
+    check retryAdvice(readOnly) == raUnclear
 
   test "connect's aggregate is transient only when every host's failure is":
     let lost = (ref PgUnavailableError)(msg: "lost")

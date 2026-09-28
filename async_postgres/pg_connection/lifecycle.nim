@@ -26,9 +26,7 @@ type AuthProgress = object ## What the authentication exchange has established s
 proc startupError(fields: seq[ErrorField]): ref PgConnectionError =
   ## The server refused the session; keep its fields so callers can tell a
   ## bad password from a server that is still starting up.
-  (ref PgConnectionError)(
-    msg: formatError(fields), serverError: newPgQueryError(fields)
-  )
+  newStartupError(formatError(fields), newPgQueryError(fields))
 
 proc foldFailures(
     msg: string, attempts: seq[ref CatchableError], perHost = false

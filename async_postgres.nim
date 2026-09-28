@@ -157,6 +157,7 @@ export pg_pool.activeCount
 export pg_pool.size
 export pg_pool.isClosed
 export pg_pool.metrics
+export pg_pool.connectRefusal
 export pg_pool.resetSession
 export pg_pool.newPool
 export pg_pool.release
