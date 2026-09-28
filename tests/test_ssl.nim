@@ -1,7 +1,7 @@
 import std/[unittest, strutils, os]
 
 import cert_fixtures
-from mock_pg_server import buildPreV3Error
+from mock_pg_server import buildPreV3Error, sendSegmentsNow
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 from ../async_postgres/pg_auth import computeTlsServerEndpoint
 
@@ -622,8 +622,10 @@ suite "SSL negotiation - pre-TLS byte injection":
     check securityRefusal
 
   test "split-write injection after 'S' response is rejected (CVE-2021-23214 family)":
-    # Two writes: caught by `socketHasPendingData` or, if they coalesce into
-    # chronos's read, by the `n > 1` path.
+    # Two segments: caught by `socketHasPendingData` or, if they coalesce into
+    # chronos's read, by the `n > 1` path. Both must be sent before the client
+    # reads 'S': an injection arriving after the check is left to fail the TLS
+    # handshake instead (libpq checks the same way).
     var raised = false
     var msgMatches = false
     var securityRefusal = false
@@ -635,8 +637,7 @@ suite "SSL negotiation - pre-TLS byte injection":
         let st = await ms.accept()
         try:
           discard await readN(st, 8) # SSLRequest
-          await sendBytes(st, @[byte('S')])
-          await sendBytes(st, @[byte('X'), byte('Y'), byte('Z')])
+          sendSegmentsNow(st, [@[byte('S')], @[byte('X'), byte('Y'), byte('Z')]])
         except CatchableError:
           discard
         await closeClient(st)
