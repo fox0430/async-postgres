@@ -1,8 +1,7 @@
 import std/[options, macros, strutils, typetraits, times]
 
 import ../pg_protocol
-import core, decoding, encoding
-import accessors {.all.}
+import core, decoding, encoding, accessors
 
 # User-defined enum type support
 #

@@ -1399,7 +1399,7 @@ async_postgres/pg_sql.nim	queryValueOrDefault#5
 async_postgres/pg_sql.nim	queryValueOrDefault#6
 async_postgres/pg_sql.nim	sql
 async_postgres/pg_sql.nim	sqlParams
-async_postgres/pg_types.nim	export accessors except nameAccessor, optAccessor
+async_postgres/pg_types.nim	export accessors except nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid, wireOidIsDynamic
 async_postgres/pg_types.nim	export array
 async_postgres/pg_types.nim	export core except PgIntParse, pipOk, pipInvalid, pipOverflow, checkPgTimeFields, checkPgTimeTzOffset, isPgHexText, isPgIntText, isPgUIntText, pgParseBiggestInt, pgParseBiggestIntView, pgParseFloat, pgParseFloat32, pgParseHexInt, pgParseHexUInt32, pgParseInt, pgParseInt16, pgParseInt32, pgParseIntView, pgParseUIntField, parsePgBoolText, pgTypeErrorOnValueError
 async_postgres/pg_types.nim	export decoding.fromPgText

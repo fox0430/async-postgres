@@ -3,8 +3,9 @@ import std/[options, json, strutils, tables, times]
 import ../pg_protocol
 import core, decoding, encoding
 
-proc cellInfo(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
-  ## Raw cell offset/len; private (wholesale export would leak it).
+proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  ## Raw cell offset/len. Sibling-only: `pg_types.nim` excludes it from the
+  ## wholesale export.
   # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
   # `except PgError` would miss an out-of-range col and crash the process
   # (UB in -d:release). Same family as the other accessor errors here so
@@ -154,7 +155,7 @@ const FirstNormalObjectId = 16384'i32
   ## Built-in OIDs are below this bound (``access/transam.h``); dynamic types
   ## are at or above it.
 
-func wireOidIsDynamic(actual: int32): bool {.inline.} =
+func wireOidIsDynamic*(actual: int32): bool {.inline.} =
   ## Whether ``actual`` is catalog-assigned (dynamic), regardless of layout.
   actual >= FirstNormalObjectId
 
@@ -194,7 +195,7 @@ func describeUnknownOid(accessor, kind: string, expected: openArray[int32]): str
     " expected " & describeExpectedOids(expected) &
     " (binary column type mismatch; drop the OID metadata or use resultFormat = rfText)"
 
-proc checkScalarColOid(
+proc checkScalarColOid*(
     accessor: string, row: Row, col: int, expected: openArray[int32]
 ) =
   ## Reject a binary column this accessor cannot decode. Same-length types
@@ -1308,7 +1309,7 @@ proc decodeDateArrayElem(buf: openArray[byte]): DateTime =
 # ``decodeJsonArrayElem`` is defined above (near the scalar accessors) so
 # ``getJson`` can delegate to it without a forward declaration.
 
-proc checkArrayElemOid(accessor: string, actual: int32, expected: openArray[int32]) =
+proc checkArrayElemOid*(accessor: string, actual: int32, expected: openArray[int32]) =
   ## Reject a binary array this accessor cannot decode (same policy as scalars).
   if wireOidAcceptable(actual, expected):
     return

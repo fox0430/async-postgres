@@ -60,8 +60,11 @@ export decoding.parsePointsText
 export decoding.parseTextArray
 
 # `accessors` — typed row accessors and query-result helpers. The codegen
-# templates are sibling-only (expanded from this file and `ranges.nim`).
-export accessors except nameAccessor, optAccessor
+# templates are sibling-only (expanded from this file and `ranges.nim`), as are
+# the raw cell / wire-OID helpers `ranges.nim` and `user_types.nim` build on.
+export accessors except
+  nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid,
+  wireOidIsDynamic
 
 # `ranges` — range/multirange construction and typed parameters; the raw
 # binary decoders were privatised in the module itself.

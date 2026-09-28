@@ -24,7 +24,8 @@ task apiSurfaceWrite,
 task parseGuard, "check that stdlib text parsers are only called from the grammar layer":
   exec "nim c -r --hints:off tools/parse_guard.nim"
 
-task privateAccessGuard, "check that privateAccess is only used from tests":
+task privateAccessGuard,
+  "check that privateAccess and {.all.} imports are only used from tests":
   exec "nim c -r --hints:off tools/private_access_guard.nim"
 
 task test, "test":

@@ -1,9 +1,7 @@
 import std/[options, times]
 
 import ../pg_protocol
-import core, encoding
-import decoding {.all.}
-import accessors {.all.}
+import core, decoding, encoding, accessors
 
 type
   RangeBinaryInput =

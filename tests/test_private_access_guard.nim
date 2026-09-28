@@ -19,6 +19,15 @@ proc detects(lines: varargs[string]): bool =
       return true
   false
 
+proc allPragmaHits(lines: varargs[string]): seq[int] =
+  ## Line indices the guard's `{.all.}` scan reports for ``lines``.
+  var
+    sc: LineScanner
+    code: seq[string]
+  for line in lines:
+    code.add stripLiteralsAndComment(line, sc)
+  allPragmaLines(code)
+
 suite "private_access_guard":
   test "sameIdent is Nim's rule: first letter case-sensitive, rest is not":
     check sameIdent("privateAccess", "privateAccess")
@@ -53,3 +62,29 @@ suite "private_access_guard":
 
   test "a line comment does not blind the line after it":
     check detects("# importutils is banned", "privateAccess(PgConnection)")
+
+  test "an {.all.} import is reported":
+    check allPragmaHits("import accessors {.all.}") == @[0]
+    check allPragmaHits("from ../pg_errors {.all.} import foldFailures") == @[0]
+    check allPragmaHits("import decoding {. all .}") == @[0]
+    check allPragmaHits("import decoding {.a_ll.}") == @[0]
+    check allPragmaHits("import decoding {.`all`.}") == @[0]
+    check allPragmaHits("import core", "import decoding {.all.}") == @[1]
+
+  test "an {.all.} pragma split across lines is reported":
+    check allPragmaHits("import decoding {.", "  all", ".}") == @[1]
+
+  test "all outside a pragma item name is not a use":
+    check allPragmaHits("import accessors").len == 0
+    check allPragmaHits("if all(xs, p): discard").len == 0
+    check allPragmaHits("import decoding {.All.}").len == 0
+    check allPragmaHits("proc f() {.raises: [], allWarnings.} = discard").len == 0
+    check allPragmaHits("proc f() {.tags: [all].} = discard").len == 0
+    check allPragmaHits("proc f() {.deprecated: all.} = discard").len == 0
+    check allPragmaHits("proc f() {.raises: [].} = all(xs, p)").len == 0
+
+  test "an {.all.} in a comment or literal is not a use":
+    check allPragmaHits("# import accessors {.all.}").len == 0
+    check allPragmaHits("## `import x {.all.}` is for tests only").len == 0
+    check allPragmaHits("let s = \"import x {.all.}\"").len == 0
+    check allPragmaHits("#[", "import accessors {.all.}", "]#").len == 0

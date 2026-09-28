@@ -388,8 +388,12 @@ async_postgres/pg_protocol.nim	startupParamBytes
 async_postgres/pg_protocol.nim	startupUserKey
 async_postgres/pg_protocol.nim	withAtomicMessage
 async_postgres/pg_saslprep.nim	saslprep
+async_postgres/pg_types/accessors.nim	cellInfo
+async_postgres/pg_types/accessors.nim	checkArrayElemOid
+async_postgres/pg_types/accessors.nim	checkScalarColOid
 async_postgres/pg_types/accessors.nim	nameAccessor
 async_postgres/pg_types/accessors.nim	optAccessor
+async_postgres/pg_types/accessors.nim	wireOidIsDynamic
 async_postgres/pg_types/core.nim	PgIntParse
 async_postgres/pg_types/core.nim	PgIntParse.pipInvalid
 async_postgres/pg_types/core.nim	PgIntParse.pipOk
@@ -424,6 +428,7 @@ async_postgres/pg_types/decoding.nim	decodeHstoreBinary
 async_postgres/pg_types/decoding.nim	decodeInetBinary
 async_postgres/pg_types/decoding.nim	decodeNumericBinary
 async_postgres/pg_types/decoding.nim	decodePointBinary
+async_postgres/pg_types/decoding.nim	ensureNoTrailing
 async_postgres/pg_types/decoding.nim	export array
 async_postgres/pg_types/decoding.nim	export pg_bytes
 async_postgres/pg_types/decoding.nim	rejectMultiDim
