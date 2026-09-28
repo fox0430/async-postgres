@@ -1,9 +1,9 @@
-import std/[unittest, options, tables, math, net]
+import std/[unittest, options, tables, net]
 
 import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_replication, pg_client, pg_connection]
-import ../async_postgres/pg_connection/[simple_query, lifecycle]
+import ../async_postgres/pg_connection/simple_query
 
 import e2e_common
 

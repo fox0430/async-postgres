@@ -1,7 +1,6 @@
 import std/[unittest, options, strutils, tables, deques, importutils]
 
-import
-  ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection, pg_errors]
+import ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_errors]
 import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/notify
 import ../async_postgres/pg_connection/simple_query

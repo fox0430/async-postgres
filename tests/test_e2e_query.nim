@@ -1,7 +1,6 @@
-import std/[unittest, options, strutils, math, net]
+import std/[unittest, options, strutils]
 
-import
-  ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
+import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
 

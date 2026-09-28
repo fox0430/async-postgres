@@ -1,7 +1,6 @@
 import std/[unittest, importutils, strutils, tables]
 
 import ../async_postgres/[async_backend, pg_errors, pg_protocol]
-import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_replication {.all.}
 

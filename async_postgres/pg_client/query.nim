@@ -4,12 +4,11 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[options, tables]
+import std/options
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../[async_backend, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
-import ../pg_types/encoding
-import ./core
+import core
 
 proc queryImpl*(
     conn: PgConnection,

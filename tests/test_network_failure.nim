@@ -8,7 +8,6 @@
 
 import std/[unittest, strutils, base64]
 
-import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 
 import ../async_postgres/[async_backend, pg_protocol]

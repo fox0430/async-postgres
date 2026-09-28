@@ -2,10 +2,10 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[options, tables, math, random]
+import std/[options, math, random]
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, simple_query]
+import ../[async_backend, pg_protocol, pg_types]
+import ../pg_connection/[types, buffer_io]
 import ../pg_types/encoding
 
 type

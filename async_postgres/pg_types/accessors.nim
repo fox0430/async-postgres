@@ -1,4 +1,4 @@
-import std/[options, json, macros, strutils, tables, times, net]
+import std/[options, json, strutils, tables, times]
 
 import ../pg_protocol
 import core, decoding, encoding

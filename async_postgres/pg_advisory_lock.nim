@@ -78,7 +78,7 @@
 
 import std/macros
 
-import async_backend, pg_protocol, pg_types, pg_connection, pg_client
+import async_backend, pg_protocol, pg_types, pg_client
 import pg_connection/types
 
 # Internal body templates
