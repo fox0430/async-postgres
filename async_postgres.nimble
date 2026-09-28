@@ -27,10 +27,17 @@ task parseGuard, "check that stdlib text parsers are only called from the gramma
 task privateAccessGuard, "check that privateAccess is only used from tests":
   exec "nim c -r --hints:off tools/private_access_guard.nim"
 
-task test, "test":
+proc runSuite(file: string) =
+  ## Build and run `file` once per async backend.
+  exec "bash tests/gen_certs.sh"
+  exec "nim c -d:asyncBackend=asyncdispatch -r " & file
+  exec "nim c -d:asyncBackend=chronos -r " & file
+
+task test, "run the full suite (requires a live PostgreSQL on 127.0.0.1:15432)":
   apiSurfaceTask()
   parseGuardTask()
   privateAccessGuardTask()
-  exec "bash tests/gen_certs.sh"
-  exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
-  exec "nim c -d:asyncBackend=chronos -r tests/all_tests.nim"
+  runSuite "tests/all_tests.nim"
+
+task testUnit, "run unit and mock-server tests only (no PostgreSQL required)":
+  runSuite "tests/all_tests_unit.nim"

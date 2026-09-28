@@ -475,6 +475,26 @@ suite "Fallback":
       check cluster.replica.idle.len == 1
       check cluster.replica.idle.peekFirst().conn == lateConn
 
+    test "an abandoned replica acquire that later fails does not crash the drain":
+      # The drain must not release a nil connection out of the failed future.
+      let cluster =
+        makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(20))
+      cluster.replica.active = cluster.replica.config.maxSize
+      cluster.replica.config.acquireTimeout = milliseconds(60)
+
+      let primaryConn = mockConn()
+      cluster.primary.idle.addLast(
+        PooledConn(conn: primaryConn, lastUsedAt: Moment.now())
+      )
+      let (acquired, pool) = waitFor acquireRead(cluster)
+      check acquired == primaryConn
+      check pool == cluster.primary
+
+      # Let the replica acquire hit its own acquireTimeout and the drain run.
+      waitFor sleepMsAsync(150)
+
+      check cluster.replica.waiterCount == 0
+
     test "a drained late connection is closed by the pool, not by the application":
       # The replica pool shuts down mid-acquire. `drainAbandonedAcquire` must
       # reclaim through the pool's own path: a plain `release()` would stamp

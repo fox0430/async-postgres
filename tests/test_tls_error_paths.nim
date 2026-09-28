@@ -405,7 +405,8 @@ suite "TLS handshake failure path":
     # `connect` folds every per-host failure into PgConnectionError, so the type
     # says nothing here; only the wording checked below rules out a leak.
     when hasAsyncDispatch:
-      check "closed by peer" in msg
+      # Closing with our ClientHello unread may send an RST instead of a FIN.
+      check "closed by peer" in msg or "reset by peer" in msg
     elif hasChronos:
       check "TLS handshake failed" in msg
 

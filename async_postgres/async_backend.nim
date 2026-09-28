@@ -210,7 +210,10 @@ elif hasAsyncDispatch:
     ## release other resources the orphan holds. When ``onOrphan`` is omitted
     ## the default handler drains the orphan's outcome (clears a late failure)
     ## but does **not** release other resources. Pass an explicit ``onOrphan``
-    ## when the orphan owns a connection or other live resource.
+    ## when the orphan owns a connection or other live resource. The default
+    ## clears the error on ``fut`` itself, so anything else that awaits ``fut``
+    ## after the timeout reads a late failure as a default-valued success; pass
+    ## an explicit ``onOrphan`` (a no-op will do) in that case too.
     ##
     ## Under chronos the ``onOrphan`` argument is accepted but never called —
     ## futures are properly cancelled on timeout and no orphan remains.
