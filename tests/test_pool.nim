@@ -2363,7 +2363,8 @@ when hasChronos:
           "refused",
           (ref PgQueryError)(msg: "28P01", sqlState: "28P01", severity: "FATAL"),
         )
-        let cancelled = Waiter(fut: newFuture[PgConnection]("cancelled"), cancelled: false)
+        let cancelled =
+          Waiter(fut: newFuture[PgConnection]("cancelled"), cancelled: false)
         let live = Waiter(fut: newFuture[PgConnection]("live"), cancelled: false)
         pool.waiters.addLast(cancelled)
         pool.waiters.addLast(live)
