@@ -461,14 +461,10 @@ proc connectToHostImpl(
     when defined(posix):
       if not isUnix:
         try:
-          when defined(nimdoc):
-            # nim doc resolves nativesockets.SocketHandle to winlean on some
-            # setups, so cast explicitly to satisfy the doc-time type check.
-            configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
-            configureKeepalive(posix.SocketHandle(sock.getFd()), config)
-          else:
-            configureTcpNoDelay(sock.getFd())
-            configureKeepalive(sock.getFd(), config)
+          # Cast explicitly: nim doc resolves nativesockets.SocketHandle to
+          # winlean on some setups.
+          configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
+          configureKeepalive(posix.SocketHandle(sock.getFd()), config)
         except CatchableError as e:
           sock.close()
           raise e
