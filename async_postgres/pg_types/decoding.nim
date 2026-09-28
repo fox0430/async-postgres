@@ -13,7 +13,7 @@ type TsPrec = enum
   tpNot
   tpOperand
 
-proc ensureNoTrailing(pos, total: int, what: string) {.inline.} =
+proc ensureNoTrailing*(pos, total: int, what: string) {.inline.} =
   ## Reject trailing bytes after a binary value.
   if pos != total:
     raise
