@@ -1,10 +1,8 @@
-import std/[unittest, options, strutils, times, math, net, typetraits]
+import std/[unittest, options, strutils, times]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
 import ../async_postgres/pg_types/core {.all.}
-import ../async_postgres/pg_types/encoding {.all.}
-import ../async_postgres/pg_types/accessors {.all.}
 import ../async_postgres/pg_types/decoding {.all.}
 
 import types_common

@@ -6,7 +6,7 @@ import pkg/nimcrypto/pbkdf2
 import pkg/nimcrypto/utils as ncutils
 
 import pg_errors, pg_saslprep
-from pg_types/core import isPgUIntText, pgParseIntView, PgIntParse, pipOk
+from pg_types/core import isPgUIntText, pgParseIntView, pipOk
 
 template burnStr*(s: var string) =
   ## Wipe a string's heap buffer. Compiler is prevented from eliding the

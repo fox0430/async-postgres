@@ -1,4 +1,4 @@
-import std/[unittest, options, tables, math, importutils, net]
+import std/[unittest, options, tables, importutils, net]
 
 import
   ../async_postgres/

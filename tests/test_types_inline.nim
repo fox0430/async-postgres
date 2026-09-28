@@ -1,12 +1,10 @@
-import std/[json, unittest, options, tables, math, net, typetraits, importutils]
+import std/[json, unittest, options, tables, importutils]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
 import ../async_postgres/pg_types/core {.all.}
 import ../async_postgres/pg_types/encoding {.all.}
 import ../async_postgres/pg_types/accessors {.all.}
-import ../async_postgres/pg_types/decoding {.all.}
-import ../async_postgres/pg_client
 import ../async_postgres/pg_client/core {.all.}
 import ../async_postgres/pg_client/pipeline {.all.}
 

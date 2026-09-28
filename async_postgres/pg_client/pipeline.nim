@@ -6,9 +6,8 @@
 
 import std/[options, tables]
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../[async_backend, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
-import ../pg_types/encoding
 import core
 
 type

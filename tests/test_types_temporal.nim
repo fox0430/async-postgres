@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, times, math, net, typetraits]
+import std/[unittest, options, strutils, times]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}

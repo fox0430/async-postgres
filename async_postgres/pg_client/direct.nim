@@ -4,9 +4,9 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[algorithm, macros, options, sets, tables]
+import std/[algorithm, macros, options, sets]
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../[async_backend, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
 import ./core

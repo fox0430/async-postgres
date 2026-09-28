@@ -1,4 +1,4 @@
-import std/[json, unittest, options, tables, math, net, typetraits]
+import std/[unittest, options, tables, net]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}

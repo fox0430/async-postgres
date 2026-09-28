@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, tables, math, importutils, net, macros]
+import std/[unittest, options, strutils, tables, importutils, macros]
 
 import
   ../async_postgres/[
@@ -7,7 +7,7 @@ import
   ]
 
 import ../async_postgres/pg_client/transaction {.all.}
-import ../async_postgres/pg_connection/[simple_query, lifecycle]
+import ../async_postgres/pg_connection/simple_query
 
 import e2e_common
 

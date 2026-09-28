@@ -3,11 +3,11 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[macros, options]
+import std/macros
 
-import ../[async_backend, pg_protocol, pg_connection]
+import ../[async_backend, pg_protocol]
 import ../pg_connection/[types, simple_query]
-import ./core
+import core
 
 proc hasReturnStmt(n: NimNode): bool =
   ## Check whether an AST contains a `return` statement (excluding nested

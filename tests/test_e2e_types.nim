@@ -1,9 +1,6 @@
-import std/[unittest, options, math, net, times]
+import std/[unittest, options, times]
 
 import ../async_postgres/[async_backend, pg_types]
-
-when hasAsyncDispatch:
-  import std/strutils
 
 import ../async_postgres/pg_client
 import ../async_postgres/pg_pool

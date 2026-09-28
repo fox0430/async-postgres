@@ -1,10 +1,6 @@
-import std/[unittest, options, tables, math, net]
+import std/[unittest, options, tables]
 
-import
-  ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
-
-when hasAsyncDispatch:
-  import std/strutils
+import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
 
