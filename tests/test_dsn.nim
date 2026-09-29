@@ -92,6 +92,194 @@ suite "parseDsn":
     let cfg = parseDsn("postgresql://my%40user@host/db")
     check cfg.user == "my@user"
 
+  template rejectedMsg(dsn: string): string =
+    var msg = ""
+    try:
+      discard parseDsn(dsn)
+    except PgConfigError as e:
+      msg = e.msg
+    msg
+
+  test "userinfo ends at the last raw '@' in the authority":
+    var cfg = parseDsn("postgresql://u:p@ss@h/db")
+    check cfg.user == "u"
+    check cfg.password == "p@ss"
+    check cfg.host == "h"
+    check cfg.database == "db"
+    cfg = parseDsn("postgresql://user@srv:pw@srv.example.com:6432/db")
+    check cfg.user == "user@srv"
+    check cfg.password == "pw"
+    check cfg.host == "srv.example.com"
+    check cfg.port == 6432
+
+  test "raw '@' in the database is rejected even without a password or port":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://svc/admin@" & tail & "@db.example.com/app", # '/' in the user
+      "postgresql://my/" & tail & "@h/db",
+      "postgresql://db1/appdb@replica",
+      "postgresql://h/a@b/c",
+      "postgresql://[::1]/a@b",
+      "postgresql:///a@b",
+      "postgresql://alice@h/app@replica",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%2F" in msg
+      check "%40" in msg
+      check tail notin msg
+
+  test "raw '@' in a query value stays in the query":
+    for (dsn, host, port) in [
+      ("postgresql://h/?user=alice@example.com", "h", 5432),
+      ("postgresql://h:5433/?user=alice@example.com", "h", 5433),
+      ("postgresql://[::1]:5432/?user=alice@example.com", "::1", 5432),
+      ("postgresql://h/db?user=alice@example.com", "h", 5432),
+      ("postgresql://h:5433/db?user=alice@example.com", "h", 5433),
+      ("postgresql://h/db?application_name=svc:1&user=alice@example.com", "h", 5432),
+      ("postgresql:///db?host=[::1]&user=alice@example.com", "[::1]", 5432),
+    ]:
+      let cfg = parseDsn(dsn)
+      check cfg.user == "alice@example.com"
+      check cfg.password == ""
+      check cfg.host == host
+      check cfg.port == port
+    let cfg = parseDsn("postgresql://u:pw@h/db?application_name=svc@x")
+    check cfg.user == "u"
+    check cfg.password == "pw"
+    check cfg.host == "h"
+    check cfg.applicationName == "svc@x"
+
+  test "raw '@' in the database after a password or port is rejected":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://u:p@" & tail & "/s@h", # '@' and '/' in the password
+      "postgresql://u:p@s/" & tail & "@h/db",
+      "postgresql://u:pw@primary/app@replica", # '@' in the database
+      "postgresql://u:1234/" & tail & "@h", # numeric password, no database
+      "postgresql://u:1234/" & tail & "@h/db",
+      "postgresql://u:p/" & tail & "@h/db", # non-numeric password head
+      "postgresql://u:ab/c" & tail & "%zz@h", # bad escape in the tail
+      "postgresql://[::1]:5432/" & tail & "@x",
+      "postgresql://user@srv:1234/" & tail & "@h", # '@' in the user name
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%40" in msg
+      check "%2F" in msg
+      check tail notin msg
+
+  test "a raw '/' in a password is reported before authority errors":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://user:pa:ss/" & tail & "@host/db", # would be unbracketed IPv6
+      "postgresql://u:p%zz/" & tail & "@h", # would be a bad port escape
+      "postgresql://u:1x/" & tail & "@h", # would be an invalid port
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%2F" in msg
+      check tail notin msg
+
+  test "raw '?' in the userinfo before a query with no path is rejected":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://u:1234?application_name=" & tail & "@h", # password as port
+      "postgresql://u:p@" & tail & "?k@h/db", # '@' and '?' in the password
+      "postgresql://u:12?" & tail & "@h/db",
+      "postgresql://my?" & tail & "@h/db", # '?' in the user name
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%3F" in msg
+      check "%40" in msg
+      check tail notin msg
+
+  test "raw '@' in a forwarded query parameter is kept":
+    var cfg = parseDsn("postgresql://u:pw@h/db?search_path=a@b")
+    check cfg.host == "h"
+    check cfg.password == "pw"
+    check cfg.extraParams == @[("search_path", "a@b")]
+    cfg = parseDsn("postgresql://h/db?options=-c%20log_line_prefix%3D%25u@%25d")
+    check cfg.extraParams == @[("options", "-c log_line_prefix=%u@%d")]
+    cfg = parseDsn("postgresql://h/db?search_path=a%40b")
+    check cfg.extraParams == @[("search_path", "a@b")]
+
+  test "raw '@' in a query with no path is rejected":
+    for dsn in [
+      "postgresql://h:5433?user=alice@example.com",
+      "postgresql://[::1]:5432?user=alice@example.com",
+      "postgresql://[::1]?user=alice@example.com",
+      "postgresql://localhost?user=alice@example.com",
+      "postgresql://h1,h2:5433?user=alice@example.com",
+      "postgresql://u:pw@h?application_name=svc@x",
+      "postgresql://?user=alice@example.com",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%40" in msg
+      check "add '/' before '?'" in msg
+
+  test "raw '/' in the user name before a password is rejected":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://my/user:" & tail & "@h/db",
+      "postgresql://my/user:" & tail & "@h",
+      "postgresql://my/user:p@" & tail & "@h/db",
+      "postgresql://my/user:" & tail & "@h?application_name=x",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check tail notin msg
+
+  test "an unmatched '[' does not hide a port from the ambiguous guard":
+    for dsn in [
+      "postgresql://u[x:5432/pw@h/db",
+      "postgresql://u[:5/x@h/db",
+      "postgresql://a[:1/b@c/db",
+      # A bracket pair not at an element start does not hide the port.
+      "postgresql://a[b:5432,x]y/tail@h/db",
+      "postgresql://h,a[b:1]/x@h/db",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%2F" in msg
+      check "%40" in msg
+
+  test "brackets in the authority take any host, as in libpq":
+    for (dsn, host) in [
+      ("postgresql://[localhost]:5433/db", "localhost"),
+      ("postgresql://[127.0.0.1]:5433/db", "127.0.0.1"),
+      ("postgresql://[fe80::1%25eth0]:5433/db", "fe80::1%eth0"),
+    ]:
+      let cfg = parseDsn(dsn)
+      check cfg.host == host
+      check cfg.port == 5433
+
+  test "encoded '@' after userinfo or after host:port is accepted":
+    var cfg = parseDsn("postgresql://u:pw@primary/app%40replica")
+    check cfg.host == "primary"
+    check cfg.password == "pw"
+    check cfg.database == "app@replica"
+    cfg = parseDsn("postgresql://srv:5432?user=admin%40srv&password=s3cret")
+    check cfg.host == "srv"
+    check cfg.user == "admin@srv"
+    check cfg.password == "s3cret"
+
+  test "unrelated errors carry no password hint":
+    for dsn in [
+      "postgresql://h:ab/db", "postgresql:///db?host=h&port=zz",
+      "postgresql://h/db?port=zz", "postgresql://[::1]:zz/db",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Invalid port" in msg
+      check "%2F" notin msg
+
+  test "encoded '/' and '?' in the password":
+    let cfg = parseDsn("postgresql://u:a%2Fb%3Fc@h/db")
+    check cfg.password == "a/b?c"
+    check cfg.host == "h"
+
   test "URL-encoded database":
     let cfg = parseDsn("postgresql://host/my%2Fdb")
     check cfg.database == "my/db"

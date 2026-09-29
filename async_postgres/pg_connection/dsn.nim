@@ -805,24 +805,45 @@ proc parseUriDsn(dsn: string): ConnConfig =
   # Strip scheme prefix
   let rest = dsn[scheme.len + 3 .. ^1] # skip "scheme://"
 
-  # Split query string
-  var body: string
-  var queryStr: string
-  let qpos = rest.find('?')
+  # Userinfo ends at the last '@' before the first '/' or '?' (WHATWG, not
+  # libpq's first '@'), so a raw '@' in user or password parses.
+  let authEnd = block:
+    let p = rest.find({'/', '?'})
+    if p < 0: rest.len else: p
+  let upos =
+    if authEnd > 0:
+      rest.rfind('@', last = authEnd - 1)
+    else:
+      -1
+  let userinfo =
+    if upos >= 0:
+      rest[0 ..< upos]
+    else:
+      ""
+  let hostport = rest[upos + 1 ..< authEnd]
+  let hasPath = authEnd < rest.len and rest[authEnd] == '/'
+  let qpos = rest.find('?', start = authEnd)
+  var dbpath, queryStr: string
+  if hasPath:
+    dbpath = rest[authEnd + 1 ..< (if qpos >= 0: qpos else: rest.len)]
   if qpos >= 0:
-    body = rest[0 ..< qpos]
     queryStr = rest[qpos + 1 .. ^1]
-  else:
-    body = rest
 
-  # Split userinfo and hostpath by '@'
-  var userinfo, hostpath: string
-  let apos = body.rfind('@')
-  if apos >= 0:
-    userinfo = body[0 ..< apos]
-    hostpath = body[apos + 1 .. ^1]
-  else:
-    hostpath = body
+  # A raw '/' or '?' in the userinfo moves its '@'-bearing tail right after the
+  # authority ("svc/admin@REALM@h" -> host "svc"); reject before host errors.
+  if '@' in dbpath:
+    raise newException(
+      PgConfigError,
+      "Ambiguous DSN: raw '@' in the database; percent-encode '/' in the " &
+        "user name or password (%2F) or '@' in the database (%40)",
+    )
+  if not hasPath and '@' in queryStr:
+    raise newException(
+      PgConfigError,
+      "Ambiguous DSN: raw '@' in a query with no path; percent-encode '?' " &
+        "in the user name or password (%3F) or '@' in the query (%40), or " &
+        "add '/' before '?'",
+    )
 
   # Parse user:password
   if userinfo.len > 0:
@@ -832,18 +853,6 @@ proc parseUriDsn(dsn: string): ConnConfig =
       result.password = pctDecode(userinfo[cpos + 1 .. ^1], "userinfo")
     else:
       result.user = pctDecode(userinfo, "userinfo")
-
-  # Parse host:port/database
-  var hostport, dbpath: string
-  let spos = hostpath.find('/')
-  if spos >= 0:
-    hostport = hostpath[0 ..< spos]
-    dbpath = hostpath[spos + 1 .. ^1]
-  else:
-    hostport = hostpath
-
-  if dbpath.len > 0:
-    result.database = pctDecode(dbpath, "database")
 
   # Parse host(s) and port(s) — supports comma-separated multi-host syntax.
   # libpq order: the authority splits on commas *before* percent-decoding
@@ -905,6 +914,9 @@ proc parseUriDsn(dsn: string): ConnConfig =
           hostList.add decodeHostElem(part, "host", hidx)
           portList.add ""
     hostGiven = true
+
+  if dbpath.len > 0:
+    result.database = pctDecode(dbpath, "database")
 
   if queryStr.len > 0:
     let items = queryStr.split('&')
@@ -1109,6 +1121,9 @@ proc parseDsn*(dsn: string): ConnConfig =
   ## - keyword=value: ``host=localhost port=5432 dbname=test`` (libpq compatible)
   ##
   ## Both ``postgresql://`` and ``postgres://`` schemes are accepted for URI format.
+  ## A raw ``@`` in user or password parses; a raw ``/`` or ``?`` there must be
+  ## percent-encoded, and a raw ``@`` in the database, or in a query with no
+  ## path, raises ``PgConfigError`` (``h/db?user=a@b`` is fine).
   ##
   ## ``client_encoding`` is always UTF8: another value, directly or via ``-c``
   ## in ``options``, raises ``PgConfigError``.
