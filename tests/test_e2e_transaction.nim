@@ -1085,6 +1085,370 @@ suite "E2E: Transaction":
 
     )
 
+  test "withTransaction rejects break/continue passed to a loop template":
+    # The unexpanded walk can't see the loop a template wraps around its
+    # argument, so it rejects a `break`/`continue` passed to one even when that
+    # loop would capture it. The check errs on the side of rejecting.
+    template txEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            txEachN(3):
+              if conn.pid == 0:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withSavepoint:
+              txEachN(3):
+                continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionDeadline(seconds(5)):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withConnection(conn):
+              txEachN(3):
+                break
+
+    )
+
+  test "scoped bodies accept variables of a type declared in the body":
+    # Regression: splicing the type-checked body back in type-checks it a
+    # second time, which Nim rejects for a variable of a body-local object or
+    # enum type ("inconsistent typing for reintroduced symbol").
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            type TxLocal = object
+              a: int
+
+            let v = TxLocal(a: 1)
+            doAssert v.a == 1
+            conn.withSavepoint:
+              type SpLocal = enum
+                spA
+                spB
+
+              var e = spA
+              doAssert e != spB
+
+    )
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            type RetryLocal = object
+              a: int
+
+            let v = RetryLocal(a: 1)
+            doAssert v.a == 1
+
+    )
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionDeadline(conn, seconds(5)):
+            type PoolLocal = object
+              a: int
+
+            let v = PoolLocal(a: 1)
+            doAssert v.a == 1
+          pool.withConnection(conn):
+            type ConnLocal = enum
+              clA
+              clB
+
+            var e = clA
+            doAssert e != clB
+
+    )
+
+  test "withTransaction rejects break escaping through a template argument":
+    # A template that runs its body argument without a loop of its own leaves
+    # the `break` bound to the caller's loop.
+    template txTwice(body: untyped) =
+      body
+      body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withTransaction:
+              txTwice:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withConnection(conn):
+              txTwice:
+                continue
+
+    )
+
+  test "retry/pipeline/cluster scopes reject break passed to a loop template":
+    # The unexpanded walk can't see the loop a template wraps around its
+    # argument, so it rejects a `break`/`continue` passed to one even when that
+    # loop would capture it. The check errs on the side of rejecting.
+    template txEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetryDeadline(RetryOptions(), seconds(5)):
+            txEachN(3):
+              continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetry(RetryOptions(), conn):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetryDeadline(RetryOptions(), conn, seconds(5)):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withPipeline(p):
+              txEachN(3):
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          for i in 0 ..< 3:
+            cluster.withReadConnection(c):
+              txEachN(3):
+                break
+            cluster.withWriteConnection(c):
+              txEachN(3):
+                continue
+          cluster.withTransactionRetry(RetryOptions(), conn):
+            txEachN(3):
+              break
+
+    )
+
+  test "retry/pipeline/cluster scopes reject break escaping through a template":
+    template txTwice(body: untyped) =
+      body
+      body
+
+    # No caller loop: the `break`/`continue` would bind to the retry loop.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            txTwice:
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetryDeadline(RetryOptions(), seconds(5)):
+            txTwice:
+              continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetry(RetryOptions(), conn):
+            txTwice:
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetryDeadline(RetryOptions(), conn, seconds(5)):
+            txTwice:
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withPipeline(p):
+              txTwice:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          for i in 0 ..< 3:
+            cluster.withReadConnection(c):
+              txTwice:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          for i in 0 ..< 3:
+            cluster.withWriteConnection(c):
+              txTwice:
+                continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          cluster.withTransactionRetry(RetryOptions(), conn):
+            txTwice:
+              break
+
+    )
+
+  test "withTransaction rejects labeled break through a loop template":
+    # The template's loop captures only unlabeled `break`s; `break outer` still
+    # leaves the body unless the body itself defines `outer`.
+    template txEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    template txLabeled(body: untyped) =
+      block outer:
+        body
+
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            block outer:
+              txEachN(3):
+                break outer
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          block outer:
+            conn.withTransaction:
+              txEachN(3):
+                break outer
+
+    )
+    # A template's own `block outer:` must not hide an escape to the caller's
+    # `outer`: its label is gensym'd, so the user's `break outer` still binds
+    # to the enclosing block.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          block outer:
+            conn.withTransaction:
+              txLabeled:
+                break outer
+
+    )
+
   test "withSavepoint rejects return at compile time":
     doAssert not compiles(
       block:
@@ -1211,6 +1575,53 @@ suite "E2E: Transaction":
           for i in 0 ..< 3:
             conn.withSavepoint:
               break
+
+    )
+
+  test "withTransaction accepts break in a while condition":
+    # Nim evaluates the condition inside the loop, so an unlabeled `break`
+    # there leaves only the `while` and COMMIT still runs.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for j in 0 ..< 2:
+            conn.withTransaction:
+              while (if j == 0: break ; false):
+                discard
+
+    )
+
+  test "withTransaction rejects break in a for iterable":
+    # The iterable is evaluated before the loop is entered, so the `break`
+    # leaves the body.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for j in 0 ..< 2:
+            conn.withTransaction:
+              for x in (if j == 0: break ; @[1]):
+                discard x
+
+    )
+
+  test "withTransaction rejects return in a template defined in the body":
+    template txLater(body: untyped) =
+      let fn = proc() {.async.} =
+        body
+      asyncSpawn fn()
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            template bail() =
+              txLater:
+                return
+
+            bail()
 
     )
 
@@ -4472,10 +4883,37 @@ static:
   # (UnnamedBreak in Nim >= 2.2), so a body-local `block:` captures it and
   # the COMMIT/RELEASE still runs. Only a `break` with no loop/`block` in
   # scope inside the body can skip the COMMIT/RELEASE.
-  doAssert(not hasLoopEscapeStmt(parseStmt("block:\n  break")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("block:\n  if x:\n    break")))
-  doAssert hasLoopEscapeStmt(parseStmt("break"))
-  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  block:\n    break")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  break")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("block lbl:\n  break lbl")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  continue")))
+  proc escapes(src: string): bool =
+    escapingStmts(parseStmt(src)).len > 0
+
+  doAssert(not escapes("block:\n  break"))
+  doAssert(not escapes("block:\n  if x:\n    break"))
+  doAssert escapes("break")
+  doAssert(not escapes("while true:\n  block:\n    break"))
+  doAssert(not escapes("while true:\n  break"))
+  doAssert(not escapes("block lbl:\n  break lbl"))
+  doAssert escapes("block lbl:\n  discard\nbreak lbl")
+  doAssert(not escapes("while true:\n  continue"))
+  doAssert escapes("block:\n  continue")
+  # Before expansion the loop a template wraps around its argument is
+  # invisible, so a `break` passed to a template is rejected; so is a `return`
+  # inside a call.
+  doAssert escapes("eachN(3):\n  break")
+  doAssert escapes("later:\n  return")
+  # A `return` in a body-local template is collected (asyncdispatch's `async`
+  # rewrites it before the template expands), not its `break`/`continue`: they
+  # only reach the body through an expansion, which the typed re-check
+  # catches. A body-local proc is skipped.
+  block:
+    let found = escapingStmts(
+      parseStmt("template bail =\n  later:\n    return\n  break\nproc p() =\n  return")
+    )
+    doAssert found.len == 1 and found[0].kind == nnkReturnStmt
+  # A `while` condition is evaluated inside the loop, where a `break` leaves
+  # only that `while`; a `continue` there binds to an enclosing loop. A `for`
+  # iterable is evaluated before the loop is entered.
+  doAssert(not escapes("while (if x: break; false):\n  discard"))
+  doAssert escapes("while (if x: continue; false):\n  discard")
+  doAssert escapes("for i in (if x: break; s):\n  discard")
+  doAssert(not escapes("while (block: break; false):\n  discard"))
+  doAssert(not escapes("for i in s:\n  (if x: break)"))

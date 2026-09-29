@@ -282,7 +282,7 @@ macro withReadConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped 
   ## Release runs outside `finally` (a failing `await` in an asyncdispatch
   ## `finally` masks the body error), so `return` / `break` / `continue`
   ## escaping the body are rejected at compile time.
-  checkNoBodyEscape(body, "withReadConnection", "the connection release")
+  let body = checkNoBodyEscape(body, "withReadConnection", "the connection release")
   let clusterSym = genSym(nskLet, "cluster")
   let connPoolSym = genSym(nskLet, "connPool")
   let bodyErrSym = genSym(nskVar, "bodyErr")
@@ -303,19 +303,13 @@ macro withReadConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped 
       except Defect as d:
         `bodyDefectSym` = d
       `releaseBlock`
-      checkNoBodyEscapePost(
-        block:
-          `body`,
-        "withReadConnection",
-        "the connection release",
-      )
 
 macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
   ##
   ## Body `return` / `break` / `continue` escaping to an enclosing loop are
   ## rejected at compile time (see `withReadConnection`).
-  checkNoBodyEscape(body, "withWriteConnection", "the connection release")
+  let body = checkNoBodyEscape(body, "withWriteConnection", "the connection release")
   let clusterSym = genSym(nskLet, "cluster")
   let bodyErrSym = genSym(nskVar, "bodyErr")
   let bodyDefectSym = genSym(nskVar, "bodyDefect")
@@ -335,12 +329,6 @@ macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped
       except Defect as d:
         `bodyDefectSym` = d
       `releaseBlock`
-      checkNoBodyEscapePost(
-        block:
-          `body`,
-        "withWriteConnection",
-        "the connection release",
-      )
 
 macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool.

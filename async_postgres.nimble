@@ -28,10 +28,16 @@ task privateAccessGuard,
   "check that privateAccess and {.all.} imports are only used from tests":
   exec "nim c -r --hints:off tools/private_access_guard.nim"
 
+task escapeDiagnostics,
+  "check the compile errors of the scoped-body escape check with `nim check`":
+  exec "nim c -r --hints:off -d:asyncBackend=asyncdispatch tests/test_body_escape_diagnostics.nim"
+  exec "nim c -r --hints:off -d:asyncBackend=chronos tests/test_body_escape_diagnostics.nim"
+
 task test, "test":
   apiSurfaceTask()
   parseGuardTask()
   privateAccessGuardTask()
+  escapeDiagnosticsTask()
   exec "bash tests/gen_certs.sh"
   exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
   exec "nim c -d:asyncBackend=chronos -r tests/all_tests.nim"

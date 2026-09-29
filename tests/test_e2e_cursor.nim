@@ -307,6 +307,43 @@ suite "E2E: Cursor/Streaming":
 
     )
 
+  test "withCursor accepts a variable of a type declared in the body":
+    # Regression: splicing the type-checked body back in rejected a variable
+    # of a body-local type as a reintroduced symbol.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withCursor("SELECT 1", 5'i32, cur):
+            type CursorLocal = object
+              a: int
+
+            let v = CursorLocal(a: 1)
+            doAssert v.a == 1
+
+    )
+
+  test "withCursor rejects break passed to a loop template":
+    # The unexpanded walk can't see the loop a template wraps around its
+    # argument, so it rejects a `break`/`continue` passed to one even when that
+    # loop would capture it. The check errs on the side of rejecting.
+    template cursorEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              cursorEachN(3):
+                break
+
+    )
+
   test "withCursor rejects return hidden inside a template":
     # A `return` inside a template called from the body is invisible to the
     # unexpanded walk; the typed re-check must still reject it.

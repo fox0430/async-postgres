@@ -3,124 +3,135 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/macros
+import std/[macros, sequtils]
 
 import ../[async_backend, pg_protocol]
 import ../pg_connection/[types, simple_query]
 import core
 
-proc hasReturnStmt(n: NimNode): bool =
-  ## Check whether an AST contains a `return` statement (excluding nested
-  ## proc/func/method/iterator definitions where `return` is valid).
-  if n.kind == nnkReturnStmt:
-    return true
-  if n.kind in {
-    nnkProcDef, nnkFuncDef, nnkMethodDef, nnkIteratorDef, nnkLambda, nnkDo,
-    nnkConverterDef, nnkTemplateDef, nnkMacroDef,
-  }:
-    return false
-  for child in n:
-    if hasReturnStmt(child):
-      return true
-  return false
+const routineDefKinds = {
+  nnkProcDef, nnkFuncDef, nnkMethodDef, nnkIteratorDef, nnkLambda, nnkDo,
+  nnkConverterDef, nnkTemplateDef, nnkMacroDef,
+} ## Nested definitions whose `return` / `break` / `continue` can't leave the body.
 
-proc escapeLabelName(n: NimNode): string =
-  ## Plain name of a `break`/`continue`/`block` label (`nnkIdent` or `nnkSym`).
-  n.strVal
+proc sameLabel(a, b: NimNode): bool =
+  ## Whether two `break`/`block` labels name the same block. Typed labels are
+  ## compared as symbols, so a template's gensym'd label never matches a
+  ## caller's label of the same name; untyped ones can only be compared by name.
+  if a.kind == nnkSym and b.kind == nnkSym:
+    a == b
+  else:
+    eqIdent(a, b)
 
-proc hasLoopEscapeStmt(n: NimNode): bool =
-  ## True if a `break`/`continue` in `n` would escape to a loop or `block:`
-  ## outside the body, skipping the trailing COMMIT / RELEASE. Statements
-  ## captured by a body-local loop/`block` are accepted.
-  proc walk(n: NimNode, inLoop, inBlock: bool, labels: var seq[string]): bool =
+proc escapingStmts(body: NimNode, typed = false): seq[NimNode] =
+  ## Every `return` / `break` / `continue` that may leave `body`, skipping nested
+  ## routines. Unexpanded, a body-local template's `return` counts (asyncdispatch's
+  ## `async` rewrites it first); its `break`/`continue` are left to the typed walk.
+  proc walk(
+      n: NimNode,
+      breakCaptured, continueCaptured, inTemplate: bool,
+      labels: var seq[NimNode],
+      found: var seq[NimNode],
+  ) =
     case n.kind
+    of nnkTemplateDef:
+      if not typed:
+        for child in n:
+          walk(child, breakCaptured, continueCaptured, true, labels, found)
+    of routineDefKinds - {nnkTemplateDef}:
+      discard
+    of nnkReturnStmt:
+      found.add(n)
     of nnkContinueStmt:
-      # Nim rejects labeled `continue` at compile time; unlabeled ones are
-      # captured by any body-local loop.
-      return not inLoop
+      # Nim rejects labeled `continue`; unlabeled ones bind to the innermost loop.
+      if not (inTemplate or continueCaptured):
+        found.add(n)
     of nnkBreakStmt:
-      if n.len > 0 and n[0].kind in {nnkIdent, nnkSym}:
-        return not labels.contains(escapeLabelName(n[0]))
-      return not (inLoop or inBlock)
-    of nnkProcDef, nnkFuncDef, nnkMethodDef, nnkIteratorDef, nnkLambda, nnkDo,
-        nnkConverterDef, nnkTemplateDef, nnkMacroDef:
-      return false
-    of nnkForStmt, nnkWhileStmt:
-      for child in n:
-        if walk(child, inLoop = true, inBlock, labels):
-          return true
-      return false
+      if not inTemplate:
+        let escapes =
+          if n.len > 0 and n[0].kind != nnkEmpty:
+            not labels.anyIt(sameLabel(it, n[0]))
+          else:
+            not breakCaptured
+        if escapes:
+          found.add(n)
+    of nnkWhileStmt:
+      # A `break` in the condition leaves this loop; a `continue` there doesn't.
+      walk(n[0], true, continueCaptured, inTemplate, labels, found)
+      walk(n[1], true, true, inTemplate, labels, found)
+    of nnkForStmt:
+      for i in 0 ..< n.len - 1:
+        walk(n[i], breakCaptured, continueCaptured, inTemplate, labels, found)
+      walk(n[^1], true, true, inTemplate, labels, found)
     of nnkBlockStmt, nnkBlockExpr:
-      let hasLabel = n.len > 0 and n[0].kind in {nnkIdent, nnkSym}
+      let hasLabel = n[0].kind != nnkEmpty
       if hasLabel:
-        labels.add(escapeLabelName(n[0]))
+        labels.add(n[0])
       for child in n:
-        if walk(child, inLoop, inBlock = true, labels):
-          return true
+        walk(child, true, continueCaptured, inTemplate, labels, found)
       if hasLabel:
         labels.setLen(labels.len - 1)
-      return false
     else:
       for child in n:
-        if walk(child, inLoop, inBlock, labels):
-          return true
-      return false
+        walk(child, breakCaptured, continueCaptured, inTemplate, labels, found)
 
-  var labels: seq[string]
-  return walk(n, inLoop = false, inBlock = false, labels)
+  var labels: seq[NimNode]
+  walk(body, false, false, false, labels, result)
 
-proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string) =
-  ## Reject control flow inside a transaction/savepoint macro `body` that would
-  ## bypass the trailing `cleanup` (`"COMMIT/ROLLBACK"` or `"RELEASE/ROLLBACK"`):
-  ## a `return`, or a `break`/`continue` that escapes the body to an enclosing
-  ## loop. Either would skip the COMMIT/RELEASE the macro appends after `body`,
-  ## silently discarding the transaction's work. Shared by every `withTransaction`
-  ## / `withSavepoint` variant (conn / pool / cluster).
-  ## A `return` hidden in a template called from the body is invisible to the
-  ## unexpanded walk; `checkNoBodyEscapePost` re-checks after expansion.
-  if hasReturnStmt(body):
-    error(
-      "'return' inside " & macroName & " is not allowed: " & cleanup &
-        " would be skipped",
-      body,
-    )
-  if hasLoopEscapeStmt(body):
-    error(
-      "'break'/'continue' escaping " & macroName & " is not allowed: " & cleanup &
-        " would be skipped",
-      body,
-    )
+proc rejectEscape(stmt: NimNode, macroName, cleanup: string, hidden: bool) =
+  ## Raise the compile error for an escaping `stmt`; `hidden` marks one that
+  ## comes from a template's expansion rather than the body itself.
+  let what =
+    if stmt.kind == nnkReturnStmt: "'return' inside" else: "'break'/'continue' escaping"
+  let hint = if hidden: " (hidden inside a template)" else: ""
+  error(
+    what & " " & macroName & hint & " is not allowed: " & cleanup & " would be skipped",
+    stmt,
+  )
 
-macro checkNoBodyEscapePost*(body: typed, macroName, cleanup: static string): untyped =
-  ## Static re-check after template expansion: control flow hidden in a
-  ## template is invisible to the unexpanded walk. The caller's wrapping
-  ## `block:` (which would capture unlabeled `break`s) is unwrapped first.
-  let inner =
-    if body.kind == nnkBlockStmt and body.len > 0:
-      body[^1]
-    else:
-      body
-  if hasReturnStmt(inner):
+macro checkNoBodyEscapePost*(
+    copy: typed, macroName, cleanup: static string, body: untyped
+): untyped =
+  ## Reject control flow that template expansions hid in the typed `copy`, then
+  ## expand to the untyped `body`: re-splicing typed type sections breaks them.
+  ## The `while false:` wrapper lets a stray `break`/`continue` type-check.
+  if copy.kind != nnkWhileStmt or copy.len != 2:
     error(
-      "'return' inside " & macroName &
-        " (possibly hidden inside a template) is not allowed: " & cleanup &
-        " would be skipped",
-      body,
+      "internal: " & macroName & " body escape check expects the body copy " &
+        "wrapped in `while false:`, got " & $copy.kind,
+      copy,
     )
-  if hasLoopEscapeStmt(inner):
-    error(
-      "'break'/'continue' escaping " & macroName &
-        " (possibly hidden inside a template) is not allowed: " & cleanup &
-        " would be skipped",
-      body,
-    )
-  result = newStmtList()
+  for stmt in escapingStmts(copy[1], typed = true):
+    rejectEscape(stmt, macroName, cleanup, hidden = true)
+  result = body
 
-macro checkNoBodyEscapePre*(body: untyped, macroName, cleanup: static string): untyped =
+proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string): NimNode =
+  ## Reject control flow inside a scoped macro `body` that would bypass the
+  ## trailing `cleanup` (`"COMMIT/ROLLBACK"`, `"RELEASE/ROLLBACK"`, a release
+  ## or close): a `return`, or a `break`/`continue` that escapes the body to an
+  ## enclosing loop. Either would skip the cleanup the macro appends after
+  ## `body`, silently discarding the transaction's work or leaking the
+  ## resource. Shared by every scoped construct (conn / pool / cluster).
+  ##
+  ## Returns the body to splice; its typed copy is type-checked too, so a body
+  ## nested n constructs deep is type-checked 2^n times.
+  for stmt in escapingStmts(body):
+    rejectEscape(stmt, macroName, cleanup, hidden = false)
+  newCall(
+    bindSym"checkNoBodyEscapePost",
+    nnkWhileStmt.newTree(newLit(false), body.copyNimTree),
+    newLit(macroName),
+    newLit(cleanup),
+    body,
+  )
+
+macro checkTemplateBodyEscape*(
+    body: untyped, macroName, cleanup: static string
+): untyped =
   ## `checkNoBodyEscape` for template-based scoped constructs, which can't call
-  ## a compile-time proc directly on their untyped `body`.
+  ## a compile-time proc directly on their untyped `body`. Use it as the body's
+  ## only occurrence: it expands to the checked body.
   checkNoBodyEscape(body, macroName, cleanup)
-  result = newStmtList()
 
 proc bindCleanupSkippedSyms(): tuple[fire, invalidated, failed: NimNode] {.compileTime.} =
   ## Common `bindSym` set for the `onCleanupSkipped` wiring shared by
@@ -514,7 +525,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -541,12 +552,6 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       `bodyCleanup`
       # Re-raise; deadline variants wrap.
       raise `dSym`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withTransaction",
-      "COMMIT/ROLLBACK",
-    )
 
 macro withTransactionRetry*(
     conn: PgConnection, retryOpts: RetryOptions, args: varargs[untyped]
@@ -607,7 +612,7 @@ macro withTransactionRetry*(
       retryOpts,
     )
 
-  checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -618,12 +623,6 @@ macro withTransactionRetry*(
     `connSym`.checkTxIdle()
     let `retryOptsSym` = `retryOpts`
     `loop`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withTransactionRetry",
-      "COMMIT/ROLLBACK",
-    )
 
 proc savepointNameExpr(connSym, spName: NimNode): NimNode {.compileTime.} =
   ## Savepoint name expr: explicit name as-is, else `nextPortalName` for uniqueness.
@@ -687,7 +686,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  checkNoBodyEscape(body, "withSavepoint", "RELEASE/ROLLBACK")
+  body = checkNoBodyEscape(body, "withSavepoint", "RELEASE/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -725,12 +724,6 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
       `spCleanup`
       # Re-raise; deadline sibling wraps.
       raise `dSym`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withSavepoint",
-      "RELEASE/ROLLBACK",
-    )
 
 const rollbackGraceMs* {.intdefine: "asyncPgRollbackGraceMs".}: int = 5000
   ## Compile-time override (milliseconds) for the per-call ROLLBACK / RELEASE
@@ -803,7 +796,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
       args[0],
     )
 
-  checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -837,12 +830,6 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
         raise newException(PgError, `dSym`.msg, `dSym`)
 
     `awaitAndTimeout`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withTransactionDeadline",
-      "COMMIT/ROLLBACK",
-    )
 
 macro withTransactionRetryDeadline*(
     conn: PgConnection, retryOpts: RetryOptions, args: varargs[untyped]
@@ -895,7 +882,7 @@ macro withTransactionRetryDeadline*(
       args[0],
     )
 
-  checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -948,12 +935,6 @@ macro withTransactionRetryDeadline*(
         raise newException(PgError, `dSym`.msg, `dSym`)
 
     `loop`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withTransactionRetryDeadline",
-      "COMMIT/ROLLBACK",
-    )
 
 macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a SAVEPOINT bounded by a single wall-clock deadline
@@ -1002,7 +983,7 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
       args[0],
     )
 
-  checkNoBodyEscape(body, "withSavepointDeadline", "RELEASE/ROLLBACK")
+  body = checkNoBodyEscape(body, "withSavepointDeadline", "RELEASE/ROLLBACK")
 
   let connExpr = conn
   let connSym = genSym(nskLet, "conn")
@@ -1042,9 +1023,3 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
         raise newException(PgError, `dSym`.msg, `dSym`)
 
     `awaitAndTimeout`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withSavepointDeadline",
-      "RELEASE/ROLLBACK",
-    )
