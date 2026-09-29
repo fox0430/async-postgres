@@ -143,7 +143,7 @@ type
   HostEntry* = object ## A single host:port entry for multi-host connection.
     host*: string ## Host name (or Unix socket dir); used for SSL verification
     hostaddr*: string
-      ## Numeric address dialed instead of resolving `host` (libpq `hostaddr`).
+      ## Address dialed instead of resolving `host` (libpq `hostaddr`).
       ## Empty = resolve `host`.
     port*: int
 
@@ -152,7 +152,7 @@ type
     host*: string
     port*: int # default 5432
     hostaddr*: string
-      ## Numeric address dialed instead of resolving `host` (libpq `hostaddr`).
+      ## Address dialed instead of resolving `host` (libpq `hostaddr`).
       ## `host` is still the name used for SSL certificate verification.
     user*: string
     password*: string
@@ -758,8 +758,8 @@ proc validateTlsConfig*(
 # HostEntry accessors
 
 func dialAddr*(entry: HostEntry): string {.inline.} =
-  ## The address actually dialed: `hostaddr` bypasses name resolution when
-  ## given, otherwise `host` is resolved (libpq semantics).
+  ## The address actually dialed: `hostaddr` when given, otherwise `host`.
+  ## Unlike libpq, a name in `hostaddr` is resolved rather than rejected.
   if entry.hostaddr.len > 0: entry.hostaddr else: entry.host
 
 func displayHost*(entry: HostEntry): string {.inline.} =

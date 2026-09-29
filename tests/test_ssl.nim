@@ -176,6 +176,11 @@ suite "sniName":
     check sniName("[2001:db8::1]", true) == ""
     check sniName("fe80::1%eth0", true) == ""
 
+  test "empty for an empty-zone literal":
+    # Undialable, but still an IP literal, never a name.
+    check sniName("fe80::1%", true) == ""
+    check sniName("[fe80::1%]", true) == ""
+
   test "returns hostname that only looks numeric":
     check sniName("db1.example.com", true) == "db1.example.com"
 
