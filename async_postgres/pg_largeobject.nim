@@ -386,6 +386,9 @@ macro withLargeObject*(
         await `lo`.loClose()
       except CatchableError:
         discard
+      except Defect:
+        # Same-frame Defect from the close: swallow so it can't replace the body error.
+        discard
       raise loBodyErr
     except Defect as loBodyDefect:
       # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
@@ -393,6 +396,8 @@ macro withLargeObject*(
       try:
         await `lo`.loClose()
       except CatchableError:
+        discard
+      except Defect:
         discard
       raise loBodyDefect
     # Surface a genuine close failure to the caller.
