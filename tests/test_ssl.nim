@@ -1,7 +1,8 @@
 import std/[unittest, strutils, os]
 
 import cert_fixtures
-from mock_pg_server import buildPreV3Error
+from mock_pg_server import
+  buildPreV3Error, buildAuthCleartextPassword, buildAuthMD5Password
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 from ../async_postgres/pg_auth import computeTlsServerEndpoint
 
@@ -1911,10 +1912,8 @@ suite "SCRAM channel binding enforcement":
     r
 
   test "cbRequire refuses a password request before sending the password":
-    let requests = [
-      ("cleartext", buildBackendMsg('R', @[byte 0, 0, 0, 3])),
-      ("md5", buildBackendMsg('R', @[byte 0, 0, 0, 5, 1, 2, 3, 4])),
-    ]
+    let requests =
+      [("cleartext", buildAuthCleartextPassword()), ("md5", buildAuthMD5Password())]
     for (name, req) in requests:
       checkpoint name
       let r = cbRequireRefusal(req)

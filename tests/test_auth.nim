@@ -1,36 +1,15 @@
-import std/[unittest, strutils, base64]
+import std/[unittest, strutils, base64, importutils]
 
 import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 
-import ../async_postgres/[pg_auth, pg_errors]
+import ../async_postgres/pg_auth {.all.}
+import ../async_postgres/pg_errors
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
   for i in 0 ..< s.len:
     result[i] = byte(s[i])
-
-proc scramClientFirstMessage(
-    user: string,
-    nonce: string,
-    state: var ScramState,
-    cbType: string = "",
-    cbData: seq[byte] = @[],
-    cbSupportedButUnused: bool = false,
-): seq[byte] =
-  ## Test helper with fixed nonce. Mirrors the state setup of the production
-  ## random-nonce overload so RFC vectors stay deterministic.
-  state.clientNonce = nonce
-  state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & nonce
-  state.gs2Header =
-    if cbType.len > 0:
-      "p=" & cbType & ",,"
-    elif cbSupportedButUnused:
-      "y,,"
-    else:
-      "n,,"
-  state.channelBindingData = cbData
-  result = toBytes(state.gs2Header & state.clientFirstBare)
 
 proc toString(data: seq[byte]): string =
   result = newString(data.len)
@@ -123,9 +102,85 @@ suite "SCRAM-SHA-256":
     let serverFinal = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
     check scramVerifyServerFinal(toBytes(serverFinal), state) == true
 
-    # Step 5: Wrong signature fails
+    # Step 5: Verification consumes the signature, so no replay verifies,
+    # not even as all zeros
+    check scramVerifyServerFinal(toBytes(serverFinal), state) == false
+    check scramVerifyServerFinal(toBytes("v=" & base64.encode(newString(32))), state) ==
+      false
+
+  test "a failed verification also consumes the signature":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "rOprNGfwEbeRWgbNEkqO", state)
+    let serverFirst =
+      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0," &
+      "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    discard scramClientFinalMessage("pencil", toBytes(serverFirst), state)
     let wrongFinal = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     check scramVerifyServerFinal(toBytes(wrongFinal), state) == false
+    let serverFinal = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+    check scramVerifyServerFinal(toBytes(serverFinal), state) == false
+
+  test "wipeServerSignature makes a computed signature fail":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "rOprNGfwEbeRWgbNEkqO", state)
+    let serverFirst =
+      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0," &
+      "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    discard scramClientFinalMessage("pencil", toBytes(serverFirst), state)
+    state.wipeServerSignature()
+    let serverFinal = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+    check scramVerifyServerFinal(toBytes(serverFinal), state) == false
+
+  test "a new exchange on a reused state drops the previous signature":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "rOprNGfwEbeRWgbNEkqO", state)
+    let serverFirst =
+      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0," &
+      "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    discard scramClientFinalMessage("pencil", toBytes(serverFirst), state)
+
+    discard scramClientFirstMessage("user", state)
+    let serverFinal = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+    check scramVerifyServerFinal(toBytes(serverFinal), state) == false
+
+  test "a fixed-nonce exchange on a reused state drops the previous signature":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "rOprNGfwEbeRWgbNEkqO", state)
+    let serverFirst =
+      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0," &
+      "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    discard scramClientFinalMessage("pencil", toBytes(serverFirst), state)
+
+    discard scramClientFirstMessage("user", "rOprNGfwEbeRWgbNEkqO", state)
+    let serverFinal = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+    check scramVerifyServerFinal(toBytes(serverFinal), state) == false
+
+  test "a rejected server-first drops the previous signature":
+    var state: ScramState
+    discard scramClientFirstMessage("user", "rOprNGfwEbeRWgbNEkqO", state)
+    let serverFirst =
+      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0," &
+      "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    discard scramClientFinalMessage("pencil", toBytes(serverFirst), state)
+
+    expect PgSecurityError:
+      discard scramClientFinalMessage(
+        "pencil", toBytes("r=otherNonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"), state
+      )
+    let serverFinal = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+    check scramVerifyServerFinal(toBytes(serverFinal), state) == false
+
+  test "the fixed-nonce client-first rejects an unusable nonce":
+    var state: ScramState
+    for nonce in ["", "ab,cd", "ab cd", "ab\ncd"]:
+      checkpoint nonce
+      expect AssertionDefect:
+        discard scramClientFirstMessage("user", nonce, state)
+
+  test "scramVerifyServerFinal rejects a signature that was never computed":
+    var state: ScramState
+    check scramVerifyServerFinal(toBytes("v=" & base64.encode(newString(32))), state) ==
+      false
 
   test "scramVerifyServerFinal rejects invalid format":
     var state: ScramState
@@ -226,6 +281,7 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     )
     check toString(msg) == "p=tls-server-end-point,,n=user,r=testNonce"
     check state.gs2Header == "p=tls-server-end-point,,"
+    check state.channelBound
     check state.channelBindingData == cbData
     check state.clientFirstBare == "n=user,r=testNonce"
 
@@ -234,6 +290,7 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     let msg = scramClientFirstMessage("user", "testNonce", state)
     check toString(msg) == "n,,n=user,r=testNonce"
     check state.gs2Header == "n,,"
+    check not state.channelBound
     check state.channelBindingData.len == 0
 
   test "clientFirstMessage emits y,, when CB supported but unused (downgrade)":
@@ -242,6 +299,7 @@ suite "SCRAM-SHA-256-PLUS channel binding":
       scramClientFirstMessage("user", "testNonce", state, cbSupportedButUnused = true)
     check toString(msg) == "y,,n=user,r=testNonce"
     check state.gs2Header == "y,,"
+    check not state.channelBound
     check state.channelBindingData.len == 0
 
   test "clientFirstMessage prefers p=,, over y,, when channel binding is in use":
@@ -344,7 +402,8 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     let serverFinal = "v=" & base64.encode(expectedSig)
     check scramVerifyServerFinal(toBytes(serverFinal), state) == true
 
-    # Wrong signature must fail
+    # Wrong signature must fail against a freshly computed one
+    discard scramClientFinalMessage("pencil", toBytes(serverFirst), state)
     check scramVerifyServerFinal(
       toBytes("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="), state
     ) == false
@@ -369,7 +428,12 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     )
     discard scramClientFinalMessage("pencil", toBytes(serverFirst), statePlus)
 
+    privateAccess(ScramState)
     check stateNormal.serverSignature != statePlus.serverSignature
+    # The RFC 7677 signature is the non-PLUS one.
+    let serverFinal = toBytes("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+    check scramVerifyServerFinal(serverFinal, stateNormal) == true
+    check scramVerifyServerFinal(serverFinal, statePlus) == false
 
   test "clientFirstMessage with random nonce and channel binding":
     var state: ScramState

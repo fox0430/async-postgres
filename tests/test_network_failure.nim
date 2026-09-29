@@ -802,160 +802,298 @@ proc serverSignatureFor(
   let serverSig = sha256.hmac(serverKey, authMessage).data
   "v=" & base64.encode(serverSig)
 
+proc connectRefusal(
+    server: proc(st: MockClient): Future[void] {.async.}, tracer: PgTracer = nil
+): Future[string] {.async.} =
+  ## Connect to a mock running ``server`` and return the refusal message, or
+  ## "" if the connection succeeded and is ready. A refusal must be a
+  ## PgSecurityError: a retryable error would resend the password.
+  let ms = startMockServer()
+  proc serverHandler() {.async.} =
+    let st = await ms.accept()
+    try:
+      await server(st)
+    except CatchableError:
+      discard
+    await closeClient(st)
+
+  let serverFut = serverHandler()
+  try:
+    var cfg = mockConfig(ms.port)
+    cfg.tracer = tracer
+    let conn = await connect(cfg)
+    if conn.state != csReady:
+      result = "connection not ready: " & $conn.state
+    await conn.close()
+  except PgSecurityError as e:
+    result = e.msg
+  except CatchableError as e:
+    checkpoint e.msg
+    result = "not a PgSecurityError: " & $e.name
+  finally:
+    try:
+      await serverFut
+    except CatchableError:
+      discard
+    await closeServer(ms)
+
 suite "SCRAM mutual-auth enforcement":
   test "rejects AuthenticationOk sent before SASLFinal":
-    var raised = false
-    var sawScramMsg = false
+    proc server(st: MockClient) {.async.} =
+      discard await driveScramUntilClientFinal(st)
+      # Malicious: skip AuthenticationSASLFinal entirely and jump to AuthOk.
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          discard await driveScramUntilClientFinal(st)
-          # Malicious: skip AuthenticationSASLFinal entirely and jump to AuthOk.
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationOk before completing SCRAM"
+    )
 
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        await conn.close()
-      except PgConnectionError as e:
-        raised = true
-        sawScramMsg = e.msg.contains("SCRAM")
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
+  test "rejects AuthenticationOk sent right after AuthenticationSASL":
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
 
-    waitFor testBody()
-    check raised
-    check sawScramMsg
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationOk before completing SCRAM"
+    )
 
   test "accepts a valid SASLFinal server signature":
-    var connected = false
+    proc server(st: MockClient) {.async.} =
+      let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
+      # mockConfig sets password "pencil"; both sides must use the same.
+      await sendBytes(st, buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf)))
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
-          # mockConfig sets password "pencil"; both sides must use the same.
-          await sendBytes(
-            st, buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf))
-          )
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        connected = conn.state == csReady
-        await conn.close()
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
-
-    waitFor testBody()
-    check connected
+    check (waitFor connectRefusal(server)) == ""
 
   test "rejects SASLContinue without a preceding AuthenticationSASL":
-    # A malicious server / MITM that skips AuthenticationSASL leaves scramState
-    # default-initialized (clientNonce == ""), which would otherwise make the
-    # nonce-binding check pass vacuously. The client must reject the message.
-    var raised = false
-    var sawScramMsg = false
+    # A default scramState has an empty nonce, which would make the
+    # nonce-binding check pass vacuously.
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      let serverFirst =
+        "r=forgedNonce,s=" & base64.encode(scramSalt) & ",i=" & $scramIterations
+      await sendBytes(st, buildAuthSASLContinue(serverFirst))
+      await sendBytes(st, buildAuthOk())
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          # Forge a server-first message without ever sending AuthenticationSASL.
-          let serverFirst =
-            "r=forgedNonce,s=" & base64.encode(scramSalt) & ",i=" & $scramIterations
-          await sendBytes(st, buildAuthSASLContinue(serverFirst))
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        await conn.close()
-      except PgConnectionError as e:
-        raised = true
-        sawScramMsg = e.msg.contains("AuthenticationSASL")
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
-
-    waitFor testBody()
-    check raised
-    check sawScramMsg
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLContinue out of order, before any authentication request"
+    )
 
   test "rejects SASLFinal without a preceding AuthenticationSASL":
-    # A malicious server / MITM that skips AuthenticationSASL leaves scramState
-    # default-initialized (serverSignature zeroed) and would otherwise bypass
-    # the SCRAM server-signature verification path. The client must reject it.
-    var raised = false
-    var sawScramMsg = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASLFinal("v=" & base64.encode(newString(32))))
+      await sendBytes(st, buildAuthOk())
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          # Forge a server-final message without ever sending AuthenticationSASL.
-          await sendBytes(st, buildAuthSASLFinal("v=forgedSignature"))
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLFinal out of order, before any authentication request"
+    )
 
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        await conn.close()
-      except PgConnectionError as e:
-        raised = true
-        sawScramMsg = e.msg.contains("AuthenticationSASL")
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
+  test "rejects SASLFinal before SASLContinue":
+    # Without a server-first message the expected server signature was never
+    # computed, so a forged all-zero signature must not be accepted.
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthSASLFinal("v=" & base64.encode(newString(32))))
+      await sendBytes(st, buildAuthOk())
 
-    waitFor testBody()
-    check raised
-    check sawScramMsg
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLFinal out of order, after AuthenticationSASL "
+    )
+
+  test "rejects a second SASLContinue":
+    proc server(st: MockClient) {.async.} =
+      let (_, sf, _) = await driveScramUntilClientFinal(st)
+      await sendBytes(st, buildAuthSASLContinue(sf))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLContinue out of order, after AuthenticationSASLContinue"
+    )
+
+suite "SCRAM exchange order":
+  test "rejects a second AuthenticationSASL":
+    proc server(st: MockClient) {.async.} =
+      discard await driveScramUntilClientFinal(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASL out of order, after AuthenticationSASLContinue"
+    )
+
+  # PasswordMessage is type 'p'; the client must hang up without one. The
+  # server reads one message and closes, so a leaking client fails fast.
+  test "rejects a cleartext password request after SCRAM started":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationCleartextPassword out of order, after AuthenticationSASL "
+    )
+    check not sentPassword
+
+  test "rejects an MD5 password request after SCRAM started":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationMD5Password out of order, after AuthenticationSASL "
+    )
+    check not sentPassword
+
+  test "rejects a cleartext password request after SCRAM verified":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
+      await sendBytes(st, buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf)))
+      await sendBytes(st, buildAuthCleartextPassword())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationCleartextPassword out of order, after AuthenticationSASLFinal"
+    )
+    check not sentPassword
+
+  test "rejects a second SASLFinal":
+    proc server(st: MockClient) {.async.} =
+      let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
+      let final = buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf))
+      await sendBytes(st, final)
+      await sendBytes(st, final)
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLFinal out of order, after AuthenticationSASLFinal"
+    )
+
+  test "rejects SCRAM after an MD5 password was sent":
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASL out of order, after an MD5 password request"
+    )
+
+  test "rejects SCRAM after a cleartext password was sent":
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASL out of order, after a cleartext password request"
+    )
+
+  test "rejects a cleartext password request after an MD5 one":
+    # The server already has the MD5 hash; cleartext would hand it the password.
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationCleartextPassword out of order, after an MD5 password request"
+    )
+    check not sentPassword
+
+  test "rejects an MD5 password request after a cleartext one":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationMD5Password out of order, after a cleartext password request"
+    )
+    check not sentPassword
+
+  # A PAM stack with several prompting modules sends one request per prompt,
+  # and libpq answers every one.
+  test "answers repeated password requests of the same method":
+    for req in [buildAuthCleartextPassword(), buildAuthMD5Password()]:
+      var passwords: int
+      proc server(st: MockClient) {.async.} =
+        await drainStartupMessage(st)
+        for _ in 0 ..< 8:
+          await sendBytes(st, req)
+          if (await drainFrontendMessage(st)).msgType == 'p':
+            inc passwords
+        await sendBytes(st, buildAuthOk())
+        await sendBytes(st, buildBackendKeyData(1, 2))
+        await sendBytes(st, buildReadyForQuery('I'))
+        discard await drainFrontendMessage(st)
+
+      check (waitFor connectRefusal(server)) == ""
+      check passwords == 8
+
+  test "the auth advisory hooks fire only for an answered request":
+    var insecure, deprecated: int
+    let tracer = PgTracer()
+    tracer.onInsecureAuth = proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].} =
+      inc insecure
+    tracer.onDeprecatedAuth = proc(
+        data: TraceDeprecatedAuthData
+    ) {.gcsafe, raises: [].} =
+      inc deprecated
+    proc refusedServer(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(refusedServer, tracer)).contains(
+      "AuthenticationMD5Password out of order"
+    )
+    check deprecated == 0
+    check insecure == 0
+
+    for req in [buildAuthMD5Password(), buildAuthCleartextPassword()]:
+      proc answeredServer(st: MockClient) {.async.} =
+        await drainStartupMessage(st)
+        await sendBytes(st, req)
+        discard await drainFrontendMessage(st)
+        await sendBytes(st, buildAuthOk())
+        await sendBytes(st, buildBackendKeyData(1, 2))
+        await sendBytes(st, buildReadyForQuery('I'))
+        discard await drainFrontendMessage(st)
+
+      check (waitFor connectRefusal(answeredServer, tracer)) == ""
+    check deprecated == 1
+    check insecure == 1

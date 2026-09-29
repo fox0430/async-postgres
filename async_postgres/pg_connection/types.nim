@@ -655,9 +655,11 @@ type
     onCleanupSkipped*: proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].}
       ## Skipped/failed ROLLBACK (may fire twice when nested).
     onInsecureAuth*: proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].}
-      ## Insecure auth over plaintext.
+      ## Cleartext password sent over plaintext. Fires only for a request the
+      ## client answers, after the order and require_auth checks.
     onDeprecatedAuth*: proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].}
-      ## Weak auth (MD5).
+      ## MD5 password sent. Fires only for a request the client answers, after
+      ## the order and require_auth checks.
     onAdvisoryUnlockFailed*:
       proc(data: TraceAdvisoryUnlockFailedData) {.gcsafe, raises: [].}
       ## Swallowed unlock failure.

@@ -4,8 +4,8 @@ async_postgres/pg_auth.nim	ScramState.channelBindingData
 async_postgres/pg_auth.nim	ScramState.clientFirstBare
 async_postgres/pg_auth.nim	ScramState.clientNonce
 async_postgres/pg_auth.nim	ScramState.gs2Header
-async_postgres/pg_auth.nim	ScramState.serverSignature
 async_postgres/pg_auth.nim	burnStr
+async_postgres/pg_auth.nim	channelBound
 async_postgres/pg_auth.nim	computeTlsServerEndpoint
 async_postgres/pg_auth.nim	md5AuthHash
 async_postgres/pg_auth.nim	oidRsaPss
@@ -13,6 +13,7 @@ async_postgres/pg_auth.nim	scramClientFinalMessage
 async_postgres/pg_auth.nim	scramClientFirstMessage
 async_postgres/pg_auth.nim	scramEscapeUsername
 async_postgres/pg_auth.nim	scramVerifyServerFinal
+async_postgres/pg_auth.nim	wipeServerSignature
 async_postgres/pg_bearssl.nim	EncryptedKeyMsg
 async_postgres/pg_bearssl.nim	TrustAnchorResult
 async_postgres/pg_bearssl.nim	TrustAnchorResult.backing
