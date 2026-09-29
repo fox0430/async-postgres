@@ -2008,6 +2008,38 @@ suite "nextMessage ParameterStatus bounds":
     check not conn.serverParams.hasKey("n")
     check conn.serverParamsBytes == MaxServerParamsBytes - 1
 
+  test "client_encoding other than UTF8 closes the connection":
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("client_encoding", "UTF8") & buildReadyForQuery()
+    check conn.nextMessage().isSome
+    check conn.state == csReady
+    conn.recvBufStart = 0
+    conn.recvBuf = buildParameterStatusMsg("client_encoding", "SJIS")
+    expect PgProtocolError:
+      discard conn.nextMessage()
+    check conn.state == csClosed
+    check conn.serverParams["client_encoding"] == "SJIS"
+
+  test "oversized client_encoding hits the byte cap before being quoted":
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("client_encoding", 'x'.repeat(MaxServerParamsBytes))
+    try:
+      discard conn.nextMessage()
+      fail()
+    except PgProtocolError as e:
+      check "byte total" in e.msg
+    check conn.state == csClosed
+
+  test "client_encoding accepts other UTF8 spellings":
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("client_encoding", "UNICODE") & buildReadyForQuery()
+    check conn.nextMessage().isSome
+    check conn.state == csReady
+    check conn.serverParams["client_encoding"] == "UNICODE"
+
   test "value at the byte cap is accepted":
     var conn = mockConn()
     # Leave exactly 3 bytes of room, then store name "ab" + value "c".

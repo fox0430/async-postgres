@@ -72,6 +72,23 @@ suite "E2E: ConnConfig Options":
 
     waitFor t()
 
+  test "client_encoding is pinned to UTF8":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.extraParams = @[("client_encoding", "utf-8")]
+      let conn = await connect(cfg)
+      doAssert conn.serverParam("client_encoding") == "UTF8"
+      var raised = false
+      try:
+        discard await conn.simpleQuery("SET client_encoding TO 'SJIS'")
+      except PgProtocolError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csClosed
+      await conn.close()
+
+    waitFor t()
+
   test "connectTimeout raises on unreachable host":
     proc t() {.async.} =
       var cfg = plainConfig()

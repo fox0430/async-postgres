@@ -442,6 +442,67 @@ const maxSockOptInt = int64(high(cint))
   ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
   ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
 
+proc checkClientEncoding(val: string) =
+  ## The client pins ``client_encoding`` to UTF8.
+  if not isUtf8EncodingName(val):
+    raise
+      newException(PgConfigError, "client_encoding must be UTF8 (len=" & $val.len & ")")
+
+proc splitStartupOptions(options: string): seq[string] =
+  ## Split like the server's ``pg_split_opts``: whitespace separates, ``\``
+  ## escapes the next byte.
+  var cur = ""
+  var inArg = false
+  var i = 0
+  while i < options.len:
+    let c = options[i]
+    if c in Whitespace:
+      if inArg:
+        result.add(cur)
+        cur = ""
+        inArg = false
+    else:
+      if c == '\\':
+        # A trailing escape is dropped.
+        if i + 1 < options.len:
+          inc i
+          cur.add(options[i])
+      else:
+        cur.add(c)
+      inArg = true
+    inc i
+  if inArg:
+    result.add(cur)
+
+proc checkOptionsClientEncoding(options: string) =
+  ## Our startup ``client_encoding`` would silently override a ``-c`` switch,
+  ## so reject a non-UTF8 one as if it were given directly.
+  const argOpts =
+    {'B', 'C', 'c', 'D', 'd', 'f', 'h', 'k', 'N', 'p', 'r', 'S', 't', 'v', 'W', '-'}
+    # postgres's getopt string
+  let args = splitStartupOptions(options)
+  var i = 0
+  while i < args.len:
+    let a = args[i]
+    inc i
+    if a.len < 2 or a[0] != '-':
+      continue
+    for j in 1 ..< a.len:
+      if a[j] notin argOpts:
+        continue
+      var optArg: string
+      if j + 1 < a.len:
+        optArg = a[j + 1 .. ^1]
+      elif i < args.len:
+        optArg = args[i]
+        inc i
+      if a[j] in {'c', '-'}:
+        let eq = optArg.find('=')
+        # ParseLongOption maps '-' to '_' in the name.
+        if eq >= 0 and isClientEncodingKey(optArg[0 ..< eq].replace('-', '_')):
+          checkClientEncoding(optArg[eq + 1 .. ^1])
+      break
+
 proc applyParam(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
   ##
@@ -567,7 +628,13 @@ proc applyParam(result: var ConnConfig, key, val: string) =
         "max_scram_iterations must be non-negative (len=" & $val.len & ")",
       )
   else:
-    result.extraParams.add((key, val))
+    if isClientEncodingKey(key):
+      # Not kept: the startup message always sends UTF8.
+      checkClientEncoding(val)
+    else:
+      if key == "options":
+        checkOptionsClientEncoding(val)
+      result.extraParams.add((key, val))
 
 proc parseKeyValueDsn(dsn: string): ConnConfig =
   ## Parse a libpq keyword=value connection string into a ConnConfig.
@@ -961,6 +1028,11 @@ proc validateConnConfig*(config: var ConnConfig) =
     raise newException(PgConfigError, "max_message_size must be non-negative")
   if config.maxScramIterations < 0:
     raise newException(PgConfigError, "max_scram_iterations must be non-negative")
+  for (k, v) in config.extraParams:
+    if isClientEncodingKey(k):
+      checkClientEncoding(v)
+    elif k == "options": # the server matches this key case-sensitively
+      checkOptionsClientEncoding(v)
 
 proc initConnConfig*(
     host = "127.0.0.1",
@@ -1037,6 +1109,9 @@ proc parseDsn*(dsn: string): ConnConfig =
   ## - keyword=value: ``host=localhost port=5432 dbname=test`` (libpq compatible)
   ##
   ## Both ``postgresql://`` and ``postgres://`` schemes are accepted for URI format.
+  ##
+  ## ``client_encoding`` is always UTF8: another value, directly or via ``-c``
+  ## in ``options``, raises ``PgConfigError``.
   ##
   ## Security: the DSN is trusted configuration — unknown keys are forwarded
   ## as StartupMessage parameters, so a typo in a security-sensitive key (e.g.

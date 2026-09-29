@@ -536,7 +536,11 @@ proc connectToHostImpl(
       conn.initPlainStreams()
 
     # Send StartupMessage
-    var startupParams = config.extraParams
+    # Decoders assume UTF8; checkClientEncodingStatus closes on a later change.
+    var startupParams = @[("client_encoding", "UTF8")]
+    for p in config.extraParams:
+      if not isClientEncodingKey(p[0]):
+        startupParams.add(p)
     if config.applicationName.len > 0:
       startupParams.add(("application_name", config.applicationName))
     await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))

@@ -5,6 +5,7 @@
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[tables, sets, deques, lists, macros, options]
+from std/strutils import isAlphaNumeric, toLowerAscii, cmpIgnoreCase
 when defined(posix):
   import std/posix
 
@@ -203,6 +204,8 @@ type
     extraParams*: seq[(string, string)]
       ## Additional StartupMessage parameters (unknown DSN keys land here).
       ## Forwarded verbatim; treat as trusted config — typos are not rejected.
+      ## Exception: ``client_encoding`` is always sent as UTF8, and another
+      ## value (also via ``-c`` in ``options``) raises ``PgConfigError``.
     maxMessageSize*: int
       ## Max backend message size (0 = 1 GiB default); larger → ``PgProtocolError``.
     maxScramIterations*: int
@@ -1531,6 +1534,19 @@ proc markClosed*(conn: PgConnection) {.inline, raises: [].} =
   ## Retire the connection: the wire is unusable, whether the transport is torn
   ## down yet or not.
   conn.markState(csClosed)
+
+proc isUtf8EncodingName*(val: string): bool =
+  ## Whether ``val`` is one of the server's spellings of UTF8
+  ## (``pg_char_to_encoding`` ignores case and punctuation).
+  var name = ""
+  for c in val:
+    if c.isAlphaNumeric:
+      name.add(c.toLowerAscii)
+  name in ["utf8", "unicode"]
+
+proc isClientEncodingKey*(key: string): bool =
+  ## GUC names are case-insensitive.
+  cmpIgnoreCase(key, "client_encoding") == 0
 
 proc recordParameterStatus*(
     conn: PgConnection, name, value: string

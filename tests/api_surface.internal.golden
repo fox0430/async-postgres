@@ -243,6 +243,8 @@ async_postgres/pg_connection/types.nim	initPlainStreams
 async_postgres/pg_connection/types.nim	initReplLsnTracking
 async_postgres/pg_connection/types.nim	installTlsStream
 async_postgres/pg_connection/types.nim	invalidateStmtCache
+async_postgres/pg_connection/types.nim	isClientEncodingKey
+async_postgres/pg_connection/types.nim	isUtf8EncodingName
 async_postgres/pg_connection/types.nim	listenChannels
 async_postgres/pg_connection/types.nim	listenErrorCallback
 async_postgres/pg_connection/types.nim	listenReconnectStopWaitMs

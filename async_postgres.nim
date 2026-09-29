@@ -114,6 +114,14 @@
 ## ``simpleQuery``/``simpleExec``; on timeout the connection is marked
 ## closed because the wire protocol desynchronises.
 ##
+## Client encoding
+## ===============
+## ``client_encoding`` is pinned to UTF8. A non-UTF8 value in the config
+## (including ``-c client_encoding=`` in ``options``) raises ``PgConfigError``,
+## and a session reporting a switch away (``SET client_encoding``) is closed
+## with ``PgProtocolError``. The switch is detected only after the fact, so do
+## not change it within a query or pipeline.
+##
 ## Modules
 ## =======
 ## - `pg_connection <async_postgres/pg_connection.html>`_ — Connection management, DSN parsing, SSL, LISTEN/NOTIFY

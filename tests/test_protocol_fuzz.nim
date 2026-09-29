@@ -10,7 +10,7 @@
 ## Anything else — in particular `IndexDefect`, `RangeDefect`, `DivByZeroDefect`
 ## — is a bug in the decoder.
 
-import std/[unittest, random]
+import std/[unittest, random, strutils]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types/[core, decoding]
@@ -625,10 +625,22 @@ suite "Binary type decoders: malformed input":
     expectTypeError:
       discard decodeBinaryTsQuery(data)
 
-  test "decodeBinaryTsQuery nesting depth limit":
-    # Build a chain of 1001 NOT operators (depth >= 1000) wrapping an operand.
+  test "decodeBinaryTsQuery token count mismatch":
+    # AND(b, a) is three tokens; a header claiming one or four must fail.
+    const tree = @[byte 2, 2, 1, 0, 0, byte('b'), 0, 1, 0, 0, byte('a'), 0]
+    for n in [1'i32, 4]:
+      expectTypeError:
+        discard decodeBinaryTsQuery(@(toBE32(n)) & tree)
+
+  test "decodeBinaryTsQuery invalid weight bits":
+    let data = @[byte 0, 0, 0, 1, 1, 0x10, 0, byte('x'), 0]
+    expectTypeError:
+      discard decodeBinaryTsQuery(data)
+
+  test "decodeBinaryTsQuery deep nesting does not recurse":
+    # plainto_tsquery nests one level per word; 5000 NOTs must still decode.
     # Each NOT = [2, 1], operand = [1, 0, 0, 'x', 0].
-    const nNot = 1001
+    const nNot = 5000
     const operand = @[byte 1, 0, 0, byte('x'), 0]
     var data = newSeq[byte](4 + nNot * 2 + operand.len)
     data[0 .. 3] = toBE32((nNot + 1).int32)
@@ -638,8 +650,28 @@ suite "Binary type decoders: malformed input":
       data[pos + 1] = 1
       pos += 2
     data[pos ..^ 1] = operand
+    check decodeBinaryTsQuery(data) == "!".repeat(nNot) & "'x'"
+
+  test "decodeBinaryTsQuery operator missing an operand":
+    # AND followed by a single operand, header matching the token count.
+    const data = @[byte 0, 0, 0, 2, 2, 2, 1, 0, 0, byte('a'), 0]
     expectTypeError:
       discard decodeBinaryTsQuery(data)
+
+  test "decodeBinaryTsQuery token count exceeding data":
+    expectTypeError:
+      discard decodeBinaryTsQuery(@[byte 0x7F, 0xFF, 0xFF, 0xFF, 1, 0, 0, 0])
+
+  test "decodeBinaryTsQuery phrase distance range":
+    # The server sends summed distances past tsqueryrecv's 16384 limit and
+    # tsqueryout prints them as int16.
+    proc phrase(dist: uint16): seq[byte] =
+      @[byte 0, 0, 0, 3, 2, 4] & @(toBE16(cast[int16](dist))) &
+        @[byte 1, 0, 0, byte('b'), 0, 1, 0, 0, byte('a'), 0]
+
+    check decodeBinaryTsQuery(phrase(16384)) == "'a' <16384> 'b'"
+    check decodeBinaryTsQuery(phrase(32000)) == "'a' <32000> 'b'"
+    check decodeBinaryTsQuery(phrase(0xC000)) == "'a' <-16384> 'b'"
 
 # Seeded random fuzz on binary type decoders
 
