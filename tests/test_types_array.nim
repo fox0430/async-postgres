@@ -954,7 +954,8 @@ suite "Other array types":
     check $arr[0] == "'cat':1A"
 
   test "getTsQueryArray binary decodes structured elements":
-    # Same binary body as "getTsQuery binary format simple AND".
+    # Same binary body as "getTsQuery binary format simple AND": AND, then
+    # the right operand ("dog") before the left one ("cat").
     var elem: seq[byte] = @[]
     elem.add(@(toBE32(3'i32)))
     elem.add(2'u8)
@@ -962,13 +963,13 @@ suite "Other array types":
     elem.add(1'u8)
     elem.add(0'u8)
     elem.add(0'u8)
-    for c in "cat":
+    for c in "dog":
       elem.add(byte(c))
     elem.add(0'u8)
     elem.add(1'u8)
     elem.add(0'u8)
     elem.add(0'u8)
-    for c in "dog":
+    for c in "cat":
       elem.add(byte(c))
     elem.add(0'u8)
     let payload = encodeBinaryArray(OidTsQuery, @[some(elem)])

@@ -93,10 +93,10 @@ proc quoteLiteral*(s: string): string =
   ## concatenated directly after an identifier or numeric constant cannot merge
   ## into it (``LIKE`` & ``E'a\\b'`` would otherwise lex as ``likee``).
   ##
-  ## Assumes an ASCII-compatible ``client_encoding``: bytes are scanned
-  ## individually, so under a client encoding whose multi-byte trail bytes may
-  ## be ``0x5C`` (SJIS, BIG5, GBK, UHC) an embedded character can be mistaken
-  ## for a backslash.
+  ## Bytes are scanned individually, which relies on the pinned UTF8
+  ## ``client_encoding``. A switch is only detected after the fact, so do not
+  ## send a ``SET client_encoding`` in the same query or pipeline: under SJIS,
+  ## BIG5, GBK or UHC a trail byte ``0x5C`` would be read as a backslash.
   ##
   ## Raises ``ValueError`` for an embedded NUL byte: the wire protocol
   ## terminates the query string there, so it cannot be represented.

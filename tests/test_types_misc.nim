@@ -1,4 +1,4 @@
-import std/[unittest, options, tables, net]
+import std/[unittest, options, tables, net, strutils]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
@@ -798,148 +798,99 @@ suite "tsvector / tsquery":
     let v = row.getTsVector(0)
     check "'bar' 'foo':2B" == $v
 
+  test "getTsVector binary escapes quotes and backslashes in lexemes":
+    # `encode(tsvectorsend($$'it''s':1A 'a\\b'$$::tsvector), 'hex')` from PG 18.3.
+    let data = toBytes(parseHexStr("00000002615c6200000069742773000001c001"))
+    check decodeBinaryTsVector(data) == "'a\\\\b' 'it''s':1A"
+
+  # Fixtures below are `encode(tsquerysend(q), 'hex')` from PostgreSQL 18.3;
+  # the expected strings are the server's own `q::text` for the same value.
+  proc tsqWire(hex: string): seq[byte] =
+    toBytes(parseHexStr(hex))
+
   test "getTsQuery binary format simple AND":
-    # Binary tsquery for 'cat' & 'dog' (prefix: AND, cat, dog)
-    var data: seq[byte] = @[]
-    # ntokens = 3
-    data.add(@(toBE32(3'i32)))
-    # AND operator: type=2, op=2
-    data.add(2'u8)
-    data.add(2'u8)
-    # operand "cat": type=1, weight=0, prefix=0, "cat\0"
-    data.add(1'u8) # type
-    data.add(0'u8) # weight
-    data.add(0'u8) # prefix
-    for c in "cat":
-      data.add(byte(c))
-    data.add(0'u8)
-    # operand "dog": type=1, weight=0, prefix=0, "dog\0"
-    data.add(1'u8)
-    data.add(0'u8)
-    data.add(0'u8)
-    for c in "dog":
-      data.add(byte(c))
-    data.add(0'u8)
+    let data = tsqWire("000000030202010000646f670001000063617400")
     let fields = @[mkField(OidTsQuery, 1'i16)]
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
     check "'cat' & 'dog'" == $q
 
   test "getTsQuery binary format NOT":
-    # Binary tsquery for !'cat' (prefix: NOT, cat)
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(2'i32)))
-    # NOT operator: type=2, op=1
-    data.add(2'u8)
-    data.add(1'u8)
-    # operand "cat"
-    data.add(1'u8)
-    data.add(0'u8)
-    data.add(0'u8)
-    for c in "cat":
-      data.add(byte(c))
-    data.add(0'u8)
+    let data = tsqWire("00000002020101000063617400")
     let fields = @[mkField(OidTsQuery, 1'i16)]
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
     check "!'cat'" == $q
 
   test "getTsQuery binary format PHRASE":
-    # Binary tsquery for 'cat' <-> 'dog' (prefix: PHRASE dist=1, cat, dog)
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(3'i32)))
-    # PHRASE operator: type=2, op=4, distance=1
-    data.add(2'u8)
-    data.add(4'u8)
-    data.add(@(toBE16(1'i16)))
-    # operand "cat"
-    data.add(1'u8)
-    data.add(0'u8)
-    data.add(0'u8)
-    for c in "cat":
-      data.add(byte(c))
-    data.add(0'u8)
-    # operand "dog"
-    data.add(1'u8)
-    data.add(0'u8)
-    data.add(0'u8)
-    for c in "dog":
-      data.add(byte(c))
-    data.add(0'u8)
+    let data = tsqWire("0000000302040001010000646f670001000063617400")
     let fields = @[mkField(OidTsQuery, 1'i16)]
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
     check "'cat' <-> 'dog'" == $q
 
+  test "getTsQuery binary reads the right operand before the left":
+    # The wire order is operator, right subtree, left subtree. Reading it
+    # left-first swaps every binary operator, which reverses PHRASE.
+    check decodeBinaryTsQuery(tsqWire("00000003020301000062000100006100")) == "'a' | 'b'"
+    check decodeBinaryTsQuery(tsqWire("000000030204000301000062000100006100")) ==
+      "'a' <3> 'b'"
+    check decodeBinaryTsQuery(
+      tsqWire("000000050204000101000063000204000101000062000100006100")
+    ) == "'a' <-> 'b' <-> 'c'"
+    check decodeBinaryTsQuery(
+      tsqWire("00000008020400020202020101000064000100006300020301000062000100006100")
+    ) == "( 'a' | 'b' ) <2> ( 'c' & !'d' )"
+
   test "getTsQuery binary NOT wraps compound child":
     # NOT(AND(a, b)) must round-trip as "!( 'a' & 'b' )", not "!'a' & 'b'"
     # (which reparses as AND(NOT a, b)).
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(4'i32)))
-    data.add(@[byte 2, 1]) # NOT
-    data.add(@[byte 2, 2]) # AND
-    data.add(@[byte 1, 0, 0, byte('a'), 0])
-    data.add(@[byte 1, 0, 0, byte('b'), 0])
-    check decodeBinaryTsQuery(data) == "!( 'a' & 'b' )"
+    check decodeBinaryTsQuery(tsqWire("000000040201020201000062000100006100")) ==
+      "!( 'a' & 'b' )"
 
   test "getTsQuery binary AND(NOT a, b) does not collide with NOT(AND a b)":
     # NOT binds tighter than AND, so this needs no wrap and stays "!'a' & 'b'".
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(4'i32)))
-    data.add(@[byte 2, 2]) # AND
-    data.add(@[byte 2, 1]) # NOT
-    data.add(@[byte 1, 0, 0, byte('a'), 0])
-    data.add(@[byte 1, 0, 0, byte('b'), 0])
-    check decodeBinaryTsQuery(data) == "!'a' & 'b'"
+    check decodeBinaryTsQuery(tsqWire("000000040202010000620002010100006100")) ==
+      "!'a' & 'b'"
 
   test "getTsQuery binary PHRASE wraps AND child":
     # PHRASE binds tighter than AND, so AND under PHRASE needs parens.
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(5'i32)))
-    data.add(@[byte 2, 4, 0, 1]) # PHRASE dist=1
-    data.add(@[byte 1, 0, 0, byte('a'), 0])
-    data.add(@[byte 2, 2]) # AND
-    data.add(@[byte 1, 0, 0, byte('b'), 0])
-    data.add(@[byte 1, 0, 0, byte('c'), 0])
-    check decodeBinaryTsQuery(data) == "'a' <-> ( 'b' & 'c' )"
+    check decodeBinaryTsQuery(
+      tsqWire("00000005020400010202010000630001000062000100006100")
+    ) == "'a' <-> ( 'b' & 'c' )"
 
   test "getTsQuery binary AND wraps OR child":
     # AND binds tighter than OR, so OR under AND needs parens.
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(5'i32)))
-    data.add(@[byte 2, 2]) # AND
-    data.add(@[byte 2, 3]) # OR
-    data.add(@[byte 1, 0, 0, byte('a'), 0])
-    data.add(@[byte 1, 0, 0, byte('b'), 0])
-    data.add(@[byte 1, 0, 0, byte('c'), 0])
-    check decodeBinaryTsQuery(data) == "( 'a' | 'b' ) & 'c'"
+    check decodeBinaryTsQuery(tsqWire("0000000502020100006300020301000062000100006100")) ==
+      "( 'a' | 'b' ) & 'c'"
 
   test "getTsQuery binary OR does not wrap AND child":
     # AND binds tighter than OR; no parens needed.
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(5'i32)))
-    data.add(@[byte 2, 3]) # OR
-    data.add(@[byte 2, 2]) # AND
-    data.add(@[byte 1, 0, 0, byte('a'), 0])
-    data.add(@[byte 1, 0, 0, byte('b'), 0])
-    data.add(@[byte 1, 0, 0, byte('c'), 0])
-    check decodeBinaryTsQuery(data) == "'a' & 'b' | 'c'"
+    check decodeBinaryTsQuery(tsqWire("0000000502030100006300020201000062000100006100")) ==
+      "'a' & 'b' | 'c'"
+
+  test "getTsQuery binary PHRASE wraps a right-hand PHRASE child":
+    # Phrase is not associative: only the right-hand side needs parens.
+    check decodeBinaryTsQuery(
+      tsqWire("000000050204000102040002010000630001000062000100006100")
+    ) == "'a' <-> ( 'b' <2> 'c' )"
+    check decodeBinaryTsQuery(
+      tsqWire("000000050204000201000063000204000101000062000100006100")
+    ) == "'a' <-> 'b' <2> 'c'"
+
+  test "getTsQuery binary escapes quotes and backslashes in operands":
+    check decodeBinaryTsQuery(tsqWire("00000003020201000078000100006974277300")) ==
+      "'it''s' & 'x'"
+    check decodeBinaryTsQuery(tsqWire("0000000302020100006300010000615c6200")) ==
+      "'a\\\\b' & 'c'"
 
   test "getTsQuery binary format with weight and prefix":
-    # Binary tsquery for 'cat':AB* (single operand with weights A+B and prefix)
-    var data: seq[byte] = @[]
-    data.add(@(toBE32(1'i32)))
-    # operand "cat": type=1, weight=0x0C (A=0x08 + B=0x04), prefix=1
-    data.add(1'u8)
-    data.add(0x0C'u8) # A + B
-    data.add(1'u8) # prefix
-    for c in "cat":
-      data.add(byte(c))
-    data.add(0'u8)
+    # weight=0x0C (A+B), prefix=1; the server prints the prefix marker first.
+    let data = tsqWire("00000001010c0163617400")
     let fields = @[mkField(OidTsQuery, 1'i16)]
     let row = mkRow(@[some(data)], fields)
     let q = row.getTsQuery(0)
-    check "'cat':AB*" == $q
+    check "'cat':*AB" == $q
 
   test "getTsVectorOpt text some":
     let data = toBytes("'cat':1A")

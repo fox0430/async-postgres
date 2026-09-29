@@ -475,6 +475,19 @@ when hasAsyncDispatch:
 # ``compactRecvBuf`` / ``fillRecvBuf`` / ``fillRecvBufDetached`` live in
 # ``types`` with the private fields they move as a pair.
 
+proc checkClientEncodingStatus(
+    conn: PgConnection, name, value: string
+) {.raises: [PgProtocolError].} =
+  ## Close the connection on a non-UTF8 ``client_encoding`` report: decoders
+  ## rely on UTF8. Detected after the fact; a change reverted within one
+  ## query (a function's ``SET`` clause) is never reported.
+  if name == "client_encoding" and not isUtf8EncodingName(value):
+    conn.markClosed()
+    raise newException(
+      PgProtocolError,
+      "client_encoding changed to " & value & "; the client requires UTF8",
+    )
+
 proc nextMessage*(
     conn: PgConnection,
     rowData: RowData = nil,
@@ -537,6 +550,8 @@ proc nextMessage*(
       # Distinct-key and total-byte caps reject hostile flooding (fail-closed).
       let m = res.message
       conn.recordParameterStatus(m.paramName, m.paramValue)
+      # After the caps, so the value quoted in the error stays bounded.
+      conn.checkClientEncodingStatus(m.paramName, m.paramValue)
       continue
     if res.message.kind == bmkNegotiateProtocolVersion:
       # Informational per libpq; record and drop so callers never see it.

@@ -725,6 +725,17 @@ proc parseInetText*(
       raise newException(PgTypeError, "inet mask out of range (len=" & $s.len & ")")
     result = (ip, uint8(mask))
 
+proc addQuotedLexeme(s: var string, data: openArray[byte], first, last: int) =
+  ## Append ``data[first ..< last]`` quoted like tsvectorout/tsqueryout.
+  ## Byte-wise scanning relies on the pinned UTF8 ``client_encoding``.
+  s.add('\'')
+  for i in first ..< last:
+    let c = char(data[i])
+    if c == '\'' or c == '\\':
+      s.add(c)
+    s.add(c)
+  s.add('\'')
+
 proc decodeBinaryTsVector*(data: openArray[byte]): string {.raises: [PgError].} =
   ## Decode PostgreSQL binary tsvector to text representation.
   if data.len < 4:
@@ -747,9 +758,8 @@ proc decodeBinaryTsVector*(data: openArray[byte]): string {.raises: [PgError].} 
       inc lexEnd
     if lexEnd >= data.len:
       raise newException(PgTypeError, "tsvector binary: lexeme missing null terminator")
-    var lexeme = newString(lexEnd - pos)
-    for j in 0 ..< lexEnd - pos:
-      lexeme[j] = char(data[pos + j])
+    var part = newStringOfCap(lexEnd - pos + 2)
+    part.addQuotedLexeme(data, pos, lexEnd)
     pos = lexEnd + 1 # skip null terminator
     # Read positions
     if pos + 1 >= data.len:
@@ -759,7 +769,6 @@ proc decodeBinaryTsVector*(data: openArray[byte]): string {.raises: [PgError].} 
       raise
         newException(PgTypeError, "tsvector binary: invalid position count " & $npos)
     pos += 2
-    var part = "'" & lexeme & "'"
     if npos > 0:
       part.add(':')
       for j in 0 ..< npos:
@@ -778,25 +787,14 @@ proc decodeBinaryTsVector*(data: openArray[byte]): string {.raises: [PgError].} 
   ensureNoTrailing(pos, data.len, "tsvector binary")
   parts.join(" ")
 
-proc renderTsQueryChild(
-    child: tuple[text: string, prec: TsPrec], parent: TsPrec
-): string =
-  # Wrap a child that binds looser than its parent so the printed form
-  # reparses to the same tree (e.g. NOT(AND a b) must not collapse to
-  # "!a & b", which reparses as AND(NOT a, b)).
-  if ord(child.prec) < ord(parent):
-    "( " & child.text & " )"
-  else:
-    child.text
+type TsStep = enum
+  tsVisit
+  tsInfix
+  tsOpen
+  tsClose
 
-proc parseTsQueryNode(
-    data: openArray[byte], pos: var int, depth: int = 0
-): tuple[text: string, prec: TsPrec] =
-  const maxDepth = 1000
-  if depth >= maxDepth:
-    raise newException(
-      PgTypeError, "tsquery binary: nesting depth exceeds limit (" & $maxDepth & ")"
-    )
+proc parseTsQueryToken(data: openArray[byte], pos: var int) =
+  ## Validate one token and advance past it.
   if pos >= data.len:
     raise newException(PgTypeError, "tsquery binary truncated")
   let tokenType = data[pos]
@@ -806,91 +804,163 @@ proc parseTsQueryNode(
     if pos + 2 >= data.len:
       raise newException(PgTypeError, "tsquery operand truncated")
     let weightByte = data[pos]
+    if weightByte > 0x0F:
+      # tsqueryrecv only accepts the four weight bits.
+      raise newException(PgTypeError, "tsquery binary: invalid weight " & $weightByte)
+    pos += 2
+    while pos < data.len and data[pos] != 0:
+      inc pos
+    if pos >= data.len:
+      raise newException(PgTypeError, "tsquery operand missing null terminator")
     inc pos
-    let prefix = data[pos] != 0
-    inc pos
-    var strEnd = pos
-    while strEnd < data.len and data[strEnd] != 0:
-      inc strEnd
-    if strEnd >= data.len:
-      raise newException(PgTypeError, "tsquery binary: operand missing null terminator")
-    var operand = newString(strEnd - pos)
-    for j in 0 ..< strEnd - pos:
-      operand[j] = char(data[pos + j])
-    pos = strEnd + 1
-    var s = "'" & operand & "'"
-    var suffix = ""
-    if (weightByte and 0x08) != 0:
-      suffix.add('A')
-    if (weightByte and 0x04) != 0:
-      suffix.add('B')
-    if (weightByte and 0x02) != 0:
-      suffix.add('C')
-    if (weightByte and 0x01) != 0:
-      suffix.add('D')
-    if suffix.len > 0 or prefix:
-      s.add(':')
-      s.add(suffix)
-      if prefix:
-        s.add('*')
-    (s, tpOperand)
   of 2: # operator
     if pos >= data.len:
       raise newException(PgTypeError, "tsquery operator truncated")
     let op = data[pos]
     inc pos
     case op
-    of 1: # NOT
-      let arg = parseTsQueryNode(data, pos, depth + 1)
-      ("!" & renderTsQueryChild(arg, tpNot), tpNot)
-    of 2: # AND
-      let left = parseTsQueryNode(data, pos, depth + 1)
-      let right = parseTsQueryNode(data, pos, depth + 1)
-      (
-        renderTsQueryChild(left, tpAnd) & " & " & renderTsQueryChild(right, tpAnd),
-        tpAnd,
-      )
-    of 3: # OR
-      let left = parseTsQueryNode(data, pos, depth + 1)
-      let right = parseTsQueryNode(data, pos, depth + 1)
-      (renderTsQueryChild(left, tpOr) & " | " & renderTsQueryChild(right, tpOr), tpOr)
+    of 1, 2, 3: # NOT, AND, OR
+      discard
     of 4: # PHRASE
       if pos + 1 >= data.len:
         raise newException(PgTypeError, "tsquery PHRASE distance truncated")
-      let distance = int(fromBE16(data.toOpenArray(pos, pos + 1)))
+      # No range check: stopword removal sums distances, so the server
+      # itself sends values tsqueryrecv would reject.
       pos += 2
-      let left = parseTsQueryNode(data, pos, depth + 1)
-      let right = parseTsQueryNode(data, pos, depth + 1)
-      let opText =
-        if distance == 1:
-          " <-> "
-        else:
-          " <" & $distance & "> "
-      (
-        renderTsQueryChild(left, tpPhrase) & opText & renderTsQueryChild(
-          right, tpPhrase
-        ),
-        tpPhrase,
-      )
     else:
       raise newException(PgTypeError, "Unknown tsquery operator: " & $op)
   else:
     raise newException(PgTypeError, "Unknown tsquery token type: " & $tokenType)
 
+proc tsTokenPrec(data: openArray[byte], off: int): TsPrec {.inline.} =
+  if data[off] == 1:
+    return tpOperand
+  case data[off + 1]
+  of 1: tpNot
+  of 2: tpAnd
+  of 3: tpOr
+  else: tpPhrase
+
+proc addTsQueryOperand(s: var string, data: openArray[byte], off: int) =
+  ## Render an operand token validated by ``parseTsQueryToken``.
+  let weight = data[off + 1]
+  let prefix = data[off + 2] != 0
+  var strEnd = off + 3
+  while data[strEnd] != 0:
+    inc strEnd
+  s.addQuotedLexeme(data, off + 3, strEnd)
+  if weight != 0 or prefix:
+    # Same order as the server's tsqueryout: prefix marker before weights.
+    s.add(':')
+    if prefix:
+      s.add('*')
+    if (weight and 0x08) != 0:
+      s.add('A')
+    if (weight and 0x04) != 0:
+      s.add('B')
+    if (weight and 0x02) != 0:
+      s.add('C')
+    if (weight and 0x01) != 0:
+      s.add('D')
+
 proc decodeBinaryTsQuery*(data: openArray[byte]): string {.raises: [PgError].} =
-  ## Decode PostgreSQL binary tsquery (prefix/preorder) to text representation (infix).
+  ## Decode PostgreSQL binary tsquery (prefix/preorder, right operand first) to
+  ## the server's text representation (infix).
   if data.len < 4:
     raise newException(PgTypeError, "tsquery binary data too short")
   let ntokens = int(fromBE32(data.toOpenArray(0, 3)))
   if ntokens < 0:
     raise newException(PgTypeError, "tsquery binary: invalid token count " & $ntokens)
+  # Every token takes at least 2 bytes.
+  if ntokens > (data.len - 4) div 2:
+    raise newException(PgTypeError, "tsquery binary: token count exceeds data")
+  # tsqueryrecv's cap: MaxAllocSize / sizeof(QueryItem).
+  const maxTokens = 0x3fffffff div 12
+  if ntokens > maxTokens:
+    raise newException(PgTypeError, "tsquery binary: invalid token count " & $ntokens)
   if ntokens == 0:
     ensureNoTrailing(4, data.len, "tsquery binary")
     return ""
+
+  # Per token: its byte offset, and for a binary operator the index of its
+  # left operand. The right operand always follows the operator directly.
+  var nodes = newSeq[tuple[off, left: int32]](ntokens)
   var pos = 4
-  let text = parseTsQueryNode(data, pos).text
+  for i in 0 ..< ntokens:
+    nodes[i].off = int32(pos)
+    parseTsQueryToken(data, pos)
   ensureNoTrailing(pos, data.len, "tsquery binary")
-  text
+
+  # Link without recursion: plainto_tsquery nests one level per word.
+  # Scanning backwards, an operator's right operand is on top of the stack.
+  var roots: seq[int32]
+  for i in countdown(ntokens - 1, 0):
+    let arity =
+      case tsTokenPrec(data, nodes[i].off)
+      of tpOperand: 0
+      of tpNot: 1
+      else: 2
+    if roots.len < arity:
+      raise newException(PgTypeError, "tsquery binary: operator missing operand")
+    if arity >= 1:
+      discard roots.pop()
+    if arity == 2:
+      nodes[i].left = roots.pop()
+    roots.add(int32(i))
+  if roots.len != 1:
+    raise newException(
+      PgTypeError,
+      "tsquery binary: token count " & $ntokens & " but " & $roots.len & " trees present",
+    )
+
+  var todo = @[(step: tsVisit, node: 0'i32)]
+  template pushChild(child: int32, parentPrec: TsPrec, rightOfPhrase: bool) =
+    # Parenthesize like tsqueryout's infix(): a looser child, or a
+    # right-hand phrase under a phrase (phrase is not associative).
+    let prec = tsTokenPrec(data, nodes[child].off)
+    let wrap = prec < parentPrec or (rightOfPhrase and prec == tpPhrase)
+    if wrap:
+      todo.add((tsClose, child))
+    todo.add((tsVisit, child))
+    if wrap:
+      todo.add((tsOpen, child))
+
+  while todo.len > 0:
+    let (step, i) = todo.pop()
+    let off = int(nodes[i].off)
+    case step
+    of tsOpen:
+      result.add("( ")
+    of tsClose:
+      result.add(" )")
+    of tsInfix:
+      case data[off + 1]
+      of 2:
+        result.add(" & ")
+      of 3:
+        result.add(" | ")
+      else:
+        # int16 like tsqueryout's "%d", so wrapped sums print negative.
+        let distance = fromBE16(data.toOpenArray(off + 2, off + 3))
+        if distance == 1:
+          result.add(" <-> ")
+        else:
+          result.add(" <")
+          result.add($distance)
+          result.add("> ")
+    of tsVisit:
+      let prec = tsTokenPrec(data, off)
+      case prec
+      of tpOperand:
+        result.addTsQueryOperand(data, off)
+      of tpNot:
+        result.add('!')
+        pushChild(i + 1, tpNot, false)
+      else:
+        # Pushed in reverse so the left operand prints first.
+        pushChild(i + 1, prec, prec == tpPhrase)
+        todo.add((tsInfix, i))
+        pushChild(nodes[i].left, prec, false)
 
 # Geometry text format parsers
 

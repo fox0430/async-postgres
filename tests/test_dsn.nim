@@ -188,6 +188,55 @@ suite "parseDsn":
     check cfg.extraParams[0] == ("search_path", "public")
     check cfg.extraParams[1] == ("options", "-c log_statement=all")
 
+  test "client_encoding accepts only UTF8 spellings":
+    for v in ["UTF8", "utf-8", "Unicode"]:
+      let cfg = parseDsn("postgresql://host/db?client_encoding=" & v)
+      check cfg.extraParams.len == 0
+    check parseDsn("host=h client_encoding=utf8").extraParams.len == 0
+    check parseDsn("host=h CLIENT_ENCODING=utf8").extraParams.len == 0
+    expect PgConfigError:
+      discard parseDsn("postgresql://host/db?client_encoding=SJIS")
+    expect PgConfigError:
+      discard parseDsn("host=h client_encoding=auto")
+
+  test "validateConnConfig rejects a non-UTF8 client_encoding in extraParams":
+    var cfg = parseDsn("postgresql://host/db")
+    cfg.extraParams = @[("client_encoding", "UTF-8")]
+    validateConnConfig(cfg)
+    cfg.extraParams = @[("client_encoding", "SJIS")]
+    expect PgConfigError:
+      validateConnConfig(cfg)
+    cfg.extraParams = @[("CLIENT_ENCODING", "LATIN1")]
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "validateConnConfig rejects a non-UTF8 client_encoding in options":
+    var cfg = parseDsn("postgresql://host/db")
+    for opts in [
+      "-c client_encoding=UTF8", "--client-encoding=unicode",
+      "-c search_path=a\\ b -c work_mem=64MB", "-c client_encoding",
+    ]:
+      cfg.extraParams = @[("options", opts)]
+      validateConnConfig(cfg)
+    for opts in [
+      "-c client_encoding=LATIN1", "-cclient_encoding=SJIS", "--CLIENT-ENCODING=SJIS",
+      "-c work_mem=1MB  -c   client_encoding=SJIS", "-c client_encoding=a\\ b",
+    ]:
+      cfg.extraParams = @[("options", opts)]
+      expect PgConfigError:
+        validateConnConfig(cfg)
+    expect PgConfigError:
+      discard parseDsn("host=h options='-c client_encoding=LATIN1'")
+    expect PgConfigError:
+      discard parseDsn("postgresql://host/db?CLIENT_ENCODING=LATIN1")
+
+  test "splitStartupOptions matches pg_split_opts":
+    check splitStartupOptions("  -c a=b\\ c   -d ") == @["-c", "a=b c", "-d"]
+    check splitStartupOptions("a\\\\b") == @["a\\b"]
+    # A trailing escape is dropped, leaving an empty argument when alone.
+    check splitStartupOptions("-c x\\") == @["-c", "x"]
+    check splitStartupOptions("-c \\") == @["-c", ""]
+
   test "multiple query params":
     let cfg = parseDsn(
       "postgresql://u:p@h:5433/d?sslmode=require&application_name=test&connect_timeout=10"
