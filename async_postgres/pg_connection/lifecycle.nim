@@ -15,11 +15,18 @@ when defined(posix):
 when hasAsyncDispatch:
   import std/asyncnet
 
-type AuthProgress = object ## What the authentication exchange has established so far.
-  sawRequest: bool ## the server asked for credentials
-  scramStarted: bool ## an AuthenticationSASL began a SCRAM exchange
-  scramFinalVerified: bool ## the server proved it knows the password
-  channelBound: bool ## SCRAM-SHA-256-PLUS was chosen
+type AuthStep = enum
+  ## The last authentication request accepted, recorded before the client
+  ## answers it. Each value names the position for a refusal message.
+  asNone = "before any authentication request"
+  asCleartextSent = "after a cleartext password request"
+  asMd5Sent = "after an MD5 password request"
+  asScramStarted = "after AuthenticationSASL"
+  asScramContinued = "after AuthenticationSASLContinue"
+    ## the expected server signature is computed only once the client-final
+    ## is built
+  asScramVerified = "after AuthenticationSASLFinal"
+    ## the server proved it knows the password
 
 # Error message helpers
 
@@ -130,31 +137,52 @@ proc enforceAuthAllowed(
       msg.add(")")
     raise newException(PgSecurityError, msg)
 
-proc checkAuthRequest(
-    kind: BackendMessageKind, auth: AuthProgress, config: ConnConfig
+proc refuseOutOfOrder(
+    kind: BackendMessageKind, step: AuthStep, threat: string
+) {.noreturn, raises: [PgSecurityError].} =
+  # Drop the "bmk" prefix to get the protocol message name.
+  raise newException(
+    PgSecurityError,
+    "server sent " & substr($kind, 3) & " out of order, " & $step & " (possible " &
+      threat & " or MITM)",
+  )
+
+proc advanceAuth(
+    msg: BackendMessage,
+    step: var AuthStep,
+    scramState: var ScramState,
+    config: ConnConfig,
 ) {.raises: [PgSecurityError].} =
   ## Refuse an authentication message ``config`` does not allow at this point
-  ## of the exchange, as libpq's ``check_expected_areq`` does.
-  case kind
+  ## of the exchange, as libpq's ``check_expected_areq`` does, and record the
+  ## step it takes. SASLFinal is verified here so ``asScramVerified`` is only
+  ## ever set together with a matching server signature.
+  case msg.kind
   of bmkAuthenticationOk:
-    if not auth.sawRequest:
+    if step == asNone:
       enforceAuthAllowed(amNone, config.requireAuth)
     # SCRAM authenticates both ways: skipping SASLFinal would accept a server
     # that never proved it knows the password.
-    if auth.scramStarted and not auth.scramFinalVerified:
+    if step in {asScramStarted, asScramContinued}:
       raise newException(
         PgSecurityError,
         "server sent AuthenticationOk before completing SCRAM server " &
           "signature verification (possible downgrade or MITM)",
       )
-    if config.channelBinding == cbRequire and not auth.channelBound:
+    # The gs2 header is what the server's signature covered.
+    if config.channelBinding == cbRequire and
+        not (step == asScramVerified and scramState.channelBound):
       raise newException(
         PgSecurityError,
         "channel binding is required, but server authenticated client " &
           "without channel binding",
       )
   of bmkAuthenticationCleartextPassword, bmkAuthenticationMD5Password:
-    let authMethod = if kind == bmkAuthenticationMD5Password: amMd5 else: amPassword
+    let (authMethod, next) =
+      if msg.kind == bmkAuthenticationMD5Password:
+        (amMd5, asMd5Sent)
+      else:
+        (amPassword, asCleartextSent)
     enforceAuthAllowed(authMethod, config.requireAuth)
     # Refused before the password leaves: only SCRAM-SHA-256-PLUS binds.
     if config.channelBinding == cbRequire:
@@ -163,20 +191,34 @@ proc checkAuthRequest(
         "channel binding is required, but server requested auth method '" & $authMethod &
           "'",
       )
+    # A repeat of the same request is answered, as libpq does: PAM sends one
+    # per prompt. Switching method, e.g. MD5 to cleartext, is a downgrade.
+    if step notin {asNone, next}:
+      refuseOutOfOrder(msg.kind, step, "downgrade")
+    step = next
+  of bmkAuthenticationSASL:
+    case step
+    of asNone:
+      discard
+    of asCleartextSent, asMd5Sent:
+      refuseOutOfOrder(msg.kind, step, "downgrade")
+    of asScramStarted, asScramContinued, asScramVerified:
+      refuseOutOfOrder(msg.kind, step, "protocol violation")
+    step = asScramStarted
   of bmkAuthenticationSASLContinue, bmkAuthenticationSASLFinal:
-    if not auth.scramStarted:
-      # A default scramState (empty nonce, zeroed signature) would let a forged
-      # exchange through.
-      let name =
-        if kind == bmkAuthenticationSASLContinue:
-          "AuthenticationSASLContinue"
-        else:
-          "AuthenticationSASLFinal"
-      raise newException(
-        PgSecurityError,
-        "server sent " & name & " without a preceding " &
-          "AuthenticationSASL (possible protocol violation or MITM)",
-      )
+    # Only Started -> Continue -> Final is valid. A Final before Continue
+    # would be checked against an expected signature never computed.
+    let expected =
+      if msg.kind == bmkAuthenticationSASLContinue: asScramStarted else: asScramContinued
+    if step != expected:
+      refuseOutOfOrder(msg.kind, step, "protocol violation")
+    if msg.kind == bmkAuthenticationSASLContinue:
+      step = asScramContinued
+    else:
+      if not scramVerifyServerFinal(msg.saslFinalData, scramState):
+        raise
+          newException(PgSecurityError, "SCRAM server signature verification failed")
+      step = asScramVerified
   else:
     discard
 
@@ -475,6 +517,7 @@ proc connectToHostImpl(
     conn = newPgConnection(hostAddr, hostPort, config)
     conn.attachTransport(sock, dialed.target)
 
+  var scramState: ScramState
   try:
     # SSL negotiation (before StartupMessage). Unix sockets skip it (libpq 17
     # parity: sslnegotiation is ignored for AF_UNIX), and allow's plaintext leg
@@ -501,32 +544,28 @@ proc connectToHostImpl(
     await conn.checkPreV3Error()
 
     # Authentication loop
-    var
-      scramState: ScramState
-      auth: AuthProgress
+    var authStep = asNone
 
     block authLoop:
       while true:
         while (let opt = conn.nextMessage(); opt.isSome):
           let msg = opt.get
+          if msg.kind in bmkAuthenticationOk .. bmkAuthenticationSASLFinal:
+            advanceAuth(msg, authStep, scramState, config)
           case msg.kind
           of bmkAuthenticationOk:
-            checkAuthRequest(msg.kind, auth, config)
             break authLoop
+          # The advisory hooks fire only for a request the client answers.
           of bmkAuthenticationCleartextPassword:
-            auth.sawRequest = true
             if not conn.sslEnabled:
               fireInsecureAuth(conn, amPassword)
-            checkAuthRequest(msg.kind, auth, config)
             var pwMsg = encodePassword(config.password)
             try:
               await conn.sendMsg(pwMsg)
             finally:
               ncutils.burnMem(pwMsg)
           of bmkAuthenticationMD5Password:
-            auth.sawRequest = true
             fireDeprecatedAuth(conn, amMd5)
-            checkAuthRequest(msg.kind, auth, config)
             var hash = md5AuthHash(config.user, config.password, msg.md5Salt)
             var hashMsg = encodePassword(hash)
             burnStr(hash)
@@ -535,14 +574,11 @@ proc connectToHostImpl(
             finally:
               ncutils.burnMem(hashMsg)
           of bmkAuthenticationSASL:
-            auth.sawRequest = true
-            auth.scramStarted = true
             let choice = selectScramMechanism(
               conn.sslEnabled, conn.serverCertDer, msg.saslMechanisms,
               config.channelBinding, config.requireAuth,
             )
             let chosen = saslAuthMethod(choice.mechanism).get
-            auth.channelBound = chosen == amScramSha256Plus
             # Defensive: selectScramMechanism only picks from the require_auth
             # filtered offer; this guards against a future fallback past it.
             enforceAuthAllowed(chosen, config.requireAuth, $msg.saslMechanisms)
@@ -552,7 +588,6 @@ proc connectToHostImpl(
             )
             await conn.sendMsg(encodeSASLInitialResponse(choice.mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
-            checkAuthRequest(msg.kind, auth, config)
             var clientFinal = scramClientFinalMessage(
               config.password, msg.saslData, scramState,
               config.effectiveMaxScramIterations,
@@ -564,14 +599,7 @@ proc connectToHostImpl(
             finally:
               ncutils.burnMem(saslMsg)
           of bmkAuthenticationSASLFinal:
-            checkAuthRequest(msg.kind, auth, config)
-            let ok = scramVerifyServerFinal(msg.saslFinalData, scramState)
-            ncutils.burnMem(scramState.serverSignature)
-            if not ok:
-              raise newException(
-                PgSecurityError, "SCRAM server signature verification failed"
-              )
-            auth.scramFinalVerified = true
+            discard # verified by advanceAuth
           of bmkErrorResponse:
             raise startupError(msg.errorFields)
           else:
@@ -601,6 +629,10 @@ proc connectToHostImpl(
     conn.createdAt = Moment.now()
     return conn
   except CatchableError as e:
+    # SASLFinal wipes the expected server signature; an exit before it (e.g.
+    # an ErrorResponse for a wrong password) must too. A future abandoned
+    # mid-await (asyncdispatch timeout) never resumes to get here.
+    scramState.wipeServerSignature()
     await conn.closeTransport()
     raise e
 

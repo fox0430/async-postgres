@@ -191,6 +191,12 @@ proc buildBackendMsg*(msgType: char, body: openArray[byte]): seq[byte] =
 proc buildAuthOk*(): seq[byte] =
   buildBackendMsg('R', @[byte 0, 0, 0, 0])
 
+proc buildAuthCleartextPassword*(): seq[byte] =
+  buildBackendMsg('R', @[byte 0, 0, 0, 3])
+
+proc buildAuthMD5Password*(salt: array[4, byte] = [1'u8, 2, 3, 4]): seq[byte] =
+  buildBackendMsg('R', @[byte 0, 0, 0, 5] & @salt)
+
 proc buildAuthSASL*(mechanisms: seq[string] = @["SCRAM-SHA-256"]): seq[byte] =
   ## AuthenticationSASL (R, subtype 10): advertise SASL mechanism names as a
   ## null-terminated list followed by a final null terminator.

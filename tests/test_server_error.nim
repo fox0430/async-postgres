@@ -785,7 +785,7 @@ suite "client-side refusals":
   test "an auth method outside require_auth is not retried":
     var cfg = mockConfig(0)
     cfg.requireAuth = {amScramSha256}
-    let cleartext = buildBackendMsg('R', @[byte 0, 0, 0, 3])
+    let cleartext = buildAuthCleartextPassword()
     let err = waitFor refusal(cfg, cleartext)
     check err != nil
     check err.serverError == nil
@@ -795,7 +795,7 @@ suite "client-side refusals":
   test "a refusal is not hidden behind another host's refused dial":
     var cfg = mockConfig(0)
     cfg.requireAuth = {amScramSha256}
-    let cleartext = buildBackendMsg('R', @[byte 0, 0, 0, 3])
+    let cleartext = buildAuthCleartextPassword()
     let err = waitFor refusal(cfg, cleartext, thenRefusedDial = true)
     check err != nil
     check err.attempts.len == 2
@@ -898,9 +898,8 @@ suite "client-side refusals":
     cfg.requireAuth = {amScramSha256}
     # Plaintext: cleartext auth, outside require_auth. TLS: bytes injected
     # after 'S', in one segment for chronos's `readOnce`.
-    let err = waitFor allowError(
-      cfg, buildBackendMsg('R', @[byte 0, 0, 0, 3]), @[byte('S'), byte('X')]
-    )
+    let err =
+      waitFor allowError(cfg, buildAuthCleartextPassword(), @[byte('S'), byte('X')])
     check err != nil
     check (ref Exception)(err) of PgSecurityError
     check not isTransientError(err)
@@ -908,8 +907,7 @@ suite "client-side refusals":
   test "sslmode=allow with only one security refusal is no PgSecurityError":
     var cfg = mockConfig(0)
     cfg.requireAuth = {amScramSha256}
-    let err =
-      waitFor allowError(cfg, buildBackendMsg('R', @[byte 0, 0, 0, 3]), @[byte('N')])
+    let err = waitFor allowError(cfg, buildAuthCleartextPassword(), @[byte('N')])
     check err != nil
     check err.attempt(0).attempts[0] of PgSecurityError
     check not ((ref Exception)(err) of PgSecurityError)
