@@ -91,7 +91,7 @@ proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string) =
       body,
     )
 
-macro checkNoBodyEscapePost*(body: typed, macroName, cleanup: string): untyped =
+macro checkNoBodyEscapePost*(body: typed, macroName, cleanup: static string): untyped =
   ## Static re-check after template expansion: control flow hidden in a
   ## template is invisible to the unexpanded walk. The caller's wrapping
   ## `block:` (which would capture unlabeled `break`s) is unwrapped first.
@@ -102,18 +102,24 @@ macro checkNoBodyEscapePost*(body: typed, macroName, cleanup: string): untyped =
       body
   if hasReturnStmt(inner):
     error(
-      "'return' inside " & macroName.strVal &
-        " (possibly hidden inside a template) is not allowed: " & cleanup.strVal &
+      "'return' inside " & macroName &
+        " (possibly hidden inside a template) is not allowed: " & cleanup &
         " would be skipped",
       body,
     )
   if hasLoopEscapeStmt(inner):
     error(
-      "'break'/'continue' escaping " & macroName.strVal &
-        " (possibly hidden inside a template) is not allowed: " & cleanup.strVal &
+      "'break'/'continue' escaping " & macroName &
+        " (possibly hidden inside a template) is not allowed: " & cleanup &
         " would be skipped",
       body,
     )
+  result = newStmtList()
+
+macro checkNoBodyEscapePre*(body: untyped, macroName, cleanup: static string): untyped =
+  ## `checkNoBodyEscape` for template-based scoped constructs, which can't call
+  ## a compile-time proc directly on their untyped `body`.
+  checkNoBodyEscape(body, macroName, cleanup)
   result = newStmtList()
 
 proc bindCleanupSkippedSyms(): tuple[fire, invalidated, failed: NimNode] {.compileTime.} =

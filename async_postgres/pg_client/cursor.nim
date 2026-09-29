@@ -7,7 +7,7 @@ import std/options
 
 import ../[async_backend, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
-import core
+import core, transaction
 
 type Cursor* = ref object
   ## A server-side portal for incremental row fetching via `declareCursor`/`fetch`.
@@ -361,26 +361,48 @@ template withCursor*(
   ## (A `finally` block cannot be used here — on asyncdispatch a failing
   ## `await` in a `finally` replaces the in-flight exception, silently
   ## discarding the body's error.) If `body` succeeds, a close failure
-  ## propagates to the caller.
+  ## propagates to the caller. A `Defect` from `body` is re-raised raw after
+  ## the close attempt. (On chronos, a `Defect` raised in an awaited proc after
+  ## it suspends escapes the event loop directly, so no close runs.)
+  ##
+  ## Body `return` / `break` / `continue` that would escape the body are
+  ## rejected at compile time so the close is not skipped (which would leave
+  ## the connection busy with the open portal).
+  checkNoBodyEscapePre(body, "withCursor", "the cursor close")
   let cursorName =
     await conn.openCursor(sql, chunkSize = chunks, timeout = cursorTimeout)
   var bodyErr: ref CatchableError = nil
+  var bodyDefect: ref Defect = nil
   try:
     body
   except CatchableError as e:
     bodyErr = e
+  except Defect as d:
+    # Not a `CatchableError`: capture it so the close still runs.
+    bodyDefect = d
 
-  if bodyErr != nil:
+  if bodyErr != nil or bodyDefect != nil:
     # Body failed: still close the cursor, but never let a close failure mask
     # the original error.
     try:
       await cursorName.close()
     except CatchableError:
       discard
-    raise bodyErr
+    except Defect:
+      # Same-frame Defect from the close: swallow so it can't replace the body error.
+      discard
+    if bodyErr != nil:
+      raise bodyErr
+    raise bodyDefect
   else:
     # Body succeeded: surface any close failure to the caller.
     await cursorName.close()
+  checkNoBodyEscapePost(
+    block:
+      body,
+    "withCursor",
+    "the cursor close",
+  )
 
 proc openCursor*(
     conn: PgConnection,

@@ -80,6 +80,7 @@ import std/macros
 
 import async_backend, pg_protocol, pg_types, pg_client
 import pg_connection/types
+import pg_client/transaction
 
 # Internal body templates
 #
@@ -360,6 +361,10 @@ proc advisoryTryLockXactShared*(
 # failures are reported via the connection's tracer
 # (``onAdvisoryUnlockFailed``); if the connection is lost the server releases
 # the session lock anyway.
+#
+# Body ``return`` / ``break`` / ``continue`` that would escape the body are
+# rejected at compile time: they would skip the unlock and hold the session
+# lock until the connection closes.
 
 template withAdvisoryLockCore(
     c: PgConnection,
@@ -373,6 +378,8 @@ template withAdvisoryLockCore(
   ## Internal helper implementing the acquire/try/finally pattern for all
   ## session-level ``withAdvisoryLock*`` macros. ``c``, ``k``/``k1``/``k2``
   ## must already be bound to ``let`` symbols by the caller macro.
+  const macroName = when shared: "withAdvisoryLockShared" else: "withAdvisoryLock"
+  checkNoBodyEscapePre(body, macroName, "the advisory unlock")
   when hasTimeout:
     when twoKey:
       await c.lockProc(k1, k2, timeout = t)
@@ -414,6 +421,14 @@ template withAdvisoryLockCore(
       fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, nil)
   except CatchableError as e:
     fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, e)
+  except Defect as d:
+    # Same-frame Defect from the unlock: surface it only when it can't
+    # replace a body error.
+    if bodyErr == nil and bodyDefect == nil:
+      raise d
+    fireAdvisoryUnlockFailed(
+      c, k, k1, k2, shared, twoKey, newException(PgError, d.msg, d)
+    )
 
   if bodyErr != nil:
     # Re-raise the original body exception now that the lock has been released,
@@ -421,6 +436,12 @@ template withAdvisoryLockCore(
     raise bodyErr
   if bodyDefect != nil:
     raise bodyDefect
+  checkNoBodyEscapePost(
+    block:
+      body,
+    macroName,
+    "the advisory unlock",
+  )
 
 macro withAdvisoryLock*(conn: PgConnection, key: int64, body: untyped): untyped =
   ## Acquire a session-level exclusive advisory lock, execute ``body``,

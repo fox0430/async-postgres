@@ -192,6 +192,148 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "withCursor closes the cursor on a Defect":
+    # A ``Defect`` is not a ``CatchableError``, so it used to skip the close
+    # and leave the connection busy with the open portal.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      var caught = ""
+      try:
+        {.push warning[UnreachableCode]: off.} # body always raises
+        conn.withCursor("SELECT generate_series(1, 20)", 5'i32, cur):
+          discard await cur.fetchNext()
+          raise newException(IndexDefect, "sentinel body defect")
+        {.pop.}
+      except Defect as e:
+        caught = e.msg
+
+      doAssert caught == "sentinel body defect"
+      doAssert conn.state == csReady
+      let res = await conn.query("SELECT 1")
+      doAssert res.rows.len == 1
+
+    waitFor t()
+
+  test "withCursor rejects return at compile time":
+    # Body `return` would skip the close and leave the connection busy.
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withCursor("SELECT 1", 5'i32, cur):
+            discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withCursor("SELECT 1", 5'i32, cur):
+            return
+
+    )
+
+  test "withCursor rejects break escaping at compile time":
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              break
+
+    )
+
+  test "withCursor rejects continue escaping at compile time":
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              continue
+
+    )
+
+  test "withCursor rejects break hidden inside a template":
+    # A `break` inside a template called from the body is invisible to the
+    # unexpanded walk; the typed re-check must still reject it.
+    template cursorBreakTemplate(): untyped =
+      break
+
+    template cursorNoopLoopTemplate(): untyped =
+      discard
+
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              cursorNoopLoopTemplate()
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              cursorBreakTemplate()
+
+    )
+
+  test "withCursor rejects return hidden inside a template":
+    # A `return` inside a template called from the body is invisible to the
+    # unexpanded walk; the typed re-check must still reject it.
+    template cursorBailOutTemplate(): untyped =
+      return
+
+    template cursorNoopTemplate(): untyped =
+      discard
+
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withCursor("SELECT 1", 5'i32, cur):
+            cursorNoopTemplate()
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withCursor("SELECT 1", 5'i32, cur):
+            cursorBailOutTemplate()
+
+    )
+
   test "withCursor body error survives a failing close":
     # When `body` raises and the automatic close() also fails, the original
     # body exception must propagate — the close failure must not mask it.

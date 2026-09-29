@@ -606,7 +606,9 @@ type
     key2*: int32 ## Second key (two-key only)
     shared*: bool ## Shared lock?
     twoKey*: bool ## Two-key variant?
-    err*: ref CatchableError ## Nil = unlock returned false (not held)
+    err*: ref CatchableError
+      ## Nil = unlock returned false (not held). An unlock `Defect` arrives
+      ## wrapped in `PgError` (`parent` = the Defect).
 
   PgTracer* = ref object
     ## Tracing hooks (nil = skipped; Start → ``TraceContext`` → End).
