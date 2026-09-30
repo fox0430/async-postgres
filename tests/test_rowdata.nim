@@ -287,6 +287,44 @@ suite "Row.clone":
     let cloned = row.clone()
     check cloned.data == nil
 
+  test "row index outside the RowData raises PgTypeError, not IndexDefect":
+    let rd = newRowData(2)
+    parseDataRowInto(buildDataRowBody(["a", "b"]), rd)
+    for idx in [-1'i32, 1'i32, int32.high]:
+      expect PgTypeError:
+        discard initRow(rd, idx).clone()
+
+  test "hand-built cell outside the buffer raises PgTypeError":
+    let rd = RowData(numCols: 1, buf: @[byte('x')], cellIndex: @[0'i32, 5'i32])
+    expect PgTypeError:
+      discard initRow(rd, 0).clone()
+    rd.cellIndex = @[-1'i32, 1'i32]
+    expect PgTypeError:
+      discard initRow(rd, 0).clone()
+    rd.cellIndex = @[0'i32, -2'i32]
+    expect PgTypeError:
+      discard initRow(rd, 0).clone()
+    rd.cellIndex = @[0'i32, 1'i32]
+    check getCell(initRow(rd, 0).clone().data, 0, 0) == "x"
+
+  test "negative numCols raises PgTypeError instead of a broken Row":
+    # The RowData fields are public, so a hand-built buffer can carry it; clone
+    # must reject it rather than return a Row whose column count is negative.
+    let rd = RowData(numCols: -1, buf: @[byte('x')], cellIndex: @[])
+    expect PgTypeError:
+      discard initRow(rd, 0).clone()
+
+  test "overlapping cells totalling over int32.high raise PgTypeError":
+    # Each cell lies inside buf, but the copy would need offsets past int32
+    # (RangeDefect on the narrowing). Rejected before the copy is allocated.
+    const n = 25_000
+    var cells = newSeq[int32](n * 2)
+    for i in 0 ..< n:
+      cells[i * 2 + 1] = 100_000'i32
+    let rd = RowData(numCols: int16(n), buf: newSeq[byte](100_000), cellIndex: cells)
+    expect PgTypeError:
+      discard initRow(rd, 0).clone()
+
 suite "parseDataRowInto overflow guard":
   test "raises PgProtocolError when cumulative buf exceeds int32.high":
     var rd = newRowData(1)

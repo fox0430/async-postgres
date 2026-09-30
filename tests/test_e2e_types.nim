@@ -327,6 +327,54 @@ suite "E2E: Extended Type Roundtrip":
 
     waitFor t()
 
+  test "text DateTime params keep the era, years past 9999 and the instant":
+    # The binary encoding has no year spelling or offset to get wrong, so the
+    # server comparing the two checks the text literal.
+    template fixedZone(name: string, west: static int): Timezone =
+      proc fromTime(time: Time): ZonedTime {.gensym, nimcall, gcsafe, raises: [].} =
+        ZonedTime(isDst: false, utcOffset: west, time: time)
+
+      proc fromAdj(adjTime: Time): ZonedTime {.gensym, nimcall, gcsafe, raises: [].} =
+        ZonedTime(
+          isDst: false, utcOffset: west, time: adjTime + initDuration(seconds = west)
+        )
+
+      newTimezone(name, fromTime, fromAdj)
+
+    proc values(): seq[DateTime] =
+      # LMT +09:18:59: `zzz` would drop the seconds. -04:00 at the lower bound:
+      # the local date precedes PostgreSQL's first one.
+      let lmt = fixedZone("LMT+09:18:59", -(9 * 3600 + 18 * 60 + 59))
+      let west4 = fixedZone("-04:00", 4 * 3600)
+      @[
+        dateTime(-4713, mNov, 24, zone = utc()),
+        dateTime(0, mDec, 31, 23, 59, 59, 999_999_000, utc()),
+        dateTime(10000, mJan, 1, zone = utc()),
+        dateTime(294276, mDec, 31, 23, 59, 59, 999_999_000, utc()),
+        dateTime(1850, mJan, 1, 12, 0, 0, zone = utc()).inZone(lmt),
+        dateTime(-4713, mNov, 24, 1, 0, 0, zone = utc()).inZone(west4),
+      ]
+
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      for dt in values():
+        let res = await conn.query(
+          "SELECT $1::timestamp = $2, $3::timestamptz = $4, $5::date = $6",
+          @[
+            toPgParam(dt),
+            toPgBinaryParam(dt),
+            toPgTimestampTzParam(dt),
+            toPgBinaryTimestampTzParam(dt),
+            toPgDateParam(dt),
+            toPgBinaryDateParam(dt),
+          ],
+        )
+        let row = res.rows[0]
+        doAssert row.getBool(0) and row.getBool(1) and row.getBool(2), $dt
+      await conn.close()
+
+    waitFor t()
+
   test "UUID roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

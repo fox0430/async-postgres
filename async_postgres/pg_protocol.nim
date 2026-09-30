@@ -346,6 +346,29 @@ func data*(row: Row): RowData = ## The underlying RowData buffer.
 func rowIdx*(row: Row): int32 = ## The row index within the RowData buffer.
   row.rowIdx
 
+proc cellSpan*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  ## Offset and length (-1 = NULL) of one cell in ``row.data.buf``. Shared by
+  ## the ``pg_types`` accessors and ``clone`` as the only cell lookup.
+  # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
+  # `except PgError` would miss them and crash the process (UB in -d:release).
+  # `initRow` and the RowData fields are public, so every coordinate is checked.
+  if row.data == nil:
+    raise newException(PgTypeError, "Row has no data")
+  if col < 0 or col >= int(row.data.numCols):
+    raise newException(
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
+    )
+  let idx = (int64(row.rowIdx) * int64(row.data.numCols) + int64(col)) * 2
+  if row.rowIdx < 0 or idx + 1 >= int64(row.data.cellIndex.len):
+    raise newException(PgTypeError, "row index " & $row.rowIdx & " out of range")
+  result.off = int(row.data.cellIndex[idx])
+  result.len = int(row.data.cellIndex[idx + 1])
+  if result.len < -1 or (
+    result.len > 0 and (result.off < 0 or result.off > row.data.buf.len - result.len)
+  ):
+    raise
+      newException(PgTypeError, "column " & $col & " cell lies outside the row buffer")
+
 func isBinarySafeOid*(oid: int32): bool =
   ## Check if a type OID can be safely requested in binary format.
   oid >= 0 and oid <= BinarySafeMaxOid and binarySafeLookup[oid]
@@ -1430,40 +1453,50 @@ proc clone*(row: Row): Row =
   ## containing only this single row. Use this to retain rows from a
   ## `queryEach` callback beyond the callback's lifetime — the original
   ## buffer is reused for subsequent rows and would otherwise be overwritten.
+  ## Raises ``PgTypeError`` if ``row`` does not lie inside its ``RowData``
+  ## (see ``cellSpan``; a negative ``numCols`` included) or its cells total
+  ## over ``int32.high`` bytes; a Row without data clones to another one.
   if row.data == nil:
     return Row(data: nil, rowIdx: 0)
   let src = row.data
-  let numCols = src.numCols
-  let cellBase = int(row.rowIdx) * int(numCols) * 2
-  var total = 0
-  for i in 0 ..< int(numCols):
-    let clen = src.cellIndex[cellBase + i * 2 + 1]
-    if clen > 0:
-      total += int(clen)
+  # A hand-built RowData can carry a negative numCols (the fields are public);
+  # no cell in it is addressable then, so reject it the way cellSpan rejects
+  # out-of-range coordinates instead of returning a Row whose len is negative.
+  if src.numCols < 0:
+    raise
+      newException(PgTypeError, "RowData has negative numCols (" & $src.numCols & ")")
+  let numCols = int(src.numCols)
+  # int64: the copy can exceed int32, and where `int` is 32-bit the running sum
+  # would wrap before the guard below could fire.
+  var total: int64 = 0
+  for i in 0 ..< numCols:
+    total += int64(max(row.cellSpan(i).len, 0))
+    # Hand-built cells may overlap, so the copy can outgrow the int32 offsets.
+    if total > int64(int32.high):
+      raise newException(PgTypeError, "row too large to clone (" & $total & " bytes)")
   let rd = RowData(
-    numCols: numCols,
+    numCols: src.numCols,
     colFormats: src.colFormats,
     colTypeOids: src.colTypeOids,
     fields: src.fields,
     colMap: src.colMap,
-    cellIndex: newSeq[int32](int(numCols) * 2),
-    buf: newSeq[byte](total),
+    cellIndex: newSeq[int32](numCols * 2),
+    buf: newSeq[byte](int(total)),
   )
   var pos = 0
-  for i in 0 ..< int(numCols):
-    let srcOff = int(src.cellIndex[cellBase + i * 2])
-    let clen = src.cellIndex[cellBase + i * 2 + 1]
-    if clen == -1:
+  for i in 0 ..< numCols:
+    let c = row.cellSpan(i)
+    if c.len == -1:
       rd.cellIndex[i * 2] = 0'i32
       rd.cellIndex[i * 2 + 1] = -1'i32
-    elif clen == 0:
+    elif c.len == 0:
       rd.cellIndex[i * 2] = 0'i32
       rd.cellIndex[i * 2 + 1] = 0'i32
     else:
-      rd.buf.writeBytesAt(pos, src.buf.toOpenArray(srcOff, srcOff + int(clen) - 1))
+      rd.buf.writeBytesAt(pos, src.buf.toOpenArray(c.off, c.off + c.len - 1))
       rd.cellIndex[i * 2] = int32(pos)
-      rd.cellIndex[i * 2 + 1] = clen
-      pos += int(clen)
+      rd.cellIndex[i * 2 + 1] = int32(c.len)
+      pos += c.len
   Row(data: rd, rowIdx: 0)
 
 proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =

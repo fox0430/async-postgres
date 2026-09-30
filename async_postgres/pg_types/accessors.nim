@@ -5,18 +5,9 @@ import core, decoding, encoding
 
 proc cellInfo*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
   ## Raw cell offset/len. Sibling-only: `pg_types.nim` excludes it from the
-  ## wholesale export.
-  # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
-  # `except PgError` would miss an out-of-range col and crash the process
-  # (UB in -d:release). Same family as the other accessor errors here so
-  # callers only need one `except PgTypeError` clause.
-  if col < 0 or col >= int(row.data.numCols):
-    raise newException(
-      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
-    )
-  let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
-  result.off = int(row.data.cellIndex[idx])
-  result.len = int(row.data.cellIndex[idx + 1])
+  ## wholesale export. Raises ``PgTypeError`` (see ``cellSpan``), so callers
+  ## only need one ``except PgTypeError`` clause.
+  row.cellSpan(col)
 
 template bufView(row: Row, off, clen: int): openArray[char] =
   ## Zero-copy char view into row.data.buf for parseutils.
@@ -42,8 +33,12 @@ proc raiseIntParse(outcome: PgIntParse, col, clen: int) {.inline.} =
     )
 
 proc len*(row: Row): int {.inline.} =
-  ## Return the number of columns in this row.
-  int(row.data.numCols)
+  ## Return the number of columns in this row (0 for a Row without data, and
+  ## never negative: a hand-built RowData can carry a negative numCols).
+  if row.data == nil:
+    0
+  else:
+    max(int(row.data.numCols), 0)
 
 proc `[]`*(row: Row, col: int): Option[seq[byte]] =
   ## Backward-compatible cell access. Returns a copy of the cell data.
@@ -129,24 +124,22 @@ proc contains*(cr: CommandResult, s: string): bool {.inline.} =
   s in cr.commandTag
 
 proc isNull*(row: Row, col: int): bool =
-  ## Check if the column value is NULL. Raises `PgTypeError` on out-of-range
-  ## column index (see cellInfo for why not IndexDefect).
-  if col < 0 or col >= int(row.data.numCols):
-    raise newException(
-      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
-    )
-  let idx = (int(row.rowIdx) * int(row.data.numCols) + col) * 2
-  row.data.cellIndex[idx + 1] == -1'i32
+  ## Check if the column value is NULL. Raises `PgTypeError` when the cell is
+  ## not in the row (see ``cellSpan`` for why not IndexDefect).
+  row.cellSpan(col).len == -1
+
+# The metadata probes below run before the accessors' `cellInfo`, so they treat
+# a missing RowData and a negative col as "no metadata" and let `cellInfo`
+# raise the `PgTypeError`.
 
 proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
   ## Check if column was received in binary format.
-  # `col >= 0` first: many accessors call this before their `cellInfo`/`isNull`
-  # bounds check, so a negative col would reach `colFormats[col]` here.
-  col >= 0 and row.data.colFormats.len > col and row.data.colFormats[col] == 1'i16
+  col >= 0 and row.data != nil and row.data.colFormats.len > col and
+    row.data.colFormats[col] == 1'i16
 
 proc colTypeOid(row: Row, col: int): int32 {.inline.} =
   ## Get the type OID for a column, or 0 if not available.
-  if col >= 0 and row.data.colTypeOids.len > col:
+  if col >= 0 and row.data != nil and row.data.colTypeOids.len > col:
     row.data.colTypeOids[col]
   else:
     0'i32
@@ -201,7 +194,7 @@ proc checkScalarColOid*(
   ## Reject a binary column this accessor cannot decode. Same-length types
   ## would otherwise misdecode silently. Missing OID metadata skips the check;
   ## an explicit wire OID is always judged.
-  if col < 0 or row.data.colTypeOids.len <= col:
+  if col < 0 or row.data == nil or row.data.colTypeOids.len <= col:
     return
   let actual = row.data.colTypeOids[col]
   if wireOidAcceptable(actual, expected):

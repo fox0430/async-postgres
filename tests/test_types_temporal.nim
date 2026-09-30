@@ -740,6 +740,84 @@ suite "Timestamp/date infinity sentinels":
       check raisedAsPgType
       check raisedAsPgError
 
+  test "parseTimestampText keeps the era and years past 9999":
+    check parseTimestampText("4714-11-24 00:00:00.000000Z BC").year == -4713
+    check parseTimestampText("4714-11-24 01:00:00.000000 BC").year == -4713
+    check parseTimestampText("10000-01-01 00:00:00.000000").year == 10000
+    check parseTimestampText("4714-11-24 00:00:00.000000Z AD").year == 4714
+    # PostgreSQL omits `.000000`, so the era formats without a fraction (and
+    # `zz` / `zzz` offsets next to `g`) need their own success paths.
+    check parseTimestampText("4714-11-24 00:00:00 BC").year == -4713
+    check parseTimestampText("4714-11-24 00:00:00Z BC").year == -4713
+    check parseTimestampText("0001-06-01 00:00:00+09 BC").year == 0
+    check parseTimestampText("0001-06-01 00:00:00+09:30 BC").year == 0
+    # A short fraction is right-padded before the era is read.
+    check parseTimestampText("0001-06-01 00:00:00.5+09 BC").year == 0
+
+  test "parseDateText keeps the era and years past 9999":
+    check parseDateText("4714-11-24 BC").year == -4713
+    check parseDateText("0001-12-31 BC").year == 0
+    check parseDateText("294277-01-01").year == 294277
+    check parseDateText("2024-01-15 AD").year == 2024
+
+  test "text date round trip keeps the era and years past 9999":
+    # The text encoders accept date's whole range, so the text parser must read
+    # them back (the binary codec already did).
+    for dt in [
+      dateTime(-4713, mNov, 24, zone = utc()),
+      dateTime(0, mDec, 31, zone = utc()),
+      dateTime(10000, mJan, 1, zone = utc()),
+      dateTime(5874897, mDec, 31, zone = utc()),
+    ]:
+      check parseDateText(toString(toPgDateParam(dt).value.get)) == dt
+
+  test "text timestamp round trip keeps the era and years past 9999":
+    for dt in [
+      dateTime(-4713, mNov, 24, zone = utc()),
+      dateTime(0, mDec, 31, 23, 59, 59, 999_999_000, utc()),
+      dateTime(10000, mJan, 1, zone = utc()),
+      dateTime(294276, mDec, 31, 23, 59, 59, 999_999_000, utc()),
+    ]:
+      check parseTimestampText(toString(toPgParam(dt).value.get)) == dt
+      check parseTimestampText(toString(toPgTimestampTzParam(dt).value.get)) == dt
+
+  test "text temporal parsers keep PostgreSQL's exact ends":
+    # `YYYY` takes any number of digits; past ~2.92e11 the stdlib date math
+    # overflowed int64 (OverflowDefect, not a TimeParseError) and years just
+    # past a type's end used to decode silently.
+    for bad in [
+      "999999999999-01-01", "292277026597-01-01", "100000000000-01-01", "5874898-01-01"
+    ]:
+      expect PgTypeError:
+        discard parseDateText(bad)
+      expect PgTypeError:
+        discard parseTimestampText(bad & " 00:00:00.000000")
+    expect PgTypeError:
+      discard parseTimestampText("294277-01-01 00:00:00")
+    # `date` starts at 4714-11-24 BC, so one day earlier must not decode.
+    expect PgTypeError:
+      discard parseDateText("4714-11-23 BC")
+    check parseDateText("5874897-12-31").year == 5874897
+    check parseDateText("294277-01-01").year == 294277
+    check parseDateText("4714-11-24 BC").year == -4713
+    check parseTimestampText("294276-12-31 23:59:59.999999").year == 294276
+    check parseTimestampText("4714-11-24 00:00:00.000000Z BC").year == -4713
+
+  test "huge text years through the accessors raise PgTypeError":
+    let tsRow = mkRow(
+      @[some(toBytes("999999999999-01-01 00:00:00"))], @[mkField(OidTimestamp, 0)]
+    )
+    expect PgTypeError:
+      discard tsRow.getTimestamp(0)
+    let dateRow = mkRow(@[some(toBytes("999999999999-01-01"))], @[mkField(OidDate, 0)])
+    expect PgTypeError:
+      discard dateRow.getDate(0)
+    let rangeRow = mkRow(
+      @[some(toBytes("[999999999999-01-01,2000-01-01)"))], @[mkField(OidDateRange, 0)]
+    )
+    expect PgTypeError:
+      discard rangeRow.getDateRange(0)
+
   test "getDate binary unexpected length":
     let fields = @[mkField(OidDate, 1)]
     let row = mkRow(@[some(newSeq[byte](2))], fields) # 2 bytes (expected 4)

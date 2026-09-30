@@ -7,7 +7,8 @@
 ## ``PgStateError`` and ``PgConfigError`` are deliberately siblings, being a
 ## programming error and a configuration fault that no reconnect fixes.
 ##
-## ``PgTypeError`` = caller data the wire format cannot carry; ``PgQueryError`` =
+## ``PgTypeError`` = a value the wire format or the local type cannot carry
+## (parameter encoding and row/column decoding alike); ``PgQueryError`` =
 ## an error the server reported; ``ValueError`` = a precondition, and the one kind
 ## not under ``PgError`` (except DSN parsing).
 ##
