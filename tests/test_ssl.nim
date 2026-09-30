@@ -2492,6 +2492,10 @@ when hasAsyncDispatch and defined(ssl):
               x509Free(peer)
             # Unblock the server's `recv(1)` so its future completes.
             await c.send(" ")
+            # Closing with the server's session tickets unread sends an RST,
+            # and Windows then drops the byte before the server reads it.
+            # Bounded, so a byte that never arrives fails the check below.
+            discard await serverFut.withTimeout(5000)
           finally:
             c.close()
 

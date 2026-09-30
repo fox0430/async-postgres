@@ -405,8 +405,10 @@ suite "TLS handshake failure path":
     # `connect` folds every per-host failure into PgConnectionError, so the type
     # says nothing here; only the wording checked below rules out a leak.
     when hasAsyncDispatch:
-      # Closing with our ClientHello unread may send an RST instead of a FIN.
-      check "closed by peer" in msg or "reset by peer" in msg
+      # Closing with our ClientHello unread may send an RST instead of a FIN,
+      # which each OS words its own way: match our prefix, not its text.
+      check "TLS handshake: connection closed by peer" in msg or
+        "TLS handshake: recv failed: " in msg or "TLS handshake: send failed: " in msg
     elif hasChronos:
       check "TLS handshake failed" in msg
 
@@ -441,6 +443,9 @@ suite "direct SSL: ALPN enforcement":
         "-key",
         CertDir / "server.key",
         "-quiet",
+        # Without it s_server reads stdin, which on Windows blocks on the
+        # redirected pipe before the handshake is ever answered.
+        "-www",
       ],
       options = {poUsePath, poStdErrToStdOut},
     )
