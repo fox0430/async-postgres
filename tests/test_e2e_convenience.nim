@@ -1044,6 +1044,36 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: query and queryEach with capacity=0 decode binary results":
+    # Same Describe(Portal) mirroring on the single-statement recv loops.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 0
+
+      let r = await conn.query("SELECT 987654::int4 AS v", resultFormat = rfBinary)
+      doAssert conn.stmtCache.len == 0
+      doAssert r.fields[0].formatCode == 1
+      doAssert r.rows[0].isBinaryCol(0)
+      doAssert r.rows[0].getInt(0) == 987654
+
+      var values: seq[int64]
+      var binary: seq[bool]
+      let rowCount = await conn.queryEach(
+        "SELECT 6789::int8 AS v",
+        resultFormat = rfBinary,
+        callback = proc(row: Row) =
+          binary.add(row.isBinaryCol(0))
+          values.add(row.getInt64(0)),
+      )
+      doAssert conn.stmtCache.len == 0
+      doAssert rowCount == 1
+      doAssert binary == @[true]
+      doAssert values == @[6789'i64]
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: exec then query on same SQL preserves cached decode metadata":
     # exec's addStmtCache path must populate decode metadata for a later query hit.
     proc t() {.async.} =
@@ -1156,11 +1186,9 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "stmt cache: addStmtCache evicts down to capacity after shrink":
-    # Shrinking stmtCacheCapacity below the current size leaves the cache
-    # over-full; the next addStmtCache must drain it down to the new
-    # capacity rather than dropping the new entry or stopping after one
-    # eviction. All evicted names are queued in pendingStmtCloses.
+  test "stmt cache: shrinking capacity evicts the LRU excess at once":
+    # The setter drains the cache down to the new capacity itself and queues
+    # every evicted name, so reclaiming them does not wait for a cache miss.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       conn.stmtCacheCapacity = 4
@@ -1171,7 +1199,14 @@ suite "E2E: Convenience Query Methods":
       conn.addStmtCache("D", CachedStmt(name: "s4"))
       doAssert conn.stmtCache.len == 4
 
-      conn.stmtCacheCapacity = 2
+      # privateAccess turns `conn.stmtCacheCapacity = n` into a raw field
+      # write; call the setter by name.
+      `stmtCacheCapacity=`(conn, 2)
+      doAssert conn.stmtCache.len == 2
+      doAssert conn.stmtCache.hasKey("C")
+      doAssert conn.stmtCache.hasKey("D")
+      doAssert conn.pendingStmtCloses == @["s1", "s2"]
+
       conn.addStmtCache("E", CachedStmt(name: "s5"))
       doAssert conn.stmtCache.len == 2
       doAssert conn.stmtCache.hasKey("D") # most-recent kept
@@ -1435,6 +1470,159 @@ suite "E2E: Convenience Query Methods":
       )
       doAssert post.rows.len == 1
       doAssert post.rows[0].getStr(0) == secondName
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: disabling the cache closes its statements server-side":
+    # Capacity 0 turns lookups off, so entries left behind would never be hit
+    # or evicted again: their statements would stay until the session ends.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      discard await conn.query("SELECT 1")
+      discard await conn.exec("SELECT 2")
+      let n1 = conn.stmtCache["SELECT 1"].name
+      let n2 = conn.stmtCache["SELECT 2"].name
+
+      `stmtCacheCapacity=`(conn, 0) # the setter, not the field (privateAccess)
+      doAssert conn.stmtCache.len == 0
+      doAssert conn.pendingStmtCloses.len == 2
+
+      # The Closes ride ahead of this op's own Parse, so it sees them applied.
+      let r = await conn.query(
+        "SELECT count(*)::int FROM pg_prepared_statements WHERE name IN ($1, $2)",
+        @[toPgParam(n1), toPgParam(n2)],
+      )
+      doAssert r.rows[0].getInt(0) == 0
+      doAssert conn.pendingStmtCloses.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: a cache miss failing at Execute is cached on every path":
+    # Parse and Describe succeeded, so the statement is kept rather than
+    # Closed: a repeat Binds it again instead of Parsing a new one. Each path
+    # gets its own SQL so each one takes the miss branch.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      proc serverCount(sql: string): Future[int] {.async.} =
+        (
+          await conn.simpleQuery(
+            "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" & sql &
+              "'"
+          )
+        )[0].rows[0].getInt(0)
+
+      template expectCached(path: string, call: untyped) =
+        block:
+          let sql {.inject.} = "SELECT 1 / $1::int -- " & path
+          var name = ""
+          for i in 0 ..< 2:
+            var raised = false
+            try:
+              call
+            except PgQueryError:
+              raised = true
+            doAssert raised, path & " did not fail"
+            doAssert conn.stmtCache.hasKey(sql), path & " did not cache the statement"
+            if i == 0:
+              name = conn.stmtCache[sql].name
+            doAssert conn.stmtCache[sql].name == name, path & " re-Parsed on a repeat"
+            doAssert conn.pendingStmtCloses.len == 0, path & " queued a Close"
+            doAssert (await serverCount(sql)) == 1, path & " left an extra statement"
+
+      expectCached "query":
+        discard await conn.query(sql, @[toPgParam(0'i32)])
+      expectCached "queryEach":
+        discard await conn.queryEach(
+          sql,
+          @[toPgParam(0'i32)],
+          callback = proc(row: Row) =
+            discard,
+        )
+      expectCached "exec":
+        discard await conn.exec(sql, @[toPgParam(0'i32)])
+      expectCached "queryDirect":
+        discard await conn.queryDirect(sql, 0'i32)
+      expectCached "execDirect":
+        discard await conn.execDirect(sql, 0'i32)
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: a cache miss whose Parse fails queues no Close":
+    # Nothing was created, and a Close for the name could drop someone else's.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      for path in ["query", "exec"]:
+        var state = ""
+        try:
+          if path == "query":
+            discard await conn.query("SELEC 1")
+          else:
+            discard await conn.exec("SELEC 1")
+        except PgQueryError as e:
+          state = e.sqlState
+        doAssert state == "42601", path
+        doAssert conn.stmtCache.len == 0, path
+        doAssert conn.pendingStmtCloses.len == 0, path
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: a name taken by SQL PREPARE is not Closed by the cache":
+    # SQL PREPARE bypasses `prepare`'s reserved-name check. The cache's Parse
+    # then fails with 42P05, and must leave the application's statement alone.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let taken = "_sc_" & $(conn.stmtCounter + 1)
+      discard await conn.simpleExec("PREPARE " & taken & " AS SELECT 'mine'::text")
+
+      var state = ""
+      try:
+        discard await conn.query("SELECT 2")
+      except PgQueryError as e:
+        state = e.sqlState
+      doAssert state == "42P05"
+      doAssert conn.pendingStmtCloses.len == 0
+
+      # The next miss takes a fresh name, and the application's statement survives it.
+      doAssert (await conn.query("SELECT 2")).rows[0].getStr(0) == "2"
+      let mine = await conn.simpleQuery("EXECUTE " & taken)
+      doAssert mine[0].rows[0].getStr(0) == "mine"
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: queryEach callback failure still caches the statement":
+    # The server ran the statement to completion; only the caller's callback
+    # failed, so the freshly Parsed statement is kept rather than orphaned.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT generate_series(1, 3) AS v"
+
+      var raised = false
+      try:
+        discard await conn.queryEach(
+          sql,
+          callback = proc(row: Row) =
+            raise newException(ValueError, "callback failed"),
+        )
+      except ValueError:
+        raised = true
+      doAssert raised
+      doAssert conn.stmtCache.hasKey(sql)
+      doAssert conn.pendingStmtCloses.len == 0
+      let name = conn.stmtCache[sql].name
+
+      let r = await conn.query(sql)
+      doAssert r.rows.len == 3
+      doAssert conn.stmtCache[sql].name == name # hit, not a fresh Parse
 
       await conn.close()
 

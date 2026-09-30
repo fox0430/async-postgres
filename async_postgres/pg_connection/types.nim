@@ -376,12 +376,13 @@ type
     pendingStmtCloses: seq[string]
       ## Server-side prepared statement names whose ``Close`` was not bundled
       ## with the operation that evicted them. Populated when the defensive
-      ## eviction loop in ``addStmtCache`` fires (caller skipped the
-      ## pre-eviction step, or ``stmtCacheCapacity`` was shrunk below the
-      ## current cache size). Staged by ``stagePendingStmtCloses`` at the
-      ## start of the next Extended Query send phase so the leak is bounded
-      ## to the gap until the next operation, which moves them to
-      ## ``stagedStmtCloses``.
+      ## eviction loop in ``addStmtCache`` fires (a pipeline never
+      ## pre-evicts), when ``stmtCacheCapacity=`` shrinks the cache, when an
+      ## entry is invalidated or replaced, and for statements no entry holds
+      ## (a cache miss the server Parsed but the cache did not keep). Staged by
+      ## ``stagePendingStmtCloses`` at the start of the next Extended Query
+      ## send phase so the leak is bounded to the gap until the next
+      ## operation, which moves them to ``stagedStmtCloses``.
     heldSessionLocks: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
       ## API, minus tracked releases. Reported (best-effort) by the
@@ -1636,16 +1637,12 @@ proc clearStaged*(conn: PgConnection) {.inline, raises: [].} =
 # callers stage and drop through them, never by touching the queues.
 
 const stmtNamePrefix* = "_sc_"
+  ## Reserved for the cache's names: `prepare` rejects a name that starts with it.
 
 proc nextStmtName*(conn: PgConnection): string =
   ## Generate the next unique prepared statement name for the statement cache.
   inc conn.stmtCounter
   stmtNamePrefix & $conn.stmtCounter
-
-func stmtCacheSize*(conn: PgConnection): int {.inline.} =
-  ## Number of live cache entries; the pipeline's eviction math reads it
-  ## because its own pending inserts are not in the table yet.
-  conn.stmtCache.len
 
 proc lookupStmtCache*(conn: PgConnection, sql: string): CachedStmt =
   ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
@@ -1668,10 +1665,12 @@ proc evictStmtCache*(conn: PgConnection): CachedStmt =
   conn.stmtCache.del(oldSql)
 
 proc queueStmtClose*(conn: PgConnection, stmtName: string) =
-  ## Queue a server-side ``Close`` for a statement the cache does not track
-  ## (a failed cache-miss Parse, or one superseded inside a pipeline build).
-  ## The next Extended Query send carries it; closing a statement the server
-  ## never saw is a no-op.
+  ## Queue a server-side ``Close`` for a statement the cache no longer tracks
+  ## (a dropped entry, or a cache miss the server Parsed but the cache did not
+  ## keep). The next Extended Query send carries it at its head.
+  ##
+  ## Only for names this cache Parsed: a Close for a name whose Parse failed
+  ## would drop whoever else holds it.
   conn.pendingStmtCloses.add(stmtName)
 
 proc removeStmtCache*(conn: PgConnection, sql: string) =
@@ -1683,16 +1682,32 @@ proc removeStmtCache*(conn: PgConnection, sql: string) =
 
 proc invalidateStmtCache*(conn: PgConnection, sql, stmtName: string) =
   ## Drop a cache entry the server invalidated and queue its ``Close`` together.
-  conn.queueStmtClose(stmtName)
+  ## A no-op once ``sql`` no longer maps to ``stmtName``: whatever dropped that
+  ## entry already queued its Close.
+  let entry = conn.stmtCache.getOrDefault(sql)
+  if entry == nil or entry.name != stmtName:
+    return
   conn.removeStmtCache(sql)
+  conn.queueStmtClose(stmtName)
 
 proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   ## Add a prepared statement to the cache with auto-computed result formats.
-  ## Callers normally pre-evict; the loop below is a defensive guard that
-  ## evicts while over capacity and queues the evicted names for the next
-  ## Extended Query send.
+  ## Single-statement callers pre-evict (``evictForInsert``) so the Close
+  ## rides along. A pipeline would have to Close mid-batch, where a failing op
+  ## gets it skipped, so it leaves eviction to the loop below, which queues
+  ## the names for the next Extended Query send.
+  ##
+  ## Every name handed in ends up cached or queued for ``Close``: a statement
+  ## the cache cannot keep (caching turned off while it was in flight) or an
+  ## entry it replaces is closed, not forgotten.
   if conn.stmtCacheCapacity <= 0:
+    conn.queueStmtClose(cached.name)
     return
+  let existing = conn.stmtCache.getOrDefault(sql)
+  if existing != nil:
+    conn.removeStmtCache(sql)
+    if existing.name != cached.name:
+      conn.queueStmtClose(existing.name)
   while conn.stmtCache.len >= conn.stmtCacheCapacity:
     let evicted = conn.evictStmtCache()
     conn.queueStmtClose(evicted.name)
@@ -1744,19 +1759,28 @@ proc stagePendingStmtCloses*(conn: PgConnection) {.inline.} =
   ## a separate batch).
   conn.stagePendingStmtCloses(conn.sendBuf)
 
+when defined(pgStateChecks):
+  func onlyCloses(buf: openArray[byte]): bool =
+    var i = 0
+    while i < buf.len:
+      if buf[i] != byte('C'):
+        return false
+      i += 1 + int(decodeInt32(buf, i + 1))
+    true
+
 proc stageEvictedClose*(conn: PgConnection, buf: var seq[byte], name: string) =
   ## Stage the ``Close`` for a statement the build itself evicted. Staged, not
   ## queued: the cache no longer remembers the name, and an aborted build
   ## leaves staged names owed just as the queue would.
+  ##
+  ## Only ahead of the build's first Parse/Bind/Describe/Execute: behind a
+  ## failing one the backend skips it up to ``Sync``, yet the name is dropped
+  ## once the bytes are sent.
+  when defined(pgStateChecks):
+    doAssert onlyCloses(buf), "eviction Close staged behind a message that can fail"
   conn.requireStaged("staging an eviction Close")
   conn.stagedStmtCloses.add name
   buf.addClose(dkStatement, name)
-
-proc stageEvictedClose*(conn: PgConnection, name: string) {.inline.} =
-  ## Stage the ``Close`` for one evicted statement into the connection's own
-  ## send buffer. Staged, not queued: the cache no longer remembers the name,
-  ## and an aborted build leaves staged names owed just as the queue would.
-  conn.stageEvictedClose(conn.sendBuf, name)
 
 proc dropStagedStmtCloses*(conn: PgConnection) =
   ## Forget the names whose ``Close`` is now on the wire. Names queued since the
@@ -1880,11 +1904,13 @@ func stmtCacheCapacity*(conn: PgConnection): int {.inline.} =
   ## Statement-cache capacity; see `stmtCacheCapacity=`.
   conn.stmtCacheCapacity
 
-proc `stmtCacheCapacity=`*(conn: PgConnection, value: int) {.inline.} =
+proc `stmtCacheCapacity=`*(conn: PgConnection, value: int) =
   ## Resize the client-side prepared-statement cache (256 default; 0 disables
-  ## it). Shrinking below the current size leaves the excess to the next
-  ## operation's eviction pass, which bundles the server-side ``Close``.
+  ## it). Shrinking evicts the least recently used excess at once; their
+  ## server-side ``Close`` rides along with the next Extended Query operation.
   conn.stmtCacheCapacity = value
+  while conn.stmtCache.len > max(value, 0):
+    conn.queueStmtClose(conn.evictStmtCache().name)
 
 func state*(conn: PgConnection): PgConnState {.inline.} =
   ## Current state (read-only; see `isConnected`).

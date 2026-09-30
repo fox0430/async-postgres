@@ -28,10 +28,9 @@ proc queryDirectRunImpl*(
   ## ``query.nim``).
   result = QueryResult()
   await conn.sendStagedBufMsg()
-  var cf = cachedFields
   queryRecvLoop(
-    conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cf, colFmts, colOids,
-    result,
+    conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cachedFields, colFmts,
+    colOids, result,
   )
 
 proc queryDirectImpl*(

@@ -3377,9 +3377,11 @@ suite "E2E: execInTransaction / queryInTransaction":
         state = e.sqlState
       doAssert state == "22012" # division_by_zero
 
-      # Succeeded-before-error op is cached; the failing op is not.
+      # Both are cached: the failing op got through Parse and Describe before
+      # its Execute failed.
       doAssert conn.stmtCache.hasKey("SELECT $1::int4")
-      doAssert not conn.stmtCache.hasKey("SELECT 1 / $1::int4")
+      doAssert conn.stmtCache.hasKey("SELECT 1 / $1::int4")
+      doAssert conn.pendingStmtCloses.len == 0
 
       # Reuse: a fresh pipeline with the same SQL is a cache hit and adds no new
       # entry (with the bug it was a miss -> a new entry and a leaked _sc_N).
@@ -3525,17 +3527,14 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
-  test "pipeline: failing scsMiss op queues Close so no server statement leaks":
-    # A cache-miss op that fails at Execute time (Parse succeeded) leaves its
-    # freshly Parsed statement on the server. The cache-add happens only on
-    # success, so nothing reuses it — without a queued Close every repeat of
-    # the failing SQL would pile up a new server statement (each run is a fresh
-    # miss with a fresh name).
+  test "pipeline: a cache miss failing at Execute is cached and reused":
+    # Parse and Describe succeeded, so the statement is kept rather than
+    # Closed: each repeat Binds it again instead of Parsing a new one.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let failingSql = "SELECT $1::int / 0"
 
-      proc countLeaked(): Future[int] {.async.} =
+      proc serverCount(): Future[int] {.async.} =
         (
           await conn.simpleQuery(
             "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
@@ -3543,8 +3542,9 @@ suite "E2E: execInTransaction / queryInTransaction":
           )
         )[0].rows[0].getInt(0)
 
-      doAssert (await countLeaked()) == 0
+      doAssert (await serverCount()) == 0
 
+      var name = ""
       for i in 0 ..< 3:
         let p = newPipeline(conn)
         p.addQuery(failingSql, @[toPgParam(0)])
@@ -3554,24 +3554,23 @@ suite "E2E: execInTransaction / queryInTransaction":
         except PgQueryError:
           raised = true
         doAssert raised
-        # The queued Close rides along with the next extended-query op.
-        discard await conn.query("SELECT 1")
-        doAssert (await countLeaked()) == 0,
-          "failing scsMiss op leaked a server statement"
+        doAssert conn.stmtCache.hasKey(failingSql)
+        if i == 0:
+          name = conn.stmtCache[failingSql].name
+        doAssert conn.stmtCache[failingSql].name == name, "re-Parsed on a repeat"
+        doAssert conn.pendingStmtCloses.len == 0
+        doAssert (await serverCount()) == 1
 
       await conn.close()
 
     waitFor t()
 
-  test "pipeline: executeIsolated failing scsMiss op queues Close so no leak":
-    # executeIsolated counterpart: per-op SYNC still leaves the failed op's
-    # freshly Parsed statement on the server, and the cache-add happens only
-    # on success.
+  test "pipeline: executeIsolated caches a cache miss failing at Execute":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let failingSql = "SELECT 1 / $1::int"
 
-      proc countLeaked(): Future[int] {.async.} =
+      proc serverCount(): Future[int] {.async.} =
         (
           await conn.simpleQuery(
             "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
@@ -3579,16 +3578,20 @@ suite "E2E: execInTransaction / queryInTransaction":
           )
         )[0].rows[0].getInt(0)
 
-      doAssert (await countLeaked()) == 0
+      doAssert (await serverCount()) == 0
 
+      var name = ""
       for i in 0 ..< 3:
         let p = newPipeline(conn)
         p.addQuery(failingSql, @[toPgParam(0)])
         let ir = await p.executeIsolated()
         doAssert ir.errors[0] != nil
-        # The queued Close rides along with the next extended-query op.
-        discard await conn.query("SELECT 1")
-        doAssert (await countLeaked()) == 0, "executeIsolated leaked a server statement"
+        doAssert conn.stmtCache.hasKey(failingSql)
+        if i == 0:
+          name = conn.stmtCache[failingSql].name
+        doAssert conn.stmtCache[failingSql].name == name, "re-Parsed on a repeat"
+        doAssert conn.pendingStmtCloses.len == 0
+        doAssert (await serverCount()) == 1
 
       await conn.close()
 
@@ -4615,10 +4618,9 @@ suite "E2E: execInTransaction / queryInTransaction":
 
   test "pipeline: same SQL with mismatched OIDs in one batch":
     # Mid-batch OID change: op 0 Parses with int8, op 1 wants int4. The
-    # in-flight entry's OIDs don't match, so the in-flight stmt must be
-    # explicitly Closed and a fresh Parse emitted. The cache must end with
-    # only the latest (type-correct) stmt; the server must not retain the
-    # int8 stmt either.
+    # in-flight entry's OIDs don't match, so a fresh Parse is emitted. The
+    # cache must end with only the latest (type-correct) stmt, and the int8
+    # stmt is Closed at the head of the next operation, not mid-batch.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
@@ -4633,8 +4635,12 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert conn.stmtCache.len == 1
       let entry = conn.stmtCache[sql]
       doAssert entry.paramOids == @[OidInt4]
+      doAssert conn.pendingStmtCloses.len == 1
 
-      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      discard await conn.query("SELECT 1")
+      let pq = await conn.simpleQuery(
+        "SELECT name FROM pg_prepared_statements WHERE statement = '" & sql & "'"
+      )
       doAssert pq[0].rowCount == 1
       doAssert pq[0].rows[0].getStr(0) == entry.name
 
@@ -4644,10 +4650,9 @@ suite "E2E: execInTransaction / queryInTransaction":
 
   test "pipeline: same SQL three ops, OID changes after a share":
     # The hardest interleave: op 0 cacheMiss (int8) — op 1 cacheShare (int8)
-    # — op 2 OID mismatch (int4). The mid-batch Close must target op 0's
-    # stmt, op 0 must be marked superseded (so it isn't added to cache), and
-    # op 1's share is still valid (its Bind/Execute completes before the
-    # Close hits the wire).
+    # — op 2 OID mismatch (int4). Settling in op order caches op 0's stmt and
+    # then replaces it with op 2's, queueing op 0's Close for the next
+    # operation, so op 1's share is still valid when it runs.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
@@ -4663,10 +4668,88 @@ suite "E2E: execInTransaction / queryInTransaction":
 
       doAssert conn.stmtCache.len == 1
       doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
-      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert conn.pendingStmtCloses.len == 1
+
+      discard await conn.query("SELECT 1")
+      let pq = await conn.simpleQuery(
+        "SELECT name FROM pg_prepared_statements WHERE statement = '" & sql & "'"
+      )
       doAssert pq[0].rowCount == 1
       doAssert pq[0].rows[0].getStr(0) == conn.stmtCache[sql].name
 
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: a Close decided mid-batch survives a failing op":
+    # The backend skips everything after a failing op up to Sync. A Close the
+    # build wrote there would be skipped while its name was forgotten, so
+    # every statement the server still holds must be cached or queued.
+    proc untracked(conn: PgConnection): Future[seq[string]] {.async.} =
+      let rs = await conn.simpleQuery(
+        "SELECT name FROM pg_prepared_statements WHERE name LIKE '\\_sc\\_%' ORDER BY name"
+      )
+      for r in rs[0].rows:
+        let name = r.getStr(0)
+        var tracked = name in conn.pendingStmtCloses
+        for _, c in conn.stmtCache:
+          tracked = tracked or c.name == name
+        if not tracked:
+          result.add name
+
+    proc t() {.async.} =
+      # Eviction: the second miss needs room only after the failing op.
+      block:
+        let conn = await connect(plainConfig())
+        `stmtCacheCapacity=`(conn, 2) # the setter, not the field (privateAccess)
+        discard await conn.query("SELECT 1")
+        discard await conn.query("SELECT 2")
+        let p = newPipeline(conn)
+        p.addExec("SELECT 1/0")
+        p.addQuery("SELECT 3")
+        var raised = false
+        try:
+          discard await p.execute()
+        except PgQueryError:
+          raised = true
+        doAssert raised
+        doAssert (await conn.untracked()).len == 0
+        await conn.close()
+
+      # Superseded: the later same-SQL Parse sits after the failing op.
+      block:
+        let conn = await connect(plainConfig())
+        let p = newPipeline(conn)
+        p.addExec("SELECT $1", @[toPgParam(1'i32)])
+        p.addExec("SELECT 1/0")
+        p.addExec("SELECT $1", @[toPgParam("x")])
+        var raised = false
+        try:
+          discard await p.execute()
+        except PgQueryError:
+          raised = true
+        doAssert raised
+        doAssert (await conn.untracked()).len == 0
+        # The statement that ran before the failure is cached, not dropped.
+        doAssert conn.stmtCache["SELECT $1"].paramOids == @[OidInt4]
+        await conn.close()
+
+    waitFor t()
+
+  test "pipeline: an exec cache miss keeps the row description":
+    # A later query hitting the entry decodes rows from the cached fields; an
+    # exec that cached none would make that query return no rows.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 7::int4 AS v"
+      let p = newPipeline(conn)
+      p.addExec(sql)
+      discard await p.execute()
+      doAssert conn.stmtCache[sql].fields.len == 1
+
+      let r = await conn.query(sql)
+      doAssert r.rows.len == 1
+      doAssert r.rows[0].getInt(0) == 7
       await conn.close()
 
     waitFor t()
