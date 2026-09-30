@@ -529,6 +529,11 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## unlock failure reported only to `onAdvisoryUnlockFailed`, aborts the
   ## transaction the same way.
   ##
+  ## Do not issue transaction-control SQL (`COMMIT`, `ROLLBACK`, `END`,
+  ## `ABORT`, `PREPARE TRANSACTION`) inside the body: ending the transaction
+  ## yourself is not detected — later statements run in autocommit and the
+  ## macro still returns success.
+  ##
   ## Usage:
   ##   conn.withTransaction:
   ##     await conn.exec(...)

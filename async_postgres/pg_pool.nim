@@ -2313,6 +2313,9 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## **Warning:** Inside the body, use `conn.exec(...)` / `conn.query(...)`
   ## directly — not `pool.exec(...)` / `pool.query(...)`. Pool methods acquire
   ## a separate connection, so those statements would run outside this transaction.
+  ## Do not issue transaction-control SQL (`COMMIT`, `ROLLBACK`, ...) inside
+  ## the body either: as in the `PgConnection` overload, ending the
+  ## transaction yourself is not detected.
   ##
   ## **Timeout semantics:** The `timeout` argument applies *per-call* to
   ## BEGIN, COMMIT, and ROLLBACK only — it does **not** bound `body` operations
