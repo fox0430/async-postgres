@@ -28,17 +28,23 @@ permissions:
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
-    # macOS devel runs take about 30 minutes; Linux finishes in about 15.
-    timeout-minutes: ${{ matrix.os == 'macOS-latest' && 60 || 30 }}
+    # macOS and Windows are compile-heavy and slower than Linux: Linux
+    # finishes in about 15 minutes, macOS devel takes about 30.
+    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 30 || 60 }}
     strategy:
       matrix:
         os:
           - 'ubuntu-latest'
           - 'macOS-latest'
+          - 'windows-latest'
         nim-version:
           - '2.2.4'
           - 'stable'
           - 'devel'
+        exclude:
+          # setup-nim-action cannot install the devel compiler on Windows.
+          - os: 'windows-latest'
+            nim-version: 'devel'
 
     name: Tests on ${{ matrix.nim-version }} (${{ matrix.os }})
     steps:
@@ -74,7 +80,7 @@ jobs:
       - name: Generate test certificates
         run: bash tests/gen_certs.sh
 
-      # macOS runners have no Docker.
+      # macOS and Windows runners cannot run the Linux PostgreSQL container.
       - name: Start PostgreSQL
         id: start-psql
         if: runner.os == 'Linux'
@@ -90,6 +96,7 @@ jobs:
         wait: [start-psql, install-chronos]
 
       - name: Install async_postgres
+        shell: bash
         run: |
           rm -rf ~/.nimble/pkgs2/async_postgres-*
           nimble install -y
@@ -100,7 +107,7 @@ jobs:
         run: nimble test -y
         background: true
 
-      # No PostgreSQL on macOS: unit and mock-server tests only.
+      # No PostgreSQL on macOS/Windows: unit and mock-server tests only.
       - name: Run unit tests
         id: run-unit-tests
         if: runner.os != 'Linux'
@@ -112,9 +119,11 @@ jobs:
         run: nim check --hints:off --warningAsError:UnreachableCode --warningAsError:UnusedImport async_postgres.nim
 
       - name: Compile examples (asyncdispatch)
+        shell: bash
         run: for f in examples/*.nim; do nim c "$f"; done
 
       - name: Compile examples (chronos)
+        shell: bash
         run: for f in examples/*.nim; do nim c -d:asyncBackend=chronos "$f"; done
 
       # Platform-independent, so generate once.

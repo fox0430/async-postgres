@@ -2,7 +2,9 @@ import std/[unittest, strutils, os]
 
 import cert_fixtures
 from mock_pg_server import
-  buildPreV3Error, buildAuthCleartextPassword, buildAuthMD5Password, sendSegmentsNow
+  buildPreV3Error, buildAuthCleartextPassword, buildAuthMD5Password
+when defined(posix):
+  from mock_pg_server import sendSegmentsNow
 import ../async_postgres/[async_backend, pg_bytes, pg_protocol]
 from ../async_postgres/pg_auth import computeTlsServerEndpoint
 
@@ -627,52 +629,58 @@ suite "SSL negotiation - pre-TLS byte injection":
     check msgMatches
     check securityRefusal
 
-  test "split-write injection after 'S' response is rejected (CVE-2021-23214 family)":
-    # Two segments: caught by `socketHasPendingData` or, if they coalesce into
-    # chronos's read, by the `n > 1` path. Both must be sent before the client
-    # reads 'S': an injection arriving after the check is left to fail the TLS
-    # handshake instead (libpq checks the same way).
-    var raised = false
-    var msgMatches = false
-    var securityRefusal = false
+  # sendSegmentsNow is posix-only (raw segment control), so the split-write
+  # variant cannot be expressed here. The single-write test above still covers
+  # the rejection on every platform: chronos coalesces the bytes in `readOnce`,
+  # and asyncdispatch's kernel-buffer probe (`socketHasPendingData`) is
+  # implemented for Windows too.
+  when defined(posix):
+    test "split-write injection after 'S' response is rejected (CVE-2021-23214 family)":
+      # Two segments: caught by `socketHasPendingData` or, if they coalesce into
+      # chronos's read, by the `n > 1` path. Both must be sent before the client
+      # reads 'S': an injection arriving after the check is left to fail the TLS
+      # handshake instead (libpq checks the same way).
+      var raised = false
+      var msgMatches = false
+      var securityRefusal = false
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
+      proc testBody() {.async.} =
+        let ms = startMockServer()
 
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
+        proc serverHandler() {.async.} =
+          let st = await ms.accept()
+          try:
+            discard await readN(st, 8) # SSLRequest
+            sendSegmentsNow(st, [@[byte('S')], @[byte('X'), byte('Y'), byte('Z')]])
+          except CatchableError:
+            discard
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslRequire,
+        )
+
         try:
-          discard await readN(st, 8) # SSLRequest
-          sendSegmentsNow(st, [@[byte('S')], @[byte('X'), byte('Y'), byte('Z')]])
-        except CatchableError:
-          discard
-        await closeClient(st)
+          let conn = await connect(config)
+          await conn.close()
+        except PgError as e:
+          raised = true
+          msgMatches = "unencrypted data" in e.msg
+          securityRefusal = e.parent of PgSecurityError
 
-      let serverFut = serverHandler()
+        await serverFut
+        await closeServer(ms)
 
-      let config = ConnConfig(
-        host: "127.0.0.1",
-        port: ms.port,
-        user: "test",
-        database: "test",
-        sslMode: sslRequire,
-      )
-
-      try:
-        let conn = await connect(config)
-        await conn.close()
-      except PgError as e:
-        raised = true
-        msgMatches = "unencrypted data" in e.msg
-        securityRefusal = e.parent of PgSecurityError
-
-      await serverFut
-      await closeServer(ms)
-
-    waitFor testBody()
-    check raised
-    check msgMatches
-    check securityRefusal
+      waitFor testBody()
+      check raised
+      check msgMatches
+      check securityRefusal
 
   test "data trailing an 'N' reply is rejected in every sslmode":
     # One segment so chronos's `readOnce` pulls the extra bytes in.

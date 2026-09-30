@@ -41,6 +41,12 @@ when defined(posix):
   # POSIX socket option constants (used by liveness probes and TCP keepalive)
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
   var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
+elif defined(windows):
+  # `nativesockets` exposes `ioctlsocket` but not `FIONREAD` (winsock2.h:
+  # `#define FIONREAD _IOR('f', 127, u_long)`).
+  from std/nativesockets import SocketHandle, ioctlsocket
+
+  const FIONREAD = clong(0x4004667F)
 
 type
   RecvWatch* = ref object
@@ -51,13 +57,14 @@ type
     fut: Future[void]
 
   SocketPeek = enum
-    ## Outcome of a single non-blocking `MSG_PEEK` byte probe of a socket.
-    spData ## bytes are readable in the kernel buffer (`recv` > 0)
-    spClosed ## peer has closed: FIN/RST observed (`recv` == 0)
-    spIdle ## socket alive with no data ready (`EAGAIN`/`EWOULDBLOCK`)
+    ## Outcome of a single non-suspending socket probe (`MSG_PEEK` on POSIX,
+    ## `FIONREAD` on Windows).
+    spData ## bytes are readable in the kernel buffer
+    spClosed ## peer has closed: FIN/RST observed (`recv` == 0; POSIX only)
+    spIdle ## socket alive with no data ready (`EAGAIN`/`EWOULDBLOCK` on POSIX)
     spTransient ## transient kernel resource exhaustion (`ENOMEM`/`ENOBUFS`)
-    spError ## any other `recv` error
-    spUnavailable ## no transport handle, or probe unsupported (non-POSIX)
+    spError ## any other probe error
+    spUnavailable ## no transport handle
 
 # Host / address helpers
 
@@ -876,10 +883,11 @@ proc closeTransport*(conn: PgConnection) {.async.} =
 # Liveness probes
 
 proc peekSocket(conn: PgConnection): SocketPeek =
-  ## Single `recv(MSG_PEEK | MSG_DONTWAIT)` byte probe shared by the liveness
-  ## and pre-TLS-injection checks. Classifies the kernel's view of the socket
-  ## without consuming data or blocking; retries on `EINTR`. Callers decide
-  ## what each outcome means (see `socketHasFin` / `socketHasPendingData`).
+  ## Single-byte probe shared by the liveness and pre-TLS-injection checks:
+  ## `recv(MSG_PEEK | MSG_DONTWAIT)` on POSIX, `ioctlsocket(FIONREAD)` on
+  ## Windows. Classifies the kernel's view of the socket without consuming data
+  ## or blocking; retries on `EINTR`. Callers decide what each outcome means
+  ## (see `socketHasFin` / `socketHasPendingData`).
   when defined(posix):
     when hasChronos:
       if conn.transport.isNil:
@@ -906,10 +914,28 @@ proc peekSocket(conn: PgConnection): SocketPeek =
         return spTransient
       return spError
   else:
-    spUnavailable
+    # Windows has no `MSG_DONTWAIT`; `FIONREAD` reports how many bytes the
+    # kernel holds for the socket without consuming them and never suspends.
+    # It cannot tell FIN/RST apart from an idle socket, so `socketHasFin`
+    # stays conservative (false) on Windows.
+    when hasChronos:
+      if conn.transport.isNil:
+        return spUnavailable
+      let fd = SocketHandle(conn.transport.fd)
+    elif hasAsyncDispatch:
+      if conn.socket.isNil:
+        return spUnavailable
+      let fd = SocketHandle(conn.socket.getFd())
+    var pending: clong
+    if ioctlsocket(fd, FIONREAD, addr pending) != 0:
+      return spError
+    if pending > 0:
+      return spData
+    spIdle
 
 proc socketHasFin*(conn: PgConnection): bool =
-  ## POSIX half-open probe (``MSG_PEEK``): true if FIN/RST observed; false otherwise or unavailable.
+  ## Half-open probe: true if FIN/RST observed, false otherwise. The Windows
+  ## `FIONREAD` probe cannot observe FIN/RST, so this stays false there.
   case conn.peekSocket()
   of spClosed, spError:
     # FIN/RST observed, or an unclassified error we conservatively read as a
@@ -922,7 +948,8 @@ proc socketHasFin*(conn: PgConnection): bool =
     false
 
 proc socketHasPendingData*(conn: PgConnection): bool =
-  ## True if kernel has readable bytes (pre-TLS injection check; kernel buffer only).
+  ## True if the kernel has readable bytes (pre-TLS injection check; kernel
+  ## buffer only). `MSG_PEEK` on POSIX, `FIONREAD` on Windows.
   conn.peekSocket() == spData
 
 proc isConnected*(conn: PgConnection): bool =

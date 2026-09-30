@@ -12,7 +12,7 @@ import types, buffer_io, ssl, simple_query, dsn
 when defined(posix):
   import std/posix
 
-when hasAsyncDispatch:
+when hasAsyncDispatch and defined(posix):
   import std/asyncnet
 
 type AuthStep = enum

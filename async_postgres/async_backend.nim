@@ -66,29 +66,32 @@ when hasChronos:
         # escape, breaking "Never raises". `cancelTimer` cannot suspend.
         cancelTimer(timer)
 
-  proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
-    ## Register a file descriptor for read-readiness notifications on the event loop.
-    ## `cb` is called whenever the fd becomes readable.
-    let afd = AsyncFD(fd)
-    register2(afd).tryGet()
+  # chronos exposes raw-fd readiness registration only on selector-based
+  # (posix) dispatchers; the Windows IOCP dispatcher has no equivalent.
+  when defined(posix):
+    proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
+      ## Register a file descriptor for read-readiness notifications on the event loop.
+      ## `cb` is called whenever the fd becomes readable.
+      let afd = AsyncFD(fd)
+      register2(afd).tryGet()
 
-    try:
-      addReader2(
-        afd,
-        proc(udata: pointer) {.raises: [].} =
-          cb(),
-        nil,
-      )
-        .tryGet()
-    except CatchableError as e:
+      try:
+        addReader2(
+          afd,
+          proc(udata: pointer) {.raises: [].} =
+            cb(),
+          nil,
+        )
+          .tryGet()
+      except CatchableError as e:
+        discard unregister2(afd)
+        raise e
+
+    proc unregisterFdReader*(fd: cint) =
+      ## Remove a previously registered read-readiness watcher from the event loop.
+      let afd = AsyncFD(fd)
+      discard removeReader2(afd)
       discard unregister2(afd)
-      raise e
-
-  proc unregisterFdReader*(fd: cint) =
-    ## Remove a previously registered read-readiness watcher from the event loop.
-    let afd = AsyncFD(fd)
-    discard removeReader2(afd)
-    discard unregister2(afd)
 
   proc scheduleSoon*(cb: proc() {.gcsafe, raises: [].}) =
     ## Schedule `cb` to run on the next event loop tick.
