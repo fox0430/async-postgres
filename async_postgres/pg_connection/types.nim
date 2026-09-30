@@ -196,7 +196,8 @@ type
       ## has no keepalive path, so this and the timing options below are ignored there.
     keepAliveIdle*: int ## Seconds before first probe (0 = OS default). POSIX only.
     keepAliveInterval*: int ## Seconds between probes (0 = OS default). POSIX only.
-    keepAliveCount*: int ## Number of probes before giving up (0 = OS default). POSIX only.
+    keepAliveCount*: int
+      ## Number of probes before giving up (0 = OS default). POSIX only.
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     loadBalanceHosts*: LoadBalanceHosts
