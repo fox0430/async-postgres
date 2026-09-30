@@ -6007,21 +6007,43 @@ suite "Aborted pipeline send phase keeps evicted statements closable":
   ## `sendBuf` the abort discards — so the backend kept it allocated until
   ## session end.
 
-  test "a statement evicted by a failed build stays queued for Close":
+  test "a statement dropped by a failed build stays queued for Close":
+    let conn = mockConn()
+    conn.stmtCacheCapacity = 4
+    # Cached under other parameter types, so the build drops it before failing.
+    conn.addStmtCache("SELECT $1\0", CachedStmt(name: "_sc_1", paramOids: @[OidInt8]))
+    let p = newPipeline(conn)
+    # Straight into `ops`: the add-time SQL guard exists to keep an unencodable
+    # statement out of the send phase, so this state has to be built behind it.
+    p.ops.add PipelineOp(
+      kind: pokExec,
+      sql: "SELECT $1\0",
+      params: @[some(@[0'u8, 0, 0, 1])],
+      paramOids: @[OidInt4],
+    )
+
+    expect PgTypeError:
+      discard p.buildSendPhase(perOpSync = true)
+
+    check "SELECT $1\0" notin conn.stmtCache
+    # Queued, not staged: a pipeline build writes no Close after its head.
+    check conn.pendingStmtCloses == @["_sc_1"]
+    check conn.stagedStmtCloses.len == 0
+
+  test "a failed build evicts nothing":
+    # Eviction waits for settle time, so an aborted build has no Close to lose.
     let conn = mockConn()
     conn.stmtCacheCapacity = 1
     conn.addStmtCache("SELECT old", CachedStmt(name: "_sc_1"))
     let p = newPipeline(conn)
-    # Straight into `ops`: the add-time SQL guard exists to keep an unencodable
-    # statement out of the send phase, so this state has to be built behind it.
     p.ops.add PipelineOp(kind: pokExec, sql: "SELECT 1\0")
 
     expect PgTypeError:
       discard p.buildSendPhase(perOpSync = true)
 
-    check "SELECT old" notin conn.stmtCache
-    # Staged, not queued: the next build takes staged names back onto the queue.
-    check conn.stagedStmtCloses == @["_sc_1"]
+    check conn.lookupStmtCache("SELECT old").name == "_sc_1"
+    check conn.pendingStmtCloses.len == 0
+    check conn.stagedStmtCloses.len == 0
 
 suite "Cursor handle fields are read-only":
   test "external writes to handle fields do not compile":

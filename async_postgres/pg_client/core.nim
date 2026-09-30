@@ -92,6 +92,29 @@ func cacheHitColFmts*(
   else:
     cachedColFmts
 
+proc describedRowData*(
+    fields: var seq[FieldDescription], portal: bool, resultFormats: openArray[int16]
+): RowData =
+  ## RowData for a RowDescription. A portal Describe reports the formats Bind
+  ## negotiated; a statement Describe reports text for every column, so the
+  ## requested formats are stamped over ``fields``.
+  var cf: seq[int16]
+  var co: seq[int32]
+  if portal:
+    cf = newSeq[int16](fields.len)
+    co = newSeq[int32](fields.len)
+    for i in 0 ..< fields.len:
+      cf[i] = fields[i].formatCode
+      co[i] = fields[i].typeOid
+  elif resultFormats.len > 0:
+    cf = deriveColFmts(resultFormats, fields.len)
+    co = newSeq[int32](fields.len)
+    for i in 0 ..< fields.len:
+      co[i] = fields[i].typeOid
+      fields[i].formatCode = cf[i]
+  result = newRowData(int16(fields.len), cf, co)
+  result.fields = fields
+
 proc buildBeginSql*(opts: TransactionOptions): string =
   ## Build a BEGIN SQL statement with the specified transaction options
   ## (isolation level, access mode, deferrable mode).
@@ -141,6 +164,80 @@ const StmtCacheInvalidatingStates* = ["26000", "0A000"]
   ## SQLSTATEs that invalidate cached prepared statements (requires re-parse).
   ## ``42P18`` is absent on purpose: it is Parse-phase, so no cached statement
   ## can hit it.
+
+type
+  StmtCacheStatus* = enum
+    ## How an operation uses the statement cache, decided in the send phase.
+    scsUncached ## Caching disabled: unnamed Parse.
+    scsHit ## Binds a cache entry's statement (same SQL, matching OIDs).
+    scsShare
+      ## Binds a statement an earlier op of the same pipeline Parses (same SQL,
+      ## compatible OIDs). Skips Parse/Describe(Statement) and Describes the
+      ## portal instead.
+    scsMiss ## Parses a fresh named statement; `settleStmtCache` decides its fate.
+
+  MissFacts* = object
+    ## What the server confirmed about a cache miss's Parse and
+    ## Describe(Statement). The cache acts on these alone: whether the
+    ## operation failed says nothing about how far the server got.
+    parsed*: bool ## ``ParseComplete`` arrived: the statement exists.
+    described*: bool
+      ## ``RowDescription`` or ``NoData`` arrived: ``fields`` and ``paramOids``
+      ## are complete.
+    fields*: seq[FieldDescription]
+    paramOids*: seq[int32]
+
+func stmtCacheStatus*(cacheHit, cacheMiss: bool): StmtCacheStatus {.inline.} =
+  if cacheHit:
+    scsHit
+  elif cacheMiss:
+    scsMiss
+  else:
+    scsUncached
+
+proc observe*(facts: var MissFacts, msg: BackendMessage) =
+  ## Record a reply to the miss's Parse or Describe(Statement).
+  case msg.kind
+  of bmkParseComplete:
+    facts.parsed = true
+  of bmkParameterDescription:
+    facts.paramOids = msg.paramTypeOids
+  of bmkRowDescription:
+    facts.fields = msg.fields
+    facts.described = true
+  of bmkNoData:
+    facts.described = true
+  else:
+    discard
+
+proc settleStmtCache*(
+    conn: PgConnection,
+    sql, stmtName: string,
+    cache: StmtCacheStatus,
+    facts: sink MissFacts,
+    queryError: ref PgQueryError,
+) =
+  ## Statement-cache bookkeeping once an operation's ``ReadyForQuery``
+  ## arrives. A miss the server Described is cached even when Bind or Execute
+  ## then failed (a plan gone stale meanwhile fails its next hit, which
+  ## invalidates it); one it Parsed but did not Describe is Closed; one it
+  ## never Parsed is left alone, since the name may be someone else's (42P05).
+  case cache
+  of scsMiss:
+    if facts.described:
+      conn.addStmtCache(
+        sql,
+        CachedStmt(
+          name: stmtName, fields: move facts.fields, paramOids: move facts.paramOids
+        ),
+      )
+    elif facts.parsed:
+      conn.queueStmtClose(stmtName)
+  of scsHit, scsShare:
+    if queryError != nil and queryError.sqlState in StmtCacheInvalidatingStates:
+      conn.invalidateStmtCache(sql, stmtName)
+  of scsUncached:
+    discard
 
 proc backoffDelayMs*(opts: RetryOptions, attempt: int): int =
   ## Backoff ms for attempt (1-based). Exponential with jitter.
@@ -525,12 +622,12 @@ template queryRecvLoop*(
     resultFormats: openArray[int16],
     cacheHit, cacheMiss: bool,
     stmtName: string,
-    cachedFields: var seq[FieldDescription],
+    cachedFields: seq[FieldDescription],
     cachedColFmts: seq[int16],
     cachedColOids: seq[int32],
     qr: var QueryResult,
 ) =
-  var cachedParamOids: seq[int32]
+  var facts: MissFacts
 
   if cacheHit:
     # Take the cached field descriptions (already a private copy of the cache
@@ -548,44 +645,22 @@ template queryRecvLoop*(
       qr.data.fields = qr.fields
 
   conn.pumpUntilReady(qr.data, addr qr.rowCount):
+    if cacheMiss:
+      facts.observe(pumpMsg)
     case pumpMsg.kind
-    of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-      discard
-    of bmkParameterDescription:
-      if cacheMiss:
-        cachedParamOids = pumpMsg.paramTypeOids
     of bmkRowDescription:
-      var fields = pumpMsg.fields
-      var cf: seq[int16]
-      var co: seq[int32]
-      if cacheMiss:
-        cachedFields = pumpMsg.fields
-        if resultFormats.len > 0:
-          cf = deriveColFmts(resultFormats, fields.len)
-          co = newSeq[int32](fields.len)
-          for i in 0 ..< fields.len:
-            co[i] = fields[i].typeOid
-            fields[i].formatCode = cf[i]
-      qr.fields = fields
-      qr.data = newRowData(int16(qr.fields.len), cf, co)
-      qr.data.fields = qr.fields
-    of bmkNoData:
-      discard
+      # A cache hit sends no Describe; only the cache-disabled path Describes
+      # the portal.
+      qr.fields = pumpMsg.fields
+      qr.data = describedRowData(qr.fields, portal = not cacheMiss, resultFormats)
     of bmkCommandComplete:
       qr.commandTag = pumpMsg.commandTag
-    of bmkEmptyQueryResponse:
-      discard
     else:
       discard
   do:
-    if queryError != nil:
-      if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-        conn.invalidateStmtCache(sql, stmtName)
-    elif cacheMiss:
-      conn.addStmtCache(
-        sql,
-        CachedStmt(name: stmtName, fields: cachedFields, paramOids: cachedParamOids),
-      )
+    conn.settleStmtCache(
+      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), move facts, queryError
+    )
 
 template queryEachRecvLoop*(
     conn: PgConnection,
@@ -593,14 +668,14 @@ template queryEachRecvLoop*(
     resultFormats: openArray[int16],
     cacheHit, cacheMiss: bool,
     stmtName: string,
-    cachedFields: var seq[FieldDescription],
+    cachedFields: seq[FieldDescription],
     cachedColFmts: seq[int16],
     cachedColOids: seq[int32],
     callback: RowCallback,
     rowCount: var int64,
 ) =
   var rd: RowData
-  var cachedParamOids: seq[int32]
+  var facts: MissFacts
   var callbackError: ref CatchableError = nil
 
   if cacheHit:
@@ -625,43 +700,19 @@ template queryEachRecvLoop*(
     rowCount += 1
 
   conn.pumpUntilReady(rd, onRow, addr callbackError):
-    case pumpMsg.kind
-    of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-      discard
-    of bmkParameterDescription:
-      if cacheMiss:
-        cachedParamOids = pumpMsg.paramTypeOids
-    of bmkRowDescription:
+    if cacheMiss:
+      facts.observe(pumpMsg)
+    if pumpMsg.kind == bmkRowDescription:
       var fields = pumpMsg.fields
-      var cf: seq[int16]
-      var co: seq[int32]
-      if cacheMiss:
-        cachedFields = pumpMsg.fields
-        if resultFormats.len > 0:
-          cf = deriveColFmts(resultFormats, fields.len)
-          co = newSeq[int32](fields.len)
-          for i in 0 ..< fields.len:
-            co[i] = fields[i].typeOid
-            fields[i].formatCode = cf[i]
-      rd = newRowData(int16(fields.len), cf, co)
-      rd.fields = fields
-    of bmkNoData, bmkCommandComplete, bmkEmptyQueryResponse:
-      discard
-    else:
-      discard
+      rd = describedRowData(fields, portal = not cacheMiss, resultFormats)
   do:
-    # Callback errors take precedence over server errors: match the previous
-    # inline order and skip cache updates when the caller's callback failed.
+    # The statement's fate is the server's outcome, whatever the callback did.
+    conn.settleStmtCache(
+      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), move facts, queryError
+    )
+    # Callback errors take precedence over server errors.
     if callbackError != nil:
       raise callbackError
-    if queryError != nil:
-      if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-        conn.invalidateStmtCache(sql, stmtName)
-    elif cacheMiss:
-      conn.addStmtCache(
-        sql,
-        CachedStmt(name: stmtName, fields: cachedFields, paramOids: cachedParamOids),
-      )
 
 template execRecvLoop*(
     conn: PgConnection,
@@ -675,33 +726,14 @@ template execRecvLoop*(
   ## `skipDataRow = true`); this loop only exposes the `CommandComplete` tag
   ## via the `commandTag` out-parameter. Shared by `execImpl` (both
   ## overloads), `execInlineImpl`, and `execDirectRunImpl`.
-  var cachedFields: seq[FieldDescription]
-  var cachedParamOids: seq[int32]
+  var facts: MissFacts
 
   conn.pumpUntilReady:
-    case pumpMsg.kind
-    of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-      discard
-    of bmkParameterDescription:
-      if cacheMiss:
-        cachedParamOids = pumpMsg.paramTypeOids
-    of bmkRowDescription:
-      if cacheMiss:
-        cachedFields = pumpMsg.fields
-    of bmkNoData:
-      discard
-    of bmkCommandComplete:
+    if cacheMiss:
+      facts.observe(pumpMsg)
+    if pumpMsg.kind == bmkCommandComplete:
       commandTag = pumpMsg.commandTag
-    of bmkEmptyQueryResponse:
-      discard
-    else:
-      discard
   do:
-    if queryError != nil:
-      if cacheHit and queryError.sqlState in StmtCacheInvalidatingStates:
-        conn.invalidateStmtCache(sql, stmtName)
-    elif cacheMiss:
-      conn.addStmtCache(
-        sql,
-        CachedStmt(name: stmtName, fields: cachedFields, paramOids: cachedParamOids),
-      )
+    conn.settleStmtCache(
+      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), move facts, queryError
+    )

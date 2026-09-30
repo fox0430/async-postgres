@@ -15,20 +15,6 @@ type
     pokExec
     pokQuery
 
-  StmtCacheStatus = enum
-    ## Per-op prepared-statement cache disposition, decided in the send phase.
-    ## Mutually exclusive by construction — invalid combinations
-    ## (e.g. hit+miss, share+miss) cannot be represented.
-    scsUncached ## `stmtCacheCapacity == 0` path — anonymous (unnamed) Parse.
-    scsHit ## Reuses a persistent stmtCache entry (same SQL, matching OIDs).
-    scsShare
-      ## Reuses an in-flight prepared statement Parsed by an earlier op in
-      ## the same pipeline (same SQL, compatible OIDs). Skips Parse/Describe,
-      ## emits Bind + Describe(Portal) + Execute instead.
-    scsMiss
-      ## Fresh Parse. Added to the persistent cache on success unless later
-      ## demoted via `cacheSuperseded`.
-
   PipelineOp* = object
     kind: PipelineOpKind
     sql: string
@@ -49,11 +35,6 @@ type
     inlineCount: int32
     # Set during send phase
     cache: StmtCacheStatus
-    cacheSuperseded: bool
-      ## An `scsMiss` op whose freshly-Parsed prepared statement was Closed
-      ## mid-pipeline by a later same-SQL op with mismatched OIDs. The op's
-      ## results are still returned, but it is not added to the persistent
-      ## stmt cache (only the latest, type-correct stmt is).
     stmtName: string
 
   PipelineResultKind* = enum
@@ -247,21 +228,18 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
   ## `perOpSync` is true a Sync is appended after each op (executeIsolated);
   ## otherwise a single trailing Sync is appended (execute).
   ##
-  ## Statements this build drops from the persistent cache go through
-  ## `stageEvictedClose`, so an aborted build leaves them owed rather than only
-  ## in a buffer nothing sends.
+  ## Writes no statement ``Close`` after the queued ones at the head: behind a
+  ## failing op the backend would skip it up to ``Sync``. Statements this
+  ## build drops from the cache are queued for the next operation instead, and
+  ## it never pre-evicts (`addStmtCache` evicts at settle time).
   let conn = p.conn
   conn.beginSendBuf()
   var hasCachedStmts = false
-  var pendingCacheAdds = 0 # track pending additions for LRU eviction in pipeline
   var defaultFormats: seq[int16] # reused across ops when paramFormats is empty
   # Statements Parsed earlier in this same pipeline batch. Lets subsequent
-  # same-SQL ops reuse the just-allocated stmtName instead of re-Parsing —
-  # without this, N same-SQL ops on a cold cache would orphan N-1 server-side
-  # prepared statements (only the last addStmtCache would survive, the rest
-  # would leak until session end).
-  var inFlight:
-    Table[string, tuple[stmtName: string, paramOids: seq[int32], opIdx: int]]
+  # same-SQL ops reuse the just-allocated stmtName instead of Parsing (and
+  # then Closing) one statement per op.
+  var inFlight: Table[string, tuple[stmtName: string, paramOids: seq[int32]]]
 
   # Names the op an encode failure came from. The batch still fails whole (the
   # ops are positional on the wire), but the message says who caused it.
@@ -314,14 +292,12 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
       var cacheHit = cached != nil
       if cacheHit:
         # Stale parse-time OIDs would have the server read the bind bytes
-        # under the wrong types. Not ``invalidateIfOidMismatch``: its Close
-        # would miss this build's own staging.
+        # under the wrong types. The Close waits for the next operation: an
+        # earlier op of this batch may still Bind the statement.
         if not currentOidsMatch(cached.paramOids):
-          conn.removeStmtCache(p.ops[i].sql)
-          conn.stageEvictedClose(cached.name)
+          conn.invalidateStmtCache(p.ops[i].sql, cached.name)
           cacheHit = false
       p.ops[i].cache = scsUncached
-      p.ops[i].cacheSuperseded = false
 
       if cacheHit:
         p.ops[i].cache = scsHit
@@ -357,20 +333,13 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
               conn.addDescribe(dkPortal, "")
             conn.addExecute("", 0)
           else:
-            # Same SQL, different OIDs — close the in-flight stmt and demote its
-            # creator; the fall-through Parses again with the new OIDs.
-            conn.addClose(dkStatement, entry.stmtName)
-            p.ops[entry.opIdx].cacheSuperseded = true
-            dec pendingCacheAdds
+            # Same SQL, different OIDs: Parse again. Settled in op order, the
+            # newer statement replaces the older one in the cache, which
+            # queues the older one's Close.
             inFlight.del(p.ops[i].sql)
         if not shared:
           p.ops[i].cache = scsMiss
           p.ops[i].stmtName = conn.nextStmtName()
-          if conn.stmtCacheSize() + pendingCacheAdds >= conn.stmtCacheCapacity and
-              conn.stmtCacheSize() > 0:
-            let evicted = conn.evictStmtCache()
-            conn.stageEvictedClose(evicted.name)
-          inc pendingCacheAdds
           emitParse(p.ops[i].stmtName)
           conn.addDescribe(dkStatement, p.ops[i].stmtName)
           emitBind(p.ops[i].stmtName, p.ops[i].resultFormats)
@@ -383,7 +352,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
             else:
               @(p.ops[i].paramOids)
           inFlight[p.ops[i].sql] =
-            (stmtName: p.ops[i].stmtName, paramOids: recordedOids, opIdx: i)
+            (stmtName: p.ops[i].stmtName, paramOids: recordedOids)
       else:
         emitParse("")
         emitBind("", p.ops[i].resultFormats)
@@ -435,31 +404,16 @@ proc applyRowDescriptionToQr(
     cache: StmtCacheStatus,
     resultFormats: seq[int16],
 ) =
-  ## Populate qr.fields / qr.data from a RowDescription. Cache-aware:
-  ## scsMiss with explicit resultFormats derives per-column formats and
-  ## patches fields[j].formatCode; scsShare / scsUncached mirror the
-  ## server-sent Describe(Portal) formats. Shared by both pipeline
-  ## receive paths (executeImpl and executeIsolatedImpl) so the two cannot
-  ## drift on cache handling. `fields` is sunk so the RowDescription seq is
-  ## moved into qr.fields without an intermediate copy.
-  var cf: seq[int16]
-  var co: seq[int32]
-  if cache == scsMiss:
-    if resultFormats.len > 0:
-      cf = deriveColFmts(resultFormats, fields.len)
-      co = newSeq[int32](fields.len)
-      for j in 0 ..< fields.len:
-        co[j] = fields[j].typeOid
-        fields[j].formatCode = cf[j]
-  elif cache in {scsShare, scsUncached}:
-    cf = newSeq[int16](fields.len)
-    co = newSeq[int32](fields.len)
-    for j in 0 ..< fields.len:
-      cf[j] = fields[j].formatCode
-      co[j] = fields[j].typeOid
+  ## Populate qr.fields / qr.data from a RowDescription. scsMiss Describes the
+  ## statement; scsShare / scsUncached Describe the portal (see
+  ## `describedRowData`). Shared by both pipeline receive paths (executeImpl
+  ## and executeIsolatedImpl) so the two cannot drift on cache handling.
+  ## `fields` is sunk so the RowDescription seq is moved into qr.fields
+  ## without an intermediate copy.
   qr.fields = fields
-  qr.data = newRowData(int16(qr.fields.len), cf, co)
-  qr.data.fields = qr.fields
+  qr.data = describedRowData(
+    qr.fields, portal = cache in {scsShare, scsUncached}, resultFormats
+  )
 
 template settleSendFut(sendFut: untyped) =
   ## Cancel or drain sendFut so the Future never leaks on abnormal exit.
@@ -495,32 +449,9 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
   var results = newSeq[PipelineResult](p.ops.len)
   var activeOpIdx = 0
   var queryError: ref PgQueryError
-  var cachedFieldsPerOp: seq[seq[FieldDescription]] # lazy-init for cache misses
-  var cachedParamOidsPerOp: seq[seq[int32]] # lazy-init, parallel to ops
+  var missFacts = newSeq[MissFacts](p.ops.len)
 
   initPipelineResults(results, p, cachedStmts)
-
-  template addCacheMissOp(i: int) =
-    ## Add op `i`'s freshly-Parsed prepared statement to the cache. Shared by the
-    ## success path (all ops) and the error path (only ops before the failure),
-    ## so a mid-batch error cannot orphan the statements of ops that completed
-    ## before it. Skips ops superseded by a later same-SQL op (already Closed in
-    ## buildSendPhase).
-    if p.ops[i].cache == scsMiss and not p.ops[i].cacheSuperseded:
-      let fields =
-        if cachedFieldsPerOp.len > 0:
-          cachedFieldsPerOp[i]
-        else:
-          @[]
-      let paramOids =
-        if cachedParamOidsPerOp.len > 0:
-          cachedParamOidsPerOp[i]
-        else:
-          @[]
-      conn.addStmtCache(
-        p.ops[i].sql,
-        CachedStmt(name: p.ops[i].stmtName, fields: fields, paramOids: paramOids),
-      )
 
   try:
     block recvLoop:
@@ -533,24 +464,11 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
 
         while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
           let msg = opt.get
+          if activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsMiss:
+            missFacts[activeOpIdx].observe(msg)
           case msg.kind
-          of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-            discard
-          of bmkParameterDescription:
-            # Skip cacheSuperseded ops: their stmt was Closed mid-pipeline and
-            # will not be added to stmtCache, so the paramOids would be unused.
-            if activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsMiss and
-                not p.ops[activeOpIdx].cacheSuperseded:
-              if cachedParamOidsPerOp.len == 0:
-                cachedParamOidsPerOp = newSeq[seq[int32]](p.ops.len)
-              cachedParamOidsPerOp[activeOpIdx] = msg.paramTypeOids
           of bmkRowDescription:
             if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
-              if p.ops[activeOpIdx].cache == scsMiss and
-                  not p.ops[activeOpIdx].cacheSuperseded:
-                if cachedFieldsPerOp.len == 0:
-                  cachedFieldsPerOp = newSeq[seq[FieldDescription]](p.ops.len)
-                cachedFieldsPerOp[activeOpIdx] = msg.fields
               applyRowDescriptionToQr(
                 results[activeOpIdx].queryResult,
                 msg.fields,
@@ -560,8 +478,6 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
               # Update pointers for nextMessage
               rowData = results[activeOpIdx].queryResult.data
               rowCount = addr results[activeOpIdx].queryResult.rowCount
-          of bmkNoData:
-            discard
           of bmkCommandComplete:
             if activeOpIdx < p.ops.len:
               if p.ops[activeOpIdx].kind == pokExec:
@@ -592,43 +508,21 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
             conn.txStatus = msg.txStatus
             if conn.state != csClosed:
               conn.markReady()
-            if queryError != nil:
-              # The batch ran as one implicit transaction that aborted, but
-              # prepared statements created by Parse survive the rollback (they
-              # are session state, not transactional data). Every op before the
-              # failing one (activeOpIdx) was fully Parse/Describe/Execute'd, so
-              # its server statement still exists — recover each cache-miss into
-              # the cache instead of orphaning it. The failing op and everything
-              # after it were skipped by the server until Sync, so leave them
-              # alone (the failing op's stmt may never have been Parsed).
-              for i in 0 ..< activeOpIdx:
-                addCacheMissOp(i)
-              # Invalidate only the *failing* op's cache entry for 26000
-              # (statement gone) / 0A000 (cached plan result type changed after
-              # DDL) — not every cache hit in the batch. Ride a server-side
-              # Close along on the next operation so a still-live statement
-              # (0A000) is reclaimed instead of leaked; Close of an already-gone
-              # statement (26000) is a harmless no-op. See
-              # StmtCacheInvalidatingStates. scsShare shares the sql/stmtName of
-              # an earlier scsMiss whose entry addCacheMissOp just added above.
-              if queryError.sqlState in StmtCacheInvalidatingStates and
-                  activeOpIdx < p.ops.len and
-                  p.ops[activeOpIdx].cache in {scsHit, scsShare}:
-                conn.invalidateStmtCache(
-                  p.ops[activeOpIdx].sql, p.ops[activeOpIdx].stmtName
-                )
-              elif activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsMiss and
-                  not p.ops[activeOpIdx].cacheSuperseded:
-                # Cache-miss stmts are cached only on success, so a failed
-                # op's stmt is orphaned unless Closed. Close of an unparsed
-                # or already-Closed stmt is a harmless no-op.
-                conn.queueStmtClose(p.ops[activeOpIdx].stmtName)
-              raise queryError
-            # Cache misses: add to cache (skip ops superseded by a later
-            # same-SQL op in this same pipeline — those stmts were already
-            # Closed in buildSendPhase).
+            # Prepared statements survive the batch's implicit rollback, so
+            # every op settles on its own facts. In op order, so a later
+            # same-SQL miss replaces an earlier one. Only the failing op
+            # (activeOpIdx) sees the error; the backend skipped the ops after
+            # it, whose facts are empty.
             for i in 0 ..< p.ops.len:
-              addCacheMissOp(i)
+              conn.settleStmtCache(
+                p.ops[i].sql,
+                p.ops[i].stmtName,
+                p.ops[i].cache,
+                move missFacts[i],
+                if i == activeOpIdx: queryError else: nil,
+              )
+            if queryError != nil:
+              raise queryError
             break recvLoop
           else:
             discard
@@ -699,8 +593,7 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
   try:
     for opIdx in 0 ..< p.ops.len:
       var opError: ref PgQueryError
-      var cachedFields: seq[FieldDescription]
-      var cachedParamOids: seq[int32]
+      var facts: MissFacts
 
       block opRecv:
         while true:
@@ -712,17 +605,11 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
 
           while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
             let msg = opt.get
+            if p.ops[opIdx].cache == scsMiss:
+              facts.observe(msg)
             case msg.kind
-            of bmkParseComplete, bmkBindComplete, bmkCloseComplete:
-              discard
-            of bmkParameterDescription:
-              # Skip cacheSuperseded ops — see executeImpl for rationale.
-              if p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
-                cachedParamOids = msg.paramTypeOids
             of bmkRowDescription:
               if p.ops[opIdx].kind == pokQuery:
-                if p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
-                  cachedFields = msg.fields
                 applyRowDescriptionToQr(
                   results[opIdx].queryResult,
                   msg.fields,
@@ -731,41 +618,25 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                 )
                 rowData = results[opIdx].queryResult.data
                 rowCount = addr results[opIdx].queryResult.rowCount
-            of bmkNoData:
-              discard
             of bmkCommandComplete:
               if p.ops[opIdx].kind == pokExec:
                 results[opIdx].commandResult = initCommandResult(msg.commandTag)
               else:
                 results[opIdx].queryResult.commandTag = msg.commandTag
-            of bmkEmptyQueryResponse:
-              discard
             of bmkErrorResponse:
               if opError == nil:
                 opError = newPgQueryError(msg.errorFields)
             of bmkReadyForQuery:
               conn.txStatus = msg.txStatus
+              conn.settleStmtCache(
+                p.ops[opIdx].sql,
+                p.ops[opIdx].stmtName,
+                p.ops[opIdx].cache,
+                move facts,
+                opError,
+              )
               if opError != nil:
-                if opError.sqlState in StmtCacheInvalidatingStates and
-                    p.ops[opIdx].cache in {scsHit, scsShare}:
-                  # Mirror executeImpl: ride a Close along so 0A000 doesn't
-                  # leak the still-live server statement. For scsShare, the
-                  # sharing scsMiss already added the entry at its own
-                  # ReadyForQuery.
-                  conn.invalidateStmtCache(p.ops[opIdx].sql, p.ops[opIdx].stmtName)
-                elif p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
-                  # Mirror executeImpl: Close the orphaned cache-miss stmt.
-                  conn.queueStmtClose(p.ops[opIdx].stmtName)
                 errors[opIdx] = opError
-              elif p.ops[opIdx].cache == scsMiss and not p.ops[opIdx].cacheSuperseded:
-                conn.addStmtCache(
-                  p.ops[opIdx].sql,
-                  CachedStmt(
-                    name: p.ops[opIdx].stmtName,
-                    fields: cachedFields,
-                    paramOids: cachedParamOids,
-                  ),
-                )
               break opRecv
             else:
               discard
