@@ -25,7 +25,8 @@ proc ensureTestCerts*(): bool =
   if findExe("openssl").len == 0:
     return false
   let script = currentSourcePath().parentDir / "gen_certs.sh"
-  let rc = execCmd("bash " & quoteShell(script))
+  # Not a bare `bash`: see runSuite in async_postgres.nimble.
+  let rc = execCmd(quoteShell(findExe("bash")) & " " & quoteShell(script))
   if rc != 0 or not certsPresent():
     raise newException(
       IOError,
