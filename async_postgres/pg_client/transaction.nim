@@ -167,6 +167,49 @@ proc buildTxBeginAndTimeout*(
       {.error: `errMsg`.}
   (beginSql, txTimeout)
 
+proc checkCommitTag(conn: PgConnection, tag: string) =
+  ## Raise when COMMIT came back as ROLLBACK: the server ends an aborted
+  ## transaction that way, without an ErrorResponse, so one is synthesized.
+  ## Same SQLSTATE as the server's own answer to RELEASE SAVEPOINT in that state.
+  ## The error that aborted the transaction, when known, becomes its `parent`.
+  if tag == "ROLLBACK":
+    let causeFields = conn.txAbortFields
+    conn.txAbortFields.setLen(0)
+    let causeMsg = getErrorField(causeFields, 'M')
+    let causeState = getErrorField(causeFields, 'C')
+    var fields = @[
+      ErrorField(code: 'S', value: "ERROR"),
+      ErrorField(code: 'V', value: "ERROR"),
+      ErrorField(code: 'C', value: SqlStateInFailedSqlTransaction),
+      ErrorField(
+        code: 'M', value: "COMMIT rolled back a transaction aborted by an earlier error"
+      ),
+    ]
+    if causeMsg.len > 0 and causeState.len > 0:
+      fields.add ErrorField(
+        code: 'D', value: "Aborted by: " & causeMsg & " (SQLSTATE " & causeState & ")"
+      )
+    fields.add ErrorField(
+      code: 'H',
+      value:
+        "An earlier statement failed and its error did not propagate: it was " &
+        "caught without re-raising (use withSavepoint to recover from an error " &
+        "and continue), returned in executeIsolated's per-op errors, or " &
+        "reported only to a tracer hook, as withAdvisoryLock does with an " &
+        "unlock failure (onAdvisoryUnlockFailed).",
+    )
+    let err = newPgQueryError(fields)
+    if causeFields.len > 0:
+      err.parent = newPgQueryError(causeFields)
+    raise err
+
+proc commitTx*(conn: PgConnection, timeout: Duration): Future[void] {.async.} =
+  ## COMMIT for the conn/pool/cluster transaction macros. `checkCommitTag` runs
+  ## inside the trace, so `onQueryEnd` reports the rollback the caller sees.
+  var tag: string
+  tracedSimpleExec(conn, "COMMIT", timeout, "COMMIT timed out", tag):
+    conn.checkCommitTag(tag)
+
 proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   ## Build the shared `onCleanupSkipped`-wired ROLLBACK cleanup used on a failed
   ## attempt by the conn/pool/cluster transaction macros: skip ROLLBACK on an
@@ -347,6 +390,7 @@ proc buildRetryTxLoop*(
   let invalidateCancelSym = bindSym"invalidateOnCancel"
 
   let cleanup = buildRollbackCleanup(connSym, txTimeout)
+  let commitSym = bindSym"commitTx"
 
   quote:
     var `attemptSym` = 0
@@ -355,7 +399,7 @@ proc buildRetryTxLoop*(
       try:
         discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
         `body`
-        discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
+        await `commitSym`(`connSym`, `txTimeout`)
         break
       except CancelledError as `cancelSym`:
         # Never retry cancel; invalidate and let outer release tear down transport.
@@ -476,6 +520,15 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## On exception, ROLLBACK is issued automatically.
   ## Using `return` inside the body is a compile-time error.
   ##
+  ## A body that catches a query error and carries on leaves the transaction
+  ## aborted: the server answers COMMIT with ROLLBACK, raised here as
+  ## `PgQueryError` with SQLSTATE `25P02` (`SqlStateInFailedSqlTransaction`)
+  ## and, when known, the error that aborted the transaction as `parent`. Use
+  ## `withSavepoint` to recover from an error inside the body. An error
+  ## `executeIsolated` returns in its per-op `errors`, or a `withAdvisoryLock`
+  ## unlock failure reported only to `onAdvisoryUnlockFailed`, aborts the
+  ## transaction the same way.
+  ##
   ## Usage:
   ##   conn.withTransaction:
   ##     await conn.exec(...)
@@ -534,13 +587,14 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let cancelSym = genSym(nskLet, "cancel")
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
+  let commitSym = bindSym"commitTx"
   result = quote:
     let `connSym` = `connExpr`
     `connSym`.checkTxIdle()
     try:
       discard await `connSym`.simpleExec(`beginSql`, timeout = `txTimeout`)
       `body`
-      discard await `connSym`.simpleExec("COMMIT", timeout = `txTimeout`)
+      await `commitSym`(`connSym`, `txTimeout`)
     except CancelledError as `cancelSym`:
       # Skip ROLLBACK on cancel; invalidate instead.
       `invalidateCancelSym`(`connSym`, releaseTransport = false)
@@ -589,7 +643,9 @@ macro withTransactionRetry*(
   ## (`csReady` + `tsIdle`) after cleanup. This holds both when the body raised
   ## (ROLLBACK restores `tsIdle`) and when COMMIT itself raised a serialization
   ## failure (PostgreSQL has already ended the transaction). Between attempts
-  ## the macro sleeps for `backoffDelayMs`.
+  ## the macro sleeps for `backoffDelayMs`. A COMMIT the server rolled back
+  ## (`25P02`, see `withTransaction`) is retried when the error that aborted the
+  ## transaction, its `parent`, is retryable (see `isRetryableTxError`).
   var body: NimNode
   var beginSql: NimNode
   var txTimeout: NimNode
@@ -745,6 +801,8 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single
   ## wall-clock deadline that covers BEGIN, the body, and COMMIT together.
   ## Unlike `withTransaction`, the timeout does not reset between calls.
+  ## A COMMIT the server rolled back raises `PgQueryError` (`25P02`), as in
+  ## `withTransaction`.
   ##
   ## Usage:
   ##   conn.withTransactionDeadline(seconds(5)):
@@ -772,7 +830,8 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   ##
   ## **On other exceptions** from the body: ROLLBACK is issued with
   ## `rollbackGrace` (5s) as a per-call timeout so cleanup runs even
-  ## past the main deadline. A failed ROLLBACK is swallowed. A `Defect`
+  ## past the main deadline. A failed ROLLBACK is swallowed. A COMMIT the
+  ## server rolled back raises as in `withTransaction`. A `Defect`
   ## raised by the body is re-raised wrapped in `PgError` (the Defect is
   ## `parent`): the body runs in a separate async frame, where chronos
   ## re-raises raw Defects eagerly — only a same-frame Defect is captured.
@@ -807,6 +866,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
+  let commitSym = bindSym"commitTx"
   let awaitAndTimeout = buildDeadlineAwaitAndTimeout(
     connSym, bodyFnSym, totalDurSym, "withTransactionDeadline exceeded", bodyCleanup
   )
@@ -821,9 +881,7 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
           `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
         )
         `body`
-        discard await `connSym`.simpleExec(
-          "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
-        )
+        await `commitSym`(`connSym`, `remainingSym`(`deadlineMomentSym`))
       except Defect as `dSym`:
         # Wrap in `PgError` (parent = Defect) so chronos doesn't re-raise the
         # raw Defect eagerly and the ROLLBACK cleanup runs exactly once.
@@ -859,8 +917,10 @@ macro withTransactionRetryDeadline*(
   ##
   ## **On a retryable body/COMMIT error:** ROLLBACK runs with `rollbackGrace`,
   ## and the transaction is retried if the connection is back to `csReady`/`tsIdle`
-  ## and budget remains. **Idempotency:** `body` runs once per attempt; non-database
-  ## side effects repeat. Using `return` inside the body is a compile-time error.
+  ## and budget remains. A COMMIT the server rolled back (`25P02`) is retried as
+  ## in `withTransactionRetry`. **Idempotency:** `body` runs once per attempt;
+  ## non-database side effects repeat. Using `return` inside the body is a
+  ## compile-time error.
   ##
   ## **On a `Defect` raised by the body:** re-raised wrapped in `PgError`
   ## (`parent` = Defect), never retried; see `withTransactionDeadline`.
@@ -894,6 +954,7 @@ macro withTransactionRetryDeadline*(
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
+  let commitSym = bindSym"commitTx"
   let retireSym = bindSym"retireOnTimeout"
   let timeoutCleanup = bodyCleanup.copyNimTree()
   # A body that could not be cancelled still holds the connection, so retire it
@@ -926,9 +987,7 @@ macro withTransactionRetryDeadline*(
           `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
         )
         `body`
-        discard await `connSym`.simpleExec(
-          "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
-        )
+        await `commitSym`(`connSym`, `remainingSym`(`deadlineMomentSym`))
       except Defect as `dSym`:
         # See withTransactionDeadline: wrap the Defect so the ROLLBACK cleanup
         # runs exactly once.

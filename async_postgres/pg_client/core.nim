@@ -123,11 +123,17 @@ proc buildBeginSql*(opts: TransactionOptions): string =
     result.add " NOT DEFERRABLE"
 
 proc isRetryableTxError*(e: ref CatchableError, states: openArray[string]): bool =
-  ## Whether `e` is a `PgQueryError` whose SQLSTATE is in `states`.
+  ## Whether `e` is a `PgQueryError` whose SQLSTATE is in `states`. The `25P02`
+  ## a transaction macro raises for a COMMIT answered with ROLLBACK also
+  ## qualifies when its `parent`, the error that aborted the transaction, does.
   ## Non-`PgQueryError` failures (connection drops, timeouts) are never
   ## retryable here: they leave the connection unusable for a fresh attempt.
   if e of PgQueryError:
-    (ref PgQueryError)(e).sqlState in states
+    let qe = (ref PgQueryError)(e)
+    qe.sqlState in states or (
+      qe.sqlState == SqlStateInFailedSqlTransaction and qe.parent != nil and
+      qe.parent of PgQueryError and (ref PgQueryError)(qe.parent).sqlState in states
+    )
   else:
     false
 

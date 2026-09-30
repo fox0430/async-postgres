@@ -564,10 +564,18 @@ proc nextMessage*(
     if res.message.kind == bmkErrorResponse and
         isSessionFatal(errorSeverity(res.message.errorFields)):
       conn.fatalServerError = newPgQueryError(res.message.errorFields)
+    if res.message.kind == bmkErrorResponse and conn.txStatus != tsInFailedTransaction:
+      # The error that fails a block arrives before the status says so (in the
+      # block, or batched with its BEGIN); later ones only report 25P02.
+      conn.txAbortFields = res.message.errorFields
     if res.message.kind == bmkReadyForQuery:
       # The session answered after all, so that FATAL did not end it (a
       # proxy's; the server closes after its own).
       conn.fatalServerError = nil
+      if conn.txStatus != tsInFailedTransaction and
+          res.message.txStatus != tsInFailedTransaction:
+        # No failed block on either side: nothing left to name as a cause.
+        conn.txAbortFields.setLen(0)
       # `unsyncedWrite` is untouched — this reply belongs to a sync point that
       # preceded those writes, so only a later one (in `noteWrite`) can end them.
       conn.settlePendingSync()

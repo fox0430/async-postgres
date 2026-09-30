@@ -310,6 +310,28 @@ suite "E2E: Transaction":
     )
     # non-PgQueryError is never retryable
     doAssert not isRetryableTxError((ref ValueError)(msg: "x"), opts.retryableStates)
+    # a 25P02 is judged by the error that aborted the transaction (its parent)
+    doAssert isRetryableTxError(
+      (ref PgQueryError)(
+        sqlState: "25P02", parent: (ref PgQueryError)(sqlState: "40001")
+      ),
+      opts.retryableStates,
+    )
+    doAssert not isRetryableTxError(
+      (ref PgQueryError)(
+        sqlState: "25P02", parent: (ref PgQueryError)(sqlState: "22012")
+      ),
+      opts.retryableStates,
+    )
+    doAssert not isRetryableTxError(
+      (ref PgQueryError)(sqlState: "25P02"), opts.retryableStates
+    )
+    doAssert not isRetryableTxError(
+      (ref PgQueryError)(
+        sqlState: "23505", parent: (ref PgQueryError)(sqlState: "40001")
+      ),
+      opts.retryableStates,
+    )
     # exponential growth, capped, jitter off => deterministic
     let g =
       RetryOptions(baseDelayMs: 10, maxDelayMs: 100, multiplier: 2.0, jitter: false)
@@ -2948,6 +2970,484 @@ suite "E2E: Deadline-bounded Transaction":
       conn.tracer = nil
       discard await conn.exec("DROP TABLE sp_injection_probe")
       await conn.close()
+
+    waitFor t()
+
+proc swallowQueryError(conn: PgConnection) {.async.} =
+  ## Fail a statement and swallow the error, leaving the transaction aborted.
+  try:
+    discard await conn.exec("SELECT 1/0")
+  except PgQueryError:
+    discard
+
+const serializationFailureSql =
+  "DO $$BEGIN RAISE EXCEPTION 'conflict' USING ERRCODE = 'serialization_failure'; END$$"
+
+proc swallowSerializationFailure(conn: PgConnection) {.async.} =
+  ## Like `swallowQueryError`, with a retryable 40001.
+  try:
+    discard await conn.exec(serializationFailureSql)
+  except PgQueryError:
+    discard
+
+proc causeState(e: ref PgQueryError): string =
+  ## SQLSTATE of the error a synthesized 25P02 names as its parent.
+  doAssert e.parent != nil and e.parent of PgQueryError
+  (ref PgQueryError)(e.parent).sqlState
+
+proc newRollbackTracedPool(): Future[(PgPool, ref seq[string])] {.async.} =
+  ## A single-connection pool recording every ROLLBACK it sends.
+  var cfg = plainConfig()
+  let (tracer, rollbacks) = rollbackTracer()
+  cfg.tracer = tracer
+  let pool = await newPool(PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1))
+  return (pool, rollbacks)
+
+proc checkKeptWithoutRollback(
+    pool: PgPool, used: PgConnection, rollbacks: ref seq[string]
+) {.async.} =
+  ## After a 25P02 the server has already ended the transaction: no ROLLBACK is
+  ## sent and the same connection goes back to the pool ready. With `maxSize: 1`
+  ## a discarded connection would come back as a different ref.
+  doAssert used != nil
+  doAssert rollbacks[].len == 0, "ROLLBACK sent " & $rollbacks[].len & " time(s)"
+  doAssert pool.activeCount == 0
+  let c = await pool.acquire()
+  doAssert c == used, "the connection must be reused, not replaced"
+  doAssert c.state == csReady
+  doAssert c.txStatus == tsIdle
+  c.release()
+
+suite "E2E: COMMIT answered with ROLLBACK":
+  test "withTransaction raises 25P02 and skips ROLLBACK":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_commit_rb")
+      discard await conn.exec("CREATE TABLE test_commit_rb (val text)")
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      var lastEnd: TraceQueryEndData
+      tracer.onQueryEnd = proc(
+          ctx: TraceContext, c: PgConnection, data: TraceQueryEndData
+      ) {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          lastEnd = data
+      conn.tracer = tracer
+
+      var err: ref PgQueryError = nil
+      try:
+        conn.withTransaction:
+          discard await conn.exec("INSERT INTO test_commit_rb VALUES ('lost')")
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        err = e
+
+      doAssert err != nil
+      doAssert err.sqlState == SqlStateInFailedSqlTransaction
+      doAssert err.errorField('C') == SqlStateInFailedSqlTransaction
+      doAssert err.severity == "ERROR"
+      doAssert err.hint.len > 0
+      doAssert err.msg.startsWith("ERROR: COMMIT rolled back")
+      doAssert err.causeState == "22012"
+      doAssert err.detail == "Aborted by: division by zero (SQLSTATE 22012)"
+      doAssert retryAdvice(err) == raUnclear
+      # Taken by the COMMIT, not left on the connection.
+      doAssert conn.txAbortFields.len == 0
+      doAssert "COMMIT" in queries
+      doAssert "ROLLBACK" notin queries
+      # COMMIT is the last traced statement; its end hook sees the failure.
+      doAssert queries[^1] == "COMMIT"
+      doAssert lastEnd.err of PgQueryError
+      doAssert (ref PgQueryError)(lastEnd.err).sqlState == SqlStateInFailedSqlTransaction
+      doAssert conn.txStatus == tsIdle
+      conn.tracer = nil
+      let res = await conn.query("SELECT val FROM test_commit_rb")
+      doAssert res.rows.len == 0
+
+      discard await conn.exec("DROP TABLE test_commit_rb")
+      await conn.close()
+
+    waitFor t()
+
+  test "25P02 names the error that aborted the transaction":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var err: ref PgQueryError = nil
+      try:
+        conn.withTransaction:
+          # Recovered by the savepoint, so it did not abort the transaction.
+          try:
+            conn.withSavepoint:
+              discard await conn.exec("SELECT 'x'::int")
+          except PgQueryError:
+            discard
+          await conn.swallowQueryError()
+          # Rejected with the server's own 25P02, which must not replace the cause.
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        err = e
+
+      doAssert err != nil
+      doAssert err.sqlState == SqlStateInFailedSqlTransaction
+      doAssert err.causeState == "22012"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "25P02 names the cause when BEGIN was batched with the failing statement":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var err: ref PgQueryError = nil
+      try:
+        conn.withTransaction:
+          # A cause from an earlier block that must not be reported.
+          await conn.swallowSerializationFailure()
+          discard await conn.simpleExec("ROLLBACK")
+          # Fails a new block straight from idle.
+          try:
+            discard await conn.simpleQuery("BEGIN; SELECT 1/0")
+          except PgQueryError:
+            discard
+      except PgQueryError as e:
+        err = e
+
+      doAssert err != nil
+      doAssert err.sqlState == SqlStateInFailedSqlTransaction
+      doAssert err.causeState == "22012"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      var sqlState = ""
+      try:
+        conn.withTransactionRetry(RetryOptions(maxAttempts: 3, baseDelayMs: 1)):
+          inc attempts
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry retries 25P02 when listed":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_commit_rb_retry")
+      discard await conn.exec("CREATE TABLE test_commit_rb_retry (val text)")
+
+      var attempts = 0
+      conn.withTransactionRetry(
+        RetryOptions(
+          maxAttempts: 3,
+          baseDelayMs: 1,
+          retryableStates: @[SqlStateInFailedSqlTransaction],
+        )
+      ):
+        inc attempts
+        discard await conn.exec("INSERT INTO test_commit_rb_retry VALUES ('ok')")
+        if attempts == 1:
+          await conn.swallowQueryError()
+
+      doAssert attempts == 2
+      let res = await conn.query("SELECT val FROM test_commit_rb_retry")
+      doAssert res.rows.len == 1
+
+      discard await conn.exec("DROP TABLE test_commit_rb_retry")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry retries 25P02 when its cause is retryable":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_commit_rb_cause")
+      discard await conn.exec("CREATE TABLE test_commit_rb_cause (val text)")
+
+      var attempts = 0
+      var ignored = 0
+      conn.withTransactionRetry(RetryOptions(maxAttempts: 3, baseDelayMs: 1)):
+        inc attempts
+        let p = newPipeline(conn)
+        # First, so the INSERT's own 25P02 must not replace it as the cause.
+        if attempts == 1:
+          p.addExec(serializationFailureSql)
+        p.addExec("INSERT INTO test_commit_rb_cause VALUES ('ok')")
+        let ir = await p.executeIsolated()
+        for e in ir.errors:
+          if e != nil:
+            inc ignored
+
+      doAssert attempts == 2
+      doAssert ignored == 2
+      let res = await conn.query("SELECT val FROM test_commit_rb_cause")
+      doAssert res.rows.len == 1
+
+      discard await conn.exec("DROP TABLE test_commit_rb_cause")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline raises 25P02":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var sqlState = ""
+      try:
+        conn.withTransactionDeadline(seconds(5)):
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      var sqlState = ""
+      try:
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1), seconds(5)
+        ):
+          inc attempts
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline retries 25P02 when its cause is retryable":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      conn.withTransactionRetryDeadline(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1), seconds(5)
+      ):
+        inc attempts
+        if attempts == 1:
+          await conn.swallowSerializationFailure()
+
+      doAssert attempts == 2
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pool.withTransaction raises 25P02 and keeps the connection":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_commit_rb")
+      discard await pool.exec("CREATE TABLE test_pool_commit_rb (val text)")
+
+      var used: PgConnection = nil
+      var sqlState = ""
+      try:
+        pool.withTransaction(conn):
+          used = conn
+          discard await conn.exec("INSERT INTO test_pool_commit_rb VALUES ('lost')")
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+      let res = await pool.query("SELECT val FROM test_pool_commit_rb")
+      doAssert res.rows.len == 0
+
+      discard await pool.exec("DROP TABLE test_pool_commit_rb")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetry does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var attempts = 0
+      var sqlState = ""
+      try:
+        pool.withTransactionRetry(RetryOptions(maxAttempts: 3, baseDelayMs: 1), conn):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline raises 25P02 and keeps the connection":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var sqlState = ""
+      try:
+        pool.withTransactionDeadline(conn, seconds(5)):
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var attempts = 0
+      var sqlState = ""
+      try:
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1), conn, seconds(5)
+        ):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline retries 25P02 when its cause is retryable":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var attempts = 0
+      pool.withTransactionRetryDeadline(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1), conn, seconds(5)
+      ):
+        inc attempts
+        used = conn
+        if attempts == 1:
+          await conn.swallowSerializationFailure()
+
+      doAssert attempts == 2
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "cluster transaction macros raise 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.targetSessionAttrs = tsaReadWrite
+      let (tracer, rollbacks) = rollbackTracer()
+      cfg.tracer = tracer
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+      )
+      let pool = cluster.primaryPool
+      let retryOpts = RetryOptions(maxAttempts: 3, baseDelayMs: 1)
+
+      var used: PgConnection = nil
+      var attempts = 0
+      var sqlState = ""
+      try:
+        cluster.withTransaction(conn):
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction, "withTransaction"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      sqlState = ""
+      try:
+        cluster.withTransactionRetry(retryOpts, conn):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction, "withTransactionRetry"
+      doAssert attempts == 1, "withTransactionRetry"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      sqlState = ""
+      try:
+        cluster.withTransactionDeadline(conn, seconds(5)):
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction, "withTransactionDeadline"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      attempts = 0
+      sqlState = ""
+      try:
+        cluster.withTransactionRetryDeadline(retryOpts, conn, seconds(5)):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction,
+        "withTransactionRetryDeadline"
+      doAssert attempts == 1, "withTransactionRetryDeadline"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await cluster.close()
 
     waitFor t()
 

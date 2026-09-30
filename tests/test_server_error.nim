@@ -1019,6 +1019,19 @@ suite "isTransientError":
       (ref PgListenError)(msg: "stopped", transportAlive: true)
     )
 
+  test "a 25P02 for a COMMIT answered with ROLLBACK is judged by its cause":
+    proc rolledBack(cause: ref PgQueryError): ref PgQueryError =
+      result = queryError(SqlStateInFailedSqlTransaction)
+      result.parent = cause
+
+    check isTransientError(rolledBack(queryError("40001")))
+    check retryAdvice(rolledBack(queryError("22012"))) == raUnclear
+    check retryAdvice(rolledBack(nil)) == raUnclear
+    # Only a 25P02 hands the verdict to its parent.
+    let other = queryError("23505")
+    other.parent = queryError("40001")
+    check not isTransientError(other)
+
   test "an error summing up attempts is transient when any of them is":
     let lost = (ref PgUnavailableError)(msg: "lost")
     let refused = (ref PgSecurityError)(msg: "refused")
