@@ -295,12 +295,13 @@ suite "Per-address connectTimeout":
       let targets =
         resolveTargets("127.0.0.1", silent.port) &
         resolveTargets("127.0.0.1", refusedPort)
+      var cfg = timedConfig(silent.port)
+      when defined(windows):
+        # Windows retries a refused SYN for about 2s before failing the dial.
+        cfg.connectTimeout = seconds(3)
       try:
         discard await attemptHostTimed(
-          timedConfig(silent.port),
-          HostEntry(host: "127.0.0.1", port: silent.port),
-          tsaAny,
-          targets,
+          cfg, HostEntry(host: "127.0.0.1", port: silent.port), tsaAny, targets
         )
       except CatchableError as e:
         result = e

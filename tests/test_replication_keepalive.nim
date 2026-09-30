@@ -830,11 +830,14 @@ suite "Replication: client-initiated stop":
       let conn = await connect(mockConfig(ms.port))
       let cb = makeReplicationCallback:
         discard msg
-      var bulk, queued: Future[void]
+      var lead, bulk, queued: Future[void]
 
       proc writer() {.async.} =
         while conn.state != csReplicating:
           await sleepAsync(milliseconds(1))
+        # Winsock takes a whole send while its buffer has room, so on Windows
+        # only the second frame is still being written when the error comes.
+        lead = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
         bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
         queued = conn.sendCopyData([byte('h')])
         # The stream closes to writes before it waits out the bulk frame.
@@ -852,7 +855,7 @@ suite "Replication: client-initiated stop":
       except PgQueryError:
         gotQueryError = true
       await writerFut
-      bulkDone = bulk.finished
+      bulkDone = lead.finished and bulk.finished
       readyAfter = conn.state == csReady
       try:
         await queued
