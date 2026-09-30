@@ -3791,6 +3791,9 @@ suite "Connect refusals":
       refuseLogins(refusing, refused)
       let pool = makePool(minSize = 4, maxSize = 4)
       pool.config.connConfig = mockConfig(refusing.port)
+      # Unset, it falls back to the 20ms interval: the mock answers one
+      # startup at a time, so a slow runner would time the round's dials out.
+      pool.config.connConfig.connectTimeout = seconds(5)
       pool.config.maintenanceInterval = milliseconds(20)
       # Short here so the test does not wait out the 60s default.
       pool.config.connectBackoffInitial = milliseconds(10)
@@ -3827,6 +3830,7 @@ suite "Connect refusals":
       let clients = new seq[MockClient]
       acceptLogins(accepting, accepted, clients)
       pool.config.connConfig = mockConfig(accepting.port)
+      pool.config.connConfig.connectTimeout = seconds(5)
       spins = 0
       while pool.idleCount() < 4 and spins < 200:
         inc spins
@@ -3964,6 +3968,9 @@ suite "Connect refusals":
       discard handler()
       let pool = makePool(minSize = 2, maxSize = 2)
       pool.config.connConfig = mockConfig(ms.port)
+      # Unset, it falls back to the 20ms interval: a slow startup would fail
+      # the round's other dial too.
+      pool.config.connConfig.connectTimeout = seconds(5)
       pool.config.maintenanceInterval = milliseconds(20)
       pool.config.connectBackoffInitial = milliseconds(10)
       pool.config.connectBackoffMax = seconds(60)
@@ -4034,6 +4041,9 @@ suite "Connect refusals":
       refuseLogins(ms, refused)
       let pool = makePool(minSize = 2, maxSize = 2)
       pool.config.connConfig = mockConfig(ms.port)
+      # Unset, it falls back to the 20ms interval: a timed-out dial is not a
+      # refusal, so the waiter would stay queued and be dialed again.
+      pool.config.connConfig.connectTimeout = seconds(5)
       pool.config.maintenanceInterval = milliseconds(20)
       pool.config.connectBackoffInitial = milliseconds(10)
       pool.config.connectBackoffMax = seconds(60)
