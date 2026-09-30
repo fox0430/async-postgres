@@ -13,7 +13,9 @@ import pkg/nimcrypto/pbkdf2
 import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
+from ../async_postgres/pg_connection/types import newPgConnection
 from ../async_postgres/pg_connection/lifecycle {.all.} import attemptHostTimed
+from ../async_postgres/pg_connection/simple_query {.all.} import cancelWithin
 when hasAsyncDispatch:
   from std/nativesockets import Domain
 
@@ -47,10 +49,13 @@ suite "Dial":
       let conn = await connect(cfg)
       let client = await accepted
       let cancelSide = ms.accept()
-      await conn.cancel()
+      # `cancel` returns once the server hangs up, so the server side runs
+      # alongside it.
+      let cancelling = conn.cancel()
       let cancelClient = await cancelSide
       result = await readN(cancelClient, 8)
       await closeClient(cancelClient)
+      await cancelling
       await conn.close()
       await closeClient(client)
       await closeServer(ms)
@@ -61,6 +66,48 @@ suite "Dial":
       let request = waitFor testBody()
       check decodeInt32(request, 0) == 16
       check decodeInt32(request, 4) == 80877102 # CancelRequest code
+
+  test "cancel returns once the server hangs up, not once the request is sent":
+    # As libpq: until then the request may still be in flight, and could hit
+    # the query the caller sends next.
+    proc testBody(): Future[bool] {.async.} =
+      let ms = startMockServer()
+      let accepted = ms.accept()
+      let conn = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
+      let cancelling = conn.cancel()
+      let cancelClient = await accepted
+      discard await readN(cancelClient, 16)
+      await sleepAsync(milliseconds(50))
+      result = cancelling.finished
+      await closeClient(cancelClient)
+      await cancelling
+      await closeServer(ms)
+
+    check not waitFor testBody()
+
+  test "cancel gives up on a server that never hangs up, releasing its socket":
+    proc testBody(): Future[(bool, bool)] {.async.} =
+      let ms = startMockServer()
+      let accepted = ms.accept()
+      let conn = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
+      let cancelling = conn.cancelWithin(milliseconds(100))
+      let cancelClient = await accepted
+      discard await readN(cancelClient, 16)
+      try:
+        await cancelling
+      except PgTimeoutError:
+        result[0] = true
+      try:
+        discard await readN(cancelClient, 1).wait(seconds(2))
+      except AsyncTimeoutError:
+        discard
+      except CatchableError:
+        # EOF: the cancel side closed its socket.
+        result[1] = true
+      await closeClient(cancelClient)
+      await closeServer(ms)
+
+    check waitFor(testBody()) == (true, true)
 
   when defined(linux):
     # All of 127/8 is loopback on Linux: 127.0.0.2 and 127.0.0.3 refuse where
@@ -326,10 +373,11 @@ suite "Per-address connectTimeout":
       )
       let client = await accepted
       let cancelSide = ms.accept()
-      await conn.cancel()
+      let cancelling = conn.cancel()
       let cancelClient = await cancelSide
       result = await readN(cancelClient, 8)
       await closeClient(cancelClient)
+      await cancelling
       await conn.close()
       await closeClient(client)
       await closeServer(ms)

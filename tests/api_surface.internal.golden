@@ -332,6 +332,7 @@ async_postgres/pg_connection/types.nim	setServerParam
 async_postgres/pg_connection/types.nim	settlePendingSync
 async_postgres/pg_connection/types.nim	settleReplWrite
 async_postgres/pg_connection/types.nim	socket
+async_postgres/pg_connection/types.nim	sslHost
 async_postgres/pg_connection/types.nim	stageEvictedClose
 async_postgres/pg_connection/types.nim	stageEvictedClose#2
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses

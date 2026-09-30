@@ -330,6 +330,9 @@ type
     cancelTarget: seq[DialTarget]
       ## The address dialed, where ``cancel`` sends its request; empty if never
       ## dialed.
+    sslHost: string
+      ## Name the session's TLS was checked against (``HostEntry.host``);
+      ## ``cancel`` checks its own TLS against the same name.
     createdAt: Moment
     portalCounter: int
     config: ConnConfig
@@ -828,11 +831,13 @@ when hasChronos:
     conn.tlsStream
 
   proc attachTransport*(
-      conn: PgConnection, t: StreamTransport, target: DialTarget
+      conn: PgConnection, t: StreamTransport, target: DialTarget, sslHost: string
   ) {.inline.} =
-    ## Attach a freshly dialled transport and its cancel target.
+    ## Attach a freshly dialled transport with what ``cancel`` needs to reach
+    ## the same server: its address and TLS name.
     conn.transport = t
     conn.cancelTarget = @[target]
+    conn.sslHost = sslHost
 
   proc initPlainStreams*(conn: PgConnection) {.inline.} =
     ## Wire plaintext ``reader``/``writer`` from the transport when none exist.
@@ -905,11 +910,13 @@ elif hasAsyncDispatch:
     conn.socket
 
   proc attachTransport*(
-      conn: PgConnection, s: AsyncSocket, target: DialTarget
+      conn: PgConnection, s: AsyncSocket, target: DialTarget, sslHost: string
   ) {.inline.} =
-    ## Attach a freshly dialled socket and its cancel target.
+    ## Attach a freshly dialled socket with what ``cancel`` needs to reach the
+    ## same server: its address and TLS name.
     conn.socket = s
     conn.cancelTarget = @[target]
+    conn.sslHost = sslHost
 
   proc graftTransportFrom*(conn, src: PgConnection) {.inline.} =
     ## Move the socket and its channel-binding certificate.
@@ -932,6 +939,9 @@ proc setServerCertDer*(conn: PgConnection, der: seq[byte]) {.inline.} =
 func cancelTarget*(conn: PgConnection): lent seq[DialTarget] {.inline.} =
   conn.cancelTarget
 
+func sslHost*(conn: PgConnection): string {.inline.} =
+  conn.sslHost
+
 func secretKey*(conn: PgConnection): int32 {.inline.} =
   conn.secretKey
 
@@ -948,6 +958,7 @@ proc graftReconnectedSession*(conn, src: PgConnection) =
   conn.host = src.host
   conn.port = src.port
   conn.cancelTarget = src.cancelTarget
+  conn.sslHost = src.sslHost
   conn.pid = src.pid
   conn.secretKey = src.secretKey
   conn.serverParams = src.serverParams
