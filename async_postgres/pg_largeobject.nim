@@ -367,7 +367,7 @@ macro withLargeObject*(
   ## are rejected at compile time so ``loClose`` is not skipped (which would
   ## leak the server-side Large Object file descriptor until the transaction
   ## ends).
-  checkNoBodyEscape(body, "withLargeObject", "loClose")
+  let body = checkNoBodyEscape(body, "withLargeObject", "loClose")
   let connSym = genSym(nskLet, "conn")
   let oidSym = genSym(nskLet, "oid")
   let modeSym = genSym(nskLet, "mode")
@@ -402,12 +402,6 @@ macro withLargeObject*(
       raise loBodyDefect
     # Surface a genuine close failure to the caller.
     await `lo`.loClose()
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withLargeObject",
-      "loClose",
-    )
 
 # Streaming API
 

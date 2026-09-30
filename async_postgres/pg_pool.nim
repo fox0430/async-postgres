@@ -1550,7 +1550,7 @@ macro withConnection*(pool: PgPool, conn, body: untyped): untyped =
   ## Release runs outside `finally` (a failing `await` in an asyncdispatch
   ## `finally` masks the body error), so `return` / `break` / `continue`
   ## escaping the body are rejected at compile time.
-  checkNoBodyEscape(body, "withConnection", "the connection release")
+  let body = checkNoBodyEscape(body, "withConnection", "the connection release")
   let poolSym = genSym(nskLet, "pool")
   let bodyErrSym = genSym(nskVar, "bodyErr")
   let bodyDefectSym = genSym(nskVar, "bodyDefect")
@@ -1569,12 +1569,6 @@ macro withConnection*(pool: PgPool, conn, body: untyped): untyped =
     except Defect as d:
       `bodyDefectSym` = d
     `releaseBlock`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withConnection",
-      "the connection release",
-    )
 
 proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
   ## Fail a pending op's future if not already finished.
@@ -2350,7 +2344,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
@@ -2391,12 +2385,6 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
     except Defect as `dSym`:
       `bodyDefectSym` = `dSym`
     `releaseBlock`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withTransaction",
-      "COMMIT/ROLLBACK",
-    )
 
 macro withTransactionRetry*(
     pool: PgPool, retryOpts: RetryOptions, args: varargs[untyped]
@@ -2447,7 +2435,7 @@ macro withTransactionRetry*(
       args[0],
     )
 
-  checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
@@ -2476,12 +2464,6 @@ macro withTransactionRetry*(
     except Defect as `dSym`:
       `bodyDefectSym` = `dSym`
     `releaseBlock`
-    checkNoBodyEscapePost(
-      block:
-        `body`,
-      "withTransactionRetry",
-      "COMMIT/ROLLBACK",
-    )
 
 macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single
@@ -2548,7 +2530,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
       args[0],
     )
 
-  checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
@@ -2636,12 +2618,6 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
         # Wrap the Defect (see runAndReleaseImpl): chronos re-raises raw
         # Defects eagerly.
         raise newPoolError(pekDefectWrapped, `bodyDefectSym`.msg, `bodyDefectSym`)
-      checkNoBodyEscapePost(
-        block:
-          `body`,
-        "withTransactionDeadline",
-        "COMMIT/ROLLBACK",
-      )
 
     let `bodyFutSym` = `bodyFnSym`()
     try:
@@ -2721,7 +2697,7 @@ macro withTransactionRetryDeadline*(
       args[0],
     )
 
-  checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
+  body = checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
   let poolSym = genSym(nskLet, "pool")
@@ -2833,12 +2809,6 @@ macro withTransactionRetryDeadline*(
         # Wrap the Defect (see runAndReleaseImpl): chronos re-raises raw
         # Defects eagerly.
         raise newPoolError(pekDefectWrapped, `bodyDefectSym`.msg, `bodyDefectSym`)
-      checkNoBodyEscapePost(
-        block:
-          `body`,
-        "withTransactionRetryDeadline",
-        "COMMIT/ROLLBACK",
-      )
 
     `loop`
 
@@ -2848,7 +2818,7 @@ macro withPipeline*(pool: PgPool, pipeline, body: untyped): untyped =
   ##
   ## Body `return` / `break` / `continue` escaping to an enclosing loop are
   ## rejected at compile time (see `withConnection`).
-  checkNoBodyEscape(body, "withPipeline", "the connection release")
+  let body = checkNoBodyEscape(body, "withPipeline", "the connection release")
   let poolSym = genSym(nskLet, "pool")
   let connId = ident("conn")
   let bodyErrSym = genSym(nskVar, "bodyErr")
@@ -2870,12 +2840,6 @@ macro withPipeline*(pool: PgPool, pipeline, body: untyped): untyped =
       except Defect as d:
         `bodyDefectSym` = d
       `releaseBlock`
-      checkNoBodyEscapePost(
-        block:
-          `body`,
-        "withPipeline",
-        "the connection release",
-      )
 
 proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close the pool: stop the maintenance loop, cancel all waiters, and close

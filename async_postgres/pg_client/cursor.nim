@@ -368,13 +368,12 @@ template withCursor*(
   ## Body `return` / `break` / `continue` that would escape the body are
   ## rejected at compile time so the close is not skipped (which would leave
   ## the connection busy with the open portal).
-  checkNoBodyEscapePre(body, "withCursor", "the cursor close")
   let cursorName =
     await conn.openCursor(sql, chunkSize = chunks, timeout = cursorTimeout)
   var bodyErr: ref CatchableError = nil
   var bodyDefect: ref Defect = nil
   try:
-    body
+    checkTemplateBodyEscape(body, "withCursor", "the cursor close")
   except CatchableError as e:
     bodyErr = e
   except Defect as d:
@@ -397,12 +396,6 @@ template withCursor*(
   else:
     # Body succeeded: surface any close failure to the caller.
     await cursorName.close()
-  checkNoBodyEscapePost(
-    block:
-      body,
-    "withCursor",
-    "the cursor close",
-  )
 
 proc openCursor*(
     conn: PgConnection,

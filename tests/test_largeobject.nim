@@ -676,6 +676,43 @@ suite "Large Object: withLargeObject macro":
 
     )
 
+  test "withLargeObject rejects break passed to a template":
+    # The unexpanded walk can't see the loop a template wraps around its
+    # argument, so it rejects a `break`/`continue` passed to one even when that
+    # loop would capture it. The check errs on the side of rejecting.
+    template loEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    template loTwice(body: untyped) =
+      body
+      body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withLargeObject(lo, 0.Oid, INV_READWRITE):
+              loEachN(3):
+                break
+
+    )
+    # Without a loop of its own, the template leaves `break` bound to the
+    # caller's loop, skipping loClose.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withLargeObject(lo, 0.Oid, INV_READWRITE):
+              loTwice:
+                break
+
+    )
+
   test "withLargeObject preserves the original error when the tx is aborted":
     # Regression: when `body` poisons the transaction, the cleanup `loClose`
     # itself raises "current transaction is aborted". That cleanup failure
