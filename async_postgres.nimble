@@ -33,15 +33,18 @@ task escapeDiagnostics,
   exec "nim c -r --hints:off -d:asyncBackend=asyncdispatch tests/test_body_escape_diagnostics.nim"
   exec "nim c -r --hints:off -d:asyncBackend=chronos tests/test_body_escape_diagnostics.nim"
 
+proc runSuite(file: string) =
+  ## Build and run `file` once per async backend.
+  exec "bash tests/gen_certs.sh"
+  exec "nim c -d:asyncBackend=asyncdispatch -r " & file
+  exec "nim c -d:asyncBackend=chronos -r " & file
+
 task test, "run the full suite (requires a live PostgreSQL on 127.0.0.1:15432)":
   apiSurfaceTask()
   parseGuardTask()
   privateAccessGuardTask()
   escapeDiagnosticsTask()
-  exec "bash tests/gen_certs.sh"
-  exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests.nim"
-  exec "nim c -d:asyncBackend=chronos -r tests/all_tests.nim"
+  runSuite "tests/all_tests.nim"
 
-task test_unit, "run unit and mock-server tests only (no PostgreSQL required)":
-  exec "nim c -d:asyncBackend=asyncdispatch -r tests/all_tests_unit.nim"
-  exec "nim c -d:asyncBackend=chronos -r tests/all_tests_unit.nim"
+task testUnit, "run unit and mock-server tests only (no PostgreSQL required)":
+  runSuite "tests/all_tests_unit.nim"

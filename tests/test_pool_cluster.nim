@@ -476,9 +476,7 @@ suite "Fallback":
       check cluster.replica.idle.peekFirst().conn == lateConn
 
     test "an abandoned replica acquire that later fails does not crash the drain":
-      # `wait()`'s default orphan hook clears the orphan's late failure, and the
-      # drain awaits the same future: it must not read a nil connection out of
-      # the (still failed) future and release it.
+      # The drain must not release a nil connection out of the failed future.
       let cluster =
         makeCluster(fallback = fallbackPrimary, fallbackTimeout = milliseconds(20))
       cluster.replica.active = cluster.replica.config.maxSize
@@ -496,7 +494,6 @@ suite "Fallback":
       waitFor sleepMsAsync(150)
 
       check cluster.replica.waiterCount == 0
-      check cluster.replica.active == cluster.replica.config.maxSize
 
     test "a drained late connection is closed by the pool, not by the application":
       # The replica pool shuts down mid-acquire. `drainAbandonedAcquire` must

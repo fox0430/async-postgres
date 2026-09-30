@@ -109,9 +109,10 @@ proc oneLine*(msg: string): string =
 type DialFailure = tuple[target: string, err: ref CatchableError]
 
 when defined(posix):
-  func isTransientErrno(code: int32): bool =
+  proc isTransientErrno(code: int32): bool {.raises: [].} =
     ## Whether an OS error may clear (``ENOENT``: a Unix socket not created yet).
-    # Qualified: chronos exports same-named OSErrorCode constants.
+    # Qualified: chronos exports same-named OSErrorCode constants. A proc, not
+    # a func: macOS's posix errno constants are importc vars, not consts.
     code in [
       posix.ECONNREFUSED, posix.ECONNRESET, posix.ECONNABORTED, posix.ETIMEDOUT,
       posix.EHOSTUNREACH, posix.ENETUNREACH, posix.ENETDOWN, posix.EADDRNOTAVAIL,

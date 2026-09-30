@@ -180,6 +180,31 @@ elif hasAsyncDispatch:
     if data.len > 0:
       await client.send(cast[string](data))
 
+when defined(posix):
+  from std/posix import nil
+
+  proc sendSegmentsNow*(client: MockClient, segments: openArray[seq[byte]]) =
+    ## Send each of `segments` as its own TCP segment before returning, so the
+    ## peer cannot run between them. Consecutive `sendBytes` calls do not
+    ## guarantee this: asyncdispatch defers each write to a later poll, and
+    ## Nagle may hold a later segment until the peer ACKs an earlier one.
+    when hasChronos:
+      let fd = posix.SocketHandle(client.fd)
+    elif hasAsyncDispatch:
+      let fd = posix.SocketHandle(client.getFd())
+    var one: cint = 1
+    doAssert posix.setsockopt(
+      fd,
+      cint(posix.IPPROTO_TCP),
+      posix.TCP_NODELAY,
+      addr one,
+      posix.SockLen(sizeof(one)),
+    ) == 0, "setsockopt(TCP_NODELAY) failed"
+    for seg in segments:
+      doAssert seg.len > 0
+      let n = posix.send(fd, unsafeAddr seg[0], seg.len, posix.MSG_NOSIGNAL)
+      doAssert n == seg.len, "short or failed send"
+
 # Message-building helpers
 
 proc buildBackendMsg*(msgType: char, body: openArray[byte]): seq[byte] =

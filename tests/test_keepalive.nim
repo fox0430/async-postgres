@@ -18,8 +18,7 @@ suite "configureKeepalive":
     fd
 
   proc keepaliveEnabled(fd: SocketHandle): bool =
-    # macOS/BSD getsockopt returns the SO_KEEPALIVE flag bit (8), Linux returns 1,
-    # so treat any non-zero value as "enabled".
+    # macOS/BSD report the flag bit (8) instead of 1.
     getIntSockOpt(fd, SOL_SOCKET, SO_KEEPALIVE) != 0
 
   test "keepAlive=false does not set SO_KEEPALIVE":

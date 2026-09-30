@@ -158,9 +158,8 @@ proc fireReadFallback(
     cluster.onReadFallback(reason, err)
 
 proc keepOrphanOutcome(fut: Future[PgConnection]) {.gcsafe.} =
-  ## Orphan hook for the acquires `drainAbandonedAcquire` takes over: the
-  ## default hook clears a late failure, and the drain's `await` would then
-  ## read a nil connection out of the still-failed future.
+  ## No-op orphan hook: the default one clears a late failure, which would make
+  ## `drainAbandonedAcquire` read a nil connection out of the failed future.
   discard
 
 proc drainAbandonedAcquire(acquireFut: Future[PgConnection]) {.async.} =

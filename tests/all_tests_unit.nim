@@ -1,7 +1,4 @@
-## Unit and in-process mock-server tests. None of these require a live
-## PostgreSQL: every test either exercises pure logic or connects to an
-## in-process mock server on an ephemeral port. They therefore run anywhere,
-## including CI hosts without Docker (e.g. macOS runners).
+## Tests that need no PostgreSQL (pure logic or in-process mock servers).
 {.push warning[UnusedImport]: off.}
 import
   test_aggregate, test_async_backend, test_auth, test_bytes, test_cache,
