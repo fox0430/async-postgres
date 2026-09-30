@@ -805,12 +805,13 @@ suite "Replication: client-initiated stop":
 
     proc testBody() {.async.} =
       let ms = startMockServer()
+      let heldUp = newFuture[void]("heldUp")
 
       proc serverHandler() {.async.} =
         let st = await acceptAndReady(ms)
         discard await drainFrontendMessage(st) # START_REPLICATION
         await sendBytes(st, buildCopyBothResponse())
-        await sleepAsync(milliseconds(100))
+        await heldUp
         var tail = buildErrorResponse("XX000", "walsender failed")
         tail.add(buildReadyForQuery('I'))
         await sendBytes(st, tail)
@@ -830,16 +831,20 @@ suite "Replication: client-initiated stop":
       let conn = await connect(mockConfig(ms.port))
       let cb = makeReplicationCallback:
         discard msg
-      var lead, bulk, queued: Future[void]
+      var bulk, queued: Future[void]
 
       proc writer() {.async.} =
         while conn.state != csReplicating:
           await sleepAsync(milliseconds(1))
-        # Winsock takes a whole send while its buffer has room, so on Windows
-        # only the second frame is still being written when the error comes.
-        lead = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
-        bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+        # Winsock takes a whole send while its buffer has room, however large,
+        # so write until a frame is actually held up by the unread socket.
+        for _ in 0 ..< 8:
+          bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+          await sleepAsync(milliseconds(100))
+          if not bulk.finished:
+            break
         queued = conn.sendCopyData([byte('h')])
+        heldUp.complete()
         # The stream closes to writes before it waits out the bulk frame.
         while conn.replWritesOpen:
           await sleepAsync(milliseconds(1))
@@ -855,7 +860,7 @@ suite "Replication: client-initiated stop":
       except PgQueryError:
         gotQueryError = true
       await writerFut
-      bulkDone = lead.finished and bulk.finished
+      bulkDone = bulk.finished
       readyAfter = conn.state == csReady
       try:
         await queued
