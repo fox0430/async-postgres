@@ -1,19 +1,13 @@
 ## `exec` overloads: extended-query single-statement execution that ignores
 ## result rows and returns just the command tag (`CommandResult`).
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
 import std/options
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, cache, simple_query]
-import ../pg_types/encoding
+import ../[async_backend, pg_protocol, pg_types]
+import ../pg_connection/[types, buffer_io, simple_query]
 import core
-
-import std/importutils
-privateAccess(PgConnection)
 
 proc execImpl*(
     conn: PgConnection,
@@ -40,8 +34,8 @@ proc execImpl*(
     cacheHit = cacheHit,
     cacheMiss = cacheMiss,
     stmtName = stmtName,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep = conn.sendBuf.addBind("", stmtName, paramFormats, params),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep = conn.addBind("", stmtName, paramFormats, params),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -69,8 +63,8 @@ proc execImpl*(
     cacheHit = cacheHit,
     cacheMiss = cacheMiss,
     stmtName = stmtName,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
-    bindStep = conn.sendBuf.addBind("", stmtName, params),
+    parseStep = conn.addParse(stmtName, sql, params),
+    bindStep = conn.addBind("", stmtName, params),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -132,8 +126,8 @@ proc execInlineImpl*(
     cacheHit = cacheHit,
     cacheMiss = cacheMiss,
     stmtName = stmtName,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep = conn.sendBuf.addBindRaw("", stmtName, paramFormats, data, ranges),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep = conn.addBindRaw("", stmtName, paramFormats, data, ranges),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()

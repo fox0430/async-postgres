@@ -2,18 +2,13 @@
 ## `queryInTransaction` issue BEGIN, the user SQL, and COMMIT with a single
 ## Sync round trip.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[options]
+import std/options
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, cache, simple_query]
-import ./core
-
-import std/importutils
-privateAccess(PgConnection)
+import ../[async_backend, pg_protocol, pg_types]
+import ../pg_connection/[types, buffer_io, simple_query]
+import core
 
 proc queryInTransactionImpl(
     conn: PgConnection,
@@ -38,20 +33,20 @@ proc queryInTransactionImpl(
   # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
   conn.beginSendBuf()
   # BEGIN
-  conn.sendBuf.addParse("", beginSql)
-  conn.sendBuf.addBind("", "", @[], @[])
-  conn.sendBuf.addExecute("", 0)
+  conn.addParse("", beginSql)
+  conn.addBind("", "", @[], @[])
+  conn.addExecute("", 0)
   # User SQL
-  conn.sendBuf.addParse("", sql, paramOids)
-  conn.sendBuf.addBind("", "", formats, params, resultFormats)
-  conn.sendBuf.addDescribe(dkPortal, "")
-  conn.sendBuf.addExecute("", 0)
+  conn.addParse("", sql, paramOids)
+  conn.addBind("", "", formats, params, resultFormats)
+  conn.addDescribe(dkPortal, "")
+  conn.addExecute("", 0)
   # COMMIT
-  conn.sendBuf.addParse("", "COMMIT")
-  conn.sendBuf.addBind("", "", @[], @[])
-  conn.sendBuf.addExecute("", 0)
+  conn.addParse("", "COMMIT")
+  conn.addBind("", "", @[], @[])
+  conn.addExecute("", 0)
   # Single Sync
-  conn.sendBuf.addSync()
+  conn.addSync()
   conn.markBusy()
   await conn.sendStagedBufMsg()
 
@@ -90,8 +85,7 @@ proc queryInTransactionImpl(
       discard
   do:
     if queryError != nil:
-      # ROLLBACK a failed transaction, swallowing any failure so it cannot
-      # mask the query error; the outer wait(timeout) bounds the cleanup.
+      # ROLLBACK without masking the query error; report failure via onCleanupSkipped.
       if conn.txStatus == tsInFailedTransaction:
         try:
           discard await conn.simpleExec("ROLLBACK")
@@ -99,8 +93,8 @@ proc queryInTransactionImpl(
           # Don't swallow cancellation (e.g. the outer wait(timeout)
           # cancelling this future under chronos) — propagate it.
           raise e
-        except CatchableError:
-          discard
+        except CatchableError as rollbackErr:
+          conn.fireCleanupSkipped(ckTxRollback, csrCleanupFailed, rollbackErr)
 
   return qr
 

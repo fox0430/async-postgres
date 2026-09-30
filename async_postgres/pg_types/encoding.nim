@@ -16,6 +16,101 @@ proc checkPgBinLen*(n: int, what: string) {.inline.} =
       what & " length " & $n & " exceeds protocol maximum of " & $maxInt32Len,
     )
 
+const
+  pgMinDateTimeYear = -4713 ## 4714 BC, where PostgreSQL's date/timestamp begin.
+  pgMaxDateTimeYear = 5874897 ## Last year of ``date``, the widest temporal type.
+  # PostgreSQL's MIN_TIMESTAMP / END_TIMESTAMP in Unix seconds, and the valid
+  # ``date`` range in days since 2000-01-01 (IS_VALID_TIMESTAMP / IS_VALID_DATE).
+  pgMinTimestampUnix = -210866803200'i64
+  pgEndTimestampUnix = 9224318016000'i64
+  pgMinDateDays = -2451545'i64
+  pgEndDateDays = 2145031949'i64
+
+proc checkPgDateTime*(v: DateTime, context = "") {.raises: [PgTypeError].} =
+  ## Run before any stdlib ``times`` call on a DateTime being encoded, which
+  ## would assert on ``default(DateTime)`` or overflow on an extreme year. The
+  ## window is ``date``'s; the helpers below check each type's exact range.
+  ## ``context`` is appended to the message (e.g. ``" in composite field"``).
+  if not v.isInitialized:
+    raise newException(PgTypeError, "Uninitialized DateTime" & context)
+  if v.year < pgMinDateTimeYear or v.year > pgMaxDateTimeYear:
+    raise newException(PgTypeError, "DateTime year out of PostgreSQL range" & context)
+
+proc pgTimestampMicros*(t: Time): int64 {.inline.} =
+  ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for a ``Time``.
+  ## Shared with the ``DateTime`` overload, ``ranges.nim``, and
+  ## ``pg_replication.currentPgTimestamp``.
+  # Rebase before scaling: Unix microseconds overflow int64 below the top of
+  # PostgreSQL's timestamp range, PostgreSQL-epoch microseconds do not.
+  (t.toUnix() - pgEpochUnix) * 1_000_000'i64 + int64(t.nanosecond div 1000)
+
+proc checkedTimestamp(v: DateTime): Time {.inline, raises: [PgTypeError].} =
+  ## ``v`` as a Time, raising ``PgTypeError`` outside PostgreSQL's timestamp
+  ## range. That also keeps ``pgTimestampMicros`` from overflowing and off the
+  ## ``infinity`` sentinels.
+  checkPgDateTime(v)
+  result = v.toTime()
+  let s = result.toUnix()
+  if s < pgMinTimestampUnix or s >= pgEndTimestampUnix:
+    raise newException(PgTypeError, "timestamp out of range")
+
+proc pgTimestampMicros*(v: DateTime): int64 {.inline, raises: [PgTypeError].} =
+  ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for ``timestamp``
+  ## / ``timestamptz`` binary format. Shared with ``ranges.nim``. Raises
+  ## ``PgTypeError`` outside PostgreSQL's timestamp range.
+  pgTimestampMicros(checkedTimestamp(v))
+
+proc pgEpochDays(t: Time): int64 {.inline.} =
+  floorDiv(t.toUnix(), 86400'i64) - int64(pgEpochDaysOffset)
+
+proc checkedDate(v: DateTime): Time {.inline, raises: [PgTypeError].} =
+  ## ``v`` as a Time, raising ``PgTypeError`` outside PostgreSQL's date range.
+  checkPgDateTime(v)
+  result = v.toTime()
+  let days = pgEpochDays(result)
+  if days < pgMinDateDays or days >= pgEndDateDays:
+    raise newException(PgTypeError, "date out of range")
+
+proc pgDateDays*(v: DateTime): int32 {.inline, raises: [PgTypeError].} =
+  ## Days since the PostgreSQL epoch (2000-01-01) for ``date`` binary format.
+  ## Shared with ``ranges.nim``. Raises ``PgTypeError`` outside PostgreSQL's
+  ## date range.
+  int32(pgEpochDays(checkedDate(v)))
+
+proc pgUtcText*(t: Time, rest: static string): string =
+  ## ``t``'s UTC wall clock as a PostgreSQL literal: the year, then ``rest``.
+  ## Stdlib's ``yyyy`` drops the era and writes ``+10000``, which PostgreSQL
+  ## reads as a zone offset, so the year is spelled here and BC is a suffix.
+  ## Taking a ``Time`` keeps the DateTime asserts out of reach.
+  let dt = t.utc
+  let bc = dt.year < 1
+  let year =
+    if bc:
+      1 - dt.year
+    else:
+      dt.year
+  result = intToStr(year, 4)
+  result.add('-')
+  result.add(dt.format(rest))
+  if bc:
+    result.add(" BC")
+
+proc pgTimestampText*(v: DateTime): string {.raises: [PgTypeError].} =
+  ## Text ``timestamp`` literal of the UTC wall clock. Formatting v directly
+  ## would emit local fields that a zoneless timestamp then stores verbatim,
+  ## drifting from the binary path by the offset.
+  pgUtcText(checkedTimestamp(v), "MM-dd HH:mm:ss'.'ffffff")
+
+proc pgTimestampTzText*(v: DateTime): string {.raises: [PgTypeError].} =
+  ## Text ``timestamptz`` literal in UTC (``Z``). ``v``'s own offset is not
+  ## kept: timestamptz stores only the instant, and ``zzz`` would drop the
+  ## seconds of an LMT offset such as +09:18:59.
+  pgUtcText(checkedTimestamp(v), "MM-dd HH:mm:ss'.'ffffffzzz")
+
+proc pgDateText*(v: DateTime): string {.raises: [PgTypeError].} =
+  ## Text ``date`` literal of the UTC calendar day, matching ``pgDateDays``.
+  pgUtcText(checkedDate(v), "MM-dd")
+
 proc textParam(oid: int32, s: string, what: string): PgParam {.inline.} =
   ## Build text-format param. Rejects oversized payload.
   checkPgBinLen(s.len, what)
@@ -110,7 +205,9 @@ proc toPgParamInline*(
     result.overflow = newSeq[byte](s.len)
     result.overflow.writeBytesAt(0, s.toOpenArrayByte(0, s.high))
 
-proc toPgParamInline*(v: PgMoney, scale: int = 2): PgParamInline =
+proc toPgParamInline*(
+    v: PgMoney, scale: int = 2
+): PgParamInline {.raises: [PgTypeError].} =
   ## Money → binary with scale validation. The wire carries only the raw
   ## amount, so ``v.scale`` must match the declared ``scale`` (server
   ## ``lc_monetary`` frac_digits). Defaults to 2 for the common locale.
@@ -136,7 +233,9 @@ proc toPgParamInline*[T](v: Option[T]): PgParamInline =
     let tmpl = toPgParamInline(default(T))
     PgParamInline(oid: tmpl.oid, format: tmpl.format, len: -1)
 
-proc toPgParamInline*(v: Option[PgMoney], scale: int = 2): PgParamInline =
+proc toPgParamInline*(
+    v: Option[PgMoney], scale: int = 2
+): PgParamInline {.raises: [PgTypeError].} =
   ## Money Option → binary with scale validation. ``none`` encodes as NULL
   ## without touching ``scale``; ``some`` requires ``v.get.scale == scale``.
   checkMoneyScale(scale)
@@ -187,25 +286,22 @@ proc toPgParam*(v: seq[byte]): PgParam {.raises: [PgTypeError].} =
   PgParam(oid: OidBytea, format: 1, value: some(v))
 
 proc toPgParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
-  # Format the UTC wall clock so a zoned DateTime encodes the same absolute
-  # instant as toPgBinaryParam. Formatting v directly would emit local fields
-  # that OidTimestamp (no zone) then stores verbatim, drifting by the offset.
-  textParam(OidTimestamp, v.utc.format("yyyy-MM-dd HH:mm:ss'.'ffffff"), "timestamp")
+  textParam(OidTimestamp, pgTimestampText(v), "timestamp")
 
 proc toPgDateParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
   ## Encode a DateTime as a date parameter (OID 1082).
-  # Take the UTC calendar day so a zoned DateTime encodes the same day as
-  # toPgBinaryDateParam, whose pgDateDays goes through toTime().
-  textParam(OidDate, v.utc.format("yyyy-MM-dd"), "date")
+  textParam(OidDate, pgDateText(v), "date")
 
 proc toPgTimestampTzParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
   ## Encode a DateTime as a timestamptz parameter (OID 1184).
-  textParam(OidTimestampTz, v.format("yyyy-MM-dd HH:mm:ss'.'ffffffzzz"), "timestamptz")
+  textParam(OidTimestampTz, pgTimestampTzText(v), "timestamptz")
 
 proc toPgParam*(v: PgTime): PgParam {.raises: [PgTypeError].} =
+  checkPgTimeFields(v.hour, v.minute, v.second, v.microsecond)
   textParam(OidTime, $v, "time")
 
 proc toPgParam*(v: PgTimeTz): PgParam {.raises: [PgTypeError].} =
+  checkPgTimeFields(v.hour, v.minute, v.second, v.microsecond)
   checkPgTimeTzOffset(v.utcOffset)
   textParam(OidTimeTz, $v, "timetz")
 
@@ -215,7 +311,7 @@ proc toPgParam*(v: PgUuid): PgParam {.raises: [PgTypeError].} =
 proc toPgParam*(v: PgNumeric): PgParam {.raises: [PgTypeError].} =
   textParam(OidNumeric, $v, "numeric")
 
-proc toPgParam*(v: PgMoney, scale: int = 2): PgParam =
+proc toPgParam*(v: PgMoney, scale: int = 2): PgParam {.raises: [PgTypeError].} =
   ## Money → binary (raw int64). Text is locale-dependent. The wire carries
   ## only the raw amount, so ``v.scale`` must match the declared ``scale``
   ## (server ``lc_monetary`` frac_digits). Defaults to 2 for the common locale.
@@ -500,28 +596,13 @@ template genFixedArray1D(
       writeVal
     PgParam(oid: arrayOid, format: 1, value: some(buf))
 
-proc pgTimeFieldsMicros(hour, minute, second, microsecond: int32): int64 {.inline.} =
+proc pgTimeFieldsMicros(
+    hour, minute, second, microsecond: int32
+): int64 {.inline, raises: [PgTypeError].} =
   ## Microseconds since midnight for PostgreSQL ``time`` / ``timetz`` binary.
+  checkPgTimeFields(hour, minute, second, microsecond)
   int64(hour) * 3_600_000_000'i64 + int64(minute) * 60_000_000'i64 +
     int64(second) * 1_000_000'i64 + int64(microsecond)
-
-proc pgTimestampMicros*(t: Time): int64 {.inline.} =
-  ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for a ``Time``.
-  ## Shared with the ``DateTime`` overload, ``ranges.nim``, and
-  ## ``pg_replication.currentPgTimestamp``.
-  let unixUs = t.toUnix() * 1_000_000'i64 + int64(t.nanosecond div 1000)
-  unixUs - pgEpochUnix * 1_000_000'i64
-
-proc pgTimestampMicros*(v: DateTime): int64 {.inline.} =
-  ## Microseconds since the PostgreSQL epoch (2000-01-01 UTC) for ``timestamp``
-  ## / ``timestamptz`` binary format. Shared with ``ranges.nim``.
-  pgTimestampMicros(v.toTime())
-
-proc pgDateDays*(v: DateTime): int32 {.inline.} =
-  ## Days since the PostgreSQL epoch (2000-01-01) for ``date`` binary format.
-  ## Shared with ``ranges.nim``.
-  let t = v.toTime()
-  int32(floorDiv(t.toUnix(), 86400'i64) - int64(pgEpochDaysOffset))
 
 template writeMoneyAt(buf: var openArray[byte], pos: int, val: PgMoney) =
   buf.writeBE64(pos, val.amount)
@@ -613,7 +694,7 @@ proc toPgParam*(v: Option[JsonNode]): PgParam {.raises: [PgTypeError].} =
   else:
     PgParam(oid: OidJsonb, format: 0, value: none(seq[byte]))
 
-proc toPgParam*(v: Option[PgMoney], scale: int = 2): PgParam =
+proc toPgParam*(v: Option[PgMoney], scale: int = 2): PgParam {.raises: [PgTypeError].} =
   ## Money Option → binary with scale validation. ``none`` encodes as NULL
   ## without touching ``scale``; ``some`` requires ``v.get.scale == scale``.
   checkMoneyScale(scale)
@@ -628,6 +709,15 @@ proc toPgParam*(v: Option[PgMoney], scale: int = 2): PgParam =
     PgParam(oid: OidMoney, format: 1, value: some(@(toBE64(m.amount))))
   else:
     PgParam(oid: OidMoney, format: 1, value: none(seq[byte]))
+
+# ``default(DateTime)`` is uninitialized, which the DateTime encoders reject.
+# The generic Option dispatcher prototypes via ``toPgParam(default(T))``, so
+# resolve OID/format statically (same pattern as Option[JsonNode] / Option[PgMoney]).
+proc toPgParam*(v: Option[DateTime]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgParam(v.get)
+  else:
+    PgParam(oid: OidTimestamp, format: 0, value: none(seq[byte]))
 
 # No raises pragma: the effect is T's encoder effects, inferred per
 # instantiation. A union annotation would over-declare for T whose encoder
@@ -696,7 +786,7 @@ proc toPgBinaryTimestampTzParam*(v: DateTime): PgParam =
   ## Encode a DateTime as a binary timestamptz parameter (OID 1184).
   PgParam(oid: OidTimestampTz, format: 1, value: some(@(toBE64(pgTimestampMicros(v)))))
 
-proc toPgBinaryParam*(v: PgTime): PgParam =
+proc toPgBinaryParam*(v: PgTime): PgParam {.raises: [PgTypeError].} =
   var data = newSeq[byte](8)
   data.writeTimeAt(0, v)
   PgParam(oid: OidTime, format: 1, value: some(data))
@@ -731,7 +821,7 @@ proc encodeNumericBinary*(v: PgNumeric): seq[byte] {.raises: [PgTypeError].} =
 proc toPgBinaryParam*(v: PgNumeric): PgParam {.raises: [PgTypeError].} =
   PgParam(oid: OidNumeric, format: 1, value: some(encodeNumericBinary(v)))
 
-proc toPgBinaryParam*(v: PgMoney, scale: int = 2): PgParam =
+proc toPgBinaryParam*(v: PgMoney, scale: int = 2): PgParam {.raises: [PgTypeError].} =
   ## Money → binary with scale validation, like ``toPgParam``.
   checkMoneyScale(scale)
   if int(v.scale) != scale:
@@ -755,8 +845,13 @@ proc hexNibble*(c: char): int =
   else:
     -1
 
-proc decodeHexPair*(s: string, i: int, errCtx: string): byte =
+proc decodeHexPair*(s: string, i: int, errCtx: string): byte {.raises: [PgTypeError].} =
   ## Failures report the position and input length only (see `PgTypeError`).
+  if i < 0 or i + 1 >= s.len:
+    raise newException(
+      PgTypeError,
+      errCtx & ": hex pair out of range at position " & $i & " (len=" & $s.len & ")",
+    )
   let hi = hexNibble(s[i])
   let lo = hexNibble(s[i + 1])
   if hi < 0 or lo < 0:
@@ -766,14 +861,27 @@ proc decodeHexPair*(s: string, i: int, errCtx: string): byte =
     )
   byte((hi shl 4) or lo)
 
-proc decodeHexPair*(buf: openArray[byte], i: int, errCtx: string): byte =
+proc decodeHexPair*(
+    buf: openArray[byte], i: int, errCtx: string
+): byte {.raises: [PgTypeError].} =
+  ## Failures report the position and input length only (see `PgTypeError`).
+  if i < 0 or i + 1 >= buf.len:
+    raise newException(
+      PgTypeError,
+      errCtx & ": hex pair out of range at position " & $i & " (len=" & $buf.len & ")",
+    )
   let hi = hexNibble(char(buf[i]))
   let lo = hexNibble(char(buf[i + 1]))
   if hi < 0 or lo < 0:
-    raise newException(PgTypeError, errCtx & ": non-hex character at position " & $i)
+    raise newException(
+      PgTypeError,
+      errCtx & ": non-hex character at position " & $i & " (len=" & $buf.len & ")",
+    )
   byte((hi shl 4) or lo)
 
-proc decodeByteaEscape*(s: openArray[char], errCtx: string): seq[byte] =
+proc decodeByteaEscape*(
+    s: openArray[char], errCtx: string
+): seq[byte] {.raises: [PgTypeError].} =
   ## Decode bytea text in the legacy `bytea_output = escape` format.
   ## Server output only ever produces `\\` and `\NNN` (3 octal digits);
   ## other bytes pass through verbatim.
@@ -1238,9 +1346,7 @@ proc toPgParam*(v: seq[PgTsQuery]): PgParam {.raises: [PgTypeError].} =
     elems[i] = string(x)
   textParam(OidTsQueryArray, encodeTsArrayText(elems, "tsquery array"), "tsquery array")
 
-proc toPgBinaryParam*[T](
-    v: seq[T]
-): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+proc toPgBinaryParam*[T](v: seq[T]): PgParam =
   toPgParam(v)
 
 proc toPgBinaryParam*(
@@ -1250,6 +1356,35 @@ proc toPgBinaryParam*(
     toPgBinaryParam(v.get)
   else:
     PgParam(oid: OidJsonb, format: 1, value: none(seq[byte]))
+
+# Types whose ``default(T)`` cannot safely prototype OID/format: distinct-string
+# empties fail binary validation, and the DateTime encoders reject an
+# uninitialized DateTime. The generic Option dispatcher prototypes via
+# ``toPgBinaryParam(default(T))``, so these must resolve OID/format statically
+# (same pattern as Option[JsonNode] / Option[PgMoney] above/below).
+proc toPgBinaryParam*(v: Option[PgUuid]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidUuid, format: 1, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: Option[PgMacAddr]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidMacAddr, format: 1, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: Option[PgMacAddr8]): PgParam {.raises: [PgTypeError].} =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidMacAddr8, format: 1, value: none(seq[byte]))
+
+proc toPgBinaryParam*(v: Option[DateTime]): PgParam =
+  if v.isSome:
+    toPgBinaryParam(v.get)
+  else:
+    PgParam(oid: OidTimestamp, format: 1, value: none(seq[byte]))
 
 proc encodeHstoreBinary*(
     v: PgHstore
@@ -1341,7 +1476,9 @@ proc toPgBinaryParam*[T](v: Option[T]): PgParam =
     let proto = toPgBinaryParam(default(T))
     result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
 
-proc toPgBinaryParam*(v: Option[PgMoney], scale: int = 2): PgParam =
+proc toPgBinaryParam*(
+    v: Option[PgMoney], scale: int = 2
+): PgParam {.raises: [PgTypeError].} =
   ## Money Option → binary with scale validation, like ``toPgParam``.
   checkMoneyScale(scale)
   if v.isSome:
@@ -1477,7 +1614,7 @@ proc pgArrayElemOid*(_: typedesc[PgTime]): int32 =
 proc pgArrayArrayOid*(_: typedesc[PgTime]): int32 =
   OidTimeArray
 
-proc encodePgArrayElement*(v: PgTime): seq[byte] {.raises: [].} =
+proc encodePgArrayElement*(v: PgTime): seq[byte] {.raises: [PgTypeError].} =
   toPgBinaryParam(v).value.get
 
 proc pgArrayElemOid*(_: typedesc[PgTimeTz]): int32 =
@@ -1783,7 +1920,9 @@ proc toPgMoneyArrayNDParam*(
     buf.writeMoneyAt(pos, v.elements[i].get)
   PgParam(oid: OidMoneyArray, format: 1, value: some(buf))
 
-proc coerceBinaryParam*(param: PgParam, serverOid: int32): PgParam =
+proc coerceBinaryParam*(
+    param: PgParam, serverOid: int32
+): PgParam {.raises: [PgTypeError].} =
   ## Return a copy of `param` whose binary payload matches `serverOid`.
   ## Text-format parameters (format == 0) and matching OIDs are returned
   ## unchanged.  For binary-format parameters with a type mismatch, safe

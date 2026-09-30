@@ -1,9 +1,6 @@
-import std/[unittest, options, math, net, times]
+import std/[unittest, options, times, strutils]
 
 import ../async_postgres/[async_backend, pg_types]
-
-when hasAsyncDispatch:
-  import std/strutils
 
 import ../async_postgres/pg_client
 import ../async_postgres/pg_pool
@@ -326,6 +323,54 @@ suite "E2E: Extended Type Roundtrip":
       doAssert got.utc().hour == 10
       doAssert got.utc().minute == 30
       doAssert got.utc().second == 45
+      await conn.close()
+
+    waitFor t()
+
+  test "text DateTime params keep the era, years past 9999 and the instant":
+    # The binary encoding has no year spelling or offset to get wrong, so the
+    # server comparing the two checks the text literal.
+    template fixedZone(name: string, west: static int): Timezone =
+      proc fromTime(time: Time): ZonedTime {.gensym, nimcall, gcsafe, raises: [].} =
+        ZonedTime(isDst: false, utcOffset: west, time: time)
+
+      proc fromAdj(adjTime: Time): ZonedTime {.gensym, nimcall, gcsafe, raises: [].} =
+        ZonedTime(
+          isDst: false, utcOffset: west, time: adjTime + initDuration(seconds = west)
+        )
+
+      newTimezone(name, fromTime, fromAdj)
+
+    proc values(): seq[DateTime] =
+      # LMT +09:18:59: `zzz` would drop the seconds. -04:00 at the lower bound:
+      # the local date precedes PostgreSQL's first one.
+      let lmt = fixedZone("LMT+09:18:59", -(9 * 3600 + 18 * 60 + 59))
+      let west4 = fixedZone("-04:00", 4 * 3600)
+      @[
+        dateTime(-4713, mNov, 24, zone = utc()),
+        dateTime(0, mDec, 31, 23, 59, 59, 999_999_000, utc()),
+        dateTime(10000, mJan, 1, zone = utc()),
+        dateTime(294276, mDec, 31, 23, 59, 59, 999_999_000, utc()),
+        dateTime(1850, mJan, 1, 12, 0, 0, zone = utc()).inZone(lmt),
+        dateTime(-4713, mNov, 24, 1, 0, 0, zone = utc()).inZone(west4),
+      ]
+
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      for dt in values():
+        let res = await conn.query(
+          "SELECT $1::timestamp = $2, $3::timestamptz = $4, $5::date = $6",
+          @[
+            toPgParam(dt),
+            toPgBinaryParam(dt),
+            toPgTimestampTzParam(dt),
+            toPgBinaryTimestampTzParam(dt),
+            toPgDateParam(dt),
+            toPgBinaryDateParam(dt),
+          ],
+        )
+        let row = res.rows[0]
+        doAssert row.getBool(0) and row.getBool(1) and row.getBool(2), $dt
       await conn.close()
 
     waitFor t()
@@ -818,6 +863,177 @@ suite "E2E: Binary Format":
       let qr = await conn.query("SELECT $1::bytea", params, resultFormat = rfBinary)
       doAssert qr.rows.len == 1
       doAssert qr.rows[0].getBytes(0) == data
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Text Search":
+  test "tsvector roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgTsVector("'cat':1A 'dog':3")
+      let res = await conn.query("SELECT $1::tsvector", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTsVector(0)
+      doAssert $got == "'cat':1A 'dog':3"
+      await conn.close()
+
+    waitFor t()
+
+  test "to_tsvector function":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT to_tsvector('english', 'The fat cat sat on the mat')")
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getTsVector(0)
+      let s = $v
+      doAssert "'cat'" in s
+      doAssert "'fat'" in s
+      doAssert "'mat'" in s
+      doAssert "'sat'" in s
+      await conn.close()
+
+    waitFor t()
+
+  test "tsquery roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let q = PgTsQuery("'fat' & 'rat'")
+      let res = await conn.query("SELECT $1::tsquery", @[toPgParam(q)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getTsQuery(0)
+      doAssert "'fat' & 'rat'" == $got
+      await conn.close()
+
+    waitFor t()
+
+  test "full-text search with @@ operator":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query(
+        "SELECT to_tsvector('english', 'the fat cat') @@ to_tsquery('english', 'fat & cat')"
+      )
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getBool(0) == true
+      let res2 = await conn.query(
+        "SELECT to_tsvector('english', 'the fat cat') @@ to_tsquery('english', 'fat & dog')"
+      )
+      doAssert res2.rows[0].getBool(0) == false
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL tsvector and tsquery":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::tsvector, NULL::tsquery")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getTsVectorOpt(0).isNone
+      doAssert res.rows[0].getTsQueryOpt(1).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "tsvector binary results":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT 'cat:1A dog:3'::tsvector", resultFormat = rfBinary)
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getTsVector(0)
+      let s = $v
+      doAssert "'cat'" in s
+      doAssert "'dog'" in s
+      await conn.close()
+
+    waitFor t()
+
+  test "tsquery binary results":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # Binary decoding must render exactly what the server prints in text.
+      for src in [
+        "fat & rat", "fat | rat", "fat <-> rat", "fat <3> rat", "a <-> b <-> c",
+        "!(a & b)", "(a | b) <2> (c & !d)", "cat:*AB & !dog:C", "a <-> (b <2> c)",
+        "(a <-> b) <2> c", "a & (b & c)", "'it''s' & x", "'a\\\\b' & c",
+      ]:
+        let res = await conn.query(
+          "SELECT $1::tsquery, $1::tsquery::text",
+          @[toPgParam(src)],
+          resultFormat = rfBinary,
+        )
+        doAssert $res.rows[0].getTsQuery(0) == res.rows[0].getStr(1),
+          src & ": " & $res.rows[0].getTsQuery(0) & " != " & res.rows[0].getStr(1)
+      # plainto_tsquery nests one AND per word.
+      let deep = await conn.query(
+        "SELECT q, q::text FROM (SELECT plainto_tsquery('simple', " &
+          "string_agg('w' || i, ' ')) q FROM generate_series(1, 1500) i) s",
+        resultFormat = rfBinary,
+      )
+      doAssert $deep.rows[0].getTsQuery(0) == deep.rows[0].getStr(1)
+      # Stopword removal sums distances past 16384 and wraps int16.
+      for src in [
+        "cat <16000> the <16000> dog", "cat <16384> the <16384> the <16384> dog"
+      ]:
+        let res = await conn.query(
+          "SELECT q, q::text FROM (SELECT to_tsquery('english', $1) q) s",
+          @[toPgParam(src)],
+          resultFormat = rfBinary,
+        )
+        doAssert $res.rows[0].getTsQuery(0) == res.rows[0].getStr(1),
+          src & ": " & $res.rows[0].getTsQuery(0) & " != " & res.rows[0].getStr(1)
+      let vec = await conn.query(
+        "SELECT v, v::text FROM (SELECT $$'it''s':1A 'a\\\\b'$$::tsvector v) s",
+        resultFormat = rfBinary,
+      )
+      doAssert $vec.rows[0].getTsVector(0) == vec.rows[0].getStr(1)
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: XML":
+  test "xml roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let v = PgXml("<root><item>hello</item></root>")
+      let res = await conn.query("SELECT $1::xml", @[toPgParam(v)])
+      doAssert res.rows.len == 1
+      let got = res.rows[0].getXml(0)
+      doAssert $got == "<root><item>hello</item></root>"
+      await conn.close()
+
+    waitFor t()
+
+  test "xmlparse function":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT xmlparse(CONTENT '<item>test</item>')")
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getXml(0)
+      doAssert "<item>test</item>" == $v
+      await conn.close()
+
+    waitFor t()
+
+  test "NULL xml":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res = await conn.query("SELECT NULL::xml")
+      doAssert res.rows.len == 1
+      doAssert res.rows[0].getXmlOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+  test "xml binary results":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let res =
+        await conn.query("SELECT '<root>data</root>'::xml", resultFormat = rfBinary)
+      doAssert res.rows.len == 1
+      let v = res.rows[0].getXml(0)
+      doAssert "<root>data</root>" == $v
       await conn.close()
 
     waitFor t()

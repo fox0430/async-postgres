@@ -8,20 +8,26 @@
 ##                                  tracing data types, the `PgTracer`
 ##                                  hook record, and the tracing helper
 ##                                  templates (`withConnTracing`,
-##                                  `withTracing`).
+##                                  `withTracing`). Also the operations
+##                                  that keep `PgConnection`'s private
+##                                  fields consistent and assemble the
+##                                  outgoing messages: send-buffer
+##                                  builders, receive buffering,
+##                                  wire-debt counters, the statement
+##                                  cache with its Close queues, the
+##                                  notification queue, and the replication
+##                                  write queue.
 ## - `pg_connection/dsn`          — DSN parsing (URI and libpq
 ##                                  keyword=value formats) plus
 ##                                  `initConnConfig` and `parseDsn`.
-## - `pg_connection/buffer_io`    — recv/send buffering (`fillRecvBuf`,
-##                                  `nextMessage`, `recvMessage`,
+## - `pg_connection/buffer_io`    — send buffering and message parsing
+##                                  (`nextMessage`, `recvMessage`,
 ##                                  `sendMsg`), TCP keepalive,
-##                                  `closeTransport`, notification/notice
-##                                  dispatch, `isConnected` /
+##                                  `closeTransport`, `isConnected` /
 ##                                  `socketHasFin`, and the `getHosts`
 ##                                  host helper.
 ## - `pg_connection/ssl`          — SSL negotiation (`negotiateSSL`) for
 ##                                  chronos+BearSSL and asyncdispatch+OpenSSL.
-## - `pg_connection/cache`        — client-side prepared-statement LRU.
 ## - `pg_connection/simple_query` — simple-query / simple-exec / ping,
 ##                                  `cancel` / `invalidateOnTimeout`,
 ##                                  `checkSessionAttrs`, `quoteIdentifier`,
@@ -37,17 +43,17 @@
 ##                                  `to_regtype` (extension types like
 ##                                  `hstore`, `citext`, etc.).
 ##
-## What this hub re-exports is the public API. The submodules are internal:
-## Nim needs a `*` on anything a sibling module uses, so their exported sets are
-## wider than what the package promises, and importing one directly reaches
-## symbols that carry no compatibility guarantee. `tests/api_surface.golden`
-## freezes the whole exported set so a widening has to be reviewed.
+## What this hub re-exports is the public API. Submodules are internal: Nim
+## needs `*` for sibling use, so their exports are wider than the promised
+## surface (`tests/api_surface.public.golden` vs `.internal.golden`).
 
 import pg_errors
 import
   pg_connection/[types, dsn, buffer_io, simple_query, lifecycle, notify, type_lookup]
 
-export pg_errors
+# `setPerHost` and `newStartupError` are sibling-only (`connect` builds its
+# errors with them).
+export pg_errors except setPerHost, newStartupError
 
 # `types` — public types, the tracer hook data types and the tracing helpers.
 export types.PgConnState
@@ -121,6 +127,8 @@ export types.notifyDropped
 export types.listenError
 export types.notifyMaxQueue
 export types.`notifyMaxQueue=`
+export types.notifyMaxQueueBytes
+export types.`notifyMaxQueueBytes=`
 export types.listenReconnectMaxAttempts
 export types.`listenReconnectMaxAttempts=`
 export types.listenReconnectMaxBackoff
@@ -133,6 +141,7 @@ export types.withTracing
 # `dsn` — the documented DSN entry points.
 export dsn.initConnConfig
 export dsn.parseDsn
+export dsn.validateConnConfig
 
 # `buffer_io` — public connection I/O and keepalive surface.
 export buffer_io.isUnixSocket

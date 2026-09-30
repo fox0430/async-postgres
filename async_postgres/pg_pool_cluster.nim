@@ -1,6 +1,6 @@
 import std/macros
 
-import async_backend, pg_protocol, pg_connection, pg_types, pg_pool, pg_client
+import async_backend, pg_types, pg_pool, pg_client
 import pg_connection/types
 import pg_client/transaction
 
@@ -289,7 +289,7 @@ macro withReadConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped 
   ## Release runs outside `finally` (a failing `await` in an asyncdispatch
   ## `finally` masks the body error), so `return` / `break` / `continue`
   ## escaping the body are rejected at compile time.
-  checkNoBodyEscape(body, "withReadConnection", "the connection release")
+  let body = checkNoBodyEscape(body, "withReadConnection", "the connection release")
   let clusterSym = genSym(nskLet, "cluster")
   let connPoolSym = genSym(nskLet, "connPool")
   let bodyErrSym = genSym(nskVar, "bodyErr")
@@ -310,19 +310,13 @@ macro withReadConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped 
       except Defect as d:
         `bodyDefectSym` = d
       `releaseBlock`
-      checkNoBodyEscapePost(
-        block:
-          `body`,
-        "withReadConnection",
-        "the connection release",
-      )
 
 macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped =
   ## Acquire a write connection from the primary pool, execute `body`, then release.
   ##
   ## Body `return` / `break` / `continue` escaping to an enclosing loop are
   ## rejected at compile time (see `withReadConnection`).
-  checkNoBodyEscape(body, "withWriteConnection", "the connection release")
+  let body = checkNoBodyEscape(body, "withWriteConnection", "the connection release")
   let clusterSym = genSym(nskLet, "cluster")
   let bodyErrSym = genSym(nskVar, "bodyErr")
   let bodyDefectSym = genSym(nskVar, "bodyDefect")
@@ -342,17 +336,12 @@ macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped
       except Defect as d:
         `bodyDefectSym` = d
       `releaseBlock`
-      checkNoBodyEscapePost(
-        block:
-          `body`,
-        "withWriteConnection",
-        "the connection release",
-      )
 
 macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool.
   ## Delegates to `pool.withTransaction` on the primary; see that overload
   ## for arity forms, timeout semantics, and the in-body `conn` warning.
+  ## A COMMIT the server rolled back raises `PgQueryError` (`25P02`).
   ##
   ## Usage:
   ##   cluster.withTransaction(conn):
@@ -373,7 +362,8 @@ macro withTransactionRetry*(
   ## Execute `body` inside a BEGIN/COMMIT transaction on the primary pool,
   ## retrying on retryable errors. Delegates to `pool.withTransactionRetry`
   ## on the primary; see that overload for arity forms, retry semantics,
-  ## and idempotency notes.
+  ## and idempotency notes. A COMMIT the server rolled back raises
+  ## `PgQueryError` (`25P02`), retried when its `parent` is retryable.
   ##
   ## Usage:
   ##   cluster.withTransactionRetry(RetryOptions(maxAttempts: 3), conn):
@@ -395,6 +385,7 @@ macro withTransactionDeadline*(
   ## bounded by a single wall-clock deadline covering acquire, BEGIN, body,
   ## and COMMIT. Delegates to `pool.withTransactionDeadline` on the primary;
   ## see that overload for arity forms and deadline / cancellation semantics.
+  ## A COMMIT the server rolled back raises `PgQueryError` (`25P02`).
   ##
   ## Usage:
   ##   cluster.withTransactionDeadline(conn, seconds(5)):
@@ -413,6 +404,8 @@ macro withTransactionRetryDeadline*(
   ## bounded by a single wall-clock deadline shared across all retry attempts.
   ## Delegates to `pool.withTransactionRetryDeadline` on the primary; see that
   ## overload for arity forms, deadline / cancellation, and retry semantics.
+  ## A COMMIT the server rolled back raises `PgQueryError` (`25P02`), retried
+  ## when its `parent` is retryable.
   ##
   ## Usage:
   ##   cluster.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), conn, seconds(5)):

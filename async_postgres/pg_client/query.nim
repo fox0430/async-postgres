@@ -2,19 +2,13 @@
 ## `queryValue`, `queryExists`, `queryColumn`) on top of the extended-query
 ## protocol. Also hosts the row-streaming `queryEach` entry point.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[options, tables]
+import std/options
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, cache, simple_query]
-import ../pg_types/encoding
-import ./core
-
-import std/importutils
-privateAccess(PgConnection)
+import ../[async_backend, pg_protocol, pg_types]
+import ../pg_connection/[types, buffer_io, simple_query]
+import core
 
 proc queryImpl*(
     conn: PgConnection,
@@ -57,9 +51,8 @@ proc queryImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep =
-      conn.sendBuf.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep = conn.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -105,8 +98,8 @@ proc queryImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
-    bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
+    parseStep = conn.addParse(stmtName, sql, params),
+    bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -153,8 +146,8 @@ proc queryEachImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, params),
-    bindStep = conn.sendBuf.addBind("", stmtName, params, effectiveResultFormats),
+    parseStep = conn.addParse(stmtName, sql, params),
+    bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()
@@ -269,10 +262,9 @@ proc queryInlineImpl*(
     cachedColFmts = cachedColFmts,
     cachedColOids = cachedColOids,
     effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.sendBuf.addParse(stmtName, sql, paramOids),
-    bindStep = conn.sendBuf.addBindRaw(
-      "", stmtName, paramFormats, data, ranges, effectiveResultFormats
-    ),
+    parseStep = conn.addParse(stmtName, sql, paramOids),
+    bindStep =
+      conn.addBindRaw("", stmtName, paramFormats, data, ranges, effectiveResultFormats),
   )
   conn.markBusy()
   await conn.sendStagedBufMsg()

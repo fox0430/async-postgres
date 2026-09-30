@@ -18,10 +18,13 @@
 ##       await lo.loSeek(0, SEEK_SET)
 ##       let readBack = await lo.loReadAll()
 
-import std/[strutils, options]
+import std/[macros, options]
 
-import async_backend, pg_types, pg_protocol, pg_connection, pg_client
+import async_backend, pg_types, pg_protocol, pg_client
+from pg_types/core import
+  isPgUIntText, pgParseBiggestIntView, pipOk, pipInvalid, pipOverflow
 import pg_connection/types
+import pg_client/transaction
 
 const
   INV_READ* = 0x00040000'i32
@@ -102,8 +105,12 @@ proc parseLoInt(s, fn: string): BiggestInt =
   ## Convert a numeric scalar returned by a Large Object server function to an
   ## integer, surfacing a malformed response as `PgTypeError` (keeps the
   ## ``except PgError`` contract) instead of leaking a raw `ValueError`.
-  pgTypeErrorOnValueError(fn & " returned a non-numeric result (len=" & $s.len & ")"):
-    parseBiggestInt(s)
+  var v: int64
+  if pgParseBiggestIntView(s, v) != pipOk:
+    raise newException(
+      PgTypeError, fn & " returned a non-numeric result (len=" & $s.len & ")"
+    )
+  BiggestInt(v)
 
 proc parseLoInt32(s, fn: string): int32 =
   ## Convert a numeric scalar returned by a Large Object server function to
@@ -120,12 +127,23 @@ proc parseLoOid(s, fn: string): Oid =
   ## Convert an OID returned by a Large Object server function, surfacing a
   ## malformed or out-of-range response as `PgTypeError` instead of a raw
   ## `ValueError` or an uncatchable ``RangeDefect``.
-  var v: uint64
-  try:
-    v = parseUInt(s)
-  except ValueError:
+  # int64 holds the full uint32 OID range; int may be 32-bit.
+  var parsed: int64
+  if not isPgUIntText(s):
     raise
       newException(PgTypeError, fn & " returned a non-numeric OID (len=" & $s.len & ")")
+  case pgParseBiggestIntView(s, parsed)
+  of pipOk:
+    discard
+  of pipInvalid:
+    raise
+      newException(PgTypeError, fn & " returned a non-numeric OID (len=" & $s.len & ")")
+  of pipOverflow:
+    # Valid digits but out of range.
+    raise newException(
+      PgTypeError, fn & " returned an OID outside uint32 range (len=" & $s.len & ")"
+    )
+  let v = uint64(parsed)
   if v > uint64(high(Oid)):
     raise newException(
       PgTypeError, fn & " returned an OID outside uint32 range (len=" & $s.len & ")"
@@ -185,6 +203,8 @@ proc loRead*(
 ): Future[seq[byte]] {.async.} =
   ## Read up to ``length`` bytes from the current position.
   ## Returns the bytes read (may be fewer than ``length`` at EOF).
+  if length < 0:
+    raise newException(ValueError, "loRead: length must be non-negative")
   let qr = await lo.conn.query(
     "SELECT loread($1, $2)",
     @[toPgParam(lo.fd), toPgParam(length)],
@@ -216,6 +236,9 @@ proc loSeek*(
     timeout: Duration = ZeroDuration,
 ): Future[int64] {.async.} =
   ## Seek to a position. Returns the new absolute position.
+  if whence != SEEK_SET and whence != SEEK_CUR and whence != SEEK_END:
+    raise
+      newException(ValueError, "loSeek: whence must be SEEK_SET, SEEK_CUR, or SEEK_END")
   let s = await lo.conn.queryValue(
     "SELECT lo_lseek64($1, $2, $3)",
     @[toPgParam(lo.fd), toPgParam(offset), toPgParam(whence)],
@@ -332,35 +355,53 @@ proc loSize*(
   result = await lo.loSeek(0, SEEK_END, timeout)
   discard await lo.loSeek(savedPos, SEEK_SET, timeout)
 
-# Template
+# Macro
 
-template withLargeObject*(
+macro withLargeObject*(
     conn: PgConnection, lo: untyped, oidVal: Oid, mode: int32, body: untyped
-) =
+): untyped =
   ## Open a Large Object, execute ``body``, then close it.
   ## Must be used inside ``withTransaction``.
-  let lo = await conn.loOpen(oidVal, mode)
-  try:
-    body
-  except CatchableError as loBodyErr:
-    # ``body`` failed and the surrounding transaction may now be in a failed
-    # state, so ``loClose`` would raise "current transaction is aborted" and
-    # mask the real error. Close best-effort and re-raise the original.
+  ##
+  ## Body ``return`` / ``break`` / ``continue`` that would escape the body
+  ## are rejected at compile time so ``loClose`` is not skipped (which would
+  ## leak the server-side Large Object file descriptor until the transaction
+  ## ends).
+  let body = checkNoBodyEscape(body, "withLargeObject", "loClose")
+  let connSym = genSym(nskLet, "conn")
+  let oidSym = genSym(nskLet, "oid")
+  let modeSym = genSym(nskLet, "mode")
+  result = quote:
+    let `connSym` = `conn`
+    let `oidSym` = `oidVal`
+    let `modeSym` = `mode`
+    let `lo` = await `connSym`.loOpen(`oidSym`, `modeSym`)
     try:
-      await lo.loClose()
-    except CatchableError:
-      discard
-    raise loBodyErr
-  except Defect as loBodyDefect:
-    # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
-    # it raw so the handle is not leaked.
-    try:
-      await lo.loClose()
-    except CatchableError:
-      discard
-    raise loBodyDefect
-  # Surface a genuine close failure to the caller.
-  await lo.loClose()
+      `body`
+    except CatchableError as loBodyErr:
+      # ``body`` failed and the surrounding transaction may now be in a failed
+      # state, so ``loClose`` would raise "current transaction is aborted" and
+      # mask the real error. Close best-effort and re-raise the original.
+      try:
+        await `lo`.loClose()
+      except CatchableError:
+        discard
+      except Defect:
+        # Same-frame Defect from the close: swallow so it can't replace the body error.
+        discard
+      raise loBodyErr
+    except Defect as loBodyDefect:
+      # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
+      # it raw so the handle is not leaked.
+      try:
+        await `lo`.loClose()
+      except CatchableError:
+        discard
+      except Defect:
+        discard
+      raise loBodyDefect
+    # Surface a genuine close failure to the caller.
+    await `lo`.loClose()
 
 # Streaming API
 

@@ -73,7 +73,7 @@
 ## ``@[toPgParamInline(a), toPgParamInline(b)]`` — which avoids per-parameter
 ## heap allocations for scalar types.
 ##
-## 3. `queryDirect`/`execDirect` — zero-allocation macros
+## 3. `queryDirect`/`execDirect` — low-allocation macros
 ## ----------------------------------------------------------------------
 ## Encodes parameters directly into the connection's send buffer at compile
 ## time; no intermediate ``seq[PgParam]`` or ``seq[byte]`` is built.
@@ -81,8 +81,8 @@
 ## .. code-block:: nim
 ##   let qr = await conn.queryDirect("SELECT name FROM users WHERE id = $1", myId)
 ##
-## - Pros: no per-call allocations for the parameter path; same statement
-##   cache semantics as `query`.
+## - Pros: no per-call allocations for the parameter path (building the
+##   `QueryResult` still allocates); same statement cache semantics as `query`.
 ## - Cons: SQL must be a string literal/compile-time constant; arguments are
 ##   positional (``$1, $2, …``), no ``{expr}`` sugar.
 ## - Use when: the call site is on a hot path and params are scalars.
@@ -114,31 +114,45 @@
 ## ``simpleQuery``/``simpleExec``; on timeout the connection is marked
 ## closed because the wire protocol desynchronises.
 ##
+## Client encoding
+## ===============
+## ``client_encoding`` is pinned to UTF8. A non-UTF8 value in the config
+## (including ``-c client_encoding=`` in ``options``) raises ``PgConfigError``,
+## and a session reporting a switch away (``SET client_encoding``) is closed
+## with ``PgProtocolError``. The switch is detected only after the fact, so do
+## not change it within a query or pipeline.
+##
 ## Modules
 ## =======
 ## - `pg_connection <async_postgres/pg_connection.html>`_ — Connection management, DSN parsing, SSL, LISTEN/NOTIFY
-## - `pg_client <async_postgres/pg_client.html>`_ — Query execution, prepared statements, cursors, pipelines, transactions, COPY, zero-alloc macros (``queryDirect``/``execDirect``)
+## - `pg_client <async_postgres/pg_client.html>`_ — Query execution, prepared statements, cursors, pipelines, transactions, COPY, low-alloc macros (``queryDirect``/``execDirect``)
 ## - `pg_pool <async_postgres/pg_pool.html>`_ — Connection pooling with health checks and maintenance
 ## - `pg_pool_cluster <async_postgres/pg_pool_cluster.html>`_ — Read replica pool cluster with automatic query routing
 ## - `pg_types <async_postgres/pg_types.html>`_ — Type conversions (``toPgParam``, row accessors, arrays, ranges, composites, enums)
 ## - `pg_protocol <async_postgres/pg_protocol.html>`_ — Wire protocol encoding/decoding
-## - `pg_auth <async_postgres/pg_auth.html>`_ — MD5 and SCRAM-SHA-256 authentication
 ## - `pg_largeobject <async_postgres/pg_largeobject.html>`_ — Large Object API for streaming binary data
 ## - `pg_advisory_lock <async_postgres/pg_advisory_lock.html>`_ — Advisory lock API (session/transaction, exclusive/shared)
 ## - `pg_replication <async_postgres/pg_replication.html>`_ — Logical replication streaming with pgoutput decoder
 ## - `async_backend <async_postgres/async_backend.html>`_ — Async framework abstraction (asyncdispatch / chronos)
+##
+## Supported imports are ``pkg/async_postgres`` and the hub modules listed
+## above. Importing a submodule directly (e.g.
+## ``async_postgres/pg_connection/types``) is unsupported and carries no
+## compatibility guarantee; only the re-exported surface is covered by
+## semantic versioning. Promised vs sibling ``*`` exports are frozen in
+## ``tests/api_surface.{public,internal}.golden``.
 
 import
   async_postgres/[
-    async_backend, pg_protocol, pg_auth, pg_types, pg_connection, pg_client, pg_pool,
+    async_backend, pg_protocol, pg_types, pg_connection, pg_client, pg_pool,
     pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication,
   ]
 
 # `pg_types`/`pg_connection`/`pg_client` whitelist themselves; the other
-# modules expose only their public API surface.
+# modules expose only their public API surface. `pg_auth` is sibling plumbing
+# (SCRAM/MD5) and is not re-exported.
 export pg_types, pg_connection, pg_client
 export pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication
-export pg_auth
 
 # `pg_pool` — public pool API (internal gauges/helpers stay in the module).
 export pg_pool.PoolConfig
@@ -151,6 +165,7 @@ export pg_pool.activeCount
 export pg_pool.size
 export pg_pool.isClosed
 export pg_pool.metrics
+export pg_pool.connectRefusal
 export pg_pool.resetSession
 export pg_pool.newPool
 export pg_pool.release

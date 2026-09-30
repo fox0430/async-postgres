@@ -9,13 +9,15 @@
 ## `loCreate`) against a scripted mock server, so the call sites that consume
 ## these parsers are covered too — not just the private helpers.
 
-import std/[unittest]
+import std/[unittest, strutils, importutils]
 
 import ../async_postgres/[async_backend, pg_connection]
 import ../async_postgres/pg_errors
 import ../async_postgres/pg_largeobject {.all.}
 
 import mock_pg_server
+
+privateAccess(LargeObject)
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
@@ -73,6 +75,21 @@ suite "Large Object result parsers":
       discard parseLoOid("-1", "lo_create")
     expect PgTypeError:
       discard parseLoOid("abc", "lo_create")
+
+  test "parseLoOid separates a range error from a syntax error":
+    # Also the observable half of parsing into int64: on a 32-bit build an int
+    # would fold every OID above 2^31 into the syntax-error branch.
+    var msg = ""
+    try:
+      discard parseLoOid("99999999999999999999", "lo_create")
+    except PgTypeError as e:
+      msg = e.msg
+    check "outside uint32 range" in msg
+    try:
+      discard parseLoOid("abc", "lo_create")
+    except PgTypeError as e:
+      msg = e.msg
+    check "non-numeric OID" in msg
 
   test "hostile values never escape as RangeDefect":
     var defect: ref Defect = nil
@@ -166,3 +183,14 @@ suite "Large Object parsers: hostile server text via the public API":
       await closeServer(ms)
 
     waitFor t()
+
+suite "Large Object precondition errors (no server)":
+  test "loRead rejects negative length with ValueError":
+    let lo = LargeObject(conn: nil, fd: 1, oid: Oid(1))
+    expect ValueError:
+      discard waitFor lo.loRead(-1)
+
+  test "loSeek rejects invalid whence with ValueError":
+    let lo = LargeObject(conn: nil, fd: 1, oid: Oid(1))
+    expect ValueError:
+      discard waitFor lo.loSeek(0, whence = 99'i32)

@@ -1,18 +1,13 @@
 ## Server-side portal-based cursors: `openCursor`, `fetchNext`, `close`, and
 ## the scoped `withCursor` template.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[options]
+import std/options
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, cache, simple_query, lifecycle]
-import ./core
-
-import std/importutils
-privateAccess(PgConnection)
+import ../[async_backend, pg_protocol, pg_types]
+import ../pg_connection/[types, buffer_io, simple_query]
+import core, transaction
 
 type Cursor* = ref object
   ## A server-side portal for incremental row fetching via `declareCursor`/`fetch`.
@@ -80,6 +75,10 @@ proc openCursorImpl(
 ): Future[Cursor] {.async.} =
   conn.checkReady()
 
+  if chunkSize <= 0:
+    raise newException(
+      PgTypeError, "openCursor: chunkSize must be positive (got " & $chunkSize & ")"
+    )
   validateExtendedQuery(sql, params.len, paramOids.len, stmtNameLen = 0)
   let formats =
     if paramFormats.len > 0:
@@ -193,8 +192,8 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
   var rowCount: int32 = 0
 
   conn.beginSendBuf()
-  conn.sendBuf.addExecute(cursor.portalName, cursor.chunkSize)
-  conn.sendBuf.addFlush()
+  conn.addExecute(cursor.portalName, cursor.chunkSize)
+  conn.addFlush()
   await conn.sendStagedBufMsg()
 
   block recvLoop:
@@ -354,6 +353,7 @@ template withCursor*(
     cursorTimeout: Duration = ZeroDuration,
 ) =
   ## Open a cursor, execute `body`, then close the cursor automatically.
+  ## `chunks` must be positive (see `openCursor`).
   ## The cursor is available as `cursorName` inside the body.
   ##
   ## A failure in the automatic `close` never masks an exception raised by
@@ -361,23 +361,38 @@ template withCursor*(
   ## (A `finally` block cannot be used here — on asyncdispatch a failing
   ## `await` in a `finally` replaces the in-flight exception, silently
   ## discarding the body's error.) If `body` succeeds, a close failure
-  ## propagates to the caller.
+  ## propagates to the caller. A `Defect` from `body` is re-raised raw after
+  ## the close attempt. (On chronos, a `Defect` raised in an awaited proc after
+  ## it suspends escapes the event loop directly, so no close runs.)
+  ##
+  ## Body `return` / `break` / `continue` that would escape the body are
+  ## rejected at compile time so the close is not skipped (which would leave
+  ## the connection busy with the open portal).
   let cursorName =
     await conn.openCursor(sql, chunkSize = chunks, timeout = cursorTimeout)
   var bodyErr: ref CatchableError = nil
+  var bodyDefect: ref Defect = nil
   try:
-    body
+    checkTemplateBodyEscape(body, "withCursor", "the cursor close")
   except CatchableError as e:
     bodyErr = e
+  except Defect as d:
+    # Not a `CatchableError`: capture it so the close still runs.
+    bodyDefect = d
 
-  if bodyErr != nil:
+  if bodyErr != nil or bodyDefect != nil:
     # Body failed: still close the cursor, but never let a close failure mask
     # the original error.
     try:
       await cursorName.close()
     except CatchableError:
       discard
-    raise bodyErr
+    except Defect:
+      # Same-frame Defect from the close: swallow so it can't replace the body error.
+      discard
+    if bodyErr != nil:
+      raise bodyErr
+    raise bodyDefect
   else:
     # Body succeeded: surface any close failure to the caller.
     await cursorName.close()
@@ -391,9 +406,12 @@ proc openCursor*(
     timeout: Duration = ZeroDuration,
 ): Future[Cursor] {.async.} =
   ## Open a server-side cursor for streaming rows in chunks.
+  ## `chunkSize` must be positive: `0` would mean `Execute` maxRows `0`
+  ## (unlimited) and silently fetch all rows at once instead of streaming.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
-  ## Raises ``PgStateError`` / ``PgConnectionError`` on a closed connection as
+  ## Raises ``PgTypeError`` for a non-positive `chunkSize`,
+  ## ``PgStateError`` / ``PgConnectionError`` on a closed connection as
   ## `fetchNext` does.
   let (oids, formats, values) = extractParams(params)
   let resultFormats = resultFormat.toFormatCodes()

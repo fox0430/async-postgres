@@ -1,18 +1,13 @@
 ## COPY IN / COPY OUT via the simple-query protocol, including the streaming
 ## `copyInStream` / `copyOutStream` variants that move data through callbacks.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[options]
+import std/options
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
+import ../[async_backend, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
-import ./core
-
-import std/importutils
-privateAccess(PgConnection)
+import core
 
 proc pollCopyInError(
     conn: PgConnection, watch: RecvWatch
@@ -78,7 +73,7 @@ proc drainLeftoverToReady(conn: PgConnection) {.async.} =
       if opt.get.kind == bmkReadyForQuery:
         conn.txStatus = opt.get.txStatus
         return
-    if conn.recvBufStart < conn.recvBuf.len:
+    if conn.recvBufLen() > 0:
       await conn.drainToReadyBestEffort()
   except CancelledError as e:
     raise e
@@ -140,20 +135,20 @@ proc copyInRawImpl(
   # blindly sending the whole input and only learning of the failure after
   # CopyDone.
   const maxPayload = copyBatchSize - 5 # leave room for CopyData header
-  conn.sendBuf.setLen(0)
+  conn.clearSendBuf()
   let watch = conn.startRecvWatch()
   var offset = 0
   try:
     while offset < data.len:
       let endIdx = min(offset + maxPayload - 1, data.len - 1)
-      encodeCopyData(conn.sendBuf, data.toOpenArray(offset, endIdx))
+      conn.appendCopyData(data.toOpenArray(offset, endIdx))
       offset = endIdx + 1
-      if conn.sendBuf.len >= copyBatchSize:
+      if conn.sendBufLen >= copyBatchSize:
         await conn.sendBufMsg()
-        conn.sendBuf.setLen(0)
+        conn.clearSendBuf()
         abortError = await conn.pollCopyInError(watch)
         if abortError != nil:
-          conn.sendBuf.setLen(0)
+          conn.clearSendBuf()
           break
     if abortError == nil:
       # Final non-blocking abort check before CopyDone (mirrors the
@@ -161,9 +156,9 @@ proc copyInRawImpl(
       abortError = await conn.pollCopyInError(watch)
       if abortError == nil:
         # Flush remaining data + CopyDone in one send
-        conn.sendBuf.addCopyDone()
+        conn.appendCopyDone()
         await conn.sendBufMsg()
-        conn.sendBuf.setLen(0)
+        conn.clearSendBuf()
   except CatchableError as e:
     # Transport failure mid-stream: the protocol is out of sync, so invalidate
     # the connection and surface the original error.
@@ -174,7 +169,7 @@ proc copyInRawImpl(
     # Server aborted the COPY mid-stream (already consumed by pollCopyInError):
     # the backend has left copy-in mode, so drain to ReadyForQuery and raise,
     # mirroring copyInStreamImpl. (The second pump cannot surface it.)
-    conn.sendBuf.setLen(0)
+    conn.clearSendBuf()
     await conn.drainToReadyBestEffort()
     raise abortError
 
@@ -317,7 +312,7 @@ proc copyInStreamImpl(
   # of draining the whole callback and only failing after CopyDone.
   const batchThreshold = copyBatchSize
   var callbackError: ref CatchableError = nil
-  conn.sendBuf.setLen(0)
+  conn.clearSendBuf()
   let watch = conn.startRecvWatch()
   try:
     while true:
@@ -326,7 +321,7 @@ proc copyInStreamImpl(
         chunk = await callback()
         if chunk.len == 0:
           break
-        encodeCopyData(conn.sendBuf, chunk)
+        conn.appendCopyData(chunk)
       except CancelledError as e:
         # Cancellation (e.g. a `wait()`-driven timeout tearing down the stream)
         # is not a recoverable callback failure: let it reach the outer handler,
@@ -341,9 +336,9 @@ proc copyInStreamImpl(
         # transport failures must not be sent CopyFail.
         callbackError = e
         break
-      if conn.sendBuf.len >= batchThreshold:
+      if conn.sendBufLen >= batchThreshold:
         await conn.sendBufMsg()
-        conn.sendBuf.setLen(0)
+        conn.clearSendBuf()
         abortError = await conn.pollCopyInError(watch)
         if abortError != nil:
           break
@@ -362,7 +357,7 @@ proc copyInStreamImpl(
     # ReadyForQuery, so neither CopyDone nor CopyFail is needed — drain and raise.
     # If the transport dies before the drain reaches ReadyForQuery the connection
     # is already csClosed; surface the server's error, not that secondary failure.
-    conn.sendBuf.setLen(0)
+    conn.clearSendBuf()
     await conn.drainToReadyBestEffort()
     raise abortError
   elif callbackError != nil:
@@ -372,7 +367,7 @@ proc copyInStreamImpl(
     # the backend has left copy-in mode and a CopyFail would be a stray message
     # that desyncs the stream, so drain the abort and surface the server's error
     # instead of the callback's.
-    conn.sendBuf.setLen(0)
+    conn.clearSendBuf()
     try:
       abortError = await conn.pollCopyInError(watch)
     except CatchableError as e:
@@ -428,11 +423,11 @@ proc copyInStreamImpl(
       conn.abortCopyWatch(watch)
       raise e
     if abortError != nil:
-      conn.sendBuf.setLen(0)
+      conn.clearSendBuf()
       await conn.drainToReadyBestEffort()
       raise abortError
     # Flush remaining data + CopyDone in one send
-    conn.sendBuf.addCopyDone()
+    conn.appendCopyDone()
     try:
       await conn.sendBufMsg()
     except CatchableError as e:
@@ -441,7 +436,7 @@ proc copyInStreamImpl(
       # the original error. Mirrors copyInRawImpl and the outer handler.
       conn.abortCopyWatch(watch)
       raise e
-    conn.sendBuf.setLen(0)
+    conn.clearSendBuf()
 
   # Settle the in-flight watch read (normal completion) before parsing.
   if watch.pending:

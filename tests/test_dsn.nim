@@ -3,7 +3,7 @@ when defined(posix):
   import std/posix
 
 import ../async_postgres/[async_backend, pg_connection]
-import ../async_postgres/pg_connection/dsn
+import ../async_postgres/pg_connection/dsn {.all.}
 
 const dummyPem = "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n"
 
@@ -91,6 +91,194 @@ suite "parseDsn":
   test "URL-encoded user":
     let cfg = parseDsn("postgresql://my%40user@host/db")
     check cfg.user == "my@user"
+
+  template rejectedMsg(dsn: string): string =
+    var msg = ""
+    try:
+      discard parseDsn(dsn)
+    except PgConfigError as e:
+      msg = e.msg
+    msg
+
+  test "userinfo ends at the last raw '@' in the authority":
+    var cfg = parseDsn("postgresql://u:p@ss@h/db")
+    check cfg.user == "u"
+    check cfg.password == "p@ss"
+    check cfg.host == "h"
+    check cfg.database == "db"
+    cfg = parseDsn("postgresql://user@srv:pw@srv.example.com:6432/db")
+    check cfg.user == "user@srv"
+    check cfg.password == "pw"
+    check cfg.host == "srv.example.com"
+    check cfg.port == 6432
+
+  test "raw '@' in the database is rejected even without a password or port":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://svc/admin@" & tail & "@db.example.com/app", # '/' in the user
+      "postgresql://my/" & tail & "@h/db",
+      "postgresql://db1/appdb@replica",
+      "postgresql://h/a@b/c",
+      "postgresql://[::1]/a@b",
+      "postgresql:///a@b",
+      "postgresql://alice@h/app@replica",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%2F" in msg
+      check "%40" in msg
+      check tail notin msg
+
+  test "raw '@' in a query value stays in the query":
+    for (dsn, host, port) in [
+      ("postgresql://h/?user=alice@example.com", "h", 5432),
+      ("postgresql://h:5433/?user=alice@example.com", "h", 5433),
+      ("postgresql://[::1]:5432/?user=alice@example.com", "::1", 5432),
+      ("postgresql://h/db?user=alice@example.com", "h", 5432),
+      ("postgresql://h:5433/db?user=alice@example.com", "h", 5433),
+      ("postgresql://h/db?application_name=svc:1&user=alice@example.com", "h", 5432),
+      ("postgresql:///db?host=[::1]&user=alice@example.com", "[::1]", 5432),
+    ]:
+      let cfg = parseDsn(dsn)
+      check cfg.user == "alice@example.com"
+      check cfg.password == ""
+      check cfg.host == host
+      check cfg.port == port
+    let cfg = parseDsn("postgresql://u:pw@h/db?application_name=svc@x")
+    check cfg.user == "u"
+    check cfg.password == "pw"
+    check cfg.host == "h"
+    check cfg.applicationName == "svc@x"
+
+  test "raw '@' in the database after a password or port is rejected":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://u:p@" & tail & "/s@h", # '@' and '/' in the password
+      "postgresql://u:p@s/" & tail & "@h/db",
+      "postgresql://u:pw@primary/app@replica", # '@' in the database
+      "postgresql://u:1234/" & tail & "@h", # numeric password, no database
+      "postgresql://u:1234/" & tail & "@h/db",
+      "postgresql://u:p/" & tail & "@h/db", # non-numeric password head
+      "postgresql://u:ab/c" & tail & "%zz@h", # bad escape in the tail
+      "postgresql://[::1]:5432/" & tail & "@x",
+      "postgresql://user@srv:1234/" & tail & "@h", # '@' in the user name
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%40" in msg
+      check "%2F" in msg
+      check tail notin msg
+
+  test "a raw '/' in a password is reported before authority errors":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://user:pa:ss/" & tail & "@host/db", # would be unbracketed IPv6
+      "postgresql://u:p%zz/" & tail & "@h", # would be a bad port escape
+      "postgresql://u:1x/" & tail & "@h", # would be an invalid port
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%2F" in msg
+      check tail notin msg
+
+  test "raw '?' in the userinfo before a query with no path is rejected":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://u:1234?application_name=" & tail & "@h", # password as port
+      "postgresql://u:p@" & tail & "?k@h/db", # '@' and '?' in the password
+      "postgresql://u:12?" & tail & "@h/db",
+      "postgresql://my?" & tail & "@h/db", # '?' in the user name
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%3F" in msg
+      check "%40" in msg
+      check tail notin msg
+
+  test "raw '@' in a forwarded query parameter is kept":
+    var cfg = parseDsn("postgresql://u:pw@h/db?search_path=a@b")
+    check cfg.host == "h"
+    check cfg.password == "pw"
+    check cfg.extraParams == @[("search_path", "a@b")]
+    cfg = parseDsn("postgresql://h/db?options=-c%20log_line_prefix%3D%25u@%25d")
+    check cfg.extraParams == @[("options", "-c log_line_prefix=%u@%d")]
+    cfg = parseDsn("postgresql://h/db?search_path=a%40b")
+    check cfg.extraParams == @[("search_path", "a@b")]
+
+  test "raw '@' in a query with no path is rejected":
+    for dsn in [
+      "postgresql://h:5433?user=alice@example.com",
+      "postgresql://[::1]:5432?user=alice@example.com",
+      "postgresql://[::1]?user=alice@example.com",
+      "postgresql://localhost?user=alice@example.com",
+      "postgresql://h1,h2:5433?user=alice@example.com",
+      "postgresql://u:pw@h?application_name=svc@x",
+      "postgresql://?user=alice@example.com",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%40" in msg
+      check "add '/' before '?'" in msg
+
+  test "raw '/' in the user name before a password is rejected":
+    const tail = "SECRETtail-XYZ"
+    for dsn in [
+      "postgresql://my/user:" & tail & "@h/db",
+      "postgresql://my/user:" & tail & "@h",
+      "postgresql://my/user:p@" & tail & "@h/db",
+      "postgresql://my/user:" & tail & "@h?application_name=x",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check tail notin msg
+
+  test "an unmatched '[' does not hide a port from the ambiguous guard":
+    for dsn in [
+      "postgresql://u[x:5432/pw@h/db",
+      "postgresql://u[:5/x@h/db",
+      "postgresql://a[:1/b@c/db",
+      # A bracket pair not at an element start does not hide the port.
+      "postgresql://a[b:5432,x]y/tail@h/db",
+      "postgresql://h,a[b:1]/x@h/db",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Ambiguous" in msg
+      check "%2F" in msg
+      check "%40" in msg
+
+  test "brackets in the authority take any host, as in libpq":
+    for (dsn, host) in [
+      ("postgresql://[localhost]:5433/db", "localhost"),
+      ("postgresql://[127.0.0.1]:5433/db", "127.0.0.1"),
+      ("postgresql://[fe80::1%25eth0]:5433/db", "fe80::1%eth0"),
+    ]:
+      let cfg = parseDsn(dsn)
+      check cfg.host == host
+      check cfg.port == 5433
+
+  test "encoded '@' after userinfo or after host:port is accepted":
+    var cfg = parseDsn("postgresql://u:pw@primary/app%40replica")
+    check cfg.host == "primary"
+    check cfg.password == "pw"
+    check cfg.database == "app@replica"
+    cfg = parseDsn("postgresql://srv:5432?user=admin%40srv&password=s3cret")
+    check cfg.host == "srv"
+    check cfg.user == "admin@srv"
+    check cfg.password == "s3cret"
+
+  test "unrelated errors carry no password hint":
+    for dsn in [
+      "postgresql://h:ab/db", "postgresql:///db?host=h&port=zz",
+      "postgresql://h/db?port=zz", "postgresql://[::1]:zz/db",
+    ]:
+      let msg = rejectedMsg(dsn)
+      check "Invalid port" in msg
+      check "%2F" notin msg
+
+  test "encoded '/' and '?' in the password":
+    let cfg = parseDsn("postgresql://u:a%2Fb%3Fc@h/db")
+    check cfg.password == "a/b?c"
+    check cfg.host == "h"
 
   test "URL-encoded database":
     let cfg = parseDsn("postgresql://host/my%2Fdb")
@@ -187,6 +375,55 @@ suite "parseDsn":
     check cfg.extraParams.len == 2
     check cfg.extraParams[0] == ("search_path", "public")
     check cfg.extraParams[1] == ("options", "-c log_statement=all")
+
+  test "client_encoding accepts only UTF8 spellings":
+    for v in ["UTF8", "utf-8", "Unicode"]:
+      let cfg = parseDsn("postgresql://host/db?client_encoding=" & v)
+      check cfg.extraParams.len == 0
+    check parseDsn("host=h client_encoding=utf8").extraParams.len == 0
+    check parseDsn("host=h CLIENT_ENCODING=utf8").extraParams.len == 0
+    expect PgConfigError:
+      discard parseDsn("postgresql://host/db?client_encoding=SJIS")
+    expect PgConfigError:
+      discard parseDsn("host=h client_encoding=auto")
+
+  test "validateConnConfig rejects a non-UTF8 client_encoding in extraParams":
+    var cfg = parseDsn("postgresql://host/db")
+    cfg.extraParams = @[("client_encoding", "UTF-8")]
+    validateConnConfig(cfg)
+    cfg.extraParams = @[("client_encoding", "SJIS")]
+    expect PgConfigError:
+      validateConnConfig(cfg)
+    cfg.extraParams = @[("CLIENT_ENCODING", "LATIN1")]
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "validateConnConfig rejects a non-UTF8 client_encoding in options":
+    var cfg = parseDsn("postgresql://host/db")
+    for opts in [
+      "-c client_encoding=UTF8", "--client-encoding=unicode",
+      "-c search_path=a\\ b -c work_mem=64MB", "-c client_encoding",
+    ]:
+      cfg.extraParams = @[("options", opts)]
+      validateConnConfig(cfg)
+    for opts in [
+      "-c client_encoding=LATIN1", "-cclient_encoding=SJIS", "--CLIENT-ENCODING=SJIS",
+      "-c work_mem=1MB  -c   client_encoding=SJIS", "-c client_encoding=a\\ b",
+    ]:
+      cfg.extraParams = @[("options", opts)]
+      expect PgConfigError:
+        validateConnConfig(cfg)
+    expect PgConfigError:
+      discard parseDsn("host=h options='-c client_encoding=LATIN1'")
+    expect PgConfigError:
+      discard parseDsn("postgresql://host/db?CLIENT_ENCODING=LATIN1")
+
+  test "splitStartupOptions matches pg_split_opts":
+    check splitStartupOptions("  -c a=b\\ c   -d ") == @["-c", "a=b c", "-d"]
+    check splitStartupOptions("a\\\\b") == @["a\\b"]
+    # A trailing escape is dropped, leaving an empty argument when alone.
+    check splitStartupOptions("-c x\\") == @["-c", "x"]
+    check splitStartupOptions("-c \\") == @["-c", ""]
 
   test "multiple query params":
     let cfg = parseDsn(
@@ -578,13 +815,76 @@ suite "parseDsn":
     check cfg.hosts[1].host == "h2"
     check cfg.hosts[1].port == 5433
 
-  test "multi-host empty entry selects default (libpq parity)":
-    let cfg = parseDsn("postgresql://h1,,h3/db")
-    check cfg.hosts.len == 3
-    check cfg.hosts[0].host == "h1"
-    check cfg.hosts[1].host == "127.0.0.1"
-    check cfg.hosts[1].port == 5432
-    check cfg.hosts[2].host == "h3"
+  test "error: empty entry in a URI multi-host list":
+    expect PgConfigError:
+      discard parseDsn("postgresql://h1,,h3/db")
+
+  test "error: trailing comma in a URI multi-host list":
+    expect PgConfigError:
+      discard parseDsn("postgresql://h1,h3,/db")
+
+  test "error: empty host query parameter overriding the authority":
+    expect PgConfigError:
+      discard parseDsn("postgresql://h1/db?host=")
+
+  test "error: empty host with an empty hostaddr element":
+    for dsn in [
+      "postgresql:///db?host=&hostaddr=10.0.0.1,", "postgresql:///db?host=&hostaddr=,",
+      "host='' hostaddr=10.0.0.1,",
+    ]:
+      expect PgConfigError:
+        discard parseDsn(dsn)
+
+  test "error: empty hostaddr element with no host parameter":
+    # The mis-templating hazard is the same when only `hostaddr` is spelled
+    # out: an unset variable must not leave a localhost failover target.
+    for dsn in [
+      "postgresql:///db?hostaddr=10.0.0.1,", "postgresql:///db?hostaddr=,10.0.0.1",
+      "hostaddr=10.0.0.1,", "hostaddr=,10.0.0.1",
+    ]:
+      expect PgConfigError:
+        discard parseDsn(dsn)
+
+  test "error: an all-empty hostaddr parameter":
+    # An unset `hostaddr=$VAR` names no target, and defaulting it to
+    # localhost would hand the credentials to whatever listens there — the
+    # same hazard `host=` is rejected for. Intentionally stricter than libpq.
+    for dsn in ["postgresql:///db?hostaddr=", "dbname=db hostaddr=", "hostaddr=''"]:
+      expect PgConfigError:
+        discard parseDsn(dsn)
+
+  test "empty host paired with a hostaddr stays valid":
+    let cfg = parseDsn("postgresql:///db?host=&hostaddr=10.0.0.1")
+    check cfg.hosts == @[HostEntry(host: "", hostaddr: "10.0.0.1", port: 5432)]
+
+  test "error: empty entry in a host query parameter list":
+    expect PgConfigError:
+      discard parseDsn("postgresql:///db?host=h1,,h3")
+
+  test "error: authority with a port but no host":
+    expect PgConfigError:
+      discard parseDsn("postgresql://:5433/db")
+
+  test "host/hostaddr count mismatch is reported as a count mismatch":
+    # The empty element is a symptom here; the message must name both counts.
+    var msg = ""
+    try:
+      discard parseDsn("postgresql:///db?host=h1,&hostaddr=10.0.0.1")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.contains("Could not match")
+
+  test "empty host entry backed by a hostaddr stays valid":
+    let cfg = parseDsn("postgresql:///db?host=h1,&hostaddr=10.0.0.1,10.0.0.2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[1].host == ""
+    check cfg.hosts[1].hostaddr == "10.0.0.2"
+
+  test "omitted host still defaults":
+    let cfg = parseDsn("postgresql:///db?port=5433")
+    check cfg.hosts.len == 1
+    check cfg.hosts[0].host == "127.0.0.1"
+    check cfg.hosts[0].port == 5433
 
   test "host and port as query parameters (libpq documented form)":
     let cfg = parseDsn("postgresql:///mydb?host=localhost&port=5433")
@@ -642,6 +942,20 @@ suite "parseDsn":
   test "error: unbracketed IPv6 literal with trailing port in DSN":
     expect PgError:
       discard parseDsn("postgresql://user:pass@2001:db8::1:5432/db")
+
+  test "error: empty IPv6 brackets do not default to localhost":
+    # ``[]`` must not fall through buildHosts empty-host → 127.0.0.1.
+    var raised = false
+    try:
+      discard parseDsn("postgresql://[]/db")
+    except PgConfigError as e:
+      raised = true
+      check "Empty IPv6" in e.msg or "IPv6" in e.msg
+    check raised
+
+  test "error: empty IPv6 brackets with port":
+    expect PgConfigError:
+      discard parseDsn("postgresql://[]:5432/db")
 
   test "target_session_attrs all values":
     check parseDsn("postgresql://h/db?target_session_attrs=any").targetSessionAttrs ==
@@ -794,6 +1108,94 @@ suite "parseDsn":
     check cfg.sslCert == dummyPem
     check cfg.sslKey == dummyPem
 
+  test "error: empty sslcert PEM file rejected":
+    let certPath = writePemFile("")
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    var raised = false
+    try:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+    except PgConfigError as e:
+      raised = true
+      check "file is empty" in e.msg
+    check raised
+
+  test "error: empty sslkey PEM file rejected":
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile("")
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    var raised = false
+    try:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+    except PgConfigError as e:
+      raised = true
+      check "file is empty" in e.msg
+    check raised
+
+  test "error: oversized sslcert PEM file rejected":
+    # Cap is 4 MiB; write just over the limit without holding it all in a Nim string
+    # twice longer than needed for the assert.
+    const overLimit = 4 * 1024 * 1024 + 1
+    let certPath = writePemFile(newString(overLimit))
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    var raised = false
+    try:
+      discard parseDsn(
+        "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+      )
+    except PgConfigError as e:
+      raised = true
+      check "size limit" in e.msg
+    check raised
+
+  test "a small PEM file does not retain a cap-sized buffer":
+    # `setLen` shrinks the length but not the payload, so reading into a
+    # cap-sized buffer would keep 4 MiB resident per file for the lifetime of
+    # the config.
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    let dsn =
+      "postgresql://host/db?sslmode=require&sslcert=" & certPath & "&sslkey=" & keyPath
+    const copies = 8
+    var configs: seq[ConnConfig]
+    GC_fullCollect()
+    let before = getOccupiedMem()
+    for _ in 0 ..< copies:
+      configs.add parseDsn(dsn)
+    check configs.len == copies
+    for cfg in configs:
+      check cfg.sslCert == dummyPem
+      check cfg.sslKey == dummyPem
+    # A retained cap-sized buffer costs 2 * copies * 4 MiB; the slack keeps the
+    # bound clear of GC/allocator noise, which varies with --mm.
+    GC_fullCollect()
+    check getOccupiedMem() - before < 4 * 1024 * 1024
+
+  when defined(linux):
+    test "a file reporting st_size == 0 is still read in full":
+      # procfs/sysfs stream their content; the size hint must only seed the
+      # buffer, not bound the read.
+      const streamed = "/proc/self/status"
+      if fileExists(streamed):
+        let cfg =
+          parseDsn("postgresql://host/db?sslmode=verify-ca&sslrootcert=" & streamed)
+        check cfg.sslRootCert.len > 0
+        check "Name:" in cfg.sslRootCert
+
   test "error: sslcert with sslmode=disable rejected":
     let certPath = writePemFile(dummyPem)
     let keyPath = writeKeyFile(dummyPem)
@@ -815,6 +1217,25 @@ suite "parseDsn":
       discard parseDsn(
         "postgresql://host/db?sslmode=allow&sslcert=" & certPath & "&sslkey=" & keyPath
       )
+
+  test "the sslmode rejection names the libpq spelling, not the enum identifier":
+    # `$sslDisable` is "sslDisable", which is not a value anyone can write in a
+    # connection string: the message has to name something the user can act on.
+    let certPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(certPath)
+      removeFile(keyPath)
+    for mode in ["disable", "allow"]:
+      try:
+        discard parseDsn(
+          "postgresql://host/db?sslmode=" & mode & "&sslcert=" & certPath & "&sslkey=" &
+            keyPath
+        )
+        check false
+      except PgError as e:
+        check "(got " & mode & ")" in e.msg
+        check "ssl" & mode.capitalizeAscii notin e.msg
 
   when defined(posix):
     test "error: sslkey with group-readable permissions rejected":
@@ -963,12 +1384,17 @@ suite "parseDsn keyword=value":
     check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
     check cfg.hosts[1] == HostEntry(host: "h2", port: 5434)
 
-  test "multi-host empty entry selects default":
-    let cfg = parseDsn("host=h1,,h3 port=5433,,5435")
-    check cfg.hosts.len == 3
-    check cfg.hosts[0] == HostEntry(host: "h1", port: 5433)
-    check cfg.hosts[1] == HostEntry(host: "127.0.0.1", port: 5432)
-    check cfg.hosts[2] == HostEntry(host: "h3", port: 5435)
+  test "error: multi-host empty entry":
+    expect PgConfigError:
+      discard parseDsn("host=h1,,h3 port=5433,,5435")
+
+  test "error: empty host keyword":
+    expect PgConfigError:
+      discard parseDsn("dbname=db host=''")
+
+  test "empty port entry still selects the default port":
+    let cfg = parseDsn("host=h1,h2,h3 port=5433,,5435")
+    check cfg.hosts[1] == HostEntry(host: "h2", port: 5432)
 
   test "multi-host hostaddr comma-separated":
     let cfg = parseDsn("hostaddr=10.0.0.1,10.0.0.2")
@@ -1083,6 +1509,16 @@ suite "parseDsn keyword=value":
   test "error: digit-group underscore in port (libpq rejects)":
     expect PgError:
       discard parseDsn("host=h port=5_433")
+
+  test "error: digit-group underscore in non-port integers":
+    for dsn in [
+      "host=h connect_timeout=1_0", "host=h sslsni=1_0", "host=h keepalives=1_0",
+      "host=h keepalives_idle=1_0", "host=h keepalives_interval=1_0",
+      "host=h keepalives_count=1_0", "host=h max_message_size=1_0",
+      "host=h max_scram_iterations=1_0",
+    ]:
+      expect PgError:
+        discard parseDsn(dsn)
 
   test "error: invalid port":
     expect PgError:
@@ -1221,6 +1657,79 @@ suite "applyParam multi-host":
     check cfg.getHosts() == @[HostEntry(host: "new", port: 5433)]
     check cfg.host == "new"
 
+  test "empty host element may be paired by a later hostaddr":
+    # `host` and `hostaddr` must be applicable in either order; an unpaired
+    # empty host is left for `validateConnConfig` to reject.
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,")
+    cfg.applyParam("hostaddr", "10.0.0.1,10.0.0.2")
+    check cfg.hosts.len == 2
+    check cfg.hosts[0] == HostEntry(host: "h1", hostaddr: "10.0.0.1", port: 5432)
+    check cfg.hosts[1] == HostEntry(host: "", hostaddr: "10.0.0.2", port: 5432)
+
+  test "an unpaired empty host element never becomes localhost":
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,")
+    cfg.applyParam("port", "5433")
+    check cfg.hosts[1].host == ""
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "dropping the hostaddr of an empty host does not default it":
+    # The empty host stays explicit, so the rebuilt entry must not silently
+    # become localhost once its pairing address is cleared.
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "h1,")
+    cfg.applyParam("hostaddr", "10.0.0.1,10.0.0.2")
+    cfg.applyParam("hostaddr", "")
+    check cfg.hosts[1].host == ""
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "an empty hostaddr element never becomes localhost":
+    # `applyParam` does not run `checkExplicitHosts` (the lists may arrive in
+    # any order), so the empty entry must survive to `validateConnConfig`.
+    var cfg = ConnConfig()
+    cfg.applyParam("hostaddr", "10.0.0.1,")
+    check cfg.hosts.len == 2
+    check cfg.hosts[1] == HostEntry(host: "", hostaddr: "", port: 5432)
+    expect PgConfigError:
+      validateConnConfig(cfg)
+
+  test "clearing hostaddr leaves a host name dialable":
+    # An all-empty `hostaddr` is "not provided", so it must not turn the
+    # surviving host name into an explicitly empty target.
+    var cfg = ConnConfig()
+    cfg.applyParam("host", "db.example.com")
+    cfg.applyParam("hostaddr", "10.0.0.1")
+    cfg.applyParam("hostaddr", "")
+    check cfg.hosts == @[HostEntry(host: "db.example.com", port: 5432)]
+    validateConnConfig(cfg)
+
+  test "a never-set host still defaults to localhost":
+    # An all-empty scalar config is the zero value, not an explicitly empty
+    # host, so rebuilding `hosts` must keep the 127.0.0.1 default.
+    var cfg = ConnConfig()
+    cfg.applyParam("port", "5433")
+    check cfg.hosts == @[HostEntry(host: "127.0.0.1", port: 5433)]
+    validateConnConfig(cfg)
+
+  test "an explicit 127.0.0.1 element survives a rebuild beside a hostaddr":
+    # The localhost fold is only valid for a single implicit target: with a
+    # sibling carrying a `hostaddr` the entry was spelled out, so rebuilding
+    # must keep the name instead of blanking it.
+    var cfg = parseDsn("host=127.0.0.1,db2 hostaddr=,10.0.0.2")
+    cfg.applyParam("port", "5433")
+    check cfg.hosts[0] == HostEntry(host: "127.0.0.1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "db2", hostaddr: "10.0.0.2", port: 5433)
+    validateConnConfig(cfg)
+
+  test "an explicit 127.0.0.1 element survives a rebuild beside a plain host":
+    var cfg = parseDsn("host=127.0.0.1,db2")
+    cfg.applyParam("port", "5433")
+    check cfg.hosts[0] == HostEntry(host: "127.0.0.1", port: 5433)
+    check cfg.hosts[1] == HostEntry(host: "db2", port: 5433)
+
   test "error: hostaddr count mismatch against existing hosts":
     var cfg = ConnConfig()
     cfg.applyParam("host", "h1,h2")
@@ -1246,13 +1755,15 @@ suite "applyParam multi-host":
         fail()
       check caughtBase
     block:
-      var caught: ref PgConfigError = nil
+      # Widen to `ref Exception` so `of PgError` is a runtime check (not CondTrue).
+      var caught: ref Exception = nil
       try:
         discard parseDsn("postgresql://host/db?sslmode=bogus")
       except PgConfigError as e:
         caught = e
       check caught != nil
       check (caught of PgError)
+      check (caught of PgConfigError)
 
 suite "DSN parse failures omit secret content":
   test "malformed percent-encoding in password reports offset/len, not content":

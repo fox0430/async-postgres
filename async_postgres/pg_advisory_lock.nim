@@ -76,12 +76,18 @@
 ##   conn.withAdvisoryLock(42'i64):
 ##     echo "lock held here"
 
-import std/[macros, importutils]
+import std/macros
 
-import async_backend, pg_protocol, pg_types, pg_connection, pg_client
+import async_backend, pg_protocol, pg_types, pg_client
 import pg_connection/types
+import pg_client/transaction
 
-privateAccess(PgConnection)
+type AdvisoryLockArgs = object
+  ## The key(s) and timeout of a session-level ``withAdvisoryLock*`` call.
+  twoKey: bool
+  key: int64
+  key1, key2: int32
+  timeout: Duration
 
 # Internal body templates
 #
@@ -94,24 +100,21 @@ template acquireSessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ) =
   discard await conn.queryValue(sql, params, timeout = t)
-  inc conn.heldSessionLocks
-  conn.sessionLockDirty = true
+  conn.noteSessionLockAcquired()
 
 template trySessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ): bool =
   let acquired = await conn.queryValue(bool, sql, params, timeout = t)
   if acquired:
-    inc conn.heldSessionLocks
-    conn.sessionLockDirty = true
+    conn.noteSessionLockAcquired()
   acquired
 
 template unlockSessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
 ): bool =
   let released = await conn.queryValue(bool, sql, params, timeout = t)
-  if released and conn.heldSessionLocks > 0:
-    dec conn.heldSessionLocks
+  conn.noteSessionLockReleased(released)
   released
 
 proc ensureXactScope(conn: PgConnection) {.inline.} =
@@ -193,8 +196,7 @@ proc advisoryUnlockAll*(
 ): Future[void] {.async.} =
   ## Release all session-level advisory locks held by the current session.
   discard await conn.exec("SELECT pg_advisory_unlock_all()", timeout = timeout)
-  conn.heldSessionLocks = 0
-  conn.sessionLockDirty = false
+  conn.clearSessionLocks()
 
 # Transaction-level exclusive locks
 
@@ -366,34 +368,39 @@ proc advisoryTryLockXactShared*(
 # failures are reported via the connection's tracer
 # (``onAdvisoryUnlockFailed``); if the connection is lost the server releases
 # the session lock anyway.
+#
+# Body ``return`` / ``break`` / ``continue`` that would escape the body are
+# rejected at compile time: they would skip the unlock and hold the session
+# lock until the connection closes.
+
+proc advisoryLockArgs(key: int64, timeout: Duration = ZeroDuration): AdvisoryLockArgs =
+  AdvisoryLockArgs(key: key, timeout: timeout)
+
+proc advisoryLockArgs(
+    key1, key2: int32, timeout: Duration = ZeroDuration
+): AdvisoryLockArgs =
+  AdvisoryLockArgs(twoKey: true, key1: key1, key2: key2, timeout: timeout)
 
 template withAdvisoryLockCore(
     c: PgConnection,
     lockProc, unlockProc: untyped,
-    k: int64,
-    k1, k2: int32,
-    shared, twoKey, hasTimeout: static bool,
-    t: Duration,
+    a: AdvisoryLockArgs,
+    shared: static bool,
     body: untyped,
 ) =
   ## Internal helper implementing the acquire/try/finally pattern for all
-  ## session-level ``withAdvisoryLock*`` macros. ``c``, ``k``/``k1``/``k2``
-  ## must already be bound to ``let`` symbols by the caller macro.
-  when hasTimeout:
-    when twoKey:
-      await c.lockProc(k1, k2, timeout = t)
-    else:
-      await c.lockProc(k, timeout = t)
+  ## session-level ``withAdvisoryLock*`` macros. ``c`` and ``a`` must already
+  ## be bound to ``let`` symbols by the caller macro.
+  const macroName = when shared: "withAdvisoryLockShared" else: "withAdvisoryLock"
+  if a.twoKey:
+    await c.lockProc(a.key1, a.key2, timeout = a.timeout)
   else:
-    when twoKey:
-      await c.lockProc(k1, k2)
-    else:
-      await c.lockProc(k)
+    await c.lockProc(a.key, timeout = a.timeout)
 
   var bodyErr: ref CatchableError = nil
   var bodyDefect: ref Defect = nil
   try:
-    body
+    checkTemplateBodyEscape(body, macroName, "the advisory unlock")
   except CatchableError as e:
     bodyErr = e
   except Defect as d:
@@ -403,23 +410,25 @@ template withAdvisoryLockCore(
 
   try:
     var released: bool
-    when hasTimeout:
-      when twoKey:
-        released = await c.unlockProc(k1, k2, timeout = t)
-      else:
-        released = await c.unlockProc(k, timeout = t)
+    if a.twoKey:
+      released = await c.unlockProc(a.key1, a.key2, timeout = a.timeout)
     else:
-      when twoKey:
-        released = await c.unlockProc(k1, k2)
-      else:
-        released = await c.unlockProc(k)
+      released = await c.unlockProc(a.key, timeout = a.timeout)
     if not released:
       # The unlock query succeeded but the server reports the lock was not
       # held (``pg_advisory_unlock*`` returned ``false``). Report it with a
       # nil ``err`` so observers can distinguish it from a raised failure.
-      fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, nil)
+      fireAdvisoryUnlockFailed(c, a.key, a.key1, a.key2, shared, a.twoKey, nil)
   except CatchableError as e:
-    fireAdvisoryUnlockFailed(c, k, k1, k2, shared, twoKey, e)
+    fireAdvisoryUnlockFailed(c, a.key, a.key1, a.key2, shared, a.twoKey, e)
+  except Defect as d:
+    # Same-frame Defect from the unlock: surface it only when it can't
+    # replace a body error.
+    if bodyErr == nil and bodyDefect == nil:
+      raise d
+    fireAdvisoryUnlockFailed(
+      c, a.key, a.key1, a.key2, shared, a.twoKey, newException(PgError, d.msg, d)
+    )
 
   if bodyErr != nil:
     # Re-raise the original body exception now that the lock has been released,
@@ -428,272 +437,115 @@ template withAdvisoryLockCore(
   if bodyDefect != nil:
     raise bodyDefect
 
-macro withAdvisoryLock*(conn: PgConnection, key: int64, body: untyped): untyped =
+proc splitAdvisoryLockBody(
+    macroName: string, args: NimNode
+): tuple[lockArgs: seq[NimNode], body: NimNode] =
+  ## Split the lock arguments from the body. Overloads per argument list would
+  ## type-check the body as a longer overload's ``timeout``/``key2`` first,
+  ## rejecting any type declared in it when it is spliced again.
+  if args.len == 0 or args[^1].kind != nnkStmtList:
+    error(
+      macroName & " expects (conn, key), (conn, key, timeout), (conn, key1, key2) or " &
+        "(conn, key1, key2, timeout) followed by the body",
+      if args.len == 0:
+        args
+      else:
+        args[^1],
+    )
+  for i in 0 ..< args.len - 1:
+    result.lockArgs.add(args[i])
+  result.body = args[^1]
+
+proc buildSessionAdvisoryLock(conn, args: NimNode, shared: bool): NimNode =
+  ## Expand a session-level ``withAdvisoryLock`` / ``withAdvisoryLockShared``
+  ## call. ``conn``, then the keys and the timeout, are each evaluated once
+  ## into ``let`` bindings.
+  let macroName = if shared: "withAdvisoryLockShared" else: "withAdvisoryLock"
+  let (lockArgs, body) = splitAdvisoryLockBody(macroName, args)
+  let (lockProc, unlockProc) =
+    if shared:
+      (bindSym"advisoryLockShared", bindSym"advisoryUnlockShared")
+    else:
+      (bindSym"advisoryLock", bindSym"advisoryUnlock")
+  let c = genSym(nskLet, "conn")
+  let a = genSym(nskLet, "lockArgs")
+  let argsCall = newCall(bindSym"advisoryLockArgs", lockArgs)
+  # Report a mismatch at the arguments rather than at the body.
+  argsCall.copyLineInfo(
+    if lockArgs.len > 0:
+      lockArgs[0]
+    else:
+      conn
+  )
+  newStmtList(
+    newLetStmt(c, conn),
+    newLetStmt(a, argsCall),
+    newCall(
+      bindSym"withAdvisoryLockCore", c, lockProc, unlockProc, a, newLit(shared), body
+    ),
+  )
+
+proc buildXactAdvisoryLock(conn, args: NimNode, shared: bool): NimNode =
+  ## Expand a ``withAdvisoryLockXact`` / ``withAdvisoryLockXactShared`` call:
+  ## the lock arguments go to the ``advisoryLockXact*`` overloads.
+  let macroName = if shared: "withAdvisoryLockXactShared" else: "withAdvisoryLockXact"
+  let (lockArgs, body) = splitAdvisoryLockBody(macroName, args)
+  let lock = newCall(
+    if shared:
+      bindSym"advisoryLockXactShared"
+    else:
+      bindSym"advisoryLockXact",
+    conn,
+  )
+  for arg in lockArgs:
+    lock.add(arg)
+  lock.copyLineInfo(
+    if lockArgs.len > 0:
+      lockArgs[0]
+    else:
+      conn
+  )
+  quote:
+    await `lock`
+    `body`
+
+macro withAdvisoryLock*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Acquire a session-level exclusive advisory lock, execute ``body``,
-  ## then release the lock (even on exception).
+  ## then release the lock (even on exception). Accepts
+  ## ``(conn, key: int64)``, ``(conn, key: int64, timeout: Duration)``,
+  ## ``(conn, key1, key2: int32)`` or
+  ## ``(conn, key1, key2: int32, timeout: Duration)``, followed by the body.
+  ## ``timeout`` bounds the lock and unlock queries, not ``body``.
   ##
   ## If unlocking fails (for example because the connection was lost), the
   ## failure is reported through the connection's tracer
   ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
   ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k = genSym(nskLet, "key")
-  let connExpr = conn
-  let keyExpr = key
-  result = quote:
-    let `c` = `connExpr`
-    let `k` = `keyExpr`
-    withAdvisoryLockCore(
-      `c`, advisoryLock, advisoryUnlock, `k`, 0'i32, 0'i32, false, false, false,
-      ZeroDuration,
-    ):
-      `body`
+  buildSessionAdvisoryLock(conn, args, shared = false)
 
-macro withAdvisoryLock*(
-    conn: PgConnection, key: int64, timeout: Duration, body: untyped
-): untyped =
-  ## Acquire a session-level exclusive advisory lock with a timeout,
-  ## execute ``body``, then release the lock (even on exception).
-  ##
-  ## If unlocking fails (for example because the connection was lost), the
-  ## failure is reported through the connection's tracer
-  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
-  ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k = genSym(nskLet, "key")
-  let t = genSym(nskLet, "timeout")
-  let connExpr = conn
-  let keyExpr = key
-  let timeoutExpr = timeout
-  result = quote:
-    let `c` = `connExpr`
-    let `k` = `keyExpr`
-    let `t` = `timeoutExpr`
-    withAdvisoryLockCore(
-      `c`, advisoryLock, advisoryUnlock, `k`, 0'i32, 0'i32, false, false, true, `t`
-    ):
-      `body`
-
-macro withAdvisoryLock*(conn: PgConnection, key1, key2: int32, body: untyped): untyped =
-  ## Acquire a session-level exclusive advisory lock (two int32 keys),
-  ## execute ``body``, then release the lock (even on exception).
-  ##
-  ## If unlocking fails (for example because the connection was lost), the
-  ## failure is reported through the connection's tracer
-  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
-  ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k1 = genSym(nskLet, "key1")
-  let k2 = genSym(nskLet, "key2")
-  let connExpr = conn
-  let key1Expr = key1
-  let key2Expr = key2
-  result = quote:
-    let `c` = `connExpr`
-    let `k1` = `key1Expr`
-    let `k2` = `key2Expr`
-    withAdvisoryLockCore(
-      `c`, advisoryLock, advisoryUnlock, 0'i64, `k1`, `k2`, false, true, false,
-      ZeroDuration,
-    ):
-      `body`
-
-macro withAdvisoryLock*(
-    conn: PgConnection, key1, key2: int32, timeout: Duration, body: untyped
-): untyped =
-  ## Acquire a session-level exclusive advisory lock (two int32 keys)
-  ## with a timeout, execute ``body``, then release the lock (even on exception).
-  ##
-  ## If unlocking fails (for example because the connection was lost), the
-  ## failure is reported through the connection's tracer
-  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
-  ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k1 = genSym(nskLet, "key1")
-  let k2 = genSym(nskLet, "key2")
-  let t = genSym(nskLet, "timeout")
-  let connExpr = conn
-  let key1Expr = key1
-  let key2Expr = key2
-  let timeoutExpr = timeout
-  result = quote:
-    let `c` = `connExpr`
-    let `k1` = `key1Expr`
-    let `k2` = `key2Expr`
-    let `t` = `timeoutExpr`
-    withAdvisoryLockCore(
-      `c`, advisoryLock, advisoryUnlock, 0'i64, `k1`, `k2`, false, true, true, `t`
-    ):
-      `body`
-
-macro withAdvisoryLockShared*(conn: PgConnection, key: int64, body: untyped): untyped =
+macro withAdvisoryLockShared*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Acquire a session-level shared advisory lock, execute ``body``,
-  ## then release the lock (even on exception).
+  ## then release the lock (even on exception). Accepts the same argument
+  ## lists as ``withAdvisoryLock``.
   ##
   ## If unlocking fails (for example because the connection was lost), the
   ## failure is reported through the connection's tracer
   ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
   ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k = genSym(nskLet, "key")
-  let connExpr = conn
-  let keyExpr = key
-  result = quote:
-    let `c` = `connExpr`
-    let `k` = `keyExpr`
-    withAdvisoryLockCore(
-      `c`, advisoryLockShared, advisoryUnlockShared, `k`, 0'i32, 0'i32, true, false,
-      false, ZeroDuration,
-    ):
-      `body`
+  buildSessionAdvisoryLock(conn, args, shared = true)
 
-macro withAdvisoryLockShared*(
-    conn: PgConnection, key: int64, timeout: Duration, body: untyped
-): untyped =
-  ## Acquire a session-level shared advisory lock with a timeout,
-  ## execute ``body``, then release the lock (even on exception).
-  ##
-  ## If unlocking fails (for example because the connection was lost), the
-  ## failure is reported through the connection's tracer
-  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
-  ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k = genSym(nskLet, "key")
-  let t = genSym(nskLet, "timeout")
-  let connExpr = conn
-  let keyExpr = key
-  let timeoutExpr = timeout
-  result = quote:
-    let `c` = `connExpr`
-    let `k` = `keyExpr`
-    let `t` = `timeoutExpr`
-    withAdvisoryLockCore(
-      `c`, advisoryLockShared, advisoryUnlockShared, `k`, 0'i32, 0'i32, true, false,
-      true, `t`,
-    ):
-      `body`
+# Transaction-level convenience macros
 
-macro withAdvisoryLockShared*(
-    conn: PgConnection, key1, key2: int32, body: untyped
-): untyped =
-  ## Acquire a session-level shared advisory lock (two int32 keys),
-  ## execute ``body``, then release the lock (even on exception).
-  ##
-  ## If unlocking fails (for example because the connection was lost), the
-  ## failure is reported through the connection's tracer
-  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
-  ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k1 = genSym(nskLet, "key1")
-  let k2 = genSym(nskLet, "key2")
-  let connExpr = conn
-  let key1Expr = key1
-  let key2Expr = key2
-  result = quote:
-    let `c` = `connExpr`
-    let `k1` = `key1Expr`
-    let `k2` = `key2Expr`
-    withAdvisoryLockCore(
-      `c`, advisoryLockShared, advisoryUnlockShared, 0'i64, `k1`, `k2`, true, true,
-      false, ZeroDuration,
-    ):
-      `body`
-
-macro withAdvisoryLockShared*(
-    conn: PgConnection, key1, key2: int32, timeout: Duration, body: untyped
-): untyped =
-  ## Acquire a session-level shared advisory lock (two int32 keys)
-  ## with a timeout, execute ``body``, then release the lock (even on exception).
-  ##
-  ## If unlocking fails (for example because the connection was lost), the
-  ## failure is reported through the connection's tracer
-  ## (``onAdvisoryUnlockFailed``) so the original exception from ``body`` is
-  ## not masked.
-  let c = genSym(nskLet, "conn")
-  let k1 = genSym(nskLet, "key1")
-  let k2 = genSym(nskLet, "key2")
-  let t = genSym(nskLet, "timeout")
-  let connExpr = conn
-  let key1Expr = key1
-  let key2Expr = key2
-  let timeoutExpr = timeout
-  result = quote:
-    let `c` = `connExpr`
-    let `k1` = `key1Expr`
-    let `k2` = `key2Expr`
-    let `t` = `timeoutExpr`
-    withAdvisoryLockCore(
-      `c`, advisoryLockShared, advisoryUnlockShared, 0'i64, `k1`, `k2`, true, true,
-      true, `t`,
-    ):
-      `body`
-
-# Transaction-level convenience templates
-
-template withAdvisoryLockXact*(conn: PgConnection, key: int64, body: untyped) =
+macro withAdvisoryLockXact*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Acquire a transaction-level exclusive advisory lock inside a transaction,
   ## execute ``body``. The lock is automatically released at transaction end.
-  ## Must be called within ``withTransaction``.
-  await conn.advisoryLockXact(key)
-  body
+  ## Must be called within ``withTransaction``. Accepts the same argument
+  ## lists as ``withAdvisoryLock``.
+  buildXactAdvisoryLock(conn, args, shared = false)
 
-template withAdvisoryLockXact*(
-    conn: PgConnection, key: int64, timeout: Duration, body: untyped
-) =
-  ## Acquire a transaction-level exclusive advisory lock with a timeout
-  ## inside a transaction, execute ``body``. The lock is automatically
-  ## released at transaction end. Must be called within ``withTransaction``.
-  await conn.advisoryLockXact(key, timeout = timeout)
-  body
-
-template withAdvisoryLockXact*(conn: PgConnection, key1, key2: int32, body: untyped) =
-  ## Acquire a transaction-level exclusive advisory lock (two int32 keys)
-  ## inside a transaction, execute ``body``. The lock is automatically
-  ## released at transaction end. Must be called within ``withTransaction``.
-  await conn.advisoryLockXact(key1, key2)
-  body
-
-template withAdvisoryLockXact*(
-    conn: PgConnection, key1, key2: int32, timeout: Duration, body: untyped
-) =
-  ## Acquire a transaction-level exclusive advisory lock (two int32 keys)
-  ## with a timeout inside a transaction, execute ``body``. The lock is
-  ## automatically released at transaction end.
-  ## Must be called within ``withTransaction``.
-  await conn.advisoryLockXact(key1, key2, timeout = timeout)
-  body
-
-template withAdvisoryLockXactShared*(conn: PgConnection, key: int64, body: untyped) =
+macro withAdvisoryLockXactShared*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Acquire a transaction-level shared advisory lock inside a transaction,
   ## execute ``body``. The lock is automatically released at transaction end.
-  ## Must be called within ``withTransaction``.
-  await conn.advisoryLockXactShared(key)
-  body
-
-template withAdvisoryLockXactShared*(
-    conn: PgConnection, key: int64, timeout: Duration, body: untyped
-) =
-  ## Acquire a transaction-level shared advisory lock with a timeout
-  ## inside a transaction, execute ``body``. The lock is automatically
-  ## released at transaction end. Must be called within ``withTransaction``.
-  await conn.advisoryLockXactShared(key, timeout = timeout)
-  body
-
-template withAdvisoryLockXactShared*(
-    conn: PgConnection, key1, key2: int32, body: untyped
-) =
-  ## Acquire a transaction-level shared advisory lock (two int32 keys)
-  ## inside a transaction, execute ``body``. The lock is automatically
-  ## released at transaction end. Must be called within ``withTransaction``.
-  await conn.advisoryLockXactShared(key1, key2)
-  body
-
-template withAdvisoryLockXactShared*(
-    conn: PgConnection, key1, key2: int32, timeout: Duration, body: untyped
-) =
-  ## Acquire a transaction-level shared advisory lock (two int32 keys)
-  ## with a timeout inside a transaction, execute ``body``. The lock is
-  ## automatically released at transaction end.
-  ## Must be called within ``withTransaction``.
-  await conn.advisoryLockXactShared(key1, key2, timeout = timeout)
-  body
+  ## Must be called within ``withTransaction``. Accepts the same argument
+  ## lists as ``withAdvisoryLock``.
+  buildXactAdvisoryLock(conn, args, shared = true)

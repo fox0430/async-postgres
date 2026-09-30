@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, tables, math, importutils, net, macros]
+import std/[unittest, options, strutils, tables, importutils, macros]
 
 import
   ../async_postgres/[
@@ -7,7 +7,7 @@ import
   ]
 
 import ../async_postgres/pg_client/transaction {.all.}
-import ../async_postgres/pg_connection/[simple_query, lifecycle]
+import ../async_postgres/pg_connection/simple_query
 
 import e2e_common
 
@@ -310,6 +310,28 @@ suite "E2E: Transaction":
     )
     # non-PgQueryError is never retryable
     doAssert not isRetryableTxError((ref ValueError)(msg: "x"), opts.retryableStates)
+    # a 25P02 is judged by the error that aborted the transaction (its parent)
+    doAssert isRetryableTxError(
+      (ref PgQueryError)(
+        sqlState: "25P02", parent: (ref PgQueryError)(sqlState: "40001")
+      ),
+      opts.retryableStates,
+    )
+    doAssert not isRetryableTxError(
+      (ref PgQueryError)(
+        sqlState: "25P02", parent: (ref PgQueryError)(sqlState: "22012")
+      ),
+      opts.retryableStates,
+    )
+    doAssert not isRetryableTxError(
+      (ref PgQueryError)(sqlState: "25P02"), opts.retryableStates
+    )
+    doAssert not isRetryableTxError(
+      (ref PgQueryError)(
+        sqlState: "23505", parent: (ref PgQueryError)(sqlState: "40001")
+      ),
+      opts.retryableStates,
+    )
     # exponential growth, capped, jitter off => deterministic
     let g =
       RetryOptions(baseDelayMs: 10, maxDelayMs: 100, multiplier: 2.0, jitter: false)
@@ -1085,6 +1107,370 @@ suite "E2E: Transaction":
 
     )
 
+  test "withTransaction rejects break/continue passed to a loop template":
+    # The unexpanded walk can't see the loop a template wraps around its
+    # argument, so it rejects a `break`/`continue` passed to one even when that
+    # loop would capture it. The check errs on the side of rejecting.
+    template txEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            txEachN(3):
+              if conn.pid == 0:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withSavepoint:
+              txEachN(3):
+                continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionDeadline(seconds(5)):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withConnection(conn):
+              txEachN(3):
+                break
+
+    )
+
+  test "scoped bodies accept variables of a type declared in the body":
+    # Regression: splicing the type-checked body back in type-checks it a
+    # second time, which Nim rejects for a variable of a body-local object or
+    # enum type ("inconsistent typing for reintroduced symbol").
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            type TxLocal = object
+              a: int
+
+            let v = TxLocal(a: 1)
+            doAssert v.a == 1
+            conn.withSavepoint:
+              type SpLocal = enum
+                spA
+                spB
+
+              var e = spA
+              doAssert e != spB
+
+    )
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            type RetryLocal = object
+              a: int
+
+            let v = RetryLocal(a: 1)
+            doAssert v.a == 1
+
+    )
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionDeadline(conn, seconds(5)):
+            type PoolLocal = object
+              a: int
+
+            let v = PoolLocal(a: 1)
+            doAssert v.a == 1
+          pool.withConnection(conn):
+            type ConnLocal = enum
+              clA
+              clB
+
+            var e = clA
+            doAssert e != clB
+
+    )
+
+  test "withTransaction rejects break escaping through a template argument":
+    # A template that runs its body argument without a loop of its own leaves
+    # the `break` bound to the caller's loop.
+    template txTwice(body: untyped) =
+      body
+      body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withTransaction:
+              txTwice:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withConnection(conn):
+              txTwice:
+                continue
+
+    )
+
+  test "retry/pipeline/cluster scopes reject break passed to a loop template":
+    # The unexpanded walk can't see the loop a template wraps around its
+    # argument, so it rejects a `break`/`continue` passed to one even when that
+    # loop would capture it. The check errs on the side of rejecting.
+    template txEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetryDeadline(RetryOptions(), seconds(5)):
+            txEachN(3):
+              continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetry(RetryOptions(), conn):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetryDeadline(RetryOptions(), conn, seconds(5)):
+            txEachN(3):
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withPipeline(p):
+              txEachN(3):
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          for i in 0 ..< 3:
+            cluster.withReadConnection(c):
+              txEachN(3):
+                break
+            cluster.withWriteConnection(c):
+              txEachN(3):
+                continue
+          cluster.withTransactionRetry(RetryOptions(), conn):
+            txEachN(3):
+              break
+
+    )
+
+  test "retry/pipeline/cluster scopes reject break escaping through a template":
+    template txTwice(body: untyped) =
+      body
+      body
+
+    # No caller loop: the `break`/`continue` would bind to the retry loop.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            txTwice:
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetryDeadline(RetryOptions(), seconds(5)):
+            txTwice:
+              continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetry(RetryOptions(), conn):
+            txTwice:
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          pool.withTransactionRetryDeadline(RetryOptions(), conn, seconds(5)):
+            txTwice:
+              break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let pool =
+            await newPool(initPoolConfig(plainConfig(), minSize = 1, maxSize = 1))
+          for i in 0 ..< 3:
+            pool.withPipeline(p):
+              txTwice:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          for i in 0 ..< 3:
+            cluster.withReadConnection(c):
+              txTwice:
+                break
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          for i in 0 ..< 3:
+            cluster.withWriteConnection(c):
+              txTwice:
+                continue
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          var cfg = plainConfig()
+          cfg.targetSessionAttrs = tsaReadWrite
+          let cluster = await newPoolCluster(
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+            PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+          )
+          cluster.withTransactionRetry(RetryOptions(), conn):
+            txTwice:
+              break
+
+    )
+
+  test "withTransaction rejects labeled break through a loop template":
+    # The template's loop captures only unlabeled `break`s; `break outer` still
+    # leaves the body unless the body itself defines `outer`.
+    template txEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    template txLabeled(body: untyped) =
+      block outer:
+        body
+
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            block outer:
+              txEachN(3):
+                break outer
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          block outer:
+            conn.withTransaction:
+              txEachN(3):
+                break outer
+
+    )
+    # A template's own `block outer:` must not hide an escape to the caller's
+    # `outer`: its label is gensym'd, so the user's `break outer` still binds
+    # to the enclosing block.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          block outer:
+            conn.withTransaction:
+              txLabeled:
+                break outer
+
+    )
+
   test "withSavepoint rejects return at compile time":
     doAssert not compiles(
       block:
@@ -1211,6 +1597,53 @@ suite "E2E: Transaction":
           for i in 0 ..< 3:
             conn.withSavepoint:
               break
+
+    )
+
+  test "withTransaction accepts break in a while condition":
+    # Nim evaluates the condition inside the loop, so an unlabeled `break`
+    # there leaves only the `while` and COMMIT still runs.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for j in 0 ..< 2:
+            conn.withTransaction:
+              while (if j == 0: break ; false):
+                discard
+
+    )
+
+  test "withTransaction rejects break in a for iterable":
+    # The iterable is evaluated before the loop is entered, so the `break`
+    # leaves the body.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for j in 0 ..< 2:
+            conn.withTransaction:
+              for x in (if j == 0: break ; @[1]):
+                discard x
+
+    )
+
+  test "withTransaction rejects return in a template defined in the body":
+    template txLater(body: untyped) =
+      let fn = proc() {.async.} =
+        body
+      asyncSpawn fn()
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            template bail() =
+              txLater:
+                return
+
+            bail()
 
     )
 
@@ -2540,6 +2973,484 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+proc swallowQueryError(conn: PgConnection) {.async.} =
+  ## Fail a statement and swallow the error, leaving the transaction aborted.
+  try:
+    discard await conn.exec("SELECT 1/0")
+  except PgQueryError:
+    discard
+
+const serializationFailureSql =
+  "DO $$BEGIN RAISE EXCEPTION 'conflict' USING ERRCODE = 'serialization_failure'; END$$"
+
+proc swallowSerializationFailure(conn: PgConnection) {.async.} =
+  ## Like `swallowQueryError`, with a retryable 40001.
+  try:
+    discard await conn.exec(serializationFailureSql)
+  except PgQueryError:
+    discard
+
+proc causeState(e: ref PgQueryError): string =
+  ## SQLSTATE of the error a synthesized 25P02 names as its parent.
+  doAssert e.parent != nil and e.parent of PgQueryError
+  (ref PgQueryError)(e.parent).sqlState
+
+proc newRollbackTracedPool(): Future[(PgPool, ref seq[string])] {.async.} =
+  ## A single-connection pool recording every ROLLBACK it sends.
+  var cfg = plainConfig()
+  let (tracer, rollbacks) = rollbackTracer()
+  cfg.tracer = tracer
+  let pool = await newPool(PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1))
+  return (pool, rollbacks)
+
+proc checkKeptWithoutRollback(
+    pool: PgPool, used: PgConnection, rollbacks: ref seq[string]
+) {.async.} =
+  ## After a 25P02 the server has already ended the transaction: no ROLLBACK is
+  ## sent and the same connection goes back to the pool ready. With `maxSize: 1`
+  ## a discarded connection would come back as a different ref.
+  doAssert used != nil
+  doAssert rollbacks[].len == 0, "ROLLBACK sent " & $rollbacks[].len & " time(s)"
+  doAssert pool.activeCount == 0
+  let c = await pool.acquire()
+  doAssert c == used, "the connection must be reused, not replaced"
+  doAssert c.state == csReady
+  doAssert c.txStatus == tsIdle
+  c.release()
+
+suite "E2E: COMMIT answered with ROLLBACK":
+  test "withTransaction raises 25P02 and skips ROLLBACK":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_commit_rb")
+      discard await conn.exec("CREATE TABLE test_commit_rb (val text)")
+
+      var queries = newSeq[string]()
+      let tracer = PgTracer()
+      tracer.onQueryStart = proc(
+          c: PgConnection, data: TraceQueryStartData
+      ): TraceContext {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          queries.add(data.sql)
+        return nil
+      var lastEnd: TraceQueryEndData
+      tracer.onQueryEnd = proc(
+          ctx: TraceContext, c: PgConnection, data: TraceQueryEndData
+      ) {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          lastEnd = data
+      conn.tracer = tracer
+
+      var err: ref PgQueryError = nil
+      try:
+        conn.withTransaction:
+          discard await conn.exec("INSERT INTO test_commit_rb VALUES ('lost')")
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        err = e
+
+      doAssert err != nil
+      doAssert err.sqlState == SqlStateInFailedSqlTransaction
+      doAssert err.errorField('C') == SqlStateInFailedSqlTransaction
+      doAssert err.severity == "ERROR"
+      doAssert err.hint.len > 0
+      doAssert err.msg.startsWith("ERROR: COMMIT rolled back")
+      doAssert err.causeState == "22012"
+      doAssert err.detail == "Aborted by: division by zero (SQLSTATE 22012)"
+      doAssert retryAdvice(err) == raUnclear
+      # Taken by the COMMIT, not left on the connection.
+      doAssert conn.txAbortFields.len == 0
+      doAssert "COMMIT" in queries
+      doAssert "ROLLBACK" notin queries
+      # COMMIT is the last traced statement; its end hook sees the failure.
+      doAssert queries[^1] == "COMMIT"
+      doAssert lastEnd.err of PgQueryError
+      doAssert (ref PgQueryError)(lastEnd.err).sqlState == SqlStateInFailedSqlTransaction
+      doAssert conn.txStatus == tsIdle
+      conn.tracer = nil
+      let res = await conn.query("SELECT val FROM test_commit_rb")
+      doAssert res.rows.len == 0
+
+      discard await conn.exec("DROP TABLE test_commit_rb")
+      await conn.close()
+
+    waitFor t()
+
+  test "25P02 names the error that aborted the transaction":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var err: ref PgQueryError = nil
+      try:
+        conn.withTransaction:
+          # Recovered by the savepoint, so it did not abort the transaction.
+          try:
+            conn.withSavepoint:
+              discard await conn.exec("SELECT 'x'::int")
+          except PgQueryError:
+            discard
+          await conn.swallowQueryError()
+          # Rejected with the server's own 25P02, which must not replace the cause.
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        err = e
+
+      doAssert err != nil
+      doAssert err.sqlState == SqlStateInFailedSqlTransaction
+      doAssert err.causeState == "22012"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "25P02 names the cause when BEGIN was batched with the failing statement":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var err: ref PgQueryError = nil
+      try:
+        conn.withTransaction:
+          # A cause from an earlier block that must not be reported.
+          await conn.swallowSerializationFailure()
+          discard await conn.simpleExec("ROLLBACK")
+          # Fails a new block straight from idle.
+          try:
+            discard await conn.simpleQuery("BEGIN; SELECT 1/0")
+          except PgQueryError:
+            discard
+      except PgQueryError as e:
+        err = e
+
+      doAssert err != nil
+      doAssert err.sqlState == SqlStateInFailedSqlTransaction
+      doAssert err.causeState == "22012"
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      var sqlState = ""
+      try:
+        conn.withTransactionRetry(RetryOptions(maxAttempts: 3, baseDelayMs: 1)):
+          inc attempts
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry retries 25P02 when listed":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_commit_rb_retry")
+      discard await conn.exec("CREATE TABLE test_commit_rb_retry (val text)")
+
+      var attempts = 0
+      conn.withTransactionRetry(
+        RetryOptions(
+          maxAttempts: 3,
+          baseDelayMs: 1,
+          retryableStates: @[SqlStateInFailedSqlTransaction],
+        )
+      ):
+        inc attempts
+        discard await conn.exec("INSERT INTO test_commit_rb_retry VALUES ('ok')")
+        if attempts == 1:
+          await conn.swallowQueryError()
+
+      doAssert attempts == 2
+      let res = await conn.query("SELECT val FROM test_commit_rb_retry")
+      doAssert res.rows.len == 1
+
+      discard await conn.exec("DROP TABLE test_commit_rb_retry")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetry retries 25P02 when its cause is retryable":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_commit_rb_cause")
+      discard await conn.exec("CREATE TABLE test_commit_rb_cause (val text)")
+
+      var attempts = 0
+      var ignored = 0
+      conn.withTransactionRetry(RetryOptions(maxAttempts: 3, baseDelayMs: 1)):
+        inc attempts
+        let p = newPipeline(conn)
+        # First, so the INSERT's own 25P02 must not replace it as the cause.
+        if attempts == 1:
+          p.addExec(serializationFailureSql)
+        p.addExec("INSERT INTO test_commit_rb_cause VALUES ('ok')")
+        let ir = await p.executeIsolated()
+        for e in ir.errors:
+          if e != nil:
+            inc ignored
+
+      doAssert attempts == 2
+      doAssert ignored == 2
+      let res = await conn.query("SELECT val FROM test_commit_rb_cause")
+      doAssert res.rows.len == 1
+
+      discard await conn.exec("DROP TABLE test_commit_rb_cause")
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionDeadline raises 25P02":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var sqlState = ""
+      try:
+        conn.withTransactionDeadline(seconds(5)):
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      var sqlState = ""
+      try:
+        conn.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1), seconds(5)
+        ):
+          inc attempts
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline retries 25P02 when its cause is retryable":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      var attempts = 0
+      conn.withTransactionRetryDeadline(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1), seconds(5)
+      ):
+        inc attempts
+        if attempts == 1:
+          await conn.swallowSerializationFailure()
+
+      doAssert attempts == 2
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      await conn.close()
+
+    waitFor t()
+
+  test "pool.withTransaction raises 25P02 and keeps the connection":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+      discard await pool.exec("DROP TABLE IF EXISTS test_pool_commit_rb")
+      discard await pool.exec("CREATE TABLE test_pool_commit_rb (val text)")
+
+      var used: PgConnection = nil
+      var sqlState = ""
+      try:
+        pool.withTransaction(conn):
+          used = conn
+          discard await conn.exec("INSERT INTO test_pool_commit_rb VALUES ('lost')")
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+      let res = await pool.query("SELECT val FROM test_pool_commit_rb")
+      doAssert res.rows.len == 0
+
+      discard await pool.exec("DROP TABLE test_pool_commit_rb")
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetry does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var attempts = 0
+      var sqlState = ""
+      try:
+        pool.withTransactionRetry(RetryOptions(maxAttempts: 3, baseDelayMs: 1), conn):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionDeadline raises 25P02 and keeps the connection":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var sqlState = ""
+      try:
+        pool.withTransactionDeadline(conn, seconds(5)):
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline does not retry 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var attempts = 0
+      var sqlState = ""
+      try:
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 1), conn, seconds(5)
+        ):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+
+      doAssert sqlState == SqlStateInFailedSqlTransaction
+      doAssert attempts == 1
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "pool.withTransactionRetryDeadline retries 25P02 when its cause is retryable":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+
+      var used: PgConnection = nil
+      var attempts = 0
+      pool.withTransactionRetryDeadline(
+        RetryOptions(maxAttempts: 3, baseDelayMs: 1), conn, seconds(5)
+      ):
+        inc attempts
+        used = conn
+        if attempts == 1:
+          await conn.swallowSerializationFailure()
+
+      doAssert attempts == 2
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await pool.close()
+
+    waitFor t()
+
+  test "cluster transaction macros raise 25P02 with a non-retryable cause":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.targetSessionAttrs = tsaReadWrite
+      let (tracer, rollbacks) = rollbackTracer()
+      cfg.tracer = tracer
+      let cluster = await newPoolCluster(
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+        PoolConfig(connConfig: cfg, minSize: 1, maxSize: 1),
+      )
+      let pool = cluster.primaryPool
+      let retryOpts = RetryOptions(maxAttempts: 3, baseDelayMs: 1)
+
+      var used: PgConnection = nil
+      var attempts = 0
+      var sqlState = ""
+      try:
+        cluster.withTransaction(conn):
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction, "withTransaction"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      sqlState = ""
+      try:
+        cluster.withTransactionRetry(retryOpts, conn):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction, "withTransactionRetry"
+      doAssert attempts == 1, "withTransactionRetry"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      sqlState = ""
+      try:
+        cluster.withTransactionDeadline(conn, seconds(5)):
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction, "withTransactionDeadline"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      attempts = 0
+      sqlState = ""
+      try:
+        cluster.withTransactionRetryDeadline(retryOpts, conn, seconds(5)):
+          inc attempts
+          used = conn
+          await conn.swallowQueryError()
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == SqlStateInFailedSqlTransaction,
+        "withTransactionRetryDeadline"
+      doAssert attempts == 1, "withTransactionRetryDeadline"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      await cluster.close()
+
+    waitFor t()
+
 suite "E2E: execInTransaction / queryInTransaction":
   test "execInTransaction commits successfully":
     proc t() {.async.} =
@@ -2966,9 +3877,11 @@ suite "E2E: execInTransaction / queryInTransaction":
         state = e.sqlState
       doAssert state == "22012" # division_by_zero
 
-      # Succeeded-before-error op is cached; the failing op is not.
+      # Both are cached: the failing op got through Parse and Describe before
+      # its Execute failed.
       doAssert conn.stmtCache.hasKey("SELECT $1::int4")
-      doAssert not conn.stmtCache.hasKey("SELECT 1 / $1::int4")
+      doAssert conn.stmtCache.hasKey("SELECT 1 / $1::int4")
+      doAssert conn.pendingStmtCloses.len == 0
 
       # Reuse: a fresh pipeline with the same SQL is a cache hit and adds no new
       # entry (with the bug it was a miss -> a new entry and a leaked _sc_N).
@@ -3114,17 +4027,14 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
-  test "pipeline: failing scsMiss op queues Close so no server statement leaks":
-    # A cache-miss op that fails at Execute time (Parse succeeded) leaves its
-    # freshly Parsed statement on the server. The cache-add happens only on
-    # success, so nothing reuses it — without a queued Close every repeat of
-    # the failing SQL would pile up a new server statement (each run is a fresh
-    # miss with a fresh name).
+  test "pipeline: a cache miss failing at Execute is cached and reused":
+    # Parse and Describe succeeded, so the statement is kept rather than
+    # Closed: each repeat Binds it again instead of Parsing a new one.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let failingSql = "SELECT $1::int / 0"
 
-      proc countLeaked(): Future[int] {.async.} =
+      proc serverCount(): Future[int] {.async.} =
         (
           await conn.simpleQuery(
             "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
@@ -3132,8 +4042,9 @@ suite "E2E: execInTransaction / queryInTransaction":
           )
         )[0].rows[0].getInt(0)
 
-      doAssert (await countLeaked()) == 0
+      doAssert (await serverCount()) == 0
 
+      var name = ""
       for i in 0 ..< 3:
         let p = newPipeline(conn)
         p.addQuery(failingSql, @[toPgParam(0)])
@@ -3143,24 +4054,23 @@ suite "E2E: execInTransaction / queryInTransaction":
         except PgQueryError:
           raised = true
         doAssert raised
-        # The queued Close rides along with the next extended-query op.
-        discard await conn.query("SELECT 1")
-        doAssert (await countLeaked()) == 0,
-          "failing scsMiss op leaked a server statement"
+        doAssert conn.stmtCache.hasKey(failingSql)
+        if i == 0:
+          name = conn.stmtCache[failingSql].name
+        doAssert conn.stmtCache[failingSql].name == name, "re-Parsed on a repeat"
+        doAssert conn.pendingStmtCloses.len == 0
+        doAssert (await serverCount()) == 1
 
       await conn.close()
 
     waitFor t()
 
-  test "pipeline: executeIsolated failing scsMiss op queues Close so no leak":
-    # executeIsolated counterpart: per-op SYNC still leaves the failed op's
-    # freshly Parsed statement on the server, and the cache-add happens only
-    # on success.
+  test "pipeline: executeIsolated caches a cache miss failing at Execute":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let failingSql = "SELECT 1 / $1::int"
 
-      proc countLeaked(): Future[int] {.async.} =
+      proc serverCount(): Future[int] {.async.} =
         (
           await conn.simpleQuery(
             "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = '" &
@@ -3168,16 +4078,20 @@ suite "E2E: execInTransaction / queryInTransaction":
           )
         )[0].rows[0].getInt(0)
 
-      doAssert (await countLeaked()) == 0
+      doAssert (await serverCount()) == 0
 
+      var name = ""
       for i in 0 ..< 3:
         let p = newPipeline(conn)
         p.addQuery(failingSql, @[toPgParam(0)])
         let ir = await p.executeIsolated()
         doAssert ir.errors[0] != nil
-        # The queued Close rides along with the next extended-query op.
-        discard await conn.query("SELECT 1")
-        doAssert (await countLeaked()) == 0, "executeIsolated leaked a server statement"
+        doAssert conn.stmtCache.hasKey(failingSql)
+        if i == 0:
+          name = conn.stmtCache[failingSql].name
+        doAssert conn.stmtCache[failingSql].name == name, "re-Parsed on a repeat"
+        doAssert conn.pendingStmtCloses.len == 0
+        doAssert (await serverCount()) == 1
 
       await conn.close()
 
@@ -3527,6 +4441,33 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert r2[0].queryResult.rows[0].getStr(0) == "reused"
 
       await conn.close()
+
+    waitFor t()
+
+  test "pipeline: default autoReset=false re-sends queued ops on second execute":
+    # Pins the documented hazard: without autoReset/reset, a second execute()
+    # replays the same ops (non-idempotent INSERT would duplicate rows).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+
+      discard await conn.exec(
+        "CREATE TEMP TABLE pipe_resend(id serial PRIMARY KEY, v int NOT NULL)"
+      )
+
+      let p = newPipeline(conn) # autoReset=false by default
+      p.addExec("INSERT INTO pipe_resend (v) VALUES ($1)", @[toPgParam(1'i32)])
+      let r1 = await p.execute()
+      doAssert r1.len == 1
+
+      let r2 = await p.execute()
+      doAssert r2.len == 1
+
+      let count =
+        (await conn.query("SELECT count(*)::int4 FROM pipe_resend")).rows[0].getInt(0)
+      doAssert count == 2,
+        "second execute without reset must re-send the INSERT (got count=" & $count & ")"
 
     waitFor t()
 
@@ -4177,10 +5118,9 @@ suite "E2E: execInTransaction / queryInTransaction":
 
   test "pipeline: same SQL with mismatched OIDs in one batch":
     # Mid-batch OID change: op 0 Parses with int8, op 1 wants int4. The
-    # in-flight entry's OIDs don't match, so the in-flight stmt must be
-    # explicitly Closed and a fresh Parse emitted. The cache must end with
-    # only the latest (type-correct) stmt; the server must not retain the
-    # int8 stmt either.
+    # in-flight entry's OIDs don't match, so a fresh Parse is emitted. The
+    # cache must end with only the latest (type-correct) stmt, and the int8
+    # stmt is Closed at the head of the next operation, not mid-batch.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
@@ -4195,8 +5135,12 @@ suite "E2E: execInTransaction / queryInTransaction":
       doAssert conn.stmtCache.len == 1
       let entry = conn.stmtCache[sql]
       doAssert entry.paramOids == @[OidInt4]
+      doAssert conn.pendingStmtCloses.len == 1
 
-      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      discard await conn.query("SELECT 1")
+      let pq = await conn.simpleQuery(
+        "SELECT name FROM pg_prepared_statements WHERE statement = '" & sql & "'"
+      )
       doAssert pq[0].rowCount == 1
       doAssert pq[0].rows[0].getStr(0) == entry.name
 
@@ -4206,10 +5150,9 @@ suite "E2E: execInTransaction / queryInTransaction":
 
   test "pipeline: same SQL three ops, OID changes after a share":
     # The hardest interleave: op 0 cacheMiss (int8) — op 1 cacheShare (int8)
-    # — op 2 OID mismatch (int4). The mid-batch Close must target op 0's
-    # stmt, op 0 must be marked superseded (so it isn't added to cache), and
-    # op 1's share is still valid (its Bind/Execute completes before the
-    # Close hits the wire).
+    # — op 2 OID mismatch (int4). Settling in op order caches op 0's stmt and
+    # then replaces it with op 2's, queueing op 0's Close for the next
+    # operation, so op 1's share is still valid when it runs.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
@@ -4225,10 +5168,88 @@ suite "E2E: execInTransaction / queryInTransaction":
 
       doAssert conn.stmtCache.len == 1
       doAssert conn.stmtCache[sql].paramOids == @[OidInt4]
-      let pq = await conn.simpleQuery("SELECT name FROM pg_prepared_statements")
+      doAssert conn.pendingStmtCloses.len == 1
+
+      discard await conn.query("SELECT 1")
+      let pq = await conn.simpleQuery(
+        "SELECT name FROM pg_prepared_statements WHERE statement = '" & sql & "'"
+      )
       doAssert pq[0].rowCount == 1
       doAssert pq[0].rows[0].getStr(0) == conn.stmtCache[sql].name
 
+      await conn.close()
+
+    waitFor t()
+
+  test "pipeline: a Close decided mid-batch survives a failing op":
+    # The backend skips everything after a failing op up to Sync. A Close the
+    # build wrote there would be skipped while its name was forgotten, so
+    # every statement the server still holds must be cached or queued.
+    proc untracked(conn: PgConnection): Future[seq[string]] {.async.} =
+      let rs = await conn.simpleQuery(
+        "SELECT name FROM pg_prepared_statements WHERE name LIKE '\\_sc\\_%' ORDER BY name"
+      )
+      for r in rs[0].rows:
+        let name = r.getStr(0)
+        var tracked = name in conn.pendingStmtCloses
+        for _, c in conn.stmtCache:
+          tracked = tracked or c.name == name
+        if not tracked:
+          result.add name
+
+    proc t() {.async.} =
+      # Eviction: the second miss needs room only after the failing op.
+      block:
+        let conn = await connect(plainConfig())
+        `stmtCacheCapacity=`(conn, 2) # the setter, not the field (privateAccess)
+        discard await conn.query("SELECT 1")
+        discard await conn.query("SELECT 2")
+        let p = newPipeline(conn)
+        p.addExec("SELECT 1/0")
+        p.addQuery("SELECT 3")
+        var raised = false
+        try:
+          discard await p.execute()
+        except PgQueryError:
+          raised = true
+        doAssert raised
+        doAssert (await conn.untracked()).len == 0
+        await conn.close()
+
+      # Superseded: the later same-SQL Parse sits after the failing op.
+      block:
+        let conn = await connect(plainConfig())
+        let p = newPipeline(conn)
+        p.addExec("SELECT $1", @[toPgParam(1'i32)])
+        p.addExec("SELECT 1/0")
+        p.addExec("SELECT $1", @[toPgParam("x")])
+        var raised = false
+        try:
+          discard await p.execute()
+        except PgQueryError:
+          raised = true
+        doAssert raised
+        doAssert (await conn.untracked()).len == 0
+        # The statement that ran before the failure is cached, not dropped.
+        doAssert conn.stmtCache["SELECT $1"].paramOids == @[OidInt4]
+        await conn.close()
+
+    waitFor t()
+
+  test "pipeline: an exec cache miss keeps the row description":
+    # A later query hitting the entry decodes rows from the cached fields; an
+    # exec that cached none would make that query return no rows.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT 7::int4 AS v"
+      let p = newPipeline(conn)
+      p.addExec(sql)
+      discard await p.execute()
+      doAssert conn.stmtCache[sql].fields.len == 1
+
+      let r = await conn.query(sql)
+      doAssert r.rows.len == 1
+      doAssert r.rows[0].getInt(0) == 7
       await conn.close()
 
     waitFor t()
@@ -4445,10 +5466,37 @@ static:
   # (UnnamedBreak in Nim >= 2.2), so a body-local `block:` captures it and
   # the COMMIT/RELEASE still runs. Only a `break` with no loop/`block` in
   # scope inside the body can skip the COMMIT/RELEASE.
-  doAssert(not hasLoopEscapeStmt(parseStmt("block:\n  break")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("block:\n  if x:\n    break")))
-  doAssert hasLoopEscapeStmt(parseStmt("break"))
-  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  block:\n    break")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  break")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("block lbl:\n  break lbl")))
-  doAssert(not hasLoopEscapeStmt(parseStmt("while true:\n  continue")))
+  proc escapes(src: string): bool =
+    escapingStmts(parseStmt(src)).len > 0
+
+  doAssert(not escapes("block:\n  break"))
+  doAssert(not escapes("block:\n  if x:\n    break"))
+  doAssert escapes("break")
+  doAssert(not escapes("while true:\n  block:\n    break"))
+  doAssert(not escapes("while true:\n  break"))
+  doAssert(not escapes("block lbl:\n  break lbl"))
+  doAssert escapes("block lbl:\n  discard\nbreak lbl")
+  doAssert(not escapes("while true:\n  continue"))
+  doAssert escapes("block:\n  continue")
+  # Before expansion the loop a template wraps around its argument is
+  # invisible, so a `break` passed to a template is rejected; so is a `return`
+  # inside a call.
+  doAssert escapes("eachN(3):\n  break")
+  doAssert escapes("later:\n  return")
+  # A `return` in a body-local template is collected (asyncdispatch's `async`
+  # rewrites it before the template expands), not its `break`/`continue`: they
+  # only reach the body through an expansion, which the typed re-check
+  # catches. A body-local proc is skipped.
+  block:
+    let found = escapingStmts(
+      parseStmt("template bail =\n  later:\n    return\n  break\nproc p() =\n  return")
+    )
+    doAssert found.len == 1 and found[0].kind == nnkReturnStmt
+  # A `while` condition is evaluated inside the loop, where a `break` leaves
+  # only that `while`; a `continue` there binds to an enclosing loop. A `for`
+  # iterable is evaluated before the loop is entered.
+  doAssert(not escapes("while (if x: break; false):\n  discard"))
+  doAssert escapes("while (if x: continue; false):\n  discard")
+  doAssert escapes("for i in (if x: break; s):\n  discard")
+  doAssert(not escapes("while (block: break; false):\n  discard"))
+  doAssert(not escapes("for i in s:\n  (if x: break)"))

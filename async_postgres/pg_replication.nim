@@ -17,12 +17,10 @@
 
 import std/[strutils, tables, times, options]
 
-import async_backend, pg_protocol, pg_connection, pg_types
+import async_backend, pg_protocol, pg_types
+from pg_types/core import isPgUIntText, pgParseHexUInt32, pgParseIntView, pipOk
 import pg_connection/[types, dsn, buffer_io, simple_query, lifecycle]
 import pg_types/encoding
-
-import std/importutils
-privateAccess(PgConnection)
 
 type
   Lsn* = distinct uint64
@@ -36,19 +34,29 @@ type
     rmkPrimaryKeepalive
 
   XLogData* = object ## WAL data payload from the server.
-    startLsn*: Lsn ## Start LSN of the WAL data in this message
+    startLsn*: Lsn
+      ## Start LSN of the WAL data in this message. On a logical stream it is
+      ## the decoded record's LSN, or ``InvalidLsn`` for a write that is not the
+      ## last for its change (e.g. pgoutput Relation and Type messages).
     walEnd*: Lsn
-      ## Current end of WAL on the server at the time this message was sent.
-      ## This is *not* the end of the WAL data contained in this message; it
-      ## reflects how far WAL has advanced on the server and is informational.
-      ## To acknowledge what was actually received, use ``receivedEndLsn``
-      ## (``startLsn + data.len``), never ``walEnd`` — ``walEnd`` may be ahead
-      ## of what this message contains.
+      ## Informational. On a physical stream it is the end of WAL the server
+      ## can send, which may be ahead of this message's data: acknowledge
+      ## ``receivedEndLsn`` (``startLsn + data.len``), never ``walEnd``. On a
+      ## logical stream it equals ``startLsn``; confirm ``CommitMessage.endLsn``
+      ## or ``PrimaryKeepalive.walEnd`` instead. With any output plugin, the
+      ## ``startLsn`` of a transaction's commit message is its end LSN.
     sendTime*: int64 ## Server send time (microseconds since PG epoch)
     data*: seq[byte] ## Raw WAL data (plugin-dependent format)
 
   PrimaryKeepalive* = object ## Keepalive message from the server.
-    walEnd*: Lsn ## Current end of WAL on the server
+    walEnd*: Lsn
+      ## The walsender's sent position. On a logical stream it counts as
+      ## received, so once every earlier message is processed it may be passed
+      ## to ``confirmFlushed`` (``startReplication(autoConfirm = true)`` does
+      ## this outside a transaction). The auto-reply to a keepalive with
+      ## ``replyRequested`` is sent before the callback runs, so that
+      ## confirmation goes out with the next status update (the next requested
+      ## reply, ``statusInterval``, or ``stopReplication``).
     sendTime*: int64 ## Server send time (microseconds since PG epoch)
     replyRequested*: bool ## Whether the server wants an immediate status reply
 
@@ -256,22 +264,10 @@ proc parseLsn*(s: string): Lsn =
   let parts = s.split('/')
   if parts.len != 2:
     raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-  # fromHex[uint64] returns 0 for an empty string instead of raising, so an
-  # empty half would silently produce a zero LSN — reject explicitly.
-  if parts[0].len == 0 or parts[1].len == 0:
-    raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-  # fromHex[uint64] wraps silently past 16 significant hex digits instead of
-  # raising; compare significant digits, not raw length, so a zero-padded but
-  # in-range half isn't rejected.
-  if stripLeadingZeros(parts[0]).len > 16 or stripLeadingZeros(parts[1]).len > 16:
-    raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-  pgTypeErrorOnValueError("Invalid LSN format (len=" & $s.len & ")"):
-    let hi = fromHex[uint64](parts[0])
-    let lo = fromHex[uint64](parts[1])
-    # A half > 32 bits would have its excess bits silently dropped by `hi shl 32` below.
-    if hi > 0xFFFF_FFFF'u64 or lo > 0xFFFF_FFFF'u64:
-      raise newException(PgTypeError, "Invalid LSN format (len=" & $s.len & ")")
-    Lsn((hi shl 32) or lo)
+  let context = "Invalid LSN format (len=" & $s.len & ")"
+  let hi = pgParseHexUInt32(parts[0], context)
+  let lo = pgParseHexUInt32(parts[1], context)
+  Lsn((uint64(hi) shl 32) or uint64(lo))
 
 # PostgreSQL timestamp helpers
 
@@ -362,6 +358,12 @@ proc decodeTuple(buf: openArray[byte], offset: int): (seq[TupleField], int) =
       raise newException(PgProtocolError, "Unknown tuple field kind: " & kind)
   (fields, pos)
 
+const CommitEndLsnPos = 10
+  ## pgoutput Commit: 'C', flags (1), commit LSN (8), then end LSN (8).
+
+proc commitEndLsn(data: openArray[byte]): Lsn {.inline.} =
+  Lsn(cast[uint64](readInt64At(data, CommitEndLsnPos)))
+
 proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
   ## Decode a pgoutput logical decoding message from raw WAL bytes.
   if data.len == 0:
@@ -378,7 +380,7 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
     var msg = CommitMessage()
     msg.flags = readByteAt(data, 1)
     msg.commitLsn = Lsn(cast[uint64](readInt64At(data, 2)))
-    msg.endLsn = Lsn(cast[uint64](readInt64At(data, 10)))
+    msg.endLsn = commitEndLsn(data)
     msg.commitTime = readInt64At(data, 18)
     PgOutputMessage(kind: pomkCommit, commit: msg)
   of 'O': # Origin
@@ -500,9 +502,13 @@ proc parsePgOutputMessage*(data: openArray[byte]): PgOutputMessage =
 
 proc receivedEndLsn*(msg: XLogData): Lsn =
   ## End LSN of the WAL data actually contained in this message
-  ## (``startLsn + len(data)``). Use this when acknowledging received data via
-  ## ``sendStandbyStatus``; do not use ``walEnd``, which is the server's
-  ## current WAL position and may point past data this message does not carry.
+  ## (``startLsn + len(data)``). On a physical stream, use this when
+  ## acknowledging received data via ``sendStandbyStatus``; do not use
+  ## ``walEnd``, which may point past data this message does not carry.
+  ##
+  ## Physical replication only: logical ``data`` is plugin output, not WAL
+  ## bytes, so this may point past commits not yet sent. Confirm logical
+  ## progress with ``CommitMessage.endLsn`` or ``PrimaryKeepalive.walEnd``.
   let startLsn = uint64(msg.startLsn)
   let dataLen = uint64(msg.data.len)
   # Unsigned addition wraps silently instead of raising; check before adding.
@@ -566,22 +572,27 @@ proc connectReplication*(
   cfg.extraParams.add(("replication", replicationParamValue(mode)))
   connect(cfg)
 
+proc parseTimelineIdText(s: string, what: string): int32 =
+  ## Parse unsigned-decimal timeline id with int32-range check (`what` for errors).
+  if not isPgUIntText(s):
+    raise newException(
+      PgTypeError, what & " returned a non-numeric timeline (len=" & $s.len & ")"
+    )
+  var t: int
+  if pgParseIntView(s, t) != pipOk:
+    raise newException(
+      PgTypeError, what & " returned a non-numeric timeline (len=" & $s.len & ")"
+    )
+  if t < int(int32.low) or t > int(int32.high):
+    raise newException(
+      PgTypeError, what & " returned a timeline out of int32 range (len=" & $s.len & ")"
+    )
+  t.int32
+
 proc parseTimelineId*(s: string): int32 =
-  ## Parse the timeline id from an ``IDENTIFY_SYSTEM`` result row (text format).
-  ## Converts a non-numeric value and an out-of-``int32``-range value into
-  ## `PgTypeError` so callers stay under the ``except PgError`` contract.
-  ## Range-check before narrowing: a bare ``parseInt(...).int32`` would raise
-  ## ``RangeDefect`` (a Defect, outside ``PgError``) on an out-of-range value.
-  pgTypeErrorOnValueError(
-    "IDENTIFY_SYSTEM returned a non-numeric timeline (len=" & $s.len & ")"
-  ):
-    let t = parseInt(s)
-    if t < int(int32.low) or t > int(int32.high):
-      raise newException(
-        PgTypeError,
-        "IDENTIFY_SYSTEM returned a timeline out of int32 range (len=" & $s.len & ")",
-      )
-    t.int32
+  ## Parse timeline id from an ``IDENTIFY_SYSTEM`` row (text format).
+  ## Non-numeric/out-of-range values raise `PgTypeError`, not `RangeDefect`.
+  parseTimelineIdText(s, "IDENTIFY_SYSTEM")
 
 # Replication commands (via simple query protocol)
 
@@ -632,12 +643,8 @@ proc decodeCreateSlotRow(qr: QueryResult): ReplicationSlotInfo =
 proc quoteReplLiteral(s: string): string =
   ## Single-quote a walsender option value. Unlike `quoteLiteral` this never
   ## emits the ``E'...'`` form: the replication scanner has no such rule and
-  ## treats ``\`` literally, so doubling ``'`` is the whole escape.
-  ##
-  ## Raises ``ValueError`` for an embedded NUL byte, like `quoteLiteral`: the
-  ## wire protocol terminates the query string there.
-  if '\0' in s:
-    raise newException(ValueError, "Replication option value contains a NUL byte")
+  ## treats ``\`` literally, so doubling ``'`` is the whole escape. The caller
+  ## rejects a NUL byte first: the wire protocol ends the query string there.
   "'" & s.replace("'", "''") & "'"
 
 proc createReplicationSlot*(
@@ -701,7 +708,9 @@ proc decodeReadSlotRow(qr: QueryResult, slotName: string): ReplicationSlotInfo =
   if not row.isNull(1):
     result.consistentPoint = parseLsn(row.getStr(1))
   if not row.isNull(2):
-    result.restartTli = pgParseBiggestInt(row.getStr(2))
+    # Same range check as IDENTIFY_SYSTEM.
+    result.restartTli =
+      parseTimelineIdText(row.getStr(2), "READ_REPLICATION_SLOT").int64
 
 proc readReplicationSlot*(
     conn: PgConnection, slotName: string, timeout: async_backend.Duration = ZeroDuration
@@ -793,7 +802,9 @@ proc checkReplicating(conn: PgConnection, op: string) =
   ## application requested.
   # ``closedByUser`` first, as ``checkReady`` does: ``close()`` sets it while the
   # connection is still ``csReplicating``.
-  conn.checkNotClosed()
+  let closed = conn.replClosedError()
+  if closed != nil:
+    raise closed
   if conn.state == csReplicating:
     return
   raise newException(
@@ -801,33 +812,153 @@ proc checkReplicating(conn: PgConnection, op: string) =
     op & ": connection is not in replicating state (state: " & $conn.state & ")",
   )
 
-proc sendCopyData*(conn: PgConnection, data: openArray[byte]): Future[void] =
-  ## Send CopyData during ``csReplicating``. Raises ``PgStateError`` (not
-  ## replicating) / ``PgConnectionError`` (connection lost) / ``PgTypeError``
-  ## synchronously before first suspension. ``data`` is encoded into the frame
-  ## there too, so the caller's buffer need not outlive the returned ``Future``.
-  conn.checkReplicating("sendCopyData")
-  var buf: seq[byte]
-  encodeCopyData(buf, data)
-  conn.sendMsg(buf)
+const StandbyStatusLen = 1 + 8 + 8 + 8 + 8 + 1
+  ## 'r' + receive + flush + apply + clock + replyRequested.
 
-proc sendStandbyStatusRaw(
-    conn: PgConnection, receiveLsn, flushLsn, applyLsn: Lsn, replyRequested: bool
-): Future[void] {.async.} =
-  ## Encode and send a Standby Status Update with the given receive/flush/apply
-  ## LSNs verbatim — no ``InvalidLsn`` defaulting. This is the single place the
-  ## wire encoding lives; the public ``sendStandbyStatus`` (which applies the
-  ## up-to-receive defaulting) and ``sendConfirmedStatus`` (which sends the
-  ## confirmed position verbatim) both route through it. Callers are responsible
-  ## for the ``csReplicating`` guard.
-  let msg = encodeStandbyStatusUpdate(
+# Replication write queue. Every CopyData and CopyDone the client writes during
+# a stream is queued without suspending and written in queue order by one task.
+# Whether the client's CopyDone is out and which positions a caller reported are
+# settled when queued, so concurrent callers cannot interleave or undercut each
+# other. Cancelling a caller only ends its wait; its frame still goes out whole.
+#
+# The queue bookkeeping lives in `pg_connection/types` with the private fields
+# it owns; this module keeps the drain loop and the stream loop.
+
+proc encodeStatus(
+    receiveLsn, flushLsn, applyLsn: Lsn, replyRequested: bool
+): seq[byte] =
+  ## Standby Status Update with the given LSNs verbatim — no ``InvalidLsn``
+  ## defaulting. The single place the wire encoding lives.
+  encodeStandbyStatusUpdate(
     receiveLsn.toInt64,
     flushLsn.toInt64,
     applyLsn.toInt64,
     currentPgTimestamp(),
     if replyRequested: 1'u8 else: 0'u8,
   )
-  await conn.sendMsg(msg)
+
+proc encodeConfirmedStatus(conn: PgConnection): tuple[msg: seq[byte], flush: uint64] =
+  ## The library's Standby Status Update, encoded as it is written: highest
+  ## received position in *receive* (resets ``wal_sender_timeout``), the
+  ## ``confirmFlushed`` position in flush/apply. Unconfirmed with the default
+  ## ``startLsn`` that is ``0/0``, which PostgreSQL treats as "unknown".
+  ##
+  ## Each field is raised to the caller's last reported status: a lower flush
+  ## would move a physical slot's ``restart_lsn`` backwards.
+  let confirmed = conn.replConfirmedFlushLsn()
+  let reported = conn.replReported
+  let flushLsn = max(confirmed, reported.flush)
+  let applyLsn = max(confirmed, reported.apply)
+  let receive =
+    max(max(conn.replMaxReceivedLsn(), reported.receive), max(flushLsn, applyLsn))
+  (encodeStatus(Lsn(receive), Lsn(flushLsn), Lsn(applyLsn), false), flushLsn)
+
+proc flushReplWrites(conn: PgConnection) {.async.} =
+  ## Write queued entries in order until none is left. A failed write closes the
+  ## connection, so it and every entry behind it fail. Never fails itself.
+  var w: ReplWrite
+  try:
+    while true:
+      w = conn.nextReplWrite()
+      if w == nil:
+        break
+      w.state = rwWriting
+      if conn.state != csReplicating or conn.closedReason != crOpen:
+        # Nothing was written, so the transport is left alone.
+        conn.settleReplWrite(w, ok = false)
+        conn.failQueuedReplWrites()
+        return
+      if w.frame.len > 0:
+        await conn.sendMsg(move(w.frame))
+      else:
+        # The library's status carries the positions current when it goes
+        # out. Counted as sent from here: a failed write ends the stream.
+        let (msg, flush) = conn.encodeConfirmedStatus()
+        conn.noteReplSentFlush(flush)
+        await conn.sendMsg(msg)
+      conn.settleReplWrite(w, ok = true)
+  except CatchableError as e:
+    # A failed write (sendMsg has marked the connection closed, possibly
+    # mid-frame) or anything unexpected: the wire can no longer be trusted.
+    # Retire the connection and settle every waiter. chronos: drop the socket
+    # so the recv loop ends too. asyncdispatch: closing would unregister the
+    # pending read and strand the recv loop.
+    conn.noteReplWriteFailure(e)
+    conn.markClosed()
+    when hasChronos:
+      try:
+        await noCancel conn.closeTransport()
+      except CatchableError:
+        discard
+    if w != nil and w.state == rwWriting:
+      conn.settleReplWrite(w, ok = false)
+    conn.closeReplWrites()
+
+proc startFlush(conn: PgConnection) =
+  ## Drain ``replWrites`` unless a task already does. Waiters go on before
+  ## this: the flush may finish an entry without suspending.
+  if conn.replFlusherIdle():
+    conn.setReplFlusher(conn.flushReplWrites())
+
+proc awaitReplWritesIdle(conn: PgConnection) {.async.} =
+  ## Close the stream to writes and wait out the one being written, so no
+  ## replication frame is still going out once the connection is handed back.
+  conn.closeReplWrites()
+  while (let flusher = conn.replFlusher(); flusher != nil and not flusher.finished):
+    # chronos: a cancel of this wait must not cancel the write mid-frame.
+    when hasChronos:
+      await flusher.join()
+    else:
+      await flusher
+
+proc queueCallerCopyData(
+    conn: PgConnection,
+    op: string,
+    frame: sink seq[byte],
+    reported = none(tuple[receive, flush, apply: uint64]),
+): Future[void] =
+  ## Queue a caller's CopyData; a Standby Status Update records ``reported``
+  ## now so later library statuses never go below it. Dropped rather than
+  ## raised once the stop's final status is encoded: raising would end the
+  ## stream for a callback acking a message from before the stop.
+  if not conn.replWritesOpen():
+    raise newException(PgStateError, op & ": the replication stream has ended")
+  if not conn.replCanStillReport():
+    result = newFuture[void]("replWriteDropped")
+    result.complete()
+    return
+  if reported.isSome:
+    let r = reported.get
+    conn.noteReplReported(r.receive, r.flush, r.apply)
+  let w = ReplWrite(frame: frame)
+  result = w.waitReplWrite()
+  conn.replQueueWrite(w)
+  conn.startFlush()
+
+proc sendCopyData*(conn: PgConnection, data: openArray[byte]): Future[void] =
+  ## Send CopyData during ``csReplicating``. Raises ``PgStateError`` (not
+  ## replicating) / ``PgConnectionError`` (connection lost) / ``PgTypeError``
+  ## synchronously before first suspension. ``data`` is encoded into the frame
+  ## there too, so the caller's buffer need not outlive the returned ``Future``.
+  ## A hand-built Standby Status Update is recorded like ``sendStandbyStatus``.
+  ## Writes go out in call order with the library's own. After
+  ## ``stopReplication`` (or the reply to a server-initiated stop) the frame
+  ## still goes out ahead of the stop's final status while that is queued;
+  ## once it is encoded the frame is silently dropped, as the walsender reads
+  ## nothing after the client's CopyDone. Cancelling the returned ``Future``
+  ## only stops the wait: the frame is still written. A failed write closes the
+  ## connection.
+  conn.checkReplicating("sendCopyData")
+  var buf: seq[byte]
+  encodeCopyData(buf, data)
+  if data.len == StandbyStatusLen and data[0] == byte('r'):
+    let positions: tuple[receive, flush, apply: uint64] = (
+      cast[uint64](decodeInt64(data, 1)),
+      cast[uint64](decodeInt64(data, 9)),
+      cast[uint64](decodeInt64(data, 17)),
+    )
+    return conn.queueCallerCopyData("sendCopyData", buf, some(positions))
+  conn.queueCallerCopyData("sendCopyData", buf)
 
 proc sendStandbyStatus*(
     conn: PgConnection,
@@ -838,11 +969,30 @@ proc sendStandbyStatus*(
 ): Future[void] {.async.} =
   ## Send Standby Status Update. ``InvalidLsn`` defaults up to ``receiveLsn``.
   ## Raises ``PgStateError`` unless the connection is ``csReplicating``, or
-  ## ``PgConnectionError`` when the connection was lost.
+  ## ``PgConnectionError`` when the connection was lost. After
+  ## ``stopReplication`` the update still goes out, ahead of the stop's final
+  ## status, while that is queued; once it is encoded the update is silently
+  ## dropped, as the walsender reads nothing after the client's CopyDone.
+  ## Report before stopping to be sure. Cancelling only
+  ## stops the wait: the update is still written. A failed write closes the
+  ## connection.
+  ##
+  ## Values are sent verbatim, unlike ``confirmFlushed``. On a logical stream
+  ## pass ``CommitMessage.endLsn`` or ``PrimaryKeepalive.walEnd``, never
+  ## ``receivedEndLsn``: a flush past an unsent commit makes the server skip it.
+  ## The auto-reply, periodic status and ``stopReplication`` never report less
+  ## than the last update sent here: they send the ``confirmFlushed`` position
+  ## or these, whichever is higher.
   conn.checkReplicating("sendStandbyStatus")
   let flushVal = if flushLsn == InvalidLsn: receiveLsn else: flushLsn
   let applyVal = if applyLsn == InvalidLsn: receiveLsn else: applyLsn
-  await conn.sendStandbyStatusRaw(receiveLsn, flushVal, applyVal, replyRequested)
+  await conn.queueCallerCopyData(
+    "sendStandbyStatus",
+    encodeStatus(receiveLsn, flushVal, applyVal, replyRequested),
+    some(
+      (receive: receiveLsn.toUInt64, flush: flushVal.toUInt64, apply: applyVal.toUInt64)
+    ),
+  )
 
 proc confirmedFlushLsn*(conn: PgConnection): Lsn {.inline.} =
   ## Confirmed flush LSN for current stream, or ``InvalidLsn`` outside stream.
@@ -854,7 +1004,12 @@ proc confirmedFlushLsn*(conn: PgConnection): Lsn {.inline.} =
 
 proc confirmFlushed*(conn: PgConnection, lsn: Lsn): bool =
   ## Confirm WAL up to ``lsn`` as durable. Clamped to received WAL, monotonic.
-  ## Returns true if advanced. Must be in ``csReplicating``.
+  ## Returns true if advanced. Must be in ``csReplicating``. Received WAL is the
+  ## highest ``receivedEndLsn`` (physical) or ``XLogData.startLsn`` /
+  ## ``PrimaryKeepalive.walEnd`` (logical). Returns false without advancing once
+  ## ``stopReplication``'s final status is encoded: the position could no
+  ## longer be reported. That waits for a running callback to return, so a
+  ## callback may still confirm after calling ``stopReplication``.
   conn.checkReplicating("confirmFlushed")
   # Clamp to received WAL: durably-persisted WAL can never exceed what was
   # received. Clamping (rather than raising) keeps automatic replies from
@@ -862,36 +1017,56 @@ proc confirmFlushed*(conn: PgConnection, lsn: Lsn): bool =
   # the readily-available ``walEnd`` — throw out of the callback and strand the
   # connection in ``csReplicating``. The raw helper in pg_connection/types
   # performs the clamp and the monotonic advance in one place.
-  return conn.confirmReplFlushed(lsn.toUInt64)
+  return conn.confirmReplReportable(lsn.toUInt64)
 
-proc sendConfirmedStatus(conn: PgConnection, receiveLsn: Lsn): Future[void] {.async.} =
-  ## Send a Standby Status Update carrying ``receiveLsn`` in the *receive* field
-  ## (which resets ``wal_sender_timeout`` on the server) and the
-  ## ``confirmFlushed`` position in flush/apply. The confirmed position is sent
-  ## verbatim — it is the stream's ``startLsn`` until ``confirmFlushed`` advances
-  ## it, so when nothing has been confirmed and ``startLsn`` was left at its
-  ## default ``InvalidLsn`` it is ``0/0``, which PostgreSQL reads as "position
-  ## unknown" and will not move the slot backwards. Either way flush never
-  ## advances past WAL the callback has not yet confirmed durable. Used by the
-  ## automatic keepalive reply and by ``stopReplication``.
-  ##
-  ## Only valid while ``csReplicating``, where ``confirmedFlushLsn`` is bounded
-  ## by received WAL (see ``confirmFlushed``), so flush never exceeds receive.
-  ## Calling this outside an active replication stream raises ``PgStateError``.
+proc sendConfirmedStatus(conn: PgConnection): Future[bool] {.async.} =
+  ## Queue the library's status and wait for it. False, sending nothing, once
+  ## the client's CopyDone is queued. Raises ``PgStateError`` outside an active
+  ## replication stream.
   conn.checkReplicating("sendConfirmedStatus")
-  let flushLsn = conn.confirmedFlushLsn
-  await conn.sendStandbyStatusRaw(
-    receiveLsn, flushLsn, flushLsn, replyRequested = false
-  )
+  if conn.replCopyDoneQueued() or not conn.replWritesOpen():
+    return false
+  let fut = conn.queueReplStatus().waitReplWrite()
+  conn.startFlush()
+  await fut
+  return true
 
-proc resetReplLsnTracking(conn: PgConnection, startLsn: Lsn) =
+proc stopStream(conn: PgConnection): Future[void] =
+  ## Queue the client's end of the stream: a last status, then CopyDone. Once
+  ## it is queued, a later stop waits on that same CopyDone and shares its
+  ## outcome.
+  let copyDone = conn.replCopyDone()
+  if copyDone == nil:
+    if not conn.replWritesOpen():
+      result = newFuture[void]("replStopEnded")
+      result.fail(newException(PgStateError, "the replication stream has ended"))
+      return
+    let copyDone = conn.replQueueStop()
+    # A failed status fails the CopyDone behind it, which reports it.
+    result = copyDone.waitReplWrite()
+    conn.startFlush()
+    return
+  case copyDone.state
+  of rwQueued, rwWriting:
+    result = copyDone.waitReplWrite()
+  of rwFailed:
+    result = newFuture[void]("replStopFailed")
+    result.fail(conn.replWriteError())
+  of rwWritten:
+    result = newFuture[void]("replStopDone")
+    result.complete()
+
+proc resetReplLsnTracking(
+    conn: PgConnection, startLsn: Lsn, autoConfirm = false, serverFlush = InvalidLsn
+) =
   ## Reset the per-stream confirmed-flush and max-received positions to the
   ## resume point at the start of a stream, so a reused connection never inherits
   ## a stale value from a previous stream. The confirmed-flush position then
   ## advances only via ``confirmFlushed``; the max-received position advances as
-  ## ``XLogData`` arrives and bounds what ``confirmFlushed`` will accept.
+  ## ``XLogData`` (and, on a logical stream, ``PrimaryKeepalive``) arrives and
+  ## bounds what ``confirmFlushed`` will accept.
   conn.initReplLsnTracking(startLsn.toUInt64)
-  conn.replCopyDoneSent = false
+  conn.replResetStream(autoConfirm, serverFlush.toUInt64)
 
 proc replFillRecvBuf(
     conn: PgConnection,
@@ -969,10 +1144,10 @@ proc maybeSendPeriodicStatus(
   ## Emit a proactive Standby Status Update if ``statusInterval`` has elapsed
   ## since the last one, so ``confirmed_flush_lsn`` advances (and
   ## ``wal_sender_timeout`` resets) even when the server never requests a reply —
-  ## e.g. a server configured with ``wal_sender_timeout = 0``. The update reports
-  ## the highest received LSN as receive and the ``confirmFlushed`` position as
-  ## flush/apply, identical to the automatic keepalive reply, so it never advances
-  ## flush past WAL the callback has confirmed durable. Returns the timestamp to
+  ## e.g. a server configured with ``wal_sender_timeout = 0``. The update is the
+  ## automatic keepalive reply's (see ``sendConfirmedStatus``): receive = highest
+  ## received, flush/apply = the ``confirmFlushed`` position, never below the
+  ## caller's last reported status. Returns the timestamp to
   ## record as the new ``lastStatusSent`` (unchanged when nothing was sent).
   ##
   ## Only active together with ``autoKeepaliveReply``: under manual reply
@@ -984,21 +1159,35 @@ proc maybeSendPeriodicStatus(
     return lastStatusSent
   if Moment.now() - lastStatusSent < statusInterval:
     return lastStatusSent
-  await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
+  # After the client's CopyDone nothing is sent, but the clock still restarts:
+  # otherwise the elapsed interval re-arms the recv loop's timer every tick.
+  discard await sendConfirmedStatus(conn)
   return Moment.now()
+
+type ReplStreamKind = enum
+  rskLogical
+  rskPhysical
+
+func label(kind: ReplStreamKind): string =
+  case kind
+  of rskLogical: "replication"
+  of rskPhysical: "physical replication"
 
 proc handleReplicationData(
     conn: PgConnection,
     copyData: sink seq[byte],
     autoKeepaliveReply: bool,
+    kind: ReplStreamKind,
     callback: ReplicationCallback,
     lastStatusSent: Moment,
 ): Future[Moment] {.async.} =
   ## Process one CopyData frame from a replication stream: parse it, advance the
-  ## received-WAL position on ``XLogData`` (the single source of truth read by
+  ## received-WAL position (the single source of truth read by
   ## ``confirmFlushed`` and the auto-reply), emit an automatic keepalive reply on
-  ## a ``PrimaryKeepalive`` with ``replyRequested`` when ``autoKeepaliveReply`` is
-  ## set, then invoke the user ``callback``. Shared by ``startReplication`` and
+  ## a ``PrimaryKeepalive`` with ``replyRequested`` when ``autoKeepaliveReply``
+  ## is set (and, under ``autoConfirm`` regardless of it, on one outside a
+  ## transaction with an unreported position), then invoke the user
+  ## ``callback``. Shared by ``startReplication`` and
   ## ``startPhysicalReplication`` so the received-tracking and auto-reply logic
   ## lives in exactly one place.
   ##
@@ -1008,16 +1197,115 @@ proc handleReplicationData(
   ## proactive updates.
   var newLastStatusSent = lastStatusSent
   let replMsg = parseReplicationMessage(move(copyData))
+  # autoConfirm: a Commit is confirmed only once the callback has processed it.
+  var commitEnd = InvalidLsn
+  var sawCommit = false
   case replMsg.kind
   of rmkXLogData:
-    let received = replMsg.xlogData.receivedEndLsn
+    # Logical data isn't WAL bytes; a Commit's startLsn equals its endLsn.
+    let received =
+      case kind
+      of rskLogical: replMsg.xlogData.startLsn
+      of rskPhysical: replMsg.xlogData.receivedEndLsn
     discard conn.updateReplMaxReceivedLsn(received.toUInt64)
+    if conn.replAutoConfirm() and replMsg.xlogData.data.len > 0:
+      case char(replMsg.xlogData.data[0])
+      of 'B':
+        conn.replEnterTxn()
+      of 'C':
+        # A short frame is left for the callback's own parse to reject.
+        sawCommit = true
+        if replMsg.xlogData.data.len >= CommitEndLsnPos + 8:
+          commitEnd = commitEndLsn(replMsg.xlogData.data)
+      else:
+        discard
   of rmkPrimaryKeepalive:
+    # walEnd is the walsender's sent position; on a logical stream every commit
+    # before it was already streamed. Physical keeps the byte-exact XLogData bound.
+    if kind == rskLogical:
+      discard conn.updateReplMaxReceivedLsn(replMsg.keepalive.walEnd.toUInt64)
+    if conn.replAutoConfirm() and not conn.replInTxn():
+      # Everything before it is processed; pgoutput reports skipped
+      # transactions only through walEnd.
+      discard conn.confirmReplReportable(replMsg.keepalive.walEnd.toUInt64)
     if autoKeepaliveReply and replMsg.keepalive.replyRequested:
-      await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
-      newLastStatusSent = Moment.now()
-  await callback(replMsg)
+      if await sendConfirmedStatus(conn):
+        newLastStatusSent = Moment.now()
+    elif conn.replAutoConfirm() and not conn.replInTxn() and
+        not conn.replPendingStatusQueued() and
+        conn.replConfirmedFlushLsn() > max(
+          conn.replSentFlush(), conn.replReported.flush
+        ):
+      # Report a confirmation the server has not heard yet. Awaited so a failed
+      # write surfaces here; asyncdispatch's recv loop would miss it until more data.
+      if await sendConfirmedStatus(conn):
+        newLastStatusSent = Moment.now()
+  conn.setReplInCallback(true)
+  try:
+    await callback(replMsg)
+    if sawCommit:
+      conn.replExitTxn()
+      discard conn.confirmReplReportable(commitEnd.toUInt64)
+  finally:
+    conn.setReplInCallback(false)
+  if conn.replStopStatusQueued():
+    # A stop held back while the callback ran goes out now.
+    conn.startFlush()
   return newLastStatusSent
+
+proc raiseIfStreamClosed(
+    conn: PgConnection, kind: ReplStreamKind, queryError: ref PgQueryError = nil
+) =
+  ## Raise if the connection died under the stream, naming the replication
+  ## write that killed it as the cause, and the server's error if it sent one.
+  if conn.state != csClosed:
+    return
+  var msg = "Connection closed during " & kind.label
+  if queryError != nil:
+    msg.add(" after the server's error: " & queryError.msg)
+  raise conn.replClosedError(msg)
+
+proc finishStream(
+    conn: PgConnection,
+    kind: ReplStreamKind,
+    txStatus: TransactionStatus,
+    queryError: ref PgQueryError,
+    copyDoneSeen = true,
+) {.async.} =
+  ## ReadyForQuery ends the stream: settle our writes, then hand the connection
+  ## back unless a write that failed meanwhile left it dead.
+  ##
+  ## ``copyDoneSeen`` is false when ReadyForQuery arrives in the receive loop:
+  ## no server CopyDone and no error. On a logical stream that is a reused
+  ## connection's end (BUG #18754, the walsender does not reset its streaming
+  ## flags), so the connection cannot stream logical replication again. A
+  ## physical one does reset them, so no ordinary stream ends that way. Either
+  ## way the connection is retired (``csClosed``) and ``PgUnavailableError``
+  ## raised.
+  await conn.awaitReplWritesIdle()
+  conn.raiseIfStreamClosed(kind, queryError)
+  if not copyDoneSeen and queryError == nil:
+    conn.markClosed()
+    # Only a reused logical connection ends here: the logical walsender keeps
+    # its streaming flags across START_REPLICATION (BUG #18754). A physical
+    # walsender resets them, so no ordinary stream ends that way and there is
+    # no cause to name for it.
+    let cause =
+      case kind
+      of rskLogical:
+        "; PostgreSQL cannot restart logical replication on a connection that" &
+          " already streamed (BUG #18754)"
+      of rskPhysical:
+        "; no error explains it"
+    raise newException(
+      PgUnavailableError,
+      kind.label & ": the server ended the stream without CopyDone" & cause &
+        ", reconnect to resume",
+    )
+  conn.txStatus = txStatus
+  conn.markReady()
+  if queryError != nil:
+    raise queryError
 
 proc invalidateAbandonedStream(conn: PgConnection) =
   ## Poison a connection whose CopyBoth replication stream was torn down
@@ -1047,12 +1335,14 @@ proc runReplicationStream(
     startLsn: Lsn,
     autoKeepaliveReply: bool,
     statusInterval: async_backend.Duration,
+    kind: ReplStreamKind,
     callback: ReplicationCallback,
-    context: string,
+    autoConfirm = false,
+    serverFlush = InvalidLsn,
 ): Future[void] {.async.} =
   ## Shared replication stream body. Caller must have already sent the
-  ## ``START_REPLICATION`` query. ``context`` appears in error messages
-  ## (e.g. ``"replication"`` / ``"physical replication"``).
+  ## ``START_REPLICATION`` query. ``kind`` selects the received-LSN rule and
+  ## labels error messages.
   var queryError: ref PgQueryError
 
   # Register the poison-on-abandon defer BEFORE waitCopyBoth so a raise during
@@ -1060,6 +1350,8 @@ proc runReplicationStream(
   # mid-stream failure once csReplicating.
   defer:
     conn.invalidateAbandonedStream()
+    # Only an abandoned stream leaves writes queued; nothing will flush them.
+    conn.closeReplWrites()
 
   block waitCopyBoth:
     while true:
@@ -1078,13 +1370,13 @@ proc runReplicationStream(
             raise queryError
           raise newException(
             PgConnectionError,
-            "START_REPLICATION " & context & " ended without CopyBothResponse",
+            "START_REPLICATION " & kind.label & " ended without CopyBothResponse",
           )
         else:
           discard
       await conn.fillRecvBuf()
 
-  conn.resetReplLsnTracking(startLsn)
+  conn.resetReplLsnTracking(startLsn, autoConfirm, serverFlush)
 
   var lastStatusSent = Moment.now()
   var pendingRead: Future[void] = nil
@@ -1096,47 +1388,46 @@ proc runReplicationStream(
   block recvLoop:
     while true:
       while (let opt = conn.nextMessage(); opt.isSome):
+        # A failed write ends the stream even with messages still buffered.
+        conn.raiseIfStreamClosed(kind)
         var msg = opt.get
         case msg.kind
         of bmkCopyData:
           lastStatusSent = await conn.handleReplicationData(
-            move(msg.copyData), autoKeepaliveReply, callback, lastStatusSent
+            move(msg.copyData), autoKeepaliveReply, kind, callback, lastStatusSent
           )
         of bmkCopyDone:
           # Mirror only on server-initiated stop (walsender timeout,
           # pg_terminate_backend, slot drop). If the client already sent
-          # CopyDone via stopReplication, a second one would land after the
-          # server left COPY mode -> "invalid frontend message type".
-          if not conn.replCopyDoneSent:
-            try:
-              await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
-            except CancelledError as e:
-              raise e
-            except CatchableError:
-              discard
-            conn.replCopyDoneSent = true
-            await conn.sendMsg(@copyDoneMsg)
+          # CopyDone via stopReplication, the protocol allows no second one
+          # (PostgreSQL ignores it once out of COPY mode).
+          await conn.stopStream()
           break recvLoop
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.markReady()
-          if queryError != nil:
-            raise queryError
+          # No server CopyDone: either the server left COPY on an error, or it
+          # ended the stream without CopyDone. finishStream tells the two apart.
+          await conn.finishStream(kind, msg.txStatus, queryError, copyDoneSeen = false)
           return
         else:
           discard
       lastStatusSent = await conn.maybeSendPeriodicStatus(
         autoKeepaliveReply, statusInterval, lastStatusSent
       )
-      if conn.state == csClosed:
-        conn.raiseClosedConnection("Connection closed during " & context)
+      conn.raiseIfStreamClosed(kind)
       # Without autoKeepaliveReply, lastStatusSent never advances, so a timer
       # race here would rearm every ~1 ms.
       let effectiveInterval = if autoKeepaliveReply: statusInterval else: ZeroDuration
-      pendingRead =
-        await conn.replFillRecvBuf(effectiveInterval, lastStatusSent, pendingRead)
+      try:
+        pendingRead =
+          await conn.replFillRecvBuf(effectiveInterval, lastStatusSent, pendingRead)
+      except PgConnectionError as e:
+        # chronos: a failed write drops the socket, so the read fails next;
+        # name the write as the cause.
+        if e.parent == nil:
+          e.parent = conn.replWriteFailure()
+        raise e
       lastStatusSent = await conn.maybeSendPeriodicStatus(
         autoKeepaliveReply, statusInterval, lastStatusSent
       )
@@ -1149,10 +1440,7 @@ proc runReplicationStream(
         of bmkErrorResponse:
           queryError = newPgQueryError(msg.errorFields)
         of bmkReadyForQuery:
-          conn.txStatus = msg.txStatus
-          conn.markReady()
-          if queryError != nil:
-            raise queryError
+          await conn.finishStream(kind, msg.txStatus, queryError)
           break drainLoop
         else:
           discard
@@ -1166,13 +1454,48 @@ proc startReplication*(
     autoKeepaliveReply: bool = true,
     statusInterval: async_backend.Duration = ZeroDuration,
     callback: ReplicationCallback,
+    autoConfirm: bool = false,
 ): Future[void] {.async.} =
   ## Begin logical replication. Callback invoked per message. Use
   ## ``confirmFlushed`` for flush tracking; or set ``autoKeepaliveReply=false``
   ## and use ``sendStandbyStatus`` manually.
   ##
-  ## Returns on server ``CopyDone`` or connection close. To stop from the client
-  ## side, call ``stopReplication`` from the callback (or a concurrent task).
+  ## ``autoConfirm`` (pgoutput only) confirms progress for you: a transaction's
+  ## ``CommitMessage.endLsn`` once the callback has returned for its Commit, and
+  ## a keepalive's ``walEnd`` outside a transaction (reported right away), so
+  ## the slot also advances while pgoutput skips unpublished transactions. The
+  ## callback returning therefore means "processed durably"; a callback raising
+  ## on a transaction's messages confirms nothing of it. A keepalive carries no
+  ## data, so its position is confirmed before its callback runs.
+  ##
+  ## Nothing is confirmed once ``stopReplication``'s final status is encoded.
+  ## That waits for a running callback to return, so a stop from a Commit's
+  ## own callback still reports that transaction; messages after it are not
+  ## confirmed.
+  ##
+  ## To resume after an error, reconnect and pass ``InvalidLsn``: the server
+  ## restarts from the slot's ``confirmed_flush_lsn``, re-sending
+  ## anything not yet reported. The slot's ``confirmed_flush_lsn`` is looked up
+  ## first and the stream starts from it or ``startLsn``, whichever is later
+  ## (the server would not start earlier either), so keepalives seen while the
+  ## server re-reads WAL from ``restart_lsn`` never report a position below it.
+  ## A Commit's position is confirmed at once but reaches the server with the
+  ## next status: a keepalive's, ``statusInterval``'s or the stop's. Set
+  ## ``statusInterval`` on a stream that may stay busy for long, as its
+  ## walsender sends no idle keepalive meanwhile.
+  ##
+  ## A connection can stream logical replication only once: its walsender does
+  ## not reset the streaming flags, so the next ``START_REPLICATION ...
+  ## LOGICAL`` on it ends at once (BUG #18754). The library retires the
+  ## connection (``csClosed``) and raises ``PgUnavailableError`` — accepted by
+  ## ``isTransientError`` — so reconnect and resume with ``InvalidLsn``.
+  ##
+  ## Requires ``publication_names`` in ``options`` and ``autoKeepaliveReply``
+  ## (``ValueError`` otherwise).
+  ##
+  ## Returns on server ``CopyDone`` or connection close, or raises
+  ## ``PgUnavailableError`` as above. To stop from the client side, call
+  ## ``stopReplication`` from the callback (or a concurrent task).
   ##
   ## Errors poison connection. Track LSN for resume. A failing auto-reply
   ## propagates too, and the callback is *not* invoked for that keepalive.
@@ -1194,7 +1517,8 @@ proc startReplication*(
   ##
   ## ``statusInterval`` (``ZeroDuration`` = off) sends a proactive Standby Status
   ## Update at least that often — receive = highest received, flush/apply =
-  ## ``confirmFlushed`` — so the slot advances on a server that never requests a
+  ## ``confirmFlushed`` (never below a position the caller itself reported via
+  ## ``sendStandbyStatus``) — so the slot advances on a server that never requests a
   ## reply (``wal_sender_timeout = 0``). Honoured only with
   ## ``autoKeepaliveReply``; under asyncdispatch it fires only while messages are
   ## flowing, so a fully idle stream sends nothing until the next message.
@@ -1208,6 +1532,13 @@ proc startReplication*(
   var hasProtoVersion = false
   var hasPublicationNames = false
   for (k, v) in options:
+    if k.len == 0:
+      raise newException(ValueError, "Empty replication option key")
+    # Checked here, before the autoConfirm slot lookup touches the wire.
+    if k[0] notin IdentStartChars or not k.allCharsInSet(IdentChars):
+      raise newException(ValueError, "Invalid replication option key: " & k)
+    if '\0' in v:
+      raise newException(ValueError, "Replication option value contains a NUL byte")
     # Values are quoted below, so one that already arrives wrapped in quotes
     # would reach the server including them. Reject the pre-quoting spelling
     # rather than sending a value the plugin rejects mid-stream.
@@ -1243,7 +1574,43 @@ proc startReplication*(
             " names, e.g. \"my_pub\")",
         )
 
+  if autoConfirm:
+    if not hasPublicationNames:
+      raise newException(
+        ValueError,
+        "autoConfirm requires pgoutput (publication_names in options): it" &
+          " tracks transactions through pgoutput Begin/Commit messages",
+      )
+    if not autoKeepaliveReply:
+      raise newException(
+        ValueError,
+        "autoConfirm requires autoKeepaliveReply: under manual replies the" &
+          " caller reports progress via sendStandbyStatus",
+      )
+
   conn.checkReady()
+
+  var effectiveStart = startLsn
+  var slotFlush = InvalidLsn
+  if autoConfirm:
+    # A logical walsender starts no earlier than the slot's confirmed_flush_lsn
+    # but re-reads WAL from restart_lsn, so its keepalive walEnd can trail that
+    # position until it catches up. Track from the later of the two.
+    let results = await conn.simpleQuery(
+      "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name = " &
+        quoteLiteral(slotName)
+    )
+    if results.len > 0 and results[0].rowCount > 0:
+      if results[0].fields.len < 1:
+        raise
+          newException(PgConnectionError, "replication slot lookup returned no columns")
+      let row = initRow(results[0].data, 0)
+      if not row.isNull(0):
+        slotFlush = parseLsn(row.getStr(0))
+        effectiveStart = max(startLsn, slotFlush)
+    # The lookup left the connection ready across a suspension; another task
+    # may have taken it since.
+    conn.checkReady()
 
   # publication_names => pgoutput; pin proto_version defensively against a
   # future server-side default bump past 1.
@@ -1254,19 +1621,12 @@ proc startReplication*(
   # Build START_REPLICATION command. Values are single-quoted so untrusted
   # input cannot break out of the option list via the simple-query protocol.
   var sql =
-    "START_REPLICATION SLOT " & quoteIdentifier(slotName) & " LOGICAL " & $startLsn
+    "START_REPLICATION SLOT " & quoteIdentifier(slotName) & " LOGICAL " & $effectiveStart
   if effectiveOptions.len > 0:
     sql.add(" (")
     for i, (k, v) in effectiveOptions:
       if i > 0:
         sql.add(", ")
-      for j, c in k:
-        if j == 0:
-          if c notin {'a' .. 'z', 'A' .. 'Z', '_'}:
-            raise newException(ValueError, "Invalid replication option key: " & k)
-        else:
-          if c notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}:
-            raise newException(ValueError, "Invalid replication option key: " & k)
       sql.add(k)
       if v.len > 0:
         sql.add(" " & quoteReplLiteral(v))
@@ -1276,17 +1636,31 @@ proc startReplication*(
   conn.markBusy()
   await conn.sendMsg(msg)
   await runReplicationStream(
-    conn, startLsn, autoKeepaliveReply, statusInterval, callback, "replication"
+    conn, effectiveStart, autoKeepaliveReply, statusInterval, rskLogical, callback,
+    autoConfirm, slotFlush,
   )
 
 proc stopReplication*(conn: PgConnection): Future[void] {.async.} =
-  ## Terminate replication. Flushes confirmed position before CopyDone.
+  ## Terminate replication. Flushes confirmed position before CopyDone, never
+  ## below the caller's last reported status (``sendStandbyStatus``).
   ## Raises ``PgStateError`` unless the connection is ``csReplicating``, or
-  ## ``PgConnectionError`` when the connection was lost.
+  ## ``PgConnectionError`` when the connection was lost. The final status and
+  ## CopyDone are queued behind every earlier replication write; a call made
+  ## once they are queued waits for that same CopyDone. Cancelling only stops
+  ## the wait: the stop still goes out. A failed write closes the connection.
+  ##
+  ## While the stream's callback runs, the final status waits for it to return,
+  ## so a position it confirms after this call (``autoConfirm``'s Commit
+  ## included) is still reported. A call made meanwhile, from the callback or
+  ## elsewhere, returns once the stop is queued; ``startReplication`` reports
+  ## a failed write. To stop from another task, await ``startReplication``
+  ## rather than calling ``close()`` right after, or the stop may never go out.
   conn.checkReplicating("stopReplication")
-  await sendConfirmedStatus(conn, Lsn(conn.replMaxReceivedLsn()))
-  conn.replCopyDoneSent = true
-  await conn.sendMsg(@copyDoneMsg)
+  let stopped = conn.stopStream()
+  if conn.replInCallback() and not stopped.finished:
+    # Waiting would deadlock when the caller is the callback itself.
+    return
+  await stopped
 
 proc startPhysicalReplication*(
     conn: PgConnection,
@@ -1302,10 +1676,13 @@ proc startPhysicalReplication*(
   ## ``csReady``. Error handling matches ``startReplication``: a callback
   ## exception or any other mid-stream failure poisons the connection (marked
   ## closed) and propagates, so reconnect and resume from the last LSN tracked.
+  ## A ReadyForQuery without ``CopyDone`` retires the connection and raises
+  ## ``PgUnavailableError`` too, with no cause named: a physical walsender does
+  ## reset its streaming flags, so no ordinary stream ends that way.
   ##
-  ## ``slotName = ""`` streams without a slot. A non-zero ``timeline`` is appended
-  ## as ``TIMELINE n``, so the server aborts the stream if it advanced past that
-  ## timeline. ``statusInterval`` behaves as on ``startReplication``.
+  ## ``slotName = ""`` streams without a slot. Non-zero ``timeline`` is sent as
+  ## ``TIMELINE n`` (negative raises ``ValueError``). ``statusInterval`` behaves
+  ## as on ``startReplication``.
   ##
   ## On a timeline switch the server may send a result set describing the next
   ## timeline between ``CopyDone`` and ``ReadyForQuery``; this proc drains and
@@ -1315,6 +1692,8 @@ proc startPhysicalReplication*(
   ## recycle, so a standby in ``synchronous_standby_names`` that relies on the
   ## auto-reply must call ``confirmFlushed`` (or reply manually) or the primary's
   ## ``COMMIT``s block waiting on a flush position that never advances.
+  if timeline < 0:
+    raise newException(ValueError, "timeline must be >= 0, got " & $timeline)
   conn.checkReady()
 
   var sql = "START_REPLICATION"
@@ -1328,5 +1707,5 @@ proc startPhysicalReplication*(
   conn.markBusy()
   await conn.sendMsg(msg)
   await runReplicationStream(
-    conn, startLsn, autoKeepaliveReply, statusInterval, callback, "physical replication"
+    conn, startLsn, autoKeepaliveReply, statusInterval, rskPhysical, callback
   )

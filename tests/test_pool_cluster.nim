@@ -1,6 +1,6 @@
 import std/[unittest, deques, tables, importutils, strutils]
 
-import ../async_postgres/[async_backend, pg_protocol, pg_connection]
+import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection/types {.all.}
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/pg_pool_cluster {.all.}

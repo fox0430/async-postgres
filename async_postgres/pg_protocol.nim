@@ -1,7 +1,9 @@
 import std/[options, tables]
 
 import pg_bytes, pg_errors
-export pg_errors
+# Third re-export path of `pg_errors`; `setPerHost` and `newStartupError` stay
+# sibling-only, as in the `pg_connection` / `pg_types/core` hubs.
+export pg_errors except setPerHost, newStartupError
 
 type
   FrontendMessageKind* = enum
@@ -344,6 +346,29 @@ func data*(row: Row): RowData = ## The underlying RowData buffer.
 func rowIdx*(row: Row): int32 = ## The row index within the RowData buffer.
   row.rowIdx
 
+proc cellSpan*(row: Row, col: int): tuple[off: int, len: int] {.inline.} =
+  ## Offset and length (-1 = NULL) of one cell in ``row.data.buf``. Shared by
+  ## the ``pg_types`` accessors and ``clone`` as the only cell lookup.
+  # PgTypeError, not IndexDefect: `raises: []` doesn't suppress Defects, so
+  # `except PgError` would miss them and crash the process (UB in -d:release).
+  # `initRow` and the RowData fields are public, so every coordinate is checked.
+  if row.data == nil:
+    raise newException(PgTypeError, "Row has no data")
+  if col < 0 or col >= int(row.data.numCols):
+    raise newException(
+      PgTypeError, "column index " & $col & " out of range 0..<" & $row.data.numCols
+    )
+  let idx = (int64(row.rowIdx) * int64(row.data.numCols) + int64(col)) * 2
+  if row.rowIdx < 0 or idx + 1 >= int64(row.data.cellIndex.len):
+    raise newException(PgTypeError, "row index " & $row.rowIdx & " out of range")
+  result.off = int(row.data.cellIndex[idx])
+  result.len = int(row.data.cellIndex[idx + 1])
+  if result.len < -1 or (
+    result.len > 0 and (result.off < 0 or result.off > row.data.buf.len - result.len)
+  ):
+    raise
+      newException(PgTypeError, "column " & $col & " cell lies outside the row buffer")
+
 func isBinarySafeOid*(oid: int32): bool =
   ## Check if a type OID can be safely requested in binary format.
   oid >= 0 and oid <= BinarySafeMaxOid and binarySafeLookup[oid]
@@ -459,7 +484,7 @@ proc patchMsgLenAtomic*(buf: var seq[byte], msgStart: int) =
 # the tests that import this module directly; off the export whitelist.
 const
   parseLengthOverhead* = 8
-    ## Beyond stmtName.len+sql.len+4*n: length field + 2 terminators + count
+    ## Beyond ``stmtName.len+sql.len+4*n``: length field + 2 terminators + count
   bindLengthOverhead* = 12
     ## Beyond names+payload: length field + 2 terminators + 3 counts
   describeLengthOverhead* = 6
@@ -1098,6 +1123,13 @@ proc encodeCopyFail*(
 
 # Backend message parsing (internal helpers)
 
+proc rejectTrailing(body: openArray[byte], offset: int, label: string) {.inline.} =
+  ## Reject trailing bytes past the last consumed field.
+  if offset != body.len:
+    raise newException(
+      PgProtocolError, label & ": trailing data (" & $(body.len - offset) & " bytes)"
+    )
+
 proc parseAuthentication(body: openArray[byte]): BackendMessage =
   if body.len < 4:
     raise newException(PgProtocolError, "Authentication message too short")
@@ -1106,14 +1138,17 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
   case authType
   of 0:
     result = BackendMessage(kind: bmkAuthenticationOk)
+    rejectTrailing(body, 4, "AuthenticationOk")
   of 3:
     result = BackendMessage(kind: bmkAuthenticationCleartextPassword)
+    rejectTrailing(body, 4, "AuthenticationCleartextPassword")
   of 5:
     if body.len < 8:
       raise newException(PgProtocolError, "MD5 auth message too short")
     result = BackendMessage(kind: bmkAuthenticationMD5Password)
     for i, b in body[4 .. 7]:
       result.md5Salt[i] = b
+    rejectTrailing(body, 8, "AuthenticationMD5Password")
   of 10:
     # SASL
     result = BackendMessage(kind: bmkAuthenticationSASL)
@@ -1131,12 +1166,13 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
           "AuthenticationSASL: mechanism count exceeds maximum of " & $MaxSaslMechanisms,
         )
       result.saslMechanisms.add(mechanism)
+    rejectTrailing(body, offset, "AuthenticationSASL")
   of 11:
-    # SASLContinue
+    # Rest is challenge payload.
     result = BackendMessage(kind: bmkAuthenticationSASLContinue)
     result.saslData = @(body.toOpenArray(4, body.len - 1))
   of 12:
-    # SASLFinal
+    # Rest is server-final payload.
     result = BackendMessage(kind: bmkAuthenticationSASLFinal)
     result.saslFinalData = @(body.toOpenArray(4, body.len - 1))
   else:
@@ -1148,11 +1184,13 @@ proc parseBackendKeyData(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkBackendKeyData)
   result.backendPid = decodeInt32(body, 0)
   result.backendSecretKey = decodeInt32(body, 4)
+  rejectTrailing(body, 8, "BackendKeyData")
 
 proc parseCommandComplete(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkCommandComplete)
-  let (tag, _) = decodeCString(body, 0)
+  let (tag, consumed) = decodeCString(body, 0)
   result.commandTag = tag
+  rejectTrailing(body, consumed, "CommandComplete")
 
 proc parseDataRow(body: openArray[byte]): BackendMessage =
   if body.len < 2:
@@ -1177,12 +1215,12 @@ proc parseDataRow(body: openArray[byte]): BackendMessage =
         raise newException(PgProtocolError, "DataRow: column data truncated")
       result.columns[i] = some(@(body.toOpenArray(offset, offset + colLen - 1)))
       offset += colLen
+  rejectTrailing(body, offset, "DataRow")
 
 proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
-  # Reject empty body: the '\0' field terminator is mandatory, and letting it
-  # through surfaces upstack as a diagnostically empty PgQueryError.
+  # Empty body would surface as an empty PgQueryError.
+  let name = if isError: "ErrorResponse" else: "NoticeResponse"
   if body.len == 0:
-    let name = if isError: "ErrorResponse" else: "NoticeResponse"
     raise newException(PgProtocolError, name & ": empty body")
   if isError:
     result = BackendMessage(kind: bmkErrorResponse)
@@ -1196,13 +1234,13 @@ proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
     let fieldType = char(body[offset])
     inc offset
     if fieldType == '\0':
+      rejectTrailing(body, offset, name)
       break
     let (value, consumed) = decodeCString(body, offset)
     offset += consumed
     # Bound field count before allocating: a hostile ~1 GiB body could otherwise
     # produce hundreds of millions of two-byte fields, amplifying allocation.
     if fieldCount >= MaxErrorOrNoticeFields:
-      let name = if isError: "ErrorResponse" else: "NoticeResponse"
       raise newException(
         PgProtocolError,
         name & ": field count exceeds maximum of " & $MaxErrorOrNoticeFields,
@@ -1223,15 +1261,18 @@ proc parseNotification(body: openArray[byte]): BackendMessage =
   let (channel, consumed1) = decodeCString(body, offset)
   result.notifChannel = channel
   offset += consumed1
-  let (payload, _) = decodeCString(body, offset)
+  let (payload, consumed2) = decodeCString(body, offset)
   result.notifPayload = payload
+  offset += consumed2
+  rejectTrailing(body, offset, "NotificationResponse")
 
 proc parseParameterStatus(body: openArray[byte]): BackendMessage =
   result = BackendMessage(kind: bmkParameterStatus)
   let (name, consumed) = decodeCString(body, 0)
   result.paramName = name
-  let (value, _) = decodeCString(body, consumed)
+  let (value, consumed2) = decodeCString(body, consumed)
   result.paramValue = value
+  rejectTrailing(body, consumed + consumed2, "ParameterStatus")
 
 proc parseRowDescription(body: openArray[byte]): BackendMessage =
   if body.len < 2:
@@ -1258,6 +1299,7 @@ proc parseRowDescription(body: openArray[byte]): BackendMessage =
       formatCode: decodeInt16(body, offset + 16),
     )
     offset += 18
+  rejectTrailing(body, offset, "RowDescription")
 
 proc parseReadyForQuery(body: openArray[byte]): BackendMessage =
   if body.len < 1:
@@ -1272,6 +1314,7 @@ proc parseReadyForQuery(body: openArray[byte]): BackendMessage =
     result.txStatus = tsInFailedTransaction
   else:
     raise newException(PgProtocolError, "Unknown transaction status: " & $char(body[0]))
+  rejectTrailing(body, 1, "ReadyForQuery")
 
 proc parseParameterDescription(body: openArray[byte]): BackendMessage =
   if body.len < 2:
@@ -1289,6 +1332,7 @@ proc parseParameterDescription(body: openArray[byte]): BackendMessage =
       raise newException(PgProtocolError, "ParameterDescription truncated")
     result.paramTypeOids[i] = decodeInt32(body, offset)
     offset += 4
+  rejectTrailing(body, offset, "ParameterDescription")
 
 proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
   if body.len < 8:
@@ -1317,6 +1361,7 @@ proc parseNegotiateProtocolVersion(body: openArray[byte]): BackendMessage =
     let (opt, consumed) = decodeCString(body, offset)
     result.unrecognizedOptions[i] = opt
     offset += consumed
+  rejectTrailing(body, offset, "NegotiateProtocolVersion")
 
 proc parseCopyResponse(
     body: openArray[byte], kind: BackendMessageKind
@@ -1325,7 +1370,13 @@ proc parseCopyResponse(
   if body.len < 3:
     raise newException(PgProtocolError, label & " message too short")
   result = BackendMessage(kind: kind)
-  result.copyFormat = if body[0] == 0: cfText else: cfBinary
+  case body[0]
+  of 0:
+    result.copyFormat = cfText
+  of 1:
+    result.copyFormat = cfBinary
+  else:
+    raise newException(PgProtocolError, label & ": unknown overall format " & $body[0])
   let numCols = decodeInt16(body, 1)
   if numCols < 0:
     raise newException(PgProtocolError, label & ": invalid column count " & $numCols)
@@ -1334,8 +1385,20 @@ proc parseCopyResponse(
   for i in 0 ..< numCols:
     if offset + 2 > body.len:
       raise newException(PgProtocolError, label & " truncated")
-    result.copyColumnFormats[i] = decodeInt16(body, offset)
+    let fmt = decodeInt16(body, offset)
+    # Column codes are 0/1; text-format copies require all zeros.
+    if fmt != 0 and fmt != 1:
+      raise newException(
+        PgProtocolError, label & ": unknown column format " & $fmt & " at column " & $i
+      )
+    if result.copyFormat == cfText and fmt != 0:
+      raise newException(
+        PgProtocolError,
+        label & ": column " & $i & " format " & $fmt & " in a text-format copy",
+      )
+    result.copyColumnFormats[i] = fmt
     offset += 2
+  rejectTrailing(body, offset, label)
 
 proc newRowData*(
     numCols: int16, colFormats: seq[int16] = @[], colTypeOids: seq[int32] = @[]
@@ -1390,40 +1453,50 @@ proc clone*(row: Row): Row =
   ## containing only this single row. Use this to retain rows from a
   ## `queryEach` callback beyond the callback's lifetime — the original
   ## buffer is reused for subsequent rows and would otherwise be overwritten.
+  ## Raises ``PgTypeError`` if ``row`` does not lie inside its ``RowData``
+  ## (see ``cellSpan``; a negative ``numCols`` included) or its cells total
+  ## over ``int32.high`` bytes; a Row without data clones to another one.
   if row.data == nil:
     return Row(data: nil, rowIdx: 0)
   let src = row.data
-  let numCols = src.numCols
-  let cellBase = int(row.rowIdx) * int(numCols) * 2
-  var total = 0
-  for i in 0 ..< int(numCols):
-    let clen = src.cellIndex[cellBase + i * 2 + 1]
-    if clen > 0:
-      total += int(clen)
+  # A hand-built RowData can carry a negative numCols (the fields are public);
+  # no cell in it is addressable then, so reject it the way cellSpan rejects
+  # out-of-range coordinates instead of returning a Row whose len is negative.
+  if src.numCols < 0:
+    raise
+      newException(PgTypeError, "RowData has negative numCols (" & $src.numCols & ")")
+  let numCols = int(src.numCols)
+  # int64: the copy can exceed int32, and where `int` is 32-bit the running sum
+  # would wrap before the guard below could fire.
+  var total: int64 = 0
+  for i in 0 ..< numCols:
+    total += int64(max(row.cellSpan(i).len, 0))
+    # Hand-built cells may overlap, so the copy can outgrow the int32 offsets.
+    if total > int64(int32.high):
+      raise newException(PgTypeError, "row too large to clone (" & $total & " bytes)")
   let rd = RowData(
-    numCols: numCols,
+    numCols: src.numCols,
     colFormats: src.colFormats,
     colTypeOids: src.colTypeOids,
     fields: src.fields,
     colMap: src.colMap,
-    cellIndex: newSeq[int32](int(numCols) * 2),
-    buf: newSeq[byte](total),
+    cellIndex: newSeq[int32](numCols * 2),
+    buf: newSeq[byte](int(total)),
   )
   var pos = 0
-  for i in 0 ..< int(numCols):
-    let srcOff = int(src.cellIndex[cellBase + i * 2])
-    let clen = src.cellIndex[cellBase + i * 2 + 1]
-    if clen == -1:
+  for i in 0 ..< numCols:
+    let c = row.cellSpan(i)
+    if c.len == -1:
       rd.cellIndex[i * 2] = 0'i32
       rd.cellIndex[i * 2 + 1] = -1'i32
-    elif clen == 0:
+    elif c.len == 0:
       rd.cellIndex[i * 2] = 0'i32
       rd.cellIndex[i * 2 + 1] = 0'i32
     else:
-      rd.buf.writeBytesAt(pos, src.buf.toOpenArray(srcOff, srcOff + int(clen) - 1))
+      rd.buf.writeBytesAt(pos, src.buf.toOpenArray(c.off, c.off + c.len - 1))
       rd.cellIndex[i * 2] = int32(pos)
-      rd.cellIndex[i * 2 + 1] = clen
-      pos += int(clen)
+      rd.cellIndex[i * 2 + 1] = int32(c.len)
+      pos += c.len
   Row(data: rd, rowIdx: 0)
 
 proc buildResultFormats*(fields: openArray[FieldDescription]): seq[int16] =
@@ -1493,6 +1566,12 @@ proc parseDataRowInto*(body: openArray[byte], rd: RowData) =
       rd.cellIndex[ci] = int32(pos)
       rd.cellIndex[ci + 1] = colLen
       pos += int(colLen)
+  if pos != bufEnd:
+    rd.cellIndex.setLen(cellBase)
+    rd.buf.setLen(bufBase)
+    raise newException(
+      PgProtocolError, "DataRow: trailing data (" & $(bufEnd - pos) & " bytes)"
+    )
 
 # Streaming backend message parser
 
@@ -1575,16 +1654,22 @@ proc parseBackendMessage*(
   of 'v':
     msg = parseNegotiateProtocolVersion(body)
   of '1':
+    rejectTrailing(body, 0, "ParseComplete")
     msg = BackendMessage(kind: bmkParseComplete)
   of '2':
+    rejectTrailing(body, 0, "BindComplete")
     msg = BackendMessage(kind: bmkBindComplete)
   of '3':
+    rejectTrailing(body, 0, "CloseComplete")
     msg = BackendMessage(kind: bmkCloseComplete)
   of 'I':
+    rejectTrailing(body, 0, "EmptyQueryResponse")
     msg = BackendMessage(kind: bmkEmptyQueryResponse)
   of 'n':
+    rejectTrailing(body, 0, "NoData")
     msg = BackendMessage(kind: bmkNoData)
   of 's':
+    rejectTrailing(body, 0, "PortalSuspended")
     msg = BackendMessage(kind: bmkPortalSuspended)
   of 'G':
     msg = parseCopyResponse(body, bmkCopyInResponse)
@@ -1596,6 +1681,7 @@ proc parseBackendMessage*(
     msg = BackendMessage(kind: bmkCopyData)
     msg.copyData = @(body)
   of 'c':
+    rejectTrailing(body, 0, "CopyDone")
     msg = BackendMessage(kind: bmkCopyDone)
   else:
     raise newException(PgProtocolError, "Unknown backend message type: " & msgType)

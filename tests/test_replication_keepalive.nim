@@ -1,18 +1,22 @@
 ## Replication keepalive auto-reply E2E tests using the in-process mock server.
 ##
-## Verifies that when `startReplication` is invoked with `autoKeepaliveReply = true`
-## (the default), the library responds to `PrimaryKeepalive(replyRequested=true)`
-## messages automatically, reporting the highest `receivedEndLsn`
-## (`XLogData.startLsn + data.len`) observed so far in the *receive* field —
-## never the server's `walEnd` (neither the keepalive's nor the XLogData's).
+## Verifies that with `autoKeepaliveReply = true` (the default) the library
+## responds to `PrimaryKeepalive(replyRequested=true)` messages automatically,
+## reporting the highest received position in the *receive* field:
+## `receivedEndLsn` on a physical stream (never a `walEnd`), and on a logical
+## stream `XLogData.startLsn` or the keepalive's `walEnd` (the sent position).
 ## Also verifies that flush/apply only reflect the LSN confirmed durable via
 ## `confirmFlushed` (so merely-received WAL does not advance
 ## `confirmed_flush_lsn`, preserving at-least-once delivery) and the opt-out path.
 
 import std/[strutils, unittest]
 
+when defined(posix):
+  import std/posix
+
 import ../async_postgres/[async_backend, pg_replication]
 import ../async_postgres/pg_connection {.all.}
+import ../async_postgres/pg_connection/types
 
 import mock_pg_server
 
@@ -21,6 +25,7 @@ privateAccess(PgConnection)
 
 when hasChronos:
   from std/times import cpuTime
+  import ../async_postgres/pg_connection/buffer_io
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
@@ -30,13 +35,13 @@ proc mockConfig(port: int): ConnConfig =
 const
   # startLsn of the XLogData burst the mock server sends.
   testStartLsn = 0x0000_0000_0000_1000'i64
-  # WAL bytes carried by the XLogData. The receivedEndLsn the client should
-  # acknowledge is testStartLsn + testWalData.len.
+  # WAL bytes carried by the XLogData. On a physical stream the client should
+  # acknowledge receivedEndLsn = testStartLsn + testWalData.len.
   testWalData: seq[byte] = @[1'u8, 2, 3]
   testReceivedEndLsn = testStartLsn + testWalData.len
-  # XLogData.walEnd and PrimaryKeepalive.walEnd are both the server's current
-  # WAL end; they may be far ahead of what the message actually contains.
-  # The client must NOT acknowledge these.
+  # Physical walEnd values, which may be far ahead of what the message
+  # contains; a physical client must NOT acknowledge these. A logical XLogData
+  # carries walEnd == startLsn, so logical tests pass testStartLsn instead.
   testXLogWalEnd = 0x0000_0000_0000_5000'i64
   testKeepaliveWalEnd = 0x0000_0000_0000_9999'i64
 
@@ -81,7 +86,7 @@ suite "Replication: auto keepalive reply":
         {.cast(gcsafe).}:
           callbackKinds.add(msg.kind)
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -99,6 +104,80 @@ suite "Replication: auto keepalive reply":
     check observedFlushLsn == 0
     check observedApplyLsn == 0
     check callbackKinds == @[rmkXLogData, rmkPrimaryKeepalive]
+
+  test "logical: keepalive walEnd is received; confirmFlushed clamps to startLsn":
+    observedReceiveLsn = -1
+    observedFlushLsn = -1
+    observedApplyLsn = -1
+    observedReplyMsgType = '\0'
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        let ssu = await runAutoKeepaliveServer(
+          st, testStartLsn, testStartLsn, testKeepaliveWalEnd, testWalData
+        )
+        observedReplyMsgType = ssu.msgType
+        observedReceiveLsn = ssu.receive
+        observedFlushLsn = ssu.flush
+        observedApplyLsn = ssu.apply
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          if msg.kind == rmkXLogData:
+            discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
+
+      await conn.startReplication("test_slot", callback = cb)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check observedReplyMsgType == 'd'
+    check observedReceiveLsn == testKeepaliveWalEnd
+    check observedFlushLsn == testStartLsn
+    check observedApplyLsn == testStartLsn
+
+  test "logical: XLogData counts startLsn, not startLsn + data.len":
+    observedReceiveLsn = -1
+    observedFlushLsn = -1
+    observedReplyMsgType = '\0'
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        # Keepalive walEnd at startLsn so it cannot mask the XLogData bound.
+        let ssu = await runAutoKeepaliveServer(
+          st, testStartLsn, testStartLsn, testStartLsn, testWalData
+        )
+        observedReplyMsgType = ssu.msgType
+        observedReceiveLsn = ssu.receive
+        observedFlushLsn = ssu.flush
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        {.cast(gcsafe).}:
+          if msg.kind == rmkXLogData:
+            discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
+
+      await conn.startReplication("test_slot", callback = cb)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check observedReplyMsgType == 'd'
+    check observedReceiveLsn == testStartLsn
+    check observedFlushLsn == testStartLsn
 
   test "auto-reply disabled: library does not send Standby Status":
     keepaliveSeen = false
@@ -183,7 +262,7 @@ suite "Replication: auto keepalive reply":
             # receive field and we prove they track confirmFlushed, not receipt.
             discard conn.confirmFlushed(msg.xlogData.startLsn)
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -234,7 +313,7 @@ suite "Replication: auto keepalive reply":
             discard conn.confirmFlushed(msg.xlogData.receivedEndLsn)
             discard conn.confirmFlushed(msg.xlogData.startLsn)
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -281,7 +360,7 @@ suite "Replication: auto keepalive reply":
             discard
               conn.confirmFlushed(Lsn(uint64(msg.xlogData.receivedEndLsn) + 1'u64))
 
-      await conn.startReplication("test_slot", callback = cb)
+      await conn.startPhysicalReplication(InvalidLsn, "test_slot", callback = cb)
       await conn.close()
       await serverFut
       await closeServer(ms)
@@ -338,13 +417,14 @@ suite "Replication: auto keepalive reply":
     check not thirdAdvanced
 
 suite "Replication: proactive status interval":
-  test "statusInterval sends a Standby Status without a reply-requested keepalive":
+  test "logical: statusInterval sends a Standby Status without a reply-requested keepalive":
     # A server with wal_sender_timeout = 0 never requests a reply, so the slot
     # only advances if the standby sends status updates on its own. With a
     # positive statusInterval the library must emit a Standby Status Update
     # (receive = received LSN, flush/apply = confirmFlushed) even though the
     # server set replyRequested only never. Works on both backends: chronos via a
     # timed idle wake, asyncdispatch via the post-message path nudged below.
+    # The physical variant lives in test_physical_replication.
     observedReceiveLsn = -1
     observedFlushLsn = -1
     observedApplyLsn = -1
@@ -359,15 +439,14 @@ suite "Replication: proactive status interval":
         var burst: seq[byte]
         burst.add(buildCopyBothResponse())
         # XLogData only — crucially, no PrimaryKeepalive(replyRequested=true).
-        burst.add(buildXLogData(testStartLsn, testXLogWalEnd, 0, testWalData))
+        burst.add(buildXLogData(testStartLsn, testStartLsn, 0, testWalData))
         await sendBytes(st, burst)
         # Let the status interval (50ms) elapse, then send a non-reply keepalive
         # to unblock the asyncdispatch read (which cannot wake on a timer);
-        # chronos has already emitted updates on its own by now.
+        # chronos has already emitted updates on its own by now. Its walEnd is
+        # startLsn so the received LSN is the same whichever backend replies.
         await sleepAsync(milliseconds(150))
-        await sendBytes(
-          st, buildKeepalive(testKeepaliveWalEnd, 0, replyRequested = false)
-        )
+        await sendBytes(st, buildKeepalive(testStartLsn, 0, replyRequested = false))
         let reply = await drainFrontendMessage(st)
         observedReplyMsgType = reply.msgType
         if reply.msgType == 'd':
@@ -407,12 +486,12 @@ suite "Replication: proactive status interval":
 
     waitFor testBody()
     # A proactive Standby Status Update arrived even though the server never set
-    # replyRequested: receive carries the received LSN, flush/apply the confirmed
-    # position (here equal, since the callback confirmed the full received range).
+    # replyRequested: receive carries the received LSN (startLsn on a logical
+    # stream), flush/apply the confirmed position clamped to it.
     check observedReplyMsgType == 'd'
-    check observedReceiveLsn == testReceivedEndLsn
-    check observedFlushLsn == testReceivedEndLsn
-    check observedApplyLsn == testReceivedEndLsn
+    check observedReceiveLsn == testStartLsn
+    check observedFlushLsn == testStartLsn
+    check observedApplyLsn == testStartLsn
 
 var poisonRaised: bool
 var poisonFinalState: PgConnState
@@ -467,8 +546,8 @@ suite "Replication: client-initiated stop":
   test "stopReplication does not double-send CopyDone":
     # Regression: the recv-loop `bmkCopyDone` handler used to mirror the
     # server's CopyDone unconditionally, so after stopReplication the client
-    # sent [status, CopyDone] twice. The second CopyDone arrives after the
-    # server has left COPY mode and would be `invalid frontend message type`.
+    # sent [status, CopyDone] twice. No CopyData or CopyDone may follow the
+    # client's CopyDone (PostgreSQL ignores it once out of COPY mode).
     stopFrontendMsgs.setLen(0)
 
     proc testBody() {.async.} =
@@ -521,6 +600,741 @@ suite "Replication: client-initiated stop":
 
     waitFor testBody()
     check stopFrontendMsgs == @['d', 'c', 'X']
+
+  test "sends past the stop's final status are dropped, a concurrent stop shares it":
+    # The walsender stops reading at the client's CopyDone, so a later status
+    # is dropped rather than raised: a callback acking a message still in
+    # flight from before the stop must not end the stream.
+    stopFrontendMsgs.setLen(0)
+    var stillReplicating, bothStopped, statusDropped, copyDropped = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        await sendBytes(st, buildCopyBothResponse())
+        let m1 = await drainFrontendMessage(st)
+        let m2 = await drainFrontendMessage(st)
+        {.cast(gcsafe).}:
+          stopFrontendMsgs.add(m1.msgType)
+          stopFrontendMsgs.add(m2.msgType)
+        var tail: seq[byte]
+        tail.add(buildCopyDone())
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          {.cast(gcsafe).}:
+            stopFrontendMsgs.add(m.msgType)
+          if m.msgType == 'X':
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        discard msg
+
+      proc stopper() {.async.} =
+        while conn.state != csReplicating:
+          await sleepAsync(milliseconds(1))
+        # Both calls start before any suspension: the second waits for the
+        # first instead of sending its own status and CopyDone.
+        let first = conn.stopReplication()
+        let second = conn.stopReplication()
+        stillReplicating = conn.state == csReplicating
+        # The idle queue took the final status at once: too late for these.
+        await conn.sendStandbyStatus(Lsn(1))
+        statusDropped = true
+        await conn.sendCopyData([byte('x')])
+        copyDropped = true
+        await first
+        await second
+        bothStopped = true
+
+      let stopFut = stopper()
+      await conn.startReplication("test_slot", callback = cb)
+      await stopFut
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check stillReplicating
+    check statusDropped
+    check copyDropped
+    check bothStopped
+    check stopFrontendMsgs == @['d', 'c', 'X']
+
+  test "a callback acking XLogData that arrives after the stop keeps the connection":
+    # The walsender keeps sending what it had in flight until it reads the
+    # client's CopyDone; a callback acking each message must not end the stream.
+    stopFrontendMsgs.setLen(0)
+    var acks = 0
+    var readyAfter = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        await sendBytes(st, buildCopyBothResponse())
+        let m1 = await drainFrontendMessage(st)
+        let m2 = await drainFrontendMessage(st)
+        {.cast(gcsafe).}:
+          stopFrontendMsgs.add(m1.msgType)
+          stopFrontendMsgs.add(m2.msgType)
+        var tail = buildXLogData(0x1000, 0x1010, 0, newSeq[byte](16))
+        tail.add(buildCopyDone())
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          {.cast(gcsafe).}:
+            stopFrontendMsgs.add(m.msgType)
+          if m.msgType == 'X':
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        if msg.kind == rmkXLogData:
+          await conn.sendStandbyStatus(msg.xlogData.startLsn)
+          inc acks
+
+      proc stopper() {.async.} =
+        while conn.state != csReplicating:
+          await sleepAsync(milliseconds(1))
+        await conn.stopReplication()
+
+      let stopFut = stopper()
+      await conn.startReplication("test_slot", callback = cb)
+      await stopFut
+      readyAfter = conn.state == csReady
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check acks == 1
+    check readyAfter
+    check stopFrontendMsgs == @['d', 'c', 'X']
+
+  test "a status sent after the stop goes out ahead of its final status":
+    # The stop's status waits behind a frame still being written, so a report
+    # made after stopReplication is still written, verbatim, before it.
+    var flushes: seq[int64]
+    var seen: seq[char]
+    var reportDone = false
+    const late = 0x7000'i64
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        await sendBytes(st, buildCopyBothResponse())
+        # Read nothing for a while so the bulk frame stays in flight.
+        await sleepAsync(milliseconds(500))
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          {.cast(gcsafe).}:
+            seen.add(m.msgType)
+            if m.msgType == 'd' and m.body.len > 0 and m.body[0] == byte('r'):
+              flushes.add(decodeStandbyStatus(m.body).flush)
+          if m.msgType == 'c':
+            var tail: seq[byte]
+            tail.add(buildCopyDone())
+            tail.add(buildReadyForQuery('I'))
+            await sendBytes(st, tail)
+          if m.msgType == 'X':
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        discard msg
+
+      proc stopper() {.async.} =
+        while conn.state != csReplicating:
+          await sleepAsync(milliseconds(1))
+        let bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+        let stop = conn.stopReplication()
+        await conn.sendStandbyStatus(Lsn(late))
+        reportDone = true
+        await stop
+        await bulk
+
+      let stopFut = stopper()
+      await conn.startReplication("test_slot", callback = cb)
+      await stopFut
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check reportDone
+    check flushes == @[late, late]
+    check seen == @['d', 'd', 'd', 'c', 'X']
+
+  test "an error ending the stream settles writes before handing back":
+    # The server leaves COPY with ErrorResponse while a frame is still being
+    # written. The stream must not return the connection mid-frame, a write
+    # queued behind it must fail rather than go out on an idle connection, and
+    # so must one issued while the stream waits out the frame.
+    var bulkDone, queuedRefused, gotQueryError, readyAfter = false
+    var lateRefused, lateWhileReplicating = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        await sendBytes(st, buildCopyBothResponse())
+        await sleepAsync(milliseconds(100))
+        var tail = buildErrorResponse("XX000", "walsender failed")
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        # Only now drain the client's writes.
+        await sleepAsync(milliseconds(300))
+        while true:
+          let m =
+            try:
+              await drainFrontendMessage(st)
+            except CatchableError:
+              break
+          if m.msgType == 'X':
+            break
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        discard msg
+      var bulk, queued: Future[void]
+
+      proc writer() {.async.} =
+        while conn.state != csReplicating:
+          await sleepAsync(milliseconds(1))
+        bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+        queued = conn.sendCopyData([byte('h')])
+        # The stream closes to writes before it waits out the bulk frame.
+        while conn.replWritesOpen:
+          await sleepAsync(milliseconds(1))
+        lateWhileReplicating = conn.state == csReplicating
+        try:
+          await conn.sendStandbyStatus(Lsn(1))
+        except PgStateError:
+          lateRefused = true
+
+      let writerFut = writer()
+      try:
+        await conn.startReplication("test_slot", callback = cb)
+      except PgQueryError:
+        gotQueryError = true
+      await writerFut
+      bulkDone = bulk.finished
+      readyAfter = conn.state == csReady
+      try:
+        await queued
+      except PgStateError:
+        queuedRefused = true
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check gotQueryError
+    check bulkDone
+    check queuedRefused
+    check readyAfter
+    check lateWhileReplicating
+    check lateRefused
+
+  test "a write failing while an error ends the stream leaves it closed":
+    # The server errors out of COPY and drops the connection while a frame is
+    # still being written. If the write fails during the wait, the connection
+    # must stay closed rather than be handed back as ready; if it went through,
+    # the server's error ends the stream as usual.
+    var gotConnError, gotQueryError, closedAfter, bulkFailed = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        await sendBytes(st, buildCopyBothResponse())
+        await sleepAsync(milliseconds(100))
+        var tail = buildErrorResponse("XX000", "walsender failed")
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        await closeClient(st) # unread client bytes turn into a reset
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        discard msg
+      var bulk: Future[void]
+
+      proc writer() {.async.} =
+        while conn.state != csReplicating:
+          await sleepAsync(milliseconds(1))
+        bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+
+      let writerFut = writer()
+      try:
+        await conn.startReplication("test_slot", callback = cb)
+      except PgConnectionError:
+        gotConnError = true
+      except PgQueryError:
+        gotQueryError = true
+      await writerFut
+      closedAfter = conn.state == csClosed
+      try:
+        await bulk
+      except CatchableError:
+        bulkFailed = true
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    # chronos reliably sees the reset on the pending write; asyncdispatch may
+    # finish it into the socket buffer first.
+    when hasChronos:
+      check bulkFailed
+    check gotConnError == bulkFailed
+    check closedAfter == bulkFailed
+    check gotQueryError == not bulkFailed
+
+  when hasChronos:
+    test "a cancelled stop still goes out whole and ends the stream":
+      # Cancelling a stop only ends that caller's wait: the queued status and
+      # CopyDone are written anyway, a concurrent stop completes with them, and
+      # the connection stays usable.
+      var ownerCancelled, waiterDone, streamEnded, readyAfter = false
+      var seen: seq[char]
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+
+        proc serverHandler() {.async.} =
+          let st = await acceptAndReady(ms)
+          discard await drainFrontendMessage(st) # START_REPLICATION
+          await sendBytes(st, buildCopyBothResponse())
+          # Read nothing for a while, so the client's writes back up behind a
+          # full socket buffer and the cancel lands before the stop is written.
+          await sleepAsync(seconds(2))
+          while true:
+            let m =
+              try:
+                await drainFrontendMessage(st)
+              except CatchableError:
+                break
+            {.cast(gcsafe).}:
+              seen.add(m.msgType)
+            if m.msgType == 'c':
+              var tail: seq[byte]
+              tail.add(buildCopyDone())
+              tail.add(buildReadyForQuery('I'))
+              await sendBytes(st, tail)
+            if m.msgType == 'X':
+              break
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+        let cb = makeReplicationCallback:
+          discard msg
+
+        proc stopper() {.async.} =
+          while conn.state != csReplicating:
+            await sleepAsync(milliseconds(1))
+          # Fill the socket so the stop stays queued behind this frame.
+          let bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+          let owner = conn.stopReplication()
+          let waiter = conn.stopReplication()
+          await owner.cancelAndWait()
+          ownerCancelled = owner.cancelled
+          await waiter
+          waiterDone = true
+          await bulk
+
+        let stopFut = stopper()
+        await conn.startReplication("test_slot", callback = cb)
+        streamEnded = true
+        readyAfter = conn.state == csReady
+        await stopFut
+        await conn.close()
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody().wait(seconds(10))
+      check ownerCancelled
+      check waiterDone
+      check streamEnded
+      check readyAfter
+      check seen == @['d', 'd', 'c', 'X']
+
+  when hasChronos:
+    test "dropping the transport fails writes queued behind a stuck one":
+      # The write in flight is stuck on a socket the server never drains; once
+      # the transport is gone it fails, and so does the stop queued behind it,
+      # rather than waiting on a write that never completes.
+      var waiterFailed, waiterTimedOut, holderFailed, causeKept = false
+      var laterStopCause, streamCause = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let serverDone = newFuture[void]("serverDone")
+
+        proc serverHandler() {.async.} =
+          let st = await acceptAndReady(ms)
+          discard await drainFrontendMessage(st) # START_REPLICATION
+          await sendBytes(st, buildCopyBothResponse())
+          await serverDone # read nothing more
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+        let cb = makeReplicationCallback:
+          discard msg
+
+        proc driver() {.async.} =
+          while conn.state != csReplicating:
+            await sleepAsync(milliseconds(1))
+          let holder = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024)) # stuck
+          let waiter = conn.stopReplication() # queued behind it
+          await conn.closeTransport()
+          try:
+            await waiter.wait(seconds(2))
+          except AsyncTimeoutError:
+            waiterTimedOut = true
+          except PgConnectionError as e:
+            waiterFailed = true
+            # The transport failure that ended the stream stays attached.
+            causeKept = e.parent != nil
+          try:
+            await holder
+          except PgConnectionError:
+            holderFailed = true
+          # A stop issued afterwards still names the write failure as cause.
+          try:
+            await conn.stopReplication()
+          except PgConnectionError as e:
+            laterStopCause = e.parent != nil
+
+        let driverFut = driver()
+        try:
+          await conn.startReplication("test_slot", callback = cb)
+        except PgConnectionError as e:
+          streamCause = e.parent != nil
+        except CatchableError:
+          discard
+        await driverFut
+        serverDone.complete()
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody().wait(seconds(10))
+      check waiterFailed
+      check not waiterTimedOut
+      check holderFailed
+      check causeKept
+      check laterStopCause
+      check streamCause
+
+  when hasChronos and defined(posix):
+    test "a failed write stops the callback for messages still buffered":
+      # Only the write direction is shut down, so the buffered messages stay
+      # readable while the write fails.
+      var calls = 0
+      var streamCause = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let serverDone = newFuture[void]("serverDone")
+
+        proc serverHandler() {.async.} =
+          let st = await acceptAndReady(ms)
+          discard await drainFrontendMessage(st) # START_REPLICATION
+          var burst = buildCopyBothResponse()
+          for i in 0 ..< 3:
+            let lsn = testStartLsn + i * 0x100
+            burst.add(buildXLogData(lsn, lsn, 0, testWalData))
+          await sendBytes(st, burst)
+          await serverDone
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+        var sent: Future[void]
+        let cb = makeReplicationCallback:
+          {.cast(gcsafe).}:
+            inc calls
+            if calls == 1:
+              doAssert shutdown(SocketHandle(conn.transport.fd), SHUT_WR) == 0
+              sent = conn.sendCopyData(@[byte 1, 2, 3])
+        try:
+          await conn.startReplication("test_slot", callback = cb)
+        except PgConnectionError as e:
+          streamCause = e.parent != nil
+        try:
+          await sent
+        except CatchableError:
+          discard
+        serverDone.complete()
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody().wait(seconds(10))
+      check calls == 1
+      check streamCause
+
+    test "dropping the transport under a statusInterval read is a connection error":
+      # The read in flight across status timer wakes must fail as a lost
+      # connection, not as a cancellation.
+      var gotConnError, gotCancel = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let serverDone = newFuture[void]("serverDone")
+
+        proc serverHandler() {.async.} =
+          let st = await acceptAndReady(ms)
+          discard await drainFrontendMessage(st) # START_REPLICATION
+          await sendBytes(st, buildCopyBothResponse())
+          await serverDone # read nothing more
+          await closeClient(st)
+
+        let serverFut = serverHandler()
+        let conn = await connect(mockConfig(ms.port))
+        let cb = makeReplicationCallback:
+          discard msg
+
+        proc driver() {.async.} =
+          while conn.state != csReplicating:
+            await sleepAsync(milliseconds(1))
+          await sleepAsync(milliseconds(50)) # the detached read is in flight
+          let holder = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024)) # stuck
+          await conn.closeTransport()
+          try:
+            await holder
+          except CatchableError:
+            discard
+
+        let driverFut = driver()
+        try:
+          await conn.startReplication(
+            "test_slot", statusInterval = seconds(10), callback = cb
+          )
+        except CancelledError:
+          gotCancel = true
+        except PgConnectionError:
+          gotConnError = true
+        await driverFut
+        serverDone.complete()
+        await serverFut
+        await closeServer(ms)
+
+      waitFor testBody().wait(seconds(10))
+      check gotConnError
+      check not gotCancel
+
+  proc statusFrame(lsn: int64): seq[byte] =
+    ## A hand-built Standby Status Update reporting ``lsn`` in every field.
+    var f = @[byte('r')]
+    for _ in 0 ..< 3:
+      for i in countdown(7, 0):
+        f.add(byte((lsn shr (i * 8)) and 0xff))
+    for _ in 0 ..< 8:
+      f.add(0'u8)
+    f.add(0'u8)
+    f
+
+  type ReportVia = enum
+    rvStatus # sendStandbyStatus
+    rvCopyData # a hand-built status via sendCopyData
+
+  proc runReportThenStop(
+      reports: seq[int64],
+      confirm: bool,
+      autoReply: bool,
+      via = rvStatus,
+      overlap = false,
+  ): tuple[msgs: seq[char], last: tuple[receive, flush, apply: int64]] =
+    ## On the XLogData the callback sends each of ``reports`` as a status
+    ## (after a lower confirmFlushed when ``confirm``) and stops. With
+    ## ``overlap`` the stop starts before the reports' writes are awaited.
+    ## Records frontend messages up to CopyDone and the positions of the last
+    ## status.
+    var res: tuple[msgs: seq[char], last: tuple[receive, flush, apply: int64]] =
+      (@[], (-1'i64, -1'i64, -1'i64))
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        var burst = buildCopyBothResponse()
+        burst.add(buildXLogData(testStartLsn, testStartLsn, 0, testWalData))
+        await sendBytes(st, burst)
+        while true:
+          let m = await drainFrontendMessage(st)
+          {.cast(gcsafe).}:
+            res.msgs.add(m.msgType)
+            if m.msgType == 'd':
+              res.last = decodeStandbyStatus(m.body)
+          if m.msgType == 'c':
+            break
+        var tail = buildCopyDone()
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        discard await drainFrontendMessage(st) # Terminate
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        if msg.kind == rmkXLogData:
+          if confirm:
+            discard conn.confirmFlushed(msg.xlogData.startLsn)
+          var pending: seq[Future[void]]
+          for lsn in reports:
+            let fut =
+              case via
+              of rvStatus:
+                conn.sendStandbyStatus(Lsn(lsn))
+              of rvCopyData:
+                conn.sendCopyData(statusFrame(lsn))
+            if overlap:
+              pending.add(fut)
+            else:
+              await fut
+          await conn.stopReplication()
+          for fut in pending:
+            await fut
+
+      await conn.startReplication(
+        "test_slot", autoKeepaliveReply = autoReply, callback = cb
+      )
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    res
+
+  # The library's own status must not report below the caller's last report:
+  # on a physical slot PostgreSQL takes flush as the new restart_lsn.
+  test "manual mode: the stop's status keeps the reported flush":
+    let r =
+      runReportThenStop(@[testKeepaliveWalEnd], confirm = false, autoReply = false)
+    check r.msgs == @['d', 'd', 'c']
+    check r.last == (testKeepaliveWalEnd, testKeepaliveWalEnd, testKeepaliveWalEnd)
+
+  test "manual mode with a lower confirmFlushed: the reported flush still wins":
+    let r = runReportThenStop(@[testKeepaliveWalEnd], confirm = true, autoReply = false)
+    check r.msgs == @['d', 'd', 'c']
+    check r.last.flush == testKeepaliveWalEnd
+
+  test "auto-reply mode: a manual report is not undercut by the stop":
+    let r = runReportThenStop(@[testKeepaliveWalEnd], confirm = true, autoReply = true)
+    check r.msgs == @['d', 'd', 'c']
+    check r.last.flush == testKeepaliveWalEnd
+
+  test "a status sent via sendCopyData is kept too":
+    let r = runReportThenStop(
+      @[testKeepaliveWalEnd], confirm = false, autoReply = false, via = rvCopyData
+    )
+    check r.msgs == @['d', 'd', 'c']
+    check r.last.flush == testKeepaliveWalEnd
+
+  test "a report still being written when the stop starts is not undercut":
+    # The stop's status is computed only once the report's write is through.
+    let r = runReportThenStop(
+      @[testKeepaliveWalEnd], confirm = false, autoReply = false, overlap = true
+    )
+    check r.msgs == @['d', 'd', 'c']
+    check r.last.flush == testKeepaliveWalEnd
+
+  test "a deliberately lower report is kept, not the earlier higher one":
+    let lower = testStartLsn + 0x100
+    let r = runReportThenStop(
+      @[testKeepaliveWalEnd, lower], confirm = false, autoReply = false
+    )
+    check r.msgs == @['d', 'd', 'd', 'c']
+    check r.last.flush == lower
+
+  test "the keepalive reply and the server-stop mirror keep the reported position":
+    # Receive, flush and apply of each library status stay at or above the
+    # caller's report.
+    var replies: seq[tuple[receive, flush, apply: int64]]
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st) # START_REPLICATION
+        var burst = buildCopyBothResponse()
+        burst.add(buildXLogData(testStartLsn, testStartLsn, 0, testWalData))
+        await sendBytes(st, burst)
+        discard await drainFrontendMessage(st) # the caller's report
+        await sendBytes(st, buildKeepalive(testStartLsn, 0, replyRequested = true))
+        let reply = await drainFrontendMessage(st)
+        {.cast(gcsafe).}:
+          replies.add(decodeStandbyStatus(reply.body))
+        var tail = buildCopyDone() # server-initiated stop
+        tail.add(buildReadyForQuery('I'))
+        await sendBytes(st, tail)
+        let mirror = await drainFrontendMessage(st) # status before its CopyDone
+        {.cast(gcsafe).}:
+          replies.add(decodeStandbyStatus(mirror.body))
+        discard await drainFrontendMessage(st) # CopyDone
+        discard await drainFrontendMessage(st) # Terminate
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        if msg.kind == rmkXLogData:
+          await conn.sendStandbyStatus(
+            Lsn(testKeepaliveWalEnd), applyLsn = Lsn(testStartLsn)
+          )
+
+      await conn.startReplication("test_slot", callback = cb)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check replies.len == 2
+    for r in replies:
+      check r.receive == testKeepaliveWalEnd
+      check r.flush == testKeepaliveWalEnd
+      check r.apply == testStartLsn
 
 when hasChronos:
   suite "Replication: idle wakeup rate":

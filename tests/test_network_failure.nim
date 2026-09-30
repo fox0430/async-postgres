@@ -8,12 +8,16 @@
 
 import std/[unittest, strutils, base64]
 
-import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 
 import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
+from ../async_postgres/pg_connection/types import newPgConnection
+from ../async_postgres/pg_connection/lifecycle {.all.} import attemptHostTimed
+from ../async_postgres/pg_connection/simple_query {.all.} import cancelWithin
+when hasAsyncDispatch:
+  from std/nativesockets import Domain
 
 import ./mock_pg_server
 
@@ -26,6 +30,360 @@ proc mockConfig(port: int): ConnConfig =
     password: "pencil",
     sslMode: sslDisable,
   )
+
+proc hasIpv6Loopback(): bool =
+  ## Whether ::1 can be bound: not in a container or runner with IPv6 off.
+  try:
+    waitFor closeServer(startMockServer("::1"))
+    true
+  except CatchableError:
+    false
+
+suite "Dial":
+  test "an IPv6 host is reachable, and so is its cancel":
+    proc testBody(): Future[seq[byte]] {.async.} =
+      let ms = startMockServer("::1")
+      let accepted = ms.acceptAndReady()
+      var cfg = mockConfig(ms.port)
+      cfg.host = "::1"
+      let conn = await connect(cfg)
+      let client = await accepted
+      let cancelSide = ms.accept()
+      # `cancel` returns once the server hangs up, so the server side runs
+      # alongside it.
+      let cancelling = conn.cancel()
+      let cancelClient = await cancelSide
+      result = await readN(cancelClient, 8)
+      await closeClient(cancelClient)
+      await cancelling
+      await conn.close()
+      await closeClient(client)
+      await closeServer(ms)
+
+    if not hasIpv6Loopback():
+      skip()
+    else:
+      let request = waitFor testBody()
+      check decodeInt32(request, 0) == 16
+      check decodeInt32(request, 4) == 80877102 # CancelRequest code
+
+  test "cancel returns once the server hangs up, not once the request is sent":
+    # As libpq: until then the request may still be in flight, and could hit
+    # the query the caller sends next.
+    proc testBody(): Future[bool] {.async.} =
+      let ms = startMockServer()
+      let accepted = ms.accept()
+      let conn = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
+      let cancelling = conn.cancel()
+      let cancelClient = await accepted
+      discard await readN(cancelClient, 16)
+      await sleepAsync(milliseconds(50))
+      result = cancelling.finished
+      await closeClient(cancelClient)
+      await cancelling
+      await closeServer(ms)
+
+    check not waitFor testBody()
+
+  test "cancel gives up on a server that never hangs up, releasing its socket":
+    proc testBody(): Future[(bool, bool)] {.async.} =
+      let ms = startMockServer()
+      let accepted = ms.accept()
+      let conn = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
+      let cancelling = conn.cancelWithin(milliseconds(100))
+      let cancelClient = await accepted
+      discard await readN(cancelClient, 16)
+      try:
+        await cancelling
+      except PgTimeoutError:
+        result[0] = true
+      try:
+        discard await readN(cancelClient, 1).wait(seconds(2))
+      except AsyncTimeoutError:
+        discard
+      except CatchableError:
+        # EOF: the cancel side closed its socket.
+        result[1] = true
+      await closeClient(cancelClient)
+      await closeServer(ms)
+
+    check waitFor(testBody()) == (true, true)
+
+  when defined(linux):
+    # All of 127/8 is loopback on Linux: 127.0.0.2 and 127.0.0.3 refuse where
+    # only 127.0.0.1 listens.
+    test "each address is tried until one accepts":
+      proc testBody(): Future[string] {.async.} =
+        let ms = startMockServer("127.0.0.1")
+        let accepted = ms.accept()
+        let targets =
+          resolveTargets("127.0.0.2", ms.port) & resolveTargets("127.0.0.1", ms.port)
+        let dialed = await dialTargets(targets)
+        let client = await accepted
+        result = dialed.target.shown
+        await closeClient(dialed.stream)
+        await closeClient(client)
+        await closeServer(ms)
+
+      check (waitFor testBody()) == "127.0.0.1"
+
+    test "every refused address is reported, on one line each":
+      proc testBody(): Future[ref CatchableError] {.async.} =
+        let ms = startMockServer("127.0.0.1")
+        let port = ms.port
+        await closeServer(ms)
+        let targets =
+          resolveTargets("127.0.0.2", port) & resolveTargets("127.0.0.3", port)
+        try:
+          discard await dialTargets(targets)
+        except CatchableError as e:
+          result = e
+
+      let err = waitFor testBody()
+      check err of PgUnavailableError
+      check isTransientError(err)
+      # asyncdispatch appends its traceback at the await above.
+      let summary = err.msg.split("\nAsync traceback:")[0]
+      check summary.startsWith("127.0.0.2: ")
+      check "; 127.0.0.3: " in summary
+      check '\n' notin summary
+
+  test "prefer-standby looks each host up once for both passes":
+    proc testBody(): Future[ref CatchableError] {.async.} =
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      await closeServer(gone)
+      var cfg = mockConfig(refusedPort)
+      cfg.hosts = @[
+        HostEntry(host: "nonexistent.invalid", port: 5432),
+        HostEntry(host: "127.0.0.1", port: refusedPort),
+      ]
+      cfg.targetSessionAttrs = tsaPreferStandby
+      try:
+        discard await connect(cfg)
+      except CatchableError as e:
+        result = e
+
+    let err = waitFor testBody()
+    require err of PgConnectionError
+    check (ref PgConnectionError)(err).attempts.len == 2
+    # The dial is tried in both passes, the failed lookup only in the first.
+    let summary = err.msg.split("\nAsync traceback:")[0]
+    check summary.count("Could not resolve host") == 1
+    check summary.count("127.0.0.1:") == 2
+
+  test "a name the resolver does not know is transient":
+    # A container or pod may not be registered yet; a typo retries to the cap.
+    var err: ref CatchableError
+    try:
+      discard resolveTargets("nonexistent.invalid", 5432)
+    except CatchableError as e:
+      err = e
+    check err of PgUnavailableError
+    check "nonexistent.invalid" in err.msg
+    check isTransientError(err)
+
+  when hasAsyncDispatch and defined(linux):
+    test "a mapped IPv4 is dialed over IPv4, with no second lookup":
+      proc testBody(): Future[string] {.async.} =
+        let ms = startMockServer("127.0.0.1")
+        let accepted = ms.accept()
+        let dialed = await dialTargets(resolveTargets("::ffff:127.0.0.1", ms.port))
+        let client = await accepted
+        result = dialed.target.shown
+        await closeClient(dialed.stream)
+        await closeClient(client)
+        await closeServer(ms)
+
+      check (waitFor testBody()) == "127.0.0.1"
+
+    test "a resolved address keeps its zone and unmaps a mapped IPv4":
+      let linkLocal = resolveTargets("fe80::1%1", 5432)
+      check linkLocal.len == 1
+      check linkLocal[0].domain == Domain.AF_INET6
+      check linkLocal[0].address == "fe80::1%1"
+      let mapped = resolveTargets("::ffff:127.0.0.1", 5432)
+      check mapped.len == 1
+      check mapped[0].domain == Domain.AF_INET
+      check mapped[0].address == "127.0.0.1"
+
+  test "an empty target list is refused, not indexed":
+    proc testBody(): Future[ref CatchableError] {.async.} =
+      try:
+        discard await dialTargets(@[])
+      except CatchableError as e:
+        result = e
+
+    check (waitFor testBody()) of ValueError
+
+  test "a config fault is not hidden behind a failed lookup":
+    # verify-full without sslrootcert is refused per TCP host, before its lookup.
+    proc testBody(): Future[ref CatchableError] {.async.} =
+      var cfg = mockConfig(5432)
+      cfg.host = "nonexistent.invalid"
+      cfg.sslMode = sslVerifyFull
+      try:
+        discard await connect(cfg)
+      except CatchableError as e:
+        result = e
+
+    check (waitFor testBody()) of PgConfigError
+
+suite "Per-address connectTimeout":
+  # Two ports on 127.0.0.1 stand in for two addresses of one host.
+  proc timedConfig(port: int): ConnConfig =
+    result = mockConfig(port)
+    result.connectTimeout = milliseconds(300)
+
+  test "an address that never answers leaves the next its own budget":
+    proc testBody(): Future[PgConnState] {.async.} =
+      let silent = startMockServer()
+      let ms = startMockServer()
+      let stalled = silent.accept()
+      let accepted = ms.acceptAndReady()
+      let targets =
+        resolveTargets("127.0.0.1", silent.port) & resolveTargets("127.0.0.1", ms.port)
+      let conn = await attemptHostTimed(
+        timedConfig(ms.port),
+        HostEntry(host: "127.0.0.1", port: ms.port),
+        tsaAny,
+        targets,
+      )
+      let client = await accepted
+      result = conn.state
+      await conn.close()
+      await closeClient(client)
+      await closeClient(await stalled)
+      await closeServer(silent)
+      await closeServer(ms)
+
+    check (waitFor testBody()) == csReady
+
+  test "a host whose every address times out times out":
+    proc testBody(): Future[ref CatchableError] {.async.} =
+      let a = startMockServer()
+      let b = startMockServer()
+      let stalledA = a.accept()
+      let stalledB = b.accept()
+      let targets =
+        resolveTargets("127.0.0.1", a.port) & resolveTargets("127.0.0.1", b.port)
+      try:
+        discard await attemptHostTimed(
+          timedConfig(a.port),
+          HostEntry(host: "127.0.0.1", port: a.port),
+          tsaAny,
+          targets,
+        )
+      except CatchableError as e:
+        result = e
+      await closeClient(await stalledA)
+      await closeClient(await stalledB)
+      await closeServer(a)
+      await closeServer(b)
+
+    let err = waitFor testBody()
+    check err of AsyncTimeoutError
+    check isTransientError(err)
+
+  test "a host that timed out at one address and was refused at another times out":
+    proc testBody(): Future[ref CatchableError] {.async.} =
+      let silent = startMockServer()
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      await closeServer(gone)
+      let stalled = silent.accept()
+      let targets =
+        resolveTargets("127.0.0.1", silent.port) &
+        resolveTargets("127.0.0.1", refusedPort)
+      try:
+        discard await attemptHostTimed(
+          timedConfig(silent.port),
+          HostEntry(host: "127.0.0.1", port: silent.port),
+          tsaAny,
+          targets,
+        )
+      except CatchableError as e:
+        result = e
+      await closeClient(await stalled)
+      await closeServer(silent)
+
+    let err = waitFor testBody()
+    # Raw, as a single host's connectTimeout is, yet naming every address.
+    check err of AsyncTimeoutError
+    let summary = err.msg.split("\nAsync traceback:")[0]
+    check summary.count("127.0.0.1: ") == 2
+    check err.parent of PgUnavailableError
+    check isTransientError(err)
+
+  test "a server's refusal skips the host's other addresses":
+    # They lead to the same server: the password is not sent again, nor the
+    # refusal summed up with a refused dial into a transient failure.
+    proc testBody(timeout: Duration): Future[ref CatchableError] {.async.} =
+      let refusing = startMockServer()
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      await closeServer(gone)
+      proc refuse() {.async.} =
+        let st = await refusing.accept()
+        await drainStartupMessage(st)
+        await sendBytes(
+          st, buildErrorResponse("28P01", "password authentication failed", "FATAL")
+        )
+        await closeClient(st)
+
+      let serverFut = refuse()
+      var cfg = mockConfig(refusing.port)
+      cfg.connectTimeout = timeout
+      let targets =
+        resolveTargets("127.0.0.1", refusing.port) &
+        resolveTargets("127.0.0.1", refusedPort)
+      try:
+        discard await attemptHostTimed(
+          cfg, HostEntry(host: "127.0.0.1", port: refusing.port), tsaAny, targets
+        )
+      except CatchableError as e:
+        result = e
+      await serverFut
+      await closeServer(refusing)
+
+    for timeout in [default(Duration), milliseconds(300)]:
+      let err = waitFor testBody(timeout)
+      check err of PgConnectionError
+      let ce = (ref PgConnectionError)(err)
+      check ce.attempts.len == 0
+      check ce.serverError != nil and ce.serverError.sqlState == "28P01"
+      check not isTransientError(err)
+
+  test "cancel reaches the address the session is on":
+    # The host's first address refused the session, so it runs on the second;
+    # a cancel dialing the host afresh would hit the first.
+    proc testBody(): Future[seq[byte]] {.async.} =
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      await closeServer(gone)
+      let ms = startMockServer()
+      let accepted = ms.acceptAndReady()
+      let targets =
+        resolveTargets("127.0.0.1", refusedPort) & resolveTargets("127.0.0.1", ms.port)
+      let conn = await attemptHostTimed(
+        mockConfig(refusedPort),
+        HostEntry(host: "127.0.0.1", port: refusedPort),
+        tsaAny,
+        targets,
+      )
+      let client = await accepted
+      let cancelSide = ms.accept()
+      let cancelling = conn.cancel()
+      let cancelClient = await cancelSide
+      result = await readN(cancelClient, 8)
+      await closeClient(cancelClient)
+      await cancelling
+      await conn.close()
+      await closeClient(client)
+      await closeServer(ms)
+
+    let request = waitFor testBody()
+    check decodeInt32(request, 4) == 80877102 # CancelRequest code
 
 # Handshake failures
 
@@ -52,9 +410,7 @@ suite "Network failure: handshake":
     check raised
 
   test "server reads startup then disconnects":
-    var raised = false
-
-    proc testBody() {.async.} =
+    proc testBody(): Future[ref CatchableError] {.async.} =
       let ms = startMockServer()
       proc serverHandler() {.async.} =
         let st = await ms.accept()
@@ -68,13 +424,16 @@ suite "Network failure: handshake":
       try:
         let conn = await connect(mockConfig(ms.port))
         await conn.close()
-      except CatchableError:
-        raised = true
+      except CatchableError as e:
+        result = e
       await serverFut
       await closeServer(ms)
 
-    waitFor testBody()
-    check raised
+    let err = waitFor testBody()
+    require err of PgConnectionError
+    # Also how a proxy with nothing behind it yet answers.
+    check (ref PgConnectionError)(err).attempts[0] of PgUnavailableError
+    check isTransientError(err)
 
 when hasAsyncDispatch:
   suite "Network failure: connect timeout orphan":
@@ -490,160 +849,298 @@ proc serverSignatureFor(
   let serverSig = sha256.hmac(serverKey, authMessage).data
   "v=" & base64.encode(serverSig)
 
+proc connectRefusal(
+    server: proc(st: MockClient): Future[void] {.async.}, tracer: PgTracer = nil
+): Future[string] {.async.} =
+  ## Connect to a mock running ``server`` and return the refusal message, or
+  ## "" if the connection succeeded and is ready. A refusal must be a
+  ## PgSecurityError: a retryable error would resend the password.
+  let ms = startMockServer()
+  proc serverHandler() {.async.} =
+    let st = await ms.accept()
+    try:
+      await server(st)
+    except CatchableError:
+      discard
+    await closeClient(st)
+
+  let serverFut = serverHandler()
+  try:
+    var cfg = mockConfig(ms.port)
+    cfg.tracer = tracer
+    let conn = await connect(cfg)
+    if conn.state != csReady:
+      result = "connection not ready: " & $conn.state
+    await conn.close()
+  except PgSecurityError as e:
+    result = e.msg
+  except CatchableError as e:
+    checkpoint e.msg
+    result = "not a PgSecurityError: " & $e.name
+  finally:
+    try:
+      await serverFut
+    except CatchableError:
+      discard
+    await closeServer(ms)
+
 suite "SCRAM mutual-auth enforcement":
   test "rejects AuthenticationOk sent before SASLFinal":
-    var raised = false
-    var sawScramMsg = false
+    proc server(st: MockClient) {.async.} =
+      discard await driveScramUntilClientFinal(st)
+      # Malicious: skip AuthenticationSASLFinal entirely and jump to AuthOk.
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          discard await driveScramUntilClientFinal(st)
-          # Malicious: skip AuthenticationSASLFinal entirely and jump to AuthOk.
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationOk before completing SCRAM"
+    )
 
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        await conn.close()
-      except PgConnectionError as e:
-        raised = true
-        sawScramMsg = e.msg.contains("SCRAM")
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
+  test "rejects AuthenticationOk sent right after AuthenticationSASL":
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
 
-    waitFor testBody()
-    check raised
-    check sawScramMsg
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationOk before completing SCRAM"
+    )
 
   test "accepts a valid SASLFinal server signature":
-    var connected = false
+    proc server(st: MockClient) {.async.} =
+      let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
+      # mockConfig sets password "pencil"; both sides must use the same.
+      await sendBytes(st, buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf)))
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
-          # mockConfig sets password "pencil"; both sides must use the same.
-          await sendBytes(
-            st, buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf))
-          )
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        connected = conn.state == csReady
-        await conn.close()
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
-
-    waitFor testBody()
-    check connected
+    check (waitFor connectRefusal(server)) == ""
 
   test "rejects SASLContinue without a preceding AuthenticationSASL":
-    # A malicious server / MITM that skips AuthenticationSASL leaves scramState
-    # default-initialized (clientNonce == ""), which would otherwise make the
-    # nonce-binding check pass vacuously. The client must reject the message.
-    var raised = false
-    var sawScramMsg = false
+    # A default scramState has an empty nonce, which would make the
+    # nonce-binding check pass vacuously.
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      let serverFirst =
+        "r=forgedNonce,s=" & base64.encode(scramSalt) & ",i=" & $scramIterations
+      await sendBytes(st, buildAuthSASLContinue(serverFirst))
+      await sendBytes(st, buildAuthOk())
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          # Forge a server-first message without ever sending AuthenticationSASL.
-          let serverFirst =
-            "r=forgedNonce,s=" & base64.encode(scramSalt) & ",i=" & $scramIterations
-          await sendBytes(st, buildAuthSASLContinue(serverFirst))
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
-
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        await conn.close()
-      except PgConnectionError as e:
-        raised = true
-        sawScramMsg = e.msg.contains("AuthenticationSASL")
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
-
-    waitFor testBody()
-    check raised
-    check sawScramMsg
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLContinue out of order, before any authentication request"
+    )
 
   test "rejects SASLFinal without a preceding AuthenticationSASL":
-    # A malicious server / MITM that skips AuthenticationSASL leaves scramState
-    # default-initialized (serverSignature zeroed) and would otherwise bypass
-    # the SCRAM server-signature verification path. The client must reject it.
-    var raised = false
-    var sawScramMsg = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASLFinal("v=" & base64.encode(newString(32))))
+      await sendBytes(st, buildAuthOk())
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        let st = await ms.accept()
-        try:
-          await drainStartupMessage(st)
-          # Forge a server-final message without ever sending AuthenticationSASL.
-          await sendBytes(st, buildAuthSASLFinal("v=forgedSignature"))
-          await sendBytes(st, buildAuthOk())
-          await sendBytes(st, buildBackendKeyData(1, 2))
-          await sendBytes(st, buildReadyForQuery('I'))
-        except CatchableError:
-          discard
-        await closeClient(st)
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLFinal out of order, before any authentication request"
+    )
 
-      let serverFut = serverHandler()
-      try:
-        let conn = await connect(mockConfig(ms.port))
-        await conn.close()
-      except PgConnectionError as e:
-        raised = true
-        sawScramMsg = e.msg.contains("AuthenticationSASL")
-      except CatchableError:
-        discard
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-      await closeServer(ms)
+  test "rejects SASLFinal before SASLContinue":
+    # Without a server-first message the expected server signature was never
+    # computed, so a forged all-zero signature must not be accepted.
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthSASLFinal("v=" & base64.encode(newString(32))))
+      await sendBytes(st, buildAuthOk())
 
-    waitFor testBody()
-    check raised
-    check sawScramMsg
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLFinal out of order, after AuthenticationSASL "
+    )
+
+  test "rejects a second SASLContinue":
+    proc server(st: MockClient) {.async.} =
+      let (_, sf, _) = await driveScramUntilClientFinal(st)
+      await sendBytes(st, buildAuthSASLContinue(sf))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLContinue out of order, after AuthenticationSASLContinue"
+    )
+
+suite "SCRAM exchange order":
+  test "rejects a second AuthenticationSASL":
+    proc server(st: MockClient) {.async.} =
+      discard await driveScramUntilClientFinal(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASL out of order, after AuthenticationSASLContinue"
+    )
+
+  # PasswordMessage is type 'p'; the client must hang up without one. The
+  # server reads one message and closes, so a leaking client fails fast.
+  test "rejects a cleartext password request after SCRAM started":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationCleartextPassword out of order, after AuthenticationSASL "
+    )
+    check not sentPassword
+
+  test "rejects an MD5 password request after SCRAM started":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationMD5Password out of order, after AuthenticationSASL "
+    )
+    check not sentPassword
+
+  test "rejects a cleartext password request after SCRAM verified":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
+      await sendBytes(st, buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf)))
+      await sendBytes(st, buildAuthCleartextPassword())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationCleartextPassword out of order, after AuthenticationSASLFinal"
+    )
+    check not sentPassword
+
+  test "rejects a second SASLFinal":
+    proc server(st: MockClient) {.async.} =
+      let (cfb, sf, cf) = await driveScramUntilClientFinal(st)
+      let final = buildAuthSASLFinal(serverSignatureFor("pencil", cfb, sf, cf))
+      await sendBytes(st, final)
+      await sendBytes(st, final)
+      await sendBytes(st, buildAuthOk())
+      await sendBytes(st, buildBackendKeyData(1, 2))
+      await sendBytes(st, buildReadyForQuery('I'))
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASLFinal out of order, after AuthenticationSASLFinal"
+    )
+
+  test "rejects SCRAM after an MD5 password was sent":
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASL out of order, after an MD5 password request"
+    )
+
+  test "rejects SCRAM after a cleartext password was sent":
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationSASL out of order, after a cleartext password request"
+    )
+
+  test "rejects a cleartext password request after an MD5 one":
+    # The server already has the MD5 hash; cleartext would hand it the password.
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationCleartextPassword out of order, after an MD5 password request"
+    )
+    check not sentPassword
+
+  test "rejects an MD5 password request after a cleartext one":
+    var sentPassword = false
+    proc server(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthCleartextPassword())
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      sentPassword = (await drainFrontendMessage(st)).msgType == 'p'
+
+    check (waitFor connectRefusal(server)).contains(
+      "AuthenticationMD5Password out of order, after a cleartext password request"
+    )
+    check not sentPassword
+
+  # A PAM stack with several prompting modules sends one request per prompt,
+  # and libpq answers every one.
+  test "answers repeated password requests of the same method":
+    for req in [buildAuthCleartextPassword(), buildAuthMD5Password()]:
+      var passwords: int
+      proc server(st: MockClient) {.async.} =
+        await drainStartupMessage(st)
+        for _ in 0 ..< 8:
+          await sendBytes(st, req)
+          if (await drainFrontendMessage(st)).msgType == 'p':
+            inc passwords
+        await sendBytes(st, buildAuthOk())
+        await sendBytes(st, buildBackendKeyData(1, 2))
+        await sendBytes(st, buildReadyForQuery('I'))
+        discard await drainFrontendMessage(st)
+
+      check (waitFor connectRefusal(server)) == ""
+      check passwords == 8
+
+  test "the auth advisory hooks fire only for an answered request":
+    var insecure, deprecated: int
+    let tracer = PgTracer()
+    tracer.onInsecureAuth = proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].} =
+      inc insecure
+    tracer.onDeprecatedAuth = proc(
+        data: TraceDeprecatedAuthData
+    ) {.gcsafe, raises: [].} =
+      inc deprecated
+    proc refusedServer(st: MockClient) {.async.} =
+      await drainStartupMessage(st)
+      await sendBytes(st, buildAuthSASL(@["SCRAM-SHA-256"]))
+      discard await drainFrontendMessage(st)
+      await sendBytes(st, buildAuthMD5Password())
+      discard await drainFrontendMessage(st)
+
+    check (waitFor connectRefusal(refusedServer, tracer)).contains(
+      "AuthenticationMD5Password out of order"
+    )
+    check deprecated == 0
+    check insecure == 0
+
+    for req in [buildAuthMD5Password(), buildAuthCleartextPassword()]:
+      proc answeredServer(st: MockClient) {.async.} =
+        await drainStartupMessage(st)
+        await sendBytes(st, req)
+        discard await drainFrontendMessage(st)
+        await sendBytes(st, buildAuthOk())
+        await sendBytes(st, buildBackendKeyData(1, 2))
+        await sendBytes(st, buildReadyForQuery('I'))
+        discard await drainFrontendMessage(st)
+
+      check (waitFor connectRefusal(answeredServer, tracer)) == ""
+    check deprecated == 1
+    check insecure == 1

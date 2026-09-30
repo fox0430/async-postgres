@@ -1,10 +1,10 @@
 ## In-process PostgreSQL wire-protocol mock server.
 ##
-## Starts a TCP listener on 127.0.0.1 with an ephemeral port and lets test code
-## script arbitrary byte sequences back to a real `PgConnection`. Used to
-## exercise code paths that a real PostgreSQL server would never reproduce on
-## demand: mid-message disconnects, malformed responses, truncated frames,
-## stalled senders, etc.
+## Starts a TCP listener on 127.0.0.1 (or a given host, e.g. ``::1``) with an
+## ephemeral port and lets test code script arbitrary byte sequences back to a
+## real `PgConnection`. Used to exercise code paths that a real PostgreSQL
+## server would never reproduce on demand: mid-message disconnects, malformed
+## responses, truncated frames, stalled senders, etc.
 ##
 ## Works with both `chronos` and `asyncdispatch` via the same unified API.
 ## The chronos and asyncdispatch branches expose identical `MockServer` /
@@ -14,6 +14,9 @@ import ../async_postgres/[async_backend, pg_protocol]
 
 when hasAsyncDispatch:
   import std/asyncnet
+  from std/nativesockets import Domain, SockType, Protocol
+  when defined(posix):
+    import std/os
 
 # Types and low-level transport
 
@@ -30,9 +33,16 @@ when hasChronos:
 
     MockClient* = StreamTransport
 
-  proc startMockServer*(): MockServer =
-    let server = createStreamServer(initTAddress("127.0.0.1", 0))
+  proc startMockServer*(host = "127.0.0.1"): MockServer =
+    let server = createStreamServer(initTAddress(host, 0))
     MockServer(server: server, port: int(server.localAddress().port))
+
+  when defined(posix):
+    proc startMockServerUnix*(socketPath: string): MockServer =
+      ## Listen on the Unix-domain socket ``socketPath`` (AF_UNIX). The caller
+      ## creates the directory and removes the socket file afterwards.
+      let server = createStreamServer(initTAddress(socketPath))
+      MockServer(server: server, port: 0)
 
   proc accept*(ms: MockServer): Future[MockClient] =
     ms.server.accept()
@@ -122,13 +132,30 @@ elif hasAsyncDispatch:
 
     MockClient* = AsyncSocket
 
-  proc startMockServer*(): MockServer =
-    let sock = newAsyncSocket(buffered = false)
+  proc startMockServer*(host = "127.0.0.1"): MockServer =
+    let domain = if ':' in host: Domain.AF_INET6 else: Domain.AF_INET
+    let sock = newAsyncSocket(domain, buffered = false)
     sock.setSockOpt(OptReuseAddr, true)
-    sock.bindAddr(Port(0))
+    sock.bindAddr(Port(0), host)
     let port = int(sock.getLocalAddr()[1])
     sock.listen()
     MockServer(socket: sock, port: port)
+
+  when defined(posix):
+    proc startMockServerUnix*(socketPath: string): MockServer =
+      ## Listen on the Unix-domain socket ``socketPath`` (AF_UNIX). The caller
+      ## creates the directory and removes the socket file afterwards.
+      # bindUnix fails on a stale file left by an earlier run.
+      try:
+        removeFile(socketPath)
+      except OSError:
+        discard
+      let sock = newAsyncSocket(
+        Domain.AF_UNIX, SockType.SOCK_STREAM, Protocol.IPPROTO_IP, buffered = false
+      )
+      sock.bindUnix(socketPath)
+      sock.listen()
+      MockServer(socket: sock, port: 0)
 
   proc accept*(ms: MockServer): Future[MockClient] =
     ms.socket.accept()
@@ -163,6 +190,12 @@ proc buildBackendMsg*(msgType: char, body: openArray[byte]): seq[byte] =
 
 proc buildAuthOk*(): seq[byte] =
   buildBackendMsg('R', @[byte 0, 0, 0, 0])
+
+proc buildAuthCleartextPassword*(): seq[byte] =
+  buildBackendMsg('R', @[byte 0, 0, 0, 3])
+
+proc buildAuthMD5Password*(salt: array[4, byte] = [1'u8, 2, 3, 4]): seq[byte] =
+  buildBackendMsg('R', @[byte 0, 0, 0, 5] & @salt)
 
 proc buildAuthSASL*(mechanisms: seq[string] = @["SCRAM-SHA-256"]): seq[byte] =
   ## AuthenticationSASL (R, subtype 10): advertise SASL mechanism names as a
@@ -302,11 +335,11 @@ proc buildNotificationResponse*(pid: int32, channel, payload: string): seq[byte]
   body.add(0'u8)
   buildBackendMsg('A', body)
 
-proc buildErrorResponse*(sqlState, message: string): seq[byte] =
+proc buildErrorResponse*(sqlState, message: string, severity = "ERROR"): seq[byte] =
   ## Minimal ErrorResponse with severity 'S', sqlstate 'C', message 'M'.
   var body: seq[byte]
   body.add(byte('S'))
-  for c in "ERROR":
+  for c in severity:
     body.add(byte(c))
   body.add(0'u8)
   body.add(byte('C'))
@@ -319,6 +352,14 @@ proc buildErrorResponse*(sqlState, message: string): seq[byte] =
   body.add(0'u8)
   body.add(0'u8) # field list terminator
   buildBackendMsg('E', body)
+
+proc buildPreV3Error*(text: string): seq[byte] =
+  ## Pre-3.0 error, as the postmaster reports a failed fork: 'E' and
+  ## NUL-terminated text, no length.
+  result = @[byte('E')]
+  for c in text:
+    result.add(byte(c))
+  result.add(0'u8)
 
 # Replication (CopyBothResponse / CopyData) builders and decoders, shared by the
 # replication test suites.

@@ -1,5 +1,6 @@
-import std/[net, os, osproc, strutils, unittest]
+import std/[net, os, osproc, streams, strutils, tempfiles, unittest]
 
+import cert_fixtures
 import ../async_postgres/[async_backend, pg_connection, pg_errors]
 import mock_pg_server
 
@@ -19,6 +20,8 @@ proc testConfig(port: int, mode: SslMode, sslNegotiation = sslnPostgres): ConnCo
   )
 
 proc readCert(name: string): string =
+  doAssert ensureTestCerts(),
+    "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
   readFile(CertDir / name)
 
 proc startSslProbe(ms: MockServer, closeAfterReply: bool) =
@@ -93,9 +96,7 @@ suite "TLS error paths: client cert/key/CA loading":
     check waitFor(runTest())
 
   test "verify-ca without sslrootcert escapes the per-host fold":
-    # Two entries share the one broken config: the first host's check must
-    # raise `PgConfigError` out of `connect` instead of folding it into the
-    # aggregate and dialing the second.
+    # Two entries share the broken config: raise before dialing the second.
     proc runTest(): Future[string] {.async.} =
       let ms = startMockServer()
       startSslProbe(ms, closeAfterReply = false)
@@ -118,6 +119,36 @@ suite "TLS error paths: client cert/key/CA loading":
     let msg = waitFor runTest()
     check "requires sslrootcert" in msg
     check "Could not connect to any host" notin msg
+
+  test "a verified sslmode without sslrootcert still dials a Unix socket":
+    # TLS is skipped over AF_UNIX, so no root cert is missing (as in libpq): the
+    # attempt must fail at the dial of the absent socket, not before it.
+    proc runTest(mode: SslMode, direct: bool): Future[ref CatchableError] {.async.} =
+      let cfg = ConnConfig(
+        host: "/nonexistent-async-postgres-socket-dir",
+        port: 5432,
+        user: "test",
+        database: "test",
+        sslMode: mode,
+        connectTimeout: milliseconds(5000),
+      )
+      try:
+        let conn =
+          if direct:
+            await connectToHost(cfg, HostEntry(host: cfg.host, port: cfg.port))
+          else:
+            await connect(cfg)
+        await conn.close()
+      except CatchableError as e:
+        result = e
+
+    for mode in [sslVerifyCa, sslVerifyFull]:
+      for direct in [false, true]:
+        checkpoint $mode & " direct=" & $direct
+        let err = waitFor runTest(mode, direct)
+        require err != nil
+        check not (err of PgConfigError)
+        check "sslrootcert" notin err.msg
 
   test "a lone sslcert through connectToHost is a config fault":
     # `connectToHost` validates the pairing at entry, so a direct caller sees
@@ -143,9 +174,9 @@ suite "TLS error paths: client cert/key/CA loading":
     check waitFor(runTest())
 
   test "sslAllow with client certs is rejected by connectToHost":
-    # The pairing check runs before the sslAllow branch rewrites sslMode to
-    # sslDisable; without it a successful plaintext attempt would silently
-    # drop the certs. No server is needed: the check precedes any dial.
+    # The pairing check rejects sslcert/sslkey with sslmode=allow outright;
+    # without it a successful plaintext attempt would silently drop the certs.
+    # No server is needed: the check precedes any dial.
     proc runTest(): Future[bool] {.async.} =
       var cfg = testConfig(5432, sslAllow)
       cfg.sslCert = readCert("server.crt")
@@ -153,6 +184,31 @@ suite "TLS error paths: client cert/key/CA loading":
       var configFault = false
       try:
         let conn = await connectToHost(cfg, HostEntry(host: "127.0.0.1", port: 5432))
+        await conn.close()
+      except PgConfigError:
+        configFault = true
+      configFault
+
+    check waitFor(runTest())
+
+  test "sslAllow with client certs escapes the connect fold as a config fault":
+    # Companion to the connectToHost-level rejection above: through connect()
+    # the shared-config fault must surface as PgConfigError instead of being
+    # folded into the per-host aggregate, even with multiple hosts. Multiple
+    # entries prove the escape: a per-host outcome would report
+    # "Could not connect to any host". No server is needed: wrapped()
+    # validates before any dial. Content is irrelevant, only presence.
+    proc runTest(): Future[bool] {.async.} =
+      var cfg = testConfig(5432, sslAllow)
+      cfg.sslCert = "cert"
+      cfg.sslKey = "key"
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: 5432),
+        HostEntry(host: "127.0.0.1", port: 5433),
+      ]
+      var configFault = false
+      try:
+        let conn = await connect(cfg)
         await conn.close()
       except PgConfigError:
         configFault = true
@@ -180,6 +236,44 @@ suite "TLS error paths: client cert/key/CA loading":
 
     check waitFor(runTest())
 
+  test "connectToHost dials the entry, not the config scalars":
+    # `connectToHost` is a low-level dial primitive: the target is `entry`, so
+    # a config carrying no host of its own must still reach the wire instead
+    # of tripping the empty-host / port-range guards on its unset scalars.
+    proc runTest(): Future[string] {.async.} =
+      let ms = startMockServer()
+
+      proc handler() {.async.} =
+        try:
+          let st = await ms.accept()
+          await closeClient(st)
+        except CatchableError:
+          discard
+
+      discard handler()
+      var cfg = ConnConfig(
+        user: "test",
+        database: "test",
+        sslMode: sslDisable,
+        connectTimeout: milliseconds(5000),
+      )
+      var outcome = ""
+      try:
+        try:
+          let conn =
+            await connectToHost(cfg, HostEntry(host: "127.0.0.1", port: ms.port))
+          await conn.close()
+          outcome = "connected"
+        except PgConfigError as e:
+          outcome = "config fault: " & e.msg
+        except CatchableError:
+          outcome = "dialed"
+      finally:
+        await closeServer(ms)
+      outcome
+
+    check waitFor(runTest()) == "dialed"
+
   test "garbage client certificate content fails":
     proc runTest(): Future[ProbeResult] {.async.} =
       let ms = startMockServer()
@@ -203,10 +297,7 @@ suite "TLS error paths: client cert/key/CA loading":
     when hasAsyncDispatch:
       check "Failed to load client certificate" in msg
     elif hasChronos:
-      # BearSSL reports the same PEM-decode error for cert and key loading,
-      # so only the load-stage failure is observable, not which of the two
-      # inputs was malformed.
-      check "Invalid PEM encoding" in msg
+      check "Could not find any certificates" in msg
 
   test "garbage client key content fails":
     proc runTest(): Future[ProbeResult] {.async.} =
@@ -231,8 +322,7 @@ suite "TLS error paths: client cert/key/CA loading":
     when hasAsyncDispatch:
       check "Failed to load client private key" in msg
     elif hasChronos:
-      # Same BearSSL PEM-decode error as the certificate case above.
-      check "Invalid PEM encoding" in msg
+      check "Could not find private key" in msg
 
   test "passphrase-protected client key is rejected":
     proc runTest(): Future[ProbeResult] {.async.} =
@@ -261,7 +351,7 @@ suite "TLS error paths: client cert/key/CA loading":
       # wrapper prefix does not.
       check "client private key" in msg
     elif hasChronos:
-      check "Could not find private key" in msg
+      check "passphrase-protected" in msg
 
   when hasAsyncDispatch:
     test "mismatched client cert/key pair is rejected (key values mismatch)":
@@ -337,6 +427,9 @@ suite "direct SSL: ALPN enforcement":
     ## Returns the client's error message, or a descriptive message when the
     ## server exits early (e.g. bind failure) so the caller's check fails
     ## loudly instead of after the full retry window.
+    if not ensureTestCerts():
+      return
+        "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
     let port = ephemeralPort()
     let p = startProcess(
       opensslPath,
@@ -363,9 +456,16 @@ suite "direct SSL: ALPN enforcement":
       for attempt in 0 ..< 30:
         let exitCode = p.peekExitCode()
         if exitCode != -1:
+          var extra = ""
+          try:
+            extra = p.outputStream.readAll().strip()
+          except CatchableError:
+            discard
           msg =
             "openssl s_server exited before accepting connections (port " & $port &
             ", exit code " & $exitCode & ")"
+          if extra.len > 0:
+            msg.add(": " & extra)
           break
         try:
           let conn = await connect(testConfig(port, sslRequire, sslnDirect))
@@ -408,3 +508,127 @@ suite "direct SSL: ALPN enforcement":
         let msg = runAlpnProbe(opensslPath)
         check "ALPN" in msg
         check "without ALPN" in msg
+
+when defined(posix):
+  suite "sslmode=allow over Unix sockets":
+    test "one plaintext attempt; the refusal is not folded with a TLS leg":
+      # libpq never sends SSLRequest over AF_UNIX: allow makes one plaintext
+      # attempt and surfaces its error as-is. A second connection is answered
+      # too, so a regression fails the count instead of hanging the suite.
+      let dir = createTempDir("async_pg_allow_", "")
+      let port = 5432
+      let socketPath = dir / ".s.PGSQL." & $port
+      defer:
+        try:
+          removeFile(socketPath)
+        except OSError:
+          discard
+        try:
+          removeDir(dir)
+        except OSError:
+          discard
+
+      proc rejectStartup(st: MockClient) {.async.} =
+        ## Refuse the startup as a server with its own hba rules would.
+        try:
+          await drainStartupMessage(st)
+          await sendBytes(
+            st,
+            buildErrorResponse(
+              "28P01", "password authentication failed for user \"test\"", "FATAL"
+            ),
+          )
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      var attemptCount = 0
+
+      proc serverHandler(ms: MockServer) {.async.} =
+        for _ in 0 ..< 2:
+          try:
+            # Bounded so a regression cannot hang the suite.
+            let st = await ms.accept().wait(milliseconds(1000))
+            attemptCount.inc
+            await rejectStartup(st)
+          except CatchableError:
+            discard
+
+      proc testBody(dir, socketPath: string): Future[ref CatchableError] {.async.} =
+        let ms = startMockServerUnix(socketPath)
+        let serverFut = serverHandler(ms)
+
+        let config = ConnConfig(
+          host: dir,
+          port: port,
+          user: "test",
+          password: "test",
+          database: "test",
+          sslMode: sslAllow,
+        )
+        try:
+          let conn = await connectToHost(config, HostEntry(host: dir, port: port))
+          await conn.close()
+        except CatchableError as e:
+          result = e
+
+        await closeServer(ms)
+        await serverFut
+
+      let err = waitFor testBody(dir, socketPath)
+      check attemptCount == 1
+      require err != nil
+      require err of PgConnectionError
+      check "password authentication failed" in err.msg
+      # The TCP form folds both legs; over AF_UNIX there is no second leg.
+      check "sslmode=allow" notin err.msg
+      check (ref PgConnectionError)(err).attempts.len == 0
+      # The refusal itself is kept, as `startupError` promises.
+      check (ref PgConnectionError)(err).serverError != nil
+
+    test "a successful plaintext connection keeps sslmode=allow for reconnects":
+      # The test above pins the AF_UNIX failure shape; this pins the success
+      # shape. The plaintext leg must not rewrite sslMode, or a reconnect that
+      # dials `conn.config` would come back with sslDisable on this path too.
+      let dir = createTempDir("async_pg_allow_ok_", "")
+      let port = 5432
+      let socketPath = dir / ".s.PGSQL." & $port
+      defer:
+        try:
+          removeFile(socketPath)
+        except OSError:
+          discard
+        try:
+          removeDir(dir)
+        except OSError:
+          discard
+
+      var connState: PgConnState
+      var connSslEnabled: bool
+      var connConfiguredSslMode: SslMode
+
+      proc testBody(dir, socketPath: string) {.async.} =
+        let ms = startMockServerUnix(socketPath)
+        # AuthOk right after the startup message: an SSLRequest here would be
+        # consumed as the startup message and the handshake would never finish.
+        let serverFut = ms.acceptAndReady()
+
+        var config = testConfig(port, sslAllow)
+        config.host = dir
+        config.password = "test"
+        # Same entry form as the test above: the AF_UNIX branch keys off
+        # `entry.dialAddr`.
+        let conn = await connectToHost(config, HostEntry(host: dir, port: port))
+        connState = conn.state
+        connSslEnabled = conn.sslEnabled
+        connConfiguredSslMode = conn.config.sslMode
+        await conn.close()
+
+        let st = await serverFut
+        await closeClient(st)
+        await closeServer(ms)
+
+      waitFor testBody(dir, socketPath)
+      check connState == csReady
+      check connSslEnabled == false
+      check connConfiguredSslMode == sslAllow

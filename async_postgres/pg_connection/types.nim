@@ -1,20 +1,23 @@
-## Shared building blocks for ``pg_connection`` submodules (``PgConnection``, ``ConnConfig``, tracing).
+## Shared building blocks for ``pg_connection`` submodules (``PgConnection``,
+## ``ConnConfig``, tracing) and the state operations that keep its private
+## fields consistent (see the sections below).
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[tables, sets, deques, lists]
+import std/[tables, sets, deques, lists, macros, options]
+from std/strutils import isAlphaNumeric, toLowerAscii, cmpIgnoreCase
 when defined(posix):
   import std/posix
 
 import ../[async_backend, pg_auth, pg_errors, pg_protocol, pg_types]
+import ../pg_types/encoding
 
 when hasChronos:
   import chronos/streams/tlsstream
   import ../pg_bearssl
 elif hasAsyncDispatch:
   import std/asyncnet
+  from std/nativesockets import Domain, Port
 
 # TCP keepalive socket options (not exported by posix module)
 when defined(linux):
@@ -33,14 +36,43 @@ else:
       "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
   .}
 
-const closedByUserMsg* = "Connection closed by the application"
-  ## Shared by `failNotifyWaiter` and `checkListenAlive` so a deliberate
-  ## `close()` reports the same thing whether a waiter was parked or not.
+const
+  closedByUserMsg* = "Connection closed by the application"
+    ## Shared by `failNotifyWaiter` and `checkListenAlive` so a deliberate
+    ## `close()` reports the same thing whether a waiter was parked or not.
+  DefaultNotifyMaxQueue* = 1024 ## Connect-time pull-API count cap.
+  DefaultNotifyMaxQueueBytes* = 16 * 1024 * 1024
+    ## Connect-time pull-API byte cap. 1024 × (channel + ≤8000-byte payload)
+    ## fits with headroom.
+
+const ForkFailureText* = "could not fork new process for connection: "
+  ## Start of the postmaster's error when it cannot fork a backend (untranslated).
 
 var listenReconnectStopWaitMs* = 10_000
   ## Max wait (ms) for a listen pump stuck in a blocking `connect()`; it is
   ## orphaned on timeout. Not re-exported through `pg_connection`, so call
   ## sites cannot set it to 0 via the aggregate import and disable orphan safety.
+
+when hasChronos:
+  type DialTarget* = TransportAddress
+    ## One address to dial: an IP and port, or a Unix socket path.
+
+elif hasAsyncDispatch:
+  when defined(posix):
+    type DialTarget* =
+      tuple[
+        domain: Domain,
+        address: string,
+        port: Port,
+        sa: Sockaddr_storage,
+        saLen: SockLen,
+      ]
+      ## One address to dial: an IP and port, or for ``AF_UNIX`` a socket path.
+      ## ``address`` is for display (zone kept); ``sa`` is what is dialed.
+
+  else:
+    type DialTarget* = tuple[domain: Domain, address: string, port: Port]
+      ## One address to dial: an IP (its zone kept) and port.
 
 type
   PgConnState* = enum
@@ -88,8 +120,11 @@ type
     amNone ## AuthenticationOk with no challenge (trust/peer/ident)
     amPassword ## cleartext password (libpq: "password")
     amMd5 ## MD5 challenge (libpq: "md5")
-    amScramSha256 ## SASL SCRAM-SHA-256 (libpq: "scram-sha-256")
-    amScramSha256Plus ## SASL SCRAM-SHA-256-PLUS (libpq: "scram-sha-256-plus")
+    amScramSha256
+      ## SASL SCRAM-SHA-256, with or without channel binding (libpq:
+      ## "scram-sha-256")
+    amScramSha256Plus
+      ## SASL SCRAM-SHA-256-PLUS alone ("scram-sha-256-plus", not in libpq)
 
   TargetSessionAttrs* = enum
     ## Target server type for multi-host failover (libpq compatible).
@@ -108,7 +143,7 @@ type
   HostEntry* = object ## A single host:port entry for multi-host connection.
     host*: string ## Host name (or Unix socket dir); used for SSL verification
     hostaddr*: string
-      ## Numeric address dialed instead of resolving `host` (libpq `hostaddr`).
+      ## Address dialed instead of resolving `host` (libpq `hostaddr`).
       ## Empty = resolve `host`.
     port*: int
 
@@ -117,7 +152,7 @@ type
     host*: string
     port*: int # default 5432
     hostaddr*: string
-      ## Numeric address dialed instead of resolving `host` (libpq `hostaddr`).
+      ## Address dialed instead of resolving `host` (libpq `hostaddr`).
       ## `host` is still the name used for SSL certificate verification.
     user*: string
     password*: string
@@ -142,16 +177,20 @@ type
     sslKey*: string
       ## PEM-encoded client private key for mutual TLS. The key must be
       ## **unencrypted** on both backends (no passphrase callback is wired up).
-      ## On chronos/BearSSL specifically it must be PKCS#8 (RSA or EC); PKCS#1
-      ## is not supported. Must be paired with ``sslCert``.
+      ## PKCS#8, PKCS#1 (``RSA PRIVATE KEY``) and SEC1 (``EC PRIVATE KEY``) PEM
+      ## are accepted. Must be paired with ``sslCert``.
     sslSni*: bool ## Send TLS SNI (default true; suppressed for IP/empty host).
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
     requireAuth*: set[AuthMethod]
       ## Allowed auth methods; empty = any (libpq ``require_auth`` parity).
+      ## Cleartext password and MD5 are allowed by default; set this (e.g. to
+      ## ``{amScramSha256}``) to reject them.
     applicationName*: string
-    connectTimeout*: Duration ## TCP connect timeout (default: no timeout)
+    connectTimeout*: Duration
+      ## Timeout per address a host resolves to, dial to ready (libpq
+      ## ``connect_timeout``); ``ZeroDuration`` (default, or negative) = none.
     keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
     keepAliveIdle*: int ## Seconds before first probe (0 = OS default)
     keepAliveInterval*: int ## Seconds between probes (0 = OS default)
@@ -162,7 +201,11 @@ type
       ## Host ordering for multi-host connections (libpq `load_balance_hosts`);
       ## see `LoadBalanceHosts`. `lbhDisable` (default) preserves the configured
       ## order.
-    extraParams*: seq[(string, string)] ## Additional startup parameters
+    extraParams*: seq[(string, string)]
+      ## Additional StartupMessage parameters (unknown DSN keys land here).
+      ## Forwarded verbatim; treat as trusted config — typos are not rejected.
+      ## Exception: ``client_encoding`` is always sent as UTF8, and another
+      ## value (also via ``-c`` in ``options``) raises ``PgConfigError``.
     maxMessageSize*: int
       ## Max backend message size (0 = 1 GiB default); larger → ``PgProtocolError``.
     maxScramIterations*: int
@@ -284,14 +327,23 @@ type
       ## observe `listenStopRequested` instead of sending the query.
     host: string
     port: int
+    cancelTarget: seq[DialTarget]
+      ## The address dialed, where ``cancel`` sends its request; empty if never
+      ## dialed.
+    sslHost: string
+      ## Name the session's TLS was checked against (``HostEntry.host``);
+      ## ``cancel`` checks its own TLS against the same name.
     createdAt: Moment
     portalCounter: int
     config: ConnConfig
     notifyQueue: Deque[Notification]
     notifyMaxQueue: int
-      ## Pull-API queue cap (1024 default; <=0 = unbounded). A handoff and a
-      ## requeue of it sit outside the queue, so at most ``notifyMaxQueue + 1``
-      ## notifications are retained.
+      ## Pull-API count cap (`DefaultNotifyMaxQueue`; <=0 = unbounded). A
+      ## handoff and a requeue of it sit outside the queue, so at most
+      ## ``notifyMaxQueue + 1`` until the next arrival trims.
+    notifyMaxQueueBytes: int
+      ## Pull-API byte cap (`DefaultNotifyMaxQueueBytes`; <=0 = unbounded).
+      ## Queued ``channel.len + payload.len`` only; same overshoot as count.
     notifyWaiter: Future[void]
     notifyHandoff: Notification
       ## Reserved handoff for completed ``notifyWaiter`` (see ``hasNotifyHandoff``).
@@ -302,6 +354,14 @@ type
     closedByUser: bool
       ## Set by `close()`, one-way. Keeps a deliberate close out of
       ## `PgConnectionError` reconnect loops (see `closedReason`).
+    fatalServerError: ref PgQueryError
+      ## The FATAL/PANIC ErrorResponse that ended the session; attached to
+      ## closed-connection errors as ``serverError``.
+    txAbortFields: seq[ErrorField]
+      ## Fields of the last ErrorResponse received while not in a failed block,
+      ## so in one, the error that failed it. Kept past that block's end, so a
+      ## COMMIT answered with ROLLBACK can name the cause, until that COMMIT
+      ## takes it or a ReadyForQuery with no failed block on either side.
     listenReconnectMaxAttempts: int
       ## Max reconnect attempts on listen pump failure. Default 10.
       ## 0 or negative = unlimited retries (retry until close()).
@@ -321,12 +381,13 @@ type
     pendingStmtCloses: seq[string]
       ## Server-side prepared statement names whose ``Close`` was not bundled
       ## with the operation that evicted them. Populated when the defensive
-      ## eviction loop in ``addStmtCache`` fires (caller skipped the
-      ## pre-eviction step, or ``stmtCacheCapacity`` was shrunk below the
-      ## current cache size). Staged by ``stagePendingStmtCloses`` at the
-      ## start of the next Extended Query send phase so the leak is bounded
-      ## to the gap until the next operation, which moves them to
-      ## ``stagedStmtCloses``.
+      ## eviction loop in ``addStmtCache`` fires (a pipeline never
+      ## pre-evicts), when ``stmtCacheCapacity=`` shrinks the cache, when an
+      ## entry is invalidated or replaced, and for statements no entry holds
+      ## (a cache miss the server Parsed but the cache did not keep). Staged by
+      ## ``stagePendingStmtCloses`` at the start of the next Extended Query
+      ## send phase so the leak is bounded to the gap until the next
+      ## operation, which moves them to ``stagedStmtCloses``.
     heldSessionLocks: int
       ## Count of session-level `pg_advisory_lock` acquires through the typed
       ## API, minus tracked releases. Reported (best-effort) by the
@@ -357,7 +418,38 @@ type
       ## Replication: confirmed flush LSN (raw; see ``pg_replication``).
     replMaxReceivedLsnRaw: uint64 ## Replication: max received LSN (raw).
     replReadScratch: seq[byte] ## Chronos scratch for ``fillRecvBufDetached``.
-    replCopyDoneSent: bool ## Client already sent CopyDone (skip mirror).
+    replWrites: Deque[ReplWrite]
+      ## Replication writes not yet started, in wire order (see ``pg_replication``).
+    replFlusher: Future[void] ## The task draining ``replWrites``; nil when idle.
+    replFinalStatus: ReplWrite
+      ## The stop's last status, written once ``replWrites`` is drained.
+    replWriteFailure: ref CatchableError
+      ## The write failure that ended the stream, kept as the cause of later errors.
+    replPendingStatus: ReplWrite ## The library's status queued and not yet encoded.
+    replWritesOpen: bool ## The stream accepts writes; cleared as it ends.
+    replCopyDone: ReplWrite
+      ## The client's CopyDone once requested, written after ``replFinalStatus``.
+    replAutoConfirm: bool ## Logical stream confirms progress itself (``autoConfirm``).
+    replInTxn: bool ## ``autoConfirm``: between a pgoutput Begin and Commit.
+    replInCallback: bool
+      ## The stream's callback is running; the stop's final status waits for it.
+    replReportedRaw: tuple[receive, flush, apply: uint64]
+      ## Replication: positions of the caller's last Standby Status Update (raw).
+    replSentFlushRaw: uint64
+      ## Replication: flush of the library's last Standby Status Update (raw).
+
+  ReplWriteState* = enum
+    ## Lifecycle of a queued replication write (internal).
+    rwQueued ## Waiting in the queue.
+    rwWriting ## Taken off the queue; a library status is encoded by then.
+    rwWritten
+    rwFailed ## Not written, whether it had started or not.
+
+  ReplWrite* = ref object
+    ## A queued replication write (internal; see ``pg_replication``).
+    frame*: seq[byte] ## Encoded frame; empty for the library's status.
+    waiters*: seq[Future[void]] ## Completed once written, failed if not.
+    state*: ReplWriteState
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
@@ -523,7 +615,9 @@ type
     key2*: int32 ## Second key (two-key only)
     shared*: bool ## Shared lock?
     twoKey*: bool ## Two-key variant?
-    err*: ref CatchableError ## Nil = unlock returned false (not held)
+    err*: ref CatchableError
+      ## Nil = unlock returned false (not held). An unlock `Defect` arrives
+      ## wrapped in `PgError` (`parent` = the Defect).
 
   PgTracer* = ref object
     ## Tracing hooks (nil = skipped; Start → ``TraceContext`` → End).
@@ -575,9 +669,11 @@ type
     onCleanupSkipped*: proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].}
       ## Skipped/failed ROLLBACK (may fire twice when nested).
     onInsecureAuth*: proc(data: TraceInsecureAuthData) {.gcsafe, raises: [].}
-      ## Insecure auth over plaintext.
+      ## Cleartext password sent over plaintext. Fires only for a request the
+      ## client answers, after the order and require_auth checks.
     onDeprecatedAuth*: proc(data: TraceDeprecatedAuthData) {.gcsafe, raises: [].}
-      ## Weak auth (MD5).
+      ## MD5 password sent. Fires only for a request the client answers, after
+      ## the order and require_auth checks.
     onAdvisoryUnlockFailed*:
       proc(data: TraceAdvisoryUnlockFailedData) {.gcsafe, raises: [].}
       ## Swallowed unlock failure.
@@ -616,6 +712,16 @@ proc warnStderr*(msg: string) =
   except IOError:
     discard
 
+func dsnName(mode: SslMode): string {.inline.} =
+  ## libpq `sslmode=` spelling of `mode` for error messages.
+  case mode
+  of sslDisable: "disable"
+  of sslAllow: "allow"
+  of sslPrefer: "prefer"
+  of sslRequire: "require"
+  of sslVerifyCa: "verify-ca"
+  of sslVerifyFull: "verify-full"
+
 proc validateClientCertConfig*(config: ConnConfig) =
   ## Reject inconsistent client certificate configurations early (at config
   ## build time, before any connection is opened). Both halves of an mTLS
@@ -627,15 +733,42 @@ proc validateClientCertConfig*(config: ConnConfig) =
       config.sslMode in {sslDisable, sslAllow}:
     raise newException(
       PgConfigError,
-      "sslcert/sslkey require sslmode of prefer or stronger (got " & $config.sslMode &
-        "); they would otherwise be silently unused",
+      "sslcert/sslkey require sslmode of prefer or stronger (got " &
+        config.sslMode.dsnName & "); they would otherwise be silently unused",
+    )
+
+proc validateTlsConfig*(
+    config: ConnConfig, overTcp = true
+) {.raises: [PgConfigError].} =
+  ## Reject TLS settings no server can satisfy (as libpq): a TLS requirement in a
+  ## build without TLS (asyncdispatch without ``-d:ssl``), or, when ``overTcp``,
+  ## a verified sslmode without ``sslrootcert`` (a Unix socket skips TLS).
+  when not hasTls:
+    const hint = ", which this build lacks (compile with -d:ssl)"
+    if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
+      raise newException(
+        PgConfigError, "sslmode=" & config.sslMode.dsnName & " needs TLS" & hint
+      )
+    if config.channelBinding == cbRequire:
+      raise newException(PgConfigError, "channel_binding=require needs TLS" & hint)
+    if config.requireAuth == {amScramSha256Plus}:
+      raise newException(
+        PgConfigError,
+        "require_auth allows only SCRAM-SHA-256-PLUS, which needs TLS" & hint,
+      )
+  if overTcp and config.sslMode in {sslVerifyCa, sslVerifyFull} and
+      config.sslRootCert.len == 0:
+    # Both backends would fall back to a Web PKI store, and verify-ca skips the
+    # hostname check, so any publicly issued cert could MITM. Fail closed.
+    raise newException(
+      PgConfigError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
     )
 
 # HostEntry accessors
 
 func dialAddr*(entry: HostEntry): string {.inline.} =
-  ## The address actually dialed: `hostaddr` bypasses name resolution when
-  ## given, otherwise `host` is resolved (libpq semantics).
+  ## The address actually dialed: `hostaddr` when given, otherwise `host`.
+  ## Unlike libpq, a name in `hostaddr` is resolved rather than rejected.
   if entry.hostaddr.len > 0: entry.hostaddr else: entry.host
 
 func displayHost*(entry: HostEntry): string {.inline.} =
@@ -643,7 +776,532 @@ func displayHost*(entry: HostEntry): string {.inline.} =
   ## `hostaddr` (mirrors libpq's PQhost()).
   if entry.host.len > 0: entry.host else: entry.hostaddr
 
-# Internal accessor for cross-module use within the library
+# Internal accessors
+#
+# Sibling modules reach the private record through these rather than
+# `privateAccess`, which is reserved for tests. The hub re-exports none of
+# them; the promised ones are the "Public accessors" section below. A field
+# with a public getter gets a setter here instead: a `var` overload cannot
+# share the getter's name. `state` and `config` are the two exceptions: the
+# former is written only through ``markState``, the latter is an immutable
+# `lent` view.
+#
+# Fields that have to move together get named operations instead of per-field
+# `var` accessors, so no sibling can update one half of an invariant:
+#
+# - receive buffer (`recvBuf` / `recvBufStart`): read through ``recvBuf``,
+#   ``recvBufStart`` and ``recvBufLen``, advance with ``consumeRecv``; the
+#   fills live in the "Receive buffer" section.
+# - wire debt (`pendingSyncs` / `unsyncedWrite`): ``noteWrite``,
+#   ``settlePendingSync``, ``clearWireDebt`` and ``resetWireState``.
+# - statement cache, its LRU list, counters and Close queues: the
+#   "Statement cache" section.
+# - notification queue with its waiter and handoff slot: the "Notification
+#   queue" section.
+# - replication write queue and stream flags: the "Replication write queue"
+#   section.
+
+proc newPgConnection*(host: string, port: int, config: ConnConfig): PgConnection =
+  ## A ``csConnecting`` record with the default tunables, before the caller
+  ## attaches its transport.
+  PgConnection(
+    state: csConnecting,
+    serverParams: initTable[string, string](),
+    host: host,
+    port: port,
+    config: config,
+    notifyMaxQueue: DefaultNotifyMaxQueue,
+    notifyMaxQueueBytes: DefaultNotifyMaxQueueBytes,
+    stmtCacheCapacity: 256,
+    listenReconnectMaxAttempts: 10,
+    listenReconnectMaxBackoff: 30,
+  )
+
+when hasChronos:
+  func transport*(conn: PgConnection): StreamTransport {.inline.} =
+    conn.transport
+
+  func baseReader*(conn: PgConnection): AsyncStreamReader {.inline.} =
+    conn.baseReader
+
+  func baseWriter*(conn: PgConnection): AsyncStreamWriter {.inline.} =
+    conn.baseWriter
+
+  func reader*(conn: PgConnection): AsyncStreamReader {.inline.} =
+    conn.reader
+
+  func writer*(conn: PgConnection): AsyncStreamWriter {.inline.} =
+    conn.writer
+
+  func tlsStream*(conn: PgConnection): TLSAsyncStream {.inline.} =
+    conn.tlsStream
+
+  proc attachTransport*(
+      conn: PgConnection, t: StreamTransport, target: DialTarget, sslHost: string
+  ) {.inline.} =
+    ## Attach a freshly dialled transport with what ``cancel`` needs to reach
+    ## the same server: its address and TLS name.
+    conn.transport = t
+    conn.cancelTarget = @[target]
+    conn.sslHost = sslHost
+
+  proc initPlainStreams*(conn: PgConnection) {.inline.} =
+    ## Wire plaintext ``reader``/``writer`` from the transport when none exist.
+    if conn.reader.isNil:
+      conn.baseReader = newAsyncStreamReader(conn.transport)
+      conn.baseWriter = newAsyncStreamWriter(conn.transport)
+      conn.reader = conn.baseReader
+      conn.writer = conn.baseWriter
+
+  proc beginTlsBase*(conn: PgConnection) {.inline.} =
+    ## Create the base streams a TLS handshake wraps.
+    conn.baseReader = newAsyncStreamReader(conn.transport)
+    conn.baseWriter = newAsyncStreamWriter(conn.transport)
+
+  proc installTlsStream*(
+      conn: PgConnection, stream: TLSAsyncStream, backing: sink seq[seq[byte]]
+  ) =
+    ## Adopt ``stream`` with its trust-anchor backing and point the X509
+    ## capture at this record's own ``serverCertDer`` storage. ``backing`` must
+    ## be moved in: the anchors point into its inner buffers, which a copy
+    ## would not preserve.
+    conn.trustAnchorBufs = backing
+    conn.tlsStream = stream
+    installX509Capture(
+      conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+    )
+
+  proc finishTls*(conn: PgConnection) {.inline.} =
+    ## Switch ``reader``/``writer`` to the established TLS stream.
+    conn.reader = conn.tlsStream.reader
+    conn.writer = conn.tlsStream.writer
+    conn.sslEnabled = true
+
+  proc graftTransportFrom*(conn, src: PgConnection) =
+    ## Move the transport cluster from ``src`` and rebind the X509 capture.
+    conn.transport = src.transport
+    conn.baseReader = src.baseReader
+    conn.baseWriter = src.baseWriter
+    conn.reader = src.reader
+    conn.writer = src.writer
+    conn.tlsStream = src.tlsStream
+    conn.trustAnchorBufs = move(src.trustAnchorBufs)
+    conn.x509Capture = src.x509Capture
+    conn.sslEnabled = src.sslEnabled
+    conn.serverCertDer = src.serverCertDer
+    if conn.tlsStream != nil:
+      rebindX509Capture(
+        conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
+      )
+
+  proc detachTransport*(
+      conn: PgConnection
+  ): tuple[
+    tls: TLSAsyncStream,
+    baseReader: AsyncStreamReader,
+    baseWriter: AsyncStreamWriter,
+    transport: StreamTransport,
+  ] =
+    ## Detach all transport handles for the caller to close.
+    result = (conn.tlsStream, conn.baseReader, conn.baseWriter, conn.transport)
+    conn.tlsStream = nil
+    conn.baseReader = nil
+    conn.baseWriter = nil
+    conn.transport = nil
+    conn.reader = nil
+    conn.writer = nil
+
+elif hasAsyncDispatch:
+  func socket*(conn: PgConnection): AsyncSocket {.inline.} =
+    conn.socket
+
+  proc attachTransport*(
+      conn: PgConnection, s: AsyncSocket, target: DialTarget, sslHost: string
+  ) {.inline.} =
+    ## Attach a freshly dialled socket with what ``cancel`` needs to reach the
+    ## same server: its address and TLS name.
+    conn.socket = s
+    conn.cancelTarget = @[target]
+    conn.sslHost = sslHost
+
+  proc graftTransportFrom*(conn, src: PgConnection) {.inline.} =
+    ## Move the socket and its channel-binding certificate.
+    conn.socket = src.socket
+    conn.sslEnabled = src.sslEnabled
+    conn.serverCertDer = src.serverCertDer
+
+  proc detachTransport*(conn: PgConnection): AsyncSocket {.inline.} =
+    ## Detach the socket for the caller to close.
+    result = conn.socket
+    conn.socket = nil
+
+func serverCertDer*(conn: PgConnection): lent seq[byte] {.inline.} =
+  conn.serverCertDer
+
+proc setServerCertDer*(conn: PgConnection, der: seq[byte]) {.inline.} =
+  ## Store the server certificate DER for SCRAM channel binding.
+  conn.serverCertDer = der
+
+func cancelTarget*(conn: PgConnection): lent seq[DialTarget] {.inline.} =
+  conn.cancelTarget
+
+func sslHost*(conn: PgConnection): string {.inline.} =
+  conn.sslHost
+
+func secretKey*(conn: PgConnection): int32 {.inline.} =
+  conn.secretKey
+
+proc noteBackendKeyData*(conn: PgConnection, pid, secret: int32) {.inline.} =
+  ## Record ``BackendKeyData``: the pid and secret move together for ``cancel``.
+  conn.pid = pid
+  conn.secretKey = secret
+
+proc graftReconnectedSession*(conn, src: PgConnection) =
+  ## Move a fresh connection's wire and session identity onto ``conn`` for an
+  ## in-place reconnect. The caller owns state, the statement cache, session
+  ## locks and the fatal error around it.
+  conn.graftTransportFrom(src)
+  conn.host = src.host
+  conn.port = src.port
+  conn.cancelTarget = src.cancelTarget
+  conn.sslHost = src.sslHost
+  conn.pid = src.pid
+  conn.secretKey = src.secretKey
+  conn.serverParams = src.serverParams
+  conn.serverParamsBytes = src.serverParamsBytes
+  conn.txStatus = src.txStatus
+  conn.createdAt = src.createdAt
+  conn.recvBuf = src.recvBuf
+  conn.recvBufStart = src.recvBufStart
+
+func recvBuf*(conn: PgConnection): lent seq[byte] {.inline.} =
+  ## The receive buffer, parsed prefix included: everything before
+  ## ``recvBufStart`` is spent. Read-only; the writing side lives below.
+  conn.recvBuf
+
+func recvBufStart*(conn: PgConnection): int {.inline.} =
+  ## First unparsed byte in ``recvBuf``.
+  conn.recvBufStart
+
+func recvBufLen*(conn: PgConnection): int {.inline.} =
+  ## Number of unparsed bytes buffered.
+  conn.recvBuf.len - conn.recvBufStart
+
+proc consumeRecv*(conn: PgConnection, count: int) {.inline.} =
+  ## Mark ``count`` unparsed bytes parsed. Callers pass what one parse
+  ## consumed; nothing may be skipped without being parsed.
+  conn.recvBufStart += count
+
+proc noteWrite*(conn: PgConnection, data: openArray[byte]) {.inline.} =
+  ## Book what these bytes leave the backend owing. Before the write, not
+  ## after: a failed or cancelled write may still have reached the wire, and a
+  ## ``CancelRequest`` at an idle backend is a harmless no-op.
+  let owed = outstandingReplies(data)
+  conn.pendingSyncs += owed.syncPoints
+  if owed.syncPoints > 0:
+    # A sync point ends every request written before it, so only what follows
+    # the last one stays unended.
+    conn.unsyncedWrite = owed.unsynced
+  elif owed.unsynced:
+    conn.unsyncedWrite = true
+
+proc settlePendingSync*(conn: PgConnection) {.inline.} =
+  ## One ``ReadyForQuery`` reply has been read, so the backend owes one reply
+  ## less. Counts down rather than clearing: a pipelined batch owes several.
+  if conn.pendingSyncs > 0:
+    dec conn.pendingSyncs
+
+proc clearWireDebt*(conn: PgConnection) {.inline.} =
+  ## Forget which replies the previous frame was waiting for, without touching
+  ## the buffers. For a frame that takes over a half-read wire — it is the
+  ## reply count a ``CancelRequest`` must abort, and only the first frame to
+  ## claim it may dial.
+  conn.pendingSyncs = 0
+  conn.unsyncedWrite = false
+
+proc resetWireState*(conn: PgConnection) =
+  ## Forget what the wire's previous life left behind: the buffered bytes on
+  ## both sides and the replies the old backend owed.
+  ##
+  ## Sole owner of that reset: a stale count carried onto a fresh backend would
+  ## dial a ``CancelRequest`` at an unrelated PID and retire a healthy
+  ## connection.
+  conn.recvBuf.setLen(0)
+  conn.recvBufStart = 0
+  conn.sendBuf.setLen(0)
+  conn.pendingSyncs = 0
+  conn.unsyncedWrite = false
+
+proc noteNegotiatedProtocol*(
+    conn: PgConnection, minor: int32, opts: seq[string]
+) {.inline.} =
+  ## Record a ``NegotiateProtocolVersion`` reply; the two fields arrive together.
+  conn.negotiatedMinorVersion = minor
+  conn.unrecognizedStartupOptions = opts
+
+proc notifyCallback*(conn: PgConnection): var NotifyCallback {.inline.} =
+  conn.notifyCallback
+
+proc noticeCallback*(conn: PgConnection): var NoticeCallback {.inline.} =
+  conn.noticeCallback
+
+proc listenChannels*(conn: PgConnection): var HashSet[string] {.inline.} =
+  conn.listenChannels
+
+proc borrowedByUser*(conn: PgConnection): var bool {.inline.} =
+  conn.borrowedByUser
+
+proc transportCloseFut*(conn: PgConnection): var Future[void] {.inline.} =
+  conn.transportCloseFut
+
+func listenTask*(conn: PgConnection): Future[void] {.inline.} =
+  conn.listenTask
+
+func listenStopRequested*(conn: PgConnection): bool {.inline.} =
+  conn.listenStopRequested
+
+func listenReconnecting*(conn: PgConnection): bool {.inline.} =
+  conn.listenReconnecting
+
+proc noteListenPumpStarted*(conn: PgConnection, task: Future[void]) {.inline.} =
+  ## Adopt ``task`` as the pump and clear any previous stop/reconnect state.
+  conn.listenStopRequested = false
+  conn.listenReconnecting = false
+  conn.listenTask = task
+
+proc clearListenTask*(conn: PgConnection) {.inline.} =
+  ## Forget the pump task without touching the stop flag.
+  conn.listenTask = nil
+
+proc requestListenStop*(conn: PgConnection) {.inline.} =
+  conn.listenStopRequested = true
+
+proc clearListenStop*(conn: PgConnection) {.inline.} =
+  conn.listenStopRequested = false
+
+proc setListenReconnecting*(conn: PgConnection, value: bool) {.inline.} =
+  conn.listenReconnecting = value
+
+proc closedByUser*(conn: PgConnection): var bool {.inline.} =
+  conn.closedByUser
+
+proc fatalServerError*(conn: PgConnection): var ref PgQueryError {.inline.} =
+  conn.fatalServerError
+
+proc txAbortFields*(conn: PgConnection): var seq[ErrorField] {.inline.} =
+  conn.txAbortFields
+
+proc reconnectCallback*(conn: PgConnection): var ReconnectCallback {.inline.} =
+  conn.reconnectCallback
+
+proc notifyOverflowCallback*(
+    conn: PgConnection
+): var NotifyOverflowCallback {.inline.} =
+  conn.notifyOverflowCallback
+
+proc listenErrorCallback*(conn: PgConnection): var ListenErrorCallback {.inline.} =
+  conn.listenErrorCallback
+
+func heldSessionLocks*(conn: PgConnection): int {.inline.} =
+  conn.heldSessionLocks
+
+func sessionLockDirty*(conn: PgConnection): bool {.inline.} =
+  conn.sessionLockDirty
+
+proc noteSessionLockAcquired*(conn: PgConnection) {.inline.} =
+  ## Track one session-level acquire; the sticky flag outlives the counter.
+  inc conn.heldSessionLocks
+  conn.sessionLockDirty = true
+
+proc noteSessionLockReleased*(conn: PgConnection, released: bool) {.inline.} =
+  ## Track a server-confirmed release, clamping at zero for mixed raw/typed use.
+  if released and conn.heldSessionLocks > 0:
+    dec conn.heldSessionLocks
+
+proc clearSessionLocks*(conn: PgConnection) {.inline.} =
+  ## Forget session-lock tracking for a fresh or reset session.
+  conn.heldSessionLocks = 0
+  conn.sessionLockDirty = false
+
+proc tracer*(conn: PgConnection): var PgTracer {.inline.} =
+  conn.tracer
+
+proc ownerPool*(conn: PgConnection): var PgPoolOwner {.inline.} =
+  conn.ownerPool
+
+proc borrowed*(conn: PgConnection): var bool {.inline.} =
+  conn.borrowed
+
+proc `pid=`*(conn: PgConnection, value: int32) {.inline.} =
+  conn.pid = value
+
+proc `host=`*(conn: PgConnection, value: string) {.inline.} =
+  conn.host = value
+
+proc `port=`*(conn: PgConnection, value: int) {.inline.} =
+  conn.port = value
+
+proc `createdAt=`*(conn: PgConnection, value: Moment) {.inline.} =
+  conn.createdAt = value
+
+proc `sslEnabled=`*(conn: PgConnection, value: bool) {.inline.} =
+  conn.sslEnabled = value
+
+proc `serverParams=`*(conn: PgConnection, value: Table[string, string]) {.inline.} =
+  conn.serverParams = value
+
+proc setServerParam*(conn: PgConnection, name, value: string) {.inline.} =
+  ## Store one ``ParameterStatus`` value. Prefer ``recordParameterStatus``,
+  ## which also maintains the bounds and ``serverParamsBytes``.
+  conn.serverParams[name] = value
+
+proc `notifyDropped=`*(conn: PgConnection, value: int) {.inline.} =
+  conn.notifyDropped = value
+
+proc `listenError=`*(conn: PgConnection, value: ref PgListenError) {.inline.} =
+  conn.listenError = value
+
+proc `txStatus=`*(conn: PgConnection, value: TransactionStatus) {.inline.} =
+  conn.txStatus = value
+
+func sendBuf*(conn: PgConnection): lent seq[byte] {.inline.} =
+  ## Read-only view of the send buffer: raw sends read it, and the message
+  ## builders below append to it. Nothing outside this module gets a mutable
+  ## view, so no caller can splice bytes in behind the staging bookkeeping.
+  conn.sendBuf
+
+proc sendBufVar(conn: PgConnection): var seq[byte] {.inline.} =
+  ## Mutable view for this module's direct-encoding macros (``sendBuf`` is
+  ## read-only, and a macro cannot emit a field access into caller scope).
+  conn.sendBuf
+
+proc clearSendBuf*(conn: PgConnection) {.inline.} =
+  ## Empty the send buffer without touching staged statement Closes.
+  conn.sendBuf.setLen(0)
+
+func sendBufLen*(conn: PgConnection): int {.inline.} =
+  conn.sendBuf.len
+
+proc appendCopyData*(conn: PgConnection, data: openArray[byte]) {.inline.} =
+  ## Append one ``CopyData`` frame to the send buffer.
+  encodeCopyData(conn.sendBuf, data)
+
+proc appendCopyDone*(conn: PgConnection) {.inline.} =
+  conn.sendBuf.addCopyDone()
+
+# Extended Query assembly
+#
+# The builders append to the connection's own send buffer, so no caller needs
+# a mutable view of it. The buffer moves as one unit with the staged-Close
+# bookkeeping: `beginSendBuf` empties and stages, the builders append, and the
+# staged names drop only once the bytes are on the wire.
+
+proc addParse*(
+    conn: PgConnection,
+    stmtName: string,
+    sql: string,
+    paramTypeOids: openArray[int32] = [],
+) {.inline.} =
+  ## Append a Parse message to the send buffer.
+  conn.sendBuf.addParse(stmtName, sql, paramTypeOids)
+
+proc addParse*(
+    conn: PgConnection, stmtName: string, sql: string, params: openArray[PgParam]
+) {.inline.} =
+  ## Append a Parse message to the send buffer, taking the parameter OIDs from
+  ## ``params`` without reshaping them into a ``seq[int32]``.
+  conn.sendBuf.addParse(stmtName, sql, params)
+
+proc addBind*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    paramFormats: openArray[int16],
+    paramValues: openArray[Option[seq[byte]]],
+    resultFormats: openArray[int16] = [],
+) {.inline.} =
+  ## Append a Bind message to the send buffer.
+  conn.sendBuf.addBind(portalName, stmtName, paramFormats, paramValues, resultFormats)
+
+proc addBind*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    params: openArray[PgParam],
+    resultFormats: openArray[int16] = [],
+) {.inline.} =
+  ## Append a Bind message to the send buffer, writing straight out of
+  ## ``params`` instead of flattening them into values and formats.
+  conn.sendBuf.addBind(portalName, stmtName, params, resultFormats)
+
+proc addBindRaw*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    paramFormats: openArray[int16],
+    paramData: openArray[byte],
+    paramRanges: openArray[tuple[off: int32, len: int32]],
+    resultFormats: openArray[int16] = [],
+) {.inline.} =
+  ## Append a Bind message built from raw parameter bytes and ranges.
+  conn.sendBuf.addBindRaw(
+    portalName, stmtName, paramFormats, paramData, paramRanges, resultFormats
+  )
+
+proc addDescribe*(conn: PgConnection, kind: DescribeKind, name: string) {.inline.} =
+  ## Append a Describe message to the send buffer.
+  conn.sendBuf.addDescribe(kind, name)
+
+proc addExecute*(
+    conn: PgConnection, portalName: string, maxRows: int32 = 0
+) {.inline.} =
+  ## Append an Execute message to the send buffer.
+  conn.sendBuf.addExecute(portalName, maxRows)
+
+proc addClose*(conn: PgConnection, kind: DescribeKind, name: string) {.inline.} =
+  ## Append a Close message to the send buffer.
+  conn.sendBuf.addClose(kind, name)
+
+proc addSync*(conn: PgConnection) {.inline.} =
+  ## Append a Sync message to the send buffer.
+  conn.sendBuf.addSync()
+
+proc addFlush*(conn: PgConnection) {.inline.} =
+  ## Append a Flush message to the send buffer.
+  conn.sendBuf.addFlush()
+
+macro addParseDirect*(
+    conn: PgConnection, stmtName: string, sql: string, args: varargs[untyped]
+): untyped =
+  ## Connection-level form of ``pg_types/encoding.addParseDirect``: encodes the
+  ## Parse straight into the send buffer, with parameter OIDs taken from the
+  ## argument types. The operand rules are the encoding macro's.
+  let inner = bindSym"addParseDirect"
+  result = newCall(inner, newCall(bindSym"sendBufVar", conn), stmtName, sql)
+  for arg in args:
+    result.add(arg)
+
+macro addBindDirect*(
+    conn: PgConnection,
+    portalName: string,
+    stmtName: string,
+    resultFormats: untyped,
+    args: varargs[untyped],
+): untyped =
+  ## Connection-level form of ``pg_types/encoding.addBindDirect``: encodes the
+  ## Bind straight into the send buffer with per-argument format codes and no
+  ## intermediate ``seq[byte]``. The operand rules are the encoding macro's.
+  let inner = bindSym"addBindDirect"
+  result = newCall(
+    inner, newCall(bindSym"sendBufVar", conn), portalName, stmtName, resultFormats
+  )
+  for arg in args:
+    result.add(arg)
+
+proc nextPortalName*(conn: PgConnection, prefix: string): string =
+  ## Fresh portal/savepoint name; owns counter so macro scope stays sealed.
+  inc conn.portalCounter
+  prefix & $conn.portalCounter
 
 func effectiveMaxMessageSize*(conn: PgConnection): int {.inline.} =
   ## Effective per-message recv cap for this connection. Resolves the
@@ -667,6 +1325,7 @@ proc initReplLsnTracking*(conn: PgConnection, startLsn: uint64) =
   ## Reset per-stream LSN tracking to ``startLsn``.
   conn.replConfirmedFlushLsnRaw = startLsn
   conn.replMaxReceivedLsnRaw = startLsn
+  conn.replReportedRaw = (0'u64, 0'u64, 0'u64)
 
 proc updateReplMaxReceivedLsn*(conn: PgConnection, received: uint64): bool =
   ## Advance max-received LSN if ``received`` is greater; return if updated.
@@ -675,6 +1334,15 @@ proc updateReplMaxReceivedLsn*(conn: PgConnection, received: uint64): bool =
     true
   else:
     false
+
+proc noteReplReported*(conn: PgConnection, receive, flush, apply: uint64) =
+  ## Record the positions a caller's Standby Status Update just sent. The
+  ## latest report wins, so a caller may deliberately report lower.
+  conn.replReportedRaw = (receive, flush, apply)
+
+func replReported*(conn: PgConnection): tuple[receive, flush, apply: uint64] =
+  ## Raw reported positions (see ``noteReplReported``).
+  conn.replReportedRaw
 
 func replConfirmedFlushLsn*(conn: PgConnection): uint64 =
   ## Raw flush LSN (use typed API).
@@ -692,10 +1360,16 @@ proc confirmReplFlushed*(conn: PgConnection, lsn: uint64): bool =
   else:
     false
 
+func errorSeverity*(fields: seq[ErrorField]): string =
+  ## Severity of an ErrorResponse: 'V' (PG 9.6+) is never localized; 'S' may be.
+  result = getErrorField(fields, 'V')
+  if result.len == 0:
+    result = getErrorField(fields, 'S')
+
 proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
   ## Create a PgQueryError from server ErrorResponse fields.
   let sqlState = getErrorField(fields, 'C')
-  let severity = getErrorField(fields, 'S')
+  let severity = errorSeverity(fields)
   let detail = getErrorField(fields, 'D')
   let hint = getErrorField(fields, 'H')
   result = (ref PgQueryError)(
@@ -706,6 +1380,19 @@ proc newPgQueryError*(fields: seq[ErrorField]): ref PgQueryError =
     hint: hint,
     fields: fields,
   )
+
+proc copyServerError*(se: ref PgQueryError): ref PgQueryError {.raises: [].} =
+  ## ``se``'s own copy for one error, nil for nil. A ref shared between errors
+  ## would pile every raise's stack trace onto each of them.
+  if se != nil:
+    result = (ref PgQueryError)(
+      msg: se.msg,
+      sqlState: se.sqlState,
+      severity: se.severity,
+      detail: se.detail,
+      hint: se.hint,
+      fields: se.fields,
+    )
 
 # Tracer fire helpers (cross-module use)
 
@@ -870,6 +1557,56 @@ proc markClosed*(conn: PgConnection) {.inline, raises: [].} =
   ## down yet or not.
   conn.markState(csClosed)
 
+proc isUtf8EncodingName*(val: string): bool =
+  ## Whether ``val`` is one of the server's spellings of UTF8
+  ## (``pg_char_to_encoding`` ignores case and punctuation).
+  var name = ""
+  for c in val:
+    if c.isAlphaNumeric:
+      name.add(c.toLowerAscii)
+  name in ["utf8", "unicode"]
+
+proc isClientEncodingKey*(key: string): bool =
+  ## GUC names are case-insensitive.
+  cmpIgnoreCase(key, "client_encoding") == 0
+
+proc recordParameterStatus*(
+    conn: PgConnection, name, value: string
+) {.raises: [PgProtocolError].} =
+  ## Store one ``ParameterStatus`` under ``MaxServerParams`` /
+  ## ``MaxServerParamsBytes``. Exceeding either cap is treated as a broken
+  ## peer: the connection is closed and ``PgProtocolError`` is raised. Updates
+  ## to an existing key are always admitted when the resulting byte total fits.
+  let newEntryBytes = name.len + value.len
+  if conn.serverParams.hasKey(name):
+    let oldLen = conn.serverParams.getOrDefault(name).len
+    let delta = value.len - oldLen
+    if delta > 0 and conn.serverParamsBytes > MaxServerParamsBytes - delta:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams byte total would exceed maximum of " &
+          $MaxServerParamsBytes,
+      )
+    conn.serverParamsBytes += delta
+    conn.setServerParam(name, value)
+  else:
+    if conn.serverParams.len >= MaxServerParams:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams key count exceeds maximum of " & $MaxServerParams,
+      )
+    if newEntryBytes > MaxServerParamsBytes - conn.serverParamsBytes:
+      conn.markClosed()
+      raise newException(
+        PgProtocolError,
+        "ParameterStatus: serverParams byte total would exceed maximum of " &
+          $MaxServerParamsBytes,
+      )
+    conn.setServerParam(name, value)
+    conn.serverParamsBytes += newEntryBytes
+
 # Staged statement-close bookkeeping
 #
 # Only a completed send licenses forgetting the staged names. Staging and
@@ -898,6 +1635,191 @@ proc clearStaged*(conn: PgConnection) {.inline, raises: [].} =
   ## tripping this guard.
   when defined(pgStateChecks):
     conn.sendBufStaged = false
+
+# Statement cache
+#
+# The cache table, its LRU list, the name counter and the two Close queues move
+# as one unit: an entry and its list node must be added or dropped together, and
+# a name enters ``pendingStmtCloses`` only when the entry it belonged to is gone
+# (or never landed). The operations below are the only way in; send-phase
+# callers stage and drop through them, never by touching the queues.
+
+const stmtNamePrefix* = "_sc_"
+  ## Reserved for the cache's names: `prepare` rejects a name that starts with it.
+
+proc nextStmtName*(conn: PgConnection): string =
+  ## Generate the next unique prepared statement name for the statement cache.
+  inc conn.stmtCounter
+  stmtNamePrefix & $conn.stmtCounter
+
+proc lookupStmtCache*(conn: PgConnection, sql: string): CachedStmt =
+  ## Look up a cached prepared statement by SQL text, updating LRU order on hit.
+  ## Returns ``nil`` on miss. The returned ``ref`` stays valid across later
+  ## mutations.
+  if conn.stmtCacheCapacity <= 0:
+    return nil
+  conn.stmtCache.withValue(sql, entry):
+    conn.stmtCacheLru.remove(entry.lruNode)
+    conn.stmtCacheLru.append(entry.lruNode)
+    return entry[]
+  return nil
+
+proc evictStmtCache*(conn: PgConnection): CachedStmt =
+  ## Evict the least recently used entry from the cache. Returns the evicted entry.
+  let node = conn.stmtCacheLru.head
+  let oldSql = node.value
+  conn.stmtCacheLru.remove(node)
+  result = conn.stmtCache[oldSql]
+  conn.stmtCache.del(oldSql)
+
+proc queueStmtClose*(conn: PgConnection, stmtName: string) =
+  ## Queue a server-side ``Close`` for a statement the cache no longer tracks
+  ## (a dropped entry, or a cache miss the server Parsed but the cache did not
+  ## keep). The next Extended Query send carries it at its head.
+  ##
+  ## Only for names this cache Parsed: a Close for a name whose Parse failed
+  ## would drop whoever else holds it.
+  conn.pendingStmtCloses.add(stmtName)
+
+proc removeStmtCache*(conn: PgConnection, sql: string) =
+  ## Remove a statement from the cache by its SQL text. The caller queues the
+  ## server-side ``Close`` (see ``queueStmtClose``).
+  conn.stmtCache.withValue(sql, entry):
+    conn.stmtCacheLru.remove(entry.lruNode)
+  conn.stmtCache.del(sql)
+
+proc invalidateStmtCache*(conn: PgConnection, sql, stmtName: string) =
+  ## Drop a cache entry the server invalidated and queue its ``Close`` together.
+  ## A no-op once ``sql`` no longer maps to ``stmtName``: whatever dropped that
+  ## entry already queued its Close.
+  let entry = conn.stmtCache.getOrDefault(sql)
+  if entry == nil or entry.name != stmtName:
+    return
+  conn.removeStmtCache(sql)
+  conn.queueStmtClose(stmtName)
+
+proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
+  ## Add a prepared statement to the cache with auto-computed result formats.
+  ## Single-statement callers pre-evict (``evictForInsert``) so the Close
+  ## rides along. A pipeline would have to Close mid-batch, where a failing op
+  ## gets it skipped, so it leaves eviction to the loop below, which queues
+  ## the names for the next Extended Query send.
+  ##
+  ## Every name handed in ends up cached or queued for ``Close``: a statement
+  ## the cache cannot keep (caching turned off while it was in flight) or an
+  ## entry it replaces is closed, not forgotten.
+  if conn.stmtCacheCapacity <= 0:
+    conn.queueStmtClose(cached.name)
+    return
+  let existing = conn.stmtCache.getOrDefault(sql)
+  if existing != nil:
+    conn.removeStmtCache(sql)
+    if existing.name != cached.name:
+      conn.queueStmtClose(existing.name)
+  while conn.stmtCache.len >= conn.stmtCacheCapacity:
+    let evicted = conn.evictStmtCache()
+    conn.queueStmtClose(evicted.name)
+  if cached.resultFormats.len == 0 and cached.fields.len > 0:
+    cached.resultFormats = buildResultFormats(cached.fields)
+    cached.colFmts = newSeq[int16](cached.fields.len)
+    cached.colOids = newSeq[int32](cached.fields.len)
+    for i in 0 ..< cached.fields.len:
+      cached.colOids[i] = cached.fields[i].typeOid
+      cached.colFmts[i] = cached.resultFormats[i]
+  let node = newDoublyLinkedNode(sql)
+  cached.lruNode = node
+  conn.stmtCache[sql] = cached
+  conn.stmtCacheLru.append(node)
+
+proc clearStmtCache*(conn: PgConnection) =
+  ## Clear the client-side statement cache. Does not close server-side
+  ## statements, including any ``Close`` messages queued in
+  ## ``pendingStmtCloses`` from defensive eviction — the queue is dropped on
+  ## the assumption the caller will reset the session externally (e.g. via
+  ## ``DISCARD ALL`` or by closing the connection).
+  conn.stmtCache.clear()
+  conn.stmtCacheLru = initDoublyLinkedList[string]()
+  conn.pendingStmtCloses.setLen(0)
+  conn.stagedStmtCloses.setLen(0)
+
+proc stagePendingStmtCloses*(conn: PgConnection, buf: var seq[byte]) =
+  ## Append a ``Close`` for every owed statement name to ``buf`` so they ride
+  ## along with this operation's ``Sync``, moving them from the queue to
+  ## ``stagedStmtCloses``.
+  ##
+  ## Only `sendStagedBufMsg` / `sendStagedMsg` drop them once on the wire;
+  ## a re-sent ``Close`` is a backend no-op.
+  ##
+  ## ``buf`` must already be emptied, or the build truncates the Closes away.
+  if conn.stagedStmtCloses.len > 0:
+    # A previous build staged these and never sent them. Owed again, ahead of
+    # anything queued since.
+    conn.pendingStmtCloses = conn.stagedStmtCloses & conn.pendingStmtCloses
+    conn.stagedStmtCloses.setLen(0)
+  for name in conn.pendingStmtCloses:
+    buf.addClose(dkStatement, name)
+  conn.stagedStmtCloses = move(conn.pendingStmtCloses)
+  conn.markStaged()
+
+proc stagePendingStmtCloses*(conn: PgConnection) {.inline.} =
+  ## Stage every owed statement ``Close`` into the connection's own send
+  ## buffer (the assembly path; the two-argument form serves callers building
+  ## a separate batch).
+  conn.stagePendingStmtCloses(conn.sendBuf)
+
+when defined(pgStateChecks):
+  func onlyCloses(buf: openArray[byte]): bool =
+    var i = 0
+    while i < buf.len:
+      if buf[i] != byte('C'):
+        return false
+      i += 1 + int(decodeInt32(buf, i + 1))
+    true
+
+proc stageEvictedClose*(conn: PgConnection, buf: var seq[byte], name: string) =
+  ## Stage the ``Close`` for a statement the build itself evicted. Staged, not
+  ## queued: the cache no longer remembers the name, and an aborted build
+  ## leaves staged names owed just as the queue would.
+  ##
+  ## Only ahead of the build's first Parse/Bind/Describe/Execute: behind a
+  ## failing one the backend skips it up to ``Sync``, yet the name is dropped
+  ## once the bytes are sent.
+  when defined(pgStateChecks):
+    doAssert onlyCloses(buf), "eviction Close staged behind a message that can fail"
+  conn.requireStaged("staging an eviction Close")
+  conn.stagedStmtCloses.add name
+  buf.addClose(dkStatement, name)
+
+proc dropStagedStmtCloses*(conn: PgConnection) =
+  ## Forget the names whose ``Close`` is now on the wire. Names queued since the
+  ## staging are in ``pendingStmtCloses`` and untouched by this.
+  conn.requireStaged("dropping the staged statement Closes")
+  conn.clearStaged()
+  conn.stagedStmtCloses.setLen(0)
+
+proc beginSendBuf*(conn: PgConnection) =
+  ## Start a new operation's send buffer: empty it, then stage the queued
+  ## ``Close`` messages into it. The order matters: staging first would be
+  ## truncated by the emptying.
+  conn.sendBuf.setLen(0)
+  conn.stagePendingStmtCloses(conn.sendBuf)
+
+proc evictForInsert*(conn: PgConnection, buf: var seq[byte]) =
+  ## Make room for one more cache entry, staging the evicted ``Close`` into
+  ## ``buf`` (the buffer this operation assembles).
+  if conn.stmtCacheCapacity <= 0 or conn.stmtCache.len < conn.stmtCacheCapacity:
+    return
+  let evicted = conn.evictStmtCache()
+  conn.stageEvictedClose(buf, evicted.name)
+
+proc evictForInsert*(conn: PgConnection) {.inline.} =
+  ## Make room for one more cache entry, staging the evicted ``Close`` into the
+  ## connection's own send buffer.
+  conn.evictForInsert(conn.sendBuf)
+
+proc stmtCachingEnabled*(conn: PgConnection): bool {.inline.} =
+  ## Whether prepared statements are cached on this connection.
+  conn.stmtCacheCapacity > 0
 
 # Public accessors
 #
@@ -951,13 +1873,22 @@ func listenError*(conn: PgConnection): ref PgListenError {.inline.} =
   conn.listenError
 
 func notifyMaxQueue*(conn: PgConnection): int {.inline.} =
-  ## Pull-API queue cap; see `notifyMaxQueue=`.
+  ## Pull-API count cap; see `notifyMaxQueue=`.
   conn.notifyMaxQueue
 
 proc `notifyMaxQueue=`*(conn: PgConnection, value: int) {.inline.} =
-  ## Cap the pull-API queue (1024 default; <=0 = unbounded). Overflow drops
-  ## the oldest entry and fires `onNotifyOverflow`.
+  ## Cap the pull-API queue by count (1024 default; <=0 = unbounded count).
+  ## Overflow drops the oldest entry and fires `onNotifyOverflow`.
   conn.notifyMaxQueue = value
+
+func notifyMaxQueueBytes*(conn: PgConnection): int {.inline.} =
+  ## Pull-API byte cap; see `notifyMaxQueueBytes=`.
+  conn.notifyMaxQueueBytes
+
+proc `notifyMaxQueueBytes=`*(conn: PgConnection, value: int) {.inline.} =
+  ## Cap queued ``channel.len + payload.len`` (16 MiB default; <=0 = unbounded).
+  ## Overflow drops oldest; a notification larger than the cap is not queued.
+  conn.notifyMaxQueueBytes = value
 
 func listenReconnectMaxAttempts*(conn: PgConnection): int {.inline.} =
   ## Reconnect attempt budget; see `listenReconnectMaxAttempts=`.
@@ -965,7 +1896,8 @@ func listenReconnectMaxAttempts*(conn: PgConnection): int {.inline.} =
 
 proc `listenReconnectMaxAttempts=`*(conn: PgConnection, value: int) {.inline.} =
   ## Max reconnect attempts on listen-pump failure (10 default; <=0 = retry
-  ## until `close`).
+  ## until `close`). A refusal — a wrong password, say — or a config fault
+  ## ends the pump at once, whatever the budget left.
   conn.listenReconnectMaxAttempts = value
 
 func listenReconnectMaxBackoff*(conn: PgConnection): int {.inline.} =
@@ -980,28 +1912,24 @@ func stmtCacheCapacity*(conn: PgConnection): int {.inline.} =
   ## Statement-cache capacity; see `stmtCacheCapacity=`.
   conn.stmtCacheCapacity
 
-proc `stmtCacheCapacity=`*(conn: PgConnection, value: int) {.inline.} =
+proc `stmtCacheCapacity=`*(conn: PgConnection, value: int) =
   ## Resize the client-side prepared-statement cache (256 default; 0 disables
-  ## it). Shrinking below the current size leaves the excess to the next
-  ## operation's eviction pass, which bundles the server-side ``Close``.
+  ## it). Shrinking evicts the least recently used excess at once; their
+  ## server-side ``Close`` rides along with the next Extended Query operation.
   conn.stmtCacheCapacity = value
+  while conn.stmtCache.len > max(value, 0):
+    conn.queueStmtClose(conn.evictStmtCache().name)
 
 func state*(conn: PgConnection): PgConnState {.inline.} =
-  ## Current state (read-only; see `isConnected` / `closedReason`).
+  ## Current state (read-only; see `isConnected`).
   conn.state
 
 func txStatus*(conn: PgConnection): TransactionStatus {.inline.} =
-  ## Tx status from last ``ReadyForQuery`` (read-only, via `bindSym`).
+  ## Tx status from last ``ReadyForQuery`` (via `bindSym`). Read-only to
+  ## applications; library modules update it through the internal `txStatus=`.
   conn.txStatus
 
-proc sendBuf*(conn: PgConnection): var seq[byte] {.inline.} =
-  ## Send buffer for `queryDirect` / `execDirect` (via `bindSym`).
-  conn.sendBuf
-
-proc nextPortalName*(conn: PgConnection, prefix: string): string =
-  ## Fresh portal/savepoint name; owns counter so macro scope stays sealed.
-  inc conn.portalCounter
-  prefix & $conn.portalCounter
+# Closed-connection checks (internal)
 
 func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
   ## Why unusable (``crClosedByUser`` outranks ``crClosed``).
@@ -1012,6 +1940,15 @@ func closedReason*(conn: PgConnection): PgClosedReason {.inline.} =
   else:
     crOpen
 
+proc newClosedError*(
+    conn: PgConnection, msg: string, parent: ref Exception = nil
+): ref PgConnectionError =
+  ## ``PgUnavailableError`` for a connection that died, carrying the server's
+  ## FATAL ErrorResponse (if any) as ``serverError``.
+  (ref PgUnavailableError)(
+    msg: msg, parent: parent, serverError: copyServerError(conn.fatalServerError)
+  )
+
 proc checkNotClosed*(conn: PgConnection) {.inline.} =
   ## Reject if closed: ``PgStateError`` for deliberate ``close()``, else ``PgConnectionError``.
   case conn.closedReason
@@ -1020,7 +1957,7 @@ proc checkNotClosed*(conn: PgConnection) {.inline.} =
   of crClosedByUser:
     raise newException(PgStateError, closedByUserMsg)
   of crClosed:
-    raise newException(PgConnectionError, "Connection is closed")
+    raise conn.newClosedError("Connection is closed")
 
 proc raiseClosedConnection*(conn: PgConnection, msg: string) {.noreturn.} =
   ## Like ``checkNotClosed`` with a custom ``crClosed`` message.
@@ -1030,7 +1967,7 @@ proc raiseClosedConnection*(conn: PgConnection, msg: string) {.noreturn.} =
     raise (ref PgStateError)(
       msg: closedByUserMsg, parent: newException(PgConnectionError, msg)
     )
-  raise newException(PgConnectionError, msg)
+  raise conn.newClosedError(msg)
 
 proc raiseTransportFailure*(
     conn: PgConnection, what: string, e: ref CatchableError
@@ -1040,7 +1977,7 @@ proc raiseTransportFailure*(
     raise (ref PgStateError)(msg: closedByUserMsg, parent: e)
   if e of PgError:
     raise e
-  raise newException(PgConnectionError, what & ": " & e.msg, e)
+  raise conn.newClosedError(what & ": " & e.msg, e)
 
 proc failNotifyWaiter*(conn: PgConnection, err: ref PgError = nil) {.raises: [].} =
   ## Fail parked waiter: ``closedByUser``→``PgStateError``, else ``err``/``csClosed``/stopped. Pass fresh ``err``.
@@ -1053,7 +1990,7 @@ proc failNotifyWaiter*(conn: PgConnection, err: ref PgError = nil) {.raises: [].
       elif err != nil:
         err
       elif conn.state == csClosed:
-        (ref PgConnectionError)(msg: "Connection is closed")
+        conn.newClosedError("Connection is closed")
       else:
         (ref PgStateError)(msg: "Listener stopped")
     # asyncdispatch types `Future.fail`'s callback chain as raising `Exception`,
@@ -1062,3 +1999,521 @@ proc failNotifyWaiter*(conn: PgConnection, err: ref PgError = nil) {.raises: [].
       conn.notifyWaiter.fail(e)
     except Exception:
       discard
+
+# Receive buffer
+
+proc compactRecvBuf*(conn: PgConnection) =
+  ## Move the unparsed bytes to the front, freeing the space already parsed.
+  ## Only safe before reading new data from the socket: it moves bytes an
+  ## in-flight read still points at.
+  let start = conn.recvBufStart
+  if start == 0:
+    return
+  let remaining = conn.recvBuf.len - start
+  if remaining == 0:
+    conn.recvBuf.setLen(0)
+  else:
+    moveMem(addr conn.recvBuf[0], addr conn.recvBuf[start], remaining)
+    conn.recvBuf.setLen(remaining)
+  conn.recvBufStart = 0
+
+proc adoptRecvBuf*(conn, other: PgConnection) =
+  ## Take over ``other``'s buffered bytes and read pointer. For an in-place
+  ## reconnect, which grafts the fresh connection's wire state onto the old
+  ## record; the two fields must move as a pair or the pointer describes the
+  ## wrong buffer.
+  conn.recvBuf = other.recvBuf
+  conn.recvBufStart = other.recvBufStart
+
+proc fillRecvBuf*(
+    conn: PgConnection, timeout: Duration = ZeroDuration
+): Future[void] {.async.} =
+  ## Read into recvBuf. ``AsyncTimeoutError``: caller handles state; other errors
+  ## → ``csClosed`` + ``raiseTransportFailure``.
+  # An orphaned pump can revive here after a timeout or cancellation handler
+  # retired the connection; refuse a socket read on one we've given up on.
+  if conn.state == csClosed:
+    conn.raiseClosedConnection("fillRecvBuf: connection is closed (csClosed)")
+  conn.compactRecvBuf()
+  when hasChronos:
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + RecvBufSize)
+    var n: int
+    try:
+      n =
+        if timeout == ZeroDuration:
+          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
+        else:
+          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
+            timeout
+          )
+    except AsyncTimeoutError as e:
+      conn.recvBuf.setLen(oldLen)
+      raise e
+    except CancelledError as e:
+      # csClosed as for any other failure: the read may have consumed bytes, so
+      # the stream is no longer parseable. Only the exception type is preserved.
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      raise e
+    except CatchableError as e:
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      conn.raiseTransportFailure("fillRecvBuf", e)
+    if n == 0:
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      conn.raiseClosedConnection("Connection closed by server")
+    # An orphan read settling after csClosed must not re-extend the buffer.
+    if conn.state == csClosed:
+      conn.recvBuf.setLen(oldLen)
+      conn.raiseClosedConnection("fillRecvBuf: connection was closed during readOnce")
+    conn.recvBuf.setLen(oldLen + n)
+  elif hasAsyncDispatch:
+    # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
+    # into `recvBuf[oldLen..]` after we truncate. Safe because `recvMessage`, the
+    # only caller that passes a timeout, marks csClosed itself before any later
+    # read can be issued, and seq shrink keeps capacity.
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + RecvBufSize)
+    var n: int
+    try:
+      n =
+        if timeout == ZeroDuration:
+          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize)
+        else:
+          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize).wait(
+            timeout
+          )
+    except AsyncTimeoutError as e:
+      conn.recvBuf.setLen(oldLen)
+      raise e
+    except CancelledError as e:
+      # csClosed as for any other failure: the read may have consumed bytes, so
+      # the stream is no longer parseable. Only the exception type is preserved.
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      raise e
+    except CatchableError as e:
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      conn.raiseTransportFailure("fillRecvBuf", e)
+    if n == 0:
+      conn.recvBuf.setLen(oldLen)
+      conn.markClosed()
+      conn.raiseClosedConnection("Connection closed by server")
+    # An orphan `recvInto` settling after csClosed must not re-extend the buffer.
+    if conn.state == csClosed:
+      conn.recvBuf.setLen(oldLen)
+      conn.raiseClosedConnection("fillRecvBuf: connection was closed during recvInto")
+    conn.recvBuf.setLen(oldLen + n)
+
+when hasChronos:
+  proc fillRecvBufDetached*(conn: PgConnection): Future[void] {.async.} =
+    ## Read into scratch then append to ``recvBuf`` (keeps ``recvBuf`` parseable while pending); errors → ``csClosed``.
+    # Entrance guard, as in ``fillRecvBuf``: no fresh read on csClosed.
+    if conn.state == csClosed:
+      conn.raiseClosedConnection("fillRecvBufDetached: connection is closed (csClosed)")
+    if conn.replReadScratch.len < RecvBufSize:
+      conn.replReadScratch.setLen(RecvBufSize)
+    let n =
+      try:
+        await conn.reader.readOnce(addr conn.replReadScratch[0], RecvBufSize)
+      except CancelledError as e:
+        conn.markClosed()
+        raise e
+      except CatchableError as e:
+        conn.markClosed()
+        conn.raiseTransportFailure("fillRecvBufDetached", e)
+    if n == 0:
+      conn.markClosed()
+      conn.raiseClosedConnection("Connection closed by server")
+    # Exit guard: a read settling after the caller flipped csClosed must not
+    # re-extend recvBuf.
+    if conn.state == csClosed:
+      conn.raiseClosedConnection(
+        "fillRecvBufDetached: connection was closed during readOnce"
+      )
+    conn.compactRecvBuf()
+    let oldLen = conn.recvBuf.len
+    conn.recvBuf.setLen(oldLen + n)
+    copyMem(addr conn.recvBuf[oldLen], addr conn.replReadScratch[0], n)
+
+# Notification queue
+#
+# notifyQueue, its parked waiter and the handoff slot move together: a
+# completed waiter's notification is reserved in notifyHandoff (never left in
+# the capped queue) and must be claimed by the waiter that owns it. The
+# operations below are the only way in, so a half-delivered notification cannot
+# be observed from outside.
+
+func notifyEntryBytes(n: Notification): int64 {.inline.} =
+  n.channel.len.int64 + n.payload.len.int64
+
+proc noteNotifyDrop(conn: PgConnection, droppedNow: var int) {.inline, raises: [].} =
+  if conn.notifyDropped < high(int): # saturating; reset once reported
+    conn.notifyDropped = conn.notifyDropped + 1
+  droppedNow.inc
+
+proc dropOldestNotification(
+    conn: PgConnection, queuedBytes: var int64, droppedNow: var int
+) {.inline, raises: [].} =
+  let oldest = conn.notifyQueue.popFirst()
+  queuedBytes -= notifyEntryBytes(oldest)
+  if queuedBytes < 0:
+    queuedBytes = 0
+  conn.noteNotifyDrop(droppedNow)
+
+proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].} =
+  ## Enqueue under ``notifyMaxQueue`` and ``notifyMaxQueueBytes`` (either
+  ## ``<=0`` = unbounded). Overflow drops oldest; oversize is not queued.
+  ## Push ``onNotify`` still sees every arrival.
+  # Caps queued entries only: an outstanding handoff is already claimed.
+  var droppedNow = 0
+  let incoming = notifyEntryBytes(notif)
+  let maxN = conn.notifyMaxQueue
+  let maxB = conn.notifyMaxQueueBytes
+  var queuedBytes: int64 = 0
+  if maxB > 0:
+    for n in conn.notifyQueue:
+      queuedBytes += notifyEntryBytes(n)
+
+  # Trim a requeued overshoot before considering the arrival.
+  if maxN > 0 or maxB > 0:
+    while conn.notifyQueue.len > 0:
+      let countOver = maxN > 0 and conn.notifyQueue.len > maxN
+      let bytesOver = maxB > 0 and queuedBytes > maxB.int64
+      if not countOver and not bytesOver:
+        break
+      conn.dropOldestNotification(queuedBytes, droppedNow)
+
+  if maxB > 0 and incoming > maxB.int64:
+    conn.noteNotifyDrop(droppedNow)
+    # noteNotifyDrop always increments, so `droppedNow > 0` holds here.
+    if droppedNow > 0:
+      let overflow = conn.notifyOverflowCallback
+      if overflow != nil:
+        overflow(droppedNow)
+    return
+
+  while conn.notifyQueue.len > 0:
+    let countFull = maxN > 0 and conn.notifyQueue.len >= maxN
+    let bytesFull = maxB > 0 and queuedBytes + incoming > maxB.int64
+    if not countFull and not bytesFull:
+      break
+    conn.dropOldestNotification(queuedBytes, droppedNow)
+
+  conn.notifyQueue.addLast(notif)
+  if droppedNow > 0:
+    # Read once: the accessor is a call, and this path runs per NOTIFY.
+    let overflow = conn.notifyOverflowCallback
+    if overflow != nil:
+      overflow(droppedNow)
+
+proc requeueHandoff*(conn: PgConnection, notif: Notification) {.raises: [].} =
+  ## Requeue an unconsumed handoff at the front.
+  # Trims nothing, keeping the drop policy in one place: the queue may sit one
+  # over the cap until the next arrival's drop-oldest reaches this entry.
+  conn.notifyQueue.addFirst(notif)
+
+proc reclaimHandoff*(conn: PgConnection) {.raises: [].} =
+  ## Requeue a handoff whose waiter will never claim it, so an abandoned frame
+  ## cannot make the notification unreachable.
+  if conn.hasNotifyHandoff:
+    conn.hasNotifyHandoff = false
+    conn.requeueHandoff(move conn.notifyHandoff)
+
+func hasNotification*(conn: PgConnection): bool {.inline.} =
+  ## Whether the pull-API queue holds a notification (handoff slot excluded).
+  conn.notifyQueue.len > 0
+
+proc popNotification*(conn: PgConnection): Notification {.inline.} =
+  ## Take the oldest queued notification; caller checks ``hasNotification``.
+  conn.notifyQueue.popFirst()
+
+func hasNotifyWaiter*(conn: PgConnection): bool {.inline.} =
+  ## Whether a ``waitNotification`` is parked.
+  conn.notifyWaiter != nil
+
+proc registerNotifyWaiter*(conn: PgConnection, waiter: Future[void]) =
+  ## Park the single allowed waiter. A second would never be woken, so it is
+  ## rejected here rather than left to hang.
+  if conn.notifyWaiter != nil:
+    raise newException(PgStateError, "Another waitNotification is already active")
+  conn.notifyWaiter = waiter
+
+proc unregisterNotifyWaiter*(conn: PgConnection, waiter: Future[void]): bool =
+  ## Drop ``waiter``'s registration if it is still the parked one. False means
+  ## a later waiter owns the slot now; only the owner may claim the handoff.
+  if conn.notifyWaiter == waiter:
+    conn.notifyWaiter = nil
+    true
+  else:
+    false
+
+proc takeNotifyHandoff*(conn: PgConnection): Option[Notification] {.inline.} =
+  ## Claim the reserved handoff, if any. Only the registered waiter may call
+  ## this; the handoff is returned directly and never re-enters the capped
+  ## queue.
+  if conn.hasNotifyHandoff:
+    conn.hasNotifyHandoff = false
+    some(move conn.notifyHandoff)
+  else:
+    none(Notification)
+
+proc reclaimStaleNotifyWaiter*(conn: PgConnection) =
+  ## Drop a finished waiter's registration and put back its unclaimed handoff.
+  # A waiter that never resumes would otherwise strand the notification in
+  # ``notifyHandoff`` and block every later waiter.
+  if conn.notifyWaiter != nil and conn.notifyWaiter.finished:
+    conn.notifyWaiter = nil
+    conn.reclaimHandoff()
+
+proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
+  let notif = Notification(
+    pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
+  )
+  # Handed directly to an unresumed waiter: parking it in the shared queue
+  # instead would make it the first thing the overflow drop discards.
+  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
+    conn.notifyHandoff = notif
+    conn.hasNotifyHandoff = true
+    # asyncdispatch's `Future.complete` has inferred effect `Exception`
+    # via the callback chain; swallow it to keep this proc `raises: []`.
+    try:
+      conn.notifyWaiter.complete()
+    except Exception:
+      # The waiter will never resume, so nothing would ever move the handoff
+      # back: queue it here instead of losing it.
+      conn.hasNotifyHandoff = false
+      conn.notifyHandoff = Notification()
+      conn.enqueueNotification(notif)
+  else:
+    conn.enqueueNotification(notif)
+  let notifyCb = conn.notifyCallback
+  if notifyCb != nil:
+    notifyCb(notif)
+
+proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
+  let noticeCb = conn.noticeCallback
+  if noticeCb != nil:
+    noticeCb(Notice(fields: msg.noticeFields))
+
+# Replication write queue
+#
+# ``replWrites``, the drain task, the stop's final status and CopyDone, and the
+# stream flags are one cluster: what is still queued decides whether the
+# library may report a position at all, and the final status may only be
+# promoted once nothing can be queued behind it. ``pg_replication`` owns the
+# drain loop (it needs the wire); everything the queue means lives here.
+
+proc replClosedError*(conn: PgConnection, msg = "Connection is closed"): ref PgError =
+  ## ``raiseClosedConnection``'s error, or nil while open, keeping the
+  ## replication write that killed the connection as the cause.
+  case conn.closedReason
+  of crOpen:
+    nil
+  of crClosedByUser:
+    (ref PgStateError)(
+      msg: closedByUserMsg,
+      parent: newException(PgConnectionError, msg, conn.replWriteFailure),
+    )
+  of crClosed:
+    conn.newClosedError(msg, conn.replWriteFailure)
+
+proc replWriteError*(conn: PgConnection): ref CatchableError =
+  ## A fresh error per waiter of a write that did not make it: one raised
+  ## exception cannot be shared between futures.
+  result = conn.replClosedError()
+  if result == nil:
+    result = newException(
+      PgStateError, "the replication stream ended before this write",
+      conn.replWriteFailure,
+    )
+
+proc settleReplWrite*(conn: PgConnection, w: ReplWrite, ok: bool) =
+  w.state = if ok: rwWritten else: rwFailed
+  for fut in w.waiters:
+    if fut.finished: # the caller cancelled its wait
+      continue
+    if ok:
+      fut.complete()
+    else:
+      fut.fail(conn.replWriteError())
+  w.waiters.setLen(0)
+
+proc waitReplWrite*(w: ReplWrite): Future[void] =
+  result = newFuture[void]("replWrite")
+  w.waiters.add(result)
+
+proc failQueuedReplWrites*(conn: PgConnection) =
+  ## Fail every write not yet started. The one being written settles itself.
+  conn.replPendingStatus = nil
+  while conn.replWrites.len > 0:
+    conn.settleReplWrite(conn.replWrites.popFirst(), ok = false)
+  for w in [conn.replFinalStatus, conn.replCopyDone]:
+    if w != nil and w.state == rwQueued:
+      conn.settleReplWrite(w, ok = false)
+
+proc closeReplWrites*(conn: PgConnection) =
+  ## The stream is ending: accept no more writes and fail those not started.
+  conn.replWritesOpen = false
+  conn.failQueuedReplWrites()
+
+proc nextReplWrite*(conn: PgConnection): ReplWrite =
+  ## The queue in order, then the stop's final status and CopyDone, so nothing
+  ## queued before the final status is encoded can land after CopyDone. Taking
+  ## the library's status off the queue retires its pending mark, so the next
+  ## one queued is a fresh entry.
+  if conn.replWrites.len > 0:
+    result = conn.replWrites.popFirst()
+    if result == conn.replPendingStatus:
+      conn.replPendingStatus = nil
+    return
+  for w in [conn.replFinalStatus, conn.replCopyDone]:
+    if w != nil and w.state == rwQueued:
+      if w == conn.replFinalStatus and conn.replInCallback:
+        # The running callback may still confirm a position for it.
+        return nil
+      return w
+
+proc replQueueWrite*(conn: PgConnection, w: ReplWrite) {.inline.} =
+  ## Append a caller's write to the drain queue, in call order.
+  conn.replWrites.addLast(w)
+
+proc tailPendingReplStatus*(conn: PgConnection): ReplWrite =
+  ## The library's status still queued at the tail, or nil. It is encoded when
+  ## written, so it already carries anything newer and can stand for another.
+  let pending = conn.replPendingStatus
+  if pending != nil and conn.replWrites.peekLast == pending:
+    return pending
+
+proc queueReplStatus*(conn: PgConnection): ReplWrite =
+  ## Queue the library's status, or share the one at the tail.
+  result = conn.tailPendingReplStatus()
+  if result != nil:
+    return
+  result = ReplWrite()
+  conn.replWrites.addLast(result)
+  conn.replPendingStatus = result
+
+proc replCanStillReport*(conn: PgConnection): bool =
+  ## Whether a position recorded now still reaches the server: always before
+  ## the client's stop, then only until the stop's final status is encoded,
+  ## which waits for a running callback to return.
+  conn.replWritesOpen and
+    (conn.replCopyDone == nil or conn.replFinalStatus.state == rwQueued)
+
+proc confirmReplReportable*(conn: PgConnection, lsn: uint64): bool =
+  ## ``confirmReplFlushed`` while the position can still reach the server.
+  conn.replCanStillReport() and conn.confirmReplFlushed(lsn)
+
+proc replQueueStop*(conn: PgConnection): ReplWrite =
+  ## Queue the client's end of the stream — a last status, then CopyDone — and
+  ## return the CopyDone future's write. Once queued, a later stop waits on
+  ## that same CopyDone and shares its outcome.
+  let pending = conn.tailPendingReplStatus()
+  if pending != nil:
+    # A library status still queued at the tail becomes the final one.
+    discard conn.replWrites.popLast()
+    conn.replPendingStatus = nil
+    conn.replFinalStatus = pending
+  else:
+    conn.replFinalStatus = ReplWrite()
+  result = ReplWrite(frame: @copyDoneMsg)
+  conn.replCopyDone = result
+
+proc replResetStream*(conn: PgConnection, autoConfirm: bool, serverFlush: uint64) =
+  ## Reset the write cluster for a new stream, so a reused connection never
+  ## inherits a final status or a failure from the previous one.
+  conn.replFinalStatus = nil
+  conn.replWriteFailure = nil
+  conn.replPendingStatus = nil
+  conn.replCopyDone = nil
+  conn.replWritesOpen = true
+  conn.replAutoConfirm = autoConfirm
+  conn.replInTxn = false
+  conn.replInCallback = false
+  # What the server already holds, not the stream's start: autoConfirm reports
+  # anything above it, a start ahead of the slot included.
+  conn.replSentFlushRaw = serverFlush
+
+proc replEnterTxn*(conn: PgConnection) {.inline.} =
+  ## ``autoConfirm``: a pgoutput ``Begin`` was seen; a commit now waits for the
+  ## callback to process it.
+  conn.replInTxn = true
+
+proc replExitTxn*(conn: PgConnection) {.inline.} =
+  ## ``autoConfirm``: the commit is processed, so positions may be reported
+  ## again.
+  conn.replInTxn = false
+
+proc setReplInCallback*(conn: PgConnection, value: bool) {.inline.} =
+  ## Mark the stream's callback as running or returned; the stop's final status
+  ## waits for a true one to clear.
+  conn.replInCallback = value
+
+func replAutoConfirm*(conn: PgConnection): bool {.inline.} =
+  ## Whether the logical stream confirms progress itself.
+  conn.replAutoConfirm
+
+func replInTxn*(conn: PgConnection): bool {.inline.} =
+  ## ``autoConfirm``: between a pgoutput Begin and Commit.
+  conn.replInTxn
+
+func replInCallback*(conn: PgConnection): bool {.inline.} =
+  ## Whether the stream's callback is running.
+  conn.replInCallback
+
+func replWritesOpen*(conn: PgConnection): bool {.inline.} =
+  ## Whether the stream still accepts writes.
+  conn.replWritesOpen
+
+func replCopyDoneQueued*(conn: PgConnection): bool {.inline.} =
+  ## Whether the client's CopyDone has been queued.
+  conn.replCopyDone != nil
+
+func replCopyDone*(conn: PgConnection): ReplWrite {.inline.} =
+  ## The queued CopyDone write, or nil. Read-only: ``replQueueStop`` creates it.
+  conn.replCopyDone
+
+func replPendingStatusQueued*(conn: PgConnection): bool {.inline.} =
+  ## Whether a library status is queued and not yet encoded.
+  conn.replPendingStatus != nil
+
+func replStopStatusQueued*(conn: PgConnection): bool {.inline.} =
+  ## Whether the stop's final status is still waiting to be encoded.
+  conn.replFinalStatus != nil and conn.replFinalStatus.state == rwQueued and
+    conn.replWritesOpen
+
+func replWriteFailure*(conn: PgConnection): ref CatchableError {.inline.} =
+  ## The write failure that ended the stream, kept as the cause of later
+  ## errors.
+  conn.replWriteFailure
+
+proc noteReplWriteFailure*(conn: PgConnection, e: ref CatchableError) {.inline.} =
+  ## Latch the write failure that ended the stream.
+  conn.replWriteFailure = e
+
+func replSentFlush*(conn: PgConnection): uint64 {.inline.} =
+  ## Flush position of the library's last Standby Status Update (raw).
+  conn.replSentFlushRaw
+
+proc noteReplSentFlush*(conn: PgConnection, flush: uint64) {.inline.} =
+  ## Record the flush position the library's status is about to send.
+  conn.replSentFlushRaw = flush
+
+func replFlusher*(conn: PgConnection): Future[void] {.inline.} =
+  ## The task draining ``replWrites``, nil when idle. Read-only; a new drain
+  ## starts through ``replFlusherIdle`` + ``setReplFlusher`` so two tasks never
+  ## share the queue.
+  conn.replFlusher
+
+func replFlusherIdle*(conn: PgConnection): bool {.inline.} =
+  ## Whether a drain task may be started.
+  conn.replFlusher == nil or conn.replFlusher.finished
+
+proc setReplFlusher*(conn: PgConnection, fut: Future[void]) {.inline.} =
+  ## Adopt ``fut`` as the drain task; only valid right after
+  ## ``replFlusherIdle`` returned true.
+  conn.replFlusher = fut

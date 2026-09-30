@@ -1,10 +1,8 @@
-import std/[unittest, options, math, importutils, net, deques]
+import std/[unittest, options, importutils, deques]
 
 import
-  ../async_postgres/[
-    async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection,
-    pg_advisory_lock,
-  ]
+  ../async_postgres/
+    [async_backend, pg_types, pg_client, pg_pool, pg_connection, pg_advisory_lock]
 
 import e2e_common
 

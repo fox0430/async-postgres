@@ -318,7 +318,7 @@ suite "reconnectInPlace session state reset":
       # Seed the shape a typed advisoryLock + a partial send would leave.
       conn.heldSessionLocks = 3
       conn.sessionLockDirty = true
-      conn.sendBuf = @[byte 0xAA, 0xBB, 0xCC]
+      conn.addSync() # stale bytes from a partial send
       preHeld = conn.heldSessionLocks
       preDirty = conn.sessionLockDirty
       preSendLen = conn.sendBuf.len
@@ -341,7 +341,7 @@ suite "reconnectInPlace session state reset":
     # Sanity: seeding took effect (otherwise "reset to 0" proves nothing).
     check preHeld == 3
     check preDirty
-    check preSendLen == 3
+    check preSendLen > 0
     check finalHeld == 0
     check not finalDirty
     check finalSendLen == 0
@@ -641,6 +641,335 @@ suite "listenPump async ErrorResponse":
     check errored
     check reconnectionAttempted
     check finalState == csClosed
+
+proc dropAfterListen(ms: MockServer, pumpStarted: Future[void]) {.async.} =
+  ## Serve the first session's LISTEN, then drop it once the pump runs.
+  let sc = await acceptAndReady(ms)
+  discard await drainFrontendMessage(sc) # LISTEN "x"
+  await sendBytes(sc, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+  await pumpStarted
+  await closeClient(sc)
+
+suite "listen reconnect after a failed redial":
+  ## Regression: the retry loop ran inside the handler of the error that ended
+  ## the pump, and on Nim >= 2.2.6 a failed redial there crashed it (SIGSEGV).
+
+  test "a redial that loses the connection is followed by one that succeeds":
+    var passed = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      let pumpStarted = newFuture[void]("pumpStarted")
+      var sc3: MockClient
+
+      proc serverHandler() {.async.} =
+        await dropAfterListen(ms, pumpStarted)
+        # Takes the login, then drops the session under the re-LISTEN.
+        let sc2 = await acceptAndReady(ms)
+        await closeClient(sc2)
+        sc3 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc3)
+        await sendBytes(sc3, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.listenReconnectMaxAttempts = 3
+      conn.listenReconnectMaxBackoff = 1
+      var reconnected = false
+      conn.onReconnect(
+        proc() {.gcsafe, raises: [].} =
+          reconnected = true
+      )
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      var spins = 0
+      while not reconnected and spins < 3000:
+        inc spins
+        await sleepAsync(milliseconds(2))
+      doAssert reconnected
+      doAssert conn.state == csListening
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      if not sc3.isNil:
+        try:
+          await closeClient(sc3)
+        except CatchableError:
+          discard
+      await closeServer(ms)
+      passed = true
+
+    waitFor testBody()
+    check passed
+
+suite "listen reconnect gives up on a refusal":
+  test "a refused login ends an unlimited pump at once":
+    var passed = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      let pumpStarted = newFuture[void]("pumpStarted")
+      var redials = 0
+
+      proc serverHandler() {.async.} =
+        await dropAfterListen(ms, pumpStarted)
+        try:
+          while true:
+            let sc = await ms.accept()
+            inc redials
+            await drainStartupMessage(sc)
+            await sendBytes(
+              sc,
+              buildErrorResponse(
+                "28P01", "password authentication failed for user \"test\"", "FATAL"
+              ),
+            )
+            await closeClient(sc)
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      # No budget at all: only the classification can end the pump.
+      conn.listenReconnectMaxAttempts = 0
+      conn.listenReconnectMaxBackoff = 1
+      var cbErr: ref PgListenError
+      conn.onListenError(
+        proc(err: ref PgListenError) {.gcsafe, raises: [].} =
+          cbErr = err
+      )
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      var spins = 0
+      while cbErr == nil and spins < 2500:
+        inc spins
+        await sleepAsync(milliseconds(2))
+
+      doAssert cbErr != nil, "listen pump kept redialing a refused login"
+      doAssert "refusing this config" in cbErr.msg, cbErr.msg
+      doAssert "password authentication failed" in cbErr.msg, cbErr.msg
+      doAssert cbErr.reconnectionAttempted
+      doAssert cbErr.attempts.len == 1
+      doAssert not isTransientError(cbErr)
+      doAssert conn.state == csClosed
+      doAssert redials == 1, $redials
+      # Past the next backoff tick: another redial would have been counted.
+      await sleepAsync(milliseconds(1200))
+      doAssert redials == 1, $redials
+
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await closeServer(ms)
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      passed = true
+
+    waitFor testBody()
+    check passed
+
+  proc refuseEvery(ms: MockServer) {.async.} =
+    ## Answer every startup with a wrong-password refusal.
+    try:
+      while true:
+        let st = await ms.accept()
+        await drainStartupMessage(st)
+        await sendBytes(
+          st, buildErrorResponse("28P01", "password authentication failed", "FATAL")
+        )
+        await closeClient(st)
+    except CatchableError:
+      discard
+
+  proc redialKeepsRetrying(
+      reply: seq[byte], onReListen = false, refusingStandby = false
+  ) {.async.} =
+    ## The first redial gets `reply` to its startup (or, `onReListen`, to its
+    ## re-LISTEN) and is closed; the next one succeeds. `refusingStandby`: a
+    ## host listed ahead of it refuses every startup.
+    let ms = startMockServer()
+    let pumpStarted = newFuture[void]("pumpStarted")
+    var sc3: MockClient
+
+    proc serverHandler() {.async.} =
+      await dropAfterListen(ms, pumpStarted)
+      var sc2: MockClient
+      if onReListen:
+        sc2 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc2)
+      else:
+        sc2 = await ms.accept()
+        await drainStartupMessage(sc2)
+      await sendBytes(sc2, reply)
+      await closeClient(sc2)
+      sc3 = await acceptAndReady(ms)
+      discard await drainFrontendMessage(sc3)
+      await sendBytes(sc3, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+
+    let serverFut = serverHandler()
+    var cfg = mockConfig(ms.port)
+    var standby: MockServer
+    if refusingStandby:
+      standby = startMockServer()
+      discard refuseEvery(standby)
+      cfg.hosts = @[
+        HostEntry(host: "127.0.0.1", port: standby.port),
+        HostEntry(host: "127.0.0.1", port: ms.port),
+      ]
+    let conn = await connect(cfg)
+    conn.listenReconnectMaxAttempts = 3
+    conn.listenReconnectMaxBackoff = 1
+    var reconnected = false
+    var cbErr: ref PgListenError
+    conn.onReconnect(
+      proc() {.gcsafe, raises: [].} =
+        reconnected = true
+    )
+    conn.onListenError(
+      proc(err: ref PgListenError) {.gcsafe, raises: [].} =
+        cbErr = err
+    )
+    await conn.listen("x")
+    pumpStarted.complete()
+
+    var spins = 0
+    while not reconnected and cbErr == nil and spins < 3000:
+      inc spins
+      await sleepAsync(milliseconds(2))
+
+    doAssert cbErr == nil, "pump gave up: " & cbErr.msg
+    doAssert reconnected
+    doAssert conn.state == csListening
+
+    try:
+      await serverFut.wait(seconds(5))
+    except CatchableError:
+      discard
+    try:
+      await conn.close()
+    except CatchableError:
+      discard
+    if not sc3.isNil:
+      try:
+        await closeClient(sc3)
+      except CatchableError:
+        discard
+    await closeServer(ms)
+    if refusingStandby:
+      await closeServer(standby)
+
+  test "a redial that meets a protocol violation keeps retrying":
+    # 08P01 is a startup packet the server could not parse, not a refusal.
+    waitFor redialKeepsRetrying(
+      buildErrorResponse("08P01", "invalid startup packet layout", "FATAL")
+    )
+
+  test "a redial answered with an unlisted SQLSTATE keeps retrying":
+    # A proxy's answer while the server wakes up, not the config's fault.
+    waitFor redialKeepsRetrying(
+      buildErrorResponse("XX000", "Couldn't connect to compute node", "FATAL")
+    )
+
+  test "a redial one host refuses while another restarts keeps retrying":
+    # A refusal speaks for its own server: a standby that turns this password
+    # away does not stop the pump while the primary restarts.
+    waitFor redialKeepsRetrying(@[], refusingStandby = true)
+
+  test "a redial an LDAP outage answers keeps retrying":
+    # The server answers 28000 whether its LDAP server is down or the
+    # credentials are wrong.
+    waitFor redialKeepsRetrying(
+      buildErrorResponse("28000", "LDAP authentication failed for user", "FATAL")
+    )
+
+  test "a FATAL ending the redial's re-LISTEN is not a refusal":
+    # A listed SQLSTATE counts only as the startup's answer.
+    waitFor redialKeepsRetrying(
+      buildErrorResponse("42501", "terminating connection", "FATAL"), onReListen = true
+    )
+
+  test "a redial that reaches a server in recovery keeps retrying":
+    var passed = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      let pumpStarted = newFuture[void]("pumpStarted")
+      var sc3: MockClient
+
+      proc serverHandler() {.async.} =
+        await dropAfterListen(ms, pumpStarted)
+        # A standby mid-failover takes the login but refuses the re-LISTEN.
+        let sc2 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc2)
+        await sendBytes(
+          sc2,
+          buildErrorResponse("25006", "cannot execute LISTEN during recovery") &
+            buildReadyForQuery('I'),
+        )
+        # The promoted server takes both.
+        sc3 = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc3)
+        await sendBytes(sc3, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        try:
+          await closeClient(sc2)
+        except CatchableError:
+          discard
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      conn.listenReconnectMaxAttempts = 3
+      conn.listenReconnectMaxBackoff = 1
+      var reconnected = false
+      var cbErr: ref PgListenError
+      conn.onReconnect(
+        proc() {.gcsafe, raises: [].} =
+          reconnected = true
+      )
+      conn.onListenError(
+        proc(err: ref PgListenError) {.gcsafe, raises: [].} =
+          cbErr = err
+      )
+      await conn.listen("x")
+      pumpStarted.complete()
+
+      var spins = 0
+      while not reconnected and cbErr == nil and spins < 3000:
+        inc spins
+        await sleepAsync(milliseconds(2))
+
+      doAssert cbErr == nil, "pump gave up: " & cbErr.msg
+      doAssert reconnected
+      doAssert conn.state == csListening
+
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      if not sc3.isNil:
+        try:
+          await closeClient(sc3)
+        except CatchableError:
+          discard
+      await closeServer(ms)
+      passed = true
+
+    waitFor testBody()
+    check passed
 
 ## Regression: with the listen pump parked inside a blocking `connect()`,
 ## asyncdispatch `close()` must return bounded instead of hanging on `await

@@ -1,7 +1,6 @@
 import std/[unittest, importutils, strutils, tables]
 
 import ../async_postgres/[async_backend, pg_errors, pg_protocol]
-import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_replication {.all.}
 
@@ -31,8 +30,7 @@ suite "LSN":
 
   # IDENTIFY_SYSTEM / CREATE_REPLICATION_SLOT return the LSN as text. Like
   # parseTimelineId, parseLsn must convert a malformed value into PgTypeError
-  # (not leak a raw ValueError, including the one fromHex throws on non-hex
-  # halves) so callers stay under the single `except PgError` contract.
+  # so callers stay under the single `except PgError` contract.
   test "parseLsn invalid format":
     expect(PgTypeError):
       discard parseLsn("invalid")
@@ -46,8 +44,7 @@ suite "LSN":
       discard parseLsn("0/XYZ")
 
   test "parseLsn empty half rejected":
-    # fromHex[uint64]("") returns 0 without raising, so a half left blank
-    # would silently produce a valid-looking LSN. Reject explicitly.
+    # An empty half must not silently produce a zero LSN.
     expect(PgTypeError):
       discard parseLsn("/")
     expect(PgTypeError):
@@ -61,9 +58,17 @@ suite "LSN":
       discard parseLsn("100000000/0")
 
   test "parseLsn half wider than 64 bits":
-    # fromHex wraps modulo 2^64 past 16 hex digits instead of raising.
+    # An over-long half must fail instead of wrapping modulo 2^64.
     expect(PgTypeError):
       discard parseLsn("10000000000000000/0")
+
+  test "parseLsn rejects stdlib hex leniency":
+    # fromHex accepts underscores and 0x/#/0X prefixes, none of which the
+    # server emits. Each must raise instead of decoding to a wrong LSN.
+    for bad in ["1_0/0", "0/1_0", "0x10/0", "0/0x10", "#10/0", "0X10/0", "_/0", "0/_"]:
+      expect(PgTypeError):
+        discard parseLsn(bad)
+    check parseLsn("10/0").toUInt64 == 0x10_00000000'u64
 
   test "parseLsn zero-padded half longer than 16 characters still parses":
     # Leading zeros pad past 16 characters but the value is still in-range.
@@ -116,14 +121,27 @@ suite "CopyBothResponse parsing":
     body.add(0'u8) # text format
     body.addInt16(2'i16) # 2 columns
     body.addInt16(0'i16) # col 0: text
-    body.addInt16(1'i16) # col 1: binary
+    body.addInt16(0'i16) # col 1: text
     let raw = buildBackendMsg('W', body)
     var consumed: int
     let res = parseBackendMessage(raw, consumed)
     check res.state == psComplete
     check res.message.kind == bmkCopyBothResponse
     check res.message.copyFormat == cfText
-    check res.message.copyColumnFormats == @[0'i16, 1'i16]
+    check res.message.copyColumnFormats == @[0'i16, 0'i16]
+
+  test "a binary column inside a text-format CopyBothResponse is rejected":
+    # The protocol pins every per-column code to 0 when the overall format is
+    # text; accepting one would let a stream be read in the wrong format.
+    var body: seq[byte]
+    body.add(0'u8) # text format
+    body.addInt16(2'i16)
+    body.addInt16(0'i16)
+    body.addInt16(1'i16) # binary column in a text copy
+    let raw = buildBackendMsg('W', body)
+    var consumed: int
+    expect PgProtocolError:
+      discard parseBackendMessage(raw, consumed)
 
   test "parse CopyBothResponse binary format no columns":
     var body: seq[byte]
@@ -778,6 +796,12 @@ suite "checkReplicating during the close window":
     # Reaches the clamp instead of raising; nothing was received, so no advance.
     check not conn.confirmFlushed(parseLsn("0/1"))
 
+  test "confirmFlushed raises only PgError":
+    proc confirm(conn: PgConnection): bool {.raises: [PgError].} =
+      conn.confirmFlushed(parseLsn("0/1"))
+
+    check not confirm(mkReplConn(closedByUser = false))
+
   test "confirmedFlushLsn reports InvalidLsn inside the close window":
     check mkReplConn(closedByUser = true).confirmedFlushLsn == InvalidLsn
 
@@ -896,3 +920,101 @@ suite "decodeReadSlotRow":
     let qr = mkReadQr(["physical", "0/16B3740", "not-an-int"], 3)
     expect(PgTypeError):
       discard decodeReadSlotRow(qr, "my_phys")
+
+  test "negative restart_tli raises PgTypeError":
+    # Timeline ids are unsigned; the signed BiggestInt path used to accept "-5".
+    let qr = mkReadQr(["physical", "0/16B3740", "-5"], 3)
+    expect(PgTypeError):
+      discard decodeReadSlotRow(qr, "my_phys")
+
+  test "restart_tli out of int32 range raises PgTypeError":
+    let qr = mkReadQr(["physical", "0/16B3740", "2147483648"], 3)
+    expect(PgTypeError):
+      discard decodeReadSlotRow(qr, "my_phys")
+
+  test "restart_tli failures omit the input, reporting length only":
+    const badTli = "abcSECRET_RESTART_TLI"
+    let qr = mkReadQr(["physical", "0/16B3740", badTli], 3)
+    var msg = ""
+    try:
+      discard decodeReadSlotRow(qr, "my_phys")
+    except PgTypeError as e:
+      msg = e.msg
+    check msg ==
+      "READ_REPLICATION_SLOT returned a non-numeric timeline (len=" & $badTli.len & ")"
+    check "SECRET_RESTART_TLI" notin msg
+
+suite "startReplication / startPhysicalReplication preflight":
+  # These guards run before checkReady / wire I/O, so a closed stub connection
+  # is enough to exercise the ValueError paths without a mock server.
+  proc mkStubConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: csClosed,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "empty replication option key raises ValueError":
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect ValueError:
+      waitFor conn.startReplication(
+        "slot", InvalidLsn, options = @[("", "1")], callback = cb
+      )
+
+  test "non-ASCII replication option key raises ValueError":
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    for k in ["k\xff", "\xe9t\xe9"]:
+      expect ValueError:
+        waitFor conn.startReplication(
+          "slot", InvalidLsn, options = @[(k, "1")], callback = cb
+        )
+
+  test "negative physical timeline raises ValueError":
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect ValueError:
+      waitFor conn.startPhysicalReplication(
+        startLsn = Lsn(0x1000'u64), timeline = -1'i32, callback = cb
+      )
+
+  test "timeline 0 is allowed (omits TIMELINE clause; fails later on closed conn)":
+    # 0 means "omit TIMELINE"; validation must not raise ValueError for it.
+    # The stub is csClosed, so checkReady raises PgConnectionError next.
+    let conn = mkStubConn()
+    let cb = makeReplicationCallback:
+      discard
+    expect PgConnectionError:
+      waitFor conn.startPhysicalReplication(
+        startLsn = Lsn(0x1000'u64), timeline = 0'i32, callback = cb
+      )
+
+suite "parseReplicationMessage defense branches":
+  test "empty CopyData is rejected":
+    expect PgProtocolError:
+      discard parseReplicationMessage(@[])
+
+  test "truncated XLogData is rejected":
+    var payload: seq[byte]
+    payload.add(byte('w'))
+    payload.addInt64(1'i64)
+    # Fewer than the required 25 bytes (type + 3×int64).
+    expect PgProtocolError:
+      discard parseReplicationMessage(payload)
+
+  test "truncated PrimaryKeepalive is rejected":
+    var payload: seq[byte]
+    payload.add(byte('k'))
+    payload.addInt64(1'i64)
+    expect PgProtocolError:
+      discard parseReplicationMessage(payload)
+
+  test "unknown replication message type is rejected":
+    expect PgProtocolError:
+      discard parseReplicationMessage(@[byte('Z')])

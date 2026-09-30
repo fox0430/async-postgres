@@ -329,6 +329,34 @@ suite "Advisory Lock: withAdvisoryLock template":
 
     waitFor t()
 
+  test "advisory lock scopes accept a positional argument after a named one":
+    # As for the lock procs, the positional argument fills the parameter at its
+    # own position.
+    proc t() {.async.} =
+      let holder = await connect(plainConfig())
+      let probe = await connect(plainConfig())
+      defer:
+        await holder.close()
+        await probe.close()
+      holder.withAdvisoryLock(`key` = 50023'i64, seconds(5)):
+        let held = await probe.advisoryTryLock(50023'i64)
+        doAssert not held
+      holder.withAdvisoryLockShared(key1 = 21'i32, 22'i32):
+        let held = await probe.advisoryTryLock(21'i32, 22'i32)
+        doAssert not held
+      holder.withTransaction:
+        holder.withAdvisoryLockXact(key = 50024'i64, seconds(5)):
+          let xactHeld = await probe.advisoryTryLock(50024'i64)
+          doAssert not xactHeld
+        holder.withAdvisoryLockXactShared(key1 = 23'i32, 24'i32, seconds(5)):
+          let xactSharedHeld = await probe.advisoryTryLock(23'i32, 24'i32)
+          doAssert not xactSharedHeld
+      let released = await probe.advisoryTryLock(50023'i64)
+      doAssert released
+      discard await probe.advisoryUnlock(50023'i64)
+
+    waitFor t()
+
   test "withAdvisoryLock releases on exception":
     proc t() {.async.} =
       let conn1 = await connect(plainConfig())
@@ -402,6 +430,241 @@ suite "Advisory Lock: withAdvisoryLock template":
       # The unlock attempt fails because the connection is closed, but the
       # original body Defect must still propagate raw.
       doAssert bodyMsg == "original body defect"
+
+    waitFor t()
+
+suite "Advisory Lock: withAdvisoryLock body escape":
+  # Body `return` / `break` / `continue` would skip the unlock and hold the
+  # session lock until the connection closes.
+  test "withAdvisoryLock rejects return at compile time":
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(50020'i64):
+            discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(50020'i64):
+            return
+
+    )
+
+  test "withAdvisoryLock with timeout rejects return at compile time":
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(50020'i64, seconds(1)):
+            discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(50020'i64, seconds(1)):
+            return
+
+    )
+
+  test "withAdvisoryLock two-key rejects break escaping at compile time":
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withAdvisoryLock(1'i32, 2'i32):
+              discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withAdvisoryLock(1'i32, 2'i32):
+              break
+
+    )
+
+  test "withAdvisoryLockShared rejects continue escaping at compile time":
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withAdvisoryLockShared(50020'i64):
+              discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withAdvisoryLockShared(50020'i64):
+              continue
+
+    )
+
+  test "withAdvisoryLockShared rejects return hidden inside a template":
+    # A `return` inside a template called from the body is invisible to the
+    # unexpanded walk; the typed re-check must still reject it.
+    template lockBailOutTemplate(): untyped =
+      return
+
+    template lockNoopTemplate(): untyped =
+      discard
+
+    # Control: the same snippet without the escape compiles.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLockShared(1'i32, 2'i32, seconds(1)):
+            lockNoopTemplate()
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLockShared(1'i32, 2'i32, seconds(1)):
+            lockBailOutTemplate()
+
+    )
+
+  test "advisory lock scopes accept a variable of a type declared in the body":
+    # Regression: splicing the type-checked body back in, or type-checking it
+    # as the `timeout` / `key2` argument of a longer overload, rejected a
+    # variable of a body-local type as a reintroduced symbol.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(50022'i64):
+            type LockLocal = object
+              a: int
+
+            let v = LockLocal(a: 1)
+            doAssert v.a == 1
+          conn.withAdvisoryLock(1'i32, 2'i32):
+            type LockLocal2 = enum
+              llA
+
+            var e = llA
+            discard e
+          conn.withAdvisoryLock(50022'i64, seconds(5)):
+            type LockLocal3 = object
+            discard LockLocal3()
+          conn.withAdvisoryLockShared(50022'i64):
+            type SharedLocal = object
+            discard SharedLocal()
+          conn.withAdvisoryLockShared(1'i32, 2'i32):
+            type SharedLocal2 = object
+            discard SharedLocal2()
+          conn.withTransaction:
+            conn.withAdvisoryLockXact(50022'i64):
+              type XactLocal = object
+              discard XactLocal()
+            conn.withAdvisoryLockXact(1'i32, 2'i32):
+              type XactLocal2 = object
+              discard XactLocal2()
+            conn.withAdvisoryLockXactShared(50022'i64):
+              type XactSharedLocal = object
+              discard XactSharedLocal()
+            conn.withAdvisoryLockXactShared(1'i32, 2'i32, seconds(5)):
+              type XactSharedLocal2 = object
+              discard XactSharedLocal2()
+
+    )
+
+  test "advisory lock scopes reject an argument list they don't accept":
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(1'i32, 2'i32, seconds(5), 4):
+            discard
+
+    )
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(1'i64, "2"):
+            discard
+
+    )
+    # The positional argument lands on `timeout`, already given by name.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withAdvisoryLock(timeout = seconds(5), 1'i64):
+            discard
+
+    )
+
+  test "withAdvisoryLock rejects break passed to a template":
+    # The unexpanded walk can't see the loop a template wraps around its
+    # argument, so it rejects a `break`/`continue` passed to one even when that
+    # loop would capture it. The check errs on the side of rejecting.
+    template lockEachN(n: int, body: untyped) =
+      var i = 0
+      while i < n:
+        inc i
+        body
+
+    template lockTwice(body: untyped) =
+      body
+      body
+
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withAdvisoryLock(50021'i64):
+              lockEachN(3):
+                break
+
+    )
+    # Without a loop of its own, the template leaves `break` bound to the
+    # caller's loop, skipping the unlock.
+    doAssert not compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withAdvisoryLock(50021'i64):
+              lockTwice:
+                break
+
+    )
+
+  test "withAdvisoryLock allows a loop contained in the body":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      var n = 0
+      conn.withAdvisoryLock(50021'i64):
+        for i in 0 ..< 5:
+          if i == 3:
+            break
+          n.inc
+      doAssert n == 3
+      doAssert conn.heldSessionLocks == 0
 
     waitFor t()
 

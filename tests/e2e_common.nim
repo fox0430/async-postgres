@@ -3,6 +3,7 @@
 
 import std/os
 
+import cert_fixtures
 import ../async_postgres/pg_connection
 
 const
@@ -33,9 +34,13 @@ proc sslConfig*(mode: SslMode = sslRequire): ConnConfig =
   )
 
 proc loadCaCert*(): string =
+  doAssert ensureTestCerts(),
+    "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
   let certsDir = currentSourcePath().parentDir / "certs"
   readFile(certsDir / "ca.crt")
 
 proc loadWrongCaCert*(): string =
+  doAssert ensureTestCerts(),
+    "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
   let certsDir = currentSourcePath().parentDir / "certs"
   readFile(certsDir / "wrong_ca.crt")

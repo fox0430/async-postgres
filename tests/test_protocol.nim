@@ -1,7 +1,6 @@
 import std/[unittest, options, strutils, tables, deques, importutils]
 
-import
-  ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_connection, pg_errors]
+import ../async_postgres/[async_backend, pg_bytes, pg_protocol, pg_errors]
 import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/notify
 import ../async_postgres/pg_connection/simple_query
@@ -885,6 +884,194 @@ suite "Backend decoding":
     check res.message.kind == bmkCopyOutResponse
     check res.message.copyFormat == cfBinary
 
+  test "CopyInResponse rejects unknown overall format":
+    var body: seq[byte] = @[]
+    body.add(2'u8) # neither text(0) nor binary(1)
+    body.addInt16(1)
+    body.addInt16(0)
+    var buf = buildMsg('G', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "CopyInResponse rejects an unknown per-column format":
+    var body: seq[byte] = @[]
+    body.add(1'u8) # binary
+    body.addInt16(1)
+    body.addInt16(2) # neither text(0) nor binary(1)
+    var buf = buildMsg('G', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "CopyInResponse rejects a binary column inside a text-format copy":
+    var body: seq[byte] = @[]
+    body.add(0'u8) # text
+    body.addInt16(2)
+    body.addInt16(0)
+    body.addInt16(1)
+    var buf = buildMsg('G', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "CopyOutResponse rejects trailing bytes after the format array":
+    var body: seq[byte] = @[]
+    body.add(1'u8) # binary
+    body.addInt16(1)
+    body.addInt16(1)
+    body.add(0'u8) # one byte past the declared column count
+    var buf = buildMsg('H', body)
+    expect PgProtocolError:
+      discard parseBackendMessage(buf)
+
+  test "zero-payload responses reject trailing bytes":
+    for (msgType, _) in [
+      ('1', "ParseComplete"),
+      ('2', "BindComplete"),
+      ('3', "CloseComplete"),
+      ('I', "EmptyQueryResponse"),
+      ('n', "NoData"),
+      ('s', "PortalSuspended"),
+      ('c', "CopyDone"),
+    ]:
+      var buf = buildMsg(msgType, @[0x99'u8])
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+
+  test "shaped parsers reject trailing bytes":
+    # AuthenticationOk (int32 0) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationCleartextPassword (int32 3) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(3)
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationMD5Password (int32 5 + 4-byte salt) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(5)
+      body.add(@[0xDE'u8, 0xAD, 0xBE, 0xEF])
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationSASL (single mechanism) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(10)
+      body.addCString("SCRAM-SHA-256")
+      body.add(0'u8) # terminator
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # AuthenticationSASL (multiple mechanisms) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(10)
+      body.addCString("SCRAM-SHA-256")
+      body.addCString("SCRAM-SHA-512")
+      body.add(0'u8) # terminator
+      body.add(0x99'u8)
+      var buf = buildMsg('R', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # BackendKeyData (8 bytes) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(1)
+      body.addInt32(2)
+      body.add(0x99'u8)
+      var buf = buildMsg('K', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # CommandComplete + junk after the tag NUL
+    block:
+      var body: seq[byte] = @[]
+      body.addCString("SELECT 1")
+      body.add(0x99'u8)
+      var buf = buildMsg('C', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ReadyForQuery + junk
+    block:
+      var buf = buildMsg('Z', @[byte('I'), 0x99'u8])
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ParameterStatus + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addCString("client_encoding")
+      body.addCString("UTF8")
+      body.add(0x99'u8)
+      var buf = buildMsg('S', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # RowDescription (0 fields) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt16(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('T', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # DataRow (0 cols) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt16(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('D', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ParameterDescription (0 params) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt16(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('t', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # ErrorResponse after terminator + junk
+    block:
+      var body: seq[byte] = @[]
+      body.add(byte('S'))
+      body.addCString("ERROR")
+      body.add(byte('C'))
+      body.addCString("XX000")
+      body.add(byte('M'))
+      body.addCString("boom")
+      body.add(0'u8) # field terminator
+      body.add(0x99'u8)
+      var buf = buildMsg('E', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # NotificationResponse + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(42)
+      body.addCString("chan")
+      body.addCString("payload")
+      body.add(0x99'u8)
+      var buf = buildMsg('A', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+    # NegotiateProtocolVersion (0 options) + junk
+    block:
+      var body: seq[byte] = @[]
+      body.addInt32(0)
+      body.addInt32(0)
+      body.add(0x99'u8)
+      var buf = buildMsg('v', body)
+      expect PgProtocolError:
+        discard parseBackendMessage(buf)
+
   test "CopyData":
     var buf = buildMsg('d', @[1'u8, 2, 3])
     let res = parseBackendMessage(buf)
@@ -1155,6 +1342,7 @@ suite "newPgQueryError":
     check errWithState(SqlStateSerializationFailure).isSerializationFailure
     check errWithState(SqlStateDeadlockDetected).isDeadlockDetected
     check errWithState(SqlStateQueryCanceled).isQueryCanceled
+    check errWithState(SqlStateDuplicateObject).isDuplicateObject
     check not errWithState("42P01").isUniqueViolation
     check not errWithState("42P01").isIntegrityConstraintViolation
     check not errWithState("").isIntegrityConstraintViolation
@@ -1496,6 +1684,16 @@ suite "Frontend encoding - edge cases":
     check msg[0] == byte('f')
     check decodeInt32(msg, 1) == int32(msg.len - 1)
 
+suite "receive buffer accessors":
+  test "consumeRecv advances the read pointer by exactly its count":
+    let conn = PgConnection(recvBuf: @[1'u8, 2, 3, 4], recvBufStart: 1)
+    check conn.recvBufLen() == 3
+    conn.consumeRecv(2)
+    check conn.recvBufStart == 3
+    check conn.recvBufLen() == 1
+    conn.consumeRecv(1)
+    check conn.recvBufLen() == 0
+
 suite "nextMessage recvBufStart update":
   proc buildMsg(msgType: char, body: seq[byte]): seq[byte] =
     result = @[byte(msgType)]
@@ -1682,7 +1880,7 @@ suite "nextMessage onRow requires onRowError":
     conn.recvBuf = buildDataRowMsg(["hello"])
     conn.recvBufStart = 0
     var rd = newRowData(1)
-    let cb: RowCallback = proc(row: Row) {.gcsafe, raises: [CatchableError].} =
+    let cb: RowCallback = proc(row: Row) {.gcsafe, raises: [].} =
       discard
     expect PgProtocolError:
       discard conn.nextMessage(rd, onRow = cb)
@@ -1810,6 +2008,38 @@ suite "nextMessage ParameterStatus bounds":
     check not conn.serverParams.hasKey("n")
     check conn.serverParamsBytes == MaxServerParamsBytes - 1
 
+  test "client_encoding other than UTF8 closes the connection":
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("client_encoding", "UTF8") & buildReadyForQuery()
+    check conn.nextMessage().isSome
+    check conn.state == csReady
+    conn.recvBufStart = 0
+    conn.recvBuf = buildParameterStatusMsg("client_encoding", "SJIS")
+    expect PgProtocolError:
+      discard conn.nextMessage()
+    check conn.state == csClosed
+    check conn.serverParams["client_encoding"] == "SJIS"
+
+  test "oversized client_encoding hits the byte cap before being quoted":
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("client_encoding", 'x'.repeat(MaxServerParamsBytes))
+    try:
+      discard conn.nextMessage()
+      fail()
+    except PgProtocolError as e:
+      check "byte total" in e.msg
+    check conn.state == csClosed
+
+  test "client_encoding accepts other UTF8 spellings":
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("client_encoding", "UNICODE") & buildReadyForQuery()
+    check conn.nextMessage().isSome
+    check conn.state == csReady
+    check conn.serverParams["client_encoding"] == "UNICODE"
+
   test "value at the byte cap is accepted":
     var conn = mockConn()
     # Leave exactly 3 bytes of room, then store name "ab" + value "c".
@@ -1894,6 +2124,112 @@ suite "enqueueNotification with an outstanding handoff":
     check conn.notifyQueue[0].payload == "2" # oldest went, arrival stayed
     check conn.notifyQueue[1].payload == "new"
     check conn.notifyDropped == 1
+
+suite "enqueueNotification byte cap":
+  ## Dual of the count cap: drop-oldest on ``channel.len + payload.len``;
+  ## oversize is refused rather than wiping the backlog.
+  proc byteConn(maxBytes: int, maxQueue = 1024): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      state: csListening,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+      notifyQueue: initDeque[Notification](),
+      notifyMaxQueue: maxQueue,
+      notifyMaxQueueBytes: maxBytes,
+      config: ConnConfig(),
+    )
+
+  proc n(payload: string, channel = "ch"): Notification =
+    Notification(pid: 1, channel: channel, payload: payload)
+
+  test "drop-oldest when queued channel+payload exceeds the byte cap":
+    let conn = byteConn(maxBytes = 10, maxQueue = 100)
+    conn.enqueueNotification(n("12345")) # "ch"+5 = 7
+    conn.enqueueNotification(n("67890")) # 7+7 > 10, drop first
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "67890"
+    check conn.notifyDropped == 1
+
+  test "a single notification larger than the byte cap is not queued":
+    let conn = byteConn(maxBytes = 10)
+    conn.enqueueNotification(n("tiny")) # 2+4 = 6, kept
+    var reported = -1
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(n("1234567890")) # 2+10 = 12 > 10, drop incoming
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "tiny"
+    check conn.notifyDropped == 1
+    check reported == 1
+
+  test "an oversized requeue is trimmed on the next arrival":
+    let conn = byteConn(maxBytes = 10)
+    conn.enqueueNotification(n("ok")) # 2+2 = 4
+    conn.requeueHandoff(n("1234567890")) # 12, no trim
+    check conn.notifyQueue.len == 2
+    check conn.notifyDropped == 0
+    conn.enqueueNotification(n("x")) # 3; overshoot 12 is dropped first
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "ok"
+    check conn.notifyQueue[1].payload == "x"
+    check conn.notifyDropped == 1
+
+  test "an oversized arrival still trims an overshot backlog and reports both":
+    let conn = byteConn(maxBytes = 10)
+    conn.enqueueNotification(n("tiny")) # 2+4 = 6
+    conn.requeueHandoff(n("1234567890")) # 2+10 = 12, no trim; at the front
+    check conn.notifyQueue.len == 2
+    var reported = -1
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(n("1234567890")) # 12 > 10, refused; overshoot trimmed first
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "tiny"
+    check conn.notifyDropped == 2
+    check reported == 2
+
+  test "byte cap <= 0 is unbounded while the count cap still binds":
+    let conn = byteConn(maxBytes = 0, maxQueue = 2)
+    conn.enqueueNotification(n("1"))
+    conn.enqueueNotification(n("2"))
+    conn.enqueueNotification(n("3"))
+    check conn.notifyQueue.len == 2
+    check conn.notifyQueue[0].payload == "2"
+    check conn.notifyQueue[1].payload == "3"
+    check conn.notifyDropped == 1
+
+  test "count cap <= 0 is unbounded while the byte cap still binds":
+    let conn = byteConn(maxBytes = 10, maxQueue = 0)
+    conn.enqueueNotification(n("12345"))
+    conn.enqueueNotification(n("67890"))
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "67890"
+    check conn.notifyDropped == 1
+
+  test "a lowered byte cap is trimmed down on the next arrival":
+    let conn = byteConn(maxBytes = 100, maxQueue = 100)
+    conn.enqueueNotification(n("12345"))
+    conn.enqueueNotification(n("67890"))
+    check conn.notifyQueue.len == 2
+    conn.notifyMaxQueueBytes = 10
+    var reported = -1
+    conn.onNotifyOverflow proc(dropped: int) {.gcsafe, raises: [].} =
+      reported = dropped
+    conn.enqueueNotification(n("12345")) # 7; both 7-byte entries must go
+    check reported == 2
+    check conn.notifyQueue.len == 1
+    check conn.notifyQueue[0].payload == "12345"
+    check conn.notifyDropped == 2
+
+  test "an outstanding handoff is not charged against the byte cap":
+    let conn = byteConn(maxBytes = 7, maxQueue = 100)
+    conn.hasNotifyHandoff = true
+    conn.notifyHandoff = n("ABCDE") # 2+5 = 7 outstanding, must not count
+    conn.enqueueNotification(n("12345")) # 7, fills the cap by itself
+    check conn.notifyQueue.len == 1
+    check conn.notifyDropped == 0
 
 suite "waitNotification defensive branch":
   proc mockNotifyConn(): PgConnection =
@@ -2621,6 +2957,74 @@ suite "What a send leaves the backend owing":
     wide.add(newSeq[byte](19))
     check outstandingReplies(wide) == (5, true)
 
+suite "Connection-level send-buffer builders equal the buffer-level builders":
+  ## The `conn.addX` overloads must forward every argument to the buffer-level
+  ## builders: a dropped default or a swapped overload would only surface on a
+  ## live connection. Each test builds the same bytes both ways and compares.
+  proc mockConn(): PgConnection =
+    PgConnection(
+      recvBuf: @[],
+      recvBufStart: 0,
+      state: csReady,
+      txStatus: tsIdle,
+      serverParams: initTable[string, string](),
+      createdAt: Moment.now(),
+    )
+
+  test "addParse/addBind/addDescribe/addExecute/addClose/addSync/addFlush forward":
+    var buf: seq[byte]
+    buf.addParse("s1", "SELECT $1, $2", [OidInt4, OidText])
+    buf.addBind("", "s1", [1'i16, 0'i16], [some(@[1'u8]), none(seq[byte])], [1'i16])
+    buf.addDescribe(dkStatement, "s1")
+    buf.addExecute("", 5)
+    buf.addClose(dkPortal, "")
+    buf.addSync()
+    buf.addFlush()
+
+    var conn = mockConn()
+    conn.addParse("s1", "SELECT $1, $2", [OidInt4, OidText])
+    conn.addBind("", "s1", [1'i16, 0'i16], [some(@[1'u8]), none(seq[byte])], [1'i16])
+    conn.addDescribe(dkStatement, "s1")
+    conn.addExecute("", 5)
+    conn.addClose(dkPortal, "")
+    conn.addSync()
+    conn.addFlush()
+    check conn.sendBuf == buf
+
+  test "the PgParam overloads forward OIDs, formats, and values":
+    let params = [
+      PgParam(oid: OidInt4, format: 1, value: some(@[0'u8, 0, 0, 7])),
+      PgParam(oid: OidText, format: 0, value: none(seq[byte])),
+    ]
+    var buf: seq[byte]
+    buf.addParse("s2", "SELECT $1, $2", params)
+    buf.addBind("", "s2", params, [1'i16])
+
+    var conn = mockConn()
+    conn.addParse("s2", "SELECT $1, $2", params)
+    conn.addBind("", "s2", params, [1'i16])
+    check conn.sendBuf == buf
+
+  test "addBindRaw forwards bytes, ranges, and formats":
+    let data = @[1'u8, 2, 3, 4]
+    let ranges = @[(off: int32(0), len: int32(2)), (off: int32(2), len: int32(2))]
+    var buf: seq[byte]
+    buf.addBindRaw("", "s3", [1'i16, 1'i16], data, ranges, [])
+
+    var conn = mockConn()
+    conn.addBindRaw("", "s3", [1'i16, 1'i16], data, ranges, [])
+    check conn.sendBuf == buf
+
+  test "addParseDirect/addBindDirect forward the argument list":
+    var buf: seq[byte]
+    buf.addParseDirect("myStmt", "SELECT $1, $2", 1'i32, "x")
+    buf.addBindDirect("p", "myStmt", @[0'i16], 1'i32, "abc")
+
+    var conn = mockConn()
+    conn.addParseDirect("myStmt", "SELECT $1, $2", 1'i32, "x")
+    conn.addBindDirect("p", "myStmt", @[0'i16], 1'i32, "abc")
+    check conn.sendBuf == buf
+
 suite "Retiring a connection on the replies it still owes":
   proc pipelinedConn(pending: int, unsynced = false): PgConnection =
     PgConnection(
@@ -2700,7 +3104,7 @@ suite "Retiring a connection on the replies it still owes":
     ## connection.
     let conn = pipelinedConn(2, unsynced = true)
     conn.recvBuf = readyForQuery
-    conn.sendBuf = encodeSync()
+    conn.addSync()
     conn.resetWireState()
     check conn.wireSettled
     check conn.recvBuf.len == 0
@@ -2764,3 +3168,45 @@ when defined(pgStateChecks):
       conn.stagedStmtCloses = @["_sc_1"]
       conn.checkReady()
       check conn.stagedStmtCloses == @["_sc_1"]
+
+suite "buildResultFormats":
+  test "marks binary-safe OIDs as format 1 and others as 0":
+    let fields = @[
+      FieldDescription(name: "i", typeOid: OidInt4, formatCode: 0),
+      FieldDescription(name: "t", typeOid: OidText, formatCode: 0),
+      FieldDescription(name: "b", typeOid: OidBool, formatCode: 0),
+      FieldDescription(name: "u", typeOid: 999999'i32, formatCode: 0),
+    ]
+    let fmts = buildResultFormats(fields)
+    check fmts == @[1'i16, 1'i16, 1'i16, 0'i16]
+    check isBinarySafeOid(OidInt4)
+    check isBinarySafeOid(OidText)
+    check isBinarySafeOid(OidBool)
+    check not isBinarySafeOid(-1)
+    check not isBinarySafeOid(999999'i32)
+
+  test "empty fields yields empty formats":
+    check buildResultFormats(@[]).len == 0
+
+suite "patchMsgLenAtomic":
+  test "patches length and leaves a valid frontend frame":
+    var buf: seq[byte]
+    let start = buf.len
+    buf.add(byte('Q'))
+    buf.addInt32(0) # placeholder length
+    buf.add(@[byte('S'), byte('E'), byte('L'), 0'u8])
+    buf.patchMsgLenAtomic(start)
+    check buf[0] == byte('Q')
+    check fromBE32(buf, 1) == int32(buf.len - 1)
+
+  test "out-of-range msgStart truncates back to msgStart before raising":
+    var buf = @[1'u8, 2, 3, 4, 5]
+    expect PgProtocolError:
+      buf.patchMsgLenAtomic(3) # 3+4 >= 5
+    check buf == @[1'u8, 2, 3]
+
+  test "negative msgStart raises without truncating":
+    var buf = @[1'u8, 2, 3, 4, 5]
+    expect PgProtocolError:
+      buf.patchMsgLenAtomic(-1)
+    check buf == @[1'u8, 2, 3, 4, 5]

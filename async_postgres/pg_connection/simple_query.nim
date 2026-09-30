@@ -1,23 +1,17 @@
 ## Simple Query Protocol: ``simpleQuery``/``simpleExec``/``ping``, ``checkReady``,
 ## cancel helpers (``cancel``/``invalidateOnTimeout``), ``checkSessionAttrs``,
-## ``quoteIdentifier``, and ``quoteLiteral``. Layer between ``buffer_io`` and
-## ``lifecycle``.
+## ``quoteIdentifier``, and ``quoteLiteral``. Layer between ``buffer_io``/``ssl``
+## and ``lifecycle``.
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[options, strutils, tables]
 
 import ../[async_backend, pg_errors, pg_protocol, pg_types]
-import types, buffer_io
+import types, buffer_io, ssl
 
 when hasAsyncDispatch:
   import std/asyncnet
-  from std/nativesockets import Domain, SockType, Protocol
-
-import std/importutils
-privateAccess(PgConnection)
 
 # QueryResult helpers
 
@@ -84,6 +78,9 @@ proc checkTxIdle*(conn: PgConnection) =
 
 proc quoteIdentifier*(s: string): string =
   ## Quote a SQL identifier (e.g. table/channel name) with double quotes, escaping embedded quotes.
+  ## Raises ``ValueError`` for an embedded NUL byte (same as ``quoteLiteral``).
+  if '\0' in s:
+    raise newException(ValueError, "SQL identifier contains a NUL byte")
   "\"" & s.replace("\"", "\"\"") & "\""
 
 proc quoteLiteral*(s: string): string =
@@ -96,10 +93,10 @@ proc quoteLiteral*(s: string): string =
   ## concatenated directly after an identifier or numeric constant cannot merge
   ## into it (``LIKE`` & ``E'a\\b'`` would otherwise lex as ``likee``).
   ##
-  ## Assumes an ASCII-compatible ``client_encoding``: bytes are scanned
-  ## individually, so under a client encoding whose multi-byte trail bytes may
-  ## be ``0x5C`` (SJIS, BIG5, GBK, UHC) an embedded character can be mistaken
-  ## for a backslash.
+  ## Bytes are scanned individually, which relies on the pinned UTF8
+  ## ``client_encoding``. A switch is only detected after the fact, so do not
+  ## send a ``SET client_encoding`` in the same query or pipeline: under SJIS,
+  ## BIG5, GBK or UHC a trail byte ``0x5C`` would be read as a backslash.
   ##
   ## Raises ``ValueError`` for an embedded NUL byte: the wire protocol
   ## terminates the query string there, so it cannot be represented.
@@ -169,55 +166,125 @@ proc simpleExecImpl(conn: PgConnection, sql: string): Future[string] {.async.} =
 
 # Cancellation (out-of-band CancelRequest over a separate socket)
 
-proc cancel*(conn: PgConnection): Future[void] {.async.} =
-  ## Send a CancelRequest over a separate connection to abort the running query.
-  let isUnix = isUnixSocket(conn.host)
+proc sendCancelRequest(side: PgConnection, msg: seq[byte]) {.async.} =
+  ## Write ``msg`` on the cancel connection ``side``.
   when hasChronos:
-    let transport =
-      if isUnix:
-        when defined(posix):
-          await connect(initTAddress(unixSocketPath(conn.host, conn.port)))
-        else:
-          raise newException(
-            PgConnectionError, "Unix sockets are not supported on this platform"
-          )
-      else:
-        let addresses = resolveTAddress(conn.host, Port(conn.port))
-        if addresses.len == 0:
-          raise newException(PgConnectionError, "Could not resolve host: " & conn.host)
-        await connect(addresses[0])
-    try:
-      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
-      discard await transport.write(msg)
-    finally:
-      await transport.closeWait()
+    if side.sslEnabled:
+      try:
+        await side.writer.write(msg)
+      except AsyncStreamError as e:
+        raise newException(PgUnavailableError, "CancelRequest not sent: " & e.msg, e)
+    else:
+      var sent = 0
+      try:
+        sent = await side.transport.write(msg)
+      except TransportError as e:
+        raise socketError(e)
+      if sent < msg.len:
+        # chronos reports a peer's reset as a short write, not an error.
+        raise newException(
+          PgUnavailableError, "CancelRequest not sent: connection reset by peer"
+        )
   elif hasAsyncDispatch:
-    let sock =
-      if isUnix:
-        when defined(posix):
-          newAsyncSocket(
-            Domain.AF_UNIX, SockType.SOCK_STREAM, Protocol.IPPROTO_IP, buffered = false
-          )
-        else:
-          raise newException(
-            PgConnectionError, "Unix sockets are not supported on this platform"
-          )
-      else:
-        newAsyncSocket(buffered = false)
     try:
-      if isUnix:
-        when defined(posix):
-          await sock.connectUnix(unixSocketPath(conn.host, conn.port))
-        else:
-          raise newException(
-            PgConnectionError, "Unix sockets are not supported on this platform"
-          )
+      await side.socket.sendRawBytes(msg)
+    except CancelledError as e:
+      raise e
+    except OSError as e:
+      raise socketError(e)
+    except CatchableError as e:
+      # A TLS write failure, which is no OSError.
+      raise newException(PgUnavailableError, "CancelRequest not sent: " & e.msg, e)
+
+proc awaitServerClose(side: PgConnection) {.async.} =
+  ## Wait for the server to hang up the cancel connection ``side``. How it
+  ## does is not judged: the request is already out.
+  try:
+    when hasChronos:
+      var b: byte
+      if side.sslEnabled:
+        discard await side.reader.readOnce(addr b, 1)
       else:
-        await sock.connect(conn.host, Port(conn.port))
-      let msg = encodeCancelRequest(conn.pid, conn.secretKey)
-      await sock.sendRawBytes(msg)
-    finally:
-      sock.close()
+        discard await side.transport.readOnce(addr b, 1)
+    elif hasAsyncDispatch:
+      discard await side.socket.recv(1)
+  except CancelledError as e:
+    raise e
+  except CatchableError:
+    discard
+
+const cancelTimeoutMs = 10_000
+  ## Floor on the bound of a whole cancel, dial to hang-up: ``connectTimeout``
+  ## may be unset, and a cancel spawned by a timeout has no caller to give up on it.
+
+proc cancelRound(
+    side: PgConnection,
+    targets: seq[DialTarget],
+    sslHost: string,
+    overTls: bool,
+    msg: seq[byte],
+    abandoned: ref bool,
+) {.async.} =
+  ## Dial the cancel connection ``side``, send ``msg`` and wait for the hang-up.
+  let dialed = await dialTargets(targets)
+  side.attachTransport(dialed.stream, dialed.target, sslHost)
+  try:
+    # Only on asyncdispatch, whose `wait` cannot stop a dial that lands late.
+    if abandoned[]:
+      return
+    if overTls:
+      await side.negotiateSSL(side.config, sslHost)
+    await side.sendCancelRequest(msg)
+    await side.awaitServerClose()
+  finally:
+    await side.closeTransport()
+
+proc cancelWithin(conn: PgConnection, timeout: Duration) {.async.} =
+  ## ``cancel`` giving up after ``timeout``.
+  let msg = encodeCancelRequest(conn.pid, conn.secretKey)
+  # The session's own address: another the host resolves to may be another
+  # server, which would ignore the request.
+  let targets =
+    if conn.cancelTarget.len > 0:
+      conn.cancelTarget
+    else:
+      resolveTargets(conn.host, conn.port)
+  # Taken before the dial, like the key: a reconnect may replace them meanwhile.
+  let overTls = conn.sslEnabled
+  let sslHost = conn.sslHost
+  var config = conn.config
+  # Not the user's connection: its teardown errors are not theirs to trace.
+  config.tracer = nil
+  if overTls and config.sslMode in {sslAllow, sslPrefer}:
+    # The session got TLS from this server: an 'N' now is no reason to send
+    # the key in the clear.
+    config.sslMode = sslRequire
+  let side = newPgConnection(conn.host, conn.port, config)
+  let abandoned = new(bool)
+  try:
+    await side.cancelRound(targets, sslHost, overTls, msg, abandoned).wait(timeout)
+  except AsyncTimeoutError as e:
+    # asyncdispatch's `wait` leaves the round running: closing the socket ends
+    # the I/O it is stuck in.
+    abandoned[] = true
+    await side.closeTransport()
+    raise
+      newException(PgTimeoutError, "CancelRequest not answered within " & $timeout, e)
+
+proc cancel*(conn: PgConnection): Future[void] =
+  ## Send a CancelRequest over a separate connection to abort the running
+  ## query, then wait for the server to close that connection, as libpq does:
+  ## the request is then no longer in flight to hit a later query.
+  ##
+  ## A TLS session sends it over TLS, checked as the session was and never
+  ## falling back to plaintext: the secret key must not cross the wire less
+  ## protected than the session that delivered it.
+  ##
+  ## Raises ``PgTimeoutError`` if the whole exchange takes longer than
+  ## ``connectTimeout`` or 10 seconds, whichever is longer.
+  # A link that needs a long `connectTimeout` needs it for the cancel's dial
+  # and handshake too.
+  conn.cancelWithin(max(milliseconds(cancelTimeoutMs), conn.config.connectTimeout))
 
 proc cancelNoWait*(conn: PgConnection) =
   ## Schedule a best-effort CancelRequest without waiting. For use in timeout handlers.
@@ -276,8 +343,7 @@ proc invalidateWire(conn: PgConnection, releaseTransport: bool, reuseIfSettled =
   else:
     # Only the first frame to claim the outstanding replies may dial, or every
     # frame the cancellation passes through opens its own socket for one query.
-    conn.pendingSyncs = 0
-    conn.unsyncedWrite = false
+    conn.clearWireDebt()
     conn.cancelNoWait()
   conn.markClosed()
   if releaseTransport:
@@ -376,6 +442,29 @@ template awaitVoidOrInvalidate*(
       connExpr.invalidateOnCancel()
       raise e
 
+template tracedSimpleExec*(
+    conn: PgConnection,
+    stmt: string,
+    timeout: Duration,
+    reason: static string,
+    tag: untyped,
+    check: untyped,
+) =
+  ## ``simpleExec``'s traced, timeout-bounded core, storing the last tag in
+  ## ``tag``. ``check`` runs inside the trace, so ``onQueryEnd`` reports what it
+  ## raises.
+  # Not `sql`: a template param would also replace the `sql:` field name below.
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: stmt, isExec: true),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: tag),
+  ):
+    awaitOrInvalidate(conn, tag, simpleExecImpl(conn, stmt), timeout, reason)
+    check
+
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
@@ -384,17 +473,8 @@ proc simpleExec*(
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var tag: string
-  withConnTracing(
-    conn,
-    onQueryStart,
-    onQueryEnd,
-    TraceQueryStartData(sql: sql, isExec: true),
-    TraceQueryEndData,
-    TraceQueryEndData(commandTag: tag),
-  ):
-    awaitOrInvalidate(
-      conn, tag, simpleExecImpl(conn, sql), timeout, "simpleExec timed out"
-    )
+  tracedSimpleExec(conn, sql, timeout, "simpleExec timed out", tag):
+    discard
   return initCommandResult(tag)
 
 proc simpleQuery*(
@@ -440,7 +520,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
     conn.checkReady()
     if not conn.isConnected():
       conn.markClosed()
-      raise newException(PgConnectionError, "Connection is not established")
+      raise newException(PgUnavailableError, "Connection is not established")
     conn.markBusy()
     await conn.sendMsg(encodeQuery(""))
 

@@ -1,10 +1,9 @@
-import std/[unittest, options, strutils, tables, math, net, json]
+import std/[unittest, options, strutils, tables, net, json]
 from std/times import
   DateTime, dateTime, mMar, mJun, mJan, mDec, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
 
-import
-  ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
+import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
 

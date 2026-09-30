@@ -1,7 +1,6 @@
-import std/[unittest, options, strutils, math, net]
+import std/[unittest, options, strutils]
 
-import
-  ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
+import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
 
@@ -231,6 +230,32 @@ suite "E2E: Prepared Statement Edge Cases":
       let res = await conn.query("SELECT 42")
       doAssert res.rows[0].getStr(0) == "42"
       await stmt1.close()
+      await conn.close()
+
+    waitFor t()
+
+  test "names another Parse can replace are rejected before sending":
+    # "" is the unnamed statement the library's own queries re-Parse, and the
+    # statement cache owns the "_sc_" names (and Closes them on failure).
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.query("SELECT 1") # the cache now holds a _sc_ name
+      for name in ["", "_sc_1", "_sc_mine"]:
+        var raised = false
+        try:
+          discard await conn.prepare(name, "SELECT 2")
+        except PgTypeError:
+          raised = true
+        doAssert raised, "prepare accepted " & name.escape
+        doAssert conn.state == csReady
+      let leaked = await conn.query(
+        "SELECT count(*)::int FROM pg_prepared_statements WHERE statement = 'SELECT 2'"
+      )
+      doAssert leaked.rows[0].getInt(0) == 0
+      # Names that merely contain the prefix are the application's.
+      let stmt = await conn.prepare("my_sc_1", "SELECT 3")
+      doAssert (await stmt.execute()).rows[0].getStr(0) == "3"
+      await stmt.close()
       await conn.close()
 
     waitFor t()

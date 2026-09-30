@@ -28,21 +28,17 @@ proc main() {.async.} =
   for i in 1'i32 .. 25:
     discard await conn.exec(sql"INSERT INTO numbers (value) VALUES ({i})")
 
-  # Open a cursor with a chunk size of 10 rows
-  let cursor =
-    await conn.openCursor("SELECT id, value FROM numbers ORDER BY id", chunkSize = 10)
-
-  # Fetch rows in chunks until exhausted
+  # Open with a chunk size of 10 rows; withCursor closes the cursor
+  # automatically, even if the body raises.
   var total = 0
-  while not cursor.exhausted():
-    let rows = await cursor.fetchNext()
-    echo "Fetched ", rows.len, " rows:"
-    for row in rows:
-      echo "  id=", row.getInt("id"), " value=", row.getInt("value")
-    total += rows.len
+  conn.withCursor("SELECT id, value FROM numbers ORDER BY id", 10, cursor):
+    while not cursor.exhausted():
+      let rows = await cursor.fetchNext()
+      echo "Fetched ", rows.len, " rows:"
+      for row in rows:
+        echo "  id=", row.getInt("id"), " value=", row.getInt("value")
+      total += rows.len
 
   echo "\nTotal rows fetched: ", total
-
-  await cursor.close()
 
 waitFor main()

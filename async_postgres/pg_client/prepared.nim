@@ -1,18 +1,13 @@
 ## Named server-side prepared statements: `prepare`, `execute`, and `close`.
 ##
-## Internal module: not part of the public API. Import the `pg_client` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/[options]
+import std/[options, strutils]
 
-import ../[async_backend, pg_protocol, pg_connection, pg_types]
-import ../pg_connection/[types, buffer_io, cache, simple_query]
+import ../[async_backend, pg_protocol, pg_types]
+import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
-import ./core
-
-import std/importutils
-privateAccess(PgConnection)
+import core
 
 type PreparedStatement* = object
   ## A server-side prepared statement returned by `prepare`.
@@ -57,13 +52,31 @@ proc columnIndex*(stmt: PreparedStatement, name: string): int =
   ## Find the index of a column by name in a prepared statement.
   stmt.fields.columnIndex(name)
 
+proc checkPreparedName(name: string) =
+  ## Reject names another Parse on this session can replace: the library's own
+  ## queries reuse the unnamed statement, and the statement cache owns
+  ## ``stmtNamePrefix``.
+  if name.len == 0:
+    raise newException(
+      PgTypeError,
+      "prepared statement name must not be empty: " &
+        "the unnamed statement is replaced by the next unnamed Parse",
+    )
+  if name.startsWith(stmtNamePrefix):
+    raise newException(
+      PgTypeError,
+      "prepared statement name '" & name & "' starts with '" & stmtNamePrefix &
+        "', which is reserved for the statement cache",
+    )
+
 proc prepareImpl*(
     conn: PgConnection, name: string, sql: string
 ): Future[PreparedStatement] {.async.} =
   conn.checkReady()
   # The name is the application's, not a generated `nextStmtName()`, so it is
-  # both checked for NUL and charged against the Parse envelope.
+  # checked for NUL and reserved names, and charged against the Parse envelope.
   checkNoNul(name, "prepared statement name")
+  checkPreparedName(name)
   validateParseMsg(sql, nParams = 0, stmtNameLen = name.len)
 
   var batch = newSeqOfCap[byte](sql.len + name.len + 32)
@@ -96,6 +109,10 @@ proc prepare*(
     conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration
 ): Future[PreparedStatement] {.async.} =
   ## Prepare a named statement, returning metadata.
+  ##
+  ## Raises ``PgTypeError`` for an empty ``name`` or one starting with ``_sc_``
+  ## (the statement cache's names): another Parse on the session could replace
+  ## either.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var stmt: PreparedStatement
@@ -138,9 +155,9 @@ proc executeImpl*(
   validateTypedParams(effective, resultFormats.len, stmt.name.len)
 
   conn.beginSendBuf()
-  conn.sendBuf.addBind("", stmt.name, effective, resultFormats)
-  conn.sendBuf.addExecute("", 0)
-  conn.sendBuf.addSync()
+  conn.addBind("", stmt.name, effective, resultFormats)
+  conn.addExecute("", 0)
+  conn.addSync()
   conn.markBusy()
   await conn.sendStagedBufMsg()
 

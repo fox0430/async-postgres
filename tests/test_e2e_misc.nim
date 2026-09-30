@@ -1,9 +1,9 @@
-import std/[unittest, options, tables, math, net]
+import std/[unittest, options, tables, net]
 
 import
   ../async_postgres/
     [async_backend, pg_protocol, pg_types, pg_replication, pg_client, pg_connection]
-import ../async_postgres/pg_connection/[simple_query, lifecycle]
+import ../async_postgres/pg_connection/simple_query
 
 import e2e_common
 
@@ -186,6 +186,14 @@ suite "E2E: quoteIdentifier":
   test "identifier with spaces":
     doAssert quoteIdentifier("my table") == "\"my table\""
 
+  test "NUL byte raises ValueError":
+    var raised = false
+    try:
+      discard quoteIdentifier("a\0b")
+    except ValueError:
+      raised = true
+    doAssert raised, "NUL byte should raise ValueError"
+
 suite "E2E: quoteLiteral":
   test "simple literal":
     doAssert quoteLiteral("foo") == "'foo'"
@@ -265,6 +273,8 @@ suite "E2E: Logical Replication":
       var gotInsert = false
       var insertRelName = ""
       var insertVal = ""
+      var commitEnd = InvalidLsn
+      var confirmedAtCommit = InvalidLsn
 
       let cb = makeReplicationCallback:
         case msg.kind
@@ -280,16 +290,17 @@ suite "E2E: Logical Replication":
             if pgMsg.insert.newTuple.len >= 2 and
                 pgMsg.insert.newTuple[1].kind == tdkText:
               insertVal = pgMsg.insert.newTuple[1].toString()
-            await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
-            await replConn.stopReplication()
           of pomkCommit:
-            discard
+            if gotInsert:
+              # Unclamped only if the Commit's XLogData.startLsn is its endLsn.
+              commitEnd = pgMsg.commit.endLsn
+              discard replConn.confirmFlushed(commitEnd)
+              confirmedAtCommit = replConn.confirmedFlushLsn
+              await replConn.stopReplication()
           else:
             discard
         of rmkPrimaryKeepalive:
-          # autoKeepaliveReply (default) already replied: receivedEndLsn in the
-          # receive field (resets wal_sender_timeout); flush/apply track the
-          # confirmFlushed position. No manual reply needed.
+          # autoKeepaliveReply (default) already replied.
           discard
 
       # Insert a row from the writer connection after a short delay
@@ -313,7 +324,16 @@ suite "E2E: Logical Replication":
       doAssert gotInsert, "Should have received an INSERT message"
       doAssert insertRelName == "test_repl_tbl"
       doAssert insertVal == "hello_repl"
+      doAssert commitEnd != InvalidLsn
+      doAssert confirmedAtCommit == commitEnd
       doAssert replConn.state == csReady
+
+      # stopReplication reported the confirmed position as flush.
+      let slotRes = await writer.simpleQuery(
+        "SELECT confirmed_flush_lsn FROM pg_replication_slots " &
+          "WHERE slot_name = 'test_stream_slot'"
+      )
+      doAssert parseLsn(slotRes[0].rows[0].getStr(0)) == commitEnd
 
       await replConn.close()
 
@@ -338,11 +358,11 @@ suite "E2E: Logical Replication":
       let cb = makeReplicationCallback:
         case msg.kind
         of rmkXLogData:
-          await replConn.sendStandbyStatus(msg.xlogData.receivedEndLsn)
+          discard
         of rmkPrimaryKeepalive:
-          # Stop immediately on first keepalive. autoKeepaliveReply (default)
-          # already replied (receive = receivedEndLsn); flush/apply track the
-          # confirmFlushed position.
+          # Confirm first so stopReplication's status doesn't move flush back.
+          discard replConn.confirmFlushed(msg.keepalive.walEnd)
+          await replConn.sendStandbyStatus(replConn.confirmedFlushLsn)
           await replConn.stopReplication()
 
       await replConn.startReplication(
@@ -480,6 +500,194 @@ suite "E2E: Logical Replication":
 
     waitFor t()
 
+suite "E2E: Replication restart":
+  test "logical replication cannot restart on the same connection":
+    # A connection whose logical stream already ended leaves COPY at once on
+    # the next logical start, with no CopyDone (BUG #18754). The library must
+    # retire the connection and raise a transient error instead of reporting a
+    # clean stop; reconnecting resumes from the slot without redelivery.
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_restart_e2e') " &
+          "FROM pg_replication_slots WHERE slot_name = 'test_restart_e2e'"
+      )
+      discard await writer.simpleQuery("DROP PUBLICATION IF EXISTS test_restart_pub")
+      discard await writer.simpleQuery("DROP TABLE IF EXISTS test_restart_tbl")
+      discard await writer.simpleQuery(
+        "CREATE TABLE test_restart_tbl (id serial PRIMARY KEY, val text)"
+      )
+      discard await writer.simpleQuery(
+        "CREATE PUBLICATION test_restart_pub FOR TABLE test_restart_tbl"
+      )
+      var firstConn, secondConn: PgConnection
+      try:
+        firstConn = await connectReplication(plainConfig())
+        # Permanent: it must outlive the connection whose restart fails.
+        discard await firstConn.createReplicationSlot("test_restart_e2e", "pgoutput")
+        const options: seq[(string, string)] =
+          @{"proto_version": "1", "publication_names": "test_restart_pub"}
+
+        var firstCommit = InvalidLsn
+        let firstCb = makeReplicationCallback:
+          case msg.kind
+          of rmkXLogData:
+            let pgMsg = decodePgOutput(msg.xlogData)
+            if pgMsg.kind == pomkCommit:
+              firstCommit = pgMsg.commit.endLsn
+              discard firstConn.confirmFlushed(firstCommit)
+              await firstConn.stopReplication()
+          of rmkPrimaryKeepalive:
+            # autoKeepaliveReply (the default) already replied.
+            discard
+
+        discard await writer.simpleQuery(
+          "INSERT INTO test_restart_tbl (val) VALUES ('before_restart')"
+        )
+        await firstConn.startReplication(
+          "test_restart_e2e", InvalidLsn, options = options, callback = firstCb
+        )
+        doAssert firstCommit != InvalidLsn
+        doAssert firstConn.state == csReady
+
+        var raised = false
+        var transient = false
+        try:
+          await firstConn.startReplication(
+            "test_restart_e2e", InvalidLsn, options = options, callback = firstCb
+          )
+        except PgUnavailableError as e:
+          raised = true
+          transient = isTransientError(e)
+        doAssert raised, "the second logical stream on a reused connection must raise"
+        doAssert transient, "a reconnect loop must pick the error up"
+        doAssert firstConn.state == csClosed, "the connection must be retired"
+        await firstConn.close()
+
+        # Reconnect and resume with autoConfirm: the confirmed row is not
+        # redelivered.
+        secondConn = await connectReplication(plainConfig())
+        var resumedRows: seq[string]
+        var secondCommit = InvalidLsn
+        let resumeCb = makeReplicationCallback:
+          case msg.kind
+          of rmkXLogData:
+            let pgMsg = decodePgOutput(msg.xlogData)
+            case pgMsg.kind
+            of pomkInsert:
+              if pgMsg.insert.newTuple.len >= 2 and
+                  pgMsg.insert.newTuple[1].kind == tdkText:
+                resumedRows.add(pgMsg.insert.newTuple[1].toString())
+            of pomkCommit:
+              secondCommit = pgMsg.commit.endLsn
+              await secondConn.stopReplication()
+            else:
+              discard
+          of rmkPrimaryKeepalive:
+            discard
+
+        discard await writer.simpleQuery(
+          "INSERT INTO test_restart_tbl (val) VALUES ('after_restart')"
+        )
+        await secondConn.startReplication(
+          "test_restart_e2e",
+          InvalidLsn,
+          options = options,
+          callback = resumeCb,
+          autoConfirm = true,
+        )
+        doAssert secondCommit != InvalidLsn
+        doAssert resumedRows == @["after_restart"],
+          "the confirmed transaction must not be redelivered: " & $resumedRows
+        doAssert secondConn.state == csReady
+        await secondConn.close()
+      finally:
+        if firstConn != nil:
+          await firstConn.close()
+        if secondConn != nil:
+          await secondConn.close()
+        discard await writer.simpleQuery(
+          "SELECT pg_drop_replication_slot('test_restart_e2e') " &
+            "FROM pg_replication_slots WHERE slot_name = 'test_restart_e2e'"
+        )
+        discard await writer.simpleQuery("DROP PUBLICATION test_restart_pub")
+        discard await writer.simpleQuery("DROP TABLE test_restart_tbl")
+        await writer.close()
+
+    waitFor t()
+
+  test "logical then physical streams on one connection still work":
+    # Only a repeated logical start hits the walsender's stale flags: physical
+    # streaming resets them, so a connection that already streamed may stream
+    # physical — after logical and then again.
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery("DROP PUBLICATION IF EXISTS test_combo_pub")
+      discard await writer.simpleQuery("DROP TABLE IF EXISTS test_combo_tbl")
+      discard await writer.simpleQuery(
+        "CREATE TABLE test_combo_tbl (id serial PRIMARY KEY, val text)"
+      )
+      discard await writer.simpleQuery(
+        "CREATE PUBLICATION test_combo_pub FOR TABLE test_combo_tbl"
+      )
+      let conn = await connectReplication(plainConfig())
+      try:
+        let slot = await conn.createReplicationSlot(
+          "test_combo_slot", "pgoutput", temporary = true
+        )
+        doAssert slot.consistentPoint != InvalidLsn
+
+        # 1) Logical, stopped from its first Commit.
+        var logicalCommit = false
+        let logicalCb = makeReplicationCallback:
+          case msg.kind
+          of rmkXLogData:
+            let pgMsg = decodePgOutput(msg.xlogData)
+            if pgMsg.kind == pomkCommit:
+              logicalCommit = true
+              await conn.stopReplication()
+          of rmkPrimaryKeepalive:
+            discard
+
+        discard await writer.simpleQuery(
+          "INSERT INTO test_combo_tbl (val) VALUES ('logical')"
+        )
+        await conn.startReplication(
+          "test_combo_slot",
+          InvalidLsn,
+          options = @{"proto_version": "1", "publication_names": "test_combo_pub"},
+          callback = logicalCb,
+        )
+        doAssert logicalCommit
+        doAssert conn.state == csReady
+
+        # 2) + 3) Physical on the same connection, each stopped on first WAL.
+        var streamNo = 0
+        var sawWal: seq[int]
+        let physicalCb = makeReplicationCallback:
+          if msg.kind == rmkXLogData and msg.xlogData.data.len > 0:
+            sawWal.add(streamNo)
+            await conn.stopReplication()
+
+        for _ in 0 ..< 2:
+          inc streamNo
+          let info = await conn.identifySystem()
+          discard
+            await writer.simpleQuery("INSERT INTO test_combo_tbl (val) VALUES ('phys')")
+          await conn.startPhysicalReplication(
+            startLsn = info.xLogPos, callback = physicalCb
+          )
+          doAssert conn.state == csReady
+
+        doAssert sawWal == @[1, 2], "each physical stream must deliver WAL: " & $sawWal
+      finally:
+        await conn.close()
+        discard await writer.simpleQuery("DROP PUBLICATION test_combo_pub")
+        discard await writer.simpleQuery("DROP TABLE test_combo_tbl")
+        await writer.close()
+
+    waitFor t()
+
 suite "E2E: Physical Replication":
   test "connectReplication(rmPhysical) + identifySystem":
     proc t() {.async.} =
@@ -593,6 +801,64 @@ suite "E2E: Physical Replication":
       discard
         await writer.simpleQuery("SELECT pg_drop_replication_slot('test_phys_e2e')")
       await writer.close()
+
+    waitFor t()
+
+  test "manual mode stop does not move the slot's restart_lsn back":
+    # The caller reported its flush; the stop's own status must not report the
+    # lower resume point, which would move restart_lsn backwards.
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_phys_manual') " &
+          "FROM pg_replication_slots WHERE slot_name = 'test_phys_manual'"
+      )
+      discard await writer.simpleQuery(
+        "SELECT pg_create_physical_replication_slot('test_phys_manual', true)"
+      )
+      discard await writer.simpleQuery("DROP TABLE IF EXISTS test_phys_manual_tbl")
+      discard await writer.simpleQuery("CREATE TABLE test_phys_manual_tbl (v int)")
+      # The slot reserves WAL: drop it even when an assertion fails.
+      try:
+        let replConn = await connectReplication(plainConfig(), rmPhysical)
+        let info = await replConn.identifySystem()
+
+        var reported = InvalidLsn
+        let cb = makeReplicationCallback:
+          if msg.kind == rmkXLogData and msg.xlogData.data.len > 0 and
+              reported == InvalidLsn:
+            reported = msg.xlogData.receivedEndLsn
+            await replConn.sendStandbyStatus(reported)
+            await replConn.stopReplication()
+
+        proc insertRows() {.async.} =
+          await sleepAsync(milliseconds(200))
+          discard
+            await writer.simpleQuery("INSERT INTO test_phys_manual_tbl VALUES (1)")
+
+        let insertFut = insertRows()
+        await replConn.startPhysicalReplication(
+          startLsn = info.xLogPos,
+          slotName = "test_phys_manual",
+          autoKeepaliveReply = false,
+          callback = cb,
+        )
+        await insertFut
+        await replConn.close()
+
+        doAssert reported != InvalidLsn
+        let slotRes = await writer.simpleQuery(
+          "SELECT restart_lsn FROM pg_replication_slots " &
+            "WHERE slot_name = 'test_phys_manual'"
+        )
+        doAssert parseLsn(slotRes[0].rows[0].getStr(0)) == reported
+      finally:
+        discard await writer.simpleQuery(
+          "SELECT pg_drop_replication_slot('test_phys_manual') " &
+            "FROM pg_replication_slots WHERE slot_name = 'test_phys_manual'"
+        )
+        discard await writer.simpleQuery("DROP TABLE IF EXISTS test_phys_manual_tbl")
+        await writer.close()
 
     waitFor t()
 

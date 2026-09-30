@@ -1,24 +1,26 @@
-## Transport-layer buffering and message I/O.
+## Transport-layer message I/O.
 ##
-## - recvBuf/sendBuf management (compact, fill, send)
+## - sendBuf management and raw sends
 ## - Synchronous backend-message parsing (`nextMessage`) and the async wrapper
 ##   `recvMessage`
-## - Notification/Notice dispatch (called from `nextMessage`)
+## - Background read watch for COPY IN early-error detection (`RecvWatch`)
 ## - Transport teardown (`closeTransport`)
 ## - TCP keepalive / TCP_NODELAY socket options
-## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`)
+## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`) and dialing
+##   (`resolveTargets`, `dialTargets`, `dialServer`, `socketError`, `oneLine`)
 ## - `makeCopyOutCallback` / `makeCopyInCallback` cross-backend templates
 ##
+## The receive buffer and its fills live in `types` with the private
+## `recvBuf` / `recvBufStart` pair they move.
+##
 ## The host helpers and `makeCopy*` templates are re-exported through
-## `pg_connection.nim`; the transport buffering machinery stays here for
+## `pg_connection.nim`; the message-parsing and send machinery stays here for
 ## sibling modules and tests. Depends only on `types.nim` and the
 ## protocol/error/backend abstraction modules.
 ##
-## Internal module: not part of the public API. Import the `pg_connection` hub
-## instead; what it re-exports is the supported surface (see
-## `tests/api_surface.golden`).
+## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[deques, options, tables]
+import std/[options, strutils]
 when defined(posix):
   import std/posix
 
@@ -29,9 +31,11 @@ when hasChronos:
   import chronos/streams/tlsstream
 elif hasAsyncDispatch:
   import std/asyncnet
-
-import std/importutils
-privateAccess(PgConnection)
+  from std/nativesockets import
+    Domain, SockType, Protocol, `==`, getAddrInfo, freeAddrInfo, toKnownDomain,
+    getAddrString, getSockOptInt
+  when defined(posix):
+    from std/oserrors import OSErrorCode, newOSError, osLastError
 
 when defined(posix):
   # POSIX socket option constants (used by liveness probes and TCP keepalive)
@@ -80,6 +84,341 @@ proc getHosts*(config: ConnConfig): seq[HostEntry] =
       )
     ]
 
+# Dialing
+
+const AsyncTracebackMarker = "\nAsync traceback:"
+  ## Header asyncdispatch prepends to its injected traceback.
+
+proc oneLine*(msg: string): string =
+  ## Collapse `msg` to one line, dropping the asyncdispatch traceback.
+  ## Cuts at the traceback marker so server DETAIL/HINT lines survive,
+  ## joined with " | ".
+  let cut = msg.find(AsyncTracebackMarker)
+  let body =
+    if cut >= 0:
+      msg[0 ..< cut]
+    else:
+      msg
+  var parts: seq[string]
+  for line in body.splitLines():
+    let stripped = line.strip()
+    if stripped.len > 0:
+      parts.add(stripped)
+  parts.join(" | ")
+
+type DialFailure = tuple[target: string, err: ref CatchableError]
+
+when defined(posix):
+  func isTransientErrno(code: int32): bool =
+    ## Whether an OS error may clear (``ENOENT``: a Unix socket not created yet).
+    # Qualified: chronos exports same-named OSErrorCode constants.
+    code in [
+      posix.ECONNREFUSED, posix.ECONNRESET, posix.ECONNABORTED, posix.ETIMEDOUT,
+      posix.EHOSTUNREACH, posix.ENETUNREACH, posix.ENETDOWN, posix.EADDRNOTAVAIL,
+      posix.EPIPE, posix.EAGAIN, posix.ENOENT, posix.EMFILE, posix.ENFILE,
+      posix.ENOBUFS, posix.ENOMEM,
+    ]
+
+proc isTransientDial(e: ref CatchableError): bool {.raises: [].} =
+  ## Whether a failed connect or send may succeed later.
+  var code: int32
+  when hasChronos:
+    if e of TransportTooManyError: # EMFILE and the like, its code not kept
+      return true
+    if not (e of TransportOsError):
+      return false
+    code = int32((ref TransportOsError)(e).code)
+  else:
+    if not (e of OSError):
+      return false
+    code = (ref OSError)(e).errorCode
+  when defined(posix):
+    isTransientErrno(code)
+  else:
+    discard code # Windows' connect error codes are not mapped.
+    true
+
+proc dialError(failures: openArray[DialFailure]): ref PgConnectionError {.raises: [].} =
+  ## One error for every address that failed, the last as ``parent``: a
+  ## ``PgUnavailableError`` when any of them may clear.
+  var msg = ""
+  var transient = false
+  for i, f in failures:
+    transient = transient or isTransientDial(f.err)
+    if failures.len == 1:
+      msg = oneLine(f.err.msg)
+    else:
+      if i > 0:
+        msg.add("; ")
+      msg.add(f.target & ": " & oneLine(f.err.msg))
+  if transient:
+    (ref PgUnavailableError)(msg: msg, parent: failures[^1].err)
+  else:
+    (ref PgConnectionError)(msg: msg, parent: failures[^1].err)
+
+proc unresolved(host: string): ref PgConnectionError =
+  newException(PgUnavailableError, "Could not resolve host: " & host)
+
+when defined(posix):
+  proc lookup(host: string, port: int): ptr posix.AddrInfo =
+    ## ``host``'s TCP addresses, to free with ``freeAddrInfo``. An unknown name
+    ## is transient: it may be a container not registered yet.
+    var hints: posix.AddrInfo
+    hints.ai_family = posix.AF_UNSPEC
+    hints.ai_socktype = posix.SOCK_STREAM
+    hints.ai_protocol = posix.IPPROTO_TCP
+    let rc = posix.getaddrinfo(cstring(host), cstring($port), addr hints, result)
+    if rc != 0:
+      let sysErr = posix.errno
+      let reason =
+        if rc == posix.EAI_SYSTEM:
+          $posix.strerror(sysErr)
+        else:
+          $posix.gai_strerror(rc)
+      let msg = "Could not resolve host " & host & ": " & reason
+      if rc in [
+        posix.EAI_FAIL, posix.EAI_FAMILY, posix.EAI_SOCKTYPE, posix.EAI_SERVICE,
+        posix.EAI_BADFLAGS,
+      ] or (rc == posix.EAI_SYSTEM and not isTransientErrno(sysErr)):
+        raise newException(PgConnectionError, msg)
+      raise newException(PgUnavailableError, msg)
+
+when hasChronos:
+  type
+    DialStream* = StreamTransport
+    Dialed* = tuple[stream: DialStream, target: DialTarget]
+      ## A connected stream and the address it reached.
+
+  func shown*(t: DialTarget): string =
+    ## ``t`` as error messages name it.
+    if t.family == AddressFamily.Unix:
+      $t
+    else:
+      t.host
+
+  proc resolveTargets*(host: string, port: int): seq[DialTarget] =
+    ## What ``host`` names: its Unix socket, or each address it resolves to in
+    ## the resolver's order.
+    if isUnixSocket(host):
+      when defined(posix):
+        try:
+          return @[initTAddress(unixSocketPath(host, port))]
+        except TransportAddressError as e:
+          raise (ref PgConnectionError)(msg: e.msg, parent: e)
+      else:
+        raise newException(
+          PgConnectionError, "Unix sockets are not supported on this platform"
+        )
+    when defined(posix):
+      let aiList = lookup(host, port)
+      try:
+        var it = aiList
+        while it != nil:
+          var ta: TransportAddress
+          fromSAddr(cast[ptr Sockaddr_storage](it.ai_addr), SockLen(it.ai_addrlen), ta)
+          if ta.family in {AddressFamily.IPv4, AddressFamily.IPv6} and ta notin result:
+            result.add(ta)
+          it = it.ai_next
+      finally:
+        posix.freeAddrInfo(aiList)
+    else:
+      try:
+        result = resolveTAddress(host, Port(port))
+      except TransportAddressError as e:
+        # Its resolver code is lost here: judged as a name not known yet.
+        raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+    if result.len == 0:
+      raise unresolved(host)
+
+  proc dialTargets*(targets: seq[DialTarget]): Future[Dialed] {.async.} =
+    ## Connect to the first of ``targets`` that accepts, as libpq does.
+    if targets.len == 0:
+      raise newException(ValueError, "dialTargets: no address to dial")
+    var failures: seq[DialFailure]
+    for t in targets:
+      try:
+        return (stream: await connect(t), target: t)
+      except TransportError as e:
+        failures.add((t.shown, (ref CatchableError)(e)))
+    raise dialError(failures)
+
+elif hasAsyncDispatch:
+  type
+    DialStream* = AsyncSocket
+    Dialed* = tuple[stream: DialStream, target: DialTarget]
+      ## A connected stream and the address it reached.
+
+  func shown*(t: DialTarget): string =
+    ## ``t`` as error messages name it.
+    if t.domain == Domain.AF_INET6:
+      "[" & t.address & "]"
+    else:
+      t.address
+
+  func `==`(a, b: DialTarget): bool =
+    # Not `sa`: the text names the address, zone included.
+    a.domain == b.domain and a.address == b.address and a.port == b.port
+
+  proc resolveTargets*(host: string, port: int): seq[DialTarget] =
+    ## What ``host`` names: its Unix socket, or each address it resolves to in
+    ## the resolver's order.
+    if isUnixSocket(host):
+      when defined(posix):
+        var t: DialTarget
+        t.domain = Domain.AF_UNIX
+        t.address = unixSocketPath(host, port)
+        t.port = Port(port)
+        return @[t]
+      else:
+        raise newException(
+          PgConnectionError, "Unix sockets are not supported on this platform"
+        )
+    when defined(posix):
+      let aiList = lookup(host, port)
+      try:
+        var it = aiList
+        while it != nil:
+          var t: DialTarget
+          t.port = Port(port)
+          if it.ai_family == posix.AF_INET:
+            t.domain = Domain.AF_INET
+            copyMem(addr t.sa, it.ai_addr, it.ai_addrlen)
+            t.saLen = it.ai_addrlen
+          elif it.ai_family == posix.AF_INET6:
+            let sa6 = cast[ptr Sockaddr_in6](it.ai_addr)
+            if posix.IN6_IS_ADDR_V4MAPPED(addr sa6.sin6_addr) != 0:
+              # Dial the IPv4 it names: an AF_INET6 socket may be v6-only.
+              var sa4: Sockaddr_in
+              sa4.sin_family = typeof(sa4.sin_family)(posix.AF_INET)
+              sa4.sin_port = sa6.sin6_port
+              copyMem(addr sa4.sin_addr, addr sa6.sin6_addr.s6_addr[12], 4)
+              t.domain = Domain.AF_INET
+              copyMem(addr t.sa, addr sa4, sizeof(sa4))
+              t.saLen = SockLen(sizeof(sa4))
+            else:
+              t.domain = Domain.AF_INET6
+              copyMem(addr t.sa, it.ai_addr, it.ai_addrlen)
+              t.saLen = it.ai_addrlen
+          else:
+            it = it.ai_next
+            continue
+          # nim doc builds nativesockets on winlean: name its types.
+          t.address = getAddrString(cast[ptr nativesockets.SockAddr](addr t.sa))
+          if t.domain == Domain.AF_INET6:
+            # The text form drops a link-local address's zone; keep it.
+            let scope = cast[ptr Sockaddr_in6](addr t.sa).sin6_scope_id
+            if scope != 0:
+              t.address.add("%" & $scope)
+          if t notin result:
+            result.add(t)
+          it = it.ai_next
+      finally:
+        posix.freeAddrInfo(aiList)
+    else:
+      # Resolved here rather than by std `dial`: its lookup failure carries a
+      # stale errno, so only this split tells it from a refused connect.
+      let aiList =
+        try:
+          getAddrInfo(host, Port(port), Domain.AF_UNSPEC)
+        except OSError as e:
+          const WSANO_RECOVERY = 11003 # as EAI_FAIL
+          if e.errorCode == WSANO_RECOVERY:
+            raise (ref PgConnectionError)(msg: e.msg, parent: e)
+          raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+      try:
+        var it = aiList
+        while it != nil:
+          let known = toKnownDomain(it.ai_family)
+          if known.isSome and known.get in {Domain.AF_INET, Domain.AF_INET6}:
+            var domain = known.get
+            let ip = getAddrString(it.ai_addr)
+            if domain == Domain.AF_INET6 and ':' notin ip:
+              # getAddrString unmaps ::ffff:a.b.c.d; dial the IPv4 it names.
+              domain = Domain.AF_INET
+            let t: DialTarget = (domain: domain, address: ip, port: Port(port))
+            if t notin result:
+              result.add(t)
+          it = it.ai_next
+      finally:
+        freeAddrInfo(aiList)
+    if result.len == 0:
+      raise unresolved(host)
+
+  when defined(posix):
+    proc connectResolved(sock: AsyncSocket, t: DialTarget): Future[void] =
+      ## Connect ``sock`` to ``t``'s resolved address, with no second lookup.
+      let fut = newFuture[void]("connectResolved")
+      result = fut
+
+      proc onWritable(fd: AsyncFD): bool =
+        let err =
+          nativesockets.SocketHandle(fd).getSockOptInt(cint(SOL_SOCKET), cint(SO_ERROR))
+        if err == 0:
+          fut.complete()
+        elif err == EINTR:
+          return false
+        else:
+          fut.fail(newOSError(OSErrorCode(err)))
+        true
+
+      var sa = t.sa
+      if posix.connect(
+        posix.SocketHandle(sock.getFd), cast[ptr SockAddr](addr sa), t.saLen
+      ) == 0:
+        fut.complete()
+      else:
+        let err = osLastError()
+        if err.int32 in [EINTR, EINPROGRESS]:
+          addWrite(AsyncFD(sock.getFd), onWritable)
+        else:
+          fut.fail(newOSError(err))
+
+  proc dialTargets*(targets: seq[DialTarget]): Future[Dialed] {.async.} =
+    ## Connect to the first of ``targets`` that accepts, as libpq does.
+    if targets.len == 0:
+      raise newException(ValueError, "dialTargets: no address to dial")
+    var failures: seq[DialFailure]
+    for t in targets:
+      var sock: AsyncSocket
+      try:
+        if t.domain == Domain.AF_UNIX:
+          when defined(posix):
+            sock = newAsyncSocket(
+              Domain.AF_UNIX,
+              SockType.SOCK_STREAM,
+              Protocol.IPPROTO_IP,
+              buffered = false,
+            )
+            await sock.connectUnix(t.address)
+          else:
+            raiseAssert "resolveTargets yields AF_UNIX on POSIX only"
+        else:
+          sock = newAsyncSocket(
+            t.domain, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP, buffered = false
+          )
+          when defined(posix):
+            await sock.connectResolved(t)
+          else:
+            await sock.connect(t.address, t.port)
+        return (stream: sock, target: t)
+      except CatchableError as e:
+        if sock != nil:
+          sock.close()
+        if not (e of OSError):
+          raise e
+        failures.add((t.shown, e))
+    raise dialError(failures)
+
+proc dialServer*(host: string, port: int): Future[Dialed] =
+  ## Connect to the first address ``host`` resolves to that accepts.
+  # No future of its own: each extra layer delays a pump's cancellation by a
+  # tick, which chronos (4.4) may run only at the next I/O or timer event.
+  dialTargets(resolveTargets(host, port))
+
+proc socketError*(e: ref CatchableError): ref PgConnectionError =
+  ## A failed connect or send, classified as a dial is.
+  dialError([("", e)])
+
 # COPY callback factories (cross-backend)
 
 template makeCopyOutCallback*(body: untyped): CopyOutCallback =
@@ -108,100 +447,7 @@ template makeCopyInCallback*(body: untyped): CopyInCallback =
   ##       newSeq[byte]()
   makeAsyncSeqByteCallback(CopyInCallback, body)
 
-# Notification / notice dispatch
-
-proc enqueueNotification*(conn: PgConnection, notif: Notification) {.raises: [].} =
-  ## Enqueue under ``notifyMaxQueue`` (<=0 = unbounded); drop oldest on overflow.
-  # The cap counts queued notifications only: an outstanding handoff belongs to a
-  # waiter about to consume it, and charging it here would shrink the depth by one.
-  var droppedNow = 0
-  if conn.notifyMaxQueue > 0:
-    while conn.notifyQueue.len >= conn.notifyMaxQueue:
-      discard conn.notifyQueue.popFirst()
-      if conn.notifyDropped < high(int): # saturating; reset once reported
-        conn.notifyDropped.inc
-      droppedNow.inc
-  conn.notifyQueue.addLast(notif)
-  if droppedNow > 0 and conn.notifyOverflowCallback != nil:
-    conn.notifyOverflowCallback(droppedNow)
-
-proc requeueHandoff*(conn: PgConnection, notif: Notification) {.raises: [].} =
-  ## Requeue an unconsumed handoff at the front.
-  # Trims nothing, keeping the drop policy in one place: the queue may sit one
-  # over the cap until the next arrival's drop-oldest reaches this entry.
-  conn.notifyQueue.addFirst(notif)
-
-proc reclaimHandoff*(conn: PgConnection) {.raises: [].} =
-  ## Requeue a handoff whose waiter will never claim it, so an abandoned frame
-  ## cannot make the notification unreachable.
-  if conn.hasNotifyHandoff:
-    conn.hasNotifyHandoff = false
-    conn.requeueHandoff(move conn.notifyHandoff)
-
-proc dispatchNotification*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
-  let notif = Notification(
-    pid: msg.notifPid, channel: msg.notifChannel, payload: msg.notifPayload
-  )
-  # Handed directly to an unresumed waiter: parking it in the shared queue
-  # instead would make it the first thing the overflow drop discards.
-  if conn.notifyWaiter != nil and not conn.notifyWaiter.finished:
-    conn.notifyHandoff = notif
-    conn.hasNotifyHandoff = true
-    # asyncdispatch's `Future.complete` has inferred effect `Exception`
-    # via the callback chain; swallow it to keep this proc `raises: []`.
-    try:
-      conn.notifyWaiter.complete()
-    except Exception:
-      # The waiter will never resume, so nothing would ever move the handoff
-      # back: queue it here instead of losing it.
-      conn.hasNotifyHandoff = false
-      conn.notifyHandoff = Notification()
-      conn.enqueueNotification(notif)
-  else:
-    conn.enqueueNotification(notif)
-  if conn.notifyCallback != nil:
-    conn.notifyCallback(notif)
-
-proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
-  if conn.noticeCallback != nil:
-    conn.noticeCallback(Notice(fields: msg.noticeFields))
-
-proc recordParameterStatus(
-    conn: PgConnection, name, value: string
-) {.raises: [PgProtocolError].} =
-  ## Store one ``ParameterStatus`` under ``MaxServerParams`` /
-  ## ``MaxServerParamsBytes``. Exceeding either cap is treated as a broken
-  ## peer: the connection is closed and ``PgProtocolError`` is raised. Updates
-  ## to an existing key are always admitted when the resulting byte total fits.
-  let newEntryBytes = name.len + value.len
-  if conn.serverParams.hasKey(name):
-    let oldLen = conn.serverParams.getOrDefault(name).len
-    let delta = value.len - oldLen
-    if delta > 0 and conn.serverParamsBytes > MaxServerParamsBytes - delta:
-      conn.markClosed()
-      raise newException(
-        PgProtocolError,
-        "ParameterStatus: serverParams byte total would exceed maximum of " &
-          $MaxServerParamsBytes,
-      )
-    conn.serverParamsBytes += delta
-    conn.serverParams[name] = value
-  else:
-    if conn.serverParams.len >= MaxServerParams:
-      conn.markClosed()
-      raise newException(
-        PgProtocolError,
-        "ParameterStatus: serverParams key count exceeds maximum of " & $MaxServerParams,
-      )
-    if newEntryBytes > MaxServerParamsBytes - conn.serverParamsBytes:
-      conn.markClosed()
-      raise newException(
-        PgProtocolError,
-        "ParameterStatus: serverParams byte total would exceed maximum of " &
-          $MaxServerParamsBytes,
-      )
-    conn.serverParams[name] = value
-    conn.serverParamsBytes += newEntryBytes
+# Notification / notice dispatch lives in ``types`` with the queue fields.
 
 # Raw send helpers (asyncdispatch only)
 
@@ -225,133 +471,22 @@ when hasAsyncDispatch:
     sendRawData(socket, addr data[0], data.len)
 
 # Receive buffer management
+#
+# ``compactRecvBuf`` / ``fillRecvBuf`` / ``fillRecvBufDetached`` live in
+# ``types`` with the private fields they move as a pair.
 
-proc compactRecvBuf*(conn: PgConnection) {.inline.} =
-  ## Compact recvBuf (caller checks ``csClosed``). Only safe before reading new
-  ## data from the socket: it moves bytes an in-flight read still points at.
-  let start = conn.recvBufStart
-  if start == 0:
-    return
-  let remaining = conn.recvBuf.len - start
-  if remaining == 0:
-    conn.recvBuf.setLen(0)
-  else:
-    moveMem(addr conn.recvBuf[0], addr conn.recvBuf[start], remaining)
-    conn.recvBuf.setLen(remaining)
-  conn.recvBufStart = 0
-
-proc fillRecvBuf*(
-    conn: PgConnection, timeout: Duration = ZeroDuration
-): Future[void] {.async.} =
-  ## Read into recvBuf. ``AsyncTimeoutError``: caller handles state; other errors → ``csClosed`` + ``raiseTransportFailure``.
-  # An orphaned pump can revive here after a timeout or cancellation handler
-  # retired the connection; refuse a socket read on one we've given up on.
-  if conn.state == csClosed:
-    conn.raiseClosedConnection("fillRecvBuf: connection is closed (csClosed)")
-  conn.compactRecvBuf()
-  when hasChronos:
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + RecvBufSize)
-    var n: int
-    try:
-      n =
-        if timeout == ZeroDuration:
-          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
-        else:
-          await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
-            timeout
-          )
-    except AsyncTimeoutError as e:
-      conn.recvBuf.setLen(oldLen)
-      raise e
-    except CancelledError as e:
-      # csClosed as for any other failure: the read may have consumed bytes, so
-      # the stream is no longer parseable. Only the exception type is preserved.
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      raise e
-    except CatchableError as e:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseTransportFailure("fillRecvBuf", e)
-    if n == 0:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseClosedConnection("Connection closed by server")
-    # An orphan read settling after csClosed must not re-extend the buffer.
-    if conn.state == csClosed:
-      conn.recvBuf.setLen(oldLen)
-      conn.raiseClosedConnection("fillRecvBuf: connection was closed during readOnce")
-    conn.recvBuf.setLen(oldLen + n)
-  elif hasAsyncDispatch:
-    # On timeout, `wait()` cannot cancel `recvInto` — the orphan may still write
-    # into `recvBuf[oldLen..]` after we truncate. Safe because `recvMessage`, the
-    # only caller that passes a timeout, marks csClosed itself before any later
-    # read can be issued, and seq shrink keeps capacity.
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + RecvBufSize)
-    var n: int
-    try:
-      n =
-        if timeout == ZeroDuration:
-          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize)
-        else:
-          await conn.socket.recvInto(addr conn.recvBuf[oldLen], RecvBufSize).wait(
-            timeout
-          )
-    except AsyncTimeoutError as e:
-      conn.recvBuf.setLen(oldLen)
-      raise e
-    except CancelledError as e:
-      # csClosed as for any other failure: the read may have consumed bytes, so
-      # the stream is no longer parseable. Only the exception type is preserved.
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      raise e
-    except CatchableError as e:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseTransportFailure("fillRecvBuf", e)
-    if n == 0:
-      conn.recvBuf.setLen(oldLen)
-      conn.markClosed()
-      conn.raiseClosedConnection("Connection closed by server")
-    # An orphan `recvInto` settling after csClosed must not re-extend the buffer.
-    if conn.state == csClosed:
-      conn.recvBuf.setLen(oldLen)
-      conn.raiseClosedConnection("fillRecvBuf: connection was closed during recvInto")
-    conn.recvBuf.setLen(oldLen + n)
-
-when hasChronos:
-  proc fillRecvBufDetached*(conn: PgConnection): Future[void] {.async.} =
-    ## Read into scratch then append to ``recvBuf`` (keeps ``recvBuf`` parseable while pending); errors → ``csClosed``.
-    # Entrance guard, as in ``fillRecvBuf``: no fresh read on csClosed.
-    if conn.state == csClosed:
-      conn.raiseClosedConnection("fillRecvBufDetached: connection is closed (csClosed)")
-    if conn.replReadScratch.len < RecvBufSize:
-      conn.replReadScratch.setLen(RecvBufSize)
-    let n =
-      try:
-        await conn.reader.readOnce(addr conn.replReadScratch[0], RecvBufSize)
-      except CancelledError as e:
-        conn.markClosed()
-        raise e
-      except CatchableError as e:
-        conn.markClosed()
-        conn.raiseTransportFailure("fillRecvBufDetached", e)
-    if n == 0:
-      conn.markClosed()
-      conn.raiseClosedConnection("Connection closed by server")
-    # Exit guard: a read settling after the caller flipped csClosed must not
-    # re-extend recvBuf.
-    if conn.state == csClosed:
-      conn.raiseClosedConnection(
-        "fillRecvBufDetached: connection was closed during readOnce"
-      )
-    conn.compactRecvBuf()
-    let oldLen = conn.recvBuf.len
-    conn.recvBuf.setLen(oldLen + n)
-    copyMem(addr conn.recvBuf[oldLen], addr conn.replReadScratch[0], n)
+proc checkClientEncodingStatus(
+    conn: PgConnection, name, value: string
+) {.raises: [PgProtocolError].} =
+  ## Close the connection on a non-UTF8 ``client_encoding`` report: decoders
+  ## rely on UTF8. Detected after the fact; a change reverted within one
+  ## query (a function's ``SET`` clause) is never reported.
+  if name == "client_encoding" and not isUtf8EncodingName(value):
+    conn.markClosed()
+    raise newException(
+      PgProtocolError,
+      "client_encoding changed to " & value & "; the client requires UTF8",
+    )
 
 proc nextMessage*(
     conn: PgConnection,
@@ -371,14 +506,13 @@ proc nextMessage*(
   ## corruption, this is a caller bug, not a broken peer).
   if onRow != nil and onRowError == nil:
     raise newException(PgProtocolError, "nextMessage: onRow requires onRowError")
-  var pos = conn.recvBufStart
   let maxLen = conn.effectiveMaxMessageSize()
   while true:
     var consumed: int
     let res =
       try:
         parseBackendMessage(
-          conn.recvBuf.toOpenArray(pos, conn.recvBuf.len - 1),
+          conn.recvBuf.toOpenArray(conn.recvBufStart, conn.recvBuf.len - 1),
           consumed,
           rowData,
           maxLen,
@@ -389,8 +523,7 @@ proc nextMessage*(
         raise e
     if res.state == psIncomplete:
       return none(BackendMessage)
-    pos += consumed
-    conn.recvBufStart = pos
+    conn.consumeRecv(consumed)
     if res.state == psDataRow:
       if onRow != nil:
         if onRowError[] == nil:
@@ -417,23 +550,35 @@ proc nextMessage*(
       # Distinct-key and total-byte caps reject hostile flooding (fail-closed).
       let m = res.message
       conn.recordParameterStatus(m.paramName, m.paramValue)
+      # After the caps, so the value quoted in the error stays bounded.
+      conn.checkClientEncodingStatus(m.paramName, m.paramValue)
       continue
     if res.message.kind == bmkNegotiateProtocolVersion:
       # Informational per libpq; record and drop so callers never see it.
       let m = res.message
-      conn.negotiatedMinorVersion = m.newestMinorVersion
-      conn.unrecognizedStartupOptions = m.unrecognizedOptions
+      conn.noteNegotiatedProtocol(m.newestMinorVersion, m.unrecognizedOptions)
       continue
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
+    if res.message.kind == bmkErrorResponse and
+        isSessionFatal(errorSeverity(res.message.errorFields)):
+      conn.fatalServerError = newPgQueryError(res.message.errorFields)
+    if res.message.kind == bmkErrorResponse and conn.txStatus != tsInFailedTransaction:
+      # The error that fails a block arrives before the status says so (in the
+      # block, or batched with its BEGIN); later ones only report 25P02.
+      conn.txAbortFields = res.message.errorFields
     if res.message.kind == bmkReadyForQuery:
-      # Counts down rather than clearing: a batch of per-op `Sync`s owes one
-      # reply each. `unsyncedWrite` is untouched — this reply belongs to a sync
-      # point that preceded those writes, so only a later one (in `noteWrite`)
-      # can end them.
-      if conn.pendingSyncs > 0:
-        dec conn.pendingSyncs
+      # The session answered after all, so that FATAL did not end it (a
+      # proxy's; the server closes after its own).
+      conn.fatalServerError = nil
+      if conn.txStatus != tsInFailedTransaction and
+          res.message.txStatus != tsInFailedTransaction:
+        # No failed block on either side: nothing left to name as a cause.
+        conn.txAbortFields.setLen(0)
+      # `unsyncedWrite` is untouched — this reply belongs to a sync point that
+      # preceded those writes, so only a later one (in `noteWrite`) can end them.
+      conn.settlePendingSync()
     return some(res.message)
 
 proc recvMessage*(
@@ -588,32 +733,6 @@ proc cancel*(w: RecvWatch) =
       )
   w.fut = nil
 
-proc noteWrite(conn: PgConnection, data: openArray[byte]) {.inline.} =
-  ## Book what these bytes leave the backend owing. Before the write, not
-  ## after: a failed or cancelled write may still have reached the wire, and a
-  ## ``CancelRequest`` at an idle backend is a harmless no-op.
-  let owed = outstandingReplies(data)
-  conn.pendingSyncs += owed.syncPoints
-  if owed.syncPoints > 0:
-    # A sync point ends every request written before it, so only what follows
-    # the last one stays unended.
-    conn.unsyncedWrite = owed.unsynced
-  elif owed.unsynced:
-    conn.unsyncedWrite = true
-
-proc resetWireState*(conn: PgConnection) =
-  ## Forget what the wire's previous life left behind: the buffered bytes on
-  ## both sides and the replies the old backend owed.
-  ##
-  ## Sole owner of that reset: a stale count carried onto a fresh backend would
-  ## dial a ``CancelRequest`` at an unrelated PID and retire a healthy
-  ## connection.
-  conn.recvBuf.setLen(0)
-  conn.recvBufStart = 0
-  conn.sendBuf.setLen(0)
-  conn.pendingSyncs = 0
-  conn.unsyncedWrite = false
-
 # Send helpers
 
 proc sendMsg*(conn: PgConnection, data: seq[byte]): Future[void] {.async.} =
@@ -665,6 +784,17 @@ proc sendBufMsg*(conn: PgConnection): Future[void] {.async.} =
         conn.markClosed()
         conn.raiseTransportFailure("sendBufMsg", e)
 
+proc sendStagedBufMsg*(conn: PgConnection) {.async.} =
+  ## `sendBufMsg` paired with `stagePendingStmtCloses`: drop the staged
+  ## statement Closes only once the buffer is on the wire.
+  await conn.sendBufMsg()
+  conn.dropStagedStmtCloses()
+
+proc sendStagedMsg*(conn: PgConnection, data: seq[byte]) {.async.} =
+  ## `sendMsg` counterpart, for builds that assemble their own buffer.
+  await conn.sendMsg(data)
+  conn.dropStagedStmtCloses()
+
 # Transport teardown
 
 proc closeTransportImpl(conn: PgConnection) {.async.} =
@@ -675,16 +805,11 @@ proc closeTransportImpl(conn: PgConnection) {.async.} =
     # detaching let a racing teardown close the base transport under this
     # frame's still-running TLS close. `reader`/`writer` go with them, or
     # `isConnected()` reports healthy while `peekSocket` sees no transport.
-    let tls = conn.tlsStream
-    let baseReader = conn.baseReader
-    let baseWriter = conn.baseWriter
-    let transport = conn.transport
-    conn.tlsStream = nil
-    conn.baseReader = nil
-    conn.baseWriter = nil
-    conn.transport = nil
-    conn.reader = nil
-    conn.writer = nil
+    let detached = conn.detachTransport()
+    let tls = detached.tls
+    let baseReader = detached.baseReader
+    let baseWriter = detached.baseWriter
+    let transport = detached.transport
     if tls != nil:
       try:
         await tls.reader.closeWait()
@@ -710,9 +835,8 @@ proc closeTransportImpl(conn: PgConnection) {.async.} =
       except CatchableError as e:
         conn.fireTransportCloseError(tcsTransport, e)
   elif hasAsyncDispatch:
-    if not conn.socket.isNil:
-      let socket = conn.socket
-      conn.socket = nil
+    let socket = conn.detachTransport()
+    if not socket.isNil:
       socket.close()
 
 proc closeTransport*(conn: PgConnection) {.async.} =

@@ -1,8 +1,7 @@
-import std/[options, macros, strutils, typetraits]
+import std/[options, macros, strutils, typetraits, times]
 
 import ../pg_protocol
-import core, decoding, encoding
-import accessors {.all.}
+import core, decoding, encoding, accessors
 
 # User-defined enum type support
 #
@@ -21,6 +20,37 @@ import accessors {.all.}
 # Reading rows:
 #   let m = row.getEnum[Mood](0)
 #   let m = row.getEnumOpt[Mood](0)
+
+const LabelBearingOids = [OidText, OidVarchar, OidBpchar, OidName, OidChar]
+  ## Character types whose binary payload is the label itself, so
+  ## ``SELECT status::text`` reads back as an enum.
+
+proc checkEnumOid(accessor: string, actual: int32, kind: string) =
+  ## Wire-OID guard for enum reads. Accepts dynamic OIDs and character types;
+  ## rejects explicit 0 and other built-ins. ``kind`` is ``"colOid"``/``"elemOid"``.
+  if wireOidIsDynamic(actual) or actual in LabelBearingOids:
+    return
+  if actual == 0'i32:
+    raise newException(
+      PgTypeError,
+      accessor & ": wire " & kind & "=0 is unknown (no type info from RowDescription);" &
+        " not readable as an enum in binary (drop the OID metadata or use resultFormat = rfText)",
+    )
+  raise newException(
+    PgTypeError,
+    accessor & ": wire " & kind & "=" & $actual &
+      " is not an enum (binary column type mismatch)",
+  )
+
+proc checkEnumArrayElemOid(accessor: string, actual: int32) =
+  ## Binary ``enum[]`` element guard.
+  checkEnumOid(accessor, actual, "elemOid")
+
+proc checkEnumColOid(accessor: string, row: Row, col: int) =
+  ## Scalar-enum column guard. Missing metadata skips the check; explicit OIDs judged.
+  if col < 0 or row.data == nil or row.data.colTypeOids.len <= col:
+    return
+  checkEnumOid(accessor, row.data.colTypeOids[col], "colOid")
 
 proc encodeEnumTextArray*(
     labels: seq[Option[string]]
@@ -140,14 +170,22 @@ macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
       )
 
 proc pgParseEnum[T: enum](s: string): T =
-  ## Parse an enum label, converting `ValueError` (unknown label) to `PgTypeError`
-  ## so callers can rely on the ``except PgError`` contract (see ``pg_errors``).
-  pgTypeErrorOnValueError("invalid enum value for " & name(T) & " (len=" & $s.len & ")"):
-    parseEnum[T](s)
+  ## Parse an enum label by exact match, raising `PgTypeError` for unknown ones.
+  ## Unlike ``parseEnum``, no case/underscore folding: server labels stay distinct.
+  for v in T:
+    if $v == s:
+      return v
+  raise newException(
+    PgTypeError, "invalid enum value for " & name(T) & " (len=" & $s.len & ")"
+  )
 
 proc getEnum*[T: enum](row: Row, col: int): T =
   ## Read a PostgreSQL enum column (text format) as a Nim enum.
   ## The column value must exactly match one of ``T``'s string representations.
+  ## In binary, built-in OIDs are rejected (stringified scalars would collide
+  ## with labels).
+  if row.isBinaryCol(col) and not row.isNull(col):
+    checkEnumColOid("getEnum", row, col)
   let s = row.getStr(col)
   try:
     pgParseEnum[T](s)
@@ -171,6 +209,7 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
     rejectMultiDim(decoded)
+    checkEnumArrayElemOid("getEnumArray", decoded.elemOid)
     result = newSeq[T](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -198,6 +237,7 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
       raise newException(PgTypeError, "Column " & $col & " is NULL")
     let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
     rejectMultiDim(decoded)
+    checkEnumArrayElemOid("getEnumArrayElemOpt", decoded.elemOid)
     result = newSeq[Option[T]](decoded.elements.len)
     for i, e in decoded.elements:
       if e.len == -1:
@@ -349,6 +389,13 @@ proc encodeCompositeText*(fields: seq[Option[string]]): string {.raises: [].} =
       result.add(compositeFieldToText(f.get))
   result.add(')')
 
+proc compositeDateTimeToText(dt: DateTime): string =
+  ## Text form of a composite DateTime field. The UTC offset is mandatory:
+  ## without it a timestamptz field is reinterpreted in the session TimeZone.
+  # Window check only: the field may be a date, whose range is wider.
+  checkPgDateTime(dt, " in composite field")
+  pgUtcText(dt.toTime(), "MM-dd HH:mm:ss'.'ffffffzzz")
+
 macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
   ## Generate ``toPgParam`` for a Nim object as a PostgreSQL composite type.
   ## Each field is sent as text inside the composite text format.
@@ -362,9 +409,14 @@ macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
       for _, val in v.fieldPairs:
         when typeof(val) is Option:
           if val.isSome:
-            fields.add(some($val.get))
+            when typeof(val.get) is DateTime:
+              fields.add(some(compositeDateTimeToText(val.get)))
+            else:
+              fields.add(some($val.get))
           else:
             fields.add(none(string))
+        elif typeof(val) is DateTime:
+          fields.add(some(compositeDateTimeToText(val)))
         else:
           fields.add(some($val))
       PgParam(
@@ -391,6 +443,8 @@ proc compositeFieldFromText[T](s: string): T =
     parsePgBoolText(s)
   elif T is PgNumeric:
     parsePgNumeric(s)
+  elif T is DateTime:
+    parseTimestampText(s)
   else:
     raise newException(PgTypeError, "Unsupported composite field type")
 
@@ -416,7 +470,7 @@ template checkFieldOid(actual: int32, allowed: openArray[int32], typeName: strin
 
 template decodeBinaryField(val, buf: untyped, fOid: int32, fOff, fEnd, fLen: int) =
   when typeof(val) is string:
-    checkFieldOid(fOid, [OidText, OidVarchar], "string")
+    checkFieldOid(fOid, LabelBearingOids, "string")
     val = readString(buf, fOff, fLen)
   elif typeof(val) is int16:
     checkFieldOid(fOid, [OidInt2], "int16")
@@ -442,6 +496,10 @@ template decodeBinaryField(val, buf: untyped, fOid: int32, fOff, fEnd, fLen: int
     checkFieldOid(fOid, [OidBool], "bool")
     checkFieldLen(fLen, 1, "bool")
     val = buf[fOff] != 0
+  elif typeof(val) is DateTime:
+    checkFieldOid(fOid, [OidTimestamp, OidTimestampTz], "DateTime")
+    checkFieldLen(fLen, 8, "DateTime")
+    val = decodeBinaryTimestamp(buf.toOpenArray(fOff, fEnd))
   else:
     val = compositeFieldFromText[typeof(val)](readString(buf, fOff, fLen))
 
@@ -534,12 +592,16 @@ proc getDomain*[T: distinct](row: Row, col: int): T =
     T(row.getInt64(col))
   elif distinctBase(T) is float64:
     T(row.getFloat(col))
+  elif distinctBase(T) is float32:
+    T(row.getFloat32(col))
   elif distinctBase(T) is bool:
     T(row.getBool(col))
+  elif distinctBase(T) is DateTime:
+    T(row.getTimestamp(col))
   else:
     {.
       error:
-        "Unsupported domain base type: use string, int16, int32, int64, float64, or bool"
+        "Unsupported domain base type: use string, int16, int32, int64, float32, float64, bool, or DateTime"
     .}
 
 proc getDomainOpt*[T: distinct](row: Row, col: int): Option[T] =

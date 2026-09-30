@@ -111,7 +111,9 @@ waitFor main()
 - **Connection pool (`PgPool` / `PgPoolCluster`)** — broken connections are detected and discarded automatically. On `acquire`, entries whose state is not `csReady` (or that fail the optional `ping` health check) are retired and replaced. On `release`, connections left in a non-ready or in-transaction state are also closed rather than returned to the idle queue. Configure `healthCheckTimeout` / `pingTimeout` to tune idle-connection probing.
 - **Direct `PgConnection`** — no automatic reconnection for regular queries. Per-query retry would be unsafe for non-idempotent statements and in-flight transactions, so a closed connection must be replaced by calling `connect(...)` again (or by using the pool). Inspect `conn.isConnected()` or `conn.state` to decide whether a handle is still usable.
 - **Configuration faults** — a `PgConfigError` (a cert, key or CA that will not load, `sslcert` without `sslkey`, `sslmode=verify-ca` without `sslrootcert`, …) is deliberately *not* a `PgConnectionError`. `connect(...)` raises it in place of the per-host aggregate, so a reconnect-on-`PgConnectionError` loop never retries a fault no retry can fix. A pool reports it as a `PgPoolError` of kind `pekConfigFault` and stops opening connections, since its config cannot change.
-- **LISTEN/NOTIFY** — this is the one exception. The listen pump reconnects with exponential backoff (up to 10 attempts, 30 s cap) and re-subscribes to all channels. Register a `reconnectCallback` if you need to resynchronise application state after a reconnect. If reconnection is ultimately exhausted the pump gives up permanently. The failure surfaces as one of two types, chosen by what the recovery is:
+- **Retry classification** — `retryAdvice(err)` returns `raRetry`, `raStop` or `raUnclear` for any failure; `isTransientError(err)` is the `raRetry` case. `raRetry` does not make replaying safe — a connection lost during `COMMIT` may have committed — and retries need a cap regardless. See [pg_errors](https://fox0430.github.io/async-postgres/async_postgres/pg_errors.html).
+- **Refusals** — a server refusing the config itself (`28P01`, `3D000`, `42501` at startup) is `raStop`. A pool reports it as `pekRefused` and keeps it in `PgPool.connectRefusal`, but unlike a config fault keeps dialing, so a server-side fix is picked up. See [pg_pool](https://fox0430.github.io/async-postgres/async_postgres/pg_pool.html).
+- **LISTEN/NOTIFY** — this is the one exception. The listen pump reconnects with exponential backoff (up to 10 attempts, 30 s cap) and re-subscribes to all channels. Register a `reconnectCallback` if you need to resynchronise application state after a reconnect. If reconnection is ultimately exhausted the pump gives up permanently; a refusal or a config fault ends it at once. The failure surfaces as one of two types, chosen by what the recovery is:
   - `PgListenError` (a `PgConnectionError`) — the connection itself is gone; recover by re-dialling with `connect(...)`.
   - `PgListenStoppedError` (a `PgStateError`, deliberately *not* a `PgConnectionError`) — the pump died but the transport is still usable; recover by calling `listen` again. A reconnect-on-`PgConnectionError` loop must not re-dial here, which is why this type sits outside that hierarchy.
 
@@ -134,21 +136,20 @@ nim c -d:asyncBackend=chronos your_app.nim
 **chronos is recommended.** chronos supports proper future cancellation, which enables reliable timeout handling and clean connection teardown. asyncdispatch lacks real cancellation — timed-out futures continue running in the background, and `cancelAndWait` is a no-op.
 
 SSL backend differs by async backend:
-- asyncdispatch: OpenSSL (requires `-d:ssl`)
+- asyncdispatch: OpenSSL (requires `-d:ssl`; without it `sslmode=prefer`/`allow`
+  connect in plaintext, and settings that need TLS raise `PgConfigError`)
 - chronos: BearSSL (via [nim-bearssl](https://github.com/status-im/nim-bearssl); TLS 1.2 only due to BearSSL limitation)
 
 Client certificate authentication (mTLS) is enabled by setting `sslCert` and
 `sslKey` on `ConnConfig` (or `sslcert=` / `sslkey=` in a DSN, which load the
 files from disk). Both must be provided together, and `sslMode` must be
-`sslPrefer` or stronger (`sslcert`/`sslkey` paired with `sslDisable` or
-`sslAllow` is rejected at config time because TLS would not be negotiated).
-The private key must be **unencrypted** on both backends — neither chronos
-(BearSSL) nor asyncdispatch (OpenSSL) is wired to a passphrase callback. On
-chronos the key specifically must be PKCS#8 PEM (RSA or EC); PKCS#1 is not
-supported. When loaded via DSN on POSIX, the `sslkey` file must not have any group
-or world permission bits set. This is intentionally stricter than libpq
-(which permits owner-group-read `0o640` for root-owned keys); tighten
-offending keys with `chmod 0600` (or `0400`).
+`sslPrefer` or stronger (otherwise it is rejected at config time). The key
+must be an **unencrypted** PKCS#8, PKCS#1 or SEC1 PEM; no passphrase callback
+is wired up on either backend. On chronos, `TRUSTED CERTIFICATE` blocks
+(`openssl x509 -trustout`) are ignored in `sslrootcert` because BearSSL cannot
+honour their trust settings; export CAs as plain `CERTIFICATE`. When loaded
+via DSN on POSIX, the `sslkey` file must have no group or world permission
+bits (stricter than libpq's `0o640` for root-owned keys); use `chmod 0600`.
 
 Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
 stronger. On the chronos backend it needs chronos >= 4.4.0 for ALPN support.
@@ -159,7 +160,7 @@ The [examples](examples/) directory contains runnable samples:
 
 - [basic_query](examples/basic_query.nim) — Connect, insert, and query rows
 - [query_variants](examples/query_variants.nim) — `queryExists` / `queryValueOrDefault` / `queryValueOpt` / `queryRowOpt` / `queryColumn` / `queryEach` / `simpleExec` / `simpleQuery`
-- [query_direct](examples/query_direct.nim) — Zero-allocation `queryDirect` / `execDirect` macros for hot paths
+- [query_direct](examples/query_direct.nim) — Low-allocation `queryDirect` / `execDirect` macros for hot paths (parameter encoding is allocation-free)
 - [prepared_statement](examples/prepared_statement.nim) — Server-side prepared statements
 - [transaction](examples/transaction.nim) — Transaction control with rollback and isolation levels
 - [cursor](examples/cursor.nim) — Server-side cursors for streaming large result sets

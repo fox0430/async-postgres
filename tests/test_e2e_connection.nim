@@ -1,10 +1,6 @@
-import std/[unittest, options, tables, math, net]
+import std/[unittest, options, tables]
 
-import
-  ../async_postgres/[async_backend, pg_protocol, pg_types, pg_client, pg_connection]
-
-when hasAsyncDispatch:
-  import std/strutils
+import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
 
@@ -76,6 +72,23 @@ suite "E2E: ConnConfig Options":
 
     waitFor t()
 
+  test "client_encoding is pinned to UTF8":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.extraParams = @[("client_encoding", "utf-8")]
+      let conn = await connect(cfg)
+      doAssert conn.serverParam("client_encoding") == "UTF8"
+      var raised = false
+      try:
+        discard await conn.simpleQuery("SET client_encoding TO 'SJIS'")
+      except PgProtocolError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csClosed
+      await conn.close()
+
+    waitFor t()
+
   test "connectTimeout raises on unreachable host":
     proc t() {.async.} =
       var cfg = plainConfig()
@@ -111,6 +124,21 @@ suite "E2E: SSL Connection":
 
     waitFor t()
 
+  test "require_auth=scram-sha-256 connects over SSL, channel binding or not":
+    # libpq's scram-sha-256 covers SCRAM-SHA-256-PLUS, which the server offers.
+    # Only cbRequire proves that here; test_ssl pins each mode's choice.
+    proc t(cb: ChannelBindingMode) {.async.} =
+      var cfg = sslConfig(sslRequire)
+      cfg.requireAuth = {amScramSha256}
+      cfg.channelBinding = cb
+      let conn = await connect(cfg)
+      doAssert conn.sslEnabled == true
+      await conn.close()
+
+    for cb in [cbPrefer, cbRequire, cbDisable]:
+      checkpoint "channelBinding=" & $cb
+      waitFor t(cb)
+
   test "sslPrefer connects with SSL when server supports it":
     proc t() {.async.} =
       let conn = await connect(sslConfig(sslPrefer))
@@ -134,6 +162,9 @@ suite "E2E: SSL Connection":
       let conn = await connect(sslConfig(sslAllow))
       doAssert conn.state == csReady
       doAssert conn.sslEnabled == false
+      # The plaintext leg keeps sslmode=allow, so a reconnect still tries TLS
+      # (libpq `PQreset` parity).
+      doAssert conn.config.sslMode == sslAllow
       await conn.close()
 
     waitFor t()
@@ -242,7 +273,7 @@ suite "E2E: SSL Verification":
           )
         )
         await conn.close()
-      except CatchableError:
+      except PgSecurityError:
         raised = true
       doAssert raised
 
@@ -264,7 +295,7 @@ suite "E2E: SSL Verification":
           )
         )
         await conn.close()
-      except CatchableError:
+      except PgSecurityError:
         raised = true
       doAssert raised
 

@@ -6,6 +6,7 @@ import pkg/nimcrypto/pbkdf2
 import pkg/nimcrypto/utils as ncutils
 
 import pg_errors, pg_saslprep
+from pg_types/core import isPgUIntText, pgParseIntView, pipOk
 
 template burnStr*(s: var string) =
   ## Wipe a string's heap buffer. Compiler is prevented from eliding the
@@ -23,7 +24,9 @@ type ScramState* = object
   ## Intermediate state for SCRAM-SHA-256 authentication handshake.
   clientNonce*: string
   clientFirstBare*: string
-  serverSignature*: array[32, byte]
+  serverSignature: array[32, byte]
+    ## Private so it can only be cleared together with ``serverSignatureSet``.
+  serverSignatureSet: bool ## serverSignature holds a computed, unwiped value
   gs2Header*: string
     ## GS2 header: "n,," (no channel binding), "y,," (channel binding supported
     ## but not negotiated — downgrade-detection signal), or
@@ -61,6 +64,41 @@ proc scramEscapeUsername*(user: string): string =
   ## '=' is encoded as '=3D' and ',' is encoded as '=2C'.
   result = user.replace("=", "=3D").replace(",", "=2C")
 
+proc wipeServerSignature*(state: var ScramState) =
+  ## Wipe the expected server signature; it would aid an attacker
+  ## impersonating the server. Later verification against it fails.
+  ncutils.burnMem(state.serverSignature)
+  state.serverSignatureSet = false
+
+func channelBound*(state: ScramState): bool =
+  ## The client-first carried a channel binding (SCRAM-SHA-256-PLUS).
+  state.gs2Header.startsWith("p=")
+
+proc scramClientFirstMessage(
+    user: string,
+    nonce: string,
+    state: var ScramState,
+    cbType: string = "",
+    cbData: seq[byte] = @[],
+    cbSupportedButUnused: bool = false,
+): seq[byte] =
+  ## Fixed-nonce variant, kept private for deterministic test vectors.
+  # An empty nonce would make any server nonce pass the prefix check.
+  doAssert nonce.len > 0 and nonce.allCharsInSet({'\x21' .. '\x7E'} - {','}),
+    "SCRAM nonce must be non-empty printable ASCII without ','"
+  state.wipeServerSignature()
+  state.clientNonce = nonce
+  state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & nonce
+  state.gs2Header =
+    if cbType.len > 0:
+      "p=" & cbType & ",,"
+    elif cbSupportedButUnused:
+      "y,,"
+    else:
+      "n,,"
+  state.channelBindingData = cbData
+  result = toBytes(state.gs2Header & state.clientFirstBare)
+
 proc scramClientFirstMessage*(
     user: string,
     state: var ScramState,
@@ -77,18 +115,14 @@ proc scramClientFirstMessage*(
   var nonceBuf: array[24, byte]
   let n = randomBytes(nonceBuf)
   if n != 24:
+    # A reused state must not carry the previous exchange's signature or
+    # channel binding.
+    state.wipeServerSignature()
+    state = ScramState()
     raise newException(PgConnectionError, "SCRAM: failed to generate random nonce")
-  state.clientNonce = base64.encode(nonceBuf)
-  state.clientFirstBare = "n=" & scramEscapeUsername(user) & ",r=" & state.clientNonce
-  state.gs2Header =
-    if cbType.len > 0:
-      "p=" & cbType & ",,"
-    elif cbSupportedButUnused:
-      "y,,"
-    else:
-      "n,,"
-  state.channelBindingData = cbData
-  result = toBytes(state.gs2Header & state.clientFirstBare)
+  scramClientFirstMessage(
+    user, base64.encode(nonceBuf), state, cbType, cbData, cbSupportedButUnused
+  )
 
 proc scramClientFinalMessage*(
     password: string,
@@ -98,6 +132,8 @@ proc scramClientFinalMessage*(
 ): seq[byte] =
   ## Generate the SCRAM-SHA-256 client-final message from the server's first response.
   ## Computes the client proof and stores the expected server signature in `state`.
+  # A rejected server-first must not leave an earlier signature verifiable.
+  state.wipeServerSignature()
   let serverFirstMsg = toString(serverFirstData)
   var combinedNonce, saltB64: string
   var iterations: int
@@ -110,19 +146,18 @@ proc scramClientFinalMessage*(
       saltB64 = part[2 .. ^1]
       hasSalt = true
     elif part.startsWith("i="):
-      try:
-        iterations = parseInt(part[2 .. ^1])
-      except ValueError:
-        raise newException(PgConnectionError, "SCRAM: invalid iteration count")
+      if not isPgUIntText(part.toOpenArray(2, part.high)) or
+          pgParseIntView(part.toOpenArray(2, part.high), iterations) != pipOk:
+        raise newException(PgProtocolError, "SCRAM: invalid iteration count")
       hasIterations = true
 
   if not hasNonce:
-    raise newException(PgConnectionError, "SCRAM: server response missing nonce (r=)")
+    raise newException(PgProtocolError, "SCRAM: server response missing nonce (r=)")
   if not hasSalt:
-    raise newException(PgConnectionError, "SCRAM: server response missing salt (s=)")
+    raise newException(PgProtocolError, "SCRAM: server response missing salt (s=)")
   if not hasIterations:
     raise newException(
-      PgConnectionError, "SCRAM: server response missing iteration count (i=)"
+      PgProtocolError, "SCRAM: server response missing iteration count (i=)"
     )
   if iterations < 4096:
     # RFC 5802 sets no floor, but PostgreSQL's default (and the hardcoded
@@ -130,24 +165,24 @@ proc scramClientFinalMessage*(
     # A malicious server returning a low count would make an offline brute-force
     # of the password from the ClientProof dramatically cheaper, so reject it.
     # Stricter than libpq, which accepts any count the server sends.
-    raise newException(
-      PgConnectionError, "SCRAM: iteration count too small: " & $iterations
-    )
+    raise
+      newException(PgSecurityError, "SCRAM: iteration count too small: " & $iterations)
   if iterations > maxIterations:
+    # Our own cost cap, not a failure to verify the server.
     raise newException(
       PgConnectionError, "SCRAM: iteration count too large: " & $iterations
     )
 
   if not combinedNonce.startsWith(state.clientNonce):
     raise newException(
-      PgConnectionError, "SCRAM: server nonce doesn't start with client nonce"
+      PgSecurityError, "SCRAM: server nonce doesn't start with client nonce"
     )
 
   let salt =
     try:
       base64.decode(saltB64)
     except ValueError:
-      raise newException(PgConnectionError, "SCRAM: invalid base64 in salt")
+      raise newException(PgProtocolError, "SCRAM: invalid base64 in salt")
 
   var saltedPassword: seq[byte]
   var clientKey, storedKey, clientSignature, serverKey: array[32, byte]
@@ -172,6 +207,7 @@ proc scramClientFinalMessage*(
 
     serverKey = sha256.hmac(saltedPassword, "Server Key").data
     state.serverSignature = sha256.hmac(serverKey, authMessage).data
+    state.serverSignatureSet = true
 
     result = toBytes(clientFinalWithoutProof & ",p=" & base64.encode(clientProof))
   finally:
@@ -317,11 +353,15 @@ proc computeTlsServerEndpoint*(certDer: openArray[byte]): seq[byte] =
     result = @(sha256.digest(certDer).data)
 
 proc scramVerifyServerFinal*(
-    serverFinalData: openArray[byte], state: ScramState
+    serverFinalData: openArray[byte], state: var ScramState
 ): bool =
-  ## Verify the server's final SCRAM-SHA-256 signature matches the expected value.
-  ## The caller is expected to wipe `state.serverSignature` after verification
-  ## since it is no longer needed and would aid an attacker impersonating the server.
+  ## Verify the server's final SCRAM-SHA-256 signature matches the expected value,
+  ## then wipe it, so each computed signature is checked at most once. Fails if
+  ## ``scramClientFinalMessage`` has not computed it or it was wiped.
+  if not state.serverSignatureSet:
+    return false
+  defer:
+    state.wipeServerSignature()
   let serverFinalMsg = toString(serverFinalData)
   if not serverFinalMsg.startsWith("v="):
     return false
