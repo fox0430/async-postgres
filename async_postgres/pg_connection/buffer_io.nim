@@ -167,6 +167,10 @@ proc dialError(failures: openArray[DialFailure]): ref PgConnectionError {.raises
 proc unresolved(host: string): ref PgConnectionError =
   newException(PgUnavailableError, "Could not resolve host: " & host)
 
+func lookupFailed(host, reason: string): string =
+  ## A failed lookup of ``host``, worded alike on every platform.
+  "Could not resolve host " & host & ": " & reason
+
 when defined(posix):
   proc lookup(host: string, port: int): ptr posix.AddrInfo =
     ## ``host``'s TCP addresses, to free with ``freeAddrInfo``. An unknown name
@@ -183,7 +187,7 @@ when defined(posix):
           $posix.strerror(sysErr)
         else:
           $posix.gai_strerror(rc)
-      let msg = "Could not resolve host " & host & ": " & reason
+      let msg = lookupFailed(host, reason)
       if rc in [
         posix.EAI_FAIL, posix.EAI_FAMILY, posix.EAI_SOCKTYPE, posix.EAI_SERVICE,
         posix.EAI_BADFLAGS,
@@ -234,7 +238,8 @@ when hasChronos:
         result = resolveTAddress(host, Port(port))
       except TransportAddressError as e:
         # Its resolver code is lost here: judged as a name not known yet.
-        raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+        raise
+          (ref PgUnavailableError)(msg: lookupFailed(host, oneLine(e.msg)), parent: e)
     if result.len == 0:
       raise unresolved(host)
 
@@ -330,9 +335,10 @@ elif hasAsyncDispatch:
           getAddrInfo(host, Port(port), Domain.AF_UNSPEC)
         except OSError as e:
           const WSANO_RECOVERY = 11003 # as EAI_FAIL
+          let msg = lookupFailed(host, oneLine(e.msg))
           if e.errorCode == WSANO_RECOVERY:
-            raise (ref PgConnectionError)(msg: e.msg, parent: e)
-          raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+            raise (ref PgConnectionError)(msg: msg, parent: e)
+          raise (ref PgUnavailableError)(msg: msg, parent: e)
       try:
         var it = aiList
         while it != nil:
