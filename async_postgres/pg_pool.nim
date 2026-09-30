@@ -2296,7 +2296,8 @@ proc notify*(
 
 macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction using a pooled connection.
-  ## On exception, ROLLBACK is issued automatically.
+  ## On exception, ROLLBACK is issued automatically. A COMMIT the server rolled
+  ## back raises `PgQueryError` (`25P02`), as in the `PgConnection` overload.
   ## Using `return` inside the body is a compile-time error.
   ##
   ## Usage:
@@ -2356,6 +2357,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
+  let commitSym = bindSym"commitTx"
   let releaseCall = quote:
     `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
   let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
@@ -2369,7 +2371,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
       discard await `connIdent`.simpleExec(`beginSql`, timeout = `txTimeout`)
       try:
         `body`
-        discard await `connIdent`.simpleExec("COMMIT", timeout = `txTimeout`)
+        await `commitSym`(`connIdent`, `txTimeout`)
       except CancelledError as `cancelSym`:
         # Skip ROLLBACK on cancel; invalidate so release() discards.
         `invalidateCancelSym`(`connIdent`, releaseTransport = false)
@@ -2395,7 +2397,9 @@ macro withTransactionRetry*(
   ## `RetryOptions`). The pooled connection is acquired once and reused across
   ## attempts; a ROLLBACK between attempts returns it to a clean `tsIdle` state.
   ## On a non-retryable error, or once `maxAttempts` is exhausted, the last
-  ## exception propagates. Using `return` inside the body is a compile-time error.
+  ## exception propagates. A COMMIT the server rolled back raises `PgQueryError`
+  ## (`25P02`), retried as in the `PgConnection` overload.
+  ## Using `return` inside the body is a compile-time error.
   ##
   ## Usage:
   ##   pool.withTransactionRetry(RetryOptions(maxAttempts: 3), conn):
@@ -2468,7 +2472,8 @@ macro withTransactionRetry*(
 macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single
   ## wall-clock deadline that covers `pool.acquire()`, BEGIN, the body, and
-  ## COMMIT together.
+  ## COMMIT together. A COMMIT the server rolled back raises `PgQueryError`
+  ## (`25P02`), as in `withTransaction`.
   ##
   ## Usage:
   ##   pool.withTransactionDeadline(conn, seconds(5)):
@@ -2555,6 +2560,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let graceSym = bindSym"rollbackGrace"
   let retireSym = bindSym"retireOnTimeout"
   let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
+  let commitSym = bindSym"commitTx"
 
   # asyncdispatch-safe release (see `buildReleaseAndReraise`): `releasedSym`
   # is set on release, success or failure, as the old try/finally did.
@@ -2575,9 +2581,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
         )
         try:
           `body`
-          discard await `connIdent`.simpleExec(
-            "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
-          )
+          await `commitSym`(`connIdent`, `remainingSym`(`deadlineMomentSym`))
         except CancelledError as `cancelSym`:
           # Skip ROLLBACK on body-cancel; the outer handler aborts server-side.
           raise `cancelSym`
@@ -2670,7 +2674,9 @@ macro withTransactionRetryDeadline*(
   ## in-flight connection is handled as in `withTransactionDeadline`.
   ## **On a retryable error:**
   ## ROLLBACK runs with `rollbackGrace` and the transaction is retried if budget
-  ## remains. See `withTransactionDeadline` for the acquire-race / `completed()`
+  ## remains. A COMMIT the server rolled back (`25P02`) is retried as in
+  ## `withTransactionRetry`.
+  ## See `withTransactionDeadline` for the acquire-race / `completed()`
   ## rationale and the in-body `conn.exec(...)` warning. **Idempotency:** `body`
   ## runs once per attempt; non-database side effects repeat. Using `return`
   ## inside the body is a compile-time error.
@@ -2745,6 +2751,7 @@ macro withTransactionRetryDeadline*(
     catchableCleanup = newStmtList(),
   )
   let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
+  let commitSym = bindSym"commitTx"
   result = quote:
     let `poolSym` = `poolExpr`
     let `retryOptsSym` = `retryOpts`
@@ -2766,9 +2773,7 @@ macro withTransactionRetryDeadline*(
         )
         try:
           `body`
-          discard await `connIdent`.simpleExec(
-            "COMMIT", timeout = `remainingSym`(`deadlineMomentSym`)
-          )
+          await `commitSym`(`connIdent`, `remainingSym`(`deadlineMomentSym`))
         except CancelledError as `cancelSym`:
           # See withTransactionDeadline — skip ROLLBACK on body-cancel.
           raise `cancelSym`

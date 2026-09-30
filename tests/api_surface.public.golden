@@ -851,6 +851,7 @@ async_postgres/pg_errors.nim	SqlStateDeadlockDetected
 async_postgres/pg_errors.nim	SqlStateDuplicateObject
 async_postgres/pg_errors.nim	SqlStateExclusionViolation
 async_postgres/pg_errors.nim	SqlStateForeignKeyViolation
+async_postgres/pg_errors.nim	SqlStateInFailedSqlTransaction
 async_postgres/pg_errors.nim	SqlStateNotNullViolation
 async_postgres/pg_errors.nim	SqlStateQueryCanceled
 async_postgres/pg_errors.nim	SqlStateSerializationFailure

@@ -354,6 +354,11 @@ type
     fatalServerError: ref PgQueryError
       ## The FATAL/PANIC ErrorResponse that ended the session; attached to
       ## closed-connection errors as ``serverError``.
+    txAbortFields: seq[ErrorField]
+      ## Fields of the last ErrorResponse received while not in a failed block,
+      ## so in one, the error that failed it. Kept past that block's end, so a
+      ## COMMIT answered with ROLLBACK can name the cause, until that COMMIT
+      ## takes it or a ReadyForQuery with no failed block on either side.
     listenReconnectMaxAttempts: int
       ## Max reconnect attempts on listen pump failure. Default 10.
       ## 0 or negative = unlimited retries (retry until close()).
@@ -1070,6 +1075,9 @@ proc closedByUser*(conn: PgConnection): var bool {.inline.} =
 
 proc fatalServerError*(conn: PgConnection): var ref PgQueryError {.inline.} =
   conn.fatalServerError
+
+proc txAbortFields*(conn: PgConnection): var seq[ErrorField] {.inline.} =
+  conn.txAbortFields
 
 proc reconnectCallback*(conn: PgConnection): var ReconnectCallback {.inline.} =
   conn.reconnectCallback

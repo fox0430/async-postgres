@@ -356,6 +356,29 @@ template awaitVoidOrInvalidate*(
       connExpr.invalidateOnCancel()
       raise e
 
+template tracedSimpleExec*(
+    conn: PgConnection,
+    stmt: string,
+    timeout: Duration,
+    reason: static string,
+    tag: untyped,
+    check: untyped,
+) =
+  ## ``simpleExec``'s traced, timeout-bounded core, storing the last tag in
+  ## ``tag``. ``check`` runs inside the trace, so ``onQueryEnd`` reports what it
+  ## raises.
+  # Not `sql`: a template param would also replace the `sql:` field name below.
+  withConnTracing(
+    conn,
+    onQueryStart,
+    onQueryEnd,
+    TraceQueryStartData(sql: stmt, isExec: true),
+    TraceQueryEndData,
+    TraceQueryEndData(commandTag: tag),
+  ):
+    awaitOrInvalidate(conn, tag, simpleExecImpl(conn, stmt), timeout, reason)
+    check
+
 proc simpleExec*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CommandResult] {.async.} =
@@ -364,17 +387,8 @@ proc simpleExec*(
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var tag: string
-  withConnTracing(
-    conn,
-    onQueryStart,
-    onQueryEnd,
-    TraceQueryStartData(sql: sql, isExec: true),
-    TraceQueryEndData,
-    TraceQueryEndData(commandTag: tag),
-  ):
-    awaitOrInvalidate(
-      conn, tag, simpleExecImpl(conn, sql), timeout, "simpleExec timed out"
-    )
+  tracedSimpleExec(conn, sql, timeout, "simpleExec timed out", tag):
+    discard
   return initCommandResult(tag)
 
 proc simpleQuery*(

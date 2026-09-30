@@ -246,6 +246,7 @@ const
   SqlStateUniqueViolation* = "23505"
   SqlStateCheckViolation* = "23514"
   SqlStateExclusionViolation* = "23P01"
+  SqlStateInFailedSqlTransaction* = "25P02"
   SqlStateSerializationFailure* = "40001"
   SqlStateDeadlockDetected* = "40P01"
   SqlStateSyntaxError* = "42601"
@@ -363,7 +364,14 @@ func verdict(e: ref CatchableError): Verdict {.raises: [], gcsafe.} =
     # A cert that will not load, contradicting sslmode options: permanent.
     vHopeless
   elif e of PgQueryError:
-    if isTransientServerError((ref PgQueryError)(e)): vRetry else: vUnclear
+    let qe = (ref PgQueryError)(e)
+    if qe.sqlState == SqlStateInFailedSqlTransaction and qe.parent of PgQueryError:
+      # A COMMIT answered with ROLLBACK: the error that failed the block decides.
+      verdict((ref PgQueryError)(qe.parent))
+    elif isTransientServerError(qe):
+      vRetry
+    else:
+      vUnclear
   elif e of PgConnectionError:
     let ce = (ref PgConnectionError)(e)
     if ce.attempts.len > 0:
@@ -449,7 +457,8 @@ func isTransientError*(e: ref CatchableError): bool {.raises: [], gcsafe.} =
   ## ``connectTimeout``, a pool's full queue or acquire timeout, or a server
   ## error whose SQLSTATE may clear (``40001``, ``57P03``, a FATAL ``08xxx``,
   ## ...). Errors with ``attempts`` are judged by them (for ``connect``, every
-  ## host must clear); anything unclassified is not transient.
+  ## host must clear), and the ``25P02`` raised for a COMMIT answered with
+  ## ROLLBACK by its ``parent``; anything unclassified is not transient.
   ##
   ## True does not mean the connection is gone (check ``conn.state``) or that
   ## replaying is safe (a lost ``COMMIT`` may have committed). Cap retries.

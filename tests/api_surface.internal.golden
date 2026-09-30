@@ -81,6 +81,7 @@ async_postgres/pg_client/transaction.nim	buildTxBeginAndTimeout
 async_postgres/pg_client/transaction.nim	checkNoBodyEscape
 async_postgres/pg_client/transaction.nim	checkNoBodyEscapePost
 async_postgres/pg_client/transaction.nim	checkTemplateBodyEscape
+async_postgres/pg_client/transaction.nim	commitTx
 async_postgres/pg_client/transaction.nim	rollbackGrace
 async_postgres/pg_client/transaction.nim	rollbackGraceMs
 async_postgres/pg_connection/buffer_io.nim	DialStream
@@ -130,6 +131,7 @@ async_postgres/pg_connection/simple_query.nim	checkReady
 async_postgres/pg_connection/simple_query.nim	checkTxIdle
 async_postgres/pg_connection/simple_query.nim	invalidateOnCancel
 async_postgres/pg_connection/simple_query.nim	retireOnTimeout
+async_postgres/pg_connection/simple_query.nim	tracedSimpleExec
 async_postgres/pg_connection/ssl.nim	negotiateSSL
 async_postgres/pg_connection/ssl.nim	sniName
 async_postgres/pg_connection/ssl.nim	validateDirectSslCompatible
@@ -345,6 +347,7 @@ async_postgres/pg_connection/types.nim	tlsStream
 async_postgres/pg_connection/types.nim	tracer
 async_postgres/pg_connection/types.nim	transport
 async_postgres/pg_connection/types.nim	transportCloseFut
+async_postgres/pg_connection/types.nim	txAbortFields
 async_postgres/pg_connection/types.nim	unregisterNotifyWaiter
 async_postgres/pg_connection/types.nim	updateReplMaxReceivedLsn
 async_postgres/pg_connection/types.nim	validateClientCertConfig
