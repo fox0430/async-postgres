@@ -78,6 +78,7 @@ jobs:
         run: nimble apiSurface -y
 
       - name: Generate test certificates
+        if: runner.os == 'Linux'
         run: bash tests/gen_certs.sh
 
       # macOS and Windows runners cannot run the Linux PostgreSQL container.

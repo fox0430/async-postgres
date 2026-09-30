@@ -8,6 +8,14 @@
 
 set -euo pipefail
 
+# openssl's stderr is discarded below, so name the command that failed.
+trap 'echo "error: gen_certs.sh line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+# Git Bash on Windows rewrites arguments that look like POSIX paths before
+# running a native openssl, turning `-subj "/CN=..."` into a Windows path.
+# Exempt only the subjects so the file paths are still converted.
+export MSYS2_ARG_CONV_EXCL="/CN="
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CERT_DIR="${SCRIPT_DIR}/certs"
 mkdir -p "${CERT_DIR}"
@@ -68,6 +76,9 @@ if [[ "${REGENERATE:-}" == "1" ]] || ! all_present "${CORE[@]}"; then
     2>/dev/null
 
   # --- Sign server cert with CA (SAN: DNS:localhost, IP:127.0.0.1) ---
+  # A file, not process substitution: a native Windows openssl cannot open
+  # Git Bash's /dev/fd pipe.
+  printf "subjectAltName=DNS:localhost,IP:127.0.0.1\n" >"${CERT_DIR}/server.ext"
   openssl x509 -req \
     -in "${CERT_DIR}/server.csr" \
     -CA "${CERT_DIR}/ca.crt" \
@@ -75,7 +86,7 @@ if [[ "${REGENERATE:-}" == "1" ]] || ! all_present "${CORE[@]}"; then
     -CAcreateserial \
     -days 3650 \
     -out "${CERT_DIR}/server.crt" \
-    -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1") \
+    -extfile "${CERT_DIR}/server.ext" \
     2>/dev/null
 
   # PostgreSQL requires server.key to be readable only by owner
@@ -139,7 +150,7 @@ if [[ ! -f "${CERT_DIR}/ec.key" ]]; then
 fi
 
 # Clean up intermediates
-rm -f "${CERT_DIR}/server.csr" "${CERT_DIR}/ca.srl"
+rm -f "${CERT_DIR}/server.csr" "${CERT_DIR}/server.ext" "${CERT_DIR}/ca.srl"
 
 echo "Certificates generated in ${CERT_DIR}:"
 ls -la "${CERT_DIR}"
