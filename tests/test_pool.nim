@@ -2610,6 +2610,11 @@ when hasChronos:
         # borrowed; the other two acquires either queue as waiters or fail (no
         # real server for a fresh connect), never producing extra conns.
         doAssert pool.active + pool.idle.len <= pool.config.maxSize
+        # An acquire's dial counts in `active` until it fails, and Windows
+        # retries a refused SYN for about 2s before failing the dial.
+        let dialsDone = Moment.now() + seconds(10)
+        while pool.active > 2 and Moment.now() < dialsDone:
+          await sleepAsync(milliseconds(10))
         doAssert pool.active <= 2 # only the 2 healthy conns can serve
 
         pool.closed = true

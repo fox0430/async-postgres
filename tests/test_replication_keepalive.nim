@@ -32,6 +32,15 @@ proc mockConfig(port: int): ConnConfig =
     host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
   )
 
+proc sendUntilHeldUp(conn: PgConnection): Future[Future[void]] {.async.} =
+  ## Queue 32 MiB frames until one is held up by the unread socket; return it.
+  ## Winsock takes a whole send while its buffer has room, however large.
+  for _ in 0 ..< 8:
+    result = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+    await sleepAsync(milliseconds(100))
+    if not result.finished:
+      return
+
 const
   # startLsn of the XLogData burst the mock server sends.
   testStartLsn = 0x0000_0000_0000_1000'i64
@@ -836,13 +845,7 @@ suite "Replication: client-initiated stop":
       proc writer() {.async.} =
         while conn.state != csReplicating:
           await sleepAsync(milliseconds(1))
-        # Winsock takes a whole send while its buffer has room, however large,
-        # so write until a frame is actually held up by the unread socket.
-        for _ in 0 ..< 8:
-          bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
-          await sleepAsync(milliseconds(100))
-          if not bulk.finished:
-            break
+        bulk = await conn.sendUntilHeldUp()
         queued = conn.sendCopyData([byte('h')])
         heldUp.complete()
         # The stream closes to writes before it waits out the bulk frame.
@@ -887,12 +890,13 @@ suite "Replication: client-initiated stop":
 
     proc testBody() {.async.} =
       let ms = startMockServer()
+      let heldUp = newFuture[void]("heldUp")
 
       proc serverHandler() {.async.} =
         let st = await acceptAndReady(ms)
         discard await drainFrontendMessage(st) # START_REPLICATION
         await sendBytes(st, buildCopyBothResponse())
-        await sleepAsync(milliseconds(100))
+        await heldUp
         var tail = buildErrorResponse("XX000", "walsender failed")
         tail.add(buildReadyForQuery('I'))
         await sendBytes(st, tail)
@@ -907,7 +911,8 @@ suite "Replication: client-initiated stop":
       proc writer() {.async.} =
         while conn.state != csReplicating:
           await sleepAsync(milliseconds(1))
-        bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+        bulk = await conn.sendUntilHeldUp()
+        heldUp.complete()
 
       let writerFut = writer()
       try:
@@ -1031,7 +1036,7 @@ suite "Replication: client-initiated stop":
         proc driver() {.async.} =
           while conn.state != csReplicating:
             await sleepAsync(milliseconds(1))
-          let holder = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024)) # stuck
+          let holder = await conn.sendUntilHeldUp() # stuck
           let waiter = conn.stopReplication() # queued behind it
           await conn.closeTransport()
           try:

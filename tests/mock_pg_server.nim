@@ -449,6 +449,14 @@ proc drainFrontendMessage*(
   if msgLen > 4:
     result.body = await readN(client, msgLen - 4)
 
+proc drainThroughCopyDone*(client: MockClient) {.async.} =
+  ## Read frontend messages through the client's CopyDone. A stop writes its
+  ## final status first; closing before CopyDone arrives can fail that write.
+  while true:
+    let m = await drainFrontendMessage(client)
+    if m.msgType == 'c':
+      break
+
 proc runAutoKeepaliveServer*(
     client: MockClient,
     startLsn, walEnd, keepaliveWalEnd: int64,
@@ -479,7 +487,7 @@ proc runAutoKeepaliveServer*(
     tail.add(buildCopyDone())
     tail.add(buildReadyForQuery('I'))
     await sendBytes(client, tail)
-    discard await drainFrontendMessage(client) # client's CopyDone
+    await drainThroughCopyDone(client)
   return observed
 
 # Full handshake shortcut
