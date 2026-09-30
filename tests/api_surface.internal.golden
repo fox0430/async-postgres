@@ -366,6 +366,7 @@ async_postgres/pg_protocol.nim	bindLengthOverhead
 async_postgres/pg_protocol.nim	calcBindMessageLength
 async_postgres/pg_protocol.nim	calcParseMessageLength
 async_postgres/pg_protocol.nim	calcStartupBudget
+async_postgres/pg_protocol.nim	cellSpan
 async_postgres/pg_protocol.nim	checkCopyDataLen
 async_postgres/pg_protocol.nim	checkMsgLenBound64
 async_postgres/pg_protocol.nim	checkMsgLenBoundCalls
@@ -442,6 +443,7 @@ async_postgres/pg_types/encoding.nim	addParse
 async_postgres/pg_types/encoding.nim	checkArrayLen
 async_postgres/pg_types/encoding.nim	checkPgBinLen
 async_postgres/pg_types/encoding.nim	checkPgBinPayload
+async_postgres/pg_types/encoding.nim	checkPgDateTime
 async_postgres/pg_types/encoding.nim	decodeByteaEscape
 async_postgres/pg_types/encoding.nim	decodeHexPair
 async_postgres/pg_types/encoding.nim	decodeHexPair#2
@@ -546,6 +548,10 @@ async_postgres/pg_types/encoding.nim	pgArrayElemOid#7
 async_postgres/pg_types/encoding.nim	pgArrayElemOid#8
 async_postgres/pg_types/encoding.nim	pgArrayElemOid#9
 async_postgres/pg_types/encoding.nim	pgDateDays
+async_postgres/pg_types/encoding.nim	pgDateText
 async_postgres/pg_types/encoding.nim	pgTimestampMicros
 async_postgres/pg_types/encoding.nim	pgTimestampMicros#2
+async_postgres/pg_types/encoding.nim	pgTimestampText
+async_postgres/pg_types/encoding.nim	pgTimestampTzText
+async_postgres/pg_types/encoding.nim	pgUtcText
 async_postgres/pg_types/encoding.nim	writePointAt

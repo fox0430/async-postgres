@@ -48,7 +48,7 @@ proc checkEnumArrayElemOid(accessor: string, actual: int32) =
 
 proc checkEnumColOid(accessor: string, row: Row, col: int) =
   ## Scalar-enum column guard. Missing metadata skips the check; explicit OIDs judged.
-  if col < 0 or row.data.colTypeOids.len <= col:
+  if col < 0 or row.data == nil or row.data.colTypeOids.len <= col:
     return
   checkEnumOid(accessor, row.data.colTypeOids[col], "colOid")
 
@@ -392,9 +392,9 @@ proc encodeCompositeText*(fields: seq[Option[string]]): string {.raises: [].} =
 proc compositeDateTimeToText(dt: DateTime): string =
   ## Text form of a composite DateTime field. The UTC offset is mandatory:
   ## without it a timestamptz field is reinterpreted in the session TimeZone.
-  if not dt.isInitialized:
-    raise newException(PgTypeError, "Uninitialized DateTime in composite field")
-  dt.utc.format("yyyy-MM-dd HH:mm:ss'.'ffffffzzz")
+  # Window check only: the field may be a date, whose range is wider.
+  checkPgDateTime(dt, " in composite field")
+  pgUtcText(dt.toTime(), "MM-dd HH:mm:ss'.'ffffffzzz")
 
 macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
   ## Generate ``toPgParam`` for a Nim object as a PostgreSQL composite type.

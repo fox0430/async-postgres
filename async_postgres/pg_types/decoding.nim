@@ -1,7 +1,7 @@
 import std/[options, strutils, tables, times, net]
 
 import ../pg_bytes
-import core, array
+import core, array, encoding
 
 export pg_bytes, array
 
@@ -372,13 +372,35 @@ proc decodeBinaryComposite*(
       pos += flen
   ensureNoTrailing(pos, data.len, "Binary composite")
 
+proc textYearTooLong(s: string): bool =
+  ## True when the ``YYYY`` field at the start of ``s`` holds more significant
+  ## digits than the widest PostgreSQL temporal year (``date``'s 5874897).
+  # `YYYY` takes any number of digits, and `parse` sums the year in an `int`
+  # before the stdlib scales epoch days by 86400 in int64: past ~2.92e11 that
+  # raises ``OverflowDefect`` from inside the stdlib, which the `except
+  # TimeParseError, IndexDefect` below would miss. Bound the field before
+  # `parse` sees it; the exact per-type ends are enforced after the parse.
+  var i = 0
+  while i < s.len and s[i] == '0':
+    inc i
+  var digits = 0
+  while i < s.len and s[i] in {'0' .. '9'}:
+    inc digits
+    inc i
+  digits > 7
+
 proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
-  # Raises ``PgTypeError`` for infinity/unparseable input (under ``PgError``).
+  # Raises ``PgTypeError`` for infinity/unparseable input or a year outside
+  # PostgreSQL's timestamp range (under ``PgError``). Accepts the whole output
+  # range: unpadded years past 9999 and the ``BC``/``AD`` era suffix, which it
+  # prints after the zone.
   if s == "infinity" or s == "-infinity":
     # Known literal, safe to name (mirrors the binary decoder's message).
     raise newException(
       PgTypeError, "Timestamp is '" & s & "', not representable as a DateTime"
     )
+  if textYearTooLong(s):
+    raise newException(PgTypeError, "timestamp year out of range (len=" & $s.len & ")")
   # PG trims trailing zeros in text output ('.500000' -> '.5'), but Nim's
   # 'ffffff' requires exactly 6 digits. Right-pad short fractions before parse.
   var norm = s
@@ -390,37 +412,59 @@ proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
     let fracLen = e - dot - 1
     if fracLen in 1 .. 5:
       norm = s[0 ..< e] & repeat('0', 6 - fracLen) & s[e .. ^1]
-  # Pre-compiled: malformed pattern is a build error, not runtime.
+  # Pre-compiled: malformed pattern is a build error, not runtime. `YYYY` takes
+  # any number of year digits and `g` the era suffix; a format that leaves input
+  # unconsumed fails, so the era variants after the others stay unambiguous.
   const formats = [
-    initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffffzzz"),
-    initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffffzz"),
-    initTimeFormat("yyyy-MM-dd HH:mm:ss'.'ffffff"),
-    initTimeFormat("yyyy-MM-dd HH:mm:sszzz"),
-    initTimeFormat("yyyy-MM-dd HH:mm:sszz"),
-    initTimeFormat("yyyy-MM-dd HH:mm:ss"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzzz"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzz"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffff"),
+    initTimeFormat("YYYY-MM-dd HH:mm:sszzz"),
+    initTimeFormat("YYYY-MM-dd HH:mm:sszz"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzzz g"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzz g"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffff g"),
+    initTimeFormat("YYYY-MM-dd HH:mm:sszzz g"),
+    initTimeFormat("YYYY-MM-dd HH:mm:sszz g"),
+    initTimeFormat("YYYY-MM-dd HH:mm:ss g"),
   ]
   # Zoneless input uses utc(); indexing skips the per-iteration copy a `for fmt
   # in formats` loop variable would take (`parse` itself takes it by reference).
   for i in 0 ..< formats.len:
     try:
-      return parse(norm, formats[i], utc())
+      let dt = parse(norm, formats[i], utc())
+      # Same ends as the encoders (`pgTimestampMicros`), so text past them
+      # cannot decode to a DateTime no encoder would accept back.
+      discard pgTimestampMicros(dt)
+      return dt
     except TimeParseError, IndexDefect:
       discard
   raise newException(PgTypeError, "Invalid timestamp (len=" & $s.len & ")")
 
 proc parseDateText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
-  # Raises ``PgTypeError`` for infinity/unparseable.
+  # Raises ``PgTypeError`` for infinity/unparseable or a year outside
+  # PostgreSQL's date range; accepts years past 9999 and the era suffix (see
+  # ``parseTimestampText``).
   if s == "infinity" or s == "-infinity":
     # Known literal, safe to name (mirrors the binary decoder's message).
     raise
       newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
-  const dateFormat = initTimeFormat("yyyy-MM-dd")
-  try:
-    # Zone is utc() so a date decodes to the same absolute instant as
-    # decodeBinaryDate; the local default would shift it by the UTC offset.
-    return parse(s, dateFormat, utc())
-  except TimeParseError, IndexDefect:
-    raise newException(PgTypeError, "Invalid date (len=" & $s.len & ")")
+  if textYearTooLong(s):
+    raise newException(PgTypeError, "date year out of range (len=" & $s.len & ")")
+  const dateFormats = [initTimeFormat("YYYY-MM-dd"), initTimeFormat("YYYY-MM-dd g")]
+  for i in 0 ..< dateFormats.len:
+    try:
+      # Zone is utc() so a date decodes to the same absolute instant as
+      # decodeBinaryDate; the local default would shift it by the UTC offset.
+      let dt = parse(s, dateFormats[i], utc())
+      # `date` reaches further than `timestamp`, so check against its own ends
+      # (`pgDateDays`), mirroring the date encoders.
+      discard pgDateDays(dt)
+      return dt
+    except TimeParseError, IndexDefect:
+      discard
+  raise newException(PgTypeError, "Invalid date (len=" & $s.len & ")")
 
 proc parseTimeText*(s: string): PgTime {.raises: [PgError].} =
   ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".

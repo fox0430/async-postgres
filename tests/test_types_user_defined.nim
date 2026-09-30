@@ -66,6 +66,13 @@ suite "User-defined enum":
     check getEnum[Mood](Row @[some(toBytes("sad"))], 0) == sad
     check getEnum[Mood](Row @[some(toBytes("ok"))], 0) == ok
 
+  test "getEnum on a Row without data raises PgTypeError":
+    for row in [default(Row), default(Row).clone()]:
+      expect PgTypeError:
+        discard getEnum[Mood](row, 0)
+      expect PgTypeError:
+        discard getEnumArray[Mood](row, 0)
+
   test "getEnum raises on invalid value":
     let row: Row = @[some(toBytes("unknown"))]
     var raised = false
@@ -687,8 +694,19 @@ suite "User-defined composite":
     check got.at == dt
 
   test "pgComposite rejects an uninitialized DateTime field":
-    expect PgTypeError:
+    try:
       discard toPgParam(TimestampRecord(label: "evt"))
+      fail()
+    except PgTypeError as e:
+      check "in composite field" in e.msg
+
+  test "pgComposite DateTime keeps the era and years past 9999":
+    let bc = dateTime(-4713, mNov, 24, zone = utc())
+    check "4714-11-24 00:00:00.000000Z BC" in
+      toString(toPgParam(TimestampRecord(label: "evt", at: bc)).value.get)
+    let far = dateTime(10000, mJan, 1, zone = utc())
+    check "10000-01-01 00:00:00.000000Z" in
+      toString(toPgParam(TimestampRecord(label: "evt", at: far)).value.get)
 
   test "getComposite DateTime binary format":
     let dt = dateTime(2024, mMar, 15, 10, 30, 0, 0, utc())

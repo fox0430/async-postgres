@@ -1523,3 +1523,317 @@ suite "row columnIndex by name":
       raised = true
       check "Column not found" in e.msg
     check raised
+
+template fixedZone(name: string, west: static int): Timezone =
+  ## A zone `west` seconds west of UTC (Nim's utcOffset sign).
+  proc fromTime(time: Time): ZonedTime {.gensym, nimcall, gcsafe, raises: [].} =
+    ZonedTime(isDst: false, utcOffset: west, time: time)
+
+  proc fromAdj(adjTime: Time): ZonedTime {.gensym, nimcall, gcsafe, raises: [].} =
+    ZonedTime(
+      isDst: false, utcOffset: west, time: adjTime + initDuration(seconds = west)
+    )
+
+  newTimezone(name, fromTime, fromAdj)
+
+suite "Out-of-contract inputs raise PgTypeError, not a Defect":
+  # A Defect escapes `except PgError` / `except CatchableError`, so each of these
+  # would take the process down instead of failing the one call.
+  let unset = default(DateTime)
+
+  test "uninitialized DateTime in every scalar and array encoder":
+    expect PgTypeError:
+      discard toPgParam(unset)
+    expect PgTypeError:
+      discard toPgDateParam(unset)
+    expect PgTypeError:
+      discard toPgTimestampTzParam(unset)
+    expect PgTypeError:
+      discard toPgBinaryParam(unset)
+    expect PgTypeError:
+      discard toPgBinaryDateParam(unset)
+    expect PgTypeError:
+      discard toPgBinaryTimestampTzParam(unset)
+    expect PgTypeError:
+      discard toPgParam(some(unset))
+    expect PgTypeError:
+      discard toPgBinaryParam(some(unset))
+    expect PgTypeError:
+      discard toPgTimestampArrayParam(@[unset])
+    expect PgTypeError:
+      discard toPgTimestampTzArrayParam(@[unset])
+    expect PgTypeError:
+      discard toPgDateArrayParam(@[unset])
+
+  test "uninitialized DateTime in range and multirange encoders":
+    let dt = dateTime(2024, mJan, 15, zone = utc())
+    for r in [rangeOf(unset, dt), rangeOf(dt, unset)]:
+      expect PgTypeError:
+        discard toPgParam(r)
+      expect PgTypeError:
+        discard toPgTsTzRangeParam(r)
+      expect PgTypeError:
+        discard toPgDateRangeParam(r)
+      expect PgTypeError:
+        discard toPgBinaryParam(r)
+      expect PgTypeError:
+        discard toPgBinaryDateRangeParam(r)
+      expect PgTypeError:
+        discard toPgParam(toMultirange(r))
+      expect PgTypeError:
+        discard toPgBinaryParam(toMultirange(r))
+
+  test "binary timestamp accepts exactly PostgreSQL's range":
+    let first = dateTime(-4713, mNov, 24, zone = utc())
+    let last = dateTime(294276, mDec, 31, 23, 59, 59, 999_999_000, utc())
+    check pgTimestampMicros(first) == -211813488000000000'i64
+    check pgTimestampMicros(last) == 9223371331199999999'i64
+    # Past the end the scaling used to overflow int64 (OverflowDefect).
+    for dt in [
+      first - initDuration(microseconds = 1),
+      last + initDuration(microseconds = 1),
+      dateTime(300000, mJan, 1, zone = utc()),
+    ]:
+      expect PgTypeError:
+        discard toPgBinaryParam(dt)
+      expect PgTypeError:
+        discard toPgBinaryTimestampTzParam(dt)
+      expect PgTypeError:
+        discard toPgTimestampArrayParam(@[dt])
+
+  test "binary date accepts exactly PostgreSQL's range":
+    let first = dateTime(-4713, mNov, 24, zone = utc())
+    let last = dateTime(5874897, mDec, 31, zone = utc())
+    check pgDateDays(first) == -2451545'i32
+    check pgDateDays(last) == 2145031948'i32
+    for dt in [first - initDuration(days = 1), last + initDuration(days = 1)]:
+      expect PgTypeError:
+        discard toPgBinaryDateParam(dt)
+      expect PgTypeError:
+        discard toPgDateArrayParam(@[dt])
+
+  test "DateTime years no PostgreSQL type holds are rejected before stdlib math":
+    for year in [-4714, 5874898, 100_000_000_000]:
+      let dt = dateTime(year, mJan, 1, zone = utc())
+      expect PgTypeError:
+        discard toPgParam(dt)
+      expect PgTypeError:
+        discard toPgDateParam(dt)
+      expect PgTypeError:
+        discard toPgTimestampTzParam(dt)
+
+  test "pgParseFloat bounds the exponent instead of overflowing":
+    for s in [
+      "1e9223372036854775808", "1e-9223372036854775808", "1.5e99999999999999999999",
+      "1e1000000000",
+    ]:
+      expect PgTypeError:
+        discard pgParseFloat(s)
+    check pgParseFloat("1e999999999") == Inf
+    check pgParseFloat("1e-999999999") == 0.0
+    check pgParseFloat("1e0000000000000000000002") == 100.0
+    check pgParseFloat("0e0") == 0.0
+
+  test "pgParseFloat bounds the first exponent, the one the stdlib sums":
+    # Only the first `e`/`E` starts the exponent the stdlib parses; a later one
+    # must not reset the digit counter, or the parsed exponent is left to the
+    # stdlib's unchecked int sum (`pgParseFloat` must stay PgTypeError-only).
+    for s in [
+      "1e9999999999999999999e1", "1e9223372036854775808e1", "1e1111111111e-1",
+      "1e1000000000e1",
+    ]:
+      expect PgTypeError:
+        discard pgParseFloat(s)
+    # A later `e` cannot rescue a sign-only first exponent either.
+    for s in ["1e+e5", "1e-e5", "1e+E5", "1e-e"]:
+      expect PgTypeError:
+        discard pgParseFloat(s)
+
+  test "pgParseFloat rejects a sign-only exponent before the stdlib parser":
+    # The stdlib parses the byte after the sign without a bounds check, so a
+    # zero-copy cell ending in `1e+` would read the next cell's first byte and
+    # could return the mantissa as if the exponent were 0.
+    for s in ["1e+", "1e-", "1E+", "1.5e-", "1e", "0e"]:
+      expect PgTypeError:
+        discard pgParseFloat(s)
+
+  test "getFloat on a malformed exponent cell does not read the next cell":
+    let row: Row = @[some(toBytes("1e+")), some(toBytes("5"))]
+    expect PgTypeError:
+      discard row.getFloat(0)
+    expect PgTypeError:
+      discard row.getFloat32(0)
+
+  test "getFloat on a server-sent huge exponent":
+    let row = mkRow(@[some(toBytes("1e9223372036854775808"))], @[mkField(OidFloat8, 0)])
+    expect PgTypeError:
+      discard row.getFloat(0)
+
+  test "getFloat bounds the exponent parsed from a multi-exponent cell":
+    # Same mismatch as pgParseFloat: the server cell can hold a second `e`.
+    let row =
+      mkRow(@[some(toBytes("1e9999999999999999999e1"))], @[mkField(OidFloat8, 0)])
+    expect PgTypeError:
+      discard row.getFloat(0)
+    expect PgTypeError:
+      discard row.getFloat32(0)
+
+  test "server-sent text years outside PostgreSQL's range raise PgTypeError":
+    # `YYYY` takes any number of digits; past ~2.92e11 the stdlib date math
+    # overflowed int64 (OverflowDefect escaped `except PgError`) and years just
+    # past a type's end decoded silently.
+    let tsRow = mkRow(
+      @[some(toBytes("999999999999-01-01 00:00:00"))], @[mkField(OidTimestamp, 0)]
+    )
+    expect PgTypeError:
+      discard tsRow.getTimestamp(0)
+    let dateRow = mkRow(@[some(toBytes("5874898-01-01"))], @[mkField(OidDate, 0)])
+    expect PgTypeError:
+      discard dateRow.getDate(0)
+    let rangeRow = mkRow(
+      @[some(toBytes("[999999999999-01-01,2000-01-01)"))], @[mkField(OidDateRange, 0)]
+    )
+    expect PgTypeError:
+      discard rangeRow.getDateRange(0)
+
+  test "$PgNumeric at the maximum weight":
+    # 131072 integer digits = 32768 base-10000 groups = weight high(int16).
+    let s = "1" & repeat('0', 131071)
+    let n = parsePgNumeric(s)
+    check n.weight == high(int16)
+    check $n == s
+    check toPgParam(n).value.get.len == s.len
+    let neg =
+      PgNumeric(weight: high(int16), sign: pgNegative, dscale: 2, digits: @[7'i16])
+    check $neg == "-7" & repeat('0', 32767 * 4) & ".00"
+
+  test "row index outside the RowData":
+    let row = mkRow(@[some(toBytes("x"))], @[mkField(OidText, 0)])
+    for idx in [-1'i32, 1'i32, int32.high]:
+      let bad = initRow(row.data, idx)
+      expect PgTypeError:
+        discard bad.getStr(0)
+      expect PgTypeError:
+        discard bad.isNull(0)
+      expect PgTypeError:
+        discard bad.getStrOpt(0)
+      expect PgTypeError:
+        discard bad.getNumeric(0)
+      expect PgTypeError:
+        discard bad.clone()
+
+  test "hand-built RowData with a short cellIndex or a cell past the buffer":
+    let short = RowData(numCols: 2, buf: toBytes("x"), cellIndex: @[0'i32, 1'i32])
+    check initRow(short, 0).getStr(0) == "x"
+    expect PgTypeError:
+      discard initRow(short, 0).getStr(1)
+    expect PgTypeError:
+      discard initRow(short, 0).isNull(1)
+    # A negative numCols never surfaces as a negative column count.
+    check initRow(RowData(numCols: -1, buf: @[], cellIndex: @[]), 0).len == 0
+    for cell in [@[0'i32, 2'i32], @[-1'i32, 1'i32], @[0'i32, -2'i32]]:
+      let rd = RowData(numCols: 1, buf: toBytes("x"), cellIndex: cell)
+      expect PgTypeError:
+        discard initRow(rd, 0).getStr(0)
+
+  test "Row without data":
+    # Typed getters probe the column format/OID before reading the cell, so
+    # each probe must tolerate a nil RowData and leave the error to the read.
+    template rejects(body: untyped) =
+      expect PgTypeError:
+        discard body
+
+    for row in [default(Row), default(Row).clone()]:
+      check row.len == 0
+      check not row.isBinaryCol(0)
+      rejects row[0]
+      rejects row.isNull(0)
+      rejects row.getStr(0)
+      rejects row.getStrOpt(0)
+      rejects row.getInt(0)
+      rejects row.getInt64(0)
+      rejects row.getFloat(0)
+      rejects row.getBool(0)
+      rejects row.getNumeric(0)
+      rejects row.getNumericOpt(0)
+      rejects row.getTimestamp(0)
+      rejects row.getDate(0)
+      rejects row.getUuid(0)
+      rejects row.getJson(0)
+      rejects row.getBytes(0)
+      rejects row.getIntArray(0)
+      rejects row.getTsRange(0)
+
+  test "text DateTime literals spell the era and years past 9999":
+    # Stdlib's `yyyy` would print 4714 BC as 4714 (AD) and 10000 as `+10000`,
+    # which PostgreSQL reads as a zone offset.
+    let bc = dateTime(-4713, mNov, 24, zone = utc())
+    let ad = dateTime(2000, mJan, 1, zone = utc())
+    check toString(toPgParam(bc).value.get) == "4714-11-24 00:00:00.000000 BC"
+    check toString(toPgTimestampTzParam(bc).value.get) ==
+      "4714-11-24 00:00:00.000000Z BC"
+    check toString(toPgDateParam(bc).value.get) == "4714-11-24 BC"
+    check toString(toPgDateParam(dateTime(0, mDec, 31, zone = utc())).value.get) ==
+      "0001-12-31 BC"
+    check toString(toPgDateParam(dateTime(1, mJan, 1, zone = utc())).value.get) ==
+      "0001-01-01"
+    check toString(toPgParam(dateTime(10000, mJan, 1, zone = utc())).value.get) ==
+      "10000-01-01 00:00:00.000000"
+    for lit in [
+      toString(toPgParam(rangeOf(bc, ad)).value.get),
+      toString(toPgTsTzRangeParam(rangeOf(bc, ad)).value.get),
+      toString(toPgDateRangeParam(rangeOf(bc, ad)).value.get),
+      toString(toPgParam(toMultirange(rangeOf(bc, ad))).value.get),
+    ]:
+      check "4714-11-24" in lit
+      check " BC\"" in lit
+    for lit in [
+      toString(toPgParam(@[rangeOf(bc, ad)]).value.get),
+      toString(toPgTsTzRangeArrayParam(@[rangeOf(bc, ad)]).value.get),
+      toString(toPgDateRangeArrayParam(@[rangeOf(bc, ad)]).value.get),
+      toString(toPgTsMultirangeArrayParam(@[toMultirange(rangeOf(bc, ad))]).value.get),
+      toString(toPgTsTzMultirangeArrayParam(@[toMultirange(rangeOf(bc, ad))]).value.get),
+      toString(toPgDateMultirangeArrayParam(@[toMultirange(rangeOf(bc, ad))]).value.get),
+    ]:
+      check "4714-11-24" in lit
+      check " BC" in lit
+
+  test "text timestamp and date check the same range as binary":
+    let pastTs = dateTime(294277, mJan, 1, zone = utc())
+    let beforeAll = dateTime(-4713, mNov, 23, zone = utc())
+    let ad = dateTime(2000, mJan, 1, zone = utc())
+    expect PgTypeError:
+      discard toPgParam(pastTs)
+    expect PgTypeError:
+      discard toPgTimestampTzParam(pastTs)
+    expect PgTypeError:
+      discard toPgParam(rangeOf(ad, pastTs))
+    # `date` reaches much further than `timestamp`.
+    check toString(toPgDateParam(pastTs).value.get) == "294277-01-01"
+    check toString(toPgDateRangeParam(rangeOf(ad, pastTs)).value.get) ==
+      "[2000-01-01,294277-01-01)"
+    for dt in [beforeAll, dateTime(5874898, mJan, 1, zone = utc())]:
+      expect PgTypeError:
+        discard toPgParam(dt)
+      expect PgTypeError:
+        discard toPgDateParam(dt)
+
+  test "text timestamptz keeps the instant of a seconds-bearing offset":
+    # `zzz` prints +09:18, which PostgreSQL reads 59 s later than +09:18:59.
+    let lmt = fixedZone("LMT+09:18:59", -(9 * 3600 + 18 * 60 + 59))
+    let dt = dateTime(1850, mJan, 1, 12, 0, 0, zone = utc()).inZone(lmt)
+    check dt.hour == 21 and dt.minute == 18 and dt.second == 59
+    check toString(toPgTimestampTzParam(dt).value.get) == "1850-01-01 12:00:00.000000Z"
+    check toString(toPgTsTzRangeParam(rangeOf(dt, dt)).value.get) ==
+      "[\"1850-01-01 12:00:00.000000Z\",\"1850-01-01 12:00:00.000000Z\")"
+    check toString(toPgTsTzMultirangeParam(toMultirange(rangeOf(dt, dt))).value.get) ==
+      "{[\"1850-01-01 12:00:00.000000Z\",\"1850-01-01 12:00:00.000000Z\")}"
+
+  test "text timestamptz at the lower bound in a zone west of UTC":
+    # The local wall clock is a day before PostgreSQL's first date; the
+    # literal is written in UTC, where the checked instant lies.
+    let west4 = fixedZone("-04:00", 4 * 3600)
+    let dt = dateTime(-4713, mNov, 24, 1, 0, 0, zone = utc()).inZone(west4)
+    check dt.monthday == 23
+    check toString(toPgTimestampTzParam(dt).value.get) ==
+      "4714-11-24 01:00:00.000000Z BC"

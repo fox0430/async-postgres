@@ -462,10 +462,40 @@ proc pgParseFloat*(s: openArray[char]): float =
   # `1e+10` exponents keep working.
   if s.len > 0 and s[0] == '+':
     raise newException(PgTypeError, "invalid float value (len=" & $s.len & ")")
-  # Reject digit-group underscores (`1_0.5` would parse as 10.5).
+  # Reject digit-group underscores (`1_0.5` would parse as 10.5). Bound the
+  # exponent: `parseFloat` sums it in an unchecked `int` (19 digits overflow).
+  # Past 9 significant digits the value is 0 or infinite anyway. Only the first
+  # `e`/`E` starts that sum; the stdlib reads no later one, so a later `e` must
+  # not reset the counter (that left the parsed exponent unbounded). Also
+  # require a digit after `e`/`E`: the parser tests the byte after the sign
+  # without a bounds check, so a cell ending in `1e+` would read the byte past
+  # its zero-copy view (the next cell's first byte, or the heap) and, when that
+  # byte is a digit, return the mantissa as if the exponent were 0.
+  var expDigits = -1
+  var expHasDigit = false
   for c in s:
-    if c == '_':
+    case c
+    of '_':
       raise newException(PgTypeError, "invalid float value (len=" & $s.len & ")")
+    of 'e', 'E':
+      if expDigits < 0:
+        expDigits = 0
+        expHasDigit = false
+    of '1' .. '9':
+      if expDigits >= 0:
+        inc expDigits
+        expHasDigit = true
+    of '0':
+      if expDigits >= 0:
+        expHasDigit = true
+        if expDigits > 0:
+          inc expDigits
+    else:
+      discard
+  if expDigits >= 0 and not expHasDigit:
+    raise newException(PgTypeError, "invalid float value (len=" & $s.len & ")")
+  if expDigits > 9:
+    raise newException(PgTypeError, "float exponent out of range (len=" & $s.len & ")")
   # Mirror ``strutils.parseFloat``'s strictness (entire input must parse) but on a
   # view, without its throwing `string` overload's allocation/`ValueError`.
   let n = parseutils.parseFloat(s, result)
@@ -1414,10 +1444,11 @@ proc `$`*(v: PgNumeric): string =
   result = ""
   if v.sign == pgNegative:
     result.add('-')
-  let intGroups = v.weight + 1
+  # Widen first: `weight` may be high(int16), which parsePgNumeric accepts.
+  let intGroups = v.weight.int + 1
   # Integer part
   var wroteInt = false
-  for i in 0 ..< min(v.digits.len, intGroups.int):
+  for i in 0 ..< min(v.digits.len, intGroups):
     let d = int(v.digits[i])
     if not wroteInt:
       result.add($d)
@@ -1428,7 +1459,7 @@ proc `$`*(v: PgNumeric): string =
         result.add('0')
       result.add(s)
   if intGroups > v.digits.len:
-    for _ in 0 ..< (intGroups.int - v.digits.len) * 4:
+    for _ in 0 ..< (intGroups - v.digits.len) * 4:
       result.add('0')
     wroteInt = true
   if not wroteInt:
@@ -1438,10 +1469,10 @@ proc `$`*(v: PgNumeric): string =
     let fracStart = result.len
     # Leading zero groups for pure fractions (intGroups < 0)
     if intGroups < 0:
-      for _ in 0 ..< -intGroups.int * 4:
+      for _ in 0 ..< -intGroups * 4:
         result.add('0')
     # Fractional digit groups
-    for i in max(intGroups.int, 0) ..< v.digits.len:
+    for i in max(intGroups, 0) ..< v.digits.len:
       let s = $int(v.digits[i])
       for _ in 0 ..< 4 - s.len:
         result.add('0')
