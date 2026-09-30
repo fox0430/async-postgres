@@ -157,6 +157,11 @@ proc fireReadFallback(
   if cluster.onReadFallback != nil:
     cluster.onReadFallback(reason, err)
 
+proc keepOrphanOutcome(fut: Future[PgConnection]) {.gcsafe.} =
+  ## No-op orphan hook: the default one clears a late failure, which would make
+  ## `drainAbandonedAcquire` read a nil connection out of the failed future.
+  discard
+
 proc drainAbandonedAcquire(acquireFut: Future[PgConnection]) {.async.} =
   ## Reclaim the connection from a pool acquire abandoned by `fallbackTimeout`.
   ##
@@ -170,9 +175,10 @@ proc drainAbandonedAcquire(acquireFut: Future[PgConnection]) {.async.} =
   ## resolves immediately without a connection.
   try:
     let conn = await acquireFut
-    # Not `release()`: the pool is taking its own abandoned acquire back, not the
-    # application returning a borrow.
-    conn.releaseReclaimed()
+    if conn != nil:
+      # Not `release()`: the pool is taking its own abandoned acquire back, not
+      # the application returning a borrow.
+      conn.releaseReclaimed()
   except CatchableError:
     discard # a failed/cancelled acquire cleans up its own pool accounting
 
@@ -198,7 +204,7 @@ proc acquireRead(
   if cluster.fallbackTimeout > ZeroDuration:
     let replicaFut = cluster.replica.acquire()
     try:
-      let conn = await replicaFut.wait(cluster.fallbackTimeout)
+      let conn = await replicaFut.wait(cluster.fallbackTimeout, keepOrphanOutcome)
       return (conn, cluster.replica)
     except AsyncTimeoutError as e:
       asyncSpawn drainAbandonedAcquire(replicaFut)
@@ -229,7 +235,7 @@ proc acquireRead(
   if cluster.fallbackTimeout > ZeroDuration:
     let primaryFut = cluster.primary.acquire()
     try:
-      let conn = await primaryFut.wait(cluster.fallbackTimeout)
+      let conn = await primaryFut.wait(cluster.fallbackTimeout, keepOrphanOutcome)
       return (conn, cluster.primary)
     except AsyncTimeoutError:
       asyncSpawn drainAbandonedAcquire(primaryFut)
