@@ -1561,6 +1561,77 @@ suite "SSL negotiation - sslDisable":
     check connState == csReady
     check connSslEnabled == false
 
+proc bytesUntilClose(client: MockClient): Future[int] {.async.} =
+  ## How many bytes the client sends before hanging up.
+  try:
+    while true:
+      discard await readN(client, 1)
+      inc result
+  except CatchableError:
+    discard
+
+proc sessionAt(port: int, mode: SslMode, overTls: bool): PgConnection =
+  ## A session under ``mode``, on TLS if ``overTls``, for ``cancel`` to act on.
+  PgConnection(
+    host: "127.0.0.1",
+    port: port,
+    config: ConnConfig(host: "127.0.0.1", port: port, sslMode: mode),
+    sslEnabled: overTls,
+    sslHost: "127.0.0.1",
+    pid: 1234,
+    secretKey: 5678,
+  )
+
+suite "Cancel over TLS":
+  test "a TLS session's cancel does not fall back to plaintext":
+    # prefer and allow fall back for a session, but this one got TLS from the
+    # server, so an 'N' is no reason to send the key in the clear.
+    proc attempt(mode: SslMode): Future[(int32, int, ref CatchableError)] {.async.} =
+      let ms = startMockServer()
+
+      proc serverSide(): Future[(int32, int)] {.async.} =
+        let st = await ms.accept()
+        try:
+          let code = decodeInt32(await readN(st, 8), 4)
+          await sendBytes(st, @[byte('N')])
+          return (code, await bytesUntilClose(st))
+        finally:
+          await closeClient(st)
+
+      let server = serverSide()
+      var err: ref CatchableError
+      try:
+        await sessionAt(ms.port, mode, overTls = true).cancel()
+      except CatchableError as e:
+        err = e
+      let (code, after) = await server
+      await closeServer(ms)
+      return (code, after, err)
+
+    for mode in [sslPrefer, sslAllow]:
+      checkpoint "sslmode=" & $mode
+      let (code, after, err) = waitFor attempt(mode)
+      check code == 80877103'i32 # SSLRequest
+      check after == 0 # no CancelRequest followed the refusal
+      check err of PgSecurityError
+
+  test "a plaintext session's cancel sends no SSLRequest":
+    # Its key already crossed the wire in the clear, as did the session.
+    proc attempt(): Future[seq[byte]] {.async.} =
+      let ms = startMockServer()
+      let accepted = ms.accept()
+      let cancelling = sessionAt(ms.port, sslPrefer, overTls = false).cancel()
+      let st = await accepted
+      result = await readN(st, 16)
+      await closeClient(st)
+      await cancelling
+      await closeServer(ms)
+
+    let request = waitFor attempt()
+    check decodeInt32(request, 4) == 80877102'i32 # CancelRequest
+    check decodeInt32(request, 8) == 1234'i32
+    check decodeInt32(request, 12) == 5678'i32
+
 suite "Direct SSL negotiation":
   test "sslnegotiation=direct rejects weak sslmode before any bytes are sent":
     var raised = false

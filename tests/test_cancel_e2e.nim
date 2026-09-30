@@ -209,3 +209,46 @@ suite "E2E: Cancel races":
       await conn.close()
 
     waitFor t()
+
+# TLS
+
+suite "E2E: Cancel over TLS":
+  proc cancelsOverTls(cfg: ConnConfig) {.async.} =
+    let conn = await connect(cfg)
+    doAssert conn.sslEnabled
+    let fut = conn.simpleQuery("SELECT pg_sleep(30)")
+    await sleepAsync(milliseconds(100))
+    await conn.cancel()
+    var raised = false
+    try:
+      discard await fut
+    except PgQueryError as e:
+      raised = true
+      doAssert e.isCanceled, "expected 57014, got: " & e.sqlState
+    doAssert raised, "query should have raised"
+    await conn.close()
+
+  test "a TLS session's cancel reaches the server under each sslmode":
+    for mode in [sslPrefer, sslRequire]:
+      checkpoint "sslmode=" & $mode
+      waitFor cancelsOverTls(sslConfig(mode))
+    var verifyCa = sslConfig(sslVerifyCa)
+    verifyCa.sslRootCert = loadCaCert()
+    checkpoint "sslmode=verify-ca"
+    waitFor cancelsOverTls(verifyCa)
+
+  test "a verify-full session's cancel verifies the name of the host it is on":
+    # Not the scalar host, which mirrors the first entry, nor the address
+    # dialed: the session is on the second entry, reached by IP.
+    var cfg = sslConfig(sslVerifyFull)
+    cfg.sslRootCert = loadCaCert()
+    cfg.hosts = @[
+      HostEntry(host: "unmatched.invalid", hostaddr: PgHost, port: 1),
+      HostEntry(host: "localhost", hostaddr: PgHost, port: PgPort),
+    ]
+    waitFor cancelsOverTls(cfg)
+
+  test "a direct-TLS session's cancel reaches the server (PG17+)":
+    var cfg = sslConfig(sslRequire)
+    cfg.sslNegotiation = sslnDirect
+    waitFor cancelsOverTls(cfg)

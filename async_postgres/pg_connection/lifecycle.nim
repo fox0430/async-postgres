@@ -494,7 +494,7 @@ proc connectToHostImpl(
             discard
           raise newException(PgConnectionError, e.msg, e)
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(transport, dialed.target)
+    conn.attachTransport(transport, dialed.target, entry.host)
   elif hasAsyncDispatch:
     let dialed = await dialing
     if reached != nil:
@@ -515,7 +515,7 @@ proc connectToHostImpl(
           sock.close()
           raise e
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(sock, dialed.target)
+    conn.attachTransport(sock, dialed.target, entry.host)
 
   var scramState: ScramState
   try:
