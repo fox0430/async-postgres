@@ -11,7 +11,7 @@
 
 import std/[strutils, unittest]
 
-when defined(posix):
+when defined(linux):
   import std/posix
 
 import ../async_postgres/[async_backend, pg_replication]

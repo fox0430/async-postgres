@@ -6,7 +6,7 @@
 
 import std/[tables, sets, deques, lists, macros, options]
 from std/strutils import isAlphaNumeric, toLowerAscii, cmpIgnoreCase
-when defined(posix):
+when defined(linux):
   import std/posix
 
 import ../[async_backend, pg_auth, pg_errors, pg_protocol, pg_types]
