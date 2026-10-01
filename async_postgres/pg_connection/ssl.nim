@@ -752,6 +752,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         conn.raiseTransportFailure("negotiateSSL: SSLRequest", e)
       # Two bytes: chronos drains the whole segment beyond MSG_PEEK's reach, so a
       # trailing byte must show up here. `readOnce` never waits for the second.
+      # On Windows its posted read takes later segments too, leaving this the
+      # only check, as in libpq; bytes it misses after 'S' fail the handshake.
       var response: array[2, byte]
       var n: int
       try:

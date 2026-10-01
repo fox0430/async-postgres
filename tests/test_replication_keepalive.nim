@@ -52,10 +52,12 @@ proc sendUntilHeldUp(conn: PgConnection): Future[Future[void]] {.async.} =
   ## Queue 32 MiB frames until one is held up by the unread socket; return it.
   ## Winsock takes a whole send while its buffer has room, however large.
   for _ in 0 ..< 8:
-    result = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+    let frame = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
     await sleepAsync(milliseconds(100))
-    if not result.finished:
-      return
+    if not frame.finished:
+      return frame
+    doAssert not frame.failed, "a frame failed before one was held up"
+  raiseAssert "no frame was held up"
 
 const
   # startLsn of the XLogData burst the mock server sends.

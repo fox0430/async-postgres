@@ -42,11 +42,12 @@ when defined(posix):
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
   var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
 elif defined(windows):
-  # `nativesockets` exposes `ioctlsocket` but not `FIONREAD` (winsock2.h:
-  # `#define FIONREAD _IOR('f', 127, u_long)`).
-  from std/nativesockets import SocketHandle, ioctlsocket
+  from std/winlean import nil
 
-  const FIONREAD = clong(0x4004667F)
+  # winsock2.h values winlean lacks
+  const
+    WSAENOBUFS = 10055'i32
+    IpprotoTcp = 6.cint
 
 type
   RecvWatch* = ref object
@@ -57,13 +58,12 @@ type
     fut: Future[void]
 
   SocketPeek = enum
-    ## Outcome of a single non-suspending socket probe (`MSG_PEEK` on POSIX,
-    ## `FIONREAD` on Windows).
-    spData ## bytes are readable in the kernel buffer
-    spClosed ## peer has closed: FIN/RST observed (`recv` == 0; POSIX only)
-    spIdle ## socket alive with no data ready (`EAGAIN`/`EWOULDBLOCK` on POSIX)
+    ## Outcome of a single non-blocking `MSG_PEEK` byte probe of a socket.
+    spData ## bytes are readable in the kernel buffer (`recv` > 0)
+    spClosed ## peer has closed: FIN/RST observed (`recv` == 0)
+    spIdle ## socket alive with no data ready (`EAGAIN`/`EWOULDBLOCK`)
     spTransient ## transient kernel resource exhaustion (`ENOMEM`/`ENOBUFS`)
-    spError ## any other probe error
+    spError ## any other `recv` error
     spUnavailable ## no transport handle
 
 # Host / address helpers
@@ -164,12 +164,12 @@ proc dialError(failures: openArray[DialFailure]): ref PgConnectionError {.raises
   else:
     (ref PgConnectionError)(msg: msg, parent: failures[^1].err)
 
-proc unresolved(host: string): ref PgConnectionError =
-  newException(PgUnavailableError, "Could not resolve host: " & host)
-
 func lookupFailed(host, reason: string): string =
   ## A failed lookup of ``host``, worded alike on every platform.
   "Could not resolve host " & host & ": " & reason
+
+proc unresolved(host: string): ref PgConnectionError =
+  newException(PgUnavailableError, lookupFailed(host, "no addresses"))
 
 when defined(posix):
   proc lookup(host: string, port: int): ptr posix.AddrInfo =
@@ -889,11 +889,11 @@ proc closeTransport*(conn: PgConnection) {.async.} =
 # Liveness probes
 
 proc peekSocket(conn: PgConnection): SocketPeek =
-  ## Single-byte probe shared by the liveness and pre-TLS-injection checks:
-  ## `recv(MSG_PEEK | MSG_DONTWAIT)` on POSIX, `ioctlsocket(FIONREAD)` on
-  ## Windows. Classifies the kernel's view of the socket without consuming data
-  ## or blocking; retries on `EINTR`. Callers decide what each outcome means
-  ## (see `socketHasFin` / `socketHasPendingData`).
+  ## Single `recv(MSG_PEEK)` byte probe shared by the liveness and
+  ## pre-TLS-injection checks (`MSG_DONTWAIT` on POSIX; Windows sockets are
+  ## non-blocking in both backends). Classifies the kernel's view of the socket
+  ## without consuming data or blocking; retries on `EINTR`. Callers decide
+  ## what each outcome means (see `socketHasFin` / `socketHasPendingData`).
   when defined(posix):
     when hasChronos:
       if conn.transport.isNil:
@@ -920,28 +920,33 @@ proc peekSocket(conn: PgConnection): SocketPeek =
         return spTransient
       return spError
   else:
-    # Windows has no `MSG_DONTWAIT`; `FIONREAD` reports how many bytes the
-    # kernel holds for the socket without consuming them and never suspends.
-    # It cannot tell FIN/RST apart from an idle socket, so `socketHasFin`
-    # stays conservative (false) on Windows.
     when hasChronos:
       if conn.transport.isNil:
         return spUnavailable
-      let fd = SocketHandle(conn.transport.fd)
+      # Once chronos starts reading it keeps an overlapped read posted, which
+      # takes data and the FIN off the socket; a FIN it took shows here.
+      if not conn.transport.running():
+        return spClosed
+      let fd = winlean.SocketHandle(conn.transport.fd)
     elif hasAsyncDispatch:
       if conn.socket.isNil:
         return spUnavailable
-      let fd = SocketHandle(conn.socket.getFd())
-    var pending: clong
-    if ioctlsocket(fd, FIONREAD, addr pending) != 0:
-      return spError
-    if pending > 0:
+      let fd = winlean.SocketHandle(conn.socket.getFd())
+    var buf: byte
+    let n = winlean.recv(fd, addr buf, 1, winlean.MSG_PEEK)
+    if n > 0:
       return spData
-    spIdle
+    if n == 0:
+      return spClosed
+    let err = winlean.wsaGetLastError()
+    if err == winlean.WSAEWOULDBLOCK:
+      return spIdle
+    if err == WSAENOBUFS:
+      return spTransient
+    spError
 
 proc socketHasFin*(conn: PgConnection): bool =
-  ## Half-open probe: true if FIN/RST observed, false otherwise. The Windows
-  ## `FIONREAD` probe cannot observe FIN/RST, so this stays false there.
+  ## Half-open probe (``MSG_PEEK``): true if FIN/RST observed; false otherwise or unavailable.
   case conn.peekSocket()
   of spClosed, spError:
     # FIN/RST observed, or an unclassified error we conservatively read as a
@@ -955,7 +960,8 @@ proc socketHasFin*(conn: PgConnection): bool =
 
 proc socketHasPendingData*(conn: PgConnection): bool =
   ## True if the kernel has readable bytes (pre-TLS injection check; kernel
-  ## buffer only). `MSG_PEEK` on POSIX, `FIONREAD` on Windows.
+  ## buffer only). Blind under chronos on Windows once reading has started:
+  ## its posted read takes the bytes first.
   conn.peekSocket() == spData
 
 proc isConnected*(conn: PgConnection): bool =
@@ -1018,3 +1024,11 @@ when defined(posix):
           warning:
             "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
         .}
+
+elif defined(windows):
+  proc configureTcpNoDelay*(fd: winlean.SocketHandle) =
+    ## Disable Nagle's algorithm for low-latency sends.
+    var optval: cint = 1
+    discard winlean.setsockopt(
+      fd, IpprotoTcp, winlean.TCP_NODELAY, addr optval, winlean.SockLen(sizeof(optval))
+    )

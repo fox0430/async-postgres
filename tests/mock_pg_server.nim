@@ -23,10 +23,11 @@ when hasAsyncDispatch:
 type AutoKeepaliveResult* =
   tuple[msgType: char, receive: int64, flush: int64, apply: int64]
 
+when defined(windows):
+  from std/winlean import nil
+
 when hasChronos:
   import chronos/streams/asyncstream
-  when defined(windows):
-    from std/winlean import nil
 
   type
     MockServer* = object
@@ -212,6 +213,23 @@ when defined(posix):
     for seg in segments:
       doAssert seg.len > 0
       let n = posix.send(fd, unsafeAddr seg[0], seg.len, posix.MSG_NOSIGNAL)
+      doAssert n == seg.len, "short or failed send"
+
+elif defined(windows):
+  proc sendSegmentsNow*(client: MockClient, segments: openArray[seq[byte]]) =
+    ## Winsock twin of the POSIX `sendSegmentsNow`.
+    const IpprotoTcp = 6.cint # winsock2.h; not in winlean
+    when hasChronos:
+      let fd = winlean.SocketHandle(client.fd)
+    elif hasAsyncDispatch:
+      let fd = winlean.SocketHandle(client.getFd())
+    var one: cint = 1
+    doAssert winlean.setsockopt(
+      fd, IpprotoTcp, winlean.TCP_NODELAY, addr one, winlean.SockLen(sizeof(one))
+    ) == 0, "setsockopt(TCP_NODELAY) failed"
+    for seg in segments:
+      doAssert seg.len > 0
+      let n = winlean.send(fd, unsafeAddr seg[0], cint(seg.len), 0)
       doAssert n == seg.len, "short or failed send"
 
 # Message-building helpers
