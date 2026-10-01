@@ -191,10 +191,13 @@ type
     connectTimeout*: Duration
       ## Timeout per address a host resolves to, dial to ready (libpq
       ## ``connect_timeout``); ``ZeroDuration`` (default, or negative) = none.
-    keepAlive*: bool ## Enable TCP keepalive (default true via parseDsn)
-    keepAliveIdle*: int ## Seconds before first probe (0 = OS default)
-    keepAliveInterval*: int ## Seconds between probes (0 = OS default)
-    keepAliveCount*: int ## Number of probes before giving up (0 = OS default)
+    keepAlive*: bool
+      ## Enable TCP keepalive (default true via parseDsn). POSIX only: Windows
+      ## has no keepalive path, so this and the timing options below are ignored there.
+    keepAliveIdle*: int ## Seconds before first probe (0 = OS default). POSIX only.
+    keepAliveInterval*: int ## Seconds between probes (0 = OS default). POSIX only.
+    keepAliveCount*: int
+      ## Number of probes before giving up (0 = OS default). POSIX only.
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     loadBalanceHosts*: LoadBalanceHosts

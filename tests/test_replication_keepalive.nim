@@ -24,13 +24,40 @@ import std/importutils
 privateAccess(PgConnection)
 
 when hasChronos:
-  from std/times import cpuTime
   import ../async_postgres/pg_connection/buffer_io
+
+  when defined(windows):
+    from std/winlean import nil
+
+    proc cpuSeconds(): float =
+      ## `cpuTime` is the CRT's `clock` on Windows, which counts wall time.
+      var creation, exit, kernel, user: winlean.FILETIME
+      doAssert winlean.getProcessTimes(
+        winlean.getCurrentProcess(), creation, exit, kernel, user
+      ) != 0
+      float(winlean.rdFileTime(kernel) + winlean.rdFileTime(user)) / 1e7
+
+  else:
+    from std/times import cpuTime
+
+    proc cpuSeconds(): float =
+      cpuTime()
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
     host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
   )
+
+proc sendUntilHeldUp(conn: PgConnection): Future[Future[void]] {.async.} =
+  ## Queue 32 MiB frames until one is held up by the unread socket; return it.
+  ## Winsock takes a whole send while its buffer has room, however large.
+  for _ in 0 ..< 8:
+    let frame = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+    await sleepAsync(milliseconds(100))
+    if not frame.finished:
+      return frame
+    doAssert not frame.failed, "a frame failed before one was held up"
+  raiseAssert "no frame was held up"
 
 const
   # startLsn of the XLogData burst the mock server sends.
@@ -805,12 +832,13 @@ suite "Replication: client-initiated stop":
 
     proc testBody() {.async.} =
       let ms = startMockServer()
+      let heldUp = newFuture[void]("heldUp")
 
       proc serverHandler() {.async.} =
         let st = await acceptAndReady(ms)
         discard await drainFrontendMessage(st) # START_REPLICATION
         await sendBytes(st, buildCopyBothResponse())
-        await sleepAsync(milliseconds(100))
+        await heldUp
         var tail = buildErrorResponse("XX000", "walsender failed")
         tail.add(buildReadyForQuery('I'))
         await sendBytes(st, tail)
@@ -835,8 +863,9 @@ suite "Replication: client-initiated stop":
       proc writer() {.async.} =
         while conn.state != csReplicating:
           await sleepAsync(milliseconds(1))
-        bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+        bulk = await conn.sendUntilHeldUp()
         queued = conn.sendCopyData([byte('h')])
+        heldUp.complete()
         # The stream closes to writes before it waits out the bulk frame.
         while conn.replWritesOpen:
           await sleepAsync(milliseconds(1))
@@ -879,12 +908,13 @@ suite "Replication: client-initiated stop":
 
     proc testBody() {.async.} =
       let ms = startMockServer()
+      let heldUp = newFuture[void]("heldUp")
 
       proc serverHandler() {.async.} =
         let st = await acceptAndReady(ms)
         discard await drainFrontendMessage(st) # START_REPLICATION
         await sendBytes(st, buildCopyBothResponse())
-        await sleepAsync(milliseconds(100))
+        await heldUp
         var tail = buildErrorResponse("XX000", "walsender failed")
         tail.add(buildReadyForQuery('I'))
         await sendBytes(st, tail)
@@ -899,7 +929,8 @@ suite "Replication: client-initiated stop":
       proc writer() {.async.} =
         while conn.state != csReplicating:
           await sleepAsync(milliseconds(1))
-        bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
+        bulk = await conn.sendUntilHeldUp()
+        heldUp.complete()
 
       let writerFut = writer()
       try:
@@ -1023,7 +1054,7 @@ suite "Replication: client-initiated stop":
         proc driver() {.async.} =
           while conn.state != csReplicating:
             await sleepAsync(milliseconds(1))
-          let holder = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024)) # stuck
+          let holder = await conn.sendUntilHeldUp() # stuck
           let waiter = conn.stopReplication() # queued behind it
           await conn.closeTransport()
           try:
@@ -1383,7 +1414,7 @@ when hasChronos:
             discard msg
             callbackCalls.inc
 
-        let cpuBefore = cpuTime()
+        let cpuBefore = cpuSeconds()
         let wallBefore = Moment.now()
         await conn.startReplication(
           "test_slot",
@@ -1391,7 +1422,7 @@ when hasChronos:
           statusInterval = milliseconds(50),
           callback = cb,
         )
-        elapsedCpu = cpuTime() - cpuBefore
+        elapsedCpu = cpuSeconds() - cpuBefore
         elapsedWallMs = (Moment.now() - wallBefore).milliseconds
 
         await conn.close()
@@ -1512,7 +1543,7 @@ proc runStartReplicationCapture(slot: string, options: seq[(string, string)]): s
       tail.add(buildCopyDone())
       tail.add(buildReadyForQuery('I'))
       await sendBytes(st, tail)
-      discard await drainFrontendMessage(st) # client's CopyDone
+      await drainThroughCopyDone(st)
       await closeClient(st)
 
     let serverFut = serverHandler()

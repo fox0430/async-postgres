@@ -79,7 +79,7 @@ suite "Physical replication: SQL building":
         burst.add(buildCopyDone())
         burst.add(buildReadyForQuery('I'))
         await sendBytes(st, burst)
-        discard await drainFrontendMessage(st) # client's CopyDone reply
+        await drainThroughCopyDone(st)
         await closeClient(st)
 
       let serverFut = serverHandler()
@@ -141,7 +141,7 @@ suite "Physical replication: streaming and drain":
         burst.add(buildCommandComplete("START_STREAMING"))
         burst.add(buildReadyForQuery('I'))
         await sendBytes(st, burst)
-        discard await drainFrontendMessage(st) # client's CopyDone reply
+        await drainThroughCopyDone(st)
         await closeClient(st)
 
       let serverFut = serverHandler()

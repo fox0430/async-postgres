@@ -671,8 +671,11 @@ suite "SSL negotiation - pre-TLS byte injection":
 
     waitFor testBody()
     check raised
-    check msgMatches
-    check securityRefusal
+    # chronos on Windows reads the second segment off the socket before the
+    # probe, so unless the segments coalesce they fail the handshake instead.
+    when not (hasChronos and defined(windows)):
+      check msgMatches
+      check securityRefusal
 
   test "data trailing an 'N' reply is rejected in every sslmode":
     # One segment so chronos's `readOnce` pulls the extra bytes in.
@@ -2484,6 +2487,10 @@ when hasAsyncDispatch and defined(ssl):
               x509Free(peer)
             # Unblock the server's `recv(1)` so its future completes.
             await c.send(" ")
+            # Closing with the server's session tickets unread sends an RST,
+            # and Windows then drops the byte before the server reads it.
+            # Bounded, so a byte that never arrives fails the check below.
+            discard await serverFut.withTimeout(5000)
           finally:
             c.close()
 
@@ -3112,9 +3119,10 @@ JeOmWtVZvOCrgXRtH9DmA+/cbA==
           await serverFut
           await closeServer(ms)
 
+      # chronos's own PEM parsing rejects the CRLF a Windows openssl writes.
       waitFor testBody(
-        TLSPrivateKey.init(readCertFile("server.key")),
-        TLSCertificate.init(readCertFile("server.crt")),
+        loadPrivateKey(readCertFile("server.key")),
+        loadCertificate(readCertFile("server.crt")),
       )
       check sslEnabled
       check certDerLen > 0

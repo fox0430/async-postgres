@@ -406,7 +406,12 @@ suite "TLS handshake failure path":
     # says nothing here; only the wording checked below rules out a leak.
     when hasAsyncDispatch:
       # Closing with our ClientHello unread may send an RST instead of a FIN.
-      check "closed by peer" in msg or "reset by peer" in msg
+      when defined(windows):
+        # Winsock words the RST its own way: match our prefix, not its text.
+        check "TLS handshake: connection closed by peer" in msg or
+          "TLS handshake: recv failed: " in msg or "TLS handshake: send failed: " in msg
+      else:
+        check "closed by peer" in msg or "reset by peer" in msg
     elif hasChronos:
       check "TLS handshake failed" in msg
 
@@ -441,6 +446,9 @@ suite "direct SSL: ALPN enforcement":
         "-key",
         CertDir / "server.key",
         "-quiet",
+        # Without it s_server reads stdin, which on Windows blocks on the
+        # redirected pipe before the handshake is ever answered.
+        "-www",
       ],
       options = {poUsePath, poStdErrToStdOut},
     )

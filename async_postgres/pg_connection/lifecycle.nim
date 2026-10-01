@@ -11,6 +11,8 @@ import types, buffer_io, ssl, simple_query, dsn
 
 when defined(posix):
   import std/posix
+elif defined(windows):
+  from std/winlean import nil
 
 when hasAsyncDispatch:
   import std/asyncnet
@@ -493,6 +495,10 @@ proc connectToHostImpl(
           except CatchableError:
             discard
           raise newException(PgConnectionError, e.msg, e)
+    elif defined(windows):
+      # Keepalive stays POSIX-only (see `ConnConfig.keepAlive`).
+      if not isUnix:
+        configureTcpNoDelay(winlean.SocketHandle(transport.fd))
     conn = newPgConnection(hostAddr, hostPort, config)
     conn.attachTransport(transport, dialed.target, entry.host)
   elif hasAsyncDispatch:
@@ -510,6 +516,9 @@ proc connectToHostImpl(
         except CatchableError as e:
           sock.close()
           raise e
+    elif defined(windows):
+      if not isUnix:
+        configureTcpNoDelay(winlean.SocketHandle(sock.getFd()))
     conn = newPgConnection(hostAddr, hostPort, config)
     conn.attachTransport(sock, dialed.target, entry.host)
 

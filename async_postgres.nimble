@@ -13,6 +13,8 @@ requires "checksums >= 0.2.2"
 requires "unicodedb >= 0.13.2"
 requires "normalize >= 0.9.0"
 
+import std/os
+
 task apiSurface,
   "check promised vs sibling-export surfaces against the two golden files":
   exec "nim c -r --hints:off tools/api_surface.nim check tests/api_surface.public.golden tests/api_surface.internal.golden"
@@ -35,7 +37,9 @@ task escapeDiagnostics,
 
 proc runSuite(file: string) =
   ## Build and run `file` once per async backend.
-  exec "bash tests/gen_certs.sh"
+  # A bare `bash` gets System32\bash.exe (the WSL launcher) on Windows, because
+  # CreateProcess searches there before PATH. findExe walks PATH like a shell.
+  exec quoteShell(findExe("bash")) & " tests/gen_certs.sh"
   exec "nim c -d:asyncBackend=asyncdispatch -r " & file
   exec "nim c -d:asyncBackend=chronos -r " & file
 

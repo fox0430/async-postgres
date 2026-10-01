@@ -23,6 +23,9 @@ when hasAsyncDispatch:
 type AutoKeepaliveResult* =
   tuple[msgType: char, receive: int64, flush: int64, apply: int64]
 
+when defined(windows):
+  from std/winlean import nil
+
 when hasChronos:
   import chronos/streams/asyncstream
 
@@ -51,6 +54,13 @@ when hasChronos:
     await ms.server.closeWait()
 
   proc closeClient*(client: MockClient) {.async.} =
+    when defined(windows):
+      # Winsock resets a socket closed with a read pending, as chronos keeps
+      # one, and the peer drops what it has not read. Shut down sends first
+      # so the close is a FIN.
+      if not client.closed():
+        const SdSend = 1.cint
+        discard winlean.shutdown(winlean.SocketHandle(client.fd), SdSend)
     await client.closeWait()
 
   proc readN*(client: MockClient, n: int): Future[seq[byte]] {.async.} =
@@ -203,6 +213,23 @@ when defined(posix):
     for seg in segments:
       doAssert seg.len > 0
       let n = posix.send(fd, unsafeAddr seg[0], seg.len, posix.MSG_NOSIGNAL)
+      doAssert n == seg.len, "short or failed send"
+
+elif defined(windows):
+  proc sendSegmentsNow*(client: MockClient, segments: openArray[seq[byte]]) =
+    ## Winsock twin of the POSIX `sendSegmentsNow`.
+    const IpprotoTcp = 6.cint # winsock2.h; not in winlean
+    when hasChronos:
+      let fd = winlean.SocketHandle(client.fd)
+    elif hasAsyncDispatch:
+      let fd = winlean.SocketHandle(client.getFd())
+    var one: cint = 1
+    doAssert winlean.setsockopt(
+      fd, IpprotoTcp, winlean.TCP_NODELAY, addr one, winlean.SockLen(sizeof(one))
+    ) == 0, "setsockopt(TCP_NODELAY) failed"
+    for seg in segments:
+      doAssert seg.len > 0
+      let n = winlean.send(fd, unsafeAddr seg[0], cint(seg.len), 0)
       doAssert n == seg.len, "short or failed send"
 
 # Message-building helpers
@@ -449,6 +476,14 @@ proc drainFrontendMessage*(
   if msgLen > 4:
     result.body = await readN(client, msgLen - 4)
 
+proc drainThroughCopyDone*(client: MockClient) {.async.} =
+  ## Read frontend messages through the client's CopyDone. A stop writes its
+  ## final status first; closing before CopyDone arrives can fail that write.
+  while true:
+    let m = await drainFrontendMessage(client)
+    if m.msgType == 'c':
+      break
+
 proc runAutoKeepaliveServer*(
     client: MockClient,
     startLsn, walEnd, keepaliveWalEnd: int64,
@@ -479,7 +514,7 @@ proc runAutoKeepaliveServer*(
     tail.add(buildCopyDone())
     tail.add(buildReadyForQuery('I'))
     await sendBytes(client, tail)
-    discard await drainFrontendMessage(client) # client's CopyDone
+    await drainThroughCopyDone(client)
   return observed
 
 # Full handshake shortcut

@@ -107,6 +107,7 @@ async_postgres/pg_connection/buffer_io.nim	cancel
 async_postgres/pg_connection/buffer_io.nim	closeTransport
 async_postgres/pg_connection/buffer_io.nim	configureKeepalive
 async_postgres/pg_connection/buffer_io.nim	configureTcpNoDelay
+async_postgres/pg_connection/buffer_io.nim	configureTcpNoDelay#2
 async_postgres/pg_connection/buffer_io.nim	dialServer
 async_postgres/pg_connection/buffer_io.nim	dialTargets
 async_postgres/pg_connection/buffer_io.nim	dialTargets#2

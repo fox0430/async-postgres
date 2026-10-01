@@ -119,6 +119,7 @@ when hasChronos:
         let serverFut = serverHandler()
         let (tracer, skipped) = cleanupSkippedTracer()
         let conn = await connect(mockConfig(ms.port, tracer))
+        let origWriter = conn.writer
 
         var caught: ref ValueError = nil
         try:
@@ -141,6 +142,8 @@ when hasChronos:
         doAssert skipped[][0].parentMsg == "boom",
           "the cleanup Defect must be preserved as parent of the reported error"
 
+        # Windows cannot see the server's FIN, so close() still sends Terminate.
+        conn.writer = origWriter
         await closeClient(serverClient)
         try:
           await conn.close()
@@ -164,6 +167,7 @@ when hasChronos:
         let serverFut = serverHandler()
         let (tracer, skipped) = cleanupSkippedTracer()
         let conn = await connect(mockConfig(ms.port, tracer))
+        let origWriter = conn.writer
 
         var caught: ref ValueError = nil
         try:
@@ -186,6 +190,8 @@ when hasChronos:
         doAssert skipped[][0].parentMsg == "boom",
           "the cleanup Defect must be preserved as parent of the reported error"
 
+        # Windows cannot see the server's FIN, so close() still sends Terminate.
+        conn.writer = origWriter
         await closeClient(serverClient)
         try:
           await conn.close()

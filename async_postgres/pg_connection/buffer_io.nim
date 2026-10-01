@@ -41,6 +41,13 @@ when defined(posix):
   # POSIX socket option constants (used by liveness probes and TCP keepalive)
   var TCP_NODELAY {.importc, header: "<netinet/tcp.h>".}: cint
   var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
+elif defined(windows):
+  from std/winlean import nil
+
+  # winsock2.h values winlean lacks
+  const
+    WSAENOBUFS = 10055'i32
+    IpprotoTcp = 6.cint
 
 type
   RecvWatch* = ref object
@@ -57,7 +64,7 @@ type
     spIdle ## socket alive with no data ready (`EAGAIN`/`EWOULDBLOCK`)
     spTransient ## transient kernel resource exhaustion (`ENOMEM`/`ENOBUFS`)
     spError ## any other `recv` error
-    spUnavailable ## no transport handle, or probe unsupported (non-POSIX)
+    spUnavailable ## no transport handle
 
 # Host / address helpers
 
@@ -157,8 +164,12 @@ proc dialError(failures: openArray[DialFailure]): ref PgConnectionError {.raises
   else:
     (ref PgConnectionError)(msg: msg, parent: failures[^1].err)
 
+func lookupFailed(host, reason: string): string =
+  ## A failed lookup of ``host``, worded alike on every platform.
+  "Could not resolve host " & host & ": " & reason
+
 proc unresolved(host: string): ref PgConnectionError =
-  newException(PgUnavailableError, "Could not resolve host: " & host)
+  newException(PgUnavailableError, lookupFailed(host, "no addresses"))
 
 when defined(posix):
   proc lookup(host: string, port: int): ptr posix.AddrInfo =
@@ -176,7 +187,7 @@ when defined(posix):
           $posix.strerror(sysErr)
         else:
           $posix.gai_strerror(rc)
-      let msg = "Could not resolve host " & host & ": " & reason
+      let msg = lookupFailed(host, reason)
       if rc in [
         posix.EAI_FAIL, posix.EAI_FAMILY, posix.EAI_SOCKTYPE, posix.EAI_SERVICE,
         posix.EAI_BADFLAGS,
@@ -227,7 +238,8 @@ when hasChronos:
         result = resolveTAddress(host, Port(port))
       except TransportAddressError as e:
         # Its resolver code is lost here: judged as a name not known yet.
-        raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+        raise
+          (ref PgUnavailableError)(msg: lookupFailed(host, oneLine(e.msg)), parent: e)
     if result.len == 0:
       raise unresolved(host)
 
@@ -323,9 +335,10 @@ elif hasAsyncDispatch:
           getAddrInfo(host, Port(port), Domain.AF_UNSPEC)
         except OSError as e:
           const WSANO_RECOVERY = 11003 # as EAI_FAIL
+          let msg = lookupFailed(host, oneLine(e.msg))
           if e.errorCode == WSANO_RECOVERY:
-            raise (ref PgConnectionError)(msg: e.msg, parent: e)
-          raise (ref PgUnavailableError)(msg: e.msg, parent: e)
+            raise (ref PgConnectionError)(msg: msg, parent: e)
+          raise (ref PgUnavailableError)(msg: msg, parent: e)
       try:
         var it = aiList
         while it != nil:
@@ -876,8 +889,9 @@ proc closeTransport*(conn: PgConnection) {.async.} =
 # Liveness probes
 
 proc peekSocket(conn: PgConnection): SocketPeek =
-  ## Single `recv(MSG_PEEK | MSG_DONTWAIT)` byte probe shared by the liveness
-  ## and pre-TLS-injection checks. Classifies the kernel's view of the socket
+  ## Single `recv(MSG_PEEK)` byte probe shared by the liveness and
+  ## pre-TLS-injection checks (`MSG_DONTWAIT` on POSIX; Windows sockets are
+  ## non-blocking in both backends). Classifies the kernel's view of the socket
   ## without consuming data or blocking; retries on `EINTR`. Callers decide
   ## what each outcome means (see `socketHasFin` / `socketHasPendingData`).
   when defined(posix):
@@ -906,10 +920,33 @@ proc peekSocket(conn: PgConnection): SocketPeek =
         return spTransient
       return spError
   else:
-    spUnavailable
+    when hasChronos:
+      if conn.transport.isNil:
+        return spUnavailable
+      # Once chronos starts reading it keeps an overlapped read posted, which
+      # takes data and the FIN off the socket; a FIN it took shows here.
+      if not conn.transport.running():
+        return spClosed
+      let fd = winlean.SocketHandle(conn.transport.fd)
+    elif hasAsyncDispatch:
+      if conn.socket.isNil:
+        return spUnavailable
+      let fd = winlean.SocketHandle(conn.socket.getFd())
+    var buf: byte
+    let n = winlean.recv(fd, addr buf, 1, winlean.MSG_PEEK)
+    if n > 0:
+      return spData
+    if n == 0:
+      return spClosed
+    let err = winlean.wsaGetLastError()
+    if err == winlean.WSAEWOULDBLOCK:
+      return spIdle
+    if err == WSAENOBUFS:
+      return spTransient
+    spError
 
 proc socketHasFin*(conn: PgConnection): bool =
-  ## POSIX half-open probe (``MSG_PEEK``): true if FIN/RST observed; false otherwise or unavailable.
+  ## Half-open probe (``MSG_PEEK``): true if FIN/RST observed; false otherwise or unavailable.
   case conn.peekSocket()
   of spClosed, spError:
     # FIN/RST observed, or an unclassified error we conservatively read as a
@@ -922,7 +959,9 @@ proc socketHasFin*(conn: PgConnection): bool =
     false
 
 proc socketHasPendingData*(conn: PgConnection): bool =
-  ## True if kernel has readable bytes (pre-TLS injection check; kernel buffer only).
+  ## True if the kernel has readable bytes (pre-TLS injection check; kernel
+  ## buffer only). Blind under chronos on Windows once reading has started:
+  ## its posted read takes the bytes first.
   conn.peekSocket() == spData
 
 proc isConnected*(conn: PgConnection): bool =
@@ -985,3 +1024,11 @@ when defined(posix):
           warning:
             "TCP keepalive timing options (idle/interval/count) are not supported on this platform and will be ignored"
         .}
+
+elif defined(windows):
+  proc configureTcpNoDelay*(fd: winlean.SocketHandle) =
+    ## Disable Nagle's algorithm for low-latency sends.
+    var optval: cint = 1
+    discard winlean.setsockopt(
+      fd, IpprotoTcp, winlean.TCP_NODELAY, addr optval, winlean.SockLen(sizeof(optval))
+    )
