@@ -25,6 +25,8 @@ type AutoKeepaliveResult* =
 
 when hasChronos:
   import chronos/streams/asyncstream
+  when defined(windows):
+    from std/winlean import nil
 
   type
     MockServer* = object
@@ -51,6 +53,13 @@ when hasChronos:
     await ms.server.closeWait()
 
   proc closeClient*(client: MockClient) {.async.} =
+    when defined(windows):
+      # Winsock resets a socket closed with a read pending, as chronos keeps
+      # one, and the peer drops what it has not read. Shut down sends first
+      # so the close is a FIN.
+      if not client.closed():
+        const SdSend = 1.cint
+        discard winlean.shutdown(winlean.SocketHandle(client.fd), SdSend)
     await client.closeWait()
 
   proc readN*(client: MockClient, n: int): Future[seq[byte]] {.async.} =

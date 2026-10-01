@@ -24,8 +24,24 @@ import std/importutils
 privateAccess(PgConnection)
 
 when hasChronos:
-  from std/times import cpuTime
   import ../async_postgres/pg_connection/buffer_io
+
+  when defined(windows):
+    from std/winlean import nil
+
+    proc cpuSeconds(): float =
+      ## `cpuTime` is the CRT's `clock` on Windows, which counts wall time.
+      var creation, exit, kernel, user: winlean.FILETIME
+      doAssert winlean.getProcessTimes(
+        winlean.getCurrentProcess(), creation, exit, kernel, user
+      ) != 0
+      float(winlean.rdFileTime(kernel) + winlean.rdFileTime(user)) / 1e7
+
+  else:
+    from std/times import cpuTime
+
+    proc cpuSeconds(): float =
+      cpuTime()
 
 proc mockConfig(port: int): ConnConfig =
   ConnConfig(
@@ -1396,7 +1412,7 @@ when hasChronos:
             discard msg
             callbackCalls.inc
 
-        let cpuBefore = cpuTime()
+        let cpuBefore = cpuSeconds()
         let wallBefore = Moment.now()
         await conn.startReplication(
           "test_slot",
@@ -1404,7 +1420,7 @@ when hasChronos:
           statusInterval = milliseconds(50),
           callback = cb,
         )
-        elapsedCpu = cpuTime() - cpuBefore
+        elapsedCpu = cpuSeconds() - cpuBefore
         elapsedWallMs = (Moment.now() - wallBefore).milliseconds
 
         await conn.close()
@@ -1525,7 +1541,7 @@ proc runStartReplicationCapture(slot: string, options: seq[(string, string)]): s
       tail.add(buildCopyDone())
       tail.add(buildReadyForQuery('I'))
       await sendBytes(st, tail)
-      discard await drainFrontendMessage(st) # client's CopyDone
+      await drainThroughCopyDone(st)
       await closeClient(st)
 
     let serverFut = serverHandler()

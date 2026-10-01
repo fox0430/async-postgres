@@ -3124,9 +3124,10 @@ JeOmWtVZvOCrgXRtH9DmA+/cbA==
           await serverFut
           await closeServer(ms)
 
+      # chronos's own PEM parsing rejects the CRLF a Windows openssl writes.
       waitFor testBody(
-        TLSPrivateKey.init(readCertFile("server.key")),
-        TLSCertificate.init(readCertFile("server.crt")),
+        loadPrivateKey(readCertFile("server.key")),
+        loadCertificate(readCertFile("server.crt")),
       )
       check sslEnabled
       check certDerLen > 0
