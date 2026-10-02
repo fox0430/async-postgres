@@ -41,7 +41,8 @@ type
       ## SQL to execute when returning a connection to the pool (default ""=disabled).
       ## Common values: "DISCARD ALL" (full reset, recommended for PgBouncer),
       ## "DEALLOCATE ALL" (clear prepared statements only),
-      ## "RESET ALL" (reset session parameters only).
+      ## "RESET ALL" (reset session parameters only). The statement cache is
+      ## kept unless it drops the prepared statements (DISCARD/DEALLOCATE ALL).
       ## On failure, the connection is discarded. A `TimeZone` it leaves off
       ## the connect value is set back afterwards, at the cost of a round trip;
       ## behind PgBouncer, starting its server connections in the same zone
@@ -426,7 +427,6 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
       discard await conn.simpleExec(
         pool.config.resetQuery, timeout = pool.config.resetQueryTimeout
       )
-      conn.clearStmtCache()
     if conn.timeZoneChanged and conn.canRestoreTimeZone:
       # The next borrower's DateTime params would shift by the new offset.
       if conn.timeZoneFollowsServer:

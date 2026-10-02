@@ -1,4 +1,4 @@
-import std/[unittest, options, importutils, deques]
+import std/[unittest, options, importutils, deques, tables]
 from std/times import dateTime, mJan, utc
 
 import
@@ -278,6 +278,30 @@ suite "E2E: resetQuery timeout":
       # Re-acquire the same conn (minSize=0, maxSize=1) and verify unlock ran.
       pool.withConnection(conn2):
         doAssert conn2.heldSessionLocks == 0
+
+    waitFor t()
+
+suite "E2E: resetQuery and the statement cache":
+  test "the cache survives a resetQuery unless it drops the statements":
+    # Clearing it after every resetQuery left RESET ALL sessions holding one
+    # forgotten server-side statement per release.
+    proc t() {.async.} =
+      for (resetQuery, kept) in [("RESET ALL", true), ("DISCARD ALL", false)]:
+        let pool = await newPool(
+          initPoolConfig(
+            plainConfig(), minSize = 0, maxSize = 1, resetQuery = resetQuery
+          )
+        )
+        for _ in 0 ..< 3:
+          pool.withConnection(conn):
+            doAssert (await conn.query("SELECT 1")).rows[0].getInt(0) == 1
+        pool.withConnection(conn):
+          doAssert ("SELECT 1" in conn.stmtCache) == kept
+          let server = (
+            await conn.simpleQuery("SELECT count(*)::int FROM pg_prepared_statements")
+          )[0].rows[0].getInt(0)
+          doAssert server == conn.stmtCache.len
+        await pool.close()
 
     waitFor t()
 

@@ -402,6 +402,7 @@ type
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
     stmtCounter: int
     stmtCacheCapacity: int ## 0=disabled, default 256
+    stmtCacheResetGen: int ## Bumped by ``clearStmtCache``.
     pendingStmtCloses: seq[string]
       ## Server-side prepared statement names whose ``Close`` was not bundled
       ## with the operation that evicted them. Populated when the defensive
@@ -1840,6 +1841,19 @@ proc invalidateStmtCache*(conn: PgConnection, sql, stmtName: string) =
   conn.removeStmtCache(sql)
   conn.queueStmtClose(stmtName)
 
+proc invalidateAllStmtCache*(conn: PgConnection, sql, stmtName: string) =
+  ## Drop every entry and queue its ``Close``: a hit's statement vanished with
+  ## no reset tag seen, so the rest likely went with it. A ``Close`` for a name
+  ## already gone is a backend no-op. A no-op once ``sql`` no longer maps to
+  ## ``stmtName``, as in ``invalidateStmtCache``.
+  let entry = conn.stmtCache.getOrDefault(sql)
+  if entry == nil or entry.name != stmtName:
+    return
+  for cachedSql in conn.stmtCacheLru:
+    conn.queueStmtClose(conn.stmtCache[cachedSql].name)
+  conn.stmtCache.clear()
+  conn.stmtCacheLru = initDoublyLinkedList[string]()
+
 proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   ## Add a prepared statement to the cache with auto-computed result formats.
   ## Single-statement callers pre-evict (``evictForInsert``) so the Close
@@ -1874,15 +1888,22 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   conn.stmtCacheLru.append(node)
 
 proc clearStmtCache*(conn: PgConnection) =
-  ## Clear the client-side statement cache. Does not close server-side
-  ## statements, including any ``Close`` messages queued in
-  ## ``pendingStmtCloses`` from defensive eviction — the queue is dropped on
-  ## the assumption the caller will reset the session externally (e.g. via
-  ## ``DISCARD ALL`` or by closing the connection).
+  ## Forget every cached statement and owed ``Close``: the session no longer
+  ## holds them. A miss Parsed before this settles as gone (``stmtCacheResetGen``).
   conn.stmtCache.clear()
   conn.stmtCacheLru = initDoublyLinkedList[string]()
   conn.pendingStmtCloses.setLen(0)
   conn.stagedStmtCloses.setLen(0)
+  inc conn.stmtCacheResetGen
+
+func stmtCacheResetGen*(conn: PgConnection): int {.inline.} =
+  conn.stmtCacheResetGen
+
+proc noteCommandTag*(conn: PgConnection, tag: string) =
+  ## Drop the cache once the session's prepared statements are gone. A run
+  ## inside a function sends no such tag; the first hit's 26000 catches that.
+  if tag in ["DISCARD ALL", "DEALLOCATE ALL"]:
+    conn.clearStmtCache()
 
 proc stagePendingStmtCloses*(conn: PgConnection, buf: var seq[byte]) =
   ## Append a ``Close`` for every owed statement name to ``buf`` so they ride

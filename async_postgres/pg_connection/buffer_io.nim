@@ -589,6 +589,8 @@ proc nextMessage*(
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
+    if res.message.kind == bmkCommandComplete:
+      conn.noteCommandTag(res.message.commandTag)
     if res.message.kind == bmkErrorResponse and
         isSessionFatal(errorSeverity(res.message.errorFields)):
       conn.fatalServerError = newPgQueryError(res.message.errorFields)
