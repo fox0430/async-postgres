@@ -74,11 +74,18 @@ proc encodeEnumTextArray*(
     checkPgBinLen(result.len + 1, "enum array")
   result.add('}')
 
+macro checkPgEnumType(T: typedesc): untyped =
+  ## Reject a non-enum ``T``: ``pgEnum(int32)`` would otherwise shadow the
+  ## built-in ``toPgParam(int32)`` with an OID-0 text overload.
+  if T.getType[1].typeKind != ntyEnum:
+    error("pgEnum requires an enum type, got " & repr(T), T)
+  newEmptyNode()
+
 macro pgEnum*(T: untyped): untyped =
   ## Generate ``toPgParam`` overloads for a Nim enum type and its array forms.
   ## OIDs are 0 (unspecified) so PostgreSQL infers the type from context
   ## (use ``$1::mytype`` / ``$1::mytype[]`` in the SQL).
-  result = newStmtList()
+  result = newStmtList(newCall(bindSym"checkPgEnumType", T))
   result.add quote do:
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: 0'i32, format: 0'i16, value: some(toBytes($v)))
@@ -109,7 +116,7 @@ macro pgEnum*(T: untyped, oid: untyped): untyped =
   ## Generate ``toPgParam`` overloads for a Nim enum type with an explicit
   ## scalar OID. The array OID is unspecified (0); add a ``$1::mytype[]``
   ## cast in the SQL, or use the 3-argument form to set the array OID too.
-  result = newStmtList()
+  result = newStmtList(newCall(bindSym"checkPgEnumType", T))
   result.add quote do:
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
@@ -138,7 +145,7 @@ macro pgEnum*(T: untyped, oid: untyped): untyped =
 
 macro pgEnum*(T: untyped, oid: untyped, arrayOid: untyped): untyped =
   ## Generate ``toPgParam`` overloads with explicit scalar and array OIDs.
-  result = newStmtList()
+  result = newStmtList(newCall(bindSym"checkPgEnumType", T))
   result.add quote do:
     proc toPgParam*(v: `T`): PgParam =
       PgParam(oid: int32(`oid`), format: 0'i16, value: some(toBytes($v)))
@@ -399,6 +406,9 @@ proc compositeDateTimeToText(dt: DateTime): string =
 macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
   ## Generate ``toPgParam`` for a Nim object as a PostgreSQL composite type.
   ## Each field is sent as text inside the composite text format.
+  ## Fields map by position, in both directions: the object's field order must
+  ## match the composite's attribute order. Neither wire format carries names,
+  ## so a swap of same-typed fields is not detected.
   ## When OID is 0 (default), PostgreSQL infers the type from context.
   let tImpl = T.getType[1]
   let tSym = tImpl
@@ -566,13 +576,41 @@ proc getCompositeOpt*[T: object](row: Row, col: int): Option[T] =
 
 # User-defined domain type support
 
+macro checkPgDomainTypes(T, Base: typedesc): untyped =
+  ## The generated overload converts ``T`` to ``Base`` and encodes that. A
+  ## distinct ``Base`` must lie below ``T`` in its ``distinct`` chain, so each
+  ## step moves down a finite chain: ``Base`` equal to ``T``, or two types
+  ## naming each other, would otherwise recurse forever. A non-distinct ``T``
+  ## would make the overload call itself.
+  let tSym = T.getType[1]
+  if tSym.typeKind != ntyDistinct:
+    error("pgDomain requires a distinct type, got " & repr(T), T)
+  let bSym = Base.getType[1]
+  if bSym.typeKind == ntyDistinct:
+    var t = tSym
+    while true:
+      let impl = t.getTypeImpl
+      # getTypeImpl, unlike typeKind, sees through an alias of a distinct type.
+      if impl.kind != nnkDistinctTy or impl[0].getTypeImpl.kind != nnkDistinctTy:
+        error(
+          "pgDomain base " & repr(Base) & " is distinct, so " & repr(T) &
+            " must be declared from it (`" & repr(T) & " = distinct " & repr(Base) & "`)",
+          Base,
+        )
+      t = impl[0]
+      if sameType(t, bSym):
+        break
+  newEmptyNode()
+
 macro pgDomain*(T: typedesc, Base: typedesc, oid: int32 = 0'i32): untyped =
   ## Generate ``toPgParam`` for a Nim distinct type as a PostgreSQL domain type.
-  ## Encoding delegates to the base type's ``toPgParam``.
+  ## Encoding delegates to the base type's ``toPgParam``. A distinct ``Base``
+  ## (a domain over another domain) must be one ``T`` is declared from:
+  ## ``type T = distinct Base``.
   ## When OID is 0 (default), the base type's OID is used.
   let tSym = T.getType[1]
   let bSym = Base.getType[1]
-  result = newStmtList()
+  result = newStmtList(newCall(bindSym"checkPgDomainTypes", T, Base))
   result.add quote do:
     proc toPgParam*(v: `tSym`): PgParam =
       result = toPgParam(`bSym`(v))

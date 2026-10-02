@@ -1089,7 +1089,19 @@ suite "PgInterval":
 
   test "$ negative months and days":
     let v = PgInterval(months: -14, days: -3, microseconds: -14706123456)
-    check $v == "-1 year -2 mons -3 days -04:05:06.123456"
+    check $v == "-1 years -2 mons -3 days -04:05:06.123456"
+
+  test "$ signs a field that follows a negative one":
+    # Without the sign, IntervalStyle = sql_standard would read "-1 years 3 days"
+    # as -1 year -3 days.
+    check $PgInterval(months: -12, days: 3, microseconds: 3_600_000_000) ==
+      "-1 years +3 days 01:00:00"
+    check $PgInterval(months: -1, days: 0, microseconds: 1) == "-1 mons +00:00:00.000001"
+    check $PgInterval(months: 12, days: -3, microseconds: 1_000_000) ==
+      "1 year -3 days +00:00:01"
+    check $PgInterval(months: -12, days: -3, microseconds: 1_000_000) ==
+      "-1 years -3 days +00:00:01"
+    check $PgInterval(months: 0, days: 3, microseconds: -1_000_000) == "3 days -00:00:01"
 
   test "$ int64.min microseconds does not overflow":
     let v = PgInterval(months: 0, days: 0, microseconds: int64.low)
@@ -1108,6 +1120,21 @@ suite "PgInterval":
     check $PgInterval(months: 2, days: 0, microseconds: 0) == "2 mons"
     check $PgInterval(months: 0, days: 1, microseconds: 0) == "1 day"
     check $PgInterval(months: 0, days: 2, microseconds: 0) == "2 days"
+    # The server writes the singular only for exactly 1, not -1.
+    check $PgInterval(months: -12, days: 0, microseconds: 0) == "-1 years"
+    check $PgInterval(months: -1, days: 0, microseconds: 0) == "-1 mons"
+    check $PgInterval(months: 0, days: -1, microseconds: 0) == "-1 days"
+
+  test "$ infinity":
+    # PostgreSQL 16 reads "infinity" as invalid but this as itself; 17+ reads
+    # both as infinity.
+    check $PgInterval(months: int32.high, days: int32.high, microseconds: int64.high) ==
+      "178956970 years 7 mons 2147483647 days 2562047788:00:54.775807"
+    check $PgInterval(months: int32.low, days: int32.low, microseconds: int64.low) ==
+      "-infinity"
+    # Only the full field set is infinite.
+    check $PgInterval(months: 0, days: 0, microseconds: int64.high) ==
+      "2562047788:00:54.775807"
 
   test "== operator":
     let a = PgInterval(months: 1, days: 2, microseconds: 3)
@@ -1138,15 +1165,62 @@ suite "PgInterval":
     check v.days == 0
     check v.microseconds == 5_400_000_000'i64
 
+  test "parseIntervalText ignores surrounding spaces":
+    for text in [" 01:30:00", "01:30:00 ", " 1-2 ", " 1 day "]:
+      check parseIntervalText(text) == parseIntervalText(text.strip)
+
   test "parseIntervalText days and time":
     let v = parseIntervalText("7 days 12:00:00")
     check v.days == 7
     check v.microseconds == 43_200_000_000'i64
 
+  test "parseIntervalText reads every IntervalStyle":
+    # Server output for the same values under each style.
+    let full = PgInterval(months: 14, days: 3, microseconds: 14706789000)
+    let mixed = PgInterval(months: -10, days: -3, microseconds: 14394000000)
+    let cases = [
+      ("1 year 2 mons 3 days 04:05:06.789", full),
+      ("@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs", full),
+      ("+1-2 +3 +4:05:06.789", full),
+      ("P1Y2M3DT4H5M6.789S", full),
+      ("-10 mons -3 days +03:59:54", mixed),
+      ("@ 10 mons 3 days -3 hours -59 mins -54 secs ago", mixed),
+      ("-0-10 -3 +3:59:54", mixed),
+      ("P-10M-3DT3H59M54S", mixed),
+      ("-1 days -00:00:00.5", PgInterval(days: -1, microseconds: -500_000)),
+      ("@ 1 day 0.5 secs ago", PgInterval(days: -1, microseconds: -500_000)),
+      ("-1 0:00:00.5", PgInterval(days: -1, microseconds: -500_000)),
+      ("P-1DT-0.5S", PgInterval(days: -1, microseconds: -500_000)),
+      ("1-2", PgInterval(months: 14)),
+      ("-1-2", PgInterval(months: -14)),
+      ("4:05:06", PgInterval(microseconds: 14706_000_000)),
+      ("0", PgInterval()),
+      ("@ 0", PgInterval()),
+      ("PT0S", PgInterval()),
+      ("@ 2147483648 days ago", PgInterval(days: int32.low)),
+      ("-2562047788:00:54.775808", PgInterval(microseconds: int64.low)),
+      ("-1 years +3 days", PgInterval(months: -12, days: 3)),
+      (
+        "infinity",
+        PgInterval(months: int32.high, days: int32.high, microseconds: int64.high),
+      ),
+      (
+        "-infinity",
+        PgInterval(months: int32.low, days: int32.low, microseconds: int64.low),
+      ),
+    ]
+    for (text, want) in cases:
+      checkpoint text
+      check parseIntervalText(text) == want
+
   test "parseIntervalText malformed raises":
     # Bare garbage, unknown units, bare number, and non-alnum bytes must all
     # raise. "!!" previously spun the parser in an infinite loop.
-    for bad in ["junk", "5 fortnights", "1", "!!", "-", "3 days garbage"]:
+    for bad in [
+      "junk", "5 fortnights", "1", "!!", "-", "3 days garbage", "@", "@ 1",
+      "@ 1.5 days", "@ 1 day ago ago", "P", "PT", "P1.5Y", "P1X", "PT1HT1M", "1-",
+      "+1-2 3 +4:05:06", "1-2 3 4:05:06", "1-2  3", "01:00:00.",
+    ]:
       var raised = false
       try:
         discard parseIntervalText(bad)
@@ -1165,6 +1239,10 @@ suite "PgInterval":
       "3000000000 days", # overflows int32 days
       "99999999999999999999:00:00", # hours accumulation overflows int64
       "3000000000000:00:00", # hours * 3_600_000_000 overflows int64
+      "5 mons 9223372036854775807 mons", # field past int32 on a nonzero sum
+      "@ 9223372036854775807 hours", # verbose unit scaling overflows int64
+      "PT9223372036854775807S",
+      "+1-2 +9223372036854775807 +0:00:00",
     ]
     for bad in bads:
       var raised = false

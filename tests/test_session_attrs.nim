@@ -7,10 +7,12 @@
 ## `tsaReadOnly` are judged on the read-only state. In particular a primary
 ## running with `default_transaction_read_only=on` must still match
 ## `tsaPrimary`, and an indeterminate probe result must skip the host.
+## Also covers the `DateStyle` `connect` sends at startup.
 
 import std/[unittest, strutils]
 
 import ../async_postgres/[async_backend, pg_connection]
+from ../async_postgres/pg_protocol import decodeInt32
 
 import mock_pg_server
 
@@ -37,6 +39,13 @@ proc buildEmptyResult(colName, tag: string): seq[byte] =
   result.add(buildRowDescription(colName))
   result.add(buildCommandComplete(tag))
   result.add(buildReadyForQuery('I'))
+
+proc readStartupParams(client: MockClient): Future[string] {.async.} =
+  ## The StartupMessage's key/value cstrings (after the protocol version).
+  let lenBuf = await readN(client, 4)
+  let body = await readN(client, int(decodeInt32(lenBuf, 0)) - 4)
+  for b in body[4 .. ^1]:
+    result.add(char(b))
 
 suite "target_session_attrs: recovery-state checks":
   test "tsaPrimary accepts a read-only-by-default primary without a probe query":
@@ -148,37 +157,39 @@ suite "target_session_attrs: recovery-state checks":
 
   test "a pre-14 physical replication connection probes SHOW, not SELECT":
     # A walsender rejects arbitrary SQL, so the recovery probe must fall back
-    # to SHOW transaction_read_only. The alternate boolean spelling
-    # `replication=on` (reaching extraParams verbatim, e.g. via a DSN) must
-    # also be recognised as physical replication.
-    var probeOk = false
+    # to SHOW transaction_read_only. Every spelling the server's parse_bool
+    # reads as true (reaching extraParams verbatim, e.g. via a DSN) must be
+    # recognised as physical replication.
+    for spelling in ["on", "TRUE", "t", "Yes", "1"]:
+      checkpoint spelling
+      var probeOk = false
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        # Pre-14 server: no in_hot_standby ParameterStatus.
-        let st = await acceptAndReady(ms)
-        try:
-          let (msgType, body) = await drainFrontendMessage(st)
-          probeOk = msgType == 'Q' and queryText(body) == "SHOW transaction_read_only"
-          await sendBytes(
-            st, buildSingleRowResult("transaction_read_only", "off", "SHOW")
-          )
-          discard await drainFrontendMessage(st) # Terminate
-        except CatchableError:
-          discard
-        await closeClient(st)
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        proc serverHandler() {.async.} =
+          # Pre-14 server: no in_hot_standby ParameterStatus.
+          let st = await acceptAndReady(ms)
+          try:
+            let (msgType, body) = await drainFrontendMessage(st)
+            probeOk = msgType == 'Q' and queryText(body) == "SHOW transaction_read_only"
+            await sendBytes(
+              st, buildSingleRowResult("transaction_read_only", "off", "SHOW")
+            )
+            discard await drainFrontendMessage(st) # Terminate
+          except CatchableError:
+            discard
+          await closeClient(st)
 
-      let serverFut = serverHandler()
-      var cfg = mockConfig(ms.port, tsaPrimary)
-      cfg.extraParams = @[("replication", "on")]
-      let conn = await connect(cfg)
-      await conn.close()
-      await serverFut
-      await closeServer(ms)
+        let serverFut = serverHandler()
+        var cfg = mockConfig(ms.port, tsaPrimary)
+        cfg.extraParams = @[("replication", spelling)]
+        let conn = await connect(cfg)
+        await conn.close()
+        await serverFut
+        await closeServer(ms)
 
-    waitFor testBody()
-    check probeOk
+      waitFor testBody()
+      check probeOk
 
   test "an indeterminate recovery probe skips the host (fail-closed)":
     # A probe that returns zero rows is indeterminate; libpq advances to the
@@ -438,3 +449,72 @@ suite "target_session_attrs: read-only-state checks":
 
     waitFor testBody()
     check firstMsgType == 'X'
+
+suite "connect: DateStyle":
+  proc startupAndFirstMsg(
+      cfg: ConnConfig, ms: MockServer, reported: string
+  ): Future[(string, char)] {.async.} =
+    ## The StartupMessage parameters, and the first message after ReadyForQuery.
+    var startup = ""
+    var firstMsgType = '\0'
+    proc serverHandler() {.async.} =
+      let st = await ms.accept()
+      startup = await readStartupParams(st)
+      await sendFullHandshake(st, params = @[("DateStyle", reported)])
+      try:
+        let (msgType, _) = await drainFrontendMessage(st)
+        firstMsgType = msgType
+      except CatchableError:
+        discard
+      await closeClient(st)
+
+    let serverFut = serverHandler()
+    let conn = await connect(cfg)
+    await conn.close()
+    await serverFut
+    await closeServer(ms)
+    return (startup, firstMsgType)
+
+  test "ISO is sent at startup, with no SET after it":
+    # A startup value, unlike a SET, is what RESET and DISCARD ALL restore.
+    proc testBody(): Future[(string, char)] {.async.} =
+      let ms = startMockServer()
+      return await startupAndFirstMsg(mockConfig(ms.port, tsaAny), ms, "ISO, MDY")
+
+    let (startup, firstMsgType) = waitFor testBody()
+    check "DateStyle\0ISO\0" in startup
+    check firstMsgType == 'X'
+
+  test "a caller's field order joins the startup ISO":
+    proc testBody(): Future[(string, char)] {.async.} =
+      let ms = startMockServer()
+      var cfg = mockConfig(ms.port, tsaAny)
+      cfg.extraParams = @[("datestyle", "DMY")]
+      return await startupAndFirstMsg(cfg, ms, "ISO, DMY")
+
+    let (startup, _) = waitFor testBody()
+    check "DateStyle\0ISO, DMY\0" in startup
+    check "datestyle" notin startup
+
+  test "a non-ISO DateStyle reported at startup fails connect":
+    # A server or proxy that ignored the startup value.
+    var msg = ""
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms, params = @[("DateStyle", "SQL, DMY")])
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      try:
+        let conn = await connect(mockConfig(ms.port, tsaAny))
+        await conn.close()
+      except PgConnectionError as e:
+        {.cast(gcsafe).}:
+          msg = e.msg
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check "DateStyle changed to SQL, DMY" in msg

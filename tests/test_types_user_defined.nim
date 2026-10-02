@@ -4,6 +4,7 @@ import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
 import ../async_postgres/pg_types/core {.all.}
 import ../async_postgres/pg_types/decoding {.all.}
+import ../async_postgres/pg_types/user_types {.all.}
 
 import types_common
 
@@ -16,6 +17,11 @@ type
   IsActive = distinct bool
   RatioF32 = distinct float32
   EventAt = distinct DateTime
+  Int32Alias = int32
+  ZipPlus4 = distinct UsPostalCode
+  OtherZip = distinct string
+  PostalAlias = UsPostalCode
+  AliasZip = distinct PostalAlias
 
 proc `==`(a, b: UsPostalCode): bool {.borrow.}
 proc `==`(a, b: SmallCount): bool {.borrow.}
@@ -35,6 +41,7 @@ pgDomain(BigCount, int64)
 pgDomain(IsActive, bool)
 pgDomain(RatioF32, float32)
 pgDomain(EventAt, DateTime)
+pgDomain(ZipPlus4, UsPostalCode, 90002)
 
 suite "User-defined enum":
   test "pgEnum generates toPgParam with OID 0":
@@ -189,6 +196,13 @@ suite "User-defined enum":
     let fields = @[mkField(99999'i32, 1'i16)]
     let row = mkRow(@[p.value], fields)
     check getEnum[Mood](row, 0) == orig
+
+  test "pgEnum rejects a non-enum type":
+    # The check pgEnum emits first; the macro itself cannot run in `compiles`.
+    check compiles(checkPgEnumType(Mood))
+    check not compiles(checkPgEnumType(int32))
+    check not compiles(checkPgEnumType(string))
+    check toPgParam(5'i32).oid == OidInt4
 
 suite "Composite text parser":
   test "parseCompositeText simple":
@@ -731,6 +745,26 @@ suite "User-defined composite":
     check got.name == "alice"
 
 suite "User-defined domain":
+  test "pgDomain rejects a type its overload would recurse on":
+    # The check pgDomain emits first; the macro itself cannot run in `compiles`.
+    check compiles(checkPgDomainTypes(UsPostalCode, string))
+    check compiles(checkPgDomainTypes(ZipPlus4, string))
+    check not compiles(checkPgDomainTypes(Int32Alias, int32))
+    check not compiles(checkPgDomainTypes(UsPostalCode, UsPostalCode))
+    # Siblings could name each other; the base must be in the distinct chain.
+    check not compiles(checkPgDomainTypes(OtherZip, UsPostalCode))
+    check not compiles(checkPgDomainTypes(UsPostalCode, ZipPlus4))
+    # A distinct type declared through an alias of its base.
+    check compiles(checkPgDomainTypes(AliasZip, UsPostalCode))
+    check compiles(checkPgDomainTypes(AliasZip, PostalAlias))
+    check compiles(checkPgDomainTypes(AliasZip, string))
+    check not compiles(checkPgDomainTypes(AliasZip, OtherZip))
+
+  test "pgDomain over another pgDomain type":
+    let p = toPgParam(ZipPlus4("12345-6789"))
+    check p.oid == 90002
+    check toString(p.value.get) == "12345-6789"
+
   test "pgDomain generates toPgParam with base type OID":
     let p = toPgParam(UsPostalCode("12345"))
     check p.oid == OidText

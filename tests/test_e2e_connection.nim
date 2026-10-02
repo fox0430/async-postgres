@@ -1,4 +1,6 @@
 import std/[unittest, options, tables]
+from std/times import dateTime, mJan, mFeb, utc, `==`
+from std/strutils import startsWith
 
 import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
@@ -81,6 +83,70 @@ suite "E2E: ConnConfig Options":
       var raised = false
       try:
         discard await conn.simpleQuery("SET client_encoding TO 'SJIS'")
+      except PgProtocolError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csClosed
+      await conn.close()
+
+    waitFor t()
+
+  test "DateStyle is ISO from startup, so RESET and DISCARD ALL keep it":
+    proc t() {.async.} =
+      const role = "async_pg_datestyle_probe"
+      let admin = await connect(plainConfig())
+      discard await admin.simpleQuery("DROP ROLE IF EXISTS " & role)
+      discard await admin.simpleQuery(
+        "CREATE ROLE " & role & " LOGIN PASSWORD 'p'; " & "ALTER ROLE " & role &
+          " SET DateStyle = 'SQL, YMD'"
+      )
+      try:
+        var cfg = plainConfig()
+        cfg.user = role
+        cfg.password = "p"
+        # The startup value overrides the role's, field order included.
+        let conn = await connect(cfg)
+        let style = conn.serverParam("DateStyle")
+        doAssert style.startsWith("ISO, ") and style != "ISO, YMD", style
+        for sql in [
+          "RESET DateStyle", "RESET ALL", "DISCARD ALL", "SET DateStyle TO DEFAULT"
+        ]:
+          discard await conn.simpleQuery(sql)
+          doAssert conn.state == csReady, sql
+          doAssert conn.serverParam("DateStyle") == style, sql
+        let res = await conn.query(
+          "SELECT '2024-01-15 10:00:00'::timestamp", resultFormat = rfText
+        )
+        doAssert res.rows[0].getTimestamp(0) ==
+          dateTime(2024, mJan, 15, 10, 0, 0, 0, utc())
+        await conn.close()
+        # A field order from the caller joins the ISO style, and RESET keeps it.
+        cfg.extraParams = @[("DateStyle", "DMY")]
+        let explicit = await connect(cfg)
+        doAssert explicit.serverParam("DateStyle") == "ISO, DMY"
+        discard await explicit.simpleQuery("RESET ALL")
+        doAssert explicit.serverParam("DateStyle") == "ISO, DMY"
+        let dmy =
+          await explicit.query("SELECT '01/02/2026'::date", resultFormat = rfText)
+        doAssert dmy.rows[0].getDate(0) == dateTime(2026, mFeb, 1, 0, 0, 0, 0, utc())
+        await explicit.close()
+      finally:
+        discard await admin.simpleQuery("DROP ROLE " & role)
+        await admin.close()
+
+    waitFor t()
+
+  test "a later non-ISO DateStyle closes the connection":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # A field order change keeps the ISO output.
+      discard await conn.simpleQuery("SET DateStyle TO 'ISO, DMY'")
+      doAssert conn.state == csReady
+      let res = await conn.query("SELECT '2024-01-15'::date", resultFormat = rfText)
+      doAssert res.rows[0].getDate(0) == dateTime(2024, mJan, 15, 0, 0, 0, 0, utc())
+      var raised = false
+      try:
+        discard await conn.simpleQuery("SET DateStyle TO 'SQL, DMY'")
       except PgProtocolError:
         raised = true
       doAssert raised

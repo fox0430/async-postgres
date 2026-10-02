@@ -560,11 +560,14 @@ proc probeBool(conn: PgConnection, sql, trueLiteral: string): Future[bool] {.asy
     newException(PgConnectionError, "probe \"" & sql & "\" returned no usable result")
 
 proc isPhysicalReplicationConn(conn: PgConnection): bool =
-  ## True for physical replication (``replication`` in {true,on,yes,1}); cannot run ``SELECT``.
+  ## Physical replication cannot run ``SELECT``. ``replication`` is true as the
+  ## server's ``parse_bool`` reads it: any case, a prefix of ``true`` or
+  ## ``yes``, ``on``, ``1``. The last one given wins, as on the server.
   for (k, v) in conn.config.extraParams:
-    if k == "replication" and v in ["true", "on", "yes", "1"]:
-      return true
-  false
+    if k == "replication":
+      let b = v.toLowerAscii
+      result =
+        b.len > 0 and ("true".startsWith(b) or "yes".startsWith(b)) or b in ["on", "1"]
 
 proc inRecovery(conn: PgConnection): Future[bool] {.async.} =
   ## Recovery state: ``in_hot_standby`` (PG14+) else ``pg_is_in_recovery()``;

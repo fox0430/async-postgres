@@ -541,11 +541,16 @@ proc connectToHostImpl(
       conn.initPlainStreams()
 
     # Send StartupMessage
-    # Decoders assume UTF8; checkClientEncodingStatus closes on a later change.
+    # Decoders assume UTF8 and the ISO DateStyle; checkPinnedParamStatus closes
+    # on a later change. Startup values, unlike a SET, are what RESET restores.
     var startupParams = @[("client_encoding", "UTF8")]
+    var dateStyle = ""
     for p in config.extraParams:
-      if not isClientEncodingKey(p[0]):
+      if isDateStyleKey(p[0]):
+        dateStyle = p[1]
+      elif not isClientEncodingKey(p[0]):
         startupParams.add(p)
+    startupParams.add(("DateStyle", startupDateStyle(dateStyle)))
     if config.applicationName.len > 0:
       startupParams.add(("application_name", config.applicationName))
     await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))

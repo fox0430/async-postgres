@@ -606,145 +606,333 @@ proc parseHstoreText*(s: string): PgHstore {.raises: [PgError].} =
         PgTypeError, "hstore: expected NULL or quoted string at position " & $i
       )
 
-proc parseIntervalText*(s: string): PgInterval {.raises: [PgError].} =
-  ## Parse PostgreSQL default interval text format:
-  ##   "1 year 2 mons 3 days 04:05:06.123456"
-  ##   "-1 year -2 mons +3 days -04:05:06"
-  ##   "00:00:00"
-  ##
-  ## Numeric accumulation and unit scaling are bounds-checked so a malicious
-  ## or broken server sending oversized fields raises a catchable
-  ## ``PgTypeError`` rather than crashing with ``OverflowDefect`` /
-  ## ``RangeDefect`` (or silently wrapping in release builds).
-  proc accumDigit(acc: int64, ch: char, s: string): int64 =
-    let d = int64(ord(ch) - ord('0'))
-    if acc > (int64.high - d) div 10:
-      raise newException(PgTypeError, "interval numeric overflow (len=" & $s.len & ")")
-    acc * 10 + d
+proc invalidInterval(s: string): ref PgTypeError =
+  newException(PgTypeError, "Invalid interval (len=" & $s.len & ")")
 
-  proc addI32(a, b: int32, s: string): int32 =
-    if (b > 0 and a > int32.high - b) or (b < 0 and a < int32.low - b):
-      raise
-        newException(PgTypeError, "interval field overflows int32 (len=" & $s.len & ")")
-    a + b
+proc intervalOverflow(s: string): ref PgTypeError =
+  newException(PgTypeError, "interval field overflow (len=" & $s.len & ")")
 
-  proc toI32(v: int64, s: string): int32 =
-    if v < int64(int32.low) or v > int64(int32.high):
-      raise newException(
-        PgTypeError, "interval field out of int32 range (len=" & $s.len & ")"
-      )
-    int32(v)
+type IntervalFields = object
+  months, days: int32
+  micros: int64
 
-  var months: int32 = 0
-  var days: int32 = 0
-  var microseconds: int64 = 0
+# Numeric accumulation and unit scaling are bounds-checked so a malicious or
+# broken server sending oversized fields raises a catchable ``PgTypeError``
+# rather than ``OverflowDefect`` / ``RangeDefect`` (or wrapping in release builds).
+
+proc addI32(acc: var int32, v: int64, s: string) =
+  # ``v`` is bounded first so the int64 sum itself cannot overflow.
+  if v < int64(int32.low) or v > int64(int32.high):
+    raise intervalOverflow(s)
+  let sum = int64(acc) + v
+  if sum < int64(int32.low) or sum > int64(int32.high):
+    raise intervalOverflow(s)
+  acc = int32(sum)
+
+proc addChecked(acc: var int64, v: int64, s: string) =
+  if (v > 0 and acc > int64.high - v) or (v < 0 and acc < int64.low - v):
+    raise intervalOverflow(s)
+  acc += v
+
+proc scaled(v, unit: int64, s: string): int64 =
+  if v > int64.high div unit or v < int64.low div unit:
+    raise intervalOverflow(s)
+  v * unit
+
+type IntervalUnit = enum
+  iuYear
+  iuMonth
+  iuDay
+  iuHour
+  iuMinute
+  iuSecond
+
+const noFrac = -1'i64
+
+proc addField(
+    f: var IntervalFields,
+    unit: IntervalUnit,
+    v: int64,
+    neg: bool,
+    s: string,
+    frac = noFrac,
+) =
+  ## Add ``v`` (>= 0) of ``unit`` and, for seconds only, ``frac`` microseconds,
+  ## signed by ``neg``. Each part is signed before it is added, so a negative
+  ## total reaches ``int64.low``, which no magnitude can hold.
+  let sv =
+    if neg:
+      -v
+    else:
+      v
+  case unit
+  of iuYear:
+    # Bounding first keeps ``sv * 12`` itself from overflowing.
+    if sv < int64(int32.low) div 12 or sv > int64(int32.high) div 12:
+      raise intervalOverflow(s)
+    f.months.addI32(sv * 12, s)
+  of iuMonth:
+    f.months.addI32(sv, s)
+  of iuDay:
+    f.days.addI32(sv, s)
+  of iuHour:
+    f.micros.addChecked(scaled(sv, 3_600_000_000'i64, s), s)
+  of iuMinute:
+    f.micros.addChecked(scaled(sv, 60_000_000'i64, s), s)
+  of iuSecond:
+    f.micros.addChecked(scaled(sv, 1_000_000, s), s)
+  if frac != noFrac:
+    if unit != iuSecond:
+      raise invalidInterval(s)
+    f.micros.addChecked(
+      if neg:
+        -frac
+      else:
+        frac,
+      s,
+    )
+
+proc intervalUnit(word, s: string): IntervalUnit =
+  ## A unit word of the ``postgres`` and ``postgres_verbose`` styles.
+  case word
+  of "year", "years":
+    iuYear
+  of "mon", "mons":
+    iuMonth
+  of "day", "days":
+    iuDay
+  of "hour", "hours":
+    iuHour
+  of "min", "mins":
+    iuMinute
+  of "sec", "secs":
+    iuSecond
+  of "":
+    # Also guarantees forward progress on a non-unit byte.
+    raise invalidInterval(s)
+  else:
+    raise newException(PgTypeError, "Invalid interval unit (len=" & $s.len & ")")
+
+proc readSign(s: string, i: var int): bool =
+  ## Consume an optional sign; true for ``-``.
+  if i < s.len and s[i] in {'+', '-'}:
+    result = s[i] == '-'
+    inc i
+
+proc readUInt(s: string, i: var int): int64 =
+  ## One or more decimal digits at ``i``.
+  if i >= s.len or s[i] notin {'0' .. '9'}:
+    raise invalidInterval(s)
+  while i < s.len and s[i] in {'0' .. '9'}:
+    let d = int64(ord(s[i]) - ord('0'))
+    if result > (int64.high - d) div 10:
+      raise intervalOverflow(s)
+    result = result * 10 + d
+    inc i
+
+proc readFracMicros(s: string, i: var int): int64 =
+  ## An optional ``.ffffff`` at ``i`` as microseconds, else ``noFrac``. Digits
+  ## past the sixth are dropped: the server prints at most six.
+  if i >= s.len or s[i] != '.':
+    return noFrac
+  inc i
+  if i >= s.len or s[i] notin {'0' .. '9'}:
+    raise invalidInterval(s)
+  var digits = 0
+  while i < s.len and s[i] in {'0' .. '9'}:
+    if digits < 6:
+      result = result * 10 + int64(ord(s[i]) - ord('0'))
+      inc digits
+    inc i
+  while digits < 6:
+    result *= 10
+    inc digits
+
+proc readTime(f: var IntervalFields, s: string, i: var int, neg: bool) =
+  ## ``H:MM[:SS[.ffffff]]`` at ``i``, signed by ``neg``.
+  f.addField(iuHour, readUInt(s, i), neg, s)
+  if i >= s.len or s[i] != ':':
+    raise invalidInterval(s)
+  inc i
+  f.addField(iuMinute, readUInt(s, i), neg, s)
+  if i < s.len and s[i] == ':':
+    inc i
+    let secs = readUInt(s, i)
+    f.addField(iuSecond, secs, neg, s, readFracMicros(s, i))
+
+proc parseIntervalPostgres(s: string): IntervalFields =
+  ## ``postgres``: "1 year 2 mons 3 days 04:05:06.5", "-1 years +3 days -04:05:06".
   var i = 0
-  let n = s.len
+  while i < s.len:
+    if s[i] == ' ':
+      inc i
+      continue
+    var j = i
+    if s[j] in {'+', '-'}:
+      inc j
+    while j < s.len and s[j] in {'0' .. '9'}:
+      inc j
+    let neg = readSign(s, i)
+    if j < s.len and s[j] == ':':
+      result.readTime(s, i, neg)
+      continue
+    let v = readUInt(s, i)
+    while i < s.len and s[i] == ' ':
+      inc i
+    let unitStart = i
+    while i < s.len and s[i] in {'a' .. 'z'}:
+      inc i
+    result.addField(intervalUnit(s[unitStart ..< i], s), v, neg, s)
+
+proc parseIntervalVerbose(s: string): IntervalFields =
+  ## ``postgres_verbose``: "@ 1 year 2 mons -3 days 4 hours 5 mins 6.5 secs ago".
+  ## Fields are signed relative to a trailing ``ago``, which negates them all;
+  ## it is applied per field so "@ 2147483648 days ago" fits.
+  let ago = s.endsWith(" ago")
+  var n = s.len
+  if ago:
+    n -= 4
+  if n == 3 and s.startsWith("@ 0"):
+    return
+  var i = 1
+  var seen = false
   while i < n:
     if s[i] == ' ':
-      i += 1
+      inc i
       continue
-    # Check for time part (starts with optional sign then digit followed eventually by ':')
-    var j = i
-    if j < n and (s[j] == '-' or s[j] == '+'):
-      j += 1
-    if j < n and s[j] in '0' .. '9':
-      # Look ahead for ':' to distinguish time from number+unit
-      var k = j
-      while k < n and s[k] in '0' .. '9':
-        k += 1
-      if k < n and s[k] == ':':
-        # Time part: [+-]HH:MM:SS[.ffffff]
-        let neg = i < n and s[i] == '-'
-        if s[i] == '-' or s[i] == '+':
-          i += 1
-        var hours: int64 = 0
-        while i < n and s[i] in '0' .. '9':
-          hours = accumDigit(hours, s[i], s)
-          i += 1
-        i += 1 # skip ':'
-        var mins: int64 = 0
-        while i < n and s[i] in '0' .. '9':
-          mins = accumDigit(mins, s[i], s)
-          i += 1
-        var secs: int64 = 0
-        var frac: int64 = 0
-        if i < n and s[i] == ':':
-          i += 1
-          while i < n and s[i] in '0' .. '9':
-            secs = accumDigit(secs, s[i], s)
-            i += 1
-          if i < n and s[i] == '.':
-            i += 1
-            var fracDigits = 0
-            while i < n and s[i] in '0' .. '9' and fracDigits < 6:
-              frac = frac * 10 + int64(ord(s[i]) - ord('0'))
-              fracDigits += 1
-              i += 1
-            # Pad to 6 digits
-            while fracDigits < 6:
-              frac *= 10
-              fracDigits += 1
-            # Skip remaining fractional digits
-            while i < n and s[i] in '0' .. '9':
-              i += 1
-        # Reject fields large enough to overflow the microsecond total before
-        # multiplying, so ``us`` computation itself is safe.
-        if hours > int64.high div 3_600_000_000'i64 or
-            mins > int64.high div 60_000_000'i64 or secs > int64.high div 1_000_000'i64:
-          raise newException(PgTypeError, "interval time overflow (len=" & $s.len & ")")
-        let hUs = hours * 3_600_000_000'i64
-        let mUs = mins * 60_000_000'i64
-        let sUs = secs * 1_000_000'i64
-        if mUs > int64.high - hUs or sUs > int64.high - hUs - mUs or
-            frac > int64.high - hUs - mUs - sUs:
-          raise newException(PgTypeError, "interval time overflow (len=" & $s.len & ")")
-        let us = hUs + mUs + sUs + frac
-        # ``us`` is in [0, int64.high], so ``-us`` cannot overflow.
-        microseconds =
-          if neg:
-            -us
-          else:
-            us
-        continue
-    # Number + unit
-    let neg = i < n and s[i] == '-'
-    if s[i] == '-' or s[i] == '+':
-      i += 1
-    var val: int64 = 0
-    var sawDigit = false
-    while i < n and s[i] in '0' .. '9':
-      val = accumDigit(val, s[i], s)
-      i += 1
-      sawDigit = true
-    if neg:
-      val = -val
-    # Skip space
-    while i < n and s[i] == ' ':
-      i += 1
-    # Read unit
-    var unit = ""
-    while i < n and s[i] in 'a' .. 'z':
-      unit.add(s[i])
-      i += 1
-    # Guarantees forward progress: "!" would else leave i unchanged and spin.
-    if not sawDigit or unit.len == 0:
-      raise newException(PgTypeError, "Invalid interval (len=" & $s.len & ")")
-    case unit
-    of "year", "years":
-      # Constrain ``val`` so ``val * 12`` fits in int32; that also keeps the
-      # int64 multiplication itself well below overflow.
-      if val < int64(int32.low) div 12 or val > int64(int32.high) div 12:
-        raise
-          newException(PgTypeError, "interval years out of range (len=" & $s.len & ")")
-      months = addI32(months, int32(val * 12), s)
-    of "mon", "mons":
-      months = addI32(months, toI32(val, s), s)
-    of "day", "days":
-      days = addI32(days, toI32(val, s), s)
+    let neg = readSign(s, i) != ago
+    let v = readUInt(s, i)
+    let frac = readFracMicros(s, i)
+    if i >= n or s[i] != ' ':
+      raise invalidInterval(s)
+    inc i
+    let unitStart = i
+    while i < n and s[i] in {'a' .. 'z'}:
+      inc i
+    result.addField(intervalUnit(s[unitStart ..< i], s), v, neg, s, frac)
+    seen = true
+  if not seen:
+    raise invalidInterval(s)
+
+proc parseIntervalIso8601(s: string): IntervalFields =
+  ## ``iso_8601``: "P1Y2M3DT4H5M6.5S", "P-1Y-2M3DT-4H-5M-6.5S", "PT0S".
+  var i = 1
+  var inTime = false
+  var seen = false
+  while i < s.len:
+    if s[i] == 'T' and not inTime:
+      inTime = true
+      inc i
+      continue
+    let neg = readSign(s, i)
+    let v = readUInt(s, i)
+    let frac = readFracMicros(s, i)
+    if i >= s.len:
+      raise invalidInterval(s)
+    let unit =
+      if inTime:
+        case s[i]
+        of 'H':
+          iuHour
+        of 'M':
+          iuMinute
+        of 'S':
+          iuSecond
+        else:
+          raise invalidInterval(s)
+      else:
+        case s[i]
+        of 'Y':
+          iuYear
+        of 'M':
+          iuMonth
+        of 'D':
+          iuDay
+        else:
+          raise invalidInterval(s)
+    inc i
+    result.addField(unit, v, neg, s, frac)
+    seen = true
+  if not seen:
+    raise invalidInterval(s)
+
+proc parseIntervalSqlStandard(s: string): IntervalFields =
+  ## ``sql_standard``: "0", "1-2", "3 4:05:06.5", "-4:05:06" with one leading
+  ## sign for every field, or "+1-2 -3 +4:05:06" with a sign on each.
+  if s == "0":
+    return
+  var i = 0
+  template sep() =
+    if i >= s.len or s[i] != ' ':
+      raise invalidInterval(s)
+    inc i
+
+  template yearMonth(neg: bool) =
+    let years = readUInt(s, i)
+    if i >= s.len or s[i] != '-':
+      raise invalidInterval(s)
+    inc i
+    let mons = readUInt(s, i)
+    result.addField(iuYear, years, neg, s)
+    result.addField(iuMonth, mons, neg, s)
+
+  template signedField(): bool =
+    if i >= s.len or s[i] notin {'+', '-'}:
+      raise invalidInterval(s)
+    readSign(s, i)
+
+  case s.count(' ')
+  of 2:
+    let ymNeg = signedField()
+    yearMonth(ymNeg)
+    sep()
+    let dayNeg = signedField()
+    result.addField(iuDay, readUInt(s, i), dayNeg, s)
+    sep()
+    let timeNeg = signedField()
+    result.readTime(s, i, timeNeg)
+  of 1:
+    let neg = readSign(s, i)
+    result.addField(iuDay, readUInt(s, i), neg, s)
+    sep()
+    result.readTime(s, i, neg)
+  of 0:
+    let neg = readSign(s, i)
+    if ':' in s:
+      result.readTime(s, i, neg)
     else:
-      raise newException(PgTypeError, "Invalid interval unit (len=" & $s.len & ")")
-  PgInterval(months: months, days: days, microseconds: microseconds)
+      yearMonth(neg)
+  else:
+    raise invalidInterval(s)
+  if i != s.len:
+    raise invalidInterval(s)
+
+proc parseIntervalText*(s: string): PgInterval {.raises: [PgError].} =
+  ## Parse interval text output in any ``IntervalStyle``:
+  ##   postgres:         "1 year 2 mons 3 days 04:05:06.123456", "-1 years +3 days"
+  ##   postgres_verbose: "@ 1 year 2 mons 3 days 4 hours 5 mins 6.5 secs ago"
+  ##   sql_standard:     "1-2", "3 4:05:06.5", "+1-2 -3 +4:05:06"
+  ##   iso_8601:         "P1Y2M3DT4H5M6.5S"
+  ##
+  ## ``infinity`` / ``-infinity`` (PostgreSQL 17+, every style) decode to the
+  ## same all-max / all-min fields as the binary format. Oversized fields raise
+  ## ``PgTypeError``, never a Defect. Surrounding spaces are ignored.
+  let t = s.strip(chars = {' '})
+  if t == "infinity":
+    return PgInterval(months: int32.high, days: int32.high, microseconds: int64.high)
+  if t == "-infinity":
+    return PgInterval(months: int32.low, days: int32.low, microseconds: int64.low)
+  let f =
+    if t.len > 0 and t[0] == '@':
+      parseIntervalVerbose(t)
+    elif t.len > 0 and t[0] == 'P':
+      parseIntervalIso8601(t)
+    elif t.contains({'a' .. 'z'}):
+      parseIntervalPostgres(t)
+    else:
+      # Also a postgres time-only value ("-01:00:00"), which reads the same.
+      parseIntervalSqlStandard(t)
+  PgInterval(months: f.months, days: f.days, microseconds: f.micros)
 
 proc parseInetText*(
     s: string
