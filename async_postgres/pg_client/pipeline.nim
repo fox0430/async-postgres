@@ -465,7 +465,7 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
         while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
           let msg = opt.get
           if activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsMiss:
-            missFacts[activeOpIdx].observe(msg)
+            missFacts[activeOpIdx].observe(conn, msg)
           case msg.kind
           of bmkRowDescription:
             if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
@@ -606,7 +606,7 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
           while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
             let msg = opt.get
             if p.ops[opIdx].cache == scsMiss:
-              facts.observe(msg)
+              facts.observe(conn, msg)
             case msg.kind
             of bmkRowDescription:
               if p.ops[opIdx].kind == pokQuery:

@@ -284,10 +284,88 @@ suite "settleStmtCache acts on what the server confirmed":
     check conn.lookupStmtCache("q").isNil
     check conn.pendingStmtCloses == @["_sc_1"]
 
+  test "a hit's 26000 drops every entry":
+    # Gone with no reset tag seen: the other entries went with it.
+    let conn = mockConn(3)
+    conn.addStmtCache("a", cached("_sc_a"))
+    conn.addStmtCache("q", cached("_sc_1"))
+    conn.addStmtCache("b", cached("_sc_b"))
+    conn.settleStmtCache("q", "_sc_1", scsHit, MissFacts(), failure("26000"))
+    check conn.stmtCache.len == 0
+    check lruLen(conn) == 0
+    check conn.pendingStmtCloses == @["_sc_a", "_sc_1", "_sc_b"]
+
+  test "a hit's 0A000 and a share's 26000 drop only their entry":
+    # A share's 26000 comes from the earlier op's failed Parse.
+    for (cache, state) in [(scsHit, "0A000"), (scsShare, "26000")]:
+      let conn = mockConn(2)
+      conn.addStmtCache("a", cached("_sc_a"))
+      conn.addStmtCache("q", cached("_sc_1"))
+      conn.settleStmtCache("q", "_sc_1", cache, MissFacts(), failure(state))
+      check conn.lookupStmtCache("q").isNil
+      check conn.lookupStmtCache("a").name == "_sc_a"
+      check conn.pendingStmtCloses == @["_sc_1"]
+
+  test "a hit's 26000 after a reset already seen leaves the cache alone":
+    # A pipeline hit queued behind a DEALLOCATE ALL of the same batch.
+    let conn = mockConn(2)
+    conn.addStmtCache("q", cached("_sc_1"))
+    conn.noteCommandTag("DEALLOCATE ALL")
+    conn.addStmtCache("a", cached("_sc_2"))
+    conn.settleStmtCache("q", "_sc_1", scsHit, MissFacts(), failure("26000"))
+    check conn.lookupStmtCache("a").name == "_sc_2"
+    check conn.pendingStmtCloses.len == 0
+
   test "a miss settled after caching was turned off is Closed":
     let conn = mockConn(0)
     conn.settleStmtCache("q", "_sc_1", scsMiss, facts(true, true), nil)
     check conn.pendingStmtCloses == @["_sc_1"]
+
+  test "a miss Parsed before a reset is neither cached nor Closed":
+    for described in [true, false]:
+      let conn = mockConn(2)
+      var f = facts(true, described)
+      f.parsedGen = conn.stmtCacheResetGen
+      conn.noteCommandTag("DEALLOCATE ALL")
+      conn.settleStmtCache("q", "_sc_1", scsMiss, f, nil)
+      check conn.lookupStmtCache("q").isNil
+      check conn.pendingStmtCloses.len == 0
+
+  test "a miss Parsed after a reset is cached":
+    let conn = mockConn(2)
+    conn.noteCommandTag("DISCARD ALL")
+    var f: MissFacts
+    f.observe(conn, BackendMessage(kind: bmkParseComplete))
+    f.observe(conn, BackendMessage(kind: bmkNoData))
+    conn.settleStmtCache("q", "_sc_1", scsMiss, f, nil)
+    check conn.lookupStmtCache("q").name == "_sc_1"
+
+suite "statements dropped by the session":
+  test "DISCARD ALL and DEALLOCATE ALL empty the cache and the owed Closes":
+    for tag in ["DISCARD ALL", "DEALLOCATE ALL"]:
+      let conn = mockConn(2)
+      conn.addStmtCache("a", cached("_sc_a"))
+      conn.pendingStmtCloses = @["_sc_x"]
+      conn.stagedStmtCloses = @["_sc_y"]
+      let gen = conn.stmtCacheResetGen
+      conn.noteCommandTag(tag)
+      check conn.lookupStmtCache("a").isNil
+      check lruLen(conn) == 0
+      check conn.pendingStmtCloses.len == 0
+      check conn.stagedStmtCloses.len == 0
+      check conn.stmtCacheResetGen == gen + 1
+
+  test "other tags leave the cache alone":
+    # DEALLOCATE of one name reports no name, so its hits find out by 26000.
+    for tag in ["DISCARD PLANS", "DISCARD TEMP", "DEALLOCATE", "RESET", "SELECT 1"]:
+      let conn = mockConn(2)
+      conn.addStmtCache("a", cached("_sc_a"))
+      conn.pendingStmtCloses = @["_sc_x"]
+      let gen = conn.stmtCacheResetGen
+      conn.noteCommandTag(tag)
+      check conn.lookupStmtCache("a").name == "_sc_a"
+      check conn.pendingStmtCloses == @["_sc_x"]
+      check conn.stmtCacheResetGen == gen
 
 when defined(pgStateChecks):
   suite "an eviction Close only ahead of the build's first fallible message":

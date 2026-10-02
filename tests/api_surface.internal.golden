@@ -34,6 +34,7 @@ async_postgres/pg_client/core.nim	MissFacts.described
 async_postgres/pg_client/core.nim	MissFacts.fields
 async_postgres/pg_client/core.nim	MissFacts.paramOids
 async_postgres/pg_client/core.nim	MissFacts.parsed
+async_postgres/pg_client/core.nim	MissFacts.parsedGen
 async_postgres/pg_client/core.nim	StmtCacheInvalidatingStates
 async_postgres/pg_client/core.nim	StmtCacheStatus
 async_postgres/pg_client/core.nim	StmtCacheStatus.scsHit
@@ -264,6 +265,7 @@ async_postgres/pg_connection/types.nim	heldSessionLocks
 async_postgres/pg_connection/types.nim	initPlainStreams
 async_postgres/pg_connection/types.nim	initReplLsnTracking
 async_postgres/pg_connection/types.nim	installTlsStream
+async_postgres/pg_connection/types.nim	invalidateAllStmtCache
 async_postgres/pg_connection/types.nim	invalidateStmtCache
 async_postgres/pg_connection/types.nim	isGucName
 async_postgres/pg_connection/types.nim	isUtcZoneName
@@ -288,6 +290,7 @@ async_postgres/pg_connection/types.nim	nextPortalName
 async_postgres/pg_connection/types.nim	nextReplWrite
 async_postgres/pg_connection/types.nim	nextStmtName
 async_postgres/pg_connection/types.nim	noteBackendKeyData
+async_postgres/pg_connection/types.nim	noteCommandTag
 async_postgres/pg_connection/types.nim	noteConnectTimeZone
 async_postgres/pg_connection/types.nim	noteListenPumpStarted
 async_postgres/pg_connection/types.nim	noteNegotiatedProtocol
@@ -362,6 +365,7 @@ async_postgres/pg_connection/types.nim	stageEvictedClose
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses#2
 async_postgres/pg_connection/types.nim	startupDateStyle
+async_postgres/pg_connection/types.nim	stmtCacheResetGen
 async_postgres/pg_connection/types.nim	stmtCachingEnabled
 async_postgres/pg_connection/types.nim	stmtNamePrefix
 async_postgres/pg_connection/types.nim	tailPendingReplStatus

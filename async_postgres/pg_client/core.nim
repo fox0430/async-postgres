@@ -181,6 +181,7 @@ type
     ## Describe(Statement). The cache acts on these alone: whether the
     ## operation failed says nothing about how far the server got.
     parsed*: bool ## ``ParseComplete`` arrived: the statement exists.
+    parsedGen*: int ## ``stmtCacheResetGen`` when it arrived.
     described*: bool
       ## ``RowDescription`` or ``NoData`` arrived: ``fields`` and ``paramOids``
       ## are complete.
@@ -195,11 +196,12 @@ func stmtCacheStatus*(cacheHit, cacheMiss: bool): StmtCacheStatus {.inline.} =
   else:
     scsUncached
 
-proc observe*(facts: var MissFacts, msg: BackendMessage) =
+proc observe*(facts: var MissFacts, conn: PgConnection, msg: BackendMessage) =
   ## Record a reply to the miss's Parse or Describe(Statement).
   case msg.kind
   of bmkParseComplete:
     facts.parsed = true
+    facts.parsedGen = conn.stmtCacheResetGen
   of bmkParameterDescription:
     facts.paramOids = msg.paramTypeOids
   of bmkRowDescription:
@@ -222,9 +224,14 @@ proc settleStmtCache*(
   ## then failed (a plan gone stale meanwhile fails its next hit, which
   ## invalidates it); one it Parsed but did not Describe is Closed; one it
   ## never Parsed is left alone, since the name may be someone else's (42P05).
+  ## A miss Parsed before a later ``DISCARD ALL`` / ``DEALLOCATE ALL``
+  ## (``facts.parsedGen`` behind ``stmtCacheResetGen``) is neither cached nor
+  ## Closed: the server already dropped the statement.
   case cache
   of scsMiss:
-    if facts.described:
+    if facts.parsed and facts.parsedGen != conn.stmtCacheResetGen:
+      discard
+    elif facts.described:
       conn.addStmtCache(
         sql,
         CachedStmt(
@@ -234,7 +241,14 @@ proc settleStmtCache*(
     elif facts.parsed:
       conn.queueStmtClose(stmtName)
   of scsHit, scsShare:
-    if queryError != nil and queryError.sqlState in StmtCacheInvalidatingStates:
+    if queryError == nil or queryError.sqlState notin StmtCacheInvalidatingStates:
+      discard
+    elif cache == scsHit and queryError.sqlState == "26000":
+      # Gone without a reset tag (a DEALLOCATE ALL inside a function): one
+      # failure instead of one per entry. Not for a share, whose 26000 is the
+      # earlier op's failed Parse.
+      conn.invalidateAllStmtCache(sql, stmtName)
+    else:
       conn.invalidateStmtCache(sql, stmtName)
   of scsUncached:
     discard
@@ -646,7 +660,7 @@ template queryRecvLoop*(
 
   conn.pumpUntilReady(qr.data, addr qr.rowCount):
     if cacheMiss:
-      facts.observe(pumpMsg)
+      facts.observe(conn, pumpMsg)
     case pumpMsg.kind
     of bmkRowDescription:
       # A cache hit sends no Describe; only the cache-disabled path Describes
@@ -701,7 +715,7 @@ template queryEachRecvLoop*(
 
   conn.pumpUntilReady(rd, onRow, addr callbackError):
     if cacheMiss:
-      facts.observe(pumpMsg)
+      facts.observe(conn, pumpMsg)
     if pumpMsg.kind == bmkRowDescription:
       var fields = pumpMsg.fields
       rd = describedRowData(fields, portal = not cacheMiss, resultFormats)
@@ -730,7 +744,7 @@ template execRecvLoop*(
 
   conn.pumpUntilReady:
     if cacheMiss:
-      facts.observe(pumpMsg)
+      facts.observe(conn, pumpMsg)
     if pumpMsg.kind == bmkCommandComplete:
       commandTag = pumpMsg.commandTag
   do:
