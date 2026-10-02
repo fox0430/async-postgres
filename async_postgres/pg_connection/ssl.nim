@@ -400,8 +400,9 @@ when hasTls:
           {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
 
       # BearSSL's serverName doubles as SNI wire value and X509 name check input.
-      # Under verify-full it must be sslHost for BearSSL to verify; other modes
-      # honor sslSni and RFC 6066 IP-literal suppression.
+      # Under verify-full it must be sslHost for BearSSL to verify. Other modes
+      # set NoVerifyServerName, under which chronos drops serverName: no SNI is
+      # sent, whatever sslSni says.
       let serverName =
         if config.sslMode == sslVerifyFull:
           sslHost
