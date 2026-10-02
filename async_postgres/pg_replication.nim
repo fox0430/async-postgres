@@ -1506,9 +1506,11 @@ proc startReplication*(
   ## ``csReady``, and ``ValueError`` for a ``proto_version`` other than ``1``
   ## in ``options`` (the value must be the unquoted string ``"1"``, an empty
   ## one included): the bundled pgoutput decoder supports v1 only. Any value already wrapped in
-  ## quotes raises ``ValueError`` too, whatever its key, so the verbatim-options
-  ## spelling cannot silently name a publication ``'my_pub'`` or send a
-  ## thrice-quoted ``binary`` flag the plugin rejects mid-stream. An empty
+  ## quotes raises ``ValueError`` too, so the verbatim-options spelling cannot
+  ## silently name a publication ``'my_pub'`` or send a thrice-quoted
+  ## ``binary`` flag the plugin rejects mid-stream. ``publication_names`` alone
+  ## may be wrapped in double quotes: it is an identifier list, where
+  ## ``"MyPub"`` keeps the case (unquoted, ``MyPub`` means ``mypub``). An empty
   ## ``publication_names`` and a value containing a NUL byte are rejected the
   ## same way.
   ## ``publication_names`` without an explicit ``proto_version`` adds
@@ -1539,10 +1541,13 @@ proc startReplication*(
       raise newException(ValueError, "Invalid replication option key: " & k)
     if '\0' in v:
       raise newException(ValueError, "Replication option value contains a NUL byte")
+    let isPublicationNames = k.cmpIgnoreCase("publication_names") == 0
     # Values are quoted below, so one that already arrives wrapped in quotes
     # would reach the server including them. Reject the pre-quoting spelling
-    # rather than sending a value the plugin rejects mid-stream.
-    if v.len >= 2 and v[0] in {'\'', '"'} and v[^1] == v[0]:
+    # rather than sending a value the plugin rejects mid-stream. Double quotes
+    # stay legal in publication_names, an identifier list where they keep case.
+    if v.len >= 2 and v[^1] == v[0] and
+        (v[0] == '\'' or (v[0] == '"' and not isPublicationNames)):
       raise newException(
         ValueError,
         "Quoted value " & v & " for replication option " & k &
@@ -1564,7 +1569,7 @@ proc startReplication*(
             ": the bundled decoder supports proto_version 1 only" &
             " (pass option values unquoted, e.g. \"1\")",
         )
-    elif k.cmpIgnoreCase("publication_names") == 0:
+    elif isPublicationNames:
       hasPublicationNames = true
       if v.len == 0:
         raise newException(
