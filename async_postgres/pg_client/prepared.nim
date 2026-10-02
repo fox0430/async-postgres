@@ -9,8 +9,10 @@ import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
 import core
 
-type PreparedStatement* = object
+type PreparedStatement* = ref object
   ## A server-side prepared statement returned by `prepare`.
+  ##
+  ## A `ref` handle: copies refer to the same server-side statement.
   ##
   ## Valid only within the server session that prepared it. A session reset
   ## (``DISCARD ALL`` / ``DEALLOCATE``, or a pooled backend being recycled)
