@@ -101,8 +101,13 @@ proc newPoolCluster*(
   ## With `fallback == fallbackPrimary`, `fallbackTimeout` (when > `ZeroDuration`)
   ## bounds *both* the replica and the fallback primary acquire so a saturated
   ## replica fails over promptly instead of blocking for its full
-  ## `acquireTimeout`. `onReadFallback` is an optional advisory hook invoked on
-  ## each replica->primary read fallback (see `ReadFallbackCallback`).
+  ## `acquireTimeout`. A negative `fallbackTimeout` raises `ValueError`, as
+  ## negative `PoolConfig` durations do. `onReadFallback` is an optional advisory
+  ## hook invoked on each replica->primary read fallback (see
+  ## `ReadFallbackCallback`).
+  # Before either pool dials, so a bad value opens no connection.
+  if fallbackTimeout < ZeroDuration:
+    raise newException(ValueError, "fallbackTimeout must be >= 0")
   var pCfg = primaryConfig
   if pCfg.connConfig.targetSessionAttrs == tsaAny:
     pCfg.connConfig.targetSessionAttrs = tsaReadWrite
