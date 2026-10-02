@@ -448,6 +448,14 @@ proc checkClientEncoding(val: string) =
     raise
       newException(PgConfigError, "client_encoding must be UTF8 (len=" & $val.len & ")")
 
+proc checkDateStyle(val: string) =
+  ## The client pins the ``DateStyle`` output style to ISO; only the field
+  ## order (``DMY``, ...) is the caller's.
+  if namesNonIsoDateStyle(val):
+    raise newException(
+      PgConfigError, "DateStyle must use the ISO output style (len=" & $val.len & ")"
+    )
+
 proc splitStartupOptions(options: string): seq[string] =
   ## Split like the server's ``pg_split_opts``: whitespace separates, ``\``
   ## escapes the next byte.
@@ -474,9 +482,10 @@ proc splitStartupOptions(options: string): seq[string] =
   if inArg:
     result.add(cur)
 
-proc checkOptionsClientEncoding(options: string) =
-  ## Our startup ``client_encoding`` would silently override a ``-c`` switch,
-  ## so reject a non-UTF8 one as if it were given directly.
+proc checkOptionsPinnedParams(options: string) =
+  ## Our startup ``client_encoding`` and ``DateStyle`` output style would
+  ## silently override a ``-c`` switch, so reject a conflicting one as if it
+  ## were given directly.
   const argOpts =
     {'B', 'C', 'c', 'D', 'd', 'f', 'h', 'k', 'N', 'p', 'r', 'S', 't', 'v', 'W', '-'}
     # postgres's getopt string
@@ -498,9 +507,13 @@ proc checkOptionsClientEncoding(options: string) =
         inc i
       if a[j] in {'c', '-'}:
         let eq = optArg.find('=')
-        # ParseLongOption maps '-' to '_' in the name.
-        if eq >= 0 and isClientEncodingKey(optArg[0 ..< eq].replace('-', '_')):
-          checkClientEncoding(optArg[eq + 1 .. ^1])
+        if eq >= 0:
+          # ParseLongOption maps '-' to '_' in the name.
+          let name = optArg[0 ..< eq].replace('-', '_')
+          if isClientEncodingKey(name):
+            checkClientEncoding(optArg[eq + 1 .. ^1])
+          elif isDateStyleKey(name):
+            checkDateStyle(optArg[eq + 1 .. ^1])
       break
 
 proc applyParam(result: var ConnConfig, key, val: string) =
@@ -632,8 +645,10 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       # Not kept: the startup message always sends UTF8.
       checkClientEncoding(val)
     else:
-      if key == "options":
-        checkOptionsClientEncoding(val)
+      if isDateStyleKey(key):
+        checkDateStyle(val)
+      elif key == "options":
+        checkOptionsPinnedParams(val)
       result.extraParams.add((key, val))
 
 proc parseKeyValueDsn(dsn: string): ConnConfig =
@@ -1043,8 +1058,10 @@ proc validateConnConfig*(config: var ConnConfig) =
   for (k, v) in config.extraParams:
     if isClientEncodingKey(k):
       checkClientEncoding(v)
+    elif isDateStyleKey(k):
+      checkDateStyle(v)
     elif k == "options": # the server matches this key case-sensitively
-      checkOptionsClientEncoding(v)
+      checkOptionsPinnedParams(v)
 
 proc initConnConfig*(
     host = "127.0.0.1",
@@ -1126,7 +1143,8 @@ proc parseDsn*(dsn: string): ConnConfig =
   ## path, raises ``PgConfigError`` (``h/db?user=a@b`` is fine).
   ##
   ## ``client_encoding`` is always UTF8: another value, directly or via ``-c``
-  ## in ``options``, raises ``PgConfigError``.
+  ## in ``options``, raises ``PgConfigError``. Likewise ``DateStyle`` always
+  ## uses the ISO output style: only its field order (``DMY``, ...) may be set.
   ##
   ## Security: the DSN is trusted configuration — unknown keys are forwarded
   ## as StartupMessage parameters, so a typo in a security-sensitive key (e.g.

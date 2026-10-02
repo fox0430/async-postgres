@@ -1037,3 +1037,71 @@ suite "E2E: XML":
       await conn.close()
 
     waitFor t()
+
+suite "E2E: Interval styles":
+  const intervalStyles = ["postgres", "postgres_verbose", "sql_standard", "iso_8601"]
+
+  test "interval text decodes like binary under every IntervalStyle":
+    const literals = [
+      "0", "1 year", "-1 year", "1 mon", "-11 mons", "1 day", "-1 day", "1 hour",
+      "-1 hour", "1.5 seconds", "-0.5 seconds", "0.000001 seconds", "-0.000001 seconds",
+      "1 year 2 mons 3 days 04:05:06.789", "-1 year -2 mons -3 days -04:05:06.789",
+      "-1 year 2 mons", "1 year -3 days", "-3 days 01:00:00", "3 days -01:00:00",
+      "1 mon -1 day 01:00:00", "-1 year 2 mons -3 days 4 hours -5 minutes 6 seconds",
+      "1 day -1.5 seconds", "-1 day 1.5 seconds", "1 minute -0.5 seconds",
+      "-1 minute 0.5 seconds", "100 hours", "-100 hours 0.5 seconds", "178000000 years",
+      "-178000000 years", "2147483647 days", "-2147483648 days", "2147483647 mons",
+      "-2147483647 mons", "2562047788:00:54.775807", "-2562047788:00:54.775807",
+      "infinity", "-infinity",
+    ]
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      var sql = "SELECT "
+      for i, lit in literals:
+        if i > 0:
+          sql.add(", ")
+        sql.add("'" & lit & "'::interval")
+      for style in intervalStyles:
+        discard await conn.exec("SET IntervalStyle = " & style)
+        let text = await conn.query(sql, resultFormat = rfText)
+        let bin = await conn.query(sql, resultFormat = rfBinary)
+        for i, lit in literals:
+          let want = bin.rows[0].getInterval(i)
+          var got: PgInterval
+          try:
+            got = text.rows[0].getInterval(i)
+          except PgTypeError as e:
+            doAssert false,
+              style & " '" & text.rows[0].getStr(i) & "' (" & lit & "): " & e.msg
+          doAssert got == want,
+            style & " '" & text.rows[0].getStr(i) & "' (" & lit & "): got " & $got &
+              ", want " & $want
+      await conn.close()
+
+    waitFor t()
+
+  test "interval text param keeps its value under every IntervalStyle":
+    let values = [
+      PgInterval(months: -12, days: 3, microseconds: 3_600_000_000),
+      PgInterval(months: -1, days: 0, microseconds: 1),
+      PgInterval(months: 0, days: -3, microseconds: 3_600_000_000),
+      PgInterval(months: 14, days: -3, microseconds: -1),
+      PgInterval(months: -14, days: -3, microseconds: -14706123456),
+      PgInterval(months: 0, days: 0, microseconds: -5),
+      PgInterval(months: -12, days: -1, microseconds: 0),
+      PgInterval(months: int32.high, days: int32.high, microseconds: int64.high),
+      PgInterval(months: int32.low, days: int32.low, microseconds: int64.low),
+    ]
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      for style in intervalStyles:
+        discard await conn.exec("SET IntervalStyle = " & style)
+        for v in values:
+          let res = await conn.query(
+            "SELECT $1::interval", @[toPgParam(v)], resultFormat = rfBinary
+          )
+          doAssert res.rows[0].getInterval(0) == v,
+            style & " '" & $v & "': got " & $res.rows[0].getInterval(0)
+      await conn.close()
+
+    waitFor t()

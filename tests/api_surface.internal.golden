@@ -262,6 +262,7 @@ async_postgres/pg_connection/types.nim	initReplLsnTracking
 async_postgres/pg_connection/types.nim	installTlsStream
 async_postgres/pg_connection/types.nim	invalidateStmtCache
 async_postgres/pg_connection/types.nim	isClientEncodingKey
+async_postgres/pg_connection/types.nim	isDateStyleKey
 async_postgres/pg_connection/types.nim	isUtf8EncodingName
 async_postgres/pg_connection/types.nim	listenChannels
 async_postgres/pg_connection/types.nim	listenErrorCallback
@@ -275,6 +276,7 @@ async_postgres/pg_connection/types.nim	markClosed
 async_postgres/pg_connection/types.nim	markReady
 async_postgres/pg_connection/types.nim	markStaged
 async_postgres/pg_connection/types.nim	markState
+async_postgres/pg_connection/types.nim	namesNonIsoDateStyle
 async_postgres/pg_connection/types.nim	newClosedError
 async_postgres/pg_connection/types.nim	newPgConnection
 async_postgres/pg_connection/types.nim	newPgQueryError
@@ -332,6 +334,7 @@ async_postgres/pg_connection/types.nim	replStopStatusQueued
 async_postgres/pg_connection/types.nim	replWriteError
 async_postgres/pg_connection/types.nim	replWriteFailure
 async_postgres/pg_connection/types.nim	replWritesOpen
+async_postgres/pg_connection/types.nim	reportsIsoDateStyle
 async_postgres/pg_connection/types.nim	requestListenStop
 async_postgres/pg_connection/types.nim	requeueHandoff
 async_postgres/pg_connection/types.nim	requireStaged
@@ -353,6 +356,7 @@ async_postgres/pg_connection/types.nim	sslHost
 async_postgres/pg_connection/types.nim	stageEvictedClose
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses#2
+async_postgres/pg_connection/types.nim	startupDateStyle
 async_postgres/pg_connection/types.nim	stmtCachingEnabled
 async_postgres/pg_connection/types.nim	stmtNamePrefix
 async_postgres/pg_connection/types.nim	tailPendingReplStatus

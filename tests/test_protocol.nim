@@ -2040,6 +2040,36 @@ suite "nextMessage ParameterStatus bounds":
     check conn.state == csReady
     check conn.serverParams["client_encoding"] == "UNICODE"
 
+  test "DateStyle output style other than ISO closes the connection":
+    for style in ["SQL, DMY", "Postgres, MDY", "German, DMY"]:
+      checkpoint style
+      var conn = mockConn()
+      conn.recvBuf = buildParameterStatusMsg("DateStyle", style)
+      expect PgProtocolError:
+        discard conn.nextMessage()
+      check conn.state == csClosed
+      check conn.serverParams["DateStyle"] == style
+
+  test "DateStyle field order change keeps the connection":
+    # The ISO output the decoders read does not depend on the order.
+    var conn = mockConn()
+    conn.recvBuf =
+      buildParameterStatusMsg("DateStyle", "ISO, MDY") &
+      buildParameterStatusMsg("DateStyle", "ISO, DMY") & buildReadyForQuery()
+    check conn.nextMessage().isSome
+    check conn.state == csReady
+    check conn.serverParams["DateStyle"] == "ISO, DMY"
+
+  test "non-ISO DateStyle during startup closes the connection":
+    # ISO is sent at startup; this means a server or proxy ignored it.
+    var conn = mockConn()
+    conn.state = csAuthentication
+    conn.recvBuf =
+      buildParameterStatusMsg("DateStyle", "SQL, DMY") & buildReadyForQuery()
+    expect PgProtocolError:
+      discard conn.nextMessage()
+    check conn.state == csClosed
+
   test "value at the byte cap is accepted":
     var conn = mockConn()
     # Leave exactly 3 bytes of room, then store name "ab" + value "c".

@@ -4,6 +4,7 @@ when defined(posix):
 
 import ../async_postgres/[async_backend, pg_connection]
 import ../async_postgres/pg_connection/dsn {.all.}
+import ../async_postgres/pg_connection/types
 
 const dummyPem = "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n"
 
@@ -417,6 +418,48 @@ suite "parseDsn":
       discard parseDsn("host=h options='-c client_encoding=LATIN1'")
     expect PgConfigError:
       discard parseDsn("postgresql://host/db?CLIENT_ENCODING=LATIN1")
+
+  test "DateStyle accepts only the ISO output style":
+    for v in ["ISO", "iso, DMY", "DMY", "YMD, ISO", "\"ISO\", MDY", "Euro"]:
+      let cfg = parseDsn("host=h DateStyle='" & v & "'")
+      check cfg.extraParams == @[("DateStyle", v)]
+    for v in [
+      "SQL, DMY", "Postgres", "PostgreSQL, DMY", "german", "DEFAULT", "ISO, \"SQL\""
+    ]:
+      expect PgConfigError:
+        discard parseDsn("host=h DateStyle='" & v & "'")
+    expect PgConfigError:
+      discard parseDsn("postgresql://host/db?datestyle=SQL")
+
+  test "validateConnConfig rejects a non-ISO DateStyle in extraParams and options":
+    var cfg = parseDsn("postgresql://host/db")
+    for p in [
+      ("DateStyle", "ISO, DMY"),
+      ("datestyle", "MDY"),
+      ("options", "-c DateStyle=DMY"),
+      ("options", "--datestyle=ISO,YMD"),
+    ]:
+      cfg.extraParams = @[p]
+      validateConnConfig(cfg)
+    for p in [
+      ("DATESTYLE", "SQL"),
+      ("options", "-c DateStyle=SQL,DMY"),
+      ("options", "-cdatestyle=German"),
+      ("options", "-c work_mem=1MB --DateStyle=Postgres"),
+      ("options", "-c datestyle=postgresql"),
+    ]:
+      cfg.extraParams = @[p]
+      expect PgConfigError:
+        validateConnConfig(cfg)
+    expect PgConfigError:
+      discard parseDsn("host=h options='-c DateStyle=SQL'")
+
+  test "namesNonIsoDateStyle matches the server's style tokens":
+    # The server takes any token starting with "postgres" as that style.
+    for v in ["postgres_verbose", "\"PostgreSQL\"", "DMY, sql"]:
+      check namesNonIsoDateStyle(v)
+    for v in ["", "ISO", "DMY, ISO", "EUROPEAN", "NonEuro"]:
+      check not namesNonIsoDateStyle(v)
 
   test "splitStartupOptions matches pg_split_opts":
     check splitStartupOptions("  -c a=b\\ c   -d ") == @["-c", "a=b c", "-d"]

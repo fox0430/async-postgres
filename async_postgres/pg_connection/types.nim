@@ -5,7 +5,8 @@
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[tables, sets, deques, lists, macros, options]
-from std/strutils import isAlphaNumeric, toLowerAscii, cmpIgnoreCase
+from std/strutils import
+  isAlphaNumeric, toLowerAscii, cmpIgnoreCase, split, strip, startsWith, Whitespace
 when defined(posix):
   import std/posix
 
@@ -209,6 +210,13 @@ type
       ## Forwarded verbatim; treat as trusted config — typos are not rejected.
       ## Exception: ``client_encoding`` is always sent as UTF8, and another
       ## value (also via ``-c`` in ``options``) raises ``PgConfigError``.
+      ## Likewise ``DateStyle`` is always sent with the ISO output style, so it
+      ## overrides a role or database one, field order included (the order from
+      ## the server's configuration or a ``-c`` in ``options`` stays). One here
+      ## may set only the field order (``DMY``, ...); another output style
+      ## raises ``PgConfigError`` the same way. As startup values, both survive
+      ## ``RESET`` and ``DISCARD ALL``; a later ``SET`` of either to a value the
+      ## decoders cannot read closes the connection with ``PgProtocolError``.
     maxMessageSize*: int
       ## Max backend message size (0 = 1 GiB default); larger → ``PgProtocolError``.
     maxScramIterations*: int
@@ -1572,6 +1580,34 @@ proc isUtf8EncodingName*(val: string): bool =
 proc isClientEncodingKey*(key: string): bool =
   ## GUC names are case-insensitive.
   cmpIgnoreCase(key, "client_encoding") == 0
+
+proc isDateStyleKey*(key: string): bool =
+  ## GUC names are case-insensitive.
+  cmpIgnoreCase(key, "DateStyle") == 0
+
+proc namesNonIsoDateStyle*(val: string): bool =
+  ## Whether a ``DateStyle`` value picks an output style other than ISO.
+  ## ``DEFAULT`` counts: it is the server's, possibly non-ISO. The server
+  ## takes any token starting with ``postgres`` as that style.
+  for item in val.split(','):
+    let token = item.strip(chars = Whitespace + {'"'}).toLowerAscii
+    if token in ["sql", "german", "default"] or token.startsWith("postgres"):
+      return true
+  false
+
+proc reportsIsoDateStyle*(value: string): bool =
+  ## Whether a reported ``DateStyle`` has the ISO output style the text
+  ## decoders parse. The server reports the style first: ``ISO, MDY``.
+  value.toLowerAscii.startsWith("iso")
+
+proc startupDateStyle*(val: string): string =
+  ## The startup ``DateStyle`` for a caller's ``val`` (empty if none), which
+  ## names no other output style: ISO, then any field order ``val`` sets. The
+  ## server accepts a repeated ``ISO``.
+  if val.strip.len == 0:
+    "ISO"
+  else:
+    "ISO, " & val
 
 proc recordParameterStatus*(
     conn: PgConnection, name, value: string
