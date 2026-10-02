@@ -183,7 +183,10 @@ type
       ## **unencrypted** on both backends (no passphrase callback is wired up).
       ## PKCS#8, PKCS#1 (``RSA PRIVATE KEY``) and SEC1 (``EC PRIVATE KEY``) PEM
       ## are accepted. Must be paired with ``sslCert``.
-    sslSni*: bool ## Send TLS SNI (default true; suppressed for IP/empty host).
+    sslSni*: bool
+      ## Send TLS SNI (default true; suppressed for IP/empty host). chronos
+      ## ignores it: it sends SNI only under `sslVerifyFull`, where BearSSL
+      ## checks the same name.
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
