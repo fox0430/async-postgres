@@ -150,6 +150,7 @@ async_postgres/pg_connection/simple_query.nim	tracedSimpleExec
 async_postgres/pg_connection/ssl.nim	negotiateSSL
 async_postgres/pg_connection/ssl.nim	sniName
 async_postgres/pg_connection/ssl.nim	validateDirectSslCompatible
+async_postgres/pg_connection/types.nim	DefaultHost
 async_postgres/pg_connection/types.nim	DefaultNotifyMaxQueue
 async_postgres/pg_connection/types.nim	DefaultNotifyMaxQueueBytes
 async_postgres/pg_connection/types.nim	DialTarget
@@ -233,6 +234,7 @@ async_postgres/pg_connection/types.nim	detachTransport#2
 async_postgres/pg_connection/types.nim	dispatchNotice
 async_postgres/pg_connection/types.nim	dispatchNotification
 async_postgres/pg_connection/types.nim	dropStagedStmtCloses
+async_postgres/pg_connection/types.nim	effectiveHost
 async_postgres/pg_connection/types.nim	effectiveMaxMessageSize
 async_postgres/pg_connection/types.nim	effectiveMaxScramIterations
 async_postgres/pg_connection/types.nim	enqueueNotification
