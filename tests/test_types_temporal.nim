@@ -323,22 +323,37 @@ suite "PgTimeTz":
     let t = row.getTimeTz(0)
     check t.utcOffset == 19815
 
-  test "getTimeTz text ±15:59:59 TZDISP_LIMIT inclusive max":
-    # PostgreSQL TZDISP_LIMIT is exclusive of ±16h; ±15:59:59 is the last valid.
-    let pos = @[some(toBytes("00:00:00+15:59:59"))].getTimeTz(0)
-    check pos.utcOffset == 15 * 3600 + 59 * 60 + 59
-    let neg = @[some(toBytes("00:00:00-15:59:59"))].getTimeTz(0)
-    check neg.utcOffset == -(15 * 3600 + 59 * 60 + 59)
+  test "getTimeTz text reads offsets past timetz input's ±15:59:59":
+    # A POSIX session zone prints up to +169 (`SET TimeZone =
+    # 'FOO-167:59:60BAR'`), and `AT TIME ZONE` an interval any int32.
+    for (text, off) in [
+      ("00:00:00+15:59:59", 15 * 3600 + 59 * 60 + 59),
+      ("00:00:00-15:59:59", -(15 * 3600 + 59 * 60 + 59)),
+      ("00:00:00+16", 16 * 3600),
+      ("00:00:00-16:00:00", -16 * 3600),
+      ("12:00:00+20", 20 * 3600),
+      ("12:00:00+100:30", 100 * 3600 + 30 * 60),
+      ("01:00:00+169", 169 * 3600),
+      ("15:14:07+596523:14:07", int(int32.high)),
+      ("08:45:53-596523:14:07", -int(int32.high)),
+    ]:
+      checkpoint text
+      check @[some(toBytes(text))].getTimeTz(0).utcOffset == off
 
-  test "getTimeTz text +16 and +16:00 raise":
-    for bad in ["00:00:00+16", "00:00:00+16:00", "00:00:00-16", "00:00:00-16:00:00"]:
+  test "getTimeTz text offsets PostgreSQL cannot print raise":
+    # EncodeTimezone pads the hour to two digits only, and int32.low prints as
+    # garbage (`+4294370773:4294967282:4294967288`).
+    for bad in [
+      "00:00:00+009", "00:00:00+015:00", "00:00:00-001:00:00", "00:00:00+0100",
+      "00:00:00+596523:14:08", "00:00:00-596523:14:08", "00:00:00+1000000",
+      "08:45:52+4294370773:4294967282:4294967288",
+    ]:
       let row = @[some(toBytes(bad))]
       expect PgTypeError:
         discard row.getTimeTz(0)
 
   test "getTimeTz text minutes/seconds out of 0..59 raise":
-    # Total seconds of +00:99 is still inside TZDISP_LIMIT; DecodeTimezone
-    # rejects the component anyway.
+    # EncodeTimezone never prints a component past 59.
     for bad in ["00:00:00+00:99", "00:00:00+00:00:60", "00:00:00-01:60"]:
       let row = @[some(toBytes(bad))]
       expect PgTypeError:
@@ -658,19 +673,23 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard decodeBinaryTimeTz(tt)
 
-  test "decodeBinaryTimeTz TZDISP_LIMIT exclusive ±16h raises":
-    # Wire zone is seconds west of UTC; the bound is symmetric.
+  test "decodeBinaryTimeTz reads zones past timetz input's ±16h":
+    # Wire zone is seconds west of UTC. timetz_send emits whatever is stored,
+    # e.g. -169h under `SET TimeZone = 'FOO-167:59:60BAR'`.
     proc timetzBin(zone: int32): seq[byte] =
       result = @(toBE64(0'i64))
       result.add @(toBE32(zone))
 
-    expect PgTypeError:
-      discard decodeBinaryTimeTz(timetzBin(16 * 3600))
-    expect PgTypeError:
-      discard decodeBinaryTimeTz(timetzBin(-16 * 3600))
-    let maxOff = int32(15 * 3600 + 59 * 60 + 59)
-    check decodeBinaryTimeTz(timetzBin(-maxOff)).utcOffset == maxOff
-    check decodeBinaryTimeTz(timetzBin(maxOff)).utcOffset == -maxOff
+    for zone in [
+      int32(15 * 3600 + 59 * 60 + 59),
+      16 * 3600,
+      -16 * 3600,
+      -169 * 3600,
+      int32.high,
+      -int32.high,
+    ]:
+      checkpoint $zone
+      check decodeBinaryTimeTz(timetzBin(zone)).utcOffset == -zone
 
   test "decodeBinaryDate infinity raises":
     expect PgTypeError:
@@ -745,20 +764,101 @@ suite "Timestamp/date infinity sentinels":
     check parseTimestampText("4714-11-24 01:00:00.000000 BC").year == -4713
     check parseTimestampText("10000-01-01 00:00:00.000000").year == 10000
     check parseTimestampText("4714-11-24 00:00:00.000000Z AD").year == 4714
-    # PostgreSQL omits `.000000`, so the era formats without a fraction (and
-    # `zz` / `zzz` offsets next to `g`) need their own success paths.
+    # PostgreSQL omits `.000000`; the era also follows a bare or offset zone.
     check parseTimestampText("4714-11-24 00:00:00 BC").year == -4713
     check parseTimestampText("4714-11-24 00:00:00Z BC").year == -4713
     check parseTimestampText("0001-06-01 00:00:00+09 BC").year == 0
     check parseTimestampText("0001-06-01 00:00:00+09:30 BC").year == 0
-    # A short fraction is right-padded before the era is read.
+    # PostgreSQL trims trailing zeros from the fraction.
     check parseTimestampText("0001-06-01 00:00:00.5+09 BC").year == 0
+
+  test "parseTimestampText reads offsets with seconds":
+    # PostgreSQL prints `±HH:MM:SS` when the session zone's offset has seconds
+    # (LMT and similar historical offsets).
+    check parseTimestampText("1880-01-01 09:18:59+09:18:59") ==
+      dateTime(1880, mJan, 1, zone = utc())
+    check parseTimestampText("1969-12-31 23:15:30-00:44:30") ==
+      dateTime(1970, mJan, 1, zone = utc())
+    check parseTimestampText("1930-07-01 01:19:32.5+01:19:32") ==
+      dateTime(1930, mJul, 1, 0, 0, 0, 500_000_000, utc())
+    check parseTimestampText("0044-03-15 21:18:59+09:18:59 BC") ==
+      dateTime(-43, mMar, 15, 12, zone = utc())
+    check parseTimestampText("0044-03-15 21:18:59.000001+09:18:59 BC") ==
+      dateTime(-43, mMar, 15, 12, 0, 0, 1_000, utc())
+    for bad in [
+      "1880-01-01 09:18:59+09:18:5", "1880-01-01 09:18:59+09:18:",
+      "1880-01-01 09:18:59+09:18:59:00", "1880-01-01 09:18:59+09:18:59X",
+      "0044-03-15 21:18:59+09:18:59 XY",
+    ]:
+      expect PgTypeError:
+        discard parseTimestampText(bad)
+
+  test "parseTimestampText reads every offset PostgreSQL prints":
+    check parseTimestampText("2000-01-01 09:00:00+09") ==
+      dateTime(2000, mJan, 1, zone = utc())
+    check parseTimestampText("1999-12-31 14:30:00-09:30") ==
+      dateTime(2000, mJan, 1, zone = utc())
+    # A POSIX session zone reaches 168 hours west (`SET TimeZone =
+    # 'FOO+167:59:60'`) and, in its default daylight time, 169 east
+    # (`'FOO-167:59:60BAR'`).
+    check parseTimestampText("2000-01-05 04:30:00+100:30") ==
+      dateTime(2000, mJan, 1, zone = utc())
+    check parseTimestampText("2000-01-08 00:00:00+168") ==
+      dateTime(2000, mJan, 1, zone = utc())
+    check parseTimestampText("2000-07-08 01:00:00+169") ==
+      dateTime(2000, mJul, 1, zone = utc())
+    check parseTimestampText("1999-12-25 00:00:00-168") ==
+      dateTime(2000, mJan, 1, zone = utc())
+
+  test "parseTimestampText rejects out-of-range fields as PgTypeError":
+    # Minute and second 99 used to escape as RangeDefect.
+    for bad in [
+      "2000-01-01 00:99:00", "2000-01-01 00:00:99", "2000-01-01 00:00:60",
+      "2000-01-01 24:00:00", "2000-02-30 00:00:00", "2000-01-01 00:00:00+09:60",
+      "2000-01-01 00:00:00+09:99", "2000-01-01 00:00:00+09:00:60",
+      "2000-01-01 00:00:00+1000", "2000-01-01 00:00:00+9", "2000-01-01 00:00:00.",
+      "2000-01-01 00:00:00.1234567", "0000-01-01 00:00:00", "0000-01-01 00:00:00 BC",
+      "0002-02-29 00:00:00 BC", "2000-01-01 00:00:00 bc", "2000-01-01 00:00:00+170",
+      "2000-01-01 00:00:00+169:00:01", "2000-01-01 00:00:00-169",
+      "2000-01-01 00:00:00-168:00:01", "2000-01-01 00:00:00-999:59:59",
+      "2000-01-01 00:00:00 AD BC", "2000-01-01 00:00:00 BAD",
+    ]:
+      expect PgTypeError:
+        discard parseTimestampText(bad)
+    # 1 BC is the proleptic year 0, a leap year.
+    check parseTimestampText("0001-02-29 00:00:00 BC") ==
+      dateTime(0, mFeb, 29, zone = utc())
+
+  test "parseTimestampText rejects padding PostgreSQL does not print":
+    # The year is padded to four digits and the offset hour to two; wider only
+    # for values that need it.
+    for bad in [
+      "2000-01-01 00:00:00+009", "2000-01-01 00:00:00+0168", "02000-01-01 00:00:00",
+      "200-01-01 00:00:00", "2000-1-01 00:00:00", "2000-01-01 0:00:00",
+    ]:
+      checkpoint bad
+      expect PgTypeError:
+        discard parseTimestampText(bad)
 
   test "parseDateText keeps the era and years past 9999":
     check parseDateText("4714-11-24 BC").year == -4713
     check parseDateText("0001-12-31 BC").year == 0
     check parseDateText("294277-01-01").year == 294277
     check parseDateText("2024-01-15 AD").year == 2024
+
+  test "parseDateText rejects shapes PostgreSQL does not print":
+    # A lowercase era used to decode as AD.
+    for bad in [
+      "2000-01-01 bc", "2000-01-01 ad", "2000-01-01 BC ", "2000-01-01  BC",
+      "2000-01-01 B", "2000-01-01 BAD", "2000-01-01X", "02000-01-01", "200-01-01",
+      "0000-01-01",
+      "2000-1-01", "2000-01-1", "2000-01-01 00:00:00", "0002-02-29 BC",
+    ]:
+      checkpoint bad
+      expect PgTypeError:
+        discard parseDateText(bad)
+    # 1 BC is the proleptic year 0, a leap year.
+    check parseDateText("0001-02-29 BC") == dateTime(0, mFeb, 29, zone = utc())
 
   test "text date round trip keeps the era and years past 9999":
     # The text encoders accept date's whole range, so the text parser must read
@@ -782,7 +882,7 @@ suite "Timestamp/date infinity sentinels":
       check parseTimestampText(toString(toPgTimestampTzParam(dt).value.get)) == dt
 
   test "text temporal parsers keep PostgreSQL's exact ends":
-    # `YYYY` takes any number of digits; past ~2.92e11 the stdlib date math
+    # The stdlib `YYYY` took any number of digits; past ~2.92e11 its date math
     # overflowed int64 (OverflowDefect, not a TimeParseError) and years just
     # past a type's end used to decode silently.
     for bad in [
@@ -1227,6 +1327,17 @@ suite "PgInterval":
       except PgTypeError:
         raised = true
       check raised
+
+  test "parseIntervalText rejects a seventh fraction digit":
+    # PostgreSQL prints at most six, in every IntervalStyle. The extra digit
+    # must not be re-read as a later field (`"…7 days"`, `"…7:30"`).
+    for bad in [
+      "1 day 00:00:00.1234567", "@ 1.1234567 secs", "PT1.1234567S", "0:00:00.1234567",
+      "00:00:00.1234567 days", "00:00:00.1234567:30",
+    ]:
+      checkpoint bad
+      expect PgTypeError:
+        discard parseIntervalText(bad)
 
   test "parseIntervalText overflow raises PgTypeError (not Defect)":
     # A malicious/broken server sending oversized numeric fields must fail

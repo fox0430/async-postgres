@@ -615,7 +615,7 @@ template writeTimeAt(buf: var openArray[byte], pos: int, val: PgTime) =
 template writeTimeTzAt(buf: var openArray[byte], pos: int, val: PgTimeTz) =
   block:
     let t = val
-    # Same TZDISP_LIMIT as decodeBinaryTimeTz; also prevents negating int32.low.
+    # timetz_recv's TZDISP_LIMIT; also prevents negating int32.low.
     checkPgTimeTzOffset(t.utcOffset)
     buf.writeBE64(pos, pgTimeFieldsMicros(t.hour, t.minute, t.second, t.microsecond))
     buf.writeBE32(pos + 8, int32(-t.utcOffset)) # PostgreSQL stores offset negated

@@ -8,6 +8,12 @@ import ../async_postgres/pg_connection
 
 import e2e_common
 
+# Composite types must be registered at top level.
+type TstzRecord = object
+  at: DateTime
+
+pgComposite(TstzRecord)
+
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":
     proc t() {.async.} =
@@ -1103,5 +1109,103 @@ suite "E2E: Interval styles":
           doAssert res.rows[0].getInterval(0) == v,
             style & " '" & $v & "': got " & $res.rows[0].getInterval(0)
       await conn.close()
+
+    waitFor t()
+
+suite "E2E: Time zones":
+  test "timestamptz text decodes like binary for unusual offsets":
+    # Before a zone adopted standard time, PostgreSQL prints its LMT offset
+    # with seconds (`+09:18:59`); a POSIX zone prints hours past 99.
+    const cases = [
+      (zone: "Asia/Tokyo", lit: "1880-01-01 00:00:00+00", offset: "+09:18:59"),
+      (zone: "Africa/Monrovia", lit: "1970-01-01 00:00:00+00", offset: "-00:44:30"),
+      (zone: "Asia/Tokyo", lit: "1880-01-01 00:00:00.5+00", offset: "+09:18:59"),
+      (zone: "Asia/Tokyo", lit: "0044-03-15 12:00:00+00 BC", offset: "+09:18:59"),
+      (zone: "FOO-100:30", lit: "2000-01-01 00:00:00+00", offset: "+100:30"),
+      (zone: "FOO-167:59:60", lit: "2000-01-01 00:00:00+00", offset: "+168"),
+      (zone: "FOO+167:59:60", lit: "2000-01-01 00:00:00+00", offset: "-168"),
+      # Daylight time defaults to an hour east of standard time.
+      (zone: "FOO-167:59:60BAR", lit: "2000-07-01 00:00:00+00", offset: "+169"),
+    ]
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      try:
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_tstz_rec CASCADE")
+        discard
+          await conn.simpleQuery("CREATE TYPE test_e2e_tstz_rec AS (at timestamptz)")
+        for c in cases:
+          discard await conn.exec("SET TimeZone = '" & c.zone & "'")
+          let sql =
+            "SELECT x, ARRAY[x], tstzrange(x, x + interval '1 day'), " &
+            "tstzmultirange(tstzrange(x, x + interval '1 day')), " &
+            "ROW(x)::test_e2e_tstz_rec FROM (SELECT '" & c.lit & "'::timestamptz AS x) s"
+          let text = (await conn.query(sql, resultFormat = rfText)).rows[0]
+          let bin = (await conn.query(sql, resultFormat = rfBinary)).rows[0]
+          let ctx = c.zone & " '" & text.getStr(0) & "'"
+          doAssert c.offset in text.getStr(0), ctx
+          try:
+            doAssert text.getTimestampTz(0) == bin.getTimestampTz(0), ctx
+            doAssert text.getTimestampTzArray(1) == bin.getTimestampTzArray(1), ctx
+            doAssert text.getTsTzRange(2) == bin.getTsTzRange(2), ctx
+            doAssert text.getTsTzMultirange(3) == bin.getTsTzMultirange(3), ctx
+            doAssert getComposite[TstzRecord](text, 4).at ==
+              getComposite[TstzRecord](bin, 4).at, ctx
+          except PgTypeError as e:
+            doAssert false, ctx & ": " & e.msg
+      finally:
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_tstz_rec")
+        await conn.close()
+
+    waitFor t()
+
+  test "timetz decodes offsets past its input bound":
+    # timetz input stops at ±15:59:59, but output carries the session zone's
+    # offset, and `AT TIME ZONE` an interval stores any int32. The cast from
+    # timestamptz reads the zone at execution; a `'12:00'::timetz` literal is
+    # fixed at parse time, so a cached statement would keep the previous zone.
+    const cases = [
+      (
+        zone: "FOO-20",
+        expr: "'2000-01-01 00:00+00'::timestamptz::timetz",
+        offset: "+20",
+      ),
+      (
+        zone: "FOO-100:30",
+        expr: "'2000-01-01 00:00+00'::timestamptz::timetz",
+        offset: "+100:30",
+      ),
+      (
+        zone: "FOO-167:59:60BAR",
+        expr: "'2000-07-01 00:00+00'::timestamptz::timetz",
+        offset: "+169",
+      ),
+      (
+        zone: "UTC",
+        expr: "'12:00+00'::timetz AT TIME ZONE interval '596523:14:07'",
+        offset: "+596523:14:07",
+      ),
+      (
+        zone: "UTC",
+        expr: "'12:00+00'::timetz AT TIME ZONE interval '-596523:14:07'",
+        offset: "-596523:14:07",
+      ),
+    ]
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      try:
+        for c in cases:
+          discard await conn.exec("SET TimeZone = '" & c.zone & "'")
+          let sql = "SELECT x, ARRAY[x] FROM (SELECT " & c.expr & " AS x) s"
+          let text = (await conn.query(sql, resultFormat = rfText)).rows[0]
+          let bin = (await conn.query(sql, resultFormat = rfBinary)).rows[0]
+          let ctx = c.zone & " '" & text.getStr(0) & "'"
+          doAssert text.getStr(0).endsWith(c.offset), ctx
+          try:
+            doAssert text.getTimeTz(0) == bin.getTimeTz(0), ctx
+            doAssert text.getTimeTzArray(1) == bin.getTimeTzArray(1), ctx
+          except PgTypeError as e:
+            doAssert false, ctx & ": " & e.msg
+      finally:
+        await conn.close()
 
     waitFor t()
