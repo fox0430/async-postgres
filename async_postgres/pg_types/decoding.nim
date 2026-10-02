@@ -184,10 +184,10 @@ proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz {.raises: [PgError].} 
   if us < 0 or us > pgTimeMaxUs:
     raise newException(PgTypeError, "Binary timetz: microseconds out of range " & $us)
   let pgOffset = fromBE32(data.toOpenArray(8, 11))
-  # PostgreSQL ``timetz_recv`` rejects ``zone`` outside ``(-TZDISP_LIMIT,
-  # TZDISP_LIMIT)``. That also covers ``int32.low``, whose negation would
-  # OverflowDefect when un-negating the wire value.
-  checkPgTimeTzOffset(pgOffset)
+  # ``timetz_send`` emits any stored zone (see ``parseTimeTzText``), but
+  # un-negating ``int32.low`` would OverflowDefect.
+  if pgOffset == int32.low:
+    raise newException(PgTypeError, "Binary timetz: zone displacement out of range")
   let hours = int32(us div 3_600_000_000)
   let rem1 = us mod 3_600_000_000
   let minutes = int32(rem1 div 60_000_000)
@@ -372,22 +372,112 @@ proc decodeBinaryComposite*(
       pos += flen
   ensureNoTrailing(pos, data.len, "Binary composite")
 
-proc textYearTooLong(s: string): bool =
-  ## True when the ``YYYY`` field at the start of ``s`` holds more significant
-  ## digits than the widest PostgreSQL temporal year (``date``'s 5874897).
-  # `YYYY` takes any number of digits, and `parse` sums the year in an `int`
-  # before the stdlib scales epoch days by 86400 in int64: past ~2.92e11 that
-  # raises ``OverflowDefect`` from inside the stdlib, which the `except
-  # TimeParseError, IndexDefect` below would miss. Bound the field before
-  # `parse` sees it; the exact per-type ends are enforced after the parse.
-  var i = 0
-  while i < s.len and s[i] == '0':
+func takeChar(s: openArray[char], i: var int, c: char): bool {.inline.} =
+  result = i < s.len and s[i] == c
+  if result:
     inc i
-  var digits = 0
-  while i < s.len and s[i] in {'0' .. '9'}:
-    inc digits
-    inc i
-  digits > 7
+
+func takeDigits[T: SomeSignedInt](
+    s: openArray[char], i: var int, lo, hi: int, v: var T
+): bool =
+  ## ``lo`` to ``hi`` ASCII digits at ``s[i]``, read into ``v``. ``hi`` must
+  ## fit ``T``; 18 always fits ``int64``.
+  var j = i
+  v = 0
+  while j < s.len and j - i < hi and s[j] in {'0' .. '9'}:
+    v = v * 10 + T(ord(s[j]) - ord('0'))
+    inc j
+  result = j - i >= lo
+  if result:
+    i = j
+
+func takeDigits[T: SomeSignedInt](
+    s: openArray[char], i: var int, n: int, v: var T
+): bool {.inline.} =
+  takeDigits(s, i, n, n, v)
+
+func takePadded[T: SomeSignedInt](
+    s: openArray[char], i: var int, width, hi: int, v: var T
+): bool =
+  ## A field PostgreSQL zero-pads to ``width`` digits: wider only when the
+  ## value needs it, so never with a leading zero.
+  let start = i
+  takeDigits(s, i, width, hi, v) and (i - start == width or s[start] != '0')
+
+func takeFracMicros[T: SomeSignedInt](s: openArray[char], i: var int, us: var T): bool =
+  ## ``.f`` to ``.ffffff`` at ``s[i]`` as microseconds. PostgreSQL trims
+  ## trailing zeros and prints at most six digits; a seventh is invalid, so it
+  ## can never be re-read as the next field.
+  let start = i + 1
+  if not (takeChar(s, i, '.') and takeDigits(s, i, 1, 6, us)):
+    return false
+  if i < s.len and s[i] in {'0' .. '9'}:
+    return false
+  for _ in i - start ..< 6:
+    us *= 10
+  true
+
+func takeYmd(s: openArray[char], i: var int, year, month, day: var int): bool =
+  ## PostgreSQL's ISO ``YYYY-MM-DD``. Seven year digits reach ``date``'s
+  ## 5874897; the caller checks the calendar once the era is known.
+  takePadded(s, i, 4, 7, year) and year > 0 and takeChar(s, i, '-') and
+    takeDigits(s, i, 2, month) and takeChar(s, i, '-') and takeDigits(s, i, 2, day)
+
+func takeClock(s: openArray[char], i: var int, h, m, sec, us: var int): bool =
+  ## PostgreSQL's ``HH:MM:SS[.ffffff]``; the caller bounds the hour.
+  us = 0
+  takeDigits(s, i, 2, h) and takeChar(s, i, ':') and takeDigits(s, i, 2, m) and m <= 59 and
+    takeChar(s, i, ':') and takeDigits(s, i, 2, sec) and sec <= 59 and
+    (i >= s.len or s[i] != '.' or takeFracMicros(s, i, us))
+
+func takeTimeOfDay(s: openArray[char], i: var int, h, m, sec, us: var int): bool =
+  ## ``takeClock`` up to ``24:00:00``, PostgreSQL's inclusive end of day.
+  takeClock(s, i, h, m, sec, us) and
+    (h < 24 or (h == 24 and m == 0 and sec == 0 and us == 0))
+
+func takeUtcOffset(s: openArray[char], i: var int, off: var int64): bool =
+  ## PostgreSQL's ``±HH[:MM[:SS]]`` offset at ``s[i]``, as seconds east of UTC.
+  # EncodeTimezone prints every hour digit; six cover int32 (596523 hours).
+  if i >= s.len or s[i] notin {'+', '-'}:
+    return false
+  var j = i + 1
+  var h, m, sec: int64
+  if not takePadded(s, j, 2, 6, h):
+    return false
+  if takeChar(s, j, ':'):
+    if not takeDigits(s, j, 2, m) or m > 59:
+      return false
+    if takeChar(s, j, ':'):
+      if not takeDigits(s, j, 2, sec) or sec > 59:
+        return false
+  off = h * 3600 + m * 60 + sec
+  if s[i] == '-':
+    off = -off
+  i = j
+  true
+
+func takeEra(s: openArray[char], i: var int, year: var int): bool =
+  ## The optional era suffix: PostgreSQL prints `` BC`` (`` AD`` is read too),
+  ## which turns ``year`` into the proleptic ``1 - year``. Matched as a whole,
+  ## so a partial `` BC`` cannot fall through as `` AD``.
+  if i < s.len and s[i] == ' ':
+    if i + 2 >= s.len:
+      return false
+    if s[i + 1] == 'B' and s[i + 2] == 'C':
+      year = 1 - year
+    elif not (s[i + 1] == 'A' and s[i + 2] == 'D'):
+      return false
+    i += 3
+  true
+
+proc validYmd(year, month, day: int): bool =
+  month in 1 .. 12 and day in 1 .. getDaysInMonth(Month(month), year)
+
+const
+  pgTstzMaxEast = 169 * 3600
+    ## A POSIX session zone stops at ``167:59:60`` (168h), and its daylight
+    ## time defaults to an hour east of that: ``FOO-167:59:60BAR`` prints ``+169``.
+  pgTstzMaxWest = 168 * 3600 ## ``FOO+167:59:60`` prints ``-168``.
 
 proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
   # Raises ``PgTypeError`` for infinity/unparseable input or a year outside
@@ -399,48 +489,32 @@ proc parseTimestampText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
     raise newException(
       PgTypeError, "Timestamp is '" & s & "', not representable as a DateTime"
     )
-  if textYearTooLong(s):
-    raise newException(PgTypeError, "timestamp year out of range (len=" & $s.len & ")")
-  # PG trims trailing zeros in text output ('.500000' -> '.5'), but Nim's
-  # 'ffffff' requires exactly 6 digits. Right-pad short fractions before parse.
-  var norm = s
-  let dot = s.find('.')
-  if dot >= 0:
-    var e = dot + 1
-    while e < s.len and s[e] in {'0' .. '9'}:
-      inc e
-    let fracLen = e - dot - 1
-    if fracLen in 1 .. 5:
-      norm = s[0 ..< e] & repeat('0', 6 - fracLen) & s[e .. ^1]
-  # Pre-compiled: malformed pattern is a build error, not runtime. `YYYY` takes
-  # any number of year digits and `g` the era suffix; a format that leaves input
-  # unconsumed fails, so the era variants after the others stay unambiguous.
-  const formats = [
-    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzzz"),
-    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzz"),
-    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffff"),
-    initTimeFormat("YYYY-MM-dd HH:mm:sszzz"),
-    initTimeFormat("YYYY-MM-dd HH:mm:sszz"),
-    initTimeFormat("YYYY-MM-dd HH:mm:ss"),
-    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzzz g"),
-    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffffzz g"),
-    initTimeFormat("YYYY-MM-dd HH:mm:ss'.'ffffff g"),
-    initTimeFormat("YYYY-MM-dd HH:mm:sszzz g"),
-    initTimeFormat("YYYY-MM-dd HH:mm:sszz g"),
-    initTimeFormat("YYYY-MM-dd HH:mm:ss g"),
-  ]
-  # Zoneless input uses utc(); indexing skips the per-iteration copy a `for fmt
-  # in formats` loop variable would take (`parse` itself takes it by reference).
-  for i in 0 ..< formats.len:
-    try:
-      let dt = parse(norm, formats[i], utc())
-      # Same ends as the encoders (`pgTimestampMicros`), so text past them
-      # cannot decode to a DateTime no encoder would accept back.
-      discard pgTimestampMicros(dt)
-      return dt
-    except TimeParseError, IndexDefect:
-      discard
-  raise newException(PgTypeError, "Invalid timestamp (len=" & $s.len & ")")
+  template invalid(): untyped =
+    newException(PgTypeError, "Invalid timestamp (len=" & $s.len & ")")
+
+  # Read by hand, not with `times.parse`: that needs a failed try per optional
+  # part and raises RangeDefect for minute 99.
+  var i = 0
+  var year, month, day, hour, minute, second, us: int
+  if not (
+    takeYmd(s, i, year, month, day) and takeChar(s, i, ' ') and
+    takeClock(s, i, hour, minute, second, us) and hour <= 23
+  ):
+    raise invalid()
+  var off: int64
+  if i < s.len and s[i] in {'+', '-'}:
+    if not takeUtcOffset(s, i, off) or off notin -pgTstzMaxWest .. pgTstzMaxEast:
+      raise invalid()
+  else:
+    discard takeChar(s, i, 'Z')
+  if not (takeEra(s, i, year) and i == s.len and validYmd(year, month, day)):
+    raise invalid()
+  result =
+    dateTime(year, Month(month), day, hour, minute, second, us * 1000, utc()) -
+    initDuration(seconds = off)
+  # Same ends as the encoders (`pgTimestampMicros`), so text past them
+  # cannot decode to a DateTime no encoder would accept back.
+  discard pgTimestampMicros(result)
 
 proc parseDateText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
   # Raises ``PgTypeError`` for infinity/unparseable or a year outside
@@ -450,95 +524,46 @@ proc parseDateText*(s: string): DateTime {.gcsafe, raises: [PgError].} =
     # Known literal, safe to name (mirrors the binary decoder's message).
     raise
       newException(PgTypeError, "Date is '" & s & "', not representable as a DateTime")
-  if textYearTooLong(s):
-    raise newException(PgTypeError, "date year out of range (len=" & $s.len & ")")
-  const dateFormats = [initTimeFormat("YYYY-MM-dd"), initTimeFormat("YYYY-MM-dd g")]
-  for i in 0 ..< dateFormats.len:
-    try:
-      # Zone is utc() so a date decodes to the same absolute instant as
-      # decodeBinaryDate; the local default would shift it by the UTC offset.
-      let dt = parse(s, dateFormats[i], utc())
-      # `date` reaches further than `timestamp`, so check against its own ends
-      # (`pgDateDays`), mirroring the date encoders.
-      discard pgDateDays(dt)
-      return dt
-    except TimeParseError, IndexDefect:
-      discard
-  raise newException(PgTypeError, "Invalid date (len=" & $s.len & ")")
+  var i = 0
+  var year, month, day: int
+  if not (
+    takeYmd(s, i, year, month, day) and takeEra(s, i, year) and i == s.len and
+    validYmd(year, month, day)
+  ):
+    raise newException(PgTypeError, "Invalid date (len=" & $s.len & ")")
+  # Zone is utc() so a date decodes to the same absolute instant as
+  # decodeBinaryDate; the local default would shift it by the UTC offset.
+  result = dateTime(year, Month(month), day, zone = utc())
+  # `date` reaches further than `timestamp`, so check against its own ends
+  # (`pgDateDays`), mirroring the date encoders.
+  discard pgDateDays(result)
 
 proc parseTimeText*(s: string): PgTime {.raises: [PgError].} =
   ## Parse PostgreSQL time text format: "HH:mm:ss" or "HH:mm:ss.ffffff".
-  if s.len < 8 or s[2] != ':' or s[5] != ':':
-    raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
+  var i = 0
   var h, m, sec, us: int
-  let timeCtx = "Invalid time (len=" & $s.len & ")"
-  h = pgParseUIntField(s.toOpenArray(0, 1), timeCtx)
-  m = pgParseUIntField(s.toOpenArray(3, 4), timeCtx)
-  sec = pgParseUIntField(s.toOpenArray(6, 7), timeCtx)
-  if h notin 0 .. 24 or m notin 0 .. 59 or sec notin 0 .. 59:
-    raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
-  if s.len > 8:
-    # Reject trailing garbage. Only "HH:MM:SS" or "HH:MM:SS.ffffff" are valid;
-    # anything else (e.g. "01:23:45X") must fail rather than silently return.
-    if s[8] != '.':
-      raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
-    let frac = s[9 .. ^1]
-    if frac.len == 0 or frac.len > 6:
-      raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
-    us = pgParseUIntField(frac, timeCtx)
-    # Pad to 6 digits
-    for _ in 0 ..< (6 - frac.len):
-      us *= 10
-  # PostgreSQL accepts '24:00:00' as the inclusive end-of-day bound, but nothing
-  # past it (no '24:00:01', no '24:00:00.000001').
-  if h == 24 and (m != 0 or sec != 0 or us != 0):
+  if not (takeTimeOfDay(s, i, h, m, sec, us) and i == s.len):
     raise newException(PgTypeError, "Invalid time (len=" & $s.len & ")")
   PgTime(hour: int32(h), minute: int32(m), second: int32(sec), microsecond: int32(us))
 
 proc parseTimeTzText*(s: string): PgTimeTz {.raises: [PgError].} =
-  var tzPos = -1
-  for i in 8 ..< s.len:
-    if s[i] == '+' or s[i] == '-':
-      tzPos = i
-      break
-  if tzPos < 0:
+  var i = 0
+  var h, m, sec, us: int
+  if not takeTimeOfDay(s, i, h, m, sec, us):
+    raise newException(PgTypeError, "Invalid timetz (len=" & $s.len & ")")
+  if i == s.len:
     raise newException(PgTypeError, "Invalid timetz (no offset) (len=" & $s.len & ")")
-  let timePart = s[0 ..< tzPos]
-  let t = parseTimeText(timePart)
-  let sign = if s[tzPos] == '+': 1 else: -1
-  let offStr = s[tzPos + 1 .. ^1]
-  # PostgreSQL DecodeTimezone takes no sign inside the components; ``parseInt``
-  # would accept ``++5`` or ``+05:+3``.
-  for c in offStr:
-    if c notin {'0' .. '9', ':'}:
-      raise newException(PgTypeError, "Invalid timetz offset (len=" & $s.len & ")")
-  var offH, offM, offS: int
-  let offCtx = "Invalid timetz offset (len=" & $s.len & ")"
-  if offStr.len == 2:
-    offH = pgParseUIntField(offStr, offCtx)
-  elif offStr.len == 5 and offStr[2] == ':':
-    offH = pgParseUIntField(offStr.toOpenArray(0, 1), offCtx)
-    offM = pgParseUIntField(offStr.toOpenArray(3, 4), offCtx)
-  elif offStr.len == 8 and offStr[2] == ':' and offStr[5] == ':':
-    offH = pgParseUIntField(offStr.toOpenArray(0, 1), offCtx)
-    offM = pgParseUIntField(offStr.toOpenArray(3, 4), offCtx)
-    offS = pgParseUIntField(offStr.toOpenArray(6, 7), offCtx)
-  else:
-    raise newException(PgTypeError, offCtx)
-  # PostgreSQL DecodeTimezone: hour 0..MAX_TZDISP_HOUR, minute 0..59,
-  # second 0..59. ``+00:99`` must not be accepted as 99 minutes (which is
-  # inside TZDISP_LIMIT). Derive the hour bound from ``pgTzDispLimit`` so the
-  # displacement bound stays single-sourced.
-  const maxTzHour = pgTzDispLimit div 3600 - 1
-  if offH notin 0 .. maxTzHour or offM notin 0 .. 59 or offS notin 0 .. 59:
+  # Not bounded like timetz input (``pgTzDispLimit``): a session zone prints up
+  # to +169, and ``AT TIME ZONE`` an interval stores any int32 (+596523:14:07).
+  var off: int64
+  if not (takeUtcOffset(s, i, off) and i == s.len and abs(off) <= int32.high):
     raise newException(PgTypeError, "Invalid timetz offset (len=" & $s.len & ")")
-  let utcOff = sign * (offH * 3600 + offM * 60 + offS)
   PgTimeTz(
-    hour: t.hour,
-    minute: t.minute,
-    second: t.second,
-    microsecond: t.microsecond,
-    utcOffset: int32(utcOff),
+    hour: int32(h),
+    minute: int32(m),
+    second: int32(sec),
+    microsecond: int32(us),
+    utcOffset: int32(off),
   )
 
 proc parseHstoreText*(s: string): PgHstore {.raises: [PgError].} =
@@ -721,32 +746,19 @@ proc readSign(s: string, i: var int): bool =
 
 proc readUInt(s: string, i: var int): int64 =
   ## One or more decimal digits at ``i``.
-  if i >= s.len or s[i] notin {'0' .. '9'}:
+  if not takeDigits(s, i, 1, 18, result):
     raise invalidInterval(s)
-  while i < s.len and s[i] in {'0' .. '9'}:
-    let d = int64(ord(s[i]) - ord('0'))
-    if result > (int64.high - d) div 10:
-      raise intervalOverflow(s)
-    result = result * 10 + d
-    inc i
+  # A 19th digit overflows every field it could feed.
+  if i < s.len and s[i] in {'0' .. '9'}:
+    raise intervalOverflow(s)
 
 proc readFracMicros(s: string, i: var int): int64 =
-  ## An optional ``.ffffff`` at ``i`` as microseconds, else ``noFrac``. Digits
-  ## past the sixth are dropped: the server prints at most six.
+  ## An optional ``.ffffff`` at ``i`` as microseconds, else ``noFrac``. A
+  ## seventh digit is invalid (``takeFracMicros``), never a later field.
   if i >= s.len or s[i] != '.':
     return noFrac
-  inc i
-  if i >= s.len or s[i] notin {'0' .. '9'}:
+  if not takeFracMicros(s, i, result):
     raise invalidInterval(s)
-  var digits = 0
-  while i < s.len and s[i] in {'0' .. '9'}:
-    if digits < 6:
-      result = result * 10 + int64(ord(s[i]) - ord('0'))
-      inc digits
-    inc i
-  while digits < 6:
-    result *= 10
-    inc digits
 
 proc readTime(f: var IntervalFields, s: string, i: var int, neg: bool) =
   ## ``H:MM[:SS[.ffffff]]`` at ``i``, signed by ``neg``.
