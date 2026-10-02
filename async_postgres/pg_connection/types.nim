@@ -217,6 +217,16 @@ type
       ## raises ``PgConfigError`` the same way. As startup values, both survive
       ## ``RESET`` and ``DISCARD ALL``; a later ``SET`` of either to a value the
       ## decoders cannot read closes the connection with ``PgProtocolError``.
+      ## ``TimeZone`` is sent as UTC unless set here or via ``-c`` in
+      ## ``options``; ``DEFAULT`` sends none, keeping the server's, database's
+      ## or role's zone. A session asked for UTC that reports another zone (a
+      ## proxy dropped the startup value) fails ``connect`` with
+      ## ``PgConnectionError``. In another zone, the ``DateTime`` encoders that
+      ## send ``timestamp`` (``toPgParam``, ``toPgBinaryParam``,
+      ## ``toPgTimestampArrayParam``) shift by its offset when bound to
+      ## ``timestamptz``; the ``TimestampTz`` ones do not. The ``DateTime``
+      ## range and multirange encoders shift the same way when a ``tsrange`` or
+      ## ``tsmultirange`` value is bound to its ``tstz`` counterpart.
     maxMessageSize*: int
       ## Max backend message size (0 = 1 GiB default); larger → ``PgProtocolError``.
     maxScramIterations*: int
@@ -417,6 +427,13 @@ type
       ## reset/discard decision so `pg_advisory_unlock_all` runs whenever a
       ## tracked acquire ever happened, even if the tracked counter was
       ## decremented back to zero by a typed unlock of a raw-acquired key.
+    connectTimeZone: string
+      ## ``TimeZone`` the pool restores on release: the zone the session started
+      ## with, or — with ``timeZoneFollowsServer`` — the zone the server
+      ## reported after its last ``RESET TimeZone``.
+    timeZoneFollowsServer: bool
+      ## No startup ``TimeZone`` (``DEFAULT``): the server's, database's or
+      ## role's zone applies, so the pool restores it with ``RESET``.
     tracer: PgTracer ## Inherited from ConnConfig on connect
     ownerPool: PgPoolOwner
       ## Owning pool back-reference. Set when this connection is managed by
@@ -980,6 +997,8 @@ proc graftReconnectedSession*(conn, src: PgConnection) =
   conn.secretKey = src.secretKey
   conn.serverParams = src.serverParams
   conn.serverParamsBytes = src.serverParamsBytes
+  conn.connectTimeZone = src.connectTimeZone
+  conn.timeZoneFollowsServer = src.timeZoneFollowsServer
   conn.txStatus = src.txStatus
   conn.createdAt = src.createdAt
   conn.recvBuf = src.recvBuf
@@ -1577,13 +1596,9 @@ proc isUtf8EncodingName*(val: string): bool =
       name.add(c.toLowerAscii)
   name in ["utf8", "unicode"]
 
-proc isClientEncodingKey*(key: string): bool =
+proc isGucName*(key, name: string): bool =
   ## GUC names are case-insensitive.
-  cmpIgnoreCase(key, "client_encoding") == 0
-
-proc isDateStyleKey*(key: string): bool =
-  ## GUC names are case-insensitive.
-  cmpIgnoreCase(key, "DateStyle") == 0
+  cmpIgnoreCase(key, name) == 0
 
 proc namesNonIsoDateStyle*(val: string): bool =
   ## Whether a ``DateStyle`` value picks an output style other than ISO.
@@ -1599,6 +1614,83 @@ proc reportsIsoDateStyle*(value: string): bool =
   ## Whether a reported ``DateStyle`` has the ISO output style the text
   ## decoders parse. The server reports the style first: ``ISO, MDY``.
   value.toLowerAscii.startsWith("iso")
+
+proc isZeroOffsetSpec(spec: string): bool =
+  ## Whether a POSIX-style offset spec — ``[+-]hh[:mm[:ss]]``, a field may
+  ## carry a decimal fraction — names zero: every digit is ``0``. A sign
+  ## alone, an empty field, a fourth field, a stray character or a non-zero
+  ## digit fails, so a DST tail cannot slip through.
+  var i = 0
+  if i < spec.len and spec[i] in {'+', '-'}:
+    inc i
+  var separators = 0
+  var sawValue = false
+  while i < spec.len:
+    var digits = 0
+    while i < spec.len and spec[i] in {'0' .. '9'}:
+      if spec[i] != '0':
+        return false
+      inc digits
+      inc i
+    if i < spec.len and spec[i] == '.':
+      inc i
+      while i < spec.len and spec[i] in {'0' .. '9'}:
+        if spec[i] != '0':
+          return false
+        inc digits
+        inc i
+    if digits == 0:
+      return false
+    sawValue = true
+    if i < spec.len and spec[i] == ':':
+      if separators >= 2:
+        return false
+      inc separators
+      inc i
+      continue
+    break
+  sawValue and i == spec.len
+
+proc isUtcZoneName*(val: string): bool =
+  ## Whether ``val`` names a zone fixed at UTC+0, in any case and under the
+  ## spellings the server accepts and reports: the tzdata links (``UTC``,
+  ## ``Etc/UTC``, ``GMT0``, ``Greenwich``, ...), POSIX forms of those with a
+  ## zero offset (``UTC0``, ``GMT+00:00``, ...), a bare zero offset (``0``,
+  ## ``+00``, ``0.0``) and the synthetic bracketed name of a numeric zone
+  ## (``<+00>-00``). Any non-zero offset fails, so ``Etc/GMT+1``,
+  ## ``GMT+00:01`` and ``<+09>-09`` are not UTC.
+  const utcNames = ["utc", "uct", "universal", "zulu", "gmt", "gmt0", "greenwich"]
+  const etcPrefix = "etc/"
+  var name = val.toLowerAscii
+  if name.len > etcPrefix.len and name.startsWith(etcPrefix):
+    name = name[etcPrefix.len .. ^1]
+  if name in utcNames:
+    return true
+  var head = ""
+  var tail = ""
+  var bracketed = false
+  if name.len > 0 and name[0] == '<':
+    bracketed = true
+    var close = -1
+    for i in 1 ..< name.len:
+      if name[i] == '>':
+        close = i
+        break
+    if close < 0:
+      return false
+    tail = name[close + 1 .. ^1]
+  else:
+    for i in 0 ..< name.len:
+      if name[i] in {'+', '-', '.'} or name[i] in {'0' .. '9'}:
+        head = name[0 ..< i]
+        tail = name[i .. ^1]
+        break
+    if tail.len == 0:
+      # No offset part: only the pure tzdata links above are UTC.
+      return false
+  if not bracketed and head.len > 0 and head notin utcNames:
+    return false
+  isZeroOffsetSpec(tail)
 
 proc startupDateStyle*(val: string): string =
   ## The startup ``DateStyle`` for a caller's ``val`` (empty if none), which
@@ -1900,6 +1992,25 @@ func serverParams*(conn: PgConnection): lent Table[string, string] {.inline.} =
 func serverParam*(conn: PgConnection, name: string): string =
   ## One ``ParameterStatus`` value, or ``""`` when the server never sent it.
   conn.serverParams.getOrDefault(name, "")
+
+proc noteConnectTimeZone*(conn: PgConnection, followsServer: bool) {.inline.} =
+  ## Take the reported ``TimeZone`` as the one the pool restores, and how.
+  conn.connectTimeZone = conn.serverParam("TimeZone")
+  conn.timeZoneFollowsServer = followsServer
+
+func connectTimeZone*(conn: PgConnection): string {.inline.} =
+  conn.connectTimeZone
+
+func timeZoneFollowsServer*(conn: PgConnection): bool {.inline.} =
+  conn.timeZoneFollowsServer
+
+func timeZoneChanged*(conn: PgConnection): bool {.inline.} =
+  ## Whether ``TimeZone`` has moved to a zone a ``DateTime`` param would read
+  ## differently under. A UTC+0 spelling of the connect zone (``Etc/UTC`` for
+  ## ``UTC``) shifts nothing, so it counts as unchanged.
+  let zone = conn.serverParam("TimeZone")
+  zone != conn.connectTimeZone and
+    not (isUtcZoneName(zone) and isUtcZoneName(conn.connectTimeZone))
 
 func notifyDropped*(conn: PgConnection): int {.inline.} =
   ## Notifications dropped by pull-API queue overflow since the last

@@ -1,4 +1,4 @@
-import std/[random, unittest, os, tempfiles, strutils]
+import std/[random, unittest, os, tempfiles, strutils, options]
 when defined(posix):
   import std/posix
 
@@ -467,6 +467,17 @@ suite "parseDsn":
     # A trailing escape is dropped, leaving an empty argument when alone.
     check splitStartupOptions("-c x\\") == @["-c", "x"]
     check splitStartupOptions("-c \\") == @["-c", ""]
+
+  test "optionsTimeZone reads -c switches like the server":
+    check optionsTimeZone("-c TimeZone=Asia/Tokyo") == some("Asia/Tokyo")
+    check optionsTimeZone("-c work_mem=1MB --timezone=UTC") == some("UTC")
+    check optionsTimeZone("-cTIMEZONE=UTC") == some("UTC")
+    # The last switch wins, as on the server.
+    check optionsTimeZone("-c TimeZone=UTC -c TimeZone=Asia/Tokyo") == some(
+      "Asia/Tokyo"
+    )
+    for o in ["", "-c work_mem=1MB", "-c TimeZone", "-d TimeZone=UTC", "TimeZone=UTC"]:
+      check optionsTimeZone(o).isNone
 
   test "multiple query params":
     let cfg = parseDsn(

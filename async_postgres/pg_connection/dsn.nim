@@ -15,7 +15,7 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/strutils
+import std/[strutils, options]
 when defined(posix):
   import std/posix
 
@@ -482,10 +482,9 @@ proc splitStartupOptions(options: string): seq[string] =
   if inArg:
     result.add(cur)
 
-proc checkOptionsPinnedParams(options: string) =
-  ## Our startup ``client_encoding`` and ``DateStyle`` output style would
-  ## silently override a ``-c`` switch, so reject a conflicting one as if it
-  ## were given directly.
+iterator optionsSettings(options: string): tuple[name, value: string] =
+  ## The ``name=value`` settings of the ``-c`` and ``--`` switches in
+  ## ``options``, read like the server's getopt.
   const argOpts =
     {'B', 'C', 'c', 'D', 'd', 'f', 'h', 'k', 'N', 'p', 'r', 'S', 't', 'v', 'W', '-'}
     # postgres's getopt string
@@ -509,12 +508,25 @@ proc checkOptionsPinnedParams(options: string) =
         let eq = optArg.find('=')
         if eq >= 0:
           # ParseLongOption maps '-' to '_' in the name.
-          let name = optArg[0 ..< eq].replace('-', '_')
-          if isClientEncodingKey(name):
-            checkClientEncoding(optArg[eq + 1 .. ^1])
-          elif isDateStyleKey(name):
-            checkDateStyle(optArg[eq + 1 .. ^1])
+          yield (optArg[0 ..< eq].replace('-', '_'), optArg[eq + 1 .. ^1])
       break
+
+proc checkOptionsPinnedParams(options: string) =
+  ## Our startup ``client_encoding`` and ``DateStyle`` output style would
+  ## silently override a ``-c`` switch, so reject a conflicting one as if it
+  ## were given directly.
+  for (name, value) in optionsSettings(options):
+    if isGucName(name, "client_encoding"):
+      checkClientEncoding(value)
+    elif isGucName(name, "DateStyle"):
+      checkDateStyle(value)
+
+proc optionsTimeZone*(options: string): Option[string] =
+  ## The ``TimeZone`` value a ``-c`` switch in ``options`` sets, if any. The
+  ## last switch wins, as on the server.
+  for (name, value) in optionsSettings(options):
+    if isGucName(name, "TimeZone"):
+      result = some(value)
 
 proc applyParam(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
@@ -641,11 +653,11 @@ proc applyParam(result: var ConnConfig, key, val: string) =
         "max_scram_iterations must be non-negative (len=" & $val.len & ")",
       )
   else:
-    if isClientEncodingKey(key):
+    if isGucName(key, "client_encoding"):
       # Not kept: the startup message always sends UTF8.
       checkClientEncoding(val)
     else:
-      if isDateStyleKey(key):
+      if isGucName(key, "DateStyle"):
         checkDateStyle(val)
       elif key == "options":
         checkOptionsPinnedParams(val)
@@ -1056,9 +1068,9 @@ proc validateConnConfig*(config: var ConnConfig) =
   if config.maxScramIterations < 0:
     raise newException(PgConfigError, "max_scram_iterations must be non-negative")
   for (k, v) in config.extraParams:
-    if isClientEncodingKey(k):
+    if isGucName(k, "client_encoding"):
       checkClientEncoding(v)
-    elif isDateStyleKey(k):
+    elif isGucName(k, "DateStyle"):
       checkDateStyle(v)
     elif k == "options": # the server matches this key case-sensitively
       checkOptionsPinnedParams(v)
@@ -1145,6 +1157,7 @@ proc parseDsn*(dsn: string): ConnConfig =
   ## ``client_encoding`` is always UTF8: another value, directly or via ``-c``
   ## in ``options``, raises ``PgConfigError``. Likewise ``DateStyle`` always
   ## uses the ISO output style: only its field order (``DMY``, ...) may be set.
+  ## ``TimeZone`` is UTC unless set here; see ``ConnConfig.extraParams``.
   ##
   ## Security: the DSN is trusted configuration — unknown keys are forwarded
   ## as StartupMessage parameters, so a typo in a security-sensitive key (e.g.
