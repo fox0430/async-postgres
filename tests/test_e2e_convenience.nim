@@ -55,6 +55,25 @@ suite "E2E: Column Name Access":
 
     waitFor t()
 
+  test "fields iteration on PreparedStatement":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let stmt = await conn.prepare(
+        "fields_iter_stmt", "SELECT $1::int4 AS val, $2::text AS label"
+      )
+      var names: seq[string]
+      for f in stmt.fields:
+        names.add f.name
+      doAssert names == @["val", "label"]
+      var indexed: seq[(int, string)]
+      for i, f in stmt.fields:
+        indexed.add (i, f.name)
+      doAssert indexed == @[(0, "val"), (1, "label")]
+      await stmt.close()
+      await conn.close()
+
+    waitFor t()
+
   test "columnIndex raises for missing column":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
