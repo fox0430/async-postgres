@@ -1591,6 +1591,12 @@ suite "Replication: pgoutput proto_version defensive injection":
     check "(binary)" in q
     check "binary ''" notin q
 
+  test "double-quoted publication names reach the server inside the literal":
+    let q = runStartReplicationCapture(
+      "test_slot", @[("publication_names", "\"PubA\",\"PubB\"")]
+    )
+    check "publication_names '\"PubA\",\"PubB\"'" in q
+
   test "backslash in an option value stays literal (no E'' form)":
     # The walsender scanner has no E'' rule, so the value must keep its plain
     # single-quoted spelling even though `quoteLiteral` would switch forms.
