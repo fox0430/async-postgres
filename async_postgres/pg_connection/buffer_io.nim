@@ -79,17 +79,22 @@ proc unixSocketPath*(host: string, port: int): string =
 
 proc getHosts*(config: ConnConfig): seq[HostEntry] =
   ## Return the list of hosts to try. If `hosts` is populated, return it;
-  ## otherwise synthesize a single entry from `host`/`port`.
-  if config.hosts.len > 0:
-    config.hosts
-  else:
-    @[
-      HostEntry(
-        host: config.host,
-        hostaddr: config.hostaddr,
-        port: if config.port == 0: 5432 else: config.port,
-      )
-    ]
+  ## otherwise synthesize a single entry from `host`/`port`. Each `host` goes
+  ## through `effectiveHost`, so errors and traces show the name verified, not
+  ## a `127.0.0.1` default left behind by a later `hostaddr`.
+  result =
+    if config.hosts.len > 0:
+      config.hosts
+    else:
+      @[
+        HostEntry(
+          host: config.host,
+          hostaddr: config.hostaddr,
+          port: if config.port == 0: 5432 else: config.port,
+        )
+      ]
+  for entry in result.mitems:
+    entry.host = entry.effectiveHost
 
 # Dialing
 

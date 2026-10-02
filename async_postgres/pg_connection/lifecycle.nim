@@ -470,6 +470,8 @@ proc connectToHostImpl(
   let hostAddr = entry.dialAddr
   let hostPort = entry.port
   let isUnix = isUnixSocket(hostAddr)
+  # Here, not only in `getHosts`: `connectToHost` callers bypass it.
+  let sslHost = entry.effectiveHost
 
   var conn: PgConnection
 
@@ -500,7 +502,7 @@ proc connectToHostImpl(
       if not isUnix:
         configureTcpNoDelay(winlean.SocketHandle(transport.fd))
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(transport, dialed.target, entry.host)
+    conn.attachTransport(transport, dialed.target, sslHost)
   elif hasAsyncDispatch:
     let dialed = await dialing
     if reached != nil:
@@ -520,7 +522,7 @@ proc connectToHostImpl(
       if not isUnix:
         configureTcpNoDelay(winlean.SocketHandle(sock.getFd()))
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(sock, dialed.target, entry.host)
+    conn.attachTransport(sock, dialed.target, sslHost)
 
   var scramState: ScramState
   try:
@@ -534,7 +536,7 @@ proc connectToHostImpl(
       # cert is silently dropped — warn like the sslPrefer 'N' fallback path.
       warnStderr "pg_connection: client certificate will NOT be sent over Unix-socket connection (TLS is skipped for AF_UNIX)"
     if config.sslMode != sslDisable and not isUnix and allowLeg != alPlaintext:
-      await negotiateSSL(conn, config, entry.host)
+      await negotiateSSL(conn, config, sslHost)
 
     when hasChronos:
       # If SSL was not established, create plain streams
@@ -694,6 +696,8 @@ proc connectToHostImpl(
 
 proc connectToHost*(config: ConnConfig, entry: HostEntry): Future[PgConnection] =
   ## Connect to a single host (dial ``hostaddr`` else ``host``; verify via ``host``).
+  ## With a ``hostaddr``, a ``"127.0.0.1"`` ``host`` is not verified (see
+  ## ``effectiveHost``), so ``sslVerifyFull`` then needs a real name.
   ##
   ## Low-level dial primitive. Unlike ``connect`` it does **not** apply
   ## ``targetSessionAttrs``, ``connectTimeout`` or connect tracing, and it

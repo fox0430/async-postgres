@@ -727,6 +727,58 @@ suite "SSL negotiation - pre-TLS byte injection":
         check err.parent of PgSecurityError
         check err of PgSecurityError
 
+proc connectBeforeSsl(
+    config: ConnConfig, direct = false
+): tuple[err: ref CatchableError, sslRequestSeen: bool] =
+  ## Connect `config` to a mock server, which replaces its ports, for configs
+  ## expected to fail before any TLS I/O. `direct` dials via `connectToHost`
+  ## with an entry taken from the scalars as is, bypassing `getHosts`.
+  var err: ref CatchableError
+  var sslRequestSeen = false
+
+  proc testBody() {.async.} =
+    let ms = startMockServer()
+
+    proc serverHandler() {.async.} =
+      try:
+        let st = await ms.accept()
+        try:
+          discard await readN(st, 8)
+          sslRequestSeen = true
+        except CatchableError:
+          discard
+        await closeClient(st)
+      except CatchableError:
+        discard
+
+    let serverFut = serverHandler()
+
+    var cfg = config
+    cfg.port = ms.port
+    for entry in cfg.hosts.mitems:
+      entry.port = ms.port
+    try:
+      let fut =
+        if direct:
+          connectToHost(
+            cfg, HostEntry(host: cfg.host, hostaddr: cfg.hostaddr, port: cfg.port)
+          )
+        else:
+          connect(cfg)
+      let conn = await fut
+      await conn.close()
+    except CatchableError as e:
+      err = e
+
+    await closeServer(ms)
+    try:
+      await serverFut
+    except CatchableError:
+      discard
+
+  waitFor testBody()
+  (err, sslRequestSeen)
+
 suite "SSL negotiation - sslVerifyCa":
   test "sslVerifyCa raises PgError when server responds N":
     var raised = false
@@ -768,99 +820,83 @@ suite "SSL negotiation - sslVerifyCa":
 
   test "sslVerifyCa without sslRootCert fails closed before I/O":
     # Web PKI fallback would let any publicly-issued cert MITM (no hostname check).
-    var raised = false
-    var msgMatches = false
-    var sslRequestSeen = false
-
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-
-      proc serverHandler() {.async.} =
-        try:
-          let st = await ms.accept()
-          try:
-            discard await readN(st, 8)
-            sslRequestSeen = true
-          except CatchableError:
-            discard
-          await closeClient(st)
-        except CatchableError:
-          discard
-
-      let serverFut = serverHandler()
-
-      let config = ConnConfig(
-        host: "127.0.0.1",
-        port: ms.port,
-        user: "test",
-        database: "test",
-        sslMode: sslVerifyCa,
+    let (err, sslRequestSeen) = connectBeforeSsl(
+      ConnConfig(
+        host: "127.0.0.1", user: "test", database: "test", sslMode: sslVerifyCa
       )
-
-      try:
-        let conn = await connect(config)
-        await conn.close()
-      except PgError as e:
-        raised = true
-        msgMatches = "sslrootcert" in e.msg
-
-      await closeServer(ms)
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-
-    waitFor testBody()
-    check raised
-    check msgMatches
+    )
+    require err != nil
+    check "sslrootcert" in err.msg
     check not sslRequestSeen
 
   test "sslVerifyFull without sslRootCert fails closed before I/O":
-    var raised = false
-    var msgMatches = false
-    var sslRequestSeen = false
+    let (err, sslRequestSeen) = connectBeforeSsl(
+      ConnConfig(
+        host: "127.0.0.1", user: "test", database: "test", sslMode: sslVerifyFull
+      )
+    )
+    require err != nil
+    check "sslrootcert" in err.msg
+    check not sslRequestSeen
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
+  test "sslVerifyFull with only a hostaddr from initConnConfig has no name to verify":
+    # The certificate must not be checked against the 127.0.0.1 default while
+    # another address is dialed.
+    let (err, sslRequestSeen) = connectBeforeSsl(
+      initConnConfig(
+        hostaddr = "127.0.0.1",
+        user = "test",
+        database = "test",
+        sslMode = sslVerifyFull,
+        sslRootCert = testCaCert(),
+      )
+    )
+    require err != nil
+    check err of PgSecurityError
+    check "host name must be specified" in err.msg
+    check not sslRequestSeen
 
-      proc serverHandler() {.async.} =
-        try:
-          let st = await ms.accept()
-          try:
-            discard await readN(st, 8)
-            sslRequestSeen = true
-          except CatchableError:
-            discard
-          await closeClient(st)
-        except CatchableError:
-          discard
+  test "sslVerifyFull with a hostaddr assigned to a defaulted config has no name to verify":
+    var cfg = initConnConfig(
+      user = "test",
+      database = "test",
+      sslMode = sslVerifyFull,
+      sslRootCert = testCaCert(),
+    )
+    cfg.hostaddr = "127.0.0.1"
+    let (err, sslRequestSeen) = connectBeforeSsl(cfg)
+    require err != nil
+    check err of PgSecurityError
+    check "host name must be specified" in err.msg
+    check not sslRequestSeen
 
-      let serverFut = serverHandler()
+  test "sslVerifyFull with a hostaddr assigned to a defaulted DSN host has no name to verify":
+    var cfg = parseDsn("user=test dbname=test")
+    cfg.sslMode = sslVerifyFull
+    cfg.sslRootCert = testCaCert()
+    cfg.hosts[0].hostaddr = "127.0.0.1"
+    let (err, sslRequestSeen) = connectBeforeSsl(cfg)
+    require err != nil
+    check err of PgSecurityError
+    check "host name must be specified" in err.msg
+    check not sslRequestSeen
 
-      let config = ConnConfig(
+  test "sslVerifyFull via connectToHost does not verify an explicit 127.0.0.1 with a hostaddr":
+    # Stricter than libpq: an explicit 127.0.0.1 looks the same as the default.
+    let (err, sslRequestSeen) = connectBeforeSsl(
+      ConnConfig(
         host: "127.0.0.1",
-        port: ms.port,
+        hostaddr: "127.0.0.1",
         user: "test",
         database: "test",
         sslMode: sslVerifyFull,
-      )
-
-      try:
-        let conn = await connect(config)
-        await conn.close()
-      except PgError as e:
-        raised = true
-        msgMatches = "sslrootcert" in e.msg
-
-      await closeServer(ms)
-      try:
-        await serverFut
-      except CatchableError:
-        discard
-
-    waitFor testBody()
-    check raised
-    check msgMatches
+        sslRootCert: testCaCert(),
+      ),
+      direct = true,
+    )
+    require err != nil
+    check err of PgSecurityError
+    check "host name must be specified" in err.msg
     check not sslRequestSeen
 
   test "sslAllow ordinal is between sslDisable and sslPrefer":
@@ -1010,6 +1046,35 @@ suite "initConnConfig numeric and hostaddr validation":
     let cfg = initConnConfig(host = "", hostaddr = "10.0.0.1")
     check cfg.hosts.len == 0
     check getHosts(cfg)[0].dialAddr == "10.0.0.1"
+
+  test "the default host is not verified when a hostaddr is given":
+    # Same as a DSN with only hostaddr: no name to verify the certificate
+    # against, rather than the 127.0.0.1 default.
+    let cfg = initConnConfig(hostaddr = "10.0.0.1")
+    check getHosts(cfg)[0].host == ""
+    check getHosts(cfg)[0].dialAddr == "10.0.0.1"
+    check getHosts(cfg)[0].displayHost == "10.0.0.1"
+
+  test "omitted host still defaults to 127.0.0.1 without a hostaddr":
+    let cfg = initConnConfig()
+    check cfg.host == "127.0.0.1"
+    check getHosts(cfg)[0].dialAddr == "127.0.0.1"
+
+  test "a named host paired with a hostaddr is kept":
+    let cfg = initConnConfig(host = "db.example", hostaddr = "10.0.0.1")
+    check cfg.host == "db.example"
+    check getHosts(cfg)[0].dialAddr == "10.0.0.1"
+
+  test "an explicit 127.0.0.1 paired with a hostaddr is not verified either":
+    # Stricter than libpq: it looks the same as the default.
+    let cfg = initConnConfig(host = "127.0.0.1", hostaddr = "127.0.0.1")
+    check getHosts(cfg)[0].host == ""
+
+  test "clearing the hostaddr falls back to the default host":
+    var cfg = initConnConfig(hostaddr = "10.0.0.1")
+    cfg.hostaddr = ""
+    validateConnConfig(cfg)
+    check getHosts(cfg)[0].dialAddr == "127.0.0.1"
 
 suite "Client certificate config validation":
   # `connect()` now validates cert/key pairing before dialing, so these tests

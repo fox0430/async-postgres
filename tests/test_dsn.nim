@@ -1138,6 +1138,17 @@ suite "parseDsn":
     let hosts = cfg.getHosts()
     check hosts[0].port == 5432
 
+  test "getHosts drops a 127.0.0.1 host once a hostaddr is assigned":
+    let want = @[HostEntry(host: "", hostaddr: "10.0.0.1", port: 5432)]
+    var scalar = initConnConfig()
+    scalar.hostaddr = "10.0.0.1"
+    check scalar.getHosts() == want
+    var listed = parseDsn("dbname=db")
+    listed.hosts[0].hostaddr = "10.0.0.1"
+    check listed.getHosts() == want
+    let named = ConnConfig(host: "db.example.com", hostaddr: "10.0.0.1", port: 5432)
+    check named.getHosts()[0].host == "db.example.com"
+
   test "multi-host with target_session_attrs":
     let cfg = parseDsn("postgresql://h1,h2,h3/db?target_session_attrs=read-write")
     check cfg.hosts.len == 3

@@ -142,7 +142,9 @@ type
     lbhRandom ## Shuffle host list per connection (replica spread)
 
   HostEntry* = object ## A single host:port entry for multi-host connection.
-    host*: string ## Host name (or Unix socket dir); used for SSL verification
+    host*: string
+      ## Host name (or Unix socket dir); used for SSL verification, except
+      ## `127.0.0.1` alongside a `hostaddr` (see `effectiveHost`).
     hostaddr*: string
       ## Address dialed instead of resolving `host` (libpq `hostaddr`).
       ## Empty = resolve `host`.
@@ -154,7 +156,8 @@ type
     port*: int # default 5432
     hostaddr*: string
       ## Address dialed instead of resolving `host` (libpq `hostaddr`).
-      ## `host` is still the name used for SSL certificate verification.
+      ## `host` is still the name used for SSL certificate verification,
+      ## except `127.0.0.1` (see `effectiveHost`).
     user*: string
     password*: string
       ## Cleartext password (libpq ``password``), held in plaintext in memory.
@@ -793,6 +796,14 @@ proc validateTlsConfig*(
     )
 
 # HostEntry accessors
+
+const DefaultHost* = "127.0.0.1" ## Target when neither host nor hostaddr is given.
+
+func effectiveHost*(entry: HostEntry): string {.inline.} =
+  ## `host` as the name to verify. With a `hostaddr`, `127.0.0.1` is dropped:
+  ## it may be the default left behind when `hostaddr` is set later, and an
+  ## explicit one looks the same.
+  if entry.hostaddr.len > 0 and entry.host == DefaultHost: "" else: entry.host
 
 func dialAddr*(entry: HostEntry): string {.inline.} =
   ## The address actually dialed: `hostaddr` when given, otherwise `host`.

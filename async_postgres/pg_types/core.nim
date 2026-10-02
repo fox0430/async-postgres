@@ -76,7 +76,9 @@ type
     microsecond*: int32 ## 0..999999
     utcOffset*: int32
       ## UTC offset in seconds (positive = east of UTC). PostgreSQL accepts
-      ## ±15:59:59; see `checkPgTimeTzOffset`.
+      ## ±15:59:59 (see `checkPgTimeTzOffset`), but a decoded value can carry
+      ## more: a session zone prints up to +169h, and ``AT TIME ZONE`` an
+      ## interval stores any offset.
 
   PgInet* = object ## PostgreSQL inet type: an IP address with a subnet mask.
     address*: IpAddress
@@ -593,11 +595,11 @@ const pgTzDispLimit* = 16 * 3600
   ## inclusive maximum is ±15:59:59.
 
 proc checkPgTimeTzOffset*(utcOffset: int32) {.raises: [PgTypeError].} =
-  ## Owner of the PostgreSQL ``timetz`` displacement bound. Encode entry
-  ## points and the binary decoder pre-flight through here, and the text
-  ## parser derives its hour bound from ``pgTzDispLimit``. The range is
-  ## symmetric, so the same check applies to the wire seconds-west value and
-  ## this library's seconds-east ``utcOffset``.
+  ## Owner of the PostgreSQL ``timetz`` input displacement bound, which encode
+  ## entry points pre-flight through. Decoders accept wider offsets, since the
+  ## server prints and sends them. The range is symmetric, so the same check
+  ## applies to the wire seconds-west value and this library's seconds-east
+  ## ``utcOffset``.
   if utcOffset <= -pgTzDispLimit or utcOffset >= pgTzDispLimit:
     raise
       newException(PgTypeError, "timetz zone displacement out of range: " & $utcOffset)

@@ -723,7 +723,8 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     return
   else:
     if config.sslMode == sslVerifyFull and sslHost.len == 0:
-      # hostaddr without host leaves no name to match (as in libpq). A per-host
+      # hostaddr without host leaves no name to match (as in libpq), and so
+      # does hostaddr with 127.0.0.1 (see `effectiveHost`). A per-host
       # error, not PgConfigError, so it folds into the per-host aggregate.
       raise newException(
         PgSecurityError, "A host name must be specified for a verified SSL connection"

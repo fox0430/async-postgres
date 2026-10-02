@@ -218,7 +218,7 @@ proc buildHosts(
       else:
         ports[i]
     result.add HostEntry(
-      host: if h.len == 0 and a.len == 0 and not explicit: "127.0.0.1" else: h,
+      host: if h.len == 0 and a.len == 0 and not explicit: DefaultHost else: h,
       hostaddr: a,
       port:
         if p.len == 0:
@@ -387,7 +387,7 @@ proc rawHost(host, hostaddr: string): string =
   ## An explicit `host=127.0.0.1` is structurally indistinguishable from the
   ## implicit default, but re-defaults to the same value on rebuild —
   ## functionally correct for the round-trip.
-  if host == "127.0.0.1" and hostaddr.len == 0: "" else: host
+  if host == DefaultHost and hostaddr.len == 0: "" else: host
 
 proc rawHostLists(
     c: ConnConfig
@@ -1076,7 +1076,7 @@ proc validateConnConfig*(config: var ConnConfig) =
       checkOptionsPinnedParams(v)
 
 proc initConnConfig*(
-    host = "127.0.0.1",
+    host = DefaultHost,
     port = 5432,
     hostaddr = "",
     user = "",
