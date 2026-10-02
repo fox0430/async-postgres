@@ -25,7 +25,7 @@ when hasChronos:
       backing*: seq[seq[byte]] ## Owns memory pointed to by trust anchor fields
 
   proc appendDnCallback(
-      ctx: pointer, buf: pointer, len: csize_t
+      ctx: pointer, buf: ConstPointer, len: csize_t
   ) {.cdecl, gcsafe, noSideEffect, raises: [].} =
     ## DN accumulation callback
     let s = cast[ptr seq[byte]](ctx)
@@ -35,6 +35,18 @@ when hasChronos:
       return
     for i in 0 ..< int(len):
       s[].add(p[i])
+
+  # Bound directly: `x509DecoderInit` takes a `void*` buf through bearssl 0.2.13
+  # but `const void*` after nim-bearssl#116; gcc 14+/clang reject the mismatch.
+  proc brX509DecoderInit(
+    ctx: var X509DecoderContext,
+    appendDn: proc(ctx: pointer, buf: ConstPointer, len: csize_t) {.
+      cdecl, gcsafe, noSideEffect, raises: []
+    .},
+    appendDnCtx: pointer,
+  ) {.
+    importc: "br_x509_decoder_init", header: "bearssl_x509.h", cdecl, gcsafe, raises: []
+  .}
 
   # X509 certificate capture callbacks
   # Intercepts BearSSL X509 callbacks to capture the leaf certificate DER bytes,
@@ -288,7 +300,7 @@ when hasChronos:
       for der in certificateDers(blocks, trusted = false):
         var dnBuf: seq[byte]
         var decoder: X509DecoderContext
-        x509DecoderInit(decoder, appendDnCallback, addr dnBuf)
+        brX509DecoderInit(decoder, appendDnCallback, addr dnBuf)
         x509DecoderPush(decoder, addr der[0], uint(der.len))
 
         if x509DecoderLastError(decoder) != 0:
