@@ -290,6 +290,33 @@ suite "initPoolConfig":
         connectBackoffMax = seconds(1),
       )
 
+  test "poolConfig returns the config in effect as a copy":
+    var maxSize, maxSizeAfterEdit = -1
+    var maintenanceInterval = ZeroDuration
+
+    proc testBody() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(
+          ConnConfig(host: "127.0.0.1", port: 1),
+          minSize = 0,
+          maxSize = 3,
+          maintenanceInterval = ZeroDuration,
+        )
+      )
+      try:
+        var cfg = pool.poolConfig
+        maxSize = cfg.maxSize
+        maintenanceInterval = cfg.maintenanceInterval
+        cfg.maxSize = 7
+        maxSizeAfterEdit = pool.poolConfig.maxSize
+      finally:
+        await pool.close()
+
+    waitFor testBody()
+    check maxSize == 3
+    check maintenanceInterval == seconds(30)
+    check maxSizeAfterEdit == 3
+
 suite "computeConnectBackoff":
   test "zero failures returns ZeroDuration":
     check computeConnectBackoff(seconds(1), seconds(60), 0) == ZeroDuration
@@ -1005,6 +1032,18 @@ suite "Pool acquire":
     pool.release(conn)
     let acquired = waitFor acquireFut
     check acquired == conn
+
+  test "pendingAcquires counts acquires queued for a connection":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+    check pool.pendingAcquires == 0
+
+    let acquireFut = pool.acquire()
+    check pool.pendingAcquires == 1
+
+    pool.release(mockConn())
+    discard waitFor acquireFut
+    check pool.pendingAcquires == 0
 
 suite "Pool acquireHandle":
   test "acquireHandle returns handle pairing conn with its pool":

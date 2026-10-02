@@ -278,7 +278,8 @@ proc initPoolConfig*(
   cfg
 
 proc poolConfig*(pool: PgPool): PoolConfig =
-  ## The pool configuration.
+  ## The configuration in effect, as a copy: editing it does not reconfigure
+  ## the pool. A zero `maintenanceInterval` reads back as the 30 s default.
   pool.config
 
 proc idleCount*(pool: PgPool): int =

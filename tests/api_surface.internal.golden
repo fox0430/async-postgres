@@ -377,8 +377,6 @@ async_postgres/pg_connection/types.nim	writer
 async_postgres/pg_errors.nim	newStartupError
 async_postgres/pg_errors.nim	setPerHost
 async_postgres/pg_pool.nim	buildReleaseAndReraise
-async_postgres/pg_pool.nim	pendingAcquires
-async_postgres/pg_pool.nim	poolConfig
 async_postgres/pg_pool.nim	releaseReclaimed
 async_postgres/pg_protocol.nim	addBindPayload
 async_postgres/pg_protocol.nim	addInt64
