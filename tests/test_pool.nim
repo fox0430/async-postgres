@@ -732,6 +732,215 @@ suite "Pool resetSession":
     waitFor pool.resetSession(conn)
     check conn.state == csReady # unchanged, not closed
 
+  test "resetSession sets TimeZone back after a resetQuery that moves it":
+    proc t(
+        startZone, resetZone: string, borrowerSet = ""
+    ): Future[(seq[string], bool)] {.async.} =
+      ## Queries after startup and whether TimeZone still differs from connect;
+      ## DISCARD ALL reports `resetZone`, as PgBouncer does for the server
+      ## connection's own zone. An empty `startZone` reports none at startup.
+      ## A non-empty `borrowerSet` runs first and reports UTC.
+      let ms = startMockServer()
+      var queries: seq[string]
+      proc serverHandler() {.async.} =
+        let params =
+          if startZone.len > 0:
+            @[("TimeZone", startZone)]
+          else:
+            @[]
+        let st = await acceptAndReady(ms, params = params)
+        try:
+          while true:
+            let (msgType, body) = await drainFrontendMessage(st)
+            if msgType != 'Q':
+              break
+            let sql = queryText(body)
+            queries.add(sql)
+            var resp: seq[byte]
+            if sql == "DISCARD ALL":
+              resp.add(buildParameterStatus("TimeZone", resetZone))
+              resp.add(buildCommandComplete("DISCARD ALL"))
+            else:
+              resp.add(buildParameterStatus("TimeZone", "UTC"))
+              resp.add(buildCommandComplete("SET"))
+            resp.add(buildReadyForQuery('I'))
+            await sendBytes(st, resp)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let pool = makePool()
+      pool.config.resetQuery = "DISCARD ALL"
+      let conn = await connect(
+        ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslDisable,
+        )
+      )
+      if borrowerSet.len > 0:
+        discard await conn.simpleExec(borrowerSet)
+      await pool.resetSession(conn)
+      doAssert conn.state == csReady
+      let changed = conn.timeZoneChanged
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+      return (queries, changed)
+
+    # RESET would land on Asia/Tokyo again.
+    check waitFor(t("UTC", "Asia/Tokyo")) ==
+      (@["DISCARD ALL", "SET TimeZone TO 'UTC'"], false)
+    # Direct to the server, DISCARD ALL already restores the startup zone.
+    check waitFor(t("UTC", "UTC")) == (@["DISCARD ALL"], false)
+    # No startup zone to set back to: no SET TimeZone TO '', and release
+    # discards the conn.
+    check waitFor(t("", "Asia/Tokyo")) == (@["DISCARD ALL"], true)
+    # Moved by the borrower with no startup zone: the conn is discarded either
+    # way, so no reset round trip either.
+    let moved = "SET TimeZone TO 'UTC'"
+    check waitFor(t("", "Asia/Tokyo", moved)) == (@[moved], true)
+
+  test "resetSessionAndRelease reports leaked locks once when TimeZone cannot be set back":
+    var leaks = 0
+    let pool = makePool()
+    let tracer = PgTracer()
+    tracer.onLeakedSessionLocks = proc(
+        data: TraceLeakedSessionLocksData
+    ) {.gcsafe, raises: [].} =
+      inc leaks
+    pool.config.tracer = tracer
+    pool.config.resetQuery = "DISCARD ALL"
+    pool.active = 1
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
+    conn.heldSessionLocks = 1
+    conn.sessionLockDirty = true
+    # Moved with none reported at connect: resetSession skips the wire.
+    conn.serverParams["TimeZone"] = "Asia/Tokyo"
+    waitFor pool.resetSessionAndRelease(conn)
+    check leaks == 1
+    check pool.active == 0
+    check pool.idle.len == 0
+
+  test "resetSession RESETs TimeZone when it came from the server":
+    proc t(
+        movedZone, resetZone: string
+    ): Future[(seq[string], string, bool)] {.async.} =
+      ## A TimeZone=DEFAULT session starting in Asia/Tokyo. The first query
+      ## reports `movedZone`; RESET reports `resetZone`, or nothing if empty.
+      let ms = startMockServer()
+      var queries: seq[string]
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms, params = @[("TimeZone", "Asia/Tokyo")])
+        try:
+          while true:
+            let (msgType, body) = await drainFrontendMessage(st)
+            if msgType != 'Q':
+              break
+            let sql = queryText(body)
+            queries.add(sql)
+            var resp: seq[byte]
+            if sql == "RESET TimeZone":
+              if resetZone.len > 0:
+                resp.add(buildParameterStatus("TimeZone", resetZone))
+              resp.add(buildCommandComplete("RESET"))
+            else:
+              resp.add(buildParameterStatus("TimeZone", movedZone))
+              resp.add(buildCommandComplete("SET"))
+            resp.add(buildReadyForQuery('I'))
+            await sendBytes(st, resp)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let pool = makePool()
+      let conn = await connect(
+        ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslDisable,
+          extraParams: @[("TimeZone", "DEFAULT")],
+        )
+      )
+      discard await conn.simpleExec("SET TimeZone TO 'America/New_York'")
+      await pool.resetSession(conn)
+      doAssert conn.state == csReady
+      let res = (queries, conn.connectTimeZone, conn.timeZoneChanged)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+      return res
+
+    # A borrower's SET goes back to the server's zone.
+    check waitFor(t("America/New_York", "Asia/Tokyo")) ==
+      (@["SET TimeZone TO 'America/New_York'", "RESET TimeZone"], "Asia/Tokyo", false)
+    # The RESET lands on another zone: keep what the server reports rather than
+    # pinning the connect zone.
+    check waitFor(t("Europe/Berlin", "")) == (
+      @["SET TimeZone TO 'America/New_York'", "RESET TimeZone"], "Europe/Berlin", false
+    )
+
+  test "an offset-identical TimeZone spelling costs no round trip and no conn":
+    proc t(connectZone, movedZone: string): Future[(seq[string], bool)] {.async.} =
+      ## Queries the server saw, then whether TimeZone counts as changed.
+      let ms = startMockServer()
+      var queries: seq[string]
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms, params = @[("TimeZone", connectZone)])
+        try:
+          while true:
+            let (msgType, body) = await drainFrontendMessage(st)
+            if msgType != 'Q':
+              break
+            queries.add(queryText(body))
+            var resp = buildParameterStatus("TimeZone", movedZone)
+            resp.add(buildCommandComplete("SET"))
+            resp.add(buildReadyForQuery('I'))
+            await sendBytes(st, resp)
+        except CatchableError:
+          discard
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let pool = makePool()
+      let conn = await connect(
+        ConnConfig(
+          host: "127.0.0.1",
+          port: ms.port,
+          user: "test",
+          database: "test",
+          sslMode: sslDisable,
+        )
+      )
+      discard await conn.simpleExec("SET TimeZone TO '" & movedZone & "'")
+      doAssert conn.serverParam("TimeZone") == movedZone
+      await pool.resetSession(conn)
+      doAssert conn.state == csReady
+      let res = (queries, conn.timeZoneChanged)
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+      return res
+
+    # A zero offset shifts no DateTime param, so no SET TimeZone is spent on
+    # the difference between two UTC+0 spellings.
+    check waitFor(t("UTC", "Etc/UTC")) == (@["SET TimeZone TO 'Etc/UTC'"], false)
+    check waitFor(t("Etc/UTC", "UTC")) == (@["SET TimeZone TO 'UTC'"], false)
+    check waitFor(t("UTC", "GMT+0")) == (@["SET TimeZone TO 'GMT+0'"], false)
+    check waitFor(t("UTC", "UTC0")) == (@["SET TimeZone TO 'UTC0'"], false)
+    check waitFor(t("UTC", "+00")) == (@["SET TimeZone TO '+00'"], false)
+    check waitFor(t("UTC", "<+00>-00")) == (@["SET TimeZone TO '<+00>-00'"], false)
+    # A real move still costs the restore.
+    check waitFor(t("UTC", "Asia/Tokyo")) ==
+      (@["SET TimeZone TO 'Asia/Tokyo'", "SET TimeZone TO 'UTC'"], true)
+
   test "resetQuery field in initPoolConfig":
     let cfg = initPoolConfig(
       ConnConfig(host: "localhost", port: 5432), resetQuery = "DISCARD ALL"

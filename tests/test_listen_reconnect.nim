@@ -161,6 +161,41 @@ suite "reconnectInPlace serverParams pairing":
     check finalStaleGone
     check finalBytesExact
 
+  test "connectTimeZone follows the fresh connection":
+    ## A connect zone left at the old session's makes the new one look changed,
+    ## so pool release would discard the conn or SET it to the old zone.
+    var finalZoneIsNew = false
+    var finalChanged = true
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc1, sc2: MockClient
+      proc serverHandler() {.async.} =
+        # A failover target whose default zone differs, as with TimeZone=DEFAULT.
+        sc1 = await acceptAndReady(ms, params = @[("TimeZone", "Asia/Tokyo")])
+        sc2 = await acceptAndReady(ms, params = @[("TimeZone", "UTC")])
+
+      let serverFut = serverHandler()
+      var cfg = mockConfig(ms.port)
+      cfg.extraParams = @[("TimeZone", "DEFAULT")]
+      let conn = await connect(cfg)
+      await conn.reconnectInPlace()
+      finalZoneIsNew = conn.connectTimeZone == "UTC"
+      finalChanged = conn.timeZoneChanged
+
+      await serverFut
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await closeClient(sc1)
+      await closeClient(sc2)
+      await closeServer(ms)
+
+    waitFor testBody()
+    check finalZoneIsNew
+    check not finalChanged
+
 ## Regression target (M-7): when multi-host failover reconnects to a *different*
 ## host, `reconnectInPlace` must copy `newConn.host`/`newConn.port` too — not just
 ## `pid`/`secretKey`. `cancel()` dials `conn.host`/`conn.port` with the (updated)

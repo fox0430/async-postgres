@@ -1,8 +1,11 @@
 import std/[unittest, options, importutils, deques]
+from std/times import dateTime, mJan, utc
 
 import
   ../async_postgres/
     [async_backend, pg_types, pg_client, pg_pool, pg_connection, pg_advisory_lock]
+
+from ../async_postgres/pg_connection/types import timeZoneChanged
 
 import e2e_common
 
@@ -275,6 +278,128 @@ suite "E2E: resetQuery timeout":
       # Re-acquire the same conn (minSize=0, maxSize=1) and verify unlock ran.
       pool.withConnection(conn2):
         doAssert conn2.heldSessionLocks == 0
+
+    waitFor t()
+
+suite "E2E: Pool TimeZone":
+  test "a TimeZone one borrower SETs is reset before the next":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 1))
+      defer:
+        await pool.close()
+
+      let closeBefore = pool.metrics.closeCount
+      pool.withConnection(conn):
+        discard await conn.simpleQuery(
+          "BEGIN; SET LOCAL TimeZone = 'America/New_York'; COMMIT"
+        )
+        doAssert not conn.timeZoneChanged
+        discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
+        doAssert conn.timeZoneChanged
+      # Reset in place rather than discarded.
+      doAssert pool.idleCount == 1
+      doAssert pool.metrics.closeCount == closeBefore
+      pool.withConnection(conn2):
+        doAssert conn2.serverParam("TimeZone") == "UTC"
+        let res = await conn2.query(
+          "SELECT $1::timestamptz = '2024-01-01 01:00:00Z'",
+          @[toPgParam(dateTime(2024, mJan, 1, 1, 0, 0, 0, utc()))],
+        )
+        doAssert res.rows[0].getBool(0)
+
+    waitFor t()
+
+  test "an offset-identical zone spelling costs no connection":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 1))
+      defer:
+        await pool.close()
+
+      let closeBefore = pool.metrics.closeCount
+      pool.withConnection(conn):
+        discard await conn.simpleQuery("SET TimeZone = 'Etc/UTC'")
+        doAssert not conn.timeZoneChanged
+      # Reset in place rather than discarded: a zero offset shifts no DateTime
+      # param, so the spelling difference costs no round trip either.
+      doAssert pool.idleCount == 1
+      doAssert pool.metrics.closeCount == closeBefore
+      # A release that skips resetSession keeps it for the same reason.
+      let borrowed = await pool.acquire()
+      discard await borrowed.simpleQuery("SET TimeZone = 'Etc/UTC'")
+      borrowed.release()
+      doAssert pool.idleCount == 1
+      doAssert pool.metrics.closeCount == closeBefore
+      pool.withConnection(conn2):
+        doAssert conn2.serverParam("TimeZone") == "Etc/UTC"
+        let res = await conn2.query(
+          "SELECT $1::timestamptz = '2024-01-01 01:00:00Z'",
+          @[toPgParam(dateTime(2024, mJan, 1, 1, 0, 0, 0, utc()))],
+        )
+        doAssert res.rows[0].getBool(0)
+
+    waitFor t()
+
+  test "a resetQuery that moves TimeZone does not cost the connection":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.extraParams = @[("TimeZone", "Asia/Tokyo")]
+      let pool = await newPool(
+        initPoolConfig(
+          cfg,
+          minSize = 0,
+          maxSize = 1,
+          resetQuery = "SET TimeZone = 'America/New_York'",
+        )
+      )
+      defer:
+        await pool.close()
+
+      let closeBefore = pool.metrics.closeCount
+      pool.withConnection(conn):
+        discard await conn.simpleQuery("SELECT 1")
+      doAssert pool.idleCount == 1
+      doAssert pool.metrics.closeCount == closeBefore
+      pool.withConnection(conn2):
+        doAssert conn2.serverParam("TimeZone") == "Asia/Tokyo"
+
+    waitFor t()
+
+  test "a TimeZone=DEFAULT session is RESET to the server's zone":
+    proc t() {.async.} =
+      var cfg = plainConfig()
+      cfg.extraParams = @[("TimeZone", "DEFAULT")]
+      let pool = await newPool(initPoolConfig(cfg, minSize = 0, maxSize = 1))
+      defer:
+        await pool.close()
+
+      let closeBefore = pool.metrics.closeCount
+      var serverZone: string
+      pool.withConnection(conn):
+        serverZone = conn.serverParam("TimeZone")
+        doAssert serverZone.len > 0
+        discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
+        doAssert conn.timeZoneChanged
+      doAssert pool.idleCount == 1
+      doAssert pool.metrics.closeCount == closeBefore
+      pool.withConnection(conn2):
+        doAssert conn2.serverParam("TimeZone") == serverZone
+        let res = await conn2.simpleQuery("SHOW TimeZone")
+        doAssert res[0].rows[0][0].get().toString() == serverZone
+
+    waitFor t()
+
+  test "a release that skips resetSession discards a changed TimeZone":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 1))
+      defer:
+        await pool.close()
+
+      let closeBefore = pool.metrics.closeCount
+      let conn = await pool.acquire()
+      discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
+      conn.release()
+      doAssert pool.idleCount == 0
+      doAssert pool.metrics.closeCount - closeBefore == 1
 
     waitFor t()
 

@@ -6,6 +6,23 @@ import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
 
+template withProbeRole(role, setting: string, body: untyped) =
+  ## Runs ``body`` with ``cfg`` logging in as ``role``, whose session default is
+  ## ``setting``. Drops the role after ``body``'s own deferred closes.
+  let admin = await connect(plainConfig())
+  defer:
+    await admin.close()
+  discard await admin.simpleQuery("DROP ROLE IF EXISTS " & role)
+  discard await admin.simpleQuery(
+    "CREATE ROLE " & role & " LOGIN PASSWORD 'p'; ALTER ROLE " & role & " SET " & setting
+  )
+  defer:
+    discard await admin.simpleQuery("DROP ROLE " & role)
+  var cfg {.inject.} = plainConfig()
+  cfg.user = role
+  cfg.password = "p"
+  body
+
 suite "E2E: Basic Connection":
   test "plain connection and close":
     proc t() {.async.} =
@@ -93,19 +110,11 @@ suite "E2E: ConnConfig Options":
 
   test "DateStyle is ISO from startup, so RESET and DISCARD ALL keep it":
     proc t() {.async.} =
-      const role = "async_pg_datestyle_probe"
-      let admin = await connect(plainConfig())
-      discard await admin.simpleQuery("DROP ROLE IF EXISTS " & role)
-      discard await admin.simpleQuery(
-        "CREATE ROLE " & role & " LOGIN PASSWORD 'p'; " & "ALTER ROLE " & role &
-          " SET DateStyle = 'SQL, YMD'"
-      )
-      try:
-        var cfg = plainConfig()
-        cfg.user = role
-        cfg.password = "p"
+      withProbeRole("async_pg_datestyle_probe", "DateStyle = 'SQL, YMD'"):
         # The startup value overrides the role's, field order included.
         let conn = await connect(cfg)
+        defer:
+          await conn.close()
         let style = conn.serverParam("DateStyle")
         doAssert style.startsWith("ISO, ") and style != "ISO, YMD", style
         for sql in [
@@ -119,20 +128,17 @@ suite "E2E: ConnConfig Options":
         )
         doAssert res.rows[0].getTimestamp(0) ==
           dateTime(2024, mJan, 15, 10, 0, 0, 0, utc())
-        await conn.close()
         # A field order from the caller joins the ISO style, and RESET keeps it.
         cfg.extraParams = @[("DateStyle", "DMY")]
         let explicit = await connect(cfg)
+        defer:
+          await explicit.close()
         doAssert explicit.serverParam("DateStyle") == "ISO, DMY"
         discard await explicit.simpleQuery("RESET ALL")
         doAssert explicit.serverParam("DateStyle") == "ISO, DMY"
         let dmy =
           await explicit.query("SELECT '01/02/2026'::date", resultFormat = rfText)
         doAssert dmy.rows[0].getDate(0) == dateTime(2026, mFeb, 1, 0, 0, 0, 0, utc())
-        await explicit.close()
-      finally:
-        discard await admin.simpleQuery("DROP ROLE " & role)
-        await admin.close()
 
     waitFor t()
 
@@ -152,6 +158,60 @@ suite "E2E: ConnConfig Options":
       doAssert raised
       doAssert conn.state == csClosed
       await conn.close()
+
+    waitFor t()
+
+  test "TimeZone is UTC from startup, so a DateTime binds to timestamptz as its instant":
+    const sameInstant = "SELECT $1::timestamptz = '2024-01-01 01:00:00Z'"
+
+    proc bindsInstant(cfg: ConnConfig, zone: string): Future[bool] {.async.} =
+      ## Whether a session of ``cfg`` reports ``zone`` and reads a UTC
+      ## ``DateTime`` bound to ``timestamptz`` as its instant. Not a loop body:
+      ## Nim 2.2.4 rejects an awaiting ``defer`` in a ``for`` over an array.
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      doAssert conn.serverParam("TimeZone") == zone, zone
+      let res = await conn.query(
+        sameInstant, @[toPgParam(dateTime(2024, mJan, 1, 1, 0, 0, 0, utc()))]
+      )
+      return res.rows[0].getBool(0)
+
+    proc t() {.async.} =
+      withProbeRole("async_pg_timezone_probe", "TimeZone = 'Asia/Tokyo'"):
+        let dt = dateTime(2024, mJan, 1, 1, 0, 0, 0, utc())
+        # The startup value overrides the role's.
+        let conn = await connect(cfg)
+        defer:
+          await conn.close()
+        doAssert conn.serverParam("TimeZone") == "UTC"
+        for sql in ["RESET ALL", "DISCARD ALL"]:
+          discard await conn.simpleQuery(sql)
+          doAssert conn.serverParam("TimeZone") == "UTC", sql
+        for p in [toPgParam(dt), toPgBinaryParam(dt)]:
+          let res = await conn.query(sameInstant, @[p])
+          doAssert res.rows[0].getBool(0)
+        # A caller's zone replaces UTC, directly or via options; DEFAULT keeps
+        # the role's.
+        for (p, zone) in [
+          (("TimeZone", "America/New_York"), "America/New_York"),
+          (("options", "-c TimeZone=America/New_York"), "America/New_York"),
+          (("TimeZone", "DEFAULT"), "Asia/Tokyo"),
+        ]:
+          cfg.extraParams = @[p]
+          let same = await bindsInstant(cfg, zone)
+          doAssert not same, p[1]
+        # A -c switch asking for UTC binds the instant like the startup pin, and
+        # so does a zero offset under a POSIX spelling; the server reports a
+        # numeric zone under a bracketed name.
+        for (p, zone) in [
+          (("options", "-c TimeZone=UTC"), "UTC"),
+          (("TimeZone", "UTC0"), "UTC0"),
+          (("TimeZone", "+00"), "<+00>-00"),
+        ]:
+          cfg.extraParams = @[p]
+          let same = await bindsInstant(cfg, zone)
+          doAssert same, p[1]
 
     waitFor t()
 
