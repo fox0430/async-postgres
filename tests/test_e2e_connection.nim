@@ -162,10 +162,24 @@ suite "E2E: ConnConfig Options":
     waitFor t()
 
   test "TimeZone is UTC from startup, so a DateTime binds to timestamptz as its instant":
+    const sameInstant = "SELECT $1::timestamptz = '2024-01-01 01:00:00Z'"
+
+    proc bindsInstant(cfg: ConnConfig, zone: string): Future[bool] {.async.} =
+      ## Whether a session of ``cfg`` reports ``zone`` and reads a UTC
+      ## ``DateTime`` bound to ``timestamptz`` as its instant. Not a loop body:
+      ## Nim 2.2.4 rejects an awaiting ``defer`` in a ``for`` over an array.
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      doAssert conn.serverParam("TimeZone") == zone, zone
+      let res = await conn.query(
+        sameInstant, @[toPgParam(dateTime(2024, mJan, 1, 1, 0, 0, 0, utc()))]
+      )
+      return res.rows[0].getBool(0)
+
     proc t() {.async.} =
       withProbeRole("async_pg_timezone_probe", "TimeZone = 'Asia/Tokyo'"):
         let dt = dateTime(2024, mJan, 1, 1, 0, 0, 0, utc())
-        const sameInstant = "SELECT $1::timestamptz = '2024-01-01 01:00:00Z'"
         # The startup value overrides the role's.
         let conn = await connect(cfg)
         defer:
@@ -185,32 +199,19 @@ suite "E2E: ConnConfig Options":
           (("TimeZone", "DEFAULT"), "Asia/Tokyo"),
         ]:
           cfg.extraParams = @[p]
-          let explicit = await connect(cfg)
-          defer:
-            await explicit.close()
-          doAssert explicit.serverParam("TimeZone") == zone, p[1]
-          let res = await explicit.query(sameInstant, @[toPgParam(dt)])
-          doAssert not res.rows[0].getBool(0), p[1]
-        # A -c switch asking for UTC binds the instant like the startup pin.
-        cfg.extraParams = @[("options", "-c TimeZone=UTC")]
-        let viaOptions = await connect(cfg)
-        defer:
-          await viaOptions.close()
-        doAssert viaOptions.serverParam("TimeZone") == "UTC"
-        let optionsRes = await viaOptions.query(sameInstant, @[toPgParam(dt)])
-        doAssert optionsRes.rows[0].getBool(0)
-        # A zero offset under a POSIX spelling binds the instant too; the
-        # server reports a numeric zone under a bracketed name.
+          let same = await bindsInstant(cfg, zone)
+          doAssert not same, p[1]
+        # A -c switch asking for UTC binds the instant like the startup pin, and
+        # so does a zero offset under a POSIX spelling; the server reports a
+        # numeric zone under a bracketed name.
         for (p, zone) in [
-          (("TimeZone", "UTC0"), "UTC0"), (("TimeZone", "+00"), "<+00>-00")
+          (("options", "-c TimeZone=UTC"), "UTC"),
+          (("TimeZone", "UTC0"), "UTC0"),
+          (("TimeZone", "+00"), "<+00>-00"),
         ]:
           cfg.extraParams = @[p]
-          let zero = await connect(cfg)
-          defer:
-            await zero.close()
-          doAssert zero.serverParam("TimeZone") == zone, p[1]
-          let zeroRes = await zero.query(sameInstant, @[toPgParam(dt)])
-          doAssert zeroRes.rows[0].getBool(0), p[1]
+          let same = await bindsInstant(cfg, zone)
+          doAssert same, p[1]
 
     waitFor t()
 
