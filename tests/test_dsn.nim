@@ -759,13 +759,31 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?keepalives_count=2147483648")
 
-  test "keepalive timings at the largest representable value":
-    let cfg = parseDsn(
-      "postgresql://host/db?keepalives_idle=2147483647&keepalives_interval=2147483647&keepalives_count=2147483647"
-    )
-    check cfg.keepAliveIdle == 2147483647
-    check cfg.keepAliveInterval == 2147483647
-    check cfg.keepAliveCount == 2147483647
+  test "keepalive timings at the largest accepted value":
+    when defined(linux):
+      let cfg = parseDsn(
+        "postgresql://host/db?keepalives_idle=32767&keepalives_interval=32767&keepalives_count=127"
+      )
+      check cfg.keepAliveIdle == 32767
+      check cfg.keepAliveInterval == 32767
+      check cfg.keepAliveCount == 127
+    else:
+      let cfg = parseDsn(
+        "postgresql://host/db?keepalives_idle=2147483647&keepalives_interval=2147483647&keepalives_count=2147483647"
+      )
+      check cfg.keepAliveIdle == 2147483647
+      check cfg.keepAliveInterval == 2147483647
+      check cfg.keepAliveCount == 2147483647
+
+  test "error: keepalive timings past the Linux kernel limits":
+    # setsockopt would reject them at connect, as a connection failure.
+    when defined(linux):
+      expect PgConfigError:
+        discard parseDsn("postgresql://host/db?keepalives_idle=32768")
+      expect PgConfigError:
+        discard parseDsn("postgresql://host/db?keepalives_interval=32768")
+      expect PgConfigError:
+        discard parseDsn("postgresql://host/db?keepalives_count=128")
 
   test "max_message_size from URI DSN":
     let cfg = parseDsn("postgresql://host/db?max_message_size=1048576")

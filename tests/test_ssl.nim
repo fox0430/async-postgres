@@ -996,6 +996,20 @@ suite "initConnConfig numeric and hostaddr validation":
       expect PgError:
         discard initConnConfig(keepAliveCount = int(high(cint)) + 1)
 
+  test "keepalive timings past the Linux kernel limits are rejected":
+    when defined(linux):
+      expect PgConfigError:
+        discard initConnConfig(keepAliveIdle = 32768)
+      expect PgConfigError:
+        discard initConnConfig(keepAliveInterval = 32768)
+      expect PgConfigError:
+        discard initConnConfig(keepAliveCount = 128)
+      let cfg = initConnConfig(
+        keepAliveIdle = 32767, keepAliveInterval = 32767, keepAliveCount = 127
+      )
+      check cfg.keepAliveIdle == 32767
+      check cfg.keepAliveCount == 127
+
   test "negative maxMessageSize is rejected":
     expect PgError:
       discard initConnConfig(maxMessageSize = -1)
@@ -1241,6 +1255,34 @@ suite "connect hand-built ConnConfig numeric validation":
           database: "test",
           sslMode: sslDisable,
           keepAliveIdle: int(high(cint)) + 1,
+        )
+        try:
+          let conn = await connect(config)
+          await conn.close()
+        except PgError as e:
+          raised = true
+          configFault = e of PgConfigError
+
+      waitFor testBody()
+      check raised
+      check configFault
+
+  test "keepAliveIdle past the Linux kernel limit is a config fault":
+    # Within cint, but setsockopt(TCP_KEEPIDLE) would fail with EINVAL after the
+    # dial; the refused port makes a missed check surface as a connect error.
+    when defined(linux):
+      var raised = false
+      var configFault = false
+
+      proc testBody() {.async.} =
+        let config = ConnConfig(
+          host: "127.0.0.1",
+          port: 1,
+          user: "test",
+          database: "test",
+          sslMode: sslDisable,
+          keepAlive: true,
+          keepAliveIdle: 40000,
         )
         try:
           let conn = await connect(config)
