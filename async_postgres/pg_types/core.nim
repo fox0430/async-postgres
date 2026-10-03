@@ -76,7 +76,9 @@ type
     microsecond*: int32 ## 0..999999
     utcOffset*: int32
       ## UTC offset in seconds (positive = east of UTC). PostgreSQL accepts
-      ## ±15:59:59; see `checkPgTimeTzOffset`.
+      ## ±15:59:59 (see `checkPgTimeTzOffset`), but a decoded value can carry
+      ## more: a session zone prints up to +169h, and ``AT TIME ZONE`` an
+      ## interval stores any offset.
 
   PgInet* = object ## PostgreSQL inet type: an IP address with a subnet mask.
     address*: IpAddress
@@ -593,11 +595,11 @@ const pgTzDispLimit* = 16 * 3600
   ## inclusive maximum is ±15:59:59.
 
 proc checkPgTimeTzOffset*(utcOffset: int32) {.raises: [PgTypeError].} =
-  ## Owner of the PostgreSQL ``timetz`` displacement bound. Encode entry
-  ## points and the binary decoder pre-flight through here, and the text
-  ## parser derives its hour bound from ``pgTzDispLimit``. The range is
-  ## symmetric, so the same check applies to the wire seconds-west value and
-  ## this library's seconds-east ``utcOffset``.
+  ## Owner of the PostgreSQL ``timetz`` input displacement bound, which encode
+  ## entry points pre-flight through. Decoders accept wider offsets, since the
+  ## server prints and sends them. The range is symmetric, so the same check
+  ## applies to the wire seconds-west value and this library's seconds-east
+  ## ``utcOffset``.
   if utcOffset <= -pgTzDispLimit or utcOffset >= pgTzDispLimit:
     raise
       newException(PgTypeError, "timetz zone displacement out of range: " & $utcOffset)
@@ -1645,16 +1647,33 @@ proc `==`*(a, b: PgCidr): bool =
   a.address == b.address and a.mask == b.mask
 
 proc `$`*(v: PgInterval): string =
+  ## PostgreSQL's ``postgres`` style. Like the server, a field after a negative
+  ## one carries an explicit sign: under ``IntervalStyle = sql_standard`` the
+  ## server applies a lone leading ``-`` to every field. The all-min field set
+  ## is PostgreSQL 17's ``-infinity``. The all-max one stays spelled out: older
+  ## servers read that as itself and 17+ as ``infinity``.
+  # Spelled out, no server version parses this one.
+  if v.months == int32.low and v.days == int32.low and v.microseconds == int64.low:
+    return "-infinity"
   var parts: seq[string]
+  var afterNeg = false
+  template addPart(n: SomeInteger, unit: string) =
+    parts.add(
+      (if afterNeg and n > 0: "+" else: "") & $n & " " & unit & (
+        if n != 1: "s" else: ""
+      )
+    )
+    afterNeg = n < 0
+
   if v.months != 0:
     let years = v.months div 12
     let mons = v.months mod 12
     if years != 0:
-      parts.add($years & " year" & (if years != 1 and years != -1: "s" else: ""))
+      addPart(years, "year")
     if mons != 0:
-      parts.add($mons & " mon" & (if mons != 1 and mons != -1: "s" else: ""))
+      addPart(mons, "mon")
   if v.days != 0:
-    parts.add($v.days & " day" & (if v.days != 1 and v.days != -1: "s" else: ""))
+    addPart(v.days, "day")
   let us = v.microseconds
   let neg = us < 0
   # Avoid overflow on int64.low by working in uint64 for the magnitude.
@@ -1670,8 +1689,8 @@ proc `$`*(v: PgInterval): string =
   let secs = r div 1_000_000'u64
   let frac = r mod 1_000_000'u64
   var timePart =
-    (if neg: "-" else: "") & align($hours, 2, '0') & ":" & align($mins, 2, '0') & ":" &
-    align($secs, 2, '0')
+    (if neg: "-" elif afterNeg: "+" else: "") & align($hours, 2, '0') & ":" &
+    align($mins, 2, '0') & ":" & align($secs, 2, '0')
   if frac != 0:
     timePart.add("." & align($frac, 6, '0'))
   if parts.len == 0 and v.microseconds == 0:

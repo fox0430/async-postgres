@@ -470,6 +470,8 @@ proc connectToHostImpl(
   let hostAddr = entry.dialAddr
   let hostPort = entry.port
   let isUnix = isUnixSocket(hostAddr)
+  # Here, not only in `getHosts`: `connectToHost` callers bypass it.
+  let sslHost = entry.effectiveHost
 
   var conn: PgConnection
 
@@ -500,7 +502,7 @@ proc connectToHostImpl(
       if not isUnix:
         configureTcpNoDelay(winlean.SocketHandle(transport.fd))
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(transport, dialed.target, entry.host)
+    conn.attachTransport(transport, dialed.target, sslHost)
   elif hasAsyncDispatch:
     let dialed = await dialing
     if reached != nil:
@@ -520,7 +522,7 @@ proc connectToHostImpl(
       if not isUnix:
         configureTcpNoDelay(winlean.SocketHandle(sock.getFd()))
     conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(sock, dialed.target, entry.host)
+    conn.attachTransport(sock, dialed.target, sslHost)
 
   var scramState: ScramState
   try:
@@ -534,18 +536,41 @@ proc connectToHostImpl(
       # cert is silently dropped — warn like the sslPrefer 'N' fallback path.
       warnStderr "pg_connection: client certificate will NOT be sent over Unix-socket connection (TLS is skipped for AF_UNIX)"
     if config.sslMode != sslDisable and not isUnix and allowLeg != alPlaintext:
-      await negotiateSSL(conn, config, entry.host)
+      await negotiateSSL(conn, config, sslHost)
 
     when hasChronos:
       # If SSL was not established, create plain streams
       conn.initPlainStreams()
 
     # Send StartupMessage
-    # Decoders assume UTF8; checkClientEncodingStatus closes on a later change.
+    # Decoders assume UTF8 and the ISO DateStyle; checkPinnedParamStatus closes
+    # on a later change. Startup values, unlike a SET, are what RESET restores.
     var startupParams = @[("client_encoding", "UTF8")]
+    var dateStyle = ""
+    var timeZone = none(string)
+    var optionsZone = none(string)
     for p in config.extraParams:
-      if not isClientEncodingKey(p[0]):
+      if isGucName(p[0], "DateStyle"):
+        dateStyle = p[1]
+      elif isGucName(p[0], "TimeZone"):
+        timeZone = some(p[1])
+      elif not isGucName(p[0], "client_encoding"):
         startupParams.add(p)
+        if p[0] == "options":
+          optionsZone = optionsTimeZone(p[1])
+    startupParams.add(("DateStyle", startupDateStyle(dateStyle)))
+    # DateTime params are zoneless timestamps of the UTC wall clock, which a
+    # timestamptz target reads in the session TimeZone. Ours would override a
+    # -c switch; "DEFAULT" sends none, as libpq does for PGTZ. From here
+    # `timeZone` is the value sent.
+    var zoneDefault = false
+    if timeZone.isSome and cmpIgnoreCase(timeZone.get, "DEFAULT") == 0:
+      zoneDefault = true
+      timeZone = none(string)
+    elif timeZone.isNone and optionsZone.isNone:
+      timeZone = some("UTC")
+    if timeZone.isSome:
+      startupParams.add(("TimeZone", timeZone.get))
     if config.applicationName.len > 0:
       startupParams.add(("application_name", config.applicationName))
     await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))
@@ -635,18 +660,44 @@ proc connectToHostImpl(
             discard
         await conn.fillRecvBuf()
 
+    # A proxy may drop the startup value. A SET in its place would not outlive
+    # transaction pooling, so fail rather than shift DateTime params. Other
+    # zones go unchecked: the server reports e.g. "+09" as "<+09>-09".
+    let zone = conn.serverParam("TimeZone")
+    # The zone the startup packet actually asks for: a startup value is
+    # applied after the ``options`` switches and wins over them.
+    let requiredZone = if timeZone.isSome: timeZone else: optionsZone
+    if requiredZone.isSome and isUtcZoneName(requiredZone.get) and zone.len > 0 and
+        not isUtcZoneName(zone):
+      raise newException(
+        PgConnectionError,
+        "TimeZone is " & zone & ", not UTC; a proxy may have dropped the startup " &
+          "value. Set TimeZone=DEFAULT to keep it, or make UTC the server's, " &
+          "database's or role's zone",
+      )
+
     conn.createdAt = Moment.now()
+    conn.noteConnectTimeZone(followsServer = zoneDefault and optionsZone.isNone)
     return conn
   except CatchableError as e:
     # SASLFinal wipes the expected server signature; an exit before it (e.g.
     # an ErrorResponse for a wrong password) must too. A future abandoned
     # mid-await (asyncdispatch timeout) never resumes to get here.
     scramState.wipeServerSignature()
+    if conn.state == csReady:
+      # Refused after ReadyForQuery: end the session cleanly, not as an
+      # unexpected EOF. Errors are ignored as in closeImpl.
+      try:
+        await conn.sendMsg(encodeTerminate())
+      except CatchableError:
+        discard
     await conn.closeTransport()
     raise e
 
 proc connectToHost*(config: ConnConfig, entry: HostEntry): Future[PgConnection] =
   ## Connect to a single host (dial ``hostaddr`` else ``host``; verify via ``host``).
+  ## With a ``hostaddr``, a ``"127.0.0.1"`` ``host`` is not verified (see
+  ## ``effectiveHost``), so ``sslVerifyFull`` then needs a real name.
   ##
   ## Low-level dial primitive. Unlike ``connect`` it does **not** apply
   ## ``targetSessionAttrs``, ``connectTimeout`` or connect tracing, and it

@@ -878,3 +878,24 @@ suite "newPoolCluster concurrent warmup":
     waitFor t()
     check raised
     check replicaTerminated
+
+suite "newPoolCluster validation":
+  test "rejects a negative fallbackTimeout before dialing":
+    # Both pools point at a freed port with minSize = 1: a dial would fail
+    # with a connect error, so a ValueError proves the check runs first.
+    proc t(): Future[ref CatchableError] {.async.} =
+      let deadMs = startMockServer()
+      let deadPort = deadMs.port
+      await closeServer(deadMs)
+      let cfg = initPoolConfig(clusterMockConfig(deadPort), minSize = 1, maxSize = 1)
+      try:
+        discard await newPoolCluster(
+          cfg, cfg, fallback = fallbackPrimary, fallbackTimeout = milliseconds(-1)
+        )
+      except CatchableError as e:
+        return e
+
+    let err = waitFor t()
+    check err != nil
+    check err of ValueError
+    check "fallbackTimeout" in err.msg

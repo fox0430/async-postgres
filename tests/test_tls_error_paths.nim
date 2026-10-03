@@ -481,6 +481,11 @@ suite "direct SSL: ALPN enforcement":
           msg = e.msg
           if "ALPN" in msg:
             break
+        except AsyncTimeoutError as e:
+          # A single host's `connectTimeout` surfaces raw (see `connect`). On a
+          # loaded Windows runner s_server once took longer than that to
+          # answer: retry like any other attempt that met no ALPN check.
+          msg = e.msg
         await sleepMsAsync(200)
       msg
 

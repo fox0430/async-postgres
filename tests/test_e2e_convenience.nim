@@ -55,6 +55,25 @@ suite "E2E: Column Name Access":
 
     waitFor t()
 
+  test "fields iteration on PreparedStatement":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let stmt = await conn.prepare(
+        "fields_iter_stmt", "SELECT $1::int4 AS val, $2::text AS label"
+      )
+      var names: seq[string]
+      for f in stmt.fields:
+        names.add f.name
+      doAssert names == @["val", "label"]
+      var indexed: seq[(int, string)]
+      for i, f in stmt.fields:
+        indexed.add (i, f.name)
+      doAssert indexed == @[(0, "val"), (1, "label")]
+      await stmt.close()
+      await conn.close()
+
+    waitFor t()
+
   test "columnIndex raises for missing column":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -1497,6 +1516,93 @@ suite "E2E: Convenience Query Methods":
       )
       doAssert r.rows[0].getInt(0) == 0
       doAssert conn.pendingStmtCloses.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: DISCARD ALL and DEALLOCATE ALL drop the cache":
+    # Left in place, every cached statement failed once with 26000, and a
+    # repeated exec of the reset Bound the statement its first run dropped.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      proc serverStmts(): Future[int] {.async.} =
+        (await conn.simpleQuery("SELECT count(*)::int FROM pg_prepared_statements"))[0].rows[
+          0
+        ].getInt(0)
+
+      for sql in ["DISCARD ALL", "DEALLOCATE ALL"]:
+        for viaSimple in [false, true]:
+          discard await conn.query("SELECT 1")
+          doAssert conn.stmtCache.len > 0
+          for _ in 0 ..< 2:
+            if viaSimple:
+              discard await conn.simpleExec(sql)
+            else:
+              discard await conn.exec(sql)
+          doAssert conn.stmtCache.len == 0
+          doAssert (await serverStmts()) == 0
+          doAssert (await conn.query("SELECT 1")).rows[0].getInt(0) == 1
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: statements dropped with no reset tag fail one hit":
+    # A DEALLOCATE ALL inside a DO block reports DO, so only a hit's 26000
+    # tells; left at that one entry, every other entry failed once too.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let queries = ["SELECT 1", "SELECT 2", "SELECT 3"]
+      for sql in queries:
+        discard await conn.query(sql)
+      discard await conn.simpleExec("DO $$ BEGIN EXECUTE 'DEALLOCATE ALL'; END $$")
+
+      var failures = 0
+      for sql in queries:
+        try:
+          discard await conn.query(sql)
+        except PgQueryError as e:
+          doAssert e.sqlState == "26000", e.msg
+          inc failures
+      doAssert failures == 1
+      for i, sql in queries:
+        doAssert (await conn.query(sql)).rows[0].getInt(0) == int32(i + 1)
+      let server = (
+        await conn.simpleQuery("SELECT count(*)::int FROM pg_prepared_statements")
+      )[0].rows[0].getInt(0)
+      doAssert server == conn.stmtCache.len
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: a pipeline keeps only the misses Parsed after DEALLOCATE ALL":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+
+      proc serverStmts(): Future[int] {.async.} =
+        (await conn.simpleQuery("SELECT count(*)::int FROM pg_prepared_statements"))[0].rows[
+          0
+        ].getInt(0)
+
+      for isolated in [false, true]:
+        let before = "SELECT 'before' -- " & $isolated
+        let after = "SELECT 'after' -- " & $isolated
+        let p = newPipeline(conn)
+        p.addQuery(before)
+        p.addExec("DEALLOCATE ALL")
+        p.addQuery(after)
+        if isolated:
+          discard await p.executeIsolated()
+        else:
+          discard await p.execute()
+        doAssert before notin conn.stmtCache
+        doAssert after in conn.stmtCache
+        doAssert (await serverStmts()) == conn.stmtCache.len
+        doAssert (await conn.query(before)).rows[0].getStr(0) == "before"
+        doAssert (await conn.query(after)).rows[0].getStr(0) == "after"
 
       await conn.close()
 

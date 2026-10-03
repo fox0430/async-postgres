@@ -7,10 +7,13 @@
 ## `tsaReadOnly` are judged on the read-only state. In particular a primary
 ## running with `default_transaction_read_only=on` must still match
 ## `tsaPrimary`, and an indeterminate probe result must skip the host.
+## Also covers the `DateStyle` and `TimeZone` `connect` sends at startup.
 
 import std/[unittest, strutils]
 
 import ../async_postgres/[async_backend, pg_connection]
+from ../async_postgres/pg_protocol import decodeInt32
+from ../async_postgres/pg_connection/types import isUtcZoneName
 
 import mock_pg_server
 
@@ -37,6 +40,13 @@ proc buildEmptyResult(colName, tag: string): seq[byte] =
   result.add(buildRowDescription(colName))
   result.add(buildCommandComplete(tag))
   result.add(buildReadyForQuery('I'))
+
+proc readStartupParams(client: MockClient): Future[string] {.async.} =
+  ## The StartupMessage's key/value cstrings (after the protocol version).
+  let lenBuf = await readN(client, 4)
+  let body = await readN(client, int(decodeInt32(lenBuf, 0)) - 4)
+  for b in body[4 .. ^1]:
+    result.add(char(b))
 
 suite "target_session_attrs: recovery-state checks":
   test "tsaPrimary accepts a read-only-by-default primary without a probe query":
@@ -148,37 +158,39 @@ suite "target_session_attrs: recovery-state checks":
 
   test "a pre-14 physical replication connection probes SHOW, not SELECT":
     # A walsender rejects arbitrary SQL, so the recovery probe must fall back
-    # to SHOW transaction_read_only. The alternate boolean spelling
-    # `replication=on` (reaching extraParams verbatim, e.g. via a DSN) must
-    # also be recognised as physical replication.
-    var probeOk = false
+    # to SHOW transaction_read_only. Every spelling the server's parse_bool
+    # reads as true (reaching extraParams verbatim, e.g. via a DSN) must be
+    # recognised as physical replication.
+    for spelling in ["on", "TRUE", "t", "Yes", "1"]:
+      checkpoint spelling
+      var probeOk = false
 
-    proc testBody() {.async.} =
-      let ms = startMockServer()
-      proc serverHandler() {.async.} =
-        # Pre-14 server: no in_hot_standby ParameterStatus.
-        let st = await acceptAndReady(ms)
-        try:
-          let (msgType, body) = await drainFrontendMessage(st)
-          probeOk = msgType == 'Q' and queryText(body) == "SHOW transaction_read_only"
-          await sendBytes(
-            st, buildSingleRowResult("transaction_read_only", "off", "SHOW")
-          )
-          discard await drainFrontendMessage(st) # Terminate
-        except CatchableError:
-          discard
-        await closeClient(st)
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        proc serverHandler() {.async.} =
+          # Pre-14 server: no in_hot_standby ParameterStatus.
+          let st = await acceptAndReady(ms)
+          try:
+            let (msgType, body) = await drainFrontendMessage(st)
+            probeOk = msgType == 'Q' and queryText(body) == "SHOW transaction_read_only"
+            await sendBytes(
+              st, buildSingleRowResult("transaction_read_only", "off", "SHOW")
+            )
+            discard await drainFrontendMessage(st) # Terminate
+          except CatchableError:
+            discard
+          await closeClient(st)
 
-      let serverFut = serverHandler()
-      var cfg = mockConfig(ms.port, tsaPrimary)
-      cfg.extraParams = @[("replication", "on")]
-      let conn = await connect(cfg)
-      await conn.close()
-      await serverFut
-      await closeServer(ms)
+        let serverFut = serverHandler()
+        var cfg = mockConfig(ms.port, tsaPrimary)
+        cfg.extraParams = @[("replication", spelling)]
+        let conn = await connect(cfg)
+        await conn.close()
+        await serverFut
+        await closeServer(ms)
 
-    waitFor testBody()
-    check probeOk
+      waitFor testBody()
+      check probeOk
 
   test "an indeterminate recovery probe skips the host (fail-closed)":
     # A probe that returns zero rows is indeterminate; libpq advances to the
@@ -438,3 +450,292 @@ suite "target_session_attrs: read-only-state checks":
 
     waitFor testBody()
     check firstMsgType == 'X'
+
+suite "connect: DateStyle and TimeZone":
+  proc connectZoneOutcome(
+      extra: seq[(string, string)], reported: string
+  ): Future[(seq[string], string)] {.async.} =
+    ## Queries after startup, then the session zone, or the connect error.
+    ## An empty `reported` reports no zone.
+    let ms = startMockServer()
+    var queries: seq[string]
+    var lastMsgType = '\0'
+    proc serverHandler() {.async.} =
+      let params =
+        if reported.len > 0:
+          @[("TimeZone", reported)]
+        else:
+          @[]
+      let st = await acceptAndReady(ms, params = params)
+      try:
+        while true:
+          let (msgType, body) = await drainFrontendMessage(st)
+          if msgType != 'Q':
+            lastMsgType = msgType
+            break
+          queries.add(queryText(body))
+      except CatchableError:
+        discard
+      await closeClient(st)
+
+    let serverFut = serverHandler()
+    var cfg = mockConfig(ms.port, tsaAny)
+    cfg.extraParams = extra
+    var outcome: string
+    try:
+      let conn = await connect(cfg)
+      outcome = conn.serverParam("TimeZone")
+      await conn.close()
+    except PgConnectionError as e:
+      outcome = e.msg
+    await serverFut
+    await closeServer(ms)
+    # A refused session ends with Terminate too, not a bare disconnect.
+    doAssert lastMsgType == 'X'
+    return (queries, outcome)
+
+  proc startupAndFirstMsg(
+      cfg: ConnConfig, ms: MockServer, reported: string
+  ): Future[(string, char)] {.async.} =
+    ## The StartupMessage parameters, and the first message after ReadyForQuery.
+    var startup = ""
+    var firstMsgType = '\0'
+    proc serverHandler() {.async.} =
+      let st = await ms.accept()
+      startup = await readStartupParams(st)
+      await sendFullHandshake(st, params = @[("DateStyle", reported)])
+      try:
+        let (msgType, _) = await drainFrontendMessage(st)
+        firstMsgType = msgType
+      except CatchableError:
+        discard
+      await closeClient(st)
+
+    let serverFut = serverHandler()
+    let conn = await connect(cfg)
+    await conn.close()
+    await serverFut
+    await closeServer(ms)
+    return (startup, firstMsgType)
+
+  test "ISO is sent at startup, with no SET after it":
+    # A startup value, unlike a SET, is what RESET and DISCARD ALL restore.
+    proc testBody(): Future[(string, char)] {.async.} =
+      let ms = startMockServer()
+      return await startupAndFirstMsg(mockConfig(ms.port, tsaAny), ms, "ISO, MDY")
+
+    let (startup, firstMsgType) = waitFor testBody()
+    check "DateStyle\0ISO\0" in startup
+    check firstMsgType == 'X'
+
+  test "a caller's field order joins the startup ISO":
+    proc testBody(): Future[(string, char)] {.async.} =
+      let ms = startMockServer()
+      var cfg = mockConfig(ms.port, tsaAny)
+      cfg.extraParams = @[("datestyle", "DMY")]
+      return await startupAndFirstMsg(cfg, ms, "ISO, DMY")
+
+    let (startup, _) = waitFor testBody()
+    check "DateStyle\0ISO, DMY\0" in startup
+    check "datestyle" notin startup
+
+  test "TimeZone is UTC at startup unless the caller sets one":
+    proc testBody(extra: seq[(string, string)]): Future[(string, char)] {.async.} =
+      let ms = startMockServer()
+      var cfg = mockConfig(ms.port, tsaAny)
+      cfg.extraParams = extra
+      return await startupAndFirstMsg(cfg, ms, "ISO, MDY")
+
+    let (byDefault, firstMsgType) = waitFor testBody(@[])
+    check "TimeZone\0UTC\0" in byDefault
+    check firstMsgType == 'X'
+    let (direct, _) = waitFor testBody(@[("timezone", "Asia/Tokyo")])
+    check "TimeZone\0Asia/Tokyo\0" in direct
+    check "timezone" notin direct
+    # A startup TimeZone would override the -c switch.
+    let (viaOptions, _) = waitFor testBody(@[("options", "-c TimeZone=Asia/Tokyo")])
+    check "options\0-c TimeZone=Asia/Tokyo\0" in viaOptions
+    check "TimeZone\0UTC\0" notin viaOptions
+    # The server applies startup values after the -c switches.
+    let (both, _) = waitFor testBody(
+      @[("TimeZone", "Asia/Tokyo"), ("options", "-c TimeZone=America/New_York")]
+    )
+    check "TimeZone\0Asia/Tokyo\0" in both
+    # DEFAULT keeps the server's zone; sent as a value it would fail startup.
+    let (inherit, _) = waitFor testBody(@[("TimeZone", "default")])
+    check "TimeZone\0" notin inherit
+    check "default" notin inherit
+
+  test "a startup UTC the server did not apply fails connect":
+    # A proxy that dropped the startup value; an explicit UTC is checked too,
+    # directly or via a -c switch in options.
+    # No SET stands in: transaction pooling would not keep it.
+    for extra in [
+      newSeq[(string, string)](),
+      @[("TimeZone", "utc")],
+      @[("TimeZone", "UTC0")],
+      @[("TimeZone", "+00")],
+      @[("options", "-c TimeZone=UTC")],
+      @[("options", "-c TimeZone=GMT+00:00")],
+      @[("options", "--timezone=Etc/UTC")],
+      # DEFAULT sends none, so the -c switch is what asks for UTC.
+      @[("TimeZone", "DEFAULT"), ("options", "-c TimeZone=0")],
+    ]:
+      let (queries, msg) = waitFor connectZoneOutcome(extra, "Asia/Tokyo")
+      check queries.len == 0
+      check "TimeZone is Asia/Tokyo, not UTC" in msg
+    let none = newSeq[string]()
+    check waitFor(connectZoneOutcome(@[], "UTC")) == (none, "UTC")
+    check waitFor(connectZoneOutcome(@[], "Etc/UTC")) == (none, "Etc/UTC")
+    check waitFor(connectZoneOutcome(@[], "")) == (none, "")
+    # A -c switch naming another zone is honored, not overridden by a UTC pin.
+    check waitFor(
+      connectZoneOutcome(@[("options", "-c TimeZone=Asia/Tokyo")], "Asia/Tokyo")
+    ) == (none, "Asia/Tokyo")
+    # The last -c switch wins, as on the server.
+    check waitFor(
+      connectZoneOutcome(
+        @[("options", "-c TimeZone=UTC -c TimeZone=Asia/Tokyo")], "Asia/Tokyo"
+      )
+    ) == (none, "Asia/Tokyo")
+    check waitFor(connectZoneOutcome(@[("options", "-c TimeZone=UTC")], "UTC")) ==
+      (none, "UTC")
+    # A zero offset under a POSIX spelling is UTC, requested or reported.
+    check waitFor(connectZoneOutcome(@[("TimeZone", "UTC0")], "UTC0")) == (none, "UTC0")
+    check waitFor(connectZoneOutcome(@[("options", "-c TimeZone=+00")], "<+00>-00")) ==
+      (none, "<+00>-00")
+    # DEFAULT defers to a -c switch naming UTC: the switch is what is checked.
+    check waitFor(
+      connectZoneOutcome(
+        @[("TimeZone", "DEFAULT"), ("options", "-c TimeZone=UTC")], "UTC"
+      )
+    ) == (none, "UTC")
+    # Other zones go unchecked: the server reports "+09" as "<+09>-09".
+    check waitFor(connectZoneOutcome(@[("TimeZone", "+09")], "<+09>-09")) ==
+      (none, "<+09>-09")
+
+  test "a UTC+0 spelling the server reports is not a dropped startup value":
+    # A proxy that dropped the startup value still leaves a UTC session when
+    # the server's own zone is UTC+0 under another spelling: the check must
+    # not read that as the pin having been lost.
+    for reported in [
+      "UTC", "utc", "Etc/UTC", "GMT", "GMT0", "GMT+0", "GMT-0", "UTC+0", "UTC-0",
+      "UTC+00", "GMT+00", "GMT-000", "UCT+0", "ZULU+0", "Etc/GMT+0", "ETC/GMT+00",
+      "UTC0", "ETC/UTC0", "GMT+00:00", "UTC+00:00", "+00", "-0", "0", "0.0", "00",
+      "00:00", "<+00>-00", "<UTC>0",
+    ]:
+      for extra in [
+        newSeq[(string, string)](),
+        @[("TimeZone", "GMT")],
+        @[("options", "-c TimeZone=UTC")],
+      ]:
+        let none = newSeq[string]()
+        check waitFor(connectZoneOutcome(extra, reported)) == (none, reported)
+
+  test "isUtcZoneName reads a numeric tail, so zero-offset spellings pass":
+    for zone in [
+      "UTC",
+      "utc",
+      "Etc/UTC",
+      "etc/utc",
+      "UCT",
+      "Etc/UCT",
+      "Universal",
+      "Etc/Universal",
+      "Zulu",
+      "Etc/Zulu",
+      "GMT",
+      "Etc/GMT",
+      "GMT0",
+      "Etc/GMT0",
+      "GMT+0",
+      "GMT-0",
+      "Etc/GMT+0",
+      "Etc/GMT-0",
+      "Greenwich",
+      "Etc/Greenwich",
+      "UTC+0",
+      "UTC-0",
+      "UTC+00",
+      "UTC-00",
+      "GMT+00",
+      "GMT-00",
+      "GMT-000",
+      "UCT+0",
+      "ZULU+0",
+      "ETC/GMT+00",
+      # POSIX spellings of the links and bare zero offsets.
+      "UTC0",
+      "UTC00",
+      "UTC0.0",
+      "ETC/UTC0",
+      "Etc/UTC0",
+      "GMT+00:00",
+      "GMT+0:0",
+      "UTC+00:00",
+      "UTC+00:00:00",
+      "0",
+      "00",
+      "+00",
+      "-0",
+      "0.0",
+      "-0.0",
+      ".0",
+      "0:0",
+      "00:00",
+      "0:0:0",
+      # The server reports a numeric zone under a bracketed name.
+      "<+00>-00",
+      "<UTC>0",
+      "<+00>+0",
+    ]:
+      check isUtcZoneName(zone)
+    for zone in [
+      "",
+      "Asia/Tokyo",
+      "Europe/Berlin",
+      "America/New_York",
+      "<+09>-09",
+      "+09",
+      "GMT+1",
+      "GMT-1",
+      "Etc/GMT+1",
+      "Etc/GMT-8",
+      "UTC+1",
+      "UTC-9",
+      "GMT+",
+      "GMT+0x",
+      "GMT0+1",
+      "utc+",
+      # A non-zero offset stays non-zero under every spelling.
+      "0.5",
+      "00:30",
+      "UTC0:30",
+      "GMT+00:01",
+      "<+05:30>-05:30",
+      "0:0:1",
+    ]:
+      check not isUtcZoneName(zone)
+
+  test "a non-ISO DateStyle reported at startup fails connect":
+    # A server or proxy that ignored the startup value.
+    var msg = ""
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms, params = @[("DateStyle", "SQL, DMY")])
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      try:
+        let conn = await connect(mockConfig(ms.port, tsaAny))
+        await conn.close()
+      except PgConnectionError as e:
+        {.cast(gcsafe).}:
+          msg = e.msg
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check "DateStyle changed to SQL, DMY" in msg

@@ -15,7 +15,7 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/strutils
+import std/[strutils, options]
 when defined(posix):
   import std/posix
 
@@ -218,7 +218,7 @@ proc buildHosts(
       else:
         ports[i]
     result.add HostEntry(
-      host: if h.len == 0 and a.len == 0 and not explicit: "127.0.0.1" else: h,
+      host: if h.len == 0 and a.len == 0 and not explicit: DefaultHost else: h,
       hostaddr: a,
       port:
         if p.len == 0:
@@ -387,7 +387,7 @@ proc rawHost(host, hostaddr: string): string =
   ## An explicit `host=127.0.0.1` is structurally indistinguishable from the
   ## implicit default, but re-defaults to the same value on rebuild —
   ## functionally correct for the round-trip.
-  if host == "127.0.0.1" and hostaddr.len == 0: "" else: host
+  if host == DefaultHost and hostaddr.len == 0: "" else: host
 
 proc rawHostLists(
     c: ConnConfig
@@ -442,11 +442,32 @@ const maxSockOptInt = int64(high(cint))
   ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
   ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
 
+when defined(linux):
+  # The kernel's MAX_TCP_KEEPIDLE / MAX_TCP_KEEPINTVL / MAX_TCP_KEEPCNT. Past
+  # them `setsockopt` fails at connect, which reads as a connection failure.
+  const
+    maxKeepAliveIdle = 32767'i64
+    maxKeepAliveInterval = 32767'i64
+    maxKeepAliveCount = 127'i64
+else:
+  const
+    maxKeepAliveIdle = maxSockOptInt
+    maxKeepAliveInterval = maxSockOptInt
+    maxKeepAliveCount = maxSockOptInt
+
 proc checkClientEncoding(val: string) =
   ## The client pins ``client_encoding`` to UTF8.
   if not isUtf8EncodingName(val):
     raise
       newException(PgConfigError, "client_encoding must be UTF8 (len=" & $val.len & ")")
+
+proc checkDateStyle(val: string) =
+  ## The client pins the ``DateStyle`` output style to ISO; only the field
+  ## order (``DMY``, ...) is the caller's.
+  if namesNonIsoDateStyle(val):
+    raise newException(
+      PgConfigError, "DateStyle must use the ISO output style (len=" & $val.len & ")"
+    )
 
 proc splitStartupOptions(options: string): seq[string] =
   ## Split like the server's ``pg_split_opts``: whitespace separates, ``\``
@@ -474,9 +495,9 @@ proc splitStartupOptions(options: string): seq[string] =
   if inArg:
     result.add(cur)
 
-proc checkOptionsClientEncoding(options: string) =
-  ## Our startup ``client_encoding`` would silently override a ``-c`` switch,
-  ## so reject a non-UTF8 one as if it were given directly.
+iterator optionsSettings(options: string): tuple[name, value: string] =
+  ## The ``name=value`` settings of the ``-c`` and ``--`` switches in
+  ## ``options``, read like the server's getopt.
   const argOpts =
     {'B', 'C', 'c', 'D', 'd', 'f', 'h', 'k', 'N', 'p', 'r', 'S', 't', 'v', 'W', '-'}
     # postgres's getopt string
@@ -498,10 +519,27 @@ proc checkOptionsClientEncoding(options: string) =
         inc i
       if a[j] in {'c', '-'}:
         let eq = optArg.find('=')
-        # ParseLongOption maps '-' to '_' in the name.
-        if eq >= 0 and isClientEncodingKey(optArg[0 ..< eq].replace('-', '_')):
-          checkClientEncoding(optArg[eq + 1 .. ^1])
+        if eq >= 0:
+          # ParseLongOption maps '-' to '_' in the name.
+          yield (optArg[0 ..< eq].replace('-', '_'), optArg[eq + 1 .. ^1])
       break
+
+proc checkOptionsPinnedParams(options: string) =
+  ## Our startup ``client_encoding`` and ``DateStyle`` output style would
+  ## silently override a ``-c`` switch, so reject a conflicting one as if it
+  ## were given directly.
+  for (name, value) in optionsSettings(options):
+    if isGucName(name, "client_encoding"):
+      checkClientEncoding(value)
+    elif isGucName(name, "DateStyle"):
+      checkDateStyle(value)
+
+proc optionsTimeZone*(options: string): Option[string] =
+  ## The ``TimeZone`` value a ``-c`` switch in ``options`` sets, if any. The
+  ## last switch wins, as on the server.
+  for (name, value) in optionsSettings(options):
+    if isGucName(name, "TimeZone"):
+      result = some(value)
 
 proc applyParam(result: var ConnConfig, key, val: string) =
   ## Apply a single connection parameter to a ConnConfig.
@@ -586,9 +624,11 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(
         PgConfigError, "keepalives_idle must be non-negative (len=" & $val.len & ")"
       )
-    if int64(result.keepAliveIdle) > maxSockOptInt:
+    if int64(result.keepAliveIdle) > maxKeepAliveIdle:
       raise newException(
-        PgConfigError, "keepalives_idle out of range (len=" & $val.len & ")"
+        PgConfigError,
+        "keepalives_idle out of range (0-" & $maxKeepAliveIdle & ") (len=" & $val.len &
+          ")",
       )
   of "keepalives_interval":
     result.keepAliveInterval = parseDsnInt(val, "keepalives_interval")
@@ -596,9 +636,11 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(
         PgConfigError, "keepalives_interval must be non-negative (len=" & $val.len & ")"
       )
-    if int64(result.keepAliveInterval) > maxSockOptInt:
+    if int64(result.keepAliveInterval) > maxKeepAliveInterval:
       raise newException(
-        PgConfigError, "keepalives_interval out of range (len=" & $val.len & ")"
+        PgConfigError,
+        "keepalives_interval out of range (0-" & $maxKeepAliveInterval & ") (len=" &
+          $val.len & ")",
       )
   of "keepalives_count":
     result.keepAliveCount = parseDsnInt(val, "keepalives_count")
@@ -606,9 +648,11 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(
         PgConfigError, "keepalives_count must be non-negative (len=" & $val.len & ")"
       )
-    if int64(result.keepAliveCount) > maxSockOptInt:
+    if int64(result.keepAliveCount) > maxKeepAliveCount:
       raise newException(
-        PgConfigError, "keepalives_count out of range (len=" & $val.len & ")"
+        PgConfigError,
+        "keepalives_count out of range (0-" & $maxKeepAliveCount & ") (len=" & $val.len &
+          ")",
       )
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
@@ -628,12 +672,14 @@ proc applyParam(result: var ConnConfig, key, val: string) =
         "max_scram_iterations must be non-negative (len=" & $val.len & ")",
       )
   else:
-    if isClientEncodingKey(key):
+    if isGucName(key, "client_encoding"):
       # Not kept: the startup message always sends UTF8.
       checkClientEncoding(val)
     else:
-      if key == "options":
-        checkOptionsClientEncoding(val)
+      if isGucName(key, "DateStyle"):
+        checkDateStyle(val)
+      elif key == "options":
+        checkOptionsPinnedParams(val)
       result.extraParams.add((key, val))
 
 proc parseKeyValueDsn(dsn: string): ConnConfig =
@@ -1025,29 +1071,38 @@ proc validateConnConfig*(config: var ConnConfig) =
 
   if config.keepAliveIdle < 0:
     raise newException(PgConfigError, "keepalives_idle must be non-negative")
-  if int64(config.keepAliveIdle) > maxSockOptInt:
-    raise newException(PgConfigError, "keepalives_idle out of range")
+  if int64(config.keepAliveIdle) > maxKeepAliveIdle:
+    raise newException(
+      PgConfigError, "keepalives_idle out of range (0-" & $maxKeepAliveIdle & ")"
+    )
   if config.keepAliveInterval < 0:
     raise newException(PgConfigError, "keepalives_interval must be non-negative")
-  if int64(config.keepAliveInterval) > maxSockOptInt:
-    raise newException(PgConfigError, "keepalives_interval out of range")
+  if int64(config.keepAliveInterval) > maxKeepAliveInterval:
+    raise newException(
+      PgConfigError,
+      "keepalives_interval out of range (0-" & $maxKeepAliveInterval & ")",
+    )
   if config.keepAliveCount < 0:
     raise newException(PgConfigError, "keepalives_count must be non-negative")
-  if int64(config.keepAliveCount) > maxSockOptInt:
-    raise newException(PgConfigError, "keepalives_count out of range")
+  if int64(config.keepAliveCount) > maxKeepAliveCount:
+    raise newException(
+      PgConfigError, "keepalives_count out of range (0-" & $maxKeepAliveCount & ")"
+    )
 
   if config.maxMessageSize < 0:
     raise newException(PgConfigError, "max_message_size must be non-negative")
   if config.maxScramIterations < 0:
     raise newException(PgConfigError, "max_scram_iterations must be non-negative")
   for (k, v) in config.extraParams:
-    if isClientEncodingKey(k):
+    if isGucName(k, "client_encoding"):
       checkClientEncoding(v)
+    elif isGucName(k, "DateStyle"):
+      checkDateStyle(v)
     elif k == "options": # the server matches this key case-sensitively
-      checkOptionsClientEncoding(v)
+      checkOptionsPinnedParams(v)
 
 proc initConnConfig*(
-    host = "127.0.0.1",
+    host = DefaultHost,
     port = 5432,
     hostaddr = "",
     user = "",
@@ -1126,7 +1181,9 @@ proc parseDsn*(dsn: string): ConnConfig =
   ## path, raises ``PgConfigError`` (``h/db?user=a@b`` is fine).
   ##
   ## ``client_encoding`` is always UTF8: another value, directly or via ``-c``
-  ## in ``options``, raises ``PgConfigError``.
+  ## in ``options``, raises ``PgConfigError``. Likewise ``DateStyle`` always
+  ## uses the ISO output style: only its field order (``DMY``, ...) may be set.
+  ## ``TimeZone`` is UTC unless set here; see ``ConnConfig.extraParams``.
   ##
   ## Security: the DSN is trusted configuration — unknown keys are forwarded
   ## as StartupMessage parameters, so a typo in a security-sensitive key (e.g.

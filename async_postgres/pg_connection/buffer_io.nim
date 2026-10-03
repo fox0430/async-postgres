@@ -79,17 +79,22 @@ proc unixSocketPath*(host: string, port: int): string =
 
 proc getHosts*(config: ConnConfig): seq[HostEntry] =
   ## Return the list of hosts to try. If `hosts` is populated, return it;
-  ## otherwise synthesize a single entry from `host`/`port`.
-  if config.hosts.len > 0:
-    config.hosts
-  else:
-    @[
-      HostEntry(
-        host: config.host,
-        hostaddr: config.hostaddr,
-        port: if config.port == 0: 5432 else: config.port,
-      )
-    ]
+  ## otherwise synthesize a single entry from `host`/`port`. Each `host` goes
+  ## through `effectiveHost`, so errors and traces show the name verified, not
+  ## a `127.0.0.1` default left behind by a later `hostaddr`.
+  result =
+    if config.hosts.len > 0:
+      config.hosts
+    else:
+      @[
+        HostEntry(
+          host: config.host,
+          hostaddr: config.hostaddr,
+          port: if config.port == 0: 5432 else: config.port,
+        )
+      ]
+  for entry in result.mitems:
+    entry.host = entry.effectiveHost
 
 # Dialing
 
@@ -489,17 +494,26 @@ when hasAsyncDispatch:
 # ``compactRecvBuf`` / ``fillRecvBuf`` / ``fillRecvBufDetached`` live in
 # ``types`` with the private fields they move as a pair.
 
-proc checkClientEncodingStatus(
+proc checkPinnedParamStatus(
     conn: PgConnection, name, value: string
 ) {.raises: [PgProtocolError].} =
-  ## Close the connection on a non-UTF8 ``client_encoding`` report: decoders
-  ## rely on UTF8. Detected after the fact; a change reverted within one
-  ## query (a function's ``SET`` clause) is never reported.
+  ## Close the connection on a report the decoders cannot follow: a non-UTF8
+  ## ``client_encoding``, or a ``DateStyle`` output style other than ISO (a
+  ## field order change alone is harmless). Detected after the fact; a change
+  ## reverted within one query (a function's ``SET`` clause) is never reported.
+  ## Both are sent at startup, so a report there means a server or proxy
+  ## ignored them.
   if name == "client_encoding" and not isUtf8EncodingName(value):
     conn.markClosed()
     raise newException(
       PgProtocolError,
       "client_encoding changed to " & value & "; the client requires UTF8",
+    )
+  if name == "DateStyle" and not reportsIsoDateStyle(value):
+    conn.markClosed()
+    raise newException(
+      PgProtocolError,
+      "DateStyle changed to " & value & "; the client requires the ISO output style",
     )
 
 proc nextMessage*(
@@ -565,7 +579,7 @@ proc nextMessage*(
       let m = res.message
       conn.recordParameterStatus(m.paramName, m.paramValue)
       # After the caps, so the value quoted in the error stays bounded.
-      conn.checkClientEncodingStatus(m.paramName, m.paramValue)
+      conn.checkPinnedParamStatus(m.paramName, m.paramValue)
       continue
     if res.message.kind == bmkNegotiateProtocolVersion:
       # Informational per libpq; record and drop so callers never see it.
@@ -575,6 +589,8 @@ proc nextMessage*(
     if res.message.kind == bmkDataRow and rowCount != nil:
       rowCount[] += 1
       continue
+    if res.message.kind == bmkCommandComplete:
+      conn.noteCommandTag(res.message.commandTag)
     if res.message.kind == bmkErrorResponse and
         isSessionFatal(errorSeverity(res.message.errorFields)):
       conn.fatalServerError = newPgQueryError(res.message.errorFields)

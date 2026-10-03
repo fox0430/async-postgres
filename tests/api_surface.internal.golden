@@ -34,6 +34,7 @@ async_postgres/pg_client/core.nim	MissFacts.described
 async_postgres/pg_client/core.nim	MissFacts.fields
 async_postgres/pg_client/core.nim	MissFacts.paramOids
 async_postgres/pg_client/core.nim	MissFacts.parsed
+async_postgres/pg_client/core.nim	MissFacts.parsedGen
 async_postgres/pg_client/core.nim	StmtCacheInvalidatingStates
 async_postgres/pg_client/core.nim	StmtCacheStatus
 async_postgres/pg_client/core.nim	StmtCacheStatus.scsHit
@@ -133,6 +134,7 @@ async_postgres/pg_connection/buffer_io.nim	shown#2
 async_postgres/pg_connection/buffer_io.nim	socketError
 async_postgres/pg_connection/buffer_io.nim	startRecvWatch
 async_postgres/pg_connection/buffer_io.nim	take
+async_postgres/pg_connection/dsn.nim	optionsTimeZone
 async_postgres/pg_connection/lifecycle.nim	closeImpl
 async_postgres/pg_connection/lifecycle.nim	filterSaslByRequireAuth
 async_postgres/pg_connection/lifecycle.nim	selectScramMechanism
@@ -150,6 +152,7 @@ async_postgres/pg_connection/simple_query.nim	tracedSimpleExec
 async_postgres/pg_connection/ssl.nim	negotiateSSL
 async_postgres/pg_connection/ssl.nim	sniName
 async_postgres/pg_connection/ssl.nim	validateDirectSslCompatible
+async_postgres/pg_connection/types.nim	DefaultHost
 async_postgres/pg_connection/types.nim	DefaultNotifyMaxQueue
 async_postgres/pg_connection/types.nim	DefaultNotifyMaxQueueBytes
 async_postgres/pg_connection/types.nim	DialTarget
@@ -226,6 +229,7 @@ async_postgres/pg_connection/types.nim	closedReason
 async_postgres/pg_connection/types.nim	compactRecvBuf
 async_postgres/pg_connection/types.nim	confirmReplFlushed
 async_postgres/pg_connection/types.nim	confirmReplReportable
+async_postgres/pg_connection/types.nim	connectTimeZone
 async_postgres/pg_connection/types.nim	consumeRecv
 async_postgres/pg_connection/types.nim	copyServerError
 async_postgres/pg_connection/types.nim	detachTransport
@@ -233,6 +237,7 @@ async_postgres/pg_connection/types.nim	detachTransport#2
 async_postgres/pg_connection/types.nim	dispatchNotice
 async_postgres/pg_connection/types.nim	dispatchNotification
 async_postgres/pg_connection/types.nim	dropStagedStmtCloses
+async_postgres/pg_connection/types.nim	effectiveHost
 async_postgres/pg_connection/types.nim	effectiveMaxMessageSize
 async_postgres/pg_connection/types.nim	effectiveMaxScramIterations
 async_postgres/pg_connection/types.nim	enqueueNotification
@@ -260,8 +265,10 @@ async_postgres/pg_connection/types.nim	heldSessionLocks
 async_postgres/pg_connection/types.nim	initPlainStreams
 async_postgres/pg_connection/types.nim	initReplLsnTracking
 async_postgres/pg_connection/types.nim	installTlsStream
+async_postgres/pg_connection/types.nim	invalidateAllStmtCache
 async_postgres/pg_connection/types.nim	invalidateStmtCache
-async_postgres/pg_connection/types.nim	isClientEncodingKey
+async_postgres/pg_connection/types.nim	isGucName
+async_postgres/pg_connection/types.nim	isUtcZoneName
 async_postgres/pg_connection/types.nim	isUtf8EncodingName
 async_postgres/pg_connection/types.nim	listenChannels
 async_postgres/pg_connection/types.nim	listenErrorCallback
@@ -275,6 +282,7 @@ async_postgres/pg_connection/types.nim	markClosed
 async_postgres/pg_connection/types.nim	markReady
 async_postgres/pg_connection/types.nim	markStaged
 async_postgres/pg_connection/types.nim	markState
+async_postgres/pg_connection/types.nim	namesNonIsoDateStyle
 async_postgres/pg_connection/types.nim	newClosedError
 async_postgres/pg_connection/types.nim	newPgConnection
 async_postgres/pg_connection/types.nim	newPgQueryError
@@ -282,6 +290,8 @@ async_postgres/pg_connection/types.nim	nextPortalName
 async_postgres/pg_connection/types.nim	nextReplWrite
 async_postgres/pg_connection/types.nim	nextStmtName
 async_postgres/pg_connection/types.nim	noteBackendKeyData
+async_postgres/pg_connection/types.nim	noteCommandTag
+async_postgres/pg_connection/types.nim	noteConnectTimeZone
 async_postgres/pg_connection/types.nim	noteListenPumpStarted
 async_postgres/pg_connection/types.nim	noteNegotiatedProtocol
 async_postgres/pg_connection/types.nim	noteReplReported
@@ -332,6 +342,7 @@ async_postgres/pg_connection/types.nim	replStopStatusQueued
 async_postgres/pg_connection/types.nim	replWriteError
 async_postgres/pg_connection/types.nim	replWriteFailure
 async_postgres/pg_connection/types.nim	replWritesOpen
+async_postgres/pg_connection/types.nim	reportsIsoDateStyle
 async_postgres/pg_connection/types.nim	requestListenStop
 async_postgres/pg_connection/types.nim	requeueHandoff
 async_postgres/pg_connection/types.nim	requireStaged
@@ -353,10 +364,14 @@ async_postgres/pg_connection/types.nim	sslHost
 async_postgres/pg_connection/types.nim	stageEvictedClose
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses
 async_postgres/pg_connection/types.nim	stagePendingStmtCloses#2
+async_postgres/pg_connection/types.nim	startupDateStyle
+async_postgres/pg_connection/types.nim	stmtCacheResetGen
 async_postgres/pg_connection/types.nim	stmtCachingEnabled
 async_postgres/pg_connection/types.nim	stmtNamePrefix
 async_postgres/pg_connection/types.nim	tailPendingReplStatus
 async_postgres/pg_connection/types.nim	takeNotifyHandoff
+async_postgres/pg_connection/types.nim	timeZoneChanged
+async_postgres/pg_connection/types.nim	timeZoneFollowsServer
 async_postgres/pg_connection/types.nim	tlsStream
 async_postgres/pg_connection/types.nim	tracer
 async_postgres/pg_connection/types.nim	transport
@@ -373,8 +388,6 @@ async_postgres/pg_connection/types.nim	writer
 async_postgres/pg_errors.nim	newStartupError
 async_postgres/pg_errors.nim	setPerHost
 async_postgres/pg_pool.nim	buildReleaseAndReraise
-async_postgres/pg_pool.nim	pendingAcquires
-async_postgres/pg_pool.nim	poolConfig
 async_postgres/pg_pool.nim	releaseReclaimed
 async_postgres/pg_protocol.nim	addBindPayload
 async_postgres/pg_protocol.nim	addInt64

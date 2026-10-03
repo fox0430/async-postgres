@@ -20,6 +20,8 @@ async_postgres.nim	export pg_pool.isClosed
 async_postgres.nim	export pg_pool.metrics
 async_postgres.nim	export pg_pool.newPool
 async_postgres.nim	export pg_pool.notify
+async_postgres.nim	export pg_pool.pendingAcquires
+async_postgres.nim	export pg_pool.poolConfig
 async_postgres.nim	export pg_pool.query
 async_postgres.nim	export pg_pool.queryColumn
 async_postgres.nim	export pg_pool.queryEach
@@ -967,6 +969,8 @@ async_postgres/pg_pool.nim	isClosed
 async_postgres/pg_pool.nim	metrics
 async_postgres/pg_pool.nim	newPool
 async_postgres/pg_pool.nim	notify
+async_postgres/pg_pool.nim	pendingAcquires
+async_postgres/pg_pool.nim	poolConfig
 async_postgres/pg_pool.nim	query
 async_postgres/pg_pool.nim	query#2
 async_postgres/pg_pool.nim	queryColumn

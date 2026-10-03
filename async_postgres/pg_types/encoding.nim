@@ -286,6 +286,8 @@ proc toPgParam*(v: seq[byte]): PgParam {.raises: [PgTypeError].} =
   PgParam(oid: OidBytea, format: 1, value: some(v))
 
 proc toPgParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
+  ## A ``timestamp`` of the UTC wall clock. A ``timestamptz`` target reads it
+  ## in the session ``TimeZone``, UTC unless configured otherwise.
   textParam(OidTimestamp, pgTimestampText(v), "timestamp")
 
 proc toPgDateParam*(v: DateTime): PgParam {.raises: [PgTypeError].} =
@@ -615,7 +617,7 @@ template writeTimeAt(buf: var openArray[byte], pos: int, val: PgTime) =
 template writeTimeTzAt(buf: var openArray[byte], pos: int, val: PgTimeTz) =
   block:
     let t = val
-    # Same TZDISP_LIMIT as decodeBinaryTimeTz; also prevents negating int32.low.
+    # timetz_recv's TZDISP_LIMIT; also prevents negating int32.low.
     checkPgTimeTzOffset(t.utcOffset)
     buf.writeBE64(pos, pgTimeFieldsMicros(t.hour, t.minute, t.second, t.microsecond))
     buf.writeBE32(pos + 8, int32(-t.utcOffset)) # PostgreSQL stores offset negated
@@ -776,6 +778,8 @@ proc toPgBinaryParam*(v: seq[byte]): PgParam {.raises: [PgTypeError].} =
   PgParam(oid: OidBytea, format: 1, value: some(v))
 
 proc toPgBinaryParam*(v: DateTime): PgParam =
+  ## A ``timestamp`` of the UTC wall clock. A ``timestamptz`` target reads it
+  ## in the session ``TimeZone``, UTC unless configured otherwise.
   PgParam(oid: OidTimestamp, format: 1, value: some(@(toBE64(pgTimestampMicros(v)))))
 
 proc toPgBinaryDateParam*(v: DateTime): PgParam =
@@ -1059,6 +1063,8 @@ proc toPgParam*(v: seq[PgBit]): PgParam {.raises: [PgTypeError, PgProtocolError]
 # Temporal array encoders
 
 proc toPgTimestampArrayParam*(v: seq[DateTime]): PgParam {.raises: [PgTypeError].} =
+  ## ``timestamp`` elements of the UTC wall clock. A ``timestamptz[]`` target
+  ## reads them in the session ``TimeZone``, UTC unless configured otherwise.
   buildFixedArray(OidTimestamp, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, 8):
     buf.writeBE64(pos, pgTimestampMicros(v[i]))
   PgParam(oid: OidTimestampArray, format: 1, value: some(buf))

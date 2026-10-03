@@ -1,9 +1,10 @@
-import std/[random, unittest, os, tempfiles, strutils]
+import std/[random, unittest, os, tempfiles, strutils, options]
 when defined(posix):
   import std/posix
 
 import ../async_postgres/[async_backend, pg_connection]
 import ../async_postgres/pg_connection/dsn {.all.}
+import ../async_postgres/pg_connection/types
 
 const dummyPem = "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n"
 
@@ -418,12 +419,65 @@ suite "parseDsn":
     expect PgConfigError:
       discard parseDsn("postgresql://host/db?CLIENT_ENCODING=LATIN1")
 
+  test "DateStyle accepts only the ISO output style":
+    for v in ["ISO", "iso, DMY", "DMY", "YMD, ISO", "\"ISO\", MDY", "Euro"]:
+      let cfg = parseDsn("host=h DateStyle='" & v & "'")
+      check cfg.extraParams == @[("DateStyle", v)]
+    for v in [
+      "SQL, DMY", "Postgres", "PostgreSQL, DMY", "german", "DEFAULT", "ISO, \"SQL\""
+    ]:
+      expect PgConfigError:
+        discard parseDsn("host=h DateStyle='" & v & "'")
+    expect PgConfigError:
+      discard parseDsn("postgresql://host/db?datestyle=SQL")
+
+  test "validateConnConfig rejects a non-ISO DateStyle in extraParams and options":
+    var cfg = parseDsn("postgresql://host/db")
+    for p in [
+      ("DateStyle", "ISO, DMY"),
+      ("datestyle", "MDY"),
+      ("options", "-c DateStyle=DMY"),
+      ("options", "--datestyle=ISO,YMD"),
+    ]:
+      cfg.extraParams = @[p]
+      validateConnConfig(cfg)
+    for p in [
+      ("DATESTYLE", "SQL"),
+      ("options", "-c DateStyle=SQL,DMY"),
+      ("options", "-cdatestyle=German"),
+      ("options", "-c work_mem=1MB --DateStyle=Postgres"),
+      ("options", "-c datestyle=postgresql"),
+    ]:
+      cfg.extraParams = @[p]
+      expect PgConfigError:
+        validateConnConfig(cfg)
+    expect PgConfigError:
+      discard parseDsn("host=h options='-c DateStyle=SQL'")
+
+  test "namesNonIsoDateStyle matches the server's style tokens":
+    # The server takes any token starting with "postgres" as that style.
+    for v in ["postgres_verbose", "\"PostgreSQL\"", "DMY, sql"]:
+      check namesNonIsoDateStyle(v)
+    for v in ["", "ISO", "DMY, ISO", "EUROPEAN", "NonEuro"]:
+      check not namesNonIsoDateStyle(v)
+
   test "splitStartupOptions matches pg_split_opts":
     check splitStartupOptions("  -c a=b\\ c   -d ") == @["-c", "a=b c", "-d"]
     check splitStartupOptions("a\\\\b") == @["a\\b"]
     # A trailing escape is dropped, leaving an empty argument when alone.
     check splitStartupOptions("-c x\\") == @["-c", "x"]
     check splitStartupOptions("-c \\") == @["-c", ""]
+
+  test "optionsTimeZone reads -c switches like the server":
+    check optionsTimeZone("-c TimeZone=Asia/Tokyo") == some("Asia/Tokyo")
+    check optionsTimeZone("-c work_mem=1MB --timezone=UTC") == some("UTC")
+    check optionsTimeZone("-cTIMEZONE=UTC") == some("UTC")
+    # The last switch wins, as on the server.
+    check optionsTimeZone("-c TimeZone=UTC -c TimeZone=Asia/Tokyo") == some(
+      "Asia/Tokyo"
+    )
+    for o in ["", "-c work_mem=1MB", "-c TimeZone", "-d TimeZone=UTC", "TimeZone=UTC"]:
+      check optionsTimeZone(o).isNone
 
   test "multiple query params":
     let cfg = parseDsn(
@@ -705,13 +759,31 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?keepalives_count=2147483648")
 
-  test "keepalive timings at the largest representable value":
-    let cfg = parseDsn(
-      "postgresql://host/db?keepalives_idle=2147483647&keepalives_interval=2147483647&keepalives_count=2147483647"
-    )
-    check cfg.keepAliveIdle == 2147483647
-    check cfg.keepAliveInterval == 2147483647
-    check cfg.keepAliveCount == 2147483647
+  test "keepalive timings at the largest accepted value":
+    when defined(linux):
+      let cfg = parseDsn(
+        "postgresql://host/db?keepalives_idle=32767&keepalives_interval=32767&keepalives_count=127"
+      )
+      check cfg.keepAliveIdle == 32767
+      check cfg.keepAliveInterval == 32767
+      check cfg.keepAliveCount == 127
+    else:
+      let cfg = parseDsn(
+        "postgresql://host/db?keepalives_idle=2147483647&keepalives_interval=2147483647&keepalives_count=2147483647"
+      )
+      check cfg.keepAliveIdle == 2147483647
+      check cfg.keepAliveInterval == 2147483647
+      check cfg.keepAliveCount == 2147483647
+
+  test "error: keepalive timings past the Linux kernel limits":
+    # setsockopt would reject them at connect, as a connection failure.
+    when defined(linux):
+      expect PgConfigError:
+        discard parseDsn("postgresql://host/db?keepalives_idle=32768")
+      expect PgConfigError:
+        discard parseDsn("postgresql://host/db?keepalives_interval=32768")
+      expect PgConfigError:
+        discard parseDsn("postgresql://host/db?keepalives_count=128")
 
   test "max_message_size from URI DSN":
     let cfg = parseDsn("postgresql://host/db?max_message_size=1048576")
@@ -1083,6 +1155,17 @@ suite "parseDsn":
     var cfg = ConnConfig(host: "myhost", port: 0)
     let hosts = cfg.getHosts()
     check hosts[0].port == 5432
+
+  test "getHosts drops a 127.0.0.1 host once a hostaddr is assigned":
+    let want = @[HostEntry(host: "", hostaddr: "10.0.0.1", port: 5432)]
+    var scalar = initConnConfig()
+    scalar.hostaddr = "10.0.0.1"
+    check scalar.getHosts() == want
+    var listed = parseDsn("dbname=db")
+    listed.hosts[0].hostaddr = "10.0.0.1"
+    check listed.getHosts() == want
+    let named = ConnConfig(host: "db.example.com", hostaddr: "10.0.0.1", port: 5432)
+    check named.getHosts()[0].host == "db.example.com"
 
   test "multi-host with target_session_attrs":
     let cfg = parseDsn("postgresql://h1,h2,h3/db?target_session_attrs=read-write")

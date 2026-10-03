@@ -447,9 +447,10 @@ suite "E2E: Logical Replication":
       let cb = makeReplicationCallback:
         discard
 
-      # Same verbatim-options legacy spellings as proto_version, plus the
-      # empty value that would reach the server as a flag-only option.
-      for bad in ["'my_pub'", "\"my_pub\"", ""]:
+      # The verbatim-options legacy spelling, plus the empty value that would
+      # reach the server as a flag-only option. Double quotes are allowed here:
+      # they quote an identifier in the list.
+      for bad in ["'my_pub'", "'\"MyPub\"'", ""]:
         var raised = false
         try:
           await replConn.startReplication(
@@ -464,6 +465,61 @@ suite "E2E: Logical Replication":
 
       doAssert replConn.state == csReady
       await replConn.close()
+
+    waitFor t()
+
+  test "double-quoted publication_names streams a mixed-case publication":
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery("DROP PUBLICATION IF EXISTS \"MixedCasePub\"")
+      discard await writer.simpleQuery("DROP TABLE IF EXISTS test_mixed_pub_tbl")
+      discard
+        await writer.simpleQuery("CREATE TABLE test_mixed_pub_tbl (id int PRIMARY KEY)")
+      discard await writer.simpleQuery(
+        "CREATE PUBLICATION \"MixedCasePub\" FOR TABLE test_mixed_pub_tbl"
+      )
+
+      let replConn = await connectReplication(plainConfig())
+      let slot = await replConn.createReplicationSlot(
+        "test_mixed_pub_slot", "pgoutput", temporary = true
+      )
+
+      var gotInsert = false
+      let cb = makeReplicationCallback:
+        if msg.kind == rmkXLogData:
+          let pgMsg = decodePgOutput(msg.xlogData)
+          if pgMsg.kind == pomkInsert:
+            gotInsert = true
+          elif pgMsg.kind == pomkCommit and gotInsert:
+            await replConn.stopReplication()
+
+      proc insertRow() {.async.} =
+        await sleepAsync(milliseconds(200))
+        discard await writer.simpleQuery("INSERT INTO test_mixed_pub_tbl VALUES (1)")
+        # Unquoted, the server would look up "mixedcasepub" and stream nothing:
+        # stop after a bound so that failure ends the test.
+        for _ in 0 ..< 50:
+          if gotInsert:
+            return
+          await sleepAsync(milliseconds(100))
+        if replConn.state == csReplicating:
+          await replConn.stopReplication()
+
+      let insertFut = insertRow()
+      await replConn.startReplication(
+        "test_mixed_pub_slot",
+        slot.consistentPoint,
+        options = @{"publication_names": "\"MixedCasePub\""},
+        callback = cb,
+      )
+      await insertFut
+
+      doAssert gotInsert, "a double-quoted mixed-case publication should stream"
+
+      await replConn.close()
+      discard await writer.simpleQuery("DROP PUBLICATION \"MixedCasePub\"")
+      discard await writer.simpleQuery("DROP TABLE test_mixed_pub_tbl")
+      await writer.close()
 
     waitFor t()
 

@@ -160,9 +160,11 @@ export pg_pool.PoolMetrics
 export pg_pool.PooledConnHandle
 export pg_pool.PgPool
 export pg_pool.initPoolConfig
+export pg_pool.poolConfig
 export pg_pool.idleCount
 export pg_pool.activeCount
 export pg_pool.size
+export pg_pool.pendingAcquires
 export pg_pool.isClosed
 export pg_pool.metrics
 export pg_pool.connectRefusal

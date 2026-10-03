@@ -28,8 +28,8 @@ permissions:
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
-    # macOS and Windows are compile-heavy and slower than Linux: Linux
-    # finishes in about 15 minutes, macOS devel takes about 30.
+    # macOS and Windows are compile-heavy and slower than Linux, which
+    # finishes in about 15 minutes.
     timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 30 || 60 }}
     strategy:
       matrix:
@@ -43,7 +43,10 @@ jobs:
           - 'devel'
         exclude:
           # setup-nim-action cannot install the devel compiler on Windows.
+          # macOS devel is too slow.
           - os: 'windows-latest'
+            nim-version: 'devel'
+          - os: 'macOS-latest'
             nim-version: 'devel'
 
     name: Tests on ${{ matrix.nim-version }} (${{ matrix.os }})

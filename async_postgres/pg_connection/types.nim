@@ -5,7 +5,8 @@
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[tables, sets, deques, lists, macros, options]
-from std/strutils import isAlphaNumeric, toLowerAscii, cmpIgnoreCase
+from std/strutils import
+  isAlphaNumeric, toLowerAscii, cmpIgnoreCase, split, strip, startsWith, Whitespace
 when defined(posix):
   import std/posix
 
@@ -141,7 +142,9 @@ type
     lbhRandom ## Shuffle host list per connection (replica spread)
 
   HostEntry* = object ## A single host:port entry for multi-host connection.
-    host*: string ## Host name (or Unix socket dir); used for SSL verification
+    host*: string
+      ## Host name (or Unix socket dir); used for SSL verification, except
+      ## `127.0.0.1` alongside a `hostaddr` (see `effectiveHost`).
     hostaddr*: string
       ## Address dialed instead of resolving `host` (libpq `hostaddr`).
       ## Empty = resolve `host`.
@@ -153,7 +156,8 @@ type
     port*: int # default 5432
     hostaddr*: string
       ## Address dialed instead of resolving `host` (libpq `hostaddr`).
-      ## `host` is still the name used for SSL certificate verification.
+      ## `host` is still the name used for SSL certificate verification,
+      ## except `127.0.0.1` (see `effectiveHost`).
     user*: string
     password*: string
       ## Cleartext password (libpq ``password``), held in plaintext in memory.
@@ -179,7 +183,10 @@ type
       ## **unencrypted** on both backends (no passphrase callback is wired up).
       ## PKCS#8, PKCS#1 (``RSA PRIVATE KEY``) and SEC1 (``EC PRIVATE KEY``) PEM
       ## are accepted. Must be paired with ``sslCert``.
-    sslSni*: bool ## Send TLS SNI (default true; suppressed for IP/empty host).
+    sslSni*: bool
+      ## Send TLS SNI (default true; suppressed for IP/empty host). chronos
+      ## ignores it: it sends SNI only under `sslVerifyFull`, where BearSSL
+      ## checks the same name.
     channelBinding*: ChannelBindingMode
       ## SCRAM channel binding policy (default cbPrefer). `cbRequire` fails the
       ## connection if SCRAM-SHA-256-PLUS cannot actually be used (libpq parity).
@@ -194,10 +201,14 @@ type
     keepAlive*: bool
       ## Enable TCP keepalive (default true via parseDsn). POSIX only: Windows
       ## has no keepalive path, so this and the timing options below are ignored there.
-    keepAliveIdle*: int ## Seconds before first probe (0 = OS default). POSIX only.
-    keepAliveInterval*: int ## Seconds between probes (0 = OS default). POSIX only.
+    keepAliveIdle*: int
+      ## Seconds before first probe (0 = OS default; at most 32767 on Linux).
+      ## POSIX only.
+    keepAliveInterval*: int
+      ## Seconds between probes (0 = OS default; at most 32767 on Linux). POSIX only.
     keepAliveCount*: int
-      ## Number of probes before giving up (0 = OS default). POSIX only.
+      ## Number of probes before giving up (0 = OS default; at most 127 on Linux).
+      ## POSIX only.
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     loadBalanceHosts*: LoadBalanceHosts
@@ -209,6 +220,23 @@ type
       ## Forwarded verbatim; treat as trusted config — typos are not rejected.
       ## Exception: ``client_encoding`` is always sent as UTF8, and another
       ## value (also via ``-c`` in ``options``) raises ``PgConfigError``.
+      ## Likewise ``DateStyle`` is always sent with the ISO output style, so it
+      ## overrides a role or database one, field order included (the order from
+      ## the server's configuration or a ``-c`` in ``options`` stays). One here
+      ## may set only the field order (``DMY``, ...); another output style
+      ## raises ``PgConfigError`` the same way. As startup values, both survive
+      ## ``RESET`` and ``DISCARD ALL``; a later ``SET`` of either to a value the
+      ## decoders cannot read closes the connection with ``PgProtocolError``.
+      ## ``TimeZone`` is sent as UTC unless set here or via ``-c`` in
+      ## ``options``; ``DEFAULT`` sends none, keeping the server's, database's
+      ## or role's zone. A session asked for UTC that reports another zone (a
+      ## proxy dropped the startup value) fails ``connect`` with
+      ## ``PgConnectionError``. In another zone, the ``DateTime`` encoders that
+      ## send ``timestamp`` (``toPgParam``, ``toPgBinaryParam``,
+      ## ``toPgTimestampArrayParam``) shift by its offset when bound to
+      ## ``timestamptz``; the ``TimestampTz`` ones do not. The ``DateTime``
+      ## range and multirange encoders shift the same way when a ``tsrange`` or
+      ## ``tsmultirange`` value is bound to its ``tstz`` counterpart.
     maxMessageSize*: int
       ## Max backend message size (0 = 1 GiB default); larger → ``PgProtocolError``.
     maxScramIterations*: int
@@ -381,6 +409,7 @@ type
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
     stmtCounter: int
     stmtCacheCapacity: int ## 0=disabled, default 256
+    stmtCacheResetGen: int ## Bumped by ``clearStmtCache``.
     pendingStmtCloses: seq[string]
       ## Server-side prepared statement names whose ``Close`` was not bundled
       ## with the operation that evicted them. Populated when the defensive
@@ -409,6 +438,13 @@ type
       ## reset/discard decision so `pg_advisory_unlock_all` runs whenever a
       ## tracked acquire ever happened, even if the tracked counter was
       ## decremented back to zero by a typed unlock of a raw-acquired key.
+    connectTimeZone: string
+      ## ``TimeZone`` the pool restores on release: the zone the session started
+      ## with, or — with ``timeZoneFollowsServer`` — the zone the server
+      ## reported after its last ``RESET TimeZone``.
+    timeZoneFollowsServer: bool
+      ## No startup ``TimeZone`` (``DEFAULT``): the server's, database's or
+      ## role's zone applies, so the pool restores it with ``RESET``.
     tracer: PgTracer ## Inherited from ConnConfig on connect
     ownerPool: PgPoolOwner
       ## Owning pool back-reference. Set when this connection is managed by
@@ -769,6 +805,14 @@ proc validateTlsConfig*(
 
 # HostEntry accessors
 
+const DefaultHost* = "127.0.0.1" ## Target when neither host nor hostaddr is given.
+
+func effectiveHost*(entry: HostEntry): string {.inline.} =
+  ## `host` as the name to verify. With a `hostaddr`, `127.0.0.1` is dropped:
+  ## it may be the default left behind when `hostaddr` is set later, and an
+  ## explicit one looks the same.
+  if entry.hostaddr.len > 0 and entry.host == DefaultHost: "" else: entry.host
+
 func dialAddr*(entry: HostEntry): string {.inline.} =
   ## The address actually dialed: `hostaddr` when given, otherwise `host`.
   ## Unlike libpq, a name in `hostaddr` is resolved rather than rejected.
@@ -972,6 +1016,8 @@ proc graftReconnectedSession*(conn, src: PgConnection) =
   conn.secretKey = src.secretKey
   conn.serverParams = src.serverParams
   conn.serverParamsBytes = src.serverParamsBytes
+  conn.connectTimeZone = src.connectTimeZone
+  conn.timeZoneFollowsServer = src.timeZoneFollowsServer
   conn.txStatus = src.txStatus
   conn.createdAt = src.createdAt
   conn.recvBuf = src.recvBuf
@@ -1569,9 +1615,110 @@ proc isUtf8EncodingName*(val: string): bool =
       name.add(c.toLowerAscii)
   name in ["utf8", "unicode"]
 
-proc isClientEncodingKey*(key: string): bool =
+proc isGucName*(key, name: string): bool =
   ## GUC names are case-insensitive.
-  cmpIgnoreCase(key, "client_encoding") == 0
+  cmpIgnoreCase(key, name) == 0
+
+proc namesNonIsoDateStyle*(val: string): bool =
+  ## Whether a ``DateStyle`` value picks an output style other than ISO.
+  ## ``DEFAULT`` counts: it is the server's, possibly non-ISO. The server
+  ## takes any token starting with ``postgres`` as that style.
+  for item in val.split(','):
+    let token = item.strip(chars = Whitespace + {'"'}).toLowerAscii
+    if token in ["sql", "german", "default"] or token.startsWith("postgres"):
+      return true
+  false
+
+proc reportsIsoDateStyle*(value: string): bool =
+  ## Whether a reported ``DateStyle`` has the ISO output style the text
+  ## decoders parse. The server reports the style first: ``ISO, MDY``.
+  value.toLowerAscii.startsWith("iso")
+
+proc isZeroOffsetSpec(spec: string): bool =
+  ## Whether a POSIX-style offset spec — ``[+-]hh[:mm[:ss]]``, a field may
+  ## carry a decimal fraction — names zero: every digit is ``0``. A sign
+  ## alone, an empty field, a fourth field, a stray character or a non-zero
+  ## digit fails, so a DST tail cannot slip through.
+  var i = 0
+  if i < spec.len and spec[i] in {'+', '-'}:
+    inc i
+  var separators = 0
+  var sawValue = false
+  while i < spec.len:
+    var digits = 0
+    while i < spec.len and spec[i] in {'0' .. '9'}:
+      if spec[i] != '0':
+        return false
+      inc digits
+      inc i
+    if i < spec.len and spec[i] == '.':
+      inc i
+      while i < spec.len and spec[i] in {'0' .. '9'}:
+        if spec[i] != '0':
+          return false
+        inc digits
+        inc i
+    if digits == 0:
+      return false
+    sawValue = true
+    if i < spec.len and spec[i] == ':':
+      if separators >= 2:
+        return false
+      inc separators
+      inc i
+      continue
+    break
+  sawValue and i == spec.len
+
+proc isUtcZoneName*(val: string): bool =
+  ## Whether ``val`` names a zone fixed at UTC+0, in any case and under the
+  ## spellings the server accepts and reports: the tzdata links (``UTC``,
+  ## ``Etc/UTC``, ``GMT0``, ``Greenwich``, ...), POSIX forms of those with a
+  ## zero offset (``UTC0``, ``GMT+00:00``, ...), a bare zero offset (``0``,
+  ## ``+00``, ``0.0``) and the synthetic bracketed name of a numeric zone
+  ## (``<+00>-00``). Any non-zero offset fails, so ``Etc/GMT+1``,
+  ## ``GMT+00:01`` and ``<+09>-09`` are not UTC.
+  const utcNames = ["utc", "uct", "universal", "zulu", "gmt", "gmt0", "greenwich"]
+  const etcPrefix = "etc/"
+  var name = val.toLowerAscii
+  if name.len > etcPrefix.len and name.startsWith(etcPrefix):
+    name = name[etcPrefix.len .. ^1]
+  if name in utcNames:
+    return true
+  var head = ""
+  var tail = ""
+  var bracketed = false
+  if name.len > 0 and name[0] == '<':
+    bracketed = true
+    var close = -1
+    for i in 1 ..< name.len:
+      if name[i] == '>':
+        close = i
+        break
+    if close < 0:
+      return false
+    tail = name[close + 1 .. ^1]
+  else:
+    for i in 0 ..< name.len:
+      if name[i] in {'+', '-', '.'} or name[i] in {'0' .. '9'}:
+        head = name[0 ..< i]
+        tail = name[i .. ^1]
+        break
+    if tail.len == 0:
+      # No offset part: only the pure tzdata links above are UTC.
+      return false
+  if not bracketed and head.len > 0 and head notin utcNames:
+    return false
+  isZeroOffsetSpec(tail)
+
+proc startupDateStyle*(val: string): string =
+  ## The startup ``DateStyle`` for a caller's ``val`` (empty if none), which
+  ## names no other output style: ISO, then any field order ``val`` sets. The
+  ## server accepts a repeated ``ISO``.
+  if val.strip.len == 0:
+    "ISO"
+  else:
+    "ISO, " & val
 
 proc recordParameterStatus*(
     conn: PgConnection, name, value: string
@@ -1701,6 +1848,19 @@ proc invalidateStmtCache*(conn: PgConnection, sql, stmtName: string) =
   conn.removeStmtCache(sql)
   conn.queueStmtClose(stmtName)
 
+proc invalidateAllStmtCache*(conn: PgConnection, sql, stmtName: string) =
+  ## Drop every entry and queue its ``Close``: a hit's statement vanished with
+  ## no reset tag seen, so the rest likely went with it. A ``Close`` for a name
+  ## already gone is a backend no-op. A no-op once ``sql`` no longer maps to
+  ## ``stmtName``, as in ``invalidateStmtCache``.
+  let entry = conn.stmtCache.getOrDefault(sql)
+  if entry == nil or entry.name != stmtName:
+    return
+  for cachedSql in conn.stmtCacheLru:
+    conn.queueStmtClose(conn.stmtCache[cachedSql].name)
+  conn.stmtCache.clear()
+  conn.stmtCacheLru = initDoublyLinkedList[string]()
+
 proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   ## Add a prepared statement to the cache with auto-computed result formats.
   ## Single-statement callers pre-evict (``evictForInsert``) so the Close
@@ -1735,15 +1895,22 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
   conn.stmtCacheLru.append(node)
 
 proc clearStmtCache*(conn: PgConnection) =
-  ## Clear the client-side statement cache. Does not close server-side
-  ## statements, including any ``Close`` messages queued in
-  ## ``pendingStmtCloses`` from defensive eviction — the queue is dropped on
-  ## the assumption the caller will reset the session externally (e.g. via
-  ## ``DISCARD ALL`` or by closing the connection).
+  ## Forget every cached statement and owed ``Close``: the session no longer
+  ## holds them. A miss Parsed before this settles as gone (``stmtCacheResetGen``).
   conn.stmtCache.clear()
   conn.stmtCacheLru = initDoublyLinkedList[string]()
   conn.pendingStmtCloses.setLen(0)
   conn.stagedStmtCloses.setLen(0)
+  inc conn.stmtCacheResetGen
+
+func stmtCacheResetGen*(conn: PgConnection): int {.inline.} =
+  conn.stmtCacheResetGen
+
+proc noteCommandTag*(conn: PgConnection, tag: string) =
+  ## Drop the cache once the session's prepared statements are gone. A run
+  ## inside a function sends no such tag; the first hit's 26000 catches that.
+  if tag in ["DISCARD ALL", "DEALLOCATE ALL"]:
+    conn.clearStmtCache()
 
 proc stagePendingStmtCloses*(conn: PgConnection, buf: var seq[byte]) =
   ## Append a ``Close`` for every owed statement name to ``buf`` so they ride
@@ -1864,6 +2031,25 @@ func serverParams*(conn: PgConnection): lent Table[string, string] {.inline.} =
 func serverParam*(conn: PgConnection, name: string): string =
   ## One ``ParameterStatus`` value, or ``""`` when the server never sent it.
   conn.serverParams.getOrDefault(name, "")
+
+proc noteConnectTimeZone*(conn: PgConnection, followsServer: bool) {.inline.} =
+  ## Take the reported ``TimeZone`` as the one the pool restores, and how.
+  conn.connectTimeZone = conn.serverParam("TimeZone")
+  conn.timeZoneFollowsServer = followsServer
+
+func connectTimeZone*(conn: PgConnection): string {.inline.} =
+  conn.connectTimeZone
+
+func timeZoneFollowsServer*(conn: PgConnection): bool {.inline.} =
+  conn.timeZoneFollowsServer
+
+func timeZoneChanged*(conn: PgConnection): bool {.inline.} =
+  ## Whether ``TimeZone`` has moved to a zone a ``DateTime`` param would read
+  ## differently under. A UTC+0 spelling of the connect zone (``Etc/UTC`` for
+  ## ``UTC``) shifts nothing, so it counts as unchanged.
+  let zone = conn.serverParam("TimeZone")
+  zone != conn.connectTimeZone and
+    not (isUtcZoneName(zone) and isUtcZoneName(conn.connectTimeZone))
 
 func notifyDropped*(conn: PgConnection): int {.inline.} =
   ## Notifications dropped by pull-API queue overflow since the last
