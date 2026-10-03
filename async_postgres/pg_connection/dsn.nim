@@ -442,6 +442,19 @@ const maxSockOptInt = int64(high(cint))
   ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
   ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
 
+when defined(linux):
+  # The kernel's MAX_TCP_KEEPIDLE / MAX_TCP_KEEPINTVL / MAX_TCP_KEEPCNT. Past
+  # them `setsockopt` fails at connect, which reads as a connection failure.
+  const
+    maxKeepAliveIdle = 32767'i64
+    maxKeepAliveInterval = 32767'i64
+    maxKeepAliveCount = 127'i64
+else:
+  const
+    maxKeepAliveIdle = maxSockOptInt
+    maxKeepAliveInterval = maxSockOptInt
+    maxKeepAliveCount = maxSockOptInt
+
 proc checkClientEncoding(val: string) =
   ## The client pins ``client_encoding`` to UTF8.
   if not isUtf8EncodingName(val):
@@ -611,9 +624,11 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(
         PgConfigError, "keepalives_idle must be non-negative (len=" & $val.len & ")"
       )
-    if int64(result.keepAliveIdle) > maxSockOptInt:
+    if int64(result.keepAliveIdle) > maxKeepAliveIdle:
       raise newException(
-        PgConfigError, "keepalives_idle out of range (len=" & $val.len & ")"
+        PgConfigError,
+        "keepalives_idle out of range (0-" & $maxKeepAliveIdle & ") (len=" & $val.len &
+          ")",
       )
   of "keepalives_interval":
     result.keepAliveInterval = parseDsnInt(val, "keepalives_interval")
@@ -621,9 +636,11 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(
         PgConfigError, "keepalives_interval must be non-negative (len=" & $val.len & ")"
       )
-    if int64(result.keepAliveInterval) > maxSockOptInt:
+    if int64(result.keepAliveInterval) > maxKeepAliveInterval:
       raise newException(
-        PgConfigError, "keepalives_interval out of range (len=" & $val.len & ")"
+        PgConfigError,
+        "keepalives_interval out of range (0-" & $maxKeepAliveInterval & ") (len=" &
+          $val.len & ")",
       )
   of "keepalives_count":
     result.keepAliveCount = parseDsnInt(val, "keepalives_count")
@@ -631,9 +648,11 @@ proc applyParam(result: var ConnConfig, key, val: string) =
       raise newException(
         PgConfigError, "keepalives_count must be non-negative (len=" & $val.len & ")"
       )
-    if int64(result.keepAliveCount) > maxSockOptInt:
+    if int64(result.keepAliveCount) > maxKeepAliveCount:
       raise newException(
-        PgConfigError, "keepalives_count out of range (len=" & $val.len & ")"
+        PgConfigError,
+        "keepalives_count out of range (0-" & $maxKeepAliveCount & ") (len=" & $val.len &
+          ")",
       )
   of "target_session_attrs":
     result.targetSessionAttrs = parseTargetSessionAttrs(val)
@@ -1052,16 +1071,23 @@ proc validateConnConfig*(config: var ConnConfig) =
 
   if config.keepAliveIdle < 0:
     raise newException(PgConfigError, "keepalives_idle must be non-negative")
-  if int64(config.keepAliveIdle) > maxSockOptInt:
-    raise newException(PgConfigError, "keepalives_idle out of range")
+  if int64(config.keepAliveIdle) > maxKeepAliveIdle:
+    raise newException(
+      PgConfigError, "keepalives_idle out of range (0-" & $maxKeepAliveIdle & ")"
+    )
   if config.keepAliveInterval < 0:
     raise newException(PgConfigError, "keepalives_interval must be non-negative")
-  if int64(config.keepAliveInterval) > maxSockOptInt:
-    raise newException(PgConfigError, "keepalives_interval out of range")
+  if int64(config.keepAliveInterval) > maxKeepAliveInterval:
+    raise newException(
+      PgConfigError,
+      "keepalives_interval out of range (0-" & $maxKeepAliveInterval & ")",
+    )
   if config.keepAliveCount < 0:
     raise newException(PgConfigError, "keepalives_count must be non-negative")
-  if int64(config.keepAliveCount) > maxSockOptInt:
-    raise newException(PgConfigError, "keepalives_count out of range")
+  if int64(config.keepAliveCount) > maxKeepAliveCount:
+    raise newException(
+      PgConfigError, "keepalives_count out of range (0-" & $maxKeepAliveCount & ")"
+    )
 
   if config.maxMessageSize < 0:
     raise newException(PgConfigError, "max_message_size must be non-negative")
