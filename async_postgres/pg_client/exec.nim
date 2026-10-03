@@ -20,29 +20,30 @@ proc execImpl*(
   validateExtendedQuery(sql, params.len, paramOids.len)
   validateEncodedParams(params, paramFormats.len)
 
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
-  var cacheMiss = false
-  var stmtName = ""
+  retryStmtCacheInvalidation(conn, cacheHit, facts):
+    let cached = conn.lookupStmtCache(sql)
+    cacheHit = cached != nil
+    conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+    var cacheMiss = false
+    var stmtName = ""
 
-  # PG Bind treats 0 format codes as "all params text" — equivalent on the
-  # wire to N zeros, so pass paramFormats through even when empty.
-  sendExtendedExec(
-    conn = conn,
-    cached = cached,
-    cacheHit = cacheHit,
-    cacheMiss = cacheMiss,
-    stmtName = stmtName,
-    parseStep = conn.addParse(stmtName, sql, paramOids),
-    bindStep = conn.addBind("", stmtName, paramFormats, params),
-  )
-  conn.markBusy()
-  await conn.sendStagedBufMsg()
+    # PG Bind treats 0 format codes as "all params text" — equivalent on the
+    # wire to N zeros, so pass paramFormats through even when empty.
+    sendExtendedExec(
+      conn = conn,
+      cached = cached,
+      cacheHit = cacheHit,
+      cacheMiss = cacheMiss,
+      stmtName = stmtName,
+      parseStep = conn.addParse(stmtName, sql, paramOids),
+      bindStep = conn.addBind("", stmtName, paramFormats, params),
+    )
+    conn.markBusy()
+    await conn.sendStagedBufMsg()
 
-  var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
-  return commandTag
+    var commandTag = ""
+    execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, facts)
+    return commandTag
 
 proc execImpl*(
     conn: PgConnection, sql: string, params: seq[PgParam] = @[]
@@ -51,27 +52,28 @@ proc execImpl*(
   validateExtendedQuery(sql, params.len)
   validateTypedParams(params)
 
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
-  var cacheMiss = false
-  var stmtName = ""
+  retryStmtCacheInvalidation(conn, cacheHit, facts):
+    let cached = conn.lookupStmtCache(sql)
+    cacheHit = cached != nil
+    conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
+    var cacheMiss = false
+    var stmtName = ""
 
-  sendExtendedExec(
-    conn = conn,
-    cached = cached,
-    cacheHit = cacheHit,
-    cacheMiss = cacheMiss,
-    stmtName = stmtName,
-    parseStep = conn.addParse(stmtName, sql, params),
-    bindStep = conn.addBind("", stmtName, params),
-  )
-  conn.markBusy()
-  await conn.sendStagedBufMsg()
+    sendExtendedExec(
+      conn = conn,
+      cached = cached,
+      cacheHit = cacheHit,
+      cacheMiss = cacheMiss,
+      stmtName = stmtName,
+      parseStep = conn.addParse(stmtName, sql, params),
+      bindStep = conn.addBind("", stmtName, params),
+    )
+    conn.markBusy()
+    await conn.sendStagedBufMsg()
 
-  var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
-  return commandTag
+    var commandTag = ""
+    execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, facts)
+    return commandTag
 
 proc exec*(
     conn: PgConnection,
@@ -114,27 +116,28 @@ proc execInlineImpl*(
   validateExtendedQuery(sql, ranges.len, paramOids.len)
   validateRawBind(data, ranges, paramFormats)
 
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
-  var cacheMiss = false
-  var stmtName = ""
+  retryStmtCacheInvalidation(conn, cacheHit, facts):
+    let cached = conn.lookupStmtCache(sql)
+    cacheHit = cached != nil
+    conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+    var cacheMiss = false
+    var stmtName = ""
 
-  sendExtendedExec(
-    conn = conn,
-    cached = cached,
-    cacheHit = cacheHit,
-    cacheMiss = cacheMiss,
-    stmtName = stmtName,
-    parseStep = conn.addParse(stmtName, sql, paramOids),
-    bindStep = conn.addBindRaw("", stmtName, paramFormats, data, ranges),
-  )
-  conn.markBusy()
-  await conn.sendStagedBufMsg()
+    sendExtendedExec(
+      conn = conn,
+      cached = cached,
+      cacheHit = cacheHit,
+      cacheMiss = cacheMiss,
+      stmtName = stmtName,
+      parseStep = conn.addParse(stmtName, sql, paramOids),
+      bindStep = conn.addBindRaw("", stmtName, paramFormats, data, ranges),
+    )
+    conn.markBusy()
+    await conn.sendStagedBufMsg()
 
-  var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
-  return commandTag
+    var commandTag = ""
+    execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, facts)
+    return commandTag
 
 proc exec*(
     conn: PgConnection,

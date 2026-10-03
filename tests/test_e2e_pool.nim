@@ -2,8 +2,10 @@ import std/[unittest, options, importutils, deques, tables]
 from std/times import dateTime, mJan, utc
 
 import
-  ../async_postgres/
-    [async_backend, pg_types, pg_client, pg_pool, pg_connection, pg_advisory_lock]
+  ../async_postgres/[
+    async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection,
+    pg_advisory_lock,
+  ]
 
 from ../async_postgres/pg_connection/types import timeZoneChanged
 
@@ -302,6 +304,236 @@ suite "E2E: resetQuery and the statement cache":
           )[0].rows[0].getInt(0)
           doAssert server == conn.stmtCache.len
         await pool.close()
+
+    waitFor t()
+
+suite "E2E: statement cache invalidation retry":
+  # Drops the session's prepared statements without a reset tag: the block
+  # reports DO, as a function running DEALLOCATE ALL reports SELECT.
+  const dropStmtsSql = "DO $$ BEGIN EXECUTE 'DEALLOCATE ALL'; END $$"
+
+  test "a resetQuery that deallocates inside a function costs no borrower error":
+    # A DEALLOCATE ALL inside a function sends no reset tag, so the next
+    # cache-hit Bind fails with 26000. That failure drops the whole cache, so
+    # within a pass only the last borrow -- the one repeating a statement an
+    # earlier borrow cached -- hits. The op is re-issued once from Parse
+    # instead of surfacing the error; without the retry that borrow raises.
+    proc t() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(
+          plainConfig(), minSize = 0, maxSize = 1, resetQuery = dropStmtsSql
+        )
+      )
+      defer:
+        await pool.close()
+      for _ in 0 ..< 4:
+        pool.withConnection(conn):
+          doAssert (await conn.query("SELECT 1")).rows[0].getInt(0) == 1
+        pool.withConnection(conn2):
+          discard await conn2.exec("SELECT 2")
+        pool.withConnection(conn3):
+          var seen = 0
+          let n = await conn3.queryEach(
+            "SELECT 3",
+            callback = proc(row: Row) =
+              doAssert row.getInt(0) == 3
+              inc seen
+            ,
+          )
+          doAssert n == 1
+          doAssert seen == 1
+        pool.withConnection(conn4):
+          doAssert (await conn4.query("SELECT $1", @[toPgParamInline(4'i32)])).rows[0].getInt(
+            0
+          ) == 4
+        pool.withConnection(conn5):
+          discard await conn5.exec("SELECT $1", @[toPgParamInline(5'i32)])
+
+    waitFor t()
+
+  test "every extended path re-issues a dropped cache-hit statement once":
+    # Each op first caches its own statement, then the session's statements
+    # are dropped with no reset tag, then the same op runs again as a cache
+    # hit: its 26000 must be re-issued from Parse, under a fresh name, instead
+    # of reaching the caller.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+
+      template rerunAfterDrop(sql: string, op: untyped) =
+        block:
+          op
+        let cachedName = conn.stmtCache[sql].name
+        discard await conn.simpleExec(dropStmtsSql)
+        doAssert conn.stmtCache[sql].name == cachedName, sql
+        block:
+          op
+        doAssert conn.stmtCache[sql].name != cachedName, sql
+
+      rerunAfterDrop("SELECT 1"):
+        doAssert (await conn.query("SELECT 1")).rows[0].getInt(0) == 1
+      rerunAfterDrop("SELECT $1"):
+        doAssert (await conn.query("SELECT $1", @[toPgParamInline(1'i32)])).rows[0].getInt(
+          0
+        ) == 1
+      rerunAfterDrop("SELECT 2"):
+        discard await conn.exec("SELECT 2")
+      rerunAfterDrop("SELECT $1"):
+        discard await conn.exec("SELECT $1", @[toPgParamInline(2'i32)])
+      rerunAfterDrop("SELECT 3"):
+        var seen = 0
+        let n = await conn.queryEach(
+          "SELECT 3",
+          callback = proc(row: Row) =
+            doAssert row.getInt(0) == 3
+            inc seen
+          ,
+        )
+        doAssert n == 1
+        doAssert seen == 1
+
+      let server = (
+        await conn.simpleQuery("SELECT count(*)::int FROM pg_prepared_statements")
+      )[0].rows[0].getInt(0)
+      doAssert server == conn.stmtCache.len
+
+    waitFor t()
+
+  test "a pipeline surfaces a dropped cache hit's 26000 instead of re-issuing":
+    # Every op is sent before the first reply, so each cache hit of the batch
+    # Binds a dropped statement: executeIsolated reports a 26000 per hit (a
+    # miss still runs) and execute fails the batch.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+
+      for sql in ["SELECT 1", "SELECT 2"]:
+        discard await conn.query(sql)
+      discard await conn.simpleExec(dropStmtsSql)
+      let p = newPipeline(conn)
+      p.addQuery("SELECT 1")
+      p.addQuery("SELECT 3")
+      p.addQuery("SELECT 2")
+      let ir = await p.executeIsolated()
+      for i in [0, 2]:
+        doAssert ir.errors[i] != nil
+        doAssert (ref PgQueryError)(ir.errors[i]).sqlState == "26000"
+      doAssert ir.errors[1] == nil
+      doAssert ir.results[1].queryResult.rows[0].getInt(0) == 3
+
+      for sql in ["SELECT 1", "SELECT 2"]:
+        discard await conn.query(sql)
+      discard await conn.simpleExec(dropStmtsSql)
+      let p2 = newPipeline(conn)
+      p2.addQuery("SELECT 1")
+      p2.addQuery("SELECT 2")
+      var saw26000 = false
+      try:
+        discard await p2.execute()
+      except PgQueryError as e:
+        saw26000 = e.sqlState == "26000"
+      doAssert saw26000
+
+    waitFor t()
+
+  test "a 26000 inside a transaction still surfaces instead of retrying":
+    # Re-issuing inside a transaction would run on an aborted transaction, so
+    # the 26000 must reach the caller. Each path gets its own transaction:
+    # the first failure aborts it and drops the cache, so the next path
+    # repopulates the cache first.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+
+      template rerunInTxAfterDrop(op: untyped) =
+        block:
+          op
+        discard await conn.simpleExec("BEGIN")
+        discard await conn.simpleExec(dropStmtsSql)
+        var saw26000 = false
+        try:
+          op
+        except PgQueryError as e:
+          saw26000 = e.sqlState == "26000"
+        doAssert saw26000
+        discard await conn.simpleExec("ROLLBACK")
+
+      rerunInTxAfterDrop:
+        discard await conn.query("SELECT 1")
+      rerunInTxAfterDrop:
+        discard await conn.exec("SELECT 2")
+      rerunInTxAfterDrop:
+        discard await conn.queryEach(
+          "SELECT 3",
+          callback = proc(row: Row) =
+            doAssert row.getInt(0) == 3
+          ,
+        )
+      rerunInTxAfterDrop:
+        discard await conn.query("SELECT $1", @[toPgParamInline(4'i32)])
+      rerunInTxAfterDrop:
+        discard await conn.exec("SELECT $1", @[toPgParamInline(5'i32)])
+
+    waitFor t()
+
+  test "an Execute-phase 26000 is not re-issued and keeps the cache":
+    # A 26000 raised by the statement itself must surface once per path: Bind
+    # already completed, so Execute may have run side effects. A session-local
+    # sequence pins the execution counts: each pair of calls must advance it
+    # by exactly two, not three. The statement bound, so the cache survives.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      defer:
+        await conn.close()
+      discard await conn.simpleExec("CREATE TEMP SEQUENCE exec_phase_seq")
+      for sig in ["", "x int"]:
+        discard await conn.simpleExec(
+          "CREATE FUNCTION pg_temp.exec_phase_26000(" & sig & ") RETURNS void AS " &
+            "$$ BEGIN PERFORM nextval('exec_phase_seq'); " &
+            "RAISE EXCEPTION 'boom' USING ERRCODE = '26000'; END $$ LANGUAGE plpgsql"
+        )
+      discard await conn.query("SELECT 1")
+
+      template runTwiceExpecting26000(op: untyped) =
+        for _ in 0 ..< 2:
+          var saw26000 = false
+          try:
+            op
+          except PgQueryError as e:
+            saw26000 = e.sqlState == "26000"
+          doAssert saw26000
+
+      runTwiceExpecting26000:
+        discard await conn.query("SELECT pg_temp.exec_phase_26000()")
+      runTwiceExpecting26000:
+        discard await conn.exec("SELECT pg_temp.exec_phase_26000()")
+      var seen = 0
+      runTwiceExpecting26000:
+        discard await conn.queryEach(
+          "SELECT pg_temp.exec_phase_26000()",
+          callback = proc(row: Row) =
+            inc seen
+          ,
+        )
+      doAssert seen == 0
+      runTwiceExpecting26000:
+        discard await conn.query(
+          "SELECT pg_temp.exec_phase_26000($1)", @[toPgParamInline(1'i32)]
+        )
+      runTwiceExpecting26000:
+        discard await conn.exec(
+          "SELECT pg_temp.exec_phase_26000($1)", @[toPgParamInline(1'i32)]
+        )
+
+      let last =
+        (await conn.query("SELECT last_value FROM exec_phase_seq")).rows[0].getInt(0)
+      doAssert last == 10,
+        "Execute-phase 26000 must not re-issue, got last_value=" & $last
+      doAssert "SELECT 1" in conn.stmtCache,
+        "an Execute-phase 26000 must not drop the other cached statements"
 
     waitFor t()
 

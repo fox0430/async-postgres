@@ -21,48 +21,50 @@ proc queryImpl*(
   conn.checkReady()
   validateExtendedQuery(sql, params.len, paramOids.len)
 
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
-  # After the lookup: a cache hit replays the cached result formats, so the
-  # pre-flight has to charge the Bind that will actually go out.
-  validateEncodedParams(
-    params,
-    paramFormats.len,
-    preflightResultFormatsLen(cached, cacheHit, resultFormats.len),
-  )
-  var cacheMiss = false
-  var stmtName = ""
-  var cachedFields: seq[FieldDescription]
-  var cachedColFmts: seq[int16]
-  var cachedColOids: seq[int32]
-  var effectiveResultFormats: seq[int16]
+  retryStmtCacheInvalidation(conn, cacheHit, facts):
+    let cached = conn.lookupStmtCache(sql)
+    cacheHit = cached != nil
+    conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+    # After the lookup: a cache hit replays the cached result formats, so the
+    # pre-flight has to charge the Bind that will actually go out.
+    validateEncodedParams(
+      params,
+      paramFormats.len,
+      preflightResultFormatsLen(cached, cacheHit, resultFormats.len),
+    )
+    var cacheMiss = false
+    var stmtName = ""
+    var cachedFields: seq[FieldDescription]
+    var cachedColFmts: seq[int16]
+    var cachedColOids: seq[int32]
+    var effectiveResultFormats: seq[int16]
 
-  # PG Bind treats 0 format codes as "all params text" — equivalent on the
-  # wire to N zeros, so pass paramFormats through even when empty.
-  sendExtendedQuery(
-    conn = conn,
-    resultFormats = resultFormats,
-    cached = cached,
-    cacheHit = cacheHit,
-    cacheMiss = cacheMiss,
-    stmtName = stmtName,
-    cachedFields = cachedFields,
-    cachedColFmts = cachedColFmts,
-    cachedColOids = cachedColOids,
-    effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.addParse(stmtName, sql, paramOids),
-    bindStep = conn.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
-  )
-  conn.markBusy()
-  await conn.sendStagedBufMsg()
+    # PG Bind treats 0 format codes as "all params text" — equivalent on the
+    # wire to N zeros, so pass paramFormats through even when empty.
+    sendExtendedQuery(
+      conn = conn,
+      resultFormats = resultFormats,
+      cached = cached,
+      cacheHit = cacheHit,
+      cacheMiss = cacheMiss,
+      stmtName = stmtName,
+      cachedFields = cachedFields,
+      cachedColFmts = cachedColFmts,
+      cachedColOids = cachedColOids,
+      effectiveResultFormats = effectiveResultFormats,
+      parseStep = conn.addParse(stmtName, sql, paramOids),
+      bindStep =
+        conn.addBind("", stmtName, paramFormats, params, effectiveResultFormats),
+    )
+    conn.markBusy()
+    await conn.sendStagedBufMsg()
 
-  var qr = QueryResult()
-  queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr,
-  )
-  return qr
+    var qr = QueryResult()
+    queryRecvLoop(
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+      cachedColFmts, cachedColOids, qr, facts,
+    )
+    return qr
 
 proc queryImpl*(
     conn: PgConnection,
@@ -73,43 +75,44 @@ proc queryImpl*(
   conn.checkReady()
   validateExtendedQuery(sql, params.len)
 
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
-  # Charge the result formats a cache hit replays, not the caller's empty list.
-  validateTypedParams(
-    params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
-  )
-  var cacheMiss = false
-  var stmtName = ""
-  var cachedFields: seq[FieldDescription]
-  var cachedColFmts: seq[int16]
-  var cachedColOids: seq[int32]
-  var effectiveResultFormats: seq[int16]
+  retryStmtCacheInvalidation(conn, cacheHit, facts):
+    let cached = conn.lookupStmtCache(sql)
+    cacheHit = cached != nil
+    conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
+    # Charge the result formats a cache hit replays, not the caller's empty list.
+    validateTypedParams(
+      params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+    )
+    var cacheMiss = false
+    var stmtName = ""
+    var cachedFields: seq[FieldDescription]
+    var cachedColFmts: seq[int16]
+    var cachedColOids: seq[int32]
+    var effectiveResultFormats: seq[int16]
 
-  sendExtendedQuery(
-    conn = conn,
-    resultFormats = resultFormats,
-    cached = cached,
-    cacheHit = cacheHit,
-    cacheMiss = cacheMiss,
-    stmtName = stmtName,
-    cachedFields = cachedFields,
-    cachedColFmts = cachedColFmts,
-    cachedColOids = cachedColOids,
-    effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.addParse(stmtName, sql, params),
-    bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
-  )
-  conn.markBusy()
-  await conn.sendStagedBufMsg()
+    sendExtendedQuery(
+      conn = conn,
+      resultFormats = resultFormats,
+      cached = cached,
+      cacheHit = cacheHit,
+      cacheMiss = cacheMiss,
+      stmtName = stmtName,
+      cachedFields = cachedFields,
+      cachedColFmts = cachedColFmts,
+      cachedColOids = cachedColOids,
+      effectiveResultFormats = effectiveResultFormats,
+      parseStep = conn.addParse(stmtName, sql, params),
+      bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
+    )
+    conn.markBusy()
+    await conn.sendStagedBufMsg()
 
-  var qr = QueryResult()
-  queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr,
-  )
-  return qr
+    var qr = QueryResult()
+    queryRecvLoop(
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+      cachedColFmts, cachedColOids, qr, facts,
+    )
+    return qr
 
 proc queryEachImpl*(
     conn: PgConnection,
@@ -121,43 +124,44 @@ proc queryEachImpl*(
   conn.checkReady()
   validateExtendedQuery(sql, params.len)
 
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
-  # Charge the result formats a cache hit replays, not the caller's empty list.
-  validateTypedParams(
-    params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
-  )
-  var cacheMiss = false
-  var stmtName = ""
-  var cachedFields: seq[FieldDescription]
-  var cachedColFmts: seq[int16]
-  var cachedColOids: seq[int32]
-  var effectiveResultFormats: seq[int16]
+  retryStmtCacheInvalidation(conn, cacheHit, facts):
+    let cached = conn.lookupStmtCache(sql)
+    cacheHit = cached != nil
+    conn.invalidateIfOidMismatch(sql, cached, params, cacheHit)
+    # Charge the result formats a cache hit replays, not the caller's empty list.
+    validateTypedParams(
+      params, preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+    )
+    var cacheMiss = false
+    var stmtName = ""
+    var cachedFields: seq[FieldDescription]
+    var cachedColFmts: seq[int16]
+    var cachedColOids: seq[int32]
+    var effectiveResultFormats: seq[int16]
 
-  sendExtendedQuery(
-    conn = conn,
-    resultFormats = resultFormats,
-    cached = cached,
-    cacheHit = cacheHit,
-    cacheMiss = cacheMiss,
-    stmtName = stmtName,
-    cachedFields = cachedFields,
-    cachedColFmts = cachedColFmts,
-    cachedColOids = cachedColOids,
-    effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.addParse(stmtName, sql, params),
-    bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
-  )
-  conn.markBusy()
-  await conn.sendStagedBufMsg()
+    sendExtendedQuery(
+      conn = conn,
+      resultFormats = resultFormats,
+      cached = cached,
+      cacheHit = cacheHit,
+      cacheMiss = cacheMiss,
+      stmtName = stmtName,
+      cachedFields = cachedFields,
+      cachedColFmts = cachedColFmts,
+      cachedColOids = cachedColOids,
+      effectiveResultFormats = effectiveResultFormats,
+      parseStep = conn.addParse(stmtName, sql, params),
+      bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
+    )
+    conn.markBusy()
+    await conn.sendStagedBufMsg()
 
-  var rowCount: int64 = 0
-  queryEachRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, callback, rowCount,
-  )
-  return rowCount
+    var rowCount: int64 = 0
+    queryEachRecvLoop(
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+      cachedColFmts, cachedColOids, callback, rowCount, facts,
+    )
+    return rowCount
 
 proc queryEach*(
     conn: PgConnection,
@@ -238,43 +242,45 @@ proc queryInlineImpl*(
   # may hand this proc `data`/`ranges` that never went through it.
   validateExtendedQuery(sql, ranges.len, paramOids.len)
 
-  let cached = conn.lookupStmtCache(sql)
-  var cacheHit = cached != nil
-  conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
-  # A cache hit replays the cached result formats, not the caller's.
-  let sendRfLen = preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
-  validateRawBind(data, ranges, paramFormats, sendRfLen)
-  var cacheMiss = false
-  var stmtName = ""
-  var cachedFields: seq[FieldDescription]
-  var cachedColFmts: seq[int16]
-  var cachedColOids: seq[int32]
-  var effectiveResultFormats: seq[int16]
+  retryStmtCacheInvalidation(conn, cacheHit, facts):
+    let cached = conn.lookupStmtCache(sql)
+    cacheHit = cached != nil
+    conn.invalidateIfOidMismatch(sql, cached, paramOids, cacheHit)
+    # A cache hit replays the cached result formats, not the caller's.
+    let sendRfLen = preflightResultFormatsLen(cached, cacheHit, resultFormats.len)
+    validateRawBind(data, ranges, paramFormats, sendRfLen)
+    var cacheMiss = false
+    var stmtName = ""
+    var cachedFields: seq[FieldDescription]
+    var cachedColFmts: seq[int16]
+    var cachedColOids: seq[int32]
+    var effectiveResultFormats: seq[int16]
 
-  sendExtendedQuery(
-    conn = conn,
-    resultFormats = resultFormats,
-    cached = cached,
-    cacheHit = cacheHit,
-    cacheMiss = cacheMiss,
-    stmtName = stmtName,
-    cachedFields = cachedFields,
-    cachedColFmts = cachedColFmts,
-    cachedColOids = cachedColOids,
-    effectiveResultFormats = effectiveResultFormats,
-    parseStep = conn.addParse(stmtName, sql, paramOids),
-    bindStep =
-      conn.addBindRaw("", stmtName, paramFormats, data, ranges, effectiveResultFormats),
-  )
-  conn.markBusy()
-  await conn.sendStagedBufMsg()
+    sendExtendedQuery(
+      conn = conn,
+      resultFormats = resultFormats,
+      cached = cached,
+      cacheHit = cacheHit,
+      cacheMiss = cacheMiss,
+      stmtName = stmtName,
+      cachedFields = cachedFields,
+      cachedColFmts = cachedColFmts,
+      cachedColOids = cachedColOids,
+      effectiveResultFormats = effectiveResultFormats,
+      parseStep = conn.addParse(stmtName, sql, paramOids),
+      bindStep = conn.addBindRaw(
+        "", stmtName, paramFormats, data, ranges, effectiveResultFormats
+      ),
+    )
+    conn.markBusy()
+    await conn.sendStagedBufMsg()
 
-  var qr = QueryResult()
-  queryRecvLoop(
-    conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-    cachedColFmts, cachedColOids, qr,
-  )
-  return qr
+    var qr = QueryResult()
+    queryRecvLoop(
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
+      cachedColFmts, cachedColOids, qr, facts,
+    )
+    return qr
 
 proc query*(
     conn: PgConnection,

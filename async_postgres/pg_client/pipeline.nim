@@ -449,7 +449,7 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
   var results = newSeq[PipelineResult](p.ops.len)
   var activeOpIdx = 0
   var queryError: ref PgQueryError
-  var missFacts = newSeq[MissFacts](p.ops.len)
+  var facts = newSeq[OpFacts](p.ops.len)
 
   initPipelineResults(results, p, cachedStmts)
 
@@ -464,8 +464,8 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
 
         while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
           let msg = opt.get
-          if activeOpIdx < p.ops.len and p.ops[activeOpIdx].cache == scsMiss:
-            missFacts[activeOpIdx].observe(conn, msg)
+          if activeOpIdx < p.ops.len:
+            facts[activeOpIdx].observe(conn, msg, p.ops[activeOpIdx].cache == scsMiss)
           case msg.kind
           of bmkRowDescription:
             if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
@@ -518,7 +518,7 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
                 p.ops[i].sql,
                 p.ops[i].stmtName,
                 p.ops[i].cache,
-                move missFacts[i],
+                facts[i],
                 if i == activeOpIdx: queryError else: nil,
               )
             if queryError != nil:
@@ -593,7 +593,7 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
   try:
     for opIdx in 0 ..< p.ops.len:
       var opError: ref PgQueryError
-      var facts: MissFacts
+      var facts: OpFacts
 
       block opRecv:
         while true:
@@ -605,8 +605,7 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
 
           while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
             let msg = opt.get
-            if p.ops[opIdx].cache == scsMiss:
-              facts.observe(conn, msg)
+            facts.observe(conn, msg, p.ops[opIdx].cache == scsMiss)
             case msg.kind
             of bmkRowDescription:
               if p.ops[opIdx].kind == pokQuery:
@@ -632,7 +631,7 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
                 p.ops[opIdx].sql,
                 p.ops[opIdx].stmtName,
                 p.ops[opIdx].cache,
-                move facts,
+                facts,
                 opError,
               )
               if opError != nil:
