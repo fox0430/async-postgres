@@ -1,4 +1,4 @@
-import std/[unittest, options, tables, net]
+import std/[unittest, options, strutils, tables, net]
 
 import
   ../async_postgres/
@@ -222,6 +222,21 @@ suite "E2E: quoteLiteral":
       raised = true
     doAssert raised, "NUL byte should raise ValueError"
 
+proc waitSlotInactive(writer: PgConnection, slotName: string): Future[bool] {.async.} =
+  ## Poll up to 5 s: a walsender releases its slot shortly after its socket
+  ## closes, not with it. False at once if the slot does not exist.
+  for _ in 0 ..< 100:
+    let res = await writer.simpleQuery(
+      "SELECT active FROM pg_replication_slots WHERE slot_name = " &
+        quoteLiteral(slotName)
+    )
+    if res[0].rows.len == 0:
+      return false
+    if res[0].rows[0].getStr(0) == "f":
+      return true
+    await sleepAsync(milliseconds(50))
+  return false
+
 suite "E2E: Logical Replication":
   test "identifySystem returns valid info":
     proc t() {.async.} =
@@ -382,6 +397,76 @@ suite "E2E: Logical Replication":
 
       discard await writer.simpleQuery("DROP PUBLICATION test_state_pub")
       await writer.close()
+
+    waitFor t()
+
+  test "closing a raising callback's connection frees the slot":
+    # The walsender keeps the slot active until the abandoned connection's
+    # socket goes, so a resume on another connection follows close().
+    proc t() {.async.} =
+      let writer = await connect(plainConfig())
+      discard await writer.simpleQuery(
+        "SELECT pg_drop_replication_slot('test_abandon_slot') " &
+          "FROM pg_replication_slots WHERE slot_name = 'test_abandon_slot'"
+      )
+      discard await writer.simpleQuery("DROP PUBLICATION IF EXISTS test_abandon_pub")
+      discard await writer.simpleQuery("CREATE PUBLICATION test_abandon_pub")
+      const options: seq[(string, string)] =
+        @{"proto_version": "1", "publication_names": "test_abandon_pub"}
+      var firstConn, secondConn: PgConnection
+      try:
+        firstConn = await connectReplication(plainConfig())
+        # Permanent: a temporary slot would vanish with its walsender.
+        discard await firstConn.createReplicationSlot("test_abandon_slot", "pgoutput")
+        let raisingCb = makeReplicationCallback:
+          raise newException(ValueError, "callback failed")
+
+        var raised = false
+        try:
+          await firstConn.startReplication(
+            "test_abandon_slot", InvalidLsn, options = options, callback = raisingCb
+          )
+        except ValueError as e:
+          raised = true
+          doAssert "callback failed" in e.msg, e.msg
+        doAssert raised, "the callback's error must reach the caller"
+        doAssert firstConn.state == csClosed
+        let held = await writer.simpleQuery(
+          "SELECT count(*) FROM pg_replication_slots " &
+            "WHERE slot_name = 'test_abandon_slot' AND active"
+        )
+        doAssert held[0].rows[0].getStr(0) == "1",
+          "the walsender must hold the slot until close()"
+        await firstConn.close()
+        doAssert await writer.waitSlotInactive("test_abandon_slot"),
+          "closing the abandoned connection must release the slot"
+
+        secondConn = await connectReplication(plainConfig())
+        let stopCb = makeReplicationCallback:
+          case msg.kind
+          of rmkXLogData:
+            discard
+          of rmkPrimaryKeepalive:
+            await secondConn.stopReplication()
+        await secondConn.startReplication(
+          "test_abandon_slot", InvalidLsn, options = options, callback = stopCb
+        )
+        doAssert secondConn.state == csReady
+      finally:
+        if firstConn != nil:
+          await firstConn.close()
+        if secondConn != nil:
+          await secondConn.close()
+        # Dropping a still-active slot raises 55006, which would replace the
+        # failed assertion; a leftover is dropped at the next run's start.
+        discard await writer.waitSlotInactive("test_abandon_slot")
+        discard await writer.simpleQuery(
+          "SELECT pg_drop_replication_slot('test_abandon_slot') " &
+            "FROM pg_replication_slots " &
+            "WHERE slot_name = 'test_abandon_slot' AND NOT active"
+        )
+        discard await writer.simpleQuery("DROP PUBLICATION test_abandon_pub")
+        await writer.close()
 
     waitFor t()
 
