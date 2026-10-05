@@ -13,11 +13,19 @@ import pkg/nimcrypto/pbkdf2
 import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
-from ../async_postgres/pg_connection/types import newPgConnection
+from ../async_postgres/pg_connection/types import newPgConnection, attachTransport
 from ../async_postgres/pg_connection/lifecycle {.all.} import attemptHostTimed
-from ../async_postgres/pg_connection/simple_query {.all.} import cancelWithin
+from ../async_postgres/pg_connection/simple_query {.all.} import
+  cancelWithin, sendCancelRequest
 when hasAsyncDispatch:
   from std/nativesockets import Domain
+when defined(posix):
+  import std/posix
+  when hasChronos:
+    from ../async_postgres/pg_connection/types import transport, initPlainStreams
+  else:
+    from std/asyncnet import getFd
+    from ../async_postgres/pg_connection/types import socket
 
 import ./mock_pg_server
 
@@ -108,6 +116,63 @@ suite "Dial":
       await closeServer(ms)
 
     check waitFor(testBody()) == (true, true)
+
+  when defined(posix):
+    test "a CancelRequest that could not be sent fails":
+      # A peer's reset cannot be timed against the write; shutting down our
+      # side fails it the same way.
+      proc testBody(): Future[ref CatchableError] {.async.} =
+        let ms = startMockServer()
+        let accepted = ms.accept()
+        let side = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
+        let dialed = await dialTargets(resolveTargets("127.0.0.1", ms.port))
+        side.attachTransport(dialed.stream, dialed.target, "")
+        let client = await accepted
+        when hasChronos:
+          let fd = SocketHandle(side.transport.fd)
+        else:
+          let fd = SocketHandle(side.socket.getFd())
+        discard posix.shutdown(fd, SHUT_WR)
+        try:
+          await side.sendCancelRequest(encodeCancelRequest(1234, 5678))
+        except CatchableError as e:
+          result = e
+        await side.closeTransport()
+        await closeClient(client)
+        await closeServer(ms)
+
+      let err = waitFor testBody()
+      check err of PgUnavailableError
+      check isTransientError(err)
+
+    test "a message that could not be sent closes the connection":
+      proc testBody(): Future[(ref CatchableError, PgConnState)] {.async.} =
+        let ms = startMockServer()
+        let accepted = ms.accept()
+        let conn = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
+        let dialed = await dialTargets(resolveTargets("127.0.0.1", ms.port))
+        conn.attachTransport(dialed.stream, dialed.target, "")
+        when hasChronos:
+          conn.initPlainStreams()
+        let client = await accepted
+        when hasChronos:
+          let fd = SocketHandle(conn.transport.fd)
+        else:
+          let fd = SocketHandle(conn.socket.getFd())
+        doAssert conn.state != csClosed
+        discard posix.shutdown(fd, SHUT_WR)
+        try:
+          await conn.sendMsg(encodeSync())
+        except CatchableError as e:
+          result[0] = e
+        result[1] = conn.state
+        await conn.closeTransport()
+        await closeClient(client)
+        await closeServer(ms)
+
+      let (err, state) = waitFor testBody()
+      check err of PgUnavailableError
+      check state == csClosed
 
   when defined(linux):
     # All of 127/8 is loopback on Linux: 127.0.0.2 and 127.0.0.3 refuse where
@@ -354,6 +419,37 @@ suite "Per-address connectTimeout":
       check ce.attempts.len == 0
       check ce.serverError != nil and ce.serverError.sqlState == "28P01"
       check not isTransientError(err)
+
+  test "a server of the wrong role skips the host's other addresses":
+    # They lead to the same server, so its role holds for them all. Were the
+    # refused one dialed, its failure would be raised.
+    proc testBody(timeout: Duration): Future[(bool, char)] {.async.} =
+      let standby = startMockServer()
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      await closeServer(gone)
+      proc serve(): Future[char] {.async.} =
+        let st = await standby.acceptAndReady(params = @[("in_hot_standby", "on")])
+        result = (await drainFrontendMessage(st)).msgType
+        await closeClient(st)
+
+      let serverFut = serve()
+      var cfg = mockConfig(standby.port)
+      cfg.connectTimeout = timeout
+      let targets =
+        resolveTargets("127.0.0.1", standby.port) &
+        resolveTargets("127.0.0.1", refusedPort)
+      let conn = await attemptHostTimed(
+        cfg, HostEntry(host: "127.0.0.1", port: standby.port), tsaPrimary, targets
+      )
+      result[0] = conn == nil
+      result[1] = await serverFut
+      await closeServer(standby)
+
+    for timeout in [default(Duration), milliseconds(300)]:
+      let (skipped, sent) = waitFor testBody(timeout)
+      check skipped
+      check sent == 'X' # the mismatch is closed, not leaked
 
   test "cancel reaches the address the session is on":
     # The host's first address refused the session, so it runs on the second;
