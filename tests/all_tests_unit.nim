@@ -8,8 +8,8 @@ import
   test_protocol, test_protocol_fuzz, test_replication, test_replication_auto_confirm,
   test_replication_keepalive, test_replication_restart, test_rowdata, test_saslprep,
   test_sendbuf_seal, test_server_error, test_session_attrs, test_source_scan, test_sql,
-  test_ssl, test_tls_error_paths, test_transaction_cancel, test_tx_cleanup_defect,
-  test_type_lookup, test_types_array, test_types_inline, test_types_misc,
-  test_types_numeric, test_types_range, test_types_scalar, test_types_temporal,
-  test_types_user_defined, test_types_validation
+  test_ssl, test_tls_error_paths, test_transaction_cancel, test_transaction_helpers,
+  test_tx_cleanup_defect, test_type_lookup, test_types_array, test_types_inline,
+  test_types_misc, test_types_numeric, test_types_range, test_types_scalar,
+  test_types_temporal, test_types_user_defined, test_types_validation
 {.pop.}

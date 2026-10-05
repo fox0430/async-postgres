@@ -10,7 +10,7 @@ import ../[async_backend, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import core
 
-proc queryInTransactionImpl(
+proc stageInTransaction(
     conn: PgConnection,
     beginSql: string,
     sql: string,
@@ -18,7 +18,8 @@ proc queryInTransactionImpl(
     paramOids: seq[int32],
     paramFormats: seq[int16],
     resultFormats: seq[int16],
-): Future[QueryResult] {.async.} =
+    describe: bool,
+) =
   conn.checkReady()
   conn.checkTxIdle()
   validateExtendedQuery(sql, params.len, paramOids.len, stmtNameLen = 0)
@@ -30,7 +31,7 @@ proc queryInTransactionImpl(
       newSeq[int16](params.len)
   validateEncodedParams(params, formats.len, resultFormats.len, stmtNameLen = 0)
 
-  # Pipeline: Parse+Bind+Execute for BEGIN, user SQL (with Describe), COMMIT + Sync
+  # Pipeline: Parse+Bind+Execute for BEGIN, user SQL, COMMIT + Sync
   conn.beginSendBuf()
   # BEGIN
   conn.addParse("", beginSql)
@@ -39,7 +40,8 @@ proc queryInTransactionImpl(
   # User SQL
   conn.addParse("", sql, paramOids)
   conn.addBind("", "", formats, params, resultFormats)
-  conn.addDescribe(dkPortal, "")
+  if describe:
+    conn.addDescribe(dkPortal, "")
   conn.addExecute("", 0)
   # COMMIT
   conn.addParse("", "COMMIT")
@@ -48,6 +50,42 @@ proc queryInTransactionImpl(
   # Single Sync
   conn.addSync()
   conn.markBusy()
+
+func noteCompletion(phase: var int, tag: var string, msg: BackendMessage) =
+  ## Count one statement's completion; only the user statement's tag is kept.
+  # Empty/comment-only user SQL yields EmptyQueryResponse instead of
+  # CommandComplete; advance the phase anyway so the trailing COMMIT's
+  # CommandComplete isn't captured as the user statement's tag.
+  if msg.kind notin {bmkEmptyQueryResponse, bmkCommandComplete}:
+    return
+  if msg.kind == bmkCommandComplete and phase == 1:
+    tag = msg.commandTag
+  inc phase
+
+template rollbackFailedTx(conn: PgConnection, queryError: ref PgQueryError) =
+  # ROLLBACK without masking the query error; report failure via onCleanupSkipped.
+  if queryError != nil and conn.txStatus == tsInFailedTransaction:
+    try:
+      discard await conn.simpleExec("ROLLBACK")
+    except CancelledError as e:
+      # Don't swallow cancellation (e.g. the outer wait(timeout)
+      # cancelling this future under chronos) — propagate it.
+      raise e
+    except CatchableError as rollbackErr:
+      conn.fireCleanupSkipped(ckTxRollback, csrCleanupFailed, rollbackErr)
+
+proc queryInTransactionImpl(
+    conn: PgConnection,
+    beginSql: string,
+    sql: string,
+    params: seq[Option[seq[byte]]],
+    paramOids: seq[int32],
+    paramFormats: seq[int16],
+    resultFormats: seq[int16],
+): Future[QueryResult] {.async.} =
+  conn.stageInTransaction(
+    beginSql, sql, params, paramOids, paramFormats, resultFormats, describe = true
+  )
   await conn.sendStagedBufMsg()
 
   var qr = QueryResult()
@@ -55,8 +93,6 @@ proc queryInTransactionImpl(
 
   conn.pumpUntilReady(qr.data, addr qr.rowCount):
     case pumpMsg.kind
-    of bmkParseComplete, bmkBindComplete:
-      discard
     of bmkRowDescription:
       var fields = pumpMsg.fields
       var cf: seq[int16]
@@ -70,31 +106,12 @@ proc queryInTransactionImpl(
       qr.fields = fields
       qr.data = newRowData(int16(qr.fields.len), cf, co)
       qr.data.fields = qr.fields
-    of bmkNoData:
-      discard
-    of bmkEmptyQueryResponse:
-      # Empty/comment-only user SQL yields EmptyQueryResponse instead of
-      # CommandComplete; advance the phase anyway so the trailing COMMIT's
-      # CommandComplete isn't captured as the user statement's tag.
-      inc phase
-    of bmkCommandComplete:
-      if phase == 1:
-        qr.commandTag = pumpMsg.commandTag
-      inc phase
+    of bmkEmptyQueryResponse, bmkCommandComplete:
+      noteCompletion(phase, qr.commandTag, pumpMsg)
     else:
       discard
   do:
-    if queryError != nil:
-      # ROLLBACK without masking the query error; report failure via onCleanupSkipped.
-      if conn.txStatus == tsInFailedTransaction:
-        try:
-          discard await conn.simpleExec("ROLLBACK")
-        except CancelledError as e:
-          # Don't swallow cancellation (e.g. the outer wait(timeout)
-          # cancelling this future under chronos) — propagate it.
-          raise e
-        except CatchableError as rollbackErr:
-          conn.fireCleanupSkipped(ckTxRollback, csrCleanupFailed, rollbackErr)
+    conn.rollbackFailedTx(queryError)
 
   return qr
 
@@ -106,10 +123,21 @@ proc execInTransactionImpl(
     paramOids: seq[int32],
     paramFormats: seq[int16],
 ): Future[string] {.async.} =
-  let qr = await queryInTransactionImpl(
-    conn, beginSql, sql, params, paramOids, paramFormats, @[]
+  # No Describe, and the bare pump frames rows (e.g. RETURNING) without decoding.
+  conn.stageInTransaction(
+    beginSql, sql, params, paramOids, paramFormats, @[], describe = false
   )
-  return qr.commandTag
+  await conn.sendStagedBufMsg()
+
+  var tag = ""
+  var phase = 0
+
+  conn.pumpUntilReady:
+    noteCompletion(phase, tag, pumpMsg)
+  do:
+    conn.rollbackFailedTx(queryError)
+
+  return tag
 
 proc execInTransaction*(
     conn: PgConnection,
@@ -118,7 +146,8 @@ proc execInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined BEGIN/COMMIT transaction (1 round trip).
-  ## On error, ROLLBACK is issued automatically.
+  ## Returned rows (e.g. ``RETURNING``) are discarded undecoded; read them with
+  ## ``queryInTransaction``. On error, ROLLBACK is issued automatically.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   var tag: string
@@ -148,6 +177,8 @@ proc execInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with options.
+  ## Returned rows (e.g. ``RETURNING``) are discarded undecoded; read them with
+  ## ``queryInTransaction``.
   var tag: string
   withConnTracing(
     conn,
