@@ -242,18 +242,31 @@ template newPoolError*(
 
 const
   # Commonly dispatched-on SQLSTATE codes
+  SqlStateProtocolViolation* = "08P01"
   SqlStateNotNullViolation* = "23502"
   SqlStateForeignKeyViolation* = "23503"
   SqlStateUniqueViolation* = "23505"
   SqlStateCheckViolation* = "23514"
   SqlStateExclusionViolation* = "23P01"
   SqlStateInFailedSqlTransaction* = "25P02"
+  SqlStateIdleInTransactionSessionTimeout* = "25P03"
+  SqlStateTransactionTimeout* = "25P04"
+  SqlStateInvalidPassword* = "28P01"
+  SqlStateInvalidCatalogName* = "3D000"
   SqlStateSerializationFailure* = "40001"
   SqlStateDeadlockDetected* = "40P01"
+  SqlStateInsufficientPrivilege* = "42501"
   SqlStateSyntaxError* = "42601"
   SqlStateUndefinedTable* = "42P01"
   SqlStateDuplicateObject* = "42710"
+  SqlStateConfigurationLimitExceeded* = "53400"
+  SqlStateObjectInUse* = "55006"
+  SqlStateLockNotAvailable* = "55P03"
   SqlStateQueryCanceled* = "57014"
+  SqlStateAdminShutdown* = "57P01"
+  SqlStateCrashShutdown* = "57P02"
+  SqlStateCannotConnectNow* = "57P03"
+  SqlStateIdleSessionTimeout* = "57P05"
 
 func getErrorField*(fields: seq[ErrorField], code: char): string =
   ## Get the value of an error field by its single-char code (e.g. 'M' for message).
@@ -302,12 +315,15 @@ func isTransientServerError(se: ref PgQueryError): bool =
   # and an ERROR 57014 (a cancel; FATAL is authentication_timeout).
   let s = se.sqlState
   const listed = [
-    "25P03", "25P04", SqlStateSerializationFailure, SqlStateDeadlockDetected, "55006",
-    "55P03", "57P01", "57P02", "57P03", "57P05",
+    SqlStateIdleInTransactionSessionTimeout, SqlStateTransactionTimeout,
+    SqlStateSerializationFailure, SqlStateDeadlockDetected, SqlStateObjectInUse,
+    SqlStateLockNotAvailable, SqlStateAdminShutdown, SqlStateCrashShutdown,
+    SqlStateCannotConnectNow, SqlStateIdleSessionTimeout,
   ]
   let fatal = se.severity == "FATAL"
-  se.severity == "PANIC" or (fatal and s.inClass("08") and s != "08P01") or
-    (s.inClass("53") and s != "53400") or s in listed or
+  se.severity == "PANIC" or
+    (fatal and s.inClass("08") and s != SqlStateProtocolViolation) or
+    (s.inClass("53") and s != SqlStateConfigurationLimitExceeded) or s in listed or
     (fatal and s == SqlStateQueryCanceled)
 
 func isStatedRefusal(se: ref PgQueryError): bool =
@@ -318,7 +334,9 @@ func isStatedRefusal(se: ref PgQueryError): bool =
   ## RADIUS or PAM check answers with it when its own server is down too.
   if se == nil:
     return false
-  se.sqlState in ["28P01", "3D000", "42501"]
+  const refused =
+    [SqlStateInvalidPassword, SqlStateInvalidCatalogName, SqlStateInsufficientPrivilege]
+  se.sqlState in refused
 
 func catchableParent(e: ref Exception): ref CatchableError =
   if e.parent of CatchableError:
