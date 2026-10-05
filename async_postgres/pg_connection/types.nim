@@ -10,7 +10,7 @@ from std/strutils import
 when defined(posix):
   import std/posix
 
-import ../[async_backend, pg_auth, pg_errors, pg_protocol, pg_types]
+import ../[async_backend, pg_auth, pg_errors, pg_gensym, pg_protocol, pg_types]
 import ../pg_types/encoding
 
 when hasChronos:
@@ -273,6 +273,7 @@ type
   CachedStmt* = ref object ## Cached prepared statement (LRU).
     name*: string ## Server-side name (``_sc_*``)
     fields*: seq[FieldDescription] ## Describe result
+    noData*: bool ## Describe answered ``NoData``: no rows, unlike a zero-column result.
     paramOids*: seq[int32]
       ## Parse-time param OIDs; mismatch → re-parse (empty = no params)
     resultFormats*: seq[int16] ## Cached buildResultFormats() output
@@ -1516,6 +1517,52 @@ when hasChronos:
 
 # Tracing helper templates
 
+template injectTraceCtx(ctx: untyped, macroName: static string) =
+  # The body's `traceCtx` is a template: a routine never becomes a closure env
+  # field (see `macroSym`). Like the variable it replaced, it may not take over
+  # a name the scope already has.
+  when declaredInScope(traceCtx):
+    {.error: macroName & ": `traceCtx` is already declared in this scope".}
+  template traceCtx(): untyped {.inject, used.} =
+    ctx
+
+template traceStart(tracer: PgTracer, hook, conn, data: untyped): TraceContext =
+  # A `nil` conn: the hook is not connection-scoped.
+  when typeof(conn) is typeof(nil):
+    tracer.hook(data)
+  else:
+    tracer.hook(conn, data)
+
+template traceEnd(tracer: PgTracer, hook, ctx, conn, data: untyped) =
+  when typeof(conn) is typeof(nil):
+    tracer.hook(ctx, data)
+  else:
+    tracer.hook(ctx, conn, data)
+
+template traced(
+    tracer: PgTracer,
+    conn: untyped,
+    startHook, endHook: untyped,
+    startData: typed,
+    EndDataType: typedesc,
+    endDataExpr: typed,
+    macroName: static string,
+    body: untyped,
+) {.macroSymLocals.} =
+  # Shared by `withConnTracing` and `withTracing`, which passes a `nil` conn.
+  var ctx: TraceContext
+  if tracer != nil and tracer.startHook != nil:
+    ctx = traceStart(tracer, startHook, conn, startData)
+  injectTraceCtx(ctx, macroName)
+  try:
+    body
+  except CatchableError as e:
+    if tracer != nil and tracer.endHook != nil:
+      traceEnd(tracer, endHook, ctx, conn, EndDataType(err: e))
+    raise e
+  if tracer != nil and tracer.endHook != nil:
+    traceEnd(tracer, endHook, ctx, conn, endDataExpr)
+
 template withConnTracing*(
     conn: PgConnection,
     startHook, endHook: untyped,
@@ -1524,18 +1571,12 @@ template withConnTracing*(
     endDataExpr: typed,
     body: untyped,
 ) =
-  ## Wrap an operation with connection-scoped tracing hooks.
-  var traceCtx {.inject.}: TraceContext
-  if conn.tracer != nil and conn.tracer.startHook != nil:
-    traceCtx = conn.tracer.startHook(conn, startData)
-  try:
-    body
-  except CatchableError as e:
-    if conn.tracer != nil and conn.tracer.endHook != nil:
-      conn.tracer.endHook(traceCtx, conn, EndDataType(err: e))
-    raise e
-  if conn.tracer != nil and conn.tracer.endHook != nil:
-    conn.tracer.endHook(traceCtx, conn, endDataExpr)
+  ## Wrap an operation with connection-scoped tracing hooks. `body` sees the
+  ## start hook's context as `traceCtx`.
+  traced(
+    conn.tracer, conn, startHook, endHook, startData, EndDataType, endDataExpr,
+    "withConnTracing", body,
+  )
 
 template withTracing*(
     tracer: PgTracer,
@@ -1546,17 +1587,11 @@ template withTracing*(
     body: untyped,
 ) =
   ## Wrap an operation with non-connection tracing hooks (connect, pool).
-  var traceCtx {.inject.}: TraceContext
-  if tracer != nil and tracer.startHook != nil:
-    traceCtx = tracer.startHook(startData)
-  try:
-    body
-  except CatchableError as e:
-    if tracer != nil and tracer.endHook != nil:
-      tracer.endHook(traceCtx, EndDataType(err: e))
-    raise e
-  if tracer != nil and tracer.endHook != nil:
-    tracer.endHook(traceCtx, endDataExpr)
+  ## `traceCtx` works as in `withConnTracing`.
+  traced(
+    tracer, nil, startHook, endHook, startData, EndDataType, endDataExpr, "withTracing",
+    body,
+  )
 
 # Connection state transitions
 

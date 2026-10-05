@@ -1,11 +1,11 @@
 ## Server-side portal-based cursors: `openCursor`, `fetchNext`, `close`, and
-## the scoped `withCursor` template.
+## the scoped `withCursor` macro.
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
 import std/options
 
-import ../[async_backend, pg_protocol, pg_types]
+import ../[async_backend, pg_gensym, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import core, transaction
 
@@ -351,7 +351,7 @@ template withCursor*(
     chunks: int32,
     cursorName, body: untyped,
     cursorTimeout: Duration = ZeroDuration,
-) =
+) {.macroSymLocals.} =
   ## Open a cursor, execute `body`, then close the cursor automatically.
   ## `chunks` must be positive (see `openCursor`).
   ## The cursor is available as `cursorName` inside the body.
@@ -373,7 +373,7 @@ template withCursor*(
   var bodyErr: ref CatchableError = nil
   var bodyDefect: ref Defect = nil
   try:
-    checkTemplateBodyEscape(body, "withCursor", "the cursor close")
+    noBodyEscape("withCursor", "the cursor close", body)
   except CatchableError as e:
     bodyErr = e
   except Defect as d:

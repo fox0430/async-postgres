@@ -30,6 +30,10 @@ task privateAccessGuard,
   "check that privateAccess and {.all.} imports are only used from tests":
   exec "nim c -r --hints:off tools/private_access_guard.nim"
 
+task macroSymGuard,
+  "check that library macros declare no locals a caller's name can collide with":
+  exec "nim c -r --hints:off tools/macro_sym_guard.nim"
+
 task escapeDiagnostics,
   "check the compile errors of the scoped-body escape check with `nim check`":
   exec "nim c -r --hints:off -d:asyncBackend=asyncdispatch tests/test_body_escape_diagnostics.nim"
@@ -47,6 +51,7 @@ task test, "run the full suite (requires a live PostgreSQL on 127.0.0.1:15432)":
   apiSurfaceTask()
   parseGuardTask()
   privateAccessGuardTask()
+  macroSymGuardTask()
   escapeDiagnosticsTask()
   runSuite "tests/all_tests.nim"
 

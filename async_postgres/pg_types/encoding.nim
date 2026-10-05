@@ -3,7 +3,7 @@
 
 import std/[options, json, macros, strutils, tables, times, net, math]
 
-import ../[pg_bytes, pg_protocol]
+import ../[pg_bytes, pg_gensym, pg_protocol]
 import core, array
 
 export pg_bytes, array
@@ -2263,7 +2263,7 @@ macro addParseDirect*(
   ## Splices every operand more than once, so callers must pass side-effect-free
   ## expressions (`queryDirect`/`execDirect` bind theirs to `let`s first).
   result = newStmtList()
-  let msgStart = genSym(nskLet, "msgStart")
+  let msgStart = macroSym(nskLet, "msgStart")
   let nParams = newLit(int16(args.len))
   let nParamsInt = newLit(args.len)
   result.add quote do:
@@ -2292,8 +2292,8 @@ macro addBindDirect*(
   ## name operands more than once, like ``addParseDirect``; parameters and the
   ## result-format list are bound to temporaries and evaluated once.
   result = newStmtList()
-  let msgStart = genSym(nskLet, "msgStart")
-  let payload = genSym(nskVar, "bindPayload")
+  let msgStart = macroSym(nskLet, "msgStart")
+  let payload = macroSym(nskVar, "bindPayload")
   let nParamsLit = newLit(int16(args.len))
   let nParamsInt = newLit(args.len)
   let emptyRf = resultFormats.kind == nnkBracket and resultFormats.len == 0
@@ -2303,7 +2303,7 @@ macro addBindDirect*(
     if emptyRf or resultFormats.kind in {nnkIdent, nnkSym}:
       resultFormats
     else:
-      let tmp = genSym(nskLet, "bindRf")
+      let tmp = macroSym(nskLet, "bindRf")
       result.add(newLetStmt(tmp, resultFormats))
       tmp
   let rfLen =
@@ -2321,10 +2321,10 @@ macro addBindDirect*(
       if arg.kind in {nnkIdent, nnkSym} or arg.kind in nnkLiterals:
         arg
       else:
-        let tmp = genSym(nskLet, "bindArg" & $i)
+        let tmp = macroSym(nskLet, "bindArg" & $i)
         result.add(newLetStmt(tmp, arg))
         tmp
-    let rendered = genSym(nskVar, "bindRendered" & $i)
+    let rendered = macroSym(nskVar, "bindRendered" & $i)
     result.add quote do:
       var `rendered`: string
     params[i] = (val, rendered)
@@ -2355,8 +2355,9 @@ macro addBindDirect*(
       `buf`.addInt16(0'i16)
       `buf`.patchMsgLenAtomic(`msgStart`)
   else:
+    let fSym = macroSym(nskForVar, "f")
     result.add quote do:
       `buf`.addInt16(int16(`rf`.len))
-      for f in `rf`:
-        `buf`.addInt16(f)
+      for `fSym` in `rf`:
+        `buf`.addInt16(`fSym`)
       `buf`.patchMsgLenAtomic(`msgStart`)

@@ -12,8 +12,8 @@
 ## underscores), outside comments and literals.
 ##
 ## The scan reports "ok" on a clean tree, so nothing but a test can tell a
-## working guard from a blind one. `sameIdent` / `usesBanned` /
-## `allPragmaLines` are therefore exported and covered by
+## working guard from a blind one. `usesBanned` / `allPragmaLines` are
+## therefore exported and covered, with `source_scan.sameIdent`, by
 ## `tests/test_private_access_guard.nim`.
 ##
 ## Usage:
@@ -26,13 +26,6 @@ const
   srcDir = "async_postgres"
   packageRoot = "async_postgres.nim"
   banned = ["importutils", "privateAccess"]
-
-proc sameIdent*(a, b: string): bool =
-  ## Nim identifier equality: the first character keeps its case, the rest
-  ## ignores case and underscores.
-  if a.len == 0 or b.len == 0:
-    return a.len == b.len
-  a[0] == b[0] and cmpIgnoreStyle(a[1 ..^ 1], b[1 ..^ 1]) == 0
 
 proc usesBanned*(code: string): bool =
   var i = 0

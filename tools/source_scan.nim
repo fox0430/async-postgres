@@ -1,7 +1,13 @@
 ## Line-level helpers shared by the source guards (`parse_guard`,
-## `private_access_guard`).
+## `private_access_guard`, `macro_sym_guard`).
+
+import std/strutils
 
 const identChars* = {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_'}
+
+proc sameIdent*(a, b: string): bool =
+  ## Nim identifier equality.
+  nimIdentNormalize(a) == nimIdentNormalize(b)
 
 type LineScanner* = object
   ## State that outlives a single line. ``#[ ... ]#`` / ``##[ ... ]##``

@@ -1,6 +1,6 @@
 import std/[deques, macros, options]
 
-import async_backend, pg_protocol, pg_types, pg_client
+import async_backend, pg_gensym, pg_protocol, pg_types, pg_client
 import pg_connection/[types, buffer_io, simple_query, lifecycle]
 import pg_client/[transaction, pipeline]
 
@@ -1551,9 +1551,9 @@ proc buildReleaseAndReraise*(releaseCall, bodyErrSym, bodyDefectSym: NimNode): N
   ## succeeded — the body error verbatim, its Defect wrapped in `PgPoolError`
   ## (the Defect is `parent`). A release-path `CancelledError` is always
   ## re-raised: the caller is cancelling the whole macro.
-  let releaseErrSym = genSym(nskLet, "releaseErr")
-  let releaseDefectSym = genSym(nskLet, "releaseDefect")
-  let cancelSym = genSym(nskLet, "cancel")
+  let releaseErrSym = macroSym(nskLet, "releaseErr")
+  let releaseDefectSym = macroSym(nskLet, "releaseDefect")
+  let cancelSym = macroSym(nskLet, "cancel")
   result = quote:
     try:
       await `releaseCall`
@@ -1588,9 +1588,11 @@ macro withConnection*(pool: PgPool, conn, body: untyped): untyped =
   ## `finally` masks the body error), so `return` / `break` / `continue`
   ## escaping the body are rejected at compile time.
   let body = checkNoBodyEscape(body, "withConnection", "the connection release")
-  let poolSym = genSym(nskLet, "pool")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let poolSym = macroSym(nskLet, "pool")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
   let releaseCall = quote:
     `poolSym`.resetSessionAndRelease(`conn`)
   let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
@@ -1601,10 +1603,10 @@ macro withConnection*(pool: PgPool, conn, body: untyped): untyped =
     var `bodyDefectSym`: ref Defect = nil
     try:
       `body`
-    except CatchableError as e:
-      `bodyErrSym` = e
-    except Defect as d:
-      `bodyDefectSym` = d
+    except CatchableError as `eSym`:
+      `bodyErrSym` = `eSym`
+    except Defect as `dSym`:
+      `bodyDefectSym` = `dSym`
     `releaseBlock`
 
 proc failPendingOp(op: PendingPoolOp, e: ref CatchableError) =
@@ -2392,12 +2394,12 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   body = checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
-  let poolSym = genSym(nskLet, "pool")
-  let eSym = genSym(nskLet, "e")
-  let dSym = genSym(nskLet, "d")
-  let cancelSym = genSym(nskLet, "cancel")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let poolSym = macroSym(nskLet, "pool")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
+  let cancelSym = macroSym(nskLet, "cancel")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
@@ -2486,12 +2488,12 @@ macro withTransactionRetry*(
   body = checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
-  let poolSym = genSym(nskLet, "pool")
-  let retryOptsSym = genSym(nskLet, "retryOpts")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
-  let eSym = genSym(nskLet, "e")
-  let dSym = genSym(nskLet, "d")
+  let poolSym = macroSym(nskLet, "pool")
+  let retryOptsSym = macroSym(nskLet, "retryOpts")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let loop = buildRetryTxLoop(connIdent, retryOptsSym, beginSql, txTimeout, body)
   let releaseCall = quote:
@@ -2582,20 +2584,20 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   body = checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
-  let poolSym = genSym(nskLet, "pool")
-  let eSym = genSym(nskLet, "e")
-  let dSym = genSym(nskLet, "d")
-  let cancelSym = genSym(nskLet, "cancel")
-  let totalDurSym = genSym(nskLet, "totalDur")
-  let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
-  let bodyFnSym = genSym(nskProc, "poolTxBodyDeadline")
-  let bodyFutSym = genSym(nskLet, "bodyFut")
-  let connOptSym = genSym(nskVar, "connOpt")
-  let releasedSym = genSym(nskVar, "released")
-  let cancelledSym = genSym(nskLet, "cancelled")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
-  let releaseErrSym = genSym(nskLet, "releaseErr")
+  let poolSym = macroSym(nskLet, "pool")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
+  let cancelSym = macroSym(nskLet, "cancel")
+  let totalDurSym = macroSym(nskLet, "totalDur")
+  let deadlineMomentSym = macroSym(nskLet, "deadlineMoment")
+  let bodyFnSym = macroSym(nskProc, "poolTxBodyDeadline")
+  let bodyFutSym = macroSym(nskLet, "bodyFut")
+  let connOptSym = macroSym(nskVar, "connOpt")
+  let releasedSym = macroSym(nskVar, "released")
+  let cancelledSym = macroSym(nskLet, "cancelled")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
+  let releaseErrSym = macroSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
@@ -2750,20 +2752,20 @@ macro withTransactionRetryDeadline*(
   body = checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
 
   let poolExpr = pool
-  let poolSym = genSym(nskLet, "pool")
-  let retryOptsSym = genSym(nskLet, "retryOpts")
-  let eSym = genSym(nskLet, "e")
-  let dSym = genSym(nskLet, "d")
-  let cancelSym = genSym(nskLet, "cancel")
-  let totalDurSym = genSym(nskLet, "totalDur")
-  let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
-  let bodyFnSym = genSym(nskProc, "poolTxBodyRetryDeadline")
-  let connOptSym = genSym(nskVar, "connOpt")
-  let releasedSym = genSym(nskVar, "released")
-  let cancelledSym = genSym(nskLet, "cancelled")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
-  let releaseErrSym = genSym(nskLet, "releaseErr")
+  let poolSym = macroSym(nskLet, "pool")
+  let retryOptsSym = macroSym(nskLet, "retryOpts")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
+  let cancelSym = macroSym(nskLet, "cancel")
+  let totalDurSym = macroSym(nskLet, "totalDur")
+  let deadlineMomentSym = macroSym(nskLet, "deadlineMoment")
+  let bodyFnSym = macroSym(nskProc, "poolTxBodyRetryDeadline")
+  let connOptSym = macroSym(nskVar, "connOpt")
+  let releasedSym = macroSym(nskVar, "released")
+  let cancelledSym = macroSym(nskLet, "cancelled")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
+  let releaseErrSym = macroSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let remainingSym = bindSym"remainingDeadlineDuration"
@@ -2868,26 +2870,34 @@ macro withPipeline*(pool: PgPool, pipeline, body: untyped): untyped =
   ## Body `return` / `break` / `continue` escaping to an enclosing loop are
   ## rejected at compile time (see `withConnection`).
   let body = checkNoBodyEscape(body, "withPipeline", "the connection release")
-  let poolSym = genSym(nskLet, "pool")
-  let connId = ident("conn")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let poolSym = macroSym(nskLet, "pool")
+  let connSym = macroSym(nskLet, "conn")
+  let connAlias = ident("conn")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
   let releaseCall = quote:
-    `poolSym`.resetSessionAndRelease(`connId`)
+    `poolSym`.resetSessionAndRelease(`connSym`)
   let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
   result = quote:
     block:
       let `poolSym` = `pool`
-      let `connId` = await `poolSym`.acquire()
-      let `pipeline` = newPipeline(`connId`)
+      let `connSym` = await `poolSym`.acquire()
+      # The body's `conn` is a template: a routine never becomes a closure env
+      # field, so no spellable name enters the caller's env (see `macroSym`).
+      template `connAlias`(): untyped {.used.} =
+        `connSym`
+
+      let `pipeline` = newPipeline(`connSym`)
       var `bodyErrSym`: ref CatchableError = nil
       var `bodyDefectSym`: ref Defect = nil
       try:
         `body`
-      except CatchableError as e:
-        `bodyErrSym` = e
-      except Defect as d:
-        `bodyDefectSym` = d
+      except CatchableError as `eSym`:
+        `bodyErrSym` = `eSym`
+      except Defect as `dSym`:
+        `bodyDefectSym` = `dSym`
       `releaseBlock`
 
 proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =

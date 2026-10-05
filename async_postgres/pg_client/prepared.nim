@@ -28,6 +28,7 @@ type PreparedStatement* = ref object
   name: string
   sql: string
   fields: seq[FieldDescription]
+  noData: bool ## Describe answered ``NoData``: no rows, unlike zero columns.
   paramOids: seq[int32]
 
 func conn*(stmt: PreparedStatement): PgConnection {.inline.} =
@@ -99,7 +100,7 @@ proc prepareImpl*(
     of bmkRowDescription:
       stmt.fields = pumpMsg.fields
     of bmkNoData:
-      discard
+      stmt.noData = true
     else:
       discard
   do:
@@ -163,19 +164,13 @@ proc executeImpl*(
   conn.markBusy()
   await conn.sendStagedBufMsg()
 
-  var qr = QueryResult(fields: stmt.fields)
-  if resultFormats.len > 0:
-    let colFmts = deriveColFmts(resultFormats, qr.fields.len)
-    for i in 0 ..< qr.fields.len:
-      qr.fields[i].formatCode = colFmts[i]
-  if qr.fields.len > 0:
-    var colFmts = newSeq[int16](qr.fields.len)
-    var colOids = newSeq[int32](qr.fields.len)
-    for i in 0 ..< qr.fields.len:
-      colFmts[i] = qr.fields[i].formatCode
-      colOids[i] = qr.fields[i].typeOid
-    qr.data = newRowData(int16(qr.fields.len), colFmts, colOids)
-    qr.data.fields = qr.fields
+  # Like a cache hit, Execute gets no RowDescription. `prepare`'s statement
+  # Describe reported text for every column.
+  var qr = QueryResult()
+  if not stmt.noData:
+    qr.initBoundResult(
+      boundRowData(stmt.fields, deriveColFmts(resultFormats, stmt.fields.len))
+    )
   conn.pumpUntilReady(qr.data, addr qr.rowCount):
     case pumpMsg.kind
     of bmkBindComplete:

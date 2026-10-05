@@ -78,7 +78,7 @@
 
 import std/macros
 
-import async_backend, pg_protocol, pg_types, pg_client
+import async_backend, pg_gensym, pg_protocol, pg_types, pg_client
 import pg_connection/types
 import pg_client/transaction
 
@@ -104,7 +104,7 @@ template acquireSessionLock(
 
 template trySessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
-): bool =
+): bool {.macroSymLocals.} =
   let acquired = await conn.queryValue(bool, sql, params, timeout = t)
   if acquired:
     conn.noteSessionLockAcquired()
@@ -112,7 +112,7 @@ template trySessionLock(
 
 template unlockSessionLock(
     conn: PgConnection, sql: string, params: seq[PgParam], t: Duration
-): bool =
+): bool {.macroSymLocals.} =
   let released = await conn.queryValue(bool, sql, params, timeout = t)
   conn.noteSessionLockReleased(released)
   released
@@ -357,7 +357,7 @@ proc advisoryTryLockXactShared*(
 # Convenience macros — session-level
 #
 # These are macros (not templates) so that ``conn``, ``key`` etc. are
-# evaluated exactly once via ``genSym``-bound ``let`` bindings.
+# evaluated exactly once via ``macroSym``-bound ``let`` bindings.
 #
 # ``advisoryUnlock*`` failures are swallowed so they cannot mask the original
 # exception raised by ``body``. The body exception (including ``Defect``) is
@@ -381,17 +381,16 @@ proc advisoryLockArgs(
 ): AdvisoryLockArgs =
   AdvisoryLockArgs(twoKey: true, key1: key1, key2: key2, timeout: timeout)
 
-template withAdvisoryLockCore(
+template withAdvisoryLockScope(
     c: PgConnection,
     lockProc, unlockProc: untyped,
     a: AdvisoryLockArgs,
     shared: static bool,
     body: untyped,
-) =
+) {.macroSymLocals.} =
   ## Internal helper implementing the acquire/try/finally pattern for all
   ## session-level ``withAdvisoryLock*`` macros. ``c`` and ``a`` must already
   ## be bound to ``let`` symbols by the caller macro.
-  const macroName = when shared: "withAdvisoryLockShared" else: "withAdvisoryLock"
   if a.twoKey:
     await c.lockProc(a.key1, a.key2, timeout = a.timeout)
   else:
@@ -400,7 +399,7 @@ template withAdvisoryLockCore(
   var bodyErr: ref CatchableError = nil
   var bodyDefect: ref Defect = nil
   try:
-    checkTemplateBodyEscape(body, macroName, "the advisory unlock")
+    body
   except CatchableError as e:
     bodyErr = e
   except Defect as d:
@@ -419,15 +418,21 @@ template withAdvisoryLockCore(
       # held (``pg_advisory_unlock*`` returned ``false``). Report it with a
       # nil ``err`` so observers can distinguish it from a raised failure.
       fireAdvisoryUnlockFailed(c, a.key, a.key1, a.key2, shared, a.twoKey, nil)
-  except CatchableError as e:
-    fireAdvisoryUnlockFailed(c, a.key, a.key1, a.key2, shared, a.twoKey, e)
-  except Defect as d:
+  except CatchableError as unlockErr:
+    fireAdvisoryUnlockFailed(c, a.key, a.key1, a.key2, shared, a.twoKey, unlockErr)
+  except Defect as unlockDefect:
     # Same-frame Defect from the unlock: surface it only when it can't
     # replace a body error.
     if bodyErr == nil and bodyDefect == nil:
-      raise d
+      raise unlockDefect
     fireAdvisoryUnlockFailed(
-      c, a.key, a.key1, a.key2, shared, a.twoKey, newException(PgError, d.msg, d)
+      c,
+      a.key,
+      a.key1,
+      a.key2,
+      shared,
+      a.twoKey,
+      newException(PgError, unlockDefect.msg, unlockDefect),
     )
 
   if bodyErr != nil:
@@ -467,8 +472,8 @@ proc buildSessionAdvisoryLock(conn, args: NimNode, shared: bool): NimNode =
       (bindSym"advisoryLockShared", bindSym"advisoryUnlockShared")
     else:
       (bindSym"advisoryLock", bindSym"advisoryUnlock")
-  let c = genSym(nskLet, "conn")
-  let a = genSym(nskLet, "lockArgs")
+  let c = macroSym(nskLet, "conn")
+  let a = macroSym(nskLet, "lockArgs")
   let argsCall = newCall(bindSym"advisoryLockArgs", lockArgs)
   # Report a mismatch at the arguments rather than at the body.
   argsCall.copyLineInfo(
@@ -481,7 +486,13 @@ proc buildSessionAdvisoryLock(conn, args: NimNode, shared: bool): NimNode =
     newLetStmt(c, conn),
     newLetStmt(a, argsCall),
     newCall(
-      bindSym"withAdvisoryLockCore", c, lockProc, unlockProc, a, newLit(shared), body
+      bindSym"withAdvisoryLockScope",
+      c,
+      lockProc,
+      unlockProc,
+      a,
+      newLit(shared),
+      checkNoBodyEscape(body, macroName, "the advisory unlock"),
     ),
   )
 

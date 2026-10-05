@@ -359,31 +359,31 @@ template makeAsyncSinkByteCallback*(cbType: typedesc, body: untyped): untyped =
   ## splicing the parameter type through an `untyped` template param confuses
   ## asyncdispatch's `{.async.}` macro; keeping the whole parameter literal
   ## sidesteps that. `data` is injected into `body`'s scope.
-  block:
-    when hasChronos:
-      let r: cbType = proc(
-          data {.inject.}: sink seq[byte]
-      ) {.async: (raises: [CatchableError]).} =
+  when hasChronos:
+    cbType(
+      proc(data {.inject.}: sink seq[byte]) {.async: (raises: [CatchableError]).} =
         body
-      r
-    else:
-      let r: cbType = proc(data {.inject.}: sink seq[byte]) {.async.} =
+    )
+  else:
+    cbType(
+      proc(data {.inject.}: sink seq[byte]) {.async.} =
         body
-      r
+    )
 
 template makeAsyncSeqByteCallback*(cbType: typedesc, body: untyped): untyped =
   ## Build a `cbType` producer callback returning `Future[seq[byte]]`.
   ## `{.async.}` handles both the final-expression form and early
   ## `return <expr>` inside `body` symmetrically across backends.
-  block:
-    when hasChronos:
-      let r: cbType = proc(): Future[seq[byte]] {.async: (raises: [CatchableError]).} =
+  when hasChronos:
+    cbType(
+      proc(): Future[seq[byte]] {.async: (raises: [CatchableError]).} =
         body
-      r
-    else:
-      let r: cbType = proc(): Future[seq[byte]] {.async.} =
+    )
+  else:
+    cbType(
+      proc(): Future[seq[byte]] {.async.} =
         body
-      r
+    )
 
 proc remainingDeadlineDuration*(deadline: Moment): Duration =
   ## Compute the remaining Duration until `deadline`. When the deadline has

@@ -939,6 +939,90 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "stmt cache: zero-column rows on cache hit":
+    # A hit gets no RowDescription, so its RowData must exist up front even
+    # with no columns, or queryValue reads a nil `qr.data`.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT FROM generate_series(1, 3)"
+
+      for _ in 0 .. 1: # miss, then hit
+        let qr = await conn.query(sql)
+        doAssert qr.rowCount == 3
+        doAssert qr.data != nil and qr.data.numCols == 0
+        var raised = false
+        try:
+          discard await conn.queryValue(sql)
+        except PgTypeError:
+          raised = true
+        doAssert raised
+      doAssert conn.stmtCache.len == 1
+
+      let p = newPipeline(conn)
+      p.addQuery(sql)
+      let pr = await p.execute()
+      doAssert pr[0].queryResult.rowCount == 3
+      doAssert pr[0].queryResult.data != nil
+      doAssert pr[0].queryResult.data.numCols == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "prepared statement: zero-column rows":
+    # Execute gets no RowDescription either, so the RowData comes from prepare.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let stmt = await conn.prepare("zero_cols", "SELECT FROM generate_series(1, 3)")
+      let qr = await stmt.execute()
+      doAssert qr.rowCount == 3
+      doAssert qr.data != nil and qr.data.numCols == 0
+      doAssert qr.rows.len == 3
+      await stmt.close()
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: a statement without rows has no RowData on hit either":
+    # NoData and zero columns both cache no fields; only the latter has rows.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("CREATE TEMP TABLE nodata_hit (id int)")
+      let sql = "INSERT INTO nodata_hit VALUES (1)"
+
+      for _ in 0 .. 1: # miss, then hit
+        let qr = await conn.query(sql)
+        doAssert qr.commandTag == "INSERT 0 1"
+        doAssert qr.data == nil and qr.fields.len == 0
+        doAssert qr.rows.len == 0
+        doAssert conn.stmtCache[sql].noData
+
+      let n = await conn.queryEach(
+        sql,
+        callback = proc(row: Row) =
+          discard,
+      )
+      doAssert n == 0
+      let dqr = await conn.queryDirect(sql)
+      doAssert dqr.commandTag == "INSERT 0 1"
+      doAssert dqr.data == nil
+
+      let p = newPipeline(conn)
+      p.addQuery(sql)
+      let pr = await p.execute()
+      doAssert pr[0].queryResult.commandTag == "INSERT 0 1"
+      doAssert pr[0].queryResult.data == nil
+
+      let stmt = await conn.prepare("nodata_ins", sql)
+      let sqr = await stmt.execute()
+      doAssert sqr.commandTag == "INSERT 0 1"
+      doAssert sqr.data == nil
+      await stmt.close()
+
+      await conn.close()
+
+    waitFor t()
+
   test "stmt cache: cached entry retains resultFormats/colFmts/colOids after miss":
     # If empty, no-override cache hits lose per-OID default formats and
     # binary decode metadata.

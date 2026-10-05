@@ -7,7 +7,7 @@
 
 import std/[options, strutils, tables]
 
-import ../[async_backend, pg_errors, pg_protocol, pg_types]
+import ../[async_backend, pg_errors, pg_gensym, pg_protocol, pg_types]
 import types, buffer_io, ssl
 
 when hasAsyncDispatch:
@@ -403,7 +403,7 @@ template awaitOrInvalidate*(
     fut: untyped,
     timeout: Duration,
     reason: static string,
-) =
+) {.macroSymLocals.} =
   ## Await ``fut`` with optional timeout. ``AsyncTimeoutError`` invalidates via
   ## ``invalidateOnTimeout``; a cancellation via ``invalidateOnCancel`` and is
   ## re-raised.
@@ -412,19 +412,19 @@ template awaitOrInvalidate*(
       dest = await fut.wait(timeout)
     except AsyncTimeoutError:
       connExpr.invalidateOnTimeout(reason)
-    except CancelledError as e:
+    except CancelledError as timedCancel:
       connExpr.invalidateOnCancel()
-      raise e
+      raise timedCancel
   else:
     try:
       dest = await fut
-    except CancelledError as e:
+    except CancelledError as cancel:
       connExpr.invalidateOnCancel()
-      raise e
+      raise cancel
 
 template awaitVoidOrInvalidate*(
     connExpr: PgConnection, fut: untyped, timeout: Duration, reason: static string
-) =
+) {.macroSymLocals.} =
   ## Void-returning variant of `awaitOrInvalidate` for `Future[void]` sites
   ## (e.g. `close` on a prepared statement or cursor).
   if timeout > ZeroDuration:
@@ -432,15 +432,15 @@ template awaitVoidOrInvalidate*(
       await fut.wait(timeout)
     except AsyncTimeoutError:
       connExpr.invalidateOnTimeout(reason)
-    except CancelledError as e:
+    except CancelledError as timedCancel:
       connExpr.invalidateOnCancel()
-      raise e
+      raise timedCancel
   else:
     try:
       await fut
-    except CancelledError as e:
+    except CancelledError as cancel:
       connExpr.invalidateOnCancel()
-      raise e
+      raise cancel
 
 template tracedSimpleExec*(
     conn: PgConnection,
