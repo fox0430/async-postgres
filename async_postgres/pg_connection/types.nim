@@ -1908,7 +1908,8 @@ func stmtCacheResetGen*(conn: PgConnection): int {.inline.} =
 
 proc noteCommandTag*(conn: PgConnection, tag: string) =
   ## Drop the cache once the session's prepared statements are gone. A run
-  ## inside a function sends no such tag; the first hit's 26000 catches that.
+  ## inside a function sends no such tag; the next cache hit's 26000 catches
+  ## that (see ``retryStmtCacheInvalidation``).
   if tag in ["DISCARD ALL", "DEALLOCATE ALL"]:
     conn.clearStmtCache()
 

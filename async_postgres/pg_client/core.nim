@@ -5,7 +5,7 @@
 import std/[options, math, random]
 
 import ../[async_backend, pg_protocol, pg_types]
-import ../pg_connection/[types, buffer_io]
+import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
 
 type
@@ -176,10 +176,11 @@ type
       ## portal instead.
     scsMiss ## Parses a fresh named statement; `settleStmtCache` decides its fate.
 
-  MissFacts* = object
-    ## What the server confirmed about a cache miss's Parse and
-    ## Describe(Statement). The cache acts on these alone: whether the
-    ## operation failed says nothing about how far the server got.
+  OpFacts* = object
+    ## What the server confirmed about an op's Bind and, for a cache miss, its
+    ## Parse and Describe(Statement). The cache acts on these alone: whether
+    ## the operation failed says nothing about how far the server got.
+    bound*: bool ## ``BindComplete`` arrived: a later error is the statement's own.
     parsed*: bool ## ``ParseComplete`` arrived: the statement exists.
     parsedGen*: int ## ``stmtCacheResetGen`` when it arrived.
     described*: bool
@@ -196,27 +197,31 @@ func stmtCacheStatus*(cacheHit, cacheMiss: bool): StmtCacheStatus {.inline.} =
   else:
     scsUncached
 
-proc observe*(facts: var MissFacts, conn: PgConnection, msg: BackendMessage) =
-  ## Record a reply to the miss's Parse or Describe(Statement).
-  case msg.kind
-  of bmkParseComplete:
-    facts.parsed = true
-    facts.parsedGen = conn.stmtCacheResetGen
-  of bmkParameterDescription:
-    facts.paramOids = msg.paramTypeOids
-  of bmkRowDescription:
-    facts.fields = msg.fields
-    facts.described = true
-  of bmkNoData:
-    facts.described = true
-  else:
-    discard
+proc observe*(facts: var OpFacts, conn: PgConnection, msg: BackendMessage, miss: bool) =
+  ## Record a reply to the op's Bind, or to a miss's Parse or
+  ## Describe(Statement). Only a miss settles on the latter.
+  if msg.kind == bmkBindComplete:
+    facts.bound = true
+  elif miss:
+    case msg.kind
+    of bmkParseComplete:
+      facts.parsed = true
+      facts.parsedGen = conn.stmtCacheResetGen
+    of bmkParameterDescription:
+      facts.paramOids = msg.paramTypeOids
+    of bmkRowDescription:
+      facts.fields = msg.fields
+      facts.described = true
+    of bmkNoData:
+      facts.described = true
+    else:
+      discard
 
 proc settleStmtCache*(
     conn: PgConnection,
     sql, stmtName: string,
     cache: StmtCacheStatus,
-    facts: sink MissFacts,
+    facts: var OpFacts,
     queryError: ref PgQueryError,
 ) =
   ## Statement-cache bookkeeping once an operation's ``ReadyForQuery``
@@ -226,7 +231,8 @@ proc settleStmtCache*(
   ## never Parsed is left alone, since the name may be someone else's (42P05).
   ## A miss Parsed before a later ``DISCARD ALL`` / ``DEALLOCATE ALL``
   ## (``facts.parsedGen`` behind ``stmtCacheResetGen``) is neither cached nor
-  ## Closed: the server already dropped the statement.
+  ## Closed: the server already dropped the statement. A hit or share that
+  ## bound is kept: the error is the statement's own.
   case cache
   of scsMiss:
     if facts.parsed and facts.parsedGen != conn.stmtCacheResetGen:
@@ -241,7 +247,8 @@ proc settleStmtCache*(
     elif facts.parsed:
       conn.queueStmtClose(stmtName)
   of scsHit, scsShare:
-    if queryError == nil or queryError.sqlState notin StmtCacheInvalidatingStates:
+    if queryError == nil or facts.bound or
+        queryError.sqlState notin StmtCacheInvalidatingStates:
       discard
     elif cache == scsHit and queryError.sqlState == "26000":
       # Gone without a reset tag (a DEALLOCATE ALL inside a function): one
@@ -252,6 +259,36 @@ proc settleStmtCache*(
       conn.invalidateStmtCache(sql, stmtName)
   of scsUncached:
     discard
+
+func shouldRetryStmtCacheInvalidation*(
+    conn: PgConnection, cacheHit: bool, sqlState: string, bound: bool
+): bool =
+  ## Whether a failed op may be re-issued once from Parse: a cache-hit Bind
+  ## refused with ``26000`` (statements dropped without a reset tag) outside a
+  ## transaction. Bind precedes Execute, so nothing ran; ``bound`` means the
+  ## error came later, from the statement itself.
+  cacheHit and not bound and sqlState == "26000" and conn.txStatus == tsIdle
+
+template retryStmtCacheInvalidation*(
+    conn: PgConnection, cacheHit, facts, body: untyped
+) =
+  ## Run ``body``, one extended-query op that sets ``cacheHit`` in its send
+  ## phase, fills ``facts`` in its receive loop and ``return``s on success,
+  ## and re-issue it once when ``shouldRetryStmtCacheInvalidation`` allows. The
+  ## re-issue passes ``checkReady`` first, so a ``close()`` during the failed
+  ## attempt stops it.
+  var retried = false
+  while true:
+    var cacheHit = false
+    var facts: OpFacts
+    try:
+      body
+    except PgQueryError as e:
+      if retried or
+          not conn.shouldRetryStmtCacheInvalidation(cacheHit, e.sqlState, facts.bound):
+        raise e
+      retried = true
+      conn.checkReady()
 
 proc backoffDelayMs*(opts: RetryOptions, attempt: int): int =
   ## Backoff ms for attempt (1-based). Exponential with jitter.
@@ -640,9 +677,8 @@ template queryRecvLoop*(
     cachedColFmts: seq[int16],
     cachedColOids: seq[int32],
     qr: var QueryResult,
+    facts: var OpFacts,
 ) =
-  var facts: MissFacts
-
   if cacheHit:
     # Take the cached field descriptions (already a private copy of the cache
     # entry) so we can update formatCode without mutating the statement cache.
@@ -659,8 +695,7 @@ template queryRecvLoop*(
       qr.data.fields = qr.fields
 
   conn.pumpUntilReady(qr.data, addr qr.rowCount):
-    if cacheMiss:
-      facts.observe(conn, pumpMsg)
+    facts.observe(conn, pumpMsg, cacheMiss)
     case pumpMsg.kind
     of bmkRowDescription:
       # A cache hit sends no Describe; only the cache-disabled path Describes
@@ -673,7 +708,7 @@ template queryRecvLoop*(
       discard
   do:
     conn.settleStmtCache(
-      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), move facts, queryError
+      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), facts, queryError
     )
 
 template queryEachRecvLoop*(
@@ -687,9 +722,9 @@ template queryEachRecvLoop*(
     cachedColOids: seq[int32],
     callback: RowCallback,
     rowCount: var int64,
+    facts: var OpFacts,
 ) =
   var rd: RowData
-  var facts: MissFacts
   var callbackError: ref CatchableError = nil
 
   if cacheHit:
@@ -714,15 +749,14 @@ template queryEachRecvLoop*(
     rowCount += 1
 
   conn.pumpUntilReady(rd, onRow, addr callbackError):
-    if cacheMiss:
-      facts.observe(conn, pumpMsg)
+    facts.observe(conn, pumpMsg, cacheMiss)
     if pumpMsg.kind == bmkRowDescription:
       var fields = pumpMsg.fields
       rd = describedRowData(fields, portal = not cacheMiss, resultFormats)
   do:
     # The statement's fate is the server's outcome, whatever the callback did.
     conn.settleStmtCache(
-      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), move facts, queryError
+      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), facts, queryError
     )
     # Callback errors take precedence over server errors.
     if callbackError != nil:
@@ -734,20 +768,18 @@ template execRecvLoop*(
     cacheHit, cacheMiss: bool,
     stmtName: string,
     commandTag: var string,
+    facts: var OpFacts,
 ) =
   ## Receive-loop counterpart of `queryRecvLoop` for the extended-query exec
   ## path: `DataRow`s are dropped by the parser (bare `pumpUntilReady` uses
   ## `skipDataRow = true`); this loop only exposes the `CommandComplete` tag
   ## via the `commandTag` out-parameter. Shared by `execImpl` (both
   ## overloads), `execInlineImpl`, and `execDirectRunImpl`.
-  var facts: MissFacts
-
   conn.pumpUntilReady:
-    if cacheMiss:
-      facts.observe(conn, pumpMsg)
+    facts.observe(conn, pumpMsg, cacheMiss)
     if pumpMsg.kind == bmkCommandComplete:
       commandTag = pumpMsg.commandTag
   do:
     conn.settleStmtCache(
-      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), move facts, queryError
+      sql, stmtName, stmtCacheStatus(cacheHit, cacheMiss), facts, queryError
     )

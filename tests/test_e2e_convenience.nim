@@ -1522,8 +1522,9 @@ suite "E2E: Convenience Query Methods":
     waitFor t()
 
   test "stmt cache: DISCARD ALL and DEALLOCATE ALL drop the cache":
-    # Left in place, every cached statement failed once with 26000, and a
-    # repeated exec of the reset Bound the statement its first run dropped.
+    # Left in place, every cached statement would cost a 26000 and a re-issue,
+    # and a repeated exec of the reset would Bind the statement its first run
+    # dropped.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
@@ -1549,26 +1550,24 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
-  test "stmt cache: statements dropped with no reset tag fail one hit":
+  test "stmt cache: statements dropped with no reset tag retry once":
     # A DEALLOCATE ALL inside a DO block reports DO, so only a hit's 26000
-    # tells; left at that one entry, every other entry failed once too.
+    # tells. That one failure drops every entry and the hit is re-issued from
+    # Parse; left at that one entry, every other entry would fail once too.
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let queries = ["SELECT 1", "SELECT 2", "SELECT 3"]
       for sql in queries:
         discard await conn.query(sql)
+      let firstName = conn.stmtCache["SELECT 1"].name
       discard await conn.simpleExec("DO $$ BEGIN EXECUTE 'DEALLOCATE ALL'; END $$")
 
-      var failures = 0
-      for sql in queries:
-        try:
-          discard await conn.query(sql)
-        except PgQueryError as e:
-          doAssert e.sqlState == "26000", e.msg
-          inc failures
-      doAssert failures == 1
-      for i, sql in queries:
-        doAssert (await conn.query(sql)).rows[0].getInt(0) == int32(i + 1)
+      doAssert (await conn.query("SELECT 1")).rows[0].getInt(0) == 1
+      doAssert conn.stmtCache.len == 1
+      doAssert conn.stmtCache["SELECT 1"].name != firstName
+      for _ in 0 ..< 2:
+        for i, sql in queries:
+          doAssert (await conn.query(sql)).rows[0].getInt(0) == int32(i + 1)
       let server = (
         await conn.simpleQuery("SELECT count(*)::int FROM pg_prepared_statements")
       )[0].rows[0].getInt(0)

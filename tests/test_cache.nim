@@ -247,8 +247,14 @@ suite "conn-level staging equals the two-argument form":
     check twoArg.lookupStmtCache("a").isNil
 
 suite "settleStmtCache acts on what the server confirmed":
-  proc facts(parsed, described: bool): MissFacts =
-    MissFacts(parsed: parsed, described: described, paramOids: @[23'i32])
+  proc facts(parsed, described: bool): OpFacts =
+    OpFacts(parsed: parsed, described: described, paramOids: @[23'i32])
+
+  proc settle(
+      conn: PgConnection, cache: StmtCacheStatus, f: OpFacts, err: ref PgQueryError
+  ) =
+    var f = f
+    conn.settleStmtCache("q", "_sc_1", cache, f, err)
 
   proc failure(state: string): ref PgQueryError =
     (ref PgQueryError)(sqlState: state, msg: state)
@@ -257,30 +263,30 @@ suite "settleStmtCache acts on what the server confirmed":
     # Even on 0A000: a plan gone stale fails its next hit, which invalidates it.
     for err in [nil, failure("22012"), failure("0A000")]:
       let conn = mockConn(2)
-      conn.settleStmtCache("q", "_sc_1", scsMiss, facts(true, true), err)
+      conn.settle(scsMiss, facts(true, true), err)
       check conn.lookupStmtCache("q").name == "_sc_1"
       check conn.lookupStmtCache("q").paramOids == @[23'i32]
       check conn.pendingStmtCloses.len == 0
 
   test "a miss Parsed but not Described is Closed":
     let conn = mockConn(2)
-    conn.settleStmtCache("q", "_sc_1", scsMiss, facts(true, false), failure("25P02"))
+    conn.settle(scsMiss, facts(true, false), failure("25P02"))
     check conn.lookupStmtCache("q").isNil
     check conn.pendingStmtCloses == @["_sc_1"]
 
   test "a miss never Parsed is left alone":
     # 42P05: the name belongs to someone else, whose statement a Close would drop.
     let conn = mockConn(2)
-    conn.settleStmtCache("q", "_sc_1", scsMiss, facts(false, false), failure("42P05"))
+    conn.settle(scsMiss, facts(false, false), failure("42P05"))
     check conn.lookupStmtCache("q").isNil
     check conn.pendingStmtCloses.len == 0
 
   test "a hit is invalidated only by an invalidating state":
     let conn = mockConn(2)
     conn.addStmtCache("q", cached("_sc_1"))
-    conn.settleStmtCache("q", "_sc_1", scsHit, MissFacts(), failure("22012"))
+    conn.settle(scsHit, OpFacts(), failure("22012"))
     check conn.lookupStmtCache("q").name == "_sc_1"
-    conn.settleStmtCache("q", "_sc_1", scsHit, MissFacts(), failure("26000"))
+    conn.settle(scsHit, OpFacts(), failure("26000"))
     check conn.lookupStmtCache("q").isNil
     check conn.pendingStmtCloses == @["_sc_1"]
 
@@ -290,7 +296,7 @@ suite "settleStmtCache acts on what the server confirmed":
     conn.addStmtCache("a", cached("_sc_a"))
     conn.addStmtCache("q", cached("_sc_1"))
     conn.addStmtCache("b", cached("_sc_b"))
-    conn.settleStmtCache("q", "_sc_1", scsHit, MissFacts(), failure("26000"))
+    conn.settle(scsHit, OpFacts(), failure("26000"))
     check conn.stmtCache.len == 0
     check lruLen(conn) == 0
     check conn.pendingStmtCloses == @["_sc_a", "_sc_1", "_sc_b"]
@@ -301,10 +307,22 @@ suite "settleStmtCache acts on what the server confirmed":
       let conn = mockConn(2)
       conn.addStmtCache("a", cached("_sc_a"))
       conn.addStmtCache("q", cached("_sc_1"))
-      conn.settleStmtCache("q", "_sc_1", cache, MissFacts(), failure(state))
+      conn.settle(cache, OpFacts(), failure(state))
       check conn.lookupStmtCache("q").isNil
       check conn.lookupStmtCache("a").name == "_sc_a"
       check conn.pendingStmtCloses == @["_sc_1"]
+
+  test "a hit or share whose Bind completed keeps the cache":
+    # The statement bound, so the 26000 / 0A000 is the statement's own.
+    for cache in [scsHit, scsShare]:
+      for state in ["26000", "0A000"]:
+        let conn = mockConn(2)
+        conn.addStmtCache("a", cached("_sc_a"))
+        conn.addStmtCache("q", cached("_sc_1"))
+        conn.settle(cache, OpFacts(bound: true), failure(state))
+        check conn.lookupStmtCache("q").name == "_sc_1"
+        check conn.lookupStmtCache("a").name == "_sc_a"
+        check conn.pendingStmtCloses.len == 0
 
   test "a hit's 26000 after a reset already seen leaves the cache alone":
     # A pipeline hit queued behind a DEALLOCATE ALL of the same batch.
@@ -312,13 +330,13 @@ suite "settleStmtCache acts on what the server confirmed":
     conn.addStmtCache("q", cached("_sc_1"))
     conn.noteCommandTag("DEALLOCATE ALL")
     conn.addStmtCache("a", cached("_sc_2"))
-    conn.settleStmtCache("q", "_sc_1", scsHit, MissFacts(), failure("26000"))
+    conn.settle(scsHit, OpFacts(), failure("26000"))
     check conn.lookupStmtCache("a").name == "_sc_2"
     check conn.pendingStmtCloses.len == 0
 
   test "a miss settled after caching was turned off is Closed":
     let conn = mockConn(0)
-    conn.settleStmtCache("q", "_sc_1", scsMiss, facts(true, true), nil)
+    conn.settle(scsMiss, facts(true, true), nil)
     check conn.pendingStmtCloses == @["_sc_1"]
 
   test "a miss Parsed before a reset is neither cached nor Closed":
@@ -327,18 +345,45 @@ suite "settleStmtCache acts on what the server confirmed":
       var f = facts(true, described)
       f.parsedGen = conn.stmtCacheResetGen
       conn.noteCommandTag("DEALLOCATE ALL")
-      conn.settleStmtCache("q", "_sc_1", scsMiss, f, nil)
+      conn.settle(scsMiss, f, nil)
       check conn.lookupStmtCache("q").isNil
       check conn.pendingStmtCloses.len == 0
 
   test "a miss Parsed after a reset is cached":
     let conn = mockConn(2)
     conn.noteCommandTag("DISCARD ALL")
-    var f: MissFacts
-    f.observe(conn, BackendMessage(kind: bmkParseComplete))
-    f.observe(conn, BackendMessage(kind: bmkNoData))
-    conn.settleStmtCache("q", "_sc_1", scsMiss, f, nil)
+    var f: OpFacts
+    f.observe(conn, BackendMessage(kind: bmkParseComplete), miss = true)
+    f.observe(conn, BackendMessage(kind: bmkNoData), miss = true)
+    conn.settle(scsMiss, f, nil)
     check conn.lookupStmtCache("q").name == "_sc_1"
+
+  test "observe records any op's Bind but only a miss's Parse and Describe":
+    let conn = mockConn(2)
+    for miss in [false, true]:
+      var f: OpFacts
+      for kind in [bmkParseComplete, bmkNoData, bmkBindComplete]:
+        f.observe(conn, BackendMessage(kind: kind), miss)
+      check f.bound
+      check f.parsed == miss
+      check f.described == miss
+
+suite "shouldRetryStmtCacheInvalidation retries only a Bind-phase 26000":
+  test "a cache-hit Bind refused with 26000 on an idle connection retries":
+    let conn = mockConn(2)
+    check conn.shouldRetryStmtCacheInvalidation(true, "26000", false)
+
+  test "an Execute-phase 26000 never retries":
+    let conn = mockConn(2)
+    check not conn.shouldRetryStmtCacheInvalidation(true, "26000", true)
+
+  test "a miss, another state, or an open transaction never retries":
+    let conn = mockConn(2)
+    check not conn.shouldRetryStmtCacheInvalidation(false, "26000", false)
+    check not conn.shouldRetryStmtCacheInvalidation(true, "0A000", false)
+    check not conn.shouldRetryStmtCacheInvalidation(true, "22012", false)
+    conn.txStatus = tsInTransaction
+    check not conn.shouldRetryStmtCacheInvalidation(true, "26000", false)
 
 suite "statements dropped by the session":
   test "DISCARD ALL and DEALLOCATE ALL empty the cache and the owed Closes":

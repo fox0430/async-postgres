@@ -28,9 +28,10 @@ proc queryDirectRunImpl*(
   ## ``query.nim``).
   result = QueryResult()
   await conn.sendStagedBufMsg()
+  var facts: OpFacts
   queryRecvLoop(
     conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cachedFields, colFmts,
-    colOids, result,
+    colOids, result, facts,
   )
 
 proc queryDirectImpl*(
@@ -591,7 +592,8 @@ proc execDirectRunImpl*(
   ## Impl can apply ``.wait(timeout)`` without an extra closure alloc.
   await conn.sendStagedBufMsg()
   var commandTag = ""
-  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag)
+  var facts: OpFacts
+  execRecvLoop(conn, sql, cacheHit, cacheMiss, stmtName, commandTag, facts)
   return commandTag
 
 proc execDirectImpl*(
