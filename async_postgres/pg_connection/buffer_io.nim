@@ -479,7 +479,8 @@ when hasAsyncDispatch:
       return fut
     var s = newString(len)
     copyMem(addr s[0], p, len)
-    socket.send(move s)
+    # No SafeDisconn: it passes EPIPE/ECONNRESET off as a completed send.
+    socket.send(move s, {})
 
   proc sendRawBytes*(socket: AsyncSocket, data: seq[byte]): Future[void] =
     ## Send ``seq[byte]`` via asyncdispatch socket.
