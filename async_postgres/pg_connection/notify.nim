@@ -31,6 +31,11 @@ proc onNotice*(conn: PgConnection, callback: NoticeCallback) =
 proc onReconnect*(conn: PgConnection, callback: ReconnectCallback) =
   ## Set a callback invoked after the listen pump reconnects in place and
   ## re-subscribes every channel.
+  ##
+  ## The new session is built from ``conn.config`` alone: ``SET`` /
+  ## ``set_config`` changes, temporary tables, prepared statements and session
+  ## advisory locks do not carry over. Put a setting that must survive in
+  ## ``extraParams`` (e.g. ``("search_path", "app")``) instead.
   conn.reconnectCallback = callback
 
 proc onNotifyOverflow*(conn: PgConnection, callback: NotifyOverflowCallback) =

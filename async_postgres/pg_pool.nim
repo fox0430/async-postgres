@@ -2277,6 +2277,8 @@ proc execInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with typed parameters.
+  ## Returned rows (e.g. ``RETURNING``) are discarded undecoded; read them with
+  ## ``queryInTransaction``.
   let conn = await pool.acquireInternal()
   return await pool.runAndRelease(conn, conn.execInTransaction(sql, params, timeout))
 
@@ -2288,7 +2290,9 @@ proc execInTransaction*(
     timeout: Duration = ZeroDuration,
 ): Future[CommandResult] {.async.} =
   ## Execute a statement inside a pipelined transaction with options
-  ## (isolation / access mode / deferrable) applied to the BEGIN.
+  ## (isolation / access mode / deferrable) applied to the BEGIN. Returned rows
+  ## (e.g. ``RETURNING``) are discarded undecoded; read them with
+  ## ``queryInTransaction``.
   let conn = await pool.acquireInternal()
   return
     await pool.runAndRelease(conn, conn.execInTransaction(sql, params, opts, timeout))

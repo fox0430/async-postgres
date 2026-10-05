@@ -3544,6 +3544,29 @@ suite "E2E: execInTransaction / queryInTransaction":
 
     waitFor t()
 
+  test "execInTransaction discards RETURNING rows and commits them":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_eit_ret")
+      discard
+        await conn.exec("CREATE TABLE test_eit_ret (id serial PRIMARY KEY, val text)")
+
+      let tag = await conn.execInTransaction(
+        "INSERT INTO test_eit_ret (val) " &
+          "SELECT 'v' || g FROM generate_series(1, 1000) g RETURNING id, val"
+      )
+      doAssert tag == "INSERT 0 1000"
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      let res = await conn.query("SELECT count(*) FROM test_eit_ret")
+      doAssert res.rows[0].getStr(0) == "1000"
+
+      discard await conn.exec("DROP TABLE test_eit_ret")
+      await conn.close()
+
+    waitFor t()
+
   test "execInTransaction with comment-only SQL does not capture COMMIT tag":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
