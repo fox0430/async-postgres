@@ -6,21 +6,23 @@ import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
 
-template withProbeRole(role, setting: string, body: untyped) =
-  ## Runs ``body`` with ``cfg`` logging in as ``role``, whose session default is
-  ## ``setting``. Drops the role after ``body``'s own deferred closes.
+template withProbeRole(role, rolePassword, setting: string, body: untyped) =
+  ## Runs ``body`` with ``cfg`` logging in as ``role`` with ``rolePassword``,
+  ## whose session default is ``setting`` unless empty. Drops the role after
+  ## ``body``'s own deferred closes.
   let admin = await connect(plainConfig())
   defer:
     await admin.close()
   discard await admin.simpleQuery("DROP ROLE IF EXISTS " & role)
-  discard await admin.simpleQuery(
-    "CREATE ROLE " & role & " LOGIN PASSWORD 'p'; ALTER ROLE " & role & " SET " & setting
-  )
+  var ddl = "CREATE ROLE " & role & " LOGIN PASSWORD " & quoteLiteral(rolePassword)
+  if setting.len > 0:
+    ddl.add "; ALTER ROLE " & role & " SET " & setting
+  discard await admin.simpleQuery(ddl)
   defer:
     discard await admin.simpleQuery("DROP ROLE " & role)
   var cfg {.inject.} = plainConfig()
   cfg.user = role
-  cfg.password = "p"
+  cfg.password = rolePassword
   body
 
 suite "E2E: Basic Connection":
@@ -110,7 +112,7 @@ suite "E2E: ConnConfig Options":
 
   test "DateStyle is ISO from startup, so RESET and DISCARD ALL keep it":
     proc t() {.async.} =
-      withProbeRole("async_pg_datestyle_probe", "DateStyle = 'SQL, YMD'"):
+      withProbeRole("async_pg_datestyle_probe", "p", "DateStyle = 'SQL, YMD'"):
         # The startup value overrides the role's, field order included.
         let conn = await connect(cfg)
         defer:
@@ -178,7 +180,7 @@ suite "E2E: ConnConfig Options":
       return res.rows[0].getBool(0)
 
     proc t() {.async.} =
-      withProbeRole("async_pg_timezone_probe", "TimeZone = 'Asia/Tokyo'"):
+      withProbeRole("async_pg_timezone_probe", "p", "TimeZone = 'Asia/Tokyo'"):
         let dt = dateTime(2024, mJan, 1, 1, 0, 0, 0, utc())
         # The startup value overrides the role's.
         let conn = await connect(cfg)
@@ -493,6 +495,25 @@ suite "E2E: Authentication":
       doAssert raised
 
     waitFor t()
+
+  proc scramLogin(password: string) {.async.} =
+    withProbeRole("async_pg_saslprep_probe", password, ""):
+      # Without this, a trust pg_hba entry would pass any password.
+      cfg.requireAuth = {amScramSha256}
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      doAssert conn.state == csReady
+
+  test "SCRAM password with a code point unassigned in Unicode 3.2":
+    # The server hashes such a password raw, U+00A0 included.
+    waitFor scramLogin("pass\xC2\xA0word\xF0\x9F\x98\x80")
+
+  test "SCRAM password bidi check uses the Unicode 3.2 tables":
+    # U+2801 is not L in 3.2, so the server maps U+00A0.
+    waitFor scramLogin("\xD7\x90\xC2\xA0\xE2\xA0\x81\xD7\x90")
+    # U+1D6C1 is L in 3.2, so the server hashes the password raw.
+    waitFor scramLogin("\xD7\x90\xC2\xA0\xF0\x9D\x9B\x81\xD7\x90")
 
 suite "E2E: DSN Connection":
   test "connect via parseDsn":

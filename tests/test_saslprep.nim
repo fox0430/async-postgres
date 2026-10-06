@@ -1,6 +1,7 @@
-import std/unittest
+import std/[unittest, strutils, sequtils]
+from std/unicode import Rune, add
 
-import ../async_postgres/pg_saslprep
+import ../async_postgres/pg_saslprep {.all.}
 
 suite "SASLprep - ASCII fast path":
   test "empty string returns empty":
@@ -49,6 +50,30 @@ suite "SASLprep - RFC 3454 C.1.2 (non-ASCII space -> U+0020)":
 
   test "Ogham space mark U+1680 becomes ASCII space":
     check saslprep("a\xE1\x9A\x80b") == "a b"
+
+suite "SASLprep - RFC 3454 range tables":
+  test "every table is sorted, disjoint inclusive pairs":
+    for table in [
+      @prohibitedRanges,
+      @unassignedRanges,
+      @randALCatRanges,
+      @lCatRanges,
+      rejectedRanges,
+    ]:
+      check table.len mod 2 == 0
+      for k in 0 ..< table.len div 2:
+        check table[2 * k] <= table[2 * k + 1]
+        if k > 0:
+          check table[2 * k - 1] < table[2 * k]
+
+  test "merged reject table is the union of prohibited and unassigned":
+    var bad = -1'i32
+    for cp in 0'i32 .. 0x10FFFF:
+      if inRanges(rejectedRanges, cp) !=
+          (inRanges(prohibitedRanges, cp) or inRanges(unassignedRanges, cp)):
+        bad = cp
+        break
+    check bad == -1
 
 suite "SASLprep - NFKC normalization":
   test "compat decomposition of feminine ordinal U+00AA -> a":
@@ -112,6 +137,29 @@ suite "SASLprep - prohibited fallback (matches PostgreSQL)":
     let raw = "a\xC2\xA0b\xC2\x85c"
     check saslprep(raw) == raw
 
+suite "SASLprep - unassigned in Unicode 3.2 (A.1) falls back to raw":
+  # U+00A0 maps to a space on success, so a raw result proves the fallback
+  # for code points that SASLprep would otherwise leave unchanged.
+
+  test "emoji U+1F600 next to U+00A0":
+    let raw = "pass\xC2\xA0word\xF0\x9F\x98\x80"
+    check saslprep(raw) == raw
+
+  test "U+1F100, whose NFKC form is \"0.\", is not normalized":
+    let raw = "\xF0\x9F\x84\x80"
+    check saslprep(raw) == raw
+
+  test "range edges U+0221, U+0234, U+024F, U+E0080, U+EFFFD":
+    for cp in [
+      "\xC8\xA1", "\xC8\xB4", "\xC9\x8F", "\xF3\xA0\x82\x80", "\xF3\xAF\xBF\xBD"
+    ]:
+      let raw = "a\xC2\xA0" & cp
+      check saslprep(raw) == raw
+
+  test "assigned neighbours U+0233 and U+0250 still map":
+    check saslprep("a\xC2\xA0\xC8\xB3") == "a \xC8\xB3"
+    check saslprep("a\xC2\xA0\xC9\x90") == "a \xC9\x90"
+
 suite "SASLprep - bidirectional (RFC 3454 Section 6)":
   test "ARABIC ALEF alone is accepted":
     let alef = "\xD8\xA7" # U+0627
@@ -132,6 +180,17 @@ suite "SASLprep - bidirectional (RFC 3454 Section 6)":
     # U+0627 U+0628 (both AL). First and last are AL.
     let s = "\xD8\xA7\xD8\xA8"
     check saslprep(s) == s
+
+  test "U+2801 is not LCat in Unicode 3.2 (D.2)":
+    # Braille became L after 3.2, so a newer Unicode table would fall back.
+    check saslprep("\xD7\x90\xC2\xA0\xE2\xA0\x81\xD7\x90") ==
+      "\xD7\x90 \xE2\xA0\x81\xD7\x90"
+
+  test "U+1D6C1 and U+17B4 are LCat in Unicode 3.2 (D.2), so raw":
+    # Both are L in D.2 but not in current Unicode; U+1D6C1 would NFKC to U+2207.
+    for cp in ["\xF0\x9D\x9B\x81", "\xE1\x9E\xB4"]:
+      let raw = "\xD7\x90\xC2\xA0" & cp & "\xD7\x90"
+      check saslprep(raw) == raw
 
 suite "SASLprep - invalid UTF-8 fallback (matches PostgreSQL)":
   # PG server and libpq both use the raw bytes when input is not valid
@@ -156,6 +215,43 @@ suite "SASLprep - invalid UTF-8 fallback (matches PostgreSQL)":
   test "ASCII fast path still wins over the fallback":
     check saslprep("Password123!") == "Password123!"
 
+  test "code points above U+10FFFF are returned as-is":
+    # validateUtf8 accepts these, and toNFKC asserts on them.
+    for s in ["\xF4\x90\x80\x80", "\xF5\x80\x80\x80", "\xF7\xBF\xBF\xBF"]:
+      check saslprep("abc" & s) == "abc" & s
+      check saslprep("a\xC2\xA0" & s) == "a\xC2\xA0" & s
+
+  test "overlong 3- and 4-byte encodings are returned as-is":
+    # E0 82 A0 decodes to U+00A0, which would otherwise map to a space.
+    for s in ["a\xE0\x82\xA0b", "\xE0\x80\xAF", "\xF0\x80\x80\xAF", "\xF0\x8F\xBF\xBF"]:
+      check saslprep(s) == s
+
+  test "shortest forms after the narrowed lead bytes E0, ED, F0 still map":
+    check saslprep("a\xC2\xA0\xE0\xA4\x85") == "a \xE0\xA4\x85" # U+0905
+    check saslprep("a\xC2\xA0\xED\x9E\xA3") == "a \xED\x9E\xA3" # U+D7A3
+    check saslprep("a\xC2\xA0\xF0\xA0\x80\x80") == "a \xF0\xA0\x80\x80" # U+20000
+
+suite "SASLprep - UTF-8 legality (PostgreSQL's pg_utf8_islegal)":
+  test "every scalar value's encoding is legal, a surrogate's is not":
+    var bad = -1'i32
+    var buf = newStringOfCap(4)
+    for cp in 0'i32 .. 0x10FFFF:
+      buf.setLen(0)
+      buf.add Rune(cp)
+      if isLegalUtf8(buf) == (cp in 0xD800'i32 .. 0xDFFF'i32):
+        bad = cp
+        break
+    check bad == -1
+
+  test "sequences PostgreSQL rejects are not legal":
+    for s in [
+      "\x80", "\xBF", "\xC0\x80", "\xC1\xBF", "\xC2", "\xC2\x41", "\xE0\x9F\xBF",
+      "\xE1\x80", "\xE1\x80\xC0", "\xED\xA0\x80", "\xED\xBF\xBF", "\xF0\x8F\xBF\xBF",
+      "\xF1\x80\x80", "\xF4\x90\x80\x80", "\xF5\x80\x80\x80", "\xF8\x88\x80\x80\x80",
+      "\xFF",
+    ]:
+      check not isLegalUtf8(s)
+
 suite "SASLprep - empty post-mapping fallback":
   test "B.1-only input falls back to raw (not empty)":
     # Soft hyphen maps to nothing; the mapped result is empty, so we
@@ -165,3 +261,17 @@ suite "SASLprep - empty post-mapping fallback":
 
   test "ZWSP-only input maps to a single space":
     check saslprep("\xE2\x80\x8B") == " "
+
+suite "SASLprep - dependencies":
+  test "the package keeps a floor on the unicodedb that toNFKC reads":
+    # Nothing imports unicodedb directly, and normalize allows >= 0.7.
+    const manifest = staticRead("../async_postgres.nimble")
+    var floor: seq[int]
+    for line in manifest.splitLines:
+      if line.strip.startsWith("requires"):
+        for spec in line.split('"'):
+          if spec.startsWith("unicodedb") and ">=" in spec:
+            floor =
+              spec.split(">=")[1].splitWhitespace[0].split('.').mapIt(parseInt(it))
+    floor.setLen(3)
+    check (floor[0], floor[1], floor[2]) >= (0, 13, 2)
