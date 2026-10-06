@@ -1468,6 +1468,24 @@ proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## `connectRefusal` keeps the refusal until a connect succeeds, but a waiter
   ## queued after it gets a dial of its own. `retryAdvice` returns `raStop` for
   ## either kind.
+  ##
+  ## Timeout types differ by phase: this proc reports its own deadline as
+  ## `PgPoolError(pekAcquireTimeout)`, while a pipelined `pool.exec` /
+  ## `pool.query` wait and the pool `withTransactionDeadline` /
+  ## `withTransactionRetryDeadline` deadline raise `PgTimeoutError` instead —
+  ## even when the deadline variant expires during its internal acquire. An
+  ## `except PgPoolError` clause alone therefore misses those operation
+  ## timeouts; catch `PgTimeoutError` first:
+  ## ```nim
+  ## try:
+  ##   discard await pool.query(sql"SELECT 1", timeout = seconds(5))
+  ## except PgTimeoutError:
+  ##   echo "operation timed out"
+  ## except PgPoolError as e:
+  ##   echo "acquire failed: ", e.kind
+  ## ```
+  ## `retryAdvice` returns `raRetry` for both timeout types, so a retry loop
+  ## can treat them alike.
   return await pool.acquireCommon(byUser = true)
 
 proc acquireHandle*(pool: PgPool): Future[PooledConnHandle] {.async.} =
@@ -2018,6 +2036,10 @@ proc exec*(
   ## and stays unlimited. A finite `timeout` is measured from enqueue (queue
   ## dwell included); when `maxWaiters >= 0`, enqueue itself rejects with
   ## `pekQueueFull` once `pendingOps` reaches that depth.
+  ##
+  ## A pipelined wait that exceeds `timeout` raises `PgTimeoutError`, not
+  ## `PgPoolError`, so `except PgPoolError` alone misses it — catch
+  ## `PgTimeoutError` first (see `acquire`).
   if pool.config.pipelined:
     let fut = newFuture[CommandResult]("PgPool.exec.pipelined")
     let op = PendingPoolOp(
@@ -2070,6 +2092,10 @@ proc query*(
   ## and stays unlimited. A finite `timeout` is measured from enqueue (queue
   ## dwell included); when `maxWaiters >= 0`, enqueue itself rejects with
   ## `pekQueueFull` once `pendingOps` reaches that depth.
+  ##
+  ## A pipelined wait that exceeds `timeout` raises `PgTimeoutError`, not
+  ## `PgPoolError`, so `except PgPoolError` alone misses it — catch
+  ## `PgTimeoutError` first (see `acquire`).
   if pool.config.pipelined:
     let fut = newFuture[QueryResult]("PgPool.query.pipelined")
     let op = PendingPoolOp(
@@ -2557,6 +2583,13 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## waiter remains queued (cancelled best-effort) until the underlying
   ## acquire future settles; this is unavoidable under asyncdispatch.
   ##
+  ## This holds for the acquire phase too: a deadline that expires while
+  ## waiting for `acquire()` raises `PgTimeoutError`, not
+  ## `PgPoolError(pekAcquireTimeout)` as a bare `acquire()` would. An
+  ## `except PgPoolError` clause alone therefore misses it — catch
+  ## `PgTimeoutError` first (see `acquire`). `retryAdvice` returns `raRetry`
+  ## for both timeout types.
+  ##
   ## **Edge case — acquire-completion race:** under asyncdispatch the only
   ## preemption point is `await`, but the outer `wait` may still fire its
   ## timeout on the same tick the body finishes. To avoid a false-positive
@@ -2733,7 +2766,13 @@ macro withTransactionRetryDeadline*(
   ## `deadline`, not `maxAttempts * deadline`.
   ##
   ## **On deadline exceeded:** `PgTimeoutError` is raised — never retried; the
-  ## in-flight connection is handled as in `withTransactionDeadline`.
+  ## in-flight connection is handled as in `withTransactionDeadline`. This
+  ## holds for the acquire phase too: a deadline that expires while waiting
+  ## for `acquire()` raises `PgTimeoutError`, not
+  ## `PgPoolError(pekAcquireTimeout)` as a bare `acquire()` would. An
+  ## `except PgPoolError` clause alone therefore misses it — catch
+  ## `PgTimeoutError` first (see `acquire`). `retryAdvice` returns `raRetry`
+  ## for both timeout types.
   ## **On a retryable error:**
   ## ROLLBACK runs with `rollbackGrace` and the transaction is retried if budget
   ## remains. A COMMIT the server rolled back (`25P02`) is retried as in

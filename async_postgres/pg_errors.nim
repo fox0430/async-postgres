@@ -158,6 +158,16 @@ type
     ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` leave the
     ## connection usable; catch ``PgTimeoutError`` before ``PgConnectionError``
     ## to tell them apart.
+    ##
+    ## Timeout types differ by phase: a pool ``acquire`` reports its own
+    ## deadline as ``PgPoolError`` (``pekAcquireTimeout``), while every
+    ## operation timeout — a pipelined ``pool.exec`` / ``pool.query`` wait and
+    ## the pool ``withTransactionDeadline`` /
+    ## ``withTransactionRetryDeadline`` deadline, including an acquire phase
+    ## that expires under it — raises ``PgTimeoutError``. An
+    ## ``except PgPoolError`` clause alone therefore misses operation timeouts;
+    ## catch ``PgTimeoutError`` first. ``retryAdvice`` returns ``raRetry`` for
+    ## both timeout types, so a retry loop can treat them alike.
 
   PoolErrorKind* = enum
     ## Machine-readable category of a `PgPoolError`.
@@ -167,7 +177,10 @@ type
     pekClosed ## The pool is permanently closed; retrying cannot succeed.
     pekAcquireTimeout
       ## An acquire deadline elapsed (`acquireTimeout` or cluster fallback);
-      ## retrying later may succeed.
+      ## retrying later may succeed. Operation timeouts (a pipelined
+      ## `pool.exec` / `pool.query` wait, a pool `withTransactionDeadline` /
+      ## `withTransactionRetryDeadline` deadline) raise `PgTimeoutError`
+      ## instead, even when the deadline variant expires during its acquire.
     pekQueueFull
       ## The acquire waiter queue — or, when `pipelined`, the `pendingOps`
       ## queue — is full (`maxWaiters` bound); retrying later may succeed.
@@ -189,10 +202,15 @@ type
       ## cross an async boundary; preserved as `parent`.
 
   PgPoolError* = object of PgError
-    ## Pool-level acquire/operation failure (closed, acquire timeout, queue
+    ## Pool-level acquire failure (closed, acquire timeout, queue
     ## full, connect failed, refused, config fault, unservable batch, or a
     ## wrapped user-code ``Defect``; the underlying error is preserved as
-    ## ``parent``).
+    ## ``parent``). Operation timeouts are not ``PgPoolError``: a pipelined
+    ## ``pool.exec`` / ``pool.query`` wait and the pool
+    ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` deadline
+    ## raise ``PgTimeoutError`` instead, so ``except PgPoolError`` alone misses
+    ## them — catch ``PgTimeoutError`` first. ``retryAdvice`` returns
+    ## ``raRetry`` for both timeout types.
     ##
     ## ``kind`` classifies the failure programmatically; the message string is
     ## informational only. Errors built without ``newPoolError`` have
