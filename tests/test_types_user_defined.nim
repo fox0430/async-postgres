@@ -736,6 +736,46 @@ suite "User-defined composite":
     check got.label == "evt"
     check got.at == dt
 
+  test "getComposite DateTime field reads a date attribute as midnight UTC":
+    let day = dateTime(2024, mMar, 15, zone = utc())
+    let text: Row = @[some(toBytes("(evt,2024-03-15)"))]
+    check getComposite[TimestampRecord](text, 0).at == day
+    let bc: Row = @[some(toBytes("(evt,\"0044-03-15 BC\")"))]
+    check getComposite[TimestampRecord](bc, 0).at ==
+      dateTime(-43, mMar, 15, zone = utc())
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("evt"))),
+      (oid: OidDate, data: some(toPgBinaryDateParam(day).value.get)),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields_data))], @[mkField(50000'i32, 1'i16)])
+    check getComposite[TimestampRecord](row, 0).at == day
+
+  test "getComposite DateTime field rejects date infinity and a timestamp-wide date":
+    let inf: Row = @[some(toBytes("(evt,infinity)"))]
+    expect PgTypeError:
+      discard getComposite[TimestampRecord](inf, 0)
+    let fields_data = @[
+      (oid: OidText, data: some(toBytes("evt"))),
+      (oid: OidDate, data: some(@(toBE64(0'i64)))),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields_data))], @[mkField(50000'i32, 1'i16)])
+    expect PgTypeError:
+      discard getComposite[TimestampRecord](row, 0)
+
+  test "getComposite DateTime field with attribute OID 0 decodes by width":
+    let day = dateTime(2024, mMar, 15, zone = utc())
+    let dt = dateTime(2024, mMar, 15, 10, 30, 0, zone = utc())
+    for (data, want) in [
+      (toPgBinaryDateParam(day).value.get, day), (toPgBinaryParam(dt).value.get, dt)
+    ]:
+      let fields_data =
+        @[(oid: OidText, data: some(toBytes("evt"))), (oid: 0'i32, data: some(data))]
+      let row =
+        mkRow(@[some(encodeBinaryComposite(fields_data))], @[mkField(50000'i32, 1'i16)])
+      check getComposite[TimestampRecord](row, 0).at == want
+
   test "getComposite binary name OID accepted for string field":
     let fields_data = @[(oid: OidName, data: some(toBytes("alice")))]
     let data = encodeBinaryComposite(fields_data)

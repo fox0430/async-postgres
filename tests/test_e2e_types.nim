@@ -1158,6 +1158,31 @@ suite "E2E: Time zones":
 
     waitFor t()
 
+  test "composite date attribute round-trips a DateTime as its UTC date":
+    # The encoder sends a UTC instant and date input drops the zone, so a
+    # session zone east of UTC must not move 20:00 UTC to the next day.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      try:
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_date_rec CASCADE")
+        discard await conn.simpleQuery("CREATE TYPE test_e2e_date_rec AS (at date)")
+        discard await conn.exec("SET TimeZone = 'Asia/Tokyo'")
+        let sent = TstzRecord(at: dateTime(2024, mJan, 1, 20, zone = utc()))
+        let sql =
+          "SELECT $1::test_e2e_date_rec, ROW('0044-03-15 BC'::date)::test_e2e_date_rec"
+        for fmt in [rfText, rfBinary]:
+          let row =
+            (await conn.query(sql, @[toPgParam(sent)], resultFormat = fmt)).rows[0]
+          doAssert getComposite[TstzRecord](row, 0).at ==
+            dateTime(2024, mJan, 1, zone = utc()), $fmt
+          doAssert getComposite[TstzRecord](row, 1).at ==
+            dateTime(-43, mMar, 15, zone = utc()), $fmt
+      finally:
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_date_rec")
+        await conn.close()
+
+    waitFor t()
+
   test "timetz decodes offsets past its input bound":
     # timetz input stops at ±15:59:59, but output carries the session zone's
     # offset, and `AT TIME ZONE` an interval stores any int32. The cast from
