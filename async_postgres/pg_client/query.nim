@@ -34,9 +34,7 @@ proc queryImpl*(
     )
     var cacheMiss = false
     var stmtName = ""
-    var cachedFields: seq[FieldDescription]
-    var cachedColFmts: seq[int16]
-    var cachedColOids: seq[int32]
+    var hitData: RowData
     var effectiveResultFormats: seq[int16]
 
     # PG Bind treats 0 format codes as "all params text" — equivalent on the
@@ -48,9 +46,7 @@ proc queryImpl*(
       cacheHit = cacheHit,
       cacheMiss = cacheMiss,
       stmtName = stmtName,
-      cachedFields = cachedFields,
-      cachedColFmts = cachedColFmts,
-      cachedColOids = cachedColOids,
+      hitData = hitData,
       effectiveResultFormats = effectiveResultFormats,
       parseStep = conn.addParse(stmtName, sql, paramOids),
       bindStep =
@@ -61,8 +57,8 @@ proc queryImpl*(
 
     var qr = QueryResult()
     queryRecvLoop(
-      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-      cachedColFmts, cachedColOids, qr, facts,
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, hitData, qr,
+      facts,
     )
     return qr
 
@@ -85,9 +81,7 @@ proc queryImpl*(
     )
     var cacheMiss = false
     var stmtName = ""
-    var cachedFields: seq[FieldDescription]
-    var cachedColFmts: seq[int16]
-    var cachedColOids: seq[int32]
+    var hitData: RowData
     var effectiveResultFormats: seq[int16]
 
     sendExtendedQuery(
@@ -97,9 +91,7 @@ proc queryImpl*(
       cacheHit = cacheHit,
       cacheMiss = cacheMiss,
       stmtName = stmtName,
-      cachedFields = cachedFields,
-      cachedColFmts = cachedColFmts,
-      cachedColOids = cachedColOids,
+      hitData = hitData,
       effectiveResultFormats = effectiveResultFormats,
       parseStep = conn.addParse(stmtName, sql, params),
       bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
@@ -109,8 +101,8 @@ proc queryImpl*(
 
     var qr = QueryResult()
     queryRecvLoop(
-      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-      cachedColFmts, cachedColOids, qr, facts,
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, hitData, qr,
+      facts,
     )
     return qr
 
@@ -134,9 +126,7 @@ proc queryEachImpl*(
     )
     var cacheMiss = false
     var stmtName = ""
-    var cachedFields: seq[FieldDescription]
-    var cachedColFmts: seq[int16]
-    var cachedColOids: seq[int32]
+    var hitData: RowData
     var effectiveResultFormats: seq[int16]
 
     sendExtendedQuery(
@@ -146,9 +136,7 @@ proc queryEachImpl*(
       cacheHit = cacheHit,
       cacheMiss = cacheMiss,
       stmtName = stmtName,
-      cachedFields = cachedFields,
-      cachedColFmts = cachedColFmts,
-      cachedColOids = cachedColOids,
+      hitData = hitData,
       effectiveResultFormats = effectiveResultFormats,
       parseStep = conn.addParse(stmtName, sql, params),
       bindStep = conn.addBind("", stmtName, params, effectiveResultFormats),
@@ -158,8 +146,8 @@ proc queryEachImpl*(
 
     var rowCount: int64 = 0
     queryEachRecvLoop(
-      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-      cachedColFmts, cachedColOids, callback, rowCount, facts,
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, hitData,
+      callback, rowCount, facts,
     )
     return rowCount
 
@@ -251,9 +239,7 @@ proc queryInlineImpl*(
     validateRawBind(data, ranges, paramFormats, sendRfLen)
     var cacheMiss = false
     var stmtName = ""
-    var cachedFields: seq[FieldDescription]
-    var cachedColFmts: seq[int16]
-    var cachedColOids: seq[int32]
+    var hitData: RowData
     var effectiveResultFormats: seq[int16]
 
     sendExtendedQuery(
@@ -263,9 +249,7 @@ proc queryInlineImpl*(
       cacheHit = cacheHit,
       cacheMiss = cacheMiss,
       stmtName = stmtName,
-      cachedFields = cachedFields,
-      cachedColFmts = cachedColFmts,
-      cachedColOids = cachedColOids,
+      hitData = hitData,
       effectiveResultFormats = effectiveResultFormats,
       parseStep = conn.addParse(stmtName, sql, paramOids),
       bindStep = conn.addBindRaw(
@@ -277,8 +261,8 @@ proc queryInlineImpl*(
 
     var qr = QueryResult()
     queryRecvLoop(
-      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, cachedFields,
-      cachedColFmts, cachedColOids, qr, facts,
+      conn, sql, effectiveResultFormats, cacheHit, cacheMiss, stmtName, hitData, qr,
+      facts,
     )
     return qr
 

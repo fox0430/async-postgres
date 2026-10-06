@@ -375,7 +375,7 @@ proc buildSendPhase(p: Pipeline, perOpSync: bool): seq[CachedStmt] =
         "pipeline op #" & $encodingOp & " (" & p.ops[encodingOp].sql & "): " & e.msg
     raise e
 
-template initPipelineResults(
+proc initPipelineResults(
     results: var seq[PipelineResult], p: Pipeline, cachedStmts: seq[CachedStmt]
 ) =
   ## Initialize prkQuery results from cache-hit CachedStmts; prkExec results
@@ -384,17 +384,9 @@ template initPipelineResults(
     if p.ops[i].kind == pokQuery:
       results[i] = PipelineResult(kind: prkQuery)
       if p.ops[i].cache == scsHit:
-        let c = cachedStmts[i]
-        results[i].queryResult.fields = c.fields
-        if results[i].queryResult.fields.len > 0:
-          let colFmts = cacheHitColFmts(
-            p.ops[i].resultFormats, c.colFmts, results[i].queryResult.fields.len
-          )
-          for j in 0 ..< results[i].queryResult.fields.len:
-            results[i].queryResult.fields[j].formatCode = colFmts[j]
-          results[i].queryResult.data =
-            newRowData(int16(results[i].queryResult.fields.len), colFmts, c.colOids)
-          results[i].queryResult.data.fields = results[i].queryResult.fields
+        results[i].queryResult.initBoundResult(
+          cacheHitRowData(p.ops[i].resultFormats, cachedStmts[i])
+        )
     else:
       results[i] = PipelineResult(kind: prkExec)
 

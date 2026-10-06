@@ -24,7 +24,7 @@ import std/[options, strutils]
 when defined(posix):
   import std/posix
 
-import ../[async_backend, pg_errors, pg_protocol]
+import ../[async_backend, pg_errors, pg_gensym, pg_protocol]
 import types
 
 when hasChronos:
@@ -631,94 +631,57 @@ proc recvMessage*(
       conn.markClosed()
       raise e
 
+template pumpUntilReadyFrom(
+    conn: PgConnection, next, body, readyBody: untyped
+) {.macroSymLocals.} =
+  ## `pumpUntilReady` reading each message with ``next``.
+  block pumpLoop:
+    var queryErrorVar: ref PgQueryError
+    var pumpMsgVar: BackendMessage
+    # The bodies' names are templates, never closure env fields (see
+    # `macroSym`). The block keeps two pumps in one proc scope from colliding
+    # on them (e.g. copy.nim's main loop plus its recvLoop2).
+    template queryError(): untyped {.inject, used.} =
+      queryErrorVar
+
+    template pumpMsg(): untyped {.inject, used.} =
+      pumpMsgVar
+
+    while true:
+      while (let opt = next; opt.isSome):
+        pumpMsgVar = opt.get
+        if pumpMsgVar.kind == bmkErrorResponse:
+          if queryErrorVar == nil:
+            queryErrorVar = newPgQueryError(pumpMsgVar.errorFields)
+        elif pumpMsgVar.kind == bmkReadyForQuery:
+          conn.txStatus = pumpMsgVar.txStatus
+          if conn.state != csClosed:
+            conn.markReady()
+          readyBody
+          if queryErrorVar != nil:
+            raise queryErrorVar
+          break pumpLoop
+        else:
+          body
+      await conn.fillRecvBuf()
+
 template pumpUntilReady*(
-    conn: PgConnection,
-    resultData: untyped,
-    rowCountPtr: untyped,
-    body: untyped,
-    readyBody: untyped,
-) {.dirty.} =
+    conn: PgConnection, resultData, rowCountPtr, body, readyBody: untyped
+) =
   ## Pump until ``ReadyForQuery``; ``pumpMsg``/``queryError`` injected into ``body``/``readyBody``.
-  # Spelled out per overload, not forwarded: ``{.dirty.}`` injection crosses only
-  # one template boundary, and typed params ahead of the untyped bodies suppress
-  # it, so neither forwarding nor defaulted params declare the names (Nim 2.2.x).
-  block pumpLoop:
-    # Declared inside the block so two pumps in one proc scope (e.g. copy.nim's
-    # main loop plus its recvLoop2) don't collide on these dirty-injected names.
-    var queryError: ref PgQueryError
-    var pumpMsg: BackendMessage
-    while true:
-      while (let opt = conn.nextMessage(resultData, rowCountPtr); opt.isSome):
-        pumpMsg = opt.get
-        if pumpMsg.kind == bmkErrorResponse:
-          if queryError == nil:
-            queryError = newPgQueryError(pumpMsg.errorFields)
-        elif pumpMsg.kind == bmkReadyForQuery:
-          conn.txStatus = pumpMsg.txStatus
-          if conn.state != csClosed:
-            conn.markReady()
-          readyBody
-          if queryError != nil:
-            raise queryError
-          break pumpLoop
-        else:
-          body
-      await conn.fillRecvBuf()
+  pumpUntilReadyFrom(conn, conn.nextMessage(resultData, rowCountPtr), body, readyBody)
 
 template pumpUntilReady*(
-    conn: PgConnection,
-    resultData: untyped,
-    onRow: untyped,
-    onRowErr: untyped,
-    body: untyped,
-    readyBody: untyped,
-) {.dirty.} =
+    conn: PgConnection, resultData, onRow, onRowErr, body, readyBody: untyped
+) =
   ## Streaming pump (``onRow`` per row; first error in ``onRowErr``).
-  block pumpLoop:
-    var queryError: ref PgQueryError
-    var pumpMsg: BackendMessage
-    while true:
-      while (let opt = conn.nextMessage(resultData, nil, onRow, onRowErr); opt.isSome):
-        pumpMsg = opt.get
-        if pumpMsg.kind == bmkErrorResponse:
-          if queryError == nil:
-            queryError = newPgQueryError(pumpMsg.errorFields)
-        elif pumpMsg.kind == bmkReadyForQuery:
-          conn.txStatus = pumpMsg.txStatus
-          if conn.state != csClosed:
-            conn.markReady()
-          readyBody
-          if queryError != nil:
-            raise queryError
-          break pumpLoop
-        else:
-          body
-      await conn.fillRecvBuf()
+  pumpUntilReadyFrom(
+    conn, conn.nextMessage(resultData, nil, onRow, onRowErr), body, readyBody
+  )
 
-template pumpUntilReady*(
-    conn: PgConnection, body: untyped, readyBody: untyped
-) {.dirty.} =
+template pumpUntilReady*(conn: PgConnection, body, readyBody: untyped) =
   ## Bare pump (``skipDataRow=true``; for callers that discard rows).
-  block pumpLoop:
-    var queryError: ref PgQueryError
-    var pumpMsg: BackendMessage
-    while true:
-      while (let opt = conn.nextMessage(skipDataRow = true); opt.isSome):
-        pumpMsg = opt.get
-        if pumpMsg.kind == bmkErrorResponse:
-          if queryError == nil:
-            queryError = newPgQueryError(pumpMsg.errorFields)
-        elif pumpMsg.kind == bmkReadyForQuery:
-          conn.txStatus = pumpMsg.txStatus
-          if conn.state != csClosed:
-            conn.markReady()
-          readyBody
-          if queryError != nil:
-            raise queryError
-          break pumpLoop
-        else:
-          body
-      await conn.fillRecvBuf()
+  pumpUntilReadyFrom(conn, conn.nextMessage(skipDataRow = true), body, readyBody)
 
 # Background read watch for COPY IN early-error detection.
 

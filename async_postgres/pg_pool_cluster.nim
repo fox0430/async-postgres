@@ -1,6 +1,6 @@
 import std/macros
 
-import async_backend, pg_types, pg_pool, pg_client
+import async_backend, pg_gensym, pg_types, pg_pool, pg_client
 import pg_connection/types
 import pg_client/transaction
 
@@ -294,25 +294,31 @@ macro withReadConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped 
   ## `finally` masks the body error), so `return` / `break` / `continue`
   ## escaping the body are rejected at compile time.
   let body = checkNoBodyEscape(body, "withReadConnection", "the connection release")
-  let clusterSym = genSym(nskLet, "cluster")
-  let connPoolSym = genSym(nskLet, "connPool")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let clusterSym = macroSym(nskLet, "cluster")
+  let acquiredSym = macroSym(nskLet, "acquired")
+  let connPoolSym = macroSym(nskLet, "connPool")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
   let releaseCall = quote:
     `connPoolSym`.resetSessionAndRelease(`conn`)
   let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
   result = quote:
     let `clusterSym` = `cluster`
     block:
-      let (`conn`, `connPoolSym`) = await acquireRead(`clusterSym`)
+      # Not `let (a, b) =`: the compiler names that temporary a plain `tmpTuple`.
+      let `acquiredSym` = await acquireRead(`clusterSym`)
+      let `conn` = `acquiredSym`.conn
+      let `connPoolSym` = `acquiredSym`.pool
       var `bodyErrSym`: ref CatchableError = nil
       var `bodyDefectSym`: ref Defect = nil
       try:
         `body`
-      except CatchableError as e:
-        `bodyErrSym` = e
-      except Defect as d:
-        `bodyDefectSym` = d
+      except CatchableError as `eSym`:
+        `bodyErrSym` = `eSym`
+      except Defect as `dSym`:
+        `bodyDefectSym` = `dSym`
       `releaseBlock`
 
 macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped =
@@ -321,9 +327,11 @@ macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped
   ## Body `return` / `break` / `continue` escaping to an enclosing loop are
   ## rejected at compile time (see `withReadConnection`).
   let body = checkNoBodyEscape(body, "withWriteConnection", "the connection release")
-  let clusterSym = genSym(nskLet, "cluster")
-  let bodyErrSym = genSym(nskVar, "bodyErr")
-  let bodyDefectSym = genSym(nskVar, "bodyDefect")
+  let clusterSym = macroSym(nskLet, "cluster")
+  let bodyErrSym = macroSym(nskVar, "bodyErr")
+  let bodyDefectSym = macroSym(nskVar, "bodyDefect")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
   let releaseCall = quote:
     `clusterSym`.primary.resetSessionAndRelease(`conn`)
   let releaseBlock = buildReleaseAndReraise(releaseCall, bodyErrSym, bodyDefectSym)
@@ -335,10 +343,10 @@ macro withWriteConnection*(cluster: PgPoolCluster, conn, body: untyped): untyped
       var `bodyDefectSym`: ref Defect = nil
       try:
         `body`
-      except CatchableError as e:
-        `bodyErrSym` = e
-      except Defect as d:
-        `bodyDefectSym` = d
+      except CatchableError as `eSym`:
+        `bodyErrSym` = `eSym`
+      except Defect as `dSym`:
+        `bodyDefectSym` = `dSym`
       `releaseBlock`
 
 macro withTransaction*(cluster: PgPoolCluster, args: varargs[untyped]): untyped =
@@ -425,7 +433,8 @@ macro withTransactionRetryDeadline*(
     result.add(a)
 
 template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
-  ## Create a pipeline on the primary pool.
+  ## Create a pipeline on the primary pool. The body sees `conn` as with
+  ## `PgPool.withPipeline`.
   cluster.primaryPool.withPipeline(pipeline):
     body
 

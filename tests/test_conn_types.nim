@@ -77,3 +77,135 @@ suite "conn-types replication LSN helpers":
     check conn.replConfirmedFlushLsn == 120
     check not conn.confirmReplFlushed(110)
     check conn.replConfirmedFlushLsn == 120
+
+type
+  TestSpan = ref object of RootObj
+
+  TracedCtx = tuple[started, replaced, seen, ended: TraceContext]
+
+# Procs, not test bodies: the gcsafe hooks capture these locals, and a test
+# body's locals are globals.
+proc connTracingCtx(): TracedCtx =
+  var r: TracedCtx = (TestSpan(), TestSpan(), nil, nil)
+  let conn = bareConn()
+  conn.tracer = PgTracer(
+    onPrepareStart: proc(
+        c: PgConnection, d: TracePrepareStartData
+    ): TraceContext {.gcsafe, raises: [].} =
+      r.started,
+    onPrepareEnd: proc(
+        ctx: TraceContext, c: PgConnection, d: TracePrepareEndData
+    ) {.gcsafe, raises: [].} =
+      r.ended = ctx,
+  )
+  withConnTracing(
+    conn,
+    onPrepareStart,
+    onPrepareEnd,
+    TracePrepareStartData(),
+    TracePrepareEndData,
+    TracePrepareEndData(),
+  ):
+    r.seen = traceCtx
+    traceCtx = r.replaced
+  r
+
+proc tracingCtx(): TracedCtx =
+  var r: TracedCtx = (TestSpan(), TestSpan(), nil, nil)
+  let tracer = PgTracer(
+    onPoolAcquireStart: proc(
+        d: TracePoolAcquireStartData
+    ): TraceContext {.gcsafe, raises: [].} =
+      r.started,
+    onPoolAcquireEnd: proc(
+        ctx: TraceContext, d: TracePoolAcquireEndData
+    ) {.gcsafe, raises: [].} =
+      r.ended = ctx,
+  )
+  withTracing(
+    tracer,
+    onPoolAcquireStart,
+    onPoolAcquireEnd,
+    TracePoolAcquireStartData(),
+    TracePoolAcquireEndData,
+    TracePoolAcquireEndData(),
+  ):
+    r.seen = traceCtx
+    traceCtx = r.replaced
+  r
+
+suite "conn-types tracing helpers":
+  test "withConnTracing: body reads and replaces traceCtx":
+    let r = connTracingCtx()
+    check r.seen == r.started
+    check r.ended == r.replaced
+
+  test "withTracing: body reads and replaces traceCtx":
+    let r = tracingCtx()
+    check r.seen == r.started
+    check r.ended == r.replaced
+
+  test "withConnTracing: traceCtx cannot take over a name in its scope":
+    # As with the variable it replaced: a second call, or a scope that already
+    # has a `traceCtx`, is a redefinition.
+    check not compiles(
+      block:
+        let conn = bareConn()
+        withConnTracing(
+          conn,
+          onPrepareStart,
+          onPrepareEnd,
+          TracePrepareStartData(),
+          TracePrepareEndData,
+          TracePrepareEndData(),
+        ):
+          discard
+        withConnTracing(
+          conn,
+          onPrepareStart,
+          onPrepareEnd,
+          TracePrepareStartData(),
+          TracePrepareEndData,
+          TracePrepareEndData(),
+        ):
+          discard
+    )
+    check not compiles(
+      block:
+        let conn = bareConn()
+        template traceCtx(): int =
+          0
+
+        withConnTracing(
+          conn,
+          onPrepareStart,
+          onPrepareEnd,
+          TracePrepareStartData(),
+          TracePrepareEndData,
+          TracePrepareEndData(),
+        ):
+          discard
+    )
+    check compiles(
+      block:
+        let conn = bareConn()
+        block:
+          withConnTracing(
+            conn,
+            onPrepareStart,
+            onPrepareEnd,
+            TracePrepareStartData(),
+            TracePrepareEndData,
+            TracePrepareEndData(),
+          ):
+            discard
+        withConnTracing(
+          conn,
+          onPrepareStart,
+          onPrepareEnd,
+          TracePrepareStartData(),
+          TracePrepareEndData,
+          TracePrepareEndData(),
+        ):
+          discard
+    )

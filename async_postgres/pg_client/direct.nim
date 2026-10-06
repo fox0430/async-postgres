@@ -6,7 +6,7 @@
 
 import std/[algorithm, macros, options, sets]
 
-import ../[async_backend, pg_protocol, pg_types]
+import ../[async_backend, pg_gensym, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
 import ./core
@@ -15,12 +15,10 @@ proc queryDirectRunImpl*(
     conn: PgConnection,
     sql: string,
     resultFormats: seq[int16],
-    colFmts: seq[int16],
-    colOids: seq[int32],
+    hitData: RowData,
     cacheHit: bool,
     cacheMiss: bool,
     stmtName: string,
-    cachedFields: seq[FieldDescription],
 ): Future[QueryResult] {.async.} =
   ## Inner send + receive loop for queryDirect. Pulled out so the outer Impl
   ## can wrap the returned Future with ``.wait(timeout)`` without paying for
@@ -30,20 +28,17 @@ proc queryDirectRunImpl*(
   await conn.sendStagedBufMsg()
   var facts: OpFacts
   queryRecvLoop(
-    conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, cachedFields, colFmts,
-    colOids, result, facts,
+    conn, sql, resultFormats, cacheHit, cacheMiss, stmtName, hitData, result, facts
   )
 
 proc queryDirectImpl*(
     conn: PgConnection,
     sql: string,
     resultFormats: seq[int16],
-    colFmts: seq[int16],
-    colOids: seq[int32],
+    hitData: RowData,
     cacheHit: bool,
     cacheMiss: bool,
     stmtName: string,
-    cachedFields: seq[FieldDescription],
     timeout: Duration = ZeroDuration,
 ): Future[QueryResult] {.async.} =
   ## Trace + timeout wrapper for the queryDirect macro. The synchronous
@@ -62,8 +57,7 @@ proc queryDirectImpl*(
       conn,
       result,
       queryDirectRunImpl(
-        conn, sql, resultFormats, colFmts, colOids, cacheHit, cacheMiss, stmtName,
-        cachedFields,
+        conn, sql, resultFormats, hitData, cacheHit, cacheMiss, stmtName
       ),
       timeout,
       "queryDirect timed out",
@@ -326,7 +320,7 @@ proc bindPositionalOnce(
   result.bindings = newStmtList()
   result.syms = newSeq[NimNode](positional.len)
   for i, arg in positional:
-    let tmp = genSym(nskLet, "directArg" & $i)
+    let tmp = macroSym(nskLet, "directArg" & $i)
     result.syms[i] = tmp
     result.bindings.add(newLetStmt(tmp, arg))
 
@@ -337,7 +331,7 @@ proc makeDirectPreflight(
   ## the send dispatch: `addParseDirect`/`addBindDirect` only check while they
   ## encode, by which point the buffer is half built. Best-effort, and
   ## allocation-free via `paramValueLenBound`.
-  let payloadSym = genSym(nskVar, "preflightPayload")
+  let payloadSym = macroSym(nskVar, "preflightPayload")
   let nParams = newLit(argSyms.len)
   result = newStmtList()
   result.add newCall(bindSym"validateParseMsg", sqlSym, nParams)
@@ -382,19 +376,14 @@ proc buildDirectSendDispatch(
     isExec: bool,
     connSym, sqlSym, cachedSym, cacheHitSym, cacheMissSym, stmtNameSym: NimNode,
     argList: NimNode,
-    effectiveRfSym, cachedFieldsSym, colFmtsSym, colOidsSym: NimNode,
+    effectiveRfSym, hitDataSym: NimNode,
 ): NimNode =
   ## Build the shared `if cacheHit / elif capacity>0 / else` send-phase AST
-  ## for queryDirect / execDirect. The two macros differ only in three
-  ## details, all folded here:
-  ##   * queryDirect emits `addDescribe(dkPortal, "")` in the no-cache path
-  ##     (the receive loop needs RowDescription to decode columns);
-  ##     execDirect skips it (rows discarded).
-  ##   * queryDirect passes `effectiveRfSym` to `addBindDirect` as the
-  ##     result-format list; execDirect passes an empty `[]` (no rows).
-  ##   * queryDirect's cache-hit path copies `fields`, `colFmts`, `colOids`,
-  ##     `resultFormats` out of the CachedStmt for the receive loop.
-  ## For `isExec: true` the last four sym args are unused (pass any node).
+  ## for queryDirect / execDirect. `isExec` folds their three differences:
+  ## queryDirect describes the no-cache portal, passes `effectiveRfSym` as the
+  ## result-format list, and takes the hit's RowData (`cacheHitRowData`) for
+  ## the receive loop; execDirect does none of the three (rows discarded).
+  ## For `isExec: true` the last two sym args are unused (pass any node).
   let evictForInsertSym = bindSym"evictForInsert"
   let beginSendBufSym = bindSym"beginSendBuf"
   let stmtCachingEnabledSym = bindSym"stmtCachingEnabled"
@@ -410,11 +399,10 @@ proc buildDirectSendDispatch(
   hitBlock.add quote do:
     `stmtNameSym` = `cachedSym`.name
   if not isExec:
+    let cacheHitRowDataSym = bindSym"cacheHitRowData"
     hitBlock.add quote do:
-      `cachedFieldsSym` = `cachedSym`.fields
-      `colFmtsSym` = `cachedSym`.colFmts
-      `colOidsSym` = `cachedSym`.colOids
       `effectiveRfSym` = `cachedSym`.resultFormats
+      `hitDataSym` = `cacheHitRowDataSym`(`effectiveRfSym`, `cachedSym`)
   hitBlock.add makeBindDirectCall(
     connSym, newStrLitNode(""), stmtNameSym, rfNode(), argList
   )
@@ -513,17 +501,15 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
   let (positional, timeoutExpr) = extractTimeoutArg(args)
   validatePlaceholderArity(sql, positional.len, "queryDirect")
 
-  let connSym = genSym(nskLet, "conn")
-  let sqlSym = genSym(nskLet, "sql")
-  let timeoutSym = genSym(nskLet, "timeout")
-  let cachedSym = genSym(nskLet, "cached")
-  let cacheHitSym = genSym(nskVar, "cacheHit")
-  let cacheMissSym = genSym(nskVar, "cacheMiss")
-  let stmtNameSym = genSym(nskVar, "stmtName")
-  let cachedFieldsSym = genSym(nskVar, "cachedFields")
-  let effectiveRfSym = genSym(nskVar, "effectiveRf")
-  let colFmtsSym = genSym(nskVar, "colFmts")
-  let colOidsSym = genSym(nskVar, "colOids")
+  let connSym = macroSym(nskLet, "conn")
+  let sqlSym = macroSym(nskLet, "sql")
+  let timeoutSym = macroSym(nskLet, "timeout")
+  let cachedSym = macroSym(nskLet, "cached")
+  let cacheHitSym = macroSym(nskVar, "cacheHit")
+  let cacheMissSym = macroSym(nskVar, "cacheMiss")
+  let stmtNameSym = macroSym(nskVar, "stmtName")
+  let effectiveRfSym = macroSym(nskVar, "effectiveRf")
+  let hitDataSym = macroSym(nskVar, "hitData")
 
   # The count is a literal, so the zero-overhead path pays no runtime branch.
   if positional.len > maxInt16Count:
@@ -543,10 +529,8 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     var `cacheHitSym` = `cachedSym` != nil
     var `cacheMissSym` = false
     var `stmtNameSym` = ""
-    var `cachedFieldsSym`: seq[FieldDescription]
     var `effectiveRfSym`: seq[int16]
-    var `colFmtsSym`: seq[int16]
-    var `colOidsSym`: seq[int32]
+    var `hitDataSym`: RowData
 
   let (argBindings, argSyms) = bindPositionalOnce(positional)
   result.add argBindings
@@ -571,17 +555,15 @@ macro queryDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unt
     stmtNameSym = stmtNameSym,
     argList = argList,
     effectiveRfSym = effectiveRfSym,
-    cachedFieldsSym = cachedFieldsSym,
-    colFmtsSym = colFmtsSym,
-    colOidsSym = colOidsSym,
+    hitDataSym = hitDataSym,
   )
 
   let markBusySym = bindSym"markBusy"
   result.add quote do:
     `markBusySym`(`connSym`)
     queryDirectImpl(
-      `connSym`, `sqlSym`, `effectiveRfSym`, `colFmtsSym`, `colOidsSym`, `cacheHitSym`,
-      `cacheMissSym`, `stmtNameSym`, `cachedFieldsSym`, `timeoutSym`,
+      `connSym`, `sqlSym`, `effectiveRfSym`, `hitDataSym`, `cacheHitSym`,
+      `cacheMissSym`, `stmtNameSym`, `timeoutSym`,
     )
 
 proc execDirectRunImpl*(
@@ -644,13 +626,13 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
   let (positional, timeoutExpr) = extractTimeoutArg(args)
   validatePlaceholderArity(sql, positional.len, "execDirect")
 
-  let connSym = genSym(nskLet, "conn")
-  let sqlSym = genSym(nskLet, "sql")
-  let timeoutSym = genSym(nskLet, "timeout")
-  let cachedSym = genSym(nskLet, "cached")
-  let cacheHitSym = genSym(nskVar, "cacheHit")
-  let cacheMissSym = genSym(nskVar, "cacheMiss")
-  let stmtNameSym = genSym(nskVar, "stmtName")
+  let connSym = macroSym(nskLet, "conn")
+  let sqlSym = macroSym(nskLet, "sql")
+  let timeoutSym = macroSym(nskLet, "timeout")
+  let cachedSym = macroSym(nskLet, "cached")
+  let cacheHitSym = macroSym(nskVar, "cacheHit")
+  let cacheMissSym = macroSym(nskVar, "cacheMiss")
+  let stmtNameSym = macroSym(nskVar, "stmtName")
 
   # The count is a literal, so the zero-overhead path pays no runtime branch.
   if positional.len > maxInt16Count:
@@ -693,9 +675,7 @@ macro execDirect*(conn: PgConnection, sql: string, args: varargs[untyped]): unty
     stmtNameSym = stmtNameSym,
     argList = argList,
     effectiveRfSym = newEmptyNode(),
-    cachedFieldsSym = newEmptyNode(),
-    colFmtsSym = newEmptyNode(),
-    colOidsSym = newEmptyNode(),
+    hitDataSym = newEmptyNode(),
   )
 
   let markBusySym = bindSym"markBusy"

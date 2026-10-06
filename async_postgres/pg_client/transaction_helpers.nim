@@ -6,7 +6,7 @@
 
 import std/options
 
-import ../[async_backend, pg_protocol, pg_types]
+import ../[async_backend, pg_gensym, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import core
 
@@ -62,7 +62,9 @@ func noteCompletion(phase: var int, tag: var string, msg: BackendMessage) =
     tag = msg.commandTag
   inc phase
 
-template rollbackFailedTx(conn: PgConnection, queryError: ref PgQueryError) =
+template rollbackFailedTx(
+    conn: PgConnection, queryError: ref PgQueryError
+) {.macroSymLocals.} =
   # ROLLBACK without masking the query error; report failure via onCleanupSkipped.
   if queryError != nil and conn.txStatus == tsInFailedTransaction:
     try:
@@ -94,18 +96,8 @@ proc queryInTransactionImpl(
   conn.pumpUntilReady(qr.data, addr qr.rowCount):
     case pumpMsg.kind
     of bmkRowDescription:
-      var fields = pumpMsg.fields
-      var cf: seq[int16]
-      var co: seq[int32]
-      if resultFormats.len > 0:
-        cf = deriveColFmts(resultFormats, fields.len)
-        co = newSeq[int32](fields.len)
-        for i in 0 ..< fields.len:
-          co[i] = fields[i].typeOid
-          fields[i].formatCode = cf[i]
-      qr.fields = fields
-      qr.data = newRowData(int16(qr.fields.len), cf, co)
-      qr.data.fields = qr.fields
+      qr.fields = pumpMsg.fields
+      qr.data = describedRowData(qr.fields, portal = true, resultFormats)
     of bmkEmptyQueryResponse, bmkCommandComplete:
       noteCompletion(phase, qr.commandTag, pumpMsg)
     else:

@@ -536,17 +536,16 @@ template makeReplicationCallback*(body: untyped): ReplicationCallback =
   ## Kept module-local: routing this through a shared template with an
   ## `untyped`/`typedesc` param for the parameter type trips asyncdispatch's
   ## `{.async.}` macro ("cannot use symbol of kind 'func' as a 'param'").
-  block:
-    when hasChronos:
-      let r: ReplicationCallback = proc(
-          msg {.inject.}: ReplicationMessage
-      ) {.async: (raises: [CatchableError]).} =
+  when hasChronos:
+    ReplicationCallback(
+      proc(msg {.inject.}: ReplicationMessage) {.async: (raises: [CatchableError]).} =
         body
-      r
-    else:
-      let r: ReplicationCallback = proc(msg {.inject.}: ReplicationMessage) {.async.} =
+    )
+  else:
+    ReplicationCallback(
+      proc(msg {.inject.}: ReplicationMessage) {.async.} =
         body
-      r
+    )
 
 # Replication connection
 

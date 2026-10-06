@@ -33,6 +33,7 @@ async_postgres/pg_client/core.nim	OpFacts
 async_postgres/pg_client/core.nim	OpFacts.bound
 async_postgres/pg_client/core.nim	OpFacts.described
 async_postgres/pg_client/core.nim	OpFacts.fields
+async_postgres/pg_client/core.nim	OpFacts.noData
 async_postgres/pg_client/core.nim	OpFacts.paramOids
 async_postgres/pg_client/core.nim	OpFacts.parsed
 async_postgres/pg_client/core.nim	OpFacts.parsedGen
@@ -43,7 +44,9 @@ async_postgres/pg_client/core.nim	StmtCacheStatus.scsMiss
 async_postgres/pg_client/core.nim	StmtCacheStatus.scsShare
 async_postgres/pg_client/core.nim	StmtCacheStatus.scsUncached
 async_postgres/pg_client/core.nim	appendInlineParamUnchecked
+async_postgres/pg_client/core.nim	boundRowData
 async_postgres/pg_client/core.nim	cacheHitColFmts
+async_postgres/pg_client/core.nim	cacheHitRowData
 async_postgres/pg_client/core.nim	copyBatchSize
 async_postgres/pg_client/core.nim	deriveColFmts
 async_postgres/pg_client/core.nim	describedRowData
@@ -52,6 +55,7 @@ async_postgres/pg_client/core.nim	extractParams
 async_postgres/pg_client/core.nim	flattenInline
 async_postgres/pg_client/core.nim	generatedPortalNameLen
 async_postgres/pg_client/core.nim	generatedStmtNameLen
+async_postgres/pg_client/core.nim	initBoundResult
 async_postgres/pg_client/core.nim	invalidateIfOidMismatch
 async_postgres/pg_client/core.nim	invalidateIfOidMismatch#2
 async_postgres/pg_client/core.nim	observe
@@ -98,8 +102,8 @@ async_postgres/pg_client/transaction.nim	buildRollbackCleanup
 async_postgres/pg_client/transaction.nim	buildTxBeginAndTimeout
 async_postgres/pg_client/transaction.nim	checkNoBodyEscape
 async_postgres/pg_client/transaction.nim	checkNoBodyEscapePost
-async_postgres/pg_client/transaction.nim	checkTemplateBodyEscape
 async_postgres/pg_client/transaction.nim	commitTx
+async_postgres/pg_client/transaction.nim	noBodyEscape
 async_postgres/pg_client/transaction.nim	rollbackGrace
 async_postgres/pg_client/transaction.nim	rollbackGraceMs
 async_postgres/pg_connection/buffer_io.nim	DialStream
@@ -390,6 +394,8 @@ async_postgres/pg_connection/types.nim	wireSettled
 async_postgres/pg_connection/types.nim	writer
 async_postgres/pg_errors.nim	newStartupError
 async_postgres/pg_errors.nim	setPerHost
+async_postgres/pg_gensym.nim	macroSym
+async_postgres/pg_gensym.nim	macroSymLocals
 async_postgres/pg_pool.nim	buildReleaseAndReraise
 async_postgres/pg_pool.nim	releaseReclaimed
 async_postgres/pg_protocol.nim	addBindPayload

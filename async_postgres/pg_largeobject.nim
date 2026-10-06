@@ -20,7 +20,7 @@
 
 import std/[macros, options]
 
-import async_backend, pg_types, pg_protocol, pg_client
+import async_backend, pg_gensym, pg_types, pg_protocol, pg_client
 from pg_types/core import
   isPgUIntText, pgParseBiggestIntView, pipOk, pipInvalid, pipOverflow
 import pg_connection/types
@@ -73,17 +73,16 @@ template makeLoReadCallback*(body: untyped): LoReadCallback =
   ## Kept module-local: routing this through a shared template with an
   ## `untyped`/`typedesc` param for the parameter type trips asyncdispatch's
   ## `{.async.}` macro ("cannot use symbol of kind 'func' as a 'param'").
-  block:
-    when hasChronos:
-      let r: LoReadCallback = proc(
-          data {.inject.}: seq[byte]
-      ) {.async: (raises: [CatchableError]).} =
+  when hasChronos:
+    LoReadCallback(
+      proc(data {.inject.}: seq[byte]) {.async: (raises: [CatchableError]).} =
         body
-      r
-    else:
-      let r: LoReadCallback = proc(data {.inject.}: seq[byte]) {.async.} =
+    )
+  else:
+    LoReadCallback(
+      proc(data {.inject.}: seq[byte]) {.async.} =
         body
-      r
+    )
 
 template makeLoWriteCallback*(body: untyped): LoWriteCallback =
   ## Create a ``LoWriteCallback`` that works with both asyncdispatch and chronos.
@@ -368,9 +367,11 @@ macro withLargeObject*(
   ## leak the server-side Large Object file descriptor until the transaction
   ## ends).
   let body = checkNoBodyEscape(body, "withLargeObject", "loClose")
-  let connSym = genSym(nskLet, "conn")
-  let oidSym = genSym(nskLet, "oid")
-  let modeSym = genSym(nskLet, "mode")
+  let connSym = macroSym(nskLet, "conn")
+  let oidSym = macroSym(nskLet, "oid")
+  let modeSym = macroSym(nskLet, "mode")
+  let bodyErrSym = macroSym(nskLet, "loBodyErr")
+  let bodyDefectSym = macroSym(nskLet, "loBodyDefect")
   result = quote:
     let `connSym` = `conn`
     let `oidSym` = `oidVal`
@@ -378,7 +379,7 @@ macro withLargeObject*(
     let `lo` = await `connSym`.loOpen(`oidSym`, `modeSym`)
     try:
       `body`
-    except CatchableError as loBodyErr:
+    except CatchableError as `bodyErrSym`:
       # ``body`` failed and the surrounding transaction may now be in a failed
       # state, so ``loClose`` would raise "current transaction is aborted" and
       # mask the real error. Close best-effort and re-raise the original.
@@ -389,8 +390,8 @@ macro withLargeObject*(
       except Defect:
         # Same-frame Defect from the close: swallow so it can't replace the body error.
         discard
-      raise loBodyErr
-    except Defect as loBodyDefect:
+      raise `bodyErrSym`
+    except Defect as `bodyDefectSym`:
       # A ``Defect`` is not a ``CatchableError``: close best-effort and re-raise
       # it raw so the handle is not leaked.
       try:
@@ -399,7 +400,7 @@ macro withLargeObject*(
         discard
       except Defect:
         discard
-      raise loBodyDefect
+      raise `bodyDefectSym`
     # Surface a genuine close failure to the caller.
     await `lo`.loClose()
 

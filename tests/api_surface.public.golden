@@ -562,6 +562,7 @@ async_postgres/pg_connection/types.nim	CachedStmt.colOids
 async_postgres/pg_connection/types.nim	CachedStmt.fields
 async_postgres/pg_connection/types.nim	CachedStmt.lruNode
 async_postgres/pg_connection/types.nim	CachedStmt.name
+async_postgres/pg_connection/types.nim	CachedStmt.noData
 async_postgres/pg_connection/types.nim	CachedStmt.paramOids
 async_postgres/pg_connection/types.nim	CachedStmt.resultFormats
 async_postgres/pg_connection/types.nim	ChannelBindingMode

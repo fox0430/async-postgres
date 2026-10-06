@@ -4,7 +4,7 @@
 
 import std/[options, math, random]
 
-import ../[async_backend, pg_protocol, pg_types]
+import ../[async_backend, pg_gensym, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
 
@@ -92,6 +92,26 @@ func cacheHitColFmts*(
   else:
     cachedColFmts
 
+proc boundRowData(
+    fields: sink seq[FieldDescription], colFmts: seq[int16], colOids: seq[int32]
+): RowData =
+  ## RowData for the formats Bind requested when no RowDescription reports
+  ## them: a private copy of ``fields`` stamped with ``colFmts`` and with
+  ## ``colOids`` as its type OIDs. Zero columns still get one, as a
+  ## RowDescription would, so a column-less row has somewhere to land.
+  var fields = fields
+  for i in 0 ..< fields.len:
+    fields[i].formatCode = colFmts[i]
+  result = newRowData(int16(fields.len), colFmts, colOids)
+  result.fields = fields
+
+proc boundRowData*(fields: sink seq[FieldDescription], colFmts: seq[int16]): RowData =
+  ## `boundRowData` with the type OIDs taken from ``fields``.
+  var colOids = newSeq[int32](fields.len)
+  for i in 0 ..< fields.len:
+    colOids[i] = fields[i].typeOid
+  boundRowData(fields, colFmts, colOids)
+
 proc describedRowData*(
     fields: var seq[FieldDescription], portal: bool, resultFormats: openArray[int16]
 ): RowData =
@@ -107,11 +127,10 @@ proc describedRowData*(
       cf[i] = fields[i].formatCode
       co[i] = fields[i].typeOid
   elif resultFormats.len > 0:
-    cf = deriveColFmts(resultFormats, fields.len)
-    co = newSeq[int32](fields.len)
-    for i in 0 ..< fields.len:
-      co[i] = fields[i].typeOid
-      fields[i].formatCode = cf[i]
+    let colFmts = deriveColFmts(resultFormats, fields.len)
+    result = boundRowData(move fields, colFmts)
+    fields = result.fields
+    return
   result = newRowData(int16(fields.len), cf, co)
   result.fields = fields
 
@@ -184,9 +203,10 @@ type
     parsed*: bool ## ``ParseComplete`` arrived: the statement exists.
     parsedGen*: int ## ``stmtCacheResetGen`` when it arrived.
     described*: bool
-      ## ``RowDescription`` or ``NoData`` arrived: ``fields`` and ``paramOids``
-      ## are complete.
+      ## ``RowDescription`` or ``NoData`` arrived: ``fields``, ``noData`` and
+      ## ``paramOids`` are complete.
     fields*: seq[FieldDescription]
+    noData*: bool ## ``NoData`` arrived: the statement returns no rows.
     paramOids*: seq[int32]
 
 func stmtCacheStatus*(cacheHit, cacheMiss: bool): StmtCacheStatus {.inline.} =
@@ -213,6 +233,7 @@ proc observe*(facts: var OpFacts, conn: PgConnection, msg: BackendMessage, miss:
       facts.fields = msg.fields
       facts.described = true
     of bmkNoData:
+      facts.noData = true
       facts.described = true
     else:
       discard
@@ -241,7 +262,10 @@ proc settleStmtCache*(
       conn.addStmtCache(
         sql,
         CachedStmt(
-          name: stmtName, fields: move facts.fields, paramOids: move facts.paramOids
+          name: stmtName,
+          fields: move facts.fields,
+          noData: facts.noData,
+          paramOids: move facts.paramOids,
         ),
       )
     elif facts.parsed:
@@ -271,7 +295,7 @@ func shouldRetryStmtCacheInvalidation*(
 
 template retryStmtCacheInvalidation*(
     conn: PgConnection, cacheHit, facts, body: untyped
-) =
+) {.macroSymLocals.} =
   ## Run ``body``, one extended-query op that sets ``cacheHit`` in its send
   ## phase, fills ``facts`` in its receive loop and ``return``s on success,
   ## and re-issue it once when ``shouldRetryStmtCacheInvalidation`` allows. The
@@ -586,27 +610,40 @@ proc flattenInline*(
       result.data, result.ranges, result.oids, result.formats, p
     )
 
+proc cacheHitRowData*(resultFormats: openArray[int16], cached: CachedStmt): RowData =
+  ## `boundRowData` for a cache hit, with the formats this Bind requested
+  ## rather than the stale cached ones (see `cacheHitColFmts`). Nil for a
+  ## statement that returns no rows, as on its miss.
+  if not cached.noData:
+    result = boundRowData(
+      cached.fields,
+      cacheHitColFmts(resultFormats, cached.colFmts, cached.fields.len),
+      cached.colOids,
+    )
+
+func initBoundResult*(qr: var QueryResult, data: sink RowData) =
+  ## Start ``qr`` from a `boundRowData` result, or nil for no rows.
+  qr.data = data
+  if qr.data != nil:
+    qr.fields = qr.data.fields
+
 template sendExtendedQuery*(
     conn: PgConnection,
     resultFormats: seq[int16],
     cached: CachedStmt,
     cacheHit, cacheMiss: var bool,
     stmtName: var string,
-    cachedFields: var seq[FieldDescription],
-    cachedColFmts: var seq[int16],
-    cachedColOids: var seq[int32],
+    hitData: var RowData,
     effectiveResultFormats: var seq[int16],
     parseStep, bindStep: untyped,
 ) =
   ## Emit Parse/Bind/Describe/Execute/Sync sequence (cache hit/miss/disabled).
   ## Precondition: ``cached`` may be nil iff ``cacheHit == false``; the
-  ## cache-miss and cache-disabled branches never read it.
+  ## cache-miss and cache-disabled branches never read it. Only a hit sets
+  ## ``hitData`` (see `cacheHitRowData`).
   conn.beginSendBuf()
   if cacheHit:
     stmtName = cached.name
-    cachedFields = cached.fields
-    cachedColFmts = cached.colFmts
-    cachedColOids = cached.colOids
     # The `cached.resultFormats` fallback is cache-hit-only: cache-miss and
     # cache-disabled both re-issue Describe, so the server returns fresh
     # column formats and the caller-supplied `resultFormats` (possibly empty)
@@ -614,6 +651,7 @@ template sendExtendedQuery*(
     # negotiated formats must be replayed when the caller didn't override.
     effectiveResultFormats =
       if resultFormats.len == 0: cached.resultFormats else: resultFormats
+    hitData = cacheHitRowData(effectiveResultFormats, cached)
     bindStep
     conn.addExecute("", 0)
     conn.addSync()
@@ -673,26 +711,11 @@ template queryRecvLoop*(
     resultFormats: openArray[int16],
     cacheHit, cacheMiss: bool,
     stmtName: string,
-    cachedFields: seq[FieldDescription],
-    cachedColFmts: seq[int16],
-    cachedColOids: seq[int32],
+    hitData: RowData,
     qr: var QueryResult,
     facts: var OpFacts,
 ) =
-  if cacheHit:
-    # Take the cached field descriptions (already a private copy of the cache
-    # entry) so we can update formatCode without mutating the statement cache.
-    qr.fields = cachedFields
-    if qr.fields.len > 0:
-      # Decode with the column formats this Bind actually requested, not the
-      # stale cached formats (see `cacheHitColFmts`), then reflect them back
-      # into the returned metadata so QueryResult.fields.formatCode stays
-      # consistent with the formats used for decoding.
-      let colFmts = cacheHitColFmts(resultFormats, cachedColFmts, qr.fields.len)
-      for i in 0 ..< qr.fields.len:
-        qr.fields[i].formatCode = colFmts[i]
-      qr.data = newRowData(int16(qr.fields.len), colFmts, cachedColOids)
-      qr.data.fields = qr.fields
+  qr.initBoundResult(hitData)
 
   conn.pumpUntilReady(qr.data, addr qr.rowCount):
     facts.observe(conn, pumpMsg, cacheMiss)
@@ -717,30 +740,13 @@ template queryEachRecvLoop*(
     resultFormats: openArray[int16],
     cacheHit, cacheMiss: bool,
     stmtName: string,
-    cachedFields: seq[FieldDescription],
-    cachedColFmts: seq[int16],
-    cachedColOids: seq[int32],
+    hitData: RowData,
     callback: RowCallback,
     rowCount: var int64,
     facts: var OpFacts,
-) =
-  var rd: RowData
+) {.macroSymLocals.} =
+  var rd = hitData
   var callbackError: ref CatchableError = nil
-
-  if cacheHit:
-    # Decode with the formats this Bind requested (`resultFormats`), not the
-    # cached first-Parse formats — see `queryRecvLoop` for the silent corruption
-    # this avoids when the same SQL is re-issued with a different `resultFormat`.
-    # Take the cached fields (a private copy) so the statement cache is not mutated.
-    var fields = cachedFields
-    let colFmts = cacheHitColFmts(resultFormats, cachedColFmts, fields.len)
-    for i in 0 ..< fields.len:
-      fields[i].formatCode = colFmts[i]
-    if colFmts.len > 0 or cachedColOids.len > 0:
-      rd = newRowData(int16(fields.len), colFmts, cachedColOids)
-    else:
-      rd = newRowData(int16(fields.len))
-    rd.fields = fields
 
   # Wrap the user callback so we can bump the int64 rowCount on success
   # (nextMessage counts through a ptr int32 which is too narrow for queryEach).
@@ -751,8 +757,8 @@ template queryEachRecvLoop*(
   conn.pumpUntilReady(rd, onRow, addr callbackError):
     facts.observe(conn, pumpMsg, cacheMiss)
     if pumpMsg.kind == bmkRowDescription:
-      var fields = pumpMsg.fields
-      rd = describedRowData(fields, portal = not cacheMiss, resultFormats)
+      # The message is not read again, so its fields can take the stamped formats.
+      rd = describedRowData(pumpMsg.fields, portal = not cacheMiss, resultFormats)
   do:
     # The statement's fate is the server's outcome, whatever the callback did.
     conn.settleStmtCache(

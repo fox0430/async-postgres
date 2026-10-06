@@ -5,7 +5,7 @@
 
 import std/[macros, sequtils]
 
-import ../[async_backend, pg_protocol]
+import ../[async_backend, pg_gensym, pg_protocol]
 import ../pg_connection/[types, simple_query]
 import core
 
@@ -125,12 +125,8 @@ proc checkNoBodyEscape*(body: NimNode, macroName, cleanup: string): NimNode =
     body,
   )
 
-macro checkTemplateBodyEscape*(
-    body: untyped, macroName, cleanup: static string
-): untyped =
-  ## `checkNoBodyEscape` for template-based scoped constructs, which can't call
-  ## a compile-time proc directly on their untyped `body`. Use it as the body's
-  ## only occurrence: it expands to the checked body.
+macro noBodyEscape*(macroName, cleanup: static string, body: untyped): untyped =
+  ## `checkNoBodyEscape` for a template's ``body``.
   checkNoBodyEscape(body, macroName, cleanup)
 
 proc bindCleanupSkippedSyms(): tuple[fire, invalidated, failed: NimNode] {.compileTime.} =
@@ -219,9 +215,9 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   ##
   ## Cancelled and plain-failure ROLLBACKs are both reported and swallowed so
   ## the enclosing `except` can re-raise the original body error.
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
-  let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
-  let cleanupDefectSym = genSym(nskLet, "cleanupDefect")
+  let cleanupErrSym = macroSym(nskLet, "cleanupErr")
+  let cleanupCancelSym = macroSym(nskLet, "cleanupCancel")
+  let cleanupDefectSym = macroSym(nskLet, "cleanupDefect")
   let csReadySym = bindSym"csReady"
   let stateSym = bindSym"state"
   let txStatusSym = bindSym"txStatus"
@@ -266,9 +262,9 @@ proc buildSavepointRollbackCleanup(
   ## `quoteIdentifier`) in the surrounding scope.
   ##
   ## Cancelled cleanup is swallowed as in `buildRollbackCleanup`.
-  let cleanupErrSym = genSym(nskLet, "cleanupErr")
-  let cleanupCancelSym = genSym(nskLet, "cleanupCancel")
-  let cleanupDefectSym = genSym(nskLet, "cleanupDefect")
+  let cleanupErrSym = macroSym(nskLet, "cleanupErr")
+  let cleanupCancelSym = macroSym(nskLet, "cleanupCancel")
+  let cleanupDefectSym = macroSym(nskLet, "cleanupDefect")
   let csReadySym = bindSym"csReady"
   let stateSym = bindSym"state"
   let txStatusSym = bindSym"txStatus"
@@ -329,9 +325,9 @@ proc buildDeadlineAwaitAndTimeout(
   ##
   ## Cancel skips cleanup and invalidates (idempotent; chronos can run both
   ## timeout arms for one deadline).
-  let bodyFutSym = genSym(nskLet, "bodyFut")
-  let eSym = genSym(nskLet, "e")
-  let cancelSym = genSym(nskLet, "cancel")
+  let bodyFutSym = macroSym(nskLet, "bodyFut")
+  let eSym = macroSym(nskLet, "e")
+  let cancelSym = macroSym(nskLet, "cancel")
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"wait"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
@@ -376,10 +372,10 @@ proc buildRetryTxLoop*(
   ## connection is back to a clean reusable state (`csReady` + `tsIdle`) — so a
   ## `csClosed` (timeout) connection or a failed ROLLBACK ends the loop. Between
   ## attempts it sleeps for `backoffDelayMs`.
-  let attemptSym = genSym(nskVar, "attempt")
-  let eSym = genSym(nskLet, "e")
-  let dSym = genSym(nskLet, "d")
-  let cancelSym = genSym(nskLet, "cancel")
+  let attemptSym = macroSym(nskVar, "attempt")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
+  let cancelSym = macroSym(nskLet, "cancel")
   let csReadySym = bindSym"csReady"
   let stateSym = bindSym"state"
   let txStatusSym = bindSym"txStatus"
@@ -444,11 +440,11 @@ proc buildRetryDeadlineLoop*(
   ##
   ## A retry (including its backoff sleep) is taken only when it still fits before
   ## the deadline, so all attempts together finish within `deadline`.
-  let attemptSym = genSym(nskVar, "attempt")
-  let bodyFutSym = genSym(nskLet, "bodyFut")
-  let eSym = genSym(nskLet, "e")
-  let cancelSym = genSym(nskLet, "cancel")
-  let backoffMsSym = genSym(nskLet, "backoffMs")
+  let attemptSym = macroSym(nskVar, "attempt")
+  let bodyFutSym = macroSym(nskLet, "bodyFut")
+  let eSym = macroSym(nskLet, "e")
+  let cancelSym = macroSym(nskLet, "cancel")
+  let backoffMsSym = macroSym(nskLet, "backoffMs")
   let csReadySym = bindSym"csReady"
   let stateSym = bindSym"state"
   let txStatusSym = bindSym"txStatus"
@@ -586,10 +582,10 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   body = checkNoBodyEscape(body, "withTransaction", "COMMIT/ROLLBACK")
 
   let connExpr = conn
-  let connSym = genSym(nskLet, "conn")
-  let eSym = genSym(nskLet, "e")
-  let dSym = genSym(nskLet, "d")
-  let cancelSym = genSym(nskLet, "cancel")
+  let connSym = macroSym(nskLet, "conn")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
+  let cancelSym = macroSym(nskLet, "cancel")
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   let commitSym = bindSym"commitTx"
@@ -676,8 +672,8 @@ macro withTransactionRetry*(
   body = checkNoBodyEscape(body, "withTransactionRetry", "COMMIT/ROLLBACK")
 
   let connExpr = conn
-  let connSym = genSym(nskLet, "conn")
-  let retryOptsSym = genSym(nskLet, "retryOpts")
+  let connSym = macroSym(nskLet, "conn")
+  let retryOptsSym = macroSym(nskLet, "retryOpts")
   let loop = buildRetryTxLoop(connSym, retryOptsSym, beginSql, txTimeout, body)
   result = quote:
     let `connSym` = `connExpr`
@@ -750,11 +746,11 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   body = checkNoBodyEscape(body, "withSavepoint", "RELEASE/ROLLBACK")
 
   let connExpr = conn
-  let connSym = genSym(nskLet, "conn")
-  let eSym = genSym(nskLet, "e")
-  let dSym = genSym(nskLet, "d")
-  let cancelSym = genSym(nskLet, "cancel")
-  let spNameSym = genSym(nskLet, "spName")
+  let connSym = macroSym(nskLet, "conn")
+  let eSym = macroSym(nskLet, "e")
+  let dSym = macroSym(nskLet, "d")
+  let cancelSym = macroSym(nskLet, "cancel")
+  let spNameSym = macroSym(nskLet, "spName")
   let quoteIdentSym = bindSym"quoteIdentifier"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
 
@@ -863,11 +859,11 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   body = checkNoBodyEscape(body, "withTransactionDeadline", "COMMIT/ROLLBACK")
 
   let connExpr = conn
-  let connSym = genSym(nskLet, "conn")
-  let totalDurSym = genSym(nskLet, "totalDur")
-  let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
-  let bodyFnSym = genSym(nskProc, "txBodyDeadline")
-  let dSym = genSym(nskLet, "d")
+  let connSym = macroSym(nskLet, "conn")
+  let totalDurSym = macroSym(nskLet, "totalDur")
+  let deadlineMomentSym = macroSym(nskLet, "deadlineMoment")
+  let bodyFnSym = macroSym(nskProc, "txBodyDeadline")
+  let dSym = macroSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
@@ -950,12 +946,12 @@ macro withTransactionRetryDeadline*(
   body = checkNoBodyEscape(body, "withTransactionRetryDeadline", "COMMIT/ROLLBACK")
 
   let connExpr = conn
-  let connSym = genSym(nskLet, "conn")
-  let retryOptsSym = genSym(nskLet, "retryOpts")
-  let totalDurSym = genSym(nskLet, "totalDur")
-  let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
-  let bodyFnSym = genSym(nskProc, "txBodyRetryDeadline")
-  let dSym = genSym(nskLet, "d")
+  let connSym = macroSym(nskLet, "conn")
+  let retryOptsSym = macroSym(nskLet, "retryOpts")
+  let totalDurSym = macroSym(nskLet, "totalDur")
+  let deadlineMomentSym = macroSym(nskLet, "deadlineMoment")
+  let bodyFnSym = macroSym(nskProc, "txBodyRetryDeadline")
+  let dSym = macroSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
@@ -1050,12 +1046,12 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   body = checkNoBodyEscape(body, "withSavepointDeadline", "RELEASE/ROLLBACK")
 
   let connExpr = conn
-  let connSym = genSym(nskLet, "conn")
-  let spNameSym = genSym(nskLet, "spName")
-  let totalDurSym = genSym(nskLet, "totalDur")
-  let deadlineMomentSym = genSym(nskLet, "deadlineMoment")
-  let bodyFnSym = genSym(nskProc, "spBodyDeadline")
-  let dSym = genSym(nskLet, "d")
+  let connSym = macroSym(nskLet, "conn")
+  let spNameSym = macroSym(nskLet, "spName")
+  let totalDurSym = macroSym(nskLet, "totalDur")
+  let deadlineMomentSym = macroSym(nskLet, "deadlineMoment")
+  let bodyFnSym = macroSym(nskProc, "spBodyDeadline")
+  let dSym = macroSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let quoteIdentSym = bindSym"quoteIdentifier"
