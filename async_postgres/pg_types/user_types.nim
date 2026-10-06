@@ -367,8 +367,9 @@ proc encodeBinaryComposite*(
 
 proc compositeFieldToText(val: string): string =
   ## Escape a composite field value for text format output.
-  ## An empty value, or an unquoted ``NULL`` token (case-insensitive), would be
-  ## read back by PostgreSQL's record input as a SQL NULL, so always quote them.
+  ## An empty value must be quoted: record input reads an empty unquoted field
+  ## as SQL NULL. ``NULL`` (any case) is quoted too, though unlike array input,
+  ## record input keeps an unquoted ``NULL`` as text, so that quote is harmless.
   var needsQuote = val.len == 0 or cmpIgnoreCase(val, "NULL") == 0
   for c in val:
     if c in {',', '(', ')', '"', '\\', ' '}:
