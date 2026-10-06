@@ -320,8 +320,8 @@ suite "Composite text parser":
     check s == "(\"\",42)"
 
   test "encodeCompositeText literal NULL string quoted":
-    # An unquoted NULL token (any case) would be read back as a SQL NULL by
-    # PostgreSQL's record input, so the literal string must be quoted.
+    # record_in keeps an unquoted NULL as text (only array_in reads it as SQL
+    # NULL), so this quote is not required; it is kept because it is harmless.
     check encodeCompositeText(@[some("NULL"), some("42")]) == "(\"NULL\",42)"
     check encodeCompositeText(@[some("null")]) == "(\"null\")"
     check encodeCompositeText(@[some("Null")]) == "(\"Null\")"
