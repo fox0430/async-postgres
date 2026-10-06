@@ -26,7 +26,7 @@
 ## .. code-block:: nim
 ##   await conn.query(sql"SELECT * FROM users WHERE age > {minAge} AND name = {name}")
 
-import std/macros
+import std/[macros, strutils]
 
 import async_backend, pg_types, pg_client, pg_pool
 import pg_connection/types
@@ -179,7 +179,8 @@ func sqlParams*(sql: string): string =
   ## placeholders.
   ##
   ## - ``??`` is an escape for a literal ``?``
-  ## - ``?|``, ``?&``, ``?-``, ``?#`` (PostgreSQL operators) are preserved
+  ## - ``?|``, ``?&``, ``?-``, ``?#`` (PostgreSQL operators) are preserved;
+  ##   ``?--`` is a placeholder followed by a line comment
   ## - ``?`` inside single-quoted SQL strings is preserved
   ## - ``?`` inside ``E'…'`` C-style escape strings is preserved
   ## - ``?`` inside double-quoted identifiers is preserved
@@ -198,7 +199,9 @@ func sqlParams*(sql: string): string =
       if i + 1 < sql.len and sql[i + 1] == '?':
         result.add('?')
         i += 2
-      elif i + 1 < sql.len and sql[i + 1] in {'|', '&', '-', '#'}:
+      elif i + 1 < sql.len and sql[i + 1] in {'|', '&', '-', '#'} and
+          not sql.continuesWith("--", i + 1):
+        # PG ends an operator at ``--``, so ``?--`` is a placeholder before a comment.
         result.add(c)
         result.add(sql[i + 1])
         i += 2
