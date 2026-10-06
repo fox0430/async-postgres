@@ -45,6 +45,9 @@ type
     sLineComment
     sBlockComment
 
+const sqlOperatorChars =
+  {'+', '-', '*', '/', '<', '>', '=', '~', '!', '@', '#', '%', '^', '&', '|', '`', '?'}
+
 template sqlParseLoop(
     sql: string,
     output: var string,
@@ -179,8 +182,10 @@ func sqlParams*(sql: string): string =
   ## placeholders.
   ##
   ## - ``??`` is an escape for a literal ``?``
-  ## - ``?|``, ``?&``, ``?-``, ``?#`` (PostgreSQL operators) are preserved;
-  ##   ``?--`` is a placeholder followed by a line comment
+  ## - ``?|``, ``?&``, ``?-``, ``?#``, ``@?`` (PostgreSQL operators) are
+  ##   preserved when they start an operator (the ``?`` of ``=?|`` and
+  ##   ``<@?`` is a placeholder); ``?--`` is a placeholder followed by a line
+  ##   comment
   ## - ``?`` inside single-quoted SQL strings is preserved
   ## - ``?`` inside ``E'…'`` C-style escape strings is preserved
   ## - ``?`` inside double-quoted identifiers is preserved
@@ -192,25 +197,44 @@ func sqlParams*(sql: string): string =
   var paramIdx = 0
   var state = sNormal
   var dollarTag = ""
+  # Input span of the operator token being emitted. Placeholders, comments
+  # and quotes end it, as they split PG's operator token after substitution.
+  var opStart, opEnd = -1
 
   sqlParseLoop(sql, result, i, state, dollarTag):
     case c
     of '?':
+      let tokenStart = opEnd != i
       if i + 1 < sql.len and sql[i + 1] == '?':
         result.add('?')
+        if tokenStart:
+          opStart = i
         i += 2
-      elif i + 1 < sql.len and sql[i + 1] in {'|', '&', '-', '#'} and
+        opEnd = i
+      elif tokenStart and i + 1 < sql.len and sql[i + 1] in {'|', '&', '-', '#'} and
           not sql.continuesWith("--", i + 1):
         # PG ends an operator at ``--``, so ``?--`` is a placeholder before a comment.
         result.add(c)
         result.add(sql[i + 1])
+        opStart = i
         i += 2
+        opEnd = i
+      elif opEnd == i and opStart == i - 1 and sql[i - 1] == '@':
+        # ``@?`` (jsonpath exists) only when ``@`` starts the token, so
+        # ``@@?``/``<@?`` keep the placeholder; ``@??`` above still yields ``@?``.
+        result.add(c)
+        inc i
+        opEnd = i
       else:
         inc paramIdx
         result.add('$')
         result.addInt(paramIdx)
         inc i
     else:
+      if c in sqlOperatorChars:
+        if opEnd != i:
+          opStart = i
+        opEnd = i + 1
       result.add(c)
       inc i
 
