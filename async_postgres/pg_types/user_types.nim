@@ -454,7 +454,13 @@ proc compositeFieldFromText[T](s: string): T =
   elif T is PgNumeric:
     parsePgNumeric(s)
   elif T is DateTime:
-    parseTimestampText(s)
+    # The text form does not name the attribute type; under the pinned ISO
+    # DateStyle only a timestamp has a clock. Infinity stays with the
+    # timestamp parser so its error is unchanged.
+    if ':' in s or s.endsWith("infinity"):
+      parseTimestampText(s)
+    else:
+      parseDateText(s)
   else:
     raise newException(PgTypeError, "Unsupported composite field type")
 
@@ -507,14 +513,21 @@ template decodeBinaryField(val, buf: untyped, fOid: int32, fOff, fEnd, fLen: int
     checkFieldLen(fLen, 1, "bool")
     val = buf[fOff] != 0
   elif typeof(val) is DateTime:
-    checkFieldOid(fOid, [OidTimestamp, OidTimestampTz], "DateTime")
-    checkFieldLen(fLen, 8, "DateTime")
-    val = decodeBinaryTimestamp(buf.toOpenArray(fOff, fEnd))
+    checkFieldOid(fOid, [OidTimestamp, OidTimestampTz, OidDate], "DateTime")
+    # OID 0 names no type, so the width picks the decoder.
+    if fOid == OidDate or (fOid == 0'i32 and fLen == 4):
+      checkFieldLen(fLen, 4, "date")
+      val = decodeBinaryDate(buf.toOpenArray(fOff, fEnd))
+    else:
+      checkFieldLen(fLen, 8, "DateTime")
+      val = decodeBinaryTimestamp(buf.toOpenArray(fOff, fEnd))
   else:
     val = compositeFieldFromText[typeof(val)](readString(buf, fOff, fLen))
 
 proc getComposite*[T: object](row: Row, col: int): T =
   ## Read a PostgreSQL composite column as a Nim object. Handles binary format.
+  ## A ``DateTime`` field reads a ``timestamp``, ``timestamptz`` or ``date``
+  ## attribute, the last as midnight UTC.
   if row.isNull(col):
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
