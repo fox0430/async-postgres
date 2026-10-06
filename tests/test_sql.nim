@@ -183,6 +183,44 @@ suite "sqlParams":
     check sqlParams("SELECT p1 ?-/* c? */ p2 WHERE id = ?") ==
       "SELECT p1 ?-/* c? */ p2 WHERE id = $1"
 
+  test "@? operator preserved":
+    check sqlParams("SELECT * FROM t WHERE doc @? '$.a' AND id = ?") ==
+      "SELECT * FROM t WHERE doc @? '$.a' AND id = $1"
+
+  test "@? at end of string":
+    check sqlParams("SELECT doc @?") == "SELECT doc @?"
+
+  test "@?? still yields @?":
+    check sqlParams("SELECT * FROM t WHERE doc @?? '$.a' AND id = ?") ==
+      "SELECT * FROM t WHERE doc @? '$.a' AND id = $1"
+
+  test "placeholder after @ needs a space":
+    check sqlParams("SELECT @ ?") == "SELECT @ $1"
+
+  test "placeholder after an operator ending in @":
+    check sqlParams("SELECT * FROM docs WHERE tsv @@? AND id = ?") ==
+      "SELECT * FROM docs WHERE tsv @@$1 AND id = $2"
+    check sqlParams("SELECT * FROM t WHERE arr <@? AND id = ?") ==
+      "SELECT * FROM t WHERE arr <@$1 AND id = $2"
+
+  test "@? before -- comment":
+    check sqlParams("SELECT doc @?-- c?\nWHERE id = ?") ==
+      "SELECT doc @?-- c?\nWHERE id = $1"
+
+  test "@? right after a placeholder":
+    check sqlParams("SELECT * FROM t WHERE ?@? '$.a'") ==
+      "SELECT * FROM t WHERE $1@? '$.a'"
+
+  test "operators right after a block comment":
+    check sqlParams("SELECT doc /*c*/@? '$.a' AND id = ?") ==
+      "SELECT doc /*c*/@? '$.a' AND id = $1"
+    check sqlParams("SELECT col /*c*/?| array[?]") == "SELECT col /*c*/?| array[$1]"
+
+  test "placeholder right after another operator":
+    check sqlParams("SELECT * FROM t WHERE a=?||'x' AND id = ?") ==
+      "SELECT * FROM t WHERE a=$1||'x' AND id = $2"
+    check sqlParams("SELECT * FROM t WHERE a=?-1") == "SELECT * FROM t WHERE a=$1-1"
+
 suite "sql macro":
   test "basic parameter extraction":
     let x = 42'i32
