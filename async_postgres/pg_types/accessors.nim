@@ -508,6 +508,15 @@ proc decodePgArrayElement(_: typedesc[PgMacAddr8], buf: openArray[byte]): PgMacA
     parts[j] = toHex(buf[j], 2).toLowerAscii()
   PgMacAddr8(parts.join(":"))
 
+template parsePgJson(s: string, what: string): JsonNode =
+  ## ``what`` is built only on failure; pass ``s`` as a plain variable.
+  try:
+    parseJson(s)
+  except ValueError, IOError, OSError:
+    # parseJson's raises also list its stream's IOError/OSError (unreachable
+    # for a string); fold everything into PgTypeError.
+    raise newException(PgTypeError, what & " (len=" & $s.len & ")")
+
 proc decodeJsonArrayElem(buf: openArray[byte], elemOid: int32): JsonNode =
   # Strip the leading jsonb version byte only when elemOid says jsonb.
   let jsonStr =
@@ -515,10 +524,7 @@ proc decodeJsonArrayElem(buf: openArray[byte], elemOid: int32): JsonNode =
       readString(buf, 1, buf.len - 1)
     else:
       readString(buf, 0, buf.len)
-  try:
-    parseJson(jsonStr)
-  except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON (len=" & $jsonStr.len & ")")
+  parsePgJson(jsonStr, "Invalid JSON")
 
 proc getUuid*(row: Row, col: int): PgUuid =
   ## Get a column value as PgUuid. Handles binary format (16 bytes).
@@ -687,12 +693,7 @@ proc getJson*(row: Row, col: int): JsonNode =
       row.data.buf.toOpenArray(off, off + clen - 1), row.colTypeOid(col)
     )
   let s = row.getStr(col)
-  try:
-    return parseJson(s)
-  except JsonParsingError:
-    raise newException(
-      PgTypeError, "Column " & $col & ": Invalid JSON (len=" & $s.len & ")"
-    )
+  parsePgJson(s, "Column " & $col & ": Invalid JSON")
 
 proc getInterval*(row: Row, col: int): PgInterval =
   ## Get a column value as PgInterval. Handles binary interval format.
@@ -1510,10 +1511,7 @@ proc bytesElemFromText(s: string): seq[byte] =
 genArrayDecoder(getBytesArray, seq[byte], "bytea", [OidBytea], bytesElemFromText(e.get))
 
 proc jsonElemFromText(s: string): JsonNode =
-  try:
-    parseJson(s)
-  except JsonParsingError:
-    raise newException(PgTypeError, "Invalid JSON element (len=" & $s.len & ")")
+  parsePgJson(s, "Invalid JSON element")
 
 genArrayDecoderCustom(
   getJsonArray,

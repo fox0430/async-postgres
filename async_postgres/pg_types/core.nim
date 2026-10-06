@@ -419,10 +419,9 @@ proc pgParseInt*(s: string): int =
   pgTypeErrorOnValueError("invalid integer value"):
     parseInt(s)
 
-proc pgParseInt32*(s: string): int32 {.gcsafe, raises: [CatchableError].} =
+proc pgParseInt32*(s: string): int32 {.gcsafe, raises: [PgTypeError].} =
   ## Parse a text integer into int32, rejecting non-numeric and out-of-range values.
   ## Plain ``int32(parseInt)`` would silently truncate (wrap) in release builds.
-  ## Effect signature lets ``parseRangeText``/``parseMultirangeText`` take it directly.
   let v = pgParseInt(s)
   if v < int(int32.low) or v > int(int32.high):
     raise
@@ -438,7 +437,7 @@ proc pgParseInt16*(s: string): int16 =
       newException(PgTypeError, "integer value out of int16 range (len=" & $s.len & ")")
   int16(v)
 
-proc pgParseBiggestInt*(s: string): int64 {.gcsafe, raises: [CatchableError].} =
+proc pgParseBiggestInt*(s: string): int64 {.gcsafe, raises: [PgTypeError].} =
   ## Parse a text integer into int64, converting `ValueError` to `PgTypeError`.
   ## Return type is spelled int64 (== BiggestInt) so procvar callers such as
   ## ``parseRangeText[int64]`` get an exact match without alias-widening.
@@ -1341,7 +1340,7 @@ proc parseBitString*(s: string): PgBit =
       )
   initPgBit(nbits, data)
 
-proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [CatchableError].} =
+proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [PgTypeError].} =
   ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN") into PgNumeric.
   if s.len == 0:
     raise newException(PgTypeError, "Invalid numeric: empty string")

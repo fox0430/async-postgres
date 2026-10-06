@@ -1850,12 +1850,15 @@ proc lookupStmtCache*(conn: PgConnection, sql: string): CachedStmt =
   return nil
 
 proc evictStmtCache*(conn: PgConnection): CachedStmt =
-  ## Evict the least recently used entry from the cache. Returns the evicted entry.
-  let node = conn.stmtCacheLru.head
-  let oldSql = node.value
-  conn.stmtCacheLru.remove(node)
-  result = conn.stmtCache[oldSql]
-  conn.stmtCache.del(oldSql)
+  ## Evict the least recently used entry from the cache. Returns the evicted
+  ## entry, or ``nil`` once the LRU list runs out.
+  while conn.stmtCacheLru.head != nil:
+    let node = conn.stmtCacheLru.head
+    conn.stmtCacheLru.remove(node)
+    # pop, not `[]`: `[]` would add KeyError to the raises of every caller
+    # (`stmtCacheCapacity=` among them). A node with no entry is skipped.
+    if conn.stmtCache.pop(node.value, result):
+      return
 
 proc queueStmtClose*(conn: PgConnection, stmtName: string) =
   ## Queue a server-side ``Close`` for a statement the cache no longer tracks
@@ -1892,7 +1895,12 @@ proc invalidateAllStmtCache*(conn: PgConnection, sql, stmtName: string) =
   if entry == nil or entry.name != stmtName:
     return
   for cachedSql in conn.stmtCacheLru:
-    conn.queueStmtClose(conn.stmtCache[cachedSql].name)
+    var cached: CachedStmt
+    if conn.stmtCache.pop(cachedSql, cached):
+      conn.queueStmtClose(cached.name)
+  # Entries the LRU list lost still owe their Close.
+  for cached in conn.stmtCache.values:
+    conn.queueStmtClose(cached.name)
   conn.stmtCache.clear()
   conn.stmtCacheLru = initDoublyLinkedList[string]()
 
@@ -1916,6 +1924,8 @@ proc addStmtCache*(conn: PgConnection, sql: string, cached: CachedStmt) =
       conn.queueStmtClose(existing.name)
   while conn.stmtCache.len >= conn.stmtCacheCapacity:
     let evicted = conn.evictStmtCache()
+    if evicted == nil:
+      break
     conn.queueStmtClose(evicted.name)
   if cached.resultFormats.len == 0 and cached.fields.len > 0:
     cached.resultFormats = buildResultFormats(cached.fields)
@@ -2016,7 +2026,8 @@ proc evictForInsert*(conn: PgConnection, buf: var seq[byte]) =
   if conn.stmtCacheCapacity <= 0 or conn.stmtCache.len < conn.stmtCacheCapacity:
     return
   let evicted = conn.evictStmtCache()
-  conn.stageEvictedClose(buf, evicted.name)
+  if evicted != nil:
+    conn.stageEvictedClose(buf, evicted.name)
 
 proc evictForInsert*(conn: PgConnection) {.inline.} =
   ## Make room for one more cache entry, staging the evicted ``Close`` into the
@@ -2143,7 +2154,10 @@ proc `stmtCacheCapacity=`*(conn: PgConnection, value: int) =
   ## server-side ``Close`` rides along with the next Extended Query operation.
   conn.stmtCacheCapacity = value
   while conn.stmtCache.len > max(value, 0):
-    conn.queueStmtClose(conn.evictStmtCache().name)
+    let evicted = conn.evictStmtCache()
+    if evicted == nil:
+      break
+    conn.queueStmtClose(evicted.name)
 
 func state*(conn: PgConnection): PgConnState {.inline.} =
   ## Current state (read-only; see `isConnected`).

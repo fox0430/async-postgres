@@ -325,8 +325,8 @@ proc parseRangeElem(
     (elem, i)
 
 proc parseRangeText*[T](
-    s: string, parseElem: proc(s: string): T {.gcsafe, raises: [CatchableError].}
-): PgRange[T] =
+    s: string, parseElem: proc(s: string): T {.gcsafe.}
+): PgRange[T] {.effectsOf: parseElem.} =
   if s == "empty":
     return PgRange[T](isEmpty: true)
   if s.len < 3:
@@ -791,8 +791,8 @@ proc `$`*[T](mr: PgMultirange[T]): string =
   result.add('}')
 
 proc parseMultirangeText*[T](
-    s: string, parseElem: proc(s: string): T {.gcsafe, raises: [CatchableError].}
-): PgMultirange[T] =
+    s: string, parseElem: proc(s: string): T {.gcsafe.}
+): PgMultirange[T] {.effectsOf: parseElem.} =
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
     raise newException(PgTypeError, "Invalid multirange literal (len=" & $s.len & ")")
   let inner = s[1 ..^ 2]
