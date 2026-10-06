@@ -160,6 +160,29 @@ suite "sqlParams":
   test "?# at end of string":
     check sqlParams("SELECT col ?#") == "SELECT col ?#"
 
+  test "placeholder before -- comment":
+    check sqlParams("SELECT * FROM t WHERE x = ?-- note?\nAND y = ?") ==
+      "SELECT * FROM t WHERE x = $1-- note?\nAND y = $2"
+
+  test "placeholder before -- comment at end of string":
+    check sqlParams("SELECT ?--") == "SELECT $1--"
+
+  test "operators before -- comment":
+    check sqlParams("SELECT col ?|-- c?\nWHERE id = ?") ==
+      "SELECT col ?|-- c?\nWHERE id = $1"
+    check sqlParams("SELECT col ?&-- c?\nWHERE id = ?") ==
+      "SELECT col ?&-- c?\nWHERE id = $1"
+    check sqlParams("SELECT p1 ?#-- c?\nWHERE id = ?") ==
+      "SELECT p1 ?#-- c?\nWHERE id = $1"
+
+  test "?? escape before -- comment":
+    check sqlParams("SELECT '{}'::jsonb ??-- c?\nWHERE id = ?") ==
+      "SELECT '{}'::jsonb ?-- c?\nWHERE id = $1"
+
+  test "?- operator before /* comment":
+    check sqlParams("SELECT p1 ?-/* c? */ p2 WHERE id = ?") ==
+      "SELECT p1 ?-/* c? */ p2 WHERE id = $1"
+
 suite "sql macro":
   test "basic parameter extraction":
     let x = 42'i32
