@@ -39,9 +39,17 @@ type
       ## `PgPoolError(pekQueueFull)` when full.
     resetQuery*: string
       ## SQL to execute when returning a connection to the pool (default ""=disabled).
+      ## Disabled, the pool clears only typed-API advisory locks and a changed
+      ## `TimeZone`: `SET` / `SET ROLE` / `search_path`, prepared statements,
+      ## temporary tables and `LISTEN` reach the next borrower. Runs from
+      ## `resetSession` (the `with*` macros and the pool's query procs); a raw
+      ## `release` skips it.
       ## Common values: "DISCARD ALL" (full reset, recommended for PgBouncer),
       ## "DEALLOCATE ALL" (clear prepared statements only),
-      ## "RESET ALL" (reset session parameters only). The statement cache is
+      ## "RESET ALL" (reset session parameters only; `SET ROLE` survives it,
+      ## so use "RESET ALL; RESET ROLE" when borrowers switch roles).
+      ## `DISCARD ALL` and `RESET ROLE` return to a role sent at startup
+      ## (`extraParams`), not to the login role. The statement cache is
       ## kept unless it drops the prepared statements (DISCARD/DEALLOCATE ALL).
       ## On failure, the connection is discarded. A `TimeZone` it leaves off
       ## the connect value is set back afterwards, at the cost of a round trip;
@@ -1051,6 +1059,12 @@ proc release*(conn: PgConnection) =
   ## in a transaction, it is closed instead; if waiters are queued, it is
   ## handed directly to the next waiter.
   ##
+  ## **No session reset:** `resetSession` does not run, so `resetQuery` is
+  ## skipped and session state (`SET`, `SET ROLE`, prepared statements, …)
+  ## reaches the next borrower; a connection holding typed-API advisory locks
+  ## or a changed `TimeZone` is closed instead. Use `resetSessionAndRelease`
+  ## or the `with*` macros to clean up.
+  ##
   ## The owning pool is tracked on `conn.ownerPool`, set automatically when
   ## the connection is acquired from a `PgPool` (including pools inside a
   ## `PgPoolCluster`). For standalone connections created with `connect`
@@ -1086,8 +1100,8 @@ proc release*(h: PooledConnHandle) =
   ## Return the borrowed connection to its pool. Idempotent — safe to call
   ## twice (e.g. once explicitly and once via `defer`).
   ##
-  ## **Does not run `resetSession`.** Session state (`SET`/`SET LOCAL` outside
-  ## a transaction, prepared statements, etc.) on the connection is **not**
+  ## **Does not run `resetSession`.** Session state (`SET`, `SET ROLE`,
+  ## prepared statements, etc.) on the connection is **not**
   ## cleared before it returns to the pool, so subsequent borrowers may
   ## observe it. A connection holding advisory locks acquired via the typed
   ## API, or whose `TimeZone` changed since connect, is closed instead, at
@@ -1582,7 +1596,9 @@ macro withConnection*(pool: PgPool, conn, body: untyped): untyped =
   ## The connection is available as `conn` inside the body.
   ## `resetSession` runs before release, so a configured `resetQuery` is
   ## applied and any session-level advisory locks acquired through the typed
-  ## API are released via `pg_advisory_unlock_all`.
+  ## API are released via `pg_advisory_unlock_all`. Without a `resetQuery`,
+  ## other session state (`SET`, `SET ROLE`, prepared statements, …) reaches
+  ## the next borrower.
   ##
   ## Release runs outside `finally` (a failing `await` in an asyncdispatch
   ## `finally` masks the body error), so `return` / `break` / `continue`
