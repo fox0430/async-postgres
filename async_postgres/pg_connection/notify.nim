@@ -34,8 +34,10 @@ proc onReconnect*(conn: PgConnection, callback: ReconnectCallback) =
   ##
   ## The new session is built from ``conn.config`` alone: ``SET`` /
   ## ``set_config`` changes, temporary tables, prepared statements and session
-  ## advisory locks do not carry over. Put a setting that must survive in
-  ## ``extraParams`` (e.g. ``("search_path", "app")``) instead.
+  ## advisory locks do not carry over. A ``SET ROLE`` is lost too, so later
+  ## queries on the connection run with the login role's privileges. Put a
+  ## setting that must survive in ``extraParams`` (e.g.
+  ## ``("search_path", "app")`` or ``("role", "app_reader")``) instead.
   conn.reconnectCallback = callback
 
 proc onNotifyOverflow*(conn: PgConnection, callback: NotifyOverflowCallback) =
