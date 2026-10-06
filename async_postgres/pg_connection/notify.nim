@@ -32,6 +32,11 @@ proc onReconnect*(conn: PgConnection, callback: ReconnectCallback) =
   ## Set a callback invoked after the listen pump reconnects in place and
   ## re-subscribes every channel.
   ##
+  ## A NOTIFY sent from the drop until the channels are listened to again is
+  ## lost, as the server queues it only for sessions listening at the time.
+  ## This callback is the only sign of that gap: re-read here whatever the
+  ## missed notifications would have announced.
+  ##
   ## The new session is built from ``conn.config`` alone: ``SET`` /
   ## ``set_config`` changes, temporary tables, prepared statements and session
   ## advisory locks do not carry over. A ``SET ROLE`` is lost too, so later
