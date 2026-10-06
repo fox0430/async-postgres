@@ -20,6 +20,7 @@ when defined(posix):
   import std/posix
 
 import ../[async_backend, pg_errors]
+from ../pg_types/encoding import hexNibble
 import types
 
 const MaxPemFileBytes = 4 * 1024 * 1024
@@ -820,7 +821,8 @@ proc pctDecode(s: string, field: string): string =
           "Invalid percent-encoded token in " & field & " of DSN at offset=" & $i &
             " (len=" & $s.len & ")",
         )
-      let c = chr(parseHexInt(s[i + 1 .. i + 2]))
+      # Not parseHexInt: its unreachable ValueError would join parseDsn's raises.
+      let c = chr(hexNibble(s[i + 1]) * 16 + hexNibble(s[i + 2]))
       if c == '\0':
         raise newException(
           PgConfigError,

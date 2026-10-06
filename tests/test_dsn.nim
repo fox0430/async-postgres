@@ -89,6 +89,15 @@ suite "parseDsn":
     check cfg.host == "host"
     check cfg.database == "db"
 
+  test "lowercase percent-encoding decodes too":
+    check parseDsn("postgresql://user:p%3aw%2fd%7e@host/db").password == "p:w/d~"
+
+  test "parseDsn raises only PgError":
+    proc parse(dsn: string): ConnConfig {.raises: [PgError].} =
+      parseDsn(dsn)
+
+    check parse("postgresql://user:p%40ss@host/db").password == "p@ss"
+
   test "URL-encoded user":
     let cfg = parseDsn("postgresql://my%40user@host/db")
     check cfg.user == "my@user"

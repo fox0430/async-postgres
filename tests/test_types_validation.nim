@@ -383,6 +383,56 @@ suite "Text-path parse errors raise PgTypeError (not ValueError)":
     expect PgTypeError:
       discard (Row @[some(toBytes("1e40"))]).getFloat32(0)
 
+suite "Accessors and text parsers raise only PgError":
+  # Each reader is `{.raises: [PgError].}`: an accessor whose inferred raises
+  # widen (CatchableError, ValueError, IOError, ...) breaks the build here.
+  test "numeric and integer array accessors":
+    proc read(row: Row): (PgNumeric, seq[int32], seq[int64]) {.raises: [PgError].} =
+      discard row.getNumericOpt(0)
+      discard row.getNumericArray(1)
+      discard row.getIntArrayElemOpt(1)
+      (row.getNumeric(0), row.getIntArray(1), row.getInt64Array(1))
+
+    let (n, ints, bigs) = read(@[some(toBytes("1.5")), some(toBytes("{1,2}"))])
+    check n == parsePgNumeric("1.5")
+    check ints == @[1'i32, 2]
+    check bigs == @[1'i64, 2]
+
+  test "range and multirange accessors":
+    proc read(row: Row): (PgRange[PgNumeric], int, int, int) {.raises: [PgError].} =
+      (
+        row.getNumRange(0),
+        row.getInt4Multirange(1).len,
+        row.getInt8RangeArray(2).len,
+        row.getInt4MultirangeArray(3).len,
+      )
+
+    let (r, mr, ra, mra) = read(
+      @[
+        some(toBytes("[1.5,9.5)")),
+        some(toBytes("{[1,3),[5,8)}")),
+        some(toBytes("{\"[100,200)\"}")),
+        some(toBytes("{\"{[1,3),[5,8)}\"}")),
+      ]
+    )
+    check r.lower.value == parsePgNumeric("1.5")
+    check (mr, ra, mra) == (2, 1, 1)
+
+  test "json accessors":
+    proc read(row: Row): (JsonNode, seq[JsonNode]) {.raises: [PgError].} =
+      (row.getJson(0), row.getJsonArray(1))
+
+    let (j, arr) = read(@[some(toBytes("{\"a\":1}")), some(toBytes("{\"[1]\"}"))])
+    check j["a"].getInt == 1
+    check arr.len == 1
+
+  test "public text parsers take the effects of their element parser":
+    proc parse(s: string): PgMultirange[PgNumeric] {.raises: [PgError].} =
+      discard parseRangeText(s[1 ..^ 2], parsePgNumeric)
+      parseMultirangeText(s, parsePgNumeric)
+
+    check parse("{[1.5,9.5)}").len == 1
+
 suite "Float text path accepts PostgreSQL Infinity/-Infinity/NaN":
   # PostgreSQL prints float infinities as the full word ``Infinity``/``-Infinity``
   # (and NaN as ``NaN``). Nim's ``parseFloat`` only takes the ``inf`` form, so the

@@ -75,6 +75,29 @@ suite "stmt cache LRU":
     check conn.lookupStmtCache("c").name == "_sc_c"
     check conn.pendingStmtCloses == @["_sc_a", "_sc_b"]
 
+  test "the capacity setter raises nothing":
+    proc resize(conn: PgConnection, capacity: int) {.raises: [].} =
+      `stmtCacheCapacity=`(conn, capacity)
+
+    let conn = mockConn(2)
+    conn.addStmtCache("a", cached("_sc_a"))
+    conn.addStmtCache("b", cached("_sc_b"))
+    resize(conn, 1)
+    check conn.pendingStmtCloses == @["_sc_a"]
+
+  test "an LRU list out of step with the table loses no Close":
+    let conn = mockConn(3)
+    conn.addStmtCache("a", cached("_sc_a"))
+    conn.addStmtCache("b", cached("_sc_b"))
+    conn.addStmtCache("c", cached("_sc_c"))
+    conn.stmtCache.del("a") # node with no entry
+    conn.stmtCacheLru.remove(conn.stmtCache["c"].lruNode) # entry with no node
+    `stmtCacheCapacity=`(conn, 0)
+    check conn.pendingStmtCloses == @["_sc_b"]
+    conn.invalidateAllStmtCache("c", "_sc_c")
+    check conn.pendingStmtCloses == @["_sc_b", "_sc_c"]
+    check conn.stmtCache.len == 0
+
   test "disabling the cache evicts every entry and queues its Close":
     for disabled in [0, -1]:
       let conn = mockConn(2)
