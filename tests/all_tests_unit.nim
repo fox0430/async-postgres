@@ -12,5 +12,9 @@ import
   test_tls_error_paths, test_transaction_cancel, test_transaction_helpers,
   test_tx_cleanup_defect, test_type_lookup, test_types_array, test_types_inline,
   test_types_misc, test_types_numeric, test_types_range, test_types_scalar,
-  test_types_temporal, test_types_user_defined, test_types_validation
+  test_types_temporal, test_types_user_defined, test_types_validation,
+  test_unit_advisory_lock, test_unit_bearssl, test_unit_core, test_unit_cursor,
+  test_unit_copy, test_unit_direct, test_unit_exec, test_unit_lifecycle,
+  test_unit_pipeline, test_unit_prepared, test_unit_query, test_unit_simple_query,
+  test_unit_transaction
 {.pop.}
