@@ -201,7 +201,7 @@ when defined(posix):
     when hasChronos:
       let fd = posix.SocketHandle(client.fd)
     elif hasAsyncDispatch:
-      let fd = posix.SocketHandle(client.getFd())
+      let fd = client.getFd()
     var one: cint = 1
     doAssert posix.setsockopt(
       fd,
@@ -222,7 +222,7 @@ elif defined(windows):
     when hasChronos:
       let fd = winlean.SocketHandle(client.fd)
     elif hasAsyncDispatch:
-      let fd = winlean.SocketHandle(client.getFd())
+      let fd = client.getFd()
     var one: cint = 1
     doAssert winlean.setsockopt(
       fd, IpprotoTcp, winlean.TCP_NODELAY, addr one, winlean.SockLen(sizeof(one))

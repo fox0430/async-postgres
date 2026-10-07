@@ -629,6 +629,19 @@ suite "Advisory Lock: withAdvisoryLock body escape":
       body
       body
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withAdvisoryLock(50021'i64):
+              lockEachN(3):
+                discard
+              lockTwice:
+                discard
+
+    )
     doAssert not compiles(
       block:
         proc t() {.async.} =

@@ -9,12 +9,12 @@ from ../pg_bytes import readString
 import pkg/nimcrypto/utils as ncutils
 import types, buffer_io, ssl, simple_query, dsn
 
-when defined(posix):
-  import std/posix
-elif defined(windows):
-  from std/winlean import nil
-
-when hasAsyncDispatch:
+when hasChronos:
+  when defined(posix):
+    import std/posix
+  elif defined(windows):
+    from std/winlean import nil
+elif hasAsyncDispatch:
   import std/asyncnet
 
 type AuthStep = enum
@@ -515,16 +515,14 @@ proc connectToHostImpl(
     when defined(posix):
       if not isUnix:
         try:
-          # Cast explicitly: nim doc resolves nativesockets.SocketHandle to
-          # winlean on some setups.
-          configureTcpNoDelay(posix.SocketHandle(sock.getFd()))
-          configureKeepalive(posix.SocketHandle(sock.getFd()), config)
+          configureTcpNoDelay(sock.posixFd)
+          configureKeepalive(sock.posixFd, config)
         except CatchableError as e:
           sock.close()
           raise e
     elif defined(windows):
       if not isUnix:
-        configureTcpNoDelay(winlean.SocketHandle(sock.getFd()))
+        configureTcpNoDelay(sock.getFd())
     conn = newPgConnection(hostAddr, hostPort, config)
     conn.attachTransport(sock, dialed.target, sslHost)
 

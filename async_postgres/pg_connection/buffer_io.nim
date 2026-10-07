@@ -266,6 +266,15 @@ elif hasAsyncDispatch:
     Dialed* = tuple[stream: DialStream, target: DialTarget]
       ## A connected stream and the address it reached.
 
+  when defined(posix):
+    template posixFd*(s: AsyncSocket): posix.SocketHandle =
+      ## ``s``'s descriptor as posix's ``SocketHandle``.
+      when defined(nimdoc):
+        # nim doc takes nativesockets' Windows branch, so getFd is winlean's.
+        posix.SocketHandle(s.getFd())
+      else:
+        s.getFd()
+
   func shown*(t: DialTarget): string =
     ## ``t`` as error messages name it.
     if t.domain == Domain.AF_INET6:
@@ -381,9 +390,7 @@ elif hasAsyncDispatch:
         true
 
       var sa = t.sa
-      if posix.connect(
-        posix.SocketHandle(sock.getFd), cast[ptr SockAddr](addr sa), t.saLen
-      ) == 0:
+      if posix.connect(sock.posixFd, cast[ptr SockAddr](addr sa), t.saLen) == 0:
         fut.complete()
       else:
         let err = osLastError()
@@ -882,7 +889,7 @@ proc peekSocket(conn: PgConnection): SocketPeek =
     elif hasAsyncDispatch:
       if conn.socket.isNil:
         return spUnavailable
-      let fd = posix.SocketHandle(conn.socket.getFd())
+      let fd = conn.socket.posixFd
     var buf: byte
     let flags = posix.MSG_PEEK or MSG_DONTWAIT
     while true:
@@ -911,7 +918,7 @@ proc peekSocket(conn: PgConnection): SocketPeek =
     elif hasAsyncDispatch:
       if conn.socket.isNil:
         return spUnavailable
-      let fd = winlean.SocketHandle(conn.socket.getFd())
+      let fd = conn.socket.getFd()
     var buf: byte
     let n = winlean.recv(fd, addr buf, 1, winlean.MSG_PEEK)
     if n > 0:

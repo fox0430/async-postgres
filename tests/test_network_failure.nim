@@ -13,7 +13,7 @@ import pkg/nimcrypto/pbkdf2
 import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
-from ../async_postgres/pg_connection/types import newPgConnection, attachTransport
+import ../async_postgres/pg_connection/types
 from ../async_postgres/pg_connection/lifecycle {.all.} import attemptHostTimed
 from ../async_postgres/pg_connection/simple_query {.all.} import
   cancelWithin, sendCancelRequest
@@ -21,11 +21,8 @@ when hasAsyncDispatch:
   from std/nativesockets import Domain
 when defined(posix):
   import std/posix
-  when hasChronos:
-    from ../async_postgres/pg_connection/types import transport, initPlainStreams
-  else:
+  when hasAsyncDispatch:
     from std/asyncnet import getFd
-    from ../async_postgres/pg_connection/types import socket
 
 import ./mock_pg_server
 
@@ -131,7 +128,7 @@ suite "Dial":
         when hasChronos:
           let fd = SocketHandle(side.transport.fd)
         else:
-          let fd = SocketHandle(side.socket.getFd())
+          let fd = side.socket.getFd()
         discard posix.shutdown(fd, SHUT_WR)
         try:
           await side.sendCancelRequest(encodeCancelRequest(1234, 5678))
@@ -158,7 +155,7 @@ suite "Dial":
         when hasChronos:
           let fd = SocketHandle(conn.transport.fd)
         else:
-          let fd = SocketHandle(conn.socket.getFd())
+          let fd = conn.socket.getFd()
         doAssert conn.state != csClosed
         discard posix.shutdown(fd, SHUT_WR)
         try:

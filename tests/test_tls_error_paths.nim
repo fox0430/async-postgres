@@ -1,4 +1,6 @@
-import std/[net, os, osproc, streams, strutils, tempfiles, unittest]
+import std/[net, os, osproc, streams, strutils, unittest]
+when defined(posix):
+  import std/tempfiles
 
 import cert_fixtures
 import ../async_postgres/[async_backend, pg_connection, pg_errors]

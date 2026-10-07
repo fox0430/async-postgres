@@ -333,6 +333,17 @@ suite "E2E: Cursor/Streaming":
         inc i
         body
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withCursor("SELECT 1", 5'i32, cur):
+              cursorEachN(3):
+                discard
+
+    )
     doAssert not compiles(
       block:
         proc t() {.async.} =
