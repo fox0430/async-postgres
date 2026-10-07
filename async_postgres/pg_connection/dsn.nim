@@ -449,8 +449,9 @@ when defined(linux):
 else:
   const
     maxSockOptInt = int64(high(cint))
-      ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
-      ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
+      ## Keepalive timings reach `setsockopt` as `cint`; a larger value would
+      ## turn into an uncatchable RangeDefect at connect time instead of a
+      ## PgConfigError here.
     maxKeepAliveIdle = maxSockOptInt
     maxKeepAliveInterval = maxSockOptInt
     maxKeepAliveCount = maxSockOptInt

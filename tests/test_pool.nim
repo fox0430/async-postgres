@@ -1390,11 +1390,15 @@ suite "Pool close":
       scheduleSoon(
         proc() {.gcsafe, raises: [].} =
           {.cast(gcsafe).}:
+            # asyncdispatch types `read` as raising Exception; Nim < 2.2.8's
+            # unittest turns BareExcept on inside test bodies.
+            {.push warning[BareExcept]: off.}
             try:
               pool.settleAbandonedWaiter(waiter)
               continuationRan = true
             except Exception as e:
               settleErr = e
+            {.pop.}
       )
 
       # close() must yield so that continuation runs and its closeNoWait task is

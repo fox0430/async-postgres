@@ -690,6 +690,19 @@ suite "Large Object: withLargeObject macro":
       body
       body
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withLargeObject(lo, 0.Oid, INV_READWRITE):
+              loEachN(3):
+                discard
+              loTwice:
+                discard
+
+    )
     doAssert not compiles(
       block:
         proc t() {.async.} =

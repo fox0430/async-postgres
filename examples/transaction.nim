@@ -47,9 +47,13 @@ proc main() {.async.} =
       discard await conn.exec(
         sql"UPDATE accounts SET balance = balance - {9999'i32} WHERE name = 'Alice'"
       )
-      raise newException(CatchableError, "something went wrong")
-  except CatchableError:
-    echo "\nTransaction rolled back due to error"
+      let balance = await conn.queryValue(
+        int32, "SELECT balance FROM accounts WHERE name = 'Alice'"
+      )
+      if balance < 0:
+        raise newException(CatchableError, "insufficient funds")
+  except CatchableError as e:
+    echo "\nTransaction rolled back: ", e.msg
 
   echo "Balances unchanged:"
   let res2 = await conn.query("SELECT name, balance FROM accounts ORDER BY name")

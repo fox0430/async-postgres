@@ -7,8 +7,6 @@
 import std/[tables, sets, deques, lists, macros, options]
 from std/strutils import
   isAlphaNumeric, toLowerAscii, cmpIgnoreCase, split, strip, startsWith, Whitespace
-when defined(posix):
-  import std/posix
 
 import ../[async_backend, pg_auth, pg_errors, pg_gensym, pg_protocol, pg_types]
 import ../pg_types/encoding
@@ -19,6 +17,8 @@ when hasChronos:
 elif hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import Domain, Port
+  when defined(posix):
+    import std/posix
 
 # TCP keepalive socket options (not exported by posix module)
 when defined(linux):

@@ -1117,6 +1117,16 @@ suite "E2E: Transaction":
         inc i
         body
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            txEachN(3):
+              discard
+
+    )
     doAssert not compiles(
       block:
         proc t() {.async.} =
@@ -1221,6 +1231,17 @@ suite "E2E: Transaction":
       body
       body
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          for i in 0 ..< 3:
+            conn.withTransaction:
+              txTwice:
+                discard
+
+    )
     doAssert not compiles(
       block:
         proc t() {.async.} =
@@ -1253,6 +1274,16 @@ suite "E2E: Transaction":
         inc i
         body
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            txEachN(3):
+              discard
+
+    )
     doAssert not compiles(
       block:
         proc t() {.async.} =
@@ -1329,6 +1360,16 @@ suite "E2E: Transaction":
       body
       body
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransactionRetry(RetryOptions()):
+            txTwice:
+              discard
+
+    )
     # No caller loop: the `break`/`continue` would bind to the retry loop.
     doAssert not compiles(
       block:
@@ -1444,6 +1485,8 @@ suite "E2E: Transaction":
           conn.withTransaction:
             block outer:
               txEachN(3):
+                break outer
+              txLabeled:
                 break outer
 
     )
@@ -1634,6 +1677,19 @@ suite "E2E: Transaction":
         body
       asyncSpawn fn()
 
+    # Control: the same shape compiles once the escape is removed.
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          conn.withTransaction:
+            template bail() =
+              txLater:
+                discard
+
+            bail()
+
+    )
     doAssert not compiles(
       block:
         proc t() {.async.} =

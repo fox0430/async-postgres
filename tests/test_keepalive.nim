@@ -7,8 +7,9 @@ elif defined(windows):
 
 import ../async_postgres/async_backend
 import ../async_postgres/pg_connection {.all.}
-import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/types {.all.}
+when defined(posix):
+  import ../async_postgres/pg_connection/buffer_io
 import ./mock_pg_server
 
 when hasAsyncDispatch:
@@ -31,15 +32,15 @@ suite "TCP_NODELAY":
         )
       )
       when hasChronos:
-        let fd = conn.transport.fd
+        let fd = SocketHandle(conn.transport.fd)
       elif hasAsyncDispatch:
         let fd = conn.socket.getFd()
       # Windows may write back a single byte; getSockOptInt starts from zero.
       when defined(windows):
         const IpprotoTcp = 6 # winsock2.h; not in winlean
-        noDelay = getSockOptInt(SocketHandle(fd), IpprotoTcp, winlean.TCP_NODELAY) != 0
+        noDelay = getSockOptInt(fd, IpprotoTcp, winlean.TCP_NODELAY) != 0
       else:
-        noDelay = getSockOptInt(SocketHandle(fd), IPPROTO_TCP, TCP_NODELAY) != 0
+        noDelay = getSockOptInt(fd, IPPROTO_TCP, TCP_NODELAY) != 0
       await conn.close()
       await closeClient(await serverFut)
       await closeServer(ms)

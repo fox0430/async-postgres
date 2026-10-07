@@ -122,6 +122,7 @@ async_postgres/pg_connection/buffer_io.nim	dialTargets#2
 async_postgres/pg_connection/buffer_io.nim	nextMessage
 async_postgres/pg_connection/buffer_io.nim	oneLine
 async_postgres/pg_connection/buffer_io.nim	pending
+async_postgres/pg_connection/buffer_io.nim	posixFd
 async_postgres/pg_connection/buffer_io.nim	pumpUntilReady
 async_postgres/pg_connection/buffer_io.nim	pumpUntilReady#2
 async_postgres/pg_connection/buffer_io.nim	pumpUntilReady#3

@@ -11,9 +11,6 @@
 
 import std/[strutils, unittest]
 
-when defined(posix):
-  import std/posix
-
 import ../async_postgres/[async_backend, pg_replication]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/types
@@ -25,6 +22,8 @@ privateAccess(PgConnection)
 
 when hasChronos:
   import ../async_postgres/pg_connection/buffer_io
+  when defined(posix):
+    import std/posix
 
   when defined(windows):
     from std/winlean import nil

@@ -4,15 +4,16 @@
 ## classified from what it records, so a reconnect loop can tell a bad password
 ## from a server shutdown.
 
-import std/[os, sequtils, sets, strutils, unittest]
+import std/[sequtils, sets, strutils, unittest]
 when defined(posix):
-  import std/posix
+  import std/[os, posix]
 
 import ../async_postgres/[async_backend, pg_replication]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/types
 import ../async_postgres/pg_connection/notify {.all.}
-from ../async_postgres/pg_connection/buffer_io {.all.} import isTransientDial
+when defined(posix):
+  from ../async_postgres/pg_connection/buffer_io {.all.} import isTransientDial
 from ../async_postgres/pg_errors {.all.} import
   isTransientServerError, setPerHost, newStartupError
 
