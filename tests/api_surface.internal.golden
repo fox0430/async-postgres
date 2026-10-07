@@ -180,6 +180,7 @@ async_postgres/pg_connection/types.nim	ReplWriteState.rwFailed
 async_postgres/pg_connection/types.nim	ReplWriteState.rwQueued
 async_postgres/pg_connection/types.nim	ReplWriteState.rwWriting
 async_postgres/pg_connection/types.nim	ReplWriteState.rwWritten
+async_postgres/pg_connection/types.nim	ServerCertUnavailable
 async_postgres/pg_connection/types.nim	TCP_KEEPALIVE
 async_postgres/pg_connection/types.nim	TCP_KEEPCNT
 async_postgres/pg_connection/types.nim	TCP_KEEPCNT#2
@@ -358,11 +359,13 @@ async_postgres/pg_connection/types.nim	secretKey
 async_postgres/pg_connection/types.nim	sendBuf
 async_postgres/pg_connection/types.nim	sendBufLen
 async_postgres/pg_connection/types.nim	serverCertDer
+async_postgres/pg_connection/types.nim	serverCertMissing
 async_postgres/pg_connection/types.nim	sessionLockDirty
 async_postgres/pg_connection/types.nim	setListenReconnecting
 async_postgres/pg_connection/types.nim	setReplFlusher
 async_postgres/pg_connection/types.nim	setReplInCallback
 async_postgres/pg_connection/types.nim	setServerCertDer
+async_postgres/pg_connection/types.nim	setServerCertMissing
 async_postgres/pg_connection/types.nim	setServerParam
 async_postgres/pg_connection/types.nim	settlePendingSync
 async_postgres/pg_connection/types.nim	settleReplWrite

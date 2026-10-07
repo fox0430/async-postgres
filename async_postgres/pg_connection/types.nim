@@ -95,8 +95,10 @@ type
   SslMode* = enum
     ## SSL mode. Zero value is ``sslDisable`` (raw ``ConnConfig``); ``parseDsn``/
     ## ``initConnConfig`` default to ``sslPrefer`` (libpq parity).
-    ## Backend divergence: chronos/BearSSL rejects expired certs and lacks IP SAN
-    ## for ``sslVerifyFull``; asyncdispatch matches libpq.
+    ## Backend divergence: chronos/BearSSL also rejects expired certificates
+    ## when ``sslAllow``/``sslPrefer``/``sslRequire`` negotiate TLS, and
+    ## refuses IP-literal hosts under ``sslVerifyFull``; full list in the
+    ## ``async_postgres`` module doc ("Async Backend").
     sslDisable ## Disable SSL
     sslAllow ## Try plaintext; fall back to SSL if refused
     sslPrefer ## Try SSL; fall back to plaintext if refused (libpq default)
@@ -300,6 +302,7 @@ type
     elif hasAsyncDispatch:
       socket: AsyncSocket
     serverCertDer: seq[byte] ## DER-encoded server certificate for SCRAM channel binding
+    serverCertMissing: string ## Why TLS setup left ``serverCertDer`` empty, when known
     sslEnabled: bool
     recvBuf: seq[byte]
     recvBufStart: int ## Read pointer into recvBuf; bytes before this are consumed
@@ -937,6 +940,7 @@ when hasChronos:
     conn.x509Capture = src.x509Capture
     conn.sslEnabled = src.sslEnabled
     conn.serverCertDer = src.serverCertDer
+    conn.serverCertMissing = src.serverCertMissing
     if conn.tlsStream != nil:
       rebindX509Capture(
         conn.x509Capture, conn.tlsStream.ccontext.eng, addr conn.serverCertDer
@@ -977,6 +981,7 @@ elif hasAsyncDispatch:
     conn.socket = src.socket
     conn.sslEnabled = src.sslEnabled
     conn.serverCertDer = src.serverCertDer
+    conn.serverCertMissing = src.serverCertMissing
 
   proc detachTransport*(conn: PgConnection): AsyncSocket {.inline.} =
     ## Detach the socket for the caller to close.
@@ -989,6 +994,17 @@ func serverCertDer*(conn: PgConnection): lent seq[byte] {.inline.} =
 proc setServerCertDer*(conn: PgConnection, der: seq[byte]) {.inline.} =
   ## Store the server certificate DER for SCRAM channel binding.
   conn.serverCertDer = der
+
+const ServerCertUnavailable* = "server certificate is unavailable"
+  ## Reason given when TLS setup recorded no cause for a missing certificate.
+
+func serverCertMissing*(conn: PgConnection): string {.inline.} =
+  ## Why ``serverCertDer`` is empty, as a clause for error messages.
+  if conn.serverCertMissing.len > 0: conn.serverCertMissing else: ServerCertUnavailable
+
+proc setServerCertMissing*(conn: PgConnection, reason: string) {.inline.} =
+  ## Record why TLS setup left ``serverCertDer`` empty.
+  conn.serverCertMissing = reason
 
 func cancelTarget*(conn: PgConnection): lent seq[DialTarget] {.inline.} =
   conn.cancelTarget

@@ -238,17 +238,15 @@ proc filterSaslByRequireAuth*(
       result.add(m)
 
 proc plusOnlyError(offered: seq[string], why: string): ref PgConnectionError =
-  ## SCRAM-SHA-256-PLUS is all that is left but channel binding is ``why``: a
+  ## SCRAM-SHA-256-PLUS is all that is left but unusable (``why``, a clause): a
   ## refusal when require_auth dropped SCRAM-SHA-256 from ``offered``.
   if "SCRAM-SHA-256" in offered:
     result = newException(
-      PgSecurityError,
-      "require_auth allows only SCRAM-SHA-256-PLUS, but channel binding is " & why,
+      PgSecurityError, "require_auth allows only SCRAM-SHA-256-PLUS, but " & why
     )
   else:
     result = newException(
-      PgConnectionError,
-      "channel binding is " & why & ", but server only offered SCRAM-SHA-256-PLUS",
+      PgConnectionError, "server only offered SCRAM-SHA-256-PLUS, but " & why
     )
 
 proc selectScramMechanism*(
@@ -257,12 +255,19 @@ proc selectScramMechanism*(
     saslMechanisms: seq[string],
     mode: ChannelBindingMode,
     allowed: set[AuthMethod] = {},
+    certMissing = ServerCertUnavailable,
 ): tuple[
-  mechanism: string, cbType: string, cbData: seq[byte], cbSupportedButUnused: bool
+  mechanism: string,
+  cbType: string,
+  cbData: seq[byte],
+  cbSupportedButUnused: bool,
+  cbLost: bool,
 ] =
   ## Pick SCRAM mechanism/binding from the server's offer narrowed to
   ## ``allowed`` (raises if ``mode`` or ``allowed`` unsatisfied;
-  ## ``cbSupportedButUnused`` → ``y,,`` else ``n,,``).
+  ## ``cbSupportedButUnused`` → ``y,,`` else ``n,,``). ``cbLost``: ``cbPrefer``
+  ## passed over an offered -PLUS for lack of a server certificate, which
+  ## ``certMissing`` explains.
   if mode == cbRequire and not sslEnabled:
     raise newException(
       PgSecurityError, "channel binding is required, but SSL is not in use"
@@ -292,10 +297,8 @@ proc selectScramMechanism*(
         "channel binding is required, but server did not offer SCRAM-SHA-256-PLUS",
       )
     if serverCertDer.len == 0:
-      raise newException(
-        PgSecurityError,
-        "channel binding is required, but server certificate is unavailable",
-      )
+      raise
+        newException(PgSecurityError, "channel binding is required, but " & certMissing)
     result.mechanism = "SCRAM-SHA-256-PLUS"
     result.cbType = "tls-server-end-point"
     result.cbData = computeTlsServerEndpoint(serverCertDer)
@@ -306,11 +309,12 @@ proc selectScramMechanism*(
       result.cbData = computeTlsServerEndpoint(serverCertDer)
     elif hasScram:
       result.mechanism = "SCRAM-SHA-256"
+      result.cbLost = hasPlus
       # "y,," lets the server detect a MITM that stripped -PLUS; if it did
       # offer -PLUS and we just couldn't use it, "y,," would make it abort.
       result.cbSupportedButUnused = sslEnabled and not offeredPlus
     elif hasPlus:
-      raise plusOnlyError(saslMechanisms, "unavailable")
+      raise plusOnlyError(saslMechanisms, certMissing)
     else:
       raise newException(
         PgConnectionError, "server doesn't support SCRAM-SHA-256 or SCRAM-SHA-256-PLUS"
@@ -319,7 +323,7 @@ proc selectScramMechanism*(
     if hasScram:
       result.mechanism = "SCRAM-SHA-256"
     elif hasPlus:
-      raise plusOnlyError(saslMechanisms, "disabled")
+      raise plusOnlyError(saslMechanisms, "channel binding is disabled")
     else:
       raise newException(PgConnectionError, "server doesn't support SCRAM-SHA-256")
 
@@ -579,6 +583,8 @@ proc connectToHostImpl(
 
     # Authentication loop
     var authStep = asNone
+    # Reported only once startup completes, so a failed attempt stays quiet.
+    var cbLost = false
 
     block authLoop:
       while true:
@@ -610,8 +616,9 @@ proc connectToHostImpl(
           of bmkAuthenticationSASL:
             let choice = selectScramMechanism(
               conn.sslEnabled, conn.serverCertDer, msg.saslMechanisms,
-              config.channelBinding, config.requireAuth,
+              config.channelBinding, config.requireAuth, conn.serverCertMissing,
             )
+            cbLost = choice.cbLost
             let chosen = saslAuthMethod(choice.mechanism).get
             # Defensive: selectScramMechanism only picks from the require_auth
             # filtered offer; this guards against a future fallback past it.
@@ -675,6 +682,10 @@ proc connectToHostImpl(
           "value. Set TimeZone=DEFAULT to keep it, or make UTC the server's, " &
           "database's or role's zone",
       )
+
+    if cbLost:
+      warnStderr "pg_connection: " & conn.serverCertMissing &
+        "; channel_binding=prefer falls back from SCRAM-SHA-256-PLUS to SCRAM-SHA-256"
 
     conn.createdAt = Moment.now()
     conn.noteConnectTimeZone(followsServer = zoneDefault and optionsZone.isNone)

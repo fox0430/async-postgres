@@ -2175,6 +2175,8 @@ suite "selectScramMechanism":
     check choice.cbData.len == 0
     # cbDisable always sends "n,,", never the downgrade-detection "y,,".
     check choice.cbSupportedButUnused == false
+    # Declined by config, not lost.
+    check choice.cbLost == false
 
   test "cbPrefer signals y,, over SSL when server omits PLUS (downgrade detect)":
     let choice = selectScramMechanism(
@@ -2186,6 +2188,8 @@ suite "selectScramMechanism":
     check choice.mechanism == "SCRAM-SHA-256"
     check choice.cbType == ""
     check choice.cbSupportedButUnused == true
+    # No -PLUS offered, so nothing was given up.
+    check choice.cbLost == false
 
   test "cbPrefer sends n,, without SSL even when CB unavailable":
     let choice = selectScramMechanism(
@@ -2209,6 +2213,7 @@ suite "selectScramMechanism":
     check choice.cbData.len > 0
     # Channel binding is in use ("p=,,"), so no downgrade signal needed.
     check choice.cbSupportedButUnused == false
+    check choice.cbLost == false
 
   test "cbPrefer falls back to SCRAM-SHA-256 when cert is missing":
     let choice = selectScramMechanism(
@@ -2222,6 +2227,7 @@ suite "selectScramMechanism":
     # cert is simply unavailable. Sending "y,," here would make the server abort
     # with a channel binding negotiation error, so send "n,," instead.
     check choice.cbSupportedButUnused == false
+    check choice.cbLost == true
 
   test "cbRequire succeeds when SSL + cert + PLUS all available":
     let choice = selectScramMechanism(
@@ -2235,13 +2241,18 @@ suite "selectScramMechanism":
     check choice.cbData.len > 0
 
   test "cbRequire raises when cert is missing even with SSL":
-    expect PgConnectionError:
+    var msg = ""
+    try:
       discard selectScramMechanism(
         sslEnabled = true,
         serverCertDer = @[],
         saslMechanisms = bothMechs,
         mode = cbRequire,
+        certMissing = "libcrypto does not export X509_free",
       )
+    except PgSecurityError as e:
+      msg = e.msg
+    check msg == "channel binding is required, but libcrypto does not export X509_free"
 
   test "cbRequire raises when the server offers only SCRAM-SHA-256":
     # The mock server cannot speak TLS, so the offered-mechanism check is only
@@ -2301,12 +2312,17 @@ suite "selectScramMechanism":
           serverCertDer = cert,
           saslMechanisms = @["SCRAM-SHA-256-PLUS"],
           mode = mode,
+          certMissing = "OpenSSL returned no server certificate",
         )
       except PgConnectionError as e:
         err = e
       require err != nil
       check not (err of PgSecurityError)
-      check "server only offered SCRAM-SHA-256-PLUS" in err.msg
+      check err.msg ==
+        "server only offered SCRAM-SHA-256-PLUS, but " & (
+          if mode == cbPrefer: "OpenSSL returned no server certificate"
+          else: "channel binding is disabled"
+        )
 
   test "require_auth leaving only SCRAM-SHA-256-PLUS it cannot bind is refused":
     for (mode, cert) in [(cbDisable, fakeCert), (cbPrefer, newSeq[byte]())]:
@@ -2324,7 +2340,9 @@ suite "selectScramMechanism":
         err = e
       require err != nil
       check err of PgSecurityError
-      check "require_auth allows only SCRAM-SHA-256-PLUS" in err.msg
+      check err.msg ==
+        "require_auth allows only SCRAM-SHA-256-PLUS, but " &
+        (if mode == cbPrefer: ServerCertUnavailable else: "channel binding is disabled")
 
   test "require_auth=scram-sha-256 admits SCRAM-SHA-256-PLUS":
     for mode in [cbPrefer, cbRequire]:
@@ -2357,6 +2375,7 @@ suite "selectScramMechanism":
       check choice.cbType == ""
       check choice.cbData.len == 0
       check choice.cbSupportedButUnused == false
+      check choice.cbLost == (mode == cbPrefer)
 
 when hasAsyncDispatch and defined(ssl):
   # Self-signed test certificates (DER, base64). Regenerate with:

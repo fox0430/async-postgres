@@ -9,6 +9,61 @@
 ## Select at compile time with ``-d:asyncBackend=asyncdispatch`` (default) or
 ## ``-d:asyncBackend=chronos``.
 ##
+## TLS backend differences
+## -----------------------
+## asyncdispatch uses OpenSSL (``-d:ssl``) and chronos uses BearSSL (via
+## nim-bearssl).
+##
+## ==========================  ======================================  ====================================
+## Behavior                    asyncdispatch (OpenSSL)                 chronos (BearSSL)
+## ==========================  ======================================  ====================================
+## Negotiated TLS              1.2 minimum, 1.3 when offered           Pinned to 1.2
+## Expired/not-yet-valid cert  Accepted (not verified) under           Handshake fails with
+##                             ``allow``/``prefer``/``require``        ``PgConnectionError``
+## IP host, ``verify-full``    Verifies IP SANs (``PgSecurityError``   Refused with ``PgSecurityError``
+##                             if OpenSSL lacks ``SSL_get0_param``     (dNSName SAN only)
+##                             or ``X509_VERIFY_PARAM_set1_ip_asc``)
+## SNI                         Every ``sslmode`` (except IP/empty      ``verify-full`` only; ``sslsni`` has
+##                             host, a host name of 256 bytes or       no effect
+##                             more, or ``sslsni=0``)
+## Host name >= 256 bytes      Under ``verify-full``: verified; the    Under ``verify-full``: refused with
+##                             ClientHello carries no SNI, with no     ``PgSecurityError``
+##                             notice
+## ``TRUSTED CERTIFICATE``     In ``sslrootcert``                      Skipped, so the CA is not trusted
+##                             (``openssl x509 -trustout``): aux       (``PgConfigError`` if no other CA is
+##                             trust settings honoured                 left); export CAs as plain
+##                                                                     ``CERTIFICATE``
+## Client cert, key, root CA   Staged as temp files (owner-only on     Decoded in memory
+##                             POSIX, ``/dev/shm`` preferred on
+##                             Linux), deleted once loaded
+## ALPN ``postgresql``         Sent unless libssl lacks                Always sent
+##                             ``SSL_CTX_set_alpn_protos`` (then
+##                             traditional mode sends none and
+##                             direct mode fails); if that call
+##                             errors, the connect fails in either
+##                             mode
+## ==========================  ======================================  ====================================
+##
+## Both backends trust only the pinned ``sslrootcert`` (no system store),
+## enforce ALPN for ``sslnegotiation=direct`` only, and drop from
+## SCRAM-SHA-256-PLUS to SCRAM-SHA-256 under ``channel_binding=prefer`` when
+## the server certificate is unavailable (``require`` fails the connect on
+## both).
+##
+## Downgrade and fallback notices
+## ------------------------------
+## These go to stderr only, one ``pg_connection:`` line per event:
+##
+## - the ``sslmode=prefer`` plaintext fallback after the server refuses SSL
+## - a client certificate that will not be sent (no TLS support, a Unix-socket
+##   connection, or that plaintext fallback, which then writes two lines)
+## - ``channel_binding=prefer`` passing over an offered SCRAM-SHA-256-PLUS for
+##   lack of a server certificate (written once startup completes)
+## - temp-file cleanup failures
+##
+## They are not reported to ``PgTracer`` and cannot be hooked, filtered, or
+## suppressed; a notification hook is future work.
+##
 ## Quick Start
 ## ===========
 ##
