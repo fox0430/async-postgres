@@ -141,6 +141,7 @@ when hasChronos:
         doAssert skipped[][0].reason == csrCleanupFailed
         doAssert skipped[][0].parentMsg == "boom",
           "the cleanup Defect must be preserved as parent of the reported error"
+        doAssert conn.state == csClosed, "the wire state after a Defect is unknown"
 
         # Windows cannot see the server's FIN, so close() still sends Terminate.
         conn.writer = origWriter
@@ -189,6 +190,7 @@ when hasChronos:
         doAssert skipped[][0].reason == csrCleanupFailed
         doAssert skipped[][0].parentMsg == "boom",
           "the cleanup Defect must be preserved as parent of the reported error"
+        doAssert conn.state == csClosed, "the wire state after a Defect is unknown"
 
         # Windows cannot see the server's FIN, so close() still sends Terminate.
         conn.writer = origWriter
@@ -512,3 +514,87 @@ when hasChronos:
         await closeServer(ms)
 
       waitFor t()
+
+# The ROLLBACK's Defect comes from the tracer's `onQueryStart`, which both
+# backends call before the ROLLBACK reaches the wire.
+import std/[unittest, strutils]
+import ../async_postgres/[pg_client, pg_connection]
+import mock_pg_server
+
+proc rollbackDefectTracer(): (PgTracer, ref seq[TraceCleanupSkippedData]) =
+  let log = new seq[TraceCleanupSkippedData]
+  let tracer = PgTracer()
+  tracer.onQueryStart = proc(
+      conn: PgConnection, data: TraceQueryStartData
+  ): TraceContext {.gcsafe, raises: [].} =
+    if data.sql == "ROLLBACK":
+      raise newException(AssertionDefect, "rollback boom")
+  tracer.onCleanupSkipped = proc(data: TraceCleanupSkippedData) {.gcsafe, raises: [].} =
+    log[].add(data)
+  (tracer, log)
+
+proc failInTransaction(
+    useQuery: bool
+): Future[(ref PgQueryError, seq[TraceCleanupSkippedData], PgConnState)] {.async.} =
+  ## Run a failing `execInTransaction`/`queryInTransaction` whose ROLLBACK
+  ## raises a Defect; return the caught error, the cleanup events and the
+  ## connection state afterwards.
+  let ms = startMockServer()
+  proc serverHandler() {.async.} =
+    let client = await acceptAndReady(ms)
+    while true:
+      let (msgType, _) = await drainFrontendMessage(client)
+      if msgType == 'S':
+        break
+    var reply = buildCommandComplete("BEGIN")
+    reply.add(buildErrorResponse("23505", "query boom"))
+    reply.add(buildReadyForQuery('E'))
+    await client.sendBytes(reply)
+    await closeClient(client)
+
+  let serverFut = serverHandler()
+  let (tracer, skipped) = rollbackDefectTracer()
+  let conn = await connect(
+    ConnConfig(
+      host: "127.0.0.1",
+      port: ms.port,
+      user: "test",
+      database: "test",
+      sslMode: sslDisable,
+      tracer: tracer,
+    )
+  )
+  var caught: ref PgQueryError = nil
+  try:
+    if useQuery:
+      discard await conn.queryInTransaction("SELECT 1")
+    else:
+      discard await conn.execInTransaction("INSERT INTO t VALUES (1)")
+  except PgQueryError as e:
+    caught = e
+  let state = conn.state
+  await serverFut
+  try:
+    await conn.close()
+  except CatchableError:
+    discard
+  await closeServer(ms)
+  return (caught, skipped[], state)
+
+suite "execInTransaction/queryInTransaction ROLLBACK Defect":
+  for useQuery in [false, true]:
+    let name = if useQuery: "queryInTransaction" else: "execInTransaction"
+    test name &
+      ": the Defect is reported, retires the connection and never masks the query error":
+      let (caught, skipped, state) = waitFor failInTransaction(useQuery)
+      check caught != nil
+      check caught.sqlState == "23505"
+      check skipped.len == 1
+      check skipped[0].kind == ckTxRollback
+      check skipped[0].reason == csrCleanupFailed
+      check skipped[0].err != nil
+      check skipped[0].err.parent != nil
+      # asyncdispatch appends an async traceback to the message.
+      check "rollback boom" in skipped[0].err.parent.msg
+      # The wire state after a Defect is unknown.
+      check state == csClosed

@@ -218,6 +218,7 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
   let cleanupErrSym = macroSym(nskLet, "cleanupErr")
   let cleanupCancelSym = macroSym(nskLet, "cleanupCancel")
   let cleanupDefectSym = macroSym(nskLet, "cleanupDefect")
+  let fireCleanupDefectSym = bindSym"fireCleanupDefect"
   let csReadySym = bindSym"csReady"
   let stateSym = bindSym"state"
   let txStatusSym = bindSym"txStatus"
@@ -241,14 +242,7 @@ proc buildRollbackCleanup*(connSym, rollbackTimeout: NimNode): NimNode =
           `connSym`, `ckTxRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
         )
       except Defect as `cleanupDefectSym`:
-        # Same-frame Defect from the ROLLBACK: report and swallow like any
-        # cleanup failure, so it can't replace the body error being re-raised.
-        `fireCleanupSkippedSym`(
-          `connSym`,
-          `ckTxRollbackSym`,
-          `csrCleanupFailedSym`,
-          newException(PgError, `cleanupDefectSym`.msg, `cleanupDefectSym`),
-        )
+        `fireCleanupDefectSym`(`connSym`, `ckTxRollbackSym`, `cleanupDefectSym`)
 
 proc buildSavepointRollbackCleanup(
     connSym, spNameSym, rollbackTimeout: NimNode
@@ -265,6 +259,7 @@ proc buildSavepointRollbackCleanup(
   let cleanupErrSym = macroSym(nskLet, "cleanupErr")
   let cleanupCancelSym = macroSym(nskLet, "cleanupCancel")
   let cleanupDefectSym = macroSym(nskLet, "cleanupDefect")
+  let fireCleanupDefectSym = bindSym"fireCleanupDefect"
   let csReadySym = bindSym"csReady"
   let stateSym = bindSym"state"
   let txStatusSym = bindSym"txStatus"
@@ -290,15 +285,7 @@ proc buildSavepointRollbackCleanup(
           `connSym`, `ckSpRollbackSym`, `csrCleanupFailedSym`, `cleanupErrSym`
         )
       except Defect as `cleanupDefectSym`:
-        # Same-frame Defect from the ROLLBACK TO SAVEPOINT: report and swallow
-        # like any cleanup failure, so it can't replace the body error being
-        # re-raised.
-        `fireCleanupSkippedSym`(
-          `connSym`,
-          `ckSpRollbackSym`,
-          `csrCleanupFailedSym`,
-          newException(PgError, `cleanupDefectSym`.msg, `cleanupDefectSym`),
-        )
+        `fireCleanupDefectSym`(`connSym`, `ckSpRollbackSym`, `cleanupDefectSym`)
 
 proc buildDeadlineAwaitAndTimeout(
     connSym, bodyFnSym, totalDurSym: NimNode, reason: string, catchableCleanup: NimNode

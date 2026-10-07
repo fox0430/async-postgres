@@ -75,6 +75,8 @@ template rollbackFailedTx(
       raise e
     except CatchableError as rollbackErr:
       conn.fireCleanupSkipped(ckTxRollback, csrCleanupFailed, rollbackErr)
+    except Defect as rollbackDefect:
+      conn.fireCleanupDefect(ckTxRollback, rollbackDefect)
 
 proc queryInTransactionImpl(
     conn: PgConnection,

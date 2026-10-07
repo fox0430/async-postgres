@@ -1689,6 +1689,33 @@ proc parseBackendMessage*(
   consumed = totalLen
   result = ParseResult(state: psComplete, message: msg)
 
+func typeByte*(kind: BackendMessageKind): char =
+  ## The protocol type byte of ``kind``, for error messages.
+  case kind
+  of bmkAuthenticationOk .. bmkAuthenticationSASLFinal: 'R'
+  of bmkBackendKeyData: 'K'
+  of bmkBindComplete: '2'
+  of bmkCloseComplete: '3'
+  of bmkCommandComplete: 'C'
+  of bmkCopyInResponse: 'G'
+  of bmkCopyOutResponse: 'H'
+  of bmkCopyBothResponse: 'W'
+  of bmkCopyData: 'd'
+  of bmkCopyDone: 'c'
+  of bmkDataRow: 'D'
+  of bmkEmptyQueryResponse: 'I'
+  of bmkErrorResponse: 'E'
+  of bmkNegotiateProtocolVersion: 'v'
+  of bmkNoData: 'n'
+  of bmkNoticeResponse: 'N'
+  of bmkNotificationResponse: 'A'
+  of bmkParameterDescription: 't'
+  of bmkParameterStatus: 'S'
+  of bmkParseComplete: '1'
+  of bmkPortalSuspended: 's'
+  of bmkReadyForQuery: 'Z'
+  of bmkRowDescription: 'T'
+
 # Utility
 
 proc formatError*(fields: seq[ErrorField]): string =

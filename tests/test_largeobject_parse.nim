@@ -9,7 +9,7 @@
 ## `loCreate`) against a scripted mock server, so the call sites that consume
 ## these parsers are covered too — not just the private helpers.
 
-import std/[unittest, strutils, importutils]
+import std/[unittest, strutils, sequtils, importutils]
 
 import ../async_postgres/[async_backend, pg_connection]
 import ../async_postgres/pg_errors
@@ -40,13 +40,28 @@ proc buildScalarResult(value, tag: string): seq[byte] =
   result.add(buildCommandComplete(tag))
   result.add(buildReadyForQuery('I'))
 
-proc serveScalarResults(ms: MockServer, values: seq[string]) {.async.} =
-  ## Answer each extended query with the corresponding scalar text.
+proc serveReplies(ms: MockServer, replies: seq[seq[byte]]) {.async.} =
+  ## Answer each extended query with the corresponding raw reply.
   let client = await acceptAndReady(ms)
-  for value in values:
+  for reply in replies:
     await drainUntilSync(client)
-    await sendBytes(client, buildScalarResult(value, "SELECT 1"))
+    await sendBytes(client, reply)
   await closeClient(client)
+
+proc buildLoReadReply(
+    row: seq[byte], fields = @[("loread", 17'i32, -1'i16)]
+): seq[byte] =
+  ## Extended-protocol reply to `loread` with `row` as its DataRows (none if empty).
+  result.add(buildBackendMsg('1', @[])) # ParseComplete
+  result.add(buildBackendMsg('2', @[])) # BindComplete
+  result.add(buildRowDescriptionFields(fields))
+  result.add(row)
+  result.add(buildCommandComplete(if row.len == 0: "SELECT 0" else: "SELECT 1"))
+  result.add(buildReadyForQuery('I'))
+
+proc serveScalarResults(ms: MockServer, values: seq[string]): Future[void] =
+  ## Answer each extended query with the corresponding scalar text.
+  serveReplies(ms, values.mapIt(buildScalarResult(it, "SELECT 1")))
 
 suite "Large Object result parsers":
   test "parseLoInt32 accepts the full int32 range":
@@ -183,6 +198,39 @@ suite "Large Object parsers: hostile server text via the public API":
       await closeServer(ms)
 
     waitFor t()
+
+suite "Large Object loRead: an answer without a value is not EOF":
+  proc loReadError(reply: seq[byte]): Future[ref PgError] {.async.} =
+    let ms = startMockServer()
+    let serverFut = serveReplies(ms, @[reply])
+    let conn = await connect(mockConfig(ms.port))
+    let lo = LargeObject(conn: conn, fd: 0, oid: Oid(1))
+    try:
+      discard await lo.loRead(16)
+    except PgError as e:
+      result = e
+    try:
+      await conn.close()
+    except CatchableError:
+      discard
+    await serverFut
+    await closeServer(ms)
+
+  test "no rows raises PgNoRowsError":
+    let err = waitFor loReadError(buildLoReadReply(@[]))
+    check err != nil
+    check err of PgNoRowsError
+
+  test "no columns raises PgTypeError":
+    let err = waitFor loReadError(buildLoReadReply(buildDataRowText([]), @[]))
+    check err != nil
+    check err of PgTypeError
+    check "no columns" in err.msg
+
+  test "a NULL value raises PgNullError":
+    let err = waitFor loReadError(buildLoReadReply(buildDataRowOpt([""], [true])))
+    check err != nil
+    check err of PgNullError
 
 suite "Large Object precondition errors (no server)":
   test "loRead rejects negative length with ValueError":

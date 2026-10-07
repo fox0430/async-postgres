@@ -201,7 +201,9 @@ proc loRead*(
     lo: LargeObject, length: int32, timeout: Duration = ZeroDuration
 ): Future[seq[byte]] {.async.} =
   ## Read up to ``length`` bytes from the current position.
-  ## Returns the bytes read (may be fewer than ``length`` at EOF).
+  ## Returns the bytes read (may be fewer than ``length`` at EOF). Raises
+  ## ``PgNoRowsError``/``PgTypeError``/``PgNullError`` if the server answers
+  ## without a value.
   if length < 0:
     raise newException(ValueError, "loRead: length must be non-negative")
   let qr = await lo.conn.query(
@@ -210,11 +212,14 @@ proc loRead*(
     resultFormat = rfBinary,
     timeout = timeout,
   )
+  # Not EOF (that is an empty bytea): an empty answer would end loReadAll early.
   if qr.rowCount == 0:
-    return @[]
+    raise newException(PgNoRowsError, "loread returned no rows")
+  if qr.data.numCols == 0:
+    raise newException(PgTypeError, "loread returned no columns")
   let row = initRow(qr.data, 0)
   if row.isNull(0):
-    return @[]
+    raise newException(PgNullError, "loread returned NULL")
   return row.getBytes(0)
 
 proc loWrite*(
