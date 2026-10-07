@@ -135,24 +135,35 @@ nim c -d:asyncBackend=chronos your_app.nim
 
 **chronos is recommended.** chronos supports proper future cancellation, which enables reliable timeout handling and clean connection teardown. asyncdispatch lacks real cancellation — timed-out futures continue running in the background, and `cancelAndWait` is a no-op.
 
-SSL backend differs by async backend:
-- asyncdispatch: OpenSSL (requires `-d:ssl`; without it `sslmode=prefer`/`allow`
-  connect in plaintext, and settings that need TLS raise `PgConfigError`)
-- chronos: BearSSL (via [nim-bearssl](https://github.com/status-im/nim-bearssl); TLS 1.2 only due to BearSSL limitation)
+SSL backend differs by async backend (`asyncdispatch`: OpenSSL, `chronos`:
+BearSSL via [nim-bearssl](https://github.com/status-im/nim-bearssl)).
+Without `-d:ssl`, `sslmode=prefer`/`allow` on asyncdispatch connect in
+plaintext (with a stderr notice only if a client certificate is configured),
+and settings that need TLS raise `PgConfigError`. Differences to weigh when
+choosing a backend:
+
+- chronos negotiates TLS 1.2 only; asyncdispatch also uses 1.3 when offered.
+- chronos fails the handshake on an expired or not-yet-valid server
+  certificate even under `allow`/`prefer`/`require`, where asyncdispatch does
+  not check it.
+- chronos refuses `verify-full` to an IP-literal host.
+- chronos sends SNI only under `verify-full` (`sslsni` has no effect).
+
+The [API docs](https://fox0430.github.io/async-postgres/async_postgres.html#async-backend)
+list every TLS difference and the downgrade notices, which go to stderr only
+(not to `PgTracer`) and cannot be suppressed.
 
 Client certificate authentication (mTLS) is enabled by setting `sslCert` and
 `sslKey` on `ConnConfig` (or `sslcert=` / `sslkey=` in a DSN, which load the
 files from disk). Both must be provided together, and `sslMode` must be
 `sslPrefer` or stronger (otherwise it is rejected at config time). The key
 must be an **unencrypted** PKCS#8, PKCS#1 or SEC1 PEM; no passphrase callback
-is wired up on either backend. On chronos, `TRUSTED CERTIFICATE` blocks
-(`openssl x509 -trustout`) are ignored in `sslrootcert` because BearSSL cannot
-honour their trust settings; export CAs as plain `CERTIFICATE`. When loaded
-via DSN on POSIX, the `sslkey` file must have no group or world permission
-bits (stricter than libpq's `0o640` for root-owned keys); use `chmod 0600`.
+is wired up on either backend. When loaded via DSN on POSIX, the `sslkey` file
+must have no group or world permission bits (stricter than libpq's `0o640` for
+root-owned keys); use `chmod 0600`.
 
 Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
-stronger. On the chronos backend it needs chronos >= 4.4.0 for ALPN support.
+stronger.
 
 ## Examples
 

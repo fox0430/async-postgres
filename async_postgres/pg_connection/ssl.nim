@@ -13,6 +13,11 @@
 ##   trust anchors written to a temp file and `SSL_get_peer_certificate` used
 ##   for channel binding.
 ##
+## User-visible backend differences and the stderr-only downgrade notices are
+## listed in the ``async_postgres`` module doc ("Async Backend"), and the ones
+## that matter for choosing a backend again in the README; update both with any
+## behavior change here.
+##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[net, strutils]
@@ -634,6 +639,8 @@ when hasTls:
           )
 
         let hostname = sniName(sslHost, config.sslSni)
+        # asyncnet discards SSL_set_tlsext_host_name's result, so a name over
+        # OpenSSL's 255-byte limit goes out without SNI (stated in the module doc).
         wrapConnectedSocket(ctx, conn.socket, handshakeAsClient, hostname)
         # asyncnet skips name matching; make OpenSSL enforce it during handshake.
         if config.sslMode == sslVerifyFull:
@@ -646,25 +653,27 @@ when hasTls:
         if direct:
           assertAlpnPostgres(getSelectedAlpnOpenssl(conn.socket.sslHandle))
         conn.sslEnabled = true
-        # Extract server certificate DER for SCRAM-SHA-256-PLUS channel binding.
-        # If unavailable, cbPrefer silently falls back to SCRAM-SHA-256 — warn
-        # so the loss of channel binding is observable. (cbRequire is enforced
-        # in selectScramMechanism.)
-        if sslGetPeerCertificate == nil or x509Free == nil:
-          warnStderr "pg_connection: OpenSSL does not expose peer-certificate functions; SCRAM-SHA-256-PLUS channel binding unavailable"
+        # Server certificate DER for SCRAM-SHA-256-PLUS channel binding. When
+        # unavailable, the cause is kept for authentication to report.
+        if sslGetPeerCertificate == nil:
+          conn.setServerCertMissing(
+            "libssl exports neither SSL_get1_peer_certificate nor SSL_get_peer_certificate"
+          )
+        elif x509Free == nil:
+          conn.setServerCertMissing("libcrypto does not export X509_free")
         else:
           let peerCert = sslGetPeerCertificate(conn.socket.sslHandle)
-          if peerCert != nil:
+          if peerCert == nil:
+            conn.setServerCertMissing("OpenSSL returned no server certificate")
+          else:
             try:
               let derStr = i2d_X509(peerCert)
               if derStr.len > 0:
                 conn.setServerCertDer(toBytes(derStr))
               else:
-                warnStderr "pg_connection: server certificate DER encoding is empty; SCRAM-SHA-256-PLUS channel binding unavailable"
+                conn.setServerCertMissing("server certificate DER encoding is empty")
             finally:
               x509Free(peerCert)
-          else:
-            warnStderr "pg_connection: server certificate unavailable; SCRAM-SHA-256-PLUS channel binding unavailable"
       finally:
         # asyncnet doesn't free the SslContext (no =destroy on std/net's type).
         # SSL_new inside wrapConnectedSocket takes its own ref, so destroying
@@ -705,7 +714,11 @@ when hasTls:
 proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.async.} =
   ## Negotiate TLS (SSLRequest or Direct). ``sslHost`` is cert verification name.
   ## Only ``prefer`` falls back to plaintext on 'N'; without TLS in this build,
-  ## ``prefer`` and ``allow`` return at once.
+  ## ``prefer`` and ``allow`` return at once (a notice only if a client
+  ## certificate is configured).
+  ## Downgrade and fallback notices (plaintext fallback, dropped client
+  ## certificate) go to stderr only; no tracer event is emitted (full list in
+  ## the ``async_postgres`` module doc).
   ## Raises ``PgConfigError`` on an invalid config, ``PgProtocolError`` on a
   ## reply the server must not send, ``PgSecurityError`` on a security refusal
   ## (data trailing 'S' included), and ``PgConnectionError`` otherwise.

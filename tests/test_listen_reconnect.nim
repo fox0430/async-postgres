@@ -290,7 +290,7 @@ suite "reconnectInPlace host/port failover":
     check finalPort == portB
 
 suite "reconnectInPlace TLS field pairing":
-  test "serverCertDer is copied from the fresh connection":
+  test "serverCertDer and its missing reason are copied from the fresh connection":
     ## Regression: `reconnectInPlace` must overwrite `serverCertDer` from the fresh
     ## connection. Pre-fix the stale DER survived the swap, so any post-reconnect
     ## reader (SCRAM channel binding — since #470 the tls-server-end-point hash is
@@ -298,6 +298,7 @@ suite "reconnectInPlace TLS field pairing":
     ## matched the live transport.
     var preCertLen = -1
     var finalCertLen = -1
+    var missingCleared = false
 
     proc testBody() {.async.} =
       let ms = startMockServer()
@@ -311,10 +312,12 @@ suite "reconnectInPlace TLS field pairing":
       # Non-TLS mock leaves serverCertDer empty; seeding it distinguishes copy
       # from no-op.
       conn.serverCertDer = @[byte 0xDE, 0xAD, 0xBE, 0xEF]
+      conn.serverCertMissing = "stale reason"
       preCertLen = conn.serverCertDer.len
 
       await conn.reconnectInPlace()
       finalCertLen = conn.serverCertDer.len
+      missingCleared = conn.serverCertMissing.len == 0
 
       await serverFut
       try:
@@ -328,6 +331,7 @@ suite "reconnectInPlace TLS field pairing":
     waitFor testBody()
     check preCertLen == 4
     check finalCertLen == 0
+    check missingCleared
 
 suite "reconnectInPlace session state reset":
   ## Regression: reconnectInPlace must clear heldSessionLocks / sessionLockDirty

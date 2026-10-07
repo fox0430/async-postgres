@@ -439,10 +439,6 @@ proc rawHostLists(
   if samePorts:
     result.ports = @[result.ports[0]]
 
-const maxSockOptInt = int64(high(cint))
-  ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
-  ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
-
 when defined(linux):
   # The kernel's MAX_TCP_KEEPIDLE / MAX_TCP_KEEPINTVL / MAX_TCP_KEEPCNT. Past
   # them `setsockopt` fails at connect, which reads as a connection failure.
@@ -452,6 +448,9 @@ when defined(linux):
     maxKeepAliveCount = 127'i64
 else:
   const
+    maxSockOptInt = int64(high(cint))
+      ## Keepalive timings reach `setsockopt` as `cint`; a larger value would turn
+      ## into an uncatchable RangeDefect at connect time instead of a PgConfigError here.
     maxKeepAliveIdle = maxSockOptInt
     maxKeepAliveInterval = maxSockOptInt
     maxKeepAliveCount = maxSockOptInt
