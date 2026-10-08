@@ -208,6 +208,28 @@ suite "parseBackendMessage: per-kind malformed bodies":
       expectParseError:
         discard tryParse(wrap(kind, @[]))
 
+  test "ErrorResponse (E) / NoticeResponse (N) without the field-list terminator":
+    # The field itself is terminated, but the empty field type ('\0') that ends
+    # the list is missing, so the body simply runs out.
+    for kind in ['E', 'N']:
+      let body = @[byte('M'), byte('h'), byte('i'), 0'u8]
+      expectParseError:
+        discard tryParse(wrap(kind, body))
+
+  test "ErrorResponse (E) / NoticeResponse (N) with an empty field list":
+    # A lone terminator is well-framed but carries no fields at all, which would
+    # surface as a PgQueryError whose message is `formatError`'s bare ": ".
+    for kind in ['E', 'N']:
+      expectParseError:
+        discard tryParse(wrap(kind, @[byte 0]))
+
+  test "AuthenticationSASL without the mechanism-list terminator":
+    # One terminated mechanism, but no empty mechanism to end the list.
+    var body = @[byte 0, byte 0, byte 0, byte 10]
+    body.addCString("SCRAM-SHA-256")
+    expectParseError:
+      discard tryParse(wrap('R', body))
+
   test "ParameterStatus (S) missing value terminator":
     # "key\0" but value has no null.
     let body = @[byte('k'), byte('e'), byte('y'), 0'u8, byte('v'), byte('a')]

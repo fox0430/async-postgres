@@ -936,6 +936,20 @@ proc getBox*(row: Row, col: int): PgBox =
       newException(PgTypeError, "Column " & $col & ": Invalid box (len=" & $s.len & ")")
   PgBox(high: points[0], low: points[1])
 
+proc isPathLiteral(s: string): bool {.inline.} =
+  ## True when ``s`` is a whole path literal: ``(...)`` closed or ``[...]`` open.
+  ## ``parsePointsText`` sees only the bracket-free list, so a mismatched pair or
+  ## surrounding garbage is rejected here.
+  if s.len < 2:
+    return false
+  case s[0]
+  of '(':
+    s[^1] == ')'
+  of '[':
+    s[^1] == ']'
+  else:
+    false
+
 proc getPath*(row: Row, col: int): PgPath =
   ## Get a column value as PgPath. Handles binary format.
   ## In binary format the column OID must be path.
@@ -957,18 +971,18 @@ proc getPath*(row: Row, col: int): PgPath =
         PgTypeError,
         "Column " & $col & ": binary path has negative point count " & $npts,
       )
-    if npts > (clen - 5) div 16:
+    if int64(clen) != 5 + int64(npts) * 16:
       raise newException(
         PgTypeError,
-        "Column " & $col & ": binary path " & $npts & " points exceed " & $clen &
-          "-byte cell",
+        "Column " & $col & ": binary path " & $npts & " points need " &
+          $(5'i64 + int64(npts) * 16) & " bytes, cell has " & $clen,
       )
     result.points = newSeq[PgPoint](npts)
     for i in 0 ..< npts:
       result.points[i] = decodePointBinary(b, off + 5 + i * 16)
     return
   let s = row.getStr(col).strip()
-  if s.len < 2:
+  if not isPathLiteral(s):
     raise newException(
       PgTypeError, "Column " & $col & ": Invalid path (len=" & $s.len & ")"
     )
@@ -1001,11 +1015,11 @@ proc getPolygon*(row: Row, col: int): PgPolygon =
         PgTypeError,
         "Column " & $col & ": binary polygon has negative point count " & $npts,
       )
-    if npts > (clen - 4) div 16:
+    if int64(clen) != 4 + int64(npts) * 16:
       raise newException(
         PgTypeError,
-        "Column " & $col & ": binary polygon " & $npts & " points exceed " & $clen &
-          "-byte cell",
+        "Column " & $col & ": binary polygon " & $npts & " points need " &
+          $(4'i64 + int64(npts) * 16) & " bytes, cell has " & $clen,
       )
     result.points = newSeq[PgPoint](npts)
     for i in 0 ..< npts:
@@ -1595,7 +1609,7 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
 
 proc pathElemFromText(s: string): PgPath =
   let v = s.strip()
-  if v.len < 2:
+  if not isPathLiteral(v):
     raise newException(PgTypeError, "Invalid path (len=" & $v.len & ")")
   let closed = v[0] == '('
   let inner = v[1 ..^ 2]
@@ -1782,7 +1796,7 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
     {.
       error:
         "getArrayND[seq[byte]] is not supported by the PgArray registry. " &
-        "Use getByteaArray instead."
+        "Use getBytesArray instead."
     .}
   elif T is int:
     {.

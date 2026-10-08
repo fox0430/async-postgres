@@ -1149,6 +1149,64 @@ suite "type-decode failures omit cell content":
     check "len=" in msg
     check "Column 0" in msg
 
+  test "getPath text rejects a mismatched bracket pair":
+    # `(` must close with `)` and `[` with `]`; the point list alone does not
+    # tell the outer brackets apart.
+    for literal in ["((0,0),(1,1)]", "[(0,0),(1,1))"]:
+      let row = mkRow(@[some(toBytes(literal))], @[mkField(OidPath, 0)])
+      var msg = ""
+      try:
+        discard row.getPath(0)
+      except PgTypeError as e:
+        msg = e.msg
+      check msg.len > 0
+      check literal notin msg
+      check "Invalid path" in msg
+      check "Column 0" in msg
+
+  test "getPath text rejects a broken inner list":
+    # Matching outer brackets with a malformed inner list still raise (from
+    # parsePointsText), so nothing is silently sliced off.
+    for literal in ["((0,0),(1,1)", "[(0,0),(1,1]"]:
+      let row = mkRow(@[some(toBytes(literal))], @[mkField(OidPath, 0)])
+      expect PgTypeError:
+        discard row.getPath(0)
+
+  test "getPath text rejects surrounding garbage":
+    let row = mkRow(@[some(toBytes("X(0,0),(1,1)Y"))], @[mkField(OidPath, 0)])
+    var msg = ""
+    try:
+      discard row.getPath(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check "Invalid path" in msg
+
+  test "getPath text still accepts matching brackets":
+    for (literal, closed, points) in [
+      ("((0,0),(1,1))", true, 2),
+      ("[(0,0),(1,1)]", false, 2),
+      ("()", true, 0),
+      ("[]", false, 0),
+    ]:
+      let row = mkRow(@[some(toBytes(literal))], @[mkField(OidPath, 0)])
+      let v = row.getPath(0)
+      check v.closed == closed
+      check v.points.len == points
+
+  test "getPathArray text element rejects a mismatched bracket pair":
+    # Array elements holding commas arrive quoted; the helper sees the
+    # unwrapped literal.
+    let row =
+      mkRow(@[some(toBytes("{\"((0,0),(1,1)]\"}"))], @[mkField(OidPathArray, 0)])
+    var msg = ""
+    try:
+      discard row.getPathArray(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.len > 0
+    check "Invalid path" in msg
+
   test "getInterval failure omits input and names the column":
     const secret = "nonsense-SECRET-INTV-ROW-XYZ"
     let row = mkRow(@[some(toBytes(secret))], @[mkField(OidInterval, 0)])

@@ -1607,6 +1607,18 @@ suite "PgArray[T] registry compile-time errors":
     let r: Row = default(Row)
     check not compiles(getArrayND[seq[byte]](r, 0))
 
+  test "getArrayND[seq[byte]] guidance names an accessor that exists":
+    # The compile-time error points at `getBytesArray`; pin the text so the
+    # advice cannot drift back to the non-existent `getByteaArray`. Scoped to
+    # the pragma's own block, so an unrelated comment cannot fail the test.
+    const src = staticRead("../async_postgres/pg_types/accessors.nim")
+    const marker = "getArrayND[seq[byte]] is not supported"
+    let at = src.find(marker)
+    check at >= 0
+    let advice = src[at ..< min(src.len, at + 320)]
+    check "Use getBytesArray instead." in advice
+    check "getByteaArray" notin advice
+
   test "toPgParam(PgArray[int32]) still compiles":
     # Sanity: registered types remain usable.
     check compiles(toPgParam(default(PgArray[int32])))
