@@ -858,7 +858,7 @@ suite "type-decode failures omit cell content":
       msg = e.msg
     check msg.len > 0
     check secret notin msg
-    check "at position" in msg
+    check "pos=" in msg
     check "len=" in msg
 
   test "getJsonArray failure omits the element":

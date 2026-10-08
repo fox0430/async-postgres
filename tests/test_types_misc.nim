@@ -1366,3 +1366,32 @@ suite "PgBit construction validation":
 
   test "consistent PgBit still encodes":
     check toPgParam(initPgBit(4, @[0xA0'u8])).value.get == toBytes("1010")
+
+suite "decode errors report positions as (len=, pos=)":
+  # One shape for "where in the input did this fail" across the pg_types
+  # parsers; `pos` is a 0-based byte offset into the string being parsed.
+  template msgOf(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
+  test "hstore":
+    check msgOf(parseHstoreText("bad")) == "hstore: expected '\"' (len=3, pos=0)"
+    check msgOf(parseHstoreText("\"k\" bad")) == "hstore: expected '=>' (len=7, pos=4)"
+    check msgOf(parseHstoreText("\"k\"=>x")) ==
+      "hstore: expected NULL or quoted string (len=6, pos=5)"
+
+  test "point list":
+    check msgOf(parsePointsText("1,2")) == "Expected '(' in point list (len=3, pos=0)"
+    check msgOf(parsePointsText("(1,2")) == "Unmatched '(' in point list (len=4, pos=0)"
+
+  test "bytea hex decoder never reports a negative pos":
+    check msgOf(decodeHexPair("abc", -1, "ctx")) == "ctx: hex pair offset is negative"
+    check msgOf(decodeHexPair("abc", 2, "ctx")) ==
+      "ctx: hex pair out of range (len=3, pos=2)"
+    check msgOf(decodeHexPair(@[byte('a'), byte('b')], -1, "ctx")) ==
+      "ctx: hex pair offset is negative"

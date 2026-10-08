@@ -695,6 +695,78 @@ suite "Binary type decoders: malformed input":
     check decodeBinaryTsQuery(phrase(32000)) == "'a' <32000> 'b'"
     check decodeBinaryTsQuery(phrase(0xC000)) == "'a' <-16384> 'b'"
 
+# Message contract: `PgTypeError` reports input lengths/offsets only, never the
+# decoded wire value (see the `PgTypeError` docs in pg_errors.nim). Pinned so
+# the binary decoders cannot drift back to echoing the value that failed.
+
+suite "Binary decoders: errors expose no wire values":
+  template typeErrorMsg(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
+  test "numeric: sign and digit":
+    # ndigits=1, sign=0x1234 (outside {0x0000, 0x4000, 0xC000}), no digits.
+    check typeErrorMsg(decodeNumericBinary(@[byte 0, 1, 0, 0, 0x12, 0x34, 0, 0])) ==
+      "Numeric binary: invalid sign"
+    # sign=0, dscale=0, weight=0, one digit = 10000 (outside 0..9999).
+    check typeErrorMsg(decodeNumericBinary(@[byte 0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10])) ==
+      "Numeric binary: invalid digit at offset 8"
+
+  test "timestamp and time: only the allowed range is named":
+    # int64.high itself is the 'infinity' sentinel; one below it is a plain
+    # out-of-representable-range value.
+    check typeErrorMsg(decodeBinaryTimestamp(toBE64(int64.high - 1))) ==
+      "Binary timestamp out of representable range"
+    check typeErrorMsg(decodeBinaryTime(toBE64(-1))) ==
+      "Binary time: microseconds out of range (expected 0..86400000000)"
+    let timetz = @(toBE64(-1)) & newSeq[byte](4)
+    check typeErrorMsg(decodeBinaryTimeTz(timetz)) ==
+      "Binary timetz: microseconds out of range (expected 0..86400000000)"
+
+  test "inet: family, addrlen and mask":
+    check typeErrorMsg(decodeInetBinary(@[byte 99, 0, 0, 4, 192, 168, 0, 1])) ==
+      "Binary inet unknown family (expected 2 or 3)"
+    check typeErrorMsg(decodeInetBinary(@[byte 2, 32, 0, 16, 192, 168, 0, 1])) ==
+      "Binary inet IPv4 addrlen mismatch (expected 4)"
+    check typeErrorMsg(decodeInetBinary(@[byte 2, 33, 0, 4, 192, 168, 0, 1])) ==
+      "Binary inet IPv4 mask out of range (expected 0..32)"
+    var v6 = @[byte 3, 129, 0, 16]
+    v6.add(newSeq[byte](16))
+    check typeErrorMsg(decodeInetBinary(v6)) ==
+      "Binary inet IPv6 mask out of range (expected 0..128)"
+
+  test "array element and composite field lengths":
+    var arr = newSeq[byte](24)
+    arr.writeBE32(0, 1'i32) # ndim
+    arr.writeBE32(4, 0'i32) # has_null
+    arr.writeBE32(8, OidInt4) # elem_oid
+    arr.writeBE32(12, 1'i32) # dim_len
+    arr.writeBE32(16, 1'i32) # lower_bound
+    arr.writeBE32(20, -2'i32) # element length below -1
+    check typeErrorMsg(decodeBinaryArray(arr)) == "Binary array: invalid element length"
+
+    var comp = newSeq[byte](12)
+    comp.writeBE32(0, 1'i32) # numFields
+    comp.writeBE32(4, OidInt4) # field oid
+    comp.writeBE32(8, -2'i32) # field length below -1
+    check typeErrorMsg(decodeBinaryComposite(comp)) ==
+      "Binary composite: invalid field length"
+
+  test "tsquery: weight and token tags":
+    check typeErrorMsg(
+      decodeBinaryTsQuery(@[byte 0, 0, 0, 1, 1, 0x10, 0, byte('x'), 0])
+    ) == "tsquery binary: invalid weight"
+    check typeErrorMsg(decodeBinaryTsQuery(@[byte 0, 0, 0, 1, 2, 9])) ==
+      "Unknown tsquery operator (expected 1..4)"
+    # Every token needs at least 2 bytes, hence the padding byte.
+    check typeErrorMsg(decodeBinaryTsQuery(@[byte 0, 0, 0, 1, 9, 0])) ==
+      "Unknown tsquery token type (expected 1 or 2)"
+
 # Seeded random fuzz on binary type decoders
 
 suite "Binary type decoders: seeded random fuzz":

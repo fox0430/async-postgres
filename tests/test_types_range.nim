@@ -1303,3 +1303,33 @@ suite "Range array row getters":
     let fields = @[mkField(OidInt4RangeArray, 1'i16)]
     let row = mkRow(@[none(seq[byte])], fields)
     check row.getInt4RangeArrayOpt(0).isNone
+
+suite "range array element errors carry the column number":
+  template msgOf(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
+  test "text element failure names the column":
+    let row: Row = @[some(toBytes("{[1,2],nope}"))]
+    check msgOf(row.getInt4RangeArray(0)).startsWith("Column 0: ")
+
+  test "multirange text element failure names the column":
+    let row: Row = @[some(toBytes("{[1,2],nope}"))]
+    check msgOf(row.getInt4MultirangeArray(0)).startsWith("Column 0: ")
+
+  test "binary element failure names the column":
+    # flags = 0 (both bounds present) with no bound bytes after it, so the
+    # element decoder rejects the payload. (flags = 1 is a valid empty range.)
+    let payload = encodeBinaryArray(OidInt4Range, @[toBytes("\x00\x01")])
+    let row = mkRow(@[some(payload)], @[mkField(OidInt4RangeArray, 1)])
+    check msgOf(row.getInt4RangeArray(0)).startsWith("Column 0: ")
+
+  test "a NULL column stays single-prefixed":
+    let row = mkRow(@[none(seq[byte])], @[mkField(OidInt4RangeArray, 1)])
+    check msgOf(row.getInt4RangeArray(0)) == "Column 0 is NULL"
+    check msgOf(row.getInt4MultirangeArray(0)) == "Column 0 is NULL"
