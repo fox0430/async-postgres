@@ -52,6 +52,21 @@ when hasChronos:
   # Intercepts BearSSL X509 callbacks to capture the leaf certificate DER bytes,
   # then delegates to the original X509 engine for actual validation.
 
+  type X509AppendFn = proc(ctx: X509ClassPointerConst, buf: ConstPtrByte, len: csize_t) {.
+    cdecl, gcsafe, noSideEffect, raises: []
+  .}
+
+  # bearssl <= 0.2.13 declares `append` with plain `pointer`, which C++ and Nim
+  # devel reject; ConstPtrPtrSslrecInClass first appears in 0.2.14.
+  type X509AppendField = typeof(default(X509Class).append)
+  const legacyX509Append = not declared(ConstPtrPtrSslrecInClass)
+
+  template appendFn(cls: ptr X509Class): X509AppendFn =
+    when legacyX509Append:
+      cast[X509AppendFn](cls[].append)
+    else:
+      cls[].append
+
   proc x509CaptureStartChain(
       ctx: X509ClassPointerConst, serverName: ConstCstring
   ) {.cdecl.} =
@@ -78,9 +93,9 @@ when hasChronos:
       let n = int(len)
       let oldLen = self.certDer[].len
       self.certDer[].setLen(oldLen + n)
-      copyMem(addr self.certDer[][oldLen], buf, n)
+      copyMem(addr self.certDer[][oldLen], cast[pointer](buf), n)
     let inner = cast[ptr ptr X509Class](self.inner)
-    inner[].append(inner, buf, len)
+    appendFn(inner[])(inner, buf, len)
 
   proc x509CaptureEndCert(ctx: X509ClassPointerConst) {.cdecl.} =
     let self = cast[ptr X509CertCaptureContext](ctx)
@@ -106,7 +121,11 @@ when hasChronos:
     contextSize: uint(sizeof(X509CertCaptureContext)),
     startChain: x509CaptureStartChain,
     startCert: x509CaptureStartCert,
-    append: x509CaptureAppend,
+    append:
+      when legacyX509Append:
+        cast[X509AppendField](X509AppendFn(x509CaptureAppend))
+      else:
+        X509AppendFn(x509CaptureAppend),
     endCert: x509CaptureEndCert,
     endChain: x509CaptureEndChain,
     getPkey: x509CaptureGetPkey,
