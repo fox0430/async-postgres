@@ -88,12 +88,15 @@ when hasChronos:
       ctx: X509ClassPointerConst, buf: ConstPtrByte, len: csize_t
   ) {.cdecl, raises: [].} =
     let self = cast[ptr X509CertCaptureContext](ctx)
-    # int(len) trap: Defect out of a cdecl frame into C is UB. Inner still gets raw csize_t.
-    if self.capturing and len <= csize_t(high(int)):
-      let n = int(len)
+    # int(len), oldLen + n and addr s[oldLen] on an empty chunk trap: Defect
+    # out of a cdecl frame into C is UB.
+    # Inner still gets raw csize_t.
+    if self.capturing:
       let oldLen = self.certDer[].len
-      self.certDer[].setLen(oldLen + n)
-      copyMem(addr self.certDer[][oldLen], cast[pointer](buf), n)
+      if len > 0 and len <= csize_t(high(int) - oldLen):
+        let n = int(len)
+        self.certDer[].setLen(oldLen + n)
+        copyMem(addr self.certDer[][oldLen], cast[pointer](buf), n)
     let inner = cast[ptr ptr X509Class](self.inner)
     appendFn(inner[])(inner, buf, len)
 

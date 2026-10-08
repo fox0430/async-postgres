@@ -28,6 +28,7 @@ when hasChronos:
   import ../async_postgres/pg_bearssl {.all.}
   import chronos/streams/tlsstream
   import bearssl/abi/bearssl_ssl as bssl
+  import bearssl/x509
 
 proc testCaCert(): string =
   doAssert ensureTestCerts(),
@@ -3065,6 +3066,51 @@ when hasChronos:
         cast[pointer](addr buf), cast[pointer](unsafeAddr src[0]), csize_t.high
       )
       check buf.len == 0
+
+    type InnerEngine = object
+      vtable: ptr X509Class # BearSSL passes the address of this first field
+      gotLen: csize_t
+
+    proc innerAppend(
+        ctx: X509ClassPointerConst, buf: ConstPtrByte, len: csize_t
+    ) {.cdecl, gcsafe, raises: [].} =
+      cast[ptr InnerEngine](ctx).gotLen = len
+
+    proc captureAppend(
+        der: var seq[byte], src: openArray[byte], len: csize_t
+    ): csize_t =
+      ## Returns the len the inner engine received.
+      # Field spelling differs across bearssl versions; see pg_bearssl.
+      var innerVtable =
+        X509Class(append: cast[typeof(default(X509Class).append)](innerAppend))
+      var inner = InnerEngine(vtable: addr innerVtable, gotLen: high(csize_t))
+      var cap = X509CertCaptureContext(
+        inner: cast[X509ClassPointerConst](addr inner),
+        certDer: addr der,
+        capturing: true,
+      )
+      x509CaptureAppend(
+        cast[X509ClassPointerConst](addr cap),
+        cast[ConstPtrByte](unsafeAddr src[0]),
+        len,
+      )
+      inner.gotLen
+
+    test "x509CaptureAppend skips a chunk whose length overflows the buffer":
+      var der = @[byte 0x33]
+      let hugeLen = csize_t(high(int))
+      check captureAppend(der, [byte 0x44], hugeLen) == hugeLen
+      check der == @[byte 0x33]
+
+    test "x509CaptureAppend accepts a zero-length chunk":
+      var der: seq[byte]
+      check captureAppend(der, [byte 0x55], 0) == 0
+      check der.len == 0
+
+    test "x509CaptureAppend appends a chunk and forwards it":
+      var der = @[byte 0x33]
+      check captureAppend(der, [byte 0x44, 0x45], 2) == 2
+      check der == @[byte 0x33, 0x44, 0x45]
 
 when hasChronos:
   import chronos/streams/asyncstream
