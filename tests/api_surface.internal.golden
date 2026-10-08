@@ -261,6 +261,7 @@ async_postgres/pg_connection/types.nim	fillRecvBuf
 async_postgres/pg_connection/types.nim	fillRecvBufDetached
 async_postgres/pg_connection/types.nim	finishTls
 async_postgres/pg_connection/types.nim	fireAdvisoryUnlockFailed
+async_postgres/pg_connection/types.nim	fireCleanupDefect
 async_postgres/pg_connection/types.nim	fireCleanupSkipped
 async_postgres/pg_connection/types.nim	fireDeprecatedAuth
 async_postgres/pg_connection/types.nim	fireInsecureAuth
@@ -434,6 +435,7 @@ async_postgres/pg_protocol.nim	startupDatabaseKey
 async_postgres/pg_protocol.nim	startupFixedBytes
 async_postgres/pg_protocol.nim	startupParamBytes
 async_postgres/pg_protocol.nim	startupUserKey
+async_postgres/pg_protocol.nim	typeByte
 async_postgres/pg_protocol.nim	withAtomicMessage
 async_postgres/pg_saslprep.nim	saslprep
 async_postgres/pg_types/accessors.nim	cellInfo

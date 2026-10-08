@@ -1657,6 +1657,13 @@ proc markClosed*(conn: PgConnection) {.inline, raises: [].} =
   ## down yet or not.
   conn.markState(csClosed)
 
+proc fireCleanupDefect*(conn: PgConnection, kind: CleanupKind, d: ref Defect) =
+  ## Swallow a same-frame Defect from a ROLLBACK cleanup so it can't replace the
+  ## error being re-raised. The wire state is unknown, so the connection is
+  ## retired; the Defect is reported as the parent of a ``PgError``.
+  conn.markClosed()
+  conn.fireCleanupSkipped(kind, csrCleanupFailed, newException(PgError, d.msg, d))
+
 proc isUtf8EncodingName*(val: string): bool =
   ## Whether ``val`` is one of the server's spellings of UTF8
   ## (``pg_char_to_encoding`` ignores case and punctuation).

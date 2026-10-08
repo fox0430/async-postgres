@@ -642,7 +642,13 @@ proc connectToHostImpl(
           of bmkErrorResponse:
             raise startupError(msg.errorFields)
           else:
-            discard
+            # As libpq: skipping it would wait for an AuthenticationOk that
+            # never comes.
+            raise newException(
+              PgProtocolError,
+              "expected authentication request from server, but received '" &
+                msg.kind.typeByte & "'",
+            )
         await conn.fillRecvBuf()
 
     # Collect ParameterStatus, BackendKeyData until ReadyForQuery
@@ -662,7 +668,12 @@ proc connectToHostImpl(
           of bmkErrorResponse:
             raise startupError(msg.errorFields)
           else:
-            discard
+            # Skipping it would wait for a ReadyForQuery that may never come.
+            raise newException(
+              PgProtocolError,
+              "expected BackendKeyData or ReadyForQuery from server, but received '" &
+                msg.kind.typeByte & "'",
+            )
         await conn.fillRecvBuf()
 
     # A proxy may drop the startup value. A SET in its place would not outlive

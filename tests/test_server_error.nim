@@ -293,6 +293,21 @@ suite "serverError on startup":
     # Not a failed fork: a server before protocol 3.0, or not PostgreSQL.
     check not isTransientError(err)
 
+  test "a message other than an authentication request fails the startup":
+    # Skipping it would wait for an AuthenticationOk that never comes.
+    let err = waitFor connectErrorOn(@[buildReadyForQuery()])
+    check err != nil
+    check err.parent of PgProtocolError
+    check "expected authentication request from server, but received 'Z'" in err.msg
+
+  test "a message other than BackendKeyData or ReadyForQuery after AuthenticationOk fails the startup":
+    # Skipping it would wait for a ReadyForQuery that may never come.
+    let err = waitFor connectErrorOn(@[buildAuthOk(), buildAuthCleartextPassword()])
+    check err != nil
+    check err.parent of PgProtocolError
+    check "expected BackendKeyData or ReadyForQuery from server, but received 'R'" in
+      err.msg
+
   test "an empty pre-3.0 error text gets a fallback message":
     let err = waitFor connectErrorOn(@[buildPreV3Error("")])
     check err != nil
