@@ -2949,6 +2949,25 @@ when hasChronos:
       check EncryptedKeyMsg ==
         loadKeyError(legacyEncryptedKey.replace("RSA PRIVATE", "DSA PRIVATE") & plain)
 
+    test "unsupported key types are named, not reported as missing":
+      const dsa =
+        "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n-----END DSA PRIVATE KEY-----\n"
+      const openssh =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+      const unsupportedDsa =
+        "Unsupported private key type DSA PRIVATE KEY; use PKCS#8/PKCS#1/SEC1"
+      check unsupportedDsa == loadKeyError(dsa)
+      check "Unsupported private key type OPENSSH PRIVATE KEY; use PKCS#8/PKCS#1/SEC1" ==
+        loadKeyError(openssh)
+      # The first unsupported banner is the one named.
+      check unsupportedDsa == loadKeyError(dsa & openssh)
+      # A readable key still wins, whether it comes after the banner or before.
+      check loadPrivateKey(dsa & readCertFile("wrong_ca.rsa.key")) != nil
+      # Certificates and empty supported blocks keep the plain miss.
+      check "Could not find private key" == loadKeyError(testCaCert())
+      check "Could not find private key" ==
+        loadKeyError("-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n")
+
     test "truncated key blocks are reported as malformed":
       for key in [pkcs8EncryptedKey, legacyEncryptedKey]:
         let truncated = key[0 ..< key.find("-----END")]

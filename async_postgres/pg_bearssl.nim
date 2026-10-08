@@ -266,7 +266,11 @@ when hasChronos:
   ): TLSPrivateKey {.raises: [TLSStreamProtocolError].} =
     ## `TLSPrivateKey.init` that also accepts every `KeyPemLabels` banner via
     ## chronos's DER overload. Loads the first non-empty such block; an
-    ## encrypted key block before it raises `EncryptedKeyMsg`.
+    ## encrypted key block before it raises `EncryptedKeyMsg`. A `*PRIVATE KEY`
+    ## banner BearSSL cannot read (DSA, OpenSSH, ...) is skipped in favour of a
+    ## later supported block, but when none is found the error names the
+    ## unsupported type instead of claiming the PEM holds no key.
+    var unsupported = ""
     for b in pemBlocks(pem):
       if not b.label.endsWith("PRIVATE KEY"):
         continue
@@ -282,6 +286,13 @@ when hasChronos:
         let data = decode(b)
         if data.len > 0:
           return TLSPrivateKey.init(data)
+      elif unsupported.len == 0:
+        unsupported = b.label
+    if unsupported.len > 0:
+      raise newException(
+        TLSStreamProtocolError,
+        "Unsupported private key type " & unsupported & "; use PKCS#8/PKCS#1/SEC1",
+      )
     raise newException(TLSStreamProtocolError, "Could not find private key")
 
   proc parseTrustAnchors*(pemData: string): TrustAnchorResult =
