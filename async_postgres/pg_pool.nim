@@ -1162,8 +1162,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   if pool.closed:
     raise newPoolError(pekClosed, "Pool is closed")
 
-  let now = Moment.now()
-  let acquireStart = now
+  let acquireStart = Moment.now()
 
   # `acquireTimeout` is a deadline for the whole acquire: idle health-check
   # pings, a caller-driven connect, and the final waiter wait all draw from
@@ -1195,6 +1194,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   if pool.waiterCount == 0:
     # Try to get an idle connection
     while pool.idle.len > 0:
+      # Re-taken per iteration: a failed health-check ping below awaits, and the
+      # lifetime/idle checks must not judge the next conn by a pre-await `now`.
+      let now = Moment.now()
       let pc = pool.idle.popFirst()
       if pc.conn.state != csReady or pc.conn.socketHasFin():
         # closeNoWait: avoid an await point where a cancellation could be

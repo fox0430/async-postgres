@@ -1799,6 +1799,47 @@ when hasChronos:
 
       waitFor t()
 
+    test "lifetime is re-evaluated after a health-check ping awaits":
+      # Regression: the idle scan sampled `now` once before the loop, so a
+      # connection whose maxLifetime ran out while the previous connection's
+      # health-check ping was pending was still judged fresh and handed out.
+      proc t() {.async.} =
+        let pool = makePool()
+        # A closed port: the dial left after both idle conns are discarded must
+        # fail fast rather than reach a real server.
+        pool.config.connConfig = ConnConfig(host: "127.0.0.1", port: 1)
+        pool.config.healthCheckTimeout = seconds(60)
+        pool.config.pingTimeout = milliseconds(600)
+        pool.config.maxLifetime = milliseconds(800)
+
+        # Idle long enough to be pinged, and it never answers, so the ping
+        # consumes its full 600ms budget.
+        let (hanging, server, serverTransport) = await makeHangingConn()
+        pool.idle.addLast(
+          PooledConn(conn: hanging, lastUsedAt: Moment.now() - minutes(2))
+        )
+
+        # Alive when the scan starts (300ms < 800ms), expired once that ping
+        # returns (300ms + 600ms > 800ms).
+        let behind = mockConn()
+        behind.createdAt = Moment.now() - milliseconds(300)
+        pool.idle.addLast(PooledConn(conn: behind, lastUsedAt: Moment.now()))
+
+        var raised = false
+        try:
+          discard await pool.acquire()
+        except CatchableError:
+          raised = true
+        # Two closes: the pinged conn, then the expired one. With a stale `now`
+        # the second was returned as the acquisition instead.
+        doAssert pool.metrics.closeCount == 2
+        doAssert pool.idle.len == 0
+        doAssert raised
+
+        await cleanupHanging(server, serverTransport)
+
+      waitFor t()
+
     test "concurrent acquire during health-check ping cannot exceed maxSize":
       proc t() {.async.} =
         let pool = makePool(maxSize = 1)
