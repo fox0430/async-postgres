@@ -1154,10 +1154,12 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
     result = BackendMessage(kind: bmkAuthenticationSASL)
     result.saslMechanisms = @[]
     var offset = 4
+    var terminated = false
     while offset < body.len:
       let (mechanism, consumed) = decodeCString(body, offset)
       offset += consumed
       if mechanism.len == 0:
+        terminated = true
         break
       # Bound advertised list before adding to survive a hostile pre-auth server.
       if result.saslMechanisms.len >= MaxSaslMechanisms:
@@ -1166,6 +1168,10 @@ proc parseAuthentication(body: openArray[byte]): BackendMessage =
           "AuthenticationSASL: mechanism count exceeds maximum of " & $MaxSaslMechanisms,
         )
       result.saslMechanisms.add(mechanism)
+    if not terminated:
+      raise newException(
+        PgProtocolError, "AuthenticationSASL: missing mechanism list terminator"
+      )
     rejectTrailing(body, offset, "AuthenticationSASL")
   of 11:
     # Rest is challenge payload.
@@ -1230,10 +1236,12 @@ proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
     result.noticeFields = @[]
   var offset = 0
   var fieldCount = 0
+  var terminated = false
   while offset < body.len:
     let fieldType = char(body[offset])
     inc offset
     if fieldType == '\0':
+      terminated = true
       rejectTrailing(body, offset, name)
       break
     let (value, consumed) = decodeCString(body, offset)
@@ -1251,6 +1259,11 @@ proc parseErrorOrNotice(body: openArray[byte], isError: bool): BackendMessage =
       result.errorFields.add(field)
     else:
       result.noticeFields.add(field)
+  if not terminated:
+    raise newException(PgProtocolError, name & ": missing field list terminator")
+  if fieldCount == 0:
+    # A lone terminator would otherwise surface as an empty PgQueryError.
+    raise newException(PgProtocolError, name & ": empty field list")
 
 proc parseNotification(body: openArray[byte]): BackendMessage =
   if body.len < 4:

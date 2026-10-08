@@ -1161,6 +1161,36 @@ suite "Timestamp/date infinity sentinels":
     expect PgTypeError:
       discard row.getPolygon(0)
 
+  test "getPath binary rejects trailing slack":
+    # closed(1) + npts(4) = a 5-byte header with 8 trailing bytes. The wire form
+    # is exact (like the path[] element decoder), so the slack must not be
+    # silently truncated.
+    let bin = newSeq[byte](13)
+    let fields = @[mkField(OidPath, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    var msg = ""
+    try:
+      discard row.getPath(0)
+    except PgTypeError as e:
+      msg = e.msg
+    # The length check names the cell, so this cannot pass through the text
+    # branch (which would reject the NUL bytes for a different reason).
+    check "binary path" in msg
+    check "cell has 13" in msg
+
+  test "getPolygon binary rejects trailing slack":
+    # npts(4) = 0 with 8 trailing bytes; the wire form is 4 + npts*16.
+    let bin = newSeq[byte](12)
+    let fields = @[mkField(OidPolygon, 1)]
+    let row = mkRow(@[some(bin)], fields)
+    var msg = ""
+    try:
+      discard row.getPolygon(0)
+    except PgTypeError as e:
+      msg = e.msg
+    check "binary polygon" in msg
+    check "cell has 12" in msg
+
 suite "PgInterval":
   test "$ zero interval":
     let v = PgInterval(months: 0, days: 0, microseconds: 0)

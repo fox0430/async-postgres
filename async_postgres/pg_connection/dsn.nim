@@ -327,6 +327,17 @@ proc readCapped(f: File, sizeHint: int64): string =
     total += n
   result.setLen(total)
 
+proc rejectRawNulField(field, value: string) =
+  ## Raise ``PgConfigError`` if ``value`` holds a raw NUL. The message names the
+  ## field and offset but never the value, which may be the password.
+  let at = value.find('\0')
+  if at >= 0:
+    raise newException(
+      PgConfigError,
+      "Forbidden zero byte in " & field & " at offset=" & $at & " (len=" & $value.len &
+        ")",
+    )
+
 proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
   ## Read a PEM parameter file (sslrootcert/sslcert/sslkey), wrapping the
   ## stdlib `IOError` into a `PgConfigError` with the parameter name. An empty file
@@ -335,6 +346,8 @@ proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
   ## is rejected — intentionally stricter than libpq, which permits `0o640`
   ## for root-owned keys. No permission check off-POSIX (libpq also skips it
   ## on Windows).
+  # Before the C `open`, which would cut the path at a NUL and read another file.
+  rejectRawNulField(label, path)
   template failRead() =
     raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
 
@@ -1024,6 +1037,34 @@ proc parseUriDsn(dsn: string): ConnConfig =
   result.port = result.hosts[0].port
   validateClientCertConfig(result)
 
+proc rejectRawNul(config: ConnConfig) =
+  ## Reject a raw NUL in every value that leaves the process as a C string: a
+  ## StartupMessage parameter, the dial target, or a certificate value. A NUL
+  ## reaches here untouched in either DSN form (``pctDecode`` only rejects
+  ## ``%00``), and the C boundary would silently cut the value.
+  ##
+  ## ``password`` is exempt: it is not a startup item, SCRAM only hashes it, and
+  ## the cleartext/MD5 messages are checked when they are built.
+  rejectRawNulField("user", config.user)
+  rejectRawNulField("database", config.database)
+  rejectRawNulField("application_name", config.applicationName)
+  var i = 0
+  for pair in config.extraParams:
+    rejectRawNulField("extra parameter name #" & $i, pair[0])
+    rejectRawNulField("extra parameter value #" & $i, pair[1])
+    inc i
+  rejectRawNulField("host", config.host)
+  rejectRawNulField("hostaddr", config.hostaddr)
+  var h = 0
+  for entry in config.hosts:
+    rejectRawNulField("host #" & $h, entry.host)
+    rejectRawNulField("hostaddr #" & $h, entry.hostaddr)
+    inc h
+  # A DSN path was checked before its file read; this catches a hand-built config.
+  rejectRawNulField("sslrootcert", config.sslRootCert)
+  rejectRawNulField("sslcert", config.sslCert)
+  rejectRawNulField("sslkey", config.sslKey)
+
 proc validateConnConfig*(config: var ConnConfig) =
   ## Mirror DSN guards for ``initConnConfig`` and the ``connect`` chokepoint
   ## (DSN parsers validate inline; hand-built ``ConnConfig`` is re-checked at
@@ -1035,6 +1076,7 @@ proc validateConnConfig*(config: var ConnConfig) =
   ## ``host``/``hostaddr``/``port`` are mirrored from ``hosts[0]``, which is
   ## what ``getHosts`` dials. Negative ``connectTimeout`` becomes
   ## ``ZeroDuration``.
+  rejectRawNul(config)
   if config.connectTimeout < ZeroDuration:
     config.connectTimeout = ZeroDuration
 
@@ -1199,3 +1241,4 @@ proc parseDsn*(dsn: string): ConnConfig =
     result = parseUriDsn(dsn)
   else:
     result = parseKeyValueDsn(dsn)
+  rejectRawNul(result)

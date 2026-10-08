@@ -340,6 +340,41 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/d%00b")
 
+  test "error: raw zero byte in URI startup values":
+    # `pctDecode` rejects an encoded `%00`; a literal NUL must fail at parse time
+    # too, otherwise it would split the startup key/value pair on the wire.
+    for dsn in [
+      "postgresql://us\0er@host/db", "postgresql://host/db\0name",
+      "postgresql://host/db?application_name=a\0b", "postgresql://host/db?sslmde=a\0b",
+    ]:
+      var msg = ""
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError as e:
+        msg = e.msg
+      check "Forbidden zero byte" in msg
+
+  test "raw zero byte in a password still parses":
+    # The password has no C-string use on the wire: SCRAM only hashes it, and
+    # the cleartext/MD5 messages are checked when they are built.
+    let cfg = parseDsn("postgresql://u:p\0w@host/db")
+    check cfg.password == "p\0w"
+
+  test "error: raw zero byte in URI connect-target values":
+    # host/hostaddr cross the same C boundary as a startup parameter:
+    # `getAddrInfo` cuts the name at the NUL, so the DSN would dial a host it
+    # does not name.
+    for dsn in [
+      "postgresql://ho\0st/db", "postgresql://h1,ho\0st2/db",
+      "postgresql://host/db?hostaddr=1.2.3.4\0x",
+    ]:
+      var msg = ""
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError as e:
+        msg = e.msg
+      check "Forbidden zero byte" in msg
+
   test "sslmode defaults to prefer when unspecified (libpq parity)":
     check parseDsn("postgresql://host/db").sslMode == sslPrefer
 
@@ -1251,6 +1286,32 @@ suite "parseDsn":
       check "size limit" in e.msg
     check raised
 
+  test "error: raw zero byte in a certificate path is rejected before the read":
+    # `readPemFileParam` opens the path as a C string: without the guard the NUL
+    # would be cut there and the config would hold a *different* file's PEM.
+    let caPath = writePemFile(dummyPem)
+    let keyPath = writeKeyFile(dummyPem)
+    defer:
+      removeFile(caPath)
+      removeFile(keyPath)
+    # A keyword value needs quotes for whitespace and doubled backslashes (a
+    # Windows path would otherwise be read as escapes); the URI query keeps both
+    # raw. Either way the NUL is what the parser must reject.
+    let caEsc = caPath.replace("\\", "\\\\")
+    let keyEsc = keyPath.replace("\\", "\\\\")
+    for dsn in [
+      "postgresql://host/db?sslrootcert=" & caPath & "\0.bak",
+      "sslrootcert='" & caEsc & "\0.bak'",
+      "sslrootcert='" & caEsc & "\0.bak' sslcert='" & caEsc & "' sslkey='" & keyEsc & "'",
+      "sslrootcert='" & caEsc & "' sslcert='" & caEsc & "' sslkey='" & keyEsc & "\0.bak'",
+    ]:
+      var msg = ""
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError as e:
+        msg = e.msg
+      check "Forbidden zero byte" in msg
+
   test "a small PEM file does not retain a cap-sized buffer":
     # `setLen` shrinks the length but not the payload, so reading into a
     # cap-sized buffer would keep 4 MiB resident per file for the lifetime of
@@ -1396,6 +1457,77 @@ suite "parseDsn keyword=value":
     let cfg = parseDsn("")
     check cfg.host == "127.0.0.1"
     check cfg.port == 5432
+
+  test "error: raw zero byte in keyword startup values":
+    for dsn in [
+      "user=us\0er host=dbhost", "dbname=db\0name host=dbhost",
+      "application_name=a\0b host=dbhost", "host=dbhost opt\0key=value",
+      "host=dbhost options='-c x=1\0'",
+    ]:
+      var msg = ""
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError as e:
+        msg = e.msg
+      check "Forbidden zero byte" in msg
+
+  test "error: initConnConfig rejects a raw zero byte in a startup value":
+    # The same guard mirrors into validateConnConfig for hand-built configs.
+    var msg = ""
+    try:
+      discard initConnConfig(host = "dbhost", user = "us\0er")
+    except PgConfigError as e:
+      msg = e.msg
+    check "Forbidden zero byte in user" in msg
+    msg = ""
+    try:
+      discard initConnConfig(host = "dbhost", extraParams = @[("a\0b", "c")])
+    except PgConfigError as e:
+      msg = e.msg
+    check "Forbidden zero byte in extra parameter name" in msg
+
+  test "error: raw zero byte in keyword connect-target values":
+    # A host list's second element is reached through the per-entry check.
+    for dsn in ["host=ho\0st", "hostaddr=1.2.3.4\0x", "host=h1,ho\0st2"]:
+      var msg = ""
+      try:
+        discard parseDsn(dsn)
+      except PgConfigError as e:
+        msg = e.msg
+      check "Forbidden zero byte" in msg
+
+  test "error: initConnConfig rejects a raw zero byte in a dial target or path":
+    # No file is opened for a hand-built config, so the NUL is what rejects the
+    # certificate path; the index names which host entry is at fault.
+    for (build, want) in [
+      (
+        proc(): ConnConfig =
+          initConnConfig(host = "ho\0st"),
+        "Forbidden zero byte in host",
+      ),
+      (
+        proc(): ConnConfig =
+          initConnConfig(
+            host = "h1",
+            hosts = @[
+              HostEntry(host: "h1", port: 5432),
+              HostEntry(host: "h2", hostaddr: "1.2.3.4\0x", port: 5432),
+            ],
+          ),
+        "Forbidden zero byte in hostaddr #1",
+      ),
+      (
+        proc(): ConnConfig =
+          initConnConfig(host = "h1", sslRootCert = "/etc/x\0.pem"),
+        "Forbidden zero byte in sslrootcert",
+      ),
+    ]:
+      var msg = ""
+      try:
+        discard build()
+      except PgConfigError as e:
+        msg = e.msg
+      check want in msg
 
   test "single-quoted value with spaces":
     let cfg = parseDsn("application_name='my app'")
@@ -1897,6 +2029,19 @@ suite "DSN parse failures omit secret content":
     check secret notin msg
     check "query value" in msg
     check "item #0" in msg
+
+  test "raw zero byte in a forwarded parameter omits content":
+    const secret = "qsecret-XYZ"
+    var msg = ""
+    try:
+      discard parseDsn("postgresql://host/db?sslmde=" & secret & "\0trailer")
+    except PgConfigError as e:
+      msg = e.msg
+    check msg.len > 0
+    check secret notin msg
+    check "offset=" in msg
+    check "len=" in msg
+    check "extra parameter value" in msg
 
   test "query pctDecode failure locates the faulty item":
     var msg = ""
