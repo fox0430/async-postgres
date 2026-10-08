@@ -86,7 +86,9 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric {.raises: [PgError].
     of 0xC000'u16:
       pgNaN
     else:
-      raise newException(PgTypeError, "Invalid numeric sign: " & $signRaw)
+      # No decoded sign in the message: `PgTypeError` reports input
+      # lengths/offsets only (see pg_errors.nim).
+      raise newException(PgTypeError, "Numeric binary: invalid sign")
   let expectedLen = 8 + ndigits * 2
   if data.len != expectedLen:
     raise newException(
@@ -101,7 +103,10 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric {.raises: [PgError].
     # Enforce PgNumeric.digits invariant (each 0..9999). Out-of-range values
     # would otherwise silently corrupt `$PgNumeric` and cmp results.
     if d < 0 or d > 9999:
-      raise newException(PgTypeError, "Numeric binary: invalid digit " & $d)
+      # Report where, not what: the digit itself is wire content.
+      raise newException(
+        PgTypeError, "Numeric binary: invalid digit at offset " & $(8 + i * 2)
+      )
     digits[i] = d
   PgNumeric(weight: weight, sign: sign, dscale: dscale, digits: digits)
 
@@ -129,8 +134,7 @@ proc decodeBinaryTimestamp*(data: openArray[byte]): DateTime {.raises: [PgError]
   # symmetric low-end guard is needed.
   const pgEpochUs = pgEpochUnix * 1_000_000
   if pgUs > int64.high - pgEpochUs:
-    raise
-      newException(PgTypeError, "Binary timestamp out of representable range: " & $pgUs)
+    raise newException(PgTypeError, "Binary timestamp out of representable range")
   let unixUs = pgUs + pgEpochUs
   var unixSec = unixUs div 1_000_000
   var fracUs = unixUs mod 1_000_000
@@ -167,7 +171,10 @@ proc decodeBinaryTime*(data: openArray[byte]): PgTime {.raises: [PgError].} =
     raise newException(PgTypeError, "Binary time: expected 8 bytes, got " & $data.len)
   let us = fromBE64(data)
   if us < 0 or us > pgTimeMaxUs:
-    raise newException(PgTypeError, "Binary time: microseconds out of range " & $us)
+    raise newException(
+      PgTypeError,
+      "Binary time: microseconds out of range (expected 0.." & $pgTimeMaxUs & ")",
+    )
   let hours = int32(us div 3_600_000_000)
   let rem1 = us mod 3_600_000_000
   let minutes = int32(rem1 div 60_000_000)
@@ -182,7 +189,10 @@ proc decodeBinaryTimeTz*(data: openArray[byte]): PgTimeTz {.raises: [PgError].} 
       newException(PgTypeError, "Binary timetz: expected 12 bytes, got " & $data.len)
   let us = fromBE64(data)
   if us < 0 or us > pgTimeMaxUs:
-    raise newException(PgTypeError, "Binary timetz: microseconds out of range " & $us)
+    raise newException(
+      PgTypeError,
+      "Binary timetz: microseconds out of range (expected 0.." & $pgTimeMaxUs & ")",
+    )
   let pgOffset = fromBE32(data.toOpenArray(8, 11))
   # ``timetz_send`` emits any stored zone (see ``parseTimeTzText``), but
   # un-negating ``int32.low`` would OverflowDefect.
@@ -219,14 +229,15 @@ proc decodeInetBinary*(
   let addrlen = data[3]
   if family == 2:
     if addrlen != 4:
-      raise newException(PgTypeError, "Binary inet IPv4 addrlen mismatch: " & $addrlen)
+      raise newException(PgTypeError, "Binary inet IPv4 addrlen mismatch (expected 4)")
     if data.len < 8:
       raise newException(PgTypeError, "Binary inet IPv4 data too short: " & $data.len)
     # Match the text path (parseInetText): reject a netmask wider than the
     # family allows so a malformed wire value surfaces as PgTypeError rather
     # than a plausible-but-wrong mask. ``bits`` is uint8, so 0 is implicit.
     if bits > 32:
-      raise newException(PgTypeError, "Binary inet IPv4 mask out of range: " & $bits)
+      raise
+        newException(PgTypeError, "Binary inet IPv4 mask out of range (expected 0..32)")
     var ip = IpAddress(family: IpAddressFamily.IPv4)
     for i in 0 ..< 4:
       ip.address_v4[i] = data[4 + i]
@@ -234,18 +245,20 @@ proc decodeInetBinary*(
     (ip, bits)
   elif family == 3:
     if addrlen != 16:
-      raise newException(PgTypeError, "Binary inet IPv6 addrlen mismatch: " & $addrlen)
+      raise newException(PgTypeError, "Binary inet IPv6 addrlen mismatch (expected 16)")
     if data.len < 20:
       raise newException(PgTypeError, "Binary inet IPv6 data too short: " & $data.len)
     if bits > 128:
-      raise newException(PgTypeError, "Binary inet IPv6 mask out of range: " & $bits)
+      raise newException(
+        PgTypeError, "Binary inet IPv6 mask out of range (expected 0..128)"
+      )
     var ip = IpAddress(family: IpAddressFamily.IPv6)
     for i in 0 ..< 16:
       ip.address_v6[i] = data[4 + i]
     ensureNoTrailing(20, data.len, "Binary inet IPv6")
     (ip, bits)
   else:
-    raise newException(PgTypeError, "Binary inet unknown family: " & $family)
+    raise newException(PgTypeError, "Binary inet unknown family (expected 2 or 3)")
 
 proc decodePointBinary*(
     data: openArray[byte], off: int
@@ -308,7 +321,7 @@ proc decodeBinaryArray*(
     let eLen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
     pos += 4
     if eLen < -1:
-      raise newException(PgTypeError, "Binary array: invalid element length " & $eLen)
+      raise newException(PgTypeError, "Binary array: invalid element length")
     elif eLen == -1:
       result.elements[i] = (off: RelOff(0), len: -1)
     else:
@@ -359,7 +372,7 @@ proc decodeBinaryComposite*(
     let flen = int(fromBE32(data.toOpenArray(pos, pos + 3)))
     pos += 4
     if flen < -1:
-      raise newException(PgTypeError, "Binary composite: invalid field length " & $flen)
+      raise newException(PgTypeError, "Binary composite: invalid field length")
     elif flen == -1:
       result[i].off = RelOff(0)
       result[i].len = -1
@@ -580,7 +593,9 @@ proc parseHstoreText*(s: string): PgHstore {.raises: [PgError].} =
       break
     # Parse key (must be quoted)
     if s[i] != '"':
-      raise newException(PgTypeError, "hstore: expected '\"' at position " & $i)
+      raise newException(
+        PgTypeError, "hstore: expected '\"' (len=" & $s.len & ", pos=" & $i & ")"
+      )
     i += 1
     var key = ""
     while i < s.len:
@@ -600,7 +615,9 @@ proc parseHstoreText*(s: string): PgHstore {.raises: [PgError].} =
       i += 1
     # Expect =>
     if i + 1 >= s.len or s[i] != '=' or s[i + 1] != '>':
-      raise newException(PgTypeError, "hstore: expected '=>' at position " & $i)
+      raise newException(
+        PgTypeError, "hstore: expected '=>' (len=" & $s.len & ", pos=" & $i & ")"
+      )
     i += 2
     # Skip whitespace
     while i < s.len and s[i] == ' ':
@@ -628,7 +645,8 @@ proc parseHstoreText*(s: string): PgHstore {.raises: [PgError].} =
       result[key] = some(val)
     else:
       raise newException(
-        PgTypeError, "hstore: expected NULL or quoted string at position " & $i
+        PgTypeError,
+        "hstore: expected NULL or quoted string (len=" & $s.len & ", pos=" & $i & ")",
       )
 
 proc invalidInterval(s: string): ref PgTypeError =
@@ -1050,7 +1068,7 @@ proc parseTsQueryToken(data: openArray[byte], pos: var int) =
     let weightByte = data[pos]
     if weightByte > 0x0F:
       # tsqueryrecv only accepts the four weight bits.
-      raise newException(PgTypeError, "tsquery binary: invalid weight " & $weightByte)
+      raise newException(PgTypeError, "tsquery binary: invalid weight")
     pos += 2
     while pos < data.len and data[pos] != 0:
       inc pos
@@ -1072,9 +1090,9 @@ proc parseTsQueryToken(data: openArray[byte], pos: var int) =
       # itself sends values tsqueryrecv would reject.
       pos += 2
     else:
-      raise newException(PgTypeError, "Unknown tsquery operator: " & $op)
+      raise newException(PgTypeError, "Unknown tsquery operator (expected 1..4)")
   else:
-    raise newException(PgTypeError, "Unknown tsquery token type: " & $tokenType)
+    raise newException(PgTypeError, "Unknown tsquery token type (expected 1 or 2)")
 
 proc tsTokenPrec(data: openArray[byte], off: int): TsPrec {.inline.} =
   if data[off] == 1:
@@ -1229,7 +1247,7 @@ proc parsePointsText*(s: string): seq[PgPoint] {.raises: [PgError].} =
       break
     if s[i] != '(':
       raise newException(
-        PgTypeError, "Expected '(' in point list at pos " & $i & " (len=" & $s.len & ")"
+        PgTypeError, "Expected '(' in point list (len=" & $s.len & ", pos=" & $i & ")"
       )
     let start = i
     i += 1
@@ -1237,8 +1255,10 @@ proc parsePointsText*(s: string): seq[PgPoint] {.raises: [PgError].} =
     while i < n and s[i] != ')':
       i += 1
     if i >= n:
-      raise
-        newException(PgTypeError, "Unmatched '(' in point list (len=" & $s.len & ")")
+      raise newException(
+        PgTypeError,
+        "Unmatched '(' in point list (len=" & $s.len & ", pos=" & $start & ")",
+      )
     i += 1 # skip ')'
     result.add(parsePointText(s[start ..< i]))
 
@@ -1249,8 +1269,21 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
   ## Returns elements as ``Option[string]`` (none for NULL).
   ## Raises ``PgTypeError`` for multi-dimensional literals; callers that need
   ## multi-dim support should decode via the ``PgArray[T]`` accessors.
+  ## Every error carries ``len=`` and ``pos=``, the latter a 0-based byte offset
+  ## into ``s`` (so it matches what the caller sees) pointing at the byte that
+  ## failed — for an unterminated quoted element, at its opening quote. An empty
+  ## literal has no byte to point at and reports ``pos=0``.
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
-    raise newException(PgTypeError, "Invalid array literal (len=" & $s.len & ")")
+    # Point at the brace that is wrong; a literal too short to have one reports
+    # offset 0, so every error from here carries both ``len=`` and ``pos=``.
+    let bracePos =
+      if s.len >= 2 and s[0] == '{':
+        s.len - 1
+      else:
+        0
+    raise newException(
+      PgTypeError, "Invalid array literal (len=" & $s.len & ", pos=" & $bracePos & ")"
+    )
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     return @[]
@@ -1264,10 +1297,12 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
       raise newException(
         PgTypeError,
         "Multi-dimensional array text literal cannot be read as seq; " &
-          "use the PgArray[T] accessor instead",
+          "use the PgArray[T] accessor instead (len=" & $s.len & ", pos=" & $(i + 1) &
+          ")",
       )
     if inner[i] == '"':
       # Quoted element
+      let quotePos = i + 1 # 0-based offset of the opening quote in ``s``
       i += 1
       var elem = ""
       while i < inner.len:
@@ -1280,12 +1315,20 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
           elem.add(inner[i])
         i += 1
       if i >= inner.len:
-        raise newException(PgTypeError, "array: unterminated quoted element")
+        raise newException(
+          PgTypeError,
+          "array: unterminated quoted element (len=" & $s.len & ", pos=" & $quotePos &
+            ")",
+        )
       i += 1 # skip closing quote
       # A quoted element must be followed by ',' or the end of the array;
       # anything else (e.g. `{"ab"cd}`) would otherwise split silently.
       if i < inner.len and inner[i] != ',':
-        raise newException(PgTypeError, "array: unexpected byte after quoted element")
+        raise newException(
+          PgTypeError,
+          "array: unexpected byte after quoted element (len=" & $s.len & ", pos=" &
+            $(i + 1) & ")",
+        )
       result.add(some(elem))
     else:
       # Unquoted element
@@ -1294,7 +1337,11 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
         # Server-side output quotes elements containing these structural
         # bytes, so an unquoted occurrence is malformed input.
         if inner[i] in {'"', '\\', '{', '}'}:
-          raise newException(PgTypeError, "array: unexpected byte in unquoted element")
+          raise newException(
+            PgTypeError,
+            "array: unexpected byte in unquoted element (len=" & $s.len & ", pos=" &
+              $(i + 1) & ")",
+          )
         elem.add(inner[i])
         i += 1
       if elem == "NULL":
@@ -1304,4 +1351,8 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
     if i < inner.len and inner[i] == ',':
       i += 1
       if i == inner.len:
-        raise newException(PgTypeError, "array: trailing comma")
+        # ``i`` was just advanced past the comma, so it is the comma's own
+        # 0-based offset in ``s``.
+        raise newException(
+          PgTypeError, "array: trailing comma (len=" & $s.len & ", pos=" & $i & ")"
+        )

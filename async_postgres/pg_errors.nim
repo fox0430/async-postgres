@@ -48,7 +48,8 @@ type
     ## protocol cannot encode (count past Int16, length past Int32, embedded NUL).
     ##
     ## Decode-failure messages report input lengths/offsets only, never the
-    ## content (cells may hold PII or secrets).
+    ## content (cells may hold PII or secrets), with positions written as
+    ## ``(len=…, pos=…)`` where ``pos`` is a 0-based byte offset into the input.
 
   PgMessageTooLargeError* = object of PgTypeError
     ## An assembled protocol message exceeds the wire format's Int32 length.

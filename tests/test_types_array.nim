@@ -293,6 +293,24 @@ suite "parseTextArray":
     expect PgTypeError:
       discard parseTextArray("{a{b},c}")
 
+  test "error messages carry len and pos":
+    # `pos` is a 0-based offset into the literal the caller passed in, so it
+    # can be pointed at directly.
+    proc msgOf(s: string): string =
+      result = ""
+      try:
+        discard parseTextArray(s)
+      except PgTypeError as e:
+        result = e.msg
+
+    check msgOf("{\"abc}") == "array: unterminated quoted element (len=6, pos=1)"
+    check msgOf("{\"ok\",\"abc}") == "array: unterminated quoted element (len=11, pos=6)"
+    check msgOf("{\"ab\"cd}") ==
+      "array: unexpected byte after quoted element (len=8, pos=5)"
+    check msgOf("{a\"b,c}") ==
+      "array: unexpected byte in unquoted element (len=7, pos=2)"
+    check msgOf("{a,b,}") == "array: trailing comma (len=6, pos=4)"
+
 suite "Array row accessors":
   test "getIntArray":
     let row: Row = @[some(toBytes("{1,2,3}"))]
@@ -2170,3 +2188,134 @@ suite "expectedElemCount strictness":
       discard expectedElemCount(@[2'i32, 0])
     expect PgError:
       discard expectedElemCount(@[0'i32])
+
+suite "array element errors carry the column number":
+  # Scalar accessors report "Column N: ..." on a decode failure; every array
+  # accessor must match so a multi-column fetch can tell which column failed.
+  # These pin the paths that go through `genArrayDecoder*` and the ones with
+  # hand-written element loops (money, box, N-D, enum).
+  template msgOf(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
+  let badInt4Cell = encodeBinaryArray(OidInt4, @[toBytes("\x00\x01")])
+  let badInt4Row = mkRow(@[some(badInt4Cell)], @[mkField(OidInt4Array, 1)])
+
+  test "binary element failure names the column":
+    # elemOid is int4, but the element payload is 2 bytes, not 4.
+    check msgOf(badInt4Row.getIntArray(0)) ==
+      "Column 0: int4 array element: bad length 2"
+
+  test "text element failure names the column":
+    let row: Row = @[some(toBytes("{1,no}"))]
+    check row.isBinaryCol(0) == false
+    check msgOf(row.getIntArray(0)).startsWith("Column 0: ")
+
+  test "malformed text literal names the column":
+    let row: Row = @[some(toBytes("{1,2"))]
+    check msgOf(row.getIntArray(0)) == "Column 0: Invalid array literal (len=4, pos=3)"
+
+  test "NULL element names the column":
+    let row: Row = @[some(toBytes("{1,NULL}"))]
+    check msgOf(row.getIntArray(0)) == "Column 0: NULL element in int array"
+
+  test "column number is the failing cell's own index":
+    let row: Row = @[some(toBytes("{1,2}")), some(toBytes("{3,bad}"))]
+    check msgOf(row.getIntArray(0)) == ""
+    check msgOf(row.getIntArray(1)).startsWith("Column 1: ")
+
+  test "a NULL cell keeps getStr's own message (no double prefix)":
+    let row: Row = @[none(seq[byte])]
+    check msgOf(row.getIntArray(0)) == "Column 0 is NULL"
+
+  test "element-optional getters name the column":
+    check msgOf(badInt4Row.getIntArrayElemOpt(0)) ==
+      "Column 0: int4 array element: bad length 2"
+    let row: Row = @[some(toBytes("{1,no}"))]
+    check msgOf(row.getIntArrayElemOpt(0)).startsWith("Column 0: ")
+
+  test "N-D getters name the column":
+    check msgOf(getArrayND[int32](badInt4Row, 0)) ==
+      "Column 0: int4 array element: bad length 2"
+    check msgOf(getArrayNDOpt[int32](badInt4Row, 0)) ==
+      "Column 0: int4 array element: bad length 2"
+
+  test "money getters name the column":
+    let payload = encodeBinaryArray(OidMoney, @[toBytes("\x00\x01\x02\x03")])
+    let row = mkRow(@[some(payload)], @[mkField(OidMoneyArray, 1)])
+    check msgOf(row.getMoneyArray(0)) ==
+      "Column 0: Unexpected binary element length 4 for money array"
+    check msgOf(row.getMoneyArrayND(0)) ==
+      "Column 0: Unexpected binary element length 4 for money array"
+
+  test "enum getters name the column":
+    let row: Row = @[some(toBytes("{happy,NOPE}"))]
+    check msgOf(getEnumArray[Mood](row, 0)).startsWith("Column 0: ")
+    check msgOf(getEnumArrayElemOpt[Mood](row, 0)).startsWith("Column 0: ")
+
+  test "box getters name the column":
+    # Box arrays use ';' as the element delimiter; the second element is not a
+    # point pair, so `parsePointsText` fails on it.
+    let row: Row = @[some(toBytes("{(1,2),(3,4);nope}"))]
+    check msgOf(row.getBoxArray(0)).startsWith("Column 0: ")
+
+  test "box literal error carries len and pos":
+    let noBraces: Row = @[some(toBytes("(1,2),(3,4)"))]
+    check msgOf(noBraces.getBoxArray(0)) ==
+      "Column 0: Invalid box array literal (len=11, pos=0)"
+    let openBrace: Row = @[some(toBytes("{(1,2),(3,4)"))]
+    check msgOf(openBrace.getBoxArray(0)) ==
+      "Column 0: Invalid box array literal (len=12, pos=11)"
+
+  test "a NULL column stays single-prefixed on every array path":
+    # A NULL cell is a column-level failure the getters already report as
+    # "Column N is NULL"; wrapping it again would say "Column 0: Column 0 is
+    # NULL". Pin every path that gained a wrap.
+    let intNull = mkRow(@[none(seq[byte])], @[mkField(OidInt4Array, 1)])
+    check msgOf(getIntArray(intNull, 0)) == "Column 0 is NULL"
+    check msgOf(getIntArrayElemOpt(intNull, 0)) == "Column 0 is NULL"
+    check msgOf(getArrayND[int32](intNull, 0)) == "Column 0 is NULL"
+    check getArrayNDOpt[int32](intNull, 0).isNone # NULL-safe: no raise
+    check msgOf(getEnumArray[Mood](intNull, 0)) == "Column 0 is NULL"
+    check msgOf(getEnumArrayElemOpt[Mood](intNull, 0)) == "Column 0 is NULL"
+    check msgOf(getBoxArray(intNull, 0)) == "Column 0 is NULL"
+    let moneyNullBin = mkRow(@[none(seq[byte])], @[mkField(OidMoneyArray, 1)])
+    check msgOf(getMoneyArray(moneyNullBin, 0)) == "Column 0 is NULL"
+    check msgOf(getMoneyArrayND(moneyNullBin, 0)) == "Column 0 is NULL"
+    let moneyNullTxt = mkRow(@[none(seq[byte])], @[mkField(OidMoneyArray, 0)])
+    check msgOf(getMoneyArray(moneyNullTxt, 0)) == "Column 0 is NULL"
+
+  test "a text column on a binary-only getter names the column":
+    let row: Row = @[some(toBytes("{$1.00}"))]
+    check msgOf(getArrayND[int32](row, 0)) ==
+      "Column 0: getArrayND requires binary column format"
+    check msgOf(getMoneyArrayND(row, 0)) ==
+      "Column 0: getMoneyArrayND requires binary column format"
+
+  test "a mismatched elemOid stays unprefixed (it is not a column error)":
+    # The wire-OID guard names the accessor, not the column; the column
+    # context belongs to element decode failures and column-property errors.
+    let int8Payload = @[toBytes("\x00\x00\x00\x00\x00\x00\x00\x01")]
+    let oidMismatch = mkRow(
+      @[some(encodeBinaryArray(OidInt8, int8Payload))], @[mkField(OidInt8Array, 1)]
+    )
+    check msgOf(getIntArray(oidMismatch, 0)) ==
+      "getIntArray: wire elemOid=20 expected 23"
+    check msgOf(getIntArrayElemOpt(oidMismatch, 0)) ==
+      "getIntArrayElemOpt: wire elemOid=20 expected 23"
+    check msgOf(getArrayND[int32](oidMismatch, 0)) ==
+      "getArrayND[int32]: wire elemOid=20 expected 23"
+    # Same class on the hand-written paths: a money[] cell carrying int4.
+    let moneyMismatch = mkRow(
+      @[some(encodeBinaryArray(OidInt4, @[toBytes("\x00\x00\x00\x01")]))],
+      @[mkField(OidMoneyArray, 1)],
+    )
+    check msgOf(getMoneyArray(moneyMismatch, 0)) ==
+      "getMoneyArray: wire elemOid=23 expected 790"
+    check msgOf(getMoneyArrayND(moneyMismatch, 0)) ==
+      "getMoneyArrayND: wire elemOid=23 expected 790"

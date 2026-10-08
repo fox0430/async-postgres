@@ -207,6 +207,16 @@ proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
   else:
     some(getEnum[T](row, col))
 
+template withColumnContext(col: int, body: untyped) =
+  ## Prefix a `PgTypeError` escaping `body` with the column number, matching the
+  ## array accessors in `accessors`. Mutates and re-raises the caught exception
+  ## so its identity and parent chain survive.
+  try:
+    body
+  except PgTypeError as err:
+    err.msg = "Column " & $col & ": " & err.msg
+    raise err
+
 proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
   ## Read a PostgreSQL ``enum[]`` column as ``seq[T]``.
   ## Raises ``PgTypeError`` on NULL column or NULL element.
@@ -218,16 +228,18 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
     rejectMultiDim(decoded)
     checkEnumArrayElemOid("getEnumArray", decoded.elemOid)
     result = newSeq[T](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in enum array")
-      result[i] = pgParseEnum[T](readString(row.data.buf, off + e.off, e.len))
+    withColumnContext(col):
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in enum array")
+        result[i] = pgParseEnum[T](readString(row.data.buf, off + e.off, e.len))
     return
   let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in enum array")
-    result.add(pgParseEnum[T](e.get))
+  withColumnContext(col):
+    for e in parseTextArray(s):
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in enum array")
+      result.add(pgParseEnum[T](e.get))
 
 proc getEnumArrayOpt*[T: enum](row: Row, col: int): Option[seq[T]] =
   ## NULL-safe column-level variant. Element NULL still raises.
@@ -246,18 +258,20 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
     rejectMultiDim(decoded)
     checkEnumArrayElemOid("getEnumArrayElemOpt", decoded.elemOid)
     result = newSeq[Option[T]](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        result[i] = none(T)
-      else:
-        result[i] = some(pgParseEnum[T](readString(row.data.buf, off + e.off, e.len)))
+    withColumnContext(col):
+      for i, e in decoded.elements:
+        if e.len == -1:
+          result[i] = none(T)
+        else:
+          result[i] = some(pgParseEnum[T](readString(row.data.buf, off + e.off, e.len)))
     return
   let s = row.getStr(col)
-  for e in parseTextArray(s):
-    if e.isNone:
-      result.add(none(T))
-    else:
-      result.add(some(pgParseEnum[T](e.get)))
+  withColumnContext(col):
+    for e in parseTextArray(s):
+      if e.isNone:
+        result.add(none(T))
+      else:
+        result.add(some(pgParseEnum[T](e.get)))
 
 # User-defined composite type support
 

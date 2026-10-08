@@ -851,17 +851,20 @@ proc hexNibble*(c: char): int =
 
 proc decodeHexPair*(s: string, i: int, errCtx: string): byte {.raises: [PgTypeError].} =
   ## Failures report the position and input length only (see `PgTypeError`).
-  if i < 0 or i + 1 >= s.len:
+  ## A negative offset is a caller bug rather than a position in `s`, so it is
+  ## reported without a `pos=`.
+  if i < 0:
+    raise newException(PgTypeError, errCtx & ": hex pair offset is negative")
+  if i + 1 >= s.len:
     raise newException(
       PgTypeError,
-      errCtx & ": hex pair out of range at position " & $i & " (len=" & $s.len & ")",
+      errCtx & ": hex pair out of range (len=" & $s.len & ", pos=" & $i & ")",
     )
   let hi = hexNibble(s[i])
   let lo = hexNibble(s[i + 1])
   if hi < 0 or lo < 0:
     raise newException(
-      PgTypeError,
-      errCtx & ": non-hex character at position " & $i & " (len=" & $s.len & ")",
+      PgTypeError, errCtx & ": non-hex character (len=" & $s.len & ", pos=" & $i & ")"
     )
   byte((hi shl 4) or lo)
 
@@ -869,17 +872,20 @@ proc decodeHexPair*(
     buf: openArray[byte], i: int, errCtx: string
 ): byte {.raises: [PgTypeError].} =
   ## Failures report the position and input length only (see `PgTypeError`).
-  if i < 0 or i + 1 >= buf.len:
+  ## A negative offset is a caller bug rather than a position in `buf`, so it is
+  ## reported without a `pos=`.
+  if i < 0:
+    raise newException(PgTypeError, errCtx & ": hex pair offset is negative")
+  if i + 1 >= buf.len:
     raise newException(
       PgTypeError,
-      errCtx & ": hex pair out of range at position " & $i & " (len=" & $buf.len & ")",
+      errCtx & ": hex pair out of range (len=" & $buf.len & ", pos=" & $i & ")",
     )
   let hi = hexNibble(char(buf[i]))
   let lo = hexNibble(char(buf[i + 1]))
   if hi < 0 or lo < 0:
     raise newException(
-      PgTypeError,
-      errCtx & ": non-hex character at position " & $i & " (len=" & $buf.len & ")",
+      PgTypeError, errCtx & ": non-hex character (len=" & $buf.len & ", pos=" & $i & ")"
     )
   byte((hi shl 4) or lo)
 

@@ -1331,6 +1331,18 @@ proc checkArrayElemOid*(accessor: string, actual: int32, expected: openArray[int
       describeExpectedOids(expected),
   )
 
+template withColumnContext(col: int, body: untyped) =
+  ## Prefix a `PgTypeError` escaping `body` with the column number, so the array
+  ## paths report the same "Column N: " context as the scalar accessors. The
+  ## caught exception is mutated and re-raised, keeping its identity and parent
+  ## chain; callers must wrap a region exactly once (a helper that already
+  ## prefixes must not be wrapped again).
+  try:
+    body
+  except PgTypeError as err:
+    err.msg = "Column " & $col & ": " & err.msg
+    raise err
+
 # Array decoder skeletons. ``elemOids`` lists accepted binary element OIDs
 # (``dynamicElemOidOnly`` for types without a built-in OID).
 template genArrayDecoderCustom(
@@ -1349,15 +1361,18 @@ template genArrayDecoderCustom(
       rejectMultiDim(decoded)
       checkArrayElemOid(astToStr(getProc), decoded.elemOid, elemOids)
       result = newSeq[T](decoded.elements.len)
-      for i, e in decoded.elements:
-        if e.len == -1:
-          raise newException(PgTypeError, "NULL element in " & typeName & " array")
-        result[i] = binBody
+      withColumnContext(col):
+        for i, e in decoded.elements:
+          if e.len == -1:
+            raise newException(PgTypeError, "NULL element in " & typeName & " array")
+          result[i] = binBody
       return
-    for e in parseTextArray(row.getStr(col)):
-      if e.isNone:
-        raise newException(PgTypeError, "NULL element in " & typeName & " array")
-      result.add(textBody)
+    let textCell = row.getStr(col)
+    withColumnContext(col):
+      for e in parseTextArray(textCell):
+        if e.isNone:
+          raise newException(PgTypeError, "NULL element in " & typeName & " array")
+        result.add(textBody)
 
 template genArrayDecoder(
     getProc: untyped,
@@ -1385,6 +1400,8 @@ genArrayDecoder(getInt64Array, int64, "int64", [OidInt8], pgParseBiggestInt(e.ge
 
 proc moneyArrayFromBinary(row: Row, col: int, scale: int): seq[PgMoney] =
   ## Shared binary ``money[]`` decode for both `getMoneyArray` overloads.
+  ## Element failures are prefixed with the column here; the NULL-cell and
+  ## elemOid checks above stay raw, like the template-generated getters.
   let (off, clen) = cellInfo(row, col)
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -1392,23 +1409,28 @@ proc moneyArrayFromBinary(row: Row, col: int, scale: int): seq[PgMoney] =
   rejectMultiDim(decoded)
   checkArrayElemOid("getMoneyArray", decoded.elemOid, [OidMoney])
   result = newSeq[PgMoney](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      raise newException(PgTypeError, "NULL element in money array")
-    if e.len != 8:
-      raise newException(
-        PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
+  withColumnContext(col):
+    for i, e in decoded.elements:
+      if e.len == -1:
+        raise newException(PgTypeError, "NULL element in money array")
+      if e.len != 8:
+        raise newException(
+          PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
+        )
+      result[i] = initPgMoney(
+        fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)), scale
       )
-    result[i] = initPgMoney(
-      fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)), scale
-    )
 
 proc moneyTextElements(row: Row, col: int): seq[string] =
   ## Elements of a text ``money[]`` cell; ``seq[PgMoney]`` cannot hold a NULL.
-  for e in parseTextArray(row.getStr(col)):
-    if e.isNone:
-      raise newException(PgTypeError, "NULL element in money array")
-    result.add(e.get)
+  ## The literal and NULL-element failures are prefixed here; `getStr`'s own
+  ## "Column N is NULL" is raised outside the wrap so it is not doubled.
+  let textCell = row.getStr(col)
+  withColumnContext(col):
+    for e in parseTextArray(textCell):
+      if e.isNone:
+        raise newException(PgTypeError, "NULL element in money array")
+      result.add(e.get)
 
 proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   ## Get a column value as a seq of PgMoney. Handles binary array format and
@@ -1418,8 +1440,10 @@ proc getMoneyArray*(row: Row, col: int, scale: int = 2): seq[PgMoney] =
   checkMoneyScale(scale)
   if row.isBinaryCol(col):
     return moneyArrayFromBinary(row, col, scale)
-  for e in moneyTextElements(row, col):
-    result.add(parsePgMoney(e, scale))
+  let elems = moneyTextElements(row, col) # already column-prefixed on failure
+  withColumnContext(col):
+    for e in elems:
+      result.add(parsePgMoney(e, scale))
 
 proc getMoneyArray*(row: Row, col: int, conv: PgMoneyConventions): seq[PgMoney] =
   ## ``money[]`` under known ``lc_monetary`` conventions. See the
@@ -1427,8 +1451,10 @@ proc getMoneyArray*(row: Row, col: int, conv: PgMoneyConventions): seq[PgMoney] 
   checkPgMoneyConventions(conv)
   if row.isBinaryCol(col):
     return moneyArrayFromBinary(row, col, conv.fracDigits)
-  for e in moneyTextElements(row, col):
-    result.add(parsePgMoney(e, conv))
+  let elems = moneyTextElements(row, col) # already column-prefixed on failure
+  withColumnContext(col):
+    for e in elems:
+      result.add(parsePgMoney(e, conv))
 
 # ``getFloatArray`` decodes ``float8[]`` only; ``float4[]`` raises PgTypeError.
 genArrayDecoder(getFloatArray, float64, "float", [OidFloat8], pgParseFloat(e.get))
@@ -1579,33 +1605,42 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
     rejectMultiDim(decoded)
     checkArrayElemOid("getBoxArray", decoded.elemOid, [OidBox])
     result = newSeq[PgBox](decoded.elements.len)
-    for i, e in decoded.elements:
-      if e.len == -1:
-        raise newException(PgTypeError, "NULL element in box array")
-      result[i] = decodePgArrayElement(
-        PgBox, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-      )
+    withColumnContext(col):
+      for i, e in decoded.elements:
+        if e.len == -1:
+          raise newException(PgTypeError, "NULL element in box array")
+        result[i] = decodePgArrayElement(
+          PgBox, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+        )
     return
   # PostgreSQL uses ';' as array element delimiter for box type
   let s = row.getStr(col)
   if s.len < 2 or s[0] != '{' or s[^1] != '}':
+    # Same rule as `parseTextArray`: point at the brace that is wrong, or at 0
+    # when the literal is too short to have one.
+    let bracePos =
+      if s.len >= 2 and s[0] == '{':
+        s.len - 1
+      else:
+        0
     raise newException(
-      PgTypeError, "Column " & $col & ": Invalid box array literal (len=" & $s.len & ")"
+      PgTypeError,
+      "Column " & $col & ": Invalid box array literal (len=" & $s.len & ", pos=" &
+        $bracePos & ")",
     )
   let inner = s[1 ..^ 2]
   if inner.len == 0:
     return
   let parts = inner.split(';')
-  for p in parts:
-    let v = p.strip()
-    if v == "NULL":
-      raise newException(PgTypeError, "NULL element in box array")
-    let points = parsePointsText(v)
-    if points.len != 2:
-      raise newException(
-        PgTypeError, "Column " & $col & ": Invalid box (len=" & $v.len & ")"
-      )
-    result.add(PgBox(high: points[0], low: points[1]))
+  withColumnContext(col):
+    for p in parts:
+      let v = p.strip()
+      if v == "NULL":
+        raise newException(PgTypeError, "NULL element in box array")
+      let points = parsePointsText(v)
+      if points.len != 2:
+        raise newException(PgTypeError, "Invalid box (len=" & $v.len & ")")
+      result.add(PgBox(high: points[0], low: points[1]))
 
 proc pathElemFromText(s: string): PgPath =
   let v = s.strip()
@@ -1680,17 +1715,20 @@ template genArrayDecoderElemOptCustom(
       rejectMultiDim(decoded)
       checkArrayElemOid(astToStr(getProc), decoded.elemOid, elemOids)
       result = newSeq[Option[T]](decoded.elements.len)
-      for i, e in decoded.elements:
-        if e.len == -1:
-          result[i] = none(T)
-        else:
-          result[i] = some(binBody)
+      withColumnContext(col):
+        for i, e in decoded.elements:
+          if e.len == -1:
+            result[i] = none(T)
+          else:
+            result[i] = some(binBody)
       return
-    for e in parseTextArray(row.getStr(col)):
-      if e.isNone:
-        result.add(none(T))
-      else:
-        result.add(some(textBody))
+    let textCell = row.getStr(col)
+    withColumnContext(col):
+      for e in parseTextArray(textCell):
+        if e.isNone:
+          result.add(none(T))
+        else:
+          result.add(some(textBody))
 
 template genArrayDecoderElemOpt(
     getProc: untyped, T: typedesc, elemOids: untyped, textBody: untyped
@@ -1828,7 +1866,7 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
   let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
-      PgTypeError, "getArrayND requires binary column format (col " & $col & ")"
+      PgTypeError, "Column " & $col & ": getArrayND requires binary column format"
     )
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -1858,25 +1896,26 @@ proc getArrayND*[T](row: Row, col: int): PgArray[T] =
   result.dims = decoded.dims
   result.lowerBounds = decoded.lowerBounds
   result.elements = newSeq[Option[T]](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      result.elements[i] = none(T)
-    else:
-      when T is JsonNode:
-        # Strip the leading jsonb version byte only when the wire elemOid
-        # actually says jsonb. Plain ``json`` payloads are forwarded as-is.
-        result.elements[i] = some(
-          decodeJsonArrayElem(
-            row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1),
-            decoded.elemOid,
-          )
-        )
+  withColumnContext(col):
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result.elements[i] = none(T)
       else:
-        result.elements[i] = some(
-          decodePgArrayElement(
-            T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+        when T is JsonNode:
+          # Strip the leading jsonb version byte only when the wire elemOid
+          # actually says jsonb. Plain ``json`` payloads are forwarded as-is.
+          result.elements[i] = some(
+            decodeJsonArrayElem(
+              row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1),
+              decoded.elemOid,
+            )
           )
-        )
+        else:
+          result.elements[i] = some(
+            decodePgArrayElement(
+              T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+            )
+          )
 
 proc getArrayNDOpt*[T](row: Row, col: int): Option[PgArray[T]] =
   ## NULL-safe column-level variant of ``getArrayND[T]``.
@@ -1887,11 +1926,13 @@ proc getArrayNDOpt*[T](row: Row, col: int): Option[PgArray[T]] =
 
 proc moneyArrayNDImpl(row: Row, col: int, scale: int): PgArray[PgMoney] =
   ## Shared body of the ``scale`` and ``conv`` overloads of `getMoneyArrayND`.
+  ## Element failures are prefixed with the column here; the NULL-cell, format
+  ## and elemOid checks above stay raw.
   # cellInfo first (see getArrayND).
   let (off, clen) = cellInfo(row, col)
   if not row.isBinaryCol(col):
     raise newException(
-      PgTypeError, "getMoneyArrayND requires binary column format (col " & $col & ")"
+      PgTypeError, "Column " & $col & ": getMoneyArrayND requires binary column format"
     )
   if clen == -1:
     raise newException(PgTypeError, "Column " & $col & " is NULL")
@@ -1905,20 +1946,22 @@ proc moneyArrayNDImpl(row: Row, col: int, scale: int): PgArray[PgMoney] =
   result.dims = decoded.dims
   result.lowerBounds = decoded.lowerBounds
   result.elements = newSeq[Option[PgMoney]](decoded.elements.len)
-  for i, e in decoded.elements:
-    if e.len == -1:
-      result.elements[i] = none(PgMoney)
-    else:
-      if e.len != 8:
-        raise newException(
-          PgTypeError, "Unexpected binary element length " & $e.len & " for money array"
+  withColumnContext(col):
+    for i, e in decoded.elements:
+      if e.len == -1:
+        result.elements[i] = none(PgMoney)
+      else:
+        if e.len != 8:
+          raise newException(
+            PgTypeError,
+            "Unexpected binary element length " & $e.len & " for money array",
+          )
+        result.elements[i] = some(
+          initPgMoney(
+            fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
+            scale,
+          )
         )
-      result.elements[i] = some(
-        initPgMoney(
-          fromBE64(row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)),
-          scale,
-        )
-      )
 
 proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
   ## ``getArrayND``-style accessor for ``money[]`` (any dimensionality).
@@ -1929,7 +1972,7 @@ proc getMoneyArrayND*(row: Row, col: int, scale: int = 2): PgArray[PgMoney] =
   ## read a ``money[]`` column. Defaults to ``scale = 2`` for the common
   ## locale. Raises ``PgTypeError`` when ``scale`` is outside ``0..18``.
   checkMoneyScale(scale)
-  moneyArrayNDImpl(row, col, scale)
+  result = moneyArrayNDImpl(row, col, scale)
 
 proc getMoneyArrayND*(row: Row, col: int, conv: PgMoneyConventions): PgArray[PgMoney] =
   ## ``money[]`` of any dimensionality under known ``lc_monetary``
@@ -1938,7 +1981,7 @@ proc getMoneyArrayND*(row: Row, col: int, conv: PgMoneyConventions): PgArray[PgM
   ## caller holding one need not unpack it, and validated because this path
   ## never reaches the text parser.
   checkPgMoneyConventions(conv)
-  moneyArrayNDImpl(row, col, conv.fracDigits)
+  result = moneyArrayNDImpl(row, col, conv.fracDigits)
 
 proc getMoneyArrayNDOpt*(row: Row, col: int, scale: int = 2): Option[PgArray[PgMoney]] =
   ## NULL-safe column-level variant of ``getMoneyArrayND``.
