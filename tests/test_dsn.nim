@@ -1437,6 +1437,21 @@ suite "parseDsn":
             certPath
         )
 
+  test "error: PEM path that is not a regular file is rejected":
+    # A directory stands in for the FIFO case on every platform: POSIX rejects
+    # it via `S_ISREG` on the opened fd, non-POSIX via `getFileInfo` before the
+    # blocking `open`. Both must name the same fault.
+    let dirPath = createTempDir("pg_test_pem_dir_", "")
+    defer:
+      removeDir(dirPath)
+    for label in ["sslrootcert", "sslcert", "sslkey"]:
+      var msg = ""
+      try:
+        discard readPemFileParam(dirPath, label)
+      except PgConfigError as e:
+        msg = e.msg
+      check label & " file is not a regular file, refusing to use: " & dirPath == msg
+
 suite "parseDsn keyword=value":
   test "full connection string":
     let cfg = parseDsn("host=dbhost port=5433 dbname=mydb user=myuser password=mypass")

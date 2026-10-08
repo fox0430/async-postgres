@@ -18,6 +18,10 @@
 import std/[strutils, options]
 when defined(posix):
   import std/posix
+else:
+  # `getFileInfo` stands in for the POSIX `fstat` + `S_ISREG` check: Windows has
+  # no `O_NONBLOCK`, so the kind must be ruled out before `open` can block.
+  import std/os
 
 import ../[async_backend, pg_errors]
 from ../pg_types/encoding import hexNibble
@@ -375,6 +379,19 @@ proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
     finally:
       close(opened.f)
   else:
+    # Windows has no `O_NONBLOCK`, so `open` on a device name (`CON`) or a pipe
+    # would block parseDsn before `connect_timeout` applies. `getFileInfo`
+    # follows symlinks like `open` does and rejects those kinds up front; the
+    # POSIX branch gets the same guarantee from `S_ISREG` on the opened fd.
+    var info: FileInfo
+    try:
+      info = getFileInfo(path)
+    except OSError:
+      failRead()
+    if info.kind != pcFile:
+      raise newException(
+        PgConfigError, label & " file is not a regular file, refusing to use: " & path
+      )
     # Capped as well as pre-checked, in case the reported size understates it.
     var f: File
     if not open(f, path, fmRead):
