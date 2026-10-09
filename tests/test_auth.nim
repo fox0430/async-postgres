@@ -5,6 +5,7 @@ import pkg/nimcrypto/pbkdf2
 
 import ../async_postgres/pg_auth {.all.}
 import ../async_postgres/pg_errors
+import ../async_postgres/pg_der
 
 proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -637,3 +638,17 @@ suite "SCRAM-SHA-256-PLUS channel binding":
     let binding = computeTlsServerEndpoint(malformed)
     check binding.len == 32
     check binding == @(sha256.digest(malformed).data)
+
+suite "DER OID validation":
+  test "oidValid agrees with oidText":
+    let cases: seq[seq[byte]] = @[
+      @[0x2A'u8, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], # 1.2.840.10045.2.1
+      @[],
+      @[0x2A'u8, 0x86], # last subidentifier unterminated
+      # An arc past uint64.
+      @[0x81'u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00],
+    ]
+    check oidText(cases[0]) == "1.2.840.10045.2.1"
+    for oid in cases:
+      check oidValid(oid) == (oidText(oid).len > 0)
+    check not oidValid(cases[3])

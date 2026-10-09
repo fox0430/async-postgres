@@ -8,7 +8,7 @@ when hasChronos:
   import std/[base64, strutils]
   import chronos/streams/tlsstream
   import bearssl/[x509, rsa, ec, ssl]
-  import pg_types
+  import pg_types, pg_der
 
   type
     X509CertCaptureContext* = object
@@ -214,6 +214,15 @@ when hasChronos:
       cur.malformed = true
       result.add(cur)
 
+  proc shownLabel(label: string): string =
+    ## Banner text comes from the file: bound and escape it before it reaches
+    ## error messages and logs.
+    const maxLen = 64
+    if label.len > maxLen:
+      label[0 ..< maxLen].escape("", "") & "..."
+    else:
+      label.escape("", "")
+
   proc decode(b: PemBlock): seq[byte] {.raises: [TLSStreamProtocolError].} =
     ## DER of an unencrypted block; raises when it is malformed.
     # BearSSL's decoder, unlike std/base64, rejects URL-safe or truncated text.
@@ -225,7 +234,8 @@ when hasChronos:
       except TLSStreamProtocolError:
         discard
     raise newException(
-      TLSStreamProtocolError, "Invalid PEM encoding in " & b.label & " block"
+      TLSStreamProtocolError,
+      "Invalid PEM encoding in " & shownLabel(b.label) & " block",
     )
 
   proc firstDerElement(
@@ -233,26 +243,12 @@ when hasChronos:
   ): seq[byte] {.raises: [TLSStreamProtocolError].} =
     ## The leading DER SEQUENCE of `data`, i.e. the certificate of a
     ## TRUSTED CERTIFICATE block without its trailing X509_CERT_AUX.
-    template malformed() =
+    var pos = 0
+    let bodyLen = derElement(data, pos, 0x30, data.len)
+    if bodyLen < 0:
       raise
         newException(TLSStreamProtocolError, "Malformed TRUSTED CERTIFICATE PEM block")
-
-    if data.len < 2 or data[0] != 0x30'u8:
-      malformed()
-    var bodyLen = 0
-    var hdrLen = 2
-    if data[1] < 0x80'u8:
-      bodyLen = int(data[1])
-    else:
-      let n = int(data[1] and 0x7F'u8)
-      if n == 0 or n > 4 or data.len < 2 + n:
-        malformed()
-      for i in 0 ..< n:
-        bodyLen = (bodyLen shl 8) or int(data[2 + i])
-      hdrLen = 2 + n
-    if bodyLen > data.len - hdrLen:
-      malformed()
-    @(data.toOpenArray(0, hdrLen + bodyLen - 1))
+    @(data.toOpenArray(0, pos + bodyLen - 1))
 
   iterator certificateDers(
       blocks: openArray[PemBlock], trusted: bool
@@ -283,27 +279,182 @@ when hasChronos:
       raise newException(TLSStreamProtocolError, "Could not find any certificates")
     TLSCertificate.init(canonical)
 
+  proc readOid(der: openArray[byte], pos: var int, limit: int): seq[byte] =
+    ## Content of the OID at `pos`, advancing past it; @[] when absent or
+    ## malformed.
+    let len = derElement(der, pos, 0x06, limit)
+    if len <= 0:
+      return @[]
+    let start = pos
+    pos += len
+    if oidValid(der.toOpenArray(start, pos - 1)):
+      result = @(der.toOpenArray(start, pos - 1))
+
+  const
+    RsaOid = @[byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]
+    EcOid = @[byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]
+
+  type EcParams = tuple[curve: seq[byte], explicit: bool]
+
+  proc readEcParams(der: openArray[byte], pos, limit: int): EcParams =
+    ## ECParameters at `pos`: a named-curve OID, or `explicit` for an inline
+    ## curve SEQUENCE, which BearSSL cannot read; empty when not parsable.
+    var p = pos
+    if derElement(der, p, 0x30, limit) >= 0:
+      result.explicit = true
+    else:
+      p = pos
+      result.curve = readOid(der, p, limit)
+
+  proc pkcs8Algorithm(der: openArray[byte]): tuple[alg: seq[byte], params: EcParams] =
+    ## Algorithm OID of a PKCS#8 PrivateKeyInfo and, for EC, its parameters;
+    ## empty for what is absent or not parsable (left for BearSSL to judge).
+    var pos = 0
+    let topLen = derElement(der, pos, 0x30, der.len)
+    if topLen < 0:
+      return
+    let topEnd = pos + topLen
+    let versionLen = derElement(der, pos, 0x02, topEnd)
+    if versionLen < 0:
+      return
+    pos += versionLen
+    let algLen = derElement(der, pos, 0x30, topEnd)
+    if algLen < 0:
+      return
+    let algEnd = pos + algLen
+    result.alg = readOid(der, pos, algEnd)
+    if result.alg == EcOid:
+      result.params = readEcParams(der, pos, algEnd)
+
+  proc sec1Params(der: openArray[byte]): EcParams =
+    ## A SEC1 ECPrivateKey's `[0] parameters`; empty when absent or not
+    ## parsable.
+    var pos = 0
+    let topLen = derElement(der, pos, 0x30, der.len)
+    if topLen < 0:
+      return
+    let topEnd = pos + topLen
+    for tag in [0x02'u8, 0x04]: # version, privateKey
+      let len = derElement(der, pos, tag, topEnd)
+      if len < 0:
+        return
+      pos += len
+    let paramsLen = derElement(der, pos, 0xA0, topEnd)
+    if paramsLen < 0:
+      return
+    readEcParams(der, pos, pos + paramsLen)
+
+  const
+    KnownKeyAlgorithms = [
+      (@[byte 0x2B, 0x65, 0x70], "Ed25519"),
+      (@[byte 0x2B, 0x65, 0x71], "Ed448"),
+      (@[byte 0x2B, 0x65, 0x6E], "X25519"),
+      (@[byte 0x2B, 0x65, 0x6F], "X448"),
+      (@[byte 0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x01], "DSA"),
+      (@oidRsaPss, "RSASSA-PSS"),
+      (@[byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x03, 0x01], "DH"),
+    ]
+    # The curves BearSSL's key decoder reads.
+    SupportedCurves = [
+      @[byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07], # P-256
+      @[byte 0x2B, 0x81, 0x04, 0x00, 0x22], # P-384
+      @[byte 0x2B, 0x81, 0x04, 0x00, 0x23], # P-521
+    ]
+    KnownCurves = [
+      (@[byte 0x2B, 0x81, 0x04, 0x00, 0x0A], "secp256k1"),
+      (@[byte 0x2B, 0x81, 0x04, 0x00, 0x21], "P-224"),
+      (@[byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x01], "P-192"),
+      (@[byte 0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07], "brainpoolP256r1"),
+      (@[byte 0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0B], "brainpoolP384r1"),
+      (@[byte 0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0D], "brainpoolP512r1"),
+    ]
+
+  proc oidName(oid: seq[byte], known: openArray[(seq[byte], string)]): string =
+    for (o, name) in known:
+      if o == oid:
+        return name
+    "OID " & oidText(oid)
+
+  proc unsupportedKey(label: string, der: openArray[byte]): string =
+    ## Why BearSSL cannot load the key in a `KeyPemLabels` block, or "" to
+    ## let it judge.
+    var params: EcParams
+    if label == "PRIVATE KEY":
+      let (alg, algParams) = pkcs8Algorithm(der)
+      if alg.len == 0 or alg == RsaOid:
+        return ""
+      if alg != EcOid:
+        # A PSS key is an RSA key too, so "only RSA" would not explain it.
+        let rsa = if alg == @oidRsaPss: "rsaEncryption RSA" else: "RSA"
+        return
+          "Unsupported private key algorithm " & oidName(alg, KnownKeyAlgorithms) &
+          " in PRIVATE KEY block; only " & rsa & " and EC keys are supported"
+      params = algParams
+    elif label == "EC PRIVATE KEY":
+      params = sec1Params(der)
+    if params.explicit:
+      return
+        "Unsupported explicit EC parameters in " & label &
+        " block; only the named curves P-256, P-384 and P-521 are supported"
+    if params.curve.len == 0 or params.curve in SupportedCurves:
+      return ""
+    "Unsupported EC curve " & oidName(params.curve, KnownCurves) & " in " & label &
+      " block; only P-256, P-384 and P-521 are supported"
+
   proc loadPrivateKey*(
       pem: string
   ): TLSPrivateKey {.raises: [TLSStreamProtocolError].} =
     ## `TLSPrivateKey.init` that also accepts every `KeyPemLabels` banner via
-    ## chronos's DER overload. Loads the first non-empty such block; an
-    ## encrypted key block before it raises `EncryptedKeyMsg`.
+    ## chronos's DER overload. Loads the first non-empty such block that looks
+    ## readable: RSA, or EC on a named curve BearSSL has, as PKCS#8, PKCS#1 or
+    ## SEC1. Blocks skipped by those checks are remembered, and the first one is
+    ## named when nothing loads — its algorithm, its curve, its banner, or its
+    ## broken encoding. The scan ends at an encrypted key block of a supported
+    ## banner (or `ENCRYPTED PRIVATE KEY`), which raises
+    ## `EncryptedKeyMsg` since removing its passphrase may be all that is
+    ## needed; at a broken key block; and at a block BearSSL rejects. The
+    ## latter two still name the first unreadable block if there is one.
+    var unreadable = ""
+    template raiseFirst(msg: string) =
+      raise newException(
+        TLSStreamProtocolError, if unreadable.len > 0: unreadable else: msg
+      )
+
     for b in pemBlocks(pem):
       if not b.label.endsWith("PRIVATE KEY"):
         continue
-      if b.label == "ENCRYPTED PRIVATE KEY" or b.encrypted:
-        raise newException(
-          TLSStreamProtocolError,
-          if b.malformed:
-            "Invalid PEM encoding in " & b.label & " block"
-          else:
-            EncryptedKeyMsg,
-        )
+      # Only for a key BearSSL could read once decrypted: an encrypted block of
+      # another type is unsupported either way.
+      if b.label == "ENCRYPTED PRIVATE KEY" or (b.encrypted and b.label in KeyPemLabels):
+        if b.malformed:
+          raiseFirst("Invalid PEM encoding in " & shownLabel(b.label) & " block")
+        raise newException(TLSStreamProtocolError, EncryptedKeyMsg)
       if b.label in KeyPemLabels:
-        let data = decode(b)
-        if data.len > 0:
-          return TLSPrivateKey.init(data)
+        let data =
+          try:
+            decode(b)
+          except TLSStreamProtocolError as e:
+            raiseFirst(e.msg)
+        if data.len == 0:
+          continue
+        let reason = unsupportedKey(b.label, data)
+        if reason.len == 0:
+          try:
+            return TLSPrivateKey.init(data)
+          except TLSStreamProtocolError as e:
+            raiseFirst(e.msg)
+        if unreadable.len == 0:
+          unreadable = reason
+      elif unreadable.len == 0:
+        # A broken block is reported as such, not as a key type to convert.
+        unreadable =
+          if b.malformed:
+            "Invalid PEM encoding in " & shownLabel(b.label) & " block"
+          else:
+            "Unsupported private key type " & shownLabel(b.label) &
+              "; only RSA and EC keys are supported"
+    if unreadable.len > 0:
+      raise newException(TLSStreamProtocolError, unreadable)
     raise newException(TLSStreamProtocolError, "Could not find private key")
 
   proc parseTrustAnchors*(pemData: string): TrustAnchorResult =

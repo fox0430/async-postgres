@@ -5,7 +5,7 @@ import pkg/nimcrypto
 import pkg/nimcrypto/pbkdf2
 import pkg/nimcrypto/utils as ncutils
 
-import pg_errors, pg_saslprep
+import pg_der, pg_errors, pg_saslprep
 from pg_types/core import isPgUIntText, pgParseIntView, pipOk
 
 template burnStr*(s: var string) =
@@ -221,112 +221,54 @@ proc scramClientFinalMessage*(
     burnStr(authMessage)
     burnStr(preparedPassword)
 
-proc derReadLen(data: openArray[byte], pos: var int): int =
-  ## DER definite-form length; -1 on malformed input.
-  if pos >= data.len:
-    return -1
-  let first = data[pos]
-  inc pos
-  if first < 0x80:
-    return int(first)
-  let n = int(first and 0x7F)
-  if n == 0 or n > 4 or pos + n > data.len:
-    return -1
-  # Accumulate as uint32 to avoid signed-shift UB and to represent full
-  # 4-byte DER lengths on 32-bit int platforms.
-  var v: uint32 = 0
-  for i in 0 ..< n:
-    v = (v shl 8) or uint32(data[pos + i])
-  pos += n
-  if v > uint32(high(int)):
-    return -1
-  return int(v)
-
 proc certSignatureAlgorithm(
     certDer: openArray[byte]
 ): tuple[oid: seq[byte], params: seq[byte]] =
   ## Extract signatureAlgorithm OID and raw parameters bytes from an X.509 DER
   ## cert; (@[], @[]) on parse failure.
   var pos = 0
-  if pos >= certDer.len or certDer[pos] != 0x30:
-    return (@[], @[])
-  inc pos
-  let outerLen = derReadLen(certDer, pos)
-  if outerLen < 0 or pos + outerLen > certDer.len:
+  let outerLen = derElement(certDer, pos, 0x30, certDer.len)
+  if outerLen < 0:
     return (@[], @[])
   let outerEnd = pos + outerLen
-
-  if pos >= outerEnd or certDer[pos] != 0x30:
-    return (@[], @[])
-  inc pos
-  let tbsLen = derReadLen(certDer, pos)
-  if tbsLen < 0 or pos + tbsLen > outerEnd:
+  let tbsLen = derElement(certDer, pos, 0x30, outerEnd)
+  if tbsLen < 0:
     return (@[], @[])
   pos += tbsLen
-
-  if pos >= outerEnd or certDer[pos] != 0x30:
-    return (@[], @[])
-  inc pos
-  let sigAlgLen = derReadLen(certDer, pos)
-  if sigAlgLen < 0 or pos + sigAlgLen > outerEnd:
+  let sigAlgLen = derElement(certDer, pos, 0x30, outerEnd)
+  if sigAlgLen < 0:
     return (@[], @[])
   let sigAlgEnd = pos + sigAlgLen
-
-  if pos >= sigAlgEnd or certDer[pos] != 0x06:
+  let oidLen = derElement(certDer, pos, 0x06, sigAlgEnd)
+  if oidLen < 0:
     return (@[], @[])
-  inc pos
-  let oidLen = derReadLen(certDer, pos)
-  if oidLen < 0 or pos + oidLen > sigAlgEnd:
-    return (@[], @[])
-  result.oid = newSeq[byte](oidLen)
-  for i in 0 ..< oidLen:
-    result.oid[i] = certDer[pos + i]
+  result.oid = @(certDer.toOpenArray(pos, pos + oidLen - 1))
   pos += oidLen
-  result.params = newSeq[byte](sigAlgEnd - pos)
-  for i in 0 ..< result.params.len:
-    result.params[i] = certDer[pos + i]
+  result.params = @(certDer.toOpenArray(pos, sigAlgEnd - 1))
 
 proc pssHashOid(params: openArray[byte]): seq[byte] =
   ## hashAlgorithm OID from RSASSA-PSS-params (RFC 4055 §3.1); @[] when absent or
   ## malformed, which per the DEFAULT sha1 falls through to SHA-256
   ## (RFC 5929 §4: MD5/SHA-1 channel-binding hash MUST be promoted to SHA-256).
   var pos = 0
-  if pos >= params.len or params[pos] != 0x30:
+  let seqLen = derElement(params, pos, 0x30, params.len)
+  if seqLen < 0:
     return @[]
-  inc pos
-  let seqLen = derReadLen(params, pos)
-  if seqLen < 0 or pos + seqLen > params.len:
+  let ctxLen = derElement(params, pos, 0xA0, pos + seqLen)
+  if ctxLen < 0:
     return @[]
-  let seqEnd = pos + seqLen
-  if pos >= seqEnd or params[pos] != 0xA0:
+  let algLen = derElement(params, pos, 0x30, pos + ctxLen)
+  if algLen < 0:
     return @[]
-  inc pos
-  let ctxLen = derReadLen(params, pos)
-  if ctxLen < 0 or pos + ctxLen > seqEnd:
+  let oidLen = derElement(params, pos, 0x06, pos + algLen)
+  if oidLen < 0:
     return @[]
-  let ctxEnd = pos + ctxLen
-  if pos >= ctxEnd or params[pos] != 0x30:
-    return @[]
-  inc pos
-  let algLen = derReadLen(params, pos)
-  if algLen < 0 or pos + algLen > ctxEnd:
-    return @[]
-  let algEnd = pos + algLen
-  if pos >= algEnd or params[pos] != 0x06:
-    return @[]
-  inc pos
-  let oidLen = derReadLen(params, pos)
-  if oidLen < 0 or pos + oidLen > algEnd:
-    return @[]
-  result = newSeq[byte](oidLen)
-  for i in 0 ..< oidLen:
-    result[i] = params[pos + i]
+  @(params.toOpenArray(pos, pos + oidLen - 1))
 
 # Signature-algorithm and hash OID contents (no tag/length prefix).
 const
   oidSha384Rsa = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C]
   oidSha512Rsa = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D]
-  oidRsaPss* = [byte 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A]
   oidEcdsaSha384 = [byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]
   oidEcdsaSha512 = [byte 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]
   oidDsaSha384 = [byte 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x03]

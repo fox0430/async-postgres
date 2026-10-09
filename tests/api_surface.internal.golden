@@ -8,7 +8,6 @@ async_postgres/pg_auth.nim	burnStr
 async_postgres/pg_auth.nim	channelBound
 async_postgres/pg_auth.nim	computeTlsServerEndpoint
 async_postgres/pg_auth.nim	md5AuthHash
-async_postgres/pg_auth.nim	oidRsaPss
 async_postgres/pg_auth.nim	scramClientFinalMessage
 async_postgres/pg_auth.nim	scramClientFirstMessage
 async_postgres/pg_auth.nim	scramEscapeUsername
@@ -397,6 +396,10 @@ async_postgres/pg_connection/types.nim	waitReplWrite
 async_postgres/pg_connection/types.nim	warnStderr
 async_postgres/pg_connection/types.nim	wireSettled
 async_postgres/pg_connection/types.nim	writer
+async_postgres/pg_der.nim	derElement
+async_postgres/pg_der.nim	oidRsaPss
+async_postgres/pg_der.nim	oidText
+async_postgres/pg_der.nim	oidValid
 async_postgres/pg_errors.nim	newStartupError
 async_postgres/pg_errors.nim	setPerHost
 async_postgres/pg_gensym.nim	macroSym

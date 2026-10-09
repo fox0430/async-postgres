@@ -1,4 +1,4 @@
-import std/[unittest, strutils, os]
+import std/[unittest, strutils, os, base64]
 
 import cert_fixtures
 from mock_pg_server import
@@ -38,7 +38,7 @@ proc testCaCert(): string =
 when hasAsyncDispatch:
   import std/asyncnet
   when defined(ssl):
-    import std/[dynlib, net, openssl, base64]
+    import std/[dynlib, net, openssl]
 
 proc buildBackendMsg(msgType: char, body: seq[byte]): seq[byte] =
   result = @[byte(msgType)]
@@ -2918,6 +2918,47 @@ when hasChronos:
       except TLSStreamProtocolError as e:
         return e.msg
 
+    proc derPem(label: string, der: seq[byte]): string =
+      "-----BEGIN " & label & "-----\n" & base64.encode(der) & "\n-----END " & label &
+        "-----\n"
+
+    proc derTlv(tag: byte, body: seq[byte]): seq[byte] =
+      doAssert body.len < 0x80, "short-form length only"
+      @[tag, byte(body.len)] & body
+
+    const
+      rsaOid = @[0x2A'u8, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]
+      rsaPssOid = @[0x2A'u8, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A]
+      ecOid = @[0x2A'u8, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]
+      secp256k1 = @[0x2B'u8, 0x81, 0x04, 0x00, 0x0A]
+      p256 = @[0x2A'u8, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+      # 1.2.3.200: a multi-byte arc
+      unnamedOid = @[0x2A'u8, 0x03, 0x81, 0x48]
+      # Stand-in for an inline ECParameters { version 1, ... }.
+      explicitCurve = @[0x30'u8, 0x03, 0x02, 0x01, 0x01]
+      # `openssl genpkey -algorithm ed25519`
+      ed25519 =
+        "-----BEGIN PRIVATE KEY-----\n" &
+        "MC4CAQAwBQYDK2VwBCIEIKEeYP8vhwsQh0N/pkq39bFy882Xzyr/1Ye04qr+wTnQ\n" &
+        "-----END PRIVATE KEY-----\n"
+      dsa = "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n-----END DSA PRIVATE KEY-----\n"
+      openssh =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+
+    proc pkcs8Pem(alg: seq[byte]): string =
+      ## PrivateKeyInfo { 0, `alg`, OCTET STRING {} }: no key BearSSL can read.
+      derPem(
+        "PRIVATE KEY",
+        derTlv(0x30, @[0x02'u8, 0x01, 0x00] & derTlv(0x30, alg) & @[0x04'u8, 0x00]),
+      )
+
+    proc sec1Pem(params: seq[byte]): string =
+      ## SEC1 ECPrivateKey { 1, OCTET STRING, [0] `params` }
+      derPem(
+        "EC PRIVATE KEY",
+        derTlv(0x30, @[0x02'u8, 0x01, 0x01, 0x04, 0x01, 0x01] & derTlv(0xA0, params)),
+      )
+
     test "loadPrivateKey reports passphrase-protected keys":
       let plain = readCertFile("wrong_ca.rsa.key")
       check EncryptedKeyMsg == loadKeyError(readCertFile("encrypted.key"))
@@ -2937,23 +2978,122 @@ when hasChronos:
       check loadPrivateKey(plain & legacyEncryptedKey) != nil
       check loadPrivateKey(plain & pkcs8EncryptedKey) != nil
 
-    test "key blocks BearSSL cannot read are skipped unless encrypted":
+    test "key blocks BearSSL cannot read are skipped, encrypted or not":
       let plain = readCertFile("wrong_ca.rsa.key")
       const brokenDsa = "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n"
-      const dsa =
-        "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n-----END DSA PRIVATE KEY-----\n"
-      const openssh =
-        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
       check loadPrivateKey(dsa & plain) != nil
       check loadPrivateKey(openssh & plain) != nil
       check loadPrivateKey(brokenDsa & plain) != nil
-      check EncryptedKeyMsg ==
-        loadKeyError(legacyEncryptedKey.replace("RSA PRIVATE", "DSA PRIVATE") & plain)
+      # Removing the passphrase would not make a DSA key loadable.
+      let encryptedDsa = legacyEncryptedKey.replace("RSA PRIVATE", "DSA PRIVATE")
+      check loadPrivateKey(encryptedDsa & plain) != nil
+      check "Unsupported private key type DSA PRIVATE KEY; only RSA and EC keys are supported" ==
+        loadKeyError(encryptedDsa)
+
+    test "unsupported key types are named, not reported as missing":
+      const unsupportedDsa =
+        "Unsupported private key type DSA PRIVATE KEY; only RSA and EC keys are supported"
+      check unsupportedDsa == loadKeyError(dsa)
+      check "Unsupported private key type OPENSSH PRIVATE KEY; only RSA and EC keys are supported" ==
+        loadKeyError(openssh)
+      # The first unsupported banner is named.
+      check unsupportedDsa == loadKeyError(dsa & openssh)
+      # A readable key still wins.
+      check loadPrivateKey(dsa & readCertFile("wrong_ca.rsa.key")) != nil
+      # Certificates and empty supported blocks keep the plain miss.
+      check "Could not find private key" == loadKeyError(testCaCert())
+      check "Could not find private key" ==
+        loadKeyError("-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n")
+
+    test "PKCS#8 keys of an algorithm BearSSL lacks are named":
+      const unsupportedEd25519 =
+        "Unsupported private key algorithm Ed25519 in PRIVATE KEY block; " &
+        "only RSA and EC keys are supported"
+      check unsupportedEd25519 == loadKeyError(ed25519)
+      # The first unreadable block is named, whichever kind it is.
+      check unsupportedEd25519 == loadKeyError(ed25519 & dsa)
+      # Also when a later broken block ends the scan.
+      let truncated = readCertFile("wrong_ca.rsa.key")
+      check unsupportedEd25519 ==
+        loadKeyError(ed25519 & truncated[0 ..< truncated.find("-----END")])
+      # An encrypted key may only need its passphrase removed: that is the
+      # advice, not converting it to RSA or EC.
+      check EncryptedKeyMsg == loadKeyError(ed25519 & legacyEncryptedKey)
+      # A readable key after it still wins.
+      check loadPrivateKey(ed25519 & readCertFile("wrong_ca.rsa.key")) != nil
+
+      check "Unsupported private key algorithm OID 1.2.3.200 in PRIVATE KEY block; " &
+        "only RSA and EC keys are supported" ==
+        loadKeyError(pkcs8Pem(derTlv(0x06, unnamedOid)))
+      # A PSS key is RSA too, so the message names the RSA form that loads.
+      check "Unsupported private key algorithm RSASSA-PSS in PRIVATE KEY block; " &
+        "only rsaEncryption RSA and EC keys are supported" ==
+        loadKeyError(pkcs8Pem(derTlv(0x06, rsaPssOid)))
+
+    test "a key BearSSL rejects after an unsupported one still names the first":
+      let brokenRsa = pkcs8Pem(derTlv(0x06, rsaOid))
+      let bearSslError = loadKeyError(brokenRsa)
+      check "Unsupported" notin bearSslError
+      check "Unsupported private key algorithm Ed25519 in PRIVATE KEY block; " &
+        "only RSA and EC keys are supported" == loadKeyError(ed25519 & brokenRsa)
+
+    test "EC keys on a curve BearSSL lacks are named":
+      const unsupportedCurve = " block; only P-256, P-384 and P-521 are supported"
+      check "Unsupported EC curve secp256k1 in PRIVATE KEY" & unsupportedCurve ==
+        loadKeyError(pkcs8Pem(derTlv(0x06, ecOid) & derTlv(0x06, secp256k1)))
+      let sec1 = sec1Pem(derTlv(0x06, secp256k1))
+      check "Unsupported EC curve secp256k1 in EC PRIVATE KEY" & unsupportedCurve ==
+        loadKeyError(sec1)
+      check "Unsupported EC curve OID 1.2.3.200 in PRIVATE KEY" & unsupportedCurve ==
+        loadKeyError(pkcs8Pem(derTlv(0x06, ecOid) & derTlv(0x06, unnamedOid)))
+      # A supported curve is left to BearSSL.
+      check "Unsupported" notin
+        loadKeyError(pkcs8Pem(derTlv(0x06, ecOid) & derTlv(0x06, p256)))
+      # A readable key after it still wins.
+      check loadPrivateKey(sec1 & readCertFile("wrong_ca.rsa.key")) != nil
+
+    test "EC keys with explicit curve parameters are named":
+      # `openssl ecparam -param_enc explicit`; BearSSL reads named curves only.
+      const unsupportedExplicit =
+        " block; only the named curves P-256, P-384 and P-521 are supported"
+      check "Unsupported explicit EC parameters in PRIVATE KEY" & unsupportedExplicit ==
+        loadKeyError(pkcs8Pem(derTlv(0x06, ecOid) & explicitCurve))
+      check "Unsupported explicit EC parameters in EC PRIVATE KEY" & unsupportedExplicit ==
+        loadKeyError(sec1Pem(explicitCurve))
+      # Parameters that are neither an OID nor a SEQUENCE are left to BearSSL.
+      check "Unsupported" notin
+        loadKeyError(pkcs8Pem(derTlv(0x06, ecOid) & @[0x05'u8, 0x00]))
+      check loadPrivateKey(sec1Pem(explicitCurve) & readCertFile("wrong_ca.rsa.key")) !=
+        nil
+
+    test "a malformed unsupported block is reported as malformed":
+      for pem in [
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n",
+        "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n",
+      ]:
+        check loadKeyError(pem).startsWith("Invalid PEM encoding in ")
+
+    test "banner text in key errors is bounded and escaped":
+      let label = "\x1b[31m" & 'X'.repeat(100) & " PRIVATE KEY"
+      let msg = loadKeyError(
+        "-----BEGIN " & label & "-----\nAAAA\n-----END " & label & "-----\n"
+      )
+      check "Unsupported private key type \\x1B[31m" & 'X'.repeat(59) &
+        "...; only RSA and EC keys are supported" == msg
 
     test "truncated key blocks are reported as malformed":
       for key in [pkcs8EncryptedKey, legacyEncryptedKey]:
         let truncated = key[0 ..< key.find("-----END")]
         check "Invalid PEM encoding" in loadKeyError(truncated)
+
+    test "a 4-byte DER length at the sign bit is rejected, not wrapped":
+      # 0x80000000 wraps negative in a 32-bit int and passed the bounds check.
+      let version = @[0x30'u8, 0x07, 0x02, 0x84, 0x80, 0x00, 0x00, 0x00, 0x00]
+      check loadKeyError(derPem("PRIVATE KEY", version)).len > 0
+      expect TLSStreamProtocolError:
+        discard loadCertificate(
+          derPem("TRUSTED CERTIFICATE", @[0x30'u8, 0x84, 0x80, 0x00, 0x00, 0x00])
+        )
 
     test "a malformed key block is reported as such, not as encrypted":
       const corrupt = "-----BEGIN PRIVATE KEY-----\nAA*A\n-----END PRIVATE KEY-----\n"
