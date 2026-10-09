@@ -3081,6 +3081,14 @@ when hasChronos:
       check "Unsupported private key type \\x1B[31m" & 'X'.repeat(59) &
         "...; only RSA and EC keys are supported" == msg
 
+    test "OID text in key errors is bounded":
+      var oid = newSeq[byte](60)
+      oid[0] = 0x2A # 1.2, then 59 zero arcs
+      let text = "1.2" & ".0".repeat(59)
+      check "Unsupported private key algorithm OID " & text[0 ..< 64] &
+        "... in PRIVATE KEY block; only RSA and EC keys are supported" ==
+        loadKeyError(pkcs8Pem(derTlv(0x06, oid)))
+
     test "truncated key blocks are reported as malformed":
       for key in [pkcs8EncryptedKey, legacyEncryptedKey]:
         let truncated = key[0 ..< key.find("-----END")]
@@ -3088,8 +3096,10 @@ when hasChronos:
 
     test "a 4-byte DER length at the sign bit is rejected, not wrapped":
       # 0x80000000 wraps negative in a 32-bit int and passed the bounds check.
-      let version = @[0x30'u8, 0x07, 0x02, 0x84, 0x80, 0x00, 0x00, 0x00, 0x00]
-      check loadKeyError(derPem("PRIVATE KEY", version)).len > 0
+      # On the OID, an unchecked length would index past the data.
+      let msg = loadKeyError(pkcs8Pem(@[0x06'u8, 0x84, 0x80, 0x00, 0x00, 0x00]))
+      check msg.len > 0
+      check "Unsupported" notin msg
       expect TLSStreamProtocolError:
         discard loadCertificate(
           derPem("TRUSTED CERTIFICATE", @[0x30'u8, 0x84, 0x80, 0x00, 0x00, 0x00])

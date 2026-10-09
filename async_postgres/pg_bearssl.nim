@@ -373,7 +373,8 @@ when hasChronos:
     for (o, name) in known:
       if o == oid:
         return name
-    "OID " & oidText(oid)
+    # The OID comes from the file too.
+    "OID " & shownLabel(oidText(oid))
 
   proc unsupportedKey(label: string, der: openArray[byte]): string =
     ## Why BearSSL cannot load the key in a `KeyPemLabels` block, or "" to
