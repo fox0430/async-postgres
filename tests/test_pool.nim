@@ -2642,6 +2642,30 @@ suite "maxLifetime across a health-check ping":
 
     waitFor t()
 
+  test "a waiter granted a conn due for a ping pings it itself":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = lifetimePool(ms, maxSize = 1)
+      pool.config.maxLifetime = ZeroDuration
+      pool.active = 1
+      let waiter = pool.acquire()
+      doAssert pool.waiterCount == 1
+      # A caller gives up its slot, leaving an unpinged conn behind.
+      let (stale, staleSt) = await connectToMock(ms)
+      pool.addStale(stale)
+      pool.releaseSlot()
+
+      doAssert (await drainFrontendMessage(staleSt)).msgType == 'Q'
+      await staleSt.answerPing()
+      doAssert (await waiter.wait(seconds(5))) == stale
+      doAssert pool.active == 1
+
+      await stale.close()
+      await closeClient(staleSt)
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "maxLifetime on release":
   proc connectToMock(ms: MockServer): Future[(PgConnection, MockClient)] {.async.} =
     let connFut = connect(mockConfig(ms.port))
@@ -2721,6 +2745,63 @@ suite "maxLifetime on release":
       await pool.close(seconds(1))
       await closeClient(st)
       await closeServer(ms)
+
+    waitFor t()
+
+  test "an expired conn released inside a backoff window is replaced too":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.maxLifetime = seconds(1)
+      let first = pool.acquire()
+      let firstSt = await acceptAndReady(ms)
+      let conn = await first.wait(seconds(5))
+      let second = pool.acquire()
+      doAssert pool.waiterCount == 1
+      # Paces the replenish only: the waiter dials like any acquire.
+      pool.consecutiveConnectFailures = 1
+      pool.nextConnectRetryAt = Moment.now() + minutes(5)
+
+      conn.createdAt = Moment.now() - seconds(5)
+      conn.release()
+      let freshFut = acceptAndReady(ms)
+      let fresh = await second.wait(seconds(5))
+      doAssert fresh != conn
+      let freshSt = await freshFut
+      doAssert pool.active == 1
+
+      await fresh.close()
+      await closeClient(freshSt)
+      await closeClient(firstSt)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a waiter whose replacement dial fails gets its error":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.maxLifetime = seconds(1)
+      let first = pool.acquire()
+      let firstSt = await acceptAndReady(ms)
+      let conn = await first.wait(seconds(5))
+      let second = pool.acquire()
+      doAssert pool.waiterCount == 1
+      await closeServer(ms)
+
+      conn.createdAt = Moment.now() - seconds(5)
+      conn.release()
+      var kind = pekClosed
+      try:
+        discard await second.wait(seconds(5))
+      except PgPoolError as e:
+        kind = e.kind
+      doAssert kind == pekConnectFailed
+      doAssert pool.active == 0
+
+      await closeClient(firstSt)
 
     waitFor t()
 
@@ -3088,7 +3169,8 @@ suite "Acquire timeout":
         let waiter = pool.waiters.peekFirst()
         proc failWaiter() {.async.} =
           await sleepMsAsync(30) # due after the acquire's timer
-          doAssert pool.failLastWaiter(newException(PgConnectionError, "dial failed"))
+          # The only slot's holder gives it up on a refused dial.
+          pool.releaseSlot(newException(PgConnectionError, "refused"))
 
         let failFut = failWaiter()
         blockPast(Moment.now() + milliseconds(30))
@@ -3835,63 +3917,101 @@ suite "FIFO fairness":
     check not pool.tryHandoffToWaiter(mockConn())
     check pool.waiters.len == 0
 
-  test "failLastWaiter fails the tail and preserves the head":
-    # FIFO fairness: a spawn connect failure must not strike the head waiter,
-    # which has waited longest and keeps its claim on the next good connection.
-    # The youngest (tail) waiter absorbs the failure instead.
-    let pool = makePool()
-    let headFut = newFuture[PgConnection]("head")
-    let tailFut = newFuture[PgConnection]("tail")
-    pool.waiters.addLast(Waiter(fut: headFut, cancelled: false))
-    pool.waiters.addLast(Waiter(fut: tailFut, cancelled: false))
+  test "grantSlots hands the head waiter an idle conn with its slot":
+    # The head gets the idle conn, unchecked, with a slot; nothing is left for
+    # the next waiter at maxSize.
+    let pool = makePool(maxSize = 1)
+    let idleConn = mockConn()
+    pool.idle.addLast(toPooled(idleConn))
+    let head = Waiter(fut: newFuture[PgConnection]("head"), cancelled: false)
+    let tail = Waiter(fut: newFuture[PgConnection]("tail"), cancelled: false)
+    pool.waiters.addLast(head)
+    pool.waiters.addLast(tail)
     pool.waiterCount = 2
 
-    check pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+    pool.grantSlots()
+    check head.fut.completed()
+    check head.fut.read() == nil
+    check head.grant.conn == idleConn
+    check not tail.fut.finished()
+    check pool.idle.len == 0
+    check pool.active == 1
     check pool.waiterCount == 1
-    check tailFut.failed() # youngest waiter took the failure
-    check not headFut.finished() # oldest waiter still queued for delivery
 
-    # A subsequent success still goes to the head, in FIFO order.
-    let conn = mockConn()
-    check pool.tryHandoffToWaiter(conn)
-    check pool.waiterCount == 0
-    check headFut.completed()
-    check headFut.read() == conn
-
-    # Drain the stored failure so it isn't flagged as unhandled at teardown.
-    try:
-      discard tailFut.read()
-    except PgPoolError:
-      discard
-
-  test "failLastWaiter skips abandoned waiters from the back":
-    # A cancelled waiter at the tail is inert (already settled): skip it and
-    # fail the next live waiter, without touching waiterCount for the cancelled
-    # one (settleAbandonedWaiter already decremented it).
-    let pool = makePool()
-    let liveFut = newFuture[PgConnection]("live")
-    pool.waiters.addLast(Waiter(fut: liveFut, cancelled: false))
+  test "grantSlots gives an empty slot under maxSize, skipping abandoned waiters":
+    let pool = makePool(maxSize = 1)
+    let live = Waiter(fut: newFuture[PgConnection]("live"), cancelled: false)
     pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("c"), cancelled: true))
+    pool.waiters.addLast(live)
     pool.waiterCount = 1
 
-    check pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+    pool.grantSlots()
+    check live.fut.completed()
+    check live.grant.conn == nil
+    check pool.active == 1
     check pool.waiterCount == 0
     check pool.waiters.len == 0
-    check liveFut.failed()
 
-    try:
-      discard liveFut.read()
-    except PgPoolError:
-      discard
+  test "grantSlots serves as many waiters as free capacity allows":
+    let pool = makePool(maxSize = 3)
+    pool.active = 1
+    var ws: seq[Waiter]
+    for i in 0 ..< 3:
+      ws.add Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+      pool.waiters.addLast(ws[^1])
+    pool.waiterCount = 3
 
-  test "failLastWaiter returns false with no live waiters":
-    let pool = makePool()
-    check not pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+    pool.grantSlots()
+    check ws[0].fut.completed() and ws[1].fut.completed()
+    check not ws[2].fut.finished()
+    check pool.active == 3
+    check pool.waiterCount == 1
 
-    # All-cancelled waiters are equivalent to no waiters and get drained.
-    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("c"), cancelled: true))
-    check not pool.failLastWaiter(newException(PgPoolError, "connect failed"))
-    check pool.waiters.len == 0
+  test "grantSlots gives an empty slot inside a connect-backoff window":
+    # The waiter dials itself, like an acquire on the fast path.
+    let pool = makePool(maxSize = 1)
+    pool.consecutiveConnectFailures = 1
+    pool.nextConnectRetryAt = Moment.now() + seconds(60)
+    let w = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(w)
+    pool.waiterCount = 1
+
+    pool.grantSlots()
+    check w.fut.completed()
+    check pool.active == 1
+
+  test "grantSlots gives no empty slot at maxSize, under a config fault, or without dial":
+    let pool = makePool(maxSize = 1)
+    let w = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(w)
+    pool.waiterCount = 1
+
+    pool.active = 1
+    pool.grantSlots()
+    check not w.fut.finished()
+
+    pool.active = 0
+    pool.grantSlots(dial = false)
+    check not w.fut.finished()
+
+    pool.configFault = newException(PgConfigError, "bad config")
+    pool.grantSlots()
+    check not w.fut.finished()
+    check pool.active == 0
+    check pool.waiterCount == 1
+
+  test "grantSlots is a no-op on a closed pool":
+    let pool = makePool(maxSize = 1)
+    pool.closed = true
+    pool.idle.addLast(toPooled(mockConn()))
+    let w = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(w)
+    pool.waiterCount = 1
+
+    pool.grantSlots()
+    check not w.fut.finished()
+    check pool.idle.len == 1
+    check pool.active == 0
 
   test "abandoned waiter handed off on same tick does not double-decrement":
     # Regression: the timeout/cancel cleanup decremented `waiterCount`
@@ -3938,10 +4058,50 @@ suite "FIFO fairness":
     check waiter.cancelled
     check pool.idle.len == 0 # nothing was delivered, nothing to return
 
+  test "abandoned waiter granted a slot on the same tick passes it on":
+    # A grant decrements and completes in one step too. The abandoned acquire
+    # puts the unchecked conn back at the head of `idle`, and the slot goes to
+    # the next waiter with it.
+    let pool = makePool(maxSize = 1)
+    let idleConn = mockConn()
+    pool.idle.addLast(toPooled(idleConn))
+    let first = Waiter(fut: newFuture[PgConnection]("first"), cancelled: false)
+    pool.waiters.addLast(first)
+    pool.waiterCount = 1
+    pool.grantSlots()
+    check first.fut.completed()
+
+    let next = Waiter(fut: newFuture[PgConnection]("next"), cancelled: false)
+    pool.waiters.addLast(next)
+    pool.waiterCount.inc
+
+    pool.settleAbandonedWaiter(first)
+    check pool.waiterCount == 0
+    check next.fut.completed()
+    check next.grant.conn == idleConn
+    check pool.active == 1
+    check pool.idle.len == 0
+
+  test "abandoned waiter granted an empty slot gives it back":
+    let pool = makePool(maxSize = 1)
+    let w = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(w)
+    pool.waiterCount = 1
+    pool.grantSlots()
+    check pool.active == 1
+
+    check pool.dialsInFlight == 1 # its dial is as good as under way
+
+    pool.settleAbandonedWaiter(w)
+    check pool.waiterCount == 0
+    check pool.active == 0
+    check pool.idle.len == 0
+    check pool.dialsInFlight == 0
+
   test "waiter failed on same tick does not double-decrement waiterCount":
-    # The fail-path sibling of the handoff race: `failLastWaiter` (spawn connect
-    # failure or `close`) pops the waiter, decrements `waiterCount`, and *fails*
-    # the future. asyncdispatch `wait()` can still surface AsyncTimeoutError on
+    # The fail-path sibling of the handoff race: `failStrandedWaiters` (a refused
+    # or config-faulted dial) or `close` pops the waiter, decrements
+    # `waiterCount`, and *fails* the future. asyncdispatch `wait()` can still surface AsyncTimeoutError on
     # the same tick when its timeout side wins the `withTimeout` race. Cleanup
     # must skip the decrement for a failed future too (not just a completed one),
     # or `waiterCount` drifts negative like the handoff case.
@@ -3950,15 +4110,15 @@ suite "FIFO fairness":
     pool.waiters.addLast(waiter)
     pool.waiterCount.inc
 
-    # failLastWaiter pops the waiter, decrements, and fails the future.
-    check pool.failLastWaiter(newException(PgPoolError, "connect failed"))
+    # failStrandedWaiters pops the waiter, decrements, and fails the future.
+    pool.failStrandedWaiters(newException(PgConnectionError, "refused"))
     check pool.waiterCount == 0
     check waiter.fut.failed()
 
     # The acquire then observes a timeout/cancel on the same tick. Cleanup must
     # not decrement again; a failed future carries no conn to return. As with the
-    # handoff case, `failLastWaiter` already popped the waiter, so no `cancelled`
-    # flag is set.
+    # handoff case, `failStrandedWaiters` already popped the waiter, so no
+    # `cancelled` flag is set.
     pool.settleAbandonedWaiter(waiter)
     check pool.waiterCount == 0 # not -1
     check pool.idle.len == 0 # nothing delivered, nothing to return
@@ -3972,180 +4132,93 @@ suite "FIFO fairness":
 
   test "acquire does not jump idle when waiters are already queued":
     # Pre-fix bug: a fresh acquire would pop the idle conn and bypass any
-    # already-queued waiter. After the fix, the new caller must join the
-    # back of the queue and leave idle untouched.
+    # already-queued waiter. The new caller must join the back of the queue;
+    # the idle conn goes to the head waiter.
     let pool = makePool(maxSize = 2)
-    pool.active = 2 # at maxSize
-    pool.idle.addLast(toPooled(mockConn()))
-    let existingFut = newFuture[PgConnection]("existing")
-    pool.waiters.addLast(Waiter(fut: existingFut, cancelled: false))
+    pool.active = 1
+    let idleConn = mockConn()
+    pool.idle.addLast(toPooled(idleConn))
+    let existing = Waiter(fut: newFuture[PgConnection]("existing"), cancelled: false)
+    pool.waiters.addLast(existing)
     pool.waiterCount = 1
 
     let newFut = pool.acquire()
 
-    check pool.waiters.len == 2
-    check pool.waiterCount == 2
-    check pool.idle.len == 1
+    check existing.fut.completed()
+    check existing.grant.conn == idleConn
+    check pool.idle.len == 0
+    check pool.waiterCount == 1
     check not newFut.finished
-    check not existingFut.finished
 
-    # Drain in FIFO order: existing waiter first, then the new one.
     let c1 = mockConn()
     pool.release(c1)
-    check existingFut.finished
-    check existingFut.read() == c1
-
-    let c2 = mockConn()
-    pool.release(c2)
-    check waitFor(newFut) == c2
+    check waitFor(newFut) == c1
 
   test "acquire does not create new conn when waiters are already queued":
     # Pre-fix bug: with active<maxSize and waiters queued (e.g. after a
     # broken-conn release dropped active without serving the waiter), a
     # fresh acquire would create a new connection that should have gone to
-    # the head-of-queue waiter. After the fix, the new caller queues.
-    let pool = makePool(maxSize = 5)
+    # the head-of-queue waiter. The new caller queues, and the free slot goes
+    # to the head.
+    let pool = makePool(maxSize = 2)
     pool.active = 1
-    let existingFut = newFuture[PgConnection]("existing")
-    pool.waiters.addLast(Waiter(fut: existingFut, cancelled: false))
+    let existing = Waiter(fut: newFuture[PgConnection]("existing"), cancelled: false)
+    pool.waiters.addLast(existing)
     pool.waiterCount = 1
-    # Suppress the spawn-for-waiter so the test isolates the queue logic
-    # from the async connect path.
-    pool.consecutiveConnectFailures = 1
-    pool.nextConnectRetryAt = Moment.now() + seconds(60)
 
     let newFut = pool.acquire()
 
-    check pool.waiters.len == 2
-    check pool.waiterCount == 2
-    check pool.active == 1
+    check existing.fut.completed()
+    check existing.grant.conn == nil
+    check pool.active == 2
+    check pool.waiterCount == 1
     check not newFut.finished
-    check not existingFut.finished
 
-    # Drain front-of-queue waiter; newFut intentionally left pending.
-    pool.release(mockConn())
-    check existingFut.finished
-    discard newFut
+    let c1 = mockConn()
+    pool.release(c1)
+    check waitFor(newFut) == c1
 
-  test "broken-conn release in backoff does not reserve a slot":
-    # Verifies canAttemptConnect is honored: while in the backoff window,
-    # a broken-conn release just frees the active slot without kicking off
-    # a spawn-for-waiter (which would otherwise pile failures on a known
-    # unreachable DB).
+  test "broken-conn release in a backoff window grants the slot to the waiter":
+    # A backoff window paces the replenish only: the waiter dials into the
+    # freed slot itself, like an acquire on the fast path.
     let pool = makePool(maxSize = 1)
     pool.active = 1
-    let waitFut = newFuture[PgConnection]("waiter")
-    pool.waiters.addLast(Waiter(fut: waitFut, cancelled: false))
+    let waiter = Waiter(fut: newFuture[PgConnection]("waiter"), cancelled: false)
+    pool.waiters.addLast(waiter)
     pool.waiterCount = 1
     pool.consecutiveConnectFailures = 1
     pool.nextConnectRetryAt = Moment.now() + seconds(60)
 
     pool.release(mockConn(csClosed))
 
-    check pool.active == 0
-    check pool.waiterCount == 1
-    check not waitFut.finished
+    check pool.active == 1
+    check pool.waiterCount == 0
+    check waiter.fut.completed()
+    check waiter.grant.conn == nil
 
-  test "broken-conn release reserves an active slot for queued waiter":
-    # The fix: discarding a broken connection while a waiter is queued
-    # must immediately reserve the freed slot for an out-of-band connect.
-    # Otherwise a concurrent fresh acquire would jump the queue.
-    proc t() {.async.} =
-      let pool = makePool(maxSize = 1)
-      # The spawn-for-waiter triggered by release() will try to connect to
-      # localhost:5432. Cap the attempt so the test doesn't hang on hosts
-      # where the SYN is silently dropped (the assertions below are
-      # synchronous; the connect outcome only affects close()'s drain).
-      pool.config.connConfig.connectTimeout = milliseconds(100)
-      pool.active = 1
-      let waitFut = newFuture[PgConnection]("waiter")
-      pool.waiters.addLast(Waiter(fut: waitFut, cancelled: false))
-      pool.waiterCount = 1
-
-      pool.release(mockConn(csClosed))
-
-      # Synchronously after release: active was decremented from 1 to 0,
-      # then re-incremented to 1 as a reservation for the spawn-for-waiter
-      # task. The waiter is still queued (the spawn body has not run yet).
-      doAssert pool.active == 1
-      doAssert pool.waiterCount == 1
-
-      # Drain the in-flight spawn via close so the test does not outlive it.
-      await pool.close()
-      doAssert pool.closed
-
-    waitFor t()
-
-  test "respawnForStrandedWaiter reserves a slot when a waiter is queued":
-    proc t() {.async.} =
-      let pool = makePool(maxSize = 1)
-      pool.config.connConfig.connectTimeout = milliseconds(100)
-      let waitFut = newFuture[PgConnection]("waiter")
-      pool.waiters.addLast(Waiter(fut: waitFut, cancelled: false))
-      pool.waiterCount = 1
-
-      pool.respawnForStrandedWaiter()
-
-      doAssert pool.active == 1
-      doAssert pool.waiterCount == 1
-      doAssert pool.pendingBackgroundTasks.len >= 1
-
-      await pool.close()
-
-    waitFor t()
-
-  test "respawnForStrandedWaiter is a no-op without a queued waiter":
-    let pool = makePool(maxSize = 1)
-    pool.respawnForStrandedWaiter()
-    check pool.active == 0
-    check pool.pendingBackgroundTasks.len == 0
-
-  test "respawnForStrandedWaiter is a no-op when the pool is at maxSize":
+  test "broken-conn release grants the freed slot to the queued waiter":
+    # Discarding a broken connection while a waiter is queued must hand the
+    # freed slot to it at once. Otherwise a concurrent fresh acquire would
+    # jump the queue.
     let pool = makePool(maxSize = 1)
     pool.active = 1
-    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("w"), cancelled: false))
+    let waiter = Waiter(fut: newFuture[PgConnection]("waiter"), cancelled: false)
+    pool.waiters.addLast(waiter)
     pool.waiterCount = 1
-    pool.respawnForStrandedWaiter()
+
+    pool.release(mockConn(csClosed))
+
     check pool.active == 1
-    check pool.pendingBackgroundTasks.len == 0
-
-  test "respawnForStrandedWaiter honors the connect-backoff window":
-    let pool = makePool(maxSize = 1)
-    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("w"), cancelled: false))
-    pool.waiterCount = 1
-    pool.consecutiveConnectFailures = 1
-    pool.nextConnectRetryAt = Moment.now() + seconds(60)
-    pool.respawnForStrandedWaiter()
-    check pool.active == 0
-    check pool.pendingBackgroundTasks.len == 0
-
-  test "respawnForStrandedWaiter is a no-op on a closed pool":
-    let pool = makePool(maxSize = 1)
-    pool.closed = true
-    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("w"), cancelled: false))
-    pool.waiterCount = 1
-    pool.respawnForStrandedWaiter()
-    check pool.active == 0
-    check pool.pendingBackgroundTasks.len == 0
-
-  test "respawnForStrandedWaiter does not stack a dial on a waiter with one in flight":
-    # Called every tick: a slow connect must not gain a dial per tick.
-    let pool = makePool(maxSize = 3)
-    pool.waiters.addLast(Waiter(fut: newFuture[PgConnection]("w"), cancelled: false))
-    pool.waiterCount = 1
-    pool.spawnsInFlight = 1
-    pool.active = 1
-    pool.respawnForStrandedWaiter()
-    check pool.active == 1
-    check pool.pendingBackgroundTasks.len == 0
+    check pool.waiterCount == 0
+    check waiter.fut.completed()
+    check waiter.fut.read() == nil
 
   when hasChronos:
-    test "failed caller-driven connect respawns for the waiter queued behind it":
-      # A takes the fresh-connect fast path (waiterCount==0) and reserves the
-      # only slot. B queues while A is suspended, sees active==maxSize, and
-      # skips the queue-time spawn. When A's connect times out and releases
-      # the slot, B would sit until its own budget elapses unless the failure
-      # path also emits a spawn.
+    test "failed caller-driven connect passes its slot to the waiter queued behind it":
+      # A takes the fresh-connect fast path (waiterCount==0) and holds the only
+      # slot. B queues while A is suspended and gets no slot (active==maxSize).
+      # When A's connect times out, B would sit until its own budget elapses
+      # unless A's failure path hands it the slot to dial into.
       proc t() {.async.} =
         let ms = startMockServer()
 
@@ -4175,8 +4248,8 @@ suite "FIFO fairness":
         doAssert errA != nil
         doAssert errA.kind == pekConnectFailed
 
-        # With the fix, B is served by the spawn (which also fails against the
-        # unresponsive mock) and returns fast; without it, B would time out on
+        # B dials into the slot (and also fails against the unresponsive
+        # mock), returning fast; without the grant, B would time out on
         # acquireTimeout with pekAcquireTimeout.
         var errB: ref PgPoolError = nil
         let bStart = Moment.now()
@@ -4509,11 +4582,10 @@ suite "Error type granularity":
 
   when hasChronos:
     # asyncdispatch has no cancellation (cancelAndWait is a no-op shim), so
-    # the spawn-cancellation path is only reachable under chronos.
-    test "cancelled spawn connect is not treated as a connect failure":
-      # A cancelled spawn-for-waiter must not bump the backoff counter or
-      # fail the waiter with a pool error: cancellation is not a connect
-      # failure. The capacity reservation is still released.
+    # the dial-cancellation path is only reachable under chronos.
+    test "a cancelled waiter's dial is not a connect failure":
+      # Cancelling an acquire mid-dial must not bump the backoff counter:
+      # cancellation is not a connect failure. Its slot is still released.
       proc t() {.async.} =
         # Accepts TCP but never answers the startup message, so the connect
         # attempt stays suspended until we cancel it.
@@ -4522,7 +4594,7 @@ suite "Error type granularity":
         let pool = makePool(maxSize = 1)
         pool.config.connConfig.host = "127.0.0.1"
         pool.config.connConfig.port = ms.port
-        # Backstop: if cancellation failed to reach the spawn, the connect
+        # Backstop: if cancellation failed to reach the dial, the connect
         # would fail on its own and trip the assertions below instead of
         # hanging the test.
         pool.config.connConfig.connectTimeout = seconds(2)
@@ -4530,25 +4602,18 @@ suite "Error type granularity":
         pool.active = 1
 
         let acqFut = pool.acquire() # queues as a waiter (deadline path)
-        pool.release(mockConn(csClosed)) # spawn-for-waiter kicks in
-        # release() queues the broken conn's closeNoWait first, then the
-        # spawn-for-waiter — the spawn future is the last entry.
-        doAssert pool.pendingBackgroundTasks.len >= 1
-        await cancelAndWait(pool.pendingBackgroundTasks[^1])
+        pool.release(mockConn(csClosed)) # grants the waiter the freed slot
+        let client = await ms.accept()
+        doAssert pool.dialsInFlight == 1
+        await cancelAndWait(acqFut)
 
         doAssert pool.consecutiveConnectFailures == 0
-        doAssert pool.waiterCount == 1 # waiter still queued, not failed
-        doAssert pool.active == 0 # reservation released by `finally`
+        doAssert pool.waiterCount == 0
+        doAssert pool.dialsInFlight == 0
+        doAssert pool.active == 0
 
-        # close() settles the still-queued waiter with pekClosed.
         await pool.close()
-        var caught: ref PgPoolError
-        try:
-          discard await acqFut
-        except PgPoolError as e:
-          caught = e
-        doAssert caught != nil
-        doAssert caught.kind == pekClosed
+        await closeClient(client)
         await closeServer(ms)
 
       waitFor t()
@@ -4819,12 +4884,6 @@ suite "Connect refusals":
       )
     )
 
-  proc strandWaiter(pool: PgPool): Future[PgConnection] =
-    ## Queue a waiter with no dial attached and no borrower to serve it.
-    result = newFuture[PgConnection]("waiter")
-    pool.waiters.addLast(Waiter(fut: result, cancelled: false))
-    pool.waiterCount.inc
-
   test "a refusal skips the backoff ramp and holds until a connect succeeds":
     let refusal: ref CatchableError = newStartupError(
       "refused", (ref PgQueryError)(msg: "28P01", sqlState: "28P01", severity: "FATAL")
@@ -4980,25 +5039,17 @@ suite "Connect refusals":
       let futB = pool.acquire()
       let futC = pool.acquire()
       var kinds: seq[PoolErrorKind]
-      for fut in [futA, futC]:
+      for fut in [futA, futB, futC]:
         try:
           discard await fut
         except PgPoolError as e:
           kinds.add(e.kind)
-      # A's own dial, then the one made for the queue, which C pays for.
-      doAssert kinds == @[pekConnectFailed, pekConnectFailed], $kinds
-      doAssert dropped[] == 2, $dropped[]
-      await sleepAsync(milliseconds(50))
-      doAssert not futB.finished
-      doAssert pool.waiterCount == 1
+      # Each fails with its own dial, passing the slot on; none with the refusal.
+      doAssert kinds == @[pekConnectFailed, pekConnectFailed, pekConnectFailed], $kinds
+      doAssert dropped[] == 3, $dropped[]
+      doAssert pool.waiterCount == 0
 
       await pool.close()
-      var errB: ref PgPoolError
-      try:
-        discard await futB
-      except PgPoolError as e:
-        errB = e
-      doAssert errB != nil and errB.kind == pekClosed
       await closeServer(ms)
 
     waitFor t()
@@ -5015,10 +5066,13 @@ suite "Connect refusals":
       pool.config.connectBackoffInitial = milliseconds(10)
       pool.config.connectBackoffMax = seconds(60)
       pool.recordRefusal()
+      pool.active = 1 # a borrower at maxSize
 
-      let waitFut = pool.strandWaiter()
-      pool.respawnForStrandedWaiter()
-      let conn = await waitFut
+      let waitFut = pool.acquire()
+      doAssert pool.waiterCount == 1
+      # Its broken release frees the slot: the waiter dials into it.
+      pool.release(mockConn(csClosed))
+      let conn = await waitFut.wait(seconds(5))
       doAssert accepted[] == 1
       doAssert pool.connectRefusal == nil
       pool.release(conn)
@@ -5115,15 +5169,14 @@ suite "Connect refusals":
 
     waitFor t()
 
-  test "a waiter's dial is the refused pool's one dial of the round":
+  test "an acquire's dial is the refused pool's one dial of the round":
     proc t() {.async.} =
       let ms = startMockServer()
       let refused = new int
-      refuseLogins(ms, refused)
+      # Held past several rounds: each would add a dial of its own.
+      refuseLogins(ms, refused, firstDelay = milliseconds(100))
       let pool = makePool(minSize = 2, maxSize = 2)
       pool.config.connConfig = mockConfig(ms.port)
-      # Unset, it falls back to the 20ms interval: a timed-out dial is not a
-      # refusal, so the waiter would stay queued and be dialed again.
       pool.config.connConfig.connectTimeout = seconds(5)
       pool.config.maintenanceInterval = milliseconds(20)
       pool.config.connectBackoffInitial = milliseconds(10)
@@ -5131,8 +5184,8 @@ suite "Connect refusals":
       pool.recordRefusal()
       # The round's dial is due.
       pool.nextConnectRetryAt = Moment.now()
-      let waitFut = pool.strandWaiter()
       pool.maintenanceTask = maintenanceLoop(pool)
+      let waitFut = pool.acquire()
 
       var err: ref PgPoolError
       try:
@@ -5149,7 +5202,7 @@ suite "Connect refusals":
 
     waitFor t()
 
-  test "a failure that may clear leaves the waiter queued":
+  test "a failure that may clear hands the waiter a dial of its own":
     proc t() {.async.} =
       let ms = startMockServer()
       let dropped = new int
@@ -5158,7 +5211,7 @@ suite "Connect refusals":
       let pool = makePool(maxSize = 1)
       pool.config.connConfig = mockConfig(ms.port)
       pool.config.acquireTimeout = seconds(10)
-      # A real window: with backoff disabled the failure clears the deadline.
+      # A real window: it paces the replenish only, like an acquire's dial.
       pool.config.connectBackoffInitial = seconds(60)
       pool.config.connectBackoffMax = seconds(60)
       pool.consecutiveConnectFailures = 1
@@ -5167,25 +5220,19 @@ suite "Connect refusals":
       let futA = pool.acquire()
       await sleepAsync(milliseconds(20))
       let futB = pool.acquire()
-      var errA: ref PgPoolError
-      try:
-        discard await futA
-      except PgPoolError as e:
-        errA = e
-      doAssert errA != nil and errA.kind == pekConnectFailed
-      doAssert isTransientError(errA)
-      await sleepAsync(milliseconds(50))
+      for fut in [futA, futB]:
+        var err: ref PgPoolError
+        try:
+          discard await fut
+        except PgPoolError as e:
+          err = e
+        doAssert err != nil and err.kind == pekConnectFailed
+        doAssert isTransientError(err)
+      doAssert dropped[] == 2, $dropped[]
       doAssert pool.connectRefusal == nil
-      doAssert not futB.finished
-      doAssert pool.waiterCount == 1
+      doAssert pool.waiterCount == 0
 
       await pool.close()
-      var errB: ref PgPoolError
-      try:
-        discard await futB
-      except PgPoolError as e:
-        errB = e
-      doAssert errB != nil and errB.kind == pekClosed
       await closeServer(ms)
 
     waitFor t()
@@ -5742,13 +5789,12 @@ suite "Pool acquire close-race":
 
     waitFor t()
 
-suite "Pool spawn-connect close-race":
-  test "spawn-for-waiter closes a connection won after the pool is closed":
-    # Regression: spawnConnectForWaiter's closed-branch used to close the fresh
-    # conn without bumping closeCount. A spawn whose connect returned success
-    # after pool.close() flipped `closed` left createCount incremented but
-    # closeCount not — a permanent skew poisoning all metric-based accounting.
-    # Gate the handshake so the connect is provably in flight when we close.
+suite "Pool waiter-dial close-race":
+  test "a waiter's dial won after the pool is closed is closed and counted":
+    # A dial whose connect returns success after pool.close() flipped `closed`
+    # must close the fresh conn and bump closeCount, or createCount and
+    # closeCount skew for good. Gate the handshake so the connect is provably
+    # in flight when we close.
     proc t() {.async.} =
       let ms = startMockServer()
 
@@ -5758,11 +5804,11 @@ suite "Pool spawn-connect close-race":
       pool.active = 1 # simulated borrower at maxSize
 
       let acqFut = pool.acquire() # queues as a waiter
-      # Broken-conn release frees the slot and spawns a connect for the waiter.
-      # This bumps closeCount for the mock, so snapshot AFTER it.
+      # Broken-conn release frees the slot; the waiter dials into it. This
+      # bumps closeCount for the mock, so snapshot AFTER it.
       pool.release(mockConn(csClosed))
 
-      # accept() resolves once the spawn's TCP is up; draining the startup
+      # accept() resolves once the waiter's TCP is up; draining the startup
       # message leaves connect() suspended awaiting the handshake.
       let client = await ms.accept()
       await drainStartupMessage(client)
@@ -5770,17 +5816,17 @@ suite "Pool spawn-connect close-race":
       let createBefore = pool.metrics.createCount
       let closeBefore = pool.metrics.closeCount
 
-      # Start close() (synchronously flips `closed` and fails waiters), then
-      # let the handshake complete so the spawn resumes into the closed-branch.
-      # close() awaits pendingBackgroundTasks, so the spawn is drained by the
-      # time closeFut resolves.
-      let closeFut = pool.close()
+      await pool.close()
       await sendFullHandshake(client)
-      await closeFut
+      var err: ref PgPoolError
+      try:
+        discard await acqFut.wait(seconds(5))
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil and err.kind == pekClosed
 
-      doAssert acqFut.finished
-      doAssert acqFut.failed
       doAssert pool.active == 0
+      doAssert pool.dialsInFlight == 0
       doAssert pool.metrics.createCount - createBefore == 1
       doAssert pool.metrics.closeCount - closeBefore == 1
       doAssert pool.idle.len == 0
@@ -5790,18 +5836,15 @@ suite "Pool spawn-connect close-race":
 
     waitFor t()
 
-  test "close does not hang when spawn-for-waiter connect stalls with unset connectTimeout":
-    # Regression: close()'s final pendingBackgroundTasks drain awaited
-    # spawnConnectForWaiter with no bound. With connectTimeout unset, a stalled
-    # handshake pinned close() indefinitely. spawnConnectForWaiter now caps an
-    # unset connectTimeout with maintenanceInterval.
+  test "close does not wait for a waiter's stalled dial":
+    # The dial is the waiter's own, like an acquire's on the fast path:
+    # close() leaves it to the acquire's budget, which settles with it.
     proc t() {.async.} =
       let ms = startMockServer()
 
       let pool = makePool(minSize = 0, maxSize = 1)
       pool.config.connConfig = mockConfig(ms.port)
       pool.config.connConfig.connectTimeout = ZeroDuration
-      pool.config.maintenanceInterval = milliseconds(300)
       pool.active = 1
 
       let acqFut = pool.acquire()
@@ -5809,83 +5852,24 @@ suite "Pool spawn-connect close-race":
 
       let client = await ms.accept()
       await drainStartupMessage(client)
-      # No sendFullHandshake: the spawn is now suspended awaiting auth.
-      doAssert pool.pendingBackgroundTasks.len >= 1
+      # No sendFullHandshake: the dial is now suspended awaiting auth.
+      doAssert pool.dialsInFlight == 1
 
       let closeStart = Moment.now()
       await pool.close().wait(seconds(5))
-      let elapsed = Moment.now() - closeStart
-
-      # Fallback fires at ~300ms; allow generous headroom.
-      doAssert elapsed < seconds(2), $elapsed
-      doAssert acqFut.finished
-      doAssert pool.pendingBackgroundTasks.len == 0
+      doAssert Moment.now() - closeStart < seconds(1)
+      doAssert not acqFut.finished
 
       await closeClient(client)
-      await closeServer(ms)
+      var err: ref PgPoolError
+      try:
+        discard await acqFut.wait(seconds(5))
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert pool.active == 0
+      doAssert pool.dialsInFlight == 0
 
-    waitFor t()
-
-  test "close(timeout) honors its budget when spawn-for-waiter connect stalls":
-    # Regression: close(timeout=100ms) blocked on pendingBackgroundTasks drain
-    # until the spawn's connectTimeout (=maintenanceInterval fallback, default
-    # 30s) elapsed. close() now bounds the drain by its own deadline and
-    # cancels remaining spawns.
-    proc t() {.async.} =
-      let ms = startMockServer()
-
-      let pool = makePool(minSize = 0, maxSize = 1)
-      pool.config.connConfig = mockConfig(ms.port)
-      pool.config.connConfig.connectTimeout = ZeroDuration
-      pool.config.maintenanceInterval = seconds(30) # default; must not gate close
-      pool.active = 1
-
-      let acqFut = pool.acquire()
-      pool.release(mockConn(csClosed))
-
-      let client = await ms.accept()
-      await drainStartupMessage(client)
-      doAssert pool.pendingBackgroundTasks.len >= 1
-
-      let closeStart = Moment.now()
-      await pool.close(timeout = milliseconds(100)).wait(seconds(5))
-      let elapsed = Moment.now() - closeStart
-
-      # Must be bounded by timeout (100ms), not the 30s connectTimeout fallback.
-      doAssert elapsed < seconds(1), $elapsed
-      doAssert acqFut.finished
-
-      await closeClient(client)
-      await closeServer(ms)
-
-    waitFor t()
-
-  test "close does not hang on a stalled spawn when maintenanceInterval is zero":
-    # Regression: with connectTimeout unset the spawn's bound is
-    # `maintenanceInterval`; a zero one left the fallback zero too, so the
-    # stalled handshake kept the dial unbounded and close() never returned.
-    proc t() {.async.} =
-      let ms = startMockServer()
-
-      let pool = makePool(minSize = 0, maxSize = 1)
-      pool.config.connConfig = mockConfig(ms.port)
-      pool.config.connConfig.connectTimeout = ZeroDuration
-      pool.config.maintenanceInterval = ZeroDuration
-      pool.active = 1
-
-      let acqFut = pool.acquire()
-      pool.release(mockConn(csClosed))
-
-      let client = await ms.accept()
-      await drainStartupMessage(client)
-      doAssert pool.pendingBackgroundTasks.len >= 1
-
-      # Without a bound this await fails the 5s wait below instead of returning.
-      await pool.close().wait(seconds(5))
-      doAssert acqFut.finished
-      doAssert pool.pendingBackgroundTasks.len == 0
-
-      await closeClient(client)
       await closeServer(ms)
 
     waitFor t()
