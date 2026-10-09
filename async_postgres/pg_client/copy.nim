@@ -557,7 +557,8 @@ proc copyOut*(
     conn: PgConnection, sql: string, timeout: Duration = ZeroDuration
 ): Future[CopyResult] {.async.} =
   ## Execute COPY ... TO STDOUT via simple query protocol.
-  ## Collects all CopyData messages and returns them in a CopyResult.
+  ## Collects all CopyData messages and returns them in a CopyResult, so the
+  ## whole output is held in memory; use ``copyOutStream`` for large exports.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ##

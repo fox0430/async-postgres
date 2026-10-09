@@ -2233,13 +2233,17 @@ proc get*(row: Row, col: int, T: typedesc[seq[Option[string]]]): seq[Option[stri
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.
+  ## A duplicated name (``SELECT a.id, b.id``) resolves to its *first*
+  ## column, unlike ``columnIndex(Row, …)`` and ``columnMap``; alias the
+  ## columns to reach the others.
   for i, f in fields:
     if f.name == name:
       return i
   raise newException(PgTypeError, "Column not found: " & name)
 
 proc columnMap*(fields: seq[FieldDescription]): Table[string, int] =
-  ## Build a name-to-index mapping for all columns.
+  ## Build a name-to-index mapping for all columns. A duplicated name maps to
+  ## its *last* column.
   for i, f in fields:
     result[f.name] = i
 
@@ -2249,7 +2253,9 @@ proc columnIndex*(row: Row, name: string): int =
   ## Find the index of a column by name using a cached name→index table on the
   ## row's underlying ``RowData``.  The table is built lazily on first access.
   ## Raises ``PgTypeError`` if the metadata is not available (e.g. the Row was
-  ## constructed manually) or the column name is not found.
+  ## constructed manually) or the column name is not found. A duplicated name
+  ## resolves to its *last* column, as do the name-based ``get`` overloads,
+  ## unlike ``columnIndex(fields, …)``.
   if row.data == nil or row.data.fields.len == 0:
     raise newException(PgTypeError, "Column name lookup requires field metadata")
   if row.data.colMap.len == 0 and row.data.fields.len > 0:

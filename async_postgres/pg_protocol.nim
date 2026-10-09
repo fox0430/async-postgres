@@ -556,14 +556,17 @@ proc addCString*(buf: var seq[byte], s: string, what = "protocol string") =
 
 proc decodeInt16*(buf: openArray[byte], offset: int): int16 {.inline.} =
   ## Decode a 16-bit integer from big-endian bytes at the given offset.
+  ## Unchecked like ``fromBE16``: the caller keeps ``offset + 2 <= buf.len``.
   fromBE16(buf, offset)
 
 proc decodeInt32*(buf: openArray[byte], offset: int): int32 {.inline.} =
   ## Decode a 32-bit integer from big-endian bytes at the given offset.
+  ## Unchecked like ``fromBE32``: the caller keeps ``offset + 4 <= buf.len``.
   fromBE32(buf, offset)
 
 proc decodeInt64*(buf: openArray[byte], offset: int): int64 {.inline.} =
   ## Decode a 64-bit integer from big-endian bytes at the given offset.
+  ## Unchecked like ``fromBE64``: the caller keeps ``offset + 8 <= buf.len``.
   fromBE64(buf, offset)
 
 proc decodeCString*(buf: openArray[byte], offset: int): (string, int) =
@@ -1434,6 +1437,8 @@ proc reuseRowData*(
   ## Create a new RowData that takes over the old buffer's capacity via move.
   ## `rd` remains a valid ref but its `buf`/`cellIndex` are emptied — callers
   ## still holding `rd` must not read row data through it after this call.
+  ## `fields` and the name cache are not carried over: set `fields` again for
+  ## name-based access.
   result = RowData(
     buf: move rd.buf,
     cellIndex: move rd.cellIndex,
@@ -1449,6 +1454,7 @@ proc reuseRowData*(rd: RowData, numCols: int16): RowData =
   ## without format metadata. `rd` remains a valid ref but its
   ## `buf`/`cellIndex`/`colFormats`/`colTypeOids` are emptied — callers still
   ## holding `rd` must not read row data or formats through it after this call.
+  ## `fields` and the name cache are not carried over, as in the overload above.
   result = RowData(
     buf: move rd.buf,
     cellIndex: move rd.cellIndex,
@@ -1597,7 +1603,8 @@ proc parseBackendMessage*(
 ): ParseResult {.raises: [PgProtocolError].} =
   ## Parse one backend message. Sets ``consumed`` bytes. Rejects messages over
   ## ``maxLen`` (``<= 0`` disables the cap, for tests; production resolves it via
-  ## ``effectiveMaxMessageSize``). With ``skipDataRow`` DataRow is framed only.
+  ## ``effectiveMaxMessageSize``). A non-nil ``rowData`` receives each DataRow;
+  ## otherwise, with ``skipDataRow``, DataRow is framed only.
   consumed = 0
 
   # Need at least 5 bytes: 1 type + 4 length

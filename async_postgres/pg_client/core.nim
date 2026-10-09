@@ -15,7 +15,7 @@ type
     ilReadCommitted
     ilRepeatableRead
     ilSerializable
-    ilReadUncommitted
+    ilReadUncommitted ## PostgreSQL runs it as ``READ COMMITTED`` (no dirty reads).
 
   AccessMode* = enum
     ## PostgreSQL transaction access mode (read-write or read-only).
@@ -37,7 +37,9 @@ type
 
   RetryOptions* = object
     ## Retry config for ``withTransactionRetry``; unset fields keep the
-    ## defaults below.
+    ## defaults below. Fields are not validated: a backoff that computes
+    ## negative (e.g. a negative ``baseDelayMs`` or ``maxDelayMs``) becomes
+    ## 0ms, an immediate retry.
     maxAttempts*: int = 3 ## Total attempts (``<=1`` = no retry).
     baseDelayMs*: int = 20 ## Initial backoff ms.
     maxDelayMs*: int = 1000 ## Max backoff ms.

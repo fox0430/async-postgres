@@ -68,7 +68,10 @@ type
       ## Enable implicit query batching for pool.exec/query (default false).
       ## When enabled, concurrent calls within the same event loop tick are
       ## batched into a single TCP write per connection using per-query SYNC
-      ## for error isolation.
+      ## for error isolation. One dispatch uses at most `maxSize div 2`
+      ## connections (at least 1, or 2 when its ops mix finite and unlimited
+      ## timeouts). A dispatch from a later tick can overlap a running one and
+      ## takes its own share, so this does not bound the pool's total.
     maxPipelineSize*: int
       ## Max operations per pipeline batch per connection (default 0=unlimited).
       ## Only used when `pipelined` is true.
@@ -2978,6 +2981,11 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## cancelled so close() returns promptly. Without a timeout (or
   ## `ZeroDuration`), active connections are closed on release and the
   ## background drain waits unbounded.
+  ##
+  ## asyncdispatch cannot cancel a future: there the maintenance loop, and
+  ## background tasks still running at the deadline, outlive close() until
+  ## their current sleep, connect or close ends. A connection they open after
+  ## close() is closed, not kept.
   pool.closed = true
 
   let hasDeadline = timeout > ZeroDuration

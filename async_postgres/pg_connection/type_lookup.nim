@@ -52,8 +52,9 @@ proc lookupTypeOids*(
   ## from the result, so callers detect absence with ``hasKey`` /
   ## ``getOrDefault``.
   ##
-  ## Requires the connection to be in ``csReady`` state and raises
-  ## ``PgConnectionError`` otherwise. Rejects names containing characters
+  ## Requires the connection to be in ``csReady`` state: raises
+  ## ``PgStateError`` after ``close()`` or while the connection is in use, and
+  ## ``PgConnectionError`` once it is lost. Rejects names containing characters
   ## outside ``[A-Za-z0-9_."]`` with ``PgTypeError``. Empty ``names``
   ## returns an empty table without contacting the server.
   ##

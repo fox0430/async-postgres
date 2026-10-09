@@ -52,7 +52,8 @@ func paramOids*(stmt: PreparedStatement): seq[int32] {.inline.} =
   stmt.paramOids
 
 proc columnIndex*(stmt: PreparedStatement, name: string): int =
-  ## Find the index of a column by name in a prepared statement.
+  ## Find the index of a column by name in a prepared statement. A duplicated name
+  ## resolves to its first column, as in ``columnIndex(fields, …)``.
   stmt.fields.columnIndex(name)
 
 proc checkPreparedName(name: string) =

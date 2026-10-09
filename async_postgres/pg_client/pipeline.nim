@@ -532,6 +532,11 @@ proc execute*(
     p: Pipeline, timeout: Duration = ZeroDuration
 ): Future[seq[PipelineResult]] {.async.} =
   ## Execute all queued pipeline operations in a single round trip.
+  ## The batch shares one Sync, so it runs as one implicit transaction: when
+  ## an op fails, the backend skips the ops after it, rolls back the ones
+  ## before it, and the first `PgQueryError` is raised. Inside an explicit
+  ## transaction (an earlier `BEGIN`), that transaction is aborted instead
+  ## and needs a `ROLLBACK`. Use `executeIsolated` for per-op outcomes.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## When `p.autoReset` is true, the pipeline is reset on exit (including on
@@ -649,6 +654,13 @@ proc executeIsolated*(
   ## Execute all queued pipeline operations with per-query error isolation.
   ## Each operation gets its own SYNC message, so a failed operation does not
   ## abort subsequent ones. Returns results and per-op errors.
+  ## `errors[i]` only ever holds the server's `PgQueryError` for op `i`;
+  ## a transport failure, timeout or cancellation raises instead, and the
+  ## results are lost. A failed op's `results[i]` holds no result: an exec's
+  ## stays default, but a query's may already carry the column descriptions
+  ## and any rows received before the error. Inside an explicit
+  ## transaction, the first failure aborts it, so every later op fails too
+  ## (`25P02`).
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## When `p.autoReset` is true, the pipeline is reset on exit (including on

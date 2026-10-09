@@ -1359,6 +1359,10 @@ proc toPgParam*(v: seq[PgTsQuery]): PgParam {.raises: [PgTypeError].} =
   textParam(OidTsQueryArray, encodeTsArrayText(elems, "tsquery array"), "tsquery array")
 
 proc toPgBinaryParam*[T](v: seq[T]): PgParam =
+  ## Same as ``toPgParam(v)``. Most arrays go in binary there, but range and
+  ## multirange arrays and ``seq[PgTsVector]`` / ``seq[PgTsQuery]`` go as text,
+  ## and ``seq[PgHstore]`` and ``pgEnum`` arrays as text with OID 0 (pass the
+  ## hstore OIDs for binary; the 3-argument ``pgEnum`` sets the array OID).
   toPgParam(v)
 
 proc toPgBinaryParam*(

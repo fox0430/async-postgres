@@ -29,7 +29,8 @@ type Cursor* = ref object
     ## ``markReady``), so ``checkReady`` cannot guard re-entrant cursor ops.
 
 proc columnIndex*(cursor: Cursor, name: string): int =
-  ## Find the index of a column by name in a cursor.
+  ## Find the index of a column by name in a cursor. A duplicated name
+  ## resolves to its first column, as in ``columnIndex(fields, …)``.
   cursor.fields.columnIndex(name)
 
 func conn*(cursor: Cursor): PgConnection {.inline.} =
@@ -408,6 +409,9 @@ proc openCursor*(
   ## Open a server-side cursor for streaming rows in chunks.
   ## `chunkSize` must be positive: `0` would mean `Execute` maxRows `0`
   ## (unlimited) and silently fetch all rows at once instead of streaming.
+  ## The cursor holds `conn` until it is exhausted, closed or a fetch fails:
+  ## any other operation on `conn` meanwhile raises ``PgStateError``.
+  ## `withCursor` closes it on scope exit.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## Raises ``PgTypeError`` for a non-positive `chunkSize`,

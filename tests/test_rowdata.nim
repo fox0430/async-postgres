@@ -177,18 +177,16 @@ suite "reuseRowData":
     check getCell(rd, 0, 0) == ""
     check isCellNull(rd, 0, 1)
 
-  test "old RowData remains intact after reuse":
+  test "reuse moves buf and cellIndex out of the old RowData":
     let rd1 = newRowData(2)
     parseDataRowInto(buildDataRowBody(["hello", "world"]), rd1)
     check getCell(rd1, 0, 0) == "hello"
     check getCell(rd1, 0, 1) == "world"
 
-    # Reuse creates a new RowData; rd1 should keep its data
     let rd2 = rd1.reuseRowData(2)
     parseDataRowInto(buildDataRowBody(["new", "data"]), rd2)
 
-    # rd1's data is still accessible (buf/cellIndex were moved, so rd1 has empty seqs)
-    # But the old data was moved away — rd1.buf is now empty
+    # rd1 stays a valid ref, but its storage now belongs to rd2.
     check rd1.buf.len == 0
     check rd1.cellIndex.len == 0
 
