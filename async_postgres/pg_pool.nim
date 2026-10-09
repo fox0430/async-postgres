@@ -760,6 +760,11 @@ proc settleReplenishConnect(pool: PgPool, conn: PgConnection, now: Moment) =
     pool.active.dec
     pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
 
+proc isExpired(pool: PgPool, conn: PgConnection, at: Moment): bool =
+  ## Whether `conn` is past `maxLifetime` at `at`.
+  pool.config.maxLifetime > ZeroDuration and
+    at - conn.createdAt > pool.config.maxLifetime
+
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
     await sleepAsync(pool.config.maintenanceInterval)
@@ -781,8 +786,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
         continue
 
       # Always close max-lifetime-exceeded connections (acquire rejects them anyway)
-      if pool.config.maxLifetime > ZeroDuration and
-          now - pc.conn.createdAt > pool.config.maxLifetime:
+      if pool.isExpired(pc.conn, now):
         pool.closeNoWait(pc.conn)
         continue
 
@@ -1162,8 +1166,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   if pool.closed:
     raise newPoolError(pekClosed, "Pool is closed")
 
-  let now = Moment.now()
-  let acquireStart = now
+  let acquireStart = Moment.now()
 
   # `acquireTimeout` is a deadline for the whole acquire: idle health-check
   # pings, a caller-driven connect, and the final waiter wait all draw from
@@ -1191,18 +1194,21 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   # FIFO fairness: skip the idle / new-conn fast paths when waiters are
   # already queued, otherwise a fresh caller would jump the queue. Cancelled
   # waiters don't count (they're swept lazily by release/handoff), so the
-  # `waiterCount` field — which tracks only live waiters — is the guard.
+  # `waiterCount` field — which tracks only live waiters — is the guard. It is
+  # checked once: a waiter that queues during a ping below arrived after this
+  # caller, which reuses the slot of a conn it discards unless it gives up.
   if pool.waiterCount == 0:
     # Try to get an idle connection
     while pool.idle.len > 0:
+      # Re-taken per iteration: the health-check ping below awaits.
+      let now = Moment.now()
       let pc = pool.idle.popFirst()
       if pc.conn.state != csReady or pc.conn.socketHasFin():
         # closeNoWait: avoid an await point where a cancellation could be
         # swallowed by tracedClose and leak the next acquired conn (see ping guard).
         pool.closeNoWait(pc.conn)
         continue
-      if pool.config.maxLifetime > ZeroDuration and
-          now - pc.conn.createdAt > pool.config.maxLifetime:
+      if pool.isExpired(pc.conn, now):
         pool.closeNoWait(pc.conn)
         continue
       # Health check: ping connections that have been idle too long.
@@ -1239,6 +1245,7 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         # Count the conn as active across the ping so a concurrent acquire
         # can't overshoot maxSize while it is off `idle`.
         pool.active.inc
+        var alive = true
         try:
           await pc.conn.ping(pingBudget)
         except CancelledError as e:
@@ -1252,14 +1259,15 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           pool.respawnForStrandedWaiter()
           raise e
         except CatchableError:
+          alive = false
+        # Discard it if the ping failed, a close() during the ping didn't drain
+        # it, or it expired meanwhile (the lifetime check above is stale).
+        if not alive or pool.closed or pool.isExpired(pc.conn, Moment.now()):
           pool.active.dec
           pool.closeNoWait(pc.conn)
+          if pool.closed:
+            raisePoolClosed()
           continue
-        # A close() during the ping didn't drain the popped conn — discard it.
-        if pool.closed:
-          pool.active.dec
-          pool.closeNoWait(pc.conn)
-          raisePoolClosed()
         pc.conn.borrowed = true
         recordAcquire()
         return (pc.conn, false)
@@ -1279,6 +1287,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       if hasDeadline:
         rem = remainingBudget()
         if rem <= ZeroDuration:
+          # A waiter that queued during a ping above got no dial (the ping held
+          # the slot): hand it the slot this caller gives up.
+          pool.respawnForStrandedWaiter()
           raiseAcquireTimeout()
       pool.active.inc
       var newConn: PgConnection
@@ -1362,7 +1373,9 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   # queue up and wait for delivery.
   if pool.configFault != nil and pool.active == 0 and pool.idle.len == 0:
     # No borrower will release and no connect can succeed (see `configFault`):
-    # fail now instead of waiting out the acquire budget.
+    # fail now instead of waiting out the acquire budget, along with any waiter
+    # that queued during a ping above while the fault was recorded.
+    pool.failStrandedWaiters()
     raise pool.configFaultError()
   if pool.config.maxWaiters >= 0 and pool.waiterCount >= pool.config.maxWaiters:
     raise newPoolError(

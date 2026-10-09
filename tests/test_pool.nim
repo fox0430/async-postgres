@@ -51,6 +51,11 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
     closed: false,
   )
 
+proc mockConfig(port: int): ConnConfig =
+  ConnConfig(
+    host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
+  )
+
 proc toPooled(conn: PgConnection): PooledConn =
   PooledConn(conn: conn, lastUsedAt: Moment.now())
 
@@ -1924,6 +1929,188 @@ when hasChronos:
         await cleanupHanging(server, serverTransport)
 
       waitFor t()
+
+suite "maxLifetime across a health-check ping":
+  proc connectToMock(ms: MockServer): Future[(PgConnection, MockClient)] {.async.} =
+    let connFut = connect(mockConfig(ms.port))
+    let client = await acceptAndReady(ms)
+    return (await connFut, client)
+
+  proc lifetimePool(ms: MockServer, maxSize = 5): PgPool =
+    result = makePool(maxSize = maxSize)
+    result.config.connConfig = mockConfig(ms.port)
+    result.config.healthCheckTimeout = seconds(60)
+    # Outlasts any hold the tests put on a ping.
+    result.config.pingTimeout = seconds(5)
+    result.config.maxLifetime = seconds(1)
+
+  proc addStale(pool: PgPool, conn: PgConnection) =
+    ## Idle long enough to be pinged.
+    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now() - minutes(2)))
+
+  proc answerPing(client: MockClient) {.async.} =
+    await client.sendBytes(buildEmptyQueryResponse() & buildReadyForQuery('I'))
+
+  proc expire(conn: PgConnection) =
+    ## Age `conn` past maxLifetime, as if its ping had outlasted it.
+    conn.createdAt = Moment.now() - minutes(1)
+
+  test "a conn that expires during its own ping is discarded":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = lifetimePool(ms)
+      let (pinged, pingedSt) = await connectToMock(ms)
+      pool.addStale(pinged)
+
+      let fut = pool.acquire()
+      doAssert (await drainFrontendMessage(pingedSt)).msgType == 'Q'
+      pinged.expire()
+      await pingedSt.answerPing()
+      let freshSt = await acceptAndReady(ms).wait(seconds(5))
+      let conn = await fut.wait(seconds(5))
+
+      doAssert conn != pinged
+      doAssert pinged.state == csClosed
+      doAssert pool.active == 1
+
+      await conn.close()
+      await closeClient(freshSt)
+      await closeClient(pingedSt)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a conn behind a ping is judged by the clock after it":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = lifetimePool(ms)
+      let (pinged, pingedSt) = await connectToMock(ms)
+      pool.addStale(pinged)
+      # Alive at scan start, expired once the ping has failed. Aged by the
+      # clock, not by hand: a scan-start reading would catch a hand-aged conn.
+      let behind = mockConn()
+      behind.createdAt = Moment.now() - milliseconds(500)
+      pool.idle.addLast(PooledConn(conn: behind, lastUsedAt: Moment.now()))
+
+      let fut = pool.acquire()
+      doAssert (await drainFrontendMessage(pingedSt)).msgType == 'Q'
+      await sleepAsync(milliseconds(700))
+      await closeClient(pingedSt)
+      let freshSt = await acceptAndReady(ms).wait(seconds(5))
+      let conn = await fut.wait(seconds(5))
+
+      doAssert conn != pinged and conn != behind
+      doAssert behind.state == csClosed
+      doAssert pool.idle.len == 0
+
+      await conn.close()
+      await closeClient(freshSt)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a caller reuses the slot of a conn expired during its ping":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = lifetimePool(ms, maxSize = 1)
+      pool.config.maxWaiters = 1
+      let (pinged, pingedSt) = await connectToMock(ms)
+      pool.addStale(pinged)
+
+      let first = pool.acquire()
+      doAssert (await drainFrontendMessage(pingedSt)).msgType == 'Q'
+      # The pinged conn holds the only slot, so this one queues with no dial.
+      let second = pool.acquire()
+      doAssert pool.waiterCount == 1
+      pinged.expire()
+      await pingedSt.answerPing()
+
+      # `first` arrived before the waiter: it dials into the freed slot itself
+      # rather than queueing behind (or being rejected by a full queue).
+      let freshSt = await acceptAndReady(ms).wait(seconds(5))
+      let conn = await first.wait(seconds(5))
+      doAssert conn != pinged
+      doAssert not second.finished
+      conn.release()
+      doAssert (await second.wait(seconds(5))) == conn
+      doAssert pool.waiterCount == 0
+
+      await conn.close()
+      await closeClient(freshSt)
+      await closeClient(pingedSt)
+      await closeServer(ms)
+
+    waitFor t()
+
+  # asyncdispatch's timers can fire just short of the deadline: `first` then
+  # dials once more, and that dial's failure hands the slot over instead.
+  when hasChronos:
+    test "a caller whose budget runs out in its ping hands the slot to a waiter":
+      proc t() {.async.} =
+        let ms = startMockServer()
+        # The timed-out ping's CancelRequest dials here, apart from the pool's.
+        let pingMs = startMockServer()
+        let pool = lifetimePool(ms, maxSize = 1)
+        let (pinged, pingedSt) = await connectToMock(pingMs)
+        pool.addStale(pinged)
+
+        # Only `first` has a deadline, and its ping is never answered.
+        pool.config.acquireTimeout = milliseconds(200)
+        let first = pool.acquire()
+        doAssert (await drainFrontendMessage(pingedSt)).msgType == 'Q'
+        pool.config.acquireTimeout = ZeroDuration
+        let second = pool.acquire()
+        doAssert pool.waiterCount == 1
+
+        var err: ref PgPoolError
+        try:
+          discard await first.wait(seconds(5))
+        except PgPoolError as e:
+          err = e
+        doAssert err != nil and err.kind == pekAcquireTimeout
+        let freshSt = await acceptAndReady(ms).wait(seconds(5))
+        let conn = await second.wait(seconds(5))
+        doAssert conn != pinged
+        doAssert pool.active == 1
+
+        await conn.close()
+        await closeClient(freshSt)
+        await closeClient(pingedSt)
+        await closeServer(pingMs)
+        await closeServer(ms)
+
+      waitFor t()
+
+  test "a config fault recorded during a ping fails the waiter too":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = lifetimePool(ms, maxSize = 1)
+      let (pinged, pingedSt) = await connectToMock(ms)
+      pool.addStale(pinged)
+
+      let first = pool.acquire()
+      doAssert (await drainFrontendMessage(pingedSt)).msgType == 'Q'
+      let second = pool.acquire()
+      doAssert pool.waiterCount == 1
+      # As a replenish dial already in flight would record it.
+      pool.configFault = newException(PgConfigError, "bad sslrootcert")
+      pinged.expire()
+      await pingedSt.answerPing()
+
+      for fut in [first, second]:
+        var err: ref PgPoolError
+        try:
+          discard await fut.wait(seconds(2))
+        except PgPoolError as e:
+          err = e
+        doAssert err != nil and err.kind == pekConfigFault
+      doAssert pool.waiterCount == 0
+      doAssert pool.active == 0
+
+      await closeClient(pingedSt)
+      await closeServer(ms)
+
+    waitFor t()
 
 suite "Acquire deadline budget":
   ## Regression for acquire latency exceeding acquireTimeout: health-check
@@ -3935,11 +4122,6 @@ suite "isConnected":
       check hasFin
       check not stillConnected
       check stateAtProbe == csReady
-
-proc mockConfig(port: int): ConnConfig =
-  ConnConfig(
-    host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
-  )
 
 suite "Connect refusals":
   proc wrongPassword(): seq[byte] =
