@@ -60,7 +60,8 @@ proc decodeHstoreBinary*(data: openArray[byte]): PgHstore {.raises: [PgError].} 
   ensureNoTrailing(pos, data.len, "hstore binary")
 
 proc fromPgText*(data: seq[byte], oid: int32): string {.raises: [].} =
-  ## Convert text-format bytes from PostgreSQL to a Nim string.
+  ## Convert text-format bytes from PostgreSQL to a Nim string. The bytes are
+  ## copied as is; ``oid`` is unused and kept for compatibility.
   result = newString(data.len)
   for i in 0 ..< data.len:
     result[i] = char(data[i])

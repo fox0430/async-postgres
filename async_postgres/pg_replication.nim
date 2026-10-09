@@ -1474,10 +1474,12 @@ proc startReplication*(
   ##
   ## To resume after an error, reconnect and pass ``InvalidLsn``: the server
   ## restarts from the slot's ``confirmed_flush_lsn``, re-sending
-  ## anything not yet reported. The slot's ``confirmed_flush_lsn`` is looked up
-  ## first and the stream starts from it or ``startLsn``, whichever is later
-  ## (the server would not start earlier either), so keepalives seen while the
-  ## server re-reads WAL from ``restart_lsn`` never report a position below it.
+  ## anything not yet reported. With ``autoConfirm``, the slot's
+  ## ``confirmed_flush_lsn`` is looked up first and the stream starts from it
+  ## or ``startLsn``, whichever is later (the server would not start earlier
+  ## either), so keepalives seen while the server re-reads WAL from
+  ## ``restart_lsn`` never report a position below it. Without it, no lookup
+  ## is made and ``startLsn`` is sent as given.
   ## A Commit's position is confirmed at once but reaches the server with the
   ## next status: a keepalive's, ``statusInterval``'s or the stop's. Set
   ## ``statusInterval`` on a stream that may stay busy for long, as its
@@ -1501,17 +1503,17 @@ proc startReplication*(
   ## Option values are passed unquoted and single-quoted when building the
   ## command (keys stay identifier-validated). An empty value means a
   ## flag-only option (``binary`` rather than ``binary ''``). Raises
-  ## ``PgConnectionError`` (closed) / ``PgStateError`` (busy) unless
-  ## ``csReady``, and ``ValueError`` for a ``proto_version`` other than ``1``
-  ## in ``options`` (the value must be the unquoted string ``"1"``, an empty
-  ## one included): the bundled pgoutput decoder supports v1 only. Any value already wrapped in
-  ## quotes raises ``ValueError`` too, so the verbatim-options spelling cannot
-  ## silently name a publication ``'my_pub'`` or send a thrice-quoted
-  ## ``binary`` flag the plugin rejects mid-stream. ``publication_names`` alone
-  ## may be wrapped in double quotes: it is an identifier list, where
-  ## ``"MyPub"`` keeps the case (unquoted, ``MyPub`` means ``mypub``). An empty
-  ## ``publication_names`` and a value containing a NUL byte are rejected the
-  ## same way.
+  ## ``PgStateError`` (closed by ``close()``, or busy) / ``PgConnectionError``
+  ## (lost) unless ``csReady``, and ``ValueError`` for a ``proto_version`` other
+  ## than ``1`` in ``options`` (the value must be the unquoted string ``"1"``,
+  ## an empty one included): the bundled pgoutput decoder supports v1 only. Any
+  ## value already wrapped in quotes raises ``ValueError`` too, so the
+  ## verbatim-options spelling cannot silently name a publication ``'my_pub'``
+  ## or send a thrice-quoted ``binary`` flag the plugin rejects mid-stream.
+  ## ``publication_names`` alone may be wrapped in double quotes: it is an
+  ## identifier list, where ``"MyPub"`` keeps the case (unquoted, ``MyPub``
+  ## means ``mypub``). An empty ``publication_names`` and a value containing a
+  ## NUL byte are rejected the same way.
   ## ``publication_names`` without an explicit ``proto_version`` adds
   ## ``proto_version '1'`` to the generated command, so a server-side default
   ## bump cannot outrun that decoder.
@@ -1676,10 +1678,11 @@ proc startPhysicalReplication*(
     callback: ReplicationCallback,
 ): Future[void] {.async.} =
   ## Physical replication streaming. Callback per message, raw WAL in ``XLogData``.
-  ## Raises ``PgConnectionError`` (closed) / ``PgStateError`` (busy) unless
-  ## ``csReady``. Error handling matches ``startReplication``: a callback
-  ## exception or any other mid-stream failure poisons the connection (marked
-  ## closed) and propagates, so reconnect and resume from the last LSN tracked.
+  ## Raises ``PgStateError`` (closed by ``close()``, or busy) /
+  ## ``PgConnectionError`` (lost) unless ``csReady``. Error handling matches
+  ## ``startReplication``: a callback exception or any other mid-stream failure
+  ## poisons the connection (marked closed) and propagates, so reconnect and
+  ## resume from the last LSN tracked.
   ## A ReadyForQuery without ``CopyDone`` retires the connection and raises
   ## ``PgUnavailableError`` too, with no cause named: a physical walsender does
   ## reset its streaming flags, so no ordinary stream ends that way.

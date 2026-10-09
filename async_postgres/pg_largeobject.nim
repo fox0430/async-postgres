@@ -273,6 +273,9 @@ proc loImport*(
     conn: PgConnection, filename: string, timeout: Duration = ZeroDuration
 ): Future[Oid] {.async.} =
   ## Import a server-side file into a new Large Object, returning its OID.
+  ## ``filename`` is a path on the database server, read with the server's OS
+  ## permissions, not the client's; by default only superusers may call it.
+  ## Never pass an untrusted path.
   let s = await conn.queryValue(
     "SELECT lo_import($1)", @[toPgParam(filename)], timeout = timeout
   )
@@ -282,6 +285,9 @@ proc loExport*(
     conn: PgConnection, oid: Oid, filename: string, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Export a Large Object to a server-side file.
+  ## ``filename`` is written on the database server with the server's OS
+  ## permissions and can overwrite its files; by default only superusers may
+  ## call it. Never pass an untrusted path.
   discard await conn.queryValue(
     "SELECT lo_export($1, $2)",
     @[toPgParam(oidToInt32(oid)), toPgParam(filename)],
@@ -296,6 +302,7 @@ proc loReadAll*(
     timeout: Duration = ZeroDuration,
 ): Future[seq[byte]] {.async.} =
   ## Read the entire Large Object from the current position to EOF.
+  ## The whole object is held in memory; use `loReadStream` for large ones.
   ##
   ## **Timeout semantics:** `timeout` applies *per chunk*. Total wall-clock can
   ## reach `N × timeout` for N chunks. Use `loReadAllDeadline` for a single
@@ -482,6 +489,7 @@ proc loReadAllDeadline*(
     lo: LargeObject, deadline: Duration, chunkSize: int32 = loDefaultChunkSize
 ): Future[seq[byte]] {.async.} =
   ## Like `loReadAll` but `deadline` bounds total wall-clock across all chunks.
+  ## Holds the whole object in memory too; `loReadStreamDeadline` streams it.
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
   if chunkSize <= 0:
     raise newException(ValueError, "loReadAllDeadline: chunkSize must be positive")

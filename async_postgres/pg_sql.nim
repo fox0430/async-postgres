@@ -25,6 +25,10 @@
 ##
 ## .. code-block:: nim
 ##   await conn.query(sql"SELECT * FROM users WHERE age > {minAge} AND name = {name}")
+##
+## Do not mix literal ``$n`` placeholders with ``?`` or ``{expr}`` in one query:
+## both number from ``$1`` without skipping the ``$n`` already there, so
+## ``"tenant = $1 AND id = ?"`` binds the same value to both conditions.
 
 import std/[macros, strutils]
 
@@ -192,6 +196,8 @@ func sqlParams*(sql: string): string =
   ## - ``?`` inside dollar-quoted strings (``$$…$$``, ``$tag$…$tag$``) is preserved
   ## - ``?`` inside ``-- …`` line comments is preserved
   ## - ``?`` inside ``/* … */`` block comments (nestable) is preserved
+  ## - a literal ``$n`` is left as is and shares the numbering, so do not mix
+  ##   it with ``?``
   result = newStringOfCap(sql.len + 16)
   var i = 0
   var paramIdx = 0
@@ -246,7 +252,8 @@ macro sql*(queryStr: static[string]): untyped =
   ## Use ``{{`` and ``}}`` to produce literal braces.  Placeholders inside
   ## single-quoted SQL strings, ``E'…'`` strings, double-quoted identifiers,
   ## dollar-quoted strings, and SQL comments (``-- …`` and ``/* … */``,
-  ## nestable) are left as-is.
+  ## nestable) are left as-is. A literal ``$n`` is left as-is too and shares
+  ## the numbering, so do not mix it with ``{expr}``.
   ##
   ## Inside ``{expr}`` the following Nim syntax is recognised so ``{``/``}`` in
   ## their content does not affect brace matching: ``"…"`` / ``r"…"`` (raw) /

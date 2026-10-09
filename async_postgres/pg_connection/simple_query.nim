@@ -20,7 +20,8 @@ proc len*(qr: QueryResult): int {.inline.} =
   int(qr.rowCount)
 
 proc columnIndex*(qr: QueryResult, name: string): int =
-  ## Find the index of a column by name in a query result.
+  ## Find the index of a column by name in a query result. A duplicated name
+  ## resolves to its first column, as in ``columnIndex(fields, …)``.
   qr.fields.columnIndex(name)
 
 proc rows*(qr: QueryResult): seq[Row] =

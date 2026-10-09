@@ -1,20 +1,30 @@
 ## Low-level byte buffer helpers for big-endian encoding / bulk copy.
 ## Only depends on ``pg_errors`` (itself dependency-free) so it stays importable
 ## from ``pg_protocol`` and ``pg_types/*`` without cycles.
+##
+## The fixed-width helpers (``writeBE*``, ``fromBE*``, ``decodeFloat*BE``) do
+## not check bounds: the caller keeps ``pos``/``offset`` plus the width inside
+## the buffer. An overrun is an ``IndexDefect``, which ``except PgError`` does
+## not catch, and under ``-d:danger`` an unchecked out-of-bounds access. The
+## copy helpers (``writeBytesAt``, ``readString``, ``readBytes``) raise
+## ``PgProtocolError`` instead.
 
 import pg_errors
 
 template writeBE16*(buf: var openArray[byte], pos: int, v: int16) =
+  ## Write `v` big-endian at ``buf[pos ..< pos + 2]``, unchecked.
   buf[pos] = byte((v shr 8) and 0xFF)
   buf[pos + 1] = byte(v and 0xFF)
 
 template writeBE32*(buf: var openArray[byte], pos: int, v: int32) =
+  ## Write `v` big-endian at ``buf[pos ..< pos + 4]``, unchecked.
   buf[pos] = byte((v shr 24) and 0xFF)
   buf[pos + 1] = byte((v shr 16) and 0xFF)
   buf[pos + 2] = byte((v shr 8) and 0xFF)
   buf[pos + 3] = byte(v and 0xFF)
 
 template writeBE64*(buf: var openArray[byte], pos: int, v: int64) =
+  ## Write `v` big-endian at ``buf[pos ..< pos + 8]``, unchecked.
   buf[pos] = byte((v shr 56) and 0xFF)
   buf[pos + 1] = byte((v shr 48) and 0xFF)
   buf[pos + 2] = byte((v shr 40) and 0xFF)
@@ -51,27 +61,29 @@ func toBE64*(v: int64): array[8, byte] {.inline.} =
   ]
 
 func fromBE16*(data: openArray[byte], offset = 0): int16 {.inline.} =
-  ## Decode a big-endian 16-bit integer from `data` at `offset`.
+  ## Decode a big-endian 16-bit integer from `data` at `offset`, unchecked.
   int16(data[offset]) shl 8 or int16(data[offset + 1])
 
 func fromBE32*(data: openArray[byte], offset = 0): int32 {.inline.} =
-  ## Decode a big-endian 32-bit integer from `data` at `offset`.
+  ## Decode a big-endian 32-bit integer from `data` at `offset`, unchecked.
   int32(data[offset]) shl 24 or int32(data[offset + 1]) shl 16 or
     int32(data[offset + 2]) shl 8 or int32(data[offset + 3])
 
 func fromBE64*(data: openArray[byte], offset = 0): int64 {.inline.} =
-  ## Decode a big-endian 64-bit integer from `data` at `offset`.
+  ## Decode a big-endian 64-bit integer from `data` at `offset`, unchecked.
   int64(data[offset]) shl 56 or int64(data[offset + 1]) shl 48 or
     int64(data[offset + 2]) shl 40 or int64(data[offset + 3]) shl 32 or
     int64(data[offset + 4]) shl 24 or int64(data[offset + 5]) shl 16 or
     int64(data[offset + 6]) shl 8 or int64(data[offset + 7])
 
 func decodeFloat32BE*(data: openArray[byte], offset = 0): float32 {.inline.} =
-  ## Decode a big-endian IEEE-754 32-bit float from `data` at `offset`.
+  ## Decode a big-endian IEEE-754 32-bit float from `data` at `offset`,
+  ## unchecked.
   cast[float32](cast[uint32](fromBE32(data, offset)))
 
 func decodeFloat64BE*(data: openArray[byte], offset = 0): float64 {.inline.} =
-  ## Decode a big-endian IEEE-754 64-bit float from `data` at `offset`.
+  ## Decode a big-endian IEEE-754 64-bit float from `data` at `offset`,
+  ## unchecked.
   cast[float64](cast[uint64](fromBE64(data, offset)))
 
 template writeBytesAt*(dst: var openArray[byte], pos: int, src: openArray[byte]) =

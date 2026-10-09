@@ -512,6 +512,12 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## unlock failure reported only to `onAdvisoryUnlockFailed`, aborts the
   ## transaction the same way.
   ##
+  ## A ROLLBACK that fails, or is skipped on a retired connection, never
+  ## replaces the body's error, which is re-raised; it is reported only to
+  ## the tracer's `onCleanupSkipped`. A timed-out ROLLBACK still retires the
+  ## connection like any per-call timeout (below), and a Defect from it always
+  ## does, so later calls on that connection fail.
+  ##
   ## Do not issue transaction-control SQL (`COMMIT`, `ROLLBACK`, `END`,
   ## `ABORT`, `PREPARE TRANSACTION`) inside the body: ending the transaction
   ## yourself is not detected — later statements run in autocommit and the
@@ -679,7 +685,9 @@ proc savepointNameExpr(connSym, spName: NimNode): NimNode {.compileTime.} =
 
 macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## Execute `body` inside a SAVEPOINT.
-  ## On exception, ROLLBACK TO SAVEPOINT is issued automatically.
+  ## On exception, ROLLBACK TO SAVEPOINT is issued automatically; like
+  ## `withTransaction`'s ROLLBACK, a failure of it is reported only to
+  ## `onCleanupSkipped`.
   ## Using `return` inside the body is a compile-time error.
   ##
   ## Usage:
