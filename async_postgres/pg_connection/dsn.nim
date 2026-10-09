@@ -18,6 +18,16 @@
 import std/[strutils, options]
 when defined(posix):
   import std/posix
+elif defined(windows):
+  import std/[oserrors, winlean]
+
+  proc getFileType(
+    h: Handle
+  ): int32 {.stdcall, dynlib: "kernel32", importc: "GetFileType".}
+
+  const
+    FileTypeUnknown = 0'i32
+    FileTypeDisk = 1'i32
 
 import ../[async_backend, pg_errors]
 from ../pg_types/encoding import hexNibble
@@ -265,6 +275,12 @@ proc checkExplicitHosts(
       raise
         newException(PgConfigError, "Empty host in DSN host list (element #" & $i & ")")
 
+when defined(posix) or defined(windows):
+  proc notRegularFileError(label, path: string): ref PgConfigError =
+    newException(
+      PgConfigError, label & " file is not a regular file, refusing to use: " & path
+    )
+
 when defined(posix):
   proc openRegularFile(path, label: string): tuple[f: File, st: Stat] =
     ## Open `path` as a File, guaranteeing it is a regular file without
@@ -283,9 +299,7 @@ when defined(posix):
       raise newException(PgConfigError, "Cannot stat " & label & " file: " & path)
     if not S_ISREG(result.st.st_mode):
       discard close(fd)
-      raise newException(
-        PgConfigError, label & " file is not a regular file, refusing to use: " & path
-      )
+      raise notRegularFileError(label, path)
     let flags = fcntl(fd, F_GETFL)
     if flags == -1 or fcntl(fd, F_SETFL, flags and not O_NONBLOCK) == -1:
       discard close(fd)
@@ -375,11 +389,21 @@ proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
     finally:
       close(opened.f)
   else:
-    # Capped as well as pre-checked, in case the reported size understates it.
     var f: File
     if not open(f, path, fmRead):
       failRead()
     try:
+      when defined(windows):
+        # Check the opened handle: a device name (NUL, CON) or a pipe opens
+        # without blocking — only reading it does — and reparse-point files
+        # (OneDrive placeholders) stay DISK.
+        let fileType = getFileType(Handle(getOsFileHandle(f)))
+        if fileType != FileTypeDisk:
+          # UNKNOWN with an error set is a failed call, not a file kind.
+          if fileType == FileTypeUnknown and osLastError() != OSErrorCode(0):
+            failRead()
+          raise notRegularFileError(label, path)
+      # Capped as well as pre-checked, in case the reported size understates it.
       try:
         let size = getFileSize(f)
         if size > MaxPemFileBytes:

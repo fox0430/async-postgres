@@ -1437,6 +1437,23 @@ suite "parseDsn":
             certPath
         )
 
+  test "error: PEM path that is not a regular file is rejected":
+    # Windows `fopen` refuses a directory before the handle check, so use a
+    # character device there instead.
+    when defined(windows):
+      let path = "NUL"
+    else:
+      let path = createTempDir("pg_test_pem_dir_", "")
+      defer:
+        removeDir(path)
+    for label in ["sslrootcert", "sslcert", "sslkey"]:
+      var msg = ""
+      try:
+        discard readPemFileParam(path, label)
+      except PgConfigError as e:
+        msg = e.msg
+      check label & " file is not a regular file, refusing to use: " & path == msg
+
 suite "parseDsn keyword=value":
   test "full connection string":
     let cfg = parseDsn("host=dbhost port=5433 dbname=mydb user=myuser password=mypass")
