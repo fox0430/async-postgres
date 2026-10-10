@@ -5,13 +5,16 @@ async_postgres.nim	export pg_connection
 async_postgres.nim	export pg_largeobject
 async_postgres.nim	export pg_pool.PgPool
 async_postgres.nim	export pg_pool.PoolConfig
+async_postgres.nim	export pg_pool.PoolConnectState
 async_postgres.nim	export pg_pool.PoolMetrics
 async_postgres.nim	export pg_pool.PooledConnHandle
 async_postgres.nim	export pg_pool.acquire
 async_postgres.nim	export pg_pool.acquireHandle
 async_postgres.nim	export pg_pool.activeCount
 async_postgres.nim	export pg_pool.close
+async_postgres.nim	export pg_pool.connectError
 async_postgres.nim	export pg_pool.connectRefusal
+async_postgres.nim	export pg_pool.connectState
 async_postgres.nim	export pg_pool.exec
 async_postgres.nim	export pg_pool.execInTransaction
 async_postgres.nim	export pg_pool.idleCount
@@ -22,6 +25,7 @@ async_postgres.nim	export pg_pool.newPool
 async_postgres.nim	export pg_pool.notify
 async_postgres.nim	export pg_pool.pendingAcquires
 async_postgres.nim	export pg_pool.poolConfig
+async_postgres.nim	export pg_pool.probeConnect
 async_postgres.nim	export pg_pool.query
 async_postgres.nim	export pg_pool.queryColumn
 async_postgres.nim	export pg_pool.queryEach
@@ -957,6 +961,12 @@ async_postgres/pg_pool.nim	PoolConfig.resetQuery
 async_postgres/pg_pool.nim	PoolConfig.resetQueryTimeout
 async_postgres/pg_pool.nim	PoolConfig.tlsHealthCheckTimeout
 async_postgres/pg_pool.nim	PoolConfig.tracer
+async_postgres/pg_pool.nim	PoolConnectState
+async_postgres/pg_pool.nim	PoolConnectState.pcsClosed
+async_postgres/pg_pool.nim	PoolConnectState.pcsConfigFault
+async_postgres/pg_pool.nim	PoolConnectState.pcsFailing
+async_postgres/pg_pool.nim	PoolConnectState.pcsNormal
+async_postgres/pg_pool.nim	PoolConnectState.pcsRefused
 async_postgres/pg_pool.nim	PoolMetrics
 async_postgres/pg_pool.nim	PoolMetrics.acquireCount
 async_postgres/pg_pool.nim	PoolMetrics.acquireDuration
@@ -972,7 +982,9 @@ async_postgres/pg_pool.nim	acquire
 async_postgres/pg_pool.nim	acquireHandle
 async_postgres/pg_pool.nim	activeCount
 async_postgres/pg_pool.nim	close
+async_postgres/pg_pool.nim	connectError
 async_postgres/pg_pool.nim	connectRefusal
+async_postgres/pg_pool.nim	connectState
 async_postgres/pg_pool.nim	exec
 async_postgres/pg_pool.nim	exec#2
 async_postgres/pg_pool.nim	execInTransaction
@@ -985,6 +997,7 @@ async_postgres/pg_pool.nim	newPool
 async_postgres/pg_pool.nim	notify
 async_postgres/pg_pool.nim	pendingAcquires
 async_postgres/pg_pool.nim	poolConfig
+async_postgres/pg_pool.nim	probeConnect
 async_postgres/pg_pool.nim	query
 async_postgres/pg_pool.nim	query#2
 async_postgres/pg_pool.nim	queryColumn

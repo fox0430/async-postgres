@@ -3585,6 +3585,8 @@ suite "Config faults":
       doAssert err.kind == pekConfigFault
       doAssert err.parent of PgConfigError
       doAssert pool.configFault != nil
+      doAssert pool.connectState == pcsConfigFault
+      doAssert pool.connectError of PgConfigError
       doAssert pool.active == 0
       doAssert not pool.canAttemptConnect()
       doAssert pool.consecutiveConnectFailures == 0
@@ -4189,8 +4191,12 @@ suite "Connect refusals":
     pool.config.connectBackoffInitial = milliseconds(10)
     pool.config.connectBackoffMax = seconds(60)
 
+    doAssert pool.connectState == pcsNormal
+    doAssert pool.connectError == nil
     doAssert pool.noteConnectFailure(refusal) == cfRefused
     doAssert pool.connectRefusal == refusal
+    doAssert pool.connectState == pcsRefused
+    doAssert pool.connectError == refusal
     doAssert pool.metrics.refusalCount == 1
     doAssert pool.metrics.connectFailureCount == 1
     # Gated like any other failure, but straight at the cap.
@@ -4201,11 +4207,15 @@ suite "Connect refusals":
     # refusal: it holds, and so does the cap.
     doAssert pool.noteConnectFailure(lost) == cfFailed
     doAssert pool.connectRefusal == refusal
+    doAssert pool.connectState == pcsRefused
+    doAssert pool.connectError == refusal
     doAssert pool.nextConnectRetryAt - Moment.now() > seconds(59)
     doAssert pool.metrics.connectFailureCount == 2
 
     pool.noteConnected()
     doAssert pool.connectRefusal == nil
+    doAssert pool.connectState == pcsNormal
+    doAssert pool.connectError == nil
     doAssert pool.consecutiveConnectFailures == 0
     doAssert pool.canAttemptConnect()
     # Without a refusal, the ramp starts over.
@@ -4219,6 +4229,65 @@ suite "Connect refusals":
     doAssert pool.canAttemptConnect()
 
     waitFor pool.close()
+
+  test "any other failure reports pcsFailing until a connect succeeds":
+    let lost: ref CatchableError = (ref PgUnavailableError)(msg: "lost")
+    let pool = makePool(minSize = 1, maxSize = 1)
+    # An acquire's failure does not back off, but it is recorded all the same.
+    doAssert pool.noteConnectFailure(lost, backOff = false) == cfFailed
+    doAssert pool.consecutiveConnectFailures == 0
+    doAssert pool.connectState == pcsFailing
+    doAssert pool.connectError == lost
+    doAssert pool.connectRefusal == nil
+    pool.noteConnected()
+    doAssert pool.connectState == pcsNormal
+    doAssert pool.connectError == nil
+
+    waitFor pool.close()
+
+  test "a config fault outranks what any other dial reports":
+    let refusal: ref CatchableError = newStartupError(
+      "refused", (ref PgQueryError)(msg: "28P01", sqlState: "28P01", severity: "FATAL")
+    )
+    let lost: ref CatchableError = (ref PgUnavailableError)(msg: "lost")
+    let fault: ref CatchableError = newException(PgConfigError, "bad sslrootcert")
+    let pool = makePool(minSize = 1, maxSize = 1)
+    pool.config.connectBackoffInitial = milliseconds(10)
+    pool.config.connectBackoffMax = seconds(60)
+    doAssert pool.noteConnectFailure(refusal) == cfRefused
+    doAssert pool.noteConnectFailure(fault) == cfConfigFault
+    doAssert pool.connectState == pcsConfigFault
+    doAssert pool.connectError == fault
+    # The refusal stays on record; the state only ranks it lower.
+    doAssert pool.connectRefusal == refusal
+    # A dial already in flight reports the fault whatever it was told: no later
+    # dial is made for a server-side fix to help, so none is scheduled either.
+    let failures = pool.consecutiveConnectFailures
+    let retryAt = Moment.now() + seconds(1)
+    pool.nextConnectRetryAt = retryAt
+    doAssert pool.noteConnectFailure(refusal) == cfConfigFault
+    doAssert pool.noteConnectFailure(lost) == cfConfigFault
+    doAssert pool.connectState == pcsConfigFault
+    doAssert pool.connectError == fault
+    doAssert pool.consecutiveConnectFailures == failures
+    doAssert pool.nextConnectRetryAt == retryAt
+    doAssert pool.metrics.refusalCount == 2
+    doAssert pool.metrics.connectFailureCount == 4
+    # A success never clears a config fault: no later dial is made.
+    pool.noteConnected()
+    doAssert pool.connectState == pcsConfigFault
+    doAssert pool.connectError == fault
+
+    waitFor pool.close()
+    doAssert pool.connectState == pcsClosed
+    doAssert pool.connectError == nil
+
+  test "a closed pool reports pcsClosed":
+    let pool = makePool()
+    doAssert pool.connectState == pcsNormal
+    waitFor pool.close()
+    doAssert pool.connectState == pcsClosed
+    doAssert pool.connectError == nil
 
   test "a refused pool dials one connection per connectBackoffMax until a fix":
     proc t() {.async.} =
@@ -4462,6 +4531,54 @@ suite "Connect refusals":
       doAssert pool.consecutiveConnectFailures == 1
       # Held to the backoff: no round has refilled the dropped slot.
       doAssert pool.idleCount() == 1, $pool.idleCount()
+      doAssert pool.connectState == pcsFailing
+      doAssert isTransientError(pool.connectError)
+
+      await pool.close()
+      for c in clients[]:
+        await closeClient(c)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a refusal a round's other dial got past still reports pcsFailing":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let clients = new seq[MockClient]
+      proc handler() {.async.} =
+        try:
+          # Of the round's two dials, the first to arrive is refused.
+          let first = await ms.accept()
+          await drainStartupMessage(first)
+          await sendBytes(first, wrongPassword())
+          await closeClient(first)
+          while true:
+            clients[].add(await acceptAndReady(ms))
+        except CatchableError:
+          discard
+
+      discard handler()
+      let pool = makePool(minSize = 2, maxSize = 2)
+      pool.config.connConfig = mockConfig(ms.port)
+      # Unset, it falls back to the 20ms interval: a slow startup would fail
+      # the round's other dial too.
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.maintenanceInterval = milliseconds(20)
+      # Held to the backoff, no later round's success clears what this one
+      # recorded.
+      pool.config.connectBackoffInitial = seconds(60)
+      pool.config.connectBackoffMax = seconds(60)
+      pool.maintenanceTask = maintenanceLoop(pool)
+
+      var spins = 0
+      while (pool.idleCount() == 0 or pool.active != 0) and spins < 200:
+        inc spins
+        await sleepAsync(milliseconds(10))
+      doAssert pool.idleCount() == 1, $pool.idleCount()
+      doAssert pool.connectRefusal == nil
+      # As for a transient failure in the same spot: the refused dial shows.
+      doAssert pool.connectState == pcsFailing
+      doAssert isLastingRefusal(pool.connectError)
 
       await pool.close()
       for c in clients[]:
@@ -4531,6 +4648,8 @@ suite "Connect refusals":
       doAssert isTransientError(errA)
       await sleepAsync(milliseconds(50))
       doAssert pool.connectRefusal == nil
+      doAssert pool.connectState == pcsFailing
+      doAssert pool.connectError == (ref CatchableError)(errA.parent)
       doAssert not futB.finished
       doAssert pool.waiterCount == 1
 
@@ -4670,6 +4789,181 @@ suite "Connect refusals":
         await closeClient(c)
       await closeServer(accepting)
       await closeServer(refusing)
+
+    waitFor t()
+
+  test "probeConnect clears a stale refusal and keeps no connection":
+    proc t() {.async.} =
+      # Fixed server-side since the refusal.
+      let ms = startMockServer()
+      let accepted = new int
+      let clients = new seq[MockClient]
+      acceptLogins(ms, accepted, clients)
+      let pool = makePool(minSize = 1, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connectBackoffInitial = milliseconds(10)
+      pool.config.connectBackoffMax = seconds(60)
+      pool.recordRefusal()
+      doAssert not pool.canAttemptConnect()
+
+      doAssert (await pool.probeConnect()) == pcsNormal
+      doAssert pool.connectRefusal == nil
+      doAssert pool.connectError == nil
+      # The replenish no longer waits out `connectBackoffMax`.
+      doAssert pool.canAttemptConnect()
+      # Closed, not parked: it never counted against `maxSize`.
+      doAssert pool.idleCount() == 0
+      doAssert pool.active == 0
+      var spins = 0
+      while clients[].len == 0 and spins < 200:
+        inc spins
+        await sleepAsync(milliseconds(5))
+      doAssert accepted[] == 1
+      let msg = await drainFrontendMessage(clients[][0]).wait(seconds(2))
+      doAssert msg.msgType == 'X'
+      doAssert pool.metrics.createCount == 1
+      doAssert pool.metrics.closeCount == 1
+
+      await pool.close()
+      for c in clients[]:
+        await closeClient(c)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "probeConnect reports a refusal through the state instead of raising":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let refused = new int
+      refuseLogins(ms, refused)
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connectBackoffInitial = milliseconds(10)
+      pool.config.connectBackoffMax = seconds(60)
+
+      doAssert (await pool.probeConnect()) == pcsRefused
+      doAssert refused[] == 1, $refused[]
+      doAssert pool.connectError == pool.connectRefusal
+      doAssert isLastingRefusal(pool.connectError)
+      doAssert pool.metrics.refusalCount == 1
+
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a probe's failure that may clear does not push back the replenish":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let dropped = new int
+      refuseLogins(ms, dropped, reply = @[])
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connectBackoffInitial = seconds(60)
+      pool.config.connectBackoffMax = seconds(60)
+
+      doAssert (await pool.probeConnect()) == pcsFailing
+      doAssert dropped[] == 1, $dropped[]
+      doAssert isTransientError(pool.connectError)
+      doAssert pool.connectRefusal == nil
+      doAssert pool.consecutiveConnectFailures == 0
+      doAssert pool.canAttemptConnect()
+
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "probeConnect records a config fault and dials no more after it":
+    proc t() {.async.} =
+      let pool = makePool()
+      # sslcert without sslkey: rejected before any dial.
+      pool.config.connConfig.sslCert = "dummy"
+      doAssert (await pool.probeConnect()) == pcsConfigFault
+      doAssert pool.connectError of PgConfigError
+      # A config that now works is never dialed: port 1 would refuse the TCP
+      # connect and count a failure if it were.
+      pool.config.connConfig.sslCert = ""
+      pool.config.connConfig.port = 1
+      doAssert (await pool.probeConnect()) == pcsConfigFault
+      doAssert pool.metrics.connectFailureCount == 1
+      await pool.close()
+      doAssert (await pool.probeConnect()) == pcsClosed
+      doAssert pool.metrics.connectFailureCount == 1
+
+    waitFor t()
+
+  test "a probe's refusal fails the waiters nothing else can serve":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let refused = new int
+      refuseLogins(ms, refused)
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connectBackoffInitial = milliseconds(10)
+      pool.config.connectBackoffMax = seconds(60)
+      let waitFut = pool.strandWaiter()
+
+      doAssert (await pool.probeConnect()) == pcsRefused
+      var err: ref PgPoolError
+      try:
+        discard await waitFut.wait(seconds(2))
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil and err.kind == pekRefused
+      doAssert pool.waiterCount == 0
+      # The probe's dial answered the waiter: none was made for it.
+      doAssert refused[] == 1, $refused[]
+
+      await pool.close()
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a probe's config fault fails the waiters nothing else can serve":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      # sslcert without sslkey: rejected before any dial.
+      pool.config.connConfig.sslCert = "dummy"
+      let waitFut = pool.strandWaiter()
+
+      doAssert (await pool.probeConnect()) == pcsConfigFault
+      var err: ref PgPoolError
+      try:
+        discard await waitFut.wait(seconds(2))
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil and err.kind == pekConfigFault
+      doAssert pool.waiterCount == 0
+
+      await pool.close()
+
+    waitFor t()
+
+  test "a probe's success gives a waiter the backoff held back a dial":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let accepted = new int
+      let clients = new seq[MockClient]
+      acceptLogins(ms, accepted, clients)
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connectBackoffInitial = seconds(60)
+      pool.config.connectBackoffMax = seconds(60)
+      pool.consecutiveConnectFailures = 1
+      pool.nextConnectRetryAt = Moment.now() + seconds(60)
+      let waitFut = pool.strandWaiter()
+
+      doAssert (await pool.probeConnect()) == pcsNormal
+      # No maintenance loop runs: only the probe can have dialed for it.
+      let conn = await waitFut.wait(seconds(2))
+      doAssert accepted[] == 2, $accepted[]
+      pool.release(conn)
+
+      await pool.close()
+      for c in clients[]:
+        await closeClient(c)
+      await closeServer(ms)
 
     waitFor t()
 

@@ -147,6 +147,20 @@ type
     execFut: Future[CommandResult] ## Non-nil for popExec
     queryFut: Future[QueryResult] ## Non-nil for popQuery
 
+  PoolConnectState* = enum
+    ## What a pool last learned about opening new connections; see
+    ## `connectState`. Each value outranks the ones before it.
+    pcsNormal ## No connect has failed since one last succeeded.
+    pcsFailing
+      ## A connect failed since one last succeeded, neither refused nor
+      ## faulted: one that may clear on its own (server down, a network error,
+      ## `53300` too many connections) or one not classified (a `pg_hba.conf`
+      ## reject, `28000`; an unmet `channel_binding`). A refusal counts here
+      ## when another dial of the same maintenance round went through.
+    pcsRefused ## A refusal is recorded (`connectRefusal` is non-nil).
+    pcsConfigFault ## The config can never connect. Only a close leaves this state.
+    pcsClosed ## The pool is closed and never opens a connection again.
+
   PgPool* = ref object of PgPoolOwner
     ## Connection pool that manages a set of PostgreSQL connections.
     config: PoolConfig
@@ -179,6 +193,10 @@ type
       ## failure leaves it: dials come from uncoordinated places, so only a
       ## success says the refusal cleared. It paces the replenish; no waiter is
       ## failed with it (see `failStrandedWaiters`).
+    lastFailure: ref CatchableError
+      ## The latest connect failure neither a refusal nor a config fault since
+      ## a connect last succeeded, or a refusal `dropRoundRefusal` let go. Only
+      ## a success clears it, as for `lastRefusal`; it gates nothing.
     spawnsInFlight: int
       ## Unsettled `spawnConnectForWaiter` dials, so the per-tick respawn does
       ## not stack a second one on a waiter.
@@ -551,7 +569,7 @@ proc connectRetryDelay(pool: PgPool): Duration =
     pool.config.connectBackoffMax
 
 type ConnectFailure = enum
-  cfFailed ## May clear on its own; backed off.
+  cfFailed ## May clear on its own; recorded in `lastFailure` and backed off.
   cfRefused ## The server refused the session; recorded in `lastRefusal`.
   cfConfigFault ## The config can never connect; recorded in `configFault`.
 
@@ -569,26 +587,42 @@ proc noteConnectFailure(
   ## Record one failed connect and schedule the next attempt. `backOff = false`
   ## leaves the schedule alone for a `cfFailed`: an `acquire`'s caller gets the
   ## error itself, and the next `acquire` dials regardless.
-  result = connectFailureOf(err)
+  ##
+  ## Returns what the failure means for the pool, not only what the dial was
+  ## told: once a config fault is recorded every failure is `cfConfigFault`,
+  ## since no later dial is made for a server-side fix to help.
+  let failure = connectFailureOf(err)
   pool.metrics.connectFailureCount.inc
-  case result
+  case failure
   of cfConfigFault:
     if pool.configFault == nil:
       pool.configFault = (ref PgConfigError)(err)
-    return
   of cfRefused:
     pool.metrics.refusalCount.inc
     pool.lastRefusal = err
   of cfFailed:
-    if not backOff:
-      return
+    pool.lastFailure = err
+  if pool.configFault != nil:
+    return cfConfigFault
+  if failure == cfFailed and not backOff:
+    return failure
   pool.consecutiveConnectFailures.inc
   pool.scheduleConnectRetry(pool.connectRetryDelay())
+  failure
 
 proc noteConnected(pool: PgPool) =
   ## A connect succeeded: whatever failed the earlier ones has cleared.
   pool.consecutiveConnectFailures = 0
   pool.lastRefusal = nil
+  pool.lastFailure = nil
+
+proc dropRoundRefusal(pool: PgPool) =
+  ## A maintenance round recorded a refusal, but another of its dials went
+  ## through: the server takes this config. Keep it as an ordinary failure, in
+  ## `lastFailure` and the backoff, as for the round's other failures.
+  pool.lastFailure = pool.lastRefusal
+  pool.lastRefusal = nil
+  pool.scheduleConnectRetry(pool.connectRetryDelay())
 
 proc configFaultError(pool: PgPool): ref PgPoolError =
   newPoolError(
@@ -601,11 +635,47 @@ proc refusedError(cause: ref CatchableError): ref PgPoolError =
 proc connectRefusal*(pool: PgPool): ref CatchableError =
   ## The latest refusal a connect reported (a wrong password, a missing
   ## database) since one last succeeded, or nil. It is how a pool held below
-  ## `minSize` by a refusal surfaces. A failure of another kind leaves it; the
-  ## next successful connect clears it: an `acquire`'s, or the maintenance
-  ## loop's every `connectBackoffMax`. A config fault surfaces as
-  ## `pekConfigFault` instead.
+  ## `minSize` by a refusal surfaces. A failure of another kind, a config fault
+  ## and a close leave it; the next successful connect clears it: an
+  ## `acquire`'s, a `probeConnect`'s, or the maintenance loop's every
+  ## `connectBackoffMax` while the pool is below `minSize`. `connectState`
+  ## ranks it below a config fault and a close.
   pool.lastRefusal
+
+proc connectState*(pool: PgPool): PoolConnectState =
+  ## What the pool last learned about opening new connections, for a health
+  ## check to poll: open sessions keep working while new connects fail, so
+  ## queries alone do not show it. `connectError` holds the cause. The highest
+  ## applies: a close, a config fault, a refusal (see `isLastingRefusal`), then
+  ## any other failure since a connect last succeeded. A refusal outlasts a
+  ## later failure of another kind: only a success says it cleared.
+  ##
+  ## It is what the pool's dials were told, not a fresh check: the pool dials
+  ## only when it needs a connection (an `acquire` with none idle, a queued
+  ## waiter, a replenish below `minSize`). A pool served from idle sees a
+  ## failure only once it dials, and reports one after it clears until a dial
+  ## succeeds. `probeConnect` dials to bring it up to date. A dial an
+  ## `acquire`'s budget cut short says nothing of the server and leaves it.
+  if pool.closed:
+    pcsClosed
+  elif pool.configFault != nil:
+    pcsConfigFault
+  elif pool.lastRefusal != nil:
+    pcsRefused
+  elif pool.lastFailure != nil:
+    pcsFailing
+  else:
+    pcsNormal
+
+proc connectError*(pool: PgPool): ref CatchableError =
+  ## The cause of `connectState`: the `PgConfigError` for `pcsConfigFault`,
+  ## `connectRefusal` for `pcsRefused`, the latest failure for `pcsFailing`,
+  ## nil for `pcsNormal` and `pcsClosed`.
+  case pool.connectState
+  of pcsConfigFault: pool.configFault
+  of pcsRefused: pool.lastRefusal
+  of pcsFailing: pool.lastFailure
+  of pcsNormal, pcsClosed: nil
 
 proc failStrandedWaiters(pool: PgPool, refusal: ref CatchableError = nil) =
   ## Fail every live waiter once nothing but a doomed dial could serve one: no
@@ -643,6 +713,15 @@ proc canDialForWaiter(pool: PgPool): bool =
   ## only: like an `acquire`, a waiter hears from the server itself.
   pool.configFault == nil and (pool.lastRefusal != nil or pool.canAttemptConnect())
 
+proc boundedConnConfig(pool: PgPool): ConnConfig =
+  ## `connConfig` for a dial no acquire budget bounds: an unset
+  ## `connectTimeout` falls back to `maintenanceInterval`, so a stuck TCP
+  ## connect cannot hold the dial, or `close()`'s drain of it, open
+  ## indefinitely.
+  result = pool.config.connConfig
+  if result.connectTimeout == ZeroDuration:
+    result.connectTimeout = pool.config.maintenanceInterval
+
 proc spawnConnectForWaiter(pool: PgPool) =
   ## Open a connection asynchronously and hand it to the next queued waiter
   ## (FIFO). The caller MUST have already incremented `pool.active` as a
@@ -660,12 +739,7 @@ proc spawnConnectForWaiter(pool: PgPool) =
   ## `failLastWaiter`).
   ## The spawned future is tracked in
   ## `pendingBackgroundTasks` so `pool.close()` drains it before returning.
-  # Bound an unset connectTimeout with maintenanceInterval so a stuck TCP
-  # connect can't hold close()'s final pendingBackgroundTasks drain open
-  # indefinitely. Mirrors maintenanceLoop's fallback.
-  var connCfg = pool.config.connConfig
-  if connCfg.connectTimeout == ZeroDuration:
-    connCfg.connectTimeout = pool.config.maintenanceInterval
+  let connCfg = pool.boundedConnConfig()
 
   proc run() {.async.} =
     var consumed = false
@@ -735,8 +809,8 @@ proc respawnForStrandedWaiter(pool: PgPool, refusal: ref CatchableError = nil) =
   ## attached (queue-time spawn was skipped because `active == maxSize`) and
   ## no borrower to release, so it would sit until its own wait budget elapses.
   ## The maintenance loop also calls it each tick, for waiters a failed
-  ## background spawn left behind. `refusal`: the failed dial was refused,
-  ## which answers the waiters too.
+  ## background spawn left behind, and `probeConnect` after its dial.
+  ## `refusal`: the failed dial was refused, which answers the waiters too.
   if pool.closed or pool.waiterCount <= pool.spawnsInFlight:
     return
   if refusal == nil and pool.active < pool.config.maxSize and pool.canDialForWaiter():
@@ -744,6 +818,44 @@ proc respawnForStrandedWaiter(pool: PgPool, refusal: ref CatchableError = nil) =
     pool.spawnConnectForWaiter()
   else:
     pool.failStrandedWaiters(refusal)
+
+proc probeConnect*(pool: PgPool): Future[PoolConnectState] {.async.} =
+  ## Dial once with the pool's config, record the outcome as an `acquire`'s
+  ## dial does, and return the `connectState` that results: how a health check
+  ## brings the state up to date while the pool needs no connection. A success
+  ## clears a recorded refusal or failure, and the replenish backoff with it.
+  ## A failure shows in the state and `connectError`; it is not raised.
+  ## Queued waiters hear of the outcome as of an `acquire`'s dial: a refusal or
+  ## a config fault fails those nothing else can serve.
+  ##
+  ## The connection is closed once its startup completes, never kept, so while
+  ## open it sits outside `maxSize`. It counts in `metrics` as any connection
+  ## the pool opens and closes. Each call costs a login, and a failed login in
+  ## the server log while the server refuses. A closed pool, or one with a
+  ## config fault, returns its state without dialing. An unset
+  ## `connectTimeout` is bounded by `maintenanceInterval`.
+  if pool.closed or pool.configFault != nil:
+    return pool.connectState
+  var conn: PgConnection
+  try:
+    conn = await connect(pool.boundedConnConfig())
+  except CancelledError as e:
+    raise e
+  except CatchableError as e:
+    # A failure that may clear does not push back the replenish: the probe is
+    # no part of its schedule.
+    let failure = pool.noteConnectFailure(e, backOff = false)
+    pool.respawnForStrandedWaiter(if failure == cfRefused: e else: nil)
+    return pool.connectState
+  pool.metrics.createCount.inc
+  pool.noteConnected()
+  # The backoff this success cleared may have held a waiter's dial back.
+  pool.respawnForStrandedWaiter()
+  # closeNoWait: no await is left for a cancellation to land in. A `close()`
+  # still running drains it; one that returned during the dial does not, as
+  # for an `acquire`'s dial.
+  pool.closeNoWait(conn)
+  return pool.connectState
 
 proc settleReplenishConnect(pool: PgPool, conn: PgConnection, now: Moment) =
   ## Settle a fresh replenishment connection: the pre-reserved `pool.active`
@@ -809,16 +921,12 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     # refusal does not hold back their dial.
     pool.respawnForStrandedWaiter()
 
-    # A config fault never clears (see `configFault`): keep sweeping idle
-    # entries, never replenish.
-    if pool.configFault != nil:
-      continue
-
-    # Skip the replenish phase while we are inside a backoff window from a
-    # recent failure. Idle pruning above still runs every interval — only the
-    # connect attempts are throttled, so a backed-off pool keeps closing dead
+    # Skip the replenish phase for good after a config fault (see
+    # `configFault`), and while we are inside a backoff window from a recent
+    # failure. Idle pruning above still runs every interval — only the connect
+    # attempts are throttled, so a backed-off pool keeps closing dead
     # idle/expired connections normally.
-    if pool.consecutiveConnectFailures > 0 and Moment.now() < pool.nextConnectRetryAt:
+    if not pool.canAttemptConnect():
       continue
 
     # Replenish to minSize (best-effort). Open all needed connections
@@ -840,10 +948,8 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       # would let concurrent acquires overshoot maxSize once these park.
       pool.active.inc(needed)
       var connectFuts: seq[Future[PgConnection]]
+      let connCfg = pool.boundedConnConfig()
       for i in 0 ..< needed:
-        var connCfg = pool.config.connConfig
-        if connCfg.connectTimeout == ZeroDuration:
-          connCfg.connectTimeout = pool.config.maintenanceInterval
         connectFuts.add(connect(connCfg))
       try:
         await allFutures(connectFuts)
@@ -873,10 +979,8 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
           if pool.noteConnectFailure(e) == cfRefused:
             refusal = e
       if connected and refusal != nil:
-        # A dial of the same round went through: the server takes this config.
-        pool.lastRefusal = nil
+        pool.dropRoundRefusal()
         refusal = nil
-        pool.scheduleConnectRetry(pool.connectRetryDelay())
       pool.failStrandedWaiters(refusal)
 
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
