@@ -594,6 +594,210 @@ suite "Frontend encoding":
     check msg[0] == byte('f')
     check decodeInt32(msg, 1) == int32(msg.len - 1)
 
+suite "Binary COPY builders":
+  test "header: signature, zero flags, empty extension area":
+    var buf: seq[byte] = @[]
+    buf.addCopyBinaryHeader()
+    check buf ==
+      @[
+        byte('P'),
+        byte('G'),
+        byte('C'),
+        byte('O'),
+        byte('P'),
+        byte('Y'),
+        0x0A,
+        0xFF,
+        0x0D,
+        0x0A,
+        0x00, # signature
+        0x00,
+        0x00,
+        0x00,
+        0x00, # flags
+        0x00,
+        0x00,
+        0x00,
+        0x00, # extension area length
+      ]
+
+  test "trailer is an int16 -1":
+    var buf: seq[byte] = @[]
+    buf.addCopyBinaryTrailer()
+    check buf == @[0xFF'u8, 0xFF]
+
+  test "tuple start is the int16 field count":
+    var buf: seq[byte] = @[]
+    buf.addCopyTupleStart(3)
+    buf.addCopyTupleStart(int16.high)
+    check buf == @[0x00'u8, 0x03, 0x7F, 0xFF]
+
+  test "NULL field is a length of -1 and no data":
+    var buf: seq[byte] = @[]
+    buf.addCopyFieldNull()
+    check buf == @[0xFF'u8, 0xFF, 0xFF, 0xFF]
+
+  test "integer fields: int32 length, then the big-endian value":
+    var buf: seq[byte] = @[]
+    buf.addCopyFieldInt16(-2)
+    check buf == @[0x00'u8, 0x00, 0x00, 0x02, 0xFF, 0xFE]
+    buf.setLen(0)
+    buf.addCopyFieldInt32(0x01020304)
+    check buf == @[0x00'u8, 0x00, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04]
+    buf.setLen(0)
+    buf.addCopyFieldInt64(0x0102030405060708)
+    check buf ==
+      @[0x00'u8, 0x00, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+
+  test "float fields carry the IEEE 754 bits":
+    var buf: seq[byte] = @[]
+    buf.addCopyFieldFloat32(1.5'f32) # 0x3FC00000
+    check buf == @[0x00'u8, 0x00, 0x00, 0x04, 0x3F, 0xC0, 0x00, 0x00]
+    buf.setLen(0)
+    buf.addCopyFieldFloat64(-2.0) # 0xC000000000000000
+    check buf ==
+      @[0x00'u8, 0x00, 0x00, 0x08, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  test "bool field is one byte, 1 or 0":
+    var buf: seq[byte] = @[]
+    buf.addCopyFieldBool(true)
+    buf.addCopyFieldBool(false)
+    check buf == @[0x00'u8, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00]
+
+  test "byte and string fields: int32 length, then the raw bytes":
+    var buf: seq[byte] = @[]
+    buf.addCopyFieldText([0x00'u8, 0xFF])
+    check buf == @[0x00'u8, 0x00, 0x00, 0x02, 0x00, 0xFF]
+    buf.setLen(0)
+    buf.addCopyFieldString("hé") # UTF-8, so 3 bytes
+    check buf == @[0x00'u8, 0x00, 0x00, 0x03, 0x68, 0xC3, 0xA9]
+
+  test "empty byte and string fields are a zero length, not NULL":
+    var buf: seq[byte] = @[]
+    buf.addCopyFieldText(newSeq[byte]())
+    buf.addCopyFieldString("")
+    check buf == @[0x00'u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  test "builders append, so a whole stream composes in one buffer":
+    var buf = @[0xAA'u8] # pre-existing content must survive
+    buf.addCopyBinaryHeader()
+    buf.addCopyTupleStart(2)
+    buf.addCopyFieldInt32(7)
+    buf.addCopyFieldNull()
+    buf.addCopyBinaryTrailer()
+    check buf.len == 1 + 19 + 2 + 8 + 4 + 2
+    check buf[0] == 0xAA'u8
+    check buf[1 .. 19] == @pgCopyBinaryHeader
+    check buf[20 .. ^1] ==
+      @[
+        0x00'u8,
+        0x02, # field count
+        0x00,
+        0x00,
+        0x00,
+        0x04,
+        0x00,
+        0x00,
+        0x00,
+        0x07, # int32 7
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF, # NULL
+        0xFF,
+        0xFF, # trailer
+      ]
+
+suite "Direct parameter encoding agrees with toPgParam":
+  # queryDirect/execDirect bypass toPgParam and write each argument through
+  # these overloads, so the two paths must agree on OID, format and bytes.
+  template checkAgrees(v: typed, wantOid: int32, wantFormat: int16) =
+    let p = toPgParam(v)
+    check p.oid == wantOid
+    check p.format == wantFormat
+    check paramOidOf(v) == wantOid
+    var oidBuf: seq[byte] = @[]
+    oidBuf.writeParamOid(v)
+    check oidBuf == @(toBE32(wantOid))
+    var fmtBuf: seq[byte] = @[]
+    fmtBuf.writeParamFormat(v)
+    check fmtBuf == @(toBE16(wantFormat))
+    check paramValueLen(v) == p.value.get.len
+    var valBuf: seq[byte] = @[]
+    valBuf.writeParamValue(v)
+    check valBuf.len == 4 + paramValueLen(v)
+    check decodeInt32(valBuf, 0) == int32(paramValueLen(v))
+    check valBuf[4 .. ^1] == p.value.get
+
+  test "integers are binary":
+    for v in [0'i16, -2, int16.high, int16.low]:
+      checkAgrees(v, OidInt2, 1)
+    for v in [0'i32, 0x01020304, -1, int32.low]:
+      checkAgrees(v, OidInt4, 1)
+    for v in [0'i64, int64.high, int64.low]:
+      checkAgrees(v, OidInt8, 1)
+    # `int` is sent as int8 whatever the platform width.
+    for v in [0, -1, int.high, int.low]:
+      checkAgrees(v, OidInt8, 1)
+
+  test "floats are binary":
+    for v in [0'f32, 1.5'f32, -0.0'f32, float32(Inf), float32(NaN)]:
+      checkAgrees(v, OidFloat4, 1)
+    for v in [0.0, -2.0, 1e300, NegInf, NaN]:
+      checkAgrees(v, OidFloat8, 1)
+
+  test "bool is binary":
+    checkAgrees(true, OidBool, 1)
+    checkAgrees(false, OidBool, 1)
+
+  test "string is text":
+    for v in ["", "abc", "héllo"]:
+      checkAgrees(v, OidText, 0)
+
+  test "seq[byte] is binary bytea, not text-format bytea":
+    for v in [newSeq[byte](), @[0x00'u8, 0xFF, 0x5C]]:
+      checkAgrees(v, OidBytea, 1)
+
+  test "PgNumeric is text":
+    for s in ["0", "-123.4500", "NaN", "0.00001", "12345678901234567890.000000001"]:
+      checkAgrees(parsePgNumeric(s), OidNumeric, 0)
+
+  test "foldBindParam charges what writeBindParam writes":
+    # PgNumeric renders once during the fold and writes that scratch; other
+    # types leave it untouched and write the value itself.
+    let n = parsePgNumeric("-123.4500")
+    var payload = 10'i64
+    var rendered = ""
+    foldBindParam(payload, n, rendered)
+    check rendered == $n
+    check payload == 10 + int64(paramValueLen(n))
+    var viaFold, direct: seq[byte] = @[]
+    viaFold.writeBindParam(n, rendered)
+    direct.writeParamValue(n)
+    check viaFold == direct
+    # The scratch is what reaches the wire: a re-rendering implementation fails.
+    var viaScratch: seq[byte] = @[]
+    viaScratch.writeBindParam(n, "SENTINEL")
+    check decodeInt32(viaScratch, 0) == 8'i32
+    check viaScratch[4 .. ^1] == toBytes("SENTINEL")
+    # The charge is the bytes written, not paramValueLen restated.
+    check payload - 10 == int64(viaFold.len - 4)
+
+    payload = 0
+    rendered = ""
+    foldBindParam(payload, 0x01020304'i32, rendered)
+    check rendered == ""
+    check payload == 4
+    viaFold.setLen(0)
+    direct.setLen(0)
+    viaFold.writeBindParam(0x01020304'i32, rendered)
+    direct.writeParamValue(0x01020304'i32)
+    check viaFold == direct
+    # Non-numeric types ignore the scratch and write the value itself.
+    var genericScratch: seq[byte] = @[]
+    genericScratch.writeBindParam(0x01020304'i32, "SENTINEL")
+    check genericScratch == direct
+
 suite "CopyData oversized chunk guard":
   test "checkCopyDataLen boundary values run the real raise path":
     # pg_protocol's own guard, called by encodeCopyData, so the boundary is

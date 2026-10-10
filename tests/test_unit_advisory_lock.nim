@@ -1,9 +1,10 @@
 ## Unit tests for `pg_advisory_lock` via the mock server.
 ##
 ## PG-less: session lock acquire/release accounting, try-lock booleans,
-## xact-scope guard, and `withAdvisoryLock` release on body error.
+## xact-scope guard, `withAdvisoryLock` release on body error, and the
+## `onAdvisoryUnlockFailed` report of a failed release.
 
-import std/[unittest, importutils]
+import std/[unittest, importutils, strutils]
 
 import ../async_postgres/[async_backend, pg_connection, pg_protocol]
 import ../async_postgres/pg_advisory_lock
@@ -174,6 +175,117 @@ suite "advisory_lock: mock round trip":
       doAssert conn.heldSessionLocks == 0
       await conn.close()
       await serverFut
+      await ms.closeServer()
+
+    waitFor t()
+
+type UnlockFailLog = ref object
+  calls: seq[TraceAdvisoryUnlockFailedData]
+
+proc tracedConfig(port: int, log: UnlockFailLog): ConnConfig =
+  result = mockConfig(port)
+  result.tracer = PgTracer(
+    onAdvisoryUnlockFailed: proc(
+        data: TraceAdvisoryUnlockFailedData
+    ) {.gcsafe, raises: [].} =
+      log.calls.add(data)
+  )
+
+suite "advisory_lock: unlock failure hook":
+  test "withAdvisoryLock reports an unlock that returns false with a nil err":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        await drainOneExtended(client) # acquire
+        await client.sendBytes(boolReply(true))
+        await drainOneExtended(client) # release: lock was not held
+        await client.sendBytes(boolReply(false))
+        discard await drainFrontendMessage(client)
+        await closeClient(client)
+
+      let serverFut = serve()
+      let log = UnlockFailLog()
+      let conn = await connect(tracedConfig(ms.port, log)).wait(seconds(5))
+      var ran = false
+      conn.withAdvisoryLock(77'i64):
+        ran = true
+      doAssert ran
+      doAssert log.calls.len == 1, $log.calls.len
+      let data = log.calls[0]
+      doAssert data.err == nil
+      doAssert data.conn == conn
+      doAssert data.key == 77'i64
+      doAssert not data.shared
+      doAssert not data.twoKey
+      await conn.close()
+      await serverFut.wait(seconds(5))
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "withAdvisoryLock reports a raised unlock failure without masking the body's error":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        await drainOneExtended(client) # acquire
+        await client.sendBytes(boolReply(true))
+        await drainOneExtended(client) # release fails
+        await client.sendBytes(
+          buildErrorResponse("XX000", "unlock boom") & buildReadyForQuery('I')
+        )
+        discard await drainFrontendMessage(client)
+        await closeClient(client)
+
+      let serverFut = serve()
+      let log = UnlockFailLog()
+      let conn = await connect(tracedConfig(ms.port, log)).wait(seconds(5))
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(78'i64):
+          raise newException(ValueError, "body boom")
+      except ValueError as e:
+        bodyMsg = e.msg
+      doAssert "body boom" in bodyMsg, bodyMsg
+      doAssert log.calls.len == 1, $log.calls.len
+      let data = log.calls[0]
+      doAssert data.err != nil
+      doAssert data.err of PgQueryError
+      doAssert "unlock boom" in data.err.msg, data.err.msg
+      doAssert data.key == 78'i64
+      await conn.close()
+      await serverFut.wait(seconds(5))
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "withAdvisoryLockShared reports the shared two-key lock it failed to release":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        await drainOneExtended(client) # acquire
+        await client.sendBytes(boolReply(true))
+        await drainOneExtended(client) # release: lock was not held
+        await client.sendBytes(boolReply(false))
+        discard await drainFrontendMessage(client)
+        await closeClient(client)
+
+      let serverFut = serve()
+      let log = UnlockFailLog()
+      let conn = await connect(tracedConfig(ms.port, log)).wait(seconds(5))
+      conn.withAdvisoryLockShared(3'i32, 4'i32):
+        discard
+      doAssert log.calls.len == 1, $log.calls.len
+      let data = log.calls[0]
+      doAssert data.err == nil
+      doAssert data.shared
+      doAssert data.twoKey
+      doAssert data.key1 == 3'i32
+      doAssert data.key2 == 4'i32
+      await conn.close()
+      await serverFut.wait(seconds(5))
       await ms.closeServer()
 
     waitFor t()

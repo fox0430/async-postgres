@@ -2651,7 +2651,8 @@ proc tailPendingReplStatus*(conn: PgConnection): ReplWrite =
   ## The library's status still queued at the tail, or nil. It is encoded when
   ## written, so it already carries anything newer and can stand for another.
   let pending = conn.replPendingStatus
-  if pending != nil and conn.replWrites.peekLast == pending:
+  # Defensive: a stale mark must not read past an empty queue.
+  if pending != nil and conn.replWrites.len > 0 and conn.replWrites.peekLast == pending:
     return pending
 
 proc queueReplStatus*(conn: PgConnection): ReplWrite =

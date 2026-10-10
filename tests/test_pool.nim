@@ -1167,6 +1167,442 @@ suite "Pool withConnection release-path Defect":
 
       waitFor t()
 
+proc readRequest(client: MockClient): Future[seq[string]] {.async.} =
+  ## The SQL of one client request: a simple Query, or an extended batch through
+  ## its Sync (one entry per Parse). A Terminate reads as "<terminate>".
+  var sqls: seq[string]
+  while true:
+    let (t, body) = await drainFrontendMessage(client)
+    case t
+    of 'Q':
+      sqls.add(queryText(body))
+      break
+    of 'P':
+      # decodeCString returns (string, bytes consumed): the statement name
+      # starts at offset 0, so what it consumed is the query string's offset.
+      let (_, nameEnd) = decodeCString(body, 0)
+      sqls.add(decodeCString(body, nameEnd)[0])
+    of 'S':
+      break
+    of 'X':
+      sqls.add("<terminate>")
+      break
+    else:
+      discard
+  return sqls
+
+proc serveScript(
+    ms: MockServer, replies: seq[seq[byte]], log: ref seq[string]
+) {.async.} =
+  ## Answer one connection's requests with `replies` in order, logging their
+  ## SQL, then log what follows (the Terminate of the pool's close). A failure
+  ## of the script is logged with the request it hit, never raised: the client
+  ## only sees its connection end.
+  let client = await acceptAndReady(ms)
+  var served = 0
+  try:
+    for reply in replies:
+      let sqls = await readRequest(client)
+      if sqls.len == 0:
+        # Replying now would answer the wrong statement: stop, leaving the
+        # client without the reply it waits for.
+        log[].add(
+          "server error: request #" & $(served + 1) & " carried no Parse or Query"
+        )
+        break
+      log[].add(sqls)
+      await client.sendBytes(reply)
+      inc served
+    if served == replies.len:
+      let tail = await readRequest(client)
+      log[].add(tail)
+  except Exception as e:
+    # Defects included: what the client reports is a closed connection, so the
+    # log is the only account of the request that broke the script.
+    log[].add("server error: request #" & $(served + 1) & ": " & e.msg)
+  await closeClient(client)
+
+proc simpleOk(tag: string, status: char): seq[byte] =
+  buildCommandComplete(tag) & buildReadyForQuery(status)
+
+proc simpleErr(sqlState: string): seq[byte] =
+  buildErrorResponse(sqlState, "scripted failure") & buildReadyForQuery('E')
+
+proc extendedOk(tag: string, rows: openArray[string] = []): seq[byte] =
+  ## ParseComplete + BindComplete, a text column when `rows` is non-empty,
+  ## then CommandComplete + ReadyForQuery.
+  result = buildBackendMsg('1', @[]) & buildBackendMsg('2', @[])
+  if rows.len > 0:
+    result.add(buildRowDescriptionFields(@[("v", 25'i32, -1'i16)]))
+    for r in rows:
+      result.add(buildDataRowText([r]))
+  result.add(buildCommandComplete(tag))
+  result.add(buildReadyForQuery('I'))
+
+proc scriptedPool(ms: MockServer): Future[PgPool] =
+  newPool(initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 1))
+
+suite "Pool transaction and pipeline macros":
+  test "withTransaction commits the body and releases the connection":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[simpleOk("BEGIN", 'T'), simpleOk("UPDATE 1", 'T'), simpleOk("COMMIT", 'I')],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      proc run() {.async.} =
+        pool.withTransaction(txConn):
+          discard await txConn.simpleExec("UPDATE t SET v = 1")
+          doAssert pool.active == 1
+
+      await run().wait(seconds(5))
+      doAssert log[] == @["BEGIN", "UPDATE t SET v = 1", "COMMIT"], $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+      doAssert pool.idle[0].conn.txStatus == tsIdle
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransaction rolls back a raising body and re-raises it unchanged":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut =
+        serveScript(ms, @[simpleOk("BEGIN", 'T'), simpleOk("ROLLBACK", 'I')], log)
+      let pool = await scriptedPool(ms)
+      let boom = newException(ValueError, "boom")
+      {.push warning[UnreachableCode]: off.}
+      proc run() {.async.} =
+        pool.withTransaction(txConn):
+          raise boom
+
+      {.pop.}
+      var caught: ref ValueError
+      try:
+        await run().wait(seconds(5))
+      except ValueError as e:
+        caught = e
+      doAssert caught == boom
+      doAssert log[] == @["BEGIN", "ROLLBACK"], $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransactionRetry reruns a serialization failure on the same connection":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[
+          simpleOk("BEGIN", 'T'),
+          simpleErr("40001"),
+          simpleOk("ROLLBACK", 'I'),
+          simpleOk("BEGIN", 'T'),
+          simpleOk("UPDATE 1", 'T'),
+          simpleOk("COMMIT", 'I'),
+        ],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      var attempts = 0
+      proc run() {.async.} =
+        pool.withTransactionRetry(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 0, jitter: false), txConn
+        ):
+          inc attempts
+          discard await txConn.simpleExec("UPDATE t SET v = 1")
+
+      await run().wait(seconds(5))
+      doAssert attempts == 2
+      doAssert log[] ==
+        @[
+          "BEGIN", "UPDATE t SET v = 1", "ROLLBACK", "BEGIN", "UPDATE t SET v = 1",
+          "COMMIT",
+        ], $log[]
+      doAssert pool.metrics.acquireCount == 1
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransactionRetry rolls back a non-retryable error once and re-raises it":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut =
+        serveScript(ms, @[simpleOk("BEGIN", 'T'), simpleOk("ROLLBACK", 'I')], log)
+      let pool = await scriptedPool(ms)
+      let boom = newException(ValueError, "boom")
+      var attempts = 0
+      {.push warning[UnreachableCode]: off.}
+      proc run() {.async.} =
+        pool.withTransactionRetry(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 0, jitter: false), txConn
+        ):
+          inc attempts
+          raise boom
+
+      {.pop.}
+      var caught: ref ValueError
+      try:
+        await run().wait(seconds(5))
+      except ValueError as e:
+        caught = e
+      doAssert caught == boom
+      doAssert attempts == 1
+      doAssert log[] == @["BEGIN", "ROLLBACK"], $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransactionRetry re-raises a non-retryable server error without a retry":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[simpleOk("BEGIN", 'T'), simpleErr("23505"), simpleOk("ROLLBACK", 'I')],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      var attempts = 0
+      proc run() {.async.} =
+        pool.withTransactionRetry(
+          RetryOptions(maxAttempts: 3, baseDelayMs: 0, jitter: false), txConn
+        ):
+          inc attempts
+          discard await txConn.simpleExec("INSERT INTO t VALUES (1)")
+
+      var caught: ref PgQueryError
+      try:
+        await run().wait(seconds(5))
+      except PgQueryError as e:
+        caught = e
+      doAssert caught != nil and caught.sqlState == "23505"
+      doAssert attempts == 1
+      doAssert log[] == @["BEGIN", "INSERT INTO t VALUES (1)", "ROLLBACK"], $log[]
+      doAssert pool.metrics.acquireCount == 1
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransactionDeadline commits within its deadline and releases":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[simpleOk("BEGIN", 'T'), simpleOk("UPDATE 1", 'T'), simpleOk("COMMIT", 'I')],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      proc run() {.async.} =
+        pool.withTransactionDeadline(txConn, seconds(5)):
+          discard await txConn.simpleExec("UPDATE t SET v = 1")
+
+      await run().wait(seconds(5))
+      doAssert log[] == @["BEGIN", "UPDATE t SET v = 1", "COMMIT"], $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransactionDeadline rolls back a raising body and re-raises it":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut =
+        serveScript(ms, @[simpleOk("BEGIN", 'T'), simpleOk("ROLLBACK", 'I')], log)
+      let pool = await scriptedPool(ms)
+      let boom = newException(ValueError, "boom")
+      {.push warning[UnreachableCode]: off.}
+      proc run() {.async.} =
+        pool.withTransactionDeadline(txConn, seconds(5)):
+          raise boom
+
+      {.pop.}
+      var caught: ref ValueError
+      try:
+        await run().wait(seconds(5))
+      except ValueError as e:
+        caught = e
+      doAssert caught == boom
+      doAssert log[] == @["BEGIN", "ROLLBACK"], $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withPipeline runs the batch on one connection and releases it":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      var reply = buildBackendMsg('1', @[]) & buildBackendMsg('2', @[])
+      reply.add(buildCommandComplete("UPDATE 1"))
+      reply.add(extendedOk("SELECT 1", ["hi"]))
+      let serverFut = serveScript(ms, @[reply], log)
+      let pool = await scriptedPool(ms)
+      var results: seq[PipelineResult]
+      proc run() {.async.} =
+        pool.withPipeline(pipe):
+          doAssert pipe.conn == conn
+          pipe.addExec("UPDATE t SET v = 1")
+          pipe.addQuery("SELECT v FROM t")
+          results = await pipe.execute()
+
+      await run().wait(seconds(5))
+      doAssert log[] == @["UPDATE t SET v = 1", "SELECT v FROM t"], $log[]
+      doAssert results.len == 2
+      doAssert results[0].commandResult.commandTag == "UPDATE 1"
+      doAssert results[1].queryResult.rows[0].getStr(0) == "hi"
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withPipeline releases the connection when the body raises":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(ms, @[], log)
+      let pool = await scriptedPool(ms)
+      let boom = newException(ValueError, "boom")
+      proc run() {.async.} =
+        pool.withPipeline(pipe):
+          pipe.addExec("UPDATE t SET v = 1")
+          raise boom
+
+      var caught: ref ValueError
+      try:
+        await run().wait(seconds(5))
+      except ValueError as e:
+        caught = e
+      doAssert caught == boom
+      # The unexecuted batch never reaches the wire.
+      doAssert log[].len == 0, $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      doAssert log[] == @["<terminate>"], $log[]
+      await closeServer(ms)
+
+    waitFor t()
+
+suite "Pool convenience wrappers":
+  test "queryRow, queryValue and notify return their results and release":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[
+          extendedOk("SELECT 1", ["hello"]),
+          extendedOk("SELECT 1", ["42"]),
+          extendedOk("NOTIFY"),
+          extendedOk("SELECT 1"),
+        ],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+
+      let row = await pool.queryRow("SELECT v FROM t").wait(seconds(5))
+      doAssert row.getStr(0) == "hello"
+      doAssert pool.active == 0 and pool.idle.len == 1
+      let value = await pool.queryValue("SELECT n FROM t").wait(seconds(5))
+      doAssert value == "42"
+      doAssert pool.active == 0 and pool.idle.len == 1
+      await pool.notify("chan").wait(seconds(5))
+      await pool.notify("chan", "payload").wait(seconds(5))
+      doAssert pool.active == 0 and pool.idle.len == 1
+
+      doAssert log[] ==
+        @[
+          "SELECT v FROM t", "SELECT n FROM t", "NOTIFY \"chan\"",
+          "SELECT pg_notify($1, $2)",
+        ], $log[]
+      # Every call reused the one connection.
+      doAssert pool.metrics.createCount == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a convenience call the server fails still releases its connection":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[
+          buildErrorResponse("42501", "permission denied") & buildReadyForQuery('I'),
+          extendedOk("SELECT 1", ["ok"]),
+        ],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+
+      var caught: ref PgQueryError
+      try:
+        discard await pool.queryValue("SELECT secret FROM t").wait(seconds(5))
+      except PgQueryError as e:
+        caught = e
+      doAssert caught != nil and caught.sqlState == "42501"
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+      # The released connection serves the next call.
+      doAssert (await pool.queryValue("SELECT 1").wait(seconds(5))) == "ok"
+      doAssert pool.metrics.createCount == 1
+      doAssert log[] == @["SELECT secret FROM t", "SELECT 1"], $log[]
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "Pool acquire":
   test "acquire from idle":
     let pool = makePool()

@@ -579,6 +579,49 @@ suite "Range binary decoding rejects malformed bLen":
     expect PgTypeError:
       discard decodeDateRangeBinary(data)
 
+suite "Zero-length range parts raise PgTypeError":
+  # A zero-length bound passes the range header decoder, so the bound's own
+  # decoder is what rejects it: a length guard for the typed ranges, the
+  # numeric decoder's empty-input check for numrange. An empty cell or array
+  # element is caught by the "too short" guard before a bound is read.
+  test "numrange bound of length 0":
+    var lowerOnly = @[rangeLbInc or rangeUbInf]
+    lowerOnly.add(toBE32(0'i32))
+    expect PgTypeError:
+      discard decodeNumRangeBinary(lowerOnly)
+    var upperOnly = @[rangeLbInf]
+    upperOnly.add(toBE32(0'i32))
+    expect PgTypeError:
+      discard decodeNumRangeBinary(upperOnly)
+
+  test "range cell of length 0":
+    let row = mkRow(@[some(newSeq[byte]())], @[mkField(OidInt4Range, 1)])
+    expect PgTypeError:
+      discard row.getInt4Range(0)
+
+  test "multirange member of length 0":
+    var cell: seq[byte]
+    cell.add(toBE32(1'i32)) # one range
+    cell.add(toBE32(0'i32)) # of length 0
+    let row = mkRow(@[some(cell)], @[mkField(OidInt4Multirange, 1)])
+    expect PgTypeError:
+      discard row.getInt4Multirange(0)
+
+  test "range array element of length 0":
+    let cell = encodeBinaryArray(OidInt4Range, @[newSeq[byte]()])
+    let row = mkRow(@[some(cell)], @[mkField(OidInt4RangeArray, 1)])
+    expect PgTypeError:
+      discard row.getInt4RangeArray(0)
+
+  test "multirange array element with a member of length 0":
+    var member: seq[byte]
+    member.add(toBE32(1'i32))
+    member.add(toBE32(0'i32))
+    let cell = encodeBinaryArray(OidInt4Multirange, @[member])
+    let row = mkRow(@[some(cell)], @[mkField(OidInt4MultirangeArray, 1)])
+    expect PgTypeError:
+      discard row.getInt4MultirangeArray(0)
+
 suite "Range row getters":
   test "getInt4Range text":
     let row: Row = @[some(toBytes("[1,10)"))]
