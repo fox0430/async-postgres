@@ -4,11 +4,12 @@
 ## hostile/empty input. On the asyncdispatch backend the module compiles to
 ## an empty stub, so the suite asserts the stub contract instead.
 
-import std/[unittest, strutils]
+import std/unittest
 
 import ../async_postgres/async_backend
 
 when hasChronos:
+  import std/strutils
   import ../async_postgres/pg_bearssl
   import ../async_postgres/pg_errors
   import chronos/streams/tlsstream

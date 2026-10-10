@@ -12,14 +12,14 @@
 ## query so the cleanup guard admits the ROLLBACK attempt; the failing
 ## writer stops the cleanup SQL before it reaches the wire.
 
-import ../async_postgres/async_backend
+import std/[unittest, strutils]
+
+import ../async_postgres/[async_backend, pg_client, pg_connection]
+import mock_pg_server
 
 when hasChronos:
-  import std/[unittest, importutils]
-  import ../async_postgres/[pg_client, pg_connection]
+  import std/importutils
   import ../async_postgres/pg_pool {.all.}
-
-  import mock_pg_server
 
   privateAccess(PgConnection)
   privateAccess(PgPool)
@@ -517,9 +517,6 @@ when hasChronos:
 
 # The ROLLBACK's Defect comes from the tracer's `onQueryStart`, which both
 # backends call before the ROLLBACK reaches the wire.
-import std/[unittest, strutils]
-import ../async_postgres/[pg_client, pg_connection]
-import mock_pg_server
 
 proc rollbackDefectTracer(): (PgTracer, ref seq[TraceCleanupSkippedData]) =
   let log = new seq[TraceCleanupSkippedData]

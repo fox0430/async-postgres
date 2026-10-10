@@ -5,7 +5,7 @@
 
 import std/unittest
 
-import ../async_postgres/[async_backend, pg_errors, pg_protocol, pg_types]
+import ../async_postgres/[pg_errors, pg_protocol, pg_types]
 import ../async_postgres/pg_client/core
 
 suite "core: format codes":

@@ -58,8 +58,9 @@ when hasChronos:
 
   # bearssl <= 0.2.13 declares `append` with plain `pointer`, which C++ and Nim
   # devel reject; ConstPtrPtrSslrecInClass first appears in 0.2.14.
-  type X509AppendField = typeof(default(X509Class).append)
   const legacyX509Append = not declared(ConstPtrPtrSslrecInClass)
+  when legacyX509Append:
+    type X509AppendField = typeof(default(X509Class).append)
 
   template appendFn(cls: ptr X509Class): X509AppendFn =
     when legacyX509Append:
