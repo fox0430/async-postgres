@@ -1810,6 +1810,110 @@ when hasChronos:
       check taskNilAfterCancel
       check pumpFinishedAfterCancel
 
+proc rejectedUpFront(fut: Future[void]): bool =
+  ## Already failed with `ValueError`: raised before the call's first await.
+  fut.failed and fut.error of ValueError
+
+suite "listen/unlisten reject a bad channel up front":
+  ## Regression: the NUL check ran after the pump was stopped, and an empty name
+  ## reached the server, so a bad name cost the running pump a restart (and the
+  ## parked waiter, if that failed), and a closed connection reported its state
+  ## instead of the bad name.
+
+  test "a bad channel leaves the running pump and its waiter alone":
+    var listenRejected = 0
+    var unlistenRejected = 0
+    var samePump = false
+    var stillListening = false
+    var waiterGotNotification = false
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc: MockClient
+      let badCallsDone = newFuture[void]("badCallsDone")
+
+      proc serverHandler() {.async.} =
+        sc = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc) # LISTEN a
+        await sendBytes(sc, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        # A pump stop would send an empty query here; nothing answers it.
+        await badCallsDone
+        await sendBytes(sc, buildNotificationResponse(42'i32, "a", "hello"))
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await conn.listen("a")
+      let pump = conn.listenTask
+      let waitFut = conn.waitNotification()
+      for name in ["a\0b", ""]:
+        # Not awaited: a regressed call suspends on the unanswered pump stop.
+        if not conn.listen(name).rejectedUpFront:
+          break
+        inc listenRejected
+        if not conn.unlisten(name).rejectedUpFront:
+          break
+        inc unlistenRejected
+      samePump = conn.listenTask == pump and not pump.finished
+      stillListening = conn.state == csListening
+      badCallsDone.complete()
+      try:
+        let notif = await waitFut.wait(seconds(5))
+        waiterGotNotification = notif.channel == "a" and notif.payload == "hello"
+      except CatchableError as e:
+        echo "waiter did not get the notification: ", e.name, ": ", e.msg
+      try:
+        await serverFut.wait(seconds(5))
+      except CatchableError:
+        discard
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      if not sc.isNil:
+        try:
+          await closeClient(sc)
+        except CatchableError:
+          discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check listenRejected == 2
+    check unlistenRejected == 2
+    check samePump
+    check stillListening
+    check waiterGotNotification
+
+  test "a bad channel on a closed connection raises ValueError":
+    var listenRejected = 0
+    var unlistenRejected = 0
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var sc: MockClient
+
+      proc serverHandler() {.async.} =
+        sc = await acceptAndReady(ms)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await serverFut.wait(seconds(5))
+      await conn.close()
+      for name in ["a\0b", ""]:
+        if conn.listen(name).rejectedUpFront:
+          inc listenRejected
+        if conn.unlisten(name).rejectedUpFront:
+          inc unlistenRejected
+      if not sc.isNil:
+        try:
+          await closeClient(sc)
+        except CatchableError:
+          discard
+      await closeServer(ms)
+
+    waitFor testBody()
+    check listenRejected == 2
+    check unlistenRejected == 2
+
 suite "listen round trip failure keeps the surviving channels pumped":
   ## Regression: `listen`/`unlisten` stop the pump before their own round trip,
   ## and a round trip rejected by a *live* server re-raised without restarting

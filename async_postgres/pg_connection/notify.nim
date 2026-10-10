@@ -480,13 +480,21 @@ proc restartPumpOrFailWaiter(
       cause = cause,
     )
 
+proc quoteChannel(channel: string): string =
+  ## ``quoteIdentifier`` plus the empty name, which the server would reject.
+  if channel.len == 0:
+    raise newException(ValueError, "LISTEN/UNLISTEN channel name is empty")
+  quoteIdentifier(channel)
+
 proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
   ## Subscribe to channel and start pump. Keeps parked ``waitNotification`` across restart;
   ## may raise ``PgTimeoutError`` (pump stop did not complete in time),
   ## ``PgStateError``/``PgConnectionError`` (connection not ready or lost),
   ## ``PgQueryError``/``PgProtocolError`` (LISTEN round trip failed),
-  ## ``ValueError`` (``channel`` contains a NUL byte),
+  ## ``ValueError`` (``channel`` is empty or contains a NUL byte),
   ## or ``CancelledError`` (the caller cancelled the call).
+  # Before the pump stop: a bad name must not cost the running pump a restart.
+  let ident = quoteChannel(channel)
   # Reconnecting pump is in ``csReady`` but still owns ``listenTask``; stop it first to keep waiter.
   let restarted = conn.state == csListening or conn.listenReconnecting
   try:
@@ -495,7 +503,7 @@ proc listen*(conn: PgConnection, channel: string): Future[void] {.async.} =
       # otherwise strand the kept waiter with no pump left to complete it.
       await conn.stopListeningImpl(keepWaiter = true)
     conn.checkReady()
-    discard await conn.simpleQuery("LISTEN " & quoteIdentifier(channel))
+    discard await conn.simpleQuery("LISTEN " & ident)
   except CatchableError as e:
     # `CancelledError` included: cancelling *this* call does not unsubscribe the
     # channels the pump carried, and leaving them pumpless is a silent deafness.
@@ -510,14 +518,15 @@ proc unlisten*(conn: PgConnection, channel: string): Future[void] {.async.} =
   ## Unsubscribe; stops pump if no channels remain (keeps waiter across restart except last).
   ## May raise the same errors as ``listen`` (``PgTimeoutError`` from the pump stop,
   ## ``PgStateError``/``PgConnectionError``, ``PgQueryError``/``PgProtocolError``
-  ## from the UNLISTEN round trip, ``ValueError`` for a NUL byte, or
-  ## ``CancelledError``).
+  ## from the UNLISTEN round trip, ``ValueError`` for an empty or NUL-bearing
+  ## name, or ``CancelledError``).
+  let ident = quoteChannel(channel) # before the pump stop, see `listen`
   let restarted = conn.state == csListening or conn.listenReconnecting
   try:
     if restarted:
       await conn.stopListeningImpl(keepWaiter = true) # see `listen` for why it is here
     conn.checkReady()
-    discard await conn.simpleQuery("UNLISTEN " & quoteIdentifier(channel))
+    discard await conn.simpleQuery("UNLISTEN " & ident)
   except CatchableError as e: # `CancelledError` included, see `listen`
     conn.restartPumpOrFailWaiter(restarted, e)
     raise e
