@@ -5,7 +5,7 @@
 
 import std/unittest
 
-import ../async_postgres/[async_backend, pg_connection]
+import ../async_postgres/pg_connection
 import ../async_postgres/pg_connection/lifecycle {.all.}
 
 suite "lifecycle: filterSaslByRequireAuth":

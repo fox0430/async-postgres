@@ -2,7 +2,7 @@
 ##
 ## PG-less: extended-protocol `query` family against scripted replies.
 
-import std/[unittest, options]
+import std/unittest
 
 import
   ../async_postgres/[async_backend, pg_client, pg_connection, pg_protocol, pg_types]

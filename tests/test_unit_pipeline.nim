@@ -5,7 +5,7 @@
 
 import std/unittest
 
-import ../async_postgres/[async_backend, pg_client, pg_connection, pg_protocol]
+import ../async_postgres/[async_backend, pg_client, pg_connection]
 
 import mock_pg_server
 

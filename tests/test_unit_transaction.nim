@@ -108,7 +108,8 @@ suite "transaction: mock round trip":
       var caught = false
       try:
         conn.withTransaction:
-          raise newException(CatchableError, "body boom")
+          if true:
+            raise newException(CatchableError, "body boom")
       except CatchableError:
         caught = true
       doAssert caught
