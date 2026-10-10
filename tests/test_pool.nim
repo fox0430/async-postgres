@@ -4959,6 +4959,21 @@ suite "Pool replenish capacity race":
 
     waitFor t()
 
+  test "boundedConnConfig falls back to maintenanceInterval, floored at 1ms":
+    let pool = makePool(minSize = 1, maxSize = 2)
+    pool.config.maintenanceInterval = milliseconds(20)
+    doAssert pool.boundedConnConfig().connectTimeout == milliseconds(20)
+
+    # A zero interval would leave the fallback zero, which reads as "no
+    # timeout": the dial the bound exists for would be left unbounded instead.
+    pool.config.maintenanceInterval = ZeroDuration
+    doAssert pool.boundedConnConfig().connectTimeout == milliseconds(1)
+
+    # An explicit `connectTimeout` is the operator's, not the fallback's.
+    pool.config.connConfig.connectTimeout = seconds(7)
+    pool.config.maintenanceInterval = ZeroDuration
+    doAssert pool.boundedConnConfig().connectTimeout == seconds(7)
+
   when hasChronos:
     test "close cancelling in-flight replenish releases its reservations (landed and in-flight)":
       # chronos-only: one replenish connect lands before close() cancels the
@@ -5198,6 +5213,36 @@ suite "Pool spawn-connect close-race":
       # Must be bounded by timeout (100ms), not the 30s connectTimeout fallback.
       doAssert elapsed < seconds(1), $elapsed
       doAssert acqFut.finished
+
+      await closeClient(client)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "close does not hang on a stalled spawn when maintenanceInterval is zero":
+    # Regression: with connectTimeout unset the spawn's bound is
+    # `maintenanceInterval`; a zero one left the fallback zero too, so the
+    # stalled handshake kept the dial unbounded and close() never returned.
+    proc t() {.async.} =
+      let ms = startMockServer()
+
+      let pool = makePool(minSize = 0, maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.connConfig.connectTimeout = ZeroDuration
+      pool.config.maintenanceInterval = ZeroDuration
+      pool.active = 1
+
+      let acqFut = pool.acquire()
+      pool.release(mockConn(csClosed))
+
+      let client = await ms.accept()
+      await drainStartupMessage(client)
+      doAssert pool.pendingBackgroundTasks.len >= 1
+
+      # Without a bound this await fails the 5s wait below instead of returning.
+      await pool.close().wait(seconds(5))
+      doAssert acqFut.finished
+      doAssert pool.pendingBackgroundTasks.len == 0
 
       await closeClient(client)
       await closeServer(ms)
