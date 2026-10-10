@@ -43,8 +43,10 @@ proc rollbackTracer(): (PgTracer, ref seq[string]) =
     return nil
   (tracer, log)
 
+const slowResetQuery = "SELECT pg_sleep(1)"
+
 proc resetStartTracer(): (PgTracer, ref Moment, ref bool) =
-  ## Records when the pool's resetQuery ("SELECT pg_sleep(2)") starts — the
+  ## Records when the pool's resetQuery (`slowResetQuery`) starts — the
   ## release is the only path that runs it, so a deadline fired during the
   ## release is distinguishable from one fired during the body.
   let startedAt = new Moment
@@ -53,7 +55,7 @@ proc resetStartTracer(): (PgTracer, ref Moment, ref bool) =
   tracer.onQueryStart = proc(
       conn: PgConnection, data: TraceQueryStartData
   ): TraceContext {.gcsafe, raises: [].} =
-    if data.sql == "SELECT pg_sleep(2)":
+    if data.sql == slowResetQuery:
       started[] = true
       startedAt[] = Moment.now()
     return nil
@@ -2250,12 +2252,12 @@ suite "E2E: Deadline-bounded Transaction":
     # `resetSessionAndRelease` is still running: the outer handler must
     # report PgTimeoutError, not success.
     #
-    # Deterministic construction: a fast body plus a pg_sleep(2) resetQuery
-    # puts the 1s deadline inside the release window with a ~980ms margin.
-    # `pg_sleep(2)` blocks the server for at least 2s, so the 1s deadline is
+    # Deterministic construction: a fast body plus a pg_sleep(1) resetQuery
+    # puts the 300ms deadline inside the release window with a ~280ms margin.
+    # `pg_sleep(1)` blocks the server for at least 1s, so the 300ms deadline is
     # guaranteed to fire while `resetSessionAndRelease` is still running —
     # the only way this could regress to "no timeout" is the event loop
-    # itself stalling for >1s, which would break any timing-based test.
+    # itself stalling for >300ms, which would break any timing-based test.
     # The `resetStartedAt` discriminator below pins the firing point so the
     # test cannot silently drift to the body-phase.
     proc t() {.async.} =
@@ -2263,7 +2265,7 @@ suite "E2E: Deadline-bounded Transaction":
       let (tracer, resetStartedAt, resetStarted) = resetStartTracer()
       cfg.tracer = tracer
       let pool = await newPool(
-        initPoolConfig(cfg, minSize = 1, maxSize = 3, resetQuery = "SELECT pg_sleep(2)")
+        initPoolConfig(cfg, minSize = 1, maxSize = 3, resetQuery = slowResetQuery)
       )
       defer:
         await pool.close()
@@ -2271,7 +2273,7 @@ suite "E2E: Deadline-bounded Transaction":
       var raised = false
       var deadlineFiredAt = Moment.now()
       try:
-        pool.withTransactionDeadline(conn, seconds(1)):
+        pool.withTransactionDeadline(conn, milliseconds(300)):
           discard await conn.query("SELECT 1")
       except PgTimeoutError:
         deadlineFiredAt = Moment.now()
@@ -2289,7 +2291,7 @@ suite "E2E: Deadline-bounded Transaction":
         # the orphaned bodyFn running; its release completes asynchronously.
         doAssert pool.activeCount == 0
       else:
-        # asyncdispatch: the orphaned release takes ~2s (pg_sleep); 20s poll
+        # asyncdispatch: the orphaned release takes ~1s (pg_sleep); 20s poll
         # bound so slow CI does not flake.
         var released = false
         for _ in 0 ..< 2000:
@@ -2305,8 +2307,8 @@ suite "E2E: Deadline-bounded Transaction":
   test "pool.withTransactionRetryDeadline reports timeout when deadline expires during release":
     # Regression: same class as the withTransactionDeadline variant above —
     # the shared deadline must not be swallowed when it fires during release.
-    # Deterministic construction as in that test (fast body + pg_sleep(2)
-    # resetQuery, ~980ms margin); pg_sleep(2) guarantees the 1s deadline
+    # Deterministic construction as in that test (fast body + pg_sleep(1)
+    # resetQuery, ~280ms margin); pg_sleep(1) guarantees the 300ms deadline
     # fires inside the release window (see the sibling test). The same
     # `resetStartedAt` discriminator pins the firing point.
     proc t() {.async.} =
@@ -2314,7 +2316,7 @@ suite "E2E: Deadline-bounded Transaction":
       let (tracer, resetStartedAt, resetStarted) = resetStartTracer()
       cfg.tracer = tracer
       let pool = await newPool(
-        initPoolConfig(cfg, minSize = 1, maxSize = 3, resetQuery = "SELECT pg_sleep(2)")
+        initPoolConfig(cfg, minSize = 1, maxSize = 3, resetQuery = slowResetQuery)
       )
       defer:
         await pool.close()
@@ -2323,7 +2325,7 @@ suite "E2E: Deadline-bounded Transaction":
       var deadlineFiredAt = Moment.now()
       try:
         pool.withTransactionRetryDeadline(
-          RetryOptions(maxAttempts: 3), conn, seconds(1)
+          RetryOptions(maxAttempts: 3), conn, milliseconds(300)
         ):
           discard await conn.query("SELECT 1")
       except PgTimeoutError:
@@ -2339,7 +2341,7 @@ suite "E2E: Deadline-bounded Transaction":
       when hasChronos:
         doAssert pool.activeCount == 0
       else:
-        # asyncdispatch: orphaned release takes ~2s; 20s poll bound (see the
+        # asyncdispatch: orphaned release takes ~1s; 20s poll bound (see the
         # sibling test).
         var released = false
         for _ in 0 ..< 2000:
@@ -2774,15 +2776,20 @@ suite "E2E: Deadline-bounded Transaction":
       discard await pool.exec("DROP TABLE IF EXISTS test_pool_txd_idle")
       discard await pool.exec("CREATE TABLE test_pool_txd_idle (val text)")
 
+      # Holds the body past the deadline; let go right after it, since the
+      # asyncdispatch body cannot be cancelled and keeps the only connection.
+      let hold = newFuture[void]("hold")
       var raised = false
       try:
         pool.withTransactionDeadline(conn, milliseconds(300)):
           discard await conn.exec(
             "INSERT INTO test_pool_txd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
           )
-          await sleepAsync(seconds(3))
+          await hold.wait(seconds(3))
       except PgTimeoutError:
         raised = true
+      if not hold.finished:
+        hold.complete()
       doAssert raised
 
       let next = await pool.acquire()
@@ -2804,6 +2811,9 @@ suite "E2E: Deadline-bounded Transaction":
       discard await pool.exec("DROP TABLE IF EXISTS test_pool_txrd_idle")
       discard await pool.exec("CREATE TABLE test_pool_txrd_idle (val text)")
 
+      # Holds the body past the deadline; let go right after it, since the
+      # asyncdispatch body cannot be cancelled and keeps the only connection.
+      let hold = newFuture[void]("hold")
       var raised = false
       try:
         pool.withTransactionRetryDeadline(
@@ -2812,9 +2822,11 @@ suite "E2E: Deadline-bounded Transaction":
           discard await conn.exec(
             "INSERT INTO test_pool_txrd_idle (val) VALUES ($1)", @[toPgParam("orphan")]
           )
-          await sleepAsync(seconds(3))
+          await hold.wait(seconds(3))
       except PgTimeoutError:
         raised = true
+      if not hold.finished:
+        hold.complete()
       doAssert raised
 
       let next = await pool.acquire()

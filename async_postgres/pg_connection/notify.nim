@@ -10,7 +10,8 @@ import types, buffer_io, simple_query, lifecycle
 
 const listenBackoffTickMs = 50 ## Backoff tick ms (stop check granularity).
 
-# listenReconnectStopWaitMs lives in types.nim to avoid a circular import.
+# listenReconnectStopWaitMs and listenBackoffUnitMs live in types.nim to avoid a
+# circular import.
 
 # Callback registration
 
@@ -216,8 +217,10 @@ proc listenPump*(conn: PgConnection) {.async.} =
     let sessionFatal = conn.fatalServerError
     try:
       let maxAttempts = conn.listenReconnectMaxAttempts
-      # Cap so `backoff * 1000` and `backoff * 2` below cannot overflow int.
-      let maxBackoff = clamp(conn.listenReconnectMaxBackoff, 1, high(int) div 1000)
+      let unitMs = max(listenBackoffUnitMs, 1)
+      # Cap so `backoff * unitMs` and `backoff * 2` below cannot overflow int.
+      let maxBackoff =
+        clamp(conn.listenReconnectMaxBackoff, 1, high(int) div unitMs div 2)
       let unlimited = maxAttempts <= 0
       var reconnected = false
       var giveUp = false
@@ -227,7 +230,7 @@ proc listenPump*(conn: PgConnection) {.async.} =
       while (unlimited or attempt < maxAttempts) and not conn.listenStopRequested:
         try:
           # Interruptible backoff: tick-based stop check.
-          var remainingMs = backoff * 1000
+          var remainingMs = backoff * unitMs
           while remainingMs > 0 and not conn.listenStopRequested:
             let tickMs = min(remainingMs, listenBackoffTickMs)
             await sleepAsync(milliseconds(tickMs))

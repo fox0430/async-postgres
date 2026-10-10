@@ -29,6 +29,11 @@ proc mockConfig(port: int): ConnConfig =
     host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
   )
 
+# Every listen redial first sleeps a backoff step, 1s by default. Restored at
+# the end.
+let savedBackoffUnitMs = listenBackoffUnitMs
+listenBackoffUnitMs = 50
+
 proc refuseStartup(ms: MockServer, sqlState: string) {.async.} =
   let st = await ms.accept()
   try:
@@ -656,13 +661,17 @@ suite "serverError when the server closes the connection":
         discard await drainFrontendMessage(st) # LISTEN
         await sendBytes(st, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
         await sleepAsync(milliseconds(50))
+        if redial == rdGone:
+          # Before the FATAL: a live listener nobody accepts on would stall the
+          # redial's handshake instead of refusing it.
+          await closeServer(ms)
         await sendBytes(st, buildErrorResponse("57P01", "shutting down", "FATAL"))
       except CatchableError:
         discard
       await closeClient(st)
       case redial
       of rdGone:
-        await closeServer(ms)
+        discard
       of rdPasswordRotated:
         await refuseStartup(ms, "28P01")
       of rdListenRefused:
@@ -1348,3 +1357,5 @@ suite "isTransientError":
       newPoolError(pekBatchFailed, "b", newPoolError(pekAcquireTimeout, "t"))
     )
     check not isTransientError(newPoolError(pekBatchFailed, "b", refused))
+
+listenBackoffUnitMs = savedBackoffUnitMs

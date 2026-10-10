@@ -768,13 +768,15 @@ suite "Replication: client-initiated stop":
 
     proc testBody() {.async.} =
       let ms = startMockServer()
+      let reportIssued = newFuture[void]("reportIssued")
 
       proc serverHandler() {.async.} =
         let st = await acceptAndReady(ms)
         discard await drainFrontendMessage(st) # START_REPLICATION
         await sendBytes(st, buildCopyBothResponse())
-        # Read nothing for a while so the bulk frame stays in flight.
-        await sleepAsync(milliseconds(500))
+        # Read nothing until the report is issued, so the bulk frame is still
+        # in flight.
+        await reportIssued
         while true:
           let m =
             try:
@@ -804,7 +806,9 @@ suite "Replication: client-initiated stop":
           await sleepAsync(milliseconds(1))
         let bulk = conn.sendCopyData(newSeq[byte](32 * 1024 * 1024))
         let stop = conn.stopReplication()
-        await conn.sendStandbyStatus(Lsn(late))
+        let report = conn.sendStandbyStatus(Lsn(late))
+        reportIssued.complete()
+        await report
         reportDone = true
         await stop
         await bulk
@@ -832,6 +836,7 @@ suite "Replication: client-initiated stop":
     proc testBody() {.async.} =
       let ms = startMockServer()
       let heldUp = newFuture[void]("heldUp")
+      let lateTried = newFuture[void]("lateTried")
 
       proc serverHandler() {.async.} =
         let st = await acceptAndReady(ms)
@@ -841,8 +846,13 @@ suite "Replication: client-initiated stop":
         var tail = buildErrorResponse("XX000", "walsender failed")
         tail.add(buildReadyForQuery('I'))
         await sendBytes(st, tail)
-        # Only now drain the client's writes.
-        await sleepAsync(milliseconds(300))
+        # Only now drain the client's writes, once the late one was tried.
+        # Bounded: a late write queued behind the bulk frame would never return
+        # until we drain, so waiting unbounded would hang instead of fail.
+        var spins = 0
+        while not lateTried.finished and spins < 2000:
+          inc spins
+          await sleepAsync(milliseconds(5))
         while true:
           let m =
             try:
@@ -873,6 +883,7 @@ suite "Replication: client-initiated stop":
           await conn.sendStandbyStatus(Lsn(1))
         except PgStateError:
           lateRefused = true
+        lateTried.complete()
 
       let writerFut = writer()
       try:
@@ -967,14 +978,15 @@ suite "Replication: client-initiated stop":
 
       proc testBody() {.async.} =
         let ms = startMockServer()
+        let ownerCancelDone = newFuture[void]("ownerCancelDone")
 
         proc serverHandler() {.async.} =
           let st = await acceptAndReady(ms)
           discard await drainFrontendMessage(st) # START_REPLICATION
           await sendBytes(st, buildCopyBothResponse())
-          # Read nothing for a while, so the client's writes back up behind a
-          # full socket buffer and the cancel lands before the stop is written.
-          await sleepAsync(seconds(2))
+          # Read nothing until the cancel has landed, so the client's writes are
+          # backed up behind a full socket buffer and the stop is not written yet.
+          await ownerCancelDone
           while true:
             let m =
               try:
@@ -1006,6 +1018,7 @@ suite "Replication: client-initiated stop":
           let waiter = conn.stopReplication()
           await owner.cancelAndWait()
           ownerCancelled = owner.cancelled
+          ownerCancelDone.complete()
           await waiter
           waiterDone = true
           await bulk

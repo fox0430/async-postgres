@@ -161,7 +161,7 @@ suite "E2E: Cancel with invalid secret key":
       let origSecret = conn.secretKey
       conn.secretKey = origSecret xor 0x5A5A5A5A'i32
 
-      let fut = conn.query("SELECT pg_sleep(1)")
+      let fut = conn.query("SELECT pg_sleep(0.5)")
       await sleepAsync(milliseconds(100))
       await conn.cancel() # silently ignored by the server
       # Query completes normally (no 57014).

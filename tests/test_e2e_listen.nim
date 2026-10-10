@@ -11,6 +11,11 @@ import e2e_common
 
 privateAccess(PgConnection)
 
+# Every listen redial first sleeps a backoff step, 1s by default. Restored at
+# the end.
+let savedBackoffUnitMs = listenBackoffUnitMs
+listenBackoffUnitMs = 50
+
 suite "E2E: Cancel Request":
   test "cancel aborts pg_sleep":
     proc t() {.async.} =
@@ -314,10 +319,10 @@ suite "E2E: Background LISTEN Pump":
       doAssert listener.state == csClosed
       doAssert listener.listenTask == nil
 
-      # First reconnect attempt fires after a 1s backoff; wait past it and
-      # confirm the pump did not flip the state back to csListening or take a
-      # fresh backend pid.
-      await sleepAsync(milliseconds(1500))
+      # A first reconnect attempt would fire after one backoff step; wait past
+      # it and confirm the pump did not flip the state back to csListening or
+      # take a fresh backend pid.
+      await sleepAsync(milliseconds(10 * listenBackoffUnitMs))
       doAssert listener.state == csClosed
       doAssert listener.pid == originalPid
 
@@ -819,9 +824,10 @@ when hasChronos:
           discard
         await killer.close()
 
-        # Wait for reconnect (backoff starts at 1s)
-        await sleepAsync(milliseconds(3000))
-
+        var spins = 0
+        while not reconnected and spins < 2000:
+          inc spins
+          await sleepAsync(milliseconds(5))
         doAssert reconnected
         doAssert listener.state == csListening
 
@@ -858,8 +864,12 @@ when hasChronos:
           discard
         await killer.close()
 
-        # Give pump time to detect the failure and start reconnecting
-        await sleepAsync(milliseconds(500))
+        # Wait for the pump to detect the failure and start reconnecting.
+        var spins = 0
+        while not listener.listenReconnecting and spins < 10000:
+          inc spins
+          await sleepAsync(milliseconds(1))
+        doAssert listener.listenReconnecting, "pump never entered its reconnect loop"
 
         # Close should not hang even if reconnect is in progress
         await listener.close().wait(seconds(5))
@@ -911,8 +921,11 @@ when hasChronos:
           discard
         await killer.close()
 
-        # First retry runs after backoff=1s; reconnect should succeed.
-        await sleepAsync(milliseconds(3000))
+        # The first retry should succeed.
+        var spins = 0
+        while not reconnected and spins < 2000:
+          inc spins
+          await sleepAsync(milliseconds(5))
         doAssert reconnected
         doAssert listener.state == csListening
 
@@ -941,7 +954,10 @@ when hasChronos:
           discard
         await killer.close()
 
-        await sleepAsync(milliseconds(3000))
+        var spins = 0
+        while not reconnected and spins < 2000:
+          inc spins
+          await sleepAsync(milliseconds(5))
         doAssert reconnected
         doAssert listener.state == csListening
 
@@ -981,9 +997,11 @@ when hasChronos:
           discard
         await killer.close()
 
-        # backoff=1s, then the single reconnect attempt fails → permanent death.
-        await sleepAsync(milliseconds(4000))
-
+        # The single reconnect attempt fails → permanent death.
+        var spins = 0
+        while not errored and spins < 2000:
+          inc spins
+          await sleepAsync(milliseconds(5))
         doAssert errored
         doAssert errMsg.len > 0
         doAssert "reconnection failed" in errMsg
@@ -1015,8 +1033,11 @@ when hasChronos:
           discard
         await killer.close()
 
-        # backoff=1s, then the single reconnect attempt fails → permanent death.
-        await sleepAsync(milliseconds(4000))
+        # The single reconnect attempt fails → permanent death.
+        var spins = 0
+        while listener.listenError == nil and spins < 2000:
+          inc spins
+          await sleepAsync(milliseconds(5))
         doAssert listener.listenError != nil
 
         # The pull API surfaces the structured PgListenError, not a bare PgError.
@@ -1155,3 +1176,5 @@ suite "E2E: cancelNoWait":
       await conn.close()
 
     waitFor t()
+
+listenBackoffUnitMs = savedBackoffUnitMs

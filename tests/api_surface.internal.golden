@@ -279,6 +279,7 @@ async_postgres/pg_connection/types.nim	invalidateStmtCache
 async_postgres/pg_connection/types.nim	isGucName
 async_postgres/pg_connection/types.nim	isUtcZoneName
 async_postgres/pg_connection/types.nim	isUtf8EncodingName
+async_postgres/pg_connection/types.nim	listenBackoffUnitMs
 async_postgres/pg_connection/types.nim	listenChannels
 async_postgres/pg_connection/types.nim	listenErrorCallback
 async_postgres/pg_connection/types.nim	listenReconnectStopWaitMs

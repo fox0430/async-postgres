@@ -54,6 +54,10 @@ var listenReconnectStopWaitMs* = 10_000
   ## orphaned on timeout. Not re-exported through `pg_connection`, so call
   ## sites cannot set it to 0 via the aggregate import and disable orphan safety.
 
+var listenBackoffUnitMs* = 1000
+  ## One listen-reconnect backoff step (ms), the unit `listenReconnectMaxBackoff`
+  ## counts in. Tests shrink it; not re-exported through `pg_connection`.
+
 when hasChronos:
   type DialTarget* = TransportAddress
     ## One address to dial: an IP and port, or a Unix socket path.

@@ -173,7 +173,7 @@ suite "toPgParamInline":
       # Through the encoder: a helper-only check stays green if the guard is
       # dropped from toPgParamInline, leaving a RangeDefect on int32(v.len).
       expect PgTypeError:
-        discard toPgParamInline(newString(int(int32.high) + 1))
+        discard toPgParamInline(newStringUninit(int(int32.high) + 1))
     check toPgParamInline("a").len == 1
 
   test "seq[byte] length guard raises PgTypeError":
@@ -181,7 +181,7 @@ suite "toPgParamInline":
       expect PgTypeError:
         checkPgBinLen(maxInt32Len + 1, "bytea")
       expect PgTypeError:
-        discard toPgParamInline(newSeq[byte](int(int32.high) + 1))
+        discard toPgParamInline(newSeqUninit[byte](int(int32.high) + 1))
     check toPgParamInline(@[1'u8, 2]).len == 2
 
   test "toPgParam string and seq[byte] share the inline length guard":
@@ -200,7 +200,7 @@ suite "toPgParamInline":
     when sizeof(int) >= 8:
       expect PgTypeError:
         checkPgBinLen(maxInt32Len + 1, "xml")
-      let huge = newString(maxInt32Len + 1)
+      let huge = newStringUninit(maxInt32Len + 1)
       expect PgTypeError:
         discard toPgParam(PgXml(huge))
       expect PgTypeError:
