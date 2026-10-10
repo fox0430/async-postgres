@@ -246,7 +246,7 @@ suite "SCRAM-SHA-256":
     # PG16+ scram_iterations may legitimately exceed the OWASP-recommended 600k
     var state: ScramState
     discard scramClientFirstMessage("user", "myNonce", state)
-    let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000000"
+    let serverFirst = "r=myNonceServerPart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=600001"
     discard scramClientFinalMessage("password", toBytes(serverFirst), state)
 
   test "scramClientFinalMessage enforces custom maxIterations":

@@ -324,16 +324,17 @@ suite "Row.clone":
       discard initRow(rd, 0).clone()
 
 suite "parseDataRowInto overflow guard":
+  # The guard reads only `rd.buf.len`; `newSeqUninit` spares zeroing 2 GiB.
   test "raises PgProtocolError when cumulative buf exceeds int32.high":
     var rd = newRowData(1)
-    rd.buf.setLen(int32.high)
+    rd.buf = newSeqUninit[byte](int32.high)
     expect PgProtocolError:
       parseDataRowInto(buildDataRowBody(["x"]), rd)
 
   test "state unchanged on overflow error":
     var rd = newRowData(1)
     let saveLen = int32.high - 4
-    rd.buf.setLen(saveLen)
+    rd.buf = newSeqUninit[byte](saveLen)
     let savedCellBase = rd.cellIndex.len
     expect PgProtocolError:
       parseDataRowInto(buildDataRowBody(["x"]), rd)
@@ -342,6 +343,8 @@ suite "parseDataRowInto overflow guard":
 
   test "no error just below int32.high":
     var rd = newRowData(1)
+    # Full capacity up front, so the append below does not copy 2 GiB.
+    rd.buf = newSeqUninit[byte](int32.high)
     rd.buf.setLen(int32.high - 5)
     parseDataRowInto(buildDataRowBody(["x"]), rd)
     check rd.buf.len == int32.high

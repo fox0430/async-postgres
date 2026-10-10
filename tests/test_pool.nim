@@ -1891,6 +1891,8 @@ when hasChronos:
         # State flipped synchronously so a follow-up release() would discard.
         doAssert conn.state == csClosed
 
+        # Give back the slot taken by hand above, or close() waits out its timeout.
+        pool.active = 0
         await pool.close(seconds(1))
         await cleanupHanging(server, serverTransport)
 
@@ -1984,17 +1986,19 @@ suite "maxLifetime across a health-check ping":
     proc t() {.async.} =
       let ms = startMockServer()
       let pool = lifetimePool(ms)
+      # Shorter than the shared lifetime so the ping need not be held long.
+      pool.config.maxLifetime = milliseconds(400)
       let (pinged, pingedSt) = await connectToMock(ms)
       pool.addStale(pinged)
       # Alive at scan start, expired once the ping has failed. Aged by the
       # clock, not by hand: a scan-start reading would catch a hand-aged conn.
       let behind = mockConn()
-      behind.createdAt = Moment.now() - milliseconds(500)
+      behind.createdAt = Moment.now() - milliseconds(200)
       pool.idle.addLast(PooledConn(conn: behind, lastUsedAt: Moment.now()))
 
       let fut = pool.acquire()
       doAssert (await drainFrontendMessage(pingedSt)).msgType == 'Q'
-      await sleepAsync(milliseconds(700))
+      await sleepAsync(milliseconds(300))
       await closeClient(pingedSt)
       let freshSt = await acceptAndReady(ms).wait(seconds(5))
       let conn = await fut.wait(seconds(5))

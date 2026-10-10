@@ -329,17 +329,18 @@ suite "Per-address connectTimeout":
       let stalledB = b.accept()
       let targets =
         resolveTargets("127.0.0.1", a.port) & resolveTargets("127.0.0.1", b.port)
+      var cfg = timedConfig(a.port)
+      # Each address waits out its own budget; nothing here needs it long.
+      cfg.connectTimeout = milliseconds(100)
       try:
         discard await attemptHostTimed(
-          timedConfig(a.port),
-          HostEntry(host: "127.0.0.1", port: a.port),
-          tsaAny,
-          targets,
+          cfg, HostEntry(host: "127.0.0.1", port: a.port), tsaAny, targets
         )
       except CatchableError as e:
         result = e
-      await closeClient(await stalledA)
-      await closeClient(await stalledB)
+      # Bounded so a dial that never reached its listener fails, not hangs.
+      await closeClient(await stalledA.wait(seconds(5)))
+      await closeClient(await stalledB.wait(seconds(5)))
       await closeServer(a)
       await closeServer(b)
 

@@ -627,12 +627,12 @@ suite "E2E: Cursor/Streaming":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
 
-      # Row v=1 returns instantly, v>=2 sleeps 2s — exceeds the 500ms timeout
+      # Row v=1 returns instantly, v>=2 sleeps 2s — exceeds the 200ms timeout
       let cursor = await conn.openCursor(
         "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
           "FROM generate_series(1, 5) AS v",
         chunkSize = 1,
-        timeout = milliseconds(500),
+        timeout = milliseconds(200),
       )
       # openCursor fetched v=1 (instant) into buffer
       let chunk1 = await cursor.fetchNext() # returns buffered data, no I/O
@@ -655,12 +655,12 @@ suite "E2E: Cursor/Streaming":
       let conn = await connect(plainConfig())
 
       # Same setup as "fetchNext times out": v=1 returns instantly, v>=2 sleeps
-      # 2s — the second fetch overruns the 500ms timeout.
+      # 2s — the second fetch overruns the 200ms timeout.
       let cursor = await conn.openCursor(
         "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
           "FROM generate_series(1, 5) AS v",
         chunkSize = 1,
-        timeout = milliseconds(500),
+        timeout = milliseconds(200),
       )
       let chunk1 = await cursor.fetchNext() # buffered v=1, no I/O
       doAssert chunk1.len == 1
@@ -693,7 +693,7 @@ suite "E2E: Cursor/Streaming":
       # Drain the openCursor-buffered first row, then start a slow second fetch
       # so a concurrent fetchNext can race the in-flight Execute.
       let cursor = await conn.openCursor(
-        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
+        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(0.5) END " &
           "FROM generate_series(1, 5) AS v",
         chunkSize = 1,
       )
@@ -724,7 +724,7 @@ suite "E2E: Cursor/Streaming":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
       let cursor = await conn.openCursor(
-        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(2) END " &
+        "SELECT v, CASE WHEN v = 1 THEN pg_sleep(0) ELSE pg_sleep(0.5) END " &
           "FROM generate_series(1, 5) AS v",
         chunkSize = 1,
       )

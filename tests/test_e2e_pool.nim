@@ -61,8 +61,8 @@ suite "E2E: Connection Pool":
           connConfig: plainConfig(),
           minSize: 1,
           maxSize: 3,
-          maxLifetime: milliseconds(500),
-          maintenanceInterval: milliseconds(100),
+          maxLifetime: milliseconds(250),
+          maintenanceInterval: milliseconds(50),
         )
       )
 
@@ -73,7 +73,7 @@ suite "E2E: Connection Pool":
       conn1.release()
 
       # Wait for maxLifetime to expire
-      await sleepAsync(milliseconds(600))
+      await sleepAsync(milliseconds(300))
 
       # Maintenance should have closed the expired connection
       # Next acquire should create a new one
@@ -94,8 +94,8 @@ suite "E2E: Connection Pool":
           connConfig: plainConfig(),
           minSize: 0,
           maxSize: 3,
-          idleTimeout: milliseconds(200),
-          maintenanceInterval: milliseconds(100),
+          idleTimeout: milliseconds(100),
+          maintenanceInterval: milliseconds(50),
         )
       )
 
@@ -105,7 +105,7 @@ suite "E2E: Connection Pool":
       conn.release()
 
       # Wait for idleTimeout + maintenance cycle
-      await sleepAsync(milliseconds(500))
+      await sleepAsync(milliseconds(250))
 
       # Pool should have cleaned up idle connections
       doAssert pool.idleCount == 0
@@ -121,8 +121,8 @@ suite "E2E: Connection Pool":
           connConfig: plainConfig(),
           minSize: 2,
           maxSize: 3,
-          idleTimeout: milliseconds(200),
-          maintenanceInterval: milliseconds(100),
+          idleTimeout: milliseconds(100),
+          maintenanceInterval: milliseconds(50),
         )
       )
 
@@ -136,7 +136,7 @@ suite "E2E: Connection Pool":
       doAssert pool.idleCount == 3
 
       # Wait for idleTimeout + maintenance cycles
-      await sleepAsync(milliseconds(500))
+      await sleepAsync(milliseconds(250))
 
       # Should shrink to minSize, not below
       doAssert pool.idleCount == 2
@@ -152,7 +152,7 @@ suite "E2E: Connection Pool":
           connConfig: plainConfig(),
           minSize: 1,
           maxSize: 3,
-          maxLifetime: milliseconds(300),
+          maxLifetime: milliseconds(150),
           maintenanceInterval: seconds(60), # long interval so maintenance won't run
         )
       )
@@ -162,7 +162,7 @@ suite "E2E: Connection Pool":
       conn1.release()
 
       # Wait for maxLifetime to expire
-      await sleepAsync(milliseconds(400))
+      await sleepAsync(milliseconds(200))
 
       # Maintenance hasn't run (60s interval), but acquire should skip expired
       let conn2 = await pool.acquire()
@@ -181,8 +181,8 @@ suite "E2E: Connection Pool":
           connConfig: plainConfig(),
           minSize: 1,
           maxSize: 3,
-          maxLifetime: milliseconds(300),
-          maintenanceInterval: milliseconds(100),
+          maxLifetime: milliseconds(150),
+          maintenanceInterval: milliseconds(50),
         )
       )
 
@@ -190,7 +190,7 @@ suite "E2E: Connection Pool":
       conn1.release()
 
       # Wait for maxLifetime to expire and maintenance to clean up
-      await sleepAsync(milliseconds(500))
+      await sleepAsync(milliseconds(250))
 
       # New connection after recycle should execute queries correctly
       pool.withConnection(conn):
@@ -759,14 +759,14 @@ suite "E2E: Pool minSize Replenishment":
           minSize: 2,
           maxSize: 5,
           maxLifetime: milliseconds(200),
-          maintenanceInterval: milliseconds(100),
+          maintenanceInterval: milliseconds(50),
         )
       )
 
       doAssert pool.idleCount == 2
 
       # Wait for maxLifetime to expire + maintenance to clean + replenish
-      await sleepAsync(milliseconds(600))
+      await sleepAsync(milliseconds(300))
 
       doAssert pool.idleCount == 2
 
