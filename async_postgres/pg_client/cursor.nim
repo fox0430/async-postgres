@@ -65,6 +65,18 @@ proc beginCursorOp(cursor: Cursor) =
 proc endCursorOp(cursor: Cursor) {.inline, raises: [].} =
   cursor.inFlight = false
 
+template closePortal(conn: PgConnection, portalName: string) =
+  ## Close the portal and Sync. The Sync can commit an implicit transaction,
+  ## so a commit failure (deferred constraint, serialization) raises here.
+  conn.beginSendBuf()
+  conn.addClose(dkPortal, portalName)
+  conn.addSync()
+  await conn.sendStagedBufMsg()
+  conn.pumpUntilReady:
+    discard
+  do:
+    discard
+
 proc openCursorImpl(
     conn: PgConnection,
     sql: string,
@@ -110,7 +122,6 @@ proc openCursorImpl(
 
   var cursor =
     Cursor(conn: conn, portalName: portalName, chunkSize: chunkSize, exhausted: false)
-  var queryError: ref PgQueryError
 
   block recvLoop:
     while true:
@@ -147,26 +158,15 @@ proc openCursorImpl(
           discard
         of bmkPortalSuspended:
           break recvLoop
-        of bmkCommandComplete:
+        of bmkCommandComplete, bmkEmptyQueryResponse:
+          # Empty or comment-only SQL completes with EmptyQueryResponse.
           cursor.exhausted = true
-          # Need to Sync to get ReadyForQuery
-          await conn.sendMsg(encodeSync())
-          block drainLoop:
-            while true:
-              while (let ropt = conn.nextMessage(); ropt.isSome):
-                let rmsg = ropt.get
-                case rmsg.kind
-                of bmkReadyForQuery:
-                  conn.txStatus = rmsg.txStatus
-                  if conn.state != csClosed:
-                    conn.markReady()
-                  break drainLoop
-                else:
-                  discard
-              await conn.fillRecvBuf()
+          # Sync alone leaves the portal open until an explicit transaction
+          # ends, and `close()` skips an exhausted cursor.
+          conn.closePortal(portalName)
           break recvLoop
         of bmkErrorResponse:
-          queryError = newPgQueryError(pumpMsg.errorFields)
+          let queryError = newPgQueryError(pumpMsg.errorFields)
           # Drain until ReadyForQuery
           await conn.sendMsg(encodeSync())
           block errDrain:
@@ -206,26 +206,7 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
           break recvLoop
         of bmkCommandComplete:
           cursor.exhausted = true
-          # Close portal and sync
-          var closeBatch: seq[byte]
-          closeBatch.addClose(dkPortal, cursor.portalName)
-          closeBatch.addSync()
-          await conn.sendMsg(closeBatch)
-          block drainLoop:
-            while true:
-              while (let ropt = conn.nextMessage(); ropt.isSome):
-                let rmsg = ropt.get
-                case rmsg.kind
-                of bmkCloseComplete:
-                  discard
-                of bmkReadyForQuery:
-                  conn.txStatus = rmsg.txStatus
-                  if conn.state != csClosed:
-                    conn.markReady()
-                  break drainLoop
-                else:
-                  discard
-              await conn.fillRecvBuf()
+          conn.closePortal(cursor.portalName)
           break recvLoop
         of bmkErrorResponse:
           let queryError = newPgQueryError(pumpMsg.errorFields)
@@ -239,10 +220,9 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
                     conn.markReady()
                   break errDrain
               await conn.fillRecvBuf()
-          # The Sync above aborts the (implicit) transaction holding the portal,
-          # so the portal is already gone. Mark the cursor exhausted so a later
-          # `close()` short-circuits instead of issuing a wasteful Close/Sync
-          # round-trip against a portal the server has dropped.
+          # The portal is dead: the Sync dropped it with an implicit transaction,
+          # or it lingers failed until an explicit one is rolled back. Mark the
+          # cursor exhausted so a later `close()` skips the Close/Sync round-trip.
           cursor.exhausted = true
           raise queryError
         else:
@@ -256,6 +236,11 @@ proc fetchNextImpl(cursor: Cursor): Future[seq[Row]] {.async.} =
 proc fetchNext*(cursor: Cursor): Future[seq[Row]] {.async.} =
   ## Fetch the next chunk of rows from the cursor.
   ## Returns an empty seq when the cursor is exhausted.
+  ## A server error raises ``PgQueryError``. The call that exhausts the cursor
+  ## also closes the portal with a Sync, which commits the statement outside a
+  ## transaction block; a commit failure (deferred constraint, serialization)
+  ## raises too: that call's rows are discarded and the statement's writes
+  ## rolled back.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## A closed connection raises ``PgStateError`` after a deliberate ``close()``,
@@ -316,23 +301,14 @@ proc closeCursorImpl(cursor: Cursor): Future[void] {.async.} =
     cursor.exhausted = true
     return
 
-  var batch = newSeqOfCap[byte](cursor.portalName.len + 16)
-  conn.stagePendingStmtCloses(batch)
-  batch.addClose(dkPortal, cursor.portalName)
-  batch.addSync()
-  await conn.sendStagedMsg(batch)
-
-  conn.pumpUntilReady:
-    case pumpMsg.kind
-    of bmkCloseComplete: discard
-    else: discard
-  do:
-    discard
-
+  # Set first: a commit failure at the Sync raises after the portal is closed.
   cursor.exhausted = true
+  conn.closePortal(cursor.portalName)
 
 proc close*(cursor: Cursor): Future[void] {.async.} =
   ## Close the cursor and return the connection to ready state.
+  ## Outside a transaction block the closing Sync commits the statement; a
+  ## commit failure raises ``PgQueryError`` and still leaves the cursor closed.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   ## Concurrent ``fetchNext``/``close`` on the same cursor raises ``PgStateError``.
@@ -414,9 +390,10 @@ proc openCursor*(
   ## `withCursor` closes it on scope exit.
   ## On timeout, the connection is retired (csClosed) unless the wire had
   ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
-  ## Raises ``PgTypeError`` for a non-positive `chunkSize`,
-  ## ``PgStateError`` / ``PgConnectionError`` on a closed connection as
-  ## `fetchNext` does.
+  ## Raises ``PgTypeError`` for a non-positive `chunkSize`, and as `fetchNext`
+  ## does, ``PgStateError`` / ``PgConnectionError`` on a closed connection and
+  ## ``PgQueryError`` on a server error, including a commit failure when the
+  ## first chunk exhausts the cursor.
   let (oids, formats, values) = extractParams(params)
   let resultFormats = resultFormat.toFormatCodes()
   awaitOrInvalidate(

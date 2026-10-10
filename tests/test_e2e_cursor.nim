@@ -111,6 +111,102 @@ suite "E2E: Cursor/Streaming":
 
     waitFor t()
 
+  test "empty and comment-only SQL exhaust the cursor":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let c1 = await conn.openCursor("", chunkSize = 10)
+      doAssert c1.exhausted()
+      doAssert (await c1.fetchNext()).len == 0
+      doAssert conn.state == csReady
+
+      # Inside a transaction only the Close drops the portal.
+      discard await conn.exec("BEGIN")
+      let c2 = await conn.openCursor("-- nothing", chunkSize = 10)
+      doAssert c2.exhausted()
+      let res = await conn.query("SELECT count(*) FROM pg_cursors WHERE name <> ''")
+      doAssert res.rows[0].getStr(0) == "0"
+      discard await conn.exec("ROLLBACK")
+      await conn.close()
+
+    waitFor t()
+
+  test "exhausted cursors leave no portal open inside a transaction":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("BEGIN")
+      # Exhausted by openCursor's own Execute.
+      let c1 = await conn.openCursor("SELECT 1 AS x", chunkSize = 10)
+      doAssert c1.exhausted()
+      # Exhausted by fetchNext.
+      let c2 = await conn.openCursor("SELECT generate_series(1, 3)", chunkSize = 2)
+      var fetched = 0
+      while true:
+        let chunk = await c2.fetchNext()
+        if chunk.len == 0:
+          break
+        fetched += chunk.len
+      doAssert fetched == 3
+      doAssert c2.exhausted()
+
+      # The unnamed portal of this query is listed too.
+      let res = await conn.query("SELECT count(*) FROM pg_cursors WHERE name <> ''")
+      doAssert res.rows[0].getStr(0) == "0"
+      discard await conn.exec("ROLLBACK")
+      await conn.close()
+
+    waitFor t()
+
+  test "a commit failure at the closing Sync is raised":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_cursor_deferred")
+      discard await conn.exec(
+        """
+        CREATE TABLE test_cursor_deferred (
+          id int PRIMARY KEY,
+          ref_id int REFERENCES test_cursor_deferred(id)
+            DEFERRABLE INITIALLY DEFERRED
+        )
+        """
+      )
+
+      # Exhausted by openCursor's own Execute.
+      var state = ""
+      try:
+        discard await conn.openCursor(
+          "INSERT INTO test_cursor_deferred VALUES (1, 999) RETURNING id",
+          chunkSize = 10,
+        )
+      except PgQueryError as e:
+        state = e.sqlState
+      doAssert state == "23503"
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      # Exhausted by fetchNext.
+      let cur = await conn.openCursor(
+        "INSERT INTO test_cursor_deferred VALUES (1, 999), (2, 999) RETURNING id",
+        chunkSize = 1,
+      )
+      state = ""
+      try:
+        while true:
+          let chunk = await cur.fetchNext()
+          if chunk.len == 0:
+            break
+      except PgQueryError as e:
+        state = e.sqlState
+      doAssert state == "23503"
+      doAssert conn.state == csReady
+      doAssert conn.txStatus == tsIdle
+
+      let res = await conn.query("SELECT count(*) FROM test_cursor_deferred")
+      doAssert res.rows[0].getStr(0) == "0"
+      discard await conn.exec("DROP TABLE test_cursor_deferred")
+      await conn.close()
+
+    waitFor t()
+
   test "fetchNext on exhausted cursor returns empty":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
