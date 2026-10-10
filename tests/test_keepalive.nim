@@ -150,3 +150,53 @@ when defined(posix):
       config.keepAlive = true
       expect PgError:
         configureKeepalive(SocketHandle(-1), config)
+
+    proc connectAndProbe(config: ConnConfig): tuple[enabled: bool, idle: cint] =
+      ## Keepalive options on the socket of a live connection opened with
+      ## `config` against a mock server.
+      var probed: tuple[enabled: bool, idle: cint]
+
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let serverFut = acceptAndReady(ms)
+        var cfg = config
+        cfg.host = "127.0.0.1"
+        cfg.port = ms.port
+        let conn = await connect(cfg).wait(seconds(5))
+        when hasChronos:
+          let fd = SocketHandle(conn.transport.fd)
+        elif hasAsyncDispatch:
+          let fd = conn.socket.getFd()
+        probed.enabled = keepaliveEnabled(fd)
+        when defined(linux):
+          probed.idle = getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPIDLE)
+        elif defined(macosx):
+          probed.idle = getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPALIVE)
+        await conn.close()
+        await closeClient(await serverFut.wait(seconds(5)))
+        await closeServer(ms)
+
+      waitFor t()
+      probed
+
+    test "connect applies keepAlive to the TCP socket":
+      let probed = connectAndProbe(
+        ConnConfig(
+          user: "test",
+          database: "test",
+          sslMode: sslDisable,
+          keepAlive: true,
+          keepAliveIdle: 42,
+        )
+      )
+      check probed.enabled
+      when defined(linux) or defined(macosx):
+        check probed.idle == 42
+
+    test "connect without keepAlive leaves SO_KEEPALIVE off":
+      let probed = connectAndProbe(
+        ConnConfig(
+          user: "test", database: "test", sslMode: sslDisable, keepAlive: false
+        )
+      )
+      check not probed.enabled

@@ -1239,6 +1239,14 @@ suite "columnIndex and columnMap":
     let single = @[mkFieldDesc("only")]
     check single.columnIndex("only") == 0
 
+  test "a duplicated name: fields take the first column, Row and columnMap the last":
+    let dup = @[mkFieldDesc("id"), mkFieldDesc("name"), mkFieldDesc("id")]
+    check dup.columnIndex("id") == 0
+    check dup.columnMap()["id"] == 2
+    let row = mkRow(@[some(@[byte('1')]), some(@[byte('x')]), some(@[byte('2')])], dup)
+    check row.columnIndex("id") == 2
+    check row.get("id", string) == "2"
+
 suite "coerceBinaryParam":
   test "matching OID unchanged":
     let p = toPgParam(42'i32)

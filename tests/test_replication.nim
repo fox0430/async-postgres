@@ -249,6 +249,20 @@ suite "pgoutput decoder":
     check msg.commit.commitLsn == Lsn(0x600'u64)
     check msg.commit.endLsn == Lsn(0x700'u64)
 
+  test "Origin message":
+    var data: seq[byte]
+    data.add(byte('O'))
+    # High bit set: the LSN must come back unsigned.
+    data.addInt64(cast[int64](0x8000_0001_0000_0002'u64)) # originLsn
+    for c in "node_a":
+      data.add(byte(c))
+    data.add(0'u8)
+
+    let msg = parsePgOutputMessage(data)
+    check msg.kind == pomkOrigin
+    check msg.origin.originLsn == Lsn(0x8000_0001_0000_0002'u64)
+    check msg.origin.originName == "node_a"
+
   test "Relation message":
     var data: seq[byte]
     data.add(byte('R'))
@@ -291,6 +305,23 @@ suite "pgoutput decoder":
     check msg.relation.columns[1].name == "name"
     check msg.relation.columns[1].typeOid == 25'i32
 
+  test "Type message":
+    var data: seq[byte]
+    data.add(byte('Y'))
+    data.addInt32(16500'i32) # typeId
+    for c in "public":
+      data.add(byte(c))
+    data.add(0'u8)
+    for c in "mood":
+      data.add(byte(c))
+    data.add(0'u8)
+
+    let msg = parsePgOutputMessage(data)
+    check msg.kind == pomkType
+    check msg.typeMsg.typeId == 16500'i32
+    check msg.typeMsg.namespace == "public"
+    check msg.typeMsg.name == "mood"
+
   test "Insert message":
     var data: seq[byte]
     data.add(byte('I'))
@@ -312,6 +343,13 @@ suite "pgoutput decoder":
     check msg.insert.newTuple[0].kind == tdkText
     check msg.insert.newTuple[0].data == @[byte('4'), byte('2')]
     check msg.insert.newTuple[1].kind == tdkNull
+
+  test "toString copies a field's bytes verbatim":
+    check TupleField(kind: tdkText, data: @[byte('4'), byte('2')]).toString() == "42"
+    # Binary data is not decoded: NUL and high bytes come through as-is.
+    let bin = TupleField(kind: tdkBinary, data: @[0x00'u8, 0xFF, 0x7F])
+    check bin.toString() == "\x00\xFF\x7F"
+    check TupleField(kind: tdkNull).toString() == ""
 
   test "Insert message with invalid marker raises":
     var data: seq[byte]
