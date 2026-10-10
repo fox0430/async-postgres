@@ -122,13 +122,20 @@ jobs:
       - name: Check build without TLS (asyncdispatch, no -d:ssl)
         run: nim check --hints:off --warningAsError:UnreachableCode --warningAsError:UnusedImport async_postgres.nim
 
-      - name: Compile examples (asyncdispatch)
+      # One build per backend: a build per example repeats the library and C
+      # compile each time. Imported, an example's top-level `waitFor main()`
+      # still compiles, but a `when isMainModule` block would be skipped.
+      - name: Aggregate examples
         shell: bash
-        run: for f in examples/*.nim; do nim c "$f"; done
+        run: |
+          imports=$(for f in examples/*.nim; do echo "import $(basename "$f" .nim)"; done)
+          printf '{.push warning[UnusedImport]: off.}\n%s\n{.pop.}\n' "$imports" > examples/all_examples.nim
+
+      - name: Compile examples (asyncdispatch)
+        run: nim c examples/all_examples.nim
 
       - name: Compile examples (chronos)
-        shell: bash
-        run: for f in examples/*.nim; do nim c -d:asyncBackend=chronos "$f"; done
+        run: nim c -d:asyncBackend=chronos examples/all_examples.nim
 
       # Platform-independent, so generate once.
       - name: Gen docs
