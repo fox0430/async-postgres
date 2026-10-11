@@ -13,7 +13,12 @@ type
     idleTimeout*: Duration
       ## Close idle connections after this duration (default 10min, ZeroDuration=disabled)
     maxLifetime*: Duration
-      ## Max connection lifetime (default 1hr, ZeroDuration=disabled)
+      ## Max connection lifetime (default 1hr, ZeroDuration=disabled), measured
+      ## from connect completion. A connection past it is closed, not reused: the
+      ## idle scan of `acquire` and the maintenance sweep evict it, and `release`
+      ## closes it rather than parking it or handing it to a waiter. A borrow
+      ## already in flight is not interrupted, and a conn a `connect` has just
+      ## produced is handed out once, however long the dial took.
     maintenanceInterval*: Duration ## Maintenance loop interval (default 30s)
     healthCheckTimeout*: Duration
       ## Ping idle connections older than this before returning (default 5s, ZeroDuration=disabled).
@@ -947,16 +952,23 @@ proc releaseCore(
   ## `releaseImpl`. Returns flags describing the disposition of `conn` so
   ## the caller can report them to the tracer.
   # Only a healthy borrow the *application* hands back counts as its own
-  # `pool.close()`; a discard or internal release stays a `PgConnectionError`.
+  # `pool.close()`; a discard, an expiry or an internal release stays a
+  # `PgConnectionError`.
   let discarded =
     conn.state != csReady or conn.txStatus != tsIdle or conn.sessionLockDirty or
     conn.timeZoneChanged
-  if pool.closed or discarded:
+  let now = Moment.now()
+  # Judged here, not only on the idle path: a released conn goes straight to
+  # the head waiter and never reaches `idle`, so under a queue that never
+  # drains an expired conn would stay in use indefinitely.
+  if pool.closed or discarded or pool.isExpired(conn, now):
     if pool.active > 0:
       pool.active.dec
-    pool.closeNoWait(conn, byUser = conn.borrowedByUser and not discarded)
-    # A discarded conn frees an `active` slot without serving a waiter;
-    # spawn a replacement so the head waiter is not stranded.
+    pool.closeNoWait(
+      conn, byUser = conn.borrowedByUser and pool.closed and not discarded
+    )
+    # A discarded or expired conn frees an `active` slot without serving a
+    # waiter; spawn a replacement so the head waiter is not stranded.
     pool.respawnForStrandedWaiter()
     return (true, false)
   # FIFO handoff: serve the head waiter directly with the released conn.
@@ -975,9 +987,9 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## Implementation of `release(conn)`; called once the owning pool is known.
   ## `conn.borrowedByUser` decides whether a close during shutdown counts as the
   ## application's (see `releaseCore`), so no call site can get it wrong.
-  ## Returns the connection to the pool. If the connection is broken or in
-  ## a transaction, it is closed instead. If waiters are queued, the
-  ## connection is handed directly to the next waiter.
+  ## Returns the connection to the pool. If the connection is broken, in a
+  ## transaction, or past `maxLifetime`, it is closed instead. If waiters are
+  ## queued, the connection is handed directly to the next waiter.
   ##
   ## Discard criteria (`conn.state != csReady`):
   ## - A timed-out request reaches us via `invalidateOnTimeout`, normally with
@@ -992,7 +1004,8 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## connection to be discarded: callers who route through `resetSession`
   ## clear them ahead of time, so anything reaching here still dirty has
   ## bypassed that path and must not return to the idle queue. A `TimeZone`
-  ## changed since connect is discarded the same way.
+  ## changed since connect, or a conn past `maxLifetime`, is discarded the
+  ## same way.
   ##
   ## Double-release guard: a connection that is not currently checked out
   ## (`borrowed == false`) has already been returned to the pool — or never
@@ -1064,9 +1077,9 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
       discard
 
 proc release*(conn: PgConnection) =
-  ## Return a connection to its owning pool. If the connection is broken or
-  ## in a transaction, it is closed instead; if waiters are queued, it is
-  ## handed directly to the next waiter.
+  ## Return a connection to its owning pool. If the connection is broken, in a
+  ## transaction, or past `maxLifetime`, it is closed instead; if waiters are
+  ## queued, it is handed directly to the next waiter.
   ##
   ## **No session reset:** `resetSession` does not run, so `resetQuery` is
   ## skipped and session state (`SET`, `SET ROLE`, prepared statements, …)
@@ -1125,9 +1138,12 @@ proc resetSessionAndRelease*(pool: PgPool, conn: PgConnection) {.async.} =
   ## `resetSession` + `release`, wrapped so `release()` still runs when the
   ## reset propagates `CancelledError` (else a pool slot leaks).
   ##
-  ## Correct for both application-held and pool-internal borrows.
+  ## Correct for both application-held and pool-internal borrows. A conn past
+  ## `maxLifetime` skips the reset: `release` closes it, so the round trip would
+  ## be spent on a conn the pool throws away.
   try:
-    await pool.resetSession(conn)
+    if not pool.isExpired(conn, Moment.now()):
+      await pool.resetSession(conn)
   finally:
     conn.release()
 

@@ -658,6 +658,47 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
+  test "release past maxLifetime closes instead of parking":
+    let pool = makePool()
+    pool.config.maxLifetime = seconds(1)
+    pool.active = 1
+    let conn = mockConn()
+    conn.borrowedByUser = true # as `acquire` leaves it
+    conn.createdAt = Moment.now() - seconds(5)
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 0
+    check conn.state == csClosed
+    check pool.metrics.closeCount == 1
+    # An eviction is the pool's decision, so a stale handle on it must still
+    # report a connection failure (the recovery `maxLifetime` exists for).
+    check not conn.closedByUser
+    expect PgConnectionError:
+      conn.checkNotClosed()
+
+  test "release within maxLifetime parks as before":
+    let pool = makePool()
+    pool.config.maxLifetime = seconds(1)
+    pool.active = 1
+    let conn = mockConn()
+    pool.release(conn)
+    check pool.active == 0
+    check pool.idle.len == 1
+    check conn.state == csReady
+    check pool.metrics.closeCount == 0
+
+  test "maxLifetime is judged exclusively, and ZeroDuration disables it":
+    let pool = makePool()
+    pool.config.maxLifetime = seconds(1)
+    let conn = mockConn()
+    let at = Moment.now()
+    conn.createdAt = at - seconds(1)
+    # Exactly at the limit is still reusable; a tick past it is not.
+    check not pool.isExpired(conn, at)
+    check pool.isExpired(conn, at + milliseconds(1))
+    pool.config.maxLifetime = ZeroDuration
+    check not pool.isExpired(conn, at + hours(1))
+
   test "release stamps lastUsedAt with the return time, not a stale acquire-time timestamp":
     let pool = makePool()
     pool.active = 1
@@ -2380,7 +2421,10 @@ suite "maxLifetime across a health-check ping":
     result.config.healthCheckTimeout = seconds(60)
     # Outlasts any hold the tests put on a ping.
     result.config.pingTimeout = seconds(5)
-    result.config.maxLifetime = seconds(1)
+    # Comfortably above any test's wall time: `release` judges a returned conn
+    # against it, so a short value would tie a handoff assertion to timing.
+    # `expire` ages a conn past it by a minute.
+    result.config.maxLifetime = seconds(30)
 
   proc addStale(pool: PgPool, conn: PgConnection) =
     ## Idle long enough to be pinged.
@@ -2548,6 +2592,88 @@ suite "maxLifetime across a health-check ping":
       doAssert pool.active == 0
 
       await closeClient(pingedSt)
+      await closeServer(ms)
+
+    waitFor t()
+
+suite "maxLifetime on release":
+  proc connectToMock(ms: MockServer): Future[(PgConnection, MockClient)] {.async.} =
+    let connFut = connect(mockConfig(ms.port))
+    let client = await acceptAndReady(ms)
+    return (await connFut, client)
+
+  test "a released conn past maxLifetime is closed and the waiter dials fresh":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.maxLifetime = seconds(1)
+
+      let (old, oldSt) = await connectToMock(ms)
+      old.ownerPool = pool
+      old.borrowed = true
+      pool.active = 1
+
+      # Queued with no dial of its own: the borrow holds the only slot.
+      let waiter = pool.acquire()
+      doAssert pool.waiterCount == 1
+      doAssert not waiter.finished
+
+      old.createdAt = Moment.now() - seconds(5)
+      old.release()
+
+      # The waiter gets a dial into the freed slot, and what it receives is
+      # the fresh conn — never the expired one.
+      let freshSt = await acceptAndReady(ms).wait(seconds(5))
+      let fresh = await waiter.wait(seconds(5))
+      # Let the close `release` scheduled run before reading its state.
+      await allFutures(pool.pendingBackgroundTasks)
+
+      doAssert fresh != old
+      doAssert old.state == csClosed
+      doAssert pool.metrics.closeCount == 1
+      doAssert pool.metrics.createCount == 1
+      doAssert pool.active == 1
+      doAssert pool.idle.len == 0
+
+      fresh.release()
+      await pool.close(seconds(1))
+      await closeClient(freshSt)
+      await closeClient(oldSt)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "resetSessionAndRelease skips the reset for a conn release closes":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = makePool(maxSize = 1)
+      pool.config.connConfig = mockConfig(ms.port)
+      pool.config.maxLifetime = seconds(1)
+      pool.config.resetQuery = "DISCARD ALL"
+      # Bounds the reset the expired conn must not run, so a regression fails on
+      # the assertion below instead of hanging on an unanswered query.
+      pool.config.resetQueryTimeout = milliseconds(200)
+
+      let (conn, st) = await connectToMock(ms)
+      conn.ownerPool = pool
+      conn.borrowed = true
+      pool.active = 1
+      conn.createdAt = Moment.now() - seconds(5)
+
+      await pool.resetSessionAndRelease(conn)
+
+      # Past its lifetime the conn is closed, not reset: the first thing the
+      # server sees is the Terminate, never the reset query.
+      let msg = await drainFrontendMessage(st).wait(seconds(5))
+      doAssert msg.msgType == 'X'
+      await allFutures(pool.pendingBackgroundTasks)
+      doAssert conn.state == csClosed
+      doAssert pool.active == 0
+      doAssert pool.metrics.closeCount == 1
+
+      await pool.close(seconds(1))
+      await closeClient(st)
       await closeServer(ms)
 
     waitFor t()
