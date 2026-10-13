@@ -216,7 +216,9 @@ elif hasAsyncDispatch:
     ## when the orphan owns a connection or other live resource. The default
     ## clears the error on ``fut`` itself, so anything else that awaits ``fut``
     ## after the timeout reads a late failure as a default-valued success; pass
-    ## an explicit ``onOrphan`` (a no-op will do) in that case too.
+    ## an explicit ``onOrphan`` (a no-op will do) in that case too. That
+    ## includes the caller's own timeout handler checking ``fut.completed()``:
+    ## a failure landing on the timer's tick is cleared before the handler runs.
     ##
     ## Under chronos the ``onOrphan`` argument is accepted but never called —
     ## futures are properly cancelled on timeout and no orphan remains.

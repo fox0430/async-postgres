@@ -1,7 +1,7 @@
 ## Unit tests for `pg_client/transaction` via the mock server.
 ##
-## PG-less: `withTransaction` commit/rollback and the body-escape
-## compile-time guards.
+## PG-less: `withTransaction` commit/rollback, the body-escape compile-time
+## guards, and a body failing on its deadline's tick.
 
 import std/[unittest, strutils]
 
@@ -147,3 +147,81 @@ suite "transaction: mock round trip":
       await ms.closeServer()
 
     waitFor t()
+
+when hasAsyncDispatch:
+  from std/os import sleep
+
+  # A body that fails after `wait` saw the deadline but before it resumed: the
+  # default orphan hook cleared that failure, so the timeout handler took the
+  # body for completed and the macro returned as if it had committed.
+  suite "transaction: a body failing on its deadline's tick":
+    proc blockPast(deadline: Moment) =
+      ## Block the event loop until `deadline` has passed, so every timer due by
+      ## then fires in the next poll, in deadline order.
+      sleep(max(0, toMilliseconds(deadline - Moment.now())) + 50)
+
+    proc serveBeginRollback(
+        ms: MockServer, queries: ref seq[string]
+    ): Future[void] {.async.} =
+      let client = await acceptAndReady(ms)
+      for tx in ['T', 'I']: # BEGIN, then the timeout path's ROLLBACK
+        queries[].add(await readSimpleQuery(client))
+        await client.sendBytes(
+          buildCommandComplete(queries[^1]) & buildReadyForQuery(tx)
+        )
+      await closeClient(client)
+
+    test "withTransactionDeadline rolls back and raises PgTimeoutError":
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let queries = new seq[string]
+        let serverFut = serveBeginRollback(ms, queries)
+        let conn = await connect(mockConfig(ms.port))
+        let deadline = milliseconds(300)
+        let start = Moment.now()
+        var caught: ref CatchableError
+        try:
+          conn.withTransactionDeadline(deadline):
+            blockPast(start + deadline)
+            await sleepMsAsync(0) # due after the deadline's timer
+            if true:
+              raise newException(ValueError, "boom")
+        except CatchableError as e:
+          caught = e
+        doAssert caught of PgTimeoutError,
+          (if caught == nil: "no error" else: caught.msg)
+        await serverFut.wait(seconds(5))
+        doAssert queries[] == @["BEGIN", "ROLLBACK"], $queries[]
+        await conn.close()
+        await ms.closeServer()
+
+      waitFor t()
+
+    test "withTransactionRetryDeadline rolls back and raises PgTimeoutError":
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let queries = new seq[string]
+        let serverFut = serveBeginRollback(ms, queries)
+        let conn = await connect(mockConfig(ms.port))
+        let deadline = milliseconds(300)
+        let start = Moment.now()
+        var attempts = 0
+        var caught: ref CatchableError
+        try:
+          conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), deadline):
+            inc attempts
+            blockPast(start + deadline)
+            await sleepMsAsync(0) # due after the deadline's timer
+            if true:
+              raise newException(ValueError, "boom")
+        except CatchableError as e:
+          caught = e
+        doAssert caught of PgTimeoutError,
+          (if caught == nil: "no error" else: caught.msg)
+        doAssert attempts == 1
+        await serverFut.wait(seconds(5))
+        doAssert queries[] == @["BEGIN", "ROLLBACK"], $queries[]
+        await conn.close()
+        await ms.closeServer()
+
+      waitFor t()

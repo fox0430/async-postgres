@@ -1113,6 +1113,9 @@ proc releaseReclaimed*(conn: PgConnection) =
   ## delivered one. The application never took delivery, so the borrow is
   ## demoted before the release and a close taken during shutdown stays a
   ## `PgConnectionError`.
+  if conn == nil:
+    # Canary: only a default-hook `wait` draining a late failure reads nil here.
+    raise newException(PgError, "releaseReclaimed() called without a connection")
   if conn.ownerPool == nil:
     raise newException(PgError, "releaseReclaimed() called on a standalone connection")
   conn.borrowedByUser = false
@@ -1431,7 +1434,8 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
 
   if hasDeadline:
     try:
-      let conn = await fut.wait(waitBudget)
+      # `settleAbandonedWaiter` reads the outcome after a timeout.
+      let conn = await fut.waitKeepingOutcome(waitBudget)
       recordAcquire()
       return (conn, false)
     except AsyncTimeoutError:
@@ -2684,7 +2688,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
-  let waitSym = bindSym"wait"
+  let waitSym = bindSym"waitKeepingOutcome"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
   let retireSym = bindSym"retireOnTimeout"
