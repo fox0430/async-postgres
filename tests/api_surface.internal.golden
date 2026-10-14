@@ -156,6 +156,7 @@ async_postgres/pg_connection/simple_query.nim	checkTxIdle
 async_postgres/pg_connection/simple_query.nim	invalidateOnCancel
 async_postgres/pg_connection/simple_query.nim	retireOnTimeout
 async_postgres/pg_connection/simple_query.nim	tracedSimpleExec
+async_postgres/pg_connection/simple_query.nim	waitKeepingOutcome
 async_postgres/pg_connection/ssl.nim	negotiateSSL
 async_postgres/pg_connection/ssl.nim	sniName
 async_postgres/pg_connection/ssl.nim	validateDirectSslCompatible

@@ -398,6 +398,26 @@ proc invalidateOnCancel*(conn: PgConnection, releaseTransport = true) =
   ## only covers a cancellation landing between operations.
   conn.invalidateWire(releaseTransport)
 
+proc waitKeepingOutcome*[T](fut: Future[T], timeout: Duration): Future[T] =
+  ## ``wait`` for callers that still read ``fut`` (``await``, ``completed()``,
+  ## ``read()``) after an ``AsyncTimeoutError``. On asyncdispatch the default
+  ## ``onOrphan`` clears a late failure — one landing on the timer's tick is
+  ## cleared before the timeout handler runs — so ``fut`` would read as a
+  ## success holding a default value.
+  ##
+  ## The caller owns the orphan's outcome: nothing drains it, so a late success
+  ## keeps the value it delivered — a ``PgConnection`` that only the caller can
+  ## hand back — and a late failure stays readable for a later ``completed()`` /
+  ## ``failed()`` check.
+  when hasAsyncDispatch:
+    fut.wait(
+      timeout,
+      proc(orphan: Future[T]) {.gcsafe.} =
+        discard,
+    )
+  else:
+    fut.wait(timeout)
+
 template awaitOrInvalidate*(
     connExpr: PgConnection,
     dest: untyped,

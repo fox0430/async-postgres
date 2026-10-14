@@ -316,7 +316,7 @@ proc buildDeadlineAwaitAndTimeout(
   let eSym = macroSym(nskLet, "e")
   let cancelSym = macroSym(nskLet, "cancel")
   let timeoutErrSym = bindSym"AsyncTimeoutError"
-  let waitSym = bindSym"wait"
+  let waitSym = bindSym"waitKeepingOutcome"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let retireSym = bindSym"retireOnTimeout"
   let timeoutCleanup = catchableCleanup.copyNimTree()
@@ -437,7 +437,7 @@ proc buildRetryDeadlineLoop*(
   let txStatusSym = bindSym"txStatus"
   let tsIdleSym = bindSym"tsIdle"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
-  let waitSym = bindSym"wait"
+  let waitSym = bindSym"waitKeepingOutcome"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let msSym = bindSym"milliseconds"
   let isRetryableSym = bindSym"isRetryableTxError"
