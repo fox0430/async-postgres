@@ -500,6 +500,8 @@ type
 
   QueryResult* = object
     ## Result of a query: field descriptions, row data, and command tag.
+    ## ``data`` is nil only when the statement returned no rows, so
+    ## ``rowCount > 0`` implies ``data != nil``.
     fields*: seq[FieldDescription]
     data*: RowData
     rowCount*: int32

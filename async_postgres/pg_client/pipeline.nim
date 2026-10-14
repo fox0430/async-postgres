@@ -453,8 +453,14 @@ proc executeImpl(p: Pipeline): Future[seq[PipelineResult]] {.async.} =
         if activeOpIdx < p.ops.len and p.ops[activeOpIdx].kind == pokQuery:
           rowData = results[activeOpIdx].queryResult.data
           rowCount = addr results[activeOpIdx].queryResult.rowCount
-
-        while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
+        # A pokExec has no row sink, so its rows (a RETURNING statement's) are
+        # framed and dropped rather than decoded for the loop's `else`. A query
+        # op always sets its counter, keeping `nextMessage`'s fail-closed check.
+        while (
+          let opt = conn.nextMessage(rowData, rowCount, skipDataRow = rowCount == nil)
+          opt.isSome
+        )
+        :
           let msg = opt.get
           if activeOpIdx < p.ops.len:
             facts[activeOpIdx].observe(conn, msg, p.ops[activeOpIdx].cache == scsMiss)
@@ -599,8 +605,12 @@ proc executeIsolatedImpl(p: Pipeline): Future[IsolatedPipelineResults] {.async.}
           if p.ops[opIdx].kind == pokQuery:
             rowData = results[opIdx].queryResult.data
             rowCount = addr results[opIdx].queryResult.rowCount
-
-          while (let opt = conn.nextMessage(rowData, rowCount); opt.isSome):
+          # Same as `executeImpl`: a pokExec's rows are framed, not decoded.
+          while (
+            let opt = conn.nextMessage(rowData, rowCount, skipDataRow = rowCount == nil)
+            opt.isSome
+          )
+          :
             let msg = opt.get
             facts.observe(conn, msg, p.ops[opIdx].cache == scsMiss)
             case msg.kind

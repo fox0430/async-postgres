@@ -134,3 +134,42 @@ suite "prepared: mock round trip":
       await ms.closeServer()
 
     waitFor t()
+
+  test "a DataRow for a NoData statement fails closed":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        # prepare: the statement describes itself as returning no rows.
+        await drainUntilSync(client)
+        let describeReply =
+          buildBackendMsg('1', @[]) & buildBackendMsg('n', @[]) & buildReadyForQuery(
+            'I'
+          )
+        await client.sendBytes(describeReply)
+        # execute: a row with no RowData bound anywhere.
+        await drainUntilSync(client)
+        await client.sendBytes(
+          buildBackendMsg('2', @[]) & buildDataRowText(["1"]) &
+            buildCommandComplete("SELECT 1") & buildReadyForQuery('I')
+        )
+        # The connection is retired, so it closes without a Terminate.
+        await closeClient(client)
+
+      let serverFut = serve()
+      let conn = await connect(mockConfig(ms.port))
+      let stmt = await conn.prepare("no_data", "SET search_path = public")
+      var raised = false
+      try:
+        discard await stmt.execute()
+      except PgProtocolError:
+        raised = true
+      doAssert raised
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
