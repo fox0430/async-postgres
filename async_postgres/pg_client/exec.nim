@@ -88,8 +88,9 @@ proc exec*(
   ## ``VACUUM``, ``LISTEN`` …) or ``simpleQuery`` when you need multi-statement
   ## execution in one round trip.
   ##
-  ## On timeout the connection is marked closed (protocol desync) and cannot be
-  ## reused; pooled connections are discarded automatically.
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the
+  ## socket). A pooled connection retired this way is discarded, not reused.
   var tag: string
   withConnTracing(
     conn,

@@ -52,8 +52,9 @@
 ## ===========================  =========  ============  ===========  ==============
 ##
 ## Timeout behaviour is shared by all four: when a ``timeout`` is exceeded the
-## connection is marked ``csClosed`` (the protocol may be mid-exchange) and a
-## pooled connection is discarded on release.
+## connection is retired (``csClosed``) unless the wire had settled
+## (asyncdispatch always retires: the timed-out operation stays on the socket),
+## and a pooled connection retired this way is discarded on release.
 ##
 ## This module is a thin re-export hub for the implementation submodules under
 ## `pg_client/`. From `core` only the stable public surface

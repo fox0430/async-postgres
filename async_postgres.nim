@@ -33,6 +33,10 @@
 ##                             (``openssl x509 -trustout``): aux       (``PgConfigError`` if no other CA is
 ##                             trust settings honoured                 left); export CAs as plain
 ##                                                                     ``CERTIFICATE``
+## Root CA without CA:TRUE     Accepted as a CA with                   Refused as a CA with
+##                             ``keyUsage`` keyCertSign; a bare        ``PgSecurityError``
+##                             root and ``CA:FALSE`` are refused
+##                             as a CA
 ## Client cert, key, root CA   Staged as temp files (owner-only on     Decoded in memory
 ##                             POSIX, ``/dev/shm`` preferred on
 ##                             Linux), deleted once loaded
@@ -44,11 +48,23 @@
 ##                             mode
 ## ==========================  ======================================  ====================================
 ##
+## A certificate refused as a CA (``CA:FALSE``, or a root OpenSSL rates not
+## CA-capable) is still usable as a **direct pin**: with the server's own
+## certificate in ``sslrootcert``, both backends verify it — BearSSL matches
+## the DN and public key, whatever the CA flag says.
+##
 ## Both backends trust only the pinned ``sslrootcert`` (no system store),
 ## enforce ALPN for ``sslnegotiation=direct`` only, and drop from
 ## SCRAM-SHA-256-PLUS to SCRAM-SHA-256 under ``channel_binding=prefer`` when
 ## the server certificate is unavailable (``require`` fails the connect on
 ## both).
+##
+## ``sslrootcert`` reaches the trust store only under ``verify-ca`` /
+## ``verify-full``; under ``require`` (and ``allow`` / ``prefer``) the server
+## certificate is accepted unverified even when a CA is configured (libpq loads
+## the file whenever it exists and verifies against it even under
+## ``require``). A DSN's ``sslrootcert=`` is read while the DSN is parsed,
+## whatever the mode, so a missing or unreadable file is a ``PgConfigError``.
 ##
 ## Downgrade and fallback notices
 ## ------------------------------
@@ -166,8 +182,10 @@
 ## the per-connection prepared-statement cache; ``simpleQuery``/``simpleExec``
 ## use the simple protocol and are not cached. A ``timeout`` parameter is
 ## accepted by ``query``/``exec``, ``queryDirect``/``execDirect``, and
-## ``simpleQuery``/``simpleExec``; on timeout the connection is marked
-## closed because the wire protocol desynchronises.
+## ``simpleQuery``/``simpleExec``; on timeout the connection is retired
+## (``csClosed``) because the wire protocol desynchronises, unless the wire had
+## settled (asyncdispatch always retires: the timed-out operation stays on the
+## socket).
 ##
 ## Client encoding
 ## ===============

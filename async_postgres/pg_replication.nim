@@ -735,8 +735,8 @@ proc timelineHistory*(
     conn: PgConnection, timeline: int32, timeout: async_backend.Duration = ZeroDuration
 ): Future[TimelineHistory] {.async.} =
   ## Execute ``TIMELINE_HISTORY``. Raises ``ValueError`` if ``timeline <=0``.
-  ## On timeout the connection is marked ``csClosed`` (protocol out of sync), so
-  ## a caller catching ``PgTimeoutError`` must reconnect, not retry in place.
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the socket).
   if timeline <= 0:
     raise newException(ValueError, "timeline must be > 0, got " & $timeline)
   let results = await conn.simpleQuery("TIMELINE_HISTORY " & $timeline, timeout)
@@ -1491,8 +1491,10 @@ proc startReplication*(
   ## connection (``csClosed``) and raises ``PgUnavailableError`` — accepted by
   ## ``isTransientError`` — so reconnect and resume with ``InvalidLsn``.
   ##
-  ## Requires ``publication_names`` in ``options`` and ``autoKeepaliveReply``
-  ## (``ValueError`` otherwise).
+  ## With ``autoConfirm``, requires ``publication_names`` in ``options`` and
+  ## ``autoKeepaliveReply`` (``ValueError`` otherwise). Without it, omitting
+  ## ``publication_names`` is left to the server, which rejects a logical stream
+  ## without one (pgoutput); the option checks above still apply.
   ##
   ## Returns on server ``CopyDone`` or connection close, or raises
   ## ``PgUnavailableError`` as above. To stop from the client side, call

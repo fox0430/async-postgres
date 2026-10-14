@@ -159,9 +159,12 @@ type
   PgTimeoutError* = object of PgConnectionError
     ## Raised when an operation times out.
     ##
-    ## A timeout on a query/exec/copy/prepare/transaction marks the connection
-    ## ``csClosed`` (the wire may be mid-exchange), hence ``PgConnectionError``.
-    ## ``waitNotification`` and an acquire timeout inside
+    ## A timeout on a query/exec/copy/prepare retires the connection
+    ## (``csClosed``) unless the wire had settled (asyncdispatch always retires,
+    ## leaving the timed-out operation on the socket); a transaction deadline
+    ## retires whenever the body may still be running, whatever the wire looks
+    ## like. Either is reported as a ``PgConnectionError`` so a reconnect loop
+    ## handles it. ``waitNotification`` and an acquire timeout inside
     ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` leave the
     ## connection usable; catch ``PgTimeoutError`` before ``PgConnectionError``
     ## to tell them apart.

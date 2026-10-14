@@ -444,6 +444,10 @@ when hasTls:
       # is called unconditionally); enforcement stays direct-only below.
       try:
         if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+          # Both backends read sslrootcert only under these two modes (the
+          # asyncdispatch branch below gates `caPath` the same way): a CA
+          # configured with require/allow/prefer stays unread, where libpq
+          # loads the file whenever it exists and verifies against it.
           var parsed = parseTrustAnchors(config.sslRootCert)
           conn.installTlsStream(
             newTLSClientAsyncStream(
@@ -545,6 +549,9 @@ when hasTls:
         p
 
       try:
+        # Mirrors the chronos branch: sslrootcert is read only under these two
+        # modes, so a CA configured with require/allow/prefer stays unread
+        # where libpq would verify against it under require.
         let caPath =
           if config.sslMode in {sslVerifyCa, sslVerifyFull}:
             writeTempPem(config.sslRootCert, "pg_ca_")
