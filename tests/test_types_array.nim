@@ -2297,25 +2297,59 @@ suite "array element errors carry the column number":
     check msgOf(getMoneyArrayND(row, 0)) ==
       "Column 0: getMoneyArrayND requires binary column format"
 
-  test "a mismatched elemOid stays unprefixed (it is not a column error)":
-    # The wire-OID guard names the accessor, not the column; the column
-    # context belongs to element decode failures and column-property errors.
+  test "a mismatched elemOid names the column too":
+    # The guard reads the elemOid from the cell payload, so it is a column
+    # failure like the element decodes; only the scalar colOid guard, which
+    # judges RowDescription metadata, stays unprefixed.
     let int8Payload = @[toBytes("\x00\x00\x00\x00\x00\x00\x00\x01")]
     let oidMismatch = mkRow(
       @[some(encodeBinaryArray(OidInt8, int8Payload))], @[mkField(OidInt8Array, 1)]
     )
     check msgOf(getIntArray(oidMismatch, 0)) ==
-      "getIntArray: wire elemOid=20 expected 23"
+      "Column 0: getIntArray: wire elemOid=20 expected 23"
     check msgOf(getIntArrayElemOpt(oidMismatch, 0)) ==
-      "getIntArrayElemOpt: wire elemOid=20 expected 23"
+      "Column 0: getIntArrayElemOpt: wire elemOid=20 expected 23"
     check msgOf(getArrayND[int32](oidMismatch, 0)) ==
-      "getArrayND[int32]: wire elemOid=20 expected 23"
+      "Column 0: getArrayND[int32]: wire elemOid=20 expected 23"
     # Same class on the hand-written paths: a money[] cell carrying int4.
     let moneyMismatch = mkRow(
       @[some(encodeBinaryArray(OidInt4, @[toBytes("\x00\x00\x00\x01")]))],
       @[mkField(OidMoneyArray, 1)],
     )
     check msgOf(getMoneyArray(moneyMismatch, 0)) ==
-      "getMoneyArray: wire elemOid=23 expected 790"
+      "Column 0: getMoneyArray: wire elemOid=23 expected 790"
     check msgOf(getMoneyArrayND(moneyMismatch, 0)) ==
-      "getMoneyArrayND: wire elemOid=23 expected 790"
+      "Column 0: getMoneyArrayND: wire elemOid=23 expected 790"
+
+  test "a malformed binary array header names the column":
+    # Fewer than 12 bytes cannot even carry the array header.
+    let short = mkRow(@[some(newSeq[byte](8))], @[mkField(OidInt4Array, 1)])
+    check msgOf(short.getIntArray(0)) == "Column 0: Binary array too short"
+    check msgOf(short.getIntArrayElemOpt(0)) == "Column 0: Binary array too short"
+    check msgOf(getArrayND[int32](short, 0)) == "Column 0: Binary array too short"
+    let money = mkRow(@[some(newSeq[byte](8))], @[mkField(OidMoneyArray, 1)])
+    check msgOf(money.getMoneyArray(0)) == "Column 0: Binary array too short"
+    check msgOf(money.getMoneyArrayND(0)) == "Column 0: Binary array too short"
+    let box = mkRow(@[some(newSeq[byte](8))], @[mkField(OidBoxArray, 1)])
+    check msgOf(box.getBoxArray(0)) == "Column 0: Binary array too short"
+
+  test "a multi-dimensional payload names the column on 1-D getters":
+    let twoDim = encodeBinaryArray(
+      OidInt4,
+      @[2'i32, 1'i32],
+      @[1'i32, 1'i32],
+      @[some(@(toBE32(1'i32))), some(@(toBE32(2'i32)))],
+    )
+    let row = mkRow(@[some(twoDim)], @[mkField(OidInt4Array, 1)])
+    check msgOf(row.getIntArray(0)).startsWith("Column 0: Multi-dimensional array")
+    check msgOf(row.getIntArrayElemOpt(0)).startsWith(
+      "Column 0: Multi-dimensional array"
+    )
+    # getArrayND is the accessor that reads it.
+    check getArrayND[int32](row, 0).dims == @[2'i32, 1'i32]
+
+  test "enum array payload errors name the column":
+    let short = mkRow(@[some(newSeq[byte](8))], @[mkField(90125'i32, 1)])
+    check msgOf(getEnumArray[Mood](short, 0)) == "Column 0: Binary array too short"
+    check msgOf(getEnumArrayElemOpt[Mood](short, 0)) ==
+      "Column 0: Binary array too short"

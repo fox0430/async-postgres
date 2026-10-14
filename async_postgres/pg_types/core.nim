@@ -6,6 +6,29 @@ export pg_errors except setPerHost, newStartupError
 import ../pg_bytes
 export pg_bytes
 
+template withColumnContext*[T](col: int, body: T): T =
+  ## Prefix a `PgTypeError` escaping `body` with the column number, so every
+  ## accessor reports the same "Column N: " context. `body` may be a statement
+  ## list or a single expression, and the template yields the body's value: a
+  ## call whose value is unused must sit in tail position or be `discard`ed.
+  ## The caught exception is mutated and re-raised, keeping its identity and
+  ## parent chain; callers must wrap a region exactly once (a helper that
+  ## already prefixes must not be wrapped again).
+  ##
+  ## Wrap only what the getter itself attributes to the column: a NULL cell it
+  ## raises, a malformed payload it decodes, or the ``elemOid`` that payload
+  ## carries. `cellInfo`'s index check and the scalar ``colOid`` guard stay
+  ## unprefixed — they judge column metadata, not the cell — and a NULL cell
+  ## that ``getStr`` already reports as "Column N is NULL" must be raised
+  ## outside the wrap so it is not doubled.
+  ##
+  ## Sibling-only: the hub keeps it out of the wholesale export.
+  try:
+    body
+  except PgTypeError as err:
+    err.msg = "Column " & $col & ": " & err.msg
+    raise err
+
 type
   RelOff* = distinct int
     ## Offset relative to the start of a slice that was passed into a binary

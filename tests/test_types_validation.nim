@@ -575,7 +575,7 @@ suite "1-D array accessors reject a mismatched wire elemOid":
     expect PgTypeError:
       discard row.getIntArray(0)
 
-  test "rejection names the accessor and both OIDs":
+  test "rejection names the column, the accessor and both OIDs":
     let bin = encodeBinaryArray(OidInt4, @[@[0'u8, 0, 0, 7]])
     let row = mkRow(@[some(bin)], @[mkField(OidInt4Array, 1)])
     var msg = ""
@@ -583,7 +583,7 @@ suite "1-D array accessors reject a mismatched wire elemOid":
       discard row.getInt64Array(0)
     except PgTypeError as e:
       msg = e.msg
-    check msg == "getInt64Array: wire elemOid=23 expected 20"
+    check msg == "Column 0: getInt64Array: wire elemOid=23 expected 20"
 
   test "getTimestampArray rejects timestamptz[]":
     let bin = encodeBinaryArray(OidTimestampTz, @[@[0'u8, 0, 0, 0, 0, 0, 0, 0]])
@@ -740,7 +740,7 @@ suite "range array accessors reject a mismatched wire elemOid":
       discard row.getDateRangeArray(0)
     except PgTypeError as e:
       msg = e.msg
-    check msg == "getDateRangeArray: wire elemOid=3904 expected 3912"
+    check msg == "Column 0: getDateRangeArray: wire elemOid=3904 expected 3912"
 
   test "getInt4RangeArray rejects daterange[]":
     let dt1 = dateTime(2023, mJan, 1, zone = utc())
@@ -1481,7 +1481,9 @@ suite "wire OID policy: a binary read needs an exact built-in match":
       discard row.getIntArray(0)
     except PgTypeError as e:
       msg = e.msg
-    check msg.startsWith("getIntArray: wire elemOid=20003 is a user-defined type")
+    check msg.startsWith(
+      "Column 0: getIntArray: wire elemOid=20003 is a user-defined type"
+    )
 
   test "getEnum accepts a dynamic colOid and rejects a stringified built-in":
     let cell = some(toBytes("happy"))
@@ -1509,7 +1511,7 @@ suite "wire OID policy: a binary read needs an exact built-in match":
     except PgTypeError as e:
       msg = e.msg
     check msg ==
-      "getEnumArray: wire elemOid=" & $OidInt4 &
+      "Column 0: getEnumArray: wire elemOid=" & $OidInt4 &
       " is not an enum (binary column type mismatch)"
 
   test "getHstore rejects a built-in colOid but takes a dynamic one":
@@ -1945,3 +1947,119 @@ suite "Out-of-contract inputs raise PgTypeError, not a Defect":
     check dt.monthday == 23
     check toString(toPgTimestampTzParam(dt).value.get) ==
       "4714-11-24 01:00:00.000000Z BC"
+
+suite "scalar payload errors carry the column number":
+  # Scalar accessors must name the failing column on both formats, including
+  # the ones that delegate to a shared decoder (uuid, interval, inet, macaddr,
+  # tsvector, tsquery, hstore, json) and the geometry length checks.
+  template msgOf(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
+  proc binRow(oid: int32, len: int): Row =
+    mkRow(@[some(newSeq[byte](len))], @[mkField(oid, 1'i16)])
+
+  proc binBytes(oid: int32, data: seq[byte]): Row =
+    mkRow(@[some(data)], @[mkField(oid, 1'i16)])
+
+  proc txtRow(oid: int32, s: string): Row =
+    mkRow(@[some(toBytes(s))], @[mkField(oid, 0'i16)])
+
+  test "geometry binary length failures name the column":
+    check msgOf(binRow(OidBit, 2).getBit(0)) ==
+      "Column 0: Invalid binary bit data: too short"
+    check msgOf(binRow(OidPoint, 8).getPoint(0)) ==
+      "Column 0: Invalid binary point length: 8"
+    check msgOf(binRow(OidLine, 8).getLine(0)) ==
+      "Column 0: Invalid binary line length: 8"
+    check msgOf(binRow(OidLseg, 8).getLseg(0)) ==
+      "Column 0: Invalid binary lseg length: 8"
+    check msgOf(binRow(OidBox, 8).getBox(0)) == "Column 0: Invalid binary box length: 8"
+    check msgOf(binRow(OidCircle, 8).getCircle(0)) ==
+      "Column 0: Invalid binary circle length: 8"
+
+  test "delegated binary decoders name the column":
+    check msgOf(binRow(OidUuid, 5).getUuid(0)) == "Column 0: uuid: bad length 5"
+    check msgOf(binRow(OidInterval, 12).getInterval(0)) ==
+      "Column 0: interval: bad length 12"
+    check msgOf(binRow(OidInet, 3).getInet(0)) ==
+      "Column 0: Binary inet data too short: 3"
+    check msgOf(binRow(OidCidr, 3).getCidr(0)) ==
+      "Column 0: Binary inet data too short: 3"
+    check msgOf(binRow(OidMacAddr, 3).getMacAddr(0)) == "Column 0: macaddr: bad length 3"
+    check msgOf(binRow(OidMacAddr8, 3).getMacAddr8(0)) ==
+      "Column 0: macaddr8: bad length 3"
+    check msgOf(binRow(OidTsVector, 3).getTsVector(0)) ==
+      "Column 0: tsvector binary data too short"
+    check msgOf(binRow(OidTsQuery, 3).getTsQuery(0)) ==
+      "Column 0: tsquery binary data too short"
+    check msgOf(binRow(90123'i32, 3).getHstore(0)) ==
+      "Column 0: hstore binary data too short"
+
+  test "json failures name the column on both formats":
+    let bin = mkRow(@[some(@[0x01'u8])], @[mkField(OidJson, 1'i16)])
+    check msgOf(bin.getJson(0)) == "Column 0: Invalid JSON (len=1)"
+    let text = mkRow(@[some(toBytes("zz"))], @[mkField(OidJson, 0'i16)])
+    check msgOf(text.getJson(0)) == "Column 0: Invalid JSON (len=2)"
+
+  test "text parse failures name the column":
+    check msgOf(txtRow(OidBit, "zz").getBit(0)) ==
+      "Column 0: Invalid bit character at offset=0 (len=2)"
+    check msgOf(txtRow(OidFloat8, "zz").getFloat(0)) ==
+      "Column 0: invalid float value (len=2)"
+    check msgOf(txtRow(OidFloat4, "zz").getFloat32(0)) ==
+      "Column 0: invalid float value (len=2)"
+    check msgOf(txtRow(OidNumeric, "zz").getNumeric(0)) ==
+      "Column 0: Invalid numeric (len=2)"
+    check msgOf(txtRow(OidMoney, "zz").getMoney(0)) ==
+      "Column 0: Invalid money format (len=2)"
+    check msgOf(txtRow(90123'i32, "zz").getHstore(0)) ==
+      "Column 0: hstore: expected '\"' (len=2, pos=0)"
+    check msgOf(txtRow(OidLine, "{1,2,zz}").getLine(0)) ==
+      "Column 0: invalid float value (len=2)"
+
+  test "binary value checks name the column, not only the length checks":
+    # These cells pass the accessor's own length guard, so only the decoder's
+    # value check rejects them; it must name the column too.
+    let inf = @[0x7F'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    let negInf = @[0x80'u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    check msgOf(binBytes(OidTimestamp, inf).getTimestamp(0)) ==
+      "Column 0: Binary timestamp is 'infinity', not representable as a DateTime"
+    check msgOf(binBytes(OidTimestampTz, negInf).getTimestampTz(0)) ==
+      "Column 0: Binary timestamp is '-infinity', not representable as a DateTime"
+    check msgOf(binBytes(OidDate, @[0x7F'u8, 0xFF, 0xFF, 0xFF]).getDate(0)) ==
+      "Column 0: Binary date is 'infinity', not representable as a DateTime"
+    let max8 = @[0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    check msgOf(binBytes(OidTime, max8).getTime(0)) ==
+      "Column 0: Binary time: microseconds out of range (expected 0..86400000000)"
+    check msgOf(binBytes(OidTimeTz, max8 & newSeq[byte](4)).getTimeTz(0)) ==
+      "Column 0: Binary timetz: microseconds out of range (expected 0..86400000000)"
+    check msgOf(binBytes(OidNumeric, newSeq[byte](9)).getNumeric(0)) ==
+      "Column 0: Numeric binary: expected length 8 got 9"
+    check msgOf(binBytes(OidBit, @[0x00'u8, 0x00, 0x00, 0x08]).getBit(0)) ==
+      "Column 0: Invalid PgBit: nbits=8 inconsistent with data.len=0"
+    check msgOf(binBytes(OidBit, @[0xFF'u8, 0xFF, 0xFF, 0xFF]).getBit(0)) ==
+      "Column 0: Invalid PgBit: negative nbits -1"
+
+  test "column number is the failing cell's own index":
+    let row = mkRow(
+      @[some(newSeq[byte](16)), some(newSeq[byte](8))],
+      @[mkField(OidPoint, 1'i16), mkField(OidPoint, 1'i16)],
+    )
+    check msgOf(row.getPoint(0)).len == 0
+    check msgOf(row.getPoint(1)) == "Column 1: Invalid binary point length: 8"
+
+  test "NULL cells stay single-prefixed on the wrapped paths":
+    check msgOf(mkRow(@[none(seq[byte])], @[mkField(OidUuid, 1'i16)]).getUuid(0)) ==
+      "Column 0 is NULL"
+    check msgOf(mkRow(@[none(seq[byte])], @[mkField(OidBit, 0'i16)]).getBit(0)) ==
+      "Column 0 is NULL"
+    check msgOf(mkRow(@[none(seq[byte])], @[mkField(OidFloat8, 0'i16)]).getFloat(0)) ==
+      "Column 0 is NULL"
+    check msgOf(mkRow(@[none(seq[byte])], @[mkField(90123'i32, 0'i16)]).getHstore(0)) ==
+      "Column 0 is NULL"
