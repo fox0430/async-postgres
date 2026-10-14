@@ -471,6 +471,7 @@ async_postgres/pg_types/core.nim	pgParseInt32
 async_postgres/pg_types/core.nim	pgParseIntView
 async_postgres/pg_types/core.nim	pgParseUIntField
 async_postgres/pg_types/core.nim	pgTypeErrorOnValueError
+async_postgres/pg_types/core.nim	withColumnContext
 async_postgres/pg_types/decoding.nim	decodeBinaryArray
 async_postgres/pg_types/decoding.nim	decodeBinaryComposite
 async_postgres/pg_types/decoding.nim	decodeBinaryDate

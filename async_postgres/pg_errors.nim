@@ -50,6 +50,12 @@ type
     ## Decode-failure messages report input lengths/offsets only, never the
     ## content (cells may hold PII or secrets), with positions written as
     ## ``(len=…, pos=…)`` where ``pos`` is a 0-based byte offset into the input.
+    ##
+    ## A column accessor reports the cell it was given as "Column N: " (0-based)
+    ## for the failures it attributes to that cell: a NULL cell, a malformed
+    ## payload, or a wire element OID the payload carries (``wire elemOid=``).
+    ## A mismatch judged from the column description instead (``wire colOid=``)
+    ## names the accessor only.
 
   PgMessageTooLargeError* = object of PgTypeError
     ## An assembled protocol message exceeds the wire format's Int32 length.
