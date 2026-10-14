@@ -148,3 +148,75 @@ suite "query: mock round trip":
       await ms.closeServer()
 
     waitFor t()
+
+  test "a DataRow before RowDescription fails closed":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        await drainOneExtended(client)
+        # A non-conforming peer: the row arrives before the RowDescription that
+        # must precede it. Without the guard the row is counted into a nil
+        # `QueryResult.data`, which `queryValue` then dereferences.
+        var reply = buildBackendMsg('1', @[]) & buildBackendMsg('2', @[])
+        reply.add(buildDataRowText(["1"]))
+        reply.add(buildCommandComplete("SELECT 1"))
+        reply.add(buildReadyForQuery('I'))
+        await client.sendBytes(reply)
+        # The client retires the connection, so it closes without a Terminate.
+        await closeClient(client)
+
+      let serverFut = serve()
+      let conn = await connect(mockConfig(ms.port))
+      var raised = false
+      try:
+        discard await conn.queryValue("SELECT 1")
+      except PgProtocolError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csClosed
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "a DataRow before RowDescription cannot vanish inside queryEach":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        await drainOneExtended(client)
+        var reply = buildBackendMsg('1', @[]) & buildBackendMsg('2', @[])
+        reply.add(buildDataRowText(["dropped"]))
+        reply.add(buildCommandComplete("SELECT 1"))
+        reply.add(buildReadyForQuery('I'))
+        await client.sendBytes(reply)
+        await closeClient(client)
+
+      let serverFut = serve()
+      let conn = await connect(mockConfig(ms.port))
+      var seen: seq[string]
+      var raised = false
+      try:
+        discard await conn.queryEach(
+          "SELECT 1",
+          @[],
+          proc(r: Row) {.gcsafe, raises: [CatchableError].} =
+            seen.add(r.getStr(0)),
+        )
+      except PgProtocolError:
+        raised = true
+      doAssert raised
+      doAssert seen.len == 0
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
