@@ -85,6 +85,12 @@ macro pgEnum*(T: untyped): untyped =
   ## Generate ``toPgParam`` overloads for a Nim enum type and its array forms.
   ## OIDs are 0 (unspecified) so PostgreSQL infers the type from context
   ## (use ``$1::mytype`` / ``$1::mytype[]`` in the SQL).
+  ## The generated overloads live in the calling module, where the ``sql``
+  ## macro and ``pgParams`` cannot resolve them: pass ``@[toPgParam(v)]`` to any
+  ## call that takes a ``seq[PgParam]`` (``query``, ``exec``, ``queryRow``,
+  ## ``queryValue``, ``queryEach``, ``openCursor``, their ``pool.*`` variants)
+  ## instead. ``queryDirect`` / ``execDirect`` take their parameters as
+  ## separate arguments and cannot encode these types.
   result = newStmtList(newCall(bindSym"checkPgEnumType", T))
   result.add quote do:
     proc toPgParam*(v: `T`): PgParam =
@@ -418,6 +424,12 @@ macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
   ## match the composite's attribute order. Neither wire format carries names,
   ## so a swap of same-typed fields is not detected.
   ## When OID is 0 (default), PostgreSQL infers the type from context.
+  ## The generated overload lives in the calling module, where the ``sql``
+  ## macro and ``pgParams`` cannot resolve it: pass ``@[toPgParam(v)]`` to any
+  ## call that takes a ``seq[PgParam]`` (``query``, ``exec``, ``queryRow``,
+  ## ``queryValue``, ``queryEach``, ``openCursor``, their ``pool.*`` variants)
+  ## instead. ``queryDirect`` / ``execDirect`` take their parameters as
+  ## separate arguments and cannot encode these types.
   let tImpl = T.getType[1]
   let tSym = tImpl
   result = newStmtList()
@@ -635,6 +647,12 @@ macro pgDomain*(T: typedesc, Base: typedesc, oid: int32 = 0'i32): untyped =
   ## (a domain over another domain) must be one ``T`` is declared from:
   ## ``type T = distinct Base``.
   ## When OID is 0 (default), the base type's OID is used.
+  ## The generated overload lives in the calling module, where the ``sql``
+  ## macro and ``pgParams`` cannot resolve it: pass ``@[toPgParam(v)]`` to any
+  ## call that takes a ``seq[PgParam]`` (``query``, ``exec``, ``queryRow``,
+  ## ``queryValue``, ``queryEach``, ``openCursor``, their ``pool.*`` variants)
+  ## instead. ``queryDirect`` / ``execDirect`` take their parameters as
+  ## separate arguments and cannot encode these types.
   let tSym = T.getType[1]
   let bSym = Base.getType[1]
   result = newStmtList(newCall(bindSym"checkPgDomainTypes", T, Base))
