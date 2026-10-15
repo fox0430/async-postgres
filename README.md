@@ -52,6 +52,15 @@ Async PostgreSQL client in Nim.
 - hstore type (`PgHstore` — extension; requires `lookupTypeOids` for binary encoding)
 - XML type (`PgXml`)
 
+Parameter values of types built with the `pgEnum`, `pgDomain` and `pgComposite`
+macros are passed differently: the `toPgParam` those macros generate lives in
+the calling module, where `sql"…{v}…"` and `pgParams(v)` cannot see it. Pass
+`@[toPgParam(v)]` to any call that takes a `seq[PgParam]` — `query`, `exec`,
+`queryRow`, `queryValue`, `queryEach`, `openCursor`, the other `query*` helpers,
+their `pool.*` variants — instead, and cast the placeholder (`$1::mytype`) when
+the client does not know the type's OID. `queryDirect` / `execDirect` take their
+parameters as separate arguments and cannot encode these types.
+
 ### Performance
 - Automatic binary format selection for known-safe types
 - Compile-time binary format lookup tables
@@ -152,6 +161,14 @@ choosing a backend:
 The [API docs](https://fox0430.github.io/async-postgres/async_postgres.html#async-backend)
 list every TLS difference and the downgrade notices, which go to stderr only
 (not to `PgTracer`) and cannot be suppressed.
+
+`sslrootcert` reaches the trust store only under `sslmode=verify-ca` /
+`verify-full`. Under `require` (and `allow` / `prefer`) the server certificate
+is accepted without verification even when a CA is configured; libpq instead
+loads the file whenever it exists and verifies against it even under `require`
+(host-name matching still needs `verify-full`). A DSN's `sslrootcert=` is read
+while the DSN is parsed, whatever the mode, so a missing or unreadable file
+fails there as a `PgConfigError` — `ConnConfig.sslRootCert` holds the PEM.
 
 Client certificate authentication (mTLS) is enabled by setting `sslCert` and
 `sslKey` on `ConnConfig` (or `sslcert=` / `sslkey=` in a DSN, which load the

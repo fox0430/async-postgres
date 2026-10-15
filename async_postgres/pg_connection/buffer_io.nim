@@ -540,9 +540,18 @@ proc nextMessage*(
   ## DataRow would dereference nil, so the missing slot is rejected up front
   ## with ``PgProtocolError`` (the connection is left open — unlike wire
   ## corruption, this is a caller bug, not a broken peer).
+  ##
+  ## A DataRow with no ``rowData`` to land in is a `PgProtocolError` when the
+  ## caller asked for rows (``onRow`` or ``rowCount``), ``skipDataRow`` or not:
+  ## a described result always precedes its rows, and a row the caller cannot
+  ## read must not be counted as if it had been. With no row sink at all the
+  ## decoded message is returned instead; ``skipDataRow`` frames the row without
+  ## decoding it.
   if onRow != nil and onRowError == nil:
     raise newException(PgProtocolError, "nextMessage: onRow requires onRowError")
   let maxLen = conn.effectiveMaxMessageSize()
+  # An explicit skip with no row sink at all: DataRows are framed and dropped.
+  let skipRows = skipDataRow and rowData == nil and onRow == nil and rowCount == nil
   while true:
     var consumed: int
     let res =
@@ -552,7 +561,7 @@ proc nextMessage*(
           consumed,
           rowData,
           maxLen,
-          skipDataRow = skipDataRow and rowData == nil and onRow == nil,
+          skipDataRow = skipRows,
         )
       except PgProtocolError as e:
         conn.markClosed()
@@ -594,9 +603,16 @@ proc nextMessage*(
       let m = res.message
       conn.noteNegotiatedProtocol(m.newestMinorVersion, m.unrecognizedOptions)
       continue
-    if res.message.kind == bmkDataRow and rowCount != nil:
-      rowCount[] += 1
-      continue
+    if res.message.kind == bmkDataRow:
+      # Reached only with no RowData and no skip: a described result is parsed
+      # in place above, and a skipped row comes back as `psDataRow`. So a row
+      # sink here means the row arrived before the peer described the result —
+      # counting it would hand the caller a `rowCount` its nil `data` cannot
+      # back (fail closed).
+      if onRow != nil or rowCount != nil:
+        conn.markClosed()
+        raise newException(PgProtocolError, "DataRow received before RowDescription")
+      # No sink: the caller reads the wire itself, so hand over the message.
     if res.message.kind == bmkCommandComplete:
       conn.noteCommandTag(res.message.commandTag)
     if res.message.kind == bmkErrorResponse and

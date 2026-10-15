@@ -59,6 +59,14 @@ proc mockConfig(port: int): ConnConfig =
 proc toPooled(conn: PgConnection): PooledConn =
   PooledConn(conn: conn, lastUsedAt: Moment.now())
 
+when hasAsyncDispatch:
+  from std/os import sleep
+
+  proc blockPast(deadline: Moment) =
+    ## Block the event loop until `deadline` has passed, so every timer due by
+    ## then fires in the next poll, in deadline order.
+    sleep(max(0, toMilliseconds(deadline - Moment.now())) + 50)
+
 proc release(pool: PgPool, conn: PgConnection) =
   ## Test-only shim that wires `ownerPool` on throw-away mock connections and
   ## marks them checked out (mirroring an `acquire`) before delegating to the
@@ -1508,6 +1516,44 @@ suite "Pool transaction and pipeline macros":
       await closeServer(ms)
 
     waitFor t()
+
+  when hasAsyncDispatch:
+    test "withTransactionDeadline reports a body that fails on the deadline's tick":
+      # The body fails after `wait` saw the timeout but before it resumed. The
+      # default orphan hook cleared that failure, so the timeout handler took
+      # the body for completed and the macro returned as if it had succeeded.
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let log = new seq[string]
+        # 'I' after BEGIN: the body's failure then needs no ROLLBACK or reset
+        # round trip, so the body future fails on the tick the body resumes.
+        let serverFut = serveScript(ms, @[simpleOk("BEGIN", 'I')], log)
+        let pool = await scriptedPool(ms)
+        let deadline = milliseconds(300)
+        {.push warning[UnreachableCode]: off.}
+        proc run() {.async.} =
+          let start = Moment.now()
+          pool.withTransactionDeadline(txConn, deadline):
+            blockPast(start + deadline)
+            await sleepMsAsync(0) # due after the deadline's timer
+            raise newException(ValueError, "boom")
+
+        {.pop.}
+        var caught: ref CatchableError
+        try:
+          await run().wait(seconds(5))
+        except CatchableError as e:
+          caught = e
+        doAssert caught of PgTimeoutError,
+          (if caught == nil: "no error" else: caught.msg)
+        doAssert log[] == @["BEGIN"], $log[]
+        doAssert pool.active == 0
+
+        await pool.close()
+        await serverFut.wait(seconds(5))
+        await closeServer(ms)
+
+      waitFor t()
 
   test "withPipeline runs the batch on one connection and releases it":
     proc t() {.async.} =
@@ -3026,6 +3072,39 @@ suite "Acquire timeout":
       doAssert pool.waiterCount == 0
 
     waitFor t()
+
+  when hasAsyncDispatch:
+    test "a waiter failed on the tick its acquire times out raises the timeout":
+      # The failure lands after `wait` saw the timeout but before it resumed.
+      # The default orphan hook cleared it there, so the abandon path read the
+      # waiter as handed a (nil) connection.
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(30)
+        pool.active = 1
+
+        let acquireFut = pool.acquire()
+        doAssert pool.waiterCount == 1
+        let waiter = pool.waiters.peekFirst()
+        proc failWaiter() {.async.} =
+          await sleepMsAsync(30) # due after the acquire's timer
+          doAssert pool.failLastWaiter(newException(PgConnectionError, "dial failed"))
+
+        let failFut = failWaiter()
+        blockPast(Moment.now() + milliseconds(30))
+        var caught: ref CatchableError
+        try:
+          discard await acquireFut
+        except CatchableError as e:
+          caught = e
+        doAssert caught of PgPoolError and
+          (ref PgPoolError)(caught).kind == pekAcquireTimeout,
+          (if caught == nil: "no error" else: caught.msg)
+        doAssert waiter.fut.failed
+        doAssert pool.waiterCount == 0
+        await failFut
+
+      waitFor t()
 
   test "acquire without timeout waits indefinitely":
     proc t() {.async.} =

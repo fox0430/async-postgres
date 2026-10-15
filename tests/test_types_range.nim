@@ -1376,3 +1376,57 @@ suite "range array element errors carry the column number":
     let row = mkRow(@[none(seq[byte])], @[mkField(OidInt4RangeArray, 1)])
     check msgOf(row.getInt4RangeArray(0)) == "Column 0 is NULL"
     check msgOf(row.getInt4MultirangeArray(0)) == "Column 0 is NULL"
+    let scalar = mkRow(@[none(seq[byte])], @[mkField(OidInt4Range, 1)])
+    check msgOf(scalar.getInt4Range(0)) == "Column 0 is NULL"
+    let scalarMulti = mkRow(@[none(seq[byte])], @[mkField(OidInt4Multirange, 1)])
+    check msgOf(scalarMulti.getInt4Multirange(0)) == "Column 0 is NULL"
+
+  test "a malformed binary array header names the column":
+    let row = mkRow(@[some(newSeq[byte](8))], @[mkField(OidInt4RangeArray, 1)])
+    check msgOf(row.getInt4RangeArray(0)) == "Column 0: Binary array too short"
+    let multi = mkRow(@[some(newSeq[byte](8))], @[mkField(OidInt4MultirangeArray, 1)])
+    check msgOf(multi.getInt4MultirangeArray(0)) == "Column 0: Binary array too short"
+
+  test "a multi-dimensional payload names the column":
+    let twoDim = encodeBinaryArray(
+      OidInt4Range,
+      @[2'i32, 1'i32],
+      @[1'i32, 1'i32],
+      @[some(@(toBE32(1'i32))), some(@(toBE32(2'i32)))],
+    )
+    let row = mkRow(@[some(twoDim)], @[mkField(OidInt4RangeArray, 1)])
+    check msgOf(row.getInt4RangeArray(0)).startsWith(
+      "Column 0: Multi-dimensional array"
+    )
+    let multi = mkRow(@[some(twoDim)], @[mkField(OidInt4MultirangeArray, 1)])
+    check msgOf(multi.getInt4MultirangeArray(0)).startsWith(
+      "Column 0: Multi-dimensional array"
+    )
+
+  test "scalar range and multirange payload failures name the column":
+    # The array getters above already prefix the same decoders.
+    let bin = mkRow(@[some(newSeq[byte](0))], @[mkField(OidInt4Range, 1'i16)])
+    check msgOf(bin.getInt4Range(0)) == "Column 0: Binary range too short"
+    let binMulti = mkRow(@[some(newSeq[byte](0))], @[mkField(OidInt4Multirange, 1'i16)])
+    check msgOf(binMulti.getInt4Multirange(0)) == "Column 0: Binary multirange too short"
+    let text: Row = @[some(toBytes("zz"))]
+    check msgOf(text.getInt4Range(0)) == "Column 0: Invalid range literal (len=2)"
+    let textMulti: Row = @[some(toBytes("zz"))]
+    check msgOf(textMulti.getInt4Multirange(0)) ==
+      "Column 0: Invalid multirange literal (len=2)"
+
+  test "a bad range inside a scalar multirange names the column":
+    # count=1, one 1-byte range: flags = 0 asks for a lower bound the payload
+    # does not carry, so the inner range decoder rejects it.
+    let payload = @[0x00'u8, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00]
+    let row = mkRow(@[some(payload)], @[mkField(OidInt4Multirange, 1'i16)])
+    check msgOf(row.getInt4Multirange(0)) ==
+      "Column 0: Binary range truncated at lower bound length"
+
+  test "a scalar payload failure on another column names that column":
+    let row = mkRow(
+      @[some(toBytes("[1,2]")), some(toBytes("zz"))],
+      @[mkField(OidInt4Range, 0'i16), mkField(OidInt4Range, 0'i16)],
+    )
+    check msgOf(row.getInt4Range(0)).len == 0
+    check msgOf(row.getInt4Range(1)) == "Column 1: Invalid range literal (len=2)"

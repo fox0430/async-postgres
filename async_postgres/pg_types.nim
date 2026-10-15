@@ -10,7 +10,7 @@ export core except
   isPgHexText, isPgIntText, isPgUIntText, pgParseBiggestInt, pgParseBiggestIntView,
   pgParseFloat, pgParseFloat32, pgParseHexInt, pgParseHexUInt32, pgParseInt,
   pgParseInt16, pgParseInt32, pgParseIntView, pgParseUIntField, parsePgBoolText,
-  pgTypeErrorOnValueError
+  pgTypeErrorOnValueError, withColumnContext
 # `array` (PgArray + shape validation) and `user_types` (enum/composite/domain
 # macros) likewise expose only public API.
 export array

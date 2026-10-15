@@ -50,6 +50,12 @@ type
     ## Decode-failure messages report input lengths/offsets only, never the
     ## content (cells may hold PII or secrets), with positions written as
     ## ``(len=…, pos=…)`` where ``pos`` is a 0-based byte offset into the input.
+    ##
+    ## A column accessor reports the cell it was given as "Column N: " (0-based)
+    ## for the failures it attributes to that cell: a NULL cell, a malformed
+    ## payload, or a wire element OID the payload carries (``wire elemOid=``).
+    ## A mismatch judged from the column description instead (``wire colOid=``)
+    ## names the accessor only.
 
   PgMessageTooLargeError* = object of PgTypeError
     ## An assembled protocol message exceeds the wire format's Int32 length.
@@ -153,9 +159,12 @@ type
   PgTimeoutError* = object of PgConnectionError
     ## Raised when an operation times out.
     ##
-    ## A timeout on a query/exec/copy/prepare/transaction marks the connection
-    ## ``csClosed`` (the wire may be mid-exchange), hence ``PgConnectionError``.
-    ## ``waitNotification`` and an acquire timeout inside
+    ## A timeout on a query/exec/copy/prepare retires the connection
+    ## (``csClosed``) unless the wire had settled (asyncdispatch always retires,
+    ## leaving the timed-out operation on the socket); a transaction deadline
+    ## retires whenever the body may still be running, whatever the wire looks
+    ## like. Either is reported as a ``PgConnectionError`` so a reconnect loop
+    ## handles it. ``waitNotification`` and an acquire timeout inside
     ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` leave the
     ## connection usable; catch ``PgTimeoutError`` before ``PgConnectionError``
     ## to tell them apart.

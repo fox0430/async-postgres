@@ -404,6 +404,15 @@ suite "Composite binary encoder/decoder":
     check decoded.len == 0
 
 suite "User-defined composite":
+  template msgOf(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
   test "pgComposite generates toPgParam with OID 0":
     let p = toPgParam(PointRecord(x: 1.5, y: 2.5))
     check p.oid == 0'i32
@@ -783,6 +792,43 @@ suite "User-defined composite":
     let row = mkRow(@[some(data)], fields)
     let got = getComposite[NameFieldRecord](row, 0)
     check got.name == "alice"
+
+  test "getComposite payload failures name the column":
+    let text: Row = @[some(toBytes("(1.0,2.0)")), some(toBytes("zz"))]
+    check msgOf(getComposite[PointRecord](text, 1)) ==
+      "Column 1: Invalid composite literal (len=2)"
+
+    let short = @[(oid: OidText, data: some(toBytes("Grace")))]
+    let shortRow =
+      mkRow(@[some(encodeBinaryComposite(short))], @[mkField(0'i32, 1'i16)])
+    check msgOf(getComposite[WideIntRecord](shortRow, 0)) ==
+      "Column 0: Binary composite has fewer fields than object"
+
+    let wide = @[
+      (oid: OidText, data: some(toBytes("Grace"))),
+      (oid: 0'i32, data: some(@(toBE64(1'i64)))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+    ]
+    let wideRow =
+      mkRow(@[some(encodeBinaryComposite(wide))], @[mkField(50000'i32, 1'i16)])
+    check msgOf(getComposite[PersonRecord](wideRow, 0)) ==
+      "Column 0: Composite binary field length 8 does not match int32 (expected 4)"
+
+    let wrongOid = @[
+      (oid: OidText, data: some(toBytes("Grace"))),
+      (oid: OidInt8, data: some(@(toBE64(1'i64)))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+    ]
+    let wrongOidRow =
+      mkRow(@[some(encodeBinaryComposite(wrongOid))], @[mkField(50000'i32, 1'i16)])
+    check msgOf(getComposite[PersonRecord](wrongOidRow, 0)) ==
+      "Column 0: Composite binary field OID 20 incompatible with Nim int32"
+
+  test "NULL composite cells stay single-prefixed":
+    let row = mkRow(@[none(seq[byte])], @[mkField(0'i32, 0'i16)])
+    check msgOf(getComposite[PointRecord](row, 0)) == "Column 0 is NULL"
+    let bin = mkRow(@[none(seq[byte])], @[mkField(0'i32, 1'i16)])
+    check msgOf(getComposite[PointRecord](bin, 0)) == "Column 0 is NULL"
 
 suite "User-defined domain":
   test "pgDomain rejects a type its overload would recurse on":

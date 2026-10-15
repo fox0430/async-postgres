@@ -85,6 +85,12 @@ macro pgEnum*(T: untyped): untyped =
   ## Generate ``toPgParam`` overloads for a Nim enum type and its array forms.
   ## OIDs are 0 (unspecified) so PostgreSQL infers the type from context
   ## (use ``$1::mytype`` / ``$1::mytype[]`` in the SQL).
+  ## The generated overloads live in the calling module, where the ``sql``
+  ## macro and ``pgParams`` cannot resolve them: pass ``@[toPgParam(v)]`` to any
+  ## call that takes a ``seq[PgParam]`` (``query``, ``exec``, ``queryRow``,
+  ## ``queryValue``, ``queryEach``, ``openCursor``, their ``pool.*`` variants)
+  ## instead. ``queryDirect`` / ``execDirect`` take their parameters as
+  ## separate arguments and cannot encode these types.
   result = newStmtList(newCall(bindSym"checkPgEnumType", T))
   result.add quote do:
     proc toPgParam*(v: `T`): PgParam =
@@ -194,10 +200,7 @@ proc getEnum*[T: enum](row: Row, col: int): T =
   if row.isBinaryCol(col) and not row.isNull(col):
     checkEnumColOid("getEnum", row, col)
   let s = row.getStr(col)
-  try:
-    pgParseEnum[T](s)
-  except PgTypeError as e:
-    raise newException(PgTypeError, "Column " & $col & ": " & e.msg)
+  withColumnContext(col, pgParseEnum[T](s))
 
 proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
   ## Read a PostgreSQL enum column as ``Option[T]``. Returns none if NULL.
@@ -207,16 +210,6 @@ proc getEnumOpt*[T: enum](row: Row, col: int): Option[T] =
   else:
     some(getEnum[T](row, col))
 
-template withColumnContext(col: int, body: untyped) =
-  ## Prefix a `PgTypeError` escaping `body` with the column number, matching the
-  ## array accessors in `accessors`. Mutates and re-raises the caught exception
-  ## so its identity and parent chain survive.
-  try:
-    body
-  except PgTypeError as err:
-    err.msg = "Column " & $col & ": " & err.msg
-    raise err
-
 proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
   ## Read a PostgreSQL ``enum[]`` column as ``seq[T]``.
   ## Raises ``PgTypeError`` on NULL column or NULL element.
@@ -224,9 +217,11 @@ proc getEnumArray*[T: enum](row: Row, col: int): seq[T] =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    checkEnumArrayElemOid("getEnumArray", decoded.elemOid)
+    let decoded = withColumnContext(
+      col, decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    )
+    withColumnContext(col, rejectMultiDim(decoded))
+    withColumnContext(col, checkEnumArrayElemOid("getEnumArray", decoded.elemOid))
     result = newSeq[T](decoded.elements.len)
     withColumnContext(col):
       for i, e in decoded.elements:
@@ -254,9 +249,13 @@ proc getEnumArrayElemOpt*[T: enum](row: Row, col: int): seq[Option[T]] =
     let (off, clen) = cellInfo(row, col)
     if clen == -1:
       raise newException(PgTypeError, "Column " & $col & " is NULL")
-    let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-    rejectMultiDim(decoded)
-    checkEnumArrayElemOid("getEnumArrayElemOpt", decoded.elemOid)
+    let decoded = withColumnContext(
+      col, decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    )
+    withColumnContext(col, rejectMultiDim(decoded))
+    withColumnContext(
+      col, checkEnumArrayElemOid("getEnumArrayElemOpt", decoded.elemOid)
+    )
     result = newSeq[Option[T]](decoded.elements.len)
     withColumnContext(col):
       for i, e in decoded.elements:
@@ -425,6 +424,12 @@ macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
   ## match the composite's attribute order. Neither wire format carries names,
   ## so a swap of same-typed fields is not detected.
   ## When OID is 0 (default), PostgreSQL infers the type from context.
+  ## The generated overload lives in the calling module, where the ``sql``
+  ## macro and ``pgParams`` cannot resolve it: pass ``@[toPgParam(v)]`` to any
+  ## call that takes a ``seq[PgParam]`` (``query``, ``exec``, ``queryRow``,
+  ## ``queryValue``, ``queryEach``, ``openCursor``, their ``pool.*`` variants)
+  ## instead. ``queryDirect`` / ``execDirect`` take their parameters as
+  ## separate arguments and cannot encode these types.
   let tImpl = T.getType[1]
   let tSym = tImpl
   result = newStmtList()
@@ -547,53 +552,59 @@ proc getComposite*[T: object](row: Row, col: int): T =
     raise newException(PgTypeError, "Column " & $col & " is NULL")
   if row.isBinaryCol(col):
     let (off, clen) = cellInfo(row, col)
-    let decoded = decodeBinaryComposite(row.data.buf.toOpenArray(off, off + clen - 1))
+    let decoded = withColumnContext(
+      col, decodeBinaryComposite(row.data.buf.toOpenArray(off, off + clen - 1))
+    )
     var idx = 0
-    for _, val in result.fieldPairs:
-      if idx >= decoded.len:
-        raise newException(PgTypeError, "Binary composite has fewer fields than object")
-      let f = decoded[idx]
-      let fOff = off + f.off
-      let fEnd = fOff + f.len - 1
-      when typeof(val) is Option:
-        if f.len == -1:
-          val = none(typeof(val.get))
-        else:
-          var inner: typeof(val.get)
-          decodeBinaryField(inner, row.data.buf, f.oid, fOff, fEnd, f.len)
-          val = some(inner)
-      else:
-        if f.len == -1:
+    withColumnContext(col):
+      for _, val in result.fieldPairs:
+        if idx >= decoded.len:
           raise
-            newException(PgTypeError, "NULL field in binary composite at index " & $idx)
-        decodeBinaryField(val, row.data.buf, f.oid, fOff, fEnd, f.len)
-      idx += 1
-    if idx != decoded.len:
-      raise newException(
-        PgTypeError,
-        "Binary composite has " & $decoded.len & " fields but object has " & $idx,
-      )
+            newException(PgTypeError, "Binary composite has fewer fields than object")
+        let f = decoded[idx]
+        let fOff = off + f.off
+        let fEnd = fOff + f.len - 1
+        when typeof(val) is Option:
+          if f.len == -1:
+            val = none(typeof(val.get))
+          else:
+            var inner: typeof(val.get)
+            decodeBinaryField(inner, row.data.buf, f.oid, fOff, fEnd, f.len)
+            val = some(inner)
+        else:
+          if f.len == -1:
+            raise newException(
+              PgTypeError, "NULL field in binary composite at index " & $idx
+            )
+          decodeBinaryField(val, row.data.buf, f.oid, fOff, fEnd, f.len)
+        idx += 1
+      if idx != decoded.len:
+        raise newException(
+          PgTypeError,
+          "Binary composite has " & $decoded.len & " fields but object has " & $idx,
+        )
     return
   let s = row.getStr(col)
-  let parts = parseCompositeText(s)
+  let parts = withColumnContext(col, parseCompositeText(s))
   var idx = 0
-  for _, val in result.fieldPairs:
-    if idx >= parts.len:
-      raise newException(PgTypeError, "Composite has fewer fields than object")
-    when typeof(val) is Option:
-      if parts[idx].isNone:
-        val = none(typeof(val.get))
+  withColumnContext(col):
+    for _, val in result.fieldPairs:
+      if idx >= parts.len:
+        raise newException(PgTypeError, "Composite has fewer fields than object")
+      when typeof(val) is Option:
+        if parts[idx].isNone:
+          val = none(typeof(val.get))
+        else:
+          val = some(compositeFieldFromText[typeof(val.get)](parts[idx].get))
       else:
-        val = some(compositeFieldFromText[typeof(val.get)](parts[idx].get))
-    else:
-      if parts[idx].isNone:
-        raise newException(PgTypeError, "NULL field in composite at index " & $idx)
-      val = compositeFieldFromText[typeof(val)](parts[idx].get)
-    idx += 1
-  if idx != parts.len:
-    raise newException(
-      PgTypeError, "Composite has " & $parts.len & " fields but object has " & $idx
-    )
+        if parts[idx].isNone:
+          raise newException(PgTypeError, "NULL field in composite at index " & $idx)
+        val = compositeFieldFromText[typeof(val)](parts[idx].get)
+      idx += 1
+    if idx != parts.len:
+      raise newException(
+        PgTypeError, "Composite has " & $parts.len & " fields but object has " & $idx
+      )
 
 proc getCompositeOpt*[T: object](row: Row, col: int): Option[T] =
   ## NULL-safe version of ``getComposite``.
@@ -636,6 +647,12 @@ macro pgDomain*(T: typedesc, Base: typedesc, oid: int32 = 0'i32): untyped =
   ## (a domain over another domain) must be one ``T`` is declared from:
   ## ``type T = distinct Base``.
   ## When OID is 0 (default), the base type's OID is used.
+  ## The generated overload lives in the calling module, where the ``sql``
+  ## macro and ``pgParams`` cannot resolve it: pass ``@[toPgParam(v)]`` to any
+  ## call that takes a ``seq[PgParam]`` (``query``, ``exec``, ``queryRow``,
+  ## ``queryValue``, ``queryEach``, ``openCursor``, their ``pool.*`` variants)
+  ## instead. ``queryDirect`` / ``execDirect`` take their parameters as
+  ## separate arguments and cannot encode these types.
   let tSym = T.getType[1]
   let bSym = Base.getType[1]
   result = newStmtList(newCall(bindSym"checkPgDomainTypes", T, Base))

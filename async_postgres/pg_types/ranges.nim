@@ -724,9 +724,10 @@ template genRangeGetter(
       let (off, clen) = cellInfo(row, col)
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
-      return decodeBin(row.data.buf.toOpenArray(off, off + clen - 1))
+      return
+        withColumnContext(col, decodeBin(row.data.buf.toOpenArray(off, off + clen - 1)))
     let s = row.getStr(col)
-    parseRangeText[T](s, parseElem)
+    withColumnContext(col, parseRangeText[T](s, parseElem))
 
 genRangeGetter(getInt4Range, int32, OidInt4Range, decodeInt4RangeBinary, pgParseInt32)
 genRangeGetter(
@@ -1182,15 +1183,17 @@ template genMultirangeGetter(
       let (off, clen) = cellInfo(row, col)
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let parts =
-        decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+      let parts = withColumnContext(
+        col, decodeMultirangeBinaryRaw(row.data.buf.toOpenArray(off, off + clen - 1))
+      )
       var ranges = newSeq[PgRange[T]](parts.len)
-      for i, p in parts:
-        ranges[i] =
-          decodeBin(row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1))
+      withColumnContext(col):
+        for i, p in parts:
+          ranges[i] =
+            decodeBin(row.data.buf.toOpenArray(off + p.off, off + p.off + p.len - 1))
       return PgMultirange[T](ranges)
     let s = row.getStr(col)
-    parseMultirangeText[T](s, parseElem)
+    withColumnContext(col, parseMultirangeText[T](s, parseElem))
 
 genMultirangeGetter(
   getInt4Multirange, int32, OidInt4Multirange, decodeInt4RangeBinary, pgParseInt32
@@ -1223,16 +1226,6 @@ optAccessor(getDateMultirange, getDateMultirangeOpt, PgMultirange[DateTime])
 
 # Multirange array type support
 
-template withColumnContext(col: int, body: untyped) =
-  ## Prefix a `PgTypeError` escaping `body` with the column number, matching the
-  ## array accessors in `accessors`. Mutates and re-raises the caught exception
-  ## so its identity and parent chain survive.
-  try:
-    body
-  except PgTypeError as err:
-    err.msg = "Column " & $col & ": " & err.msg
-    raise err
-
 template genMultirangeArrayGetter(
     name: untyped, T: typedesc, expectedOid: int32, decodeBin, parseElem: untyped
 ) =
@@ -1241,9 +1234,13 @@ template genMultirangeArrayGetter(
       let (off, clen) = cellInfo(row, col)
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      rejectMultiDim(decoded)
-      checkArrayElemOid(astToStr(name), decoded.elemOid, [expectedOid])
+      let decoded = withColumnContext(
+        col, decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      )
+      withColumnContext(col, rejectMultiDim(decoded))
+      withColumnContext(
+        col, checkArrayElemOid(astToStr(name), decoded.elemOid, [expectedOid])
+      )
       result = newSeq[PgMultirange[T]](decoded.elements.len)
       withColumnContext(col):
         for i, e in decoded.elements:
@@ -1315,9 +1312,13 @@ template genRangeArrayGetter(
       let (off, clen) = cellInfo(row, col)
       if clen == -1:
         raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let decoded = decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      rejectMultiDim(decoded)
-      checkArrayElemOid(astToStr(name), decoded.elemOid, [expectedOid])
+      let decoded = withColumnContext(
+        col, decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+      )
+      withColumnContext(col, rejectMultiDim(decoded))
+      withColumnContext(
+        col, checkArrayElemOid(astToStr(name), decoded.elemOid, [expectedOid])
+      )
       result = newSeq[PgRange[T]](decoded.elements.len)
       withColumnContext(col):
         for i, e in decoded.elements:

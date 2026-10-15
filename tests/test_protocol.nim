@@ -2023,7 +2023,7 @@ suite "nextMessage skipDataRow":
     check opt.get.kind == bmkCommandComplete
     check conn.recvBufStart == row1.len + row2.len + cc.len
 
-  test "skipDataRow=true still increments rowCount":
+  test "skipDataRow=true with a rowCount sink fails closed":
     var conn = mockConn()
     let row1 = buildDataRowMsg(["a"])
     let row2 = buildDataRowMsg(["bb"])
@@ -2032,10 +2032,12 @@ suite "nextMessage skipDataRow":
     conn.recvBufStart = 0
 
     var count: int32 = 0
-    let opt = conn.nextMessage(rowCount = addr count, skipDataRow = true)
-    check opt.isSome
-    check opt.get.kind == bmkCommandComplete
-    check count == 2
+    # A skip frames the row without decoding it, so the count would have no
+    # `data` behind it: rejected like any other row sink without a RowData.
+    expect PgProtocolError:
+      discard conn.nextMessage(rowCount = addr count, skipDataRow = true)
+    check count == 0
+    check conn.state == csClosed
 
   test "skipDataRow gated when rowData is provided — row is decoded":
     var conn = mockConn()
@@ -2052,6 +2054,47 @@ suite "nextMessage skipDataRow":
     check count == 1
     check rd.cellIndex.len == 2 # 1 column * (offset, length)
     check rd.cellIndex[1] == 2'i32 # "hi" length
+    check conn.recvBufStart == row.len
+
+  test "rowCount sink with no RowData fails closed instead of counting":
+    var conn = mockConn()
+    let row = buildDataRowMsg(["hello"])
+    let cc = buildCommandComplete("SELECT 1")
+    conn.recvBuf = row & cc
+    conn.recvBufStart = 0
+
+    var count: int32 = 0
+    expect PgProtocolError:
+      discard conn.nextMessage(rowCount = addr count)
+    check count == 0
+    check conn.state == csClosed
+
+  test "onRow sink with no RowData fails closed instead of dropping the row":
+    var conn = mockConn()
+    conn.recvBuf = buildDataRowMsg(["hello"])
+    conn.recvBufStart = 0
+
+    var rows = 0
+    var callbackError: ref CatchableError = nil
+    let onRow: RowCallback = proc(row: Row) {.gcsafe, raises: [CatchableError].} =
+      inc rows
+    expect PgProtocolError:
+      discard conn.nextMessage(onRow = onRow, onRowError = addr callbackError)
+    check rows == 0
+    check callbackError == nil
+    check conn.state == csClosed
+
+  test "without a row sink the DataRow is still returned as a message":
+    var conn = mockConn()
+    let row = buildDataRowMsg(["hello"])
+    conn.recvBuf = row
+    conn.recvBufStart = 0
+
+    let opt = conn.nextMessage()
+    check opt.isSome
+    check opt.get.kind == bmkDataRow
+    check opt.get.columns.len == 1
+    check conn.state == csReady
     check conn.recvBufStart == row.len
 
 suite "nextMessage onRow requires onRowError":

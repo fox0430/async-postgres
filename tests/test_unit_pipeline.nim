@@ -122,3 +122,37 @@ suite "pipeline: mock round trip":
       await ms.closeServer()
 
     waitFor t()
+
+  test "an exec op drops rows a RETURNING statement sends":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        await drainOnePipeline(client, 1)
+        var reply: seq[byte]
+        reply.add(buildBackendMsg('1', @[]))
+        reply.add(buildBackendMsg('2', @[]))
+        # A cache-disabled exec op sends no Describe, so PostgreSQL returns the
+        # RETURNING rows with no RowDescription.
+        reply.add(buildDataRowText(["1"]))
+        reply.add(buildCommandComplete("INSERT 0 1"))
+        reply.add(buildReadyForQuery('I'))
+        await client.sendBytes(reply)
+        discard await drainFrontendMessage(client)
+        await closeClient(client)
+
+      let serverFut = serve()
+      let conn = await connect(mockConfig(ms.port))
+      # The unnamed-statement path, the one whose exec ops skip Describe.
+      conn.stmtCacheCapacity = 0
+      let p = newPipeline(conn)
+      p.addExec("INSERT INTO t VALUES (1) RETURNING id")
+      let res = await p.execute()
+      doAssert res.len == 1
+      doAssert res[0].kind == prkExec
+      doAssert res[0].commandResult.commandTag == "INSERT 0 1"
+      await conn.close()
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()

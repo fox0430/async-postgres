@@ -2,6 +2,7 @@ import std/macros
 
 import async_backend, pg_gensym, pg_types, pg_pool, pg_client
 import pg_connection/types
+from pg_connection/simple_query import waitKeepingOutcome
 import pg_client/transaction
 
 type
@@ -162,11 +163,6 @@ proc fireReadFallback(
   if cluster.onReadFallback != nil:
     cluster.onReadFallback(reason, err)
 
-proc keepOrphanOutcome(fut: Future[PgConnection]) {.gcsafe.} =
-  ## No-op orphan hook: the default one clears a late failure, which would make
-  ## `drainAbandonedAcquire` read a nil connection out of the failed future.
-  discard
-
 proc drainAbandonedAcquire(acquireFut: Future[PgConnection]) {.async.} =
   ## Reclaim the connection from a pool acquire abandoned by `fallbackTimeout`.
   ##
@@ -209,7 +205,7 @@ proc acquireRead(
   if cluster.fallbackTimeout > ZeroDuration:
     let replicaFut = cluster.replica.acquire()
     try:
-      let conn = await replicaFut.wait(cluster.fallbackTimeout, keepOrphanOutcome)
+      let conn = await replicaFut.waitKeepingOutcome(cluster.fallbackTimeout)
       return (conn, cluster.replica)
     except AsyncTimeoutError as e:
       asyncSpawn drainAbandonedAcquire(replicaFut)
@@ -240,7 +236,7 @@ proc acquireRead(
   if cluster.fallbackTimeout > ZeroDuration:
     let primaryFut = cluster.primary.acquire()
     try:
-      let conn = await primaryFut.wait(cluster.fallbackTimeout, keepOrphanOutcome)
+      let conn = await primaryFut.waitKeepingOutcome(cluster.fallbackTimeout)
       return (conn, cluster.primary)
     except AsyncTimeoutError:
       asyncSpawn drainAbandonedAcquire(primaryFut)

@@ -199,8 +199,9 @@ proc query*(
   ## ``simpleQuery`` when you need multiple ``;``-separated statements to run
   ## in one round trip (no parameters, text-only rows).
   ##
-  ## On timeout the connection is marked closed (protocol desync) and cannot be
-  ## reused; pooled connections are discarded automatically.
+  ## On timeout, the connection is retired (csClosed) unless the wire had
+  ## settled (asyncdispatch always retires: the timed-out op stays on the
+  ## socket). A pooled connection retired this way is discarded, not reused.
   var qr: QueryResult
   withConnTracing(
     conn,

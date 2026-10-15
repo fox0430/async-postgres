@@ -18,7 +18,13 @@ type PreparedStatement* = ref object
   ## (``DISCARD ALL`` / ``DEALLOCATE``, or a pooled backend being recycled)
   ## drops the statement; a later `execute` then raises ``PgQueryError`` with
   ## SQLSTATE ``26000`` (invalid_sql_statement_name) and the caller must
-  ## `prepare` it again. There is no transparent re-prepare here — that is
+  ## `prepare` it again. A later `prepare` with that same name on a session
+  ## that still holds it raises ``PgQueryError`` (``42P05``,
+  ## duplicate_prepared_statement): the name is free to reuse only after
+  ## `close`, an SQL ``DEALLOCATE``, or a session reset. A handle whose name
+  ## was freed and re-prepared then executes whatever that name now refers to.
+  ##
+  ## There is no transparent re-prepare here — that is
   ## reserved for the auto-prepare statement cache (see the cache path's
   ## ``StmtCacheInvalidatingStates`` handling in `pg_client/core`).
   ##
@@ -197,9 +203,16 @@ proc execute*(
   ##
   ## If the server session has lost the statement (``DISCARD ALL`` /
   ## ``DEALLOCATE``, or a pooled backend reset), this raises ``PgQueryError``
-  ## with SQLSTATE ``26000``; recover by calling `prepare` again. The error is
-  ## propagated, not retried — unlike the auto-prepare cache, an explicit
-  ## `PreparedStatement` is never re-prepared transparently.
+  ## with SQLSTATE ``26000``; recover by calling `prepare` again. The name is
+  ## not re-validated, so if the name was freed (`close`, ``DEALLOCATE``, a
+  ## session reset) and re-prepared meanwhile, this executes whatever it now
+  ## refers to: the rows are decoded with this handle's stale ``fields``, and
+  ## the parameters are coerced against its stale ``paramOids``. A re-prepared
+  ## statement with a different column count is refused instead — the DataRow
+  ## no longer matches the bound ``fields``, so this raises ``PgProtocolError``
+  ## and the connection is retired (``csClosed``). The error is propagated, not
+  ## retried — unlike the auto-prepare cache, an explicit `PreparedStatement`
+  ## is never re-prepared transparently.
   var qr: QueryResult
   withConnTracing(
     stmt.conn,
