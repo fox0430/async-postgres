@@ -1,6 +1,13 @@
-import std/unittest
+{.push warning[UnusedImport]: off.}
+import narrow_import_probe
+{.pop.}
+
+import std/[macrocache, macros, unittest]
+from std/json import JsonNode
+from std/options import Option
 
 import ../async_postgres
+from ../async_postgres/pg_types/encoding {.all.} import pgArrayElemTypes
 
 # Compile-time probe: the aggregate `import ../async_postgres` must re-export
 # the documented public API. Every individually re-exported hub symbol is
@@ -12,7 +19,7 @@ import ../async_postgres
 #
 # Name visibility only: dropping one overload of a shared name is not caught.
 # `nameAccessor` families share names with index getters, so `apiNameAccessor`
-# probes those by call shape.
+# probes those by call shape, as `apiArrayParams` does the array encoders.
 template apiExists(name: untyped) =
   when not declared(async_postgres.`name`):
     {.error: "aggregate import does not expose `" & astToStr(name) & "`".}
@@ -777,6 +784,38 @@ apiExists(getXml)
 apiExists(getXmlArray)
 apiExists(getXmlArrayOpt)
 apiExists(getXmlOpt)
+
+# -- array parameter probes
+# Pins the encoders the PgArray registry generates per type
+# (`tools/api_surface.nim` lists each template declaration once): `seq[T]`,
+# `PgArray[T]` and `pgParams` for every registered type, and `seq[Option[T]]`
+# for exactly the types listed.
+const optSeqArrayTypes =
+  ["int16", "int32", "int64", "float32", "float64", "bool", "string"]
+
+macro apiArrayParams(): untyped =
+  result = newStmtList()
+  for registered in pgArrayElemTypes:
+    # By name: the registry's own symbol resolves even if the aggregate
+    # stopped exporting the type.
+    let T = ident(registered.repr)
+    let name = newLit(registered.repr)
+    let hasOptSeq = newLit(registered.repr in optSeqArrayTypes)
+    result.add quote do:
+      when not compiles(pgParams(default(seq[`T`]), default(PgArray[`T`]))):
+        {.error: "aggregate import does not encode `" & `name` & "` arrays".}
+      when compiles(toPgParam(default(seq[Option[`T`]]))) != `hasOptSeq`:
+        {.error: "seq[Option[" & `name` & "]] encoding differs from optSeqArrayTypes".}
+
+apiArrayParams()
+
+# `pgParams` is declared in the hub, so it binds the `ranges` encoders too.
+when not compiles(
+  pgParams(
+    rangeOf(1'i32, 2'i32), @[rangeOf(1'i32, 2'i32)], default(PgMultirange[int32])
+  )
+):
+  {.error: "aggregate import's `pgParams` does not encode ranges".}
 
 # -- name-based overload probes
 # Pins the `(Row, string)` overloads `nameAccessor` expands into `pg_types.nim`

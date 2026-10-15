@@ -10,17 +10,6 @@ import ../async_postgres/pg_types/ranges {.all.}
 
 import types_common
 
-suite "Array OID constants":
-  test "array OID values":
-    check OidBoolArray == 1000'i32
-    check OidInt2Array == 1005'i32
-    check OidInt4Array == 1007'i32
-    check OidInt8Array == 1016'i32
-    check OidFloat4Array == 1021'i32
-    check OidFloat8Array == 1022'i32
-    check OidTextArray == 1009'i32
-    check OidVarcharArray == 1015'i32
-
 suite "Array toPgParam (binary)":
   test "seq[int32]":
     let p = toPgParam(@[1'i32, 2, 3])
@@ -1417,6 +1406,18 @@ suite "PgArray[T] toPgParam":
     let p = toPgParam(a)
     let data = p.value.get
     check fromBE32(data.toOpenArray(4, 7)) == 1'i32
+
+  test "toPgParam PgArray reports a bad shape before a bad element":
+    template checkShapeFirst(T: typedesc, bad: T) =
+      let a = PgArray[T](dims: @[2'i32], lowerBounds: @[1'i32], elements: @[some(bad)])
+      try:
+        discard toPgParam(a)
+        fail()
+      except PgTypeError as e:
+        check "product(dims)" in e.msg
+
+    checkShapeFirst(PgNumeric, PgNumeric(digits: @[10000'i16])) # variable width
+    checkShapeFirst(PgTime, PgTime(hour: 25)) # fixed width
 
   test "toPgParam PgArray[bool] 3D":
     let a =

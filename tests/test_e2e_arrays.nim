@@ -1,11 +1,26 @@
-import std/[unittest, options, strutils, tables, net, json]
+import std/[unittest, options, strutils, tables, net, json, macrocache, macros]
 from std/times import
   DateTime, dateTime, mMar, mJun, mJan, mDec, utc, year, month, monthday, hour, minute,
   second, toTime, toUnix, nanosecond
 
 import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
+from ../async_postgres/pg_types/encoding {.all.} import
+  pgArrayElemTypes, pgArrayAcceptOids, pgArrayAcceptArrayOids
 
 import e2e_common
+
+macro registeredOidGroups(): untyped =
+  ## ``(name, accepted element OIDs, their array OIDs)`` per registration.
+  result = nnkBracket.newTree()
+  for T in pgArrayElemTypes:
+    let name = newLit(T.repr)
+    result.add quote do:
+      (
+        name: `name`,
+        elems: @(pgArrayAcceptOids(`T`)),
+        arrs: @(pgArrayAcceptArrayOids(`T`)),
+      )
+  result = prefix(result, "@")
 
 # User-defined type definitions for e2e tests (macros must be at top level)
 type
@@ -95,6 +110,22 @@ suite "E2E: Array Types":
 
     waitFor t()
 
+  test "a cached \"char\" array reads the same as its first execution":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # A high-bit byte and NUL: the text form escapes both, binary sends them
+      # raw. The text[] column shows the second run hit the statement cache.
+      let sql =
+        "SELECT ARRAY['a'::\"char\", E'\\\\351'::\"char\", ''::\"char\"], ARRAY['x']"
+      let first = (await conn.query(sql)).rows[0]
+      let cached = (await conn.query(sql)).rows[0]
+      doAssert cached.isBinaryCol(1), "the second execution missed the statement cache"
+      doAssert not cached.isBinaryCol(0), "\"char\"[] must stay text on a cache hit"
+      doAssert cached.getStrArray(0) == first.getStrArray(0)
+      await conn.close()
+
+    waitFor t()
+
   test "empty array roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -124,6 +155,120 @@ suite "E2E: Array Types":
       doAssert res.rows.len == 1
       doAssert res.rows[0].isNull(0)
       doAssert res.rows[0].getIntArrayOpt(0).isNone
+      await conn.close()
+
+    waitFor t()
+
+suite "E2E: Array registry types with no prior coverage":
+  # ``line[]``, ``lseg[]``, ``path[]``, ``polygon[]`` and ``macaddr8[]`` had no
+  # test at all, so a type added to one registry table only stayed invisible.
+  # Each case goes through the generic ``PgArray[T]`` path (binary, which is
+  # what the registry decoder requires) and the 1-D accessor.
+  test "line array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let lines = @[PgLine(a: 1.0, b: -1.0, c: 0.0), PgLine(a: 0.0, b: 1.0, c: -2.0)]
+      let res = await conn.query("SELECT $1::line[]", @[toPgParam(lines)], rfBinary)
+      doAssert res.rows.len == 1
+      doAssert getArrayND[PgLine](res.rows[0], 0) == pgArray(lines)
+      doAssert res.rows[0].getLineArray(0) == lines
+      await conn.close()
+
+    waitFor t()
+
+  test "lseg array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let segs = @[
+        PgLseg(p1: PgPoint(x: 0.0, y: 0.0), p2: PgPoint(x: 3.0, y: 4.0)),
+        PgLseg(p1: PgPoint(x: -1.0, y: 2.0), p2: PgPoint(x: 5.0, y: -6.0)),
+      ]
+      let res = await conn.query("SELECT $1::lseg[]", @[toPgParam(segs)], rfBinary)
+      doAssert res.rows.len == 1
+      doAssert getArrayND[PgLseg](res.rows[0], 0) == pgArray(segs)
+      doAssert res.rows[0].getLsegArray(0) == segs
+      await conn.close()
+
+    waitFor t()
+
+  test "path array roundtrip keeps open and closed paths apart":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let paths = @[
+        PgPath(
+          closed: false, points: @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 1.0)]
+        ),
+        PgPath(
+          closed: true,
+          points:
+            @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0), PgPoint(x: 1.0, y: 1.0)],
+        ),
+      ]
+      let res = await conn.query("SELECT $1::path[]", @[toPgParam(paths)], rfBinary)
+      doAssert res.rows.len == 1
+      doAssert getArrayND[PgPath](res.rows[0], 0) == pgArray(paths)
+      doAssert res.rows[0].getPathArray(0) == paths
+      await conn.close()
+
+    waitFor t()
+
+  test "polygon array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let polys = @[
+        PgPolygon(points: @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 1.0, y: 0.0)]),
+        PgPolygon(
+          points:
+            @[PgPoint(x: 0.0, y: 0.0), PgPoint(x: 2.0, y: 0.0), PgPoint(x: 0.0, y: 2.0)]
+        ),
+      ]
+      let res = await conn.query("SELECT $1::polygon[]", @[toPgParam(polys)], rfBinary)
+      doAssert res.rows.len == 1
+      doAssert getArrayND[PgPolygon](res.rows[0], 0) == pgArray(polys)
+      doAssert res.rows[0].getPolygonArray(0) == polys
+      await conn.close()
+
+    waitFor t()
+
+  test "macaddr8 array roundtrip":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let macs =
+        @[PgMacAddr8("08:00:2b:01:02:03:04:05"), PgMacAddr8("08:00:2b:01:02:03:04:06")]
+      let res = await conn.query("SELECT $1::macaddr8[]", @[toPgParam(macs)], rfBinary)
+      doAssert res.rows.len == 1
+      doAssert getArrayND[PgMacAddr8](res.rows[0], 0) == pgArray(macs)
+      doAssert res.rows[0].getMacAddr8Array(0) == macs
+      await conn.close()
+
+    waitFor t()
+
+  test "pg_type pairs every accepted element OID with its array OID":
+    # The unit test pins the literals; this checks the registry against the
+    # catalog of a live server. OIDs are unique, so no schema filter is needed.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let groups = registeredOidGroups()
+      var elemOids: seq[int32]
+      for g in groups:
+        doAssert g.elems.len == g.arrs.len, g.name
+        for oid in g.elems:
+          elemOids.add(oid)
+      let res = await conn.query(
+        "SELECT e.oid::int4, e.typarray::int4, a.typelem::int4 FROM pg_type e " &
+          "JOIN pg_type a ON a.oid = e.typarray WHERE e.oid = ANY($1::oid[])",
+        @[toPgParam(elemOids)],
+        resultFormat = rfText,
+      )
+      var byOid: Table[int32, tuple[arr, elem: int32]]
+      for row in res.rows:
+        byOid[row.getInt(0)] = (row.getInt(1), row.getInt(2))
+      for g in groups:
+        for i in 0 ..< g.elems.len:
+          let e = g.elems[i]
+          doAssert e in byOid, g.name & ": no pg_type row with an array"
+          doAssert byOid[e].arr == g.arrs[i], g.name & " typarray for elemOid " & $e
+          doAssert byOid[e].elem == e, g.name & " typelem for elemOid " & $e
       await conn.close()
 
     waitFor t()

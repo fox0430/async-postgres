@@ -1484,6 +1484,36 @@ suite "wire OID policy: a binary read needs an exact built-in match":
     check msg.startsWith(
       "Column 0: getIntArray: wire elemOid=20003 is a user-defined type"
     )
+    msg = ""
+    try:
+      discard getArrayND[int32](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.startsWith(
+      "Column 0: getArrayND[int32]: wire elemOid=20003 is a user-defined type"
+    )
+
+  test "getArrayND[JsonNode] names json and jsonb on a built-in mismatch":
+    var raw = toPgBinaryParam(@[1'i32, 2'i32]).value.get
+    let row = mkRow(@[some(raw)], @[mkField(OidInt4Array, 1)])
+    var msg = ""
+    try:
+      discard getArrayND[JsonNode](row, 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg ==
+      "Column 0: getArrayND[JsonNode]: wire elemOid=23 is neither json nor jsonb"
+    # An elemOid the catalog assigned keeps the shared diagnostics.
+    for i in 0 .. 3:
+      raw[8 + i] = byte((userEnumOid shr (8 * (3 - i))) and 0xff)
+    msg = ""
+    try:
+      discard getArrayND[JsonNode](mkRow(@[some(raw)], @[mkField(OidJsonbArray, 1)]), 0)
+    except PgTypeError as e:
+      msg = e.msg
+    check msg.startsWith(
+      "Column 0: getArrayND[JsonNode]: wire elemOid=20003 is a user-defined type"
+    )
 
   test "getEnum accepts a dynamic colOid and rejects a stringified built-in":
     let cell = some(toBytes("happy"))

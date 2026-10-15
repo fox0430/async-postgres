@@ -256,6 +256,9 @@ const
   OidFloat8Array* = 1022'i32
   OidTextArray* = 1009'i32
   OidVarcharArray* = 1015'i32
+  OidBpcharArray* = 1014'i32
+  OidNameArray* = 1003'i32
+  OidCharArray* = 1002'i32
 
   pgEpochUnix* = 946684800'i64 ## 2000-01-01 00:00:00 UTC in Unix seconds
   pgEpochDaysOffset* = 10957'i32 ## Days from 1970-01-01 to 2000-01-01
@@ -313,6 +316,7 @@ const
   OidTimeTzArray* = 1270'i32
   OidUuidArray* = 2951'i32
   OidJsonbArray* = 3807'i32
+  OidJsonArray* = 199'i32
   OidInetArray* = 1041'i32
   OidCidrArray* = 651'i32
   OidMacAddrArray* = 1040'i32
