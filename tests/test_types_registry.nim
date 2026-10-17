@@ -40,6 +40,14 @@ macro forEachRegistered(check: untyped): untyped =
   for T in pgArrayElemTypes:
     result.add newCall(check, T)
 
+macro forEachRegisteredOptSeq(check: untyped): untyped =
+  var optSeqNames: seq[string]
+  for T in pgArrayOptSeqElemTypes:
+    optSeqNames.add T.repr
+  result = newStmtList()
+  for T in pgArrayElemTypes:
+    result.add newCall(check, T, newLit(T.repr in optSeqNames))
+
 macro typeNames(registered: static bool): untyped =
   var names: seq[string]
   if registered:
@@ -82,6 +90,16 @@ proc encodedElem[T](v: T): seq[byte] =
     writePgArrayElementAt(result, 0, v)
   else:
     result = encodePgArrayElement(v)
+
+template checkOptSeqPair(T: typedesc, expected: static bool) =
+  block:
+    checkpoint $T
+    # ``optSeq`` registrations yield ``toPgParam(seq[Option[T]])`` while the
+    # generic ``get`` overloads for ``seq[Option[T]]`` delegate to the
+    # hand-written ElemOpt getters. One side without the other is a
+    # half-exposed API, so both sides must match the registry flag.
+    check compiles(toPgParam(default(seq[Option[T]]))) == expected
+    check compiles(get(default(Row), 0, seq[Option[T]])) == expected
 
 template checkRegistered(T: typedesc) =
   block:
@@ -321,6 +339,9 @@ suite "Array registry vs the scalar codecs and both array codecs":
 
   test "registered types":
     forEachRegistered(checkRegistered)
+
+  test "optSeq encoders and ElemOpt decoders agree":
+    forEachRegisteredOptSeq(checkOptSeqPair)
 
   test "types outside the registry stay outside":
     # They have scalar or 1-D codecs only; the generic codec rejects them at
