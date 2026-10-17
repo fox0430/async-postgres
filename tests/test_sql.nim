@@ -1,7 +1,11 @@
 import std/[unittest, options]
 
-import ../async_postgres/pg_types {.all.}
-import ../async_postgres/pg_sql
+import ../async_postgres/[pg_types, pg_sql]
+
+import sql_ambiguous_fixture
+# Its `toPgParam(string)` would make every string parameter here ambiguous.
+from sql_shadow_fixture import ShadowOid, shadowedPgParams, shadowedSqlParams
+import sql_types_fixture
 
 suite "sqlParams":
   test "basic conversion":
@@ -419,3 +423,66 @@ suite "sql macro":
     let sq = sql"""SELECT {5'i32 #[ outer #[ inner } ]# still } ]# + 3'i32}"""
     check sq.query == "SELECT $1"
     check sq.params.len == 1
+
+suite "caller-module toPgParam resolution":
+  test "pgParams encodes pgEnum values and arrays":
+    let p = pgParams(cmHappy, @[cmHappy, cmSad], @[some(cmSad), none(CallerMood)])
+    check p.len == 3
+    check p[0].oid == 0'i32
+    check toString(p[0].value.get) == "cmHappy"
+    check p[1] == toPgParam(@[cmHappy, cmSad])
+    check p[2] == toPgParam(@[some(cmSad), none(CallerMood)])
+
+  test "pgParams encodes pgDomain, pgComposite and user-defined values":
+    let p = pgParams(
+      CallerEmail("a@b.c"), CallerPerson(name: "n", age: 3'i32), CallerId(7'i32)
+    )
+    check p.len == 3
+    check p[0].oid == OidText
+    check toString(p[0].value.get) == "a@b.c"
+    check p[1].oid == 0'i32
+    check toString(p[1].value.get) == "(n,3)"
+    check p[2] == toPgParam(7'i32)
+
+  test "pgParams encodes Option of caller overloads":
+    let p = pgParams(
+      some(cmHappy), none(CallerMood), some(CallerEmail("a@b.c")),
+      some(CallerPerson(name: "n", age: 3'i32)),
+    )
+    check p[0] == toPgParam(cmHappy)
+    check p[1].oid == 0'i32
+    check p[1].value.isNone
+    check p[2] == toPgParam(CallerEmail("a@b.c"))
+    check p[3] == toPgParam(CallerPerson(name: "n", age: 3'i32))
+
+  test "pgParams mixes caller and library overloads":
+    let p = pgParams(cmHappy, 25'i32, "Alice")
+    check p.len == 3
+    check p[1] == toPgParam(25'i32)
+    check p[2] == toPgParam("Alice")
+
+  test "sql encodes caller overloads alongside built-in ones":
+    let
+      mood = some(cmSad)
+      email = CallerEmail("a@b.c")
+      person = CallerPerson(name: "n", age: 3'i32)
+      id = CallerId(7'i32)
+    let sq = sql"SELECT {mood}, {email}, {person}, {id} WHERE age > {25'i32}"
+    check sq.query == "SELECT $1, $2, $3, $4 WHERE age > $5"
+    check sq.params ==
+      @[
+        toPgParam(cmSad),
+        toPgParam(email),
+        toPgParam(person),
+        toPgParam(7'i32),
+        toPgParam(25'i32),
+      ]
+
+  test "an overload declared at the call site wins over the built-in one":
+    check shadowedPgParams()[0].oid == ShadowOid
+    check shadowedSqlParams()[0].oid == ShadowOid
+
+  test "an imported overload with a built-in signature is ambiguous":
+    check int32ParamCompiles
+    check qualifiedCallCompiles
+    check not stringParamCompiles

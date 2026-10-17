@@ -53,13 +53,13 @@ Async PostgreSQL client in Nim.
 - XML type (`PgXml`)
 
 Parameter values of types built with the `pgEnum`, `pgDomain` and `pgComposite`
-macros are passed differently: the `toPgParam` those macros generate lives in
-the calling module, where `sql"…{v}…"` and `pgParams(v)` cannot see it. Pass
-`@[toPgParam(v)]` to any call that takes a `seq[PgParam]` — `query`, `exec`,
-`queryRow`, `queryValue`, `queryEach`, `openCursor`, the other `query*` helpers,
-their `pool.*` variants — instead, and cast the placeholder (`$1::mytype`) when
-the client does not know the type's OID. `queryDirect` / `execDirect` take their
-parameters as separate arguments and cannot encode these types.
+macros, and `Option`s of them, work with `sql"…{v}…"` and `pgParams(v)`: both
+resolve `toPgParam` at the call site, as a direct `toPgParam(v)` call there
+would, so they find the overloads those macros generate. Only `pgEnum` also
+generates the `seq[T]` and `seq[Option[T]]` forms. Cast the placeholder
+(`$1::mytype`) when the client does not know the type's OID. `queryDirect` /
+`execDirect` take their parameters as separate arguments and cannot encode
+these types.
 
 ### Performance
 - Automatic binary format selection for known-safe types
