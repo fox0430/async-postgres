@@ -126,6 +126,39 @@ suite "E2E: Array Types":
 
     waitFor t()
 
+  test "cached bpchar/json/name arrays stay readable via getArrayND":
+    # 199/1014/1003 joined BinarySafeOids after the registry rework, so the
+    # second execution (statement-cache hit) returns binary and getArrayND
+    # works there. "char"[] still stays text; see the test above.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let bpcharSql = "SELECT ARRAY['ab', 'cd']::bpchar[]"
+      let bpFirst = (await conn.query(bpcharSql)).rows[0]
+      let bpCached = (await conn.query(bpcharSql)).rows[0]
+      doAssert not bpFirst.isBinaryCol(0), "first execution must be text"
+      doAssert bpCached.isBinaryCol(0), "bpchar[] must turn binary on a cache hit"
+      doAssert bpCached.getStrArray(0) == bpFirst.getStrArray(0)
+      doAssert getArrayND[string](bpCached, 0) == pgArray(@["ab", "cd"])
+
+      let jsonSql = """SELECT ARRAY['{"a": 1}', '[1, 2]']::json[]"""
+      let jsonFirst = (await conn.query(jsonSql)).rows[0]
+      let jsonCached = (await conn.query(jsonSql)).rows[0]
+      doAssert not jsonFirst.isBinaryCol(0), "first execution must be text"
+      doAssert jsonCached.isBinaryCol(0), "json[] must turn binary on a cache hit"
+      doAssert jsonCached.getJsonArray(0) == jsonFirst.getJsonArray(0)
+      doAssert getArrayND[JsonNode](jsonCached, 0) == pgArray(@[%*{"a": 1}, %*[1, 2]])
+
+      let nameSql = "SELECT ARRAY['foo', 'bar']::name[]"
+      let nameFirst = (await conn.query(nameSql)).rows[0]
+      let nameCached = (await conn.query(nameSql)).rows[0]
+      doAssert not nameFirst.isBinaryCol(0), "first execution must be text"
+      doAssert nameCached.isBinaryCol(0), "name[] must turn binary on a cache hit"
+      doAssert nameCached.getStrArray(0) == nameFirst.getStrArray(0)
+      doAssert getArrayND[string](nameCached, 0) == pgArray(@["foo", "bar"])
+      await conn.close()
+
+    waitFor t()
+
   test "empty array roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
