@@ -1802,7 +1802,10 @@ optAccessor(getStrArrayElemOpt, getStrArrayElemOptOpt, seq[Option[string]])
 proc getArrayND*[T](row: Row, col: int): PgArray[T] =
   ## Read an N-dimensional PostgreSQL array column as a ``PgArray[T]``.
   ## Requires binary column format, so query with ``rfBinary``: ``rfAuto``
-  ## returns text on a statement's first execution. Text-format
+  ## returns text on a statement's first execution and binary from the second
+  ## on for the binary-safe array OIDs under ``rfAuto``. ``"char"[]`` (1002)
+  ## stays text even on an ``rfAuto`` cache hit, so it is only readable via
+  ## the 1-D accessor under ``rfAuto``. Text-format
   ## multi-dimensional arrays are not supported. Raises ``PgTypeError`` when
   ## the column is NULL, or when the wire ``elemOid`` is not one ``T`` is
   ## registered to accept (the same set as the 1-D accessor: ``JsonNode``
