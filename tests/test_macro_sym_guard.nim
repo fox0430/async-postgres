@@ -163,8 +163,13 @@ suite "macro_sym_guard: locals of async expansions":
     for bound in ["bindSym(\"core\", brOpen)", "bindSym \"core\""]:
       check localHits(
         source(
-          "m.nim", "template core(x: untyped) =", "  let local = x", "proc p() =",
-          "  core(1)", "macro m(): untyped =", "  newCall(" & bound & ", newLit(1))",
+          "m.nim",
+          "template core(x: untyped) =",
+          "  let local = x",
+          "proc p() =",
+          "  core(1)",
+          "macro m(): untyped =",
+          "  newCall(" & bound & ", newLit(1))",
         )
       ) == @["m.nim:1:local"]
 

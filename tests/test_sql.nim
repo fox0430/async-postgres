@@ -446,7 +446,9 @@ suite "caller-module toPgParam resolution":
 
   test "pgParams encodes Option of caller overloads":
     let p = pgParams(
-      some(cmHappy), none(CallerMood), some(CallerEmail("a@b.c")),
+      some(cmHappy),
+      none(CallerMood),
+      some(CallerEmail("a@b.c")),
       some(CallerPerson(name: "n", age: 3'i32)),
     )
     check p[0] == toPgParam(cmHappy)
