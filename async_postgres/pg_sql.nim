@@ -362,7 +362,7 @@ macro sql*(queryStr: static[string]): untyped =
         inc paramIdx
         resultSql.add('$')
         resultSql.addInt(paramIdx)
-        paramNodes.add(newCall(bindSym"toPgParam", exprNode))
+        paramNodes.add(newCall(bindSym("toPgParam", brOpen), exprNode))
         i = j + 1
     of '}':
       if i + 1 < queryStr.len and queryStr[i + 1] == '}':

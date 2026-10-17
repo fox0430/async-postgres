@@ -292,14 +292,19 @@ proc scanScopes(f: SourceFile, fileIdx: int, scopes: var seq[Scope]): seq[int] =
       pending = if depth > 0: id else: -1
 
 proc bindSymNames(raw: string): seq[string] =
-  var at = raw.find("bindSym\"")
+  ## Names bound by `bindSym"name"`, `bindSym "name"` or `bindSym("name", ...)`.
+  var at = raw.find("bindSym")
   while at >= 0:
-    let start = at + "bindSym\"".len
-    let close = raw.find('"', start)
-    if close < 0:
-      break
-    result.add raw[start ..< close]
-    at = raw.find("bindSym\"", close)
+    var start = at + "bindSym".len
+    while start < raw.len and raw[start] in {' ', '('}:
+      inc start
+    if start < raw.len and raw[start] == '"':
+      let close = raw.find('"', start + 1)
+      if close < 0:
+        break
+      result.add raw[start + 1 ..< close]
+      start = close
+    at = raw.find("bindSym", start)
 
 proc lineDecls(s: string, section: bool): seq[string] =
   ## Names a statement line declares: `let`/`var` (also inside parentheses),

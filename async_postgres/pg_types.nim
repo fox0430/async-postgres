@@ -45,8 +45,8 @@ export encoding.writeParamOid
 export encoding.foldBindParam
 export encoding.writeBindParam
 
-# Here rather than in `encoding`: `bindSym` binds the `toPgParam` overloads
-# in scope where the macro is declared, which includes `ranges`.
+# Here rather than in `encoding` so `bindSym` sees the `ranges` overloads;
+# `brOpen` adds the ones visible at the call site.
 macro pgParams*(args: varargs[typed]): untyped =
   ## Convert multiple values to a ``seq[PgParam]`` in one call.
   ## At least one argument is required; for parameterless queries omit the
@@ -59,7 +59,7 @@ macro pgParams*(args: varargs[typed]): untyped =
   result.add(ident"@")
   let bracket = newNimNode(nnkBracket)
   for arg in args:
-    bracket.add(newCall(bindSym"toPgParam", arg))
+    bracket.add(newCall(bindSym("toPgParam", brOpen), arg))
   result.add(bracket)
 
 # `decoding` — public text parsers; the raw binary decoders stay internal.
